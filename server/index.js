@@ -28,12 +28,86 @@ app.get("/api/config", (_req, res) => {
 // In-memory process state: key = "project/agent" → { process, state, error }
 const agentProcesses = new Map();
 
+// AgentChattr server process
+let chattrProcess = { process: null, state: "stopped", error: null };
+
 app.get("/api/agents", (_req, res) => {
   const agents = {};
   for (const [key, info] of agentProcesses) {
     agents[key] = { state: info.state, error: info.error || null };
   }
+  agents["_agentchattr"] = { state: chattrProcess.state, error: chattrProcess.error };
   res.json(agents);
+});
+
+app.post("/api/agentchattr/:action", (req, res) => {
+  const { action } = req.params;
+  const cfg = readConfig();
+  const chattrUrl = cfg.agentchattr_url || "http://127.0.0.1:8300";
+  const chattrPort = new URL(chattrUrl).port || "8300";
+
+  if (action === "start") {
+    if (chattrProcess.state === "running" && chattrProcess.process) {
+      return res.json({ ok: true, state: "running", message: "Already running" });
+    }
+    try {
+      const child = spawn("agentchattr", ["--port", chattrPort], {
+        env: process.env,
+        stdio: "ignore",
+        detached: true,
+      });
+      child.unref();
+      child.on("error", (err) => {
+        chattrProcess = { process: null, state: "error", error: err.message };
+      });
+      child.on("exit", (code) => {
+        if (chattrProcess.process === child) {
+          chattrProcess = { process: null, state: "stopped", error: code ? `exit:${code}` : null };
+        }
+      });
+      chattrProcess = { process: child, state: "running", error: null };
+      res.json({ ok: true, state: "running", pid: child.pid });
+    } catch (err) {
+      chattrProcess = { process: null, state: "error", error: err.message };
+      res.status(500).json({ ok: false, state: "error", error: err.message });
+    }
+  } else if (action === "stop") {
+    if (chattrProcess.process) {
+      try { chattrProcess.process.kill("SIGTERM"); } catch {}
+    }
+    chattrProcess = { process: null, state: "stopped", error: null };
+    res.json({ ok: true, state: "stopped" });
+  } else if (action === "restart") {
+    if (chattrProcess.process) {
+      try { chattrProcess.process.kill("SIGTERM"); } catch {}
+    }
+    chattrProcess = { process: null, state: "stopped", error: null };
+    setTimeout(() => {
+      try {
+        const child = spawn("agentchattr", ["--port", chattrPort], {
+          env: process.env,
+          stdio: "ignore",
+          detached: true,
+        });
+        child.unref();
+        child.on("error", (err) => {
+          chattrProcess = { process: null, state: "error", error: err.message };
+        });
+        child.on("exit", (code) => {
+          if (chattrProcess.process === child) {
+            chattrProcess = { process: null, state: "stopped", error: code ? `exit:${code}` : null };
+          }
+        });
+        chattrProcess = { process: child, state: "running", error: null };
+        res.json({ ok: true, state: "running", pid: child.pid });
+      } catch (err) {
+        chattrProcess = { process: null, state: "error", error: err.message };
+        res.status(500).json({ ok: false, state: "error", error: err.message });
+      }
+    }, 500);
+  } else {
+    res.status(400).json({ error: "Unknown action" });
+  }
 });
 
 app.post("/api/agents/:project/:agent/start", (req, res) => {

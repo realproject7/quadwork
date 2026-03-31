@@ -94,6 +94,16 @@ export default function TerminalGrid({
                     title="Stop"
                   >■</button>
                 )}
+                <button
+                  onClick={() => {
+                    fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agent.id)}&action=restart`, { method: "POST" })
+                      .then((r) => r.json())
+                      .then((d) => { if (d.state && onStatusChange) onStatusChange(agent.id, d.state); })
+                      .catch(() => {});
+                  }}
+                  className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
+                  title="Restart"
+                >↻</button>
                 {isExpanded && (
                   <button
                     onClick={() => setExpanded(null)}
