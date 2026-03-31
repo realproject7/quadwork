@@ -1,4 +1,4 @@
-import TerminalGrid from "@/components/TerminalGrid";
+import ProjectDashboard from "@/components/ProjectDashboard";
 
 interface ProjectPageProps {
   params: Promise<{ id: string }>;
@@ -9,7 +9,7 @@ export default async function ProjectPage({ params }: ProjectPageProps) {
 
   return (
     <div className="w-full h-full">
-      <TerminalGrid projectId={id} />
+      <ProjectDashboard projectId={id} />
     </div>
   );
 }
