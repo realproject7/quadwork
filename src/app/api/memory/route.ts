@@ -24,7 +24,7 @@ function getMemoryPaths(project: { working_dir: string; memory_cards_dir?: strin
   };
 }
 
-// GET /api/memory?project=X&action=cards|status|shared-memory
+// GET /api/memory?project=X&action=cards|status|shared-memory|settings
 export async function GET(req: NextRequest) {
   const projectId = req.nextUrl.searchParams.get("project") || "";
   const action = req.nextUrl.searchParams.get("action") || "cards";
@@ -42,10 +42,17 @@ export async function GET(req: NextRequest) {
   if (action === "shared-memory") {
     return readSharedMemory(paths.sharedMemoryPath);
   }
+  if (action === "settings") {
+    return NextResponse.json({
+      memory_cards_dir: project.memory_cards_dir || "",
+      shared_memory_path: project.shared_memory_path || "",
+      butler_scripts_dir: project.butler_scripts_dir || "",
+    });
+  }
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });
 }
 
-// POST /api/memory?project=X&action=butler|save-memory
+// POST /api/memory?project=X&action=butler|save-memory|save-settings
 export async function POST(req: NextRequest) {
   const projectId = req.nextUrl.searchParams.get("project") || "";
   const action = req.nextUrl.searchParams.get("action") || "";
@@ -61,6 +68,10 @@ export async function POST(req: NextRequest) {
   if (action === "save-memory") {
     const body = await req.json();
     return saveSharedMemory(paths.sharedMemoryPath, body.content);
+  }
+  if (action === "save-settings") {
+    const body = await req.json();
+    return saveSettings(projectId, body);
   }
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });
 }
@@ -127,6 +138,21 @@ function saveSharedMemory(sharedMemoryPath: string, content: string) {
     const dir = path.dirname(sharedMemoryPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(sharedMemoryPath, content);
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    return NextResponse.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+function saveSettings(projectId: string, settings: { memory_cards_dir?: string; shared_memory_path?: string; butler_scripts_dir?: string }) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const project = cfg.projects?.find((p: { id: string }) => p.id === projectId);
+    if (!project) return NextResponse.json({ ok: false, error: "Project not found" });
+    if (settings.memory_cards_dir !== undefined) project.memory_cards_dir = settings.memory_cards_dir || undefined;
+    if (settings.shared_memory_path !== undefined) project.shared_memory_path = settings.shared_memory_path || undefined;
+    if (settings.butler_scripts_dir !== undefined) project.butler_scripts_dir = settings.butler_scripts_dir || undefined;
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
     return NextResponse.json({ ok: true });
   } catch (err) {
     return NextResponse.json({ ok: false, error: err instanceof Error ? err.message : String(err) });

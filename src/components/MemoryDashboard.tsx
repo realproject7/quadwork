@@ -30,7 +30,10 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
   const [butlerRunning, setButlerRunning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [tab, setTab] = useState<"cards" | "editor">("cards");
+  const [tab, setTab] = useState<"cards" | "editor" | "settings">("cards");
+  const [settings, setSettings] = useState({ memory_cards_dir: "", shared_memory_path: "", butler_scripts_dir: "" });
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsSaved, setSettingsSaved] = useState(false);
 
   const fetchCards = useCallback(() => {
     fetch(`/api/memory?project=${encodeURIComponent(projectId)}&action=cards&search=${encodeURIComponent(search)}`)
@@ -52,6 +55,13 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
     fetch(`/api/memory?project=${encodeURIComponent(projectId)}&action=shared-memory`)
       .then((r) => r.ok ? r.json() : { content: "" })
       .then((d) => setSharedMemory(d.content))
+      .catch(() => {});
+  }, [projectId]);
+
+  useEffect(() => {
+    fetch(`/api/memory?project=${encodeURIComponent(projectId)}&action=settings`)
+      .then((r) => r.ok ? r.json() : {})
+      .then((d: { memory_cards_dir?: string; shared_memory_path?: string; butler_scripts_dir?: string }) => setSettings({ memory_cards_dir: d.memory_cards_dir || "", shared_memory_path: d.shared_memory_path || "", butler_scripts_dir: d.butler_scripts_dir || "" }))
       .catch(() => {});
   }, [projectId]);
 
@@ -81,6 +91,19 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
       .finally(() => setButlerRunning(false));
   };
 
+  const saveSettings = () => {
+    setSettingsSaving(true);
+    fetch(`/api/memory?project=${encodeURIComponent(projectId)}&action=save-settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    })
+      .then((r) => r.json())
+      .then((d) => { if (d.ok) { setSettingsSaved(true); setTimeout(() => setSettingsSaved(false), 2000); } })
+      .catch(() => {})
+      .finally(() => setSettingsSaving(false));
+  };
+
   const saveMemory = () => {
     setSaving(true);
     fetch(`/api/memory?project=${encodeURIComponent(projectId)}&action=save-memory`, {
@@ -101,6 +124,7 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
         <div className="flex items-center gap-1 border border-border">
           <button onClick={() => setTab("cards")} className={`px-3 py-1 text-[11px] ${tab === "cards" ? "bg-accent text-bg" : "text-text-muted hover:text-text"}`}>Cards</button>
           <button onClick={() => setTab("editor")} className={`px-3 py-1 text-[11px] ${tab === "editor" ? "bg-accent text-bg" : "text-text-muted hover:text-text"}`}>Editor</button>
+          <button onClick={() => setTab("settings")} className={`px-3 py-1 text-[11px] ${tab === "settings" ? "bg-accent text-bg" : "text-text-muted hover:text-text"}`}>Settings</button>
         </div>
       </div>
 
@@ -179,6 +203,45 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
             onChange={(e) => setSharedMemory(e.target.value)}
             className="flex-1 bg-bg-surface border border-border p-3 text-[12px] text-text outline-none focus:border-accent resize-none"
           />
+        </div>
+      )}
+
+      {/* Settings tab */}
+      {tab === "settings" && (
+        <div className="flex-1 min-h-0 flex flex-col gap-4">
+          <p className="text-[11px] text-text-muted">Override default paths for this project. Leave blank to use defaults.</p>
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] text-text-muted">Memory Cards Directory</span>
+            <input
+              value={settings.memory_cards_dir}
+              onChange={(e) => setSettings({ ...settings, memory_cards_dir: e.target.value })}
+              placeholder="../agent-memory/cards"
+              className="bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] text-text-muted">Shared Memory Path</span>
+            <input
+              value={settings.shared_memory_path}
+              onChange={(e) => setSettings({ ...settings, shared_memory_path: e.target.value })}
+              placeholder="../agent-memory/shared-memory.md"
+              className="bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] text-text-muted">Butler Scripts Directory</span>
+            <input
+              value={settings.butler_scripts_dir}
+              onChange={(e) => setSettings({ ...settings, butler_scripts_dir: e.target.value })}
+              placeholder="../agent-memory/bin"
+              className="bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+            />
+          </label>
+          <div>
+            <button onClick={saveSettings} disabled={settingsSaving} className="px-4 py-1 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
+              {settingsSaving ? "Saving..." : settingsSaved ? "Saved" : "Save Settings"}
+            </button>
+          </div>
         </div>
       )}
     </div>
