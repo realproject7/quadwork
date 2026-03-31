@@ -1,6 +1,23 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
+
+/** Simple markdown to HTML for preview (headings, lists, bold, code, links) */
+function renderMarkdown(md: string): string {
+  return md
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/^### (.+)$/gm, '<h3 class="text-sm font-semibold text-text mt-3 mb-1">$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2 class="text-sm font-semibold text-accent mt-4 mb-1">$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1 class="text-base font-bold text-text mt-2 mb-2">$1</h1>')
+    .replace(/^\d+\. (.+)$/gm, '<div class="pl-4 text-text">• $1</div>')
+    .replace(/^- (.+)$/gm, '<div class="pl-4 text-text-muted">– $1</div>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong class="text-text">$1</strong>')
+    .replace(/`([^`]+)`/g, '<code class="text-accent text-[11px] bg-bg px-1">$1</code>')
+    .replace(/\n\n/g, '<div class="h-2"></div>')
+    .replace(/\n/g, "<br>");
+}
 
 interface Issue {
   number: number;
@@ -106,6 +123,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
     URL.revokeObjectURL(url);
   };
 
+  const renderedPreview = useMemo(() => renderMarkdown(content), [content]);
   const prompt = generatePrompt(content, repo);
 
   const copyPrompt = async () => {
@@ -115,14 +133,12 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
   };
 
   const sendToT1 = async () => {
-    // Send prompt to T1 terminal via backend WebSocket write
     try {
       const cfgRes = await fetch("/api/config");
       if (!cfgRes.ok) throw new Error("config");
       const cfg = await cfgRes.json();
       const port = cfg.port || 3001;
 
-      // Use the backend to write to T1's PTY
       const res = await fetch(`http://127.0.0.1:${port}/api/agents/${projectId}/t1/write`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -131,10 +147,17 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       if (res.ok) {
         setSent(true);
         setTimeout(() => setSent(false), 3000);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        if (res.status === 404) {
+          alert("No active T1 terminal session. Open the project dashboard first and ensure T1's terminal is connected, then try again.");
+        } else {
+          alert(`Send failed: ${err.error || res.status}`);
+        }
       }
     } catch {
-      // Fallback: copy to clipboard
       await copyPrompt();
+      alert("Could not reach backend. Prompt copied to clipboard instead.");
     }
   };
 
@@ -182,8 +205,12 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
           <div className="px-3 py-1.5 border-b border-border">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">Preview</span>
           </div>
-          <div className="flex-1 overflow-y-auto p-3 text-[12px] text-text whitespace-pre-wrap">
-            {content || <span className="text-text-muted">Preview will appear here...</span>}
+          <div className="flex-1 overflow-y-auto p-3 text-[12px] text-text">
+            {content ? (
+              <div dangerouslySetInnerHTML={{ __html: renderedPreview }} />
+            ) : (
+              <span className="text-text-muted">Preview will appear here...</span>
+            )}
           </div>
         </div>
       </div>
