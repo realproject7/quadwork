@@ -21,8 +21,10 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
 
   const clamp = useCallback(
     (ratio: number, totalPx: number) => {
+      // Available space excludes the divider track
+      const available = totalPx - DIVIDER;
       const minRatio = MIN_SIZE / totalPx;
-      const maxRatio = 1 - MIN_SIZE / totalPx;
+      const maxRatio = (available - MIN_SIZE) / totalPx;
       return Math.min(maxRatio, Math.max(minRatio, ratio));
     },
     []
