@@ -18,9 +18,9 @@ function getProject(projectId: string) {
 function getMemoryPaths(project: { working_dir: string; memory_cards_dir?: string; shared_memory_path?: string; butler_scripts_dir?: string }) {
   const workDir = project.working_dir || "";
   return {
-    cardsDir: project.memory_cards_dir || path.join(workDir, "..", "agent-memory", "cards"),
-    sharedMemoryPath: project.shared_memory_path || path.join(workDir, "..", "agent-memory", "shared-memory.md"),
-    butlerDir: project.butler_scripts_dir || path.join(workDir, "..", "agent-memory", "bin"),
+    cardsDir: project.memory_cards_dir || path.join(workDir, "..", "agent-memory", "archive", "v2", "cards"),
+    sharedMemoryPath: project.shared_memory_path || path.join(workDir, "..", "agent-memory", "central", "short-term", "agent-os.md"),
+    butlerDir: project.butler_scripts_dir || path.join(workDir, "..", "agent-memory", "scripts"),
   };
 }
 

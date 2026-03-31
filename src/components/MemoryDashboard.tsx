@@ -215,7 +215,7 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
             <input
               value={settings.memory_cards_dir}
               onChange={(e) => setSettings({ ...settings, memory_cards_dir: e.target.value })}
-              placeholder="../agent-memory/cards"
+              placeholder="../agent-memory/archive/v2/cards"
               className="bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
@@ -224,7 +224,7 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
             <input
               value={settings.shared_memory_path}
               onChange={(e) => setSettings({ ...settings, shared_memory_path: e.target.value })}
-              placeholder="../agent-memory/shared-memory.md"
+              placeholder="../agent-memory/central/short-term/agent-os.md"
               className="bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
@@ -233,7 +233,7 @@ export default function MemoryDashboard({ projectId }: MemoryDashboardProps) {
             <input
               value={settings.butler_scripts_dir}
               onChange={(e) => setSettings({ ...settings, butler_scripts_dir: e.target.value })}
-              placeholder="../agent-memory/bin"
+              placeholder="../agent-memory/scripts"
               className="bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
