@@ -4,6 +4,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import TerminalPanel from "./TerminalPanel";
 import TerminalGrid from "./TerminalGrid";
 import PanelHeader from "./PanelHeader";
+import ChatPanel from "./ChatPanel";
 
 const MIN_SIZE = 150; // px
 const DIVIDER = 4; // px
@@ -119,9 +120,9 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
 
       {/* Panel 3: Chat placeholder — bottom-left */}
       <div className="flex flex-col overflow-hidden">
-        <PanelHeader label="Panel 3" />
-        <div className="flex-1 min-h-0 flex items-center justify-center">
-          <span className="text-xs text-text-muted">Chat — #8</span>
+        <PanelHeader label="Chat" />
+        <div className="flex-1 min-h-0">
+          <ChatPanel />
         </div>
       </div>
 
