@@ -15,6 +15,7 @@ function renderMarkdown(md: string): string {
     .replace(/^- (.+)$/gm, '<div class="pl-4 text-text-muted">– $1</div>')
     .replace(/\*\*(.+?)\*\*/g, '<strong class="text-text">$1</strong>')
     .replace(/`([^`]+)`/g, '<code class="text-accent text-[11px] bg-bg px-1">$1</code>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" class="text-accent hover:underline">$1</a>')
     .replace(/\n\n/g, '<div class="h-2"></div>')
     .replace(/\n/g, "<br>");
 }
@@ -46,7 +47,7 @@ function generateTemplate(issues: Issue[], repo: string): string {
   ];
 
   issues.forEach((issue, i) => {
-    lines.push(`${i + 1}. #${issue.number} — ${issue.title} (task/${issue.number}-slug)`);
+    lines.push(`${i + 1}. [${repo}#${issue.number}](https://github.com/${repo}/issues/${issue.number}) — ${issue.title} (task/${issue.number}-slug)`);
   });
 
   lines.push("");
@@ -138,22 +139,42 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       if (!cfgRes.ok) throw new Error("config");
       const cfg = await cfgRes.json();
       const port = cfg.port || 3001;
+      const backendUrl = `http://127.0.0.1:${port}`;
 
-      const res = await fetch(`http://127.0.0.1:${port}/api/agents/${projectId}/t1/write`, {
+      // Try to write directly first
+      let res = await fetch(`${backendUrl}/api/agents/${projectId}/t1/write`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: prompt + "\n" }),
       });
+
+      // If no session exists, create one by opening a WebSocket connection
+      if (res.status === 404) {
+        const wsUrl = `ws://127.0.0.1:${port}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=t1`;
+        const ws = new WebSocket(wsUrl);
+        await new Promise<void>((resolve, reject) => {
+          ws.onopen = () => resolve();
+          ws.onerror = () => reject(new Error("WebSocket failed"));
+          setTimeout(() => reject(new Error("WebSocket timeout")), 5000);
+        });
+
+        // Wait for PTY to initialize
+        await new Promise((r) => setTimeout(r, 1000));
+
+        // Retry write
+        res = await fetch(`${backendUrl}/api/agents/${projectId}/t1/write`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: prompt + "\n" }),
+        });
+      }
+
       if (res.ok) {
         setSent(true);
         setTimeout(() => setSent(false), 3000);
       } else {
         const err = await res.json().catch(() => ({}));
-        if (res.status === 404) {
-          alert("No active T1 terminal session. Open the project dashboard first and ensure T1's terminal is connected, then try again.");
-        } else {
-          alert(`Send failed: ${err.error || res.status}`);
-        }
+        alert(`Send failed: ${err.error || res.status}`);
       }
     } catch {
       await copyPrompt();
