@@ -104,9 +104,12 @@ export default function Sidebar() {
 
   useEffect(() => {
     fetch("/api/config")
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`Config fetch failed: ${r.status}`);
+        return r.json();
+      })
       .then((cfg) => setProjects(cfg.projects || []))
-      .catch(() => {});
+      .catch((err) => console.error(err.message));
   }, []);
 
   const isHome = pathname === "/";
