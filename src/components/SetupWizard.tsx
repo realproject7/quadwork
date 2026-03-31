@@ -180,12 +180,23 @@ export default function SetupWizard() {
           {step?.id === "protection" && (
             <div>
               <h2 className="text-sm font-semibold text-text mb-3">Branch Protection</h2>
-              <p className="text-[11px] text-text-muted mb-3">Ensure branch protection is configured on <code className="text-accent">main</code>:</p>
-              <div className="border border-border bg-bg-surface p-3 mb-3 text-[11px] text-text space-y-1">
-                <p>1. Go to GitHub → Settings → Branches → Add rule for <code className="text-accent">main</code></p>
-                <p>2. Enable &quot;Require pull request reviews before merging&quot;</p>
-                <p>3. Set required approvals to 1</p>
-                <p>4. Add reviewer account as collaborator with write access</p>
+              <p className="text-[11px] text-text-muted mb-3">Configure branch protection on <code className="text-accent">main</code>. Run these commands or configure via GitHub UI:</p>
+              <div className="border border-border bg-bg-surface p-3 mb-3 text-[11px] space-y-2">
+                <div>
+                  <p className="text-text-muted mb-1">Enable branch protection via gh CLI:</p>
+                  <div className="flex items-center gap-2">
+                    <code className="text-accent flex-1 select-all">{`gh api repos/${repo}/branches/main/protection -X PUT -f "required_pull_request_reviews[required_approving_review_count]=1" -f "enforce_admins=false" -f "required_status_checks=null" -f "restrictions=null"`}</code>
+                    <button onClick={() => navigator.clipboard.writeText(`gh api repos/${repo}/branches/main/protection -X PUT -f "required_pull_request_reviews[required_approving_review_count]=1" -f "enforce_admins=false" -f "required_status_checks=null" -f "restrictions=null"`)} className="text-[10px] text-text-muted hover:text-accent shrink-0">copy</button>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-text-muted mb-1">Or manually in GitHub UI:</p>
+                  <div className="flex items-center gap-2">
+                    <code className="text-accent flex-1 select-all">{`https://github.com/${repo}/settings/branches`}</code>
+                    <button onClick={() => navigator.clipboard.writeText(`https://github.com/${repo}/settings/branches`)} className="text-[10px] text-text-muted hover:text-accent shrink-0">copy</button>
+                  </div>
+                  <p className="text-text mt-1">→ Add rule for &quot;main&quot; → Require 1 approval → Save</p>
+                </div>
               </div>
               <div className="flex gap-2">
                 <button onClick={goNext} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors">
@@ -269,7 +280,7 @@ export default function SetupWizard() {
               <div className="flex gap-2">
                 <button
                   onClick={async () => {
-                    const result = await apiCall("agentchattr-config", { workingDir, projectName, repo });
+                    const result = await apiCall("agentchattr-config", { workingDir, projectName, repo, backend });
                     if (result.ok) goNext();
                     else updateStep(currentStep, { status: "error", error: result.error });
                   }}

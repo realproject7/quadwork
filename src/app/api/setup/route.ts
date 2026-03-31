@@ -29,7 +29,7 @@ export async function POST(req: NextRequest) {
     case "seed-files":
       return seedFiles(body.workingDir, body.projectName, body.repo);
     case "agentchattr-config":
-      return updateAgentChattr(body.workingDir, body.projectName);
+      return updateAgentChattr(body.workingDir, body.projectName, body.backend);
     case "add-config":
       return addConfig(body);
     default:
@@ -108,7 +108,7 @@ function seedFiles(workingDir: string, projectName: string, repo: string) {
   return NextResponse.json({ ok: true, seeded });
 }
 
-function updateAgentChattr(workingDir: string, projectName: string) {
+function updateAgentChattr(workingDir: string, projectName: string, backend?: string) {
   if (!workingDir) return NextResponse.json({ ok: false, error: "Missing working directory" });
 
   // Find AgentChattr config.toml
@@ -132,7 +132,7 @@ function updateAgentChattr(workingDir: string, projectName: string) {
     let content = `[meta]\nname = "${projectName}"\n\n`;
 
     agents.forEach((agent, i) => {
-      content += `[agents.${agent}]\ncommand = "claude"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
+      content += `[agents.${agent}]\ncommand = "${backend || "claude"}"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
     });
 
     fs.writeFileSync(tomlPath, content);
@@ -145,7 +145,7 @@ function updateAgentChattr(workingDir: string, projectName: string) {
 
     agents.forEach((agent, i) => {
       if (!content.includes(`[agents.${agent}]`)) {
-        content += `\n[agents.${agent}]\ncommand = "claude"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n`;
+        content += `\n[agents.${agent}]\ncommand = "${backend || "claude"}"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n`;
       }
     });
 
