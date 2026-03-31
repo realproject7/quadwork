@@ -106,10 +106,13 @@ export default function HomeDashboard() {
           </Link>
         ))}
 
-        {/* + New Project placeholder */}
-        <button className="border border-dashed border-border p-4 flex items-center justify-center text-text-muted hover:text-text hover:border-text-muted transition-colors min-h-[88px]">
+        {/* + New Project */}
+        <Link
+          href="/settings?add=true"
+          className="border border-dashed border-border p-4 flex items-center justify-center text-text-muted hover:text-text hover:border-text-muted transition-colors min-h-[88px]"
+        >
           <span className="text-sm">+ New Project</span>
-        </button>
+        </Link>
       </div>
 
       {/* Activity feed */}

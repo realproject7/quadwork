@@ -1,17 +1,21 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { useSearchParams } from "next/navigation";
 
 interface AgentConfig {
+  display_name: string;
   command: string;
   cwd: string;
   model: string;
+  agents_md: string;
 }
 
 interface TelegramConfig {
   enabled: boolean;
   bot_token: string;
   chat_id: string;
+  status?: string;
 }
 
 interface ProjectConfig {
@@ -32,10 +36,10 @@ interface Config {
 }
 
 const DEFAULT_AGENTS: Record<string, AgentConfig> = {
-  t1: { command: "claude", cwd: "", model: "opus" },
-  t2a: { command: "claude", cwd: "", model: "sonnet" },
-  t2b: { command: "claude", cwd: "", model: "sonnet" },
-  t3: { command: "claude", cwd: "", model: "sonnet" },
+  t1: { display_name: "T1", command: "claude", cwd: "", model: "opus", agents_md: "" },
+  t2a: { display_name: "T2a", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
+  t2b: { display_name: "T2b", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
+  t3: { display_name: "T3", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
 };
 
 const BACKENDS = ["claude-code", "codex"];
@@ -85,11 +89,13 @@ function Select({ label, value, onChange, options }: {
 }
 
 export default function SettingsPage() {
+  const searchParams = useSearchParams();
   const [config, setConfig] = useState<Config | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [autoAdded, setAutoAdded] = useState(false);
 
   const load = useCallback(() => {
     fetch("/api/config")
@@ -108,6 +114,14 @@ export default function SettingsPage() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  // Auto-add project when navigated with ?add=true
+  useEffect(() => {
+    if (config && searchParams.get("add") === "true" && !autoAdded) {
+      setAutoAdded(true);
+      addProject();
+    }
+  }, [config, searchParams, autoAdded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const save = async () => {
     if (!config) return;
@@ -265,39 +279,63 @@ export default function SettingsPage() {
                   <div className="mt-4">
                     <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Agents</h3>
                     <div className="border border-border">
-                      <div className="grid grid-cols-4 gap-0 px-2 py-1 border-b border-border text-[10px] text-text-muted uppercase">
-                        <span>Agent</span>
+                      <div className="grid grid-cols-5 gap-0 px-2 py-1 border-b border-border text-[10px] text-text-muted uppercase">
+                        <span>Name</span>
                         <span>Command</span>
                         <span>Model</span>
                         <span>CWD</span>
+                        <span>AGENTS.md</span>
                       </div>
                       {Object.entries(project.agents || {}).map(([agentId, agent]) => (
-                        <div key={agentId} className="grid grid-cols-4 gap-0 px-2 py-1 border-b border-border/50 last:border-b-0">
-                          <span className="text-[11px] text-text font-semibold self-center">{agentId}</span>
-                          <select
-                            value={agent.command || "claude"}
-                            onChange={(e) => updateAgent(idx, agentId, { command: e.target.value })}
-                            className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
-                          >
-                            {BACKENDS.map((b) => (
-                              <option key={b} value={b} className="bg-bg-surface">{b}</option>
-                            ))}
-                          </select>
-                          <select
-                            value={agent.model || "sonnet"}
-                            onChange={(e) => updateAgent(idx, agentId, { model: e.target.value })}
-                            className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
-                          >
-                            {MODELS.map((m) => (
-                              <option key={m} value={m} className="bg-bg-surface">{m}</option>
-                            ))}
-                          </select>
-                          <input
-                            value={agent.cwd || ""}
-                            onChange={(e) => updateAgent(idx, agentId, { cwd: e.target.value })}
-                            placeholder="/path/to/worktree"
-                            className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
-                          />
+                        <div key={agentId} className="border-b border-border/50 last:border-b-0">
+                          <div className="grid grid-cols-5 gap-0 px-2 py-1">
+                            <input
+                              value={agent.display_name || agentId.toUpperCase()}
+                              onChange={(e) => updateAgent(idx, agentId, { display_name: e.target.value })}
+                              className="bg-transparent text-[11px] text-text font-semibold outline-none border border-border px-1 py-0.5 focus:border-accent"
+                            />
+                            <select
+                              value={agent.command || "claude"}
+                              onChange={(e) => updateAgent(idx, agentId, { command: e.target.value })}
+                              className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
+                            >
+                              {BACKENDS.map((b) => (
+                                <option key={b} value={b} className="bg-bg-surface">{b}</option>
+                              ))}
+                            </select>
+                            <select
+                              value={agent.model || "sonnet"}
+                              onChange={(e) => updateAgent(idx, agentId, { model: e.target.value })}
+                              className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
+                            >
+                              {MODELS.map((m) => (
+                                <option key={m} value={m} className="bg-bg-surface">{m}</option>
+                              ))}
+                            </select>
+                            <input
+                              value={agent.cwd || ""}
+                              onChange={(e) => updateAgent(idx, agentId, { cwd: e.target.value })}
+                              placeholder="/path/to/worktree"
+                              className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
+                            />
+                            <button
+                              onClick={() => setExpanded({ ...expanded, [`${project.id}-${agentId}-md`]: !expanded[`${project.id}-${agentId}-md`] })}
+                              className="text-[10px] text-text-muted hover:text-accent transition-colors text-left px-1"
+                            >
+                              {expanded[`${project.id}-${agentId}-md`] ? "▾ edit" : "▸ edit"}
+                            </button>
+                          </div>
+                          {expanded[`${project.id}-${agentId}-md`] && (
+                            <div className="px-2 pb-2">
+                              <textarea
+                                value={agent.agents_md || ""}
+                                onChange={(e) => updateAgent(idx, agentId, { agents_md: e.target.value })}
+                                placeholder="# AGENTS.md seed content for this agent..."
+                                rows={8}
+                                className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent resize-y"
+                              />
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -323,7 +361,7 @@ export default function SettingsPage() {
                         <span className="text-[11px] text-text">{telegram.enabled ? "Enabled" : "Disabled"}</span>
                         <span className={`w-1.5 h-1.5 rounded-full ${telegram.enabled ? "bg-accent" : "bg-text-muted"}`} />
                       </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
                         <Input
                           label="Bot Token"
                           value={telegram.bot_token}
@@ -337,6 +375,57 @@ export default function SettingsPage() {
                           onChange={(v) => updateTelegram(idx, { chat_id: v })}
                           placeholder="-1001234567890"
                         />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => {
+                            fetch("/api/telegram?action=test", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ bot_token: telegram.bot_token, chat_id: telegram.chat_id }),
+                            })
+                              .then((r) => r.json())
+                              .then((d) => alert(d.ok ? "Connection OK" : `Error: ${d.error}`))
+                              .catch(() => alert("Test failed"));
+                          }}
+                          className="px-2 py-1 text-[11px] border border-border text-text-muted hover:text-text hover:border-accent transition-colors"
+                        >
+                          Test Connection
+                        </button>
+                        <button
+                          onClick={() => {
+                            fetch("/api/telegram?action=install", { method: "POST" })
+                              .then((r) => r.json())
+                              .then((d) => alert(d.ok ? "Installed" : `Error: ${d.error}`))
+                              .catch(() => alert("Install failed"));
+                          }}
+                          className="px-2 py-1 text-[11px] border border-border text-text-muted hover:text-text hover:border-accent transition-colors"
+                        >
+                          Install Bridge
+                        </button>
+                        <button
+                          onClick={() => {
+                            const action = telegram.enabled ? "stop" : "start";
+                            fetch(`/api/telegram?action=${action}`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ project_id: project.id }),
+                            })
+                              .then((r) => r.json())
+                              .then((d) => {
+                                if (d.ok) updateTelegram(idx, { enabled: action === "start", status: action === "start" ? "running" : "stopped" });
+                                else alert(`Error: ${d.error}`);
+                              })
+                              .catch(() => alert(`${action} failed`));
+                          }}
+                          className={`px-2 py-1 text-[11px] border border-border transition-colors ${
+                            telegram.enabled
+                              ? "text-error hover:border-error"
+                              : "text-accent hover:border-accent"
+                          }`}
+                        >
+                          {telegram.enabled ? "Stop Daemon" : "Start Daemon"}
+                        </button>
                       </div>
                     </div>
                   </div>
