@@ -362,9 +362,23 @@ export default function SettingsPage() {
                     <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Telegram Bridge</h3>
                     <div className="border border-border p-3">
                       <div className="flex items-center gap-3 mb-3">
+                        <button
+                          onClick={() => updateTelegram(idx, { enabled: !telegram.enabled })}
+                          className={`w-8 h-4 rounded-full transition-colors relative ${
+                            telegram.enabled ? "bg-accent" : "bg-border"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 w-3 h-3 rounded-full bg-text transition-transform ${
+                              telegram.enabled ? "left-4" : "left-0.5"
+                            }`}
+                          />
+                        </button>
+                        <span className="text-[11px] text-text">{telegram.enabled ? "Enabled" : "Disabled"}</span>
+                        <span className="text-[11px] text-text-muted">·</span>
                         <span className={`w-1.5 h-1.5 rounded-full ${daemonStatus[project.id] ? "bg-accent" : "bg-text-muted"}`} />
-                        <span className="text-[11px] text-text">
-                          {daemonStatus[project.id] ? "Running" : "Stopped"}
+                        <span className="text-[11px] text-text-muted">
+                          {daemonStatus[project.id] ? "running" : "stopped"}
                         </span>
                       </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
