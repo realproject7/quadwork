@@ -11,6 +11,23 @@ const DEFAULT_CONFIG = {
   projects: [],
 };
 
+export async function PUT(req: Request) {
+  try {
+    const body = await req.json();
+    const dir = path.dirname(CONFIG_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(body, null, 2));
+    return NextResponse.json({ ok: true });
+  } catch (err: unknown) {
+    return NextResponse.json(
+      { error: "Failed to write config", detail: err instanceof Error ? err.message : String(err) },
+      { status: 500 }
+    );
+  }
+}
+
 export async function GET() {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
