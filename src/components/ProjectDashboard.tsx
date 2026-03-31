@@ -10,16 +10,44 @@ import GitHubPanel from "./GitHubPanel";
 const MIN_SIZE = 150; // px
 const DIVIDER = 4; // px
 
+type AgentState = "running" | "stopped" | "error";
+
 interface ProjectDashboardProps {
   projectId: string;
 }
 
 export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  // Ratios: 0–1, where colRatio is left column width fraction, rowRatio is top row height fraction
   const [colRatio, setColRatio] = useState(0.5);
   const [rowRatio, setRowRatio] = useState(0.5);
   const dragging = useRef<"col" | "row" | null>(null);
+  const [agentStates, setAgentStates] = useState<Record<string, AgentState>>({});
+
+  // Poll agent states
+  useEffect(() => {
+    const poll = () => {
+      fetch("/api/agents")
+        .then((r) => r.ok ? r.json() : {})
+        .then((data) => {
+          const states: Record<string, AgentState> = {};
+          for (const [key, info] of Object.entries(data)) {
+            if (key.startsWith(`${projectId}/`)) {
+              const agent = key.split("/")[1];
+              states[agent] = (info as { state: string }).state as AgentState;
+            }
+          }
+          setAgentStates(states);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const interval = setInterval(poll, 5000);
+    return () => clearInterval(interval);
+  }, [projectId]);
+
+  const updateAgentState = (agent: string, state: string) => {
+    setAgentStates((prev) => ({ ...prev, [agent]: state as AgentState }));
+  };
 
   const clamp = useCallback(
     (ratio: number, totalPx: number) => {
@@ -81,7 +109,13 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     >
       {/* Panel 1: T1 Terminal — top-left */}
       <div className="flex flex-col overflow-hidden">
-        <PanelHeader label="T1" status="running" />
+        <PanelHeader
+          label="T1"
+          status={agentStates["t1"] || "stopped"}
+          projectId={projectId}
+          agentId="t1"
+          onStatusChange={(s) => updateAgentState("t1", s)}
+        />
         <div className="flex-1 min-h-0">
           <TerminalPanel projectId={projectId} agentId="t1" />
         </div>
@@ -137,7 +171,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       <div className="flex flex-col overflow-hidden">
         <PanelHeader label="Panel 4" />
         <div className="flex-1 min-h-0">
-          <TerminalGrid projectId={projectId} />
+          <TerminalGrid
+            projectId={projectId}
+            agentStates={agentStates}
+            onStatusChange={updateAgentState}
+          />
         </div>
       </div>
     </div>
