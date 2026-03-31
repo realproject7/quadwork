@@ -35,7 +35,9 @@ export default function SetupWizard() {
   // Form state
   const [projectName, setProjectName] = useState("");
   const [repo, setRepo] = useState("");
-  const [backend, setBackend] = useState("claude-code");
+  const [backends, setBackends] = useState<Record<string, string>>({
+    t1: "claude-code", t2a: "claude-code", t2b: "claude-code", t3: "claude-code",
+  });
   const [workingDir, setWorkingDir] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -104,7 +106,7 @@ export default function SetupWizard() {
 
   const saveConfig = async () => {
     const id = projectName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
-    const result = await apiCall("add-config", { id, name: projectName, repo, workingDir, backend });
+    const result = await apiCall("add-config", { id, name: projectName, repo, workingDir, backends });
     if (result.ok) {
       updateStep(currentStep, { status: "done" });
       setTimeout(() => router.push(`/project/${id}`), 500);
@@ -197,6 +199,13 @@ export default function SetupWizard() {
                   </div>
                   <p className="text-text mt-1">→ Add rule for &quot;main&quot; → Require 1 approval → Save</p>
                 </div>
+                <div>
+                  <p className="text-text-muted mb-1">Add reviewer as collaborator (replace USERNAME):</p>
+                  <div className="flex items-center gap-2">
+                    <code className="text-accent flex-1 select-all">{`gh api repos/${repo}/collaborators/USERNAME -X PUT -f permission=push`}</code>
+                    <button onClick={() => navigator.clipboard.writeText(`gh api repos/${repo}/collaborators/USERNAME -X PUT -f permission=push`)} className="text-[10px] text-text-muted hover:text-accent shrink-0">copy</button>
+                  </div>
+                </div>
               </div>
               <div className="flex gap-2">
                 <button onClick={goNext} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors">
@@ -211,14 +220,22 @@ export default function SetupWizard() {
 
           {step?.id === "backend" && (
             <div>
-              <h2 className="text-sm font-semibold text-text mb-3">CLI Backend</h2>
-              <select
-                value={backend}
-                onChange={(e) => setBackend(e.target.value)}
-                className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-3 cursor-pointer"
-              >
-                {BACKENDS.map((b) => <option key={b} value={b} className="bg-bg-surface">{b}</option>)}
-              </select>
+              <h2 className="text-sm font-semibold text-text mb-3">CLI Backend per Agent</h2>
+              <div className="border border-border mb-3">
+                {["t1", "t2a", "t2b", "t3"].map((agent) => (
+                  <div key={agent} className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 last:border-b-0">
+                    <span className="text-[11px] text-text font-semibold w-10">{agent.toUpperCase()}</span>
+                    <span className="text-[10px] text-text-muted w-16">{agent === "t1" ? "Owner" : agent.startsWith("t2") ? "Reviewer" : "Builder"}</span>
+                    <select
+                      value={backends[agent]}
+                      onChange={(e) => setBackends({ ...backends, [agent]: e.target.value })}
+                      className="bg-transparent border border-border px-2 py-0.5 text-[11px] text-text outline-none focus:border-accent cursor-pointer"
+                    >
+                      {BACKENDS.map((b) => <option key={b} value={b} className="bg-bg-surface">{b}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
               <button onClick={goNext} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors">
                 Next
               </button>
@@ -280,7 +297,7 @@ export default function SetupWizard() {
               <div className="flex gap-2">
                 <button
                   onClick={async () => {
-                    const result = await apiCall("agentchattr-config", { workingDir, projectName, repo, backend });
+                    const result = await apiCall("agentchattr-config", { workingDir, projectName, repo, backends });
                     if (result.ok) goNext();
                     else updateStep(currentStep, { status: "error", error: result.error });
                   }}
@@ -302,7 +319,7 @@ export default function SetupWizard() {
               <div className="border border-border bg-bg-surface p-3 mb-3 text-[11px] text-text space-y-1">
                 <p><strong>Name:</strong> {projectName}</p>
                 <p><strong>Repo:</strong> {repo}</p>
-                <p><strong>Backend:</strong> {backend}</p>
+                <p><strong>Backends:</strong> {Object.entries(backends).map(([a, b]) => `${a.toUpperCase()}=${b}`).join(", ")}</p>
                 <p><strong>Directory:</strong> {workingDir}</p>
                 <p><strong>Agents:</strong> T1, T2a, T2b, T3</p>
               </div>

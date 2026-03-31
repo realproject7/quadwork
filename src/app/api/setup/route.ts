@@ -29,7 +29,7 @@ export async function POST(req: NextRequest) {
     case "seed-files":
       return seedFiles(body.workingDir, body.projectName, body.repo);
     case "agentchattr-config":
-      return updateAgentChattr(body.workingDir, body.projectName, body.backend);
+      return updateAgentChattr(body.workingDir, body.projectName, body.backends);
     case "add-config":
       return addConfig(body);
     default:
@@ -108,7 +108,7 @@ function seedFiles(workingDir: string, projectName: string, repo: string) {
   return NextResponse.json({ ok: true, seeded });
 }
 
-function updateAgentChattr(workingDir: string, projectName: string, backend?: string) {
+function updateAgentChattr(workingDir: string, projectName: string, backends?: Record<string, string>) {
   if (!workingDir) return NextResponse.json({ ok: false, error: "Missing working directory" });
 
   // Find AgentChattr config.toml
@@ -132,7 +132,7 @@ function updateAgentChattr(workingDir: string, projectName: string, backend?: st
     let content = `[meta]\nname = "${projectName}"\n\n`;
 
     agents.forEach((agent, i) => {
-      content += `[agents.${agent}]\ncommand = "${backend || "claude"}"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
+      content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
     });
 
     fs.writeFileSync(tomlPath, content);
@@ -145,7 +145,7 @@ function updateAgentChattr(workingDir: string, projectName: string, backend?: st
 
     agents.forEach((agent, i) => {
       if (!content.includes(`[agents.${agent}]`)) {
-        content += `\n[agents.${agent}]\ncommand = "${backend || "claude"}"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n`;
+        content += `\n[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${path.join(workingDir, agent)}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n`;
       }
     });
 
@@ -162,8 +162,8 @@ function updateAgentChattr(workingDir: string, projectName: string, backend?: st
   return NextResponse.json({ ok: true, path: tomlPath });
 }
 
-function addConfig(body: { id: string; name: string; repo: string; workingDir: string; backend: string }) {
-  const { id, name, repo, workingDir, backend } = body;
+function addConfig(body: { id: string; name: string; repo: string; workingDir: string; backends?: Record<string, string> }) {
+  const { id, name, repo, workingDir, backends } = body;
 
   let cfg;
   try {
@@ -181,7 +181,7 @@ function addConfig(body: { id: string; name: string; repo: string; workingDir: s
   for (const [agentId, role] of [["t1", "opus"], ["t2a", "sonnet"], ["t2b", "sonnet"], ["t3", "sonnet"]]) {
     agents[agentId] = {
       display_name: agentId.toUpperCase(),
-      command: backend || "claude",
+      command: (backends && backends[agentId]) || "claude",
       cwd: path.join(workingDir, agentId),
       model: role,
       agents_md: "",
