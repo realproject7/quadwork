@@ -80,9 +80,22 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // Propagate to AgentChattr config.toml
-      const tomlPath = path.join(os.homedir(), ".quadwork", `telegram-${projectId}.toml`);
-      if (replaceInFile(tomlPath, oldDisplayName, newName)) changes.push("config.toml");
+      // Propagate to AgentChattr config.toml (in working_dir or parent agentchattr dir)
+      // AgentChattr config.toml has [agents.X] sections with label = "Display Name"
+      if (workDir) {
+        // Try common AgentChattr config.toml locations
+        const tomlPaths = [
+          path.join(workDir, "agentchattr", "config.toml"),
+          path.join(workDir, "..", "agentchattr", "config.toml"),
+          path.join(workDir, "config.toml"),
+        ];
+        for (const tomlPath of tomlPaths) {
+          if (replaceInFile(tomlPath, `label = "${oldDisplayName}`, `label = "${newName}`)) {
+            changes.push("agentchattr/config.toml");
+            break;
+          }
+        }
+      }
 
       // Propagate to CLAUDE.md in working directory
       if (workDir) {
