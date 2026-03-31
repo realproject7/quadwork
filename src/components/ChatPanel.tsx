@@ -61,7 +61,10 @@ export default function ChatPanel() {
   // Poll messages via proxy
   const fetchMessages = useCallback(() => {
     fetch(`/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}`)
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`Poll failed: ${r.status}`);
+        return r.json();
+      })
       .then((data) => {
         const msgs: Message[] = Array.isArray(data) ? data : data.messages || [];
         if (msgs.length > 0) {
@@ -105,12 +108,12 @@ export default function ChatPanel() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, channel, sender: "user" }),
     })
-      .then(() => {
+      .then((r) => {
+        if (!r.ok) throw new Error(`Send failed: ${r.status}`);
         setInput("");
-        // Immediate poll for the sent message
         setTimeout(fetchMessages, 300);
       })
-      .catch(() => {});
+      .catch((err) => console.error(err.message));
   };
 
   // @mention handling

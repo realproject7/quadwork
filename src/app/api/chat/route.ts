@@ -5,51 +5,34 @@ import os from "os";
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 
-function getChattrUrl(): string {
+interface ChattrConfig {
+  url: string;
+  token: string | null;
+}
+
+function getChattrConfig(): ChattrConfig {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
     const cfg = JSON.parse(raw);
-    return cfg.agentchattr_url || "http://127.0.0.1:8300";
+    return {
+      url: cfg.agentchattr_url || "http://127.0.0.1:8300",
+      token: cfg.agentchattr_token || null,
+    };
   } catch {
-    return "http://127.0.0.1:8300";
+    return { url: "http://127.0.0.1:8300", token: null };
   }
-}
-
-// Cached bearer token from agent registration
-let cachedToken: string | null = null;
-
-async function getToken(): Promise<string | null> {
-  if (cachedToken) return cachedToken;
-
-  const base = getChattrUrl();
-  try {
-    const res = await fetch(`${base}/api/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ base: "quadwork-ui", label: "QuadWork Dashboard" }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      cachedToken = data.token || null;
-      return cachedToken;
-    }
-  } catch {
-    // Registration failed — server may not require auth
-  }
-  return null;
 }
 
 function authHeaders(token: string | null): Record<string, string> {
   if (!token) return {};
-  return { Authorization: `Bearer ${token}` };
+  return { "x-session-token": token };
 }
 
 // Proxy GET requests: /api/chat?path=/api/messages&channel=general&cursor=0
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
   const apiPath = searchParams.get("path") || "/api/messages";
-  const base = getChattrUrl();
-  const token = await getToken();
+  const { url: base, token } = getChattrConfig();
 
   // Forward all query params except "path"
   const fwd = new URLSearchParams();
@@ -62,20 +45,6 @@ export async function GET(req: NextRequest) {
   try {
     const res = await fetch(url, { headers: authHeaders(token) });
     if (!res.ok) {
-      // Token may have expired — clear cache and retry once
-      if (res.status === 403 && cachedToken) {
-        cachedToken = null;
-        const newToken = await getToken();
-        const retry = await fetch(url, { headers: authHeaders(newToken) });
-        if (!retry.ok) {
-          return NextResponse.json(
-            { error: `AgentChattr returned ${retry.status}` },
-            { status: retry.status }
-          );
-        }
-        const data = await retry.json();
-        return NextResponse.json(data);
-      }
       return NextResponse.json(
         { error: `AgentChattr returned ${res.status}` },
         { status: res.status }
@@ -91,10 +60,9 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// Proxy POST requests: /api/chat (body forwarded as-is)
+// Proxy POST requests: /api/chat (body forwarded as-is to /api/send)
 export async function POST(req: NextRequest) {
-  const base = getChattrUrl();
-  const token = await getToken();
+  const { url: base, token } = getChattrConfig();
   const body = await req.json();
 
   try {
@@ -104,24 +72,6 @@ export async function POST(req: NextRequest) {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      // Token may have expired — clear cache and retry once
-      if (res.status === 403 && cachedToken) {
-        cachedToken = null;
-        const newToken = await getToken();
-        const retry = await fetch(`${base}/api/send`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...authHeaders(newToken) },
-          body: JSON.stringify(body),
-        });
-        if (!retry.ok) {
-          return NextResponse.json(
-            { error: `AgentChattr returned ${retry.status}` },
-            { status: retry.status }
-          );
-        }
-        const data = await retry.json();
-        return NextResponse.json(data);
-      }
       return NextResponse.json(
         { error: `AgentChattr returned ${res.status}` },
         { status: res.status }
