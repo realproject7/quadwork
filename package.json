@@ -12,7 +12,7 @@
   "dependencies": {
     "express": "^5.2.1",
     "next": "16.2.1",
-    "node-pty": "^1.1.0",
+    "node-pty": "^1.2.0-beta.12",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "ws": "^8.20.0"
