@@ -280,15 +280,27 @@ async function sendTriggerMessage(projectId) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers["x-session-token"] = token;
 
+  const info = triggers.get(projectId);
   try {
-    await fetch(`${chattrUrl}/api/send`, {
+    // Try with session token header
+    let tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
+    const res = await fetch(`${chattrUrl}/api/send${tokenParam}`, {
       method: "POST",
       headers,
       body: JSON.stringify({ text: message, channel: "general", sender: "user" }),
     });
-  } catch {}
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      console.error(`Trigger send failed for ${projectId}: ${res.status} ${err}`);
+      if (info) info.lastError = `${res.status}: ${err.slice(0, 100)}`;
+    } else {
+      if (info) info.lastError = null;
+    }
+  } catch (err) {
+    console.error(`Trigger send error for ${projectId}:`, err.message);
+    if (info) info.lastError = err.message;
+  }
 
-  const info = triggers.get(projectId);
   if (info) {
     info.lastSent = Date.now();
     info.nextAt = Date.now() + info.interval;
@@ -303,6 +315,7 @@ app.get("/api/triggers", (_req, res) => {
       interval: info.interval,
       lastSent: info.lastSent,
       nextAt: info.nextAt,
+      lastError: info.lastError || null,
     };
   }
   res.json(result);

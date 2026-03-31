@@ -25,6 +25,7 @@ interface ProjectConfig {
   working_dir: string;
   agents: Record<string, AgentConfig>;
   telegram?: TelegramConfig;
+  trigger_enabled?: boolean;
   trigger_interval?: number;
   trigger_message?: string;
 }
@@ -363,6 +364,21 @@ export default function SettingsPage() {
                   <div className="mt-4">
                     <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Scheduled Trigger</h3>
                     <div className="border border-border p-3">
+                      <div className="flex items-center gap-3 mb-3">
+                        <button
+                          onClick={() => updateProject(idx, { trigger_enabled: !project.trigger_enabled } as Partial<ProjectConfig>)}
+                          className={`w-8 h-4 rounded-full transition-colors relative ${
+                            project.trigger_enabled ? "bg-accent" : "bg-border"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 w-3 h-3 rounded-full bg-text transition-transform ${
+                              project.trigger_enabled ? "left-4" : "left-0.5"
+                            }`}
+                          />
+                        </button>
+                        <span className="text-[11px] text-text">{project.trigger_enabled ? "Enabled" : "Disabled"}</span>
+                      </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
                         <Input
                           label="Interval (minutes)"
