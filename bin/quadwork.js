@@ -485,8 +485,24 @@ function cmdStart() {
     process.exit(1);
   }
 
+  const quadworkDir = path.join(__dirname, "..");
+
+  // Start Next.js frontend
+  log("Starting Next.js frontend...");
+  const frontend = spawn("npx", ["next", "start"], {
+    stdio: "ignore",
+    detached: true,
+    cwd: quadworkDir,
+    env: { ...process.env },
+  });
+  frontend.unref();
+  if (frontend.pid) {
+    ok(`Frontend started (PID: ${frontend.pid})`);
+    fs.writeFileSync(path.join(CONFIG_DIR, "frontend.pid"), String(frontend.pid));
+  }
+
   // Start QuadWork backend server
-  const serverDir = path.join(__dirname, "..", "server");
+  const serverDir = path.join(quadworkDir, "server");
   if (!fs.existsSync(path.join(serverDir, "index.js"))) {
     fail("Server not found. Run from the quadwork directory.");
     process.exit(1);
@@ -558,6 +574,7 @@ function cmdStop() {
   if (stopPid("Telegram bridge", "telegram-bridge.pid")) stopped++;
   if (stopPid("AgentChattr", "agentchattr.pid")) stopped++;
   if (stopPid("Backend server", "server.pid")) stopped++;
+  if (stopPid("Frontend", "frontend.pid")) stopped++;
 
   if (stopped === 0) warn("No running processes found");
   else ok(`Stopped ${stopped} process(es)`);
