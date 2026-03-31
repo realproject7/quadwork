@@ -15,11 +15,41 @@ function getChattrUrl(): string {
   }
 }
 
+// Cached bearer token from agent registration
+let cachedToken: string | null = null;
+
+async function getToken(): Promise<string | null> {
+  if (cachedToken) return cachedToken;
+
+  const base = getChattrUrl();
+  try {
+    const res = await fetch(`${base}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base: "quadwork-ui", label: "QuadWork Dashboard" }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      cachedToken = data.token || null;
+      return cachedToken;
+    }
+  } catch {
+    // Registration failed — server may not require auth
+  }
+  return null;
+}
+
+function authHeaders(token: string | null): Record<string, string> {
+  if (!token) return {};
+  return { Authorization: `Bearer ${token}` };
+}
+
 // Proxy GET requests: /api/chat?path=/api/messages&channel=general&cursor=0
 export async function GET(req: NextRequest) {
   const { searchParams } = req.nextUrl;
   const apiPath = searchParams.get("path") || "/api/messages";
   const base = getChattrUrl();
+  const token = await getToken();
 
   // Forward all query params except "path"
   const fwd = new URLSearchParams();
@@ -30,7 +60,27 @@ export async function GET(req: NextRequest) {
   const url = `${base}${apiPath}?${fwd.toString()}`;
 
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { headers: authHeaders(token) });
+    if (!res.ok) {
+      // Token may have expired — clear cache and retry once
+      if (res.status === 403 && cachedToken) {
+        cachedToken = null;
+        const newToken = await getToken();
+        const retry = await fetch(url, { headers: authHeaders(newToken) });
+        if (!retry.ok) {
+          return NextResponse.json(
+            { error: `AgentChattr returned ${retry.status}` },
+            { status: retry.status }
+          );
+        }
+        const data = await retry.json();
+        return NextResponse.json(data);
+      }
+      return NextResponse.json(
+        { error: `AgentChattr returned ${res.status}` },
+        { status: res.status }
+      );
+    }
     const data = await res.json();
     return NextResponse.json(data);
   } catch (err) {
@@ -44,14 +94,39 @@ export async function GET(req: NextRequest) {
 // Proxy POST requests: /api/chat (body forwarded as-is)
 export async function POST(req: NextRequest) {
   const base = getChattrUrl();
+  const token = await getToken();
   const body = await req.json();
 
   try {
     const res = await fetch(`${base}/api/send`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(token) },
       body: JSON.stringify(body),
     });
+    if (!res.ok) {
+      // Token may have expired — clear cache and retry once
+      if (res.status === 403 && cachedToken) {
+        cachedToken = null;
+        const newToken = await getToken();
+        const retry = await fetch(`${base}/api/send`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders(newToken) },
+          body: JSON.stringify(body),
+        });
+        if (!retry.ok) {
+          return NextResponse.json(
+            { error: `AgentChattr returned ${retry.status}` },
+            { status: retry.status }
+          );
+        }
+        const data = await retry.json();
+        return NextResponse.json(data);
+      }
+      return NextResponse.json(
+        { error: `AgentChattr returned ${res.status}` },
+        { status: res.status }
+      );
+    }
     const data = await res.json();
     return NextResponse.json(data);
   } catch (err) {

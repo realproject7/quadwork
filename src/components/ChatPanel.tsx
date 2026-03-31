@@ -170,6 +170,9 @@ export default function ChatPanel() {
             <span className="text-text-muted shrink-0 w-12 text-right tabular-nums">
               {msg.time?.slice(0, 5) || ""}
             </span>
+            <span className="shrink-0 text-[10px] text-text-muted border border-border px-1 rounded-sm self-start mt-0.5">
+              #{msg.channel || channel}
+            </span>
             <span
               className="shrink-0 font-semibold w-10 text-right"
               style={{ color: senderColor(msg.sender) }}
