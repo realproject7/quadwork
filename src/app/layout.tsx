@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist_Mono } from "next/font/google";
 import "./globals.css";
+import Sidebar from "@/components/Sidebar";
 
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
@@ -20,8 +21,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${geistMono.variable} h-full`}>
       <body className="h-full flex">
-        {/* Sidebar placeholder — 64px, will be built out in #4 */}
-        <aside className="w-16 shrink-0 border-r border-border bg-bg-surface" />
+        <Sidebar />
         <main className="flex-1 min-w-0 overflow-auto">{children}</main>
       </body>
     </html>
