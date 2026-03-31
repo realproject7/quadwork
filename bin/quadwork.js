@@ -302,6 +302,13 @@ async function setupAddons(rl, setup, configTomlPath) {
       const chatId = await ask(rl, "Telegram chat ID", "");
 
       if (botToken && chatId) {
+        // Persist telegram settings for writeQuadWorkConfig
+        setup.telegram = {
+          bot_token: botToken,
+          chat_id: chatId,
+          bridge_dir: telegramDir,
+        };
+
         // Append telegram section to config.toml
         const telegramSection = `
 [telegram]
@@ -409,6 +416,14 @@ function writeQuadWorkConfig(setup) {
     project.memory_cards_dir = path.join(setup.memoryDir, "archive", "v2", "cards");
     project.shared_memory_path = path.join(setup.memoryDir, "central", "short-term", `${setup.projectName}.md`);
     project.butler_scripts_dir = path.join(setup.memoryDir, "scripts");
+  }
+
+  if (setup.telegram) {
+    project.telegram = {
+      bot_token: setup.telegram.bot_token,
+      chat_id: setup.telegram.chat_id,
+      bridge_dir: setup.telegram.bridge_dir,
+    };
   }
 
   // Upsert project
