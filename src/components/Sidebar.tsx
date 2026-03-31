@@ -151,7 +151,7 @@ export default function Sidebar() {
 
         {/* Add project */}
         <Link
-          href="/settings?add=true"
+          href="/setup"
           className="w-10 h-10 flex items-center justify-center rounded-full border border-dashed border-border text-text-muted hover:text-text hover:bg-[#1a1a1a] transition-colors"
           title="Add project"
         >
