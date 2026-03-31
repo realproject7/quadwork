@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 
 interface AgentConfig {
@@ -204,36 +204,68 @@ export default function SettingsPage() {
     setExpanded({ ...expanded, [id]: true });
   };
 
+  // Track original names for debounced rename propagation
+  const originalNames = useRef<Record<string, string>>({});
+  const renameTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+
   const renameProject = (idx: number, newName: string) => {
     if (!config) return;
     const project = config.projects[idx];
-    const oldName = project.name;
-    if (oldName === newName) return;
+    const key = `project:${project.id}`;
 
-    // Propagate rename via API, then reload config to get server-side changes
-    fetch("/api/rename", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "project", projectId: project.id, oldName, newName }),
-    })
-      .then(() => load())
-      .catch(() => {});
+    // Store the original name on first edit
+    if (!(key in originalNames.current)) {
+      originalNames.current[key] = project.name;
+    }
+
+    // Update local state immediately for responsive UI
+    updateProject(idx, { name: newName });
+
+    // Debounce the API propagation (800ms after last keystroke)
+    if (renameTimers.current[key]) clearTimeout(renameTimers.current[key]);
+    renameTimers.current[key] = setTimeout(() => {
+      const oldName = originalNames.current[key];
+      if (oldName && oldName !== newName) {
+        fetch("/api/rename", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "project", projectId: project.id, oldName, newName }),
+        })
+          .then(() => load())
+          .catch(() => {});
+      }
+      delete originalNames.current[key];
+      delete renameTimers.current[key];
+    }, 800);
   };
 
   const renameAgent = (projectIdx: number, agentId: string, newName: string) => {
     if (!config) return;
     const project = config.projects[projectIdx];
     const agent = project.agents?.[agentId];
-    const oldName = agent?.display_name || agentId.toUpperCase();
-    if (oldName === newName) return;
+    const key = `agent:${project.id}:${agentId}`;
 
-    fetch("/api/rename", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "agent", projectId: project.id, agentId, oldName, newName }),
-    })
-      .then(() => load())
-      .catch(() => {});
+    if (!(key in originalNames.current)) {
+      originalNames.current[key] = agent?.display_name || agentId.toUpperCase();
+    }
+
+    updateAgent(projectIdx, agentId, { display_name: newName });
+
+    if (renameTimers.current[key]) clearTimeout(renameTimers.current[key]);
+    renameTimers.current[key] = setTimeout(() => {
+      const oldName = originalNames.current[key];
+      if (oldName && oldName !== newName) {
+        fetch("/api/rename", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "agent", projectId: project.id, agentId, oldName, newName }),
+        })
+          .then(() => load())
+          .catch(() => {});
+      }
+      delete originalNames.current[key];
+      delete renameTimers.current[key];
+    }, 800);
   };
 
   const archiveProject = (idx: number) => {
