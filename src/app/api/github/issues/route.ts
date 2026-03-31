@@ -1,17 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import os from "os";
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
+const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
 
 function getRepo(projectId: string): string | null {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
     const cfg = JSON.parse(raw);
     const project = cfg.projects?.find((p: { id: string }) => p.id === projectId);
-    return project?.repo || null;
+    const repo = project?.repo;
+    if (repo && REPO_RE.test(repo)) return repo;
+    return null;
   } catch {
     return null;
   }
@@ -26,8 +29,9 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const out = execSync(
-      `gh issue list -R ${repo} --json number,title,state,assignees,labels,createdAt,url --limit 50`,
+    const out = execFileSync(
+      "gh",
+      ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"],
       { encoding: "utf-8", timeout: 15000 }
     );
     return NextResponse.json(JSON.parse(out));
