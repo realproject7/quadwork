@@ -76,26 +76,59 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });
 }
 
+function findMdFiles(dir: string): string[] {
+  const results: string[] = [];
+  if (!fs.existsSync(dir)) return results;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...findMdFiles(full));
+    } else if (entry.name.endsWith(".md")) {
+      results.push(full);
+    }
+  }
+  return results;
+}
+
+function parseFrontmatter(content: string): Record<string, string> {
+  const fm: Record<string, string> = {};
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return fm;
+  for (const line of match[1].split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx > 0) {
+      const key = line.slice(0, idx).trim();
+      let val = line.slice(idx + 1).trim();
+      // Strip YAML array brackets for tags
+      if (val.startsWith("[") && val.endsWith("]")) val = val.slice(1, -1).trim();
+      fm[key] = val;
+    }
+  }
+  return fm;
+}
+
 function listCards(cardsDir: string, search: string) {
   try {
-    if (!fs.existsSync(cardsDir)) return NextResponse.json([]);
-    const files = fs.readdirSync(cardsDir).filter((f) => f.endsWith(".md"));
-    const cards = files.map((f) => {
-      const content = fs.readFileSync(path.join(cardsDir, f), "utf-8");
-      const lines = content.split("\n");
-      const title = lines.find((l) => l.startsWith("# "))?.replace("# ", "") || f;
-      const dateLine = lines.find((l) => /date:|created:/i.test(l));
-      const agentLine = lines.find((l) => /agent:|source:/i.test(l));
-      const tagLine = lines.find((l) => /tags:/i.test(l));
+    const files = findMdFiles(cardsDir);
+    const cards = files.map((fullPath) => {
+      const content = fs.readFileSync(fullPath, "utf-8");
+      const fm = parseFrontmatter(content);
+      const relPath = path.relative(cardsDir, fullPath);
+      // Body is everything after the frontmatter
+      const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+      // Title: first line of body, or id from frontmatter, or filename
+      const firstLine = body.split("\n")[0]?.replace(/^#\s*/, "").trim();
       return {
-        file: f,
-        title,
-        date: dateLine?.split(":").slice(1).join(":").trim() || "",
-        agent: agentLine?.split(":").slice(1).join(":").trim() || "",
-        tags: tagLine?.split(":").slice(1).join(":").trim() || "",
-        content,
+        file: relPath,
+        title: firstLine || fm.id || path.basename(fullPath, ".md"),
+        date: fm.at || "",
+        agent: fm.by || "",
+        tags: fm.tags || "",
+        content: body,
       };
     });
+    // Sort by date descending
+    cards.sort((a, b) => b.date.localeCompare(a.date));
     if (search) {
       const q = search.toLowerCase();
       return NextResponse.json(cards.filter((c) =>
