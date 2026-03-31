@@ -261,6 +261,81 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
   }
 });
 
+// --- Scheduled Triggers ---
+
+const triggers = new Map(); // projectId → { interval, timer, lastSent, nextAt }
+
+const DEFAULT_MESSAGE = `@t1 @t2a @t2b @t3 — Queue check.
+T1: Merge any PR with both approvals, assign next from queue.
+T3: Work on assigned ticket or address review feedback.
+T2a/T2b: Review open PRs. If T3 pushed fixes, re-review. Post verdict on PR AND notify here.
+ALL: Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
+
+async function sendTriggerMessage(projectId) {
+  const cfg = readConfig();
+  const project = cfg.projects && cfg.projects.find((p) => p.id === projectId);
+  const chattrUrl = cfg.agentchattr_url || "http://127.0.0.1:8300";
+  const token = cfg.agentchattr_token || "";
+  const message = (project && project.trigger_message) || DEFAULT_MESSAGE;
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers["x-session-token"] = token;
+
+  try {
+    await fetch(`${chattrUrl}/api/send`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: message, channel: "general", sender: "user" }),
+    });
+  } catch {}
+
+  const info = triggers.get(projectId);
+  if (info) {
+    info.lastSent = Date.now();
+    info.nextAt = Date.now() + info.interval;
+  }
+}
+
+app.get("/api/triggers", (_req, res) => {
+  const result = {};
+  for (const [id, info] of triggers) {
+    result[id] = {
+      enabled: true,
+      interval: info.interval,
+      lastSent: info.lastSent,
+      nextAt: info.nextAt,
+    };
+  }
+  res.json(result);
+});
+
+app.post("/api/triggers/:project/start", (req, res) => {
+  const { project } = req.params;
+  const { interval } = req.body || {};
+  const ms = (interval || 30) * 60 * 1000;
+
+  // Clear existing
+  const existing = triggers.get(project);
+  if (existing && existing.timer) clearInterval(existing.timer);
+
+  const timer = setInterval(() => sendTriggerMessage(project), ms);
+  triggers.set(project, { interval: ms, timer, lastSent: null, nextAt: Date.now() + ms });
+  res.json({ ok: true, enabled: true, interval: ms, nextAt: Date.now() + ms });
+});
+
+app.post("/api/triggers/:project/stop", (req, res) => {
+  const { project } = req.params;
+  const existing = triggers.get(project);
+  if (existing && existing.timer) clearInterval(existing.timer);
+  triggers.delete(project);
+  res.json({ ok: true, enabled: false });
+});
+
+app.post("/api/triggers/:project/send-now", (req, res) => {
+  const { project } = req.params;
+  sendTriggerMessage(project);
+  res.json({ ok: true, sent: true });
+});
+
 // --- WebSocket + PTY ---
 
 const wss = new WebSocketServer({ server, path: "/ws/terminal" });

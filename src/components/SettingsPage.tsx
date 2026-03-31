@@ -25,6 +25,8 @@ interface ProjectConfig {
   working_dir: string;
   agents: Record<string, AgentConfig>;
   telegram?: TelegramConfig;
+  trigger_interval?: number;
+  trigger_message?: string;
 }
 
 interface Config {
@@ -354,6 +356,31 @@ export default function SettingsPage() {
                           )}
                         </div>
                       ))}
+                    </div>
+                  </div>
+
+                  {/* Scheduled Trigger */}
+                  <div className="mt-4">
+                    <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Scheduled Trigger</h3>
+                    <div className="border border-border p-3">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
+                        <Input
+                          label="Interval (minutes)"
+                          value={String(project.trigger_interval || 30)}
+                          onChange={(v) => updateProject(idx, { trigger_interval: parseInt(v, 10) || 30 } as Partial<ProjectConfig>)}
+                          type="number"
+                        />
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[11px] text-text-muted uppercase tracking-wider">Message Template</label>
+                          <textarea
+                            value={project.trigger_message || ""}
+                            onChange={(e) => updateProject(idx, { trigger_message: e.target.value } as Partial<ProjectConfig>)}
+                            placeholder="@t1 @t2a @t2b @t3 — Queue check..."
+                            rows={4}
+                            className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent resize-y"
+                          />
+                        </div>
+                      </div>
                     </div>
                   </div>
 
