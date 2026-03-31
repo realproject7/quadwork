@@ -11,6 +11,8 @@ interface Agent {
 interface TerminalGridProps {
   projectId: string;
   agents?: Agent[];
+  agentStates?: Record<string, string>;
+  onStatusChange?: (agentId: string, state: string) => void;
 }
 
 const DEFAULT_AGENTS: Agent[] = [
@@ -28,6 +30,8 @@ const GRID_CLASSES = [
 export default function TerminalGrid({
   projectId,
   agents = DEFAULT_AGENTS,
+  agentStates = {},
+  onStatusChange,
 }: TerminalGridProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -48,22 +52,67 @@ export default function TerminalGrid({
             style={isHidden ? { visibility: "hidden", overflow: "hidden" } : undefined}
           >
             <div
-              className={`flex items-center px-3 shrink-0 border-b border-border ${
-                isExpanded ? "h-7 justify-between" : "h-6 cursor-pointer"
+              className={`flex items-center justify-between px-3 shrink-0 border-b border-border ${
+                isExpanded ? "h-7" : "h-6"
               }`}
-              onClick={isExpanded ? undefined : () => setExpanded(agent.id)}
             >
-              <span className="text-[11px] text-text-muted uppercase tracking-wider">
-                {agent.label}
-              </span>
-              {isExpanded && (
+              <div
+                className={`flex items-center gap-1.5 ${!isExpanded ? "cursor-pointer" : ""}`}
+                onClick={isExpanded ? undefined : () => setExpanded(agent.id)}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${
+                  agentStates[agent.id] === "running" ? "bg-accent"
+                    : agentStates[agent.id] === "error" ? "bg-error"
+                    : "bg-text-muted"
+                }`} />
+                <span className="text-[11px] text-text-muted uppercase tracking-wider">
+                  {agent.label}
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                {agentStates[agent.id] !== "running" && (
+                  <button
+                    onClick={() => {
+                      fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agent.id)}&action=start`, { method: "POST" })
+                        .then((r) => r.json())
+                        .then((d) => { if (d.state && onStatusChange) onStatusChange(agent.id, d.state); })
+                        .catch(() => {});
+                    }}
+                    className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
+                    title="Start"
+                  >▶</button>
+                )}
+                {agentStates[agent.id] === "running" && (
+                  <button
+                    onClick={() => {
+                      fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agent.id)}&action=stop`, { method: "POST" })
+                        .then((r) => r.json())
+                        .then((d) => { if (d.state && onStatusChange) onStatusChange(agent.id, d.state); })
+                        .catch(() => {});
+                    }}
+                    className="text-[10px] text-text-muted hover:text-error transition-colors px-0.5"
+                    title="Stop"
+                  >■</button>
+                )}
                 <button
-                  onClick={() => setExpanded(null)}
-                  className="text-[11px] text-text-muted hover:text-text transition-colors"
-                >
-                  esc
-                </button>
-              )}
+                  onClick={() => {
+                    fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agent.id)}&action=restart`, { method: "POST" })
+                      .then((r) => r.json())
+                      .then((d) => { if (d.state && onStatusChange) onStatusChange(agent.id, d.state); })
+                      .catch(() => {});
+                  }}
+                  className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
+                  title="Restart"
+                >↻</button>
+                {isExpanded && (
+                  <button
+                    onClick={() => setExpanded(null)}
+                    className="text-[11px] text-text-muted hover:text-text transition-colors ml-1"
+                  >
+                    esc
+                  </button>
+                )}
+              </div>
             </div>
             <div className="flex-1 min-h-0">
               <TerminalPanel projectId={projectId} agentId={agent.id} />
