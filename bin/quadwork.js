@@ -356,8 +356,15 @@ async function setupAddons(rl, setup, configTomlPath) {
         ok("Installed Telegram Bridge dependencies");
       }
 
+      log("Create a bot via @BotFather on Telegram (https://t.me/BotFather), then copy the token.");
       const botToken = await ask(rl, "Telegram bot token", "");
+      log("To find your chat ID:");
+      log("  1. Open your bot on Telegram and send it any message (e.g., 'hi')");
+      log("  2. Run: curl https://api.telegram.org/bot<TOKEN>/getUpdates");
+      log("  3. Look for \"chat\":{\"id\":123456789,...} — the number is your chat ID");
+      log("  Note: Returns empty if no messages have been sent to the bot yet.");
       const chatId = await ask(rl, "Telegram chat ID", "");
+      log("Need help? See https://github.com/realproject7/agentchattr-telegram#readme");
 
       if (botToken && chatId) {
         // Write bot token to ~/.quadwork/.env (never stored in config files)
