@@ -42,6 +42,45 @@ function ask(rl, question, defaultVal) {
   });
 }
 
+function askSecret(rl, question) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const stdout = process.stdout;
+    stdout.write(`  ${question}: `);
+    let secret = "";
+    const wasRaw = stdin.isRaw;
+    stdin.setRawMode(true);
+    stdin.resume();
+    const onData = (ch) => {
+      const c = ch.toString("utf-8");
+      if (c === "\n" || c === "\r") {
+        stdin.setRawMode(wasRaw || false);
+        stdin.removeListener("data", onData);
+        stdout.write("\n");
+        resolve(secret);
+      } else if (c === "\u007F" || c === "\b") {
+        // Backspace
+        if (secret.length > 0) {
+          secret = secret.slice(0, -1);
+          stdout.write("\b \b");
+        }
+      } else if (c === "\u0003") {
+        // Ctrl+C
+        process.exit(1);
+      } else if (c >= " ") {
+        secret += c;
+        stdout.write("*");
+      }
+    };
+    stdin.on("data", onData);
+  });
+}
+
+function maskValue(val) {
+  if (!val || val.length < 8) return "****";
+  return val.slice(0, 4) + "***" + val.slice(-3);
+}
+
 function askYN(rl, question, defaultYes = false) {
   return new Promise((resolve) => {
     const hint = defaultYes ? "Y/n" : "y/N";
@@ -357,7 +396,7 @@ async function setupAddons(rl, setup, configTomlPath) {
       }
 
       log("Create a bot via @BotFather on Telegram (https://t.me/BotFather), then copy the token.");
-      const botToken = await ask(rl, "Telegram bot token", "");
+      const botToken = await askSecret(rl, "Telegram bot token");
       log("To find your chat ID:");
       log("  1. Open your bot on Telegram and send it any message (e.g., 'hi')");
       log("  2. Run: curl https://api.telegram.org/bot<TOKEN>/getUpdates");
@@ -381,7 +420,7 @@ async function setupAddons(rl, setup, configTomlPath) {
         }
         fs.writeFileSync(envPath, envContent, { mode: 0o600 });
         fs.chmodSync(envPath, 0o600);
-        ok(`Saved bot token to ${envPath}`);
+        ok(`Saved bot token (${maskValue(botToken)}) to ${envPath}`);
 
         // Persist telegram settings for writeQuadWorkConfig (env reference, not plaintext)
         setup.telegram = {
