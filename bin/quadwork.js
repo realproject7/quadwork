@@ -190,12 +190,12 @@ async function setupAgents(rl, repo) {
   log("A separate reviewer account lets T2a/T2b approve PRs independently. You can set this up later in Settings.");
   const wantReviewer = await askYN(rl, "Use a separate GitHub account for reviewers (T2a/T2b)?", false);
   let reviewerUser = "";
-  let reviewerTokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
+  let reviewerTokenPath = "";
   if (wantReviewer) {
     log("GitHub username for the reviewer account (used in T2a/T2b seed files for PR reviews).");
     reviewerUser = await ask(rl, "Reviewer GitHub username", "");
     log("Path to a file containing a GitHub PAT for the reviewer account.");
-    reviewerTokenPath = await ask(rl, "Reviewer token file path", reviewerTokenPath);
+    reviewerTokenPath = await ask(rl, "Reviewer token file path", path.join(os.homedir(), ".quadwork", "reviewer-token"));
   }
 
   const projectName = path.basename(absDir);
