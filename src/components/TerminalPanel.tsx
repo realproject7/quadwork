@@ -99,18 +99,9 @@ export default function TerminalPanel({
     (async () => {
       let base = wsUrl;
       if (!base) {
-        try {
-          const res = await fetch("/api/config");
-          if (res.ok) {
-            const cfg = await res.json();
-            const port = cfg.port || 3001;
-            base = `ws://${window.location.hostname}:${port}`;
-          } else {
-            base = `ws://${window.location.hostname}:3001`;
-          }
-        } catch {
-          base = `ws://${window.location.hostname}:3001`;
-        }
+        // Same-origin: derive WebSocket URL from current page location
+        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        base = `${wsProto}//${window.location.host}`;
       }
       if (cancelled) return;
 

@@ -1,15 +1,10 @@
-import ProjectDashboard from "@/components/ProjectDashboard";
+import ProjectPageClient from "./ProjectPageClient";
 
-interface ProjectPageProps {
-  params: Promise<{ id: string }>;
+export function generateStaticParams() {
+  // Return a placeholder; SPA fallback handles real project IDs at runtime
+  return [{ id: "_" }];
 }
 
-export default async function ProjectPage({ params }: ProjectPageProps) {
-  const { id } = await params;
-
-  return (
-    <div className="w-full h-full">
-      <ProjectDashboard projectId={id} />
-    </div>
-  );
+export default function ProjectPage() {
+  return <ProjectPageClient />;
 }

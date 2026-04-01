@@ -1,10 +1,9 @@
-import QueueManager from "@/components/QueueManager";
+import QueuePageClient from "./QueuePageClient";
 
-interface QueuePageProps {
-  params: Promise<{ id: string }>;
+export function generateStaticParams() {
+  return [{ id: "_" }];
 }
 
-export default async function QueuePage({ params }: QueuePageProps) {
-  const { id } = await params;
-  return <QueueManager projectId={id} />;
+export default function QueuePage() {
+  return <QueuePageClient />;
 }

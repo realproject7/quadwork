@@ -138,11 +138,9 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       const cfgRes = await fetch("/api/config");
       if (!cfgRes.ok) throw new Error("config");
       const cfg = await cfgRes.json();
-      const port = cfg.port || 3001;
-      const backendUrl = `http://127.0.0.1:${port}`;
 
-      // Try to write directly first
-      let res = await fetch(`${backendUrl}/api/agents/${projectId}/t1/write`, {
+      // Same-origin: all API calls go to the same host
+      let res = await fetch(`/api/agents/${projectId}/t1/write`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: prompt + "\n" }),
@@ -150,12 +148,12 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
 
       // If no session exists, create one and start the T1 agent
       if (res.status === 404) {
-        // Get T1 agent command from config
         const project = cfg.projects?.find((p: { id: string }) => p.id === projectId);
         const t1Command = project?.agents?.t1?.command || "claude";
 
-        // Open WebSocket to create PTY session
-        const wsUrl = `ws://127.0.0.1:${port}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=t1`;
+        // Open WebSocket to create PTY session (same-origin)
+        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${wsProto}//${window.location.host}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=t1`;
         const ws = new WebSocket(wsUrl);
         await new Promise<void>((resolve, reject) => {
           ws.onopen = () => resolve();
@@ -167,7 +165,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         await new Promise((r) => setTimeout(r, 500));
 
         // Start the T1 agent CLI in the PTY shell
-        await fetch(`${backendUrl}/api/agents/${projectId}/t1/write`, {
+        await fetch(`/api/agents/${projectId}/t1/write`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: `${t1Command}\n` }),
@@ -177,7 +175,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         await new Promise((r) => setTimeout(r, 3000));
 
         // Now write the queue prompt to the running agent
-        res = await fetch(`${backendUrl}/api/agents/${projectId}/t1/write`, {
+        res = await fetch(`/api/agents/${projectId}/t1/write`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: prompt + "\n" }),

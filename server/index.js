@@ -1,34 +1,33 @@
 const express = require("express");
 const http = require("http");
+const path = require("path");
+const fs = require("fs");
 const { WebSocketServer } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand } = require("./config");
+const routes = require("./routes");
 
 const config = readConfig();
-const PORT = config.port || 3001;
+const PORT = config.port || 8400;
 
 const app = express();
 app.use(express.json());
+
+// --- Mount migrated API routes (from Next.js) ---
+app.use(routes);
+
 const server = http.createServer(app);
 
-// --- REST endpoints ---
+// --- REST endpoints (original backend) ---
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-app.get("/api/config", (_req, res) => {
-  const cfg = readConfig();
-  res.json(cfg);
-});
-
 // --- Agent lifecycle ---
 
-// In-memory process state: key = "project/agent" → { process, state, error }
 const agentProcesses = new Map();
-
-// AgentChattr server process
 let chattrProcess = { process: null, state: "stopped", error: null };
 
 app.get("/api/agents", (_req, res) => {
@@ -180,16 +179,11 @@ app.post("/api/agents/:project/:agent/restart", (req, res) => {
   const key = `${project}/${agent}`;
   const info = agentProcesses.get(key);
 
-  // Stop first
   if (info && info.process) {
     try { info.process.kill("SIGTERM"); } catch {}
   }
   agentProcesses.set(key, { process: null, state: "stopped", error: null });
 
-  // Then start (delegate to start handler by forwarding)
-  req.params.project = project;
-  req.params.agent = agent;
-  // Small delay to let process die
   setTimeout(() => {
     const cfg = readConfig();
     const proj = cfg.projects && cfg.projects.find((p) => p.id === project);
@@ -228,17 +222,19 @@ app.post("/api/agents/:project/:agent/restart", (req, res) => {
 
 // --- Active sessions tracking ---
 
-const activeSessions = new Map(); // key: "project/agent" → { projectId, agentId }
+const activeSessions = new Map();
+
+// Expose activeSessions to migrated routes (for /api/projects)
+app.set("activeSessions", activeSessions);
 
 app.get("/api/sessions", (_req, res) => {
   const sessions = [];
   for (const [, info] of activeSessions) {
-    sessions.push(info);
+    sessions.push({ projectId: info.projectId, agentId: info.agentId });
   }
   res.json(sessions);
 });
 
-// Write to an active PTY session
 app.post("/api/agents/:project/:agent/write", (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
@@ -263,7 +259,7 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
 
 // --- Scheduled Triggers ---
 
-const triggers = new Map(); // projectId → { interval, timer, lastSent, nextAt }
+const triggers = new Map();
 
 const DEFAULT_MESSAGE = `@t1 @t2a @t2b @t3 — Queue check.
 T1: Merge any PR with both approvals, assign next from queue.
@@ -282,7 +278,6 @@ async function sendTriggerMessage(projectId) {
 
   const info = triggers.get(projectId);
   try {
-    // Try with session token header
     let tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
     const res = await fetch(`${chattrUrl}/api/send${tokenParam}`, {
       method: "POST",
@@ -326,7 +321,6 @@ app.post("/api/triggers/:project/start", (req, res) => {
   const { interval } = req.body || {};
   const ms = (interval || 30) * 60 * 1000;
 
-  // Clear existing
   const existing = triggers.get(project);
   if (existing && existing.timer) clearInterval(existing.timer);
 
@@ -347,6 +341,35 @@ app.post("/api/triggers/:project/send-now", (req, res) => {
   const { project } = req.params;
   sendTriggerMessage(project);
   res.json({ ok: true, sent: true });
+});
+
+app.post("/api/triggers/sync", (_req, res) => {
+  syncTriggersFromConfig();
+  res.json({ ok: true });
+});
+
+// Expose syncTriggers for migrated routes (config PUT, rename)
+app.set("syncTriggers", syncTriggersFromConfig);
+
+// --- Serve static frontend (built Next.js export) ---
+
+const outDir = path.join(__dirname, "..", "out");
+if (fs.existsSync(outDir)) {
+  app.use(express.static(outDir));
+}
+
+// SPA fallback: serve index.html for all non-API, non-WS routes
+app.get("*", (req, res) => {
+  // Don't intercept API routes (already handled above)
+  if (req.path.startsWith("/api/")) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  const indexPath = path.join(outDir, "index.html");
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(503).send("Frontend not built. Run: npm run build");
+  }
 });
 
 // --- WebSocket + PTY ---
@@ -388,10 +411,8 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  // Register session only after successful PTY spawn (include term for write access)
   activeSessions.set(sessionKey, { projectId, agentId, term });
 
-  // PTY → client
   term.onData((data) => {
     if (ws.readyState === ws.OPEN) {
       ws.send(data);
@@ -404,21 +425,15 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  // Client → PTY
   ws.on("message", (msg) => {
     const str = msg.toString();
-
-    // Handle resize messages: JSON { type: "resize", cols, rows }
     try {
       const parsed = JSON.parse(str);
       if (parsed.type === "resize" && parsed.cols && parsed.rows) {
         term.resize(parsed.cols, parsed.rows);
         return;
       }
-    } catch {
-      // Not JSON — treat as terminal input
-    }
-
+    } catch {}
     term.write(str);
   });
 
@@ -440,7 +455,6 @@ function syncTriggersFromConfig() {
         activeIds.add(project.id);
         const ms = (project.trigger_interval || 30) * 60 * 1000;
         const existing = triggers.get(project.id);
-        // Only restart if interval changed or not running
         if (!existing || existing.interval !== ms) {
           if (existing && existing.timer) clearInterval(existing.timer);
           const timer = setInterval(() => sendTriggerMessage(project.id), ms);
@@ -450,7 +464,6 @@ function syncTriggersFromConfig() {
     }
   }
 
-  // Stop triggers for projects no longer enabled
   for (const [id, info] of triggers) {
     if (!activeIds.has(id)) {
       if (info.timer) clearInterval(info.timer);
@@ -459,16 +472,9 @@ function syncTriggersFromConfig() {
   }
 }
 
-// Sync triggers when config changes (called after PUT /api/config from Next.js)
-app.post("/api/triggers/sync", (_req, res) => {
-  syncTriggersFromConfig();
-  res.json({ ok: true });
-});
-
 // --- Start ---
 
-server.listen(PORT, () => {
-  console.log(`QuadWork server listening on http://localhost:${PORT}`);
-  // Auto-start enabled triggers from config
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
 });
