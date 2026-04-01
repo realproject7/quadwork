@@ -101,6 +101,7 @@ function ProjectIcon({ project, isActive }: { project: Project; isActive: boolea
 export default function Sidebar() {
   const pathname = usePathname();
   const [projects, setProjects] = useState<Project[]>([]);
+  const [backendStatus, setBackendStatus] = useState<"online" | "offline" | "recovering">("online");
 
   useEffect(() => {
     fetch("/api/config")
@@ -109,8 +110,36 @@ export default function Sidebar() {
         return r.json();
       })
       .then((cfg) => setProjects((cfg.projects || []).filter((p: Project & { archived?: boolean }) => !p.archived)))
-      .catch((err) => console.error(err.message));
+      .catch(() => {});
   }, []);
+
+  // Health check poll every 5 seconds
+  useEffect(() => {
+    let timeout: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      try {
+        const res = await fetch("/api/health", { signal: AbortSignal.timeout(3000) });
+        if (res.ok) {
+          setBackendStatus((prev) => prev === "offline" ? "recovering" : "online");
+        } else {
+          setBackendStatus("offline");
+        }
+      } catch {
+        setBackendStatus("offline");
+      }
+      timeout = setTimeout(check, 5000);
+    };
+    check();
+    return () => clearTimeout(timeout);
+  }, []);
+
+  // Clear "recovering" state after brief flash
+  useEffect(() => {
+    if (backendStatus === "recovering") {
+      const t = setTimeout(() => setBackendStatus("online"), 1500);
+      return () => clearTimeout(t);
+    }
+  }, [backendStatus]);
 
   const isHome = pathname === "/";
   const isSettings = pathname === "/settings";
@@ -161,6 +190,26 @@ export default function Sidebar() {
 
       {/* Divider */}
       <div className="w-6 h-px bg-border my-2" />
+
+      {/* Backend status indicator */}
+      {backendStatus !== "online" && (
+        <div className="mb-2 relative group">
+          <div
+            className={`w-3 h-3 rounded-full ${
+              backendStatus === "offline"
+                ? "bg-red-500 animate-pulse"
+                : "bg-green-500"
+            }`}
+          />
+          <div className="fixed left-16 ml-2 px-2 py-1 bg-bg-surface border border-border text-xs whitespace-nowrap z-50 hidden group-hover:block"
+            style={{ transform: "translateY(-50%)", top: "auto" }}
+          >
+            {backendStatus === "offline"
+              ? "Backend offline — run quadwork start"
+              : "Backend reconnected"}
+          </div>
+        </div>
+      )}
 
       {/* Settings */}
       <Link
