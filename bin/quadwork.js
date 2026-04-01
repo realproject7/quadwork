@@ -13,13 +13,38 @@ const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const AGENTS = ["t1", "t2a", "t2b", "t3"];
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── ANSI Helpers ──────────────────────────────────────────────────────────
 
-function log(msg) { console.log(`  ${msg}`); }
-function ok(msg) { console.log(`  ✓ ${msg}`); }
-function warn(msg) { console.log(`  ⚠ ${msg}`); }
-function fail(msg) { console.error(`  ✗ ${msg}`); }
-function header(msg) { console.log(`\n── ${msg} ${"─".repeat(Math.max(0, 58 - msg.length))}\n`); }
+const c = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  cyan: "\x1b[36m",
+  white: "\x1b[37m",
+};
+
+function log(msg) { console.log(`  ${c.dim}${msg}${c.reset}`); }
+function ok(msg) { console.log(`  ${c.green}✓${c.reset} ${msg}`); }
+function warn(msg) { console.log(`  ${c.yellow}⚠ ${msg}${c.reset}`); }
+function fail(msg) { console.error(`  ${c.red}✗ ${msg}${c.reset}`); }
+function header(msg) { console.log(`\n  ${c.cyan}${c.bold}┌─ ${msg} ${"─".repeat(Math.max(0, 54 - msg.length))}┐${c.reset}\n`); }
+
+function spinner(msg) {
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let i = 0;
+  const id = setInterval(() => {
+    process.stdout.write(`\r  ${c.cyan}${frames[i++ % frames.length]}${c.reset} ${msg}`);
+  }, 80);
+  return {
+    stop(result) {
+      clearInterval(id);
+      process.stdout.write(`\r  ${result ? `${c.green}✓${c.reset} ${msg}` : `${c.red}✗${c.reset} ${msg}`}${" ".repeat(10)}\n`);
+    },
+  };
+}
 
 function run(cmd, opts = {}) {
   try {
@@ -35,8 +60,8 @@ function which(cmd) {
 
 function ask(rl, question, defaultVal) {
   return new Promise((resolve) => {
-    const suffix = defaultVal ? ` [${defaultVal}]` : "";
-    rl.question(`  ${question}${suffix}: `, (answer) => {
+    const suffix = defaultVal ? ` ${c.dim}[${defaultVal}]${c.reset}` : "";
+    rl.question(`  ${c.bold}${question}${c.reset}${suffix}${c.cyan} > ${c.reset}`, (answer) => {
       resolve(answer.trim() || defaultVal || "");
     });
   });
@@ -46,7 +71,7 @@ function askSecret(rl, question) {
   return new Promise((resolve) => {
     const stdin = process.stdin;
     const stdout = process.stdout;
-    stdout.write(`  ${question}: `);
+    stdout.write(`  ${c.bold}${question}${c.reset}${c.cyan} > ${c.reset}`);
     let secret = "";
     const wasRaw = stdin.isRaw;
     stdin.setRawMode(true);
@@ -86,7 +111,7 @@ function maskValue(val) {
 function askYN(rl, question, defaultYes = false) {
   return new Promise((resolve) => {
     const hint = defaultYes ? "Y/n" : "y/N";
-    rl.question(`  ${question} [${hint}]: `, (answer) => {
+    rl.question(`  ${c.bold}${question}${c.reset} ${c.dim}[${hint}]${c.reset}${c.cyan} > ${c.reset}`, (answer) => {
       const a = answer.trim().toLowerCase();
       resolve(a === "" ? defaultYes : a === "y" || a === "yes");
     });
@@ -175,10 +200,12 @@ async function setupGitHub(rl) {
   }
 
   // Verify repo exists
+  const sp = spinner(`Verifying ${repo}...`);
   const repoCheck = run(`gh repo view ${repo} --json name 2>&1`);
   if (repoCheck && repoCheck.includes('"name"')) {
-    ok(`Repo ${repo} verified`);
+    sp.stop(true);
   } else {
+    sp.stop(false);
     fail(`Cannot access ${repo} — check permissions`);
     return null;
   }
@@ -565,8 +592,12 @@ function writeQuadWorkConfig(setup) {
 // ─── Init Command ───────────────────────────────────────────────────────────
 
 async function cmdInit() {
-  console.log("\n  QuadWork Init — 4-agent coding team setup\n");
-  console.log("  Tip: Press Enter to accept defaults shown in [brackets].\n");
+  console.log("");
+  console.log(`  ${c.cyan}${c.bold}╔══════════════════════════════════════════╗${c.reset}`);
+  console.log(`  ${c.cyan}${c.bold}║${c.reset}  ${c.white}${c.bold}QuadWork Init${c.reset}                           ${c.cyan}${c.bold}║${c.reset}`);
+  console.log(`  ${c.cyan}${c.bold}║${c.reset}  ${c.dim}4-agent coding team setup${c.reset}                ${c.cyan}${c.bold}║${c.reset}`);
+  console.log(`  ${c.cyan}${c.bold}╚══════════════════════════════════════════╝${c.reset}`);
+  console.log(`\n  ${c.dim}Tip: Press Enter to accept defaults shown in [brackets].${c.reset}\n`);
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
