@@ -151,10 +151,22 @@ async function setupAgents(rl, repo) {
   const hasClaude = which("claude");
   const hasCodex = which("codex");
   let defaultBackend = hasClaude ? "claude" : "codex";
-  const backend = await ask(rl, "CLI backend for agents (claude/codex)", defaultBackend);
+  const backend = await ask(rl, "Default CLI backend (claude/codex)", defaultBackend);
   if (backend !== "claude" && backend !== "codex") {
     fail("Backend must be 'claude' or 'codex'");
     return null;
+  }
+
+  // Per-agent backend selection
+  const backends = {};
+  const customPerAgent = await askYN(rl, "Use same backend for all agents?", true);
+  if (customPerAgent) {
+    for (const agent of AGENTS) backends[agent] = backend;
+  } else {
+    for (const agent of AGENTS) {
+      const agentBackend = await ask(rl, `${agent.toUpperCase()} backend (claude/codex)`, backend);
+      backends[agent] = (agentBackend === "claude" || agentBackend === "codex") ? agentBackend : backend;
+    }
   }
 
   const projectDir = await ask(rl, "Project directory", process.cwd());
@@ -227,7 +239,7 @@ async function setupAgents(rl, repo) {
     ok("Copied CLAUDE.md to all worktrees");
   }
 
-  return { projectName, absDir, worktrees, repo, backend };
+  return { projectName, absDir, worktrees, repo, backend, backends };
 }
 
 // ─── AgentChattr Config ─────────────────────────────────────────────────────
@@ -242,8 +254,14 @@ function writeAgentChattrConfig(setup, configTomlPath) {
   // Replace placeholders
   tomlContent = tomlContent.replace(/\{\{project_name\}\}/g, setup.projectName);
   tomlContent = tomlContent.replace(/\{\{repo\}\}/g, setup.repo);
-  // Replace all agent commands with the chosen backend
-  tomlContent = tomlContent.replace(/command = "(?:claude|codex)"/g, `command = "${setup.backend}"`);
+  // Replace per-agent commands with chosen backends
+  for (const agent of AGENTS) {
+    const cmd = (setup.backends && setup.backends[agent]) || setup.backend;
+    tomlContent = tomlContent.replace(
+      new RegExp(`(\\[agents\\.${agent}\\][\\s\\S]*?command = )"(?:claude|codex)"`),
+      `$1"${cmd}"`
+    );
+  }
 
   // Write config.toml
   const configDir = path.dirname(configTomlPath);
@@ -449,7 +467,7 @@ function writeQuadWorkConfig(setup) {
   };
 
   for (const agent of AGENTS) {
-    project.agents[agent] = { cwd: setup.worktrees[agent], command: setup.backend };
+    project.agents[agent] = { cwd: setup.worktrees[agent], command: (setup.backends && setup.backends[agent]) || setup.backend };
   }
 
   if (setup.memoryDir) {
