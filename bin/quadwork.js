@@ -13,13 +13,43 @@ const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const AGENTS = ["t1", "t2a", "t2b", "t3"];
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── ANSI Helpers ──────────────────────────────────────────────────────────
 
-function log(msg) { console.log(`  ${msg}`); }
-function ok(msg) { console.log(`  ✓ ${msg}`); }
-function warn(msg) { console.log(`  ⚠ ${msg}`); }
-function fail(msg) { console.error(`  ✗ ${msg}`); }
-function header(msg) { console.log(`\n── ${msg} ${"─".repeat(Math.max(0, 58 - msg.length))}\n`); }
+const isTTY = process.stdout.isTTY;
+const c = isTTY ? {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  cyan: "\x1b[36m",
+  white: "\x1b[37m",
+} : { reset: "", bold: "", dim: "", green: "", yellow: "", red: "", cyan: "", white: "" };
+
+function log(msg) { console.log(`  ${c.dim}${msg}${c.reset}`); }
+function ok(msg) { console.log(`  ${c.green}✓${c.reset} ${msg}`); }
+function warn(msg) { console.log(`  ${c.yellow}⚠ ${msg}${c.reset}`); }
+function fail(msg) { console.error(`  ${c.red}✗ ${msg}${c.reset}`); }
+function header(msg) { console.log(`\n  ${c.cyan}${c.bold}┌─ ${msg} ${"─".repeat(Math.max(0, 54 - msg.length))}┐${c.reset}\n`); }
+
+function spinner(msg) {
+  if (!isTTY) {
+    console.log(`  ${msg}`);
+    return { stop(result) { console.log(`  ${result ? "✓" : "✗"} ${msg}`); } };
+  }
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let i = 0;
+  const id = setInterval(() => {
+    process.stdout.write(`\r  ${c.cyan}${frames[i++ % frames.length]}${c.reset} ${msg}`);
+  }, 80);
+  return {
+    stop(result) {
+      clearInterval(id);
+      process.stdout.write(`\r  ${result ? `${c.green}✓${c.reset} ${msg}` : `${c.red}✗${c.reset} ${msg}`}${" ".repeat(10)}\n`);
+    },
+  };
+}
 
 function run(cmd, opts = {}) {
   try {
@@ -35,8 +65,8 @@ function which(cmd) {
 
 function ask(rl, question, defaultVal) {
   return new Promise((resolve) => {
-    const suffix = defaultVal ? ` [${defaultVal}]` : "";
-    rl.question(`  ${question}${suffix}: `, (answer) => {
+    const suffix = defaultVal ? ` ${c.dim}[${defaultVal}]${c.reset}` : "";
+    rl.question(`  ${c.bold}${question}${c.reset}${suffix}${c.cyan} > ${c.reset}`, (answer) => {
       resolve(answer.trim() || defaultVal || "");
     });
   });
@@ -46,7 +76,7 @@ function askSecret(rl, question) {
   return new Promise((resolve) => {
     const stdin = process.stdin;
     const stdout = process.stdout;
-    stdout.write(`  ${question}: `);
+    stdout.write(`  ${c.bold}${question}${c.reset}${c.cyan} > ${c.reset}`);
     let secret = "";
     const wasRaw = stdin.isRaw;
     stdin.setRawMode(true);
@@ -86,7 +116,7 @@ function maskValue(val) {
 function askYN(rl, question, defaultYes = false) {
   return new Promise((resolve) => {
     const hint = defaultYes ? "Y/n" : "y/N";
-    rl.question(`  ${question} [${hint}]: `, (answer) => {
+    rl.question(`  ${c.bold}${question}${c.reset} ${c.dim}[${hint}]${c.reset}${c.cyan} > ${c.reset}`, (answer) => {
       const a = answer.trim().toLowerCase();
       resolve(a === "" ? defaultYes : a === "y" || a === "yes");
     });
@@ -175,10 +205,12 @@ async function setupGitHub(rl) {
   }
 
   // Verify repo exists
+  const sp = spinner(`Verifying ${repo}...`);
   const repoCheck = run(`gh repo view ${repo} --json name 2>&1`);
   if (repoCheck && repoCheck.includes('"name"')) {
-    ok(`Repo ${repo} verified`);
+    sp.stop(true);
   } else {
+    sp.stop(false);
     fail(`Cannot access ${repo} — check permissions`);
     return null;
   }
@@ -244,25 +276,19 @@ async function setupAgents(rl, repo) {
 
   const projectName = path.basename(absDir);
   log(`Project: ${projectName}`);
-  log("Creating worktrees for 4 agents...\n");
+  const wtSpinner = spinner("Creating worktrees and seeding files...");
 
   const worktrees = {};
+  let wtFailed = null;
   for (const agent of AGENTS) {
     const wtDir = path.join(path.dirname(absDir), `${projectName}-${agent}`);
-    if (fs.existsSync(wtDir)) {
-      ok(`Worktree exists: ${agent} → ${wtDir}`);
-    } else {
+    if (!fs.existsSync(wtDir)) {
       const branchName = `worktree-${agent}`;
-      // Create branch if needed
       run(`git -C "${absDir}" branch ${branchName} HEAD 2>&1`);
       const result = run(`git -C "${absDir}" worktree add "${wtDir}" ${branchName} 2>&1`);
-      if (result !== null) {
-        ok(`Created worktree: ${agent} → ${wtDir}`);
-      } else {
-        // Try without branch (detached)
+      if (!result) {
         const result2 = run(`git -C "${absDir}" worktree add --detach "${wtDir}" HEAD 2>&1`);
-        if (result2 !== null) ok(`Created worktree (detached): ${agent} → ${wtDir}`);
-        else { fail(`Failed to create worktree for ${agent}`); return null; }
+        if (!result2) { wtFailed = agent; break; }
       }
     }
     worktrees[agent] = wtDir;
@@ -282,8 +308,13 @@ async function setupAgents(rl, repo) {
         seedContent = seedContent.replace(/\{\{reviewer_token_path\}\}/g, "");
       }
       fs.writeFileSync(seedDst, seedContent);
-      log(`  Copied ${agent}.AGENTS.md`);
     }
+  }
+
+  if (wtFailed) {
+    wtSpinner.stop(false);
+    fail(`Failed to create worktree for ${wtFailed}`);
+    return null;
   }
 
   // Copy CLAUDE.md to each worktree
@@ -293,13 +324,13 @@ async function setupAgents(rl, repo) {
     claudeContent = claudeContent.replace(/\{\{project_name\}\}/g, projectName);
     for (const agent of AGENTS) {
       const dst = path.join(worktrees[agent], "CLAUDE.md");
-      // Don't overwrite if CLAUDE.md already exists
       if (!fs.existsSync(dst)) {
         fs.writeFileSync(dst, claudeContent);
       }
     }
-    ok("Copied CLAUDE.md to all worktrees");
   }
+
+  wtSpinner.stop(true);
 
   return { projectName, absDir, worktrees, repo, backend, backends };
 }
@@ -334,14 +365,15 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
   // Start AgentChattr if available; optionally skip install attempt
   let acAvailable = which("agentchattr");
   if (!acAvailable && !skipInstall) {
-    log("Installing AgentChattr...");
+    const acSpinner = spinner("Installing AgentChattr...");
     const installResult = run("pip install agentchattr 2>&1");
     if (installResult !== null) {
-      ok("Installed AgentChattr");
+      acSpinner.stop(true);
       acAvailable = which("agentchattr");
       if (!acAvailable) warn("agentchattr binary not found in PATH after install");
     } else {
-      warn("Failed to install AgentChattr — install manually: pip install agentchattr");
+      acSpinner.stop(false);
+      warn("Install manually: pip install agentchattr");
     }
   }
 
@@ -382,10 +414,10 @@ async function setupAddons(rl, setup, configTomlPath) {
   if (wantTelegram) {
     const telegramDir = path.join(path.dirname(setup.absDir), "agentchattr-telegram");
     if (!fs.existsSync(telegramDir)) {
-      log("Cloning agentchattr-telegram...");
+      const cloneSpinner = spinner("Cloning agentchattr-telegram...");
       const cloneResult = run(`git clone https://github.com/realproject7/agentchattr-telegram.git "${telegramDir}" 2>&1`);
-      if (cloneResult !== null) ok("Cloned agentchattr-telegram");
-      else warn("Failed to clone — you can set it up manually later");
+      cloneSpinner.stop(cloneResult !== null);
+      if (!cloneResult) warn("You can set it up manually later");
     } else {
       ok("agentchattr-telegram already present");
     }
@@ -393,8 +425,9 @@ async function setupAddons(rl, setup, configTomlPath) {
     if (fs.existsSync(telegramDir)) {
       const reqFile = path.join(telegramDir, "requirements.txt");
       if (fs.existsSync(reqFile)) {
-        run(`pip install -r "${reqFile}" 2>&1`);
-        ok("Installed Telegram Bridge dependencies");
+        const tgSpinner = spinner("Installing Telegram Bridge dependencies...");
+        const tgResult = run(`pip install -r "${reqFile}" 2>&1`);
+        tgSpinner.stop(tgResult !== null);
       }
 
       log("Create a bot via @BotFather on Telegram (https://t.me/BotFather), then copy the token.");
@@ -474,10 +507,10 @@ bridge_sender = "telegram-bridge"
   if (wantMemory) {
     const memoryDir = path.join(path.dirname(setup.absDir), "agent-memory");
     if (!fs.existsSync(memoryDir)) {
-      log("Cloning agent-memory...");
+      const memSpinner = spinner("Cloning agent-memory...");
       const cloneResult = run(`git clone https://github.com/realproject7/agent-memory.git "${memoryDir}" 2>&1`);
-      if (cloneResult !== null) ok("Cloned agent-memory");
-      else warn("Failed to clone — you can set it up manually later");
+      memSpinner.stop(cloneResult !== null);
+      if (!cloneResult) warn("You can set it up manually later");
     } else {
       ok("agent-memory already present");
     }
@@ -565,8 +598,12 @@ function writeQuadWorkConfig(setup) {
 // ─── Init Command ───────────────────────────────────────────────────────────
 
 async function cmdInit() {
-  console.log("\n  QuadWork Init — 4-agent coding team setup\n");
-  console.log("  Tip: Press Enter to accept defaults shown in [brackets].\n");
+  console.log("");
+  console.log(`  ${c.cyan}${c.bold}╔══════════════════════════════════════════╗${c.reset}`);
+  console.log(`  ${c.cyan}${c.bold}║${c.reset}  ${c.white}${c.bold}QuadWork Init${c.reset}                           ${c.cyan}${c.bold}║${c.reset}`);
+  console.log(`  ${c.cyan}${c.bold}║${c.reset}  ${c.dim}4-agent coding team setup${c.reset}                ${c.cyan}${c.bold}║${c.reset}`);
+  console.log(`  ${c.cyan}${c.bold}╚══════════════════════════════════════════╝${c.reset}`);
+  console.log(`\n  ${c.dim}Tip: Press Enter to accept defaults shown in [brackets].${c.reset}\n`);
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
