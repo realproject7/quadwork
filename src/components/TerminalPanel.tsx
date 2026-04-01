@@ -99,17 +99,26 @@ export default function TerminalPanel({
     (async () => {
       let base = wsUrl;
       if (!base) {
+        // In production, WS is same-origin. In dev mode (next dev on :3000),
+        // resolve the backend port from config since WS isn't proxied by Next.js.
+        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
         try {
           const res = await fetch("/api/config");
           if (res.ok) {
             const cfg = await res.json();
-            const port = cfg.port || 3001;
-            base = `ws://${window.location.hostname}:${port}`;
+            const backendPort = cfg.port || 8400;
+            const currentPort = parseInt(window.location.port, 10);
+            if (currentPort && currentPort !== backendPort) {
+              // Dev mode: connect directly to Express backend
+              base = `${wsProto}//${window.location.hostname}:${backendPort}`;
+            } else {
+              base = `${wsProto}//${window.location.host}`;
+            }
           } else {
-            base = `ws://${window.location.hostname}:3001`;
+            base = `${wsProto}//${window.location.host}`;
           }
         } catch {
-          base = `ws://${window.location.hostname}:3001`;
+          base = `${wsProto}//${window.location.host}`;
         }
       }
       if (cancelled) return;

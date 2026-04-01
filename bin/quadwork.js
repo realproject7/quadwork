@@ -56,7 +56,7 @@ function readConfig() {
   try {
     return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
   } catch {
-    return { port: 3001, agentchattr_url: "http://127.0.0.1:8300", projects: [] };
+    return { port: 8400, agentchattr_url: "http://127.0.0.1:8300", projects: [] };
   }
 }
 
@@ -528,49 +528,36 @@ function cmdStart() {
   }
 
   const quadworkDir = path.join(__dirname, "..");
+  const port = config.port || 8400;
 
-  // Build Next.js if no production build exists
-  const nextBuildDir = path.join(quadworkDir, ".next");
-  if (!fs.existsSync(nextBuildDir)) {
-    log("Building Next.js frontend (first run)...");
+  // Build static frontend if out/ directory doesn't exist
+  const outDir = path.join(quadworkDir, "out");
+  if (!fs.existsSync(outDir)) {
+    log("Building static frontend (first run)...");
     try {
       execSync("npm run build", { cwd: quadworkDir, stdio: "inherit" });
       ok("Build complete");
     } catch {
-      fail("Next.js build failed — fix build errors and retry");
+      fail("Frontend build failed — fix build errors and retry");
       process.exit(1);
     }
   }
 
-  // Start Next.js frontend
-  log("Starting Next.js frontend...");
-  const frontend = spawn("npx", ["next", "start"], {
-    stdio: "ignore",
-    detached: true,
-    cwd: quadworkDir,
-    env: { ...process.env },
-  });
-  frontend.unref();
-  if (frontend.pid) {
-    ok(`Frontend started (PID: ${frontend.pid})`);
-    fs.writeFileSync(path.join(CONFIG_DIR, "frontend.pid"), String(frontend.pid));
-  }
-
-  // Start QuadWork backend server
+  // Start single Express server (serves API + WebSocket + static frontend)
   const serverDir = path.join(quadworkDir, "server");
   if (!fs.existsSync(path.join(serverDir, "index.js"))) {
     fail("Server not found. Run from the quadwork directory.");
     process.exit(1);
   }
 
-  log("Starting QuadWork backend...");
+  log("Starting QuadWork server...");
   const server = spawn("node", [serverDir], {
     stdio: "ignore",
     detached: true,
     env: { ...process.env },
   });
   server.unref();
-  ok(`Backend started (PID: ${server.pid})`);
+  ok(`Server started (PID: ${server.pid})`);
 
   // Save PID for stop command
   const pidFile = path.join(CONFIG_DIR, "server.pid");
@@ -594,7 +581,7 @@ function cmdStart() {
   }
 
   // Open dashboard in browser
-  const dashboardUrl = "http://localhost:3000";
+  const dashboardUrl = `http://127.0.0.1:${port}`;
   const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
   setTimeout(() => {
     try { execSync(`${openCmd} ${dashboardUrl}`, { stdio: "ignore" }); } catch {}
@@ -628,8 +615,7 @@ function cmdStop() {
   let stopped = 0;
   if (stopPid("Telegram bridge", "telegram-bridge.pid")) stopped++;
   if (stopPid("AgentChattr", "agentchattr.pid")) stopped++;
-  if (stopPid("Backend server", "server.pid")) stopped++;
-  if (stopPid("Frontend", "frontend.pid")) stopped++;
+  if (stopPid("Server", "server.pid")) stopped++;
 
   if (stopped === 0) warn("No running processes found");
   else ok(`Stopped ${stopped} process(es)`);

@@ -1,10 +1,9 @@
-import MemoryDashboard from "@/components/MemoryDashboard";
+import MemoryPageClient from "./MemoryPageClient";
 
-interface MemoryPageProps {
-  params: Promise<{ id: string }>;
+export function generateStaticParams() {
+  return [{ id: "_" }];
 }
 
-export default async function MemoryPage({ params }: MemoryPageProps) {
-  const { id } = await params;
-  return <MemoryDashboard projectId={id} />;
+export default function MemoryPage() {
+  return <MemoryPageClient />;
 }

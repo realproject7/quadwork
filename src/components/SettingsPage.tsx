@@ -109,7 +109,7 @@ export default function SettingsPage() {
         return r.json();
       })
       .then((data) => setConfig({
-        port: data.port || 3001,
+        port: data.port || 8400,
         agentchattr_url: data.agentchattr_url || "http://127.0.0.1:8300",
         agentchattr_token: data.agentchattr_token || "",
         default_backend: data.default_backend || "claude-code",
@@ -333,7 +333,7 @@ export default function SettingsPage() {
           <Input
             label="QuadWork Port"
             value={String(config.port)}
-            onChange={(v) => updateGlobal("port", parseInt(v, 10) || 3001)}
+            onChange={(v) => updateGlobal("port", parseInt(v, 10) || 8400)}
             type="number"
           />
         </div>
