@@ -125,8 +125,12 @@ async function testConnection(botToken: string, chatId: string) {
   if (!botToken || !chatId) {
     return NextResponse.json({ ok: false, error: "Missing bot_token or chat_id" });
   }
+  const resolved = resolveToken(botToken);
+  if (!resolved) {
+    return NextResponse.json({ ok: false, error: "Could not resolve bot token from environment" });
+  }
   try {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/getChat?chat_id=${chatId}`);
+    const res = await fetch(`https://api.telegram.org/bot${resolved}/getChat?chat_id=${chatId}`);
     const data = await res.json();
     return NextResponse.json({ ok: data.ok, error: data.ok ? undefined : data.description });
   } catch (err) {
@@ -158,7 +162,7 @@ function writeProjectToml(projectId: string): string | null {
 
   const tomlPath = configToml(projectId);
   const content = `[telegram]\nbot_token = "${tg.bot_token}"\nchat_id = "${tg.chat_id}"\n\n[agentchattr]\nurl = "${tg.agentchattr_url}"\n`;
-  fs.writeFileSync(tomlPath, content);
+  fs.writeFileSync(tomlPath, content, { mode: 0o600 });
   return tomlPath;
 }
 
