@@ -119,7 +119,7 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
           href={issue.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="flex items-center gap-2 px-3 py-1 hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
+          className="flex items-center gap-2 px-3 py-1 font-mono hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
         >
           <StatusDot color={issueStatusColor(issue.state)} />
           <span className="text-[11px] text-text-muted w-8 shrink-0">#{issue.number}</span>

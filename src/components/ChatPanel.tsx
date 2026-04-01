@@ -61,10 +61,27 @@ export default function ChatPanel() {
     return (
       <div className="w-full h-full">
         <iframe
+          ref={(el) => {
+            if (!el) return;
+            el.onload = () => {
+              // onLoad fires even for CSP/X-Frame-Options blocks.
+              // Try accessing contentDocument — blocked iframes throw.
+              try {
+                const doc = el.contentDocument || el.contentWindow?.document;
+                if (doc && doc.body && doc.body.innerHTML.length > 0) {
+                  setMode("iframe");
+                } else {
+                  setMode("api");
+                }
+              } catch {
+                // Cross-origin or blocked — fall back to API
+                setMode("api");
+              }
+            };
+            el.onerror = () => setMode("api");
+          }}
           src={chattrUrl}
           className="w-full h-full border-0"
-          onLoad={() => setMode("iframe")}
-          onError={() => setMode("api")}
           style={{ display: mode === "loading" ? "none" : "block" }}
           sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
         />
