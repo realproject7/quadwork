@@ -228,8 +228,15 @@ async function setupAgents(rl, repo) {
     const seedDst = path.join(wtDir, "AGENTS.md");
     if (fs.existsSync(seedSrc)) {
       let seedContent = fs.readFileSync(seedSrc, "utf-8");
-      seedContent = seedContent.replace(/\{\{reviewer_github_user\}\}/g, reviewerUser);
-      seedContent = seedContent.replace(/\{\{reviewer_token_path\}\}/g, reviewerTokenPath);
+      if (reviewerUser) {
+        seedContent = seedContent.replace(/\{\{reviewer_github_user\}\}/g, reviewerUser);
+        seedContent = seedContent.replace(/\{\{reviewer_token_path\}\}/g, reviewerTokenPath);
+      } else {
+        // No reviewer configured — remove the GitHub Authentication section
+        seedContent = seedContent.replace(/## GitHub Authentication[\s\S]*?## Forbidden Actions/, "## Forbidden Actions");
+        seedContent = seedContent.replace(/\{\{reviewer_github_user\}\}/g, "");
+        seedContent = seedContent.replace(/\{\{reviewer_token_path\}\}/g, "");
+      }
       fs.writeFileSync(seedDst, seedContent);
       log(`  Copied ${agent}.AGENTS.md`);
     }
