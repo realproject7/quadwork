@@ -124,6 +124,7 @@ async function setupGitHub(rl) {
     return null;
   }
 
+  log("Enter the GitHub repo for your first project. You can add more later with `quadwork add-project`.");
   const repo = await ask(rl, "GitHub repo (owner/repo)", "");
   if (!repo || !repo.includes("/")) {
     fail("Invalid repo format — use owner/repo");
@@ -151,6 +152,7 @@ async function setupAgents(rl, repo) {
   const hasClaude = which("claude");
   const hasCodex = which("codex");
   let defaultBackend = hasClaude ? "claude" : "codex";
+  log("Choose which AI CLI to run in agent terminals. Claude Code (`claude`) or OpenAI Codex (`codex`).");
   const backend = await ask(rl, "Default CLI backend (claude/codex)", defaultBackend);
   if (backend !== "claude" && backend !== "codex") {
     fail("Backend must be 'claude' or 'codex'");
@@ -169,6 +171,7 @@ async function setupAgents(rl, repo) {
     }
   }
 
+  log("Path to your local clone of the repo. Worktrees will be created as sibling directories.");
   const projectDir = await ask(rl, "Project directory", process.cwd());
   const absDir = path.resolve(projectDir);
 
@@ -184,7 +187,9 @@ async function setupAgents(rl, repo) {
   }
 
   // Prompt for reviewer credentials (used in T2a/T2b seed templates)
+  log("GitHub username for the reviewer account (used in T2a/T2b seed files for PR reviews).");
   const reviewerUser = await ask(rl, "Reviewer GitHub username (for T2a/T2b)", "");
+  log("Path to a file containing a GitHub PAT for the reviewer account.");
   const reviewerTokenPath = await ask(rl, "Reviewer token file path (for T2a/T2b)", path.join(os.homedir(), ".quadwork", "reviewer-token"));
 
   const projectName = path.basename(absDir);
@@ -317,6 +322,7 @@ async function setupAddons(rl, setup, configTomlPath) {
   header("Step 5: Optional Add-ons");
 
   // Telegram Bridge
+  log("Optional: connect a Telegram bot for remote notifications.");
   const wantTelegram = await askYN(rl, "Set up Telegram Bridge?", false);
   if (wantTelegram) {
     const telegramDir = path.join(path.dirname(setup.absDir), "agentchattr-telegram");
@@ -401,6 +407,7 @@ bridge_sender = "telegram-bridge"
   }
 
   // Shared Memory
+  log("Optional: set up shared memory cards for cross-agent knowledge.");
   const wantMemory = await askYN(rl, "Set up Shared Memory?", false);
   if (wantMemory) {
     const memoryDir = path.join(path.dirname(setup.absDir), "agent-memory");
