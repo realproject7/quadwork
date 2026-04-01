@@ -322,6 +322,7 @@ async function setupAddons(rl, setup, configTomlPath) {
           envContent = envContent.trimEnd() + (envContent ? "\n" : "") + envLine + "\n";
         }
         fs.writeFileSync(envPath, envContent, { mode: 0o600 });
+        fs.chmodSync(envPath, 0o600);
         ok(`Saved bot token to ${envPath}`);
 
         // Persist telegram settings for writeQuadWorkConfig (env reference, not plaintext)
@@ -350,6 +351,7 @@ bridge_sender = "telegram-bridge"
           const bridgeToml = path.join(CONFIG_DIR, `telegram-${setup.projectName}.toml`);
           const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\n\n[agentchattr]\nurl = "http://127.0.0.1:8300"\n`;
           fs.writeFileSync(bridgeToml, bridgeTomlContent, { mode: 0o600 });
+          fs.chmodSync(bridgeToml, 0o600);
           const bridgeProc = spawn("python3", [bridgeScript, "--config", bridgeToml], {
             stdio: "ignore",
             detached: true,

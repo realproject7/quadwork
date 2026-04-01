@@ -59,6 +59,7 @@ function writeEnvToken(key: string, value: string): void {
     content = content.trimEnd() + (content ? "\n" : "") + line + "\n";
   }
   fs.writeFileSync(ENV_PATH, content, { mode: 0o600 });
+  fs.chmodSync(ENV_PATH, 0o600);
 }
 
 /** Resolve a bot_token value — if it starts with "env:" read from .env file */
@@ -163,6 +164,7 @@ function writeProjectToml(projectId: string): string | null {
   const tomlPath = configToml(projectId);
   const content = `[telegram]\nbot_token = "${tg.bot_token}"\nchat_id = "${tg.chat_id}"\n\n[agentchattr]\nurl = "${tg.agentchattr_url}"\n`;
   fs.writeFileSync(tomlPath, content, { mode: 0o600 });
+  fs.chmodSync(tomlPath, 0o600);
   return tomlPath;
 }
 
