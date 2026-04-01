@@ -135,11 +135,11 @@ router.get("/api/projects", async (req, res) => {
   const chattrUrl = cfg.agentchattr_url || "http://127.0.0.1:8300";
   const chattrToken = cfg.agentchattr_token;
 
-  // Fetch active sessions from our own in-memory state
+  // Fetch active sessions from our own in-memory state (only running PTYs)
   const activeSessions = req.app.get("activeSessions") || new Map();
   const activeProjectIds = new Set();
   for (const [, info] of activeSessions) {
-    if (info.projectId) activeProjectIds.add(info.projectId);
+    if (info.projectId && info.state === "running") activeProjectIds.add(info.projectId);
   }
 
   // Fetch chat messages
