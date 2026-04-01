@@ -19,21 +19,85 @@ app.use(routes);
 
 const server = http.createServer(app);
 
-// --- REST endpoints (original backend) ---
+// --- REST endpoints ---
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-// --- Agent lifecycle ---
+// --- Unified agent sessions ---
+// Single map: key = "project/agent" → { projectId, agentId, term, ws, state, error }
+// PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
+const agentSessions = new Map();
 
-const agentProcesses = new Map();
+// AgentChattr server process (separate — not a PTY agent)
 let chattrProcess = { process: null, state: "stopped", error: null };
+
+// Helper: spawn a PTY for a project/agent and register in agentSessions
+function spawnAgentPty(project, agent) {
+  const key = `${project}/${agent}`;
+
+  const cwd = resolveAgentCwd(project, agent);
+  if (!cwd) return { ok: false, error: `Unknown agent: ${key}` };
+
+  const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
+
+  try {
+    const term = pty.spawn(command, [], {
+      name: "xterm-256color",
+      cols: 120,
+      rows: 30,
+      cwd,
+      env: process.env,
+    });
+
+    const session = { projectId: project, agentId: agent, term, ws: null, state: "running", error: null };
+    agentSessions.set(key, session);
+
+    term.onExit(({ exitCode }) => {
+      const current = agentSessions.get(key);
+      if (current && current.term === term) {
+        current.state = "stopped";
+        current.error = exitCode ? `exit:${exitCode}` : null;
+        current.term = null;
+        // Close WS if attached
+        if (current.ws && current.ws.readyState <= 1) {
+          current.ws.close(1000, `exited:${exitCode}`);
+        }
+        current.ws = null;
+      }
+    });
+
+    return { ok: true, pid: term.pid };
+  } catch (err) {
+    agentSessions.set(key, { projectId: project, agentId: agent, term: null, ws: null, state: "error", error: err.message });
+    return { ok: false, error: err.message };
+  }
+}
+
+// Helper: stop an agent session — kill PTY, close WS
+function stopAgentSession(key) {
+  const session = agentSessions.get(key);
+  if (!session) {
+    agentSessions.set(key, { projectId: null, agentId: null, term: null, ws: null, state: "stopped", error: null });
+    return;
+  }
+  if (session.term) {
+    try { session.term.kill(); } catch {}
+    session.term = null;
+  }
+  if (session.ws && session.ws.readyState <= 1) {
+    session.ws.close(1000, "stopped");
+  }
+  session.ws = null;
+  session.state = "stopped";
+  session.error = null;
+}
 
 app.get("/api/agents", (_req, res) => {
   const agents = {};
-  for (const [key, info] of agentProcesses) {
-    agents[key] = { state: info.state, error: info.error || null };
+  for (const [key, session] of agentSessions) {
+    agents[key] = { state: session.state, error: session.error || null };
   }
   agents["_agentchattr"] = { state: chattrProcess.state, error: chattrProcess.error };
   res.json(agents);
@@ -109,136 +173,73 @@ app.post("/api/agentchattr/:action", (req, res) => {
   }
 });
 
+// --- Lifecycle: start spawns PTY (visible in terminal panel) ---
+
 app.post("/api/agents/:project/:agent/start", (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
-  if (agentProcesses.has(key) && agentProcesses.get(key).state === "running") {
+  const existing = agentSessions.get(key);
+  if (existing && existing.state === "running" && existing.term) {
     return res.json({ ok: true, state: "running", message: "Already running" });
   }
 
-  const cfg = readConfig();
-  const proj = cfg.projects && cfg.projects.find((p) => p.id === project);
-  if (!proj || !proj.agents || !proj.agents[agent]) {
-    return res.status(400).json({ ok: false, error: `Unknown agent: ${key}` });
-  }
-
-  const agentCfg = proj.agents[agent];
-  const cwd = agentCfg.cwd || proj.working_dir || process.env.HOME;
-  const command = agentCfg.command || "claude";
-
-  try {
-    const child = spawn(command, [], {
-      cwd,
-      env: { ...process.env, TERM: "xterm-256color" },
-      stdio: "ignore",
-      detached: true,
-    });
-    child.unref();
-
-    child.on("error", (err) => {
-      agentProcesses.set(key, { process: null, state: "error", error: err.message });
-    });
-
-    child.on("exit", (code) => {
-      const existing = agentProcesses.get(key);
-      if (existing && existing.process === child) {
-        agentProcesses.set(key, { process: null, state: "stopped", error: code ? `exit:${code}` : null });
-      }
-    });
-
-    agentProcesses.set(key, { process: child, state: "running", error: null });
-    res.json({ ok: true, state: "running", pid: child.pid });
-  } catch (err) {
-    agentProcesses.set(key, { process: null, state: "error", error: err.message });
-    res.status(500).json({ ok: false, state: "error", error: err.message });
+  const result = spawnAgentPty(project, agent);
+  if (result.ok) {
+    res.json({ ok: true, state: "running", pid: result.pid });
+  } else {
+    res.status(result.error?.includes("Unknown") ? 400 : 500).json({ ok: false, state: "error", error: result.error });
   }
 });
+
+// --- Lifecycle: stop kills PTY + closes WS ---
 
 app.post("/api/agents/:project/:agent/stop", (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
-  const info = agentProcesses.get(key);
-
-  if (!info || !info.process) {
-    agentProcesses.set(key, { process: null, state: "stopped", error: null });
-    return res.json({ ok: true, state: "stopped" });
-  }
-
-  try {
-    info.process.kill("SIGTERM");
-    agentProcesses.set(key, { process: null, state: "stopped", error: null });
-    res.json({ ok: true, state: "stopped" });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  stopAgentSession(key);
+  res.json({ ok: true, state: "stopped" });
 });
+
+// --- Lifecycle: restart ---
 
 app.post("/api/agents/:project/:agent/restart", (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
-  const info = agentProcesses.get(key);
 
-  if (info && info.process) {
-    try { info.process.kill("SIGTERM"); } catch {}
-  }
-  agentProcesses.set(key, { process: null, state: "stopped", error: null });
+  stopAgentSession(key);
 
   setTimeout(() => {
-    const cfg = readConfig();
-    const proj = cfg.projects && cfg.projects.find((p) => p.id === project);
-    if (!proj || !proj.agents || !proj.agents[agent]) {
-      return res.status(400).json({ ok: false, error: `Unknown agent: ${key}` });
-    }
-    const agentCfg = proj.agents[agent];
-    const cwd = agentCfg.cwd || proj.working_dir || process.env.HOME;
-    const command = agentCfg.command || "claude";
-
-    try {
-      const child = spawn(command, [], {
-        cwd,
-        env: { ...process.env, TERM: "xterm-256color" },
-        stdio: "ignore",
-        detached: true,
-      });
-      child.unref();
-      child.on("error", (err) => {
-        agentProcesses.set(key, { process: null, state: "error", error: err.message });
-      });
-      child.on("exit", (code) => {
-        const existing = agentProcesses.get(key);
-        if (existing && existing.process === child) {
-          agentProcesses.set(key, { process: null, state: "stopped", error: code ? `exit:${code}` : null });
-        }
-      });
-      agentProcesses.set(key, { process: child, state: "running", error: null });
-      res.json({ ok: true, state: "running", pid: child.pid });
-    } catch (err) {
-      agentProcesses.set(key, { process: null, state: "error", error: err.message });
-      res.status(500).json({ ok: false, state: "error", error: err.message });
+    const result = spawnAgentPty(project, agent);
+    if (result.ok) {
+      res.json({ ok: true, state: "running", pid: result.pid });
+    } else {
+      res.status(500).json({ ok: false, state: "error", error: result.error });
     }
   }, 500);
 });
 
-// --- Active sessions tracking ---
+// --- Sessions tracking (for /api/projects dashboard) ---
 
-const activeSessions = new Map();
-
-// Expose activeSessions to migrated routes (for /api/projects)
-app.set("activeSessions", activeSessions);
+// Expose agentSessions to migrated routes
+app.set("activeSessions", agentSessions);
 
 app.get("/api/sessions", (_req, res) => {
   const sessions = [];
-  for (const [, info] of activeSessions) {
-    sessions.push({ projectId: info.projectId, agentId: info.agentId });
+  for (const [, info] of agentSessions) {
+    if (info.state === "running") {
+      sessions.push({ projectId: info.projectId, agentId: info.agentId });
+    }
   }
   res.json(sessions);
 });
 
+// --- Write to active PTY session ---
+
 app.post("/api/agents/:project/:agent/write", (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
-  const session = activeSessions.get(key);
+  const session = agentSessions.get(key);
 
   if (!session || !session.term) {
     return res.status(404).json({ ok: false, error: "No active terminal session" });
@@ -360,7 +361,6 @@ if (fs.existsSync(outDir)) {
 
 // SPA fallback: serve index.html for all non-API, non-WS routes
 app.get("*", (req, res) => {
-  // Don't intercept API routes (already handled above)
   if (req.path.startsWith("/api/")) {
     return res.status(404).json({ error: "Not found" });
   }
@@ -373,6 +373,8 @@ app.get("*", (req, res) => {
 });
 
 // --- WebSocket + PTY ---
+// WS connects to an existing PTY session (started via lifecycle API)
+// or spawns a new one if none exists.
 
 const wss = new WebSocketServer({ server, path: "/ws/terminal" });
 
@@ -380,66 +382,60 @@ wss.on("connection", (ws, req) => {
   const params = new URL(req.url, `http://localhost:${PORT}`).searchParams;
   const projectId = params.get("project");
   const agentId = params.get("agent");
-  const defaultShell = process.env.SHELL || "/bin/zsh";
 
   if (!projectId || !agentId) {
     ws.close(1008, "missing project or agent query params");
     return;
   }
 
-  const cwd = resolveAgentCwd(projectId, agentId);
-  if (!cwd) {
-    ws.close(1008, `unknown project/agent: ${projectId}/${agentId}`);
-    return;
-  }
-
-  const command = resolveAgentCommand(projectId, agentId) || defaultShell;
   const sessionKey = `${projectId}/${agentId}`;
+  let session = agentSessions.get(sessionKey);
 
-  let term;
-  try {
-    term = pty.spawn(command, [], {
-      name: "xterm-256color",
-      cols: 120,
-      rows: 30,
-      cwd,
-      env: process.env,
-    });
-  } catch (err) {
-    console.error("Failed to spawn PTY:", err.message);
-    ws.close(1011, "pty-spawn-failed");
-    return;
+  // If no active PTY, spawn one
+  if (!session || !session.term) {
+    const result = spawnAgentPty(projectId, agentId);
+    if (!result.ok) {
+      ws.close(1011, "pty-spawn-failed");
+      return;
+    }
+    session = agentSessions.get(sessionKey);
   }
 
-  activeSessions.set(sessionKey, { projectId, agentId, term });
+  // Close previous WS if one was attached
+  if (session.ws && session.ws !== ws && session.ws.readyState <= 1) {
+    session.ws.close(1000, "replaced");
+  }
 
-  term.onData((data) => {
+  // Attach WS to session
+  session.ws = ws;
+
+  // PTY → client
+  const dataHandler = session.term.onData((data) => {
     if (ws.readyState === ws.OPEN) {
       ws.send(data);
     }
   });
 
-  term.onExit(({ exitCode }) => {
-    if (ws.readyState === ws.OPEN) {
-      ws.close(1000, `exited:${exitCode}`);
-    }
-  });
-
+  // Client → PTY
   ws.on("message", (msg) => {
+    if (!session.term) return;
     const str = msg.toString();
     try {
       const parsed = JSON.parse(str);
       if (parsed.type === "resize" && parsed.cols && parsed.rows) {
-        term.resize(parsed.cols, parsed.rows);
+        session.term.resize(parsed.cols, parsed.rows);
         return;
       }
     } catch {}
-    term.write(str);
+    session.term.write(str);
   });
 
   ws.on("close", () => {
-    activeSessions.delete(sessionKey);
-    term.kill();
+    dataHandler.dispose();
+    // Only clear ws reference, don't kill PTY (it stays running for reconnect)
+    if (session.ws === ws) {
+      session.ws = null;
+    }
   });
 });
 
