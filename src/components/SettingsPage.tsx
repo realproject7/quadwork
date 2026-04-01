@@ -147,10 +147,24 @@ export default function SettingsPage() {
     if (!config) return;
     setSaving(true);
     try {
+      // Save bot tokens securely to .env via telegram API, then strip from config
+      const configToSave = JSON.parse(JSON.stringify(config));
+      for (const project of configToSave.projects) {
+        if (project.telegram?.bot_token && !project.telegram.bot_token.startsWith("env:")) {
+          await fetch("/api/telegram?action=save-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project_id: project.id, bot_token: project.telegram.bot_token }),
+          });
+          // Config will be updated by save-token to use env: reference
+          const envKey = `TELEGRAM_BOT_TOKEN_${project.id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+          project.telegram.bot_token = `env:${envKey}`;
+        }
+      }
       const res = await fetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify(configToSave),
       });
       if (!res.ok) throw new Error(`${res.status}`);
       setSaved(true);

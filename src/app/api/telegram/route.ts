@@ -7,6 +7,7 @@ import os from "os";
 const QUADWORK_DIR = path.join(os.homedir(), ".quadwork");
 const BRIDGE_DIR = path.join(QUADWORK_DIR, "agentchattr-telegram");
 const CONFIG_PATH = path.join(QUADWORK_DIR, "config.json");
+const ENV_PATH = path.join(QUADWORK_DIR, ".env");
 
 function pidFile(projectId: string): string {
   return path.join(QUADWORK_DIR, `telegram-bridge-${projectId}.pid`);
@@ -31,14 +32,58 @@ function isRunning(projectId: string): boolean {
   }
 }
 
+/** Read a key=value from ~/.quadwork/.env */
+function readEnvToken(key: string): string {
+  try {
+    const content = fs.readFileSync(ENV_PATH, "utf-8");
+    const match = content.match(new RegExp(`^${key}=(.*)$`, "m"));
+    return match ? match[1].trim().replace(/^["']|["']$/g, "") : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Write or update a key=value in ~/.quadwork/.env */
+function writeEnvToken(key: string, value: string): void {
+  let content = "";
+  try {
+    content = fs.readFileSync(ENV_PATH, "utf-8");
+  } catch {
+    // File doesn't exist yet
+  }
+  const regex = new RegExp(`^${key}=.*$`, "m");
+  const line = `${key}=${value}`;
+  if (regex.test(content)) {
+    content = content.replace(regex, line);
+  } else {
+    content = content.trimEnd() + (content ? "\n" : "") + line + "\n";
+  }
+  fs.writeFileSync(ENV_PATH, content, { mode: 0o600 });
+  fs.chmodSync(ENV_PATH, 0o600);
+}
+
+/** Resolve a bot_token value — if it starts with "env:" read from .env file */
+function resolveToken(value: string): string {
+  if (value.startsWith("env:")) {
+    return readEnvToken(value.slice(4)) || "";
+  }
+  return value;
+}
+
+function envKeyForProject(projectId: string): string {
+  const safe = projectId.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  return `TELEGRAM_BOT_TOKEN_${safe}`;
+}
+
 function getProjectTelegram(projectId: string): { bot_token: string; chat_id: string; agentchattr_url: string } | null {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
     const cfg = JSON.parse(raw);
     const project = cfg.projects?.find((p: { id: string }) => p.id === projectId);
     if (!project?.telegram) return null;
+    const rawToken = project.telegram.bot_token || "";
     return {
-      bot_token: project.telegram.bot_token || "",
+      bot_token: resolveToken(rawToken),
       chat_id: project.telegram.chat_id || "",
       agentchattr_url: cfg.agentchattr_url || "http://127.0.0.1:8300",
     };
@@ -70,6 +115,8 @@ export async function POST(req: NextRequest) {
       return stopDaemon(body.project_id);
     case "status":
       return NextResponse.json({ running: isRunning(body.project_id || "") });
+    case "save-token":
+      return saveToken(body.project_id, body.bot_token);
     default:
       return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   }
@@ -79,8 +126,12 @@ async function testConnection(botToken: string, chatId: string) {
   if (!botToken || !chatId) {
     return NextResponse.json({ ok: false, error: "Missing bot_token or chat_id" });
   }
+  const resolved = resolveToken(botToken);
+  if (!resolved) {
+    return NextResponse.json({ ok: false, error: "Could not resolve bot token from environment" });
+  }
   try {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/getChat?chat_id=${chatId}`);
+    const res = await fetch(`https://api.telegram.org/bot${resolved}/getChat?chat_id=${chatId}`);
     const data = await res.json();
     return NextResponse.json({ ok: data.ok, error: data.ok ? undefined : data.description });
   } catch (err) {
@@ -112,7 +163,8 @@ function writeProjectToml(projectId: string): string | null {
 
   const tomlPath = configToml(projectId);
   const content = `[telegram]\nbot_token = "${tg.bot_token}"\nchat_id = "${tg.chat_id}"\n\n[agentchattr]\nurl = "${tg.agentchattr_url}"\n`;
-  fs.writeFileSync(tomlPath, content);
+  fs.writeFileSync(tomlPath, content, { mode: 0o600 });
+  fs.chmodSync(tomlPath, 0o600);
   return tomlPath;
 }
 
@@ -147,6 +199,29 @@ function startDaemon(projectId: string) {
   } catch (err) {
     return NextResponse.json({ ok: false, error: err instanceof Error ? err.message : "Start failed" });
   }
+}
+
+function saveToken(projectId: string, botToken: string) {
+  if (!projectId) {
+    return NextResponse.json({ ok: false, error: "Missing project_id" });
+  }
+  const envKey = envKeyForProject(projectId);
+  writeEnvToken(envKey, botToken);
+
+  // Update config.json to use env reference instead of plaintext
+  try {
+    const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+    const cfg = JSON.parse(raw);
+    const project = cfg.projects?.find((p: { id: string }) => p.id === projectId);
+    if (project?.telegram) {
+      project.telegram.bot_token = `env:${envKey}`;
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    }
+  } catch {
+    // Config update is best-effort; token is already saved in .env
+  }
+
+  return NextResponse.json({ ok: true, env_key: envKey });
 }
 
 function stopDaemon(projectId: string) {
