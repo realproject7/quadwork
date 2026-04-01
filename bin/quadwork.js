@@ -252,29 +252,42 @@ function writeAgentChattrConfig(setup, configTomlPath) {
   ok(`Wrote ${configTomlPath}`);
 
   // Install AgentChattr if missing, then start it
-  const acInstalled = run("agentchattr --version") || run("python3 -m agentchattr --version");
-  if (!acInstalled) {
+  // Only check for the actual binary — python3 -m availability doesn't mean the CLI is in PATH
+  let acAvailable = which("agentchattr");
+  if (!acAvailable) {
     log("Installing AgentChattr...");
     const installResult = run("pip install agentchattr 2>&1");
-    if (installResult !== null) ok("Installed AgentChattr");
-    else warn("Failed to install AgentChattr — install manually: pip install agentchattr");
+    if (installResult !== null) {
+      ok("Installed AgentChattr");
+      // Re-check that the binary is actually in PATH after install
+      acAvailable = which("agentchattr");
+      if (!acAvailable) warn("agentchattr binary not found in PATH after install");
+    } else {
+      warn("Failed to install AgentChattr — install manually: pip install agentchattr");
+    }
   }
 
-  // Start AgentChattr server
-  log("Starting AgentChattr server...");
-  const acProc = spawn("agentchattr", ["--config", configTomlPath], {
-    stdio: "ignore",
-    detached: true,
-  });
-  acProc.unref();
-  if (acProc.pid) {
-    ok(`AgentChattr started (PID: ${acProc.pid})`);
-    // Save PID for stop
-    const pidFile = path.join(CONFIG_DIR, "agentchattr.pid");
-    if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(pidFile, String(acProc.pid));
+  // Start AgentChattr server (only if installed)
+  if (acAvailable) {
+    log("Starting AgentChattr server...");
+    const acProc = spawn("agentchattr", ["--config", configTomlPath], {
+      stdio: "ignore",
+      detached: true,
+    });
+    acProc.on("error", (err) => {
+      warn(`AgentChattr failed to start: ${err.message}`);
+    });
+    acProc.unref();
+    if (acProc.pid) {
+      ok(`AgentChattr started (PID: ${acProc.pid})`);
+      const pidFile = path.join(CONFIG_DIR, "agentchattr.pid");
+      if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+      fs.writeFileSync(pidFile, String(acProc.pid));
+    } else {
+      warn("Could not start AgentChattr — start manually: agentchattr --config " + configTomlPath);
+    }
   } else {
-    warn("Could not start AgentChattr — start manually: agentchattr --config " + configTomlPath);
+    warn("AgentChattr not installed — skipping auto-start. Start manually later: agentchattr --config " + configTomlPath);
   }
 
   return configTomlPath;
@@ -557,15 +570,16 @@ function cmdStart() {
   const pidFile = path.join(CONFIG_DIR, "server.pid");
   fs.writeFileSync(pidFile, String(server.pid));
 
-  // Start AgentChattr if config.toml exists for first project
+  // Start AgentChattr if installed and config.toml exists for first project
   const firstProject = config.projects[0];
-  if (firstProject) {
+  if (firstProject && which("agentchattr")) {
     const configToml = path.join(firstProject.working_dir, "config.toml");
     if (fs.existsSync(configToml)) {
       const acProc = spawn("agentchattr", ["--config", configToml], {
         stdio: "ignore",
         detached: true,
       });
+      acProc.on("error", () => {});
       acProc.unref();
       if (acProc.pid) {
         ok(`AgentChattr started (PID: ${acProc.pid})`);
