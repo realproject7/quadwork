@@ -67,6 +67,8 @@ function writeConfig(config) {
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────
 
+let agentChattrFound = false;
+
 function checkPrereqs() {
   header("Step 1: Prerequisites");
   let allOk = true;
@@ -90,7 +92,7 @@ function checkPrereqs() {
 
   // AgentChattr
   const acVer = run("agentchattr --version") || run("python3 -m agentchattr --version");
-  if (acVer) ok(`AgentChattr ${acVer}`);
+  if (acVer) { ok(`AgentChattr ${acVer}`); agentChattrFound = true; }
   else { warn("AgentChattr not found — install: pip install agentchattr"); allOk = false; }
 
   // gh CLI
@@ -262,7 +264,7 @@ async function setupAgents(rl, repo) {
 
 // ─── AgentChattr Config ─────────────────────────────────────────────────────
 
-function writeAgentChattrConfig(setup, configTomlPath) {
+function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } = {}) {
   header("Step 4: AgentChattr Setup");
 
   let tomlContent = fs.readFileSync(path.join(TEMPLATES_DIR, "config.toml"), "utf-8");
@@ -287,15 +289,13 @@ function writeAgentChattrConfig(setup, configTomlPath) {
   fs.writeFileSync(configTomlPath, tomlContent);
   ok(`Wrote ${configTomlPath}`);
 
-  // Install AgentChattr if missing, then start it
-  // Only check for the actual binary — python3 -m availability doesn't mean the CLI is in PATH
+  // Start AgentChattr if available; optionally skip install attempt
   let acAvailable = which("agentchattr");
-  if (!acAvailable) {
+  if (!acAvailable && !skipInstall) {
     log("Installing AgentChattr...");
     const installResult = run("pip install agentchattr 2>&1");
     if (installResult !== null) {
       ok("Installed AgentChattr");
-      // Re-check that the binary is actually in PATH after install
       acAvailable = which("agentchattr");
       if (!acAvailable) warn("agentchattr binary not found in PATH after install");
     } else {
@@ -536,9 +536,9 @@ async function cmdInit() {
     const setup = await setupAgents(rl, repo);
     if (!setup) { rl.close(); process.exit(1); }
 
-    // Step 4: AgentChattr config
+    // Step 4: AgentChattr config (skip install if prereqs already flagged it missing)
     const configTomlPath = path.join(setup.absDir, "config.toml");
-    writeAgentChattrConfig(setup, configTomlPath);
+    writeAgentChattrConfig(setup, configTomlPath, { skipInstall: !agentChattrFound });
 
     // Step 5: Optional add-ons
     await setupAddons(rl, setup, configTomlPath);
@@ -550,9 +550,12 @@ async function cmdInit() {
     header("Setup Complete");
     log(`Project:      ${setup.projectName}`);
     log(`Repo:         ${setup.repo}`);
-    log(`Worktrees:    ${AGENTS.map((a) => `${a}/`).join(", ")}`);
+    log(`Worktrees:    ${AGENTS.map((a) => `${setup.projectName}-${a}/`).join(", ")}`);
+    log(`Backends:     ${AGENTS.map((a) => `${a.toUpperCase()}=${(setup.backends && setup.backends[a]) || setup.backend}`).join(", ")}`);
     log(`Config:       ${CONFIG_PATH}`);
     log(`AgentChattr:  ${configTomlPath}`);
+    if (setup.telegram) log(`Telegram:     configured`);
+    if (setup.memoryDir) log(`Shared Memory: ${setup.memoryDir}`);
     log("");
     log("Next steps:");
     log("  npx quadwork start    — launch dashboard + agents");
