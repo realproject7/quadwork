@@ -276,7 +276,7 @@ async function setupAgents(rl, repo) {
 
   const projectName = path.basename(absDir);
   log(`Project: ${projectName}`);
-  log("Creating worktrees for 4 agents...\n");
+  log("Creating worktrees for 4 agents...");
 
   const worktrees = {};
   for (const agent of AGENTS) {
@@ -366,14 +366,15 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
   // Start AgentChattr if available; optionally skip install attempt
   let acAvailable = which("agentchattr");
   if (!acAvailable && !skipInstall) {
-    log("Installing AgentChattr...");
+    const acSpinner = spinner("Installing AgentChattr...");
     const installResult = run("pip install agentchattr 2>&1");
     if (installResult !== null) {
-      ok("Installed AgentChattr");
+      acSpinner.stop(true);
       acAvailable = which("agentchattr");
       if (!acAvailable) warn("agentchattr binary not found in PATH after install");
     } else {
-      warn("Failed to install AgentChattr — install manually: pip install agentchattr");
+      acSpinner.stop(false);
+      warn("Install manually: pip install agentchattr");
     }
   }
 
@@ -414,10 +415,10 @@ async function setupAddons(rl, setup, configTomlPath) {
   if (wantTelegram) {
     const telegramDir = path.join(path.dirname(setup.absDir), "agentchattr-telegram");
     if (!fs.existsSync(telegramDir)) {
-      log("Cloning agentchattr-telegram...");
+      const cloneSpinner = spinner("Cloning agentchattr-telegram...");
       const cloneResult = run(`git clone https://github.com/realproject7/agentchattr-telegram.git "${telegramDir}" 2>&1`);
-      if (cloneResult !== null) ok("Cloned agentchattr-telegram");
-      else warn("Failed to clone — you can set it up manually later");
+      cloneSpinner.stop(cloneResult !== null);
+      if (!cloneResult) warn("You can set it up manually later");
     } else {
       ok("agentchattr-telegram already present");
     }
@@ -425,8 +426,9 @@ async function setupAddons(rl, setup, configTomlPath) {
     if (fs.existsSync(telegramDir)) {
       const reqFile = path.join(telegramDir, "requirements.txt");
       if (fs.existsSync(reqFile)) {
-        run(`pip install -r "${reqFile}" 2>&1`);
-        ok("Installed Telegram Bridge dependencies");
+        const tgSpinner = spinner("Installing Telegram Bridge dependencies...");
+        const tgResult = run(`pip install -r "${reqFile}" 2>&1`);
+        tgSpinner.stop(tgResult !== null);
       }
 
       log("Create a bot via @BotFather on Telegram (https://t.me/BotFather), then copy the token.");
@@ -506,10 +508,10 @@ bridge_sender = "telegram-bridge"
   if (wantMemory) {
     const memoryDir = path.join(path.dirname(setup.absDir), "agent-memory");
     if (!fs.existsSync(memoryDir)) {
-      log("Cloning agent-memory...");
+      const memSpinner = spinner("Cloning agent-memory...");
       const cloneResult = run(`git clone https://github.com/realproject7/agent-memory.git "${memoryDir}" 2>&1`);
-      if (cloneResult !== null) ok("Cloned agent-memory");
-      else warn("Failed to clone — you can set it up manually later");
+      memSpinner.stop(cloneResult !== null);
+      if (!cloneResult) warn("You can set it up manually later");
     } else {
       ok("agent-memory already present");
     }
