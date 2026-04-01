@@ -276,25 +276,19 @@ async function setupAgents(rl, repo) {
 
   const projectName = path.basename(absDir);
   log(`Project: ${projectName}`);
-  log("Creating worktrees for 4 agents...");
+  const wtSpinner = spinner("Creating worktrees and seeding files...");
 
   const worktrees = {};
+  let wtFailed = null;
   for (const agent of AGENTS) {
     const wtDir = path.join(path.dirname(absDir), `${projectName}-${agent}`);
-    if (fs.existsSync(wtDir)) {
-      ok(`Worktree exists: ${agent} → ${wtDir}`);
-    } else {
+    if (!fs.existsSync(wtDir)) {
       const branchName = `worktree-${agent}`;
-      // Create branch if needed
       run(`git -C "${absDir}" branch ${branchName} HEAD 2>&1`);
       const result = run(`git -C "${absDir}" worktree add "${wtDir}" ${branchName} 2>&1`);
-      if (result !== null) {
-        ok(`Created worktree: ${agent} → ${wtDir}`);
-      } else {
-        // Try without branch (detached)
+      if (!result) {
         const result2 = run(`git -C "${absDir}" worktree add --detach "${wtDir}" HEAD 2>&1`);
-        if (result2 !== null) ok(`Created worktree (detached): ${agent} → ${wtDir}`);
-        else { fail(`Failed to create worktree for ${agent}`); return null; }
+        if (!result2) { wtFailed = agent; break; }
       }
     }
     worktrees[agent] = wtDir;
@@ -314,8 +308,13 @@ async function setupAgents(rl, repo) {
         seedContent = seedContent.replace(/\{\{reviewer_token_path\}\}/g, "");
       }
       fs.writeFileSync(seedDst, seedContent);
-      log(`  Copied ${agent}.AGENTS.md`);
     }
+  }
+
+  if (wtFailed) {
+    wtSpinner.stop(false);
+    fail(`Failed to create worktree for ${wtFailed}`);
+    return null;
   }
 
   // Copy CLAUDE.md to each worktree
@@ -325,13 +324,13 @@ async function setupAgents(rl, repo) {
     claudeContent = claudeContent.replace(/\{\{project_name\}\}/g, projectName);
     for (const agent of AGENTS) {
       const dst = path.join(worktrees[agent], "CLAUDE.md");
-      // Don't overwrite if CLAUDE.md already exists
       if (!fs.existsSync(dst)) {
         fs.writeFileSync(dst, claudeContent);
       }
     }
-    ok("Copied CLAUDE.md to all worktrees");
   }
+
+  wtSpinner.stop(true);
 
   return { projectName, absDir, worktrees, repo, backend, backends };
 }
