@@ -35,7 +35,7 @@ function which(cmd) {
 
 function ask(rl, question, defaultVal) {
   return new Promise((resolve) => {
-    const suffix = defaultVal ? ` (${defaultVal})` : "";
+    const suffix = defaultVal ? ` [${defaultVal}]` : "";
     rl.question(`  ${question}${suffix}: `, (answer) => {
       resolve(answer.trim() || defaultVal || "");
     });
@@ -173,7 +173,8 @@ async function setupAgents(rl, repo) {
     }
   }
 
-  log("Path to your local clone of the repo. Worktrees will be created as sibling directories.");
+  log("Path to your local clone of the repo. Four worktrees will be created next to it");
+  log("(e.g., project-t1/, project-t2a/, project-t2b/, project-t3/).");
   const projectDir = await ask(rl, "Project directory", process.cwd());
   const absDir = path.resolve(projectDir);
 
@@ -517,6 +518,7 @@ function writeQuadWorkConfig(setup) {
 
 async function cmdInit() {
   console.log("\n  QuadWork Init — 4-agent coding team setup\n");
+  console.log("  Tip: Press Enter to accept defaults shown in [brackets].\n");
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
