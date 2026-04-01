@@ -3,7 +3,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand } = require("./config");
 
 const config = readConfig();
 const PORT = config.port || 3001;
@@ -357,7 +357,7 @@ wss.on("connection", (ws, req) => {
   const params = new URL(req.url, `http://localhost:${PORT}`).searchParams;
   const projectId = params.get("project");
   const agentId = params.get("agent");
-  const shell = process.env.SHELL || "/bin/zsh";
+  const defaultShell = process.env.SHELL || "/bin/zsh";
 
   if (!projectId || !agentId) {
     ws.close(1008, "missing project or agent query params");
@@ -370,11 +370,12 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
+  const command = resolveAgentCommand(projectId, agentId) || defaultShell;
   const sessionKey = `${projectId}/${agentId}`;
 
   let term;
   try {
-    term = pty.spawn(shell, [], {
+    term = pty.spawn(command, [], {
       name: "xterm-256color",
       cols: 120,
       rows: 30,

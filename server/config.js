@@ -47,4 +47,17 @@ function resolveAgentCwd(projectId, agentId) {
   return agent.cwd;
 }
 
-module.exports = { readConfig, resolveAgentCwd, CONFIG_PATH };
+/**
+ * Resolve the configured command for a project/agent pair.
+ * Returns null if not found (caller should fall back to default shell).
+ */
+function resolveAgentCommand(projectId, agentId) {
+  const config = readConfig();
+  const project = config.projects.find((p) => p.id === projectId);
+  if (!project) return null;
+  const agent = project.agents && project.agents[agentId];
+  if (!agent || !agent.command) return null;
+  return agent.command;
+}
+
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH };
