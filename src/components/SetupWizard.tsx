@@ -42,6 +42,8 @@ export default function SetupWizard() {
     t1: "claude", t2a: "claude", t2b: "claude", t3: "claude",
   });
   const [workingDir, setWorkingDir] = useState("");
+  const [reviewerUser, setReviewerUser] = useState("");
+  const [reviewerTokenPath, setReviewerTokenPath] = useState("");
   const [loading, setLoading] = useState(false);
 
   const updateStep = (idx: number, updates: Partial<Step>) => {
@@ -102,13 +104,14 @@ export default function SetupWizard() {
   };
 
   const seedFiles = async () => {
-    const result = await apiCall("seed-files", { workingDir, projectName, repo });
+    const result = await apiCall("seed-files", { workingDir, projectName, repo, reviewerUser, reviewerTokenPath });
     if (result.ok) goNext();
     else updateStep(currentStep, { status: "error", error: result.error });
   };
 
   const saveConfig = async () => {
-    const id = projectName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+    // Use directory basename as project ID (matches CLI wizard)
+    const id = workingDir.split("/").pop() || projectName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
     const result = await apiCall("add-config", { id, name: projectName, repo, workingDir, backends });
     if (result.ok) {
       updateStep(currentStep, { status: "done" });
@@ -239,6 +242,20 @@ export default function SetupWizard() {
                   </div>
                 ))}
               </div>
+              <h2 className="text-sm font-semibold text-text mb-2 mt-4">Reviewer Credentials</h2>
+              <p className="text-[11px] text-text-muted mb-2">Used by T2a/T2b to post GitHub reviews</p>
+              <input
+                value={reviewerUser}
+                onChange={(e) => setReviewerUser(e.target.value)}
+                placeholder="Reviewer GitHub username"
+                className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-2"
+              />
+              <input
+                value={reviewerTokenPath}
+                onChange={(e) => setReviewerTokenPath(e.target.value)}
+                placeholder="Token file path (default: ~/.quadwork/reviewer-token)"
+                className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-3"
+              />
               <button onClick={goNext} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors">
                 Next
               </button>
@@ -263,7 +280,7 @@ export default function SetupWizard() {
           {step?.id === "worktrees" && (
             <div>
               <h2 className="text-sm font-semibold text-text mb-3">Create Worktrees</h2>
-              <p className="text-[11px] text-text-muted mb-3">Creates 4 git worktrees: t1/, t2a/, t2b/, t3/ in <code className="text-accent">{workingDir}</code></p>
+              <p className="text-[11px] text-text-muted mb-3">Creates 4 git worktrees as sibling directories: <code className="text-accent">{workingDir ? `${workingDir.split("/").pop()}-t1/` : "project-t1/"}</code>, etc.</p>
               {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
               <div className="flex gap-2">
                 <button onClick={createWorktrees} disabled={loading} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
