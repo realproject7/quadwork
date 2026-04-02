@@ -599,12 +599,19 @@ export default function SetupWizard() {
                           className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
                         />
                       ) : (
-                        <input
-                          value={reviewerTokenPath}
-                          onChange={(e) => setReviewerTokenPath(e.target.value)}
-                          placeholder="~/.quadwork/reviewer-token"
-                          className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
-                        />
+                        <>
+                          <input
+                            value={reviewerTokenPath}
+                            onChange={(e) => setReviewerTokenPath(e.target.value)}
+                            placeholder="~/.quadwork/reviewer-token"
+                            className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+                          />
+                          {reviewerTokenPath && !reviewerTokenPath.startsWith("~/.quadwork") && !reviewerTokenPath.startsWith(String.raw`${process.env.HOME}/.quadwork`) && (
+                            <p className="text-[10px] text-[#ffcc00] mt-1">
+                              This path may be inside a git repository. Consider using the default ~/.quadwork/ location to avoid accidentally committing tokens.
+                            </p>
+                          )}
+                        </>
                       )}
                     </div>
                   </div>

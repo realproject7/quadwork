@@ -619,6 +619,20 @@ router.post("/api/setup", (req, res) => {
           }
           seeded.push(`${agent}/CLAUDE.md`);
         }
+
+        // .gitignore — ensure token files are never committed
+        const gitignorePath = path.join(wtDir, ".gitignore");
+        const tokenIgnorePatterns = "reviewer-token\n*-token\n";
+        if (!fs.existsSync(gitignorePath)) {
+          fs.writeFileSync(gitignorePath, tokenIgnorePatterns);
+          seeded.push(`${agent}/.gitignore`);
+        } else {
+          const existing = fs.readFileSync(gitignorePath, "utf-8");
+          if (!existing.includes("*-token")) {
+            fs.appendFileSync(gitignorePath, "\n" + tokenIgnorePatterns);
+            seeded.push(`${agent}/.gitignore (updated)`);
+          }
+        }
       }
       return res.json({ ok: true, seeded });
     }
