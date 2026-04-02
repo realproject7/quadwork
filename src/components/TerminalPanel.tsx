@@ -48,8 +48,10 @@ export default function TerminalPanel({
 
     const term = new Terminal({
       scrollback: 1000,
-      fontSize: 13,
-      fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+      fontSize: 12,
+      fontFamily: '"Geist Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
+      lineHeight: 1.4,
+      letterSpacing: 0.5,
       cursorBlink: false,
       cursorStyle: "block",
       theme: {
