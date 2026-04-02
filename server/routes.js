@@ -625,9 +625,13 @@ router.post("/api/setup", (req, res) => {
       while (usedMcpPorts.has(mcp_http_port)) mcp_http_port++;
       let mcp_sse_port = mcp_http_port + 1;
       while (usedMcpPorts.has(mcp_sse_port)) mcp_sse_port++;
+      // Auto-generate per-project session token
+      const crypto = require("crypto");
+      const agentchattr_token = crypto.randomBytes(16).toString("hex");
       cfg.projects.push({
         id, name, repo, working_dir: workingDir, agents,
         agentchattr_url: `http://127.0.0.1:${chattrPort}`,
+        agentchattr_token,
         mcp_http_port,
         mcp_sse_port,
       });

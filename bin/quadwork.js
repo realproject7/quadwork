@@ -505,12 +505,17 @@ async function setupAddons(rl, setup, configTomlPath) {
           bridge_dir: telegramDir,
         };
 
+        // Resolve per-project AgentChattr URL
+        const projectCfg = readConfig();
+        const projectEntry = projectCfg.projects?.find((p) => p.id === setup.projectName);
+        const projectChattrUrl = projectEntry?.agentchattr_url || "http://127.0.0.1:8300";
+
         // Append telegram section to config.toml (token read from env at runtime)
         const telegramSection = `
 [telegram]
 bot_token = "env:${envKey}"
 chat_id = "${chatId}"
-agentchattr_url = "http://127.0.0.1:8300"
+agentchattr_url = "${projectChattrUrl}"
 poll_interval = 2
 bridge_sender = "telegram-bridge"
 `;
@@ -522,7 +527,7 @@ bridge_sender = "telegram-bridge"
         if (fs.existsSync(bridgeScript)) {
           log("Starting Telegram bridge...");
           const bridgeToml = path.join(CONFIG_DIR, `telegram-${setup.projectName}.toml`);
-          const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\n\n[agentchattr]\nurl = "http://127.0.0.1:8300"\n`;
+          const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\n\n[agentchattr]\nurl = "${projectChattrUrl}"\n`;
           fs.writeFileSync(bridgeToml, bridgeTomlContent, { mode: 0o600 });
           fs.chmodSync(bridgeToml, 0o600);
           const bridgeProc = spawn("python3", [bridgeScript, "--config", bridgeToml], {
@@ -640,6 +645,7 @@ function writeQuadWorkConfig(setup) {
   let mcp_sse = mcp_http + 1;
   while (usedMcpPorts.has(mcp_sse)) mcp_sse++;
   project.agentchattr_url = `http://127.0.0.1:${chattrPort}`;
+  project.agentchattr_token = require("crypto").randomBytes(16).toString("hex");
   project.mcp_http_port = mcp_http;
   project.mcp_sse_port = mcp_sse;
 
