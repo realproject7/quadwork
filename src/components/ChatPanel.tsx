@@ -33,15 +33,19 @@ function senderColor(sender: string): string {
 export default function ChatPanel() {
   const [mode, setMode] = useState<"iframe" | "api" | "loading">("loading");
   const [chattrUrl, setChattrUrl] = useState("");
+  const [chattrToken, setChattrToken] = useState("");
 
-  // Resolve AgentChattr URL from config
+  // Resolve AgentChattr URL and token from config
   useEffect(() => {
     fetch("/api/config")
       .then((r) => {
         if (!r.ok) throw new Error("config fetch failed");
         return r.json();
       })
-      .then((cfg) => setChattrUrl(cfg.agentchattr_url || "http://127.0.0.1:8300"))
+      .then((cfg) => {
+        setChattrUrl(cfg.agentchattr_url || "http://127.0.0.1:8300");
+        setChattrToken(cfg.agentchattr_token || "");
+      })
       .catch(() => setChattrUrl("http://127.0.0.1:8300"));
   }, []);
 
@@ -80,7 +84,7 @@ export default function ChatPanel() {
             };
             el.onerror = () => setMode("api");
           }}
-          src={chattrUrl}
+          src={chattrToken ? `${chattrUrl}?token=${encodeURIComponent(chattrToken)}` : chattrUrl}
           className="w-full h-full border-0"
           style={{ display: mode === "loading" ? "none" : "block" }}
           sandbox="allow-same-origin allow-scripts allow-forms allow-popups"
@@ -105,6 +109,7 @@ function ChatPanelAPI() {
   const [input, setInput] = useState("");
   const [showMentions, setShowMentions] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
   const cursorRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -114,10 +119,15 @@ function ChatPanelAPI() {
   useEffect(() => {
     fetch("/api/chat?path=/api/channels")
       .then((r) => {
+        if (r.status === 403) {
+          setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
+          throw new Error("auth failed");
+        }
         if (!r.ok) throw new Error("channels fetch failed");
         return r.json();
       })
       .then((data) => {
+        setAuthError(null);
         const list = Array.isArray(data) ? data : data.channels || [];
         setChannels(list.map((c: string | { name: string }) => (typeof c === "string" ? c : c.name)));
       })
@@ -134,10 +144,15 @@ function ChatPanelAPI() {
   const fetchMessages = useCallback(() => {
     fetch(`/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}`)
       .then((r) => {
+        if (r.status === 403) {
+          setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
+          throw new Error("auth failed");
+        }
         if (!r.ok) throw new Error(`Poll failed: ${r.status}`);
         return r.json();
       })
       .then((data) => {
+        setAuthError(null);
         const msgs: Message[] = Array.isArray(data) ? data : data.messages || [];
         if (msgs.length > 0) {
           setMessages((prev) => {
@@ -213,6 +228,12 @@ function ChatPanelAPI() {
 
   return (
     <div className="flex flex-col h-full bg-bg">
+      {/* Auth error banner */}
+      {authError && (
+        <div className="px-3 py-2 bg-red-900/30 border-b border-red-700/50 text-[11px] text-red-400">
+          {authError}
+        </div>
+      )}
       {/* Channel selector */}
       <div className="flex items-center gap-2 px-3 h-7 shrink-0 border-b border-border">
         <span className="text-[11px] text-text-muted">#</span>

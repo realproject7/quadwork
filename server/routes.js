@@ -92,6 +92,7 @@ router.get("/api/chat", async (req, res) => {
   for (const [k, v] of Object.entries(req.query)) {
     if (k !== "path") fwd.set(k, String(v));
   }
+  if (token) fwd.set("token", token);
 
   const url = `${base}${apiPath}?${fwd.toString()}`;
   try {
@@ -105,8 +106,9 @@ router.get("/api/chat", async (req, res) => {
 
 router.post("/api/chat", async (req, res) => {
   const { url: base, token } = getChattrConfig();
+  const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
   try {
-    const r = await fetch(`${base}/api/send`, {
+    const r = await fetch(`${base}/api/send${tokenParam}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...chatAuthHeaders(token) },
       body: JSON.stringify(req.body),
