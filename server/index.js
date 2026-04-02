@@ -359,11 +359,31 @@ if (fs.existsSync(outDir)) {
   app.use(express.static(outDir));
 }
 
-// SPA fallback: serve index.html for all non-API, non-WS routes
+// SPA fallback: serve the correct pre-rendered HTML for dynamic routes.
+// Static export only generates templates for placeholder params (e.g. /project/_),
+// so we map real dynamic segments back to those template files.
 app.use((req, res, next) => {
   if (req.method !== "GET" || req.path.startsWith("/api/")) {
     return next();
   }
+
+  // Map dynamic routes to their pre-rendered template HTML
+  const dynamicRoutes = [
+    { pattern: /^\/project\/[^/]+\/memory\/?$/, template: "project/_/memory.html" },
+    { pattern: /^\/project\/[^/]+\/queue\/?$/, template: "project/_/queue.html" },
+    { pattern: /^\/project\/[^/]+\/?$/, template: "project/_.html" },
+  ];
+
+  for (const route of dynamicRoutes) {
+    if (route.pattern.test(req.path)) {
+      const templatePath = path.join(outDir, route.template);
+      if (fs.existsSync(templatePath)) {
+        return res.sendFile(templatePath);
+      }
+    }
+  }
+
+  // Default fallback to index.html
   const indexPath = path.join(outDir, "index.html");
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);
