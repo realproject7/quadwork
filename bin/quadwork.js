@@ -675,8 +675,7 @@ async function cmdInit() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
   try {
-    // Step 1: Prerequisites
-    header("Step 1: Prerequisites");
+    // Step 1: Prerequisites (header printed by checkPrereqs)
     const prereqsOk = checkPrereqs();
     if (!prereqsOk) {
       const proceed = await askYN(rl, "Some prerequisites missing. Continue anyway?", false);
