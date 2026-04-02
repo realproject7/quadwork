@@ -19,8 +19,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${geistMono.variable} h-full`}>
-      <body className="h-full flex">
+    <html lang="en" className={`${geistMono.variable} h-full`} suppressHydrationWarning>
+      <body className="h-full flex" suppressHydrationWarning>
         <Sidebar />
         <main className="flex-1 min-w-0 overflow-auto">{children}</main>
       </body>
