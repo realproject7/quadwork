@@ -393,6 +393,11 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
   const mcpSse = existingProject?.mcp_sse_port || 8201;
   tomlContent = tomlContent.replace(/^port = \d+/m, `port = ${chattrPort}`);
   tomlContent = tomlContent.replace(/^data_dir = .+/m, `data_dir = "${dataDir}"`);
+  // Add session_token to [server] section if project has one
+  const sessionToken = existingProject?.agentchattr_token || "";
+  if (sessionToken) {
+    tomlContent = tomlContent.replace(/^(data_dir = .+)$/m, `$1\nsession_token = "${sessionToken}"`);
+  }
   tomlContent = tomlContent.replace(/^http_port = \d+/m, `http_port = ${mcpHttp}`);
   tomlContent = tomlContent.replace(/^sse_port = \d+/m, `sse_port = ${mcpSse}`);
 

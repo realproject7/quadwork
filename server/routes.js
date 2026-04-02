@@ -580,8 +580,15 @@ router.post("/api/setup", (req, res) => {
       const colors = ["#10a37f", "#22c55e", "#f59e0b", "#da7756"];
       const labels = ["Owner", "Reviewer", "Reviewer", "Builder"];
 
+      // Read saved token for this project (if available)
+      const savedCfg = readConfigFile();
+      const savedProject = savedCfg.projects?.find((p) => p.id === dirName);
+      const sessionToken = body.agentchattr_token || savedProject?.agentchattr_token || "";
+
       let content = `[meta]\nname = "${displayName}"\n\n`;
-      content += `[server]\nport = ${chattrPort}\nhost = "127.0.0.1"\ndata_dir = "${dataDir}"\n\n`;
+      content += `[server]\nport = ${chattrPort}\nhost = "127.0.0.1"\ndata_dir = "${dataDir}"\n`;
+      if (sessionToken) content += `session_token = "${sessionToken}"\n`;
+      content += `\n`;
       agents.forEach((agent, i) => {
         const wtDir = path.join(parentDir, `${dirName}-${agent}`);
         content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${agent.charAt(0).toUpperCase() + agent.slice(1)} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
