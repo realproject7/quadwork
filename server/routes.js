@@ -483,6 +483,32 @@ router.get("/api/github/repos", (req, res) => {
   }
 });
 
+// Auto-detect existing clone of a repo
+router.get("/api/setup/detect-clone", (req, res) => {
+  const repoName = req.query.repo; // "owner/repo"
+  if (!repoName) return res.status(400).json({ error: "Missing repo" });
+  const slug = String(repoName).split("/").pop();
+  const home = os.homedir();
+  const searchDirs = [
+    path.join(home, "Projects"),
+    path.join(home, "Developer"),
+    path.join(home, "repos"),
+    path.join(home, "code"),
+    path.join(home, "src"),
+    path.join(home, "workspace"),
+    home,
+  ];
+  for (const dir of searchDirs) {
+    const candidate = path.join(dir, slug);
+    if (fs.existsSync(path.join(candidate, ".git"))) {
+      return res.json({ found: true, path: candidate, suggested: path.join(searchDirs[0], slug) });
+    }
+  }
+  // Not found — suggest a default location
+  const defaultDir = fs.existsSync(searchDirs[0]) ? searchDirs[0] : home;
+  return res.json({ found: false, path: null, suggested: path.join(defaultDir, slug) });
+});
+
 // Save reviewer token securely
 router.post("/api/setup/save-token", (req, res) => {
   const { token } = req.body;

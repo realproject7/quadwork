@@ -46,6 +46,95 @@ const AGENTS = [
 
 /* ── Component ─────────────────────────────────────────────────────────── */
 
+function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
+  repo: string; workingDir: string; setWorkingDir: (v: string) => void; error?: string; onNext: () => void;
+}) {
+  const [detecting, setDetecting] = useState(true);
+  const [detected, setDetected] = useState<{ found: boolean; path: string | null; suggested: string } | null>(null);
+  const [showManual, setShowManual] = useState(false);
+  const slug = repo ? repo.split("/")[1] : "project";
+
+  useEffect(() => {
+    if (!repo) { setDetecting(false); return; }
+    fetch(`/api/setup/detect-clone?repo=${encodeURIComponent(repo)}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        setDetected(data);
+        if (data?.found && data.path) setWorkingDir(data.path);
+        else if (data?.suggested) setWorkingDir(data.suggested);
+        setDetecting(false);
+      })
+      .catch(() => setDetecting(false));
+  }, [repo, setWorkingDir]);
+
+  return (
+    <div>
+      <h2 className="text-sm font-semibold text-text mb-1">Where is your project?</h2>
+      <p className="text-[11px] text-text-muted mb-3">
+        Your project&apos;s git repository on your local machine. QuadWork will create 4 agent workspaces next to this directory.
+      </p>
+
+      {detecting && <p className="text-[11px] text-text-muted mb-3">Scanning for existing clone...</p>}
+
+      {!detecting && detected?.found && (
+        <div className="border border-accent/30 bg-accent/5 p-3 mb-4 text-[11px]">
+          <p className="text-accent font-semibold mb-1">Found existing clone</p>
+          <p className="text-text font-mono">{detected.path}</p>
+          <div className="flex gap-2 mt-2">
+            <button onClick={onNext} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors">
+              Use this
+            </button>
+            <button onClick={() => { setShowManual(true); setWorkingDir(""); }} className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text transition-colors">
+              Choose different path
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!detecting && !detected?.found && !showManual && (
+        <div className="border border-border bg-bg-surface p-3 mb-4 text-[11px]">
+          <p className="text-text-muted mb-1">No local clone found for <span className="text-accent">{repo}</span></p>
+          <p className="text-text-muted mb-2">Setup will clone it to:</p>
+          <p className="text-text font-mono mb-2">{detected?.suggested || `~/Projects/${slug}`}</p>
+          <div className="flex gap-2">
+            <button onClick={onNext} disabled={!workingDir.trim()} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
+              Clone here & continue
+            </button>
+            <button onClick={() => setShowManual(true)} className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text transition-colors">
+              Choose different path
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(showManual || (!detecting && !detected)) && (
+        <>
+          <input
+            value={workingDir}
+            onChange={(e) => setWorkingDir(e.target.value)}
+            placeholder={`~/Projects/${slug}`}
+            className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-2"
+          />
+          <button onClick={onNext} disabled={!workingDir.trim()} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
+            Next
+          </button>
+        </>
+      )}
+
+      {error && <p className="text-[11px] text-error mt-2">{error}</p>}
+
+      <div className="border border-border bg-bg-surface p-3 mt-4 text-[11px] text-text-muted font-mono space-y-0.5">
+        <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1 font-sans">Workspace layout</p>
+        <p className="text-accent">{slug}/              &larr; your repo</p>
+        <p>{slug}-head/         &larr; Head agent</p>
+        <p>{slug}-dev/          &larr; Dev agent</p>
+        <p>{slug}-reviewer1/    &larr; Reviewer1</p>
+        <p>{slug}-reviewer2/    &larr; Reviewer2</p>
+      </div>
+    </div>
+  );
+}
+
 export default function SetupWizard() {
   const router = useRouter();
   const [steps, setSteps] = useState<Step[]>(INITIAL_STEPS);
@@ -532,38 +621,13 @@ export default function SetupWizard() {
 
             {/* Step 4: Working Directory */}
             {step?.id === "workdir" && (
-              <div>
-                <h2 className="text-sm font-semibold text-text mb-1">Where is your project?</h2>
-                <p className="text-[11px] text-text-muted mb-3">
-                  Your project&apos;s git repository on your local machine. QuadWork will create 4 agent workspaces next to this directory.
-                </p>
-                <div className="border border-border bg-bg-surface p-3 mb-4 text-[11px] text-text-muted font-mono space-y-0.5">
-                  <p className="text-text-muted">~/Projects/</p>
-                  <p className="text-accent pl-2">{repo ? repo.split("/")[1] : "project"}/              &larr; your repo (this path)</p>
-                  <p className="text-text-muted pl-2">{repo ? repo.split("/")[1] : "project"}-head/         &larr; Head agent workspace</p>
-                  <p className="text-text-muted pl-2">{repo ? repo.split("/")[1] : "project"}-dev/          &larr; Dev agent workspace</p>
-                  <p className="text-text-muted pl-2">{repo ? repo.split("/")[1] : "project"}-reviewer1/    &larr; Reviewer1 workspace</p>
-                  <p className="text-text-muted pl-2">{repo ? repo.split("/")[1] : "project"}-reviewer2/    &larr; Reviewer2 workspace</p>
-                </div>
-                <input
-                  value={workingDir}
-                  onChange={(e) => setWorkingDir(e.target.value)}
-                  placeholder={`~/Projects/${repo ? repo.split("/")[1] : "project"}`}
-                  className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-2"
-                />
-                <p className="text-[10px] text-text-muted mb-4">
-                  Enter the path to an existing local clone, or a new path to clone into.
-                  If the directory doesn&apos;t exist or isn&apos;t a git repo, the setup will clone it for you.
-                </p>
-                {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
-                <button
-                  onClick={goNext}
-                  disabled={!workingDir.trim()}
-                  className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
-                >
-                  Next
-                </button>
-              </div>
+              <WorkdirStep
+                repo={repo}
+                workingDir={workingDir}
+                setWorkingDir={setWorkingDir}
+                error={step.error}
+                onNext={goNext}
+              />
             )}
 
             {/* Step 5: Create Workspaces */}
