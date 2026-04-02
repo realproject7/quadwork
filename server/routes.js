@@ -143,7 +143,6 @@ router.get("/api/projects", async (req, res) => {
     const { url: chattrUrl, token: chattrToken } = getChattrConfig(p.id);
     try {
       const headers = chattrToken ? { "x-session-token": chattrToken } : {};
-      if (chattrToken) headers["x-session-token"] = chattrToken;
       const tokenParam = chattrToken ? `&token=${encodeURIComponent(chattrToken)}` : "";
       const r = await fetch(`${chattrUrl}/api/messages?channel=general&limit=30${tokenParam}`, { headers });
       if (r.ok) {
