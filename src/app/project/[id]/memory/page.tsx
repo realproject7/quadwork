@@ -5,5 +5,5 @@ export function generateStaticParams() {
 }
 
 export default function MemoryPage() {
-  return <MemoryPageClient />;
+  return <div suppressHydrationWarning><MemoryPageClient /></div>;
 }
