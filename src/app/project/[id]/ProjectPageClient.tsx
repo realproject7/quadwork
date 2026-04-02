@@ -1,14 +1,14 @@
 "use client";
 
-import { useParams } from "next/navigation";
+import { usePathname } from "next/navigation";
 import ProjectDashboard from "@/components/ProjectDashboard";
 
 export default function ProjectPageClient() {
-  const { id } = useParams<{ id: string }>();
+  const pathname = usePathname();
+  // Extract project ID from URL path: /project/<id>
+  const segments = pathname.split("/");
+  const id = segments[2] || "";
 
-  // Static export pre-renders with placeholder "_". Wait for hydration
-  // to resolve the real project ID before rendering child components
-  // that issue API/WebSocket requests.
   if (!id || id === "_") {
     return null;
   }

@@ -1,10 +1,12 @@
 "use client";
 
-import { useParams } from "next/navigation";
+import { usePathname } from "next/navigation";
 import QueueManager from "@/components/QueueManager";
 
 export default function QueuePageClient() {
-  const { id } = useParams<{ id: string }>();
+  const pathname = usePathname();
+  const segments = pathname.split("/");
+  const id = segments[2] || "";
 
   if (!id || id === "_") {
     return null;
