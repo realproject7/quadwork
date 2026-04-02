@@ -53,8 +53,8 @@ function generateTemplate(issues: Issue[], repo: string): string {
   lines.push("");
   lines.push("## Rules");
   lines.push("");
-  lines.push("1. Assign ONE ticket at a time to @t3");
-  lines.push("2. Wait for @t2a AND @t2b to both approve before merging");
+  lines.push("1. Assign ONE ticket at a time to @dev");
+  lines.push("2. Wait for @reviewer1 AND @reviewer2 to both approve before merging");
   lines.push("3. After merge, immediately assign the next ticket");
   lines.push("4. PR titles: [#<issue>] Short description");
   lines.push("5. Branch naming: task/<issue-number>-<slug>");
@@ -67,8 +67,8 @@ function generateTemplate(issues: Issue[], repo: string): string {
 }
 
 function generatePrompt(queueContent: string, repo: string): string {
-  return `@t1 Work through this queue top-to-bottom. Assign ONE ticket at a time to
-   @t3. After each PR is merged, assign the next ticket immediately.
+  return `@head Work through this queue top-to-bottom. Assign ONE ticket at a time to
+   @dev. After each PR is merged, assign the next ticket immediately.
   All tickets are autonomous — no operator gates.
 
   IMPORTANT — Repo context:
@@ -78,7 +78,7 @@ function generatePrompt(queueContent: string, repo: string): string {
 
 ${queueContent}
 
-  Start now. Assign the first ticket to @t3.`;
+  Start now. Assign the first ticket to @dev.`;
 }
 
 export default function QueueManager({ projectId }: QueueManagerProps) {
@@ -140,16 +140,16 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       const cfg = await cfgRes.json();
 
       // Same-origin: all API calls go to the same host
-      let res = await fetch(`/api/agents/${projectId}/t1/write`, {
+      let res = await fetch(`/api/agents/${projectId}/head/write`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: prompt + "\n" }),
       });
 
-      // If no session exists, create one and start the T1 agent
+      // If no session exists, create one and start the Head agent
       if (res.status === 404) {
         const project = cfg.projects?.find((p: { id: string }) => p.id === projectId);
-        const t1Command = project?.agents?.t1?.command || "claude";
+        const headCommand = project?.agents?.head?.command || "claude";
 
         // Open WebSocket to create PTY session
         // In dev mode, WS connects directly to Express backend since Next.js doesn't proxy WS
@@ -159,7 +159,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         const wsHost = (currentPort && currentPort !== backendPort)
           ? `${window.location.hostname}:${backendPort}`
           : window.location.host;
-        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=t1`;
+        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=head`;
         const ws = new WebSocket(wsUrl);
         await new Promise<void>((resolve, reject) => {
           ws.onopen = () => resolve();
@@ -170,18 +170,18 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         // Wait for shell to initialize
         await new Promise((r) => setTimeout(r, 500));
 
-        // Start the T1 agent CLI in the PTY shell
-        await fetch(`/api/agents/${projectId}/t1/write`, {
+        // Start the Head agent CLI in the PTY shell
+        await fetch(`/api/agents/${projectId}/head/write`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: `${t1Command}\n` }),
+          body: JSON.stringify({ text: `${headCommand}\n` }),
         });
 
         // Wait for agent to initialize
         await new Promise((r) => setTimeout(r, 3000));
 
         // Now write the queue prompt to the running agent
-        res = await fetch(`/api/agents/${projectId}/t1/write`, {
+        res = await fetch(`/api/agents/${projectId}/head/write`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: prompt + "\n" }),
@@ -257,7 +257,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
 
       {/* Guide */}
       <div className="mb-4 px-3 py-2 border border-border bg-bg-surface text-[11px] text-text-muted">
-        <strong className="text-text">How to use:</strong> Click &quot;Generate Template&quot; to auto-fill from open issues. Edit the queue, organize into batches, then click &quot;Start Queue&quot; to generate and send the T1 initiation prompt.
+        <strong className="text-text">How to use:</strong> Click &quot;Generate Template&quot; to auto-fill from open issues. Edit the queue, organize into batches, then click &quot;Start Queue&quot; to generate and send the Head initiation prompt.
       </div>
 
       {/* Start Queue */}
@@ -283,7 +283,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
             onClick={sendToT1}
             className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors"
           >
-            {sent ? "Sent to T1" : "Send to T1 Terminal"}
+            {sent ? "Sent to Head" : "Send to Head Terminal"}
           </button>
           <button
             onClick={copyPrompt}

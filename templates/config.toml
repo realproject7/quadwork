@@ -13,29 +13,29 @@ port = 8300
 host = "127.0.0.1"
 data_dir = "./data"
 
-[agents.t1]
+[agents.head]
 command = "codex"
-cwd = "{{t1_cwd}}"
+cwd = "{{head_cwd}}"
 color = "#10a37f"
-label = "T1 Head"
+label = "Head Owner"
 
-[agents.t2a]
+[agents.reviewer1]
 command = "codex"
-cwd = "{{t2a_cwd}}"
+cwd = "{{reviewer1_cwd}}"
 color = "#22c55e"
-label = "T2a Reviewer"
+label = "Reviewer1 Reviewer"
 
-[agents.t2b]
+[agents.reviewer2]
 command = "claude"
-cwd = "{{t2b_cwd}}"
+cwd = "{{reviewer2_cwd}}"
 color = "#f59e0b"
-label = "T2b Reviewer"
+label = "Reviewer2 Reviewer"
 
-[agents.t3]
+[agents.dev]
 command = "claude"
-cwd = "{{t3_cwd}}"
+cwd = "{{dev_cwd}}"
 color = "#da7756"
-label = "T3 Builder"
+label = "Dev Builder"
 
 [routing]
 default = "none"

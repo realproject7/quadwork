@@ -39,7 +39,7 @@ export default function SetupWizard() {
   const [projectName, setProjectName] = useState("");
   const [repo, setRepo] = useState("");
   const [backends, setBackends] = useState<Record<string, string>>({
-    t1: "claude", t2a: "claude", t2b: "claude", t3: "claude",
+    head: "claude", reviewer1: "claude", reviewer2: "claude", dev: "claude",
   });
   const [workingDir, setWorkingDir] = useState("");
   const [reviewerUser, setReviewerUser] = useState("");
@@ -228,10 +228,10 @@ export default function SetupWizard() {
             <div>
               <h2 className="text-sm font-semibold text-text mb-3">CLI Backend per Agent</h2>
               <div className="border border-border mb-3">
-                {["t1", "t2a", "t2b", "t3"].map((agent) => (
+                {["head", "reviewer1", "reviewer2", "dev"].map((agent) => (
                   <div key={agent} className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 last:border-b-0">
-                    <span className="text-[11px] text-text font-semibold w-10">{agent.toUpperCase()}</span>
-                    <span className="text-[10px] text-text-muted w-16">{agent === "t1" ? "Owner" : agent.startsWith("t2") ? "Reviewer" : "Builder"}</span>
+                    <span className="text-[11px] text-text font-semibold w-10">{agent.charAt(0).toUpperCase() + agent.slice(1)}</span>
+                    <span className="text-[10px] text-text-muted w-16">{agent === "head" ? "Owner" : agent.startsWith("reviewer") ? "Reviewer" : "Builder"}</span>
                     <select
                       value={backends[agent]}
                       onChange={(e) => setBackends({ ...backends, [agent]: e.target.value })}
@@ -243,7 +243,7 @@ export default function SetupWizard() {
                 ))}
               </div>
               <h2 className="text-sm font-semibold text-text mb-2 mt-4">Reviewer Credentials</h2>
-              <p className="text-[11px] text-text-muted mb-2">Used by T2a/T2b to post GitHub reviews</p>
+              <p className="text-[11px] text-text-muted mb-2">Used by reviewer1/reviewer2 to post GitHub reviews</p>
               <input
                 value={reviewerUser}
                 onChange={(e) => setReviewerUser(e.target.value)}
@@ -280,7 +280,7 @@ export default function SetupWizard() {
           {step?.id === "worktrees" && (
             <div>
               <h2 className="text-sm font-semibold text-text mb-3">Create Worktrees</h2>
-              <p className="text-[11px] text-text-muted mb-3">Creates 4 git worktrees as sibling directories: <code className="text-accent">{workingDir ? `${workingDir.split("/").pop()}-t1/` : "project-t1/"}</code>, etc.</p>
+              <p className="text-[11px] text-text-muted mb-3">Creates 4 git worktrees as sibling directories: <code className="text-accent">{workingDir ? `${workingDir.split("/").pop()}-head/` : "project-head/"}</code>, etc.</p>
               {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
               <div className="flex gap-2">
                 <button onClick={createWorktrees} disabled={loading} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
@@ -341,7 +341,7 @@ export default function SetupWizard() {
                 <p><strong>Repo:</strong> {repo}</p>
                 <p><strong>Backends:</strong> {Object.entries(backends).map(([a, b]) => `${a.toUpperCase()}=${b}`).join(", ")}</p>
                 <p><strong>Directory:</strong> {workingDir}</p>
-                <p><strong>Agents:</strong> T1, T2a, T2b, T3</p>
+                <p><strong>Agents:</strong> Head, Reviewer1, Reviewer2, Dev</p>
               </div>
               {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
               <button onClick={saveConfig} disabled={loading} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">

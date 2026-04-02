@@ -40,10 +40,10 @@ interface Config {
 }
 
 const DEFAULT_AGENTS: Record<string, AgentConfig> = {
-  t1: { display_name: "T1", command: "claude", cwd: "", model: "opus", agents_md: "" },
-  t2a: { display_name: "T2a", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
-  t2b: { display_name: "T2b", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
-  t3: { display_name: "T3", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
+  head: { display_name: "Head", command: "claude", cwd: "", model: "opus", agents_md: "" },
+  reviewer1: { display_name: "Reviewer1", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
+  reviewer2: { display_name: "Reviewer2", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
+  dev: { display_name: "Dev", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
 };
 
 const BACKENDS: { value: string; label: string }[] = [
@@ -408,7 +408,7 @@ export default function SettingsPage() {
                                 className="bg-transparent text-[11px] text-text font-semibold outline-none border border-border px-1 py-0.5 focus:border-accent"
                               />
                               <span className="text-[9px] text-text-muted px-1">
-                                {agentId === "t1" ? "Owner" : agentId.startsWith("t2") ? "Reviewer" : "Builder"}
+                                {agentId === "head" ? "Owner" : agentId.startsWith("reviewer") ? "Reviewer" : "Builder"}
                               </span>
                             </div>
                             <select
@@ -489,7 +489,7 @@ export default function SettingsPage() {
                           <textarea
                             value={project.trigger_message || ""}
                             onChange={(e) => updateProject(idx, { trigger_message: e.target.value } as Partial<ProjectConfig>)}
-                            placeholder="@t1 @t2a @t2b @t3 — Queue check..."
+                            placeholder="@head @reviewer1 @reviewer2 @dev — Queue check..."
                             rows={4}
                             className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent resize-y"
                           />

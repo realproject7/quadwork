@@ -476,10 +476,10 @@ router.post("/api/setup", (req, res) => {
         const clone = exec("gh", ["repo", "clone", body.repo, workingDir]);
         if (!clone.ok) return res.json({ ok: false, error: `Clone failed: ${clone.output}` });
       }
-      // Sibling dirs: ../projectName-t1/, ../projectName-t2a/, etc. (matches CLI wizard)
+      // Sibling dirs: ../projectName-head/, ../projectName-reviewer1/, etc. (matches CLI wizard)
       const projectName = path.basename(workingDir);
       const parentDir = path.dirname(workingDir);
-      const agents = ["t1", "t2a", "t2b", "t3"];
+      const agents = ["head", "reviewer1", "reviewer2", "dev"];
       const created = [];
       const errors = [];
       for (const agent of agents) {
@@ -507,7 +507,7 @@ router.post("/api/setup", (req, res) => {
       const parentDir = path.dirname(workingDir);
       const reviewerUser = body.reviewerUser || "";
       const reviewerTokenPath = body.reviewerTokenPath || path.join(os.homedir(), ".quadwork", "reviewer-token");
-      const agents = ["t1", "t2a", "t2b", "t3"];
+      const agents = ["head", "reviewer1", "reviewer2", "dev"];
       const seeded = [];
       for (const agent of agents) {
         // Sibling dir layout (matches CLI wizard)
@@ -525,7 +525,7 @@ router.post("/api/setup", (req, res) => {
             fs.writeFileSync(agentsMd, content);
           } else {
             // Fallback stub if template missing
-            fs.writeFileSync(agentsMd, `# ${dirName} — ${agent.toUpperCase()} Agent\n\nRepo: ${body.repo}\nRole: ${agent === "t1" ? "Owner" : agent.startsWith("t2") ? "Reviewer" : "Builder"}\n`);
+            fs.writeFileSync(agentsMd, `# ${dirName} — ${agent.charAt(0).toUpperCase() + agent.slice(1)} Agent\n\nRepo: ${body.repo}\nRole: ${agent === "head" ? "Owner" : agent.startsWith("reviewer") ? "Reviewer" : "Builder"}\n`);
           }
           seeded.push(`${agent}/AGENTS.md`);
         }
@@ -565,24 +565,24 @@ router.post("/api/setup", (req, res) => {
         const dir = path.join(workingDir, "agentchattr");
         fs.mkdirSync(dir, { recursive: true });
         tomlPath = path.join(dir, "config.toml");
-        const agents = ["t1", "t2a", "t2b", "t3"];
+        const agents = ["head", "reviewer1", "reviewer2", "dev"];
         const colors = ["#10a37f", "#22c55e", "#f59e0b", "#da7756"];
         const labels = ["Owner", "Reviewer", "Reviewer", "Builder"];
         let content = `[meta]\nname = "${displayName}"\n\n`;
         agents.forEach((agent, i) => {
           const wtDir = path.join(parentDir, `${dirName}-${agent}`);
-          content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
+          content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${agent.charAt(0).toUpperCase() + agent.slice(1)} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
         });
         fs.writeFileSync(tomlPath, content);
       } else {
         let content = fs.readFileSync(tomlPath, "utf-8");
-        const agents = ["t1", "t2a", "t2b", "t3"];
+        const agents = ["head", "reviewer1", "reviewer2", "dev"];
         const colors = ["#10a37f", "#22c55e", "#f59e0b", "#da7756"];
         const labels = ["Owner", "Reviewer", "Reviewer", "Builder"];
         agents.forEach((agent, i) => {
           if (!content.includes(`[agents.${agent}]`)) {
             const wtDir = path.join(parentDir, `${dirName}-${agent}`);
-            content += `\n[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${agent.toUpperCase()} ${labels[i]}"\nmcp_inject = "flag"\n`;
+            content += `\n[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${agent.charAt(0).toUpperCase() + agent.slice(1)} ${labels[i]}"\nmcp_inject = "flag"\n`;
           }
         });
         fs.writeFileSync(tomlPath, content);
@@ -606,7 +606,7 @@ router.post("/api/setup", (req, res) => {
       if (cfg.projects.some((p) => p.id === id)) return res.json({ ok: true, message: "Project already in config" });
       // Match CLI wizard agent structure: { cwd, command }
       const agents = {};
-      for (const agentId of ["t1", "t2a", "t2b", "t3"]) {
+      for (const agentId of ["head", "reviewer1", "reviewer2", "dev"]) {
         agents[agentId] = {
           cwd: path.join(parentDir, `${dirName}-${agentId}`),
           command: (backends && backends[agentId]) || "claude",

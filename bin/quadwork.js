@@ -11,7 +11,7 @@ const readline = require("readline");
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
-const AGENTS = ["t1", "t2a", "t2b", "t3"];
+const AGENTS = ["head", "reviewer1", "reviewer2", "dev"];
 
 // ─── ANSI Helpers ──────────────────────────────────────────────────────────
 
@@ -123,9 +123,33 @@ function askYN(rl, question, defaultYes = false) {
   });
 }
 
+// Migration: rename old agent keys to new ones
+const AGENT_KEY_MAP = { t1: "head", t2a: "reviewer1", t2b: "reviewer2", t3: "dev" };
+
+function migrateAgentKeys(config) {
+  let changed = false;
+  if (config.projects) {
+    for (const project of config.projects) {
+      if (!project.agents) continue;
+      for (const [oldKey, newKey] of Object.entries(AGENT_KEY_MAP)) {
+        if (project.agents[oldKey] && !project.agents[newKey]) {
+          project.agents[newKey] = project.agents[oldKey];
+          delete project.agents[oldKey];
+          changed = true;
+        }
+      }
+    }
+  }
+  if (changed) {
+    try { writeConfig(config); } catch {}
+  }
+  return config;
+}
+
 function readConfig() {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    return migrateAgentKeys(config);
   } catch {
     return { port: 8400, agentchattr_url: "http://127.0.0.1:8300", projects: [] };
   }
@@ -247,7 +271,7 @@ async function setupAgents(rl, repo) {
   }
 
   log("Path to your local clone of the repo. Four worktrees will be created next to it");
-  log("(e.g., project-t1/, project-t2a/, project-t2b/, project-t3/).");
+  log("(e.g., project-head/, project-reviewer1/, project-reviewer2/, project-dev/).");
   const projectDir = await ask(rl, "Project directory", process.cwd());
   const absDir = path.resolve(projectDir);
 
@@ -263,12 +287,12 @@ async function setupAgents(rl, repo) {
   }
 
   // Prompt for reviewer credentials (optional)
-  log("A separate reviewer account lets T2a/T2b approve PRs independently. You can set this up later in Settings.");
-  const wantReviewer = await askYN(rl, "Use a separate GitHub account for reviewers (T2a/T2b)?", false);
+  log("A separate reviewer account lets Reviewer1/Reviewer2 approve PRs independently. You can set this up later in Settings.");
+  const wantReviewer = await askYN(rl, "Use a separate GitHub account for reviewers (Reviewer1/Reviewer2)?", false);
   let reviewerUser = "";
   let reviewerTokenPath = "";
   if (wantReviewer) {
-    log("GitHub username for the reviewer account (used in T2a/T2b seed files for PR reviews).");
+    log("GitHub username for the reviewer account (used in Reviewer1/Reviewer2 seed files for PR reviews).");
     reviewerUser = await ask(rl, "Reviewer GitHub username", "");
     log("Path to a file containing a GitHub PAT for the reviewer account.");
     reviewerTokenPath = await ask(rl, "Reviewer token file path", path.join(os.homedir(), ".quadwork", "reviewer-token"));
@@ -342,7 +366,7 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
 
   let tomlContent = fs.readFileSync(path.join(TEMPLATES_DIR, "config.toml"), "utf-8");
   for (const agent of AGENTS) {
-    tomlContent = tomlContent.replace(`{{${agent}_cwd}}`, setup.worktrees[agent]);
+    tomlContent = tomlContent.replace(new RegExp(`\\{\\{${agent}_cwd\\}\\}`, "g"), setup.worktrees[agent]);
   }
   // Replace placeholders
   tomlContent = tomlContent.replace(/\{\{project_name\}\}/g, setup.projectName);

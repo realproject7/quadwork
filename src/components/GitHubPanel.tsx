@@ -146,14 +146,14 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         const decision = pr.reviewDecision || "REVIEW_REQUIRED";
 
         // Extract per-agent review status from body text
-        // Reviews start with "T2a" or "T2b", or contain "## Verdict:" (T2a format)
+        // Reviews start with "Reviewer2" or "Reviewer1", or contain "## Verdict:" (Reviewer1 format)
         const agentStatus: Record<string, string> = {};
         for (const r of reviews) {
           const body = (r.body || "").trim();
-          if (/^T2b\b/i.test(body)) {
-            agentStatus["t2b"] = r.state;
-          } else if (/^T2a\b/i.test(body) || /^##\s*Verdict/i.test(body)) {
-            agentStatus["t2a"] = r.state;
+          if (/^(?:Reviewer2|T2b)\b/i.test(body)) {
+            agentStatus["reviewer2"] = r.state;
+          } else if (/^(?:Reviewer1|T2a)\b/i.test(body) || /^##\s*Verdict/i.test(body)) {
+            agentStatus["reviewer1"] = r.state;
           }
         }
 
@@ -174,7 +174,7 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
               </span>
             )}
             {/* Per-agent review slots */}
-            {["t2a", "t2b"].map((agent) => {
+            {["reviewer1", "reviewer2"].map((agent) => {
               const state = agentStatus[agent];
               return (
                 <span

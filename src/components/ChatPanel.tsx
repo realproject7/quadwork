@@ -12,15 +12,15 @@ interface Message {
 }
 
 const SENDER_COLORS: Record<string, string> = {
-  t1: "#00ff88",
-  t2a: "#4488ff",
-  t2b: "#cc44ff",
-  t3: "#ffcc00",
+  head: "#00ff88",
+  reviewer1: "#4488ff",
+  reviewer2: "#cc44ff",
+  dev: "#ffcc00",
   user: "#e0e0e0",
   system: "#737373",
 };
 
-const AGENTS = ["t1", "t2a", "t2b", "t3", "user"];
+const AGENTS = ["head", "reviewer1", "reviewer2", "dev", "user"];
 
 function senderColor(sender: string): string {
   return SENDER_COLORS[sender.toLowerCase()] || "#e0e0e0";

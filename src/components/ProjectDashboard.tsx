@@ -108,17 +108,17 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         gridTemplateRows: rowTemplate,
       }}
     >
-      {/* Panel 1: T1 Terminal — top-left */}
+      {/* Panel 1: Head Terminal — top-left */}
       <div className="flex flex-col overflow-hidden">
         <PanelHeader
-          label="T1"
-          status={agentStates["t1"] || "stopped"}
+          label="Head"
+          status={agentStates["head"] || "stopped"}
           projectId={projectId}
-          agentId="t1"
-          onStatusChange={(s) => updateAgentState("t1", s)}
+          agentId="head"
+          onStatusChange={(s) => updateAgentState("head", s)}
         />
         <div className="flex-1 min-h-0">
-          <TerminalPanel projectId={projectId} agentId="t1" />
+          <TerminalPanel projectId={projectId} agentId="head" />
         </div>
       </div>
 

@@ -16,9 +16,9 @@ interface TerminalGridProps {
 }
 
 const DEFAULT_AGENTS: Agent[] = [
-  { id: "t2a", label: "T2a" },
-  { id: "t2b", label: "T2b" },
-  { id: "t3", label: "T3" },
+  { id: "reviewer1", label: "Reviewer1" },
+  { id: "reviewer2", label: "Reviewer2" },
+  { id: "dev", label: "Dev" },
 ];
 
 const GRID_CLASSES = [

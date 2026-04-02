@@ -10,6 +10,31 @@ const DEFAULT_CONFIG = {
   projects: [],
 };
 
+// Migration: rename old agent keys to new ones
+const AGENT_KEY_MAP = { t1: "head", t2a: "reviewer1", t2b: "reviewer2", t3: "dev" };
+
+function migrateAgentKeys(config) {
+  let changed = false;
+  if (config.projects) {
+    for (const project of config.projects) {
+      if (!project.agents) continue;
+      for (const [oldKey, newKey] of Object.entries(AGENT_KEY_MAP)) {
+        if (project.agents[oldKey] && !project.agents[newKey]) {
+          project.agents[newKey] = project.agents[oldKey];
+          delete project.agents[oldKey];
+          changed = true;
+        }
+      }
+    }
+  }
+  if (changed) {
+    try {
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    } catch {}
+  }
+  return config;
+}
+
 function readConfig() {
   let raw;
   try {
@@ -28,7 +53,8 @@ function readConfig() {
   }
 
   try {
-    return JSON.parse(raw);
+    const config = JSON.parse(raw);
+    return migrateAgentKeys(config);
   } catch (err) {
     throw new Error(`Invalid JSON in ${CONFIG_PATH}: ${err.message}`);
   }

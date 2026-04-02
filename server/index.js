@@ -262,10 +262,10 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
 
 const triggers = new Map();
 
-const DEFAULT_MESSAGE = `@t1 @t2a @t2b @t3 — Queue check.
-T1: Merge any PR with both approvals, assign next from queue.
-T3: Work on assigned ticket or address review feedback.
-T2a/T2b: Review open PRs. If T3 pushed fixes, re-review. Post verdict on PR AND notify here.
+const DEFAULT_MESSAGE = `@head @reviewer1 @reviewer2 @dev — Queue check.
+Head: Merge any PR with both approvals, assign next from queue.
+Dev: Work on assigned ticket or address review feedback.
+Reviewer1/Reviewer2: Review open PRs. If Dev pushed fixes, re-review. Post verdict on PR AND notify here.
 ALL: Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
 
 async function sendTriggerMessage(projectId) {

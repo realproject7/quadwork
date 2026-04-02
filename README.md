@@ -84,10 +84,10 @@ Config is stored at `~/.quadwork/config.json`:
       "repo": "owner/repo",
       "working_dir": "/path/to/project",
       "agents": {
-        "t1": { "cwd": "/path/to/project-t1", "command": "claude" },
-        "t2a": { "cwd": "/path/to/project-t2a", "command": "claude" },
-        "t2b": { "cwd": "/path/to/project-t2b", "command": "claude" },
-        "t3": { "cwd": "/path/to/project-t3", "command": "claude" }
+        "head": { "cwd": "/path/to/project-head", "command": "claude" },
+        "reviewer1": { "cwd": "/path/to/project-reviewer1", "command": "claude" },
+        "reviewer2": { "cwd": "/path/to/project-reviewer2", "command": "claude" },
+        "dev": { "cwd": "/path/to/project-dev", "command": "claude" }
       }
     }
   ]
