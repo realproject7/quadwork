@@ -30,12 +30,16 @@ function senderColor(sender: string): string {
  * Tries iframe first (uses AgentChattr's own session auth).
  * Falls back to API polling if iframe fails to load.
  */
-export default function ChatPanel() {
+interface ChatPanelProps {
+  projectId?: string;
+}
+
+export default function ChatPanel({ projectId }: ChatPanelProps) {
   const [mode, setMode] = useState<"iframe" | "api" | "loading">("loading");
   const [chattrUrl, setChattrUrl] = useState("");
   const [chattrToken, setChattrToken] = useState("");
 
-  // Resolve AgentChattr URL and token from config
+  // Resolve AgentChattr URL and token from per-project config (fallback to global)
   useEffect(() => {
     fetch("/api/config")
       .then((r) => {
@@ -43,11 +47,12 @@ export default function ChatPanel() {
         return r.json();
       })
       .then((cfg) => {
-        setChattrUrl(cfg.agentchattr_url || "http://127.0.0.1:8300");
-        setChattrToken(cfg.agentchattr_token || "");
+        const project = projectId ? cfg.projects?.find((p: { id: string }) => p.id === projectId) : null;
+        setChattrUrl(project?.agentchattr_url || cfg.agentchattr_url || "http://127.0.0.1:8300");
+        setChattrToken(project?.agentchattr_token || cfg.agentchattr_token || "");
       })
       .catch(() => setChattrUrl("http://127.0.0.1:8300"));
-  }, []);
+  }, [projectId]);
 
   // Timeout fallback: if iframe hasn't loaded within 3s, switch to API mode
   // (onError doesn't fire for CSP/X-Frame-Options blocks)
@@ -98,11 +103,11 @@ export default function ChatPanel() {
     );
   }
 
-  return <ChatPanelAPI />;
+  return <ChatPanelAPI projectId={projectId} />;
 }
 
 /** API-driven fallback when iframe is blocked */
-function ChatPanelAPI() {
+function ChatPanelAPI({ projectId }: { projectId?: string }) {
   const [channels, setChannels] = useState<string[]>(["general"]);
   const [channel, setChannel] = useState("general");
   const [messages, setMessages] = useState<Message[]>([]);
@@ -117,7 +122,7 @@ function ChatPanelAPI() {
 
   // Fetch channels via proxy
   useEffect(() => {
-    fetch("/api/chat?path=/api/channels")
+    fetch(`/api/chat?path=/api/channels${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`)
       .then((r) => {
         if (r.status === 403) {
           setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
@@ -138,11 +143,11 @@ function ChatPanelAPI() {
   useEffect(() => {
     cursorRef.current = 0;
     setMessages([]);
-  }, [channel]);
+  }, [channel, projectId]);
 
   // Poll messages via proxy
   const fetchMessages = useCallback(() => {
-    fetch(`/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}`)
+    fetch(`/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`)
       .then((r) => {
         if (r.status === 403) {
           setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
@@ -165,7 +170,7 @@ function ChatPanelAPI() {
         }
       })
       .catch(() => {});
-  }, [channel]);
+  }, [channel, projectId]);
 
   useEffect(() => {
     fetchMessages();
@@ -190,7 +195,7 @@ function ChatPanelAPI() {
   const send = () => {
     const text = input.trim();
     if (!text) return;
-    fetch("/api/chat", {
+    fetch(`/api/chat${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, channel, sender: "user" }),

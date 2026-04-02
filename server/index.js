@@ -5,7 +5,7 @@ const fs = require("fs");
 const { WebSocketServer } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd, resolveAgentCommand } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr } = require("./config");
 const routes = require("./routes");
 
 const config = readConfig();
@@ -30,8 +30,8 @@ app.get("/api/health", (_req, res) => {
 // PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
 const agentSessions = new Map();
 
-// AgentChattr server process (separate — not a PTY agent)
-let chattrProcess = { process: null, state: "stopped", error: null };
+// AgentChattr server processes — per-project (key = projectId)
+const chattrProcesses = new Map();
 
 // Helper: spawn a PTY for a project/agent and register in agentSessions
 function spawnAgentPty(project, agent) {
@@ -99,72 +99,87 @@ app.get("/api/agents", (_req, res) => {
   for (const [key, session] of agentSessions) {
     agents[key] = { state: session.state, error: session.error || null };
   }
-  agents["_agentchattr"] = { state: chattrProcess.state, error: chattrProcess.error };
+  for (const [pid, proc] of chattrProcesses) {
+    agents[`_agentchattr/${pid}`] = { state: proc.state, error: proc.error };
+  }
   res.json(agents);
 });
 
-app.post("/api/agentchattr/:action", (req, res) => {
-  const { action } = req.params;
-  const cfg = readConfig();
-  const chattrUrl = cfg.agentchattr_url || "http://127.0.0.1:8300";
+// Per-project AgentChattr lifecycle: /api/agentchattr/:project/:action
+// Backward compat: /api/agentchattr/:action uses first project
+app.post("/api/agentchattr/:projectOrAction/:action?", (req, res) => {
+  let projectId, action;
+  if (req.params.action) {
+    projectId = req.params.projectOrAction;
+    action = req.params.action;
+  } else {
+    // Backward compat: single-param = action, use first project
+    action = req.params.projectOrAction;
+    const cfg = readConfig();
+    projectId = cfg.projects?.[0]?.id || "_default";
+  }
+
+  const { url: chattrUrl } = resolveProjectChattr(projectId);
   const chattrPort = new URL(chattrUrl).port || "8300";
 
+  function getProc() {
+    return chattrProcesses.get(projectId) || { process: null, state: "stopped", error: null };
+  }
+  function setProc(val) {
+    chattrProcesses.set(projectId, val);
+  }
+
+  function spawnChattr() {
+    const child = spawn("agentchattr", ["--port", chattrPort], {
+      env: process.env,
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+    child.on("error", (err) => {
+      setProc({ process: null, state: "error", error: err.message });
+    });
+    child.on("exit", (code) => {
+      const cur = getProc();
+      if (cur.process === child) {
+        setProc({ process: null, state: "stopped", error: code ? `exit:${code}` : null });
+      }
+    });
+    setProc({ process: child, state: "running", error: null });
+    return child;
+  }
+
   if (action === "start") {
-    if (chattrProcess.state === "running" && chattrProcess.process) {
+    const proc = getProc();
+    if (proc.state === "running" && proc.process) {
       return res.json({ ok: true, state: "running", message: "Already running" });
     }
     try {
-      const child = spawn("agentchattr", ["--port", chattrPort], {
-        env: process.env,
-        stdio: "ignore",
-        detached: true,
-      });
-      child.unref();
-      child.on("error", (err) => {
-        chattrProcess = { process: null, state: "error", error: err.message };
-      });
-      child.on("exit", (code) => {
-        if (chattrProcess.process === child) {
-          chattrProcess = { process: null, state: "stopped", error: code ? `exit:${code}` : null };
-        }
-      });
-      chattrProcess = { process: child, state: "running", error: null };
+      const child = spawnChattr();
       res.json({ ok: true, state: "running", pid: child.pid });
     } catch (err) {
-      chattrProcess = { process: null, state: "error", error: err.message };
+      setProc({ process: null, state: "error", error: err.message });
       res.status(500).json({ ok: false, state: "error", error: err.message });
     }
   } else if (action === "stop") {
-    if (chattrProcess.process) {
-      try { chattrProcess.process.kill("SIGTERM"); } catch {}
+    const proc = getProc();
+    if (proc.process) {
+      try { proc.process.kill("SIGTERM"); } catch {}
     }
-    chattrProcess = { process: null, state: "stopped", error: null };
+    setProc({ process: null, state: "stopped", error: null });
     res.json({ ok: true, state: "stopped" });
   } else if (action === "restart") {
-    if (chattrProcess.process) {
-      try { chattrProcess.process.kill("SIGTERM"); } catch {}
+    const proc = getProc();
+    if (proc.process) {
+      try { proc.process.kill("SIGTERM"); } catch {}
     }
-    chattrProcess = { process: null, state: "stopped", error: null };
+    setProc({ process: null, state: "stopped", error: null });
     setTimeout(() => {
       try {
-        const child = spawn("agentchattr", ["--port", chattrPort], {
-          env: process.env,
-          stdio: "ignore",
-          detached: true,
-        });
-        child.unref();
-        child.on("error", (err) => {
-          chattrProcess = { process: null, state: "error", error: err.message };
-        });
-        child.on("exit", (code) => {
-          if (chattrProcess.process === child) {
-            chattrProcess = { process: null, state: "stopped", error: code ? `exit:${code}` : null };
-          }
-        });
-        chattrProcess = { process: child, state: "running", error: null };
+        const child = spawnChattr();
         res.json({ ok: true, state: "running", pid: child.pid });
       } catch (err) {
-        chattrProcess = { process: null, state: "error", error: err.message };
+        setProc({ process: null, state: "error", error: err.message });
         res.status(500).json({ ok: false, state: "error", error: err.message });
       }
     }, 500);
@@ -271,8 +286,8 @@ ALL: Communicate via this chat by tagging agents. Your terminal is NOT visible.`
 async function sendTriggerMessage(projectId) {
   const cfg = readConfig();
   const project = cfg.projects && cfg.projects.find((p) => p.id === projectId);
-  const chattrUrl = cfg.agentchattr_url || "http://127.0.0.1:8300";
-  const token = cfg.agentchattr_token || "";
+  const { url: chattrUrl, token: chattrToken } = resolveProjectChattr(projectId);
+  const token = chattrToken || "";
   const message = (project && project.trigger_message) || DEFAULT_MESSAGE;
   const headers = { "Content-Type": "application/json" };
   if (token) headers["x-session-token"] = token;

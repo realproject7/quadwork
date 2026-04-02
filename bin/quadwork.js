@@ -610,9 +610,16 @@ function writeQuadWorkConfig(setup) {
     };
   }
 
+  // Auto-assign per-project AgentChattr and MCP ports
+  const existingIdx = config.projects.findIndex((p) => p.id === setup.projectName);
+  const projectIdx = existingIdx >= 0 ? existingIdx : config.projects.length;
+  const chattrPort = 8300 + projectIdx;
+  project.agentchattr_url = `http://127.0.0.1:${chattrPort}`;
+  project.mcp_http_port = 8200 + (projectIdx * 2);
+  project.mcp_sse_port = 8201 + (projectIdx * 2);
+
   // Upsert project
-  const idx = config.projects.findIndex((p) => p.id === setup.projectName);
-  if (idx >= 0) config.projects[idx] = project;
+  if (existingIdx >= 0) config.projects[existingIdx] = project;
   else config.projects.push(project);
 
   writeConfig(config);

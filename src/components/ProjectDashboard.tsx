@@ -158,7 +158,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       <div className="flex flex-col overflow-hidden">
         <PanelHeader label="Chat" />
         <div className="flex-1 min-h-0">
-          <ChatPanel />
+          <ChatPanel projectId={projectId} />
         </div>
         <TriggerWidget projectId={projectId} />
       </div>

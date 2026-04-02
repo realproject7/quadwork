@@ -67,16 +67,11 @@ router.put("/api/config", (req, res) => {
 
 // ─── Chat (AgentChattr proxy) ──────────────────────────────────────────────
 
-function getChattrConfig() {
-  try {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-    return {
-      url: cfg.agentchattr_url || "http://127.0.0.1:8300",
-      token: cfg.agentchattr_token || null,
-    };
-  } catch {
-    return { url: "http://127.0.0.1:8300", token: null };
-  }
+const { resolveProjectChattr } = require("./config");
+
+function getChattrConfig(projectId) {
+  const resolved = resolveProjectChattr(projectId);
+  return { url: resolved.url, token: resolved.token };
 }
 
 function chatAuthHeaders(token) {
@@ -86,7 +81,7 @@ function chatAuthHeaders(token) {
 
 router.get("/api/chat", async (req, res) => {
   const apiPath = req.query.path || "/api/messages";
-  const { url: base, token } = getChattrConfig();
+  const { url: base, token } = getChattrConfig(req.query.project);
 
   const fwd = new URLSearchParams();
   for (const [k, v] of Object.entries(req.query)) {
@@ -105,7 +100,7 @@ router.get("/api/chat", async (req, res) => {
 });
 
 router.post("/api/chat", async (req, res) => {
-  const { url: base, token } = getChattrConfig();
+  const { url: base, token } = getChattrConfig(req.query.project || req.body.project);
   const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
   try {
     const r = await fetch(`${base}/api/send${tokenParam}`, {
@@ -134,8 +129,6 @@ function ghJson(args) {
 
 router.get("/api/projects", async (req, res) => {
   const cfg = readConfigFile();
-  const chattrUrl = cfg.agentchattr_url || "http://127.0.0.1:8300";
-  const chattrToken = cfg.agentchattr_token;
 
   // Fetch active sessions from our own in-memory state (only running PTYs)
   const activeSessions = req.app.get("activeSessions") || new Map();
@@ -144,16 +137,24 @@ router.get("/api/projects", async (req, res) => {
     if (info.projectId && info.state === "running") activeProjectIds.add(info.projectId);
   }
 
-  // Fetch chat messages
-  let chatMsgs = [];
-  try {
-    const headers = chattrToken ? { "x-session-token": chattrToken } : {};
-    const r = await fetch(`${chattrUrl}/api/messages?channel=general&limit=30`, { headers });
-    if (r.ok) {
-      const data = await r.json();
-      chatMsgs = Array.isArray(data) ? data : data.messages || [];
-    }
-  } catch {}
+  // Fetch chat messages from all projects (per-project AgentChattr instances)
+  const chatMsgsByProject = {};
+  const chatFetches = (cfg.projects || []).map(async (p) => {
+    const { url: chattrUrl, token: chattrToken } = getChattrConfig(p.id);
+    try {
+      const headers = chattrToken ? { "x-session-token": chattrToken } : {};
+      if (chattrToken) headers["x-session-token"] = chattrToken;
+      const tokenParam = chattrToken ? `&token=${encodeURIComponent(chattrToken)}` : "";
+      const r = await fetch(`${chattrUrl}/api/messages?channel=general&limit=30${tokenParam}`, { headers });
+      if (r.ok) {
+        const data = await r.json();
+        chatMsgsByProject[p.id] = Array.isArray(data) ? data : data.messages || [];
+      }
+    } catch {}
+  });
+  await Promise.allSettled(chatFetches);
+  // Aggregate all project chat messages for the activity feed
+  let chatMsgs = Object.values(chatMsgsByProject).flat();
 
   const eventKeywords = /\b(PR|merged|pushed|approved|opened|closed|review|commit)\b/i;
   const workflowMsgs = chatMsgs
@@ -612,7 +613,17 @@ router.post("/api/setup", (req, res) => {
           command: (backends && backends[agentId]) || "claude",
         };
       }
-      cfg.projects.push({ id, name, repo, working_dir: workingDir, agents });
+      // Auto-assign per-project AgentChattr and MCP ports
+      const idx = cfg.projects.length;
+      const chattrPort = 8300 + idx;
+      const mcp_http_port = 8200 + (idx * 2);
+      const mcp_sse_port = 8201 + (idx * 2);
+      cfg.projects.push({
+        id, name, repo, working_dir: workingDir, agents,
+        agentchattr_url: `http://127.0.0.1:${chattrPort}`,
+        mcp_http_port,
+        mcp_sse_port,
+      });
       const dir = path.dirname(CONFIG_PATH);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));

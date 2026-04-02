@@ -86,4 +86,18 @@ function resolveAgentCommand(projectId, agentId) {
   return agent.command;
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH };
+/**
+ * Resolve AgentChattr connection for a project (per-project → global fallback).
+ */
+function resolveProjectChattr(projectId) {
+  const config = readConfig();
+  const project = projectId ? config.projects?.find((p) => p.id === projectId) : null;
+  return {
+    url: project?.agentchattr_url || config.agentchattr_url || "http://127.0.0.1:8300",
+    token: project?.agentchattr_token || config.agentchattr_token || null,
+    mcp_http_port: project?.mcp_http_port || null,
+    mcp_sse_port: project?.mcp_sse_port || null,
+  };
+}
+
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, CONFIG_PATH };

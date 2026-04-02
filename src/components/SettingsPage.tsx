@@ -24,6 +24,10 @@ interface ProjectConfig {
   repo: string;
   working_dir: string;
   agents: Record<string, AgentConfig>;
+  agentchattr_url?: string;
+  agentchattr_token?: string;
+  mcp_http_port?: number;
+  mcp_sse_port?: number;
   telegram?: TelegramConfig;
   trigger_enabled?: boolean;
   trigger_interval?: number;
@@ -455,6 +459,41 @@ export default function SettingsPage() {
                           )}
                         </div>
                       ))}
+                    </div>
+                  </div>
+
+                  {/* AgentChattr (per-project) */}
+                  <div className="mt-4">
+                    <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">AgentChattr</h3>
+                    <div className="border border-border p-3">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <Input
+                          label="AgentChattr URL"
+                          value={project.agentchattr_url || ""}
+                          onChange={(v) => updateProject(idx, { agentchattr_url: v } as Partial<ProjectConfig>)}
+                          placeholder="http://127.0.0.1:8300"
+                        />
+                        <Input
+                          label="Session Token"
+                          value={project.agentchattr_token || ""}
+                          onChange={(v) => updateProject(idx, { agentchattr_token: v } as Partial<ProjectConfig>)}
+                          placeholder="(optional)"
+                        />
+                        <Input
+                          label="MCP HTTP Port"
+                          value={String(project.mcp_http_port || "")}
+                          onChange={(v) => updateProject(idx, { mcp_http_port: parseInt(v, 10) || undefined } as Partial<ProjectConfig>)}
+                          type="number"
+                          placeholder="8200"
+                        />
+                        <Input
+                          label="MCP SSE Port"
+                          value={String(project.mcp_sse_port || "")}
+                          onChange={(v) => updateProject(idx, { mcp_sse_port: parseInt(v, 10) || undefined } as Partial<ProjectConfig>)}
+                          type="number"
+                          placeholder="8201"
+                        />
+                      </div>
                     </div>
                   </div>
 
