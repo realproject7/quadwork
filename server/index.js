@@ -449,7 +449,7 @@ if (fs.existsSync(outDir)) {
 // Static export only generates templates for placeholder params (e.g. /project/_),
 // so we map real dynamic segments back to those template files.
 app.use((req, res, next) => {
-  if (req.method !== "GET" || req.path.startsWith("/api/")) {
+  if ((req.method !== "GET" && req.method !== "HEAD") || req.path.startsWith("/api/")) {
     return next();
   }
 
