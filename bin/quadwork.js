@@ -668,7 +668,7 @@ async function cmdInit() {
   console.log("");
   console.log(`  ${c.cyan}${c.bold}╔══════════════════════════════════════════╗${c.reset}`);
   console.log(`  ${c.cyan}${c.bold}║${c.reset}  ${c.white}${c.bold}QuadWork Init${c.reset}                           ${c.cyan}${c.bold}║${c.reset}`);
-  console.log(`  ${c.cyan}${c.bold}║${c.reset}  ${c.dim}4-agent coding team setup${c.reset}                ${c.cyan}${c.bold}║${c.reset}`);
+  console.log(`  ${c.cyan}${c.bold}║${c.reset}  ${c.dim}Global setup — projects via web UI${c.reset}       ${c.cyan}${c.bold}║${c.reset}`);
   console.log(`  ${c.cyan}${c.bold}╚══════════════════════════════════════════╝${c.reset}`);
   console.log(`\n  ${c.dim}Tip: Press Enter to accept defaults shown in [brackets].${c.reset}\n`);
 
@@ -676,45 +676,66 @@ async function cmdInit() {
 
   try {
     // Step 1: Prerequisites
+    header("Step 1: Prerequisites");
     const prereqsOk = checkPrereqs();
     if (!prereqsOk) {
       const proceed = await askYN(rl, "Some prerequisites missing. Continue anyway?", false);
       if (!proceed) { rl.close(); process.exit(1); }
     }
 
-    // Step 2: GitHub
-    const repo = await setupGitHub(rl);
-    if (!repo) { rl.close(); process.exit(1); }
+    // Step 2: Global config
+    header("Step 2: Global Configuration");
+    const port = await ask(rl, "Dashboard port", "8400");
+    const defaultBackend = which("claude") ? "claude" : which("codex") ? "codex" : "claude";
+    const backend = await ask(rl, "Default CLI backend (claude/codex)", defaultBackend);
 
-    // Step 3: Agents
-    const setup = await setupAgents(rl, repo);
-    if (!setup) { rl.close(); process.exit(1); }
+    // Write global config
+    const config = readConfig();
+    config.port = parseInt(port, 10) || 8400;
+    config.default_backend = backend;
+    writeConfig(config);
+    ok(`Wrote ${CONFIG_PATH}`);
 
-    // Write QuadWork config first (assigns per-project ports)
-    writeQuadWorkConfig(setup);
-
-    // Step 4: AgentChattr config (reads assigned ports from saved config)
-    const configTomlPath = path.join(setup.absDir, "agentchattr", "config.toml");
-    writeAgentChattrConfig(setup, configTomlPath, { skipInstall: !agentChattrFound });
-
-    // Step 5: Optional add-ons
-    await setupAddons(rl, setup, configTomlPath);
+    // Step 3: Start server
+    header("Step 3: Starting Dashboard");
+    const quadworkDir = path.join(__dirname, "..");
+    const serverDir = path.join(quadworkDir, "server");
+    if (fs.existsSync(path.join(serverDir, "index.js"))) {
+      const server = spawn("node", [serverDir], {
+        stdio: "ignore",
+        detached: true,
+        env: { ...process.env },
+      });
+      server.unref();
+      if (server.pid) {
+        ok(`Server started (PID: ${server.pid})`);
+        const pidFile = path.join(CONFIG_DIR, "server.pid");
+        if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+        fs.writeFileSync(pidFile, String(server.pid));
+      }
+    } else {
+      warn("Server not found — run from the quadwork directory");
+    }
 
     // Done
+    const dashPort = parseInt(port, 10) || 8400;
+    const dashboardUrl = `http://127.0.0.1:${dashPort}`;
+
     header("Setup Complete");
-    log(`Project:      ${setup.projectName}`);
-    log(`Repo:         ${setup.repo}`);
-    log(`Worktrees:    ${AGENTS.map((a) => `${setup.projectName}-${a}/`).join(", ")}`);
-    log(`Backends:     ${AGENTS.map((a) => `${a.toUpperCase()}=${(setup.backends && setup.backends[a]) || setup.backend}`).join(", ")}`);
-    log(`Config:       ${CONFIG_PATH}`);
-    log(`AgentChattr:  ${configTomlPath}`);
-    if (setup.telegram) log(`Telegram:     configured`);
-    if (setup.memoryDir) log(`Shared Memory: ${setup.memoryDir}`);
+    log(`Config:     ${CONFIG_PATH}`);
+    log(`Dashboard:  ${dashboardUrl}`);
+    log(`Backend:    ${backend}`);
     log("");
     log("Next steps:");
-    log("  npx quadwork start    — launch dashboard + agents");
+    log(`  Open ${c.cyan}${dashboardUrl}/setup${c.reset} to create your first project`);
     log("  npx quadwork stop     — stop all processes");
     log("");
+
+    // Open browser
+    const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    setTimeout(() => {
+      try { execSync(`${openCmd} ${dashboardUrl}/setup`, { stdio: "ignore" }); } catch {}
+    }, 1500);
 
     rl.close();
   } catch (err) {
@@ -889,16 +910,20 @@ switch (command) {
   Usage: quadwork <command>
 
   Commands:
-    init          Set up a new QuadWork 4-agent environment
+    init          Global setup (prereqs, port, backend) — then open web UI
     start         Start the QuadWork dashboard and backend
     stop          Stop all QuadWork processes
-    add-project   Add a project to an existing QuadWork setup
+    add-project   Add a project via CLI (alternative to web UI /setup)
+
+  Workflow:
+    1. npx quadwork init     — one-time global setup, opens dashboard
+    2. Open /setup in browser — create projects with guided web UI
+    3. npx quadwork stop     — stop everything when done
 
   Examples:
     npx quadwork init
     npx quadwork start
     npx quadwork stop
-    npx quadwork add-project
 `);
     if (command) process.exit(1);
 }

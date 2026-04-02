@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
 type StepStatus = "pending" | "active" | "done" | "error" | "skipped";
@@ -47,6 +47,19 @@ export default function SetupWizard() {
   const [reviewerUser, setReviewerUser] = useState("");
   const [reviewerTokenPath, setReviewerTokenPath] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Read default_backend from global config to initialize agent backends
+  useEffect(() => {
+    fetch("/api/config")
+      .then((r) => r.ok ? r.json() : null)
+      .then((cfg) => {
+        const defaultBackend = cfg?.default_backend;
+        if (defaultBackend && (defaultBackend === "claude" || defaultBackend === "codex")) {
+          setBackends({ head: defaultBackend, reviewer1: defaultBackend, reviewer2: defaultBackend, dev: defaultBackend });
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const updateStep = (idx: number, updates: Partial<Step>) => {
     setSteps((prev) => prev.map((s, i) => (i === idx ? { ...s, ...updates } : s)));
