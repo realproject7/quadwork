@@ -5,7 +5,7 @@ const fs = require("fs");
 const { WebSocketServer } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, syncChattrToken } = require("./config");
 const routes = require("./routes");
 
 const config = readConfig();
@@ -167,6 +167,8 @@ function handleAgentChattr(req, res) {
     }
     try {
       const child = spawnChattr();
+      // Sync token after AgentChattr starts (it generates its own)
+      setTimeout(() => syncChattrToken(projectId), 2000);
       res.json({ ok: true, state: "running", pid: child.pid });
     } catch (err) {
       setProc({ process: null, state: "error", error: err.message });
@@ -188,6 +190,8 @@ function handleAgentChattr(req, res) {
     setTimeout(() => {
       try {
         const child = spawnChattr();
+        // Sync token after AgentChattr restarts
+        setTimeout(() => syncChattrToken(projectId), 2000);
         res.json({ ok: true, state: "running", pid: child.pid });
       } catch (err) {
         setProc({ process: null, state: "error", error: err.message });
@@ -531,4 +535,9 @@ function syncTriggersFromConfig() {
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
+  // Sync AgentChattr tokens for all projects on startup
+  const startupCfg = readConfig();
+  for (const p of (startupCfg.projects || [])) {
+    syncChattrToken(p.id);
+  }
 });

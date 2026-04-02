@@ -100,4 +100,28 @@ function resolveProjectChattr(projectId) {
   };
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, CONFIG_PATH };
+/**
+ * Fetch AgentChattr's real session token from its HTML and save to project config.
+ * AgentChattr generates its own token at startup; this syncs it back.
+ */
+async function syncChattrToken(projectId) {
+  const config = readConfig();
+  const project = config.projects?.find((p) => p.id === projectId);
+  if (!project) return;
+  const url = project.agentchattr_url || config.agentchattr_url || "http://127.0.0.1:8300";
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const html = await res.text();
+    const match = html.match(/__SESSION_TOKEN__="([^"]+)"/);
+    if (match && match[1]) {
+      const realToken = match[1];
+      if (project.agentchattr_token !== realToken) {
+        project.agentchattr_token = realToken;
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+      }
+    }
+  } catch {}
+}
+
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, syncChattrToken, CONFIG_PATH };
