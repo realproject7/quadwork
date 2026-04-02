@@ -382,6 +382,16 @@ app.set("syncTriggers", syncTriggersFromConfig);
 
 // --- Serve static frontend (built Next.js export) ---
 
+// Strip trailing slashes (redirect /settings/ → /settings, /setup/ → /setup)
+app.use((req, res, next) => {
+  if (req.path !== "/" && req.path.endsWith("/")) {
+    const clean = req.path.slice(0, -1);
+    const query = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    return res.redirect(301, clean + query);
+  }
+  next();
+});
+
 const outDir = path.join(__dirname, "..", "out");
 if (fs.existsSync(outDir)) {
   app.use(express.static(outDir));
