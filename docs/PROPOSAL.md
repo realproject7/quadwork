@@ -254,7 +254,7 @@ Step 1/5: Prerequisites Check
   ✓ Node.js 20+ detected
   ✓ Python 3.10+ detected
   ✗ AgentChattr not found
-    → Installing AgentChattr... done (pip install agentchattr)
+    → Installing AgentChattr... done (pipx install agentchattr)
   ✓ GitHub CLI (gh) detected
   ✓ Claude Code detected
 

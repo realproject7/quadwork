@@ -185,10 +185,14 @@ function checkPrereqs() {
     else { fail(`${pyVer} — need 3.10+`); allOk = false; }
   } else { fail("Python 3 not found"); allOk = false; }
 
+  // pipx
+  if (which("pipx")) ok("pipx");
+  else warn("pipx not found — install: python3 -m pip install --user pipx && pipx ensurepath");
+
   // AgentChattr
   const acVer = run("agentchattr --version") || run("python3 -m agentchattr --version");
   if (acVer) { ok(`AgentChattr ${acVer}`); agentChattrFound = true; }
-  else { warn("AgentChattr not found — install: pip install agentchattr"); allOk = false; }
+  else { warn("AgentChattr not found — install: pipx install agentchattr"); allOk = false; }
 
   // gh CLI
   if (which("gh")) ok("GitHub CLI (gh)");
@@ -411,14 +415,14 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
   let acAvailable = which("agentchattr");
   if (!acAvailable && !skipInstall) {
     const acSpinner = spinner("Installing AgentChattr...");
-    const installResult = run("pip install agentchattr 2>&1");
+    const installResult = run("pipx install agentchattr 2>&1");
     if (installResult !== null) {
       acSpinner.stop(true);
       acAvailable = which("agentchattr");
       if (!acAvailable) warn("agentchattr binary not found in PATH after install");
     } else {
       acSpinner.stop(false);
-      warn("Install manually: pip install agentchattr");
+      warn("Install manually: pipx install agentchattr");
     }
   }
 

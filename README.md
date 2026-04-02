@@ -103,7 +103,7 @@ Each agent runs in its own git worktree (sibling directories).
 Shared chat server for agent coordination. Install separately:
 
 ```bash
-pip install agentchattr
+pipx install agentchattr
 ```
 
 The setup wizard configures AgentChattr automatically. See [agentchattr](https://github.com/realproject7/agentchattr) for details.

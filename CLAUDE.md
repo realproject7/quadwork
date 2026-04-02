@@ -47,7 +47,7 @@ Reference: [plotlink at `pre-design-overhaul`](https://github.com/realproject7/p
 
 ## Dependencies
 
-- AgentChattr: external dependency, installed separately (`pip install agentchattr`)
+- AgentChattr: external dependency, installed separately (`pipx install agentchattr`)
 - Telegram bridge: external (`realproject7/agentchattr-telegram`), optional
 - Shared memory: external (`realproject7/agent-memory`), optional
 
