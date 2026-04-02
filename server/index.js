@@ -122,6 +122,13 @@ app.post("/api/agentchattr/:projectOrAction/:action?", (req, res) => {
   const { url: chattrUrl } = resolveProjectChattr(projectId);
   const chattrPort = new URL(chattrUrl).port || "8300";
 
+  // Find per-project config.toml (prefer project working_dir/agentchattr/config.toml)
+  const cfg = readConfig();
+  const project = cfg.projects?.find((p) => p.id === projectId);
+  const projectConfigToml = project?.working_dir
+    ? path.join(project.working_dir, "agentchattr", "config.toml")
+    : null;
+
   function getProc() {
     return chattrProcesses.get(projectId) || { process: null, state: "stopped", error: null };
   }
@@ -130,7 +137,11 @@ app.post("/api/agentchattr/:projectOrAction/:action?", (req, res) => {
   }
 
   function spawnChattr() {
-    const child = spawn("agentchattr", ["--port", chattrPort], {
+    // Use project config.toml if available (isolated data dir + ports), otherwise fall back to --port
+    const args = (projectConfigToml && fs.existsSync(projectConfigToml))
+      ? ["--config", projectConfigToml]
+      : ["--port", chattrPort];
+    const child = spawn("agentchattr", args, {
       env: process.env,
       stdio: "ignore",
       detached: true,

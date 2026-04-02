@@ -562,12 +562,19 @@ router.post("/api/setup", (req, res) => {
       fs.mkdirSync(dataDir, { recursive: true });
       const tomlPath = path.join(projectConfigDir, "config.toml");
 
-      // Resolve per-project port from config (if already assigned)
-      const { resolveProjectChattr: rpc } = require("./config");
-      const projectChattr = rpc(dirName);
-      const chattrPort = new URL(projectChattr.url).port || "8300";
-      const mcp_http = projectChattr.mcp_http_port || 8200;
-      const mcp_sse = projectChattr.mcp_sse_port || 8201;
+      // Resolve per-project ports: prefer explicit body params (from setup wizard),
+      // then fall back to saved config, then defaults
+      let chattrPort, mcp_http, mcp_sse;
+      if (body.agentchattr_port) {
+        chattrPort = String(body.agentchattr_port);
+        mcp_http = body.mcp_http_port || 8200;
+        mcp_sse = body.mcp_sse_port || 8201;
+      } else {
+        const projectChattr = resolveProjectChattr(dirName);
+        chattrPort = new URL(projectChattr.url).port || "8300";
+        mcp_http = projectChattr.mcp_http_port || 8200;
+        mcp_sse = projectChattr.mcp_sse_port || 8201;
+      }
 
       const agents = ["head", "reviewer1", "reviewer2", "dev"];
       const colors = ["#10a37f", "#22c55e", "#f59e0b", "#da7756"];

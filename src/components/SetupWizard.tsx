@@ -317,7 +317,23 @@ export default function SetupWizard() {
               <div className="flex gap-2">
                 <button
                   onClick={async () => {
-                    const result = await apiCall("agentchattr-config", { workingDir, projectName, repo, backends });
+                    // Pre-compute available ports for the new project
+                    let agentchattr_port = 8300, mcp_http_port = 8200, mcp_sse_port = 8201;
+                    try {
+                      const cfgRes = await fetch("/api/config");
+                      if (cfgRes.ok) {
+                        const cfg = await cfgRes.json();
+                        const usedChattr = new Set((cfg.projects || []).map((p: { agentchattr_url?: string }) => {
+                          try { return parseInt(new URL(p.agentchattr_url || "").port, 10); } catch { return 0; }
+                        }).filter(Boolean));
+                        const usedMcp = new Set((cfg.projects || []).flatMap((p: { mcp_http_port?: number; mcp_sse_port?: number }) => [p.mcp_http_port, p.mcp_sse_port]).filter(Boolean));
+                        while (usedChattr.has(agentchattr_port)) agentchattr_port++;
+                        while (usedMcp.has(mcp_http_port)) mcp_http_port++;
+                        mcp_sse_port = mcp_http_port + 1;
+                        while (usedMcp.has(mcp_sse_port)) mcp_sse_port++;
+                      }
+                    } catch {}
+                    const result = await apiCall("agentchattr-config", { workingDir, projectName, repo, backends, agentchattr_port, mcp_http_port, mcp_sse_port });
                     if (result.ok) goNext();
                     else updateStep(currentStep, { status: "error", error: result.error });
                   }}
