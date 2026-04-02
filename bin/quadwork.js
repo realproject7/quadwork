@@ -678,15 +678,15 @@ async function cmdInit() {
     const setup = await setupAgents(rl, repo);
     if (!setup) { rl.close(); process.exit(1); }
 
-    // Step 4: AgentChattr config (skip install if prereqs already flagged it missing)
-    const configTomlPath = path.join(setup.absDir, "config.toml");
+    // Write QuadWork config first (assigns per-project ports)
+    writeQuadWorkConfig(setup);
+
+    // Step 4: AgentChattr config (reads assigned ports from saved config)
+    const configTomlPath = path.join(setup.absDir, "agentchattr", "config.toml");
     writeAgentChattrConfig(setup, configTomlPath, { skipInstall: !agentChattrFound });
 
     // Step 5: Optional add-ons
     await setupAddons(rl, setup, configTomlPath);
-
-    // Write QuadWork config
-    writeQuadWorkConfig(setup);
 
     // Done
     header("Setup Complete");
@@ -753,11 +753,12 @@ function cmdStart() {
   const pidFile = path.join(CONFIG_DIR, "server.pid");
   fs.writeFileSync(pidFile, String(server.pid));
 
-  // Start AgentChattr if installed and config.toml exists for first project
-  const firstProject = config.projects[0];
-  if (firstProject && which("agentchattr")) {
-    const configToml = path.join(firstProject.working_dir, "config.toml");
-    if (fs.existsSync(configToml)) {
+  // Start AgentChattr for each project that has a config.toml
+  if (which("agentchattr")) {
+    for (const project of config.projects) {
+      if (!project.working_dir) continue;
+      const configToml = path.join(project.working_dir, "agentchattr", "config.toml");
+      if (!fs.existsSync(configToml)) continue;
       const acProc = spawn("agentchattr", ["--config", configToml], {
         stdio: "ignore",
         detached: true,
@@ -765,8 +766,8 @@ function cmdStart() {
       acProc.on("error", () => {});
       acProc.unref();
       if (acProc.pid) {
-        ok(`AgentChattr started (PID: ${acProc.pid})`);
-        fs.writeFileSync(path.join(CONFIG_DIR, "agentchattr.pid"), String(acProc.pid));
+        ok(`AgentChattr started for ${project.id} (PID: ${acProc.pid})`);
+        fs.writeFileSync(path.join(CONFIG_DIR, `agentchattr-${project.id}.pid`), String(acProc.pid));
       }
     }
   }
@@ -827,10 +828,10 @@ async function cmdAddProject() {
     const setup = await setupAgents(rl, repo);
     if (!setup) { rl.close(); process.exit(1); }
 
-    const configTomlPath = path.join(setup.absDir, "config.toml");
-    writeAgentChattrConfig(setup, configTomlPath);
-
     writeQuadWorkConfig(setup);
+
+    const configTomlPath = path.join(setup.absDir, "agentchattr", "config.toml");
+    writeAgentChattrConfig(setup, configTomlPath);
 
     header("Project Added");
     log(`Project:      ${setup.projectName}`);
