@@ -398,7 +398,7 @@ app.use((req, res, next) => {
 
 const outDir = path.join(__dirname, "..", "out");
 if (fs.existsSync(outDir)) {
-  app.use(express.static(outDir, { redirect: false }));
+  app.use(express.static(outDir, { redirect: false, extensions: ["html"] }));
 }
 
 // SPA fallback: serve the correct pre-rendered HTML for dynamic routes.
