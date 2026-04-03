@@ -505,13 +505,21 @@ app.use((req, res, next) => {
     return next();
   }
 
-  // Dynamic routes → serve minimal app shell (no SSG payload = no hydration mismatch).
-  // The client-side router renders the correct page after mount.
-  const isDynamic = /^\/project\/[^/]+(\/memory|\/queue)?\/?$/.test(req.path);
-  if (isDynamic) {
-    const shellPath = path.join(outDir, "app-shell.html");
-    if (fs.existsSync(shellPath)) {
-      return res.sendFile(shellPath);
+  // Dynamic routes → serve their pre-rendered template (has the right JS chunks).
+  // Hydration #418 is cosmetic — dashboard renders and functions correctly.
+  // NOTE: app-shell.html does NOT work — it has no route JS chunks and renders blank.
+  const dynamicRoutes = [
+    { pattern: /^\/project\/[^/]+\/memory\/?$/, template: "project/_/memory.html" },
+    { pattern: /^\/project\/[^/]+\/queue\/?$/, template: "project/_/queue.html" },
+    { pattern: /^\/project\/[^/]+\/?$/, template: "project/_.html" },
+  ];
+
+  for (const route of dynamicRoutes) {
+    if (route.pattern.test(req.path)) {
+      const templatePath = path.join(outDir, route.template);
+      if (fs.existsSync(templatePath)) {
+        return res.sendFile(templatePath);
+      }
     }
   }
 
