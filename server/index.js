@@ -8,6 +8,7 @@ const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, syncChattrToken } = require("./config");
 const routes = require("./routes");
 
+const net = require("net");
 const config = readConfig();
 const PORT = config.port || 8400;
 
@@ -23,6 +24,39 @@ const server = http.createServer(app);
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
+});
+
+// --- Port availability check ---
+
+function checkPort(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once("error", () => resolve(false));
+    srv.once("listening", () => { srv.close(); resolve(true); });
+    srv.listen(port, "127.0.0.1");
+  });
+}
+
+app.get("/api/port-check", async (req, res) => {
+  const port = parseInt(req.query.port, 10);
+  if (!port || port < 1 || port > 65535) {
+    return res.status(400).json({ error: "Invalid port" });
+  }
+  const free = await checkPort(port);
+  res.json({ port, free });
+});
+
+app.get("/api/port-check/auto", async (req, res) => {
+  const start = parseInt(req.query.start, 10) || 8300;
+  const count = Math.min(parseInt(req.query.count, 10) || 3, 10);
+  const results = [];
+  let port = start;
+  for (let i = 0; i < count; i++) {
+    while (!(await checkPort(port)) && port < 65535) port++;
+    results.push(port);
+    port++;
+  }
+  res.json({ ports: results });
 });
 
 // --- Caffeinate (sleep prevention) ---

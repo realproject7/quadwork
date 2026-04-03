@@ -162,6 +162,9 @@ export default function SetupWizard() {
   const [loading, setLoading] = useState(false);
   const [workspaceLog, setWorkspaceLog] = useState<string[]>([]);
   const [launchStatus, setLaunchStatus] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [customPorts, setCustomPorts] = useState({ chattr: 0, mcpHttp: 0, mcpSse: 0 });
+  const [autoDetectedPorts, setAutoDetectedPorts] = useState({ chattr: 0, mcpHttp: 0, mcpSse: 0 });
 
   // Fetch GitHub user on mount
   useEffect(() => {
@@ -282,22 +285,19 @@ export default function SetupWizard() {
   const launchProject = async () => {
     setLaunchStatus("running");
 
-    // 1. AgentChattr config
-    let agentchattr_port = 8300, mcp_http_port = 8200, mcp_sse_port = 8201;
-    try {
-      const cfgRes = await fetch("/api/config");
-      if (cfgRes.ok) {
-        const cfg = await cfgRes.json();
-        const usedChattr = new Set((cfg.projects || []).map((p: { agentchattr_url?: string }) => {
-          try { return parseInt(new URL(p.agentchattr_url || "").port, 10); } catch { return 0; }
-        }).filter(Boolean));
-        const usedMcp = new Set((cfg.projects || []).flatMap((p: { mcp_http_port?: number; mcp_sse_port?: number }) => [p.mcp_http_port, p.mcp_sse_port]).filter(Boolean));
-        while (usedChattr.has(agentchattr_port)) agentchattr_port++;
-        while (usedMcp.has(mcp_http_port)) mcp_http_port++;
-        mcp_sse_port = mcp_http_port + 1;
-        while (usedMcp.has(mcp_sse_port)) mcp_sse_port++;
-      }
-    } catch {}
+    // 1. Determine ports: use custom if set, otherwise auto-detect free ports
+    let agentchattr_port: number, mcp_http_port: number, mcp_sse_port: number;
+
+    if (showAdvanced && customPorts.chattr > 0) {
+      agentchattr_port = customPorts.chattr;
+      mcp_http_port = customPorts.mcpHttp || customPorts.chattr - 100;
+      mcp_sse_port = customPorts.mcpSse || mcp_http_port + 1;
+    } else {
+      // Auto-detect free ports via server-side check
+      agentchattr_port = autoDetectedPorts.chattr || 8300;
+      mcp_http_port = autoDetectedPorts.mcpHttp || 8200;
+      mcp_sse_port = autoDetectedPorts.mcpSse || 8201;
+    }
 
     const chattrResult = await apiCall("agentchattr-config", {
       workingDir, projectName, repo, backends,
@@ -333,6 +333,28 @@ export default function SetupWizard() {
       updateStep(currentStep, { status: "error", error: configResult.error });
     }
   };
+
+  // Auto-detect free ports when reaching the launch step
+  useEffect(() => {
+    if (steps[currentStep]?.id !== "launch") return;
+    (async () => {
+      try {
+        // Get 1 free port starting from 8300 (chattr)
+        const chattrRes = await fetch("/api/port-check/auto?start=8300&count=1");
+        const chattrData = await chattrRes.json();
+        // Get 2 free ports starting from 8200 (mcp http + sse)
+        const mcpRes = await fetch("/api/port-check/auto?start=8200&count=2");
+        const mcpData = await mcpRes.json();
+        const detected = {
+          chattr: chattrData.ports?.[0] || 8300,
+          mcpHttp: mcpData.ports?.[0] || 8200,
+          mcpSse: mcpData.ports?.[1] || 8201,
+        };
+        setAutoDetectedPorts(detected);
+        if (!customPorts.chattr) setCustomPorts(detected);
+      } catch {}
+    })();
+  }, [currentStep, steps]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filteredRepos = repos.filter((r) =>
     r.name.toLowerCase().includes(repoSearch.toLowerCase())
@@ -682,6 +704,64 @@ export default function SetupWizard() {
                       <span className="text-[11px] text-accent">{backends[agent.key] === "claude" ? "Claude Code" : "Codex"}</span>
                     </div>
                   ))}
+                </div>
+
+                {/* Advanced: Custom ports */}
+                <div className="mb-4">
+                  <label className="flex items-center gap-2 cursor-pointer mb-2">
+                    <input
+                      type="checkbox"
+                      checked={showAdvanced}
+                      onChange={(e) => setShowAdvanced(e.target.checked)}
+                      className="accent-accent"
+                    />
+                    <span className="text-[11px] text-text-muted">Custom ports</span>
+                  </label>
+                  {showAdvanced && (
+                    <div className="border border-border p-3 space-y-2">
+                      <div className="grid grid-cols-3 gap-3">
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-text-muted uppercase tracking-wider">AgentChattr port</label>
+                          <input
+                            type="number"
+                            value={customPorts.chattr || ""}
+                            onChange={(e) => setCustomPorts({ ...customPorts, chattr: parseInt(e.target.value, 10) || 0 })}
+                            placeholder={String(autoDetectedPorts.chattr || 8300)}
+                            className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
+                          />
+                          {autoDetectedPorts.chattr > 0 && (
+                            <span className="text-[10px] text-text-muted">auto-detected: {autoDetectedPorts.chattr}</span>
+                          )}
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-text-muted uppercase tracking-wider">MCP HTTP port</label>
+                          <input
+                            type="number"
+                            value={customPorts.mcpHttp || ""}
+                            onChange={(e) => setCustomPorts({ ...customPorts, mcpHttp: parseInt(e.target.value, 10) || 0 })}
+                            placeholder={String(autoDetectedPorts.mcpHttp || 8200)}
+                            className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
+                          />
+                          {autoDetectedPorts.mcpHttp > 0 && (
+                            <span className="text-[10px] text-text-muted">auto-detected: {autoDetectedPorts.mcpHttp}</span>
+                          )}
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-text-muted uppercase tracking-wider">MCP SSE port</label>
+                          <input
+                            type="number"
+                            value={customPorts.mcpSse || ""}
+                            onChange={(e) => setCustomPorts({ ...customPorts, mcpSse: parseInt(e.target.value, 10) || 0 })}
+                            placeholder={String(autoDetectedPorts.mcpSse || 8201)}
+                            className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
+                          />
+                          {autoDetectedPorts.mcpSse > 0 && (
+                            <span className="text-[10px] text-text-muted">auto-detected: {autoDetectedPorts.mcpSse}</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
