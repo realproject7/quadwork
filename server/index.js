@@ -249,7 +249,9 @@ function handleAgentChattr(req, res) {
 app.post("/api/agentchattr/:projectOrAction/:action", handleAgentChattr);
 app.post("/api/agentchattr/:projectOrAction", handleAgentChattr);
 
-// --- Reset agents: deregister all stale/duplicate slots ---
+// --- Reset agents: deregister all registered slots ---
+// AgentChattr doesn't expose staleness metadata, so this clears all slots.
+// Agents' wrapper heartbeat will auto-re-register with clean names.
 
 app.post("/api/agents/:project/reset", async (req, res) => {
   const projectId = req.params.project;

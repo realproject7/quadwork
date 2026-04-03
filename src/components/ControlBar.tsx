@@ -159,6 +159,13 @@ function ServerSection({ projectId }: { projectId: string }) {
     setTimeout(() => setFeedback(null), 3000);
   };
 
+  // Auto-reset confirmation after 4s if user doesn't follow through
+  useEffect(() => {
+    if (!confirmStop) return;
+    const timer = setTimeout(() => setConfirmStop(false), 4000);
+    return () => clearTimeout(timer);
+  }, [confirmStop]);
+
   const handleStop = async () => {
     if (!confirmStop) {
       setConfirmStop(true);
@@ -205,7 +212,7 @@ function ServerSection({ projectId }: { projectId: string }) {
       );
       const d = await r.json();
       setFeedback(
-        d.ok ? `Reset — ${d.cleared} slot${d.cleared !== 1 ? "s" : ""} cleared` : "Failed"
+        d.ok ? `Reset — ${d.cleared} of ${d.total} slot${d.total !== 1 ? "s" : ""} deregistered` : "Failed"
       );
     } catch {
       setFeedback("Error");
