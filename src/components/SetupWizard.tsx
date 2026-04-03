@@ -289,14 +289,43 @@ export default function SetupWizard() {
     let agentchattr_port: number, mcp_http_port: number, mcp_sse_port: number;
 
     if (showAdvanced && customPorts.chattr > 0) {
+      // Validate custom ports against collisions
       agentchattr_port = customPorts.chattr;
       mcp_http_port = customPorts.mcpHttp || customPorts.chattr - 100;
       mcp_sse_port = customPorts.mcpSse || mcp_http_port + 1;
+      const portsToCheck = [agentchattr_port, mcp_http_port, mcp_sse_port];
+      try {
+        const checks = await Promise.all(
+          portsToCheck.map((p) => fetch(`/api/port-check?port=${p}`).then((r) => r.json()))
+        );
+        const busy = checks.filter((c) => !c.free).map((c) => c.port);
+        if (busy.length > 0) {
+          setLaunchStatus("error");
+          updateStep(currentStep, { status: "error", error: `Port${busy.length > 1 ? "s" : ""} ${busy.join(", ")} already in use` });
+          return;
+        }
+      } catch {}
     } else {
-      // Auto-detect free ports via server-side check
-      agentchattr_port = autoDetectedPorts.chattr || 8300;
-      mcp_http_port = autoDetectedPorts.mcpHttp || 8200;
-      mcp_sse_port = autoDetectedPorts.mcpSse || 8201;
+      // Auto-detect free ports via server-side check (run inline if not yet ready)
+      if (!autoDetectedPorts.chattr) {
+        try {
+          const chattrRes = await fetch("/api/port-check/auto?start=8300&count=1");
+          const chattrData = await chattrRes.json();
+          const mcpRes = await fetch("/api/port-check/auto?start=8200&count=2");
+          const mcpData = await mcpRes.json();
+          agentchattr_port = chattrData.ports?.[0] || 8300;
+          mcp_http_port = mcpData.ports?.[0] || 8200;
+          mcp_sse_port = mcpData.ports?.[1] || 8201;
+        } catch {
+          agentchattr_port = 8300;
+          mcp_http_port = 8200;
+          mcp_sse_port = 8201;
+        }
+      } else {
+        agentchattr_port = autoDetectedPorts.chattr;
+        mcp_http_port = autoDetectedPorts.mcpHttp;
+        mcp_sse_port = autoDetectedPorts.mcpSse;
+      }
     }
 
     const chattrResult = await apiCall("agentchattr-config", {
