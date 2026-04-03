@@ -479,6 +479,21 @@ app.use((req, res, next) => {
 });
 
 const outDir = path.join(__dirname, "..", "out");
+
+// HEAD requests: express.static extensions don't resolve when a same-name
+// directory exists (e.g. /settings dir shadows settings.html for HEAD).
+// Resolve extensionless HEAD requests to their .html file explicitly.
+app.use((req, res, next) => {
+  if (req.method !== "HEAD" || req.path.startsWith("/api/") || path.extname(req.path)) {
+    return next();
+  }
+  const htmlPath = path.join(outDir, req.path + ".html");
+  if (fs.existsSync(htmlPath)) {
+    return res.sendFile(htmlPath);
+  }
+  next();
+});
+
 if (fs.existsSync(outDir)) {
   app.use(express.static(outDir, { redirect: false, extensions: ["html"] }));
 }
