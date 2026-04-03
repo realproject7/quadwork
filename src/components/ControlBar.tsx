@@ -195,7 +195,11 @@ function ServerSection({ projectId }: { projectId: string }) {
         { method: "POST" }
       );
       const d = await r.json();
-      setFeedback(d.ok ? `Restarted (PID: ${d.pid})` : "Failed");
+      if (d.ok && d.pid) {
+        setFeedback(`Restarted (PID: ${d.pid})`);
+      } else {
+        setFeedback(d.error || "Failed to restart");
+      }
     } catch {
       setFeedback("Error");
     }

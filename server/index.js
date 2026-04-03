@@ -180,7 +180,20 @@ function handleAgentChattr(req, res) {
     chattrProcesses.set(projectId, val);
   }
 
+  function regenerateConfigToml() {
+    // If project has a config.toml, update the port to match current config
+    if (!projectConfigToml || !fs.existsSync(projectConfigToml)) return;
+    try {
+      let content = fs.readFileSync(projectConfigToml, "utf-8");
+      content = content.replace(/^port = \d+/m, `port = ${chattrPort}`);
+      fs.writeFileSync(projectConfigToml, content);
+    } catch {}
+  }
+
   function spawnChattr() {
+    // Sync config.toml port before starting
+    regenerateConfigToml();
+
     // Use project config.toml if available (isolated data dir + ports), otherwise fall back to --port
     const args = (projectConfigToml && fs.existsSync(projectConfigToml))
       ? ["--config", projectConfigToml]
@@ -190,6 +203,15 @@ function handleAgentChattr(req, res) {
       stdio: "ignore",
       detached: true,
     });
+
+    // If pid is undefined, spawn failed (binary not found)
+    if (!child.pid) {
+      setProc({ process: null, state: "error", error: "Failed to start AgentChattr — is it installed? Run: pipx install agentchattr" });
+      // Still register error handler to prevent unhandled error crash
+      child.on("error", () => {});
+      return null;
+    }
+
     child.unref();
     child.on("error", (err) => {
       setProc({ process: null, state: "error", error: err.message });
@@ -211,6 +233,10 @@ function handleAgentChattr(req, res) {
     }
     try {
       const child = spawnChattr();
+      if (!child) {
+        const errProc = getProc();
+        return res.status(500).json({ ok: false, state: "error", error: errProc.error || "Failed to start AgentChattr" });
+      }
       // Sync token after AgentChattr starts (it generates its own)
       setTimeout(() => syncChattrToken(projectId), 2000);
       res.json({ ok: true, state: "running", pid: child.pid });
@@ -234,6 +260,10 @@ function handleAgentChattr(req, res) {
     setTimeout(() => {
       try {
         const child = spawnChattr();
+        if (!child) {
+          const errProc = getProc();
+          return res.status(500).json({ ok: false, state: "error", error: errProc.error || "Failed to start AgentChattr" });
+        }
         // Sync token after AgentChattr restarts
         setTimeout(() => syncChattrToken(projectId), 2000);
         res.json({ ok: true, state: "running", pid: child.pid });
