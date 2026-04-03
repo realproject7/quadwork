@@ -108,8 +108,7 @@ export default function ChatPanel({ projectId }: ChatPanelProps) {
 
 /** API-driven fallback when iframe is blocked */
 function ChatPanelAPI({ projectId }: { projectId?: string }) {
-  const [channels, setChannels] = useState<string[]>(["general"]);
-  const [channel, setChannel] = useState("general");
+  const channel = "general";
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [showMentions, setShowMentions] = useState(false);
@@ -121,40 +120,11 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
   const shouldAutoScroll = useRef(true);
   const authRetryRef = useRef(0);
 
-  // Fetch channels via proxy (with 403 retry for token sync race)
-  useEffect(() => {
-    const fetchChannels = () => {
-      fetch(`/api/chat?path=/api/channels${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`)
-        .then((r) => {
-          if (r.status === 403) {
-            if (authRetryRef.current < 3) {
-              authRetryRef.current++;
-              setTimeout(fetchChannels, 2000);
-              return;
-            }
-            setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
-            throw new Error("auth failed");
-          }
-          if (!r.ok) throw new Error("channels fetch failed");
-          return r.json();
-        })
-        .then((data) => {
-          if (!data) return;
-          setAuthError(null);
-          authRetryRef.current = 0;
-          const list = Array.isArray(data) ? data : data.channels || [];
-          setChannels(list.map((c: string | { name: string }) => (typeof c === "string" ? c : c.name)));
-        })
-        .catch(() => setChannels(["general"]));
-    };
-    fetchChannels();
-  }, [projectId]);
-
-  // Reset cursor when channel changes
+  // Reset cursor when project changes
   useEffect(() => {
     cursorRef.current = 0;
     setMessages([]);
-  }, [channel, projectId]);
+  }, [projectId]);
 
   // Poll messages via proxy
   const fetchMessages = useCallback(() => {
@@ -252,22 +222,6 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
           {authError}
         </div>
       )}
-      {/* Channel selector */}
-      <div className="flex items-center gap-2 px-3 h-7 shrink-0 border-b border-border">
-        <span className="text-[11px] text-text-muted">#</span>
-        <select
-          value={channel}
-          onChange={(e) => setChannel(e.target.value)}
-          className="bg-transparent text-[11px] text-text-muted outline-none cursor-pointer"
-        >
-          {channels.map((ch) => (
-            <option key={ch} value={ch} className="bg-bg-surface">
-              {ch}
-            </option>
-          ))}
-        </select>
-      </div>
-
       {/* Messages */}
       <div
         ref={listRef}
@@ -283,9 +237,6 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
           <div key={msg.id} className="flex gap-2 text-[12px] leading-5">
             <span className="text-text-muted shrink-0 w-12 text-right tabular-nums">
               {msg.time?.slice(0, 5) || ""}
-            </span>
-            <span className="shrink-0 text-[10px] text-text-muted border border-border px-1 rounded-sm self-start mt-0.5">
-              #{msg.channel || channel}
             </span>
             <span
               className="shrink-0 font-semibold w-10 text-right"
