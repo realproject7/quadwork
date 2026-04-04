@@ -164,48 +164,283 @@ function writeConfig(config) {
 
 let agentChattrFound = false;
 
-function checkPrereqs() {
-  header("Step 1: Prerequisites");
-  let allOk = true;
+function detectPlatform() {
+  const p = os.platform();
+  if (p === "darwin") return "macos";
+  if (p === "linux") {
+    // Check for apt vs dnf vs yum
+    if (which("apt")) return "linux-apt";
+    if (which("dnf")) return "linux-dnf";
+    if (which("yum")) return "linux-yum";
+    return "linux";
+  }
+  return "other";
+}
 
-  // Node.js 20+
+async function tryInstall(rl, name, description, commands, { platform } = {}) {
+  const cmd = typeof commands === "function" ? commands(platform) : commands;
+  if (!cmd) {
+    warn(`${name} cannot be auto-installed on your system.`);
+    return false;
+  }
+  console.log("");
+  log(`${description}`);
+  const doInstall = await askYN(rl, `Install ${name} now?`, true);
+  if (!doInstall) {
+    log("Skipped.");
+    return false;
+  }
+  const sp = spinner(`Installing ${name}...`);
+  const result = run(`${cmd} 2>&1`, { timeout: 120000 });
+  if (result !== null) {
+    sp.stop(true);
+    return true;
+  } else {
+    sp.stop(false);
+    warn(`Auto-install failed. You can install manually and try again.`);
+    return false;
+  }
+}
+
+async function checkPrereqs(rl) {
+  header("Step 1: Prerequisites");
+  const platform = detectPlatform();
+  let allOk = true;
+  let hasPython = false;
+  let hasPipx = false;
+
+  // ── 1. Node.js 20+ (must already exist — user ran npx) ──
   const nodeVer = run("node --version");
   if (nodeVer) {
     const major = parseInt(nodeVer.replace("v", "").split(".")[0], 10);
-    if (major >= 20) ok(`Node.js ${nodeVer}`);
-    else { fail(`Node.js ${nodeVer} — need 20+`); allOk = false; }
-  } else { fail("Node.js not found"); allOk = false; }
+    if (major >= 20) {
+      ok(`Node.js ${nodeVer}`);
+    } else {
+      fail(`Node.js ${nodeVer} — version 20 or newer is required`);
+      log("Update from: https://nodejs.org");
+      allOk = false;
+    }
+  } else {
+    fail("Node.js not found (this shouldn't happen since you ran npx)");
+    allOk = false;
+  }
 
-  // Python 3.10+
+  // ── 2. Python 3.10+ (manual install — guide only) ──
   const pyVer = run("python3 --version");
   if (pyVer) {
     const parts = pyVer.replace("Python ", "").split(".");
     const minor = parseInt(parts[1], 10);
-    if (parseInt(parts[0], 10) >= 3 && minor >= 10) ok(`${pyVer}`);
-    else { fail(`${pyVer} — need 3.10+`); allOk = false; }
-  } else { fail("Python 3 not found"); allOk = false; }
+    if (parseInt(parts[0], 10) >= 3 && minor >= 10) {
+      ok(`${pyVer}`);
+      hasPython = true;
+    } else {
+      console.log("");
+      warn(`${pyVer} found, but version 3.10 or newer is required.`);
+      log("Python powers the agent communication layer.");
+      log("Download the latest version from:");
+      log(`  → https://python.org/downloads`);
+      log("");
+      log("After installing, close and reopen your terminal, then run:");
+      log("  → npx quadwork init");
+      allOk = false;
+    }
+  } else {
+    console.log("");
+    warn("Python 3 is required but not installed on your system.");
+    log("");
+    log("Python powers the agent communication layer. Install it from:");
+    log("  → https://python.org/downloads (download and run the installer)");
+    log("");
+    log("After installing, close and reopen your terminal, then run:");
+    log("  → npx quadwork init");
+    allOk = false;
+  }
 
-  // pipx
-  if (which("pipx")) ok("pipx");
-  else warn("pipx not found — install: python3 -m pip install --user pipx && pipx ensurepath");
+  if (!hasPython) {
+    // Can't continue with pipx/AgentChattr without Python
+    console.log("");
+    fail("Python is required before we can set up the remaining tools.");
+    log("Install Python first, then re-run: npx quadwork init");
+    return false;
+  }
 
-  // AgentChattr
+  // ── 3. pipx (needs Python) ──
+  if (which("pipx")) {
+    ok("pipx");
+    hasPipx = true;
+  } else {
+    console.log("");
+    warn("pipx is needed to install AgentChattr safely.");
+    log("(pipx keeps Python tools isolated so they don't conflict with your system)");
+    const installed = await tryInstall(rl, "pipx", "We can install it automatically.",
+      "python3 -m pip install --user pipx && python3 -m pipx ensurepath");
+    if (installed && which("pipx")) {
+      ok("pipx installed");
+      hasPipx = true;
+    } else if (installed) {
+      // pipx installed but not in PATH yet
+      warn("pipx was installed but isn't in your PATH yet.");
+      log("Close and reopen your terminal, then run: npx quadwork init");
+      return false;
+    } else {
+      warn("pipx skipped — you can install it later:");
+      log("  → python3 -m pip install --user pipx && pipx ensurepath");
+    }
+  }
+
+  // ── 4. AgentChattr (needs pipx) ──
   const acVer = run("agentchattr --version") || run("python3 -m agentchattr --version");
-  if (acVer) { ok(`AgentChattr ${acVer}`); agentChattrFound = true; }
-  else { warn("AgentChattr not found — install: pipx install agentchattr"); allOk = false; }
+  if (acVer) {
+    ok(`AgentChattr ${acVer}`);
+    agentChattrFound = true;
+  } else if (hasPipx) {
+    console.log("");
+    warn("AgentChattr lets your AI agents communicate with each other.");
+    const installed = await tryInstall(rl, "AgentChattr",
+      "We can install it now using pipx.", "pipx install agentchattr");
+    const acVerAfter = run("agentchattr --version") || run("python3 -m agentchattr --version");
+    if (acVerAfter) {
+      ok(`AgentChattr ${acVerAfter} installed`);
+      agentChattrFound = true;
+    } else {
+      warn("AgentChattr not available — agents won't be able to chat until it's installed.");
+      log("  → Install later: pipx install agentchattr");
+    }
+  } else {
+    warn("AgentChattr not found — install pipx first, then: pipx install agentchattr");
+  }
 
-  // gh CLI
-  if (which("gh")) ok("GitHub CLI (gh)");
-  else { fail("GitHub CLI not found — install: https://cli.github.com"); allOk = false; }
+  // ── 5. GitHub CLI (independent) ──
+  if (which("gh")) {
+    ok("GitHub CLI (gh)");
+  } else {
+    console.log("");
+    warn("GitHub CLI is required for agents to create branches, PRs, and reviews.");
+    const ghCmd = (p) => {
+      if (p === "macos") return "brew install gh";
+      if (p === "linux-apt") return "sudo apt install gh -y";
+      if (p === "linux-dnf") return "sudo dnf install gh -y";
+      return null;
+    };
+    const cmd = ghCmd(platform);
+    if (cmd) {
+      const installed = await tryInstall(rl, "GitHub CLI",
+        "We can install it now.", ghCmd, { platform });
+      if (installed && which("gh")) {
+        ok("GitHub CLI installed");
+      } else {
+        fail("GitHub CLI is required. Install from: https://cli.github.com");
+        allOk = false;
+      }
+    } else {
+      fail("GitHub CLI is required. Install from: https://cli.github.com");
+      allOk = false;
+    }
+  }
 
-  // Claude Code or Codex
-  const hasClaude = which("claude");
-  const hasCodex = which("codex");
+  // ── 6. AI CLIs — at least one required (independent) ──
+  let hasClaude = which("claude");
+  let hasCodex = which("codex");
+
   if (hasClaude) ok("Claude Code");
   if (hasCodex) ok("Codex CLI");
+
   if (!hasClaude && !hasCodex) {
-    fail("No AI CLI found — install Claude Code or Codex CLI");
-    allOk = false;
+    console.log("");
+    warn("You need at least one AI CLI to power your agents.");
+    log("Choose one (or both) to install:");
+    console.log("");
+
+    // Claude Code
+    log("Claude Code — Anthropic's AI coding assistant");
+    const installClaude = await askYN(rl, "Install Claude Code?", true);
+    if (installClaude) {
+      const sp = spinner("Installing Claude Code...");
+      const result = run("npm install -g @anthropic-ai/claude-code 2>&1", { timeout: 120000 });
+      sp.stop(result !== null);
+      hasClaude = which("claude");
+      if (hasClaude) ok("Claude Code installed");
+      else warn("Install failed — try manually: npm install -g @anthropic-ai/claude-code");
+    }
+
+    // Codex CLI
+    if (!hasClaude || !hasCodex) {
+      log("Codex CLI — OpenAI's AI coding assistant");
+      const installCodex = await askYN(rl, "Install Codex CLI?", !hasClaude);
+      if (installCodex) {
+        const sp = spinner("Installing Codex CLI...");
+        const result = run("npm install -g codex 2>&1", { timeout: 120000 });
+        sp.stop(result !== null);
+        hasCodex = which("codex");
+        if (hasCodex) ok("Codex CLI installed");
+        else warn("Install failed — try manually: npm install -g codex");
+      }
+    }
+
+    if (!hasClaude && !hasCodex) {
+      fail("At least one AI CLI is required (Claude Code or Codex CLI).");
+      log("Install one and re-run: npx quadwork init");
+      allOk = false;
+    }
+  }
+
+  // ── CLI Authentication Checks ──
+  if (allOk) {
+    console.log("");
+    log("Checking CLI authentication...");
+    console.log("");
+
+    // GitHub CLI auth
+    const ghAuth = run("gh auth status 2>&1");
+    if (ghAuth && ghAuth.includes("Logged in")) {
+      ok("GitHub CLI — authenticated");
+    } else {
+      warn("GitHub CLI is installed but not logged in.");
+      log("  Run this command to log in:");
+      log("  → gh auth login");
+      log("");
+      const recheck = await askYN(rl, "Done? Press Y to re-check, or N to continue anyway", false);
+      if (recheck) {
+        const ghAuth2 = run("gh auth status 2>&1");
+        if (ghAuth2 && ghAuth2.includes("Logged in")) {
+          ok("GitHub CLI — authenticated");
+        } else {
+          warn("Still not authenticated — you can set this up later.");
+        }
+      }
+    }
+
+    // Claude Code auth
+    if (hasClaude) {
+      const claudeAuth = run("claude auth status 2>&1") || run("claude --version 2>&1");
+      if (claudeAuth && (claudeAuth.includes("authenticated") || claudeAuth.includes("Logged in") || claudeAuth.includes("@"))) {
+        ok("Claude Code — authenticated");
+      } else {
+        warn("Claude Code may need authentication.");
+        log("  If prompted when agents start, run: claude auth login");
+      }
+    }
+
+    // Codex CLI auth
+    if (hasCodex) {
+      const codexAuth = run("codex auth status 2>&1") || run("codex --version 2>&1");
+      if (codexAuth && (codexAuth.includes("authenticated") || codexAuth.includes("Logged in") || codexAuth.includes("@"))) {
+        ok("Codex CLI — authenticated");
+      } else {
+        warn("Codex CLI may need authentication.");
+        log("  If prompted when agents start, run: codex auth");
+      }
+    }
+  }
+
+  // ── Summary ──
+  console.log("");
+  if (allOk) {
+    ok("All prerequisites ready!");
+  } else {
+    console.log("");
+    log("Some prerequisites are missing. Fix the issues above and re-run:");
+    log("  → npx quadwork init");
   }
 
   return allOk;
@@ -680,7 +915,7 @@ async function cmdInit() {
 
   try {
     // Step 1: Prerequisites (header printed by checkPrereqs)
-    const prereqsOk = checkPrereqs();
+    const prereqsOk = await checkPrereqs(rl);
     if (!prereqsOk) {
       const proceed = await askYN(rl, "Some prerequisites missing. Continue anyway?", false);
       if (!proceed) { rl.close(); process.exit(1); }
