@@ -305,9 +305,11 @@ async function checkPrereqs(rl) {
     } else {
       warn("AgentChattr not available — agents won't be able to chat until it's installed.");
       log("  → Install later: pipx install agentchattr");
+      allOk = false;
     }
   } else {
     warn("AgentChattr not found — install pipx first, then: pipx install agentchattr");
+    allOk = false;
   }
 
   // ── 5. GitHub CLI (independent) ──
@@ -350,10 +352,13 @@ async function checkPrereqs(rl) {
     warn("You need at least one AI CLI to power your agents.");
     log("Choose one (or both) to install:");
     console.log("");
+  }
 
-    // Claude Code
+  // Offer to install Claude Code if missing
+  if (!hasClaude) {
+    const isRequired = !hasCodex;
     log("Claude Code — Anthropic's AI coding assistant");
-    const installClaude = await askYN(rl, "Install Claude Code?", true);
+    const installClaude = await askYN(rl, "Install Claude Code?", isRequired);
     if (installClaude) {
       const sp = spinner("Installing Claude Code...");
       const result = run("npm install -g @anthropic-ai/claude-code 2>&1", { timeout: 120000 });
@@ -362,26 +367,31 @@ async function checkPrereqs(rl) {
       if (hasClaude) ok("Claude Code installed");
       else warn("Install failed — try manually: npm install -g @anthropic-ai/claude-code");
     }
+  }
 
-    // Codex CLI
-    if (!hasClaude || !hasCodex) {
-      log("Codex CLI — OpenAI's AI coding assistant");
-      const installCodex = await askYN(rl, "Install Codex CLI?", !hasClaude);
-      if (installCodex) {
-        const sp = spinner("Installing Codex CLI...");
-        const result = run("npm install -g codex 2>&1", { timeout: 120000 });
-        sp.stop(result !== null);
-        hasCodex = which("codex");
-        if (hasCodex) ok("Codex CLI installed");
-        else warn("Install failed — try manually: npm install -g codex");
-      }
+  // Offer to install Codex CLI if missing
+  if (!hasCodex) {
+    const isRequired = !hasClaude;
+    if (hasClaude) {
+      console.log("");
+      log("Tip: Installing Codex CLI too gives your team different AI perspectives.");
     }
+    log("Codex CLI — OpenAI's AI coding assistant");
+    const installCodex = await askYN(rl, "Install Codex CLI?", isRequired);
+    if (installCodex) {
+      const sp = spinner("Installing Codex CLI...");
+      const result = run("npm install -g codex 2>&1", { timeout: 120000 });
+      sp.stop(result !== null);
+      hasCodex = which("codex");
+      if (hasCodex) ok("Codex CLI installed");
+      else warn("Install failed — try manually: npm install -g codex");
+    }
+  }
 
-    if (!hasClaude && !hasCodex) {
-      fail("At least one AI CLI is required (Claude Code or Codex CLI).");
-      log("Install one and re-run: npx quadwork init");
-      allOk = false;
-    }
+  if (!hasClaude && !hasCodex) {
+    fail("At least one AI CLI is required (Claude Code or Codex CLI).");
+    log("Install one and re-run: npx quadwork init");
+    allOk = false;
   }
 
   // ── CLI Authentication Checks ──
