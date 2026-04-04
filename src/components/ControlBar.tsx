@@ -82,7 +82,7 @@ function KeepAliveSection({ projectId }: { projectId: string }) {
 
   const start = () => {
     fetch(
-      `/api/triggers?project=${encodeURIComponent(projectId)}&action=start`,
+      `/api/triggers/${encodeURIComponent(projectId)}/start`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -105,7 +105,7 @@ function KeepAliveSection({ projectId }: { projectId: string }) {
 
   const stop = () => {
     fetch(
-      `/api/triggers?project=${encodeURIComponent(projectId)}&action=stop`,
+      `/api/triggers/${encodeURIComponent(projectId)}/stop`,
       { method: "POST" }
     )
       .then((r) => r.json())
@@ -117,7 +117,7 @@ function KeepAliveSection({ projectId }: { projectId: string }) {
 
   const sendNow = () => {
     fetch(
-      `/api/triggers?project=${encodeURIComponent(projectId)}&action=send-now`,
+      `/api/triggers/${encodeURIComponent(projectId)}/send-now`,
       { method: "POST" }
     ).catch(() => {});
   };
