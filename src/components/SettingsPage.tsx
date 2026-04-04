@@ -221,12 +221,22 @@ export default function SettingsPage() {
   const addProject = () => {
     if (!config) return;
     const id = `project-${Date.now()}`;
+    // Use CLI-status-aware defaults: if only one CLI installed, use it for all agents
+    const defaultCmd = cliStatus
+      ? (cliStatus.claude && !cliStatus.codex ? "claude"
+        : !cliStatus.claude && cliStatus.codex ? "codex"
+        : "claude")
+      : "claude";
+    const agents: Record<string, AgentConfig> = {};
+    for (const [key, val] of Object.entries(DEFAULT_AGENTS)) {
+      agents[key] = { ...val, command: defaultCmd };
+    }
     const newProject: ProjectConfig = {
       id,
       name: "New Project",
       repo: "owner/repo",
       working_dir: "",
-      agents: { ...DEFAULT_AGENTS },
+      agents,
     };
     setConfig({ ...config, projects: [...config.projects, newProject] });
     setExpanded({ ...expanded, [id]: true });
