@@ -302,7 +302,27 @@ async function checkPrereqs(rl) {
     allOk = false;
   }
 
-  // ── 2. Python 3.10+ (manual install — guide only) ──
+  // ── 2. Homebrew (macOS only — needed for gh, AI CLIs) ──
+  if (platform === "macos") {
+    if (which("brew")) {
+      ok("Homebrew");
+    } else {
+      console.log("");
+      warn("Homebrew is required to install developer tools (GitHub CLI, AI coding tools).");
+      log("It's the standard macOS package manager. Install it by pasting this into your terminal:");
+      log("");
+      log(`  → /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`);
+      log("");
+      log("After installing, close and reopen your terminal, then run:");
+      log("  → npx quadwork init");
+      console.log("");
+      fail("Homebrew is required before we can set up the remaining tools.");
+      log("Install Homebrew first, then re-run: npx quadwork init");
+      return false;
+    }
+  }
+
+  // ── 3. Python 3.10+ (manual install — guide only) ──
   const pyVer = run("python3 --version");
   if (pyVer) {
     const parts = pyVer.replace("Python ", "").split(".");
