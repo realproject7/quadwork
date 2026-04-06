@@ -152,6 +152,7 @@ export default function SetupWizard() {
   const [backends, setBackends] = useState<Record<string, string>>({
     head: "claude", reviewer1: "claude", reviewer2: "claude", dev: "claude",
   });
+  const [autoApprove, setAutoApprove] = useState(true);
   const [showReviewerCreds, setShowReviewerCreds] = useState(false);
   const [reviewerUser, setReviewerUser] = useState("");
   const [reviewerTokenMode, setReviewerTokenMode] = useState<"paste" | "file">("paste");
@@ -365,7 +366,7 @@ export default function SetupWizard() {
     // 2. Save config
     const id = workingDir.split("/").pop() || projectName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
     const configResult = await apiCall("add-config", {
-      id, name: projectName, repo, workingDir, backends,
+      id, name: projectName, repo, workingDir, backends, auto_approve: autoApprove,
       ...(chattrResult.ok ? {
         agentchattr_token: chattrResult.agentchattr_token,
         agentchattr_port: chattrResult.agentchattr_port,
@@ -647,6 +648,22 @@ export default function SetupWizard() {
                     </div>
                   ))}
                 </div>
+
+                {/* Auto-approve toggle */}
+                <label className="flex items-center gap-2 mb-3 cursor-pointer" title="Enable permission bypass flags so agents can work autonomously without prompting for approval on every action">
+                  <input
+                    type="checkbox"
+                    checked={autoApprove}
+                    onChange={(e) => setAutoApprove(e.target.checked)}
+                    className="accent-accent"
+                  />
+                  <span className="text-[11px] text-text">
+                    Auto-approve agent actions
+                  </span>
+                  <span className="text-[10px] text-text-muted">
+                    (required for autonomous work)
+                  </span>
+                </label>
 
                 {/* Reviewer credentials toggle */}
                 <label className="flex items-center gap-2 mb-3 cursor-pointer">

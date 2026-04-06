@@ -1020,7 +1020,15 @@ function writeQuadWorkConfig(setup) {
   };
 
   for (const agent of AGENTS) {
-    project.agents[agent] = { cwd: setup.worktrees[agent], command: (setup.backends && setup.backends[agent]) || setup.backend };
+    const cmd = (setup.backends && setup.backends[agent]) || setup.backend;
+    const cliBase = cmd.split("/").pop().split(" ")[0];
+    const injectMode = cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag";
+    project.agents[agent] = {
+      cwd: setup.worktrees[agent],
+      command: cmd,
+      auto_approve: true,
+      mcp_inject: injectMode,
+    };
   }
 
   if (setup.memoryDir) {

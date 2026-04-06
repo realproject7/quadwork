@@ -131,22 +131,197 @@ const agentSessions = new Map();
 // AgentChattr server processes — per-project (key = projectId)
 const chattrProcesses = new Map();
 
+// --- MCP auth proxy for Codex (can't pass headers via -c flag) ---
+// Maps "project/agent" → { server, port }
+const mcpProxies = new Map();
+
+/**
+ * Start a local HTTP proxy that forwards MCP requests with Bearer token.
+ * Returns a Promise that resolves to the proxy URL once listening.
+ */
+function startMcpProxy(projectId, agentId, upstreamUrl, token) {
+  const key = `${projectId}/${agentId}`;
+  const existing = mcpProxies.get(key);
+  if (existing) return Promise.resolve(`http://127.0.0.1:${existing.port}/mcp`);
+
+  return new Promise((resolve, reject) => {
+    const proxyServer = http.createServer((req, res) => {
+      const parsedUrl = new URL(req.url, `http://127.0.0.1`);
+      const targetUrl = `${upstreamUrl}${parsedUrl.pathname}${parsedUrl.search}`;
+      const headers = { ...req.headers, host: new URL(upstreamUrl).host };
+      if (token) {
+        headers["authorization"] = `Bearer ${token}`;
+        headers["x-agent-token"] = token;
+      }
+      delete headers["content-length"];
+
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        const body = Buffer.concat(chunks);
+        const proxyReq = (upstreamUrl.startsWith("https") ? require("https") : http).request(
+          targetUrl,
+          { method: req.method, headers: { ...headers, "content-length": body.length } },
+          (proxyRes) => {
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(res);
+          }
+        );
+        proxyReq.on("error", (err) => {
+          res.writeHead(502);
+          res.end(`Proxy error: ${err.message}`);
+        });
+        proxyReq.end(body);
+      });
+    });
+
+    proxyServer.on("error", (err) => reject(err));
+    proxyServer.listen(0, "127.0.0.1", () => {
+      const port = proxyServer.address().port;
+      mcpProxies.set(key, { server: proxyServer, port });
+      resolve(`http://127.0.0.1:${port}/mcp`);
+    });
+  });
+}
+
+function stopMcpProxy(projectId, agentId) {
+  const key = `${projectId}/${agentId}`;
+  const proxy = mcpProxies.get(key);
+  if (proxy) {
+    try { proxy.server.close(); } catch {}
+    mcpProxies.delete(key);
+  }
+}
+
+// --- Permission bypass flags per CLI ---
+const PERMISSION_FLAGS = {
+  claude: ["--dangerously-skip-permissions"],
+  codex: ["--dangerously-bypass-approvals-and-sandbox"],
+  gemini: ["--yolo"],
+};
+
+// --- MCP config generation & agent launch args ---
+
+/**
+ * Generate a per-agent MCP config file for Claude (--mcp-config).
+ * Returns the absolute path to the written JSON file.
+ */
+function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
+  const os = require("os");
+  const configDir = path.join(os.homedir(), ".quadwork", projectId);
+  if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+  const filePath = path.join(configDir, `mcp-${agentId}.json`);
+  const url = `http://127.0.0.1:${mcpHttpPort}/mcp`;
+  const config = {
+    mcpServers: {
+      agentchattr: {
+        type: "http",
+        url,
+        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+      },
+    },
+  };
+  fs.writeFileSync(filePath, JSON.stringify(config, null, 2));
+  return filePath;
+}
+
+/**
+ * Build extra launch args for an agent (permission flags + MCP injection).
+ * Async because Codex proxy_flag mode needs to await proxy startup.
+ */
+async function buildAgentArgs(projectId, agentId) {
+  const cfg = readConfig();
+  const project = cfg.projects?.find((p) => p.id === projectId);
+  if (!project) return [];
+
+  const agentCfg = project.agents?.[agentId] || {};
+  const command = agentCfg.command || "claude";
+  const cliBase = command.split("/").pop().split(" ")[0]; // extract base CLI name
+  const args = [];
+
+  // Permission bypass flags
+  if (agentCfg.auto_approve !== false) {
+    const flags = PERMISSION_FLAGS[cliBase];
+    if (flags) args.push(...flags);
+  }
+
+  // MCP config injection
+  const mcpHttpPort = project.mcp_http_port;
+  const token = project.agentchattr_token;
+  if (mcpHttpPort) {
+    const injectMode = agentCfg.mcp_inject || (cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag");
+    if (injectMode === "flag") {
+      // Claude/Kimi: write config file, pass --mcp-config
+      const mcpConfigPath = writeMcpConfigFile(projectId, agentId, mcpHttpPort, token);
+      const flag = agentCfg.mcp_flag || "--mcp-config";
+      args.push(flag, mcpConfigPath);
+    } else if (injectMode === "proxy_flag") {
+      // Codex: start local auth proxy, pass proxy URL via -c flag
+      const upstreamUrl = `http://127.0.0.1:${mcpHttpPort}`;
+      const proxyUrl = await startMcpProxy(projectId, agentId, upstreamUrl, token);
+      if (proxyUrl) {
+        args.push("-c", `mcp_servers.agentchattr.url="${proxyUrl}"`);
+      }
+    }
+  }
+
+  return args;
+}
+
+/**
+ * Build extra env vars for an agent (MCP injection via env for Gemini).
+ */
+function buildAgentEnv(projectId, agentId) {
+  const cfg = readConfig();
+  const project = cfg.projects?.find((p) => p.id === projectId);
+  if (!project) return {};
+
+  const agentCfg = project.agents?.[agentId] || {};
+  const command = agentCfg.command || "claude";
+  const cliBase = command.split("/").pop().split(" ")[0];
+  const env = {};
+
+  // Gemini: inject MCP via env var
+  if (cliBase === "gemini" && project.mcp_http_port) {
+    const os = require("os");
+    const configDir = path.join(os.homedir(), ".quadwork", projectId);
+    if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+    const settingsPath = path.join(configDir, `mcp-${agentId}-settings.json`);
+    const url = `http://127.0.0.1:${project.mcp_http_port}/mcp`;
+    const settings = {
+      mcpServers: {
+        agentchattr: {
+          type: "http",
+          url,
+          ...(project.agentchattr_token ? { headers: { Authorization: `Bearer ${project.agentchattr_token}` } } : {}),
+        },
+      },
+    };
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = settingsPath;
+  }
+
+  return env;
+}
+
 // Helper: spawn a PTY for a project/agent and register in agentSessions
-function spawnAgentPty(project, agent) {
+async function spawnAgentPty(project, agent) {
   const key = `${project}/${agent}`;
 
   const cwd = resolveAgentCwd(project, agent);
   if (!cwd) return { ok: false, error: `Unknown agent: ${key}` };
 
   const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
+  const args = await buildAgentArgs(project, agent);
+  const extraEnv = buildAgentEnv(project, agent);
 
   try {
-    const term = pty.spawn(command, [], {
+    const term = pty.spawn(command, args, {
       name: "xterm-256color",
       cols: 120,
       rows: 30,
       cwd,
-      env: process.env,
+      env: { ...process.env, ...extraEnv },
     });
 
     const session = { projectId: project, agentId: agent, term, ws: null, state: "running", error: null };
@@ -190,6 +365,9 @@ function stopAgentSession(key) {
   session.ws = null;
   session.state = "stopped";
   session.error = null;
+  // Clean up MCP auth proxy if running
+  const [projectId, agentId] = key.split("/");
+  if (projectId && agentId) stopMcpProxy(projectId, agentId);
 }
 
 app.get("/api/agents", (_req, res) => {
@@ -423,7 +601,7 @@ app.post("/api/agents/:project/reset", async (req, res) => {
 
 // --- Lifecycle: start spawns PTY (visible in terminal panel) ---
 
-app.post("/api/agents/:project/:agent/start", (req, res) => {
+app.post("/api/agents/:project/:agent/start", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
@@ -432,7 +610,7 @@ app.post("/api/agents/:project/:agent/start", (req, res) => {
     return res.json({ ok: true, state: "running", message: "Already running" });
   }
 
-  const result = spawnAgentPty(project, agent);
+  const result = await spawnAgentPty(project, agent);
   if (result.ok) {
     res.json({ ok: true, state: "running", pid: result.pid });
   } else {
@@ -451,14 +629,14 @@ app.post("/api/agents/:project/:agent/stop", (req, res) => {
 
 // --- Lifecycle: restart ---
 
-app.post("/api/agents/:project/:agent/restart", (req, res) => {
+app.post("/api/agents/:project/:agent/restart", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
   stopAgentSession(key);
 
-  setTimeout(() => {
-    const result = spawnAgentPty(project, agent);
+  setTimeout(async () => {
+    const result = await spawnAgentPty(project, agent);
     if (result.ok) {
       res.json({ ok: true, state: "running", pid: result.pid });
     } else {
@@ -708,7 +886,7 @@ app.use((req, res, next) => {
 
 const wss = new WebSocketServer({ server, path: "/ws/terminal" });
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", async (ws, req) => {
   const params = new URL(req.url, `http://localhost:${PORT}`).searchParams;
   const projectId = params.get("project");
   const agentId = params.get("agent");
@@ -723,7 +901,7 @@ wss.on("connection", (ws, req) => {
 
   // If no active PTY, spawn one
   if (!session || !session.term) {
-    const result = spawnAgentPty(projectId, agentId);
+    const result = await spawnAgentPty(projectId, agentId);
     if (!result.ok) {
       ws.close(1011, "pty-spawn-failed");
       return;

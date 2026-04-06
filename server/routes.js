@@ -697,19 +697,25 @@ router.post("/api/setup", (req, res) => {
     }
     case "add-config": {
       const { id, name, repo, workingDir, backends } = body;
+      const autoApprove = body.auto_approve !== false; // default true
       // Use directory basename for sibling paths (matches CLI wizard)
       const dirName = path.basename(workingDir);
       const parentDir = path.dirname(workingDir);
       let cfg;
       try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
-      catch { cfg = { port: 8400, agentchattr_url: "http://127.0.0.1:8300", projects: [] }; }
+      catch { cfg = { port: 8400, agentchattr_url: "http://127.0.0.1:8300", agentchattr_dir: path.join(os.homedir(), ".quadwork", "agentchattr"), projects: [] }; }
       if (cfg.projects.some((p) => p.id === id)) return res.json({ ok: true, message: "Project already in config" });
-      // Match CLI wizard agent structure: { cwd, command }
+      // Match CLI wizard agent structure: { cwd, command, auto_approve, mcp_inject }
       const agents = {};
       for (const agentId of ["head", "reviewer1", "reviewer2", "dev"]) {
+        const cmd = (backends && backends[agentId]) || "claude";
+        const cliBase = cmd.split("/").pop().split(" ")[0];
+        const injectMode = cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag";
         agents[agentId] = {
           cwd: path.join(parentDir, `${dirName}-${agentId}`),
-          command: (backends && backends[agentId]) || "claude",
+          command: cmd,
+          auto_approve: autoApprove,
+          mcp_inject: injectMode,
         };
       }
       // Use pre-assigned ports/token from agentchattr-config step if provided,
