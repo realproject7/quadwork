@@ -136,20 +136,27 @@ const chattrProcesses = new Map();
 const mcpProxies = new Map();
 
 /**
+ * Grab a free port synchronously by spawning a child process.
+ */
+function getFreePortSync() {
+  const result = execSync(
+    `node -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close()})"`,
+    { encoding: "utf-8", timeout: 5000 }
+  );
+  return parseInt(result.trim(), 10);
+}
+
+/**
  * Start a local HTTP proxy that forwards MCP requests with Bearer token.
  * Returns the proxy URL (e.g. http://127.0.0.1:54321/mcp).
- * Uses a pre-allocated port to avoid async listen race.
+ * Port is allocated synchronously via a subprocess to avoid async races.
  */
 function startMcpProxy(projectId, agentId, upstreamUrl, token) {
   const key = `${projectId}/${agentId}`;
   const existing = mcpProxies.get(key);
   if (existing) return `http://127.0.0.1:${existing.port}/mcp`;
 
-  // Pre-allocate a free port synchronously using a temporary net server
-  const tmpServer = net.createServer();
-  tmpServer.listen(0, "127.0.0.1");
-  const port = tmpServer.address().port;
-  tmpServer.close();
+  const port = getFreePortSync();
 
   const proxyServer = http.createServer((req, res) => {
     const parsedUrl = new URL(req.url, `http://127.0.0.1`);
@@ -181,7 +188,7 @@ function startMcpProxy(projectId, agentId, upstreamUrl, token) {
     });
   });
 
-  // Bind to the pre-allocated port
+  // Bind to the pre-allocated port (listen is async but port is reserved)
   proxyServer.listen(port, "127.0.0.1");
   mcpProxies.set(key, { server: proxyServer, port });
   return `http://127.0.0.1:${port}/mcp`;
