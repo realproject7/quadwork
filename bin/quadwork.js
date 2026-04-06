@@ -93,11 +93,19 @@ function installAgentChattr(dir) {
   // Clone if not already present
   if (!fs.existsSync(path.join(dir, "run.py"))) {
     if (fs.existsSync(dir)) {
-      // Directory exists but no run.py — only clean up if it looks like a failed clone
-      const hasGitDir = fs.existsSync(path.join(dir, ".git"));
+      // Directory exists but no run.py — only clean up if positively identified
       const isEmpty = fs.readdirSync(dir).length === 0;
-      if (hasGitDir || isEmpty) {
+      if (isEmpty) {
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      } else if (fs.existsSync(path.join(dir, ".git"))) {
+        // Verify this is actually an AgentChattr repo by checking the remote
+        const remote = run(`git -C "${dir}" remote get-url origin 2>/dev/null`);
+        if (remote && remote.includes("agentchattr")) {
+          try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        } else {
+          // Git repo but not AgentChattr — refuse to overwrite
+          return null;
+        }
       } else {
         // Non-empty, non-git directory — refuse to overwrite
         return null;
