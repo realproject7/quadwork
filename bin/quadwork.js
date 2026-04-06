@@ -1181,8 +1181,7 @@ function cmdStart() {
 
   const config = readConfig();
   if (config.projects.length === 0) {
-    fail("No projects configured. Run: npx quadwork init");
-    process.exit(1);
+    warn("No projects configured yet. Create one at the setup page.");
   }
 
   const quadworkDir = path.join(__dirname, "..");
