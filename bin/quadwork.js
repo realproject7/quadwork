@@ -1155,8 +1155,7 @@ async function cmdInit() {
     console.log(`    ${c.dim}3.${c.reset} Hit Start — your team takes it from there`);
     console.log("");
     console.log(`  ${c.dim}Commands:${c.reset}`);
-    console.log(`    ${c.dim}npx quadwork start${c.reset}    — restart everything`);
-    console.log(`    ${c.dim}npx quadwork stop${c.reset}     — shut it all down`);
+    console.log(`    ${c.dim}npx quadwork start${c.reset}    — start the dashboard (Ctrl+C to stop)`);
     console.log("");
     console.log(`  ${c.green}${c.bold}Happy shipping!${c.reset}`);
     console.log("");
@@ -1203,20 +1202,8 @@ function cmdStart() {
     process.exit(1);
   }
 
-  log("Starting QuadWork server...");
-  const server = spawn("node", [serverDir], {
-    stdio: "ignore",
-    detached: true,
-    env: { ...process.env },
-  });
-  server.unref();
-  ok(`Server started (PID: ${server.pid})`);
-
-  // Save PID for stop command
-  const pidFile = path.join(CONFIG_DIR, "server.pid");
-  fs.writeFileSync(pidFile, String(server.pid));
-
   // Start AgentChattr for each project that has a config.toml
+  const acPids = [];
   const acDir = findAgentChattr(config.agentchattr_dir);
   if (acDir) {
     for (const project of config.projects) {
@@ -1234,20 +1221,34 @@ function cmdStart() {
       acProc.unref();
       if (acProc.pid) {
         ok(`AgentChattr started for ${project.id} (PID: ${acProc.pid})`);
-        fs.writeFileSync(path.join(CONFIG_DIR, `agentchattr-${project.id}.pid`), String(acProc.pid));
+        acPids.push(acProc.pid);
       }
     }
   }
 
-  // Open dashboard in browser
+  // Open dashboard in browser after a short delay
   const dashboardUrl = `http://127.0.0.1:${port}`;
   const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
   setTimeout(() => {
     try { execSync(`${openCmd} ${dashboardUrl}`, { stdio: "ignore" }); } catch {}
   }, 1500);
 
+  // Graceful shutdown on Ctrl+C
+  process.on("SIGINT", () => {
+    console.log("");
+    log("Shutting down...");
+    // Stop AgentChattr processes
+    for (const pid of acPids) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+    }
+    ok("Stopped. Goodbye!");
+    process.exit(0);
+  });
+
+  // Run server in foreground
   log(`Dashboard: ${dashboardUrl}`);
-  log("");
+  log("Press Ctrl+C to stop.\n");
+  require(path.join(serverDir, "index.js"));
 }
 
 // ─── Stop Command ───────────────────────────────────────────────────────────
