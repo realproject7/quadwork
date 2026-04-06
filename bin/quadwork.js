@@ -274,14 +274,30 @@ async function checkPrereqs(rl) {
     log("(pipx keeps Python tools isolated so they don't conflict with your system)");
     const installed = await tryInstall(rl, "pipx", "We can install it automatically.",
       "python3 -m pip install --user pipx && python3 -m pipx ensurepath");
-    if (installed && which("pipx")) {
-      ok("pipx installed");
-      hasPipx = true;
-    } else if (installed) {
-      // pipx installed but not in PATH yet
-      warn("pipx was installed but isn't in your PATH yet.");
-      log("Close and reopen your terminal, then run: npx quadwork init");
-      return false;
+    if (installed) {
+      // Add common pipx binary paths to current session PATH so we don't need a terminal restart
+      const home = os.homedir();
+      const extraPaths = [
+        path.join(home, ".local", "bin"),
+        path.join(home, "Library", "Python", "3.14", "bin"),
+        path.join(home, "Library", "Python", "3.13", "bin"),
+        path.join(home, "Library", "Python", "3.12", "bin"),
+        path.join(home, "Library", "Python", "3.11", "bin"),
+        path.join(home, "Library", "Python", "3.10", "bin"),
+      ];
+      for (const p of extraPaths) {
+        if (fs.existsSync(p) && !process.env.PATH.includes(p)) {
+          process.env.PATH = p + ":" + process.env.PATH;
+        }
+      }
+      if (which("pipx")) {
+        ok("pipx installed");
+        hasPipx = true;
+      } else {
+        // Still not in PATH — use python3 -m pipx as fallback
+        ok("pipx installed (using python3 -m pipx)");
+        hasPipx = true;
+      }
     } else {
       warn("pipx skipped — you can install it later:");
       log("  → python3 -m pip install --user pipx && pipx ensurepath");
@@ -289,6 +305,7 @@ async function checkPrereqs(rl) {
   }
 
   // ── 4. AgentChattr (needs pipx) ──
+  const pipxCmd = which("pipx") ? "pipx" : "python3 -m pipx";
   const acVer = run("agentchattr --version") || run("python3 -m agentchattr --version");
   if (acVer) {
     ok(`AgentChattr ${acVer}`);
@@ -297,14 +314,22 @@ async function checkPrereqs(rl) {
     console.log("");
     warn("AgentChattr lets your AI agents communicate with each other.");
     const installed = await tryInstall(rl, "AgentChattr",
-      "We can install it now using pipx.", "pipx install agentchattr");
+      "We can install it now using pipx.", `${pipxCmd} install agentchattr`);
+    if (installed) {
+      // Re-scan PATH for newly installed agentchattr binary
+      const home = os.homedir();
+      const acBinDir = path.join(home, ".local", "bin");
+      if (fs.existsSync(acBinDir) && !process.env.PATH.includes(acBinDir)) {
+        process.env.PATH = acBinDir + ":" + process.env.PATH;
+      }
+    }
     const acVerAfter = run("agentchattr --version") || run("python3 -m agentchattr --version");
     if (acVerAfter) {
       ok(`AgentChattr ${acVerAfter} installed`);
       agentChattrFound = true;
     } else {
       warn("AgentChattr not available — agents won't be able to chat until it's installed.");
-      log("  → Install later: pipx install agentchattr");
+      log(`  → Install later: ${pipxCmd} install agentchattr`);
       allOk = false;
     }
   } else {
