@@ -19,6 +19,7 @@ const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
 const DEFAULT_CONFIG = {
   port: 8400,
   agentchattr_url: "http://127.0.0.1:8300",
+  agentchattr_dir: path.join(os.homedir(), ".quadwork", "agentchattr"),
   projects: [],
 };
 

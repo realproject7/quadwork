@@ -7,6 +7,7 @@ const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 const DEFAULT_CONFIG = {
   port: 8400,
   agentchattr_url: "http://127.0.0.1:8300",
+  agentchattr_dir: path.join(os.homedir(), ".quadwork", "agentchattr"),
   projects: [],
 };
 
@@ -97,7 +98,21 @@ function resolveProjectChattr(projectId) {
     token: project?.agentchattr_token || config.agentchattr_token || null,
     mcp_http_port: project?.mcp_http_port || null,
     mcp_sse_port: project?.mcp_sse_port || null,
+    dir: project?.agentchattr_dir || config.agentchattr_dir || path.join(os.homedir(), ".quadwork", "agentchattr"),
   };
+}
+
+/**
+ * Resolve the command + args to spawn AgentChattr from its cloned directory.
+ * Returns { command, args, cwd } or null if not fully set up.
+ * Requires .venv/bin/python — never falls back to bare python3.
+ */
+function resolveChattrSpawn(agentchattrDir) {
+  const dir = agentchattrDir || path.join(os.homedir(), ".quadwork", "agentchattr");
+  const runPy = path.join(dir, "run.py");
+  const venvPython = path.join(dir, ".venv", "bin", "python");
+  if (!fs.existsSync(runPy) || !fs.existsSync(venvPython)) return null;
+  return { command: venvPython, args: ["run.py"], cwd: dir };
 }
 
 /**
@@ -124,4 +139,4 @@ async function syncChattrToken(projectId) {
   } catch {}
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, syncChattrToken, CONFIG_PATH };
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH };

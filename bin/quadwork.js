@@ -12,6 +12,8 @@ const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const AGENTS = ["head", "reviewer1", "reviewer2", "dev"];
+const DEFAULT_AGENTCHATTR_DIR = path.join(CONFIG_DIR, "agentchattr");
+const AGENTCHATTR_REPO = "https://github.com/bcurts/agentchattr.git";
 
 // ─── ANSI Helpers ──────────────────────────────────────────────────────────
 
@@ -61,6 +63,82 @@ function run(cmd, opts = {}) {
 
 function which(cmd) {
   return run(`which ${cmd}`) !== null;
+}
+
+/**
+ * Resolve the agentchattr_dir from config, falling back to DEFAULT_AGENTCHATTR_DIR.
+ */
+function getAgentChattrDir() {
+  const config = readConfig();
+  return config.agentchattr_dir || DEFAULT_AGENTCHATTR_DIR;
+}
+
+/**
+ * Check if AgentChattr is fully installed (cloned + venv ready).
+ * Returns the directory path if both run.py and .venv/bin/python exist, or null.
+ */
+function findAgentChattr(dir) {
+  dir = dir || getAgentChattrDir();
+  if (fs.existsSync(path.join(dir, "run.py")) && fs.existsSync(path.join(dir, ".venv", "bin", "python"))) return dir;
+  return null;
+}
+
+/**
+ * Clone AgentChattr and set up its venv. Idempotent — safe to re-run.
+ * Only removes existing directories that are identifiable as failed AgentChattr clones.
+ * Returns the directory path on success, null on failure.
+ */
+function installAgentChattr(dir) {
+  dir = dir || getAgentChattrDir();
+  // Clone if not already present
+  if (!fs.existsSync(path.join(dir, "run.py"))) {
+    if (fs.existsSync(dir)) {
+      // Directory exists but no run.py — only clean up if positively identified
+      const isEmpty = fs.readdirSync(dir).length === 0;
+      if (isEmpty) {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      } else if (fs.existsSync(path.join(dir, ".git"))) {
+        // Verify this is actually an AgentChattr repo by checking the remote
+        const remote = run(`git -C "${dir}" remote get-url origin 2>/dev/null`);
+        if (remote && remote.includes("agentchattr")) {
+          try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        } else {
+          // Git repo but not AgentChattr — refuse to overwrite
+          return null;
+        }
+      } else {
+        // Non-empty, non-git directory — refuse to overwrite
+        return null;
+      }
+    }
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    const cloneResult = run(`git clone "${AGENTCHATTR_REPO}" "${dir}" 2>&1`, { timeout: 60000 });
+    if (cloneResult === null || !fs.existsSync(path.join(dir, "run.py"))) return null;
+  }
+  // Create venv and install deps (always ensure venv is ready)
+  const venvPython = path.join(dir, ".venv", "bin", "python");
+  if (!fs.existsSync(venvPython)) {
+    const venvResult = run(`python3 -m venv "${path.join(dir, ".venv")}" 2>&1`, { timeout: 60000 });
+    if (venvResult === null) return null;
+  }
+  const reqFile = path.join(dir, "requirements.txt");
+  if (fs.existsSync(reqFile)) {
+    const pipResult = run(`"${venvPython}" -m pip install -r "${reqFile}" 2>&1`, { timeout: 120000 });
+    if (pipResult === null) return null;
+  }
+  return dir;
+}
+
+/**
+ * Get spawn args for launching AgentChattr from its cloned directory.
+ * Returns { command, spawnArgs, cwd } or null if not fully installed.
+ * Requires .venv/bin/python — never falls back to bare python3.
+ */
+function chattrSpawnArgs(dir, extraArgs) {
+  dir = dir || getAgentChattrDir();
+  const venvPython = path.join(dir, ".venv", "bin", "python");
+  if (!fs.existsSync(path.join(dir, "run.py")) || !fs.existsSync(venvPython)) return null;
+  return { command: venvPython, spawnArgs: ["run.py", ...(extraArgs || [])], cwd: dir };
 }
 
 function ask(rl, question, defaultVal) {
@@ -151,7 +229,7 @@ function readConfig() {
     const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     return migrateAgentKeys(config);
   } catch {
-    return { port: 8400, agentchattr_url: "http://127.0.0.1:8300", projects: [] };
+    return { port: 8400, agentchattr_url: "http://127.0.0.1:8300", agentchattr_dir: DEFAULT_AGENTCHATTR_DIR, projects: [] };
   }
 }
 
@@ -207,7 +285,6 @@ async function checkPrereqs(rl) {
   const platform = detectPlatform();
   let allOk = true;
   let hasPython = false;
-  let hasPipx = false;
 
   // ── 1. Node.js 20+ (must already exist — user ran npx) ──
   const nodeVer = run("node --version");
@@ -257,83 +334,43 @@ async function checkPrereqs(rl) {
   }
 
   if (!hasPython) {
-    // Can't continue with pipx/AgentChattr without Python
+    // Can't continue with AgentChattr without Python
     console.log("");
     fail("Python is required before we can set up the remaining tools.");
     log("Install Python first, then re-run: npx quadwork init");
     return false;
   }
 
-  // ── 3. pipx (needs Python) ──
-  if (which("pipx")) {
-    ok("pipx");
-    hasPipx = true;
-  } else {
-    console.log("");
-    warn("pipx is needed to install AgentChattr safely.");
-    log("(pipx keeps Python tools isolated so they don't conflict with your system)");
-    const installed = await tryInstall(rl, "pipx", "We can install it automatically.",
-      "python3 -m pip install --user pipx && python3 -m pipx ensurepath");
-    if (installed) {
-      // Add common pipx binary paths to current session PATH so we don't need a terminal restart
-      const home = os.homedir();
-      const extraPaths = [
-        path.join(home, ".local", "bin"),
-        path.join(home, "Library", "Python", "3.14", "bin"),
-        path.join(home, "Library", "Python", "3.13", "bin"),
-        path.join(home, "Library", "Python", "3.12", "bin"),
-        path.join(home, "Library", "Python", "3.11", "bin"),
-        path.join(home, "Library", "Python", "3.10", "bin"),
-      ];
-      for (const p of extraPaths) {
-        if (fs.existsSync(p) && !process.env.PATH.includes(p)) {
-          process.env.PATH = p + ":" + process.env.PATH;
-        }
-      }
-      if (which("pipx")) {
-        ok("pipx installed");
-        hasPipx = true;
-      } else {
-        // Still not in PATH — use python3 -m pipx as fallback
-        ok("pipx installed (using python3 -m pipx)");
-        hasPipx = true;
-      }
-    } else {
-      warn("pipx skipped — you can install it later:");
-      log("  → python3 -m pip install --user pipx && pipx ensurepath");
-    }
-  }
-
-  // ── 4. AgentChattr (needs pipx) ──
-  const pipxCmd = which("pipx") ? "pipx" : "python3 -m pipx";
-  const acVer = run("agentchattr --version") || run("python3 -m agentchattr --version");
-  if (acVer) {
-    ok(`AgentChattr ${acVer}`);
+  // ── 3. AgentChattr (clone + venv — needs Python and git) ──
+  const acDir = findAgentChattr();
+  if (acDir) {
+    ok(`AgentChattr (${acDir})`);
     agentChattrFound = true;
-  } else if (hasPipx) {
+  } else if (hasPython) {
     console.log("");
     warn("AgentChattr lets your AI agents communicate with each other.");
-    const installed = await tryInstall(rl, "AgentChattr",
-      "We can install it now using pipx.", `${pipxCmd} install agentchattr`);
-    if (installed) {
-      // Re-scan PATH for newly installed agentchattr binary
-      const home = os.homedir();
-      const acBinDir = path.join(home, ".local", "bin");
-      if (fs.existsSync(acBinDir) && !process.env.PATH.includes(acBinDir)) {
-        process.env.PATH = acBinDir + ":" + process.env.PATH;
+    log("It will be cloned and set up in a virtualenv.");
+    const doInstall = await askYN(rl, "Install AgentChattr now?", true);
+    if (doInstall) {
+      const acSpinner = spinner("Cloning and setting up AgentChattr...");
+      const result = installAgentChattr();
+      acSpinner.stop(result !== null);
+      if (result) {
+        ok(`AgentChattr installed (${DEFAULT_AGENTCHATTR_DIR})`);
+        agentChattrFound = true;
+      } else {
+        warn("AgentChattr install failed. You can set it up manually:");
+        log(`  → git clone ${AGENTCHATTR_REPO} ${DEFAULT_AGENTCHATTR_DIR}`);
+        log(`  → cd ${DEFAULT_AGENTCHATTR_DIR} && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`);
+        allOk = false;
       }
-    }
-    const acVerAfter = run("agentchattr --version") || run("python3 -m agentchattr --version");
-    if (acVerAfter) {
-      ok(`AgentChattr ${acVerAfter} installed`);
-      agentChattrFound = true;
     } else {
-      warn("AgentChattr not available — agents won't be able to chat until it's installed.");
-      log(`  → Install later: ${pipxCmd} install agentchattr`);
+      warn("AgentChattr skipped — agents won't be able to chat until it's installed.");
+      log(`  → Install later: git clone ${AGENTCHATTR_REPO} ${DEFAULT_AGENTCHATTR_DIR}`);
       allOk = false;
     }
   } else {
-    warn("AgentChattr not found — install pipx first, then: pipx install agentchattr");
+    warn("AgentChattr requires Python — install Python first, then re-run init.");
     allOk = false;
   }
 
@@ -706,42 +743,48 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
   ok(`Wrote ${configTomlPath}`);
 
   // Start AgentChattr if available; optionally skip install attempt
-  let acAvailable = which("agentchattr");
+  const acDir = findAgentChattr();
+  let acAvailable = !!acDir;
   if (!acAvailable && !skipInstall) {
-    const acSpinner = spinner("Installing AgentChattr...");
-    const installResult = run("pipx install agentchattr 2>&1");
-    if (installResult !== null) {
+    const acSpinner = spinner("Setting up AgentChattr...");
+    const installResult = installAgentChattr();
+    if (installResult) {
       acSpinner.stop(true);
-      acAvailable = which("agentchattr");
-      if (!acAvailable) warn("agentchattr binary not found in PATH after install");
+      acAvailable = true;
     } else {
       acSpinner.stop(false);
-      warn("Install manually: pipx install agentchattr");
+      warn(`Install manually: git clone ${AGENTCHATTR_REPO} ${DEFAULT_AGENTCHATTR_DIR}`);
     }
   }
 
   // Start AgentChattr server (only if installed)
   if (acAvailable) {
     log("Starting AgentChattr server...");
-    const acProc = spawn("agentchattr", ["--config", configTomlPath], {
-      stdio: "ignore",
-      detached: true,
-    });
-    acProc.on("error", (err) => {
-      warn(`AgentChattr failed to start: ${err.message}`);
-    });
-    acProc.unref();
-    if (acProc.pid) {
-      ok(`AgentChattr started (PID: ${acProc.pid})`);
-      // Per-project PID file
-      if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
-      const pidFile = path.join(CONFIG_DIR, `agentchattr-${setup.projectName}.pid`);
-      fs.writeFileSync(pidFile, String(acProc.pid));
+    const acSpawn = chattrSpawnArgs(findAgentChattr(), ["--config", configTomlPath]);
+    if (acSpawn) {
+      const acProc = spawn(acSpawn.command, acSpawn.spawnArgs, {
+        cwd: acSpawn.cwd,
+        stdio: "ignore",
+        detached: true,
+      });
+      acProc.on("error", (err) => {
+        warn(`AgentChattr failed to start: ${err.message}`);
+      });
+      acProc.unref();
+      if (acProc.pid) {
+        ok(`AgentChattr started (PID: ${acProc.pid})`);
+        if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+        const pidFile = path.join(CONFIG_DIR, `agentchattr-${setup.projectName}.pid`);
+        fs.writeFileSync(pidFile, String(acProc.pid));
+      } else {
+        warn("Could not start AgentChattr — check logs in " + (findAgentChattr() || DEFAULT_AGENTCHATTR_DIR));
+      }
     } else {
-      warn("Could not start AgentChattr — start manually: agentchattr --config " + configTomlPath);
+      warn("AgentChattr run.py not found — skipping auto-start.");
     }
   } else {
-    warn("AgentChattr not installed — skipping auto-start. Start manually later: agentchattr --config " + configTomlPath);
+    warn("AgentChattr not installed — skipping auto-start.");
+    log(`  → Install: git clone ${AGENTCHATTR_REPO} ${DEFAULT_AGENTCHATTR_DIR}`);
   }
 
   return configTomlPath;
@@ -1115,12 +1158,16 @@ function cmdStart() {
   fs.writeFileSync(pidFile, String(server.pid));
 
   // Start AgentChattr for each project that has a config.toml
-  if (which("agentchattr")) {
+  const acDir = findAgentChattr(config.agentchattr_dir);
+  if (acDir) {
     for (const project of config.projects) {
       if (!project.working_dir) continue;
       const configToml = path.join(project.working_dir, "agentchattr", "config.toml");
       if (!fs.existsSync(configToml)) continue;
-      const acProc = spawn("agentchattr", ["--config", configToml], {
+      const acSpawn = chattrSpawnArgs(acDir, ["--config", configToml]);
+      if (!acSpawn) continue;
+      const acProc = spawn(acSpawn.command, acSpawn.spawnArgs, {
+        cwd: acSpawn.cwd,
         stdio: "ignore",
         detached: true,
       });
