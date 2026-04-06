@@ -445,12 +445,15 @@ async function checkPrereqs(rl) {
     log("Claude Code — Anthropic's AI coding assistant");
     const installClaude = await askYN(rl, "Install Claude Code?", isRequired);
     if (installClaude) {
-      const sp = spinner("Installing Claude Code...");
-      const result = run(`${npmPrefix}npm install -g @anthropic-ai/claude-code 2>&1`, { timeout: 120000 });
-      sp.stop(result !== null);
-      hasClaude = which("claude");
-      if (hasClaude) ok("Claude Code installed");
-      else warn(`Install failed — try manually: ${npmPrefix}npm install -g @anthropic-ai/claude-code`);
+      log(`Running: ${npmPrefix}npm install -g @anthropic-ai/claude-code`);
+      try {
+        execSync(`${npmPrefix}npm install -g @anthropic-ai/claude-code`, { stdio: "inherit", timeout: 120000 });
+        hasClaude = which("claude");
+        if (hasClaude) ok("Claude Code installed");
+        else warn(`Install seemed to succeed but 'claude' not found on PATH. Try restarting your terminal.`);
+      } catch {
+        warn(`Install failed — try manually: ${npmPrefix}npm install -g @anthropic-ai/claude-code`);
+      }
     }
   }
 
@@ -464,12 +467,15 @@ async function checkPrereqs(rl) {
     log("Codex CLI — OpenAI's AI coding assistant");
     const installCodex = await askYN(rl, "Install Codex CLI?", isRequired);
     if (installCodex) {
-      const sp = spinner("Installing Codex CLI...");
-      const result = run(`${npmPrefix}npm install -g codex 2>&1`, { timeout: 120000 });
-      sp.stop(result !== null);
-      hasCodex = which("codex");
-      if (hasCodex) ok("Codex CLI installed");
-      else warn(`Install failed — try manually: ${npmPrefix}npm install -g codex`);
+      log(`Running: ${npmPrefix}npm install -g codex`);
+      try {
+        execSync(`${npmPrefix}npm install -g codex`, { stdio: "inherit", timeout: 120000 });
+        hasCodex = which("codex");
+        if (hasCodex) ok("Codex CLI installed");
+        else warn(`Install seemed to succeed but 'codex' not found on PATH. Try restarting your terminal.`);
+      } catch {
+        warn(`Install failed — try manually: ${npmPrefix}npm install -g codex`);
+      }
     }
   }
 
