@@ -5,13 +5,14 @@ Your AI dev team in a box. Four agents — one Head, one Dev, two Reviewers — 
 ## Getting Started
 
 1. Install [Node.js 20+](https://nodejs.org) if you don't have it
-2. Open your terminal and run:
+2. Install [Homebrew](https://brew.sh) if you're on macOS: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
+3. Open your terminal and run:
 
 ```bash
 npx quadwork init
 ```
 
-3. The wizard installs everything else and opens your dashboard.
+4. The wizard installs everything else and opens your dashboard.
 
 That's it. The wizard handles Python, GitHub CLI, AI tools, and authentication — you just follow the prompts.
 
