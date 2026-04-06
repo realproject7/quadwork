@@ -205,7 +205,7 @@ app.get("/api/agents", (_req, res) => {
 
 // Per-project AgentChattr lifecycle: /api/agentchattr/:project/:action
 // Backward compat: /api/agentchattr/:action uses first project
-function handleAgentChattr(req, res) {
+async function handleAgentChattr(req, res) {
   let projectId, action;
   if (req.params.action) {
     projectId = req.params.projectOrAction;
@@ -257,7 +257,7 @@ function handleAgentChattr(req, res) {
     const { dir: acDir } = resolveProjectChattr(projectId);
     const acSpawn = resolveChattrSpawn(acDir);
     if (!acSpawn) {
-      setProc({ process: null, state: "error", error: "AgentChattr not installed. Clone it: git clone https://github.com/bcurts/agentchattr.git ~/.quadwork/agentchattr" });
+      setProc({ process: null, state: "error", error: `AgentChattr not installed. Clone it: git clone https://github.com/bcurts/agentchattr.git ${acDir}` });
       return null;
     }
 
@@ -336,13 +336,24 @@ function handleAgentChattr(req, res) {
       }
     }, 500);
   } else if (action === "update") {
-    // Update AgentChattr: git pull + refresh venv dependencies
+    // Update AgentChattr: stop → git pull → pip install → restart
     const { dir: acDir } = resolveProjectChattr(projectId);
     if (!acDir || !fs.existsSync(path.join(acDir, "run.py"))) {
       return res.status(400).json({ ok: false, error: "AgentChattr not installed at " + (acDir || "unknown") });
     }
     try {
       const { execSync } = require("child_process");
+
+      // Stop running process before pulling
+      const proc = getProc();
+      const wasRunning = proc.process && proc.state === "running";
+      if (wasRunning) {
+        try { proc.process.kill("SIGTERM"); } catch {}
+        setProc({ process: null, state: "stopped", error: null });
+        // Brief wait for process to release files
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
       const pullResult = execSync("git pull 2>&1", { cwd: acDir, encoding: "utf-8", timeout: 30000 }).trim();
       const venvPython = path.join(acDir, ".venv", "bin", "python");
       let pipResult = "";
@@ -350,7 +361,18 @@ function handleAgentChattr(req, res) {
       if (fs.existsSync(venvPython) && fs.existsSync(reqFile)) {
         pipResult = execSync(`"${venvPython}" -m pip install -r requirements.txt 2>&1`, { cwd: acDir, encoding: "utf-8", timeout: 120000 }).trim();
       }
-      res.json({ ok: true, pull: pullResult, pip: pipResult });
+
+      // Restart if it was running before the update
+      let restarted = false;
+      if (wasRunning) {
+        const child = spawnChattr();
+        restarted = !!child;
+        if (child) {
+          setTimeout(() => syncChattrToken(projectId).catch(() => {}), 2000);
+        }
+      }
+
+      res.json({ ok: true, pull: pullResult, pip: pipResult, restarted });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }
