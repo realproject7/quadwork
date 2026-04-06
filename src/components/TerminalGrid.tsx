@@ -104,6 +104,19 @@ export default function TerminalGrid({
                   className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
                   title="Restart"
                 >↻</button>
+                {agentStates[agent.id] === "running" && (
+                  <button
+                    onClick={() => {
+                      fetch(`/api/agents/${encodeURIComponent(projectId)}/${encodeURIComponent(agent.id)}/write`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ text: "/compact\n" }),
+                      }).catch(() => {});
+                    }}
+                    className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
+                    title="Compact — frees context/memory when agent is stuck"
+                  >&#x29C9;</button>
+                )}
                 {isExpanded && (
                   <button
                     onClick={() => setExpanded(null)}
