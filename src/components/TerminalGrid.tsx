@@ -115,7 +115,7 @@ export default function TerminalGrid({
                     }}
                     className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
                     title="Compact — frees context/memory when agent is stuck"
-                  >&#x29C9;</button>
+                  >/c</button>
                 )}
                 {isExpanded && (
                   <button
