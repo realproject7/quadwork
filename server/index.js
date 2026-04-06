@@ -645,11 +645,11 @@ app.use((req, res, next) => {
 
 const outDir = path.join(__dirname, "..", "out");
 
-// HEAD requests: express.static extensions don't resolve when a same-name
-// directory exists (e.g. /settings dir shadows settings.html for HEAD).
-// Resolve extensionless HEAD requests to their .html file explicitly.
+// Resolve extensionless requests to .html files before express.static.
+// Next.js static export creates both /setup.html and /setup/ directory —
+// express.static finds the directory first and returns NotFoundError.
 app.use((req, res, next) => {
-  if (req.method !== "HEAD" || req.path.startsWith("/api/") || path.extname(req.path)) {
+  if (req.path.startsWith("/api/") || req.path.startsWith("/_next/") || path.extname(req.path)) {
     return next();
   }
   const htmlPath = path.join(outDir, req.path + ".html");
