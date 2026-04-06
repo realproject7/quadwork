@@ -104,15 +104,15 @@ function resolveProjectChattr(projectId) {
 
 /**
  * Resolve the command + args to spawn AgentChattr from its cloned directory.
- * Returns { command, args, cwd } or null if the directory is not set up.
+ * Returns { command, args, cwd } or null if not fully set up.
+ * Requires .venv/bin/python — never falls back to bare python3.
  */
 function resolveChattrSpawn(agentchattrDir) {
   const dir = agentchattrDir || path.join(os.homedir(), ".quadwork", "agentchattr");
   const runPy = path.join(dir, "run.py");
-  if (!fs.existsSync(runPy)) return null;
   const venvPython = path.join(dir, ".venv", "bin", "python");
-  const python = fs.existsSync(venvPython) ? venvPython : "python3";
-  return { command: python, args: ["run.py"], cwd: dir };
+  if (!fs.existsSync(runPy) || !fs.existsSync(venvPython)) return null;
+  return { command: venvPython, args: ["run.py"], cwd: dir };
 }
 
 /**

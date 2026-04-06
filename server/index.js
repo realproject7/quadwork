@@ -335,6 +335,25 @@ function handleAgentChattr(req, res) {
         res.status(500).json({ ok: false, state: "error", error: err.message });
       }
     }, 500);
+  } else if (action === "update") {
+    // Update AgentChattr: git pull + refresh venv dependencies
+    const { dir: acDir } = resolveProjectChattr(projectId);
+    if (!acDir || !fs.existsSync(path.join(acDir, "run.py"))) {
+      return res.status(400).json({ ok: false, error: "AgentChattr not installed at " + (acDir || "unknown") });
+    }
+    try {
+      const { execSync } = require("child_process");
+      const pullResult = execSync("git pull 2>&1", { cwd: acDir, encoding: "utf-8", timeout: 30000 }).trim();
+      const venvPython = path.join(acDir, ".venv", "bin", "python");
+      let pipResult = "";
+      const reqFile = path.join(acDir, "requirements.txt");
+      if (fs.existsSync(venvPython) && fs.existsSync(reqFile)) {
+        pipResult = execSync(`"${venvPython}" -m pip install -r requirements.txt 2>&1`, { cwd: acDir, encoding: "utf-8", timeout: 120000 }).trim();
+      }
+      res.json({ ok: true, pull: pullResult, pip: pipResult });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
   } else {
     res.status(400).json({ error: "Unknown action" });
   }

@@ -66,28 +66,41 @@ function which(cmd) {
 }
 
 /**
- * Check if AgentChattr is installed in a cloned directory.
- * Returns the directory path if run.py exists, or null.
+ * Resolve the agentchattr_dir from config, falling back to DEFAULT_AGENTCHATTR_DIR.
+ */
+function getAgentChattrDir() {
+  const config = readConfig();
+  return config.agentchattr_dir || DEFAULT_AGENTCHATTR_DIR;
+}
+
+/**
+ * Check if AgentChattr is fully installed (cloned + venv ready).
+ * Returns the directory path if both run.py and .venv/bin/python exist, or null.
  */
 function findAgentChattr(dir) {
-  dir = dir || DEFAULT_AGENTCHATTR_DIR;
-  if (fs.existsSync(path.join(dir, "run.py"))) return dir;
+  dir = dir || getAgentChattrDir();
+  if (fs.existsSync(path.join(dir, "run.py")) && fs.existsSync(path.join(dir, ".venv", "bin", "python"))) return dir;
   return null;
 }
 
 /**
  * Clone AgentChattr and set up its venv. Idempotent — safe to re-run.
+ * Handles partial clones by removing and re-cloning.
  * Returns the directory path on success, null on failure.
  */
 function installAgentChattr(dir) {
-  dir = dir || DEFAULT_AGENTCHATTR_DIR;
-  // Clone if not already present
+  dir = dir || getAgentChattrDir();
+  // Clone if not already present or recover from partial clone
   if (!fs.existsSync(path.join(dir, "run.py"))) {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (fs.existsSync(dir)) {
+      // Partial clone — clean up and re-clone
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
     const cloneResult = run(`git clone "${AGENTCHATTR_REPO}" "${dir}" 2>&1`, { timeout: 60000 });
     if (cloneResult === null || !fs.existsSync(path.join(dir, "run.py"))) return null;
   }
-  // Create venv and install deps if needed
+  // Create venv and install deps (always ensure venv is ready)
   const venvPython = path.join(dir, ".venv", "bin", "python");
   if (!fs.existsSync(venvPython)) {
     const venvResult = run(`python3 -m venv "${path.join(dir, ".venv")}" 2>&1`, { timeout: 60000 });
@@ -103,14 +116,14 @@ function installAgentChattr(dir) {
 
 /**
  * Get spawn args for launching AgentChattr from its cloned directory.
- * Returns { command, spawnArgs, cwd } or null if not installed.
+ * Returns { command, spawnArgs, cwd } or null if not fully installed.
+ * Requires .venv/bin/python — never falls back to bare python3.
  */
 function chattrSpawnArgs(dir, extraArgs) {
-  dir = dir || DEFAULT_AGENTCHATTR_DIR;
-  if (!fs.existsSync(path.join(dir, "run.py"))) return null;
+  dir = dir || getAgentChattrDir();
   const venvPython = path.join(dir, ".venv", "bin", "python");
-  const command = fs.existsSync(venvPython) ? venvPython : "python3";
-  return { command, spawnArgs: ["run.py", ...(extraArgs || [])], cwd: dir };
+  if (!fs.existsSync(path.join(dir, "run.py")) || !fs.existsSync(venvPython)) return null;
+  return { command: venvPython, spawnArgs: ["run.py", ...(extraArgs || [])], cwd: dir };
 }
 
 function ask(rl, question, defaultVal) {
