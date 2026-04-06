@@ -186,7 +186,7 @@ function buildAgentArgs(projectId, agentId) {
   const mcpHttpPort = project.mcp_http_port;
   const token = project.agentchattr_token;
   if (mcpHttpPort) {
-    const injectMode = agentCfg.mcp_inject || (cliBase === "codex" ? "proxy_flag" : "flag");
+    const injectMode = agentCfg.mcp_inject || (cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag");
     if (injectMode === "flag") {
       // Claude/Kimi: write config file, pass --mcp-config
       const mcpConfigPath = writeMcpConfigFile(projectId, agentId, mcpHttpPort, token);

@@ -710,11 +710,12 @@ router.post("/api/setup", (req, res) => {
       for (const agentId of ["head", "reviewer1", "reviewer2", "dev"]) {
         const cmd = (backends && backends[agentId]) || "claude";
         const cliBase = cmd.split("/").pop().split(" ")[0];
+        const injectMode = cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag";
         agents[agentId] = {
           cwd: path.join(parentDir, `${dirName}-${agentId}`),
           command: cmd,
           auto_approve: autoApprove,
-          mcp_inject: cliBase === "codex" ? "proxy_flag" : "flag",
+          mcp_inject: injectMode,
         };
       }
       // Use pre-assigned ports/token from agentchattr-config step if provided,
