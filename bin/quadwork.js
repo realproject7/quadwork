@@ -497,17 +497,22 @@ async function checkPrereqs(rl) {
       ok("GitHub CLI — authenticated");
     } else {
       warn("GitHub CLI is installed but not logged in.");
-      log("  Run this command to log in:");
-      log("  → gh auth login");
-      log("");
-      const recheck = await askYN(rl, "Done? Press Y to re-check, or N to continue anyway", false);
-      if (recheck) {
-        const ghAuth2 = run("gh auth status 2>&1");
-        if (ghAuth2 && ghAuth2.includes("Logged in")) {
-          ok("GitHub CLI — authenticated");
-        } else {
-          warn("Still not authenticated — you can set this up later.");
+      log("  A browser window will open for authentication.");
+      const doLogin = await askYN(rl, "Log in to GitHub now?", true);
+      if (doLogin) {
+        try {
+          execSync("gh auth login -w", { stdio: "inherit", timeout: 120000 });
+          const ghAuth2 = run("gh auth status 2>&1");
+          if (ghAuth2 && ghAuth2.includes("Logged in")) {
+            ok("GitHub CLI — authenticated");
+          } else {
+            warn("Authentication may not have completed — you can run 'gh auth login' later.");
+          }
+        } catch {
+          warn("Authentication cancelled or failed — you can run 'gh auth login' later.");
         }
+      } else {
+        warn("Skipped — you can run 'gh auth login' later.");
       }
     }
 
@@ -517,8 +522,18 @@ async function checkPrereqs(rl) {
       if (claudeAuth && (claudeAuth.includes("authenticated") || claudeAuth.includes("Logged in") || claudeAuth.includes("@"))) {
         ok("Claude Code — authenticated");
       } else {
-        warn("Claude Code may need authentication.");
-        log("  If prompted when agents start, run: claude auth login");
+        warn("Claude Code needs authentication.");
+        const doLogin = await askYN(rl, "Log in to Claude Code now?", true);
+        if (doLogin) {
+          try {
+            execSync("claude auth login", { stdio: "inherit", timeout: 120000 });
+            ok("Claude Code — authentication complete");
+          } catch {
+            warn("Authentication cancelled or failed — you can run 'claude auth login' later.");
+          }
+        } else {
+          warn("Skipped — you can run 'claude auth login' later.");
+        }
       }
     }
 
@@ -528,8 +543,18 @@ async function checkPrereqs(rl) {
       if (codexAuth && (codexAuth.includes("authenticated") || codexAuth.includes("Logged in") || codexAuth.includes("@"))) {
         ok("Codex CLI — authenticated");
       } else {
-        warn("Codex CLI may need authentication.");
-        log("  If prompted when agents start, run: codex auth");
+        warn("Codex CLI needs authentication.");
+        const doLogin = await askYN(rl, "Log in to Codex CLI now?", true);
+        if (doLogin) {
+          try {
+            execSync("codex auth", { stdio: "inherit", timeout: 120000 });
+            ok("Codex CLI — authentication complete");
+          } catch {
+            warn("Authentication cancelled or failed — you can run 'codex auth' later.");
+          }
+        } else {
+          warn("Skipped — you can run 'codex auth' later.");
+        }
       }
     }
   }

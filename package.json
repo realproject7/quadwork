@@ -1,6 +1,6 @@
 {
   "name": "quadwork",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Unified dashboard for multi-agent coding teams — 4 AI agents, one terminal",
   "bin": {
     "quadwork": "./bin/quadwork.js"
