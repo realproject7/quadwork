@@ -643,18 +643,21 @@ app.use((req, res, next) => {
   next();
 });
 
-const outDir = path.join(__dirname, "..", "out");
+const outDir = path.resolve(__dirname, "..", "out");
 
 // Resolve extensionless requests to .html files before express.static.
 // Next.js static export creates both /setup.html and /setup/ directory —
 // express.static finds the directory first and returns NotFoundError.
 app.use((req, res, next) => {
-  if (req.path.startsWith("/api/") || req.path.startsWith("/_next/") || path.extname(req.path)) {
+  if (req.path === "/" || req.path.startsWith("/api/") || req.path.startsWith("/_next/") || path.extname(req.path)) {
     return next();
   }
-  const htmlPath = path.join(outDir, req.path + ".html");
+  const htmlFile = req.path.slice(1) + ".html";
+  const htmlPath = path.join(outDir, htmlFile);
   if (fs.existsSync(htmlPath)) {
-    return res.sendFile(htmlPath);
+    return res.sendFile(htmlFile, { root: outDir }, (err) => {
+      if (err) next();
+    });
   }
   next();
 });
