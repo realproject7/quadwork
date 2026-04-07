@@ -155,8 +155,26 @@ function installAgentChattr(dir) {
     } catch (e) {
       if (e.code !== "EEXIST") return setError(`Cannot create install lock ${lockFile}: ${e.message}`);
       // Reclaim if the existing lock is stale (crashed pid or too old).
+      // Use rename → unlink instead of unlink directly: rename is atomic,
+      // so only one racing process can move the stale lock aside. The
+      // others see ENOENT and just retry the wx create. Without this,
+      // two processes could both observe the same stale lock, both
+      // unlink it (one of those unlinks would target the *next* lock
+      // freshly acquired by a third process), and both proceed past the
+      // gate concurrently — see review on quadwork#193.
       if (_isLockStale(lockFile)) {
-        try { fs.unlinkSync(lockFile); } catch {}
+        const sideline = `${lockFile}.stale.${process.pid}.${Date.now()}`;
+        try {
+          fs.renameSync(lockFile, sideline);
+          try { fs.unlinkSync(sideline); } catch {}
+        } catch (renameErr) {
+          // ENOENT: another process already reclaimed it. Anything else:
+          // treat as transient and retry — the next iteration will read
+          // whatever is at lockFile now and decide again.
+          if (renameErr.code !== "ENOENT") {
+            return setError(`Cannot reclaim stale lock ${lockFile}: ${renameErr.message}`);
+          }
+        }
         continue;
       }
       // Live peer install in progress. After it finishes, the install
