@@ -22,12 +22,23 @@ const TYPE_MS = 70;
 const DELETE_MS = 35;
 const HOLD_MS = 2000;
 
-function useTypewriter(variants: string[]) {
+function useTypewriter(variants: string[], enabled: boolean) {
   const [index, setIndex] = useState(0);
   const [text, setText] = useState("");
   const [phase, setPhase] = useState<"typing" | "holding" | "deleting">("typing");
 
   useEffect(() => {
+    // #227: when disabled, freeze on the first variant fully typed
+    // out and stop scheduling further phase transitions. The
+    // displayed text remains visible so the line doesn't suddenly
+    // empty when the operator toggles the animation off.
+    if (!enabled) {
+      setIndex(0);
+      setText(variants[0] || "");
+      setPhase("typing");
+      return;
+    }
+
     const current = variants[index];
     let timer: ReturnType<typeof setTimeout>;
 
@@ -49,14 +60,34 @@ function useTypewriter(variants: string[]) {
     }
 
     return () => clearTimeout(timer);
-  }, [text, phase, index, variants]);
+  }, [text, phase, index, variants, enabled]);
 
   return text;
 }
 
+const TAGLINE_LS_KEY = "quadwork_tagline_animation";
+
 export default function TopHeader() {
   const [aboutOpen, setAboutOpen] = useState(false);
-  const suffix = useTypewriter(TAGLINE_VARIANTS);
+  // #227: tagline animation toggle persisted in localStorage. Default
+  // is "on" for new visitors. Initialised lazily so SSR doesn't try
+  // to read window.localStorage during the first render.
+  const [animationEnabled, setAnimationEnabled] = useState(true);
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(TAGLINE_LS_KEY);
+      if (saved === "off") setAnimationEnabled(false);
+    } catch { /* localStorage unavailable — keep default */ }
+  }, []);
+  const toggleAnimation = () => {
+    setAnimationEnabled((prev) => {
+      const next = !prev;
+      try { window.localStorage.setItem(TAGLINE_LS_KEY, next ? "on" : "off"); } catch {}
+      return next;
+    });
+  };
+
+  const suffix = useTypewriter(TAGLINE_VARIANTS, animationEnabled);
 
   return (
     <>
@@ -69,8 +100,21 @@ export default function TopHeader() {
           <span className="hidden sm:inline text-[13px] text-neutral-400 truncate">
             Your AI dev team while you{" "}
             <span className="text-neutral-200">{suffix}</span>
-            <span className="ml-0.5 inline-block w-[1px] h-[12px] align-middle bg-neutral-400 animate-qw-blink" />
+            {animationEnabled && (
+              <span className="ml-0.5 inline-block w-[1px] h-[12px] align-middle bg-neutral-400 animate-qw-blink" />
+            )}
           </span>
+          {/* #227: small unobtrusive toggle for the tagline animation. */}
+          <button
+            type="button"
+            onClick={toggleAnimation}
+            aria-label={animationEnabled ? "Pause tagline animation" : "Resume tagline animation"}
+            aria-pressed={animationEnabled}
+            title={animationEnabled ? "Pause tagline animation" : "Resume tagline animation"}
+            className="hidden sm:inline-flex items-center justify-center w-3.5 h-3.5 ml-1 rounded-full border border-white/15 text-neutral-500 hover:text-white hover:border-white/40 transition-colors text-[8px]"
+          >
+            {animationEnabled ? "❚❚" : "▶"}
+          </button>
         </div>
         <div className="flex items-center gap-3 shrink-0">
           <button
