@@ -179,8 +179,14 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
 
   // Send message
   const send = () => {
-    const text = input.trim();
-    if (!text || sending) return;
+    const raw = input.trim();
+    if (!raw || sending) return;
+    // #228: if the operator didn't tag a known agent, prepend
+    // `@head ` so the message has somewhere to go. Unknown
+    // `@whatever` mentions don't count — Head is still added.
+    // Known agents: head, dev, reviewer1, reviewer2.
+    const KNOWN_AGENT_RE = /@(head|dev|reviewer1|reviewer2)\b/i;
+    const text = KNOWN_AGENT_RE.test(raw) ? raw : `@head ${raw}`;
     setSending(true);
     setSendError(null);
     fetch(`/api/chat${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`, {
