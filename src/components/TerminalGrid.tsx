@@ -21,10 +21,19 @@ const DEFAULT_AGENTS: Agent[] = [
   { id: "dev", label: "Dev" },
 ];
 
-const GRID_CLASSES = [
+// Border classes per tile. 3-agent legacy layout (reviewer1/reviewer2/dev)
+// has a full-width bottom tile; the 4-agent layout used by the new
+// #208 top-right quadrant has all four tiles in a 2x2 grid.
+const GRID_CLASSES_3 = [
   "border-r border-b border-border", // top-left
   "border-b border-border",          // top-right
   "col-span-2",                      // bottom full-width
+];
+const GRID_CLASSES_4 = [
+  "border-r border-b border-border", // top-left
+  "border-b border-border",          // top-right
+  "border-r border-border",          // bottom-left
+  "",                                // bottom-right
 ];
 
 export default function TerminalGrid({
@@ -34,6 +43,7 @@ export default function TerminalGrid({
   onStatusChange,
 }: TerminalGridProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
+  const gridClasses = agents.length >= 4 ? GRID_CLASSES_4 : GRID_CLASSES_3;
 
   return (
     <div className="w-full h-full relative grid grid-rows-2 grid-cols-2">
@@ -47,7 +57,7 @@ export default function TerminalGrid({
             className={`flex flex-col ${
               isExpanded
                 ? "absolute inset-0 z-10 bg-bg"
-                : `${GRID_CLASSES[i] || ""}`
+                : `${gridClasses[i] || ""}`
             }`}
             style={isHidden ? { visibility: "hidden", overflow: "hidden" } : undefined}
           >

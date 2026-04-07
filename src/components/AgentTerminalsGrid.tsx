@@ -3,6 +3,19 @@
 import { useState } from "react";
 import TerminalGrid from "./TerminalGrid";
 
+// #208: the top-right quadrant must show all four agents
+// (Head, Reviewer1, Reviewer2, Dev) as a 2x2 grid. TerminalGrid's
+// default agent list only has three entries (Reviewer1, Reviewer2,
+// Dev) because it used to live alongside a dedicated Head panel —
+// pass the full four-agent list explicitly so Head doesn't get
+// dropped when the old Head panel was removed.
+const FOUR_AGENTS = [
+  { id: "head", label: "Head" },
+  { id: "reviewer1", label: "Reviewer1" },
+  { id: "reviewer2", label: "Reviewer2" },
+  { id: "dev", label: "Dev" },
+];
+
 type AgentState = "running" | "stopped" | "error";
 
 interface AgentTerminalsGridProps {
@@ -57,6 +70,7 @@ export default function AgentTerminalsGrid({ projectId, agentStates, onStatusCha
       <div className="flex-1 min-h-0">
         <TerminalGrid
           projectId={projectId}
+          agents={FOUR_AGENTS}
           agentStates={agentStates}
           onStatusChange={onStatusChange}
         />
