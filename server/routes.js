@@ -544,6 +544,15 @@ router.post("/api/setup/save-token", (req, res) => {
   res.json({ ok: true, path: tokenPath });
 });
 
+// #212: report whether the reviewer GitHub token is configured.
+// Never returns the token itself — just `exists` + the path so the
+// Settings page can show "Configured" / "Not configured" without
+// leaking the secret over the API.
+router.get("/api/setup/reviewer-token-status", (_req, res) => {
+  const tokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
+  res.json({ exists: fs.existsSync(tokenPath), path: tokenPath });
+});
+
 // ─── Setup Wizard ─────────────────────────────────────────────────────────
 
 router.post("/api/setup", (req, res) => {

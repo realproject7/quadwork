@@ -32,6 +32,8 @@ interface Config {
   port: number;
   agentchattr_url: string;
   agentchattr_token: string;
+  default_backend?: string;
+  reviewer_github_user?: string;
   projects: ProjectConfig[];
 }
 
@@ -114,6 +116,8 @@ export default function SettingsPage() {
         port: data.port || 8400,
         agentchattr_url: data.agentchattr_url || "http://127.0.0.1:8300",
         agentchattr_token: data.agentchattr_token || "",
+        default_backend: data.default_backend || "claude",
+        reviewer_github_user: data.reviewer_github_user || "",
         projects: data.projects || [],
       }))
       .catch(() => {});
@@ -128,6 +132,66 @@ export default function SettingsPage() {
       .then((status) => setCliStatus(status))
       .catch(() => {});
   }, []);
+
+  // #212: reviewer-token presence + Keep Awake state for the new
+  // global Settings sub-sections.
+  const [reviewerTokenExists, setReviewerTokenExists] = useState<boolean | null>(null);
+  const [reviewerTokenInput, setReviewerTokenInput] = useState("");
+  const [reviewerTokenSaving, setReviewerTokenSaving] = useState(false);
+  const [keepAwakeActive, setKeepAwakeActive] = useState(false);
+  const [keepAwakeBusy, setKeepAwakeBusy] = useState(false);
+
+  const refreshReviewerTokenStatus = useCallback(() => {
+    fetch("/api/setup/reviewer-token-status")
+      .then((r) => (r.ok ? r.json() : { exists: false }))
+      .then((d) => setReviewerTokenExists(!!d.exists))
+      .catch(() => setReviewerTokenExists(false));
+  }, []);
+
+  const refreshKeepAwake = useCallback(() => {
+    fetch("/api/caffeinate/status")
+      .then((r) => (r.ok ? r.json() : { active: false }))
+      .then((d) => setKeepAwakeActive(!!d.active))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshReviewerTokenStatus();
+    refreshKeepAwake();
+  }, [refreshReviewerTokenStatus, refreshKeepAwake]);
+
+  const saveReviewerToken = async () => {
+    if (!reviewerTokenInput.trim()) return;
+    setReviewerTokenSaving(true);
+    try {
+      const r = await fetch("/api/setup/save-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: reviewerTokenInput.trim() }),
+      });
+      if (r.ok) {
+        setReviewerTokenInput("");
+        refreshReviewerTokenStatus();
+      }
+    } finally {
+      setReviewerTokenSaving(false);
+    }
+  };
+
+  const toggleKeepAwake = async () => {
+    setKeepAwakeBusy(true);
+    try {
+      const url = keepAwakeActive ? "/api/caffeinate/stop" : "/api/caffeinate/start";
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (r.ok) refreshKeepAwake();
+    } finally {
+      setKeepAwakeBusy(false);
+    }
+  };
 
   // Auto-add project when navigated with ?add=true
   useEffect(() => {
@@ -322,6 +386,80 @@ export default function SettingsPage() {
           The dashboard binds to the QuadWork port. The AgentChattr URL is the v1 fallback;
           new projects use a per-project AgentChattr clone (master #181) and ignore this field.
         </p>
+      </section>
+
+      {/* Defaults — default agent CLI + reviewer credentials (#212) */}
+      <section className="mb-8">
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Defaults</h2>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+          <Select
+            label="Default agent CLI"
+            value={config.default_backend || "claude"}
+            onChange={(v) => updateGlobal("default_backend" as keyof Config, v)}
+            options={BACKENDS.map((b) => ({
+              value: b.value,
+              label: b.label + (cliStatus && !cliStatus[b.value as keyof typeof cliStatus] ? " (not installed)" : ""),
+            }))}
+          />
+          <Input
+            label="Reviewer GitHub user"
+            value={config.reviewer_github_user || ""}
+            onChange={(v) => updateGlobal("reviewer_github_user" as keyof Config, v)}
+            placeholder="reviewer-bot"
+          />
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] text-text-muted uppercase tracking-wider">Reviewer GitHub token</label>
+            <div className="flex items-center gap-2">
+              <span className={`w-1.5 h-1.5 rounded-full ${reviewerTokenExists ? "bg-accent" : "bg-text-muted"}`} />
+              <span className="text-[11px] text-text-muted">
+                {reviewerTokenExists === null ? "…" : reviewerTokenExists ? "Configured" : "Not configured"}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 mt-1">
+              <input
+                type="password"
+                value={reviewerTokenInput}
+                onChange={(e) => setReviewerTokenInput(e.target.value)}
+                placeholder="Paste new token"
+                className="flex-1 bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent font-mono"
+              />
+              <button
+                onClick={saveReviewerToken}
+                disabled={reviewerTokenSaving || !reviewerTokenInput.trim()}
+                className="px-2 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 transition-colors"
+              >
+                {reviewerTokenSaving ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+        <p className="mt-2 text-[10px] text-text-muted leading-snug">
+          The default CLI seeds new project agents. The reviewer GitHub user/token are
+          used by Reviewer1/Reviewer2 to post PR review comments without your personal
+          token. The token is written to{" "}
+          <code className="bg-bg-surface px-1 rounded">~/.quadwork/reviewer-token</code>{" "}
+          (mode 0600) and is never returned by the API.
+        </p>
+      </section>
+
+      {/* System — Keep Awake (#212) */}
+      <section className="mb-8">
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">System</h2>
+        <div className="border border-border p-3 flex items-center gap-3">
+          <span className={`w-1.5 h-1.5 rounded-full ${keepAwakeActive ? "bg-accent" : "bg-text-muted"}`} />
+          <span className="text-[11px] text-text">Keep Awake — {keepAwakeActive ? "on" : "off"}</span>
+          <button
+            onClick={toggleKeepAwake}
+            disabled={keepAwakeBusy}
+            className="px-2 py-1 text-[11px] border border-border text-text-muted hover:text-text hover:border-accent disabled:opacity-50 transition-colors"
+          >
+            {keepAwakeBusy ? "…" : keepAwakeActive ? "Stop" : "Start"}
+          </button>
+          <span className="text-[10px] text-text-muted">
+            Prevents this machine from sleeping while agents are running. Machine-level
+            (not per-project) — uses <code>caffeinate</code> on macOS.
+          </span>
+        </div>
       </section>
 
       {/* Cleanup commands (#212 / #189) */}
