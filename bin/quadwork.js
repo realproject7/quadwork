@@ -1618,6 +1618,112 @@ async function cmdAddProject() {
   }
 }
 
+// ─── Cleanup Command (#181 sub-H) ───────────────────────────────────────────
+
+/**
+ * Reclaim disk space taken by per-project AgentChattr clones (~77 MB each)
+ * or by the legacy shared install left behind after migration (#188).
+ *
+ * Usage:
+ *   npx quadwork cleanup --project <id>
+ *     Removes ~/.quadwork/{id}/ and the matching entry from config.json.
+ *     Leaves the user's worktrees and source repos completely alone.
+ *
+ *   npx quadwork cleanup --legacy
+ *     Removes the legacy shared ~/.quadwork/agentchattr/ install. Refuses
+ *     to run unless every project in config.json already has its own
+ *     working per-project clone (so nothing falls back onto the legacy
+ *     install via #186's resolution ladder).
+ *
+ * Both modes prompt for confirmation before deleting.
+ */
+async function cmdCleanup() {
+  const args = process.argv.slice(3);
+  const projectFlagIdx = args.indexOf("--project");
+  const projectId = projectFlagIdx >= 0 ? args[projectFlagIdx + 1] : null;
+  const legacy = args.includes("--legacy");
+
+  if (!projectId && !legacy) {
+    console.log(`
+  Usage:
+    npx quadwork cleanup --project <id>   Remove a project's AgentChattr clone + config entry
+    npx quadwork cleanup --legacy         Remove the legacy ~/.quadwork/agentchattr/ install
+`);
+    process.exit(1);
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const config = readConfig();
+
+    // --- Per-project cleanup ---
+    if (projectId) {
+      const idx = (config.projects || []).findIndex((p) => p.id === projectId);
+      const projectDir = path.join(CONFIG_DIR, projectId);
+      if (idx < 0 && !fs.existsSync(projectDir)) {
+        warn(`No project '${projectId}' in config and no directory at ${projectDir}.`);
+        return;
+      }
+      header(`Cleanup: ${projectId}`);
+      if (fs.existsSync(projectDir)) log(`  Directory: ${projectDir}`);
+      if (idx >= 0) log(`  Config entry: ${projectId} (${config.projects[idx].repo || "no repo"})`);
+      log("  Worktrees and source repos will NOT be touched.");
+      const confirm = await askYN(rl, `Delete ${projectDir} and remove the config entry?`, false);
+      if (!confirm) { warn("Aborted."); return; }
+
+      if (fs.existsSync(projectDir)) {
+        try { fs.rmSync(projectDir, { recursive: true, force: true }); ok(`Removed ${projectDir}`); }
+        catch (e) { fail(`Could not remove ${projectDir}: ${e.message}`); return; }
+      }
+      if (idx >= 0) {
+        config.projects.splice(idx, 1);
+        try { writeConfig(config); ok(`Updated ${CONFIG_PATH}`); }
+        catch (e) { fail(`Could not write config: ${e.message}`); return; }
+      }
+      return;
+    }
+
+    // --- Legacy cleanup ---
+    if (legacy) {
+      const legacyDir = path.join(CONFIG_DIR, "agentchattr");
+      if (!fs.existsSync(legacyDir)) {
+        warn(`No legacy install at ${legacyDir}.`);
+        return;
+      }
+      header("Cleanup: legacy ~/.quadwork/agentchattr/");
+
+      // Refuse if any project still depends on the legacy install — i.e.
+      // any project without its own working per-project clone (run.py +
+      // venv + config.toml at ROOT). Mirrors #186's resolution ladder.
+      const stillDepends = [];
+      for (const p of config.projects || []) {
+        if (!p.id) continue;
+        const dir = p.agentchattr_dir || path.join(CONFIG_DIR, p.id, "agentchattr");
+        const ok = fs.existsSync(path.join(dir, "run.py")) &&
+                   fs.existsSync(path.join(dir, ".venv", "bin", "python")) &&
+                   fs.existsSync(path.join(dir, "config.toml"));
+        if (!ok) stillDepends.push(p.id);
+      }
+      if (stillDepends.length > 0) {
+        fail(`Refusing to remove legacy install — these projects still depend on it:`);
+        for (const id of stillDepends) console.log(`    - ${id}`);
+        warn(`Run 'npx quadwork start' to migrate them (#188), then re-run cleanup --legacy.`);
+        return;
+      }
+
+      log(`  Directory: ${legacyDir}`);
+      log("  All projects already have their own per-project clones.");
+      const confirm = await askYN(rl, `Delete ${legacyDir}?`, false);
+      if (!confirm) { warn("Aborted."); return; }
+
+      try { fs.rmSync(legacyDir, { recursive: true, force: true }); ok(`Removed ${legacyDir}`); }
+      catch (e) { fail(`Could not remove ${legacyDir}: ${e.message}`); return; }
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 const command = process.argv[2];
@@ -1635,6 +1741,9 @@ switch (command) {
   case "add-project":
     cmdAddProject();
     break;
+  case "cleanup":
+    cmdCleanup();
+    break;
   default:
     console.log(`
   Usage: quadwork <command>
@@ -1644,6 +1753,7 @@ switch (command) {
     start         Start the QuadWork dashboard and backend
     stop          Stop all QuadWork processes
     add-project   Add a project via CLI (alternative to web UI /setup)
+    cleanup       Reclaim disk space (--project <id> or --legacy)
 
   Workflow:
     1. npx quadwork init     — one-time global setup, opens dashboard
@@ -1654,6 +1764,8 @@ switch (command) {
     npx quadwork init
     npx quadwork start
     npx quadwork stop
+    npx quadwork cleanup --project my-project
+    npx quadwork cleanup --legacy
 `);
     if (command) process.exit(1);
 }

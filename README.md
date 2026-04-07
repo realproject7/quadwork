@@ -64,8 +64,36 @@ Every task follows a GitHub workflow: Issue → Branch → PR → 2 Reviews → 
 | `npx quadwork init` | One-time setup — installs prerequisites and opens the dashboard |
 | `npx quadwork start` | Start the dashboard server |
 | `npx quadwork stop` | Stop all processes |
+| `npx quadwork cleanup --project <id>` | Remove a project's AgentChattr clone and config entry |
+| `npx quadwork cleanup --legacy` | Remove the legacy `~/.quadwork/agentchattr/` install after migration |
 
 After init, create projects from the web UI at `http://127.0.0.1:8400/setup`.
+
+### Disk usage
+
+Each project gets its own AgentChattr clone at `~/.quadwork/{project_id}/agentchattr/` (~77 MB). For example:
+
+| Projects | Disk |
+|---------:|-----:|
+| 1 | ~77 MB |
+| 5 | ~385 MB |
+| 10 | ~770 MB |
+
+Per-project clones are necessary so multiple projects can run AgentChattr simultaneously without port conflicts (each clone has its own `config.toml`, ports, and data directory).
+
+To free space, delete unused projects from the dashboard or run:
+
+```sh
+npx quadwork cleanup --project <id>
+```
+
+Existing v1 users are auto-migrated to per-project clones on the next `npx quadwork start`. After all projects are migrated, the legacy shared install can be removed with:
+
+```sh
+npx quadwork cleanup --legacy
+```
+
+`cleanup --legacy` refuses to run unless every project already has its own working per-project clone, so it can never strand a project on a missing install.
 
 ## Configuration
 
