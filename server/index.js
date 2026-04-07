@@ -749,29 +749,37 @@ app.get("/api/triggers", (_req, res) => {
       nextAt: info.nextAt,
       lastError: info.lastError || null,
       expiresAt: info.expiresAt || null,
-      message: null, // filled in below from config
+      message: null,        // filled in below from config
+      intervalMin: null,    // filled in below — last-used interval in minutes
+      durationMin: null,    // filled in below — last-used duration in minutes
     };
   }
-  // Enrich with the persisted message + surface last-used settings
-  // for projects that don't currently have a running trigger. The
-  // Scheduled Trigger widget (#210) needs this to pre-fill the
-  // textarea on page reload even when the timer is idle.
+  // Enrich with the persisted message AND last-used interval/duration
+  // for every project in config.json — even projects that don't
+  // currently have a running trigger. The Scheduled Trigger widget
+  // (#210) hydrates all three controls from this on page reload.
   try {
     const cfg = readConfig();
     for (const p of (cfg.projects || [])) {
-      const existing = result[p.id];
       const msg = typeof p.trigger_message === "string" ? p.trigger_message : null;
+      const intervalMin = Number.isFinite(p.trigger_interval_min) ? p.trigger_interval_min : null;
+      const durationMin = Number.isFinite(p.trigger_duration_min) ? p.trigger_duration_min : null;
+      const existing = result[p.id];
       if (existing) {
         existing.message = msg;
-      } else if (msg) {
+        existing.intervalMin = intervalMin;
+        existing.durationMin = durationMin;
+      } else if (msg !== null || intervalMin !== null || durationMin !== null) {
         result[p.id] = {
           enabled: false,
-          interval: 0,
+          interval: intervalMin !== null ? intervalMin * 60 * 1000 : 0,
           lastSent: null,
           nextAt: null,
           lastError: null,
           expiresAt: null,
           message: msg,
+          intervalMin,
+          durationMin,
         };
       }
     }
@@ -794,19 +802,22 @@ app.post("/api/triggers/:project/start", (req, res) => {
   const ms = (interval || 30) * 60 * 1000;
   const durationMs = duration ? duration * 60 * 1000 : 0; // duration in minutes, 0 = indefinite
 
-  // #210: if the caller supplied a custom message, persist it on the
-  // project entry so sendTriggerMessage() picks it up on every tick
-  // (and so reopening the project shows the last-used message).
-  if (typeof message === "string" && message.length > 0) {
-    try {
-      const cfg = readConfig();
-      const entry = (cfg.projects || []).find((p) => p.id === project);
-      if (entry) {
-        entry.trigger_message = message;
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
-      }
-    } catch (e) { /* non-fatal — timer still runs with DEFAULT_MESSAGE */ }
-  }
+  // #210: persist the custom message AND the last-used interval +
+  // duration on the project entry so reopening an idle project
+  // pre-fills all three controls from the saved state (not just the
+  // message). Without persisting interval/duration, the widget
+  // would snap back to its defaults (15 min / 3 hr) after every
+  // reload even if the operator had picked something else.
+  try {
+    const cfg = readConfig();
+    const entry = (cfg.projects || []).find((p) => p.id === project);
+    if (entry) {
+      if (typeof message === "string" && message.length > 0) entry.trigger_message = message;
+      if (Number.isFinite(interval) && interval > 0) entry.trigger_interval_min = interval;
+      if (Number.isFinite(duration) && duration >= 0) entry.trigger_duration_min = duration;
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    }
+  } catch (e) { /* non-fatal — timer still runs with its in-memory values */ }
 
   const existing = triggers.get(project);
   if (existing) {

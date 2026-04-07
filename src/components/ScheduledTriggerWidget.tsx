@@ -8,11 +8,13 @@ interface ScheduledTriggerWidgetProps {
 
 interface TriggerInfo {
   enabled: boolean;
-  interval: number;  // ms
+  interval: number;  // ms (active timer interval, 0 when idle-with-saved-state)
   lastSent: number | null;
   nextAt: number | null;
   expiresAt: number | null;
   message: string | null;
+  intervalMin: number | null; // last-used, persisted for idle reloads
+  durationMin: number | null; // last-used, persisted for idle reloads
 }
 
 const DURATION_PRESETS = [
@@ -60,6 +62,10 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   const [message, setMessage] = useState<string>("");
   const [intervalMin, setIntervalMin] = useState<number>(15);
   const [durationMin, setDurationMin] = useState<number>(180);
+  // Track which controls the operator has touched so incoming polls
+  // don't clobber mid-edit changes.
+  const [intervalDirty, setIntervalDirty] = useState(false);
+  const [durationDirty, setDurationDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState("");
@@ -73,13 +79,31 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       const data: Record<string, TriggerInfo> = await r.json();
       const t = data[projectId] || null;
       setTrigger(t);
-      if (t?.message && !message) setMessage(t.message);
-      if (t?.interval) setIntervalMin(Math.max(1, Math.round(t.interval / 60000)));
+      if (t) {
+        // Hydrate message unless the operator has already typed
+        // something (we don't want polls to overwrite unsaved edits).
+        if (t.message && !message) setMessage(t.message);
+        // Hydrate interval from: active timer value (ms), else the
+        // persisted last-used value (minutes), else leave the default.
+        // Skip if the operator has touched the control.
+        if (!intervalDirty) {
+          if (t.enabled && t.interval) {
+            setIntervalMin(Math.max(1, Math.round(t.interval / 60000)));
+          } else if (typeof t.intervalMin === "number" && t.intervalMin > 0) {
+            setIntervalMin(t.intervalMin);
+          }
+        }
+        // Hydrate duration from the persisted last-used value.
+        if (!durationDirty && typeof t.durationMin === "number" && t.durationMin >= 0) {
+          setDurationMin(t.durationMin);
+        }
+      }
       setError(null);
     } catch (e) {
       setError((e as Error).message);
     }
-  // Intentionally exclude `message` so user edits aren't clobbered mid-typing.
+  // Intentionally exclude `message`/`intervalDirty`/`durationDirty`
+  // so user edits aren't clobbered mid-typing.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
@@ -122,6 +146,11 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
         body: JSON.stringify({ interval: intervalMin, duration: durationMin, message, sendImmediately: true }),
       });
       if (!r.ok) throw new Error(`${r.status}`);
+      // After the backend persists the new values, treat them as the
+      // baseline — subsequent polls should be free to re-hydrate from
+      // server state again.
+      setIntervalDirty(false);
+      setDurationDirty(false);
       await load();
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
@@ -164,7 +193,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
             <input
               type="number"
               value={intervalMin}
-              onChange={(e) => setIntervalMin(parseInt(e.target.value, 10) || 15)}
+              onChange={(e) => { setIntervalMin(parseInt(e.target.value, 10) || 15); setIntervalDirty(true); }}
               min={1}
               max={1440}
               className="w-12 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
@@ -172,7 +201,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
             <span className="text-text-muted">min for</span>
             <select
               value={durationMin}
-              onChange={(e) => setDurationMin(parseInt(e.target.value, 10))}
+              onChange={(e) => { setDurationMin(parseInt(e.target.value, 10)); setDurationDirty(true); }}
               className="bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent cursor-pointer"
             >
               {DURATION_PRESETS.map((p) => (
