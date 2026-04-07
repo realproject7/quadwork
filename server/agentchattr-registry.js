@@ -69,12 +69,18 @@ registerAgent.lastError = null;
 /**
  * Best-effort deregister. Failures are non-fatal (e.g. AgentChattr already
  * shut down). Returns true on a 2xx response, false otherwise.
+ *
+ * AgentChattr's /api/deregister/{name} requires the agent's own bearer
+ * token for "family" names (head/dev/reviewer1/reviewer2) — see
+ * app.py:2123-2135. Pass the registration token returned by registerAgent.
  */
-async function deregisterAgent(serverPort, name) {
+async function deregisterAgent(serverPort, name, token) {
   try {
+    const headers = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
     const r = await fetchWithTimeout(
       `http://127.0.0.1:${serverPort}/api/deregister/${encodeURIComponent(name)}`,
-      { method: "POST" },
+      { method: "POST", headers },
     );
     return r.ok;
   } catch {
