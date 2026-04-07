@@ -1242,33 +1242,29 @@ async function cmdInit() {
     writeConfig(config);
     ok(`Wrote ${CONFIG_PATH}`);
 
-    // Step 3: Start server
+    // Step 3: Start server in the foreground (Batch 25 / #203).
+    //
+    // Previously cmdInit spawned the server detached and exited, which
+    // left users without logs, without a clear stop story, and
+    // inconsistent with `npx quadwork start` (#169). Now we print the
+    // welcome banner first, schedule the browser open, close the
+    // wizard readline, and then require() the server so it runs in
+    // the user's terminal — Ctrl+C stops it cleanly via the SIGINT
+    // handler below (same pattern cmdStart uses).
     header("Step 3: Starting Dashboard");
     const quadworkDir = path.join(__dirname, "..");
     const serverDir = path.join(quadworkDir, "server");
-    let serverPid = null;
-    if (fs.existsSync(path.join(serverDir, "index.js"))) {
-      const server = spawn("node", [serverDir], {
-        stdio: "ignore",
-        detached: true,
-        env: { ...process.env },
-      });
-      server.unref();
-      if (server.pid) {
-        serverPid = server.pid;
-        ok(`Server started (PID: ${serverPid})`);
-        const pidFile = path.join(CONFIG_DIR, "server.pid");
-        if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
-        fs.writeFileSync(pidFile, String(serverPid));
-      }
-    } else {
-      warn("Server not found — run from the quadwork directory");
+    if (!fs.existsSync(path.join(serverDir, "index.js"))) {
+      fail("Server not found. Run from the quadwork directory.");
+      rl.close();
+      process.exit(1);
     }
 
-    // Done — celebratory welcome
     const dashPort = parseInt(port, 10) || 8400;
     const dashboardUrl = `http://127.0.0.1:${dashPort}`;
 
+    // Celebratory welcome (printed BEFORE the server takes over stdout
+    // so it stays visible at the top of the scrollback).
     console.log("");
     console.log(`  ${c.cyan}${c.bold}╔══════════════════════════════════════════════════════════╗${c.reset}`);
     console.log(`  ${c.cyan}${c.bold}║${c.reset}                                                          ${c.cyan}${c.bold}║${c.reset}`);
@@ -1285,12 +1281,8 @@ async function cmdInit() {
     console.log(`  ${c.cyan}${c.bold}║${c.reset}                                                          ${c.cyan}${c.bold}║${c.reset}`);
     console.log(`  ${c.cyan}${c.bold}╚══════════════════════════════════════════════════════════╝${c.reset}`);
     console.log("");
-    if (serverPid) {
-      console.log(`  ${c.green}*${c.reset} Server running at ${c.cyan}${dashboardUrl}${c.reset} ${c.dim}(PID: ${serverPid})${c.reset}`);
-    } else {
-      console.log(`  ${c.yellow}*${c.reset} Server not started — run ${c.dim}npx quadwork start${c.reset} to launch`);
-    }
-    console.log(`  ${c.green}*${c.reset} Config saved to ${c.dim}${CONFIG_PATH}${c.reset}`);
+    console.log(`  ${c.green}*${c.reset} Dashboard: ${c.cyan}${dashboardUrl}${c.reset}`);
+    console.log(`  ${c.green}*${c.reset} Config:    ${c.dim}${CONFIG_PATH}${c.reset}`);
     console.log("");
     console.log(`  ${c.cyan}${c.bold}--- Create Your First Project ---${c.reset}`);
     console.log("");
@@ -1302,19 +1294,34 @@ async function cmdInit() {
     console.log(`    ${c.dim}2.${c.reset} Pick models for each agent`);
     console.log(`    ${c.dim}3.${c.reset} Hit Start — your team takes it from there`);
     console.log("");
-    console.log(`  ${c.dim}Commands:${c.reset}`);
-    console.log(`    ${c.dim}npx --yes quadwork start${c.reset}  — start the dashboard (Ctrl+C to stop)`);
-    console.log("");
-    console.log(`  ${c.green}${c.bold}Happy shipping!${c.reset}`);
+    console.log(`  ${c.green}${c.bold}Happy shipping!${c.reset}  ${c.dim}(Press Ctrl+C to stop.)${c.reset}`);
     console.log("");
 
-    // Open browser
+    // Close the wizard readline before requiring the server, otherwise
+    // stdin stays in raw/line-buffered mode and swallows Ctrl+C.
+    rl.close();
+
+    // Schedule browser open after the server has had a moment to bind.
     const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
     setTimeout(() => {
       try { execSync(`${openCmd} ${dashboardUrl}/setup`, { stdio: "ignore" }); } catch {}
     }, 1500);
 
-    rl.close();
+    // Graceful shutdown on Ctrl+C. cmdInit doesn't spawn per-project
+    // AgentChattr processes (there are no projects yet), so the
+    // handler only needs to stop the in-process server — require()
+    // brings it into this same Node process, so process.exit() is
+    // enough to release the port.
+    process.on("SIGINT", () => {
+      console.log("");
+      log("Shutting down...");
+      ok("Stopped.");
+      process.exit(0);
+    });
+
+    // Run the server in the foreground. require() starts the express
+    // listener in this process, so cmdInit stays alive until Ctrl+C.
+    require(path.join(serverDir, "index.js"));
   } catch (err) {
     fail(err.message);
     rl.close();
