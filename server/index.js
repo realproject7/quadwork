@@ -261,6 +261,11 @@ async function buildAgentArgs(projectId, agentId) {
       const chattrInfo = resolveProjectChattr(projectId);
       acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
       await waitForAgentChattrReady(acServerPort);
+      // #242: best-effort deregister any stale registration of the
+      // canonical name (left over by a crashed previous QuadWork
+      // session) so the fresh register lands at slot 1 instead of
+      // head-2 / reviewer2-2. Failures are non-fatal.
+      await deregisterAgent(acServerPort, agentId).catch(() => {});
       const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null);
       if (!registration) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
@@ -277,6 +282,8 @@ async function buildAgentArgs(projectId, agentId) {
       const chattrInfo = resolveProjectChattr(projectId);
       acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
       await waitForAgentChattrReady(acServerPort);
+      // #242: best-effort deregister stale canonical name first.
+      await deregisterAgent(acServerPort, agentId).catch(() => {});
       const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null);
       if (!registration) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
