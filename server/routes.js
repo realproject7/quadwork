@@ -749,6 +749,8 @@ router.post("/api/setup", (req, res) => {
         agentchattr_token,
         mcp_http_port,
         mcp_sse_port,
+        // Per-project AgentChattr clone path (Option B / #181).
+        agentchattr_dir: path.join(os.homedir(), ".quadwork", id, "agentchattr"),
       });
       const dir = path.dirname(CONFIG_PATH);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });

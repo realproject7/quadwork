@@ -1061,6 +1061,10 @@ function writeQuadWorkConfig(setup) {
   project.agentchattr_token = require("crypto").randomBytes(16).toString("hex");
   project.mcp_http_port = mcp_http;
   project.mcp_sse_port = mcp_sse;
+  // Per-project AgentChattr clone path (Option B / #181). Each project gets
+  // its own clone so AgentChattr's ROOT/config.toml lookup picks up the right
+  // ports — see master ticket #181.
+  project.agentchattr_dir = path.join(os.homedir(), ".quadwork", setup.projectName, "agentchattr");
 
   // Upsert project
   if (existingIdx >= 0) config.projects[existingIdx] = project;
