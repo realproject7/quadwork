@@ -1005,7 +1005,28 @@ function getProjectTelegram(projectId) {
 router.get("/api/telegram", (req, res) => {
   const projectId = req.query.project || "";
   if (!projectId) return res.status(400).json({ error: "Missing project" });
-  res.json({ running: isTelegramRunning(projectId) });
+  // #211: expose whether credentials are configured + the chat_id,
+  // but never the raw bot token. Widget uses `configured` + the last
+  // 4 chars of the stored token to decide between "Set up" and
+  // "Edit credentials" copy.
+  let configured = false;
+  let chatId = "";
+  let bridgeInstalled = false;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const project = cfg.projects?.find((p) => p.id === projectId);
+    if (project?.telegram?.bot_token && project?.telegram?.chat_id) {
+      configured = true;
+      chatId = project.telegram.chat_id;
+    }
+    bridgeInstalled = fs.existsSync(path.join(BRIDGE_DIR, "telegram_bridge.py"));
+  } catch {}
+  res.json({
+    running: isTelegramRunning(projectId),
+    configured,
+    chat_id: chatId,
+    bridge_installed: bridgeInstalled,
+  });
 });
 
 router.post("/api/telegram", async (req, res) => {
@@ -1090,6 +1111,37 @@ router.post("/api/telegram", async (req, res) => {
         }
       } catch {}
       return res.json({ ok: true, env_key: envKey });
+    }
+    case "save-config": {
+      // #211: atomic save of bot_token + chat_id for the per-project
+      // Telegram Bridge widget. Unlike save-token (which requires
+      // project.telegram to already exist), save-config creates the
+      // telegram block on the fly for projects that haven't been
+      // configured yet. The raw token is written to ~/.quadwork/.env
+      // (0600) and replaced on the config entry with `env:KEY`.
+      const projectId = body.project_id;
+      const bot_token = typeof body.bot_token === "string" ? body.bot_token.trim() : "";
+      const chat_id = typeof body.chat_id === "string" ? body.chat_id.trim() : "";
+      if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      if (!bot_token || !chat_id) return res.json({ ok: false, error: "bot_token and chat_id are required" });
+      const envKey = envKeyForProject(projectId);
+      try { writeEnvToken(envKey, bot_token); }
+      catch (err) { return res.json({ ok: false, error: `Could not write .env: ${err.message}` }); }
+      try {
+        const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+        const cfg = JSON.parse(raw);
+        const project = cfg.projects?.find((p) => p.id === projectId);
+        if (!project) return res.json({ ok: false, error: "Unknown project" });
+        project.telegram = {
+          ...(project.telegram || {}),
+          bot_token: `env:${envKey}`,
+          chat_id,
+        };
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+        return res.json({ ok: true, env_key: envKey });
+      } catch (err) {
+        return res.json({ ok: false, error: err.message || "Config write failed" });
+      }
     }
     default:
       return res.status(400).json({ error: "Unknown action" });

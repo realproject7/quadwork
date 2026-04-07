@@ -3,14 +3,15 @@
 import PanelHeader from "./PanelHeader";
 import OvernightQueueWidget from "./OvernightQueueWidget";
 import ScheduledTriggerWidget from "./ScheduledTriggerWidget";
+import TelegramBridgeWidget from "./TelegramBridgeWidget";
 
 /**
  * Bottom-right quadrant of the project dashboard (#208).
  *
  * Hosts the operator-only widgets:
  *   - #209 OVERNIGHT-QUEUE.md viewer/editor
- *   - #210 Scheduled Trigger (this ticket)
- *   - #211 Telegram Bridge (pending)
+ *   - #210 Scheduled Trigger
+ *   - #211 Telegram Bridge (this ticket)
  */
 export default function OperatorFeaturesPanel({ projectId }: { projectId: string }) {
   return (
@@ -21,9 +22,7 @@ export default function OperatorFeaturesPanel({ projectId }: { projectId: string
           <OvernightQueueWidget projectId={projectId} />
         </div>
         <ScheduledTriggerWidget projectId={projectId} />
-        <div className="shrink-0 px-3 py-2 border border-dashed border-border text-[10px] text-text-muted">
-          Telegram Bridge (#211) — coming soon
-        </div>
+        <TelegramBridgeWidget projectId={projectId} />
       </div>
     </div>
   );
