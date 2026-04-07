@@ -1,12 +1,12 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import TerminalPanel from "./TerminalPanel";
-import TerminalGrid from "./TerminalGrid";
 import PanelHeader from "./PanelHeader";
 import ChatPanel from "./ChatPanel";
 import GitHubPanel from "./GitHubPanel";
 import ControlBar from "./ControlBar";
+import AgentTerminalsGrid from "./AgentTerminalsGrid";
+import OperatorFeaturesPanel from "./OperatorFeaturesPanel";
 
 const MIN_SIZE = 150; // px
 const DIVIDER = 4; // px
@@ -108,18 +108,15 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         gridTemplateRows: rowTemplate,
       }}
     >
-      {/* Panel 1: Head Terminal — top-left */}
-      <div className="flex flex-col overflow-hidden">
-        <PanelHeader
-          label="Head"
-          status={agentStates["head"] || "stopped"}
-          projectId={projectId}
-          agentId="head"
-          onStatusChange={(s) => updateAgentState("head", s)}
-        />
+      {/* Quadrant 1 (top-left): AgentChattr chat — highlighted as
+          the primary interface (#208). 2px accent border + explicit
+          "primary chat" label in the panel header. */}
+      <div className="flex flex-col overflow-hidden border-2 border-accent">
+        <PanelHeader label="AgentChattr — primary chat" />
         <div className="flex-1 min-h-0">
-          <TerminalPanel projectId={projectId} agentId="head" />
+          <ChatPanel projectId={projectId} />
         </div>
+        <ControlBar projectId={projectId} />
       </div>
 
       {/* Vertical divider — top segment */}
@@ -128,12 +125,14 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         onMouseDown={() => startDrag("col")}
       />
 
-      {/* Panel 2: GitHub placeholder — top-right */}
+      {/* Quadrant 2 (top-right): Agent terminals — 2x2 grid with
+          header + "do not type here" tooltip (#208). */}
       <div className="flex flex-col overflow-hidden">
-        <PanelHeader label="GitHub" />
-        <div className="flex-1 min-h-0">
-          <GitHubPanel projectId={projectId} />
-        </div>
+        <AgentTerminalsGrid
+          projectId={projectId}
+          agentStates={agentStates}
+          onStatusChange={updateAgentState}
+        />
       </div>
 
       {/* Horizontal divider — left segment */}
@@ -154,13 +153,12 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         onMouseDown={() => startDrag("row")}
       />
 
-      {/* Panel 3: Chat — bottom-left */}
+      {/* Quadrant 3 (bottom-left): GitHub (#208). */}
       <div className="flex flex-col overflow-hidden">
-        <PanelHeader label="Chat" />
+        <PanelHeader label="GitHub" />
         <div className="flex-1 min-h-0">
-          <ChatPanel projectId={projectId} />
+          <GitHubPanel projectId={projectId} />
         </div>
-        <ControlBar projectId={projectId} />
       </div>
 
       {/* Vertical divider — bottom segment */}
@@ -169,17 +167,9 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         onMouseDown={() => startDrag("col")}
       />
 
-      {/* Panel 4: Agent terminals — bottom-right */}
-      <div className="flex flex-col overflow-hidden">
-        <PanelHeader label="Panel 4" />
-        <div className="flex-1 min-h-0">
-          <TerminalGrid
-            projectId={projectId}
-            agentStates={agentStates}
-            onStatusChange={updateAgentState}
-          />
-        </div>
-      </div>
+      {/* Quadrant 4 (bottom-right): Operator Features (#208) —
+          placeholder container. Sub-tickets #209/#210/#211 fill it. */}
+      <OperatorFeaturesPanel projectId={projectId} />
     </div>
   );
 }
