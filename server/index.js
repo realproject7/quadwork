@@ -5,7 +5,7 @@ const fs = require("fs");
 const { WebSocketServer } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH } = require("./config");
 const routes = require("./routes");
 
 const net = require("net");
@@ -740,6 +740,7 @@ async function sendTriggerMessage(projectId) {
 
 app.get("/api/triggers", (_req, res) => {
   const result = {};
+  // Include active runtime triggers first.
   for (const [id, info] of triggers) {
     result[id] = {
       enabled: true,
@@ -748,8 +749,33 @@ app.get("/api/triggers", (_req, res) => {
       nextAt: info.nextAt,
       lastError: info.lastError || null,
       expiresAt: info.expiresAt || null,
+      message: null, // filled in below from config
     };
   }
+  // Enrich with the persisted message + surface last-used settings
+  // for projects that don't currently have a running trigger. The
+  // Scheduled Trigger widget (#210) needs this to pre-fill the
+  // textarea on page reload even when the timer is idle.
+  try {
+    const cfg = readConfig();
+    for (const p of (cfg.projects || [])) {
+      const existing = result[p.id];
+      const msg = typeof p.trigger_message === "string" ? p.trigger_message : null;
+      if (existing) {
+        existing.message = msg;
+      } else if (msg) {
+        result[p.id] = {
+          enabled: false,
+          interval: 0,
+          lastSent: null,
+          nextAt: null,
+          lastError: null,
+          expiresAt: null,
+          message: msg,
+        };
+      }
+    }
+  } catch { /* non-fatal */ }
   res.json(result);
 });
 
@@ -764,14 +790,38 @@ function stopTrigger(project) {
 
 app.post("/api/triggers/:project/start", (req, res) => {
   const { project } = req.params;
-  const { interval, duration } = req.body || {};
+  const { interval, duration, message, sendImmediately } = req.body || {};
   const ms = (interval || 30) * 60 * 1000;
   const durationMs = duration ? duration * 60 * 1000 : 0; // duration in minutes, 0 = indefinite
+
+  // #210: if the caller supplied a custom message, persist it on the
+  // project entry so sendTriggerMessage() picks it up on every tick
+  // (and so reopening the project shows the last-used message).
+  if (typeof message === "string" && message.length > 0) {
+    try {
+      const cfg = readConfig();
+      const entry = (cfg.projects || []).find((p) => p.id === project);
+      if (entry) {
+        entry.trigger_message = message;
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+      }
+    } catch (e) { /* non-fatal — timer still runs with DEFAULT_MESSAGE */ }
+  }
 
   const existing = triggers.get(project);
   if (existing) {
     if (existing.timer) clearInterval(existing.timer);
     if (existing.durationTimer) clearTimeout(existing.durationTimer);
+  }
+
+  // #210: the Scheduled Trigger widget's "Send Message and Start
+  // Trigger" button expects an immediate send, not the first fire
+  // one interval in the future. setInterval won't do that on its
+  // own, so trigger a one-shot send when sendImmediately is true.
+  if (sendImmediately) {
+    // Don't await — keep the response fast. sendTriggerMessage logs
+    // its own errors and updates lastError on the trigger info.
+    sendTriggerMessage(project).catch(() => {});
   }
 
   const timer = setInterval(() => sendTriggerMessage(project), ms);
