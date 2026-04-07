@@ -60,11 +60,20 @@ export default function TerminalGrid({
                 className={`flex items-center gap-1.5 ${!isExpanded ? "cursor-pointer" : ""}`}
                 onClick={isExpanded ? undefined : () => setExpanded(agent.id)}
               >
-                <span className={`w-1.5 h-1.5 rounded-full ${
-                  agentStates[agent.id] === "running" ? "bg-accent"
-                    : agentStates[agent.id] === "error" ? "bg-error"
-                    : "bg-text-muted"
-                }`} />
+                {/* #208: status dot with activity ring when the
+                    agent is running — pulsing ring around the dot
+                    signals "agent is working". Idle/stopped/error
+                    states omit the ring. */}
+                <span className="relative inline-flex items-center justify-center w-2 h-2">
+                  {agentStates[agent.id] === "running" && (
+                    <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-60 animate-ping" />
+                  )}
+                  <span className={`relative w-1.5 h-1.5 rounded-full ${
+                    agentStates[agent.id] === "running" ? "bg-accent"
+                      : agentStates[agent.id] === "error" ? "bg-error"
+                      : "bg-text-muted"
+                  }`} />
+                </span>
                 <span className="text-[11px] text-text-muted uppercase tracking-wider">
                   {agent.label}
                 </span>
