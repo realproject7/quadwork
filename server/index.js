@@ -818,6 +818,61 @@ app.post("/api/triggers/sync", (_req, res) => {
 // Expose syncTriggers for migrated routes (config PUT, rename)
 app.set("syncTriggers", syncTriggersFromConfig);
 
+// --- OVERNIGHT-QUEUE.md viewer/editor (#209) ---------------------------------
+// Read/write the per-project ~/.quadwork/{id}/OVERNIGHT-QUEUE.md file from
+// the operator panel. The id must resolve to a project already saved in
+// config.json — we never touch an arbitrary path on disk.
+function resolveQueueProject(projectId) {
+  if (!projectId || typeof projectId !== "string") return null;
+  if (projectId.includes("/") || projectId.includes("\\") || projectId.includes("..")) return null;
+  const cfg = readConfig();
+  return (cfg.projects || []).find((p) => p.id === projectId) || null;
+}
+function queuePathFor(projectId) {
+  return path.join(os.homedir(), ".quadwork", projectId, "OVERNIGHT-QUEUE.md");
+}
+const OVERNIGHT_TEMPLATES_DIR = path.resolve(__dirname, "..", "templates");
+
+app.get("/api/queue", (req, res) => {
+  const projectId = String(req.query.project || "");
+  if (!resolveQueueProject(projectId)) return res.status(404).json({ error: "Unknown project" });
+  const p = queuePathFor(projectId);
+  if (!fs.existsSync(p)) return res.json({ ok: true, exists: false, content: "" });
+  try { return res.json({ ok: true, exists: true, content: fs.readFileSync(p, "utf-8") }); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+app.put("/api/queue", express.json({ limit: "512kb" }), (req, res) => {
+  const projectId = String(req.query.project || "");
+  if (!resolveQueueProject(projectId)) return res.status(404).json({ error: "Unknown project" });
+  const content = typeof req.body?.content === "string" ? req.body.content : null;
+  if (content === null) return res.status(400).json({ error: "Missing content" });
+  const p = queuePathFor(projectId);
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/queue", (req, res) => {
+  const projectId = String(req.query.project || "");
+  const project = resolveQueueProject(projectId);
+  if (!project) return res.status(404).json({ error: "Unknown project" });
+  const p = queuePathFor(projectId);
+  if (fs.existsSync(p)) return res.json({ ok: true, existed: true });
+  const tpl = path.join(OVERNIGHT_TEMPLATES_DIR, "OVERNIGHT-QUEUE.md");
+  if (!fs.existsSync(tpl)) return res.status(500).json({ error: "Template missing" });
+  try {
+    let content = fs.readFileSync(tpl, "utf-8");
+    content = content.replace(/\{\{project_name\}\}/g, project.name || projectId);
+    content = content.replace(/\{\{repo\}\}/g, project.repo || "");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content);
+    return res.json({ ok: true, existed: false });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
 // --- Serve static frontend (built Next.js export) ---
 
 // Strip trailing slashes (redirect /settings/ → /settings, /setup/ → /setup)
