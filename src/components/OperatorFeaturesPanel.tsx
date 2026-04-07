@@ -1,24 +1,27 @@
 "use client";
 
 import PanelHeader from "./PanelHeader";
+import OvernightQueueWidget from "./OvernightQueueWidget";
 
 /**
  * Bottom-right quadrant of the project dashboard (#208).
  *
- * Placeholder container for the Operator Features panel. Sub-tickets
- * #209 (OVERNIGHT-QUEUE.md viewer), #210 (Scheduled Trigger widget),
- * and #211 (Telegram Bridge widget) will fill the body.
+ * Hosts the operator-only widgets:
+ *   - #209 OVERNIGHT-QUEUE.md viewer/editor (this ticket)
+ *   - #210 Scheduled Trigger (pending)
+ *   - #211 Telegram Bridge (pending)
  */
-export default function OperatorFeaturesPanel(_props: { projectId: string }) {
+export default function OperatorFeaturesPanel({ projectId }: { projectId: string }) {
   return (
     <div className="flex flex-col h-full min-h-0">
       <PanelHeader label="Operator Features" />
-      <div className="flex-1 min-h-0 overflow-auto p-3 text-[11px] text-text-muted">
-        <ul className="space-y-1">
-          <li>• OVERNIGHT-QUEUE.md viewer <span className="text-text-muted/70">(#209)</span></li>
-          <li>• Scheduled Trigger <span className="text-text-muted/70">(#210)</span></li>
-          <li>• Telegram Bridge <span className="text-text-muted/70">(#211)</span></li>
-        </ul>
+      <div className="flex-1 min-h-0 flex flex-col gap-2 p-2 overflow-auto">
+        <div className="flex-1 min-h-[200px]">
+          <OvernightQueueWidget projectId={projectId} />
+        </div>
+        <div className="shrink-0 px-3 py-2 border border-dashed border-border text-[10px] text-text-muted">
+          Scheduled Trigger (#210) · Telegram Bridge (#211) — coming soon
+        </div>
       </div>
     </div>
   );
