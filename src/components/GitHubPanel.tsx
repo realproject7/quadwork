@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import OvernightQueueModal from "./OvernightQueueModal";
 
 interface Issue {
   number: number;
@@ -77,6 +78,23 @@ interface GitHubPanelProps {
 export default function GitHubPanel({ projectId }: GitHubPanelProps) {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prs, setPrs] = useState<PR[]>([]);
+  const [queueModalOpen, setQueueModalOpen] = useState(false);
+
+  // #226: auto-create OVERNIGHT-QUEUE.md on dashboard load if it
+  // doesn't exist yet. Idempotent — POST returns `existed:true`
+  // when the file is already there. Covers projects that pre-date
+  // #204 (the wizard fix that seeds the file at create time).
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/queue?project=${encodeURIComponent(projectId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data || data.exists) return;
+        return fetch(`/api/queue?project=${encodeURIComponent(projectId)}`, { method: "POST" });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [projectId]);
 
   const fetchData = useCallback(() => {
     fetch(`/api/github/issues?project=${encodeURIComponent(projectId)}`)
@@ -103,98 +121,122 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
   }, [fetchData]);
 
   return (
-    <div className="flex flex-col h-full overflow-y-auto">
-      {/* Issues */}
-      <div className="px-3 py-1.5 border-b border-border">
-        <span className="text-[10px] text-text-muted uppercase tracking-wider">
-          Issues ({issues.length})
-        </span>
-      </div>
-      {issues.length === 0 && (
-        <div className="px-3 py-2 text-[11px] text-text-muted">No issues</div>
-      )}
-      {issues.map((issue) => (
-        <a
-          key={issue.number}
-          href={issue.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-2 px-3 py-1 font-mono hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
-        >
-          <StatusDot color={issueStatusColor(issue.state)} />
-          <span className="text-[11px] text-text-muted w-8 shrink-0">#{issue.number}</span>
-          <span className="text-[11px] text-text truncate flex-1 min-w-0">{issue.title}</span>
-          {issue.assignees?.[0] && (
-            <span className="text-[10px] text-text-muted shrink-0">
-              {issue.assignees[0].login}
+    <div className="flex flex-col h-full min-h-0">
+      {/* #226: side-by-side issues + PRs columns */}
+      <div className="flex-1 min-h-0 flex">
+        {/* Issues column */}
+        <div className="flex-1 min-w-0 flex flex-col border-r border-border">
+          <div className="px-3 py-1.5 border-b border-border shrink-0">
+            <span className="text-[10px] text-text-muted uppercase tracking-wider">
+              Issues ({issues.length})
             </span>
-          )}
-        </a>
-      ))}
-
-      {/* PRs */}
-      <div className="px-3 py-1.5 border-b border-border mt-1">
-        <span className="text-[10px] text-text-muted uppercase tracking-wider">
-          Pull Requests ({prs.length})
-        </span>
-      </div>
-      {prs.length === 0 && (
-        <div className="px-3 py-2 text-[11px] text-text-muted">No PRs</div>
-      )}
-      {prs.map((pr) => {
-        const reviews = pr.reviews || [];
-        const decision = pr.reviewDecision || "REVIEW_REQUIRED";
-
-        // Extract per-agent review status from body text
-        // Reviews start with "Reviewer2" or "Reviewer1", or contain "## Verdict:" (Reviewer1 format)
-        const agentStatus: Record<string, string> = {};
-        for (const r of reviews) {
-          const body = (r.body || "").trim();
-          if (/^(?:Reviewer2|T2b)\b/i.test(body)) {
-            agentStatus["reviewer2"] = r.state;
-          } else if (/^(?:Reviewer1|T2a)\b/i.test(body) || /^##\s*Verdict/i.test(body)) {
-            agentStatus["reviewer1"] = r.state;
-          }
-        }
-
-        return (
-          <a
-            key={pr.number}
-            href={pr.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-2 px-3 py-1 font-mono hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
-          >
-            <StatusDot color={reviewColor(decision)} />
-            <span className="text-[11px] text-text-muted w-8 shrink-0">#{pr.number}</span>
-            <span className="text-[11px] text-text truncate flex-1 min-w-0">{pr.title}</span>
-            {pr.assignees?.[0] && (
-              <span className="text-[10px] text-text-muted shrink-0">
-                {pr.assignees[0].login}
-              </span>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto">
+            {issues.length === 0 && (
+              <div className="px-3 py-2 text-[11px] text-text-muted">No issues</div>
             )}
-            {/* Per-agent review slots */}
-            {["reviewer1", "reviewer2"].map((agent) => {
-              const state = agentStatus[agent];
+            {issues.map((issue) => (
+              <a
+                key={issue.number}
+                href={issue.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-3 py-1 font-mono hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
+              >
+                <StatusDot color={issueStatusColor(issue.state)} />
+                <span className="text-[11px] text-text-muted w-8 shrink-0">#{issue.number}</span>
+                <span className="text-[11px] text-text truncate flex-1 min-w-0">{issue.title}</span>
+                {issue.assignees?.[0] && (
+                  <span className="text-[10px] text-text-muted shrink-0">
+                    {issue.assignees[0].login}
+                  </span>
+                )}
+              </a>
+            ))}
+          </div>
+        </div>
+
+        {/* PRs column */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          <div className="px-3 py-1.5 border-b border-border shrink-0">
+            <span className="text-[10px] text-text-muted uppercase tracking-wider">
+              Pull Requests ({prs.length})
+            </span>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto">
+            {prs.length === 0 && (
+              <div className="px-3 py-2 text-[11px] text-text-muted">No PRs</div>
+            )}
+            {prs.map((pr) => {
+              const reviews = pr.reviews || [];
+              const decision = pr.reviewDecision || "REVIEW_REQUIRED";
+
+              // Extract per-agent review status from body text
+              const agentStatus: Record<string, string> = {};
+              for (const r of reviews) {
+                const body = (r.body || "").trim();
+                if (/^(?:Reviewer2|T2b)\b/i.test(body)) {
+                  agentStatus["reviewer2"] = r.state;
+                } else if (/^(?:Reviewer1|T2a)\b/i.test(body) || /^##\s*Verdict/i.test(body)) {
+                  agentStatus["reviewer1"] = r.state;
+                }
+              }
+
               return (
-                <span
-                  key={agent}
-                  className={`text-[10px] shrink-0 ${
-                    state
-                      ? reviewTextColor(state)
-                      : "text-text-muted"
-                  }`}
+                <a
+                  key={pr.number}
+                  href={pr.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-2 px-3 py-1 font-mono hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
                 >
-                  {agent}:{state ? reviewLabel(state) : "—"}
-                </span>
+                  <StatusDot color={reviewColor(decision)} />
+                  <span className="text-[11px] text-text-muted w-8 shrink-0">#{pr.number}</span>
+                  <span className="text-[11px] text-text truncate flex-1 min-w-0">{pr.title}</span>
+                  {pr.assignees?.[0] && (
+                    <span className="text-[10px] text-text-muted shrink-0">
+                      {pr.assignees[0].login}
+                    </span>
+                  )}
+                  {["reviewer1", "reviewer2"].map((agent) => {
+                    const state = agentStatus[agent];
+                    return (
+                      <span
+                        key={agent}
+                        className={`text-[10px] shrink-0 ${
+                          state ? reviewTextColor(state) : "text-text-muted"
+                        }`}
+                      >
+                        {agent}:{state ? reviewLabel(state) : "—"}
+                      </span>
+                    );
+                  })}
+                  <span className={`text-[10px] shrink-0 ${ciColor(pr.statusCheckRollup)}`}>
+                    {ciLabel(pr.statusCheckRollup)}
+                  </span>
+                </a>
               );
             })}
-            <span className={`text-[10px] shrink-0 ${ciColor(pr.statusCheckRollup)}`}>
-              {ciLabel(pr.statusCheckRollup)}
-            </span>
-          </a>
-        );
-      })}
+          </div>
+        </div>
+      </div>
+
+      {/* #226: compact OVERNIGHT-QUEUE.md row at the bottom */}
+      <div className="shrink-0 flex items-center justify-between px-3 py-1.5 border-t border-border">
+        <span className="text-[11px] text-text-muted font-mono">OVERNIGHT-QUEUE.md</span>
+        <button
+          onClick={() => setQueueModalOpen(true)}
+          className="px-2 py-0.5 text-[10px] text-text-muted hover:text-accent border border-border hover:border-accent transition-colors uppercase tracking-wider"
+        >
+          Edit
+        </button>
+      </div>
+
+      <OvernightQueueModal
+        open={queueModalOpen}
+        projectId={projectId}
+        onClose={() => setQueueModalOpen(false)}
+      />
     </div>
   );
 }
