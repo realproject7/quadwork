@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Sidebar from "@/components/Sidebar";
+import TopHeader from "@/components/TopHeader";
 
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
@@ -20,9 +21,12 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={`${geistMono.variable} h-full`}>
-      <body className="h-full flex">
-        <Sidebar />
-        <main className="flex-1 min-w-0 overflow-auto">{children}</main>
+      <body className="h-full flex flex-col">
+        <TopHeader />
+        <div className="flex flex-1 min-h-0">
+          <Sidebar />
+          <main className="flex-1 min-w-0 overflow-auto">{children}</main>
+        </div>
       </body>
     </html>
   );
