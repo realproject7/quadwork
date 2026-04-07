@@ -10,6 +10,11 @@
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
+// Tokens returned from registerAgent are cached per (port, name) so the
+// two-arg deregisterAgent(serverPort, name) form from the #238 contract
+// works without the caller having to thread the token through.
+const _tokenCache = new Map();
+
 function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -58,6 +63,7 @@ async function registerAgent(serverPort, base, label = null) {
       registerAgent.lastError = `register ${base}: malformed response`;
       return null;
     }
+    _tokenCache.set(`${serverPort}:${data.name}`, data.token);
     return { name: data.name, token: data.token, slot: data.slot };
   } catch (err) {
     registerAgent.lastError = `register ${base}: ${err.message || err}`;
@@ -72,16 +78,20 @@ registerAgent.lastError = null;
  *
  * AgentChattr's /api/deregister/{name} requires the agent's own bearer
  * token for "family" names (head/dev/reviewer1/reviewer2) — see
- * app.py:2123-2135. Pass the registration token returned by registerAgent.
+ * app.py:2123-2135. The token is looked up automatically from the cache
+ * populated by registerAgent; an explicit token may be passed as a third
+ * argument to override (e.g. recovering a session).
  */
 async function deregisterAgent(serverPort, name, token) {
   try {
     const headers = {};
-    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const tok = token || _tokenCache.get(`${serverPort}:${name}`);
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
     const r = await fetchWithTimeout(
       `http://127.0.0.1:${serverPort}/api/deregister/${encodeURIComponent(name)}`,
       { method: "POST", headers },
     );
+    if (r.ok) _tokenCache.delete(`${serverPort}:${name}`);
     return r.ok;
   } catch {
     return false;
