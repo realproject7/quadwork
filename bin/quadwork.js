@@ -84,50 +84,85 @@ function findAgentChattr(dir) {
 }
 
 /**
- * Clone AgentChattr and set up its venv. Idempotent — safe to re-run.
- * Only removes existing directories that are identifiable as failed AgentChattr clones.
- * Returns the directory path on success, null on failure.
+ * Clone AgentChattr and set up its venv. Idempotent — safe to re-run on
+ * the same path, and safe to call repeatedly with different paths in
+ * the same process. Designed to support per-project clones (#181).
+ *
+ * Behavior on re-run:
+ *   - Fully-installed path → no-op (skips clone, skips venv create, skips pip)
+ *   - Missing run.py        → clones (only after refusing to overwrite
+ *                             unrelated content; see safety rules below)
+ *   - Missing venv          → creates venv and reinstalls requirements
+ *
+ * Safety rules — never accidentally clean up unrelated directories:
+ *   - Empty dir                                  → safe to remove
+ *   - Git repo whose origin contains "agentchattr" → safe to remove
+ *   - Anything else                              → refuse, return null
+ *
+ * On failure, returns null and stores a human-readable reason on
+ * `installAgentChattr.lastError` so callers can surface it without
+ * changing the return shape.
  */
 function installAgentChattr(dir) {
   dir = dir || getAgentChattrDir();
-  // Clone if not already present
-  if (!fs.existsSync(path.join(dir, "run.py"))) {
+  installAgentChattr.lastError = null;
+  const setError = (msg) => { installAgentChattr.lastError = msg; return null; };
+
+  const runPy = path.join(dir, "run.py");
+  const venvPython = path.join(dir, ".venv", "bin", "python");
+  let venvJustCreated = false;
+
+  // 1. Clone if run.py is missing.
+  if (!fs.existsSync(runPy)) {
     if (fs.existsSync(dir)) {
-      // Directory exists but no run.py — only clean up if positively identified
-      const isEmpty = fs.readdirSync(dir).length === 0;
+      let entries;
+      try { entries = fs.readdirSync(dir); }
+      catch (e) { return setError(`Cannot read ${dir}: ${e.message}`); }
+      const isEmpty = entries.length === 0;
       if (isEmpty) {
-        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        try { fs.rmSync(dir, { recursive: true, force: true }); }
+        catch (e) { return setError(`Cannot remove empty dir ${dir}: ${e.message}`); }
       } else if (fs.existsSync(path.join(dir, ".git"))) {
-        // Verify this is actually an AgentChattr repo by checking the remote
+        // Only remove if origin remote positively identifies this as agentchattr.
         const remote = run(`git -C "${dir}" remote get-url origin 2>/dev/null`);
         if (remote && remote.includes("agentchattr")) {
-          try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+          try { fs.rmSync(dir, { recursive: true, force: true }); }
+          catch (e) { return setError(`Cannot remove failed clone at ${dir}: ${e.message}`); }
         } else {
-          // Git repo but not AgentChattr — refuse to overwrite
-          return null;
+          return setError(`Refusing to overwrite ${dir}: contains a non-AgentChattr git repo`);
         }
       } else {
-        // Non-empty, non-git directory — refuse to overwrite
-        return null;
+        return setError(`Refusing to overwrite ${dir}: directory exists with unrelated content`);
       }
     }
-    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    // Ensure parent exists before clone (supports arbitrary nested paths).
+    try { fs.mkdirSync(path.dirname(dir), { recursive: true }); }
+    catch (e) { return setError(`Cannot create parent of ${dir}: ${e.message}`); }
     const cloneResult = run(`git clone "${AGENTCHATTR_REPO}" "${dir}" 2>&1`, { timeout: 60000 });
-    if (cloneResult === null || !fs.existsSync(path.join(dir, "run.py"))) return null;
+    if (cloneResult === null) return setError(`git clone of ${AGENTCHATTR_REPO} into ${dir} failed`);
+    if (!fs.existsSync(runPy)) return setError(`Clone completed but run.py missing at ${dir}`);
   }
-  // Create venv and install deps (always ensure venv is ready)
-  const venvPython = path.join(dir, ".venv", "bin", "python");
+
+  // 2. Create venv if missing.
   if (!fs.existsSync(venvPython)) {
     const venvResult = run(`python3 -m venv "${path.join(dir, ".venv")}" 2>&1`, { timeout: 60000 });
-    if (venvResult === null) return null;
+    if (venvResult === null) return setError(`python3 -m venv failed at ${dir}/.venv (is python3 installed?)`);
+    if (!fs.existsSync(venvPython)) return setError(`venv created but ${venvPython} missing`);
+    venvJustCreated = true;
   }
-  const reqFile = path.join(dir, "requirements.txt");
-  if (fs.existsSync(reqFile)) {
-    const pipResult = run(`"${venvPython}" -m pip install -r "${reqFile}" 2>&1`, { timeout: 120000 });
-    if (pipResult === null) return null;
+
+  // 3. Install requirements only when the venv was just (re)created.
+  //    This makes re-running on a fully-installed path a true no-op.
+  if (venvJustCreated) {
+    const reqFile = path.join(dir, "requirements.txt");
+    if (fs.existsSync(reqFile)) {
+      const pipResult = run(`"${venvPython}" -m pip install -r "${reqFile}" 2>&1`, { timeout: 120000 });
+      if (pipResult === null) return setError(`pip install -r ${reqFile} failed`);
+    }
   }
   return dir;
 }
+installAgentChattr.lastError = null;
 
 /**
  * Get spawn args for launching AgentChattr from its cloned directory.
