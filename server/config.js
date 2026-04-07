@@ -93,22 +93,33 @@ function resolveAgentCommand(projectId, agentId) {
 function resolveProjectChattr(projectId) {
   const config = readConfig();
   const project = projectId ? config.projects?.find((p) => p.id === projectId) : null;
+
+  // Resolution order for AgentChattr install dir:
+  //   1. project.agentchattr_dir   — per-project clone (Option B, #181)
+  //   2. config.agentchattr_dir    — legacy global clone (v1 backward compat)
+  //   3. ~/.quadwork/{projectId}/agentchattr — per-project default
+  //
+  // Phase 1A (#182) is schema-only: project.agentchattr_dir is now written
+  // on every new project, but the actual clone-on-create logic does not
+  // land until #183/#184/#185. Until then, if the project field points at
+  // a directory that does not yet contain a working install, fall back to
+  // the legacy global so existing setups (and brand-new projects on a v1
+  // host) keep starting AgentChattr from the working clone.
+  const perProjectDefault = projectId
+    ? path.join(os.homedir(), ".quadwork", projectId, "agentchattr")
+    : path.join(os.homedir(), ".quadwork", "agentchattr");
+  const legacyGlobal = config.agentchattr_dir || path.join(os.homedir(), ".quadwork", "agentchattr");
+  let dir = project?.agentchattr_dir || legacyGlobal || perProjectDefault;
+  if (!fs.existsSync(path.join(dir, "run.py")) && fs.existsSync(path.join(legacyGlobal, "run.py"))) {
+    dir = legacyGlobal;
+  }
+
   return {
     url: project?.agentchattr_url || config.agentchattr_url || "http://127.0.0.1:8300",
     token: project?.agentchattr_token || config.agentchattr_token || null,
     mcp_http_port: project?.mcp_http_port || null,
     mcp_sse_port: project?.mcp_sse_port || null,
-    // Resolution order:
-    //   1. project.agentchattr_dir   — per-project clone (Option B, current default)
-    //   2. config.agentchattr_dir    — legacy global clone (v1 backward compat)
-    //   3. ~/.quadwork/{projectId}/agentchattr — per-project default path
-    //      (used when neither value is set; matches what new projects will write)
-    dir:
-      project?.agentchattr_dir ||
-      config.agentchattr_dir ||
-      (projectId
-        ? path.join(os.homedir(), ".quadwork", projectId, "agentchattr")
-        : path.join(os.homedir(), ".quadwork", "agentchattr")),
+    dir,
   };
 }
 
