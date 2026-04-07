@@ -77,13 +77,15 @@ function ProjectIcon({ project, isActive }: { project: Project; isActive: boolea
         onMouseLeave={() => setTooltip(null)}
       >
         <div
-          className={`w-10 h-10 flex items-center justify-center rounded-full text-xs font-semibold uppercase transition-colors ${
+          className={`w-10 h-10 flex items-center justify-center rounded-full text-[11px] font-semibold uppercase tracking-tight transition-colors ${
             isActive
               ? "border-2 border-accent text-accent"
               : "border border-border text-text-muted hover:text-text hover:bg-[#1a1a1a]"
           }`}
         >
-          {project.name.charAt(0)}
+          {/* #207: two-letter chip — first two characters of the project
+              name, falling back to a single character for 1-char names. */}
+          {project.name.slice(0, 2) || "?"}
         </div>
       </Link>
       {tooltip && (
