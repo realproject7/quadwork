@@ -69,6 +69,7 @@ router.put("/api/config", (req, res) => {
 // ─── Chat (AgentChattr proxy) ──────────────────────────────────────────────
 
 const { resolveProjectChattr } = require("./config");
+const { installAgentChattr, findAgentChattr } = require("./install-agentchattr");
 
 function getChattrConfig(projectId) {
   const resolved = resolveProjectChattr(projectId);
@@ -650,8 +651,14 @@ router.post("/api/setup", (req, res) => {
       const parentDir = path.dirname(workingDir);
       const backends = body.backends;
 
-      // Per-project: isolated config dir + data dir
-      const projectConfigDir = path.join(workingDir, "agentchattr");
+      // Phase 2D / #181: config.toml lives at the per-project AgentChattr
+      // clone ROOT (~/.quadwork/{id}/agentchattr/), not inside the user's
+      // project working_dir. AgentChattr's run.py loads ROOT/config.toml
+      // and ignores --config, so the toml has to be at the same path the
+      // clone-on-create step (#185 add-config) installs into. Same path
+      // matches what writeQuadWorkConfig() persists in agentchattr_dir
+      // (#182) and what the CLI wizard writes (#184).
+      const projectConfigDir = path.join(CONFIG_DIR, dirName, "agentchattr");
       fs.mkdirSync(projectConfigDir, { recursive: true });
       const dataDir = path.join(projectConfigDir, "data");
       fs.mkdirSync(dataDir, { recursive: true });
@@ -743,6 +750,19 @@ router.post("/api/setup", (req, res) => {
         while (usedMcpPorts.has(mcp_sse_port)) mcp_sse_port++;
       }
       if (!agentchattr_token) agentchattr_token = crypto.randomBytes(16).toString("hex");
+
+      // Phase 2D / #181: clone AgentChattr per-project before saving config.
+      // The path here must match the one written into agentchattr_dir below
+      // and the one agentchattr-config writes config.toml into.
+      const perProjectDir = path.join(CONFIG_DIR, id, "agentchattr");
+      if (!findAgentChattr(perProjectDir)) {
+        const installResult = installAgentChattr(perProjectDir);
+        if (!installResult) {
+          const reason = installAgentChattr.lastError || "unknown error";
+          return res.json({ ok: false, error: `AgentChattr install failed at ${perProjectDir}: ${reason}` });
+        }
+      }
+
       cfg.projects.push({
         id, name, repo, working_dir: workingDir, agents,
         agentchattr_url: `http://127.0.0.1:${chattrPort}`,
@@ -750,7 +770,7 @@ router.post("/api/setup", (req, res) => {
         mcp_http_port,
         mcp_sse_port,
         // Per-project AgentChattr clone path (Option B / #181).
-        agentchattr_dir: path.join(os.homedir(), ".quadwork", id, "agentchattr"),
+        agentchattr_dir: perProjectDir,
       });
       const dir = path.dirname(CONFIG_PATH);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
