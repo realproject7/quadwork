@@ -90,6 +90,24 @@ export default function TopHeader() {
   // resumes from where the animation was paused.
   const suffix = animationEnabled ? liveSuffix : (TAGLINE_VARIANTS[0] || "");
 
+  // #227: the toggle should appear only after the typewriter
+  // completes one cycle (operator has seen the animation in
+  // motion) or after a ~5s fallback. If the animation is already
+  // off (operator paused it on a previous visit), show the toggle
+  // immediately so they can re-enable.
+  const [showToggle, setShowToggle] = useState(false);
+  useEffect(() => {
+    if (!animationEnabled) { setShowToggle(true); return; }
+    const t = setTimeout(() => setShowToggle(true), 5000);
+    return () => clearTimeout(t);
+  }, [animationEnabled]);
+  // First-cycle completion: a "deleting → empty → next variant"
+  // transition produces an empty `liveSuffix`. Show as soon as we
+  // observe the first one.
+  useEffect(() => {
+    if (animationEnabled && liveSuffix === "") setShowToggle(true);
+  }, [animationEnabled, liveSuffix]);
+
   return (
     <>
       <header className="sticky top-0 z-40 flex h-12 items-center justify-between border-b border-white/10 bg-neutral-950/90 px-4 backdrop-blur">
@@ -105,17 +123,22 @@ export default function TopHeader() {
               <span className="ml-0.5 inline-block w-[1px] h-[12px] align-middle bg-neutral-400 animate-qw-blink" />
             )}
           </span>
-          {/* #227: small unobtrusive toggle for the tagline animation. */}
-          <button
-            type="button"
-            onClick={toggleAnimation}
-            aria-label={animationEnabled ? "Pause tagline animation" : "Resume tagline animation"}
-            aria-pressed={animationEnabled}
-            title={animationEnabled ? "Pause tagline animation" : "Resume tagline animation"}
-            className="hidden sm:inline-flex items-center justify-center w-3.5 h-3.5 ml-1 rounded-full border border-white/15 text-neutral-500 hover:text-white hover:border-white/40 transition-colors text-[8px]"
-          >
-            {animationEnabled ? "❚❚" : "▶"}
-          </button>
+          {/* #227: small unobtrusive toggle for the tagline animation.
+              Hidden until the operator has seen one full cycle of the
+              animation (or a ~5s fallback) so it isn't a discoverable
+              affordance the very first frame. */}
+          {showToggle && (
+            <button
+              type="button"
+              onClick={toggleAnimation}
+              aria-label={animationEnabled ? "Pause tagline animation" : "Resume tagline animation"}
+              aria-pressed={animationEnabled}
+              title={animationEnabled ? "Pause tagline animation" : "Resume tagline animation"}
+              className="hidden sm:inline-flex items-center justify-center w-3.5 h-3.5 ml-1 rounded-full border border-white/15 text-neutral-500 hover:text-white hover:border-white/40 transition-colors text-[8px]"
+            >
+              {animationEnabled ? "❚❚" : "▶"}
+            </button>
+          )}
         </div>
         <div className="flex items-center gap-3 shrink-0">
           <button
