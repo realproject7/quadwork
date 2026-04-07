@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import ProjectChatEmptyState from "./ProjectChatEmptyState";
 
 interface Message {
   id: number;
@@ -244,8 +245,11 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
         className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-0.5"
       >
         {messages.length === 0 && (
+          // #229: replace the bare "No messages" text with a richer
+          // empty state — friendly icon, headline, click-to-insert
+          // example chips, and a How to Work modal trigger.
           <div className="flex items-center justify-center h-full">
-            <span className="text-xs text-text-muted">No messages</span>
+            <ProjectChatEmptyState onInsert={(t) => { setInput(t); inputRef.current?.focus(); }} />
           </div>
         )}
         {messages.map((msg) => (

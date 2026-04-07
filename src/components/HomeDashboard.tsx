@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import HomeEmptyState from "./HomeEmptyState";
 
 interface Project {
   id: string;
@@ -50,6 +51,13 @@ export default function HomeDashboard() {
 
   return (
     <div className="h-full overflow-y-auto p-6">
+      {/* #229: friendly empty-state hero. Always rendered at the top
+          of the home page; the headline + CTA adapts to whether the
+          user has any projects yet. */}
+      <div className="mb-6">
+        <HomeEmptyState hasProjects={projects.length > 0} />
+      </div>
+
       {/* Header */}
       <div className="mb-6">
         <h1 className="text-lg font-semibold text-text tracking-tight">Projects</h1>
