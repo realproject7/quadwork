@@ -8,7 +8,7 @@ const pty = require("node-pty");
 const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH } = require("./config");
 const routes = require("./routes");
-const { waitForAgentChattrReady, registerAgent } = require("./agentchattr-registry");
+const { waitForAgentChattrReady, registerAgent, deregisterAgent } = require("./agentchattr-registry");
 
 const net = require("net");
 const config = readConfig();
@@ -234,12 +234,14 @@ function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
 async function buildAgentArgs(projectId, agentId) {
   const cfg = readConfig();
   const project = cfg.projects?.find((p) => p.id === projectId);
-  if (!project) return [];
+  if (!project) return { args: [], acRegistrationName: null, acServerPort: null };
 
   const agentCfg = project.agents?.[agentId] || {};
   const command = agentCfg.command || "claude";
   const cliBase = command.split("/").pop().split(" ")[0]; // extract base CLI name
   const args = [];
+  let acRegistrationName = null;
+  let acServerPort = null;
 
   // Permission bypass flags
   if (agentCfg.auto_approve !== false) {
@@ -256,12 +258,14 @@ async function buildAgentArgs(projectId, agentId) {
       // Claude/Kimi: register with AgentChattr to obtain a per-agent
       // token (#239 — session_token is browser auth, not MCP auth) and
       // write that into the per-agent MCP config file.
-      const acServerPort = Number(new URL(project.agentchattr_url).port) || 8300;
+      const chattrInfo = resolveProjectChattr(projectId);
+      acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
       await waitForAgentChattrReady(acServerPort);
       const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null);
       if (!registration) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
       }
+      acRegistrationName = registration.name;
       const mcpConfigPath = writeMcpConfigFile(projectId, agentId, mcpHttpPort, registration.token);
       const flag = agentCfg.mcp_flag || "--mcp-config";
       args.push(flag, mcpConfigPath);
@@ -271,12 +275,13 @@ async function buildAgentArgs(projectId, agentId) {
       // Resolve via resolveProjectChattr so legacy/global-config
       // projects without a per-project agentchattr_url still work.
       const chattrInfo = resolveProjectChattr(projectId);
-      const acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
+      acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
       await waitForAgentChattrReady(acServerPort);
       const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null);
       if (!registration) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
       }
+      acRegistrationName = registration.name;
       const upstreamUrl = `http://127.0.0.1:${mcpHttpPort}`;
       const proxyUrl = await startMcpProxy(projectId, agentId, upstreamUrl, registration.token);
       if (proxyUrl) {
@@ -285,7 +290,7 @@ async function buildAgentArgs(projectId, agentId) {
     }
   }
 
-  return args;
+  return { args, acRegistrationName, acServerPort };
 }
 
 /**
@@ -332,7 +337,8 @@ async function spawnAgentPty(project, agent) {
   if (!cwd) return { ok: false, error: `Unknown agent: ${key}` };
 
   const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
-  const args = await buildAgentArgs(project, agent);
+  const built = await buildAgentArgs(project, agent);
+  const args = built.args;
   const extraEnv = buildAgentEnv(project, agent);
 
   try {
@@ -344,7 +350,16 @@ async function spawnAgentPty(project, agent) {
       env: { ...process.env, ...extraEnv },
     });
 
-    const session = { projectId: project, agentId: agent, term, ws: null, state: "running", error: null };
+    const session = {
+      projectId: project,
+      agentId: agent,
+      term,
+      ws: null,
+      state: "running",
+      error: null,
+      acRegistrationName: built.acRegistrationName,
+      acServerPort: built.acServerPort,
+    };
     agentSessions.set(key, session);
 
     term.onExit(({ exitCode }) => {
@@ -368,8 +383,11 @@ async function spawnAgentPty(project, agent) {
   }
 }
 
-// Helper: stop an agent session — kill PTY, close WS
-function stopAgentSession(key) {
+// Helper: stop an agent session — kill PTY, close WS, deregister.
+// Async because deregister must complete before a restart re-registers,
+// otherwise the old slot stays occupied and a fresh register lands at
+// head-2 instead of slot 1 (#241).
+async function stopAgentSession(key) {
   const session = agentSessions.get(key);
   if (!session) {
     agentSessions.set(key, { projectId: null, agentId: null, term: null, ws: null, state: "stopped", error: null });
@@ -385,6 +403,16 @@ function stopAgentSession(key) {
   session.ws = null;
   session.state = "stopped";
   session.error = null;
+  // Best-effort deregister from AgentChattr (#241) so the slot frees
+  // and the next register lands at slot 1 instead of head-2.
+  if (session.acRegistrationName && session.acServerPort) {
+    try {
+      await deregisterAgent(session.acServerPort, session.acRegistrationName);
+    } catch {
+      // best-effort — failures are non-fatal
+    }
+    session.acRegistrationName = null;
+  }
   // Clean up MCP auth proxy if running
   const [projectId, agentId] = key.split("/");
   if (projectId && agentId) stopMcpProxy(projectId, agentId);
@@ -649,10 +677,10 @@ app.post("/api/agents/:project/:agent/start", async (req, res) => {
 
 // --- Lifecycle: stop kills PTY + closes WS ---
 
-app.post("/api/agents/:project/:agent/stop", (req, res) => {
+app.post("/api/agents/:project/:agent/stop", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
-  stopAgentSession(key);
+  await stopAgentSession(key);
   res.json({ ok: true, state: "stopped" });
 });
 
@@ -662,16 +690,16 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
-  stopAgentSession(key);
+  // #241: must await deregister before respawn so the slot frees and
+  // the fresh register lands at slot 1 instead of head-2.
+  await stopAgentSession(key);
 
-  setTimeout(async () => {
-    const result = await spawnAgentPty(project, agent);
-    if (result.ok) {
-      res.json({ ok: true, state: "running", pid: result.pid });
-    } else {
-      res.status(500).json({ ok: false, state: "error", error: result.error });
-    }
-  }, 500);
+  const result = await spawnAgentPty(project, agent);
+  if (result.ok) {
+    res.json({ ok: true, state: "running", pid: result.pid });
+  } else {
+    res.status(500).json({ ok: false, state: "error", error: result.error });
+  }
 });
 
 // --- Sessions tracking (for /api/projects dashboard) ---
