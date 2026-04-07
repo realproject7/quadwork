@@ -179,10 +179,16 @@ router.post("/api/chat", async (req, res) => {
   const { url: base, token: sessionToken } = getChattrConfig(projectId);
   if (!base) return res.status(400).json({ error: "Missing project" });
 
+  // #230: ignore any client-supplied sender. /api/chat is the
+  // dashboard's send path, so the message must always be attributed
+  // to "user". Forwarding `req.body.sender` would let any caller
+  // hitting QuadWork's /api/chat impersonate an agent identity (t1,
+  // t3, …) over the AgentChattr ws path, which the old /api/send
+  // flow could not do.
   const message = {
     text: typeof req.body?.text === "string" ? req.body.text : "",
     channel: req.body?.channel || "general",
-    sender: req.body?.sender || "user",
+    sender: "user",
     attachments: Array.isArray(req.body?.attachments) ? req.body.attachments : [],
   };
   if (!message.text && message.attachments.length === 0) {
