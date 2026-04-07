@@ -174,10 +174,15 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
     shouldAutoScroll.current = scrollHeight - scrollTop - clientHeight < 40;
   };
 
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+
   // Send message
   const send = () => {
     const text = input.trim();
-    if (!text) return;
+    if (!text || sending) return;
+    setSending(true);
+    setSendError(null);
     fetch(`/api/chat${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -188,7 +193,11 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
         setInput("");
         setTimeout(fetchMessages, 300);
       })
-      .catch((err) => console.error(err.message));
+      .catch((err) => {
+        setSendError(err.message);
+        console.error(err.message);
+      })
+      .finally(() => setSending(false));
   };
 
   // @mention handling
@@ -268,21 +277,43 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             ))}
           </div>
         )}
-        <input
-          ref={inputRef}
-          type="text"
-          value={input}
-          onChange={(e) => handleInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-            }
-            if (e.key === "Escape") setShowMentions(false);
-          }}
-          placeholder={`Message #${channel}...`}
-          className="w-full bg-transparent px-3 py-2 text-[12px] font-mono text-text placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent"
-        />
+        {sendError && (
+          <div className="px-3 py-1 text-[11px] text-red-400 bg-red-900/20 border-b border-red-700/40">
+            {sendError}
+          </div>
+        )}
+        <div className="flex items-center gap-1 px-1">
+          <input
+            ref={inputRef}
+            type="text"
+            value={input}
+            onChange={(e) => handleInput(e.target.value)}
+            onKeyDown={(e) => {
+              // Tab: autocomplete first filtered @mention
+              if (e.key === "Tab" && showMentions && filteredAgents.length > 0) {
+                e.preventDefault();
+                insertMention(filteredAgents[0]);
+                return;
+              }
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+              if (e.key === "Escape") setShowMentions(false);
+            }}
+            placeholder={`Message #${channel}...`}
+            disabled={sending}
+            className="flex-1 bg-transparent px-2 py-2 text-[12px] font-mono text-text placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
+          />
+          <button
+            onClick={send}
+            disabled={sending || !input.trim()}
+            className="shrink-0 px-2 py-1 text-[11px] font-mono text-accent border border-accent/40 rounded hover:bg-accent/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+            title="Send (Enter)"
+          >
+            {sending ? "…" : "Send"}
+          </button>
+        </div>
       </div>
     </div>
   );
