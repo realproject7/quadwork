@@ -28,16 +28,13 @@ function useTypewriter(variants: string[], enabled: boolean) {
   const [phase, setPhase] = useState<"typing" | "holding" | "deleting">("typing");
 
   useEffect(() => {
-    // #227: when disabled, freeze on the first variant fully typed
-    // out and stop scheduling further phase transitions. The
-    // displayed text remains visible so the line doesn't suddenly
-    // empty when the operator toggles the animation off.
-    if (!enabled) {
-      setIndex(0);
-      setText(variants[0] || "");
-      setPhase("typing");
-      return;
-    }
+    // #227: when disabled, the live `index` / `phase` / `text` are
+    // intentionally left untouched — toggling back on must resume
+    // exactly where the animation was paused, not restart from the
+    // first variant. The render side substitutes the static first
+    // variant for display while disabled; we just stop scheduling
+    // phase transitions here.
+    if (!enabled) return;
 
     const current = variants[index];
     let timer: ReturnType<typeof setTimeout>;
@@ -87,7 +84,11 @@ export default function TopHeader() {
     });
   };
 
-  const suffix = useTypewriter(TAGLINE_VARIANTS, animationEnabled);
+  const liveSuffix = useTypewriter(TAGLINE_VARIANTS, animationEnabled);
+  // #227: when disabled, freeze on the first variant ("sleep.").
+  // The hook keeps its live index/phase intact, so re-enabling
+  // resumes from where the animation was paused.
+  const suffix = animationEnabled ? liveSuffix : (TAGLINE_VARIANTS[0] || "");
 
   return (
     <>
