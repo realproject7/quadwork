@@ -655,11 +655,24 @@ router.post("/api/setup", (req, res) => {
       // clone ROOT (~/.quadwork/{id}/agentchattr/), not inside the user's
       // project working_dir. AgentChattr's run.py loads ROOT/config.toml
       // and ignores --config, so the toml has to be at the same path the
-      // clone-on-create step (#185 add-config) installs into. Same path
-      // matches what writeQuadWorkConfig() persists in agentchattr_dir
-      // (#182) and what the CLI wizard writes (#184).
+      // clone lives at. Same path matches what writeQuadWorkConfig()
+      // persists in agentchattr_dir (#182) and what the CLI wizard
+      // writes (#184).
+      //
+      // We install the clone *here*, before writing config.toml. The
+      // install must run first because installAgentChattr() refuses to
+      // overwrite a non-empty directory it doesn't recognize — if we
+      // mkdir + write config.toml first, the subsequent install in
+      // add-config would see "unrelated content" and reject the dir,
+      // breaking first-run web project creation (t2a's review of #195).
       const projectConfigDir = path.join(CONFIG_DIR, dirName, "agentchattr");
-      fs.mkdirSync(projectConfigDir, { recursive: true });
+      if (!findAgentChattr(projectConfigDir)) {
+        const installResult = installAgentChattr(projectConfigDir);
+        if (!installResult) {
+          const reason = installAgentChattr.lastError || "unknown error";
+          return res.json({ ok: false, error: `AgentChattr install failed at ${projectConfigDir}: ${reason}` });
+        }
+      }
       const dataDir = path.join(projectConfigDir, "data");
       fs.mkdirSync(dataDir, { recursive: true });
       const tomlPath = path.join(projectConfigDir, "config.toml");
