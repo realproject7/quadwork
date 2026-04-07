@@ -266,9 +266,19 @@ async function buildAgentArgs(projectId, agentId) {
       const flag = agentCfg.mcp_flag || "--mcp-config";
       args.push(flag, mcpConfigPath);
     } else if (injectMode === "proxy_flag") {
-      // Codex: start local auth proxy, pass proxy URL via -c flag
+      // Codex: register with AgentChattr first (#240) so the proxy
+      // injects a real per-agent token, not the global session token.
+      // Resolve via resolveProjectChattr so legacy/global-config
+      // projects without a per-project agentchattr_url still work.
+      const chattrInfo = resolveProjectChattr(projectId);
+      const acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
+      await waitForAgentChattrReady(acServerPort);
+      const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null);
+      if (!registration) {
+        throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
+      }
       const upstreamUrl = `http://127.0.0.1:${mcpHttpPort}`;
-      const proxyUrl = await startMcpProxy(projectId, agentId, upstreamUrl, token);
+      const proxyUrl = await startMcpProxy(projectId, agentId, upstreamUrl, registration.token);
       if (proxyUrl) {
         args.push("-c", `mcp_servers.agentchattr.url="${proxyUrl}"`);
       }
