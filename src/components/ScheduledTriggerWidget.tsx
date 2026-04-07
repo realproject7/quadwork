@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 interface ScheduledTriggerWidgetProps {
   projectId: string;
@@ -63,9 +63,19 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   const [intervalMin, setIntervalMin] = useState<number>(15);
   const [durationMin, setDurationMin] = useState<number>(180);
   // Track which controls the operator has touched so incoming polls
-  // don't clobber mid-edit changes.
+  // don't clobber mid-edit changes. The values are mirrored into
+  // refs so the memoized `load()` closure always reads the latest
+  // dirty flags + message without being re-created on every keystroke
+  // (recreating `load` would re-run the polling effect and reset the
+  // 5s interval).
   const [intervalDirty, setIntervalDirty] = useState(false);
   const [durationDirty, setDurationDirty] = useState(false);
+  const messageRef = useRef<string>("");
+  const intervalDirtyRef = useRef(false);
+  const durationDirtyRef = useRef(false);
+  useEffect(() => { messageRef.current = message; }, [message]);
+  useEffect(() => { intervalDirtyRef.current = intervalDirty; }, [intervalDirty]);
+  useEffect(() => { durationDirtyRef.current = durationDirty; }, [durationDirty]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState("");
@@ -80,21 +90,23 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       const t = data[projectId] || null;
       setTrigger(t);
       if (t) {
-        // Hydrate message unless the operator has already typed
-        // something (we don't want polls to overwrite unsaved edits).
-        if (t.message && !message) setMessage(t.message);
-        // Hydrate interval from: active timer value (ms), else the
-        // persisted last-used value (minutes), else leave the default.
-        // Skip if the operator has touched the control.
-        if (!intervalDirty) {
+        // Read dirty flags + current message from refs, NOT from the
+        // closure — `load` is memoized on `projectId` alone so the
+        // polling effect can keep a stable 5s cadence. Without the
+        // refs, a later poll would still see the initial empty
+        // message / clean flags and overwrite mid-edit changes.
+        if (t.message && !messageRef.current) {
+          setMessage(t.message);
+          messageRef.current = t.message;
+        }
+        if (!intervalDirtyRef.current) {
           if (t.enabled && t.interval) {
             setIntervalMin(Math.max(1, Math.round(t.interval / 60000)));
           } else if (typeof t.intervalMin === "number" && t.intervalMin > 0) {
             setIntervalMin(t.intervalMin);
           }
         }
-        // Hydrate duration from the persisted last-used value.
-        if (!durationDirty && typeof t.durationMin === "number" && t.durationMin >= 0) {
+        if (!durationDirtyRef.current && typeof t.durationMin === "number" && t.durationMin >= 0) {
           setDurationMin(t.durationMin);
         }
       }
@@ -102,9 +114,6 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
     } catch (e) {
       setError((e as Error).message);
     }
-  // Intentionally exclude `message`/`intervalDirty`/`durationDirty`
-  // so user edits aren't clobbered mid-typing.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
   // Seed the textarea with the ticket's default once, until the first
