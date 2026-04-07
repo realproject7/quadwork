@@ -5,7 +5,7 @@ const fs = require("fs");
 const { WebSocketServer } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH } = require("./config");
 const routes = require("./routes");
 
 const net = require("net");
@@ -740,6 +740,7 @@ async function sendTriggerMessage(projectId) {
 
 app.get("/api/triggers", (_req, res) => {
   const result = {};
+  // Include active runtime triggers first.
   for (const [id, info] of triggers) {
     result[id] = {
       enabled: true,
@@ -748,8 +749,41 @@ app.get("/api/triggers", (_req, res) => {
       nextAt: info.nextAt,
       lastError: info.lastError || null,
       expiresAt: info.expiresAt || null,
+      message: null,        // filled in below from config
+      intervalMin: null,    // filled in below — last-used interval in minutes
+      durationMin: null,    // filled in below — last-used duration in minutes
     };
   }
+  // Enrich with the persisted message AND last-used interval/duration
+  // for every project in config.json — even projects that don't
+  // currently have a running trigger. The Scheduled Trigger widget
+  // (#210) hydrates all three controls from this on page reload.
+  try {
+    const cfg = readConfig();
+    for (const p of (cfg.projects || [])) {
+      const msg = typeof p.trigger_message === "string" ? p.trigger_message : null;
+      const intervalMin = Number.isFinite(p.trigger_interval_min) ? p.trigger_interval_min : null;
+      const durationMin = Number.isFinite(p.trigger_duration_min) ? p.trigger_duration_min : null;
+      const existing = result[p.id];
+      if (existing) {
+        existing.message = msg;
+        existing.intervalMin = intervalMin;
+        existing.durationMin = durationMin;
+      } else if (msg !== null || intervalMin !== null || durationMin !== null) {
+        result[p.id] = {
+          enabled: false,
+          interval: intervalMin !== null ? intervalMin * 60 * 1000 : 0,
+          lastSent: null,
+          nextAt: null,
+          lastError: null,
+          expiresAt: null,
+          message: msg,
+          intervalMin,
+          durationMin,
+        };
+      }
+    }
+  } catch { /* non-fatal */ }
   res.json(result);
 });
 
@@ -764,14 +798,41 @@ function stopTrigger(project) {
 
 app.post("/api/triggers/:project/start", (req, res) => {
   const { project } = req.params;
-  const { interval, duration } = req.body || {};
+  const { interval, duration, message, sendImmediately } = req.body || {};
   const ms = (interval || 30) * 60 * 1000;
   const durationMs = duration ? duration * 60 * 1000 : 0; // duration in minutes, 0 = indefinite
+
+  // #210: persist the custom message AND the last-used interval +
+  // duration on the project entry so reopening an idle project
+  // pre-fills all three controls from the saved state (not just the
+  // message). Without persisting interval/duration, the widget
+  // would snap back to its defaults (15 min / 3 hr) after every
+  // reload even if the operator had picked something else.
+  try {
+    const cfg = readConfig();
+    const entry = (cfg.projects || []).find((p) => p.id === project);
+    if (entry) {
+      if (typeof message === "string" && message.length > 0) entry.trigger_message = message;
+      if (Number.isFinite(interval) && interval > 0) entry.trigger_interval_min = interval;
+      if (Number.isFinite(duration) && duration >= 0) entry.trigger_duration_min = duration;
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    }
+  } catch (e) { /* non-fatal — timer still runs with its in-memory values */ }
 
   const existing = triggers.get(project);
   if (existing) {
     if (existing.timer) clearInterval(existing.timer);
     if (existing.durationTimer) clearTimeout(existing.durationTimer);
+  }
+
+  // #210: the Scheduled Trigger widget's "Send Message and Start
+  // Trigger" button expects an immediate send, not the first fire
+  // one interval in the future. setInterval won't do that on its
+  // own, so trigger a one-shot send when sendImmediately is true.
+  if (sendImmediately) {
+    // Don't await — keep the response fast. sendTriggerMessage logs
+    // its own errors and updates lastError on the trigger info.
+    sendTriggerMessage(project).catch(() => {});
   }
 
   const timer = setInterval(() => sendTriggerMessage(project), ms);
