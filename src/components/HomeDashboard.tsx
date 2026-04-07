@@ -35,6 +35,13 @@ function timeAgo(iso: string): string {
 export default function HomeDashboard() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
+  // #229: track whether /api/projects has resolved (success OR
+  // failure) so the empty-state hero doesn't flash the "no
+  // projects" CTA before we actually know. Possible values:
+  //   "loading"  — first paint, no answer yet
+  //   "loaded"   — fetch resolved successfully
+  //   "error"    — fetch failed; preserve last-known projects
+  const [projectsState, setProjectsState] = useState<"loading" | "loaded" | "error">("loading");
 
   useEffect(() => {
     fetch("/api/projects")
@@ -45,18 +52,28 @@ export default function HomeDashboard() {
       .then((data) => {
         if (data.projects && Array.isArray(data.projects)) setProjects(data.projects.filter((p: Project & { archived?: boolean }) => !p.archived));
         if (data.recentEvents && Array.isArray(data.recentEvents)) setActivity(data.recentEvents);
+        setProjectsState("loaded");
       })
-      .catch(() => {});
+      .catch(() => { setProjectsState("error"); });
   }, []);
 
   return (
     <div className="h-full overflow-y-auto p-6">
-      {/* #229: friendly empty-state hero. Always rendered at the top
-          of the home page; the headline + CTA adapts to whether the
-          user has any projects yet. */}
-      <div className="mb-6">
-        <HomeEmptyState hasProjects={projects.length > 0} />
-      </div>
+      {/* #229: friendly empty-state hero. Only rendered after
+          /api/projects resolves successfully — we don't want to
+          flash the "no projects" onboarding CTA to existing users
+          while the first fetch is in flight, or when the API
+          errored and we have no idea which branch to show. */}
+      {projectsState === "loaded" && (
+        <div className="mb-6">
+          <HomeEmptyState hasProjects={projects.length > 0} />
+        </div>
+      )}
+      {projectsState === "error" && (
+        <div className="mb-6 border border-error/30 bg-error/5 text-error text-[11px] px-3 py-2">
+          Could not load projects from /api/projects. The dashboard may be out of date — check the server logs and reload.
+        </div>
+      )}
 
       {/* Header */}
       <div className="mb-6">
