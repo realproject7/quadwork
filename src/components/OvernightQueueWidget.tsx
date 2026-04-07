@@ -5,6 +5,13 @@ import ReactMarkdown from "react-markdown";
 
 interface OvernightQueueWidgetProps {
   projectId: string;
+  /**
+   * #226: when true, the widget enters edit mode as soon as the
+   * first /api/queue response arrives. Used by OvernightQueueModal
+   * so the operator lands directly in the textarea instead of
+   * having to click an inner Edit button after the modal opens.
+   */
+  startInEditMode?: boolean;
 }
 
 const REFRESH_MS = 10_000;
@@ -24,15 +31,16 @@ const REFRESH_MS = 10_000;
  * Empty-file state (shouldn't happen post-#204) shows a
  * "Create from template" button that hits `POST /api/queue`.
  */
-export default function OvernightQueueWidget({ projectId }: OvernightQueueWidgetProps) {
+export default function OvernightQueueWidget({ projectId, startInEditMode = false }: OvernightQueueWidgetProps) {
   const [content, setContent] = useState<string>("");
   const [exists, setExists] = useState<boolean | null>(null);
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useState(startInEditMode);
   const [draft, setDraft] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const editingRef = useRef(false);
   editingRef.current = editing;
+  const startInEditRef = useRef(startInEditMode);
 
   const load = useCallback(async () => {
     try {
@@ -42,6 +50,14 @@ export default function OvernightQueueWidget({ projectId }: OvernightQueueWidget
       setExists(!!data.exists);
       // Don't clobber the draft while the operator is actively editing.
       if (!editingRef.current) setContent(data.content || "");
+      // #226: when the widget is asked to start in edit mode, seed
+      // the draft from the first server response so the textarea
+      // is populated even though `editing` was already true on
+      // mount.
+      if (startInEditRef.current) {
+        setDraft(data.content || "");
+        startInEditRef.current = false;
+      }
       setError(null);
     } catch (e) {
       setError((e as Error).message);

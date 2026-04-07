@@ -56,7 +56,10 @@ export default function OvernightQueueModal({ open, projectId, onClose }: Overni
           </button>
         </div>
         <div className="flex-1 min-h-0">
-          <OvernightQueueWidget projectId={projectId} />
+          {/* #226: open the widget directly in edit mode so the
+              operator lands in the textarea instead of read-only
+              markdown. */}
+          <OvernightQueueWidget projectId={projectId} startInEditMode />
         </div>
       </div>
     </div>
