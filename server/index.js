@@ -8,7 +8,7 @@ const pty = require("node-pty");
 const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH } = require("./config");
 const routes = require("./routes");
-const { waitForAgentChattrReady, registerAgent, deregisterAgent } = require("./agentchattr-registry");
+const { waitForAgentChattrReady, registerAgent, deregisterAgent, startHeartbeat, stopHeartbeat } = require("./agentchattr-registry");
 
 const net = require("net");
 const config = readConfig();
@@ -267,7 +267,7 @@ function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
 async function buildAgentArgs(projectId, agentId) {
   const cfg = readConfig();
   const project = cfg.projects?.find((p) => p.id === projectId);
-  if (!project) return { args: [], acRegistrationName: null, acServerPort: null };
+  if (!project) return { args: [], acRegistrationName: null, acServerPort: null, acRegistrationToken: null };
 
   const agentCfg = project.agents?.[agentId] || {};
   const command = agentCfg.command || "claude";
@@ -275,6 +275,7 @@ async function buildAgentArgs(projectId, agentId) {
   const args = [];
   let acRegistrationName = null;
   let acServerPort = null;
+  let acRegistrationToken = null;
 
   // Permission bypass flags
   if (agentCfg.auto_approve !== false) {
@@ -311,6 +312,7 @@ async function buildAgentArgs(projectId, agentId) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
       }
       acRegistrationName = registration.name;
+      acRegistrationToken = registration.token;
       writePersistedAgentToken(projectId, agentId, registration.token);
       const mcpConfigPath = writeMcpConfigFile(projectId, agentId, mcpHttpPort, registration.token);
       const flag = agentCfg.mcp_flag || "--mcp-config";
@@ -335,6 +337,7 @@ async function buildAgentArgs(projectId, agentId) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
       }
       acRegistrationName = registration.name;
+      acRegistrationToken = registration.token;
       writePersistedAgentToken(projectId, agentId, registration.token);
       const upstreamUrl = `http://127.0.0.1:${mcpHttpPort}`;
       const proxyUrl = await startMcpProxy(projectId, agentId, upstreamUrl, registration.token);
@@ -344,7 +347,7 @@ async function buildAgentArgs(projectId, agentId) {
     }
   }
 
-  return { args, acRegistrationName, acServerPort };
+  return { args, acRegistrationName, acServerPort, acRegistrationToken };
 }
 
 /**
@@ -413,8 +416,22 @@ async function spawnAgentPty(project, agent) {
       error: null,
       acRegistrationName: built.acRegistrationName,
       acServerPort: built.acServerPort,
+      acRegistrationToken: built.acRegistrationToken,
+      acHeartbeatHandle: null,
     };
     agentSessions.set(key, session);
+
+    // #391 / quadwork#250: keep this agent alive in AgentChattr by
+    // POSTing /api/heartbeat/{name} every 5s. Without it, AC's 60s
+    // crash-detection window deregisters the agent and chat messages
+    // never reach it. Mirrors wrapper.py:_heartbeat (lines 715-748).
+    if (session.acRegistrationName && session.acServerPort && session.acRegistrationToken) {
+      session.acHeartbeatHandle = startHeartbeat(
+        session.acServerPort,
+        session.acRegistrationName,
+        session.acRegistrationToken,
+      );
+    }
 
     term.onExit(({ exitCode }) => {
       const current = agentSessions.get(key);
@@ -427,6 +444,23 @@ async function spawnAgentPty(project, agent) {
           current.ws.close(1000, `exited:${exitCode}`);
         }
         current.ws = null;
+        // #391 / quadwork#250: a crashed PTY must also clear its
+        // heartbeat interval (otherwise it leaks and a later /start
+        // double-registers) and free the AgentChattr slot (otherwise
+        // the agent stays falsely `active` forever and the next
+        // register lands at slot 2). Deregister is best-effort.
+        if (current.acHeartbeatHandle) {
+          stopHeartbeat(current.acHeartbeatHandle);
+          current.acHeartbeatHandle = null;
+        }
+        if (current.acRegistrationName && current.acServerPort) {
+          deregisterAgent(current.acServerPort, current.acRegistrationName).catch(() => {});
+          if (current.projectId && current.agentId) {
+            try { clearPersistedAgentToken(current.projectId, current.agentId); } catch {}
+          }
+          current.acRegistrationName = null;
+          current.acRegistrationToken = null;
+        }
       }
     });
 
@@ -457,6 +491,12 @@ async function stopAgentSession(key) {
   session.ws = null;
   session.state = "stopped";
   session.error = null;
+  // Stop heartbeat before deregister so we don't race a final POST
+  // against AgentChattr removing the name (#391 / quadwork#250).
+  if (session.acHeartbeatHandle) {
+    stopHeartbeat(session.acHeartbeatHandle);
+    session.acHeartbeatHandle = null;
+  }
   // Best-effort deregister from AgentChattr (#241) so the slot frees
   // and the next register lands at slot 1 instead of head-2.
   if (session.acRegistrationName && session.acServerPort) {
@@ -469,6 +509,7 @@ async function stopAgentSession(key) {
       clearPersistedAgentToken(session.projectId, session.agentId);
     }
     session.acRegistrationName = null;
+    session.acRegistrationToken = null;
   }
   // Clean up MCP auth proxy if running
   const [projectId, agentId] = key.split("/");

@@ -98,8 +98,48 @@ async function deregisterAgent(serverPort, name, token) {
   }
 }
 
+/**
+ * Start a per-agent heartbeat that POSTs /api/heartbeat/{name} every 5s
+ * with bearer auth. AgentChattr considers an agent crashed and removes
+ * it after ~60s without a heartbeat, so without this every registered
+ * QuadWork agent silently disappears from the channel one minute after
+ * registration.
+ *
+ * Returns an opaque handle suitable for stopHeartbeat. Transient errors
+ * (network blips, AgentChattr restart) are swallowed — the next tick
+ * just tries again. The 409 "identity wiped" recovery flow is sub-D
+ * (quadwork#253) and is intentionally not handled here.
+ *
+ * Reference: /Users/cho/Projects/agentchattr/wrapper.py lines 715-748.
+ */
+function startHeartbeat(serverPort, name, token, intervalMs = 5000) {
+  const url = `http://127.0.0.1:${serverPort}/api/heartbeat/${encodeURIComponent(name)}`;
+  const headers = { Authorization: `Bearer ${token}` };
+  const tick = async () => {
+    try {
+      await fetchWithTimeout(url, { method: "POST", headers }, DEFAULT_TIMEOUT_MS);
+    } catch {
+      // swallow — next tick will retry
+    }
+  };
+  // Fire one immediately so a fresh agent is held alive without waiting
+  // a full interval, then poll on the timer.
+  tick();
+  const handle = setInterval(tick, intervalMs);
+  return handle;
+}
+
+/**
+ * Stop a heartbeat started by startHeartbeat. Safe to call with null.
+ */
+function stopHeartbeat(handle) {
+  if (handle) clearInterval(handle);
+}
+
 module.exports = {
   waitForAgentChattrReady,
   registerAgent,
   deregisterAgent,
+  startHeartbeat,
+  stopHeartbeat,
 };
