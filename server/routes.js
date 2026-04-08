@@ -185,11 +185,20 @@ router.post("/api/chat", async (req, res) => {
   // hitting QuadWork's /api/chat impersonate an agent identity (t1,
   // t3, …) over the AgentChattr ws path, which the old /api/send
   // flow could not do.
+  // #397 / quadwork#262: pass reply_to through to AgentChattr so the
+  // dashboard's reply button mirrors AC's native threaded-reply
+  // behavior. Only forward when it's a real positive integer — guards
+  // against arbitrary client payloads.
+  const replyToRaw = req.body?.reply_to;
+  const replyTo = (typeof replyToRaw === "number" && Number.isInteger(replyToRaw) && replyToRaw > 0)
+    ? replyToRaw
+    : null;
   const message = {
     text: typeof req.body?.text === "string" ? req.body.text : "",
     channel: req.body?.channel || "general",
     sender: "user",
     attachments: Array.isArray(req.body?.attachments) ? req.body.attachments : [],
+    ...(replyTo !== null ? { reply_to: replyTo } : {}),
   };
   if (!message.text && message.attachments.length === 0) {
     return res.status(400).json({ error: "text or attachments required" });
