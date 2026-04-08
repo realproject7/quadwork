@@ -334,8 +334,14 @@ router.put("/api/loop-guard", async (req, res) => {
       // exposes `paused: true` iff ANY channel currently paused.
       let isPaused = false;
       try {
-        const statusRes = await fetch(`${base}/api/status`, {
-          headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+        // AC's security middleware (app.py:212-224) only accepts
+        // bearer auth for /api/messages, /api/send, and /api/rules/*.
+        // /api/status requires x-session-token header (or ?token=),
+        // so pass that instead — a bearer header silently 403s and
+        // leaves isPaused stuck at false, defeating the gate.
+        const statusUrl = `${base}/api/status`;
+        const statusRes = await fetch(statusUrl, {
+          headers: sessionToken ? { "x-session-token": sessionToken } : {},
           signal: AbortSignal.timeout(5000),
         });
         if (statusRes.ok) {
