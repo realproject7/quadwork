@@ -376,10 +376,12 @@ router.get("/api/project-history", async (req, res) => {
   }
 });
 
-// The global express.json() defaults to ~100kb which would 413 a
-// real history import; bump the limit on this route specifically to
-// match the documented 10MB cap.
-router.post("/api/project-history", express.json({ limit: "10mb" }), async (req, res) => {
+// Global express.json() in server/index.js is bumped to 10mb to
+// cover this route — see the comment there. The route handler still
+// double-checks the byte size of the parsed body below as a defense
+// in depth (e.g. if a future change scopes the global parser back
+// down without updating this comment).
+router.post("/api/project-history", async (req, res) => {
   const projectId = req.query.project || req.body?.project_id;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
 
