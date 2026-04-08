@@ -550,6 +550,43 @@ router.get("/api/github/prs", (req, res) => {
   }
 });
 
+// #411 / quadwork#281: recently closed issues + merged PRs for the
+// "Recently closed" / "Recently merged" sub-sections under each
+// list in GitHubPanel. Limit 5 items each, ordered by closedAt
+// descending so the freshest activity sits at the top.
+router.get("/api/github/closed-issues", (req, res) => {
+  const repo = getRepo(req.query.project || "");
+  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
+  try {
+    const out = execFileSync(
+      "gh",
+      ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", "5"],
+      { encoding: "utf-8", timeout: 15000 },
+    );
+    res.json(JSON.parse(out));
+  } catch (err) {
+    res.status(502).json({ error: "gh issue list (closed) failed", detail: err.message });
+  }
+});
+
+router.get("/api/github/merged-prs", (req, res) => {
+  const repo = getRepo(req.query.project || "");
+  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
+  try {
+    // gh pr list with `--state merged` filters server-side so we
+    // don't have to pull every closed PR and discard the un-merged
+    // ones (closed-without-merge).
+    const out = execFileSync(
+      "gh",
+      ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", "5"],
+      { encoding: "utf-8", timeout: 15000 },
+    );
+    res.json(JSON.parse(out));
+  } catch (err) {
+    res.status(502).json({ error: "gh pr list (merged) failed", detail: err.message });
+  }
+});
+
 // ─── Memory ────────────────────────────────────────────────────────────────
 
 function getProject(projectId) {

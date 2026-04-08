@@ -29,6 +29,15 @@ interface PR {
   url: string;
 }
 
+// #411 / quadwork#281: minimal shape for the recently-closed lists.
+// Both endpoints return the same fields the panel needs, so a single
+// type covers both columns.
+interface ClosedItem {
+  number: number;
+  title: string;
+  url: string;
+}
+
 function StatusDot({ color }: { color: string }) {
   return <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${color}`} />;
 }
@@ -78,6 +87,9 @@ interface GitHubPanelProps {
 export default function GitHubPanel({ projectId }: GitHubPanelProps) {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prs, setPrs] = useState<PR[]>([]);
+  // #411 / quadwork#281: recently closed issues + merged PRs.
+  const [closedIssues, setClosedIssues] = useState<ClosedItem[]>([]);
+  const [mergedPrs, setMergedPrs] = useState<ClosedItem[]>([]);
   const [queueModalOpen, setQueueModalOpen] = useState(false);
 
   // #226: auto-create OVERNIGHT-QUEUE.md on dashboard load if it
@@ -111,6 +123,19 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         return r.json();
       })
       .then((data) => { if (Array.isArray(data)) setPrs(data); })
+      .catch(() => {});
+
+    // #411 / quadwork#281: pull recently closed issues + merged PRs
+    // on the same poll cadence so the "Recently closed" sections
+    // refresh whenever a batch finishes a ticket.
+    fetch(`/api/github/closed-issues?project=${encodeURIComponent(projectId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (Array.isArray(data)) setClosedIssues(data); })
+      .catch(() => {});
+
+    fetch(`/api/github/merged-prs?project=${encodeURIComponent(projectId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (Array.isArray(data)) setMergedPrs(data); })
       .catch(() => {});
   }, [projectId]);
 
@@ -151,6 +176,27 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
                     {issue.assignees[0].login}
                   </span>
                 )}
+              </a>
+            ))}
+            {/* #411 / quadwork#281: Recently closed issues — last 5,
+                muted style with a ✓ to distinguish from open. */}
+            <div className="px-3 pt-2 pb-1 text-[9px] text-text-muted uppercase tracking-wider">
+              Recently closed
+            </div>
+            {closedIssues.length === 0 && (
+              <div className="px-3 py-1 text-[11px] text-text-muted">None yet</div>
+            )}
+            {closedIssues.map((issue) => (
+              <a
+                key={`closed-${issue.number}`}
+                href={issue.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-3 py-1 font-mono opacity-60 hover:opacity-100 hover:bg-[#1a1a1a] transition-all cursor-pointer border-b border-border/30"
+              >
+                <span className="text-[11px] text-text-muted shrink-0">✓</span>
+                <span className="text-[11px] text-text-muted w-8 shrink-0">#{issue.number}</span>
+                <span className="text-[11px] text-text-muted truncate flex-1 min-w-0">{issue.title}</span>
               </a>
             ))}
           </div>
@@ -217,6 +263,27 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
                 </a>
               );
             })}
+            {/* #411 / quadwork#281: Recently merged PRs — last 5,
+                muted style with a ✓ to distinguish from open. */}
+            <div className="px-3 pt-2 pb-1 text-[9px] text-text-muted uppercase tracking-wider">
+              Recently merged
+            </div>
+            {mergedPrs.length === 0 && (
+              <div className="px-3 py-1 text-[11px] text-text-muted">None yet</div>
+            )}
+            {mergedPrs.map((pr) => (
+              <a
+                key={`merged-${pr.number}`}
+                href={pr.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-3 py-1 font-mono opacity-60 hover:opacity-100 hover:bg-[#1a1a1a] transition-all cursor-pointer border-b border-border/30"
+              >
+                <span className="text-[11px] text-text-muted shrink-0">✓</span>
+                <span className="text-[11px] text-text-muted w-8 shrink-0">#{pr.number}</span>
+                <span className="text-[11px] text-text-muted truncate flex-1 min-w-0">{pr.title}</span>
+              </a>
+            ))}
           </div>
         </div>
       </div>
