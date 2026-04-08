@@ -664,6 +664,55 @@ app.get("/api/agents", (_req, res) => {
   res.json(agents);
 });
 
+// #424 / quadwork#304: best-effort auto-snapshot of chat history
+// before any AgentChattr restart. Defense-in-depth against
+// destructive ops like /clear that rewrite AC's JSONL log in place
+// — per #303 the log itself IS persistent across normal restarts,
+// so the snapshot's job is to give the operator a point-in-time
+// rollback if the log gets clobbered, not to prevent history loss
+// on ordinary lifecycle events.
+//
+// Snapshot contents = the same envelope GET /api/project-history
+// returns, so an operator (or a future "restore" button) can feed
+// the file straight into POST /api/project-history for replay.
+const HISTORY_SNAPSHOT_LIMIT = 5;
+
+async function snapshotProjectHistory(projectId) {
+  try {
+    const snapDir = path.join(require("os").homedir(), ".quadwork", projectId, "history-snapshots");
+    if (!fs.existsSync(snapDir)) fs.mkdirSync(snapDir, { recursive: true });
+    const res = await fetch(`http://127.0.0.1:${PORT}/api/project-history?project=${encodeURIComponent(projectId)}`, {
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) {
+      console.warn(`[snapshot] ${projectId} history fetch returned ${res.status}; skipping snapshot`);
+      return false;
+    }
+    const text = await res.text();
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const outPath = path.join(snapDir, `${stamp}.json`);
+    fs.writeFileSync(outPath, text);
+    console.log(`[snapshot] ${projectId} → ${outPath}`);
+    // Prune to the newest HISTORY_SNAPSHOT_LIMIT files so the
+    // directory can't grow unbounded across weeks of restarts.
+    try {
+      const entries = fs.readdirSync(snapDir)
+        .filter((f) => f.endsWith(".json"))
+        .map((f) => ({ f, t: fs.statSync(path.join(snapDir, f)).mtimeMs }))
+        .sort((a, b) => b.t - a.t);
+      for (const old of entries.slice(HISTORY_SNAPSHOT_LIMIT)) {
+        try { fs.unlinkSync(path.join(snapDir, old.f)); } catch {}
+      }
+    } catch {
+      // non-fatal — stale snapshots just linger
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[snapshot] ${projectId} snapshot failed: ${err.message || err}`);
+    return false;
+  }
+}
+
 // Per-project AgentChattr lifecycle: /api/agentchattr/:project/:action
 // Backward compat: /api/agentchattr/:action uses first project
 async function handleAgentChattr(req, res) {
@@ -785,6 +834,10 @@ async function handleAgentChattr(req, res) {
     setProc({ process: null, state: "stopped", error: null });
     res.json({ ok: true, state: "stopped" });
   } else if (action === "restart") {
+    // #424 / quadwork#304: snapshot history before killing the
+    // process. Best-effort and non-blocking-on-failure so a flaky
+    // snapshot doesn't leave the operator unable to restart AC.
+    await snapshotProjectHistory(projectId).catch(() => {});
     const proc = getProc();
     if (proc.process) {
       try { proc.process.kill("SIGTERM"); } catch {}
@@ -814,7 +867,10 @@ async function handleAgentChattr(req, res) {
     try {
       const { execSync } = require("child_process");
 
-      // Stop running process before pulling
+      // Stop running process before pulling. Snapshot first so a
+      // botched git pull can still be rolled back from disk.
+      // #424 / quadwork#304: best-effort.
+      await snapshotProjectHistory(projectId).catch(() => {});
       const proc = getProc();
       const wasRunning = proc.process && proc.state === "running";
       if (wasRunning) {
