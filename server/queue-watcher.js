@@ -91,7 +91,18 @@ function startQueueWatcher(dataDir, agentName, ptyTerm) {
       // Claude Code (shows "[Pasted text +N]") and can break injection
       // of long prompts. Mirrors wrapper.py:532.
       const flat = prompt.replace(/\n/g, " ");
-      ptyTerm.write(flat + "\r");
+      // Inject text and Enter as SEPARATE writes with a delay between.
+      // Codex's TUI does not submit when text + "\r" arrive in one chunk —
+      // it needs the text to render, then a separate Enter keystroke.
+      // Claude Code accepts either form. Mirrors wrapper_unix.py inject():
+      // tmux send-keys -l <text> ; sleep ; tmux send-keys Enter.
+      // Delay scales with prompt length so longer prompts get more time
+      // to render before submit.
+      ptyTerm.write(flat);
+      const submitDelayMs = Math.max(300, flat.length);
+      setTimeout(() => {
+        try { ptyTerm.write("\r"); } catch { /* swallow */ }
+      }, submitDelayMs);
     } catch {
       // Swallow — next tick will retry. Logging here would spam the
       // server output once per second on a permission error.
