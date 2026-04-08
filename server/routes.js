@@ -760,6 +760,261 @@ router.get("/api/github/merged-prs", (req, res) => {
   }
 });
 
+// #413 / quadwork#282: Current Batch Progress panel.
+//
+// Reads ~/.quadwork/{project}/OVERNIGHT-QUEUE.md, parses the
+// `## Active Batch` section for `Batch: N` + issue numbers, and
+// resolves each issue against GitHub (state + linked PR + review
+// counts) to compute a progress state. The 5 progress buckets are
+// deterministic from issue/PR state — no agent inference.
+//
+// Progress mapping (from upstream issue):
+//   queued    0%   issue exists, no linked PR
+//   in_review 20%  PR open, 0 approvals
+//   approved1 50%  PR open, 1 approval
+//   ready     80%  PR open, 2+ approvals
+//   merged   100%  PR merged AND issue closed
+//
+// Cached for 10s per project to avoid hammering gh on every poll.
+
+const _batchProgressCache = new Map(); // projectId -> { ts, data }
+const BATCH_PROGRESS_TTL_MS = 10000;
+
+function parseActiveBatch(queueText) {
+  if (typeof queueText !== "string" || !queueText) {
+    return { batchNumber: null, issueNumbers: [] };
+  }
+  // Pull just the Active Batch section so a stray `#123` in Backlog
+  // or Done doesn't leak into the active list.
+  const m = queueText.match(/##\s+Active Batch[\s\S]*?(?=\n##\s|$)/i);
+  if (!m) return { batchNumber: null, issueNumbers: [] };
+  const section = m[0];
+  const batchMatch = section.match(/\*\*Batch:\*\*\s*(\d+)/i) || section.match(/Batch:\s*(\d+)/i);
+  const batchNumber = batchMatch ? parseInt(batchMatch[1], 10) : null;
+  // Only collect issue numbers from lines that look like list-item
+  // entries — i.e. lines whose first content token is either `#N`
+  // or `[#N]` after an optional list marker. This rejects prose
+  // like "Tracking umbrella: #293", "next after #294 merged", and
+  // similar dependency / commentary references that t2a flagged on
+  // realproject7/dropcast's queue.
+  //
+  // Accepted line shapes:
+  //   - #295 sub-A heartbeat
+  //   * #295 sub-A heartbeat
+  //   1. #295 sub-A heartbeat
+  //   #295 sub-A heartbeat
+  //   - [#295] sub-A heartbeat
+  //   [#295] sub-A heartbeat
+  //
+  // Rejected:
+  //   Tracking umbrella: #293
+  //   Assigned next after #294 merged.
+  //   See #295 for context.
+  const ITEM_LINE_RE = /^\s*(?:[-*]\s+|\d+\.\s+)?\[?#(\d{1,6})\]?\b/;
+  const seen = new Set();
+  const issueNumbers = [];
+  for (const line of section.split("\n")) {
+    const lineMatch = line.match(ITEM_LINE_RE);
+    if (!lineMatch) continue;
+    const n = parseInt(lineMatch[1], 10);
+    if (!seen.has(n)) {
+      seen.add(n);
+      issueNumbers.push(n);
+    }
+  }
+  return { batchNumber, issueNumbers };
+}
+
+function ghJsonExec(args) {
+  try {
+    const out = execFileSync("gh", args, { encoding: "utf-8", timeout: 10000 });
+    return JSON.parse(out);
+  } catch {
+    return null;
+  }
+}
+
+function progressForItem(repo, issueNumber) {
+  // Pull issue state + linked PRs in one call. closedByPullRequestsReferences
+  // is gh's serializer for the GraphQL `closedByPullRequestsReferences`
+  // edge — only present when a PR with `Fixes #N` / `Closes #N`
+  // (or the link UI) targets the issue.
+  const issue = ghJsonExec([
+    "issue",
+    "view",
+    String(issueNumber),
+    "-R",
+    repo,
+    "--json",
+    "number,title,state,url,closedByPullRequestsReferences",
+  ]);
+  if (!issue) {
+    return {
+      issue_number: issueNumber,
+      title: `#${issueNumber} (not found)`,
+      url: null,
+      status: "unknown",
+      progress: 0,
+      label: "not found",
+    };
+  }
+  const linked = Array.isArray(issue.closedByPullRequestsReferences)
+    ? issue.closedByPullRequestsReferences
+    : [];
+  // Pick the freshest linked PR (highest number) if there are multiple.
+  const pr = linked.length > 0
+    ? linked.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0]
+    : null;
+  // No linked PR yet — queued.
+  if (!pr) {
+    return {
+      issue_number: issue.number,
+      title: issue.title,
+      url: issue.url,
+      status: "queued",
+      progress: 0,
+      label: "Issue · queued",
+    };
+  }
+  // Re-fetch the PR to get reviewDecision + reviews + state, since
+  // the issue's closedByPullRequestsReferences edge only carries
+  // number/state/url.
+  const prData = ghJsonExec([
+    "pr",
+    "view",
+    String(pr.number),
+    "-R",
+    repo,
+    "--json",
+    "number,state,url,reviewDecision,reviews",
+  ]);
+  if (!prData) {
+    return {
+      issue_number: issue.number,
+      title: issue.title,
+      url: pr.url || issue.url,
+      pr_number: pr.number,
+      status: "in_review",
+      progress: 20,
+      label: `PR #${pr.number} · waiting on review`,
+    };
+  }
+  const merged = prData.state === "MERGED" && issue.state === "CLOSED";
+  if (merged) {
+    return {
+      issue_number: issue.number,
+      title: issue.title,
+      url: prData.url || issue.url,
+      pr_number: prData.number,
+      status: "merged",
+      progress: 100,
+      label: "Merged ✓",
+    };
+  }
+  // Count distinct APPROVED reviews per author so a stale APPROVED
+  // followed by REQUEST_CHANGES doesn't double-count. Sort by
+  // submittedAt ascending first so the Map's "last write wins"
+  // genuinely lands on the freshest review per author — gh's
+  // current ordering is chronological in practice but undocumented,
+  // so the explicit sort keeps us safe if that ever changes.
+  const reviews = Array.isArray(prData.reviews) ? prData.reviews.slice() : [];
+  reviews.sort((a, b) => {
+    const ta = (a && a.submittedAt) ? Date.parse(a.submittedAt) : 0;
+    const tb = (b && b.submittedAt) ? Date.parse(b.submittedAt) : 0;
+    return ta - tb;
+  });
+  const latestByAuthor = new Map();
+  for (const r of reviews) {
+    const author = (r && r.author && r.author.login) || "";
+    if (!author) continue;
+    latestByAuthor.set(author, r.state);
+  }
+  let approvalCount = 0;
+  for (const state of latestByAuthor.values()) {
+    if (state === "APPROVED") approvalCount++;
+  }
+  if (approvalCount >= 2) {
+    return {
+      issue_number: issue.number,
+      title: issue.title,
+      url: prData.url || issue.url,
+      pr_number: prData.number,
+      status: "ready",
+      progress: 80,
+      label: `PR #${prData.number} · 2 approvals · ready`,
+    };
+  }
+  if (approvalCount === 1) {
+    return {
+      issue_number: issue.number,
+      title: issue.title,
+      url: prData.url || issue.url,
+      pr_number: prData.number,
+      status: "approved1",
+      progress: 50,
+      label: `PR #${prData.number} · 1 approval`,
+    };
+  }
+  return {
+    issue_number: issue.number,
+    title: issue.title,
+    url: prData.url || issue.url,
+    pr_number: prData.number,
+    status: "in_review",
+    progress: 20,
+    label: `PR #${prData.number} · waiting on review`,
+  };
+}
+
+function summarizeItems(items) {
+  let merged = 0, ready = 0, approved1 = 0, inReview = 0, queued = 0;
+  for (const it of items) {
+    if (it.status === "merged") merged++;
+    else if (it.status === "ready") ready++;
+    else if (it.status === "approved1") approved1++;
+    else if (it.status === "in_review") inReview++;
+    else if (it.status === "queued") queued++;
+  }
+  const parts = [`${merged}/${items.length} merged`];
+  if (ready > 0) parts.push(`${ready} ready to merge`);
+  if (approved1 > 0) parts.push(`${approved1} needs 2nd approval`);
+  if (inReview > 0) parts.push(`${inReview} in review`);
+  if (queued > 0) parts.push(`${queued} queued`);
+  return parts.join(" · ");
+}
+
+router.get("/api/batch-progress", (req, res) => {
+  const projectId = req.query.project;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+
+  const cached = _batchProgressCache.get(projectId);
+  if (cached && Date.now() - cached.ts < BATCH_PROGRESS_TTL_MS) {
+    return res.json(cached.data);
+  }
+
+  const repo = getRepo(projectId);
+  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
+
+  const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
+  let queueText = "";
+  try { queueText = fs.readFileSync(queuePath, "utf-8"); }
+  catch { /* missing file → empty active batch */ }
+
+  const { batchNumber, issueNumbers } = parseActiveBatch(queueText);
+  if (issueNumbers.length === 0) {
+    const data = { batch_number: batchNumber, items: [], summary: "", complete: false };
+    _batchProgressCache.set(projectId, { ts: Date.now(), data });
+    return res.json(data);
+  }
+
+  const items = issueNumbers.map((n) => progressForItem(repo, n));
+  const summary = summarizeItems(items);
+  const complete = items.length > 0 && items.every((it) => it.status === "merged");
+  const data = { batch_number: batchNumber, items, summary, complete };
+  _batchProgressCache.set(projectId, { ts: Date.now(), data });
+  res.json(data);
+});
+
 // ─── Memory ────────────────────────────────────────────────────────────────
 
 function getProject(projectId) {

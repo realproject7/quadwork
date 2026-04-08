@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import OvernightQueueModal from "./OvernightQueueModal";
+import BatchProgressPanel from "./BatchProgressPanel";
 
 interface Issue {
   number: number;
@@ -286,6 +287,13 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             ))}
           </div>
         </div>
+      </div>
+
+      {/* #413 / quadwork#282: Current Batch Progress section sits
+          between the issues/PRs lists and the OVERNIGHT-QUEUE.md
+          row. Reads /api/batch-progress on its own 30s cadence. */}
+      <div className="shrink-0">
+        <BatchProgressPanel projectId={projectId} />
       </div>
 
       {/* #226: compact OVERNIGHT-QUEUE.md row at the bottom */}
