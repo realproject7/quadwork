@@ -1086,7 +1086,12 @@ function stopTrigger(project) {
 
 app.post("/api/triggers/:project/start", (req, res) => {
   const { project } = req.params;
-  const { interval, duration, message, sendImmediately } = req.body || {};
+  // #418 / quadwork#306: sendImmediately was an always-true
+  // "Send Message and Start Trigger" flag from #210; operators
+  // asked for a pure scheduler ("Start Trigger" — wait for the
+  // first interval). The field is ignored here; the send-now
+  // endpoint below still exists for the explicit one-shot path.
+  const { interval, duration, message } = req.body || {};
   const ms = (interval || 30) * 60 * 1000;
   const durationMs = duration ? duration * 60 * 1000 : 0; // duration in minutes, 0 = indefinite
 
@@ -1113,16 +1118,12 @@ app.post("/api/triggers/:project/start", (req, res) => {
     if (existing.durationTimer) clearTimeout(existing.durationTimer);
   }
 
-  // #210: the Scheduled Trigger widget's "Send Message and Start
-  // Trigger" button expects an immediate send, not the first fire
-  // one interval in the future. setInterval won't do that on its
-  // own, so trigger a one-shot send when sendImmediately is true.
-  if (sendImmediately) {
-    // Don't await — keep the response fast. sendTriggerMessage logs
-    // its own errors and updates lastError on the trigger info.
-    sendTriggerMessage(project).catch(() => {});
-  }
-
+  // #418 / quadwork#306: no immediate fire — the first send happens
+  // at T + interval via the setInterval below. Operators set the
+  // trigger up in advance of going afk and don't want it interrupting
+  // whatever agents are currently mid-task. The explicit "send now"
+  // path still lives at /api/triggers/:project/send-now for the
+  // rare case an operator actually wants to kick things off.
   const timer = setInterval(() => sendTriggerMessage(project), ms);
   const expiresAt = durationMs > 0 ? Date.now() + durationMs : null;
 
