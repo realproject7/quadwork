@@ -15,6 +15,7 @@
 <p>
   <a href="https://www.npmjs.com/package/quadwork"><img src="https://img.shields.io/npm/v/quadwork" alt="npm version" /></a>
   <a href="https://www.npmjs.com/package/quadwork"><img src="https://img.shields.io/npm/dm/quadwork" alt="npm downloads" /></a>
+  <a href="https://github.com/realproject7/quadwork/releases/latest"><img src="https://img.shields.io/github/v/release/realproject7/quadwork" alt="latest release" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platform" />
   <img src="https://img.shields.io/badge/runs-locally-00d4aa" alt="runs locally" />
   <img src="https://img.shields.io/badge/agents-4-orange" alt="4 agents" />
