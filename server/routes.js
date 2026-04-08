@@ -68,7 +68,7 @@ router.put("/api/config", (req, res) => {
 
 // ─── Chat (AgentChattr proxy) ──────────────────────────────────────────────
 
-const { resolveProjectChattr } = require("./config");
+const { resolveProjectChattr, sanitizeOperatorName } = require("./config");
 const { installAgentChattr, findAgentChattr } = require("./install-agentchattr");
 
 /**
@@ -320,10 +320,24 @@ router.post("/api/chat", async (req, res) => {
 
   // #230: ignore any client-supplied sender. /api/chat is the
   // dashboard's send path, so the message must always be attributed
-  // to "user". Forwarding `req.body.sender` would let any caller
-  // hitting QuadWork's /api/chat impersonate an agent identity (t1,
-  // t3, …) over the AgentChattr ws path, which the old /api/send
-  // flow could not do.
+  // to a server-controlled value. Forwarding `req.body.sender` would
+  // let any caller hitting QuadWork's /api/chat impersonate an agent
+  // identity (t1, t3, …) over the AgentChattr ws path, which the
+  // old /api/send flow could not do.
+  //
+  // #405 / quadwork#278: read the operator's display name from the
+  // server-side config file rather than hardcoding "user". The
+  // sanitizer matches AC's registry name validator (1–32 alnum +
+  // dash + underscore) so even a hand-edited config can't post a
+  // value AC will reject (or impersonate an agent), and an empty /
+  // missing value falls back to "user".
+  let operatorSender = "user";
+  try {
+    const cfg = readConfigFile();
+    operatorSender = sanitizeOperatorName(cfg.operator_name);
+  } catch {
+    // non-fatal — fall through to "user"
+  }
   // #397 / quadwork#262: pass reply_to through to AgentChattr so the
   // dashboard's reply button mirrors AC's native threaded-reply
   // behavior. Only forward when it's a real positive integer — guards
@@ -335,7 +349,7 @@ router.post("/api/chat", async (req, res) => {
   const message = {
     text: typeof req.body?.text === "string" ? req.body.text : "",
     channel: req.body?.channel || "general",
-    sender: "user",
+    sender: operatorSender,
     attachments: Array.isArray(req.body?.attachments) ? req.body.attachments : [],
     ...(replyTo !== null ? { reply_to: replyTo } : {}),
   };

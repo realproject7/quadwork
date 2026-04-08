@@ -34,6 +34,9 @@ interface Config {
   agentchattr_token: string;
   default_backend?: string;
   reviewer_github_user?: string;
+  // #405 / quadwork#278: display name used as the chat sender for
+  // dashboard-originated messages. Defaults to "user" server-side.
+  operator_name?: string;
   projects: ProjectConfig[];
 }
 
@@ -118,6 +121,7 @@ export default function SettingsPage() {
         agentchattr_token: data.agentchattr_token || "",
         default_backend: data.default_backend || "claude",
         reviewer_github_user: data.reviewer_github_user || "",
+        operator_name: data.operator_name || "user",
         projects: data.projects || [],
       }))
       .catch(() => {});
@@ -369,6 +373,25 @@ export default function SettingsPage() {
           {saving ? "Saving..." : saved ? "Saved" : "Save"}
         </button>
       </div>
+
+      {/* #405 / quadwork#278: operator identity — name shown next to
+          dashboard chat messages. Server-side validated to AC's
+          registry name rules (1–32 alnum + dash + underscore). */}
+      <section className="mb-8">
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Operator Identity</h2>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <Input
+            label="Your name in chat"
+            value={config.operator_name || "user"}
+            onChange={(v) => updateGlobal("operator_name" as keyof Config, v)}
+            placeholder="user"
+          />
+        </div>
+        <p className="mt-2 text-[10px] text-text-muted leading-snug">
+          Shows next to your messages in the AgentChattr chat panel. Defaults to <code>user</code> if blank.
+          Allowed: 1–32 letters, digits, dash, underscore (matches AgentChattr&apos;s name rules; other characters are stripped server-side).
+        </p>
+      </section>
 
       {/* Global Settings (#212: full-width grid, every section visible) */}
       <section className="mb-8">

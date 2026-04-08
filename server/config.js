@@ -8,8 +8,25 @@ const DEFAULT_CONFIG = {
   port: 8400,
   agentchattr_url: "http://127.0.0.1:8300",
   agentchattr_dir: path.join(os.homedir(), ".quadwork", "agentchattr"),
+  // #405 / quadwork#278: display name used as the chat sender for
+  // messages posted from the dashboard. AC's registry name validator
+  // accepts 1–32 alphanumeric + dash + underscore characters; mirror
+  // that here so the sanitized value matches what AC will accept.
+  operator_name: "user",
   projects: [],
 };
+
+// Sanitize an operator-supplied display name to match AC's name
+// validator (registry.py: 1–32 alnum + dash + underscore). Empty or
+// non-string input falls back to "user". Used both when reading the
+// config (in case the file was hand-edited) and on /api/chat sends
+// (so even a stale on-disk value can't impersonate an agent).
+function sanitizeOperatorName(value) {
+  if (typeof value !== "string") return "user";
+  const cleaned = value.trim().replace(/[^A-Za-z0-9_-]/g, "");
+  if (!cleaned) return "user";
+  return cleaned.slice(0, 32);
+}
 
 // Migration: rename old agent keys to new ones
 const AGENT_KEY_MAP = { t1: "head", t2a: "reviewer1", t2b: "reviewer2", t3: "dev" };
@@ -160,4 +177,4 @@ async function syncChattrToken(projectId) {
   } catch {}
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH };
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, sanitizeOperatorName, CONFIG_PATH };

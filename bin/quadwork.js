@@ -1172,6 +1172,14 @@ function writeQuadWorkConfig(setup) {
   header("Writing QuadWork Config");
 
   const config = readConfig();
+  // #405 / quadwork#278: ensure the global config has an
+  // operator_name slot. /api/chat reads this on every send and
+  // sanitizes empty/missing values back to "user", so leaving it
+  // unset is safe — but writing the default explicitly makes the
+  // setting discoverable in the on-disk file.
+  if (typeof config.operator_name !== "string") {
+    config.operator_name = "user";
+  }
 
   const project = {
     id: setup.projectName,
