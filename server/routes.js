@@ -987,6 +987,62 @@ router.get("/api/github/merged-prs", (req, res) => {
 // Cached for 10s per project to avoid hammering gh on every poll.
 
 const _batchProgressCache = new Map(); // projectId -> { ts, data }
+
+// #429 / quadwork#316: persistent batch snapshot on disk so the
+// Batch Progress panel keeps showing merged items after Head moves
+// them from Active Batch to Done. The in-memory `_batchProgressCache`
+// above is a 10s TTL cache of the rendered rows; this new cache is
+// the *set of issue numbers* we currently consider "the active
+// batch", and it survives restarts + lives across polls.
+function batchSnapshotPath(projectId) {
+  return path.join(CONFIG_DIR, projectId, "batch-progress-cache.json");
+}
+function readBatchSnapshot(projectId) {
+  try {
+    return JSON.parse(fs.readFileSync(batchSnapshotPath(projectId), "utf-8"));
+  } catch {
+    return null;
+  }
+}
+function writeBatchSnapshot(projectId, snapshot) {
+  try {
+    const p = batchSnapshotPath(projectId);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(snapshot));
+  } catch {
+    // Non-fatal — panel still works from the live parse.
+  }
+}
+
+// Decide which batch to render, combining the live parse of
+// OVERNIGHT-QUEUE.md with the persistent snapshot. The snapshot is
+// replaced whenever a new batch starts (explicit Batch: N bump OR
+// the live Active Batch contains items the snapshot doesn't); in
+// all other cases the snapshot wins, so items Head moved to Done
+// stay visible until the operator starts the next batch.
+function resolveDisplayedBatch(queueText, projectId) {
+  const current = parseActiveBatch(queueText);
+  const snapshot = readBatchSnapshot(projectId);
+  const hasExplicitBump =
+    current.batchNumber !== null &&
+    (!snapshot || snapshot.batchNumber === null || current.batchNumber > snapshot.batchNumber);
+  const hasNewItems =
+    current.issueNumbers.length > 0 &&
+    (!snapshot || current.issueNumbers.some((n) => !snapshot.issueNumbers.includes(n)));
+  let next;
+  if (hasExplicitBump || hasNewItems) {
+    next = { batchNumber: current.batchNumber, issueNumbers: current.issueNumbers.slice() };
+  } else if (snapshot && Array.isArray(snapshot.issueNumbers) && snapshot.issueNumbers.length > 0) {
+    next = {
+      batchNumber: snapshot.batchNumber ?? null,
+      issueNumbers: snapshot.issueNumbers.slice(),
+    };
+  } else {
+    next = { batchNumber: current.batchNumber, issueNumbers: current.issueNumbers.slice() };
+  }
+  if (next.issueNumbers.length > 0) writeBatchSnapshot(projectId, next);
+  return next;
+}
 const BATCH_PROGRESS_TTL_MS = 10000;
 
 function parseActiveBatch(queueText) {
@@ -1223,7 +1279,10 @@ router.get("/api/batch-progress", async (req, res) => {
   try { queueText = fs.readFileSync(queuePath, "utf-8"); }
   catch { /* missing file → empty active batch */ }
 
-  const { batchNumber, issueNumbers } = parseActiveBatch(queueText);
+  // #429 / quadwork#316: resolve the displayed batch through the
+  // snapshot-aware helper so merged items stay visible after Head
+  // moves them from Active Batch to Done, until a new batch starts.
+  const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId);
   if (issueNumbers.length === 0) {
     const data = { batch_number: batchNumber, items: [], summary: "", complete: false };
     _batchProgressCache.set(projectId, { ts: Date.now(), data });
