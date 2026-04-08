@@ -78,6 +78,11 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   const [trigger, setTrigger] = useState<TriggerInfo | null>(null);
   const [message, setMessage] = useState<string>("");
   const [intervalMin, setIntervalMin] = useState<number>(15);
+  // #419 / quadwork#308: draft-string mirror of intervalMin so the
+  // operator can clear the field and retype without the onChange
+  // parseInt()-|| default clobbering the buffer mid-keystroke.
+  // Same pattern as durationHoursDraft below.
+  const [intervalDraft, setIntervalDraft] = useState<string>("15");
   const [durationMin, setDurationMin] = useState<number>(180);
   // #406 / quadwork#269: keep a separate raw string draft for the
   // hours input so the operator can type intermediate states like
@@ -126,9 +131,12 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
         }
         if (!intervalDirtyRef.current) {
           if (t.enabled && t.interval) {
-            setIntervalMin(Math.max(1, Math.round(t.interval / 60000)));
+            const mins = Math.max(1, Math.round(t.interval / 60000));
+            setIntervalMin(mins);
+            setIntervalDraft(String(mins));
           } else if (typeof t.intervalMin === "number" && t.intervalMin > 0) {
             setIntervalMin(t.intervalMin);
+            setIntervalDraft(String(t.intervalMin));
           }
         }
         if (!durationDirtyRef.current && typeof t.durationMin === "number" && t.durationMin >= 0) {
@@ -186,11 +194,22 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       setDurationMin(resolvedDurationMin);
       setDurationHoursDraft(minutesToHoursStr(resolvedDurationMin));
     }
+    // #419 / quadwork#308: same draft-commit treatment for the
+    // interval input. If the operator clears the field and hits
+    // Start without blurring, we must still POST a valid number.
+    const intervalRaw = parseInt(intervalDraft, 10);
+    const resolvedIntervalMin = Number.isFinite(intervalRaw)
+      ? Math.max(1, Math.min(1440, intervalRaw))
+      : 15;
+    if (resolvedIntervalMin !== intervalMin) {
+      setIntervalMin(resolvedIntervalMin);
+      setIntervalDraft(String(resolvedIntervalMin));
+    }
     try {
       const r = await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ interval: intervalMin, duration: resolvedDurationMin, message }),
+        body: JSON.stringify({ interval: resolvedIntervalMin, duration: resolvedDurationMin, message }),
       });
       if (!r.ok) throw new Error(`${r.status}`);
       // After the backend persists the new values, treat them as the
@@ -250,8 +269,14 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
             <span className="text-text-muted">Send every</span>
             <input
               type="number"
-              value={intervalMin}
-              onChange={(e) => { setIntervalMin(parseInt(e.target.value, 10) || 15); setIntervalDirty(true); }}
+              value={intervalDraft}
+              onChange={(e) => { setIntervalDraft(e.target.value); setIntervalDirty(true); }}
+              onBlur={() => {
+                const raw = parseInt(intervalDraft, 10);
+                const clamped = Number.isFinite(raw) ? Math.max(1, Math.min(1440, raw)) : 15;
+                setIntervalMin(clamped);
+                setIntervalDraft(String(clamped));
+              }}
               min={1}
               max={1440}
               className="w-12 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"

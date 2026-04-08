@@ -165,6 +165,17 @@ export default function SetupWizard() {
   const [launchStatus, setLaunchStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [customPorts, setCustomPorts] = useState({ chattr: 0, mcpHttp: 0, mcpSse: 0 });
+  // #419 / quadwork#308: draft-string mirror of customPorts so each
+  // field can be cleared and retyped without the onChange
+  // `parseInt || 0` clobbering the buffer. Committed on blur.
+  const [customPortsDraft, setCustomPortsDraft] = useState({ chattr: "", mcpHttp: "", mcpSse: "" });
+  const commitPortDraft = (key: "chattr" | "mcpHttp" | "mcpSse") => {
+    const raw = customPortsDraft[key];
+    const n = parseInt(raw, 10);
+    const clamped = Number.isFinite(n) && n > 0 && n <= 65535 ? n : 0;
+    setCustomPorts((prev) => ({ ...prev, [key]: clamped }));
+    setCustomPortsDraft((prev) => ({ ...prev, [key]: clamped ? String(clamped) : "" }));
+  };
   const [autoDetectedPorts, setAutoDetectedPorts] = useState({ chattr: 0, mcpHttp: 0, mcpSse: 0 });
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean } | null>(null);
 
@@ -402,7 +413,14 @@ export default function SetupWizard() {
           mcpSse: mcpData.ports?.[1] || 8201,
         };
         setAutoDetectedPorts(detected);
-        if (!customPorts.chattr) setCustomPorts(detected);
+        if (!customPorts.chattr) {
+          setCustomPorts(detected);
+          setCustomPortsDraft({
+            chattr: detected.chattr ? String(detected.chattr) : "",
+            mcpHttp: detected.mcpHttp ? String(detected.mcpHttp) : "",
+            mcpSse: detected.mcpSse ? String(detected.mcpSse) : "",
+          });
+        }
       } catch {}
     })();
   }, [currentStep, steps]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -847,8 +865,9 @@ export default function SetupWizard() {
                           <label className="text-[10px] text-text-muted uppercase tracking-wider">AgentChattr port</label>
                           <input
                             type="number"
-                            value={customPorts.chattr || ""}
-                            onChange={(e) => setCustomPorts({ ...customPorts, chattr: parseInt(e.target.value, 10) || 0 })}
+                            value={customPortsDraft.chattr}
+                            onChange={(e) => setCustomPortsDraft({ ...customPortsDraft, chattr: e.target.value })}
+                            onBlur={() => commitPortDraft("chattr")}
                             placeholder={String(autoDetectedPorts.chattr || 8300)}
                             className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
                           />
@@ -860,8 +879,9 @@ export default function SetupWizard() {
                           <label className="text-[10px] text-text-muted uppercase tracking-wider">MCP HTTP port</label>
                           <input
                             type="number"
-                            value={customPorts.mcpHttp || ""}
-                            onChange={(e) => setCustomPorts({ ...customPorts, mcpHttp: parseInt(e.target.value, 10) || 0 })}
+                            value={customPortsDraft.mcpHttp}
+                            onChange={(e) => setCustomPortsDraft({ ...customPortsDraft, mcpHttp: e.target.value })}
+                            onBlur={() => commitPortDraft("mcpHttp")}
                             placeholder={String(autoDetectedPorts.mcpHttp || 8200)}
                             className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
                           />
@@ -873,8 +893,9 @@ export default function SetupWizard() {
                           <label className="text-[10px] text-text-muted uppercase tracking-wider">MCP SSE port</label>
                           <input
                             type="number"
-                            value={customPorts.mcpSse || ""}
-                            onChange={(e) => setCustomPorts({ ...customPorts, mcpSse: parseInt(e.target.value, 10) || 0 })}
+                            value={customPortsDraft.mcpSse}
+                            onChange={(e) => setCustomPortsDraft({ ...customPortsDraft, mcpSse: e.target.value })}
+                            onBlur={() => commitPortDraft("mcpSse")}
                             placeholder={String(autoDetectedPorts.mcpSse || 8201)}
                             className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
                           />

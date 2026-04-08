@@ -53,10 +53,11 @@ const BACKENDS: { value: string; label: string }[] = [
 ];
 const MODELS = ["opus", "sonnet", "haiku"];
 
-function Input({ label, value, onChange, type = "text", placeholder }: {
+function Input({ label, value, onChange, onBlur, type = "text", placeholder }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
+  onBlur?: () => void;
   type?: string;
   placeholder?: string;
 }) {
@@ -67,6 +68,7 @@ function Input({ label, value, onChange, type = "text", placeholder }: {
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
         placeholder={placeholder}
         className="bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
       />
@@ -108,6 +110,11 @@ export default function SettingsPage() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [autoAdded, setAutoAdded] = useState(false);
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean } | null>(null);
+  // #419 / quadwork#308: draft-string mirror for the dashboard port
+  // field so the operator can clear it and retype without
+  // `parseInt("") || 8400` clobbering the buffer mid-keystroke.
+  // Kept in sync with config.port on load + blur commit.
+  const [portDraft, setPortDraft] = useState<string>("8400");
 
   const load = useCallback(() => {
     fetch("/api/config")
@@ -115,7 +122,9 @@ export default function SettingsPage() {
         if (!r.ok) throw new Error(`${r.status}`);
         return r.json();
       })
-      .then((data) => setConfig({
+      .then((data) => {
+        setPortDraft(String(data.port || 8400));
+        return setConfig({
         port: data.port || 8400,
         agentchattr_url: data.agentchattr_url || "http://127.0.0.1:8300",
         agentchattr_token: data.agentchattr_token || "",
@@ -123,7 +132,8 @@ export default function SettingsPage() {
         reviewer_github_user: data.reviewer_github_user || "",
         operator_name: data.operator_name || "user",
         projects: data.projects || [],
-      }))
+        });
+      })
       .catch(() => {});
   }, []);
 
@@ -400,8 +410,14 @@ export default function SettingsPage() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <Input
             label="QuadWork Dashboard Port"
-            value={String(config.port)}
-            onChange={(v) => updateGlobal("port", parseInt(v, 10) || 8400)}
+            value={portDraft}
+            onChange={(v) => setPortDraft(v)}
+            onBlur={() => {
+              const n = parseInt(portDraft, 10);
+              const clamped = Number.isFinite(n) && n > 0 && n <= 65535 ? n : 8400;
+              updateGlobal("port", clamped);
+              setPortDraft(String(clamped));
+            }}
             type="number"
           />
           <Input
