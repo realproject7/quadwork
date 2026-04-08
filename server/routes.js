@@ -267,6 +267,18 @@ router.put("/api/loop-guard", async (req, res) => {
   if (!tomlPath || !fs.existsSync(tomlPath)) {
     return res.status(404).json({ error: "config.toml not found for project" });
   }
+  // Capture the previous value before rewriting so we can decide
+  // whether the /continue auto-resume should fire (only when the
+  // operator is RAISING the limit — lowering it means they want
+  // the runaway loop to stay paused).
+  let previousValue = null;
+  try {
+    const previousContent = fs.readFileSync(tomlPath, "utf-8");
+    const prevMatch = previousContent.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
+    if (prevMatch) previousValue = parseInt(prevMatch[1], 10);
+  } catch {
+    // fall through — previousValue stays null, auto-resume will skip
+  }
   try {
     let content = fs.readFileSync(tomlPath, "utf-8");
     if (/^\s*max_agent_hops\s*=/m.test(content)) {
@@ -303,13 +315,22 @@ router.put("/api/loop-guard", async (req, res) => {
   // whole fix: the previous version updated max_hops live but left
   // the channel frozen, which made the widget look like a no-op.
   let live = false;
+  // Only auto-resume when the operator is RAISING the limit. Lowering
+  // the value is a "make the system stricter" gesture — if the router
+  // is already paused on a runaway loop, we must leave it paused so
+  // the operator can investigate, otherwise a stricter limit would
+  // paradoxically unstick the runaway. Unknown previous (null) =
+  // don't auto-resume: we can't prove this is a raise.
+  const shouldAutoResume = previousValue !== null && value > previousValue;
   const ensureLive = async (sessionToken) => {
     await sendWsEvent(base, sessionToken, { type: "update_settings", data: { max_agent_hops: value } });
-    // Resume any paused channels. /continue is routed by AC's ws
-    // message handler when the buffer starts with /continue; the
-    // handler calls router.continue_routing() which unpauses and
-    // resets hop_count. No-op when the channel is already running.
-    await sendWsEvent(base, sessionToken, { type: "message", text: "/continue", channel: "general", sender: "user" });
+    if (shouldAutoResume) {
+      // Resume any paused channels. /continue is routed by AC's ws
+      // message handler when the buffer starts with /continue; the
+      // handler calls router.continue_routing() which unpauses and
+      // resets hop_count. No-op when the channel is already running.
+      await sendWsEvent(base, sessionToken, { type: "message", text: "/continue", channel: "general", sender: "user" });
+    }
     live = true;
   };
   let base = null;
@@ -342,7 +363,7 @@ router.put("/api/loop-guard", async (req, res) => {
     console.warn(`[loop-guard] live update failed for ${projectId}: ${err.message || err}`);
   }
 
-  res.json({ ok: true, value, live });
+  res.json({ ok: true, value, live, previousValue, resumed: shouldAutoResume && live });
 });
 
 // #412 / quadwork#279: project history export + import.
