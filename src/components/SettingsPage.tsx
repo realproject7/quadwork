@@ -390,6 +390,7 @@ export default function SettingsPage() {
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
           Shows next to your messages in the AgentChattr chat panel. Defaults to <code>user</code> if blank.
           Allowed: 1–32 letters, digits, dash, underscore (matches AgentChattr&apos;s name rules; other characters are stripped server-side).
+          Reserved agent names like <code>head</code>, <code>dev</code>, <code>reviewer1</code>, <code>reviewer2</code>, and <code>system</code> are rejected and fall back to <code>user</code>.
         </p>
       </section>
 

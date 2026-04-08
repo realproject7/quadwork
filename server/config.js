@@ -16,16 +16,41 @@ const DEFAULT_CONFIG = {
   projects: [],
 };
 
+// Reserved sender names that the operator must NOT be able to claim
+// — these are the registered agent identities (current + legacy
+// aliases) plus AC's own "system" sender. Without this denylist a
+// hand-edited or PUT /api/config'd `operator_name = "head"` would
+// post chat messages with sender:"head", reopening the impersonation
+// vector #230 closed. Case-insensitive match.
+const RESERVED_OPERATOR_NAMES = new Set([
+  "head",
+  "dev",
+  "reviewer1",
+  "reviewer2",
+  // Legacy agent aliases — preserved in routing logic in a few
+  // places, so block them too even though new projects no longer
+  // register under these names.
+  "t1",
+  "t2a",
+  "t2b",
+  "t3",
+  // AC's own broadcast / housekeeping sender.
+  "system",
+]);
+
 // Sanitize an operator-supplied display name to match AC's name
-// validator (registry.py: 1–32 alnum + dash + underscore). Empty or
-// non-string input falls back to "user". Used both when reading the
-// config (in case the file was hand-edited) and on /api/chat sends
-// (so even a stale on-disk value can't impersonate an agent).
+// validator (registry.py: 1–32 alnum + dash + underscore) AND to
+// reject any reserved agent identity. Empty / non-string / reserved
+// input falls back to "user". Used both when reading the config (in
+// case the file was hand-edited) and on /api/chat sends (so even a
+// stale on-disk value can't impersonate an agent).
 function sanitizeOperatorName(value) {
   if (typeof value !== "string") return "user";
   const cleaned = value.trim().replace(/[^A-Za-z0-9_-]/g, "");
   if (!cleaned) return "user";
-  return cleaned.slice(0, 32);
+  const truncated = cleaned.slice(0, 32);
+  if (RESERVED_OPERATOR_NAMES.has(truncated.toLowerCase())) return "user";
+  return truncated;
 }
 
 // Migration: rename old agent keys to new ones
