@@ -78,6 +78,14 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   const [message, setMessage] = useState<string>("");
   const [intervalMin, setIntervalMin] = useState<number>(15);
   const [durationMin, setDurationMin] = useState<number>(180);
+  // #406 / quadwork#269: keep a separate raw string draft for the
+  // hours input so the operator can type intermediate states like
+  // "6." or "0" without the controlled input collapsing them back
+  // (clamping on every keystroke makes "6.3" / "0.5" effectively
+  // unenterable). The draft is committed to durationMin on blur and
+  // again right before start(). Polls update the draft in lockstep
+  // with durationMin so persisted values still load correctly.
+  const [durationHoursDraft, setDurationHoursDraft] = useState<string>(() => minutesToHoursStr(180));
   // Track which controls the operator has touched so incoming polls
   // don't clobber mid-edit changes. The values are mirrored into
   // refs so the memoized `load()` closure always reads the latest
@@ -124,6 +132,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
         }
         if (!durationDirtyRef.current && typeof t.durationMin === "number" && t.durationMin >= 0) {
           setDurationMin(t.durationMin);
+          setDurationHoursDraft(minutesToHoursStr(t.durationMin));
         }
       }
       setError(null);
@@ -164,11 +173,23 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
 
   const start = async () => {
     setBusy(true); setError(null);
+    // #406 / quadwork#269: commit the draft hours value before
+    // POSTing in case the user clicks Send without ever blurring
+    // the input. We compute the resolved minutes locally and pass
+    // them in the body — relying on a setDurationMin() before fetch
+    // would race the React render cycle.
+    const draftRaw = parseFloat(durationHoursDraft);
+    const resolvedHours = Number.isFinite(draftRaw) ? clampHours(draftRaw) : DURATION_HOURS_DEFAULT;
+    const resolvedDurationMin = Math.round(resolvedHours * 60);
+    if (resolvedDurationMin !== durationMin) {
+      setDurationMin(resolvedDurationMin);
+      setDurationHoursDraft(minutesToHoursStr(resolvedDurationMin));
+    }
     try {
       const r = await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ interval: intervalMin, duration: durationMin, message, sendImmediately: true }),
+        body: JSON.stringify({ interval: intervalMin, duration: resolvedDurationMin, message, sendImmediately: true }),
       });
       if (!r.ok) throw new Error(`${r.status}`);
       // After the backend persists the new values, treat them as the
@@ -235,15 +256,24 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
               className="w-12 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
             />
             <span className="text-text-muted">min for</span>
-            {/* #406 / quadwork#269: free-typed hours input. */}
+            {/* #406 / quadwork#269: free-typed hours input. The
+                draft string is committed to durationMin on blur so
+                intermediate states like "6." or "0" remain typeable
+                without instant clamp. start() also commits before
+                POSTing in case the user clicks Send without blurring. */}
             <input
               type="number"
-              value={minutesToHoursStr(durationMin)}
+              value={durationHoursDraft}
               onChange={(e) => {
-                const raw = parseFloat(e.target.value);
-                const hours = Number.isFinite(raw) ? clampHours(raw) : DURATION_HOURS_DEFAULT;
-                setDurationMin(Math.round(hours * 60));
+                setDurationHoursDraft(e.target.value);
                 setDurationDirty(true);
+              }}
+              onBlur={() => {
+                const raw = parseFloat(durationHoursDraft);
+                const hours = Number.isFinite(raw) ? clampHours(raw) : DURATION_HOURS_DEFAULT;
+                const mins = Math.round(hours * 60);
+                setDurationMin(mins);
+                setDurationHoursDraft(minutesToHoursStr(mins));
               }}
               min={DURATION_HOURS_MIN}
               max={DURATION_HOURS_MAX}
