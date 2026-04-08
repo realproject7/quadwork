@@ -184,6 +184,10 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
   // space (so `/poetry hai` still matches but `/clear extra` exits
   // back to free-typed mode).
   const [showSlashMenu, setShowSlashMenu] = useState(false);
+  // #410 / quadwork#276: keyboard selection index into the
+  // currently-filtered slash menu. ArrowUp/Down move it, Enter
+  // commits the active row instead of sending the partial buffer.
+  const [slashIndex, setSlashIndex] = useState(0);
   const [authError, setAuthError] = useState<string | null>(null);
   // #397 / quadwork#262: tracks the message the next send will be a
   // threaded reply to. Cleared after a successful send or on cancel.
@@ -347,6 +351,9 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
       const hasSpace = tail.includes(" ");
       const isPoetryVariant = value.startsWith("/poetry");
       setShowSlashMenu(!hasSpace || isPoetryVariant);
+      // Reset the active row whenever the filter changes so the
+      // selection doesn't dangle past the now-shorter list.
+      setSlashIndex(0);
     } else {
       setShowSlashMenu(false);
     }
@@ -464,16 +471,22 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
         {/* #410 / quadwork#276: slash command autocomplete dropdown */}
         {showSlashMenu && filteredSlashCommands.length > 0 && (
           <div className="absolute bottom-full left-0 right-0 max-h-60 overflow-y-auto border border-border bg-bg-surface z-10">
-            {filteredSlashCommands.map((c) => (
-              <button
-                key={c.command}
-                onClick={() => insertSlashCommand(c.command)}
-                className="w-full text-left px-3 py-1 hover:bg-[#1a1a1a] transition-colors flex items-baseline gap-2"
-              >
-                <span className="text-[12px] text-accent font-mono">{c.command}</span>
-                <span className="text-[10px] text-text-muted truncate">{c.description}</span>
-              </button>
-            ))}
+            {filteredSlashCommands.map((c, i) => {
+              const active = i === Math.min(slashIndex, filteredSlashCommands.length - 1);
+              return (
+                <button
+                  key={c.command}
+                  onClick={() => insertSlashCommand(c.command)}
+                  onMouseEnter={() => setSlashIndex(i)}
+                  className={`w-full text-left px-3 py-1 transition-colors flex items-baseline gap-2 ${
+                    active ? "bg-[#1a1a1a]" : "hover:bg-[#1a1a1a]"
+                  }`}
+                >
+                  <span className="text-[12px] text-accent font-mono">{c.command}</span>
+                  <span className="text-[10px] text-text-muted truncate">{c.description}</span>
+                </button>
+              );
+            })}
           </div>
         )}
         {sendError && (
@@ -510,10 +523,28 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
                 insertMention(filteredAgents[0]);
                 return;
               }
-              if (e.key === "Tab" && showSlashMenu && filteredSlashCommands.length > 0) {
-                e.preventDefault();
-                insertSlashCommand(filteredSlashCommands[0].command);
-                return;
+              // #410 / quadwork#276: when the slash menu is open,
+              // Tab/Enter commit the active row, ArrowUp/ArrowDown
+              // move it. Enter must NOT call send() in this state —
+              // typing /po + Enter would otherwise post the partial
+              // /po literal instead of selecting a /poetry variant.
+              if (showSlashMenu && filteredSlashCommands.length > 0) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setSlashIndex((i) => (i + 1) % filteredSlashCommands.length);
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setSlashIndex((i) => (i - 1 + filteredSlashCommands.length) % filteredSlashCommands.length);
+                  return;
+                }
+                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                  e.preventDefault();
+                  const safeIdx = Math.min(slashIndex, filteredSlashCommands.length - 1);
+                  insertSlashCommand(filteredSlashCommands[safeIdx].command);
+                  return;
+                }
               }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
