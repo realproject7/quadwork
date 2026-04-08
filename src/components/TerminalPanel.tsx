@@ -31,6 +31,13 @@ export default function TerminalPanel({
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Stash onActivity in a ref so the hot ws.onmessage path can call
+  // the latest callback without becoming an effect dep — otherwise an
+  // inline arrow from the parent (re-created on every render via the
+  // 500ms activityTick) would tear down and reopen the PTY ws every
+  // tick, losing scrollback and starving the activity signal itself.
+  const onActivityRef = useRef(onActivity);
+  useEffect(() => { onActivityRef.current = onActivity; }, [onActivity]);
 
   const fit = useCallback(() => {
     if (fitRef.current && termRef.current && containerRef.current) {
@@ -151,7 +158,8 @@ export default function TerminalPanel({
 
       ws.onmessage = (e) => {
         term.write(e.data);
-        if (onActivity) onActivity();
+        const cb = onActivityRef.current;
+        if (cb) cb();
       };
 
       ws.onclose = (e) => {
@@ -174,7 +182,7 @@ export default function TerminalPanel({
       fitRef.current = null;
       wsRef.current = null;
     };
-  }, [projectId, agentId, wsUrl, fit, onActivity]);
+  }, [projectId, agentId, wsUrl, fit]);
 
   return <div ref={containerRef} className="w-full h-full" />;
 }
