@@ -115,6 +115,26 @@ export default function SettingsPage() {
   // `parseInt("") || 8400` clobbering the buffer mid-keystroke.
   // Kept in sync with config.port on load + blur commit.
   const [portDraft, setPortDraft] = useState<string>("8400");
+  // #419 / quadwork#308: per-project MCP port drafts keyed by
+  // `${projectId}-http` / `${projectId}-sse`. Same draft-string
+  // pattern as the global port input above — the previous
+  // `parseInt(v) || undefined` onChange clobbered partial typing.
+  const [projectPortDrafts, setProjectPortDrafts] = useState<Record<string, string>>({});
+  const getProjectPortDraft = (projectId: string, key: "http" | "sse", fallback: number | undefined) => {
+    const dkey = `${projectId}-${key}`;
+    if (dkey in projectPortDrafts) return projectPortDrafts[dkey];
+    return fallback ? String(fallback) : "";
+  };
+  const setProjectPortDraftValue = (projectId: string, key: "http" | "sse", value: string) => {
+    setProjectPortDrafts((prev) => ({ ...prev, [`${projectId}-${key}`]: value }));
+  };
+  const commitProjectPortDraft = (idx: number, projectId: string, key: "http" | "sse", field: "mcp_http_port" | "mcp_sse_port") => {
+    const draft = projectPortDrafts[`${projectId}-${key}`] ?? "";
+    const n = parseInt(draft, 10);
+    const clamped = Number.isFinite(n) && n > 0 && n <= 65535 ? n : undefined;
+    updateProject(idx, { [field]: clamped } as Partial<ProjectConfig>);
+    setProjectPortDrafts((prev) => ({ ...prev, [`${projectId}-${key}`]: clamped ? String(clamped) : "" }));
+  };
 
   const load = useCallback(() => {
     fetch("/api/config")
@@ -678,15 +698,17 @@ export default function SettingsPage() {
                         />
                         <Input
                           label="MCP HTTP Port"
-                          value={String(project.mcp_http_port || "")}
-                          onChange={(v) => updateProject(idx, { mcp_http_port: parseInt(v, 10) || undefined } as Partial<ProjectConfig>)}
+                          value={getProjectPortDraft(project.id, "http", project.mcp_http_port)}
+                          onChange={(v) => setProjectPortDraftValue(project.id, "http", v)}
+                          onBlur={() => commitProjectPortDraft(idx, project.id, "http", "mcp_http_port")}
                           type="number"
                           placeholder="8200"
                         />
                         <Input
                           label="MCP SSE Port"
-                          value={String(project.mcp_sse_port || "")}
-                          onChange={(v) => updateProject(idx, { mcp_sse_port: parseInt(v, 10) || undefined } as Partial<ProjectConfig>)}
+                          value={getProjectPortDraft(project.id, "sse", project.mcp_sse_port)}
+                          onChange={(v) => setProjectPortDraftValue(project.id, "sse", v)}
+                          onBlur={() => commitProjectPortDraft(idx, project.id, "sse", "mcp_sse_port")}
                           type="number"
                           placeholder="8201"
                         />
