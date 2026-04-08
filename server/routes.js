@@ -674,6 +674,146 @@ router.post("/api/project-history/restore", async (req, res) => {
   }
 });
 
+// #430 / quadwork#312: AI team work-hours tracking.
+//
+// The frontend's TerminalGrid detects per-agent activity transitions
+// (idle → active, active → idle) via the existing activity ref and
+// POSTs them to /api/activity/log. We buffer `start` events in
+// memory keyed by `${project}/${agent}`; an `end` event looks up the
+// matching buffered start, computes the duration, and appends a
+// complete session row to ~/.quadwork/{project}/activity.jsonl.
+//
+// /api/activity/stats aggregates across all projects with a 30s
+// cache so the dashboard can poll it every minute without thrashing
+// the filesystem.
+
+const _activityStarts = new Map(); // `${project}/${agent}` → startTimestamp
+const _activityStatsCache = { ts: 0, data: null };
+const ACTIVITY_STATS_TTL_MS = 30000;
+
+function activityLogPath(projectId) {
+  return path.join(CONFIG_DIR, projectId, "activity.jsonl");
+}
+
+router.post("/api/activity/log", (req, res) => {
+  const { project, agent, type, timestamp } = req.body || {};
+  if (typeof project !== "string" || !project) return res.status(400).json({ error: "Missing project" });
+  if (typeof agent !== "string" || !agent) return res.status(400).json({ error: "Missing agent" });
+  if (type !== "start" && type !== "end") return res.status(400).json({ error: "type must be start|end" });
+  const ts = typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.now();
+  const key = `${project}/${agent}`;
+
+  if (type === "start") {
+    // Only remember the first start per session — duplicate starts
+    // are possible if the frontend re-mounts mid-stream; ignore
+    // them so the session duration reflects the original onset.
+    if (!_activityStarts.has(key)) _activityStarts.set(key, ts);
+    return res.json({ ok: true });
+  }
+
+  // type === "end"
+  const start = _activityStarts.get(key);
+  if (start === undefined) {
+    // Orphan end (missed start — probably happens on server
+    // restart while a session was live). Drop it silently so we
+    // don't write a row with an unknown start timestamp.
+    return res.json({ ok: true, dropped: "orphan" });
+  }
+  _activityStarts.delete(key);
+  const row = { agent, start, end: ts, duration_ms: Math.max(0, ts - start) };
+  try {
+    const p = activityLogPath(project);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.appendFileSync(p, JSON.stringify(row) + "\n");
+    // Invalidate the stats cache so the next read sees the new row.
+    _activityStatsCache.ts = 0;
+  } catch (err) {
+    console.warn(`[activity] failed to append ${project}/${agent}: ${err.message || err}`);
+  }
+  res.json({ ok: true, duration_ms: row.duration_ms });
+});
+
+// Aggregate all activity.jsonl files under ~/.quadwork/*/activity.jsonl.
+// `today`, `week`, `month` boundaries use the operator's local
+// timezone rather than UTC — "this week" should mean the week the
+// operator is living in, not a UTC-offset week that starts at
+// 16:00 local time.
+function computeActivityStats() {
+  if (Date.now() - _activityStatsCache.ts < ACTIVITY_STATS_TTL_MS && _activityStatsCache.data) {
+    return _activityStatsCache.data;
+  }
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  // Start of this week = local Monday 00:00. JS: getDay() → 0-Sun..6-Sat.
+  const day = now.getDay();
+  const mondayOffset = day === 0 ? -6 : 1 - day; // Sun → -6, Mon → 0, Tue → -1, …
+  const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() + mondayOffset).getTime();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+
+  const totals = { today_ms: 0, week_ms: 0, month_ms: 0, total_ms: 0 };
+  const byProject = {};
+  // #430 / quadwork#312: only count projects registered in
+  // config.json, not every directory under ~/.quadwork/. Stray
+  // folders from deleted / unconfigured projects must not inflate
+  // the stats — that's explicit in #312's acceptance.
+  let projectIds = [];
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    if (Array.isArray(cfg.projects)) {
+      projectIds = cfg.projects.map((p) => p && p.id).filter((id) => typeof id === "string" && id);
+    }
+  } catch {
+    // config unreadable → no projects → empty stats (safe fallback)
+  }
+  for (const projectId of projectIds) {
+    const p = activityLogPath(projectId);
+    if (!fs.existsSync(p)) continue;
+    const projectTotals = { today_ms: 0, week_ms: 0, month_ms: 0, total_ms: 0 };
+    let text;
+    try { text = fs.readFileSync(p, "utf-8"); } catch { continue; }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      let row;
+      try { row = JSON.parse(line); } catch { continue; }
+      const d = row && typeof row.duration_ms === "number" ? row.duration_ms : 0;
+      const start = row && typeof row.start === "number" ? row.start : 0;
+      if (d <= 0 || !start) continue;
+      projectTotals.total_ms += d;
+      if (start >= startOfToday) projectTotals.today_ms += d;
+      if (start >= startOfWeek)  projectTotals.week_ms  += d;
+      if (start >= startOfMonth) projectTotals.month_ms += d;
+    }
+    byProject[projectId] = {
+      today: Math.round(projectTotals.today_ms / 3600) / 1000,
+      week:  Math.round(projectTotals.week_ms  / 3600) / 1000,
+      month: Math.round(projectTotals.month_ms / 3600) / 1000,
+      total: Math.round(projectTotals.total_ms / 3600) / 1000,
+    };
+    totals.today_ms += projectTotals.today_ms;
+    totals.week_ms  += projectTotals.week_ms;
+    totals.month_ms += projectTotals.month_ms;
+    totals.total_ms += projectTotals.total_ms;
+  }
+  const data = {
+    today: Math.round(totals.today_ms / 3600) / 1000,
+    week:  Math.round(totals.week_ms  / 3600) / 1000,
+    month: Math.round(totals.month_ms / 3600) / 1000,
+    total: Math.round(totals.total_ms / 3600) / 1000,
+    by_project: byProject,
+  };
+  _activityStatsCache.ts = Date.now();
+  _activityStatsCache.data = data;
+  return data;
+}
+
+router.get("/api/activity/stats", (_req, res) => {
+  try {
+    res.json(computeActivityStats());
+  } catch (err) {
+    res.status(500).json({ error: "Failed to compute activity stats", detail: err.message });
+  }
+});
+
 router.post("/api/chat", async (req, res) => {
   const projectId = req.query.project || req.body.project;
   const { url: base, token: sessionToken } = getChattrConfig(projectId);

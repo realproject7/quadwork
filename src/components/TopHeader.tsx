@@ -64,8 +64,37 @@ function useTypewriter(variants: string[], enabled: boolean) {
 
 const TAGLINE_LS_KEY = "quadwork_tagline_animation";
 
+interface ActivityStats {
+  today: number;
+  week: number;
+  month: number;
+  total: number;
+  by_project: Record<string, { today: number; week: number; month: number; total: number }>;
+}
+
+function fmtHours(h: number): string {
+  if (!Number.isFinite(h) || h <= 0) return "0h";
+  if (h < 1) return `${(h * 60).toFixed(0)}m`;
+  return `${h.toFixed(1)}h`;
+}
+
 export default function TopHeader() {
   const [aboutOpen, setAboutOpen] = useState(false);
+  // #430 / quadwork#312: work-hours stat polling. 60s cadence.
+  const [stats, setStats] = useState<ActivityStats | null>(null);
+  const [showStatsTooltip, setShowStatsTooltip] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      fetch("/api/activity/stats")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (!cancelled && d) setStats(d); })
+        .catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 60000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
   // #227: tagline animation toggle persisted in localStorage. Default
   // is "on" for new visitors. Initialised lazily so SSR doesn't try
   // to read window.localStorage during the first render.
@@ -150,6 +179,43 @@ export default function TopHeader() {
           )}
         </div>
         <div className="flex items-center gap-3 shrink-0">
+          {/* #430 / quadwork#312: work-hours stat block. Globally
+              aggregated across all projects. Hover/focus surfaces
+              the per-project breakdown from stats.by_project. */}
+          {stats && (
+            <div
+              className="relative hidden md:flex items-center gap-2 text-[10px] text-neutral-500"
+              onMouseEnter={() => setShowStatsTooltip(true)}
+              onMouseLeave={() => setShowStatsTooltip(false)}
+              onFocus={() => setShowStatsTooltip(true)}
+              onBlur={() => setShowStatsTooltip(false)}
+              tabIndex={0}
+            >
+              <span>Today <span className="text-neutral-200">{fmtHours(stats.today)}</span></span>
+              <span className="text-neutral-700">·</span>
+              <span>Week <span className="text-neutral-200">{fmtHours(stats.week)}</span></span>
+              <span className="text-neutral-700">·</span>
+              <span>Month <span className="text-neutral-200">{fmtHours(stats.month)}</span></span>
+              {showStatsTooltip && (
+                <div className="absolute top-6 right-0 z-50 min-w-[220px] p-2 text-[10px] leading-snug text-neutral-200 bg-neutral-900 border border-white/15 rounded shadow-lg">
+                  <div className="mb-1 text-neutral-400 uppercase tracking-wider text-[9px]">Per project</div>
+                  {Object.entries(stats.by_project).length === 0 && (
+                    <div className="text-neutral-500">No activity logged yet</div>
+                  )}
+                  {Object.entries(stats.by_project).map(([id, s]) => (
+                    <div key={id} className="flex items-baseline gap-2">
+                      <span className="text-neutral-400 truncate flex-1">{id}</span>
+                      <span className="tabular-nums text-neutral-200">{fmtHours(s.month)}</span>
+                      <span className="text-neutral-600 text-[9px]">/ mo</span>
+                    </div>
+                  ))}
+                  <div className="mt-1 pt-1 border-t border-white/10 text-neutral-500">
+                    Lifetime: <span className="text-neutral-200">{fmtHours(stats.total)}</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           <button
             type="button"
             onClick={() => setAboutOpen(true)}
