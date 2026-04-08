@@ -1391,6 +1391,123 @@ function syncTriggersFromConfig() {
   }
 }
 
+// #422 / quadwork#310: auto-continue after loop guard.
+//
+// Per opted-in project, poll AC's /api/status every 10s. When we see
+// a false → true transition on `paused`, wait the configured delay
+// (default 30s) and POST /continue to /api/chat — same path the
+// operator would use manually. The delay gives a human a chance to
+// intervene on an actually-runaway loop, and acts as a soft rate
+// limit against pathological loops that would otherwise just loop
+// forever under an auto-continue.
+//
+// Detection is deliberately polling rather than a long-lived ws:
+// a ws subscription per project would complicate lifecycle and
+// reconnection, and 10s polling latency is acceptable when the
+// delay is tens of seconds. Skipping projects without the opt-in
+// keeps the poller cheap for single-project setups.
+
+const _loopGuardPausedState = new Map(); // projectId -> { paused: bool, scheduled: Timeout? }
+const LOOP_GUARD_POLL_INTERVAL_MS = 10000;
+
+async function checkLoopGuardPause(project) {
+  if (!project || !project.auto_continue_loop_guard) return;
+  const { url: base, token: sessionToken } = resolveProjectChattr(project.id);
+  if (!base) return;
+  let paused = false;
+  try {
+    const r = await fetch(`${base}/api/status`, {
+      headers: sessionToken ? { "x-session-token": sessionToken } : {},
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    paused = !!(data && data.paused);
+  } catch {
+    return;
+  }
+  const state = _loopGuardPausedState.get(project.id) || { paused: false, scheduled: null };
+  // Transition false → true: schedule an auto-continue after the delay.
+  if (paused && !state.paused && !state.scheduled) {
+    const delaySec = Number.isFinite(project.auto_continue_delay_sec) && project.auto_continue_delay_sec >= 5
+      ? project.auto_continue_delay_sec
+      : 30;
+    console.log(`[loop-guard] ${project.id} paused — auto-continue in ${delaySec}s`);
+    state.scheduled = setTimeout(async () => {
+      try {
+        // Re-check the opt-in at fire time so a checkbox disable
+        // mid-wait actually stops the auto-continue.
+        const freshCfg = readConfig();
+        const fresh = freshCfg.projects?.find((p) => p.id === project.id);
+        if (!fresh || !fresh.auto_continue_loop_guard) {
+          console.log(`[loop-guard] ${project.id} auto-continue cancelled (opt-in disabled during wait)`);
+        } else {
+          // Re-check the router's pause state at fire time too. The
+          // 10s status poller may not have seen a manual operator
+          // /continue yet when the delay window (5–9s) is shorter
+          // than the poll interval — without this, a manual resume
+          // inside a 5s wait would be followed by a stale auto
+          // /continue that clobbers hop_count on an already-running
+          // chain (router.continue_routing resets the counter
+          // unconditionally). The re-check closes the race.
+          let stillPaused = false;
+          try {
+            const { url: freshBase, token: freshToken } = resolveProjectChattr(project.id);
+            if (freshBase) {
+              const sr = await fetch(`${freshBase}/api/status`, {
+                headers: freshToken ? { "x-session-token": freshToken } : {},
+                signal: AbortSignal.timeout(5000),
+              });
+              if (sr.ok) {
+                const sd = await sr.json();
+                stillPaused = !!(sd && sd.paused);
+              }
+            }
+          } catch {
+            // Status re-check failed — fall back to "don't fire".
+            // Stuck pause will still be caught on the next 10s tick.
+          }
+          if (!stillPaused) {
+            console.log(`[loop-guard] ${project.id} auto-continue cancelled (router already resumed)`);
+          } else {
+            const res = await fetch(`http://127.0.0.1:${PORT}/api/chat?project=${encodeURIComponent(project.id)}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: "/continue", channel: "general" }),
+            });
+            if (res.ok) console.log(`[loop-guard] ${project.id} auto-continued`);
+            else console.warn(`[loop-guard] ${project.id} auto-continue POST returned ${res.status}`);
+          }
+        }
+      } catch (err) {
+        console.warn(`[loop-guard] ${project.id} auto-continue failed: ${err.message || err}`);
+      }
+      const s2 = _loopGuardPausedState.get(project.id);
+      if (s2) s2.scheduled = null;
+    }, delaySec * 1000);
+  }
+  // Transition true → false: clear any pending timer.
+  if (!paused && state.paused && state.scheduled) {
+    clearTimeout(state.scheduled);
+    state.scheduled = null;
+  }
+  state.paused = paused;
+  _loopGuardPausedState.set(project.id, state);
+}
+
+function runLoopGuardPollingTick() {
+  try {
+    const cfg = readConfig();
+    for (const p of (cfg.projects || [])) {
+      if (p && p.auto_continue_loop_guard) checkLoopGuardPause(p);
+    }
+  } catch {
+    // config unreadable — next tick will retry
+  }
+}
+
+setInterval(runLoopGuardPollingTick, LOOP_GUARD_POLL_INTERVAL_MS);
+
 // --- Start ---
 
 server.listen(PORT, "127.0.0.1", () => {

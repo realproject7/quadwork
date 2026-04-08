@@ -23,6 +23,14 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState<boolean | null>(null);
   const [showHelp, setShowHelp] = useState(false);
+  // #422 / quadwork#310: per-project auto-continue opt-in. Default
+  // OFF — operators opt in knowing the trade-off (runaway loops
+  // will silently resume after the delay). Hydrated from /api/config
+  // on mount; saving flips the field and PUTs the whole config back.
+  const [autoContinue, setAutoContinue] = useState<boolean>(false);
+  const [autoContinueDelaySec, setAutoContinueDelaySec] = useState<number>(30);
+  const [autoContinueDelayDraft, setAutoContinueDelayDraft] = useState<string>("30");
+  const [autoContinueSaving, setAutoContinueSaving] = useState(false);
 
   // Load on mount + when project changes.
   useEffect(() => {
@@ -35,7 +43,53 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
         }
       })
       .catch(() => {});
+    // #422 / quadwork#310: read auto-continue prefs from the whole
+    // config (they live on the project entry, not the loop-guard
+    // endpoint). Scoped to the current projectId.
+    fetch(`/api/config`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg) => {
+        if (!cfg || !Array.isArray(cfg.projects)) return;
+        const proj = cfg.projects.find((p: { id: string }) => p.id === projectId);
+        if (!proj) return;
+        setAutoContinue(!!proj.auto_continue_loop_guard);
+        const d = Number.isFinite(proj.auto_continue_delay_sec) ? proj.auto_continue_delay_sec : 30;
+        setAutoContinueDelaySec(d);
+        setAutoContinueDelayDraft(String(d));
+      })
+      .catch(() => {});
   }, [projectId]);
+
+  // Persist auto-continue prefs by fetching current config, mutating
+  // the target project's two fields, and PUT'ing back. We keep the
+  // whole-config PUT contract the SettingsPage uses so we don't
+  // have to add a new endpoint for two flags. Failures leave the
+  // in-memory checkbox out of sync with disk, which the next mount
+  // will correct.
+  const saveAutoContinue = async (nextEnabled: boolean, nextDelay: number) => {
+    setAutoContinueSaving(true);
+    try {
+      const cfgRes = await fetch(`/api/config`);
+      if (!cfgRes.ok) throw new Error(`GET /api/config ${cfgRes.status}`);
+      const cfg = await cfgRes.json();
+      if (!cfg || !Array.isArray(cfg.projects)) throw new Error("config shape");
+      const idx = cfg.projects.findIndex((p: { id: string }) => p.id === projectId);
+      if (idx < 0) throw new Error(`project ${projectId} not found`);
+      cfg.projects[idx] = {
+        ...cfg.projects[idx],
+        auto_continue_loop_guard: nextEnabled,
+        auto_continue_delay_sec: nextDelay,
+      };
+      const putRes = await fetch(`/api/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cfg),
+      });
+      if (!putRes.ok) throw new Error(`PUT /api/config ${putRes.status}`);
+    } finally {
+      setAutoContinueSaving(false);
+    }
+  };
 
   const apply = () => {
     const n = parseInt(draft, 10);
@@ -111,6 +165,46 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
           Saved to config.toml — live update failed; takes effect on next AC restart.
         </div>
       )}
+      {/* #422 / quadwork#310: auto-continue opt-in. Default OFF so
+          operators have to explicitly enable "resume the loop guard
+          for me". Delay default 30s, min 5s (prevents pathological
+          tight loops from resuming instantly). */}
+      <label className="mt-2 flex items-center gap-1.5 text-[10px] text-text-muted cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={autoContinue}
+          disabled={autoContinueSaving}
+          onChange={(e) => {
+            const next = e.target.checked;
+            setAutoContinue(next);
+            saveAutoContinue(next, autoContinueDelaySec).catch(() => {
+              // revert on failure
+              setAutoContinue(!next);
+            });
+          }}
+        />
+        Auto-continue after pause
+        <span className="text-text-muted">— wait</span>
+        <input
+          type="number"
+          min={5}
+          max={300}
+          value={autoContinueDelayDraft}
+          disabled={autoContinueSaving || !autoContinue}
+          onChange={(e) => setAutoContinueDelayDraft(e.target.value)}
+          onBlur={() => {
+            const n = parseInt(autoContinueDelayDraft, 10);
+            const clamped = Number.isFinite(n) ? Math.max(5, Math.min(300, n)) : 30;
+            setAutoContinueDelaySec(clamped);
+            setAutoContinueDelayDraft(String(clamped));
+            if (clamped !== autoContinueDelaySec) {
+              saveAutoContinue(autoContinue, clamped).catch(() => {});
+            }
+          }}
+          className="w-10 bg-transparent px-1 py-0.5 border border-border rounded text-text outline-none focus:ring-1 focus:ring-accent disabled:opacity-40 text-center"
+        />
+        <span className="text-text-muted">s before /continue</span>
+      </label>
     </div>
   );
 }
