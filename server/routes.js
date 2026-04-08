@@ -289,14 +289,37 @@ router.put("/api/loop-guard", async (req, res) => {
   // /api/chat does (#230): re-sync the session token from AC and
   // retry once. Other failures stay non-fatal — the persisted value
   // still takes effect on next AC restart.
+  //
+  // #417 / quadwork#309: the update_settings ws event correctly
+  // updates router.max_hops in the running AC (verified in AC's
+  // app.py:1249), AND writes settings.json via _save_settings. But
+  // AC's router stays paused once it has tripped the guard — raising
+  // max_hops at runtime does NOT resurrect an already-paused channel
+  // (router.py:76-77 → `paused = True`). The operator typically
+  // raises the limit precisely BECAUSE the channel is stuck paused,
+  // so we immediately follow the update_settings event with a
+  // `/continue` chat message (the same path AC's own slash command
+  // handler uses at app.py:1106-1110) to resume routing. This is the
+  // whole fix: the previous version updated max_hops live but left
+  // the channel frozen, which made the widget look like a no-op.
   let live = false;
+  const ensureLive = async (sessionToken) => {
+    await sendWsEvent(base, sessionToken, { type: "update_settings", data: { max_agent_hops: value } });
+    // Resume any paused channels. /continue is routed by AC's ws
+    // message handler when the buffer starts with /continue; the
+    // handler calls router.continue_routing() which unpauses and
+    // resets hop_count. No-op when the channel is already running.
+    await sendWsEvent(base, sessionToken, { type: "message", text: "/continue", channel: "general", sender: "user" });
+    live = true;
+  };
+  let base = null;
   try {
-    const { url: base, token: sessionToken } = getChattrConfig(projectId);
+    const chattr = getChattrConfig(projectId);
+    base = chattr.url;
+    const sessionToken = chattr.token;
     if (base) {
-      const event = { type: "update_settings", data: { max_agent_hops: value } };
       try {
-        await sendWsEvent(base, sessionToken, event);
-        live = true;
+        await ensureLive(sessionToken);
       } catch (err) {
         if (err && err.code === "EAGENTCHATTR_401") {
           console.warn(`[loop-guard] ws auth failed for ${projectId}, re-syncing session token and retrying...`);
@@ -305,8 +328,7 @@ router.put("/api/loop-guard", async (req, res) => {
           const { token: refreshed } = getChattrConfig(projectId);
           if (refreshed && refreshed !== sessionToken) {
             try {
-              await sendWsEvent(base, refreshed, event);
-              live = true;
+              await ensureLive(refreshed);
             } catch (retryErr) {
               console.warn(`[loop-guard] retry after token resync failed: ${retryErr.message || retryErr}`);
             }
