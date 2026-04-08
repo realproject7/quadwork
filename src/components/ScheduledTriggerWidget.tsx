@@ -64,11 +64,12 @@ function formatCountdown(ms: number): string {
  * Bottom-right operator widget for the Scheduled Trigger (#210).
  *
  * Combines the old Keep Alive timer with a custom message textarea.
- * "Start Trigger" sends the typed message via the
- * existing /api/triggers/:id/start endpoint (which persists the
- * message on the project entry and immediately fires once), then
- * the backend's setInterval keeps firing at the configured cadence
- * until the duration expires or Stop is pressed.
+ * "Start Trigger" hands the typed message to
+ * /api/triggers/:id/start which persists it on the project entry
+ * and schedules a setInterval at the configured cadence. The first
+ * message fires at T + interval (not on click — see #418/#306) and
+ * the interval keeps firing until duration expires or Stop is
+ * pressed.
  *
  * State is sourced from GET /api/triggers every 5s so reopening the
  * project picks up the last-used message + running status.
