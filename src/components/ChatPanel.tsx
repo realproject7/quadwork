@@ -115,6 +115,9 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
   const [showMentions, setShowMentions] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
   const [authError, setAuthError] = useState<string | null>(null);
+  // #397 / quadwork#262: tracks the message the next send will be a
+  // threaded reply to. Cleared after a successful send or on cancel.
+  const [replyTo, setReplyTo] = useState<{ id: number; sender: string } | null>(null);
   const cursorRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -193,11 +196,17 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
     fetch(`/api/chat${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, channel, sender: "user" }),
+      body: JSON.stringify({
+        text,
+        channel,
+        sender: "user",
+        ...(replyTo ? { reply_to: replyTo.id } : {}),
+      }),
     })
       .then((r) => {
         if (!r.ok) throw new Error(`Send failed: ${r.status}`);
         setInput("");
+        setReplyTo(null);
         setTimeout(fetchMessages, 300);
       })
       .catch((err) => {
@@ -253,7 +262,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
           </div>
         )}
         {messages.map((msg) => (
-          <div key={msg.id} className="flex gap-2 text-[12px] leading-5">
+          <div key={msg.id} className="group flex gap-2 text-[12px] leading-5">
             <span className="text-text-muted shrink-0 w-12 text-right tabular-nums">
               {msg.time?.slice(0, 5) || ""}
             </span>
@@ -263,9 +272,36 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             >
               {msg.sender}
             </span>
-            <span className="text-text break-words min-w-0 whitespace-pre-wrap">
+            <span className="text-text break-words min-w-0 whitespace-pre-wrap flex-1">
               {msg.text}
             </span>
+            {/* #397 / quadwork#262: reply affordance — small grey,
+                hover-revealed so it doesn't visually compete with the
+                message text. Mirrors AC's native reply UI. */}
+            <button
+              type="button"
+              onClick={() => {
+                setReplyTo({ id: msg.id, sender: msg.sender });
+                // Only prefill `@<sender>` when the sender is a real
+                // agent. Non-agent rows (user, system, …) would
+                // produce broken mentions that send() then
+                // double-routes through its auto-@head fallback,
+                // turning a reply-to-user into "@head @user …".
+                // For those rows we still set replyTo so the threaded
+                // link works in AC's native UI; we just don't poison
+                // the input with a mention that isn't routable.
+                const KNOWN_AGENTS = new Set(["head", "dev", "reviewer1", "reviewer2"]);
+                if (KNOWN_AGENTS.has(msg.sender.toLowerCase())) {
+                  const prefix = `@${msg.sender} `;
+                  setInput((prev) => (prev.startsWith(prefix) ? prev : prefix));
+                }
+                inputRef.current?.focus();
+              }}
+              className="shrink-0 self-start opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity text-[10px] text-text-muted hover:text-text px-1 py-0.5 border border-border/50 rounded"
+              title={`Reply to message #${msg.id}`}
+            >
+              reply
+            </button>
           </div>
         ))}
       </div>
@@ -292,6 +328,22 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             {sendError}
           </div>
         )}
+        {/* #397 / quadwork#262: active reply indicator with cancel */}
+        {replyTo && (
+          <div className="flex items-center gap-2 px-3 py-1 text-[11px] text-text-muted bg-bg-surface border-b border-border/50">
+            <span>
+              Replying to <span style={{ color: senderColor(replyTo.sender) }}>@{replyTo.sender}</span> #{replyTo.id}
+            </span>
+            <button
+              type="button"
+              onClick={() => setReplyTo(null)}
+              className="ml-auto hover:text-text"
+              title="Cancel reply (Esc)"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div className="flex items-center gap-1 px-1">
           <input
             ref={inputRef}
@@ -309,7 +361,10 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
                 e.preventDefault();
                 send();
               }
-              if (e.key === "Escape") setShowMentions(false);
+              if (e.key === "Escape") {
+                setShowMentions(false);
+                if (replyTo) setReplyTo(null);
+              }
             }}
             placeholder={`Message #${channel}...`}
             disabled={sending}
