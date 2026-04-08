@@ -892,15 +892,6 @@ function parseActiveBatch(queueText) {
   return { batchNumber, issueNumbers };
 }
 
-function ghJsonExec(args) {
-  try {
-    const out = execFileSync("gh", args, { encoding: "utf-8", timeout: 10000 });
-    return JSON.parse(out);
-  } catch {
-    return null;
-  }
-}
-
 // #416 / quadwork#299: async variant used by the parallelized batch
 // progress fetcher. Wraps node's execFile in a promise, swallows
 // child errors so a missing issue / PR doesn't reject the
