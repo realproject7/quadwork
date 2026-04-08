@@ -27,6 +27,17 @@ function senderColor(sender: string): string {
   return SENDER_COLORS[sender.toLowerCase()] || "#e0e0e0";
 }
 
+// #398 / quadwork#263: shorten reviewer names in the chat sender
+// column only — the underlying agent IDs (`reviewer1`, `reviewer2`)
+// must stay unchanged everywhere else (registration, MCP, queue,
+// terminal headers, etc.). Display-only.
+function senderLabel(sender: string): string {
+  const s = sender.toLowerCase();
+  if (s === "reviewer1") return "RE1";
+  if (s === "reviewer2") return "RE2";
+  return sender;
+}
+
 /**
  * Tries iframe first (uses AgentChattr's own session auth).
  * Falls back to API polling if iframe fails to load.
@@ -270,7 +281,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
               className="shrink-0 font-semibold w-10 text-right"
               style={{ color: senderColor(msg.sender) }}
             >
-              {msg.sender}
+              {senderLabel(msg.sender)}
             </span>
             <span className="text-text break-words min-w-0 whitespace-pre-wrap flex-1">
               {msg.text}
