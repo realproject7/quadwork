@@ -16,7 +16,13 @@ const config = readConfig();
 const PORT = config.port || 8400;
 
 const app = express();
-app.use(express.json());
+// #412 / quadwork#279: bump the global JSON body limit to 10mb so
+// POST /api/project-history can accept full chat exports. The
+// default ~100kb 413'd long before the route-local parser had a
+// chance to apply its own 10mb cap (the global parser runs first).
+// All other routes are well within 10mb in practice; this is the
+// least invasive fix and matches the documented import ceiling.
+app.use(express.json({ limit: "10mb" }));
 
 // --- Mount migrated API routes (from Next.js) ---
 app.use(routes);

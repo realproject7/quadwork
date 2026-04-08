@@ -323,6 +323,148 @@ router.put("/api/loop-guard", async (req, res) => {
   res.json({ ok: true, value, live });
 });
 
+// #412 / quadwork#279: project history export + import.
+//
+// Export proxies AC's /api/messages for the project channel and
+// wraps the array in a small metadata envelope so future imports
+// can warn on project-id mismatch and so a future schema bump can
+// be detected client-side.
+//
+// Import accepts the same envelope, validates the shape + size,
+// and replays each message back into the project's AgentChattr
+// instance via sendViaWebSocket — preserving the original sender
+// field for cross-tool consistency. Originals' message IDs are NOT
+// preserved (AC re-assigns on insert), which is a known v1 limit
+// and matches the issue's "AgentChattr will tell us" note.
+
+const PROJECT_HISTORY_VERSION = 1;
+const PROJECT_HISTORY_MAX_BYTES = 10 * 1024 * 1024; // 10 MB cap per issue
+const PROJECT_HISTORY_REPLAY_DELAY_MS = 25; // pace AC ws inserts
+
+router.get("/api/project-history", async (req, res) => {
+  const projectId = req.query.project;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const { url: base, token: sessionToken } = getChattrConfig(projectId);
+  if (!base) return res.status(400).json({ error: "No AgentChattr configured for project" });
+  try {
+    // AC's /api/messages accepts a bearer token in the Authorization
+    // header; the session token is what the chat panel already uses.
+    const target = `${base}/api/messages?channel=general&limit=100000`;
+    const r = await fetch(target, {
+      headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+      // Cap the AC fetch at 30s so a hung daemon doesn't park the
+      // export request indefinitely.
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!r.ok) {
+      const detail = await r.text().catch(() => "");
+      return res.status(502).json({ error: `AgentChattr /api/messages returned ${r.status}`, detail: detail.slice(0, 200) });
+    }
+    const raw = await r.json();
+    // AC returns either a bare array or { messages: [...] } depending
+    // on version — handle both.
+    const messages = Array.isArray(raw) ? raw : Array.isArray(raw && raw.messages) ? raw.messages : [];
+    res.json({
+      version: PROJECT_HISTORY_VERSION,
+      project_id: projectId,
+      exported_at: new Date().toISOString(),
+      message_count: messages.length,
+      messages,
+    });
+  } catch (err) {
+    res.status(502).json({ error: "Project history export failed", detail: err.message || String(err) });
+  }
+});
+
+// Global express.json() in server/index.js is bumped to 10mb to
+// cover this route — see the comment there. The route handler still
+// double-checks the byte size of the parsed body below as a defense
+// in depth (e.g. if a future change scopes the global parser back
+// down without updating this comment).
+router.post("/api/project-history", async (req, res) => {
+  const projectId = req.query.project || req.body?.project_id;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+
+  const body = req.body;
+  if (!body || typeof body !== "object") {
+    return res.status(400).json({ error: "Invalid JSON body" });
+  }
+  // Body size guard — express.json() respects its own limit too,
+  // but stamp the explicit cap from the issue here so the error
+  // message is operator-readable.
+  try {
+    const approxBytes = Buffer.byteLength(JSON.stringify(body));
+    if (approxBytes > PROJECT_HISTORY_MAX_BYTES) {
+      return res.status(413).json({ error: `History file too large (${approxBytes} bytes; limit ${PROJECT_HISTORY_MAX_BYTES})` });
+    }
+  } catch {
+    // JSON.stringify circular — already invalid, fall through
+  }
+
+  if (!Array.isArray(body.messages)) {
+    return res.status(400).json({ error: "Missing or invalid 'messages' array" });
+  }
+  if (body.version && body.version !== PROJECT_HISTORY_VERSION) {
+    return res.status(400).json({ error: `Unsupported export version ${body.version} (expected ${PROJECT_HISTORY_VERSION})` });
+  }
+  // Soft project-id mismatch warning. The client UI should confirm
+  // before POSTing when the IDs differ; if it didn't (e.g. curl),
+  // require an explicit override flag so we can't silently merge
+  // foreign chat into the wrong project.
+  if (body.project_id && body.project_id !== projectId && !body.allow_project_mismatch) {
+    return res.status(409).json({
+      error: `Project mismatch: file is from '${body.project_id}', target is '${projectId}'. Resend with allow_project_mismatch=true to override.`,
+    });
+  }
+
+  const { url: base, token: sessionToken } = getChattrConfig(projectId);
+  if (!base) return res.status(400).json({ error: "No AgentChattr configured for project" });
+
+  // Replay each message via the existing ws send helper. Preserve
+  // the original sender so the imported transcript still attributes
+  // each line correctly. Pace the writes so AC's ws handler isn't
+  // overloaded on a multi-thousand-message import.
+  //
+  // SECURITY NOTE: This deliberately bypasses /api/chat's #230/#288
+  // sanitize-as-user lockdown — the imported sender field is sent
+  // straight to AC's ws, so a crafted import file CAN post as
+  // `head` / `dev` / etc. That's intentional: imports must round-
+  // trip the original attribution to be useful (otherwise every
+  // restored message would say `user` and the transcript would be
+  // worthless). The trade-off is acceptable because the only entry
+  // point is an authenticated dashboard operator picking a file by
+  // hand and clicking through the project-mismatch confirm. Don't
+  // expose this route from a less-trusted surface without revisiting.
+  let imported = 0;
+  let skipped = 0;
+  const errors = [];
+  for (const m of body.messages) {
+    if (!m || typeof m !== "object" || typeof m.text !== "string" || !m.text) {
+      skipped++;
+      continue;
+    }
+    const msg = {
+      text: m.text,
+      channel: typeof m.channel === "string" && m.channel ? m.channel : "general",
+      sender: typeof m.sender === "string" && m.sender ? m.sender : "user",
+    };
+    try {
+      await sendViaWebSocket(base, sessionToken, msg);
+      imported++;
+    } catch (err) {
+      errors.push(`#${m.id ?? "?"}: ${err.message || String(err)}`);
+      // Stop on the first error to avoid spamming AC if its ws is down.
+      if (errors.length > 5) break;
+    }
+    // Tiny delay between sends — AC's ws handler can keep up but
+    // 10k messages back-to-back hit the recv buffer hard.
+    if (PROJECT_HISTORY_REPLAY_DELAY_MS > 0) {
+      await new Promise((r) => setTimeout(r, PROJECT_HISTORY_REPLAY_DELAY_MS));
+    }
+  }
+  res.json({ ok: errors.length === 0, imported, skipped, total: body.messages.length, errors });
+});
+
 router.post("/api/chat", async (req, res) => {
   const projectId = req.query.project || req.body.project;
   const { url: base, token: sessionToken } = getChattrConfig(projectId);
