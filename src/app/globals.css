@@ -75,3 +75,17 @@ h1, h2, h3, h4, h5, h6 {
 .animate-qw-blink {
   animation: qw-blink 1s steps(2, start) infinite;
 }
+
+/* #421 / quadwork#305: activity-indicator text shimmer.
+   Color-only (no text-shadow, no background, no filter) so the
+   shimmer matches the "minimal aesthetic" constraint in the
+   ticket. Pulses between the accent green and a desaturated
+   mid-point so the active agent label stands out against the
+   muted sibling labels without being garish. */
+@keyframes qw-name-shimmer {
+  0%, 100% { color: var(--accent); }
+  50% { color: color-mix(in srgb, var(--accent) 55%, #e0e0e0); }
+}
+.animate-name-shimmer {
+  animation: qw-name-shimmer 1.6s ease-in-out infinite;
+}

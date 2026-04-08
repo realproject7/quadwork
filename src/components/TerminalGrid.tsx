@@ -5,7 +5,11 @@ import TerminalPanel from "./TerminalPanel";
 
 // #399 / quadwork#264: how long an agent stays "active" after its
 // last PTY output before the activity ring stops pulsing.
-const ACTIVITY_WINDOW_MS = 2000;
+// #421 / quadwork#305: bumped from 2000 → 5000ms. 2s felt like a
+// flicker on bursty PTY output; 5s keeps the indicator steady for
+// the duration of a typical agent working burst while still going
+// idle shortly after the agent stops producing output.
+const ACTIVITY_WINDOW_MS = 5000;
 
 interface Agent {
   id: string;
@@ -115,7 +119,18 @@ export default function TerminalGrid({
                       : "bg-text-muted"
                   }`} />
                 </span>
-                <span className="text-[11px] text-text-muted uppercase tracking-wider">
+                {/* #421 / quadwork#305: active agent's label goes
+                    accent + shimmers so the operator has a bigger
+                    visual cue than the tiny dot ring. Color-only
+                    keyframe (no shadow / background / blur) per
+                    the ticket's "minimal aesthetic" constraint. */}
+                <span
+                  className={`text-[11px] uppercase tracking-wider ${
+                    agentStates[agent.id] === "running" && isActive(agent.id)
+                      ? "text-accent animate-name-shimmer"
+                      : "text-text-muted"
+                  }`}
+                >
                   {agent.label}
                 </span>
               </div>
