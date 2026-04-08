@@ -935,9 +935,27 @@ router.post("/api/setup", (req, res) => {
         fetch(
           `http://127.0.0.1:${qwPort}/api/agentchattr/${encodeURIComponent(id)}/restart`,
           { method: "POST" },
-        ).catch((err) => {
-          console.warn(`[setup] auto-spawn AgentChattr for ${id} failed:`, err.message || err);
-        });
+        )
+          .then(async (r) => {
+            // /restart reports spawn failures (e.g. port collision —
+            // server/index.js:650-668) as HTTP 500, so a resolved
+            // fetch is not the same thing as a successful spawn. Log
+            // non-2xx responses with status and body so the operator
+            // can see why the auto-spawn silently didn't take.
+            if (!r.ok) {
+              let detail = "";
+              try { detail = (await r.text()).slice(0, 500); } catch {}
+              console.warn(
+                `[setup] auto-spawn AgentChattr for ${id} returned HTTP ${r.status}: ${detail}`,
+              );
+            }
+          })
+          .catch((err) => {
+            console.warn(
+              `[setup] auto-spawn AgentChattr for ${id} failed:`,
+              err.message || err,
+            );
+          });
       } catch (err) {
         console.warn(`[setup] auto-spawn AgentChattr for ${id} skipped:`, err.message || err);
       }
