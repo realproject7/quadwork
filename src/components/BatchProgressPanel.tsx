@@ -25,17 +25,12 @@ interface BatchProgressPanelProps {
 
 const BAR_SEGMENTS = 20;
 
-function ProgressBar({ percent, status }: { percent: number; status: BatchProgressItem["status"] }) {
+function ProgressBar({ percent }: { percent: number }) {
   const filled = Math.round((percent / 100) * BAR_SEGMENTS);
   const empty = BAR_SEGMENTS - filled;
-  // Use the accent color for in-progress, a calmer green-ish accent
-  // for merged. Tailwind doesn't ship a green-500 in this theme, so
-  // reuse the existing accent + a slight opacity for the merged
-  // case to keep visual cohesion with the rest of the dashboard.
-  const fillClass = status === "merged" ? "text-accent" : "text-accent";
   return (
     <span className="font-mono text-[11px] tabular-nums whitespace-nowrap">
-      <span className={fillClass}>{"█".repeat(filled)}</span>
+      <span className="text-accent">{"█".repeat(filled)}</span>
       <span className="text-text-muted">{"░".repeat(empty)}</span>
     </span>
   );
@@ -122,7 +117,7 @@ export default function BatchProgressPanel({ projectId }: BatchProgressPanelProp
               <span className="text-[11px] text-text-muted w-8 shrink-0 tabular-nums">
                 #{item.issue_number}
               </span>
-              <ProgressBar percent={item.progress} status={item.status} />
+              <ProgressBar percent={item.progress} />
               <span className="text-[11px] text-text-muted tabular-nums shrink-0 w-9 text-right">
                 {item.progress}%
               </span>

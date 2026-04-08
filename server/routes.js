@@ -891,8 +891,17 @@ function progressForItem(repo, issueNumber) {
     };
   }
   // Count distinct APPROVED reviews per author so a stale APPROVED
-  // followed by REQUEST_CHANGES doesn't double-count.
-  const reviews = Array.isArray(prData.reviews) ? prData.reviews : [];
+  // followed by REQUEST_CHANGES doesn't double-count. Sort by
+  // submittedAt ascending first so the Map's "last write wins"
+  // genuinely lands on the freshest review per author — gh's
+  // current ordering is chronological in practice but undocumented,
+  // so the explicit sort keeps us safe if that ever changes.
+  const reviews = Array.isArray(prData.reviews) ? prData.reviews.slice() : [];
+  reviews.sort((a, b) => {
+    const ta = (a && a.submittedAt) ? Date.parse(a.submittedAt) : 0;
+    const tb = (b && b.submittedAt) ? Date.parse(b.submittedAt) : 0;
+    return ta - tb;
+  });
   const latestByAuthor = new Map();
   for (const r of reviews) {
     const author = (r && r.author && r.author.login) || "";
