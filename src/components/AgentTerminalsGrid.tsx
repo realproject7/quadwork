@@ -9,11 +9,18 @@ import TerminalGrid from "./TerminalGrid";
 // Dev) because it used to live alongside a dedicated Head panel —
 // pass the full four-agent list explicitly so Head doesn't get
 // dropped when the old Head panel was removed.
+//
+// #400 / quadwork#265: layout order is Head TL, Dev TR,
+// Reviewer1 BL, Reviewer2 BR. TerminalGrid renders tiles in array
+// order into a 2x2 row-flow grid (default `grid grid-rows-2
+// grid-cols-2`, no `grid-flow-col`), so [head, dev, reviewer1,
+// reviewer2] maps to TL, TR, BL, BR. Keep them in sync if you
+// reorder this list.
 const FOUR_AGENTS = [
   { id: "head", label: "Head" },
+  { id: "dev", label: "Dev" },
   { id: "reviewer1", label: "Reviewer1" },
   { id: "reviewer2", label: "Reviewer2" },
-  { id: "dev", label: "Dev" },
 ];
 
 type AgentState = "running" | "stopped" | "error";
