@@ -12,8 +12,10 @@ import TerminalGrid from "./TerminalGrid";
 //
 // #400 / quadwork#265: layout order is Head TL, Dev TR,
 // Reviewer1 BL, Reviewer2 BR. TerminalGrid renders tiles in array
-// order into a 2x2 (col-flow), so the array order IS the visual
-// order — keep them in sync if you reorder this list.
+// order into a 2x2 row-flow grid (default `grid grid-rows-2
+// grid-cols-2`, no `grid-flow-col`), so [head, dev, reviewer1,
+// reviewer2] maps to TL, TR, BL, BR. Keep them in sync if you
+// reorder this list.
 const FOUR_AGENTS = [
   { id: "head", label: "Head" },
   { id: "dev", label: "Dev" },
