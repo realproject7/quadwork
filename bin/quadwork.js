@@ -1480,6 +1480,37 @@ function migrateLegacyProjects(config) {
   return true;
 }
 
+/**
+ * #403 / quadwork#274 migration: append `[routing] max_agent_hops = 30`
+ * to any per-project config.toml that's missing it. Idempotent and
+ * conservative — leaves files that already have a `max_agent_hops`
+ * key alone (whatever value the operator picked stays put), and
+ * leaves files that have a [routing] section but no max_agent_hops
+ * key alone too rather than risk patching a section we don't fully
+ * understand. The web/CLI templates write the key on first run, so
+ * this only catches projects created before #403.
+ */
+function migrateLoopGuardDefaults(config) {
+  if (!config.projects || config.projects.length === 0) return;
+  for (const project of config.projects) {
+    if (!project.id) continue;
+    const tomlPath = project.agentchattr_dir
+      ? path.join(project.agentchattr_dir, "config.toml")
+      : path.join(CONFIG_DIR, project.id, "agentchattr", "config.toml");
+    if (!fs.existsSync(tomlPath)) continue;
+    let content;
+    try { content = fs.readFileSync(tomlPath, "utf-8"); } catch { continue; }
+    if (/^\s*max_agent_hops\s*=/m.test(content)) continue;
+    if (/^\s*\[routing\]/m.test(content)) continue;
+    const trailing = content.endsWith("\n") ? "" : "\n";
+    const addition = `${trailing}\n[routing]\ndefault = "none"\nmax_agent_hops = 30\n`;
+    try {
+      fs.writeFileSync(tomlPath, content + addition);
+      log(`  Loop guard default → ${project.id} (max_agent_hops = 30)`);
+    } catch { /* non-fatal */ }
+  }
+}
+
 function cmdStart() {
   console.log("\n  QuadWork Start\n");
 
@@ -1492,6 +1523,14 @@ function cmdStart() {
   // own per-project clones before any AgentChattr spawn happens.
   // Idempotent — a no-op once every project already has a working clone.
   migrateLegacyProjects(config);
+
+  // Batch 30 / #403 / quadwork#274: ensure every existing project's
+  // AgentChattr config.toml has [routing] max_agent_hops = 30 so the
+  // loop guard doesn't fire mid-PR-cycle. Idempotent: leaves any
+  // pre-existing routing section alone (only adds the section + key
+  // when both are missing). Failures are non-fatal — the project
+  // will just keep its current loop guard.
+  migrateLoopGuardDefaults(config);
 
   const quadworkDir = path.join(__dirname, "..");
   const port = config.port || 8400;

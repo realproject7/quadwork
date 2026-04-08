@@ -174,6 +174,113 @@ function sendViaWebSocket(baseUrl, sessionToken, message) {
   });
 }
 
+/**
+ * #403 / quadwork#274: send an arbitrary AC ws event (not a chat
+ * message). Used for `update_settings` so the loop guard widget can
+ * push the new max_agent_hops to the running AgentChattr without a
+ * full restart. Mirrors sendViaWebSocket but lets the caller pick
+ * the event type.
+ */
+function sendWsEvent(baseUrl, sessionToken, event) {
+  return new Promise((resolve, reject) => {
+    const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(sessionToken || "")}`;
+    const ws = new NodeWebSocket(wsUrl);
+    let settled = false;
+    const finish = (err, value) => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      if (err) reject(err); else resolve(value);
+    };
+    const giveUp = setTimeout(() => finish(new Error("websocket send timeout")), 4000);
+    ws.on("open", () => {
+      try {
+        ws.send(JSON.stringify(event));
+        setTimeout(() => { clearTimeout(giveUp); finish(null, { ok: true }); }, 250);
+      } catch (err) { clearTimeout(giveUp); finish(err); }
+    });
+    ws.on("error", (err) => { clearTimeout(giveUp); finish(err); });
+    ws.on("close", (code, reason) => {
+      if (!settled && code === 4003) {
+        clearTimeout(giveUp);
+        const msg = (reason && reason.toString()) || "forbidden: invalid session token";
+        const e = new Error(msg);
+        e.code = "EAGENTCHATTR_401";
+        finish(e);
+      }
+    });
+  });
+}
+
+// #403 / quadwork#274: read/write the loop guard for a given project.
+// Source of truth at rest is the project's config.toml [routing]
+// max_agent_hops. The PUT also pushes the value to the running AC via
+// `update_settings` so the change is live without a daemon restart.
+router.get("/api/loop-guard", (req, res) => {
+  const projectId = req.query.project;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const tomlPath = path.join(CONFIG_DIR, projectId, "agentchattr", "config.toml");
+  if (!fs.existsSync(tomlPath)) return res.json({ value: 30, source: "default" });
+  try {
+    const content = fs.readFileSync(tomlPath, "utf-8");
+    const m = content.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
+    const value = m ? parseInt(m[1], 10) : 30;
+    res.json({ value, source: m ? "toml" : "default" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to read config.toml", detail: err.message });
+  }
+});
+
+router.put("/api/loop-guard", async (req, res) => {
+  const projectId = req.query.project || req.body?.project;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const raw = req.body?.value;
+  const value = typeof raw === "number" ? raw : parseInt(raw, 10);
+  // AC's update_settings handler clamps to [1, 50]; mirror that
+  // here so we don't write a value AC will silently rewrite.
+  if (!Number.isInteger(value) || value < 4 || value > 50) {
+    return res.status(400).json({ error: "value must be an integer between 4 and 50" });
+  }
+
+  // 1. Persist to config.toml so the next restart picks it up.
+  const tomlPath = path.join(CONFIG_DIR, projectId, "agentchattr", "config.toml");
+  if (!fs.existsSync(tomlPath)) {
+    return res.status(404).json({ error: "config.toml not found for project" });
+  }
+  try {
+    let content = fs.readFileSync(tomlPath, "utf-8");
+    if (/^\s*max_agent_hops\s*=/m.test(content)) {
+      content = content.replace(/^\s*max_agent_hops\s*=.*$/m, `max_agent_hops = ${value}`);
+    } else if (/^\s*\[routing\]/m.test(content)) {
+      // Section exists but the key doesn't — append the key on the
+      // line right after the [routing] header to keep it scoped.
+      content = content.replace(/^(\s*\[routing\]\s*\n)/m, `$1max_agent_hops = ${value}\n`);
+    } else {
+      const trailing = content.endsWith("\n") ? "" : "\n";
+      content += `${trailing}\n[routing]\ndefault = "none"\nmax_agent_hops = ${value}\n`;
+    }
+    fs.writeFileSync(tomlPath, content);
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to write config.toml", detail: err.message });
+  }
+
+  // 2. Best-effort push to the running AC so the change is live.
+  // Failures here are non-fatal: the next restart still picks up
+  // the persisted value.
+  let live = false;
+  try {
+    const { url: base, token: sessionToken } = getChattrConfig(projectId);
+    if (base) {
+      await sendWsEvent(base, sessionToken, { type: "update_settings", data: { max_agent_hops: value } });
+      live = true;
+    }
+  } catch (err) {
+    console.warn(`[loop-guard] live update failed for ${projectId}: ${err.message || err}`);
+  }
+
+  res.json({ ok: true, value, live });
+});
+
 router.post("/api/chat", async (req, res) => {
   const projectId = req.query.project || req.body.project;
   const { url: base, token: sessionToken } = getChattrConfig(projectId);
@@ -839,6 +946,11 @@ router.post("/api/setup", (req, res) => {
         const wtDir = path.join(parentDir, `${dirName}-${agent}`);
         content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${agent.charAt(0).toUpperCase() + agent.slice(1)} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
       });
+      // #403 / quadwork#274: raise the loop guard from AC's default
+      // of 4 to 30 so autonomous PR review cycles (head→dev→re1+re2→
+      // dev→head, ~5 hops) don't fire mid-batch and force the
+      // operator to type /continue. AC clamps to [1, 50] internally.
+      content += `[routing]\ndefault = "none"\nmax_agent_hops = 30\n\n`;
       content += `[mcp]\nhttp_port = ${mcp_http}\nsse_port = ${mcp_sse}\n`;
       fs.writeFileSync(tomlPath, content);
 

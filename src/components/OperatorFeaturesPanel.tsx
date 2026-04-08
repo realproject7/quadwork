@@ -3,6 +3,7 @@
 import PanelHeader from "./PanelHeader";
 import ScheduledTriggerWidget from "./ScheduledTriggerWidget";
 import TelegramBridgeWidget from "./TelegramBridgeWidget";
+import LoopGuardWidget from "./LoopGuardWidget";
 
 /**
  * Bottom-right quadrant of the project dashboard (#208).
@@ -21,6 +22,7 @@ export default function OperatorFeaturesPanel({ projectId }: { projectId: string
       <PanelHeader label="Operator Features" />
       <div className="flex-1 min-h-0 flex flex-col gap-2 p-2 overflow-auto">
         <ScheduledTriggerWidget projectId={projectId} />
+        <LoopGuardWidget projectId={projectId} />
         <TelegramBridgeWidget projectId={projectId} />
       </div>
     </div>
