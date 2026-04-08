@@ -341,6 +341,24 @@ const PROJECT_HISTORY_VERSION = 1;
 const PROJECT_HISTORY_MAX_BYTES = 10 * 1024 * 1024; // 10 MB cap per issue
 const PROJECT_HISTORY_REPLAY_DELAY_MS = 25; // pace AC ws inserts
 
+// #414 / quadwork#297: reject imports whose messages claim a
+// reserved agent / system sender by default. This closes the only
+// path in QuadWork that lets a client-supplied sender reach AC
+// (every other route hardcodes / sanitizes to operator). Mirrors
+// the RESERVED_OPERATOR_NAMES denylist from sanitizeOperatorName so
+// the same identities are blocked across the codebase.
+const RESERVED_HISTORY_SENDERS = new Set([
+  "head",
+  "dev",
+  "reviewer1",
+  "reviewer2",
+  "t1",
+  "t2a",
+  "t2b",
+  "t3",
+  "system",
+]);
+
 router.get("/api/project-history", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
@@ -417,6 +435,45 @@ router.post("/api/project-history", async (req, res) => {
     });
   }
 
+  // #414 / quadwork#297 — Issue 1: agent/system sender denylist.
+  // Pre-scan the messages array; if any line claims a reserved
+  // identity, reject the entire import unless the operator opted
+  // in via allow_agent_senders=true. Default-safe so a leaked or
+  // crafted export file can't post as Head from the dashboard.
+  if (!body.allow_agent_senders) {
+    const offenders = new Set();
+    for (const m of body.messages) {
+      if (m && typeof m === "object" && typeof m.sender === "string") {
+        if (RESERVED_HISTORY_SENDERS.has(m.sender.toLowerCase())) {
+          offenders.add(m.sender);
+          if (offenders.size >= 5) break;
+        }
+      }
+    }
+    if (offenders.size > 0) {
+      return res.status(400).json({
+        error: `Import contains messages attributed to reserved agent/system identities: ${[...offenders].join(", ")}. Resend with allow_agent_senders=true to override (e.g. legitimate disaster-recovery restore).`,
+      });
+    }
+  }
+
+  // #414 / quadwork#297 — Issue 2: duplicate import detection.
+  // Persist the most recent imported `exported_at` on the project
+  // entry in config.json. If the file's marker matches, refuse the
+  // import unless allow_duplicate=true. Re-importing the same file
+  // would otherwise replay every message a second time and double
+  // the chat history.
+  const cfg = readConfigFile();
+  const project = cfg.projects?.find((p) => p.id === projectId);
+  const incomingExportedAt = typeof body.exported_at === "string" ? body.exported_at : null;
+  if (!body.allow_duplicate && project && incomingExportedAt) {
+    if (project.history_last_imported_at === incomingExportedAt) {
+      return res.status(409).json({
+        error: `This export was already imported (exported_at=${incomingExportedAt}). Resend with allow_duplicate=true to import again.`,
+      });
+    }
+  }
+
   const { url: base, token: sessionToken } = getChattrConfig(projectId);
   if (!base) return res.status(400).json({ error: "No AgentChattr configured for project" });
 
@@ -462,6 +519,16 @@ router.post("/api/project-history", async (req, res) => {
       await new Promise((r) => setTimeout(r, PROJECT_HISTORY_REPLAY_DELAY_MS));
     }
   }
+  // #414 / quadwork#297 — Issue 2: stamp the import marker on the
+  // project so a re-import of the same file is caught next time.
+  // Only update on a successful (no errors) replay so a half-broken
+  // import can be retried without the duplicate guard tripping.
+  if (incomingExportedAt && errors.length === 0 && project) {
+    project.history_last_imported_at = incomingExportedAt;
+    try { writeConfigFile(cfg); }
+    catch (err) { console.warn(`[history] failed to persist history_last_imported_at: ${err.message || err}`); }
+  }
+
   res.json({ ok: errors.length === 0, imported, skipped, total: body.messages.length, errors });
 });
 

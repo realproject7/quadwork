@@ -101,13 +101,63 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
       }
       allowMismatch = true;
     }
-    try {
-      const r = await fetch(`/api/project-history?project=${encodeURIComponent(projectId)}`, {
+    // #414 / quadwork#297: pre-scan for reserved agent senders so
+    // we can prompt once instead of after a server 400. The same
+    // RESERVED set lives in server/routes.js — keep them in sync.
+    const RESERVED_SENDERS = new Set(["head", "dev", "reviewer1", "reviewer2", "t1", "t2a", "t2b", "t3", "system"]);
+    let allowAgentSenders = false;
+    const offenders = new Set<string>();
+    for (const m of parsed.messages) {
+      if (m && typeof m === "object") {
+        const sender = (m as { sender?: unknown }).sender;
+        if (typeof sender === "string" && RESERVED_SENDERS.has(sender.toLowerCase())) {
+          offenders.add(sender);
+          if (offenders.size >= 5) break;
+        }
+      }
+    }
+    if (offenders.size > 0) {
+      const ok = window.confirm(
+        `This export contains messages attributed to reserved agent/system identities (${[...offenders].join(", ")}). Importing will replay them as those agents — only do this for a legitimate disaster-recovery restore. Continue?`,
+      );
+      if (!ok) {
+        setBusy(null);
+        return;
+      }
+      allowAgentSenders = true;
+    }
+    // Server-side duplicate detection sends a 409 the first time;
+    // we forward allow_duplicate after asking the operator. We can't
+    // pre-check this client-side since we don't store the marker
+    // here — let the server tell us, then re-POST with the flag.
+    let allowDuplicate = false;
+    const post = (extra: Record<string, unknown>) =>
+      fetch(`/api/project-history?project=${encodeURIComponent(projectId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...parsed, allow_project_mismatch: allowMismatch }),
+        body: JSON.stringify({
+          ...parsed,
+          allow_project_mismatch: allowMismatch,
+          allow_agent_senders: allowAgentSenders,
+          allow_duplicate: allowDuplicate,
+          ...extra,
+        }),
       });
-      const data = await r.json().catch(() => null);
+    try {
+      let r = await post({});
+      let data = await r.json().catch(() => null);
+      if (r.status === 409 && data && typeof data.error === "string" && /already imported/i.test(data.error)) {
+        const ok = window.confirm(
+          `${data.error}\n\nThis file looks like it was already imported. Re-import will duplicate every message. Continue anyway?`,
+        );
+        if (!ok) {
+          setBusy(null);
+          return;
+        }
+        allowDuplicate = true;
+        r = await post({ allow_duplicate: true });
+        data = await r.json().catch(() => null);
+      }
       if (!r.ok) {
         throw new Error((data && data.error) || `HTTP ${r.status}`);
       }
