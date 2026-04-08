@@ -24,6 +24,21 @@ const SENDER_COLORS: Record<string, string> = {
 
 const AGENTS = ["head", "reviewer1", "reviewer2", "dev", "user"];
 
+// #410 / quadwork#276: slash commands recognized by AgentChattr's
+// native UI (mirrors agentchattr/static/chat.js lines 1978-1989).
+// Typing `/` in the chat input opens an autocomplete menu of these.
+const SLASH_COMMANDS: { command: string; description: string }[] = [
+  { command: "/artchallenge", description: "SVG art challenge — all agents create artwork (optional theme)" },
+  { command: "/hatmaking", description: "All agents design a hat to wear on their avatar" },
+  { command: "/roastreview", description: "Get all agents to review and roast each other's work" },
+  { command: "/poetry haiku", description: "Agents write a haiku about the codebase" },
+  { command: "/poetry limerick", description: "Agents write a limerick about the codebase" },
+  { command: "/poetry sonnet", description: "Agents write a sonnet about the codebase" },
+  { command: "/summary", description: "Summarize recent messages — tag an agent (e.g. /summary @head)" },
+  { command: "/continue", description: "Resume after loop guard pauses" },
+  { command: "/clear", description: "Clear messages in current channel" },
+];
+
 function senderColor(sender: string): string {
   return SENDER_COLORS[sender.toLowerCase()] || "#e0e0e0";
 }
@@ -164,6 +179,15 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
   const [input, setInput] = useState("");
   const [showMentions, setShowMentions] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
+  // #410 / quadwork#276: slash command autocomplete menu state.
+  // Opens whenever the input *starts* with `/` and there's no later
+  // space (so `/poetry hai` still matches but `/clear extra` exits
+  // back to free-typed mode).
+  const [showSlashMenu, setShowSlashMenu] = useState(false);
+  // #410 / quadwork#276: keyboard selection index into the
+  // currently-filtered slash menu. ArrowUp/Down move it, Enter
+  // commits the active row instead of sending the partial buffer.
+  const [slashIndex, setSlashIndex] = useState(0);
   const [authError, setAuthError] = useState<string | null>(null);
   // #397 / quadwork#262: tracks the message the next send will be a
   // threaded reply to. Cleared after a successful send or on cancel.
@@ -275,8 +299,14 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
     // `@head ` so the message has somewhere to go. Unknown
     // `@whatever` mentions don't count — Head is still added.
     // Known agents: head, dev, reviewer1, reviewer2.
+    //
+    // #410 / quadwork#276: slash commands are routed by AgentChattr
+    // itself and must NOT be wrapped in `@head /continue` — that
+    // would silently break them. Skip the auto-tag when the message
+    // starts with `/`.
     const KNOWN_AGENT_RE = /@(head|dev|reviewer1|reviewer2)\b/i;
-    const text = KNOWN_AGENT_RE.test(raw) ? raw : `@head ${raw}`;
+    const startsWithSlash = raw.startsWith("/");
+    const text = (startsWithSlash || KNOWN_AGENT_RE.test(raw)) ? raw : `@head ${raw}`;
     setSending(true);
     setSendError(null);
     fetch(`/api/chat${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`, {
@@ -302,15 +332,30 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
       .finally(() => setSending(false));
   };
 
-  // @mention handling
+  // @mention + slash command handling
   const handleInput = (value: string) => {
     setInput(value);
     const atMatch = value.match(/@(\w*)$/);
     if (atMatch) {
       setShowMentions(true);
       setMentionFilter(atMatch[1].toLowerCase());
+      setShowSlashMenu(false);
+      return;
+    }
+    setShowMentions(false);
+    // #410 / quadwork#276: slash menu opens whenever the buffer
+    // starts with `/`. Special-case `/poetry ` (the only multi-word
+    // command) so the menu stays open while typing the variant.
+    if (value.startsWith("/")) {
+      const tail = value.slice(1);
+      const hasSpace = tail.includes(" ");
+      const isPoetryVariant = value.startsWith("/poetry");
+      setShowSlashMenu(!hasSpace || isPoetryVariant);
+      // Reset the active row whenever the filter changes so the
+      // selection doesn't dangle past the now-shorter list.
+      setSlashIndex(0);
     } else {
-      setShowMentions(false);
+      setShowSlashMenu(false);
     }
   };
 
@@ -321,8 +366,22 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
     inputRef.current?.focus();
   };
 
+  const insertSlashCommand = (command: string) => {
+    // Multi-word commands like "/poetry haiku" need a trailing
+    // space-less insert; single-word commands get a trailing space
+    // so the operator can keep typing args (e.g. "/summary @head").
+    const isMultiWord = command.includes(" ");
+    setInput(isMultiWord ? command : `${command} `);
+    setShowSlashMenu(false);
+    inputRef.current?.focus();
+  };
+
   const filteredAgents = AGENTS.filter((a) =>
     a.toLowerCase().startsWith(mentionFilter)
+  );
+
+  const filteredSlashCommands = SLASH_COMMANDS.filter((c) =>
+    c.command.toLowerCase().startsWith(input.toLowerCase()),
   );
 
   return (
@@ -409,6 +468,27 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             ))}
           </div>
         )}
+        {/* #410 / quadwork#276: slash command autocomplete dropdown */}
+        {showSlashMenu && filteredSlashCommands.length > 0 && (
+          <div className="absolute bottom-full left-0 right-0 max-h-60 overflow-y-auto border border-border bg-bg-surface z-10">
+            {filteredSlashCommands.map((c, i) => {
+              const active = i === Math.min(slashIndex, filteredSlashCommands.length - 1);
+              return (
+                <button
+                  key={c.command}
+                  onClick={() => insertSlashCommand(c.command)}
+                  onMouseEnter={() => setSlashIndex(i)}
+                  className={`w-full text-left px-3 py-1 transition-colors flex items-baseline gap-2 ${
+                    active ? "bg-[#1a1a1a]" : "hover:bg-[#1a1a1a]"
+                  }`}
+                >
+                  <span className="text-[12px] text-accent font-mono">{c.command}</span>
+                  <span className="text-[10px] text-text-muted truncate">{c.description}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
         {sendError && (
           <div className="px-3 py-1 text-[11px] text-red-400 bg-red-900/20 border-b border-red-700/40">
             {sendError}
@@ -437,11 +517,34 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             value={input}
             onChange={(e) => handleInput(e.target.value)}
             onKeyDown={(e) => {
-              // Tab: autocomplete first filtered @mention
+              // Tab: autocomplete first filtered @mention or slash
               if (e.key === "Tab" && showMentions && filteredAgents.length > 0) {
                 e.preventDefault();
                 insertMention(filteredAgents[0]);
                 return;
+              }
+              // #410 / quadwork#276: when the slash menu is open,
+              // Tab/Enter commit the active row, ArrowUp/ArrowDown
+              // move it. Enter must NOT call send() in this state —
+              // typing /po + Enter would otherwise post the partial
+              // /po literal instead of selecting a /poetry variant.
+              if (showSlashMenu && filteredSlashCommands.length > 0) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setSlashIndex((i) => (i + 1) % filteredSlashCommands.length);
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setSlashIndex((i) => (i - 1 + filteredSlashCommands.length) % filteredSlashCommands.length);
+                  return;
+                }
+                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                  e.preventDefault();
+                  const safeIdx = Math.min(slashIndex, filteredSlashCommands.length - 1);
+                  insertSlashCommand(filteredSlashCommands[safeIdx].command);
+                  return;
+                }
               }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -449,6 +552,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
               }
               if (e.key === "Escape") {
                 setShowMentions(false);
+                setShowSlashMenu(false);
                 if (replyTo) setReplyTo(null);
               }
             }}
