@@ -80,7 +80,9 @@ function ActivityHero() {
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
-  // Empty state — fresh install, nothing logged yet.
+  // Empty state — fresh install, nothing logged yet. Ticket
+  // explicitly requires a CTA to /setup from here so a new user
+  // can bootstrap their first project in one click.
   if (stats && (!stats.total || stats.total === 0)) {
     return (
       <div className="mb-6 border border-accent/30 bg-accent/5 rounded p-6 text-center">
@@ -89,6 +91,14 @@ function ActivityHero() {
         </div>
         <div className="text-[11px] text-text-muted mt-1">
           Kick off a batch and come back in the morning.
+        </div>
+        <div className="mt-3">
+          <Link
+            href="/setup"
+            className="inline-block px-3 py-1 text-[11px] text-accent border border-accent/40 rounded hover:bg-accent/10 transition-colors"
+          >
+            Set up your first project →
+          </Link>
         </div>
       </div>
     );

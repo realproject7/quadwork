@@ -752,11 +752,20 @@ function computeActivityStats() {
 
   const totals = { today_ms: 0, week_ms: 0, month_ms: 0, total_ms: 0 };
   const byProject = {};
-  let projectDirs = [];
-  try { projectDirs = fs.readdirSync(CONFIG_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => d.name); } catch {}
-  for (const projectId of projectDirs) {
+  // #430 / quadwork#312: only count projects registered in
+  // config.json, not every directory under ~/.quadwork/. Stray
+  // folders from deleted / unconfigured projects must not inflate
+  // the stats — that's explicit in #312's acceptance.
+  let projectIds = [];
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    if (Array.isArray(cfg.projects)) {
+      projectIds = cfg.projects.map((p) => p && p.id).filter((id) => typeof id === "string" && id);
+    }
+  } catch {
+    // config unreadable → no projects → empty stats (safe fallback)
+  }
+  for (const projectId of projectIds) {
     const p = activityLogPath(projectId);
     if (!fs.existsSync(p)) continue;
     const projectTotals = { today_ms: 0, week_ms: 0, month_ms: 0, total_ms: 0 };
