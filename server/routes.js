@@ -606,6 +606,74 @@ router.post("/api/project-history", async (req, res) => {
   res.json({ ok: errors.length === 0, imported, skipped, total: body.messages.length, errors });
 });
 
+// #424 / quadwork#304 Phase 4: list + restore auto-snapshots.
+// snapshotProjectHistory() in server/index.js writes envelope
+// files to ~/.quadwork/{id}/history-snapshots/{ISO}.json before
+// destructive restart/update operations. These endpoints let the
+// Project History widget surface them with a restore button so
+// the operator can roll back a bad /clear or botched update.
+router.get("/api/project-history/snapshots", (req, res) => {
+  const projectId = req.query.project;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const snapDir = path.join(CONFIG_DIR, projectId, "history-snapshots");
+  if (!fs.existsSync(snapDir)) return res.json({ snapshots: [] });
+  try {
+    const entries = fs.readdirSync(snapDir)
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => {
+        const st = fs.statSync(path.join(snapDir, f));
+        return { name: f, size: st.size, mtime: st.mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    res.json({ snapshots: entries });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to list snapshots", detail: err.message });
+  }
+});
+
+router.post("/api/project-history/restore", async (req, res) => {
+  const projectId = req.query.project;
+  const name = req.query.name || req.body?.name;
+  if (!projectId || !name) return res.status(400).json({ error: "Missing project or name" });
+  // Prevent path traversal — only allow basenames from the snapshot
+  // directory; reject anything with a separator or ".." segment.
+  if (name !== path.basename(name) || name.includes("..") || !name.endsWith(".json")) {
+    return res.status(400).json({ error: "Invalid snapshot name" });
+  }
+  const snapPath = path.join(CONFIG_DIR, projectId, "history-snapshots", name);
+  if (!fs.existsSync(snapPath)) {
+    return res.status(404).json({ error: "Snapshot not found" });
+  }
+  let body;
+  try {
+    const text = fs.readFileSync(snapPath, "utf-8");
+    body = JSON.parse(text);
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to read snapshot", detail: err.message });
+  }
+  // Post the snapshot back through the existing import endpoint
+  // with both bypass flags — the snapshot contains real agent
+  // senders (so allow_agent_senders) and may match a previous
+  // restore's exported_at (so allow_duplicate). This is the
+  // legitimate disaster-recovery case the #297 denylist expected.
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const qwPort = cfg.port || 8400;
+    const r = await fetch(`http://127.0.0.1:${qwPort}/api/project-history?project=${encodeURIComponent(projectId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, allow_agent_senders: true, allow_duplicate: true }),
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok) {
+      return res.status(r.status).json(data || { error: `import returned ${r.status}` });
+    }
+    res.json({ ok: true, ...(data || {}) });
+  } catch (err) {
+    res.status(502).json({ error: "Restore failed", detail: err.message });
+  }
+});
+
 router.post("/api/chat", async (req, res) => {
   const projectId = req.query.project || req.body.project;
   const { url: base, token: sessionToken } = getChattrConfig(projectId);

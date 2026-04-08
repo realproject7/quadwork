@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface ProjectHistoryWidgetProps {
   projectId: string;
@@ -12,6 +12,16 @@ interface ImportResult {
   skipped: number;
   total: number;
   errors: string[];
+}
+
+// #424 / quadwork#304 Phase 4: auto-snapshot list for the restore
+// UI. Files live at ~/.quadwork/{id}/history-snapshots/{ISO}.json
+// and are created by snapshotProjectHistory() in server/index.js
+// before every restart/update.
+interface SnapshotEntry {
+  name: string;
+  size: number;
+  mtime: number;
 }
 
 const MAX_BYTES = 10 * 1024 * 1024;
@@ -27,9 +37,51 @@ const MAX_BYTES = 10 * 1024 * 1024;
  */
 export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidgetProps) {
   const fileRef = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState<"export" | "import" | null>(null);
+  const [busy, setBusy] = useState<"export" | "import" | "restore" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
+  const [snapshots, setSnapshots] = useState<SnapshotEntry[]>([]);
+
+  const loadSnapshots = () => {
+    fetch(`/api/project-history/snapshots?project=${encodeURIComponent(projectId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d && Array.isArray(d.snapshots)) setSnapshots(d.snapshots);
+      })
+      .catch(() => {});
+  };
+  useEffect(() => {
+    loadSnapshots();
+    // Refresh the list every 15s so a restart-triggered snapshot
+    // shows up without the operator reloading the dashboard.
+    const id = setInterval(loadSnapshots, 15000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
+  const restoreSnapshot = async (name: string) => {
+    const ok = window.confirm(
+      `Restore snapshot ${name}? This will replay every message through AgentChattr (tagged by the original sender) and may duplicate history already in the chat. Continue?`,
+    );
+    if (!ok) return;
+    setBusy("restore");
+    setError(null);
+    setResult(null);
+    try {
+      const r = await fetch(
+        `/api/project-history/restore?project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(name)}`,
+        { method: "POST" },
+      );
+      const data = await r.json().catch(() => null);
+      if (!r.ok) throw new Error((data && data.error) || `HTTP ${r.status}`);
+      if (data && typeof data.imported === "number") setResult(data as ImportResult);
+    } catch (err) {
+      setError((err as Error).message || String(err));
+    } finally {
+      setBusy(null);
+      loadSnapshots();
+    }
+  };
 
   const exportHistory = async () => {
     setBusy("export");
@@ -211,6 +263,39 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
           Imported {result.imported} / {result.total}
           {result.skipped > 0 && ` · skipped ${result.skipped}`}
           {result.errors.length > 0 && ` · ${result.errors.length} errors`}
+        </div>
+      )}
+      {snapshots.length > 0 && (
+        <div className="mt-2 border-t border-border/50 pt-1.5">
+          <div className="text-[9px] text-text-muted uppercase tracking-wider mb-0.5">
+            Auto-snapshots (before restart)
+          </div>
+          {snapshots.map((s) => {
+            const date = new Date(s.mtime);
+            const label = date.toLocaleString();
+            return (
+              <div
+                key={s.name}
+                className="flex items-center gap-1.5 text-[10px] py-0.5"
+              >
+                <span className="text-text-muted tabular-nums flex-1 truncate" title={s.name}>
+                  {label}
+                </span>
+                <span className="text-text-muted tabular-nums shrink-0">
+                  {Math.round(s.size / 1024)}KB
+                </span>
+                <button
+                  type="button"
+                  onClick={() => restoreSnapshot(s.name)}
+                  disabled={busy !== null}
+                  className="px-1.5 py-0.5 text-[10px] text-accent border border-accent/40 rounded hover:bg-accent/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                  title={`Restore ${s.name}`}
+                >
+                  {busy === "restore" ? "…" : "Restore"}
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
