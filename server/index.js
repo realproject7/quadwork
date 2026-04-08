@@ -903,6 +903,12 @@ async function handleAgentChattr(req, res) {
       // botched git pull can still be rolled back from disk.
       // #424 / quadwork#304: best-effort.
       await snapshotProjectHistory(projectId).catch(() => {});
+      // Latch the auto-restore opt-in BEFORE stop, same as the
+      // explicit restart branch above — a config mutation during
+      // the git pull shouldn't starve the replay.
+      const updateCfgPre = readConfig();
+      const updateProjectPre = updateCfgPre.projects?.find((p) => p.id === projectId);
+      const updateShouldAutoRestore = !!(updateProjectPre && updateProjectPre.auto_restore_after_restart);
       const proc = getProc();
       const wasRunning = proc.process && proc.state === "running";
       if (wasRunning) {
@@ -927,6 +933,30 @@ async function handleAgentChattr(req, res) {
         restarted = !!child;
         if (child) {
           setTimeout(() => syncChattrToken(projectId).catch(() => {}), 2000);
+          // #424 / quadwork#304 Phase 3: auto-restore after an
+          // update-triggered restart too (t2a re-review). Same
+          //3s wait + newest-snapshot-by-mtime path as the explicit
+          // restart branch, using the pre-stop latched opt-in.
+          if (updateShouldAutoRestore) {
+            setTimeout(async () => {
+              try {
+                const snapDir = path.join(require("os").homedir(), ".quadwork", projectId, "history-snapshots");
+                if (!fs.existsSync(snapDir)) return;
+                const newest = fs.readdirSync(snapDir)
+                  .filter((f) => f.endsWith(".json"))
+                  .map((f) => ({ f, t: fs.statSync(path.join(snapDir, f)).mtimeMs }))
+                  .sort((a, b) => b.t - a.t)[0];
+                if (!newest) return;
+                const r = await fetch(`http://127.0.0.1:${PORT}/api/project-history/restore?project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(newest.f)}`, {
+                  method: "POST",
+                });
+                if (r.ok) console.log(`[snapshot] ${projectId} auto-restored ${newest.f} after update`);
+                else console.warn(`[snapshot] ${projectId} post-update auto-restore returned ${r.status}`);
+              } catch (err) {
+                console.warn(`[snapshot] ${projectId} post-update auto-restore failed: ${err.message || err}`);
+              }
+            }, 3000);
+          }
         }
       }
 
