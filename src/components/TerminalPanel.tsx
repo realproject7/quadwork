@@ -65,9 +65,14 @@ export default function TerminalPanel({
 
     const term = new Terminal({
       scrollback: 1000,
-      fontSize: 12,
+      // #426 / quadwork#315: fontSize 12 → 11 + lineHeight 1.4 → 1.2
+      // drops per-line height from 16.8px to 13.2px, ~20% more
+      // rows per panel without scrolling and matches the chat
+      // panel's visual density. letterSpacing stays 0.5 so the
+      // smaller glyphs don't crowd.
+      fontSize: 11,
       fontFamily: '"Geist Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
-      lineHeight: 1.4,
+      lineHeight: 1.2,
       letterSpacing: 0.5,
       cursorBlink: false,
       cursorStyle: "block",
