@@ -216,11 +216,21 @@ function sendWsEvent(baseUrl, sessionToken, event) {
 // Source of truth at rest is the project's config.toml [routing]
 // max_agent_hops. The PUT also pushes the value to the running AC via
 // `update_settings` so the change is live without a daemon restart.
+// Resolve the per-project config.toml path through resolveProjectChattr
+// so we honor `project.agentchattr_dir` (web wizard sets this; legacy
+// imports can have arbitrary paths) and don't drift from the rest of
+// the codebase that already goes through that helper.
+function resolveProjectConfigToml(projectId) {
+  const resolved = resolveProjectChattr(projectId);
+  if (!resolved || !resolved.dir) return null;
+  return path.join(resolved.dir, "config.toml");
+}
+
 router.get("/api/loop-guard", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
-  const tomlPath = path.join(CONFIG_DIR, projectId, "agentchattr", "config.toml");
-  if (!fs.existsSync(tomlPath)) return res.json({ value: 30, source: "default" });
+  const tomlPath = resolveProjectConfigToml(projectId);
+  if (!tomlPath || !fs.existsSync(tomlPath)) return res.json({ value: 30, source: "default" });
   try {
     const content = fs.readFileSync(tomlPath, "utf-8");
     const m = content.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
@@ -243,8 +253,8 @@ router.put("/api/loop-guard", async (req, res) => {
   }
 
   // 1. Persist to config.toml so the next restart picks it up.
-  const tomlPath = path.join(CONFIG_DIR, projectId, "agentchattr", "config.toml");
-  if (!fs.existsSync(tomlPath)) {
+  const tomlPath = resolveProjectConfigToml(projectId);
+  if (!tomlPath || !fs.existsSync(tomlPath)) {
     return res.status(404).json({ error: "config.toml not found for project" });
   }
   try {
