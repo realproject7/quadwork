@@ -43,7 +43,17 @@ function writeConfigFile(cfg) {
 router.get("/api/config", (_req, res) => {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
-    res.json(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    // #409 / quadwork#273: overlay the sanitized operator_name so
+    // the chat panel's self-message filter compares against the same
+    // sender /api/chat actually stamps. The on-disk file keeps the
+    // raw value the operator typed (so a future feature can show
+    // both raw + effective), but every reader sees the effective
+    // value here — including SettingsPage, which now reflects what
+    // chat actually sends. This also makes a hand-edited file with
+    // garbage characters self-correct visibly on next reload.
+    parsed.operator_name = sanitizeOperatorName(parsed.operator_name);
+    res.json(parsed);
   } catch (err) {
     if (err.code === "ENOENT") return res.json(DEFAULT_CONFIG);
     res.status(500).json({ error: "Failed to read config", detail: err.message });
