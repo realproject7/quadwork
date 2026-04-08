@@ -64,7 +64,7 @@ function formatCountdown(ms: number): string {
  * Bottom-right operator widget for the Scheduled Trigger (#210).
  *
  * Combines the old Keep Alive timer with a custom message textarea.
- * "Send Message and Start Trigger" sends the typed message via the
+ * "Start Trigger" sends the typed message via the
  * existing /api/triggers/:id/start endpoint (which persists the
  * message on the project entry and immediately fires once), then
  * the backend's setInterval keeps firing at the configured cadence
@@ -189,7 +189,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       const r = await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ interval: intervalMin, duration: resolvedDurationMin, message, sendImmediately: true }),
+        body: JSON.stringify({ interval: intervalMin, duration: resolvedDurationMin, message }),
       });
       if (!r.ok) throw new Error(`${r.status}`);
       // After the backend persists the new values, treat them as the
@@ -287,7 +287,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
             disabled={busy || !message.trim()}
             className="self-start px-3 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
-            {busy ? "Starting…" : "Send Message and Start Trigger"}
+            {busy ? "Starting…" : "Start Trigger"}
           </button>
         </div>
       ) : (
