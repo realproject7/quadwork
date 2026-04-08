@@ -147,14 +147,20 @@ function startMcpProxy(projectId, agentId, upstreamUrl, token) {
   const existing = mcpProxies.get(key);
   if (existing) return Promise.resolve(`http://127.0.0.1:${existing.port}/mcp`);
 
+  // #394 / quadwork#253: token is mutable so the 409 recovery path can
+  // swap it via updateMcpProxyToken without rebinding the listener —
+  // Codex was launched with a fixed proxy URL on an ephemeral port and
+  // can't be told to use a new one mid-flight.
+  const tokenRef = { current: token };
   return new Promise((resolve, reject) => {
     const proxyServer = http.createServer((req, res) => {
       const parsedUrl = new URL(req.url, `http://127.0.0.1`);
       const targetUrl = `${upstreamUrl}${parsedUrl.pathname}${parsedUrl.search}`;
       const headers = { ...req.headers, host: new URL(upstreamUrl).host };
-      if (token) {
-        headers["authorization"] = `Bearer ${token}`;
-        headers["x-agent-token"] = token;
+      const tok = tokenRef.current;
+      if (tok) {
+        headers["authorization"] = `Bearer ${tok}`;
+        headers["x-agent-token"] = tok;
       }
       delete headers["content-length"];
 
@@ -181,10 +187,25 @@ function startMcpProxy(projectId, agentId, upstreamUrl, token) {
     proxyServer.on("error", (err) => reject(err));
     proxyServer.listen(0, "127.0.0.1", () => {
       const port = proxyServer.address().port;
-      mcpProxies.set(key, { server: proxyServer, port });
+      mcpProxies.set(key, { server: proxyServer, port, tokenRef });
       resolve(`http://127.0.0.1:${port}/mcp`);
     });
   });
+}
+
+/**
+ * Swap the bearer token of a running MCP proxy in place. Used by the
+ * sub-D 409 recovery path: rebinding the listener would change the
+ * ephemeral port and the running Codex process is pinned to the
+ * original URL, so we mutate the closure-captured tokenRef instead.
+ * Returns true if a proxy existed and was updated.
+ */
+function updateMcpProxyToken(projectId, agentId, newToken) {
+  const key = `${projectId}/${agentId}`;
+  const proxy = mcpProxies.get(key);
+  if (!proxy || !proxy.tokenRef) return false;
+  proxy.tokenRef.current = newToken;
+  return true;
 }
 
 function stopMcpProxy(projectId, agentId) {
@@ -432,12 +453,10 @@ async function recoverFrom409(projectId, agentId, session) {
   // AC with the new bearer token instead of the now-rejected one.
   if (session.acInjectMode === "flag" && session.acMcpHttpPort) {
     try { writeMcpConfigFile(projectId, agentId, session.acMcpHttpPort, replacement.token); } catch {}
-  } else if (session.acInjectMode === "proxy_flag" && session.acMcpHttpPort) {
-    try {
-      stopMcpProxy(projectId, agentId);
-      const upstreamUrl = `http://127.0.0.1:${session.acMcpHttpPort}`;
-      await startMcpProxy(projectId, agentId, upstreamUrl, replacement.token);
-    } catch {}
+  } else if (session.acInjectMode === "proxy_flag") {
+    // Codex is pinned to the original ephemeral proxy URL, so we
+    // can't tear the listener down — mutate the token in place.
+    try { updateMcpProxyToken(projectId, agentId, replacement.token); } catch {}
   }
 
   // If the assigned name changed (e.g. multi-instance slot collision)
