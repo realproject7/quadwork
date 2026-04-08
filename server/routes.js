@@ -892,21 +892,34 @@ function parseActiveBatch(queueText) {
   return { batchNumber, issueNumbers };
 }
 
-function ghJsonExec(args) {
-  try {
-    const out = execFileSync("gh", args, { encoding: "utf-8", timeout: 10000 });
-    return JSON.parse(out);
-  } catch {
-    return null;
-  }
+// #416 / quadwork#299: async variant used by the parallelized batch
+// progress fetcher. Wraps node's execFile in a promise.
+//
+// THROWS on subprocess failure (non-zero exit, timeout, JSON parse,
+// network) so progressForItemAsync can decide which subset of
+// failures should bubble up to the Promise.allSettled "fetch failed"
+// row vs. which should fall through to a softer state. The previous
+// catch-all-and-return-null contract collapsed real subprocess
+// errors into the "not found" branch, making the new failure-row
+// fallback unreachable for genuine command failures (t2a review).
+const { execFile: _execFile } = require("child_process");
+const _execFileAsync = require("util").promisify(_execFile);
+async function ghJsonExecAsync(args) {
+  const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 10000 });
+  return JSON.parse(stdout);
 }
 
-function progressForItem(repo, issueNumber) {
+async function progressForItemAsync(repo, issueNumber) {
   // Pull issue state + linked PRs in one call. closedByPullRequestsReferences
   // is gh's serializer for the GraphQL `closedByPullRequestsReferences`
   // edge — only present when a PR with `Fixes #N` / `Closes #N`
   // (or the link UI) targets the issue.
-  const issue = ghJsonExec([
+  // Issue fetch is the load-bearing call — if gh can't read the
+  // issue at all (404, network, auth, timeout) we can't compute a
+  // meaningful progress row. Let the rejection propagate to the
+  // route's Promise.allSettled so the operator sees a single
+  // "fetch failed" row instead of a misleading "queued" entry.
+  const issue = await ghJsonExecAsync([
     "issue",
     "view",
     String(issueNumber),
@@ -915,16 +928,6 @@ function progressForItem(repo, issueNumber) {
     "--json",
     "number,title,state,url,closedByPullRequestsReferences",
   ]);
-  if (!issue) {
-    return {
-      issue_number: issueNumber,
-      title: `#${issueNumber} (not found)`,
-      url: null,
-      status: "unknown",
-      progress: 0,
-      label: "not found",
-    };
-  }
   const linked = Array.isArray(issue.closedByPullRequestsReferences)
     ? issue.closedByPullRequestsReferences
     : [];
@@ -945,16 +948,27 @@ function progressForItem(repo, issueNumber) {
   }
   // Re-fetch the PR to get reviewDecision + reviews + state, since
   // the issue's closedByPullRequestsReferences edge only carries
-  // number/state/url.
-  const prData = ghJsonExec([
-    "pr",
-    "view",
-    String(pr.number),
-    "-R",
-    repo,
-    "--json",
-    "number,state,url,reviewDecision,reviews",
-  ]);
+  // number/state/url. The PR fetch is intentionally soft: if gh
+  // glitches on this single call we still know the PR exists (we
+  // got the link from the issue) and can render a partial
+  // "in_review" row, which is more useful than dropping the whole
+  // item to "fetch failed". A persistent failure here will still
+  // surface on the next cache miss because the issue fetch above
+  // is the load-bearing one that controls the per-item rejection.
+  let prData = null;
+  try {
+    prData = await ghJsonExecAsync([
+      "pr",
+      "view",
+      String(pr.number),
+      "-R",
+      repo,
+      "--json",
+      "number,state,url,reviewDecision,reviews",
+    ]);
+  } catch {
+    // soft fall-through to the in_review row below
+  }
   if (!prData) {
     return {
       issue_number: issue.number,
@@ -1050,7 +1064,7 @@ function summarizeItems(items) {
   return parts.join(" · ");
 }
 
-router.get("/api/batch-progress", (req, res) => {
+router.get("/api/batch-progress", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
 
@@ -1074,7 +1088,26 @@ router.get("/api/batch-progress", (req, res) => {
     return res.json(data);
   }
 
-  const items = issueNumbers.map((n) => progressForItem(repo, n));
+  // #416 / quadwork#299: parallelize the per-item gh fetches.
+  // Sequential execFileSync was costing ~10s on a cold cache for a
+  // 5-item batch (2 gh calls per item, ~1s each); Promise.allSettled
+  // over progressForItemAsync drops that to roughly the time of the
+  // slowest single item-pair (~2s). One failed item resolves with a
+  // synthetic "unknown" row instead of failing the whole response.
+  const settled = await Promise.allSettled(
+    issueNumbers.map((n) => progressForItemAsync(repo, n)),
+  );
+  const items = settled.map((r, i) => {
+    if (r.status === "fulfilled") return r.value;
+    return {
+      issue_number: issueNumbers[i],
+      title: `#${issueNumbers[i]} (fetch failed)`,
+      url: null,
+      status: "unknown",
+      progress: 0,
+      label: "fetch failed",
+    };
+  });
   const summary = summarizeItems(items);
   const complete = items.length > 0 && items.every((it) => it.status === "merged");
   const data = { batch_number: batchNumber, items, summary, complete };
