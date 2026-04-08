@@ -237,69 +237,100 @@ function SystemSection() {
       .catch(() => {});
   };
 
-  // Don't return null on non-darwin: notification sound controls
-  // still apply, just hide the Keep Awake button.
+  // #425 / quadwork#311: Keep Awake is now a standalone subsection
+  // and renders even on non-darwin (the button just hides). The
+  // Notification Sound subsection sits below a small divider so the
+  // two controls no longer look like they share a feature.
+
+  const showKeepAwakeSubsection = !platform || platform === "darwin";
 
   return (
-    <div className="flex flex-col gap-1 relative">
-      <div className="text-[10px] text-text-muted uppercase tracking-wider font-semibold">
-        System
-      </div>
-      <div className="flex items-center gap-1.5 flex-wrap">
-        {(!platform || platform === "darwin") && (
-        <button
-          onClick={() => (active ? stop() : setShowPresets(!showPresets))}
-          className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
-            active
-              ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
-              : "border-border text-text-muted hover:text-text hover:border-accent"
-          }`}
-        >
-          {active ? "Awake" : "Keep Awake"}
-          {active && remaining !== null && remaining > 0 && (
-            <span className="ml-1 text-accent/70">{formatTime(remaining)}</span>
-          )}
-          {active && remaining === null && (
-            <span className="ml-1 text-accent/70">on</span>
-          )}
-        </button>
-        )}
-        {/* #409 / quadwork#273: notification sound controls. */}
-        <button
-          type="button"
-          onClick={toggleSound}
-          title={soundEnabled ? "Notification sound on (click to mute)" : "Notification sound off (click to unmute)"}
-          className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
-            soundEnabled
-              ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
-              : "border-border text-text-muted hover:text-text hover:border-accent"
-          }`}
-        >
-          {soundEnabled ? "🔔" : "🔕"} Sound
-        </button>
-        {soundEnabled && (
-          <select
-            value={soundChoice}
-            onChange={(e) => updateChoice(e.target.value as NotificationSoundChoice)}
-            title="Notification sound"
-            className="bg-transparent border border-border px-1 py-0.5 text-[10px] text-text outline-none focus:border-accent cursor-pointer"
-          >
-            {NOTIFICATION_SOUND_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value} className="bg-bg-surface">{o.label}</option>
-            ))}
-          </select>
-        )}
-      </div>
-      {soundEnabled && (
-        <label className="flex items-center gap-1 text-[10px] text-text-muted cursor-pointer select-none mt-0.5">
-          <input
-            type="checkbox"
-            checked={soundBgOnly}
-            onChange={(e) => toggleBgOnly(e.target.checked)}
-          />
-          Only when tab is in background
-        </label>
+    <div className="flex flex-col gap-2 relative">
+      {showKeepAwakeSubsection && (
+        <div className="flex flex-col gap-0.5">
+          <div className="flex items-center gap-1 text-[10px] text-text-muted uppercase tracking-wider font-semibold">
+            Keep Mac Awake
+          </div>
+          <div className="text-[10px] text-text-muted leading-tight">
+            {active && remaining !== null && remaining > 0
+              ? `Awake for ${formatTime(remaining)} more — keep Mac plugged in`
+              : active && remaining === null
+                ? "Awake indefinitely — keep Mac plugged in"
+                : "Prevents your Mac from sleeping during overnight runs."}
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+            <button
+              onClick={() => (active ? stop() : setShowPresets(!showPresets))}
+              title="Keep Mac awake (caffeinate)"
+              className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
+                active
+                  ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+                  : "border-border text-text-muted hover:text-text hover:border-accent"
+              }`}
+            >
+              {active ? "Awake" : "Start"}
+              {active && remaining !== null && remaining > 0 && (
+                <span className="ml-1 text-accent/70">{formatTime(remaining)}</span>
+              )}
+              {active && remaining === null && (
+                <span className="ml-1 text-accent/70">on</span>
+              )}
+            </button>
+          </div>
+        </div>
       )}
+
+      {/* #425 / quadwork#311: divider between the two subsections. */}
+      {showKeepAwakeSubsection && (
+        <div className="border-t border-border/40" />
+      )}
+
+      {/* #409 / quadwork#273 + #425 / quadwork#311: notification sound
+          is now its own subsection with an always-visible descriptor. */}
+      <div className="flex flex-col gap-0.5">
+        <div className="text-[10px] text-text-muted uppercase tracking-wider font-semibold">
+          Notification Sound
+        </div>
+        <div className="text-[10px] text-text-muted leading-tight">
+          Plays a chime when an agent posts a new message.
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+          <button
+            type="button"
+            onClick={toggleSound}
+            title={soundEnabled ? "Notification sound on (click to mute)" : "Notification sound off (click to unmute)"}
+            className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
+              soundEnabled
+                ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+                : "border-border text-text-muted hover:text-text hover:border-accent"
+            }`}
+          >
+            {soundEnabled ? "🔔" : "🔕"} Sound
+          </button>
+          {soundEnabled && (
+            <select
+              value={soundChoice}
+              onChange={(e) => updateChoice(e.target.value as NotificationSoundChoice)}
+              title="Notification sound"
+              className="bg-transparent border border-border px-1 py-0.5 text-[10px] text-text outline-none focus:border-accent cursor-pointer"
+            >
+              {NOTIFICATION_SOUND_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value} className="bg-bg-surface">{o.label}</option>
+              ))}
+            </select>
+          )}
+        </div>
+        {soundEnabled && (
+          <label className="flex items-center gap-1 text-[10px] text-text-muted cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={soundBgOnly}
+              onChange={(e) => toggleBgOnly(e.target.checked)}
+            />
+            Only when tab is in background
+          </label>
+        )}
+      </div>
 
       {showPresets && !active && (
         <div className="absolute bottom-full left-0 mb-1 p-2 border border-border bg-bg-surface z-20 min-w-[220px] flex flex-col gap-1.5">
