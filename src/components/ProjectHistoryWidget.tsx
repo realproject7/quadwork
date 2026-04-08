@@ -41,6 +41,41 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [snapshots, setSnapshots] = useState<SnapshotEntry[]>([]);
+  // #424 / quadwork#304 Phase 3: per-project auto-restore flag.
+  // Default OFF. When enabled, the server auto-restores the newest
+  // snapshot after every restart (handleAgentChattr reads the flag
+  // pre-restart so an in-flight toggle can't starve the replay).
+  const [autoRestore, setAutoRestore] = useState<boolean>(false);
+  const [autoRestoreSaving, setAutoRestoreSaving] = useState(false);
+  useEffect(() => {
+    fetch(`/api/config`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg) => {
+        if (!cfg || !Array.isArray(cfg.projects)) return;
+        const proj = cfg.projects.find((p: { id: string }) => p.id === projectId);
+        if (proj) setAutoRestore(!!proj.auto_restore_after_restart);
+      })
+      .catch(() => {});
+  }, [projectId]);
+  const saveAutoRestore = async (next: boolean) => {
+    setAutoRestoreSaving(true);
+    try {
+      const r = await fetch(`/api/config`);
+      if (!r.ok) throw new Error(`GET /api/config ${r.status}`);
+      const cfg = await r.json();
+      const idx = cfg.projects?.findIndex((p: { id: string }) => p.id === projectId) ?? -1;
+      if (idx < 0) throw new Error("project not found");
+      cfg.projects[idx] = { ...cfg.projects[idx], auto_restore_after_restart: next };
+      const pr = await fetch(`/api/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cfg),
+      });
+      if (!pr.ok) throw new Error(`PUT /api/config ${pr.status}`);
+    } finally {
+      setAutoRestoreSaving(false);
+    }
+  };
 
   const loadSnapshots = () => {
     fetch(`/api/project-history/snapshots?project=${encodeURIComponent(projectId)}`)
@@ -265,6 +300,19 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
           {result.errors.length > 0 && ` · ${result.errors.length} errors`}
         </div>
       )}
+      <label className="mt-2 flex items-center gap-1.5 text-[10px] text-text-muted cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={autoRestore}
+          disabled={autoRestoreSaving}
+          onChange={(e) => {
+            const next = e.target.checked;
+            setAutoRestore(next);
+            saveAutoRestore(next).catch(() => setAutoRestore(!next));
+          }}
+        />
+        Auto-restore newest snapshot after AC restart
+      </label>
       {snapshots.length > 0 && (
         <div className="mt-2 border-t border-border/50 pt-1.5">
           <div className="text-[9px] text-text-muted uppercase tracking-wider mb-0.5">

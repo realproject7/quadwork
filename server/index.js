@@ -838,6 +838,14 @@ async function handleAgentChattr(req, res) {
     // process. Best-effort and non-blocking-on-failure so a flaky
     // snapshot doesn't leave the operator unable to restart AC.
     await snapshotProjectHistory(projectId).catch(() => {});
+    // #424 / quadwork#304 Phase 3: latch the opt-in BEFORE the
+    // spawn so a restart that itself clears the flag can't starve
+    // the auto-restore. We capture the snapshot filename we just
+    // wrote + the project's auto_restore_after_restart flag and
+    // replay it in the post-spawn tick below if both are set.
+    const preRestartCfg = readConfig();
+    const preRestartProject = preRestartCfg.projects?.find((p) => p.id === projectId);
+    const shouldAutoRestore = !!(preRestartProject && preRestartProject.auto_restore_after_restart);
     const proc = getProc();
     if (proc.process) {
       try { proc.process.kill("SIGTERM"); } catch {}
@@ -852,6 +860,30 @@ async function handleAgentChattr(req, res) {
         }
         // Sync token after AgentChattr restarts
         setTimeout(() => syncChattrToken(projectId), 2000);
+        // #424 / quadwork#304 Phase 3: optional auto-restore.
+        // Fire the restore 3s after spawn so AC's ws is ready.
+        // Best-effort: never blocks the restart response or
+        // rolls back on error.
+        if (shouldAutoRestore) {
+          setTimeout(async () => {
+            try {
+              const snapDir = path.join(require("os").homedir(), ".quadwork", projectId, "history-snapshots");
+              if (!fs.existsSync(snapDir)) return;
+              const newest = fs.readdirSync(snapDir)
+                .filter((f) => f.endsWith(".json"))
+                .map((f) => ({ f, t: fs.statSync(path.join(snapDir, f)).mtimeMs }))
+                .sort((a, b) => b.t - a.t)[0];
+              if (!newest) return;
+              const r = await fetch(`http://127.0.0.1:${PORT}/api/project-history/restore?project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(newest.f)}`, {
+                method: "POST",
+              });
+              if (r.ok) console.log(`[snapshot] ${projectId} auto-restored ${newest.f}`);
+              else console.warn(`[snapshot] ${projectId} auto-restore returned ${r.status}`);
+            } catch (err) {
+              console.warn(`[snapshot] ${projectId} auto-restore failed: ${err.message || err}`);
+            }
+          }, 3000);
+        }
         res.json({ ok: true, state: "running", pid: child.pid });
       } catch (err) {
         setProc({ process: null, state: "error", error: err.message });
