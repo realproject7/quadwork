@@ -275,14 +275,36 @@ router.put("/api/loop-guard", async (req, res) => {
   }
 
   // 2. Best-effort push to the running AC so the change is live.
-  // Failures here are non-fatal: the next restart still picks up
-  // the persisted value.
+  // On stale-token (4003 → EAGENTCHATTR_401) recover the same way
+  // /api/chat does (#230): re-sync the session token from AC and
+  // retry once. Other failures stay non-fatal — the persisted value
+  // still takes effect on next AC restart.
   let live = false;
   try {
     const { url: base, token: sessionToken } = getChattrConfig(projectId);
     if (base) {
-      await sendWsEvent(base, sessionToken, { type: "update_settings", data: { max_agent_hops: value } });
-      live = true;
+      const event = { type: "update_settings", data: { max_agent_hops: value } };
+      try {
+        await sendWsEvent(base, sessionToken, event);
+        live = true;
+      } catch (err) {
+        if (err && err.code === "EAGENTCHATTR_401") {
+          console.warn(`[loop-guard] ws auth failed for ${projectId}, re-syncing session token and retrying...`);
+          try { await syncChattrToken(projectId); }
+          catch (syncErr) { console.warn(`[loop-guard] syncChattrToken failed: ${syncErr.message}`); }
+          const { token: refreshed } = getChattrConfig(projectId);
+          if (refreshed && refreshed !== sessionToken) {
+            try {
+              await sendWsEvent(base, refreshed, event);
+              live = true;
+            } catch (retryErr) {
+              console.warn(`[loop-guard] retry after token resync failed: ${retryErr.message || retryErr}`);
+            }
+          }
+        } else {
+          throw err;
+        }
+      }
     }
   } catch (err) {
     console.warn(`[loop-guard] live update failed for ${projectId}: ${err.message || err}`);
