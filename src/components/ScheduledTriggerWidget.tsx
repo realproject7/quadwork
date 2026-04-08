@@ -17,12 +17,28 @@ interface TriggerInfo {
   durationMin: number | null; // last-used, persisted for idle reloads
 }
 
-const DURATION_PRESETS = [
-  { label: "1 hour", minutes: 60 },
-  { label: "3 hours", minutes: 180 },
-  { label: "8 hours", minutes: 480 },
-  { label: "Until stopped", minutes: 0 },
-];
+// #406 / quadwork#269: trigger duration is now a free-typed numeric
+// hours input. Defaults / bounds match the issue: default 3 hours,
+// 0.1h min (≈6 minute test runs), 24h cap as a safety rail, decimals
+// allowed at 0.1h granularity. The previous "Until stopped" preset
+// is intentionally dropped — operators wanted finer control more
+// than the unbounded option. The trigger backend still takes
+// minutes; we convert hours → minutes on send.
+const DURATION_HOURS_DEFAULT = 3;
+const DURATION_HOURS_MIN = 0.1;
+const DURATION_HOURS_MAX = 24;
+function clampHours(h: number): number {
+  if (!Number.isFinite(h)) return DURATION_HOURS_DEFAULT;
+  return Math.min(Math.max(h, DURATION_HOURS_MIN), DURATION_HOURS_MAX);
+}
+function minutesToHoursStr(min: number): string {
+  if (!Number.isFinite(min) || min <= 0) return String(DURATION_HOURS_DEFAULT);
+  const h = min / 60;
+  // 1 decimal place is enough for the 0.1h step granularity, and
+  // round-trips integer minutes that map to clean fractional hours
+  // (e.g. 378 → "6.3").
+  return (Math.round(h * 10) / 10).toString();
+}
 
 function defaultMessage(projectId: string) {
   const queuePath = `~/.quadwork/${projectId}/OVERNIGHT-QUEUE.md`;
@@ -219,15 +235,22 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
               className="w-12 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
             />
             <span className="text-text-muted">min for</span>
-            <select
-              value={durationMin}
-              onChange={(e) => { setDurationMin(parseInt(e.target.value, 10)); setDurationDirty(true); }}
-              className="bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent cursor-pointer"
-            >
-              {DURATION_PRESETS.map((p) => (
-                <option key={p.minutes} value={p.minutes} className="bg-bg-surface">{p.label}</option>
-              ))}
-            </select>
+            {/* #406 / quadwork#269: free-typed hours input. */}
+            <input
+              type="number"
+              value={minutesToHoursStr(durationMin)}
+              onChange={(e) => {
+                const raw = parseFloat(e.target.value);
+                const hours = Number.isFinite(raw) ? clampHours(raw) : DURATION_HOURS_DEFAULT;
+                setDurationMin(Math.round(hours * 60));
+                setDurationDirty(true);
+              }}
+              min={DURATION_HOURS_MIN}
+              max={DURATION_HOURS_MAX}
+              step={0.1}
+              className="w-14 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
+            />
+            <span className="text-text-muted">hours</span>
           </div>
           <button
             onClick={start}
