@@ -42,8 +42,11 @@ function senderLabel(sender: string): string {
 // pills. Only the four agent IDs + "user" qualify; unknown handles
 // stay as plain text. The mention must be preceded by start-of-string
 // or whitespace so URL fragments like "https://github.com/@user"
-// don't accidentally pillify.
-const MENTION_RE = /(^|\s)(@(?:head|dev|reviewer1|reviewer2|user))\b/gi;
+// don't accidentally pillify, AND must be followed by something that
+// can't continue a handle (no word char, no hyphen) so longer
+// hyphenated handles like "@user-name" or "@head-2" don't pill the
+// known prefix and leave the rest as plain text.
+const MENTION_RE = /(^|\s)(@(?:head|dev|reviewer1|reviewer2|user))(?![\w-])/gi;
 function renderMessageWithMentions(text: string): React.ReactNode[] {
   const parts: React.ReactNode[] = [];
   let last = 0;
