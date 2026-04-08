@@ -1442,13 +1442,42 @@ async function checkLoopGuardPause(project) {
         if (!fresh || !fresh.auto_continue_loop_guard) {
           console.log(`[loop-guard] ${project.id} auto-continue cancelled (opt-in disabled during wait)`);
         } else {
-          const res = await fetch(`http://127.0.0.1:${PORT}/api/chat?project=${encodeURIComponent(project.id)}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: "/continue", channel: "general" }),
-          });
-          if (res.ok) console.log(`[loop-guard] ${project.id} auto-continued`);
-          else console.warn(`[loop-guard] ${project.id} auto-continue POST returned ${res.status}`);
+          // Re-check the router's pause state at fire time too. The
+          // 10s status poller may not have seen a manual operator
+          // /continue yet when the delay window (5–9s) is shorter
+          // than the poll interval — without this, a manual resume
+          // inside a 5s wait would be followed by a stale auto
+          // /continue that clobbers hop_count on an already-running
+          // chain (router.continue_routing resets the counter
+          // unconditionally). The re-check closes the race.
+          let stillPaused = false;
+          try {
+            const { url: freshBase, token: freshToken } = resolveProjectChattr(project.id);
+            if (freshBase) {
+              const sr = await fetch(`${freshBase}/api/status`, {
+                headers: freshToken ? { "x-session-token": freshToken } : {},
+                signal: AbortSignal.timeout(5000),
+              });
+              if (sr.ok) {
+                const sd = await sr.json();
+                stillPaused = !!(sd && sd.paused);
+              }
+            }
+          } catch {
+            // Status re-check failed — fall back to "don't fire".
+            // Stuck pause will still be caught on the next 10s tick.
+          }
+          if (!stillPaused) {
+            console.log(`[loop-guard] ${project.id} auto-continue cancelled (router already resumed)`);
+          } else {
+            const res = await fetch(`http://127.0.0.1:${PORT}/api/chat?project=${encodeURIComponent(project.id)}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: "/continue", channel: "general" }),
+            });
+            if (res.ok) console.log(`[loop-guard] ${project.id} auto-continued`);
+            else console.warn(`[loop-guard] ${project.id} auto-continue POST returned ${res.status}`);
+          }
         }
       } catch (err) {
         console.warn(`[loop-guard] ${project.id} auto-continue failed: ${err.message || err}`);
