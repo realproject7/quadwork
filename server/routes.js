@@ -1020,7 +1020,13 @@ function writeBatchSnapshot(projectId, snapshot) {
 // the live Active Batch contains items the snapshot doesn't); in
 // all other cases the snapshot wins, so items Head moved to Done
 // stay visible until the operator starts the next batch.
-function resolveDisplayedBatch(queueText, projectId) {
+function resolveDisplayedBatch(queueText, projectId, { queueReadOk = true } = {}) {
+  // Queue file deleted / unreadable → fall back to empty state per
+  // #316's edge case. Returning the snapshot here would "heal" a
+  // genuinely missing file into stale data the operator can't
+  // reconcile without nuking ~/.quadwork/{id}/batch-progress-cache.json
+  // manually.
+  if (!queueReadOk) return { batchNumber: null, issueNumbers: [] };
   const current = parseActiveBatch(queueText);
   const snapshot = readBatchSnapshot(projectId);
   const hasExplicitBump =
@@ -1276,13 +1282,20 @@ router.get("/api/batch-progress", async (req, res) => {
 
   const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
   let queueText = "";
-  try { queueText = fs.readFileSync(queuePath, "utf-8"); }
-  catch { /* missing file → empty active batch */ }
+  let queueReadOk = false;
+  try {
+    queueText = fs.readFileSync(queuePath, "utf-8");
+    queueReadOk = true;
+  } catch {
+    // Missing / unreadable file — pass queueReadOk=false so the
+    // resolver bypasses the snapshot and returns the empty state
+    // per #316's edge case.
+  }
 
   // #429 / quadwork#316: resolve the displayed batch through the
   // snapshot-aware helper so merged items stay visible after Head
   // moves them from Active Batch to Done, until a new batch starts.
-  const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId);
+  const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
   if (issueNumbers.length === 0) {
     const data = { batch_number: batchNumber, items: [], summary: "", complete: false };
     _batchProgressCache.set(projectId, { ts: Date.now(), data });
