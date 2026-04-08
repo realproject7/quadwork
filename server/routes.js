@@ -267,6 +267,18 @@ router.put("/api/loop-guard", async (req, res) => {
   if (!tomlPath || !fs.existsSync(tomlPath)) {
     return res.status(404).json({ error: "config.toml not found for project" });
   }
+  // Capture the previous value before rewriting so we can decide
+  // whether the /continue auto-resume should fire (only when the
+  // operator is RAISING the limit — lowering it means they want
+  // the runaway loop to stay paused).
+  let previousValue = null;
+  try {
+    const previousContent = fs.readFileSync(tomlPath, "utf-8");
+    const prevMatch = previousContent.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
+    if (prevMatch) previousValue = parseInt(prevMatch[1], 10);
+  } catch {
+    // fall through — previousValue stays null, auto-resume will skip
+  }
   try {
     let content = fs.readFileSync(tomlPath, "utf-8");
     if (/^\s*max_agent_hops\s*=/m.test(content)) {
@@ -289,14 +301,77 @@ router.put("/api/loop-guard", async (req, res) => {
   // /api/chat does (#230): re-sync the session token from AC and
   // retry once. Other failures stay non-fatal — the persisted value
   // still takes effect on next AC restart.
+  //
+  // #417 / quadwork#309: the update_settings ws event correctly
+  // updates router.max_hops in the running AC (verified in AC's
+  // app.py:1249), AND writes settings.json via _save_settings. But
+  // AC's router stays paused once it has tripped the guard — raising
+  // max_hops at runtime does NOT resurrect an already-paused channel
+  // (router.py:76-77 → `paused = True`). The operator typically
+  // raises the limit precisely BECAUSE the channel is stuck paused,
+  // so we immediately follow the update_settings event with a
+  // `/continue` chat message (the same path AC's own slash command
+  // handler uses at app.py:1106-1110) to resume routing. This is the
+  // whole fix: the previous version updated max_hops live but left
+  // the channel frozen, which made the widget look like a no-op.
   let live = false;
-  try {
-    const { url: base, token: sessionToken } = getChattrConfig(projectId);
-    if (base) {
-      const event = { type: "update_settings", data: { max_agent_hops: value } };
+  let autoResumed = false;
+  // Only auto-resume when ALL of:
+  //   (a) operator is RAISING the limit (lowering = "make it
+  //       stricter", must leave a paused runaway alone)
+  //   (b) the router is currently paused (AC's continue_routing
+  //       resets hop_count + paused + guard_emitted unconditionally,
+  //       so firing it on an actively-running chain would silently
+  //       extend the chain beyond the new limit — t2a finding)
+  //   (c) previousValue is known (null means we can't prove it's a
+  //       raise, so err on the side of not touching router state)
+  const isRaising = previousValue !== null && value > previousValue;
+  const ensureLive = async (sessionToken) => {
+    await sendWsEvent(base, sessionToken, { type: "update_settings", data: { max_agent_hops: value } });
+    if (isRaising) {
+      // Check AC's /api/status before firing /continue so we don't
+      // reset hop_count on a running (unpaused) chain. The endpoint
+      // exposes `paused: true` iff ANY channel currently paused.
+      let isPaused = false;
       try {
-        await sendWsEvent(base, sessionToken, event);
-        live = true;
+        // AC's security middleware (app.py:212-224) only accepts
+        // bearer auth for /api/messages, /api/send, and /api/rules/*.
+        // /api/status requires x-session-token header (or ?token=),
+        // so pass that instead — a bearer header silently 403s and
+        // leaves isPaused stuck at false, defeating the gate.
+        const statusUrl = `${base}/api/status`;
+        const statusRes = await fetch(statusUrl, {
+          headers: sessionToken ? { "x-session-token": sessionToken } : {},
+          signal: AbortSignal.timeout(5000),
+        });
+        if (statusRes.ok) {
+          const statusJson = await statusRes.json();
+          isPaused = !!(statusJson && statusJson.paused);
+        }
+      } catch {
+        // Status fetch failed — err toward "don't auto-resume". The
+        // operator can always type /continue manually.
+      }
+      if (isPaused) {
+        // Resume paused channels. /continue is routed by AC's ws
+        // message handler when the buffer starts with /continue;
+        // the handler calls router.continue_routing() which
+        // unpauses AND resets hop_count — which is why we gate on
+        // isPaused to avoid wiping the counter on a live chain.
+        await sendWsEvent(base, sessionToken, { type: "message", text: "/continue", channel: "general", sender: "user" });
+        autoResumed = true;
+      }
+    }
+    live = true;
+  };
+  let base = null;
+  try {
+    const chattr = getChattrConfig(projectId);
+    base = chattr.url;
+    const sessionToken = chattr.token;
+    if (base) {
+      try {
+        await ensureLive(sessionToken);
       } catch (err) {
         if (err && err.code === "EAGENTCHATTR_401") {
           console.warn(`[loop-guard] ws auth failed for ${projectId}, re-syncing session token and retrying...`);
@@ -305,8 +380,7 @@ router.put("/api/loop-guard", async (req, res) => {
           const { token: refreshed } = getChattrConfig(projectId);
           if (refreshed && refreshed !== sessionToken) {
             try {
-              await sendWsEvent(base, refreshed, event);
-              live = true;
+              await ensureLive(refreshed);
             } catch (retryErr) {
               console.warn(`[loop-guard] retry after token resync failed: ${retryErr.message || retryErr}`);
             }
@@ -320,7 +394,7 @@ router.put("/api/loop-guard", async (req, res) => {
     console.warn(`[loop-guard] live update failed for ${projectId}: ${err.message || err}`);
   }
 
-  res.json({ ok: true, value, live });
+  res.json({ ok: true, value, live, previousValue, resumed: autoResumed });
 });
 
 // #412 / quadwork#279: project history export + import.
