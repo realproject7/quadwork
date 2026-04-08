@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import ProjectChatEmptyState from "./ProjectChatEmptyState";
 
 interface Message {
@@ -36,6 +36,41 @@ function senderLabel(sender: string): string {
   if (s === "reviewer1") return "RE1";
   if (s === "reviewer2") return "RE2";
   return sender;
+}
+
+// #408 / quadwork#271: render @mentions of known agents as colored
+// pills. Only the four agent IDs + "user" qualify; unknown handles
+// stay as plain text. The mention must be preceded by start-of-string
+// or whitespace so URL fragments like "https://github.com/@user"
+// don't accidentally pillify.
+const MENTION_RE = /(^|\s)(@(?:head|dev|reviewer1|reviewer2|user))\b/gi;
+function renderMessageWithMentions(text: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  let last = 0;
+  let key = 0;
+  for (const match of text.matchAll(MENTION_RE)) {
+    const fullStart = match.index ?? 0;
+    const lead = match[1];
+    const mention = match[2];
+    const mentionStart = fullStart + lead.length;
+    if (mentionStart > last) {
+      parts.push(text.slice(last, mentionStart));
+    }
+    const agentId = mention.slice(1).toLowerCase();
+    const color = senderColor(agentId);
+    parts.push(
+      <span
+        key={`m${key++}`}
+        className="inline-block px-1 py-0 rounded font-mono"
+        style={{ backgroundColor: `${color}22`, color }}
+      >
+        {mention}
+      </span>,
+    );
+    last = mentionStart + mention.length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts.length > 0 ? parts : [text];
 }
 
 /**
@@ -284,7 +319,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
               {senderLabel(msg.sender)}
             </span>
             <span className="text-text break-words min-w-0 whitespace-pre-wrap flex-1">
-              {msg.text}
+              {renderMessageWithMentions(msg.text)}
             </span>
             {/* #397 / quadwork#262: reply affordance — small grey,
                 hover-revealed so it doesn't visually compete with the
