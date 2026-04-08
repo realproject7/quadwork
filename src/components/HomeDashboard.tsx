@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import Link from "next/link";
 import HomeEmptyState from "./HomeEmptyState";
 
@@ -30,6 +30,90 @@ function timeAgo(iso: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+// #430 / quadwork#312: AI team work-hours hero — the marketing
+// surface on the home page. Big lifetime-hours number in accent,
+// rotating value-focused tagline, three-column time-window footer.
+const HERO_TAGLINES = [
+  "You've slept easier for",
+  "You've gone for runs for",
+  "You've enjoyed life for",
+  "You've had time for the people you love for",
+  "You've touched grass for",
+  "You've watched movies for",
+  "You've taken vacations for",
+  "You've gone on dates for",
+  "You've cooked dinner for",
+  "You've read books for",
+];
+
+interface HeroStats {
+  today: number;
+  week: number;
+  month: number;
+  total: number;
+}
+
+function heroFmt(h: number): string {
+  if (!Number.isFinite(h) || h <= 0) return "0h";
+  if (h < 1) return `${(h * 60).toFixed(0)}m`;
+  return `${h.toFixed(1)}h`;
+}
+
+function ActivityHero() {
+  const [stats, setStats] = useState<HeroStats | null>(null);
+  const tagline = useMemo(
+    () => HERO_TAGLINES[Math.floor(Math.random() * HERO_TAGLINES.length)],
+    [],
+  );
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      fetch("/api/activity/stats")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (!cancelled && d) setStats(d); })
+        .catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 60000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  // Empty state — fresh install, nothing logged yet.
+  if (stats && (!stats.total || stats.total === 0)) {
+    return (
+      <div className="mb-6 border border-accent/30 bg-accent/5 rounded p-6 text-center">
+        <div className="text-[13px] text-text-muted">
+          Your AI team hasn&apos;t started shipping yet.
+        </div>
+        <div className="text-[11px] text-text-muted mt-1">
+          Kick off a batch and come back in the morning.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-6 border border-accent/30 bg-accent/5 rounded p-6 text-center">
+      <div className="text-[13px] text-text-muted">{tagline}</div>
+      <div className="my-3">
+        <span className="inline-block px-4 py-1 text-5xl font-mono font-semibold text-accent border border-accent/40 rounded tabular-nums">
+          {stats ? heroFmt(stats.total) : "—"}
+        </span>
+      </div>
+      <div className="text-[13px] text-text-muted">
+        while your AI team shipped code overnight
+      </div>
+      <div className="mt-4 flex items-center justify-center gap-4 text-[11px] text-text-muted">
+        <span>Today <span className="text-text tabular-nums">{stats ? heroFmt(stats.today) : "—"}</span></span>
+        <span className="text-border">│</span>
+        <span>This week <span className="text-text tabular-nums">{stats ? heroFmt(stats.week) : "—"}</span></span>
+        <span className="text-border">│</span>
+        <span>Month <span className="text-text tabular-nums">{stats ? heroFmt(stats.month) : "—"}</span></span>
+      </div>
+    </div>
+  );
 }
 
 export default function HomeDashboard() {
@@ -74,6 +158,12 @@ export default function HomeDashboard() {
           Could not load projects from /api/projects. The dashboard may be out of date — check the server logs and reload.
         </div>
       )}
+
+      {/* #430 / quadwork#312: AI team work hours hero. Rotates the
+          value-focused tagline per page load, keeps the lifetime
+          number as the headline figure, and mirrors the three time
+          windows from the top header stat block. */}
+      <ActivityHero />
 
       {/* Header */}
       <div className="mb-6">

@@ -68,10 +68,45 @@ export default function TerminalGrid({
   const markActivity = useCallback((agentId: string) => {
     lastActivityRef.current[agentId] = Date.now();
   }, []);
+  // #430 / quadwork#312: track per-agent session transitions (idle
+  // → active → idle) and POST them to /api/activity/log so the
+  // backend can persist work-hours rows. A session starts the
+  // first tick isActive flips true and ends the first tick it
+  // flips back to false (ACTIVITY_WINDOW_MS after the last PTY
+  // write). fetch failures are best-effort — losing one session
+  // just under-counts the stat, never blocks the UI.
+  const sessionActiveRef = useRef<Record<string, boolean>>({});
+  const logActivity = useCallback((agentId: string, type: "start" | "end") => {
+    fetch("/api/activity/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project: projectId,
+        agent: agentId,
+        type,
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+  }, [projectId]);
   useEffect(() => {
-    const interval = setInterval(() => setActivityTick((t) => t + 1), 500);
+    const interval = setInterval(() => {
+      setActivityTick((t) => t + 1);
+      // On every tick, walk the known agents and detect transitions.
+      for (const agent of agents) {
+        const ts = lastActivityRef.current[agent.id];
+        const active = ts !== undefined && Date.now() - ts < ACTIVITY_WINDOW_MS;
+        const wasActive = !!sessionActiveRef.current[agent.id];
+        if (active && !wasActive) {
+          sessionActiveRef.current[agent.id] = true;
+          logActivity(agent.id, "start");
+        } else if (!active && wasActive) {
+          sessionActiveRef.current[agent.id] = false;
+          logActivity(agent.id, "end");
+        }
+      }
+    }, 500);
     return () => clearInterval(interval);
-  }, []);
+  }, [agents, logActivity]);
   const isActive = (agentId: string) => {
     const ts = lastActivityRef.current[agentId];
     return ts !== undefined && Date.now() - ts < ACTIVITY_WINDOW_MS;
