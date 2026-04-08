@@ -1515,8 +1515,17 @@ function migrateLoopGuardDefaults(config) {
     if (!fs.existsSync(tomlPath)) continue;
     let content;
     try { content = fs.readFileSync(tomlPath, "utf-8"); } catch { continue; }
-    // Case 1: key already present anywhere in the file. Idempotent.
-    if (/^\s*max_agent_hops\s*=/m.test(content)) continue;
+    // Case 1: key already present *inside* the [routing] section.
+    // We must NOT short-circuit on a same-named key in some other
+    // table (e.g. `[other]\nmax_agent_hops = 7`) because that would
+    // leave a real partial [routing] section unpatched. Slice the
+    // file to just the [routing] body before the next [section]
+    // header (or EOF) and look there.
+    const routingBody = (() => {
+      const m = content.match(/^\s*\[routing\][ \t]*\r?\n([\s\S]*?)(?=^\s*\[|\z)/m);
+      return m ? m[1] : null;
+    })();
+    if (routingBody !== null && /^\s*max_agent_hops\s*=/m.test(routingBody)) continue;
     let next;
     if (/^\s*\[routing\]/m.test(content)) {
       // Case 2: section exists, key missing. Insert the key on the
