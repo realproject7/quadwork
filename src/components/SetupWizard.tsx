@@ -316,16 +316,40 @@ export default function SetupWizard() {
 
   // Step: launch (agentchattr-config + add-config + redirect)
   const launchProject = async () => {
+    // #332: commit any unblurred custom-port drafts before reading
+    // customPorts, so clicking Launch with the cursor still inside a
+    // port input uses the typed value instead of discarding it.
+    // setCustomPorts is async so we cannot read `customPorts` in this
+    // same call tick; derive the effective values directly from the
+    // draft strings using the same clamp rules as commitPortDraft.
+    commitPortDraft("chattr");
+    commitPortDraft("mcpHttp");
+    commitPortDraft("mcpSse");
+    const committedPort = (key: "chattr" | "mcpHttp" | "mcpSse"): number => {
+      const draftRaw = customPortsDraft[key];
+      if (draftRaw !== "") {
+        const n = parseInt(draftRaw, 10);
+        if (Number.isFinite(n) && n > 0 && n <= 65535) return n;
+        return 0;
+      }
+      return customPorts[key];
+    };
+    const effectivePorts = {
+      chattr: committedPort("chattr"),
+      mcpHttp: committedPort("mcpHttp"),
+      mcpSse: committedPort("mcpSse"),
+    };
+
     setLaunchStatus("running");
 
     // 1. Determine ports: use custom if set, otherwise auto-detect free ports
     let agentchattr_port: number, mcp_http_port: number, mcp_sse_port: number;
 
-    if (showAdvanced && customPorts.chattr > 0) {
+    if (showAdvanced && effectivePorts.chattr > 0) {
       // Validate custom ports against collisions
-      agentchattr_port = customPorts.chattr;
-      mcp_http_port = customPorts.mcpHttp || customPorts.chattr - 100;
-      mcp_sse_port = customPorts.mcpSse || mcp_http_port + 1;
+      agentchattr_port = effectivePorts.chattr;
+      mcp_http_port = effectivePorts.mcpHttp || effectivePorts.chattr - 100;
+      mcp_sse_port = effectivePorts.mcpSse || mcp_http_port + 1;
       const portsToCheck = [agentchattr_port, mcp_http_port, mcp_sse_port];
       try {
         const checks = await Promise.all(
