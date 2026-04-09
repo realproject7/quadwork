@@ -2339,7 +2339,12 @@ function readLastLines(filePath, n) {
 // otherwise. Keep the import list small and close to what the
 // bridge actually needs; add modules here if the bridge gains new
 // hard deps.
-function checkTelegramBridgePythonDeps() {
+// #380: `pythonPath` defaults to bare `python3` for backward-compat,
+// but the production call sites (install, start) MUST pass the
+// dedicated bridge venv's interpreter (`<BRIDGE_DIR>/.venv/bin/python3`)
+// so the import check runs against the same interpreter the spawn will
+// use. See #379 research ticket for root cause.
+function checkTelegramBridgePythonDeps(pythonPath = "python3") {
   try {
     // Only check the third-party module the bridge actually needs
     // at import time — `requests`. Toml parsing differs between
@@ -2347,7 +2352,7 @@ function checkTelegramBridgePythonDeps() {
     // genuine toml import failure will now be captured in the
     // bridge log file on spawn, so this pre-flight stays narrow
     // and avoids false negatives on older Python installs.
-    execFileSync("python3", ["-c", "import requests"], {
+    execFileSync(pythonPath, ["-c", "import requests"], {
       encoding: "utf-8",
       timeout: 10000,
       stdio: ["ignore", "pipe", "pipe"],
@@ -2503,34 +2508,47 @@ router.post("/api/telegram", async (req, res) => {
       }
     }
     case "install": {
-      // #353: pip3 can exit 0 on some systems (PEP 668 externally-
-      // managed environments, non-writable site-packages) even when
-      // the subsequent import still fails. After the pip step, run
-      // a post-install import check and surface both the pip output
-      // and the import error together if the check fails — that's
-      // the signal the operator needs to know whether to pick a
-      // virtualenv, use --user, or --break-system-packages.
+      // #380: create a dedicated bridge venv at
+      // `<BRIDGE_DIR>/.venv` and install requirements into it using
+      // that venv's pip. All bridge subprocesses then spawn with
+      // `<BRIDGE_DIR>/.venv/bin/python3` by absolute path. See #379
+      // research ticket for the root cause — bare `python3` / `pip3`
+      // resolve to Homebrew Python on modern macOS where `requests`
+      // is not available, producing a ModuleNotFoundError on Start.
+      // Idempotent: existing installs missing a `.venv` get the venv
+      // created on top of the existing clone without re-cloning.
+      const venvDir = path.join(BRIDGE_DIR, ".venv");
+      const venvPython = path.join(venvDir, "bin", "python3");
+      const venvPip = path.join(venvDir, "bin", "pip");
       let pipOutput = "";
       try {
         if (!fs.existsSync(BRIDGE_DIR)) {
           execFileSync("gh", ["repo", "clone", "realproject7/agentchattr-telegram", BRIDGE_DIR], { encoding: "utf-8", timeout: 30000 });
         }
+        // #380: create the dedicated venv if missing. `python3 -m venv`
+        // builds a fresh isolated environment that bypasses PEP 668
+        // externally-managed markers, so this works even on Homebrew
+        // Python where bare `pip3 install` would be blocked.
+        if (!fs.existsSync(venvPython)) {
+          execFileSync("python3", ["-m", "venv", venvDir], { encoding: "utf-8", timeout: 60000 });
+        }
         pipOutput = execFileSync(
-          "pip3",
+          venvPip,
           ["install", "-r", path.join(BRIDGE_DIR, "requirements.txt")],
-          { encoding: "utf-8", timeout: 60000 },
+          { encoding: "utf-8", timeout: 120000 },
         );
       } catch (err) {
-        return res.json({ ok: false, error: err.message || "Install failed" });
+        const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
+        return res.json({ ok: false, error: (stderr.trim() || err.message || "Install failed") });
       }
-      const depCheck = checkTelegramBridgePythonDeps();
+      const depCheck = checkTelegramBridgePythonDeps(venvPython);
       if (!depCheck.ok) {
         return res.json({
           ok: false,
           error:
-            "pip3 reported success but the bridge's Python deps still fail to import. " +
-            "This usually means pip installed into a location python3 cannot see " +
-            "(externally-managed environment / PEP 668 / mismatched interpreter).\n\n" +
+            "pip reported success but the bridge venv's Python deps still fail to import. " +
+            "This is unexpected for a freshly-created venv — check disk space and permissions " +
+            `on ${venvDir}.\n\n` +
             `Import error: ${depCheck.error}\n\n` +
             `pip output tail:\n${pipOutput.split("\n").slice(-10).join("\n")}`,
         });
@@ -2543,6 +2561,18 @@ router.post("/api/telegram", async (req, res) => {
       if (isTelegramRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const bridgeScript = path.join(BRIDGE_DIR, "telegram_bridge.py");
       if (!fs.existsSync(bridgeScript)) return res.json({ ok: false, error: "Bridge not installed. Click Install Bridge first." });
+      // #380: resolve the dedicated venv's python3 by absolute path.
+      // Do NOT activate the venv or set VIRTUAL_ENV in the parent —
+      // calling the venv's python3 directly is sufficient because
+      // Python's sys.executable bootstrap resolves the venv
+      // automatically. See #379 research ticket.
+      const venvPython = path.join(BRIDGE_DIR, ".venv", "bin", "python3");
+      if (!fs.existsSync(venvPython)) {
+        return res.json({
+          ok: false,
+          error: "Bridge venv missing. Click \"Install Bridge\" to create it.",
+        });
+      }
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
       const tomlPath = telegramConfigToml(projectId);
@@ -2553,7 +2583,7 @@ router.post("/api/telegram", async (req, res) => {
       // `requests` module produces a readable error instead of the
       // Start → Running → Stopped flicker that the v1 code path
       // produced with `stdio: "ignore"`.
-      const depCheck = checkTelegramBridgePythonDeps();
+      const depCheck = checkTelegramBridgePythonDeps(venvPython);
       if (!depCheck.ok) {
         // #372: persist the pre-flight failure to the bridge log
         // file so the GET /api/telegram `last_error` tail picks it
@@ -2562,8 +2592,8 @@ router.post("/api/telegram", async (req, res) => {
         // local error state, producing the "silent fail" symptom
         // (pill flips back to Stopped with no trace of why).
         const msg =
-          "Bridge Python dependencies not installed. Click \"Install Bridge\" to install them, " +
-          "or run: pip3 install -r " + path.join(BRIDGE_DIR, "requirements.txt") + "\n\n" +
+          "Bridge Python dependencies not installed in the dedicated venv. " +
+          "Click \"Install Bridge\" to (re)create the venv and install them.\n\n" +
           `Import error: ${depCheck.error}`;
         try {
           fs.writeFileSync(
@@ -2595,7 +2625,7 @@ router.post("/api/telegram", async (req, res) => {
       }
       let child;
       try {
-        child = spawn("python3", [bridgeScript, "--config", tomlPath], {
+        child = spawn(venvPython, [bridgeScript, "--config", tomlPath], {
           detached: true,
           stdio: ["ignore", outFd, errFd],
         });
@@ -2780,3 +2810,6 @@ module.exports.buildNoPrRow = buildNoPrRow;
 module.exports.summarizeItems = summarizeItems;
 // #353: expose readLastLines for the telegram-bridge test.
 module.exports.readLastLines = readLastLines;
+// #380: expose checkTelegramBridgePythonDeps so the bridge test can
+// exercise the venv-path interpreter argument round trip.
+module.exports.checkTelegramBridgePythonDeps = checkTelegramBridgePythonDeps;

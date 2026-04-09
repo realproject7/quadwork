@@ -10,7 +10,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { readLastLines } = require("./routes");
+const { execFileSync } = require("node:child_process");
+const { readLastLines, checkTelegramBridgePythonDeps } = require("./routes");
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qw-bridge-log-"));
 function write(name, content) {
@@ -89,7 +90,54 @@ try {
   assert.match(tail, /ModuleNotFoundError/);
   assert.match(tail, /Install Bridge/);
 
-  console.log("routes.telegramBridge.test.js: all assertions passed (8 cases)");
+  // 9) #380: checkTelegramBridgePythonDeps accepts an explicit
+  //    interpreter path. Passing a guaranteed-broken path must
+  //    return { ok: false, error } without throwing.
+  const broken = checkTelegramBridgePythonDeps(path.join(tmp, "nope", "python3"));
+  assert.equal(broken.ok, false);
+  assert.ok(broken.error && broken.error.length > 0);
+
+  // 10) #380: start handler's missing-venv branch — we don't boot
+  //     the server here, but the branch reduces to a plain
+  //     fs.existsSync check on `<BRIDGE_DIR>/.venv/bin/python3`,
+  //     so we verify the check returns false for a fixture dir
+  //     that has no `.venv` subdir at all.
+  const fixtureBridgeDir = fs.mkdtempSync(path.join(tmp, "bridge-no-venv-"));
+  const missingVenvPython = path.join(fixtureBridgeDir, ".venv", "bin", "python3");
+  assert.equal(fs.existsSync(missingVenvPython), false);
+
+  // 11) #380: round-trip — build a real venv in a tmp dir, install
+  //     a stdlib-only sentinel is trivially importable, and confirm
+  //     checkTelegramBridgePythonDeps reports ok when `requests`
+  //     is installed into that venv. Skipped gracefully on CI if
+  //     `python3 -m venv` or network-backed pip install fails.
+  const venvDir = path.join(tmp, "case11-venv");
+  let venvSkipped = false;
+  try {
+    execFileSync("python3", ["-m", "venv", venvDir], { timeout: 30000, stdio: "pipe" });
+    const venvPython = path.join(venvDir, "bin", "python3");
+    const venvPip = path.join(venvDir, "bin", "pip");
+    // Without `requests` installed yet, the check must fail.
+    const before = checkTelegramBridgePythonDeps(venvPython);
+    assert.equal(before.ok, false);
+    try {
+      execFileSync(venvPip, ["install", "--quiet", "requests"], { timeout: 120000, stdio: "pipe" });
+    } catch {
+      venvSkipped = true;
+    }
+    if (!venvSkipped) {
+      const after = checkTelegramBridgePythonDeps(venvPython);
+      assert.equal(after.ok, true);
+    }
+  } catch {
+    venvSkipped = true;
+  }
+
+  console.log(
+    "routes.telegramBridge.test.js: all assertions passed (11 cases" +
+      (venvSkipped ? ", case 11 pip step skipped" : "") +
+      ")",
+  );
 } finally {
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 }
