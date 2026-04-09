@@ -1153,6 +1153,55 @@ function writeBatchSnapshot(projectId, snapshot) {
     // Non-fatal — panel still works from the live parse.
   }
 }
+function deleteBatchSnapshot(projectId) {
+  try {
+    fs.unlinkSync(batchSnapshotPath(projectId));
+  } catch {
+    // Non-fatal — file may already be gone.
+  }
+}
+
+// #334: verify the snapshot's first issue number still exists on
+// GitHub before trusting the snapshot. A soft existence check is
+// enough — if the first issue genuinely 404s, treat the whole
+// snapshot as stale (most likely a leftover from a prior
+// project/repo that was purged) and let the caller drop it. One
+// gh call per cache miss, wrapped in the existing
+// BATCH_PROGRESS_TTL_MS cache upstream.
+//
+// Returns one of:
+//   "fresh"   — first issue resolved, snapshot is trustworthy
+//   "gone"    — first issue confirmed 404; snapshot should be dropped
+//   "unknown" — transient error (auth/network/timeout); leave
+//               snapshot alone and let the next cache miss retry
+async function checkBatchSnapshotFreshness(repo, snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.issueNumbers) || snapshot.issueNumbers.length === 0) {
+    return "gone";
+  }
+  const first = snapshot.issueNumbers[0];
+  try {
+    await ghJsonExecAsync([
+      "issue",
+      "view",
+      String(first),
+      "-R",
+      repo,
+      "--json",
+      "number",
+    ]);
+    return "fresh";
+  } catch (err) {
+    // gh surfaces a 404 via stderr text on a non-zero exit. Only
+    // the unambiguous "not found" / "could not resolve" shapes
+    // count as genuinely gone; anything else (network, auth,
+    // timeout) is transient and must NOT delete the snapshot.
+    const msg = String((err && (err.stderr || err.message)) || "").toLowerCase();
+    if (msg.includes("could not resolve") || msg.includes("not found") || msg.includes("no issue")) {
+      return "gone";
+    }
+    return "unknown";
+  }
+}
 
 // Decide which batch to render, combining the live parse of
 // OVERNIGHT-QUEUE.md with the persistent snapshot. The snapshot is
@@ -1430,6 +1479,27 @@ router.get("/api/batch-progress", async (req, res) => {
     // Missing / unreadable file — pass queueReadOk=false so the
     // resolver bypasses the snapshot and returns the empty state
     // per #316's edge case.
+  }
+
+  // #334 / quadwork#334: validate the on-disk snapshot against
+  // GitHub before resolveDisplayedBatch can serve it. A snapshot
+  // whose first issue 404s is almost certainly a leftover from a
+  // prior project/repo that was purged; drop the file so the
+  // resolver falls through to the live queue parse (which will
+  // typically also be empty) instead of serving stale data
+  // indefinitely. We only run the check on cache-miss paths (this
+  // route already sits behind BATCH_PROGRESS_TTL_MS) and only
+  // when we'd actually rely on the snapshot — i.e. the live queue
+  // read succeeded, so the existing #316 bypass for unreadable
+  // queue files keeps precedence.
+  if (queueReadOk) {
+    const existing = readBatchSnapshot(projectId);
+    if (existing && Array.isArray(existing.issueNumbers) && existing.issueNumbers.length > 0) {
+      const freshness = await checkBatchSnapshotFreshness(repo, existing);
+      if (freshness === "gone") deleteBatchSnapshot(projectId);
+      // "unknown" → leave the file alone; transient failure will
+      // retry on the next cache miss.
+    }
   }
 
   // #429 / quadwork#316: resolve the displayed batch through the
