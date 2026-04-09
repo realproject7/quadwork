@@ -64,7 +64,32 @@ try {
   assert.match(got, /ModuleNotFoundError/);
   assert.match(got, /No module named 'requests'/);
 
-  console.log("routes.telegramBridge.test.js: all assertions passed (7 cases)");
+  // 8) #372: pre-flight dep-check failures must be persisted to
+  //    the bridge log file so a subsequent status poll can surface
+  //    them via last_error. Without this the widget's local
+  //    actionError got clobbered by the next 5s polling cycle and
+  //    the failure appeared as a silent Start → Stopped flicker.
+  //    Here we simulate the exact fs.writeFileSync the start
+  //    handler now runs on pre-flight failure, then round-trip it
+  //    through readLastLines to confirm the error text survives.
+  const preflightLog = path.join(tmp, "preflight.log");
+  const msg =
+    "Bridge Python dependencies not installed. Click \"Install Bridge\" to install them, " +
+    "or run: pip3 install -r /tmp/fake/requirements.txt\n\n" +
+    "Import error: Traceback (most recent call last):\n" +
+    "  File \"<string>\", line 1, in <module>\n" +
+    "    import requests\n" +
+    "ModuleNotFoundError: No module named 'requests'";
+  fs.writeFileSync(
+    preflightLog,
+    `[${new Date().toISOString()}] pre-flight dep check failed\n${msg}\n`,
+  );
+  const tail = readLastLines(preflightLog, 20);
+  assert.match(tail, /pre-flight dep check failed/);
+  assert.match(tail, /ModuleNotFoundError/);
+  assert.match(tail, /Install Bridge/);
+
+  console.log("routes.telegramBridge.test.js: all assertions passed (8 cases)");
 } finally {
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 }

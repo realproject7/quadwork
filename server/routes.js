@@ -2555,13 +2555,23 @@ router.post("/api/telegram", async (req, res) => {
       // produced with `stdio: "ignore"`.
       const depCheck = checkTelegramBridgePythonDeps();
       if (!depCheck.ok) {
-        return res.json({
-          ok: false,
-          error:
-            "Bridge Python dependencies not installed. Click \"Install Bridge\" to install them, " +
-            "or run: pip3 install -r " + path.join(BRIDGE_DIR, "requirements.txt") + "\n\n" +
-            `Import error: ${depCheck.error}`,
-        });
+        // #372: persist the pre-flight failure to the bridge log
+        // file so the GET /api/telegram `last_error` tail picks it
+        // up on the next status poll. Without this the widget only
+        // sees the error for ~5s before the polling cycle clobbers
+        // local error state, producing the "silent fail" symptom
+        // (pill flips back to Stopped with no trace of why).
+        const msg =
+          "Bridge Python dependencies not installed. Click \"Install Bridge\" to install them, " +
+          "or run: pip3 install -r " + path.join(BRIDGE_DIR, "requirements.txt") + "\n\n" +
+          `Import error: ${depCheck.error}`;
+        try {
+          fs.writeFileSync(
+            telegramBridgeLog(projectId),
+            `[${new Date().toISOString()}] pre-flight dep check failed\n${msg}\n`,
+          );
+        } catch {}
+        return res.json({ ok: false, error: msg });
       }
       // #353: capture stdout + stderr to a per-project log file so
       // bridge crashes (bad token, network failure, config parse

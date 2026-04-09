@@ -79,6 +79,22 @@ function fmtHours(h: number): string {
 }
 
 export default function TopHeader() {
+  // #372: TopHeader mixes localStorage-derived state (tagline
+  // animation toggle), an async activity-stats fetch, and a
+  // typewriter animation that all tick independently on the
+  // client. Next.js was rendering slightly different text between
+  // the SSR pass and the first client render, producing React
+  // error #418 ("hydration failed — text content mismatch") and
+  // forcing React to throw away the server-rendered subtree and
+  // fully re-render — which operators observed as an unexplained
+  // "right column unmounts and remounts" whenever the client
+  // re-hydrated mid-interaction. Gating the whole header on a
+  // mounted flag gives the SSR and first-client render identical
+  // output (an empty 48px placeholder shell), then triggers a
+  // single safe client-side render after hydration. No more
+  // mismatch, no more subtree remount cascade.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
   const [aboutOpen, setAboutOpen] = useState(false);
   // #430 / quadwork#312: work-hours stat polling. 60s cadence.
   const [stats, setStats] = useState<ActivityStats | null>(null);
@@ -145,6 +161,18 @@ export default function TopHeader() {
       setShowToggle(true);
     }
   }, [animationEnabled, liveSuffix]);
+
+  if (!mounted) {
+    // #372: empty placeholder shell with the same dimensions as
+    // the real header so layout doesn't jump on hydration. SSR
+    // and first client render produce identical HTML → no #418.
+    return (
+      <header
+        className="sticky top-0 z-40 flex h-12 items-center justify-between border-b border-white/10 bg-neutral-950/90 px-4 backdrop-blur"
+        aria-hidden="true"
+      />
+    );
+  }
 
   return (
     <>

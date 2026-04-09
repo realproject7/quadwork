@@ -42,7 +42,13 @@ async function callTelegram(action: string, body: Record<string, unknown>) {
 export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidgetProps) {
   const [status, setStatus] = useState<TelegramStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // #372: split error state — actionError is set by the operator's
+  // Start/Stop click and must persist across polling cycles so a
+  // failed start doesn't silently disappear after the next 5s
+  // poll. pollError is set only by the background status fetch and
+  // gets cleared on a successful poll.
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pollError, setPollError] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
 
   const load = useCallback(async () => {
@@ -51,9 +57,9 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
       if (!r.ok) throw new Error(`${r.status}`);
       const data = (await r.json()) as TelegramStatus;
       setStatus(data);
-      setError(null);
+      setPollError(null);
     } catch (e) {
-      setError((e as Error).message);
+      setPollError((e as Error).message);
     }
   }, [projectId]);
 
@@ -64,7 +70,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   }, [load]);
 
   const start = async () => {
-    setBusy(true); setError(null);
+    setBusy(true); setActionError(null);
     try {
       // The first-time path clones + pip-installs the bridge before
       // spawning it. "install" is a no-op if it's already installed.
@@ -73,16 +79,16 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
       }
       await callTelegram("start", { project_id: projectId });
       await load();
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) { setActionError((e as Error).message); }
     finally { setBusy(false); }
   };
 
   const stop = async () => {
-    setBusy(true); setError(null);
+    setBusy(true); setActionError(null);
     try {
       await callTelegram("stop", { project_id: projectId });
       await load();
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) { setActionError((e as Error).message); }
     finally { setBusy(false); }
   };
 
@@ -96,26 +102,28 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
     } catch (e) {
       // Leave the save persisted even if start fails; the operator
       // can retry from the widget.
-      setError((e as Error).message);
+      setActionError((e as Error).message);
     }
     await load();
   };
 
   const configured = !!status?.configured;
   const running = !!status?.running;
+  // #372: show, in preference order, the most recent actionable
+  // error: the operator's last Start/Stop failure, then a poll
+  // failure, then the server-side log tail from a crashed bridge.
+  // Rendered as a dedicated multi-line block below the controls
+  // (not a truncated span in the header) so long Python tracebacks
+  // from dep-check / spawn failures are actually readable.
+  const displayError = actionError || pollError || (!running && status?.last_error) || "";
 
   return (
     <>
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
           <span className="text-[11px] text-text-muted uppercase tracking-wider">Telegram Bridge</span>
-          {(error || (!status?.running && status?.last_error)) && (
-            <span
-              className="text-[10px] text-error max-w-[60%] truncate"
-              title={error || status?.last_error || ""}
-            >
-              err: {error || status?.last_error}
-            </span>
+          {displayError && (
+            <span className="text-[10px] text-error">error</span>
           )}
         </div>
         <div className="p-3 flex flex-col gap-2">
@@ -191,6 +199,20 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                 </button>
               </div>
             </>
+          )}
+          {displayError && (
+            <div className="mt-1 p-2 text-[10px] text-error border border-error/40 bg-error/5 font-mono whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+              {displayError}
+              {actionError && (
+                <button
+                  type="button"
+                  onClick={() => setActionError(null)}
+                  className="block mt-1 text-text-muted hover:text-text underline"
+                >
+                  dismiss
+                </button>
+              )}
+            </div>
           )}
         </div>
       </div>
