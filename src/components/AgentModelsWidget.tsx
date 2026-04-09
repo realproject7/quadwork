@@ -26,10 +26,43 @@ interface AgentModelsWidgetProps {
 // No xhigh — explicitly excluded per #343 ("capacity-failure hot spot").
 const REASONING_LEVELS = ["minimal", "low", "medium", "high"] as const;
 
+// #343 follow-up: backend-specific model dropdown options.
+// Empty string = use the CLI's own default (no -c / --model flag
+// passed at all). The lists below are the known-good slugs we
+// ship with this release; operators who need something bleeding
+// edge can still override by editing ~/.quadwork/config.json
+// directly — this widget is the guided happy path.
+const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
+  codex: [
+    { value: "", label: "(CLI default)" },
+    { value: "gpt-5.4", label: "gpt-5.4" },
+    { value: "gpt-5", label: "gpt-5" },
+    { value: "gpt-4o", label: "gpt-4o" },
+  ],
+  claude: [
+    { value: "", label: "(CLI default)" },
+    { value: "claude-opus-4-6", label: "claude-opus-4-6" },
+    { value: "claude-sonnet-4-6", label: "claude-sonnet-4-6" },
+    { value: "claude-haiku-4-5-20251001", label: "claude-haiku-4-5" },
+  ],
+};
+function optionsForBackend(backend: string) {
+  return MODEL_OPTIONS[backend] || [{ value: "", label: "(CLI default)" }];
+}
+
 export default function AgentModelsWidget({ projectId }: AgentModelsWidgetProps) {
   const [rows, setRows] = useState<AgentRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // #343 follow-up: track which agents have edits that haven't
+  // yet been applied to the live session. A row is marked dirty
+  // when the operator saves a new model or reasoning setting via
+  // update(), and cleared only when the operator clicks Restart
+  // on that row (restart() succeeds). Until then the UI shows a
+  // "needs restart" badge next to the agent id so it is visually
+  // obvious which sessions are running stale config — the ticket
+  // explicitly calls this out as a required acceptance.
+  const [needsRestart, setNeedsRestart] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     try {
@@ -56,6 +89,13 @@ export default function AgentModelsWidget({ projectId }: AgentModelsWidgetProps)
       });
       const data = await r.json();
       if (!r.ok || data.ok === false) throw new Error(data.error || `${r.status}`);
+      // #343: config has drifted from the running session until
+      // the operator explicitly restarts this agent.
+      setNeedsRestart((prev) => {
+        const next = new Set(prev);
+        next.add(agentId);
+        return next;
+      });
       await load();
     } catch (e) {
       setError((e as Error).message);
@@ -71,6 +111,13 @@ export default function AgentModelsWidget({ projectId }: AgentModelsWidgetProps)
       const r = await fetch(`/api/agents/${encodeURIComponent(projectId)}/${encodeURIComponent(agentId)}/restart`, { method: "POST" });
       const data = await r.json();
       if (!r.ok || data.ok === false) throw new Error(data.error || `${r.status}`);
+      // Running session is now on the new config — clear the
+      // restart-required badge.
+      setNeedsRestart((prev) => {
+        const next = new Set(prev);
+        next.delete(agentId);
+        return next;
+      });
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -93,23 +140,34 @@ export default function AgentModelsWidget({ projectId }: AgentModelsWidgetProps)
           <div key={row.agent_id} className="flex items-center gap-1.5 flex-wrap">
             <span className="text-[11px] text-text font-semibold w-16 shrink-0">{row.agent_id}</span>
             <span className="text-[10px] text-text-muted w-12 shrink-0">{row.backend}</span>
-            <input
-              type="text"
+            {needsRestart.has(row.agent_id) && (
+              <span
+                className="text-[9px] text-[#ffcc00] border border-[#ffcc00]/40 px-1 py-[1px] shrink-0"
+                title="Config changed — running session is still on the old model/effort. Click Restart to apply."
+              >
+                restart required
+              </span>
+            )}
+            {/* #343: backend-specific model dropdown. Empty value
+                = CLI default (no override). Options come from
+                MODEL_OPTIONS[backend]; unknown backends fall
+                back to just the "(CLI default)" entry. */}
+            <select
               value={row.model}
-              placeholder="(CLI default)"
               disabled={busy === row.agent_id}
-              onChange={(e) => {
-                setRows((prev) => prev?.map((r) => (r.agent_id === row.agent_id ? { ...r, model: e.target.value } : r)) || null);
-              }}
-              onBlur={(e) => {
-                if (e.target.value !== row.model || true) {
-                  // Commit the draft on blur so the model text can be retyped
-                  // without hammering the backend on every keystroke.
-                  update(row.agent_id, { model: e.target.value });
-                }
-              }}
-              className="flex-1 min-w-[100px] bg-transparent border border-border px-1.5 py-0.5 text-[11px] font-mono text-text outline-none focus:border-accent disabled:opacity-50"
-            />
+              onChange={(e) => update(row.agent_id, { model: e.target.value })}
+              className="flex-1 min-w-[140px] bg-transparent border border-border px-1 py-0.5 text-[11px] font-mono text-text outline-none focus:border-accent cursor-pointer disabled:opacity-50"
+            >
+              {optionsForBackend(row.backend).map((opt) => (
+                <option key={opt.value} value={opt.value} className="bg-bg-surface">{opt.label}</option>
+              ))}
+              {/* If the persisted model isn't in the known list
+                  (e.g. operator hand-edited config.json), keep
+                  it selectable so their override doesn't vanish. */}
+              {row.model && !optionsForBackend(row.backend).some((o) => o.value === row.model) && (
+                <option value={row.model} className="bg-bg-surface">{row.model} (custom)</option>
+              )}
+            </select>
             {row.reasoning_supported ? (
               <select
                 value={row.reasoning_effort || ""}
