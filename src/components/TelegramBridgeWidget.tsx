@@ -13,6 +13,11 @@ interface TelegramStatus {
   chat_id: string;
   bot_username: string;
   bridge_installed: boolean;
+  // #353: tail of ~/.quadwork/telegram-bridge-<projectId>.log
+  // populated by the server when running === false and the log
+  // file has content, so runtime crashes after a successful
+  // Start are still visible in the widget.
+  last_error?: string;
 }
 
 async function callTelegram(action: string, body: Record<string, unknown>) {
@@ -104,7 +109,14 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
           <span className="text-[11px] text-text-muted uppercase tracking-wider">Telegram Bridge</span>
-          {error && <span className="text-[10px] text-error max-w-[60%] truncate" title={error}>err: {error}</span>}
+          {(error || (!status?.running && status?.last_error)) && (
+            <span
+              className="text-[10px] text-error max-w-[60%] truncate"
+              title={error || status?.last_error || ""}
+            >
+              err: {error || status?.last_error}
+            </span>
+          )}
         </div>
         <div className="p-3 flex flex-col gap-2">
           {!configured ? (

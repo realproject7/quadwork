@@ -2293,6 +2293,66 @@ function telegramConfigToml(projectId) {
   return path.join(CONFIG_DIR, `telegram-${projectId}.toml`);
 }
 
+// #353: per-project log file for the bridge subprocess. The start
+// handler redirects stdout + stderr here so crashes (ImportError,
+// config parse, auth failure) are recoverable instead of
+// /dev/null'd by `stdio: "ignore"`.
+function telegramBridgeLog(projectId) {
+  return path.join(CONFIG_DIR, `telegram-bridge-${projectId}.log`);
+}
+
+// Tail the last N lines of a file without reading the whole thing
+// into memory if it is huge. For the bridge log we care about the
+// final crash frame, not historical output.
+function readLastLines(filePath, n) {
+  try {
+    if (!fs.existsSync(filePath)) return "";
+    const stat = fs.statSync(filePath);
+    const readBytes = Math.min(stat.size, 64 * 1024);
+    if (readBytes === 0) return "";
+    const buf = Buffer.alloc(readBytes);
+    const fd = fs.openSync(filePath, "r");
+    try {
+      fs.readSync(fd, buf, 0, readBytes, Math.max(0, stat.size - readBytes));
+    } finally {
+      fs.closeSync(fd);
+    }
+    const text = buf.toString("utf-8");
+    const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
+    return lines.slice(-n).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+// Verify that the bridge's Python runtime has its required modules
+// available. Cheap pre-flight so a missing `requests` install
+// produces a readable error instead of a silent Start → Stopped
+// flicker. Returns { ok: true } on success, { ok: false, error }
+// otherwise. Keep the import list small and close to what the
+// bridge actually needs; add modules here if the bridge gains new
+// hard deps.
+function checkTelegramBridgePythonDeps() {
+  try {
+    // Only check the third-party module the bridge actually needs
+    // at import time — `requests`. Toml parsing differs between
+    // Python versions (tomllib on 3.11+, tomli on 3.10-), and any
+    // genuine toml import failure will now be captured in the
+    // bridge log file on spawn, so this pre-flight stays narrow
+    // and avoids false negatives on older Python installs.
+    execFileSync("python3", ["-c", "import requests"], {
+      encoding: "utf-8",
+      timeout: 10000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { ok: true };
+  } catch (err) {
+    const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
+    const msg = stderr.trim() || (err && err.message) || "python3 import check failed";
+    return { ok: false, error: msg };
+  }
+}
+
 function isTelegramRunning(projectId) {
   const pf = telegramPidFile(projectId);
   if (!fs.existsSync(pf)) return false;
@@ -2391,12 +2451,29 @@ router.get("/api/telegram", async (req, res) => {
       }
     } catch { /* non-fatal — widget will just show no username */ }
   }
+  // #353: if the bridge is not running but a log file exists with
+  // content, tail it and expose it as `last_error` so the widget
+  // can surface runtime crashes (bad token mid-session, network
+  // failure, config parse error) that happen after the initial
+  // 500 ms post-spawn liveness check and would otherwise just
+  // revert the pill to Stopped with no explanation.
+  const running = isTelegramRunning(projectId);
+  let lastError = "";
+  if (!running) {
+    const logPath = telegramBridgeLog(projectId);
+    try {
+      if (fs.existsSync(logPath) && fs.statSync(logPath).size > 0) {
+        lastError = readLastLines(logPath, 20);
+      }
+    } catch {}
+  }
   res.json({
-    running: isTelegramRunning(projectId),
+    running,
     configured,
     chat_id: chatId,
     bot_username: botUsername,
     bridge_installed: bridgeInstalled,
+    last_error: lastError,
   });
 });
 
@@ -2419,15 +2496,39 @@ router.post("/api/telegram", async (req, res) => {
       }
     }
     case "install": {
+      // #353: pip3 can exit 0 on some systems (PEP 668 externally-
+      // managed environments, non-writable site-packages) even when
+      // the subsequent import still fails. After the pip step, run
+      // a post-install import check and surface both the pip output
+      // and the import error together if the check fails — that's
+      // the signal the operator needs to know whether to pick a
+      // virtualenv, use --user, or --break-system-packages.
+      let pipOutput = "";
       try {
         if (!fs.existsSync(BRIDGE_DIR)) {
           execFileSync("gh", ["repo", "clone", "realproject7/agentchattr-telegram", BRIDGE_DIR], { encoding: "utf-8", timeout: 30000 });
         }
-        execFileSync("pip3", ["install", "-r", path.join(BRIDGE_DIR, "requirements.txt")], { encoding: "utf-8", timeout: 30000 });
-        return res.json({ ok: true });
+        pipOutput = execFileSync(
+          "pip3",
+          ["install", "-r", path.join(BRIDGE_DIR, "requirements.txt")],
+          { encoding: "utf-8", timeout: 60000 },
+        );
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Install failed" });
       }
+      const depCheck = checkTelegramBridgePythonDeps();
+      if (!depCheck.ok) {
+        return res.json({
+          ok: false,
+          error:
+            "pip3 reported success but the bridge's Python deps still fail to import. " +
+            "This usually means pip installed into a location python3 cannot see " +
+            "(externally-managed environment / PEP 668 / mismatched interpreter).\n\n" +
+            `Import error: ${depCheck.error}\n\n` +
+            `pip output tail:\n${pipOutput.split("\n").slice(-10).join("\n")}`,
+        });
+      }
+      return res.json({ ok: true });
     }
     case "start": {
       const projectId = body.project_id;
@@ -2441,14 +2542,75 @@ router.post("/api/telegram", async (req, res) => {
       const tomlContent = `[telegram]\nbot_token = "${tg.bot_token}"\nchat_id = "${tg.chat_id}"\n\n[agentchattr]\nurl = "${tg.agentchattr_url}"\n`;
       fs.writeFileSync(tomlPath, tomlContent, { mode: 0o600 });
       fs.chmodSync(tomlPath, 0o600);
+      // #353: pre-flight import check so a fresh install with no
+      // `requests` module produces a readable error instead of the
+      // Start → Running → Stopped flicker that the v1 code path
+      // produced with `stdio: "ignore"`.
+      const depCheck = checkTelegramBridgePythonDeps();
+      if (!depCheck.ok) {
+        return res.json({
+          ok: false,
+          error:
+            "Bridge Python dependencies not installed. Click \"Install Bridge\" to install them, " +
+            "or run: pip3 install -r " + path.join(BRIDGE_DIR, "requirements.txt") + "\n\n" +
+            `Import error: ${depCheck.error}`,
+        });
+      }
+      // #353: capture stdout + stderr to a per-project log file so
+      // bridge crashes (bad token, network failure, config parse
+      // error, etc.) are recoverable. The handle must be opened
+      // BEFORE spawn and passed through stdio so the detached
+      // child keeps writing after the parent unrefs it.
+      const logPath = telegramBridgeLog(projectId);
+      // #353 follow-up: truncate the log at the start of every
+      // spawn so the status endpoint's last_error tail only ever
+      // reflects the *current* session. Otherwise a previous
+      // crash's trace would linger forever and the widget would
+      // keep surfacing a stale error even after the operator
+      // fixed the underlying problem and restarted cleanly.
+      try { fs.writeFileSync(logPath, ""); } catch {}
+      let outFd, errFd;
       try {
-        const child = spawn("python3", [bridgeScript, "--config", tomlPath], { detached: true, stdio: "ignore" });
+        outFd = fs.openSync(logPath, "a");
+        errFd = fs.openSync(logPath, "a");
+      } catch (err) {
+        return res.json({ ok: false, error: `Could not open bridge log file: ${err.message}` });
+      }
+      let child;
+      try {
+        child = spawn("python3", [bridgeScript, "--config", tomlPath], {
+          detached: true,
+          stdio: ["ignore", outFd, errFd],
+        });
         child.unref();
         if (child.pid) fs.writeFileSync(telegramPidFile(projectId), String(child.pid));
-        return res.json({ ok: true, running: true, pid: child.pid });
       } catch (err) {
+        try { fs.closeSync(outFd); } catch {}
+        try { fs.closeSync(errFd); } catch {}
         return res.json({ ok: false, error: err.message || "Start failed" });
       }
+      // Close our copies of the fds in the parent now that the
+      // child has inherited them — otherwise the parent holds the
+      // log file open forever.
+      try { fs.closeSync(outFd); } catch {}
+      try { fs.closeSync(errFd); } catch {}
+      // #353: liveness check — wait 500ms, then verify the child
+      // is still running. If it already died, tail the log file
+      // and return those lines as the error.
+      await new Promise((r) => setTimeout(r, 500));
+      let alive = true;
+      try { process.kill(child.pid, 0); } catch { alive = false; }
+      if (!alive) {
+        const tail = readLastLines(logPath, 20);
+        try { fs.unlinkSync(telegramPidFile(projectId)); } catch {}
+        return res.json({
+          ok: false,
+          error:
+            "Bridge crashed on start (exited within 500ms).\n\n" +
+            `Last log lines (${logPath}):\n${tail || "(log empty)"}`,
+        });
+      }
+      return res.json({ ok: true, running: true, pid: child.pid });
     }
     case "stop": {
       const projectId = body.project_id;
@@ -2531,3 +2693,5 @@ module.exports.parseActiveBatch = parseActiveBatch;
 // summarizeItems for the batch-progress fixture test.
 module.exports.buildNoPrRow = buildNoPrRow;
 module.exports.summarizeItems = summarizeItems;
+// #353: expose readLastLines for the telegram-bridge test.
+module.exports.readLastLines = readLastLines;
