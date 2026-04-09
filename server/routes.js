@@ -148,11 +148,22 @@ router.get("/api/chat", async (req, res) => {
 const { WebSocket: NodeWebSocket } = require("ws");
 const { syncChattrToken } = require("./config");
 
+// #236: wait for AgentChattr to echo our message back over the same ws
+// connection before resolving, instead of fire-and-forgetting after
+// 250ms. AC's /ws handler broadcasts `{type:"message", data: msg}` to
+// every connected client (including the sender) after `store.add()`
+// succeeds — so if we stay subscribed briefly after sending, we see
+// our own message come back with its server-assigned id/timestamp.
+// We match on (sender, text, channel, reply_to) since AC does not
+// echo a client-supplied correlation id. On timeout / early close /
+// 4003, we surface a proper error so the /api/chat handler can
+// return a 5xx (or 401) instead of a silent {ok:true}.
 function sendViaWebSocket(baseUrl, sessionToken, message) {
   return new Promise((resolve, reject) => {
     const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(sessionToken || "")}`;
     const ws = new NodeWebSocket(wsUrl);
     let settled = false;
+    let sentAt = 0;
     const finish = (err, value) => {
       if (settled) return;
       settled = true;
@@ -163,11 +174,28 @@ function sendViaWebSocket(baseUrl, sessionToken, message) {
     ws.on("open", () => {
       try {
         ws.send(JSON.stringify({ type: "message", ...message }));
-        // Server acks via broadcast, but the dashboard's POST /api/chat
-        // contract only needs to know the message was accepted. Wait
-        // ~250ms for the server to enqueue + close cleanly.
-        setTimeout(() => { clearTimeout(giveUp); finish(null, { ok: true }); }, 250);
+        sentAt = Date.now();
       } catch (err) { clearTimeout(giveUp); finish(err); }
+    });
+    ws.on("message", (raw) => {
+      if (settled || !sentAt) return;
+      let frame;
+      try { frame = JSON.parse(raw.toString()); } catch { return; }
+      if (!frame || frame.type !== "message" || !frame.data) return;
+      const d = frame.data;
+      // AC replays history on connect (same type:"message" envelope).
+      // Ignore any echo whose stored timestamp predates our send — it
+      // can only be an old message, not our ack. AC timestamps are
+      // epoch seconds (float) on the `timestamp` field.
+      if (typeof d.timestamp === "number" && d.timestamp * 1000 < sentAt - 1500) return;
+      if (d.sender !== message.sender) return;
+      if (d.text !== message.text) return;
+      if ((d.channel || "general") !== (message.channel || "general")) return;
+      const wantReply = message.reply_to ?? null;
+      const gotReply = d.reply_to ?? null;
+      if (wantReply !== gotReply) return;
+      clearTimeout(giveUp);
+      finish(null, { ok: true, message: d });
     });
     ws.on("error", (err) => { clearTimeout(giveUp); finish(err); });
     ws.on("close", (code, reason) => {
@@ -179,6 +207,15 @@ function sendViaWebSocket(baseUrl, sessionToken, message) {
         const e = new Error(msg);
         e.code = "EAGENTCHATTR_401";
         finish(e);
+        return;
+      }
+      // Any other premature close after we sent but before we saw
+      // the echo is an error — the old code path would have claimed
+      // success, silently swallowing a server-side reject.
+      if (!settled) {
+        clearTimeout(giveUp);
+        const r = (reason && reason.toString()) || "";
+        finish(new Error(`websocket closed before ack (code=${code}${r ? ", reason=" + r : ""})`));
       }
     });
   });
@@ -861,8 +898,12 @@ router.post("/api/chat", async (req, res) => {
   const attemptSend = () => sendViaWebSocket(base, sessionToken, message);
 
   try {
-    await attemptSend();
-    return res.json({ ok: true });
+    // #236: sendViaWebSocket now waits for AC's broadcast echo and
+    // returns `{ok, message}` where `message` is the stored record
+    // (with server-assigned id/timestamp). Pass it through so
+    // callers regain parity with the old /api/send response body.
+    const result = await attemptSend();
+    return res.json({ ok: true, message: result.message });
   } catch (err) {
     // If the cached session_token is stale (AgentChattr regenerates
     // one on every restart) the ws closes with code 4003 — re-sync
@@ -876,8 +917,8 @@ router.post("/api/chat", async (req, res) => {
       const { token: refreshed } = getChattrConfig(projectId);
       if (refreshed && refreshed !== sessionToken) {
         try {
-          await sendViaWebSocket(base, refreshed, message);
-          return res.json({ ok: true, resynced: true });
+          const retry = await sendViaWebSocket(base, refreshed, message);
+          return res.json({ ok: true, resynced: true, message: retry.message });
         } catch (retryErr) {
           console.warn(`[chat] retry after token resync failed: ${retryErr.message}`);
           return res.status(401).json({ error: "AgentChattr auth failed (token resync did not help)", detail: retryErr.message });
@@ -2813,3 +2854,6 @@ module.exports.readLastLines = readLastLines;
 // #380: expose checkTelegramBridgePythonDeps so the bridge test can
 // exercise the venv-path interpreter argument round trip.
 module.exports.checkTelegramBridgePythonDeps = checkTelegramBridgePythonDeps;
+// #236: expose sendViaWebSocket so the chat-ws-send regression test
+// can verify the ack/body/error paths against a fake AC ws server.
+module.exports.sendViaWebSocket = sendViaWebSocket;
