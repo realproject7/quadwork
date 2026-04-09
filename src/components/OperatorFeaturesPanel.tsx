@@ -34,8 +34,12 @@ export default function OperatorFeaturesPanel({ projectId }: { projectId: string
         {/* Left column: Scheduled Trigger spans full panel height.
             min-w-[280px] at lg+ keeps the message textarea from
             collapsing below a usable width when the panel is
-            narrow-but-still-lg. */}
-        <div className="lg:flex-1 lg:min-w-[280px] lg:min-h-0 lg:overflow-y-auto">
+            narrow-but-still-lg. Per #351, the Trigger must remain
+            the always-reachable primary surface — no overflow-y
+            on this column. The parent lg:overflow-hidden clamps
+            any overshoot visually; the right column is the only
+            independent scroll container. */}
+        <div className="lg:flex-1 lg:min-w-[280px] lg:min-h-0">
           <ScheduledTriggerWidget projectId={projectId} />
         </div>
         {/* Vertical divider between the two columns, only at lg+. */}
