@@ -442,9 +442,12 @@ export default function ControlBar({ projectId }: ControlBarProps) {
   // carries the server lifecycle + system controls.
   return (
     <div className="border-t border-border px-3 py-2">
-      <div className="flex items-start gap-6">
+      {/* #337 / quadwork#337: stack SERVER / KEEP MAC AWAKE / NOTIFICATION
+          SOUND vertically with dividers so the Notification Sound
+          subsection has room to expand below the chat panel. */}
+      <div className="flex flex-col gap-2">
         <ServerSection projectId={projectId} />
-        <div className="w-px self-stretch bg-border" />
+        <div className="border-t border-border/40" />
         <SystemSection />
       </div>
     </div>
