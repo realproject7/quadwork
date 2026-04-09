@@ -252,7 +252,15 @@ function SystemSection() {
   const showKeepAwakeSubsection = !platform || platform === "darwin";
 
   return (
-    <div className="flex flex-col gap-2 relative">
+    // #369: Keep Awake + Notification Sound now sit side-by-side at
+    // md+ widths so ControlBar can present three real columns
+    // (Server | Keep Mac Awake | Notification Sound) separated by
+    // vertical dividers, instead of the stacked-row layout PR #345
+    // landed. Below md the layout collapses back to stacked rows so
+    // narrow split-views still fit. Keep Awake hides entirely on
+    // non-darwin and Notification Sound takes the full subsection
+    // width on its own.
+    <div className="flex flex-col md:flex-row md:items-start gap-2 md:gap-6 relative">
       {showKeepAwakeSubsection && (
         <div className="flex flex-col gap-0.5 relative">
           <div className="flex items-center gap-1 text-[10px] text-text-muted uppercase tracking-wider font-semibold">
@@ -298,9 +306,11 @@ function SystemSection() {
         </div>
       )}
 
-      {/* #425 / quadwork#311: divider between the two subsections. */}
+      {/* #369: vertical divider between Keep Awake and Notification
+          Sound at md+; horizontal divider in the stacked fallback so
+          the two subsections still read as distinct on narrow widths. */}
       {showKeepAwakeSubsection && (
-        <div className="border-t border-border/40" />
+        <div className="border-t border-border/40 md:border-t-0 md:w-px md:h-auto md:self-stretch md:bg-border" />
       )}
 
       {/* #409 / quadwork#273 + #425 / quadwork#311: notification sound
@@ -442,12 +452,17 @@ export default function ControlBar({ projectId }: ControlBarProps) {
   // carries the server lifecycle + system controls.
   return (
     <div className="border-t border-border px-3 py-2">
-      {/* #337 / quadwork#337: stack SERVER / KEEP MAC AWAKE / NOTIFICATION
-          SOUND vertically with dividers so the Notification Sound
-          subsection has room to expand below the chat panel. */}
-      <div className="flex flex-col gap-2">
+      {/* #369 / quadwork#369: revert the #337 stacked-row interpretation.
+          Lay out SERVER | KEEP MAC AWAKE | NOTIFICATION SOUND as three
+          horizontally arranged columns separated by vertical w-px
+          dividers. SystemSection internally renders the right two
+          columns (Keep Awake hides on non-darwin so the row collapses
+          to two columns naturally). At narrow widths (< md) the
+          whole layout collapses back to stacked rows with horizontal
+          dividers so cramped split-views still fit. */}
+      <div className="flex flex-col md:flex-row md:items-start gap-2 md:gap-6">
         <ServerSection projectId={projectId} />
-        <div className="border-t border-border/40" />
+        <div className="border-t border-border/40 md:border-t-0 md:w-px md:h-auto md:self-stretch md:bg-border" />
         <SystemSection />
       </div>
     </div>
