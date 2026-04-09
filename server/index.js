@@ -312,6 +312,32 @@ async function buildAgentArgs(projectId, agentId) {
     if (flags) args.push(...flags);
   }
 
+  // #343: per-agent model + reasoning effort overrides. Persist in
+  // project.agents[agentId].{model,reasoning_effort} via the
+  // dashboard Agent Models widget. When unset, fall back to the
+  // CLI's own default so existing projects without overrides keep
+  // their current behavior.
+  //
+  // Codex: -c model="<slug>" / -c model_reasoning_effort="<level>"
+  //   reasoning levels: minimal | low | medium | high (xhigh is
+  //   deliberately NOT offered — it's the capacity-failure hot
+  //   spot #343 was filed for).
+  // Claude: --model <slug>
+  //   reasoning_effort is not wired for Claude — Anthropic's CLI
+  //   doesn't expose an equivalent flag.
+  if (cliBase === "codex") {
+    if (agentCfg.model && typeof agentCfg.model === "string") {
+      args.push("-c", `model="${agentCfg.model}"`);
+    }
+    if (agentCfg.reasoning_effort && typeof agentCfg.reasoning_effort === "string") {
+      args.push("-c", `model_reasoning_effort="${agentCfg.reasoning_effort}"`);
+    }
+  } else if (cliBase === "claude") {
+    if (agentCfg.model && typeof agentCfg.model === "string") {
+      args.push("--model", agentCfg.model);
+    }
+  }
+
   // MCP config injection
   const mcpHttpPort = project.mcp_http_port;
   const token = project.agentchattr_token;

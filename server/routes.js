@@ -2074,6 +2074,12 @@ router.post("/api/setup", (req, res) => {
         return res.json({ ok: true, message: "Project already in config" });
       }
       // Match CLI wizard agent structure: { cwd, command, auto_approve, mcp_inject }
+      // #343: default Codex-backed agents to reasoning_effort="medium"
+      // instead of the upstream xhigh/high default. high/xhigh is the
+      // provider-side capacity-failure hot spot; medium is the
+      // safe-default for fresh installs so new projects don't hit
+      // "Selected model is at capacity" out of the box. Operators can
+      // bump individual agents back up via the Agent Models widget.
       const agents = {};
       for (const agentId of ["head", "reviewer1", "reviewer2", "dev"]) {
         const cmd = (backends && backends[agentId]) || "claude";
@@ -2084,6 +2090,7 @@ router.post("/api/setup", (req, res) => {
           command: cmd,
           auto_approve: autoApprove,
           mcp_inject: injectMode,
+          ...(cliBase === "codex" ? { reasoning_effort: "medium" } : {}),
         };
       }
       // Use pre-assigned ports/token from agentchattr-config step if provided,
@@ -2681,6 +2688,74 @@ router.post("/api/telegram", async (req, res) => {
     }
     default:
       return res.status(400).json({ error: "Unknown action" });
+  }
+});
+
+// #343: per-agent model + reasoning-effort settings endpoint.
+// GET returns the rows the dashboard Agent Models widget needs;
+// PUT persists a single row back to config.json. Kept narrow on
+// purpose — only `model` and `reasoning_effort` are writable
+// here, and codex is the only backend that accepts
+// reasoning_effort today. The launch-time wiring lives in
+// server/index.js buildAgentArgs; this endpoint is purely
+// config storage.
+const ALLOWED_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high"]);
+
+router.get("/api/project/:projectId/agent-models", (req, res) => {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const project = cfg.projects?.find((p) => p.id === req.params.projectId);
+    if (!project) return res.status(404).json({ error: "Unknown project" });
+    const rows = ["head", "reviewer1", "reviewer2", "dev"].map((agentId) => {
+      const a = project.agents?.[agentId] || {};
+      const command = a.command || "claude";
+      const cliBase = command.split("/").pop().split(" ")[0];
+      return {
+        agent_id: agentId,
+        backend: cliBase,
+        model: a.model || "",
+        reasoning_effort: a.reasoning_effort || "",
+        reasoning_supported: cliBase === "codex",
+      };
+    });
+    return res.json({ agents: rows });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || "read failed" });
+  }
+});
+
+router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
+  const { projectId, agentId } = req.params;
+  if (!["head", "reviewer1", "reviewer2", "dev"].includes(agentId)) {
+    return res.json({ ok: false, error: "Unknown agent" });
+  }
+  const body = req.body || {};
+  // Accept empty string as "clear override → fall back to CLI default".
+  const model = typeof body.model === "string" ? body.model.trim() : undefined;
+  const reasoning = typeof body.reasoning_effort === "string" ? body.reasoning_effort.trim() : undefined;
+  if (reasoning && reasoning !== "" && !ALLOWED_REASONING_EFFORTS.has(reasoning)) {
+    return res.json({ ok: false, error: `Invalid reasoning_effort: ${reasoning}` });
+  }
+  try {
+    const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+    const cfg = JSON.parse(raw);
+    const project = cfg.projects?.find((p) => p.id === projectId);
+    if (!project) return res.status(404).json({ ok: false, error: "Unknown project" });
+    if (!project.agents) project.agents = {};
+    const a = project.agents[agentId] || {};
+    if (model !== undefined) {
+      if (model === "") delete a.model;
+      else a.model = model;
+    }
+    if (reasoning !== undefined) {
+      if (reasoning === "") delete a.reasoning_effort;
+      else a.reasoning_effort = reasoning;
+    }
+    project.agents[agentId] = a;
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    return res.json({ ok: true, agent: { agent_id: agentId, model: a.model || "", reasoning_effort: a.reasoning_effort || "" } });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message || "write failed" });
   }
 });
 
