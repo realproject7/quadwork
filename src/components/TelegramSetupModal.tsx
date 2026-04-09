@@ -23,6 +23,10 @@ export default function TelegramSetupModal({ open, initialChatId = "", onClose, 
   const [chatId, setChatId] = useState(initialChatId);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // #352: troubleshooting section starts collapsed so first-time
+  // setup isn't cluttered with debug commands, but the operator
+  // can expand it inline when the happy path doesn't work.
+  const [troubleshootOpen, setTroubleshootOpen] = useState(false);
 
   useEffect(() => { if (open) setChatId(initialChatId); }, [open, initialChatId]);
 
@@ -90,16 +94,57 @@ export default function TelegramSetupModal({ open, initialChatId = "", onClose, 
           <section>
             <h3 className="text-[13px] font-semibold text-white">Step 2 — Get your chat ID</h3>
             <ol className="mt-1 pl-4 list-decimal space-y-0.5 text-neutral-300">
-              <li>Open Telegram and search for your new bot by username.</li>
-              <li>Click <b>Start</b> and send any message (e.g. <code className="bg-white/5 px-1 rounded text-[11px]">hello</code>).</li>
+              <li>Open Telegram and search for your new bot by its exact <code className="bg-white/5 px-1 rounded text-[11px]">@username</code>.</li>
+              <li>
+                Tap <b>Start</b> and send any message (e.g. <code className="bg-white/5 px-1 rounded text-[11px]">hello</code>).
+                {" "}<span className="text-neutral-400">You must send at least one message first — <code className="bg-white/5 px-0.5 rounded">getUpdates</code> returns <code className="bg-white/5 px-0.5 rounded">{`{"ok":true,"result":[]}`}</code> until Telegram has an inbound message on record.</span>
+              </li>
               <li>
                 Open this URL in your browser (replace <code className="bg-white/5 px-1 rounded text-[11px]">YOUR_TOKEN</code>):
                 <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">https://api.telegram.org/botYOUR_TOKEN/getUpdates</pre>
               </li>
-              <li>Look for <code className="bg-white/5 px-1 rounded text-[11px]">&quot;chat&quot;:&#123;&quot;id&quot;:&lt;NUMBER&gt;</code> in the JSON. That number is your <b>chat id</b>.</li>
+              <li>Look for <code className="bg-white/5 px-1 rounded text-[11px]">&quot;chat&quot;:&#123;&quot;id&quot;:&lt;NUMBER&gt;</code> in the JSON. That number is your <b>chat id</b>. Group chat ids are negative (e.g. <code className="bg-white/5 px-1 rounded text-[11px]">-1001234567890</code>) — paste the full value <b>including the minus sign</b>.</li>
             </ol>
-            <p className="mt-1 text-neutral-400">Or use this curl command in your terminal:</p>
-            <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">curl -s &apos;https://api.telegram.org/bot&lt;YOUR_TOKEN&gt;/getUpdates&apos; | grep -o &apos;&quot;id&quot;:[0-9-]*&apos; | head -1</pre>
+            <p className="mt-1 text-neutral-400">Or use one of these terminal one-liners:</p>
+            {/* #352: the previous one-liner used `grep -o '"id":[0-9-]*' | head -1`,
+                which matched the top-level `update_id` field instead of
+                `message.chat.id`. Both replacements below anchor on the
+                `chat` object so they can't collide with `update_id` or
+                `from.id`. */}
+            <p className="mt-1 text-[11px] text-neutral-400">With <code className="bg-white/5 px-1 rounded text-[11px]">jq</code> (cleanest):</p>
+            <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">curl -s &quot;https://api.telegram.org/bot&lt;YOUR_TOKEN&gt;/getUpdates&quot; | jq &apos;.result[-1].message.chat.id&apos;</pre>
+            <p className="mt-1 text-[11px] text-neutral-400">Without <code className="bg-white/5 px-1 rounded text-[11px]">jq</code> (pure grep):</p>
+            <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">curl -s &quot;https://api.telegram.org/bot&lt;YOUR_TOKEN&gt;/getUpdates&quot; | grep -o &apos;&quot;chat&quot;:&#123;&quot;id&quot;:-\?[0-9]*&apos; | tail -1</pre>
+            <p className="mt-1 text-[11px] text-neutral-500">
+              The first message from a brand-new bot sometimes doesn&apos;t propagate to <code className="bg-white/5 px-0.5 rounded">getUpdates</code> instantly. If <code className="bg-white/5 px-0.5 rounded">result</code> is empty, send 2-3 more messages and retry.
+            </p>
+
+            <button
+              type="button"
+              onClick={() => setTroubleshootOpen((s) => !s)}
+              className="mt-2 text-[11px] text-accent hover:underline"
+              aria-expanded={troubleshootOpen}
+            >
+              {troubleshootOpen ? "Hide troubleshooting ▾" : "Still empty? Troubleshooting ▸"}
+            </button>
+            {troubleshootOpen && (
+              <div className="mt-2 p-2 border border-white/10 rounded text-[11px] text-neutral-300 space-y-2">
+                <div>
+                  <b className="text-white">Webhook conflict.</b> Something else may be consuming updates. Check and delete any active webhook:
+                  <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">curl -s &quot;https://api.telegram.org/bot&lt;TOKEN&gt;/getWebhookInfo&quot;
+curl -s &quot;https://api.telegram.org/bot&lt;TOKEN&gt;/deleteWebhook&quot;</pre>
+                </div>
+                <div>
+                  <b className="text-white">Stale bridge process.</b> A leftover bridge from a previous install will hold the update queue. Two consumers can&apos;t share one bot:
+                  <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">ps aux | grep telegram_bridge | grep -v grep</pre>
+                  Kill any PIDs that show up before retrying the curl.
+                </div>
+                <div>
+                  <b className="text-white">Token / bot mismatch.</b> A token that doesn&apos;t match the bot you&apos;re messaging silently returns empty results. Confirm the token&apos;s <code className="bg-white/5 px-0.5 rounded">username</code> matches the <code className="bg-white/5 px-0.5 rounded">@username</code> you&apos;re chatting with:
+                  <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">curl -s &quot;https://api.telegram.org/bot&lt;TOKEN&gt;/getMe&quot;</pre>
+                </div>
+              </div>
+            )}
           </section>
 
           <section>
