@@ -247,12 +247,38 @@ function _installAgentChattrLocked(dir, setError) {
     if (cloneResult === null) return setError(`git clone of ${AGENTCHATTR_REPO} into ${dir} failed`);
     if (!fs.existsSync(runPy)) return setError(`Clone completed but run.py missing at ${dir}`);
     // #348: pin to the known-good AgentChattr commit shipped with
-    // this QuadWork release. On failure (commit unreachable /
-    // force-pushed away), fall back to the default branch with a
-    // loud warning instead of hard-failing the install.
-    const pinResult = run(`git -C "${dir}" checkout ${AGENTCHATTR_PIN} 2>&1`, { timeout: 30000 });
+    // this QuadWork release. #366: use `checkout -B pinned <sha>`
+    // so the clone lands on a named local branch ("pinned") whose
+    // HEAD is the pinned commit, rather than detached HEAD. Named
+    // HEAD avoids the AC2 worktree-rot class of bug: `git status`
+    // says `On branch pinned`, downstream tooling that reads the
+    // current branch sees a stable name, and a future `git pull`
+    // fails with a clear "no upstream" message instead of a vague
+    // detached-HEAD warning. -B (capital) is idempotent — it
+    // force-creates/updates the branch so re-runs are no-ops.
+    // On failure (commit unreachable / force-pushed away), fall
+    // back to the default branch with a loud warning instead of
+    // hard-failing the install.
+    const pinResult = run(`git -C "${dir}" checkout -B pinned ${AGENTCHATTR_PIN} 2>&1`, { timeout: 30000 });
     if (pinResult === null) {
       try { console.warn(`[quadwork] WARNING: could not check out AgentChattr pin ${AGENTCHATTR_PIN} at ${dir}; falling back to default branch. The upstream commit may have been force-pushed away — update AGENTCHATTR_PIN in bin/quadwork.js for reproducible installs.`); } catch {}
+    }
+  } else {
+    // #366: existing clone from a pre-fix install. If the clone
+    // is currently in detached HEAD pointing exactly at the pin,
+    // migrate it onto the named `pinned` branch in place. This
+    // is safe because no commits are lost — the SHA is the same,
+    // we're just attaching a name to it. Skip migration if the
+    // clone is on a different SHA (drift) or already on a named
+    // branch (operator may have set up their own work branch on
+    // top); doctor will flag drift cases.
+    const headSha = (run(`git -C "${dir}" rev-parse HEAD 2>&1`) || "").trim();
+    const headRef = (run(`git -C "${dir}" symbolic-ref --quiet HEAD 2>&1`) || "").trim();
+    if (headSha === AGENTCHATTR_PIN && !headRef) {
+      const migrateResult = run(`git -C "${dir}" checkout -B pinned ${AGENTCHATTR_PIN} 2>&1`, { timeout: 30000 });
+      if (migrateResult === null) {
+        try { console.warn(`[quadwork] WARNING: could not migrate ${dir} from detached HEAD to the 'pinned' branch.`); } catch {}
+      }
     }
   }
 
@@ -1916,6 +1942,15 @@ function cmdDoctor() {
     const sha = run(`git -C "${dir}" rev-parse HEAD 2>&1`);
     return sha ? sha.trim() : null;
   };
+  // #366: surface whether the clone is on the named `pinned`
+  // branch, on a different named branch, or in detached HEAD.
+  // Detached-HEAD-but-on-pin gets a soft warning so operators
+  // know to re-run install (which auto-migrates) or re-clone.
+  const cloneBranchAt = (dir) => {
+    const ref = run(`git -C "${dir}" symbolic-ref --quiet HEAD 2>&1`);
+    if (!ref) return null; // detached
+    return ref.trim().replace(/^refs\/heads\//, "");
+  };
   const report = (label, dir) => {
     if (!dir || !fs.existsSync(dir)) {
       console.log(`  [skip] ${label}: ${dir || "(not configured)"} — missing`);
@@ -1926,8 +1961,19 @@ function cmdDoctor() {
       console.log(`  [warn] ${label}: ${dir} — not a git clone`);
       return;
     }
-    const tag = sha === AGENTCHATTR_PIN ? "OK  " : "DIFF";
-    console.log(`  [${tag}] ${label}: ${sha} (${dir})`);
+    const branch = cloneBranchAt(dir);
+    let tag;
+    if (sha !== AGENTCHATTR_PIN) {
+      tag = "DIFF";
+    } else if (!branch) {
+      tag = "DETACH"; // on-pin but in detached HEAD — re-run install to migrate
+    } else if (branch !== "pinned") {
+      tag = "BR  "; // on-pin but on a non-`pinned` named branch (operator override)
+    } else {
+      tag = "OK  ";
+    }
+    const branchLabel = branch ? `branch=${branch}` : "branch=(detached)";
+    console.log(`  [${tag}] ${label}: ${sha} ${branchLabel} (${dir})`);
   };
   // Global clone
   report("global", DEFAULT_AGENTCHATTR_DIR);
@@ -1951,7 +1997,7 @@ function cmdDoctor() {
     console.log(`  (could not enumerate projects: ${err.message})`);
   }
   console.log("");
-  console.log("Legend: [OK  ] clone matches the pin; [DIFF] clone is off-pin (re-clone manually to re-sync)");
+  console.log("Legend: [OK  ] on pin + on `pinned` branch; [BR  ] on pin but on a non-`pinned` named branch; [DETACH] on pin but in detached HEAD (re-run quadwork start to auto-migrate); [DIFF] off-pin (re-clone manually to re-sync)");
   console.log("");
 }
 

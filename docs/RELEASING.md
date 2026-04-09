@@ -125,6 +125,21 @@ If the pinned commit becomes unreachable (upstream force-push),
 default branch instead of hard-failing the install. The next
 release should update the pin to a reachable commit.
 
+### Branch model (#366)
+
+The pin is checked out via `git checkout -B pinned <sha>` so the
+clone always lands on a named local branch called `pinned` whose
+HEAD is the pinned commit, never in detached HEAD. This avoids
+the AC2 worktree-rot class of bug (downstream tooling reading
+"detached at <sha>" as the branch name) and gives `git status` a
+clean `On branch pinned` line. When bumping the pin in a future
+release, leave this branch model intact: keep using `-B pinned`
+(capital B is idempotent and force-updates the branch on re-
+runs). Pre-#366 detached-HEAD clones are auto-migrated onto the
+`pinned` branch on the next `quadwork start`, but only when the
+clone is currently exactly at the pin SHA — drift cases are left
+alone and surfaced by `quadwork doctor`.
+
 ## Pitfalls
 
 - **Never run `npm run release:*` from a dirty tree.** `npm version` will
