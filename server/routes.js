@@ -1118,11 +1118,13 @@ router.get("/api/github/merged-prs", (req, res) => {
 // deterministic from issue/PR state — no agent inference.
 //
 // Progress mapping (from upstream issue):
-//   queued    0%   issue exists, no linked PR
+//   queued    0%   issue OPEN, no linked PR
 //   in_review 20%  PR open, 0 approvals
 //   approved1 50%  PR open, 1 approval
 //   ready     80%  PR open, 2+ approvals
 //   merged   100%  PR merged AND issue closed
+//   closed   100%  issue CLOSED with no linked PR (superseded,
+//                  not planned, or runbook-only tasks) — #350
 //
 // Cached for 10s per project to avoid hammering gh on every poll.
 
@@ -1313,6 +1315,32 @@ async function ghJsonExecAsync(args) {
   return JSON.parse(stdout);
 }
 
+// #350: pure helper for the "no linked PR" branch of
+// progressForItemAsync. Takes the issue JSON (shape: { number,
+// title, state, url, ... }) and returns the batch-progress row
+// for an item that has no closedByPullRequestsReferences. Exported
+// from module.exports below for unit tests — no other callers.
+function buildNoPrRow(issue) {
+  if (issue && issue.state === "CLOSED") {
+    return {
+      issue_number: issue.number,
+      title: issue.title,
+      url: issue.url,
+      status: "closed",
+      progress: 100,
+      label: "Closed (no PR) ✓",
+    };
+  }
+  return {
+    issue_number: issue.number,
+    title: issue.title,
+    url: issue.url,
+    status: "queued",
+    progress: 0,
+    label: "Issue · queued",
+  };
+}
+
 async function progressForItemAsync(repo, issueNumber) {
   // Pull issue state + linked PRs in one call. closedByPullRequestsReferences
   // is gh's serializer for the GraphQL `closedByPullRequestsReferences`
@@ -1339,16 +1367,14 @@ async function progressForItemAsync(repo, issueNumber) {
   const pr = linked.length > 0
     ? linked.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0]
     : null;
-  // No linked PR yet — queued.
+  // No linked PR. #350: before falling into the "queued" bucket,
+  // honor the issue's own state — a CLOSED issue with no linked
+  // PR is fully done (superseded, not planned, runbook-only, etc.)
+  // and should render at 100% with a ✓ label instead of a
+  // misleading "0% · queued" row. Only truly OPEN issues with no
+  // linked PR are still queued.
   if (!pr) {
-    return {
-      issue_number: issue.number,
-      title: issue.title,
-      url: issue.url,
-      status: "queued",
-      progress: 0,
-      label: "Issue · queued",
-    };
+    return buildNoPrRow(issue);
   }
   // Re-fetch the PR to get reviewDecision + reviews + state, since
   // the issue's closedByPullRequestsReferences edge only carries
@@ -1452,15 +1478,23 @@ async function progressForItemAsync(repo, issueNumber) {
 }
 
 function summarizeItems(items) {
-  let merged = 0, ready = 0, approved1 = 0, inReview = 0, queued = 0;
+  // #350: "closed" (CLOSED issue with no linked PR — superseded,
+  // not planned, runbook-only) counts toward the complete tally
+  // alongside "merged". The panel tally now reads "X/N complete"
+  // when the batch mixes both kinds of completion, otherwise
+  // "X/N merged" for the classic all-via-PR case.
+  let merged = 0, closed = 0, ready = 0, approved1 = 0, inReview = 0, queued = 0;
   for (const it of items) {
     if (it.status === "merged") merged++;
+    else if (it.status === "closed") closed++;
     else if (it.status === "ready") ready++;
     else if (it.status === "approved1") approved1++;
     else if (it.status === "in_review") inReview++;
     else if (it.status === "queued") queued++;
   }
-  const parts = [`${merged}/${items.length} merged`];
+  const done = merged + closed;
+  const doneLabel = closed > 0 ? "complete" : "merged";
+  const parts = [`${done}/${items.length} ${doneLabel}`];
   if (ready > 0) parts.push(`${ready} ready to merge`);
   if (approved1 > 0) parts.push(`${approved1} needs 2nd approval`);
   if (inReview > 0) parts.push(`${inReview} in review`);
@@ -1544,7 +1578,10 @@ router.get("/api/batch-progress", async (req, res) => {
     };
   });
   const summary = summarizeItems(items);
-  const complete = items.length > 0 && items.every((it) => it.status === "merged");
+  // #350: treat CLOSED-without-PR items as complete alongside merged
+  // so batches that mix runbook/superseded closes with real PRs
+  // still flip to the COMPLETE state once everything is done.
+  const complete = items.length > 0 && items.every((it) => it.status === "merged" || it.status === "closed");
   const data = { batch_number: batchNumber, items, summary, complete };
   _batchProgressCache.set(projectId, { ts: Date.now(), data });
   res.json(data);
@@ -2490,3 +2527,7 @@ module.exports = router;
 // outside this file; the export is strictly for the node:assert
 // script at server/routes.parseActiveBatch.test.js.
 module.exports.parseActiveBatch = parseActiveBatch;
+// #350: same pattern — expose the no-linked-PR row builder and
+// summarizeItems for the batch-progress fixture test.
+module.exports.buildNoPrRow = buildNoPrRow;
+module.exports.summarizeItems = summarizeItems;

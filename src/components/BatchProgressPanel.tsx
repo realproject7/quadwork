@@ -7,7 +7,10 @@ interface BatchProgressItem {
   title: string;
   url: string | null;
   pr_number?: number;
-  status: "queued" | "in_review" | "approved1" | "ready" | "merged" | "unknown";
+  // #350: "closed" = issue CLOSED with no linked PR (superseded,
+  // not planned, or runbook-only). Rendered at 100% like merged
+  // but with a distinct label from the server.
+  status: "queued" | "in_review" | "approved1" | "ready" | "merged" | "closed" | "unknown";
   progress: number; // 0..100
   label: string;
 }
