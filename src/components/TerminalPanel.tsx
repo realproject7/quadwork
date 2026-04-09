@@ -117,34 +117,72 @@ export default function TerminalPanel({
     const observer = new ResizeObserver(() => fit());
     observer.observe(containerRef.current);
 
+    // #368: register the xterm → client data handler ONCE up-front
+    // so reattach cycles don't stack duplicate handlers that would
+    // each try to send the same keystroke to the latest ws.
+    term.onData((data) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(data);
+      }
+    });
+
     // Connect WebSocket — resolve backend URL from config if not provided
     let cancelled = false;
+    let baseUrl: string | null = null;
 
-    (async () => {
-      let base = wsUrl;
-      if (!base) {
-        // In production, WS is same-origin. In dev mode (next dev on :3000),
-        // resolve the backend port from config since WS isn't proxied by Next.js.
-        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        try {
-          const res = await fetch("/api/config");
-          if (res.ok) {
-            const cfg = await res.json();
-            const backendPort = cfg.port || 8400;
-            const currentPort = parseInt(window.location.port, 10);
-            if (currentPort && currentPort !== backendPort) {
-              // Dev mode: connect directly to Express backend
-              base = `${wsProto}//${window.location.hostname}:${backendPort}`;
-            } else {
-              base = `${wsProto}//${window.location.host}`;
-            }
+    const resolveBase = async (): Promise<string> => {
+      if (baseUrl) return baseUrl;
+      if (wsUrl) { baseUrl = wsUrl; return baseUrl; }
+      const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      try {
+        const res = await fetch("/api/config");
+        if (res.ok) {
+          const cfg = await res.json();
+          const backendPort = cfg.port || 8400;
+          const currentPort = parseInt(window.location.port, 10);
+          if (currentPort && currentPort !== backendPort) {
+            baseUrl = `${wsProto}//${window.location.hostname}:${backendPort}`;
           } else {
-            base = `${wsProto}//${window.location.host}`;
+            baseUrl = `${wsProto}//${window.location.host}`;
           }
-        } catch {
-          base = `${wsProto}//${window.location.host}`;
+        } else {
+          baseUrl = `${wsProto}//${window.location.host}`;
         }
+      } catch {
+        baseUrl = `${wsProto}//${window.location.host}`;
       }
+      return baseUrl;
+    };
+
+    // #368: after a ws close (typically because the PTY was stopped
+    // by a /api/agents/:project/:agent/restart handler), check
+    // /api/sessions to see if a fresh session already exists under
+    // the same project/agent key. If it does, clear the buffer and
+    // reattach transparently so the terminal tracks the new PTY
+    // without the operator having to reload the page. If not,
+    // render the "session closed" line as before.
+    const sessionIsLive = async (): Promise<boolean> => {
+      try {
+        const res = await fetch("/api/sessions");
+        if (!res.ok) return false;
+        const list = await res.json();
+        return Array.isArray(list) && list.some(
+          (s) => s && s.projectId === projectId && s.agentId === agentId,
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    // Track reattach attempts so a genuinely dead session cannot
+    // trigger an infinite reconnect loop. Resets whenever a ws
+    // successfully opens (i.e. a real session was observed).
+    let reattachAttempts = 0;
+    const MAX_REATTACH = 5;
+
+    const connect = async () => {
+      const base = await resolveBase();
       if (cancelled) return;
 
       const endpoint = `${base}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agentId)}`;
@@ -152,6 +190,7 @@ export default function TerminalPanel({
       wsRef.current = ws;
 
       ws.onopen = () => {
+        reattachAttempts = 0;
         ws.send(
           JSON.stringify({
             type: "resize",
@@ -167,16 +206,47 @@ export default function TerminalPanel({
         if (cb) cb();
       };
 
-      ws.onclose = (e) => {
+      ws.onclose = async (e) => {
+        if (cancelled) return;
+        // #368: bounded polling probe of /api/sessions. A single
+        // fixed-delay probe is timing-fragile — if the server-side
+        // stop→spawn sequence takes longer than the delay (slow
+        // PTY spawn, busy event loop, AgentChattr re-registration
+        // stall) the probe sees "no session" and the terminal
+        // permanently falls through to [session closed] even
+        // though the new PTY came up a moment later. Instead,
+        // poll every 200ms for up to 2000ms (10 attempts) and
+        // reattach as soon as a live session appears. The loop
+        // bails immediately on any liveness hit, so the happy
+        // path still completes in ~200-400ms.
+        if (reattachAttempts < MAX_REATTACH) {
+          const PROBE_INTERVAL_MS = 200;
+          const PROBE_WINDOW_MS = 2000;
+          const probeStart = Date.now();
+          let live = false;
+          while (Date.now() - probeStart < PROBE_WINDOW_MS) {
+            await new Promise((r) => setTimeout(r, PROBE_INTERVAL_MS));
+            if (cancelled) return;
+            if (await sessionIsLive()) { live = true; break; }
+          }
+          if (cancelled) return;
+          if (live) {
+            reattachAttempts += 1;
+            // Clear the stale buffer so the previous session's
+            // last frame (including any "stopped" marker) doesn't
+            // linger above the new prompt.
+            term.reset();
+            term.write(`\x1b[38;2;115;115;115m[reattached to new session]\x1b[0m\r\n`);
+            connect();
+            return;
+          }
+        }
         term.write(`\r\n\x1b[38;2;115;115;115m[session closed: ${e.reason || e.code}]\x1b[0m\r\n`);
       };
 
-      term.onData((data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
-        }
-      });
-    })();
+    };
+
+    connect();
 
     return () => {
       cancelled = true;
