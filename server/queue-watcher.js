@@ -11,14 +11,57 @@
  * Reference: /Users/cho/Projects/agentchattr/wrapper.py lines 438-541
  * (`_queue_watcher`). Polling (not fs.watch) is intentional: matches
  * wrapper.py's behavior and avoids the cross-platform fs.watch
- * footguns. The role/rules/identity-hint additions from wrapper.py
- * lines 501-528 are intentionally out of scope for v1 per the issue.
+ * footguns.
+ *
+ * #342 / quadwork#342: the v1 prompt intentionally omitted the
+ * identity hints from wrapper.py lines 501-528, which broke
+ * Claude Code agent sessions. Claude's default self-concept is
+ * `@claude`, so a bare `mcp read #general - you were mentioned`
+ * causes chat_read(sender: "claude") and a filter on `@claude`
+ * mentions — both wrong when the agent is actually @dev /
+ * @reviewerN. Codex doesn't trip the same way because its init
+ * path already claims identity. The fix here is to scope the
+ * wrapper.py additions to identity only: the injected prompt
+ * now explicitly names the agent slug and tells the agent which
+ * sender to use on chat_read and which mentions to look for.
  */
 
 const fs = require("fs");
 const path = require("path");
 
 const POLL_INTERVAL_MS = 1000;
+
+/**
+ * Pure helper: build the injected prompt text for a given agent
+ * slug + trigger shape. Exported so it can be unit-tested without
+ * a PTY or a filesystem queue. Priority matches the tick() call
+ * site below: customPrompt > jobId > channel.
+ *
+ * agentName is expected to be the registered agent slug such as
+ * `dev`, `head`, `reviewer1`, `reviewer2`. The helper does not
+ * validate — upstream already controls who may register.
+ */
+function buildInjectionPrompt(agentName, { channel, jobId, customPrompt } = {}) {
+  if (customPrompt && typeof customPrompt === "string" && customPrompt.trim()) {
+    // Operator-supplied prompts already control the identity
+    // wording; leave them alone.
+    return customPrompt.trim();
+  }
+  if (jobId) {
+    return (
+      `You are @${agentName} in this AgentChattr instance. ` +
+      `mcp read job_id=${jobId} with sender: "${agentName}" — ` +
+      `you (@${agentName}) were mentioned in a job thread, take appropriate action.`
+    );
+  }
+  const ch = channel || "general";
+  return (
+    `You are @${agentName} in this AgentChattr instance. ` +
+    `mcp read #${ch} with sender: "${agentName}" — ` +
+    `look for @${agentName} mentions (NOT @claude). ` +
+    `You were mentioned, take appropriate action.`
+  );
+}
 
 /**
  * Start polling `{dataDir}/{agentName}_queue.jsonl`. When non-empty,
@@ -78,14 +121,7 @@ function startQueueWatcher(dataDir, agentName, ptyTerm) {
       }
       if (!hasTrigger) return;
 
-      let prompt;
-      if (customPrompt) {
-        prompt = customPrompt;
-      } else if (jobId) {
-        prompt = `mcp read job_id=${jobId} - you were mentioned in a job thread, take appropriate action`;
-      } else {
-        prompt = `mcp read #${channel} - you were mentioned, take appropriate action`;
-      }
+      const prompt = buildInjectionPrompt(agentName, { channel, jobId, customPrompt });
 
       // Flatten newlines: multi-line writes trigger paste detection in
       // Claude Code (shows "[Pasted text +N]") and can break injection
@@ -122,4 +158,5 @@ function stopQueueWatcher(handle) {
 module.exports = {
   startQueueWatcher,
   stopQueueWatcher,
+  buildInjectionPrompt,
 };
