@@ -16,16 +16,37 @@ import ProjectHistoryWidget from "./ProjectHistoryWidget";
  * #226: OVERNIGHT-QUEUE.md viewer/editor moved to a compact row at
  * the bottom of the GitHub panel (bottom-left quadrant) — click Edit
  * there to open the modal.
+ *
+ * #351: two-column layout at lg+ widths — Scheduled Trigger gets
+ * the full-height left column (primary surface during an
+ * overnight run so its textarea + Start/Stop button are always
+ * reachable without scrolling), while Telegram Bridge → Loop
+ * Guard → Project History stack in the right column and scroll
+ * independently if the stack exceeds panel height. Below lg the
+ * layout collapses back to the single-column stack so nothing
+ * clips in cramped split-view / mobile.
  */
 export default function OperatorFeaturesPanel({ projectId }: { projectId: string }) {
   return (
     <div className="flex flex-col h-full min-h-0">
       <PanelHeader label="Operator Features" />
-      <div className="flex-1 min-h-0 flex flex-col gap-2 p-2 overflow-auto">
-        <ScheduledTriggerWidget projectId={projectId} />
-        <LoopGuardWidget projectId={projectId} />
-        <ProjectHistoryWidget projectId={projectId} />
-        <TelegramBridgeWidget projectId={projectId} />
+      <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-2 p-2 overflow-auto lg:overflow-hidden">
+        {/* Left column: Scheduled Trigger spans full panel height.
+            min-w-[280px] at lg+ keeps the message textarea from
+            collapsing below a usable width when the panel is
+            narrow-but-still-lg. */}
+        <div className="lg:flex-1 lg:min-w-[280px] lg:min-h-0 lg:overflow-y-auto">
+          <ScheduledTriggerWidget projectId={projectId} />
+        </div>
+        {/* Vertical divider between the two columns, only at lg+. */}
+        <div className="hidden lg:block w-px self-stretch bg-border" />
+        {/* Right column: Telegram Bridge → Loop Guard → Project
+            History. Scrolls independently of the left column. */}
+        <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto flex flex-col gap-2">
+          <TelegramBridgeWidget projectId={projectId} />
+          <LoopGuardWidget projectId={projectId} />
+          <ProjectHistoryWidget projectId={projectId} />
+        </div>
       </div>
     </div>
   );
