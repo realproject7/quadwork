@@ -213,6 +213,12 @@ export default function TopHeader() {
                   <div className="mt-1 pt-1 border-t border-white/10 text-neutral-500">
                     Lifetime: <span className="text-neutral-200">{fmtHours(stats.total)}</span>
                   </div>
+                  {/* #335 / quadwork#335: narrow scope after #338 removed
+                      the home hero — only the top-header tooltip carries
+                      the best-effort undercount note now. */}
+                  <div className="mt-1 pt-1 border-t border-white/10 text-neutral-500 leading-snug">
+                    ⓘ Stats are best-effort. Server restarts may undercount in-flight sessions.
+                  </div>
                 </div>
               )}
             </div>
