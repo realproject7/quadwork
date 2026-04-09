@@ -2385,6 +2385,63 @@ function telegramConfigToml(projectId) {
   return path.join(CONFIG_DIR, `telegram-${projectId}.toml`);
 }
 
+// #383: path to a project's AgentChattr config.toml. The install
+// handler patches this file to declare the `telegram-bridge` agent
+// so AC's registry accepts the bridge's register call.
+function projectAgentchattrConfigPath(projectId) {
+  return path.join(CONFIG_DIR, projectId, "agentchattr", "config.toml");
+}
+
+// #383 Bug 1: prefer the per-project agentchattr_url. Every project
+// after the first uses a distinct port (8301, 8302, ...), so reading
+// the global default silently routed bridge traffic to the wrong AC
+// instance.
+function resolveProjectAgentchattrUrl(cfg, project) {
+  return (
+    (project && project.agentchattr_url) ||
+    (cfg && cfg.agentchattr_url) ||
+    "http://127.0.0.1:8300"
+  );
+}
+
+// #383 Bug 2: the upstream bridge only reads `agentchattr_url` from
+// inside `[telegram]`. A separate `[agentchattr]` section is silently
+// ignored and the bridge falls back to its hardcoded :8300 default.
+function buildTelegramBridgeToml(tg) {
+  return (
+    `[telegram]\n` +
+    `bot_token = "${tg.bot_token}"\n` +
+    `chat_id = "${tg.chat_id}"\n` +
+    `agentchattr_url = "${tg.agentchattr_url}"\n`
+  );
+}
+
+// #383 Bug 3: AC's registry rejects any base name not pre-declared
+// in config.toml with `400 unknown base`. The bridge registers as
+// `telegram-bridge`, so every per-project AC config must declare it.
+// Idempotent: only appends if the section is not already present.
+function patchAgentchattrConfigForTelegramBridge(tomlText) {
+  if (/^\[agents\.telegram-bridge\]\s*$/m.test(tomlText)) {
+    return { text: tomlText, changed: false };
+  }
+  const sep = tomlText.length === 0 || tomlText.endsWith("\n") ? "" : "\n";
+  const block = `\n[agents.telegram-bridge]\nlabel = "Telegram Bridge"\n`;
+  return { text: tomlText + sep + block, changed: true };
+}
+
+// #383 Bug 4: the upstream bridge treats env vars as higher
+// precedence than TOML values. If the parent shell exported
+// TELEGRAM_BOT_TOKEN for a different bot, the bridge silently ran
+// as the wrong identity. Scrub those keys from the child's env so
+// the TOML is the single source of truth.
+function buildTelegramBridgeSpawnEnv(parentEnv) {
+  const env = { ...parentEnv };
+  delete env.TELEGRAM_BOT_TOKEN;
+  delete env.TELEGRAM_CHAT_ID;
+  delete env.AGENTCHATTR_URL;
+  return env;
+}
+
 // #353: per-project log file for the bridge subprocess. The start
 // handler redirects stdout + stderr here so crashes (ImportError,
 // config parse, auth failure) are recoverable instead of
@@ -2502,7 +2559,8 @@ function getProjectTelegram(projectId) {
     return {
       bot_token: resolveToken(project.telegram.bot_token || ""),
       chat_id: project.telegram.chat_id || "",
-      agentchattr_url: cfg.agentchattr_url || "http://127.0.0.1:8300",
+      // #383 Bug 1: prefer per-project URL over the global default.
+      agentchattr_url: resolveProjectAgentchattrUrl(cfg, project),
     };
   } catch {
     return null;
@@ -2638,7 +2696,31 @@ router.post("/api/telegram", async (req, res) => {
             `pip output tail:\n${pipOutput.split("\n").slice(-10).join("\n")}`,
         });
       }
-      return res.json({ ok: true });
+      // #383 Bug 3: ensure every known project's AC config declares
+      // the `telegram-bridge` agent. Without this, AC's registry
+      // rejects the bridge's register call with `400 unknown base`
+      // and the bridge enters an infinite re-register loop.
+      // Idempotent — append-only, skips configs that already have
+      // the section. Does NOT restart AC servers; the operator
+      // must click SERVER → Restart to load the new agent slug.
+      const patched = [];
+      try {
+        const cfgAll = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        for (const proj of cfgAll.projects || []) {
+          if (!proj || !proj.id) continue;
+          const acPath = projectAgentchattrConfigPath(proj.id);
+          if (!fs.existsSync(acPath)) continue;
+          try {
+            const before = fs.readFileSync(acPath, "utf-8");
+            const { text, changed } = patchAgentchattrConfigForTelegramBridge(before);
+            if (changed) {
+              fs.writeFileSync(acPath, text);
+              patched.push(proj.id);
+            }
+          } catch {}
+        }
+      } catch {}
+      return res.json({ ok: true, patched_projects: patched });
     }
     case "start": {
       const projectId = body.project_id;
@@ -2661,7 +2743,9 @@ router.post("/api/telegram", async (req, res) => {
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
       const tomlPath = telegramConfigToml(projectId);
-      const tomlContent = `[telegram]\nbot_token = "${tg.bot_token}"\nchat_id = "${tg.chat_id}"\n\n[agentchattr]\nurl = "${tg.agentchattr_url}"\n`;
+      // #383 Bug 2: write agentchattr_url inside [telegram]; the
+      // bridge's load_config only reads from that section.
+      const tomlContent = buildTelegramBridgeToml(tg);
       fs.writeFileSync(tomlPath, tomlContent, { mode: 0o600 });
       fs.chmodSync(tomlPath, 0o600);
       // #353: pre-flight import check so a fresh install with no
@@ -2710,9 +2794,15 @@ router.post("/api/telegram", async (req, res) => {
       }
       let child;
       try {
+        // #383 Bug 4: scrub TELEGRAM_*/AGENTCHATTR_URL from the child
+        // env so an operator shell that exports a different bot's
+        // token (common on machines running AC2) can't silently
+        // override the TOML. Makes the TOML the single source of
+        // truth for the bridge's identity.
         child = spawn(venvPython, [bridgeScript, "--config", tomlPath], {
           detached: true,
           stdio: ["ignore", outFd, errFd],
+          env: buildTelegramBridgeSpawnEnv(process.env),
         });
         child.unref();
         if (child.pid) fs.writeFileSync(telegramPidFile(projectId), String(child.pid));
@@ -2898,6 +2988,13 @@ module.exports.readLastLines = readLastLines;
 // #380: expose checkTelegramBridgePythonDeps so the bridge test can
 // exercise the venv-path interpreter argument round trip.
 module.exports.checkTelegramBridgePythonDeps = checkTelegramBridgePythonDeps;
+// #383: pure helpers exposed for unit tests in
+// routes.telegramBridge.test.js. No production callers outside
+// this file.
+module.exports.resolveProjectAgentchattrUrl = resolveProjectAgentchattrUrl;
+module.exports.buildTelegramBridgeToml = buildTelegramBridgeToml;
+module.exports.patchAgentchattrConfigForTelegramBridge = patchAgentchattrConfigForTelegramBridge;
+module.exports.buildTelegramBridgeSpawnEnv = buildTelegramBridgeSpawnEnv;
 // #236: expose sendViaWebSocket so the chat-ws-send regression test
 // can verify the ack/body/error paths against a fake AC ws server.
 module.exports.sendViaWebSocket = sendViaWebSocket;

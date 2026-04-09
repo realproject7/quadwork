@@ -50,6 +50,15 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   const [actionError, setActionError] = useState<string | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
+  // #383: the Install Bridge handler now migrates every existing
+  // per-project AC `config.toml` to declare `[agents.telegram-bridge]`
+  // (required so AC's registry accepts the bridge's register call).
+  // When that migration actually touches any configs, the operator
+  // must click SERVER → Restart for AC to load the new agent slug;
+  // otherwise Start immediately afterwards will still fail with a
+  // 400 registration loop. Surface that prompt here instead of
+  // silently returning "Installed".
+  const [restartNotice, setRestartNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -69,13 +78,28 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
     return () => window.clearInterval(id);
   }, [load]);
 
+  const noteInstallResponse = (data: { patched_projects?: string[] }) => {
+    const patched = Array.isArray(data?.patched_projects) ? data.patched_projects : [];
+    if (patched.length > 0) {
+      setRestartNotice(
+        `Install Bridge patched ${patched.length} AgentChattr config(s) ` +
+        `(${patched.join(", ")}) to declare [agents.telegram-bridge]. ` +
+        `Click SERVER → Restart so AgentChattr picks up the new agent slug, ` +
+        `then click Start again. Without the restart, Start will fail with a 400 registration loop.`,
+      );
+    } else {
+      setRestartNotice(null);
+    }
+  };
+
   const start = async () => {
     setBusy(true); setActionError(null);
     try {
       // The first-time path clones + pip-installs the bridge before
       // spawning it. "install" is a no-op if it's already installed.
       if (status && !status.bridge_installed) {
-        await callTelegram("install", {});
+        const data = await callTelegram("install", {});
+        noteInstallResponse(data);
       }
       await callTelegram("start", { project_id: projectId });
       await load();
@@ -97,7 +121,10 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
     // After saving, try to start immediately — matches the
     // "Save and start bridge" affordance in the modal.
     try {
-      if (status && !status.bridge_installed) await callTelegram("install", {});
+      if (status && !status.bridge_installed) {
+        const data = await callTelegram("install", {});
+        noteInstallResponse(data);
+      }
       await callTelegram("start", { project_id: projectId });
     } catch (e) {
       // Leave the save persisted even if start fails; the operator
@@ -199,6 +226,18 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                 </button>
               </div>
             </>
+          )}
+          {restartNotice && (
+            <div className="mt-1 p-2 text-[10px] text-accent border border-accent/40 bg-accent/5 whitespace-pre-wrap break-words">
+              {restartNotice}
+              <button
+                type="button"
+                onClick={() => setRestartNotice(null)}
+                className="block mt-1 text-text-muted hover:text-text underline"
+              >
+                dismiss
+              </button>
+            </div>
           )}
           {displayError && (
             <div className="mt-1 p-2 text-[10px] text-error border border-error/40 bg-error/5 font-mono whitespace-pre-wrap break-words max-h-40 overflow-y-auto">

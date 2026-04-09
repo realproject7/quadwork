@@ -37,6 +37,14 @@ cwd = "{{dev_cwd}}"
 color = "#da7756"
 label = "Dev Builder"
 
+# #383: AC's registry rejects bases not declared in config.toml.
+# The Telegram bridge registers as `telegram-bridge`, so every
+# per-project AC config must declare it. The bridge has no
+# command/cwd of its own — it is a long-running external client
+# that posts to AC's HTTP API.
+[agents.telegram-bridge]
+label = "Telegram Bridge"
+
 [routing]
 default = "none"
 max_agent_hops = 30

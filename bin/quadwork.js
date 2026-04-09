@@ -1116,12 +1116,24 @@ bridge_sender = "telegram-bridge"
         if (fs.existsSync(bridgeScript)) {
           log("Starting Telegram bridge...");
           const bridgeToml = path.join(CONFIG_DIR, `telegram-${setup.projectName}.toml`);
-          const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\n\n[agentchattr]\nurl = "${projectChattrUrl}"\n`;
+          // #383 Bug 2: the bridge only reads agentchattr_url from
+          // inside [telegram]. A separate [agentchattr] section is
+          // silently ignored and the bridge falls back to :8300.
+          const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\nagentchattr_url = "${projectChattrUrl}"\n`;
           fs.writeFileSync(bridgeToml, bridgeTomlContent, { mode: 0o600 });
           fs.chmodSync(bridgeToml, 0o600);
+          // #383 Bug 4: scrub TELEGRAM_*/AGENTCHATTR_URL from the
+          // child env so an ambient shell that exported a different
+          // bot's token can't silently override the TOML we just
+          // wrote. Same fix as server/routes.js Start handler.
+          const bridgeEnv = { ...process.env };
+          delete bridgeEnv.TELEGRAM_BOT_TOKEN;
+          delete bridgeEnv.TELEGRAM_CHAT_ID;
+          delete bridgeEnv.AGENTCHATTR_URL;
           const bridgeProc = spawn("python3", [bridgeScript, "--config", bridgeToml], {
             stdio: "ignore",
             detached: true,
+            env: bridgeEnv,
           });
           bridgeProc.unref();
           if (bridgeProc.pid) {

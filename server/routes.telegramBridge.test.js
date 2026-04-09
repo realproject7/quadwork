@@ -11,7 +11,14 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
-const { readLastLines, checkTelegramBridgePythonDeps } = require("./routes");
+const {
+  readLastLines,
+  checkTelegramBridgePythonDeps,
+  resolveProjectAgentchattrUrl,
+  buildTelegramBridgeToml,
+  patchAgentchattrConfigForTelegramBridge,
+  buildTelegramBridgeSpawnEnv,
+} = require("./routes");
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qw-bridge-log-"));
 function write(name, content) {
@@ -133,8 +140,96 @@ try {
     venvSkipped = true;
   }
 
+  // 12) #383 Bug 1: resolveProjectAgentchattrUrl prefers the
+  //     per-project URL over the global default. Every project
+  //     after the first uses a distinct port, so silently reading
+  //     the global default routed bridge traffic to the wrong AC
+  //     instance.
+  assert.equal(
+    resolveProjectAgentchattrUrl(
+      { agentchattr_url: "http://127.0.0.1:8300" },
+      { id: "quadwork", agentchattr_url: "http://127.0.0.1:8301" },
+    ),
+    "http://127.0.0.1:8301",
+  );
+  // Falls back to global default when the project has no URL of
+  // its own (legacy single-project installs).
+  assert.equal(
+    resolveProjectAgentchattrUrl(
+      { agentchattr_url: "http://127.0.0.1:8300" },
+      { id: "legacy" },
+    ),
+    "http://127.0.0.1:8300",
+  );
+  // Hard-coded fallback when neither is set.
+  assert.equal(
+    resolveProjectAgentchattrUrl({}, {}),
+    "http://127.0.0.1:8300",
+  );
+
+  // 13) #383 Bug 2: buildTelegramBridgeToml writes agentchattr_url
+  //     inside [telegram]. The upstream bridge's load_config only
+  //     reads from that section — a separate [agentchattr] section
+  //     is silently ignored and the bridge falls back to its
+  //     hardcoded :8300 default.
+  const toml13 = buildTelegramBridgeToml({
+    bot_token: "123:abc",
+    chat_id: "-42",
+    agentchattr_url: "http://127.0.0.1:8301",
+  });
+  assert.match(toml13, /^\[telegram\]/);
+  assert.match(toml13, /bot_token = "123:abc"/);
+  assert.match(toml13, /chat_id = "-42"/);
+  assert.match(toml13, /agentchattr_url = "http:\/\/127\.0\.0\.1:8301"/);
+  // Must NOT emit a separate [agentchattr] section — the bridge
+  // would silently ignore it.
+  assert.equal(toml13.includes("\n[agentchattr]\n"), false);
+
+  // 14) #383 Bug 3: patchAgentchattrConfigForTelegramBridge is
+  //     idempotent. The Install Bridge migration may run multiple
+  //     times; it must not duplicate the section or corrupt the
+  //     file.
+  const baseConfig =
+    "[agents.head]\nlabel = \"Head\"\n\n[agents.dev]\nlabel = \"Dev\"\n";
+  const first = patchAgentchattrConfigForTelegramBridge(baseConfig);
+  assert.equal(first.changed, true);
+  assert.match(first.text, /^\[agents\.telegram-bridge\]$/m);
+  assert.match(first.text, /label = "Telegram Bridge"/);
+  // Running a second time is a no-op.
+  const second = patchAgentchattrConfigForTelegramBridge(first.text);
+  assert.equal(second.changed, false);
+  assert.equal(second.text, first.text);
+  // A config that was hand-patched during diagnosis is recognized
+  // as already-correct — do not clobber the operator's edit.
+  const handPatched =
+    baseConfig + "\n[agents.telegram-bridge]\nlabel = \"Telegram Bridge\"\n";
+  const third = patchAgentchattrConfigForTelegramBridge(handPatched);
+  assert.equal(third.changed, false);
+  assert.equal(third.text, handPatched);
+
+  // 15) #383 Bug 4: buildTelegramBridgeSpawnEnv strips the three
+  //     env vars the upstream bridge treats as higher-precedence
+  //     than TOML. Without this, an operator shell that exported a
+  //     different bot's token (common on machines running AC2)
+  //     silently overrode the QuadWork-written TOML and the bridge
+  //     ran as the wrong identity.
+  const scrubbed = buildTelegramBridgeSpawnEnv({
+    PATH: "/usr/bin",
+    HOME: "/home/op",
+    TELEGRAM_BOT_TOKEN: "wrong-token",
+    TELEGRAM_CHAT_ID: "-999",
+    AGENTCHATTR_URL: "http://127.0.0.1:9999",
+  });
+  assert.equal(scrubbed.TELEGRAM_BOT_TOKEN, undefined);
+  assert.equal(scrubbed.TELEGRAM_CHAT_ID, undefined);
+  assert.equal(scrubbed.AGENTCHATTR_URL, undefined);
+  // Non-telegram keys must pass through untouched — the bridge
+  // still needs PATH/HOME/etc. to find python and open files.
+  assert.equal(scrubbed.PATH, "/usr/bin");
+  assert.equal(scrubbed.HOME, "/home/op");
+
   console.log(
-    "routes.telegramBridge.test.js: all assertions passed (11 cases" +
+    "routes.telegramBridge.test.js: all assertions passed (15 cases" +
       (venvSkipped ? ", case 11 pip step skipped" : "") +
       ")",
   );
