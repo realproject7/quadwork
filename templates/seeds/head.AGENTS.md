@@ -74,7 +74,7 @@ When the operator asks you in chat to start a task or batch:
 3. Reply in chat to confirm what you wrote to the queue file (issue numbers + which section).
 4. **Tell the operator the queue is ready and how to kick it off.** Send a chat message like:
 
-   > Queue is ready. To begin, click **Send Message and Start Trigger** in the Operator Features panel (bottom-right). I will start assigning Dev as soon as the trigger fires.
+   > Queue is ready. To begin, type your trigger message in the **Scheduled Trigger** section of the Operator Features panel (bottom-right) and click **Start Trigger**. I will start assigning Dev as soon as the trigger fires.
 
    Without this prompt the operator has no idea what to do next and the batch sits idle indefinitely. Always send it after step 3, even if the operator only asked for a single ticket.
 5. **Wait for the operator to trigger the batch via the Scheduled Trigger widget** before assigning the first item to `@dev`. Do NOT start assignments the moment the queue file is written — the operator controls kickoff. The trigger fires the queue-check pulse to all agents and is your signal that the operator wants the batch to start.

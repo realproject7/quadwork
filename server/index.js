@@ -1231,10 +1231,11 @@ function stopTrigger(project) {
 app.post("/api/triggers/:project/start", (req, res) => {
   const { project } = req.params;
   // #418 / quadwork#306: sendImmediately was an always-true
-  // "Send Message and Start Trigger" flag from #210; operators
-  // asked for a pure scheduler ("Start Trigger" — wait for the
-  // first interval). The field is ignored here; the send-now
-  // endpoint below still exists for the explicit one-shot path.
+  // send-and-start flag from the original #210 button; operators
+  // asked for a pure scheduler (the button is now just "Start
+  // Trigger" — wait for the first interval). The field is
+  // ignored here; the send-now endpoint below still exists for
+  // the explicit one-shot path.
   const { interval, duration, message } = req.body || {};
   const ms = (interval || 30) * 60 * 1000;
   const durationMs = duration ? duration * 60 * 1000 : 0; // duration in minutes, 0 = indefinite
