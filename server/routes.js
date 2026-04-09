@@ -149,21 +149,40 @@ const { WebSocket: NodeWebSocket } = require("ws");
 const { syncChattrToken } = require("./config");
 
 // #236: wait for AgentChattr to echo our message back over the same ws
-// connection before resolving, instead of fire-and-forgetting after
-// 250ms. AC's /ws handler broadcasts `{type:"message", data: msg}` to
-// every connected client (including the sender) after `store.add()`
-// succeeds — so if we stay subscribed briefly after sending, we see
-// our own message come back with its server-assigned id/timestamp.
-// We match on (sender, text, channel, reply_to) since AC does not
-// echo a client-supplied correlation id. On timeout / early close /
-// 4003, we surface a proper error so the /api/chat handler can
-// return a 5xx (or 401) instead of a silent {ok:true}.
+// connection before resolving, instead of fire-and-forgetting. AC's
+// /ws handler does this on every connect:
+//   1. Replays history as N `{type:"message", data: msg}` frames.
+//   2. Sends one `{type:"status", data: …}` frame (broadcast_status).
+//   3. Enters the receive loop and accepts our outgoing frame.
+// After our `type:"message"` is processed, AC calls `store.add()`
+// which broadcasts the stored record back to all clients (including
+// us) as another `{type:"message", data: msg}`.
+//
+// To get a race-free ack we therefore:
+//   A. Wait for the first `type:"status"` frame to confirm the
+//      history replay is done — any `type:"message"` frame seen
+//      BEFORE that is historical and must be ignored.
+//   B. Only then send our message and record the highest message
+//      id observed so far as a correlation baseline.
+//   C. Accept the first post-send `type:"message"` whose payload
+//      matches (sender, text, channel, reply_to) AND whose id is
+//      strictly greater than the baseline (AC ids are monotonically
+//      increasing from store.add). This eliminates the risk a
+//      reviewer flagged on #382 round 1: a historical identical
+//      message from <1.5s ago could have satisfied the old
+//      heuristic matcher.
+// On timeout / early close / 4003, we surface a proper error so the
+// /api/chat handler can return a 5xx (or 401) instead of a silent
+// {ok:true}.
 function sendViaWebSocket(baseUrl, sessionToken, message) {
   return new Promise((resolve, reject) => {
     const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(sessionToken || "")}`;
     const ws = new NodeWebSocket(wsUrl);
     let settled = false;
-    let sentAt = 0;
+    let historyFlushed = false;
+    let sent = false;
+    let maxIdAtSend = -Infinity;
+    let maxHistoryId = -Infinity;
     const finish = (err, value) => {
       if (settled) return;
       settled = true;
@@ -171,23 +190,48 @@ function sendViaWebSocket(baseUrl, sessionToken, message) {
       if (err) reject(err); else resolve(value);
     };
     const giveUp = setTimeout(() => finish(new Error("websocket send timeout")), 4000);
-    ws.on("open", () => {
+    const doSend = () => {
+      if (sent || settled) return;
       try {
+        maxIdAtSend = maxHistoryId;
         ws.send(JSON.stringify({ type: "message", ...message }));
-        sentAt = Date.now();
+        sent = true;
       } catch (err) { clearTimeout(giveUp); finish(err); }
+    };
+    ws.on("open", () => {
+      // Do NOT send yet. Wait for the status frame that marks the
+      // end of history replay so we have a clean correlation
+      // baseline. A safety timer covers the (unlikely) case of an
+      // AC build that doesn't emit status on connect — after 750ms
+      // we fall back to sending anyway, using whatever max id we
+      // collected from history so far as the baseline.
+      setTimeout(() => {
+        if (!historyFlushed) {
+          historyFlushed = true;
+          doSend();
+        }
+      }, 750);
     });
     ws.on("message", (raw) => {
-      if (settled || !sentAt) return;
+      if (settled) return;
       let frame;
       try { frame = JSON.parse(raw.toString()); } catch { return; }
-      if (!frame || frame.type !== "message" || !frame.data) return;
+      if (!frame || !frame.type) return;
+      if (frame.type === "status" && !historyFlushed) {
+        historyFlushed = true;
+        doSend();
+        return;
+      }
+      if (frame.type !== "message" || !frame.data) return;
       const d = frame.data;
-      // AC replays history on connect (same type:"message" envelope).
-      // Ignore any echo whose stored timestamp predates our send — it
-      // can only be an old message, not our ack. AC timestamps are
-      // epoch seconds (float) on the `timestamp` field.
-      if (typeof d.timestamp === "number" && d.timestamp * 1000 < sentAt - 1500) return;
+      // Track the highest message id we have observed, whether from
+      // history replay or from other live broadcasts. Used as the
+      // baseline for the post-send correlation check.
+      if (typeof d.id === "number" && d.id > maxHistoryId) {
+        maxHistoryId = d.id;
+      }
+      if (!sent) return; // anything before our send is history
+      if (typeof d.id !== "number" || d.id <= maxIdAtSend) return;
       if (d.sender !== message.sender) return;
       if (d.text !== message.text) return;
       if ((d.channel || "general") !== (message.channel || "general")) return;

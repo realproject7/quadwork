@@ -36,9 +36,16 @@ function startFakeAc({ historyBeforeAck = [], rejectWithCode = null, dropBeforeA
     wss.handleUpgrade(req, socket, head, (ws) => {
       // Simulate history replay on connect — these must NOT satisfy
       // the ack, even if they match (sender,text,channel).
+      let historyMaxId = 0;
       for (const msg of historyBeforeAck) {
         ws.send(JSON.stringify({ type: "message", data: msg }));
+        if (typeof msg.id === "number" && msg.id > historyMaxId) historyMaxId = msg.id;
       }
+      // Mirror AC: emit one `type:"status"` frame after history so the
+      // client knows the replay is done. See agentchattr/app.py
+      // `broadcast_status()` call in the /ws handler (line ~1082).
+      ws.send(JSON.stringify({ type: "status", data: { ready: true } }));
+      let nextId = Math.max(9000, historyMaxId + 1);
       ws.on("message", (raw) => {
         const frame = JSON.parse(raw.toString());
         if (frame.type !== "message") return;
@@ -48,7 +55,7 @@ function startFakeAc({ historyBeforeAck = [], rejectWithCode = null, dropBeforeA
         }
         // Mirror store.add: assign id + timestamp, rebroadcast.
         const echoed = {
-          id: 9001,
+          id: nextId++,
           sender: frame.sender,
           text: frame.text,
           channel: frame.channel || "general",
@@ -80,7 +87,8 @@ function startFakeAc({ historyBeforeAck = [], rejectWithCode = null, dropBeforeA
     });
     assert.equal(result.ok, true);
     assert.ok(result.message, "expected echoed message object");
-    assert.equal(result.message.id, 9001);
+    assert.equal(typeof result.message.id, "number");
+    assert.ok(result.message.id >= 9000);
     assert.equal(result.message.text, "hello from test");
     assert.equal(result.message.sender, "user");
     assert.equal(result.message.attachments.length, 1);
@@ -88,24 +96,28 @@ function startFakeAc({ historyBeforeAck = [], rejectWithCode = null, dropBeforeA
     await ac.close();
   }
 
-  // 3) Stale history replay must NOT satisfy the ack. The server sends
-  //    a matching (sender,text) frame on connect BEFORE we've sent
-  //    anything — sendViaWebSocket should ignore it (timestamp gate
-  //    + sentAt guard) and still wait for the real post-send echo.
+  // 3) Stale history replay must NOT satisfy the ack — even when the
+  //    history contains a message that is IDENTICAL (sender, text,
+  //    channel, reply_to) and has a recent timestamp (e.g. a retry of
+  //    the same message sent <1s ago). Prior heuristic matcher was
+  //    vulnerable to this; the fix uses the (1) status-frame history
+  //    boundary and (2) strictly-greater-id correlation baseline so
+  //    the historical echo is definitionally rejected. Reviewer1
+  //    flagged this race on PR #382 round 1.
   {
     const stale = {
-      id: 1, sender: "user", text: "ghost", channel: "general",
-      attachments: [], reply_to: null,
-      timestamp: (Date.now() - 60_000) / 1000, // 60s in the past
+      id: 42, sender: "user", text: "same words",
+      channel: "general", attachments: [], reply_to: null,
+      timestamp: Date.now() / 1000, // RIGHT NOW — old heuristic would accept this
     };
     const ac = await startFakeAc({ historyBeforeAck: [stale] });
     const result = await sendViaWebSocket(ac.url, "fake-token", {
-      text: "ghost",
+      text: "same words",
       sender: "user",
       channel: "general",
       attachments: [],
     });
-    assert.equal(result.message.id, 9001, "must resolve with the live echo, not the historical one");
+    assert.ok(result.message.id > 42, `expected live echo id > 42, got ${result.message.id}`);
     await ac.close();
   }
 
