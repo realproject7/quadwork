@@ -14,6 +14,18 @@ const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const AGENTS = ["head", "reviewer1", "reviewer2", "dev"];
 const DEFAULT_AGENTCHATTR_DIR = path.join(CONFIG_DIR, "agentchattr");
 const AGENTCHATTR_REPO = "https://github.com/bcurts/agentchattr.git";
+// #348: pinned AgentChattr commit shipped with this QuadWork
+// release. The install path clones the default branch and then
+// checks this commit out so two fresh installs on different days
+// produce byte-identical clones. When bumping this pin,
+// deliberately test against the new upstream commit first and
+// note the update in docs/RELEASING.md.
+//
+// On checkout failure (e.g. upstream force-pushed the commit
+// away), the install path falls back to the default branch with
+// a loud warning instead of hard-failing — see installAgentChattr
+// below.
+const AGENTCHATTR_PIN = "3e71d4267572579e7ffeb83576645f90932c1849";
 
 // ─── ANSI Helpers ──────────────────────────────────────────────────────────
 
@@ -234,6 +246,14 @@ function _installAgentChattrLocked(dir, setError) {
     const cloneResult = run(`git clone "${AGENTCHATTR_REPO}" "${dir}" 2>&1`, { timeout: 60000 });
     if (cloneResult === null) return setError(`git clone of ${AGENTCHATTR_REPO} into ${dir} failed`);
     if (!fs.existsSync(runPy)) return setError(`Clone completed but run.py missing at ${dir}`);
+    // #348: pin to the known-good AgentChattr commit shipped with
+    // this QuadWork release. On failure (commit unreachable /
+    // force-pushed away), fall back to the default branch with a
+    // loud warning instead of hard-failing the install.
+    const pinResult = run(`git -C "${dir}" checkout ${AGENTCHATTR_PIN} 2>&1`, { timeout: 30000 });
+    if (pinResult === null) {
+      try { console.warn(`[quadwork] WARNING: could not check out AgentChattr pin ${AGENTCHATTR_PIN} at ${dir}; falling back to default branch. The upstream commit may have been force-pushed away — update AGENTCHATTR_PIN in bin/quadwork.js for reproducible installs.`); } catch {}
+    }
   }
 
   // 2. Create venv if missing.
@@ -1877,6 +1897,64 @@ async function cmdCleanup() {
   }
 }
 
+// ─── Doctor ─────────────────────────────────────────────────────────────────
+
+// #348: show the AgentChattr pin and the actual commit SHA of
+// every per-project clone so operators can spot mismatches. The
+// global clone at DEFAULT_AGENTCHATTR_DIR is checked first, then
+// any clones under ~/.quadwork/<projectId>/agentchattr that are
+// referenced by config.json.
+function cmdDoctor() {
+  console.log("");
+  console.log("QuadWork doctor");
+  console.log("===============");
+  console.log(`AgentChattr repo: ${AGENTCHATTR_REPO}`);
+  console.log(`Expected pin:     ${AGENTCHATTR_PIN}`);
+  console.log("");
+  const cloneShaAt = (dir) => {
+    if (!fs.existsSync(path.join(dir, ".git"))) return null;
+    const sha = run(`git -C "${dir}" rev-parse HEAD 2>&1`);
+    return sha ? sha.trim() : null;
+  };
+  const report = (label, dir) => {
+    if (!dir || !fs.existsSync(dir)) {
+      console.log(`  [skip] ${label}: ${dir || "(not configured)"} — missing`);
+      return;
+    }
+    const sha = cloneShaAt(dir);
+    if (!sha) {
+      console.log(`  [warn] ${label}: ${dir} — not a git clone`);
+      return;
+    }
+    const tag = sha === AGENTCHATTR_PIN ? "OK  " : "DIFF";
+    console.log(`  [${tag}] ${label}: ${sha} (${dir})`);
+  };
+  // Global clone
+  report("global", DEFAULT_AGENTCHATTR_DIR);
+  // Per-project clones referenced by config.json
+  try {
+    const cfg = readConfig();
+    const projects = Array.isArray(cfg.projects) ? cfg.projects : [];
+    if (projects.length === 0) {
+      console.log("  (no projects in config.json)");
+    }
+    for (const p of projects) {
+      // Per-project clones live under ~/.quadwork/<id>/agentchattr
+      // per cmdAddProject's layout, but a project may also override
+      // via its own agentchattr_dir field.
+      const perProject = p && p.agentchattr_dir
+        ? p.agentchattr_dir
+        : path.join(CONFIG_DIR, p.id || "", "agentchattr");
+      report(`project:${p.id || "(unnamed)"}`, perProject);
+    }
+  } catch (err) {
+    console.log(`  (could not enumerate projects: ${err.message})`);
+  }
+  console.log("");
+  console.log("Legend: [OK  ] clone matches the pin; [DIFF] clone is off-pin (re-clone manually to re-sync)");
+  console.log("");
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 const command = process.argv[2];
@@ -1897,6 +1975,9 @@ switch (command) {
   case "cleanup":
     cmdCleanup();
     break;
+  case "doctor":
+    cmdDoctor();
+    break;
   default:
     console.log(`
   Usage: quadwork <command>
@@ -1907,6 +1988,7 @@ switch (command) {
     stop          Stop all QuadWork processes
     add-project   Add a project via CLI (alternative to web UI /setup)
     cleanup       Reclaim disk space (--project <id> or --legacy)
+    doctor        Report the AgentChattr pin + per-project clone SHAs
 
   Workflow:
     1. npx quadwork init     — one-time global setup, opens dashboard

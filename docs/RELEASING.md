@@ -90,6 +90,41 @@ Notes about the loop:
 - Post the release URL in the project chat so the batch reviewers can
   verify the auto-generated notes look sane.
 
+## Bumping the AgentChattr pin (#348)
+
+QuadWork installs AgentChattr via `git clone` and then checks out
+a pinned commit declared in `bin/quadwork.js`:
+
+```js
+const AGENTCHATTR_PIN = "<commit-sha>";
+```
+
+Every fresh `npx quadwork` install produces a byte-identical
+AgentChattr clone at this commit, so two users installing on
+different days land on the same upstream state. When cutting a
+new QuadWork release that needs a newer AgentChattr:
+
+1. Pull the upstream repo locally and pick the target commit
+   (prefer a tag if one exists, otherwise a bare SHA).
+2. Manually install QuadWork against that commit and run the
+   dashboard end-to-end against at least one real project.
+   Verify `quadwork doctor` shows the new pin and reports every
+   per-project clone in-sync (see below).
+3. Update `AGENTCHATTR_PIN` in `bin/quadwork.js` to the new
+   commit and commit it as part of the same release PR.
+4. Note the bump in the release changelog so operators know
+   what upstream changes are rolling in.
+
+Existing installs are **not** auto-updated on `quadwork start`
+— operators may have local commits on top of the old pin, and
+we don't want to silently rewrite their tree. `quadwork doctor`
+will flag the mismatch so they can decide to re-clone manually.
+
+If the pinned commit becomes unreachable (upstream force-push),
+`installAgentChattr` logs a loud warning and falls back to the
+default branch instead of hard-failing the install. The next
+release should update the pin to a reachable commit.
+
 ## Pitfalls
 
 - **Never run `npm run release:*` from a dirty tree.** `npm version` will
