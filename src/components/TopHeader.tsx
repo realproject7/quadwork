@@ -191,6 +191,7 @@ export default function TopHeader() {
               onBlur={() => setShowStatsTooltip(false)}
               tabIndex={0}
             >
+              <span className="text-neutral-200">Your AI team worked:</span>
               <span>Today <span className="text-neutral-200">{fmtHours(stats.today)}</span></span>
               <span className="text-neutral-700">·</span>
               <span>Week <span className="text-neutral-200">{fmtHours(stats.week)}</span></span>
