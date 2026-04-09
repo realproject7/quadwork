@@ -208,21 +208,38 @@ export default function TerminalPanel({
 
       ws.onclose = async (e) => {
         if (cancelled) return;
-        // #368: delayed probe of /api/sessions. The restart path on
-        // the server does stop→spawn sequentially, so the fresh
-        // session may need a short beat to register before we ask.
-        // A single 250ms retry window is enough in practice.
-        await new Promise((r) => setTimeout(r, 250));
-        if (cancelled) return;
-        if (reattachAttempts < MAX_REATTACH && await sessionIsLive()) {
-          reattachAttempts += 1;
-          // Clear the stale buffer so the previous session's last
-          // frame (including any "stopped" marker) doesn't linger
-          // above the new prompt.
-          term.reset();
-          term.write(`\x1b[38;2;115;115;115m[reattached to new session]\x1b[0m\r\n`);
-          connect();
-          return;
+        // #368: bounded polling probe of /api/sessions. A single
+        // fixed-delay probe is timing-fragile — if the server-side
+        // stop→spawn sequence takes longer than the delay (slow
+        // PTY spawn, busy event loop, AgentChattr re-registration
+        // stall) the probe sees "no session" and the terminal
+        // permanently falls through to [session closed] even
+        // though the new PTY came up a moment later. Instead,
+        // poll every 200ms for up to 2000ms (10 attempts) and
+        // reattach as soon as a live session appears. The loop
+        // bails immediately on any liveness hit, so the happy
+        // path still completes in ~200-400ms.
+        if (reattachAttempts < MAX_REATTACH) {
+          const PROBE_INTERVAL_MS = 200;
+          const PROBE_WINDOW_MS = 2000;
+          const probeStart = Date.now();
+          let live = false;
+          while (Date.now() - probeStart < PROBE_WINDOW_MS) {
+            await new Promise((r) => setTimeout(r, PROBE_INTERVAL_MS));
+            if (cancelled) return;
+            if (await sessionIsLive()) { live = true; break; }
+          }
+          if (cancelled) return;
+          if (live) {
+            reattachAttempts += 1;
+            // Clear the stale buffer so the previous session's
+            // last frame (including any "stopped" marker) doesn't
+            // linger above the new prompt.
+            term.reset();
+            term.write(`\x1b[38;2;115;115;115m[reattached to new session]\x1b[0m\r\n`);
+            connect();
+            return;
+          }
         }
         term.write(`\r\n\x1b[38;2;115;115;115m[session closed: ${e.reason || e.code}]\x1b[0m\r\n`);
       };
