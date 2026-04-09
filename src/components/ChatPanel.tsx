@@ -210,7 +210,13 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
   }, []);
   const cursorRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  // #344: IME composition guard — Korean/Japanese candidate
+  // selection ends with an Enter keystroke that must NOT submit
+  // the message. React synthesizes keydown BEFORE the composition
+  // flags flip, so we track a ref alongside the element's own
+  // isComposing flag and check both in the Enter handler.
+  const isComposingRef = useRef(false);
   const shouldAutoScroll = useRef(true);
   const authRetryRef = useRef(0);
 
@@ -290,6 +296,20 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
 
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+
+  // #344: auto-grow the chat textarea to fit its content up to
+  // ~6 lines, then scroll internally. Reset to 'auto' first so
+  // shrinking after a deletion works — reading scrollHeight on a
+  // fixed-height element would pin the lower bound to the
+  // previous height. Capped at CHAT_INPUT_MAX_PX to match the
+  // inline style; anything taller scrolls inside the textarea.
+  const CHAT_INPUT_MAX_PX = 120;
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, CHAT_INPUT_MAX_PX) + "px";
+  }, [input]);
 
   // Send message
   const send = () => {
@@ -510,12 +530,19 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             </button>
           </div>
         )}
-        <div className="flex items-center gap-1 px-1">
-          <input
+        {/* #344: textarea replaces single-line input. Shift+Enter
+            inserts a newline, Enter sends, Korean/Japanese IME
+            composition is guarded via isComposingRef + the native
+            `isComposing` flag on the event. Height follows content
+            up to CHAT_INPUT_MAX_PX (~6 lines), then scrolls. */}
+        <div className="flex items-end gap-1 px-1">
+          <textarea
             ref={inputRef}
-            type="text"
+            rows={1}
             value={input}
             onChange={(e) => handleInput(e.target.value)}
+            onCompositionStart={() => { isComposingRef.current = true; }}
+            onCompositionEnd={() => { isComposingRef.current = false; }}
             onKeyDown={(e) => {
               // Tab: autocomplete first filtered @mention or slash
               if (e.key === "Tab" && showMentions && filteredAgents.length > 0) {
@@ -546,7 +573,17 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
                   return;
                 }
               }
-              if (e.key === "Enter" && !e.shiftKey) {
+              // #344: Shift+Enter → newline (let the textarea
+              // handle it natively). Plain Enter → send, but only
+              // when the IME isn't mid-composition — Korean/Japanese
+              // candidate confirmation fires a keydown with
+              // `isComposing === true` that must not submit.
+              if (
+                e.key === "Enter" &&
+                !e.shiftKey &&
+                !isComposingRef.current &&
+                !(e.nativeEvent as KeyboardEvent).isComposing
+              ) {
                 e.preventDefault();
                 send();
               }
@@ -558,7 +595,8 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             }}
             placeholder={`Message #${channel}...`}
             disabled={sending}
-            className="flex-1 bg-transparent px-2 py-2 text-[12px] font-mono text-text placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
+            className="flex-1 bg-transparent px-2 py-2 text-[12px] font-mono text-text placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent disabled:opacity-50 resize-none overflow-y-auto leading-snug"
+            style={{ maxHeight: 120 }}
           />
           <button
             onClick={send}
