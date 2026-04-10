@@ -1,14 +1,18 @@
 "use client";
 
+import React from "react";
+
 interface PanelHeaderProps {
   label: string;
   status?: "running" | "stopped" | "error";
   projectId?: string;
   agentId?: string;
   onStatusChange?: (newStatus: string) => void;
+  /** #407: optional info tooltip element rendered after the label */
+  tooltip?: React.ReactNode;
 }
 
-export default function PanelHeader({ label, status, projectId, agentId, onStatusChange }: PanelHeaderProps) {
+export default function PanelHeader({ label, status, projectId, agentId, onStatusChange, tooltip }: PanelHeaderProps) {
   const dotColor =
     status === "running"
       ? "bg-accent"
@@ -39,6 +43,7 @@ export default function PanelHeader({ label, status, projectId, agentId, onStatu
         <span className="text-[11px] text-text-muted uppercase tracking-wider">
           {label}
         </span>
+        {tooltip}
       </div>
       {showControls && (
         <div className="flex items-center gap-1">

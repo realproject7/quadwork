@@ -20,6 +20,7 @@
 // widgets — see #367 for the rationale.
 
 import { useCallback, useEffect, useState } from "react";
+import InfoTooltip from "./InfoTooltip";
 
 interface AgentRow {
   agent_id: string;
@@ -275,7 +276,12 @@ export default function AgentModelsButton({ projectId }: AgentModelsWidgetProps)
     <>
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
-          <span className="text-[11px] text-text-muted uppercase tracking-wider">Agent Models</span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] text-text-muted uppercase tracking-wider">Agent Models</span>
+            <InfoTooltip>
+              <b>Agent Models</b> — configure which LLM model and reasoning effort each agent uses. Changes require an agent restart to take effect.
+            </InfoTooltip>
+          </div>
           <button
             type="button"
             onClick={() => setOpen(true)}

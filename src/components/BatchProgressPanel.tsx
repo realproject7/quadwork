@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import InfoTooltip from "./InfoTooltip";
 
 interface BatchProgressItem {
   issue_number: number;
@@ -112,6 +113,9 @@ export default function BatchProgressPanel({ projectId }: BatchProgressPanelProp
           Current Batch: Batch {data.batch_number ?? "—"}
         </span>
         <span className="text-[10px] text-text-muted">({data.items.length} items)</span>
+        <InfoTooltip>
+          <b>Current Batch</b> — progress tracker for the active batch. Polls GitHub to resolve each issue&apos;s status (queued &rarr; in review &rarr; approved &rarr; merged).
+        </InfoTooltip>
       </div>
       <div className="max-h-40 overflow-y-auto">
         {data.items.map((item) => {

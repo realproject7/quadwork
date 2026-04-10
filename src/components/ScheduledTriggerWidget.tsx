@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import InfoTooltip from "./InfoTooltip";
 
 interface ScheduledTriggerWidgetProps {
   projectId: string;
@@ -249,9 +250,14 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   return (
     <div className="flex flex-col border border-border">
       <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
-        <span className="text-[11px] text-text-muted uppercase tracking-wider">
-          Scheduled Trigger{running ? " (running)" : ""}
-        </span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] text-text-muted uppercase tracking-wider">
+            Scheduled Trigger{running ? " (running)" : ""}
+          </span>
+          <InfoTooltip>
+            <b>Scheduled Trigger</b> sends a periodic message to all agents on a timer. Use this to keep the autonomous workflow running overnight. First message fires after the configured interval, not immediately.
+          </InfoTooltip>
+        </div>
         {error && <span className="text-[10px] text-error">err: {error}</span>}
       </div>
 

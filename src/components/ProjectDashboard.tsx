@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 import PanelHeader from "./PanelHeader";
+import InfoTooltip from "./InfoTooltip";
 import ChatPanel from "./ChatPanel";
 import GitHubPanel from "./GitHubPanel";
 import ControlBar from "./ControlBar";
@@ -112,7 +113,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           the primary interface (#208). 2px accent border + explicit
           "primary chat" label in the panel header. */}
       <div className="flex flex-col overflow-hidden border-2 border-accent">
-        <PanelHeader label="AgentChattr — primary chat" />
+        <PanelHeader label="AgentChattr — primary chat" tooltip={
+          <InfoTooltip>
+            <b>Primary Chat</b> — live chat between you and the 4 AI agents. Messages you type here trigger agent actions. Use @mentions to address specific agents.
+          </InfoTooltip>
+        } />
         <div className="flex-1 min-h-0">
           <ChatPanel projectId={projectId} />
         </div>
@@ -155,7 +160,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
 
       {/* Quadrant 3 (bottom-left): GitHub (#208). */}
       <div className="flex flex-col overflow-hidden">
-        <PanelHeader label="GitHub" />
+        <PanelHeader label="GitHub" tooltip={
+          <InfoTooltip>
+            <b>GitHub</b> — open issues and pull requests on this project&apos;s repo. Click any item to open it on GitHub. The batch progress panel tracks the active batch&apos;s lifecycle from queued to merged.
+          </InfoTooltip>
+        } />
         <div className="flex-1 min-h-0">
           <GitHubPanel projectId={projectId} />
         </div>
