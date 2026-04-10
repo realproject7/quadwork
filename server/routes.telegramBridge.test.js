@@ -176,11 +176,14 @@ try {
     bot_token: "123:abc",
     chat_id: "-42",
     agentchattr_url: "http://127.0.0.1:8301",
-  });
+  }, "testproject");
   assert.match(toml13, /^\[telegram\]/);
   assert.match(toml13, /bot_token = "123:abc"/);
   assert.match(toml13, /chat_id = "-42"/);
   assert.match(toml13, /agentchattr_url = "http:\/\/127\.0\.0\.1:8301"/);
+  // #404: cursor_file must be per-project so multiple bridges
+  // don't clobber each other's position.
+  assert.match(toml13, /cursor_file = ".*telegram-bridge-cursor-testproject\.json"/);
   // Must NOT emit a separate [agentchattr] section — the bridge
   // would silently ignore it.
   assert.equal(toml13.includes("\n[agentchattr]\n"), false);

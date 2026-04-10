@@ -2407,12 +2407,19 @@ function resolveProjectAgentchattrUrl(cfg, project) {
 // #383 Bug 2: the upstream bridge only reads `agentchattr_url` from
 // inside `[telegram]`. A separate `[agentchattr]` section is silently
 // ignored and the bridge falls back to its hardcoded :8300 default.
-function buildTelegramBridgeToml(tg) {
+// #404: accept projectId so we can write a per-project cursor_file
+// path. Without this, multiple project bridges share the same default
+// cursor and clobber each other's position — the project with higher
+// AC message IDs advances the cursor past the other project's range,
+// silently killing AC→TG forwarding for that project.
+function buildTelegramBridgeToml(tg, projectId) {
+  const cursorFile = path.join(CONFIG_DIR, `telegram-bridge-cursor-${projectId}.json`);
   return (
     `[telegram]\n` +
     `bot_token = "${tg.bot_token}"\n` +
     `chat_id = "${tg.chat_id}"\n` +
-    `agentchattr_url = "${tg.agentchattr_url}"\n`
+    `agentchattr_url = "${tg.agentchattr_url}"\n` +
+    `cursor_file = "${cursorFile}"\n`
   );
 }
 
@@ -2745,7 +2752,7 @@ router.post("/api/telegram", async (req, res) => {
       const tomlPath = telegramConfigToml(projectId);
       // #383 Bug 2: write agentchattr_url inside [telegram]; the
       // bridge's load_config only reads from that section.
-      const tomlContent = buildTelegramBridgeToml(tg);
+      const tomlContent = buildTelegramBridgeToml(tg, projectId);
       fs.writeFileSync(tomlPath, tomlContent, { mode: 0o600 });
       fs.chmodSync(tomlPath, 0o600);
       // #353: pre-flight import check so a fresh install with no

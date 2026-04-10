@@ -1119,7 +1119,10 @@ bridge_sender = "telegram-bridge"
           // #383 Bug 2: the bridge only reads agentchattr_url from
           // inside [telegram]. A separate [agentchattr] section is
           // silently ignored and the bridge falls back to :8300.
-          const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\nagentchattr_url = "${projectChattrUrl}"\n`;
+          // #404: cursor_file must be per-project so multiple bridges
+          // don't clobber each other's position.
+          const cursorFile = path.join(CONFIG_DIR, `telegram-bridge-cursor-${setup.projectName}.json`);
+          const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\nagentchattr_url = "${projectChattrUrl}"\ncursor_file = "${cursorFile}"\n`;
           fs.writeFileSync(bridgeToml, bridgeTomlContent, { mode: 0o600 });
           fs.chmodSync(bridgeToml, 0o600);
           // #383 Bug 4: scrub TELEGRAM_*/AGENTCHATTR_URL from the
