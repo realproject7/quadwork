@@ -85,5 +85,7 @@ Head owns this file — do not edit it. Read it when you need context on the bat
   - After BOTH Reviewer1 AND Reviewer2 approve → ONLY THEN message **@head** to request merge.
 - Always include issue/PR numbers in messages
 - Report blockers to @head immediately
+- **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.
+- **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **Do NOT send ANY message to @head between assignment and merge request** — no acks, no status updates.
 - **After merge confirmation from Head**: do NOT reply. The loop is COMPLETE — silence is required.

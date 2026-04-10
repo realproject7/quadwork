@@ -33,7 +33,8 @@ Branch naming (strict): `task/<issue-number>-<short-slug>`
 
 ## Communication Rules
 
-- **No acknowledgment messages** — don't send "on it", "noted", "standing by"
+- **Always reply to the operator** — when the operator (sender: "user") addresses you in chat, you MUST reply via `chat_send`. The operator's terminal is invisible; if you don't `chat_send`, your response does not exist.
+- **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **No status updates to Head** — Dev works silently until PR is ready
 - **Strict routing**: Dev→Reviewer1/Reviewer2 (review) → Dev→Head (merge request) → Head→Dev (merged)
 - **Post-merge silence**: Head sends ONE "merged" message. No further replies from anyone.

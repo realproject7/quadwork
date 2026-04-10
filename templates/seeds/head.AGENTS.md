@@ -97,5 +97,7 @@ When the operator asks you in chat to start a task or batch:
 - **ALWAYS @mention the next agent** — never @user or @human
 - Route: you → @dev for task assignments. You do NOT message @reviewer1 or @reviewer2 directly.
 - Include issue/PR numbers in all messages
+- **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.
+- **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **Do NOT reply to acknowledgments** — if Dev says "on it" or similar, do NOT respond. Wait silently for the PR.
 - **After merge**: send ONE message: "@dev PR #<number> merged. Issue #<number> closed." — no further replies needed.

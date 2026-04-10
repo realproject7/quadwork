@@ -101,5 +101,7 @@ Run this once at the start of each session.
 - **After BLOCK**: send message to @head AND @dev — Head decides whether to reassign or close
 - Always include PR number in messages
 - Tag specific findings with file:line references
-- **Do NOT send "standing by" or acknowledgment messages** — only message when you have a completed review to deliver.
+- **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.
+- **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
+- Only send unsolicited messages when delivering a completed review verdict. But ALWAYS reply when the operator addresses you directly — even if the message is not a review request. The operator may be asking about your status, giving instructions, or testing connectivity.
 - **After merge confirmation from Head**: do NOT reply. The loop is complete — no acknowledgment needed.
