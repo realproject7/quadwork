@@ -9,6 +9,7 @@ const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH } = require("./config");
 const routes = require("./routes");
 const { waitForAgentChattrReady, registerAgent, deregisterAgent, startHeartbeat, stopHeartbeat } = require("./agentchattr-registry");
+const { patchAgentchattrCss } = require("./install-agentchattr");
 const { startQueueWatcher, stopQueueWatcher } = require("./queue-watcher");
 
 const net = require("net");
@@ -1006,6 +1007,8 @@ async function handleAgentChattr(req, res) {
       }
 
       const pullResult = execSync("git pull 2>&1", { cwd: acDir, encoding: "utf-8", timeout: 30000 }).trim();
+      // #388: re-apply sender-overflow CSS patch after git pull
+      patchAgentchattrCss(acDir);
       const venvPython = path.join(acDir, ".venv", "bin", "python");
       let pipResult = "";
       const reqFile = path.join(acDir, "requirements.txt");

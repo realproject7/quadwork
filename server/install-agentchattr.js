@@ -192,6 +192,8 @@ function _installAgentChattrLocked(dir, setError) {
       if (pipResult === null) return setError(`pip install -r ${reqFile} failed`);
     }
   }
+  // #388: patch sender-column overflow CSS after clone/install
+  patchAgentchattrCss(dir);
   return dir;
 }
 
@@ -207,9 +209,37 @@ function chattrSpawnArgs(dir, extraArgs) {
   return { command: venvPython, spawnArgs: ["run.py", ...(extraArgs || [])], cwd: dir };
 }
 
+/**
+ * #388: Patch AgentChattr's style.css to cap the sender column width.
+ * Idempotent — skips if the marker comment is already present.
+ * Called after install and after update (git pull overwrites style.css).
+ */
+function patchAgentchattrCss(dir) {
+  if (!dir) return;
+  const cssPath = path.join(dir, "static", "style.css");
+  if (!fs.existsSync(cssPath)) return;
+  try {
+    const content = fs.readFileSync(cssPath, "utf-8");
+    if (content.includes("/* quadwork#388 sender-overflow fix */")) return;
+    const patch = `
+/* quadwork#388 sender-overflow fix */
+.msg-sender {
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: middle;
+}
+`;
+    fs.writeFileSync(cssPath, content + patch);
+  } catch {}
+}
+
 module.exports = {
   AGENTCHATTR_REPO,
   findAgentChattr,
   installAgentChattr,
   chattrSpawnArgs,
+  patchAgentchattrCss,
 };

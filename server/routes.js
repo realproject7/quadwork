@@ -2837,6 +2837,17 @@ router.post("/api/telegram", async (req, res) => {
     case "stop": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      // #388: deregister the bridge from AC before killing so the slot
+      // clears immediately instead of lingering for 60s as a stale -2/-3.
+      try {
+        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        const project = cfg.projects?.find((p) => p.id === projectId);
+        const acUrl = resolveProjectAgentchattrUrl(cfg, project);
+        if (acUrl) {
+          const acPort = new URL(acUrl).port || "8300";
+          fetch(`http://127.0.0.1:${acPort}/api/deregister/telegram-bridge`, { method: "POST" }).catch(() => {});
+        }
+      } catch {}
       try {
         const pf = telegramPidFile(projectId);
         if (fs.existsSync(pf)) {
