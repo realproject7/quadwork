@@ -2930,6 +2930,354 @@ router.post("/api/telegram", async (req, res) => {
   }
 });
 
+// --- Discord Bridge ---
+// #396/#399: Discord ↔ AgentChattr bridge, bundled in quadwork
+// package at bridges/discord/. Mirrors Telegram bridge patterns.
+
+const DISCORD_BRIDGE_SRC = path.join(__dirname, "..", "bridges", "discord");
+const DISCORD_BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-discord");
+
+function discordPidFile(projectId) {
+  return path.join(CONFIG_DIR, `discord-bridge-${projectId}.pid`);
+}
+
+function discordConfigToml(projectId) {
+  return path.join(CONFIG_DIR, `discord-${projectId}.toml`);
+}
+
+function discordBridgeLog(projectId) {
+  return path.join(CONFIG_DIR, `discord-bridge-${projectId}.log`);
+}
+
+function buildDiscordBridgeToml(dc, projectId) {
+  const cursorFile = path.join(CONFIG_DIR, `discord-bridge-cursor-${projectId}.json`);
+  return (
+    `[discord]\n` +
+    `bot_token = "${dc.bot_token}"\n` +
+    `channel_id = "${dc.channel_id}"\n` +
+    `agentchattr_url = "${dc.agentchattr_url}"\n` +
+    `cursor_file = "${cursorFile}"\n`
+  );
+}
+
+function patchAgentchattrConfigForDiscordBridge(tomlText) {
+  if (/^\[agents\.discord-bridge\]\s*$/m.test(tomlText)) {
+    return { text: tomlText, changed: false };
+  }
+  const sep = tomlText.length === 0 || tomlText.endsWith("\n") ? "" : "\n";
+  const block = `\n[agents.discord-bridge]\nlabel = "Discord Bridge"\n`;
+  return { text: tomlText + sep + block, changed: true };
+}
+
+function buildDiscordBridgeSpawnEnv(parentEnv) {
+  const env = { ...parentEnv };
+  delete env.DISCORD_BOT_TOKEN;
+  delete env.DISCORD_CHANNEL_ID;
+  delete env.AGENTCHATTR_URL;
+  return env;
+}
+
+function checkDiscordBridgePythonDeps(pythonPath = "python3") {
+  try {
+    execFileSync(pythonPath, ["-c", "import discord, requests"], {
+      encoding: "utf-8",
+      timeout: 10000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { ok: true };
+  } catch (err) {
+    const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
+    const msg = stderr.trim() || (err && err.message) || "python3 import check failed";
+    return { ok: false, error: msg };
+  }
+}
+
+function isDiscordRunning(projectId) {
+  const pf = discordPidFile(projectId);
+  if (!fs.existsSync(pf)) return false;
+  const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    fs.unlinkSync(pf);
+    return false;
+  }
+}
+
+function discordEnvKeyForProject(projectId) {
+  return `DISCORD_BOT_TOKEN_${projectId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+}
+
+function getProjectDiscord(projectId) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const project = cfg.projects?.find((p) => p.id === projectId);
+    if (!project?.discord) return null;
+    return {
+      bot_token: resolveToken(project.discord.bot_token || ""),
+      channel_id: project.discord.channel_id || "",
+      agentchattr_url: resolveProjectAgentchattrUrl(cfg, project),
+    };
+  } catch {
+    return null;
+  }
+}
+
+router.get("/api/discord", async (req, res) => {
+  const projectId = req.query.project || "";
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+  let configured = false;
+  let channelId = "";
+  let botUsername = "";
+  let bridgeInstalled = false;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const project = cfg.projects?.find((p) => p.id === projectId) || null;
+    if (project?.discord?.bot_token && project?.discord?.channel_id) {
+      configured = true;
+      channelId = project.discord.channel_id;
+      botUsername = project.discord.bot_username || "";
+    }
+    bridgeInstalled = fs.existsSync(path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py"));
+  } catch {}
+  const running = isDiscordRunning(projectId);
+  let lastError = "";
+  if (!running) {
+    const logPath = discordBridgeLog(projectId);
+    try {
+      if (fs.existsSync(logPath) && fs.statSync(logPath).size > 0) {
+        lastError = readLastLines(logPath, 20);
+      }
+    } catch {}
+  }
+  res.json({
+    running,
+    configured,
+    channel_id: channelId,
+    bot_username: botUsername,
+    bridge_installed: bridgeInstalled,
+    last_error: lastError,
+  });
+});
+
+router.post("/api/discord", async (req, res) => {
+  const action = req.query.action;
+  const body = req.body || {};
+
+  switch (action) {
+    case "test": {
+      const { bot_token } = body;
+      if (!bot_token) return res.json({ ok: false, error: "Missing bot_token" });
+      const resolved = resolveToken(bot_token);
+      if (!resolved) return res.json({ ok: false, error: "Could not resolve bot token from environment" });
+      try {
+        const r = await fetch(`https://discord.com/api/v10/users/@me`, {
+          headers: { Authorization: `Bot ${resolved}` },
+        });
+        const data = await r.json();
+        if (r.ok && data.username) {
+          return res.json({ ok: true, username: data.username, discriminator: data.discriminator || "" });
+        }
+        return res.json({ ok: false, error: data.message || `Discord API returned ${r.status}` });
+      } catch (err) {
+        return res.json({ ok: false, error: err.message || "Connection failed" });
+      }
+    }
+    case "install": {
+      const venvDir = path.join(DISCORD_BRIDGE_DIR, ".venv");
+      const venvPython = path.join(venvDir, "bin", "python3");
+      const venvPip = path.join(venvDir, "bin", "pip");
+      let pipOutput = "";
+      try {
+        // Copy from bundled package dir (not clone — #397 decision)
+        if (!fs.existsSync(path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py"))) {
+          fs.cpSync(DISCORD_BRIDGE_SRC, DISCORD_BRIDGE_DIR, { recursive: true });
+        } else {
+          // On upgrade: overwrite script, keep venv
+          fs.cpSync(
+            path.join(DISCORD_BRIDGE_SRC, "discord_bridge.py"),
+            path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py"),
+          );
+          fs.cpSync(
+            path.join(DISCORD_BRIDGE_SRC, "requirements.txt"),
+            path.join(DISCORD_BRIDGE_DIR, "requirements.txt"),
+          );
+        }
+        if (!fs.existsSync(venvPython)) {
+          execFileSync("python3", ["-m", "venv", venvDir], { encoding: "utf-8", timeout: 60000 });
+        }
+        pipOutput = execFileSync(
+          venvPip,
+          ["install", "-r", path.join(DISCORD_BRIDGE_DIR, "requirements.txt")],
+          { encoding: "utf-8", timeout: 120000 },
+        );
+      } catch (err) {
+        const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
+        return res.json({ ok: false, error: (stderr.trim() || err.message || "Install failed") });
+      }
+      const depCheck = checkDiscordBridgePythonDeps(venvPython);
+      if (!depCheck.ok) {
+        return res.json({
+          ok: false,
+          error:
+            "pip reported success but the bridge venv's Python deps still fail to import. " +
+            `Check disk space and permissions on ${venvDir}.\n\n` +
+            `Import error: ${depCheck.error}\n\n` +
+            `pip output tail:\n${pipOutput.split("\n").slice(-10).join("\n")}`,
+        });
+      }
+      // Patch all project AC configs with [agents.discord-bridge]
+      const patched = [];
+      try {
+        const cfgAll = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        for (const proj of cfgAll.projects || []) {
+          if (!proj || !proj.id) continue;
+          const acPath = projectAgentchattrConfigPath(proj.id);
+          if (!fs.existsSync(acPath)) continue;
+          try {
+            const before = fs.readFileSync(acPath, "utf-8");
+            const { text, changed } = patchAgentchattrConfigForDiscordBridge(before);
+            if (changed) {
+              fs.writeFileSync(acPath, text);
+              patched.push(proj.id);
+            }
+          } catch {}
+        }
+      } catch {}
+      return res.json({ ok: true, patched_projects: patched });
+    }
+    case "start": {
+      const projectId = body.project_id;
+      if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      if (isDiscordRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
+      const bridgeScript = path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py");
+      if (!fs.existsSync(bridgeScript)) return res.json({ ok: false, error: "Bridge not installed. Click Install Bridge first." });
+      const venvPython = path.join(DISCORD_BRIDGE_DIR, ".venv", "bin", "python3");
+      if (!fs.existsSync(venvPython)) {
+        return res.json({ ok: false, error: "Bridge venv missing. Click \"Install Bridge\" to create it." });
+      }
+      const dc = getProjectDiscord(projectId);
+      if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
+      const tomlPath = discordConfigToml(projectId);
+      const tomlContent = buildDiscordBridgeToml(dc, projectId);
+      fs.writeFileSync(tomlPath, tomlContent, { mode: 0o600 });
+      fs.chmodSync(tomlPath, 0o600);
+      const depCheck = checkDiscordBridgePythonDeps(venvPython);
+      if (!depCheck.ok) {
+        const msg =
+          "Bridge Python dependencies not installed in the dedicated venv. " +
+          "Click \"Install Bridge\" to (re)create the venv and install them.\n\n" +
+          `Import error: ${depCheck.error}`;
+        try {
+          fs.writeFileSync(
+            discordBridgeLog(projectId),
+            `[${new Date().toISOString()}] pre-flight dep check failed\n${msg}\n`,
+          );
+        } catch {}
+        return res.json({ ok: false, error: msg });
+      }
+      const logPath = discordBridgeLog(projectId);
+      try { fs.writeFileSync(logPath, ""); } catch {}
+      let outFd, errFd;
+      try {
+        outFd = fs.openSync(logPath, "a");
+        errFd = fs.openSync(logPath, "a");
+      } catch (err) {
+        return res.json({ ok: false, error: `Could not open bridge log file: ${err.message}` });
+      }
+      let child;
+      try {
+        child = spawn(venvPython, [bridgeScript, "--config", tomlPath], {
+          detached: true,
+          stdio: ["ignore", outFd, errFd],
+          env: buildDiscordBridgeSpawnEnv(process.env),
+        });
+        child.unref();
+        if (child.pid) fs.writeFileSync(discordPidFile(projectId), String(child.pid));
+      } catch (err) {
+        try { fs.closeSync(outFd); } catch {}
+        try { fs.closeSync(errFd); } catch {}
+        return res.json({ ok: false, error: err.message || "Start failed" });
+      }
+      try { fs.closeSync(outFd); } catch {}
+      try { fs.closeSync(errFd); } catch {}
+      await new Promise((r) => setTimeout(r, 500));
+      let alive = true;
+      try { process.kill(child.pid, 0); } catch { alive = false; }
+      if (!alive) {
+        const tail = readLastLines(logPath, 20);
+        try { fs.unlinkSync(discordPidFile(projectId)); } catch {}
+        return res.json({
+          ok: false,
+          error:
+            "Bridge crashed on start (exited within 500ms).\n\n" +
+            `Last log lines (${logPath}):\n${tail || "(log empty)"}`,
+        });
+      }
+      return res.json({ ok: true, running: true, pid: child.pid });
+    }
+    case "stop": {
+      const projectId = body.project_id;
+      if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      try {
+        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        const project = cfg.projects?.find((p) => p.id === projectId);
+        const acUrl = resolveProjectAgentchattrUrl(cfg, project);
+        if (acUrl) {
+          const acPort = new URL(acUrl).port || "8300";
+          await fetch(`http://127.0.0.1:${acPort}/api/deregister/discord-bridge`, {
+            method: "POST",
+            signal: AbortSignal.timeout(3000),
+          }).catch(() => {});
+        }
+      } catch {}
+      try {
+        const pf = discordPidFile(projectId);
+        if (fs.existsSync(pf)) {
+          const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
+          if (pid) process.kill(pid, "SIGTERM");
+          fs.unlinkSync(pf);
+        }
+        return res.json({ ok: true, running: false });
+      } catch (err) {
+        return res.json({ ok: false, error: err.message || "Stop failed" });
+      }
+    }
+    case "status":
+      return res.json({ running: isDiscordRunning(body.project_id || "") });
+    case "save-config": {
+      const projectId = body.project_id;
+      const bot_token = typeof body.bot_token === "string" ? body.bot_token.trim() : "";
+      const channel_id = typeof body.channel_id === "string" ? body.channel_id.trim() : "";
+      if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      if (!bot_token || !channel_id) return res.json({ ok: false, error: "bot_token and channel_id are required" });
+      const envKey = discordEnvKeyForProject(projectId);
+      try { writeEnvToken(envKey, bot_token); }
+      catch (err) { return res.json({ ok: false, error: `Could not write .env: ${err.message}` }); }
+      try {
+        const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+        const cfg = JSON.parse(raw);
+        const project = cfg.projects?.find((p) => p.id === projectId);
+        if (!project) return res.json({ ok: false, error: "Unknown project" });
+        project.discord = {
+          ...(project.discord || {}),
+          bot_token: `env:${envKey}`,
+          channel_id,
+          bot_username: "",
+        };
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+        return res.json({ ok: true, env_key: envKey });
+      } catch (err) {
+        return res.json({ ok: false, error: err.message || "Config write failed" });
+      }
+    }
+    default:
+      return res.status(400).json({ error: "Unknown action" });
+  }
+});
+
 // #343: per-agent model + reasoning-effort settings endpoint.
 // GET returns the rows the dashboard Agent Models widget needs;
 // PUT persists a single row back to config.json. Kept narrow on
@@ -3019,6 +3367,10 @@ module.exports.resolveProjectAgentchattrUrl = resolveProjectAgentchattrUrl;
 module.exports.buildTelegramBridgeToml = buildTelegramBridgeToml;
 module.exports.patchAgentchattrConfigForTelegramBridge = patchAgentchattrConfigForTelegramBridge;
 module.exports.buildTelegramBridgeSpawnEnv = buildTelegramBridgeSpawnEnv;
+module.exports.checkDiscordBridgePythonDeps = checkDiscordBridgePythonDeps;
+module.exports.buildDiscordBridgeToml = buildDiscordBridgeToml;
+module.exports.patchAgentchattrConfigForDiscordBridge = patchAgentchattrConfigForDiscordBridge;
+module.exports.buildDiscordBridgeSpawnEnv = buildDiscordBridgeSpawnEnv;
 // #236: expose sendViaWebSocket so the chat-ws-send regression test
 // can verify the ack/body/error paths against a fake AC ws server.
 module.exports.sendViaWebSocket = sendViaWebSocket;

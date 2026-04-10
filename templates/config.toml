@@ -45,6 +45,10 @@ label = "Builder"
 [agents.telegram-bridge]
 label = "Telegram Bridge"
 
+# #399: Discord bridge registers as `discord-bridge`.
+[agents.discord-bridge]
+label = "Discord Bridge"
+
 [routing]
 default = "none"
 max_agent_hops = 30

@@ -4,6 +4,7 @@ import PanelHeader from "./PanelHeader";
 import InfoTooltip from "./InfoTooltip";
 import ScheduledTriggerWidget from "./ScheduledTriggerWidget";
 import TelegramBridgeWidget from "./TelegramBridgeWidget";
+import DiscordBridgeWidget from "./DiscordBridgeWidget";
 import LoopGuardWidget from "./LoopGuardWidget";
 import ProjectHistoryWidget from "./ProjectHistoryWidget";
 import AgentModelsWidget from "./AgentModelsWidget";
@@ -55,6 +56,7 @@ export default function OperatorFeaturesPanel({ projectId }: { projectId: string
         <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto flex flex-col gap-2">
           <AgentModelsWidget projectId={projectId} />
           <TelegramBridgeWidget projectId={projectId} />
+          <DiscordBridgeWidget projectId={projectId} />
           <LoopGuardWidget projectId={projectId} />
           <ProjectHistoryWidget projectId={projectId} />
         </div>
