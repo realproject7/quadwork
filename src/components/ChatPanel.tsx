@@ -2,7 +2,6 @@
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import ProjectChatEmptyState from "./ProjectChatEmptyState";
-import { playNotificationSound } from "../lib/notificationSound";
 
 interface Message {
   id: number;
@@ -192,22 +191,6 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
   // #397 / quadwork#262: tracks the message the next send will be a
   // threaded reply to. Cleared after a successful send or on cancel.
   const [replyTo, setReplyTo] = useState<{ id: number; sender: string } | null>(null);
-  // #409 / quadwork#273 + #405 / quadwork#278: track the operator's
-  // configured display name so the notification-sound filter
-  // suppresses self-messages even when the operator renamed
-  // themselves (e.g. operator_name = "alice"). Held in a ref so the
-  // hot poll path doesn't need a dep on the state value.
-  const operatorNameRef = useRef<string>("user");
-  useEffect(() => {
-    fetch("/api/config")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((cfg) => {
-        if (cfg && typeof cfg.operator_name === "string" && cfg.operator_name) {
-          operatorNameRef.current = cfg.operator_name;
-        }
-      })
-      .catch(() => {});
-  }, []);
   const cursorRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -243,25 +226,6 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
         setAuthError(null);
         const msgs: Message[] = Array.isArray(data) ? data : data.messages || [];
         if (msgs.length > 0) {
-          // #409 / quadwork#273: ding on incoming agent chat. Skip
-          // the operator's own messages, skip system/join/leave
-          // events, and only fire after the first poll has populated
-          // the cursor so the initial backfill doesn't dump a chord
-          // of historical pings. Detected here (outside the
-          // setMessages updater) so React strict mode's double-invoke
-          // can't double-fire the audio.
-          const previousCursor = cursorRef.current;
-          const opName = operatorNameRef.current;
-          const newAgentMessage =
-            previousCursor > 0 &&
-            msgs.some(
-              (m) =>
-                m.id > previousCursor &&
-                (m.type === undefined || m.type === "chat") &&
-                m.sender !== "user" &&
-                m.sender !== opName &&
-                m.sender !== "system",
-            );
           setMessages((prev) => {
             const existingIds = new Set(prev.map((m) => m.id));
             const newMsgs = msgs.filter((m) => !existingIds.has(m.id));
@@ -269,7 +233,6 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
           });
           const maxId = Math.max(...msgs.map((m) => m.id));
           if (maxId > cursorRef.current) cursorRef.current = maxId;
-          if (newAgentMessage) playNotificationSound();
         }
       })
       .catch(() => {});

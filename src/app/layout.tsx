@@ -3,6 +3,7 @@ import { Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Sidebar from "@/components/Sidebar";
 import TopHeader from "@/components/TopHeader";
+import GlobalNotificationListener from "@/components/GlobalNotificationListener";
 
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
@@ -22,6 +23,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${geistMono.variable} h-full`}>
       <body className="h-full flex flex-col">
+        <GlobalNotificationListener />
         <TopHeader />
         <div className="flex flex-1 min-h-0">
           <Sidebar />
