@@ -119,7 +119,10 @@ export default function DiscordSetupModal({ open, initialChannelId = "", onClose
                   <li><code className="bg-white/5 px-1 rounded text-[11px]">View Channels</code></li>
                 </ul>
               </li>
-              <li>Copy the generated URL at the bottom.</li>
+              <li>
+                Copy the generated URL at the bottom. It will look like:
+                <pre className="mt-1 p-2 bg-white/5 rounded text-[11px] text-neutral-200 overflow-auto">https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&amp;permissions=66560&amp;scope=bot</pre>
+              </li>
               <li>Open it in your browser &rarr; select your Discord server &rarr; <b>Authorize</b>.</li>
             </ol>
           </section>
