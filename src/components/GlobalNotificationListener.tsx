@@ -27,17 +27,35 @@ export default function GlobalNotificationListener() {
   // Whether initial config has loaded (skip polling until we know projects).
   const readyRef = useRef(false);
 
-  // Fetch config once to populate project list + operator name.
+  // Fetch config once to populate project list + operator name, then
+  // seed per-project cursors so the first genuinely new message chimes
+  // instead of being swallowed by the "initial backfill" guard.
   useEffect(() => {
     fetch("/api/config")
       .then((r) => (r.ok ? r.json() : null))
-      .then((cfg) => {
+      .then(async (cfg) => {
         if (!cfg) return;
         if (typeof cfg.operator_name === "string" && cfg.operator_name) {
           operatorNameRef.current = cfg.operator_name;
         }
         const projects: Project[] = cfg.projects || [];
         projectsRef.current = projects;
+        // Seed cursors: fetch current max message id per project so
+        // the polling loop treats everything already present as "seen".
+        await Promise.all(
+          projects.map((p) =>
+            fetch(`/api/chat?path=/api/messages&channel=general&cursor=0&project=${encodeURIComponent(p.id)}`)
+              .then((r) => (r.ok ? r.json() : null))
+              .then((data) => {
+                if (!data) return;
+                const msgs: { id: number }[] = Array.isArray(data) ? data : data.messages || [];
+                if (msgs.length > 0) {
+                  cursorsRef.current[p.id] = Math.max(...msgs.map((m) => m.id));
+                }
+              })
+              .catch(() => {}),
+          ),
+        );
         readyRef.current = true;
       })
       .catch(() => {});
@@ -61,10 +79,6 @@ export default function GlobalNotificationListener() {
           const prevCursor = cursorsRef.current[project.id] ?? 0;
           const maxId = Math.max(...msgs.map((m) => m.id));
           if (maxId > prevCursor) cursorsRef.current[project.id] = maxId;
-
-          // Only fire after the first poll has seeded the cursor so the
-          // initial backfill doesn't produce a burst of chimes.
-          if (prevCursor === 0) return;
 
           const opName = operatorNameRef.current;
           const hasNewAgentMessage = msgs.some(
