@@ -891,6 +891,17 @@ async function handleAgentChattr(req, res) {
     if (proc.state === "running" && proc.process) {
       return res.json({ ok: true, state: "running", message: "Already running" });
     }
+    // #401: validate AgentChattr is installed BEFORE killing anything on
+    // the port. Without this guard, clicking Start when AC is missing
+    // kills an unrelated process then fails with "not installed".
+    const { dir: acDir } = resolveProjectChattr(projectId);
+    const acSpawn = resolveChattrSpawn(acDir);
+    if (!acSpawn) {
+      const errMsg = `AgentChattr not installed. Clone it: git clone https://github.com/bcurts/agentchattr.git ${acDir}`;
+      setProc({ process: null, state: "error", error: errMsg });
+      return res.status(500).json({ ok: false, state: "error", error: errMsg });
+    }
+
     // #393: kill any orphaned process on the port before spawning
     // (same pattern as restart/stop from #386).
     killProcessOnPort(chattrPort);
