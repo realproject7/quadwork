@@ -7,6 +7,16 @@ interface ScheduledTriggerWidgetProps {
   projectId: string;
 }
 
+// #408: batch progress shape from /api/batch-progress
+interface BatchState {
+  complete: boolean;
+  items: { issue_number: number; status: string }[];
+  batch_number: number | null;
+}
+
+// How often the auto-trigger polls batch progress (same as BatchProgressPanel).
+const AUTO_TRIGGER_POLL_MS = 30_000;
+
 interface TriggerInfo {
   enabled: boolean;
   interval: number;  // ms (active timer interval, 0 when idle-with-saved-state)
@@ -112,6 +122,36 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   const [countdown, setCountdown] = useState("");
   const [expiresCountdown, setExpiresCountdown] = useState("");
   const initialMessage = useMemo(() => defaultMessage(projectId), [projectId]);
+  // #408: auto-trigger state
+  const [autoTrigger, setAutoTrigger] = useState(false);
+  const [autoTriggered, setAutoTriggered] = useState(false); // true when current run was auto-started
+  const [autoStatus, setAutoStatus] = useState<string | null>(null); // flash message
+  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
+
+  // #408: load auto-trigger setting from project config on mount.
+  // Reset refs on projectId change to avoid stale state across projects.
+  const autoTriggerLoadedRef = useRef(false);
+  useEffect(() => {
+    autoTriggerLoadedRef.current = false;
+    prevBatchRef.current = null;
+    setAutoTrigger(false);
+    setAutoTriggered(false);
+    setAutoStatus(null);
+  }, [projectId]);
+  useEffect(() => {
+    if (autoTriggerLoadedRef.current) return;
+    fetch("/api/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg) => {
+        if (!cfg) return;
+        const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+        if (entry?.trigger_auto) {
+          setAutoTrigger(true);
+        }
+        autoTriggerLoadedRef.current = true;
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   const load = useCallback(async () => {
     try {
@@ -228,6 +268,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
     try {
       const r = await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
       if (!r.ok) throw new Error(`${r.status}`);
+      setAutoTriggered(false);
       setTrigger({
         ...(trigger || {
           interval: 0,
@@ -245,6 +286,104 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
     finally { setBusy(false); }
   };
 
+  // #408: persist auto-trigger toggle to project config
+  const toggleAutoTrigger = useCallback(async () => {
+    const next = !autoTrigger;
+    setAutoTrigger(next);
+    if (!next) {
+      setAutoStatus(null);
+      prevBatchRef.current = null;
+    }
+    try {
+      const r = await fetch("/api/config");
+      if (!r.ok) return;
+      const cfg = await r.json();
+      const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+      if (entry) {
+        entry.trigger_auto = next;
+        await fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cfg),
+        });
+      }
+    } catch { /* non-fatal */ }
+  }, [autoTrigger, projectId]);
+
+  // #408: auto-trigger batch lifecycle polling.
+  // When autoTrigger is ON, polls /api/batch-progress every 30s to
+  // detect batch start/complete transitions.
+  const autoTriggerRef = useRef(autoTrigger);
+  const triggerRef = useRef(trigger);
+  useEffect(() => { autoTriggerRef.current = autoTrigger; }, [autoTrigger]);
+  useEffect(() => { triggerRef.current = trigger; }, [trigger]);
+
+  const checkBatchLifecycle = useCallback(async () => {
+    if (!autoTriggerRef.current) return;
+    try {
+      const r = await fetch(`/api/batch-progress?project=${encodeURIComponent(projectId)}`);
+      if (!r.ok) return;
+      const data: BatchState = await r.json();
+      const hasItems = data.items.length > 0;
+      const prev = prevBatchRef.current;
+      prevBatchRef.current = { complete: data.complete, hasItems };
+
+      if (!prev) {
+        // First poll — if there's an active non-complete batch, auto-start
+        if (hasItems && !data.complete && !triggerRef.current?.enabled) {
+          setAutoTriggered(true);
+          setAutoStatus(null);
+          // Use the start endpoint directly with current field values
+          const draftRaw = parseFloat(durationHoursDraft);
+          const resolvedHours = Number.isFinite(draftRaw) ? clampHours(draftRaw) : DURATION_HOURS_DEFAULT;
+          const resolvedDurationMin = Math.round(resolvedHours * 60);
+          const intervalRaw = parseInt(intervalDraft, 10);
+          const resolvedIntervalMin = Number.isFinite(intervalRaw) ? Math.max(1, Math.min(1440, intervalRaw)) : 15;
+          await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ interval: resolvedIntervalMin, duration: resolvedDurationMin, message: messageRef.current || initialMessage }),
+          });
+          await load();
+        }
+        return;
+      }
+
+      // Batch just completed → auto-stop
+      if (hasItems && data.complete && !prev.complete && triggerRef.current?.enabled) {
+        await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
+        setAutoTriggered(false);
+        setAutoStatus("Batch complete — trigger paused. Waiting for next batch.");
+        await load();
+        return;
+      }
+
+      // New batch started (complete→active, or empty→active) → auto-start
+      if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !triggerRef.current?.enabled) {
+        setAutoTriggered(true);
+        setAutoStatus(null);
+        const draftRaw = parseFloat(durationHoursDraft);
+        const resolvedHours = Number.isFinite(draftRaw) ? clampHours(draftRaw) : DURATION_HOURS_DEFAULT;
+        const resolvedDurationMin = Math.round(resolvedHours * 60);
+        const intervalRaw = parseInt(intervalDraft, 10);
+        const resolvedIntervalMin = Number.isFinite(intervalRaw) ? Math.max(1, Math.min(1440, intervalRaw)) : 15;
+        await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ interval: resolvedIntervalMin, duration: resolvedDurationMin, message: messageRef.current || initialMessage }),
+        });
+        await load();
+      }
+    } catch { /* non-fatal */ }
+  }, [projectId, durationHoursDraft, intervalDraft, initialMessage, load]);
+
+  useEffect(() => {
+    if (!autoTrigger) return;
+    checkBatchLifecycle();
+    const id = window.setInterval(checkBatchLifecycle, AUTO_TRIGGER_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [autoTrigger, checkBatchLifecycle]);
+
   const running = !!trigger?.enabled;
 
   return (
@@ -252,14 +391,35 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
         <div className="flex items-center gap-1.5">
           <span className="text-[11px] text-text-muted uppercase tracking-wider">
-            Scheduled Trigger{running ? " (running)" : ""}
+            Scheduled Trigger{running ? (autoTriggered ? " (auto)" : " (running)") : ""}
           </span>
           <InfoTooltip>
             <b>Scheduled Trigger</b> sends a periodic message to all agents on a timer. Use this to keep the autonomous workflow running overnight. First message fires after the configured interval, not immediately.
           </InfoTooltip>
         </div>
-        {error && <span className="text-[10px] text-error">err: {error}</span>}
+        <div className="flex items-center gap-2">
+          {error && <span className="text-[10px] text-error">err: {error}</span>}
+          {/* #408: Auto-Trigger toggle */}
+          <button
+            type="button"
+            onClick={toggleAutoTrigger}
+            title={autoTrigger ? "Auto-trigger ON — trigger follows batch lifecycle" : "Auto-trigger OFF — manual start/stop only"}
+            className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
+              autoTrigger
+                ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+                : "border-border text-text-muted hover:text-text hover:border-accent"
+            }`}
+          >
+            Auto {autoTrigger ? "●" : "○"}
+          </button>
+        </div>
       </div>
+      {/* #408: auto-trigger status flash */}
+      {autoStatus && (
+        <div className="px-3 py-1 text-[10px] text-accent bg-accent/5 border-b border-border/50">
+          {autoStatus}
+        </div>
+      )}
 
       {!running ? (
         <div className="p-3 flex flex-col gap-2">
