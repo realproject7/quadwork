@@ -292,9 +292,9 @@ Step 5/5: Optional Add-ons
 | What | Details |
 |------|---------|
 | **AgentChattr** | Installs if missing, writes `config.toml`, starts server |
-| **Agent worktrees** | Creates 4 git worktrees (`head/`, `reviewer1/`, `reviewer2/`, `dev/`) |
-| **Seed files** | Copies default `AGENTS.md` per agent (Head=coordinator, Reviewer1/Reviewer2=reviewer, Dev=builder) |
-| **Workflow rules** | Writes default `CLAUDE.md` with the Head→Dev→Reviewer1/Reviewer2→Head protocol |
+| **Agent worktrees** | Creates 4 git worktrees (`head/`, `re1/`, `re2/`, `dev/`) |
+| **Seed files** | Copies default `AGENTS.md` per agent (Head=coordinator, RE1/RE2=reviewer, Dev=builder) |
+| **Workflow rules** | Writes default `CLAUDE.md` with the Head→Dev→RE1/RE2→Head protocol |
 | **wrapper.py** | Copies agent launcher with auto-trigger and REMINDER injection |
 | **GitHub** | Configures branch protection (require 1 approval on `main`) |
 | **Telegram** | (Optional) Installs bridge, writes bot config, starts daemon |

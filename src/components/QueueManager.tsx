@@ -54,7 +54,7 @@ function generateTemplate(issues: Issue[], repo: string): string {
   lines.push("## Rules");
   lines.push("");
   lines.push("1. Assign ONE ticket at a time to @dev");
-  lines.push("2. Wait for @reviewer1 AND @reviewer2 to both approve before merging");
+  lines.push("2. Wait for @re1 AND @re2 to both approve before merging");
   lines.push("3. After merge, immediately assign the next ticket");
   lines.push("4. PR titles: [#<issue>] Short description");
   lines.push("5. Branch naming: task/<issue-number>-<slug>");

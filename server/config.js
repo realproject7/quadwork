@@ -25,11 +25,13 @@ const DEFAULT_CONFIG = {
 const RESERVED_OPERATOR_NAMES = new Set([
   "head",
   "dev",
-  "reviewer1",
-  "reviewer2",
+  "re1",
+  "re2",
   // Legacy agent aliases — preserved in routing logic in a few
   // places, so block them too even though new projects no longer
   // register under these names.
+  "reviewer1",
+  "reviewer2",
   "t1",
   "t2a",
   "t2b",
@@ -54,7 +56,7 @@ function sanitizeOperatorName(value) {
 }
 
 // Migration: rename old agent keys to new ones
-const AGENT_KEY_MAP = { t1: "head", t2a: "reviewer1", t2b: "reviewer2", t3: "dev" };
+const AGENT_KEY_MAP = { t1: "head", t2a: "re1", t2b: "re2", t3: "dev", reviewer1: "re1", reviewer2: "re2" };
 
 function migrateAgentKeys(config) {
   let changed = false;

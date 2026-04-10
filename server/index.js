@@ -355,7 +355,7 @@ async function buildAgentArgs(projectId, agentId) {
       // #242: best-effort deregister any stale registration of the
       // canonical name (left over by a crashed previous QuadWork
       // session) so the fresh register lands at slot 1 instead of
-      // head-2 / reviewer2-2. We need the previous agent's bearer
+      // head-2 / re2-2. We need the previous agent's bearer
       // token because app.py:2123 requires authenticated agent
       // session for family names — load it from disk (persisted
       // across restarts). Failures are non-fatal.
@@ -1209,10 +1209,10 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
 
 const triggers = new Map();
 
-const DEFAULT_MESSAGE = `@head @reviewer1 @reviewer2 @dev — Queue check.
+const DEFAULT_MESSAGE = `@head @re1 @re2 @dev — Queue check.
 Head: Merge any PR with both approvals, assign next from queue.
 Dev: Work on assigned ticket or address review feedback.
-Reviewer1/Reviewer2: Review open PRs. If Dev pushed fixes, re-review. Post verdict on PR AND notify here.
+RE1/RE2: Review open PRs. If Dev pushed fixes, re-review. Post verdict on PR AND notify here.
 ALL: Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
 
 async function sendTriggerMessage(projectId) {

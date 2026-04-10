@@ -38,7 +38,7 @@ const POLL_INTERVAL_MS = 1000;
  * site below: customPrompt > jobId > channel.
  *
  * agentName is expected to be the registered agent slug such as
- * `dev`, `head`, `reviewer1`, `reviewer2`. The helper does not
+ * `dev`, `head`, `re1`, `re2`. The helper does not
  * validate — upstream already controls who may register.
  */
 function buildInjectionPrompt(agentName, { channel, jobId, customPrompt } = {}) {

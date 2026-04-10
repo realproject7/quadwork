@@ -77,7 +77,7 @@ registerAgent.lastError = null;
  * shut down). Returns true on a 2xx response, false otherwise.
  *
  * AgentChattr's /api/deregister/{name} requires the agent's own bearer
- * token for "family" names (head/dev/reviewer1/reviewer2) — see
+ * token for "family" names (head/dev/re1/re2) — see
  * app.py:2123-2135. The token is looked up automatically from the cache
  * populated by registerAgent; an explicit token may be passed as a third
  * argument to override (e.g. recovering a session).

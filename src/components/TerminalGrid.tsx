@@ -24,12 +24,12 @@ interface TerminalGridProps {
 }
 
 const DEFAULT_AGENTS: Agent[] = [
-  { id: "reviewer1", label: "Reviewer1" },
-  { id: "reviewer2", label: "Reviewer2" },
+  { id: "re1", label: "RE1" },
+  { id: "re2", label: "RE2" },
   { id: "dev", label: "Dev" },
 ];
 
-// Border classes per tile. 3-agent legacy layout (reviewer1/reviewer2/dev)
+// Border classes per tile. 3-agent legacy layout (re1/re2/dev)
 // has a full-width bottom tile; the 4-agent layout used by the new
 // #208 top-right quadrant has all four tiles in a 2x2 grid.
 const GRID_CLASSES_3 = [

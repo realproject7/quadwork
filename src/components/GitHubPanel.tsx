@@ -229,10 +229,10 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
               const agentStatus: Record<string, string> = {};
               for (const r of reviews) {
                 const body = (r.body || "").trim();
-                if (/^(?:Reviewer2|T2b)\b/i.test(body)) {
-                  agentStatus["reviewer2"] = r.state;
-                } else if (/^(?:Reviewer1|T2a)\b/i.test(body) || /^##\s*Verdict/i.test(body)) {
-                  agentStatus["reviewer1"] = r.state;
+                if (/^(?:RE2|Reviewer2|T2b)\b/i.test(body)) {
+                  agentStatus["re2"] = r.state;
+                } else if (/^(?:RE1|Reviewer1|T2a)\b/i.test(body) || /^##\s*Verdict/i.test(body)) {
+                  agentStatus["re1"] = r.state;
                 }
               }
 
@@ -252,7 +252,7 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
                       {pr.assignees[0].login}
                     </span>
                   )}
-                  {["reviewer1", "reviewer2"].map((agent) => {
+                  {["re1", "re2"].map((agent) => {
                     const state = agentStatus[agent];
                     return (
                       <span

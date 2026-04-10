@@ -39,8 +39,8 @@ const BACKENDS: { value: string; label: string }[] = [
 
 const AGENTS = [
   { key: "head", label: "T1 — Head", role: "Owner / Final Guard", desc: "Merges PRs, makes final calls" },
-  { key: "reviewer1", label: "T2a — Reviewer 1", role: "Design Reviewer", desc: "Reviews architecture & design" },
-  { key: "reviewer2", label: "T2b — Reviewer 2", role: "Code Reviewer", desc: "Reviews implementation quality" },
+  { key: "re1", label: "RE1 — Reviewer 1", role: "Design Reviewer", desc: "Reviews architecture & design" },
+  { key: "re2", label: "RE2 — Reviewer 2", role: "Code Reviewer", desc: "Reviews implementation quality" },
   { key: "dev", label: "T3 — Developer", role: "Full-Stack Builder", desc: "Implements features & fixes" },
 ];
 
@@ -128,8 +128,8 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
         <p className="text-accent">{slug}/              &larr; your repo</p>
         <p>{slug}-head/         &larr; Head agent</p>
         <p>{slug}-dev/          &larr; Dev agent</p>
-        <p>{slug}-reviewer1/    &larr; Reviewer1</p>
-        <p>{slug}-reviewer2/    &larr; Reviewer2</p>
+        <p>{slug}-re1/          &larr; RE1</p>
+        <p>{slug}-re2/          &larr; RE2</p>
       </div>
     </div>
   );
@@ -150,7 +150,7 @@ export default function SetupWizard() {
   const [ghUser, setGhUser] = useState("");
   const [enableProtection, setEnableProtection] = useState(false);
   const [backends, setBackends] = useState<Record<string, string>>({
-    head: "claude", reviewer1: "claude", reviewer2: "claude", dev: "claude",
+    head: "claude", re1: "claude", re2: "claude", dev: "claude",
   });
   const [autoApprove, setAutoApprove] = useState(true);
   const [showReviewerCreds, setShowReviewerCreds] = useState(false);
@@ -190,10 +190,10 @@ export default function SetupWizard() {
           : !status.claude && status.codex ? "codex"
           : null;
         if (availableCli) {
-          setBackends({ head: availableCli, reviewer1: availableCli, reviewer2: availableCli, dev: availableCli });
+          setBackends({ head: availableCli, re1: availableCli, re2: availableCli, dev: availableCli });
         } else if (status.claude && status.codex) {
           // Both available — use mixed defaults for review diversity
-          setBackends({ head: "codex", dev: "claude", reviewer1: "codex", reviewer2: "claude" });
+          setBackends({ head: "codex", dev: "claude", re1: "codex", re2: "claude" });
         }
       })
       .catch(() => {});

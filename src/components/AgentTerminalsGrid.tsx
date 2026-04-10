@@ -4,23 +4,23 @@ import { useState } from "react";
 import TerminalGrid from "./TerminalGrid";
 
 // #208: the top-right quadrant must show all four agents
-// (Head, Reviewer1, Reviewer2, Dev) as a 2x2 grid. TerminalGrid's
-// default agent list only has three entries (Reviewer1, Reviewer2,
+// (Head, RE1, RE2, Dev) as a 2x2 grid. TerminalGrid's
+// default agent list only has three entries (RE1, RE2,
 // Dev) because it used to live alongside a dedicated Head panel —
 // pass the full four-agent list explicitly so Head doesn't get
 // dropped when the old Head panel was removed.
 //
 // #400 / quadwork#265: layout order is Head TL, Dev TR,
-// Reviewer1 BL, Reviewer2 BR. TerminalGrid renders tiles in array
+// RE1 BL, RE2 BR. TerminalGrid renders tiles in array
 // order into a 2x2 row-flow grid (default `grid grid-rows-2
-// grid-cols-2`, no `grid-flow-col`), so [head, dev, reviewer1,
-// reviewer2] maps to TL, TR, BL, BR. Keep them in sync if you
+// grid-cols-2`, no `grid-flow-col`), so [head, dev, re1,
+// re2] maps to TL, TR, BL, BR. Keep them in sync if you
 // reorder this list.
 const FOUR_AGENTS = [
   { id: "head", label: "Head" },
   { id: "dev", label: "Dev" },
-  { id: "reviewer1", label: "Reviewer1" },
-  { id: "reviewer2", label: "Reviewer2" },
+  { id: "re1", label: "RE1" },
+  { id: "re2", label: "RE2" },
 ];
 
 type AgentState = "running" | "stopped" | "error";

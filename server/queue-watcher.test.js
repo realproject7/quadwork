@@ -6,7 +6,7 @@
 const assert = require("node:assert/strict");
 const { buildInjectionPrompt } = require("./queue-watcher");
 
-const DEFAULT_AGENT_SLUGS = ["dev", "head", "reviewer1", "reviewer2"];
+const DEFAULT_AGENT_SLUGS = ["dev", "head", "re1", "re2"];
 
 // 1) Channel prompt — each of the 4 default slugs must:
 //    - name the agent with @<slug>
@@ -56,8 +56,8 @@ for (const slug of DEFAULT_AGENT_SLUGS) {
 
 // 6) Blank customPrompt is ignored (falls through to channel/job path).
 {
-  const p = buildInjectionPrompt("reviewer2", { customPrompt: "   ", channel: "general" });
-  assert.match(p, /You are @reviewer2 /);
+  const p = buildInjectionPrompt("re2", { customPrompt: "   ", channel: "general" });
+  assert.match(p, /You are @re2 /);
   assert.match(p, /#general/);
 }
 

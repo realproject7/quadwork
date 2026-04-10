@@ -17,25 +17,25 @@ data_dir = "./data"
 command = "codex"
 cwd = "{{head_cwd}}"
 color = "#10a37f"
-label = "Head Owner"
+label = "Lead"
 
-[agents.reviewer1]
+[agents.re1]
 command = "codex"
-cwd = "{{reviewer1_cwd}}"
+cwd = "{{re1_cwd}}"
 color = "#22c55e"
-label = "Reviewer1 Reviewer"
+label = "Reviewer 1"
 
-[agents.reviewer2]
+[agents.re2]
 command = "claude"
-cwd = "{{reviewer2_cwd}}"
+cwd = "{{re2_cwd}}"
 color = "#f59e0b"
-label = "Reviewer2 Reviewer"
+label = "Reviewer 2"
 
 [agents.dev]
 command = "claude"
 cwd = "{{dev_cwd}}"
 color = "#da7756"
-label = "Dev Builder"
+label = "Builder"
 
 # #383: AC's registry rejects bases not declared in config.toml.
 # The Telegram bridge registers as `telegram-bridge`, so every

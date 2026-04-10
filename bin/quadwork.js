@@ -11,7 +11,7 @@ const readline = require("readline");
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
-const AGENTS = ["head", "reviewer1", "reviewer2", "dev"];
+const AGENTS = ["head", "re1", "re2", "dev"];
 const DEFAULT_AGENTCHATTR_DIR = path.join(CONFIG_DIR, "agentchattr");
 const AGENTCHATTR_REPO = "https://github.com/bcurts/agentchattr.git";
 // #348: pinned AgentChattr commit shipped with this QuadWork
@@ -376,7 +376,7 @@ function askYN(rl, question, defaultYes = false) {
 }
 
 // Migration: rename old agent keys to new ones
-const AGENT_KEY_MAP = { t1: "head", t2a: "reviewer1", t2b: "reviewer2", t3: "dev" };
+const AGENT_KEY_MAP = { t1: "head", t2a: "re1", t2b: "re2", t3: "dev", reviewer1: "re1", reviewer2: "re2" };
 
 function migrateAgentKeys(config) {
   let changed = false;
@@ -839,7 +839,7 @@ async function setupAgents(rl, repo) {
   const backend = defaultBackend;
 
   log("Path to your local clone of the repo. Four worktrees will be created next to it");
-  log("(e.g., project-head/, project-reviewer1/, project-reviewer2/, project-dev/).");
+  log("(e.g., project-head/, project-re1/, project-re2/, project-dev/).");
   const projectDir = await ask(rl, "Project directory", process.cwd());
   const absDir = path.resolve(projectDir);
 
@@ -855,12 +855,12 @@ async function setupAgents(rl, repo) {
   }
 
   // Prompt for reviewer credentials (optional)
-  log("A separate reviewer account lets Reviewer1/Reviewer2 approve PRs independently. You can set this up later in Settings.");
-  const wantReviewer = await askYN(rl, "Use a separate GitHub account for reviewers (Reviewer1/Reviewer2)?", false);
+  log("A separate reviewer account lets RE1/RE2 approve PRs independently. You can set this up later in Settings.");
+  const wantReviewer = await askYN(rl, "Use a separate GitHub account for reviewers (RE1/RE2)?", false);
   let reviewerUser = "";
   let reviewerTokenPath = "";
   if (wantReviewer) {
-    log("GitHub username for the reviewer account (used in Reviewer1/Reviewer2 seed files for PR reviews).");
+    log("GitHub username for the reviewer account (used in RE1/RE2 seed files for PR reviews).");
     reviewerUser = await ask(rl, "Reviewer GitHub username", "");
     log("Path to a file containing a GitHub PAT for the reviewer account.");
     reviewerTokenPath = await ask(rl, "Reviewer token file path", path.join(os.homedir(), ".quadwork", "reviewer-token"));
@@ -2016,6 +2016,131 @@ function cmdDoctor() {
   console.log("");
 }
 
+// ─── Migrate Agent Slugs ────────────────────────────────────────────────────
+
+/**
+ * One-shot migration: rename reviewer1/reviewer2 → re1/re2 in
+ * ~/.quadwork/config.json and per-project AgentChattr config.toml files.
+ * Idempotent — skips projects that already use the new slugs.
+ *
+ * Does NOT rename worktree directories; instead adds a worktree_suffix
+ * field so re1 maps to the existing project-reviewer1 dir for legacy
+ * projects. New projects created after this version will use re1/re2
+ * directory names directly.
+ *
+ * Does NOT rewrite chat history — old messages keep their original sender.
+ */
+async function cmdMigrateAgentSlugs() {
+  header("Migrate Agent Slugs (reviewer1/reviewer2 → re1/re2)");
+
+  const config = readConfig();
+  if (!config.projects || config.projects.length === 0) {
+    warn("No projects found in config. Nothing to migrate.");
+    return;
+  }
+
+  const SLUG_MAP = { reviewer1: "re1", reviewer2: "re2" };
+  const LABEL_MAP = { head: "Lead", dev: "Builder", re1: "Reviewer 1", re2: "Reviewer 2" };
+
+  let totalChanged = 0;
+
+  for (const project of config.projects) {
+    const changes = [];
+    if (!project.agents) continue;
+
+    // 1. Rename agent keys in config.json
+    for (const [oldKey, newKey] of Object.entries(SLUG_MAP)) {
+      if (project.agents[oldKey] && !project.agents[newKey]) {
+        project.agents[newKey] = { ...project.agents[oldKey] };
+        delete project.agents[oldKey];
+        changes.push(`  agents.${oldKey} → agents.${newKey}`);
+      }
+    }
+
+    // 2. Add labels to all agents
+    for (const [agentId, label] of Object.entries(LABEL_MAP)) {
+      if (project.agents[agentId] && !project.agents[agentId].label) {
+        project.agents[agentId].label = label;
+        changes.push(`  agents.${agentId}.label = "${label}"`);
+      }
+    }
+
+    // 3. Add worktree_suffix for legacy worktree dirs
+    for (const [oldKey, newKey] of Object.entries(SLUG_MAP)) {
+      if (project.agents[newKey] && !project.agents[newKey].worktree_suffix) {
+        // Check if the worktree dir uses the old naming convention
+        const cwd = project.agents[newKey].cwd || "";
+        if (cwd.includes(`-${oldKey}`)) {
+          project.agents[newKey].worktree_suffix = oldKey;
+          changes.push(`  agents.${newKey}.worktree_suffix = "${oldKey}"`);
+        }
+      }
+    }
+
+    // 4. Rewrite per-project AgentChattr config.toml
+    const tomlPath = project.agentchattr_dir
+      ? path.join(project.agentchattr_dir, "config.toml")
+      : path.join(CONFIG_DIR, project.id, "agentchattr", "config.toml");
+    if (fs.existsSync(tomlPath)) {
+      let toml = fs.readFileSync(tomlPath, "utf-8");
+      let tomlChanged = false;
+      if (toml.includes("[agents.reviewer1]")) {
+        toml = toml.replace(/\[agents\.reviewer1\]/g, "[agents.re1]");
+        tomlChanged = true;
+      }
+      if (toml.includes("[agents.reviewer2]")) {
+        toml = toml.replace(/\[agents\.reviewer2\]/g, "[agents.re2]");
+        tomlChanged = true;
+      }
+      // Add label lines if missing
+      for (const [slug, label] of Object.entries(LABEL_MAP)) {
+        const sectionRe = new RegExp(`(\\[agents\\.${slug}\\][^\\[]*?)(?=\\n\\[|$)`, "s");
+        const match = toml.match(sectionRe);
+        if (match && !match[1].includes("label =")) {
+          toml = toml.replace(sectionRe, `$1label = "${label}"\n`);
+          tomlChanged = true;
+        }
+      }
+      if (tomlChanged) {
+        fs.writeFileSync(tomlPath, toml);
+        changes.push(`  config.toml rewritten: ${tomlPath}`);
+      }
+    }
+
+    // 5. Rename queue files (reviewer1_queue.jsonl → re1_queue.jsonl)
+    const dataDir = project.agentchattr_dir
+      ? path.join(project.agentchattr_dir, "data")
+      : null;
+    if (dataDir && fs.existsSync(dataDir)) {
+      for (const [oldKey, newKey] of Object.entries(SLUG_MAP)) {
+        const oldQf = path.join(dataDir, `${oldKey}_queue.jsonl`);
+        const newQf = path.join(dataDir, `${newKey}_queue.jsonl`);
+        if (fs.existsSync(oldQf) && !fs.existsSync(newQf)) {
+          fs.renameSync(oldQf, newQf);
+          changes.push(`  queue file: ${oldKey}_queue.jsonl → ${newKey}_queue.jsonl`);
+        }
+      }
+    }
+
+    if (changes.length > 0) {
+      ok(`Project "${project.id}" — ${changes.length} change(s):`);
+      for (const c of changes) log(c);
+      totalChanged++;
+    } else {
+      log(`Project "${project.id}" — already migrated, skipping.`);
+    }
+  }
+
+  // Write updated config
+  writeConfig(config);
+  ok(`Config saved. ${totalChanged} project(s) migrated.`);
+  log("");
+  log("Next steps:");
+  log("  1. Run 'npx quadwork start' to restart with the new slugs");
+  log("  2. AgentChattr will pick up the renamed config.toml sections");
+  log("  3. Old chat messages keep their original sender — no history rewrite");
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 const command = process.argv[2];
@@ -2039,6 +2164,9 @@ switch (command) {
   case "doctor":
     cmdDoctor();
     break;
+  case "migrate-agent-slugs":
+    cmdMigrateAgentSlugs();
+    break;
   default:
     console.log(`
   Usage: quadwork <command>
@@ -2050,6 +2178,7 @@ switch (command) {
     add-project   Add a project via CLI (alternative to web UI /setup)
     cleanup       Reclaim disk space (--project <id> or --legacy)
     doctor        Report the AgentChattr pin + per-project clone SHAs
+    migrate-agent-slugs  Rename reviewer1/reviewer2 → re1/re2 in existing projects
 
   Workflow:
     1. npx quadwork init     — one-time global setup, opens dashboard

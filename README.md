@@ -187,8 +187,8 @@ project queue lives at `~/.quadwork/{project_id}/OVERNIGHT-QUEUE.md`.
       "agents": {
         "head":      { "cwd": "/path/to/project-head",      "command": "codex"  },
         "dev":       { "cwd": "/path/to/project-dev",       "command": "claude" },
-        "reviewer1": { "cwd": "/path/to/project-reviewer1", "command": "codex"  },
-        "reviewer2": { "cwd": "/path/to/project-reviewer2", "command": "claude" }
+        "re1":       { "cwd": "/path/to/project-re1",       "command": "codex"  },
+        "re2":       { "cwd": "/path/to/project-re2",       "command": "claude" }
       }
     }
   ]
@@ -207,7 +207,7 @@ QuadWork runs as a single Express server on `127.0.0.1:8400`:
 
 Per-project AgentChattr clones live at `~/.quadwork/{project}/agentchattr/`,
 each with their own ports. Per-project git worktrees sit next to the repo:
-`{repo}-head`, `{repo}-dev`, `{repo}-reviewer1`, `{repo}-reviewer2`. The
+`{repo}-head`, `{repo}-dev`, `{repo}-re1`, `{repo}-re2`. The
 dashboard's xterm.js tiles attach to node-pty sessions over a WebSocket;
 nothing about the agent state is held client-side.
 

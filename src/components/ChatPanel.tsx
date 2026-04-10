@@ -14,14 +14,14 @@ interface Message {
 
 const SENDER_COLORS: Record<string, string> = {
   head: "#00ff88",
-  reviewer1: "#4488ff",
-  reviewer2: "#cc44ff",
+  re1: "#4488ff",
+  re2: "#cc44ff",
   dev: "#ffcc00",
   user: "#e0e0e0",
   system: "#737373",
 };
 
-const AGENTS = ["head", "reviewer1", "reviewer2", "dev", "user"];
+const AGENTS = ["head", "re1", "re2", "dev", "user"];
 
 // #410 / quadwork#276: slash commands recognized by AgentChattr's
 // native UI (mirrors agentchattr/static/chat.js lines 1978-1989).
@@ -42,14 +42,12 @@ function senderColor(sender: string): string {
   return SENDER_COLORS[sender.toLowerCase()] || "#e0e0e0";
 }
 
-// #398 / quadwork#263: shorten reviewer names in the chat sender
-// column only — the underlying agent IDs (`reviewer1`, `reviewer2`)
-// must stay unchanged everywhere else (registration, MCP, queue,
-// terminal headers, etc.). Display-only.
+// #398 / quadwork#263: uppercase reviewer short names for the chat
+// sender column. The backend now serves `re1`/`re2` directly.
 function senderLabel(sender: string): string {
   const s = sender.toLowerCase();
-  if (s === "reviewer1") return "RE1";
-  if (s === "reviewer2") return "RE2";
+  if (s === "re1") return "RE1";
+  if (s === "re2") return "RE2";
   return sender;
 }
 
@@ -61,7 +59,7 @@ function senderLabel(sender: string): string {
 // can't continue a handle (no word char, no hyphen) so longer
 // hyphenated handles like "@user-name" or "@head-2" don't pill the
 // known prefix and leave the rest as plain text.
-const MENTION_RE = /(^|\s)(@(?:head|dev|reviewer1|reviewer2|user))(?![\w-])/gi;
+const MENTION_RE = /(^|\s)(@(?:head|dev|re1|re2|user))(?![\w-])/gi;
 function renderMessageWithMentions(text: string): React.ReactNode[] {
   const parts: React.ReactNode[] = [];
   let last = 0;
@@ -286,13 +284,13 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
     // #228: if the operator didn't tag a known agent, prepend
     // `@head ` so the message has somewhere to go. Unknown
     // `@whatever` mentions don't count — Head is still added.
-    // Known agents: head, dev, reviewer1, reviewer2.
+    // Known agents: head, dev, re1, re2.
     //
     // #410 / quadwork#276: slash commands are routed by AgentChattr
     // itself and must NOT be wrapped in `@head /continue` — that
     // would silently break them. Skip the auto-tag when the message
     // starts with `/`.
-    const KNOWN_AGENT_RE = /@(head|dev|reviewer1|reviewer2)\b/i;
+    const KNOWN_AGENT_RE = /@(head|dev|re1|re2)\b/i;
     const startsWithSlash = raw.startsWith("/");
     const text = (startsWithSlash || KNOWN_AGENT_RE.test(raw)) ? raw : `@head ${raw}`;
     setSending(true);
@@ -428,7 +426,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
                 // For those rows we still set replyTo so the threaded
                 // link works in AC's native UI; we just don't poison
                 // the input with a mention that isn't routable.
-                const KNOWN_AGENTS = new Set(["head", "dev", "reviewer1", "reviewer2"]);
+                const KNOWN_AGENTS = new Set(["head", "dev", "re1", "re2"]);
                 if (KNOWN_AGENTS.has(msg.sender.toLowerCase())) {
                   const prefix = `@${msg.sender} `;
                   setInput((prev) => (prev.startsWith(prefix) ? prev : prefix));

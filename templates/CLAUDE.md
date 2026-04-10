@@ -5,11 +5,11 @@
 | Agent | Role | Can Code? | Authority |
 |-------|------|-----------|-----------|
 | Head | Owner / Final Guard | No | FINAL (merge, deploy) |
-| Reviewer1 | Reviewer 1 | No | VETO (design) |
-| Reviewer2 | Reviewer 2 | No | VETO (design) |
+| RE1 | Reviewer 1 | No | VETO (design) |
+| RE2 | Reviewer 2 | No | VETO (design) |
 | Dev | Full-Stack Builder | Yes | Implementation |
 
-- **Each agent = ONE role** — escalate to Head/Reviewer1/Reviewer2 if task doesn't match
+- **Each agent = ONE role** — escalate to Head/RE1/RE2 if task doesn't match
 - **AGENTS.md is the primary instruction set** when running as an AgentChattr agent — it overrides these rules where they conflict
 
 ## GitHub Workflow
@@ -18,8 +18,8 @@
 2. Head assigns to Dev via @dev — then **waits silently**
 3. Dev creates branch: `task/<issue-number>-<slug>`
 4. Dev opens PR with `Fixes #<issue>`
-5. Dev requests review from **@reviewer1 AND @reviewer2** (NOT Head)
-6. Reviewer1/Reviewer2 review PR (APPROVE/REQUEST CHANGES/BLOCK) — send verdict to **@dev**
+5. Dev requests review from **@re1 AND @re2** (NOT Head)
+6. RE1/RE2 review PR (APPROVE/REQUEST CHANGES/BLOCK) — send verdict to **@dev**
 7. Dev aggregates both approvals, then notifies **@head**
 8. Head verifies approvals, merges; Issue auto-closes
 
@@ -36,7 +36,7 @@ Branch naming (strict): `task/<issue-number>-<short-slug>`
 - **Always reply to the operator** — when the operator (sender: "user") addresses you in chat, you MUST reply via `chat_send`. The operator's terminal is invisible; if you don't `chat_send`, your response does not exist.
 - **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **No status updates to Head** — Dev works silently until PR is ready
-- **Strict routing**: Dev→Reviewer1/Reviewer2 (review) → Dev→Head (merge request) → Head→Dev (merged)
+- **Strict routing**: Dev→RE1/RE2 (review) → Dev→Head (merge request) → Head→Dev (merged)
 - **Post-merge silence**: Head sends ONE "merged" message. No further replies from anyone.
 - **ALWAYS @mention the next agent** — never @user or @human
 

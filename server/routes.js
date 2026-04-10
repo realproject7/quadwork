@@ -505,6 +505,8 @@ const PROJECT_HISTORY_REPLAY_DELAY_MS = 25; // pace AC ws inserts
 const RESERVED_HISTORY_SENDERS = new Set([
   "head",
   "dev",
+  "re1",
+  "re2",
   "reviewer1",
   "reviewer2",
   "t1",
@@ -1966,10 +1968,10 @@ router.post("/api/setup", (req, res) => {
         const clone = exec("gh", ["repo", "clone", body.repo, workingDir]);
         if (!clone.ok) return res.json({ ok: false, error: `Clone failed: ${clone.output}` });
       }
-      // Sibling dirs: ../projectName-head/, ../projectName-reviewer1/, etc. (matches CLI wizard)
+      // Sibling dirs: ../projectName-head/, ../projectName-re1/, etc. (matches CLI wizard)
       const projectName = path.basename(workingDir);
       const parentDir = path.dirname(workingDir);
-      const agents = ["head", "reviewer1", "reviewer2", "dev"];
+      const agents = ["head", "re1", "re2", "dev"];
       const created = [];
       const errors = [];
       for (const agent of agents) {
@@ -1997,7 +1999,7 @@ router.post("/api/setup", (req, res) => {
       const parentDir = path.dirname(workingDir);
       const reviewerUser = body.reviewerUser || "";
       const reviewerTokenPath = body.reviewerTokenPath || path.join(os.homedir(), ".quadwork", "reviewer-token");
-      const agents = ["head", "reviewer1", "reviewer2", "dev"];
+      const agents = ["head", "re1", "re2", "dev"];
       const seeded = [];
       for (const agent of agents) {
         // Sibling dir layout (matches CLI wizard)
@@ -2106,9 +2108,9 @@ router.post("/api/setup", (req, res) => {
         mcp_sse = projectChattr.mcp_sse_port || 8201;
       }
 
-      const agents = ["head", "reviewer1", "reviewer2", "dev"];
+      const agents = ["head", "re1", "re2", "dev"];
       const colors = ["#10a37f", "#22c55e", "#f59e0b", "#da7756"];
-      const labels = ["Owner", "Reviewer", "Reviewer", "Builder"];
+      const labels = ["Lead", "Reviewer 1", "Reviewer 2", "Builder"];
 
       // Read or generate token for this project
       const crypto = require("crypto");
@@ -2122,7 +2124,7 @@ router.post("/api/setup", (req, res) => {
       content += `\n`;
       agents.forEach((agent, i) => {
         const wtDir = path.join(parentDir, `${dirName}-${agent}`);
-        content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${agent.charAt(0).toUpperCase() + agent.slice(1)} ${labels[i]}"\nmcp_inject = "flag"\n\n`;
+        content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${labels[i]}"\nmcp_inject = "flag"\n\n`;
       });
       // #403 / quadwork#274: raise the loop guard from AC's default
       // of 4 to 30 so autonomous PR review cycles (head→dev→re1+re2→
@@ -2166,7 +2168,7 @@ router.post("/api/setup", (req, res) => {
       // "Selected model is at capacity" out of the box. Operators can
       // bump individual agents back up via the Agent Models widget.
       const agents = {};
-      for (const agentId of ["head", "reviewer1", "reviewer2", "dev"]) {
+      for (const agentId of ["head", "re1", "re2", "dev"]) {
         const cmd = (backends && backends[agentId]) || "claude";
         const cliBase = cmd.split("/").pop().split(" ")[0];
         const injectMode = cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag";
@@ -2943,7 +2945,7 @@ router.get("/api/project/:projectId/agent-models", (req, res) => {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     const project = cfg.projects?.find((p) => p.id === req.params.projectId);
     if (!project) return res.status(404).json({ error: "Unknown project" });
-    const rows = ["head", "reviewer1", "reviewer2", "dev"].map((agentId) => {
+    const rows = ["head", "re1", "re2", "dev"].map((agentId) => {
       const a = project.agents?.[agentId] || {};
       const command = a.command || "claude";
       const cliBase = command.split("/").pop().split(" ")[0];
@@ -2963,7 +2965,7 @@ router.get("/api/project/:projectId/agent-models", (req, res) => {
 
 router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
   const { projectId, agentId } = req.params;
-  if (!["head", "reviewer1", "reviewer2", "dev"].includes(agentId)) {
+  if (!["head", "re1", "re2", "dev"].includes(agentId)) {
     return res.json({ ok: false, error: "Unknown agent" });
   }
   const body = req.body || {};

@@ -42,8 +42,8 @@ interface Config {
 
 const DEFAULT_AGENTS: Record<string, AgentConfig> = {
   head: { display_name: "Head", command: "claude", cwd: "", model: "opus", agents_md: "" },
-  reviewer1: { display_name: "Reviewer1", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
-  reviewer2: { display_name: "Reviewer2", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
+  re1: { display_name: "RE1", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
+  re2: { display_name: "RE2", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
   dev: { display_name: "Dev", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
 };
 
@@ -420,7 +420,7 @@ export default function SettingsPage() {
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
           Shows next to your messages in the AgentChattr chat panel. Defaults to <code>user</code> if blank.
           Allowed: 1–32 letters, digits, dash, underscore (matches AgentChattr&apos;s name rules; other characters are stripped server-side).
-          Reserved agent names like <code>head</code>, <code>dev</code>, <code>reviewer1</code>, <code>reviewer2</code>, and <code>system</code> are rejected and fall back to <code>user</code>.
+          Reserved agent names like <code>head</code>, <code>dev</code>, <code>re1</code>, <code>re2</code>, and <code>system</code> are rejected and fall back to <code>user</code>.
         </p>
       </section>
 
@@ -500,7 +500,7 @@ export default function SettingsPage() {
         </div>
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
           The default CLI seeds new project agents. The reviewer GitHub user/token are
-          used by Reviewer1/Reviewer2 to post PR review comments without your personal
+          used by RE1/RE2 to post PR review comments without your personal
           token. The token is written to{" "}
           <code className="bg-bg-surface px-1 rounded">~/.quadwork/reviewer-token</code>{" "}
           (mode 0600) and is never returned by the API.

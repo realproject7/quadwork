@@ -22,7 +22,7 @@ const STEPS: { title: string; body: string }[] = [
   },
   {
     title: "Reviewers check the work",
-    body: "Reviewer1 and Reviewer2 each review the PR independently. Both must approve before the PR is mergeable.",
+    body: "RE1 and RE2 each review the PR independently. Both must approve before the PR is mergeable.",
   },
   {
     title: "Head merges and continues",
