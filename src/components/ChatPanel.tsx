@@ -175,6 +175,9 @@ export default function ChatPanel({ projectId }: ChatPanelProps) {
 function ChatPanelAPI({ projectId }: { projectId?: string }) {
   const channel = "general";
   const [messages, setMessages] = useState<Message[]>([]);
+  // #410: track whether the initial fetch has completed so we don't
+  // flash the welcome/empty state while messages are still loading.
+  const [loaded, setLoaded] = useState(false);
   const [input, setInput] = useState("");
   const [showMentions, setShowMentions] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
@@ -207,6 +210,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
   useEffect(() => {
     cursorRef.current = 0;
     setMessages([]);
+    setLoaded(false);
   }, [projectId]);
 
   // Poll messages via proxy
@@ -235,7 +239,8 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
           if (maxId > cursorRef.current) cursorRef.current = maxId;
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => { setLoaded(true); });
   }, [channel, projectId]);
 
   useEffect(() => {
@@ -381,7 +386,12 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
         onScroll={handleScroll}
         className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-0.5"
       >
-        {messages.length === 0 && (
+        {!loaded && messages.length === 0 && (
+          <div className="flex items-center justify-center h-full">
+            <span className="text-xs text-text-muted">Loading messages...</span>
+          </div>
+        )}
+        {loaded && messages.length === 0 && (
           // #229: replace the bare "No messages" text with a richer
           // empty state — friendly icon, headline, click-to-insert
           // example chips, and a How to Work modal trigger.
