@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import InfoTooltip from "./InfoTooltip";
 import TelegramSetupModal from "./TelegramSetupModal";
 
 interface TelegramBridgeWidgetProps {
@@ -148,7 +149,12 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
     <>
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
-          <span className="text-[11px] text-text-muted uppercase tracking-wider">Telegram Bridge</span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] text-text-muted uppercase tracking-wider">Telegram Bridge</span>
+            <InfoTooltip>
+              <b>Telegram Bridge</b> forwards AgentChattr messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.
+            </InfoTooltip>
+          </div>
           {displayError && (
             <span className="text-[10px] text-error">error</span>
           )}

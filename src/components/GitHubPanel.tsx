@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import InfoTooltip from "./InfoTooltip";
 import OvernightQueueModal from "./OvernightQueueModal";
 import BatchProgressPanel from "./BatchProgressPanel";
 
@@ -152,10 +153,13 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
       <div className="flex-1 min-h-0 flex">
         {/* Issues column */}
         <div className="flex-1 min-w-0 flex flex-col border-r border-border">
-          <div className="px-3 py-1.5 border-b border-border shrink-0">
+          <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
               Issues ({issues.length})
             </span>
+            <InfoTooltip>
+              <b>Issues</b> — open issues on the project&apos;s GitHub repo. Click any item to open it on GitHub.
+            </InfoTooltip>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto">
             {issues.length === 0 && (
@@ -205,10 +209,13 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
 
         {/* PRs column */}
         <div className="flex-1 min-w-0 flex flex-col">
-          <div className="px-3 py-1.5 border-b border-border shrink-0">
+          <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
               Pull Requests ({prs.length})
             </span>
+            <InfoTooltip>
+              <b>Pull Requests</b> — open PRs awaiting review or merge. Click to open on GitHub.
+            </InfoTooltip>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto">
             {prs.length === 0 && (
@@ -298,7 +305,12 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
 
       {/* #226: compact OVERNIGHT-QUEUE.md row at the bottom */}
       <div className="shrink-0 flex items-center justify-between px-3 py-1.5 border-t border-border">
-        <span className="text-[11px] text-text-muted font-mono">OVERNIGHT-QUEUE.md</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] text-text-muted font-mono">OVERNIGHT-QUEUE.md</span>
+          <InfoTooltip>
+            <b>Overnight Queue</b> — the task queue file Head reads to pick the next ticket. Click Edit to modify batch contents and ordering.
+          </InfoTooltip>
+        </div>
         <button
           onClick={() => setQueueModalOpen(true)}
           className="px-2 py-0.5 text-[10px] text-text-muted hover:text-accent border border-border hover:border-accent transition-colors uppercase tracking-wider"

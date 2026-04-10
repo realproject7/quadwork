@@ -1,6 +1,7 @@
 "use client";
 
 import PanelHeader from "./PanelHeader";
+import InfoTooltip from "./InfoTooltip";
 import ScheduledTriggerWidget from "./ScheduledTriggerWidget";
 import TelegramBridgeWidget from "./TelegramBridgeWidget";
 import LoopGuardWidget from "./LoopGuardWidget";
@@ -30,7 +31,11 @@ import AgentModelsWidget from "./AgentModelsWidget";
 export default function OperatorFeaturesPanel({ projectId }: { projectId: string }) {
   return (
     <div className="flex flex-col h-full min-h-0">
-      <PanelHeader label="Operator Features" />
+      <PanelHeader label="Operator Features" tooltip={
+        <InfoTooltip>
+          <b>Operator Features</b> — tools for running autonomous overnight batches. Includes the Scheduled Trigger, Telegram Bridge, Loop Guard, Project History, and Agent Models.
+        </InfoTooltip>
+      } />
       <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-2 p-2 overflow-auto lg:overflow-hidden">
         {/* Left column: Scheduled Trigger spans full panel height.
             min-w-[280px] at lg+ keeps the message textarea from

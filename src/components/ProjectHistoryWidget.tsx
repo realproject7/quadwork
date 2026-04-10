@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import InfoTooltip from "./InfoTooltip";
 
 interface ProjectHistoryWidgetProps {
   projectId: string;
@@ -259,7 +260,12 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
 
   return (
     <div className="border border-border rounded p-2 text-[11px] font-mono">
-      <div className="text-text-muted uppercase tracking-wider mb-1.5">Project History</div>
+      <div className="flex items-center gap-1.5 text-text-muted uppercase tracking-wider mb-1.5">
+        Project History
+        <InfoTooltip>
+          <b>Project History</b> — export or import the full AgentChattr chat history for this project. Useful for backup, migration, or resuming after a fresh install.
+        </InfoTooltip>
+      </div>
       <div className="flex items-center gap-1.5 flex-wrap">
         <button
           type="button"
