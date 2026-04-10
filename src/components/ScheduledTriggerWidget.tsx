@@ -129,7 +129,15 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
 
   // #408: load auto-trigger setting from project config on mount.
+  // Reset refs on projectId change to avoid stale state across projects.
   const autoTriggerLoadedRef = useRef(false);
+  useEffect(() => {
+    autoTriggerLoadedRef.current = false;
+    prevBatchRef.current = null;
+    setAutoTrigger(false);
+    setAutoTriggered(false);
+    setAutoStatus(null);
+  }, [projectId]);
   useEffect(() => {
     if (autoTriggerLoadedRef.current) return;
     fetch("/api/config")
