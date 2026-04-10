@@ -144,11 +144,14 @@ def save_cursor(path):
 # ---------------------------------------------------------------------------
 
 # Mutable dict so heartbeat thread sees re-registration updates.
-ac = {"token": "", "name": ""}
+# bridge_sender is set from cfg during main() so all callers can read it.
+ac = {"token": "", "name": "", "bridge_sender": "discord-bridge"}
 
 
-def ac_register(url, base="discord-bridge", label="Discord Bridge"):
+def ac_register(url, base=None, label="Discord Bridge"):
     """Register with AgentChattr. Returns {name, token} or raises."""
+    if base is None:
+        base = ac["bridge_sender"]
     resp = requests.post(
         f"{url}/api/register",
         json={"base": base, "label": label},
@@ -435,6 +438,9 @@ def main():
 
     cfg = load_config(args.config)
     validate_config(cfg)
+
+    # Set bridge_sender so ac_register uses the configured base name
+    ac["bridge_sender"] = cfg["bridge_sender"]
 
     # Load cursor
     load_cursor(cfg["cursor_file"])
