@@ -1743,10 +1743,14 @@ setInterval(runLoopGuardPollingTick, LOOP_GUARD_POLL_INTERVAL_MS);
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
-  // Sync AgentChattr tokens for all projects on startup
+  // Sync AgentChattr tokens for all projects on startup and backfill
+  // the sender-overflow CSS/JS patch (#402) so already-running AC
+  // instances receive the fix without requiring a restart.
   const startupCfg = readConfig();
   for (const p of (startupCfg.projects || [])) {
     syncChattrToken(p.id);
+    const { dir: acDir } = resolveProjectChattr(p.id);
+    if (acDir) patchAgentchattrCss(acDir);
   }
 });
 
