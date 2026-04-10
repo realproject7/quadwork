@@ -228,7 +228,6 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
       })
       .then((data) => {
         setAuthError(null);
-        setLoaded(true);
         const msgs: Message[] = Array.isArray(data) ? data : data.messages || [];
         if (msgs.length > 0) {
           setMessages((prev) => {
@@ -240,7 +239,8 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
           if (maxId > cursorRef.current) cursorRef.current = maxId;
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => { setLoaded(true); });
   }, [channel, projectId]);
 
   useEffect(() => {
