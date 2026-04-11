@@ -2430,6 +2430,11 @@ function resolveProjectAgentchattrUrl(cfg, project) {
 // silently killing AC→TG forwarding for that project.
 function buildTelegramBridgeToml(tg, projectId) {
   const cursorFile = path.join(CONFIG_DIR, `tg-bridge-cursor-${projectId}.json`);
+  // #439: migrate old cursor file so the bridge doesn't replay history
+  const oldCursor = path.join(CONFIG_DIR, `telegram-bridge-cursor-${projectId}.json`);
+  if (!fs.existsSync(cursorFile) && fs.existsSync(oldCursor)) {
+    fs.renameSync(oldCursor, cursorFile);
+  }
   return (
     `[telegram]\n` +
     `bot_token = "${tg.bot_token}"\n` +
@@ -2969,6 +2974,11 @@ function discordBridgeLog(projectId) {
 
 function buildDiscordBridgeToml(dc, projectId) {
   const cursorFile = path.join(CONFIG_DIR, `dc-bridge-cursor-${projectId}.json`);
+  // #439: migrate old cursor file so the bridge doesn't replay history
+  const oldCursor = path.join(CONFIG_DIR, `discord-bridge-cursor-${projectId}.json`);
+  if (!fs.existsSync(cursorFile) && fs.existsSync(oldCursor)) {
+    fs.renameSync(oldCursor, cursorFile);
+  }
   return (
     `[discord]\n` +
     `bot_token = "${dc.bot_token}"\n` +
