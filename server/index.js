@@ -1086,6 +1086,23 @@ app.post("/api/agentchattr/:projectOrAction", handleAgentChattr);
 // AgentChattr doesn't expose staleness metadata, so this clears all slots.
 // Agents' wrapper heartbeat will auto-re-register with clean names.
 
+// #416: AC health status endpoint — returns the health monitor state
+// for a project so the dashboard can surface auto-restart events.
+app.get("/api/agentchattr/:project/health", (req, res) => {
+  const projectId = req.params.project;
+  const proc = chattrProcesses.get(projectId);
+  const health = _acHealth.state.get(projectId) || { lastRestart: 0, consecutiveFailures: 0 };
+  res.json({
+    state: proc?.state || "unknown",
+    error: proc?.error || null,
+    autoRestart: {
+      lastRestart: health.lastRestart || null,
+      consecutiveFailures: health.consecutiveFailures,
+      gaveUp: health.consecutiveFailures >= 3,
+    },
+  });
+});
+
 app.post("/api/agents/:project/reset", async (req, res) => {
   const projectId = req.params.project;
 
@@ -1763,6 +1780,149 @@ setInterval(runLoopGuardPollingTick, LOOP_GUARD_POLL_INTERVAL_MS);
 
 // --- Start ---
 
+// ---------------------------------------------------------------------------
+// #416: AC health monitor — auto-restart AgentChattr on crash detection.
+// Runs a TCP connect probe every 30s for each project with a "running" AC
+// process. If the port is dead, auto-restarts (reusing the existing restart
+// logic). Rate-limited to one restart per 60s per project; gives up after
+// 3 consecutive failures and surfaces a persistent error.
+// ---------------------------------------------------------------------------
+const _acHealth = {
+  // Per-project: { lastRestart: timestamp, consecutiveFailures: number }
+  state: new Map(),
+  intervalHandle: null,
+};
+
+function isPortAlive(port) {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ port, host: "127.0.0.1" }, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.on("error", () => resolve(false));
+    sock.setTimeout(2000, () => { sock.destroy(); resolve(false); });
+  });
+}
+
+async function acHealthCheck() {
+  const cfg = readConfig();
+  for (const project of (cfg.projects || [])) {
+    const proc = chattrProcesses.get(project.id);
+    // Only monitor projects that were explicitly started (state === "running"
+    // or had a process). Skip intentionally stopped projects.
+    if (!proc || proc.state === "stopped") continue;
+
+    const { url } = resolveProjectChattr(project.id);
+    const portMatch = url.match(/:(\d+)/);
+    const port = portMatch ? parseInt(portMatch[1], 10) : 8300;
+
+    const alive = await isPortAlive(port);
+    const health = _acHealth.state.get(project.id) || { lastRestart: 0, consecutiveFailures: 0 };
+
+    if (alive) {
+      // Healthy — reset failure counter
+      if (health.consecutiveFailures > 0) {
+        console.log(`[health] AC for ${project.id} recovered (port ${port} alive)`);
+      }
+      health.consecutiveFailures = 0;
+      _acHealth.state.set(project.id, health);
+      continue;
+    }
+
+    // Port is dead — check rate limits
+    if (health.consecutiveFailures >= 3) {
+      // Already gave up — don't spam restarts. The error state persists
+      // in chattrProcesses for the dashboard to surface.
+      continue;
+    }
+
+    const now = Date.now();
+    if (now - health.lastRestart < 60_000) {
+      // Too soon since last restart attempt
+      continue;
+    }
+
+    health.consecutiveFailures++;
+    health.lastRestart = now;
+    _acHealth.state.set(project.id, health);
+
+    console.warn(`[health] AC for ${project.id} on port ${port} is down (failure ${health.consecutiveFailures}/3) — auto-restarting`);
+
+    try {
+      // Reuse the same restart logic as the /api/agentchattr/:id/restart endpoint
+      if (proc.process) {
+        try { proc.process.kill("SIGTERM"); } catch {}
+      }
+      chattrProcesses.set(project.id, { process: null, state: "stopped", error: null });
+
+      // Resolve and spawn — inline version of spawnChattr from the route closure
+      const { dir: acDir } = resolveProjectChattr(project.id);
+      const acSpawn = resolveChattrSpawn(acDir);
+      if (!acSpawn) {
+        console.error(`[health] AC for ${project.id} — not installed, cannot auto-restart`);
+        chattrProcesses.set(project.id, { process: null, state: "error", error: "AgentChattr not installed" });
+        health.consecutiveFailures = 3; // give up
+        continue;
+      }
+
+      // Find config.toml for the project
+      let projectConfigToml = null;
+      const perProjectAcDir = path.join(os.homedir(), ".quadwork", project.id, "agentchattr");
+      if (fs.existsSync(path.join(perProjectAcDir, "config.toml"))) {
+        projectConfigToml = path.join(perProjectAcDir, "config.toml");
+      } else if (fs.existsSync(path.join(acDir, "config.toml"))) {
+        projectConfigToml = path.join(acDir, "config.toml");
+      } else if (project.working_dir) {
+        const legacyToml = path.join(project.working_dir, "agentchattr", "config.toml");
+        if (fs.existsSync(legacyToml)) projectConfigToml = legacyToml;
+      }
+
+      const extraArgs = projectConfigToml
+        ? ["--config", projectConfigToml]
+        : ["--port", String(port)];
+
+      patchAgentchattrCss(acDir);
+      const child = spawn(acSpawn.command, [...acSpawn.args, ...extraArgs], {
+        cwd: acSpawn.cwd,
+        env: process.env,
+        stdio: "ignore",
+        detached: true,
+      });
+
+      if (!child.pid) {
+        console.error(`[health] AC for ${project.id} — spawn failed`);
+        chattrProcesses.set(project.id, { process: null, state: "error", error: "Auto-restart spawn failed" });
+        continue;
+      }
+
+      child.unref();
+      child.on("error", (err) => {
+        chattrProcesses.set(project.id, { process: null, state: "error", error: err.message });
+      });
+      child.on("exit", (code) => {
+        const cur = chattrProcesses.get(project.id);
+        if (cur && cur.process === child) {
+          chattrProcesses.set(project.id, { process: null, state: "stopped", error: code ? `exit:${code}` : null });
+        }
+      });
+      chattrProcesses.set(project.id, { process: child, state: "running", error: null });
+      console.log(`[health] AC for ${project.id} auto-restarted (PID: ${child.pid})`);
+
+      // Sync token after restart
+      setTimeout(() => syncChattrToken(project.id), 2000);
+    } catch (err) {
+      console.error(`[health] AC auto-restart failed for ${project.id}:`, err.message);
+      chattrProcesses.set(project.id, { process: null, state: "error", error: `Auto-restart failed: ${err.message}` });
+    }
+  }
+}
+
+function startAcHealthMonitor() {
+  if (_acHealth.intervalHandle) return;
+  _acHealth.intervalHandle = setInterval(acHealthCheck, 30_000);
+  console.log("[health] AC health monitor started (30s interval)");
+}
+
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
@@ -1775,6 +1935,8 @@ server.listen(PORT, "127.0.0.1", () => {
     const { dir: acDir } = resolveProjectChattr(p.id);
     if (acDir) patchAgentchattrCss(acDir);
   }
+  // #416: start the AC health monitor
+  startAcHealthMonitor();
 });
 
 /**

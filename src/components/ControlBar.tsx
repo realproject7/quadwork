@@ -18,6 +18,36 @@ function ServerSection({ projectId }: { projectId: string }) {
   const [loading, setLoading] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
+  // #416: AC health monitor status — poll every 30s to surface
+  // auto-restart events and persistent errors in the dashboard.
+  const [healthNote, setHealthNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    const pollHealth = () => {
+      fetch(`/api/agentchattr/${encodeURIComponent(projectId)}/health`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (!d) { setHealthNote(null); return; }
+          if (d.autoRestart?.gaveUp) {
+            setHealthNote("AC auto-restart failed 3x — manual restart required");
+          } else if (d.autoRestart?.lastRestart) {
+            const ago = Math.round((Date.now() - d.autoRestart.lastRestart) / 1000);
+            if (ago < 300) {
+              const time = new Date(d.autoRestart.lastRestart).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+              setHealthNote(`AC auto-restarted at ${time}`);
+            } else {
+              setHealthNote(null);
+            }
+          } else {
+            setHealthNote(null);
+          }
+        })
+        .catch(() => setHealthNote(null));
+    };
+    pollHealth();
+    const interval = setInterval(pollHealth, 30000);
+    return () => clearInterval(interval);
+  }, [projectId]);
 
   const clearFeedback = () => {
     setTimeout(() => setFeedback(null), 3000);
@@ -140,6 +170,11 @@ function ServerSection({ projectId }: { projectId: string }) {
       </div>
       {feedback && (
         <div className="text-[10px] text-accent">{feedback}</div>
+      )}
+      {healthNote && !feedback && (
+        <div className={`text-[10px] ${healthNote.includes("failed") ? "text-error" : "text-[#ffcc00]"}`}>
+          {healthNote}
+        </div>
       )}
     </div>
   );
