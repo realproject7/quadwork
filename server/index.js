@@ -1006,6 +1006,26 @@ async function handleAgentChattr(req, res) {
         }, 3000);
       }
       res.json({ ok: true, state: "running", pid: child.pid });
+      // #447: auto-reset all agents after AC restart so they get
+      // fresh MCP tokens. buildAgentArgs → waitForAgentChattrReady
+      // handles the AC-readiness wait internally; the 2s delay here
+      // just lets the AC process finish binding its port before we
+      // start polling.
+      setTimeout(async () => {
+        try {
+          const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(projectId)}/reset`, {
+            method: "POST",
+          });
+          if (resetResp.ok) {
+            const resetData = await resetResp.json();
+            console.log(`[agentchattr] ${projectId} auto-reset ${resetData.restarted} agent(s) after AC restart`);
+          } else {
+            console.warn(`[agentchattr] ${projectId} agent reset after AC restart returned ${resetResp.status}`);
+          }
+        } catch (err) {
+          console.warn(`[agentchattr] ${projectId} agent reset after AC restart failed: ${err.message || err}`);
+        }
+      }, 2000);
     } catch (err) {
       setProc({ process: null, state: "error", error: err.message });
       res.status(500).json({ ok: false, state: "error", error: err.message });
@@ -1880,19 +1900,8 @@ async function acHealthCheck() {
       if (resp.ok) {
         const data = await resp.json();
         console.log(`[health] AC for ${project.id} auto-restarted (PID: ${data.pid})`);
-        // #417/#416: also reset agents so they get fresh MCP tokens,
-        // same as the manual SERVER Restart button chain.
-        try {
-          const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(project.id)}/reset`, {
-            method: "POST",
-          });
-          if (resetResp.ok) {
-            const resetData = await resetResp.json();
-            console.log(`[health] ${resetData.restarted} agent(s) reset for ${project.id}`);
-          }
-        } catch (resetErr) {
-          console.warn(`[health] Agent reset after AC auto-restart failed for ${project.id}:`, resetErr.message);
-        }
+        // #447: agent reset is now chained inside the restart endpoint
+        // itself (fires on a 2s timer), so no separate call needed here.
       } else {
         const body = await resp.text().catch(() => "");
         console.error(`[health] AC auto-restart failed for ${project.id}: ${resp.status} ${body.slice(0, 120)}`);
