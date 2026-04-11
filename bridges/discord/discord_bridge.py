@@ -145,7 +145,7 @@ def save_cursor(path):
 
 # Mutable dict so heartbeat thread sees re-registration updates.
 # bridge_sender is set from cfg during main() so all callers can read it.
-ac = {"token": "", "name": "", "bridge_sender": "discord-bridge"}
+ac = {"token": "", "name": "", "bridge_sender": "discord-bridge", "known_names": set()}
 
 
 def ac_register(url, base=None, label="Discord Bridge"):
@@ -161,7 +161,8 @@ def ac_register(url, base=None, label="Discord Bridge"):
     data = resp.json()
     ac["name"] = data["name"]
     ac["token"] = data["token"]
-    log.info("Registered with AC as %s", ac["name"])
+    ac["known_names"].add(data["name"])
+    log.info("Registered with AC as %s (known: %s)", ac["name"], ac["known_names"])
     return data
 
 
@@ -258,8 +259,9 @@ async def poll_ac_to_discord(cfg, channel):
                 sender = msg.get("sender", "")
                 text = msg.get("text", "")
 
-                # Echo prevention: skip our own messages
-                if sender == bridge_sender or sender == ac["name"]:
+                # Echo prevention: skip our own messages (any name
+                # the bridge has ever registered as this session)
+                if sender in ac["known_names"] or sender == bridge_sender:
                     if msg_id > _cursor["last_seen_id"]:
                         _cursor["last_seen_id"] = msg_id
                     continue
