@@ -1160,54 +1160,7 @@ bridge_sender = "tg"
     }
   }
 
-  // Shared Memory
-  log("Optional: set up shared memory cards for cross-agent knowledge.");
-  const wantMemory = await askYN(rl, "Set up Shared Memory?", false);
-  if (wantMemory) {
-    const memoryDir = path.join(path.dirname(setup.absDir), "agent-memory");
-    if (!fs.existsSync(memoryDir)) {
-      const memSpinner = spinner("Cloning agent-memory...");
-      const cloneResult = run(`git clone https://github.com/realproject7/agent-memory.git "${memoryDir}" 2>&1`);
-      memSpinner.stop(cloneResult !== null);
-      if (!cloneResult) warn("You can set it up manually later");
-    } else {
-      ok("agent-memory already present");
-    }
-
-    if (fs.existsSync(memoryDir)) {
-      // Verify butler scripts exist
-      const scriptsDir = path.join(memoryDir, "scripts");
-      const requiredScripts = ["butler-scan.sh", "butler-consolidate.sh", "inject.sh"];
-      for (const script of requiredScripts) {
-        const scriptPath = path.join(scriptsDir, script);
-        if (fs.existsSync(scriptPath)) {
-          // Ensure executable
-          try { fs.chmodSync(scriptPath, 0o755); } catch {}
-        } else {
-          warn(`Butler script not found: ${scriptPath}`);
-        }
-      }
-      ok("Butler scripts verified");
-
-      // Create project short-term memory file if missing
-      const shortTermDir = path.join(memoryDir, "central", "short-term");
-      const projectMemFile = path.join(shortTermDir, `${setup.projectName}.md`);
-      if (!fs.existsSync(projectMemFile)) {
-        if (!fs.existsSync(shortTermDir)) fs.mkdirSync(shortTermDir, { recursive: true });
-        fs.writeFileSync(projectMemFile, `# ${setup.projectName} — Short-Term Memory\n\n_No entries yet._\n`);
-        ok(`Created ${projectMemFile}`);
-      }
-
-      // Create cards directory if missing
-      const cardsDir = path.join(memoryDir, "archive", "v2", "cards");
-      if (!fs.existsSync(cardsDir)) {
-        fs.mkdirSync(cardsDir, { recursive: true });
-        ok("Created cards directory");
-      }
-    }
-
-    setup.memoryDir = memoryDir;
-  }
+  // #445: Shared Memory wizard step removed (agent-memory integration deprecated).
 
   return setup;
 }
@@ -1269,12 +1222,6 @@ function writeQuadWorkConfig(setup) {
       auto_approve: true,
       mcp_inject: injectMode,
     };
-  }
-
-  if (setup.memoryDir) {
-    project.memory_cards_dir = path.join(setup.memoryDir, "archive", "v2", "cards");
-    project.shared_memory_path = path.join(setup.memoryDir, "central", "short-term", `${setup.projectName}.md`);
-    project.butler_scripts_dir = path.join(setup.memoryDir, "scripts");
   }
 
   if (setup.telegram) {

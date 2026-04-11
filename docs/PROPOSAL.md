@@ -16,7 +16,6 @@ Running a multi-agent coding team today requires stitching together several disc
 - **tmux** for monitoring agent terminal sessions
 - **GitHub** for issues, PRs, and reviews
 - **Telegram** for mobile operator access
-- **agent-memory** scripts for shared knowledge injection
 - Manual `launch.sh` / `wrapper.py` orchestration
 
 The operator context-switches between 4–6 windows constantly. There is no single place to see what the team is doing, assign work, and track progress.
@@ -31,7 +30,7 @@ The operator context-switches between 4–6 windows constantly. There is no sing
 3. **Templatized** — workflow rules, agent seeds, and panel layouts ship as defaults, but the operator can customize
 4. **Display layer, not logic layer** — QuadWork organizes terminals, chat, and GitHub panels; it doesn't replace them
 
-Think of it as: **"AgentChattr + tmux + GitHub dashboard + Telegram bridge + agent-memory, in one browser tab."**
+Think of it as: **"AgentChattr + tmux + GitHub dashboard + Telegram bridge, in one browser tab."**
 
 ## 3. Core Workflow
 
@@ -100,7 +99,6 @@ All agents run locally on the operator's machine. No VPS or cloud infrastructure
 | **AgentChattr** | Agent-to-agent chat routing (embedded in Panel 3) | Existing (bcurts/agentchattr) |
 | **wrapper.py** | Agent process lifecycle + auto-trigger | Existing (agent-os) |
 | **Telegram Bridge** | Mobile operator access (optional add-on) | Existing (agentchattr-telegram) |
-| **Memory Butler** | Shared knowledge injection (optional add-on) | Existing (agent-memory) |
 
 ## 5. Dashboard Design
 
@@ -279,8 +277,6 @@ Step 5/5: Optional Add-ons
     → Bot token: ***
     → Chat ID: ***
     → Bridge started... done
-  → Shared Memory? (y/n)
-    → Butler pipeline configured... done
 
 ✓ QuadWork is ready!
   Dashboard: http://localhost:3000
@@ -298,7 +294,6 @@ Step 5/5: Optional Add-ons
 | **wrapper.py** | Copies agent launcher with auto-trigger and REMINDER injection |
 | **GitHub** | Configures branch protection (require 1 approval on `main`) |
 | **Telegram** | (Optional) Installs bridge, writes bot config, starts daemon |
-| **Shared Memory** | (Optional) Sets up butler scripts and injection pipeline |
 
 ### 6.3 Adding a Project (Post-Init)
 
@@ -332,20 +327,7 @@ Reuses the existing `agentchattr-telegram` bridge:
 - `/status`, `/channels`, `/merge` commands from Telegram
 - New: `/approve <PR#>` command to approve merges from mobile
 
-## 8. Shared Memory Dashboard
-
-Surfaces the `agent-memory` butler system in the UI:
-
-- **Memory Cards**: Browse and search existing memory cards
-- **Injection Status**: See which agents have `shared-memory.md` injected
-- **Butler Controls**:
-  - `Scan` — run butler-scan.sh to collect new cards
-  - `Consolidate` — run butler-consolidate.sh to merge duplicates
-  - `Inject` — run inject.sh to push to agent workspaces
-- **Memory Editor**: View/edit shared-memory.md content directly
-- **Card Timeline**: Visual timeline of when memories were created/updated
-
-## 9. Design Direction
+## 8. Design Direction
 
 Terminal-native, dark-mode-only aesthetic. The visual language comes from PlotLink's pre-overhaul design — monospace, minimal, with a bright green accent on deep black surfaces.
 
@@ -397,7 +379,6 @@ The dashboard should feel like a well-organized tmux session rendered in a brows
 | GitHub | `gh` CLI (shelled out) | Already installed, no SDK needed |
 | Chat | AgentChattr REST API | Already running separately |
 | Telegram | agentchattr-telegram | Already built (optional) |
-| Memory | Shell scripts (butler) | Already built (optional) |
 
 **No database. No ORM. No auth layer. No SDK dependencies beyond xterm.js and node-pty.**
 
@@ -419,7 +400,6 @@ The dashboard should feel like a well-organized tmux session rendered in a brows
 
 ### Phase 3 — Optional Add-ons
 - [ ] Telegram bridge setup in settings
-- [ ] Shared memory viewer + butler controls
 - [ ] AGENTS.md seed editor in UI
 
 ### Phase 4 — Polish
@@ -438,7 +418,6 @@ A significant amount of the system already exists and is battle-tested:
 | Agent seeds (AGENTS.md) | Production | agent-os/agentchattr2/seeds/ |
 | wrapper.py (lifecycle) | Production | agent-os/agentchattr2/wrapper.py |
 | Telegram bridge | Published | agentchattr-telegram (MIT) |
-| Memory butler | Production | agent-memory repo |
 | GitHub workflow (v6) | Production | CLAUDE.md + agent seeds |
 
 The dashboard and backend API are the new pieces. Everything else is integration work connecting existing, working components.

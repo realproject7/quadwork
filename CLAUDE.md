@@ -49,7 +49,6 @@ Reference: [plotlink at `pre-design-overhaul`](https://github.com/realproject7/p
 
 - AgentChattr: external dependency, cloned to `~/.quadwork/agentchattr` and run via `.venv/bin/python run.py`
 - Telegram bridge: external (`realproject7/agentchattr-telegram`), optional
-- Shared memory: external (`realproject7/agent-memory`), optional
 
 ## Running locally
 
