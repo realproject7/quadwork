@@ -113,18 +113,32 @@ function chatAuthHeaders(token) {
 }
 
 router.get("/api/chat", async (req, res) => {
+  const projectId = req.query.project;
   const apiPath = req.query.path || "/api/messages";
-  const { url: base, token } = getChattrConfig(req.query.project);
+  const { url: base, token } = getChattrConfig(projectId);
 
-  const fwd = new URLSearchParams();
-  for (const [k, v] of Object.entries(req.query)) {
-    if (k !== "path") fwd.set(k, String(v));
-  }
-  if (token) fwd.set("token", token);
+  const buildUrl = (tok) => {
+    const fwd = new URLSearchParams();
+    for (const [k, v] of Object.entries(req.query)) {
+      if (k !== "path") fwd.set(k, String(v));
+    }
+    if (tok) fwd.set("token", tok);
+    return `${base}${apiPath}?${fwd.toString()}`;
+  };
 
-  const url = `${base}${apiPath}?${fwd.toString()}`;
   try {
-    const r = await fetch(url, { headers: chatAuthHeaders(token) });
+    const r = await fetch(buildUrl(token), { headers: chatAuthHeaders(token) });
+    // #448: on 401/403, re-sync the session token from AC and retry
+    // once. The stored token may be stale after an AC restart.
+    if ((r.status === 401 || r.status === 403) && projectId) {
+      try { await syncChattrToken(projectId); } catch {}
+      const { token: refreshed } = getChattrConfig(projectId);
+      if (refreshed && refreshed !== token) {
+        const retry = await fetch(buildUrl(refreshed), { headers: chatAuthHeaders(refreshed) });
+        if (!retry.ok) return res.status(retry.status).json({ error: `AgentChattr returned ${retry.status}` });
+        return res.json(await retry.json());
+      }
+    }
     if (!r.ok) return res.status(r.status).json({ error: `AgentChattr returned ${r.status}` });
     res.json(await r.json());
   } catch (err) {
