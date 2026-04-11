@@ -545,8 +545,23 @@ async function spawnAgentPty(project, agent) {
       acMcpHttpPort: built.acMcpHttpPort,
       acHeartbeatHandle: null,
       queueWatcherHandle: null,
+      // #418: ring buffer of recent PTY output so reconnecting WS
+      // clients see the terminal state instead of a blank panel.
+      scrollback: Buffer.alloc(0),
     };
     agentSessions.set(key, session);
+
+    // #418: capture PTY output into the scrollback ring buffer (64KB).
+    // This runs independently of WS — even when no client is connected,
+    // the buffer accumulates so the next connect gets replay.
+    const SCROLLBACK_SIZE = 64 * 1024;
+    term.onData((data) => {
+      const chunk = Buffer.from(data);
+      session.scrollback = Buffer.concat([session.scrollback, chunk]);
+      if (session.scrollback.length > SCROLLBACK_SIZE) {
+        session.scrollback = session.scrollback.slice(-SCROLLBACK_SIZE);
+      }
+    });
 
     // #391 / quadwork#250: keep this agent alive in AgentChattr by
     // POSTing /api/heartbeat/{name} every 5s. Without it, AC's 60s
@@ -1600,6 +1615,12 @@ wss.on("connection", async (ws, req) => {
 
   // Attach WS to session
   session.ws = ws;
+
+  // #418: replay scrollback buffer so the terminal isn't blank on reconnect.
+  // xterm.js processes ANSI escapes from the buffer the same as live data.
+  if (session.scrollback && session.scrollback.length > 0) {
+    ws.send(session.scrollback);
+  }
 
   // PTY → client
   const dataHandler = session.term.onData((data) => {
