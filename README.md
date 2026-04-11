@@ -149,6 +149,7 @@ Head: merges, picks the next issue
 - 📺 **4-quadrant project view** — chat, agent terminals (HEAD / DEV / RE1 / RE2), GitHub board, operator panel
 - ⏰ **Scheduled Trigger** — recurring "queue check" pulses for autonomous overnight runs
 - 📲 **Telegram bridge** — mirror the chat to your phone for remote monitoring
+- 💬 **Discord bridge** — forward agent chat to a Discord channel for team visibility
 - 💾 **Project history export/import** — JSON snapshots of the full chat transcript
 - 🧯 **Loop Guard control** — raise the hop limit and auto-resume stuck chains without restarting AC
 - 🔔 **Notification sounds** — Web Audio chime on new agent messages with a background-only mode
