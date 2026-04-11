@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="public/icon.png" alt="QuadWork" width="80" />
+
 # QuadWork
 
 ### Your AI dev team while you sleep.
