@@ -26,6 +26,8 @@ const AGENTCHATTR_REPO = "https://github.com/bcurts/agentchattr.git";
 // a loud warning instead of hard-failing — see installAgentChattr
 // below.
 const AGENTCHATTR_PIN = "3e71d4267572579e7ffeb83576645f90932c1849";
+// #444: same pattern for realproject7/agentchattr-telegram.
+const AGENTCHATTR_TELEGRAM_PIN = "4a6b45f1794c612328b9d5ee6d6fcb3f77015abc";
 
 // ─── ANSI Helpers ──────────────────────────────────────────────────────────
 
@@ -1047,7 +1049,14 @@ async function setupAddons(rl, setup, configTomlPath) {
       const cloneSpinner = spinner("Cloning agentchattr-telegram...");
       const cloneResult = run(`git clone https://github.com/realproject7/agentchattr-telegram.git "${telegramDir}" 2>&1`);
       cloneSpinner.stop(cloneResult !== null);
-      if (!cloneResult) warn("You can set it up manually later");
+      if (!cloneResult) { warn("You can set it up manually later"); }
+      else {
+        // #444: pin to a known commit, same pattern as AGENTCHATTR_PIN
+        const pinResult = run(`git -C "${telegramDir}" checkout -B pinned ${AGENTCHATTR_TELEGRAM_PIN} 2>&1`, { timeout: 30000 });
+        if (pinResult === null) {
+          try { console.warn(`[quadwork] WARNING: could not check out agentchattr-telegram pin ${AGENTCHATTR_TELEGRAM_PIN} at ${telegramDir}; falling back to default branch.`); } catch {}
+        }
+      }
     } else {
       ok("agentchattr-telegram already present");
     }
@@ -2011,6 +2020,33 @@ function cmdDoctor() {
   } catch (err) {
     console.log(`  (could not enumerate projects: ${err.message})`);
   }
+  // #444: agentchattr-telegram pin status
+  console.log("");
+  console.log(`agentchattr-telegram pin: ${AGENTCHATTR_TELEGRAM_PIN}`);
+  const tgBridgeDir = path.join(CONFIG_DIR, "agentchattr-telegram");
+  if (!fs.existsSync(tgBridgeDir)) {
+    console.log("  [skip] agentchattr-telegram: not installed");
+  } else {
+    const tgSha = cloneShaAt(tgBridgeDir);
+    if (!tgSha) {
+      console.log(`  [warn] agentchattr-telegram: ${tgBridgeDir} — not a git clone`);
+    } else {
+      const tgBranch = cloneBranchAt(tgBridgeDir);
+      let tgTag;
+      if (tgSha !== AGENTCHATTR_TELEGRAM_PIN) {
+        tgTag = "DIFF";
+      } else if (!tgBranch) {
+        tgTag = "DETACH";
+      } else if (tgBranch !== "pinned") {
+        tgTag = "BR  ";
+      } else {
+        tgTag = "OK  ";
+      }
+      const tgBranchLabel = tgBranch ? `branch=${tgBranch}` : "branch=(detached)";
+      console.log(`  [${tgTag}] ${tgSha} ${tgBranchLabel} (${tgBridgeDir})`);
+    }
+  }
+
   console.log("");
   console.log("Legend: [OK  ] on pin + on `pinned` branch; [BR  ] on pin but on a non-`pinned` named branch; [DETACH] on pin but in detached HEAD (re-run quadwork start to auto-migrate); [DIFF] off-pin (re-clone manually to re-sync)");
   console.log("");

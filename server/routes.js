@@ -2392,6 +2392,9 @@ router.post("/api/rename", (req, res) => {
 // ─── Telegram ──────────────────────────────────────────────────────────────
 
 const BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-telegram");
+// #444: pin agentchattr-telegram to a known commit (same pattern as
+// AGENTCHATTR_PIN in bin/quadwork.js for bcurts/agentchattr).
+const AGENTCHATTR_TELEGRAM_PIN = "4a6b45f1794c612328b9d5ee6d6fcb3f77015abc";
 
 function telegramPidFile(projectId) {
   return path.join(CONFIG_DIR, `tg-bridge-${projectId}.pid`);
@@ -2699,6 +2702,12 @@ router.post("/api/telegram", async (req, res) => {
       try {
         if (!fs.existsSync(BRIDGE_DIR)) {
           execFileSync("gh", ["repo", "clone", "realproject7/agentchattr-telegram", BRIDGE_DIR], { encoding: "utf-8", timeout: 30000 });
+          // #444: pin to a known commit after clone
+          try {
+            execFileSync("git", ["-C", BRIDGE_DIR, "checkout", "-B", "pinned", AGENTCHATTR_TELEGRAM_PIN], { encoding: "utf-8", timeout: 30000 });
+          } catch {
+            console.warn(`[telegram] WARNING: could not check out agentchattr-telegram pin ${AGENTCHATTR_TELEGRAM_PIN}; falling back to default branch.`);
+          }
         }
         // #380: create the dedicated venv if missing. `python3 -m venv`
         // builds a fresh isolated environment that bypasses PEP 668

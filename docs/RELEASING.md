@@ -90,14 +90,18 @@ Notes about the loop:
 - Post the release URL in the project chat so the batch reviewers can
   verify the auto-generated notes look sane.
 
-## Bumping the AgentChattr pin (#348)
+## Bumping the AgentChattr pins (#348, #444)
 
-QuadWork installs AgentChattr via `git clone` and then checks out
-a pinned commit declared in `bin/quadwork.js`:
+QuadWork installs AgentChattr and agentchattr-telegram via `git clone`
+and then checks out pinned commits declared in `bin/quadwork.js`:
 
 ```js
 const AGENTCHATTR_PIN = "<commit-sha>";
+const AGENTCHATTR_TELEGRAM_PIN = "<commit-sha>";
 ```
+
+The telegram pin is also declared in `server/routes.js` for the
+Install Bridge dashboard handler.
 
 Every fresh `npx quadwork` install produces a byte-identical
 AgentChattr clone at this commit, so two users installing on
@@ -110,8 +114,10 @@ new QuadWork release that needs a newer AgentChattr:
    dashboard end-to-end against at least one real project.
    Verify `quadwork doctor` shows the new pin and reports every
    per-project clone in-sync (see below).
-3. Update `AGENTCHATTR_PIN` in `bin/quadwork.js` to the new
-   commit and commit it as part of the same release PR.
+3. Update `AGENTCHATTR_PIN` and/or `AGENTCHATTR_TELEGRAM_PIN`
+   in `bin/quadwork.js` (and `server/routes.js` for the telegram
+   pin) to the new commit(s) and commit as part of the same
+   release PR.
 4. Note the bump in the release changelog so operators know
    what upstream changes are rolling in.
 
