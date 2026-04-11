@@ -38,15 +38,15 @@ color = "#da7756"
 label = "Builder"
 
 # #383: AC's registry rejects bases not declared in config.toml.
-# The Telegram bridge registers as `telegram-bridge`, so every
-# per-project AC config must declare it. The bridge has no
-# command/cwd of its own — it is a long-running external client
-# that posts to AC's HTTP API.
-[agents.telegram-bridge]
+# The Telegram bridge registers as `tg` (#439: renamed from
+# `telegram-bridge`), so every per-project AC config must declare
+# it. The bridge has no command/cwd of its own — it is a long-running
+# external client that posts to AC's HTTP API.
+[agents.tg]
 label = "Telegram Bridge"
 
-# #399: Discord bridge registers as `discord-bridge`.
-[agents.discord-bridge]
+# #399/#439: Discord bridge registers as `dc` (renamed from `discord-bridge`).
+[agents.dc]
 label = "Discord Bridge"
 
 [routing]

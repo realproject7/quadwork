@@ -14,7 +14,7 @@ interface TelegramStatus {
   chat_id: string;
   bot_username: string;
   bridge_installed: boolean;
-  // #353: tail of ~/.quadwork/telegram-bridge-<projectId>.log
+  // #353: tail of ~/.quadwork/tg-bridge-<projectId>.log
   // populated by the server when running === false and the log
   // file has content, so runtime crashes after a successful
   // Start are still visible in the widget.
@@ -52,7 +52,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   const [pollError, setPollError] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   // #383: the Install Bridge handler now migrates every existing
-  // per-project AC `config.toml` to declare `[agents.telegram-bridge]`
+  // per-project AC `config.toml` to declare `[agents.tg]`
   // (required so AC's registry accepts the bridge's register call).
   // When that migration actually touches any configs, the operator
   // must click SERVER → Restart for AC to load the new agent slug;
@@ -84,7 +84,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
     if (patched.length > 0) {
       setRestartNotice(
         `Install Bridge patched ${patched.length} AgentChattr config(s) ` +
-        `(${patched.join(", ")}) to declare [agents.telegram-bridge]. ` +
+        `(${patched.join(", ")}) to declare [agents.tg]. ` +
         `Click SERVER → Restart so AgentChattr picks up the new agent slug, ` +
         `then click Start again. Without the restart, Start will fail with a 400 registration loop.`,
       );

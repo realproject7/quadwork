@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 import discord
 import requests
 
-log = logging.getLogger("discord-bridge")
+log = logging.getLogger("dc-bridge")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     "channel_id": "",
     "agentchattr_url": "http://127.0.0.1:8300",
     "poll_interval": 2,
-    "bridge_sender": "discord-bridge",
+    "bridge_sender": "dc",
     "cursor_file": "",
 }
 
@@ -145,7 +145,7 @@ def save_cursor(path):
 
 # Mutable dict so heartbeat thread sees re-registration updates.
 # bridge_sender is set from cfg during main() so all callers can read it.
-ac = {"token": "", "name": "", "bridge_sender": "discord-bridge", "known_names": set()}
+ac = {"token": "", "name": "", "bridge_sender": "dc", "known_names": set()}
 
 
 def ac_register(url, base=None, label="Discord Bridge"):

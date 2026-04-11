@@ -183,7 +183,7 @@ try {
   assert.match(toml13, /agentchattr_url = "http:\/\/127\.0\.0\.1:8301"/);
   // #404: cursor_file must be per-project so multiple bridges
   // don't clobber each other's position.
-  assert.match(toml13, /cursor_file = ".*telegram-bridge-cursor-testproject\.json"/);
+  assert.match(toml13, /cursor_file = ".*tg-bridge-cursor-testproject\.json"/);
   // Must NOT emit a separate [agentchattr] section — the bridge
   // would silently ignore it.
   assert.equal(toml13.includes("\n[agentchattr]\n"), false);
@@ -196,19 +196,19 @@ try {
     "[agents.head]\nlabel = \"Head\"\n\n[agents.dev]\nlabel = \"Dev\"\n";
   const first = patchAgentchattrConfigForTelegramBridge(baseConfig);
   assert.equal(first.changed, true);
-  assert.match(first.text, /^\[agents\.telegram-bridge\]$/m);
+  assert.match(first.text, /^\[agents\.tg\]$/m);
   assert.match(first.text, /label = "Telegram Bridge"/);
   // Running a second time is a no-op.
   const second = patchAgentchattrConfigForTelegramBridge(first.text);
   assert.equal(second.changed, false);
   assert.equal(second.text, first.text);
-  // A config that was hand-patched during diagnosis is recognized
-  // as already-correct — do not clobber the operator's edit.
+  // #439: a config with old slug [agents.telegram-bridge] is migrated
+  // to [agents.tg] and flagged as changed.
   const handPatched =
     baseConfig + "\n[agents.telegram-bridge]\nlabel = \"Telegram Bridge\"\n";
   const third = patchAgentchattrConfigForTelegramBridge(handPatched);
-  assert.equal(third.changed, false);
-  assert.equal(third.text, handPatched);
+  assert.equal(third.changed, true);
+  assert.match(third.text, /^\[agents\.tg\]$/m);
 
   // 15) #383 Bug 4: buildTelegramBridgeSpawnEnv strips the three
   //     env vars the upstream bridge treats as higher-precedence

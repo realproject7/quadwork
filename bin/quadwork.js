@@ -1106,7 +1106,7 @@ bot_token = "env:${envKey}"
 chat_id = "${chatId}"
 agentchattr_url = "${projectChattrUrl}"
 poll_interval = 2
-bridge_sender = "telegram-bridge"
+bridge_sender = "tg"
 `;
         fs.appendFileSync(configTomlPath, telegramSection);
         ok("Added Telegram config to config.toml (token stored in .env)");
@@ -1121,7 +1121,7 @@ bridge_sender = "telegram-bridge"
           // silently ignored and the bridge falls back to :8300.
           // #404: cursor_file must be per-project so multiple bridges
           // don't clobber each other's position.
-          const cursorFile = path.join(CONFIG_DIR, `telegram-bridge-cursor-${setup.projectName}.json`);
+          const cursorFile = path.join(CONFIG_DIR, `tg-bridge-cursor-${setup.projectName}.json`);
           const bridgeTomlContent = `[telegram]\nbot_token = "${botToken}"\nchat_id = "${chatId}"\nagentchattr_url = "${projectChattrUrl}"\ncursor_file = "${cursorFile}"\n`;
           fs.writeFileSync(bridgeToml, bridgeTomlContent, { mode: 0o600 });
           fs.chmodSync(bridgeToml, 0o600);
@@ -1141,7 +1141,7 @@ bridge_sender = "telegram-bridge"
           bridgeProc.unref();
           if (bridgeProc.pid) {
             ok(`Telegram bridge started (PID: ${bridgeProc.pid})`);
-            const pidFile = path.join(CONFIG_DIR, "telegram-bridge.pid");
+            const pidFile = path.join(CONFIG_DIR, "tg-bridge.pid");
             fs.writeFileSync(pidFile, String(bridgeProc.pid));
           } else {
             warn("Could not start Telegram bridge — start manually");
@@ -1765,7 +1765,7 @@ function cmdStop() {
   console.log("\n  QuadWork Stop\n");
 
   let stopped = 0;
-  if (stopPid("Telegram bridge", "telegram-bridge.pid")) stopped++;
+  if (stopPid("Telegram bridge", "tg-bridge.pid")) stopped++;
 
   // Stop per-project AgentChattr instances
   const config = readConfig();

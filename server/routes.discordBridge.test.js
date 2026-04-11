@@ -32,7 +32,7 @@ try {
   assert.match(toml, /channel_id = "123456789"/);
   assert.match(toml, /agentchattr_url = "http:\/\/127\.0\.0\.1:8301"/);
   // Per-project cursor file
-  assert.match(toml, /cursor_file = ".*discord-bridge-cursor-testproject\.json"/);
+  assert.match(toml, /cursor_file = ".*dc-bridge-cursor-testproject\.json"/);
   // Must NOT emit a separate [agentchattr] section
   assert.equal(toml.includes("\n[agentchattr]\n"), false);
 
@@ -41,18 +41,18 @@ try {
     "[agents.head]\nlabel = \"Head\"\n\n[agents.dev]\nlabel = \"Dev\"\n";
   const first = patchAgentchattrConfigForDiscordBridge(baseConfig);
   assert.equal(first.changed, true);
-  assert.match(first.text, /^\[agents\.discord-bridge\]$/m);
+  assert.match(first.text, /^\[agents\.dc\]$/m);
   assert.match(first.text, /label = "Discord Bridge"/);
   // Second run is a no-op
   const second = patchAgentchattrConfigForDiscordBridge(first.text);
   assert.equal(second.changed, false);
   assert.equal(second.text, first.text);
-  // Hand-patched config is recognized
+  // #439: old slug [agents.discord-bridge] is migrated to [agents.dc]
   const handPatched =
     baseConfig + "\n[agents.discord-bridge]\nlabel = \"Discord Bridge\"\n";
   const third = patchAgentchattrConfigForDiscordBridge(handPatched);
-  assert.equal(third.changed, false);
-  assert.equal(third.text, handPatched);
+  assert.equal(third.changed, true);
+  assert.match(third.text, /^\[agents\.dc\]$/m);
 
   // 4) buildDiscordBridgeSpawnEnv strips Discord-specific env vars.
   const scrubbed = buildDiscordBridgeSpawnEnv({

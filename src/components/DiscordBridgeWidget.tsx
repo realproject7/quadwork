@@ -67,7 +67,7 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
     if (patched.length > 0) {
       setRestartNotice(
         `Install Bridge patched ${patched.length} AgentChattr config(s) ` +
-        `(${patched.join(", ")}) to declare [agents.discord-bridge]. ` +
+        `(${patched.join(", ")}) to declare [agents.dc]. ` +
         `Click SERVER \u2192 Restart so AgentChattr picks up the new agent slug, ` +
         `then click Start again. Without the restart, Start will fail with a 400 registration loop.`,
       );

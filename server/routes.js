@@ -2394,7 +2394,7 @@ router.post("/api/rename", (req, res) => {
 const BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-telegram");
 
 function telegramPidFile(projectId) {
-  return path.join(CONFIG_DIR, `telegram-bridge-${projectId}.pid`);
+  return path.join(CONFIG_DIR, `tg-bridge-${projectId}.pid`);
 }
 
 function telegramConfigToml(projectId) {
@@ -2402,7 +2402,7 @@ function telegramConfigToml(projectId) {
 }
 
 // #383: path to a project's AgentChattr config.toml. The install
-// handler patches this file to declare the `telegram-bridge` agent
+// handler patches this file to declare the `tg` agent
 // so AC's registry accepts the bridge's register call.
 function projectAgentchattrConfigPath(projectId) {
   return path.join(CONFIG_DIR, projectId, "agentchattr", "config.toml");
@@ -2429,7 +2429,7 @@ function resolveProjectAgentchattrUrl(cfg, project) {
 // AC message IDs advances the cursor past the other project's range,
 // silently killing AC→TG forwarding for that project.
 function buildTelegramBridgeToml(tg, projectId) {
-  const cursorFile = path.join(CONFIG_DIR, `telegram-bridge-cursor-${projectId}.json`);
+  const cursorFile = path.join(CONFIG_DIR, `tg-bridge-cursor-${projectId}.json`);
   return (
     `[telegram]\n` +
     `bot_token = "${tg.bot_token}"\n` +
@@ -2441,14 +2441,18 @@ function buildTelegramBridgeToml(tg, projectId) {
 
 // #383 Bug 3: AC's registry rejects any base name not pre-declared
 // in config.toml with `400 unknown base`. The bridge registers as
-// `telegram-bridge`, so every per-project AC config must declare it.
-// Idempotent: only appends if the section is not already present.
+// `tg` (#439: renamed from `telegram-bridge`), so every per-project
+// AC config must declare it. Idempotent: only appends if the section
+// is not already present. Also migrates old `[agents.telegram-bridge]`.
 function patchAgentchattrConfigForTelegramBridge(tomlText) {
-  if (/^\[agents\.telegram-bridge\]\s*$/m.test(tomlText)) {
-    return { text: tomlText, changed: false };
+  // #439: migrate old slug if present
+  const original = tomlText;
+  tomlText = tomlText.replace(/^\[agents\.telegram-bridge\]\s*$/m, "[agents.tg]");
+  if (/^\[agents\.tg\]\s*$/m.test(tomlText)) {
+    return { text: tomlText, changed: tomlText !== original };
   }
   const sep = tomlText.length === 0 || tomlText.endsWith("\n") ? "" : "\n";
-  const block = `\n[agents.telegram-bridge]\nlabel = "Telegram Bridge"\n`;
+  const block = `\n[agents.tg]\nlabel = "Telegram Bridge"\n`;
   return { text: tomlText + sep + block, changed: true };
 }
 
@@ -2470,7 +2474,7 @@ function buildTelegramBridgeSpawnEnv(parentEnv) {
 // config parse, auth failure) are recoverable instead of
 // /dev/null'd by `stdio: "ignore"`.
 function telegramBridgeLog(projectId) {
-  return path.join(CONFIG_DIR, `telegram-bridge-${projectId}.log`);
+  return path.join(CONFIG_DIR, `tg-bridge-${projectId}.log`);
 }
 
 // Tail the last N lines of a file without reading the whole thing
@@ -2720,7 +2724,7 @@ router.post("/api/telegram", async (req, res) => {
         });
       }
       // #383 Bug 3: ensure every known project's AC config declares
-      // the `telegram-bridge` agent. Without this, AC's registry
+      // the `tg` agent. Without this, AC's registry
       // rejects the bridge's register call with `400 unknown base`
       // and the bridge enters an infinite re-register loop.
       // Idempotent — append-only, skips configs that already have
@@ -2869,7 +2873,7 @@ router.post("/api/telegram", async (req, res) => {
         const acUrl = resolveProjectAgentchattrUrl(cfg, project);
         if (acUrl) {
           const acPort = new URL(acUrl).port || "8300";
-          await fetch(`http://127.0.0.1:${acPort}/api/deregister/telegram-bridge`, {
+          await fetch(`http://127.0.0.1:${acPort}/api/deregister/tg`, {
             method: "POST",
             signal: AbortSignal.timeout(3000),
           }).catch(() => {});
@@ -2952,7 +2956,7 @@ const DISCORD_BRIDGE_SRC = path.join(__dirname, "..", "bridges", "discord");
 const DISCORD_BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-discord");
 
 function discordPidFile(projectId) {
-  return path.join(CONFIG_DIR, `discord-bridge-${projectId}.pid`);
+  return path.join(CONFIG_DIR, `dc-bridge-${projectId}.pid`);
 }
 
 function discordConfigToml(projectId) {
@@ -2960,11 +2964,11 @@ function discordConfigToml(projectId) {
 }
 
 function discordBridgeLog(projectId) {
-  return path.join(CONFIG_DIR, `discord-bridge-${projectId}.log`);
+  return path.join(CONFIG_DIR, `dc-bridge-${projectId}.log`);
 }
 
 function buildDiscordBridgeToml(dc, projectId) {
-  const cursorFile = path.join(CONFIG_DIR, `discord-bridge-cursor-${projectId}.json`);
+  const cursorFile = path.join(CONFIG_DIR, `dc-bridge-cursor-${projectId}.json`);
   return (
     `[discord]\n` +
     `bot_token = "${dc.bot_token}"\n` +
@@ -2975,11 +2979,14 @@ function buildDiscordBridgeToml(dc, projectId) {
 }
 
 function patchAgentchattrConfigForDiscordBridge(tomlText) {
-  if (/^\[agents\.discord-bridge\]\s*$/m.test(tomlText)) {
-    return { text: tomlText, changed: false };
+  // #439: migrate old slug if present
+  const original = tomlText;
+  tomlText = tomlText.replace(/^\[agents\.discord-bridge\]\s*$/m, "[agents.dc]");
+  if (/^\[agents\.dc\]\s*$/m.test(tomlText)) {
+    return { text: tomlText, changed: tomlText !== original };
   }
   const sep = tomlText.length === 0 || tomlText.endsWith("\n") ? "" : "\n";
-  const block = `\n[agents.discord-bridge]\nlabel = "Discord Bridge"\n`;
+  const block = `\n[agents.dc]\nlabel = "Discord Bridge"\n`;
   return { text: tomlText + sep + block, changed: true };
 }
 
@@ -3161,7 +3168,7 @@ router.post("/api/discord", async (req, res) => {
             `pip output tail:\n${pipOutput.split("\n").slice(-10).join("\n")}`,
         });
       }
-      // Patch all project AC configs with [agents.discord-bridge]
+      // Patch all project AC configs with [agents.dc]
       const patched = [];
       try {
         const cfgAll = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
@@ -3260,7 +3267,7 @@ router.post("/api/discord", async (req, res) => {
         const acUrl = resolveProjectAgentchattrUrl(cfg, project);
         if (acUrl) {
           const acPort = new URL(acUrl).port || "8300";
-          await fetch(`http://127.0.0.1:${acPort}/api/deregister/discord-bridge`, {
+          await fetch(`http://127.0.0.1:${acPort}/api/deregister/dc`, {
             method: "POST",
             signal: AbortSignal.timeout(3000),
           }).catch(() => {});
@@ -3388,7 +3395,7 @@ module.exports.parseActiveBatch = parseActiveBatch;
 // summarizeItems for the batch-progress fixture test.
 module.exports.buildNoPrRow = buildNoPrRow;
 module.exports.summarizeItems = summarizeItems;
-// #353: expose readLastLines for the telegram-bridge test.
+// #353: expose readLastLines for the tg-bridge test.
 module.exports.readLastLines = readLastLines;
 // #380: expose checkTelegramBridgePythonDeps so the bridge test can
 // exercise the venv-path interpreter argument round trip.
