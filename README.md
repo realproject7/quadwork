@@ -36,6 +36,8 @@ reviews and branch protection, it allows solo founders and engineers to ship
 code 24/7 through a reliable "Issue → Branch → PR → Merge" loop while
 maintaining high code quality without manual oversight.
 
+[![QuadWork Demo](https://img.youtube.com/vi/Q0814uXjYoQ/maxresdefault.jpg)](https://www.youtube.com/watch?v=Q0814uXjYoQ)
+
 ### How QuadWork Orchestrates Your Workflow
 
 ```
