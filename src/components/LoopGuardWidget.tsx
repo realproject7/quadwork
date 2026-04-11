@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import InfoTooltip from "./InfoTooltip";
 
 interface LoopGuardWidgetProps {
   projectId: string;
@@ -22,7 +23,6 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState<boolean | null>(null);
-  const [showHelp, setShowHelp] = useState(false);
   // #422 / quadwork#310: per-project auto-continue opt-in. Default
   // OFF — operators opt in knowing the trade-off (runaway loops
   // will silently resume after the delay). Hydrated from /api/config
@@ -123,18 +123,10 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
     <div className="border border-border rounded p-2 text-[11px] font-mono">
       <div className="flex items-center gap-1.5 mb-1">
         <span className="uppercase tracking-wider text-text-muted">Loop Guard</span>
-        <button
-          type="button"
-          aria-label="About loop guard"
-          onClick={() => setShowHelp((s) => !s)}
-          className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
-        >?</button>
-      </div>
-      {showHelp && (
-        <div className="mb-1.5 p-1.5 text-[10px] leading-snug text-text bg-bg-surface border border-border/60 rounded">
+        <InfoTooltip>
           <b>Loop Guard</b> pauses agent-to-agent message chains after this many hops with no human reply. Higher values let agents work longer overnight; lower values add safety against runaway loops. AgentChattr accepts <b>4–50</b>; QuadWork defaults to <b>30</b> (about 5–6 full PR cycles). Posting any chat message yourself resets the counter immediately.
-        </div>
-      )}
+        </InfoTooltip>
+      </div>
       <div className="flex items-center gap-1.5">
         <span className="text-text-muted">Pause after</span>
         <input

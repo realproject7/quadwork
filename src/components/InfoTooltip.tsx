@@ -4,6 +4,8 @@ import { useState, useRef, useEffect } from "react";
 
 interface InfoTooltipProps {
   children: React.ReactNode;
+  /** Open popover above the button instead of below. */
+  position?: "below" | "above";
 }
 
 /**
@@ -14,7 +16,7 @@ interface InfoTooltipProps {
  * AgentTerminalsGrid — consistent `w-3.5 h-3.5 rounded-full`
  * styling with accent hover.
  */
-export default function InfoTooltip({ children }: InfoTooltipProps) {
+export default function InfoTooltip({ children, position = "below" }: InfoTooltipProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -42,7 +44,7 @@ export default function InfoTooltip({ children }: InfoTooltipProps) {
         className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
       >?</button>
       {open && (
-        <div className="absolute left-0 top-5 z-30 w-64 p-2 text-[10px] leading-snug text-text bg-bg-surface border border-border rounded shadow-lg">
+        <div className={`absolute left-0 z-30 w-64 p-2 text-[10px] leading-snug text-text bg-bg-surface border border-border rounded shadow-lg ${position === "above" ? "bottom-5" : "top-5"}`}>
           {children}
         </div>
       )}

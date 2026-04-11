@@ -307,7 +307,7 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
       <div className="shrink-0 flex items-center justify-between px-3 py-1.5 border-t border-border">
         <div className="flex items-center gap-1.5">
           <span className="text-[11px] text-text-muted font-mono">OVERNIGHT-QUEUE.md</span>
-          <InfoTooltip>
+          <InfoTooltip position="above">
             <b>Overnight Queue</b> — the task queue file Head reads to pick the next ticket. Click Edit to modify batch contents and ordering.
           </InfoTooltip>
         </div>
