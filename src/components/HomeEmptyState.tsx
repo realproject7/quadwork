@@ -27,26 +27,8 @@ export default function HomeEmptyState({ hasProjects }: HomeEmptyStateProps) {
 
   return (
     <div className="flex flex-col items-center justify-center text-center px-6 py-12 border border-border bg-bg-surface">
-      {/* Stylised agent-team icon. Pure SVG so there's no asset
-          footprint and it inherits the dashboard's accent. */}
-      <svg
-        width="64"
-        height="64"
-        viewBox="0 0 64 64"
-        fill="none"
-        aria-hidden
-        className="text-accent"
-      >
-        <rect x="6" y="14" width="18" height="22" rx="2" stroke="currentColor" strokeWidth="2" />
-        <rect x="40" y="14" width="18" height="22" rx="2" stroke="currentColor" strokeWidth="2" />
-        <rect x="6" y="42" width="18" height="14" rx="2" stroke="currentColor" strokeWidth="2" />
-        <rect x="40" y="42" width="18" height="14" rx="2" stroke="currentColor" strokeWidth="2" />
-        <circle cx="15" cy="25" r="2" fill="currentColor" />
-        <circle cx="49" cy="25" r="2" fill="currentColor" />
-        <circle cx="15" cy="49" r="2" fill="currentColor" />
-        <circle cx="49" cy="49" r="2" fill="currentColor" />
-        <path d="M24 25 L40 25 M24 49 L40 49 M15 36 L15 42 M49 36 L49 42" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-      </svg>
+      {/* #446: QuadWork symbol replaces the generic agent-team icon */}
+      <img src="/quadwork-symbol.svg" alt="" width={64} height={64} aria-hidden />
 
       <h1 className="mt-5 text-lg font-semibold text-text max-w-md">{headline}</h1>
       <p className="mt-2 text-[12px] text-text-muted leading-relaxed max-w-md">{subtext}</p>
