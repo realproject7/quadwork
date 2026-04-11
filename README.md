@@ -15,10 +15,9 @@
 <p>
   <a href="https://www.npmjs.com/package/quadwork"><img src="https://img.shields.io/npm/v/quadwork" alt="npm version" /></a>
   <a href="https://www.npmjs.com/package/quadwork"><img src="https://img.shields.io/npm/dm/quadwork" alt="npm downloads" /></a>
-  <a href="https://github.com/realproject7/quadwork/releases/latest"><img src="https://img.shields.io/github/v/release/realproject7/quadwork" alt="latest release" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platform" />
   <img src="https://img.shields.io/badge/runs-locally-00d4aa" alt="runs locally" />
-  <img src="https://img.shields.io/badge/agents-4-orange" alt="4 agents" />
+  <img src="https://img.shields.io/badge/team-Head%20%C2%B7%20Dev%20%C2%B7%20RE1%20%C2%B7%20RE2-orange" alt="team: Head · Dev · RE1 · RE2" />
   <a href="https://github.com/bcurts/agentchattr"><img src="https://img.shields.io/badge/built_on-AgentChattr-8b5cf6" alt="AgentChattr" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" /></a>
 </p>
@@ -27,16 +26,42 @@
 
 ---
 
+## What is QuadWork?
+
+**QuadWork** is a local-first, open-source automation framework that
+orchestrates a collaborative team of four autonomous AI agents — **Head, Dev,
+and two Reviewers** — to manage a complete, production-grade GitHub workflow.
+By enforcing strict safety rails such as mandatory two-person independent code
+reviews and branch protection, it allows solo founders and engineers to ship
+code 24/7 through a reliable "Issue → Branch → PR → Merge" loop while
+maintaining high code quality without manual oversight.
+
+### How QuadWork Orchestrates Your Workflow
+
+```
+Issue → Branch → PR → Review × 2 → Merge
+  ↑                                    │
+  └──────── next ticket ───────────────┘
+```
+
+Head creates issues and assigns them to Dev. Dev opens a PR. Reviewer 1
+and Reviewer 2 each review independently — approve, request changes, or
+veto. Dev iterates until both approve. Head merges and picks the next
+ticket. The cycle repeats autonomously until the batch is complete.
+
+### Core Value Proposition
+
+- **Autonomous Reliability:** Runs overnight batches using a scheduled trigger, so you can wake up to a queue of successfully merged pull requests.
+- **Multi-Agent Governance:** Unlike single-agent tools, QuadWork uses a system of checks and balances where agents must convince each other through code review before merging to `main`.
+- **Privacy & Control:** Operates as a local Express server on your machine, managing your configured LLMs (Claude, OpenAI, Gemini) and GitHub CLI sessions without third-party proxying.
+- **Complete Visibility:** Features a comprehensive 4-quadrant dashboard with real-time agent terminals, chat history, and progress tracking.
+
 ## Why QuadWork?
 
 Manually reviewing every AI-generated PR is exhausting. Letting one AI agent
 push straight to `main` is how you end up rolling back broken migrations at
-2am. QuadWork runs a **four-agent team** that enforces a real GitHub workflow
-on each other — code, review, ship — autonomously, with safety rails.
-
-- 🤖 **Runs 24/7** — agents keep working overnight while you rest
-- 🛡️ **Always reviewed** — every PR needs **2 independent approvals** before merge
-- 🔒 **Local-first** — the dashboard, terminals, chat server, and PTY sessions all run on your machine. The agents still make outbound calls to the LLM APIs you've configured (Claude / Codex / Gemini) and to GitHub, and the optional Telegram bridge mirrors chat to your phone. QuadWork itself doesn't host or proxy any of that traffic through a third party
+2am. QuadWork solves this — you describe the work, kick off a batch, and come
+back to merged PRs that were each reviewed twice before touching `main`.
 
 ## Who is QuadWork for?
 
