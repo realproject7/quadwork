@@ -181,6 +181,11 @@ export default function TerminalPanel({
     let reattachAttempts = 0;
     const MAX_REATTACH = 5;
 
+    // #477: track whether we've done a post-replay fit. After the
+    // scrollback replay data is written, xterm needs a fit() to
+    // repaint — otherwise idle terminals appear blank until resize.
+    let needsPostReplayFit = false;
+
     const connect = async () => {
       const base = await resolveBase();
       if (cancelled) return;
@@ -191,6 +196,7 @@ export default function TerminalPanel({
 
       ws.onopen = () => {
         reattachAttempts = 0;
+        needsPostReplayFit = true;
         ws.send(
           JSON.stringify({
             type: "resize",
@@ -206,6 +212,13 @@ export default function TerminalPanel({
 
       ws.onmessage = (e) => {
         term.write(e.data);
+        // #477: after the first data write (scrollback replay), force
+        // a fit() so xterm repaints. Without this, idle terminals stay
+        // blank until a browser resize event triggers repaint.
+        if (needsPostReplayFit) {
+          needsPostReplayFit = false;
+          requestAnimationFrame(() => fit());
+        }
         const cb = onActivityRef.current;
         if (cb) cb();
       };
