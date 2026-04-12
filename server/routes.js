@@ -1000,7 +1000,7 @@ const ALLOWED_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/web
 const uploadStorage = multer.diskStorage({
   destination: (req, _file, cb) => {
     const projectId = req.query.project || "";
-    if (!projectId) return cb(new Error("Missing project"));
+    if (!projectId || /[/\\]/.test(projectId)) return cb(new Error("Invalid project"));
     const dir = path.join(CONFIG_DIR, projectId, "uploads");
     fs.mkdirSync(dir, { recursive: true });
     cb(null, dir);
