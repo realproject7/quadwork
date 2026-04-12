@@ -369,7 +369,8 @@ async function buildAgentArgs(projectId, agentId) {
         await deregisterAgent(acServerPort, agentId, stalePersistedToken).catch(() => {});
         clearPersistedAgentToken(projectId, agentId);
       }
-      const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null);
+      // #478: force-replace so AC expires any ghost slots for this base
+      const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null, { force: true });
       if (!registration) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
       }
@@ -394,7 +395,8 @@ async function buildAgentArgs(projectId, agentId) {
         await deregisterAgent(acServerPort, agentId, stalePersistedToken).catch(() => {});
         clearPersistedAgentToken(projectId, agentId);
       }
-      const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null);
+      // #478: force-replace so AC expires any ghost slots for this base
+      const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null, { force: true });
       if (!registration) {
         throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
       }
@@ -478,7 +480,8 @@ async function recoverFrom409(projectId, agentId, session) {
     clearPersistedAgentToken(projectId, agentId);
   }
 
-  const replacement = await registerAgent(session.acServerPort, agentId, agentCfg.display_name || null);
+  // #478: force-replace so AC expires any ghost slots for this base
+  const replacement = await registerAgent(session.acServerPort, agentId, agentCfg.display_name || null, { force: true });
   if (!replacement) return;
 
   const previousName = session.acRegistrationName;
@@ -2033,6 +2036,59 @@ server.listen(PORT, "127.0.0.1", () => {
         } catch (err) {
           console.warn(`[reseed] ${p.id}/${agentId}: failed to patch ${filename}: ${err.message}`);
         }
+      }
+    }
+  }
+  // #478: patch deployed AgentChattr instances to support force-replace
+  // on register. Prevents ghost slot accumulation after restarts.
+  for (const p of (startupCfg.projects || [])) {
+    const acDir = p.agentchattr_dir || path.join(os.homedir(), ".quadwork", p.id, "agentchattr");
+    // Patch registry.py: add force parameter to register()
+    const regPath = path.join(acDir, "registry.py");
+    if (fs.existsSync(regPath)) {
+      try {
+        let reg = fs.readFileSync(regPath, "utf-8");
+        if (!reg.includes("force: bool")) {
+          // Add force parameter to register() signature
+          reg = reg.replace(
+            /def register\(self, base: str, label: str \| None = None\) -> dict \| None:/,
+            "def register(self, base: str, label: str | None = None, force: bool = False) -> dict | None:",
+          );
+          // Add force-replace logic after _expire_reserved()
+          reg = reg.replace(
+            "            self._expire_reserved()\n\n            # Find next free slot",
+            "            self._expire_reserved()\n\n" +
+            "            # quadwork#478: force-replace — expire all existing slots for this\n" +
+            "            # base so the new registration always lands at slot 1.\n" +
+            "            if force:\n" +
+            "                ghosts = [n for n, i in self._instances.items() if i.base == base]\n" +
+            "                for name in ghosts:\n" +
+            "                    del self._instances[name]\n" +
+            "                    self._reserved[name] = time.time()\n\n" +
+            "            # Find next free slot",
+          );
+          fs.writeFileSync(regPath, reg);
+          console.log(`[ghost-fix] ${p.id}: patched registry.py with force-replace support`);
+        }
+      } catch (err) {
+        console.warn(`[ghost-fix] ${p.id}: failed to patch registry.py: ${err.message}`);
+      }
+    }
+    // Patch app.py: pass force from request body to registry.register()
+    const appPath = path.join(acDir, "app.py");
+    if (fs.existsSync(appPath)) {
+      try {
+        let app = fs.readFileSync(appPath, "utf-8");
+        if (!app.includes("force = bool(body.get(\"force\"")) {
+          app = app.replace(
+            "    result = registry.register(base, label)\n",
+            "    force = bool(body.get(\"force\", False))\n    result = registry.register(base, label, force=force)\n",
+          );
+          fs.writeFileSync(appPath, app);
+          console.log(`[ghost-fix] ${p.id}: patched app.py with force-replace support`);
+        }
+      } catch (err) {
+        console.warn(`[ghost-fix] ${p.id}: failed to patch app.py: ${err.message}`);
       }
     }
   }
