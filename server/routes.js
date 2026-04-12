@@ -2581,10 +2581,8 @@ router.post("/api/telegram", async (req, res) => {
               // #457: restart AC so it loads the new agent slug
               setTimeout(async () => {
                 try {
-                  await fetch(`http://127.0.0.1:${serverPort}/api/agentchattr/${encodeURIComponent(proj.id)}`, {
+                  await fetch(`http://127.0.0.1:${serverPort}/api/agentchattr/${encodeURIComponent(proj.id)}/restart`, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ action: "restart" }),
                   });
                 } catch {}
               }, 1000);
@@ -3037,10 +3035,8 @@ router.post("/api/discord", async (req, res) => {
               // #457: restart AC so it loads the new agent slug
               setTimeout(async () => {
                 try {
-                  await fetch(`http://127.0.0.1:${serverPort}/api/agentchattr/${encodeURIComponent(proj.id)}`, {
+                  await fetch(`http://127.0.0.1:${serverPort}/api/agentchattr/${encodeURIComponent(proj.id)}/restart`, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ action: "restart" }),
                   });
                 } catch {}
               }, 1000);

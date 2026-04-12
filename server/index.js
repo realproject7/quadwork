@@ -1957,10 +1957,8 @@ server.listen(PORT, "127.0.0.1", () => {
         // Restart AC so it loads the new agent slugs
         setTimeout(async () => {
           try {
-            const r = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(p.id)}`, {
+            const r = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(p.id)}/restart`, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ action: "restart" }),
             });
             if (r.ok) console.log(`[bridge-migrate] ${p.id}: restarted AC`);
             else console.warn(`[bridge-migrate] ${p.id}: AC restart returned ${r.status}`);
