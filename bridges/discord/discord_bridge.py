@@ -277,41 +277,46 @@ async def poll_ac_to_discord(cfg, channel):
                     log.warning("AC returned stale batch (max_id=%d <= cursor=%d) — breaking drain", max_batch_id, _cursor["last_seen_id"])
                     break
 
+                # #458: build echo names once per batch (inputs don't
+                # change per-message).
+                echo_names = ac["known_names"] | {
+                    bridge_sender,
+                    "discord-bridge",
+                    "discord_bridge",
+                }
+
                 for msg in messages:
                     msg_id = msg.get("id", 0)
                     sender = msg.get("sender", "")
                     text = msg.get("text", "")
 
-                    # Always advance cursor and persist immediately so a
-                    # crash between messages doesn't replay from a stale
-                    # position (#458).
-                    if msg_id > _cursor["last_seen_id"]:
-                        _cursor["last_seen_id"] = msg_id
-                        save_cursor(cfg["cursor_file"])
+                    # Helper: advance cursor and persist. Called after
+                    # a message is fully handled (skipped or forwarded)
+                    # so a crash can't replay it (#458). NOT called
+                    # before Discord delivery to avoid silent message
+                    # loss on transient send failures.
+                    def commit_cursor():
+                        if msg_id > _cursor["last_seen_id"]:
+                            _cursor["last_seen_id"] = msg_id
+                            save_cursor(cfg["cursor_file"])
 
-                    # Echo prevention: skip our own messages (any name
-                    # the bridge has ever registered as this session,
-                    # plus the configured bridge_sender and common
-                    # slug variants to survive slug mismatches)
-                    # #458: also match "discord-bridge" (old slug) and
-                    # any dash/underscore variant of bridge_sender
-                    echo_names = ac["known_names"] | {
-                        bridge_sender,
-                        "discord-bridge",
-                        "discord_bridge",
-                    }
+                    # Echo prevention: skip our own messages
                     if sender in echo_names:
+                        commit_cursor()
                         continue
 
                     # Skip system auto-recovery messages
                     if sender == "system":
+                        commit_cursor()
                         continue
 
                     if not text:
+                        commit_cursor()
                         continue
 
                     # #458: dedup guard — skip already-forwarded messages
                     if msg_id in forwarded_ids:
+                        commit_cursor()
                         continue
 
                     # Forward to Discord
@@ -321,10 +326,12 @@ async def poll_ac_to_discord(cfg, channel):
                         if len(discord_text) > 2000:
                             discord_text = discord_text[:1997] + "..."
                         await channel.send(discord_text)
+                        # Only commit cursor + mark forwarded AFTER
+                        # successful Discord delivery.
                         forwarded_ids.add(msg_id)
+                        commit_cursor()
                         # Trim the set if it grows too large
                         if len(forwarded_ids) > MAX_FORWARDED:
-                            # Keep only the most recent half
                             sorted_ids = sorted(forwarded_ids)
                             forwarded_ids.clear()
                             forwarded_ids.update(sorted_ids[len(sorted_ids) // 2:])
