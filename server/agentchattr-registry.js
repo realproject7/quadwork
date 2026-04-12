@@ -43,7 +43,7 @@ async function waitForAgentChattrReady(serverPort, timeoutMs = 10000) {
  * Register an agent with AgentChattr. Returns {name, token, slot} on
  * success, null on failure (with registerAgent.lastError populated).
  */
-async function registerAgent(serverPort, base, label = null) {
+async function registerAgent(serverPort, base, label = null, { force = false } = {}) {
   registerAgent.lastError = null;
   try {
     const r = await fetchWithTimeout(
@@ -51,7 +51,7 @@ async function registerAgent(serverPort, base, label = null) {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base, label }),
+        body: JSON.stringify({ base, label, force }),
       },
     );
     if (!r.ok) {
