@@ -40,6 +40,8 @@ maintaining high code quality without manual oversight.
 
 <video src="https://github.com/user-attachments/assets/d1f6f3d6-27de-4afb-9b58-9fe1f87cddb8" width="720" controls></video>
 
+[▶ View Live Demo on YouTube](https://www.youtube.com/watch?v=Q0814uXjYoQ)
+
 ### How QuadWork Orchestrates Your Workflow
 
 ```
