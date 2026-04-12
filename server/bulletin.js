@@ -75,6 +75,10 @@ function createPost({ from_project, from_agent, to_project, content, status }) {
   const month = currentMonth();
   const filePath = monthFilePath(month);
 
+  // Escape bare "---" lines in content so they don't corrupt the
+  // post delimiter when the file is parsed back.
+  const safeContent = content.replace(/^---$/gm, "\\-\\-\\-");
+
   const block = [
     "---",
     `## [${postId}] ${from_project} → ${to_project} | ${now}`,
@@ -82,7 +86,7 @@ function createPost({ from_project, from_agent, to_project, content, status }) {
     `To: ${to_project}`,
     `Status: ${status || "open"}`,
     "",
-    content,
+    safeContent,
     "",
     "---",
     "",
@@ -170,7 +174,8 @@ function parsePost(block) {
   const repliesStart = block.indexOf("\n> **Reply**");
   const closingDash = block.lastIndexOf("\n---");
   const contentEnd = repliesStart !== -1 ? repliesStart : (closingDash !== -1 ? closingDash : block.length);
-  const content = block.slice(statusEnd + 1, contentEnd).trim();
+  // Unescape "---" lines that were escaped on write.
+  const content = block.slice(statusEnd + 1, contentEnd).trim().replace(/^\\-\\-\\-$/gm, "---");
 
   // Extract replies
   const replies = [];
@@ -208,7 +213,7 @@ function readPosts({ month, project, status } = {}) {
   const text = fs.readFileSync(filePath, "utf-8");
   // Split on "---" delimiters — each post is between two delimiters
   const blocks = text.split(/^---$/m).filter((b) => b.trim());
-  const posts = blocks.map(parsePost).filter(Boolean);
+  const posts = blocks.map(parsePost).filter(Boolean).reverse();
 
   let filtered = posts;
   if (project) {
@@ -233,6 +238,8 @@ function readLatestPosts(limit = 10) {
     const text = fs.readFileSync(f, "utf-8");
     const blocks = text.split(/^---$/m).filter((b) => b.trim());
     const posts = blocks.map(parsePost).filter(Boolean);
+    // Reverse so newest posts within this month come first
+    posts.reverse();
     all.push(...posts);
     if (all.length >= limit) break;
   }
