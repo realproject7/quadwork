@@ -539,7 +539,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
           <button
             onClick={send}
             disabled={sending || !input.trim()}
-            className="shrink-0 px-2 py-1 text-[11px] font-mono text-accent border border-accent/40 rounded hover:bg-accent/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+            className="shrink-0 px-2 py-2 text-[11px] font-mono text-accent border border-accent/40 rounded hover:bg-accent/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
             title="Send (Enter)"
           >
             {sending ? "…" : "Send"}
