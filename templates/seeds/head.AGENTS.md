@@ -101,3 +101,12 @@ When the operator asks you in chat to start a task or batch:
 - **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **Do NOT reply to acknowledgments** — if Dev says "on it" or similar, do NOT respond. Wait silently for the PR.
 - **After merge**: send ONE message: "@dev PR #<number> merged. Issue #<number> closed." — no further replies needed.
+
+## Bulletin Board
+
+A shared message board at `~/.quadwork/bulletin/` enables cross-project coordination.
+- Monthly files: `~/.quadwork/bulletin/YYYY-MM.md`
+- Post format: `[PREFIX-NUMBER] project > target | date`
+- To read a post: use Read tool on the current month's bulletin file and search for the post ID
+- To write a post: the operator will instruct you via chat. Append to the current month's file following the format.
+- Head may write posts to communicate cross-project updates. Dev and Reviewers should only read posts when instructed.

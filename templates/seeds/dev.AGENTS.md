@@ -89,3 +89,11 @@ Head owns this file — do not edit it. Read it when you need context on the bat
 - **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **Do NOT send ANY message to @head between assignment and merge request** — no acks, no status updates.
 - **After merge confirmation from Head**: do NOT reply. The loop is COMPLETE — silence is required.
+
+## Bulletin Board
+
+A shared message board at `~/.quadwork/bulletin/` enables cross-project coordination.
+- Monthly files: `~/.quadwork/bulletin/YYYY-MM.md`
+- Post format: `[PREFIX-NUMBER] project > target | date`
+- To read a post: use Read tool on the current month's bulletin file and search for the post ID
+- Only Head should write posts. Dev should read posts when instructed by the operator.

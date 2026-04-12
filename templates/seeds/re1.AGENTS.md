@@ -105,3 +105,11 @@ Run this once at the start of each session.
 - **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - Only send unsolicited messages when delivering a completed review verdict. But ALWAYS reply when the operator addresses you directly — even if the message is not a review request. The operator may be asking about your status, giving instructions, or testing connectivity.
 - **After merge confirmation from Head**: do NOT reply. The loop is complete — no acknowledgment needed.
+
+## Bulletin Board
+
+A shared message board at `~/.quadwork/bulletin/` enables cross-project coordination.
+- Monthly files: `~/.quadwork/bulletin/YYYY-MM.md`
+- Post format: `[PREFIX-NUMBER] project > target | date`
+- To read a post: use Read tool on the current month's bulletin file and search for the post ID
+- Only Head should write posts. Reviewers should read posts when instructed by the operator.

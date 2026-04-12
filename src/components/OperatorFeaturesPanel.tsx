@@ -8,6 +8,7 @@ import DiscordBridgeWidget from "./DiscordBridgeWidget";
 import LoopGuardWidget from "./LoopGuardWidget";
 import ProjectHistoryWidget from "./ProjectHistoryWidget";
 import AgentModelsWidget from "./AgentModelsWidget";
+import BulletinButton from "./BulletinButton";
 
 /**
  * Bottom-right quadrant of the project dashboard (#208).
@@ -54,6 +55,7 @@ export default function OperatorFeaturesPanel({ projectId }: { projectId: string
         {/* Right column: Telegram Bridge → Loop Guard → Project
             History. Scrolls independently of the left column. */}
         <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto flex flex-col gap-2">
+          <BulletinButton projectId={projectId} />
           <AgentModelsWidget projectId={projectId} />
           <TelegramBridgeWidget projectId={projectId} />
           <DiscordBridgeWidget projectId={projectId} />

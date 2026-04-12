@@ -3296,6 +3296,75 @@ router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
   }
 });
 
+// ─── Bulletin Board (#471) ──────────────────────────────────────────────────
+const bulletin = require("./bulletin");
+
+router.get("/api/bulletin", (_req, res) => {
+  try {
+    const { month, project, status } = _req.query;
+    const result = bulletin.readPosts({ month, project, status });
+    return res.json(result);
+  } catch (err) {
+    return res.json({ posts: [], error: err.message });
+  }
+});
+
+router.get("/api/bulletin/latest", (_req, res) => {
+  try {
+    const limit = parseInt(_req.query.limit) || 10;
+    const posts = bulletin.readLatestPosts(limit);
+    return res.json({ posts });
+  } catch (err) {
+    return res.json({ posts: [], error: err.message });
+  }
+});
+
+router.post("/api/bulletin", (req, res) => {
+  const { from_project, from_agent, to_project, content, status } = req.body || {};
+  if (!from_project || !from_agent || !to_project || !content) {
+    return res.status(400).json({ ok: false, error: "Missing required fields: from_project, from_agent, to_project, content" });
+  }
+  if (content.length > 10000) {
+    return res.status(413).json({ ok: false, error: "Content too long (max 10000 chars)" });
+  }
+  try {
+    const result = bulletin.createPost({ from_project, from_agent, to_project, content, status });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message });
+  }
+});
+
+router.post("/api/bulletin/:postId/reply", (req, res) => {
+  const { postId } = req.params;
+  const { from_project, from_agent, content } = req.body || {};
+  if (!from_project || !from_agent || !content) {
+    return res.status(400).json({ ok: false, error: "Missing required fields: from_project, from_agent, content" });
+  }
+  try {
+    const found = bulletin.addReply(postId, { from_project, from_agent, content });
+    if (!found) return res.status(404).json({ ok: false, error: `Post ${postId} not found` });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message });
+  }
+});
+
+router.put("/api/bulletin/:postId/status", (req, res) => {
+  const { postId } = req.params;
+  const { status } = req.body || {};
+  if (!status || !["open", "closed"].includes(status)) {
+    return res.status(400).json({ ok: false, error: "status must be 'open' or 'closed'" });
+  }
+  try {
+    const found = bulletin.updateStatus(postId, status);
+    if (!found) return res.status(404).json({ ok: false, error: `Post ${postId} not found` });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.json({ ok: false, error: err.message });
+  }
+});
+
 module.exports = router;
 // #341: export parseActiveBatch for unit tests. No production callers
 // outside this file; the export is strictly for the node:assert

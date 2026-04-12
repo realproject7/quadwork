@@ -3,6 +3,8 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import HomeEmptyState from "./HomeEmptyState";
+import InfoTooltip from "./InfoTooltip";
+import BulletinBoard from "./BulletinBoard";
 
 interface Project {
   id: string;
@@ -140,39 +142,119 @@ export default function HomeDashboard() {
         </Link>
       </div>
 
-      {/* Activity feed */}
-      <div className="mb-6">
-        <h2 className="text-xs text-text-muted uppercase tracking-wider mb-3">Recent Activity</h2>
-        <div className="border border-border bg-bg-surface">
-          {activity.length === 0 && (
-            <div className="px-3 py-3 text-[11px] text-text-muted">No recent activity</div>
-          )}
-          {activity.map((item, i) => (
-            <div
-              key={`${item.time}-${i}`}
-              className="flex gap-3 px-3 py-1.5 border-b border-border/50 last:border-b-0 text-[11px]"
-            >
-              <span className="text-text-muted shrink-0 w-10 text-right tabular-nums">
-                {item.time?.slice(0, 5) || ""}
-              </span>
-              <span className="text-accent shrink-0 font-semibold w-12">
-                {item.projectName}
-              </span>
-              <span className="text-[#ffcc00] shrink-0 font-semibold w-12">
-                {/* #420 / quadwork#307: widen column + mirror the
-                    RE1/RE2 short labels PR #272 (#263) already uses
-                    in the chat sender column. w-6 was 24px and
-                    overflowed re1/re2 into the adjacent
-                    message text column. */}
-                {item.actor}
-              </span>
-              <span className="text-text truncate min-w-0">
-                {item.text}
-              </span>
-            </div>
-          ))}
+      {/* #471: Two-column grid — Recent Activity | Bulletin Board */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+        {/* Activity feed */}
+        <div>
+          <h2 className="text-xs text-text-muted uppercase tracking-wider mb-3">Recent Activity</h2>
+          <div className="border border-border bg-bg-surface">
+            {activity.length === 0 && (
+              <div className="px-3 py-3 text-[11px] text-text-muted">No recent activity</div>
+            )}
+            {activity.map((item, i) => (
+              <div
+                key={`${item.time}-${i}`}
+                className="flex gap-3 px-3 py-1.5 border-b border-border/50 last:border-b-0 text-[11px]"
+              >
+                <span className="text-text-muted shrink-0 w-10 text-right tabular-nums">
+                  {item.time?.slice(0, 5) || ""}
+                </span>
+                <span className="text-accent shrink-0 font-semibold w-12">
+                  {item.projectName}
+                </span>
+                <span className="text-[#ffcc00] shrink-0 font-semibold w-12">
+                  {item.actor}
+                </span>
+                <span className="text-text truncate min-w-0">
+                  {item.text}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
+
+        {/* Bulletin Board panel */}
+        <HomeBulletinPanel />
       </div>
+    </div>
+  );
+}
+
+interface BulletinPostSummary {
+  id: string;
+  from_project: string;
+  to_project: string;
+  date: string;
+  status: string;
+  content: string;
+}
+
+function HomeBulletinPanel() {
+  const [posts, setPosts] = useState<BulletinPostSummary[]>([]);
+  const [showModal, setShowModal] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/bulletin/latest?limit=10")
+      .then((r) => r.json())
+      .then((data) => setPosts(data.posts || []))
+      .catch(() => {});
+  }, []);
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        <h2 className="text-xs text-text-muted uppercase tracking-wider">Bulletin Board</h2>
+        <InfoTooltip>
+          <b>Bulletin Board</b> — cross-project messages posted by agents.
+          When an agent in one project needs to communicate with agents in
+          another project, they post here. Click a post to see details, then
+          instruct the relevant project&apos;s agents to act on it.
+        </InfoTooltip>
+      </div>
+      <div className="border border-border bg-bg-surface">
+        {posts.length === 0 && (
+          <div className="px-3 py-3 text-[11px] text-text-muted">No bulletin posts yet</div>
+        )}
+        {posts.map((post) => (
+          <div
+            key={post.id}
+            className="flex gap-3 px-3 py-1.5 border-b border-border/50 last:border-b-0 text-[11px]"
+          >
+            <span className="text-accent shrink-0 font-mono text-[10px] w-16">
+              {post.id}
+            </span>
+            <span className="text-text-muted shrink-0 w-20 text-[10px]">
+              {post.from_project} {">"} {post.to_project}
+            </span>
+            <span className="text-text-muted shrink-0 w-16 tabular-nums text-[10px]">
+              {post.date?.slice(0, 10)}
+            </span>
+            <span
+              className={`text-[9px] px-1 py-px shrink-0 ${
+                post.status === "open"
+                  ? "bg-accent/15 text-accent"
+                  : "bg-text-muted/15 text-text-muted"
+              }`}
+            >
+              {post.status}
+            </span>
+            <span className="text-text truncate min-w-0 text-[10px]">
+              {post.content.slice(0, 60)}
+            </span>
+          </div>
+        ))}
+        {posts.length > 0 && (
+          <div className="px-3 py-1.5">
+            <button
+              onClick={() => setShowModal(true)}
+              className="text-[10px] text-accent hover:text-text transition-colors"
+            >
+              View All {"\u2192"}
+            </button>
+          </div>
+        )}
+      </div>
+      {showModal && <BulletinBoard onClose={() => setShowModal(false)} />}
     </div>
   );
 }
