@@ -405,6 +405,11 @@ function SystemSection({ projectId }: { projectId: string }) {
             autoStart();
             setAwakeAutoStatus("Batch active — auto-started caffeinate.");
           }
+          // #462: First poll — batch already complete but caffeinate still running → auto-stop
+          if (hasItems && data.complete && activeRef.current) {
+            autoStop();
+            setAwakeAutoStatus("Batch complete — awake paused.");
+          }
           return;
         }
 
