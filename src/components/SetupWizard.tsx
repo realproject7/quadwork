@@ -222,13 +222,35 @@ export default function SetupWizard() {
     setSteps((prev) => prev.map((s, i) => (i === idx ? { ...s, ...updates } : s)));
   }, []);
 
+  // #472: track the furthest step reached so back-navigation can
+  // skip already-completed steps when proceeding forward again.
+  const [furthestStep, setFurthestStep] = useState(0);
+
   const goNext = useCallback(() => {
+    // #472: if we're behind the furthest step (editing a past step),
+    // skip forward to where the operator left off instead of walking
+    // through already-completed intermediate steps one by one.
+    const target = currentStep < furthestStep ? furthestStep : currentStep + 1;
+
     setSteps((prev) => prev.map((s, i) => {
       if (i === currentStep) return { ...s, status: "done" as StepStatus };
-      if (i === currentStep + 1) return { ...s, status: "active" as StepStatus };
+      if (i === target) return { ...s, status: "active" as StepStatus };
       return s;
     }));
-    setCurrentStep((c) => c + 1);
+    setCurrentStep(target);
+    setFurthestStep((f) => Math.max(f, target));
+  }, [currentStep, furthestStep]);
+
+  // #472: navigate back to a completed step for editing. The
+  // previously-active step becomes "done" (values preserved in
+  // state) and the target step becomes "active" again.
+  const goToStep = useCallback((targetIdx: number) => {
+    setSteps((prev) => prev.map((s, i) => {
+      if (i === targetIdx) return { ...s, status: "active" as StepStatus };
+      if (i === currentStep) return { ...s, status: "done" as StepStatus };
+      return s;
+    }));
+    setCurrentStep(targetIdx);
   }, [currentStep]);
 
   const apiCall = async (step: string, body: Record<string, unknown>) => {
@@ -474,29 +496,39 @@ export default function SetupWizard() {
         <div className="flex-1 flex gap-6 p-6 overflow-y-auto">
           {/* Step sidebar */}
           <div className="w-44 shrink-0">
-            {steps.map((s, i) => (
-              <div key={s.id} className="flex items-start gap-2 py-2">
-                <span className={`w-5 h-5 flex items-center justify-center text-[10px] border shrink-0 mt-0.5 ${
-                  s.status === "done" ? "border-accent text-accent" :
-                  s.status === "error" ? "border-error text-error" :
-                  s.status === "active" ? "border-accent text-accent bg-accent/10" :
-                  s.status === "skipped" ? "border-border text-text-muted line-through" :
-                  "border-border text-text-muted"
-                }`}>
-                  {s.status === "done" ? "\u2713" : s.status === "error" ? "!" : i + 1}
-                </span>
-                <div>
-                  <span className={`text-[11px] block leading-tight ${
-                    s.status === "active" ? "text-text font-semibold" :
-                    s.status === "done" ? "text-accent" :
-                    "text-text-muted"
+            {steps.map((s, i) => {
+              const isClickable = s.status === "done";
+              return (
+                <div
+                  key={s.id}
+                  className={`flex items-start gap-2 py-2 ${isClickable ? "cursor-pointer group" : ""}`}
+                  onClick={isClickable ? () => goToStep(i) : undefined}
+                  role={isClickable ? "button" : undefined}
+                  tabIndex={isClickable ? 0 : undefined}
+                  onKeyDown={isClickable ? (e) => { if (e.key === "Enter" || e.key === " ") goToStep(i); } : undefined}
+                >
+                  <span className={`w-5 h-5 flex items-center justify-center text-[10px] border shrink-0 mt-0.5 ${
+                    s.status === "done" ? "border-accent text-accent" :
+                    s.status === "error" ? "border-error text-error" :
+                    s.status === "active" ? "border-accent text-accent bg-accent/10" :
+                    s.status === "skipped" ? "border-border text-text-muted line-through" :
+                    "border-border text-text-muted"
                   }`}>
-                    {s.label}
+                    {s.status === "done" ? "\u2713" : s.status === "error" ? "!" : i + 1}
                   </span>
-                  <span className="text-[10px] text-text-muted block">{s.subtitle}</span>
+                  <div>
+                    <span className={`text-[11px] block leading-tight ${
+                      s.status === "active" ? "text-text font-semibold" :
+                      s.status === "done" ? "text-accent group-hover:text-text" :
+                      "text-text-muted"
+                    }`}>
+                      {s.label}
+                    </span>
+                    <span className="text-[10px] text-text-muted block">{s.subtitle}</span>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           {/* Step content */}
