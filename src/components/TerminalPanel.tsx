@@ -198,6 +198,12 @@ export default function TerminalPanel({
             rows: term.rows,
           })
         );
+        // #461: request scrollback replay after xterm + onmessage are
+        // ready. The server also sends scrollback immediately on WS
+        // connect, but that can arrive before onmessage is registered
+        // (race). This explicit request guarantees the replay arrives
+        // when the client can process it.
+        ws.send(JSON.stringify({ type: "replay" }));
       };
 
       ws.onmessage = (e) => {

@@ -1664,6 +1664,19 @@ wss.on("connection", async (ws, req) => {
         session.term.resize(parsed.cols, parsed.rows);
         return;
       }
+      // #461: client requests scrollback replay after xterm is fully
+      // initialized. This eliminates the timing race where the server
+      // sends scrollback before the client's onmessage handler is ready.
+      // If the buffer is empty (idle agent with no output yet), send a
+      // synthetic status line so the terminal isn't completely blank.
+      if (parsed.type === "replay") {
+        if (session.scrollback && session.scrollback.length > 0) {
+          ws.send(session.scrollback);
+        } else {
+          ws.send(`\x1b[2m[agent online — waiting for input]\x1b[0m\r\n`);
+        }
+        return;
+      }
     } catch {}
     session.term.write(str);
   });
