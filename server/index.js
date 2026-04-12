@@ -1997,33 +1997,42 @@ server.listen(PORT, "127.0.0.1", () => {
       console.log(`[bridge-migrate] patched stale bridge_sender in ${path.basename(file)}`);
     } catch {}
   }
-  // #479: reseed worktree AGENTS.md files from templates on startup.
-  // Compares each agent's worktree AGENTS.md against the shipped template;
-  // if the template is newer, overwrites the worktree copy so slug changes
-  // and seed improvements propagate automatically.
-  const seedsDir = path.join(OVERNIGHT_TEMPLATES_DIR, "seeds");
+  // #479: fix stale agent slugs in worktree AGENTS.md and CLAUDE.md on startup.
+  // Uses in-place replacement (not full template overwrite) to preserve
+  // reviewer auth credentials and other site-specific customisations.
+  const SLUG_FIXES = [
+    [/@reviewer1/g, "@re1"],
+    [/@reviewer2/g, "@re2"],
+    [/@t2a/g, "@re1"],
+    [/@t2b/g, "@re2"],
+    [/@t1\b/g, "@head"],
+    [/@t3\b/g, "@dev"],
+    [/\breviewer1\b/g, "re1"],
+    [/\breviewer2\b/g, "re2"],
+  ];
   for (const p of (startupCfg.projects || [])) {
     if (!p.agents) continue;
     for (const [agentId, agentCfg] of Object.entries(p.agents)) {
       const wtDir = agentCfg.cwd;
       if (!wtDir || !fs.existsSync(wtDir)) continue;
-      const templatePath = path.join(seedsDir, `${agentId}.AGENTS.md`);
-      if (!fs.existsSync(templatePath)) continue;
-      const destPath = path.join(wtDir, "AGENTS.md");
-      try {
-        const tplStat = fs.statSync(templatePath);
-        const destStat = fs.existsSync(destPath) ? fs.statSync(destPath) : null;
-        if (!destStat || tplStat.mtimeMs > destStat.mtimeMs) {
-          let content = fs.readFileSync(templatePath, "utf-8");
-          content = content.replace(/\{\{project_name\}\}/g, p.id);
-          // Clear reviewer placeholders if not applicable
-          content = content.replace(/\{\{reviewer_github_user\}\}/g, "");
-          content = content.replace(/\{\{reviewer_token_path\}\}/g, "");
-          fs.writeFileSync(destPath, content);
-          console.log(`[reseed] ${p.id}/${agentId}: updated AGENTS.md from template`);
+      for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
+        const filePath = path.join(wtDir, filename);
+        if (!fs.existsSync(filePath)) continue;
+        try {
+          let content = fs.readFileSync(filePath, "utf-8");
+          let changed = false;
+          for (const [pattern, replacement] of SLUG_FIXES) {
+            const before = content;
+            content = content.replace(pattern, replacement);
+            if (content !== before) changed = true;
+          }
+          if (changed) {
+            fs.writeFileSync(filePath, content);
+            console.log(`[reseed] ${p.id}/${agentId}: fixed stale slugs in ${filename}`);
+          }
+        } catch (err) {
+          console.warn(`[reseed] ${p.id}/${agentId}: failed to patch ${filename}: ${err.message}`);
         }
-      } catch (err) {
-        console.warn(`[reseed] ${p.id}/${agentId}: failed to reseed AGENTS.md: ${err.message}`);
       }
     }
   }
