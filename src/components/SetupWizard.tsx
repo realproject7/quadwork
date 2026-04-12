@@ -227,27 +227,18 @@ export default function SetupWizard() {
   const [furthestStep, setFurthestStep] = useState(0);
 
   const goNext = useCallback(() => {
-    // If we're behind the furthest completed step (editing a past
-    // step), skip forward to the next incomplete step instead of
-    // advancing one-by-one through already-done steps.
-    const nextIncomplete = (() => {
-      for (let i = currentStep + 1; i < INITIAL_STEPS.length; i++) {
-        // steps state isn't readable inside this callback's closure
-        // at the time of the setSteps call, so use furthestStep as
-        // the proxy: anything <= furthestStep was already completed.
-        if (i > furthestStep) return i;
-      }
-      // All subsequent steps are done — go one past current
-      return currentStep + 1;
-    })();
+    // #472: if we're behind the furthest step (editing a past step),
+    // skip forward to where the operator left off instead of walking
+    // through already-completed intermediate steps one by one.
+    const target = currentStep < furthestStep ? furthestStep : currentStep + 1;
 
     setSteps((prev) => prev.map((s, i) => {
       if (i === currentStep) return { ...s, status: "done" as StepStatus };
-      if (i === nextIncomplete) return { ...s, status: "active" as StepStatus };
+      if (i === target) return { ...s, status: "active" as StepStatus };
       return s;
     }));
-    setCurrentStep(nextIncomplete);
-    setFurthestStep((f) => Math.max(f, nextIncomplete));
+    setCurrentStep(target);
+    setFurthestStep((f) => Math.max(f, target));
   }, [currentStep, furthestStep]);
 
   // #472: navigate back to a completed step for editing. The
