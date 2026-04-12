@@ -346,6 +346,13 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
           });
           await load();
         }
+        // #462: First poll — batch already complete but trigger still running → auto-stop
+        if (hasItems && data.complete && triggerRef.current?.enabled) {
+          await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
+          setAutoTriggered(false);
+          setAutoStatus("Batch complete — trigger paused. Waiting for next batch.");
+          await load();
+        }
         return;
       }
 
