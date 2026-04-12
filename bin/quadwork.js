@@ -2108,6 +2108,40 @@ async function cmdMigrateAgentSlugs() {
       }
     }
 
+    // 6. Rewrite stale slugs in worktree AGENTS.md and CLAUDE.md files (#479)
+    const SEED_REPLACEMENTS = [
+      [/@reviewer1/g, "@re1"],
+      [/@reviewer2/g, "@re2"],
+      [/@t2a/g, "@re1"],
+      [/@t2b/g, "@re2"],
+      [/@t1/g, "@head"],
+      [/@t3/g, "@dev"],
+      [/\breviewer1\b/g, "re1"],
+      [/\breviewer2\b/g, "re2"],
+    ];
+
+    if (project.agents) {
+      for (const [agentId, agentCfg] of Object.entries(project.agents)) {
+        const wtDir = agentCfg.cwd;
+        if (!wtDir || !fs.existsSync(wtDir)) continue;
+        for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
+          const filePath = path.join(wtDir, filename);
+          if (!fs.existsSync(filePath)) continue;
+          let content = fs.readFileSync(filePath, "utf-8");
+          let fileChanged = false;
+          for (const [pattern, replacement] of SEED_REPLACEMENTS) {
+            const before = content;
+            content = content.replace(pattern, replacement);
+            if (content !== before) fileChanged = true;
+          }
+          if (fileChanged) {
+            fs.writeFileSync(filePath, content);
+            changes.push(`  rewritten: ${filePath}`);
+          }
+        }
+      }
+    }
+
     if (changes.length > 0) {
       ok(`Project "${project.id}" — ${changes.length} change(s):`);
       for (const c of changes) log(c);

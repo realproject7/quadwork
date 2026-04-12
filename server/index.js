@@ -1997,6 +1997,45 @@ server.listen(PORT, "127.0.0.1", () => {
       console.log(`[bridge-migrate] patched stale bridge_sender in ${path.basename(file)}`);
     } catch {}
   }
+  // #479: fix stale agent slugs in worktree AGENTS.md and CLAUDE.md on startup.
+  // Uses in-place replacement (not full template overwrite) to preserve
+  // reviewer auth credentials and other site-specific customisations.
+  const SLUG_FIXES = [
+    [/@reviewer1/g, "@re1"],
+    [/@reviewer2/g, "@re2"],
+    [/@t2a/g, "@re1"],
+    [/@t2b/g, "@re2"],
+    [/@t1\b/g, "@head"],
+    [/@t3\b/g, "@dev"],
+    [/\breviewer1\b/g, "re1"],
+    [/\breviewer2\b/g, "re2"],
+  ];
+  for (const p of (startupCfg.projects || [])) {
+    if (!p.agents) continue;
+    for (const [agentId, agentCfg] of Object.entries(p.agents)) {
+      const wtDir = agentCfg.cwd;
+      if (!wtDir || !fs.existsSync(wtDir)) continue;
+      for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
+        const filePath = path.join(wtDir, filename);
+        if (!fs.existsSync(filePath)) continue;
+        try {
+          let content = fs.readFileSync(filePath, "utf-8");
+          let changed = false;
+          for (const [pattern, replacement] of SLUG_FIXES) {
+            const before = content;
+            content = content.replace(pattern, replacement);
+            if (content !== before) changed = true;
+          }
+          if (changed) {
+            fs.writeFileSync(filePath, content);
+            console.log(`[reseed] ${p.id}/${agentId}: fixed stale slugs in ${filename}`);
+          }
+        } catch (err) {
+          console.warn(`[reseed] ${p.id}/${agentId}: failed to patch ${filename}: ${err.message}`);
+        }
+      }
+    }
+  }
   // #416: start the AC health monitor
   startAcHealthMonitor();
 });
