@@ -20,8 +20,7 @@
   --color-accent-dim: var(--accent-dim);
   --color-border: var(--border);
   --color-error: var(--error);
-  --font-sans: var(--font-pretendard), -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-mono: var(--font-geist-mono);
 }
 
 ::selection {
@@ -32,13 +31,14 @@
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: var(--font-pretendard), -apple-system, "Segoe UI", sans-serif;
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, "SF Mono",
+    Menlo, Consolas, "Liberation Mono", monospace;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
 h1, h2, h3, h4, h5, h6 {
-  font-family: var(--font-pretendard), -apple-system, "Segoe UI", sans-serif;
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
   letter-spacing: -0.01em;
 }
 
