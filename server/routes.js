@@ -146,6 +146,20 @@ router.get("/api/chat", async (req, res) => {
     if (!r.ok) return res.status(r.status).json({ error: `AgentChattr returned ${r.status}` });
     res.json(await r.json());
   } catch (err) {
+    // #487: fetch threw (ECONNREFUSED, DNS failure, etc.) — AC is
+    // unreachable. Resync the token and retry once; AC may have
+    // restarted with a new session token by the time the retry fires.
+    if (projectId) {
+      try { await syncChattrToken(projectId); } catch {}
+      const { token: refreshed } = getChattrConfig(projectId);
+      if (refreshed && refreshed !== token) {
+        try {
+          const retry = await fetch(buildUrl(refreshed), { headers: chatAuthHeaders(refreshed) });
+          if (!retry.ok) return res.status(retry.status).json({ error: `AgentChattr returned ${retry.status}` });
+          return res.json(await retry.json());
+        } catch {}
+      }
+    }
     res.status(502).json({ error: "AgentChattr unreachable", detail: err.message });
   }
 });
