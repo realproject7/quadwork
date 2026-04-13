@@ -59,27 +59,27 @@ export default function HomeDashboard() {
 
   return (
     <div className="h-full overflow-y-auto p-6">
-      {/* #229: friendly empty-state hero. Only rendered after
-          /api/projects resolves successfully — we don't want to
-          flash the "no projects" onboarding CTA to existing users
-          while the first fetch is in flight, or when the API
-          errored and we have no idea which branch to show. */}
-      {projectsState === "loaded" && (
-        <div className="mb-6">
-          <HomeEmptyState hasProjects={projects.length > 0} />
-        </div>
-      )}
-      {projectsState === "error" && (
-        <div className="mb-6 border border-error/30 bg-error/5 text-error text-[11px] px-3 py-2">
-          Could not load projects from /api/projects. The dashboard may be out of date — check the server logs and reload.
-        </div>
-      )}
-
       {/* #488: two-column layout at lg+ — hero+projects left, activity right.
           Collapses to current stacked layout below lg. */}
-      <div className="lg:grid lg:grid-cols-[1fr_340px] lg:gap-6 lg:h-[calc(100%-4rem)]">
-        {/* Left column: header + project cards */}
+      <div className="lg:grid lg:grid-cols-[1fr_340px] lg:gap-6 lg:h-[calc(100%-1rem)]">
+        {/* Left column: hero + header + project cards */}
         <div className="lg:overflow-y-auto lg:min-h-0">
+          {/* #229: friendly empty-state hero. Only rendered after
+              /api/projects resolves successfully — we don't want to
+              flash the "no projects" onboarding CTA to existing users
+              while the first fetch is in flight, or when the API
+              errored and we have no idea which branch to show. */}
+          {projectsState === "loaded" && (
+            <div className="mb-6">
+              <HomeEmptyState hasProjects={projects.length > 0} />
+            </div>
+          )}
+          {projectsState === "error" && (
+            <div className="mb-6 border border-error/30 bg-error/5 text-error text-[11px] px-3 py-2">
+              Could not load projects from /api/projects. The dashboard may be out of date — check the server logs and reload.
+            </div>
+          )}
+
           {/* Header */}
           <div className="mb-6">
             <h1 className="text-lg font-semibold text-text tracking-tight">Projects</h1>
