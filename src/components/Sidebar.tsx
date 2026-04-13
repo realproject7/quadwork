@@ -245,14 +245,19 @@ export default function Sidebar() {
 
   const persistPins = useCallback((newPins: string[]) => {
     setPinnedIds(newPins);
-    if (!configRef.current) return;
-    const updated = { ...configRef.current, pinned_projects: newPins };
-    configRef.current = updated;
-    fetch("/api/config", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updated),
-    }).catch(() => {});
+    // Re-read latest config before writing to avoid clobbering concurrent changes
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((latest) => {
+        const updated = { ...latest, pinned_projects: newPins };
+        configRef.current = updated;
+        return fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(updated),
+        });
+      })
+      .catch(() => {});
   }, []);
 
   const handlePin = (projectId: string) => {
@@ -377,7 +382,7 @@ export default function Sidebar() {
       {/* Context menu */}
       {contextMenu && (
         <div
-          className="fixed bg-bg-surface border border-border py-1 z-50 text-xs shadow-lg"
+          className="fixed bg-bg-surface border border-border py-1 z-50 text-xs"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           {pinnedSet.has(contextMenu.projectId) ? (
