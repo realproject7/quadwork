@@ -131,12 +131,22 @@ export default function Sidebar() {
   const [backendStatus, setBackendStatus] = useState<"online" | "offline" | "recovering">("online");
   const [expanded, setExpanded] = useState(false);
 
-  // Restore persisted state on mount
+  // Restore persisted state on mount — only on desktop-width screens
   useEffect(() => {
     try {
-      const stored = localStorage.getItem(SIDEBAR_KEY);
-      if (stored === "true") setExpanded(true);
+      if (window.innerWidth >= 768) {
+        const stored = localStorage.getItem(SIDEBAR_KEY);
+        if (stored === "true") setExpanded(true);
+      }
     } catch {}
+  }, []);
+
+  // Force-collapse on small screens when viewport resizes
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 767px)");
+    const handler = (e: MediaQueryListEvent) => { if (e.matches) setExpanded(false); };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
   }, []);
 
   const toggleExpanded = () => {
@@ -200,10 +210,10 @@ export default function Sidebar() {
         expanded ? "w-52 items-stretch px-2" : "w-16 items-center"
       }`}
     >
-      {/* Toggle */}
+      {/* Toggle — hidden on mobile */}
       <button
         onClick={toggleExpanded}
-        className={`shrink-0 flex items-center justify-center w-8 h-8 rounded-sm text-text-muted hover:text-text hover:bg-[#1a1a1a] transition-colors ${
+        className={`hidden md:flex shrink-0 items-center justify-center w-8 h-8 rounded-sm text-text-muted hover:text-text hover:bg-[#1a1a1a] transition-colors ${
           expanded ? "self-end mr-0" : "self-center"
         }`}
         title={expanded ? "Collapse sidebar" : "Expand sidebar"}
