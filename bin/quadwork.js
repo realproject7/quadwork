@@ -872,6 +872,14 @@ async function setupAgents(rl, repo) {
   log(`Project: ${projectName}`);
   const wtSpinner = spinner("Creating worktrees and seeding files...");
 
+  // Empty repos have no commits — git worktree add requires at least one.
+  const headCheck = run(`git -C "${absDir}" rev-parse HEAD 2>&1`);
+  if (!headCheck || headCheck.includes("fatal")) {
+    run(`git -C "${absDir}" commit --allow-empty -m "Initial commit (created by QuadWork setup)"`);
+    const defaultBranch = run(`git -C "${absDir}" symbolic-ref --short HEAD 2>&1`) || "main";
+    run(`git -C "${absDir}" push origin ${defaultBranch} 2>&1`);
+  }
+
   const worktrees = {};
   let wtFailed = null;
   for (const agent of AGENTS) {

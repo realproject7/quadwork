@@ -1881,6 +1881,14 @@ router.post("/api/setup", (req, res) => {
         const clone = exec("gh", ["repo", "clone", body.repo, workingDir]);
         if (!clone.ok) return res.json({ ok: false, error: `Clone failed: ${clone.output}` });
       }
+      // Empty repos have no commits — git worktree add requires at least one.
+      const headCheck = exec("git", ["rev-parse", "HEAD"], { cwd: workingDir });
+      if (!headCheck.ok) {
+        exec("git", ["commit", "--allow-empty", "-m", "Initial commit (created by QuadWork setup)"], { cwd: workingDir });
+        const branchResult = exec("git", ["symbolic-ref", "--short", "HEAD"], { cwd: workingDir });
+        const defaultBranch = branchResult.ok ? branchResult.output : "main";
+        exec("git", ["push", "origin", defaultBranch], { cwd: workingDir });
+      }
       // Sibling dirs: ../projectName-head/, ../projectName-re1/, etc. (matches CLI wizard)
       const projectName = path.basename(workingDir);
       const parentDir = path.dirname(workingDir);
