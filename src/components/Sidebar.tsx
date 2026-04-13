@@ -9,6 +9,11 @@ interface Project {
   name: string;
 }
 
+interface SidebarGroup {
+  name: string;
+  projects: string[];
+}
+
 function HomeIcon() {
   return (
     <svg
@@ -73,6 +78,24 @@ function ExpandIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <path d="M6 3l5 5-5 5" />
+    </svg>
+  );
+}
+
+function ChevronDownIcon({ collapsed }: { collapsed: boolean }) {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`transition-transform duration-150 ${collapsed ? "-rotate-90" : ""}`}
+    >
+      <path d="M3 4.5l3 3 3-3" />
     </svg>
   );
 }
@@ -150,17 +173,21 @@ function ProjectIcon({ project, isActive, expanded, pinned, onContextMenu }: Pro
 }
 
 const SIDEBAR_KEY = "qw-sidebar-expanded";
+const GROUP_COLLAPSE_KEY = "qw-sidebar-collapsed-groups";
 
 interface ContextMenu {
   x: number;
   y: number;
   projectId: string;
+  showGroupMenu?: boolean;
 }
 
 export default function Sidebar() {
   const pathname = usePathname();
   const [projects, setProjects] = useState<Project[]>([]);
   const [pinnedIds, setPinnedIds] = useState<string[]>([]);
+  const [groups, setGroups] = useState<SidebarGroup[]>([]);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [backendStatus, setBackendStatus] = useState<"online" | "offline" | "recovering">("online");
   const [expanded, setExpanded] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
@@ -173,6 +200,8 @@ export default function Sidebar() {
         const stored = localStorage.getItem(SIDEBAR_KEY);
         if (stored === "true") setExpanded(true);
       }
+      const storedGroups = localStorage.getItem(GROUP_COLLAPSE_KEY);
+      if (storedGroups) setCollapsedGroups(new Set(JSON.parse(storedGroups)));
     } catch {}
   }, []);
 
@@ -202,6 +231,7 @@ export default function Sidebar() {
         configRef.current = cfg;
         setProjects((cfg.projects || []).filter((p: Project & { archived?: boolean }) => !p.archived));
         setPinnedIds(cfg.pinned_projects || []);
+        setGroups(cfg.sidebar_groups || []);
       })
       .catch(() => {});
   }, []);
@@ -260,6 +290,51 @@ export default function Sidebar() {
       .catch(() => {});
   }, []);
 
+  const toggleGroupCollapse = (groupName: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupName)) next.delete(groupName);
+      else next.add(groupName);
+      try { localStorage.setItem(GROUP_COLLAPSE_KEY, JSON.stringify([...next])); } catch {}
+      return next;
+    });
+  };
+
+  const persistGroups = useCallback((newGroups: SidebarGroup[]) => {
+    setGroups(newGroups);
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((latest) => {
+        const updated = { ...latest, sidebar_groups: newGroups };
+        configRef.current = updated;
+        return fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(updated),
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  const moveToGroup = (projectId: string, groupName: string) => {
+    const newGroups = groups.map((g) => ({
+      ...g,
+      projects: g.projects.filter((id) => id !== projectId),
+    }));
+    if (groupName === "__ungrouped__") {
+      persistGroups(newGroups.filter((g) => g.projects.length > 0));
+    } else {
+      const target = newGroups.find((g) => g.name === groupName);
+      if (target) {
+        target.projects.push(projectId);
+      } else {
+        newGroups.push({ name: groupName, projects: [projectId] });
+      }
+      persistGroups(newGroups.filter((g) => g.projects.length > 0));
+    }
+    setContextMenu(null);
+  };
+
   const handlePin = (projectId: string) => {
     if (pinnedIds.includes(projectId)) return;
     persistPins([projectId, ...pinnedIds]);
@@ -284,12 +359,15 @@ export default function Sidebar() {
     return () => window.removeEventListener("click", close);
   }, [contextMenu]);
 
-  // Sort projects: pinned first (in pin order), then unpinned
+  // Sort projects: pinned first (in pin order), then grouped, then ungrouped
   const pinnedSet = new Set(pinnedIds);
   const pinnedProjects = pinnedIds
     .map((id) => projects.find((p) => p.id === id))
     .filter((p): p is Project => !!p);
+
+  const groupedIds = new Set(groups.flatMap((g) => g.projects));
   const unpinnedProjects = projects.filter((p) => !pinnedSet.has(p.id));
+  const ungroupedProjects = unpinnedProjects.filter((p) => !groupedIds.has(p.id));
 
   return (
     <aside
@@ -347,13 +425,63 @@ export default function Sidebar() {
                 onContextMenu={handleContextMenu}
               />
             ))}
-            {/* Divider between pinned and unpinned */}
             <div className={`h-px bg-border ${expanded ? "" : "w-6"}`} />
           </>
         )}
 
-        {/* Unpinned group */}
-        {unpinnedProjects.map((project) => (
+        {/* Grouped projects */}
+        {groups.map((group) => {
+          const groupProjects = group.projects
+            .map((id) => unpinnedProjects.find((p) => p.id === id))
+            .filter((p): p is Project => !!p);
+          if (groupProjects.length === 0) return null;
+          const isCollapsed = collapsedGroups.has(group.name);
+          return (
+            <div key={group.name} className="flex flex-col gap-1">
+              {/* Group header */}
+              <button
+                onClick={() => toggleGroupCollapse(group.name)}
+                className={`flex items-center gap-1 text-text-muted hover:text-text transition-colors ${
+                  expanded ? "px-2 py-0.5" : "justify-center w-full"
+                }`}
+                title={`${isCollapsed ? "Expand" : "Collapse"} ${group.name}`}
+              >
+                {expanded ? (
+                  <>
+                    <ChevronDownIcon collapsed={isCollapsed} />
+                    <span className="text-[10px] uppercase tracking-widest truncate">{group.name}</span>
+                  </>
+                ) : (
+                  <div className={`w-6 h-px ${isCollapsed ? "bg-text-muted" : "bg-border"}`} />
+                )}
+              </button>
+              {/* Group children */}
+              {!isCollapsed && groupProjects.map((project) => (
+                <ProjectIcon
+                  key={project.id}
+                  project={project}
+                  isActive={activeProjectId === project.id}
+                  expanded={expanded}
+                  pinned={false}
+                  onContextMenu={handleContextMenu}
+                />
+              ))}
+            </div>
+          );
+        })}
+
+        {/* Ungrouped projects */}
+        {ungroupedProjects.length > 0 && groups.length > 0 && (
+          <>
+            {expanded && (
+              <span className="text-[10px] uppercase tracking-widest text-text-muted px-2">Ungrouped</span>
+            )}
+            {groups.length > 0 && !expanded && (
+              <div className="w-6 h-px bg-border" />
+            )}
+          </>
+        )}
+        {ungroupedProjects.map((project) => (
           <ProjectIcon
             key={project.id}
             project={project}
@@ -384,6 +512,7 @@ export default function Sidebar() {
         <div
           className="fixed bg-bg-surface border border-border py-1 z-50 text-xs"
           style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
         >
           {pinnedSet.has(contextMenu.projectId) ? (
             <button
@@ -399,6 +528,44 @@ export default function Sidebar() {
             >
               Pin to top
             </button>
+          )}
+          <div className="h-px bg-border my-1" />
+          {!contextMenu.showGroupMenu ? (
+            <button
+              className="w-full px-3 py-1.5 text-left text-text hover:bg-[#1a1a1a] transition-colors"
+              onClick={() => setContextMenu({ ...contextMenu, showGroupMenu: true })}
+            >
+              Move to group...
+            </button>
+          ) : (
+            <div className="flex flex-col">
+              {groups.map((g) => (
+                <button
+                  key={g.name}
+                  className="w-full px-3 py-1.5 text-left text-text hover:bg-[#1a1a1a] transition-colors"
+                  onClick={() => moveToGroup(contextMenu.projectId, g.name)}
+                >
+                  {g.name}
+                </button>
+              ))}
+              <button
+                className="w-full px-3 py-1.5 text-left text-text hover:bg-[#1a1a1a] transition-colors"
+                onClick={() => {
+                  const name = prompt("New group name:");
+                  if (name?.trim()) moveToGroup(contextMenu.projectId, name.trim());
+                }}
+              >
+                + New group
+              </button>
+              {groupedIds.has(contextMenu.projectId) && (
+                <button
+                  className="w-full px-3 py-1.5 text-left text-text-muted hover:bg-[#1a1a1a] transition-colors"
+                  onClick={() => moveToGroup(contextMenu.projectId, "__ungrouped__")}
+                >
+                  Remove from group
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
