@@ -1885,7 +1885,9 @@ router.post("/api/setup", (req, res) => {
       const headCheck = exec("git", ["rev-parse", "HEAD"], { cwd: workingDir });
       if (!headCheck.ok) {
         exec("git", ["commit", "--allow-empty", "-m", "Initial commit (created by QuadWork setup)"], { cwd: workingDir });
-        exec("git", ["push", "origin", "main"], { cwd: workingDir });
+        const branchResult = exec("git", ["symbolic-ref", "--short", "HEAD"], { cwd: workingDir });
+        const defaultBranch = branchResult.ok ? branchResult.output : "main";
+        exec("git", ["push", "origin", defaultBranch], { cwd: workingDir });
       }
       // Sibling dirs: ../projectName-head/, ../projectName-re1/, etc. (matches CLI wizard)
       const projectName = path.basename(workingDir);
