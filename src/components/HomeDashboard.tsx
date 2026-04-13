@@ -58,10 +58,11 @@ export default function HomeDashboard() {
   }, []);
 
   return (
-    <div className="h-full overflow-y-auto p-6">
+    <div className="h-full overflow-y-auto lg:overflow-hidden lg:flex lg:flex-col p-6">
       {/* #488: two-column layout at lg+ — hero+projects left, activity right.
-          Collapses to current stacked layout below lg. */}
-      <div className="lg:grid lg:grid-cols-[1fr_340px] lg:gap-6 lg:h-[calc(100%-1rem)]">
+          Collapses to current stacked layout below lg. Flex-1 + min-h-0
+          lets the grid fill remaining height without a magic calc. */}
+      <div className="lg:grid lg:grid-cols-[1fr_340px] lg:gap-6 lg:flex-1 lg:min-h-0">
         {/* Left column: hero + header + project cards */}
         <div className="lg:overflow-y-auto lg:min-h-0">
           {/* #229: friendly empty-state hero. Only rendered after
