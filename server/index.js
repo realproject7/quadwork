@@ -2042,7 +2042,7 @@ server.listen(PORT, "127.0.0.1", () => {
   // #478 + #502: patch deployed AgentChattr instances to support force-replace
   // on register and fix idle-agent crash timeout.
   for (const p of (startupCfg.projects || [])) {
-    const acDir = p.agentchattr_dir || path.join(os.homedir(), ".quadwork", p.id, "agentchattr");
+    const acDir = resolveProjectChattr(p.id).dir;
     // Patch registry.py: add force parameter to register()
     const regPath = path.join(acDir, "registry.py");
     if (fs.existsSync(regPath)) {
