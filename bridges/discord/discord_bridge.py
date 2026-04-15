@@ -302,6 +302,9 @@ async def poll_ac_to_discord(cfg, channel):
     bridge_sender = cfg["bridge_sender"]
     interval = cfg["poll_interval"]
 
+    # #500: track connection failures so we can seed cursor on recovery
+    poll_was_failing = False
+
     # #458: dedup guard — track recently forwarded message IDs so a
     # stale cursor, drain-loop hiccup, or restart replay can't send
     # the same AC message to Discord twice within a session.
@@ -345,6 +348,13 @@ async def poll_ac_to_discord(cfg, channel):
                     break
 
                 resp.raise_for_status()
+
+                # #500: if we were failing and just recovered, seed cursor
+                if poll_was_failing:
+                    poll_was_failing = False
+                    _seed_cursor_to_latest(url, cfg["cursor_file"])
+                    break  # re-enter drain loop with fresh cursor
+
                 messages = resp.json()
 
                 if not isinstance(messages, list) or not messages:
@@ -430,8 +440,10 @@ async def poll_ac_to_discord(cfg, channel):
 
         except requests.RequestException as exc:
             log.warning("AC poll error: %s", exc)
+            poll_was_failing = True
         except Exception as exc:
             log.error("Unexpected AC poll error: %s", exc)
+            poll_was_failing = True
 
         await asyncio.sleep(interval)
 
