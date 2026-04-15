@@ -101,7 +101,7 @@ async function deregisterAgent(serverPort, name, token) {
 /**
  * Start a per-agent heartbeat that POSTs /api/heartbeat/{name} every 5s
  * with bearer auth. AgentChattr considers an agent crashed and removes
- * it after ~60s without a heartbeat, so without this every registered
+ * it after ~120s without a heartbeat, so without this every registered
  * QuadWork agent silently disappears from the channel one minute after
  * registration.
  *

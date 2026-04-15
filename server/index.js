@@ -2039,10 +2039,10 @@ server.listen(PORT, "127.0.0.1", () => {
       }
     }
   }
-  // #478: patch deployed AgentChattr instances to support force-replace
-  // on register. Prevents ghost slot accumulation after restarts.
+  // #478 + #502: patch deployed AgentChattr instances to support force-replace
+  // on register and fix idle-agent crash timeout.
   for (const p of (startupCfg.projects || [])) {
-    const acDir = p.agentchattr_dir || path.join(os.homedir(), ".quadwork", p.id, "agentchattr");
+    const acDir = resolveProjectChattr(p.id).dir;
     // Patch registry.py: add force parameter to register()
     const regPath = path.join(acDir, "registry.py");
     if (fs.existsSync(regPath)) {
@@ -2058,17 +2058,35 @@ server.listen(PORT, "127.0.0.1", () => {
           reg = reg.replace(
             "            self._expire_reserved()\n\n            # Find next free slot",
             "            self._expire_reserved()\n\n" +
-            "            # quadwork#478: force-replace — expire all existing slots for this\n" +
-            "            # base so the new registration always lands at slot 1.\n" +
+            "            # quadwork#478 + #502: force-replace — expire all existing slots\n" +
+            "            # for this base so the new registration always lands at slot 1.\n" +
+            "            # Also clear _reserved entries: after a crash-timeout the old name\n" +
+            "            # lives only in _reserved, so without this the grace period still\n" +
+            "            # blocks slot 1 and the agent gets a -2 suffix.\n" +
             "            if force:\n" +
             "                ghosts = [n for n, i in self._instances.items() if i.base == base]\n" +
             "                for name in ghosts:\n" +
             "                    del self._instances[name]\n" +
-            "                    self._reserved[name] = time.time()\n\n" +
+            "                stale_reserved = [rn for rn in self._reserved\n" +
+            "                                  if self._parse_name(rn)[0] == base]\n" +
+            "                for rn in stale_reserved:\n" +
+            "                    del self._reserved[rn]\n\n" +
             "            # Find next free slot",
           );
           fs.writeFileSync(regPath, reg);
           console.log(`[ghost-fix] ${p.id}: patched registry.py with force-replace support`);
+        } else if (!reg.includes("stale_reserved")) {
+          // #502: upgrade existing force-replace patch to also clear _reserved
+          reg = reg.replace(
+            /( +)for name in ghosts:\n\1    del self\._instances\[name\]\n\1    self\._reserved\[name\] = time\.time\(\)/,
+            "$1for name in ghosts:\n$1    del self._instances[name]\n" +
+            "$1stale_reserved = [rn for rn in self._reserved\n" +
+            "$1                  if self._parse_name(rn)[0] == base]\n" +
+            "$1for rn in stale_reserved:\n" +
+            "$1    del self._reserved[rn]",
+          );
+          fs.writeFileSync(regPath, reg);
+          console.log(`[ghost-fix] ${p.id}: upgraded registry.py force-replace to clear _reserved (#502)`);
         }
       } catch (err) {
         console.warn(`[ghost-fix] ${p.id}: failed to patch registry.py: ${err.message}`);
@@ -2089,6 +2107,27 @@ server.listen(PORT, "127.0.0.1", () => {
         }
       } catch (err) {
         console.warn(`[ghost-fix] ${p.id}: failed to patch app.py: ${err.message}`);
+      }
+    }
+    // #502: increase crash timeout from 15s to 120s for idle agent tolerance
+    if (fs.existsSync(appPath)) {
+      try {
+        let app = fs.readFileSync(appPath, "utf-8");
+        if (app.includes("_CRASH_TIMEOUT = 15")) {
+          app = app.replace(
+            "_CRASH_TIMEOUT = 15",
+            "_CRASH_TIMEOUT = 120",
+          );
+          // Fix the misleading comment too
+          app = app.replace(
+            "# Crash timeout: if a wrapper hasn't heartbeated for 60s,\n",
+            "# Crash timeout: if a wrapper hasn't heartbeated for 120s,\n",
+          );
+          fs.writeFileSync(appPath, app);
+          console.log(`[idle-fix] ${p.id}: increased crash timeout to 120s (#502)`);
+        }
+      } catch (err) {
+        console.warn(`[idle-fix] ${p.id}: failed to patch app.py crash timeout: ${err.message}`);
       }
     }
   }
