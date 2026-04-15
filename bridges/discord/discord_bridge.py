@@ -140,6 +140,25 @@ def save_cursor(path):
         log.warning("Failed to save cursor to %s: %s", path, exc)
 
 
+def _seed_cursor_to_latest(url, cursor_file):
+    """#500: Skip to latest AC message so reconnect doesn't replay old messages."""
+    try:
+        headers = {}
+        if ac["token"]:
+            headers["Authorization"] = f"Bearer {ac['token']}"
+        resp = requests.get(f"{url}/api/messages", params={"limit": 1}, headers=headers, timeout=10)
+        if resp.ok:
+            msgs = resp.json()
+            if isinstance(msgs, list) and msgs:
+                latest_id = max(m.get("id", 0) for m in msgs)
+                if latest_id > _cursor["last_seen_id"]:
+                    _cursor["last_seen_id"] = latest_id
+                    save_cursor(cursor_file)
+                    log.info("Seeded cursor to latest: last_seen_id=%d", latest_id)
+    except Exception as exc:
+        log.warning("Failed to seed cursor to latest: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # AgentChattr registration + heartbeat
 # ---------------------------------------------------------------------------
@@ -182,7 +201,7 @@ def ac_deregister(url):
         pass
 
 
-def _heartbeat_loop(url):
+def _heartbeat_loop(url, cursor_file):
     """Daemon thread: POST /api/heartbeat/{name} every 5s."""
     while True:
         name = ac["name"]
@@ -199,6 +218,7 @@ def _heartbeat_loop(url):
                     log.warning("Heartbeat 409 — AC restarted, re-registering")
                     try:
                         ac_register(url)
+                        _seed_cursor_to_latest(url, cursor_file)
                     except Exception as exc:
                         log.error("Re-register failed: %s", exc)
             except Exception:
@@ -206,9 +226,9 @@ def _heartbeat_loop(url):
         time.sleep(5)
 
 
-def start_heartbeat(url):
+def start_heartbeat(url, cursor_file=""):
     """Start the heartbeat daemon thread."""
-    t = threading.Thread(target=_heartbeat_loop, args=(url,), daemon=True)
+    t = threading.Thread(target=_heartbeat_loop, args=(url, cursor_file), daemon=True)
     t.start()
     return t
 
@@ -282,6 +302,9 @@ async def poll_ac_to_discord(cfg, channel):
     bridge_sender = cfg["bridge_sender"]
     interval = cfg["poll_interval"]
 
+    # #500: track connection failures so we can seed cursor on recovery
+    poll_was_failing = False
+
     # #458: dedup guard — track recently forwarded message IDs so a
     # stale cursor, drain-loop hiccup, or restart replay can't send
     # the same AC message to Discord twice within a session.
@@ -319,11 +342,19 @@ async def poll_ac_to_discord(cfg, channel):
                     log.warning("AC poll %d — re-registering", resp.status_code)
                     try:
                         ac_register(url)
+                        _seed_cursor_to_latest(url, cfg["cursor_file"])
                     except Exception as exc:
                         log.error("Re-register failed: %s", exc)
                     break
 
                 resp.raise_for_status()
+
+                # #500: if we were failing and just recovered, seed cursor
+                if poll_was_failing:
+                    poll_was_failing = False
+                    _seed_cursor_to_latest(url, cfg["cursor_file"])
+                    break  # re-enter drain loop with fresh cursor
+
                 messages = resp.json()
 
                 if not isinstance(messages, list) or not messages:
@@ -409,8 +440,10 @@ async def poll_ac_to_discord(cfg, channel):
 
         except requests.RequestException as exc:
             log.warning("AC poll error: %s", exc)
+            poll_was_failing = True
         except Exception as exc:
             log.error("Unexpected AC poll error: %s", exc)
+            poll_was_failing = True
 
         await asyncio.sleep(interval)
 
@@ -568,8 +601,11 @@ def main():
         log.error("Initial AC registration failed: %s", exc)
         log.info("Will retry on first message send")
 
+    # #500: seed cursor to latest on startup to avoid replaying history
+    _seed_cursor_to_latest(cfg["agentchattr_url"], cfg["cursor_file"])
+
     # Start heartbeat
-    start_heartbeat(cfg["agentchattr_url"])
+    start_heartbeat(cfg["agentchattr_url"], cfg["cursor_file"])
 
     # Register shutdown handlers
     atexit.register(shutdown, cfg)
