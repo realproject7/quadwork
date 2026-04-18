@@ -1318,11 +1318,13 @@ async function sendTriggerMessage(projectId) {
         if (bp && bp.complete) {
           console.log(`[auto-trigger] ${projectId}: batch complete, auto-stopped`);
           stopTrigger(projectId);
-          // Also stop caffeinate if running (#441 companion fix)
-          if (caffeinateProcess.process) {
+          // Also stop caffeinate if no other triggers remain running
+          // (#441 companion fix). caffeinateProcess is global (not
+          // project-scoped), so only kill it when all work is done.
+          if (caffeinateProcess.process && triggers.size === 0) {
             try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
             caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
-            console.log(`[auto-trigger] ${projectId}: caffeinate auto-stopped`);
+            console.log(`[auto-trigger] ${projectId}: caffeinate auto-stopped (no active triggers remain)`);
           }
           return;
         }
