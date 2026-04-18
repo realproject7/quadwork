@@ -29,6 +29,26 @@ const SENDER_COLORS: Record<string, string> = {
 
 const AGENTS = ["head", "re1", "re2", "dev", "user"];
 
+// #519: system/status message filter patterns — reuses the same set
+// from the bridge noise filter (#501 / PR #504).
+const SYSTEM_PATTERNS = [
+  /^.+ is online$/,
+  /disconnected \(timeout\)/,
+  /^.+ disconnected$/,
+  /auto-recovered/,
+  /Resuming agent conversation/,
+  /Loop guard:/,
+];
+
+function isSystemMessage(msg: Message): boolean {
+  if (msg.sender === "system") return true;
+  if (msg.type === "join" || msg.type === "leave") return true;
+  for (const pat of SYSTEM_PATTERNS) {
+    if (pat.test(msg.text)) return true;
+  }
+  return false;
+}
+
 // #410 / quadwork#276: slash commands recognized by AgentChattr's
 // native UI (mirrors agentchattr/static/chat.js lines 1978-1989).
 // Typing `/` in the chat input opens an autocomplete menu of these.
@@ -115,6 +135,19 @@ export default function ChatPanel({ projectId }: ChatPanelProps) {
 /** API-driven fallback when iframe is blocked */
 function ChatPanelAPI({ projectId }: { projectId?: string }) {
   const channel = "general";
+  // #519: filter toggle — hide system/status messages. Persisted in
+  // localStorage (per-browser, not per-project). Default: OFF.
+  const [filterSystem, setFilterSystem] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("chatFilterSystem") === "1";
+  });
+  const toggleFilter = useCallback(() => {
+    setFilterSystem((prev) => {
+      const next = !prev;
+      localStorage.setItem("chatFilterSystem", next ? "1" : "0");
+      return next;
+    });
+  }, []);
   const [messages, setMessages] = useState<Message[]>([]);
   // #410: track whether the initial fetch has completed so we don't
   // flash the welcome/empty state while messages are still loading.
@@ -380,8 +413,25 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
     c.command.toLowerCase().startsWith(input.toLowerCase()),
   );
 
+  const displayMessages = filterSystem ? messages.filter((m) => !isSystemMessage(m)) : messages;
+
   return (
     <div className="flex flex-col h-full bg-bg">
+      {/* #519: filter toggle header */}
+      <div className="flex items-center justify-end h-7 px-3 shrink-0 border-b border-border">
+        <button
+          type="button"
+          onClick={toggleFilter}
+          title={filterSystem ? "Showing agent messages only — click to show all" : "Showing all messages — click to hide system/status noise"}
+          className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
+            filterSystem
+              ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+              : "border-border text-text-muted hover:text-text hover:border-accent"
+          }`}
+        >
+          {filterSystem ? "Agents only" : "All messages"}
+        </button>
+      </div>
       {/* Auth error banner */}
       {authError && (
         <div className="px-3 py-2 bg-red-900/30 border-b border-red-700/50 text-[11px] text-red-400">
@@ -399,7 +449,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             <span className="text-xs text-text-muted">Loading messages...</span>
           </div>
         )}
-        {loaded && messages.length === 0 && (
+        {loaded && displayMessages.length === 0 && (
           // #229: replace the bare "No messages" text with a richer
           // empty state — friendly icon, headline, click-to-insert
           // example chips, and a How to Work modal trigger.
@@ -407,7 +457,7 @@ function ChatPanelAPI({ projectId }: { projectId?: string }) {
             <ProjectChatEmptyState onInsert={(t) => { setInput(t); inputRef.current?.focus(); }} />
           </div>
         )}
-        {messages.map((msg) => (
+        {displayMessages.map((msg) => (
           <div key={msg.id} className="group flex gap-2 text-[12px] leading-5">
             <span className="text-text-muted shrink-0 w-12 text-right tabular-nums">
               {msg.time?.slice(0, 5) || ""}
