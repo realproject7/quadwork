@@ -181,10 +181,12 @@ export default function TerminalPanel({
     let reattachAttempts = 0;
     const MAX_REATTACH = 5;
 
-    // #477: track whether we've done a post-replay fit. After the
-    // scrollback replay data is written, xterm needs a fit() to
-    // repaint — otherwise idle terminals appear blank until resize.
-    let needsPostReplayFit = false;
+    // #511: aggressive post-replay fit strategy. A single rAF fit
+    // isn't enough — the container may not have final CSS dimensions
+    // when the first WS message arrives. Retry fit() on an interval
+    // for the first 2s after connect to cover slow layout, SSR
+    // hydration delays, and lazy container sizing.
+    let postReplayFitTimer: ReturnType<typeof setInterval> | null = null;
 
     const connect = async () => {
       const base = await resolveBase();
@@ -196,7 +198,19 @@ export default function TerminalPanel({
 
       ws.onopen = () => {
         reattachAttempts = 0;
-        needsPostReplayFit = true;
+        // #511: start the aggressive fit interval on connect. Fires
+        // fit() every 500ms for 2s (4 attempts) to catch containers
+        // that aren't layout-resolved yet when scrollback arrives.
+        if (postReplayFitTimer) clearInterval(postReplayFitTimer);
+        let fitAttempts = 0;
+        postReplayFitTimer = setInterval(() => {
+          fit();
+          fitAttempts++;
+          if (fitAttempts >= 4) {
+            clearInterval(postReplayFitTimer!);
+            postReplayFitTimer = null;
+          }
+        }, 500);
         ws.send(
           JSON.stringify({
             type: "resize",
@@ -212,13 +226,6 @@ export default function TerminalPanel({
 
       ws.onmessage = (e) => {
         term.write(e.data);
-        // #477: after the first data write (scrollback replay), force
-        // a fit() so xterm repaints. Without this, idle terminals stay
-        // blank until a browser resize event triggers repaint.
-        if (needsPostReplayFit) {
-          needsPostReplayFit = false;
-          requestAnimationFrame(() => fit());
-        }
         const cb = onActivityRef.current;
         if (cb) cb();
       };
@@ -267,6 +274,7 @@ export default function TerminalPanel({
 
     return () => {
       cancelled = true;
+      if (postReplayFitTimer) clearInterval(postReplayFitTimer);
       observer.disconnect();
       wsRef.current?.close();
       term.dispose();
