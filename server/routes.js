@@ -1069,17 +1069,17 @@ router.get("/api/uploads/:project/:filename", (req, res) => {
 
 // ─── Projects (dashboard aggregation) ──────────────────────────────────────
 
-function ghJson(args) {
-  try {
-    const out = execFileSync("gh", args, { encoding: "utf-8", timeout: 15000 });
-    const parsed = JSON.parse(out);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
+// #512: cache /api/projects results for 60s to eliminate repeated
+// slow gh CLI calls on every dashboard poll.
+let _projectsCache = null;
+let _projectsCacheTs = 0;
+const PROJECTS_CACHE_TTL = 60_000;
 
 router.get("/api/projects", async (req, res) => {
+  if (_projectsCache && Date.now() - _projectsCacheTs < PROJECTS_CACHE_TTL) {
+    return res.json(_projectsCache);
+  }
+
   const cfg = readConfigFile();
 
   // Fetch active sessions from our own in-memory state (only running PTYs)
@@ -1113,24 +1113,34 @@ router.get("/api/projects", async (req, res) => {
     .slice(-10)
     .reverse();
 
-  const numberToProject = {};
-  const projectResults = (cfg.projects || []).map((p) => {
+  // #512: build project-id-to-name map from config and a reverse
+  // lookup from chat message to project name via chatMsgsByProject
+  // (which already knows which AC instance each message came from).
+  // This replaces the expensive allPrs/allIssues gh CLI calls that
+  // were only used for the numberToProject mapping.
+  const projectIdToName = {};
+  for (const p of cfg.projects || []) projectIdToName[p.id] = p.name;
+  const msgToProject = new Map();
+  for (const [pid, msgs] of Object.entries(chatMsgsByProject)) {
+    for (const m of msgs) msgToProject.set(m, projectIdToName[pid]);
+  }
+
+  // #512: parallelize gh CLI calls across projects using async exec.
+  // Only fetch open PR count and most recent PR activity — drop the
+  // allPrs/allIssues calls that were only used for numberToProject.
+  async function fetchProjectGhData(p) {
     let openPrs = 0;
     let lastActivity = null;
-
     if (REPO_RE.test(p.repo)) {
-      const prs = ghJson(["pr", "list", "-R", p.repo, "--json", "number", "--limit", "100"]);
-      openPrs = prs.length;
-
-      const recentPrs = ghJson(["pr", "list", "-R", p.repo, "--state", "all", "--json", "updatedAt", "--limit", "1"]);
-      lastActivity = recentPrs[0]?.updatedAt || null;
-
-      const allPrs = ghJson(["pr", "list", "-R", p.repo, "--state", "all", "--json", "number", "--limit", "100"]);
-      for (const pr of allPrs) numberToProject[pr.number] = p.name;
-      const allIssues = ghJson(["issue", "list", "-R", p.repo, "--state", "all", "--json", "number", "--limit", "100"]);
-      for (const issue of allIssues) numberToProject[issue.number] = p.name;
+      try {
+        const [prs, recentPrs] = await Promise.allSettled([
+          ghJsonExecAsync(["pr", "list", "-R", p.repo, "--json", "number", "--limit", "100"]),
+          ghJsonExecAsync(["pr", "list", "-R", p.repo, "--state", "all", "--json", "updatedAt", "--limit", "1"]),
+        ]);
+        if (prs.status === "fulfilled") openPrs = prs.value.length;
+        if (recentPrs.status === "fulfilled") lastActivity = recentPrs.value[0]?.updatedAt || null;
+      } catch {}
     }
-
     const hasAgents = p.agents && Object.keys(p.agents).length > 0;
     return {
       id: p.id,
@@ -1141,20 +1151,21 @@ router.get("/api/projects", async (req, res) => {
       state: hasAgents && activeProjectIds.has(p.id) ? "active" : "idle",
       lastActivity,
     };
-  });
+  }
 
-  // Build activity feed
+  const projectResults = await Promise.all(
+    (cfg.projects || []).map((p) => fetchProjectGhData(p))
+  );
+
+  // Build activity feed — use chat-based project association instead
+  // of the dropped numberToProject gh lookup.
   const recentEvents = [];
   for (const m of workflowMsgs) {
+    // First: try text match against repo/project name
     let projectName = (cfg.projects || []).find((p) => m.text.includes(p.repo) || m.text.includes(p.name))?.name;
-    if (!projectName) {
-      const numMatch = m.text.match(/#(\d+)/);
-      if (numMatch) projectName = numberToProject[parseInt(numMatch[1], 10)];
-    }
-    if (!projectName) {
-      const branchMatch = m.text.match(/task\/(\d+)/);
-      if (branchMatch) projectName = numberToProject[parseInt(branchMatch[1], 10)];
-    }
+    // Second: use the AC instance the message came from
+    if (!projectName) projectName = msgToProject.get(m);
+    // Fallback: single-project installs
     if (!projectName && cfg.projects && cfg.projects.length === 1) {
       projectName = cfg.projects[0].name;
     }
@@ -1169,7 +1180,10 @@ router.get("/api/projects", async (req, res) => {
     if (recentEvents.length >= 10) break;
   }
 
-  res.json({ projects: projectResults, recentEvents });
+  const result = { projects: projectResults, recentEvents };
+  _projectsCache = result;
+  _projectsCacheTs = Date.now();
+  res.json(result);
 });
 
 // ─── GitHub Issues / PRs ───────────────────────────────────────────────────
