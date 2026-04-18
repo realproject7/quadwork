@@ -1,8 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import DiscordSetupModal from "./DiscordSetupModal";
+
+interface BatchState {
+  complete: boolean;
+  items: { issue_number: number }[];
+}
 
 interface DiscordBridgeWidgetProps {
   projectId: string;
@@ -43,6 +48,36 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
   const [pollError, setPollError] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [restartNotice, setRestartNotice] = useState<string | null>(null);
+
+  // #518: Auto toggle — start/stop bridge with batch lifecycle
+  const [autoDiscord, setAutoDiscord] = useState(false);
+  const [autoStatus, setAutoStatus] = useState<string | null>(null);
+  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
+  const autoDiscordRef = useRef(autoDiscord);
+  const runningRef = useRef(false);
+  useEffect(() => { autoDiscordRef.current = autoDiscord; }, [autoDiscord]);
+
+  // Load persisted auto setting from config
+  const autoLoadedRef = useRef(false);
+  useEffect(() => {
+    autoLoadedRef.current = false;
+    prevBatchRef.current = null;
+    setAutoDiscord(false);
+    setAutoStatus(null);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (autoLoadedRef.current) return;
+    fetch("/api/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg) => {
+        if (!cfg) return;
+        const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+        if (entry?.discord_auto) setAutoDiscord(true);
+        autoLoadedRef.current = true;
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   const load = useCallback(async () => {
     try {
@@ -112,8 +147,84 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
     await load();
   };
 
+  // #518: toggle handler — persist discord_auto in project config
+  const toggleAutoDiscord = useCallback(async () => {
+    const next = !autoDiscord;
+    setAutoDiscord(next);
+    if (!next) {
+      setAutoStatus(null);
+      prevBatchRef.current = null;
+    }
+    try {
+      const r = await fetch("/api/config");
+      if (!r.ok) return;
+      const cfg = await r.json();
+      const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+      if (entry) {
+        entry.discord_auto = next;
+        await fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cfg),
+        });
+      }
+    } catch { /* non-fatal */ }
+  }, [autoDiscord, projectId]);
+
+  // #518: batch lifecycle polling — auto-start/stop bridge with batch
+  const AUTO_POLL_MS = 30_000;
+
+  const checkBatchLifecycle = useCallback(async () => {
+    if (!autoDiscordRef.current) return;
+    try {
+      const r = await fetch(`/api/batch-progress?project=${encodeURIComponent(projectId)}`);
+      if (!r.ok) return;
+      const data: BatchState = await r.json();
+      const hasItems = data.items.length > 0;
+      const prev = prevBatchRef.current;
+      prevBatchRef.current = { complete: data.complete, hasItems };
+
+      if (!prev) {
+        if (hasItems && !data.complete && !runningRef.current) {
+          setAutoStatus("Batch active — auto-starting bridge.");
+          await callDiscord("start", { project_id: projectId }).catch(() => {});
+          await load();
+        }
+        if (hasItems && data.complete && runningRef.current) {
+          setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+          await callDiscord("stop", { project_id: projectId }).catch(() => {});
+          await load();
+        }
+        return;
+      }
+
+      // Batch just completed → auto-stop
+      if (hasItems && data.complete && !prev.complete && runningRef.current) {
+        setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+        await callDiscord("stop", { project_id: projectId }).catch(() => {});
+        await load();
+        return;
+      }
+
+      // New batch started → auto-start
+      if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !runningRef.current) {
+        setAutoStatus("New batch detected — auto-starting bridge.");
+        await callDiscord("start", { project_id: projectId }).catch(() => {});
+        await load();
+      }
+    } catch { /* non-fatal */ }
+  }, [projectId, load]);
+
+  useEffect(() => {
+    if (!autoDiscord) return;
+    checkBatchLifecycle();
+    const id = window.setInterval(checkBatchLifecycle, AUTO_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [autoDiscord, checkBatchLifecycle]);
+
   const configured = !!status?.configured;
   const running = !!status?.running;
+  useEffect(() => { runningRef.current = running; }, [running]);
   const displayError = actionError || pollError || (!running && status?.last_error) || "";
 
   return (
@@ -126,9 +237,25 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
               <b>Discord Bridge</b> forwards AgentChattr messages to a Discord channel so you can monitor from Discord. Bidirectional — replies from Discord appear in chat.
             </InfoTooltip>
           </div>
-          {displayError && (
-            <span className="text-[10px] text-error">error</span>
-          )}
+          <div className="flex items-center gap-1.5">
+            {configured && (
+              <button
+                type="button"
+                onClick={toggleAutoDiscord}
+                title={autoDiscord ? "Auto ON — bridge follows batch lifecycle" : "Auto OFF — manual start/stop only"}
+                className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
+                  autoDiscord
+                    ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+                    : "border-border text-text-muted hover:text-text hover:border-accent"
+                }`}
+              >
+                Auto {autoDiscord ? "●" : "○"}
+              </button>
+            )}
+            {displayError && (
+              <span className="text-[10px] text-error">error</span>
+            )}
+          </div>
         </div>
         <div className="p-3 flex flex-col gap-2">
           {!configured ? (
@@ -214,6 +341,11 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
               >
                 dismiss
               </button>
+            </div>
+          )}
+          {autoStatus && (
+            <div className="mt-1 text-[10px] text-accent">
+              {autoStatus}
             </div>
           )}
           {displayError && (

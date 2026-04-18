@@ -1,8 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import TelegramSetupModal from "./TelegramSetupModal";
+
+interface BatchState {
+  complete: boolean;
+  items: { issue_number: number }[];
+}
 
 interface TelegramBridgeWidgetProps {
   projectId: string;
@@ -60,6 +65,36 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   // 400 registration loop. Surface that prompt here instead of
   // silently returning "Installed".
   const [restartNotice, setRestartNotice] = useState<string | null>(null);
+
+  // #518: Auto toggle — start/stop bridge with batch lifecycle
+  const [autoTelegram, setAutoTelegram] = useState(false);
+  const [autoStatus, setAutoStatus] = useState<string | null>(null);
+  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
+  const autoTelegramRef = useRef(autoTelegram);
+  const runningRef = useRef(false);
+  useEffect(() => { autoTelegramRef.current = autoTelegram; }, [autoTelegram]);
+
+  // Load persisted auto setting from config
+  const autoLoadedRef = useRef(false);
+  useEffect(() => {
+    autoLoadedRef.current = false;
+    prevBatchRef.current = null;
+    setAutoTelegram(false);
+    setAutoStatus(null);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (autoLoadedRef.current) return;
+    fetch("/api/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg) => {
+        if (!cfg) return;
+        const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+        if (entry?.telegram_auto) setAutoTelegram(true);
+        autoLoadedRef.current = true;
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   const load = useCallback(async () => {
     try {
@@ -135,8 +170,84 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
     await load();
   };
 
+  // #518: toggle handler — persist telegram_auto in project config
+  const toggleAutoTelegram = useCallback(async () => {
+    const next = !autoTelegram;
+    setAutoTelegram(next);
+    if (!next) {
+      setAutoStatus(null);
+      prevBatchRef.current = null;
+    }
+    try {
+      const r = await fetch("/api/config");
+      if (!r.ok) return;
+      const cfg = await r.json();
+      const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+      if (entry) {
+        entry.telegram_auto = next;
+        await fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cfg),
+        });
+      }
+    } catch { /* non-fatal */ }
+  }, [autoTelegram, projectId]);
+
+  // #518: batch lifecycle polling — auto-start/stop bridge with batch
+  const AUTO_POLL_MS = 30_000;
+
+  const checkBatchLifecycle = useCallback(async () => {
+    if (!autoTelegramRef.current) return;
+    try {
+      const r = await fetch(`/api/batch-progress?project=${encodeURIComponent(projectId)}`);
+      if (!r.ok) return;
+      const data: BatchState = await r.json();
+      const hasItems = data.items.length > 0;
+      const prev = prevBatchRef.current;
+      prevBatchRef.current = { complete: data.complete, hasItems };
+
+      if (!prev) {
+        if (hasItems && !data.complete && !runningRef.current) {
+          setAutoStatus("Batch active — auto-starting bridge.");
+          await callTelegram("start", { project_id: projectId }).catch(() => {});
+          await load();
+        }
+        if (hasItems && data.complete && runningRef.current) {
+          setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+          await callTelegram("stop", { project_id: projectId }).catch(() => {});
+          await load();
+        }
+        return;
+      }
+
+      // Batch just completed → auto-stop
+      if (hasItems && data.complete && !prev.complete && runningRef.current) {
+        setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+        await callTelegram("stop", { project_id: projectId }).catch(() => {});
+        await load();
+        return;
+      }
+
+      // New batch started → auto-start
+      if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !runningRef.current) {
+        setAutoStatus("New batch detected — auto-starting bridge.");
+        await callTelegram("start", { project_id: projectId }).catch(() => {});
+        await load();
+      }
+    } catch { /* non-fatal */ }
+  }, [projectId, load]);
+
+  useEffect(() => {
+    if (!autoTelegram) return;
+    checkBatchLifecycle();
+    const id = window.setInterval(checkBatchLifecycle, AUTO_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [autoTelegram, checkBatchLifecycle]);
+
   const configured = !!status?.configured;
   const running = !!status?.running;
+  useEffect(() => { runningRef.current = running; }, [running]);
   // #372: show, in preference order, the most recent actionable
   // error: the operator's last Start/Stop failure, then a poll
   // failure, then the server-side log tail from a crashed bridge.
@@ -155,9 +266,25 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
               <b>Telegram Bridge</b> forwards AgentChattr messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.
             </InfoTooltip>
           </div>
-          {displayError && (
-            <span className="text-[10px] text-error">error</span>
-          )}
+          <div className="flex items-center gap-1.5">
+            {configured && (
+              <button
+                type="button"
+                onClick={toggleAutoTelegram}
+                title={autoTelegram ? "Auto ON — bridge follows batch lifecycle" : "Auto OFF — manual start/stop only"}
+                className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
+                  autoTelegram
+                    ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+                    : "border-border text-text-muted hover:text-text hover:border-accent"
+                }`}
+              >
+                Auto {autoTelegram ? "●" : "○"}
+              </button>
+            )}
+            {displayError && (
+              <span className="text-[10px] text-error">error</span>
+            )}
+          </div>
         </div>
         <div className="p-3 flex flex-col gap-2">
           {!configured ? (
@@ -243,6 +370,11 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
               >
                 dismiss
               </button>
+            </div>
+          )}
+          {autoStatus && (
+            <div className="mt-1 text-[10px] text-accent">
+              {autoStatus}
             </div>
           )}
           {displayError && (
