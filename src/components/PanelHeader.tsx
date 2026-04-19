@@ -10,9 +10,11 @@ interface PanelHeaderProps {
   onStatusChange?: (newStatus: string) => void;
   /** #407: optional info tooltip element rendered after the label */
   tooltip?: React.ReactNode;
+  /** #523: optional right-aligned content (e.g. toggle switches) */
+  children?: React.ReactNode;
 }
 
-export default function PanelHeader({ label, status, projectId, agentId, onStatusChange, tooltip }: PanelHeaderProps) {
+export default function PanelHeader({ label, status, projectId, agentId, onStatusChange, tooltip, children }: PanelHeaderProps) {
   const dotColor =
     status === "running"
       ? "bg-accent"
@@ -45,35 +47,38 @@ export default function PanelHeader({ label, status, projectId, agentId, onStatu
         </span>
         {tooltip}
       </div>
-      {showControls && (
-        <div className="flex items-center gap-1">
-          {status !== "running" && (
+      <div className="flex items-center gap-1.5">
+        {children}
+        {showControls && (
+          <>
+            {status !== "running" && (
+              <button
+                onClick={() => lifecycleAction("start")}
+                className="text-[10px] text-text-muted hover:text-accent transition-colors px-1"
+                title="Start"
+              >
+                ▶
+              </button>
+            )}
+            {status === "running" && (
+              <button
+                onClick={() => lifecycleAction("stop")}
+                className="text-[10px] text-text-muted hover:text-error transition-colors px-1"
+                title="Stop"
+              >
+                ■
+              </button>
+            )}
             <button
-              onClick={() => lifecycleAction("start")}
+              onClick={() => lifecycleAction("restart")}
               className="text-[10px] text-text-muted hover:text-accent transition-colors px-1"
-              title="Start"
+              title="Restart"
             >
-              ▶
+              ↻
             </button>
-          )}
-          {status === "running" && (
-            <button
-              onClick={() => lifecycleAction("stop")}
-              className="text-[10px] text-text-muted hover:text-error transition-colors px-1"
-              title="Stop"
-            >
-              ■
-            </button>
-          )}
-          <button
-            onClick={() => lifecycleAction("restart")}
-            className="text-[10px] text-text-muted hover:text-accent transition-colors px-1"
-            title="Restart"
-          >
-            ↻
-          </button>
-        </div>
-      )}
+          </>
+        )}
+      </div>
     </div>
   );
 }

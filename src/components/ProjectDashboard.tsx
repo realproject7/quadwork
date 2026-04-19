@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import PanelHeader from "./PanelHeader";
 import InfoTooltip from "./InfoTooltip";
 import ChatPanel from "./ChatPanel";
@@ -24,6 +24,34 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   const [rowRatio, setRowRatio] = useState(0.5);
   const dragging = useRef<"col" | "row" | null>(null);
   const [agentStates, setAgentStates] = useState<Record<string, AgentState>>({});
+
+  // #523: system message filter — lifted here so the toggle renders
+  // inline in PanelHeader while ChatPanel consumes the value.
+  const [filterSystem, setFilterSystem] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("chatFilterSystem") === "1";
+  });
+  const toggleFilter = useCallback(() => {
+    setFilterSystem((prev) => {
+      const next = !prev;
+      localStorage.setItem("chatFilterSystem", next ? "1" : "0");
+      return next;
+    });
+  }, []);
+  const filterToggle = useMemo(() => (
+    <button
+      type="button"
+      onClick={toggleFilter}
+      title={filterSystem ? "Showing agent messages only — click to show all" : "Showing all messages — click to hide system/status noise"}
+      className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
+        filterSystem
+          ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+          : "border-border text-text-muted hover:text-text hover:border-accent"
+      }`}
+    >
+      {filterSystem ? "Agents ●" : "All ○"}
+    </button>
+  ), [filterSystem, toggleFilter]);
 
   // Poll agent states
   useEffect(() => {
@@ -117,9 +145,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           <InfoTooltip>
             <b>Primary Chat</b> — live chat between you and the 4 AI agents. Messages you type here trigger agent actions. Use @mentions to address specific agents.
           </InfoTooltip>
-        } />
+        }>
+          {filterToggle}
+        </PanelHeader>
         <div className="flex-1 min-h-0">
-          <ChatPanel projectId={projectId} />
+          <ChatPanel projectId={projectId} filterSystem={filterSystem} />
         </div>
         <ControlBar projectId={projectId} />
       </div>
