@@ -35,9 +35,25 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     setFilterSystem((prev) => {
       const next = !prev;
       localStorage.setItem("chatFilterSystem", next ? "1" : "0");
+      // #525: persist to project config so bridges respect the filter
+      fetch("/api/config")
+        .then((r) => r.ok ? r.json() : null)
+        .then((cfg) => {
+          if (!cfg) return;
+          const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+          if (entry) {
+            entry.bridge_filter_agents_only = next;
+            return fetch("/api/config", {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(cfg),
+            });
+          }
+        })
+        .catch(() => {});
       return next;
     });
-  }, []);
+  }, [projectId]);
   const filterToggle = useMemo(() => (
     <button
       type="button"

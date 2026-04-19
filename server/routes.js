@@ -2926,7 +2926,8 @@ function buildDiscordBridgeToml(dc, projectId) {
     `bot_token = "${dc.bot_token}"\n` +
     `channel_id = "${dc.channel_id}"\n` +
     `agentchattr_url = "${dc.agentchattr_url}"\n` +
-    `cursor_file = "${cursorFile}"\n`
+    `cursor_file = "${cursorFile}"\n` +
+    `project_id = "${projectId}"\n`
   );
 }
 

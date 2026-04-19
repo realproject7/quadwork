@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
     "poll_interval": 2,
     "bridge_sender": "dc",
     "cursor_file": "",
+    "project_id": "",  # #525: used to read bridge_filter_agents_only from config
 }
 
 ENV_MAP = {
@@ -234,6 +235,35 @@ def start_heartbeat(url, cursor_file=""):
 
 
 # ---------------------------------------------------------------------------
+# #525: read bridge_filter_agents_only from ~/.quadwork/config.json
+# ---------------------------------------------------------------------------
+
+_CONFIG_JSON = os.path.join(os.path.expanduser("~"), ".quadwork", "config.json")
+_agents_only_cache: dict[str, tuple[float, bool]] = {}  # project_id → (ts, value)
+_AGENTS_ONLY_TTL = 10  # seconds — recheck config every 10s
+
+
+def _is_agents_only(project_id: str) -> bool:
+    """Check whether the operator has enabled 'Agents only' for this project."""
+    now = time.time()
+    cached = _agents_only_cache.get(project_id)
+    if cached and now - cached[0] < _AGENTS_ONLY_TTL:
+        return cached[1]
+    val = False
+    try:
+        with open(_CONFIG_JSON, "r") as f:
+            cfg = json.load(f)
+        for p in cfg.get("projects", []):
+            if p.get("id") == project_id:
+                val = bool(p.get("bridge_filter_agents_only", False))
+                break
+    except Exception:
+        pass
+    _agents_only_cache[project_id] = (now, val)
+    return val
+
+
+# ---------------------------------------------------------------------------
 # #501: message filter — suppress AC housekeeping noise from bridge output
 # ---------------------------------------------------------------------------
 
@@ -250,8 +280,13 @@ _last_forwarded: dict[tuple[str, str], float] = {}
 _DEDUP_WINDOW = 60  # seconds
 
 
-def _should_forward(msg: dict) -> bool:
-    """Return True if this AC message should be forwarded. Pure check, no side effects."""
+def _should_forward(msg: dict, agents_only: bool = False) -> bool:
+    """Return True if this AC message should be forwarded. Pure check, no side effects.
+
+    When *agents_only* is True (#525), the bridge applies the same strict
+    filter as the dashboard "Agents only" toggle — only agent + operator
+    chat messages are forwarded.
+    """
     sender = msg.get("sender", "")
     text = msg.get("text", "")
     msg_type = msg.get("type", "chat")
@@ -268,6 +303,10 @@ def _should_forward(msg: dict) -> bool:
     for pat in _NOISE_PATTERNS:
         if pat.search(text):
             return False
+
+    # #525: when agents_only mode is active, also filter Loop guard messages
+    if agents_only and "Loop guard:" in text:
+        return False
 
     # Dedup: suppress identical (sender, text) within window
     key = (sender, text)
@@ -400,8 +439,11 @@ async def poll_ac_to_discord(cfg, channel):
                         commit_cursor()
                         continue
 
-                    # #501: skip system/status noise and dedup
-                    if not _should_forward(msg):
+                    # #501/#525: skip system/status noise and dedup.
+                    # When operator enables "Agents only", also filter
+                    # Loop guard and other edge-case noise.
+                    agents_only = _is_agents_only(cfg.get("project_id", ""))
+                    if not _should_forward(msg, agents_only=agents_only):
                         commit_cursor()
                         continue
 
