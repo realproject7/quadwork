@@ -192,6 +192,7 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
         }
         if (hasItems && data.complete && runningRef.current) {
           setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+          setActionError(null); // #522: clear stale action errors on auto-stop
           await callDiscord("stop", { project_id: projectId }).catch(() => {});
           await load();
         }
@@ -201,6 +202,7 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
       // Batch just completed → auto-stop
       if (hasItems && data.complete && !prev.complete && runningRef.current) {
         setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+        setActionError(null); // #522: clear stale action errors on auto-stop
         await callDiscord("stop", { project_id: projectId }).catch(() => {});
         await load();
         return;
@@ -225,7 +227,9 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
   const configured = !!status?.configured;
   const running = !!status?.running;
   useEffect(() => { runningRef.current = running; }, [running]);
-  const displayError = actionError || pollError || (!running && status?.last_error) || "";
+  // #522: suppress last_error when bridge was auto-stopped
+  const suppressLastError = !running && !!autoStatus;
+  const displayError = actionError || pollError || (!running && !suppressLastError && status?.last_error) || "";
 
   return (
     <>

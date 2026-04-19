@@ -2830,6 +2830,9 @@ router.post("/api/telegram", async (req, res) => {
           if (pid) process.kill(pid, "SIGTERM");
           fs.unlinkSync(pf);
         }
+        // #522: clear bridge log so last_error doesn't show stale
+        // connection-refused messages after an intentional stop.
+        try { fs.writeFileSync(telegramBridgeLog(projectId), ""); } catch {}
         return res.json({ ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
@@ -3238,6 +3241,9 @@ router.post("/api/discord", async (req, res) => {
           if (pid) process.kill(pid, "SIGTERM");
           fs.unlinkSync(pf);
         }
+        // #522: clear bridge log so last_error doesn't show stale
+        // connection-refused messages after an intentional stop.
+        try { fs.writeFileSync(discordBridgeLog(projectId), ""); } catch {}
         return res.json({ ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
