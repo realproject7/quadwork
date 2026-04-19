@@ -375,19 +375,6 @@ export default function Sidebar() {
         expanded ? "w-52 items-stretch px-2" : "w-16 items-center"
       }`}
     >
-      {/* Toggle — hidden on mobile */}
-      <button
-        onClick={toggleExpanded}
-        className={`hidden md:flex shrink-0 items-center justify-center w-8 h-8 rounded-sm text-text-muted hover:text-text hover:bg-[#1a1a1a] transition-colors ${
-          expanded ? "self-end mr-0" : "self-center"
-        }`}
-        title={expanded ? "Collapse sidebar" : "Expand sidebar"}
-      >
-        {expanded ? <CollapseIcon /> : <ExpandIcon />}
-      </button>
-
-      <div className="h-1" />
-
       {/* Home */}
       <Link
         href="/"
@@ -607,6 +594,19 @@ export default function Sidebar() {
           )}
         </div>
       )}
+
+      {/* #524: expand/collapse toggle — moved to bottom, larger + bordered */}
+      <button
+        onClick={toggleExpanded}
+        className={`flex shrink-0 items-center justify-center w-10 h-10 rounded-sm border border-border text-text-muted hover:text-accent hover:border-accent/50 transition-colors ${
+          expanded ? "self-end" : "self-center"
+        }`}
+        title={expanded ? "Collapse sidebar" : "Expand sidebar"}
+      >
+        {expanded ? <CollapseIcon /> : <ExpandIcon />}
+      </button>
+
+      <div className="h-1" />
 
       {/* Settings */}
       <Link
