@@ -29,6 +29,12 @@ const AGENTCHATTR_PIN = "3e71d4267572579e7ffeb83576645f90932c1849";
 // #444: same pattern for realproject7/agentchattr-telegram.
 const AGENTCHATTR_TELEGRAM_PIN = "4a6b45f1794c612328b9d5ee6d6fcb3f77015abc";
 
+// ─── Permission Helpers ────────────────────────────────────────────────────
+
+function ensureSecureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
 // ─── ANSI Helpers ──────────────────────────────────────────────────────────
 
 const isTTY = process.stdout.isTTY;
@@ -156,7 +162,7 @@ function installAgentChattr(dir) {
   // other when two projects (or two web tabs) launch simultaneously. Lock
   // file lives next to the install dir so it's scoped per-target.
   const lockFile = `${dir}.install.lock`;
-  try { fs.mkdirSync(path.dirname(lockFile), { recursive: true }); }
+  try { ensureSecureDir(path.dirname(lockFile)); }
   catch (e) { return setError(`Cannot create parent of ${dir}: ${e.message}`); }
 
   let acquired = false;
@@ -164,7 +170,7 @@ function installAgentChattr(dir) {
   while (!acquired) {
     try {
       // Atomic create: fails if file already exists, no TOCTOU race.
-      fs.writeFileSync(lockFile, `${process.pid}:${Date.now()}`, { flag: "wx" });
+      fs.writeFileSync(lockFile, `${process.pid}:${Date.now()}`, { mode: 0o600, flag: "wx" });
       acquired = true;
     } catch (e) {
       if (e.code !== "EEXIST") return setError(`Cannot create install lock ${lockFile}: ${e.message}`);
@@ -243,7 +249,7 @@ function _installAgentChattrLocked(dir, setError) {
       }
     }
     // Ensure parent exists before clone (supports arbitrary nested paths).
-    try { fs.mkdirSync(path.dirname(dir), { recursive: true }); }
+    try { ensureSecureDir(path.dirname(dir)); }
     catch (e) { return setError(`Cannot create parent of ${dir}: ${e.message}`); }
     const cloneResult = run("git", ["clone", AGENTCHATTR_REPO, dir], { timeout: 60000 });
     if (cloneResult === null) return setError(`git clone of ${AGENTCHATTR_REPO} into ${dir} failed`);
@@ -410,8 +416,8 @@ function readConfig() {
 }
 
 function writeConfig(config) {
-  if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────
@@ -971,7 +977,7 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
 
   // Per-project: isolated data dir and port
   const dataDir = path.join(path.dirname(configTomlPath), "data");
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+  if (!fs.existsSync(dataDir)) ensureSecureDir(dataDir);
   // Read assigned port from config (set by writeQuadWorkConfig)
   const existingConfig = readConfig();
   const existingProject = existingConfig.projects?.find((p) => p.id === setup.projectName);
@@ -992,7 +998,7 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
 
   // Write config.toml
   const configDir = path.dirname(configTomlPath);
-  if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+  if (!fs.existsSync(configDir)) ensureSecureDir(configDir);
   fs.writeFileSync(configTomlPath, tomlContent);
   ok(`Wrote ${configTomlPath}`);
 
@@ -1035,7 +1041,7 @@ function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } =
       acProc.unref();
       if (acProc.pid) {
         ok(`AgentChattr started (PID: ${acProc.pid})`);
-        if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+        if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
         const pidFile = path.join(CONFIG_DIR, `agentchattr-${setup.projectName}.pid`);
         fs.writeFileSync(pidFile, String(acProc.pid));
       } else {
@@ -1196,7 +1202,7 @@ function writeOvernightQueueFile(projectName, repo) {
   const queueDir = path.join(CONFIG_DIR, projectName);
   const queuePath = path.join(queueDir, "OVERNIGHT-QUEUE.md");
   if (fs.existsSync(queuePath)) return false;
-  try { fs.mkdirSync(queueDir, { recursive: true }); }
+  try { ensureSecureDir(queueDir); }
   catch (e) { warn(`Could not create ${queueDir}: ${e.message}`); return false; }
   const templatePath = path.join(TEMPLATES_DIR, "OVERNIGHT-QUEUE.md");
   if (!fs.existsSync(templatePath)) {
