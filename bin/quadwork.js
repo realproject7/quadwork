@@ -33,6 +33,7 @@ const AGENTCHATTR_TELEGRAM_PIN = "4a6b45f1794c612328b9d5ee6d6fcb3f77015abc";
 
 function ensureSecureDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch {}
 }
 
 // ─── ANSI Helpers ──────────────────────────────────────────────────────────
@@ -418,6 +419,7 @@ function readConfig() {
 function writeConfig(config) {
   if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
 }
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────

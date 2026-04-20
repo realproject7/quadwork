@@ -110,6 +110,7 @@ function installAgentChattr(dir) {
   while (!acquired) {
     try {
       fs.writeFileSync(lockFile, `${process.pid}:${Date.now()}`, { mode: 0o600, flag: "wx" });
+      try { fs.chmodSync(lockFile, 0o600); } catch {}
       acquired = true;
     } catch (e) {
       if (e.code !== "EEXIST") return setError(`Cannot create install lock ${lockFile}: ${e.message}`);

@@ -209,14 +209,18 @@ async function syncChattrToken(projectId) {
 // chat exports). Use these helpers instead of raw fs calls to ensure
 // restrictive permissions on multi-user systems.
 
-/** Create a directory with 0o700 (owner-only). */
+/** Create a directory with 0o700 (owner-only). Hardens existing dirs too. */
 function ensureSecureDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // mkdirSync mode only applies on creation — chmod existing dirs.
+  try { fs.chmodSync(dir, 0o700); } catch {}
 }
 
-/** Write a file with 0o600 (owner-only read/write). */
+/** Write a file with 0o600 (owner-only read/write). Hardens existing files too. */
 function writeSecureFile(filePath, data, extraOpts = {}) {
   fs.writeFileSync(filePath, data, { mode: 0o600, ...extraOpts });
+  // writeFileSync mode only applies on creation — chmod existing files.
+  try { fs.chmodSync(filePath, 0o600); } catch {}
 }
 
 /** Write config.json atomically with 0o600 permissions. */
