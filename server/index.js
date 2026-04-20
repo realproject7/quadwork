@@ -1823,14 +1823,15 @@ wss.on("connection", async (ws, req) => {
     try {
       const parsed = JSON.parse(str);
       if (parsed.type === "resize") {
-        // #541: validate resize payload — type-check and clamp to sane
-        // bounds before passing to PTY. Prevents NaN, negative, or
-        // absurdly large values from reaching node-pty.
-        const cols = typeof parsed.cols === "number" ? parsed.cols : parseInt(parsed.cols, 10);
-        const rows = typeof parsed.rows === "number" ? parsed.rows : parseInt(parsed.rows, 10);
-        if (Number.isFinite(cols) && Number.isFinite(rows) &&
-            cols >= 1 && cols <= 500 && rows >= 1 && rows <= 500) {
-          session.term.resize(cols, rows);
+        // #541: strict numeric type check and bounds validation before
+        // passing to PTY. The dashboard client (TerminalPanel.tsx) sends
+        // xterm.js cols/rows which are always numbers. Reject anything
+        // else at the boundary.
+        if (typeof parsed.cols === "number" && typeof parsed.rows === "number" &&
+            Number.isFinite(parsed.cols) && Number.isFinite(parsed.rows) &&
+            parsed.cols >= 1 && parsed.cols <= 500 &&
+            parsed.rows >= 1 && parsed.rows <= 500) {
+          session.term.resize(parsed.cols, parsed.rows);
         }
         return;
       }
