@@ -54,6 +54,31 @@ describe("#542 bridge auto-stop transition guard (code analysis)", () => {
     expect(setIdx).toBeGreaterThan(-1);
     expect(setIdx).toBeLessThan(stopIdx);
   });
+
+  test("autoStopBridges in sendTriggerMessage is guarded by prev.complete check", () => {
+    const fnStart = src.indexOf("async function sendTriggerMessage(");
+    expect(fnStart).toBeGreaterThan(-1);
+
+    // Extract until the next top-level function
+    const fnBody = src.slice(fnStart, fnStart + 2000);
+
+    const stopIdx = fnBody.indexOf("autoStopBridges(");
+    expect(stopIdx).toBeGreaterThan(-1);
+
+    // The guard should appear before the call
+    const guardRegion = fnBody.slice(Math.max(0, stopIdx - 300), stopIdx);
+    expect(guardRegion).toMatch(/!prev\.complete/);
+  });
+
+  test("sendTriggerMessage updates _bridgeBatchPrev before the guard", () => {
+    const fnStart = src.indexOf("async function sendTriggerMessage(");
+    const fnBody = src.slice(fnStart, fnStart + 2000);
+
+    const setIdx = fnBody.indexOf("_bridgeBatchPrev.set(");
+    const stopIdx = fnBody.indexOf("autoStopBridges(");
+    expect(setIdx).toBeGreaterThan(-1);
+    expect(setIdx).toBeLessThan(stopIdx);
+  });
 });
 
 // ---------------------------------------------------------------------------
