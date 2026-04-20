@@ -6,7 +6,7 @@ const os = require("os");
 const { WebSocketServer } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
 const routes = require("./routes");
 const {
   patchAgentchattrConfigForDiscordBridge,
@@ -264,8 +264,8 @@ function readPersistedAgentToken(projectId, agentId) {
 function writePersistedAgentToken(projectId, agentId, token) {
   try {
     const configDir = path.join(os.homedir(), ".quadwork", projectId);
-    if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
-    fs.writeFileSync(_agentTokenPath(projectId, agentId), token, { mode: 0o600 });
+    ensureSecureDir(configDir);
+    writeSecureFile(_agentTokenPath(projectId, agentId), token);
   } catch {
     // non-fatal — stale-slot reclaim will degrade but registration still works
   }
@@ -278,7 +278,7 @@ function clearPersistedAgentToken(projectId, agentId) {
 function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
   const os = require("os");
   const configDir = path.join(os.homedir(), ".quadwork", projectId);
-  if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+  ensureSecureDir(configDir);
   const filePath = path.join(configDir, `mcp-${agentId}.json`);
   const url = `http://127.0.0.1:${mcpHttpPort}/mcp`;
   const config = {
@@ -290,7 +290,7 @@ function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
       },
     },
   };
-  fs.writeFileSync(filePath, JSON.stringify(config, null, 2));
+  writeSecureFile(filePath, JSON.stringify(config, null, 2));
   return filePath;
 }
 
@@ -431,7 +431,7 @@ function buildAgentEnv(projectId, agentId) {
   if (cliBase === "gemini" && project.mcp_http_port) {
     const os = require("os");
     const configDir = path.join(os.homedir(), ".quadwork", projectId);
-    if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+    ensureSecureDir(configDir);
     const settingsPath = path.join(configDir, `mcp-${agentId}-settings.json`);
     const url = `http://127.0.0.1:${project.mcp_http_port}/mcp`;
     const settings = {
@@ -443,7 +443,7 @@ function buildAgentEnv(projectId, agentId) {
         },
       },
     };
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    writeSecureFile(settingsPath, JSON.stringify(settings, null, 2));
     env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = settingsPath;
   }
 
@@ -731,7 +731,7 @@ const HISTORY_SNAPSHOT_LIMIT = 5;
 async function snapshotProjectHistory(projectId) {
   try {
     const snapDir = path.join(require("os").homedir(), ".quadwork", projectId, "history-snapshots");
-    if (!fs.existsSync(snapDir)) fs.mkdirSync(snapDir, { recursive: true });
+    ensureSecureDir(snapDir);
     const res = await fetch(`http://127.0.0.1:${PORT}/api/project-history?project=${encodeURIComponent(projectId)}`, {
       signal: AbortSignal.timeout(30000),
     });
@@ -810,7 +810,7 @@ async function handleAgentChattr(req, res) {
     try {
       let content = fs.readFileSync(projectConfigToml, "utf-8");
       content = content.replace(/^port = \d+/m, `port = ${chattrPort}`);
-      fs.writeFileSync(projectConfigToml, content);
+      writeSecureFile(projectConfigToml, content);
     } catch {}
   }
 
@@ -1532,7 +1532,7 @@ app.post("/api/triggers/:project/start", (req, res) => {
       if (typeof message === "string" && message.length > 0) entry.trigger_message = message;
       if (Number.isFinite(interval) && interval > 0) entry.trigger_interval_min = interval;
       if (Number.isFinite(duration) && duration >= 0) entry.trigger_duration_min = duration;
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+      writeConfig(cfg);
     }
   } catch (e) { /* non-fatal — timer still runs with its in-memory values */ }
 
@@ -1623,7 +1623,7 @@ app.put("/api/queue", express.json({ limit: "512kb" }), (req, res) => {
   if (content === null) return res.status(400).json({ error: "Missing content" });
   const p = queuePathFor(projectId);
   try {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
+    ensureSecureDir(path.dirname(p));
     fs.writeFileSync(p, content);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -1641,7 +1641,7 @@ app.post("/api/queue", (req, res) => {
     let content = fs.readFileSync(tpl, "utf-8");
     content = content.replace(/\{\{project_name\}\}/g, project.name || projectId);
     content = content.replace(/\{\{repo\}\}/g, project.repo || "");
-    fs.mkdirSync(path.dirname(p), { recursive: true });
+    ensureSecureDir(path.dirname(p));
     fs.writeFileSync(p, content);
     return res.json({ ok: true, existed: false });
   } catch (e) { return res.status(500).json({ error: e.message }); }

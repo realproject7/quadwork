@@ -102,14 +102,15 @@ function installAgentChattr(dir) {
 
   // --- Per-target lock ---
   const lockFile = `${dir}.install.lock`;
-  try { fs.mkdirSync(path.dirname(lockFile), { recursive: true }); }
+  try { fs.mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 }); }
   catch (e) { return setError(`Cannot create parent of ${dir}: ${e.message}`); }
 
   let acquired = false;
   const deadline = Date.now() + INSTALL_LOCK_WAIT_TOTAL_MS;
   while (!acquired) {
     try {
-      fs.writeFileSync(lockFile, `${process.pid}:${Date.now()}`, { flag: "wx" });
+      fs.writeFileSync(lockFile, `${process.pid}:${Date.now()}`, { mode: 0o600, flag: "wx" });
+      try { fs.chmodSync(lockFile, 0o600); } catch {}
       acquired = true;
     } catch (e) {
       if (e.code !== "EEXIST") return setError(`Cannot create install lock ${lockFile}: ${e.message}`);
@@ -169,7 +170,7 @@ function _installAgentChattrLocked(dir, setError) {
         return setError(`Refusing to overwrite ${dir}: directory exists with unrelated content`);
       }
     }
-    try { fs.mkdirSync(path.dirname(dir), { recursive: true }); }
+    try { fs.mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 }); }
     catch (e) { return setError(`Cannot create parent of ${dir}: ${e.message}`); }
     const cloneResult = _run("git", ["clone", AGENTCHATTR_REPO, dir], { timeout: 60000 });
     if (cloneResult === null) return setError(`git clone of ${AGENTCHATTR_REPO} into ${dir} failed`);

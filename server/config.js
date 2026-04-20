@@ -74,7 +74,7 @@ function migrateAgentKeys(config) {
   }
   if (changed) {
     try {
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+      writeSecureFile(CONFIG_PATH, JSON.stringify(config, null, 2));
     } catch {}
   }
   return config;
@@ -89,9 +89,9 @@ function readConfig() {
       // Config file doesn't exist — create default
       const dir = path.dirname(CONFIG_PATH);
       if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+        ensureSecureDir(dir);
       }
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
+      writeSecureFile(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
       return { ...DEFAULT_CONFIG };
     }
     throw new Error(`Cannot read config at ${CONFIG_PATH}: ${err.message}`);
@@ -198,10 +198,34 @@ async function syncChattrToken(projectId) {
       const realToken = match[1];
       if (project.agentchattr_token !== realToken) {
         project.agentchattr_token = realToken;
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+        writeSecureFile(CONFIG_PATH, JSON.stringify(config, null, 2));
       }
     }
   } catch {}
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, sanitizeOperatorName, CONFIG_PATH };
+// --- #540: Secure file/directory helpers ---
+// All paths under ~/.quadwork/ may contain secrets (tokens, configs,
+// chat exports). Use these helpers instead of raw fs calls to ensure
+// restrictive permissions on multi-user systems.
+
+/** Create a directory with 0o700 (owner-only). Hardens existing dirs too. */
+function ensureSecureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // mkdirSync mode only applies on creation — chmod existing dirs.
+  try { fs.chmodSync(dir, 0o700); } catch {}
+}
+
+/** Write a file with 0o600 (owner-only read/write). Hardens existing files too. */
+function writeSecureFile(filePath, data, extraOpts = {}) {
+  fs.writeFileSync(filePath, data, { mode: 0o600, ...extraOpts });
+  // writeFileSync mode only applies on creation — chmod existing files.
+  try { fs.chmodSync(filePath, 0o600); } catch {}
+}
+
+/** Write config.json atomically with 0o600 permissions. */
+function writeConfig(cfg) {
+  writeSecureFile(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, sanitizeOperatorName, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig };

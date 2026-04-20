@@ -36,8 +36,8 @@ function readConfigFile() {
 
 function writeConfigFile(cfg) {
   const dir = path.dirname(CONFIG_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  ensureSecureDir(dir);
+  writeConfig(cfg);
 }
 
 // ─── Config ────────────────────────────────────────────────────────────────
@@ -66,8 +66,8 @@ router.put("/api/config", (req, res) => {
   try {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(body, null, 2));
+    ensureSecureDir(dir);
+    writeConfig(body);
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
       req.app.get("syncTriggers")();
@@ -80,7 +80,7 @@ router.put("/api/config", (req, res) => {
 
 // ─── Chat (AgentChattr proxy) ──────────────────────────────────────────────
 
-const { resolveProjectChattr, sanitizeOperatorName } = require("./config");
+const { resolveProjectChattr, sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
 const { installAgentChattr, findAgentChattr } = require("./install-agentchattr");
 
 /**
@@ -96,7 +96,7 @@ function writeOvernightQueueFileSafe(projectId, projectName, repo) {
     if (fs.existsSync(queuePath)) return;
     const tpl = path.join(TEMPLATES_DIR, "OVERNIGHT-QUEUE.md");
     if (!fs.existsSync(tpl)) return;
-    fs.mkdirSync(path.dirname(queuePath), { recursive: true });
+    ensureSecureDir(path.dirname(queuePath));
     let content = fs.readFileSync(tpl, "utf-8");
     content = content.replace(/\{\{project_name\}\}/g, projectName || projectId || "");
     content = content.replace(/\{\{repo\}\}/g, repo || "");
@@ -404,7 +404,7 @@ router.put("/api/loop-guard", async (req, res) => {
       const trailing = content.endsWith("\n") ? "" : "\n";
       content += `${trailing}\n[routing]\ndefault = "none"\nmax_agent_hops = ${value}\n`;
     }
-    fs.writeFileSync(tomlPath, content);
+    writeSecureFile(tomlPath, content);
   } catch (err) {
     return res.status(500).json({ error: "Failed to write config.toml", detail: err.message });
   }
@@ -838,7 +838,7 @@ router.post("/api/activity/log", (req, res) => {
   const row = { agent, start, end: ts, duration_ms: Math.max(0, ts - start) };
   try {
     const p = activityLogPath(project);
-    fs.mkdirSync(path.dirname(p), { recursive: true });
+    ensureSecureDir(path.dirname(p));
     fs.appendFileSync(p, JSON.stringify(row) + "\n");
     // Invalidate the stats cache so the next read sees the new row.
     _activityStatsCache.ts = 0;
@@ -1029,7 +1029,7 @@ const uploadStorage = multer.diskStorage({
     const projectId = req.query.project || "";
     if (!projectId || /[/\\]/.test(projectId)) return cb(new Error("Invalid project"));
     const dir = path.join(CONFIG_DIR, projectId, "uploads");
-    fs.mkdirSync(dir, { recursive: true });
+    ensureSecureDir(dir);
     cb(null, dir);
   },
   filename: (_req, file, cb) => {
@@ -1340,7 +1340,7 @@ function readBatchSnapshot(projectId) {
 function writeBatchSnapshot(projectId, snapshot) {
   try {
     const p = batchSnapshotPath(projectId);
-    fs.mkdirSync(path.dirname(p), { recursive: true });
+    ensureSecureDir(path.dirname(p));
     fs.writeFileSync(p, JSON.stringify(snapshot));
   } catch {
     // Non-fatal — panel still works from the live parse.
@@ -1850,8 +1850,8 @@ router.post("/api/setup/save-token", (req, res) => {
   if (!token) return res.status(400).json({ error: "Missing token" });
   const tokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
   const dir = path.dirname(tokenPath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(tokenPath, token.trim() + "\n", { mode: 0o600 });
+  ensureSecureDir(dir);
+  writeSecureFile(tokenPath, token.trim() + "\n");
   try { fs.chmodSync(tokenPath, 0o600); } catch {}
   res.json({ ok: true, path: tokenPath });
 });
@@ -1890,7 +1890,7 @@ router.post("/api/setup", (req, res) => {
       const workingDir = body.workingDir;
       if (!workingDir) return res.json({ ok: false, error: "Missing working directory" });
       if (!fs.existsSync(path.join(workingDir, ".git"))) {
-        if (!fs.existsSync(workingDir)) fs.mkdirSync(workingDir, { recursive: true });
+        if (!fs.existsSync(workingDir)) ensureSecureDir(workingDir);
         if (!REPO_RE.test(body.repo)) return res.json({ ok: false, error: "Invalid repo" });
         const clone = exec("gh", ["repo", "clone", body.repo, workingDir]);
         if (!clone.ok) return res.json({ ok: false, error: `Clone failed: ${clone.output}` });
@@ -2026,7 +2026,7 @@ router.post("/api/setup", (req, res) => {
         }
       }
       const dataDir = path.join(projectConfigDir, "data");
-      fs.mkdirSync(dataDir, { recursive: true });
+      ensureSecureDir(dataDir);
       const tomlPath = path.join(projectConfigDir, "config.toml");
 
       // Resolve per-project ports: prefer explicit body params (from setup wizard),
@@ -2067,7 +2067,7 @@ router.post("/api/setup", (req, res) => {
       // operator to type /continue. AC clamps to [1, 50] internally.
       content += `[routing]\ndefault = "none"\nmax_agent_hops = 30\n\n`;
       content += `[mcp]\nhttp_port = ${mcp_http}\nsse_port = ${mcp_sse}\n`;
-      fs.writeFileSync(tomlPath, content);
+      writeSecureFile(tomlPath, content);
 
       // Restart this project's AgentChattr instance (not global)
       try {
@@ -2158,8 +2158,8 @@ router.post("/api/setup", (req, res) => {
         agentchattr_dir: perProjectDir,
       });
       const dir = path.dirname(CONFIG_PATH);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+      ensureSecureDir(dir);
+      writeConfig(cfg);
 
       // Batch 25 / #204: seed the per-project OVERNIGHT-QUEUE.md at
       // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md.
@@ -2495,8 +2495,7 @@ function writeEnvToken(key, value) {
   const line = `${key}=${value}`;
   if (regex.test(content)) content = content.replace(regex, line);
   else content = content.trimEnd() + (content ? "\n" : "") + line + "\n";
-  fs.writeFileSync(ENV_PATH, content, { mode: 0o600 });
-  fs.chmodSync(ENV_PATH, 0o600);
+  writeSecureFile(ENV_PATH, content);
 }
 
 function resolveToken(value) {
@@ -2558,7 +2557,7 @@ router.get("/api/telegram", async (req, res) => {
         if (data && data.ok && data.result && typeof data.result.username === "string") {
           botUsername = data.result.username;
           project.telegram.bot_username = botUsername;
-          try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2)); } catch {}
+          try { writeConfig(cfg); } catch {}
         }
       }
     } catch { /* non-fatal — widget will just show no username */ }
@@ -2718,8 +2717,7 @@ router.post("/api/telegram", async (req, res) => {
       // #383 Bug 2: write agentchattr_url inside [telegram]; the
       // bridge's load_config only reads from that section.
       const tomlContent = buildTelegramBridgeToml(tg, projectId);
-      fs.writeFileSync(tomlPath, tomlContent, { mode: 0o600 });
-      fs.chmodSync(tomlPath, 0o600);
+      writeSecureFile(tomlPath, tomlContent);
       // #353: pre-flight import check so a fresh install with no
       // `requests` module produces a readable error instead of the
       // Start → Running → Stopped flicker that the v1 code path
@@ -2852,7 +2850,7 @@ router.post("/api/telegram", async (req, res) => {
         const project = cfg.projects?.find((p) => p.id === projectId);
         if (project?.telegram) {
           project.telegram.bot_token = `env:${envKey}`;
-          fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+          writeConfig(cfg);
         }
       } catch {}
       return res.json({ ok: true, env_key: envKey });
@@ -2885,7 +2883,7 @@ router.post("/api/telegram", async (req, res) => {
           // will re-fetch it from Telegram's getMe for the new token.
           bot_username: "",
         };
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+        writeConfig(cfg);
         return res.json({ ok: true, env_key: envKey });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Config write failed" });
@@ -3030,7 +3028,7 @@ router.get("/api/discord", async (req, res) => {
           if (r.ok && data.username) {
             botUsername = data.username;
             project.discord.bot_username = botUsername;
-            try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2)); } catch {}
+            try { writeConfig(cfg); } catch {}
           }
         }
       } catch { /* non-fatal — widget will just show no username */ }
@@ -3088,7 +3086,7 @@ router.post("/api/discord", async (req, res) => {
         // #506: always copy bundled bridge files (not just on first install)
         // so re-installing after a QuadWork upgrade refreshes the script.
         if (!fs.existsSync(DISCORD_BRIDGE_DIR)) {
-          fs.mkdirSync(DISCORD_BRIDGE_DIR, { recursive: true });
+          ensureSecureDir(DISCORD_BRIDGE_DIR);
         }
         fs.cpSync(
           path.join(DISCORD_BRIDGE_SRC, "discord_bridge.py"),
@@ -3165,8 +3163,7 @@ router.post("/api/discord", async (req, res) => {
       if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
       const tomlPath = discordConfigToml(projectId);
       const tomlContent = buildDiscordBridgeToml(dc, projectId);
-      fs.writeFileSync(tomlPath, tomlContent, { mode: 0o600 });
-      fs.chmodSync(tomlPath, 0o600);
+      writeSecureFile(tomlPath, tomlContent);
       const depCheck = checkDiscordBridgePythonDeps(venvPython);
       if (!depCheck.ok) {
         const msg =
@@ -3273,7 +3270,7 @@ router.post("/api/discord", async (req, res) => {
           channel_id,
           bot_username: "",
         };
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+        writeConfig(cfg);
         return res.json({ ok: true, env_key: envKey });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Config write failed" });
@@ -3345,7 +3342,7 @@ router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
       else a.reasoning_effort = reasoning;
     }
     project.agents[agentId] = a;
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    writeConfig(cfg);
     return res.json({ ok: true, agent: { agent_id: agentId, model: a.model || "", reasoning_effort: a.reasoning_effort || "" } });
   } catch (err) {
     return res.json({ ok: false, error: err.message || "write failed" });
