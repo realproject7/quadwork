@@ -78,7 +78,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           : "border-border text-text-muted hover:text-text hover:border-accent"
       }`}
     >
-      {filterSystem ? "Agents ●" : "All ○"}
+      {filterSystem ? "Filter system log: on" : "Filter system log: off"}
     </button>
   ), [filterSystem, toggleFilter]);
 
