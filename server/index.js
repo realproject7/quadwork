@@ -1402,7 +1402,12 @@ async function sendTriggerMessage(projectId) {
             console.log(`[auto-trigger] ${projectId}: caffeinate auto-stopped (no active triggers remain)`);
           }
           // #518: also stop bridges when batch completes
-          await autoStopBridges(projectId, project, qwPort);
+          // #542: transition guard — only stop if not already stopped for this completion
+          const prev = _bridgeBatchPrev.get(projectId);
+          _bridgeBatchPrev.set(projectId, { complete: true, hasItems: !!(bp.items && bp.items.length) });
+          if (!prev || !prev.complete) {
+            await autoStopBridges(projectId, project, qwPort);
+          }
           return;
         }
       }
@@ -1886,7 +1891,8 @@ async function autoStopPollingTick() {
           }
         }
         // #518: also stop bridges when batch completes
-        if (hasBridgeAuto) {
+        // #542: only fire on the transition (incomplete→complete), not every tick
+        if (hasBridgeAuto && (!prev || !prev.complete)) {
           await autoStopBridges(project.id, project, qwPort);
         }
       }
