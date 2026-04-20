@@ -1822,8 +1822,16 @@ wss.on("connection", async (ws, req) => {
     const str = msg.toString();
     try {
       const parsed = JSON.parse(str);
-      if (parsed.type === "resize" && parsed.cols && parsed.rows) {
-        session.term.resize(parsed.cols, parsed.rows);
+      if (parsed.type === "resize") {
+        // #541: validate resize payload — type-check and clamp to sane
+        // bounds before passing to PTY. Prevents NaN, negative, or
+        // absurdly large values from reaching node-pty.
+        const cols = typeof parsed.cols === "number" ? parsed.cols : parseInt(parsed.cols, 10);
+        const rows = typeof parsed.rows === "number" ? parsed.rows : parseInt(parsed.rows, 10);
+        if (Number.isFinite(cols) && Number.isFinite(rows) &&
+            cols >= 1 && cols <= 500 && rows >= 1 && rows <= 500) {
+          session.term.resize(cols, rows);
+        }
         return;
       }
       // #461: client requests scrollback replay after xterm is fully
