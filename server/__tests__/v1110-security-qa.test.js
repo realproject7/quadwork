@@ -138,17 +138,20 @@ test("package-lock.json has Next.js 16.2.4+ (resolved version)", () => {
   );
 });
 
-test("next build produces index.html (not stale)", () => {
-  // Check that the build output contains index.html and it was modified
-  // after the package.json (a stale out/ from an older build would have
-  // an older mtime than the current package.json).
+test("next build succeeds (runs build from scratch)", () => {
+  // Actually run the build to verify Next.js 16.2.4 works.
+  const { execFileSync } = require("child_process");
+  try {
+    execFileSync("npx", ["next", "build"], {
+      cwd: ROOT,
+      stdio: "pipe",
+      timeout: 120000,
+    });
+  } catch (e) {
+    assert.fail(`next build failed: ${e.stderr?.toString().slice(-500) || e.message}`);
+  }
   const outIndex = path.join(ROOT, "out", "index.html");
-  const pkgJson = path.join(ROOT, "package.json");
   assert(fs.existsSync(outIndex), "out/index.html should exist after build");
-  const outMtime = fs.statSync(outIndex).mtimeMs;
-  const pkgMtime = fs.statSync(pkgJson).mtimeMs;
-  // Build output should be newer than package.json (rebuilt after upgrade)
-  assert(outMtime >= pkgMtime, "out/index.html should be newer than package.json (not stale)");
 });
 
 // ============================================================================
