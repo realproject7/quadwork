@@ -86,6 +86,15 @@ interface GitHubPanelProps {
   projectId: string;
 }
 
+// #554: rate limit status shape from /api/github/rate-limit
+interface RateLimitInfo {
+  remaining: number;
+  limit: number;
+  resetInMinutes: number;
+  low: boolean;
+  critical: boolean;
+}
+
 export default function GitHubPanel({ projectId }: GitHubPanelProps) {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prs, setPrs] = useState<PR[]>([]);
@@ -93,6 +102,8 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
   const [closedIssues, setClosedIssues] = useState<ClosedItem[]>([]);
   const [mergedPrs, setMergedPrs] = useState<ClosedItem[]>([]);
   const [queueModalOpen, setQueueModalOpen] = useState(false);
+  // #554: rate limit indicator
+  const [rateLimit, setRateLimit] = useState<RateLimitInfo | null>(null);
 
   // #226: auto-create OVERNIGHT-QUEUE.md on dashboard load if it
   // doesn't exist yet. Idempotent — POST returns `existed:true`
@@ -141,6 +152,19 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
       .catch(() => {});
   }, [projectId]);
 
+  // #554: poll rate limit status every 60s
+  useEffect(() => {
+    const fetchRL = () => {
+      fetch("/api/github/rate-limit")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => { if (data) setRateLimit(data); })
+        .catch(() => {});
+    };
+    fetchRL();
+    const rlInterval = setInterval(fetchRL, 60000);
+    return () => clearInterval(rlInterval);
+  }, []);
+
   useEffect(() => {
     fetchData();
     const interval = setInterval(fetchData, 30000);
@@ -149,6 +173,19 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
 
   return (
     <div className="flex flex-col h-full min-h-0">
+      {/* #554: rate limit indicator */}
+      {rateLimit && (rateLimit.critical || rateLimit.low) && (
+        <div className={`px-3 py-1 text-[10px] shrink-0 ${
+          rateLimit.critical
+            ? "bg-error/20 text-error"
+            : "bg-[#ffcc00]/20 text-[#ffcc00]"
+        }`}>
+          {rateLimit.critical
+            ? `GitHub API rate limited — showing cached data. Resets in ${rateLimit.resetInMinutes}m`
+            : `GitHub API: ${rateLimit.remaining}/${rateLimit.limit} remaining. Resets in ${rateLimit.resetInMinutes}m`
+          }
+        </div>
+      )}
       {/* #226: side-by-side issues + PRs columns */}
       <div className="flex-1 min-h-0 flex">
         {/* Issues column */}

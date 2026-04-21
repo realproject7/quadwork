@@ -3,7 +3,8 @@
  * Routes: config, chat, projects, memory, setup, rename, github/issues, github/prs, telegram
  */
 const express = require("express");
-const { execFileSync, spawn } = require("child_process");
+const { execFile: _execFileCb, execFileSync, spawn } = require("child_process");
+const _execFileAsync = require("util").promisify(_execFileCb);
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -17,6 +18,89 @@ const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const ENV_PATH = path.join(CONFIG_DIR, ".env");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+
+// ─── GitHub API rate limit tracking (#554) ────────────────────────────────
+// Shared rate-limit state: periodically refreshed via `gh api rate_limit`.
+// Server-side gh calls check this before executing and back off when low.
+const _rateLimit = {
+  limit: 5000,
+  remaining: 5000,
+  resetAt: 0,        // epoch ms
+  updatedAt: 0,      // epoch ms when we last fetched
+  error: null,       // last fetch error message, if any
+};
+const RATE_LIMIT_POLL_MS = 60_000;       // refresh every 60s
+const RATE_LIMIT_LOW_THRESHOLD = 200;    // below this → back off
+const RATE_LIMIT_CRITICAL = 50;          // below this → stop all infra gh calls
+let _rateLimitTimer = null;
+
+async function refreshRateLimit() {
+  try {
+    const { stdout } = await _execFileAsync("gh", [
+      "api", "rate_limit", "--jq", ".resources.core | {limit,remaining,reset}",
+    ], { encoding: "utf-8", timeout: 10000 });
+    const data = JSON.parse(stdout);
+    _rateLimit.limit = data.limit;
+    _rateLimit.remaining = data.remaining;
+    _rateLimit.resetAt = data.reset * 1000; // seconds → ms
+    _rateLimit.updatedAt = Date.now();
+    _rateLimit.error = null;
+  } catch (err) {
+    _rateLimit.error = err.message;
+    _rateLimit.updatedAt = Date.now();
+  }
+}
+
+function startRateLimitPolling() {
+  if (_rateLimitTimer) return;
+  refreshRateLimit();
+  _rateLimitTimer = setInterval(refreshRateLimit, RATE_LIMIT_POLL_MS);
+}
+
+function isRateLimited() {
+  return _rateLimit.remaining < RATE_LIMIT_CRITICAL;
+}
+function isRateLow() {
+  return _rateLimit.remaining < RATE_LIMIT_LOW_THRESHOLD;
+}
+
+// Adaptive cache TTL: normal 30s, low 120s, critical ∞ (serve stale)
+function adaptiveTTL(baseTTL) {
+  if (isRateLimited()) return Infinity;
+  if (isRateLow()) return Math.max(baseTTL, 120_000);
+  return baseTTL;
+}
+
+// ─── Cached GitHub endpoint helper (#554) ─────────────────────────────────
+// Wraps a synchronous execFileSync gh call with an in-memory cache that
+// serves stale data when rate-limited instead of hammering the API.
+const _ghEndpointCache = new Map(); // key → { ts, data }
+const GH_ENDPOINT_CACHE_TTL = 30_000; // 30s base TTL
+
+function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
+  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
+  const cached = _ghEndpointCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < ttl) {
+    return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
+  }
+  // If critically rate-limited, serve whatever we have (even expired)
+  if (isRateLimited() && cached) {
+    return res.json({ ...cached.data, _stale: true, _rateLimited: true });
+  }
+  try {
+    const out = execFileSync("gh", ghArgs, { encoding: "utf-8", timeout: 15000 });
+    let data = JSON.parse(out);
+    if (transform) data = transform(data);
+    _ghEndpointCache.set(cacheKey, { ts: Date.now(), data, stale: false });
+    res.json(data);
+  } catch (err) {
+    // On error, try to serve stale cache
+    if (cached) {
+      return res.json({ ...cached.data, _stale: true });
+    }
+    res.status(502).json({ error: "gh call failed", detail: err.message });
+  }
+}
 
 const DEFAULT_CONFIG = {
   port: 8400,
@@ -1076,7 +1160,11 @@ let _projectsCacheTs = 0;
 const PROJECTS_CACHE_TTL = 60_000;
 
 router.get("/api/projects", async (req, res) => {
-  if (_projectsCache && Date.now() - _projectsCacheTs < PROJECTS_CACHE_TTL) {
+  if (_projectsCache && Date.now() - _projectsCacheTs < adaptiveTTL(PROJECTS_CACHE_TTL)) {
+    return res.json(_projectsCache);
+  }
+  // #554: serve stale projects cache when critically rate-limited
+  if (isRateLimited() && _projectsCache) {
     return res.json(_projectsCache);
   }
 
@@ -1186,6 +1274,24 @@ router.get("/api/projects", async (req, res) => {
   res.json(result);
 });
 
+// ─── GitHub Rate Limit (#554) ──────────────────────────────────────────────
+
+router.get("/api/github/rate-limit", (_req, res) => {
+  const resetIn = _rateLimit.resetAt > Date.now()
+    ? Math.ceil((_rateLimit.resetAt - Date.now()) / 60000)
+    : 0;
+  res.json({
+    limit: _rateLimit.limit,
+    remaining: _rateLimit.remaining,
+    resetAt: _rateLimit.resetAt,
+    resetInMinutes: resetIn,
+    low: isRateLow(),
+    critical: isRateLimited(),
+    updatedAt: _rateLimit.updatedAt,
+    error: _rateLimit.error,
+  });
+});
+
 // ─── GitHub Issues / PRs ───────────────────────────────────────────────────
 
 function getRepo(projectId) {
@@ -1203,33 +1309,21 @@ function getRepo(projectId) {
 router.get("/api/github/issues", (req, res) => {
   const repo = getRepo(req.query.project || "");
   if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-
-  try {
-    const out = execFileSync(
-      "gh",
-      ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"],
-      { encoding: "utf-8", timeout: 15000 }
-    );
-    res.json(JSON.parse(out));
-  } catch (err) {
-    res.status(502).json({ error: "gh issue list failed", detail: err.message });
-  }
+  cachedGhEndpoint(
+    `issues:${repo}`,
+    ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"],
+    res,
+  );
 });
 
 router.get("/api/github/prs", (req, res) => {
   const repo = getRepo(req.query.project || "");
   if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-
-  try {
-    const out = execFileSync(
-      "gh",
-      ["pr", "list", "-R", repo, "--json", "number,title,state,author,assignees,reviewDecision,reviews,statusCheckRollup,url,createdAt", "--limit", "50"],
-      { encoding: "utf-8", timeout: 15000 }
-    );
-    res.json(JSON.parse(out));
-  } catch (err) {
-    res.status(502).json({ error: "gh pr list failed", detail: err.message });
-  }
+  cachedGhEndpoint(
+    `prs:${repo}`,
+    ["pr", "list", "-R", repo, "--json", "number,title,state,author,assignees,reviewDecision,reviews,statusCheckRollup,url,createdAt", "--limit", "50"],
+    res,
+  );
 });
 
 // #411 / quadwork#281: recently closed issues + merged PRs for the
@@ -1247,57 +1341,51 @@ const RECENT_DISPLAY_LIMIT = 5;
 router.get("/api/github/closed-issues", (req, res) => {
   const repo = getRepo(req.query.project || "");
   if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  try {
-    const out = execFileSync(
-      "gh",
-      ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", String(RECENT_FETCH_LIMIT)],
-      { encoding: "utf-8", timeout: 15000 },
-    );
-    const items = JSON.parse(out);
-    const sorted = Array.isArray(items)
-      ? items
-          .slice()
-          .sort((a, b) => {
-            const ta = a && a.closedAt ? Date.parse(a.closedAt) : 0;
-            const tb = b && b.closedAt ? Date.parse(b.closedAt) : 0;
-            return tb - ta;
-          })
-          .slice(0, RECENT_DISPLAY_LIMIT)
-      : items;
-    res.json(sorted);
-  } catch (err) {
-    res.status(502).json({ error: "gh issue list (closed) failed", detail: err.message });
-  }
+  cachedGhEndpoint(
+    `closed-issues:${repo}`,
+    ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", String(RECENT_FETCH_LIMIT)],
+    res,
+    {
+      transform: (items) =>
+        Array.isArray(items)
+          ? items
+              .slice()
+              .sort((a, b) => {
+                const ta = a && a.closedAt ? Date.parse(a.closedAt) : 0;
+                const tb = b && b.closedAt ? Date.parse(b.closedAt) : 0;
+                return tb - ta;
+              })
+              .slice(0, RECENT_DISPLAY_LIMIT)
+          : items,
+    },
+  );
 });
 
 router.get("/api/github/merged-prs", (req, res) => {
   const repo = getRepo(req.query.project || "");
   if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  try {
-    // gh pr list with `--state merged` filters server-side so we
-    // don't have to pull every closed PR and discard the un-merged
-    // ones (closed-without-merge). Same fetch-wider-then-sort
-    // strategy as closed-issues so the newest merge always wins.
-    const out = execFileSync(
-      "gh",
-      ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", String(RECENT_FETCH_LIMIT)],
-      { encoding: "utf-8", timeout: 15000 },
-    );
-    const items = JSON.parse(out);
-    const sorted = Array.isArray(items)
-      ? items
-          .slice()
-          .sort((a, b) => {
-            const ta = a && a.mergedAt ? Date.parse(a.mergedAt) : 0;
-            const tb = b && b.mergedAt ? Date.parse(b.mergedAt) : 0;
-            return tb - ta;
-          })
-          .slice(0, RECENT_DISPLAY_LIMIT)
-      : items;
-    res.json(sorted);
-  } catch (err) {
-    res.status(502).json({ error: "gh pr list (merged) failed", detail: err.message });
-  }
+  // gh pr list with `--state merged` filters server-side so we
+  // don't have to pull every closed PR and discard the un-merged
+  // ones (closed-without-merge). Same fetch-wider-then-sort
+  // strategy as closed-issues so the newest merge always wins.
+  cachedGhEndpoint(
+    `merged-prs:${repo}`,
+    ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", String(RECENT_FETCH_LIMIT)],
+    res,
+    {
+      transform: (items) =>
+        Array.isArray(items)
+          ? items
+              .slice()
+              .sort((a, b) => {
+                const ta = a && a.mergedAt ? Date.parse(a.mergedAt) : 0;
+                const tb = b && b.mergedAt ? Date.parse(b.mergedAt) : 0;
+                return tb - ta;
+              })
+              .slice(0, RECENT_DISPLAY_LIMIT)
+          : items,
+    },
+  );
 });
 
 // #413 / quadwork#282: Current Batch Progress panel.
@@ -1499,8 +1587,6 @@ function parseActiveBatch(queueText) {
 // catch-all-and-return-null contract collapsed real subprocess
 // errors into the "not found" branch, making the new failure-row
 // fallback unreachable for genuine command failures (t2a review).
-const { execFile: _execFile } = require("child_process");
-const _execFileAsync = require("util").promisify(_execFile);
 async function ghJsonExecAsync(args) {
   const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 10000 });
   return JSON.parse(stdout);
@@ -1698,8 +1784,14 @@ router.get("/api/batch-progress", async (req, res) => {
   if (!projectId) return res.status(400).json({ error: "Missing project" });
 
   const cached = _batchProgressCache.get(projectId);
-  if (cached && Date.now() - cached.ts < BATCH_PROGRESS_TTL_MS) {
+  const batchTTL = adaptiveTTL(BATCH_PROGRESS_TTL_MS);
+  if (cached && Date.now() - cached.ts < batchTTL) {
     return res.json(cached.data);
+  }
+  // #554: if critically rate-limited, serve stale cache instead of
+  // firing N gh calls per batch item.
+  if (isRateLimited() && cached) {
+    return res.json({ ...cached.data, _stale: true, _rateLimited: true });
   }
 
   const repo = getRepo(projectId);
@@ -3348,6 +3440,9 @@ router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
     return res.json({ ok: false, error: err.message || "write failed" });
   }
 });
+
+// #554: start rate-limit polling as soon as routes are loaded.
+startRateLimitPolling();
 
 module.exports = router;
 // #341: export parseActiveBatch for unit tests. No production callers
