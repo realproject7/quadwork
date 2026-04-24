@@ -148,6 +148,9 @@ export default function SetupWizard() {
   const [reposLoading, setReposLoading] = useState(false);
   const [repoManual, setRepoManual] = useState(false);
   const [ghUser, setGhUser] = useState("");
+  const [orgs, setOrgs] = useState<string[]>([]);
+  const [ownerMode, setOwnerMode] = useState<"personal" | "organization">("personal");
+  const [selectedOrg, setSelectedOrg] = useState("");
   const [enableProtection, setEnableProtection] = useState(false);
   const [backends, setBackends] = useState<Record<string, string>>({
     head: "claude", re1: "claude", re2: "claude", dev: "claude",
@@ -199,24 +202,31 @@ export default function SetupWizard() {
       .catch(() => {});
   }, []);
 
-  // Fetch GitHub user on mount
+  // Fetch GitHub user + orgs on mount
   useEffect(() => {
     fetch("/api/github/user")
       .then((r) => r.json())
       .then((d) => { if (d.login) setGhUser(d.login); })
       .catch(() => {});
+    fetch("/api/github/orgs")
+      .then((r) => r.json())
+      .then((d) => { if (Array.isArray(d)) setOrgs(d); })
+      .catch(() => {});
   }, []);
 
-  // Fetch repos when ghUser is set
+  // Resolve the owner whose repos we list (personal login, or selected org).
+  const activeOwner = ownerMode === "organization" ? selectedOrg : ghUser;
+
+  // Fetch repos when the active owner changes
   useEffect(() => {
-    if (!ghUser) return;
+    if (!activeOwner) { setRepos([]); return; }
     setReposLoading(true);
-    fetch(`/api/github/repos?owner=${encodeURIComponent(ghUser)}`)
+    fetch(`/api/github/repos?owner=${encodeURIComponent(activeOwner)}`)
       .then((r) => r.json())
-      .then((d) => { if (Array.isArray(d)) setRepos(d); })
-      .catch(() => {})
+      .then((d) => { if (Array.isArray(d)) setRepos(d); else setRepos([]); })
+      .catch(() => setRepos([]))
       .finally(() => setReposLoading(false));
-  }, [ghUser]);
+  }, [activeOwner]);
 
   const updateStep = useCallback((idx: number, updates: Partial<Step>) => {
     setSteps((prev) => prev.map((s, i) => (i === idx ? { ...s, ...updates } : s)));
@@ -573,9 +583,47 @@ export default function SetupWizard() {
 
                 {!repoManual && (
                   <>
-                    {ghUser && (
+                    {orgs.length > 0 && (
+                      <div className="flex items-center gap-4 mb-2">
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="ownerMode"
+                            checked={ownerMode === "personal"}
+                            onChange={() => setOwnerMode("personal")}
+                            className="accent-accent"
+                          />
+                          <span className="text-[11px] text-text">Personal</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="ownerMode"
+                            checked={ownerMode === "organization"}
+                            onChange={() => {
+                              setOwnerMode("organization");
+                              if (!selectedOrg && orgs[0]) setSelectedOrg(orgs[0]);
+                            }}
+                            className="accent-accent"
+                          />
+                          <span className="text-[11px] text-text">Organization</span>
+                        </label>
+                        {ownerMode === "organization" && (
+                          <select
+                            value={selectedOrg}
+                            onChange={(e) => setSelectedOrg(e.target.value)}
+                            className="bg-transparent border border-border px-2 py-0.5 text-[11px] text-text outline-none focus:border-accent cursor-pointer ml-auto"
+                          >
+                            {orgs.map((o) => (
+                              <option key={o} value={o} className="bg-bg-surface">{o}</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                    )}
+                    {activeOwner && (
                       <p className="text-[11px] text-text-muted mb-2">
-                        Showing repos for <span className="text-accent">{ghUser}</span>
+                        Showing repos for <span className="text-accent">{activeOwner}</span>
                       </p>
                     )}
                     <input
@@ -589,9 +637,9 @@ export default function SetupWizard() {
                       {filteredRepos.map((r) => (
                         <button
                           key={r.name}
-                          onClick={() => setRepo(`${ghUser}/${r.name}`)}
+                          onClick={() => setRepo(`${activeOwner}/${r.name}`)}
                           className={`w-full text-left px-3 py-1.5 text-[11px] border-b border-border/50 last:border-b-0 hover:bg-accent/5 transition-colors ${
-                            repo === `${ghUser}/${r.name}` ? "bg-accent/10 text-accent" : "text-text"
+                            repo === `${activeOwner}/${r.name}` ? "bg-accent/10 text-accent" : "text-text"
                           }`}
                         >
                           <span className="font-semibold">{r.name}</span>
