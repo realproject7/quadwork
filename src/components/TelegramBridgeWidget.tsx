@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import TelegramSetupModal from "./TelegramSetupModal";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface BatchState {
   complete: boolean;
@@ -46,6 +47,7 @@ async function callTelegram(action: string, body: Record<string, unknown>) {
  * scratch.
  */
 export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidgetProps) {
+  const { locale } = useLocale();
   const [status, setStatus] = useState<TelegramStatus | null>(null);
   const [busy, setBusy] = useState(false);
   // #372: split error state — actionError is set by the operator's
@@ -267,9 +269,11 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
           <div className="flex items-center gap-1.5">
-            <span className="text-[11px] text-text-muted uppercase tracking-wider">Telegram Bridge</span>
+            <span className="text-[11px] text-text-muted uppercase tracking-wider">{locale === "ko" ? "텔레그램 브릿지" : "Telegram Bridge"}</span>
             <InfoTooltip>
-              <b>Telegram Bridge</b> forwards AgentChattr messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.
+              {locale === "ko"
+                ? <><b>텔레그램 브릿지</b> - AgentChattr 메시지를 텔레그램 봇으로 전달해서 휴대폰에서 모니터링할 수 있게 합니다. 양방향이며 텔레그램에서 보낸 답장도 채팅에 나타납니다.</>
+                : <><b>Telegram Bridge</b> forwards AgentChattr messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.</>}
             </InfoTooltip>
           </div>
           <div className="flex items-center gap-1.5">

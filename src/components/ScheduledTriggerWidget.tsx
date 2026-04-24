@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface ScheduledTriggerWidgetProps {
   projectId: string;
@@ -86,6 +87,7 @@ function formatCountdown(ms: number): string {
  * project picks up the last-used message + running status.
  */
 export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWidgetProps) {
+  const { locale } = useLocale();
   const [trigger, setTrigger] = useState<TriggerInfo | null>(null);
   const [message, setMessage] = useState<string>("");
   const [intervalMin, setIntervalMin] = useState<number>(15);
@@ -398,10 +400,14 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
         <div className="flex items-center gap-1.5">
           <span className="text-[11px] text-text-muted uppercase tracking-wider">
-            Scheduled Trigger{running ? (autoTriggered ? " (auto)" : " (running)") : ""}
+            {locale === "ko"
+              ? `예약 트리거${running ? (autoTriggered ? " (자동)" : " (실행 중)") : ""}`
+              : `Scheduled Trigger${running ? (autoTriggered ? " (auto)" : " (running)") : ""}`}
           </span>
           <InfoTooltip>
-            <b>Scheduled Trigger</b> sends a periodic message to all agents on a timer. Use this to keep the autonomous workflow running overnight. First message fires after the configured interval, not immediately.
+            {locale === "ko"
+              ? <><b>예약 트리거</b> - 타이머에 따라 모든 에이전트에게 주기적으로 메시지를 보냅니다. 야간 자율 워크플로우를 계속 돌릴 때 사용하세요. 첫 메시지는 즉시가 아니라 설정한 간격 후에 전송됩니다.</>
+              : <><b>Scheduled Trigger</b> sends a periodic message to all agents on a timer. Use this to keep the autonomous workflow running overnight. First message fires after the configured interval, not immediately.</>}
           </InfoTooltip>
         </div>
         <div className="flex items-center gap-2">
@@ -410,14 +416,16 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
           <button
             type="button"
             onClick={toggleAutoTrigger}
-            title={autoTrigger ? "Auto-trigger ON — trigger follows batch lifecycle" : "Auto-trigger OFF — manual start/stop only"}
+            title={autoTrigger
+              ? (locale === "ko" ? "자동 트리거 ON - 배치 생명주기에 따라 트리거가 동작합니다" : "Auto-trigger ON — trigger follows batch lifecycle")
+              : (locale === "ko" ? "자동 트리거 OFF - 수동 시작/중지만 가능합니다" : "Auto-trigger OFF — manual start/stop only")}
             className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
               autoTrigger
                 ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
                 : "border-border text-text-muted hover:text-text hover:border-accent"
             }`}
           >
-            Auto {autoTrigger ? "●" : "○"}
+            {locale === "ko" ? "자동 " : "Auto "}{autoTrigger ? "●" : "○"}
           </button>
         </div>
       </div>

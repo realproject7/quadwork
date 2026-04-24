@@ -89,3 +89,30 @@ h1, h2, h3, h4, h5, h6 {
 .animate-name-shimmer {
   animation: qw-name-shimmer 1.6s ease-in-out infinite;
 }
+
+/* Korean help text should wrap by word, not by individual syllable.
+   Keep long URLs/tokens from overflowing narrow tooltips and modals. */
+.ko-help {
+  word-break: keep-all;
+  overflow-wrap: normal;
+  line-break: strict;
+  text-wrap: pretty;
+}
+
+.ko-help p,
+.ko-help li,
+.ko-help div,
+.ko-help span,
+.ko-help b,
+.ko-help strong {
+  word-break: inherit;
+  overflow-wrap: inherit;
+  line-break: inherit;
+}
+
+.ko-help code,
+.ko-help pre,
+.ko-help .break-anywhere {
+  word-break: normal;
+  overflow-wrap: anywhere;
+}

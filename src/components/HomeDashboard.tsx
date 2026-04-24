@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import HomeEmptyState from "./HomeEmptyState";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface Project {
   id: string;
@@ -21,18 +22,19 @@ interface ActivityEvent {
   projectName: string;
 }
 
-function timeAgo(iso: string): string {
+function timeAgo(iso: string, locale: "en" | "ko"): string {
   const diff = Date.now() - new Date(iso).getTime();
   const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1) return locale === "ko" ? "방금 전" : "just now";
+  if (mins < 60) return locale === "ko" ? `${mins}분 전` : `${mins}m ago`;
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
+  if (hours < 24) return locale === "ko" ? `${hours}시간 전` : `${hours}h ago`;
   const days = Math.floor(hours / 24);
-  return `${days}d ago`;
+  return locale === "ko" ? `${days}일 전` : `${days}d ago`;
 }
 
 export default function HomeDashboard() {
+  const { locale } = useLocale();
   const [projects, setProjects] = useState<Project[]>([]);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   // #229: track whether /api/projects has resolved (success OR
@@ -77,15 +79,19 @@ export default function HomeDashboard() {
           )}
           {projectsState === "error" && (
             <div className="mb-6 border border-error/30 bg-error/5 text-error text-[11px] px-3 py-2">
-              Could not load projects from /api/projects. The dashboard may be out of date — check the server logs and reload.
+              {locale === "ko"
+                ? "/api/projects 에서 프로젝트를 불러오지 못했습니다. 대시보드 상태가 오래되었을 수 있습니다. 서버 로그를 확인하고 새로고침해 주세요."
+                : "Could not load projects from /api/projects. The dashboard may be out of date — check the server logs and reload."}
             </div>
           )}
 
           {/* Header */}
           <div className="mb-6">
-            <h1 className="text-lg font-semibold text-text tracking-tight">Projects</h1>
+            <h1 className="text-lg font-semibold text-text tracking-tight">{locale === "ko" ? "프로젝트" : "Projects"}</h1>
             <p className="text-xs text-text-muted mt-1">
-              {projects.length} configured project{projects.length !== 1 ? "s" : ""}
+              {locale === "ko"
+                ? `${projects.length}개 프로젝트 설정됨`
+                : `${projects.length} configured project${projects.length !== 1 ? "s" : ""}`}
             </p>
           </div>
 
@@ -110,13 +116,13 @@ export default function HomeDashboard() {
                     </span>
                   </div>
                   <span className="text-[10px] text-text-muted opacity-0 group-hover:opacity-100 transition-opacity">
-                    open →
+                    {locale === "ko" ? "열기 →" : "open →"}
                   </span>
                 </div>
 
                 <div className="flex gap-4 text-[11px] mb-2">
                   <div>
-                    <span className="text-text-muted">agents</span>
+                    <span className="text-text-muted">{locale === "ko" ? "에이전트" : "agents"}</span>
                     <span className="ml-1.5 text-text">{project.agentCount}</span>
                   </div>
                   <div>
@@ -124,14 +130,14 @@ export default function HomeDashboard() {
                     <span className="ml-1.5 text-text">{project.openPrs}</span>
                   </div>
                   <div>
-                    <span className="text-text-muted">repo</span>
+                    <span className="text-text-muted">{locale === "ko" ? "저장소" : "repo"}</span>
                     <span className="ml-1.5 text-text">{project.repo}</span>
                   </div>
                 </div>
 
                 {project.lastActivity && (
                   <div className="text-[10px] text-text-muted">
-                    last activity: {timeAgo(project.lastActivity)}
+                    {locale === "ko" ? "최근 활동: " : "last activity: "}{timeAgo(project.lastActivity, locale)}
                   </div>
                 )}
               </Link>
@@ -142,31 +148,30 @@ export default function HomeDashboard() {
               href="/setup"
               className="border border-dashed border-border p-4 flex items-center justify-center text-text-muted hover:text-text hover:border-text-muted transition-colors min-h-[88px]"
             >
-              <span className="text-sm">+ New Project</span>
+              <span className="text-sm">{locale === "ko" ? "+ 새 프로젝트" : "+ New Project"}</span>
             </Link>
           </div>
 
           {/* #507: subtle Discord community link */}
           <div className="mt-4 mb-8 lg:mb-4 text-[11px] text-text-muted">
-            Want to talk with the creator?{" "}
+            {locale === "ko" ? "제작자와 이야기하고 싶다면 " : "Want to talk with the creator? "}
             <a
               href="https://discord.gg/syhbYPk3Wq"
               target="_blank"
               rel="noopener noreferrer"
               className="text-text hover:text-accent transition-colors"
             >
-              Join Hunt Town
-            </a>{" "}
-            and find @project7.
+              {locale === "ko" ? "Hunt Town" : "Join Hunt Town"}
+            </a>{locale === "ko" ? " 에 들어와서 @project7 을 찾아보세요." : " and find @project7."}
           </div>
         </div>
 
         {/* Right column: activity feed — scrolls independently on desktop */}
         <div className="lg:overflow-y-auto lg:min-h-0 mb-6 lg:mb-0">
-          <h2 className="text-xs text-text-muted uppercase tracking-wider mb-3">Recent Activity</h2>
+          <h2 className="text-xs text-text-muted uppercase tracking-wider mb-3">{locale === "ko" ? "최근 활동" : "Recent Activity"}</h2>
           <div className="border border-border bg-bg-surface">
             {activity.length === 0 && (
-              <div className="px-3 py-3 text-[11px] text-text-muted">No recent activity</div>
+              <div className="px-3 py-3 text-[11px] text-text-muted">{locale === "ko" ? "최근 활동이 없습니다" : "No recent activity"}</div>
             )}
             {activity.map((item, i) => (
               <div
