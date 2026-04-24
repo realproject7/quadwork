@@ -1895,6 +1895,17 @@ router.get("/api/github/user", (_req, res) => {
   }
 });
 
+// GitHub orgs the authenticated user belongs to
+router.get("/api/github/orgs", (_req, res) => {
+  try {
+    const out = execFileSync("gh", ["api", "user/orgs", "--jq", "[.[].login]"], { encoding: "utf-8", timeout: 10000 });
+    const orgs = JSON.parse(out);
+    res.json(Array.isArray(orgs) ? orgs : []);
+  } catch {
+    res.json([]);
+  }
+});
+
 // GitHub repo list for an owner (only repos with push access)
 router.get("/api/github/repos", (req, res) => {
   const owner = req.query.owner;
