@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import DiscordSetupModal from "./DiscordSetupModal";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface BatchState {
   complete: boolean;
@@ -42,6 +43,7 @@ async function callDiscord(action: string, body: Record<string, unknown>) {
  * scratch.
  */
 export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetProps) {
+  const { locale } = useLocale();
   const [status, setStatus] = useState<DiscordStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -236,9 +238,11 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
           <div className="flex items-center gap-1.5">
-            <span className="text-[11px] text-text-muted uppercase tracking-wider">Discord Bridge</span>
+            <span className="text-[11px] text-text-muted uppercase tracking-wider">{locale === "ko" ? "디스코드 브릿지" : "Discord Bridge"}</span>
             <InfoTooltip>
-              <b>Discord Bridge</b> forwards AgentChattr messages to a Discord channel so you can monitor from Discord. Bidirectional — replies from Discord appear in chat.
+              {locale === "ko"
+                ? <><b>디스코드 브릿지</b> - AgentChattr 메시지를 디스코드 채널로 전달해서 디스코드에서 모니터링할 수 있게 합니다. 양방향이며 디스코드에서 보낸 답장도 채팅에 나타납니다.</>
+                : <><b>Discord Bridge</b> forwards AgentChattr messages to a Discord channel so you can monitor from Discord. Bidirectional — replies from Discord appear in chat.</>}
             </InfoTooltip>
           </div>
           <div className="flex items-center gap-1.5">

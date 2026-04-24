@@ -11,10 +11,12 @@ import {
   getNotificationBackgroundOnly,
   setNotificationBackgroundOnly,
 } from "../lib/notificationSound";
+import { useLocale } from "@/components/LocaleProvider";
 
 // ─── Server Controls ─────────────────────────────────────────────────────────
 
 function ServerSection({ projectId }: { projectId: string }) {
+  const { locale } = useLocale();
   const [loading, setLoading] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
@@ -139,7 +141,7 @@ function ServerSection({ projectId }: { projectId: string }) {
   return (
     <div className="flex flex-col gap-1">
       <div className="text-[10px] text-text-muted uppercase tracking-wider font-semibold">
-        Server
+        {locale === "ko" ? "서버" : "Server"}
       </div>
       <div className="flex items-center gap-1.5 flex-wrap">
         <button
@@ -151,21 +153,21 @@ function ServerSection({ projectId }: { projectId: string }) {
               : "text-text-muted border-border hover:text-error hover:border-error/40"
           }`}
         >
-          {loading === "stop" ? "..." : confirmStop ? "Confirm Stop?" : "Stop"}
+          {loading === "stop" ? "..." : confirmStop ? (locale === "ko" ? "정말 중지?" : "Confirm Stop?") : (locale === "ko" ? "중지" : "Stop")}
         </button>
         <button
           onClick={handleRestart}
           disabled={!!loading}
           className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
         >
-          {loading === "restart" ? "..." : "Restart"}
+          {loading === "restart" ? "..." : (locale === "ko" ? "재시작" : "Restart")}
         </button>
         <button
           onClick={handleReset}
           disabled={!!loading}
           className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
         >
-          {loading === "reset" ? "..." : "Reset Agents"}
+          {loading === "reset" ? "..." : (locale === "ko" ? "에이전트 초기화" : "Reset Agents")}
         </button>
       </div>
       {feedback && (
@@ -205,6 +207,7 @@ const AWAKE_AUTO_POLL_MS = 30_000;
 const AWAKE_AUTO_DEFAULT_HOURS = 8;
 
 function SystemSection({ projectId }: { projectId: string }) {
+  const { locale } = useLocale();
   const [active, setActive] = useState(false);
   const [remaining, setRemaining] = useState<number | null>(null);
   const [platform, setPlatform] = useState<string>("");
@@ -452,10 +455,10 @@ function SystemSection({ projectId }: { projectId: string }) {
       {showKeepAwakeSubsection && (
         <div className="flex flex-col gap-0.5 relative">
           <div className="flex items-center gap-1 text-[10px] text-text-muted uppercase tracking-wider font-semibold">
-            <span>Keep Mac Awake</span>
+            <span>{locale === "ko" ? "Mac 절전 방지" : "Keep Mac Awake"}</span>
             <button
               type="button"
-              aria-label="About Keep Mac Awake"
+              aria-label={locale === "ko" ? "Mac 절전 방지 정보" : "About Keep Mac Awake"}
               onClick={() => setShowKeepAwakeHelp((s) => !s)}
               className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
             >?</button>
@@ -475,7 +478,9 @@ function SystemSection({ projectId }: { projectId: string }) {
           </div>
           {showKeepAwakeHelp && (
             <div className="absolute left-0 top-4 z-30 w-64 p-2 text-[10px] leading-snug text-text bg-bg-surface border border-border rounded shadow-lg">
-              <b>Keep Mac Awake</b> runs macOS <code>caffeinate</code> to stop the screen, disk, and system idle timers from sleeping your Mac during an overnight run. Make sure the laptop is plugged in — caffeinate blocks sleep but not battery drain.
+              {locale === "ko"
+                ? <><b>Mac 절전 방지</b>는 macOS의 <code>caffeinate</code>를 실행해 야간 작업 중 Mac이 절전 상태로 들어가는 것을 막습니다. 충전기를 연결해 두세요. caffeinate는 절전은 막지만 배터리 소모를 막아주지는 않습니다.</>
+                : <><b>Keep Mac Awake</b> runs macOS <code>caffeinate</code> to stop the screen, disk, and system idle timers from sleeping your Mac during an overnight run. Make sure the laptop is plugged in — caffeinate blocks sleep but not battery drain.</>}
             </div>
           )}
           {awakeAutoStatus && (
@@ -523,17 +528,19 @@ function SystemSection({ projectId }: { projectId: string }) {
           is now its own subsection with an always-visible descriptor. */}
       <div className="flex flex-col gap-0.5 relative">
         <div className="flex items-center gap-1 text-[10px] text-text-muted uppercase tracking-wider font-semibold">
-          <span>Notification Sound</span>
+          <span>{locale === "ko" ? "알림음" : "Notification Sound"}</span>
           <button
             type="button"
-            aria-label="About Notification Sound"
+            aria-label={locale === "ko" ? "알림음 정보" : "About Notification Sound"}
             onClick={() => setShowSoundHelp((s) => !s)}
             className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
           >?</button>
         </div>
         {showSoundHelp && (
           <div className="absolute left-0 top-4 z-30 w-64 p-2 text-[10px] leading-snug text-text bg-bg-surface border border-border rounded shadow-lg">
-            <b>Notification Sound</b> plays a brief chime when an agent posts a new message (not your own sends, not system events). Sound choice picks one of the bundled chimes. Background-only mode suppresses the chime while the tab is focused — ding only when you&apos;re looking elsewhere. All prefs persist in localStorage.
+            {locale === "ko"
+              ? <><b>알림음</b>은 에이전트가 새 메시지를 보낼 때 짧은 알림음을 재생합니다. 내 메시지나 시스템 이벤트에는 울리지 않습니다. 사운드 선택으로 내장 알림음 중 하나를 고를 수 있고, 백그라운드 전용 모드는 탭이 포커스된 동안에는 알림음을 막습니다. 모든 설정은 localStorage에 저장됩니다.</>
+              : <><b>Notification Sound</b> plays a brief chime when an agent posts a new message (not your own sends, not system events). Sound choice picks one of the bundled chimes. Background-only mode suppresses the chime while the tab is focused — ding only when you&apos;re looking elsewhere. All prefs persist in localStorage.</>}
           </div>
         )}
         <div className="text-[10px] text-text-muted leading-tight">

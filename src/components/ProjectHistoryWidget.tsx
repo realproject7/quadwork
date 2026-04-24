@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface ProjectHistoryWidgetProps {
   projectId: string;
@@ -37,6 +38,7 @@ const MAX_BYTES = 10 * 1024 * 1024;
  * project, and renders a small progress / result block.
  */
 export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidgetProps) {
+  const { locale } = useLocale();
   const fileRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState<"export" | "import" | "restore" | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -261,9 +263,11 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
   return (
     <div className="border border-border rounded p-2 text-[11px] font-mono">
       <div className="flex items-center gap-1.5 text-text-muted uppercase tracking-wider mb-1.5">
-        Project History
+        {locale === "ko" ? "프로젝트 히스토리" : "Project History"}
         <InfoTooltip>
-          <b>Project History</b> — export or import the full AgentChattr chat history for this project. Useful for backup, migration, or resuming after a fresh install.
+          {locale === "ko"
+            ? <><b>프로젝트 히스토리</b> - 이 프로젝트의 전체 AgentChattr 채팅 기록을 내보내거나 가져옵니다. 백업, 마이그레이션, 재설치 후 복구에 유용합니다.</>
+            : <><b>Project History</b> — export or import the full AgentChattr chat history for this project. Useful for backup, migration, or resuming after a fresh install.</>}
         </InfoTooltip>
       </div>
       <div className="flex items-center gap-1.5 flex-wrap">

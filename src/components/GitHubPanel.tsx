@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import InfoTooltip from "./InfoTooltip";
 import OvernightQueueModal from "./OvernightQueueModal";
 import BatchProgressPanel from "./BatchProgressPanel";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface Issue {
   number: number;
@@ -96,6 +97,7 @@ interface RateLimitInfo {
 }
 
 export default function GitHubPanel({ projectId }: GitHubPanelProps) {
+  const { locale } = useLocale();
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prs, setPrs] = useState<PR[]>([]);
   // #411 / quadwork#281: recently closed issues + merged PRs.
@@ -181,8 +183,12 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             : "bg-[#ffcc00]/20 text-[#ffcc00]"
         }`}>
           {rateLimit.critical
-            ? `GitHub API rate limited — showing cached data. Resets in ${rateLimit.resetInMinutes}m`
-            : `GitHub API: ${rateLimit.remaining}/${rateLimit.limit} remaining. Resets in ${rateLimit.resetInMinutes}m`
+            ? (locale === "ko"
+              ? `GitHub API 제한에 걸렸습니다 - 캐시된 데이터를 표시합니다. ${rateLimit.resetInMinutes}분 후 초기화됩니다`
+              : `GitHub API rate limited — showing cached data. Resets in ${rateLimit.resetInMinutes}m`)
+            : (locale === "ko"
+              ? `GitHub API 남음: ${rateLimit.remaining}/${rateLimit.limit}. ${rateLimit.resetInMinutes}분 후 초기화`
+              : `GitHub API: ${rateLimit.remaining}/${rateLimit.limit} remaining. Resets in ${rateLimit.resetInMinutes}m`)
           }
         </div>
       )}
@@ -192,15 +198,17 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         <div className="flex-1 min-w-0 flex flex-col border-r border-border">
           <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
-              Issues ({issues.length})
+              {locale === "ko" ? `이슈 (${issues.length})` : `Issues (${issues.length})`}
             </span>
             <InfoTooltip>
-              <b>Issues</b> — open issues on the project&apos;s GitHub repo. Click any item to open it on GitHub.
+              {locale === "ko"
+                ? <><b>이슈</b> - 이 프로젝트 GitHub 저장소의 열린 이슈입니다. 항목을 클릭하면 GitHub에서 열립니다.</>
+                : <><b>Issues</b> — open issues on the project&apos;s GitHub repo. Click any item to open it on GitHub.</>}
             </InfoTooltip>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto">
             {issues.length === 0 && (
-              <div className="px-3 py-2 text-[11px] text-text-muted">No issues</div>
+              <div className="px-3 py-2 text-[11px] text-text-muted">{locale === "ko" ? "이슈 없음" : "No issues"}</div>
             )}
             {issues.map((issue) => (
               <a
@@ -223,10 +231,10 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             {/* #411 / quadwork#281: Recently closed issues — last 5,
                 muted style with a ✓ to distinguish from open. */}
             <div className="px-3 pt-2 pb-1 text-[9px] text-text-muted uppercase tracking-wider">
-              Recently closed
+              {locale === "ko" ? "최근 종료됨" : "Recently closed"}
             </div>
             {closedIssues.length === 0 && (
-              <div className="px-3 py-1 text-[11px] text-text-muted">None yet</div>
+              <div className="px-3 py-1 text-[11px] text-text-muted">{locale === "ko" ? "아직 없음" : "None yet"}</div>
             )}
             {closedIssues.map((issue) => (
               <a
@@ -248,15 +256,17 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         <div className="flex-1 min-w-0 flex flex-col">
           <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
-              Pull Requests ({prs.length})
+              {locale === "ko" ? `풀 리퀘스트 (${prs.length})` : `Pull Requests (${prs.length})`}
             </span>
             <InfoTooltip>
-              <b>Pull Requests</b> — open PRs awaiting review or merge. Click to open on GitHub.
+              {locale === "ko"
+                ? <><b>풀 리퀘스트</b> - 검토 또는 병합을 기다리는 열린 PR입니다. 클릭하면 GitHub에서 열립니다.</>
+                : <><b>Pull Requests</b> — open PRs awaiting review or merge. Click to open on GitHub.</>}
             </InfoTooltip>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto">
             {prs.length === 0 && (
-              <div className="px-3 py-2 text-[11px] text-text-muted">No PRs</div>
+              <div className="px-3 py-2 text-[11px] text-text-muted">{locale === "ko" ? "PR 없음" : "No PRs"}</div>
             )}
             {prs.map((pr) => {
               const reviews = pr.reviews || [];
@@ -311,10 +321,10 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             {/* #411 / quadwork#281: Recently merged PRs — last 5,
                 muted style with a ✓ to distinguish from open. */}
             <div className="px-3 pt-2 pb-1 text-[9px] text-text-muted uppercase tracking-wider">
-              Recently merged
+              {locale === "ko" ? "최근 병합됨" : "Recently merged"}
             </div>
             {mergedPrs.length === 0 && (
-              <div className="px-3 py-1 text-[11px] text-text-muted">None yet</div>
+              <div className="px-3 py-1 text-[11px] text-text-muted">{locale === "ko" ? "아직 없음" : "None yet"}</div>
             )}
             {mergedPrs.map((pr) => (
               <a
@@ -345,14 +355,16 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         <div className="flex items-center gap-1.5">
           <span className="text-[11px] text-text-muted font-mono">OVERNIGHT-QUEUE.md</span>
           <InfoTooltip position="above">
-            <b>Overnight Queue</b> — the task queue file Head reads to pick the next ticket. Click Edit to modify batch contents and ordering.
+            {locale === "ko"
+              ? <><b>야간 큐</b> - Head가 다음 티켓을 고를 때 읽는 작업 큐 파일입니다. 편집을 눌러 배치 내용과 순서를 수정할 수 있습니다.</>
+              : <><b>Overnight Queue</b> — the task queue file Head reads to pick the next ticket. Click Edit to modify batch contents and ordering.</>}
           </InfoTooltip>
         </div>
         <button
           onClick={() => setQueueModalOpen(true)}
           className="px-2 py-0.5 text-[10px] text-text-muted hover:text-accent border border-border hover:border-accent transition-colors uppercase tracking-wider"
         >
-          Edit
+          {locale === "ko" ? "편집" : "Edit"}
         </button>
       </div>
 

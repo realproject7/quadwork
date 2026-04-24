@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface LoopGuardWidgetProps {
   projectId: string;
@@ -18,6 +19,7 @@ interface LoopGuardWidgetProps {
  * via update_settings ws event so the change is immediate.
  */
 export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
+  const { locale } = useLocale();
   const [value, setValue] = useState<number>(30);
   const [draft, setDraft] = useState<string>("30");
   const [saving, setSaving] = useState(false);
@@ -122,9 +124,11 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   return (
     <div className="border border-border rounded p-2 text-[11px] font-mono">
       <div className="flex items-center gap-1.5 mb-1">
-        <span className="uppercase tracking-wider text-text-muted">Loop Guard</span>
+        <span className="uppercase tracking-wider text-text-muted">{locale === "ko" ? "루프 가드" : "Loop Guard"}</span>
         <InfoTooltip>
-          <b>Loop Guard</b> pauses agent-to-agent message chains after this many hops with no human reply. Higher values let agents work longer overnight; lower values add safety against runaway loops. AgentChattr accepts <b>4–50</b>; QuadWork defaults to <b>30</b> (about 5–6 full PR cycles). Posting any chat message yourself resets the counter immediately.
+          {locale === "ko"
+            ? <><b>루프 가드</b> - 사람의 응답 없이 에이전트끼리 메시지를 주고받는 횟수가 이 값에 도달하면 체인을 멈춥니다. 값을 높이면 야간 작업을 더 길게 돌릴 수 있고, 낮추면 runaway loop에 대한 안전성이 높아집니다. AgentChattr 허용 범위는 <b>4-50</b>이며 QuadWork 기본값은 <b>30</b>입니다. 직접 채팅을 한 번 보내면 카운터는 즉시 초기화됩니다.</>
+            : <><b>Loop Guard</b> pauses agent-to-agent message chains after this many hops with no human reply. Higher values let agents work longer overnight; lower values add safety against runaway loops. AgentChattr accepts <b>4–50</b>; QuadWork defaults to <b>30</b> (about 5–6 full PR cycles). Posting any chat message yourself resets the counter immediately.</>}
         </InfoTooltip>
       </div>
       <div className="flex items-center gap-1.5">
