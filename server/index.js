@@ -929,7 +929,7 @@ async function handleAgentChattr(req, res) {
   // #386: Kill any process listening on the AC port. Handles orphaned
   // processes that survive QuadWork restarts (detached + unref'd spawns
   // lose their tracked reference when the Node process recycles).
-  function killProcessOnPort(port) {
+  function killProcessOnPort(port, signal = "SIGTERM") {
     try {
       const pids = execFileSync("lsof", ["-ti", `TCP:${port}`, "-sTCP:LISTEN"], {
         encoding: "utf-8",
@@ -940,7 +940,7 @@ async function handleAgentChattr(req, res) {
       for (const line of pids.split("\n")) {
         const pid = parseInt(line, 10);
         if (pid > 0) {
-          try { process.kill(pid, "SIGTERM"); } catch {}
+          try { process.kill(pid, signal); } catch {}
         }
       }
     } catch {
@@ -1034,24 +1034,36 @@ async function handleAgentChattr(req, res) {
     const shouldAutoRestore = !!(preRestartProject && preRestartProject.auto_restore_after_restart);
     const proc = getProc();
     if (proc.process) {
+      console.log(`[agentchattr] ${projectId} restart: killing AC (PID: ${proc.process.pid})`);
       try { proc.process.kill("SIGTERM"); } catch {}
     }
     // #386: also kill any orphaned process holding the port (handles
     // detached processes that survived a QuadWork restart).
     killProcessOnPort(chattrPort);
     setProc({ process: null, state: "stopped", error: null });
-    // #386: wait for the port to actually be free before spawning,
-    // instead of a fixed 500ms that may race the old process.
-    const portFree = await waitForPortFree(chattrPort, 3000);
+    // #582: wait up to 5s for the port to be free, then SIGKILL
+    // any remaining process as a fallback before spawning.
+    let portFree = await waitForPortFree(chattrPort, 5000);
     if (!portFree) {
-      console.warn(`[agentchattr] ${projectId} port ${chattrPort} still occupied after 3s — spawning anyway`);
+      console.warn(`[agentchattr] ${projectId} port ${chattrPort} still occupied after 5s — sending SIGKILL`);
+      killProcessOnPort(chattrPort, "SIGKILL");
+      portFree = await waitForPortFree(chattrPort, 3000);
+      if (!portFree) {
+        const portErr = `Port ${chattrPort} still occupied — cannot restart`;
+        console.error(`[agentchattr] ${projectId} ${portErr}`);
+        setProc({ process: null, state: "error", error: portErr });
+        return res.status(500).json({ ok: false, state: "error", error: portErr });
+      }
     }
+    console.log(`[agentchattr] ${projectId} restart: port ${chattrPort} is free, spawning AC`);
     try {
       const child = await spawnChattr();
       if (!child) {
         const errProc = getProc();
+        console.error(`[agentchattr] ${projectId} restart: spawnChattr failed — ${errProc.error || "unknown error"}`);
         return res.status(500).json({ ok: false, state: "error", error: errProc.error || "Failed to start AgentChattr" });
       }
+      console.log(`[agentchattr] ${projectId} restart: AC spawned and ready (PID: ${child.pid})`);
       // Sync token after AgentChattr restarts
       setTimeout(() => syncChattrToken(projectId), 2000);
       // #424 / quadwork#304 Phase 3: optional auto-restore.
