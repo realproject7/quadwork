@@ -919,10 +919,11 @@ async function handleAgentChattr(req, res) {
     const ready = await waitForAgentChattrReady(chattrPort, 30000);
     if (ready) {
       setProc({ process: child, state: "running", error: null });
+      return child;
     } else {
       setProc({ process: child, state: "error", error: "AgentChattr did not become ready within 30s" });
+      return null;
     }
-    return child;
   }
 
   // #386: Kill any process listening on the AC port. Handles orphaned
