@@ -2176,13 +2176,21 @@ async function acHealthCheck() {
         // These are agents where the #565 deferred restart timed out, or
         // agents spawned while AC was down. MCP flags are set at process
         // launch, so a full stop+respawn is required.
-        // #581: dedupe — skip if a reset is scheduled/in-flight or succeeded within 60s
+        // #581: dedupe — skip if a reset is in-flight or succeeded within 60s.
+        // If "scheduled" (in-flight), keep consecutiveFailures=1 so the next
+        // healthy tick re-enters this branch and retries if state became "failed".
         const rs = _acHealth.resetState.get(project.id);
-        const skipReset = rs && (
-          rs.status === "scheduled" ||
-          (rs.status === "succeeded" && Date.now() - rs.timestamp < 60000)
-        );
-        if (!skipReset) {
+        const resetSucceeded = rs && rs.status === "succeeded" && Date.now() - rs.timestamp < 60000;
+        const resetInFlight = rs && rs.status === "scheduled";
+        if (resetSucceeded) {
+          // Already handled — clear failures normally
+        } else if (resetInFlight) {
+          // In-flight — preserve failures so we retry next tick if it fails
+          health.consecutiveFailures = 1;
+          _acHealth.state.set(project.id, health);
+          continue;
+        } else {
+          // No recent reset or previous attempt failed — fire one
           _acHealth.resetState.set(project.id, { status: "scheduled", timestamp: Date.now() });
           restartUnregisteredAgents(project.id).then(() => {
             _acHealth.resetState.set(project.id, { status: "succeeded", timestamp: Date.now() });
