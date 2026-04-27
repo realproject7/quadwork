@@ -1150,7 +1150,14 @@ router.get("/api/uploads/:project/:filename", (req, res) => {
   }
   const filePath = path.join(CONFIG_DIR, project, "uploads", filename);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Not found" });
-  res.sendFile(filePath);
+  // #560: pass error callback so Express/send NotFoundError (race between
+  // existsSync and sendFile, or stricter file resolution in Express 5's
+  // send module) is handled gracefully instead of spamming the server log.
+  res.sendFile(filePath, (err) => {
+    if (err && !res.headersSent) {
+      res.status(404).json({ error: "Not found" });
+    }
+  });
 });
 
 // ─── Projects (dashboard aggregation) ──────────────────────────────────────
