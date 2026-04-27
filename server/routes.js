@@ -1154,8 +1154,11 @@ router.get("/api/uploads/:project/:filename", (req, res) => {
   // existsSync and sendFile, or stricter file resolution in Express 5's
   // send module) is handled gracefully instead of spamming the server log.
   res.sendFile(filePath, (err) => {
-    if (err && !res.headersSent) {
+    if (!err || res.headersSent) return;
+    if (err.status === 404 || err.code === "ENOENT") {
       res.status(404).json({ error: "Not found" });
+    } else {
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 });
