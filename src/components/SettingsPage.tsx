@@ -99,10 +99,6 @@ const COPY = {
     githubRepo: "GitHub Repo",
     workingDirectory: "Working Directory",
     agents: "Agents",
-    onlyInstalledPrefix: "Only",
-    onlyInstalledSuffix: "is installed.",
-    installOther: "Install",
-    forMoreBackendOptions: "for more backend options:",
     name: "Name",
     command: "Command",
     model: "Model",
@@ -176,10 +172,6 @@ const COPY = {
     githubRepo: "GitHub 저장소",
     workingDirectory: "작업 디렉터리",
     agents: "에이전트",
-    onlyInstalledPrefix: "",
-    onlyInstalledSuffix: "만 설치되어 있습니다.",
-    installOther: "",
-    forMoreBackendOptions: "다른 CLI를 설치하면 선택지가 늘어납니다:",
     name: "이름",
     command: "명령어",
     model: "모델",
@@ -764,16 +756,9 @@ export default function SettingsPage() {
                     {cliStatus && (cliStatus.claude ? !cliStatus.codex : cliStatus.codex) && (
                       <div className="border border-accent/20 bg-accent/5 p-2 mb-2 text-[10px]">
                         <span className="text-text">
-                          {locale === "ko"
-                            ? `${cliStatus.claude ? "Claude Code" : "Codex CLI"}${t.onlyInstalledSuffix}`
-                            : `${t.onlyInstalledPrefix} ${cliStatus.claude ? "Claude Code" : "Codex CLI"} ${t.onlyInstalledSuffix}`}
+                          {t.oneCliInstalled}
                         </span>
-                        <span className="text-text-muted ml-1">
-                          {locale === "ko"
-                            ? `${cliStatus.claude ? "Codex" : "Claude Code"} ${t.forMoreBackendOptions}`
-                            : `${t.installOther} ${cliStatus.claude ? "Codex" : "Claude Code"} ${t.forMoreBackendOptions}`}
-                        </span>
-                        <code className="text-accent ml-1">
+                        <code className="text-accent ml-2">
                           {cliStatus.claude ? "npm install -g codex" : "npm install -g @anthropic-ai/claude-code"}
                         </code>
                       </div>
