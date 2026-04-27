@@ -641,7 +641,12 @@ async function spawnAgentPty(project, agent) {
     if (!session.acRegistrationName && session.acServerPort && session.acInjectMode) {
       const deferredRestart = async () => {
         const ready = await waitForAgentChattrReady(session.acServerPort, 60000);
-        if (!ready) return;
+        if (!ready) {
+          // #572: log timeout so operators know the health monitor will
+          // handle recovery when AC eventually comes up.
+          console.log(`[#565] Agent ${agent}: AC not reachable after 60s — health monitor will restart agent when AC recovers.`);
+          return;
+        }
         // Guard: agent may have been stopped manually while we waited.
         const current = agentSessions.get(key);
         if (!current || !current.term || current.state !== "running") return;
@@ -2088,6 +2093,35 @@ setInterval(runLoopGuardPollingTick, LOOP_GUARD_POLL_INTERVAL_MS);
 // logic). Rate-limited to one restart per 60s per project; gives up after
 // 3 consecutive failures and surfaces a persistent error.
 // ---------------------------------------------------------------------------
+// #572: restart agents that are running without AC registration after AC
+// recovers from a crash. Scans agentSessions for the given project,
+// finds agents missing acRegistrationName, and stop+respawns them so
+// they get MCP CLI flags at launch time.
+async function restartUnregisteredAgents(projectId) {
+  const toRestart = [];
+  for (const [key, session] of agentSessions) {
+    if (session.projectId !== projectId) continue;
+    if (session.acRegistrationName) continue; // already registered
+    if (session.state !== "running") continue;
+    if (!session.acServerPort || !session.acInjectMode) continue;
+    toRestart.push({ key, agentId: session.agentId });
+  }
+
+  if (toRestart.length === 0) return;
+  const samplePort = agentSessions.get(toRestart[0].key)?.acServerPort || "?";
+  console.log(`[health] AC recovered on port ${samplePort} — restarting ${toRestart.length} agent(s) for chat integration`);
+
+  for (const { key, agentId } of toRestart) {
+    try {
+      console.log(`[health] Restarting agent ${agentId} for project ${projectId} to gain chat integration`);
+      await stopAgentSession(key);
+      await spawnAgentPty(projectId, agentId);
+    } catch (err) {
+      console.error(`[health] Failed to restart agent ${agentId}: ${err.message}`);
+    }
+  }
+}
+
 const _acHealth = {
   // Per-project: { lastRestart: timestamp, consecutiveFailures: number }
   state: new Map(),
@@ -2124,6 +2158,13 @@ async function acHealthCheck() {
       // Healthy — reset failure counter
       if (health.consecutiveFailures > 0) {
         console.log(`[health] AC for ${project.id} recovered (port ${port} alive)`);
+        // #572: restart agents that are running without chat integration.
+        // These are agents where the #565 deferred restart timed out, or
+        // agents spawned while AC was down. MCP flags are set at process
+        // launch, so a full stop+respawn is required.
+        restartUnregisteredAgents(project.id).catch((err) => {
+          console.error(`[health] Failed to restart unregistered agents for ${project.id}:`, err.message);
+        });
       }
       health.consecutiveFailures = 0;
       _acHealth.state.set(project.id, health);
