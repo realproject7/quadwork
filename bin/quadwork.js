@@ -1989,8 +1989,17 @@ function cmdDoctor() {
         console.log(`  ${p.id}: (no log file)`);
         continue;
       }
-      const content = fs.readFileSync(logPath, "utf-8");
-      const lines = content.trimEnd().split("\n");
+      // Bounded tail: read last 8KB instead of the whole file to stay
+      // fast on large append-only logs.
+      const stat = fs.statSync(logPath);
+      const readSize = Math.min(stat.size, 8192);
+      const buf = Buffer.alloc(readSize);
+      const fd = fs.openSync(logPath, "r");
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
+      fs.closeSync(fd);
+      const lines = buf.toString("utf-8").trimEnd().split("\n");
+      // If we read from mid-file, the first line is likely partial — drop it.
+      if (readSize < stat.size) lines.shift();
       const tail = lines.slice(-20);
       console.log(`  ${p.id}: ${logPath} (last ${tail.length} lines)`);
       for (const line of tail) {
