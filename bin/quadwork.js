@@ -1617,15 +1617,22 @@ function cmdStart() {
     if (!configToml) continue;
     const acSpawn = chattrSpawnArgs(projectAcDir, ["--config", configToml]);
     if (!acSpawn) continue;
+    // #569: redirect AC stdout/stderr to a log file for diagnostics.
+    const acLogDir = path.join(CONFIG_DIR, project.id);
+    try { fs.mkdirSync(acLogDir, { recursive: true, mode: 0o700 }); } catch {}
+    const acLogPath = path.join(acLogDir, "agentchattr.log");
+    const acLogFd = fs.openSync(acLogPath, "a");
     const acProc = spawn(acSpawn.command, acSpawn.spawnArgs, {
       cwd: acSpawn.cwd,
-      stdio: "ignore",
+      stdio: ["ignore", acLogFd, acLogFd],
       detached: true,
     });
+    fs.closeSync(acLogFd);
     acProc.on("error", () => {});
     acProc.unref();
     if (acProc.pid) {
       ok(`AgentChattr started for ${project.id} from ${projectAcDir} (PID: ${acProc.pid})`);
+      log(`  Log: ${acLogPath}`);
       acPids.push(acProc.pid);
     }
   }
@@ -1967,6 +1974,44 @@ function cmdDoctor() {
 
   console.log("");
   console.log("Legend: [OK  ] on pin + on `pinned` branch; [BR  ] on pin but on a non-`pinned` named branch; [DETACH] on pin but in detached HEAD (re-run quadwork start to auto-migrate); [DIFF] off-pin (re-clone manually to re-sync)");
+
+  // #569: show last 20 lines of AC log for each project to help
+  // operators diagnose startup failures.
+  console.log("");
+  console.log("AgentChattr logs");
+  console.log("────────────────");
+  try {
+    const cfg = readConfig();
+    const projects = Array.isArray(cfg.projects) ? cfg.projects : [];
+    for (const p of projects) {
+      const logPath = path.join(CONFIG_DIR, p.id || "", "agentchattr.log");
+      if (!fs.existsSync(logPath)) {
+        console.log(`  ${p.id}: (no log file)`);
+        continue;
+      }
+      // Bounded tail: read last 8KB instead of the whole file to stay
+      // fast on large append-only logs.
+      const stat = fs.statSync(logPath);
+      const readSize = Math.min(stat.size, 8192);
+      const buf = Buffer.alloc(readSize);
+      const fd = fs.openSync(logPath, "r");
+      fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
+      fs.closeSync(fd);
+      const lines = buf.toString("utf-8").trimEnd().split("\n");
+      // If we read from mid-file, the first line is likely partial — drop it.
+      if (readSize < stat.size) lines.shift();
+      const tail = lines.slice(-20);
+      console.log(`  ${p.id}: ${logPath} (last ${tail.length} lines)`);
+      for (const line of tail) {
+        console.log(`    ${line}`);
+      }
+    }
+    if (projects.length === 0) {
+      console.log("  (no projects)");
+    }
+  } catch (err) {
+    console.log(`  (could not read logs: ${err.message})`);
+  }
   console.log("");
 }
 

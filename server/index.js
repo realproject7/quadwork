@@ -875,16 +875,25 @@ async function handleAgentChattr(req, res) {
       return null;
     }
 
+    // #569: redirect AC stdout/stderr to a log file so operators can
+    // diagnose startup failures. Append mode preserves restart history.
+    const acLogDir = path.join(os.homedir(), ".quadwork", projectId);
+    try { fs.mkdirSync(acLogDir, { recursive: true, mode: 0o700 }); } catch {}
+    const acLogPath = path.join(acLogDir, "agentchattr.log");
+    const acLogFd = fs.openSync(acLogPath, "a");
     const child = spawn(acSpawn.command, [...acSpawn.args, ...extraArgs], {
       cwd: acSpawn.cwd,
       env: process.env,
-      stdio: "ignore",
+      stdio: ["ignore", acLogFd, acLogFd],
       detached: true,
     });
 
+    // Close our copy of the log fd — child inherits its own copy.
+    fs.closeSync(acLogFd);
+
     // If pid is undefined, spawn failed
     if (!child.pid) {
-      setProc({ process: null, state: "error", error: "Failed to start AgentChattr — check that Python venv is set up in " + acDir });
+      setProc({ process: null, state: "error", error: "Failed to start AgentChattr — check that Python venv is set up in " + acDir + ". Log: " + acLogPath });
       child.on("error", () => {});
       return null;
     }
