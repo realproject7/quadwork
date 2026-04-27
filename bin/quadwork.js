@@ -2157,10 +2157,10 @@ switch (command) {
     break;
   case undefined: {
     // #573: No subcommand — smart default based on config state.
-    // Returning users (config exists with projects) → start.
-    // Fresh installs (no config or empty projects) → init wizard.
-    const cfg = readConfig();
-    if (cfg.projects && cfg.projects.length > 0) {
+    // Config file exists (even with 0 projects) → start, so the user
+    // can reach /setup to create their first project after init.
+    // No config file at all → init wizard (true fresh install).
+    if (fs.existsSync(CONFIG_PATH)) {
       cmdStart();
     } else {
       cmdInit();
