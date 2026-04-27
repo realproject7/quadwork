@@ -192,6 +192,9 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
     // #414 / quadwork#297: pre-scan for reserved agent senders so
     // we can prompt once instead of after a server 400. The same
     // RESERVED set lives in server/routes.js — keep them in sync.
+    // Current + legacy agent slugs — legacy names kept so imported
+    // histories with old senders are still flagged. Mirrors
+    // RESERVED_HISTORY_SENDERS in server/routes.js.
     const RESERVED_SENDERS = new Set(["head", "dev", "reviewer1", "reviewer2", "re1", "re2", "t1", "t2a", "t2b", "t3", "system"]);
     let allowAgentSenders = false;
     const offenders = new Set<string>();

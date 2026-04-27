@@ -55,7 +55,9 @@ function sanitizeOperatorName(value) {
   return truncated;
 }
 
-// Migration: rename old agent keys to new ones
+// Migration: rename old agent keys to new ones.
+// Keep this map — it migrates pre-v1.8 configs on startup so existing
+// installs transition to the canonical head/dev/re1/re2 slugs.
 const AGENT_KEY_MAP = { t1: "head", t2a: "re1", t2b: "re2", t3: "dev", reviewer1: "re1", reviewer2: "re2" };
 
 function migrateAgentKeys(config) {

@@ -38,10 +38,10 @@ const BACKENDS: { value: string; label: string }[] = [
 ];
 
 const AGENTS = [
-  { key: "head", label: "T1 — Head", role: "Owner / Final Guard", desc: "Merges PRs, makes final calls" },
-  { key: "re1", label: "RE1 — Reviewer 1", role: "Design Reviewer", desc: "Reviews architecture & design" },
-  { key: "re2", label: "RE2 — Reviewer 2", role: "Code Reviewer", desc: "Reviews implementation quality" },
-  { key: "dev", label: "T3 — Developer", role: "Full-Stack Builder", desc: "Implements features & fixes" },
+  { key: "head", label: "Head", role: "Owner / Final Guard", desc: "Merges PRs, makes final calls" },
+  { key: "re1", label: "RE1", role: "Design Reviewer", desc: "Reviews architecture & design" },
+  { key: "re2", label: "RE2", role: "Code Reviewer", desc: "Reviews implementation quality" },
+  { key: "dev", label: "Dev", role: "Full-Stack Builder", desc: "Implements features & fixes" },
 ];
 
 /* ── Component ─────────────────────────────────────────────────────────── */

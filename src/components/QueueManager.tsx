@@ -133,7 +133,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const sendToT1 = async () => {
+  const sendToHead = async () => {
     try {
       const cfgRes = await fetch("/api/config");
       if (!cfgRes.ok) throw new Error("config");
@@ -280,7 +280,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
 
         <div className="flex items-center gap-2 px-3 py-3">
           <button
-            onClick={sendToT1}
+            onClick={sendToHead}
             className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors"
           >
             {sent ? "Sent to Head" : "Send to Head Terminal"}

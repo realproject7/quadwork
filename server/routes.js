@@ -623,6 +623,8 @@ const RESERVED_HISTORY_SENDERS = new Set([
   "dev",
   "re1",
   "re2",
+  // Legacy agent slugs — kept for backward compat so old config
+  // imports are still blocked. New projects use head/dev/re1/re2.
   "reviewer1",
   "reviewer2",
   "t1",

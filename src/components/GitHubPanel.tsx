@@ -266,6 +266,8 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
               const agentStatus: Record<string, string> = {};
               for (const r of reviews) {
                 const body = (r.body || "").trim();
+                // Current names checked first; legacy Reviewer1/2 and T2a/b
+                // kept as fallback for reviews posted before the slug rename.
                 if (/^(?:RE2|Reviewer2|T2b)\b/i.test(body)) {
                   agentStatus["re2"] = r.state;
                 } else if (/^(?:RE1|Reviewer1|T2a)\b/i.test(body) || /^##\s*Verdict/i.test(body)) {
