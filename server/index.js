@@ -1080,9 +1080,8 @@ async function handleAgentChattr(req, res) {
       }
       res.json({ ok: true, state: "running", pid: child.pid });
       // #447: auto-reset all agents after AC restart so they get
-      // fresh MCP tokens. #581: set debounce timestamp so the health
-      // monitor doesn't double-fire when it detects recovery.
-      _acHealth.lastResetTimestamp.set(projectId, Date.now());
+      // fresh MCP tokens. #581: set debounce timestamp only on success
+      // so the health monitor can still recover if this reset fails.
       setTimeout(async () => {
         try {
           const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(projectId)}/reset`, {
@@ -1090,6 +1089,7 @@ async function handleAgentChattr(req, res) {
           });
           if (resetResp.ok) {
             const resetData = await resetResp.json();
+            _acHealth.lastResetTimestamp.set(projectId, Date.now());
             console.log(`[agentchattr] ${projectId} auto-reset ${resetData.restarted} agent(s) after AC restart`);
           } else {
             console.warn(`[agentchattr] ${projectId} agent reset after AC restart returned ${resetResp.status}`);
