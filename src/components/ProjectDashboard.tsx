@@ -176,7 +176,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           the primary interface (#208). 2px accent border + explicit
           "primary chat" label in the panel header. */}
       <div className="flex flex-col overflow-hidden border-2 border-accent">
-        <PanelHeader label="AgentChattr — primary chat" tooltip={
+        <PanelHeader label={locale === "ko" ? "AgentChattr — 메인 채팅" : "AgentChattr — primary chat"} tooltip={
           <InfoTooltip>
             {locale === "ko"
               ? <><b>메인 채팅</b> - 당신과 4개의 AI 에이전트가 실시간으로 대화하는 공간입니다. 여기 입력한 메시지가 에이전트 동작을 시작시킵니다. 특정 에이전트를 부를 때는 @멘션을 사용하세요.</>

@@ -231,7 +231,7 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             {/* #411 / quadwork#281: Recently closed issues — last 5,
                 muted style with a ✓ to distinguish from open. */}
             <div className="px-3 pt-2 pb-1 text-[9px] text-text-muted uppercase tracking-wider">
-              {locale === "ko" ? "최근 종료됨" : "Recently closed"}
+              {locale === "ko" ? "최근 닫힌 이슈" : "Recently closed"}
             </div>
             {closedIssues.length === 0 && (
               <div className="px-3 py-1 text-[11px] text-text-muted">{locale === "ko" ? "아직 없음" : "None yet"}</div>

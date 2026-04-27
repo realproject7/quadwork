@@ -13,7 +13,7 @@ function getSteps(locale: "en" | "ko"): { title: string; body: string }[] {
     return [
       {
         title: "채팅에서 작업을 지시합니다",
-        body: "@head 에게 무엇을 만들지 말해 주세요. 아주 구체적으로 써도 되고, 느슨하게 지시해도 됩니다.",
+        body: "@head에게 만들 것을 말해주세요. 구체적으로 또는 모호하게 말해도 괜찮습니다.",
       },
       {
         title: "Head가 GitHub 이슈를 만듭니다",
