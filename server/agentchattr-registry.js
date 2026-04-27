@@ -162,9 +162,26 @@ function stopHeartbeat(handle) {
   if (handle) clearInterval(handle);
 }
 
+/**
+ * Register an agent with retries and exponential backoff.
+ * Returns {name, token, slot} on success, null after all attempts fail.
+ * Uses registerAgent internally so registerAgent.lastError is populated.
+ */
+async function registerAgentWithRetry(serverPort, base, label = null, { force = false, attempts = 3, delayMs = 2000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const result = await registerAgent(serverPort, base, label, { force });
+    if (result) return result;
+    if (i < attempts - 1) {
+      await new Promise((res) => setTimeout(res, delayMs * Math.pow(2, i)));
+    }
+  }
+  return null;
+}
+
 module.exports = {
   waitForAgentChattrReady,
   registerAgent,
+  registerAgentWithRetry,
   deregisterAgent,
   startHeartbeat,
   stopHeartbeat,

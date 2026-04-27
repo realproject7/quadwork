@@ -13,7 +13,7 @@ const {
   patchAgentchattrConfigForTelegramBridge,
   projectAgentchattrConfigPath,
 } = routes;
-const { waitForAgentChattrReady, registerAgent, deregisterAgent, startHeartbeat, stopHeartbeat } = require("./agentchattr-registry");
+const { waitForAgentChattrReady, registerAgent, registerAgentWithRetry, deregisterAgent, startHeartbeat, stopHeartbeat } = require("./agentchattr-registry");
 const { patchAgentchattrCss } = require("./install-agentchattr");
 const { startQueueWatcher, stopQueueWatcher } = require("./queue-watcher");
 
@@ -356,7 +356,13 @@ async function buildAgentArgs(projectId, agentId) {
       // write that into the per-agent MCP config file.
       const chattrInfo = resolveProjectChattr(projectId);
       acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
-      await waitForAgentChattrReady(acServerPort);
+      // #565: extend timeout to 30s — first setup may need AC to install
+      // (git clone + venv + pip install) before it can bind a port.
+      const acReady = await waitForAgentChattrReady(acServerPort, 30000);
+      if (!acReady) {
+        console.warn(`[#565] Agent ${agentId}: AC not reachable on port ${acServerPort} after 30s. Spawning without chat integration.`);
+        return { args, acRegistrationName: null, acServerPort: null, acRegistrationToken: null, acInjectMode: null, acMcpHttpPort: mcpHttpPort || null };
+      }
       // #242: best-effort deregister any stale registration of the
       // canonical name (left over by a crashed previous QuadWork
       // session) so the fresh register lands at slot 1 instead of
@@ -370,16 +376,18 @@ async function buildAgentArgs(projectId, agentId) {
         clearPersistedAgentToken(projectId, agentId);
       }
       // #478: force-replace so AC expires any ghost slots for this base
-      const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null, { force: true });
+      // #565: retry with backoff and degrade gracefully if AC is not ready
+      const registration = await registerAgentWithRetry(acServerPort, agentId, agentCfg.display_name || null, { force: true });
       if (!registration) {
-        throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
+        console.warn(`[#565] Agent ${agentId}: AC registration failed after retries (${registerAgent.lastError}). Spawning without chat integration.`);
+      } else {
+        acRegistrationName = registration.name;
+        acRegistrationToken = registration.token;
+        writePersistedAgentToken(projectId, agentId, registration.token);
+        const mcpConfigPath = writeMcpConfigFile(projectId, agentId, mcpHttpPort, registration.token);
+        const flag = agentCfg.mcp_flag || "--mcp-config";
+        args.push(flag, mcpConfigPath);
       }
-      acRegistrationName = registration.name;
-      acRegistrationToken = registration.token;
-      writePersistedAgentToken(projectId, agentId, registration.token);
-      const mcpConfigPath = writeMcpConfigFile(projectId, agentId, mcpHttpPort, registration.token);
-      const flag = agentCfg.mcp_flag || "--mcp-config";
-      args.push(flag, mcpConfigPath);
     } else if (injectMode === "proxy_flag") {
       // Codex: register with AgentChattr first (#240) so the proxy
       // injects a real per-agent token, not the global session token.
@@ -387,7 +395,12 @@ async function buildAgentArgs(projectId, agentId) {
       // projects without a per-project agentchattr_url still work.
       const chattrInfo = resolveProjectChattr(projectId);
       acServerPort = Number(new URL(chattrInfo.url).port) || 8300;
-      await waitForAgentChattrReady(acServerPort);
+      // #565: extend timeout to 30s for first-setup scenario
+      const acReady = await waitForAgentChattrReady(acServerPort, 30000);
+      if (!acReady) {
+        console.warn(`[#565] Agent ${agentId}: AC not reachable on port ${acServerPort} after 30s. Spawning without chat integration.`);
+        return { args, acRegistrationName: null, acServerPort: null, acRegistrationToken: null, acInjectMode: null, acMcpHttpPort: mcpHttpPort || null };
+      }
       // #242: best-effort deregister stale canonical name first using
       // the persisted bearer token from a previous session.
       const stalePersistedToken = readPersistedAgentToken(projectId, agentId);
@@ -396,17 +409,19 @@ async function buildAgentArgs(projectId, agentId) {
         clearPersistedAgentToken(projectId, agentId);
       }
       // #478: force-replace so AC expires any ghost slots for this base
-      const registration = await registerAgent(acServerPort, agentId, agentCfg.display_name || null, { force: true });
+      // #565: retry with backoff and degrade gracefully if AC is not ready
+      const registration = await registerAgentWithRetry(acServerPort, agentId, agentCfg.display_name || null, { force: true });
       if (!registration) {
-        throw new Error(`Failed to register ${agentId}: ${registerAgent.lastError}`);
-      }
-      acRegistrationName = registration.name;
-      acRegistrationToken = registration.token;
-      writePersistedAgentToken(projectId, agentId, registration.token);
-      const upstreamUrl = `http://127.0.0.1:${mcpHttpPort}`;
-      const proxyUrl = await startMcpProxy(projectId, agentId, upstreamUrl, registration.token);
-      if (proxyUrl) {
-        args.push("-c", `mcp_servers.agentchattr.url="${proxyUrl}"`);
+        console.warn(`[#565] Agent ${agentId}: AC registration failed after retries (${registerAgent.lastError}). Spawning without chat integration.`);
+      } else {
+        acRegistrationName = registration.name;
+        acRegistrationToken = registration.token;
+        writePersistedAgentToken(projectId, agentId, registration.token);
+        const upstreamUrl = `http://127.0.0.1:${mcpHttpPort}`;
+        const proxyUrl = await startMcpProxy(projectId, agentId, upstreamUrl, registration.token);
+        if (proxyUrl) {
+          args.push("-c", `mcp_servers.agentchattr.url="${proxyUrl}"`);
+        }
       }
     }
   }
@@ -526,11 +541,14 @@ async function spawnAgentPty(project, agent) {
   if (!cwd) return { ok: false, error: `Unknown agent: ${key}` };
 
   const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
-  const built = await buildAgentArgs(project, agent);
-  const args = built.args;
   const extraEnv = buildAgentEnv(project, agent);
 
   try {
+    // #565: buildAgentArgs is inside try-catch so registration failures
+    // cannot crash the server as an unhandled rejection.
+    const built = await buildAgentArgs(project, agent);
+    const args = built.args;
+
     const term = pty.spawn(command, args, {
       name: "xterm-256color",
       cols: 120,
