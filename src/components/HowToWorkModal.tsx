@@ -8,9 +8,41 @@ interface HowToWorkModalProps {
   onClose: () => void;
 }
 
-function getSteps(locale: "en" | "ko"): { title: string; body: string }[] {
-  if (locale === "ko") {
-    return [
+const COPY = {
+  en: {
+    title: "How QuadWork builds your code",
+    subtitle: "Five steps from your one-line request to a merged pull request.",
+    close: "Close",
+    helpClass: "",
+    steps: [
+      {
+        title: "You assign a task in the chat",
+        body: "Tell @head what to build. Be as specific or as vague as you like.",
+      },
+      {
+        title: "Head creates a GitHub issue",
+        body: "Head opens an issue, adds it to the queue, and waits for your trigger.",
+      },
+      {
+        title: "Dev writes the code",
+        body: "Dev clones a branch, implements the change, and opens a pull request.",
+      },
+      {
+        title: "Reviewers check the work",
+        body: "RE1 and RE2 each review the PR independently. Both must approve before the PR is mergeable.",
+      },
+      {
+        title: "Head merges and continues",
+        body: "Head merges the approved PR and assigns the next ticket from the queue. The cycle continues all night while you sleep.",
+      },
+    ],
+  },
+  ko: {
+    title: "QuadWork가 코드를 만드는 방식",
+    subtitle: "한 줄 요청에서 병합된 풀 리퀘스트까지 가는 5단계입니다.",
+    close: "닫기",
+    helpClass: "ko-help",
+    steps: [
       {
         title: "채팅에서 작업을 지시합니다",
         body: "@head에게 만들 것을 말해주세요. 구체적으로 또는 모호하게 말해도 괜찮습니다.",
@@ -31,32 +63,9 @@ function getSteps(locale: "en" | "ko"): { title: string; body: string }[] {
         title: "Head가 병합하고 계속 진행합니다",
         body: "Head가 승인된 PR을 병합하고, 큐에서 다음 티켓을 할당합니다. 당신이 자는 동안에도 이 사이클은 밤새 계속됩니다.",
       },
-    ];
-  }
-
-  return [
-    {
-      title: "You assign a task in the chat",
-      body: "Tell @head what to build. Be as specific or as vague as you like.",
-    },
-    {
-      title: "Head creates a GitHub issue",
-      body: "Head opens an issue, adds it to the queue, and waits for your trigger.",
-    },
-    {
-      title: "Dev writes the code",
-      body: "Dev clones a branch, implements the change, and opens a pull request.",
-    },
-    {
-      title: "Reviewers check the work",
-      body: "RE1 and RE2 each review the PR independently. Both must approve before the PR is mergeable.",
-    },
-    {
-      title: "Head merges and continues",
-      body: "Head merges the approved PR and assigns the next ticket from the queue. The cycle continues all night while you sleep.",
-    },
-  ];
-}
+    ],
+  },
+} as const;
 
 /**
  * "How to Work" modal (#229).
@@ -67,7 +76,7 @@ function getSteps(locale: "en" | "ko"): { title: string; body: string }[] {
  */
 export default function HowToWorkModal({ open, onClose }: HowToWorkModalProps) {
   const { locale } = useLocale();
-  const steps = getSteps(locale);
+  const t = COPY[locale];
 
   useEffect(() => {
     if (!open) return;
@@ -87,13 +96,13 @@ export default function HowToWorkModal({ open, onClose }: HowToWorkModalProps) {
       aria-labelledby="how-to-work-title"
     >
       <div
-        className={`relative mx-4 max-w-xl w-full max-h-[90vh] overflow-auto rounded-lg border border-white/10 bg-neutral-950 p-6 shadow-2xl ${locale === "ko" ? "ko-help" : ""}`}
+        className={`relative mx-4 max-w-xl w-full max-h-[90vh] overflow-auto rounded-lg border border-white/10 bg-neutral-950 p-6 shadow-2xl ${t.helpClass}`}
         onClick={(e) => e.stopPropagation()}
       >
         <button
           type="button"
           onClick={onClose}
-          aria-label={locale === "ko" ? "닫기" : "Close"}
+          aria-label={t.close}
           className="absolute right-3 top-3 rounded p-1 text-neutral-400 hover:bg-white/5 hover:text-white"
         >
           <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -102,18 +111,16 @@ export default function HowToWorkModal({ open, onClose }: HowToWorkModalProps) {
         </button>
 
         <h2 id="how-to-work-title" className="text-base font-semibold text-white">
-          {locale === "ko" ? "QuadWork가 코드를 만드는 방식" : "How QuadWork builds your code"}
+          {t.title}
         </h2>
         <p className="mt-2 text-[12px] text-neutral-400">
-          {locale === "ko"
-            ? "한 줄 요청에서 병합된 풀 리퀘스트까지 가는 5단계입니다."
-            : "Five steps from your one-line request to a merged pull request."}
+          {t.subtitle}
         </p>
 
         <ol className="mt-5 relative">
           {/* Vertical accent line connecting the step circles. */}
           <span aria-hidden className="absolute left-[14px] top-3 bottom-3 w-px bg-accent/30" />
-          {steps.map((step, i) => (
+          {t.steps.map((step, i) => (
             <li key={i} className="relative pl-10 pb-5 last:pb-0">
               <span
                 className="absolute left-0 top-0 inline-flex items-center justify-center w-7 h-7 rounded-full border border-accent bg-neutral-950 text-accent text-[12px] font-semibold tabular-nums"

@@ -4,6 +4,45 @@ import { useEffect, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
 
+const COPY = {
+  en: {
+    title: "Loop Guard",
+    tooltip: (
+      <>
+        <b>Loop Guard</b> pauses agent-to-agent message chains after this many hops with no human reply. Higher values let agents work longer overnight; lower values add safety against runaway loops. AgentChattr accepts <b>4–50</b>; QuadWork defaults to <b>30</b> (about 5–6 full PR cycles). Posting any chat message yourself resets the counter immediately.
+      </>
+    ),
+    pauseAfter: "Pause after",
+    hops: "hops",
+    apply: "Apply",
+    applying: "…",
+    applyTitle: "Apply (writes config.toml + live-pushes to AgentChattr)",
+    errorInteger: "Must be an integer between 4 and 50.",
+    liveUpdateFailed: "Saved to config.toml — live update failed; takes effect on next AC restart.",
+    autoContinue: "Auto-continue after pause",
+    wait: "— wait",
+    secondsBefore: "s before /continue",
+  },
+  ko: {
+    title: "루프 가드",
+    tooltip: (
+      <>
+        <b>루프 가드</b> - 사람의 응답 없이 에이전트끼리 메시지를 주고받는 횟수가 이 값에 도달하면 체인을 멈춥니다. 값을 높이면 야간 작업을 더 길게 돌릴 수 있고, 낮추면 runaway loop에 대한 안전성이 높아집니다. AgentChattr 허용 범위는 <b>4-50</b>이며 QuadWork 기본값은 <b>30</b>입니다. 직접 채팅을 한 번 보내면 카운터는 즉시 초기화됩니다.
+      </>
+    ),
+    pauseAfter: "다음 횟수 후 일시정지:",
+    hops: "홉",
+    apply: "적용",
+    applying: "…",
+    applyTitle: "적용 (config.toml에 저장하고 AgentChattr에 실시간 반영)",
+    errorInteger: "4에서 50 사이의 정수여야 합니다.",
+    liveUpdateFailed: "config.toml에 저장되었습니다. 실시간 업데이트는 실패하여 다음 AC 재시작 때 적용됩니다.",
+    autoContinue: "일시정지 후 자동 재개",
+    wait: "—",
+    secondsBefore: "초 대기 후 /continue",
+  },
+} as const;
+
 interface LoopGuardWidgetProps {
   projectId: string;
 }
@@ -20,6 +59,7 @@ interface LoopGuardWidgetProps {
  */
 export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   const { locale } = useLocale();
+  const t = COPY[locale];
   const [value, setValue] = useState<number>(30);
   const [draft, setDraft] = useState<string>("30");
   const [saving, setSaving] = useState(false);
@@ -96,7 +136,7 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   const apply = () => {
     const n = parseInt(draft, 10);
     if (!Number.isInteger(n) || n < 4 || n > 50) {
-      setError("Must be an integer between 4 and 50.");
+      setError(t.errorInteger);
       return;
     }
     setSaving(true);
@@ -124,15 +164,13 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   return (
     <div className="border border-border rounded p-2 text-[11px] font-mono">
       <div className="flex items-center gap-1.5 mb-1">
-        <span className="uppercase tracking-wider text-text-muted">{locale === "ko" ? "루프 가드" : "Loop Guard"}</span>
+        <span className="uppercase tracking-wider text-text-muted">{t.title}</span>
         <InfoTooltip>
-          {locale === "ko"
-            ? <><b>루프 가드</b> - 사람의 응답 없이 에이전트끼리 메시지를 주고받는 횟수가 이 값에 도달하면 체인을 멈춥니다. 값을 높이면 야간 작업을 더 길게 돌릴 수 있고, 낮추면 runaway loop에 대한 안전성이 높아집니다. AgentChattr 허용 범위는 <b>4-50</b>이며 QuadWork 기본값은 <b>30</b>입니다. 직접 채팅을 한 번 보내면 카운터는 즉시 초기화됩니다.</>
-            : <><b>Loop Guard</b> pauses agent-to-agent message chains after this many hops with no human reply. Higher values let agents work longer overnight; lower values add safety against runaway loops. AgentChattr accepts <b>4–50</b>; QuadWork defaults to <b>30</b> (about 5–6 full PR cycles). Posting any chat message yourself resets the counter immediately.</>}
+          {t.tooltip}
         </InfoTooltip>
       </div>
       <div className="flex items-center gap-1.5">
-        <span className="text-text-muted">Pause after</span>
+        <span className="text-text-muted">{t.pauseAfter}</span>
         <input
           type="number"
           min={4}
@@ -142,15 +180,15 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
           disabled={saving}
           className="w-12 bg-transparent px-1 py-0.5 border border-border rounded text-text outline-none focus:ring-1 focus:ring-accent"
         />
-        <span className="text-text-muted">hops</span>
+        <span className="text-text-muted">{t.hops}</span>
         <button
           type="button"
           onClick={apply}
           disabled={saving || draft === String(value)}
           className="ml-auto px-2 py-0.5 text-[10px] text-accent border border-accent/40 rounded hover:bg-accent/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-          title="Apply (writes config.toml + live-pushes to AgentChattr)"
+          title={t.applyTitle}
         >
-          {saving ? "…" : "Apply"}
+          {saving ? t.applying : t.apply}
         </button>
       </div>
       {error && (
@@ -158,7 +196,7 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
       )}
       {live === false && !error && (
         <div className="mt-1 text-[10px] text-text-muted">
-          Saved to config.toml — live update failed; takes effect on next AC restart.
+          {t.liveUpdateFailed}
         </div>
       )}
       {/* #422 / quadwork#310: auto-continue opt-in. Default OFF so
@@ -179,8 +217,8 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
             });
           }}
         />
-        Auto-continue after pause
-        <span className="text-text-muted">— wait</span>
+        {t.autoContinue}
+        <span className="text-text-muted">{t.wait}</span>
         <input
           type="number"
           min={5}
@@ -199,7 +237,7 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
           }}
           className="w-10 bg-transparent px-1 py-0.5 border border-border rounded text-text outline-none focus:ring-1 focus:ring-accent disabled:opacity-40 text-center"
         />
-        <span className="text-text-muted">s before /continue</span>
+        <span className="text-text-muted">{t.secondsBefore}</span>
       </label>
     </div>
   );

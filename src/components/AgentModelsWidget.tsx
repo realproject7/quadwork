@@ -23,6 +23,65 @@ import { useCallback, useEffect, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
 
+const COPY = {
+  en: {
+    title: "Agent Models",
+    loading: "Loading…",
+    noAgents: "No agents configured.",
+    restartRequired: "restart required",
+    restartRequiredTooltip: "Config changed — running session is still on the old model/effort. Click Restart to apply.",
+    default: "(default)",
+    custom: "(custom)",
+    restart: "Restart",
+    restartTooltip: "Restart this agent to pick up the new model / reasoning setting",
+    help: (
+      <>
+        Codex reasoning effort defaults to <code className="text-text">medium</code> for new projects. Blank model falls back to the CLI default. Click Restart to apply changes to a live session.
+      </>
+    ),
+    summary: (id: string, backend: string) => (
+      <>
+        <span className="text-text">{id}</span>
+        <span>: {backend}</span>
+      </>
+    ),
+    configure: "Configure →",
+    tooltip: (
+      <>
+        <b>Agent Models</b> — configure which LLM model and reasoning effort each agent uses. Changes require an agent restart to take effect.
+      </>
+    ),
+  },
+  ko: {
+    title: "에이전트 모델",
+    loading: "로딩 중…",
+    noAgents: "설정된 에이전트가 없습니다.",
+    restartRequired: "재시작 필요",
+    restartRequiredTooltip: "설정이 변경되었습니다. 실행 중인 세션에는 이전 설정이 적용되어 있습니다. 재시작을 클릭하여 적용하세요.",
+    default: "(기본값)",
+    custom: "(사용자 정의)",
+    restart: "재시작",
+    restartTooltip: "에이전트를 재시작하여 새로운 모델/추론 설정을 적용합니다",
+    help: (
+      <>
+        Codex 추론 수준은 새 프로젝트의 경우 <code className="text-text">medium</code>으로 기본 설정됩니다. 모델을 비워두면 CLI 기본값이 사용됩니다. 변경 사항을 적용하려면 재시작을 클릭하세요.
+      </>
+    ),
+    summary: (id: string, backend: string) => (
+      <>
+        <span className="text-text">{id}</span>
+        <span>: {backend}</span>
+      </>
+    ),
+    configure: "설정 →",
+    tooltip: (
+      <>
+        <b>에이전트 모델</b> - 각 에이전트가 어떤 LLM 모델과 추론 수준을 사용할지 설정합니다. 변경 사항은 에이전트를 재시작해야 적용됩니다.
+      </>
+    ),
+  },
+} as const;
+
 interface AgentRow {
   agent_id: string;
   backend: string;
@@ -70,6 +129,7 @@ function optionsForBackend(backend: string) {
 // fetch until the operator actually wants to configure something.
 function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: () => void }) {
   const { locale } = useLocale();
+  const t = COPY[locale];
   const [rows, setRows] = useState<AgentRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -174,14 +234,14 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
         </button>
 
         <div className="flex items-center justify-between mb-3">
-          <h2 id="agent-models-title" className="text-base font-semibold text-white">{locale === "ko" ? "에이전트 모델" : "Agent Models"}</h2>
+          <h2 id="agent-models-title" className="text-base font-semibold text-white">{t.title}</h2>
           {error && <span className="text-[10px] text-error max-w-[60%] truncate ml-2" title={error}>err: {error}</span>}
         </div>
 
         <div className="flex flex-col gap-1.5">
-          {!rows && <div className="text-[11px] text-text-muted">Loading…</div>}
+          {!rows && <div className="text-[11px] text-text-muted">{t.loading}</div>}
           {rows && rows.length === 0 && (
-            <div className="text-[11px] text-text-muted">No agents configured.</div>
+            <div className="text-[11px] text-text-muted">{t.noAgents}</div>
           )}
           {rows && rows.map((row) => (
             <div key={row.agent_id} className="flex items-center gap-1.5 flex-wrap">
@@ -190,9 +250,9 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
               {needsRestart.has(row.agent_id) && (
                 <span
                   className="text-[9px] text-[#ffcc00] border border-[#ffcc00]/40 px-1 py-[1px] shrink-0"
-                  title="Config changed — running session is still on the old model/effort. Click Restart to apply."
+                  title={t.restartRequiredTooltip}
                 >
-                  restart required
+                  {t.restartRequired}
                 </span>
               )}
               {/* #343: backend-specific model dropdown. Empty value
@@ -212,7 +272,7 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
                     (e.g. operator hand-edited config.json), keep
                     it selectable so their override doesn't vanish. */}
                 {row.model && !optionsForBackend(row.backend).some((o) => o.value === row.model) && (
-                  <option value={row.model} className="bg-bg-surface">{row.model} (custom)</option>
+                  <option value={row.model} className="bg-bg-surface">{row.model} {t.custom}</option>
                 )}
               </select>
               {row.reasoning_supported ? (
@@ -222,7 +282,7 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
                   onChange={(e) => update(row.agent_id, { reasoning_effort: e.target.value })}
                   className="bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent cursor-pointer disabled:opacity-50"
                 >
-                  <option value="" className="bg-bg-surface">(default)</option>
+                  <option value="" className="bg-bg-surface">{t.default}</option>
                   {REASONING_LEVELS.map((lvl) => (
                     <option key={lvl} value={lvl} className="bg-bg-surface">{lvl}</option>
                   ))}
@@ -234,15 +294,15 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
                 type="button"
                 onClick={() => restart(row.agent_id)}
                 disabled={busy === row.agent_id}
-                title="Restart this agent to pick up the new model / reasoning setting"
+                title={t.restartTooltip}
                 className="shrink-0 px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 disabled:opacity-50 transition-colors"
               >
-                {busy === row.agent_id ? "…" : "Restart"}
+                {busy === row.agent_id ? "…" : t.restart}
               </button>
             </div>
           ))}
           <p className="mt-2 text-[10px] text-text-muted leading-snug">
-            Codex reasoning effort defaults to <code className="text-text">medium</code> for new projects. Blank model falls back to the CLI default. Click Restart to apply changes to a live session.
+            {t.help}
           </p>
         </div>
       </div>
@@ -260,6 +320,7 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
 // outside the modal flow.
 export default function AgentModelsButton({ projectId }: AgentModelsWidgetProps) {
   const { locale } = useLocale();
+  const t = COPY[locale];
   const [open, setOpen] = useState(false);
   const [summary, setSummary] = useState<{ id: string; backend: string }[] | null>(null);
 
@@ -281,11 +342,9 @@ export default function AgentModelsButton({ projectId }: AgentModelsWidgetProps)
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
           <div className="flex items-center gap-1.5">
-            <span className="text-[11px] text-text-muted uppercase tracking-wider">{locale === "ko" ? "에이전트 모델" : "Agent Models"}</span>
+            <span className="text-[11px] text-text-muted uppercase tracking-wider">{t.title}</span>
             <InfoTooltip>
-              {locale === "ko"
-                ? <><b>에이전트 모델</b> - 각 에이전트가 어떤 LLM 모델과 추론 수준을 사용할지 설정합니다. 변경 사항은 에이전트를 재시작해야 적용됩니다.</>
-                : <><b>Agent Models</b> — configure which LLM model and reasoning effort each agent uses. Changes require an agent restart to take effect.</>}
+              {t.tooltip}
             </InfoTooltip>
           </div>
           <button
@@ -293,7 +352,7 @@ export default function AgentModelsButton({ projectId }: AgentModelsWidgetProps)
             onClick={() => setOpen(true)}
             className="px-2 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors"
           >
-            {locale === "ko" ? "설정 →" : "Configure →"}
+            {t.configure}
           </button>
         </div>
         {summary && summary.length > 0 && (
@@ -301,8 +360,7 @@ export default function AgentModelsButton({ projectId }: AgentModelsWidgetProps)
             {summary.map((s, i) => (
               <span key={s.id}>
                 {i > 0 && <span className="text-text-muted/60"> · </span>}
-                <span className="text-text">{s.id}</span>
-                <span>: {s.backend}</span>
+                {t.summary(s.id, s.backend)}
               </span>
             ))}
           </div>
