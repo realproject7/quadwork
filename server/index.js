@@ -1080,8 +1080,9 @@ async function handleAgentChattr(req, res) {
       }
       res.json({ ok: true, state: "running", pid: child.pid });
       // #447: auto-reset all agents after AC restart so they get
-      // fresh MCP tokens. #581: set debounce timestamp only on success
-      // so the health monitor can still recover if this reset fails.
+      // fresh MCP tokens. #581: mark reset as scheduled immediately
+      // so the health monitor skips its own reset while ours is in-flight.
+      _acHealth.resetState.set(projectId, { status: "scheduled", timestamp: Date.now() });
       setTimeout(async () => {
         try {
           const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(projectId)}/reset`, {
@@ -1089,12 +1090,14 @@ async function handleAgentChattr(req, res) {
           });
           if (resetResp.ok) {
             const resetData = await resetResp.json();
-            _acHealth.lastResetTimestamp.set(projectId, Date.now());
+            _acHealth.resetState.set(projectId, { status: "succeeded", timestamp: Date.now() });
             console.log(`[agentchattr] ${projectId} auto-reset ${resetData.restarted} agent(s) after AC restart`);
           } else {
+            _acHealth.resetState.set(projectId, { status: "failed", timestamp: Date.now() });
             console.warn(`[agentchattr] ${projectId} agent reset after AC restart returned ${resetResp.status}`);
           }
         } catch (err) {
+          _acHealth.resetState.set(projectId, { status: "failed", timestamp: Date.now() });
           console.warn(`[agentchattr] ${projectId} agent reset after AC restart failed: ${err.message || err}`);
         }
       }, 2000);
@@ -2134,8 +2137,9 @@ const _acHealth = {
   // Per-project: { lastRestart: timestamp, consecutiveFailures: number }
   state: new Map(),
   intervalHandle: null,
-  // #581: per-project debounce — auto-reset fires at most once per 60s
-  lastResetTimestamp: new Map(),
+  // #581: per-project reset state — prevents duplicate resets per restart event.
+  // Values: { status: "scheduled"|"succeeded"|"failed", timestamp: number }
+  resetState: new Map(),
 };
 
 function isPortAlive(port) {
@@ -2172,11 +2176,18 @@ async function acHealthCheck() {
         // These are agents where the #565 deferred restart timed out, or
         // agents spawned while AC was down. MCP flags are set at process
         // launch, so a full stop+respawn is required.
-        // #581: dedupe — skip if a reset already fired within 60s
-        const lastReset = _acHealth.lastResetTimestamp.get(project.id) || 0;
-        if (Date.now() - lastReset >= 60000) {
-          _acHealth.lastResetTimestamp.set(project.id, Date.now());
-          restartUnregisteredAgents(project.id).catch((err) => {
+        // #581: dedupe — skip if a reset is scheduled/in-flight or succeeded within 60s
+        const rs = _acHealth.resetState.get(project.id);
+        const skipReset = rs && (
+          rs.status === "scheduled" ||
+          (rs.status === "succeeded" && Date.now() - rs.timestamp < 60000)
+        );
+        if (!skipReset) {
+          _acHealth.resetState.set(project.id, { status: "scheduled", timestamp: Date.now() });
+          restartUnregisteredAgents(project.id).then(() => {
+            _acHealth.resetState.set(project.id, { status: "succeeded", timestamp: Date.now() });
+          }).catch((err) => {
+            _acHealth.resetState.set(project.id, { status: "failed", timestamp: Date.now() });
             console.error(`[health] Failed to restart unregistered agents for ${project.id}:`, err.message);
           });
         }
