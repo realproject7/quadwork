@@ -1564,7 +1564,30 @@ function migrateLoopGuardDefaults(config) {
   }
 }
 
-function cmdStart() {
+/**
+ * #580: Poll AC health endpoint until it responds 200, or timeout.
+ * Simple inline implementation for bin/ (no access to server/ modules).
+ */
+async function waitForAcHealth(baseUrl, timeoutMs = 30000) {
+  const http = require("http");
+  const deadline = Date.now() + timeoutMs;
+  const healthUrl = `${baseUrl}/api/health`;
+  while (Date.now() < deadline) {
+    const ok = await new Promise((resolve) => {
+      const req = http.get(healthUrl, (res) => {
+        res.resume();
+        resolve(res.statusCode >= 200 && res.statusCode < 400);
+      });
+      req.on("error", () => resolve(false));
+      req.setTimeout(2000, () => { req.destroy(); resolve(false); });
+    });
+    if (ok) return true;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return false;
+}
+
+async function cmdStart() {
   console.log("\n  QuadWork Start\n");
 
   const config = readConfig();
@@ -1638,7 +1661,14 @@ function cmdStart() {
     acProc.on("error", () => {});
     acProc.unref();
     if (acProc.pid) {
-      ok(`AgentChattr started for ${project.id} from ${projectAcDir} (PID: ${acProc.pid})`);
+      // #580: wait for AC to bind its port before declaring success.
+      const acUrl = project.agentchattr_url || "http://127.0.0.1:8300";
+      const acReady = await waitForAcHealth(acUrl, 30000);
+      if (acReady) {
+        ok(`AgentChattr started for ${project.id} from ${projectAcDir} (PID: ${acProc.pid})`);
+      } else {
+        warn(`AgentChattr spawned for ${project.id} (PID: ${acProc.pid}) but did not become ready within 30s`);
+      }
       log(`  Log: ${acLogPath}`);
       acPids.push(acProc.pid);
     }

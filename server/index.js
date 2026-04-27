@@ -860,7 +860,7 @@ async function handleAgentChattr(req, res) {
     } catch {}
   }
 
-  function spawnChattr() {
+  async function spawnChattr() {
     // Sync config.toml port before starting
     regenerateConfigToml();
 
@@ -913,7 +913,15 @@ async function handleAgentChattr(req, res) {
         setProc({ process: null, state: "stopped", error: code ? `exit:${code}` : null });
       }
     });
-    setProc({ process: child, state: "running", error: null });
+    // #580: wait for AC to actually bind the port before declaring success.
+    // On fast-start installs this resolves in 1-2s; prevents false-down
+    // detection on slow starts that triggered ghost agent cascades.
+    const ready = await waitForAgentChattrReady(chattrPort, 30000);
+    if (ready) {
+      setProc({ process: child, state: "running", error: null });
+    } else {
+      setProc({ process: child, state: "error", error: "AgentChattr did not become ready within 30s" });
+    }
     return child;
   }
 
@@ -989,7 +997,7 @@ async function handleAgentChattr(req, res) {
       console.warn(`[agentchattr] ${projectId} port ${chattrPort} still occupied after 3s — spawning anyway`);
     }
     try {
-      const child = spawnChattr();
+      const child = await spawnChattr();
       if (!child) {
         const errProc = getProc();
         return res.status(500).json({ ok: false, state: "error", error: errProc.error || "Failed to start AgentChattr" });
@@ -1038,7 +1046,7 @@ async function handleAgentChattr(req, res) {
       console.warn(`[agentchattr] ${projectId} port ${chattrPort} still occupied after 3s — spawning anyway`);
     }
     try {
-      const child = spawnChattr();
+      const child = await spawnChattr();
       if (!child) {
         const errProc = getProc();
         return res.status(500).json({ ok: false, state: "error", error: errProc.error || "Failed to start AgentChattr" });
@@ -1137,7 +1145,7 @@ async function handleAgentChattr(req, res) {
       // Restart if it was running before the update
       let restarted = false;
       if (wasRunning) {
-        const child = spawnChattr();
+        const child = await spawnChattr();
         restarted = !!child;
         if (child) {
           setTimeout(() => syncChattrToken(projectId).catch(() => {}), 2000);
