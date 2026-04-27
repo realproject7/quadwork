@@ -1049,8 +1049,10 @@ async function handleAgentChattr(req, res) {
       killProcessOnPort(chattrPort, "SIGKILL");
       portFree = await waitForPortFree(chattrPort, 3000);
       if (!portFree) {
-        console.error(`[agentchattr] ${projectId} port ${chattrPort} still occupied after SIGKILL — cannot restart`);
-        return res.status(500).json({ ok: false, state: "error", error: `Port ${chattrPort} still occupied — cannot restart` });
+        const portErr = `Port ${chattrPort} still occupied — cannot restart`;
+        console.error(`[agentchattr] ${projectId} ${portErr}`);
+        setProc({ process: null, state: "error", error: portErr });
+        return res.status(500).json({ ok: false, state: "error", error: portErr });
       }
     }
     console.log(`[agentchattr] ${projectId} restart: port ${chattrPort} is free, spawning AC`);
