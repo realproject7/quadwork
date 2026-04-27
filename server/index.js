@@ -1080,10 +1080,9 @@ async function handleAgentChattr(req, res) {
       }
       res.json({ ok: true, state: "running", pid: child.pid });
       // #447: auto-reset all agents after AC restart so they get
-      // fresh MCP tokens. buildAgentArgs → waitForAgentChattrReady
-      // handles the AC-readiness wait internally; the 2s delay here
-      // just lets the AC process finish binding its port before we
-      // start polling.
+      // fresh MCP tokens. #581: set debounce timestamp so the health
+      // monitor doesn't double-fire when it detects recovery.
+      _acHealth.lastResetTimestamp.set(projectId, Date.now());
       setTimeout(async () => {
         try {
           const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(projectId)}/reset`, {
@@ -2135,6 +2134,8 @@ const _acHealth = {
   // Per-project: { lastRestart: timestamp, consecutiveFailures: number }
   state: new Map(),
   intervalHandle: null,
+  // #581: per-project debounce — auto-reset fires at most once per 60s
+  lastResetTimestamp: new Map(),
 };
 
 function isPortAlive(port) {
@@ -2171,9 +2172,14 @@ async function acHealthCheck() {
         // These are agents where the #565 deferred restart timed out, or
         // agents spawned while AC was down. MCP flags are set at process
         // launch, so a full stop+respawn is required.
-        restartUnregisteredAgents(project.id).catch((err) => {
-          console.error(`[health] Failed to restart unregistered agents for ${project.id}:`, err.message);
-        });
+        // #581: dedupe — skip if a reset already fired within 60s
+        const lastReset = _acHealth.lastResetTimestamp.get(project.id) || 0;
+        if (Date.now() - lastReset >= 60000) {
+          _acHealth.lastResetTimestamp.set(project.id, Date.now());
+          restartUnregisteredAgents(project.id).catch((err) => {
+            console.error(`[health] Failed to restart unregistered agents for ${project.id}:`, err.message);
+          });
+        }
       }
       health.consecutiveFailures = 0;
       _acHealth.state.set(project.id, health);
