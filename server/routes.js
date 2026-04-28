@@ -2172,10 +2172,21 @@ router.post("/api/setup", (req, res) => {
       content += `[server]\nport = ${chattrPort}\nhost = "127.0.0.1"\ndata_dir = "${dataDir}"\n`;
       if (sessionToken) content += `session_token = "${sessionToken}"\n`;
       content += `\n`;
+      // #588: write CLI-based agent sections (deduped by CLI name) so AC's
+      // registry accepts the base. Role names are passed as labels at
+      // registration time, not as config.toml section names.
+      const seenClis = new Map(); // cliName → { color, label, mcp_inject }
       agents.forEach((agent, i) => {
-        const wtDir = path.join(parentDir, `${dirName}-${agent}`);
-        content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${labels[i]}"\nmcp_inject = "flag"\n\n`;
+        const cmd = (backends && backends[agent]) || "claude";
+        const cli = cmd.split("/").pop().split(" ")[0];
+        if (!seenClis.has(cli)) {
+          const injectMode = cli === "codex" ? "proxy_flag" : cli === "gemini" ? "env" : "flag";
+          seenClis.set(cli, { command: cmd, color: colors[i], label: cli.charAt(0).toUpperCase() + cli.slice(1), mcp_inject: injectMode });
+        }
       });
+      for (const [cli, cfg] of seenClis) {
+        content += `[agents.${cli}]\ncommand = "${cfg.command}"\ncolor = "${cfg.color}"\nlabel = "${cfg.label}"\nmcp_inject = "${cfg.mcp_inject}"\n\n`;
+      }
       // #403 / quadwork#274: raise the loop guard from AC's default
       // of 4 to 30 so autonomous PR review cycles (head→dev→re1+re2→
       // dev→head, ~5 hops) don't fire mid-batch and force the
