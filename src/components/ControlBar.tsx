@@ -11,10 +11,110 @@ import {
   getNotificationBackgroundOnly,
   setNotificationBackgroundOnly,
 } from "../lib/notificationSound";
+import { useLocale } from "@/components/LocaleProvider";
+
+const COPY = {
+  en: {
+    server: {
+      title: "Server",
+      stop: "Stop",
+      confirmStop: "Confirm Stop?",
+      restart: "Restart",
+      resetAgents: "Reset Agents",
+      healthGaveUp: "AC auto-restart failed 3x — manual restart required",
+      healthRestarted: (time: string) => `AC auto-restarted at ${time}`,
+      stopped: "Stopped",
+      failed: "Failed",
+      error: "Error",
+      acRestarted: (pid: number) => `AC restarted (PID: ${pid}) — resetting agents...`,
+      acAndAgentsRestarted: (restarted: number) => `AC + ${restarted} agent${restarted !== 1 ? "s" : ""} restarted`,
+      agentResetFailed: "AC restarted — agent reset failed",
+      resetResult: (restarted: number, total: number) => `Reset — ${restarted} of ${total} agent${total !== 1 ? "s" : ""} restarted`,
+    },
+    system: {
+      keepAwake: "Keep Mac Awake",
+      keepAwakeAbout: "About Keep Mac Awake",
+      keepAwakeHelp: <><b>Keep Mac Awake</b> runs macOS <code>caffeinate</code> to stop the screen, disk, and system idle timers from sleeping your Mac during an overnight run. Make sure the laptop is plugged in — caffeinate blocks sleep but not battery drain.</>,
+      autoAwakeOn: "Auto-awake ON: caffeinate starts/stops with batch lifecycle",
+      autoAwakeOff: "Auto-awake OFF: manual Start/Stop only",
+      awakeFor: (time: string) => `Awake for ${time} more — keep Mac plugged in`,
+      awakeIndefinitely: "Awake indefinitely — keep Mac plugged in",
+      awakeDesc: "Prevents your Mac from sleeping during overnight runs.",
+      awake: "Awake",
+      start: "Start",
+      on: "on",
+      sound: "Notification Sound",
+      soundAbout: "About Notification Sound",
+      soundHelp: <><b>Notification Sound</b> plays a brief chime when an agent posts a new message (not your own sends, not system events). Sound choice picks one of the bundled chimes. Background-only mode suppresses the chime while the tab is focused — ding only when you&apos;re looking elsewhere. All prefs persist in localStorage.</>,
+      soundDesc: "Plays a chime when an agent posts a new message.",
+      soundLabel: "Sound",
+      soundBgOnly: "Only when tab is in background",
+      awakeStatusActive: "Batch active — auto-started caffeinate.",
+      awakeStatusComplete: "Batch complete — awake paused.",
+      awakeStatusNew: "New batch detected — auto-started caffeinate.",
+      keepAwakeModalTitle: "Keep Awake",
+      keepAwakeModalAbout: "About Keep Awake",
+      keepAwakeModalHelp: <><b>Keep Awake</b> prevents your Mac from sleeping for the duration you set. Use this when you want agents to keep working overnight.<br /><br />Under the hood, this runs macOS&apos;s <code>caffeinate</code> command. While it&apos;s active your screen, disk, and system idle timers are all paused — make sure your Mac is <b>plugged in</b> to avoid draining the battery.</>,
+      makeSurePluggedIn: "Make sure Mac is plugged in",
+      for: "for",
+      hours: "hours",
+      untilStopped: "Until stopped (no expiry)",
+    },
+  },
+  ko: {
+    server: {
+      title: "서버",
+      stop: "중지",
+      confirmStop: "정말 중지?",
+      restart: "재시작",
+      resetAgents: "에이전트 초기화",
+      healthGaveUp: "AC 자동 재시작 3회 실패 — 수동 재시작이 필요합니다",
+      healthRestarted: (time: string) => `AC가 ${time}에 자동 재시작되었습니다`,
+      stopped: "중지됨",
+      failed: "실패",
+      error: "오류",
+      acRestarted: (pid: number) => `AC 재시작됨 (PID: ${pid}) — 에이전트 초기화 중...`,
+      acAndAgentsRestarted: (restarted: number) => `AC 및 ${restarted}개 에이전트 재시작됨`,
+      agentResetFailed: "AC 재시작됨 — 에이전트 초기화 실패",
+      resetResult: (restarted: number, total: number) => `초기화 완료 — ${total}개 중 ${restarted}개 에이전트 재시작됨`,
+    },
+    system: {
+      keepAwake: "Mac 절전 방지",
+      keepAwakeAbout: "Mac 절전 방지 정보",
+      keepAwakeHelp: <><b>Mac 절전 방지</b>는 macOS의 <code>caffeinate</code>를 실행해 야간 작업 중 Mac이 절전 상태로 들어가는 것을 막습니다. 충전기를 연결해 두세요. caffeinate는 절전은 막지만 배터리 소모를 막아주지는 않습니다.</>,
+      autoAwakeOn: "자동 절전 방지 켬: 배치 상태에 따라 caffeinate 시작/종료",
+      autoAwakeOff: "자동 절전 방지 끔: 수동 시작/종료만 가능",
+      awakeFor: (time: string) => `앞으로 ${time} 동안 절전 방지 — 전원을 연결해 두세요`,
+      awakeIndefinitely: "무기한 절전 방지 중 — 전원을 연결해 두세요",
+      awakeDesc: "야간 작업 중 Mac이 잠들지 않도록 합니다.",
+      awake: "절전 방지 중",
+      start: "시작",
+      on: "켬",
+      sound: "알림음",
+      soundAbout: "알림음 정보",
+      soundHelp: <><b>알림음</b>은 에이전트가 새 메시지를 보낼 때 짧은 알림음을 재생합니다. 내 메시지나 시스템 이벤트에는 울리지 않습니다. 사운드 선택으로 내장 알림음 중 하나를 고를 수 있고, 백그라운드 전용 모드는 탭이 포커스된 동안에는 알림음을 막습니다. 모든 설정은 localStorage에 저장됩니다.</>,
+      soundDesc: "에이전트가 새 메시지를 보낼 때 알림음을 재생합니다.",
+      soundLabel: "알림음",
+      soundBgOnly: "탭이 백그라운드에 있을 때만",
+      awakeStatusActive: "배치 실행 중 — caffeinate를 자동으로 시작했습니다.",
+      awakeStatusComplete: "배치 완료 — 절전 방지를 일시 중단했습니다.",
+      awakeStatusNew: "새 배치 감지 — caffeinate를 자동으로 시작했습니다.",
+      keepAwakeModalTitle: "절전 방지",
+      keepAwakeModalAbout: "절전 방지 정보",
+      keepAwakeModalHelp: <><b>절전 방지</b>는 설정한 시간 동안 Mac이 절전 상태로 들어가는 것을 막습니다. 에이전트가 밤새 작업하게 하려면 이 기능을 사용하세요.<br /><br />내부적으로는 macOS의 <code>caffeinate</code> 명령을 실행합니다. 실행 중에는 화면, 디스크, 시스템 유휴 타이머가 모두 정지됩니다. 배터리 소모를 막으려면 Mac에 <b>전원을 연결</b>해 두세요.</>,
+      makeSurePluggedIn: "전원을 연결해 두세요",
+      for: "시간:",
+      hours: "시간",
+      untilStopped: "중지할 때까지 (만료 없음)",
+    },
+  },
+} as const;
 
 // ─── Server Controls ─────────────────────────────────────────────────────────
 
 function ServerSection({ projectId }: { projectId: string }) {
+  const { locale } = useLocale();
+  const t = COPY[locale].server;
   const [loading, setLoading] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
@@ -29,12 +129,12 @@ function ServerSection({ projectId }: { projectId: string }) {
         .then((d) => {
           if (!d) { setHealthNote(null); return; }
           if (d.autoRestart?.gaveUp) {
-            setHealthNote("AC auto-restart failed 3x — manual restart required");
+            setHealthNote(t.healthGaveUp);
           } else if (d.autoRestart?.lastRestart) {
             const ago = Math.round((Date.now() - d.autoRestart.lastRestart) / 1000);
             if (ago < 300) {
               const time = new Date(d.autoRestart.lastRestart).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-              setHealthNote(`AC auto-restarted at ${time}`);
+              setHealthNote(t.healthRestarted(time));
             } else {
               setHealthNote(null);
             }
@@ -47,7 +147,7 @@ function ServerSection({ projectId }: { projectId: string }) {
     pollHealth();
     const interval = setInterval(pollHealth, 30000);
     return () => clearInterval(interval);
-  }, [projectId]);
+  }, [projectId, t]);
 
   const clearFeedback = () => {
     setTimeout(() => setFeedback(null), 3000);
@@ -73,9 +173,9 @@ function ServerSection({ projectId }: { projectId: string }) {
         { method: "POST" }
       );
       const d = await r.json();
-      setFeedback(d.ok ? "Stopped" : "Failed");
+      setFeedback(d.ok ? t.stopped : t.failed);
     } catch {
-      setFeedback("Error");
+      setFeedback(t.error);
     }
     setLoading(null);
     clearFeedback();
@@ -90,7 +190,7 @@ function ServerSection({ projectId }: { projectId: string }) {
       );
       const d = await r.json();
       if (d.ok && d.pid) {
-        setFeedback(`AC restarted (PID: ${d.pid}) — resetting agents...`);
+        setFeedback(t.acRestarted(d.pid));
         // #417: After AC restart, also reset all agents so they get
         // fresh MCP tokens. Without this, agents stay stuck with stale
         // connections from the pre-restart session.
@@ -101,18 +201,18 @@ function ServerSection({ projectId }: { projectId: string }) {
           );
           const resetData = await resetRes.json();
           if (resetData.ok) {
-            setFeedback(`AC + ${resetData.restarted} agent${resetData.restarted !== 1 ? "s" : ""} restarted`);
+            setFeedback(t.acAndAgentsRestarted(resetData.restarted));
           } else {
-            setFeedback(`AC restarted — agent reset failed`);
+            setFeedback(t.agentResetFailed);
           }
         } catch {
-          setFeedback(`AC restarted — agent reset failed`);
+          setFeedback(t.agentResetFailed);
         }
       } else {
-        setFeedback(d.error || "Failed to restart");
+        setFeedback(d.error || t.failed);
       }
     } catch {
-      setFeedback("Error");
+      setFeedback(t.error);
     }
     setLoading(null);
     clearFeedback();
@@ -127,10 +227,10 @@ function ServerSection({ projectId }: { projectId: string }) {
       );
       const d = await r.json();
       setFeedback(
-        d.ok ? `Reset — ${d.restarted} of ${d.total} agent${d.total !== 1 ? "s" : ""} restarted` : (d.error || "Failed")
+        d.ok ? t.resetResult(d.restarted, d.total) : (d.error || t.failed)
       );
     } catch {
-      setFeedback("Error");
+      setFeedback(t.error);
     }
     setLoading(null);
     clearFeedback();
@@ -139,7 +239,7 @@ function ServerSection({ projectId }: { projectId: string }) {
   return (
     <div className="flex flex-col gap-1">
       <div className="text-[10px] text-text-muted uppercase tracking-wider font-semibold">
-        Server
+        {t.title}
       </div>
       <div className="flex items-center gap-1.5 flex-wrap">
         <button
@@ -151,28 +251,28 @@ function ServerSection({ projectId }: { projectId: string }) {
               : "text-text-muted border-border hover:text-error hover:border-error/40"
           }`}
         >
-          {loading === "stop" ? "..." : confirmStop ? "Confirm Stop?" : "Stop"}
+          {loading === "stop" ? "..." : confirmStop ? t.confirmStop : t.stop}
         </button>
         <button
           onClick={handleRestart}
           disabled={!!loading}
           className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
         >
-          {loading === "restart" ? "..." : "Restart"}
+          {loading === "restart" ? "..." : t.restart}
         </button>
         <button
           onClick={handleReset}
           disabled={!!loading}
           className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
         >
-          {loading === "reset" ? "..." : "Reset Agents"}
+          {loading === "reset" ? "..." : t.resetAgents}
         </button>
       </div>
       {feedback && (
         <div className="text-[10px] text-accent">{feedback}</div>
       )}
       {healthNote && !feedback && (
-        <div className={`text-[10px] ${healthNote.includes("failed") ? "text-error" : "text-[#ffcc00]"}`}>
+        <div className={`text-[10px] ${healthNote.includes("failed") || healthNote.includes("\uc2e4\ud328") ? "text-error" : "text-[#ffcc00]"}`}>
           {healthNote}
         </div>
       )}
@@ -205,6 +305,8 @@ const AWAKE_AUTO_POLL_MS = 30_000;
 const AWAKE_AUTO_DEFAULT_HOURS = 8;
 
 function SystemSection({ projectId }: { projectId: string }) {
+  const { locale } = useLocale();
+  const t = COPY[locale].system;
   const [active, setActive] = useState(false);
   const [remaining, setRemaining] = useState<number | null>(null);
   const [platform, setPlatform] = useState<string>("");
@@ -403,12 +505,12 @@ function SystemSection({ projectId }: { projectId: string }) {
         if (!prev) {
           if (hasItems && !data.complete && !activeRef.current) {
             autoStart();
-            setAwakeAutoStatus("Batch active — auto-started caffeinate.");
+            setAwakeAutoStatus(t.awakeStatusActive);
           }
           // #462: First poll — batch already complete but caffeinate still running → auto-stop
           if (hasItems && data.complete && activeRef.current) {
             autoStop();
-            setAwakeAutoStatus("Batch complete — awake paused.");
+            setAwakeAutoStatus(t.awakeStatusComplete);
           }
           return;
         }
@@ -416,21 +518,21 @@ function SystemSection({ projectId }: { projectId: string }) {
         // Batch just completed → auto-stop
         if (hasItems && data.complete && !prev.complete && activeRef.current) {
           autoStop();
-          setAwakeAutoStatus("Batch complete — awake paused.");
+          setAwakeAutoStatus(t.awakeStatusComplete);
           manualStopRef.current = false;
         }
 
         // New batch started (complete→active or empty→active) → auto-start
         if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !activeRef.current && !manualStopRef.current) {
           autoStart();
-          setAwakeAutoStatus("New batch detected — auto-started caffeinate.");
+          setAwakeAutoStatus(t.awakeStatusNew);
         }
       } catch { /* non-fatal */ }
     };
     check();
     const interval = setInterval(check, AWAKE_AUTO_POLL_MS);
     return () => clearInterval(interval);
-  }, [awakeAuto, projectId, autoStart, autoStop]);
+  }, [awakeAuto, projectId, autoStart, autoStop, t]);
 
   // #425 / quadwork#311: Keep Awake is now a standalone subsection
   // and renders even on non-darwin (the button just hides). The
@@ -452,10 +554,10 @@ function SystemSection({ projectId }: { projectId: string }) {
       {showKeepAwakeSubsection && (
         <div className="flex flex-col gap-0.5 relative">
           <div className="flex items-center gap-1 text-[10px] text-text-muted uppercase tracking-wider font-semibold">
-            <span>Keep Mac Awake</span>
+            <span>{t.keepAwake}</span>
             <button
               type="button"
-              aria-label="About Keep Mac Awake"
+              aria-label={t.keepAwakeAbout}
               onClick={() => setShowKeepAwakeHelp((s) => !s)}
               className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
             >?</button>
@@ -463,7 +565,7 @@ function SystemSection({ projectId }: { projectId: string }) {
             <button
               type="button"
               onClick={toggleAwakeAuto}
-              title={awakeAuto ? "Auto-awake ON: caffeinate starts/stops with batch lifecycle" : "Auto-awake OFF: manual Start/Stop only"}
+              title={awakeAuto ? t.autoAwakeOn : t.autoAwakeOff}
               className={`ml-1 px-1.5 py-0.5 text-[10px] border transition-colors ${
                 awakeAuto
                   ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
@@ -475,7 +577,7 @@ function SystemSection({ projectId }: { projectId: string }) {
           </div>
           {showKeepAwakeHelp && (
             <div className="absolute left-0 top-4 z-30 w-64 p-2 text-[10px] leading-snug text-text bg-bg-surface border border-border rounded shadow-lg">
-              <b>Keep Mac Awake</b> runs macOS <code>caffeinate</code> to stop the screen, disk, and system idle timers from sleeping your Mac during an overnight run. Make sure the laptop is plugged in — caffeinate blocks sleep but not battery drain.
+              {t.keepAwakeHelp}
             </div>
           )}
           {awakeAutoStatus && (
@@ -485,10 +587,10 @@ function SystemSection({ projectId }: { projectId: string }) {
           )}
           <div className="text-[10px] text-text-muted leading-tight">
             {active && remaining !== null && remaining > 0
-              ? `Awake for ${formatTime(remaining)} more — keep Mac plugged in`
+              ? t.awakeFor(formatTime(remaining))
               : active && remaining === null
-                ? "Awake indefinitely — keep Mac plugged in"
-                : "Prevents your Mac from sleeping during overnight runs."}
+                ? t.awakeIndefinitely
+                : t.awakeDesc}
           </div>
           <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
             <button
@@ -500,12 +602,12 @@ function SystemSection({ projectId }: { projectId: string }) {
                   : "border-border text-text-muted hover:text-text hover:border-accent"
               }`}
             >
-              {active ? "Awake" : "Start"}
+              {active ? t.awake : t.start}
               {active && remaining !== null && remaining > 0 && (
                 <span className="ml-1 text-accent/70">{formatTime(remaining)}</span>
               )}
               {active && remaining === null && (
-                <span className="ml-1 text-accent/70">on</span>
+                <span className="ml-1 text-accent/70">{t.on}</span>
               )}
             </button>
           </div>
@@ -523,21 +625,21 @@ function SystemSection({ projectId }: { projectId: string }) {
           is now its own subsection with an always-visible descriptor. */}
       <div className="flex flex-col gap-0.5 relative">
         <div className="flex items-center gap-1 text-[10px] text-text-muted uppercase tracking-wider font-semibold">
-          <span>Notification Sound</span>
+          <span>{t.sound}</span>
           <button
             type="button"
-            aria-label="About Notification Sound"
+            aria-label={t.soundAbout}
             onClick={() => setShowSoundHelp((s) => !s)}
             className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
           >?</button>
         </div>
         {showSoundHelp && (
           <div className="absolute left-0 top-4 z-30 w-64 p-2 text-[10px] leading-snug text-text bg-bg-surface border border-border rounded shadow-lg">
-            <b>Notification Sound</b> plays a brief chime when an agent posts a new message (not your own sends, not system events). Sound choice picks one of the bundled chimes. Background-only mode suppresses the chime while the tab is focused — ding only when you&apos;re looking elsewhere. All prefs persist in localStorage.
+            {t.soundHelp}
           </div>
         )}
         <div className="text-[10px] text-text-muted leading-tight">
-          Plays a chime when an agent posts a new message.
+          {t.soundDesc}
         </div>
         <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
           <button
@@ -550,7 +652,7 @@ function SystemSection({ projectId }: { projectId: string }) {
                 : "border-border text-text-muted hover:text-text hover:border-accent"
             }`}
           >
-            {soundEnabled ? "🔔" : "🔕"} Sound
+            {soundEnabled ? "🔔" : "🔕"} {t.soundLabel}
           </button>
           {soundEnabled && (
             <select
@@ -572,7 +674,7 @@ function SystemSection({ projectId }: { projectId: string }) {
               checked={soundBgOnly}
               onChange={(e) => toggleBgOnly(e.target.checked)}
             />
-            Only when tab is in background
+            {t.soundBgOnly}
           </label>
         )}
       </div>
@@ -580,26 +682,24 @@ function SystemSection({ projectId }: { projectId: string }) {
       {showPresets && !active && (
         <div className="absolute bottom-full left-0 mb-1 p-2 border border-border bg-bg-surface z-20 min-w-[220px] flex flex-col gap-1.5">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] text-text-muted uppercase tracking-wider">Keep Awake</span>
+            <span className="text-[10px] text-text-muted uppercase tracking-wider">{t.keepAwakeModalTitle}</span>
             <button
               type="button"
-              aria-label="About Keep Awake"
+              aria-label={t.keepAwakeModalAbout}
               onClick={() => setShowHelp((s) => !s)}
               className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
             >?</button>
           </div>
           {showHelp && (
             <div className="p-1.5 text-[10px] leading-snug text-text bg-bg border border-border/60 rounded">
-              <b>Keep Awake</b> prevents your Mac from sleeping for the duration you set. Use this when you want agents to keep working overnight.
-              <br /><br />
-              Under the hood, this runs macOS&apos;s <code>caffeinate</code> command. While it&apos;s active your screen, disk, and system idle timers are all paused — make sure your Mac is <b>plugged in</b> to avoid draining the battery.
+              {t.keepAwakeModalHelp}
             </div>
           )}
           <p className="text-[10px] text-[#ffcc00]">
-            Make sure Mac is plugged in
+            {t.makeSurePluggedIn}
           </p>
           <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-text-muted">for</span>
+            <span className="text-text-muted">{t.for}</span>
             <input
               type="number"
               value={hoursDraft}
@@ -615,7 +715,7 @@ function SystemSection({ projectId }: { projectId: string }) {
               step={0.1}
               className="w-14 bg-transparent border border-border px-1 py-0.5 text-text outline-none focus:border-accent text-center disabled:opacity-40"
             />
-            <span className="text-text-muted">hours</span>
+            <span className="text-text-muted">{t.hours}</span>
           </div>
           <label className="flex items-center gap-1.5 text-[10px] text-text-muted cursor-pointer select-none">
             <input
@@ -623,7 +723,7 @@ function SystemSection({ projectId }: { projectId: string }) {
               checked={untilStopped}
               onChange={(e) => setUntilStopped(e.target.checked)}
             />
-            Until stopped (no expiry)
+            {t.untilStopped}
           </label>
           <button
             type="button"
@@ -638,7 +738,7 @@ function SystemSection({ projectId }: { projectId: string }) {
             }}
             className="self-start px-2 py-0.5 text-[10px] text-accent border border-accent/40 rounded hover:bg-accent/10 transition-colors"
           >
-            Start
+            {t.start}
           </button>
         </div>
       )}

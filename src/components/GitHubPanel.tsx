@@ -4,6 +4,64 @@ import { useState, useEffect, useCallback } from "react";
 import InfoTooltip from "./InfoTooltip";
 import OvernightQueueModal from "./OvernightQueueModal";
 import BatchProgressPanel from "./BatchProgressPanel";
+import { useLocale } from "@/components/LocaleProvider";
+
+const COPY = {
+  en: {
+    rateLimitCritical: (reset: number) => `GitHub Rate Limit CRITICAL: 0 remaining. Resets in ${reset}m.`,
+    rateLimitLow: (rem: number, limit: number, reset: number) => `GitHub Rate Limit LOW: ${rem}/${limit} remaining. Resets in ${reset}m.`,
+    issues: (count: number) => `Issues (${count})`,
+    issuesHelp: (
+      <>
+        <b>Issues</b> — open issues in this repository. Agents will pick these up automatically if they are part of the overnight queue.
+      </>
+    ),
+    noIssues: "No open issues.",
+    recentlyClosed: "Recently closed",
+    noneYet: "None yet.",
+    prs: (count: number) => `Pull Requests (${count})`,
+    prsHelp: (
+      <>
+        <b>Pull Requests</b> — active PRs in this repository. Shows review status from RE1/RE2 and CI status.
+      </>
+    ),
+    noPrs: "No active PRs.",
+    recentlyMerged: "Recently merged / closed",
+    overnightQueueHelp: (
+      <>
+        <b>OVERNIGHT-QUEUE.md</b> — a list of issue numbers (one per line) for agents to process autonomously. Edit this file to add or remove tasks from the queue.
+      </>
+    ),
+    edit: "Edit",
+  },
+  ko: {
+    rateLimitCritical: (reset: number) => `GitHub API 제한 위험: 잔여 0개. ${reset}분 후 초기화됩니다.`,
+    rateLimitLow: (rem: number, limit: number, reset: number) => `GitHub API 제한 낮음: ${rem}/${limit} 남음. ${reset}분 후 초기화됩니다.`,
+    issues: (count: number) => `이슈 (${count})`,
+    issuesHelp: (
+      <>
+        <b>이슈</b> - 이 저장소의 열려 있는 이슈들입니다. 야간 큐에 포함되면 에이전트가 자동으로 작업을 시작합니다.
+      </>
+    ),
+    noIssues: "열린 이슈가 없습니다.",
+    recentlyClosed: "최근 닫힌 이슈",
+    noneYet: "아직 없습니다.",
+    prs: (count: number) => `풀 리퀘스트 (${count})`,
+    prsHelp: (
+      <>
+        <b>풀 리퀘스트</b> - 이 저장소의 활성화된 PR들입니다. RE1/RE2의 리뷰 상태와 CI 상태를 보여줍니다.
+      </>
+    ),
+    noPrs: "활성 PR이 없습니다.",
+    recentlyMerged: "최근 머지/닫힘",
+    overnightQueueHelp: (
+      <>
+        <b>OVERNIGHT-QUEUE.md</b> - 에이전트가 자율적으로 처리할 이슈 번호 목록(한 줄에 하나씩)입니다. 이 파일을 편집하여 큐에 작업을 추가하거나 제거할 수 있습니다.
+      </>
+    ),
+    edit: "편집",
+  },
+} as const;
 
 interface Issue {
   number: number;
@@ -96,6 +154,8 @@ interface RateLimitInfo {
 }
 
 export default function GitHubPanel({ projectId }: GitHubPanelProps) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prs, setPrs] = useState<PR[]>([]);
   // #411 / quadwork#281: recently closed issues + merged PRs.
@@ -181,8 +241,8 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             : "bg-[#ffcc00]/20 text-[#ffcc00]"
         }`}>
           {rateLimit.critical
-            ? `GitHub API rate limited — showing cached data. Resets in ${rateLimit.resetInMinutes}m`
-            : `GitHub API: ${rateLimit.remaining}/${rateLimit.limit} remaining. Resets in ${rateLimit.resetInMinutes}m`
+            ? t.rateLimitCritical(rateLimit.resetInMinutes)
+            : t.rateLimitLow(rateLimit.remaining, rateLimit.limit, rateLimit.resetInMinutes)
           }
         </div>
       )}
@@ -192,15 +252,15 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         <div className="flex-1 min-w-0 flex flex-col border-r border-border">
           <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
-              Issues ({issues.length})
+              {t.issues(issues.length)}
             </span>
             <InfoTooltip>
-              <b>Issues</b> — open issues on the project&apos;s GitHub repo. Click any item to open it on GitHub.
+              {t.issuesHelp}
             </InfoTooltip>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto">
             {issues.length === 0 && (
-              <div className="px-3 py-2 text-[11px] text-text-muted">No issues</div>
+              <div className="px-3 py-2 text-[11px] text-text-muted">{t.noIssues}</div>
             )}
             {issues.map((issue) => (
               <a
@@ -223,10 +283,10 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             {/* #411 / quadwork#281: Recently closed issues — last 5,
                 muted style with a ✓ to distinguish from open. */}
             <div className="px-3 pt-2 pb-1 text-[9px] text-text-muted uppercase tracking-wider">
-              Recently closed
+              {t.recentlyClosed}
             </div>
             {closedIssues.length === 0 && (
-              <div className="px-3 py-1 text-[11px] text-text-muted">None yet</div>
+              <div className="px-3 py-1 text-[11px] text-text-muted">{t.noneYet}</div>
             )}
             {closedIssues.map((issue) => (
               <a
@@ -248,15 +308,15 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         <div className="flex-1 min-w-0 flex flex-col">
           <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
-              Pull Requests ({prs.length})
+              {t.prs(prs.length)}
             </span>
             <InfoTooltip>
-              <b>Pull Requests</b> — open PRs awaiting review or merge. Click to open on GitHub.
+              {t.prsHelp}
             </InfoTooltip>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto">
             {prs.length === 0 && (
-              <div className="px-3 py-2 text-[11px] text-text-muted">No PRs</div>
+              <div className="px-3 py-2 text-[11px] text-text-muted">{t.noPrs}</div>
             )}
             {prs.map((pr) => {
               const reviews = pr.reviews || [];
@@ -313,10 +373,10 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
             {/* #411 / quadwork#281: Recently merged PRs — last 5,
                 muted style with a ✓ to distinguish from open. */}
             <div className="px-3 pt-2 pb-1 text-[9px] text-text-muted uppercase tracking-wider">
-              Recently merged
+              {t.recentlyMerged}
             </div>
             {mergedPrs.length === 0 && (
-              <div className="px-3 py-1 text-[11px] text-text-muted">None yet</div>
+              <div className="px-3 py-1 text-[11px] text-text-muted">{t.noneYet}</div>
             )}
             {mergedPrs.map((pr) => (
               <a
@@ -347,14 +407,14 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
         <div className="flex items-center gap-1.5">
           <span className="text-[11px] text-text-muted font-mono">OVERNIGHT-QUEUE.md</span>
           <InfoTooltip position="above">
-            <b>Overnight Queue</b> — the task queue file Head reads to pick the next ticket. Click Edit to modify batch contents and ordering.
+            {t.overnightQueueHelp}
           </InfoTooltip>
         </div>
         <button
           onClick={() => setQueueModalOpen(true)}
           className="px-2 py-0.5 text-[10px] text-text-muted hover:text-accent border border-border hover:border-accent transition-colors uppercase tracking-wider"
         >
-          Edit
+          {t.edit}
         </button>
       </div>
 

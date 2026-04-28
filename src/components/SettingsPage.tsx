@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface AgentConfig {
   display_name: string;
@@ -53,6 +54,155 @@ const BACKENDS: { value: string; label: string }[] = [
 ];
 const MODELS = ["opus", "sonnet", "haiku"];
 
+const COPY = {
+  en: {
+    loading: "Loading...",
+    title: "Settings",
+    save: "Save",
+    saving: "Saving...",
+    saved: "Saved",
+    operatorIdentity: "Operator Identity",
+    yourNameInChat: "Your name in chat",
+    language: "Language",
+    operatorHelp:
+      "Shows next to your messages in the AgentChattr chat panel. Defaults to user if blank. Allowed: 1-32 letters, digits, dash, underscore (matches AgentChattr name rules; other characters are stripped server-side). Reserved agent names like head, dev, re1, re2, and system are rejected and fall back to user.",
+    global: "Global",
+    dashboardPort: "QuadWork Dashboard Port",
+    agentChattrUrlGlobal: "AgentChattr URL (global override)",
+    globalHelp:
+      "The dashboard binds to the QuadWork port. The AgentChattr URL is the v1 fallback; new projects use a per-project AgentChattr clone and ignore this field.",
+    defaults: "Defaults",
+    defaultAgentCli: "Default agent CLI",
+    reviewerGithubUser: "Reviewer GitHub user",
+    reviewerGithubToken: "Reviewer GitHub token",
+    configured: "Configured",
+    notConfigured: "Not configured",
+    pasteNewToken: "Paste new token",
+    defaultsHelp:
+      "The default CLI seeds new project agents. The reviewer GitHub user/token are used by RE1/RE2 to post PR review comments without your personal token. The token is written to ~/.quadwork/reviewer-token (mode 0600) and is never returned by the API.",
+    system: "System",
+    keepAwake: "Keep Awake",
+    on: "on",
+    off: "off",
+    stop: "Stop",
+    start: "Start",
+    keepAwakeHelp:
+      "Prevents this machine from sleeping while agents are running. Machine-level (not per-project) - uses caffeinate on macOS.",
+    cleanup: "Cleanup",
+    cleanupIntro:
+      "Each project now has its own AgentChattr clone at ~/.quadwork/{id}/agentchattr (~77 MB). After all projects are migrated, the legacy global install can be removed:",
+    cleanupSingle: "To remove a single project's clone and config entry:",
+    cleanupHelp:
+      "Both commands prompt for confirmation. Worktrees and source repos are never touched. See npx quadwork --help or the README's Disk Usage section for details.",
+    activeProjects: "Active Projects",
+    projectName: "Project Name",
+    githubRepo: "GitHub Repo",
+    workingDirectory: "Working Directory",
+    agents: "Agents",
+    name: "Name",
+    command: "Command",
+    model: "Model",
+    cwd: "CWD",
+    agentsMd: "AGENTS.md",
+    owner: "Owner",
+    reviewer: "Reviewer",
+    builder: "Builder",
+    edit: "edit",
+    oneCliInstalled: "Only one CLI installed - install the other for more options",
+    agentsMdPlaceholder: "# AGENTS.md seed content for this agent...",
+    agentChattr: "AgentChattr",
+    agentChattrUrl: "AgentChattr URL",
+    sessionToken: "Session Token",
+    optional: "(optional)",
+    mcpHttpPort: "MCP HTTP Port",
+    mcpSsePort: "MCP SSE Port",
+    restoreProject: "Restore Project",
+    archive: "Archive",
+    remove: "Remove",
+    removeQuestion: "Remove?",
+    confirm: "Confirm",
+    cancel: "Cancel",
+    addProject: "+ Add Project",
+    archived: "Archived",
+    restore: "Restore",
+    confirmRemove: "Confirm Remove",
+    newProject: "New Project",
+  },
+  ko: {
+    loading: "로딩 중...",
+    title: "설정",
+    save: "저장",
+    saving: "저장 중...",
+    saved: "저장됨",
+    operatorIdentity: "운영자 정보",
+    yourNameInChat: "채팅에서의 이름",
+    language: "언어",
+    operatorHelp:
+      "AgentChattr 채팅 패널에서 내 메시지 옆에 표시됩니다. 비워두면 기본값은 user입니다. 허용: 1-32자의 영문, 숫자, 하이픈, 언더스코어(AgentChattr 이름 규칙과 동일). 다른 문자는 서버에서 제거됩니다. head, dev, re1, re2, system 같은 예약 이름은 거부되고 user로 대체됩니다.",
+    global: "전역",
+    dashboardPort: "QuadWork 대시보드 포트",
+    agentChattrUrlGlobal: "AgentChattr URL (전역 오버라이드)",
+    globalHelp:
+      "대시보드는 QuadWork 포트에 바인딩됩니다. AgentChattr URL은 v1 호환용 기본값이며, 새 프로젝트는 프로젝트별 AgentChattr 클론을 사용하므로 이 필드는 무시됩니다.",
+    defaults: "기본값",
+    defaultAgentCli: "기본 에이전트 CLI",
+    reviewerGithubUser: "리뷰어 GitHub 사용자",
+    reviewerGithubToken: "리뷰어 GitHub 토큰",
+    configured: "설정됨",
+    notConfigured: "미설정",
+    pasteNewToken: "새 토큰 붙여넣기",
+    defaultsHelp:
+      "기본 CLI는 새 프로젝트 에이전트의 초기값으로 사용됩니다. 리뷰어 GitHub 사용자/토큰은 개인 토큰 없이 RE1/RE2가 PR 리뷰 댓글을 남길 때 사용됩니다. 토큰은 ~/.quadwork/reviewer-token (권한 0600)에 저장되며 API로는 반환되지 않습니다.",
+    system: "시스템",
+    keepAwake: "절전 방지",
+    on: "켜짐",
+    off: "꺼짐",
+    stop: "중지",
+    start: "시작",
+    keepAwakeHelp:
+      "에이전트가 실행되는 동안 이 기기가 잠들지 않도록 합니다. 기기 전체 설정이며(프로젝트별 아님) macOS에서는 caffeinate를 사용합니다.",
+    cleanup: "정리",
+    cleanupIntro:
+      "각 프로젝트는 이제 ~/.quadwork/{id}/agentchattr (~77 MB)에 자체 AgentChattr 클론을 가집니다. 모든 프로젝트 마이그레이션이 끝나면 예전 전역 설치는 제거할 수 있습니다:",
+    cleanupSingle: "특정 프로젝트의 클론과 설정 항목만 제거하려면:",
+    cleanupHelp:
+      "두 명령 모두 확인 절차가 있습니다. 워크트리와 소스 저장소는 건드리지 않습니다. 자세한 내용은 npx quadwork --help 또는 README의 Disk Usage 섹션을 참고하세요.",
+    activeProjects: "활성 프로젝트",
+    projectName: "프로젝트 이름",
+    githubRepo: "GitHub 저장소",
+    workingDirectory: "작업 디렉터리",
+    agents: "에이전트",
+    name: "이름",
+    command: "명령어",
+    model: "모델",
+    cwd: "작업 디렉터리",
+    agentsMd: "AGENTS.md",
+    owner: "소유자",
+    reviewer: "검토자",
+    builder: "개발자",
+    edit: "편집",
+    oneCliInstalled: "CLI 하나만 설치됨 - 더 많은 옵션을 위해 다른 CLI를 설치하세요",
+    agentsMdPlaceholder: "# 이 에이전트의 AGENTS.md 초기 내용...",
+    agentChattr: "AgentChattr",
+    agentChattrUrl: "AgentChattr URL",
+    sessionToken: "세션 토큰",
+    optional: "(선택)",
+    mcpHttpPort: "MCP HTTP 포트",
+    mcpSsePort: "MCP SSE 포트",
+    restoreProject: "프로젝트 복원",
+    archive: "보관",
+    remove: "제거",
+    removeQuestion: "제거할까요?",
+    confirm: "확인",
+    cancel: "취소",
+    addProject: "+ 프로젝트 추가",
+    archived: "보관됨",
+    restore: "복원",
+    confirmRemove: "제거 확인",
+    newProject: "새 프로젝트",
+  },
+} as const;
+
 function Input({ label, value, onChange, onBlur, type = "text", placeholder }: {
   label: string;
   value: string;
@@ -99,6 +249,8 @@ function Select({ label, value, onChange, options }: {
 }
 
 export default function SettingsPage() {
+  const { locale, setLocale } = useLocale();
+  const t = COPY[locale];
   const searchParams = useSearchParams();
   const [config, setConfig] = useState<Config | null>(null);
   const [saving, setSaving] = useState(false);
@@ -299,7 +451,7 @@ export default function SettingsPage() {
     }
     const newProject: ProjectConfig = {
       id,
-      name: "New Project",
+      name: t.newProject,
       repo: "owner/repo",
       working_dir: "",
       agents,
@@ -389,18 +541,18 @@ export default function SettingsPage() {
     setConfirmDelete(null);
   };
 
-  if (!config) return <div className="p-6 text-text-muted text-xs">Loading...</div>;
+  if (!config) return <div className="p-6 text-text-muted text-xs">{t.loading}</div>;
 
   return (
     <div className="h-full w-full overflow-y-auto p-6">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-lg font-semibold text-text tracking-tight">Settings</h1>
+        <h1 className="text-lg font-semibold text-text tracking-tight">{t.title}</h1>
         <button
           onClick={save}
           disabled={saving}
           className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
         >
-          {saving ? "Saving..." : saved ? "Saved" : "Save"}
+          {saving ? t.saving : saved ? t.saved : t.save}
         </button>
       </div>
 
@@ -408,28 +560,48 @@ export default function SettingsPage() {
           dashboard chat messages. Server-side validated to AC's
           registry name rules (1–32 alnum + dash + underscore). */}
       <section className="mb-8">
-        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Operator Identity</h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.operatorIdentity}</h2>
+        <div className="grid grid-cols-1 md:grid-cols-[minmax(0,2fr)_minmax(220px,1fr)] gap-3 items-end">
           <Input
-            label="Your name in chat"
+            label={t.yourNameInChat}
             value={config.operator_name || "user"}
             onChange={(v) => updateGlobal("operator_name" as keyof Config, v)}
             placeholder="user"
           />
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px] text-text-muted uppercase tracking-wider">{t.language}</label>
+            <div className="flex items-center gap-2 h-[35px]">
+              {(["en", "ko"] as const).map((code) => {
+                const active = locale === code;
+                return (
+                  <button
+                    key={code}
+                    type="button"
+                    onClick={() => setLocale(code)}
+                    className={`px-3 py-1.5 text-[12px] border transition-colors ${
+                      active
+                        ? "border-accent bg-accent text-bg"
+                        : "border-border text-text-muted hover:text-text hover:border-accent"
+                    }`}
+                  >
+                    {code}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
-          Shows next to your messages in the AgentChattr chat panel. Defaults to <code>user</code> if blank.
-          Allowed: 1–32 letters, digits, dash, underscore (matches AgentChattr&apos;s name rules; other characters are stripped server-side).
-          Reserved agent names like <code>head</code>, <code>dev</code>, <code>re1</code>, <code>re2</code>, and <code>system</code> are rejected and fall back to <code>user</code>.
+          {t.operatorHelp}
         </p>
       </section>
 
       {/* Global Settings (#212: full-width grid, every section visible) */}
       <section className="mb-8">
-        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Global</h2>
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.global}</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <Input
-            label="QuadWork Dashboard Port"
+            label={t.dashboardPort}
             value={portDraft}
             onChange={(v) => setPortDraft(v)}
             onBlur={() => {
@@ -441,24 +613,23 @@ export default function SettingsPage() {
             type="number"
           />
           <Input
-            label="AgentChattr URL (global override)"
+            label={t.agentChattrUrlGlobal}
             value={config.agentchattr_url}
             onChange={(v) => updateGlobal("agentchattr_url", v)}
             placeholder="http://127.0.0.1:8300"
           />
         </div>
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
-          The dashboard binds to the QuadWork port. The AgentChattr URL is the v1 fallback;
-          new projects use a per-project AgentChattr clone (master #181) and ignore this field.
+          {t.globalHelp}
         </p>
       </section>
 
       {/* Defaults — default agent CLI + reviewer credentials (#212) */}
       <section className="mb-8">
-        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Defaults</h2>
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.defaults}</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
           <Select
-            label="Default agent CLI"
+            label={t.defaultAgentCli}
             value={config.default_backend || "claude"}
             onChange={(v) => updateGlobal("default_backend" as keyof Config, v)}
             options={BACKENDS.map((b) => ({
@@ -467,17 +638,17 @@ export default function SettingsPage() {
             }))}
           />
           <Input
-            label="Reviewer GitHub user"
+            label={t.reviewerGithubUser}
             value={config.reviewer_github_user || ""}
             onChange={(v) => updateGlobal("reviewer_github_user" as keyof Config, v)}
             placeholder="reviewer-bot"
           />
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-text-muted uppercase tracking-wider">Reviewer GitHub token</label>
+            <label className="text-[11px] text-text-muted uppercase tracking-wider">{t.reviewerGithubToken}</label>
             <div className="flex items-center gap-2">
               <span className={`w-1.5 h-1.5 rounded-full ${reviewerTokenExists ? "bg-accent" : "bg-text-muted"}`} />
               <span className="text-[11px] text-text-muted">
-                {reviewerTokenExists === null ? "…" : reviewerTokenExists ? "Configured" : "Not configured"}
+                {reviewerTokenExists === null ? "…" : reviewerTokenExists ? t.configured : t.notConfigured}
               </span>
             </div>
             <div className="flex items-center gap-1.5 mt-1">
@@ -485,7 +656,7 @@ export default function SettingsPage() {
                 type="password"
                 value={reviewerTokenInput}
                 onChange={(e) => setReviewerTokenInput(e.target.value)}
-                placeholder="Paste new token"
+                placeholder={t.pasteNewToken}
                 className="flex-1 bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent font-mono"
               />
               <button
@@ -493,56 +664,50 @@ export default function SettingsPage() {
                 disabled={reviewerTokenSaving || !reviewerTokenInput.trim()}
                 className="px-2 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 transition-colors"
               >
-                {reviewerTokenSaving ? "Saving…" : "Save"}
+                {reviewerTokenSaving ? t.saving : t.save}
               </button>
             </div>
           </div>
         </div>
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
-          The default CLI seeds new project agents. The reviewer GitHub user/token are
-          used by RE1/RE2 to post PR review comments without your personal
-          token. The token is written to{" "}
-          <code className="bg-bg-surface px-1 rounded">~/.quadwork/reviewer-token</code>{" "}
-          (mode 0600) and is never returned by the API.
+          {t.defaultsHelp}
         </p>
       </section>
 
       {/* System — Keep Awake (#212) */}
       <section className="mb-8">
-        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">System</h2>
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.system}</h2>
         <div className="border border-border p-3 flex items-center gap-3">
           <span className={`w-1.5 h-1.5 rounded-full ${keepAwakeActive ? "bg-accent" : "bg-text-muted"}`} />
-          <span className="text-[11px] text-text">Keep Awake — {keepAwakeActive ? "on" : "off"}</span>
+          <span className="text-[11px] text-text">{t.keepAwake} - {keepAwakeActive ? t.on : t.off}</span>
           <button
             onClick={toggleKeepAwake}
             disabled={keepAwakeBusy}
             className="px-2 py-1 text-[11px] border border-border text-text-muted hover:text-text hover:border-accent disabled:opacity-50 transition-colors"
           >
-            {keepAwakeBusy ? "…" : keepAwakeActive ? "Stop" : "Start"}
+            {keepAwakeBusy ? "…" : keepAwakeActive ? t.stop : t.start}
           </button>
           <span className="text-[10px] text-text-muted">
-            Prevents this machine from sleeping while agents are running. Machine-level
-            (not per-project) — uses <code>caffeinate</code> on macOS.
+            {t.keepAwakeHelp}
           </span>
         </div>
       </section>
 
       {/* Cleanup commands (#212 / #189) */}
       <section className="mb-8">
-        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Cleanup</h2>
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.cleanup}</h2>
         <div className="border border-border p-3 text-[11px] text-text-muted space-y-1">
           <p>
-            Each project now has its own AgentChattr clone at
+            {t.cleanupIntro.split("~/.quadwork/{id}/agentchattr")[0]}
             {" "}<code className="bg-bg-surface px-1 rounded">~/.quadwork/&#123;id&#125;/agentchattr</code>
-            {" "}(~77 MB). After all projects are migrated, the legacy global install can be removed:
+            {t.cleanupIntro.includes("~/.quadwork/{id}/agentchattr")
+              ? t.cleanupIntro.split("~/.quadwork/{id}/agentchattr")[1]
+              : ""}
           </p>
           <pre className="mt-1 p-2 bg-bg-surface text-text rounded font-mono text-[11px]">npx quadwork cleanup --legacy</pre>
-          <p className="mt-2">To remove a single project&apos;s clone and config entry:</p>
+          <p className="mt-2">{t.cleanupSingle}</p>
           <pre className="mt-1 p-2 bg-bg-surface text-text rounded font-mono text-[11px]">npx quadwork cleanup --project &lt;id&gt;</pre>
-          <p className="mt-2 text-text-muted/80">
-            Both commands prompt for confirmation. Worktrees and source repos are never touched.
-            See <code>npx quadwork --help</code> or the README&apos;s Disk Usage section for details.
-          </p>
+          <p className="mt-2 text-text-muted/80">{t.cleanupHelp}</p>
         </div>
       </section>
 
@@ -550,7 +715,7 @@ export default function SettingsPage() {
 
       {/* Per-project settings */}
       <section className="mb-6">
-        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Active Projects</h2>
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.activeProjects}</h2>
 
         {config.projects.filter((p) => !p.archived).map((project) => {
           const idx = config.projects.indexOf(project);
@@ -567,18 +732,18 @@ export default function SettingsPage() {
                   {/* Basic project info */}
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
                     <Input
-                      label="Project Name"
+                      label={t.projectName}
                       value={project.name}
                       onChange={(v) => renameProject(idx, v)}
                     />
                     <Input
-                      label="GitHub Repo"
+                      label={t.githubRepo}
                       value={project.repo}
                       onChange={(v) => updateProject(idx, { repo: v })}
                       placeholder="owner/repo"
                     />
                     <Input
-                      label="Working Directory"
+                      label={t.workingDirectory}
                       value={project.working_dir || ""}
                       onChange={(v) => updateProject(idx, { working_dir: v })}
                       placeholder="/path/to/project"
@@ -587,27 +752,24 @@ export default function SettingsPage() {
 
                   {/* Agents table */}
                   <div className="mt-4">
-                    <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Agents</h3>
+                    <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">{t.agents}</h3>
                     {cliStatus && (cliStatus.claude ? !cliStatus.codex : cliStatus.codex) && (
                       <div className="border border-accent/20 bg-accent/5 p-2 mb-2 text-[10px]">
                         <span className="text-text">
-                          {cliStatus.claude ? "Only Claude Code" : "Only Codex CLI"} is installed.
+                          {t.oneCliInstalled}
                         </span>
-                        <span className="text-text-muted ml-1">
-                          Install {cliStatus.claude ? "Codex" : "Claude Code"} for more backend options:
-                        </span>
-                        <code className="text-accent ml-1">
+                        <code className="text-accent ml-2">
                           {cliStatus.claude ? "npm install -g codex" : "npm install -g @anthropic-ai/claude-code"}
                         </code>
                       </div>
                     )}
                     <div className="border border-border">
                       <div className="grid grid-cols-5 gap-0 px-2 py-1 border-b border-border text-[10px] text-text-muted uppercase">
-                        <span>Name</span>
-                        <span>Command</span>
-                        <span>Model</span>
-                        <span>CWD</span>
-                        <span>AGENTS.md</span>
+                        <span>{t.name}</span>
+                        <span>{t.command}</span>
+                        <span>{t.model}</span>
+                        <span>{t.cwd}</span>
+                        <span>{t.agentsMd}</span>
                       </div>
                       {Object.entries(project.agents || {}).map(([agentId, agent]) => (
                         <div key={agentId} className="border-b border-border/50 last:border-b-0">
@@ -619,7 +781,7 @@ export default function SettingsPage() {
                                 className="bg-transparent text-[11px] text-text font-semibold outline-none border border-border px-1 py-0.5 focus:border-accent"
                               />
                               <span className="text-[9px] text-text-muted px-1">
-                                {agentId === "head" ? "Owner" : agentId.startsWith("reviewer") ? "Reviewer" : "Builder"}
+                                {agentId === "head" ? t.owner : agentId.startsWith("reviewer") ? t.reviewer : t.builder}
                               </span>
                             </div>
                             <select
@@ -627,7 +789,7 @@ export default function SettingsPage() {
                               onChange={(e) => updateAgent(idx, agentId, { command: e.target.value })}
                               className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
                               title={cliStatus && Object.values(cliStatus).filter(Boolean).length === 1
-                                ? `Only one CLI installed — install the other for more options`
+                                ? t.oneCliInstalled
                                 : undefined}
                             >
                               {BACKENDS.map((b) => (
@@ -660,7 +822,7 @@ export default function SettingsPage() {
                               onClick={() => setExpanded({ ...expanded, [`${project.id}-${agentId}-md`]: !expanded[`${project.id}-${agentId}-md`] })}
                               className="text-[10px] text-text-muted hover:text-accent transition-colors text-left px-1"
                             >
-                              {expanded[`${project.id}-${agentId}-md`] ? "▾ edit" : "▸ edit"}
+                              {expanded[`${project.id}-${agentId}-md`] ? `▾ ${t.edit}` : `▸ ${t.edit}`}
                             </button>
                           </div>
                           {expanded[`${project.id}-${agentId}-md`] && (
@@ -668,7 +830,7 @@ export default function SettingsPage() {
                               <textarea
                                 value={agent.agents_md || ""}
                                 onChange={(e) => updateAgent(idx, agentId, { agents_md: e.target.value })}
-                                placeholder="# AGENTS.md seed content for this agent..."
+                                placeholder={t.agentsMdPlaceholder}
                                 rows={8}
                                 className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent resize-y"
                               />
@@ -681,23 +843,23 @@ export default function SettingsPage() {
 
                   {/* AgentChattr (per-project) */}
                   <div className="mt-4">
-                    <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">AgentChattr</h3>
+                    <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">{t.agentChattr}</h3>
                     <div className="border border-border p-3">
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <Input
-                          label="AgentChattr URL"
+                          label={t.agentChattrUrl}
                           value={project.agentchattr_url || ""}
                           onChange={(v) => updateProject(idx, { agentchattr_url: v } as Partial<ProjectConfig>)}
                           placeholder="http://127.0.0.1:8300"
                         />
                         <Input
-                          label="Session Token"
+                          label={t.sessionToken}
                           value={project.agentchattr_token || ""}
                           onChange={(v) => updateProject(idx, { agentchattr_token: v } as Partial<ProjectConfig>)}
-                          placeholder="(optional)"
+                          placeholder={t.optional}
                         />
                         <Input
-                          label="MCP HTTP Port"
+                          label={t.mcpHttpPort}
                           value={getProjectPortDraft(project.id, "http", project.mcp_http_port)}
                           onChange={(v) => setProjectPortDraftValue(project.id, "http", v)}
                           onBlur={() => commitProjectPortDraft(idx, project.id, "http", "mcp_http_port")}
@@ -705,7 +867,7 @@ export default function SettingsPage() {
                           placeholder="8200"
                         />
                         <Input
-                          label="MCP SSE Port"
+                          label={t.mcpSsePort}
                           value={getProjectPortDraft(project.id, "sse", project.mcp_sse_port)}
                           onChange={(v) => setProjectPortDraftValue(project.id, "sse", v)}
                           onBlur={() => commitProjectPortDraft(idx, project.id, "sse", "mcp_sse_port")}
@@ -729,30 +891,30 @@ export default function SettingsPage() {
                         onClick={() => restoreProject(idx)}
                         className="text-[11px] text-accent hover:underline"
                       >
-                        Restore Project
+                        {t.restoreProject}
                       </button>
                     ) : (
                       <button
                         onClick={() => archiveProject(idx)}
                         className="text-[11px] text-text-muted hover:text-text transition-colors"
                       >
-                        Archive
+                        {t.archive}
                       </button>
                     )}
                     {confirmDelete === project.id ? (
                       <div className="flex items-center gap-2">
-                        <span className="text-[11px] text-error">Remove?</span>
+                        <span className="text-[11px] text-error">{t.removeQuestion}</span>
                         <button
                           onClick={() => removeProject(idx)}
                           className="px-2 py-1 text-[11px] bg-error text-bg font-semibold"
                         >
-                          Confirm
+                          {t.confirm}
                         </button>
                         <button
                           onClick={() => setConfirmDelete(null)}
                           className="px-2 py-1 text-[11px] text-text-muted border border-border"
                         >
-                          Cancel
+                          {t.cancel}
                         </button>
                       </div>
                     ) : (
@@ -760,7 +922,7 @@ export default function SettingsPage() {
                         onClick={() => setConfirmDelete(project.id)}
                         className="text-[11px] text-error hover:text-text transition-colors"
                       >
-                        Remove
+                        {t.remove}
                       </button>
                     )}
                   </div>
@@ -775,14 +937,14 @@ export default function SettingsPage() {
           onClick={addProject}
           className="w-full border border-dashed border-border py-2 text-[12px] text-text-muted hover:text-text hover:border-text-muted transition-colors"
         >
-          + Add Project
+          {t.addProject}
         </button>
 
         {/* Archived projects */}
         {config.projects.some((p) => p.archived) && (
           <>
             <hr className="border-border my-4" />
-            <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">Archived</h2>
+            <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.archived}</h2>
             {config.projects.filter((p) => p.archived).map((project) => {
               const idx = config.projects.indexOf(project);
               return (
@@ -794,7 +956,7 @@ export default function SettingsPage() {
                         onClick={() => restoreProject(idx)}
                         className="text-[11px] text-accent hover:underline"
                       >
-                        Restore
+                        {t.restore}
                       </button>
                       <button
                         onClick={() => {
@@ -806,7 +968,7 @@ export default function SettingsPage() {
                         }}
                         className="text-[11px] text-error hover:underline"
                       >
-                        {confirmDelete === project.id ? "Confirm Remove" : "Remove"}
+                        {confirmDelete === project.id ? t.confirmRemove : t.remove}
                       </button>
                     </div>
                   </div>
@@ -824,7 +986,7 @@ export default function SettingsPage() {
           disabled={saving}
           className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
         >
-          {saving ? "Saving..." : saved ? "Saved" : "Save"}
+          {saving ? t.saving : saved ? t.saved : t.save}
         </button>
       </div>
     </div>

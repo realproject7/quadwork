@@ -2,6 +2,28 @@
 
 import { useState } from "react";
 import TerminalGrid from "./TerminalGrid";
+import { useLocale } from "@/components/LocaleProvider";
+
+const COPY = {
+  en: {
+    title: "Agent Terminals",
+    aboutLabel: "About agent terminals",
+    tooltip: (
+      <>
+        These show what each agent is doing in their CLI session. <b>Do not type here directly</b> — use the AgentChattr chat above instead. Agents won&apos;t see messages typed in their terminals.
+      </>
+    ),
+  },
+  ko: {
+    title: "에이전트 터미널",
+    aboutLabel: "에이전트 터미널 설명",
+    tooltip: (
+      <>
+        각 에이전트가 CLI 세션에서 무엇을 하고 있는지 보여주는 읽기 전용 터미널입니다. <b>여기에 직접 입력하지 마세요.</b> 위의 AgentChattr 채팅을 사용해야 에이전트가 메시지를 볼 수 있습니다.
+      </>
+    ),
+  },
+} as const;
 
 // #208: the top-right quadrant must show all four agents
 // (Head, RE1, RE2, Dev) as a 2x2 grid. TerminalGrid's
@@ -41,13 +63,15 @@ interface AgentTerminalsGridProps {
  * the terminals and their messages are lost to the other agents.
  */
 export default function AgentTerminalsGrid({ projectId, agentStates, onStatusChange }: AgentTerminalsGridProps) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   const [tipOpen, setTipOpen] = useState(false);
 
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
         <div className="flex items-center gap-1.5">
-          <span className="text-[11px] text-text-muted uppercase tracking-wider">Agent Terminals</span>
+          <span className="text-[11px] text-text-muted uppercase tracking-wider">{t.title}</span>
           <div
             // #399 / quadwork#264: inline-flex+items-center so the
             // (?) button vertically centers with the title text. The
@@ -61,18 +85,15 @@ export default function AgentTerminalsGrid({ projectId, agentStates, onStatusCha
           >
             <button
               type="button"
-              aria-label="About agent terminals"
+              aria-label={t.aboutLabel}
               className="w-3.5 h-3.5 rounded-full border border-border text-[9px] leading-none text-text-muted hover:text-accent hover:border-accent inline-flex items-center justify-center"
             >?</button>
             {tipOpen && (
               <div
                 role="tooltip"
-                className="absolute top-5 left-0 z-20 w-72 p-2 text-[11px] leading-snug text-text bg-bg-surface border border-border shadow-lg"
+                className="ko-help absolute top-5 left-0 z-20 w-72 max-w-[min(18rem,calc(100vw-2rem))] p-2 text-[11px] leading-snug text-text bg-bg-surface border border-border shadow-lg"
               >
-                These show what each agent is doing in their CLI session.{" "}
-                <b>Do not type here directly</b> — use the AgentChattr chat
-                above instead. Agents won&apos;t see messages typed in their
-                terminals.
+                {t.tooltip}
               </div>
             )}
           </div>

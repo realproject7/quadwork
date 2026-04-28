@@ -3,6 +3,58 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import TelegramSetupModal from "./TelegramSetupModal";
+import { useLocale } from "@/components/LocaleProvider";
+
+const COPY = {
+  en: {
+    title: "Telegram Bridge",
+    tooltip: (
+      <>
+        <b>Telegram Bridge</b> forwards AgentChattr messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.
+      </>
+    ),
+    autoOn: "Auto ON — bridge follows batch lifecycle",
+    autoOff: "Auto OFF — manual start/stop only",
+    notConfigured: "Not configured",
+    setUp: "Set up Telegram Bridge",
+    running: "Running",
+    stopped: "Stopped",
+    stop: "Stop",
+    stopping: "Stopping…",
+    start: "Start",
+    starting: "Starting…",
+    howToSetUp: "How to set up",
+    editCredentials: "Edit credentials",
+    dismiss: "dismiss",
+    batchActive: "Batch active — auto-starting bridge.",
+    batchComplete: "Batch complete — bridge paused. Waiting for next batch.",
+    newBatch: "New batch detected — auto-starting bridge.",
+  },
+  ko: {
+    title: "텔레그램 브릿지",
+    tooltip: (
+      <>
+        <b>텔레그램 브릿지</b> - AgentChattr 메시지를 텔레그램 봇으로 전달해서 휴대폰에서 모니터링할 수 있게 합니다. 양방향이며 텔레그램에서 보낸 답장도 채팅에 나타납니다.
+      </>
+    ),
+    autoOn: "자동 모드 켬 — 브릿지가 배치 주기를 따릅니다",
+    autoOff: "자동 모드 끔 — 수동 시작/중지만 가능",
+    notConfigured: "설정되지 않음",
+    setUp: "텔레그램 브릿지 설정",
+    running: "실행 중",
+    stopped: "중지됨",
+    stop: "중지",
+    stopping: "중지 중…",
+    start: "시작",
+    starting: "시작 중…",
+    howToSetUp: "설정 방법",
+    editCredentials: "인증 정보 수정",
+    dismiss: "닫기",
+    batchActive: "배치 실행 중 — 브릿지를 자동 시작합니다.",
+    batchComplete: "배치 완료 — 브릿지를 일시 중단했습니다. 다음 배치를 기다리는 중.",
+    newBatch: "새 배치 감지 — 브릿지를 자동 시작합니다.",
+  },
+} as const;
 
 interface BatchState {
   complete: boolean;
@@ -46,6 +98,8 @@ async function callTelegram(action: string, body: Record<string, unknown>) {
  * scratch.
  */
 export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidgetProps) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   const [status, setStatus] = useState<TelegramStatus | null>(null);
   const [busy, setBusy] = useState(false);
   // #372: split error state — actionError is set by the operator's
@@ -69,7 +123,6 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   // #518: Auto toggle — start/stop bridge with batch lifecycle
   const [autoTelegram, setAutoTelegram] = useState(false);
   const [autoStatus, setAutoStatus] = useState<string | null>(null);
-  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
   const autoTelegramRef = useRef(autoTelegram);
   const runningRef = useRef(false);
   useEffect(() => { autoTelegramRef.current = autoTelegram; }, [autoTelegram]);
@@ -78,7 +131,6 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   const autoLoadedRef = useRef(false);
   useEffect(() => {
     autoLoadedRef.current = false;
-    prevBatchRef.current = null;
     setAutoTelegram(false);
     setAutoStatus(null);
   }, [projectId]);
@@ -196,6 +248,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
 
   // #518: batch lifecycle polling — auto-start/stop bridge with batch
   const AUTO_POLL_MS = 30_000;
+  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
 
   const checkBatchLifecycle = useCallback(async () => {
     if (!autoTelegramRef.current) return;
@@ -209,12 +262,12 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
 
       if (!prev) {
         if (hasItems && !data.complete && !runningRef.current) {
-          setAutoStatus("Batch active — auto-starting bridge.");
+          setAutoStatus(t.batchActive);
           await callTelegram("start", { project_id: projectId }).catch(() => {});
           await load();
         }
         if (hasItems && data.complete && runningRef.current) {
-          setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+          setAutoStatus(t.batchComplete);
           setActionError(null); // #522: clear stale action errors on auto-stop
           await callTelegram("stop", { project_id: projectId }).catch(() => {});
           await load();
@@ -224,7 +277,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
 
       // Batch just completed → auto-stop
       if (hasItems && data.complete && !prev.complete && runningRef.current) {
-        setAutoStatus("Batch complete — bridge paused. Waiting for next batch.");
+        setAutoStatus(t.batchComplete);
         setActionError(null); // #522: clear stale action errors on auto-stop
         await callTelegram("stop", { project_id: projectId }).catch(() => {});
         await load();
@@ -233,12 +286,12 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
 
       // New batch started → auto-start
       if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !runningRef.current) {
-        setAutoStatus("New batch detected — auto-starting bridge.");
+        setAutoStatus(t.newBatch);
         await callTelegram("start", { project_id: projectId }).catch(() => {});
         await load();
       }
     } catch { /* non-fatal */ }
-  }, [projectId, load]);
+  }, [projectId, load, t]);
 
   useEffect(() => {
     if (!autoTelegram) return;
@@ -267,9 +320,9 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
       <div className="flex flex-col border border-border">
         <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
           <div className="flex items-center gap-1.5">
-            <span className="text-[11px] text-text-muted uppercase tracking-wider">Telegram Bridge</span>
+            <span className="text-[11px] text-text-muted uppercase tracking-wider">{t.title}</span>
             <InfoTooltip>
-              <b>Telegram Bridge</b> forwards AgentChattr messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.
+              {t.tooltip}
             </InfoTooltip>
           </div>
           <div className="flex items-center gap-1.5">
@@ -277,7 +330,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
               <button
                 type="button"
                 onClick={toggleAutoTelegram}
-                title={autoTelegram ? "Auto ON — bridge follows batch lifecycle" : "Auto OFF — manual start/stop only"}
+                title={autoTelegram ? t.autoOn : t.autoOff}
                 className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
                   autoTelegram
                     ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
@@ -297,14 +350,14 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
             <>
               <div className="flex items-center gap-2 text-[11px] text-text-muted">
                 <span className="w-1.5 h-1.5 rounded-full bg-text-muted" />
-                <span>Not configured</span>
+                <span>{t.notConfigured}</span>
               </div>
               <button
                 onClick={() => setSetupOpen(true)}
                 disabled={busy}
                 className="self-start px-3 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 transition-colors"
               >
-                Set up Telegram Bridge
+                {t.setUp}
               </button>
             </>
           ) : (
@@ -316,12 +369,12 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                       <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-60 animate-ping" />
                       <span className="relative w-1.5 h-1.5 rounded-full bg-accent" />
                     </span>
-                    <span className="text-accent">Running</span>
+                    <span className="text-accent">{t.running}</span>
                   </>
                 ) : (
                   <>
                     <span className="w-1.5 h-1.5 rounded-full bg-text-muted" />
-                    <span className="text-text-muted">Stopped</span>
+                    <span className="text-text-muted">{t.stopped}</span>
                   </>
                 )}
                 {status?.bot_username && (
@@ -338,7 +391,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                     disabled={busy}
                     className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-error hover:border-error/40 disabled:opacity-50 transition-colors"
                   >
-                    {busy ? "Stopping…" : "Stop"}
+                    {busy ? t.stopping : t.stop}
                   </button>
                 ) : (
                   <button
@@ -346,7 +399,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                     disabled={busy}
                     className="px-3 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 transition-colors"
                   >
-                    {busy ? "Starting…" : "Start"}
+                    {busy ? t.starting : t.start}
                   </button>
                 )}
                 <button
@@ -354,14 +407,14 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                   disabled={busy}
                   className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text disabled:opacity-50 transition-colors"
                 >
-                  How to set up
+                  {t.howToSetUp}
                 </button>
                 <button
                   onClick={() => setSetupOpen(true)}
                   disabled={busy}
                   className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text disabled:opacity-50 transition-colors"
                 >
-                  Edit credentials
+                  {t.editCredentials}
                 </button>
               </div>
             </>
@@ -374,7 +427,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                 onClick={() => setRestartNotice(null)}
                 className="block mt-1 text-text-muted hover:text-text underline"
               >
-                dismiss
+                {t.dismiss}
               </button>
             </div>
           )}
@@ -392,7 +445,7 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
                   onClick={() => setActionError(null)}
                   className="block mt-1 text-text-muted hover:text-text underline"
                 >
-                  dismiss
+                  {t.dismiss}
                 </button>
               )}
             </div>

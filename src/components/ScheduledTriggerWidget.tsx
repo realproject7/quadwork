@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
+import { useLocale } from "@/components/LocaleProvider";
 
 interface ScheduledTriggerWidgetProps {
   projectId: string;
@@ -27,6 +28,59 @@ interface TriggerInfo {
   intervalMin: number | null; // last-used, persisted for idle reloads
   durationMin: number | null; // last-used, persisted for idle reloads
 }
+
+const COPY = {
+  en: {
+    label: (running: boolean, auto: boolean) => `Scheduled Trigger${running ? (auto ? " (auto)" : " (running)") : ""}`,
+    tooltip: (
+      <>
+        <b>Scheduled Trigger</b> sends a periodic message to all agents on a timer. Use this to keep the autonomous workflow running overnight. First message fires after the configured interval, not immediately.
+      </>
+    ),
+    autoTriggerOn: "Auto-trigger ON — trigger follows batch lifecycle",
+    autoTriggerOff: "Auto-trigger OFF — manual start/stop only",
+    auto: "Auto ",
+    message: "Message",
+    sendEvery: "Send every",
+    minFor: "min for",
+    hours: "hours",
+    starting: "Starting…",
+    startTrigger: "Start Trigger",
+    sending: "Sending:",
+    running: "Running",
+    next: "Next: ",
+    stopsIn: "Stops in: ",
+    untilStopped: "(until stopped)",
+    stopping: "Stopping…",
+    stopTrigger: "Stop Trigger",
+    autoStopStatus: "Batch complete — trigger paused. Waiting for next batch.",
+  },
+  ko: {
+    label: (running: boolean, auto: boolean) => `예약 트리거${running ? (auto ? " (자동)" : " (실행 중)") : ""}`,
+    tooltip: (
+      <>
+        <b>예약 트리거</b> - 타이머에 따라 모든 에이전트에게 주기적으로 메시지를 보냅니다. 야간 자율 워크플로우를 계속 돌릴 때 사용하세요. 첫 메시지는 즉시가 아니라 설정한 간격 후에 전송됩니다.
+      </>
+    ),
+    autoTriggerOn: "자동 트리거 ON - 배치 생명주기에 따라 트리거가 동작합니다",
+    autoTriggerOff: "자동 트리거 OFF - 수동 시작/중지만 가능합니다",
+    auto: "자동 ",
+    message: "메시지",
+    sendEvery: "전송 간격: ",
+    minFor: "분 마다, ",
+    hours: "시간 동안",
+    starting: "시작 중…",
+    startTrigger: "트리거 시작",
+    sending: "전송 중:",
+    running: "실행 중",
+    next: "다음 전송: ",
+    stopsIn: "종료까지: ",
+    untilStopped: "(중지할 때까지)",
+    stopping: "중지 중…",
+    stopTrigger: "트리거 중지",
+    autoStopStatus: "배치 완료 — 트리거 일시 중지. 다음 배치를 기다리는 중.",
+  },
+} as const;
 
 // #406 / quadwork#269: trigger duration is now a free-typed numeric
 // hours input. Defaults / bounds match the issue: default 3 hours,
@@ -86,6 +140,8 @@ function formatCountdown(ms: number): string {
  * project picks up the last-used message + running status.
  */
 export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWidgetProps) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   const [trigger, setTrigger] = useState<TriggerInfo | null>(null);
   const [message, setMessage] = useState<string>("");
   const [intervalMin, setIntervalMin] = useState<number>(15);
@@ -158,31 +214,31 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       const r = await fetch("/api/triggers");
       if (!r.ok) throw new Error(`${r.status}`);
       const data: Record<string, TriggerInfo> = await r.json();
-      const t = data[projectId] || null;
-      setTrigger(t);
-      if (t) {
+      const tr = data[projectId] || null;
+      setTrigger(tr);
+      if (tr) {
         // Read dirty flags + current message from refs, NOT from the
         // closure — `load` is memoized on `projectId` alone so the
         // polling effect can keep a stable 5s cadence. Without the
         // refs, a later poll would still see the initial empty
         // message / clean flags and overwrite mid-edit changes.
-        if (t.message && !messageRef.current) {
-          setMessage(t.message);
-          messageRef.current = t.message;
+        if (tr.message && !messageRef.current) {
+          setMessage(tr.message);
+          messageRef.current = tr.message;
         }
         if (!intervalDirtyRef.current) {
-          if (t.enabled && t.interval) {
-            const mins = Math.max(1, Math.round(t.interval / 60000));
+          if (tr.enabled && tr.interval) {
+            const mins = Math.max(1, Math.round(tr.interval / 60000));
             setIntervalMin(mins);
             setIntervalDraft(String(mins));
-          } else if (typeof t.intervalMin === "number" && t.intervalMin > 0) {
-            setIntervalMin(t.intervalMin);
-            setIntervalDraft(String(t.intervalMin));
+          } else if (typeof tr.intervalMin === "number" && tr.intervalMin > 0) {
+            setIntervalMin(tr.intervalMin);
+            setIntervalDraft(String(tr.intervalMin));
           }
         }
-        if (!durationDirtyRef.current && typeof t.durationMin === "number" && t.durationMin >= 0) {
-          setDurationMin(t.durationMin);
-          setDurationHoursDraft(minutesToHoursStr(t.durationMin));
+        if (!durationDirtyRef.current && typeof tr.durationMin === "number" && tr.durationMin >= 0) {
+          setDurationMin(tr.durationMin);
+          setDurationHoursDraft(minutesToHoursStr(tr.durationMin));
         }
       }
       setError(null);
@@ -350,7 +406,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
         if (hasItems && data.complete && triggerRef.current?.enabled) {
           await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
           setAutoTriggered(false);
-          setAutoStatus("Batch complete — trigger paused. Waiting for next batch.");
+          setAutoStatus(t.autoStopStatus);
           await load();
         }
         return;
@@ -360,7 +416,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       if (hasItems && data.complete && !prev.complete && triggerRef.current?.enabled) {
         await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
         setAutoTriggered(false);
-        setAutoStatus("Batch complete — trigger paused. Waiting for next batch.");
+        setAutoStatus(t.autoStopStatus);
         await load();
         return;
       }
@@ -382,7 +438,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
         await load();
       }
     } catch { /* non-fatal */ }
-  }, [projectId, durationHoursDraft, intervalDraft, initialMessage, load]);
+  }, [projectId, durationHoursDraft, intervalDraft, initialMessage, load, t.autoStopStatus]);
 
   useEffect(() => {
     if (!autoTrigger) return;
@@ -398,10 +454,10 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
       <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
         <div className="flex items-center gap-1.5">
           <span className="text-[11px] text-text-muted uppercase tracking-wider">
-            Scheduled Trigger{running ? (autoTriggered ? " (auto)" : " (running)") : ""}
+            {t.label(running, autoTriggered)}
           </span>
           <InfoTooltip>
-            <b>Scheduled Trigger</b> sends a periodic message to all agents on a timer. Use this to keep the autonomous workflow running overnight. First message fires after the configured interval, not immediately.
+            {t.tooltip}
           </InfoTooltip>
         </div>
         <div className="flex items-center gap-2">
@@ -410,14 +466,14 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
           <button
             type="button"
             onClick={toggleAutoTrigger}
-            title={autoTrigger ? "Auto-trigger ON — trigger follows batch lifecycle" : "Auto-trigger OFF — manual start/stop only"}
+            title={autoTrigger ? t.autoTriggerOn : t.autoTriggerOff}
             className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
               autoTrigger
                 ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
                 : "border-border text-text-muted hover:text-text hover:border-accent"
             }`}
           >
-            Auto {autoTrigger ? "●" : "○"}
+            {t.auto}{autoTrigger ? "●" : "○"}
           </button>
         </div>
       </div>
@@ -430,7 +486,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
 
       {!running ? (
         <div className="p-3 flex flex-col gap-2">
-          <label className="text-[10px] text-text-muted uppercase tracking-wider">Message</label>
+          <label className="text-[10px] text-text-muted uppercase tracking-wider">{t.message}</label>
           <textarea
             value={message}
             onChange={(e) => setMessage(e.target.value)}
@@ -439,7 +495,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
             className="w-full bg-bg text-text text-[11px] font-mono p-2 border border-border outline-none focus:border-accent resize-y"
           />
           <div className="flex items-center gap-2 flex-wrap text-[11px]">
-            <span className="text-text-muted">Send every</span>
+            <span className="text-text-muted">{t.sendEvery}</span>
             <input
               type="number"
               value={intervalDraft}
@@ -454,7 +510,7 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
               max={1440}
               className="w-12 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
             />
-            <span className="text-text-muted">min for</span>
+            <span className="text-text-muted">{t.minFor}</span>
             {/* #406 / quadwork#269: free-typed hours input. The
                 draft string is committed to durationMin on blur so
                 intermediate states like "6." or "0" remain typeable
@@ -479,19 +535,19 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
               step={0.1}
               className="w-14 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
             />
-            <span className="text-text-muted">hours</span>
+            <span className="text-text-muted">{t.hours}</span>
           </div>
           <button
             onClick={start}
             disabled={busy || !message.trim()}
             className="self-start px-3 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
-            {busy ? "Starting…" : "Start Trigger"}
+            {busy ? t.starting : t.startTrigger}
           </button>
         </div>
       ) : (
         <div className="p-3 flex flex-col gap-2">
-          <div className="text-[11px] text-text-muted">Sending:</div>
+          <div className="text-[11px] text-text-muted">{t.sending}</div>
           <pre className="text-[11px] font-mono whitespace-pre-wrap text-text bg-bg-surface border border-border p-2 max-h-28 overflow-auto">{(trigger?.message || message).slice(0, 400)}</pre>
           <div className="flex items-center gap-3 flex-wrap text-[11px]">
             <span className="flex items-center gap-1">
@@ -499,18 +555,18 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
                 <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-60 animate-ping" />
                 <span className="relative w-1.5 h-1.5 rounded-full bg-accent" />
               </span>
-              <span className="text-accent">Running</span>
+              <span className="text-accent">{t.running}</span>
             </span>
-            <span className="tabular-nums text-text">Next: {countdown}</span>
-            {expiresCountdown && <span className="tabular-nums text-text-muted">Stops in: {expiresCountdown}</span>}
-            {!trigger?.expiresAt && <span className="text-text-muted">(until stopped)</span>}
+            <span className="tabular-nums text-text">{t.next}{countdown}</span>
+            {expiresCountdown && <span className="tabular-nums text-text-muted">{t.stopsIn}{expiresCountdown}</span>}
+            {!trigger?.expiresAt && <span className="text-text-muted">{t.untilStopped}</span>}
           </div>
           <button
             onClick={stop}
             disabled={busy}
             className="self-start px-3 py-1 text-[11px] text-text-muted border border-border hover:text-error hover:border-error/40 disabled:opacity-50 transition-colors"
           >
-            {busy ? "Stopping…" : "Stop Trigger"}
+            {busy ? t.stopping : t.stopTrigger}
           </button>
         </div>
       )}

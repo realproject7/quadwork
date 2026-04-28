@@ -8,6 +8,7 @@ import GitHubPanel from "./GitHubPanel";
 import ControlBar from "./ControlBar";
 import AgentTerminalsGrid from "./AgentTerminalsGrid";
 import OperatorFeaturesPanel from "./OperatorFeaturesPanel";
+import { useLocale } from "@/components/LocaleProvider";
 
 const MIN_SIZE = 150; // px
 const DIVIDER = 4; // px
@@ -18,7 +19,48 @@ interface ProjectDashboardProps {
   projectId: string;
 }
 
+const COPY = {
+  en: {
+    filterAgentsTitle: "Showing agent messages only — click to show all",
+    filterAllTitle: "Showing all messages — click to hide system/status noise",
+    filterOn: "Filter system log: on",
+    filterOff: "Filter system log: off",
+    chatLabel: "AgentChattr — primary chat",
+    chatTooltip: (
+      <>
+        <b>Primary Chat</b> — live chat between you and the 4 AI agents. Messages you type here trigger agent actions. Use @mentions to address specific agents.
+      </>
+    ),
+    githubLabel: "GitHub",
+    githubTooltip: (
+      <>
+        <b>GitHub</b> — open issues and pull requests on this project&apos;s repo. Click any item to open it on GitHub. The batch progress panel tracks the active batch&apos;s lifecycle from queued to merged.
+      </>
+    ),
+  },
+  ko: {
+    filterAgentsTitle: "에이전트 메시지만 표시 중 - 클릭하면 전체를 표시합니다",
+    filterAllTitle: "전체 메시지 표시 중 - 클릭하면 시스템/상태 로그를 숨깁니다",
+    filterOn: "시스템 로그 필터: 켜짐",
+    filterOff: "시스템 로그 필터: 꺼짐",
+    chatLabel: "AgentChattr — 메인 채팅",
+    chatTooltip: (
+      <>
+        <b>메인 채팅</b> - 당신과 4개의 AI 에이전트가 실시간으로 대화하는 공간입니다. 여기 입력한 메시지가 에이전트 동작을 시작시킵니다. 특정 에이전트를 부를 때는 @멘션을 사용하세요.
+      </>
+    ),
+    githubLabel: "GitHub",
+    githubTooltip: (
+      <>
+        <b>GitHub</b> - 이 프로젝트 저장소의 열린 이슈와 PR을 보여줍니다. 항목을 클릭하면 GitHub에서 바로 열립니다. 아래 배치 진행 패널은 현재 배치가 대기에서 병합까지 어떻게 진행되는지 추적합니다.
+      </>
+    ),
+  },
+} as const;
+
 export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   const containerRef = useRef<HTMLDivElement>(null);
   const [colRatio, setColRatio] = useState(0.5);
   const [rowRatio, setRowRatio] = useState(0.5);
@@ -71,16 +113,16 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     <button
       type="button"
       onClick={toggleFilter}
-      title={filterSystem ? "Showing agent messages only — click to show all" : "Showing all messages — click to hide system/status noise"}
+      title={filterSystem ? t.filterAgentsTitle : t.filterAllTitle}
       className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
         filterSystem
           ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
           : "border-border text-text-muted hover:text-text hover:border-accent"
       }`}
     >
-      {filterSystem ? "Filter system log: on" : "Filter system log: off"}
+      {filterSystem ? t.filterOn : t.filterOff}
     </button>
-  ), [filterSystem, toggleFilter]);
+  ), [filterSystem, t, toggleFilter]);
 
   // Poll agent states
   useEffect(() => {
@@ -170,9 +212,9 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           the primary interface (#208). 2px accent border + explicit
           "primary chat" label in the panel header. */}
       <div className="flex flex-col overflow-hidden border-2 border-accent">
-        <PanelHeader label="AgentChattr — primary chat" tooltip={
+        <PanelHeader label={t.chatLabel} tooltip={
           <InfoTooltip>
-            <b>Primary Chat</b> — live chat between you and the 4 AI agents. Messages you type here trigger agent actions. Use @mentions to address specific agents.
+            {t.chatTooltip}
           </InfoTooltip>
         }>
           {filterToggle}
@@ -219,9 +261,9 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
 
       {/* Quadrant 3 (bottom-left): GitHub (#208). */}
       <div className="flex flex-col overflow-hidden">
-        <PanelHeader label="GitHub" tooltip={
+        <PanelHeader label={t.githubLabel} tooltip={
           <InfoTooltip>
-            <b>GitHub</b> — open issues and pull requests on this project&apos;s repo. Click any item to open it on GitHub. The batch progress panel tracks the active batch&apos;s lifecycle from queued to merged.
+            {t.githubTooltip}
           </InfoTooltip>
         } />
         <div className="flex-1 min-h-0">

@@ -8,6 +8,26 @@ import DiscordBridgeWidget from "./DiscordBridgeWidget";
 import LoopGuardWidget from "./LoopGuardWidget";
 import ProjectHistoryWidget from "./ProjectHistoryWidget";
 import AgentModelsWidget from "./AgentModelsWidget";
+import { useLocale } from "@/components/LocaleProvider";
+
+const COPY = {
+  en: {
+    label: "Operator Features",
+    tooltip: (
+      <>
+        <b>Operator Features</b> — tools for running autonomous overnight batches. Includes the Scheduled Trigger, Telegram Bridge, Discord Bridge, Loop Guard, Project History, and Agent Models.
+      </>
+    ),
+  },
+  ko: {
+    label: "운영자 기능",
+    tooltip: (
+      <>
+        <b>운영자 기능</b> - 야간 자율 배치를 운영할 때 쓰는 도구 모음입니다. Scheduled Trigger, Telegram Bridge, Discord Bridge, Loop Guard, Project History, Agent Models가 포함됩니다.
+      </>
+    ),
+  },
+} as const;
 
 /**
  * Bottom-right quadrant of the project dashboard (#208).
@@ -30,11 +50,13 @@ import AgentModelsWidget from "./AgentModelsWidget";
  * clips in cramped split-view / mobile.
  */
 export default function OperatorFeaturesPanel({ projectId }: { projectId: string }) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   return (
     <div className="flex flex-col h-full min-h-0">
-      <PanelHeader label="Operator Features" tooltip={
+      <PanelHeader label={t.label} tooltip={
         <InfoTooltip>
-          <b>Operator Features</b> — tools for running autonomous overnight batches. Includes the Scheduled Trigger, Telegram Bridge, Loop Guard, Project History, and Agent Models.
+          {t.tooltip}
         </InfoTooltip>
       } />
       <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-2 p-2 overflow-auto lg:overflow-hidden">

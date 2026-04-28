@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import { useLocale } from "@/components/LocaleProvider";
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -23,14 +24,170 @@ interface Repo {
 
 /* ── Constants ─────────────────────────────────────────────────────────── */
 
-const INITIAL_STEPS: Step[] = [
-  { id: "name", label: "Project Name", subtitle: "Name your project", status: "active" },
-  { id: "repo", label: "GitHub Repo", subtitle: "Connect a repository", status: "pending" },
-  { id: "models", label: "Agent Models", subtitle: "Configure CLI backends", status: "pending" },
-  { id: "workdir", label: "Working Directory", subtitle: "Set the local path", status: "pending" },
-  { id: "workspaces", label: "Create Workspaces", subtitle: "Worktrees + seed files", status: "pending" },
-  { id: "launch", label: "Ready to Launch", subtitle: "Review & start", status: "pending" },
-];
+const COPY = {
+  en: {
+    title: "Set Up Your AI Dev Team",
+    subtitle: "Configure agents, connect your repo, and launch a multi-agent development workflow in minutes.",
+    steps: {
+      name: { label: "Project Name", subtitle: "Name your project" },
+      repo: { label: "GitHub Repo", subtitle: "Connect a repository" },
+      models: { label: "Agent Models", subtitle: "Configure CLI backends" },
+      workdir: { label: "Working Directory", subtitle: "Set the local path" },
+      workspaces: { label: "Create Workspaces", subtitle: "Worktrees + seed files" },
+      launch: { label: "Ready to Launch", subtitle: "Review & start" },
+    },
+    workdir: {
+      title: "Where is your project?",
+      desc: "Your project's git repository on your local machine. QuadWork will create 4 agent workspaces next to this directory.",
+      scanning: "Scanning for existing clone...",
+      found: "Found existing clone",
+      useThis: "Use this",
+      chooseDifferent: "Choose different path",
+      noClone: (repo: string) => <>No local clone found for <span className="text-accent">{repo}</span></>,
+      setupWillClone: "Setup will clone it to:",
+      cloneHere: "Clone here & continue",
+      next: "Next",
+      layout: "Workspace layout",
+    },
+    nameStep: {
+      title: "Name your project",
+      desc: "This name identifies your project in the dashboard and agent configs.",
+      placeholder: "e.g. My DeFi App",
+      next: "Next",
+    },
+    repoStep: {
+      title: "Connect a GitHub repository",
+      desc: "Select an existing repo or enter one manually. Agents will work within this repo.",
+      showingRepos: (owner: string) => <>Showing repos for <span className="text-accent">{owner}</span></>,
+      searchPlaceholder: "Search repos...",
+      loading: "Loading...",
+      noRepos: "No repos found.",
+      enterManually: "Enter manually instead",
+      backToList: "Back to repo list",
+      private: "private",
+      enableProtection: (repo: string) => <>Enable branch protection on <code className="text-accent">main</code></>,
+      protectionDesc: "Run this after setup, or configure in GitHub UI:",
+      copy: "copy",
+      verifying: "Verifying...",
+      verify: "Verify & Continue",
+    },
+    modelsStep: {
+      title: "Configure agent CLI backends",
+      desc: "Each agent runs its own CLI instance. Pick the backend for each role.",
+      next: "Next",
+    },
+    workspacesStep: {
+      title: "Create workspaces",
+      desc: "This creates git worktrees for each agent and writes seed configuration files (AGENTS.md, CLAUDE.md) into each workspace.",
+      creating: "Creating...",
+      create: "Create Worktrees & Seed Files",
+    },
+    launchStep: {
+      title: "Ready to launch",
+      desc: "Everything is configured. Review the summary and launch your AI dev team.",
+      teamRoster: "Team Roster",
+      customPorts: "Custom ports",
+      autoDetected: (port: number) => `auto-detected: ${port}`,
+      redirecting: "Project saved. Redirecting to dashboard...",
+      launching: "Launching...",
+      launched: "Launched!",
+      launch: "Launch Project",
+    },
+    preview: {
+      title: "Configuration Preview",
+      project: "Project",
+      repo: "Repository",
+      branchProtection: "+ branch protection",
+      backends: "Backends",
+      reviewer: "Reviewer",
+      directory: "Directory",
+      status: "Status",
+    },
+    setupComplete: "Setup complete!",
+    redirectingToDashboard: "Redirecting to project dashboard...",
+  },
+  ko: {
+    title: "AI 개발 팀 설정하기",
+    subtitle: "에이전트를 설정하고, 저장소를 연결하고, 몇 분 안에 멀티 에이전트 개발 워크플로우를 시작하세요.",
+    steps: {
+      name: { label: "프로젝트 이름", subtitle: "프로젝트 이름 정하기" },
+      repo: { label: "GitHub 저장소", subtitle: "저장소 연결하기" },
+      models: { label: "에이전트 모델", subtitle: "CLI 백엔드 구성" },
+      workdir: { label: "작업 디렉터리", subtitle: "로컬 경로 지정" },
+      workspaces: { label: "워크스페이스 생성", subtitle: "워크트리 + 초기 파일" },
+      launch: { label: "실행 준비", subtitle: "검토 후 시작" },
+    },
+    workdir: {
+      title: "프로젝트 위치는 어디인가요?",
+      desc: "로컬 머신에 있는 프로젝트의 Git 저장소 경로입니다. QuadWork는 이 디렉터리 옆에 4개의 에이전트 워크스페이스를 생성합니다.",
+      scanning: "기존 클론을 찾는 중...",
+      found: "기존 클론을 찾았습니다",
+      useThis: "이 경로 사용",
+      chooseDifferent: "다른 경로 선택",
+      noClone: (repo: string) => <><span className="text-accent">{repo}</span> 의 로컬 클론을 찾지 못했습니다</>,
+      setupWillClone: "설치 시 다음 경로로 클론합니다:",
+      cloneHere: "여기에 클론하고 계속",
+      next: "다음",
+      layout: "워크스페이스 구조",
+    },
+    nameStep: {
+      title: "프로젝트 이름 정하기",
+      desc: "이 이름은 대시보드와 에이전트 설정에서 프로젝트를 식별하는 데 사용됩니다.",
+      placeholder: "예: 내 DeFi 앱",
+      next: "다음",
+    },
+    repoStep: {
+      title: "GitHub 저장소 연결",
+      desc: "기존 저장소를 선택하거나 직접 입력하세요. 에이전트는 이 저장소 안에서 작업합니다.",
+      showingRepos: (owner: string) => <><span className="text-accent">{owner}</span> 의 저장소를 표시하는 중</>,
+      searchPlaceholder: "저장소 검색...",
+      loading: "로딩 중...",
+      noRepos: "저장소를 찾지 못했습니다.",
+      enterManually: "직접 입력하기",
+      backToList: "저장소 목록으로 돌아가기",
+      private: "비공개",
+      enableProtection: (repo: string) => <> <code className="text-accent">main</code> 브랜치 보호 사용</>,
+      protectionDesc: "설치 후 이 명령을 실행하거나 GitHub UI에서 직접 설정하세요:",
+      copy: "복사",
+      verifying: "확인 중...",
+      verify: "확인 후 계속",
+    },
+    modelsStep: {
+      title: "에이전트 CLI 백엔드 구성",
+      desc: "각 에이전트는 자체 CLI 인스턴스를 사용합니다. 역할별로 백엔드를 선택하세요.",
+      next: "다음",
+    },
+    workspacesStep: {
+      title: "워크스페이스 생성",
+      desc: "각 에이전트용 Git 워크트리를 만들고 각 워크스페이스에 초기 설정 파일(AGENTS.md, CLAUDE.md)을 작성합니다.",
+      creating: "생성 중...",
+      create: "워크트리 및 초기 파일 생성",
+    },
+    launchStep: {
+      title: "실행 준비 완료",
+      desc: "모든 설정이 끝났습니다. 요약을 확인하고 AI 개발 팀을 시작하세요.",
+      teamRoster: "팀 구성",
+      customPorts: "사용자 지정 포트",
+      autoDetected: (port: number) => `자동 감지: ${port}`,
+      redirecting: "프로젝트를 저장했습니다. 대시보드로 이동 중...",
+      launching: "실행 중...",
+      launched: "실행됨!",
+      launch: "프로젝트 실행",
+    },
+    preview: {
+      title: "설정 미리보기",
+      project: "프로젝트",
+      repo: "저장소",
+      branchProtection: "+ 브랜치 보호",
+      backends: "백엔드",
+      reviewer: "리뷰어",
+      directory: "디렉터리",
+      status: "상태",
+    },
+    setupComplete: "설정 완료!",
+    redirectingToDashboard: "프로젝트 대시보드로 이동 중...",
+  },
+} as const;
 
 const BACKENDS: { value: string; label: string }[] = [
   { value: "claude", label: "Claude Code" },
@@ -49,6 +206,8 @@ const AGENTS = [
 function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
   repo: string; workingDir: string; setWorkingDir: (v: string) => void; error?: string; onNext: () => void;
 }) {
+  const { locale } = useLocale();
+  const t = COPY[locale].workdir;
   const [detecting, setDetecting] = useState(true);
   const [detected, setDetected] = useState<{ found: boolean; path: string | null; suggested: string } | null>(null);
   const [showManual, setShowManual] = useState(false);
@@ -69,23 +228,23 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
 
   return (
     <div>
-      <h2 className="text-sm font-semibold text-text mb-1">Where is your project?</h2>
+      <h2 className="text-sm font-semibold text-text mb-1">{t.title}</h2>
       <p className="text-[11px] text-text-muted mb-3">
-        Your project&apos;s git repository on your local machine. QuadWork will create 4 agent workspaces next to this directory.
+        {t.desc}
       </p>
 
-      {detecting && <p className="text-[11px] text-text-muted mb-3">Scanning for existing clone...</p>}
+      {detecting && <p className="text-[11px] text-text-muted mb-3">{t.scanning}</p>}
 
       {!detecting && detected?.found && (
         <div className="border border-accent/30 bg-accent/5 p-3 mb-4 text-[11px]">
-          <p className="text-accent font-semibold mb-1">Found existing clone</p>
+          <p className="text-accent font-semibold mb-1">{t.found}</p>
           <p className="text-text font-mono">{detected.path}</p>
           <div className="flex gap-2 mt-2">
             <button onClick={onNext} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors">
-              Use this
+              {t.useThis}
             </button>
             <button onClick={() => { setShowManual(true); setWorkingDir(""); }} className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text transition-colors">
-              Choose different path
+              {t.chooseDifferent}
             </button>
           </div>
         </div>
@@ -93,15 +252,15 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
 
       {!detecting && !detected?.found && !showManual && (
         <div className="border border-border bg-bg-surface p-3 mb-4 text-[11px]">
-          <p className="text-text-muted mb-1">No local clone found for <span className="text-accent">{repo}</span></p>
-          <p className="text-text-muted mb-2">Setup will clone it to:</p>
+          <p className="text-text-muted mb-1">{t.noClone(repo)}</p>
+          <p className="text-text-muted mb-2">{t.setupWillClone}</p>
           <p className="text-text font-mono mb-2">{detected?.suggested || `~/Projects/${slug}`}</p>
           <div className="flex gap-2">
             <button onClick={onNext} disabled={!workingDir.trim()} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
-              Clone here & continue
+              {t.cloneHere}
             </button>
             <button onClick={() => setShowManual(true)} className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text transition-colors">
-              Choose different path
+              {t.chooseDifferent}
             </button>
           </div>
         </div>
@@ -116,7 +275,7 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
             className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-2"
           />
           <button onClick={onNext} disabled={!workingDir.trim()} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
-            Next
+            {t.next}
           </button>
         </>
       )}
@@ -124,7 +283,7 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
       {error && <p className="text-[11px] text-error mt-2">{error}</p>}
 
       <div className="border border-border bg-bg-surface p-3 mt-4 text-[11px] text-text-muted font-mono space-y-0.5">
-        <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1 font-sans">Workspace layout</p>
+        <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1 font-sans">{t.layout}</p>
         <p className="text-accent">{slug}/              &larr; your repo</p>
         <p>{slug}-head/         &larr; Head agent</p>
         <p>{slug}-dev/          &larr; Dev agent</p>
@@ -137,7 +296,16 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
 
 export default function SetupWizard() {
   const router = useRouter();
-  const [steps, setSteps] = useState<Step[]>(INITIAL_STEPS);
+  const { locale, hydrated } = useLocale();
+  const t = COPY[locale];
+  const [steps, setSteps] = useState<Step[]>(() => [
+    { id: "name", label: t.steps.name.label, subtitle: t.steps.name.subtitle, status: "active" },
+    { id: "repo", label: t.steps.repo.label, subtitle: t.steps.repo.subtitle, status: "pending" },
+    { id: "models", label: t.steps.models.label, subtitle: t.steps.models.subtitle, status: "pending" },
+    { id: "workdir", label: t.steps.workdir.label, subtitle: t.steps.workdir.subtitle, status: "pending" },
+    { id: "workspaces", label: t.steps.workspaces.label, subtitle: t.steps.workspaces.subtitle, status: "pending" },
+    { id: "launch", label: t.steps.launch.label, subtitle: t.steps.launch.subtitle, status: "pending" },
+  ]);
   const [currentStep, setCurrentStep] = useState(0);
 
   // Form state
@@ -181,6 +349,17 @@ export default function SetupWizard() {
   };
   const [autoDetectedPorts, setAutoDetectedPorts] = useState({ chattr: 0, mcpHttp: 0, mcpSse: 0 });
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean } | null>(null);
+
+  useEffect(() => {
+    setSteps((prev) => [
+      { id: "name", label: t.steps.name.label, subtitle: t.steps.name.subtitle, status: prev[0].status, error: prev[0].error },
+      { id: "repo", label: t.steps.repo.label, subtitle: t.steps.repo.subtitle, status: prev[1].status, error: prev[1].error },
+      { id: "models", label: t.steps.models.label, subtitle: t.steps.models.subtitle, status: prev[2].status, error: prev[2].error },
+      { id: "workdir", label: t.steps.workdir.label, subtitle: t.steps.workdir.subtitle, status: prev[3].status, error: prev[3].error },
+      { id: "workspaces", label: t.steps.workspaces.label, subtitle: t.steps.workspaces.subtitle, status: prev[4].status, error: prev[4].error },
+      { id: "launch", label: t.steps.launch.label, subtitle: t.steps.launch.subtitle, status: prev[5].status, error: prev[5].error },
+    ]);
+  }, [t]);
 
   // Fetch CLI status on mount
   useEffect(() => {
@@ -493,6 +672,10 @@ export default function SetupWizard() {
 
   const step = steps[currentStep];
 
+  if (!hydrated) {
+    return <div className="h-full overflow-y-auto" />;
+  }
+
   /* ── Render ────────────────────────────────────────────────────────────── */
 
   return (
@@ -500,10 +683,10 @@ export default function SetupWizard() {
       {/* Header */}
       <div className="px-6 pt-6 pb-4 border-b border-border">
         <h1 className="text-lg font-semibold text-text tracking-tight">
-          Set Up Your AI Dev Team
+          {t.title}
         </h1>
         <p className="text-[11px] text-text-muted mt-1">
-          Configure agents, connect your repo, and launch a multi-agent development workflow in minutes.
+          {t.subtitle}
         </p>
       </div>
 
@@ -552,14 +735,14 @@ export default function SetupWizard() {
             {/* Step 1: Project Name */}
             {step?.id === "name" && (
               <div>
-                <h2 className="text-sm font-semibold text-text mb-1">Name your project</h2>
+                <h2 className="text-sm font-semibold text-text mb-1">{t.nameStep.title}</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  This name identifies your project in the dashboard and agent configs.
+                  {t.nameStep.desc}
                 </p>
                 <input
                   value={projectName}
                   onChange={(e) => setProjectName(e.target.value)}
-                  placeholder="e.g. My DeFi App"
+                  placeholder={t.nameStep.placeholder}
                   className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-4"
                   autoFocus
                 />
@@ -568,7 +751,7 @@ export default function SetupWizard() {
                   disabled={!projectName.trim()}
                   className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
                 >
-                  Next
+                  {t.nameStep.next || "Next"}
                 </button>
               </div>
             )}
@@ -576,9 +759,9 @@ export default function SetupWizard() {
             {/* Step 2: GitHub Repo */}
             {step?.id === "repo" && (
               <div>
-                <h2 className="text-sm font-semibold text-text mb-1">Connect a GitHub repository</h2>
+                <h2 className="text-sm font-semibold text-text mb-1">{t.repoStep.title}</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  Select an existing repo or enter one manually. Agents will work within this repo.
+                  {t.repoStep.desc}
                 </p>
 
                 {!repoManual && (
@@ -623,16 +806,16 @@ export default function SetupWizard() {
                     )}
                     {activeOwner && (
                       <p className="text-[11px] text-text-muted mb-2">
-                        Showing repos for <span className="text-accent">{activeOwner}</span>
+                        {t.repoStep.showingRepos(activeOwner)}
                       </p>
                     )}
                     <input
                       value={repoSearch}
                       onChange={(e) => setRepoSearch(e.target.value)}
-                      placeholder="Search repos..."
+                      placeholder={t.repoStep.searchPlaceholder}
                       className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-2"
                     />
-                    {reposLoading && <p className="text-[11px] text-text-muted mb-2">Loading...</p>}
+                    {reposLoading && <p className="text-[11px] text-text-muted mb-2">{t.repoStep.loading}</p>}
                     <div className="max-h-40 overflow-y-auto border border-border mb-3">
                       {filteredRepos.map((r) => (
                         <button
@@ -643,19 +826,19 @@ export default function SetupWizard() {
                           }`}
                         >
                           <span className="font-semibold">{r.name}</span>
-                          {r.isPrivate && <span className="text-[10px] text-text-muted ml-2">private</span>}
+                          {r.isPrivate && <span className="text-[10px] text-text-muted ml-2">{t.repoStep.private}</span>}
                           {r.description && <span className="text-[10px] text-text-muted ml-2">{r.description}</span>}
                         </button>
                       ))}
                       {!reposLoading && filteredRepos.length === 0 && (
-                        <p className="px-3 py-2 text-[11px] text-text-muted">No repos found.</p>
+                        <p className="px-3 py-2 text-[11px] text-text-muted">{t.repoStep.noRepos}</p>
                       )}
                     </div>
                     <button
                       onClick={() => setRepoManual(true)}
                       className="text-[11px] text-text-muted hover:text-accent transition-colors mb-3 block"
                     >
-                      Enter manually instead
+                      {t.repoStep.enterManually}
                     </button>
                   </>
                 )}
@@ -672,7 +855,7 @@ export default function SetupWizard() {
                       onClick={() => setRepoManual(false)}
                       className="text-[11px] text-text-muted hover:text-accent transition-colors mb-3 block"
                     >
-                      Back to repo list
+                      {t.repoStep.backToList}
                     </button>
                   </>
                 )}
@@ -686,13 +869,13 @@ export default function SetupWizard() {
                     className="accent-accent"
                   />
                   <span className="text-[11px] text-text-muted">
-                    Enable branch protection on <code className="text-accent">main</code>
+                    {t.repoStep.enableProtection(repo || "owner/repo")}
                   </span>
                 </label>
 
                 {enableProtection && (
                   <div className="border border-border bg-bg-surface p-3 mb-4 text-[11px] space-y-2">
-                    <p className="text-text-muted">Run this after setup, or configure in GitHub UI:</p>
+                    <p className="text-text-muted">{t.repoStep.protectionDesc}</p>
                     <div className="flex items-center gap-2">
                       <code className="text-accent flex-1 select-all text-[10px] break-all">
                         {`gh api repos/${repo || "owner/repo"}/branches/main/protection -X PUT -f "required_pull_request_reviews[required_approving_review_count]=1" -f "enforce_admins=false" -f "required_status_checks=null" -f "restrictions=null"`}
@@ -701,7 +884,7 @@ export default function SetupWizard() {
                         onClick={() => navigator.clipboard.writeText(`gh api repos/${repo}/branches/main/protection -X PUT -f "required_pull_request_reviews[required_approving_review_count]=1" -f "enforce_admins=false" -f "required_status_checks=null" -f "restrictions=null"`)}
                         className="text-[10px] text-text-muted hover:text-accent shrink-0"
                       >
-                        copy
+                        {t.repoStep.copy}
                       </button>
                     </div>
                   </div>
@@ -713,7 +896,7 @@ export default function SetupWizard() {
                   disabled={!repo || loading}
                   className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
                 >
-                  {loading ? "Verifying..." : "Verify & Continue"}
+                  {loading ? t.repoStep.verifying : t.repoStep.verify}
                 </button>
               </div>
             )}
@@ -721,9 +904,11 @@ export default function SetupWizard() {
             {/* Step 3: Agent Models */}
             {step?.id === "models" && (
               <div>
-                <h2 className="text-sm font-semibold text-text mb-1">Configure agent CLI backends</h2>
+                <h2 className="text-sm font-semibold text-text mb-1">
+                  {t.modelsStep.title}
+                </h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  Each agent runs its own CLI instance. Pick the backend for each role.
+                  {t.modelsStep.desc}
                 </p>
 
                 {/* Single-CLI friendly message */}
@@ -894,7 +1079,7 @@ export default function SetupWizard() {
                   onClick={goNext}
                   className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors"
                 >
-                  Next
+                  {t.modelsStep.next}
                 </button>
               </div>
             )}
@@ -913,9 +1098,9 @@ export default function SetupWizard() {
             {/* Step 5: Create Workspaces */}
             {step?.id === "workspaces" && (
               <div>
-                <h2 className="text-sm font-semibold text-text mb-1">Create workspaces</h2>
+                <h2 className="text-sm font-semibold text-text mb-1">{t.workspacesStep.title}</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  This creates git worktrees for each agent and writes seed configuration files (AGENTS.md, CLAUDE.md) into each workspace.
+                  {t.workspacesStep.desc}
                 </p>
                 {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
                 {workspaceLog.length > 0 && (
@@ -930,7 +1115,7 @@ export default function SetupWizard() {
                   disabled={loading}
                   className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
                 >
-                  {loading ? "Creating..." : "Create Worktrees & Seed Files"}
+                  {loading ? t.workspacesStep.creating : t.workspacesStep.create}
                 </button>
               </div>
             )}
@@ -938,15 +1123,15 @@ export default function SetupWizard() {
             {/* Step 6: Ready to Launch */}
             {step?.id === "launch" && (
               <div>
-                <h2 className="text-sm font-semibold text-text mb-1">Ready to launch</h2>
+                <h2 className="text-sm font-semibold text-text mb-1">{t.launchStep.title}</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  Everything is configured. Review the summary and launch your AI dev team.
+                  {t.launchStep.desc}
                 </p>
 
                 {/* Team roster */}
                 <div className="border border-border mb-4">
                   <div className="px-3 py-1.5 border-b border-border bg-bg-surface">
-                    <span className="text-[11px] text-text font-semibold">Team Roster</span>
+                    <span className="text-[11px] text-text font-semibold">{t.launchStep.teamRoster}</span>
                   </div>
                   {AGENTS.map((agent) => (
                     <div key={agent.key} className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 last:border-b-0">
@@ -966,7 +1151,7 @@ export default function SetupWizard() {
                       onChange={(e) => setShowAdvanced(e.target.checked)}
                       className="accent-accent"
                     />
-                    <span className="text-[11px] text-text-muted">Custom ports</span>
+                    <span className="text-[11px] text-text-muted">{t.launchStep.customPorts}</span>
                   </label>
                   {showAdvanced && (
                     <div className="border border-border p-3 space-y-2">
@@ -982,7 +1167,7 @@ export default function SetupWizard() {
                             className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
                           />
                           {autoDetectedPorts.chattr > 0 && (
-                            <span className="text-[10px] text-text-muted">auto-detected: {autoDetectedPorts.chattr}</span>
+                            <span className="text-[10px] text-text-muted">{t.launchStep.autoDetected(autoDetectedPorts.chattr)}</span>
                           )}
                         </div>
                         <div className="flex flex-col gap-1">
@@ -996,7 +1181,7 @@ export default function SetupWizard() {
                             className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
                           />
                           {autoDetectedPorts.mcpHttp > 0 && (
-                            <span className="text-[10px] text-text-muted">auto-detected: {autoDetectedPorts.mcpHttp}</span>
+                            <span className="text-[10px] text-text-muted">{t.launchStep.autoDetected(autoDetectedPorts.mcpHttp)}</span>
                           )}
                         </div>
                         <div className="flex flex-col gap-1">
@@ -1010,7 +1195,7 @@ export default function SetupWizard() {
                             className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
                           />
                           {autoDetectedPorts.mcpSse > 0 && (
-                            <span className="text-[10px] text-text-muted">auto-detected: {autoDetectedPorts.mcpSse}</span>
+                            <span className="text-[10px] text-text-muted">{t.launchStep.autoDetected(autoDetectedPorts.mcpSse)}</span>
                           )}
                         </div>
                       </div>
@@ -1020,22 +1205,26 @@ export default function SetupWizard() {
 
                 {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
                 {launchStatus === "done" && (
-                  <p className="text-[11px] text-accent mb-2">Project saved. Redirecting to dashboard...</p>
+                  <p className="text-[11px] text-accent mb-2">{t.launchStep.redirecting}</p>
                 )}
                 <button
                   onClick={launchProject}
                   disabled={launchStatus === "running" || launchStatus === "done"}
                   className="px-5 py-2 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
                 >
-                  {launchStatus === "running" ? "Launching..." : launchStatus === "done" ? "Launched!" : "Launch Project"}
+                  {launchStatus === "running"
+                    ? t.launchStep.launching
+                    : launchStatus === "done"
+                      ? t.launchStep.launched
+                      : t.launchStep.launch}
                 </button>
               </div>
             )}
 
             {currentStep >= steps.length && (
               <div className="text-center py-8">
-                <p className="text-accent text-sm font-semibold">Setup complete!</p>
-                <p className="text-[11px] text-text-muted mt-2">Redirecting to project dashboard...</p>
+                <p className="text-accent text-sm font-semibold">{t.setupComplete}</p>
+                <p className="text-[11px] text-text-muted mt-2">{t.redirectingToDashboard}</p>
               </div>
             )}
           </div>
@@ -1044,20 +1233,20 @@ export default function SetupWizard() {
         {/* Right: Live Preview Panel */}
         <div className="w-64 shrink-0 border-l border-border p-4 overflow-y-auto bg-bg-surface/50">
           <h3 className="text-[11px] font-semibold text-text-muted uppercase tracking-wider mb-3">
-            Configuration Preview
+            {t.preview.title}
           </h3>
           <div className="space-y-3 text-[11px]">
             <div>
-              <span className="text-text-muted block mb-0.5">Project</span>
+              <span className="text-text-muted block mb-0.5">{t.preview.project}</span>
               <span className="text-text">{projectName || "\u2014"}</span>
             </div>
             <div>
-              <span className="text-text-muted block mb-0.5">Repository</span>
+              <span className="text-text-muted block mb-0.5">{t.preview.repo}</span>
               <span className="text-text">{repo || "\u2014"}</span>
-              {enableProtection && <span className="text-[10px] text-accent block">+ branch protection</span>}
+              {enableProtection && <span className="text-[10px] text-accent block">{t.preview.branchProtection}</span>}
             </div>
             <div>
-              <span className="text-text-muted block mb-0.5">Backends</span>
+              <span className="text-text-muted block mb-0.5">{t.preview.backends}</span>
               {Object.entries(backends).map(([agent, backend]) => (
                 <div key={agent} className="flex justify-between">
                   <span className="text-text capitalize">{agent}</span>
@@ -1067,16 +1256,16 @@ export default function SetupWizard() {
             </div>
             {showReviewerCreds && reviewerUser && (
               <div>
-                <span className="text-text-muted block mb-0.5">Reviewer</span>
+                <span className="text-text-muted block mb-0.5">{t.preview.reviewer}</span>
                 <span className="text-text">@{reviewerUser}</span>
               </div>
             )}
             <div>
-              <span className="text-text-muted block mb-0.5">Directory</span>
+              <span className="text-text-muted block mb-0.5">{t.preview.directory}</span>
               <span className="text-text font-mono text-[10px]">{workingDir || "\u2014"}</span>
             </div>
             <div>
-              <span className="text-text-muted block mb-0.5">Status</span>
+              <span className="text-text-muted block mb-0.5">{t.preview.status}</span>
               <div className="space-y-0.5">
                 {steps.map((s) => (
                   <div key={s.id} className="flex items-center gap-1.5">
