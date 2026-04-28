@@ -124,6 +124,13 @@ function writeConfigFile(cfg) {
   writeConfig(cfg);
 }
 
+// ─── Version ──────────────────────────────────────────────────────────────
+
+router.get("/api/version", (_req, res) => {
+  const pkg = require("../package.json");
+  res.json({ version: pkg.version });
+});
+
 // ─── Config ────────────────────────────────────────────────────────────────
 
 router.get("/api/config", (_req, res) => {
