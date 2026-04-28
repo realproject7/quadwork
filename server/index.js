@@ -2518,6 +2518,40 @@ server.listen(PORT, "127.0.0.1", async () => {
       }
     }
   }
+  // #596: add CLI-based agent sections to existing config.toml files.
+  // Follow-up to #592 (PR #594) which added these for new projects.
+  // Existing projects still have role-based-only sections; if their AC
+  // drifts to HEAD, registration fails with "unknown base". This
+  // migration appends [agents.claude]/[agents.codex] etc. sections so
+  // HEAD AC accepts CLI-named bases. No AC restart needed — AC reads
+  // config.toml on its own startup.
+  for (const p of (startupCfg.projects || [])) {
+    const acPath = projectAgentchattrConfigPath(p.id);
+    if (!fs.existsSync(acPath)) continue;
+    try {
+      let toml = fs.readFileSync(acPath, "utf-8");
+      const cliSections = new Set();
+      for (const [, agentCfg] of Object.entries(p.agents || {})) {
+        const cmd = agentCfg.command || "claude";
+        const cli = cmd.split("/").pop().split(" ")[0];
+        cliSections.add(cli);
+      }
+      let changed = false;
+      for (const cli of cliSections) {
+        if (!new RegExp(`^\\[agents\\.${cli}\\]`, "m").test(toml)) {
+          const injectMode = cli === "codex" ? "proxy_flag" : cli === "gemini" ? "env" : "flag";
+          toml += `\n[agents.${cli}]\ncommand = "${cli}"\nlabel = "${cli}"\nmcp_inject = "${injectMode}"\n`;
+          changed = true;
+        }
+      }
+      if (changed) {
+        fs.writeFileSync(acPath, toml);
+        console.log(`[#596] ${p.id}: added CLI-based agent sections to config.toml`);
+      }
+    } catch (err) {
+      console.warn(`[#596] ${p.id}: config.toml migration failed: ${err.message}`);
+    }
+  }
   // #416: start the AC health monitor
   startAcHealthMonitor();
 });
