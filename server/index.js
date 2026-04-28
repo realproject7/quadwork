@@ -1094,8 +1094,19 @@ async function handleAgentChattr(req, res) {
       // #447: auto-reset all agents after AC restart so they get
       // fresh MCP tokens. #581: mark reset as scheduled immediately
       // so the health monitor skips its own reset while ours is in-flight.
+      // #579: also skip if a reset already succeeded within the last 30s.
+      // Multiple restart sources (bridge-migrate, health monitor, dashboard)
+      // can fire in rapid succession — only the first should trigger a reset.
+      const existingReset = _acHealth.resetState.get(projectId);
+      const resetRecentlyDone = existingReset &&
+        (existingReset.status === "succeeded" || existingReset.status === "scheduled") &&
+        Date.now() - existingReset.timestamp < 30_000;
+      if (resetRecentlyDone) {
+        console.log(`[agentchattr] ${projectId} skipping auto-reset — one already ${existingReset.status} ${Math.round((Date.now() - existingReset.timestamp) / 1000)}s ago`);
+      } else {
       _acHealth.resetState.set(projectId, { status: "scheduled", timestamp: Date.now() });
-      setTimeout(async () => {
+      }
+      if (!resetRecentlyDone) setTimeout(async () => {
         try {
           const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(projectId)}/reset`, {
             method: "POST",
@@ -2152,6 +2163,10 @@ const _acHealth = {
   // #581: per-project reset state — prevents duplicate resets per restart event.
   // Values: { status: "scheduled"|"succeeded"|"failed", timestamp: number }
   resetState: new Map(),
+  // #579: timestamp when the health monitor started. The first 60s are a
+  // grace period: skip checks so cmdStart spawns and startup migrations
+  // (bridge-migrate, ghost-fix) can settle before the monitor acts.
+  startedAt: 0,
 };
 
 function isPortAlive(port) {
@@ -2166,6 +2181,10 @@ function isPortAlive(port) {
 }
 
 async function acHealthCheck() {
+  // #579: skip checks during the startup grace period so cmdStart spawns
+  // and startup migrations (bridge-migrate, ghost-fix) can settle.
+  if (_acHealth.startedAt && Date.now() - _acHealth.startedAt < 60_000) return;
+
   const cfg = readConfig();
   for (const project of (cfg.projects || [])) {
     const proc = chattrProcesses.get(project.id);
@@ -2263,18 +2282,36 @@ async function acHealthCheck() {
 
 function startAcHealthMonitor() {
   if (_acHealth.intervalHandle) return;
+  _acHealth.startedAt = Date.now();
   _acHealth.intervalHandle = setInterval(acHealthCheck, 30_000);
-  console.log("[health] AC health monitor started (30s interval)");
+  console.log("[health] AC health monitor started (30s interval, 60s startup grace)");
 }
 
-server.listen(PORT, "127.0.0.1", () => {
+server.listen(PORT, "127.0.0.1", async () => {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
+  // #579: detect AC processes already running (spawned by cmdStart before
+  // the server module loaded). Without this, chattrProcesses is empty on
+  // boot and the health monitor can't track cmdStart-spawned ACs, while
+  // the dashboard's Start button would redundantly kill+respawn them.
+  const startupCfg = readConfig();
+  for (const p of (startupCfg.projects || [])) {
+    const { url: acUrl } = resolveProjectChattr(p.id);
+    const acPortMatch = acUrl.match(/:(\d+)/);
+    const acPort = acPortMatch ? parseInt(acPortMatch[1], 10) : 8300;
+    const alive = await isPortAlive(acPort);
+    if (alive && !chattrProcesses.has(p.id)) {
+      // AC is already running (e.g. spawned by cmdStart). Record it so
+      // the health monitor can track it and the dashboard shows the
+      // correct state. process is null because we don't own the child.
+      chattrProcesses.set(p.id, { process: null, state: "running", error: null });
+      console.log(`[startup] ${p.id}: AC already alive on port ${acPort} — tracking`);
+    }
+  }
   // Sync AgentChattr tokens for all projects on startup and backfill
   // the sender-overflow CSS/JS patch (#402) so already-running AC
   // instances receive the fix without requiring a restart.
   // #448: retry after 5s for projects where AC isn't up yet at boot.
-  const startupCfg = readConfig();
   for (const p of (startupCfg.projects || [])) {
     syncChattrToken(p.id).catch(() => {
       setTimeout(() => syncChattrToken(p.id).catch(() => {}), 5000);
