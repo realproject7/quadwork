@@ -2046,6 +2046,17 @@ router.post("/api/setup", (req, res) => {
           else errors.push(`${agent}: ${result.output}`);
         }
       }
+      // Pre-trust worktree directories for Claude Code agents (#599).
+      // Running `claude -p` in a directory auto-trusts it for future sessions,
+      // preventing the interactive "Do you trust this directory?" prompt.
+      const claudePath = exec("which", ["claude"]);
+      if (claudePath.ok) {
+        for (const agent of agents) {
+          const wtDir = path.join(parentDir, `${projectName}-${agent}`);
+          if (!fs.existsSync(wtDir)) continue;
+          exec("claude", ["-p", "echo ok"], { cwd: wtDir, timeout: 15000, stdio: "pipe" });
+        }
+      }
       return res.json({ ok: errors.length === 0, created, errors });
     }
     case "seed-files": {
