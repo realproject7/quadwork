@@ -67,8 +67,11 @@ When the operator asks you in chat to start a task or batch:
    **Started:** <YYYY-MM-DD HH:MM>
    **Status:** pending kickoff
 
-   (items...)
+   - #598 Fix double AC restart
+   - #600 Display version in sidebar
    ```
+
+   Each item MUST start with `- #<number>` (dash, space, hash, issue number). Do NOT prefix with words like "Issue" — `- Issue #598 ...` will NOT be recognized by the batch progress panel. The `#` must be the first token after the list marker.
 
    When you move a batch to Done, **preserve its `Batch: N` line** so the next batch's number computation stays correct.
 3. Reply in chat to confirm what you wrote to the queue file (issue numbers + which section).
