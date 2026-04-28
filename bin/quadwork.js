@@ -1571,7 +1571,7 @@ function migrateLoopGuardDefaults(config) {
 async function waitForAcHealth(baseUrl, timeoutMs = 30000) {
   const http = require("http");
   const deadline = Date.now() + timeoutMs;
-  const healthUrl = `${baseUrl}/api/health`;
+  const healthUrl = `${baseUrl}/`;
   while (Date.now() < deadline) {
     const ok = await new Promise((resolve) => {
       const req = http.get(healthUrl, (res) => {
