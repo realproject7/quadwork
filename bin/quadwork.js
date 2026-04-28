@@ -268,16 +268,21 @@ function _installAgentChattrLocked(dir, setError) {
     // On failure (commit unreachable / force-pushed away), fall
     // back to the default branch with a loud warning instead of
     // hard-failing the install.
-    const pinResult = run("git", ["-C", dir, "checkout", "-B", "pinned", AGENTCHATTR_PIN], { timeout: 30000 });
+    // #593: Retry with explicit fetch on failure, abort install on persistent failure.
+    let pinResult = run("git", ["-C", dir, "checkout", "-B", "pinned", AGENTCHATTR_PIN], { timeout: 30000 });
     if (pinResult === null) {
-      const pinWarnMsg = `Could not check out AgentChattr pin ${AGENTCHATTR_PIN} at ${dir}; falling back to default branch. AC's argparse may reject unknown flags. Update AGENTCHATTR_PIN in bin/quadwork.js for reproducible installs.`;
-      warn(pinWarnMsg);
-      // Persist to install log so post-mortem diagnosis is possible
-      // without re-running the install.
-      try {
-        const logDir = path.join(path.dirname(dir));
-        fs.appendFileSync(path.join(logDir, "install.log"), `[${new Date().toISOString()}] PIN-CHECKOUT-FAIL: ${pinWarnMsg}\n`);
-      } catch {}
+      log("Pin checkout failed — fetching commit explicitly...");
+      run("git", ["-C", dir, "fetch", "origin", AGENTCHATTR_PIN], { timeout: 60000 });
+      pinResult = run("git", ["-C", dir, "checkout", "-B", "pinned", AGENTCHATTR_PIN], { timeout: 30000 });
+    }
+    if (pinResult === null) {
+      return setError(
+        `Could not check out AgentChattr pin ${AGENTCHATTR_PIN.slice(0, 12)} at ${dir}. ` +
+        `AC would run an untested HEAD version with known incompatibilities. ` +
+        `Check your network connection and retry, or manually run:\n` +
+        `  git -C ${dir} fetch origin ${AGENTCHATTR_PIN}\n` +
+        `  git -C ${dir} checkout -B pinned ${AGENTCHATTR_PIN}`
+      );
     }
   } else {
     // #366: existing clone from a pre-fix install. If the clone
