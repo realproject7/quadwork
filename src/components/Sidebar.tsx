@@ -191,6 +191,7 @@ export default function Sidebar() {
   const [backendStatus, setBackendStatus] = useState<"online" | "offline" | "recovering">("online");
   const [expanded, setExpanded] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
+  const [version, setVersion] = useState<string>("");
   const configRef = useRef<Record<string, unknown> | null>(null);
 
   // Restore persisted state on mount — only on desktop-width screens
@@ -220,6 +221,13 @@ export default function Sidebar() {
       return next;
     });
   };
+
+  useEffect(() => {
+    fetch("/api/version")
+      .then((r) => r.json())
+      .then((d) => setVersion(d.version || ""))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetch("/api/config")
@@ -623,6 +631,12 @@ export default function Sidebar() {
         <GearIcon />
         {expanded && <span className="text-xs">Settings</span>}
       </Link>
+
+      {version && (
+        <div className={`text-[10px] text-text-muted/40 ${expanded ? "px-3" : "text-center"} pt-2`}>
+          v{version}
+        </div>
+      )}
     </aside>
   );
 }
