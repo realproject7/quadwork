@@ -2197,12 +2197,6 @@ router.post("/api/setup", (req, res) => {
       content += `[mcp]\nhttp_port = ${mcp_http}\nsse_port = ${mcp_sse}\n`;
       writeSecureFile(tomlPath, content);
 
-      // Restart this project's AgentChattr instance (not global)
-      try {
-        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-        const qwPort = cfg.port || 8400;
-        fetch(`http://127.0.0.1:${qwPort}/api/agentchattr/${encodeURIComponent(dirName)}/restart`, { method: "POST" }).catch(() => {});
-      } catch {}
       return res.json({ ok: true, path: tomlPath, agentchattr_token: sessionToken, agentchattr_port: chattrPort, mcp_http_port: mcp_http, mcp_sse_port: mcp_sse });
     }
     case "add-config": {
