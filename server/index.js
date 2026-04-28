@@ -380,14 +380,18 @@ async function buildAgentArgs(projectId, agentId) {
       // token because app.py:2123 requires authenticated agent
       // session for family names — load it from disk (persisted
       // across restarts). Failures are non-fatal.
+      // #588: deregister stale registration — try both the old role-based
+      // name and the CLI-based name for backward compat during transition.
       const stalePersistedToken = readPersistedAgentToken(projectId, agentId);
       if (stalePersistedToken) {
         await deregisterAgent(acServerPort, agentId, stalePersistedToken).catch(() => {});
+        await deregisterAgent(acServerPort, cliBase, stalePersistedToken).catch(() => {});
         clearPersistedAgentToken(projectId, agentId);
       }
       // #478: force-replace so AC expires any ghost slots for this base
       // #565: retry with backoff and degrade gracefully if AC is not ready
-      const registration = await registerAgentWithRetry(acServerPort, agentId, agentCfg.display_name || null, { force: true });
+      // #588: register with CLI name as base, role name as label
+      const registration = await registerAgentWithRetry(acServerPort, cliBase, agentCfg.display_name || agentId, { force: true });
       if (!registration) {
         console.warn(`[#565] Agent ${agentId}: AC registration failed after retries (${registerAgent.lastError}). Spawning without chat integration.`);
       } else {
@@ -413,16 +417,18 @@ async function buildAgentArgs(projectId, agentId) {
         // recovery in spawnAgentPty can retry registration later.
         return { args, acRegistrationName: null, acServerPort, acRegistrationToken: null, acInjectMode: injectMode, acMcpHttpPort: mcpHttpPort || null };
       }
-      // #242: best-effort deregister stale canonical name first using
-      // the persisted bearer token from a previous session.
+      // #588: deregister stale registration — try both old role-based
+      // name and CLI-based name for backward compat during transition.
       const stalePersistedToken = readPersistedAgentToken(projectId, agentId);
       if (stalePersistedToken) {
         await deregisterAgent(acServerPort, agentId, stalePersistedToken).catch(() => {});
+        await deregisterAgent(acServerPort, cliBase, stalePersistedToken).catch(() => {});
         clearPersistedAgentToken(projectId, agentId);
       }
       // #478: force-replace so AC expires any ghost slots for this base
       // #565: retry with backoff and degrade gracefully if AC is not ready
-      const registration = await registerAgentWithRetry(acServerPort, agentId, agentCfg.display_name || null, { force: true });
+      // #588: register with CLI name as base, role name as label
+      const registration = await registerAgentWithRetry(acServerPort, cliBase, agentCfg.display_name || agentId, { force: true });
       if (!registration) {
         console.warn(`[#565] Agent ${agentId}: AC registration failed after retries (${registerAgent.lastError}). Spawning without chat integration.`);
       } else {
@@ -496,19 +502,24 @@ async function recoverFrom409(projectId, agentId, session) {
   const cfg = readConfig();
   const project = cfg.projects?.find((p) => p.id === projectId);
   const agentCfg = project?.agents?.[agentId] || {};
+  const command = agentCfg.command || "claude";
+  const cliBase = command.split("/").pop().split(" ")[0];
   // AC may need a moment to come back up after a restart — wait briefly.
   await waitForAgentChattrReady(session.acServerPort, 10000);
 
   // Best-effort cleanup of the stale registration on disk so the
   // fresh register isn't shoved into a slot 2 by leftover state.
+  // #588: try both old role-based name and CLI-based name.
   const stale = readPersistedAgentToken(projectId, agentId);
   if (stale) {
     await deregisterAgent(session.acServerPort, agentId, stale).catch(() => {});
+    await deregisterAgent(session.acServerPort, cliBase, stale).catch(() => {});
     clearPersistedAgentToken(projectId, agentId);
   }
 
   // #478: force-replace so AC expires any ghost slots for this base
-  const replacement = await registerAgent(session.acServerPort, agentId, agentCfg.display_name || null, { force: true });
+  // #588: register with CLI name as base, role name as label
+  const replacement = await registerAgent(session.acServerPort, cliBase, agentCfg.display_name || agentId, { force: true });
   if (!replacement) return;
 
   const previousName = session.acRegistrationName;
@@ -2424,6 +2435,46 @@ server.listen(PORT, "127.0.0.1", async () => {
           console.warn(`[reseed] ${p.id}/${agentId}: failed to patch ${filename}: ${err.message}`);
         }
       }
+    }
+  }
+  // #588: migrate config.toml from role-based to CLI-based agent sections.
+  // Old configs have [agents.head], [agents.dev], etc. AC's registry needs
+  // CLI-based sections ([agents.claude], [agents.codex]) to accept base
+  // registration. Add CLI sections if missing; leave role sections for compat.
+  for (const p of (startupCfg.projects || [])) {
+    const acPath = projectAgentchattrConfigPath(p.id);
+    if (!fs.existsSync(acPath)) continue;
+    try {
+      let toml = fs.readFileSync(acPath, "utf-8");
+      const cliSections = new Set();
+      // Discover which CLIs are used by this project's agents
+      for (const [, agentCfg] of Object.entries(p.agents || {})) {
+        const cmd = agentCfg.command || "claude";
+        const cli = cmd.split("/").pop().split(" ")[0];
+        cliSections.add(cli);
+      }
+      let changed = false;
+      for (const cli of cliSections) {
+        const sectionPattern = new RegExp(`^\\[agents\\.${cli}\\]`, "m");
+        if (!sectionPattern.test(toml)) {
+          const injectMode = cli === "codex" ? "proxy_flag" : cli === "gemini" ? "env" : "flag";
+          toml += `\n[agents.${cli}]\ncommand = "${cli}"\nlabel = "${cli.charAt(0).toUpperCase() + cli.slice(1)}"\nmcp_inject = "${injectMode}"\n`;
+          changed = true;
+        }
+      }
+      if (changed) {
+        fs.writeFileSync(acPath, toml);
+        console.log(`[#588] ${p.id}: added CLI-based agent sections to config.toml`);
+        // Restart AC so it picks up the new sections
+        setTimeout(async () => {
+          try {
+            const r = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(p.id)}/restart`, { method: "POST" });
+            if (r.ok) console.log(`[#588] ${p.id}: restarted AC after config migration`);
+          } catch {}
+        }, 3000);
+      }
+    } catch (err) {
+      console.warn(`[#588] ${p.id}: config.toml migration failed: ${err.message}`);
     }
   }
   // #478 + #502: patch deployed AgentChattr instances to support force-replace
