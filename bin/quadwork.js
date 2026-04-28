@@ -556,11 +556,18 @@ async function checkPrereqs(rl) {
   }
 
   // ── 3. AgentChattr (clone + venv — needs Python and git) ──
+  // #579: skip global install on fresh installs with no projects. Each
+  // project gets its own per-project clone via the web setup wizard, so
+  // a global ~/.quadwork/agentchattr/ clone is redundant cruft.
+  // Only check for an existing install to report status.
   const acDir = findAgentChattr();
+  const config = readConfig();
   if (acDir) {
     ok(`AgentChattr (${acDir})`);
     agentChattrFound = true;
-  } else if (hasPython) {
+  } else if (hasPython && config.projects && config.projects.length > 0) {
+    // Existing projects but no global install — install globally as
+    // fallback for legacy projects that don't have per-project clones.
     console.log("");
     warn("AgentChattr lets your AI agents communicate with each other.");
     log("It will be cloned and set up in a virtualenv.");
@@ -583,6 +590,11 @@ async function checkPrereqs(rl) {
       log(`  → Install later: git clone ${AGENTCHATTR_REPO} ${DEFAULT_AGENTCHATTR_DIR}`);
       allOk = false;
     }
+  } else if (hasPython) {
+    // Fresh install with no projects — AC will be installed per-project
+    // when the user creates their first project via the dashboard.
+    ok("AgentChattr will be installed per-project when you create a project.");
+    agentChattrFound = true;
   } else {
     warn("AgentChattr requires Python — install Python first, then re-run init.");
     allOk = false;
@@ -1671,6 +1683,17 @@ async function cmdStart() {
       }
       log(`  Log: ${acLogPath}`);
       acPids.push(acProc.pid);
+    }
+    // #579: verify pin checkout after spawn — surface loudly if AC clone
+    // drifted from the pinned commit, so operators know they're not on
+    // the tested version. The install-time warn() is often buried mid-
+    // spinner; this post-spawn check is always visible.
+    const headSha = (run("git", ["-C", projectAcDir, "rev-parse", "HEAD"]) || "").trim();
+    if (headSha && headSha !== AGENTCHATTR_PIN) {
+      warn(`AgentChattr for ${project.id} is NOT on the pinned commit.`);
+      log(`  Current: ${headSha.slice(0, 12)}`);
+      log(`  Pinned:  ${AGENTCHATTR_PIN.slice(0, 12)}`);
+      log(`  Run: git -C ${projectAcDir} checkout -B pinned ${AGENTCHATTR_PIN}`);
     }
   }
 
