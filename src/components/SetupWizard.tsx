@@ -498,7 +498,7 @@ export default function SetupWizard() {
 
     // 1. Create worktrees
     setWorkspaceLog((l) => [...l, "Creating worktrees..."]);
-    const wtResult = await apiCall("create-worktrees", { workingDir, repo });
+    const wtResult = await apiCall("create-worktrees", { workingDir, repo, backends });
     if (!wtResult.ok) {
       setWorkspaceLog((l) => [...l, `Error: ${wtResult.errors?.join(", ") || wtResult.error}`]);
       updateStep(currentStep, { status: "error", error: wtResult.errors?.join(", ") || wtResult.error });
