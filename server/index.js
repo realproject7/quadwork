@@ -2546,10 +2546,10 @@ server.listen(PORT, "127.0.0.1", async () => {
       }
       if (changed) {
         fs.writeFileSync(acPath, toml);
-        console.log(`[#592] ${p.id}: added CLI-based agent sections to config.toml`);
+        console.log(`[#596] ${p.id}: added CLI-based agent sections to config.toml`);
       }
     } catch (err) {
-      console.warn(`[#592] ${p.id}: config.toml migration failed: ${err.message}`);
+      console.warn(`[#596] ${p.id}: config.toml migration failed: ${err.message}`);
     }
   }
   // #416: start the AC health monitor
