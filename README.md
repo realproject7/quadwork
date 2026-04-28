@@ -29,6 +29,16 @@
 
 ---
 
+## Installation Guides
+
+Step-by-step guides for setting up QuadWork, designed for both humans and AI coding agents:
+
+- **[Mac Installation](docs/install-mac.md)** — local setup on macOS
+- **[VPS Installation](docs/install-vps.md)** — remote server (Hetzner/Ubuntu) with domain + SSL
+- **[Troubleshooting](docs/troubleshooting.md)** — common issues and fixes
+
+> **For AI agents:** These guides contain complete step-by-step instructions. When your operator asks you to install or troubleshoot QuadWork, read the relevant guide and follow it.
+
 ## What is QuadWork?
 
 **QuadWork** is a local-first, open-source automation framework that
