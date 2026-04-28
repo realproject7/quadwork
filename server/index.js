@@ -50,7 +50,15 @@ function isCliInstalled(cmd) {
     execFileSync("which", [cmd], { encoding: "utf-8", stdio: "pipe" });
     return true;
   } catch {
-    return false;
+    // #586: fallback for VPS/headless environments where ~/.local/bin
+    // is not in the inherited PATH (e.g. Claude Code installer adds to
+    // ~/.bashrc but Node's execFileSync doesn't source profile files).
+    const fallbacks = [
+      path.join(os.homedir(), ".local", "bin", cmd),
+      path.join(os.homedir(), ".npm-global", "bin", cmd),
+      `/usr/local/bin/${cmd}`,
+    ];
+    return fallbacks.some((p) => fs.existsSync(p));
   }
 }
 
