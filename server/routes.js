@@ -2217,6 +2217,9 @@ router.post("/api/setup", (req, res) => {
       // operator to type /continue. AC clamps to [1, 50] internally.
       content += `[routing]\ndefault = "none"\nmax_agent_hops = 30\n\n`;
       content += `[mcp]\nhttp_port = ${mcp_http}\nsse_port = ${mcp_sse}\n`;
+      // #607: Bridge agent declarations so AC accepts dc/tg base registration
+      content += `\n[agents.tg]\nlabel = "Telegram Bridge"\n\n`;
+      content += `[agents.dc]\nlabel = "Discord Bridge"\n`;
       writeSecureFile(tomlPath, content);
 
       return res.json({ ok: true, path: tomlPath, agentchattr_token: sessionToken, agentchattr_port: chattrPort, mcp_http_port: mcp_http, mcp_sse_port: mcp_sse });
