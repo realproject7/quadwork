@@ -75,10 +75,10 @@ Update local `~/.ssh/config` — change `User root` to `User quadwork`. **All su
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3.12-venv git
+sudo apt-get install -y python3.12-venv git apache2-utils
 ```
 
-`python3.12-venv` is required for AgentChattr's Python venv. Without it, the venv is created without pip, and AgentChattr crashes with `ModuleNotFoundError: No module named 'fastapi'`.
+`python3.12-venv` is required for AgentChattr's Python venv. Without it, the venv is created without pip, and AgentChattr crashes with `ModuleNotFoundError: No module named 'fastapi'`. `apache2-utils` provides `htpasswd` (used in Step 10 for HTTP basic auth).
 
 ---
 
@@ -271,7 +271,6 @@ The dashboard is publicly accessible once deployed. Add password protection:
 openssl rand -base64 18
 # Save the output as your password
 
-sudo apt-get install -y apache2-utils
 sudo htpasswd -cb /etc/nginx/.htpasswd admin 'YOUR_GENERATED_PASSWORD'
 ```
 
@@ -315,6 +314,8 @@ add_header Set-Cookie "qw_auth=YOUR_AUTH_SECRET; Path=/; Max-Age=86400; HttpOnly
 - To force re-login: clear the `qw_auth` cookie in your browser, or wait 24h
 - **Security:** the secret is unique to your deployment — knowing the guide's placeholder doesn't help an attacker
 
+Reload nginx to apply the new config (only needed for initial setup — nginx reads `.htpasswd` on every request, so credential changes don't require a reload):
+
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
 ```
@@ -336,15 +337,16 @@ chmod 600 ~/.quadwork/.env
 1. Create Hetzner VPS (CPX32, Ubuntu 24.04, Regular Performance)
 2. SSH in as root, create `quadwork` user with sudo + SSH keys
 3. Update local SSH config to `User quadwork`
-4. Install system packages: `python3.12-venv`, `git`
+4. Install system packages: `python3.12-venv`, `git`, `apache2-utils`
 5. Install nvm + Node.js 24
 6. Install GitHub CLI
 7. Install Claude Code + Codex CLI
 8. Authenticate CLIs (gh, claude, codex)
 9. Install QuadWork + pm2
 10. Run `quadwork init`
-11. Start with pm2 wrapper, save, configure startup
-12. Set up DNS A record
-13. Configure nginx reverse proxy + SSL
-14. Add HTTP basic auth
-15. Verify reboot survival: `sudo reboot`, then check `pm2 list`
+11. Create `~/start-quadwork.sh` wrapper script (loads nvm before exec)
+12. Start with pm2 wrapper, save, configure startup
+13. Set up DNS A record
+14. Configure nginx reverse proxy + SSL
+15. Add HTTP basic auth
+16. Verify reboot survival: `sudo reboot`, then check `pm2 list`
