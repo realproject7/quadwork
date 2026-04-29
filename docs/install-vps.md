@@ -279,17 +279,25 @@ sudo htpasswd -cb /etc/nginx/.htpasswd admin 'YOUR_GENERATED_PASSWORD'
 
 Mobile browsers (especially Safari) drop the `Authorization` header aggressively on new connections and WebSocket reconnects, causing repeated sign-in popups every few minutes. The fix: cache successful auth in a cookie so nginx skips the challenge on subsequent requests.
 
-Add a `map` block **outside** the `server` block (at the `http` level — typically at the top of your site config file or in `/etc/nginx/conf.d/auth-cache.conf`):
+Generate a unique secret for your deployment (this becomes the cookie value):
+
+```bash
+openssl rand -hex 16
+# Example output: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
+# Save this — you'll use it in the nginx config below
+```
+
+Add a `map` block **outside** the `server` block (at the `http` level — typically at the top of your site config file or in `/etc/nginx/conf.d/auth-cache.conf`). Replace `YOUR_AUTH_SECRET` with the value generated above:
 
 ```nginx
 # Cache basic auth in a cookie so mobile browsers don't reprompt
 map $cookie_qw_auth $auth_ok {
-    "authenticated" "off";
-    default         "QuadWork";
+    "YOUR_AUTH_SECRET" "off";
+    default            "QuadWork";
 }
 ```
 
-Then update the `server` block (inside `listen 443 ssl`) to use `$auth_ok` instead of a static string, and set the cookie on every response:
+Then update the `server` block (inside `listen 443 ssl`) to use `$auth_ok` instead of a static string, and set the cookie on every response. Replace `YOUR_AUTH_SECRET` with the same value:
 
 ```nginx
 auth_basic $auth_ok;
@@ -297,14 +305,15 @@ auth_basic_user_file /etc/nginx/.htpasswd;
 
 # Set cookie after successful auth (24h expiry)
 # Do NOT use "always" — it would set the cookie on 401 responses too
-add_header Set-Cookie "qw_auth=authenticated; Path=/; Max-Age=86400; HttpOnly; Secure";
+add_header Set-Cookie "qw_auth=YOUR_AUTH_SECRET; Path=/; Max-Age=86400; HttpOnly; Secure";
 ```
 
 **How it works:**
 - First visit: no `qw_auth` cookie → `$auth_ok` = `"QuadWork"` → browser prompts for credentials (normal basic auth)
-- After successful auth: cookie is set with 24h expiry
-- Subsequent requests: cookie present → `$auth_ok` = `"off"` → auth challenge skipped
+- After successful auth: cookie is set with 24h expiry (value is your unique secret)
+- Subsequent requests: cookie value matches map key → `$auth_ok` = `"off"` → auth challenge skipped
 - To force re-login: clear the `qw_auth` cookie in your browser, or wait 24h
+- **Security:** the secret is unique to your deployment — knowing the guide's placeholder doesn't help an attacker
 
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
