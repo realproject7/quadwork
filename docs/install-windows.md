@@ -103,4 +103,4 @@ QuadWork runs on `http://127.0.0.1:8400` by default. WSL2 shares localhost with 
 
 ## For AI Agents
 
-After WSL2 is installed by the operator, follow `docs/install-mac.md` exactly. The environment is standard Ubuntu — all commands work identically.
+After WSL2 is installed by the operator: follow Steps 3–4 in this guide for prerequisites, then continue with `docs/install-mac.md` starting from the **"Install AI Coding Agents"** section. Do not run the macOS-specific prerequisite steps (Homebrew, Xcode, SSL certificates) — those are already handled by Step 3 above.
