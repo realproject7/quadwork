@@ -34,6 +34,7 @@
 Step-by-step guides for setting up QuadWork, designed for both humans and AI coding agents:
 
 - **[Mac Installation](docs/install-mac.md)** — local setup on macOS
+- **[Windows Installation](docs/install-windows.md)** — local setup via WSL2 (Windows Subsystem for Linux)
 - **[VPS Installation](docs/install-vps.md)** — remote server (Hetzner/Ubuntu) with domain + SSL
 - **[Troubleshooting](docs/troubleshooting.md)** — common issues and fixes
 
