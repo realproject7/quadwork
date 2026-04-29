@@ -246,10 +246,10 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
           }
         </div>
       )}
-      {/* #226: side-by-side issues + PRs columns */}
-      <div className="flex-1 min-h-0 flex">
+      {/* #226: side-by-side issues + PRs columns (stacked on mobile) */}
+      <div className="flex-1 min-h-0 flex flex-col lg:flex-row">
         {/* Issues column */}
-        <div className="flex-1 min-w-0 flex flex-col border-r border-border">
+        <div className="flex-1 min-w-0 flex flex-col border-b lg:border-b-0 lg:border-r border-border">
           <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
               {t.issues(issues.length)}

@@ -28,6 +28,7 @@ export default function RootLayout({
           <GlobalNotificationListener />
           <TopHeader />
           <div className="flex flex-1 min-h-0">
+            {/* Desktop: permanent sidebar. Mobile: hidden (hamburger overlay in Sidebar). */}
             <Sidebar />
             <main className="flex-1 min-w-0 overflow-auto">{children}</main>
           </div>

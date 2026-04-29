@@ -4,6 +4,22 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+function HamburgerIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+      <path d="M3 5h14M3 10h14M3 15h14" />
+    </svg>
+  );
+}
+
+function CloseXIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+      <path d="M5 5l10 10M15 5L5 15" />
+    </svg>
+  );
+}
+
 interface Project {
   id: string;
   name: string;
@@ -190,9 +206,15 @@ export default function Sidebar() {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [backendStatus, setBackendStatus] = useState<"online" | "offline" | "recovering">("online");
   const [expanded, setExpanded] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
   const [version, setVersion] = useState<string>("");
   const configRef = useRef<Record<string, unknown> | null>(null);
+
+  // Close mobile overlay on navigation
+  useEffect(() => {
+    setMobileOpen(false);
+  }, [pathname]);
 
   // Restore persisted state on mount — only on desktop-width screens
   useEffect(() => {
@@ -377,17 +399,13 @@ export default function Sidebar() {
   const unpinnedProjects = projects.filter((p) => !pinnedSet.has(p.id));
   const ungroupedProjects = unpinnedProjects.filter((p) => !groupedIds.has(p.id));
 
-  return (
-    <aside
-      className={`shrink-0 h-full border-r border-border bg-bg-surface flex flex-col py-3 transition-[width] duration-200 ease-in-out overflow-hidden ${
-        expanded ? "w-52 items-stretch px-2" : "w-16 items-center"
-      }`}
-    >
+  const renderSidebarBody = (isExpanded: boolean) => (
+    <>
       {/* Home */}
       <Link
         href="/"
         className={`flex items-center gap-2 rounded-sm transition-colors ${
-          expanded ? "px-2 py-2" : "w-10 h-10 justify-center self-center"
+          isExpanded ? "px-2 py-2" : "w-10 h-10 justify-center self-center"
         } ${
           isHome
             ? "text-accent"
@@ -396,18 +414,18 @@ export default function Sidebar() {
         title="Home"
       >
         <HomeIcon />
-        {expanded && <span className="text-xs">Home</span>}
+        {isExpanded && <span className="text-xs">Home</span>}
       </Link>
 
       {/* Divider */}
-      <div className={`h-px bg-border my-2 ${expanded ? "" : "w-6 self-center"}`} />
+      <div className={`h-px bg-border my-2 ${isExpanded ? "" : "w-6 self-center"}`} />
 
       {/* Projects */}
-      <div className={`flex-1 flex flex-col gap-2 overflow-y-auto min-h-0 ${expanded ? "" : "items-center"}`}>
+      <div className={`flex-1 flex flex-col gap-2 overflow-y-auto min-h-0 ${isExpanded ? "" : "items-center"}`}>
         {/* Pinned group */}
         {pinnedProjects.length > 0 && (
           <>
-            {expanded && (
+            {isExpanded && (
               <span className="text-[10px] uppercase tracking-widest text-text-muted px-2">Pinned</span>
             )}
             {pinnedProjects.map((project) => (
@@ -415,12 +433,12 @@ export default function Sidebar() {
                 key={project.id}
                 project={project}
                 isActive={activeProjectId === project.id}
-                expanded={expanded}
+                expanded={isExpanded}
                 pinned
                 onContextMenu={handleContextMenu}
               />
             ))}
-            <div className={`h-px bg-border ${expanded ? "" : "w-6"}`} />
+            <div className={`h-px bg-border ${isExpanded ? "" : "w-6"}`} />
           </>
         )}
 
@@ -433,15 +451,14 @@ export default function Sidebar() {
           const isCollapsed = collapsedGroups.has(group.name);
           return (
             <div key={group.name} className="flex flex-col gap-1">
-              {/* Group header */}
               <button
                 onClick={() => toggleGroupCollapse(group.name)}
                 className={`flex items-center gap-1 text-text-muted hover:text-text transition-colors ${
-                  expanded ? "px-2 py-0.5" : "justify-center w-full"
+                  isExpanded ? "px-2 py-0.5" : "justify-center w-full"
                 }`}
                 title={`${isCollapsed ? "Expand" : "Collapse"} ${group.name}`}
               >
-                {expanded ? (
+                {isExpanded ? (
                   <>
                     <ChevronDownIcon collapsed={isCollapsed} />
                     <span className="text-[10px] uppercase tracking-widest truncate">{group.name}</span>
@@ -450,13 +467,12 @@ export default function Sidebar() {
                   <div className={`w-6 h-px ${isCollapsed ? "bg-text-muted" : "bg-border"}`} />
                 )}
               </button>
-              {/* Group children */}
               {!isCollapsed && groupProjects.map((project) => (
                 <ProjectIcon
                   key={project.id}
                   project={project}
                   isActive={activeProjectId === project.id}
-                  expanded={expanded}
+                  expanded={isExpanded}
                   pinned={false}
                   onContextMenu={handleContextMenu}
                 />
@@ -468,10 +484,10 @@ export default function Sidebar() {
         {/* Ungrouped projects */}
         {ungroupedProjects.length > 0 && groups.length > 0 && (
           <>
-            {expanded && (
+            {isExpanded && (
               <span className="text-[10px] uppercase tracking-widest text-text-muted px-2">Ungrouped</span>
             )}
-            {groups.length > 0 && !expanded && (
+            {!isExpanded && groups.length > 0 && (
               <div className="w-6 h-px bg-border" />
             )}
           </>
@@ -481,7 +497,7 @@ export default function Sidebar() {
             key={project.id}
             project={project}
             isActive={activeProjectId === project.id}
-            expanded={expanded}
+            expanded={isExpanded}
             pinned={false}
             onContextMenu={handleContextMenu}
           />
@@ -491,14 +507,14 @@ export default function Sidebar() {
         <Link
           href="/setup"
           className={`flex items-center gap-2 rounded-full transition-colors ${
-            expanded
+            isExpanded
               ? "px-2 py-2 border border-dashed border-border text-text-muted hover:text-text hover:bg-[#1a1a1a] rounded-sm"
               : "w-10 h-10 justify-center border border-dashed border-border text-text-muted hover:text-text hover:bg-[#1a1a1a]"
           }`}
           title="Add project"
         >
           <PlusIcon />
-          {expanded && <span className="text-xs text-text-muted">New Project</span>}
+          {isExpanded && <span className="text-xs text-text-muted">New Project</span>}
         </Link>
       </div>
 
@@ -572,11 +588,11 @@ export default function Sidebar() {
       )}
 
       {/* Divider */}
-      <div className={`h-px bg-border my-2 ${expanded ? "" : "w-6 self-center"}`} />
+      <div className={`h-px bg-border my-2 ${isExpanded ? "" : "w-6 self-center"}`} />
 
       {/* Backend status indicator */}
       {backendStatus !== "online" && (
-        <div className={`mb-2 relative group ${expanded ? "px-2" : "self-center"}`}>
+        <div className={`mb-2 relative group ${isExpanded ? "px-2" : "self-center"}`}>
           <div className="flex items-center gap-2">
             <div
               className={`w-3 h-3 shrink-0 rounded-full ${
@@ -585,13 +601,13 @@ export default function Sidebar() {
                   : "bg-green-500"
               }`}
             />
-            {expanded && (
+            {isExpanded && (
               <span className="text-xs text-text-muted">
                 {backendStatus === "offline" ? "Backend offline" : "Reconnected"}
               </span>
             )}
           </div>
-          {!expanded && (
+          {!isExpanded && (
             <div className="fixed left-16 ml-2 px-2 py-1 bg-bg-surface border border-border text-xs whitespace-nowrap z-50 hidden group-hover:block"
               style={{ transform: "translateY(-50%)", top: "auto" }}
             >
@@ -603,24 +619,11 @@ export default function Sidebar() {
         </div>
       )}
 
-      {/* #524: expand/collapse toggle — moved to bottom, larger + bordered */}
-      <button
-        onClick={toggleExpanded}
-        className={`flex shrink-0 items-center justify-center w-10 h-10 rounded-sm border border-border text-text-muted hover:text-accent hover:border-accent/50 transition-colors ${
-          expanded ? "self-end" : "self-center"
-        }`}
-        title={expanded ? "Collapse sidebar" : "Expand sidebar"}
-      >
-        {expanded ? <CollapseIcon /> : <ExpandIcon />}
-      </button>
-
-      <div className="h-1" />
-
       {/* Settings */}
       <Link
         href="/settings"
         className={`flex items-center gap-2 rounded-sm transition-colors ${
-          expanded ? "px-2 py-2" : "w-10 h-10 justify-center self-center"
+          isExpanded ? "px-2 py-2" : "w-10 h-10 justify-center self-center"
         } ${
           isSettings
             ? "text-accent"
@@ -629,14 +632,71 @@ export default function Sidebar() {
         title="Settings"
       >
         <GearIcon />
-        {expanded && <span className="text-xs">Settings</span>}
+        {isExpanded && <span className="text-xs">Settings</span>}
       </Link>
 
       {version && (
-        <div className={`text-[10px] text-text-muted/40 ${expanded ? "px-3" : "text-center"} pt-2`}>
+        <div className={`text-[10px] text-text-muted/40 ${isExpanded ? "px-3" : "text-center"} pt-2`}>
           v{version}
         </div>
       )}
-    </aside>
+    </>
+  );
+
+  return (
+    <>
+      {/* Mobile hamburger button — fixed below the top header, only below lg */}
+      <button
+        type="button"
+        onClick={() => setMobileOpen(true)}
+        className="fixed top-14 left-2 z-30 lg:hidden w-10 h-10 flex items-center justify-center bg-bg-surface border border-border text-text-muted hover:text-accent"
+      >
+        <HamburgerIcon />
+      </button>
+
+      {/* Mobile overlay backdrop */}
+      {mobileOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/50 lg:hidden"
+          onClick={() => setMobileOpen(false)}
+        />
+      )}
+
+      {/* Mobile overlay sidebar — always expanded, slides in from left */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 w-52 bg-bg-surface border-r border-border flex flex-col py-3 px-2 items-stretch overflow-y-auto transition-transform duration-200 ease-in-out lg:hidden ${
+          mobileOpen ? "translate-x-0" : "-translate-x-full"
+        }`}
+      >
+        <button
+          type="button"
+          onClick={() => setMobileOpen(false)}
+          className="self-end shrink-0 w-10 h-10 flex items-center justify-center text-text-muted hover:text-accent mb-1"
+        >
+          <CloseXIcon />
+        </button>
+        {renderSidebarBody(true)}
+      </aside>
+
+      {/* Desktop permanent sidebar — hidden below lg */}
+      <aside
+        className={`hidden lg:flex shrink-0 h-full border-r border-border bg-bg-surface flex-col py-3 transition-[width] duration-200 ease-in-out overflow-hidden ${
+          expanded ? "w-52 items-stretch px-2" : "w-16 items-center"
+        }`}
+      >
+        {renderSidebarBody(expanded)}
+        <div className="h-1" />
+        {/* #524: expand/collapse toggle — bottom, larger + bordered */}
+        <button
+          onClick={toggleExpanded}
+          className={`flex shrink-0 items-center justify-center w-10 h-10 rounded-sm border border-border text-text-muted hover:text-accent hover:border-accent/50 transition-colors ${
+            expanded ? "self-end" : "self-center"
+          }`}
+          title={expanded ? "Collapse sidebar" : "Expand sidebar"}
+        >
+          {expanded ? <CollapseIcon /> : <ExpandIcon />}
+        </button>
+      </aside>
+    </>
   );
 }
