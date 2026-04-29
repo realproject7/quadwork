@@ -296,7 +296,8 @@ auth_basic $auth_ok;
 auth_basic_user_file /etc/nginx/.htpasswd;
 
 # Set cookie after successful auth (24h expiry)
-add_header Set-Cookie "qw_auth=authenticated; Path=/; Max-Age=86400; HttpOnly; Secure" always;
+# Do NOT use "always" — it would set the cookie on 401 responses too
+add_header Set-Cookie "qw_auth=authenticated; Path=/; Max-Age=86400; HttpOnly; Secure";
 ```
 
 **How it works:**
