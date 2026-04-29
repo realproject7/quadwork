@@ -416,7 +416,7 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
       <div
         ref={listRef}
         onScroll={handleScroll}
-        className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-0.5"
+        className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain px-3 py-2 space-y-0.5"
       >
         {!loaded && messages.length === 0 && (
           <div className="flex items-center justify-center h-full">

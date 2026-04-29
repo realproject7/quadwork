@@ -216,7 +216,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       `}</style>
       <div className="qw-dashboard flex flex-col w-full h-full overflow-y-auto">
         {/* Q1: AgentChattr chat — primary interface */}
-        <div className="flex flex-col overflow-hidden border-2 border-accent min-h-[60vh] lg:min-h-0">
+        <div className="flex flex-col overflow-hidden border-2 border-accent h-[60vh] shrink-0 lg:h-auto lg:shrink lg:min-h-0">
           <PanelHeader label={t.chatLabel} tooltip={
             <InfoTooltip>
               {t.chatTooltip}
@@ -264,7 +264,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         />
 
         {/* Q3: GitHub panel */}
-        <div className="flex flex-col overflow-hidden border-t border-border lg:border-t-0">
+        <div className="flex flex-col overflow-hidden border-t border-border lg:border-t-0 min-h-[40vh] shrink-0 lg:min-h-0 lg:shrink">
           <PanelHeader label={t.githubLabel} tooltip={
             <InfoTooltip>
               {t.githubTooltip}
