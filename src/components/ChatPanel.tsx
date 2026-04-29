@@ -353,12 +353,17 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
 
   const sendPreset = useCallback((message: string) => {
     if (sending) return;
+    // Apply same routing normalization as send(): prepend @head if no
+    // agent mention or slash command at the start.
+    const STARTS_WITH_AGENT_RE = /^@(head|dev|re1|re2)\b/i;
+    const startsWithSlash = message.startsWith("/");
+    const text = (startsWithSlash || STARTS_WITH_AGENT_RE.test(message)) ? message : `@head ${message}`;
     setSending(true);
     setSendError(null);
     fetch(`/api/chat${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: message, channel, sender: "user" }),
+      body: JSON.stringify({ text, channel, sender: "user" }),
     })
       .then((r) => {
         if (!r.ok) throw new Error(`Send failed: ${r.status}`);
