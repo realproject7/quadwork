@@ -1169,6 +1169,8 @@ async function handleAgentChattr(req, res) {
       const pullResult = execFileSync("git", ["pull"], { cwd: acDir, encoding: "utf-8", timeout: 30000, stdio: "pipe" }).trim();
       // #388: re-apply sender-overflow CSS patch after git pull
       patchAgentchattrCss(acDir);
+      // #629: re-apply crash timeout patch after git pull (pull may revert app.py)
+      patchCrashTimeout(acDir);
       const venvPython = path.join(acDir, ".venv", "bin", "python");
       let pipResult = "";
       const reqFile = path.join(acDir, "requirements.txt");
@@ -2561,18 +2563,24 @@ server.listen(PORT, "127.0.0.1", async () => {
   }
   // #629: restart AC for projects where idle-fix patched the on-disk file
   // so the running Python process picks up _CRASH_TIMEOUT = 120.
+  // Use port-alive check instead of chattrProcesses — AC may be running
+  // from a previous QuadWork instance (tracked with process: null).
   if (startupCfg._acRestartNeeded) {
     for (const projectId of startupCfg._acRestartNeeded) {
-      const proc = chattrProcesses.get(projectId);
-      if (!proc || !proc.process) continue;
-      console.log(`[idle-fix] ${projectId}: restarting AC so running process observes _CRASH_TIMEOUT = 120 (#629)`);
-      fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(projectId)}/restart`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "restart" }),
+      const { url } = resolveProjectChattr(projectId);
+      const portMatch = url.match(/:(\d+)/);
+      const port = portMatch ? parseInt(portMatch[1], 10) : 8300;
+      isPortAlive(port).then((alive) => {
+        if (!alive) return;
+        console.log(`[idle-fix] ${projectId}: restarting AC (port ${port}) so running process observes _CRASH_TIMEOUT = 120 (#629)`);
+        return fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(projectId)}/restart`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "restart" }),
+        });
       }).then((r) => {
-        if (r.ok) console.log(`[idle-fix] ${projectId}: AC restarted successfully`);
-        else console.warn(`[idle-fix] ${projectId}: AC restart returned ${r.status}`);
+        if (r && r.ok) console.log(`[idle-fix] ${projectId}: AC restarted successfully`);
+        else if (r) console.warn(`[idle-fix] ${projectId}: AC restart returned ${r.status}`);
       }).catch((err) => {
         console.warn(`[idle-fix] ${projectId}: AC restart failed: ${err.message}`);
       });
