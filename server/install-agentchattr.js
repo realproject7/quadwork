@@ -195,6 +195,8 @@ function _installAgentChattrLocked(dir, setError) {
   }
   // #388: patch sender-column overflow CSS after clone/install
   patchAgentchattrCss(dir);
+  // #629: patch crash timeout before AC's first import
+  patchCrashTimeout(dir);
   return dir;
 }
 
@@ -260,10 +262,36 @@ function patchAgentchattrCss(dir) {
   }
 }
 
+/**
+ * #629: Patch AC's crash timeout from 15s to 120s.
+ * Must run at clone time (before any `python run.py`) so the first
+ * AC process imports the patched value. Idempotent.
+ */
+function patchCrashTimeout(dir) {
+  if (!dir) return;
+  const appPath = path.join(dir, "app.py");
+  if (!fs.existsSync(appPath)) return;
+  try {
+    let app = fs.readFileSync(appPath, "utf-8");
+    if (app.includes("_CRASH_TIMEOUT = 15")) {
+      app = app.replace("_CRASH_TIMEOUT = 15", "_CRASH_TIMEOUT = 120");
+      app = app.replace(
+        "# Crash timeout: if a wrapper hasn't heartbeated for 60s,\n",
+        "# Crash timeout: if a wrapper hasn't heartbeated for 120s,\n",
+      );
+      fs.writeFileSync(appPath, app);
+      console.log(`[idle-fix] ${path.basename(path.dirname(dir)) || dir}: patched crash timeout to 120s at clone time (#629)`);
+    }
+  } catch (err) {
+    console.warn(`[idle-fix] failed to patch crash timeout in ${appPath}: ${err.message}`);
+  }
+}
+
 module.exports = {
   AGENTCHATTR_REPO,
   findAgentChattr,
   installAgentChattr,
   chattrSpawnArgs,
   patchAgentchattrCss,
+  patchCrashTimeout,
 };
