@@ -1394,26 +1394,26 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
 function spawnButlerPty() {
   if (butlerSession.term) return { ok: true, pid: butlerSession.term.pid };
 
-  const docsDir = path.join(os.homedir(), "docs");
-  if (!fs.existsSync(docsDir)) {
-    fs.mkdirSync(docsDir, { recursive: true, mode: 0o700 });
-  }
-
-  const cfg = readConfig();
-  const butlerCfg = cfg.butler || {};
-  const command = butlerCfg.command || "claude";
-  const args = [];
-  if (butlerCfg.auto_approve) args.push("--dangerously-skip-permissions");
-
-  const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.AGENTS.md");
-  if (fs.existsSync(seedPath)) {
-    const agentsPath = path.join(docsDir, "AGENTS.md");
-    if (!fs.existsSync(agentsPath)) {
-      fs.copyFileSync(seedPath, agentsPath);
-    }
-  }
-
   try {
+    const docsDir = path.join(os.homedir(), "docs");
+    if (!fs.existsSync(docsDir)) {
+      fs.mkdirSync(docsDir, { recursive: true, mode: 0o700 });
+    }
+
+    const cfg = readConfig();
+    const butlerCfg = cfg.butler || {};
+    const command = butlerCfg.command || "claude";
+    const args = [];
+    if (butlerCfg.auto_approve) args.push("--dangerously-skip-permissions");
+
+    const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.AGENTS.md");
+    if (fs.existsSync(seedPath)) {
+      const agentsPath = path.join(docsDir, "AGENTS.md");
+      if (!fs.existsSync(agentsPath)) {
+        fs.copyFileSync(seedPath, agentsPath);
+      }
+    }
+
     const term = pty.spawn(command, args, {
       name: "xterm-256color",
       cols: 120,
