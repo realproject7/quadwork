@@ -320,9 +320,31 @@ function _installAgentChattrLocked(dir, setError) {
       if (pipResult === null) return setError(`pip install -r ${reqFile} failed`);
     }
   }
+  // #629: patch crash timeout before AC's first import
+  _patchCrashTimeout(dir);
   return dir;
 }
 installAgentChattr.lastError = null;
+
+function _patchCrashTimeout(dir) {
+  if (!dir) return;
+  const appPath = path.join(dir, "app.py");
+  if (!fs.existsSync(appPath)) return;
+  try {
+    let app = fs.readFileSync(appPath, "utf-8");
+    if (app.includes("_CRASH_TIMEOUT = 15")) {
+      app = app.replace("_CRASH_TIMEOUT = 15", "_CRASH_TIMEOUT = 120");
+      app = app.replace(
+        "# Crash timeout: if a wrapper hasn't heartbeated for 60s,\n",
+        "# Crash timeout: if a wrapper hasn't heartbeated for 120s,\n",
+      );
+      fs.writeFileSync(appPath, app);
+      log("[idle-fix] patched crash timeout to 120s at clone time (#629)");
+    }
+  } catch (err) {
+    try { console.warn(`[idle-fix] failed to patch crash timeout: ${err.message}`); } catch {}
+  }
+}
 
 /**
  * Get spawn args for launching AgentChattr from its cloned directory.

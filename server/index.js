@@ -14,7 +14,7 @@ const {
   projectAgentchattrConfigPath,
 } = routes;
 const { waitForAgentChattrReady, registerAgent, registerAgentWithRetry, deregisterAgent, startHeartbeat, stopHeartbeat } = require("./agentchattr-registry");
-const { patchAgentchattrCss } = require("./install-agentchattr");
+const { patchAgentchattrCss, patchCrashTimeout } = require("./install-agentchattr");
 const { startQueueWatcher, stopQueueWatcher } = require("./queue-watcher");
 
 const net = require("net");
@@ -1169,6 +1169,8 @@ async function handleAgentChattr(req, res) {
       const pullResult = execFileSync("git", ["pull"], { cwd: acDir, encoding: "utf-8", timeout: 30000, stdio: "pipe" }).trim();
       // #388: re-apply sender-overflow CSS patch after git pull
       patchAgentchattrCss(acDir);
+      // #629: re-apply crash timeout patch after git pull (pull may revert app.py)
+      patchCrashTimeout(acDir);
       const venvPython = path.join(acDir, ".venv", "bin", "python");
       let pipResult = "";
       const reqFile = path.join(acDir, "requirements.txt");
@@ -2506,22 +2508,19 @@ server.listen(PORT, "127.0.0.1", async () => {
         console.warn(`[ghost-fix] ${p.id}: failed to patch app.py: ${err.message}`);
       }
     }
-    // #502: increase crash timeout from 15s to 120s for idle agent tolerance
+    // #502 + #629: increase crash timeout from 15s to 120s.
+    // Uses the shared patchCrashTimeout() from install-agentchattr.js.
+    // For existing installs where AC is already running, the on-disk
+    // patch alone is useless (Python caches module-level values at import).
+    // Flag the project for AC restart so the running process picks it up.
     if (fs.existsSync(appPath)) {
       try {
-        let app = fs.readFileSync(appPath, "utf-8");
+        const app = fs.readFileSync(appPath, "utf-8");
         if (app.includes("_CRASH_TIMEOUT = 15")) {
-          app = app.replace(
-            "_CRASH_TIMEOUT = 15",
-            "_CRASH_TIMEOUT = 120",
-          );
-          // Fix the misleading comment too
-          app = app.replace(
-            "# Crash timeout: if a wrapper hasn't heartbeated for 60s,\n",
-            "# Crash timeout: if a wrapper hasn't heartbeated for 120s,\n",
-          );
-          fs.writeFileSync(appPath, app);
-          console.log(`[idle-fix] ${p.id}: increased crash timeout to 120s (#502)`);
+          patchCrashTimeout(acDir);
+          console.log(`[idle-fix] ${p.id}: crash timeout patched on disk — AC restart required for running process to observe it (#629)`);
+          if (!startupCfg._acRestartNeeded) startupCfg._acRestartNeeded = [];
+          startupCfg._acRestartNeeded.push(p.id);
         }
       } catch (err) {
         console.warn(`[idle-fix] ${p.id}: failed to patch app.py crash timeout: ${err.message}`);
@@ -2560,6 +2559,31 @@ server.listen(PORT, "127.0.0.1", async () => {
       }
     } catch (err) {
       console.warn(`[#596] ${p.id}: config.toml migration failed: ${err.message}`);
+    }
+  }
+  // #629: restart AC for projects where idle-fix patched the on-disk file
+  // so the running Python process picks up _CRASH_TIMEOUT = 120.
+  // Use port-alive check instead of chattrProcesses — AC may be running
+  // from a previous QuadWork instance (tracked with process: null).
+  if (startupCfg._acRestartNeeded) {
+    for (const projectId of startupCfg._acRestartNeeded) {
+      const { url } = resolveProjectChattr(projectId);
+      const portMatch = url.match(/:(\d+)/);
+      const port = portMatch ? parseInt(portMatch[1], 10) : 8300;
+      isPortAlive(port).then((alive) => {
+        if (!alive) return;
+        console.log(`[idle-fix] ${projectId}: restarting AC (port ${port}) so running process observes _CRASH_TIMEOUT = 120 (#629)`);
+        return fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(projectId)}/restart`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "restart" }),
+        });
+      }).then((r) => {
+        if (r && r.ok) console.log(`[idle-fix] ${projectId}: AC restarted successfully`);
+        else if (r) console.warn(`[idle-fix] ${projectId}: AC restart returned ${r.status}`);
+      }).catch((err) => {
+        console.warn(`[idle-fix] ${projectId}: AC restart failed: ${err.message}`);
+      });
     }
   }
   // #416: start the AC health monitor
