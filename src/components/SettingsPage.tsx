@@ -29,6 +29,14 @@ interface ProjectConfig {
   archived?: boolean;
 }
 
+interface ButlerConfig {
+  enabled?: boolean;
+  command?: string;
+  model?: string;
+  auto_start?: boolean;
+  cwd?: string;
+}
+
 interface Config {
   port: number;
   agentchattr_url: string;
@@ -39,6 +47,7 @@ interface Config {
   // dashboard-originated messages. Defaults to "user" server-side.
   operator_name?: string;
   projects: ProjectConfig[];
+  butler?: ButlerConfig;
 }
 
 const DEFAULT_AGENTS: Record<string, AgentConfig> = {
@@ -127,6 +136,16 @@ const COPY = {
     restore: "Restore",
     confirmRemove: "Confirm Remove",
     newProject: "New Project",
+    butlerAgent: "Butler Agent",
+    butlerEnabled: "Enabled",
+    butlerDisabled: "Disabled",
+    butlerCli: "CLI",
+    butlerModel: "Model",
+    butlerAutoStart: "Auto-start on boot",
+    butlerCwd: "Working directory",
+    butlerHelp: "Butler is a cross-project operator assistant that runs in ~/docs/. It helps manage tickets, proposals, reviews, and releases across all projects.",
+    enable: "Enable",
+    disable: "Disable",
   },
   ko: {
     loading: "로딩 중...",
@@ -200,6 +219,16 @@ const COPY = {
     restore: "복원",
     confirmRemove: "제거 확인",
     newProject: "새 프로젝트",
+    butlerAgent: "버틀러 에이전트",
+    butlerEnabled: "활성",
+    butlerDisabled: "비활성",
+    butlerCli: "CLI",
+    butlerModel: "모델",
+    butlerAutoStart: "서버 시작 시 자동 실행",
+    butlerCwd: "작업 디렉터리",
+    butlerHelp: "버틀러는 ~/docs/에서 실행되는 크로스 프로젝트 운영자 어시스턴트입니다. 모든 프로젝트의 티켓, 제안서, 리뷰, 릴리스 관리를 지원합니다.",
+    enable: "활성화",
+    disable: "비활성화",
   },
 } as const;
 
@@ -304,6 +333,7 @@ export default function SettingsPage() {
         reviewer_github_user: data.reviewer_github_user || "",
         operator_name: data.operator_name || "user",
         projects: data.projects || [],
+        butler: data.butler || {},
         });
       })
       .catch(() => {});
@@ -326,6 +356,8 @@ export default function SettingsPage() {
   const [reviewerTokenSaving, setReviewerTokenSaving] = useState(false);
   const [keepAwakeActive, setKeepAwakeActive] = useState(false);
   const [keepAwakeBusy, setKeepAwakeBusy] = useState(false);
+  const [butlerRunning, setButlerRunning] = useState(false);
+  const [butlerBusy, setButlerBusy] = useState(false);
 
   const refreshReviewerTokenStatus = useCallback(() => {
     fetch("/api/setup/reviewer-token-status")
@@ -341,10 +373,18 @@ export default function SettingsPage() {
       .catch(() => {});
   }, []);
 
+  const refreshButlerStatus = useCallback(() => {
+    fetch("/api/butler/status")
+      .then((r) => (r.ok ? r.json() : { running: false }))
+      .then((d) => setButlerRunning(!!d.running))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     refreshReviewerTokenStatus();
     refreshKeepAwake();
-  }, [refreshReviewerTokenStatus, refreshKeepAwake]);
+    refreshButlerStatus();
+  }, [refreshReviewerTokenStatus, refreshKeepAwake, refreshButlerStatus]);
 
   const saveReviewerToken = async () => {
     if (!reviewerTokenInput.trim()) return;
@@ -376,6 +416,29 @@ export default function SettingsPage() {
       if (r.ok) refreshKeepAwake();
     } finally {
       setKeepAwakeBusy(false);
+    }
+  };
+
+  const updateButler = (updates: Partial<ButlerConfig>) => {
+    if (!config) return;
+    setConfig({ ...config, butler: { ...config.butler, ...updates } });
+  };
+
+  const toggleButler = async () => {
+    setButlerBusy(true);
+    try {
+      const stopping = butlerRunning;
+      const url = stopping ? "/api/butler/stop" : "/api/butler/start";
+      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      if (r.ok) {
+        const data = await r.json();
+        if (stopping || data.ok) {
+          refreshButlerStatus();
+          updateButler({ enabled: !stopping });
+        }
+      }
+    } finally {
+      setButlerBusy(false);
     }
   };
 
@@ -690,6 +753,57 @@ export default function SettingsPage() {
           <span className="text-[10px] text-text-muted">
             {t.keepAwakeHelp}
           </span>
+        </div>
+      </section>
+
+      {/* Butler Agent (#632) */}
+      <section className="mb-8">
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.butlerAgent}</h2>
+        <div className="border border-border p-3 space-y-3">
+          <div className="flex items-center gap-3">
+            <span className={`w-1.5 h-1.5 rounded-full ${butlerRunning ? "bg-accent" : "bg-text-muted"}`} />
+            <span className="text-[11px] text-text">{butlerRunning ? t.butlerEnabled : t.butlerDisabled}</span>
+            <button
+              onClick={toggleButler}
+              disabled={butlerBusy}
+              className="px-2 py-1 text-[11px] border border-border text-text-muted hover:text-text hover:border-accent disabled:opacity-50 transition-colors"
+            >
+              {butlerBusy ? "…" : butlerRunning ? t.disable : t.enable}
+            </button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <Select
+              label={t.butlerCli}
+              value={config.butler?.command || "claude"}
+              onChange={(v) => updateButler({ command: v })}
+              options={BACKENDS.map((b) => ({
+                value: b.value,
+                label: b.label + (cliStatus && !cliStatus[b.value as keyof typeof cliStatus] ? " (not installed)" : ""),
+              }))}
+            />
+            <Select
+              label={t.butlerModel}
+              value={config.butler?.model || "opus"}
+              onChange={(v) => updateButler({ model: v })}
+              options={MODELS.map((m) => ({ value: m, label: m }))}
+            />
+            <Input
+              label={t.butlerCwd}
+              value={config.butler?.cwd || "~/docs/"}
+              onChange={(v) => updateButler({ cwd: v })}
+              placeholder="~/docs/"
+            />
+          </div>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={config.butler?.auto_start ?? false}
+              onChange={(e) => updateButler({ auto_start: e.target.checked })}
+              className="accent-accent"
+            />
+            <span className="text-[11px] text-text">{t.butlerAutoStart}</span>
+          </label>
+          <p className="text-[10px] text-text-muted leading-snug">{t.butlerHelp}</p>
         </div>
       </section>
 

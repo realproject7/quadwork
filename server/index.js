@@ -1395,15 +1395,17 @@ function spawnButlerPty() {
   if (butlerSession.term) return { ok: true, pid: butlerSession.term.pid };
 
   try {
-    const docsDir = path.join(os.homedir(), "docs");
+    const cfg = readConfig();
+    const butlerCfg = cfg.butler || {};
+    const cwdRaw = butlerCfg.cwd || "~/docs/";
+    const docsDir = cwdRaw.startsWith("~/") ? path.join(os.homedir(), cwdRaw.slice(2)) : cwdRaw;
     if (!fs.existsSync(docsDir)) {
       fs.mkdirSync(docsDir, { recursive: true, mode: 0o700 });
     }
 
-    const cfg = readConfig();
-    const butlerCfg = cfg.butler || {};
     const command = butlerCfg.command || "claude";
     const args = [];
+    if (butlerCfg.model) args.push("--model", butlerCfg.model);
     if (butlerCfg.auto_approve) args.push("--dangerously-skip-permissions");
 
     const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.AGENTS.md");
@@ -2766,8 +2768,8 @@ server.listen(PORT, "127.0.0.1", async () => {
       });
     }
   }
-  // #631: auto-start Butler if configured
-  if (startupCfg.butler && startupCfg.butler.enabled) {
+  // #631 + #632: auto-start Butler if enabled + auto_start
+  if (startupCfg.butler && startupCfg.butler.enabled && startupCfg.butler.auto_start) {
     const result = spawnButlerPty();
     if (result.ok) console.log(`[butler] auto-started (PID: ${result.pid})`);
     else console.warn(`[butler] auto-start failed: ${result.error}`);
