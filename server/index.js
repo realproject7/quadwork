@@ -154,6 +154,9 @@ const agentSessions = new Map();
 // AgentChattr server processes — per-project (key = projectId)
 const chattrProcesses = new Map();
 
+// #631: Butler session — single global PTY (not per-project, no AC integration)
+let butlerSession = { term: null, ws: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
+
 // --- MCP auth proxy for Codex (can't pass headers via -c flag) ---
 // Maps "project/agent" → { server, port }
 const mcpProxies = new Map();
@@ -1386,6 +1389,104 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
   }
 });
 
+// --- Butler agent (#631) ---
+
+function spawnButlerPty() {
+  if (butlerSession.term) return { ok: true, pid: butlerSession.term.pid };
+
+  const docsDir = path.join(os.homedir(), "docs");
+  if (!fs.existsSync(docsDir)) {
+    fs.mkdirSync(docsDir, { recursive: true, mode: 0o700 });
+  }
+
+  const cfg = readConfig();
+  const butlerCfg = cfg.butler || {};
+  const command = butlerCfg.command || "claude";
+  const args = [];
+  if (butlerCfg.auto_approve) args.push("--dangerously-skip-permissions");
+
+  const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.AGENTS.md");
+  if (fs.existsSync(seedPath)) {
+    const agentsPath = path.join(docsDir, "AGENTS.md");
+    if (!fs.existsSync(agentsPath)) {
+      fs.copyFileSync(seedPath, agentsPath);
+    }
+  }
+
+  try {
+    const term = pty.spawn(command, args, {
+      name: "xterm-256color",
+      cols: 120,
+      rows: 30,
+      cwd: docsDir,
+      env: { ...process.env },
+    });
+
+    butlerSession = {
+      term,
+      ws: null,
+      state: "running",
+      error: null,
+      scrollback: Buffer.alloc(0),
+    };
+
+    const SCROLLBACK_SIZE = 64 * 1024;
+    term.onData((data) => {
+      const chunk = Buffer.from(data);
+      butlerSession.scrollback = Buffer.concat([butlerSession.scrollback, chunk]);
+      if (butlerSession.scrollback.length > SCROLLBACK_SIZE) {
+        butlerSession.scrollback = butlerSession.scrollback.slice(-SCROLLBACK_SIZE);
+      }
+    });
+
+    term.onExit(({ exitCode }) => {
+      if (butlerSession.term === term) {
+        butlerSession.state = "stopped";
+        butlerSession.error = exitCode ? `exit:${exitCode}` : null;
+        butlerSession.term = null;
+        if (butlerSession.ws && butlerSession.ws.readyState <= 1) {
+          butlerSession.ws.close(1000, `exited:${exitCode}`);
+        }
+        butlerSession.ws = null;
+      }
+    });
+
+    console.log(`[butler] spawned (PID: ${term.pid}, cwd: ${docsDir})`);
+    return { ok: true, pid: term.pid };
+  } catch (err) {
+    butlerSession = { term: null, ws: null, state: "error", error: err.message, scrollback: Buffer.alloc(0) };
+    return { ok: false, error: err.message };
+  }
+}
+
+function stopButlerPty() {
+  if (butlerSession.term) {
+    try { butlerSession.term.kill(); } catch {}
+    butlerSession.term = null;
+  }
+  if (butlerSession.ws && butlerSession.ws.readyState <= 1) {
+    butlerSession.ws.close(1000, "stopped");
+  }
+  butlerSession = { term: null, ws: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
+}
+
+app.post("/api/butler/start", (_req, res) => {
+  const result = spawnButlerPty();
+  res.json(result);
+});
+
+app.post("/api/butler/stop", (_req, res) => {
+  stopButlerPty();
+  res.json({ ok: true });
+});
+
+app.get("/api/butler/status", (_req, res) => {
+  res.json({
+    running: butlerSession.state === "running" && !!butlerSession.term,
+    pid: butlerSession.term ? butlerSession.term.pid : null,
+  });
+});
+
 // --- Scheduled Triggers ---
 
 const triggers = new Map();
@@ -1915,6 +2016,64 @@ wss.on("connection", async (ws, req) => {
     // Only clear ws reference, don't kill PTY (it stays running for reconnect)
     if (session.ws === ws) {
       session.ws = null;
+    }
+  });
+});
+
+// --- Butler WebSocket (#631) ---
+const wssButler = new WebSocketServer({ server, path: "/ws/butler" });
+
+wssButler.on("connection", async (ws) => {
+  if (!butlerSession.term) {
+    const result = spawnButlerPty();
+    if (!result.ok) {
+      ws.close(1011, "pty-spawn-failed");
+      return;
+    }
+  }
+
+  if (butlerSession.ws && butlerSession.ws !== ws && butlerSession.ws.readyState <= 1) {
+    butlerSession.ws.close(1000, "replaced");
+  }
+
+  butlerSession.ws = ws;
+
+  const dataHandler = butlerSession.term.onData((data) => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(scrubSecrets(data));
+    }
+  });
+
+  ws.on("message", (msg) => {
+    if (!butlerSession.term) return;
+    const str = msg.toString();
+    try {
+      const parsed = JSON.parse(str);
+      if (parsed.type === "resize") {
+        if (typeof parsed.cols === "number" && typeof parsed.rows === "number" &&
+            Number.isFinite(parsed.cols) && Number.isFinite(parsed.rows) &&
+            parsed.cols >= 1 && parsed.cols <= 500 &&
+            parsed.rows >= 1 && parsed.rows <= 500) {
+          butlerSession.term.resize(parsed.cols, parsed.rows);
+        }
+        return;
+      }
+      if (parsed.type === "replay") {
+        if (butlerSession.scrollback && butlerSession.scrollback.length > 0) {
+          ws.send(scrubScrollback(butlerSession.scrollback));
+        } else {
+          ws.send(`\x1b[2m[butler online — waiting for input]\x1b[0m\r\n`);
+        }
+        return;
+      }
+    } catch {}
+    butlerSession.term.write(str);
+  });
+
+  ws.on("close", () => {
+    dataHandler.dispose();
+    if (butlerSession.ws === ws) {
+      butlerSession.ws = null;
     }
   });
 });
@@ -2586,6 +2745,12 @@ server.listen(PORT, "127.0.0.1", async () => {
       });
     }
   }
+  // #631: auto-start Butler if configured
+  if (startupCfg.butler && startupCfg.butler.enabled) {
+    const result = spawnButlerPty();
+    if (result.ok) console.log(`[butler] auto-started (PID: ${result.pid})`);
+    else console.warn(`[butler] auto-start failed: ${result.error}`);
+  }
   // #416: start the AC health monitor
   startAcHealthMonitor();
 });
@@ -2607,6 +2772,8 @@ function shutdownChattrProcesses() {
     }
   }
   chattrProcesses.clear();
+  // #631: stop Butler PTY on shutdown
+  stopButlerPty();
 }
 
 module.exports = { shutdownChattrProcesses };
