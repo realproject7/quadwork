@@ -1414,6 +1414,27 @@ function spawnButlerPty() {
       }
     }
 
+    // #635: seed README.md explaining ~/docs/ folder purpose
+    const readmePath = path.join(docsDir, "README.md");
+    if (!fs.existsSync(readmePath)) {
+      fs.writeFileSync(readmePath, [
+        "# ~/docs/",
+        "",
+        "Butler's working directory — cross-project operator notes and artifacts.",
+        "Not git-tracked; operator-local.",
+        "",
+        "## File types",
+        "",
+        "| Prefix | Purpose |",
+        "|--------|---------|",
+        "| `PROPOSAL-<name>.md` | Feature proposals with phases and operator gates |",
+        "| `REVIEW-<batch>.md` | PR review summaries |",
+        "| `INFO-<topic>.md` | Research notes |",
+        "| `PROGRESS-<project>.md` | Per-project progress (one file per project) |",
+        "",
+      ].join("\n"));
+    }
+
     const term = pty.spawn(command, args, {
       name: "xterm-256color",
       cols: 120,
