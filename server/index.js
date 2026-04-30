@@ -1953,9 +1953,24 @@ const { scrubSecrets, scrubScrollback } = require("./scrub-secrets");
 // WS connects to an existing PTY session (started via lifecycle API)
 // or spawns a new one if none exists.
 
-const wss = new WebSocketServer({ server, path: "/ws/terminal" });
+const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", async (ws, req) => {
+server.on("upgrade", (req, socket, head) => {
+  const pathname = new URL(req.url, "http://localhost").pathname;
+  if (pathname === "/ws/terminal") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection:terminal", ws, req);
+    });
+  } else if (pathname === "/ws/butler") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection:butler", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on("connection:terminal", async (ws, req) => {
   const params = new URL(req.url, `http://localhost:${PORT}`).searchParams;
   const projectId = params.get("project");
   const agentId = params.get("agent");
@@ -2044,9 +2059,8 @@ wss.on("connection", async (ws, req) => {
 });
 
 // --- Butler WebSocket (#631) ---
-const wssButler = new WebSocketServer({ server, path: "/ws/butler" });
 
-wssButler.on("connection", async (ws) => {
+wss.on("connection:butler", async (ws) => {
   if (!butlerSession.term) {
     const result = spawnButlerPty();
     if (!result.ok) {
