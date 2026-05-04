@@ -2634,15 +2634,7 @@ function runStartupMigrations(cfg) {
         fs.writeFileSync(acPath, tg.text);
         console.log(`[bridge-migrate] ${p.id}: migrated AC config slugs`);
         if (hadOldDc || hadOldTg) {
-          setTimeout(async () => {
-            try {
-              const r = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(p.id)}/restart`, { method: "POST" });
-              if (r.ok) console.log(`[bridge-migrate] ${p.id}: restarted AC`);
-              else console.warn(`[bridge-migrate] ${p.id}: AC restart returned ${r.status}`);
-            } catch (err) {
-              console.warn(`[bridge-migrate] ${p.id}: AC restart failed: ${err.message || err}`);
-            }
-          }, 3000);
+          if (!acRestartNeeded.includes(p.id)) acRestartNeeded.push(p.id);
         }
       }
     } catch {}
