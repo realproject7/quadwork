@@ -73,21 +73,22 @@ export default function AgentTerminalsGrid({ projectId, agentStates, onStatusCha
   const { locale } = useLocale();
   const t = COPY[locale];
   const [tipOpen, setTipOpen] = useState(false);
-  const [collapsed, setCollapsed] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return localStorage.getItem(STORAGE_KEY) === "true";
-  });
+  const [collapsed, setCollapsed] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
 
+  // Load saved preference after mount to avoid hydration mismatch
   useEffect(() => {
+    const saved = localStorage.getItem(STORAGE_KEY) === "true";
+    setCollapsed(saved);
+    setHydrated(true);
+  }, []);
+
+  // Persist to localStorage only after hydration
+  useEffect(() => {
+    if (!hydrated) return;
     localStorage.setItem(STORAGE_KEY, String(collapsed));
     onCollapsedChange?.(collapsed);
-  }, [collapsed, onCollapsedChange]);
-
-  // Notify parent of initial collapsed state on mount
-  useEffect(() => {
-    onCollapsedChange?.(collapsed);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [collapsed, hydrated, onCollapsedChange]);
 
   if (collapsed) {
     return (
