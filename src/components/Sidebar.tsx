@@ -160,7 +160,7 @@ function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onCo
               isActive
                 ? "border-2 border-accent text-accent"
                 : "border border-border text-text-muted hover:text-text"
-            }`}
+            } ${hasActiveBatch ? "animate-pulse-ring" : ""}`}
           >
             {project.name.slice(0, 2) || "?"}
           </div>
@@ -169,7 +169,6 @@ function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onCo
               <PinIcon size={8} />
             </div>
           )}
-          {hasActiveBatch && <div className="animate-orbit" />}
         </div>
         {expanded && (
           <span className={`text-xs truncate flex items-center gap-1 ${isActive ? "text-accent" : "text-text-muted"}`}>
