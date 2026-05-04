@@ -1325,7 +1325,11 @@ app.post("/api/full-reset", async (_req, res) => {
     console.log("[full-reset] stopping Butler...");
     stopButlerPty();
 
-    // 3. Restart each project's AC + agents via internal endpoint
+    // 3. Re-run startup migrations
+    console.log("[full-reset] running startup migrations...");
+    runStartupMigrations(cfg);
+
+    // 4. Restart each project's AC + agents
     let totalAgents = 0;
     const errors = [];
     for (const project of projects) {
@@ -1337,16 +1341,29 @@ app.post("/api/full-reset", async (_req, res) => {
         if (!acResp.ok) {
           const errData = await acResp.json().catch(() => ({}));
           errors.push(`${project.id}: AC restart failed — ${errData.error || acResp.status}`);
-        } else {
-          const agentIds = project.agents ? Object.keys(project.agents) : [];
-          totalAgents += agentIds.length;
+          continue;
         }
       } catch (err) {
-        errors.push(`${project.id}: ${err.message}`);
+        errors.push(`${project.id}: AC — ${err.message}`);
+        continue;
+      }
+      // Explicitly reset agents and await result
+      try {
+        const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(project.id)}/reset`, {
+          method: "POST",
+        });
+        const resetData = await resetResp.json();
+        if (resetData.ok) {
+          totalAgents += resetData.restarted;
+        } else {
+          errors.push(`${project.id}: agent reset failed`);
+        }
+      } catch (err) {
+        errors.push(`${project.id}: agent reset — ${err.message}`);
       }
     }
 
-    // 4. Restart Butler if enabled
+    // 5. Restart Butler if enabled
     if (cfg.butler?.enabled) {
       console.log("[full-reset] restarting Butler...");
       const result = spawnButlerPty();
@@ -2596,6 +2613,206 @@ function startAcHealthMonitor() {
   console.log("[health] AC health monitor started (30s interval, per-project 60s grace)");
 }
 
+// #657: extracted startup migrations so full-reset can re-run them
+function runStartupMigrations(cfg) {
+  const projects = (cfg.projects || []).filter((p) => !p.archived);
+  const acRestartNeeded = [];
+
+  // bridge-migrate
+  for (const p of projects) {
+    const acPath = projectAgentchattrConfigPath(p.id);
+    if (!fs.existsSync(acPath)) continue;
+    try {
+      const before = fs.readFileSync(acPath, "utf-8");
+      const hadOldDc = /^\[agents\.discord-bridge\]\s*$/m.test(before);
+      const hadOldTg = /^\[agents\.telegram-bridge\]\s*$/m.test(before);
+      const dc = patchAgentchattrConfigForDiscordBridge(before);
+      const tg = patchAgentchattrConfigForTelegramBridge(dc.text);
+      if (dc.changed || tg.changed) {
+        fs.writeFileSync(acPath, tg.text);
+        console.log(`[bridge-migrate] ${p.id}: migrated AC config slugs`);
+        if (hadOldDc || hadOldTg) {
+          setTimeout(async () => {
+            try {
+              const r = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(p.id)}/restart`, { method: "POST" });
+              if (r.ok) console.log(`[bridge-migrate] ${p.id}: restarted AC`);
+              else console.warn(`[bridge-migrate] ${p.id}: AC restart returned ${r.status}`);
+            } catch (err) {
+              console.warn(`[bridge-migrate] ${p.id}: AC restart failed: ${err.message || err}`);
+            }
+          }, 3000);
+        }
+      }
+    } catch {}
+  }
+
+  // bridge-refresh
+  const DISCORD_BRIDGE_SRC = path.join(__dirname, "..", "bridges", "discord", "discord_bridge.py");
+  const DISCORD_BRIDGE_DEST = path.join(os.homedir(), ".quadwork", "agentchattr-discord", "discord_bridge.py");
+  if (fs.existsSync(DISCORD_BRIDGE_SRC) && fs.existsSync(path.dirname(DISCORD_BRIDGE_DEST))) {
+    try {
+      fs.copyFileSync(DISCORD_BRIDGE_SRC, DISCORD_BRIDGE_DEST);
+      console.log("[bridge-refresh] refreshed Discord bridge script from package");
+    } catch (err) {
+      console.warn(`[bridge-refresh] failed to refresh Discord bridge script: ${err.message || err}`);
+    }
+  }
+
+  // bridge slug patches
+  const BRIDGE_SLUG_PATCHES = [
+    { file: path.join(os.homedir(), ".quadwork", "agentchattr-telegram", "telegram_bridge.py"), old: '"telegram-bridge"', replacement: '"tg"' },
+    { file: path.join(os.homedir(), ".quadwork", "agentchattr-discord", "discord_bridge.py"), old: '"discord-bridge"', replacement: '"dc"' },
+  ];
+  for (const { file, old, replacement } of BRIDGE_SLUG_PATCHES) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      const content = fs.readFileSync(file, "utf-8");
+      if (!content.includes(old)) continue;
+      fs.writeFileSync(file, content.replaceAll(old, replacement));
+      console.log(`[bridge-migrate] patched stale bridge_sender in ${path.basename(file)}`);
+    } catch {}
+  }
+
+  // reseed stale slugs
+  const SLUG_FIXES = [
+    [/@reviewer1/g, "@re1"], [/@reviewer2/g, "@re2"],
+    [/@t2a/g, "@re1"], [/@t2b/g, "@re2"],
+    [/@t1\b/g, "@head"], [/@t3\b/g, "@dev"],
+    [/\breviewer1\b/g, "re1"], [/\breviewer2\b/g, "re2"],
+  ];
+  for (const p of projects) {
+    if (!p.agents) continue;
+    for (const [agentId, agentCfg] of Object.entries(p.agents)) {
+      const wtDir = agentCfg.cwd;
+      if (!wtDir || !fs.existsSync(wtDir)) continue;
+      for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
+        const filePath = path.join(wtDir, filename);
+        if (!fs.existsSync(filePath)) continue;
+        try {
+          let content = fs.readFileSync(filePath, "utf-8");
+          let changed = false;
+          for (const [pattern, repl] of SLUG_FIXES) {
+            const before = content;
+            content = content.replace(pattern, repl);
+            if (content !== before) changed = true;
+          }
+          if (changed) {
+            fs.writeFileSync(filePath, content);
+            console.log(`[reseed] ${p.id}/${agentId}: fixed stale slugs in ${filename}`);
+          }
+        } catch (err) {
+          console.warn(`[reseed] ${p.id}/${agentId}: failed to patch ${filename}: ${err.message}`);
+        }
+      }
+    }
+  }
+
+  // ghost-fix + idle-fix
+  for (const p of projects) {
+    const acDir = resolveProjectChattr(p.id).dir;
+    const regPath = path.join(acDir, "registry.py");
+    if (fs.existsSync(regPath)) {
+      try {
+        let reg = fs.readFileSync(regPath, "utf-8");
+        if (!reg.includes("force: bool")) {
+          reg = reg.replace(
+            /def register\(self, base: str, label: str \| None = None\) -> dict \| None:/,
+            "def register(self, base: str, label: str | None = None, force: bool = False) -> dict | None:",
+          );
+          reg = reg.replace(
+            "            self._expire_reserved()\n\n            # Find next free slot",
+            "            self._expire_reserved()\n\n" +
+            "            # quadwork#478 + #502: force-replace\n" +
+            "            if force:\n" +
+            "                ghosts = [n for n, i in self._instances.items() if i.base == base]\n" +
+            "                for name in ghosts:\n" +
+            "                    del self._instances[name]\n" +
+            "                stale_reserved = [rn for rn in self._reserved\n" +
+            "                                  if self._parse_name(rn)[0] == base]\n" +
+            "                for rn in stale_reserved:\n" +
+            "                    del self._reserved[rn]\n\n" +
+            "            # Find next free slot",
+          );
+          fs.writeFileSync(regPath, reg);
+          console.log(`[ghost-fix] ${p.id}: patched registry.py with force-replace support`);
+        } else if (!reg.includes("stale_reserved")) {
+          reg = reg.replace(
+            /( +)for name in ghosts:\n\1    del self\._instances\[name\]\n\1    self\._reserved\[name\] = time\.time\(\)/,
+            "$1for name in ghosts:\n$1    del self._instances[name]\n" +
+            "$1stale_reserved = [rn for rn in self._reserved\n" +
+            "$1                  if self._parse_name(rn)[0] == base]\n" +
+            "$1for rn in stale_reserved:\n" +
+            "$1    del self._reserved[rn]",
+          );
+          fs.writeFileSync(regPath, reg);
+          console.log(`[ghost-fix] ${p.id}: upgraded registry.py force-replace to clear _reserved (#502)`);
+        }
+      } catch (err) {
+        console.warn(`[ghost-fix] ${p.id}: failed to patch registry.py: ${err.message}`);
+      }
+    }
+    const appPath = path.join(acDir, "app.py");
+    if (fs.existsSync(appPath)) {
+      try {
+        let app = fs.readFileSync(appPath, "utf-8");
+        if (!app.includes("force = bool(body.get(\"force\"")) {
+          app = app.replace(
+            "    result = registry.register(base, label)\n",
+            "    force = bool(body.get(\"force\", False))\n    result = registry.register(base, label, force=force)\n",
+          );
+          fs.writeFileSync(appPath, app);
+          console.log(`[ghost-fix] ${p.id}: patched app.py with force-replace support`);
+        }
+      } catch (err) {
+        console.warn(`[ghost-fix] ${p.id}: failed to patch app.py: ${err.message}`);
+      }
+    }
+    if (fs.existsSync(appPath)) {
+      try {
+        const app = fs.readFileSync(appPath, "utf-8");
+        if (app.includes("_CRASH_TIMEOUT = 15")) {
+          patchCrashTimeout(acDir);
+          console.log(`[idle-fix] ${p.id}: crash timeout patched on disk`);
+          acRestartNeeded.push(p.id);
+        }
+      } catch (err) {
+        console.warn(`[idle-fix] ${p.id}: failed to patch app.py crash timeout: ${err.message}`);
+      }
+    }
+  }
+
+  // CLI-based agent sections
+  for (const p of projects) {
+    const acPath = projectAgentchattrConfigPath(p.id);
+    if (!fs.existsSync(acPath)) continue;
+    try {
+      let toml = fs.readFileSync(acPath, "utf-8");
+      const cliSections = new Set();
+      for (const [, agentCfg] of Object.entries(p.agents || {})) {
+        const cmd = agentCfg.command || "claude";
+        const cli = cmd.split("/").pop().split(" ")[0];
+        cliSections.add(cli);
+      }
+      let changed = false;
+      for (const cli of cliSections) {
+        if (!new RegExp(`^\\[agents\\.${cli}\\]`, "m").test(toml)) {
+          const injectMode = cli === "codex" ? "proxy_flag" : cli === "gemini" ? "env" : "flag";
+          toml += `\n[agents.${cli}]\ncommand = "${cli}"\nlabel = "${cli}"\nmcp_inject = "${injectMode}"\n`;
+          changed = true;
+        }
+      }
+      if (changed) {
+        fs.writeFileSync(acPath, toml);
+        console.log(`[#596] ${p.id}: added CLI-based agent sections to config.toml`);
+      }
+    } catch (err) {
+      console.warn(`[#596] ${p.id}: config.toml migration failed: ${err.message}`);
+    }
+  }
+
+  return acRestartNeeded;
+}
+
 server.listen(PORT, "127.0.0.1", async () => {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
@@ -2628,238 +2845,8 @@ server.listen(PORT, "127.0.0.1", async () => {
     const { dir: acDir } = resolveProjectChattr(p.id);
     if (acDir) patchAgentchattrCss(acDir);
   }
-  // #457: migrate bridge slugs in AC configs on startup.
-  // Renames [agents.discord-bridge] → [agents.dc] and
-  // [agents.telegram-bridge] → [agents.tg] so bridges register
-  // under the short slug. Restarts AC ONLY for slug renames (not
-  // fresh block appends) — #616: script-only patches should not
-  // trigger AC restarts which kill bridge registration.
-  for (const p of (startupCfg.projects || [])) {
-    const acPath = projectAgentchattrConfigPath(p.id);
-    if (!fs.existsSync(acPath)) continue;
-    try {
-      const before = fs.readFileSync(acPath, "utf-8");
-      // Track whether an actual slug RENAME happened (old → new).
-      // Fresh block appends don't need an AC restart — AC picks them
-      // up on its next natural start.
-      const hadOldDc = /^\[agents\.discord-bridge\]\s*$/m.test(before);
-      const hadOldTg = /^\[agents\.telegram-bridge\]\s*$/m.test(before);
-      const dc = patchAgentchattrConfigForDiscordBridge(before);
-      const tg = patchAgentchattrConfigForTelegramBridge(dc.text);
-      if (dc.changed || tg.changed) {
-        fs.writeFileSync(acPath, tg.text);
-        console.log(`[bridge-migrate] ${p.id}: migrated AC config slugs`);
-        // Only restart AC when a slug was actually RENAMED — not when
-        // a fresh block was appended (#616).
-        if (hadOldDc || hadOldTg) {
-          setTimeout(async () => {
-            try {
-              const r = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(p.id)}/restart`, {
-                method: "POST",
-              });
-              if (r.ok) console.log(`[bridge-migrate] ${p.id}: restarted AC`);
-              else console.warn(`[bridge-migrate] ${p.id}: AC restart returned ${r.status}`);
-            } catch (err) {
-              console.warn(`[bridge-migrate] ${p.id}: AC restart failed: ${err.message || err}`);
-            }
-          }, 3000);
-        }
-      }
-    } catch {}
-  }
-  // #506: refresh Discord bridge script from the npm package on startup.
-  // The Telegram bridge uses git-fetch + pin, but Discord uses a file-copy
-  // pattern. Without this, upgrading QuadWork leaves a stale on-disk script
-  // missing fixes shipped in newer versions.
-  const DISCORD_BRIDGE_SRC = path.join(__dirname, "..", "bridges", "discord", "discord_bridge.py");
-  const DISCORD_BRIDGE_DEST = path.join(os.homedir(), ".quadwork", "agentchattr-discord", "discord_bridge.py");
-  if (fs.existsSync(DISCORD_BRIDGE_SRC) && fs.existsSync(path.dirname(DISCORD_BRIDGE_DEST))) {
-    try {
-      fs.copyFileSync(DISCORD_BRIDGE_SRC, DISCORD_BRIDGE_DEST);
-      console.log("[bridge-refresh] refreshed Discord bridge script from package");
-    } catch (err) {
-      console.warn(`[bridge-refresh] failed to refresh Discord bridge script: ${err.message || err}`);
-    }
-  }
-  // #470: patch stale bridge_sender defaults in on-disk bridge scripts.
-  // The AC config migration (#457) renames the agent sections, but the
-  // bridge scripts themselves may still have old defaults if the operator
-  // upgraded QuadWork without re-installing the bridges.
-  const BRIDGE_SLUG_PATCHES = [
-    { file: path.join(os.homedir(), ".quadwork", "agentchattr-telegram", "telegram_bridge.py"), old: '"telegram-bridge"', replacement: '"tg"' },
-    { file: path.join(os.homedir(), ".quadwork", "agentchattr-discord", "discord_bridge.py"), old: '"discord-bridge"', replacement: '"dc"' },
-  ];
-  for (const { file, old, replacement } of BRIDGE_SLUG_PATCHES) {
-    try {
-      if (!fs.existsSync(file)) continue;
-      const content = fs.readFileSync(file, "utf-8");
-      if (!content.includes(old)) continue;
-      fs.writeFileSync(file, content.replaceAll(old, replacement));
-      console.log(`[bridge-migrate] patched stale bridge_sender in ${path.basename(file)}`);
-    } catch {}
-  }
-  // #479: fix stale agent slugs in worktree AGENTS.md and CLAUDE.md on startup.
-  // Uses in-place replacement (not full template overwrite) to preserve
-  // reviewer auth credentials and other site-specific customisations.
-  const SLUG_FIXES = [
-    [/@reviewer1/g, "@re1"],
-    [/@reviewer2/g, "@re2"],
-    [/@t2a/g, "@re1"],
-    [/@t2b/g, "@re2"],
-    [/@t1\b/g, "@head"],
-    [/@t3\b/g, "@dev"],
-    [/\breviewer1\b/g, "re1"],
-    [/\breviewer2\b/g, "re2"],
-  ];
-  for (const p of (startupCfg.projects || [])) {
-    if (!p.agents) continue;
-    for (const [agentId, agentCfg] of Object.entries(p.agents)) {
-      const wtDir = agentCfg.cwd;
-      if (!wtDir || !fs.existsSync(wtDir)) continue;
-      for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
-        const filePath = path.join(wtDir, filename);
-        if (!fs.existsSync(filePath)) continue;
-        try {
-          let content = fs.readFileSync(filePath, "utf-8");
-          let changed = false;
-          for (const [pattern, replacement] of SLUG_FIXES) {
-            const before = content;
-            content = content.replace(pattern, replacement);
-            if (content !== before) changed = true;
-          }
-          if (changed) {
-            fs.writeFileSync(filePath, content);
-            console.log(`[reseed] ${p.id}/${agentId}: fixed stale slugs in ${filename}`);
-          }
-        } catch (err) {
-          console.warn(`[reseed] ${p.id}/${agentId}: failed to patch ${filename}: ${err.message}`);
-        }
-      }
-    }
-  }
-  // #478 + #502: patch deployed AgentChattr instances to support force-replace
-  // on register and fix idle-agent crash timeout.
-  for (const p of (startupCfg.projects || [])) {
-    const acDir = resolveProjectChattr(p.id).dir;
-    // Patch registry.py: add force parameter to register()
-    const regPath = path.join(acDir, "registry.py");
-    if (fs.existsSync(regPath)) {
-      try {
-        let reg = fs.readFileSync(regPath, "utf-8");
-        if (!reg.includes("force: bool")) {
-          // Add force parameter to register() signature
-          reg = reg.replace(
-            /def register\(self, base: str, label: str \| None = None\) -> dict \| None:/,
-            "def register(self, base: str, label: str | None = None, force: bool = False) -> dict | None:",
-          );
-          // Add force-replace logic after _expire_reserved()
-          reg = reg.replace(
-            "            self._expire_reserved()\n\n            # Find next free slot",
-            "            self._expire_reserved()\n\n" +
-            "            # quadwork#478 + #502: force-replace — expire all existing slots\n" +
-            "            # for this base so the new registration always lands at slot 1.\n" +
-            "            # Also clear _reserved entries: after a crash-timeout the old name\n" +
-            "            # lives only in _reserved, so without this the grace period still\n" +
-            "            # blocks slot 1 and the agent gets a -2 suffix.\n" +
-            "            if force:\n" +
-            "                ghosts = [n for n, i in self._instances.items() if i.base == base]\n" +
-            "                for name in ghosts:\n" +
-            "                    del self._instances[name]\n" +
-            "                stale_reserved = [rn for rn in self._reserved\n" +
-            "                                  if self._parse_name(rn)[0] == base]\n" +
-            "                for rn in stale_reserved:\n" +
-            "                    del self._reserved[rn]\n\n" +
-            "            # Find next free slot",
-          );
-          fs.writeFileSync(regPath, reg);
-          console.log(`[ghost-fix] ${p.id}: patched registry.py with force-replace support`);
-        } else if (!reg.includes("stale_reserved")) {
-          // #502: upgrade existing force-replace patch to also clear _reserved
-          reg = reg.replace(
-            /( +)for name in ghosts:\n\1    del self\._instances\[name\]\n\1    self\._reserved\[name\] = time\.time\(\)/,
-            "$1for name in ghosts:\n$1    del self._instances[name]\n" +
-            "$1stale_reserved = [rn for rn in self._reserved\n" +
-            "$1                  if self._parse_name(rn)[0] == base]\n" +
-            "$1for rn in stale_reserved:\n" +
-            "$1    del self._reserved[rn]",
-          );
-          fs.writeFileSync(regPath, reg);
-          console.log(`[ghost-fix] ${p.id}: upgraded registry.py force-replace to clear _reserved (#502)`);
-        }
-      } catch (err) {
-        console.warn(`[ghost-fix] ${p.id}: failed to patch registry.py: ${err.message}`);
-      }
-    }
-    // Patch app.py: pass force from request body to registry.register()
-    const appPath = path.join(acDir, "app.py");
-    if (fs.existsSync(appPath)) {
-      try {
-        let app = fs.readFileSync(appPath, "utf-8");
-        if (!app.includes("force = bool(body.get(\"force\"")) {
-          app = app.replace(
-            "    result = registry.register(base, label)\n",
-            "    force = bool(body.get(\"force\", False))\n    result = registry.register(base, label, force=force)\n",
-          );
-          fs.writeFileSync(appPath, app);
-          console.log(`[ghost-fix] ${p.id}: patched app.py with force-replace support`);
-        }
-      } catch (err) {
-        console.warn(`[ghost-fix] ${p.id}: failed to patch app.py: ${err.message}`);
-      }
-    }
-    // #502 + #629: increase crash timeout from 15s to 120s.
-    // Uses the shared patchCrashTimeout() from install-agentchattr.js.
-    // For existing installs where AC is already running, the on-disk
-    // patch alone is useless (Python caches module-level values at import).
-    // Flag the project for AC restart so the running process picks it up.
-    if (fs.existsSync(appPath)) {
-      try {
-        const app = fs.readFileSync(appPath, "utf-8");
-        if (app.includes("_CRASH_TIMEOUT = 15")) {
-          patchCrashTimeout(acDir);
-          console.log(`[idle-fix] ${p.id}: crash timeout patched on disk — AC restart required for running process to observe it (#629)`);
-          if (!startupCfg._acRestartNeeded) startupCfg._acRestartNeeded = [];
-          startupCfg._acRestartNeeded.push(p.id);
-        }
-      } catch (err) {
-        console.warn(`[idle-fix] ${p.id}: failed to patch app.py crash timeout: ${err.message}`);
-      }
-    }
-  }
-  // #596: add CLI-based agent sections to existing config.toml files.
-  // Follow-up to #592 (PR #594) which added these for new projects.
-  // Existing projects still have role-based-only sections; if their AC
-  // drifts to HEAD, registration fails with "unknown base". This
-  // migration appends [agents.claude]/[agents.codex] etc. sections so
-  // HEAD AC accepts CLI-named bases. No AC restart needed — AC reads
-  // config.toml on its own startup.
-  for (const p of (startupCfg.projects || [])) {
-    const acPath = projectAgentchattrConfigPath(p.id);
-    if (!fs.existsSync(acPath)) continue;
-    try {
-      let toml = fs.readFileSync(acPath, "utf-8");
-      const cliSections = new Set();
-      for (const [, agentCfg] of Object.entries(p.agents || {})) {
-        const cmd = agentCfg.command || "claude";
-        const cli = cmd.split("/").pop().split(" ")[0];
-        cliSections.add(cli);
-      }
-      let changed = false;
-      for (const cli of cliSections) {
-        if (!new RegExp(`^\\[agents\\.${cli}\\]`, "m").test(toml)) {
-          const injectMode = cli === "codex" ? "proxy_flag" : cli === "gemini" ? "env" : "flag";
-          toml += `\n[agents.${cli}]\ncommand = "${cli}"\nlabel = "${cli}"\nmcp_inject = "${injectMode}"\n`;
-          changed = true;
-        }
-      }
-      if (changed) {
-        fs.writeFileSync(acPath, toml);
-        console.log(`[#596] ${p.id}: added CLI-based agent sections to config.toml`);
-      }
-    } catch (err) {
-      console.warn(`[#596] ${p.id}: config.toml migration failed: ${err.message}`);
-    }
-  }
+  const acRestartNeeded = runStartupMigrations(startupCfg);
+  startupCfg._acRestartNeeded = acRestartNeeded.length > 0 ? acRestartNeeded : undefined;
   // #629: restart AC for projects where idle-fix patched the on-disk file
   // so the running Python process picks up _CRASH_TIMEOUT = 120.
   // Use port-alive check instead of chattrProcesses — AC may be running
