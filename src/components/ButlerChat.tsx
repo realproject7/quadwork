@@ -118,7 +118,7 @@ export default function ButlerChat() {
 
     requestAnimationFrame(() => fit());
 
-    const observer = new ResizeObserver(() => fit());
+    const observer = new ResizeObserver(() => requestAnimationFrame(() => fit()));
     observer.observe(containerRef.current);
 
     // Forward keystrokes to the WebSocket (same pattern as TerminalPanel)
