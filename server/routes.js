@@ -1798,6 +1798,19 @@ function summarizeItems(items) {
   return parts.join(" · ");
 }
 
+router.get("/api/batch-active", (req, res) => {
+  const projectId = req.query.project;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
+  let active = false;
+  try {
+    const text = fs.readFileSync(queuePath, "utf-8");
+    const { issueNumbers } = parseActiveBatch(text);
+    active = issueNumbers.length > 0;
+  } catch {}
+  return res.json({ active });
+});
+
 router.get("/api/batch-progress", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
