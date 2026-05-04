@@ -1473,20 +1473,22 @@ function spawnButlerPty() {
       }
     });
 
-    // Auto-answer trust prompt if it appears within the first 10s
-    let trustHandled = false;
-    const trustListener = term.onData((data) => {
-      if (trustHandled) return;
-      if (data.includes("trust") || data.includes("Yes,") || data.includes("1.")) {
-        setTimeout(() => {
-          if (!trustHandled && butlerSession.term === term) {
-            term.write("1\r");
-            trustHandled = true;
-          }
-        }, 500);
-      }
-    });
-    setTimeout(() => { trustListener.dispose(); trustHandled = true; }, 10000);
+    // Auto-answer Claude's trust prompt if it appears within the first 10s
+    if (command === "claude") {
+      let trustHandled = false;
+      const trustListener = term.onData((data) => {
+        if (trustHandled) return;
+        if (data.includes("trust") || data.includes("Yes,") || data.includes("1.")) {
+          setTimeout(() => {
+            if (!trustHandled && butlerSession.term === term) {
+              term.write("1\r");
+              trustHandled = true;
+            }
+          }, 500);
+        }
+      });
+      setTimeout(() => { trustListener.dispose(); trustHandled = true; }, 10000);
+    }
 
     term.onExit(({ exitCode }) => {
       if (butlerSession.term === term) {
