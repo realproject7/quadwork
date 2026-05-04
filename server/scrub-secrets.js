@@ -45,7 +45,7 @@ function scrubSecrets(text) {
 
 function scrubScrollback(buf) {
   if (!buf || buf.length === 0) return buf;
-  return Buffer.from(scrubSecrets(buf.toString("utf-8")), "utf-8");
+  return scrubSecrets(buf.toString("utf-8"));
 }
 
 module.exports = { scrubSecrets, scrubScrollback, _REDACTED };
