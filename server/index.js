@@ -1407,7 +1407,10 @@ function spawnButlerPty() {
     const command = butlerCfg.command || "claude";
     const args = [];
     if (butlerCfg.model) args.push("--model", butlerCfg.model);
-    if (butlerCfg.auto_approve !== false) args.push("--dangerously-skip-permissions");
+    if (butlerCfg.auto_approve !== false) {
+      const flags = PERMISSION_FLAGS[command] || [];
+      args.push(...flags);
+    }
 
     // Pre-trust the Butler working directory to avoid blocking trust prompt
     if (command === "claude") {
