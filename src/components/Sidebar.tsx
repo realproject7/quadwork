@@ -275,9 +275,9 @@ export default function Sidebar() {
     const poll = () => {
       Promise.all(
         projects.map((p) =>
-          fetch(`/api/batch-progress?project=${encodeURIComponent(p.id)}`)
+          fetch(`/api/batch-active?project=${encodeURIComponent(p.id)}`)
             .then((r) => (r.ok ? r.json() : null))
-            .then((d) => ({ id: p.id, active: d && Array.isArray(d.items) && d.items.length > 0 && !d.complete }))
+            .then((d) => ({ id: p.id, active: !!d?.active }))
             .catch(() => ({ id: p.id, active: false }))
         )
       ).then((results) => {
