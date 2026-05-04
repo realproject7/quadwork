@@ -41,6 +41,17 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
+// --- Safe PTY write helper (#670) ---
+
+function safeWrite(term, data) {
+  if (!term) return false;
+  try { term.write(data); return true; }
+  catch (err) {
+    if (err.code === "EIO") return false;
+    throw err;
+  }
+}
+
 // --- CLI status detection ---
 
 const { execFileSync } = require("child_process");
@@ -1563,7 +1574,7 @@ function spawnButlerPty() {
         if (data.includes("trust") || data.includes("Yes,") || data.includes("1.")) {
           setTimeout(() => {
             if (!trustHandled && butlerSession.term === term) {
-              term.write("1\r");
+              safeWrite(term, "1\r");
               trustHandled = true;
             }
           }, 500);
@@ -2168,7 +2179,7 @@ wss.on("connection:terminal", async (ws, req) => {
         return;
       }
     } catch {}
-    session.term.write(str);
+    safeWrite(session.term, str);
   });
 
   ws.on("close", () => {
@@ -2226,7 +2237,7 @@ wss.on("connection:butler", async (ws) => {
         return;
       }
     } catch {}
-    butlerSession.term.write(str);
+    safeWrite(butlerSession.term, str);
   });
 
   ws.on("close", () => {
