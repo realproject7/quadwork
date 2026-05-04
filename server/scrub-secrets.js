@@ -44,7 +44,7 @@ function scrubSecrets(text) {
 }
 
 function scrubScrollback(buf) {
-  if (!buf || buf.length === 0) return buf;
+  if (!buf || buf.length === 0) return "";
   return scrubSecrets(buf.toString("utf-8"));
 }
 
