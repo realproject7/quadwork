@@ -114,7 +114,7 @@ export default function TerminalPanel({
     requestAnimationFrame(() => fit());
 
     // Resize observer
-    const observer = new ResizeObserver(() => fit());
+    const observer = new ResizeObserver(() => requestAnimationFrame(() => fit()));
     observer.observe(containerRef.current);
 
     // #368: register the xterm → client data handler ONCE up-front
