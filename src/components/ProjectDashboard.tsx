@@ -66,6 +66,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   const [rowRatio, setRowRatio] = useState(0.5);
   const dragging = useRef<"col" | "row" | null>(null);
   const [agentStates, setAgentStates] = useState<Record<string, AgentState>>({});
+  const [terminalsCollapsed, setTerminalsCollapsed] = useState(false);
 
   // #523/#525: system message filter — source of truth is the per-project
   // config (bridge_filter_agents_only), so dashboard and bridges stay in sync.
@@ -195,7 +196,9 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     document.body.style.userSelect = "none";
   };
 
-  const colTemplate = `${colRatio * 100}% ${DIVIDER}px 1fr`;
+  const colTemplate = terminalsCollapsed
+    ? `1fr ${DIVIDER}px auto`
+    : `${colRatio * 100}% ${DIVIDER}px 1fr`;
   const rowTemplate = `${rowRatio * 100}% ${DIVIDER}px 1fr`;
 
   // On mobile (<lg): flex column layout, scrollable. Terminals + dividers hidden.
@@ -242,6 +245,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             projectId={projectId}
             agentStates={agentStates}
             onStatusChange={updateAgentState}
+            onCollapsedChange={setTerminalsCollapsed}
           />
         </div>
 
