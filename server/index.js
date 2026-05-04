@@ -1334,6 +1334,8 @@ app.post("/api/full-reset", async (_req, res) => {
     const errors = [];
     for (const project of projects) {
       console.log(`[full-reset] restarting AC for ${project.id}...`);
+      // Pre-mark reset as scheduled so AC restart's auto-reset timer is suppressed
+      _acHealth.resetState.set(project.id, { status: "scheduled", timestamp: Date.now() });
       try {
         const acResp = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(project.id)}/restart`, {
           method: "POST",
