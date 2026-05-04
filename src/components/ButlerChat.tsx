@@ -335,7 +335,7 @@ export default function ButlerChat() {
       </div>
 
       {/* Terminal */}
-      <div ref={containerRef} className="h-[40vh] min-h-[200px]" />
+      <div ref={containerRef} className="h-[40vh] min-h-[200px] overflow-hidden" />
 
       {/* Input bar */}
       <div className="flex items-center gap-2 px-3 py-2 border-t border-border shrink-0">
