@@ -63,6 +63,27 @@ const BACKENDS: { value: string; label: string }[] = [
 ];
 const MODELS = ["opus", "sonnet", "haiku"];
 
+const BUTLER_MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
+  claude: [
+    { value: "opus", label: "opus" },
+    { value: "sonnet", label: "sonnet" },
+    { value: "haiku", label: "haiku" },
+  ],
+  codex: [
+    { value: "gpt-5.4", label: "gpt-5.4" },
+    { value: "gpt-5", label: "gpt-5" },
+    { value: "gpt-4o", label: "gpt-4o" },
+  ],
+  gemini: [
+    { value: "gemini-2.5-pro", label: "gemini-2.5-pro" },
+    { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
+  ],
+};
+
+function butlerModelsForBackend(backend: string) {
+  return BUTLER_MODEL_OPTIONS[backend] || BUTLER_MODEL_OPTIONS.claude;
+}
+
 const COPY = {
   en: {
     loading: "Loading...",
@@ -784,7 +805,12 @@ export default function SettingsPage() {
             <Select
               label={t.butlerCli}
               value={config.butler?.command || "claude"}
-              onChange={(v) => updateButler({ command: v })}
+              onChange={(v) => {
+                const models = butlerModelsForBackend(v);
+                const currentModel = config.butler?.model || "opus";
+                const modelValid = models.some((m) => m.value === currentModel);
+                updateButler({ command: v, model: modelValid ? currentModel : models[0].value });
+              }}
               options={BACKENDS.map((b) => ({
                 value: b.value,
                 label: b.label + (cliStatus && !cliStatus[b.value as keyof typeof cliStatus] ? " (not installed)" : ""),
@@ -794,7 +820,7 @@ export default function SettingsPage() {
               label={t.butlerModel}
               value={config.butler?.model || "opus"}
               onChange={(v) => updateButler({ model: v })}
-              options={MODELS.map((m) => ({ value: m, label: m }))}
+              options={butlerModelsForBackend(config.butler?.command || "claude")}
             />
             <Input
               label={t.butlerCwd}
