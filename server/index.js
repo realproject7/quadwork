@@ -1496,11 +1496,23 @@ function stopButlerPty() {
 
 app.post("/api/butler/start", (_req, res) => {
   const result = spawnButlerPty();
+  if (result.ok) {
+    try {
+      const cfg = readConfig();
+      cfg.butler = { ...cfg.butler, enabled: true };
+      writeConfig(cfg);
+    } catch {}
+  }
   res.json(result);
 });
 
 app.post("/api/butler/stop", (_req, res) => {
   stopButlerPty();
+  try {
+    const cfg = readConfig();
+    cfg.butler = { ...cfg.butler, enabled: false };
+    writeConfig(cfg);
+  } catch {}
   res.json({ ok: true });
 });
 

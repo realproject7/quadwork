@@ -16,6 +16,7 @@ const COPY = {
     startButler: "Start Butler",
     starting: "Starting...",
     loading: "Loading...",
+    startError: "Failed to start Butler. Check that the selected CLI is installed.",
   },
   ko: {
     butlerAgent: "버틀러 에이전트",
@@ -26,6 +27,7 @@ const COPY = {
     startButler: "버틀러 시작",
     starting: "시작 중...",
     loading: "로딩 중...",
+    startError: "버틀러를 시작할 수 없습니다. 선택한 CLI가 설치되어 있는지 확인하세요.",
   },
 } as const;
 
@@ -37,6 +39,7 @@ export default function ButlerChat() {
   const [collapsed, setCollapsed] = useState(false);
   const [starting, setStarting] = useState(false);
   const [input, setInput] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -200,6 +203,9 @@ export default function ButlerChat() {
         if (cancelled) return;
         term.write(`\r\n\x1b[38;2;115;115;115m[session closed: ${e.reason || e.code}]\x1b[0m\r\n`);
         setRunning(false);
+        if (e.reason === "pty-spawn-failed") {
+          setError(t.startError);
+        }
       };
     };
 
@@ -218,13 +224,18 @@ export default function ButlerChat() {
 
   const handleStart = async () => {
     setStarting(true);
+    setError(null);
     try {
       const res = await fetch("/api/butler/start", { method: "POST" });
       const data = await res.json();
       if (data.ok) {
         setRunning(true);
+      } else {
+        setError(data.error || t.startError);
       }
-    } catch {}
+    } catch {
+      setError(t.startError);
+    }
     setStarting(false);
   };
 
@@ -288,7 +299,7 @@ export default function ButlerChat() {
             ▾ {t.collapse}
           </button>
         </div>
-        <div className="flex flex-col items-center justify-center py-8">
+        <div className="flex flex-col items-center justify-center py-8 gap-3">
           <button
             type="button"
             onClick={handleStart}
@@ -297,6 +308,9 @@ export default function ButlerChat() {
           >
             {starting ? t.starting : t.startButler}
           </button>
+          {error && (
+            <p className="text-[11px] text-error max-w-sm text-center">{error}</p>
+          )}
         </div>
       </div>
     );
