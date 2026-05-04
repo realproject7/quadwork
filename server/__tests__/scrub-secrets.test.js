@@ -172,31 +172,32 @@ test("handles multi-line with mixed secrets and normal output", () => {
   assert(!out.includes("eyJhbGci"));
 });
 
-// --- 5. scrubScrollback (Buffer handling) ---
+// --- 5. scrubScrollback (string output for WebSocket text frames) ---
 
-test("scrubScrollback returns Buffer", () => {
+test("scrubScrollback returns string, not Buffer", () => {
   const buf = Buffer.from("SOME_SECRET_KEY=abc123\nnormal line");
   const out = scrubScrollback(buf);
-  assert(Buffer.isBuffer(out), "should return a Buffer");
-  assert(!out.toString().includes("abc123"));
+  assert.strictEqual(typeof out, "string", "should return a string for text WebSocket frames");
+  assert(!out.includes("abc123"));
 });
 
 test("scrubScrollback handles empty buffer", () => {
   const buf = Buffer.alloc(0);
   const out = scrubScrollback(buf);
-  assert(Buffer.isBuffer(out));
-  assert.strictEqual(out.length, 0);
+  assert.strictEqual(typeof out, "string");
+  assert.strictEqual(out, "");
 });
 
 test("scrubScrollback handles null", () => {
-  assert.strictEqual(scrubScrollback(null), null);
+  assert.strictEqual(scrubScrollback(null), "");
 });
 
 test("scrubScrollback preserves non-secret content", () => {
   const content = "Hello world\nBuild succeeded\n42 tests passed";
   const buf = Buffer.from(content);
   const out = scrubScrollback(buf);
-  assert.strictEqual(out.toString(), content);
+  assert.strictEqual(typeof out, "string");
+  assert.strictEqual(out, content);
 });
 
 // --- 6. Integration path verification ---
