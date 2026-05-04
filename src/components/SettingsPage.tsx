@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
+import { MODEL_OPTIONS, optionsForBackend } from "./AgentModelsWidget";
 
 interface AgentConfig {
   display_name: string;
@@ -60,28 +61,13 @@ const DEFAULT_AGENTS: Record<string, AgentConfig> = {
 const BACKENDS: { value: string; label: string }[] = [
   { value: "claude", label: "Claude Code" },
   { value: "codex", label: "Codex" },
+  { value: "gemini", label: "Gemini CLI" },
 ];
 const MODELS = ["opus", "sonnet", "haiku"];
 
-const BUTLER_MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
-  claude: [
-    { value: "opus", label: "opus" },
-    { value: "sonnet", label: "sonnet" },
-    { value: "haiku", label: "haiku" },
-  ],
-  codex: [
-    { value: "gpt-5.4", label: "gpt-5.4" },
-    { value: "gpt-5", label: "gpt-5" },
-    { value: "gpt-4o", label: "gpt-4o" },
-  ],
-  gemini: [
-    { value: "gemini-2.5-pro", label: "gemini-2.5-pro" },
-    { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
-  ],
-};
-
 function butlerModelsForBackend(backend: string) {
-  return BUTLER_MODEL_OPTIONS[backend] || BUTLER_MODEL_OPTIONS.claude;
+  const opts = optionsForBackend(backend).filter((o) => o.value !== "");
+  return opts.length > 0 ? opts : optionsForBackend("claude").filter((o) => o.value !== "");
 }
 
 const COPY = {
