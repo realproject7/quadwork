@@ -90,21 +90,13 @@ h1, h2, h3, h4, h5, h6 {
   animation: qw-name-shimmer 1.6s ease-in-out infinite;
 }
 
-@keyframes qw-orbit {
-  from { transform: rotate(0deg) translateX(22px) rotate(0deg); }
-  to { transform: rotate(360deg) translateX(22px) rotate(-360deg); }
+@keyframes qw-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.4); }
+  50% { box-shadow: 0 0 0 4px rgba(0, 255, 136, 0); }
 }
-.animate-orbit {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 4px;
-  height: 4px;
-  margin: -2px 0 0 -2px;
-  border-radius: 50%;
-  background: var(--accent, #00ff88);
-  animation: qw-orbit 3s linear infinite;
-  pointer-events: none;
+.animate-pulse-ring {
+  animation: qw-pulse 2s ease-in-out infinite;
+  will-change: box-shadow;
 }
 
 /* Korean help text should wrap by word, not by individual syllable.
