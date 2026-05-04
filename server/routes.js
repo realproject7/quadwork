@@ -1801,6 +1801,7 @@ function summarizeItems(items) {
 router.get("/api/batch-active", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  if (!getRepo(projectId)) return res.status(400).json({ error: "No repo configured for project" });
   const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
   let active = false;
   try {
