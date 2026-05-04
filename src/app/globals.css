@@ -90,6 +90,23 @@ h1, h2, h3, h4, h5, h6 {
   animation: qw-name-shimmer 1.6s ease-in-out infinite;
 }
 
+@keyframes qw-orbit {
+  from { transform: rotate(0deg) translateX(22px) rotate(0deg); }
+  to { transform: rotate(360deg) translateX(22px) rotate(-360deg); }
+}
+.animate-orbit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin: -2px 0 0 -2px;
+  border-radius: 50%;
+  background: var(--accent, #00ff88);
+  animation: qw-orbit 3s linear infinite;
+  pointer-events: none;
+}
+
 /* Korean help text should wrap by word, not by individual syllable.
    Keep long URLs/tokens from overflowing narrow tooltips and modals. */
 .ko-help {
