@@ -1407,7 +1407,14 @@ function spawnButlerPty() {
     const command = butlerCfg.command || "claude";
     const args = [];
     if (butlerCfg.model) args.push("--model", butlerCfg.model);
-    if (butlerCfg.auto_approve) args.push("--dangerously-skip-permissions");
+    if (butlerCfg.auto_approve !== false) args.push("--dangerously-skip-permissions");
+
+    // Pre-trust the Butler working directory to avoid blocking trust prompt
+    if (command === "claude") {
+      try {
+        execFileSync("claude", ["-p", "echo ok"], { cwd: docsDir, timeout: 15000, stdio: "pipe" });
+      } catch {}
+    }
 
     const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.AGENTS.md");
     if (fs.existsSync(seedPath)) {
