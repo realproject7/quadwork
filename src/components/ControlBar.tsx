@@ -30,6 +30,10 @@ const COPY = {
       acAndAgentsRestarted: (restarted: number) => `AC + ${restarted} agent${restarted !== 1 ? "s" : ""} restarted`,
       agentResetFailed: "AC restarted — agent reset failed",
       resetResult: (restarted: number, total: number) => `Reset — ${restarted} of ${total} agent${total !== 1 ? "s" : ""} restarted`,
+      fullReset: "Full Reset",
+      confirmFullReset: "Reset all projects?",
+      fullResetResult: (projects: number, agents: number, ms: number) => `Full reset — ${projects} project${projects !== 1 ? "s" : ""}, ${agents} agent${agents !== 1 ? "s" : ""} (${(ms / 1000).toFixed(1)}s)`,
+      fullResetFailed: "Full reset failed",
     },
     system: {
       keepAwake: "Keep Mac Awake",
@@ -77,6 +81,10 @@ const COPY = {
       acAndAgentsRestarted: (restarted: number) => `AC 및 ${restarted}개 에이전트 재시작됨`,
       agentResetFailed: "AC 재시작됨 — 에이전트 초기화 실패",
       resetResult: (restarted: number, total: number) => `초기화 완료 — ${total}개 중 ${restarted}개 에이전트 재시작됨`,
+      fullReset: "전체 리셋",
+      confirmFullReset: "모든 프로젝트를 리셋할까요?",
+      fullResetResult: (projects: number, agents: number, ms: number) => `전체 리셋 완료 — ${projects}개 프로젝트, ${agents}개 에이전트 (${(ms / 1000).toFixed(1)}초)`,
+      fullResetFailed: "전체 리셋 실패",
     },
     system: {
       keepAwake: "Mac 절전 방지",
@@ -118,6 +126,7 @@ function ServerSection({ projectId }: { projectId: string }) {
   const [loading, setLoading] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
+  const [confirmFullReset, setConfirmFullReset] = useState(false);
   // #416: AC health monitor status — poll every 30s to surface
   // auto-restart events and persistent errors in the dashboard.
   const [healthNote, setHealthNote] = useState<string | null>(null);
@@ -159,6 +168,32 @@ function ServerSection({ projectId }: { projectId: string }) {
     const timer = setTimeout(() => setConfirmStop(false), 4000);
     return () => clearTimeout(timer);
   }, [confirmStop]);
+
+  useEffect(() => {
+    if (!confirmFullReset) return;
+    const timer = setTimeout(() => setConfirmFullReset(false), 4000);
+    return () => clearTimeout(timer);
+  }, [confirmFullReset]);
+
+  const handleFullReset = async () => {
+    if (!confirmFullReset) {
+      setConfirmFullReset(true);
+      return;
+    }
+    setConfirmFullReset(false);
+    setLoading("fullReset");
+    try {
+      const r = await fetch("/api/full-reset", { method: "POST" });
+      const d = await r.json();
+      setFeedback(
+        d.ok ? t.fullResetResult(d.projects, d.agents, d.duration_ms) : (d.error || t.fullResetFailed)
+      );
+    } catch {
+      setFeedback(t.fullResetFailed);
+    }
+    setLoading(null);
+    clearFeedback();
+  };
 
   const handleStop = async () => {
     if (!confirmStop) {
@@ -266,6 +301,17 @@ function ServerSection({ projectId }: { projectId: string }) {
           className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
         >
           {loading === "reset" ? "..." : t.resetAgents}
+        </button>
+        <button
+          onClick={handleFullReset}
+          disabled={!!loading}
+          className={`px-1.5 py-0.5 text-[10px] border transition-colors disabled:opacity-50 ${
+            confirmFullReset
+              ? "text-error border-error/60 bg-error/10 hover:bg-error/20"
+              : "text-text-muted border-border hover:text-accent hover:border-accent/40"
+          }`}
+        >
+          {loading === "fullReset" ? "..." : confirmFullReset ? t.confirmFullReset : t.fullReset}
         </button>
       </div>
       {feedback && (
