@@ -130,10 +130,11 @@ interface ProjectIconProps {
   isActive: boolean;
   expanded: boolean;
   pinned: boolean;
+  hasActiveBatch: boolean;
   onContextMenu: (e: React.MouseEvent, projectId: string) => void;
 }
 
-function ProjectIcon({ project, isActive, expanded, pinned, onContextMenu }: ProjectIconProps) {
+function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onContextMenu }: ProjectIconProps) {
   const [tooltip, setTooltip] = useState<{ top: number } | null>(null);
   const ref = useRef<HTMLAnchorElement>(null);
 
@@ -168,6 +169,7 @@ function ProjectIcon({ project, isActive, expanded, pinned, onContextMenu }: Pro
               <PinIcon size={8} />
             </div>
           )}
+          {hasActiveBatch && <div className="animate-orbit" />}
         </div>
         {expanded && (
           <span className={`text-xs truncate flex items-center gap-1 ${isActive ? "text-accent" : "text-text-muted"}`}>
@@ -210,6 +212,7 @@ export default function Sidebar() {
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
   const [version, setVersion] = useState<string>("");
   const configRef = useRef<Record<string, unknown> | null>(null);
+  const [activeBatches, setActiveBatches] = useState<Set<string>>(new Set());
 
   // Close mobile overlay on navigation
   useEffect(() => {
@@ -265,6 +268,28 @@ export default function Sidebar() {
       })
       .catch(() => {});
   }, []);
+
+  // Poll batch status for each project every 30s
+  useEffect(() => {
+    if (projects.length === 0) return;
+    let cancelled = false;
+    const poll = () => {
+      Promise.all(
+        projects.map((p) =>
+          fetch(`/api/batch-progress?project=${encodeURIComponent(p.id)}`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => ({ id: p.id, active: d && Array.isArray(d.items) && d.items.length > 0 && !d.complete }))
+            .catch(() => ({ id: p.id, active: false }))
+        )
+      ).then((results) => {
+        if (cancelled) return;
+        setActiveBatches(new Set(results.filter((r) => r.active).map((r) => r.id)));
+      });
+    };
+    poll();
+    const id = setInterval(poll, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [projects]);
 
   // Health check poll every 5 seconds
   useEffect(() => {
@@ -435,6 +460,7 @@ export default function Sidebar() {
                 isActive={activeProjectId === project.id}
                 expanded={isExpanded}
                 pinned
+                hasActiveBatch={activeBatches.has(project.id)}
                 onContextMenu={handleContextMenu}
               />
             ))}
@@ -474,6 +500,7 @@ export default function Sidebar() {
                   isActive={activeProjectId === project.id}
                   expanded={isExpanded}
                   pinned={false}
+                  hasActiveBatch={activeBatches.has(project.id)}
                   onContextMenu={handleContextMenu}
                 />
               ))}
@@ -499,6 +526,7 @@ export default function Sidebar() {
             isActive={activeProjectId === project.id}
             expanded={isExpanded}
             pinned={false}
+            hasActiveBatch={activeBatches.has(project.id)}
             onContextMenu={handleContextMenu}
           />
         ))}
