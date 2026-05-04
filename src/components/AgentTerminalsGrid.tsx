@@ -1,8 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import TerminalGrid from "./TerminalGrid";
 import { useLocale } from "@/components/LocaleProvider";
+
+const STORAGE_KEY = "qw-terminals-collapsed";
 
 const COPY = {
   en: {
@@ -13,6 +15,8 @@ const COPY = {
         These show what each agent is doing in their CLI session. <b>Do not type here directly</b> — use the AgentChattr chat above instead. Agents won&apos;t see messages typed in their terminals.
       </>
     ),
+    hide: "hide",
+    show: "show",
   },
   ko: {
     title: "에이전트 터미널",
@@ -22,6 +26,8 @@ const COPY = {
         각 에이전트가 CLI 세션에서 무엇을 하고 있는지 보여주는 읽기 전용 터미널입니다. <b>여기에 직접 입력하지 마세요.</b> 위의 AgentChattr 채팅을 사용해야 에이전트가 메시지를 볼 수 있습니다.
       </>
     ),
+    hide: "접기",
+    show: "펼치기",
   },
 } as const;
 
@@ -51,6 +57,7 @@ interface AgentTerminalsGridProps {
   projectId: string;
   agentStates: Record<string, AgentState>;
   onStatusChange?: (agent: string, state: string) => void;
+  onCollapsedChange?: (collapsed: boolean) => void;
 }
 
 /**
@@ -62,10 +69,42 @@ interface AgentTerminalsGridProps {
  * the top-left quadrant. Without this hint, users try to type into
  * the terminals and their messages are lost to the other agents.
  */
-export default function AgentTerminalsGrid({ projectId, agentStates, onStatusChange }: AgentTerminalsGridProps) {
+export default function AgentTerminalsGrid({ projectId, agentStates, onStatusChange, onCollapsedChange }: AgentTerminalsGridProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [tipOpen, setTipOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem(STORAGE_KEY) === "true";
+  });
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, String(collapsed));
+    onCollapsedChange?.(collapsed);
+  }, [collapsed, onCollapsedChange]);
+
+  // Notify parent of initial collapsed state on mount
+  useEffect(() => {
+    onCollapsedChange?.(collapsed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (collapsed) {
+    return (
+      <div className="flex flex-col h-full min-h-0">
+        <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
+          <span className="text-[11px] text-text-muted uppercase tracking-wider">{t.title}</span>
+          <button
+            type="button"
+            onClick={() => setCollapsed(false)}
+            className="text-[10px] text-text-muted hover:text-text transition-colors"
+          >
+            ▸ {t.show}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -98,6 +137,13 @@ export default function AgentTerminalsGrid({ projectId, agentStates, onStatusCha
             )}
           </div>
         </div>
+        <button
+          type="button"
+          onClick={() => setCollapsed(true)}
+          className="text-[10px] text-text-muted hover:text-text transition-colors"
+        >
+          ▾ {t.hide}
+        </button>
       </div>
       <div className="flex-1 min-h-0">
         <TerminalGrid
