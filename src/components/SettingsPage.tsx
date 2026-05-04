@@ -450,6 +450,15 @@ export default function SettingsPage() {
     }
   }, [config, searchParams, autoAdded]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (!config) return;
+    const hash = window.location.hash.replace("#", "");
+    if (hash) {
+      const el = document.getElementById(hash);
+      if (el) el.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [config]);
+
   const save = async () => {
     if (!config) return;
     setSaving(true);
@@ -757,7 +766,7 @@ export default function SettingsPage() {
       </section>
 
       {/* Butler Agent (#632) */}
-      <section className="mb-8">
+      <section id="butler" className="mb-8">
         <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.butlerAgent}</h2>
         <div className="border border-border p-3 space-y-3">
           <div className="flex items-center gap-3">

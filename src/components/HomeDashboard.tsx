@@ -30,6 +30,10 @@ const COPY = {
     joinLink: "Join Hunt Town",
     joinSuffix: "and find @project7.",
     recentActivity: "Recent Activity",
+    butlerCtaTitle: "Butler Agent",
+    butlerCtaNew: "NEW",
+    butlerCtaDesc: "Your cross-project AI assistant.",
+    butlerCtaLink: "Enable in Settings →",
   },
   ko: {
     loading: "대시보드 로딩 중...",
@@ -54,6 +58,10 @@ const COPY = {
     joinLink: "Hunt Town 참여",
     joinSuffix: "에서 @project7을 찾아보세요.",
     recentActivity: "최근 활동",
+    butlerCtaTitle: "Butler Agent",
+    butlerCtaNew: "NEW",
+    butlerCtaDesc: "크로스 프로젝트 AI 어시스턴트.",
+    butlerCtaLink: "설정에서 활성화 →",
   },
 } as const;
 
@@ -99,6 +107,10 @@ export default function HomeDashboard() {
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [projectsState, setProjectsState] = useState<"loading" | "loaded" | "error">("loading");
   const [butlerEnabled, setButlerEnabled] = useState(false);
+  const [butlerCtaDismissed, setButlerCtaDismissed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("qw-butler-cta-dismissed") === "1";
+  });
 
   useEffect(() => {
     fetch("/api/projects")
@@ -142,9 +154,37 @@ export default function HomeDashboard() {
           {butlerEnabled ? (
             <ButlerChat />
           ) : projectsState === "loaded" ? (
-            <div className="mb-6">
-              <HomeEmptyState hasProjects={projects.length > 0} />
-            </div>
+            <>
+              {!butlerCtaDismissed && (
+                <div className="mb-3 border border-border bg-bg-surface px-4 py-3 flex items-center justify-between">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span className="text-[11px] font-semibold text-text">{t.butlerCtaTitle}</span>
+                    <span className="text-[9px] font-semibold text-accent border border-accent/30 px-1.5 py-0.5 leading-none">{t.butlerCtaNew}</span>
+                    <span className="text-[11px] text-text-muted hidden sm:inline">{t.butlerCtaDesc}</span>
+                    <Link
+                      href="/settings#butler"
+                      className="text-[11px] text-accent hover:text-accent-dim transition-colors shrink-0"
+                    >
+                      {t.butlerCtaLink}
+                    </Link>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      localStorage.setItem("qw-butler-cta-dismissed", "1");
+                      setButlerCtaDismissed(true);
+                    }}
+                    className="text-text-muted hover:text-text text-[11px] ml-3 shrink-0 transition-colors"
+                    aria-label="Dismiss"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+              <div className="mb-6">
+                <HomeEmptyState hasProjects={projects.length > 0} />
+              </div>
+            </>
           ) : null}
           {projectsState === "error" && (
             <div className="mb-6 border border-error/30 bg-error/5 text-error text-[11px] px-3 py-2">
