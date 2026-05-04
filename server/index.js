@@ -66,6 +66,7 @@ app.get("/api/cli-status", (_req, res) => {
   res.json({
     claude: isCliInstalled("claude"),
     codex: isCliInstalled("codex"),
+    gemini: isCliInstalled("gemini"),
   });
 });
 

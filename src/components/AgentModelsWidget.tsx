@@ -103,7 +103,7 @@ const REASONING_LEVELS = ["minimal", "low", "medium", "high"] as const;
 // ship with this release; operators who need something bleeding
 // edge can still override by editing ~/.quadwork/config.json
 // directly — this widget is the guided happy path.
-const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
+export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
   codex: [
     { value: "", label: "(CLI default)" },
     { value: "gpt-5.4", label: "gpt-5.4" },
@@ -117,8 +117,13 @@ const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
     { value: "claude-sonnet-4-6", label: "claude-sonnet-4-6" },
     { value: "claude-haiku-4-5-20251001", label: "claude-haiku-4-5" },
   ],
+  gemini: [
+    { value: "", label: "(CLI default)" },
+    { value: "gemini-2.5-pro", label: "gemini-2.5-pro" },
+    { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
+  ],
 };
-function optionsForBackend(backend: string) {
+export function optionsForBackend(backend: string) {
   return MODEL_OPTIONS[backend] || [{ value: "", label: "(CLI default)" }];
 }
 

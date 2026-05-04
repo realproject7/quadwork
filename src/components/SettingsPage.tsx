@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
+import { MODEL_OPTIONS, optionsForBackend } from "./AgentModelsWidget";
 
 interface AgentConfig {
   display_name: string;
@@ -60,8 +61,14 @@ const DEFAULT_AGENTS: Record<string, AgentConfig> = {
 const BACKENDS: { value: string; label: string }[] = [
   { value: "claude", label: "Claude Code" },
   { value: "codex", label: "Codex" },
+  { value: "gemini", label: "Gemini CLI" },
 ];
 const MODELS = ["opus", "sonnet", "haiku"];
+
+function butlerModelsForBackend(backend: string) {
+  const opts = optionsForBackend(backend).filter((o) => o.value !== "");
+  return opts.length > 0 ? opts : optionsForBackend("claude").filter((o) => o.value !== "");
+}
 
 const COPY = {
   en: {
@@ -784,7 +791,12 @@ export default function SettingsPage() {
             <Select
               label={t.butlerCli}
               value={config.butler?.command || "claude"}
-              onChange={(v) => updateButler({ command: v })}
+              onChange={(v) => {
+                const models = butlerModelsForBackend(v);
+                const currentModel = config.butler?.model || "opus";
+                const modelValid = models.some((m) => m.value === currentModel);
+                updateButler({ command: v, model: modelValid ? currentModel : models[0].value });
+              }}
               options={BACKENDS.map((b) => ({
                 value: b.value,
                 label: b.label + (cliStatus && !cliStatus[b.value as keyof typeof cliStatus] ? " (not installed)" : ""),
@@ -794,7 +806,7 @@ export default function SettingsPage() {
               label={t.butlerModel}
               value={config.butler?.model || "opus"}
               onChange={(v) => updateButler({ model: v })}
-              options={MODELS.map((m) => ({ value: m, label: m }))}
+              options={butlerModelsForBackend(config.butler?.command || "claude")}
             />
             <Input
               label={t.butlerCwd}
