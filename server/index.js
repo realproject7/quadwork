@@ -1305,6 +1305,69 @@ app.post("/api/agents/:project/reset", async (req, res) => {
   }
 });
 
+// --- Full Reset: restart all AC + agents across all projects (#657) ---
+
+app.post("/api/full-reset", async (_req, res) => {
+  const start = Date.now();
+  console.log("[full-reset] starting...");
+  try {
+    const cfg = readConfig();
+    const projects = (cfg.projects || []).filter((p) => !p.archived);
+
+    // 1. Stop all agent sessions
+    console.log("[full-reset] stopping all agent sessions...");
+    const sessionKeys = [...agentSessions.keys()];
+    for (const key of sessionKeys) {
+      await stopAgentSession(key);
+    }
+
+    // 2. Stop Butler if running
+    console.log("[full-reset] stopping Butler...");
+    stopButlerPty();
+
+    // 3. Restart each project's AC + agents via internal endpoint
+    let totalAgents = 0;
+    const errors = [];
+    for (const project of projects) {
+      console.log(`[full-reset] restarting AC for ${project.id}...`);
+      try {
+        const acResp = await fetch(`http://127.0.0.1:${PORT}/api/agentchattr/${encodeURIComponent(project.id)}/restart`, {
+          method: "POST",
+        });
+        if (!acResp.ok) {
+          const errData = await acResp.json().catch(() => ({}));
+          errors.push(`${project.id}: AC restart failed — ${errData.error || acResp.status}`);
+        } else {
+          const agentIds = project.agents ? Object.keys(project.agents) : [];
+          totalAgents += agentIds.length;
+        }
+      } catch (err) {
+        errors.push(`${project.id}: ${err.message}`);
+      }
+    }
+
+    // 4. Restart Butler if enabled
+    if (cfg.butler?.enabled) {
+      console.log("[full-reset] restarting Butler...");
+      const result = spawnButlerPty();
+      if (!result.ok) errors.push(`butler: ${result.error}`);
+    }
+
+    const duration = Date.now() - start;
+    console.log(`[full-reset] complete in ${duration}ms — ${projects.length} projects, ${totalAgents} agents`);
+    res.json({
+      ok: errors.length === 0,
+      projects: projects.length,
+      agents: totalAgents,
+      duration_ms: duration,
+      ...(errors.length > 0 ? { errors } : {}),
+    });
+  } catch (err) {
+    console.error(`[full-reset] failed: ${err.message}`);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // --- Lifecycle: start spawns PTY (visible in terminal panel) ---
 
 app.post("/api/agents/:project/:agent/start", async (req, res) => {
