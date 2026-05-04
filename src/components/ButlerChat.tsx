@@ -11,8 +11,6 @@ const COPY = {
     butlerAgent: "Butler Agent",
     collapse: "collapse",
     expand: "expand",
-    inputPlaceholder: "Message butler...",
-    send: "Send",
     startButler: "Start Butler",
     starting: "Starting...",
     loading: "Loading...",
@@ -22,8 +20,6 @@ const COPY = {
     butlerAgent: "버틀러 에이전트",
     collapse: "접기",
     expand: "펼치기",
-    inputPlaceholder: "버틀러에게 메시지...",
-    send: "전송",
     startButler: "버틀러 시작",
     starting: "시작 중...",
     loading: "로딩 중...",
@@ -38,14 +34,12 @@ export default function ButlerChat() {
   const [running, setRunning] = useState<boolean | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
 
   // Fetch butler status on mount (enabled is already known from parent)
   useEffect(() => {
@@ -59,14 +53,6 @@ export default function ButlerChat() {
       .catch(() => { setRunning(false); });
     return () => { cancelled = true; };
   }, []);
-
-  // Auto-focus input on expand
-  useEffect(() => {
-    if (!collapsed && running) {
-      // Delay to let DOM render the input
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [collapsed, running]);
 
   const fit = useCallback(() => {
     if (fitRef.current && termRef.current && containerRef.current) {
@@ -96,7 +82,6 @@ export default function ButlerChat() {
       letterSpacing: 0.5,
       cursorBlink: false,
       cursorStyle: "block",
-      disableStdin: true,
       theme: {
         background: "#0a0a0a",
         foreground: "#e0e0e0",
@@ -135,6 +120,14 @@ export default function ButlerChat() {
 
     const observer = new ResizeObserver(() => fit());
     observer.observe(containerRef.current);
+
+    // Forward keystrokes to the WebSocket (same pattern as TerminalPanel)
+    term.onData((data) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(data);
+      }
+    });
 
     // Connect to /ws/butler
     let cancelled = false;
@@ -239,16 +232,6 @@ export default function ButlerChat() {
     setStarting(false);
   };
 
-  const sendInput = () => {
-    const trimmed = input.trim();
-    if (!trimmed) return;
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(trimmed + "\r");
-      setInput("");
-    }
-  };
-
   // Still loading status
   if (running === null) {
     return (
@@ -336,31 +319,6 @@ export default function ButlerChat() {
 
       {/* Terminal */}
       <div ref={containerRef} className="h-[40vh] min-h-[200px] overflow-hidden" />
-
-      {/* Input bar */}
-      <div className="flex items-center gap-2 px-3 py-2 border-t border-border shrink-0">
-        <input
-          ref={inputRef}
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              sendInput();
-            }
-          }}
-          placeholder={t.inputPlaceholder}
-          className="flex-1 bg-transparent text-[11px] text-text placeholder:text-text-muted outline-none border border-border px-2 py-1.5"
-        />
-        <button
-          type="button"
-          onClick={sendInput}
-          className="text-[11px] text-text-muted hover:text-text px-2 py-1.5 border border-border hover:border-text-muted transition-colors"
-        >
-          {t.send}
-        </button>
-      </div>
     </div>
   );
 }
