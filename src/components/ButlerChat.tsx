@@ -156,6 +156,8 @@ export default function ButlerChat() {
       return baseUrl;
     };
 
+    let fitPending = false;
+
     const connect = async () => {
       const base = await resolveBase();
       if (cancelled) return;
@@ -174,7 +176,10 @@ export default function ButlerChat() {
 
       ws.onmessage = (e) => {
         term.write(e.data);
-        requestAnimationFrame(() => fit());
+        if (!fitPending) {
+          fitPending = true;
+          requestAnimationFrame(() => { fit(); fitPending = false; });
+        }
       };
 
       ws.onclose = (e) => {

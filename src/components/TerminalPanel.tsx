@@ -181,6 +181,8 @@ export default function TerminalPanel({
     let reattachAttempts = 0;
     const MAX_REATTACH = 5;
 
+    let fitPending = false;
+
     const connect = async () => {
       const base = await resolveBase();
       if (cancelled) return;
@@ -203,7 +205,10 @@ export default function TerminalPanel({
 
       ws.onmessage = (e) => {
         term.write(e.data);
-        requestAnimationFrame(() => fit());
+        if (!fitPending) {
+          fitPending = true;
+          requestAnimationFrame(() => { fit(); fitPending = false; });
+        }
         const cb = onActivityRef.current;
         if (cb) cb();
       };
