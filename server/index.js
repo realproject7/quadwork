@@ -1555,6 +1555,8 @@ function spawnButlerPty() {
       state: "running",
       error: null,
       scrollback: Buffer.alloc(0),
+      command,
+      model: butlerCfg.model || "",
     };
 
     const SCROLLBACK_SIZE = 64 * 1024;
@@ -1637,9 +1639,12 @@ app.post("/api/butler/stop", (_req, res) => {
 });
 
 app.get("/api/butler/status", (_req, res) => {
+  const running = butlerSession.state === "running" && !!butlerSession.term;
   res.json({
-    running: butlerSession.state === "running" && !!butlerSession.term,
+    running,
     pid: butlerSession.term ? butlerSession.term.pid : null,
+    command: running ? butlerSession.command : undefined,
+    model: running ? butlerSession.model : undefined,
   });
 });
 
