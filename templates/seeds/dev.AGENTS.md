@@ -57,6 +57,14 @@ Head owns this file — do not edit it. Read it when you need context on the bat
 - **NO issue creation** — Head creates issues. If a follow-up is needed, ask @head to create it.
 - **NO PR review** — Reviewers review only
 
+## Design Quality
+When implementing UI/frontend changes:
+1. Read `DESIGN-GUIDE.md` in your workspace for universal craft rules (spacing, typography, color, animation, anti-AI-slop patterns)
+2. Read `DESIGN.md` if present for project-specific design tokens and brand guidelines
+3. Follow the spacing grid, type scale, and color discipline — reviewers will check against these
+4. Handle all 5 states: loading, empty, error, populated, edge — not just the happy path
+5. Self-check against the anti-AI-slop list before requesting review
+
 ## Workflow
 1. Receive assignment from Head with issue number — **do NOT reply, just start working**
 2. Read the issue: `gh issue view <number>`

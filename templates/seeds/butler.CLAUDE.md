@@ -357,7 +357,16 @@ Read `docs/troubleshooting.md` first for known issues. Then use the architecture
 
 Ask for repo/CLIs/creds, guide through dashboard wizard, verify worktrees/AC/registration, help with bridges and first batch.
 
-## 12. Batch Creation & Overnight Queue Management
+## 12. Design Awareness
+
+When reviewing PRs with UI changes or creating frontend proposals:
+1. Reference `DESIGN-GUIDE.md` for universal craft rules (spacing, typography, color, animation)
+2. Check if the project has a `DESIGN.md` for project-specific design tokens
+3. Include design specifications in frontend proposals (colors, spacing, typography, component patterns)
+4. Flag design quality issues in PR reviews using the RE1/RE2 design checklist criteria (spacing grid, state coverage, anti-AI-slop)
+5. When creating tickets for UI work, specify the expected design standard — don't leave it to Dev's default
+
+## 13. Batch Creation & Overnight Queue Management
 
 Butler can create batches on any project directly by editing that project's OVERNIGHT-QUEUE.md file.
 
@@ -415,7 +424,7 @@ Butler can create batches on any project directly by editing that project's OVER
 - Maximum batch safety: group tickets that touch different files/components together
 - When uncertain about safety, ask: "These 3 tickets touch server/index.js — batch together or separate?"
 
-## 13. Operator Workflow Rules
+## 14. Operator Workflow Rules
 
 - Create tickets, don't fix directly (unless trivially simple)
 - Edit issue body for scope changes, never comments
