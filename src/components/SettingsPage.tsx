@@ -296,7 +296,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const savedConfigRef = useRef<string>("");
-  const butlerStartConfig = useRef<{ command: string; model: string } | null>(null);
+  const [butlerStartConfig, setButlerStartConfig] = useState<{ command: string; model: string } | null>(null);
   // #212: drop the per-project accordion. AGENTS.md edit toggles
   // still need a per-key flag, so we keep `expanded` but no longer
   // gate the project body on it — every project is open by default.
@@ -393,16 +393,10 @@ export default function SettingsPage() {
       .then((r) => (r.ok ? r.json() : { running: false }))
       .then((d) => {
         setButlerRunning(!!d.running);
-        if (d.running && !butlerStartConfig.current) {
-          try {
-            const saved = JSON.parse(savedConfigRef.current);
-            butlerStartConfig.current = {
-              command: saved.butler?.command || "claude",
-              model: saved.butler?.model || "opus",
-            };
-          } catch { /* no saved config yet */ }
+        if (d.running && d.command) {
+          setButlerStartConfig({ command: d.command, model: d.model || "" });
         }
-        if (!d.running) butlerStartConfig.current = null;
+        if (!d.running) setButlerStartConfig(null);
       })
       .catch(() => {});
   }, []);
@@ -461,12 +455,7 @@ export default function SettingsPage() {
         const data = await r.json();
         if (stopping || data.ok) {
           if (stopping) {
-            butlerStartConfig.current = null;
-          } else {
-            butlerStartConfig.current = {
-              command: config?.butler?.command || "claude",
-              model: config?.butler?.model || "opus",
-            };
+            setButlerStartConfig(null);
           }
           refreshButlerStatus();
           updateButler({ enabled: !stopping });
@@ -652,9 +641,9 @@ export default function SettingsPage() {
   if (!config) return <div className="p-6 text-text-muted text-xs">{t.loading}</div>;
 
   const isDirty = savedConfigRef.current !== "" && JSON.stringify(config) !== savedConfigRef.current;
-  const butlerConfigChanged = butlerRunning && butlerStartConfig.current != null && (
-    (config.butler?.command || "claude") !== butlerStartConfig.current.command ||
-    (config.butler?.model || "opus") !== butlerStartConfig.current.model
+  const butlerConfigChanged = butlerRunning && butlerStartConfig != null && (
+    (config.butler?.command || "claude") !== butlerStartConfig.command ||
+    (config.butler?.model || "") !== butlerStartConfig.model
   );
 
   return (
