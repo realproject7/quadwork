@@ -1512,11 +1512,14 @@ function spawnButlerPty() {
       } catch {}
     }
 
-    const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.AGENTS.md");
-    if (fs.existsSync(seedPath)) {
-      const agentsPath = path.join(docsDir, "AGENTS.md");
-      if (!fs.existsSync(agentsPath)) {
-        fs.copyFileSync(seedPath, agentsPath);
+    const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.CLAUDE.md");
+    const claudePath = path.join(docsDir, "CLAUDE.md");
+    if (!fs.existsSync(claudePath)) {
+      const legacyPath = path.join(docsDir, "AGENTS.md");
+      if (fs.existsSync(legacyPath)) {
+        fs.copyFileSync(legacyPath, claudePath);
+      } else if (fs.existsSync(seedPath)) {
+        fs.copyFileSync(seedPath, claudePath);
       }
     }
 
