@@ -181,12 +181,7 @@ export default function TerminalPanel({
     let reattachAttempts = 0;
     const MAX_REATTACH = 5;
 
-    // #511: aggressive post-replay fit strategy. A single rAF fit
-    // isn't enough — the container may not have final CSS dimensions
-    // when the first WS message arrives. Retry fit() on an interval
-    // for the first 2s after connect to cover slow layout, SSR
-    // hydration delays, and lazy container sizing.
-    let postReplayFitTimer: ReturnType<typeof setInterval> | null = null;
+    let fitPending = false;
 
     const connect = async () => {
       const base = await resolveBase();
@@ -198,19 +193,6 @@ export default function TerminalPanel({
 
       ws.onopen = () => {
         reattachAttempts = 0;
-        // #511: start the aggressive fit interval on connect. Fires
-        // fit() every 500ms for 2s (4 attempts) to catch containers
-        // that aren't layout-resolved yet when scrollback arrives.
-        if (postReplayFitTimer) clearInterval(postReplayFitTimer);
-        let fitAttempts = 0;
-        postReplayFitTimer = setInterval(() => {
-          fit();
-          fitAttempts++;
-          if (fitAttempts >= 4) {
-            clearInterval(postReplayFitTimer!);
-            postReplayFitTimer = null;
-          }
-        }, 500);
         ws.send(
           JSON.stringify({
             type: "resize",
@@ -218,25 +200,20 @@ export default function TerminalPanel({
             rows: term.rows,
           })
         );
-        // #461: request scrollback replay after xterm + onmessage are
-        // ready. This eliminates the timing race where server-sent
-        // scrollback arrived before the client could process it.
         ws.send(JSON.stringify({ type: "replay" }));
       };
 
       ws.onmessage = (e) => {
         term.write(e.data);
+        if (!fitPending) {
+          fitPending = true;
+          requestAnimationFrame(() => { fit(); fitPending = false; });
+        }
         const cb = onActivityRef.current;
         if (cb) cb();
       };
 
       ws.onclose = async (e) => {
-        // #511: clear any running fit interval so it doesn't overlap
-        // with a new session's fit loop on reattach.
-        if (postReplayFitTimer) {
-          clearInterval(postReplayFitTimer);
-          postReplayFitTimer = null;
-        }
         if (cancelled) return;
         // #368: bounded polling probe of /api/sessions. A single
         // fixed-delay probe is timing-fragile — if the server-side
@@ -280,7 +257,6 @@ export default function TerminalPanel({
 
     return () => {
       cancelled = true;
-      if (postReplayFitTimer) clearInterval(postReplayFitTimer);
       observer.disconnect();
       wsRef.current?.close();
       term.dispose();
