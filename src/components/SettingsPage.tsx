@@ -153,6 +153,8 @@ const COPY = {
     butlerHelp: "Butler is a cross-project operator assistant that runs in ~/docs/. It helps manage tickets, proposals, reviews, and releases across all projects.",
     enable: "Enable",
     disable: "Disable",
+    unsavedChanges: "Unsaved changes",
+    butlerRestartHint: "Butler is running with previous settings. Disable and re-enable to apply changes.",
   },
   ko: {
     loading: "로딩 중...",
@@ -236,6 +238,8 @@ const COPY = {
     butlerHelp: "버틀러는 ~/docs/에서 실행되는 크로스 프로젝트 운영자 어시스턴트입니다. 모든 프로젝트의 티켓, 제안서, 리뷰, 릴리스 관리를 지원합니다.",
     enable: "활성화",
     disable: "비활성화",
+    unsavedChanges: "저장되지 않은 변경사항",
+    butlerRestartHint: "버틀러가 이전 설정으로 실행 중입니다. 변경사항을 적용하려면 비활성화 후 다시 활성화하세요.",
   },
 } as const;
 
@@ -291,6 +295,8 @@ export default function SettingsPage() {
   const [config, setConfig] = useState<Config | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const savedConfigRef = useRef<string>("");
+  const butlerStartConfig = useRef<{ command: string; model: string } | null>(null);
   // #212: drop the per-project accordion. AGENTS.md edit toggles
   // still need a per-key flag, so we keep `expanded` but no longer
   // gate the project body on it — every project is open by default.
@@ -332,16 +338,18 @@ export default function SettingsPage() {
       })
       .then((data) => {
         setPortDraft(String(data.port || 8400));
-        return setConfig({
-        port: data.port || 8400,
-        agentchattr_url: data.agentchattr_url || "http://127.0.0.1:8300",
-        agentchattr_token: data.agentchattr_token || "",
-        default_backend: data.default_backend || "claude",
-        reviewer_github_user: data.reviewer_github_user || "",
-        operator_name: data.operator_name || "user",
-        projects: data.projects || [],
-        butler: data.butler || {},
-        });
+        const cfg = {
+          port: data.port || 8400,
+          agentchattr_url: data.agentchattr_url || "http://127.0.0.1:8300",
+          agentchattr_token: data.agentchattr_token || "",
+          default_backend: data.default_backend || "claude",
+          reviewer_github_user: data.reviewer_github_user || "",
+          operator_name: data.operator_name || "user",
+          projects: data.projects || [],
+          butler: data.butler || {},
+        };
+        savedConfigRef.current = JSON.stringify(cfg);
+        return setConfig(cfg);
       })
       .catch(() => {});
   }, []);
@@ -383,7 +391,19 @@ export default function SettingsPage() {
   const refreshButlerStatus = useCallback(() => {
     fetch("/api/butler/status")
       .then((r) => (r.ok ? r.json() : { running: false }))
-      .then((d) => setButlerRunning(!!d.running))
+      .then((d) => {
+        setButlerRunning(!!d.running);
+        if (d.running && !butlerStartConfig.current) {
+          try {
+            const saved = JSON.parse(savedConfigRef.current);
+            butlerStartConfig.current = {
+              command: saved.butler?.command || "claude",
+              model: saved.butler?.model || "opus",
+            };
+          } catch { /* no saved config yet */ }
+        }
+        if (!d.running) butlerStartConfig.current = null;
+      })
       .catch(() => {});
   }, []);
 
@@ -440,6 +460,14 @@ export default function SettingsPage() {
       if (r.ok) {
         const data = await r.json();
         if (stopping || data.ok) {
+          if (stopping) {
+            butlerStartConfig.current = null;
+          } else {
+            butlerStartConfig.current = {
+              command: config?.butler?.command || "claude",
+              model: config?.butler?.model || "opus",
+            };
+          }
           refreshButlerStatus();
           updateButler({ enabled: !stopping });
         }
@@ -480,6 +508,7 @@ export default function SettingsPage() {
         body: JSON.stringify(config),
       });
       if (!res.ok) throw new Error(`${res.status}`);
+      savedConfigRef.current = JSON.stringify(config);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -621,6 +650,12 @@ export default function SettingsPage() {
   };
 
   if (!config) return <div className="p-6 text-text-muted text-xs">{t.loading}</div>;
+
+  const isDirty = savedConfigRef.current !== "" && JSON.stringify(config) !== savedConfigRef.current;
+  const butlerConfigChanged = butlerRunning && butlerStartConfig.current != null && (
+    (config.butler?.command || "claude") !== butlerStartConfig.current.command ||
+    (config.butler?.model || "opus") !== butlerStartConfig.current.model
+  );
 
   return (
     <div className="h-full w-full overflow-y-auto p-6">
@@ -825,6 +860,9 @@ export default function SettingsPage() {
             <span className="text-[11px] text-text">{t.butlerAutoStart}</span>
           </label>
           <p className="text-[10px] text-text-muted leading-snug">{t.butlerHelp}</p>
+          {butlerConfigChanged && (
+            <p className="text-[10px] text-yellow-500 leading-snug mt-1">⚠ {t.butlerRestartHint}</p>
+          )}
         </div>
       </section>
 
@@ -1124,6 +1162,20 @@ export default function SettingsPage() {
           {saving ? t.saving : saved ? t.saved : t.save}
         </button>
       </div>
+
+      {/* Sticky save bar */}
+      {isDirty && (
+        <div className="fixed bottom-0 left-0 right-0 border-t border-border bg-bg-surface px-6 py-3 flex items-center justify-between z-50">
+          <span className="text-[12px] text-text-muted">{t.unsavedChanges}</span>
+          <button
+            onClick={save}
+            disabled={saving}
+            className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
+          >
+            {saving ? t.saving : t.save}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
