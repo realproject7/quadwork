@@ -2839,7 +2839,7 @@ function runStartupMigrations(cfg) {
     }
   }
 
-  // #677: seed DESIGN-GUIDE.md into existing agent worktrees
+  // #690: seed DESIGN-GUIDE.md into existing agent worktrees
   const designGuideSrc = path.join(__dirname, "..", "templates", "seeds", "DESIGN-GUIDE.md");
   if (fs.existsSync(designGuideSrc)) {
     for (const p of projects) {
@@ -2852,7 +2852,7 @@ function runStartupMigrations(cfg) {
         if (fs.existsSync(wtDir) && !fs.existsSync(dst)) {
           try {
             fs.copyFileSync(designGuideSrc, dst);
-            console.log(`[#677] ${p.id}: seeded DESIGN-GUIDE.md into ${agent} worktree`);
+            console.log(`[#690] ${p.id}: seeded DESIGN-GUIDE.md into ${agent} worktree`);
           } catch {}
         }
       }

@@ -2130,7 +2130,7 @@ router.post("/api/setup", (req, res) => {
           seeded.push(`${agent}/CLAUDE.md`);
         }
 
-        // DESIGN-GUIDE.md — universal design craft rules (#677)
+        // DESIGN-GUIDE.md — universal design craft rules (#690)
         const designGuideSrc = path.join(TEMPLATES_DIR, "seeds", "DESIGN-GUIDE.md");
         const designGuideDst = path.join(wtDir, "DESIGN-GUIDE.md");
         if (fs.existsSync(designGuideSrc) && !fs.existsSync(designGuideDst)) {
