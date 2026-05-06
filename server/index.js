@@ -2135,12 +2135,9 @@ wss.on("connection:terminal", async (ws, req) => {
 
   session.viewers.add(ws);
 
-  // PTY → all viewers (#538: scrub secrets from live output)
+  // PTY → this viewer (#538: scrub secrets from live output)
   const dataHandler = session.term.onData((data) => {
-    const scrubbed = scrubSecrets(data);
-    for (const v of session.viewers) {
-      if (v.readyState === WebSocket.OPEN) v.send(scrubbed);
-    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(scrubSecrets(data));
   });
 
   // Client → PTY
@@ -2200,10 +2197,7 @@ wss.on("connection:butler", async (ws) => {
   butlerSession.viewers.add(ws);
 
   const dataHandler = butlerSession.term.onData((data) => {
-    const scrubbed = scrubSecrets(data);
-    for (const v of butlerSession.viewers) {
-      if (v.readyState === WebSocket.OPEN) v.send(scrubbed);
-    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(scrubSecrets(data));
   });
 
   ws.on("message", (msg) => {
