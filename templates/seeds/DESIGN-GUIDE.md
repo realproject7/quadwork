@@ -146,6 +146,27 @@ Missing states are the most common silent failure of AI-generated UI. If you onl
 
 ---
 
+## Existing Patterns First
+
+Before writing new styles, **read the existing components in the project**. Match what's already there:
+- Check existing color tokens, spacing, and typography — don't introduce new values
+- If the project uses `text-[11px]` for labels, use that — don't invent `text-[10px]`
+- If the project has a card component pattern, reuse it — don't create a new card style
+- When in doubt, grep the codebase for similar UI to what you're building
+
+---
+
+## Responsive Design
+
+- Design mobile-first or at minimum handle narrow screens
+- Use framework breakpoints (Tailwind: `sm:640px`, `md:768px`, `lg:1024px`)
+- Stack vertically on mobile, side-by-side on desktop: `flex-col lg:flex-row`
+- Hide non-essential content on mobile: `hidden lg:block`
+- Touch targets: minimum 44×44px on mobile
+- Test at 375px width (iPhone SE) as the minimum
+
+---
+
 ## Accessibility Baseline
 
 - All interactive elements must be keyboard-reachable (Tab/Enter/Escape).
