@@ -167,7 +167,7 @@ const agentSessions = new Map();
 const chattrProcesses = new Map();
 
 // #631: Butler session — single global PTY (not per-project, no AC integration)
-let butlerSession = { term: null, viewers: new Set(), state: "stopped", error: null, scrollback: Buffer.alloc(0) };
+let butlerSession = { term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
 
 // --- MCP auth proxy for Codex (can't pass headers via -c flag) ---
 // Maps "project/agent" → { server, port }
@@ -589,6 +589,8 @@ async function spawnAgentPty(project, agent) {
       agentId: agent,
       term,
       viewers: new Set(),
+      viewerDims: new Map(),
+      lastDims: null,
       state: "running",
       error: null,
       acRegistrationName: built.acRegistrationName,
@@ -716,7 +718,7 @@ async function spawnAgentPty(project, agent) {
 
     return { ok: true, pid: term.pid };
   } catch (err) {
-    agentSessions.set(key, { projectId: project, agentId: agent, term: null, viewers: new Set(), state: "error", error: err.message });
+    agentSessions.set(key, { projectId: project, agentId: agent, term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "error", error: err.message });
     return { ok: false, error: err.message };
   }
 }
@@ -728,7 +730,7 @@ async function spawnAgentPty(project, agent) {
 async function stopAgentSession(key) {
   const session = agentSessions.get(key);
   if (!session) {
-    agentSessions.set(key, { projectId: null, agentId: null, term: null, viewers: new Set(), state: "stopped", error: null });
+    agentSessions.set(key, { projectId: null, agentId: null, term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null });
     return;
   }
   if (session.term) {
@@ -1554,6 +1556,8 @@ function spawnButlerPty() {
     butlerSession = {
       term,
       viewers: new Set(),
+      viewerDims: new Map(),
+      lastDims: null,
       state: "running",
       error: null,
       scrollback: Buffer.alloc(0),
@@ -1602,7 +1606,7 @@ function spawnButlerPty() {
     console.log(`[butler] spawned (PID: ${term.pid}, cwd: ${docsDir})`);
     return { ok: true, pid: term.pid };
   } catch (err) {
-    butlerSession = { term: null, viewers: new Set(), state: "error", error: err.message, scrollback: Buffer.alloc(0) };
+    butlerSession = { term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "error", error: err.message, scrollback: Buffer.alloc(0) };
     return { ok: false, error: err.message };
   }
 }
@@ -1615,7 +1619,7 @@ function stopButlerPty() {
   for (const v of butlerSession.viewers) {
     if (v.readyState <= 1) v.close(1000, "stopped");
   }
-  butlerSession = { term: null, viewers: new Set(), state: "stopped", error: null, scrollback: Buffer.alloc(0) };
+  butlerSession = { term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
 }
 
 app.post("/api/butler/start", (_req, res) => {
@@ -2147,26 +2151,27 @@ wss.on("connection:terminal", async (ws, req) => {
     try {
       const parsed = JSON.parse(str);
       if (parsed.type === "resize") {
-        // #541: strict numeric type check and bounds validation before
-        // passing to PTY. The dashboard client (TerminalPanel.tsx) sends
-        // xterm.js cols/rows which are always numbers. Reject anything
-        // else at the boundary.
         if (typeof parsed.cols === "number" && typeof parsed.rows === "number" &&
             Number.isFinite(parsed.cols) && Number.isFinite(parsed.rows) &&
             parsed.cols >= 1 && parsed.cols <= 500 &&
             parsed.rows >= 1 && parsed.rows <= 500) {
-          session.term.resize(parsed.cols, parsed.rows);
+          session.viewerDims.set(ws, { cols: parsed.cols, rows: parsed.rows });
+          const dims = [...session.viewerDims.values()];
+          const merged = {
+            cols: Math.min(...dims.map(d => d.cols)),
+            rows: Math.min(...dims.map(d => d.rows)),
+          };
+          if (!session.lastDims ||
+              merged.cols !== session.lastDims.cols ||
+              merged.rows !== session.lastDims.rows) {
+            session.term.resize(merged.cols, merged.rows);
+            session.lastDims = merged;
+          }
         }
         return;
       }
-      // #461: client requests scrollback replay after xterm is fully
-      // initialized. This eliminates the timing race where the server
-      // sends scrollback before the client's onmessage handler is ready.
-      // If the buffer is empty (idle agent with no output yet), send a
-      // synthetic status line so the terminal isn't completely blank.
       if (parsed.type === "replay") {
         if (session.scrollback && session.scrollback.length > 0) {
-          // #538: scrub likely secrets before replaying accumulated output.
           ws.send(scrubScrollback(session.scrollback));
         } else {
           ws.send(`\x1b[2m[agent online — waiting for input]\x1b[0m\r\n`);
@@ -2180,6 +2185,18 @@ wss.on("connection:terminal", async (ws, req) => {
   ws.on("close", () => {
     dataHandler.dispose();
     session.viewers.delete(ws);
+    session.viewerDims.delete(ws);
+    if (session.viewerDims.size > 0 && session.term) {
+      const dims = [...session.viewerDims.values()];
+      const merged = {
+        cols: Math.min(...dims.map(d => d.cols)),
+        rows: Math.min(...dims.map(d => d.rows)),
+      };
+      if (merged.cols !== session.lastDims?.cols || merged.rows !== session.lastDims?.rows) {
+        session.term.resize(merged.cols, merged.rows);
+        session.lastDims = merged;
+      }
+    }
   });
 });
 
@@ -2210,7 +2227,18 @@ wss.on("connection:butler", async (ws) => {
             Number.isFinite(parsed.cols) && Number.isFinite(parsed.rows) &&
             parsed.cols >= 1 && parsed.cols <= 500 &&
             parsed.rows >= 1 && parsed.rows <= 500) {
-          butlerSession.term.resize(parsed.cols, parsed.rows);
+          butlerSession.viewerDims.set(ws, { cols: parsed.cols, rows: parsed.rows });
+          const dims = [...butlerSession.viewerDims.values()];
+          const merged = {
+            cols: Math.min(...dims.map(d => d.cols)),
+            rows: Math.min(...dims.map(d => d.rows)),
+          };
+          if (!butlerSession.lastDims ||
+              merged.cols !== butlerSession.lastDims.cols ||
+              merged.rows !== butlerSession.lastDims.rows) {
+            butlerSession.term.resize(merged.cols, merged.rows);
+            butlerSession.lastDims = merged;
+          }
         }
         return;
       }
@@ -2229,6 +2257,18 @@ wss.on("connection:butler", async (ws) => {
   ws.on("close", () => {
     dataHandler.dispose();
     butlerSession.viewers.delete(ws);
+    butlerSession.viewerDims.delete(ws);
+    if (butlerSession.viewerDims.size > 0 && butlerSession.term) {
+      const dims = [...butlerSession.viewerDims.values()];
+      const merged = {
+        cols: Math.min(...dims.map(d => d.cols)),
+        rows: Math.min(...dims.map(d => d.rows)),
+      };
+      if (merged.cols !== butlerSession.lastDims?.cols || merged.rows !== butlerSession.lastDims?.rows) {
+        butlerSession.term.resize(merged.cols, merged.rows);
+        butlerSession.lastDims = merged;
+      }
+    }
   });
 });
 
