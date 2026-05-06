@@ -89,6 +89,21 @@ Run this once at the start of each session.
 [Reason for verdict]
 ```
 
+## Design Review Checklist
+When reviewing PRs with UI/frontend changes, check these in addition to code quality:
+- [ ] Spacing follows 4px grid (4, 8, 12, 16, 24, 32, 48px)
+- [ ] Typography: max 3 font sizes per component, ALL CAPS has letter-spacing
+- [ ] Color: accent used max 2 times per screen, semantic colors for status
+- [ ] Interactive elements have hover + focus + disabled states
+- [ ] Text contrast: 4.5:1 for body, 3:1 for large text
+- [ ] State coverage: loading, empty, error states handled (not just happy path)
+- [ ] No AI slop: no default indigo accent, no emoji icons, no filler text, no hero gradients
+- [ ] Layout: left edges align, body text left-aligned (not centered)
+- [ ] Animation: only color/opacity/transform, under 300ms, respects prefers-reduced-motion
+- [ ] No rounded cards with colored left-border accent ("AI dashboard tile")
+
+Reference `DESIGN-GUIDE.md` in the workspace for full details on each rule.
+
 ## Workflow
 1. Receive review request from Dev with PR number
 2. Read the PR: `gh pr view <number>`, `gh pr diff <number>`
