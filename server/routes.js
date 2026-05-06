@@ -2130,6 +2130,14 @@ router.post("/api/setup", (req, res) => {
           seeded.push(`${agent}/CLAUDE.md`);
         }
 
+        // DESIGN-GUIDE.md — universal design craft rules (#677)
+        const designGuideSrc = path.join(TEMPLATES_DIR, "seeds", "DESIGN-GUIDE.md");
+        const designGuideDst = path.join(wtDir, "DESIGN-GUIDE.md");
+        if (fs.existsSync(designGuideSrc) && !fs.existsSync(designGuideDst)) {
+          fs.copyFileSync(designGuideSrc, designGuideDst);
+          seeded.push(`${agent}/DESIGN-GUIDE.md`);
+        }
+
         // .gitignore — ensure token files are never committed
         const gitignorePath = path.join(wtDir, ".gitignore");
         const tokenIgnorePatterns = "reviewer-token\n*-token\n";
