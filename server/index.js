@@ -2839,6 +2839,26 @@ function runStartupMigrations(cfg) {
     }
   }
 
+  // #690: seed DESIGN-GUIDE.md into existing agent worktrees
+  const designGuideSrc = path.join(__dirname, "..", "templates", "seeds", "DESIGN-GUIDE.md");
+  if (fs.existsSync(designGuideSrc)) {
+    for (const p of projects) {
+      if (!p.working_dir) continue;
+      const dirName = path.basename(p.working_dir);
+      const parentDir = path.dirname(p.working_dir);
+      for (const agent of ["head", "dev", "re1", "re2"]) {
+        const wtDir = path.join(parentDir, `${dirName}-${agent}`);
+        const dst = path.join(wtDir, "DESIGN-GUIDE.md");
+        if (fs.existsSync(wtDir) && !fs.existsSync(dst)) {
+          try {
+            fs.copyFileSync(designGuideSrc, dst);
+            console.log(`[#690] ${p.id}: seeded DESIGN-GUIDE.md into ${agent} worktree`);
+          } catch {}
+        }
+      }
+    }
+  }
+
   return acRestartNeeded;
 }
 
