@@ -163,19 +163,7 @@ export default function ButlerChat() {
       const ws = new WebSocket(`${base}/ws/butler`);
       wsRef.current = ws;
 
-      let postReplayFitTimer: ReturnType<typeof setInterval> | null = null;
-
       ws.onopen = () => {
-        if (postReplayFitTimer) clearInterval(postReplayFitTimer);
-        let fitAttempts = 0;
-        postReplayFitTimer = setInterval(() => {
-          fit();
-          fitAttempts++;
-          if (fitAttempts >= 4) {
-            clearInterval(postReplayFitTimer!);
-            postReplayFitTimer = null;
-          }
-        }, 500);
         ws.send(JSON.stringify({
           type: "resize",
           cols: term.cols,
@@ -186,13 +174,10 @@ export default function ButlerChat() {
 
       ws.onmessage = (e) => {
         term.write(e.data);
+        requestAnimationFrame(() => fit());
       };
 
       ws.onclose = (e) => {
-        if (postReplayFitTimer) {
-          clearInterval(postReplayFitTimer);
-          postReplayFitTimer = null;
-        }
         if (cancelled) return;
         term.write(`\r\n\x1b[38;2;115;115;115m[session closed: ${e.reason || e.code}]\x1b[0m\r\n`);
         setRunning(false);
