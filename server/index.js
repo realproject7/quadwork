@@ -3,7 +3,7 @@ const http = require("http");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { WebSocketServer } = require("ws");
+const { WebSocketServer, WebSocket } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
@@ -167,7 +167,7 @@ const agentSessions = new Map();
 const chattrProcesses = new Map();
 
 // #631: Butler session — single global PTY (not per-project, no AC integration)
-let butlerSession = { term: null, ws: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
+let butlerSession = { term: null, viewers: new Set(), state: "stopped", error: null, scrollback: Buffer.alloc(0) };
 
 // --- MCP auth proxy for Codex (can't pass headers via -c flag) ---
 // Maps "project/agent" → { server, port }
@@ -588,7 +588,7 @@ async function spawnAgentPty(project, agent) {
       projectId: project,
       agentId: agent,
       term,
-      ws: null,
+      viewers: new Set(),
       state: "running",
       error: null,
       acRegistrationName: built.acRegistrationName,
@@ -686,11 +686,10 @@ async function spawnAgentPty(project, agent) {
         current.state = "stopped";
         current.error = exitCode ? `exit:${exitCode}` : null;
         current.term = null;
-        // Close WS if attached
-        if (current.ws && current.ws.readyState <= 1) {
-          current.ws.close(1000, `exited:${exitCode}`);
+        for (const v of current.viewers) {
+          if (v.readyState <= 1) v.close(1000, `exited:${exitCode}`);
         }
-        current.ws = null;
+        current.viewers.clear();
         // #391 / quadwork#250: a crashed PTY must also clear its
         // heartbeat interval (otherwise it leaks and a later /start
         // double-registers) and free the AgentChattr slot (otherwise
@@ -717,7 +716,7 @@ async function spawnAgentPty(project, agent) {
 
     return { ok: true, pid: term.pid };
   } catch (err) {
-    agentSessions.set(key, { projectId: project, agentId: agent, term: null, ws: null, state: "error", error: err.message });
+    agentSessions.set(key, { projectId: project, agentId: agent, term: null, viewers: new Set(), state: "error", error: err.message });
     return { ok: false, error: err.message };
   }
 }
@@ -729,17 +728,17 @@ async function spawnAgentPty(project, agent) {
 async function stopAgentSession(key) {
   const session = agentSessions.get(key);
   if (!session) {
-    agentSessions.set(key, { projectId: null, agentId: null, term: null, ws: null, state: "stopped", error: null });
+    agentSessions.set(key, { projectId: null, agentId: null, term: null, viewers: new Set(), state: "stopped", error: null });
     return;
   }
   if (session.term) {
     try { session.term.kill(); } catch {}
     session.term = null;
   }
-  if (session.ws && session.ws.readyState <= 1) {
-    session.ws.close(1000, "stopped");
+  for (const v of session.viewers) {
+    if (v.readyState <= 1) v.close(1000, "stopped");
   }
-  session.ws = null;
+  session.viewers.clear();
   session.state = "stopped";
   session.error = null;
   // Stop heartbeat before deregister so we don't race a final POST
@@ -1554,7 +1553,7 @@ function spawnButlerPty() {
 
     butlerSession = {
       term,
-      ws: null,
+      viewers: new Set(),
       state: "running",
       error: null,
       scrollback: Buffer.alloc(0),
@@ -1593,17 +1592,17 @@ function spawnButlerPty() {
         butlerSession.state = "stopped";
         butlerSession.error = exitCode ? `exit:${exitCode}` : null;
         butlerSession.term = null;
-        if (butlerSession.ws && butlerSession.ws.readyState <= 1) {
-          butlerSession.ws.close(1000, `exited:${exitCode}`);
+        for (const v of butlerSession.viewers) {
+          if (v.readyState <= 1) v.close(1000, `exited:${exitCode}`);
         }
-        butlerSession.ws = null;
+        butlerSession.viewers.clear();
       }
     });
 
     console.log(`[butler] spawned (PID: ${term.pid}, cwd: ${docsDir})`);
     return { ok: true, pid: term.pid };
   } catch (err) {
-    butlerSession = { term: null, ws: null, state: "error", error: err.message, scrollback: Buffer.alloc(0) };
+    butlerSession = { term: null, viewers: new Set(), state: "error", error: err.message, scrollback: Buffer.alloc(0) };
     return { ok: false, error: err.message };
   }
 }
@@ -1613,10 +1612,10 @@ function stopButlerPty() {
     try { butlerSession.term.kill(); } catch {}
     butlerSession.term = null;
   }
-  if (butlerSession.ws && butlerSession.ws.readyState <= 1) {
-    butlerSession.ws.close(1000, "stopped");
+  for (const v of butlerSession.viewers) {
+    if (v.readyState <= 1) v.close(1000, "stopped");
   }
-  butlerSession = { term: null, ws: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
+  butlerSession = { term: null, viewers: new Set(), state: "stopped", error: null, scrollback: Buffer.alloc(0) };
 }
 
 app.post("/api/butler/start", (_req, res) => {
@@ -2134,22 +2133,13 @@ wss.on("connection:terminal", async (ws, req) => {
     session = agentSessions.get(sessionKey);
   }
 
-  // Close previous WS if one was attached
-  if (session.ws && session.ws !== ws && session.ws.readyState <= 1) {
-    session.ws.close(1000, "replaced");
-  }
+  session.viewers.add(ws);
 
-  // Attach WS to session
-  session.ws = ws;
-
-  // #418/#461: scrollback replay is now client-initiated via
-  // {"type":"replay"} to avoid the timing race where eager replay
-  // arrived before the client's onmessage handler was registered.
-
-  // PTY → client (#538: scrub secrets from live output)
+  // PTY → all viewers (#538: scrub secrets from live output)
   const dataHandler = session.term.onData((data) => {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(scrubSecrets(data));
+    const scrubbed = scrubSecrets(data);
+    for (const v of session.viewers) {
+      if (v.readyState === WebSocket.OPEN) v.send(scrubbed);
     }
   });
 
@@ -2192,10 +2182,7 @@ wss.on("connection:terminal", async (ws, req) => {
 
   ws.on("close", () => {
     dataHandler.dispose();
-    // Only clear ws reference, don't kill PTY (it stays running for reconnect)
-    if (session.ws === ws) {
-      session.ws = null;
-    }
+    session.viewers.delete(ws);
   });
 });
 
@@ -2210,15 +2197,12 @@ wss.on("connection:butler", async (ws) => {
     }
   }
 
-  if (butlerSession.ws && butlerSession.ws !== ws && butlerSession.ws.readyState <= 1) {
-    butlerSession.ws.close(1000, "replaced");
-  }
-
-  butlerSession.ws = ws;
+  butlerSession.viewers.add(ws);
 
   const dataHandler = butlerSession.term.onData((data) => {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(scrubSecrets(data));
+    const scrubbed = scrubSecrets(data);
+    for (const v of butlerSession.viewers) {
+      if (v.readyState === WebSocket.OPEN) v.send(scrubbed);
     }
   });
 
@@ -2250,9 +2234,7 @@ wss.on("connection:butler", async (ws) => {
 
   ws.on("close", () => {
     dataHandler.dispose();
-    if (butlerSession.ws === ws) {
-      butlerSession.ws = null;
-    }
+    butlerSession.viewers.delete(ws);
   });
 });
 
