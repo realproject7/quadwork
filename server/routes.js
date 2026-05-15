@@ -75,10 +75,13 @@ function adaptiveTTL(baseTTL) {
 // Wraps a synchronous execFileSync gh call with an in-memory cache that
 // serves stale data when rate-limited instead of hammering the API.
 const _ghEndpointCache = new Map(); // key → { ts, data }
-const GH_ENDPOINT_CACHE_TTL = 30_000; // 30s base TTL
+const GH_ENDPOINT_CACHE_TTL = 60_000; // #698: 60s base TTL (was 30s)
 
 function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
-  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
+  // #698: add per-endpoint jitter (0–15s) to stagger cache expirations and
+  // avoid burst traffic that triggers GitHub's secondary rate limit.
+  const jitter = (cacheKey.length * 7919) % 15_000; // deterministic per key
+  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL) + jitter;
   const cached = _ghEndpointCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < ttl) {
     return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
