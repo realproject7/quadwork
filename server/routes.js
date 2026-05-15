@@ -303,6 +303,7 @@ const { syncChattrToken } = require("./config");
 // "head-2" or "re1-3" are left untouched.
 const MENTION_AGENT_NAMES = ["head", "dev", "re1", "re2"];
 function normalizeMentions(text) {
+  if (typeof text !== "string" || !text) return text || "";
   return MENTION_AGENT_NAMES.reduce(
     (t, name) => t.replace(new RegExp(`(?<![@\\w])\\b${name}\\b(?![\\w-])`, "gi"), `@${name}`),
     text,
