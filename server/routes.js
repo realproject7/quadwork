@@ -77,8 +77,37 @@ function adaptiveTTL(baseTTL) {
 const _ghEndpointCache = new Map(); // key → { ts, data }
 const GH_ENDPOINT_CACHE_TTL = 60_000; // #698: 60s base TTL (was 30s)
 
-// #698: track in-flight background refreshes to avoid duplicate fetches
+// #698: concurrency-limited background refresh queue. Caps simultaneous
+// gh CLI calls to avoid triggering GitHub's secondary rate limit even
+// when many endpoints expire on the same poll cycle.
 const _ghRefreshing = new Set();
+const GH_MAX_CONCURRENT = 2;
+const _ghRefreshQueue = [];
+let _ghActiveRefreshes = 0;
+
+function _ghDrainQueue() {
+  while (_ghRefreshQueue.length > 0 && _ghActiveRefreshes < GH_MAX_CONCURRENT) {
+    const job = _ghRefreshQueue.shift();
+    _ghActiveRefreshes++;
+    job().finally(() => { _ghActiveRefreshes--; _ghDrainQueue(); });
+  }
+}
+
+function _ghEnqueueRefresh(cacheKey, ghArgs, transform) {
+  if (_ghRefreshing.has(cacheKey)) return; // already queued/in-flight
+  _ghRefreshing.add(cacheKey);
+  _ghRefreshQueue.push(() =>
+    _execFileAsync("gh", ghArgs, { encoding: "utf-8", timeout: 15000 })
+      .then(({ stdout }) => {
+        let data = JSON.parse(stdout);
+        if (transform) data = transform(data);
+        _ghEndpointCache.set(cacheKey, { ts: Date.now(), data, stale: false });
+      })
+      .catch(() => {}) // keep serving stale on error
+      .finally(() => _ghRefreshing.delete(cacheKey))
+  );
+  _ghDrainQueue();
+}
 
 function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
   const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
@@ -91,20 +120,10 @@ function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
     return res.json({ ...cached.data, _stale: true, _rateLimited: true });
   }
   // #698: stale-while-revalidate — if we have stale data, serve it
-  // immediately and refresh in the background. This prevents burst
-  // synchronous gh calls when multiple endpoints expire on the same poll.
+  // immediately and enqueue a background refresh. The queue caps
+  // concurrent gh calls to GH_MAX_CONCURRENT to prevent burst traffic.
   if (cached) {
-    if (!_ghRefreshing.has(cacheKey)) {
-      _ghRefreshing.add(cacheKey);
-      _execFileAsync("gh", ghArgs, { encoding: "utf-8", timeout: 15000 })
-        .then(({ stdout }) => {
-          let data = JSON.parse(stdout);
-          if (transform) data = transform(data);
-          _ghEndpointCache.set(cacheKey, { ts: Date.now(), data, stale: false });
-        })
-        .catch(() => {}) // keep serving stale on error
-        .finally(() => _ghRefreshing.delete(cacheKey));
-    }
+    _ghEnqueueRefresh(cacheKey, ghArgs, transform);
     return res.json({ ...cached.data, _stale: true });
   }
   // No cached data at all — must fetch synchronously for first load
