@@ -227,7 +227,7 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 30000);
+    const interval = setInterval(fetchData, 60000); // #698: 60s (was 30s)
     return () => clearInterval(interval);
   }, [fetchData]);
 
