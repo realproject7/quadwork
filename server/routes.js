@@ -77,11 +77,11 @@ function adaptiveTTL(baseTTL) {
 const _ghEndpointCache = new Map(); // key → { ts, data }
 const GH_ENDPOINT_CACHE_TTL = 60_000; // #698: 60s base TTL (was 30s)
 
+// #698: track in-flight background refreshes to avoid duplicate fetches
+const _ghRefreshing = new Set();
+
 function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
-  // #698: add per-endpoint jitter (0–15s) to stagger cache expirations and
-  // avoid burst traffic that triggers GitHub's secondary rate limit.
-  const jitter = (cacheKey.length * 7919) % 15_000; // deterministic per key
-  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL) + jitter;
+  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
   const cached = _ghEndpointCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < ttl) {
     return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
@@ -90,6 +90,24 @@ function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
   if (isRateLimited() && cached) {
     return res.json({ ...cached.data, _stale: true, _rateLimited: true });
   }
+  // #698: stale-while-revalidate — if we have stale data, serve it
+  // immediately and refresh in the background. This prevents burst
+  // synchronous gh calls when multiple endpoints expire on the same poll.
+  if (cached) {
+    if (!_ghRefreshing.has(cacheKey)) {
+      _ghRefreshing.add(cacheKey);
+      _execFileAsync("gh", ghArgs, { encoding: "utf-8", timeout: 15000 })
+        .then(({ stdout }) => {
+          let data = JSON.parse(stdout);
+          if (transform) data = transform(data);
+          _ghEndpointCache.set(cacheKey, { ts: Date.now(), data, stale: false });
+        })
+        .catch(() => {}) // keep serving stale on error
+        .finally(() => _ghRefreshing.delete(cacheKey));
+    }
+    return res.json({ ...cached.data, _stale: true });
+  }
+  // No cached data at all — must fetch synchronously for first load
   try {
     const out = execFileSync("gh", ghArgs, { encoding: "utf-8", timeout: 15000 });
     let data = JSON.parse(out);
@@ -97,10 +115,6 @@ function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
     _ghEndpointCache.set(cacheKey, { ts: Date.now(), data, stale: false });
     res.json(data);
   } catch (err) {
-    // On error, try to serve stale cache
-    if (cached) {
-      return res.json({ ...cached.data, _stale: true });
-    }
     res.status(502).json({ error: "gh call failed", detail: err.message });
   }
 }
