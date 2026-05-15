@@ -1380,6 +1380,382 @@ function getRepo(projectId) {
   }
 }
 
+// ─── #703: Batched GraphQL layer ──────────────────────────────────────────
+// Instead of spawning individual `gh issue list` / `gh pr list` subprocesses
+// per project per endpoint, we fetch ALL configured projects' GitHub data in
+// a single GraphQL query. The per-project endpoints read from this shared
+// cache, falling back to individual gh CLI calls if GraphQL fails.
+
+const _graphqlCache = new Map(); // repo → { ts, issues, prs, closedIssues, mergedPrs }
+const GRAPHQL_CACHE_TTL = 60_000; // same as GH_ENDPOINT_CACHE_TTL
+let _graphqlRefreshInFlight = false;
+
+const RECENT_FETCH_LIMIT = 20;
+const RECENT_DISPLAY_LIMIT = 5;
+
+// Build and execute a batched GraphQL query for all configured projects.
+// Returns a Map of repo → { issues, prs, closedIssues, mergedPrs }.
+async function fetchAllProjectsGraphQL() {
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+  } catch {
+    return null;
+  }
+  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo));
+  if (projects.length === 0) return null;
+
+  // Build aliased repository fields — one per project.
+  // Alias must be a valid GraphQL identifier: letters/digits/underscore only.
+  const seen = new Set();
+  const fragments = [];
+  for (const p of projects) {
+    const [owner, name] = p.repo.split("/");
+    const alias = p.repo.replace(/[^a-zA-Z0-9]/g, "_");
+    if (seen.has(alias)) continue; // skip duplicate repos
+    seen.add(alias);
+    fragments.push(`${alias}: repository(owner: "${owner}", name: "${name}") { ...repoFields }`);
+  }
+
+  const query = `query {
+  ${fragments.join("\n  ")}
+}
+fragment repoFields on Repository {
+  openIssues: issues(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    nodes { number title url state labels(first: 5) { nodes { name } } assignees(first: 5) { nodes { login } } createdAt }
+  }
+  closedIssues: issues(first: ${RECENT_FETCH_LIMIT}, states: CLOSED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    nodes { number title url state closedAt }
+  }
+  openPRs: pullRequests(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    nodes { number title url state author { login } reviews(last: 100) { nodes { state author { login } submittedAt } } createdAt }
+  }
+  mergedPRs: pullRequests(first: ${RECENT_FETCH_LIMIT}, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    nodes { number title url state mergedAt author { login } }
+  }
+}`;
+
+  try {
+    const { stdout } = await _execFileAsync("gh", [
+      "api", "graphql", "-f", `query=${query}`,
+    ], { encoding: "utf-8", timeout: 15000 });
+    const data = JSON.parse(stdout).data;
+    if (!data) return null;
+
+    const result = new Map();
+    for (const p of projects) {
+      const alias = p.repo.replace(/[^a-zA-Z0-9]/g, "_");
+      const repoData = data[alias];
+      if (!repoData) continue;
+
+      // Transform GraphQL nodes into the same shape as gh CLI JSON output.
+      const issues = (repoData.openIssues?.nodes || []).map((n) => ({
+        number: n.number,
+        title: n.title,
+        state: n.state === "OPEN" ? "open" : n.state?.toLowerCase() || n.state,
+        url: n.url,
+        labels: (n.labels?.nodes || []).map((l) => ({ name: l.name })),
+        assignees: (n.assignees?.nodes || []).map((a) => ({ login: a.login })),
+        createdAt: n.createdAt,
+      }));
+
+      const prs = (repoData.openPRs?.nodes || []).map((n) => ({
+        number: n.number,
+        title: n.title,
+        state: n.state === "OPEN" ? "open" : n.state?.toLowerCase() || n.state,
+        url: n.url,
+        author: n.author ? { login: n.author.login } : null,
+        assignees: [],
+        reviews: (n.reviews?.nodes || []).map((r) => ({
+          state: r.state,
+          author: r.author ? { login: r.author.login } : null,
+          submittedAt: r.submittedAt,
+        })),
+        createdAt: n.createdAt,
+      }));
+
+      const closedIssues = (repoData.closedIssues?.nodes || [])
+        .slice()
+        .sort((a, b) => {
+          const ta = a?.closedAt ? Date.parse(a.closedAt) : 0;
+          const tb = b?.closedAt ? Date.parse(b.closedAt) : 0;
+          return tb - ta;
+        })
+        .slice(0, RECENT_DISPLAY_LIMIT)
+        .map((n) => ({
+          number: n.number,
+          title: n.title,
+          state: n.state?.toLowerCase() || "closed",
+          url: n.url,
+          closedAt: n.closedAt,
+        }));
+
+      const mergedPrs = (repoData.mergedPRs?.nodes || [])
+        .slice()
+        .sort((a, b) => {
+          const ta = a?.mergedAt ? Date.parse(a.mergedAt) : 0;
+          const tb = b?.mergedAt ? Date.parse(b.mergedAt) : 0;
+          return tb - ta;
+        })
+        .slice(0, RECENT_DISPLAY_LIMIT)
+        .map((n) => ({
+          number: n.number,
+          title: n.title,
+          state: n.state?.toLowerCase() || "merged",
+          url: n.url,
+          mergedAt: n.mergedAt,
+          author: n.author ? { login: n.author.login } : null,
+        }));
+
+      result.set(p.repo, { issues, prs, closedIssues, mergedPrs });
+    }
+    return result;
+  } catch {
+    return null; // fallback to individual gh CLI calls
+  }
+}
+
+// Refresh the shared GraphQL cache for all projects. Called on a timer
+// and on demand when a per-project endpoint has no cached data.
+async function refreshGraphQLCache() {
+  if (_graphqlRefreshInFlight) return;
+  if (isRateLimited()) return; // don't burn quota when critically low
+  _graphqlRefreshInFlight = true;
+  try {
+    const data = await fetchAllProjectsGraphQL();
+    if (data) {
+      const now = Date.now();
+      for (const [repo, repoData] of data) {
+        _graphqlCache.set(repo, { ts: now, ...repoData });
+        // Also populate the per-endpoint _ghEndpointCache so stale-while-
+        // revalidate and existing per-project endpoints pick up the data.
+        _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: repoData.issues, stale: false });
+        _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: repoData.prs, stale: false });
+        _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: repoData.closedIssues, stale: false });
+        _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: repoData.mergedPrs, stale: false });
+      }
+    }
+  } catch {
+    // Non-fatal — per-project endpoints still work via individual gh CLI.
+  } finally {
+    _graphqlRefreshInFlight = false;
+  }
+}
+
+// Start background GraphQL polling alongside rate-limit polling.
+let _graphqlPollTimer = null;
+function startGraphQLPolling() {
+  if (_graphqlPollTimer) return;
+  // Initial fetch after a short delay (let rate-limit poll run first).
+  setTimeout(() => refreshGraphQLCache(), 2000);
+  _graphqlPollTimer = setInterval(refreshGraphQLCache, GRAPHQL_CACHE_TTL);
+}
+
+// #703: Batched GraphQL for batch progress — fetch all issue states +
+// linked PRs in a single query instead of 2N individual gh calls.
+async function fetchBatchProgressGraphQL(repo, issueNumbers) {
+  if (!issueNumbers || issueNumbers.length === 0) return null;
+  const [owner, name] = repo.split("/");
+  if (!owner || !name) return null;
+
+  // Build aliased issue fields.
+  const issueFields = issueNumbers.map((n) =>
+    `issue${n}: issue(number: ${n}) {
+      number title state url
+      closedByPullRequestsReferences(first: 3) {
+        nodes { number state url merged reviews(last: 100) { nodes { state author { login } submittedAt } } }
+      }
+    }`
+  ).join("\n    ");
+
+  const query = `query {
+  repository(owner: "${owner}", name: "${name}") {
+    ${issueFields}
+  }
+}`;
+
+  try {
+    const { stdout } = await _execFileAsync("gh", [
+      "api", "graphql", "-f", `query=${query}`,
+    ], { encoding: "utf-8", timeout: 15000 });
+    const data = JSON.parse(stdout).data;
+    if (!data?.repository) return null;
+    return data.repository;
+  } catch {
+    return null; // fallback to individual gh CLI calls
+  }
+}
+
+// Convert a GraphQL batch progress issue node into the same progress
+// row shape that progressForItemAsync produces.
+function graphqlIssueToProgressRow(issueData) {
+  if (!issueData) return null;
+
+  const linked = issueData.closedByPullRequestsReferences?.nodes || [];
+  const pr = linked.length > 0
+    ? linked.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0]
+    : null;
+
+  // No linked PR — delegate to the existing buildNoPrRow helper.
+  if (!pr) {
+    return buildNoPrRow({
+      number: issueData.number,
+      title: issueData.title,
+      state: issueData.state,
+      url: issueData.url,
+    });
+  }
+
+  const merged = pr.merged && issueData.state === "CLOSED";
+  if (merged) {
+    return {
+      issue_number: issueData.number,
+      title: issueData.title,
+      url: pr.url || issueData.url,
+      pr_number: pr.number,
+      status: "merged",
+      progress: 100,
+      label: "Merged ✓",
+    };
+  }
+
+  // Count distinct APPROVED reviews per author.
+  const reviews = (pr.reviews?.nodes || []).slice();
+  reviews.sort((a, b) => {
+    const ta = a?.submittedAt ? Date.parse(a.submittedAt) : 0;
+    const tb = b?.submittedAt ? Date.parse(b.submittedAt) : 0;
+    return ta - tb;
+  });
+  const latestByAuthor = new Map();
+  for (const r of reviews) {
+    const author = r?.author?.login || "";
+    if (!author) continue;
+    latestByAuthor.set(author, r.state);
+  }
+  let approvalCount = 0;
+  for (const state of latestByAuthor.values()) {
+    if (state === "APPROVED") approvalCount++;
+  }
+
+  if (approvalCount >= 2) {
+    return {
+      issue_number: issueData.number,
+      title: issueData.title,
+      url: pr.url || issueData.url,
+      pr_number: pr.number,
+      status: "ready",
+      progress: 80,
+      label: `PR #${pr.number} · 2 approvals · ready`,
+    };
+  }
+  if (approvalCount === 1) {
+    return {
+      issue_number: issueData.number,
+      title: issueData.title,
+      url: pr.url || issueData.url,
+      pr_number: pr.number,
+      status: "approved1",
+      progress: 50,
+      label: `PR #${pr.number} · 1 approval`,
+    };
+  }
+  return {
+    issue_number: issueData.number,
+    title: issueData.title,
+    url: pr.url || issueData.url,
+    pr_number: pr.number,
+    status: "in_review",
+    progress: 20,
+    label: `PR #${pr.number} · waiting on review`,
+  };
+}
+
+// ─── /api/github/all — batched endpoint (#703) ────────────────────────────
+// Returns all projects' GitHub data in one response. The frontend can
+// optionally filter by project query param. Serves from GraphQL cache
+// with on-demand refresh if stale.
+router.get("/api/github/all", async (req, res) => {
+  const projectFilter = req.query.project || "";
+
+  // Ensure cache is populated.
+  const anyStale = (() => {
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return true; }
+    const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo));
+    for (const p of projects) {
+      const cached = _graphqlCache.get(p.repo);
+      if (!cached || Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL)) return true;
+    }
+    return false;
+  })();
+  if (anyStale) await refreshGraphQLCache();
+
+  // Build response.
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
+  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo));
+
+  const result = {};
+  const fallbackNeeded = [];
+  for (const p of projects) {
+    if (projectFilter && p.id !== projectFilter) continue;
+    const cached = _graphqlCache.get(p.repo);
+    if (cached) {
+      result[p.id] = {
+        issues: cached.issues,
+        prs: cached.prs,
+        closedIssues: cached.closedIssues,
+        mergedPrs: cached.mergedPrs,
+        _stale: Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL),
+      };
+    } else {
+      fallbackNeeded.push(p);
+    }
+  }
+
+  // Fallback: fetch missing projects via individual gh CLI calls.
+  if (fallbackNeeded.length > 0 && !isRateLimited()) {
+    const fallbackResults = await Promise.allSettled(
+      fallbackNeeded.map(async (p) => {
+        const repo = p.repo;
+        const [issues, prs, closedIssues, mergedPrs] = await Promise.allSettled([
+          _execFileAsync("gh", ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => JSON.parse(stdout)),
+          _execFileAsync("gh", ["pr", "list", "-R", repo, "--json", "number,title,state,author,assignees,reviewDecision,reviews,statusCheckRollup,url,createdAt", "--limit", "50"], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => JSON.parse(stdout)),
+          _execFileAsync("gh", ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", String(RECENT_FETCH_LIMIT)], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => {
+            const items = JSON.parse(stdout);
+            return Array.isArray(items)
+              ? items.sort((a, b) => (Date.parse(b?.closedAt || 0)) - (Date.parse(a?.closedAt || 0))).slice(0, RECENT_DISPLAY_LIMIT)
+              : items;
+          }),
+          _execFileAsync("gh", ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", String(RECENT_FETCH_LIMIT)], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => {
+            const items = JSON.parse(stdout);
+            return Array.isArray(items)
+              ? items.sort((a, b) => (Date.parse(b?.mergedAt || 0)) - (Date.parse(a?.mergedAt || 0))).slice(0, RECENT_DISPLAY_LIMIT)
+              : items;
+          }),
+        ]);
+        return {
+          id: p.id,
+          issues: issues.status === "fulfilled" ? issues.value : [],
+          prs: prs.status === "fulfilled" ? prs.value : [],
+          closedIssues: closedIssues.status === "fulfilled" ? closedIssues.value : [],
+          mergedPrs: mergedPrs.status === "fulfilled" ? mergedPrs.value : [],
+          _fallback: true,
+        };
+      }),
+    );
+    for (const r of fallbackResults) {
+      if (r.status === "fulfilled") {
+        result[r.value.id] = r.value;
+      }
+    }
+  }
+
+  res.json(result);
+});
+
+// ─── Per-project endpoints (backward compat, served from shared cache) ────
+
 router.get("/api/github/issues", (req, res) => {
   const repo = getRepo(req.query.project || "");
   if (!repo) return res.status(400).json({ error: "No repo configured for project" });
@@ -1409,8 +1785,6 @@ router.get("/api/github/prs", (req, res) => {
 // so a stale-but-recently-closed item can sit below a fresh-but-
 // older one. We pull a wider window and re-sort by close/merge time
 // before truncating to 5 to honor #281's "newest first" requirement.
-const RECENT_FETCH_LIMIT = 20;
-const RECENT_DISPLAY_LIMIT = 5;
 
 router.get("/api/github/closed-issues", (req, res) => {
   const repo = getRepo(req.query.project || "");
@@ -1928,26 +2302,41 @@ router.get("/api/batch-progress", async (req, res) => {
     return res.json(data);
   }
 
-  // #416 / quadwork#299: parallelize the per-item gh fetches.
-  // Sequential execFileSync was costing ~10s on a cold cache for a
-  // 5-item batch (2 gh calls per item, ~1s each); Promise.allSettled
-  // over progressForItemAsync drops that to roughly the time of the
-  // slowest single item-pair (~2s). One failed item resolves with a
-  // synthetic "unknown" row instead of failing the whole response.
-  const settled = await Promise.allSettled(
-    issueNumbers.map((n) => progressForItemAsync(repo, n)),
-  );
-  const items = settled.map((r, i) => {
-    if (r.status === "fulfilled") return r.value;
-    return {
-      issue_number: issueNumbers[i],
-      title: `#${issueNumbers[i]} (fetch failed)`,
-      url: null,
-      status: "unknown",
-      progress: 0,
-      label: "fetch failed",
-    };
-  });
+  // #703: Try batched GraphQL first — one query for all batch items.
+  // Falls back to individual gh CLI calls (the #416 parallel approach)
+  // if GraphQL fails.
+  let items;
+  const graphqlData = await fetchBatchProgressGraphQL(repo, issueNumbers);
+  if (graphqlData) {
+    items = issueNumbers.map((n) => {
+      const issueNode = graphqlData[`issue${n}`];
+      const row = issueNode ? graphqlIssueToProgressRow(issueNode) : null;
+      return row || {
+        issue_number: n,
+        title: `#${n} (fetch failed)`,
+        url: null,
+        status: "unknown",
+        progress: 0,
+        label: "fetch failed",
+      };
+    });
+  } else {
+    // Fallback: #416 parallel individual gh CLI calls.
+    const settled = await Promise.allSettled(
+      issueNumbers.map((n) => progressForItemAsync(repo, n)),
+    );
+    items = settled.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      return {
+        issue_number: issueNumbers[i],
+        title: `#${issueNumbers[i]} (fetch failed)`,
+        url: null,
+        status: "unknown",
+        progress: 0,
+        label: "fetch failed",
+      };
+    });
+  }
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
   // so batches that mix runbook/superseded closes with real PRs
@@ -3575,6 +3964,8 @@ router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
 
 // #554: start rate-limit polling as soon as routes are loaded.
 startRateLimitPolling();
+// #703: start batched GraphQL polling for dashboard data.
+startGraphQLPolling();
 
 module.exports = router;
 // #341: export parseActiveBatch for unit tests. No production callers
