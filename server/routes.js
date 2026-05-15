@@ -297,7 +297,22 @@ const { syncChattrToken } = require("./config");
 // On timeout / early close / 4003, we surface a proper error so the
 // /api/chat handler can return a 5xx (or 401) instead of a silent
 // {ok:true}.
+// #693: Auto-normalize bare agent names to @mentions in outbound messages.
+// Bare "head", "dev", "re1", "re2" become "@head", "@dev", "@re1", "@re2".
+// Already-prefixed mentions are not double-prefixed; suffixed names like
+// "head-2" or "re1-3" are left untouched.
+const MENTION_AGENT_NAMES = ["head", "dev", "re1", "re2"];
+function normalizeMentions(text) {
+  if (typeof text !== "string" || !text) return text || "";
+  return MENTION_AGENT_NAMES.reduce(
+    (t, name) => t.replace(new RegExp(`(?<![@\\w])\\b${name}\\b(?![\\w-])`, "gi"), `@${name}`),
+    text,
+  );
+}
+
 function sendViaWebSocket(baseUrl, sessionToken, message) {
+  // #693: normalize bare agent names to @mentions before sending
+  message = { ...message, text: normalizeMentions(message.text || "") };
   return new Promise((resolve, reject) => {
     const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(sessionToken || "")}`;
     const ws = new NodeWebSocket(wsUrl);
@@ -1065,6 +1080,10 @@ router.post("/api/chat", async (req, res) => {
   if (!message.text && message.attachments.length === 0) {
     return res.status(400).json({ error: "text or attachments required" });
   }
+
+  // #693: normalize bare agent names to @mentions (belt-and-suspenders
+  // with sendViaWebSocket's own normalization)
+  message.text = normalizeMentions(message.text);
 
   const attemptSend = () => sendViaWebSocket(base, sessionToken, message);
 
@@ -3550,3 +3569,5 @@ module.exports.projectAgentchattrConfigPath = projectAgentchattrConfigPath;
 // #236: expose sendViaWebSocket so the chat-ws-send regression test
 // can verify the ack/body/error paths against a fake AC ws server.
 module.exports.sendViaWebSocket = sendViaWebSocket;
+// #693: expose normalizeMentions for unit tests
+module.exports.normalizeMentions = normalizeMentions;
