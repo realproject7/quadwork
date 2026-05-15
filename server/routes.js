@@ -1428,7 +1428,7 @@ fragment repoFields on Repository {
     nodes { number title url state closedAt }
   }
   openPRs: pullRequests(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-    nodes { number title url state author { login } reviews(first: 10) { nodes { state author { login } submittedAt } } createdAt }
+    nodes { number title url state author { login } reviews(last: 100) { nodes { state author { login } submittedAt } } createdAt }
   }
   mergedPRs: pullRequests(first: ${RECENT_FETCH_LIMIT}, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
     nodes { number title url state mergedAt author { login } }
@@ -1563,7 +1563,7 @@ async function fetchBatchProgressGraphQL(repo, issueNumbers) {
     `issue${n}: issue(number: ${n}) {
       number title state url
       closedByPullRequestsReferences(first: 3) {
-        nodes { number state url merged reviews(first: 10) { nodes { state author { login } submittedAt } } }
+        nodes { number state url merged reviews(last: 100) { nodes { state author { login } submittedAt } } }
       }
     }`
   ).join("\n    ");
@@ -1696,6 +1696,7 @@ router.get("/api/github/all", async (req, res) => {
   const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo));
 
   const result = {};
+  const fallbackNeeded = [];
   for (const p of projects) {
     if (projectFilter && p.id !== projectFilter) continue;
     const cached = _graphqlCache.get(p.repo);
@@ -1707,8 +1708,49 @@ router.get("/api/github/all", async (req, res) => {
         mergedPrs: cached.mergedPrs,
         _stale: Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL),
       };
+    } else {
+      fallbackNeeded.push(p);
     }
   }
+
+  // Fallback: fetch missing projects via individual gh CLI calls.
+  if (fallbackNeeded.length > 0 && !isRateLimited()) {
+    const fallbackResults = await Promise.allSettled(
+      fallbackNeeded.map(async (p) => {
+        const repo = p.repo;
+        const [issues, prs, closedIssues, mergedPrs] = await Promise.allSettled([
+          _execFileAsync("gh", ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => JSON.parse(stdout)),
+          _execFileAsync("gh", ["pr", "list", "-R", repo, "--json", "number,title,state,author,assignees,reviewDecision,reviews,statusCheckRollup,url,createdAt", "--limit", "50"], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => JSON.parse(stdout)),
+          _execFileAsync("gh", ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", String(RECENT_FETCH_LIMIT)], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => {
+            const items = JSON.parse(stdout);
+            return Array.isArray(items)
+              ? items.sort((a, b) => (Date.parse(b?.closedAt || 0)) - (Date.parse(a?.closedAt || 0))).slice(0, RECENT_DISPLAY_LIMIT)
+              : items;
+          }),
+          _execFileAsync("gh", ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", String(RECENT_FETCH_LIMIT)], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => {
+            const items = JSON.parse(stdout);
+            return Array.isArray(items)
+              ? items.sort((a, b) => (Date.parse(b?.mergedAt || 0)) - (Date.parse(a?.mergedAt || 0))).slice(0, RECENT_DISPLAY_LIMIT)
+              : items;
+          }),
+        ]);
+        return {
+          id: p.id,
+          issues: issues.status === "fulfilled" ? issues.value : [],
+          prs: prs.status === "fulfilled" ? prs.value : [],
+          closedIssues: closedIssues.status === "fulfilled" ? closedIssues.value : [],
+          mergedPrs: mergedPrs.status === "fulfilled" ? mergedPrs.value : [],
+          _fallback: true,
+        };
+      }),
+    );
+    for (const r of fallbackResults) {
+      if (r.status === "fulfilled") {
+        result[r.value.id] = r.value;
+      }
+    }
+  }
+
   res.json(result);
 });
 
