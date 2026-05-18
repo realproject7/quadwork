@@ -600,6 +600,7 @@ async function spawnAgentPty(project, agent) {
       acMcpHttpPort: built.acMcpHttpPort,
       acHeartbeatHandle: null,
       queueWatcherHandle: null,
+      lastOutputAt: Date.now(),
       // #418: ring buffer of recent PTY output so reconnecting WS
       // clients see the terminal state instead of a blank panel.
       // #538: scrollback is scrubbed of likely secrets before replay.
@@ -612,6 +613,7 @@ async function spawnAgentPty(project, agent) {
     // the buffer accumulates so the next connect gets replay.
     const SCROLLBACK_SIZE = 64 * 1024;
     term.onData((data) => {
+      session.lastOutputAt = Date.now();
       const chunk = Buffer.from(data);
       session.scrollback = Buffer.concat([session.scrollback, chunk]);
       if (session.scrollback.length > SCROLLBACK_SIZE) {
@@ -2650,6 +2652,28 @@ function startAcHealthMonitor() {
   console.log("[health] AC health monitor started (30s interval, per-project 60s grace)");
 }
 
+// #705: auto-interrupt agents stuck with no PTY output for 10 minutes.
+const WATCHDOG_TIMEOUT_MS = 10 * 60 * 1000;
+let _watchdogHandle = null;
+
+function watchdogCheck() {
+  for (const [key, session] of agentSessions) {
+    if (session.state !== "running" || !session.term) continue;
+    if (!session.lastOutputAt) continue;
+    if (Date.now() - session.lastOutputAt > WATCHDOG_TIMEOUT_MS) {
+      console.log(`[watchdog] ${key}: no output for 10m — sending Ctrl+C`);
+      safeWrite(session.term, "\x03");
+      session.lastOutputAt = Date.now();
+    }
+  }
+}
+
+function startWatchdog() {
+  if (_watchdogHandle) return;
+  _watchdogHandle = setInterval(watchdogCheck, 60_000);
+  console.log("[watchdog] stuck-agent watchdog started (60s interval, 10m threshold)");
+}
+
 // #657: extracted startup migrations so full-reset can re-run them
 function runStartupMigrations(cfg) {
   const projects = (cfg.projects || []).filter((p) => !p.archived);
@@ -2929,6 +2953,8 @@ server.listen(PORT, "127.0.0.1", async () => {
   }
   // #416: start the AC health monitor
   startAcHealthMonitor();
+  // #705: start the stuck-agent watchdog
+  startWatchdog();
 });
 
 /**
