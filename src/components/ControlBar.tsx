@@ -34,6 +34,10 @@ const COPY = {
       confirmFullReset: "Reset all projects?",
       fullResetResult: (projects: number, agents: number, ms: number) => `Full reset — ${projects} project${projects !== 1 ? "s" : ""}, ${agents} agent${agents !== 1 ? "s" : ""} (${(ms / 1000).toFixed(1)}s)`,
       fullResetFailed: "Full reset failed",
+      interrupt: "Interrupt",
+      interruptAll: "All agents",
+      interrupted: (name: string) => `Interrupted ${name}`,
+      interruptedAll: (n: number) => `Interrupted ${n} agent${n !== 1 ? "s" : ""}`,
     },
     system: {
       keepAwake: "Keep Mac Awake",
@@ -85,6 +89,10 @@ const COPY = {
       confirmFullReset: "모든 프로젝트를 리셋할까요?",
       fullResetResult: (projects: number, agents: number, ms: number) => `전체 리셋 완료 — ${projects}개 프로젝트, ${agents}개 에이전트 (${(ms / 1000).toFixed(1)}초)`,
       fullResetFailed: "전체 리셋 실패",
+      interrupt: "중단",
+      interruptAll: "모든 에이전트",
+      interrupted: (name: string) => `${name} 중단됨`,
+      interruptedAll: (n: number) => `${n}개 에이전트 중단됨`,
     },
     system: {
       keepAwake: "Mac 절전 방지",
@@ -130,6 +138,9 @@ function ServerSection({ projectId }: { projectId: string }) {
   // #416: AC health monitor status — poll every 30s to surface
   // auto-restart events and persistent errors in the dashboard.
   const [healthNote, setHealthNote] = useState<string | null>(null);
+  const [showInterrupt, setShowInterrupt] = useState(false);
+  const [agentStates, setAgentStates] = useState<Record<string, string>>({});
+  const interruptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const pollHealth = () => {
@@ -157,6 +168,59 @@ function ServerSection({ projectId }: { projectId: string }) {
     const interval = setInterval(pollHealth, 30000);
     return () => clearInterval(interval);
   }, [projectId, t]);
+
+  const AGENT_IDS = ["head", "dev", "re1", "re2"];
+
+  useEffect(() => {
+    const poll = () => {
+      fetch("/api/agents")
+        .then((r) => (r.ok ? r.json() : {}))
+        .then((data: Record<string, { state: string }>) => {
+          const states: Record<string, string> = {};
+          for (const id of AGENT_IDS) {
+            const key = `${projectId}/${id}`;
+            states[id] = data[key]?.state || "stopped";
+          }
+          setAgentStates(states);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const interval = setInterval(poll, 5000);
+    return () => clearInterval(interval);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!showInterrupt) return;
+    const handler = (e: MouseEvent) => {
+      if (interruptRef.current && !interruptRef.current.contains(e.target as Node)) {
+        setShowInterrupt(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showInterrupt]);
+
+  const handleInterrupt = async (agent: string | null) => {
+    setShowInterrupt(false);
+    const url = agent
+      ? `/api/agents/${encodeURIComponent(projectId)}/${encodeURIComponent(agent)}/interrupt`
+      : `/api/agents/${encodeURIComponent(projectId)}/interrupt-all`;
+    setLoading("interrupt");
+    try {
+      const r = await fetch(url, { method: "POST" });
+      const d = await r.json();
+      if (agent) {
+        setFeedback(d.ok ? t.interrupted(agent) : (d.error || t.failed));
+      } else {
+        setFeedback(d.ok ? t.interruptedAll(d.interrupted) : (d.error || t.failed));
+      }
+    } catch {
+      setFeedback(t.error);
+    }
+    setLoading(null);
+    clearFeedback();
+  };
 
   const clearFeedback = () => {
     setTimeout(() => setFeedback(null), 3000);
@@ -313,6 +377,36 @@ function ServerSection({ projectId }: { projectId: string }) {
         >
           {loading === "fullReset" ? "..." : confirmFullReset ? t.confirmFullReset : t.fullReset}
         </button>
+        <div className="relative" ref={interruptRef}>
+          <button
+            onClick={() => setShowInterrupt((v) => !v)}
+            disabled={!!loading}
+            className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
+          >
+            {loading === "interrupt" ? "..." : `${t.interrupt} ▾`}
+          </button>
+          {showInterrupt && (
+            <div className="absolute bottom-full left-0 mb-1 p-1 border border-border bg-bg-surface z-20 min-w-[140px] flex flex-col">
+              {AGENT_IDS.map((id) => (
+                <button
+                  key={id}
+                  onClick={() => handleInterrupt(id)}
+                  className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-text-muted hover:text-accent hover:bg-white/5 text-left"
+                >
+                  <span className={`inline-block w-1.5 h-1.5 rounded-full ${agentStates[id] === "running" ? "bg-accent" : "bg-text-muted/40"}`} />
+                  {id.charAt(0).toUpperCase() + id.slice(1)}
+                </button>
+              ))}
+              <div className="border-t border-border my-0.5" />
+              <button
+                onClick={() => handleInterrupt(null)}
+                className="px-2 py-1 text-[10px] text-text-muted hover:text-accent hover:bg-white/5 text-left"
+              >
+                {t.interruptAll}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
       {feedback && (
         <div className="text-[10px] text-accent">{feedback}</div>
