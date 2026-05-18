@@ -1447,6 +1447,32 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
   }
 });
 
+// --- #706: Manual interrupt — send Ctrl+C to agent PTY ---
+
+app.post("/api/agents/:project/:agent/interrupt", (req, res) => {
+  const key = `${req.params.project}/${req.params.agent}`;
+  const session = agentSessions.get(key);
+  if (!session || !session.term) {
+    return res.json({ ok: false, error: "Agent not running" });
+  }
+  safeWrite(session.term, "\x03");
+  console.log(`[interrupt] ${key}: operator sent Ctrl+C`);
+  res.json({ ok: true });
+});
+
+app.post("/api/agents/:project/interrupt-all", (req, res) => {
+  const { project } = req.params;
+  let count = 0;
+  for (const [key, session] of agentSessions) {
+    if (!key.startsWith(`${project}/`)) continue;
+    if (session.state !== "running" || !session.term) continue;
+    safeWrite(session.term, "\x03");
+    count++;
+  }
+  console.log(`[interrupt] ${project}: operator sent Ctrl+C to ${count} agent(s)`);
+  res.json({ ok: true, interrupted: count });
+});
+
 // --- Sessions tracking (for /api/projects dashboard) ---
 
 // Expose agentSessions to migrated routes
