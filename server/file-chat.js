@@ -235,6 +235,18 @@ function getNextId(projectId) {
   return state.nextId;
 }
 
+// #715: per-agent shim tokens for authenticated sends.
+// Map<"projectId:agentId", token>
+const _shimTokens = new Map();
+
+function registerShimToken(projectId, agentId, token) {
+  _shimTokens.set(`${projectId}:${agentId}`, token);
+}
+
+function validateShimToken(projectId, agentId, token) {
+  return _shimTokens.get(`${projectId}:${agentId}`) === token;
+}
+
 module.exports = {
   initProject,
   shutdownProject,
@@ -243,6 +255,8 @@ module.exports = {
   getNextId,
   parseMentions,
   MENTION_RE,
+  registerShimToken,
+  validateShimToken,
   // exposed for testing
   _getState: getState,
   _chatDir: chatDir,

@@ -320,20 +320,23 @@ function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
 
 function writeFileChatMcpConfig(projectId, agentId, serverPort) {
   const os = require("os");
+  const crypto = require("crypto");
   const configDir = path.join(os.homedir(), ".quadwork", projectId);
   ensureSecureDir(configDir);
   const filePath = path.join(configDir, `mcp-${agentId}.json`);
   const shimPath = path.join(__dirname, "mcp-chat-shim.js");
+  const token = crypto.randomBytes(16).toString("hex");
+  fileChat.registerShimToken(projectId, agentId, token);
   const config = {
     mcpServers: {
       chat: {
         command: "node",
-        args: [shimPath, "--project", projectId, "--agent", agentId, "--port", String(serverPort)],
+        args: [shimPath, "--project", projectId, "--agent", agentId, "--port", String(serverPort), "--token", token],
       },
     },
   };
   writeSecureFile(filePath, JSON.stringify(config, null, 2));
-  return filePath;
+  return { filePath, token };
 }
 
 /**
@@ -395,13 +398,16 @@ async function buildAgentArgs(projectId, agentId) {
     const injectMode = agentCfg.mcp_inject || (cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag");
     acInjectMode = injectMode;
     if (injectMode === "flag") {
-      const mcpConfigPath = writeFileChatMcpConfig(projectId, agentId, PORT);
+      const { filePath: mcpConfigPath } = writeFileChatMcpConfig(projectId, agentId, PORT);
       const mcpFlag = agentCfg.mcp_flag || "--mcp-config";
       args.push(mcpFlag, mcpConfigPath);
     } else if (injectMode === "proxy_flag") {
+      const { token: shimToken } = writeFileChatMcpConfig(projectId, agentId, PORT);
       const shimPath = path.join(__dirname, "mcp-chat-shim.js");
-      const shimUrl = `stdio://${shimPath}?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agentId)}&port=${PORT}`;
-      args.push("-c", `mcp_servers.chat.url="${shimUrl}"`);
+      args.push(
+        "-c", `mcp_servers.chat.command="node"`,
+        "-c", `mcp_servers.chat.args=["${shimPath}","--project","${projectId}","--agent","${agentId}","--port","${PORT}","--token","${shimToken}"]`,
+      );
     }
     // env mode (Gemini) handled in buildAgentEnv
     return { args, acRegistrationName: agentId, acServerPort: null, acRegistrationToken: null, acInjectMode: injectMode, acMcpHttpPort: null };
@@ -514,13 +520,14 @@ function buildAgentEnv(projectId, agentId) {
     const settingsPath = path.join(configDir, `mcp-${agentId}-settings.json`);
 
     if (project.chat_mode === "file") {
-      // #715: file-chat shim for Gemini
+      // #715: file-chat shim for Gemini — reuse writeFileChatMcpConfig for token generation
+      const { token: shimToken } = writeFileChatMcpConfig(projectId, agentId, PORT);
       const shimPath = path.join(__dirname, "mcp-chat-shim.js");
       const settings = {
         mcpServers: {
           chat: {
             command: "node",
-            args: [shimPath, "--project", projectId, "--agent", agentId, "--port", String(PORT)],
+            args: [shimPath, "--project", projectId, "--agent", agentId, "--port", String(PORT), "--token", shimToken],
           },
         },
       };

@@ -8,8 +8,11 @@ const os = require("os");
 const { ensureSecureDir } = require("./config");
 const fileChat = require("./file-chat");
 
+const crypto = require("crypto");
+
 const PROJECT = "__mcp_shim_test__";
 const AGENT = "test-agent";
+const TEST_TOKEN = crypto.randomBytes(16).toString("hex");
 const SHIM = path.join(__dirname, "mcp-chat-shim.js");
 
 let server;
@@ -50,7 +53,15 @@ function startTestServer() {
     });
 
     app.post("/api/chat", (req, res) => {
-      const sender = req.headers["x-chat-sender"] || "user";
+      const shimSender = req.headers["x-chat-sender"];
+      const shimToken = req.headers["x-chat-token"];
+      let sender = "user";
+      if (shimSender && shimToken) {
+        if (!fileChat.validateShimToken(PROJECT, shimSender, shimToken)) {
+          return res.status(403).json({ error: "Invalid shim token" });
+        }
+        sender = shimSender;
+      }
       const msg = fileChat.appendMessage(PROJECT, {
         sender,
         text: req.body.text || "",
@@ -87,9 +98,10 @@ async function runTests() {
 
   // Setup
   fileChat.initProject(PROJECT);
+  fileChat.registerShimToken(PROJECT, AGENT, TEST_TOKEN);
   await startTestServer();
 
-  const shim = spawn("node", [SHIM, "--project", PROJECT, "--agent", AGENT, "--port", String(serverPort)], {
+  const shim = spawn("node", [SHIM, "--project", PROJECT, "--agent", AGENT, "--port", String(serverPort), "--token", TEST_TOKEN], {
     stdio: ["pipe", "pipe", "pipe"],
   });
 

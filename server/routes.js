@@ -1114,11 +1114,18 @@ router.post("/api/chat", async (req, res) => {
   if (getProjectChatMode(projectId) === "file") {
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     if (!text) return res.status(400).json({ error: "text required" });
-    // #715: MCP shim identifies itself via X-Chat-Sender header with the
-    // agent ID injected at spawn time. Dashboard POSTs never set this
-    // header, so they always get sender: "user".
+    // #715: MCP shim identifies itself via X-Chat-Sender + X-Chat-Token
+    // headers. The token is generated at spawn time and validated against
+    // the in-memory registry to prevent impersonation.
     const shimSender = req.headers["x-chat-sender"];
-    const sender = shimSender || "user";
+    const shimToken = req.headers["x-chat-token"];
+    let sender = "user";
+    if (shimSender && shimToken) {
+      if (!fileChat.validateShimToken(projectId, shimSender, shimToken)) {
+        return res.status(403).json({ error: "Invalid shim token" });
+      }
+      sender = shimSender;
+    }
     const msg = fileChat.appendMessage(projectId, {
       sender,
       text: normalizeMentions(text),

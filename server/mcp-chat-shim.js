@@ -13,9 +13,10 @@ function flag(name) {
 const PROJECT = flag("project");
 const AGENT = flag("agent");
 const PORT = flag("port");
+const TOKEN = flag("token");
 
 if (!PROJECT || !AGENT || !PORT) {
-  process.stderr.write("Usage: node mcp-chat-shim.js --project <id> --agent <id> --port <port>\n");
+  process.stderr.write("Usage: node mcp-chat-shim.js --project <id> --agent <id> --port <port> [--token <token>]\n");
   process.exit(1);
 }
 
@@ -89,7 +90,7 @@ async function handleToolCall(id, name, params) {
       const res = await httpRequest("POST", `/api/chat?project=${encodeURIComponent(PROJECT)}`, {
         text: params.message || "",
         channel: params.channel || "general",
-      }, { "X-Chat-Sender": AGENT });
+      }, { "X-Chat-Sender": AGENT, ...(TOKEN ? { "X-Chat-Token": TOKEN } : {}) });
       if (res.status >= 400) {
         return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
       }
