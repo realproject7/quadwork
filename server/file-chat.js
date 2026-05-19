@@ -137,7 +137,7 @@ function shutdownProject(projectId) {
   projectState.delete(projectId);
 }
 
-function appendMessage(projectId, { sender, channel = "general", text, type = "message" }) {
+function appendMessage(projectId, { sender, channel = "general", text, type = "message" }, _skipLoopGuard = false) {
   const state = getState(projectId);
   if (state.nextId === null) {
     throw new Error(`Project ${projectId} not initialized — call initProject first`);
@@ -235,6 +235,57 @@ function getNextId(projectId) {
   return state.nextId;
 }
 
+// #717: per-project loop guard state
+const _loopGuardState = new Map();
+
+function checkLoopGuard(projectId, msg, maxHops = 30) {
+  let state = _loopGuardState.get(projectId) || { hops: 0, paused: false };
+
+  if (msg.sender === "user") {
+    const isResume = typeof msg.text === "string" && msg.text.trim() === "/continue";
+    state.hops = 0;
+    state.paused = false;
+    _loopGuardState.set(projectId, state);
+    if (isResume) {
+      appendMessageInternal(projectId, {
+        sender: "system",
+        type: "system",
+        text: "Loop guard resumed.",
+        channel: msg.channel || "general",
+      });
+    }
+    return;
+  }
+
+  if (msg.type === "system") return;
+  if (state.paused) return;
+
+  state.hops++;
+  if (state.hops >= maxHops) {
+    state.paused = true;
+    appendMessageInternal(projectId, {
+      sender: "system",
+      type: "system",
+      text: `Loop guard: paused after ${maxHops} agent-to-agent messages with no human reply. Type /continue to resume.`,
+      channel: msg.channel || "general",
+    });
+  }
+  _loopGuardState.set(projectId, state);
+}
+
+function isLoopGuardPaused(projectId) {
+  const state = _loopGuardState.get(projectId);
+  return state ? state.paused : false;
+}
+
+function resetLoopGuard(projectId) {
+  _loopGuardState.delete(projectId);
+}
+
+function appendMessageInternal(projectId, opts) {
+  return appendMessage(projectId, opts, true);
+}
+
 // #715: per-agent shim tokens for authenticated sends.
 // Map<"projectId:agentId", token>
 const _shimTokens = new Map();
@@ -255,6 +306,9 @@ module.exports = {
   getNextId,
   parseMentions,
   MENTION_RE,
+  checkLoopGuard,
+  isLoopGuardPaused,
+  resetLoopGuard,
   registerShimToken,
   validateShimToken,
   // exposed for testing

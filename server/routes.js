@@ -255,6 +255,22 @@ function getChattrConfig(projectId) {
   return { url: resolved.url, token: resolved.token };
 }
 
+function getProjectMaxHops(projectId) {
+  if (!projectId) return 30;
+  const cfg = readConfigFile();
+  const project = (cfg.projects || []).find((p) => p.id === projectId);
+  if (project?.max_agent_hops != null) return project.max_agent_hops;
+  const tomlPath = resolveProjectConfigToml(projectId);
+  if (tomlPath && fs.existsSync(tomlPath)) {
+    try {
+      const content = fs.readFileSync(tomlPath, "utf-8");
+      const m = content.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
+      if (m) return parseInt(m[1], 10);
+    } catch {}
+  }
+  return 30;
+}
+
 function getProjectChatMode(projectId) {
   if (!projectId) return "ac";
   const cfg = readConfigFile();
@@ -534,12 +550,16 @@ function resolveProjectConfigToml(projectId) {
 router.get("/api/loop-guard", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  // #717: file-chat mode reads from config.json or toml
+  const value = getProjectMaxHops(projectId);
+  if (getProjectChatMode(projectId) === "file") {
+    return res.json({ value, source: value === 30 ? "default" : "config" });
+  }
   const tomlPath = resolveProjectConfigToml(projectId);
   if (!tomlPath || !fs.existsSync(tomlPath)) return res.json({ value: 30, source: "default" });
   try {
     const content = fs.readFileSync(tomlPath, "utf-8");
     const m = content.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
-    const value = m ? parseInt(m[1], 10) : 30;
     res.json({ value, source: m ? "toml" : "default" });
   } catch (err) {
     res.status(500).json({ error: "Failed to read config.toml", detail: err.message });
@@ -551,13 +571,21 @@ router.put("/api/loop-guard", async (req, res) => {
   if (!projectId) return res.status(400).json({ error: "Missing project" });
   const raw = req.body?.value;
   const value = typeof raw === "number" ? raw : parseInt(raw, 10);
-  // AC's update_settings handler clamps to [1, 50]; mirror that
-  // here so we don't write a value AC will silently rewrite.
   if (!Number.isInteger(value) || value < 4 || value > 50) {
     return res.status(400).json({ error: "value must be an integer between 4 and 50" });
   }
 
-  // 1. Persist to config.toml so the next restart picks it up.
+  // #717: file-chat mode stores max_agent_hops in config.json
+  if (getProjectChatMode(projectId) === "file") {
+    const cfg = readConfigFile();
+    const project = (cfg.projects || []).find((p) => p.id === projectId);
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    project.max_agent_hops = value;
+    writeConfigFile(cfg);
+    return res.json({ ok: true, value });
+  }
+
+  // AC mode: persist to config.toml
   const tomlPath = resolveProjectConfigToml(projectId);
   if (!tomlPath || !fs.existsSync(tomlPath)) {
     return res.status(404).json({ error: "config.toml not found for project" });
@@ -1137,7 +1165,12 @@ router.post("/api/chat", async (req, res) => {
       channel: req.body?.channel || "general",
       type: "message",
     });
-    notifyMentionedAgents(projectId, msg);
+    // #717: loop guard — count agent hops, pause if threshold reached
+    const maxHops = getProjectMaxHops(projectId);
+    fileChat.checkLoopGuard(projectId, msg, maxHops);
+    if (!fileChat.isLoopGuardPaused(projectId)) {
+      notifyMentionedAgents(projectId, msg);
+    }
     return res.json({ ok: true, message: msg });
   }
 
