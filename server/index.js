@@ -8,6 +8,7 @@ const pty = require("node-pty");
 const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
 const routes = require("./routes");
+const fileChat = require("./file-chat");
 const {
   patchAgentchattrConfigForDiscordBridge,
   patchAgentchattrConfigForTelegramBridge,
@@ -2933,6 +2934,21 @@ server.listen(PORT, "127.0.0.1", async () => {
       console.log(`[startup] ${p.id}: AC already alive on port ${acPort} — tracking`);
     }
   }
+  // #714: Initialize file-chat engine for projects with chat_mode: "file".
+  // If the writer lock is held by another live process, refuse to start —
+  // enforces the single-writer invariant against the "two terminals" scenario.
+  for (const p of (startupCfg.projects || [])) {
+    if (p.chat_mode === "file") {
+      try {
+        fileChat.initProject(p.id);
+        console.log(`[startup] ${p.id}: file-chat engine initialized`);
+      } catch (err) {
+        console.error(`[startup] FATAL: ${p.id}: ${err.message}`);
+        process.exit(1);
+      }
+    }
+  }
+
   // Sync AgentChattr tokens for all projects on startup and backfill
   // the sender-overflow CSS/JS patch (#402) so already-running AC
   // instances receive the fix without requiring a restart.
@@ -3002,6 +3018,13 @@ function shutdownChattrProcesses() {
   chattrProcesses.clear();
   // #631: stop Butler PTY on shutdown
   stopButlerPty();
+  // #714: release file-chat writer locks
+  const cfg = readConfig();
+  for (const p of (cfg.projects || [])) {
+    if (p.chat_mode === "file") {
+      try { fileChat.shutdownProject(p.id); } catch {}
+    }
+  }
 }
 
 module.exports = { shutdownChattrProcesses };

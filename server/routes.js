@@ -10,6 +10,7 @@ const path = require("path");
 const os = require("os");
 
 const multer = require("multer");
+const fileChat = require("./file-chat");
 
 const router = express.Router();
 
@@ -236,6 +237,13 @@ function getChattrConfig(projectId) {
   return { url: resolved.url, token: resolved.token };
 }
 
+function getProjectChatMode(projectId) {
+  if (!projectId) return "ac";
+  const cfg = readConfigFile();
+  const project = (cfg.projects || []).find((p) => p.id === projectId);
+  return project?.chat_mode === "file" ? "file" : "ac";
+}
+
 function chatAuthHeaders(token) {
   if (!token) return {};
   return { "x-session-token": token };
@@ -243,6 +251,15 @@ function chatAuthHeaders(token) {
 
 router.get("/api/chat", async (req, res) => {
   const projectId = req.query.project;
+
+  if (getProjectChatMode(projectId) === "file") {
+    const messages = fileChat.readMessages(projectId, {
+      since_id: Number(req.query.since_id) || 0,
+      limit: Number(req.query.limit) || 50,
+    });
+    return res.json(messages);
+  }
+
   const apiPath = req.query.path || "/api/messages";
   const { url: base, token } = getChattrConfig(projectId);
 
@@ -1075,6 +1092,19 @@ router.get("/api/activity/stats", (_req, res) => {
 
 router.post("/api/chat", async (req, res) => {
   const projectId = req.query.project || req.body.project;
+
+  if (getProjectChatMode(projectId) === "file") {
+    const text = typeof req.body?.text === "string" ? req.body.text : "";
+    if (!text) return res.status(400).json({ error: "text required" });
+    const msg = fileChat.appendMessage(projectId, {
+      sender: "user",
+      text: normalizeMentions(text),
+      channel: req.body?.channel || "general",
+      type: "message",
+    });
+    return res.json({ ok: true, message: msg });
+  }
+
   const { url: base, token: sessionToken } = getChattrConfig(projectId);
   if (!base) return res.status(400).json({ error: "Missing project" });
 
@@ -1254,6 +1284,12 @@ router.get("/api/projects", async (req, res) => {
   // Fetch chat messages from all projects (per-project AgentChattr instances)
   const chatMsgsByProject = {};
   const chatFetches = (cfg.projects || []).map(async (p) => {
+    if (getProjectChatMode(p.id) === "file") {
+      try {
+        chatMsgsByProject[p.id] = fileChat.readMessages(p.id, { limit: 30 });
+      } catch {}
+      return;
+    }
     const { url: chattrUrl, token: chattrToken } = getChattrConfig(p.id);
     try {
       const headers = chattrToken ? { "x-session-token": chattrToken } : {};
@@ -3998,3 +4034,5 @@ module.exports.projectAgentchattrConfigPath = projectAgentchattrConfigPath;
 module.exports.sendViaWebSocket = sendViaWebSocket;
 // #693: expose normalizeMentions for unit tests
 module.exports.normalizeMentions = normalizeMentions;
+// #714: expose for file-chat integration
+module.exports.getProjectChatMode = getProjectChatMode;
