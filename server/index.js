@@ -23,8 +23,8 @@ const config = readConfig();
 const PORT = config.port || 8400;
 
 function emitSystemMessage(projectId, text) {
-  if (routes.getProjectChatMode(projectId) !== "file") return;
   try {
+    if (routes.getProjectChatMode(projectId) !== "file") return;
     fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
   } catch {}
 }

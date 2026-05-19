@@ -279,8 +279,8 @@ function getProjectChatMode(projectId) {
 }
 
 function emitSystemMessage(projectId, text) {
-  if (getProjectChatMode(projectId) !== "file") return;
   try {
+    if (getProjectChatMode(projectId) !== "file") return;
     fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
   } catch {}
 }
