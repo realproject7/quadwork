@@ -2934,14 +2934,18 @@ server.listen(PORT, "127.0.0.1", async () => {
       console.log(`[startup] ${p.id}: AC already alive on port ${acPort} — tracking`);
     }
   }
-  // #714: Initialize file-chat engine for projects with chat_mode: "file"
+  // #714: Initialize file-chat engine for projects with chat_mode: "file".
+  // If the writer lock is held by another process, downgrade to "ac" mode
+  // so the single-writer invariant is never violated.
   for (const p of (startupCfg.projects || [])) {
     if (p.chat_mode === "file") {
       try {
         fileChat.initProject(p.id);
         console.log(`[startup] ${p.id}: file-chat engine initialized`);
       } catch (err) {
-        console.error(`[startup] ${p.id}: file-chat init failed: ${err.message}`);
+        console.error(`[startup] ${p.id}: file-chat init failed, falling back to AC mode: ${err.message}`);
+        p.chat_mode = "ac";
+        writeConfig(startupCfg);
       }
     }
   }

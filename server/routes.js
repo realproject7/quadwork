@@ -1094,15 +1094,10 @@ router.post("/api/chat", async (req, res) => {
   const projectId = req.query.project || req.body.project;
 
   if (getProjectChatMode(projectId) === "file") {
-    let operatorSender = "user";
-    try {
-      const cfg = readConfigFile();
-      operatorSender = sanitizeOperatorName(cfg.operator_name);
-    } catch {}
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     if (!text) return res.status(400).json({ error: "text required" });
     const msg = fileChat.appendMessage(projectId, {
-      sender: operatorSender,
+      sender: "user",
       text: normalizeMentions(text),
       channel: req.body?.channel || "general",
       type: "message",

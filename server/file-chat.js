@@ -174,9 +174,7 @@ function appendMessage(projectId, { sender, channel = "general", text, type = "m
         console.error(`[file-chat] Append failure for project ${projectId}: ${err.message}`);
         throw err;
       }
-      // Brief delay before retry
-      const start = Date.now();
-      while (Date.now() - start < 100) { /* busy wait for sync context */ }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
     }
   }
 
