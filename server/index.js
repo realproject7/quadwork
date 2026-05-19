@@ -2935,17 +2935,16 @@ server.listen(PORT, "127.0.0.1", async () => {
     }
   }
   // #714: Initialize file-chat engine for projects with chat_mode: "file".
-  // If the writer lock is held by another process, downgrade to "ac" mode
-  // so the single-writer invariant is never violated.
+  // If the writer lock is held by another live process, refuse to start —
+  // enforces the single-writer invariant against the "two terminals" scenario.
   for (const p of (startupCfg.projects || [])) {
     if (p.chat_mode === "file") {
       try {
         fileChat.initProject(p.id);
         console.log(`[startup] ${p.id}: file-chat engine initialized`);
       } catch (err) {
-        console.error(`[startup] ${p.id}: file-chat init failed, falling back to AC mode: ${err.message}`);
-        p.chat_mode = "ac";
-        writeConfig(startupCfg);
+        console.error(`[startup] FATAL: ${p.id}: ${err.message}`);
+        process.exit(1);
       }
     }
   }
