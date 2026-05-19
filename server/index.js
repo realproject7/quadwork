@@ -318,6 +318,24 @@ function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
   return filePath;
 }
 
+function writeFileChatMcpConfig(projectId, agentId, serverPort) {
+  const os = require("os");
+  const configDir = path.join(os.homedir(), ".quadwork", projectId);
+  ensureSecureDir(configDir);
+  const filePath = path.join(configDir, `mcp-${agentId}.json`);
+  const shimPath = path.join(__dirname, "mcp-chat-shim.js");
+  const config = {
+    mcpServers: {
+      chat: {
+        command: "node",
+        args: [shimPath, "--project", projectId, "--agent", agentId, "--port", String(serverPort)],
+      },
+    },
+  };
+  writeSecureFile(filePath, JSON.stringify(config, null, 2));
+  return filePath;
+}
+
 /**
  * Build extra launch args for an agent (permission flags + MCP injection).
  * Async because Codex proxy_flag mode needs to await proxy startup.
@@ -371,6 +389,24 @@ async function buildAgentArgs(projectId, agentId) {
   // MCP config injection
   const mcpHttpPort = project.mcp_http_port;
   const token = project.agentchattr_token;
+
+  // #715: file-chat mode — use the MCP shim instead of AgentChattr
+  if (project.chat_mode === "file") {
+    const injectMode = agentCfg.mcp_inject || (cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag");
+    acInjectMode = injectMode;
+    if (injectMode === "flag") {
+      const mcpConfigPath = writeFileChatMcpConfig(projectId, agentId, PORT);
+      const mcpFlag = agentCfg.mcp_flag || "--mcp-config";
+      args.push(mcpFlag, mcpConfigPath);
+    } else if (injectMode === "proxy_flag") {
+      const shimPath = path.join(__dirname, "mcp-chat-shim.js");
+      const shimUrl = `stdio://${shimPath}?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agentId)}&port=${PORT}`;
+      args.push("-c", `mcp_servers.chat.url="${shimUrl}"`);
+    }
+    // env mode (Gemini) handled in buildAgentEnv
+    return { args, acRegistrationName: agentId, acServerPort: null, acRegistrationToken: null, acInjectMode: injectMode, acMcpHttpPort: null };
+  }
+
   if (mcpHttpPort) {
     const injectMode = agentCfg.mcp_inject || (cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag");
     acInjectMode = injectMode;
@@ -471,23 +507,39 @@ function buildAgentEnv(projectId, agentId) {
   const env = {};
 
   // Gemini: inject MCP via env var
-  if (cliBase === "gemini" && project.mcp_http_port) {
+  if (cliBase === "gemini") {
     const os = require("os");
     const configDir = path.join(os.homedir(), ".quadwork", projectId);
     ensureSecureDir(configDir);
     const settingsPath = path.join(configDir, `mcp-${agentId}-settings.json`);
-    const url = `http://127.0.0.1:${project.mcp_http_port}/mcp`;
-    const settings = {
-      mcpServers: {
-        agentchattr: {
-          type: "http",
-          url,
-          ...(project.agentchattr_token ? { headers: { Authorization: `Bearer ${project.agentchattr_token}` } } : {}),
+
+    if (project.chat_mode === "file") {
+      // #715: file-chat shim for Gemini
+      const shimPath = path.join(__dirname, "mcp-chat-shim.js");
+      const settings = {
+        mcpServers: {
+          chat: {
+            command: "node",
+            args: [shimPath, "--project", projectId, "--agent", agentId, "--port", String(PORT)],
+          },
         },
-      },
-    };
-    writeSecureFile(settingsPath, JSON.stringify(settings, null, 2));
-    env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = settingsPath;
+      };
+      writeSecureFile(settingsPath, JSON.stringify(settings, null, 2));
+      env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = settingsPath;
+    } else if (project.mcp_http_port) {
+      const url = `http://127.0.0.1:${project.mcp_http_port}/mcp`;
+      const settings = {
+        mcpServers: {
+          agentchattr: {
+            type: "http",
+            url,
+            ...(project.agentchattr_token ? { headers: { Authorization: `Bearer ${project.agentchattr_token}` } } : {}),
+          },
+        },
+      };
+      writeSecureFile(settingsPath, JSON.stringify(settings, null, 2));
+      env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = settingsPath;
+    }
   }
 
   return env;
