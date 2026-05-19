@@ -129,14 +129,15 @@ interface ChatPanelProps {
   projectId?: string;
   /** #523: filter state lifted to parent so toggle renders in PanelHeader */
   filterSystem?: boolean;
+  chatMode?: "ac" | "file";
 }
 
-export default function ChatPanel({ projectId, filterSystem }: ChatPanelProps) {
-  return <ChatPanelAPI projectId={projectId} filterSystem={filterSystem} />;
+export default function ChatPanel({ projectId, filterSystem, chatMode }: ChatPanelProps) {
+  return <ChatPanelAPI projectId={projectId} filterSystem={filterSystem} chatMode={chatMode} />;
 }
 
 /** API-driven fallback when iframe is blocked */
-function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string; filterSystem?: boolean }) {
+function ChatPanelAPI({ projectId, filterSystem = false, chatMode = "ac" }: { projectId?: string; filterSystem?: boolean; chatMode?: "ac" | "file" }) {
   const channel = "general";
   const [messages, setMessages] = useState<Message[]>([]);
   // #410: track whether the initial fetch has completed so we don't
@@ -190,12 +191,14 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
     if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
   }, [projectId]);
 
-  // Poll messages via proxy
+  // Poll messages via proxy (AC mode) or direct REST (file mode)
   const fetchMessages = useCallback(() => {
-    fetch(`/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`)
+    const url = chatMode === "file"
+      ? `/api/chat?project=${encodeURIComponent(projectId || "")}&since_id=${cursorRef.current}&channel=${encodeURIComponent(channel)}`
+      : `/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`;
+    fetch(url)
       .then((r) => {
         if (r.status === 403) {
-          // Token may still be syncing — clear error on next successful poll
           if (authRetryRef.current < 3) setAuthError(null);
           else setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
           throw new Error("auth failed");
@@ -215,23 +218,15 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
           const maxId = Math.max(...msgs.map((m) => m.id));
           if (maxId > cursorRef.current) cursorRef.current = maxId;
         }
-        // #436: only mark loaded after a successful fetch. This is
-        // the ONLY place `loaded` flips to true — error paths below
-        // leave it false so the component shows "Loading messages..."
-        // instead of the welcome screen while retries are pending.
         setLoaded(true);
       })
       .catch(() => {
-        // #436: if the initial load hasn't succeeded yet, schedule a
-        // retry after a delay. Once loaded is true (first success),
-        // failures in subsequent polls are harmless — the component
-        // already has messages and the next 3s poll will retry.
         if (!loaded && initialRetryRef.current < MAX_INITIAL_RETRIES) {
           initialRetryRef.current += 1;
           retryTimerRef.current = setTimeout(fetchMessages, INITIAL_RETRY_DELAY_MS);
         }
       });
-  }, [channel, projectId, loaded]);
+  }, [channel, projectId, loaded, chatMode]);
 
   useEffect(() => {
     fetchMessages();
