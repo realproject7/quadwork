@@ -278,6 +278,13 @@ function getProjectChatMode(projectId) {
   return project?.chat_mode === "file" ? "file" : "ac";
 }
 
+function emitSystemMessage(projectId, text) {
+  try {
+    if (getProjectChatMode(projectId) !== "file") return;
+    fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
+  } catch {}
+}
+
 function chatAuthHeaders(token) {
   if (!token) return {};
   return { "x-session-token": token };
@@ -3539,6 +3546,7 @@ router.post("/api/telegram", async (req, res) => {
             `Last log lines (${logPath}):\n${tail || "(log empty)"}`,
         });
       }
+      emitSystemMessage(projectId, "Telegram bridge connected");
       return res.json({ ok: true, running: true, pid: child.pid });
     }
     case "stop": {
@@ -3569,6 +3577,7 @@ router.post("/api/telegram", async (req, res) => {
         // #522: clear bridge log so last_error doesn't show stale
         // connection-refused messages after an intentional stop.
         try { fs.writeFileSync(telegramBridgeLog(projectId), ""); } catch {}
+        emitSystemMessage(projectId, "Telegram bridge disconnected");
         return res.json({ ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
@@ -3953,6 +3962,7 @@ router.post("/api/discord", async (req, res) => {
             `Last log lines (${logPath}):\n${tail || "(log empty)"}`,
         });
       }
+      emitSystemMessage(projectId, "Discord bridge connected");
       return res.json({ ok: true, running: true, pid: child.pid });
     }
     case "stop": {
@@ -3980,6 +3990,7 @@ router.post("/api/discord", async (req, res) => {
         // #522: clear bridge log so last_error doesn't show stale
         // connection-refused messages after an intentional stop.
         try { fs.writeFileSync(discordBridgeLog(projectId), ""); } catch {}
+        emitSystemMessage(projectId, "Discord bridge disconnected");
         return res.json({ ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
