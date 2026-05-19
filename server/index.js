@@ -22,6 +22,13 @@ const net = require("net");
 const config = readConfig();
 const PORT = config.port || 8400;
 
+function emitSystemMessage(projectId, text) {
+  if (routes.getProjectChatMode(projectId) !== "file") return;
+  try {
+    fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
+  } catch {}
+}
+
 const app = express();
 // #412 / quadwork#279: bump the global JSON body limit to 10mb so
 // POST /api/project-history can accept full chat exports. The
@@ -621,7 +628,7 @@ async function recoverFrom409(projectId, agentId, session) {
 }
 
 // Helper: spawn a PTY for a project/agent and register in agentSessions
-async function spawnAgentPty(project, agent) {
+async function spawnAgentPty(project, agent, opts = {}) {
   const key = `${project}/${agent}`;
 
   const cwd = resolveAgentCwd(project, agent);
@@ -667,6 +674,10 @@ async function spawnAgentPty(project, agent) {
       scrollback: Buffer.alloc(0),
     };
     agentSessions.set(key, session);
+
+    if (!opts.suppressLifecycleMsg) {
+      emitSystemMessage(project, `${agent} joined`);
+    }
 
     // #418: capture PTY output into the scrollback ring buffer (64KB).
     // This runs independently of WS — even when no client is connected,
@@ -738,8 +749,11 @@ async function spawnAgentPty(project, agent) {
         const current = agentSessions.get(key);
         if (!current || !current.term || current.state !== "running") return;
         console.log(`[#565] Agent ${agent}: AC is now reachable — restarting agent to gain chat integration.`);
+        const cur = agentSessions.get(key);
+        if (cur) cur._suppressLifecycleMsg = true;
         await stopAgentSession(key);
-        await spawnAgentPty(project, agent);
+        await spawnAgentPty(project, agent, { suppressLifecycleMsg: true });
+        emitSystemMessage(project, `${agent} restarted`);
       };
       deferredRestart().catch(() => {});
     }
@@ -794,6 +808,9 @@ async function stopAgentSession(key) {
   if (!session) {
     agentSessions.set(key, { projectId: null, agentId: null, term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null });
     return;
+  }
+  if (session.projectId && session.agentId && !session._suppressLifecycleMsg) {
+    emitSystemMessage(session.projectId, `${session.agentId} left`);
   }
   if (session.term) {
     try { session.term.kill(); } catch {}
@@ -1353,6 +1370,8 @@ app.post("/api/agents/:project/reset", async (req, res) => {
 
     // Stop all agents first (handles deregistration best-effort)
     for (const agentId of allAgentIds) {
+      const s = agentSessions.get(`${projectId}/${agentId}`);
+      if (s) s._suppressLifecycleMsg = true;
       await stopAgentSession(`${projectId}/${agentId}`);
     }
 
@@ -1360,8 +1379,9 @@ app.post("/api/agents/:project/reset", async (req, res) => {
     let restarted = 0;
     const errors = [];
     for (const agentId of allAgentIds) {
-      const result = await spawnAgentPty(projectId, agentId);
+      const result = await spawnAgentPty(projectId, agentId, { suppressLifecycleMsg: true });
       if (result.ok) {
+        emitSystemMessage(projectId, `${agentId} restarted`);
         restarted++;
       } else {
         errors.push(`${agentId}: ${result.error}`);
@@ -1497,10 +1517,13 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
 
   // #241: must await deregister before respawn so the slot frees and
   // the fresh register lands at slot 1 instead of head-2.
+  const existing = agentSessions.get(key);
+  if (existing) existing._suppressLifecycleMsg = true;
   await stopAgentSession(key);
 
-  const result = await spawnAgentPty(project, agent);
+  const result = await spawnAgentPty(project, agent, { suppressLifecycleMsg: true });
   if (result.ok) {
+    emitSystemMessage(project, `${agent} restarted`);
     res.json({ ok: true, state: "running", pid: result.pid });
   } else {
     res.status(500).json({ ok: false, state: "error", error: result.error });
