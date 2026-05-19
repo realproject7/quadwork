@@ -98,6 +98,7 @@ async function handleToolCall(id, name, params) {
 
     if (name === "chat_read") {
       const qs = new URLSearchParams({ project: PROJECT });
+      if (params.channel) qs.set("channel", params.channel);
       if (params.limit) qs.set("limit", String(params.limit));
       if (params.since_id) qs.set("since_id", String(params.since_id));
       const res = await httpRequest("GET", `/api/chat?${qs.toString()}`);

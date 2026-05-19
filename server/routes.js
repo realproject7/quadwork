@@ -1223,11 +1223,16 @@ router.post("/api/chat", async (req, res) => {
 });
 
 // #715: MCP shim notification callback registration
+const LOCALHOST_CB_RE = /^http:\/\/127\.0\.0\.1:\d+\/?$/;
+
 router.post("/api/chat/notify-register", (req, res) => {
   const projectId = req.query.project;
   const { agent, callback_url } = req.body || {};
   if (!projectId || !agent || !callback_url) {
     return res.status(400).json({ error: "project, agent, and callback_url required" });
+  }
+  if (!LOCALHOST_CB_RE.test(callback_url)) {
+    return res.status(400).json({ error: "callback_url must be http://127.0.0.1:<port>" });
   }
   if (!_notifyCallbacks.has(projectId)) {
     _notifyCallbacks.set(projectId, new Map());
