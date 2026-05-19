@@ -14,6 +14,24 @@ const fileChat = require("./file-chat");
 
 const router = express.Router();
 
+// #715: per-project notification callback registry for MCP shims.
+// Map<projectId, Map<agentId, callbackUrl>>
+const _notifyCallbacks = new Map();
+
+function notifyMentionedAgents(projectId, msg) {
+  const callbacks = _notifyCallbacks.get(projectId);
+  if (!callbacks || !msg.mentions || msg.mentions.length === 0) return;
+  for (const mention of msg.mentions) {
+    const url = callbacks.get(mention);
+    if (!url) continue;
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: msg.id, sender: msg.sender, text: msg.text, channel: msg.channel }),
+    }).catch(() => {});
+  }
+}
+
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const ENV_PATH = path.join(CONFIG_DIR, ".env");
@@ -1096,12 +1114,25 @@ router.post("/api/chat", async (req, res) => {
   if (getProjectChatMode(projectId) === "file") {
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     if (!text) return res.status(400).json({ error: "text required" });
+    // #715: MCP shim identifies itself via X-Chat-Sender + X-Chat-Token
+    // headers. The token is generated at spawn time and validated against
+    // the in-memory registry to prevent impersonation.
+    const shimSender = req.headers["x-chat-sender"];
+    const shimToken = req.headers["x-chat-token"];
+    let sender = "user";
+    if (shimSender && shimToken) {
+      if (!fileChat.validateShimToken(projectId, shimSender, shimToken)) {
+        return res.status(403).json({ error: "Invalid shim token" });
+      }
+      sender = shimSender;
+    }
     const msg = fileChat.appendMessage(projectId, {
-      sender: "user",
+      sender,
       text: normalizeMentions(text),
       channel: req.body?.channel || "general",
       type: "message",
     });
+    notifyMentionedAgents(projectId, msg);
     return res.json({ ok: true, message: msg });
   }
 
@@ -1196,6 +1227,25 @@ router.post("/api/chat", async (req, res) => {
     console.warn(`[chat] send failed for project ${projectId}: ${err && err.message}`);
     return res.status(502).json({ error: "AgentChattr unreachable", detail: err && err.message });
   }
+});
+
+// #715: MCP shim notification callback registration
+const LOCALHOST_CB_RE = /^http:\/\/127\.0\.0\.1:\d+\/?$/;
+
+router.post("/api/chat/notify-register", (req, res) => {
+  const projectId = req.query.project;
+  const { agent, callback_url } = req.body || {};
+  if (!projectId || !agent || !callback_url) {
+    return res.status(400).json({ error: "project, agent, and callback_url required" });
+  }
+  if (!LOCALHOST_CB_RE.test(callback_url)) {
+    return res.status(400).json({ error: "callback_url must be http://127.0.0.1:<port>" });
+  }
+  if (!_notifyCallbacks.has(projectId)) {
+    _notifyCallbacks.set(projectId, new Map());
+  }
+  _notifyCallbacks.get(projectId).set(agent, callback_url);
+  res.json({ ok: true });
 });
 
 // ─── Image upload (#466) ──────────────────────────────────────────────────
