@@ -271,11 +271,16 @@ router.get("/api/chat", async (req, res) => {
   const projectId = req.query.project;
 
   if (getProjectChatMode(projectId) === "file") {
+    const sinceId = Number(req.query.since_id) || Number(req.query.cursor) || 0;
     const messages = fileChat.readMessages(projectId, {
-      since_id: Number(req.query.since_id) || 0,
+      since_id: sinceId,
       limit: Number(req.query.limit) || 50,
     });
-    return res.json(messages);
+    const normalized = messages.map((m) => ({
+      ...m,
+      time: m.time || (m.ts ? m.ts.slice(11, 19) : ""),
+    }));
+    return res.json(normalized);
   }
 
   const apiPath = req.query.path || "/api/messages";

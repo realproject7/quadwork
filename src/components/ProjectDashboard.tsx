@@ -72,9 +72,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   // config (bridge_filter_agents_only), so dashboard and bridges stay in sync.
   const [filterSystem, setFilterSystem] = useState(false);
   const filterLoadedRef = useRef(false);
+  const [chatMode, setChatMode] = useState<"ac" | "file">("ac");
   useEffect(() => {
     filterLoadedRef.current = false;
     setFilterSystem(false);
+    setChatMode("ac");
   }, [projectId]);
   useEffect(() => {
     if (filterLoadedRef.current) return;
@@ -84,6 +86,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         if (!cfg) return;
         const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
         if (entry?.bridge_filter_agents_only) setFilterSystem(true);
+        if (entry?.chat_mode === "file") setChatMode("file");
         filterLoadedRef.current = true;
       })
       .catch(() => {});
@@ -228,7 +231,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             {filterToggle}
           </PanelHeader>
           <div className="flex-1 min-h-0">
-            <ChatPanel projectId={projectId} filterSystem={filterSystem} />
+            <ChatPanel projectId={projectId} filterSystem={filterSystem} chatMode={chatMode} />
           </div>
           <ControlBar projectId={projectId} />
         </div>
