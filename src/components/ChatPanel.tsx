@@ -129,15 +129,14 @@ interface ChatPanelProps {
   projectId?: string;
   /** #523: filter state lifted to parent so toggle renders in PanelHeader */
   filterSystem?: boolean;
-  chatMode?: "ac" | "file";
 }
 
-export default function ChatPanel({ projectId, filterSystem, chatMode }: ChatPanelProps) {
-  return <ChatPanelAPI projectId={projectId} filterSystem={filterSystem} chatMode={chatMode} />;
+export default function ChatPanel({ projectId, filterSystem }: ChatPanelProps) {
+  return <ChatPanelAPI projectId={projectId} filterSystem={filterSystem} />;
 }
 
 /** API-driven fallback when iframe is blocked */
-function ChatPanelAPI({ projectId, filterSystem = false, chatMode = "ac" }: { projectId?: string; filterSystem?: boolean; chatMode?: "ac" | "file" }) {
+function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string; filterSystem?: boolean }) {
   const channel = "general";
   const [messages, setMessages] = useState<Message[]>([]);
   // #410: track whether the initial fetch has completed so we don't
@@ -191,16 +190,14 @@ function ChatPanelAPI({ projectId, filterSystem = false, chatMode = "ac" }: { pr
     if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
   }, [projectId]);
 
-  // Poll messages via proxy (AC mode) or direct REST (file mode)
+  // Poll messages via proxy
   const fetchMessages = useCallback(() => {
-    const url = chatMode === "file"
-      ? `/api/chat?project=${encodeURIComponent(projectId || "")}&since_id=${cursorRef.current}&channel=${encodeURIComponent(channel)}`
-      : `/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`;
+    const url = `/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`;
     fetch(url)
       .then((r) => {
         if (r.status === 403) {
           if (authRetryRef.current < 3) setAuthError(null);
-          else setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
+          else setAuthError("Chat authentication failed (403). Check project chat configuration in Settings.");
           throw new Error("auth failed");
         }
         if (!r.ok) throw new Error(`Poll failed: ${r.status}`);
@@ -226,7 +223,7 @@ function ChatPanelAPI({ projectId, filterSystem = false, chatMode = "ac" }: { pr
           retryTimerRef.current = setTimeout(fetchMessages, INITIAL_RETRY_DELAY_MS);
         }
       });
-  }, [channel, projectId, loaded, chatMode]);
+  }, [channel, projectId, loaded]);
 
   useEffect(() => {
     fetchMessages();

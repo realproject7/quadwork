@@ -151,8 +151,6 @@ function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
 
 const DEFAULT_CONFIG = {
   port: 8400,
-  agentchattr_url: "http://127.0.0.1:8300",
-  agentchattr_dir: path.join(os.homedir(), ".quadwork", "agentchattr"),
   projects: [],
 };
 
@@ -216,10 +214,10 @@ router.put("/api/config", (req, res) => {
   }
 });
 
-// ─── Chat (AgentChattr proxy) ──────────────────────────────────────────────
+// ─── Chat (file-based) ────────────────────────────────────────────────────
 
-const { resolveProjectChattr, sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
-const { installAgentChattr, findAgentChattr } = require("./install-agentchattr");
+const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
+const { findAgentChattr } = require("./install-agentchattr");
 
 /**
  * Seed ~/.quadwork/{projectId}/OVERNIGHT-QUEUE.md from the template.
@@ -242,152 +240,39 @@ function writeOvernightQueueFileSafe(projectId, projectName, repo) {
   } catch { /* non-fatal */ }
 }
 
-function getChattrConfig(projectId) {
-  const resolved = resolveProjectChattr(projectId);
-  return { url: resolved.url, token: resolved.token };
-}
-
 function getProjectMaxHops(projectId) {
   if (!projectId) return 30;
   const cfg = readConfigFile();
   const project = (cfg.projects || []).find((p) => p.id === projectId);
   if (project?.max_agent_hops != null) return project.max_agent_hops;
-  const tomlPath = resolveProjectConfigToml(projectId);
-  if (tomlPath && fs.existsSync(tomlPath)) {
-    try {
-      const content = fs.readFileSync(tomlPath, "utf-8");
-      const m = content.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
-      if (m) return parseInt(m[1], 10);
-    } catch {}
-  }
   return 30;
 }
 
 function getProjectChatMode(projectId) {
-  if (!projectId) return "ac";
-  const cfg = readConfigFile();
-  const project = (cfg.projects || []).find((p) => p.id === projectId);
-  return project?.chat_mode === "file" ? "file" : "ac";
+  return "file";
 }
 
 function emitSystemMessage(projectId, text) {
   try {
-    if (getProjectChatMode(projectId) !== "file") return;
     fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
   } catch {}
 }
 
-function chatAuthHeaders(token) {
-  if (!token) return {};
-  return { "x-session-token": token };
-}
-
-router.get("/api/chat", async (req, res) => {
+router.get("/api/chat", (req, res) => {
   const projectId = req.query.project;
 
-  if (getProjectChatMode(projectId) === "file") {
-    const sinceId = Number(req.query.since_id) || Number(req.query.cursor) || 0;
-    const messages = fileChat.readMessages(projectId, {
-      since_id: sinceId,
-      limit: Number(req.query.limit) || 50,
-    });
-    const normalized = messages.map((m) => ({
-      ...m,
-      time: m.time || (m.ts ? new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : ""),
-    }));
-    return res.json(normalized);
-  }
-
-  const apiPath = req.query.path || "/api/messages";
-  const { url: base, token } = getChattrConfig(projectId);
-
-  const buildUrl = (tok) => {
-    const fwd = new URLSearchParams();
-    for (const [k, v] of Object.entries(req.query)) {
-      if (k !== "path") fwd.set(k, String(v));
-    }
-    if (tok) fwd.set("token", tok);
-    return `${base}${apiPath}?${fwd.toString()}`;
-  };
-
-  try {
-    const r = await fetch(buildUrl(token), { headers: chatAuthHeaders(token) });
-    // #448: on 401/403, re-sync the session token from AC and retry
-    // once. The stored token may be stale after an AC restart.
-    // #487: also retry on 5xx — a temporary AC outage (e.g. 502) may
-    // precede a restart that regenerates the session token.
-    if ((r.status === 401 || r.status === 403 || r.status >= 500) && projectId) {
-      try { await syncChattrToken(projectId); } catch {}
-      const { token: refreshed } = getChattrConfig(projectId);
-      if (refreshed && refreshed !== token) {
-        const retry = await fetch(buildUrl(refreshed), { headers: chatAuthHeaders(refreshed) });
-        if (!retry.ok) return res.status(retry.status).json({ error: `AgentChattr returned ${retry.status}` });
-        return res.json(await retry.json());
-      }
-    }
-    if (!r.ok) return res.status(r.status).json({ error: `AgentChattr returned ${r.status}` });
-    res.json(await r.json());
-  } catch (err) {
-    // #487: fetch threw (ECONNREFUSED, DNS failure, etc.) — AC is
-    // unreachable. Resync the token and retry once; AC may have
-    // restarted with a new session token by the time the retry fires.
-    if (projectId) {
-      try { await syncChattrToken(projectId); } catch {}
-      const { token: refreshed } = getChattrConfig(projectId);
-      if (refreshed && refreshed !== token) {
-        try {
-          const retry = await fetch(buildUrl(refreshed), { headers: chatAuthHeaders(refreshed) });
-          if (!retry.ok) return res.status(retry.status).json({ error: `AgentChattr returned ${retry.status}` });
-          return res.json(await retry.json());
-        } catch {}
-      }
-    }
-    res.status(502).json({ error: "AgentChattr unreachable", detail: err.message });
-  }
+  const sinceId = Number(req.query.since_id) || Number(req.query.cursor) || 0;
+  const messages = fileChat.readMessages(projectId, {
+    since_id: sinceId,
+    limit: Number(req.query.limit) || 50,
+  });
+  const normalized = messages.map((m) => ({
+    ...m,
+    time: m.time || (m.ts ? new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : ""),
+  }));
+  return res.json(normalized);
 });
 
-// #225 sub-E: send chat messages from the dashboard via the
-// AgentChattr WebSocket, not via /api/send.
-//
-// /api/send requires `Authorization: Bearer <registration_token>` and
-// the token must resolve to a registered instance via
-// `registry.resolve_token()`. The session_token we store on the
-// project entry only authorizes browser/middleware traffic — it is
-// NOT a registration token, so /api/send always 401s with
-// "missing Authorization: Bearer <token>". The dashboard browser
-// already sends through the WebSocket on `/ws?token=<session_token>`
-// and the server accepts that path, so we mirror that exact flow
-// from the express server: open a one-shot ws, push the message,
-// wait briefly for ack, close.
-const { WebSocket: NodeWebSocket } = require("ws");
-const { syncChattrToken } = require("./config");
-
-// #236: wait for AgentChattr to echo our message back over the same ws
-// connection before resolving, instead of fire-and-forgetting. AC's
-// /ws handler does this on every connect:
-//   1. Replays history as N `{type:"message", data: msg}` frames.
-//   2. Sends one `{type:"status", data: …}` frame (broadcast_status).
-//   3. Enters the receive loop and accepts our outgoing frame.
-// After our `type:"message"` is processed, AC calls `store.add()`
-// which broadcasts the stored record back to all clients (including
-// us) as another `{type:"message", data: msg}`.
-//
-// To get a race-free ack we therefore:
-//   A. Wait for the first `type:"status"` frame to confirm the
-//      history replay is done — any `type:"message"` frame seen
-//      BEFORE that is historical and must be ignored.
-//   B. Only then send our message and record the highest message
-//      id observed so far as a correlation baseline.
-//   C. Accept the first post-send `type:"message"` whose payload
-//      matches (sender, text, channel, reply_to) AND whose id is
-//      strictly greater than the baseline (AC ids are monotonically
-//      increasing from store.add). This eliminates the risk a
-//      reviewer flagged on #382 round 1: a historical identical
-//      message from <1.5s ago could have satisfied the old
-//      heuristic matcher.
-// On timeout / early close / 4003, we surface a proper error so the
-// /api/chat handler can return a 5xx (or 401) instead of a silent
-// {ok:true}.
 // #693: Auto-normalize bare agent names to @mentions in outbound messages.
 // Bare "head", "dev", "re1", "re2" become "@head", "@dev", "@re1", "@re2".
 // Already-prefixed mentions are not double-prefixed; suffixed names like
@@ -401,171 +286,14 @@ function normalizeMentions(text) {
   );
 }
 
-function sendViaWebSocket(baseUrl, sessionToken, message) {
-  // #693: normalize bare agent names to @mentions before sending
-  message = { ...message, text: normalizeMentions(message.text || "") };
-  return new Promise((resolve, reject) => {
-    const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(sessionToken || "")}`;
-    const ws = new NodeWebSocket(wsUrl);
-    let settled = false;
-    let historyFlushed = false;
-    let sent = false;
-    let maxIdAtSend = -Infinity;
-    let maxHistoryId = -Infinity;
-    const finish = (err, value) => {
-      if (settled) return;
-      settled = true;
-      try { ws.close(); } catch {}
-      if (err) reject(err); else resolve(value);
-    };
-    const giveUp = setTimeout(() => finish(new Error("websocket send timeout")), 4000);
-    const doSend = () => {
-      if (sent || settled) return;
-      try {
-        maxIdAtSend = maxHistoryId;
-        ws.send(JSON.stringify({ type: "message", ...message }));
-        sent = true;
-      } catch (err) { clearTimeout(giveUp); finish(err); }
-    };
-    ws.on("open", () => {
-      // Do NOT send yet. Wait for the status frame that marks the
-      // end of history replay so we have a clean correlation
-      // baseline. A safety timer covers the (unlikely) case of an
-      // AC build that doesn't emit status on connect — after 750ms
-      // we fall back to sending anyway, using whatever max id we
-      // collected from history so far as the baseline.
-      setTimeout(() => {
-        if (!historyFlushed) {
-          historyFlushed = true;
-          doSend();
-        }
-      }, 750);
-    });
-    ws.on("message", (raw) => {
-      if (settled) return;
-      let frame;
-      try { frame = JSON.parse(raw.toString()); } catch { return; }
-      if (!frame || !frame.type) return;
-      if (frame.type === "status" && !historyFlushed) {
-        historyFlushed = true;
-        doSend();
-        return;
-      }
-      if (frame.type !== "message" || !frame.data) return;
-      const d = frame.data;
-      // Track the highest message id we have observed, whether from
-      // history replay or from other live broadcasts. Used as the
-      // baseline for the post-send correlation check.
-      if (typeof d.id === "number" && d.id > maxHistoryId) {
-        maxHistoryId = d.id;
-      }
-      if (!sent) return; // anything before our send is history
-      if (typeof d.id !== "number" || d.id <= maxIdAtSend) return;
-      if (d.sender !== message.sender) return;
-      if (d.text !== message.text) return;
-      if ((d.channel || "general") !== (message.channel || "general")) return;
-      const wantReply = message.reply_to ?? null;
-      const gotReply = d.reply_to ?? null;
-      if (wantReply !== gotReply) return;
-      clearTimeout(giveUp);
-      finish(null, { ok: true, message: d });
-    });
-    ws.on("error", (err) => { clearTimeout(giveUp); finish(err); });
-    ws.on("close", (code, reason) => {
-      // Code 4003 = bad token (see app.py /ws handler). Surface as
-      // 401 so the dashboard's chat error banner shows the right thing.
-      if (!settled && code === 4003) {
-        clearTimeout(giveUp);
-        const msg = (reason && reason.toString()) || "forbidden: invalid session token";
-        const e = new Error(msg);
-        e.code = "EAGENTCHATTR_401";
-        finish(e);
-        return;
-      }
-      // Any other premature close after we sent but before we saw
-      // the echo is an error — the old code path would have claimed
-      // success, silently swallowing a server-side reject.
-      if (!settled) {
-        clearTimeout(giveUp);
-        const r = (reason && reason.toString()) || "";
-        finish(new Error(`websocket closed before ack (code=${code}${r ? ", reason=" + r : ""})`));
-      }
-    });
-  });
-}
-
-/**
- * #403 / quadwork#274: send an arbitrary AC ws event (not a chat
- * message). Used for `update_settings` so the loop guard widget can
- * push the new max_agent_hops to the running AgentChattr without a
- * full restart. Mirrors sendViaWebSocket but lets the caller pick
- * the event type.
- */
-function sendWsEvent(baseUrl, sessionToken, event) {
-  return new Promise((resolve, reject) => {
-    const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(sessionToken || "")}`;
-    const ws = new NodeWebSocket(wsUrl);
-    let settled = false;
-    const finish = (err, value) => {
-      if (settled) return;
-      settled = true;
-      try { ws.close(); } catch {}
-      if (err) reject(err); else resolve(value);
-    };
-    const giveUp = setTimeout(() => finish(new Error("websocket send timeout")), 4000);
-    ws.on("open", () => {
-      try {
-        ws.send(JSON.stringify(event));
-        setTimeout(() => { clearTimeout(giveUp); finish(null, { ok: true }); }, 250);
-      } catch (err) { clearTimeout(giveUp); finish(err); }
-    });
-    ws.on("error", (err) => { clearTimeout(giveUp); finish(err); });
-    ws.on("close", (code, reason) => {
-      if (!settled && code === 4003) {
-        clearTimeout(giveUp);
-        const msg = (reason && reason.toString()) || "forbidden: invalid session token";
-        const e = new Error(msg);
-        e.code = "EAGENTCHATTR_401";
-        finish(e);
-      }
-    });
-  });
-}
-
-// #403 / quadwork#274: read/write the loop guard for a given project.
-// Source of truth at rest is the project's config.toml [routing]
-// max_agent_hops. The PUT also pushes the value to the running AC via
-// `update_settings` so the change is live without a daemon restart.
-// Resolve the per-project config.toml path through resolveProjectChattr
-// so we honor `project.agentchattr_dir` (web wizard sets this; legacy
-// imports can have arbitrary paths) and don't drift from the rest of
-// the codebase that already goes through that helper.
-function resolveProjectConfigToml(projectId) {
-  const resolved = resolveProjectChattr(projectId);
-  if (!resolved || !resolved.dir) return null;
-  return path.join(resolved.dir, "config.toml");
-}
-
 router.get("/api/loop-guard", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
-  // #717: file-chat mode reads from config.json or toml
   const value = getProjectMaxHops(projectId);
-  if (getProjectChatMode(projectId) === "file") {
-    return res.json({ value, source: value === 30 ? "default" : "config" });
-  }
-  const tomlPath = resolveProjectConfigToml(projectId);
-  if (!tomlPath || !fs.existsSync(tomlPath)) return res.json({ value: 30, source: "default" });
-  try {
-    const content = fs.readFileSync(tomlPath, "utf-8");
-    const m = content.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
-    res.json({ value, source: m ? "toml" : "default" });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to read config.toml", detail: err.message });
-  }
+  return res.json({ value, source: value === 30 ? "default" : "config" });
 });
 
-router.put("/api/loop-guard", async (req, res) => {
+router.put("/api/loop-guard", (req, res) => {
   const projectId = req.query.project || req.body?.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
   const raw = req.body?.value;
@@ -574,174 +302,30 @@ router.put("/api/loop-guard", async (req, res) => {
     return res.status(400).json({ error: "value must be an integer between 4 and 50" });
   }
 
-  // #717: file-chat mode stores max_agent_hops in config.json
-  if (getProjectChatMode(projectId) === "file") {
-    const cfg = readConfigFile();
-    const project = (cfg.projects || []).find((p) => p.id === projectId);
-    if (!project) return res.status(404).json({ error: "Project not found" });
-    project.max_agent_hops = value;
-    writeConfigFile(cfg);
-    return res.json({ ok: true, value });
-  }
-
-  // AC mode: persist to config.toml
-  const tomlPath = resolveProjectConfigToml(projectId);
-  if (!tomlPath || !fs.existsSync(tomlPath)) {
-    return res.status(404).json({ error: "config.toml not found for project" });
-  }
-  // Capture the previous value before rewriting so we can decide
-  // whether the /continue auto-resume should fire (only when the
-  // operator is RAISING the limit — lowering it means they want
-  // the runaway loop to stay paused).
-  let previousValue = null;
-  try {
-    const previousContent = fs.readFileSync(tomlPath, "utf-8");
-    const prevMatch = previousContent.match(/^\s*max_agent_hops\s*=\s*(\d+)/m);
-    if (prevMatch) previousValue = parseInt(prevMatch[1], 10);
-  } catch {
-    // fall through — previousValue stays null, auto-resume will skip
-  }
-  try {
-    let content = fs.readFileSync(tomlPath, "utf-8");
-    if (/^\s*max_agent_hops\s*=/m.test(content)) {
-      content = content.replace(/^\s*max_agent_hops\s*=.*$/m, `max_agent_hops = ${value}`);
-    } else if (/^\s*\[routing\]/m.test(content)) {
-      // Section exists but the key doesn't — append the key on the
-      // line right after the [routing] header to keep it scoped.
-      content = content.replace(/^(\s*\[routing\]\s*\n)/m, `$1max_agent_hops = ${value}\n`);
-    } else {
-      const trailing = content.endsWith("\n") ? "" : "\n";
-      content += `${trailing}\n[routing]\ndefault = "none"\nmax_agent_hops = ${value}\n`;
-    }
-    writeSecureFile(tomlPath, content);
-  } catch (err) {
-    return res.status(500).json({ error: "Failed to write config.toml", detail: err.message });
-  }
-
-  // 2. Best-effort push to the running AC so the change is live.
-  // On stale-token (4003 → EAGENTCHATTR_401) recover the same way
-  // /api/chat does (#230): re-sync the session token from AC and
-  // retry once. Other failures stay non-fatal — the persisted value
-  // still takes effect on next AC restart.
-  //
-  // #417 / quadwork#309: the update_settings ws event correctly
-  // updates router.max_hops in the running AC (verified in AC's
-  // app.py:1249), AND writes settings.json via _save_settings. But
-  // AC's router stays paused once it has tripped the guard — raising
-  // max_hops at runtime does NOT resurrect an already-paused channel
-  // (router.py:76-77 → `paused = True`). The operator typically
-  // raises the limit precisely BECAUSE the channel is stuck paused,
-  // so we immediately follow the update_settings event with a
-  // `/continue` chat message (the same path AC's own slash command
-  // handler uses at app.py:1106-1110) to resume routing. This is the
-  // whole fix: the previous version updated max_hops live but left
-  // the channel frozen, which made the widget look like a no-op.
-  let live = false;
-  let autoResumed = false;
-  // Only auto-resume when ALL of:
-  //   (a) operator is RAISING the limit (lowering = "make it
-  //       stricter", must leave a paused runaway alone)
-  //   (b) the router is currently paused (AC's continue_routing
-  //       resets hop_count + paused + guard_emitted unconditionally,
-  //       so firing it on an actively-running chain would silently
-  //       extend the chain beyond the new limit — t2a finding)
-  //   (c) previousValue is known (null means we can't prove it's a
-  //       raise, so err on the side of not touching router state)
-  const isRaising = previousValue !== null && value > previousValue;
-  const ensureLive = async (sessionToken) => {
-    await sendWsEvent(base, sessionToken, { type: "update_settings", data: { max_agent_hops: value } });
-    if (isRaising) {
-      // Check AC's /api/status before firing /continue so we don't
-      // reset hop_count on a running (unpaused) chain. The endpoint
-      // exposes `paused: true` iff ANY channel currently paused.
-      let isPaused = false;
-      try {
-        // AC's security middleware (app.py:212-224) only accepts
-        // bearer auth for /api/messages, /api/send, and /api/rules/*.
-        // /api/status requires x-session-token header (or ?token=),
-        // so pass that instead — a bearer header silently 403s and
-        // leaves isPaused stuck at false, defeating the gate.
-        const statusUrl = `${base}/api/status`;
-        const statusRes = await fetch(statusUrl, {
-          headers: sessionToken ? { "x-session-token": sessionToken } : {},
-          signal: AbortSignal.timeout(5000),
-        });
-        if (statusRes.ok) {
-          const statusJson = await statusRes.json();
-          isPaused = !!(statusJson && statusJson.paused);
-        }
-      } catch {
-        // Status fetch failed — err toward "don't auto-resume". The
-        // operator can always type /continue manually.
-      }
-      if (isPaused) {
-        // Resume paused channels. /continue is routed by AC's ws
-        // message handler when the buffer starts with /continue;
-        // the handler calls router.continue_routing() which
-        // unpauses AND resets hop_count — which is why we gate on
-        // isPaused to avoid wiping the counter on a live chain.
-        await sendWsEvent(base, sessionToken, { type: "message", text: "/continue", channel: "general", sender: "user" });
-        autoResumed = true;
-      }
-    }
-    live = true;
-  };
-  let base = null;
-  try {
-    const chattr = getChattrConfig(projectId);
-    base = chattr.url;
-    const sessionToken = chattr.token;
-    if (base) {
-      try {
-        await ensureLive(sessionToken);
-      } catch (err) {
-        if (err && err.code === "EAGENTCHATTR_401") {
-          console.warn(`[loop-guard] ws auth failed for ${projectId}, re-syncing session token and retrying...`);
-          try { await syncChattrToken(projectId); }
-          catch (syncErr) { console.warn(`[loop-guard] syncChattrToken failed: ${syncErr.message}`); }
-          const { token: refreshed } = getChattrConfig(projectId);
-          if (refreshed && refreshed !== sessionToken) {
-            try {
-              await ensureLive(refreshed);
-            } catch (retryErr) {
-              console.warn(`[loop-guard] retry after token resync failed: ${retryErr.message || retryErr}`);
-            }
-          }
-        } else {
-          throw err;
-        }
-      }
-    }
-  } catch (err) {
-    console.warn(`[loop-guard] live update failed for ${projectId}: ${err.message || err}`);
-  }
-
-  res.json({ ok: true, value, live, previousValue, resumed: autoResumed });
+  const cfg = readConfigFile();
+  const project = (cfg.projects || []).find((p) => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+  project.max_agent_hops = value;
+  writeConfigFile(cfg);
+  return res.json({ ok: true, value });
 });
 
 // #412 / quadwork#279: project history export + import.
 //
-// Export proxies AC's /api/messages for the project channel and
-// wraps the array in a small metadata envelope so future imports
-// can warn on project-id mismatch and so a future schema bump can
-// be detected client-side.
+// Export reads messages from file-chat and wraps the array in a
+// small metadata envelope so future imports can warn on project-id
+// mismatch and so a future schema bump can be detected client-side.
 //
 // Import accepts the same envelope, validates the shape + size,
-// and replays each message back into the project's AgentChattr
-// instance via sendViaWebSocket — preserving the original sender
-// field for cross-tool consistency. Originals' message IDs are NOT
-// preserved (AC re-assigns on insert), which is a known v1 limit
-// and matches the issue's "AgentChattr will tell us" note.
+// and replays each message into the file-chat store — preserving
+// the original sender field for cross-tool consistency.
 
 const PROJECT_HISTORY_VERSION = 1;
 const PROJECT_HISTORY_MAX_BYTES = 10 * 1024 * 1024; // 10 MB cap per issue
-const PROJECT_HISTORY_REPLAY_DELAY_MS = 25; // pace AC ws inserts
 
 // #414 / quadwork#297: reject imports whose messages claim a
-// reserved agent / system sender by default. This closes the only
-// path in QuadWork that lets a client-supplied sender reach AC
-// (every other route hardcodes / sanitizes to operator). Mirrors
-// the RESERVED_OPERATOR_NAMES denylist from sanitizeOperatorName so
+// reserved agent / system sender by default. Mirrors the
+// RESERVED_OPERATOR_NAMES denylist from sanitizeOperatorName so
 // the same identities are blocked across the codebase.
 const RESERVED_HISTORY_SENDERS = new Set([
   "head",
@@ -759,29 +343,11 @@ const RESERVED_HISTORY_SENDERS = new Set([
   "system",
 ]);
 
-router.get("/api/project-history", async (req, res) => {
+router.get("/api/project-history", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
-  const { url: base, token: sessionToken } = getChattrConfig(projectId);
-  if (!base) return res.status(400).json({ error: "No AgentChattr configured for project" });
   try {
-    // AC's /api/messages accepts a bearer token in the Authorization
-    // header; the session token is what the chat panel already uses.
-    const target = `${base}/api/messages?channel=general&limit=100000`;
-    const r = await fetch(target, {
-      headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
-      // Cap the AC fetch at 30s so a hung daemon doesn't park the
-      // export request indefinitely.
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!r.ok) {
-      const detail = await r.text().catch(() => "");
-      return res.status(502).json({ error: `AgentChattr /api/messages returned ${r.status}`, detail: detail.slice(0, 200) });
-    }
-    const raw = await r.json();
-    // AC returns either a bare array or { messages: [...] } depending
-    // on version — handle both.
-    const messages = Array.isArray(raw) ? raw : Array.isArray(raw && raw.messages) ? raw.messages : [];
+    const messages = fileChat.readMessages(projectId, { limit: 100000 });
     res.json({
       version: PROJECT_HISTORY_VERSION,
       project_id: projectId,
@@ -790,7 +356,7 @@ router.get("/api/project-history", async (req, res) => {
       messages,
     });
   } catch (err) {
-    res.status(502).json({ error: "Project history export failed", detail: err.message || String(err) });
+    res.status(500).json({ error: "Project history export failed", detail: err.message || String(err) });
   }
 });
 
@@ -874,24 +440,9 @@ router.post("/api/project-history", async (req, res) => {
     }
   }
 
-  const { url: base, token: sessionToken } = getChattrConfig(projectId);
-  if (!base) return res.status(400).json({ error: "No AgentChattr configured for project" });
-
-  // Replay each message via the existing ws send helper. Preserve
-  // the original sender so the imported transcript still attributes
-  // each line correctly. Pace the writes so AC's ws handler isn't
-  // overloaded on a multi-thousand-message import.
-  //
-  // SECURITY NOTE: This deliberately bypasses /api/chat's #230/#288
-  // sanitize-as-user lockdown — the imported sender field is sent
-  // straight to AC's ws, so a crafted import file CAN post as
-  // `head` / `dev` / etc. That's intentional: imports must round-
-  // trip the original attribution to be useful (otherwise every
-  // restored message would say `user` and the transcript would be
-  // worthless). The trade-off is acceptable because the only entry
-  // point is an authenticated dashboard operator picking a file by
-  // hand and clicking through the project-mismatch confirm. Don't
-  // expose this route from a less-trusted surface without revisiting.
+  // Replay each message into the file-chat store. Preserve the
+  // original sender so the imported transcript still attributes
+  // each line correctly.
   let imported = 0;
   let skipped = 0;
   const errors = [];
@@ -900,23 +451,17 @@ router.post("/api/project-history", async (req, res) => {
       skipped++;
       continue;
     }
-    const msg = {
-      text: m.text,
-      channel: typeof m.channel === "string" && m.channel ? m.channel : "general",
-      sender: typeof m.sender === "string" && m.sender ? m.sender : "user",
-    };
     try {
-      await sendViaWebSocket(base, sessionToken, msg);
+      fileChat.appendMessage(projectId, {
+        sender: typeof m.sender === "string" && m.sender ? m.sender : "user",
+        text: m.text,
+        channel: typeof m.channel === "string" && m.channel ? m.channel : "general",
+        type: m.type || "message",
+      });
       imported++;
     } catch (err) {
       errors.push(`#${m.id ?? "?"}: ${err.message || String(err)}`);
-      // Stop on the first error to avoid spamming AC if its ws is down.
       if (errors.length > 5) break;
-    }
-    // Tiny delay between sends — AC's ws handler can keep up but
-    // 10k messages back-to-back hit the recv buffer hard.
-    if (PROJECT_HISTORY_REPLAY_DELAY_MS > 0) {
-      await new Promise((r) => setTimeout(r, PROJECT_HISTORY_REPLAY_DELAY_MS));
     }
   }
   // #414 / quadwork#297 — Issue 2: stamp the import marker on the
@@ -1140,134 +685,36 @@ router.get("/api/activity/stats", (_req, res) => {
   }
 });
 
-router.post("/api/chat", async (req, res) => {
+router.post("/api/chat", (req, res) => {
   const projectId = req.query.project || req.body.project;
 
-  if (getProjectChatMode(projectId) === "file") {
-    const text = typeof req.body?.text === "string" ? req.body.text : "";
-    if (!text) return res.status(400).json({ error: "text required" });
-    const shimSender = req.headers["x-chat-sender"];
-    const shimToken = req.headers["x-chat-token"];
-    const bridgeSender = req.headers["x-bridge-sender"];
-    let sender = "user";
-    if (shimSender && shimToken) {
-      if (!fileChat.validateShimToken(projectId, shimSender, shimToken)) {
-        return res.status(403).json({ error: "Invalid shim token" });
-      }
-      sender = shimSender;
-    } else if (bridgeSender && isLocalhost(req.ip)) {
-      sender = bridgeSender;
-    }
-    const msg = fileChat.appendMessage(projectId, {
-      sender,
-      text: normalizeMentions(text),
-      channel: req.body?.channel || "general",
-      type: "message",
-    });
-    // #717: loop guard — count agent hops, pause if threshold reached
-    const maxHops = getProjectMaxHops(projectId);
-    fileChat.checkLoopGuard(projectId, msg, maxHops);
-    if (!fileChat.isLoopGuardPaused(projectId)) {
-      if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
-    }
-    return res.json({ ok: true, message: msg });
-  }
-
-  const { url: base, token: sessionToken } = getChattrConfig(projectId);
-  if (!base) return res.status(400).json({ error: "Missing project" });
-
-  // #230: ignore any client-supplied sender. /api/chat is the
-  // dashboard's send path, so the message must always be attributed
-  // to a server-controlled value. Forwarding `req.body.sender` would
-  // let any caller hitting QuadWork's /api/chat impersonate an agent
-  // identity (t1, t3, …) over the AgentChattr ws path, which the
-  // old /api/send flow could not do.
-  //
-  // #405 / quadwork#278: read the operator's display name from the
-  // server-side config file rather than hardcoding "user". The
-  // sanitizer matches AC's registry name validator (1–32 alnum +
-  // dash + underscore) so even a hand-edited config can't post a
-  // value AC will reject (or impersonate an agent), and an empty /
-  // missing value falls back to "user".
-  let operatorSender = "user";
-  try {
-    const cfg = readConfigFile();
-    operatorSender = sanitizeOperatorName(cfg.operator_name);
-  } catch {
-    // non-fatal — fall through to "user"
-  }
+  const text = typeof req.body?.text === "string" ? req.body.text : "";
+  if (!text) return res.status(400).json({ error: "text required" });
+  const shimSender = req.headers["x-chat-sender"];
+  const shimToken = req.headers["x-chat-token"];
   const bridgeSender = req.headers["x-bridge-sender"];
-  if (bridgeSender && isLocalhost(req.ip)) {
-    operatorSender = bridgeSender;
-  }
-  // #397 / quadwork#262: pass reply_to through to AgentChattr so the
-  // dashboard's reply button mirrors AC's native threaded-reply
-  // behavior. Only forward when it's a real positive integer — guards
-  // against arbitrary client payloads.
-  const replyToRaw = req.body?.reply_to;
-  const replyTo = (typeof replyToRaw === "number" && Number.isInteger(replyToRaw) && replyToRaw > 0)
-    ? replyToRaw
-    : null;
-  const message = {
-    text: typeof req.body?.text === "string" ? req.body.text : "",
-    channel: req.body?.channel || "general",
-    sender: operatorSender,
-    attachments: Array.isArray(req.body?.attachments) ? req.body.attachments : [],
-    ...(replyTo !== null ? { reply_to: replyTo } : {}),
-  };
-  if (!message.text && message.attachments.length === 0) {
-    return res.status(400).json({ error: "text or attachments required" });
-  }
-
-  // #693: normalize bare agent names to @mentions (belt-and-suspenders
-  // with sendViaWebSocket's own normalization)
-  message.text = normalizeMentions(message.text);
-
-  const attemptSend = () => sendViaWebSocket(base, sessionToken, message);
-
-  try {
-    // #236: sendViaWebSocket now waits for AC's broadcast echo and
-    // returns `{ok, message}` where `message` is the stored record
-    // (with server-assigned id/timestamp). Pass it through so
-    // callers regain parity with the old /api/send response body.
-    const result = await attemptSend();
-    return res.json({ ok: true, message: result.message });
-  } catch (err) {
-    // If the cached session_token is stale (AgentChattr regenerates
-    // one on every restart) the ws closes with code 4003 — re-sync
-    // the token from AgentChattr's HTML and retry once before giving
-    // up. This is the actual fix for the "401 after restart" report
-    // in #230 (the cache was stuck on an old token).
-    //
-    // #487: also attempt resync on generic ws errors (connection
-    // refused, ECONNRESET, timeout, etc.) — a 502/5xx from a
-    // temporary AC outage may resolve after a token refresh once AC
-    // is back.
-    const isAuthError = err && err.code === "EAGENTCHATTR_401";
-    const isConnError = !isAuthError && err;
-    if ((isAuthError || isConnError) && projectId) {
-      const tag = isAuthError ? "ws auth failed" : "ws connection error";
-      console.warn(`[chat] ${tag} for project ${projectId}, re-syncing session token and retrying...`);
-      try { await syncChattrToken(projectId); }
-      catch (syncErr) { console.warn(`[chat] syncChattrToken failed: ${syncErr.message}`); }
-      const { token: refreshed } = getChattrConfig(projectId);
-      if (refreshed && refreshed !== sessionToken) {
-        try {
-          const retry = await sendViaWebSocket(base, refreshed, message);
-          return res.json({ ok: true, resynced: true, message: retry.message });
-        } catch (retryErr) {
-          console.warn(`[chat] retry after token resync failed: ${retryErr.message}`);
-          const status = isAuthError ? 401 : 502;
-          return res.status(status).json({ error: "AgentChattr send failed (token resync did not help)", detail: retryErr.message });
-        }
-      }
-      if (isAuthError) {
-        return res.status(401).json({ error: "AgentChattr auth failed", detail: err.message });
-      }
+  let sender = "user";
+  if (shimSender && shimToken) {
+    if (!fileChat.validateShimToken(projectId, shimSender, shimToken)) {
+      return res.status(403).json({ error: "Invalid shim token" });
     }
-    console.warn(`[chat] send failed for project ${projectId}: ${err && err.message}`);
-    return res.status(502).json({ error: "AgentChattr unreachable", detail: err && err.message });
+    sender = shimSender;
+  } else if (bridgeSender && isLocalhost(req.ip)) {
+    sender = bridgeSender;
   }
+  const msg = fileChat.appendMessage(projectId, {
+    sender,
+    text: normalizeMentions(text),
+    channel: req.body?.channel || "general",
+    type: "message",
+  });
+  // #717: loop guard — count agent hops, pause if threshold reached
+  const maxHops = getProjectMaxHops(projectId);
+  fileChat.checkLoopGuard(projectId, msg, maxHops);
+  if (!fileChat.isLoopGuardPaused(projectId)) {
+    if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
+  }
+  return res.json({ ok: true, message: msg });
 });
 
 // ─── Image upload (#466) ──────────────────────────────────────────────────
@@ -1355,25 +802,11 @@ router.get("/api/projects", async (req, res) => {
 
   // Fetch chat messages from all projects (per-project AgentChattr instances)
   const chatMsgsByProject = {};
-  const chatFetches = (cfg.projects || []).map(async (p) => {
-    if (getProjectChatMode(p.id) === "file") {
-      try {
-        chatMsgsByProject[p.id] = fileChat.readMessages(p.id, { limit: 30 });
-      } catch {}
-      return;
-    }
-    const { url: chattrUrl, token: chattrToken } = getChattrConfig(p.id);
+  for (const p of cfg.projects || []) {
     try {
-      const headers = chattrToken ? { "x-session-token": chattrToken } : {};
-      const tokenParam = chattrToken ? `&token=${encodeURIComponent(chattrToken)}` : "";
-      const r = await fetch(`${chattrUrl}/api/messages?channel=general&limit=30${tokenParam}`, { headers });
-      if (r.ok) {
-        const data = await r.json();
-        chatMsgsByProject[p.id] = Array.isArray(data) ? data : data.messages || [];
-      }
+      chatMsgsByProject[p.id] = fileChat.readMessages(p.id, { limit: 30 });
     } catch {}
-  });
-  await Promise.allSettled(chatFetches);
+  }
   // Aggregate all project chat messages for the activity feed
   let chatMsgs = Object.values(chatMsgsByProject).flat();
 
@@ -2706,98 +2139,6 @@ router.post("/api/setup", (req, res) => {
       }
       return res.json({ ok: true, seeded });
     }
-    case "agentchattr-config": {
-      const workingDir = body.workingDir;
-      if (!workingDir) return res.json({ ok: false, error: "Missing working directory" });
-      const dirName = path.basename(workingDir);
-      const displayName = body.projectName || dirName;
-      const parentDir = path.dirname(workingDir);
-      const backends = body.backends;
-
-      // Phase 2D / #181: config.toml lives at the per-project AgentChattr
-      // clone ROOT (~/.quadwork/{id}/agentchattr/), not inside the user's
-      // project working_dir. AgentChattr's run.py loads ROOT/config.toml
-      // and ignores --config, so the toml has to be at the same path the
-      // clone lives at. Same path matches what writeQuadWorkConfig()
-      // persists in agentchattr_dir (#182) and what the CLI wizard
-      // writes (#184).
-      //
-      // We install the clone *here*, before writing config.toml. The
-      // install must run first because installAgentChattr() refuses to
-      // overwrite a non-empty directory it doesn't recognize — if we
-      // mkdir + write config.toml first, the subsequent install in
-      // add-config would see "unrelated content" and reject the dir,
-      // breaking first-run web project creation (t2a's review of #195).
-      const projectConfigDir = path.join(CONFIG_DIR, dirName, "agentchattr");
-      if (!findAgentChattr(projectConfigDir)) {
-        const installResult = installAgentChattr(projectConfigDir);
-        if (!installResult) {
-          const reason = installAgentChattr.lastError || "unknown error";
-          return res.json({ ok: false, error: `AgentChattr install failed at ${projectConfigDir}: ${reason}` });
-        }
-      }
-      const dataDir = path.join(projectConfigDir, "data");
-      ensureSecureDir(dataDir);
-      const tomlPath = path.join(projectConfigDir, "config.toml");
-
-      // Resolve per-project ports: prefer explicit body params (from setup wizard),
-      // then fall back to saved config, then defaults
-      let chattrPort, mcp_http, mcp_sse;
-      if (body.agentchattr_port) {
-        chattrPort = String(body.agentchattr_port);
-        mcp_http = body.mcp_http_port || 8200;
-        mcp_sse = body.mcp_sse_port || 8201;
-      } else {
-        const projectChattr = resolveProjectChattr(dirName);
-        chattrPort = new URL(projectChattr.url).port || "8300";
-        mcp_http = projectChattr.mcp_http_port || 8200;
-        mcp_sse = projectChattr.mcp_sse_port || 8201;
-      }
-
-      const agents = ["head", "re1", "re2", "dev"];
-      const colors = ["#10a37f", "#22c55e", "#f59e0b", "#da7756"];
-      const labels = ["Lead", "Reviewer 1", "Reviewer 2", "Builder"];
-
-      // Read or generate token for this project
-      const crypto = require("crypto");
-      const savedCfg = readConfigFile();
-      const savedProject = savedCfg.projects?.find((p) => p.id === dirName);
-      const sessionToken = body.agentchattr_token || savedProject?.agentchattr_token || crypto.randomBytes(16).toString("hex");
-
-      let content = `[meta]\nname = "${displayName}"\n\n`;
-      content += `[server]\nport = ${chattrPort}\nhost = "127.0.0.1"\ndata_dir = "${dataDir}"\n`;
-      if (sessionToken) content += `session_token = "${sessionToken}"\n`;
-      content += `\n`;
-      agents.forEach((agent, i) => {
-        const wtDir = path.join(parentDir, `${dirName}-${agent}`);
-        content += `[agents.${agent}]\ncommand = "${(backends && backends[agent]) || "claude"}"\ncwd = "${wtDir}"\ncolor = "${colors[i]}"\nlabel = "${labels[i]}"\nmcp_inject = "flag"\n\n`;
-      });
-      // #592: CLI-based agent sections for AC HEAD compatibility.
-      // HEAD AC validates `base` against [agents.*] keys. Add CLI-name
-      // sections (deduped) so registration works on both pinned and HEAD AC.
-      const seenClis = new Set();
-      agents.forEach((agent) => {
-        const cmd = (backends && backends[agent]) || "claude";
-        const cli = cmd.split("/").pop().split(" ")[0];
-        seenClis.add(cli);
-      });
-      for (const cli of seenClis) {
-        const injectMode = cli === "codex" ? "proxy_flag" : cli === "gemini" ? "env" : "flag";
-        content += `[agents.${cli}]\ncommand = "${cli}"\nlabel = "${cli}"\nmcp_inject = "${injectMode}"\n\n`;
-      }
-      // #403 / quadwork#274: raise the loop guard from AC's default
-      // of 4 to 30 so autonomous PR review cycles (head→dev→re1+re2→
-      // dev→head, ~5 hops) don't fire mid-batch and force the
-      // operator to type /continue. AC clamps to [1, 50] internally.
-      content += `[routing]\ndefault = "none"\nmax_agent_hops = 30\n\n`;
-      content += `[mcp]\nhttp_port = ${mcp_http}\nsse_port = ${mcp_sse}\n`;
-      // #607: Bridge agent declarations so AC accepts dc/tg base registration
-      content += `\n[agents.tg]\nlabel = "Telegram Bridge"\n\n`;
-      content += `[agents.dc]\nlabel = "Discord Bridge"\n`;
-      writeSecureFile(tomlPath, content);
-
-      return res.json({ ok: true, path: tomlPath, agentchattr_token: sessionToken, agentchattr_port: chattrPort, mcp_http_port: mcp_http, mcp_sse_port: mcp_sse });
-    }
     case "add-config": {
       const { id, name, repo, workingDir, backends } = body;
       const autoApprove = body.auto_approve !== false; // default true
@@ -2806,7 +2147,7 @@ router.post("/api/setup", (req, res) => {
       const parentDir = path.dirname(workingDir);
       let cfg;
       try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
-      catch { cfg = { port: 8400, agentchattr_url: "http://127.0.0.1:8300", agentchattr_dir: path.join(os.homedir(), ".quadwork", "agentchattr"), projects: [] }; }
+      catch { cfg = { port: 8400, projects: [] }; }
       if (cfg.projects.some((p) => p.id === id)) {
         // Project already saved, but still (idempotently) seed the
         // OVERNIGHT-QUEUE.md in case a previous run failed to write
@@ -2836,47 +2177,9 @@ router.post("/api/setup", (req, res) => {
           ...(cliBase === "codex" ? { reasoning_effort: "medium" } : {}),
         };
       }
-      // Use pre-assigned ports/token from agentchattr-config step if provided,
-      // otherwise auto-assign (direct add-config without prior agentchattr-config)
-      const crypto = require("crypto");
-      let chattrPort = body.agentchattr_port;
-      let mcp_http_port = body.mcp_http_port;
-      let mcp_sse_port = body.mcp_sse_port;
-      let agentchattr_token = body.agentchattr_token;
-      if (!chattrPort) {
-        const usedChattrPorts = new Set(cfg.projects.map((p) => {
-          try { return parseInt(new URL(p.agentchattr_url).port, 10); } catch { return 0; }
-        }).filter(Boolean));
-        const usedMcpPorts = new Set(cfg.projects.flatMap((p) => [p.mcp_http_port, p.mcp_sse_port]).filter(Boolean));
-        chattrPort = 8300;
-        while (usedChattrPorts.has(chattrPort)) chattrPort++;
-        mcp_http_port = 8200;
-        while (usedMcpPorts.has(mcp_http_port)) mcp_http_port++;
-        mcp_sse_port = mcp_http_port + 1;
-        while (usedMcpPorts.has(mcp_sse_port)) mcp_sse_port++;
-      }
-      if (!agentchattr_token) agentchattr_token = crypto.randomBytes(16).toString("hex");
-
-      // Phase 2D / #181: clone AgentChattr per-project before saving config.
-      // The path here must match the one written into agentchattr_dir below
-      // and the one agentchattr-config writes config.toml into.
-      const perProjectDir = path.join(CONFIG_DIR, id, "agentchattr");
-      if (!findAgentChattr(perProjectDir)) {
-        const installResult = installAgentChattr(perProjectDir);
-        if (!installResult) {
-          const reason = installAgentChattr.lastError || "unknown error";
-          return res.json({ ok: false, error: `AgentChattr install failed at ${perProjectDir}: ${reason}` });
-        }
-      }
-
       cfg.projects.push({
         id, name, repo, working_dir: workingDir, agents,
-        agentchattr_url: `http://127.0.0.1:${chattrPort}`,
-        agentchattr_token,
-        mcp_http_port,
-        mcp_sse_port,
-        // Per-project AgentChattr clone path (Option B / #181).
-        agentchattr_dir: perProjectDir,
+        chat_mode: "file",
       });
       const dir = path.dirname(CONFIG_PATH);
       ensureSecureDir(dir);
@@ -2885,44 +2188,6 @@ router.post("/api/setup", (req, res) => {
       // Batch 25 / #204: seed the per-project OVERNIGHT-QUEUE.md at
       // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md.
       writeOvernightQueueFileSafe(id, name || id, repo);
-
-      // Batch 28 / #392 / quadwork#252: auto-spawn the per-project
-      // AgentChattr process. The CLI wizard's writeAgentChattrConfig
-      // does this; the web wizard previously left the install dormant
-      // until the user clicked Restart, so MCP fell through to a stale
-      // instance on port 8300. Mirror the loopback-restart pattern
-      // already used by the agentchattr-config branch above. Failures
-      // are non-fatal — the dashboard's Restart button is still
-      // available, and per the issue add-config must still return ok.
-      try {
-        const qwPort = cfg.port || 8400;
-        fetch(
-          `http://127.0.0.1:${qwPort}/api/agentchattr/${encodeURIComponent(id)}/restart`,
-          { method: "POST" },
-        )
-          .then(async (r) => {
-            // /restart reports spawn failures (e.g. port collision —
-            // server/index.js:650-668) as HTTP 500, so a resolved
-            // fetch is not the same thing as a successful spawn. Log
-            // non-2xx responses with status and body so the operator
-            // can see why the auto-spawn silently didn't take.
-            if (!r.ok) {
-              let detail = "";
-              try { detail = (await r.text()).slice(0, 500); } catch {}
-              console.warn(
-                `[setup] auto-spawn AgentChattr for ${id} returned HTTP ${r.status}: ${detail}`,
-              );
-            }
-          })
-          .catch((err) => {
-            console.warn(
-              `[setup] auto-spawn AgentChattr for ${id} failed:`,
-              err.message || err,
-            );
-          });
-      } catch (err) {
-        console.warn(`[setup] auto-spawn AgentChattr for ${id} skipped:`, err.message || err);
-      }
 
       return res.json({ ok: true });
     }
@@ -3033,172 +2298,6 @@ router.post("/api/rename", (req, res) => {
 
 // ─── Telegram ──────────────────────────────────────────────────────────────
 
-const BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-telegram");
-// #444: pin agentchattr-telegram to a known commit (same pattern as
-// AGENTCHATTR_PIN in bin/quadwork.js for bcurts/agentchattr).
-const AGENTCHATTR_TELEGRAM_PIN = "045ee18f6d5dbcd0bd45d5ab29f06e2a27382aaf";
-
-function telegramPidFile(projectId) {
-  return path.join(CONFIG_DIR, `tg-bridge-${projectId}.pid`);
-}
-
-function telegramConfigToml(projectId) {
-  return path.join(CONFIG_DIR, `telegram-${projectId}.toml`);
-}
-
-// #383: path to a project's AgentChattr config.toml. The install
-// handler patches this file to declare the `tg` agent
-// so AC's registry accepts the bridge's register call.
-function projectAgentchattrConfigPath(projectId) {
-  return path.join(CONFIG_DIR, projectId, "agentchattr", "config.toml");
-}
-
-// #383 Bug 1: prefer the per-project agentchattr_url. Every project
-// after the first uses a distinct port (8301, 8302, ...), so reading
-// the global default silently routed bridge traffic to the wrong AC
-// instance.
-function resolveProjectAgentchattrUrl(cfg, project) {
-  return (
-    (project && project.agentchattr_url) ||
-    (cfg && cfg.agentchattr_url) ||
-    "http://127.0.0.1:8300"
-  );
-}
-
-// #383 Bug 2: the upstream bridge only reads `agentchattr_url` from
-// inside `[telegram]`. A separate `[agentchattr]` section is silently
-// ignored and the bridge falls back to its hardcoded :8300 default.
-// #404: accept projectId so we can write a per-project cursor_file
-// path. Without this, multiple project bridges share the same default
-// cursor and clobber each other's position — the project with higher
-// AC message IDs advances the cursor past the other project's range,
-// silently killing AC→TG forwarding for that project.
-function buildTelegramBridgeToml(tg, projectId) {
-  const cursorFile = path.join(CONFIG_DIR, `tg-bridge-cursor-${projectId}.json`);
-  // #439: migrate old cursor file so the bridge doesn't replay history
-  const oldCursor = path.join(CONFIG_DIR, `telegram-bridge-cursor-${projectId}.json`);
-  if (!fs.existsSync(cursorFile) && fs.existsSync(oldCursor)) {
-    fs.renameSync(oldCursor, cursorFile);
-  }
-  return (
-    `[telegram]\n` +
-    `bot_token = "${tg.bot_token}"\n` +
-    `chat_id = "${tg.chat_id}"\n` +
-    `agentchattr_url = "${tg.agentchattr_url}"\n` +
-    `cursor_file = "${cursorFile}"\n` +
-    `project_id = "${projectId}"\n`
-  );
-}
-
-// #383 Bug 3: AC's registry rejects any base name not pre-declared
-// in config.toml with `400 unknown base`. The bridge registers as
-// `tg` (#439: renamed from `telegram-bridge`), so every per-project
-// AC config must declare it. Idempotent: only appends if the section
-// is not already present. Also migrates old `[agents.telegram-bridge]`.
-function patchAgentchattrConfigForTelegramBridge(tomlText) {
-  // #439: migrate old slug if present
-  const original = tomlText;
-  tomlText = tomlText.replace(/^\[agents\.telegram-bridge\]\s*$/m, "[agents.tg]");
-  if (/^\[agents\.tg\]\s*$/m.test(tomlText)) {
-    return { text: tomlText, changed: tomlText !== original };
-  }
-  const sep = tomlText.length === 0 || tomlText.endsWith("\n") ? "" : "\n";
-  const block = `\n[agents.tg]\nlabel = "Telegram Bridge"\n`;
-  return { text: tomlText + sep + block, changed: true };
-}
-
-// #383 Bug 4: the upstream bridge treats env vars as higher
-// precedence than TOML values. If the parent shell exported
-// TELEGRAM_BOT_TOKEN for a different bot, the bridge silently ran
-// as the wrong identity. Scrub those keys from the child's env so
-// the TOML is the single source of truth.
-function buildTelegramBridgeSpawnEnv(parentEnv) {
-  const env = { ...parentEnv };
-  delete env.TELEGRAM_BOT_TOKEN;
-  delete env.TELEGRAM_CHAT_ID;
-  delete env.AGENTCHATTR_URL;
-  return env;
-}
-
-// #353: per-project log file for the bridge subprocess. The start
-// handler redirects stdout + stderr here so crashes (ImportError,
-// config parse, auth failure) are recoverable instead of
-// /dev/null'd by `stdio: "ignore"`.
-function telegramBridgeLog(projectId) {
-  return path.join(CONFIG_DIR, `tg-bridge-${projectId}.log`);
-}
-
-// Tail the last N lines of a file without reading the whole thing
-// into memory if it is huge. For the bridge log we care about the
-// final crash frame, not historical output.
-function readLastLines(filePath, n) {
-  try {
-    if (!fs.existsSync(filePath)) return "";
-    const stat = fs.statSync(filePath);
-    const readBytes = Math.min(stat.size, 64 * 1024);
-    if (readBytes === 0) return "";
-    const buf = Buffer.alloc(readBytes);
-    const fd = fs.openSync(filePath, "r");
-    try {
-      fs.readSync(fd, buf, 0, readBytes, Math.max(0, stat.size - readBytes));
-    } finally {
-      fs.closeSync(fd);
-    }
-    const text = buf.toString("utf-8");
-    const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
-    return lines.slice(-n).join("\n");
-  } catch {
-    return "";
-  }
-}
-
-// Verify that the bridge's Python runtime has its required modules
-// available. Cheap pre-flight so a missing `requests` install
-// produces a readable error instead of a silent Start → Stopped
-// flicker. Returns { ok: true } on success, { ok: false, error }
-// otherwise. Keep the import list small and close to what the
-// bridge actually needs; add modules here if the bridge gains new
-// hard deps.
-// #380: `pythonPath` defaults to bare `python3` for backward-compat,
-// but the production call sites (install, start) MUST pass the
-// dedicated bridge venv's interpreter (`<BRIDGE_DIR>/.venv/bin/python3`)
-// so the import check runs against the same interpreter the spawn will
-// use. See #379 research ticket for root cause.
-function checkTelegramBridgePythonDeps(pythonPath = "python3") {
-  try {
-    // Only check the third-party module the bridge actually needs
-    // at import time — `requests`. Toml parsing differs between
-    // Python versions (tomllib on 3.11+, tomli on 3.10-), and any
-    // genuine toml import failure will now be captured in the
-    // bridge log file on spawn, so this pre-flight stays narrow
-    // and avoids false negatives on older Python installs.
-    execFileSync(pythonPath, ["-c", "import requests"], {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { ok: true };
-  } catch (err) {
-    const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
-    const msg = stderr.trim() || (err && err.message) || "python3 import check failed";
-    return { ok: false, error: msg };
-  }
-}
-
-function isTelegramRunning(projectId) {
-  const pf = telegramPidFile(projectId);
-  if (!fs.existsSync(pf)) return false;
-  const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    fs.unlinkSync(pf);
-    return false;
-  }
-}
-
 function readEnvToken(key) {
   try {
     const content = fs.readFileSync(ENV_PATH, "utf-8");
@@ -3236,8 +2335,6 @@ function getProjectTelegram(projectId) {
     return {
       bot_token: resolveToken(project.telegram.bot_token || ""),
       chat_id: project.telegram.chat_id || "",
-      // #383 Bug 1: prefer per-project URL over the global default.
-      agentchattr_url: resolveProjectAgentchattrUrl(cfg, project),
     };
   } catch {
     return null;
@@ -3398,89 +2495,6 @@ router.post("/api/telegram", async (req, res) => {
 });
 
 // --- Discord Bridge ---
-// #396/#399: Discord ↔ AgentChattr bridge, bundled in quadwork
-// package at bridges/discord/. Mirrors Telegram bridge patterns.
-
-const DISCORD_BRIDGE_SRC = path.join(__dirname, "..", "bridges", "discord");
-const DISCORD_BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-discord");
-
-function discordPidFile(projectId) {
-  return path.join(CONFIG_DIR, `dc-bridge-${projectId}.pid`);
-}
-
-function discordConfigToml(projectId) {
-  return path.join(CONFIG_DIR, `discord-${projectId}.toml`);
-}
-
-function discordBridgeLog(projectId) {
-  return path.join(CONFIG_DIR, `dc-bridge-${projectId}.log`);
-}
-
-function buildDiscordBridgeToml(dc, projectId) {
-  const cursorFile = path.join(CONFIG_DIR, `dc-bridge-cursor-${projectId}.json`);
-  // #439: migrate old cursor file so the bridge doesn't replay history
-  const oldCursor = path.join(CONFIG_DIR, `discord-bridge-cursor-${projectId}.json`);
-  if (!fs.existsSync(cursorFile) && fs.existsSync(oldCursor)) {
-    fs.renameSync(oldCursor, cursorFile);
-  }
-  return (
-    `[discord]\n` +
-    `bot_token = "${dc.bot_token}"\n` +
-    `channel_id = "${dc.channel_id}"\n` +
-    `agentchattr_url = "${dc.agentchattr_url}"\n` +
-    `cursor_file = "${cursorFile}"\n` +
-    `project_id = "${projectId}"\n`
-  );
-}
-
-function patchAgentchattrConfigForDiscordBridge(tomlText) {
-  // #439: migrate old slug if present
-  const original = tomlText;
-  tomlText = tomlText.replace(/^\[agents\.discord-bridge\]\s*$/m, "[agents.dc]");
-  if (/^\[agents\.dc\]\s*$/m.test(tomlText)) {
-    return { text: tomlText, changed: tomlText !== original };
-  }
-  const sep = tomlText.length === 0 || tomlText.endsWith("\n") ? "" : "\n";
-  const block = `\n[agents.dc]\nlabel = "Discord Bridge"\n`;
-  return { text: tomlText + sep + block, changed: true };
-}
-
-function buildDiscordBridgeSpawnEnv(parentEnv) {
-  const env = { ...parentEnv };
-  delete env.DISCORD_BOT_TOKEN;
-  delete env.DISCORD_CHANNEL_ID;
-  delete env.AGENTCHATTR_URL;
-  return env;
-}
-
-function checkDiscordBridgePythonDeps(pythonPath = "python3") {
-  try {
-    execFileSync(pythonPath, ["-c", "import discord, requests"], {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { ok: true };
-  } catch (err) {
-    const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
-    const msg = stderr.trim() || (err && err.message) || "python3 import check failed";
-    return { ok: false, error: msg };
-  }
-}
-
-function isDiscordRunning(projectId) {
-  const pf = discordPidFile(projectId);
-  if (!fs.existsSync(pf)) return false;
-  const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    fs.unlinkSync(pf);
-    return false;
-  }
-}
 
 function discordEnvKeyForProject(projectId) {
   return `DISCORD_BOT_TOKEN_${projectId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
@@ -3494,7 +2508,6 @@ function getProjectDiscord(projectId) {
     return {
       bot_token: resolveToken(project.discord.bot_token || ""),
       channel_id: project.discord.channel_id || "",
-      agentchattr_url: resolveProjectAgentchattrUrl(cfg, project),
     };
   } catch {
     return null;
@@ -3714,26 +2727,6 @@ module.exports.parseActiveBatch = parseActiveBatch;
 // summarizeItems for the batch-progress fixture test.
 module.exports.buildNoPrRow = buildNoPrRow;
 module.exports.summarizeItems = summarizeItems;
-// #353: expose readLastLines for the tg-bridge test.
-module.exports.readLastLines = readLastLines;
-// #380: expose checkTelegramBridgePythonDeps so the bridge test can
-// exercise the venv-path interpreter argument round trip.
-module.exports.checkTelegramBridgePythonDeps = checkTelegramBridgePythonDeps;
-// #383: pure helpers exposed for unit tests in
-// routes.telegramBridge.test.js. No production callers outside
-// this file.
-module.exports.resolveProjectAgentchattrUrl = resolveProjectAgentchattrUrl;
-module.exports.buildTelegramBridgeToml = buildTelegramBridgeToml;
-module.exports.patchAgentchattrConfigForTelegramBridge = patchAgentchattrConfigForTelegramBridge;
-module.exports.buildTelegramBridgeSpawnEnv = buildTelegramBridgeSpawnEnv;
-module.exports.checkDiscordBridgePythonDeps = checkDiscordBridgePythonDeps;
-module.exports.buildDiscordBridgeToml = buildDiscordBridgeToml;
-module.exports.patchAgentchattrConfigForDiscordBridge = patchAgentchattrConfigForDiscordBridge;
-module.exports.buildDiscordBridgeSpawnEnv = buildDiscordBridgeSpawnEnv;
-module.exports.projectAgentchattrConfigPath = projectAgentchattrConfigPath;
-// #236: expose sendViaWebSocket so the chat-ws-send regression test
-// can verify the ack/body/error paths against a fake AC ws server.
-module.exports.sendViaWebSocket = sendViaWebSocket;
 // #693: expose normalizeMentions for unit tests
 module.exports.normalizeMentions = normalizeMentions;
 // #714: expose for file-chat integration

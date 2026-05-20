@@ -23,10 +23,6 @@ interface ProjectConfig {
   repo: string;
   working_dir: string;
   agents: Record<string, AgentConfig>;
-  agentchattr_url?: string;
-  agentchattr_token?: string;
-  mcp_http_port?: number;
-  mcp_sse_port?: number;
   archived?: boolean;
 }
 
@@ -40,8 +36,6 @@ interface ButlerConfig {
 
 interface Config {
   port: number;
-  agentchattr_url: string;
-  agentchattr_token: string;
   default_backend?: string;
   reviewer_github_user?: string;
   // #405 / quadwork#278: display name used as the chat sender for
@@ -81,12 +75,11 @@ const COPY = {
     yourNameInChat: "Your name in chat",
     language: "Language",
     operatorHelp:
-      "Shows next to your messages in the AgentChattr chat panel. Defaults to user if blank. Allowed: 1-32 letters, digits, dash, underscore (matches AgentChattr name rules; other characters are stripped server-side). Reserved agent names like head, dev, re1, re2, and system are rejected and fall back to user.",
+      "Shows next to your messages in the project chat panel. Defaults to user if blank. Allowed: 1-32 letters, digits, dash, underscore (other characters are stripped server-side). Reserved agent names like head, dev, re1, re2, and system are rejected and fall back to user.",
     global: "Global",
     dashboardPort: "QuadWork Dashboard Port",
-    agentChattrUrlGlobal: "AgentChattr URL (global override)",
     globalHelp:
-      "The dashboard binds to the QuadWork port. The AgentChattr URL is the v1 fallback; new projects use a per-project AgentChattr clone and ignore this field.",
+      "The dashboard binds to the QuadWork port.",
     defaults: "Defaults",
     defaultAgentCli: "Default agent CLI",
     reviewerGithubUser: "Reviewer GitHub user",
@@ -106,7 +99,7 @@ const COPY = {
       "Prevents this machine from sleeping while agents are running. Machine-level (not per-project) - uses caffeinate on macOS.",
     cleanup: "Cleanup",
     cleanupIntro:
-      "Each project now has its own AgentChattr clone at ~/.quadwork/{id}/agentchattr (~77 MB). After all projects are migrated, the legacy global install can be removed:",
+      "Remove legacy AgentChattr files left over from pre-v2 installs:",
     cleanupSingle: "To remove a single project's clone and config entry:",
     cleanupHelp:
       "Both commands prompt for confirmation. Worktrees and source repos are never touched. See npx quadwork --help or the README's Disk Usage section for details.",
@@ -126,12 +119,6 @@ const COPY = {
     edit: "edit",
     oneCliInstalled: "Only one CLI installed - install the other for more options",
     agentsMdPlaceholder: "# AGENTS.md seed content for this agent...",
-    agentChattr: "AgentChattr",
-    agentChattrUrl: "AgentChattr URL",
-    sessionToken: "Session Token",
-    optional: "(optional)",
-    mcpHttpPort: "MCP HTTP Port",
-    mcpSsePort: "MCP SSE Port",
     restoreProject: "Restore Project",
     archive: "Archive",
     remove: "Remove",
@@ -166,12 +153,11 @@ const COPY = {
     yourNameInChat: "채팅에서의 이름",
     language: "언어",
     operatorHelp:
-      "AgentChattr 채팅 패널에서 내 메시지 옆에 표시됩니다. 비워두면 기본값은 user입니다. 허용: 1-32자의 영문, 숫자, 하이픈, 언더스코어(AgentChattr 이름 규칙과 동일). 다른 문자는 서버에서 제거됩니다. head, dev, re1, re2, system 같은 예약 이름은 거부되고 user로 대체됩니다.",
+      "프로젝트 채팅 패널에서 내 메시지 옆에 표시됩니다. 비워두면 기본값은 user입니다. 허용: 1-32자의 영문, 숫자, 하이픈, 언더스코어. 다른 문자는 서버에서 제거됩니다. head, dev, re1, re2, system 같은 예약 이름은 거부되고 user로 대체됩니다.",
     global: "전역",
     dashboardPort: "QuadWork 대시보드 포트",
-    agentChattrUrlGlobal: "AgentChattr URL (전역 오버라이드)",
     globalHelp:
-      "대시보드는 QuadWork 포트에 바인딩됩니다. AgentChattr URL은 v1 호환용 기본값이며, 새 프로젝트는 프로젝트별 AgentChattr 클론을 사용하므로 이 필드는 무시됩니다.",
+      "대시보드는 QuadWork 포트에 바인딩됩니다.",
     defaults: "기본값",
     defaultAgentCli: "기본 에이전트 CLI",
     reviewerGithubUser: "리뷰어 GitHub 사용자",
@@ -191,7 +177,7 @@ const COPY = {
       "에이전트가 실행되는 동안 이 기기가 잠들지 않도록 합니다. 기기 전체 설정이며(프로젝트별 아님) macOS에서는 caffeinate를 사용합니다.",
     cleanup: "정리",
     cleanupIntro:
-      "각 프로젝트는 이제 ~/.quadwork/{id}/agentchattr (~77 MB)에 자체 AgentChattr 클론을 가집니다. 모든 프로젝트 마이그레이션이 끝나면 예전 전역 설치는 제거할 수 있습니다:",
+      "v2 이전 설치에서 남은 레거시 AgentChattr 파일을 제거합니다:",
     cleanupSingle: "특정 프로젝트의 클론과 설정 항목만 제거하려면:",
     cleanupHelp:
       "두 명령 모두 확인 절차가 있습니다. 워크트리와 소스 저장소는 건드리지 않습니다. 자세한 내용은 npx quadwork --help 또는 README의 Disk Usage 섹션을 참고하세요.",
@@ -211,12 +197,6 @@ const COPY = {
     edit: "편집",
     oneCliInstalled: "CLI 하나만 설치됨 - 더 많은 옵션을 위해 다른 CLI를 설치하세요",
     agentsMdPlaceholder: "# 이 에이전트의 AGENTS.md 초기 내용...",
-    agentChattr: "AgentChattr",
-    agentChattrUrl: "AgentChattr URL",
-    sessionToken: "세션 토큰",
-    optional: "(선택)",
-    mcpHttpPort: "MCP HTTP 포트",
-    mcpSsePort: "MCP SSE 포트",
     restoreProject: "프로젝트 복원",
     archive: "보관",
     remove: "제거",
@@ -309,26 +289,6 @@ export default function SettingsPage() {
   // `parseInt("") || 8400` clobbering the buffer mid-keystroke.
   // Kept in sync with config.port on load + blur commit.
   const [portDraft, setPortDraft] = useState<string>("8400");
-  // #419 / quadwork#308: per-project MCP port drafts keyed by
-  // `${projectId}-http` / `${projectId}-sse`. Same draft-string
-  // pattern as the global port input above — the previous
-  // `parseInt(v) || undefined` onChange clobbered partial typing.
-  const [projectPortDrafts, setProjectPortDrafts] = useState<Record<string, string>>({});
-  const getProjectPortDraft = (projectId: string, key: "http" | "sse", fallback: number | undefined) => {
-    const dkey = `${projectId}-${key}`;
-    if (dkey in projectPortDrafts) return projectPortDrafts[dkey];
-    return fallback ? String(fallback) : "";
-  };
-  const setProjectPortDraftValue = (projectId: string, key: "http" | "sse", value: string) => {
-    setProjectPortDrafts((prev) => ({ ...prev, [`${projectId}-${key}`]: value }));
-  };
-  const commitProjectPortDraft = (idx: number, projectId: string, key: "http" | "sse", field: "mcp_http_port" | "mcp_sse_port") => {
-    const draft = projectPortDrafts[`${projectId}-${key}`] ?? "";
-    const n = parseInt(draft, 10);
-    const clamped = Number.isFinite(n) && n > 0 && n <= 65535 ? n : undefined;
-    updateProject(idx, { [field]: clamped } as Partial<ProjectConfig>);
-    setProjectPortDrafts((prev) => ({ ...prev, [`${projectId}-${key}`]: clamped ? String(clamped) : "" }));
-  };
 
   const load = useCallback(() => {
     fetch("/api/config")
@@ -340,8 +300,6 @@ export default function SettingsPage() {
         setPortDraft(String(data.port || 8400));
         const cfg = {
           port: data.port || 8400,
-          agentchattr_url: data.agentchattr_url || "http://127.0.0.1:8300",
-          agentchattr_token: data.agentchattr_token || "",
           default_backend: data.default_backend || "claude",
           reviewer_github_user: data.reviewer_github_user || "",
           operator_name: data.operator_name || "user",
@@ -660,8 +618,8 @@ export default function SettingsPage() {
       </div>
 
       {/* #405 / quadwork#278: operator identity — name shown next to
-          dashboard chat messages. Server-side validated to AC's
-          registry name rules (1–32 alnum + dash + underscore). */}
+          dashboard chat messages. Server-side validated to chat
+          name rules (1–32 alnum + dash + underscore). */}
       <section className="mb-8">
         <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.operatorIdentity}</h2>
         <div className="grid grid-cols-1 md:grid-cols-[minmax(0,2fr)_minmax(220px,1fr)] gap-3 items-end">
@@ -714,12 +672,6 @@ export default function SettingsPage() {
               setPortDraft(String(clamped));
             }}
             type="number"
-          />
-          <Input
-            label={t.agentChattrUrlGlobal}
-            value={config.agentchattr_url}
-            onChange={(v) => updateGlobal("agentchattr_url", v)}
-            placeholder="http://127.0.0.1:8300"
           />
         </div>
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
@@ -859,13 +811,7 @@ export default function SettingsPage() {
       <section className="mb-8">
         <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.cleanup}</h2>
         <div className="border border-border p-3 text-[11px] text-text-muted space-y-1">
-          <p>
-            {t.cleanupIntro.split("~/.quadwork/{id}/agentchattr")[0]}
-            {" "}<code className="bg-bg-surface px-1 rounded">~/.quadwork/&#123;id&#125;/agentchattr</code>
-            {t.cleanupIntro.includes("~/.quadwork/{id}/agentchattr")
-              ? t.cleanupIntro.split("~/.quadwork/{id}/agentchattr")[1]
-              : ""}
-          </p>
+          <p>{t.cleanupIntro}</p>
           <pre className="mt-1 p-2 bg-bg-surface text-text rounded font-mono text-[11px]">npx quadwork cleanup --legacy</pre>
           <p className="mt-2">{t.cleanupSingle}</p>
           <pre className="mt-1 p-2 bg-bg-surface text-text rounded font-mono text-[11px]">npx quadwork cleanup --project &lt;id&gt;</pre>
@@ -1000,43 +946,6 @@ export default function SettingsPage() {
                           )}
                         </div>
                       ))}
-                    </div>
-                  </div>
-
-                  {/* AgentChattr (per-project) */}
-                  <div className="mt-4">
-                    <h3 className="text-[10px] text-text-muted uppercase tracking-wider mb-2">{t.agentChattr}</h3>
-                    <div className="border border-border p-3">
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        <Input
-                          label={t.agentChattrUrl}
-                          value={project.agentchattr_url || ""}
-                          onChange={(v) => updateProject(idx, { agentchattr_url: v } as Partial<ProjectConfig>)}
-                          placeholder="http://127.0.0.1:8300"
-                        />
-                        <Input
-                          label={t.sessionToken}
-                          value={project.agentchattr_token || ""}
-                          onChange={(v) => updateProject(idx, { agentchattr_token: v } as Partial<ProjectConfig>)}
-                          placeholder={t.optional}
-                        />
-                        <Input
-                          label={t.mcpHttpPort}
-                          value={getProjectPortDraft(project.id, "http", project.mcp_http_port)}
-                          onChange={(v) => setProjectPortDraftValue(project.id, "http", v)}
-                          onBlur={() => commitProjectPortDraft(idx, project.id, "http", "mcp_http_port")}
-                          type="number"
-                          placeholder="8200"
-                        />
-                        <Input
-                          label={t.mcpSsePort}
-                          value={getProjectPortDraft(project.id, "sse", project.mcp_sse_port)}
-                          onChange={(v) => setProjectPortDraftValue(project.id, "sse", v)}
-                          onBlur={() => commitProjectPortDraft(idx, project.id, "sse", "mcp_sse_port")}
-                          type="number"
-                          placeholder="8201"
-                        />
-                      </div>
                     </div>
                   </div>
 

@@ -9,16 +9,15 @@ const COPY = {
     title: "Project History",
     tooltip: (
       <>
-        <b>Project History</b> — export or import the full AgentChattr chat history for this project. Useful for backup, migration, or resuming after a fresh install.
+        <b>Project History</b> — export or import the full chat history for this project. Useful for backup, migration, or resuming after a fresh install.
       </>
     ),
     export: (projectId: string) => `Export ${projectId} chat`,
     import: "Import history…",
     importing: "Importing…",
-    autoRestore: "Auto-restore newest snapshot after AC restart",
     autoSnapshots: "Auto-snapshots (before restart)",
     restore: "Restore",
-    restoreConfirm: (name: string) => `Restore snapshot ${name}? This will replay every message through AgentChattr (tagged by the original sender) and may duplicate history already in the chat. Continue?`,
+    restoreConfirm: (name: string) => `Restore snapshot ${name}? This will replay every message (tagged by the original sender) and may duplicate history already in the chat. Continue?`,
     importMismatchConfirm: (source: string, target: string) => `This export is from project '${source}' but you're importing into '${target}'. Continue anyway?`,
     importReservedConfirm: (senders: string) => `This export contains messages attributed to reserved agent/system identities (${senders}). Importing will replay them as those agents — only do this for a legitimate disaster-recovery restore. Continue?`,
     importDuplicateConfirm: (error: string) => `${error}\n\nThis file looks like it was already imported. Re-import will duplicate every message. Continue anyway?`,
@@ -34,16 +33,15 @@ const COPY = {
     title: "프로젝트 히스토리",
     tooltip: (
       <>
-        <b>프로젝트 히스토리</b> - 이 프로젝트의 전체 AgentChattr 채팅 기록을 내보내거나 가져옵니다. 백업, 마이그레이션, 재설치 후 복구에 유용합니다.
+        <b>프로젝트 히스토리</b> - 이 프로젝트의 전체 채팅 기록을 내보내거나 가져옵니다. 백업, 마이그레이션, 재설치 후 복구에 유용합니다.
       </>
     ),
     export: (projectId: string) => `${projectId} 채팅 내보내기`,
     import: "히스토리 가져오기…",
     importing: "가져오는 중…",
-    autoRestore: "AC 재시작 후 최신 스냅샷 자동 복구",
     autoSnapshots: "자동 스냅샷 (재시작 전)",
     restore: "복구",
-    restoreConfirm: (name: string) => `스냅샷 ${name}을(를) 복구할까요? 모든 메시지가 AgentChattr를 통해 재생되며(원본 발신자 표시), 채팅에 이미 있는 내용이 중복될 수 있습니다. 계속하시겠습니까?`,
+    restoreConfirm: (name: string) => `스냅샷 ${name}을(를) 복구할까요? 모든 메시지가 재생되며(원본 발신자 표시), 채팅에 이미 있는 내용이 중복될 수 있습니다. 계속하시겠습니까?`,
     importMismatchConfirm: (source: string, target: string) => `이 내보내기 파일은 '${source}' 프로젝트에서 생성되었지만, 현재 '${target}' 프로젝트로 가져오려 합니다. 계속하시겠습니까?`,
     importReservedConfirm: (senders: string) => `이 파일에는 예약된 에이전트/시스템 식별자(${senders})가 발신자로 표시된 메시지가 포함되어 있습니다. 가져오기를 진행하면 해당 에이전트가 말하는 것처럼 메시지가 재생됩니다. 재난 복구 상황에서만 사용하세요. 계속하시겠습니까?`,
     importDuplicateConfirm: (error: string) => `${error}\n\n이 파일은 이미 가져온 것 같습니다. 다시 가져오면 모든 메시지가 중복됩니다. 계속하시겠습니까?`,
@@ -98,42 +96,6 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [snapshots, setSnapshots] = useState<SnapshotEntry[]>([]);
-  // #424 / quadwork#304 Phase 3: per-project auto-restore flag.
-  // Default OFF. When enabled, the server auto-restores the newest
-  // snapshot after every restart (handleAgentChattr reads the flag
-  // pre-restart so an in-flight toggle can't starve the replay).
-  const [autoRestore, setAutoRestore] = useState<boolean>(false);
-  const [autoRestoreSaving, setAutoRestoreSaving] = useState(false);
-  useEffect(() => {
-    fetch(`/api/config`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((cfg) => {
-        if (!cfg || !Array.isArray(cfg.projects)) return;
-        const proj = cfg.projects.find((p: { id: string }) => p.id === projectId);
-        if (proj) setAutoRestore(!!proj.auto_restore_after_restart);
-      })
-      .catch(() => {});
-  }, [projectId]);
-  const saveAutoRestore = async (next: boolean) => {
-    setAutoRestoreSaving(true);
-    try {
-      const r = await fetch(`/api/config`);
-      if (!r.ok) throw new Error(`GET /api/config ${r.status}`);
-      const cfg = await r.json();
-      const idx = cfg.projects?.findIndex((p: { id: string }) => p.id === projectId) ?? -1;
-      if (idx < 0) throw new Error("project not found");
-      cfg.projects[idx] = { ...cfg.projects[idx], auto_restore_after_restart: next };
-      const pr = await fetch(`/api/config`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(cfg),
-      });
-      if (!pr.ok) throw new Error(`PUT /api/config ${pr.status}`);
-    } finally {
-      setAutoRestoreSaving(false);
-    }
-  };
-
   const loadSnapshots = () => {
     fetch(`/api/project-history/snapshots?project=${encodeURIComponent(projectId)}`)
       .then((r) => (r.ok ? r.json() : null))
@@ -355,19 +317,6 @@ export default function ProjectHistoryWidget({ projectId }: ProjectHistoryWidget
           {t.importStatus(result.imported, result.total, result.skipped, result.errors.length)}
         </div>
       )}
-      <label className="mt-2 flex items-center gap-1.5 text-[10px] text-text-muted cursor-pointer select-none">
-        <input
-          type="checkbox"
-          checked={autoRestore}
-          disabled={autoRestoreSaving}
-          onChange={(e) => {
-            const next = e.target.checked;
-            setAutoRestore(next);
-            saveAutoRestore(next).catch(() => setAutoRestore(!next));
-          }}
-        />
-        {t.autoRestore}
-      </label>
       {snapshots.length > 0 && (
         <div className="mt-2 border-t border-border/50 pt-1.5">
           <div className="text-[9px] text-text-muted uppercase tracking-wider mb-0.5">

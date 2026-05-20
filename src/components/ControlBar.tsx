@@ -17,18 +17,9 @@ const COPY = {
   en: {
     server: {
       title: "Server",
-      stop: "Stop",
-      confirmStop: "Confirm Stop?",
-      restart: "Restart",
       resetAgents: "Reset Agents",
-      healthGaveUp: "AC auto-restart failed 3x — manual restart required",
-      healthRestarted: (time: string) => `AC auto-restarted at ${time}`,
-      stopped: "Stopped",
       failed: "Failed",
       error: "Error",
-      acRestarted: (pid: number) => `AC restarted (PID: ${pid}) — resetting agents...`,
-      acAndAgentsRestarted: (restarted: number) => `AC + ${restarted} agent${restarted !== 1 ? "s" : ""} restarted`,
-      agentResetFailed: "AC restarted — agent reset failed",
       resetResult: (restarted: number, total: number) => `Reset — ${restarted} of ${total} agent${total !== 1 ? "s" : ""} restarted`,
       fullReset: "Full Reset",
       confirmFullReset: "Reset all projects?",
@@ -72,18 +63,9 @@ const COPY = {
   ko: {
     server: {
       title: "서버",
-      stop: "중지",
-      confirmStop: "정말 중지?",
-      restart: "재시작",
       resetAgents: "에이전트 초기화",
-      healthGaveUp: "AC 자동 재시작 3회 실패 — 수동 재시작이 필요합니다",
-      healthRestarted: (time: string) => `AC가 ${time}에 자동 재시작되었습니다`,
-      stopped: "중지됨",
       failed: "실패",
       error: "오류",
-      acRestarted: (pid: number) => `AC 재시작됨 (PID: ${pid}) — 에이전트 초기화 중...`,
-      acAndAgentsRestarted: (restarted: number) => `AC 및 ${restarted}개 에이전트 재시작됨`,
-      agentResetFailed: "AC 재시작됨 — 에이전트 초기화 실패",
       resetResult: (restarted: number, total: number) => `초기화 완료 — ${total}개 중 ${restarted}개 에이전트 재시작됨`,
       fullReset: "전체 리셋",
       confirmFullReset: "모든 프로젝트를 리셋할까요?",
@@ -133,41 +115,10 @@ function ServerSection({ projectId }: { projectId: string }) {
   const t = COPY[locale].server;
   const [loading, setLoading] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [confirmStop, setConfirmStop] = useState(false);
   const [confirmFullReset, setConfirmFullReset] = useState(false);
-  // #416: AC health monitor status — poll every 30s to surface
-  // auto-restart events and persistent errors in the dashboard.
-  const [healthNote, setHealthNote] = useState<string | null>(null);
   const [showInterrupt, setShowInterrupt] = useState(false);
   const [agentStates, setAgentStates] = useState<Record<string, string>>({});
   const interruptRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const pollHealth = () => {
-      fetch(`/api/agentchattr/${encodeURIComponent(projectId)}/health`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((d) => {
-          if (!d) { setHealthNote(null); return; }
-          if (d.autoRestart?.gaveUp) {
-            setHealthNote(t.healthGaveUp);
-          } else if (d.autoRestart?.lastRestart) {
-            const ago = Math.round((Date.now() - d.autoRestart.lastRestart) / 1000);
-            if (ago < 300) {
-              const time = new Date(d.autoRestart.lastRestart).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-              setHealthNote(t.healthRestarted(time));
-            } else {
-              setHealthNote(null);
-            }
-          } else {
-            setHealthNote(null);
-          }
-        })
-        .catch(() => setHealthNote(null));
-    };
-    pollHealth();
-    const interval = setInterval(pollHealth, 30000);
-    return () => clearInterval(interval);
-  }, [projectId, t]);
 
   const AGENT_IDS = ["head", "dev", "re1", "re2"];
 
@@ -226,13 +177,6 @@ function ServerSection({ projectId }: { projectId: string }) {
     setTimeout(() => setFeedback(null), 3000);
   };
 
-  // Auto-reset confirmation after 4s if user doesn't follow through
-  useEffect(() => {
-    if (!confirmStop) return;
-    const timer = setTimeout(() => setConfirmStop(false), 4000);
-    return () => clearTimeout(timer);
-  }, [confirmStop]);
-
   useEffect(() => {
     if (!confirmFullReset) return;
     const timer = setTimeout(() => setConfirmFullReset(false), 4000);
@@ -254,64 +198,6 @@ function ServerSection({ projectId }: { projectId: string }) {
       );
     } catch {
       setFeedback(t.fullResetFailed);
-    }
-    setLoading(null);
-    clearFeedback();
-  };
-
-  const handleStop = async () => {
-    if (!confirmStop) {
-      setConfirmStop(true);
-      return;
-    }
-    setConfirmStop(false);
-    setLoading("stop");
-    try {
-      const r = await fetch(
-        `/api/agentchattr/${encodeURIComponent(projectId)}/stop`,
-        { method: "POST" }
-      );
-      const d = await r.json();
-      setFeedback(d.ok ? t.stopped : t.failed);
-    } catch {
-      setFeedback(t.error);
-    }
-    setLoading(null);
-    clearFeedback();
-  };
-
-  const handleRestart = async () => {
-    setLoading("restart");
-    try {
-      const r = await fetch(
-        `/api/agentchattr/${encodeURIComponent(projectId)}/restart`,
-        { method: "POST" }
-      );
-      const d = await r.json();
-      if (d.ok && d.pid) {
-        setFeedback(t.acRestarted(d.pid));
-        // #417: After AC restart, also reset all agents so they get
-        // fresh MCP tokens. Without this, agents stay stuck with stale
-        // connections from the pre-restart session.
-        try {
-          const resetRes = await fetch(
-            `/api/agents/${encodeURIComponent(projectId)}/reset`,
-            { method: "POST" }
-          );
-          const resetData = await resetRes.json();
-          if (resetData.ok) {
-            setFeedback(t.acAndAgentsRestarted(resetData.restarted));
-          } else {
-            setFeedback(t.agentResetFailed);
-          }
-        } catch {
-          setFeedback(t.agentResetFailed);
-        }
-      } else {
-        setFeedback(d.error || t.failed);
-      }
-    } catch {
-      setFeedback(t.error);
     }
     setLoading(null);
     clearFeedback();
@@ -341,24 +227,6 @@ function ServerSection({ projectId }: { projectId: string }) {
         {t.title}
       </div>
       <div className="flex items-center gap-1.5 flex-wrap">
-        <button
-          onClick={handleStop}
-          disabled={!!loading}
-          className={`px-1.5 py-0.5 text-[10px] border transition-colors disabled:opacity-50 ${
-            confirmStop
-              ? "text-error border-error/60 bg-error/10 hover:bg-error/20"
-              : "text-text-muted border-border hover:text-error hover:border-error/40"
-          }`}
-        >
-          {loading === "stop" ? "..." : confirmStop ? t.confirmStop : t.stop}
-        </button>
-        <button
-          onClick={handleRestart}
-          disabled={!!loading}
-          className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
-        >
-          {loading === "restart" ? "..." : t.restart}
-        </button>
         <button
           onClick={handleReset}
           disabled={!!loading}
@@ -410,11 +278,6 @@ function ServerSection({ projectId }: { projectId: string }) {
       </div>
       {feedback && (
         <div className="text-[10px] text-accent">{feedback}</div>
-      )}
-      {healthNote && !feedback && (
-        <div className={`text-[10px] ${healthNote.includes("failed") || healthNote.includes("\uc2e4\ud328") ? "text-error" : "text-[#ffcc00]"}`}>
-          {healthNote}
-        </div>
       )}
     </div>
   );

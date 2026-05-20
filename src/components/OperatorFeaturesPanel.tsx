@@ -49,7 +49,7 @@ const COPY = {
  * layout collapses back to the single-column stack so nothing
  * clips in cramped split-view / mobile.
  */
-export default function OperatorFeaturesPanel({ projectId, chatMode = "ac" }: { projectId: string; chatMode?: "ac" | "file" }) {
+export default function OperatorFeaturesPanel({ projectId }: { projectId: string }) {
   const { locale } = useLocale();
   const t = COPY[locale];
   return (
@@ -77,8 +77,8 @@ export default function OperatorFeaturesPanel({ projectId, chatMode = "ac" }: { 
             History. Scrolls independently of the left column. */}
         <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto flex flex-col gap-2">
           <AgentModelsWidget projectId={projectId} />
-          <TelegramBridgeWidget projectId={projectId} chatMode={chatMode} />
-          <DiscordBridgeWidget projectId={projectId} chatMode={chatMode} />
+          <TelegramBridgeWidget projectId={projectId} />
+          <DiscordBridgeWidget projectId={projectId} />
           <LoopGuardWidget projectId={projectId} />
           <ProjectHistoryWidget projectId={projectId} />
         </div>
