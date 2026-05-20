@@ -59,7 +59,7 @@ function generateTemplate(issues: Issue[], repo: string): string {
   lines.push("4. PR titles: [#<issue>] Short description");
   lines.push("5. Branch naming: task/<issue-number>-<slug>");
   lines.push("6. NEVER store keys/secrets");
-  lines.push("7. Communicate via AgentChattr MCP chat by tagging agents");
+  lines.push("7. Communicate via project chat by tagging agents");
   lines.push("8. Do NOT push to main — only merge approved PRs");
   lines.push("");
 
