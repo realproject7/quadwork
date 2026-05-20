@@ -2298,98 +2298,6 @@ router.post("/api/rename", (req, res) => {
 
 // ─── Telegram ──────────────────────────────────────────────────────────────
 
-const BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-telegram");
-// #444: pin agentchattr-telegram to a known commit (same pattern as
-// AGENTCHATTR_PIN in bin/quadwork.js for bcurts/agentchattr).
-const AGENTCHATTR_TELEGRAM_PIN = "045ee18f6d5dbcd0bd45d5ab29f06e2a27382aaf";
-
-function telegramPidFile(projectId) {
-  return path.join(CONFIG_DIR, `tg-bridge-${projectId}.pid`);
-}
-
-function telegramConfigToml(projectId) {
-  return path.join(CONFIG_DIR, `telegram-${projectId}.toml`);
-}
-
-// #353: per-project log file for the bridge subprocess. The start
-// handler redirects stdout + stderr here so crashes (ImportError,
-// config parse, auth failure) are recoverable instead of
-// /dev/null'd by `stdio: "ignore"`.
-function telegramBridgeLog(projectId) {
-  return path.join(CONFIG_DIR, `tg-bridge-${projectId}.log`);
-}
-
-// Tail the last N lines of a file without reading the whole thing
-// into memory if it is huge. For the bridge log we care about the
-// final crash frame, not historical output.
-function readLastLines(filePath, n) {
-  try {
-    if (!fs.existsSync(filePath)) return "";
-    const stat = fs.statSync(filePath);
-    const readBytes = Math.min(stat.size, 64 * 1024);
-    if (readBytes === 0) return "";
-    const buf = Buffer.alloc(readBytes);
-    const fd = fs.openSync(filePath, "r");
-    try {
-      fs.readSync(fd, buf, 0, readBytes, Math.max(0, stat.size - readBytes));
-    } finally {
-      fs.closeSync(fd);
-    }
-    const text = buf.toString("utf-8");
-    const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
-    return lines.slice(-n).join("\n");
-  } catch {
-    return "";
-  }
-}
-
-// Verify that the bridge's Python runtime has its required modules
-// available. Cheap pre-flight so a missing `requests` install
-// produces a readable error instead of a silent Start → Stopped
-// flicker. Returns { ok: true } on success, { ok: false, error }
-// otherwise. Keep the import list small and close to what the
-// bridge actually needs; add modules here if the bridge gains new
-// hard deps.
-// #380: `pythonPath` defaults to bare `python3` for backward-compat,
-// but the production call sites (install, start) MUST pass the
-// dedicated bridge venv's interpreter (`<BRIDGE_DIR>/.venv/bin/python3`)
-// so the import check runs against the same interpreter the spawn will
-// use. See #379 research ticket for root cause.
-function checkTelegramBridgePythonDeps(pythonPath = "python3") {
-  try {
-    // Only check the third-party module the bridge actually needs
-    // at import time — `requests`. Toml parsing differs between
-    // Python versions (tomllib on 3.11+, tomli on 3.10-), and any
-    // genuine toml import failure will now be captured in the
-    // bridge log file on spawn, so this pre-flight stays narrow
-    // and avoids false negatives on older Python installs.
-    execFileSync(pythonPath, ["-c", "import requests"], {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { ok: true };
-  } catch (err) {
-    const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
-    const msg = stderr.trim() || (err && err.message) || "python3 import check failed";
-    return { ok: false, error: msg };
-  }
-}
-
-function isTelegramRunning(projectId) {
-  const pf = telegramPidFile(projectId);
-  if (!fs.existsSync(pf)) return false;
-  const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    fs.unlinkSync(pf);
-    return false;
-  }
-}
-
 function readEnvToken(key) {
   try {
     const content = fs.readFileSync(ENV_PATH, "utf-8");
@@ -2587,52 +2495,6 @@ router.post("/api/telegram", async (req, res) => {
 });
 
 // --- Discord Bridge ---
-// #396/#399: Discord ↔ AgentChattr bridge, bundled in quadwork
-// package at bridges/discord/. Mirrors Telegram bridge patterns.
-
-const DISCORD_BRIDGE_SRC = path.join(__dirname, "..", "bridges", "discord");
-const DISCORD_BRIDGE_DIR = path.join(CONFIG_DIR, "agentchattr-discord");
-
-function discordPidFile(projectId) {
-  return path.join(CONFIG_DIR, `dc-bridge-${projectId}.pid`);
-}
-
-function discordConfigToml(projectId) {
-  return path.join(CONFIG_DIR, `discord-${projectId}.toml`);
-}
-
-function discordBridgeLog(projectId) {
-  return path.join(CONFIG_DIR, `dc-bridge-${projectId}.log`);
-}
-
-function checkDiscordBridgePythonDeps(pythonPath = "python3") {
-  try {
-    execFileSync(pythonPath, ["-c", "import discord, requests"], {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { ok: true };
-  } catch (err) {
-    const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
-    const msg = stderr.trim() || (err && err.message) || "python3 import check failed";
-    return { ok: false, error: msg };
-  }
-}
-
-function isDiscordRunning(projectId) {
-  const pf = discordPidFile(projectId);
-  if (!fs.existsSync(pf)) return false;
-  const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    fs.unlinkSync(pf);
-    return false;
-  }
-}
 
 function discordEnvKeyForProject(projectId) {
   return `DISCORD_BOT_TOKEN_${projectId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
@@ -2865,11 +2727,6 @@ module.exports.parseActiveBatch = parseActiveBatch;
 // summarizeItems for the batch-progress fixture test.
 module.exports.buildNoPrRow = buildNoPrRow;
 module.exports.summarizeItems = summarizeItems;
-// #353: expose readLastLines for the tg-bridge test.
-module.exports.readLastLines = readLastLines;
-// #380: expose checkTelegramBridgePythonDeps so the bridge test can
-// exercise the venv-path interpreter argument round trip.
-module.exports.checkTelegramBridgePythonDeps = checkTelegramBridgePythonDeps;
 // #693: expose normalizeMentions for unit tests
 module.exports.normalizeMentions = normalizeMentions;
 // #714: expose for file-chat integration
