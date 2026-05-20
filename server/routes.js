@@ -287,7 +287,7 @@ router.get("/api/chat", async (req, res) => {
     });
     const normalized = messages.map((m) => ({
       ...m,
-      time: m.time || (m.ts ? m.ts.slice(11, 19) : ""),
+      time: m.time || (m.ts ? new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : ""),
     }));
     return res.json(normalized);
   }
