@@ -3034,9 +3034,10 @@ server.listen(PORT, "127.0.0.1", async () => {
   // Failed projects stay on AC mode — do not initialize file-chat for them.
   const migrationFailed = new Set(runAcMigration(startupCfg));
 
-  // #722: Switch all projects to file-based chat on boot.
-  // Projects whose AC migration failed stay on "ac" (handled below).
-  {
+  // #722: One-time switchover — set all projects to file-based chat.
+  // Runs once per install; operator can revert individual projects to "ac"
+  // afterward without them being flipped back on next boot.
+  if (!startupCfg.file_chat_switchover_done) {
     let switched = false;
     for (const p of (startupCfg.projects || [])) {
       if (p.chat_mode !== "file" && !migrationFailed.has(p.id)) {
@@ -3045,7 +3046,9 @@ server.listen(PORT, "127.0.0.1", async () => {
         console.log(`[startup] ${p.id}: switched to file-based chat`);
       }
     }
-    if (switched) writeConfig(startupCfg);
+    startupCfg.file_chat_switchover_done = true;
+    writeConfig(startupCfg);
+    if (switched) console.log("[startup] file-chat switchover complete");
   }
 
   // #714: Initialize file-chat engine for projects with chat_mode: "file".
