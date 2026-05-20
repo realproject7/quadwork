@@ -63,6 +63,7 @@ interface BatchState {
 
 interface DiscordBridgeWidgetProps {
   projectId: string;
+  chatMode?: "ac" | "file";
 }
 
 interface DiscordStatus {
@@ -93,7 +94,7 @@ async function callDiscord(action: string, body: Record<string, unknown>) {
  * start/stop + a setup modal to configure bot_token + channel_id from
  * scratch.
  */
-export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetProps) {
+export default function DiscordBridgeWidget({ projectId, chatMode = "ac" }: DiscordBridgeWidgetProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [status, setStatus] = useState<DiscordStatus | null>(null);
@@ -296,7 +297,7 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
             </InfoTooltip>
           </div>
           <div className="flex items-center gap-1.5">
-            {configured && (
+            {configured && chatMode !== "file" && (
               <button
                 type="button"
                 onClick={toggleAutoDiscord}
@@ -316,7 +317,11 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
           </div>
         </div>
         <div className="p-3 flex flex-col gap-2">
-          {!configured ? (
+          {chatMode === "file" ? (
+            <div className="text-[11px] text-text-muted">
+              Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead.
+            </div>
+          ) : !configured ? (
             <>
               <div className="flex items-center gap-2 text-[11px] text-text-muted">
                 <span className="w-1.5 h-1.5 rounded-full bg-text-muted" />

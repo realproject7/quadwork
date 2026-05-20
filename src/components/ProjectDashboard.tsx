@@ -290,7 +290,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
 
         {/* Q4: Operator Features */}
         <div className="border-t border-border lg:border-t-0 flex flex-col overflow-hidden">
-          <OperatorFeaturesPanel projectId={projectId} />
+          <OperatorFeaturesPanel projectId={projectId} chatMode={chatMode} />
         </div>
       </div>
     </div>
