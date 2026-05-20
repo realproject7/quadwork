@@ -25,7 +25,7 @@ const COPY = {
     filterAllTitle: "Showing all messages — click to hide system/status noise",
     filterOn: "Filter system log: on",
     filterOff: "Filter system log: off",
-    chatLabel: "AgentChattr — primary chat",
+    chatLabel: "Agent Primary Chat",
     chatTooltip: (
       <>
         <b>Primary Chat</b> — live chat between you and the 4 AI agents. Messages you type here trigger agent actions. Use @mentions to address specific agents.
@@ -43,7 +43,7 @@ const COPY = {
     filterAllTitle: "전체 메시지 표시 중 - 클릭하면 시스템/상태 로그를 숨깁니다",
     filterOn: "시스템 로그 필터: 켜짐",
     filterOff: "시스템 로그 필터: 꺼짐",
-    chatLabel: "AgentChattr — 메인 채팅",
+    chatLabel: "에이전트 메인 채팅",
     chatTooltip: (
       <>
         <b>메인 채팅</b> - 당신과 4개의 AI 에이전트가 실시간으로 대화하는 공간입니다. 여기 입력한 메시지가 에이전트 동작을 시작시킵니다. 특정 에이전트를 부를 때는 @멘션을 사용하세요.
@@ -221,7 +221,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         }
       `}</style>
       <div className="qw-dashboard flex flex-col w-full h-full overflow-y-auto">
-        {/* Q1: AgentChattr chat — primary interface */}
+        {/* Q1: Agent primary chat */}
         <div className="flex flex-col overflow-hidden border-2 border-accent h-[60vh] shrink-0 lg:h-auto lg:shrink lg:min-h-0">
           <PanelHeader label={t.chatLabel} tooltip={
             <InfoTooltip>
