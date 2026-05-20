@@ -7,8 +7,9 @@
   },
   "files": [
     "bin/",
-    "bridges/",
     "server/",
+    "!server/**/*.test.js",
+    "!server/__tests__/",
     "templates/",
     "out/"
   ],
