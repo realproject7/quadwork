@@ -6,46 +6,27 @@ const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 
 const DEFAULT_CONFIG = {
   port: 8400,
-  agentchattr_url: "http://127.0.0.1:8300",
-  agentchattr_dir: path.join(os.homedir(), ".quadwork", "agentchattr"),
-  // #405 / quadwork#278: display name used as the chat sender for
-  // messages posted from the dashboard. AC's registry name validator
-  // accepts 1–32 alphanumeric + dash + underscore characters; mirror
-  // that here so the sanitized value matches what AC will accept.
   operator_name: "user",
   projects: [],
 };
 
-// Reserved sender names that the operator must NOT be able to claim
-// — these are the registered agent identities (current + legacy
-// aliases) plus AC's own "system" sender. Without this denylist a
-// hand-edited or PUT /api/config'd `operator_name = "head"` would
-// post chat messages with sender:"head", reopening the impersonation
-// vector #230 closed. Case-insensitive match.
+// Reserved sender names that the operator must NOT be able to claim.
 const RESERVED_OPERATOR_NAMES = new Set([
   "head",
   "dev",
   "re1",
   "re2",
-  // Legacy agent aliases — preserved in routing logic in a few
-  // places, so block them too even though new projects no longer
-  // register under these names.
   "reviewer1",
   "reviewer2",
   "t1",
   "t2a",
   "t2b",
   "t3",
-  // AC's own broadcast / housekeeping sender.
   "system",
 ]);
 
-// Sanitize an operator-supplied display name to match AC's name
-// validator (registry.py: 1–32 alnum + dash + underscore) AND to
-// reject any reserved agent identity. Empty / non-string / reserved
-// input falls back to "user". Used both when reading the config (in
-// case the file was hand-edited) and on /api/chat sends (so even a
-// stale on-disk value can't impersonate an agent).
+// Sanitize operator display name: 1–32 alnum + dash + underscore,
+// reject reserved agent identities.
 function sanitizeOperatorName(value) {
   if (typeof value !== "string") return "user";
   const cleaned = value.trim().replace(/[^A-Za-z0-9_-]/g, "");
@@ -169,43 +150,6 @@ function resolveProjectChattr(projectId) {
   };
 }
 
-/**
- * Resolve the command + args to spawn AgentChattr from its cloned directory.
- * Returns { command, args, cwd } or null if not fully set up.
- * Requires .venv/bin/python — never falls back to bare python3.
- */
-function resolveChattrSpawn(agentchattrDir) {
-  const dir = agentchattrDir || path.join(os.homedir(), ".quadwork", "agentchattr");
-  const runPy = path.join(dir, "run.py");
-  const venvPython = path.join(dir, ".venv", "bin", "python");
-  if (!fs.existsSync(runPy) || !fs.existsSync(venvPython)) return null;
-  return { command: venvPython, args: ["run.py"], cwd: dir };
-}
-
-/**
- * Fetch AgentChattr's real session token from its HTML and save to project config.
- * AgentChattr generates its own token at startup; this syncs it back.
- */
-async function syncChattrToken(projectId) {
-  const config = readConfig();
-  const project = config.projects?.find((p) => p.id === projectId);
-  if (!project) return;
-  const url = project.agentchattr_url || config.agentchattr_url || "http://127.0.0.1:8300";
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return;
-    const html = await res.text();
-    const match = html.match(/__SESSION_TOKEN__="([^"]+)"/);
-    if (match && match[1]) {
-      const realToken = match[1];
-      if (project.agentchattr_token !== realToken) {
-        project.agentchattr_token = realToken;
-        writeSecureFile(CONFIG_PATH, JSON.stringify(config, null, 2));
-      }
-    }
-  } catch {}
-}
-
 // --- #540: Secure file/directory helpers ---
 // All paths under ~/.quadwork/ may contain secrets (tokens, configs,
 // chat exports). Use these helpers instead of raw fs calls to ensure
@@ -230,4 +174,4 @@ function writeConfig(cfg) {
   writeSecureFile(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, resolveChattrSpawn, syncChattrToken, sanitizeOperatorName, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig };
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, sanitizeOperatorName, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig };

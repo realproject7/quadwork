@@ -12,22 +12,6 @@ const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const AGENTS = ["head", "re1", "re2", "dev"];
-const DEFAULT_AGENTCHATTR_DIR = path.join(CONFIG_DIR, "agentchattr");
-const AGENTCHATTR_REPO = "https://github.com/bcurts/agentchattr.git";
-// #348: pinned AgentChattr commit shipped with this QuadWork
-// release. The install path clones the default branch and then
-// checks this commit out so two fresh installs on different days
-// produce byte-identical clones. When bumping this pin,
-// deliberately test against the new upstream commit first and
-// note the update in docs/RELEASING.md.
-//
-// On checkout failure (e.g. upstream force-pushed the commit
-// away), the install path falls back to the default branch with
-// a loud warning instead of hard-failing — see installAgentChattr
-// below.
-const AGENTCHATTR_PIN = "3e71d4267572579e7ffeb83576645f90932c1849";
-// #444: same pattern for realproject7/agentchattr-telegram.
-const AGENTCHATTR_TELEGRAM_PIN = "4a6b45f1794c612328b9d5ee6d6fcb3f77015abc";
 
 // ─── Permission Helpers ────────────────────────────────────────────────────
 
@@ -86,277 +70,6 @@ function which(cmd) {
   return run("which", [cmd]) !== null;
 }
 
-/**
- * Resolve the agentchattr_dir from config, falling back to DEFAULT_AGENTCHATTR_DIR.
- */
-function getAgentChattrDir() {
-  const config = readConfig();
-  return config.agentchattr_dir || DEFAULT_AGENTCHATTR_DIR;
-}
-
-/**
- * Check if AgentChattr is fully installed (cloned + venv ready).
- * Returns the directory path if both run.py and .venv/bin/python exist, or null.
- */
-function findAgentChattr(dir) {
-  dir = dir || getAgentChattrDir();
-  if (fs.existsSync(path.join(dir, "run.py")) && fs.existsSync(path.join(dir, ".venv", "bin", "python"))) return dir;
-  return null;
-}
-
-/**
- * Clone AgentChattr and set up its venv. Idempotent — safe to re-run on
- * the same path, and safe to call repeatedly with different paths in
- * the same process. Designed to support per-project clones (#181).
- *
- * Behavior on re-run:
- *   - Fully-installed path → no-op (skips clone, skips venv create, skips pip)
- *   - Missing run.py        → clones (only after refusing to overwrite
- *                             unrelated content; see safety rules below)
- *   - Missing venv          → creates venv and reinstalls requirements
- *
- * Safety rules — never accidentally clean up unrelated directories:
- *   - Empty dir                                  → safe to remove
- *   - Git repo whose origin contains "agentchattr" → safe to remove
- *   - Anything else                              → refuse, return null
- *
- * On failure, returns null and stores a human-readable reason on
- * `installAgentChattr.lastError` so callers can surface it without
- * changing the return shape.
- */
-// Stale-lock thresholds for installAgentChattr().
-// Lock files older than this OR whose owning pid is no longer alive are
-// treated as crashed and reclaimed. Tuned to comfortably exceed the longest
-// step (pip install of agentchattr requirements, ~120s timeout).
-const INSTALL_LOCK_STALE_MS = 10 * 60 * 1000; // 10 min
-const INSTALL_LOCK_WAIT_TOTAL_MS = 30 * 1000;  // wait up to 30s for a peer
-const INSTALL_LOCK_POLL_MS = 500;
-
-function _isPidAlive(pid) {
-  if (!pid || !Number.isFinite(pid)) return false;
-  try { process.kill(pid, 0); return true; }
-  catch (e) { return e.code === "EPERM"; }
-}
-
-function _readLock(lockFile) {
-  try {
-    const raw = fs.readFileSync(lockFile, "utf-8").trim();
-    const [pidStr, tsStr] = raw.split(":");
-    return { pid: parseInt(pidStr, 10), ts: parseInt(tsStr, 10) || 0 };
-  } catch { return null; }
-}
-
-function _isLockStale(lockFile) {
-  const info = _readLock(lockFile);
-  if (!info) return true; // unreadable → assume stale
-  if (Date.now() - info.ts > INSTALL_LOCK_STALE_MS) return true;
-  if (!_isPidAlive(info.pid)) return true;
-  return false;
-}
-
-function installAgentChattr(dir) {
-  dir = dir || getAgentChattrDir();
-  installAgentChattr.lastError = null;
-  const setError = (msg) => { installAgentChattr.lastError = msg; return null; };
-
-  // --- Per-target lock to prevent concurrent clones from corrupting each
-  // other when two projects (or two web tabs) launch simultaneously. Lock
-  // file lives next to the install dir so it's scoped per-target.
-  const lockFile = `${dir}.install.lock`;
-  try { ensureSecureDir(path.dirname(lockFile)); }
-  catch (e) { return setError(`Cannot create parent of ${dir}: ${e.message}`); }
-
-  let acquired = false;
-  const deadline = Date.now() + INSTALL_LOCK_WAIT_TOTAL_MS;
-  while (!acquired) {
-    try {
-      // Atomic create: fails if file already exists, no TOCTOU race.
-      fs.writeFileSync(lockFile, `${process.pid}:${Date.now()}`, { mode: 0o600, flag: "wx" });
-      acquired = true;
-    } catch (e) {
-      if (e.code !== "EEXIST") return setError(`Cannot create install lock ${lockFile}: ${e.message}`);
-      // Reclaim if the existing lock is stale (crashed pid or too old).
-      // Use rename → unlink instead of unlink directly: rename is atomic,
-      // so only one racing process can move the stale lock aside. The
-      // others see ENOENT and just retry the wx create. Without this,
-      // two processes could both observe the same stale lock, both
-      // unlink it (one of those unlinks would target the *next* lock
-      // freshly acquired by a third process), and both proceed past the
-      // gate concurrently — see review on quadwork#193.
-      if (_isLockStale(lockFile)) {
-        const sideline = `${lockFile}.stale.${process.pid}.${Date.now()}`;
-        try {
-          fs.renameSync(lockFile, sideline);
-          try { fs.unlinkSync(sideline); } catch {}
-        } catch (renameErr) {
-          // ENOENT: another process already reclaimed it. Anything else:
-          // treat as transient and retry — the next iteration will read
-          // whatever is at lockFile now and decide again.
-          if (renameErr.code !== "ENOENT") {
-            return setError(`Cannot reclaim stale lock ${lockFile}: ${renameErr.message}`);
-          }
-        }
-        continue;
-      }
-      // Live peer install in progress. After it finishes, the install
-      // is likely already done — caller will see a fully-installed path
-      // on the next call. While waiting, poll until the lock disappears
-      // or we hit the wait deadline.
-      if (Date.now() >= deadline) {
-        const info = _readLock(lockFile) || { pid: "?", ts: 0 };
-        return setError(`Another install is in progress at ${dir} (pid ${info.pid}); timed out after ${INSTALL_LOCK_WAIT_TOTAL_MS}ms. Re-run after it finishes, or remove ${lockFile} if stale.`);
-      }
-      // Synchronous sleep — installAgentChattr is itself synchronous and
-      // is called from the CLI wizard, where blocking is acceptable.
-      // Use execFileSync('sleep') instead of a busy-wait so we don't pin a CPU.
-      try { require("child_process").execFileSync("sleep", [String(INSTALL_LOCK_POLL_MS / 1000)], { stdio: "pipe" }); }
-      catch { /* sleep interrupted; loop will recheck */ }
-    }
-  }
-
-  try {
-    return _installAgentChattrLocked(dir, setError);
-  } finally {
-    try { fs.unlinkSync(lockFile); } catch {}
-  }
-}
-
-function _installAgentChattrLocked(dir, setError) {
-  const runPy = path.join(dir, "run.py");
-  const venvPython = path.join(dir, ".venv", "bin", "python");
-  let venvJustCreated = false;
-
-  // 1. Clone if run.py is missing.
-  if (!fs.existsSync(runPy)) {
-    if (fs.existsSync(dir)) {
-      let entries;
-      try { entries = fs.readdirSync(dir); }
-      catch (e) { return setError(`Cannot read ${dir}: ${e.message}`); }
-      const isEmpty = entries.length === 0;
-      if (isEmpty) {
-        try { fs.rmSync(dir, { recursive: true, force: true }); }
-        catch (e) { return setError(`Cannot remove empty dir ${dir}: ${e.message}`); }
-      } else if (fs.existsSync(path.join(dir, ".git"))) {
-        // Only remove if origin remote positively identifies this as agentchattr.
-        const remote = run("git", ["-C", dir, "remote", "get-url", "origin"]);
-        if (remote && remote.includes("agentchattr")) {
-          try { fs.rmSync(dir, { recursive: true, force: true }); }
-          catch (e) { return setError(`Cannot remove failed clone at ${dir}: ${e.message}`); }
-        } else {
-          return setError(`Refusing to overwrite ${dir}: contains a non-AgentChattr git repo`);
-        }
-      } else {
-        return setError(`Refusing to overwrite ${dir}: directory exists with unrelated content`);
-      }
-    }
-    // Ensure parent exists before clone (supports arbitrary nested paths).
-    try { ensureSecureDir(path.dirname(dir)); }
-    catch (e) { return setError(`Cannot create parent of ${dir}: ${e.message}`); }
-    const cloneResult = run("git", ["clone", AGENTCHATTR_REPO, dir], { timeout: 60000 });
-    if (cloneResult === null) return setError(`git clone of ${AGENTCHATTR_REPO} into ${dir} failed`);
-    if (!fs.existsSync(runPy)) return setError(`Clone completed but run.py missing at ${dir}`);
-    // #348: pin to the known-good AgentChattr commit shipped with
-    // this QuadWork release. #366: use `checkout -B pinned <sha>`
-    // so the clone lands on a named local branch ("pinned") whose
-    // HEAD is the pinned commit, rather than detached HEAD. Named
-    // HEAD avoids the AC2 worktree-rot class of bug: `git status`
-    // says `On branch pinned`, downstream tooling that reads the
-    // current branch sees a stable name, and a future `git pull`
-    // fails with a clear "no upstream" message instead of a vague
-    // detached-HEAD warning. -B (capital) is idempotent — it
-    // force-creates/updates the branch so re-runs are no-ops.
-    // On failure (commit unreachable / force-pushed away), fall
-    // back to the default branch with a loud warning instead of
-    // hard-failing the install.
-    // #593: Retry with explicit fetch on failure, abort install on persistent failure.
-    let pinResult = run("git", ["-C", dir, "checkout", "-B", "pinned", AGENTCHATTR_PIN], { timeout: 30000 });
-    if (pinResult === null) {
-      log("Pin checkout failed — fetching commit explicitly...");
-      run("git", ["-C", dir, "fetch", "origin", AGENTCHATTR_PIN], { timeout: 60000 });
-      pinResult = run("git", ["-C", dir, "checkout", "-B", "pinned", AGENTCHATTR_PIN], { timeout: 30000 });
-    }
-    if (pinResult === null) {
-      return setError(
-        `Could not check out AgentChattr pin ${AGENTCHATTR_PIN.slice(0, 12)} at ${dir}. ` +
-        `AC would run an untested HEAD version with known incompatibilities. ` +
-        `Check your network connection and retry, or manually run:\n` +
-        `  git -C ${dir} fetch origin ${AGENTCHATTR_PIN}\n` +
-        `  git -C ${dir} checkout -B pinned ${AGENTCHATTR_PIN}`
-      );
-    }
-  } else {
-    // #366: existing clone from a pre-fix install. If the clone
-    // is currently in detached HEAD pointing exactly at the pin,
-    // migrate it onto the named `pinned` branch in place. This
-    // is safe because no commits are lost — the SHA is the same,
-    // we're just attaching a name to it. Skip migration if the
-    // clone is on a different SHA (drift) or already on a named
-    // branch (operator may have set up their own work branch on
-    // top); doctor will flag drift cases.
-    const headSha = (run("git", ["-C", dir, "rev-parse", "HEAD"]) || "").trim();
-    const headRef = (run("git", ["-C", dir, "symbolic-ref", "--quiet", "HEAD"]) || "").trim();
-    if (headSha === AGENTCHATTR_PIN && !headRef) {
-      const migrateResult = run("git", ["-C", dir, "checkout", "-B", "pinned", AGENTCHATTR_PIN], { timeout: 30000 });
-      if (migrateResult === null) {
-        try { console.warn(`[quadwork] WARNING: could not migrate ${dir} from detached HEAD to the 'pinned' branch.`); } catch {}
-      }
-    }
-  }
-
-  // 2. Create venv if missing.
-  if (!fs.existsSync(venvPython)) {
-    const venvResult = run("python3", ["-m", "venv", path.join(dir, ".venv")], { timeout: 60000 });
-    if (venvResult === null) return setError(`python3 -m venv failed at ${dir}/.venv (is python3 installed?)`);
-    if (!fs.existsSync(venvPython)) return setError(`venv created but ${venvPython} missing`);
-    venvJustCreated = true;
-  }
-
-  // 3. Install requirements only when the venv was just (re)created.
-  //    This makes re-running on a fully-installed path a true no-op.
-  if (venvJustCreated) {
-    const reqFile = path.join(dir, "requirements.txt");
-    if (fs.existsSync(reqFile)) {
-      const pipResult = run(venvPython, ["-m", "pip", "install", "-r", reqFile], { timeout: 120000 });
-      if (pipResult === null) return setError(`pip install -r ${reqFile} failed`);
-    }
-  }
-  // #629: patch crash timeout before AC's first import
-  _patchCrashTimeout(dir);
-  return dir;
-}
-installAgentChattr.lastError = null;
-
-function _patchCrashTimeout(dir) {
-  if (!dir) return;
-  const appPath = path.join(dir, "app.py");
-  if (!fs.existsSync(appPath)) return;
-  try {
-    let app = fs.readFileSync(appPath, "utf-8");
-    if (app.includes("_CRASH_TIMEOUT = 15")) {
-      app = app.replace("_CRASH_TIMEOUT = 15", "_CRASH_TIMEOUT = 120");
-      app = app.replace(
-        "# Crash timeout: if a wrapper hasn't heartbeated for 60s,\n",
-        "# Crash timeout: if a wrapper hasn't heartbeated for 120s,\n",
-      );
-      fs.writeFileSync(appPath, app);
-      log("[idle-fix] patched crash timeout to 120s at clone time (#629)");
-    }
-  } catch (err) {
-    try { console.warn(`[idle-fix] failed to patch crash timeout: ${err.message}`); } catch {}
-  }
-}
-
-/**
- * Get spawn args for launching AgentChattr from its cloned directory.
- * Returns { command, spawnArgs, cwd } or null if not fully installed.
- * Requires .venv/bin/python — never falls back to bare python3.
- */
-function chattrSpawnArgs(dir, extraArgs) {
-  dir = dir || getAgentChattrDir();
-  const venvPython = path.join(dir, ".venv", "bin", "python");
-  if (!fs.existsSync(path.join(dir, "run.py")) || !fs.existsSync(venvPython)) return null;
-  return { command: venvPython, spawnArgs: ["run.py", ...(extraArgs || [])], cwd: dir };
-}
 
 function ask(rl, question, defaultVal) {
   return new Promise((resolve) => {
@@ -448,7 +161,7 @@ function readConfig() {
     const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     return migrateAgentKeys(config);
   } catch {
-    return { port: 8400, agentchattr_url: "http://127.0.0.1:8300", agentchattr_dir: DEFAULT_AGENTCHATTR_DIR, projects: [] };
+    return { port: 8400, projects: [] };
   }
 }
 
@@ -459,8 +172,6 @@ function writeConfig(config) {
 }
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────
-
-let agentChattrFound = false;
 
 function detectPlatform() {
   const p = os.platform();
@@ -505,7 +216,6 @@ async function checkPrereqs(rl) {
   header("Step 1: Prerequisites");
   const platform = detectPlatform();
   let allOk = true;
-  let hasPython = false;
 
   // ── 1. Node.js 20+ (must already exist — user ran npx) ──
   const nodeVer = run("node", ["--version"]);
@@ -543,91 +253,7 @@ async function checkPrereqs(rl) {
     }
   }
 
-  // ── 3. Python 3.10+ (manual install — guide only) ──
-  const pyVer = run("python3", ["--version"]);
-  if (pyVer) {
-    const parts = pyVer.replace("Python ", "").split(".");
-    const minor = parseInt(parts[1], 10);
-    if (parseInt(parts[0], 10) >= 3 && minor >= 10) {
-      ok(`${pyVer}`);
-      hasPython = true;
-    } else {
-      console.log("");
-      warn(`${pyVer} found, but version 3.10 or newer is required.`);
-      log("Python powers the agent communication layer.");
-      log("Download the latest version from:");
-      log(`  → https://python.org/downloads`);
-      log("");
-      log("After installing, close and reopen your terminal, then run:");
-      log("  → npx quadwork init");
-      allOk = false;
-    }
-  } else {
-    console.log("");
-    warn("Python 3 is required but not installed on your system.");
-    log("");
-    log("Python powers the agent communication layer. Install it from:");
-    log("  → https://python.org/downloads (download and run the installer)");
-    log("");
-    log("After installing, close and reopen your terminal, then run:");
-    log("  → npx quadwork init");
-    allOk = false;
-  }
-
-  if (!hasPython) {
-    // Can't continue with AgentChattr without Python
-    console.log("");
-    fail("Python is required before we can set up the remaining tools.");
-    log("Install Python first, then re-run: npx quadwork init");
-    return false;
-  }
-
-  // ── 3. AgentChattr (clone + venv — needs Python and git) ──
-  // #579: skip global install on fresh installs with no projects. Each
-  // project gets its own per-project clone via the web setup wizard, so
-  // a global ~/.quadwork/agentchattr/ clone is redundant cruft.
-  // Only check for an existing install to report status.
-  const acDir = findAgentChattr();
-  const config = readConfig();
-  if (acDir) {
-    ok(`AgentChattr (${acDir})`);
-    agentChattrFound = true;
-  } else if (hasPython && config.projects && config.projects.length > 0) {
-    // Existing projects but no global install — install globally as
-    // fallback for legacy projects that don't have per-project clones.
-    console.log("");
-    warn("AgentChattr lets your AI agents communicate with each other.");
-    log("It will be cloned and set up in a virtualenv.");
-    const doInstall = await askYN(rl, "Install AgentChattr now?", true);
-    if (doInstall) {
-      const acSpinner = spinner("Cloning and setting up AgentChattr...");
-      const result = installAgentChattr();
-      acSpinner.stop(result !== null);
-      if (result) {
-        ok(`AgentChattr installed (${DEFAULT_AGENTCHATTR_DIR})`);
-        agentChattrFound = true;
-      } else {
-        warn("AgentChattr install failed. You can set it up manually:");
-        log(`  → git clone ${AGENTCHATTR_REPO} ${DEFAULT_AGENTCHATTR_DIR}`);
-        log(`  → cd ${DEFAULT_AGENTCHATTR_DIR} && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`);
-        allOk = false;
-      }
-    } else {
-      warn("AgentChattr skipped — agents won't be able to chat until it's installed.");
-      log(`  → Install later: git clone ${AGENTCHATTR_REPO} ${DEFAULT_AGENTCHATTR_DIR}`);
-      allOk = false;
-    }
-  } else if (hasPython) {
-    // Fresh install with no projects — AC will be installed per-project
-    // when the user creates their first project via the dashboard.
-    ok("AgentChattr will be installed per-project when you create a project.");
-    agentChattrFound = true;
-  } else {
-    warn("AgentChattr requires Python — install Python first, then re-run init.");
-    allOk = false;
-  }
-
-  // ── 5. GitHub CLI (independent) ──
+  // ── 3. GitHub CLI (independent) ──
   if (which("gh")) {
     ok("GitHub CLI (gh)");
   } else {
@@ -1004,110 +630,6 @@ async function setupAgents(rl, repo) {
   return { projectName, absDir, worktrees, repo, backend, backends };
 }
 
-// ─── AgentChattr Config ─────────────────────────────────────────────────────
-
-function writeAgentChattrConfig(setup, configTomlPath, { skipInstall = false } = {}) {
-  header("Step 4: AgentChattr Setup");
-
-  let tomlContent = fs.readFileSync(path.join(TEMPLATES_DIR, "config.toml"), "utf-8");
-  for (const agent of AGENTS) {
-    tomlContent = tomlContent.replace(new RegExp(`\\{\\{${agent}_cwd\\}\\}`, "g"), setup.worktrees[agent]);
-  }
-  // Replace placeholders
-  tomlContent = tomlContent.replace(/\{\{project_name\}\}/g, setup.projectName);
-  tomlContent = tomlContent.replace(/\{\{repo\}\}/g, setup.repo);
-  // Replace per-agent commands with chosen backends
-  for (const agent of AGENTS) {
-    const cmd = (setup.backends && setup.backends[agent]) || setup.backend;
-    tomlContent = tomlContent.replace(
-      new RegExp(`(\\[agents\\.${agent}\\][\\s\\S]*?command = )"(?:claude|codex)"`),
-      `$1"${cmd}"`
-    );
-  }
-
-  // Per-project: isolated data dir and port
-  const dataDir = path.join(path.dirname(configTomlPath), "data");
-  if (!fs.existsSync(dataDir)) ensureSecureDir(dataDir);
-  // Read assigned port from config (set by writeQuadWorkConfig)
-  const existingConfig = readConfig();
-  const existingProject = existingConfig.projects?.find((p) => p.id === setup.projectName);
-  const chattrPort = existingProject?.agentchattr_url
-    ? new URL(existingProject.agentchattr_url).port
-    : "8300";
-  const mcpHttp = existingProject?.mcp_http_port || 8200;
-  const mcpSse = existingProject?.mcp_sse_port || 8201;
-  tomlContent = tomlContent.replace(/^port = \d+/m, `port = ${chattrPort}`);
-  tomlContent = tomlContent.replace(/^data_dir = .+/m, `data_dir = "${dataDir}"`);
-  // Add session_token to [server] section if project has one
-  const sessionToken = existingProject?.agentchattr_token || "";
-  if (sessionToken) {
-    tomlContent = tomlContent.replace(/^(data_dir = .+)$/m, `$1\nsession_token = "${sessionToken}"`);
-  }
-  tomlContent = tomlContent.replace(/^http_port = \d+/m, `http_port = ${mcpHttp}`);
-  tomlContent = tomlContent.replace(/^sse_port = \d+/m, `sse_port = ${mcpSse}`);
-
-  // Write config.toml
-  const configDir = path.dirname(configTomlPath);
-  if (!fs.existsSync(configDir)) ensureSecureDir(configDir);
-  fs.writeFileSync(configTomlPath, tomlContent);
-  ok(`Wrote ${configTomlPath}`);
-
-  // Phase 2C / #181: clone AgentChattr per-project at
-  // ~/.quadwork/{project_id}/agentchattr/. AgentChattr's run.py loads
-  // ROOT/config.toml, so each project needs its own clone to avoid
-  // multi-instance port conflicts (see master #181). The path is the
-  // same one writeQuadWorkConfig() persists in project.agentchattr_dir.
-  const perProjectDir = path.join(CONFIG_DIR, setup.projectName, "agentchattr");
-  let acDir = findAgentChattr(perProjectDir);
-  let acAvailable = !!acDir;
-  if (!acAvailable && !skipInstall) {
-    const acSpinner = spinner(`Setting up AgentChattr at ${perProjectDir}...`);
-    const installResult = installAgentChattr(perProjectDir);
-    if (installResult) {
-      acSpinner.stop(true);
-      acDir = installResult;
-      acAvailable = true;
-    } else {
-      acSpinner.stop(false);
-      const reason = installAgentChattr.lastError || "unknown error";
-      warn(`AgentChattr install failed at ${perProjectDir}: ${reason}`);
-      warn(`Install manually: git clone ${AGENTCHATTR_REPO} ${perProjectDir}`);
-    }
-  }
-
-  // Start AgentChattr server (only if installed)
-  if (acAvailable) {
-    log("Starting AgentChattr server...");
-    const acSpawn = chattrSpawnArgs(acDir, []);
-    if (acSpawn) {
-      const acProc = spawn(acSpawn.command, acSpawn.spawnArgs, {
-        cwd: acSpawn.cwd,
-        stdio: "ignore",
-        detached: true,
-      });
-      acProc.on("error", (err) => {
-        warn(`AgentChattr failed to start: ${err.message}`);
-      });
-      acProc.unref();
-      if (acProc.pid) {
-        ok(`AgentChattr started (PID: ${acProc.pid})`);
-        if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
-        const pidFile = path.join(CONFIG_DIR, `agentchattr-${setup.projectName}.pid`);
-        fs.writeFileSync(pidFile, String(acProc.pid));
-      } else {
-        warn("Could not start AgentChattr — check logs in " + (acDir || perProjectDir));
-      }
-    } else {
-      warn("AgentChattr run.py not found — skipping auto-start.");
-    }
-  } else {
-    warn("AgentChattr not installed — skipping auto-start.");
-    log(`  → Install: git clone ${AGENTCHATTR_REPO} ${perProjectDir}`);
-  }
-
-  return configTomlPath;
-}
-
 // ─── Optional Add-ons ───────────────────────────────────────────────────────
 
 async function setupAddons(rl, setup, configTomlPath) {
@@ -1131,9 +653,10 @@ async function setupAddons(rl, setup, configTomlPath) {
     // bridge_sender defaults).
     if (fs.existsSync(telegramDir)) {
       run("git", ["-C", telegramDir, "fetch", "origin"], { timeout: 30000 });
-      const pinResult = run("git", ["-C", telegramDir, "checkout", "-B", "pinned", AGENTCHATTR_TELEGRAM_PIN], { timeout: 30000 });
+      const TELEGRAM_PIN = "4a6b45f1794c612328b9d5ee6d6fcb3f77015abc";
+      const pinResult = run("git", ["-C", telegramDir, "checkout", "-B", "pinned", TELEGRAM_PIN], { timeout: 30000 });
       if (pinResult === null) {
-        try { console.warn(`[quadwork] WARNING: could not check out agentchattr-telegram pin ${AGENTCHATTR_TELEGRAM_PIN} at ${telegramDir}; falling back to default branch.`); } catch {}
+        try { console.warn(`[quadwork] WARNING: could not check out agentchattr-telegram pin ${TELEGRAM_PIN} at ${telegramDir}; falling back to default branch.`); } catch {}
       }
     }
 
@@ -1308,26 +831,10 @@ function writeQuadWorkConfig(setup) {
     };
   }
 
-  // Auto-assign per-project AgentChattr and MCP ports (scan existing to avoid collisions)
+  // All new projects use file-based chat (AC is deprecated).
+  project.chat_mode = "file";
+
   const existingIdx = config.projects.findIndex((p) => p.id === setup.projectName);
-  const usedChattrPorts = new Set(config.projects.map((p) => {
-    try { return parseInt(new URL(p.agentchattr_url).port, 10); } catch { return 0; }
-  }).filter(Boolean));
-  const usedMcpPorts = new Set(config.projects.flatMap((p) => [p.mcp_http_port, p.mcp_sse_port]).filter(Boolean));
-  let chattrPort = 8300;
-  while (usedChattrPorts.has(chattrPort)) chattrPort++;
-  let mcp_http = 8200;
-  while (usedMcpPorts.has(mcp_http)) mcp_http++;
-  let mcp_sse = mcp_http + 1;
-  while (usedMcpPorts.has(mcp_sse)) mcp_sse++;
-  project.agentchattr_url = `http://127.0.0.1:${chattrPort}`;
-  project.agentchattr_token = require("crypto").randomBytes(16).toString("hex");
-  project.mcp_http_port = mcp_http;
-  project.mcp_sse_port = mcp_sse;
-  // Per-project AgentChattr clone path (Option B / #181). Each project gets
-  // its own clone so AgentChattr's ROOT/config.toml lookup picks up the right
-  // ports — see master ticket #181.
-  project.agentchattr_dir = path.join(os.homedir(), ".quadwork", setup.projectName, "agentchattr");
 
   // Batch 25 / #204: seed the per-project OVERNIGHT-QUEUE.md at
   // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md. Idempotent — if the file
@@ -1375,9 +882,6 @@ async function cmdInit() {
     ok(`Wrote ${CONFIG_PATH}`);
 
     // #573: Install phase complete — do NOT start the server.
-    // The wizard ensures all prerequisites are installed (AC clone,
-    // venv, pip) so that `npx quadwork start` boots fast without
-    // the 25-50s AC install race.
     rl.close();
 
     console.log("");
@@ -1405,226 +909,7 @@ async function cmdInit() {
 
 // ─── Start Command ──────────────────────────────────────────────────────────
 
-/**
- * Phase 3 / #181 sub-G: migrate legacy v1 projects to per-project clones.
- *
- * Runs eagerly at the top of cmdStart() so users see clear progress before
- * any agents launch. For each project that doesn't yet have a working
- * per-project clone:
- *   1. Compute perProjectDir = ~/.quadwork/{project_id}/agentchattr
- *   2. installAgentChattr(perProjectDir) — idempotent (#183 + #187)
- *   3. Copy the existing legacy <working_dir>/agentchattr/config.toml into
- *      the new clone ROOT if it exists. AgentChattr's run.py reads
- *      ROOT/config.toml from the clone dir, so this is what makes the
- *      project actually start from its own clone.
- *   4. Set project.agentchattr_dir on the config entry and persist.
- *
- * Idempotent: if a project already has a working per-project clone with a
- * config.toml at the ROOT and agentchattr_dir set, it is skipped silently.
- * The legacy ~/.quadwork/agentchattr/ install is left alone — cleanup is
- * sub-H (#189).
- *
- * The migration never touches worktrees, repo content, or token files;
- * only the per-project AgentChattr install dir and config.json.
- */
-function migrateLegacyProjects(config) {
-  if (!config.projects || config.projects.length === 0) return false;
 
-  const needsMigration = config.projects.filter((p) => {
-    if (!p.id) return false;
-    const target = p.agentchattr_dir || path.join(CONFIG_DIR, p.id, "agentchattr");
-    const hasClone = fs.existsSync(path.join(target, "run.py")) &&
-                     fs.existsSync(path.join(target, ".venv", "bin", "python"));
-    const hasToml = fs.existsSync(path.join(target, "config.toml"));
-    const hasField = !!p.agentchattr_dir;
-    return !(hasField && hasClone && hasToml);
-  });
-
-  if (needsMigration.length === 0) return false;
-
-  header("Migrating legacy projects to per-project AgentChattr clones");
-  let mutated = false;
-  for (const project of needsMigration) {
-    const perProjectDir = path.join(CONFIG_DIR, project.id, "agentchattr");
-    log(`  ${project.id} → ${perProjectDir}`);
-
-    // 1. Install (idempotent — no-op if clone is already valid).
-    if (!findAgentChattr(perProjectDir)) {
-      const acSpinner = spinner(`    Cloning AgentChattr for ${project.id}...`);
-      const installResult = installAgentChattr(perProjectDir);
-      if (!installResult) {
-        acSpinner.stop(false);
-        const reason = installAgentChattr.lastError || "unknown error";
-        warn(`    Migration failed for ${project.id}: ${reason}`);
-        warn(`    ${project.id} will keep using the legacy global install until this is resolved.`);
-        continue;
-      }
-      acSpinner.stop(true);
-    }
-
-    // 2. Seed config.toml at the clone ROOT from the legacy in-worktree
-    //    location if present. Do not overwrite an existing per-project
-    //    config.toml — re-running the migration must be a no-op.
-    //
-    //    If the legacy toml exists but the copy fails, we MUST NOT persist
-    //    agentchattr_dir — otherwise #186's resolver would switch this
-    //    project to a clone that lacks the project's real ports, and
-    //    AgentChattr would silently start on run.py defaults. Leaving
-    //    agentchattr_dir unset keeps the project on the legacy global
-    //    install via #186's fallback ladder until the next attempt.
-    const targetToml = path.join(perProjectDir, "config.toml");
-    let tomlReady = fs.existsSync(targetToml);
-    if (!tomlReady && project.working_dir) {
-      const legacyToml = path.join(project.working_dir, "agentchattr", "config.toml");
-      if (fs.existsSync(legacyToml)) {
-        try {
-          fs.copyFileSync(legacyToml, targetToml);
-          log(`    Copied legacy config.toml → ${targetToml}`);
-          tomlReady = true;
-        } catch (e) {
-          warn(`    Could not copy ${legacyToml}: ${e.message}`);
-          warn(`    ${project.id} migration aborted: legacy config.toml not transferred.`);
-          warn(`    ${project.id} will keep using the legacy global install via #186 fallback.`);
-          continue;
-        }
-      } else {
-        // No legacy toml at all (e.g. user removed it). Refuse to migrate
-        // — without a config.toml at the clone ROOT, run.py would start
-        // on built-in defaults and bind to the wrong ports.
-        warn(`    ${project.id} has no legacy config.toml at ${legacyToml}; skipping migration.`);
-        warn(`    Re-run setup to regenerate config.toml, then 'quadwork start' will retry migration.`);
-        continue;
-      }
-    }
-    if (!tomlReady) {
-      warn(`    ${project.id} migration aborted: no config.toml at ${targetToml}.`);
-      continue;
-    }
-
-    // 3. Persist agentchattr_dir on the project entry — only after the
-    //    clone has run.py + venv + config.toml all in place.
-    if (project.agentchattr_dir !== perProjectDir) {
-      project.agentchattr_dir = perProjectDir;
-      mutated = true;
-    }
-  }
-
-  if (mutated) {
-    try { writeConfig(config); ok("Updated config.json with per-project agentchattr_dir entries"); }
-    catch (e) { warn(`Failed to write config.json: ${e.message}`); }
-  }
-  log("  Legacy ~/.quadwork/agentchattr/ left in place; remove via cleanup script (#189).");
-  return true;
-}
-
-/**
- * #403 / quadwork#274 migration: ensure every per-project config.toml
- * has `[routing] max_agent_hops = 30`. Idempotent + line-based so
- * existing comments and other keys in the [routing] section are
- * preserved.
- *
- * #415 / quadwork#298: previous version skipped projects that had
- * a [routing] section but no max_agent_hops key (e.g. only
- * `default = "none"`). Those projects silently retained AC's
- * default of 4 and kept firing the loop guard mid-cycle. This
- * version handles three cases:
- *
- *   1. max_agent_hops already set     → no change
- *   2. [routing] section exists,
- *      max_agent_hops missing         → insert key under the header
- *   3. no [routing] section at all    → append a fresh section
- */
-function migrateLoopGuardDefaults(config) {
-  if (!config.projects || config.projects.length === 0) return;
-  for (const project of config.projects) {
-    if (!project.id) continue;
-    const tomlPath = project.agentchattr_dir
-      ? path.join(project.agentchattr_dir, "config.toml")
-      : path.join(CONFIG_DIR, project.id, "agentchattr", "config.toml");
-    if (!fs.existsSync(tomlPath)) continue;
-    let content;
-    try { content = fs.readFileSync(tomlPath, "utf-8"); } catch { continue; }
-    // Case 1: key already present *inside* the [routing] section.
-    // We must NOT short-circuit on a same-named key in some other
-    // table (e.g. `[other]\nmax_agent_hops = 7`) because that would
-    // leave a real partial [routing] section unpatched. Walk the
-    // file line-by-line, find the [routing] header, and collect
-    // lines until the next [section] header or EOF. JS regex has
-    // no \z anchor and no reliable EOF lookahead inside /m, so a
-    // line scan is the simplest correct approach and also keeps
-    // pathological strings ("default = \"lazy\"") from confusing
-    // anything in the matcher.
-    const lines = content.split(/\r?\n/);
-    let inRouting = false;
-    let routingKeyPresent = false;
-    for (const line of lines) {
-      const headerMatch = line.match(/^\s*\[([^\]]+)\]/);
-      if (headerMatch) {
-        inRouting = headerMatch[1].trim() === "routing";
-        continue;
-      }
-      if (inRouting && /^\s*max_agent_hops\s*=/.test(line)) {
-        routingKeyPresent = true;
-        break;
-      }
-    }
-    if (routingKeyPresent) continue;
-    let next;
-    if (/^\s*\[routing\]/m.test(content)) {
-      // Case 2: section exists, key missing. Insert the key on the
-      // line right after the [routing] header so it's scoped to the
-      // section regardless of what other keys / comments live there.
-      // Anchored to ^ so a `[routing]` substring inside a string
-      // value can't false-match. The header line is allowed to:
-      //   - have a trailing inline comment (`[routing] # keep me`)
-      //   - end the file with no trailing newline at all
-      // The line-break group is captured separately and re-emitted,
-      // synthesizing a `\n` if the file ended exactly at the header
-      // (otherwise the new key would land glued to whatever the
-      // bracket was sitting on).
-      next = content.replace(
-        /^(\s*\[routing\][^\r\n]*)(\r?\n|$)/m,
-        (_match, header, lineBreak) => {
-          const lb = lineBreak || "\n";
-          return `${header}${lb}max_agent_hops = 30\n`;
-        },
-      );
-    } else {
-      // Case 3: no section. Append a fresh one at the end of the
-      // file with both default + max_agent_hops.
-      const trailing = content.endsWith("\n") ? "" : "\n";
-      next = content + `${trailing}\n[routing]\ndefault = "none"\nmax_agent_hops = 30\n`;
-    }
-    if (next === content) continue;
-    try {
-      fs.writeFileSync(tomlPath, next);
-      log(`  Loop guard default → ${project.id} (max_agent_hops = 30)`);
-    } catch { /* non-fatal */ }
-  }
-}
-
-/**
- * #580: Poll AC health endpoint until it responds 200, or timeout.
- * Simple inline implementation for bin/ (no access to server/ modules).
- */
-async function waitForAcHealth(baseUrl, timeoutMs = 30000) {
-  const http = require("http");
-  const deadline = Date.now() + timeoutMs;
-  const healthUrl = `${baseUrl}/`;
-  while (Date.now() < deadline) {
-    const ok = await new Promise((resolve) => {
-      const req = http.get(healthUrl, (res) => {
-        res.resume();
-        resolve(res.statusCode >= 200 && res.statusCode < 400);
-      });
-      req.on("error", () => resolve(false));
-      req.setTimeout(2000, () => { req.destroy(); resolve(false); });
-    });
-    if (ok) return true;
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  return false;
-}
 
 async function cmdStart() {
   console.log("\n  QuadWork Start\n");
@@ -1633,19 +918,6 @@ async function cmdStart() {
   if (config.projects.length === 0) {
     warn("No projects configured yet. Create one at the setup page.");
   }
-
-  // Phase 3 / #181: migrate legacy single-install projects to their
-  // own per-project clones before any AgentChattr spawn happens.
-  // Idempotent — a no-op once every project already has a working clone.
-  migrateLegacyProjects(config);
-
-  // Batch 30 / #403 / quadwork#274: ensure every existing project's
-  // AgentChattr config.toml has [routing] max_agent_hops = 30 so the
-  // loop guard doesn't fire mid-PR-cycle. Idempotent: leaves any
-  // pre-existing routing section alone (only adds the section + key
-  // when both are missing). Failures are non-fatal — the project
-  // will just keep its current loop guard.
-  migrateLoopGuardDefaults(config);
 
   const quadworkDir = path.join(__dirname, "..");
   const port = config.port || 8400;
@@ -1664,66 +936,6 @@ async function cmdStart() {
     process.exit(1);
   }
 
-  // Start AgentChattr for each project from its own per-project clone.
-  // Phase 2E / #181: each project entry now has agentchattr_dir, set by
-  // the wizards in #184/#185. Resolve per-project so two projects with
-  // their own clones (and their own ports) can run side by side without
-  // sharing a single global install. Falls back to the legacy global
-  // install dir for v1 entries that have not been migrated yet (#188).
-  const acPids = [];
-  const legacyAcDir = findAgentChattr(config.agentchattr_dir);
-  for (const project of config.projects) {
-    if (!project.working_dir) continue;
-    const projectAcDir = findAgentChattr(project.agentchattr_dir) || legacyAcDir;
-    if (!projectAcDir) continue;
-    // config.toml lives at the clone ROOT for new projects; legacy v1
-    // setups still keep it under <working_dir>/agentchattr/config.toml.
-    const perProjectToml = path.join(projectAcDir, "config.toml");
-    const legacyToml = path.join(project.working_dir, "agentchattr", "config.toml");
-    const configToml = fs.existsSync(perProjectToml)
-      ? perProjectToml
-      : (fs.existsSync(legacyToml) ? legacyToml : null);
-    if (!configToml) continue;
-    const acSpawn = chattrSpawnArgs(projectAcDir, []);
-    if (!acSpawn) continue;
-    // #569: redirect AC stdout/stderr to a log file for diagnostics.
-    const acLogDir = path.join(CONFIG_DIR, project.id);
-    try { fs.mkdirSync(acLogDir, { recursive: true, mode: 0o700 }); } catch {}
-    const acLogPath = path.join(acLogDir, "agentchattr.log");
-    const acLogFd = fs.openSync(acLogPath, "a");
-    const acProc = spawn(acSpawn.command, acSpawn.spawnArgs, {
-      cwd: acSpawn.cwd,
-      stdio: ["ignore", acLogFd, acLogFd],
-      detached: true,
-    });
-    fs.closeSync(acLogFd);
-    acProc.on("error", () => {});
-    acProc.unref();
-    if (acProc.pid) {
-      // #580: wait for AC to bind its port before declaring success.
-      const acUrl = project.agentchattr_url || "http://127.0.0.1:8300";
-      const acReady = await waitForAcHealth(acUrl, 30000);
-      if (acReady) {
-        ok(`AgentChattr started for ${project.id} from ${projectAcDir} (PID: ${acProc.pid})`);
-      } else {
-        warn(`AgentChattr spawned for ${project.id} (PID: ${acProc.pid}) but did not become ready within 30s`);
-      }
-      log(`  Log: ${acLogPath}`);
-      acPids.push(acProc.pid);
-    }
-    // #579: verify pin checkout after spawn — surface loudly if AC clone
-    // drifted from the pinned commit, so operators know they're not on
-    // the tested version. The install-time warn() is often buried mid-
-    // spinner; this post-spawn check is always visible.
-    const headSha = (run("git", ["-C", projectAcDir, "rev-parse", "HEAD"]) || "").trim();
-    if (headSha && headSha !== AGENTCHATTR_PIN) {
-      warn(`AgentChattr for ${project.id} is NOT on the pinned commit.`);
-      log(`  Current: ${headSha.slice(0, 12)}`);
-      log(`  Pinned:  ${AGENTCHATTR_PIN.slice(0, 12)}`);
-      log(`  Run: git -C ${projectAcDir} checkout -B pinned ${AGENTCHATTR_PIN}`);
-    }
-  }
-
   // Open dashboard in browser after a short delay
   const dashboardUrl = `http://127.0.0.1:${port}`;
   setTimeout(() => {
@@ -1737,24 +949,16 @@ async function cmdStart() {
   }, 1500);
 
   // Run server in foreground. Capture exports so the SIGINT handler
-  // can ask the server to SIGTERM its own chattrProcesses Map too
-  // (dashboard-spawned AgentChattr children aren't in cmdStart's
-  // acPids list).
+  // can call shutdown() for a clean exit.
   log(`Dashboard: ${dashboardUrl}`);
   log("Press Ctrl+C to stop.\n");
   const serverExports = require(path.join(serverDir, "index.js"));
 
-  // Graceful shutdown on Ctrl+C — kills cmdStart's own spawned
-  // AgentChattrs AND anything the dashboard spawned via
-  // /api/agentchattr/{id}/start after init.
   process.on("SIGINT", () => {
     console.log("");
     log("Shutting down...");
-    for (const pid of acPids) {
-      try { process.kill(pid, "SIGTERM"); } catch {}
-    }
-    try { serverExports && serverExports.shutdownChattrProcesses && serverExports.shutdownChattrProcesses(); }
-    catch (e) { warn(`shutdownChattrProcesses failed: ${e.message}`); }
+    try { serverExports && serverExports.shutdown && serverExports.shutdown(); }
+    catch (e) { warn(`shutdown failed: ${e.message}`); }
     ok("Stopped.");
     console.log("");
     log("To restart:");
@@ -1831,13 +1035,6 @@ async function cmdAddProject() {
     if (!setup) { rl.close(); process.exit(1); }
 
     writeQuadWorkConfig(setup);
-
-    // Phase 2C / #181: config.toml lives at the per-project clone ROOT
-    // because AgentChattr's run.py loads ROOT/config.toml and ignores
-    // --config. Must match the install path used inside
-    // writeAgentChattrConfig(): CONFIG_DIR/{projectName}/agentchattr.
-    const configTomlPath = path.join(CONFIG_DIR, setup.projectName, "agentchattr", "config.toml");
-    writeAgentChattrConfig(setup, configTomlPath);
 
     header("Project Added");
     log(`Project:      ${setup.projectName}`);
@@ -1961,59 +1158,12 @@ async function cmdCleanup() {
 
 // ─── Doctor ─────────────────────────────────────────────────────────────────
 
-// #348: show the AgentChattr pin and the actual commit SHA of
-// every per-project clone so operators can spot mismatches. The
-// global clone at DEFAULT_AGENTCHATTR_DIR is checked first, then
-// any clones under ~/.quadwork/<projectId>/agentchattr that are
-// referenced by config.json.
 function cmdDoctor() {
   console.log("");
   console.log("QuadWork doctor");
   console.log("===============");
-  console.log(`AgentChattr repo: ${AGENTCHATTR_REPO}`);
-  console.log(`Expected pin:     ${AGENTCHATTR_PIN}`);
+  console.log("Chat mode: file-based (AC removed)");
   console.log("");
-  const cloneShaAt = (dir) => {
-    if (!fs.existsSync(path.join(dir, ".git"))) return null;
-    const sha = run("git", ["-C", dir, "rev-parse", "HEAD"]);
-    return sha ? sha.trim() : null;
-  };
-  // #366: surface whether the clone is on the named `pinned`
-  // branch, on a different named branch, or in detached HEAD.
-  // Detached-HEAD-but-on-pin gets a soft warning so operators
-  // know to re-run install (which auto-migrates) or re-clone.
-  const cloneBranchAt = (dir) => {
-    const ref = run("git", ["-C", dir, "symbolic-ref", "--quiet", "HEAD"]);
-    if (!ref) return null; // detached
-    return ref.trim().replace(/^refs\/heads\//, "");
-  };
-  const report = (label, dir) => {
-    if (!dir || !fs.existsSync(dir)) {
-      console.log(`  [skip] ${label}: ${dir || "(not configured)"} — missing`);
-      return;
-    }
-    const sha = cloneShaAt(dir);
-    if (!sha) {
-      console.log(`  [warn] ${label}: ${dir} — not a git clone`);
-      return;
-    }
-    const branch = cloneBranchAt(dir);
-    let tag;
-    if (sha !== AGENTCHATTR_PIN) {
-      tag = "DIFF";
-    } else if (!branch) {
-      tag = "DETACH"; // on-pin but in detached HEAD — re-run install to migrate
-    } else if (branch !== "pinned") {
-      tag = "BR  "; // on-pin but on a non-`pinned` named branch (operator override)
-    } else {
-      tag = "OK  ";
-    }
-    const branchLabel = branch ? `branch=${branch}` : "branch=(detached)";
-    console.log(`  [${tag}] ${label}: ${sha} ${branchLabel} (${dir})`);
-  };
-  // Global clone
-  report("global", DEFAULT_AGENTCHATTR_DIR);
-  // Per-project clones referenced by config.json
   try {
     const cfg = readConfig();
     const projects = Array.isArray(cfg.projects) ? cfg.projects : [];
@@ -2021,83 +1171,11 @@ function cmdDoctor() {
       console.log("  (no projects in config.json)");
     }
     for (const p of projects) {
-      // Per-project clones live under ~/.quadwork/<id>/agentchattr
-      // per cmdAddProject's layout, but a project may also override
-      // via its own agentchattr_dir field.
-      const perProject = p && p.agentchattr_dir
-        ? p.agentchattr_dir
-        : path.join(CONFIG_DIR, p.id || "", "agentchattr");
-      report(`project:${p.id || "(unnamed)"}`, perProject);
+      const chatMode = p.chat_mode || "file";
+      console.log(`  project:${p.id || "(unnamed)"} chat_mode=${chatMode} working_dir=${p.working_dir || "(not set)"}`);
     }
   } catch (err) {
     console.log(`  (could not enumerate projects: ${err.message})`);
-  }
-  // #444: agentchattr-telegram pin status
-  console.log("");
-  console.log(`agentchattr-telegram pin: ${AGENTCHATTR_TELEGRAM_PIN}`);
-  const tgBridgeDir = path.join(CONFIG_DIR, "agentchattr-telegram");
-  if (!fs.existsSync(tgBridgeDir)) {
-    console.log("  [skip] agentchattr-telegram: not installed");
-  } else {
-    const tgSha = cloneShaAt(tgBridgeDir);
-    if (!tgSha) {
-      console.log(`  [warn] agentchattr-telegram: ${tgBridgeDir} — not a git clone`);
-    } else {
-      const tgBranch = cloneBranchAt(tgBridgeDir);
-      let tgTag;
-      if (tgSha !== AGENTCHATTR_TELEGRAM_PIN) {
-        tgTag = "DIFF";
-      } else if (!tgBranch) {
-        tgTag = "DETACH";
-      } else if (tgBranch !== "pinned") {
-        tgTag = "BR  ";
-      } else {
-        tgTag = "OK  ";
-      }
-      const tgBranchLabel = tgBranch ? `branch=${tgBranch}` : "branch=(detached)";
-      console.log(`  [${tgTag}] ${tgSha} ${tgBranchLabel} (${tgBridgeDir})`);
-    }
-  }
-
-  console.log("");
-  console.log("Legend: [OK  ] on pin + on `pinned` branch; [BR  ] on pin but on a non-`pinned` named branch; [DETACH] on pin but in detached HEAD (re-run quadwork start to auto-migrate); [DIFF] off-pin (re-clone manually to re-sync)");
-
-  // #569: show last 20 lines of AC log for each project to help
-  // operators diagnose startup failures.
-  console.log("");
-  console.log("AgentChattr logs");
-  console.log("────────────────");
-  try {
-    const cfg = readConfig();
-    const projects = Array.isArray(cfg.projects) ? cfg.projects : [];
-    for (const p of projects) {
-      const logPath = path.join(CONFIG_DIR, p.id || "", "agentchattr.log");
-      if (!fs.existsSync(logPath)) {
-        console.log(`  ${p.id}: (no log file)`);
-        continue;
-      }
-      // Bounded tail: read last 8KB instead of the whole file to stay
-      // fast on large append-only logs.
-      const stat = fs.statSync(logPath);
-      const readSize = Math.min(stat.size, 8192);
-      const buf = Buffer.alloc(readSize);
-      const fd = fs.openSync(logPath, "r");
-      fs.readSync(fd, buf, 0, readSize, stat.size - readSize);
-      fs.closeSync(fd);
-      const lines = buf.toString("utf-8").trimEnd().split("\n");
-      // If we read from mid-file, the first line is likely partial — drop it.
-      if (readSize < stat.size) lines.shift();
-      const tail = lines.slice(-20);
-      console.log(`  ${p.id}: ${logPath} (last ${tail.length} lines)`);
-      for (const line of tail) {
-        console.log(`    ${line}`);
-      }
-    }
-    if (projects.length === 0) {
-      console.log("  (no projects)");
-    }
-  } catch (err) {
-    console.log(`  (could not read logs: ${err.message})`);
   }
   console.log("");
 }
@@ -2163,52 +1241,7 @@ async function cmdMigrateAgentSlugs() {
       }
     }
 
-    // 4. Rewrite per-project AgentChattr config.toml
-    const tomlPath = project.agentchattr_dir
-      ? path.join(project.agentchattr_dir, "config.toml")
-      : path.join(CONFIG_DIR, project.id, "agentchattr", "config.toml");
-    if (fs.existsSync(tomlPath)) {
-      let toml = fs.readFileSync(tomlPath, "utf-8");
-      let tomlChanged = false;
-      if (toml.includes("[agents.reviewer1]")) {
-        toml = toml.replace(/\[agents\.reviewer1\]/g, "[agents.re1]");
-        tomlChanged = true;
-      }
-      if (toml.includes("[agents.reviewer2]")) {
-        toml = toml.replace(/\[agents\.reviewer2\]/g, "[agents.re2]");
-        tomlChanged = true;
-      }
-      // Add label lines if missing
-      for (const [slug, label] of Object.entries(LABEL_MAP)) {
-        const sectionRe = new RegExp(`(\\[agents\\.${slug}\\][^\\[]*?)(?=\\n\\[|$)`, "s");
-        const match = toml.match(sectionRe);
-        if (match && !match[1].includes("label =")) {
-          toml = toml.replace(sectionRe, `$1label = "${label}"\n`);
-          tomlChanged = true;
-        }
-      }
-      if (tomlChanged) {
-        fs.writeFileSync(tomlPath, toml);
-        changes.push(`  config.toml rewritten: ${tomlPath}`);
-      }
-    }
-
-    // 5. Rename queue files (reviewer1_queue.jsonl → re1_queue.jsonl)
-    const acDir = project.agentchattr_dir
-      || path.join(CONFIG_DIR, project.id, "agentchattr");
-    const dataDir = path.join(acDir, "data");
-    if (fs.existsSync(dataDir)) {
-      for (const [oldKey, newKey] of Object.entries(SLUG_MAP)) {
-        const oldQf = path.join(dataDir, `${oldKey}_queue.jsonl`);
-        const newQf = path.join(dataDir, `${newKey}_queue.jsonl`);
-        if (fs.existsSync(oldQf) && !fs.existsSync(newQf)) {
-          fs.renameSync(oldQf, newQf);
-          changes.push(`  queue file: ${oldKey}_queue.jsonl → ${newKey}_queue.jsonl`);
-        }
-      }
-    }
-
-    // 6. Rewrite stale slugs in worktree AGENTS.md and CLAUDE.md files (#479)
+    // 4. Rewrite stale slugs in worktree AGENTS.md and CLAUDE.md files (#479)
     const SEED_REPLACEMENTS = [
       [/@reviewer1/g, "@re1"],
       [/@reviewer2/g, "@re2"],
@@ -2257,8 +1290,7 @@ async function cmdMigrateAgentSlugs() {
   log("");
   log("Next steps:");
   log("  1. Run 'npx quadwork start' to restart with the new slugs");
-  log("  2. AgentChattr will pick up the renamed config.toml sections");
-  log("  3. Old chat messages keep their original sender — no history rewrite");
+  log("  2. Old chat messages keep their original sender — no history rewrite");
 }
 
 // ─── ac-restore ────────────────────────────────────────────────────────────
@@ -2335,12 +1367,12 @@ switch (command) {
   Usage: quadwork <command>
 
   Commands:
-    init          Run setup wizard (prereqs, port, AgentChattr install)
-    start         Start the QuadWork dashboard, AgentChattr, and agents
+    init          Run setup wizard (prereqs, port)
+    start         Start the QuadWork dashboard and agents
     stop          Stop all QuadWork processes
     add-project   Add a project via CLI (alternative to web UI /setup)
     cleanup       Reclaim disk space (--project <id> or --legacy)
-    doctor        Report the AgentChattr pin + per-project clone SHAs
+    doctor        Report project configuration status
     migrate-agent-slugs  Rename reviewer1/reviewer2 → re1/re2 in existing projects
     ac-restore           Restore file-chat JSONL back to AC format
 

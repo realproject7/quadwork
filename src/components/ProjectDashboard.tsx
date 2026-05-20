@@ -72,11 +72,9 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   // config (bridge_filter_agents_only), so dashboard and bridges stay in sync.
   const [filterSystem, setFilterSystem] = useState(false);
   const filterLoadedRef = useRef(false);
-  const [chatMode, setChatMode] = useState<"ac" | "file">("ac");
   useEffect(() => {
     filterLoadedRef.current = false;
     setFilterSystem(false);
-    setChatMode("ac");
   }, [projectId]);
   useEffect(() => {
     if (filterLoadedRef.current) return;
@@ -86,7 +84,6 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         if (!cfg) return;
         const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
         if (entry?.bridge_filter_agents_only) setFilterSystem(true);
-        if (entry?.chat_mode === "file") setChatMode("file");
         filterLoadedRef.current = true;
       })
       .catch(() => {});
@@ -231,7 +228,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             {filterToggle}
           </PanelHeader>
           <div className="flex-1 min-h-0">
-            <ChatPanel projectId={projectId} filterSystem={filterSystem} chatMode={chatMode} />
+            <ChatPanel projectId={projectId} filterSystem={filterSystem} />
           </div>
           <ControlBar projectId={projectId} />
         </div>
@@ -290,7 +287,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
 
         {/* Q4: Operator Features */}
         <div className="border-t border-border lg:border-t-0 flex flex-col overflow-hidden">
-          <OperatorFeaturesPanel projectId={projectId} chatMode={chatMode} />
+          <OperatorFeaturesPanel projectId={projectId} />
         </div>
       </div>
     </div>

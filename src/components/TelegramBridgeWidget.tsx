@@ -63,7 +63,6 @@ interface BatchState {
 
 interface TelegramBridgeWidgetProps {
   projectId: string;
-  chatMode?: "ac" | "file";
 }
 
 interface TelegramStatus {
@@ -98,7 +97,7 @@ async function callTelegram(action: string, body: Record<string, unknown>) {
  * start/stop + a setup modal to configure bot_token + chat_id from
  * scratch.
  */
-export default function TelegramBridgeWidget({ projectId, chatMode = "ac" }: TelegramBridgeWidgetProps) {
+export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidgetProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [status, setStatus] = useState<TelegramStatus | null>(null);

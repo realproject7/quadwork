@@ -9,16 +9,16 @@ const COPY = {
     title: "Project History",
     tooltip: (
       <>
-        <b>Project History</b> — export or import the full AgentChattr chat history for this project. Useful for backup, migration, or resuming after a fresh install.
+        <b>Project History</b> — export or import the full chat history for this project. Useful for backup, migration, or resuming after a fresh install.
       </>
     ),
     export: (projectId: string) => `Export ${projectId} chat`,
     import: "Import history…",
     importing: "Importing…",
-    autoRestore: "Auto-restore newest snapshot after AC restart",
+    autoRestore: "Auto-restore newest snapshot after restart",
     autoSnapshots: "Auto-snapshots (before restart)",
     restore: "Restore",
-    restoreConfirm: (name: string) => `Restore snapshot ${name}? This will replay every message through AgentChattr (tagged by the original sender) and may duplicate history already in the chat. Continue?`,
+    restoreConfirm: (name: string) => `Restore snapshot ${name}? This will replay every message (tagged by the original sender) and may duplicate history already in the chat. Continue?`,
     importMismatchConfirm: (source: string, target: string) => `This export is from project '${source}' but you're importing into '${target}'. Continue anyway?`,
     importReservedConfirm: (senders: string) => `This export contains messages attributed to reserved agent/system identities (${senders}). Importing will replay them as those agents — only do this for a legitimate disaster-recovery restore. Continue?`,
     importDuplicateConfirm: (error: string) => `${error}\n\nThis file looks like it was already imported. Re-import will duplicate every message. Continue anyway?`,
@@ -34,16 +34,16 @@ const COPY = {
     title: "프로젝트 히스토리",
     tooltip: (
       <>
-        <b>프로젝트 히스토리</b> - 이 프로젝트의 전체 AgentChattr 채팅 기록을 내보내거나 가져옵니다. 백업, 마이그레이션, 재설치 후 복구에 유용합니다.
+        <b>프로젝트 히스토리</b> - 이 프로젝트의 전체 채팅 기록을 내보내거나 가져옵니다. 백업, 마이그레이션, 재설치 후 복구에 유용합니다.
       </>
     ),
     export: (projectId: string) => `${projectId} 채팅 내보내기`,
     import: "히스토리 가져오기…",
     importing: "가져오는 중…",
-    autoRestore: "AC 재시작 후 최신 스냅샷 자동 복구",
+    autoRestore: "재시작 후 최신 스냅샷 자동 복구",
     autoSnapshots: "자동 스냅샷 (재시작 전)",
     restore: "복구",
-    restoreConfirm: (name: string) => `스냅샷 ${name}을(를) 복구할까요? 모든 메시지가 AgentChattr를 통해 재생되며(원본 발신자 표시), 채팅에 이미 있는 내용이 중복될 수 있습니다. 계속하시겠습니까?`,
+    restoreConfirm: (name: string) => `스냅샷 ${name}을(를) 복구할까요? 모든 메시지가 재생되며(원본 발신자 표시), 채팅에 이미 있는 내용이 중복될 수 있습니다. 계속하시겠습니까?`,
     importMismatchConfirm: (source: string, target: string) => `이 내보내기 파일은 '${source}' 프로젝트에서 생성되었지만, 현재 '${target}' 프로젝트로 가져오려 합니다. 계속하시겠습니까?`,
     importReservedConfirm: (senders: string) => `이 파일에는 예약된 에이전트/시스템 식별자(${senders})가 발신자로 표시된 메시지가 포함되어 있습니다. 가져오기를 진행하면 해당 에이전트가 말하는 것처럼 메시지가 재생됩니다. 재난 복구 상황에서만 사용하세요. 계속하시겠습니까?`,
     importDuplicateConfirm: (error: string) => `${error}\n\n이 파일은 이미 가져온 것 같습니다. 다시 가져오면 모든 메시지가 중복됩니다. 계속하시겠습니까?`,

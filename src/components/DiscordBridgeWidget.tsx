@@ -63,7 +63,6 @@ interface BatchState {
 
 interface DiscordBridgeWidgetProps {
   projectId: string;
-  chatMode?: "ac" | "file";
 }
 
 interface DiscordStatus {
@@ -94,7 +93,7 @@ async function callDiscord(action: string, body: Record<string, unknown>) {
  * start/stop + a setup modal to configure bot_token + channel_id from
  * scratch.
  */
-export default function DiscordBridgeWidget({ projectId, chatMode = "ac" }: DiscordBridgeWidgetProps) {
+export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [status, setStatus] = useState<DiscordStatus | null>(null);

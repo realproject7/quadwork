@@ -86,8 +86,6 @@ const COPY = {
       title: "Ready to launch",
       desc: "Everything is configured. Review the summary and launch your AI dev team.",
       teamRoster: "Team Roster",
-      customPorts: "Custom ports",
-      autoDetected: (port: number) => `auto-detected: ${port}`,
       redirecting: "Project saved. Redirecting to dashboard...",
       launching: "Launching...",
       launched: "Launched!",
@@ -167,8 +165,6 @@ const COPY = {
       title: "실행 준비 완료",
       desc: "모든 설정이 끝났습니다. 요약을 확인하고 AI 개발 팀을 시작하세요.",
       teamRoster: "팀 구성",
-      customPorts: "사용자 지정 포트",
-      autoDetected: (port: number) => `자동 감지: ${port}`,
       redirecting: "프로젝트를 저장했습니다. 대시보드로 이동 중...",
       launching: "실행 중...",
       launched: "실행됨!",
@@ -330,24 +326,9 @@ export default function SetupWizard() {
   const [reviewerTokenValue, setReviewerTokenValue] = useState("");
   const [reviewerTokenPath, setReviewerTokenPath] = useState("~/.quadwork/reviewer-token");
   const [workingDir, setWorkingDir] = useState("");
-  const [chattrConfig, setChattrConfig] = useState<{ agentchattr_token?: string; agentchattr_port?: number; mcp_http_port?: number; mcp_sse_port?: number }>({});
   const [loading, setLoading] = useState(false);
   const [workspaceLog, setWorkspaceLog] = useState<string[]>([]);
   const [launchStatus, setLaunchStatus] = useState<"idle" | "running" | "done" | "error">("idle");
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [customPorts, setCustomPorts] = useState({ chattr: 0, mcpHttp: 0, mcpSse: 0 });
-  // #419 / quadwork#308: draft-string mirror of customPorts so each
-  // field can be cleared and retyped without the onChange
-  // `parseInt || 0` clobbering the buffer. Committed on blur.
-  const [customPortsDraft, setCustomPortsDraft] = useState({ chattr: "", mcpHttp: "", mcpSse: "" });
-  const commitPortDraft = (key: "chattr" | "mcpHttp" | "mcpSse") => {
-    const raw = customPortsDraft[key];
-    const n = parseInt(raw, 10);
-    const clamped = Number.isFinite(n) && n > 0 && n <= 65535 ? n : 0;
-    setCustomPorts((prev) => ({ ...prev, [key]: clamped }));
-    setCustomPortsDraft((prev) => ({ ...prev, [key]: clamped ? String(clamped) : "" }));
-  };
-  const [autoDetectedPorts, setAutoDetectedPorts] = useState({ chattr: 0, mcpHttp: 0, mcpSse: 0 });
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean } | null>(null);
 
   useEffect(() => {
@@ -531,100 +512,15 @@ export default function SetupWizard() {
     goNext();
   };
 
-  // Step: launch (agentchattr-config + add-config + redirect)
+  // Step: launch (add-config + redirect)
   const launchProject = async () => {
-    // #332: commit any unblurred custom-port drafts before reading
-    // customPorts, so clicking Launch with the cursor still inside a
-    // port input uses the typed value instead of discarding it.
-    // setCustomPorts is async so we cannot read `customPorts` in this
-    // same call tick; derive the effective values directly from the
-    // draft strings using the same clamp rules as commitPortDraft.
-    commitPortDraft("chattr");
-    commitPortDraft("mcpHttp");
-    commitPortDraft("mcpSse");
-    const committedPort = (key: "chattr" | "mcpHttp" | "mcpSse"): number => {
-      const draftRaw = customPortsDraft[key];
-      if (draftRaw !== "") {
-        const n = parseInt(draftRaw, 10);
-        if (Number.isFinite(n) && n > 0 && n <= 65535) return n;
-        return 0;
-      }
-      return customPorts[key];
-    };
-    const effectivePorts = {
-      chattr: committedPort("chattr"),
-      mcpHttp: committedPort("mcpHttp"),
-      mcpSse: committedPort("mcpSse"),
-    };
-
     setLaunchStatus("running");
 
-    // 1. Determine ports: use custom if set, otherwise auto-detect free ports
-    let agentchattr_port: number, mcp_http_port: number, mcp_sse_port: number;
-
-    if (showAdvanced && effectivePorts.chattr > 0) {
-      // Validate custom ports against collisions
-      agentchattr_port = effectivePorts.chattr;
-      mcp_http_port = effectivePorts.mcpHttp || effectivePorts.chattr - 100;
-      mcp_sse_port = effectivePorts.mcpSse || mcp_http_port + 1;
-      const portsToCheck = [agentchattr_port, mcp_http_port, mcp_sse_port];
-      try {
-        const checks = await Promise.all(
-          portsToCheck.map((p) => fetch(`/api/port-check?port=${p}`).then((r) => r.json()))
-        );
-        const busy = checks.filter((c) => !c.free).map((c) => c.port);
-        if (busy.length > 0) {
-          setLaunchStatus("error");
-          updateStep(currentStep, { status: "error", error: `Port${busy.length > 1 ? "s" : ""} ${busy.join(", ")} already in use` });
-          return;
-        }
-      } catch {}
-    } else {
-      // Auto-detect free ports via server-side check (run inline if not yet ready)
-      if (!autoDetectedPorts.chattr) {
-        try {
-          const chattrRes = await fetch("/api/port-check/auto?start=8300&count=1");
-          const chattrData = await chattrRes.json();
-          const mcpRes = await fetch("/api/port-check/auto?start=8200&count=2");
-          const mcpData = await mcpRes.json();
-          agentchattr_port = chattrData.ports?.[0] || 8300;
-          mcp_http_port = mcpData.ports?.[0] || 8200;
-          mcp_sse_port = mcpData.ports?.[1] || 8201;
-        } catch {
-          agentchattr_port = 8300;
-          mcp_http_port = 8200;
-          mcp_sse_port = 8201;
-        }
-      } else {
-        agentchattr_port = autoDetectedPorts.chattr;
-        mcp_http_port = autoDetectedPorts.mcpHttp;
-        mcp_sse_port = autoDetectedPorts.mcpSse;
-      }
-    }
-
-    const chattrResult = await apiCall("agentchattr-config", {
-      workingDir, projectName, repo, backends,
-      agentchattr_port, mcp_http_port, mcp_sse_port,
-    });
-    if (chattrResult.ok) {
-      setChattrConfig({
-        agentchattr_token: chattrResult.agentchattr_token,
-        agentchattr_port: chattrResult.agentchattr_port,
-        mcp_http_port: chattrResult.mcp_http_port,
-        mcp_sse_port: chattrResult.mcp_sse_port,
-      });
-    }
-
-    // 2. Save config
+    // Save config
     const id = workingDir.split("/").pop() || projectName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
     const configResult = await apiCall("add-config", {
       id, name: projectName, repo, workingDir, backends, auto_approve: autoApprove,
-      ...(chattrResult.ok ? {
-        agentchattr_token: chattrResult.agentchattr_token,
-        agentchattr_port: chattrResult.agentchattr_port,
-        mcp_http_port: chattrResult.mcp_http_port,
-        mcp_sse_port: chattrResult.mcp_sse_port,
-      } : chattrConfig),
+      chat_mode: "file",
     });
 
     if (configResult.ok) {
@@ -636,35 +532,6 @@ export default function SetupWizard() {
       updateStep(currentStep, { status: "error", error: configResult.error });
     }
   };
-
-  // Auto-detect free ports when reaching the launch step
-  useEffect(() => {
-    if (steps[currentStep]?.id !== "launch") return;
-    (async () => {
-      try {
-        // Get 1 free port starting from 8300 (chattr)
-        const chattrRes = await fetch("/api/port-check/auto?start=8300&count=1");
-        const chattrData = await chattrRes.json();
-        // Get 2 free ports starting from 8200 (mcp http + sse)
-        const mcpRes = await fetch("/api/port-check/auto?start=8200&count=2");
-        const mcpData = await mcpRes.json();
-        const detected = {
-          chattr: chattrData.ports?.[0] || 8300,
-          mcpHttp: mcpData.ports?.[0] || 8200,
-          mcpSse: mcpData.ports?.[1] || 8201,
-        };
-        setAutoDetectedPorts(detected);
-        if (!customPorts.chattr) {
-          setCustomPorts(detected);
-          setCustomPortsDraft({
-            chattr: detected.chattr ? String(detected.chattr) : "",
-            mcpHttp: detected.mcpHttp ? String(detected.mcpHttp) : "",
-            mcpSse: detected.mcpSse ? String(detected.mcpSse) : "",
-          });
-        }
-      } catch {}
-    })();
-  }, [currentStep, steps]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filteredRepos = repos.filter((r) =>
     r.name.toLowerCase().includes(repoSearch.toLowerCase())
@@ -1140,67 +1007,6 @@ export default function SetupWizard() {
                       <span className="text-[11px] text-accent">{backends[agent.key] === "claude" ? "Claude Code" : "Codex"}</span>
                     </div>
                   ))}
-                </div>
-
-                {/* Advanced: Custom ports */}
-                <div className="mb-4">
-                  <label className="flex items-center gap-2 cursor-pointer mb-2">
-                    <input
-                      type="checkbox"
-                      checked={showAdvanced}
-                      onChange={(e) => setShowAdvanced(e.target.checked)}
-                      className="accent-accent"
-                    />
-                    <span className="text-[11px] text-text-muted">{t.launchStep.customPorts}</span>
-                  </label>
-                  {showAdvanced && (
-                    <div className="border border-border p-3 space-y-2">
-                      <div className="grid grid-cols-3 gap-3">
-                        <div className="flex flex-col gap-1">
-                          <label className="text-[10px] text-text-muted uppercase tracking-wider">AgentChattr port</label>
-                          <input
-                            type="number"
-                            value={customPortsDraft.chattr}
-                            onChange={(e) => setCustomPortsDraft({ ...customPortsDraft, chattr: e.target.value })}
-                            onBlur={() => commitPortDraft("chattr")}
-                            placeholder={String(autoDetectedPorts.chattr || 8300)}
-                            className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
-                          />
-                          {autoDetectedPorts.chattr > 0 && (
-                            <span className="text-[10px] text-text-muted">{t.launchStep.autoDetected(autoDetectedPorts.chattr)}</span>
-                          )}
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="text-[10px] text-text-muted uppercase tracking-wider">MCP HTTP port</label>
-                          <input
-                            type="number"
-                            value={customPortsDraft.mcpHttp}
-                            onChange={(e) => setCustomPortsDraft({ ...customPortsDraft, mcpHttp: e.target.value })}
-                            onBlur={() => commitPortDraft("mcpHttp")}
-                            placeholder={String(autoDetectedPorts.mcpHttp || 8200)}
-                            className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
-                          />
-                          {autoDetectedPorts.mcpHttp > 0 && (
-                            <span className="text-[10px] text-text-muted">{t.launchStep.autoDetected(autoDetectedPorts.mcpHttp)}</span>
-                          )}
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <label className="text-[10px] text-text-muted uppercase tracking-wider">MCP SSE port</label>
-                          <input
-                            type="number"
-                            value={customPortsDraft.mcpSse}
-                            onChange={(e) => setCustomPortsDraft({ ...customPortsDraft, mcpSse: e.target.value })}
-                            onBlur={() => commitPortDraft("mcpSse")}
-                            placeholder={String(autoDetectedPorts.mcpSse || 8201)}
-                            className="bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent"
-                          />
-                          {autoDetectedPorts.mcpSse > 0 && (
-                            <span className="text-[10px] text-text-muted">{t.launchStep.autoDetected(autoDetectedPorts.mcpSse)}</span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  )}
                 </div>
 
                 {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
