@@ -72,7 +72,7 @@ export default function DiscordSetupModal({ open, initialChannelId = "", onClose
 
         <h2 id="discord-setup-title" className="text-base font-semibold text-white">Set up your Discord Bridge</h2>
         <p className="mt-2 text-[12px] leading-relaxed text-neutral-300">
-          The bridge forwards AgentChattr messages from your project to a Discord channel, so you can read and reply from Discord.
+          The bridge forwards project chat messages to a Discord channel, so you can read and reply from Discord.
         </p>
 
         <div className="mt-4 text-[12px] text-neutral-300 space-y-3">

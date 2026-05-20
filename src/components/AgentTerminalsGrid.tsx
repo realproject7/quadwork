@@ -12,7 +12,7 @@ const COPY = {
     aboutLabel: "About agent terminals",
     tooltip: (
       <>
-        These show what each agent is doing in their CLI session. <b>Do not type here directly</b> — use the AgentChattr chat above instead. Agents won&apos;t see messages typed in their terminals.
+        These show what each agent is doing in their CLI session. <b>Do not type here directly</b> — use the project chat above instead. Agents won&apos;t see messages typed in their terminals.
       </>
     ),
     hide: "hide",
@@ -23,7 +23,7 @@ const COPY = {
     aboutLabel: "에이전트 터미널 설명",
     tooltip: (
       <>
-        각 에이전트가 CLI 세션에서 무엇을 하고 있는지 보여주는 읽기 전용 터미널입니다. <b>여기에 직접 입력하지 마세요.</b> 위의 AgentChattr 채팅을 사용해야 에이전트가 메시지를 볼 수 있습니다.
+        각 에이전트가 CLI 세션에서 무엇을 하고 있는지 보여주는 읽기 전용 터미널입니다. <b>여기에 직접 입력하지 마세요.</b> 위의 프로젝트 채팅을 사용해야 에이전트가 메시지를 볼 수 있습니다.
       </>
     ),
     hide: "접기",
@@ -65,7 +65,7 @@ interface AgentTerminalsGridProps {
  *
  * Wraps the existing TerminalGrid 2x2 with a header and a ? tooltip
  * that tells operators the terminals are read-only status mirrors —
- * real communication happens through the AgentChattr chat panel in
+ * real communication happens through the project chat panel in
  * the top-left quadrant. Without this hint, users try to type into
  * the terminals and their messages are lost to the other agents.
  */

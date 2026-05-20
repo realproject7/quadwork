@@ -11,11 +11,15 @@ const KNOWN_FIELDS = new Set([
 function convertAcRecord(record, nextId) {
   let ts;
   if (record.timestamp) {
-    ts = typeof record.timestamp === "number"
-      ? new Date(record.timestamp * 1000).toISOString()
+    const raw = Number(record.timestamp);
+    ts = !isNaN(raw) && raw > 0
+      ? new Date(raw * 1000).toISOString()
       : String(record.timestamp);
   } else if (record.ts) {
-    ts = String(record.ts);
+    const raw = Number(record.ts);
+    ts = !isNaN(raw) && raw > 0
+      ? new Date(raw * 1000).toISOString()
+      : String(record.ts);
   } else {
     ts = new Date().toISOString();
   }
