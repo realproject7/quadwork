@@ -85,6 +85,9 @@ function queuePendingWake(key, msgId, msg, session, deps) {
     _pendingSinceId.delete(key);
     cleanupDrainListener(key);
 
+    const lastSent = _lastChatSentAt.get(key);
+    if (lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS)) return;
+
     const formatted = buildDrainPrompt(session.agentId, pending.sinceId, pending.latestMsg);
     injectIntoTerm(session.term, formatted, deps);
   };
@@ -145,6 +148,9 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
     _coalesceTimers.delete(key);
     const session = agentSessions.get(key);
     if (!session || !session.term || session.state !== "running") return;
+
+    const lastSent = _lastChatSentAt.get(key);
+    if (lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS)) return;
 
     const msgs = state.messages;
     let formatted;
