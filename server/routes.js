@@ -18,6 +18,10 @@ const router = express.Router();
 // Map<projectId, Map<agentId, callbackUrl>>
 const _notifyCallbacks = new Map();
 
+// #730: PTY dispatch callback — set by index.js at startup
+let _ptyDispatchCallback = null;
+function setPtyDispatchCallback(fn) { _ptyDispatchCallback = fn; }
+
 function notifyMentionedAgents(projectId, msg) {
   const callbacks = _notifyCallbacks.get(projectId);
   if (!callbacks || !msg.mentions || msg.mentions.length === 0) return;
@@ -1177,6 +1181,7 @@ router.post("/api/chat", async (req, res) => {
     fileChat.checkLoopGuard(projectId, msg, maxHops);
     if (!fileChat.isLoopGuardPaused(projectId)) {
       notifyMentionedAgents(projectId, msg);
+      if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
     }
     return res.json({ ok: true, message: msg });
   }
@@ -4135,3 +4140,5 @@ module.exports.sendViaWebSocket = sendViaWebSocket;
 module.exports.normalizeMentions = normalizeMentions;
 // #714: expose for file-chat integration
 module.exports.getProjectChatMode = getProjectChatMode;
+// #730: PTY dispatch callback setter
+module.exports.setPtyDispatchCallback = setPtyDispatchCallback;
