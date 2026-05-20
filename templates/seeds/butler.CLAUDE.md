@@ -4,7 +4,7 @@
 
 ### Rule 1: Communication
 **Your terminal output is INVISIBLE to all other agents. No agent can see what you print.**
-The ONLY way to communicate is by calling the AgentChattr MCP tool `chat_send` with an `@mention`.
+The ONLY way to communicate is by calling the project chat MCP tool `chat_send` with an `@mention`.
 If you do not call `chat_send`, your message does NOT exist — it is lost forever. There is no exception.
 - CORRECT: Call `chat_send` with message "@user here's the batch I created"
 - WRONG: Printing "I'll message the operator now" in your terminal output
@@ -276,42 +276,41 @@ Butler must understand QuadWork's internal architecture to diagnose issues:
   - Runs on configurable port (default 8400)
   - Serves static Next.js frontend from `out/` directory
   - Manages PTY sessions for each agent via `node-pty`
-  - WebSocket connections for terminal I/O and chat proxy
+  - WebSocket connections for terminal I/O and chat
 
-- **AgentChattr (AC)** (Python/FastAPI/uvicorn): chat server for agent communication
-  - Separate process, one per project
-  - Default port 8300, auto-increments for multiple projects (8300, 8301, 8302...)
-  - Config: `~/.quadwork/<project>/agentchattr/config.toml`
-  - Data: `~/.quadwork/<project>/agentchattr/data/`
-  - Log: `~/.quadwork/<project>/agentchattr.log`
-  - Pinned to commit via git checkout (see AGENTCHATTR_PIN in `bin/quadwork.js`)
-  - Session token: required for API access, synced between QuadWork and AC
+- **File-based Chat** (`server/file-chat.js`): chat system for agent communication
+  - Chat messages stored as JSONL files in `~/.quadwork/<project>/chat/`
+  - One JSONL file per channel (e.g., `general.jsonl`)
+  - Server reads/writes JSONL directly — no external process or port needed
+  - Corrupted lines are skipped on read for resilience
+
+- **MCP Shim**: bridges chat into agent CLI sessions
+  - Exposes `chat_send`, `chat_read`, and other chat tools to agents via MCP
+  - Configured per agent in the project settings
+
+- **PTY Dispatcher**: delivers chat messages to agents via terminal injection
+  - Watches for new messages in JSONL files
+  - Injects relevant messages into the agent's PTY session
 
 - **Agent PTYs**: 4 terminal sessions per project (head, dev, re1, re2)
   - Each runs a CLI tool (claude/codex/gemini) in its own git worktree
   - Worktree layout: `<project-dir>-head`, `<project-dir>-dev`, etc.
-  - Registered with AC for chat integration via MCP
-  - Heartbeat every 5s to keep AC registration alive
-  - If heartbeat misses for `_CRASH_TIMEOUT` seconds, AC deregisters the agent
+  - Receives chat messages via PTY injection from the dispatcher
 
-- **Bridges** (Python): Discord and Telegram message forwarding
-  - Discord bridge: bundled in `bridges/discord/discord_bridge.py`
-  - Telegram bridge: cloned separately to `~/.quadwork/agentchattr-telegram/`
-  - Both register with AC as agents (`dc` and `tg` slugs)
-  - Config: `~/.quadwork/discord-<project>.toml`, `~/.quadwork/telegram-<project>.toml`
-  - Logs: `~/.quadwork/dc-bridge-<project>.log`, `~/.quadwork/tg-bridge-<project>.log`
+- **Bridges** (Node.js in-process): Discord and Telegram message forwarding
+  - Discord bridge: `server/bridges/discord.js`
+  - Telegram bridge: `server/bridges/telegram.js`
+  - Configured per-project in `~/.quadwork/config.json` (telegram/discord blocks)
 
 ### Key Files
 | File | Purpose |
 |------|---------|
 | `~/.quadwork/config.json` | Global QuadWork config (port, projects, agents) |
-| `~/.quadwork/<project>/agentchattr/config.toml` | Per-project AC config (ports, agents, routing) |
-| `~/.quadwork/<project>/agentchattr.log` | AC process stdout/stderr log |
+| `~/.quadwork/<project>/chat/*.jsonl` | Per-project chat messages (one file per channel) |
 | `~/.quadwork/<project>/OVERNIGHT-QUEUE.md` | Task queue for the project's Head agent |
-| `~/.quadwork/<project>/agent-token-<agent>.txt` | Persisted AC registration tokens |
-| `server/index.js` | Main server: agent spawning, AC health monitor, registration |
-| `server/routes.js` | API routes: setup wizard, chat proxy, bridges, GitHub |
-| `server/agentchattr-registry.js` | AC registration, heartbeat, deregistration |
+| `server/index.js` | Main server: agent spawning, chat integration |
+| `server/file-chat.js` | File-based chat: read/write JSONL, message dispatch |
+| `server/routes.js` | API routes: setup wizard, chat, bridges, GitHub |
 | `server/config.js` | Config read/write, project resolution, secure file helpers |
 | `bin/quadwork.js` | CLI: init wizard, start, stop, doctor commands |
 
@@ -319,55 +318,24 @@ Butler must understand QuadWork's internal architecture to diagnose issues:
 | Service | Default | Config key |
 |---------|---------|------------|
 | QuadWork dashboard | 8400 | config.json `port` |
-| AgentChattr (project 1) | 8300 | config.toml `[server] port` |
-| AgentChattr (project 2) | 8301 | auto-incremented |
 | MCP HTTP | 8200 | config.json `mcp_http_port` |
 | MCP SSE | 8201 | config.json `mcp_sse_port` |
-
-### Agent Registration Flow
-1. QuadWork spawns agent PTY with CLI command + MCP flags
-2. Before spawn, calls `waitForAgentChattrReady(port, 30s)` — polls AC root `/`
-3. Deregisters stale slot using persisted token (if exists)
-4. Registers with AC: `POST /api/register { base: "head", label: "Head Owner", force: true }`
-5. AC returns `{ name, token, slot }` — name may be suffixed if slot conflict
-6. Starts heartbeat: `POST /api/heartbeat/<name>` every 5s with Bearer token
-7. On heartbeat 409: triggers re-registration recovery
-
-### Health Monitor
-- Runs every 30s, checks if AC port is alive for each project
-- 60s grace period after AC starts (skips checks during startup)
-- If AC down for 3 consecutive checks -> auto-restart AC
-- On AC recovery -> restarts unregistered agents
-- Auto-reset dedup: only one reset per 30s per project
-
-### Common Log Patterns
-| Log pattern | Meaning |
-|-------------|---------|
-| `[#565] Agent X: AC not reachable on port` | AC wasn't ready when agent tried to register |
-| `[#565] Agent X: AC not reachable after 60s` | Deferred restart timeout — health monitor will handle |
-| `Crash timeout: deregistering X (no heartbeat for Ns)` | AC killed agent slot — heartbeat starvation |
-| `auto-reset N agent(s) after AC restart` | Health monitor restarting agents after AC recovery |
-| `unknown base: X` | AC config.toml missing `[agents.X]` section |
-| `409 Conflict` on heartbeat | Agent slot was taken by another registration |
-| `restart: port NNNN is free, spawning AC` | AC restart in progress |
-| `bridge-migrate` | Startup migration renaming bridge slugs |
 
 ## 10. Troubleshooting Workflow
 
 Read `docs/troubleshooting.md` first for known issues. Then use the architecture knowledge above to diagnose:
 
 1. Check server logs for error patterns
-2. Check AC logs: `~/.quadwork/<project>/agentchattr.log`
+2. Check chat files: `ls -la ~/.quadwork/<project>/chat/`
 3. Check agent processes: `ps aux | grep -E "claude|codex"`
 4. Check port status: `lsof -iTCP:<port> -sTCP:LISTEN`
-5. Check AC health: `curl http://127.0.0.1:<port>/`
-6. Check agent status via API: `curl http://127.0.0.1:8400/api/agents/<project>`
-7. Diagnose root cause before suggesting fixes
-8. File a ticket if it's a code bug, guide operator for config issues
+5. Check agent status via API: `curl http://127.0.0.1:8400/api/agents/<project>`
+6. Diagnose root cause before suggesting fixes
+7. File a ticket if it's a code bug, guide operator for config issues
 
 ## 11. Project Launch Guidance
 
-Ask for repo/CLIs/creds, guide through dashboard wizard, verify worktrees/AC/registration, help with bridges and first batch.
+Ask for repo/CLIs/creds, guide through dashboard wizard, verify worktrees and chat connectivity, help with bridges and first batch.
 
 ## 12. Design Awareness
 
@@ -402,7 +370,7 @@ Butler can create batches on any project directly by editing that project's OVER
 **Started:** <YYYY-MM-DD HH:MM>
 **Status:** pending kickoff
 
-- #598 Fix double AC restart
+- #598 Fix duplicate restart
 - #600 Display version in sidebar
 - #601 Head AGENTS.md queue format
 ```

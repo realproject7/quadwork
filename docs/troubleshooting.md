@@ -23,72 +23,59 @@ QuadWork v1.14.5+ automatically pre-trusts worktree directories for Claude-confi
 
 ---
 
-## Agent suffix proliferation (head-2, dev-2)
+## Chat file permissions
 
-**Symptom:** Agents register as `head-2`, `dev-2`, `re1-3` instead of their base names. Chat mentions break because agents look for `@head-2` instead of `@head`.
+**Symptom:** Chat messages fail to send or load. Agents report errors reading/writing chat files.
 
-**Cause:** AgentChattr assigns a numeric suffix when another session with the same base name is still registered (e.g., from a crashed process that didn't clean up).
-
-**Fix:**
-1. Stop all agents: stop the QuadWork server
-2. Restart AgentChattr (or restart QuadWork entirely)
-3. Agents will re-register with their base names
-
-QuadWork v1.15.0+ includes suffix-awareness in AGENTS.md seeds — agents will match mentions by base role name regardless of suffix.
-
----
-
-## AgentChattr not reachable on port 8300
-
-**Symptom:** Agents fail to register. Logs show connection refused to `127.0.0.1:8300`.
-
-**Cause:** AgentChattr may not have started yet, or crashed during startup.
+**Cause:** The JSONL chat files at `~/.quadwork/<project>/chat/` aren't readable or writable by the QuadWork server process.
 
 **Fix:**
-1. Check if AgentChattr is running:
+1. Check file permissions on the chat directory and its files:
    ```bash
-   curl http://127.0.0.1:8300/healthz
+   ls -la ~/.quadwork/<project>/chat/
    ```
-2. If not running, check the AgentChattr logs in the project's data directory
-3. Restart QuadWork — it will restart AgentChattr automatically
+2. Fix permissions:
+   ```bash
+   chmod 600 ~/.quadwork/<project>/chat/*.jsonl
+   ```
+3. Ensure the directory itself is accessible:
+   ```bash
+   chmod 700 ~/.quadwork/<project>/chat/
+   ```
 
 ---
 
-## Discord/Telegram bridge: 400 "unknown base: dc"
+## JSONL corruption recovery
 
-**Symptom:** Bridge shows "Running" but messages don't forward. Bridge log shows: `Initial AC registration failed: 400 Client Error` / `unknown base: dc` (or `tg`).
+**Symptom:** Chat history loads partially or shows errors. Server logs mention a JSON parse error for a chat file.
 
-**Cause:** The project's `config.toml` is missing `[agents.dc]` and/or `[agents.tg]` sections. AgentChattr validates the `base` field against `[agents.*]` keys during registration.
+**Cause:** A chat JSONL file has a corrupted line (e.g., incomplete write due to crash). The server skips corrupted lines on read, but the bad line remains in the file.
 
 **Fix:**
-1. Restart QuadWork — the startup migration (`bridge-migrate`) will add the missing sections
-2. If the bridge still fails, manually add to the project's `config.toml`:
-   ```toml
-   [agents.dc]
-   label = "Discord Bridge"
-
-   [agents.tg]
-   label = "Telegram Bridge"
+1. Backup the corrupted file:
+   ```bash
+   cp ~/.quadwork/<project>/chat/<channel>.jsonl ~/.quadwork/<project>/chat/<channel>.jsonl.bak
    ```
-3. Restart AgentChattr for the project (use the dashboard SERVER > Restart button)
-
-QuadWork v1.14.6+ includes bridge sections in config.toml for all new projects.
+2. Identify the corrupted line — the server log will reference the line number
+3. Remove the corrupted line manually (e.g., open in an editor and delete it)
+4. Restart the QuadWork server to reload the file
 
 ---
 
-## SSL certificate error on macOS Python
+## Agent not receiving messages
 
-**Symptom:** AgentChattr dependency installation fails with `ssl.SSLCertVerificationError` or `[SSL: CERTIFICATE_VERIFY_FAILED]`.
+**Symptom:** An agent doesn't respond to chat messages. Other agents can send and receive normally.
 
-**Cause:** macOS Python installations ship without root certificates configured. The system certificates are not linked to Python's `certifi` package.
+**Cause:** PTY injection isn't delivering messages to the agent process. The agent's MCP shim may not be configured, or the agent process may not be running.
 
 **Fix:**
-
-```bash
-/Applications/Python\ 3.*/Install\ Certificates.command
-```
-
-> **This requires operator input.** If the path doesn't match, check: `ls /Applications/ | grep Python`
+1. Check that the agent process is running:
+   ```bash
+   ps aux | grep -E "claude|codex|gemini"
+   ```
+2. Verify the agent's MCP shim is configured in the project's agent settings
+3. Check the agent's terminal in the QuadWork dashboard for errors
+4. Restart the agent from the dashboard if needed
 
 ---
 
@@ -137,39 +124,3 @@ chmod 440 /etc/sudoers.d/quadwork
 
 See the [VPS Installation Guide](install-vps.md#step-2-create-non-root-user-critical) for full setup.
 
----
-
-## python3-venv missing on Ubuntu
-
-**Symptom:** AgentChattr crashes on startup with `ModuleNotFoundError: No module named 'fastapi'`.
-
-**Cause:** Ubuntu 24.04 ships Python 3.12 without the `python3.12-venv` package. AgentChattr creates a venv during setup, but without this package the venv has no pip — dependencies are never installed.
-
-**Fix:**
-
-```bash
-sudo apt-get install -y python3.12-venv
-```
-
-If you already hit this error, recreate the venv:
-
-```bash
-cd ~/.quadwork/<project-id>/agentchattr
-rm -rf .venv
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
-
-Then restart QuadWork: `pm2 restart quadwork`
-
----
-
-## Duplicate TOML keys crash AgentChattr
-
-**Symptom:** AgentChattr crashes with a TOML parse error on startup.
-
-**Cause:** Manual edits to `config.toml` introduced duplicate keys (e.g., two `max_agent_hops` entries). TOML does not allow duplicate keys.
-
-**Fix:** Open the project's `config.toml` and remove the duplicate entry. Search for the key mentioned in the error message and ensure it appears only once.
-
-**Prevention:** Avoid manually editing `config.toml` fields that QuadWork's startup migrations also manage (e.g., `max_agent_hops`, `[agents.dc]`, `[agents.tg]`).
