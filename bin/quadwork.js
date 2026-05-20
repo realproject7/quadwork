@@ -2268,12 +2268,23 @@ function cmdAcRestore() {
   const projectFlagIdx = args.indexOf("--project");
   const projectFilter = projectFlagIdx >= 0 ? args[projectFlagIdx + 1] : null;
 
+  if (projectFlagIdx >= 0 && (!projectFilter || projectFilter.startsWith("--"))) {
+    warn("--project requires a project ID. Usage: npx quadwork ac-restore --project <id>");
+    process.exit(1);
+  }
+
   if (projectFilter && !projectFilter.match(/^[\w-]+$/)) {
     warn("Invalid project ID.");
     process.exit(1);
   }
 
   const config = readConfig();
+
+  if (projectFilter && !(config.projects || []).some((p) => p.id === projectFilter)) {
+    warn(`Project '${projectFilter}' not found in config.`);
+    process.exit(1);
+  }
+
   const { runAcRestore } = require("../server/ac-restore");
   runAcRestore(config, projectFilter || null);
 }
