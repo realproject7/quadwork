@@ -11,6 +11,8 @@ const os = require("os");
 
 const multer = require("multer");
 const fileChat = require("./file-chat");
+const telegramBridge = require("./bridges/telegram");
+const discordBridge = require("./bridges/discord");
 
 const router = express.Router();
 
@@ -23,6 +25,10 @@ const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const ENV_PATH = path.join(CONFIG_DIR, ".env");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+
+function isLocalhost(ip) {
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
 
 // ─── GitHub API rate limit tracking (#554) ────────────────────────────────
 // Shared rate-limit state: periodically refreshed via `gh api rate_limit`.
@@ -1140,17 +1146,17 @@ router.post("/api/chat", async (req, res) => {
   if (getProjectChatMode(projectId) === "file") {
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     if (!text) return res.status(400).json({ error: "text required" });
-    // #715: MCP shim identifies itself via X-Chat-Sender + X-Chat-Token
-    // headers. The token is generated at spawn time and validated against
-    // the in-memory registry to prevent impersonation.
     const shimSender = req.headers["x-chat-sender"];
     const shimToken = req.headers["x-chat-token"];
+    const bridgeSender = req.headers["x-bridge-sender"];
     let sender = "user";
     if (shimSender && shimToken) {
       if (!fileChat.validateShimToken(projectId, shimSender, shimToken)) {
         return res.status(403).json({ error: "Invalid shim token" });
       }
       sender = shimSender;
+    } else if (bridgeSender && isLocalhost(req.ip)) {
+      sender = bridgeSender;
     }
     const msg = fileChat.appendMessage(projectId, {
       sender,
@@ -1189,6 +1195,10 @@ router.post("/api/chat", async (req, res) => {
     operatorSender = sanitizeOperatorName(cfg.operator_name);
   } catch {
     // non-fatal — fall through to "user"
+  }
+  const bridgeSender = req.headers["x-bridge-sender"];
+  if (bridgeSender && isLocalhost(req.ip)) {
+    operatorSender = bridgeSender;
   }
   // #397 / quadwork#262: pass reply_to through to AgentChattr so the
   // dashboard's reply button mirrors AC's native threaded-reply
@@ -3254,11 +3264,8 @@ router.get("/api/telegram", async (req, res) => {
       chatId = project.telegram.chat_id;
       botUsername = project.telegram.bot_username || "";
     }
-    bridgeInstalled = fs.existsSync(path.join(BRIDGE_DIR, "telegram_bridge.py"));
+    bridgeInstalled = true;
   } catch {}
-  // Lazy-resolve bot username via Telegram getMe the first time
-  // after a token is saved. Cache it on the project entry so later
-  // requests don't hit the network.
   if (configured && !botUsername && project?.telegram?.bot_token && cfg) {
     try {
       const resolved = resolveToken(project.telegram.bot_token);
@@ -3271,24 +3278,10 @@ router.get("/api/telegram", async (req, res) => {
           try { writeConfig(cfg); } catch {}
         }
       }
-    } catch { /* non-fatal — widget will just show no username */ }
-  }
-  // #353: if the bridge is not running but a log file exists with
-  // content, tail it and expose it as `last_error` so the widget
-  // can surface runtime crashes (bad token mid-session, network
-  // failure, config parse error) that happen after the initial
-  // 500 ms post-spawn liveness check and would otherwise just
-  // revert the pill to Stopped with no explanation.
-  const running = isTelegramRunning(projectId);
-  let lastError = "";
-  if (!running) {
-    const logPath = telegramBridgeLog(projectId);
-    try {
-      if (fs.existsSync(logPath) && fs.statSync(logPath).size > 0) {
-        lastError = readLastLines(logPath, 20);
-      }
     } catch {}
   }
+  const running = telegramBridge.isRunning(projectId);
+  const lastError = running ? "" : (telegramBridge.getLastError(projectId) || "");
   res.json({
     running,
     configured,
@@ -3318,235 +3311,29 @@ router.post("/api/telegram", async (req, res) => {
       }
     }
     case "install": {
-      // #380: create a dedicated bridge venv at
-      // `<BRIDGE_DIR>/.venv` and install requirements into it using
-      // that venv's pip. All bridge subprocesses then spawn with
-      // `<BRIDGE_DIR>/.venv/bin/python3` by absolute path. See #379
-      // research ticket for the root cause — bare `python3` / `pip3`
-      // resolve to Homebrew Python on modern macOS where `requests`
-      // is not available, producing a ModuleNotFoundError on Start.
-      // Idempotent: existing installs missing a `.venv` get the venv
-      // created on top of the existing clone without re-cloning.
-      const venvDir = path.join(BRIDGE_DIR, ".venv");
-      const venvPython = path.join(venvDir, "bin", "python3");
-      const venvPip = path.join(venvDir, "bin", "pip");
-      let pipOutput = "";
-      try {
-        if (!fs.existsSync(BRIDGE_DIR)) {
-          execFileSync("gh", ["repo", "clone", "realproject7/agentchattr-telegram", BRIDGE_DIR], { encoding: "utf-8", timeout: 30000 });
-        }
-        // #444 / #470: pin to a known commit — on fresh clone AND on
-        // upgrade (existing clone may be on an older pin with stale
-        // bridge_sender defaults).
-        try {
-          execFileSync("git", ["-C", BRIDGE_DIR, "fetch", "origin"], { encoding: "utf-8", timeout: 30000 });
-          execFileSync("git", ["-C", BRIDGE_DIR, "checkout", "-B", "pinned", AGENTCHATTR_TELEGRAM_PIN], { encoding: "utf-8", timeout: 30000 });
-        } catch {
-          console.warn(`[telegram] WARNING: could not check out agentchattr-telegram pin ${AGENTCHATTR_TELEGRAM_PIN}; falling back to default branch.`);
-        }
-        // #380: create the dedicated venv if missing. `python3 -m venv`
-        // builds a fresh isolated environment that bypasses PEP 668
-        // externally-managed markers, so this works even on Homebrew
-        // Python where bare `pip3 install` would be blocked.
-        if (!fs.existsSync(venvPython)) {
-          execFileSync("python3", ["-m", "venv", venvDir], { encoding: "utf-8", timeout: 60000 });
-        }
-        pipOutput = execFileSync(
-          venvPip,
-          ["install", "-r", path.join(BRIDGE_DIR, "requirements.txt")],
-          { encoding: "utf-8", timeout: 120000 },
-        );
-      } catch (err) {
-        const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
-        return res.json({ ok: false, error: (stderr.trim() || err.message || "Install failed") });
-      }
-      const depCheck = checkTelegramBridgePythonDeps(venvPython);
-      if (!depCheck.ok) {
-        return res.json({
-          ok: false,
-          error:
-            "pip reported success but the bridge venv's Python deps still fail to import. " +
-            "This is unexpected for a freshly-created venv — check disk space and permissions " +
-            `on ${venvDir}.\n\n` +
-            `Import error: ${depCheck.error}\n\n` +
-            `pip output tail:\n${pipOutput.split("\n").slice(-10).join("\n")}`,
-        });
-      }
-      // #383 Bug 3 / #457: ensure every known project's AC config
-      // declares the `tg` agent and migrates old `telegram-bridge`
-      // slug. Restarts AC for projects whose config changed so the
-      // new slug loads immediately.
-      const patched = [];
-      try {
-        const cfgAll = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-        const serverPort = cfgAll.port || 8400;
-        for (const proj of cfgAll.projects || []) {
-          if (!proj || !proj.id) continue;
-          const acPath = projectAgentchattrConfigPath(proj.id);
-          if (!fs.existsSync(acPath)) continue;
-          try {
-            const before = fs.readFileSync(acPath, "utf-8");
-            const { text, changed } = patchAgentchattrConfigForTelegramBridge(before);
-            if (changed) {
-              fs.writeFileSync(acPath, text);
-              patched.push(proj.id);
-              // #457: restart AC so it loads the new agent slug
-              setTimeout(async () => {
-                try {
-                  await fetch(`http://127.0.0.1:${serverPort}/api/agentchattr/${encodeURIComponent(proj.id)}/restart`, {
-                    method: "POST",
-                  });
-                } catch {}
-              }, 1000);
-            }
-          } catch {}
-        }
-      } catch {}
-      return res.json({ ok: true, patched_projects: patched });
+      return res.json({ ok: true, patched_projects: [] });
     }
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      if (getProjectChatMode(projectId) === "file") {
-        return res.json({ ok: false, error: "Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead." });
-      }
-      if (isTelegramRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
-      const bridgeScript = path.join(BRIDGE_DIR, "telegram_bridge.py");
-      if (!fs.existsSync(bridgeScript)) return res.json({ ok: false, error: "Bridge not installed. Click Install Bridge first." });
-      // #380: resolve the dedicated venv's python3 by absolute path.
-      // Do NOT activate the venv or set VIRTUAL_ENV in the parent —
-      // calling the venv's python3 directly is sufficient because
-      // Python's sys.executable bootstrap resolves the venv
-      // automatically. See #379 research ticket.
-      const venvPython = path.join(BRIDGE_DIR, ".venv", "bin", "python3");
-      if (!fs.existsSync(venvPython)) {
-        return res.json({
-          ok: false,
-          error: "Bridge venv missing. Click \"Install Bridge\" to create it.",
-        });
-      }
+      if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
-      const tomlPath = telegramConfigToml(projectId);
-      // #383 Bug 2: write agentchattr_url inside [telegram]; the
-      // bridge's load_config only reads from that section.
-      const tomlContent = buildTelegramBridgeToml(tg, projectId);
-      writeSecureFile(tomlPath, tomlContent);
-      // #353: pre-flight import check so a fresh install with no
-      // `requests` module produces a readable error instead of the
-      // Start → Running → Stopped flicker that the v1 code path
-      // produced with `stdio: "ignore"`.
-      const depCheck = checkTelegramBridgePythonDeps(venvPython);
-      if (!depCheck.ok) {
-        // #372: persist the pre-flight failure to the bridge log
-        // file so the GET /api/telegram `last_error` tail picks it
-        // up on the next status poll. Without this the widget only
-        // sees the error for ~5s before the polling cycle clobbers
-        // local error state, producing the "silent fail" symptom
-        // (pill flips back to Stopped with no trace of why).
-        const msg =
-          "Bridge Python dependencies not installed in the dedicated venv. " +
-          "Click \"Install Bridge\" to (re)create the venv and install them.\n\n" +
-          `Import error: ${depCheck.error}`;
-        try {
-          fs.writeFileSync(
-            telegramBridgeLog(projectId),
-            `[${new Date().toISOString()}] pre-flight dep check failed\n${msg}\n`,
-          );
-        } catch {}
-        return res.json({ ok: false, error: msg });
-      }
-      // #353: capture stdout + stderr to a per-project log file so
-      // bridge crashes (bad token, network failure, config parse
-      // error, etc.) are recoverable. The handle must be opened
-      // BEFORE spawn and passed through stdio so the detached
-      // child keeps writing after the parent unrefs it.
-      const logPath = telegramBridgeLog(projectId);
-      // #353 follow-up: truncate the log at the start of every
-      // spawn so the status endpoint's last_error tail only ever
-      // reflects the *current* session. Otherwise a previous
-      // crash's trace would linger forever and the widget would
-      // keep surfacing a stale error even after the operator
-      // fixed the underlying problem and restarted cleanly.
-      try { fs.writeFileSync(logPath, ""); } catch {}
-      let outFd, errFd;
       try {
-        outFd = fs.openSync(logPath, "a");
-        errFd = fs.openSync(logPath, "a");
+        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        const qwPort = cfg.port || 8400;
+        telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort);
+        emitSystemMessage(projectId, "Telegram bridge connected");
+        return res.json({ ok: true, running: true });
       } catch (err) {
-        return res.json({ ok: false, error: `Could not open bridge log file: ${err.message}` });
-      }
-      let child;
-      try {
-        // #383 Bug 4: scrub TELEGRAM_*/AGENTCHATTR_URL from the child
-        // env so an operator shell that exports a different bot's
-        // token (common on machines running AC2) can't silently
-        // override the TOML. Makes the TOML the single source of
-        // truth for the bridge's identity.
-        child = spawn(venvPython, [bridgeScript, "--config", tomlPath], {
-          detached: true,
-          stdio: ["ignore", outFd, errFd],
-          env: buildTelegramBridgeSpawnEnv(process.env),
-        });
-        child.unref();
-        if (child.pid) fs.writeFileSync(telegramPidFile(projectId), String(child.pid));
-      } catch (err) {
-        try { fs.closeSync(outFd); } catch {}
-        try { fs.closeSync(errFd); } catch {}
         return res.json({ ok: false, error: err.message || "Start failed" });
       }
-      // Close our copies of the fds in the parent now that the
-      // child has inherited them — otherwise the parent holds the
-      // log file open forever.
-      try { fs.closeSync(outFd); } catch {}
-      try { fs.closeSync(errFd); } catch {}
-      // #353: liveness check — wait 500ms, then verify the child
-      // is still running. If it already died, tail the log file
-      // and return those lines as the error.
-      await new Promise((r) => setTimeout(r, 500));
-      let alive = true;
-      try { process.kill(child.pid, 0); } catch { alive = false; }
-      if (!alive) {
-        const tail = readLastLines(logPath, 20);
-        try { fs.unlinkSync(telegramPidFile(projectId)); } catch {}
-        return res.json({
-          ok: false,
-          error:
-            "Bridge crashed on start (exited within 500ms).\n\n" +
-            `Last log lines (${logPath}):\n${tail || "(log empty)"}`,
-        });
-      }
-      emitSystemMessage(projectId, "Telegram bridge connected");
-      return res.json({ ok: true, running: true, pid: child.pid });
     }
     case "stop": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      // #388: deregister the bridge from AC before killing so the slot
-      // clears immediately instead of lingering for 60s as a stale -2/-3.
-      // Awaited so a fast stop→start cycle doesn't race the deregister.
       try {
-        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-        const project = cfg.projects?.find((p) => p.id === projectId);
-        const acUrl = resolveProjectAgentchattrUrl(cfg, project);
-        if (acUrl) {
-          const acPort = new URL(acUrl).port || "8300";
-          await fetch(`http://127.0.0.1:${acPort}/api/deregister/tg`, {
-            method: "POST",
-            signal: AbortSignal.timeout(3000),
-          }).catch(() => {});
-        }
-      } catch {}
-      try {
-        const pf = telegramPidFile(projectId);
-        if (fs.existsSync(pf)) {
-          const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-          if (pid) process.kill(pid, "SIGTERM");
-          fs.unlinkSync(pf);
-        }
-        // #522: clear bridge log so last_error doesn't show stale
-        // connection-refused messages after an intentional stop.
-        try { fs.writeFileSync(telegramBridgeLog(projectId), ""); } catch {}
+        telegramBridge.stop(projectId);
         emitSystemMessage(projectId, "Telegram bridge disconnected");
         return res.json({ ok: true, running: false });
       } catch (err) {
@@ -3554,7 +3341,7 @@ router.post("/api/telegram", async (req, res) => {
       }
     }
     case "status":
-      return res.json({ running: isTelegramRunning(body.project_id || "") });
+      return res.json({ running: telegramBridge.isRunning(body.project_id || "") });
     case "save-token": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
@@ -3729,10 +3516,7 @@ router.get("/api/discord", async (req, res) => {
       channelId = project.discord.channel_id;
       botUsername = project.discord.bot_username || "";
     }
-    bridgeInstalled = fs.existsSync(path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py"));
-    // Lazy-resolve bot username via Discord's /users/@me the first time
-    // after a token is saved. Cache it on the project entry so later
-    // requests don't hit the network.
+    bridgeInstalled = true;
     if (configured && !botUsername && project?.discord?.bot_token && cfg) {
       try {
         const resolved = resolveToken(project.discord.bot_token);
@@ -3747,19 +3531,11 @@ router.get("/api/discord", async (req, res) => {
             try { writeConfig(cfg); } catch {}
           }
         }
-      } catch { /* non-fatal — widget will just show no username */ }
+      } catch {}
     }
   } catch {}
-  const running = isDiscordRunning(projectId);
-  let lastError = "";
-  if (!running) {
-    const logPath = discordBridgeLog(projectId);
-    try {
-      if (fs.existsSync(logPath) && fs.statSync(logPath).size > 0) {
-        lastError = readLastLines(logPath, 20);
-      }
-    } catch {}
-  }
+  const running = discordBridge.isRunning(projectId);
+  const lastError = running ? "" : (discordBridge.getLastError(projectId) || "");
   res.json({
     running,
     configured,
@@ -3794,175 +3570,29 @@ router.post("/api/discord", async (req, res) => {
       }
     }
     case "install": {
-      const venvDir = path.join(DISCORD_BRIDGE_DIR, ".venv");
-      const venvPython = path.join(venvDir, "bin", "python3");
-      const venvPip = path.join(venvDir, "bin", "pip");
-      let pipOutput = "";
-      try {
-        // #506: always copy bundled bridge files (not just on first install)
-        // so re-installing after a QuadWork upgrade refreshes the script.
-        if (!fs.existsSync(DISCORD_BRIDGE_DIR)) {
-          ensureSecureDir(DISCORD_BRIDGE_DIR);
-        }
-        fs.cpSync(
-          path.join(DISCORD_BRIDGE_SRC, "discord_bridge.py"),
-          path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py"),
-        );
-        fs.cpSync(
-          path.join(DISCORD_BRIDGE_SRC, "requirements.txt"),
-          path.join(DISCORD_BRIDGE_DIR, "requirements.txt"),
-        );
-        if (!fs.existsSync(venvPython)) {
-          execFileSync("python3", ["-m", "venv", venvDir], { encoding: "utf-8", timeout: 60000 });
-        }
-        pipOutput = execFileSync(
-          venvPip,
-          ["install", "-r", path.join(DISCORD_BRIDGE_DIR, "requirements.txt")],
-          { encoding: "utf-8", timeout: 120000 },
-        );
-      } catch (err) {
-        const stderr = (err && err.stderr && err.stderr.toString && err.stderr.toString()) || "";
-        return res.json({ ok: false, error: (stderr.trim() || err.message || "Install failed") });
-      }
-      const depCheck = checkDiscordBridgePythonDeps(venvPython);
-      if (!depCheck.ok) {
-        return res.json({
-          ok: false,
-          error:
-            "pip reported success but the bridge venv's Python deps still fail to import. " +
-            `Check disk space and permissions on ${venvDir}.\n\n` +
-            `Import error: ${depCheck.error}\n\n` +
-            `pip output tail:\n${pipOutput.split("\n").slice(-10).join("\n")}`,
-        });
-      }
-      // #457: Patch all project AC configs with [agents.dc] and
-      // migrate old `discord-bridge` slug. Restart AC for changed projects.
-      const patched = [];
-      try {
-        const cfgAll = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-        const serverPort = cfgAll.port || 8400;
-        for (const proj of cfgAll.projects || []) {
-          if (!proj || !proj.id) continue;
-          const acPath = projectAgentchattrConfigPath(proj.id);
-          if (!fs.existsSync(acPath)) continue;
-          try {
-            const before = fs.readFileSync(acPath, "utf-8");
-            const { text, changed } = patchAgentchattrConfigForDiscordBridge(before);
-            if (changed) {
-              fs.writeFileSync(acPath, text);
-              patched.push(proj.id);
-              // #457: restart AC so it loads the new agent slug
-              setTimeout(async () => {
-                try {
-                  await fetch(`http://127.0.0.1:${serverPort}/api/agentchattr/${encodeURIComponent(proj.id)}/restart`, {
-                    method: "POST",
-                  });
-                } catch {}
-              }, 1000);
-            }
-          } catch {}
-        }
-      } catch {}
-      return res.json({ ok: true, patched_projects: patched });
+      return res.json({ ok: true, patched_projects: [] });
     }
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      if (getProjectChatMode(projectId) === "file") {
-        return res.json({ ok: false, error: "Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead." });
-      }
-      if (isDiscordRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
-      const bridgeScript = path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py");
-      if (!fs.existsSync(bridgeScript)) return res.json({ ok: false, error: "Bridge not installed. Click Install Bridge first." });
-      const venvPython = path.join(DISCORD_BRIDGE_DIR, ".venv", "bin", "python3");
-      if (!fs.existsSync(venvPython)) {
-        return res.json({ ok: false, error: "Bridge venv missing. Click \"Install Bridge\" to create it." });
-      }
+      if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const dc = getProjectDiscord(projectId);
       if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
-      const tomlPath = discordConfigToml(projectId);
-      const tomlContent = buildDiscordBridgeToml(dc, projectId);
-      writeSecureFile(tomlPath, tomlContent);
-      const depCheck = checkDiscordBridgePythonDeps(venvPython);
-      if (!depCheck.ok) {
-        const msg =
-          "Bridge Python dependencies not installed in the dedicated venv. " +
-          "Click \"Install Bridge\" to (re)create the venv and install them.\n\n" +
-          `Import error: ${depCheck.error}`;
-        try {
-          fs.writeFileSync(
-            discordBridgeLog(projectId),
-            `[${new Date().toISOString()}] pre-flight dep check failed\n${msg}\n`,
-          );
-        } catch {}
-        return res.json({ ok: false, error: msg });
-      }
-      const logPath = discordBridgeLog(projectId);
-      try { fs.writeFileSync(logPath, ""); } catch {}
-      let outFd, errFd;
       try {
-        outFd = fs.openSync(logPath, "a");
-        errFd = fs.openSync(logPath, "a");
+        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+        const qwPort = cfg.port || 8400;
+        await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort);
+        emitSystemMessage(projectId, "Discord bridge connected");
+        return res.json({ ok: true, running: true });
       } catch (err) {
-        return res.json({ ok: false, error: `Could not open bridge log file: ${err.message}` });
-      }
-      let child;
-      try {
-        child = spawn(venvPython, [bridgeScript, "--config", tomlPath], {
-          detached: true,
-          stdio: ["ignore", outFd, errFd],
-          env: buildDiscordBridgeSpawnEnv(process.env),
-        });
-        child.unref();
-        if (child.pid) fs.writeFileSync(discordPidFile(projectId), String(child.pid));
-      } catch (err) {
-        try { fs.closeSync(outFd); } catch {}
-        try { fs.closeSync(errFd); } catch {}
         return res.json({ ok: false, error: err.message || "Start failed" });
       }
-      try { fs.closeSync(outFd); } catch {}
-      try { fs.closeSync(errFd); } catch {}
-      await new Promise((r) => setTimeout(r, 500));
-      let alive = true;
-      try { process.kill(child.pid, 0); } catch { alive = false; }
-      if (!alive) {
-        const tail = readLastLines(logPath, 20);
-        try { fs.unlinkSync(discordPidFile(projectId)); } catch {}
-        return res.json({
-          ok: false,
-          error:
-            "Bridge crashed on start (exited within 500ms).\n\n" +
-            `Last log lines (${logPath}):\n${tail || "(log empty)"}`,
-        });
-      }
-      emitSystemMessage(projectId, "Discord bridge connected");
-      return res.json({ ok: true, running: true, pid: child.pid });
     }
     case "stop": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
       try {
-        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-        const project = cfg.projects?.find((p) => p.id === projectId);
-        const acUrl = resolveProjectAgentchattrUrl(cfg, project);
-        if (acUrl) {
-          const acPort = new URL(acUrl).port || "8300";
-          await fetch(`http://127.0.0.1:${acPort}/api/deregister/dc`, {
-            method: "POST",
-            signal: AbortSignal.timeout(3000),
-          }).catch(() => {});
-        }
-      } catch {}
-      try {
-        const pf = discordPidFile(projectId);
-        if (fs.existsSync(pf)) {
-          const pid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-          if (pid) process.kill(pid, "SIGTERM");
-          fs.unlinkSync(pf);
-        }
-        // #522: clear bridge log so last_error doesn't show stale
-        // connection-refused messages after an intentional stop.
-        try { fs.writeFileSync(discordBridgeLog(projectId), ""); } catch {}
+        discordBridge.stop(projectId);
         emitSystemMessage(projectId, "Discord bridge disconnected");
         return res.json({ ok: true, running: false });
       } catch (err) {
@@ -3970,7 +3600,7 @@ router.post("/api/discord", async (req, res) => {
       }
     }
     case "status":
-      return res.json({ running: isDiscordRunning(body.project_id || "") });
+      return res.json({ running: discordBridge.isRunning(body.project_id || "") });
     case "save-config": {
       const projectId = body.project_id;
       const bot_token = typeof body.bot_token === "string" ? body.bot_token.trim() : "";

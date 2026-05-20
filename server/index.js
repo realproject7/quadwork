@@ -1817,10 +1817,6 @@ async function autoStopBridges(projectId, project, qwPort) {
 }
 
 async function autoStartBridges(projectId, project, qwPort) {
-  if (project?.chat_mode === "file") {
-    console.log(`[auto-bridge] ${projectId}: skipped (file-chat mode)`);
-    return;
-  }
   if (project?.telegram_auto) {
     try {
       // Check if already running before starting

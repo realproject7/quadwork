@@ -297,7 +297,7 @@ export default function DiscordBridgeWidget({ projectId, chatMode = "ac" }: Disc
             </InfoTooltip>
           </div>
           <div className="flex items-center gap-1.5">
-            {configured && chatMode !== "file" && (
+            {configured && (
               <button
                 type="button"
                 onClick={toggleAutoDiscord}
@@ -317,11 +317,7 @@ export default function DiscordBridgeWidget({ projectId, chatMode = "ac" }: Disc
           </div>
         </div>
         <div className="p-3 flex flex-col gap-2">
-          {chatMode === "file" ? (
-            <div className="text-[11px] text-text-muted">
-              Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead.
-            </div>
-          ) : !configured ? (
+          {!configured ? (
             <>
               <div className="flex items-center gap-2 text-[11px] text-text-muted">
                 <span className="w-1.5 h-1.5 rounded-full bg-text-muted" />
