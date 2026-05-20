@@ -249,7 +249,9 @@ function getProjectMaxHops(projectId) {
 }
 
 function getProjectChatMode(projectId) {
-  return "file";
+  const cfg = readConfigFile();
+  const project = cfg.projects?.find((p) => p.id === projectId);
+  return project?.chat_mode || "file";
 }
 
 function emitSystemMessage(projectId, text) {
@@ -2413,6 +2415,7 @@ router.post("/api/telegram", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      if (getProjectChatMode(projectId) === "file") return res.json({ ok: false, error: "Bridge is not available in file-chat mode." });
       if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
@@ -2588,6 +2591,7 @@ router.post("/api/discord", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      if (getProjectChatMode(projectId) === "file") return res.json({ ok: false, error: "Bridge is not available in file-chat mode." });
       if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const dc = getProjectDiscord(projectId);
       if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
