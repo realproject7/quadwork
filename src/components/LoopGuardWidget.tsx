@@ -53,9 +53,9 @@ interface LoopGuardWidgetProps {
  * normal autonomous PR review (head→dev→re1+re2→dev→head merge ≈ 5
  * hops). QuadWork ships with 30 by default but the operator may
  * want to tune it. The widget reads the persisted value from the
- * project's config.toml and writes back through /api/loop-guard,
- * which both rewrites config.toml and live-pushes to the running AC
- * via update_settings ws event so the change is immediate.
+ * project's config.json and writes back through /api/loop-guard,
+ * which updates config.json and live-pushes to the running server
+ * via WebSocket so the change is immediate.
  */
 export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   const { locale } = useLocale();

@@ -199,7 +199,7 @@ export default function DiscordSetupModal({ open, initialChannelId = "", onClose
                 </div>
                 <div>
                   <b className="text-white">Rate limited.</b>{" "}
-                  Normal for high-traffic channels. <code className="bg-white/5 px-0.5 rounded">discord.py</code> handles backoff automatically. If persistent, increase the AC poll interval in the bridge config.
+                  Normal for high-traffic channels. The Node bridge handles backoff automatically. If persistent, check the bridge logs for repeated 429 responses.
                 </div>
               </div>
             )}
