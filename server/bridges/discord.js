@@ -52,7 +52,7 @@ async function pollLoop(projectId, channelObj, qwPort) {
 
     for (const msg of messages) {
       if (inst.stopping) return;
-      if (msg.sender === "dc" || msg.sender === "discord-bridge") continue;
+      if (msg.sender === "dc" || msg.sender === "discord-bridge" || (msg.sender && msg.sender.startsWith("dc:"))) continue;
       if (inst.forwardedIds.has(msg.id)) continue;
 
       const text = `**${msg.sender}**: ${msg.text}`;
@@ -134,12 +134,14 @@ async function start(projectId, botToken, channelId, qwPort) {
 
     const from = message.author.username || "unknown";
     try {
-      await fetch(`http://127.0.0.1:${qwPort}/api/chat`, {
+      await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Bridge-Sender": `dc:${from}`,
+        },
         body: JSON.stringify({
-          project_id: projectId,
-          sender: `dc:${from}`,
+          project: projectId,
           text: message.content,
           channel: "general",
         }),

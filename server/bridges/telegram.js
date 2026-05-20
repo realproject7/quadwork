@@ -30,10 +30,10 @@ async function sendTelegram(botToken, chatId, text) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+    body: JSON.stringify({ chat_id: chatId, text }),
     signal: AbortSignal.timeout(10000),
   });
-  return res.ok;
+  if (!res.ok) throw new Error(`Telegram sendMessage ${res.status}`);
 }
 
 async function pollLoop(projectId, botToken, chatId, qwPort) {
@@ -51,7 +51,7 @@ async function pollLoop(projectId, botToken, chatId, qwPort) {
 
     for (const msg of messages) {
       if (inst.stopping) return;
-      if (msg.sender === "tg" || msg.sender === "telegram-bridge") continue;
+      if (msg.sender === "tg" || msg.sender === "telegram-bridge" || (msg.sender && msg.sender.startsWith("tg:"))) continue;
       if (inst.forwardedIds.has(msg.id)) continue;
 
       const text = `**${msg.sender}**: ${msg.text}`;
@@ -100,12 +100,14 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
           if (!text || msgChatId !== String(chatId)) continue;
 
           try {
-            await fetch(`http://127.0.0.1:${qwPort}/api/chat`, {
+            await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                "X-Bridge-Sender": `tg:${from}`,
+              },
               body: JSON.stringify({
-                project_id: projectId,
-                sender: `tg:${from}`,
+                project: projectId,
                 text,
                 channel: "general",
               }),

@@ -1142,17 +1142,17 @@ router.post("/api/chat", async (req, res) => {
   if (getProjectChatMode(projectId) === "file") {
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     if (!text) return res.status(400).json({ error: "text required" });
-    // #715: MCP shim identifies itself via X-Chat-Sender + X-Chat-Token
-    // headers. The token is generated at spawn time and validated against
-    // the in-memory registry to prevent impersonation.
     const shimSender = req.headers["x-chat-sender"];
     const shimToken = req.headers["x-chat-token"];
+    const bridgeSender = req.headers["x-bridge-sender"];
     let sender = "user";
     if (shimSender && shimToken) {
       if (!fileChat.validateShimToken(projectId, shimSender, shimToken)) {
         return res.status(403).json({ error: "Invalid shim token" });
       }
       sender = shimSender;
+    } else if (bridgeSender && req.ip === "127.0.0.1") {
+      sender = bridgeSender;
     }
     const msg = fileChat.appendMessage(projectId, {
       sender,
@@ -3308,9 +3308,6 @@ router.post("/api/telegram", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      if (getProjectChatMode(projectId) === "file") {
-        return res.json({ ok: false, error: "Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead." });
-      }
       if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
@@ -3570,9 +3567,6 @@ router.post("/api/discord", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      if (getProjectChatMode(projectId) === "file") {
-        return res.json({ ok: false, error: "Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead." });
-      }
       if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const dc = getProjectDiscord(projectId);
       if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
