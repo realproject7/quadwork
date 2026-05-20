@@ -161,6 +161,24 @@ process.on("exit", cleanup);
   console.log("PASS: existing general.jsonl without .migrated is skipped (Phase 1)");
 }
 
+// --- Test: AC log with only invalid lines is skipped ---
+{
+  const projectId = "test-all-invalid";
+  const acDataDir = path.join(TEST_DIR, ".quadwork", projectId, "agentchattr", "data");
+  fs.mkdirSync(acDataDir, { recursive: true });
+
+  const acContent = "not json\nalso not json\n{broken\n";
+  fs.writeFileSync(path.join(acDataDir, "agentchattr_log.jsonl"), acContent);
+
+  const result = migrateProject(projectId);
+  assert.equal(result, null, "should skip when all lines are invalid");
+
+  const chatDir = path.join(TEST_DIR, ".quadwork", projectId, "chat");
+  assert.ok(!fs.existsSync(path.join(chatDir, "general.jsonl")), "should not create general.jsonl");
+  assert.ok(!fs.existsSync(path.join(chatDir, ".migrated")), "should not create .migrated");
+  console.log("PASS: AC log with only invalid lines is skipped gracefully");
+}
+
 // --- Test: no AC log means nothing to migrate ---
 {
   const projectId = "test-new-project";

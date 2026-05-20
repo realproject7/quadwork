@@ -3035,13 +3035,19 @@ server.listen(PORT, "127.0.0.1", async () => {
     }
   }
   // #719: Migrate AC chat history to JSONL before initializing file-chat.
-  runAcMigration(startupCfg);
+  // Failed projects stay on AC mode — do not initialize file-chat for them.
+  const migrationFailed = new Set(runAcMigration(startupCfg));
 
   // #714: Initialize file-chat engine for projects with chat_mode: "file".
   // If the writer lock is held by another live process, refuse to start —
   // enforces the single-writer invariant against the "two terminals" scenario.
   for (const p of (startupCfg.projects || [])) {
     if (p.chat_mode === "file") {
+      if (migrationFailed.has(p.id)) {
+        console.error(`[startup] ${p.id}: migration failed — keeping AC mode, skipping file-chat init`);
+        p.chat_mode = "ac";
+        continue;
+      }
       try {
         fileChat.initProject(p.id);
         console.log(`[startup] ${p.id}: file-chat engine initialized`);

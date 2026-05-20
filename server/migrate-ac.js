@@ -81,6 +81,11 @@ function migrateProject(projectId) {
 
   if (converted.length === 0 && skipped === 0) return null;
 
+  if (converted.length === 0 && skipped > 0) {
+    console.log(`[migration] ${projectId}: AC log has ${skipped} lines but none are valid JSON — skipping`);
+    return null;
+  }
+
   ensureSecureDir(chatDir);
 
   const tmpPath = targetPath + ".tmp";
@@ -132,6 +137,7 @@ function migrateProject(projectId) {
 }
 
 function runAcMigration(config) {
+  const failed = [];
   const projects = config.projects || [];
   for (const project of projects) {
     if (!project || !project.id) continue;
@@ -139,8 +145,10 @@ function runAcMigration(config) {
       migrateProject(project.id);
     } catch (err) {
       console.error(`[migration] ${project.id}: failed — ${err.message}`);
+      failed.push(project.id);
     }
   }
+  return failed;
 }
 
 module.exports = { runAcMigration, migrateProject, convertAcRecord };
