@@ -10,6 +10,10 @@ function cursorPath(projectId) {
   return path.join(CONFIG_DIR, `tg-bridge-cursor-${projectId}.json`);
 }
 
+function offsetPath(projectId) {
+  return path.join(CONFIG_DIR, `tg-bridge-offset-${projectId}.json`);
+}
+
 function readCursor(projectId) {
   try {
     const data = JSON.parse(fs.readFileSync(cursorPath(projectId), "utf-8"));
@@ -22,6 +26,21 @@ function readCursor(projectId) {
 function writeCursor(projectId, sinceId) {
   try {
     fs.writeFileSync(cursorPath(projectId), JSON.stringify({ last_seen_id: sinceId }), { mode: 0o600 });
+  } catch {}
+}
+
+function readOffset(projectId) {
+  try {
+    const data = JSON.parse(fs.readFileSync(offsetPath(projectId), "utf-8"));
+    return data.offset || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeOffset(projectId, offset) {
+  try {
+    fs.writeFileSync(offsetPath(projectId), JSON.stringify({ offset }), { mode: 0o600 });
   } catch {}
 }
 
@@ -82,18 +101,22 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
   const inst = instances.get(projectId);
   if (!inst || inst.stopping) return;
 
-  let offset = 0;
+  let offset = readOffset(projectId);
+  let retryDelay = 500;
 
   async function tick() {
     if (!inst || inst.stopping) return;
     try {
-      const url = `https://api.telegram.org/bot${botToken}/getUpdates?offset=${offset}&timeout=10&allowed_updates=["message"]`;
+      const allowedUpdates = encodeURIComponent(JSON.stringify(["message"]));
+      const url = `https://api.telegram.org/bot${botToken}/getUpdates?offset=${offset}&timeout=10&allowed_updates=${allowedUpdates}`;
       const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
       if (!res.ok) throw new Error(`Telegram getUpdates ${res.status}`);
       const data = await res.json();
+      retryDelay = 500;
       if (data.ok && data.result) {
         for (const update of data.result) {
           offset = update.update_id + 1;
+          writeOffset(projectId, offset);
           const text = update.message?.text;
           const from = update.message?.from?.username || update.message?.from?.first_name || "unknown";
           const msgChatId = String(update.message?.chat?.id);
@@ -117,11 +140,14 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
         }
       }
     } catch (err) {
-      if (!inst.stopping) inst.lastError = err.message;
+      if (!inst.stopping) {
+        inst.lastError = err.message;
+        retryDelay = Math.min(retryDelay * 2, 30000);
+      }
     }
 
     if (!inst.stopping) {
-      inst.updateTimer = setTimeout(tick, 500);
+      inst.updateTimer = setTimeout(tick, retryDelay);
     }
   }
 

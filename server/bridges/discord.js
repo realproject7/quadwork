@@ -128,12 +128,12 @@ async function start(projectId, botToken, channelId, qwPort) {
   }
 
   client.on("messageCreate", async (message) => {
-    if (inst.stopping) return;
-    if (message.author.bot) return;
-    if (message.channel.id !== channelId) return;
-
-    const from = message.author.username || "unknown";
     try {
+      if (inst.stopping) return;
+      if (message.author.bot) return;
+      if (message.channel.id !== channelId) return;
+
+      const from = message.author.username || "unknown";
       await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
         method: "POST",
         headers: {
@@ -147,7 +147,9 @@ async function start(projectId, botToken, channelId, qwPort) {
         }),
         signal: AbortSignal.timeout(5000),
       });
-    } catch {}
+    } catch (err) {
+      if (!inst.stopping) inst.lastError = err.message;
+    }
   });
 
   pollLoop(projectId, channel, qwPort).catch((err) => {
