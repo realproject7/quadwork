@@ -26,6 +26,10 @@ const ENV_PATH = path.join(CONFIG_DIR, ".env");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
 
+function isLocalhost(ip) {
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
 // ─── GitHub API rate limit tracking (#554) ────────────────────────────────
 // Shared rate-limit state: periodically refreshed via `gh api rate_limit`.
 // Server-side gh calls check this before executing and back off when low.
@@ -1151,7 +1155,7 @@ router.post("/api/chat", async (req, res) => {
         return res.status(403).json({ error: "Invalid shim token" });
       }
       sender = shimSender;
-    } else if (bridgeSender && req.ip === "127.0.0.1") {
+    } else if (bridgeSender && isLocalhost(req.ip)) {
       sender = bridgeSender;
     }
     const msg = fileChat.appendMessage(projectId, {
@@ -1191,6 +1195,10 @@ router.post("/api/chat", async (req, res) => {
     operatorSender = sanitizeOperatorName(cfg.operator_name);
   } catch {
     // non-fatal — fall through to "user"
+  }
+  const bridgeSender = req.headers["x-bridge-sender"];
+  if (bridgeSender && isLocalhost(req.ip)) {
+    operatorSender = bridgeSender;
   }
   // #397 / quadwork#262: pass reply_to through to AgentChattr so the
   // dashboard's reply button mirrors AC's native threaded-reply
