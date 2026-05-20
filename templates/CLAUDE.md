@@ -1,6 +1,6 @@
 # {{project_name}} — Development Rules
 
-## Multi-Agent System (AgentChattr)
+## Multi-Agent System
 
 | Agent | Role | Can Code? | Authority |
 |-------|------|-----------|-----------|
@@ -10,7 +10,7 @@
 | Dev | Full-Stack Builder | Yes | Implementation |
 
 - **Each agent = ONE role** — escalate to Head/RE1/RE2 if task doesn't match
-- **AGENTS.md is the primary instruction set** when running as an AgentChattr agent — it overrides these rules where they conflict
+- **AGENTS.md is the primary instruction set** when running as a QuadWork agent — it overrides these rules where they conflict
 
 ## GitHub Workflow
 

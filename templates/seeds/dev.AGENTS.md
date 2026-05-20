@@ -4,7 +4,7 @@
 
 ### Rule 1: Communication
 **Your terminal output is INVISIBLE to all other agents. No agent can see what you print.**
-The ONLY way to communicate is by calling the AgentChattr MCP tool `chat_send` with an `@mention`.
+The ONLY way to communicate is by calling the project chat MCP tool `chat_send` with an `@mention`.
 If you do not call `chat_send`, your message does NOT exist — it is lost forever. There is no exception.
 - CORRECT: Call `chat_send` with message "@re1 @re2 please review PR #50"
 - WRONG: Printing "I'll notify the reviewers" in your terminal output

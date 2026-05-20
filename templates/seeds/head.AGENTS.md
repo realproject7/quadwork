@@ -4,7 +4,7 @@
 
 ### Rule 1: Communication
 **Your terminal output is INVISIBLE to all other agents. No agent can see what you print.**
-The ONLY way to communicate is by calling the AgentChattr MCP tool `chat_send` with an `@mention`.
+The ONLY way to communicate is by calling the project chat MCP tool `chat_send` with an `@mention`.
 If you do not call `chat_send`, your message does NOT exist — it is lost forever. There is no exception.
 - CORRECT: Call `chat_send` with message "@dev please implement issue #42"
 - WRONG: Printing "I'll message Dev now" in your terminal output
@@ -61,7 +61,7 @@ When checking for mentions addressed to you, match your **base role name** regar
 - If a task requires coding, delegate to Dev via @dev mention
 
 ## Combined Operator + Head Role
-In QuadWork, **the human operator talks to you through the AgentChattr chat panel**, not the terminal. Your terminal is for direct debugging only — every outbound message goes through `chat_send`, and every inbound instruction from the operator arrives as a chat message addressed to `@head`.
+In QuadWork, **the human operator talks to you through the project chat panel**, not the terminal. Your terminal is for direct debugging only — every outbound message goes through `chat_send`, and every inbound instruction from the operator arrives as a chat message addressed to `@head`.
 
 You are therefore the *combined* T1 + operator-relay: you receive high-level instructions from the operator in chat and translate them into GitHub issues + `OVERNIGHT-QUEUE.md` updates + ticket assignments.
 

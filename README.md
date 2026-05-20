@@ -11,8 +11,7 @@
   <a href="#-quick-start"><strong>Quick Start</strong></a> ·
   <a href="#-how-it-works"><strong>How it Works</strong></a> ·
   <a href="#-features"><strong>Features</strong></a> ·
-  <a href="#-external-tools"><strong>Credits</strong></a> ·
-  <a href="https://github.com/bcurts/agentchattr"><strong>Built on AgentChattr</strong></a>
+  <a href="#-external-tools"><strong>Credits</strong></a>
 </p>
 
 <p>
@@ -21,7 +20,6 @@
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platform" />
   <img src="https://img.shields.io/badge/runs-locally-00d4aa" alt="runs locally" />
   <img src="https://img.shields.io/badge/team-Head%20%C2%B7%20Dev%20%C2%B7%20RE1%20%C2%B7%20RE2-orange" alt="team: Head · Dev · RE1 · RE2" />
-  <a href="https://github.com/bcurts/agentchattr"><img src="https://img.shields.io/badge/built_on-AgentChattr-8b5cf6" alt="AgentChattr" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" /></a>
 </p>
 
@@ -103,7 +101,7 @@ npx quadwork init
 
 4. The wizard installs everything else and opens your dashboard.
 
-That's it. The wizard handles Python, GitHub CLI, AI tools, and
+That's it. The wizard handles GitHub CLI, AI tools, and
 authentication — you just follow the prompts. Subsequent runs are one
 command: `npx quadwork start`.
 
@@ -175,7 +173,7 @@ Head: merges, picks the next issue
 
 ### Workflow
 
-- 🧭 **Multi-project support** — each project has its own AgentChattr instance + isolated worktrees
+- 🧭 **Multi-project support** — each project has its own chat instance + isolated worktrees
 - 📝 **Per-project `OVERNIGHT-QUEUE.md`** with auto-incrementing batch numbers
 - 💬 **Slash commands** — `/continue`, `/clear`, `/summary`, `/poetry`, `/roastreview`
 - 🏷️ **Chat polish** — threaded replies, colored `@mentions`, short reviewer labels (RE1/RE2)
@@ -186,16 +184,15 @@ Head: merges, picks the next issue
 - 🚧 **GitHub branch protection** enforced on `main`
 - ✅ **2-of-2 reviewer approval** required before merge
 - 🛑 **Sender lockdown** — chat POSTs can't impersonate an agent (`head`, `dev`, …) from the UI
-- 🗄️ **Auto-snapshot** of chat history to `~/.quadwork/{project}/history-snapshots/` before every AgentChattr restart, with an in-dashboard **Restore** button and an optional auto-restore-on-restart opt-in
+- 🗄️ **Auto-snapshot** of chat history to `~/.quadwork/{project}/history-snapshots/` before every chat server restart, with an in-dashboard **Restore** button and an optional auto-restore-on-restart opt-in
 
 ## ─ External Tools
 
 QuadWork stands on top of some great open-source work. Explicit thanks:
 
 - **[AgentChattr](https://github.com/bcurts/agentchattr)** — by [@bcurts](https://github.com/bcurts).
-  The local chat server + MCP tooling that lets QuadWork's agents talk to
-  each other. **QuadWork would not exist without it** — huge thanks to
-  bcurts for building such a clean foundation.
+  QuadWork's file-based chat system was originally inspired by AgentChattr.
+  Thanks to bcurts for the foundational ideas.
 - **[GitHub CLI (`gh`)](https://cli.github.com)** — used by all four agents
   for issues, PRs, reviews, and merges.
 - **[Claude Code](https://github.com/anthropics/claude-code)** — Anthropic's
@@ -210,9 +207,8 @@ QuadWork stands on top of some great open-source work. Explicit thanks:
 
 ## ─ Configuration
 
-Global config lives at `~/.quadwork/config.json`. Per-project AgentChattr
-config lives at `~/.quadwork/{project_id}/agentchattr/config.toml`. The per-
-project queue lives at `~/.quadwork/{project_id}/OVERNIGHT-QUEUE.md`.
+Global config lives at `~/.quadwork/config.json`. The per-project queue
+lives at `~/.quadwork/{project_id}/OVERNIGHT-QUEUE.md`.
 
 ```json
 {
@@ -224,7 +220,6 @@ project queue lives at `~/.quadwork/{project_id}/OVERNIGHT-QUEUE.md`.
       "name": "My Project",
       "repo": "owner/repo",
       "working_dir": "/path/to/project",
-      "agentchattr_url": "http://127.0.0.1:8300",
       "mcp_http_port": 8200,
       "mcp_sse_port": 8201,
       "auto_continue_loop_guard": false,
@@ -241,7 +236,7 @@ project queue lives at `~/.quadwork/{project_id}/OVERNIGHT-QUEUE.md`.
 }
 ```
 
-Each project gets its own AgentChattr instance, ports, and git worktrees.
+Each project gets its own chat instance, MCP ports, and git worktrees.
 
 ## ─ Architecture
 
@@ -249,10 +244,10 @@ QuadWork runs as a single Express server on `127.0.0.1:8400`:
 
 - **Static frontend** — pre-built Next.js export (the `out/` directory)
 - **REST API** — agent lifecycle, config, GitHub proxy, chat proxy, triggers, loop guard, batch progress, project history
-- **WebSocket** — xterm.js terminal PTY sessions + AgentChattr ws fan-out
+- **WebSocket** — xterm.js terminal PTY sessions + chat event fan-out
 
-Per-project AgentChattr clones live at `~/.quadwork/{project}/agentchattr/`,
-each with their own ports. Per-project git worktrees sit next to the repo:
+Per-project chat data lives at `~/.quadwork/{project}/chat/`.
+Per-project git worktrees sit next to the repo:
 `{repo}-head`, `{repo}-dev`, `{repo}-re1`, `{repo}-re2`. The
 dashboard's xterm.js tiles attach to node-pty sessions over a WebSocket;
 nothing about the agent state is held client-side.
@@ -264,28 +259,19 @@ nothing about the agent state is held client-side.
 | `npx quadwork init` | One-time setup — installs prerequisites, opens the dashboard |
 | `npx quadwork start` | Start the dashboard server |
 | `npx quadwork stop` | Stop all processes |
-| `npx quadwork cleanup --project <id>` | Remove a project's AgentChattr clone and config entry |
-| `npx quadwork cleanup --legacy` | Remove the legacy `~/.quadwork/agentchattr/` install after migration |
+| `npx quadwork cleanup --project <id>` | Remove a project's data and config entry |
+| `npx quadwork cleanup --legacy` | Remove the legacy `~/.quadwork/agentchattr/` directory after migration |
 
 After `init`, create projects from the web UI at `http://127.0.0.1:8400/setup`.
 
 ### Disk usage
 
-Each project gets its own AgentChattr clone at
-`~/.quadwork/{project_id}/agentchattr/` (~77 MB per project):
+Each project stores its chat data at `~/.quadwork/{project_id}/chat/`.
+Disk usage is minimal — chat logs are plain JSON files.
 
-| Projects | Disk |
-|---------:|-----:|
-| 1 | ~77 MB |
-| 5 | ~385 MB |
-| 10 | ~770 MB |
-
-Per-project clones are necessary so multiple projects can run AgentChattr
-simultaneously without port conflicts. Existing v1 users are auto-migrated
-to per-project clones on the next `npx quadwork start`; once every project
-has a working clone, the legacy shared install can be removed safely via
-`npx quadwork cleanup --legacy` (which refuses to run if any project is
-still on the legacy install).
+Existing v1 users who had per-project AgentChattr clones can remove the
+legacy `~/.quadwork/agentchattr/` directory via
+`npx quadwork cleanup --legacy`.
 
 ## ─ Website
 

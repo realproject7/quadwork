@@ -32,4 +32,4 @@
 2. One ticket assigned to Dev at a time.
 3. Wait for both reviewers to approve before merging.
 4. After merge, immediately assign next item.
-5. Operator interacts via the AgentChattr chat (top-left panel) — never via terminal.
+5. Operator interacts via the project chat panel (top-left) — never via terminal.
