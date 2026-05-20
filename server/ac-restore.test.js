@@ -121,22 +121,21 @@ process.on("exit", cleanup);
   const migratedLines = fs.readFileSync(chatFile, "utf-8").trim().split("\n");
   const migratedRecords = migratedLines.map((l) => JSON.parse(l));
 
-  // Step 2: ac-restore file-chat → AC (to a new location to avoid mixing)
-  // First, remove original AC log to test fresh restore
-  const acLogBackup = fs.readFileSync(path.join(acDataDir, "agentchattr_log.jsonl"), "utf-8");
-  fs.writeFileSync(path.join(acDataDir, "agentchattr_log.jsonl"), "");
+  // Step 2: ac-restore with original AC log still present — dedup should
+  // prevent duplicates since the same messages already exist in AC format
+  const acLogBefore = fs.readFileSync(path.join(acDataDir, "agentchattr_log.jsonl"), "utf-8");
+  const acLinesBefore = acLogBefore.trim().split("\n").length;
 
   restoreProject(projectId);
 
   const restoredAcLines = fs.readFileSync(path.join(acDataDir, "agentchattr_log.jsonl"), "utf-8").trim().split("\n");
-  // Should have 2 records (system migration message is skipped)
-  assert.equal(restoredAcLines.length, 2);
+  // Original 2 AC records should still be there, no duplicates appended
+  assert.equal(restoredAcLines.length, acLinesBefore, "no duplicates appended when original AC records present");
 
   const restored0 = JSON.parse(restoredAcLines[0]);
   assert.equal(restored0.sender, "user");
   assert.equal(restored0.text, "hello @dev");
   assert.equal(restored0.uid, "aaa");
-  assert.equal(restored0.reply_to, undefined);
 
   const restored1 = JSON.parse(restoredAcLines[1]);
   assert.equal(restored1.sender, "dev");

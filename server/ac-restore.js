@@ -18,8 +18,13 @@ function convertToAcFormat(record) {
   return acRecord;
 }
 
+function normalizeTs(ts) {
+  if (typeof ts === "number") return new Date(ts * 1000).toISOString();
+  return String(ts || "");
+}
+
 function contentHash(record) {
-  const key = `${record.ts}|${record.sender}|${record.channel}|${record.text}`;
+  const key = `${normalizeTs(record.ts)}|${record.sender}|${record.channel}|${record.text}`;
   return crypto.createHash("sha1").update(key).digest("hex");
 }
 
