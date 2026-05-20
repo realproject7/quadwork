@@ -6,8 +6,10 @@ const {
   _coalesceTimers,
   _pendingSinceId,
   _drainListeners,
+  _lastChatSentAt,
   IDLE_THRESHOLD_MS,
   COALESCE_WINDOW_MS,
+  ACTIVE_SUPPRESSION_MS,
 } = require("./pty-dispatcher");
 
 async function runTests() {
@@ -159,6 +161,43 @@ async function runTests() {
     await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
     assert(written.length === 0, "stopped agent does not receive injection");
     cleanupSession("proj/dev");
+  }
+
+  // --- Test 10: active agent suppression — recently sent message skips injection ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    const deps = makeDeps();
+    // Simulate dev having sent a message recently
+    _lastChatSentAt.set("proj/dev", Date.now());
+    dispatchToAgentPTY("proj", makeMsg({ sender: "head", mentions: ["dev"] }), sessions, deps);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 0, "recently active agent is not injected");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 11: active suppression expires — agent receives injection after cooldown ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    const deps = makeDeps();
+    // Set lastChatSentAt to well past the suppression window
+    _lastChatSentAt.set("proj/dev", Date.now() - ACTIVE_SUPPRESSION_MS - 1000);
+    dispatchToAgentPTY("proj", makeMsg({ sender: "head", mentions: ["dev"] }), sessions, deps);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length >= 1, "agent receives injection after suppression window expires");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 12: sender's lastChatSentAt is tracked ---
+  {
+    const { sessions } = makeSessions({ lastOutputAt: 0 });
+    // Add a "head" session so the sender is recognized as an agent
+    sessions.set("proj/head", { projectId: "proj", agentId: "head", term: null, state: "stopped" });
+    const deps = makeDeps();
+    _lastChatSentAt.delete("proj/head");
+    dispatchToAgentPTY("proj", makeMsg({ sender: "head", mentions: ["dev"] }), sessions, deps);
+    assert(_lastChatSentAt.has("proj/head"), "sender's lastChatSentAt is tracked");
+    cleanupSession("proj/dev");
+    cleanupSession("proj/head");
   }
 
   // --- Test 9: cleanupSession clears all state ---
