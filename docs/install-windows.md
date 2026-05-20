@@ -49,10 +49,10 @@ nvm install 24
 nvm use 24
 ```
 
-**Python 3 + venv** (required for AgentChattr):
+**System packages:**
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv git
+sudo apt-get install -y git
 ```
 
 **GitHub CLI:**
@@ -103,4 +103,4 @@ QuadWork runs on `http://127.0.0.1:8400` by default. WSL2 shares localhost with 
 
 ## For AI Agents
 
-After WSL2 is installed by the operator: follow Steps 3–4 in this guide for prerequisites, then continue with `docs/install-mac.md` starting from the **"Install AI Coding Agents"** section. Do not run the macOS-specific prerequisite steps (Homebrew, Xcode, SSL certificates) — those are already handled by Step 3 above.
+After WSL2 is installed by the operator: follow Steps 3–4 in this guide for prerequisites, then continue with `docs/install-mac.md` starting from the **"Install AI Coding Agents"** section. Do not run the macOS-specific prerequisite steps (Homebrew, Xcode) — those are already handled by Step 3 above.

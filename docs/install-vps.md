@@ -75,10 +75,10 @@ Update local `~/.ssh/config` — change `User root` to `User quadwork`. **All su
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3.12-venv git apache2-utils
+sudo apt-get install -y git apache2-utils
 ```
 
-`python3.12-venv` is required for AgentChattr's Python venv. Without it, the venv is created without pip, and AgentChattr crashes with `ModuleNotFoundError: No module named 'fastapi'`. `apache2-utils` provides `htpasswd` (used in Step 10 for HTTP basic auth).
+`apache2-utils` provides `htpasswd` (used in Step 10 for HTTP basic auth).
 
 ---
 
@@ -148,8 +148,6 @@ Optional — pre-create config at `~/.quadwork/config.json`:
 ```json
 {
   "port": 3000,
-  "agentchattr_url": "http://127.0.0.1:8300",
-  "agentchattr_dir": "",
   "projects": []
 }
 ```
@@ -159,6 +157,20 @@ Run interactive setup:
 ```bash
 quadwork init
 ```
+
+---
+
+## Migrating from Older Versions (AgentChattr cleanup)
+
+If upgrading from a version that used AgentChattr (the separate Python/FastAPI chat service), remove its pm2 processes:
+
+```bash
+pm2 stop agentchattr-*
+pm2 delete agentchattr-*
+pm2 save
+```
+
+Chat is now file-based (JSONL + MCP shim) and no longer requires a separate service. You can also remove `agentchattr_url` and `agentchattr_dir` from `~/.quadwork/config.json` if present.
 
 ---
 
@@ -337,7 +349,7 @@ chmod 600 ~/.quadwork/.env
 1. Create Hetzner VPS (CPX32, Ubuntu 24.04, Regular Performance)
 2. SSH in as root, create `quadwork` user with sudo + SSH keys
 3. Update local SSH config to `User quadwork`
-4. Install system packages: `python3.12-venv`, `git`, `apache2-utils`
+4. Install system packages: `git`, `apache2-utils`
 5. Install nvm + Node.js 24
 6. Install GitHub CLI
 7. Install Claude Code + Codex CLI

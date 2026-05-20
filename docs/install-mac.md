@@ -10,7 +10,6 @@ Step-by-step guide for installing QuadWork on macOS. Designed for both humans an
 
 ```bash
 node --version   # Need 20+ (24 recommended)
-python3 --version # Need 3.x
 git --version
 gh --version
 ```
@@ -25,11 +24,6 @@ nvm install 24
 nvm use 24
 ```
 
-**Python 3** (via Homebrew if not already installed):
-```bash
-brew install python3
-```
-
 **Git** (included with Xcode Command Line Tools):
 ```bash
 xcode-select --install
@@ -39,18 +33,6 @@ xcode-select --install
 ```bash
 brew install gh
 ```
-
-### Fix macOS Python SSL certificates
-
-macOS Python installations often fail SSL verification. Run this once after installing Python:
-
-```bash
-/Applications/Python\ 3.*/Install\ Certificates.command
-```
-
-> **This requires operator input.** If the path doesn't match, ask the user to check their Python version: `ls /Applications/ | grep Python`
-
-Without this fix, AgentChattr's Python dependencies (fastapi, uvicorn) may fail to install with SSL errors.
 
 ### Authenticate GitHub CLI
 
@@ -132,7 +114,6 @@ quadwork start
 You should see output like:
 ```
 QuadWork dashboard: http://localhost:8400
-AgentChattr:        http://127.0.0.1:8300
 ```
 
 Open the dashboard URL in your browser to access the web UI.
@@ -152,7 +133,6 @@ Open the dashboard URL in your browser to access the web UI.
 
 QuadWork will:
 - Create worktree directories for each agent (e.g., `project-head/`, `project-dev/`, `project-re1/`, `project-re2/`)
-- Generate AgentChattr config
 - Seed AGENTS.md files for each role
 
 ---
