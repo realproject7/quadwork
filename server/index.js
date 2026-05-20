@@ -17,6 +17,7 @@ const {
 const { waitForAgentChattrReady, registerAgent, registerAgentWithRetry, deregisterAgent, startHeartbeat, stopHeartbeat } = require("./agentchattr-registry");
 const { patchAgentchattrCss, patchCrashTimeout } = require("./install-agentchattr");
 const { startQueueWatcher, stopQueueWatcher } = require("./queue-watcher");
+const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./pty-dispatcher");
 
 const net = require("net");
 const config = readConfig();
@@ -40,6 +41,14 @@ app.use(express.json({ limit: "10mb" }));
 
 // --- Mount migrated API routes (from Next.js) ---
 app.use(routes);
+
+// #730: wire PTY injection dispatcher into the chat route
+routes.setPtyDispatchCallback((projectId, msg) => {
+  dispatchToAgentPTY(projectId, msg, agentSessions, {
+    isLoopGuardPaused: fileChat.isLoopGuardPaused,
+    safeWrite,
+  });
+});
 
 const server = http.createServer(app);
 
@@ -761,6 +770,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
     term.onExit(({ exitCode }) => {
       const current = agentSessions.get(key);
       if (current && current.term === term) {
+        cleanupPtyDispatcher(key);
         current.state = "stopped";
         current.error = exitCode ? `exit:${exitCode}` : null;
         current.term = null;
@@ -812,6 +822,7 @@ async function stopAgentSession(key) {
   if (session.projectId && session.agentId && !session._suppressLifecycleMsg) {
     emitSystemMessage(session.projectId, `${session.agentId} left`);
   }
+  cleanupPtyDispatcher(key);
   if (session.term) {
     try { session.term.kill(); } catch {}
     session.term = null;
