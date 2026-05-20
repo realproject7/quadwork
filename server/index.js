@@ -3044,8 +3044,14 @@ server.listen(PORT, "127.0.0.1", async () => {
   for (const p of (startupCfg.projects || [])) {
     if (p.chat_mode === "file") {
       if (migrationFailed.has(p.id)) {
-        console.error(`[startup] ${p.id}: migration failed — keeping AC mode, skipping file-chat init`);
+        console.error(`[startup] ${p.id}: migration failed — reverting to AC mode, skipping file-chat init`);
         p.chat_mode = "ac";
+        const cfg = readConfig();
+        const entry = (cfg.projects || []).find((pr) => pr.id === p.id);
+        if (entry) {
+          entry.chat_mode = "ac";
+          writeConfig(cfg);
+        }
         continue;
       }
       try {
