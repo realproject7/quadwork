@@ -4,7 +4,7 @@ const {
   dispatchToAgentPTY,
   cleanupSession,
   _coalesceTimers,
-  _pendingSinceId,
+  _pendingWake,
   _drainListeners,
   _lastChatSentAt,
   IDLE_THRESHOLD_MS,
@@ -108,8 +108,9 @@ async function runTests() {
     // Coalesce timer is pending — wait for it
     await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
     assert(written.length >= 1, "idle agent receives injected message");
-    assert(written[0].includes("[chat @user]"), "injection has correct format");
-    assert(written[0].includes("hello @dev"), "injection contains message text");
+    assert(written[0].includes("You are @dev"), "injection includes agent identity");
+    assert(written[0].includes("chat_read"), "injection instructs agent to call chat_read");
+    assert(!written[0].includes("hello @dev"), "injection does NOT include raw message content");
     cleanupSession("proj/dev");
   }
 
@@ -120,13 +121,13 @@ async function runTests() {
     dispatchToAgentPTY("proj", makeMsg({ id: 42, text: "check PR #99" }), sessions, deps);
     await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
     assert(written.length === 0, "busy agent does not get immediate injection");
-    assert(_pendingSinceId.has("proj/dev"), "pending since_id is set for busy agent");
+    assert(_pendingWake.has("proj/dev"), "pending wake is set for busy agent");
     // Wait for fallback drain timer (IDLE_THRESHOLD_MS)
     await new Promise((r) => setTimeout(r, IDLE_THRESHOLD_MS + 100));
     assert(written.length >= 1, "fallback drain fires without further PTY output");
-    assert(written[0].includes("check PR #99"), "drain prompt includes latest message content");
-    assert(written[0].includes("since ID 41"), "drain prompt includes since_id for chat_read");
-    assert(!_pendingSinceId.has("proj/dev"), "pending state cleared after drain");
+    assert(written[0].includes("You are @dev"), "drain prompt includes agent identity");
+    assert(written[0].includes("chat_read"), "drain prompt instructs chat_read");
+    assert(!_pendingWake.has("proj/dev"), "pending wake cleared after drain");
     cleanupSession("proj/dev");
   }
 
@@ -139,7 +140,7 @@ async function runTests() {
     }
     await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
     assert(written.length >= 1, "coalesced injection fires");
-    assert(written[0].includes("5 new messages"), `coalesced injection mentions count (got: ${written[0].substring(0, 80)})`);
+    assert(written[0].includes("You are @dev"), "coalesced injection uses identity prompt");
     cleanupSession("proj/dev");
   }
 
@@ -203,10 +204,10 @@ async function runTests() {
   // --- Test 9: cleanupSession clears all state ---
   {
     _coalesceTimers.set("proj/dev", { timer: setTimeout(() => {}, 10000), messages: [] });
-    _pendingSinceId.set("proj/dev", { sinceId: 5, latestMsg: null });
+    _pendingWake.set("proj/dev", true);
     cleanupSession("proj/dev");
     assert(!_coalesceTimers.has("proj/dev"), "cleanupSession clears coalesce timer");
-    assert(!_pendingSinceId.has("proj/dev"), "cleanupSession clears pending since_id");
+    assert(!_pendingWake.has("proj/dev"), "cleanupSession clears pending wake");
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
