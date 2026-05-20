@@ -2261,6 +2261,34 @@ async function cmdMigrateAgentSlugs() {
   log("  3. Old chat messages keep their original sender — no history rewrite");
 }
 
+// ─── ac-restore ────────────────────────────────────────────────────────────
+
+function cmdAcRestore() {
+  const args = process.argv.slice(3);
+  const projectFlagIdx = args.indexOf("--project");
+  const projectFilter = projectFlagIdx >= 0 ? args[projectFlagIdx + 1] : null;
+
+  if (projectFlagIdx >= 0 && (!projectFilter || projectFilter.startsWith("--"))) {
+    warn("--project requires a project ID. Usage: npx quadwork ac-restore --project <id>");
+    process.exit(1);
+  }
+
+  if (projectFilter && !projectFilter.match(/^[\w-]+$/)) {
+    warn("Invalid project ID.");
+    process.exit(1);
+  }
+
+  const config = readConfig();
+
+  if (projectFilter && !(config.projects || []).some((p) => p.id === projectFilter)) {
+    warn(`Project '${projectFilter}' not found in config.`);
+    process.exit(1);
+  }
+
+  const { runAcRestore } = require("../server/ac-restore");
+  runAcRestore(config, projectFilter || null);
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 const command = process.argv[2];
@@ -2287,6 +2315,9 @@ switch (command) {
   case "migrate-agent-slugs":
     cmdMigrateAgentSlugs();
     break;
+  case "ac-restore":
+    cmdAcRestore();
+    break;
   case undefined: {
     // #573: No subcommand — smart default based on config state.
     // Config file exists (even with 0 projects) → start, so the user
@@ -2311,6 +2342,7 @@ switch (command) {
     cleanup       Reclaim disk space (--project <id> or --legacy)
     doctor        Report the AgentChattr pin + per-project clone SHAs
     migrate-agent-slugs  Rename reviewer1/reviewer2 → re1/re2 in existing projects
+    ac-restore           Restore file-chat JSONL back to AC format
 
   Workflow:
     1. npx quadwork init     — one-time setup (installs prerequisites)
