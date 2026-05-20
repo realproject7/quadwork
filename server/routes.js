@@ -3407,6 +3407,9 @@ router.post("/api/telegram", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      if (getProjectChatMode(projectId) === "file") {
+        return res.json({ ok: false, error: "Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead." });
+      }
       if (isTelegramRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const bridgeScript = path.join(BRIDGE_DIR, "telegram_bridge.py");
       if (!fs.existsSync(bridgeScript)) return res.json({ ok: false, error: "Bridge not installed. Click Install Bridge first." });
@@ -3865,6 +3868,9 @@ router.post("/api/discord", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      if (getProjectChatMode(projectId) === "file") {
+        return res.json({ ok: false, error: "Bridges use the new Node.js module in file-chat mode. Use the built-in bridge instead." });
+      }
       if (isDiscordRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const bridgeScript = path.join(DISCORD_BRIDGE_DIR, "discord_bridge.py");
       if (!fs.existsSync(bridgeScript)) return res.json({ ok: false, error: "Bridge not installed. Click Install Bridge first." });
