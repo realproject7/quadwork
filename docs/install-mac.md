@@ -169,7 +169,7 @@ cd /path/to/project-re2 && claude -p "echo ok"
 3. Enter your Telegram bot token and chat ID
 4. Click **Start**
 
-> **Note:** Bridge agent sections (`[agents.dc]`, `[agents.tg]`) are automatically included in config.toml for projects created on v1.14.6+. If upgrading from an older version, restart QuadWork — the startup migration will add them.
+> **Note:** Bridges are configured per-project in `~/.quadwork/config.json`. See the dashboard Telegram/Discord widgets for setup.
 
 ---
 

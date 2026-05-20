@@ -165,7 +165,7 @@ Head: merges, picks the next issue
 - 📲 **Telegram bridge** — mirror the chat to your phone for remote monitoring
 - 💬 **Discord bridge** — forward agent chat to a Discord channel for team visibility
 - 💾 **Project history export/import** — JSON snapshots of the full chat transcript
-- 🧯 **Loop Guard control** — raise the hop limit and auto-resume stuck chains without restarting AC
+- 🧯 **Loop Guard control** — raise the hop limit and auto-resume stuck chains
 - 🔔 **Notification sounds** — Web Audio chime on new agent messages with a background-only mode
 - 🎞️ **Current Batch Progress panel** — per-issue progress bars computed from live GitHub state
 - 🗂️ **Recently closed / merged feed** — so finished work doesn't disappear from the GitHub panel
@@ -184,7 +184,7 @@ Head: merges, picks the next issue
 - 🚧 **GitHub branch protection** enforced on `main`
 - ✅ **2-of-2 reviewer approval** required before merge
 - 🛑 **Sender lockdown** — chat POSTs can't impersonate an agent (`head`, `dev`, …) from the UI
-- 🗄️ **Auto-snapshot** of chat history to `~/.quadwork/{project}/history-snapshots/` before every chat server restart, with an in-dashboard **Restore** button and an optional auto-restore-on-restart opt-in
+- 🗄️ **Auto-snapshot** of chat history to `~/.quadwork/{project}/history-snapshots/` with an in-dashboard **Restore** button
 
 ## ─ External Tools
 
@@ -260,7 +260,7 @@ nothing about the agent state is held client-side.
 | `npx quadwork start` | Start the dashboard server |
 | `npx quadwork stop` | Stop all processes |
 | `npx quadwork cleanup --project <id>` | Remove a project's data and config entry |
-| `npx quadwork cleanup --legacy` | Remove the legacy `~/.quadwork/agentchattr/` directory after migration |
+| `npx quadwork cleanup --legacy` | Remove legacy pre-v2 files |
 
 After `init`, create projects from the web UI at `http://127.0.0.1:8400/setup`.
 
@@ -269,9 +269,7 @@ After `init`, create projects from the web UI at `http://127.0.0.1:8400/setup`.
 Each project stores its chat data at `~/.quadwork/{project_id}/chat/`.
 Disk usage is minimal — chat logs are plain JSON files.
 
-Existing v1 users who had per-project AgentChattr clones can remove the
-legacy `~/.quadwork/agentchattr/` directory via
-`npx quadwork cleanup --legacy`.
+Existing v1 users can remove legacy files via `npx quadwork cleanup --legacy`.
 
 ## ─ Website
 

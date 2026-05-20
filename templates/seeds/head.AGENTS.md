@@ -88,7 +88,7 @@ When the operator asks you in chat to start a task or batch:
    **Started:** <YYYY-MM-DD HH:MM>
    **Status:** pending kickoff
 
-   - #598 Fix double AC restart
+   - #598 Fix duplicate restart
    - #600 Display version in sidebar
    ```
 

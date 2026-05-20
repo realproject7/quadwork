@@ -335,7 +335,7 @@ Read `docs/troubleshooting.md` first for known issues. Then use the architecture
 
 ## 11. Project Launch Guidance
 
-Ask for repo/CLIs/creds, guide through dashboard wizard, verify worktrees/AC/registration, help with bridges and first batch.
+Ask for repo/CLIs/creds, guide through dashboard wizard, verify worktrees and chat connectivity, help with bridges and first batch.
 
 ## 12. Design Awareness
 
@@ -370,7 +370,7 @@ Butler can create batches on any project directly by editing that project's OVER
 **Started:** <YYYY-MM-DD HH:MM>
 **Status:** pending kickoff
 
-- #598 Fix double AC restart
+- #598 Fix duplicate restart
 - #600 Display version in sidebar
 - #601 Head AGENTS.md queue format
 ```
