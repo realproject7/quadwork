@@ -14,27 +14,9 @@ const fileChat = require("./file-chat");
 
 const router = express.Router();
 
-// #715: per-project notification callback registry for MCP shims.
-// Map<projectId, Map<agentId, callbackUrl>>
-const _notifyCallbacks = new Map();
-
 // #730: PTY dispatch callback — set by index.js at startup
 let _ptyDispatchCallback = null;
 function setPtyDispatchCallback(fn) { _ptyDispatchCallback = fn; }
-
-function notifyMentionedAgents(projectId, msg) {
-  const callbacks = _notifyCallbacks.get(projectId);
-  if (!callbacks || !msg.mentions || msg.mentions.length === 0) return;
-  for (const mention of msg.mentions) {
-    const url = callbacks.get(mention);
-    if (!url) continue;
-    fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: msg.id, sender: msg.sender, text: msg.text, channel: msg.channel }),
-    }).catch(() => {});
-  }
-}
 
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
@@ -1180,7 +1162,6 @@ router.post("/api/chat", async (req, res) => {
     const maxHops = getProjectMaxHops(projectId);
     fileChat.checkLoopGuard(projectId, msg, maxHops);
     if (!fileChat.isLoopGuardPaused(projectId)) {
-      notifyMentionedAgents(projectId, msg);
       if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
     }
     return res.json({ ok: true, message: msg });
@@ -1277,25 +1258,6 @@ router.post("/api/chat", async (req, res) => {
     console.warn(`[chat] send failed for project ${projectId}: ${err && err.message}`);
     return res.status(502).json({ error: "AgentChattr unreachable", detail: err && err.message });
   }
-});
-
-// #715: MCP shim notification callback registration
-const LOCALHOST_CB_RE = /^http:\/\/127\.0\.0\.1:\d+\/?$/;
-
-router.post("/api/chat/notify-register", (req, res) => {
-  const projectId = req.query.project;
-  const { agent, callback_url } = req.body || {};
-  if (!projectId || !agent || !callback_url) {
-    return res.status(400).json({ error: "project, agent, and callback_url required" });
-  }
-  if (!LOCALHOST_CB_RE.test(callback_url)) {
-    return res.status(400).json({ error: "callback_url must be http://127.0.0.1:<port>" });
-  }
-  if (!_notifyCallbacks.has(projectId)) {
-    _notifyCallbacks.set(projectId, new Map());
-  }
-  _notifyCallbacks.get(projectId).set(agent, callback_url);
-  res.json({ ok: true });
 });
 
 // ─── Image upload (#466) ──────────────────────────────────────────────────

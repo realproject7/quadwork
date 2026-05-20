@@ -115,49 +115,12 @@ async function handleToolCall(id, name, params) {
   }
 }
 
-// --- Notification callback server ---
-
-let notifyServer = null;
-let notifyPort = null;
-
-function startNotifyServer() {
-  return new Promise((resolve) => {
-    notifyServer = http.createServer((req, res) => {
-      if (req.method === "POST") {
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          try {
-            const payload = JSON.parse(body);
-            const notification = JSON.stringify({
-              jsonrpc: "2.0",
-              method: "notifications/message",
-              params: payload,
-            });
-            process.stdout.write(notification + "\n");
-          } catch {}
-          res.writeHead(200);
-          res.end("ok");
-        });
-      } else {
-        res.writeHead(405);
-        res.end();
-      }
-    });
-    notifyServer.listen(0, "127.0.0.1", () => {
-      notifyPort = notifyServer.address().port;
-      resolve(notifyPort);
-    });
-  });
-}
-
 // --- MCP stdio protocol ---
 
 async function handleMessage(msg) {
   const { id, method, params } = msg;
 
   if (method === "initialize") {
-    await startNotifyServer();
     return jsonRpc(id, {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
@@ -166,13 +129,6 @@ async function handleMessage(msg) {
   }
 
   if (method === "initialized") {
-    // Register notification callback with QuadWork
-    if (notifyPort) {
-      httpRequest("POST", `/api/chat/notify-register?project=${encodeURIComponent(PROJECT)}`, {
-        agent: AGENT,
-        callback_url: `http://127.0.0.1:${notifyPort}`,
-      }).catch(() => {});
-    }
     return null;
   }
 
@@ -211,6 +167,5 @@ rl.on("line", async (line) => {
 });
 
 rl.on("close", () => {
-  if (notifyServer) notifyServer.close();
   process.exit(0);
 });
