@@ -77,7 +77,7 @@ export default function TelegramSetupModal({ open, initialChatId = "", onClose, 
 
         <h2 id="telegram-setup-title" className="text-base font-semibold text-white">Set up your Telegram Bridge</h2>
         <p className="mt-2 text-[12px] leading-relaxed text-neutral-300">
-          The bridge forwards AgentChattr messages from your project to a Telegram chat, so you can read and reply on your phone.
+          The bridge forwards project chat messages to a Telegram chat, so you can read and reply on your phone.
         </p>
 
         <div className="mt-4 text-[12px] text-neutral-300 space-y-3">

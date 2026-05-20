@@ -9,16 +9,16 @@ const COPY = {
     title: "Loop Guard",
     tooltip: (
       <>
-        <b>Loop Guard</b> pauses agent-to-agent message chains after this many hops with no human reply. Higher values let agents work longer overnight; lower values add safety against runaway loops. AgentChattr accepts <b>4–50</b>; QuadWork defaults to <b>30</b> (about 5–6 full PR cycles). Posting any chat message yourself resets the counter immediately.
+        <b>Loop Guard</b> pauses agent-to-agent message chains after this many hops with no human reply. Higher values let agents work longer overnight; lower values add safety against runaway loops. Accepts <b>4–50</b>; QuadWork defaults to <b>30</b> (about 5–6 full PR cycles). Posting any chat message yourself resets the counter immediately.
       </>
     ),
     pauseAfter: "Pause after",
     hops: "hops",
     apply: "Apply",
     applying: "…",
-    applyTitle: "Apply (writes config.toml + live-pushes to AgentChattr)",
+    applyTitle: "Apply (saves to project config)",
     errorInteger: "Must be an integer between 4 and 50.",
-    liveUpdateFailed: "Saved to config.toml — live update failed; takes effect on next AC restart.",
+    liveUpdateFailed: "Saved — live update failed; takes effect on next restart.",
     autoContinue: "Auto-continue after pause",
     wait: "— wait",
     secondsBefore: "s before /continue",
@@ -27,16 +27,16 @@ const COPY = {
     title: "루프 가드",
     tooltip: (
       <>
-        <b>루프 가드</b> - 사람의 응답 없이 에이전트끼리 메시지를 주고받는 횟수가 이 값에 도달하면 체인을 멈춥니다. 값을 높이면 야간 작업을 더 길게 돌릴 수 있고, 낮추면 runaway loop에 대한 안전성이 높아집니다. AgentChattr 허용 범위는 <b>4-50</b>이며 QuadWork 기본값은 <b>30</b>입니다. 직접 채팅을 한 번 보내면 카운터는 즉시 초기화됩니다.
+        <b>루프 가드</b> - 사람의 응답 없이 에이전트끼리 메시지를 주고받는 횟수가 이 값에 도달하면 체인을 멈춥니다. 값을 높이면 야간 작업을 더 길게 돌릴 수 있고, 낮추면 runaway loop에 대한 안전성이 높아집니다. 허용 범위는 <b>4-50</b>이며 QuadWork 기본값은 <b>30</b>입니다. 직접 채팅을 한 번 보내면 카운터는 즉시 초기화됩니다.
       </>
     ),
     pauseAfter: "다음 횟수 후 일시정지:",
     hops: "홉",
     apply: "적용",
     applying: "…",
-    applyTitle: "적용 (config.toml에 저장하고 AgentChattr에 실시간 반영)",
+    applyTitle: "적용 (프로젝트 설정에 저장)",
     errorInteger: "4에서 50 사이의 정수여야 합니다.",
-    liveUpdateFailed: "config.toml에 저장되었습니다. 실시간 업데이트는 실패하여 다음 AC 재시작 때 적용됩니다.",
+    liveUpdateFailed: "저장되었습니다. 실시간 업데이트는 실패하여 다음 재시작 때 적용됩니다.",
     autoContinue: "일시정지 후 자동 재개",
     wait: "—",
     secondsBefore: "초 대기 후 /continue",
@@ -48,14 +48,14 @@ interface LoopGuardWidgetProps {
 }
 
 /**
- * #403 / quadwork#274: operator widget for AgentChattr's loop guard
- * (max_agent_hops). AC's default is 4, which fires mid-cycle on a
+ * #403 / quadwork#274: operator widget for the loop guard
+ * (max_agent_hops). The default is 4, which fires mid-cycle on a
  * normal autonomous PR review (head→dev→re1+re2→dev→head merge ≈ 5
  * hops). QuadWork ships with 30 by default but the operator may
  * want to tune it. The widget reads the persisted value from the
- * project's config.toml and writes back through /api/loop-guard,
- * which both rewrites config.toml and live-pushes to the running AC
- * via update_settings ws event so the change is immediate.
+ * project's config.json and writes back through /api/loop-guard,
+ * which updates config.json and live-pushes to the running server
+ * via WebSocket so the change is immediate.
  */
 export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   const { locale } = useLocale();

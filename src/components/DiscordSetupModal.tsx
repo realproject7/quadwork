@@ -72,7 +72,7 @@ export default function DiscordSetupModal({ open, initialChannelId = "", onClose
 
         <h2 id="discord-setup-title" className="text-base font-semibold text-white">Set up your Discord Bridge</h2>
         <p className="mt-2 text-[12px] leading-relaxed text-neutral-300">
-          The bridge forwards AgentChattr messages from your project to a Discord channel, so you can read and reply from Discord.
+          The bridge forwards project chat messages to a Discord channel, so you can read and reply from Discord.
         </p>
 
         <div className="mt-4 text-[12px] text-neutral-300 space-y-3">
@@ -199,7 +199,7 @@ export default function DiscordSetupModal({ open, initialChannelId = "", onClose
                 </div>
                 <div>
                   <b className="text-white">Rate limited.</b>{" "}
-                  Normal for high-traffic channels. <code className="bg-white/5 px-0.5 rounded">discord.py</code> handles backoff automatically. If persistent, increase the AC poll interval in the bridge config.
+                  Normal for high-traffic channels. The Node bridge handles backoff automatically. If persistent, check the bridge logs for repeated 429 responses.
                 </div>
               </div>
             )}

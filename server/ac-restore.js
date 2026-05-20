@@ -6,6 +6,7 @@ const { ensureSecureDir } = require("./config");
 
 function convertToAcFormat(record) {
   const acRecord = {
+    ...(record._legacy || {}),
     id: record.id,
     sender: record.sender,
     text: record.text,
@@ -13,7 +14,6 @@ function convertToAcFormat(record) {
     timestamp: record.ts,
     type: record.type,
     _quadwork_restored_id: record.id,
-    ...(record._legacy || {}),
   };
   return acRecord;
 }
