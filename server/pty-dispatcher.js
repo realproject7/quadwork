@@ -6,9 +6,13 @@
 
 const IDLE_THRESHOLD_MS = 5000;
 const COALESCE_WINDOW_MS = 1000;
+const ACTIVE_SUPPRESSION_MS = 30000;
 
 // Per-agent coalescing timers: key = "project/agent" → timeout handle
 const _coalesceTimers = new Map();
+
+// Per-agent last chat send timestamp: key = "project/agent" → epoch ms
+const _lastChatSentAt = new Map();
 
 // Per-agent pending state for drain: key = "project/agent" → { sinceId, latestMsg }
 const _pendingSinceId = new Map();
@@ -29,12 +33,22 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
   if (deps.isLoopGuardPaused(projectId)) return;
   if (!msg.mentions || msg.mentions.length === 0) return;
 
+  // Track when this sender last posted (for active-agent suppression)
+  const senderKey = `${projectId}/${msg.sender}`;
+  if (agentSessions.has(senderKey)) {
+    _lastChatSentAt.set(senderKey, Date.now());
+  }
+
   for (const agentId of msg.mentions) {
     const key = `${projectId}/${agentId}`;
     const session = agentSessions.get(key);
     if (!session || !session.term || session.state !== "running") continue;
-    // Don't inject a message back into the agent that sent it
     if (msg.sender === agentId) continue;
+
+    // #736: skip injection if agent recently sent a message — they're
+    // already active and will read chat via chat_read
+    const lastSent = _lastChatSentAt.get(key);
+    if (lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS)) continue;
 
     if (isAgentBusy(session)) {
       queuePendingWake(key, msg.id, msg, session, deps);
@@ -170,6 +184,7 @@ function cleanupSession(key) {
     _coalesceTimers.delete(key);
   }
   _pendingSinceId.delete(key);
+  _lastChatSentAt.delete(key);
   cleanupDrainListener(key);
 }
 
@@ -180,6 +195,8 @@ module.exports = {
   _coalesceTimers,
   _pendingSinceId,
   _drainListeners,
+  _lastChatSentAt,
   IDLE_THRESHOLD_MS,
   COALESCE_WINDOW_MS,
+  ACTIVE_SUPPRESSION_MS,
 };
