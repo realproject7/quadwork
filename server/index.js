@@ -2780,6 +2780,8 @@ function watchdogCheck() {
   for (const [key, session] of agentSessions) {
     if (session.state !== "running" || !session.term) continue;
     if (!session.lastOutputAt) continue;
+    // #732: skip file-chat projects — idle is normal, PTY dispatch wakes them
+    if (routes.getProjectChatMode(session.projectId) === "file") continue;
     if (Date.now() - session.lastOutputAt > WATCHDOG_TIMEOUT_MS) {
       console.log(`[watchdog] ${key}: no output for 10m — sending Ctrl+C`);
       safeWrite(session.term, "\x03");
