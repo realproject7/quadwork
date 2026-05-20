@@ -18,6 +18,7 @@ const { waitForAgentChattrReady, registerAgent, registerAgentWithRetry, deregist
 const { patchAgentchattrCss, patchCrashTimeout } = require("./install-agentchattr");
 const { startQueueWatcher, stopQueueWatcher } = require("./queue-watcher");
 const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./pty-dispatcher");
+const { runAcMigration } = require("./migrate-ac");
 
 const net = require("net");
 const config = readConfig();
@@ -3033,11 +3034,26 @@ server.listen(PORT, "127.0.0.1", async () => {
       console.log(`[startup] ${p.id}: AC already alive on port ${acPort} — tracking`);
     }
   }
+  // #719: Migrate AC chat history to JSONL before initializing file-chat.
+  // Failed projects stay on AC mode — do not initialize file-chat for them.
+  const migrationFailed = new Set(runAcMigration(startupCfg));
+
   // #714: Initialize file-chat engine for projects with chat_mode: "file".
   // If the writer lock is held by another live process, refuse to start —
   // enforces the single-writer invariant against the "two terminals" scenario.
   for (const p of (startupCfg.projects || [])) {
     if (p.chat_mode === "file") {
+      if (migrationFailed.has(p.id)) {
+        console.error(`[startup] ${p.id}: migration failed — reverting to AC mode, skipping file-chat init`);
+        p.chat_mode = "ac";
+        const cfg = readConfig();
+        const entry = (cfg.projects || []).find((pr) => pr.id === p.id);
+        if (entry) {
+          entry.chat_mode = "ac";
+          writeConfig(cfg);
+        }
+        continue;
+      }
       try {
         fileChat.initProject(p.id);
         console.log(`[startup] ${p.id}: file-chat engine initialized`);
