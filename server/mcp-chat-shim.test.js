@@ -71,10 +71,6 @@ function startTestServer() {
       res.json({ ok: true, message: msg });
     });
 
-    app.post("/api/chat/notify-register", (req, res) => {
-      res.json({ ok: true });
-    });
-
     server = app.listen(0, "127.0.0.1", () => {
       serverPort = server.address().port;
       resolve();
