@@ -197,7 +197,7 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
       .then((r) => {
         if (r.status === 403) {
           if (authRetryRef.current < 3) setAuthError(null);
-          else setAuthError("Chat authentication failed (403). Set agentchattr_token in Settings or ~/.quadwork/config.json.");
+          else setAuthError("Chat authentication failed (403). Check project chat configuration in Settings.");
           throw new Error("auth failed");
         }
         if (!r.ok) throw new Error(`Poll failed: ${r.status}`);

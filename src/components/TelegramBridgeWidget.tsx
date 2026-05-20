@@ -10,7 +10,7 @@ const COPY = {
     title: "Telegram Bridge",
     tooltip: (
       <>
-        <b>Telegram Bridge</b> forwards AgentChattr messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.
+        <b>Telegram Bridge</b> forwards project chat messages to a Telegram bot so you can monitor from your phone. Bidirectional — replies from Telegram appear in chat.
       </>
     ),
     autoOn: "Auto ON — bridge follows batch lifecycle",
@@ -34,7 +34,7 @@ const COPY = {
     title: "텔레그램 브릿지",
     tooltip: (
       <>
-        <b>텔레그램 브릿지</b> - AgentChattr 메시지를 텔레그램 봇으로 전달해서 휴대폰에서 모니터링할 수 있게 합니다. 양방향이며 텔레그램에서 보낸 답장도 채팅에 나타납니다.
+        <b>텔레그램 브릿지</b> - 프로젝트 채팅 메시지를 텔레그램 봇으로 전달해서 휴대폰에서 모니터링할 수 있게 합니다. 양방향이며 텔레그램에서 보낸 답장도 채팅에 나타납니다.
       </>
     ),
     autoOn: "자동 모드 켬 — 브릿지가 배치 주기를 따릅니다",
@@ -170,10 +170,9 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
     const patched = Array.isArray(data?.patched_projects) ? data.patched_projects : [];
     if (patched.length > 0) {
       setRestartNotice(
-        `Install Bridge patched ${patched.length} AgentChattr config(s) ` +
+        `Install Bridge patched ${patched.length} config(s) ` +
         `(${patched.join(", ")}) to declare [agents.tg]. ` +
-        `Click SERVER → Restart so AgentChattr picks up the new agent slug, ` +
-        `then click Start again. Without the restart, Start will fail with a 400 registration loop.`,
+        `Click Start to begin bridging.`,
       );
     } else {
       setRestartNotice(null);

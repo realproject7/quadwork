@@ -10,7 +10,7 @@ const COPY = {
     title: "Discord Bridge",
     tooltip: (
       <>
-        <b>Discord Bridge</b> forwards AgentChattr messages to a Discord channel so you can monitor from Discord. Bidirectional — replies from Discord appear in chat.
+        <b>Discord Bridge</b> forwards project chat messages to a Discord channel so you can monitor from Discord. Bidirectional — replies from Discord appear in chat.
       </>
     ),
     autoOn: "Auto ON — bridge follows batch lifecycle",
@@ -34,7 +34,7 @@ const COPY = {
     title: "디스코드 브릿지",
     tooltip: (
       <>
-        <b>디스코드 브릿지</b> - AgentChattr 메시지를 디스코드 채널로 전달해서 디스코드에서 모니터링할 수 있게 합니다. 양방향이며 디스코드에서 보낸 답장도 채팅에 나타납니다.
+        <b>디스코드 브릿지</b> - 프로젝트 채팅 메시지를 디스코드 채널로 전달해서 디스코드에서 모니터링할 수 있게 합니다. 양방향이며 디스코드에서 보낸 답장도 채팅에 나타납니다.
       </>
     ),
     autoOn: "자동 모드 켬 — 브릿지가 배치 주기를 따릅니다",
@@ -155,10 +155,9 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
     const patched = Array.isArray(data?.patched_projects) ? data.patched_projects : [];
     if (patched.length > 0) {
       setRestartNotice(
-        `Install Bridge patched ${patched.length} AgentChattr config(s) ` +
+        `Install Bridge patched ${patched.length} config(s) ` +
         `(${patched.join(", ")}) to declare [agents.dc]. ` +
-        `Click SERVER \u2192 Restart so AgentChattr picks up the new agent slug, ` +
-        `then click Start again. Without the restart, Start will fail with a 400 registration loop.`,
+        `Click Start to begin bridging.`,
       );
     } else {
       setRestartNotice(null);
