@@ -10,10 +10,10 @@ const COALESCE_WINDOW_MS = 1000;
 // Per-agent coalescing timers: key = "project/agent" → timeout handle
 const _coalesceTimers = new Map();
 
-// Per-agent pending since_id for drain: key = "project/agent" → oldest undelivered msg id
+// Per-agent pending state for drain: key = "project/agent" → { sinceId, latestMsg }
 const _pendingSinceId = new Map();
 
-// Per-agent drain listeners: key = "project/agent" → { disposable, timeout }
+// Per-agent drain listeners: key = "project/agent" → { disposable, timeoutHandle }
 const _drainListeners = new Map();
 
 /**
@@ -37,7 +37,7 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
     if (msg.sender === agentId) continue;
 
     if (isAgentBusy(session)) {
-      queuePendingWake(key, msg.id, session, deps);
+      queuePendingWake(key, msg.id, msg, session, deps);
       continue;
     }
 
@@ -51,34 +51,47 @@ function isAgentBusy(session) {
 
 /**
  * Queue a pending wake using high-water mark (since_id).
- * Hooks term.onData to drain after idle period.
+ * Hooks term.onData to drain after idle period, with a fallback
+ * timer so the wake fires even if no further PTY output arrives.
  */
-function queuePendingWake(key, msgId, session, deps) {
+function queuePendingWake(key, msgId, msg, session, deps) {
   const existing = _pendingSinceId.get(key);
-  if (!existing || msgId < existing) {
-    _pendingSinceId.set(key, msgId);
+  if (!existing || msgId < existing.sinceId) {
+    _pendingSinceId.set(key, { sinceId: msgId, latestMsg: msg });
+  } else {
+    existing.latestMsg = msg;
   }
+
+  const drainFn = () => {
+    const pending = _pendingSinceId.get(key);
+    if (pending == null) {
+      cleanupDrainListener(key);
+      return;
+    }
+    _pendingSinceId.delete(key);
+    cleanupDrainListener(key);
+
+    const formatted = buildDrainPrompt(session.agentId, pending.sinceId, pending.latestMsg);
+    injectIntoTerm(session.term, formatted, deps);
+  };
 
   if (_drainListeners.has(key)) return;
 
-  let idleTimeout = null;
-  const disposable = session.term.onData(() => {
-    if (idleTimeout) clearTimeout(idleTimeout);
-    idleTimeout = setTimeout(() => {
-      const sinceId = _pendingSinceId.get(key);
-      if (sinceId == null) {
-        cleanupDrainListener(key);
-        return;
-      }
-      _pendingSinceId.delete(key);
-      cleanupDrainListener(key);
+  const state = { timeoutHandle: null };
 
-      const formatted = buildDrainPrompt(session.agentId, sinceId);
-      injectIntoTerm(session.term, formatted, deps);
-    }, IDLE_THRESHOLD_MS);
+  function resetIdleTimer() {
+    if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
+    state.timeoutHandle = setTimeout(drainFn, IDLE_THRESHOLD_MS);
+  }
+
+  // Start fallback timer immediately so drain fires even without further output
+  resetIdleTimer();
+
+  const disposable = session.term.onData(() => {
+    resetIdleTimer();
   });
 
-  _drainListeners.set(key, { disposable, timeout: idleTimeout });
+  _drainListeners.set(key, { disposable, state });
 }
 
 function cleanupDrainListener(key) {
@@ -87,16 +100,19 @@ function cleanupDrainListener(key) {
   if (listener.disposable && typeof listener.disposable.dispose === "function") {
     listener.disposable.dispose();
   }
-  if (listener.timeout) clearTimeout(listener.timeout);
+  if (listener.state && listener.state.timeoutHandle) {
+    clearTimeout(listener.state.timeoutHandle);
+  }
   _drainListeners.delete(key);
 }
 
-function buildDrainPrompt(agentId, sinceId) {
+function buildDrainPrompt(agentId, sinceId, latestMsg) {
+  const content = latestMsg
+    ? `[chat @${latestMsg.sender}]: ${latestMsg.text}`
+    : `You were mentioned while busy.`;
   return (
-    `You are @${agentId} in this AgentChattr instance. ` +
-    `mcp read #general with sender: "${agentId}" — ` +
-    `look for @${agentId} mentions (NOT @claude). ` +
-    `You were mentioned while busy, take appropriate action.`
+    `${content} ` +
+    `(Messages since ID ${sinceId - 1}. Call chat_read with sender "${agentId}" to see all.)`
   );
 }
 

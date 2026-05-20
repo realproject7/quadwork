@@ -111,14 +111,20 @@ async function runTests() {
     cleanupSession("proj/dev");
   }
 
-  // --- Test 5: busy agent queues pending wake ---
+  // --- Test 5: busy agent queues pending wake, fallback timer drains it ---
   {
-    const { sessions, written, onDataCallbacks } = makeSessions({ lastOutputAt: Date.now() });
+    const { sessions, written } = makeSessions({ lastOutputAt: Date.now() });
     const deps = makeDeps();
-    dispatchToAgentPTY("proj", makeMsg({ id: 42 }), sessions, deps);
+    dispatchToAgentPTY("proj", makeMsg({ id: 42, text: "check PR #99" }), sessions, deps);
     await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
     assert(written.length === 0, "busy agent does not get immediate injection");
     assert(_pendingSinceId.has("proj/dev"), "pending since_id is set for busy agent");
+    // Wait for fallback drain timer (IDLE_THRESHOLD_MS)
+    await new Promise((r) => setTimeout(r, IDLE_THRESHOLD_MS + 100));
+    assert(written.length >= 1, "fallback drain fires without further PTY output");
+    assert(written[0].includes("check PR #99"), "drain prompt includes latest message content");
+    assert(written[0].includes("since ID 41"), "drain prompt includes since_id for chat_read");
+    assert(!_pendingSinceId.has("proj/dev"), "pending state cleared after drain");
     cleanupSession("proj/dev");
   }
 
@@ -158,7 +164,7 @@ async function runTests() {
   // --- Test 9: cleanupSession clears all state ---
   {
     _coalesceTimers.set("proj/dev", { timer: setTimeout(() => {}, 10000), messages: [] });
-    _pendingSinceId.set("proj/dev", 5);
+    _pendingSinceId.set("proj/dev", { sinceId: 5, latestMsg: null });
     cleanupSession("proj/dev");
     assert(!_coalesceTimers.has("proj/dev"), "cleanupSession clears coalesce timer");
     assert(!_pendingSinceId.has("proj/dev"), "cleanupSession clears pending since_id");
