@@ -91,6 +91,15 @@ When implementing UI/frontend changes:
 7. Push branch: `git push -u origin task/<issue>-<slug>`
 8. Open PR: `gh pr create --title "[#<issue>] ..." --body "Fixes #<issue>"`
 9. **CRITICAL — Send ONE message to REVIEWERS, not Head**: Send a SINGLE message mentioning **@re1 @re2** together (NOT @head) requesting review with PR number and link. Do NOT send two separate messages. This is your first message after receiving the assignment.
+
+   **WRONG (agents won't see this):**
+   `@head PR #78 done. Ready for RE1/RE2 review.`
+
+   **RIGHT (agents will be notified):**
+   `@re1 @re2 PR #78 is ready for review: https://github.com/... Please review and post your verdict.`
+
+   The `@` symbol is REQUIRED. Without it, reviewers are never notified. "RE1" alone does nothing — only `@re1` triggers notification.
+
 10. Address review feedback, push fixes
 11. Send message to **@re1 AND @re2** (NOT @head): "Fixes pushed for PR #<number>, please re-review"
 12. **Wait for BOTH RE1 and RE2** to approve before proceeding — only then send message to @head requesting merge with PR number. If only one has approved, wait silently for the other.
