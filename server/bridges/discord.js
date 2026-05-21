@@ -134,7 +134,11 @@ async function start(projectId, botToken, channelId, qwPort) {
       if (message.channel.id !== channelId) return;
 
       const from = message.author.username || "unknown";
-      await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
+      console.log(`[bridge] discord ${projectId}: received message from ${from}`);
+      if (!message.content) {
+        console.warn(`[bridge] discord ${projectId}: empty message content — check MESSAGE_CONTENT intent`);
+      }
+      const res = await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -147,9 +151,22 @@ async function start(projectId, botToken, channelId, qwPort) {
         }),
         signal: AbortSignal.timeout(5000),
       });
+      if (!res.ok) {
+        console.error(`[bridge] discord ${projectId} inbound POST failed: ${res.status}`);
+      }
     } catch (err) {
-      if (!inst.stopping) inst.lastError = err.message;
+      if (!inst.stopping) {
+        console.error(`[bridge] discord ${projectId} inbound error: ${err.message}`);
+        inst.lastError = err.message;
+      }
     }
+  });
+
+  client.on("error", (err) => {
+    console.error(`[bridge] discord ${projectId} client error: ${err?.message || err}`);
+  });
+  client.on("warn", (msg) => {
+    console.warn(`[bridge] discord ${projectId} client warn: ${msg}`);
   });
 
   pollLoop(projectId, channel, qwPort).catch((err) => {
