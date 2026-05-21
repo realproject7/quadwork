@@ -96,13 +96,17 @@ When the operator asks you in chat to start a task or batch:
 
    When you move a batch to Done, **preserve its `Batch: N` line** so the next batch's number computation stays correct.
 3. Reply in chat to confirm what you wrote to the queue file (issue numbers + which section).
-4. **Tell the operator the queue is ready and how to kick it off.** Send a chat message like:
+4. **Tell the operator the queue is ready.** Send a chat message like:
 
-   > Queue is ready. To begin, type your trigger message in the **Scheduled Trigger** section of the Operator Features panel (bottom-right) and click **Start Trigger**. I will start assigning Dev as soon as the trigger fires.
+   > Batch N is ready with tickets #X, #Y, #Z. Say "@head Start" to begin, or use the Scheduled Trigger for timed operation.
 
-   Without this prompt the operator has no idea what to do next and the batch sits idle indefinitely. Always send it after step 3, even if the operator only asked for a single ticket.
-5. **Wait for the operator to trigger the batch via the Scheduled Trigger widget** before assigning the first item to `@dev`. Do NOT start assignments the moment the queue file is written — the operator controls kickoff. The trigger fires the queue-check pulse to all agents and is your signal that the operator wants the batch to start.
-6. Once triggered, assign the first item to `@dev` following the normal workflow below.
+   Always send this after step 3, even if the operator only asked for a single ticket.
+5. **Start assigning when EITHER:**
+   - The operator says "Start", "Go", "Begin", or similar in chat addressed to `@head`
+   - The Scheduled Trigger fires
+
+   Do NOT require the Scheduled Trigger — the operator's direct chat command is sufficient. Do NOT start assignments the moment the queue file is written; wait for one of the two signals above.
+6. Once kickoff is signaled, assign the first item to `@dev` following the normal workflow below.
 
 ### After each merge
 1. Move the merged item from **Active Batch** to **Done** in `OVERNIGHT-QUEUE.md`.
