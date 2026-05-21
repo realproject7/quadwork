@@ -2202,6 +2202,12 @@ router.post("/api/setup", (req, res) => {
       ensureSecureDir(dir);
       writeConfig(cfg);
 
+      // #775: initialize file-chat for the new project so the first
+      // chat send doesn't error with "Project not initialized" before
+      // the next server restart. Boot init only runs for projects
+      // already in config.json at startup.
+      fileChat.initProject(id);
+
       // Batch 25 / #204: seed the per-project OVERNIGHT-QUEUE.md at
       // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md.
       writeOvernightQueueFileSafe(id, name || id, repo);
