@@ -123,7 +123,7 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
           if (!text || msgChatId !== String(chatId)) continue;
 
           try {
-            await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
+            const r = await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -136,7 +136,12 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
               }),
               signal: AbortSignal.timeout(5000),
             });
-          } catch {}
+            if (!r.ok) {
+              console.error(`[bridge] telegram ${projectId} inbound POST failed: ${r.status}`);
+            }
+          } catch (err) {
+            console.error(`[bridge] telegram ${projectId} inbound error: ${err.message}`);
+          }
         }
       }
     } catch (err) {
