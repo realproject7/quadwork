@@ -159,7 +159,7 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
   tick();
 }
 
-function start(projectId, botToken, chatId, qwPort) {
+async function start(projectId, botToken, chatId, qwPort) {
   if (instances.has(projectId)) return;
 
   const oldCursor = path.join(CONFIG_DIR, `telegram-bridge-cursor-${projectId}.json`);
@@ -178,6 +178,28 @@ function start(projectId, botToken, chatId, qwPort) {
     startedAt: Date.now(),
   };
   instances.set(projectId, inst);
+
+  // #782: on first enable (no cursor file, or cursor stuck at 0) seed the
+  // cursor to the latest chat message so we don't replay history to
+  // Telegram. Legitimate restarts with a valid cursor file resume from it.
+  const cursorFileExists = fs.existsSync(cursorPath(projectId));
+  if (!cursorFileExists || inst.cursor === 0) {
+    try {
+      const r = await fetch(
+        `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&limit=1`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (r.ok) {
+        const msgs = await r.json();
+        if (msgs.length > 0) {
+          inst.cursor = msgs[msgs.length - 1].id;
+          writeCursor(projectId, inst.cursor);
+        }
+      }
+    } catch (err) {
+      console.warn(`[bridge] telegram ${projectId}: cursor seed failed (${err.message})`);
+    }
+  }
 
   pollLoop(projectId, botToken, chatId, qwPort).catch((err) => {
     console.error(`[bridge] telegram ${projectId} poll crashed: ${err.message}`);
