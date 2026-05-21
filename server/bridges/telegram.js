@@ -6,6 +6,11 @@ const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 
 const instances = new Map();
 
+// #782: cursor-lag threshold beyond which a valid cursor is treated as
+// stale (bridge stopped mid-backlog) and reseeded to latest on start.
+// Small lags within this window keep continuity for graceful restarts.
+const STALE_CURSOR_THRESHOLD = 10;
+
 function cursorPath(projectId) {
   return path.join(CONFIG_DIR, `tg-bridge-cursor-${projectId}.json`);
 }
@@ -159,7 +164,7 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
   tick();
 }
 
-function start(projectId, botToken, chatId, qwPort) {
+async function start(projectId, botToken, chatId, qwPort) {
   if (instances.has(projectId)) return;
 
   const oldCursor = path.join(CONFIG_DIR, `telegram-bridge-cursor-${projectId}.json`);
@@ -178,6 +183,35 @@ function start(projectId, botToken, chatId, qwPort) {
     startedAt: Date.now(),
   };
   instances.set(projectId, inst);
+
+  // #782: seed cursor to latest on first enable (no cursor file, or
+  // cursor=0) AND on stale-cursor restarts where the cursor lags the
+  // latest chat message by more than STALE_CURSOR_THRESHOLD. The stale
+  // case covers bridges stopped mid-backlog so the next start does not
+  // replay old conversations to Telegram. Small lags (graceful restart
+  // mid-conversation) keep continuity.
+  const cursorFileExists = fs.existsSync(cursorPath(projectId));
+  try {
+    const r = await fetch(
+      `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&limit=1`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (r.ok) {
+      const msgs = await r.json();
+      if (msgs.length > 0) {
+        const latestId = msgs[msgs.length - 1].id;
+        const stale = !cursorFileExists
+          || inst.cursor === 0
+          || (latestId - inst.cursor) > STALE_CURSOR_THRESHOLD;
+        if (stale) {
+          inst.cursor = latestId;
+          writeCursor(projectId, inst.cursor);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[bridge] telegram ${projectId}: cursor seed failed (${err.message})`);
+  }
 
   pollLoop(projectId, botToken, chatId, qwPort).catch((err) => {
     console.error(`[bridge] telegram ${projectId} poll crashed: ${err.message}`);

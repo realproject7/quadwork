@@ -2442,7 +2442,7 @@ router.post("/api/telegram", async (req, res) => {
       try {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
-        telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort);
+        await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort);
         emitSystemMessage(projectId, "Telegram bridge connected");
         return res.json({ ok: true, running: true });
       } catch (err) {

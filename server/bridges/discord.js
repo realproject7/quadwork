@@ -6,6 +6,11 @@ const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 
 const instances = new Map();
 
+// #782: cursor-lag threshold beyond which a valid cursor is treated as
+// stale (bridge stopped mid-backlog) and reseeded to latest on start.
+// Small lags within this window keep continuity for graceful restarts.
+const STALE_CURSOR_THRESHOLD = 10;
+
 function cursorPath(projectId) {
   return path.join(CONFIG_DIR, `dc-bridge-cursor-${projectId}.json`);
 }
@@ -168,6 +173,36 @@ async function start(projectId, botToken, channelId, qwPort) {
   client.on("warn", (msg) => {
     console.warn(`[bridge] discord ${projectId} client warn: ${msg}`);
   });
+
+  // #782: seed cursor to latest on first enable (no cursor file, or
+  // cursor=0) AND on stale-cursor restarts where the cursor lags the
+  // latest chat message by more than STALE_CURSOR_THRESHOLD. The stale
+  // case covers bridges stopped mid-backlog (e.g. the plottoon scenario:
+  // cursor=83 with 127 messages — without this guard the next start
+  // replays 44 old messages to Discord). Small lags (graceful restart
+  // mid-conversation) keep continuity.
+  const cursorFileExists = fs.existsSync(cursorPath(projectId));
+  try {
+    const r = await fetch(
+      `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&limit=1`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (r.ok) {
+      const msgs = await r.json();
+      if (msgs.length > 0) {
+        const latestId = msgs[msgs.length - 1].id;
+        const stale = !cursorFileExists
+          || inst.cursor === 0
+          || (latestId - inst.cursor) > STALE_CURSOR_THRESHOLD;
+        if (stale) {
+          inst.cursor = latestId;
+          writeCursor(projectId, inst.cursor);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[bridge] discord ${projectId}: cursor seed failed (${err.message})`);
+  }
 
   pollLoop(projectId, channel, qwPort).catch((err) => {
     console.error(`[bridge] discord ${projectId} poll crashed: ${err.message}`);
