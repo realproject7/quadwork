@@ -268,11 +268,10 @@ router.get("/api/chat", (req, res) => {
     since_id: sinceId,
     limit: Number(req.query.limit) || 50,
   });
-  const normalized = messages.map((m) => ({
-    ...m,
-    time: m.time || (m.ts ? new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : ""),
-  }));
-  return res.json(normalized);
+  // #783: return raw ISO `ts` only. The previous server-side `time`
+  // field used the server's local time, which on UTC VPS hosts gave
+  // wrong-timezone display. The frontend formats `ts` in the browser.
+  return res.json(messages);
 });
 
 // #693: Auto-normalize bare agent names to @mentions in outbound messages.
@@ -891,7 +890,7 @@ router.get("/api/projects", async (req, res) => {
     }
     if (projectName) {
       recentEvents.push({
-        time: m.time,
+        ts: m.ts,
         text: m.text.length > 120 ? m.text.slice(0, 120) + "…" : m.text,
         actor: m.sender,
         projectName,

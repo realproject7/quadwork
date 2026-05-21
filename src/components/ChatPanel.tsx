@@ -13,10 +13,20 @@ interface Message {
   id: number;
   sender: string;
   text: string;
-  time: string;
+  ts: string;
   channel: string;
   type?: string;
   attachments?: Attachment[];
+}
+
+// #783: format ISO timestamp as HH:MM in the user's local timezone.
+// The server returns raw `ts` so VPS hosts (UTC) don't bake their
+// timezone into the displayed value.
+function formatLocalTime(ts: string | undefined): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 const SENDER_COLORS: Record<string, string> = {
@@ -452,7 +462,7 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
         {displayMessages.map((msg) => (
           <div key={msg.id} className="group flex gap-2 text-[12px] leading-5">
             <span className="text-text-muted shrink-0 w-12 text-right tabular-nums">
-              {msg.time?.slice(0, 5) || ""}
+              {formatLocalTime(msg.ts)}
             </span>
             <span
               className="shrink-0 font-semibold w-10 text-right"
