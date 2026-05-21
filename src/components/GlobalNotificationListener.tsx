@@ -118,7 +118,7 @@ export default function GlobalNotificationListener() {
           const hasNewAgentMessage = msgs.some(
             (m) =>
               m.id > prevCursor &&
-              (m.type === undefined || m.type === "chat") &&
+              m.type !== "system" &&
               m.sender !== "user" &&
               m.sender !== opName &&
               m.sender !== "system",
