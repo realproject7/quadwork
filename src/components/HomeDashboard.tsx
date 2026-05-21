@@ -76,10 +76,18 @@ interface Project {
 }
 
 interface ActivityEvent {
-  time: string;
+  ts: string;
   text: string;
   actor: string;
   projectName: string;
+}
+
+// #783: format ISO timestamp as HH:MM in the user's local timezone.
+function formatLocalTime(ts: string | undefined): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 function timeAgo(iso: string, t: typeof COPY["en"] | typeof COPY["ko"]): string {
@@ -281,11 +289,11 @@ export default function HomeDashboard() {
             )}
             {activity.map((item, i) => (
               <div
-                key={`${item.time}-${i}`}
+                key={`${item.ts}-${i}`}
                 className="flex gap-3 px-3 py-1.5 border-b border-border/50 last:border-b-0 text-[11px]"
               >
                 <span className="text-text-muted shrink-0 w-10 text-right tabular-nums">
-                  {item.time?.slice(0, 5) || ""}
+                  {formatLocalTime(item.ts)}
                 </span>
                 <span className="text-accent shrink-0 font-semibold w-12">
                   {item.projectName}
