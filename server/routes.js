@@ -292,7 +292,9 @@ function normalizeMentions(text) {
     (t, name) =>
       t.replace(new RegExp(`(?<![@\\w])\\b${name}\\b(?![\\w-])`, "gi"), (match, offset, str) => {
         const before = str.slice(Math.max(0, offset - 20), offset);
-        if (/[=\/]$/.test(before) || /\b(run|exec|npx|start)\s+$/i.test(before)) return match;
+        if (/[=\/]$/.test(before) || /\b(run|exec|npx|start|checkout|switch|rebase|cd|cat|ls|rm|mv|cp|mkdir)\s+$/i.test(before)) return match;
+        const after = str.slice(offset + name.length, offset + name.length + 1);
+        if (after === "/") return match;
         return `@${name}`;
       }),
     safe,
