@@ -282,10 +282,23 @@ router.get("/api/chat", (req, res) => {
 const MENTION_AGENT_NAMES = ["head", "dev", "re1", "re2"];
 function normalizeMentions(text) {
   if (typeof text !== "string" || !text) return text || "";
-  return MENTION_AGENT_NAMES.reduce(
-    (t, name) => t.replace(new RegExp(`(?<![@\\w])\\b${name}\\b(?![\\w-])`, "gi"), `@${name}`),
-    text,
+  const preserved = [];
+  const ph = "\x00CODE\x00";
+  let safe = text.replace(/```[\s\S]*?```|`[^`]+`/g, (m) => {
+    preserved.push(m);
+    return ph;
+  });
+  safe = MENTION_AGENT_NAMES.reduce(
+    (t, name) =>
+      t.replace(new RegExp(`(?<![@\\w])\\b${name}\\b(?![\\w-])`, "gi"), (match, offset, str) => {
+        const before = str.slice(Math.max(0, offset - 20), offset);
+        if (/[=\/]$/.test(before) || /\b(run|exec|npx|start)\s+$/i.test(before)) return match;
+        return `@${name}`;
+      }),
+    safe,
   );
+  let i = 0;
+  return safe.replace(new RegExp(ph, "g"), () => preserved[i++] || "");
 }
 
 router.get("/api/loop-guard", (req, res) => {
