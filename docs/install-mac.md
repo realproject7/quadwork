@@ -16,13 +16,15 @@ gh --version
 
 ### Install missing prerequisites
 
-**Node.js 20+** (via nvm — recommended):
+**Node.js 20+** (via nvm — strongly recommended):
 ```bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 source ~/.zshrc
 nvm install 24
 nvm use 24
 ```
+
+> Why nvm? The QuadWork install step below uses `npm install -g`. With a Homebrew or `.pkg` Node, global installs target `/usr/local/lib/node_modules/` and fail with `EACCES: permission denied` unless you use `sudo`. nvm puts the global prefix inside `~/.nvm/`, so `npm install -g` works without elevated permissions.
 
 **Git** (included with Xcode Command Line Tools):
 ```bash
@@ -92,6 +94,29 @@ Verify:
 quadwork --version
 # You should see the version number (e.g., 1.14.5)
 ```
+
+### Troubleshooting: `EACCES: permission denied`
+
+If you see an error like:
+
+```
+npm error code EACCES
+npm error syscall mkdir
+npm error path /usr/local/lib/node_modules/quadwork
+```
+
+your Node is installed system-wide (Homebrew or the `.pkg` installer) and the global prefix is not writable by your user. Pick one:
+
+- **Switch to nvm** (recommended) — see the [Prerequisites](#install-missing-prerequisites) section above, then re-run `npm install -g quadwork@latest`.
+- **Run once with `npx`** (no global install):
+  ```bash
+  npx quadwork@latest init
+  npx quadwork@latest start
+  ```
+- **Install with `sudo`** (not recommended — leaves root-owned files in your global `node_modules`):
+  ```bash
+  sudo npm install -g quadwork@latest
+  ```
 
 ---
 
