@@ -9,6 +9,11 @@ const instances = new Map();
 // #782: cursor-lag threshold beyond which a valid cursor is treated as
 // stale (bridge stopped mid-backlog) and reseeded to latest on start.
 // Small lags within this window keep continuity for graceful restarts.
+//
+// #786: intentional trade-off — if the bridge was down while 11+ messages
+// arrived, those messages are skipped (not replayed to Discord). This
+// prevents the "old message flood" bug. If continuity is needed for long
+// downtimes, increase this threshold or remove the stale-cursor check.
 const STALE_CURSOR_THRESHOLD = 10;
 
 function cursorPath(projectId) {
@@ -199,6 +204,10 @@ async function start(projectId, botToken, channelId, qwPort) {
           writeCursor(projectId, inst.cursor);
         }
       }
+    } else {
+      // #786: surface HTTP failures so non-OK responses don't fall
+      // through silently (the catch only fires on thrown errors).
+      console.warn(`[bridge] discord ${projectId}: cursor seed fetch returned ${r.status}`);
     }
   } catch (err) {
     console.warn(`[bridge] discord ${projectId}: cursor seed failed (${err.message})`);
