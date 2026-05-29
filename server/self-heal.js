@@ -83,16 +83,10 @@ function observeChunk(key, data, opts = {}) {
   }
 }
 
-// Drop guard state for an agent (e.g. on permanent stop).
-function clearState(key) {
-  _state.delete(key);
-}
-
 module.exports = {
   observeChunk,
   isThinkingBlock400,
   breakerMessage,
-  clearState,
   _state,
   COOLDOWN_MS,
   CIRCUIT_WINDOW_MS,
