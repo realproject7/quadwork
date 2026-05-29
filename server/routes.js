@@ -972,6 +972,9 @@ let _graphqlRefreshInFlight = false;
 
 const RECENT_FETCH_LIMIT = 20;
 const RECENT_DISPLAY_LIMIT = 5;
+// #828 P3: max state=closed pages (×100) to scan for the latest merged PRs when
+// a burst of recently-closed *unmerged* PRs pushes real merges past page 1.
+const MERGED_PAGE_CAP = 3;
 
 // ─── #806 (#805 step 1): REST + ETag GitHub state fetcher ──────────────────
 // The dashboard board was fed by `gh pr list`/`gh issue list --json
@@ -1186,20 +1189,60 @@ function buildStatusCheckRollup(checkRunsResp, statusResp) {
 // fully-assembled snapshot (never section-by-section) plus a status the file
 // writer (#807) can trust: "ok" (something changed), "unchanged" (all 304s),
 // or "error" (could not assemble any list — never stamp this as fresh).
+// #828 P3: page through state=closed (newest-updated first) until we have
+// ≥RECENT_DISPLAY_LIMIT merged PRs or hit the page cap — a burst of recently-
+// closed *unmerged* PRs could otherwise push real merges past a single page and
+// under-report "Recently merged". Page 1 is fetched in parallel with the other
+// top lists and passed in; further pages are fetched on demand only when page 1
+// is FULL (more pages may exist) AND short on merges. `fetchPage(page)` returns
+// the same { status, data } shape as ghApiConditional. Pure control flow over
+// an injected fetcher → unit-testable without network.
+async function gatherClosedPrPages(firstPage, fetchPage) {
+  const pages = [firstPage];
+  const mergedCount = (r) => (Array.isArray(r && r.data) ? r.data : []).filter((p) => p.merged_at).length;
+  let mergedSoFar = mergedCount(firstPage);
+  let lastLen = Array.isArray(firstPage && firstPage.data) ? firstPage.data.length : 0;
+  for (let page = 2; page <= MERGED_PAGE_CAP && mergedSoFar < RECENT_DISPLAY_LIMIT && lastLen === 100; page++) {
+    const r = await fetchPage(page);
+    pages.push(r);
+    mergedSoFar += mergedCount(r);
+    lastLen = Array.isArray(r && r.data) ? r.data.length : 0;
+  }
+  return pages;
+}
+
+// The latest RECENT_DISPLAY_LIMIT merged PRs across the gathered closed-PR
+// pages, newest merge first. Pure → unit-testable.
+function selectRecentMergedPrs(pages) {
+  return pages
+    .flatMap((r) => (Array.isArray(r && r.data) ? r.data : []))
+    .filter((p) => p.merged_at)
+    .sort((a, b) => (Date.parse(b && b.merged_at) || 0) - (Date.parse(a && a.merged_at) || 0))
+    .slice(0, RECENT_DISPLAY_LIMIT)
+    .map(restMergedPrToCanonical);
+}
+
 async function githubStateFetcher(repo) {
   const [owner, name] = (repo || "").split("/");
   if (!owner || !name) return { status: "error", data: null };
   const base = `repos/${owner}/${name}`;
   let changed = 0;
 
-  const [openPullsR, openIssuesR, closedIssuesR, closedPullsR] = await Promise.all([
+  const [openPullsR, openIssuesR, closedIssuesR, closedPulls1R] = await Promise.all([
     ghApiConditional(`${repo}#pulls-open`, `${base}/pulls?state=open&per_page=50&sort=updated&direction=desc`),
     ghApiConditional(`${repo}#issues-open`, `${base}/issues?state=open&per_page=50&sort=updated&direction=desc`),
     ghApiConditional(`${repo}#issues-closed`, `${base}/issues?state=closed&per_page=100&sort=updated&direction=desc`),
-    ghApiConditional(`${repo}#pulls-closed`, `${base}/pulls?state=closed&per_page=30&sort=updated&direction=desc`),
+    ghApiConditional(`${repo}#pulls-closed`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc`),
   ]);
+
+  // #828 P3: extend the closed-PR window across pages only when needed (each
+  // page conditional/ETag'd, so steady-state extra pages cost nothing on a 304).
+  const closedPullPages = await gatherClosedPrPages(closedPulls1R, (page) =>
+    ghApiConditional(`${repo}#pulls-closed-p${page}`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc&page=${page}`),
+  );
+
   let anyTopData = false;
-  for (const r of [openPullsR, openIssuesR, closedIssuesR, closedPullsR]) {
+  for (const r of [openPullsR, openIssuesR, closedIssuesR, ...closedPullPages]) {
     if (r.status === "ok") changed++;
     if (Array.isArray(r.data)) anyTopData = true;
   }
@@ -1218,11 +1261,14 @@ async function githubStateFetcher(repo) {
     .slice(0, RECENT_DISPLAY_LIMIT)
     .map(restClosedIssueToCanonical);
 
-  const mergedPrs = (Array.isArray(closedPullsR.data) ? closedPullsR.data : [])
-    .filter((p) => p.merged_at)
-    .sort((a, b) => (Date.parse(b && b.merged_at) || 0) - (Date.parse(a && a.merged_at) || 0))
-    .slice(0, RECENT_DISPLAY_LIMIT)
-    .map(restMergedPrToCanonical);
+  const mergedPrs = selectRecentMergedPrs(closedPullPages);
+
+  // #828 P1: record whether the open-PR board window is PROVABLY complete — we
+  // asked for 50 and got fewer, so we've seen EVERY open PR. progressFrom-
+  // Snapshot relies on this to classify a no-matching-PR open issue as queued
+  // without a by-number fetch; if exactly 50 came back the window may be
+  // truncated and it must NOT guess.
+  const openPrsWindowComplete = Array.isArray(openPullsR.data) && openPullsR.data.length < 50;
 
   const openPullsRaw = Array.isArray(openPullsR.data) ? openPullsR.data : [];
   const prs = await _mapLimited(openPullsRaw, GH_MAX_CONCURRENT, async (p) => {
@@ -1244,7 +1290,7 @@ async function githubStateFetcher(repo) {
 
   return {
     status: changed > 0 ? "ok" : "unchanged",
-    data: { issues, prs, closedIssues, mergedPrs },
+    data: { issues, prs, closedIssues, mergedPrs, openPrsWindowComplete },
   };
 }
 
@@ -1750,14 +1796,15 @@ function countApprovedRoles(reviews) {
 }
 
 // Compute issue `n`'s progress row from the snapshot (no network). Links
-// issue↔PR by the team's `[#<issue>]` PR-title convention, and ONLY returns a
-// row when it found a matching in-window PR — i.e. when the snapshot can prove
-// the item's actual state. It returns null otherwise (including when the issue
-// row is present but no matching PR is in the window), because a partial board
-// window can NEVER prove an issue has no linked PR — a real in_review/ready/
-// merged item could have its PR outside the window. The caller then does the
-// authoritative by-number fetch (progressForItemAsync → closedByPullRequests-
-// References). Bucket mapping is identical to progressForItemAsync.
+// issue↔PR by the team's `[#<issue>]` PR-title convention. Returns a row when
+// the snapshot can PROVE the state: a matching in-window PR (in_review/approved/
+// ready/merged), or — #828 P1 — a queued OPEN issue when the open-PR window is
+// provably complete (openPrsWindowComplete: <50 open PRs returned, so a
+// no-match means there genuinely is no open PR). Returns null otherwise (issue
+// absent, window possibly truncated, CLOSED-with-no-in-window-PR, or merged-
+// but-open), because a partial window can't prove the absence of a linked PR —
+// the caller then does the authoritative by-number REST fetch
+// (progressForItemRest). Bucket mapping is identical to progressForItemRest.
 function progressFromSnapshot(snapshot, n) {
   if (!snapshot) return null;
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
@@ -1781,9 +1828,18 @@ function progressFromSnapshot(snapshot, n) {
     if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
     return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
   }
-  // No matching PR in the board window. We can't prove the issue has no linked
-  // PR (it may be outside the window), so DON'T guess queued/closed here —
-  // return null and let the by-number fetch resolve it authoritatively.
+  // No matching PR in the board window. #828 P1: classify queued from the
+  // snapshot ONLY when the open-PR window is provably complete (we saw <50 open
+  // PRs → ALL of them). An OPEN issue with no matching open PR and no matching
+  // merged PR in-window is then genuinely queued — return the row here, NO
+  // GraphQL/network. A CLOSED issue (closed-no-PR vs merged-out-of-window) or a
+  // merged-but-open edge stays null so the by-number REST fetch resolves it; if
+  // the window may be truncated (≥50 open PRs) we never guess.
+  if (snapshot.openPrsWindowComplete && openIssue && !mergedPr) {
+    return buildNoPrRow({ number: n, title: openIssue.title, state: "OPEN", url: openIssue.url });
+  }
+  // Can't prove the issue has no linked PR (window truncated / issue absent) —
+  // return null and let the by-number REST fetch resolve it authoritatively.
   return null;
 }
 
@@ -1794,13 +1850,22 @@ function progressFromSnapshot(snapshot, n) {
 // complete=false — so neither can confirm on its own. Consumers (server
 // auto-stop) gate stopTrigger/bridge-stop on the confirmed signal, never a
 // single transient `complete`.
-const _batchCompleteState = new Map(); // projectId -> { ts, confirmed }
-function evalBatchCompleteConfirmed(projectId, complete, generatedAt) {
-  if (!complete) { _batchCompleteState.set(projectId, { ts: null, confirmed: false }); return false; }
-  const st = _batchCompleteState.get(projectId) || { ts: null, confirmed: false };
+const _batchCompleteState = new Map(); // projectId -> { batchKey, ts, confirmed }
+// #828 P2: confirmation is BATCH-scoped, not just project-scoped. `batchKey`
+// identifies the batch (its number + issue set); when it changes, the streak
+// resets so a brand-new already-complete batch can never inherit the prior
+// batch's first cycle and confirm in a single tick (premature auto-stop). A new
+// batch must earn its own two distinct successful cycles.
+function evalBatchCompleteConfirmed(projectId, batchKey, complete, generatedAt) {
+  let st = _batchCompleteState.get(projectId);
+  if (!st || st.batchKey !== batchKey) {
+    st = { batchKey, ts: null, confirmed: false };
+    _batchCompleteState.set(projectId, st);
+  }
+  if (!complete) { st.ts = null; st.confirmed = false; return false; }
   if (generatedAt == null) return st.confirmed;          // inconclusive cycle — no advance
-  if (st.ts == null) { _batchCompleteState.set(projectId, { ts: generatedAt, confirmed: false }); return false; }
-  if (generatedAt !== st.ts) { _batchCompleteState.set(projectId, { ts: generatedAt, confirmed: true }); return true; }
+  if (st.ts == null) { st.ts = generatedAt; st.confirmed = false; return false; }
+  if (generatedAt !== st.ts) { st.ts = generatedAt; st.confirmed = true; return true; }
   return st.confirmed;                                   // same snapshot re-served — no new cycle
 }
 
@@ -2017,15 +2082,10 @@ async function checkBatchSnapshotFreshness(repo, snapshot) {
   }
   const first = snapshot.issueNumbers[0];
   try {
-    await ghJsonExecAsync([
-      "issue",
-      "view",
-      String(first),
-      "-R",
-      repo,
-      "--json",
-      "number",
-    ]);
+    // #828 P1: REST, not `gh issue view` (GraphQL). We only need existence, so
+    // the cheap REST issue endpoint suffices and keeps the whole batch-progress
+    // path off GraphQL.
+    await ghJsonExecAsync(["api", `repos/${repo}/issues/${first}`, "--jq", ".number"]);
     return "fresh";
   } catch (err) {
     // gh surfaces a 404 via stderr text on a non-zero exit. Only
@@ -2033,7 +2093,7 @@ async function checkBatchSnapshotFreshness(repo, snapshot) {
     // count as genuinely gone; anything else (network, auth,
     // timeout) is transient and must NOT delete the snapshot.
     const msg = String((err && (err.stderr || err.message)) || "").toLowerCase();
-    if (msg.includes("could not resolve") || msg.includes("not found") || msg.includes("no issue")) {
+    if (msg.includes("could not resolve") || msg.includes("not found") || msg.includes("http 404")) {
       return "gone";
     }
     return "unknown";
@@ -2137,7 +2197,7 @@ function parseActiveBatch(queueText) {
 // progress fetcher. Wraps node's execFile in a promise.
 //
 // THROWS on subprocess failure (non-zero exit, timeout, JSON parse,
-// network) so progressForItemAsync can decide which subset of
+// network) so progressForItemRest can decide which subset of
 // failures should bubble up to the Promise.allSettled "fetch failed"
 // row vs. which should fall through to a softer state. The previous
 // catch-all-and-return-null contract collapsed real subprocess
@@ -2149,10 +2209,10 @@ async function ghJsonExecAsync(args) {
 }
 
 // #350: pure helper for the "no linked PR" branch of
-// progressForItemAsync. Takes the issue JSON (shape: { number,
+// progressForItemRest. Takes the issue JSON (shape: { number,
 // title, state, url, ... }) and returns the batch-progress row
-// for an item that has no closedByPullRequestsReferences. Exported
-// from module.exports below for unit tests — no other callers.
+// for an item that has no linked PR. Exported from module.exports
+// below for unit tests — no other callers.
 function buildNoPrRow(issue) {
   if (issue && issue.state === "CLOSED") {
     return {
@@ -2174,61 +2234,66 @@ function buildNoPrRow(issue) {
   };
 }
 
-async function progressForItemAsync(repo, issueNumber) {
-  // Pull issue state + linked PRs in one call. closedByPullRequestsReferences
-  // is gh's serializer for the GraphQL `closedByPullRequestsReferences`
-  // edge — only present when a PR with `Fixes #N` / `Closes #N`
-  // (or the link UI) targets the issue.
-  // Issue fetch is the load-bearing call — if gh can't read the
-  // issue at all (404, network, auth, timeout) we can't compute a
-  // meaningful progress row. Let the rejection propagate to the
-  // route's Promise.allSettled so the operator sees a single
-  // "fetch failed" row instead of a misleading "queued" entry.
-  const issue = await ghJsonExecAsync([
-    "issue",
-    "view",
-    String(issueNumber),
-    "-R",
-    repo,
-    "--json",
-    "number,title,state,url,closedByPullRequestsReferences",
-  ]);
-  const linked = Array.isArray(issue.closedByPullRequestsReferences)
-    ? issue.closedByPullRequestsReferences
-    : [];
-  // Pick the freshest linked PR (highest number) if there are multiple.
-  const pr = linked.length > 0
-    ? linked.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0]
-    : null;
-  // No linked PR. #350: before falling into the "queued" bucket,
-  // honor the issue's own state — a CLOSED issue with no linked
-  // PR is fully done (superseded, not planned, runbook-only, etc.)
-  // and should render at 100% with a ✓ label instead of a
-  // misleading "0% · queued" row. Only truly OPEN issues with no
-  // linked PR are still queued.
-  if (!pr) {
+// #828 P1: find the PR linked to issue `n` by the team's `[#N]` PR-title
+// convention, via the REST Search API (1 search point) — NOT GraphQL. gh's
+// `-X GET -f q=…` URL-encodes the query, so we never hand-concatenate the repo
+// or number into the URL. Search tokenises loosely (and `is:pr in:title N`
+// would also surface `[#807]` for n=80), so we re-apply the strict `^\s*\[#N\]`
+// regex the snapshot matcher uses. Returns the freshest matching PR number (or
+// null), treating a search failure as "no linked PR found".
+// Pure: pick the freshest PR (highest number) whose title matches the STRICT
+// `^\s*\[#N\]` convention from a set of REST search items. Guards `[#807]` from
+// matching n=80 even though Search's loose `in:title 80` would surface it.
+// Returns the PR number or null. Exported for unit tests.
+function pickLinkedPrFromSearch(items, n) {
+  const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
+  const matches = (Array.isArray(items) ? items : []).filter((it) => titleRe.test((it && it.title) || ""));
+  if (matches.length === 0) return null;
+  return matches.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
+}
+
+async function findLinkedPrByTitle(repo, n) {
+  let items = [];
+  try {
+    const res = await ghJsonExecAsync(["api", "-X", "GET", "search/issues", "-f", `q=repo:${repo} is:pr in:title ${n}`]);
+    items = Array.isArray(res && res.items) ? res.items : [];
+  } catch {
+    // Search glitch/rate-limit → treat as no linked PR. An OPEN issue then
+    // renders queued (correct at batch start); a later cache miss retries.
+    return null;
+  }
+  return pickLinkedPrFromSearch(items, n);
+}
+
+// Authoritative by-number resolution for an active-batch issue the board
+// snapshot can't prove (outside / truncated window, or absent). #828 P1: REST +
+// Search ONLY — zero `gh issue view` / `gh pr view` (GraphQL). Bucket mapping
+// matches progressFromSnapshot exactly.
+async function progressForItemRest(repo, issueNumber) {
+  // Load-bearing call: the issue's own state via REST. If gh can't read it at
+  // all (404, network, auth, timeout) we can't compute a meaningful row — let
+  // the rejection propagate to the route's Promise.allSettled "fetch failed"
+  // row instead of emitting a misleading "queued" entry.
+  const raw = await ghJsonExecAsync(["api", `repos/${repo}/issues/${issueNumber}`]);
+  const issue = {
+    number: raw.number,
+    title: raw.title,
+    state: (raw.state || "").toUpperCase(),
+    url: raw.html_url,
+  };
+  const prNumber = await findLinkedPrByTitle(repo, issueNumber);
+  // No linked PR. #350: honor the issue's own state — a CLOSED issue with no
+  // linked PR is fully done (superseded/not-planned/runbook) → 100% ✓; only a
+  // truly OPEN issue with no PR is queued.
+  if (prNumber == null) {
     return buildNoPrRow(issue);
   }
-  // Re-fetch the PR to get reviewDecision + reviews + state, since
-  // the issue's closedByPullRequestsReferences edge only carries
-  // number/state/url. The PR fetch is intentionally soft: if gh
-  // glitches on this single call we still know the PR exists (we
-  // got the link from the issue) and can render a partial
-  // "in_review" row, which is more useful than dropping the whole
-  // item to "fetch failed". A persistent failure here will still
-  // surface on the next cache miss because the issue fetch above
-  // is the load-bearing one that controls the per-item rejection.
+  // REST-fetch the PR for state + reviews. Soft: a glitch on these single calls
+  // still lets us render a partial in_review row (we know the PR exists) rather
+  // than dropping the whole item to "fetch failed".
   let prData = null;
   try {
-    prData = await ghJsonExecAsync([
-      "pr",
-      "view",
-      String(pr.number),
-      "-R",
-      repo,
-      "--json",
-      "number,state,url,reviewDecision,reviews",
-    ]);
+    prData = await ghJsonExecAsync(["api", `repos/${repo}/pulls/${prNumber}`]);
   } catch {
     // soft fall-through to the in_review row below
   }
@@ -2236,62 +2301,44 @@ async function progressForItemAsync(repo, issueNumber) {
     return {
       issue_number: issue.number,
       title: issue.title,
-      url: pr.url || issue.url,
-      pr_number: pr.number,
+      url: issue.url,
+      pr_number: prNumber,
       status: "in_review",
       progress: 20,
-      label: `PR #${pr.number} · waiting on review`,
+      label: `PR #${prNumber} · waiting on review`,
     };
   }
-  const merged = prData.state === "MERGED" && issue.state === "CLOSED";
-  if (merged) {
+  let reviews = [];
+  try {
+    const rv = await ghJsonExecAsync(["api", `repos/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
+    reviews = mapReviews(Array.isArray(rv) ? rv : []);
+  } catch {
+    // soft — reviews stay [], so the row degrades to in_review, never "failed"
+  }
+  const url = prData.html_url || issue.url;
+  // REST: a merged PR is state "closed" with `merged: true`. merged requires
+  // the issue CLOSED too (mirrors progressFromSnapshot and the prior path).
+  if (prData.merged === true && issue.state === "CLOSED") {
     return {
       issue_number: issue.number,
       title: issue.title,
-      url: prData.url || issue.url,
+      url,
       pr_number: prData.number,
       status: "merged",
       progress: 100,
       label: "Merged ✓",
     };
   }
-  // #810: count APPROVED reviews per body-marker ROLE (re1/re2), NOT per
-  // author — the reviewers share one GitHub login, so per-author would collapse
-  // both into one. attributeReviewsByRole takes the latest decision-affecting
-  // review per role, so a stale APPROVED followed by REQUEST_CHANGES doesn't
-  // double-count. (`gh pr view --json reviews` includes the review body.)
-  const approvalCount = countApprovedRoles(prData.reviews);
+  // #810: count APPROVED reviews per body-marker ROLE (re1/re2 share one login),
+  // latest decision-affecting review per role — no stale double-count.
+  const approvalCount = countApprovedRoles(reviews);
   if (approvalCount >= 2) {
-    return {
-      issue_number: issue.number,
-      title: issue.title,
-      url: prData.url || issue.url,
-      pr_number: prData.number,
-      status: "ready",
-      progress: 80,
-      label: `PR #${prData.number} · 2 approvals · ready`,
-    };
+    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "ready", progress: 80, label: `PR #${prData.number} · 2 approvals · ready` };
   }
   if (approvalCount === 1) {
-    return {
-      issue_number: issue.number,
-      title: issue.title,
-      url: prData.url || issue.url,
-      pr_number: prData.number,
-      status: "approved1",
-      progress: 50,
-      label: `PR #${prData.number} · 1 approval`,
-    };
+    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "approved1", progress: 50, label: `PR #${prData.number} · 1 approval` };
   }
-  return {
-    issue_number: issue.number,
-    title: issue.title,
-    url: prData.url || issue.url,
-    pr_number: prData.number,
-    status: "in_review",
-    progress: 20,
-    label: `PR #${prData.number} · waiting on review`,
-  };
+  return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "in_review", progress: 20, label: `PR #${prData.number} · waiting on review` };
 }
 
 function summarizeItems(items) {
@@ -2431,19 +2478,24 @@ router.get("/api/batch-progress", async (req, res) => {
   // snapshot-aware helper so merged items stay visible after Head
   // moves them from Active Batch to Done, until a new batch starts.
   const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
+  // #828 P2: batch identity = number + issue set. evalBatchCompleteConfirmed
+  // resets its streak when this changes, so a new already-complete batch can't
+  // inherit the prior batch's first cycle and confirm in one tick.
+  const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
   if (issueNumbers.length === 0) {
-    evalBatchCompleteConfirmed(projectId, false, null); // reset any complete streak
+    evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
     const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false };
     _batchProgressCache.set(projectId, { ts: Date.now(), data });
     return res.json(data);
   }
 
   // #810: compute each item from the #806 REST snapshot (no GraphQL in steady
-  // state); fall back to a targeted by-number fetch (progressForItemAsync) only
-  // for active-batch issues that sit outside the board window.
+  // state); #828 P1: fall back to a targeted by-number REST/Search fetch
+  // (progressForItemRest, no GraphQL) only for active-batch issues the snapshot
+  // can't prove (outside / truncated window, or absent).
   const snapshot = _graphqlCache.get(repo) || null;
   const settled = await Promise.allSettled(
-    issueNumbers.map(async (n) => progressFromSnapshot(snapshot, n) || progressForItemAsync(repo, n)),
+    issueNumbers.map(async (n) => progressFromSnapshot(snapshot, n) || progressForItemRest(repo, n)),
   );
   const items = settled.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
@@ -2464,7 +2516,7 @@ router.get("/api/batch-progress", async (req, res) => {
   // #810: confirm `complete` across two distinct successful snapshot cycles
   // before any auto-stop consumer may act on it (never auto-stop on a single
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
-  const completeConfirmed = evalBatchCompleteConfirmed(projectId, complete, snapshot ? snapshot.ts : null);
+  const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
   const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed };
   _batchProgressCache.set(projectId, { ts: Date.now(), data });
   res.json(data);
@@ -3359,3 +3411,8 @@ module.exports.GITHUB_FRESH_TTL_MS = GITHUB_FRESH_TTL_MS;
 module.exports.serveGithubList = serveGithubList;
 module.exports._ghEndpointCache = _ghEndpointCache;
 module.exports._rateLimit = _rateLimit;
+// #828: expose the merged-PR pagination helpers + the REST-search linked-PR
+// picker for unit tests. No production callers outside this file.
+module.exports.gatherClosedPrPages = gatherClosedPrPages;
+module.exports.selectRecentMergedPrs = selectRecentMergedPrs;
+module.exports.pickLinkedPrFromSearch = pickLinkedPrFromSearch;
