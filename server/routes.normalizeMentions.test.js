@@ -57,5 +57,26 @@ const { normalizeMentions } = require("./routes");
   );
 }
 
-console.log("routes.normalizeMentions.test.js: all assertions passed (5 cases)");
+// 6) #827: command-context exclusion — a name immediately after a shell verb
+//    (run/exec/npx/checkout/...) is NOT mentionized. The implementation has
+//    always done this; this closes the #788 test gap so it can't regress.
+{
+  assert.equal(
+    normalizeMentions("npm run dev", "head"),
+    "npm run dev",
+    "`npm run dev` does not turn `dev` into @dev (run-verb context)",
+  );
+  assert.equal(
+    normalizeMentions("git checkout head and ping dev", "re1"),
+    "git checkout head and ping @dev",
+    "checkout-context `head` untouched, but a normal `dev` is still mentionized",
+  );
+  assert.equal(
+    normalizeMentions("path is /head/logs", "re1"),
+    "path is /head/logs",
+    "a name in a path segment (slash-delimited) is not mentionized",
+  );
+}
+
+console.log("routes.normalizeMentions.test.js: all assertions passed (6 cases)");
 process.exit(0);

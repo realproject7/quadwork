@@ -1340,8 +1340,11 @@ const GITHUB_FRESH_TTL_MS = 5 * 60_000;
 // Live staleness for /api/github-parsed: stale if the file says so, if we have
 // no generatedAt, or if the snapshot is older than the FIXED window. Pure so
 // the rate-limit edge case (unbounded age) is regression-tested directly.
+// #827: a NaN ageMs (Date.parse of a malformed/corrupted `generatedAt`) must
+// count as stale/unknown — NOT fresh. Without the guard, `NaN > window` is
+// false and staleness would be hidden exactly when the file is suspect.
 function _githubLiveStale(headerStale, ageMs) {
-  return headerStale || ageMs == null || ageMs > GITHUB_FRESH_TTL_MS;
+  return headerStale || ageMs == null || Number.isNaN(ageMs) || ageMs > GITHUB_FRESH_TTL_MS;
 }
 const GITHUB_SECTION_HEADERS = {
   openIssues: "Open Issues",
@@ -1492,6 +1495,11 @@ function _extractNotesBody(text) {
 // preserving its `## Notes`. status drives the freshness meta.
 function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, status) {
   try {
+    // #827: re-check idle here (reads config fresh) — syncGithubFilesForRepo
+    // filtered on a config snapshot taken earlier, so an idle-flip concurrent
+    // with a setup-seed/refresh pass could otherwise still write a parked
+    // project's GITHUB.md. Defensive; idle projects must author nothing.
+    if (isProjectIdle(projectId)) return;
     const dir = path.join(CONFIG_DIR, projectId);
     const filePath = path.join(dir, "GITHUB.md");
     // Cold + total failure with nothing cached: leave the seeded template be.
@@ -2414,7 +2422,11 @@ router.get("/api/github-parsed", (req, res) => {
   // no new sync pass), age must stay visible. Compare against a FIXED window,
   // never adaptiveTTL (which is Infinity under critical rate-limit and would
   // hide unbounded staleness exactly when it matters).
-  const ageMs = parsed.generatedAt ? Date.now() - Date.parse(parsed.generatedAt) : null;
+  // #827: a malformed `generatedAt` → Date.parse NaN. Normalize to null so the
+  // response field is a clean "unknown age" (not NaN), and _githubLiveStale
+  // also treats NaN/null as stale rather than hiding staleness on a suspect file.
+  const rawAge = parsed.generatedAt ? Date.now() - Date.parse(parsed.generatedAt) : null;
+  const ageMs = Number.isNaN(rawAge) ? null : rawAge;
   return res.json({
     ...parsed,
     ageMs,
@@ -3430,3 +3442,6 @@ module.exports.gatherClosedPrPages = gatherClosedPrPages;
 module.exports.selectRecentMergedPrs = selectRecentMergedPrs;
 module.exports.pickLinkedPrFromSearch = pickLinkedPrFromSearch;
 module.exports.findLinkedPrByTitle = findLinkedPrByTitle;
+// #827: expose the GITHUB.md writer for the idle-no-op regression test. No
+// production callers outside this file.
+module.exports.writeGithubFileFromSnapshot = writeGithubFileFromSnapshot;
