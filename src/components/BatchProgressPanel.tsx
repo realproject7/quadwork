@@ -26,11 +26,13 @@ interface BatchProgressData {
 
 interface BatchProgressPanelProps {
   projectId: string;
+  idle?: boolean;
 }
 
 const COPY = {
   en: {
     loading: "Loading batch progress…",
+    idlePaused: "Project is idle — batch progress polling is paused.",
     currentBatchNone: "Current Batch: (none)",
     noActiveBatch: "No active batch. Ask Head to start one via the chat.",
     currentBatch: (n: number | string) => `Current Batch: Batch ${n}`,
@@ -45,6 +47,7 @@ const COPY = {
   },
   ko: {
     loading: "배치 진행 상황 로딩 중...",
+    idlePaused: "프로젝트가 유휴 상태입니다 — 배치 진행 폴링이 일시 중지되었습니다.",
     currentBatchNone: "현재 배치: (없음)",
     noActiveBatch: "활성 배치가 없습니다. 채팅에서 Head에게 시작을 요청하세요.",
     currentBatch: (n: number | string) => `현재 배치: ${n}번`,
@@ -81,7 +84,7 @@ function ProgressBar({ percent }: { percent: number }) {
  * label. Polls every 30s on the same cadence as the rest of the
  * GitHub panel.
  */
-export default function BatchProgressPanel({ projectId }: BatchProgressPanelProps) {
+export default function BatchProgressPanel({ projectId, idle = false }: BatchProgressPanelProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [data, setData] = useState<BatchProgressData | null>(null);
@@ -94,12 +97,27 @@ export default function BatchProgressPanel({ projectId }: BatchProgressPanelProp
   }, [projectId]);
 
   useEffect(() => {
+    if (idle) return; // #812: parked project — stop polling batch progress
     load();
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
-  }, [load]);
+  }, [load, idle]);
 
   if (!data) {
+    // #812: a project that is already idle on open has no cached batch data
+    // and never fetches — show a paused state instead of "Loading…" forever.
+    if (idle) {
+      return (
+        <div className="border-t border-border">
+          <div className="px-3 py-1.5 flex items-center gap-2">
+            <span className="text-[10px] text-text-muted uppercase tracking-wider">Idle</span>
+          </div>
+          <div className="px-3 pb-2 text-[11px] text-text-muted">
+            {t.idlePaused}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="px-3 py-1.5 text-[11px] text-text-muted border-t border-border">
         {t.loading}

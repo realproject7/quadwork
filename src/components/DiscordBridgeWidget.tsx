@@ -63,6 +63,7 @@ interface BatchState {
 
 interface DiscordBridgeWidgetProps {
   projectId: string;
+  idle?: boolean;
 }
 
 interface DiscordStatus {
@@ -93,7 +94,7 @@ async function callDiscord(action: string, body: Record<string, unknown>) {
  * start/stop + a setup modal to configure bot_token + channel_id from
  * scratch.
  */
-export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetProps) {
+export default function DiscordBridgeWidget({ projectId, idle = false }: DiscordBridgeWidgetProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [status, setStatus] = useState<DiscordStatus | null>(null);
@@ -146,10 +147,11 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
   }, [projectId]);
 
   useEffect(() => {
+    if (idle) return; // #812: parked project — stop polling bridge status
     load();
     const id = window.setInterval(load, 5000);
     return () => window.clearInterval(id);
-  }, [load]);
+  }, [load, idle]);
 
   const noteInstallResponse = (data: { patched_projects?: string[] }) => {
     const patched = Array.isArray(data?.patched_projects) ? data.patched_projects : [];
@@ -271,11 +273,11 @@ export default function DiscordBridgeWidget({ projectId }: DiscordBridgeWidgetPr
   }, [projectId, load, t]);
 
   useEffect(() => {
-    if (!autoDiscord) return;
+    if (!autoDiscord || idle) return; // #812: parked project — suppress bridge auto-lifecycle
     checkBatchLifecycle();
     const id = window.setInterval(checkBatchLifecycle, AUTO_POLL_MS);
     return () => window.clearInterval(id);
-  }, [autoDiscord, checkBatchLifecycle]);
+  }, [autoDiscord, checkBatchLifecycle, idle]);
 
   const configured = !!status?.configured;
   const running = !!status?.running;

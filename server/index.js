@@ -1183,6 +1183,13 @@ app.get("/api/triggers", (_req, res) => {
   res.json(result);
 });
 
+// #812: a parked (idle) project gets no trigger starts/pulses. Read
+// the live config so a config-write that sets idle takes effect at once.
+function isProjectIdleId(projectId) {
+  try { return !!readConfig().projects?.find((p) => p.id === projectId)?.idle; }
+  catch { return false; }
+}
+
 function stopTrigger(project) {
   const existing = triggers.get(project);
   if (existing) {
@@ -1194,6 +1201,11 @@ function stopTrigger(project) {
 
 app.post("/api/triggers/:project/start", (req, res) => {
   const { project } = req.params;
+  // #812: refuse to start a trigger for a parked (idle) project — no
+  // timer created, no agents pulsed. Toggle the project off idle first.
+  if (isProjectIdleId(project)) {
+    return res.json({ ok: false, idle: true, enabled: false });
+  }
   // #418 / quadwork#306: sendImmediately was an always-true
   // send-and-start flag from the original #210 button; operators
   // asked for a pure scheduler (the button is now just "Start
@@ -1265,6 +1277,10 @@ app.post("/api/triggers/:project/stop", (req, res) => {
 
 app.post("/api/triggers/:project/send-now", (req, res) => {
   const { project } = req.params;
+  // #812: parked (idle) project — do not pulse agents.
+  if (isProjectIdleId(project)) {
+    return res.json({ ok: false, idle: true, sent: false });
+  }
   sendTriggerMessage(project);
   res.json({ ok: true, sent: true });
 });
@@ -1593,7 +1609,11 @@ function syncTriggersFromConfig() {
 
   if (cfg.projects) {
     for (const project of cfg.projects) {
-      if (project.trigger_enabled) {
+      // #812: idle (parked) projects get no trigger. Excluding them from
+      // activeIds also makes the cleanup loop below clear any timer they
+      // had — so writing idle:true via PUT /api/config (which calls this)
+      // stops a running trigger with no separate stop call.
+      if (project.trigger_enabled && !project.idle) {
         activeIds.add(project.id);
         const ms = (project.trigger_interval || 30) * 60 * 1000;
         const existing = triggers.get(project.id);
@@ -1631,6 +1651,7 @@ async function autoStopPollingTick() {
   if (!cfg.projects) return;
 
   for (const project of cfg.projects) {
+    if (project.idle) continue; // #812: parked project — no batch-progress polling
     const hasTriggerAuto = project.trigger_auto && triggers.has(project.id);
     const hasBridgeAuto = project.telegram_auto || project.discord_auto;
     if (!hasTriggerAuto && !hasBridgeAuto) continue;

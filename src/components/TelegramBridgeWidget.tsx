@@ -63,6 +63,7 @@ interface BatchState {
 
 interface TelegramBridgeWidgetProps {
   projectId: string;
+  idle?: boolean;
 }
 
 interface TelegramStatus {
@@ -97,7 +98,7 @@ async function callTelegram(action: string, body: Record<string, unknown>) {
  * start/stop + a setup modal to configure bot_token + chat_id from
  * scratch.
  */
-export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidgetProps) {
+export default function TelegramBridgeWidget({ projectId, idle = false }: TelegramBridgeWidgetProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [status, setStatus] = useState<TelegramStatus | null>(null);
@@ -161,10 +162,11 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   }, [projectId]);
 
   useEffect(() => {
+    if (idle) return; // #812: parked project — stop polling bridge status
     load();
     const id = window.setInterval(load, 5000);
     return () => window.clearInterval(id);
-  }, [load]);
+  }, [load, idle]);
 
   const noteInstallResponse = (data: { patched_projects?: string[] }) => {
     const patched = Array.isArray(data?.patched_projects) ? data.patched_projects : [];
@@ -293,11 +295,11 @@ export default function TelegramBridgeWidget({ projectId }: TelegramBridgeWidget
   }, [projectId, load, t]);
 
   useEffect(() => {
-    if (!autoTelegram) return;
+    if (!autoTelegram || idle) return; // #812: parked project — suppress bridge auto-lifecycle
     checkBatchLifecycle();
     const id = window.setInterval(checkBatchLifecycle, AUTO_POLL_MS);
     return () => window.clearInterval(id);
-  }, [autoTelegram, checkBatchLifecycle]);
+  }, [autoTelegram, checkBatchLifecycle, idle]);
 
   const configured = !!status?.configured;
   const running = !!status?.running;
