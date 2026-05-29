@@ -8,7 +8,7 @@
 // (not GitHub login), and distinguishes a parse error from an empty section.
 
 const assert = require("node:assert/strict");
-const { renderGithubMarkdown, parseGithub, attributeReviewsByRole } = require("./routes");
+const { renderGithubMarkdown, parseGithub, attributeReviewsByRole, _githubLiveStale, GITHUB_FRESH_TTL_MS } = require("./routes");
 
 const META = { generatedAt: Date.parse("2026-05-29T15:00:00.000Z"), staleCycles: 0 };
 
@@ -128,6 +128,17 @@ function run() {
     const snap = { issues: [], prs: [], closedIssues: [], mergedPrs: [] };
     const pNever = parseGithub(renderGithubMarkdown("P", "o/r", snap, { generatedAt: 0, staleCycles: 3 }, "n"));
     ok(pNever.generatedAt === null && pNever.staleCycles === 3 && pNever.stale === true, "never-generated / staleCycles>0 → stale:true, generatedAt:null");
+  }
+
+  // ── 10) Live staleness uses a FIXED window, not adaptiveTTL (re1 review) ──
+  // The bug: computing against adaptiveTTL → Infinity under critical rate-limit
+  // hid unbounded staleness. A fixed window must flag old data as stale.
+  {
+    ok(_githubLiveStale(false, 1000) === false, "fresh data (age within window) → not stale");
+    ok(_githubLiveStale(false, GITHUB_FRESH_TTL_MS + 1) === true, "age beyond the fixed window → stale (the rate-limited case)");
+    ok(_githubLiveStale(false, null) === true, "no generatedAt (null age) → stale");
+    ok(_githubLiveStale(true, 0) === true, "header already stale → stale regardless of age");
+    ok(typeof GITHUB_FRESH_TTL_MS === "number" && Number.isFinite(GITHUB_FRESH_TTL_MS), "freshness window is a finite constant (never Infinity)");
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

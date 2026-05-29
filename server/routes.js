@@ -1286,6 +1286,17 @@ function refreshRepoRest(repo) {
 
 // Per-project freshness: projectId → { generatedAt(ms), staleCycles }.
 const _githubMeta = new Map();
+// #807: FIXED freshness window for the live `_stale` signal — must NOT use
+// adaptiveTTL, which returns Infinity under critical rate-limit (the exact case
+// where no sync pass runs and staleness is unbounded). ~5 poll cycles.
+const GITHUB_FRESH_TTL_MS = 5 * 60_000;
+
+// Live staleness for /api/github-parsed: stale if the file says so, if we have
+// no generatedAt, or if the snapshot is older than the FIXED window. Pure so
+// the rate-limit edge case (unbounded age) is regression-tested directly.
+function _githubLiveStale(headerStale, ageMs) {
+  return headerStale || ageMs == null || ageMs > GITHUB_FRESH_TTL_MS;
+}
 const GITHUB_SECTION_HEADERS = {
   openIssues: "Open Issues",
   openPRs: "Open PRs",
@@ -2384,12 +2395,14 @@ router.get("/api/github-parsed", (req, res) => {
   const parsed = parseGithub(text);
   if (!parsed.ok) return res.json(parsed);
   // Live staleness: even when the file isn't regenerated (e.g. rate-limited →
-  // adaptiveTTL serves expired data with no new pass), age must stay visible.
+  // no new sync pass), age must stay visible. Compare against a FIXED window,
+  // never adaptiveTTL (which is Infinity under critical rate-limit and would
+  // hide unbounded staleness exactly when it matters).
   const ageMs = parsed.generatedAt ? Date.now() - Date.parse(parsed.generatedAt) : null;
   return res.json({
     ...parsed,
     ageMs,
-    _stale: parsed.stale || (ageMs != null && ageMs > adaptiveTTL(GRAPHQL_CACHE_TTL)),
+    _stale: _githubLiveStale(parsed.stale, ageMs),
   });
 });
 
@@ -3392,3 +3405,5 @@ module.exports.buildStatusCheckRollup = buildStatusCheckRollup;
 module.exports.parseGithub = parseGithub;
 module.exports.renderGithubMarkdown = renderGithubMarkdown;
 module.exports.attributeReviewsByRole = attributeReviewsByRole;
+module.exports._githubLiveStale = _githubLiveStale;
+module.exports.GITHUB_FRESH_TTL_MS = GITHUB_FRESH_TTL_MS;
