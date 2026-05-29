@@ -1898,17 +1898,27 @@ async function serveGithubList(req, res, kind) {
   }
 
   const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
+  // #824: these four endpoints serve a BARE ARRAY (cached.data is an array).
+  // Stale/rate-limited state must be signalled via a response header — mirroring
+  // the X-QuadWork-Idle pattern above — never by spreading the array into an
+  // object (which yields {"0":…,"_stale":true} and trips GitHubPanel's
+  // Array.isArray guard, blanking the board exactly when it should show
+  // last-known data).
   if (cached && Date.now() - cached.ts < ttl) {
-    return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
+    if (cached.stale) res.set("X-QuadWork-Stale", "1");
+    return res.json(cached.data);
   }
   // Critically REST-rate-limited → serve whatever we have (even expired).
   if (isRateLimited() && cached) {
-    return res.json({ ...cached.data, _stale: true, _rateLimited: true });
+    res.set("X-QuadWork-Stale", "1");
+    res.set("X-QuadWork-Rate-Limited", "1");
+    return res.json(cached.data);
   }
   // Stale-while-revalidate: serve stale now, refresh the snapshot in background.
   if (cached) {
     refreshRepoRest(repo);
-    return res.json({ ...cached.data, _stale: true });
+    res.set("X-QuadWork-Stale", "1");
+    return res.json(cached.data);
   }
   // Cold: assemble the snapshot synchronously, then serve this slice.
   await refreshRepoRest(repo);
@@ -3333,3 +3343,10 @@ module.exports.attributeReviewsByRole = attributeReviewsByRole;
 module.exports._githubLiveStale = _githubLiveStale;
 module.exports._extractNotesBody = _extractNotesBody;
 module.exports.GITHUB_FRESH_TTL_MS = GITHUB_FRESH_TTL_MS;
+// #824: expose the bare-array list handler + its cache and the REST rate-limit
+// bucket so the regression test can drive the stale/rate-limited paths and
+// assert the body stays a JSON array (never an object). No production callers
+// outside this file.
+module.exports.serveGithubList = serveGithubList;
+module.exports._ghEndpointCache = _ghEndpointCache;
+module.exports._rateLimit = _rateLimit;
