@@ -50,6 +50,18 @@ The project's task queue lives at the absolute path:
 
 Head owns this file — do not edit it. Read it when you need context on the batch you're working in or want to see what's coming next.
 
+## GitHub State (discovery)
+For board context — what issues/PRs exist and their state — read the server-authored file instead of running `gh pr list`/`gh issue list`:
+
+```
+~/.quadwork/{{project_name}}/GITHUB.md
+```
+
+(or `GET http://127.0.0.1:8400/api/github-parsed?project={{project_name}}` for JSON). The server regenerates it from live GitHub each poll cycle.
+
+- Reading the **assigned issue** stays a live, by-number call: `gh issue view <n>` (the file is for context, not the source of truth for the issue you're implementing).
+- **By-number / live fallback:** Head assigns by issue number in chat — act on it directly; never gate its existence on the file. If the assigned issue is missing from GITHUB.md, or the file is stale (`_stale` true / older than ~2 cycles), just `gh issue view <n>` — **never conclude "no work" from a stale or empty file.**
+
 ## Role
 - Implement features, fix bugs, and refactor code as assigned by Head
 - Create feature branches, write code, and open PRs

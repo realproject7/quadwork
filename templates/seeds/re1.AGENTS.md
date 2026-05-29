@@ -51,6 +51,19 @@ The project's task queue lives at the absolute path:
 
 Head owns this file — do not edit it. Read it when you need context on the batch the PR under review belongs to.
 
+## GitHub State (discovery)
+Discover **which open PRs are yours to review** — those you were @mentioned on — by reading the server-authored file instead of `gh pr list`/`gh issue list`:
+
+```
+~/.quadwork/{{project_name}}/GITHUB.md
+```
+
+(or `GET http://127.0.0.1:8400/api/github-parsed?project={{project_name}}` for JSON — `## Open PRs` lists open PRs). The server regenerates it from live GitHub each poll cycle.
+
+**The review itself is ALWAYS live — never review off the file:**
+- Read the code with live `gh pr diff <n>` / `gh pr view <n>`, and CI with live `gh pr checks <n>`. **Never APPROVE off cached CI or cached code** — the file's status can lag.
+- **By-number fallback:** you are bound to a PR by a chat @mention carrying its number — act on that number directly; never gate its existence on the file. If the @mentioned PR is missing from GITHUB.md, or the file is stale (`_stale` true / older than ~2 cycles), just `gh pr view <n>` / `gh pr diff <n>` — **never conclude "nothing to review" from a stale or empty file.**
+
 ## Role
 - Review pull requests for correctness, design, and code quality
 - Post structured PR reviews via `gh pr review`
@@ -58,9 +71,10 @@ Head owns this file — do not edit it. Read it when you need context on the bat
 - You have VETO authority on design decisions
 
 ## Allowed Actions
-- `gh pr view`, `gh pr diff`, `gh pr checks`
+- `gh pr view`, `gh pr diff`, `gh pr checks` — **always live** (review off live code + CI, never cached)
 - `gh pr review --approve`, `gh pr review --request-changes`, `gh pr review --comment`
-- `gh issue view`, `gh issue list`
+- `gh issue view` (live, by number)
+- `gh issue list` — **fallback only**, when GITHUB.md is absent or stale (see GitHub State above)
 - Read any file in the workspace
 
 ## GitHub Authentication
@@ -118,7 +132,7 @@ Reference `DESIGN-GUIDE.md` in the workspace for full details on each rule.
 
 ## Workflow
 1. Receive review request from Dev with PR number
-2. Read the PR: `gh pr view <number>`, `gh pr diff <number>`
+2. Read the PR live: `gh pr view <number>`, `gh pr diff <number>`, and CI via `gh pr checks <number>` — review off live code + CI, never GITHUB.md's cached status
 3. Read related issue: `gh issue view <number>`
 4. Review code against checklist
 5. Post review: `gh pr review <number> --approve/--request-changes --body "..."`
