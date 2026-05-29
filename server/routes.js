@@ -1897,18 +1897,37 @@ async function serveGithubList(req, res, kind) {
     return res.json(cached ? cached.data : []);
   }
 
-  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
-  if (cached && Date.now() - cached.ts < ttl) {
-    return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
-  }
-  // Critically REST-rate-limited → serve whatever we have (even expired).
+  // #824: these four endpoints serve a BARE ARRAY (cached.data is an array).
+  // Stale/rate-limited state must be signalled via a response header — mirroring
+  // the X-QuadWork-Idle pattern above — never by spreading the array into an
+  // object (which yields {"0":…,"_stale":true} and trips GitHubPanel's
+  // Array.isArray guard, blanking the board exactly when it should show
+  // last-known data).
+  //
+  // Freshness is measured against the BASE TTL, not adaptiveTTL: under critical
+  // rate-limit adaptiveTTL is Infinity, so an age<ttl check would treat an
+  // arbitrarily-old cache as fresh and skip the staleness signal entirely.
+  const baseFresh = cached && Date.now() - cached.ts < GH_ENDPOINT_CACHE_TTL;
+
+  // Critically REST-rate-limited → serve whatever we have (even expired) without
+  // revalidating. MUST precede the cache-hit branch below: adaptiveTTL is
+  // Infinity here, so that branch would otherwise return first and an expired
+  // array would go out with no X-QuadWork-Stale / X-QuadWork-Rate-Limited.
   if (isRateLimited() && cached) {
-    return res.json({ ...cached.data, _stale: true, _rateLimited: true });
+    res.set("X-QuadWork-Rate-Limited", "1");
+    if (!baseFresh || cached.stale) res.set("X-QuadWork-Stale", "1");
+    return res.json(cached.data);
+  }
+  // Fresh enough (within the adaptive window) → serve as-is.
+  if (cached && Date.now() - cached.ts < adaptiveTTL(GH_ENDPOINT_CACHE_TTL)) {
+    if (cached.stale) res.set("X-QuadWork-Stale", "1");
+    return res.json(cached.data);
   }
   // Stale-while-revalidate: serve stale now, refresh the snapshot in background.
   if (cached) {
     refreshRepoRest(repo);
-    return res.json({ ...cached.data, _stale: true });
+    res.set("X-QuadWork-Stale", "1");
+    return res.json(cached.data);
   }
   // Cold: assemble the snapshot synchronously, then serve this slice.
   await refreshRepoRest(repo);
@@ -3333,3 +3352,10 @@ module.exports.attributeReviewsByRole = attributeReviewsByRole;
 module.exports._githubLiveStale = _githubLiveStale;
 module.exports._extractNotesBody = _extractNotesBody;
 module.exports.GITHUB_FRESH_TTL_MS = GITHUB_FRESH_TTL_MS;
+// #824: expose the bare-array list handler + its cache and the REST rate-limit
+// bucket so the regression test can drive the stale/rate-limited paths and
+// assert the body stays a JSON array (never an object). No production callers
+// outside this file.
+module.exports.serveGithubList = serveGithubList;
+module.exports._ghEndpointCache = _ghEndpointCache;
+module.exports._rateLimit = _rateLimit;
