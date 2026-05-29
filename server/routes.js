@@ -1735,123 +1735,68 @@ function startGraphQLPolling() {
   _graphqlPollTimer = setInterval(refreshGraphQLCache, GRAPHQL_CACHE_TTL);
 }
 
-// #703: Batched GraphQL for batch progress — fetch all issue states +
-// linked PRs in a single query instead of 2N individual gh calls.
-async function fetchBatchProgressGraphQL(repo, issueNumbers) {
-  if (!issueNumbers || issueNumbers.length === 0) return null;
-  const [owner, name] = repo.split("/");
-  if (!owner || !name) return null;
+// ─── #810: batch progress sourced from the REST snapshot ──────────────────
+// #806's server cache already holds open PRs (with full reviews + bodies),
+// open/closed issues, and merged PRs. Batch progress is computed from that
+// snapshot in steady state — no GraphQL — falling back to a targeted by-number
+// fetch only when an active-batch issue sits outside the board window.
 
-  // Build aliased issue fields.
-  const issueFields = issueNumbers.map((n) =>
-    `issue${n}: issue(number: ${n}) {
-      number title state url
-      closedByPullRequestsReferences(first: 3) {
-        nodes { number state url merged reviews(last: 100) { nodes { state author { login } submittedAt } } }
-      }
-    }`
-  ).join("\n    ");
-
-  const query = `query {
-  repository(owner: "${owner}", name: "${name}") {
-    ${issueFields}
-  }
-}`;
-
-  try {
-    const { stdout } = await _execFileAsync("gh", [
-      "api", "graphql", "-f", `query=${query}`,
-    ], { encoding: "utf-8", timeout: 15000 });
-    const data = JSON.parse(stdout).data;
-    if (!data?.repository) return null;
-    return data.repository;
-  } catch {
-    return null; // fallback to individual gh CLI calls
-  }
+// Per-ROLE approval count. re1/re2 share one GitHub login, so we attribute by
+// body-marker ROLE (attributeReviewsByRole, #807) and count roles whose LATEST
+// decision-affecting review is APPROVED — max 2 (re1, re2). NOT per-author.
+function countApprovedRoles(reviews) {
+  const roles = attributeReviewsByRole(reviews);
+  return ["re1", "re2"].filter((r) => roles[r] && roles[r].state === "APPROVED").length;
 }
 
-// Convert a GraphQL batch progress issue node into the same progress
-// row shape that progressForItemAsync produces.
-function graphqlIssueToProgressRow(issueData) {
-  if (!issueData) return null;
+// Compute issue `n`'s progress row from the snapshot (no network). Links
+// issue↔PR by the team's `[#<issue>]` PR-title convention. Returns null when
+// the issue/PR is outside the board window so the caller does a targeted
+// by-number fetch — NEVER compute solely from board-window state. Bucket
+// mapping is identical to progressForItemAsync.
+function progressFromSnapshot(snapshot, n) {
+  if (!snapshot) return null;
+  const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
+  const openPr = (snapshot.prs || []).find((p) => titleRe.test(p.title || ""));
+  const mergedPr = (snapshot.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
+  const openIssue = (snapshot.issues || []).find((i) => i.number === n);
+  const closedIssue = (snapshot.closedIssues || []).find((i) => i.number === n);
 
-  const linked = issueData.closedByPullRequestsReferences?.nodes || [];
-  const pr = linked.length > 0
-    ? linked.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0]
-    : null;
-
-  // No linked PR — delegate to the existing buildNoPrRow helper.
-  if (!pr) {
-    return buildNoPrRow({
-      number: issueData.number,
-      title: issueData.title,
-      state: issueData.state,
-      url: issueData.url,
-    });
-  }
-
-  const merged = pr.merged && issueData.state === "CLOSED";
-  if (merged) {
+  // merged requires PR merged AND issue CLOSED.
+  if (mergedPr && closedIssue) {
     return {
-      issue_number: issueData.number,
-      title: issueData.title,
-      url: pr.url || issueData.url,
-      pr_number: pr.number,
-      status: "merged",
-      progress: 100,
-      label: "Merged ✓",
+      issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url,
+      pr_number: mergedPr.number, status: "merged", progress: 100, label: "Merged ✓",
     };
   }
+  if (openPr) {
+    const title = (openIssue && openIssue.title) || (closedIssue && closedIssue.title) || `#${n}`;
+    const approvals = countApprovedRoles(openPr.reviews);
+    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
+    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
+    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
+  }
+  // No PR in the window — honor issue state if we have it; else it's a miss.
+  if (closedIssue) return buildNoPrRow({ number: n, title: closedIssue.title, state: "CLOSED", url: closedIssue.url });
+  if (openIssue) return buildNoPrRow({ number: n, title: openIssue.title, state: "OPEN", url: openIssue.url });
+  return null; // outside board window → targeted by-number fetch
+}
 
-  // Count distinct APPROVED reviews per author.
-  const reviews = (pr.reviews?.nodes || []).slice();
-  reviews.sort((a, b) => {
-    const ta = a?.submittedAt ? Date.parse(a.submittedAt) : 0;
-    const tb = b?.submittedAt ? Date.parse(b.submittedAt) : 0;
-    return ta - tb;
-  });
-  const latestByAuthor = new Map();
-  for (const r of reviews) {
-    const author = r?.author?.login || "";
-    if (!author) continue;
-    latestByAuthor.set(author, r.state);
-  }
-  let approvalCount = 0;
-  for (const state of latestByAuthor.values()) {
-    if (state === "APPROVED") approvalCount++;
-  }
-
-  if (approvalCount >= 2) {
-    return {
-      issue_number: issueData.number,
-      title: issueData.title,
-      url: pr.url || issueData.url,
-      pr_number: pr.number,
-      status: "ready",
-      progress: 80,
-      label: `PR #${pr.number} · 2 approvals · ready`,
-    };
-  }
-  if (approvalCount === 1) {
-    return {
-      issue_number: issueData.number,
-      title: issueData.title,
-      url: pr.url || issueData.url,
-      pr_number: pr.number,
-      status: "approved1",
-      progress: 50,
-      label: `PR #${pr.number} · 1 approval`,
-    };
-  }
-  return {
-    issue_number: issueData.number,
-    title: issueData.title,
-    url: pr.url || issueData.url,
-    pr_number: pr.number,
-    status: "in_review",
-    progress: 20,
-    label: `PR #${pr.number} · waiting on review`,
-  };
+// Confirmed-complete state machine, per project. `complete` must hold across
+// TWO consecutive SUCCESSFUL fetch cycles with DISTINCT generatedAt (the
+// snapshot ts, which only advances on a real #806 refresh) before we confirm.
+// A stale/served-expired cycle keeps the same ts, and an errored item flips
+// complete=false — so neither can confirm on its own. Consumers (server
+// auto-stop) gate stopTrigger/bridge-stop on the confirmed signal, never a
+// single transient `complete`.
+const _batchCompleteState = new Map(); // projectId -> { ts, confirmed }
+function evalBatchCompleteConfirmed(projectId, complete, generatedAt) {
+  if (!complete) { _batchCompleteState.set(projectId, { ts: null, confirmed: false }); return false; }
+  const st = _batchCompleteState.get(projectId) || { ts: null, confirmed: false };
+  if (generatedAt == null) return st.confirmed;          // inconclusive cycle — no advance
+  if (st.ts == null) { _batchCompleteState.set(projectId, { ts: generatedAt, confirmed: false }); return false; }
+  if (generatedAt !== st.ts) { _batchCompleteState.set(projectId, { ts: generatedAt, confirmed: true }); return true; }
+  return st.confirmed;                                   // same snapshot re-served — no new cycle
 }
 
 // ─── /api/github/all — batched endpoint (#703) ────────────────────────────
@@ -2286,28 +2231,12 @@ async function progressForItemAsync(repo, issueNumber) {
       label: "Merged ✓",
     };
   }
-  // Count distinct APPROVED reviews per author so a stale APPROVED
-  // followed by REQUEST_CHANGES doesn't double-count. Sort by
-  // submittedAt ascending first so the Map's "last write wins"
-  // genuinely lands on the freshest review per author — gh's
-  // current ordering is chronological in practice but undocumented,
-  // so the explicit sort keeps us safe if that ever changes.
-  const reviews = Array.isArray(prData.reviews) ? prData.reviews.slice() : [];
-  reviews.sort((a, b) => {
-    const ta = (a && a.submittedAt) ? Date.parse(a.submittedAt) : 0;
-    const tb = (b && b.submittedAt) ? Date.parse(b.submittedAt) : 0;
-    return ta - tb;
-  });
-  const latestByAuthor = new Map();
-  for (const r of reviews) {
-    const author = (r && r.author && r.author.login) || "";
-    if (!author) continue;
-    latestByAuthor.set(author, r.state);
-  }
-  let approvalCount = 0;
-  for (const state of latestByAuthor.values()) {
-    if (state === "APPROVED") approvalCount++;
-  }
+  // #810: count APPROVED reviews per body-marker ROLE (re1/re2), NOT per
+  // author — the reviewers share one GitHub login, so per-author would collapse
+  // both into one. attributeReviewsByRole takes the latest decision-affecting
+  // review per role, so a stale APPROVED followed by REQUEST_CHANGES doesn't
+  // double-count. (`gh pr view --json reviews` includes the review body.)
+  const approvalCount = countApprovedRoles(prData.reviews);
   if (approvalCount >= 2) {
     return {
       issue_number: issue.number,
@@ -2420,7 +2349,7 @@ router.get("/api/batch-progress", async (req, res) => {
   // precede the fresh-cache and rate-limit returns below.
   if (isProjectIdle(projectId)) {
     if (cached) return res.json({ ...cached.data, _idle: true });
-    return res.json({ batch_number: null, items: [], summary: "", complete: false, _idle: true });
+    return res.json({ batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, _idle: true });
   }
   const batchTTL = adaptiveTTL(BATCH_PROGRESS_TTL_MS);
   if (cached && Date.now() - cached.ts < batchTTL) {
@@ -2479,56 +2408,40 @@ router.get("/api/batch-progress", async (req, res) => {
   // moves them from Active Batch to Done, until a new batch starts.
   const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
   if (issueNumbers.length === 0) {
-    const data = { batch_number: batchNumber, items: [], summary: "", complete: false };
+    evalBatchCompleteConfirmed(projectId, false, null); // reset any complete streak
+    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false };
     _batchProgressCache.set(projectId, { ts: Date.now(), data });
     return res.json(data);
   }
 
-  // #703: Try batched GraphQL first — one query for all batch items.
-  // Falls back to individual gh CLI calls (the #416 parallel approach)
-  // if GraphQL fails.
-  // #802: skip GraphQL entirely when the GraphQL budget is critical so we
-  // don't drain it further; null forces the REST gh-CLI fallback below.
-  let items;
-  const graphqlData = isGraphqlRateLimited()
-    ? null
-    : await fetchBatchProgressGraphQL(repo, issueNumbers);
-  if (graphqlData) {
-    items = issueNumbers.map((n) => {
-      const issueNode = graphqlData[`issue${n}`];
-      const row = issueNode ? graphqlIssueToProgressRow(issueNode) : null;
-      return row || {
-        issue_number: n,
-        title: `#${n} (fetch failed)`,
-        url: null,
-        status: "unknown",
-        progress: 0,
-        label: "fetch failed",
-      };
-    });
-  } else {
-    // Fallback: #416 parallel individual gh CLI calls.
-    const settled = await Promise.allSettled(
-      issueNumbers.map((n) => progressForItemAsync(repo, n)),
-    );
-    items = settled.map((r, i) => {
-      if (r.status === "fulfilled") return r.value;
-      return {
-        issue_number: issueNumbers[i],
-        title: `#${issueNumbers[i]} (fetch failed)`,
-        url: null,
-        status: "unknown",
-        progress: 0,
-        label: "fetch failed",
-      };
-    });
-  }
+  // #810: compute each item from the #806 REST snapshot (no GraphQL in steady
+  // state); fall back to a targeted by-number fetch (progressForItemAsync) only
+  // for active-batch issues that sit outside the board window.
+  const snapshot = _graphqlCache.get(repo) || null;
+  const settled = await Promise.allSettled(
+    issueNumbers.map(async (n) => progressFromSnapshot(snapshot, n) || progressForItemAsync(repo, n)),
+  );
+  const items = settled.map((r, i) => {
+    if (r.status === "fulfilled") return r.value;
+    return {
+      issue_number: issueNumbers[i],
+      title: `#${issueNumbers[i]} (fetch failed)`,
+      url: null,
+      status: "unknown",
+      progress: 0,
+      label: "fetch failed",
+    };
+  });
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
   // so batches that mix runbook/superseded closes with real PRs
   // still flip to the COMPLETE state once everything is done.
   const complete = items.length > 0 && items.every((it) => it.status === "merged" || it.status === "closed");
-  const data = { batch_number: batchNumber, items, summary, complete };
+  // #810: confirm `complete` across two distinct successful snapshot cycles
+  // before any auto-stop consumer may act on it (never auto-stop on a single
+  // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
+  const completeConfirmed = evalBatchCompleteConfirmed(projectId, complete, snapshot ? snapshot.ts : null);
+  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed };
   _batchProgressCache.set(projectId, { ts: Date.now(), data });
   res.json(data);
 });
@@ -3381,6 +3294,10 @@ module.exports.parseActiveBatch = parseActiveBatch;
 // summarizeItems for the batch-progress fixture test.
 module.exports.buildNoPrRow = buildNoPrRow;
 module.exports.summarizeItems = summarizeItems;
+// #810: expose batch-progress-from-snapshot helpers for unit tests.
+module.exports.progressFromSnapshot = progressFromSnapshot;
+module.exports.countApprovedRoles = countApprovedRoles;
+module.exports.evalBatchCompleteConfirmed = evalBatchCompleteConfirmed;
 // #693: expose normalizeMentions for unit tests
 module.exports.normalizeMentions = normalizeMentions;
 // #714: expose for file-chat integration

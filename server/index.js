@@ -1113,8 +1113,10 @@ async function sendTriggerMessage(projectId) {
       );
       if (bpRes.ok) {
         const bp = await bpRes.json();
-        if (bp && bp.complete) {
-          console.log(`[auto-trigger] ${projectId}: batch complete, auto-stopped`);
+        // #810: gate auto-stop on completeConfirmed (two distinct successful
+        // fetch cycles), NOT a single transient/stale `complete`.
+        if (bp && bp.completeConfirmed) {
+          console.log(`[auto-trigger] ${projectId}: batch complete (confirmed), auto-stopped`);
           stopTrigger(projectId);
           // Also stop caffeinate if no other triggers remain running
           // (#441 companion fix). caffeinateProcess is global (not
@@ -1706,12 +1708,16 @@ async function autoStopPollingTick() {
       if (!res.ok) continue;
       const bp = await res.json();
       const hasItems = bp.items && bp.items.length > 0;
+      // #810: gate auto-stop on completeConfirmed (two distinct successful fetch
+      // cycles), not a single transient/stale `complete`. Track prev on the
+      // confirmed value so the bridge-stop transition guard fires on it.
+      const confirmed = !!bp.completeConfirmed;
       const prev = _bridgeBatchPrev.get(project.id);
-      _bridgeBatchPrev.set(project.id, { complete: bp.complete, hasItems });
+      _bridgeBatchPrev.set(project.id, { complete: confirmed, hasItems });
 
-      if (bp && bp.complete) {
+      if (bp && confirmed) {
         if (hasTriggerAuto) {
-          console.log(`[auto-trigger] ${project.id}: batch complete, auto-stopped (poller)`);
+          console.log(`[auto-trigger] ${project.id}: batch complete (confirmed), auto-stopped (poller)`);
           stopTrigger(project.id);
           if (caffeinateProcess.process && triggers.size === 0) {
             try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
