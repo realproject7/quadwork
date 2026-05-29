@@ -208,6 +208,23 @@ function writeOvernightQueueFileSafe(projectId, projectName, repo) {
   } catch { /* non-fatal */ }
 }
 
+// #807: seed the per-project GITHUB.md from the template (idempotent — no-op if
+// it already exists). Mirrors writeOvernightQueueFileSafe. The machine sections
+// are then authored by the server on each fetch pass (writeGithubFileFromSnapshot).
+function writeGithubFileSafe(projectId, projectName, repo) {
+  try {
+    const ghPath = path.join(CONFIG_DIR, projectId, "GITHUB.md");
+    if (fs.existsSync(ghPath)) return;
+    const tpl = path.join(TEMPLATES_DIR, "GITHUB.md");
+    if (!fs.existsSync(tpl)) return;
+    ensureSecureDir(path.dirname(ghPath));
+    let content = fs.readFileSync(tpl, "utf-8");
+    content = content.replace(/\{\{project_name\}\}/g, projectName || projectId || "");
+    content = content.replace(/\{\{repo\}\}/g, repo || "");
+    fs.writeFileSync(ghPath, content);
+  } catch { /* non-fatal */ }
+}
+
 function getProjectMaxHops(projectId) {
   if (!projectId) return 30;
   const cfg = readConfigFile();
@@ -1237,6 +1254,7 @@ async function githubStateFetcher(repo) {
 // SAME in-flight pass, so by the time it resolves the slice caches are written.
 function refreshRepoRest(repo) {
   return _coalesce(_restRefreshing, repo, async () => {
+    let result;
     try {
       const { status, data } = await githubStateFetcher(repo);
       if (data) {
@@ -1247,11 +1265,274 @@ function refreshRepoRest(repo) {
         _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: data.closedIssues, stale: false });
         _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: data.mergedPrs, stale: false });
       }
-      return { status, data };
+      result = { status, data };
     } catch {
-      return { status: "error", data: null };
+      result = { status: "error", data: null };
     }
+    // #807: the server is the sole author of GITHUB.md's machine sections —
+    // regenerate it from this completed pass's snapshot (success or error so
+    // staleCycles advances). Non-fatal; never affects the board cache result.
+    try { syncGithubFilesForRepo(repo, result.status); } catch { /* non-fatal */ }
+    return result;
   });
+}
+
+// ─── #807 (#805 step 2): server-authored GITHUB.md ────────────────────────
+// Per-project GITHUB.md mirrors OVERNIGHT-QUEUE.md: the server is the sole
+// author of the machine sections (built from #806's structured snapshot),
+// agents read the file for discovery. Section bodies are injection-safe and
+// strictly parseable (parseGithub). The `## Notes` block is human/HEAD-writable
+// and preserved across regeneration.
+
+// Per-project freshness: projectId → { generatedAt(ms), staleCycles }.
+const _githubMeta = new Map();
+const GITHUB_SECTION_HEADERS = {
+  openIssues: "Open Issues",
+  openPRs: "Open PRs",
+  closedIssues: "Recently Closed Issues",
+  mergedPrs: "Recently Merged PRs",
+};
+
+// Collapse untrusted text to a single safe line so it can NEVER begin a new
+// `## ` section marker or break the strict list-line grammar. Also strips the
+// field delimiter (·) we use, and `[`/`]` that bound the assignees field.
+function _sanitizeInline(s) {
+  return String(s == null ? "" : s)
+    .replace(/[\r\n]+/g, " ")
+    .replace(/[·\[\]]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function _renderAssignees(assignees) {
+  // Empty → "" so the rendered `[]` round-trips back to an empty array (rather
+  // than a phantom assignee literally named "none").
+  const logins = (assignees || []).map((a) => a && a.login).filter(Boolean).map(_sanitizeInline);
+  return logins.map((l) => `@${l}`).join(", ");
+}
+
+// One strict list line: `- [#N](url) · STATE · [assignees] · title`. The
+// free-text title is LAST (the parser reads it as the line tail), and url is
+// whitespace-free, so neither can corrupt the earlier fixed fields.
+function _renderListItem(item) {
+  const url = _sanitizeInline(item.url).replace(/\s/g, "") || "-";
+  const state = _sanitizeInline(item.state).toUpperCase() || "OPEN";
+  return `- [#${item.number}](${url}) · ${state} · [${_renderAssignees(item.assignees)}] · ${_sanitizeInline(item.title)}`;
+}
+
+function _renderSection(items, renderLine) {
+  if (!items || items.length === 0) return "(none)";
+  return items.map(renderLine).join("\n");
+}
+
+// Latest review per body-marker ROLE (re1/re2) across the shared author's full
+// review list — GitHub login can't distinguish the reviewers (same account), so
+// we match RE1/RE2/Reviewer1/Reviewer2/T2a/T2b (and `## Verdict`→re1) prefixes
+// in the review BODY. A marker-less/ambiguous review is UNCOUNTED (never
+// over-counts). Mirrors GitHubPanel.tsx's body-marker logic.
+function attributeReviewsByRole(reviews) {
+  const sorted = (reviews || []).slice().sort(
+    (a, b) => (Date.parse(a && a.submittedAt) || 0) - (Date.parse(b && b.submittedAt) || 0),
+  );
+  const out = { re1: null, re2: null };
+  for (const r of sorted) {
+    const body = ((r && r.body) || "").trim();
+    let role = null;
+    if (/^(?:RE2|Reviewer2|T2b)\b/i.test(body)) role = "re2";
+    else if (/^(?:RE1|Reviewer1|T2a)\b/i.test(body) || /^##\s*Verdict/i.test(body)) role = "re1";
+    if (!role) continue; // ambiguous → uncounted
+    out[role] = { state: r.state, submittedAt: r.submittedAt || null };
+  }
+  return out;
+}
+
+function _renderReviewDetail(prs) {
+  const lines = [];
+  for (const pr of prs || []) {
+    const roles = attributeReviewsByRole(pr.reviews);
+    for (const role of ["re1", "re2"]) {
+      const rv = roles[role];
+      if (!rv) continue;
+      lines.push(`- #${pr.number} · ${role}:${_sanitizeInline(rv.state).toUpperCase()} · ${_sanitizeInline(rv.submittedAt) || "-"}`);
+    }
+  }
+  return lines.length ? lines.join("\n") : "(none)";
+}
+
+// Build the full GITHUB.md from a structured snapshot. Pure (no I/O). `notesBody`
+// is the preserved `## Notes` text. `meta` = { generatedAt(ms), staleCycles }.
+function renderGithubMarkdown(projectName, repo, snapshot, meta, notesBody) {
+  const snap = snapshot || {};
+  const generatedAt = meta && meta.generatedAt ? new Date(meta.generatedAt).toISOString() : "never";
+  const staleCycles = (meta && meta.staleCycles) || 0;
+  const stale = staleCycles > 0 || !meta || !meta.generatedAt;
+  return [
+    `# ${projectName || ""} — GitHub State`,
+    "",
+    `> **Repo:** ${repo || ""}`,
+    `> **Generated:** ${generatedAt} · staleCycles: ${staleCycles} · stale: ${stale}`,
+    ">",
+    "> Machine-generated by QuadWork — do NOT edit the sections below (overwritten",
+    "> on every sync). Edit only `## Notes`.",
+    "",
+    "---",
+    "",
+    `## ${GITHUB_SECTION_HEADERS.openIssues}`,
+    "",
+    _renderSection(snap.issues, _renderListItem),
+    "",
+    "---",
+    "",
+    `## ${GITHUB_SECTION_HEADERS.openPRs}`,
+    "",
+    _renderSection(snap.prs, _renderListItem),
+    "",
+    "---",
+    "",
+    `## ${GITHUB_SECTION_HEADERS.closedIssues}`,
+    "",
+    _renderSection(snap.closedIssues, _renderListItem),
+    "",
+    "---",
+    "",
+    `## ${GITHUB_SECTION_HEADERS.mergedPrs}`,
+    "",
+    _renderSection(snap.mergedPrs, _renderListItem),
+    "",
+    "---",
+    "",
+    "## Review Detail",
+    "",
+    _renderReviewDetail(snap.prs),
+    "",
+    "---",
+    "",
+    "## Notes",
+    "",
+    (notesBody && notesBody.trim()) ? notesBody.trim() : "(none)",
+    "",
+  ].join("\n");
+}
+
+const _GITHUB_DEFAULT_NOTES =
+  "_Advisory only. The Review Detail above is body-marker attribution (re1/re2),\n" +
+  "not merge-authoritative — Head re-checks live before merging. This section is\n" +
+  "human/Head-writable and is preserved across regeneration._";
+
+// Extract the existing `## Notes` body (preserved verbatim across regeneration).
+function _extractNotesBody(text) {
+  const m = (text || "").match(/##\s+Notes\b[^\n]*\n([\s\S]*)$/i);
+  if (!m) return _GITHUB_DEFAULT_NOTES;
+  // Drop a trailing `---`/`##` if any future section were appended (none today).
+  const body = m[1].replace(/\n##\s[\s\S]*$/i, "").trim();
+  return body || _GITHUB_DEFAULT_NOTES;
+}
+
+// Write one project's GITHUB.md atomically (temp + rename) from a snapshot,
+// preserving its `## Notes`. status drives the freshness meta.
+function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, status) {
+  try {
+    const dir = path.join(CONFIG_DIR, projectId);
+    const filePath = path.join(dir, "GITHUB.md");
+    // Cold + total failure with nothing cached: leave the seeded template be.
+    if (!snapshot && status === "error") return;
+    ensureSecureDir(dir);
+
+    let notesBody = _GITHUB_DEFAULT_NOTES;
+    try { notesBody = _extractNotesBody(fs.readFileSync(filePath, "utf-8")); } catch { /* seed defaults */ }
+
+    const meta = _githubMeta.get(projectId) || { generatedAt: 0, staleCycles: 0 };
+    if (status === "error") {
+      meta.staleCycles += 1; // keep last generatedAt — never stamp a failed cycle fresh
+    } else {
+      meta.generatedAt = Date.now();
+      meta.staleCycles = 0;
+    }
+    _githubMeta.set(projectId, meta);
+
+    const content = renderGithubMarkdown(projectName, repo, snapshot, meta, notesBody);
+    const tmp = path.join(dir, `.GITHUB.md.tmp-${process.pid}`);
+    fs.writeFileSync(tmp, content, { mode: 0o600 });
+    fs.renameSync(tmp, filePath); // atomic — readers never see partial content
+  } catch { /* non-fatal */ }
+}
+
+// Regenerate GITHUB.md for every non-idle project bound to this repo, from the
+// last-good snapshot in _graphqlCache. Idle projects are never regenerated.
+function syncGithubFilesForRepo(repo, status) {
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
+  const snapshot = _graphqlCache.get(repo) || null;
+  for (const p of cfg.projects || []) {
+    if (p.repo !== repo || p.idle) continue;
+    writeGithubFileFromSnapshot(p.id, p.name || p.id, repo, snapshot, status);
+  }
+}
+
+// ── Strict GITHUB.md parser (mirrors parseActiveBatch). Pure; section-isolating
+// (stops at the next `## `); list lines must match the exact grammar so prose
+// `#N` can't leak. Distinguishes a parse error (not our file) from an
+// empty-but-valid section. Exported for unit tests. ──
+const _GH_ITEM_RE = /^-\s+\[#(\d{1,7})\]\((\S+)\)\s+·\s+(OPEN|CLOSED|MERGED)\s+·\s+\[([^\]]*)\]\s+·\s+(.*)$/;
+const _GH_REVIEW_RE = /^-\s+#(\d{1,7})\s+·\s+(re1|re2):([A-Z_]+)\s+·\s+(\S+)$/;
+const _GH_FRESH_RE = /\*\*Generated:\*\*\s*(\S+)\s*·\s*staleCycles:\s*(\d+)\s*·\s*stale:\s*(true|false)/i;
+
+function _ghSection(text, header) {
+  const re = new RegExp(`##\\s+${header.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b[\\s\\S]*?(?=\\n##\\s|$)`, "i");
+  const m = text.match(re);
+  return m ? m[0] : null;
+}
+
+function _parseGhList(text, header) {
+  const section = _ghSection(text, header);
+  if (section == null) return null; // header missing → distinct from empty
+  const items = [];
+  for (const line of section.split("\n")) {
+    const m = line.match(_GH_ITEM_RE);
+    if (!m) continue; // prose / "(none)" / blanks are skipped
+    const assignees = m[4].split(",").map((s) => s.trim().replace(/^@/, "")).filter(Boolean).map((login) => ({ login }));
+    items.push({ number: parseInt(m[1], 10), url: m[2], state: m[3], assignees, title: m[5].trim() });
+  }
+  return items;
+}
+
+function parseGithub(text) {
+  if (typeof text !== "string" || !text.trim()) {
+    return { ok: false, error: "empty or non-string input" };
+  }
+  const openIssues = _parseGhList(text, GITHUB_SECTION_HEADERS.openIssues);
+  const openPRs = _parseGhList(text, GITHUB_SECTION_HEADERS.openPRs);
+  const closedIssues = _parseGhList(text, GITHUB_SECTION_HEADERS.closedIssues);
+  const mergedPrs = _parseGhList(text, GITHUB_SECTION_HEADERS.mergedPrs);
+  // If none of the required machine headers exist, this isn't a GITHUB.md.
+  if (openIssues == null && openPRs == null && closedIssues == null && mergedPrs == null) {
+    return { ok: false, error: "no recognizable GITHUB.md sections" };
+  }
+
+  // Review Detail → { [prNumber]: { re1?: {state,submittedAt}, re2?: {...} } }.
+  const reviewDetail = {};
+  const reviewSection = _ghSection(text, "Review Detail");
+  if (reviewSection) {
+    for (const line of reviewSection.split("\n")) {
+      const m = line.match(_GH_REVIEW_RE);
+      if (!m) continue;
+      const n = parseInt(m[1], 10);
+      (reviewDetail[n] || (reviewDetail[n] = {}))[m[2]] = { state: m[3], submittedAt: m[4] };
+    }
+  }
+
+  const fresh = text.match(_GH_FRESH_RE);
+  return {
+    ok: true,
+    generatedAt: fresh && fresh[1] !== "never" ? fresh[1] : null,
+    staleCycles: fresh ? parseInt(fresh[2], 10) : 0,
+    stale: fresh ? fresh[3].toLowerCase() === "true" : true,
+    openIssues: openIssues || [],
+    openPRs: openPRs || [],
+    closedIssues: closedIssues || [],
+    mergedPrs: mergedPrs || [],
+    reviewDetail,
+  };
 }
 
 // Build and execute a batched GraphQL query for all configured projects.
@@ -2085,6 +2366,33 @@ router.get("/api/batch-active", (req, res) => {
   return res.json({ active });
 });
 
+// #807: parsed view of the server-authored GITHUB.md. Single source of truth is
+// the file, so this endpoint and file-reading agents see identical data. Same
+// project/config guard as batch-active (a traversal id isn't in config →
+// getRepo null → 400). Surfaces freshness + a distinct parse-error result.
+router.get("/api/github-parsed", (req, res) => {
+  const projectId = req.query.project;
+  if (!projectId) return res.status(400).json({ error: "Missing project" });
+  if (!getRepo(projectId)) return res.status(400).json({ error: "No repo configured for project" });
+  const ghPath = path.join(CONFIG_DIR, projectId, "GITHUB.md");
+  let text;
+  try {
+    text = fs.readFileSync(ghPath, "utf-8");
+  } catch {
+    return res.json({ ok: false, error: "GITHUB.md not found" });
+  }
+  const parsed = parseGithub(text);
+  if (!parsed.ok) return res.json(parsed);
+  // Live staleness: even when the file isn't regenerated (e.g. rate-limited →
+  // adaptiveTTL serves expired data with no new pass), age must stay visible.
+  const ageMs = parsed.generatedAt ? Date.now() - Date.parse(parsed.generatedAt) : null;
+  return res.json({
+    ...parsed,
+    ageMs,
+    _stale: parsed.stale || (ageMs != null && ageMs > adaptiveTTL(GRAPHQL_CACHE_TTL)),
+  });
+});
+
 router.get("/api/batch-progress", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
@@ -2476,6 +2784,7 @@ router.post("/api/setup", (req, res) => {
         // below no-ops when the file is already present, so this
         // can't clobber Head/user edits.
         writeOvernightQueueFileSafe(id, cfg.projects.find((p) => p.id === id)?.name || id, cfg.projects.find((p) => p.id === id)?.repo || "");
+        writeGithubFileSafe(id, cfg.projects.find((p) => p.id === id)?.name || id, cfg.projects.find((p) => p.id === id)?.repo || "");
         return res.json({ ok: true, message: "Project already in config" });
       }
       // Match CLI wizard agent structure: { cwd, command, auto_approve, mcp_inject }
@@ -2515,6 +2824,8 @@ router.post("/api/setup", (req, res) => {
       // Batch 25 / #204: seed the per-project OVERNIGHT-QUEUE.md at
       // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md.
       writeOvernightQueueFileSafe(id, name || id, repo);
+      // #807: seed the per-project GITHUB.md alongside it.
+      writeGithubFileSafe(id, name || id, repo);
 
       return res.json({ ok: true });
     }
@@ -3076,3 +3387,8 @@ module.exports.restPullBaseToCanonical = restPullBaseToCanonical;
 module.exports.mapReviews = mapReviews;
 module.exports.deriveReviewDecision = deriveReviewDecision;
 module.exports.buildStatusCheckRollup = buildStatusCheckRollup;
+// #807: expose the GITHUB.md parser/renderer + role attribution for unit tests.
+// No production callers outside this file.
+module.exports.parseGithub = parseGithub;
+module.exports.renderGithubMarkdown = renderGithubMarkdown;
+module.exports.attributeReviewsByRole = attributeReviewsByRole;
