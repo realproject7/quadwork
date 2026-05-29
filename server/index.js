@@ -514,6 +514,8 @@ async function spawnAgentPty(project, agent, opts = {}) {
           onRestart: () => {
             session._autoRecovering = true;
             console.log(`[self-heal] ${key}: thinking-block 400 detected — restarting session`);
+            // #825: NO clearSelfHeal here — the breaker window must persist
+            // across auto-restarts so repeated trips can pause auto-recovery.
             restartAgentSession(key, { reason: "thinking-block-400" })
               .then((result) => {
                 if (result && result.ok) {
@@ -557,7 +559,16 @@ async function spawnAgentPty(project, agent, opts = {}) {
   }
 }
 
-async function stopAgentSession(key) {
+async function stopAgentSession(key, { clearSelfHeal = false } = {}) {
+  // #825 (#797 follow-up): a MANUAL stop/restart/reset must reset the per-agent
+  // self-heal circuit-breaker window, so a fresh operator-driven session isn't
+  // suppressed by a stale "paused" state from a prior trip. This is gated:
+  // the auto-restart path (restartAgentSession with reason "thinking-block-400")
+  // leaves clearSelfHeal=false, because clearing on every auto-restart would
+  // reset countInWindow each time and defeat the #797 breaker entirely. Cleared
+  // before the session lookup so a manual stop resets the window even when no
+  // live session remains (e.g. the agent already exited).
+  if (clearSelfHeal) selfHeal.clearState(key);
   const session = agentSessions.get(key);
   if (!session) {
     agentSessions.set(key, { projectId: null, agentId: null, term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null });
@@ -628,7 +639,7 @@ app.post("/api/agents/:project/reset", async (req, res) => {
     for (const agentId of allAgentIds) {
       const s = agentSessions.get(`${projectId}/${agentId}`);
       if (s) s._suppressLifecycleMsg = true;
-      await stopAgentSession(`${projectId}/${agentId}`);
+      await stopAgentSession(`${projectId}/${agentId}`, { clearSelfHeal: true }); // #825: manual reset resets the self-heal window
     }
 
     // Respawn all agents with fresh MCP tokens
@@ -667,7 +678,7 @@ app.post("/api/full-reset", async (_req, res) => {
     console.log("[full-reset] stopping all agent sessions...");
     const sessionKeys = [...agentSessions.keys()];
     for (const key of sessionKeys) {
-      await stopAgentSession(key);
+      await stopAgentSession(key, { clearSelfHeal: true }); // #825: manual full-reset resets the self-heal window
     }
 
     console.log("[full-reset] stopping Butler...");
@@ -739,7 +750,7 @@ app.post("/api/agents/:project/:agent/start", async (req, res) => {
 app.post("/api/agents/:project/:agent/stop", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
-  await stopAgentSession(key);
+  await stopAgentSession(key, { clearSelfHeal: true }); // #825: manual stop resets the self-heal window
   res.json({ ok: true, state: "stopped" });
 });
 
@@ -748,7 +759,7 @@ app.post("/api/agents/:project/:agent/stop", async (req, res) => {
 // #797: shared restart sequence, used by both the manual restart route and
 // the self-heal detector. Exactly the prior route body — no new lifecycle
 // logic. The `reason` is informational (logged by callers).
-async function restartAgentSession(key, { reason } = {}) {
+async function restartAgentSession(key, { reason, clearSelfHeal = false } = {}) {
   const [project, agent] = key.split("/");
   console.log(`[restart] ${key}: restarting session (reason: ${reason || "unspecified"})`);
 
@@ -756,7 +767,9 @@ async function restartAgentSession(key, { reason } = {}) {
   // the fresh register lands at slot 1 instead of head-2.
   const existing = agentSessions.get(key);
   if (existing) existing._suppressLifecycleMsg = true;
-  await stopAgentSession(key);
+  // #825: forward clearSelfHeal — a manual restart resets the breaker window;
+  // the self-heal auto-restart does NOT (preserves the #797 circuit breaker).
+  await stopAgentSession(key, { clearSelfHeal });
 
   return spawnAgentPty(project, agent, { suppressLifecycleMsg: true });
 }
@@ -765,7 +778,7 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
-  const result = await restartAgentSession(key, { reason: "manual" });
+  const result = await restartAgentSession(key, { reason: "manual", clearSelfHeal: true }); // #825
   if (result.ok) {
     emitSystemMessage(project, `${agent} restarted`);
     res.json({ ok: true, state: "running", pid: result.pid });
