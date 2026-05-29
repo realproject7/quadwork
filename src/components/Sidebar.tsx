@@ -137,9 +137,10 @@ interface ProjectIconProps {
   hasActiveBatch: boolean;
   onContextMenu: (e: React.MouseEvent, projectId: string) => void;
   onToggleActive: (project: Project) => void;
+  togglePending?: boolean;
 }
 
-function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onContextMenu, onToggleActive }: ProjectIconProps) {
+function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onContextMenu, onToggleActive, togglePending }: ProjectIconProps) {
   const [tooltip, setTooltip] = useState<{ top: number } | null>(null);
   const ref = useRef<HTMLAnchorElement>(null);
 
@@ -208,7 +209,7 @@ function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onCo
       }`}
     >
       {link}
-      <ActiveSwitch active={!project.idle} onToggle={() => onToggleActive(project)} />
+      <ActiveSwitch active={!project.idle} onToggle={() => onToggleActive(project)} disabled={togglePending} />
     </div>
   );
 }
@@ -238,13 +239,25 @@ export default function Sidebar() {
   const [activeBatches, setActiveBatches] = useState<Set<string>>(new Set());
   // #814: pending "Set Inactive?" confirmation (null = no modal open).
   const [idleConfirm, setIdleConfirm] = useState<{ id: string; name: string } | null>(null);
+  // #826: project ids with an idle PUT in flight — the switch is disabled for
+  // them so a queued double-toggle can't race the persist.
+  const [idlePending, setIdlePending] = useState<Set<string>>(new Set());
 
   // Optimistically flip a project's idle flag, persist, and revert on failure.
   const applyIdle = useCallback((projectId: string, nextIdle: boolean) => {
     setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, idle: nextIdle } : p)));
-    persistProjectIdle(projectId, nextIdle).catch(() => {
-      setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, idle: !nextIdle } : p)));
-    });
+    setIdlePending((prev) => new Set(prev).add(projectId));
+    persistProjectIdle(projectId, nextIdle)
+      .catch(() => {
+        setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, idle: !nextIdle } : p)));
+      })
+      .finally(() => {
+        setIdlePending((prev) => {
+          const next = new Set(prev);
+          next.delete(projectId);
+          return next;
+        });
+      });
   }, []);
 
   // Going Inactive (parking) requires confirmation; resuming is safe.
@@ -510,6 +523,7 @@ export default function Sidebar() {
                 hasActiveBatch={activeBatches.has(project.id)}
                 onContextMenu={handleContextMenu}
                 onToggleActive={handleToggleActive}
+                togglePending={idlePending.has(project.id)}
               />
             ))}
             <div className={`h-px bg-border ${isExpanded ? "" : "w-6"}`} />
@@ -551,6 +565,7 @@ export default function Sidebar() {
                   hasActiveBatch={activeBatches.has(project.id)}
                   onContextMenu={handleContextMenu}
                   onToggleActive={handleToggleActive}
+                  togglePending={idlePending.has(project.id)}
                 />
               ))}
             </div>
@@ -578,6 +593,7 @@ export default function Sidebar() {
             hasActiveBatch={activeBatches.has(project.id)}
             onContextMenu={handleContextMenu}
             onToggleActive={handleToggleActive}
+            togglePending={idlePending.has(project.id)}
           />
         ))}
 
