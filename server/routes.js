@@ -40,6 +40,15 @@ const _rateLimit = {
   updatedAt: 0,      // epoch ms when we last fetched
   error: null,       // last fetch error message, if any
 };
+// #802: GitHub tracks REST (core) and GraphQL as SEPARATE budgets, so GraphQL
+// can hit 0 while REST is full. The background GraphQL poller and the
+// batch-progress GraphQL query must back off on THIS bucket, not the REST one.
+const _graphqlRateLimit = {
+  limit: 5000,       // GraphQL is a points/hour budget, not request count
+  remaining: 5000,
+  resetAt: 0,        // epoch ms
+  updatedAt: 0,      // epoch ms when we last fetched
+};
 const RATE_LIMIT_POLL_MS = 60_000;       // refresh every 60s
 const RATE_LIMIT_LOW_THRESHOLD = 200;    // below this → back off
 const RATE_LIMIT_CRITICAL = 50;          // below this → stop all infra gh calls
@@ -47,15 +56,24 @@ let _rateLimitTimer = null;
 
 async function refreshRateLimit() {
   try {
+    // One `gh api rate_limit` call returns every resource bucket; grab both
+    // core (REST) and graphql so each stream can gate on its own budget (#802).
     const { stdout } = await _execFileAsync("gh", [
-      "api", "rate_limit", "--jq", ".resources.core | {limit,remaining,reset}",
+      "api", "rate_limit", "--jq",
+      "{core: (.resources.core | {limit,remaining,reset}), graphql: (.resources.graphql | {limit,remaining,reset})}",
     ], { encoding: "utf-8", timeout: 10000 });
     const data = JSON.parse(stdout);
-    _rateLimit.limit = data.limit;
-    _rateLimit.remaining = data.remaining;
-    _rateLimit.resetAt = data.reset * 1000; // seconds → ms
+    _rateLimit.limit = data.core.limit;
+    _rateLimit.remaining = data.core.remaining;
+    _rateLimit.resetAt = data.core.reset * 1000; // seconds → ms
     _rateLimit.updatedAt = Date.now();
     _rateLimit.error = null;
+    if (data.graphql) {
+      _graphqlRateLimit.limit = data.graphql.limit;
+      _graphqlRateLimit.remaining = data.graphql.remaining;
+      _graphqlRateLimit.resetAt = data.graphql.reset * 1000;
+      _graphqlRateLimit.updatedAt = Date.now();
+    }
   } catch (err) {
     _rateLimit.error = err.message;
     _rateLimit.updatedAt = Date.now();
@@ -73,6 +91,13 @@ function isRateLimited() {
 }
 function isRateLow() {
   return _rateLimit.remaining < RATE_LIMIT_LOW_THRESHOLD;
+}
+// #802: same thresholds, applied to the separate GraphQL budget.
+function isGraphqlRateLimited() {
+  return _graphqlRateLimit.remaining < RATE_LIMIT_CRITICAL;
+}
+function isGraphqlRateLow() {
+  return _graphqlRateLimit.remaining < RATE_LIMIT_LOW_THRESHOLD;
 }
 
 // Adaptive cache TTL: normal 30s, low 120s, critical ∞ (serve stale)
@@ -1120,7 +1145,10 @@ fragment repoFields on Repository {
 // and on demand when a per-project endpoint has no cached data.
 async function refreshGraphQLCache() {
   if (_graphqlRefreshInFlight) return;
-  if (isRateLimited()) return; // don't burn quota when critically low
+  // #802: gate on the GraphQL budget (not REST). The proactive background
+  // poller backs off at the LOW threshold to preserve points for on-demand
+  // requests, which only hard-stop at critical.
+  if (isGraphqlRateLow()) return;
   _graphqlRefreshInFlight = true;
   try {
     const data = await fetchAllProjectsGraphQL();
@@ -1876,6 +1904,12 @@ router.get("/api/batch-progress", async (req, res) => {
   if (isRateLimited() && cached) {
     return res.json({ ...cached.data, _stale: true, _rateLimited: true });
   }
+  // #802: GraphQL budget exhausted (separate from REST) — prefer serving the
+  // existing cache (even stale) over the GraphQL query below. With no cache we
+  // fall through to the REST gh-CLI fallback path (gated on its own bucket).
+  if (isGraphqlRateLimited() && cached) {
+    return res.json({ ...cached.data, _stale: true, _rateLimited: true });
+  }
 
   const repo = getRepo(projectId);
   if (!repo) return res.status(400).json({ error: "No repo configured for project" });
@@ -1926,8 +1960,12 @@ router.get("/api/batch-progress", async (req, res) => {
   // #703: Try batched GraphQL first — one query for all batch items.
   // Falls back to individual gh CLI calls (the #416 parallel approach)
   // if GraphQL fails.
+  // #802: skip GraphQL entirely when the GraphQL budget is critical so we
+  // don't drain it further; null forces the REST gh-CLI fallback below.
   let items;
-  const graphqlData = await fetchBatchProgressGraphQL(repo, issueNumbers);
+  const graphqlData = isGraphqlRateLimited()
+    ? null
+    : await fetchBatchProgressGraphQL(repo, issueNumbers);
   if (graphqlData) {
     items = issueNumbers.map((n) => {
       const issueNode = graphqlData[`issue${n}`];
@@ -2819,3 +2857,8 @@ module.exports.normalizeMentions = normalizeMentions;
 module.exports.getProjectChatMode = getProjectChatMode;
 // #730: PTY dispatch callback setter
 module.exports.setPtyDispatchCallback = setPtyDispatchCallback;
+// #802: expose the GraphQL rate-limit bucket + predicates for unit tests.
+// No production callers outside this file.
+module.exports._graphqlRateLimit = _graphqlRateLimit;
+module.exports.isGraphqlRateLimited = isGraphqlRateLimited;
+module.exports.isGraphqlRateLow = isGraphqlRateLow;
