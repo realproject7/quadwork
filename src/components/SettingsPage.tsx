@@ -4,6 +4,9 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
 import { MODEL_OPTIONS, optionsForBackend } from "./AgentModelsWidget";
+import ActiveSwitch from "./ActiveSwitch";
+import ConfirmModal from "./ConfirmModal";
+import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
 
 interface AgentConfig {
   display_name: string;
@@ -24,6 +27,7 @@ interface ProjectConfig {
   working_dir: string;
   agents: Record<string, AgentConfig>;
   archived?: boolean;
+  idle?: boolean;
 }
 
 interface ButlerConfig {
@@ -277,6 +281,39 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const savedConfigRef = useRef<string>("");
   const [butlerStartConfig, setButlerStartConfig] = useState<{ command: string; model: string } | null>(null);
+  // #814: pending "Set Inactive?" confirmation (null = no modal).
+  const [idleConfirm, setIdleConfirm] = useState<{ id: string; name: string } | null>(null);
+
+  // Keep the saved snapshot's idle in lockstep with an idle toggle. Idle is
+  // persisted immediately (out of band from the batched Save), so without this
+  // it would falsely register as an unsaved change (isDirty) and a later Save
+  // could clobber an idle change made in the sidebar.
+  const syncSavedIdle = useCallback((projectId: string, idle: boolean) => {
+    try {
+      const saved = JSON.parse(savedConfigRef.current);
+      const sp = (saved.projects || []).find((p: { id: string }) => p.id === projectId);
+      if (sp) { sp.idle = idle; savedConfigRef.current = JSON.stringify(saved); }
+    } catch { /* no saved snapshot yet */ }
+  }, []);
+
+  const setProjectIdleLocal = useCallback((projectId: string, idle: boolean) => {
+    setConfig((prev) => (prev ? { ...prev, projects: prev.projects.map((p) => (p.id === projectId ? { ...p, idle } : p)) } : prev));
+    syncSavedIdle(projectId, idle);
+  }, [syncSavedIdle]);
+
+  // Optimistic local flip + immediate persist + revert on failure.
+  const applyIdle = useCallback((projectId: string, nextIdle: boolean) => {
+    setProjectIdleLocal(projectId, nextIdle);
+    persistProjectIdle(projectId, nextIdle).catch(() => setProjectIdleLocal(projectId, !nextIdle));
+  }, [setProjectIdleLocal]);
+
+  const handleToggleActive = useCallback((project: ProjectConfig) => {
+    if (!project.idle) setIdleConfirm({ id: project.id, name: project.name });
+    else applyIdle(project.id, false);
+  }, [applyIdle]);
+
+  // Re-sync when idle is changed elsewhere (sidebar, dashboard).
+  useEffect(() => onIdleChange(({ projectId, idle }) => setProjectIdleLocal(projectId, idle)), [setProjectIdleLocal]);
   // #212: drop the per-project accordion. AGENTS.md edit toggles
   // still need a per-key flag, so we keep `expanded` but no longer
   // gate the project body on it — every project is open by default.
@@ -833,6 +870,14 @@ export default function SettingsPage() {
               {/* Header — #212: no accordion, body always visible */}
               <div className="flex items-center justify-between px-3 py-2">
                 <span className="text-[12px] text-text font-semibold">{project.name}</span>
+                {/* #814: per-project Active/Inactive status + switch (same source
+                    of truth + confirmation as the sidebar). */}
+                <div className="flex items-center gap-2">
+                  <span className={`text-[10px] uppercase tracking-wider ${project.idle ? "text-text-muted" : "text-accent"}`}>
+                    {project.idle ? "Inactive" : "Active"}
+                  </span>
+                  <ActiveSwitch active={!project.idle} onToggle={() => handleToggleActive(project)} />
+                </div>
               </div>
 
               {(
@@ -1073,6 +1118,16 @@ export default function SettingsPage() {
             {saving ? t.saving : t.save}
           </button>
         </div>
+      )}
+
+      {idleConfirm && (
+        <ConfirmModal
+          title={idleConfirmTitle(idleConfirm.name)}
+          body={IDLE_CONFIRM_BODY}
+          confirmLabel="Set Inactive"
+          onConfirm={() => { applyIdle(idleConfirm.id, true); setIdleConfirm(null); }}
+          onCancel={() => setIdleConfirm(null)}
+        />
       )}
     </div>
   );

@@ -3,6 +3,9 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
+import ActiveSwitch from "./ActiveSwitch";
+import ConfirmModal from "./ConfirmModal";
+import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
 
 function HamburgerIcon() {
   return (
@@ -23,6 +26,7 @@ function CloseXIcon() {
 interface Project {
   id: string;
   name: string;
+  idle?: boolean;
 }
 
 interface SidebarGroup {
@@ -132,60 +136,80 @@ interface ProjectIconProps {
   pinned: boolean;
   hasActiveBatch: boolean;
   onContextMenu: (e: React.MouseEvent, projectId: string) => void;
+  onToggleActive: (project: Project) => void;
 }
 
-function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onContextMenu }: ProjectIconProps) {
+function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onContextMenu, onToggleActive }: ProjectIconProps) {
   const [tooltip, setTooltip] = useState<{ top: number } | null>(null);
   const ref = useRef<HTMLAnchorElement>(null);
 
-  return (
-    <>
-      <Link
-        ref={ref}
-        href={`/project/${project.id}`}
-        className={`flex items-center gap-2 ${expanded ? "w-full px-2" : ""} rounded-sm transition-colors ${
-          !expanded ? "" : isActive ? "bg-[#1a1a1a]" : "hover:bg-[#1a1a1a]"
-        }`}
-        onMouseEnter={() => {
-          if (expanded) return;
-          const rect = ref.current?.getBoundingClientRect();
-          if (rect) setTooltip({ top: rect.top + rect.height / 2 });
-        }}
-        onMouseLeave={() => setTooltip(null)}
-        onContextMenu={(e) => onContextMenu(e, project.id)}
-      >
-        <div className="relative shrink-0">
-          <div
-            className={`w-10 h-10 flex items-center justify-center rounded-full text-[11px] font-semibold uppercase tracking-tight transition-colors ${
-              isActive
-                ? "border-2 border-accent text-accent"
-                : "border border-border text-text-muted hover:text-text"
-            } ${hasActiveBatch ? "animate-pulse-ring" : ""}`}
-          >
-            {project.name.slice(0, 2) || "?"}
-          </div>
-          {pinned && !expanded && (
-            <div className="absolute -top-1 -right-1 text-accent">
-              <PinIcon size={8} />
-            </div>
-          )}
-        </div>
-        {expanded && (
-          <span className={`text-xs truncate flex items-center gap-1 ${isActive ? "text-accent" : "text-text-muted"}`}>
-            {project.name}
-            {pinned && <PinIcon size={10} />}
-          </span>
-        )}
-      </Link>
-      {!expanded && tooltip && (
+  const link = (
+    <Link
+      ref={ref}
+      href={`/project/${project.id}`}
+      className={`flex items-center gap-2 ${expanded ? "flex-1 min-w-0" : ""} rounded-sm transition-colors`}
+      onMouseEnter={() => {
+        if (expanded) return;
+        const rect = ref.current?.getBoundingClientRect();
+        if (rect) setTooltip({ top: rect.top + rect.height / 2 });
+      }}
+      onMouseLeave={() => setTooltip(null)}
+      onContextMenu={(e) => onContextMenu(e, project.id)}
+    >
+      <div className="relative shrink-0">
         <div
-          className="fixed px-2 py-1 bg-bg-surface border border-border text-text text-xs whitespace-nowrap pointer-events-none z-50"
-          style={{ left: 72, top: tooltip.top, transform: "translateY(-50%)" }}
+          className={`w-10 h-10 flex items-center justify-center rounded-full text-[11px] font-semibold uppercase tracking-tight transition-colors ${
+            isActive
+              ? "border-2 border-accent text-accent"
+              : "border border-border text-text-muted hover:text-text"
+          } ${hasActiveBatch ? "animate-pulse-ring" : ""}`}
         >
-          {pinned && "📌 "}{project.name}
+          {project.name.slice(0, 2) || "?"}
         </div>
+        {pinned && !expanded && (
+          <div className="absolute -top-1 -right-1 text-accent">
+            <PinIcon size={8} />
+          </div>
+        )}
+      </div>
+      {expanded && (
+        <span className={`text-xs truncate flex items-center gap-1 ${isActive ? "text-accent" : "text-text-muted"}`}>
+          {project.name}
+          {pinned && <PinIcon size={10} />}
+        </span>
       )}
-    </>
+    </Link>
+  );
+
+  // Collapsed (icon-only) rail: just the link + hover tooltip — no switch room.
+  if (!expanded) {
+    return (
+      <>
+        {link}
+        {tooltip && (
+          <div
+            className="fixed px-2 py-1 bg-bg-surface border border-border text-text text-xs whitespace-nowrap pointer-events-none z-50"
+            style={{ left: 72, top: tooltip.top, transform: "translateY(-50%)" }}
+          >
+            {pinned && "📌 "}{project.name}
+          </div>
+        )}
+      </>
+    );
+  }
+
+  // Expanded: nav row with the Active/Inactive switch on the right. The switch
+  // is a sibling of the Link (not nested) and stops propagation, so toggling
+  // never navigates.
+  return (
+    <div
+      className={`flex items-center w-full px-2 rounded-sm transition-colors ${
+        isActive ? "bg-[#1a1a1a]" : "hover:bg-[#1a1a1a]"
+      }`}
+    >
+      {link}
+      <ActiveSwitch active={!project.idle} onToggle={() => onToggleActive(project)} />
+    </div>
   );
 }
 
@@ -212,6 +236,30 @@ export default function Sidebar() {
   const [version, setVersion] = useState<string>("");
   const configRef = useRef<Record<string, unknown> | null>(null);
   const [activeBatches, setActiveBatches] = useState<Set<string>>(new Set());
+  // #814: pending "Set Inactive?" confirmation (null = no modal open).
+  const [idleConfirm, setIdleConfirm] = useState<{ id: string; name: string } | null>(null);
+
+  // Optimistically flip a project's idle flag, persist, and revert on failure.
+  const applyIdle = useCallback((projectId: string, nextIdle: boolean) => {
+    setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, idle: nextIdle } : p)));
+    persistProjectIdle(projectId, nextIdle).catch(() => {
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, idle: !nextIdle } : p)));
+    });
+  }, []);
+
+  // Going Inactive (parking) requires confirmation; resuming is safe.
+  const handleToggleActive = useCallback((project: Project) => {
+    if (!project.idle) {
+      setIdleConfirm({ id: project.id, name: project.name });
+    } else {
+      applyIdle(project.id, false);
+    }
+  }, [applyIdle]);
+
+  // Re-sync when idle is changed elsewhere (settings, dashboard, other tab view).
+  useEffect(() => onIdleChange(({ projectId, idle }) => {
+    setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, idle } : p)));
+  }), []);
 
   // Close mobile overlay on navigation
   useEffect(() => {
@@ -461,6 +509,7 @@ export default function Sidebar() {
                 pinned
                 hasActiveBatch={activeBatches.has(project.id)}
                 onContextMenu={handleContextMenu}
+                onToggleActive={handleToggleActive}
               />
             ))}
             <div className={`h-px bg-border ${isExpanded ? "" : "w-6"}`} />
@@ -501,6 +550,7 @@ export default function Sidebar() {
                   pinned={false}
                   hasActiveBatch={activeBatches.has(project.id)}
                   onContextMenu={handleContextMenu}
+                  onToggleActive={handleToggleActive}
                 />
               ))}
             </div>
@@ -527,6 +577,7 @@ export default function Sidebar() {
             pinned={false}
             hasActiveBatch={activeBatches.has(project.id)}
             onContextMenu={handleContextMenu}
+            onToggleActive={handleToggleActive}
           />
         ))}
 
@@ -666,6 +717,16 @@ export default function Sidebar() {
         <div className={`text-[10px] text-text-muted/40 ${isExpanded ? "px-3" : "text-center"} pt-2`}>
           v{version}
         </div>
+      )}
+
+      {idleConfirm && (
+        <ConfirmModal
+          title={idleConfirmTitle(idleConfirm.name)}
+          body={IDLE_CONFIRM_BODY}
+          confirmLabel="Set Inactive"
+          onConfirm={() => { applyIdle(idleConfirm.id, true); setIdleConfirm(null); }}
+          onCancel={() => setIdleConfirm(null)}
+        />
       )}
     </>
   );
