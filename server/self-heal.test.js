@@ -1,7 +1,7 @@
 "use strict";
 
 const selfHeal = require("./self-heal");
-const { observeChunk, isThinkingBlock400, breakerMessage, _state, COOLDOWN_MS } = selfHeal;
+const { observeChunk, isThinkingBlock400, breakerMessage, clearState, _state, COOLDOWN_MS } = selfHeal;
 
 // The real thinking-block 400 line emitted by claude on Opus 4.8.
 const SIGNATURE =
@@ -112,6 +112,34 @@ function runTests() {
     }
     assert(!threw, "detector swallows a throwing callback (PTY pipeline stays intact)");
     assert(result === "restart", "detection decision is still reported despite the callback throw");
+  }
+
+  // --- Test 7 (#825): clearState resets a tripped breaker, so a manual
+  //     stop+restart re-enables auto-recovery. stopAgentSession(key,
+  //     {clearSelfHeal:true}) calls clearState on every manual stop/restart/
+  //     reset; this asserts the module behaviour that makes that effective. ---
+  {
+    _state.clear();
+    let restarts = 0;
+    let breakerMsgs = [];
+    const mk = (now) => observeChunk(KEY, SIGNATURE, {
+      now, recovering: false,
+      onRestart: () => { restarts++; },
+      onBreaker: (m) => { breakerMsgs.push(m); },
+    });
+    const step = COOLDOWN_MS + 1000;
+    mk(step); mk(step * 2); mk(step * 3);          // 3 restarts → breaker trips
+    assert(restarts === 3 && mk(step * 4) === "breaker", "precondition: breaker tripped after 3 restarts");
+
+    // Operator manually stops the agent → stopAgentSession calls clearState.
+    clearState(KEY);
+    assert(!_state.has(KEY), "clearState drops the per-agent breaker/cooldown state");
+
+    // The fresh manual session's first thinking-block 400 auto-restarts again —
+    // NOT suppressed by the stale tripped window.
+    const after = mk(step * 5);
+    assert(after === "restart" && restarts === 4, "after clearState, auto-recovery works again (window reset, breaker no longer suppressing)");
+    assert(breakerMsgs.length === 1, "the reset did not re-emit the breaker message");
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
