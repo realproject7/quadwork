@@ -137,6 +137,9 @@ function run() {
     ok(_githubLiveStale(false, 1000) === false, "fresh data (age within window) → not stale");
     ok(_githubLiveStale(false, GITHUB_FRESH_TTL_MS + 1) === true, "age beyond the fixed window → stale (the rate-limited case)");
     ok(_githubLiveStale(false, null) === true, "no generatedAt (null age) → stale");
+    // #827: a malformed/corrupted `generatedAt` → Date.parse NaN. Must be
+    // treated as stale/unknown, NOT fresh (NaN > window is false, which hid it).
+    ok(_githubLiveStale(false, NaN) === true, "NaN age (unparseable generatedAt) → stale, not hidden");
     ok(_githubLiveStale(true, 0) === true, "header already stale → stale regardless of age");
     ok(typeof GITHUB_FRESH_TTL_MS === "number" && Number.isFinite(GITHUB_FRESH_TTL_MS), "freshness window is a finite constant (never Infinity)");
   }
