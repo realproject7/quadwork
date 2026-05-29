@@ -1851,6 +1851,14 @@ router.get("/api/batch-progress", async (req, res) => {
   if (!projectId) return res.status(400).json({ error: "Missing project" });
 
   const cached = _batchProgressCache.get(projectId);
+  // #812: parked (idle) project — never run batch-progress gh/GraphQL calls,
+  // and ALWAYS flag the payload _idle (even on a fresh cache hit), so the
+  // endpoint contract is consistent regardless of cache freshness. This must
+  // precede the fresh-cache and rate-limit returns below.
+  if (isProjectIdle(projectId)) {
+    if (cached) return res.json({ ...cached.data, _idle: true });
+    return res.json({ batch_number: null, items: [], summary: "", complete: false, _idle: true });
+  }
   const batchTTL = adaptiveTTL(BATCH_PROGRESS_TTL_MS);
   if (cached && Date.now() - cached.ts < batchTTL) {
     return res.json(cached.data);
@@ -1859,12 +1867,6 @@ router.get("/api/batch-progress", async (req, res) => {
   // firing N gh calls per batch item.
   if (isRateLimited() && cached) {
     return res.json({ ...cached.data, _stale: true, _rateLimited: true });
-  }
-  // #812: parked (idle) project — never run batch-progress gh/GraphQL calls.
-  // Serve last-known data (or an empty batch) flagged _idle.
-  if (isProjectIdle(projectId)) {
-    if (cached) return res.json({ ...cached.data, _idle: true });
-    return res.json({ batch_number: null, items: [], summary: "", complete: false, _idle: true });
   }
 
   const repo = getRepo(projectId);
