@@ -283,6 +283,9 @@ export default function SettingsPage() {
   const [butlerStartConfig, setButlerStartConfig] = useState<{ command: string; model: string } | null>(null);
   // #814: pending "Set Inactive?" confirmation (null = no modal).
   const [idleConfirm, setIdleConfirm] = useState<{ id: string; name: string } | null>(null);
+  // #826: project ids with an idle PUT in flight — disable the switch for them
+  // so a queued double-toggle can't race the persist.
+  const [idlePending, setIdlePending] = useState<Set<string>>(new Set());
 
   // Keep the saved snapshot's idle in lockstep with an idle toggle. Idle is
   // persisted immediately (out of band from the batched Save), so without this
@@ -304,7 +307,14 @@ export default function SettingsPage() {
   // Optimistic local flip + immediate persist + revert on failure.
   const applyIdle = useCallback((projectId: string, nextIdle: boolean) => {
     setProjectIdleLocal(projectId, nextIdle);
-    persistProjectIdle(projectId, nextIdle).catch(() => setProjectIdleLocal(projectId, !nextIdle));
+    setIdlePending((prev) => new Set(prev).add(projectId));
+    persistProjectIdle(projectId, nextIdle)
+      .catch(() => setProjectIdleLocal(projectId, !nextIdle))
+      .finally(() => setIdlePending((prev) => {
+        const next = new Set(prev);
+        next.delete(projectId);
+        return next;
+      }));
   }, [setProjectIdleLocal]);
 
   const handleToggleActive = useCallback((project: ProjectConfig) => {
@@ -876,7 +886,7 @@ export default function SettingsPage() {
                   <span className={`text-[10px] uppercase tracking-wider ${project.idle ? "text-text-muted" : "text-accent"}`}>
                     {project.idle ? "Inactive" : "Active"}
                   </span>
-                  <ActiveSwitch active={!project.idle} onToggle={() => handleToggleActive(project)} />
+                  <ActiveSwitch active={!project.idle} onToggle={() => handleToggleActive(project)} disabled={idlePending.has(project.id)} />
                 </div>
               </div>
 

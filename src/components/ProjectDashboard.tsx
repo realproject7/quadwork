@@ -136,24 +136,39 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   // the operator flips the switch elsewhere (no manual reload).
   const [idle, setIdle] = useState(false);
   const idleLoadedRef = useRef(false);
+  // #826: a live idle signal that arrives while the initial /api/config read is
+  // in flight is AUTHORITATIVE — the operator just toggled the switch, so the
+  // (possibly stale) config result must not overwrite it back. Tracked per
+  // mount/project and reset alongside idleLoadedRef.
+  const idleSignalRef = useRef(false);
   useEffect(() => {
     idleLoadedRef.current = false;
+    idleSignalRef.current = false;
     setIdle(false);
   }, [projectId]);
   useEffect(() => {
     if (idleLoadedRef.current) return;
+    // #826: guard against this read resolving after the project changed (a
+    // stale read from the prior project would otherwise set idle here).
+    let cancelled = false;
     fetch("/api/config")
       .then((r) => (r.ok ? r.json() : null))
       .then((cfg) => {
-        if (!cfg) return;
+        if (cancelled || !cfg) return;
+        idleLoadedRef.current = true;
+        // A live signal already set the authoritative value — don't clobber it.
+        if (idleSignalRef.current) return;
         const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
         setIdle(!!entry?.idle);
-        idleLoadedRef.current = true;
       })
       .catch(() => {});
+    return () => { cancelled = true; };
   }, [projectId]);
   useEffect(() => onIdleChange(({ projectId: pid, idle: next }) => {
-    if (pid === projectId) setIdle(next);
+    if (pid === projectId) {
+      idleSignalRef.current = true;
+      setIdle(next);
+    }
   }), [projectId]);
 
   // Poll agent states
