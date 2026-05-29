@@ -8,7 +8,7 @@
 // (not GitHub login), and distinguishes a parse error from an empty section.
 
 const assert = require("node:assert/strict");
-const { renderGithubMarkdown, parseGithub, attributeReviewsByRole, _githubLiveStale, GITHUB_FRESH_TTL_MS } = require("./routes");
+const { renderGithubMarkdown, parseGithub, attributeReviewsByRole, _githubLiveStale, _extractNotesBody, GITHUB_FRESH_TTL_MS } = require("./routes");
 
 const META = { generatedAt: Date.parse("2026-05-29T15:00:00.000Z"), staleCycles: 0 };
 
@@ -139,6 +139,34 @@ function run() {
     ok(_githubLiveStale(false, null) === true, "no generatedAt (null age) → stale");
     ok(_githubLiveStale(true, 0) === true, "header already stale → stale regardless of age");
     ok(typeof GITHUB_FRESH_TTL_MS === "number" && Number.isFinite(GITHUB_FRESH_TTL_MS), "freshness window is a finite constant (never Infinity)");
+  }
+
+  // ── 11) ## Notes round-trip: render → extract → re-render (re2 review) ──
+  // The bug: an UNANCHORED Notes regex matched the `## Notes` reference in the
+  // header instructions, so regeneration overwrote real notes with "---".
+  {
+    const snap = { issues: [], prs: [], closedIssues: [], mergedPrs: [] };
+    const note = "Operator note: hold #999 until infra lands.";
+    const md1 = renderGithubMarkdown("P", "o/r", snap, META, note);
+    const extracted = _extractNotesBody(md1);
+    ok(extracted === note, "extract pulls the REAL Notes section, not the header's `## Notes` reference");
+    // The actual regeneration path: feed the extracted notes back into a re-render.
+    const md2 = renderGithubMarkdown("P", "o/r", snap, META, extracted);
+    ok(_extractNotesBody(md2) === note, "notes survive a full render→extract→re-render cycle (no '---' clobber)");
+    ok(!/##\s+Notes[\s\S]*\n---\s*$/.test(md2.split("## Notes")[1] || ""), "regenerated Notes body is the note, not a separator");
+  }
+
+  // ── 12) A human note containing its own `## ` heading is preserved ──
+  {
+    const snap = { issues: [], prs: [], closedIssues: [], mergedPrs: [] };
+    const note = "Decisions:\n## Plan\n- do the thing\n## Risks\n- none";
+    const md = renderGithubMarkdown("P", "o/r", snap, META, note);
+    ok(_extractNotesBody(md) === note, "note with its own ## headings is not truncated");
+  }
+
+  // ── 13) No Notes section at all → default notes (not a crash) ──
+  {
+    ok(_extractNotesBody("# Random file\n## Open Issues\n\n(none)") !== "", "missing Notes section → non-empty default");
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

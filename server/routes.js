@@ -1431,11 +1431,14 @@ const _GITHUB_DEFAULT_NOTES =
   "human/Head-writable and is preserved across regeneration._";
 
 // Extract the existing `## Notes` body (preserved verbatim across regeneration).
+// Anchored to line start (multiline) so it matches the real `## Notes` SECTION,
+// not the `` `## Notes` `` reference in the header instructions. Notes is the
+// last section, so we capture to EOF and do NOT strip trailing `## ` lines —
+// that lets a human note contain its own `## ` headings without truncation.
 function _extractNotesBody(text) {
-  const m = (text || "").match(/##\s+Notes\b[^\n]*\n([\s\S]*)$/i);
+  const m = (text || "").match(/^##\s+Notes\b[^\n]*\n([\s\S]*)$/im);
   if (!m) return _GITHUB_DEFAULT_NOTES;
-  // Drop a trailing `---`/`##` if any future section were appended (none today).
-  const body = m[1].replace(/\n##\s[\s\S]*$/i, "").trim();
+  const body = m[1].trim();
   return body || _GITHUB_DEFAULT_NOTES;
 }
 
@@ -3406,4 +3409,5 @@ module.exports.parseGithub = parseGithub;
 module.exports.renderGithubMarkdown = renderGithubMarkdown;
 module.exports.attributeReviewsByRole = attributeReviewsByRole;
 module.exports._githubLiveStale = _githubLiveStale;
+module.exports._extractNotesBody = _extractNotesBody;
 module.exports.GITHUB_FRESH_TTL_MS = GITHUB_FRESH_TTL_MS;
