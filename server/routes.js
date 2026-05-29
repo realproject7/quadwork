@@ -2252,16 +2252,26 @@ function pickLinkedPrFromSearch(items, n) {
   return matches.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
 }
 
-async function findLinkedPrByTitle(repo, n) {
-  let items = [];
-  try {
-    const res = await ghJsonExecAsync(["api", "-X", "GET", "search/issues", "-f", `q=repo:${repo} is:pr in:title ${n}`]);
-    items = Array.isArray(res && res.items) ? res.items : [];
-  } catch {
-    // Search glitch/rate-limit → treat as no linked PR. An OPEN issue then
-    // renders queued (correct at batch start); a later cache miss retries.
-    return null;
-  }
+// The actual REST Search call, split out so findLinkedPrByTitle's
+// success-vs-failure distinction is unit-testable via an injected executor.
+// `gh api -X GET -f q=…` URL-encodes the query (we never hand-concatenate repo
+// or number into the URL). THROWS (propagates) on any Search failure.
+async function _searchLinkedPrItems(repo, n) {
+  const res = await ghJsonExecAsync(["api", "-X", "GET", "search/issues", "-f", `q=repo:${repo} is:pr in:title ${n}`]);
+  return Array.isArray(res && res.items) ? res.items : [];
+}
+
+// Find the PR linked to issue `n` by the strict `[#N]` title convention via the
+// REST Search API (1 search point) — NOT GraphQL. Returns the freshest matching
+// PR number, or null ONLY when Search SUCCEEDED with zero strict matches
+// (authoritative "no linked PR"). #828/RE1: a Search FAILURE (rate-limit /
+// network / parse) is NOT proof of no PR — it must NOT collapse to null, or an
+// out-of-window OPEN issue with a real PR would render queued (and a CLOSED one
+// with a merged PR would render closed). So failure THROWS, and the caller
+// (progressForItemRest, awaiting without a catch) drops the item to the
+// non-authoritative "fetch failed" row, retried on the next cache miss.
+async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems) {
+  const items = await search(repo, n);
   return pickLinkedPrFromSearch(items, n);
 }
 
@@ -2281,10 +2291,13 @@ async function progressForItemRest(repo, issueNumber) {
     state: (raw.state || "").toUpperCase(),
     url: raw.html_url,
   };
+  // Throws (→ route's "fetch failed" row) if Search itself fails, so a
+  // could-not-determine is NEVER mistaken for proof of no linked PR. A null
+  // here means Search SUCCEEDED with zero strict [#N] matches — authoritative.
   const prNumber = await findLinkedPrByTitle(repo, issueNumber);
-  // No linked PR. #350: honor the issue's own state — a CLOSED issue with no
-  // linked PR is fully done (superseded/not-planned/runbook) → 100% ✓; only a
-  // truly OPEN issue with no PR is queued.
+  // No linked PR (authoritative). #350: honor the issue's own state — a CLOSED
+  // issue with no linked PR is fully done (superseded/not-planned/runbook) →
+  // 100% ✓; only a truly OPEN issue with no PR is queued.
   if (prNumber == null) {
     return buildNoPrRow(issue);
   }
@@ -3416,3 +3429,4 @@ module.exports._rateLimit = _rateLimit;
 module.exports.gatherClosedPrPages = gatherClosedPrPages;
 module.exports.selectRecentMergedPrs = selectRecentMergedPrs;
 module.exports.pickLinkedPrFromSearch = pickLinkedPrFromSearch;
+module.exports.findLinkedPrByTitle = findLinkedPrByTitle;

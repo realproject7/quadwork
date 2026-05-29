@@ -14,6 +14,7 @@ const fs = require("fs");
 const path = require("path");
 const {
   pickLinkedPrFromSearch,
+  findLinkedPrByTitle,
   gatherClosedPrPages,
   selectRecentMergedPrs,
 } = require("./routes");
@@ -39,6 +40,25 @@ async function run() {
     ok(pickLinkedPrFromSearch([], 80) === null, "no items → null");
     ok(pickLinkedPrFromSearch(null, 80) === null, "non-array → null");
     ok(pickLinkedPrFromSearch([{ number: 5, title: "  [#42] leading ws" }], 42) === 5, "leading whitespace before [#N] still matches");
+  }
+
+  // ── #828 / RE1 #830: a Search FAILURE must NOT collapse to an authoritative
+  //    no-PR (which would render an out-of-window OPEN issue as queued, or a
+  //    CLOSED issue with a merged PR as closed). findLinkedPrByTitle returns
+  //    null ONLY on a SUCCESSFUL empty search; on failure it THROWS so the
+  //    caller drops the item to the non-authoritative "fetch failed" row. ──
+  {
+    const empty = await findLinkedPrByTitle("o/r", 80, async () => []);
+    ok(empty === null, "Search SUCCEEDED with no [#N] match → null (authoritative no-PR)");
+    const hit = await findLinkedPrByTitle("o/r", 80, async () => [{ number: 210, title: "[#80] real" }, { number: 5, title: "[#807] x" }]);
+    ok(hit === 210, "Search SUCCEEDED with a strict [#N] match → that PR number");
+    let threw = false;
+    try {
+      await findLinkedPrByTitle("o/r", 80, async () => { throw new Error("rate limited"); });
+    } catch {
+      threw = true;
+    }
+    ok(threw, "Search FAILURE throws (→ fetch-failed/unknown), NEVER a false queued/closed");
   }
 
   // ── P3: gatherClosedPrPages — fetch more pages only when page 1 is FULL and
@@ -110,12 +130,16 @@ async function run() {
     };
     const restFallback = span("async function progressForItemRest(");
     const finder = span("async function findLinkedPrByTitle(");
+    const search = span("async function _searchLinkedPrItems(");
     const freshness = span("async function checkBatchSnapshotFreshness(");
-    const all = restFallback + finder + freshness;
-    ok(restFallback && finder && freshness, "located the three by-number-path functions");
+    const all = restFallback + finder + search + freshness;
+    ok(restFallback && finder && search && freshness, "located the by-number-path functions");
     ok(!/"issue",\s*\n?\s*"view"|"pr",\s*\n?\s*"view"/.test(all), "no `gh issue view` / `gh pr view` (GraphQL) in the by-number path");
     ok(!/closedByPullRequestsReferences/.test(all), "no closedByPullRequestsReferences (GraphQL edge) in the by-number path");
-    ok(finder.includes("search/issues") && finder.includes("-X") && finder.includes("GET"), "linked-PR finder uses REST Search via `gh api -X GET search/issues`");
+    ok(search.includes("search/issues") && search.includes("-X") && search.includes("GET"), "linked-PR search uses REST `gh api -X GET search/issues`");
+    // RE1 #830: the finder must NOT swallow a Search failure into null — only
+    // pickLinkedPrFromSearch may yield null (on a successful empty result).
+    ok(!finder.includes("catch") && !finder.includes("return null"), "findLinkedPrByTitle does not catch/return-null — a Search failure propagates (throws)");
     ok(restFallback.includes("repos/${repo}/issues/") && restFallback.includes("repos/${repo}/pulls/"), "by-number fallback fetches issue + PR via REST `gh api repos/...`");
     ok(freshness.includes("repos/${repo}/issues/"), "snapshot freshness check uses REST `gh api`, not gh issue view");
     // And progressForItemAsync (the old GraphQL fallback) is fully gone.
