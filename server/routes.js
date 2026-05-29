@@ -967,8 +967,10 @@ const RECENT_DISPLAY_LIMIT = 5;
 
 // ETag store: etagKey → { etag, data } (the RAW REST JSON, re-mapped per pass).
 const _etagStore = new Map();
-// Per-repo refresh dedup so concurrent callers don't fan out twice.
-const _restRefreshing = new Set();
+// Per-repo in-flight refresh: repo → Promise. Concurrent callers AWAIT the same
+// refresh (not just skip it) so a cold first load — where GitHubPanel fires the
+// four list endpoints in parallel — never races ahead of the populated cache.
+const _restRefreshing = new Map();
 
 // Split a `gh api -i` response into its header block and JSON body. gh emits
 // HTTP headers (CRLF) then a blank line then the body.
@@ -1015,6 +1017,19 @@ async function ghApiConditional(etagKey, apiPath) {
     }
     return { status: "error", data: prev ? prev.data : null, changed: false };
   }
+}
+
+// Coalesce concurrent async work by key: a caller arriving while a call for the
+// same key is in flight awaits the SAME promise (so it sees the result, not a
+// premature miss); a fresh call starts only after the prior one settles.
+function _coalesce(map, key, fn) {
+  const inflight = map.get(key);
+  if (inflight) return inflight;
+  // Invoke eagerly so the work starts now; register before any await of fn can
+  // resolve so same-tick concurrent callers join this exact promise.
+  const p = (async () => fn())().finally(() => map.delete(key));
+  map.set(key, p);
+  return p;
 }
 
 // Run `fn` over `items` with at most `limit` concurrent in flight (keeps the
@@ -1216,27 +1231,27 @@ async function githubStateFetcher(repo) {
   };
 }
 
-// Refresh a single repo's REST snapshot into the shared caches. Deduped so a
-// background refresh and an on-demand cold fetch don't both fan out.
-async function refreshRepoRest(repo) {
-  if (_restRefreshing.has(repo)) return { status: "unchanged", data: null };
-  _restRefreshing.add(repo);
-  try {
-    const { status, data } = await githubStateFetcher(repo);
-    if (data) {
-      const now = Date.now();
-      _graphqlCache.set(repo, { ts: now, ...data });
-      _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: data.issues, stale: false });
-      _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: data.prs, stale: false });
-      _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: data.closedIssues, stale: false });
-      _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: data.mergedPrs, stale: false });
+// Refresh a single repo's REST snapshot into the shared caches. Coalesced: a
+// concurrent caller (e.g. the parallel cold-load of all four list endpoints, or
+// a background stale refresh overlapping an on-demand one) joins and awaits the
+// SAME in-flight pass, so by the time it resolves the slice caches are written.
+function refreshRepoRest(repo) {
+  return _coalesce(_restRefreshing, repo, async () => {
+    try {
+      const { status, data } = await githubStateFetcher(repo);
+      if (data) {
+        const now = Date.now();
+        _graphqlCache.set(repo, { ts: now, ...data });
+        _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: data.issues, stale: false });
+        _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: data.prs, stale: false });
+        _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: data.closedIssues, stale: false });
+        _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: data.mergedPrs, stale: false });
+      }
+      return { status, data };
+    } catch {
+      return { status: "error", data: null };
     }
-    return { status, data };
-  } catch {
-    return { status: "error", data: null };
-  } finally {
-    _restRefreshing.delete(repo);
-  }
+  });
 }
 
 // Build and execute a batched GraphQL query for all configured projects.
@@ -3053,6 +3068,7 @@ module.exports.isGraphqlRateLow = isGraphqlRateLow;
 // #806: expose the canonical-shape transforms for unit tests + the fetcher
 // entry point (#807's file writer consumes the assembled snapshot).
 module.exports.githubStateFetcher = githubStateFetcher;
+module.exports._coalesce = _coalesce;
 module.exports.restIssueToCanonical = restIssueToCanonical;
 module.exports.restClosedIssueToCanonical = restClosedIssueToCanonical;
 module.exports.restMergedPrToCanonical = restMergedPrToCanonical;
