@@ -107,80 +107,15 @@ function adaptiveTTL(baseTTL) {
   return baseTTL;
 }
 
-// ─── Cached GitHub endpoint helper (#554) ─────────────────────────────────
-// Wraps a synchronous execFileSync gh call with an in-memory cache that
-// serves stale data when rate-limited instead of hammering the API.
-const _ghEndpointCache = new Map(); // key → { ts, data }
+// ─── Shared GitHub endpoint cache (#554) ──────────────────────────────────
+// Per-endpoint in-memory cache of the canonical board slices, populated by the
+// REST+ETag fetcher (#806, githubStateFetcher / refreshRepoRest) and served by
+// the /api/github/* routes (serveGithubList) so reads cost ~0.
+const _ghEndpointCache = new Map(); // key → { ts, data, stale? }
 const GH_ENDPOINT_CACHE_TTL = 60_000; // #698: 60s base TTL (was 30s)
-
-// #698: concurrency-limited background refresh queue. Caps simultaneous
-// gh CLI calls to avoid triggering GitHub's secondary rate limit even
-// when many endpoints expire on the same poll cycle.
-const _ghRefreshing = new Set();
+// #698: cap simultaneous gh calls (per-PR fan-out, multi-project refresh) so we
+// never trip GitHub's secondary rate limit.
 const GH_MAX_CONCURRENT = 2;
-const _ghRefreshQueue = [];
-let _ghActiveRefreshes = 0;
-
-function _ghDrainQueue() {
-  while (_ghRefreshQueue.length > 0 && _ghActiveRefreshes < GH_MAX_CONCURRENT) {
-    const job = _ghRefreshQueue.shift();
-    _ghActiveRefreshes++;
-    job().finally(() => { _ghActiveRefreshes--; _ghDrainQueue(); });
-  }
-}
-
-function _ghEnqueueRefresh(cacheKey, ghArgs, transform) {
-  if (_ghRefreshing.has(cacheKey)) return; // already queued/in-flight
-  _ghRefreshing.add(cacheKey);
-  _ghRefreshQueue.push(() =>
-    _execFileAsync("gh", ghArgs, { encoding: "utf-8", timeout: 15000 })
-      .then(({ stdout }) => {
-        let data = JSON.parse(stdout);
-        if (transform) data = transform(data);
-        _ghEndpointCache.set(cacheKey, { ts: Date.now(), data, stale: false });
-      })
-      .catch(() => {}) // keep serving stale on error
-      .finally(() => _ghRefreshing.delete(cacheKey))
-  );
-  _ghDrainQueue();
-}
-
-function cachedGhEndpoint(cacheKey, ghArgs, res, { transform, idle } = {}) {
-  const cached = _ghEndpointCache.get(cacheKey);
-  // #812: a parked (idle) project must never initiate a gh fetch. Serve
-  // whatever we last cached, or an empty list — never call gh. The list
-  // endpoints return a bare array (client contract), so signal idle via a
-  // response header rather than mutating the JSON shape.
-  if (idle) {
-    res.set("X-QuadWork-Idle", "1");
-    return res.json(cached ? cached.data : []);
-  }
-  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
-  if (cached && Date.now() - cached.ts < ttl) {
-    return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
-  }
-  // If critically rate-limited, serve whatever we have (even expired)
-  if (isRateLimited() && cached) {
-    return res.json({ ...cached.data, _stale: true, _rateLimited: true });
-  }
-  // #698: stale-while-revalidate — if we have stale data, serve it
-  // immediately and enqueue a background refresh. The queue caps
-  // concurrent gh calls to GH_MAX_CONCURRENT to prevent burst traffic.
-  if (cached) {
-    _ghEnqueueRefresh(cacheKey, ghArgs, transform);
-    return res.json({ ...cached.data, _stale: true });
-  }
-  // No cached data at all — must fetch synchronously for first load
-  try {
-    const out = execFileSync("gh", ghArgs, { encoding: "utf-8", timeout: 15000 });
-    let data = JSON.parse(out);
-    if (transform) data = transform(data);
-    _ghEndpointCache.set(cacheKey, { ts: Date.now(), data, stale: false });
-    res.json(data);
-  } catch (err) {
-    res.status(502).json({ error: "gh call failed", detail: err.message });
-  }
-}
 
 const DEFAULT_CONFIG = {
   port: 8400,
@@ -907,12 +842,14 @@ router.get("/api/projects", async (req, res) => {
     }
     if (REPO_RE.test(p.repo)) {
       try {
-        const [prs, recentPrs] = await Promise.allSettled([
-          ghJsonExecAsync(["pr", "list", "-R", p.repo, "--json", "number", "--limit", "100"]),
-          ghJsonExecAsync(["pr", "list", "-R", p.repo, "--state", "all", "--json", "updatedAt", "--limit", "1"]),
+        // #806: REST + ETag instead of `gh pr list` (GraphQL-backed). Open-PR
+        // count + latest cross-state PR activity; both conditional (mostly 304).
+        const [prs, recentPrs] = await Promise.all([
+          ghApiConditional(`${p.repo}#projects-open-pulls`, `repos/${p.repo}/pulls?state=open&per_page=100`),
+          ghApiConditional(`${p.repo}#projects-last-activity`, `repos/${p.repo}/pulls?state=all&sort=updated&direction=desc&per_page=1`),
         ]);
-        if (prs.status === "fulfilled") openPrs = prs.value.length;
-        if (recentPrs.status === "fulfilled") lastActivity = recentPrs.value[0]?.updatedAt || null;
+        if (Array.isArray(prs.data)) openPrs = prs.data.length;
+        if (Array.isArray(recentPrs.data) && recentPrs.data[0]) lastActivity = recentPrs.data[0].updated_at || null;
       } catch {}
     }
     const hasAgents = p.agents && Object.keys(p.agents).length > 0;
@@ -1006,11 +943,11 @@ function isProjectIdle(projectId) {
   }
 }
 
-// ─── #703: Batched GraphQL layer ──────────────────────────────────────────
-// Instead of spawning individual `gh issue list` / `gh pr list` subprocesses
-// per project per endpoint, we fetch ALL configured projects' GitHub data in
-// a single GraphQL query. The per-project endpoints read from this shared
-// cache, falling back to individual gh CLI calls if GraphQL fails.
+// ─── #703 / #806: shared board cache ──────────────────────────────────────
+// `_graphqlCache` holds each repo's assembled board snapshot. As of #806 it is
+// populated by the REST+ETag fetcher (githubStateFetcher / refreshRepoRest);
+// the batched GraphQL query below (fetchAllProjectsGraphQL) remains ONLY as an
+// emergency fallback, gated on the GraphQL budget. Name kept for minimal churn.
 
 const _graphqlCache = new Map(); // repo → { ts, issues, prs, closedIssues, mergedPrs }
 const GRAPHQL_CACHE_TTL = 60_000; // same as GH_ENDPOINT_CACHE_TTL
@@ -1018,6 +955,289 @@ let _graphqlRefreshInFlight = false;
 
 const RECENT_FETCH_LIMIT = 20;
 const RECENT_DISPLAY_LIMIT = 5;
+
+// ─── #806 (#805 step 1): REST + ETag GitHub state fetcher ──────────────────
+// The dashboard board was fed by `gh pr list`/`gh issue list --json
+// reviewDecision,statusCheckRollup,...`, which are GraphQL-backed under the
+// hood — draining GitHub's GraphQL points budget on every poll. This fetcher
+// acquires the same state via plain REST (`gh api repos/...`) with conditional
+// If-None-Match requests, so steady-state polling costs ~0 (304s are free and
+// don't count against the budget). It feeds the existing _ghEndpointCache /
+// _graphqlCache, and emits a single fully-assembled snapshot per pass.
+
+// ETag store: etagKey → { etag, data } (the RAW REST JSON, re-mapped per pass).
+const _etagStore = new Map();
+// Per-repo refresh dedup so concurrent callers don't fan out twice.
+const _restRefreshing = new Set();
+
+// Split a `gh api -i` response into its header block and JSON body. gh emits
+// HTTP headers (CRLF) then a blank line then the body.
+function _parseGhInclude(raw) {
+  const sep = raw.search(/\r?\n\r?\n/);
+  if (sep === -1) return { headerBlock: raw, body: "" };
+  return {
+    headerBlock: raw.slice(0, sep),
+    body: raw.slice(sep).replace(/^\r?\n\r?\n/, ""),
+  };
+}
+
+// Extract the ETag header value (GitHub sends it as `Etag:`; match any case).
+function _extractEtag(headerBlock) {
+  const m = headerBlock.match(/^etag:\s*(.+)$/im);
+  return m ? m[1].trim() : null;
+}
+
+// gh exits non-zero on a 304; the marker lands in stderr ("gh: HTTP 304") and
+// the status line in stdout when `-i` is used.
+function _is304Error(err) {
+  const blob = `${(err && err.stderr) || ""}${(err && err.stdout) || ""}`;
+  return /HTTP 304|304 Not Modified/.test(blob);
+}
+
+// Conditional `gh api` GET. Reuses the stored ETag; on 304 returns the cached
+// payload (status "unchanged", zero budget cost). Never throws — a hard
+// failure returns the last good payload (if any) with status "error".
+async function ghApiConditional(etagKey, apiPath) {
+  const prev = _etagStore.get(etagKey);
+  const args = ["api", apiPath, "-i"];
+  if (prev && prev.etag) args.push("-H", `If-None-Match: ${prev.etag}`);
+  try {
+    const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 15000 });
+    const { headerBlock, body } = _parseGhInclude(stdout);
+    const etag = _extractEtag(headerBlock);
+    let data = null;
+    try { data = body ? JSON.parse(body) : null; } catch { data = null; }
+    _etagStore.set(etagKey, { etag, data });
+    return { status: "ok", data, changed: true };
+  } catch (err) {
+    if (_is304Error(err) && prev) {
+      return { status: "unchanged", data: prev.data, changed: false };
+    }
+    return { status: "error", data: prev ? prev.data : null, changed: false };
+  }
+}
+
+// Run `fn` over `items` with at most `limit` concurrent in flight (keeps the
+// per-PR fan-out from draining the core budget). Preserves input order.
+async function _mapLimited(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, worker));
+  return results;
+}
+
+// ── Canonical dashboard shape (pinned + tested; do NOT defer to "same as
+// GraphQL"). issue/PR `state` is UPPERCASE OPEN/CLOSED/MERGED — matches the
+// gh-CLI path and GitHubPanel.tsx's `state === "OPEN"` dot (the prior GraphQL
+// transform lowercased to "open", an inconsistency this pins). ──
+function restIssueToCanonical(it) {
+  return {
+    number: it.number,
+    title: it.title,
+    state: (it.state || "").toUpperCase(),
+    url: it.html_url,
+    labels: (it.labels || []).map((l) => ({ name: typeof l === "string" ? l : l.name })),
+    assignees: (it.assignees || []).map((a) => ({ login: a.login })),
+    createdAt: it.created_at,
+  };
+}
+
+function restClosedIssueToCanonical(it) {
+  return {
+    number: it.number,
+    title: it.title,
+    state: (it.state || "closed").toUpperCase(),
+    url: it.html_url,
+    closedAt: it.closed_at,
+  };
+}
+
+function restMergedPrToCanonical(p) {
+  return {
+    number: p.number,
+    title: p.title,
+    state: "MERGED",
+    url: p.html_url,
+    mergedAt: p.merged_at,
+    author: p.user ? { login: p.user.login } : null,
+  };
+}
+
+// Base open-PR row; reviews/reviewDecision/statusCheckRollup are attached after
+// the per-PR sub-fetches.
+function restPullBaseToCanonical(p) {
+  return {
+    number: p.number,
+    title: p.title,
+    state: (p.state || "").toUpperCase(),
+    url: p.html_url,
+    author: p.user ? { login: p.user.login } : null,
+    assignees: (p.assignees || []).map((a) => ({ login: a.login })),
+    createdAt: p.created_at,
+  };
+}
+
+// Keep the FULL review list with bodies — re1/re2 share one GitHub author, so
+// #807/#810 attribute ROLE from body markers, not author-latest collapse.
+function mapReviews(restReviews) {
+  return (restReviews || []).map((r) => ({
+    state: r.state,
+    author: r.user ? { login: r.user.login } : null,
+    submittedAt: r.submitted_at,
+    body: r.body || "",
+  }));
+}
+
+// Derive a reviewDecision from the raw review list (the per-PR reviews are
+// authoritative). Latest decision-affecting review per author wins; any
+// CHANGES_REQUESTED blocks, else any APPROVED approves, else REVIEW_REQUIRED.
+function deriveReviewDecision(reviews) {
+  const byAuthor = new Map();
+  const sorted = (reviews || []).slice().sort(
+    (a, b) => (Date.parse(a && a.submittedAt) || 0) - (Date.parse(b && b.submittedAt) || 0),
+  );
+  for (const r of sorted) {
+    const login = r && r.author && r.author.login;
+    if (!login) continue;
+    if (r.state === "APPROVED" || r.state === "CHANGES_REQUESTED" || r.state === "DISMISSED") {
+      byAuthor.set(login, r.state);
+    }
+  }
+  let approved = false;
+  for (const s of byAuthor.values()) {
+    if (s === "CHANGES_REQUESTED") return "CHANGES_REQUESTED";
+    if (s === "APPROVED") approved = true;
+  }
+  return approved ? "APPROVED" : "REVIEW_REQUIRED";
+}
+
+function _normCheckRunState(run) {
+  if (run.status && run.status !== "completed") return "PENDING";
+  switch ((run.conclusion || "").toLowerCase()) {
+    case "success": return "SUCCESS";
+    case "failure": case "timed_out": case "startup_failure": return "FAILURE";
+    case "cancelled": case "action_required": case "stale": return "ERROR";
+    case "neutral": case "skipped": return "SUCCESS";
+    default: return "PENDING";
+  }
+}
+
+function _normStatusState(state) {
+  switch ((state || "").toLowerCase()) {
+    case "success": return "SUCCESS";
+    case "failure": return "FAILURE";
+    case "error": return "ERROR";
+    default: return "PENDING";
+  }
+}
+
+// statusCheckRollup = check-runs AND the legacy combined-status, normalized to
+// the { state } array GitHubPanel.tsx's ciColor/ciLabel expect (SUCCESS /
+// FAILURE / ERROR / PENDING).
+function buildStatusCheckRollup(checkRunsResp, statusResp) {
+  const rollup = [];
+  const runs = (checkRunsResp && checkRunsResp.check_runs) || [];
+  for (const r of runs) rollup.push({ state: _normCheckRunState(r) });
+  const statuses = (statusResp && statusResp.statuses) || [];
+  for (const s of statuses) rollup.push({ state: _normStatusState(s.state) });
+  return rollup;
+}
+
+// Fetch a repo's full board state via REST + ETag in one pass. Returns a single
+// fully-assembled snapshot (never section-by-section) plus a status the file
+// writer (#807) can trust: "ok" (something changed), "unchanged" (all 304s),
+// or "error" (could not assemble any list — never stamp this as fresh).
+async function githubStateFetcher(repo) {
+  const [owner, name] = (repo || "").split("/");
+  if (!owner || !name) return { status: "error", data: null };
+  const base = `repos/${owner}/${name}`;
+  let changed = 0;
+
+  const [openPullsR, openIssuesR, closedIssuesR, closedPullsR] = await Promise.all([
+    ghApiConditional(`${repo}#pulls-open`, `${base}/pulls?state=open&per_page=50&sort=updated&direction=desc`),
+    ghApiConditional(`${repo}#issues-open`, `${base}/issues?state=open&per_page=50&sort=updated&direction=desc`),
+    ghApiConditional(`${repo}#issues-closed`, `${base}/issues?state=closed&per_page=100&sort=updated&direction=desc`),
+    ghApiConditional(`${repo}#pulls-closed`, `${base}/pulls?state=closed&per_page=30&sort=updated&direction=desc`),
+  ]);
+  let anyTopData = false;
+  for (const r of [openPullsR, openIssuesR, closedIssuesR, closedPullsR]) {
+    if (r.status === "ok") changed++;
+    if (Array.isArray(r.data)) anyTopData = true;
+  }
+  // No list data at all (first run, every call failed) → don't fabricate a
+  // snapshot; let callers keep serving whatever they already had.
+  if (!anyTopData) return { status: "error", data: null };
+
+  // REST /issues includes PRs — drop anything carrying a pull_request key.
+  const issues = (Array.isArray(openIssuesR.data) ? openIssuesR.data : [])
+    .filter((it) => !it.pull_request)
+    .map(restIssueToCanonical);
+
+  const closedIssues = (Array.isArray(closedIssuesR.data) ? closedIssuesR.data : [])
+    .filter((it) => !it.pull_request)
+    .sort((a, b) => (Date.parse(b && b.closed_at) || 0) - (Date.parse(a && a.closed_at) || 0))
+    .slice(0, RECENT_DISPLAY_LIMIT)
+    .map(restClosedIssueToCanonical);
+
+  const mergedPrs = (Array.isArray(closedPullsR.data) ? closedPullsR.data : [])
+    .filter((p) => p.merged_at)
+    .sort((a, b) => (Date.parse(b && b.merged_at) || 0) - (Date.parse(a && a.merged_at) || 0))
+    .slice(0, RECENT_DISPLAY_LIMIT)
+    .map(restMergedPrToCanonical);
+
+  const openPullsRaw = Array.isArray(openPullsR.data) ? openPullsR.data : [];
+  const prs = await _mapLimited(openPullsRaw, GH_MAX_CONCURRENT, async (p) => {
+    const sha = p.head && p.head.sha;
+    const [reviewsR, checkRunsR, statusR] = await Promise.all([
+      ghApiConditional(`${repo}#reviews-${p.number}`, `${base}/pulls/${p.number}/reviews?per_page=100`),
+      sha ? ghApiConditional(`${repo}#checkruns-${sha}`, `${base}/commits/${sha}/check-runs?per_page=100`) : Promise.resolve({ status: "error", data: null }),
+      sha ? ghApiConditional(`${repo}#status-${sha}`, `${base}/commits/${sha}/status`) : Promise.resolve({ status: "error", data: null }),
+    ]);
+    if (reviewsR.status === "ok" || checkRunsR.status === "ok" || statusR.status === "ok") changed++;
+    const reviews = mapReviews(Array.isArray(reviewsR.data) ? reviewsR.data : []);
+    return {
+      ...restPullBaseToCanonical(p),
+      reviews,
+      reviewDecision: deriveReviewDecision(reviews),
+      statusCheckRollup: buildStatusCheckRollup(checkRunsR.data, statusR.data),
+    };
+  });
+
+  return {
+    status: changed > 0 ? "ok" : "unchanged",
+    data: { issues, prs, closedIssues, mergedPrs },
+  };
+}
+
+// Refresh a single repo's REST snapshot into the shared caches. Deduped so a
+// background refresh and an on-demand cold fetch don't both fan out.
+async function refreshRepoRest(repo) {
+  if (_restRefreshing.has(repo)) return { status: "unchanged", data: null };
+  _restRefreshing.add(repo);
+  try {
+    const { status, data } = await githubStateFetcher(repo);
+    if (data) {
+      const now = Date.now();
+      _graphqlCache.set(repo, { ts: now, ...data });
+      _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: data.issues, stale: false });
+      _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: data.prs, stale: false });
+      _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: data.closedIssues, stale: false });
+      _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: data.mergedPrs, stale: false });
+    }
+    return { status, data };
+  } catch {
+    return { status: "error", data: null };
+  } finally {
+    _restRefreshing.delete(repo);
+  }
+}
 
 // Build and execute a batched GraphQL query for all configured projects.
 // Returns a Map of repo → { issues, prs, closedIssues, mergedPrs }.
@@ -1054,7 +1274,7 @@ fragment repoFields on Repository {
     nodes { number title url state closedAt }
   }
   openPRs: pullRequests(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-    nodes { number title url state author { login } reviews(last: 100) { nodes { state author { login } submittedAt } } createdAt }
+    nodes { number title url state author { login } reviews(last: 100) { nodes { state author { login } submittedAt body } } createdAt }
   }
   mergedPRs: pullRequests(first: ${RECENT_FETCH_LIMIT}, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
     nodes { number title url state mergedAt author { login } }
@@ -1075,10 +1295,13 @@ fragment repoFields on Repository {
       if (!repoData) continue;
 
       // Transform GraphQL nodes into the same shape as gh CLI JSON output.
+      // #806: pin canonical uppercase state for emergency-fallback parity with
+      // the REST path. reviewDecision/statusCheckRollup are absent here (the
+      // GraphQL query doesn't fetch them) — acceptable for a degraded fallback.
       const issues = (repoData.openIssues?.nodes || []).map((n) => ({
         number: n.number,
         title: n.title,
-        state: n.state === "OPEN" ? "open" : n.state?.toLowerCase() || n.state,
+        state: (n.state || "").toUpperCase(),
         url: n.url,
         labels: (n.labels?.nodes || []).map((l) => ({ name: l.name })),
         assignees: (n.assignees?.nodes || []).map((a) => ({ login: a.login })),
@@ -1088,7 +1311,7 @@ fragment repoFields on Repository {
       const prs = (repoData.openPRs?.nodes || []).map((n) => ({
         number: n.number,
         title: n.title,
-        state: n.state === "OPEN" ? "open" : n.state?.toLowerCase() || n.state,
+        state: (n.state || "").toUpperCase(),
         url: n.url,
         author: n.author ? { login: n.author.login } : null,
         assignees: [],
@@ -1096,6 +1319,7 @@ fragment repoFields on Repository {
           state: r.state,
           author: r.author ? { login: r.author.login } : null,
           submittedAt: r.submittedAt,
+          body: r.body || "",
         })),
         createdAt: n.createdAt,
       }));
@@ -1111,7 +1335,7 @@ fragment repoFields on Repository {
         .map((n) => ({
           number: n.number,
           title: n.title,
-          state: n.state?.toLowerCase() || "closed",
+          state: (n.state || "CLOSED").toUpperCase(),
           url: n.url,
           closedAt: n.closedAt,
         }));
@@ -1127,7 +1351,7 @@ fragment repoFields on Repository {
         .map((n) => ({
           number: n.number,
           title: n.title,
-          state: n.state?.toLowerCase() || "merged",
+          state: (n.state || "MERGED").toUpperCase(),
           url: n.url,
           mergedAt: n.mergedAt,
           author: n.author ? { login: n.author.login } : null,
@@ -1145,27 +1369,48 @@ fragment repoFields on Repository {
 // and on demand when a per-project endpoint has no cached data.
 async function refreshGraphQLCache() {
   if (_graphqlRefreshInFlight) return;
-  // #802: gate on the GraphQL budget (not REST). The proactive background
-  // poller backs off at the LOW threshold to preserve points for on-demand
-  // requests, which only hard-stop at critical.
-  if (isGraphqlRateLow()) return;
+  // #806: the board state now comes from REST + ETag (githubStateFetcher), so
+  // gate on the REST (core) budget. 304s are free, but the first/changed
+  // fetches cost core — back off when REST is critically low and let consumers
+  // serve stale. (Name kept so the module-scope auto-start stays untouched.)
+  if (isRateLimited()) return;
   _graphqlRefreshInFlight = true;
   try {
-    const data = await fetchAllProjectsGraphQL();
-    if (data) {
-      const now = Date.now();
-      for (const [repo, repoData] of data) {
-        _graphqlCache.set(repo, { ts: now, ...repoData });
-        // Also populate the per-endpoint _ghEndpointCache so stale-while-
-        // revalidate and existing per-project endpoints pick up the data.
-        _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: repoData.issues, stale: false });
-        _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: repoData.prs, stale: false });
-        _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: repoData.closedIssues, stale: false });
-        _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: repoData.mergedPrs, stale: false });
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
+    const seen = new Set();
+    const repos = [];
+    for (const p of cfg.projects || []) {
+      if (!p.repo || !REPO_RE.test(p.repo) || p.idle) continue; // #812: skip idle
+      if (seen.has(p.repo)) continue;
+      seen.add(p.repo);
+      repos.push(p.repo);
+    }
+    const results = await _mapLimited(repos, GH_MAX_CONCURRENT, (repo) =>
+      refreshRepoRest(repo).then((r) => ({ repo, status: r.status })),
+    );
+
+    // #805/#806 emergency fallback: if REST could not assemble a snapshot for
+    // some repos AND the GraphQL budget is healthy, backfill via the legacy
+    // batched GraphQL query (gated on the GRAPHQL bucket, never REST).
+    const failed = results.filter((r) => r.status === "error").map((r) => r.repo);
+    if (failed.length > 0 && !isGraphqlRateLimited()) {
+      const gql = await fetchAllProjectsGraphQL();
+      if (gql) {
+        const now = Date.now();
+        for (const repo of failed) {
+          const d = gql.get(repo);
+          if (!d) continue;
+          _graphqlCache.set(repo, { ts: now, ...d });
+          _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: d.issues, stale: false });
+          _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: d.prs, stale: false });
+          _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: d.closedIssues, stale: false });
+          _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: d.mergedPrs, stale: false });
+        }
       }
     }
   } catch {
-    // Non-fatal — per-project endpoints still work via individual gh CLI.
+    // Non-fatal — consumers serve last-known cache.
   } finally {
     _graphqlRefreshInFlight = false;
   }
@@ -1350,41 +1595,22 @@ router.get("/api/github/all", async (req, res) => {
     }
   }
 
-  // Fallback: fetch missing projects via individual gh CLI calls.
+  // #806: fallback for still-missing repos goes through the REST+ETag snapshot
+  // (refreshRepoRest), NOT `gh pr list`/`gh issue list`. Concurrency-limited so
+  // a cold multi-project load doesn't drain the core budget.
   if (fallbackNeeded.length > 0 && !isRateLimited()) {
-    const fallbackResults = await Promise.allSettled(
-      fallbackNeeded.map(async (p) => {
-        const repo = p.repo;
-        const [issues, prs, closedIssues, mergedPrs] = await Promise.allSettled([
-          _execFileAsync("gh", ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => JSON.parse(stdout)),
-          _execFileAsync("gh", ["pr", "list", "-R", repo, "--json", "number,title,state,author,assignees,reviewDecision,reviews,statusCheckRollup,url,createdAt", "--limit", "50"], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => JSON.parse(stdout)),
-          _execFileAsync("gh", ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", String(RECENT_FETCH_LIMIT)], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => {
-            const items = JSON.parse(stdout);
-            return Array.isArray(items)
-              ? items.sort((a, b) => (Date.parse(b?.closedAt || 0)) - (Date.parse(a?.closedAt || 0))).slice(0, RECENT_DISPLAY_LIMIT)
-              : items;
-          }),
-          _execFileAsync("gh", ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", String(RECENT_FETCH_LIMIT)], { encoding: "utf-8", timeout: 15000 }).then(({ stdout }) => {
-            const items = JSON.parse(stdout);
-            return Array.isArray(items)
-              ? items.sort((a, b) => (Date.parse(b?.mergedAt || 0)) - (Date.parse(a?.mergedAt || 0))).slice(0, RECENT_DISPLAY_LIMIT)
-              : items;
-          }),
-        ]);
-        return {
-          id: p.id,
-          issues: issues.status === "fulfilled" ? issues.value : [],
-          prs: prs.status === "fulfilled" ? prs.value : [],
-          closedIssues: closedIssues.status === "fulfilled" ? closedIssues.value : [],
-          mergedPrs: mergedPrs.status === "fulfilled" ? mergedPrs.value : [],
-          _fallback: true,
-        };
-      }),
-    );
-    for (const r of fallbackResults) {
-      if (r.status === "fulfilled") {
-        result[r.value.id] = r.value;
-      }
+    await _mapLimited(fallbackNeeded, GH_MAX_CONCURRENT, (p) => refreshRepoRest(p.repo));
+    for (const p of fallbackNeeded) {
+      const cached = _graphqlCache.get(p.repo);
+      result[p.id] = cached
+        ? {
+            issues: cached.issues,
+            prs: cached.prs,
+            closedIssues: cached.closedIssues,
+            mergedPrs: cached.mergedPrs,
+            _fallback: true,
+          }
+        : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _fallback: true };
     }
   }
 
@@ -1392,90 +1618,52 @@ router.get("/api/github/all", async (req, res) => {
 });
 
 // ─── Per-project endpoints (backward compat, served from shared cache) ────
-
-router.get("/api/github/issues", (req, res) => {
-  const repo = getRepo(req.query.project || "");
+//
+// #806: all four lists are slices of the single REST+ETag snapshot built by
+// githubStateFetcher (closed/merged already sorted newest-first and capped to
+// RECENT_DISPLAY_LIMIT there). On a warm cache we serve instantly; cold misses
+// fetch the whole snapshot once via refreshRepoRest — no `gh pr list`/`gh issue
+// list` (those are GraphQL-backed). Idle projects never fetch.
+async function serveGithubList(req, res, kind) {
+  const project = req.query.project || "";
+  const repo = getRepo(project);
   if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  cachedGhEndpoint(
-    `issues:${repo}`,
-    ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"],
-    res,
-    { idle: isProjectIdle(req.query.project || "") },
-  );
-});
+  const cacheKey = `${kind}:${repo}`;
+  const cached = _ghEndpointCache.get(cacheKey);
 
-router.get("/api/github/prs", (req, res) => {
-  const repo = getRepo(req.query.project || "");
-  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  cachedGhEndpoint(
-    `prs:${repo}`,
-    ["pr", "list", "-R", repo, "--json", "number,title,state,author,assignees,reviewDecision,reviews,statusCheckRollup,url,createdAt", "--limit", "50"],
-    res,
-    { idle: isProjectIdle(req.query.project || "") },
-  );
-});
+  // #812: a parked (idle) project must never initiate a fetch.
+  if (isProjectIdle(project)) {
+    res.set("X-QuadWork-Idle", "1");
+    return res.json(cached ? cached.data : []);
+  }
 
-// #411 / quadwork#281: recently closed issues + merged PRs for the
-// "Recently closed" / "Recently merged" sub-sections under each
-// list in GitHubPanel. Limit 5 items each, ordered by closedAt
-// descending so the freshest activity sits at the top.
-// gh CLI's default ordering for `issue list --state closed` and
-// `pr list --state merged` is createdAt-desc, not closedAt/mergedAt-desc,
-// so a stale-but-recently-closed item can sit below a fresh-but-
-// older one. We pull a wider window and re-sort by close/merge time
-// before truncating to 5 to honor #281's "newest first" requirement.
+  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
+  if (cached && Date.now() - cached.ts < ttl) {
+    return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
+  }
+  // Critically REST-rate-limited → serve whatever we have (even expired).
+  if (isRateLimited() && cached) {
+    return res.json({ ...cached.data, _stale: true, _rateLimited: true });
+  }
+  // Stale-while-revalidate: serve stale now, refresh the snapshot in background.
+  if (cached) {
+    refreshRepoRest(repo);
+    return res.json({ ...cached.data, _stale: true });
+  }
+  // Cold: assemble the snapshot synchronously, then serve this slice.
+  await refreshRepoRest(repo);
+  const fresh = _ghEndpointCache.get(cacheKey);
+  if (fresh) return res.json(fresh.data);
+  return res.status(502).json({ error: "gh call failed" });
+}
 
-router.get("/api/github/closed-issues", (req, res) => {
-  const repo = getRepo(req.query.project || "");
-  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  cachedGhEndpoint(
-    `closed-issues:${repo}`,
-    ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", String(RECENT_FETCH_LIMIT)],
-    res,
-    {
-      idle: isProjectIdle(req.query.project || ""),
-      transform: (items) =>
-        Array.isArray(items)
-          ? items
-              .slice()
-              .sort((a, b) => {
-                const ta = a && a.closedAt ? Date.parse(a.closedAt) : 0;
-                const tb = b && b.closedAt ? Date.parse(b.closedAt) : 0;
-                return tb - ta;
-              })
-              .slice(0, RECENT_DISPLAY_LIMIT)
-          : items,
-    },
-  );
-});
-
-router.get("/api/github/merged-prs", (req, res) => {
-  const repo = getRepo(req.query.project || "");
-  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  // gh pr list with `--state merged` filters server-side so we
-  // don't have to pull every closed PR and discard the un-merged
-  // ones (closed-without-merge). Same fetch-wider-then-sort
-  // strategy as closed-issues so the newest merge always wins.
-  cachedGhEndpoint(
-    `merged-prs:${repo}`,
-    ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", String(RECENT_FETCH_LIMIT)],
-    res,
-    {
-      idle: isProjectIdle(req.query.project || ""),
-      transform: (items) =>
-        Array.isArray(items)
-          ? items
-              .slice()
-              .sort((a, b) => {
-                const ta = a && a.mergedAt ? Date.parse(a.mergedAt) : 0;
-                const tb = b && b.mergedAt ? Date.parse(b.mergedAt) : 0;
-                return tb - ta;
-              })
-              .slice(0, RECENT_DISPLAY_LIMIT)
-          : items,
-    },
-  );
-});
+router.get("/api/github/issues", (req, res) => serveGithubList(req, res, "issues"));
+router.get("/api/github/prs", (req, res) => serveGithubList(req, res, "prs"));
+// #411 / quadwork#281: "Recently closed" / "Recently merged" — newest-first,
+// capped to 5 in githubStateFetcher (REST default ordering isn't close/merge
+// time, so the snapshot re-sorts by closedAt/mergedAt before truncating).
+router.get("/api/github/closed-issues", (req, res) => serveGithubList(req, res, "closed-issues"));
+router.get("/api/github/merged-prs", (req, res) => serveGithubList(req, res, "merged-prs"));
 
 // #413 / quadwork#282: Current Batch Progress panel.
 //
@@ -2862,3 +3050,13 @@ module.exports.setPtyDispatchCallback = setPtyDispatchCallback;
 module.exports._graphqlRateLimit = _graphqlRateLimit;
 module.exports.isGraphqlRateLimited = isGraphqlRateLimited;
 module.exports.isGraphqlRateLow = isGraphqlRateLow;
+// #806: expose the canonical-shape transforms for unit tests + the fetcher
+// entry point (#807's file writer consumes the assembled snapshot).
+module.exports.githubStateFetcher = githubStateFetcher;
+module.exports.restIssueToCanonical = restIssueToCanonical;
+module.exports.restClosedIssueToCanonical = restClosedIssueToCanonical;
+module.exports.restMergedPrToCanonical = restMergedPrToCanonical;
+module.exports.restPullBaseToCanonical = restPullBaseToCanonical;
+module.exports.mapReviews = mapReviews;
+module.exports.deriveReviewDecision = deriveReviewDecision;
+module.exports.buildStatusCheckRollup = buildStatusCheckRollup;
