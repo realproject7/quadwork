@@ -11,6 +11,7 @@ const routes = require("./routes");
 const fileChat = require("./file-chat");
 const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./pty-dispatcher");
 const { runAcMigration } = require("./migrate-ac");
+const selfHeal = require("./self-heal");
 
 const net = require("net");
 const config = readConfig();
@@ -502,6 +503,37 @@ async function spawnAgentPty(project, agent, opts = {}) {
       if (session.scrollback.length > SCROLLBACK_SIZE) {
         session.scrollback = session.scrollback.slice(-SCROLLBACK_SIZE);
       }
+
+      // #797: observe-only self-heal detector. Wrapped in its own try/catch so
+      // a detector bug can never break the PTY → xterm pipeline; the chunk is
+      // never consumed or altered (the WS viewer forwards it independently).
+      try {
+        selfHeal.observeChunk(key, data, {
+          now: Date.now(),
+          recovering: !!session._autoRecovering,
+          onRestart: () => {
+            session._autoRecovering = true;
+            console.log(`[self-heal] ${key}: thinking-block 400 detected — restarting session`);
+            restartAgentSession(key, { reason: "thinking-block-400" })
+              .then((result) => {
+                if (result && result.ok) {
+                  emitSystemMessage(project, `${agent} auto-restarted (recovered from thinking-block API error)`);
+                }
+              })
+              .catch((err) => console.error(`[self-heal] ${key}: auto-restart failed:`, err.message))
+              .finally(() => {
+                const s = agentSessions.get(key);
+                if (s) s._autoRecovering = false;
+              });
+          },
+          onBreaker: (message) => {
+            console.log(`[self-heal] ${key}: ${message}`);
+            emitSystemMessage(project, message);
+          },
+        });
+      } catch (err) {
+        console.error(`[self-heal] ${key}: detector error (ignored):`, err.message);
+      }
     });
 
     term.onExit(({ exitCode }) => {
@@ -713,9 +745,12 @@ app.post("/api/agents/:project/:agent/stop", async (req, res) => {
 
 // --- Lifecycle: restart ---
 
-app.post("/api/agents/:project/:agent/restart", async (req, res) => {
-  const { project, agent } = req.params;
-  const key = `${project}/${agent}`;
+// #797: shared restart sequence, used by both the manual restart route and
+// the self-heal detector. Exactly the prior route body — no new lifecycle
+// logic. The `reason` is informational (logged by callers).
+async function restartAgentSession(key, { reason } = {}) {
+  const [project, agent] = key.split("/");
+  console.log(`[restart] ${key}: restarting session (reason: ${reason || "unspecified"})`);
 
   // #241: must await deregister before respawn so the slot frees and
   // the fresh register lands at slot 1 instead of head-2.
@@ -723,7 +758,14 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
   if (existing) existing._suppressLifecycleMsg = true;
   await stopAgentSession(key);
 
-  const result = await spawnAgentPty(project, agent, { suppressLifecycleMsg: true });
+  return spawnAgentPty(project, agent, { suppressLifecycleMsg: true });
+}
+
+app.post("/api/agents/:project/:agent/restart", async (req, res) => {
+  const { project, agent } = req.params;
+  const key = `${project}/${agent}`;
+
+  const result = await restartAgentSession(key, { reason: "manual" });
   if (result.ok) {
     emitSystemMessage(project, `${agent} restarted`);
     res.json({ ok: true, state: "running", pid: result.pid });
