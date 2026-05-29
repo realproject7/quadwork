@@ -130,6 +130,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   // triggers / bridge auto-lifecycle for this project, and the dashboard
   // stops its own batch-progress pollers. Agent terminals stay viewable.
   const [idle, setIdle] = useState(false);
+  const [idleError, setIdleError] = useState(false);
   const idleLoadedRef = useRef(false);
   useEffect(() => {
     idleLoadedRef.current = false;
@@ -148,45 +149,54 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       .catch(() => {});
   }, [projectId]);
   const toggleIdle = useCallback(() => {
-    setIdle((prev) => {
-      const next = !prev;
-      // Persist to config. The server's syncTriggers hook fires on this
-      // PUT and clears any running trigger for a now-idle project (#812),
-      // so no separate stop call is needed.
-      fetch("/api/config")
-        .then((r) => (r.ok ? r.json() : null))
-        .then((cfg) => {
-          if (!cfg) return;
-          const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
-          if (entry) {
-            entry.idle = next;
-            return fetch("/api/config", {
-              method: "PUT",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(cfg),
-            });
-          }
-        })
-        .catch(() => {});
-      return next;
-    });
-  }, [projectId]);
+    const next = !idle;
+    // Optimistic flip so polling responds instantly.
+    setIdle(next);
+    setIdleError(false);
+    // Persist to config. The server's syncTriggers hook fires on this PUT
+    // and clears any running trigger for a now-idle project (#812), so no
+    // separate stop call is needed. If persistence fails, REVERT the local
+    // flag so the dashboard's polling state can't desync from the server.
+    (async () => {
+      try {
+        const r = await fetch("/api/config");
+        if (!r.ok) throw new Error("config read failed");
+        const cfg = await r.json();
+        const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
+        if (!entry) throw new Error("project not found in config");
+        entry.idle = next;
+        const put = await fetch("/api/config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cfg),
+        });
+        if (!put.ok) throw new Error("config write failed");
+      } catch {
+        setIdle(!next); // revert — keep UI in sync with the unchanged server state
+        setIdleError(true);
+      }
+    })();
+  }, [idle, projectId]);
   const idleToggle = useMemo(() => (
     <button
       type="button"
       onClick={toggleIdle}
-      title={idle
-        ? "Project is idle — GitHub polling, triggers & bridges are paused. Click to resume."
-        : "Idle this project — pause all GitHub polling, triggers & bridge auto-lifecycle. Click to park."}
+      title={idleError
+        ? "Failed to save idle state — reverted. Click to retry."
+        : idle
+          ? "Project is idle — GitHub polling, triggers & bridges are paused. Click to resume."
+          : "Idle this project — pause all GitHub polling, triggers & bridge auto-lifecycle. Click to park."}
       className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
-        idle
-          ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
-          : "border-border text-text-muted hover:text-text hover:border-accent"
+        idleError
+          ? "border-error/60 text-error hover:bg-error/10"
+          : idle
+            ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
+            : "border-border text-text-muted hover:text-text hover:border-accent"
       }`}
     >
-      {idle ? "Idle ●" : "Idle ○"}
+      {idleError ? "Idle !" : idle ? "Idle ●" : "Idle ○"}
     </button>
-  ), [idle, toggleIdle]);
+  ), [idle, idleError, toggleIdle]);
 
   // Poll agent states
   useEffect(() => {

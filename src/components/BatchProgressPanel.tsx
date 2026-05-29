@@ -32,6 +32,7 @@ interface BatchProgressPanelProps {
 const COPY = {
   en: {
     loading: "Loading batch progress…",
+    idlePaused: "Project is idle — batch progress polling is paused.",
     currentBatchNone: "Current Batch: (none)",
     noActiveBatch: "No active batch. Ask Head to start one via the chat.",
     currentBatch: (n: number | string) => `Current Batch: Batch ${n}`,
@@ -46,6 +47,7 @@ const COPY = {
   },
   ko: {
     loading: "배치 진행 상황 로딩 중...",
+    idlePaused: "프로젝트가 유휴 상태입니다 — 배치 진행 폴링이 일시 중지되었습니다.",
     currentBatchNone: "현재 배치: (없음)",
     noActiveBatch: "활성 배치가 없습니다. 채팅에서 Head에게 시작을 요청하세요.",
     currentBatch: (n: number | string) => `현재 배치: ${n}번`,
@@ -102,6 +104,20 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
   }, [load, idle]);
 
   if (!data) {
+    // #812: a project that is already idle on open has no cached batch data
+    // and never fetches — show a paused state instead of "Loading…" forever.
+    if (idle) {
+      return (
+        <div className="border-t border-border">
+          <div className="px-3 py-1.5 flex items-center gap-2">
+            <span className="text-[10px] text-text-muted uppercase tracking-wider">Idle</span>
+          </div>
+          <div className="px-3 pb-2 text-[11px] text-text-muted">
+            {t.idlePaused}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="px-3 py-1.5 text-[11px] text-text-muted border-t border-border">
         {t.loading}

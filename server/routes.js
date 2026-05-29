@@ -122,9 +122,14 @@ function _ghEnqueueRefresh(cacheKey, ghArgs, transform) {
 
 function cachedGhEndpoint(cacheKey, ghArgs, res, { transform, idle } = {}) {
   const cached = _ghEndpointCache.get(cacheKey);
-  // #812: a parked (idle) project must never initiate a gh fetch.
-  // Serve whatever we last cached, or an empty list — never call gh.
-  if (idle) return res.json(cached ? cached.data : []);
+  // #812: a parked (idle) project must never initiate a gh fetch. Serve
+  // whatever we last cached, or an empty list — never call gh. The list
+  // endpoints return a bare array (client contract), so signal idle via a
+  // response header rather than mutating the JSON shape.
+  if (idle) {
+    res.set("X-QuadWork-Idle", "1");
+    return res.json(cached ? cached.data : []);
+  }
   const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
   if (cached && Date.now() - cached.ts < ttl) {
     return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
@@ -1281,13 +1286,21 @@ router.get("/api/github/all", async (req, res) => {
   // Build response.
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
-  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
+  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo)); // #812: include idle projects — served stale below, never fetched
 
   const result = {};
   const fallbackNeeded = [];
   for (const p of projects) {
     if (projectFilter && p.id !== projectFilter) continue;
     const cached = _graphqlCache.get(p.repo);
+    // #812: idle (parked) project — serve last-known data flagged _idle,
+    // never trigger a fetch or fall back to gh.
+    if (p.idle) {
+      result[p.id] = cached
+        ? { issues: cached.issues, prs: cached.prs, closedIssues: cached.closedIssues, mergedPrs: cached.mergedPrs, _idle: true }
+        : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _idle: true };
+      continue;
+    }
     if (cached) {
       result[p.id] = {
         issues: cached.issues,
