@@ -49,6 +49,8 @@ Butler is the cross-project operator assistant:
 
 Read `~/.quadwork/config.json` for project IDs, repos, and working directories. Access any repo via `gh -R owner/repo`. Know worktree layout: `<working_dir>-{head,dev,re1,re2}`.
 
+**Board discovery via GITHUB.md.** To see a project's issue/PR board state, read the server-authored per-project file `~/.quadwork/<project>/GITHUB.md` (or `GET http://127.0.0.1:8400/api/github-parsed?project=<project>`) instead of `gh pr list`/`gh issue list`. **Writes and correctness-critical reads stay direct, live `gh`:** `gh issue create`/`gh issue edit`, `gh release create`, and PR-review reads (`gh pr view`, `git diff`). **By-number / live fallback:** when acting on a specific number, use a single-object `gh` call directly; if GITHUB.md is absent or stale (`_stale` / older than ~2 cycles), do one direct `gh` read — never conclude "no work" from a stale or empty file.
+
 **Critical: project context isolation.** Butler manages multiple projects simultaneously. To prevent mixing contexts:
 - Always specify `-R owner/repo` when running `gh` commands — never rely on cwd
 - When discussing a project, state the project name at the start of each response
