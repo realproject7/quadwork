@@ -286,16 +286,20 @@ router.get("/api/chat", (req, res) => {
 // Bare "head", "dev", "re1", "re2" become "@head", "@dev", "@re1", "@re2".
 // Already-prefixed mentions are not double-prefixed; suffixed names like
 // "head-2" or "re1-3" are left untouched.
+// #788: `skipName` is the sender's own agent name — it is never converted, so
+// an agent writing "head received the batch" doesn't self-mention. Pass a
+// falsy skipName (user / bridge senders) to normalize every name.
 const MENTION_AGENT_NAMES = ["head", "dev", "re1", "re2"];
-function normalizeMentions(text) {
+function normalizeMentions(text, skipName) {
   if (typeof text !== "string" || !text) return text || "";
+  const names = skipName ? MENTION_AGENT_NAMES.filter((n) => n !== skipName) : MENTION_AGENT_NAMES;
   const preserved = [];
   const ph = "\x00CODE\x00";
   let safe = text.replace(/```[\s\S]*?```|`[^`]+`/g, (m) => {
     preserved.push(m);
     return ph;
   });
-  safe = MENTION_AGENT_NAMES.reduce(
+  safe = names.reduce(
     (t, name) =>
       t.replace(new RegExp(`(?<![@\\w])\\b${name}\\b(?![\\w-])`, "gi"), (match, offset, str) => {
         const before = str.slice(Math.max(0, offset - 20), offset);
@@ -718,17 +722,21 @@ router.post("/api/chat", (req, res) => {
   const shimToken = req.headers["x-chat-token"];
   const bridgeSender = req.headers["x-bridge-sender"];
   let sender = "user";
+  // #788: only an authenticated agent (shim) sender skips its own name; user
+  // and bridge messages normalize every name.
+  let selfMentionSkip = null;
   if (shimSender && shimToken) {
     if (!fileChat.validateShimToken(projectId, shimSender, shimToken)) {
       return res.status(403).json({ error: "Invalid shim token" });
     }
     sender = shimSender;
+    selfMentionSkip = shimSender;
   } else if (bridgeSender && isLocalhost(req.ip)) {
     sender = bridgeSender;
   }
   const msg = fileChat.appendMessage(projectId, {
     sender,
-    text: normalizeMentions(text),
+    text: normalizeMentions(text, selfMentionSkip),
     channel: req.body?.channel || "general",
     type: "message",
   });
