@@ -1897,21 +1897,30 @@ async function serveGithubList(req, res, kind) {
     return res.json(cached ? cached.data : []);
   }
 
-  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
   // #824: these four endpoints serve a BARE ARRAY (cached.data is an array).
   // Stale/rate-limited state must be signalled via a response header — mirroring
   // the X-QuadWork-Idle pattern above — never by spreading the array into an
   // object (which yields {"0":…,"_stale":true} and trips GitHubPanel's
   // Array.isArray guard, blanking the board exactly when it should show
   // last-known data).
-  if (cached && Date.now() - cached.ts < ttl) {
-    if (cached.stale) res.set("X-QuadWork-Stale", "1");
+  //
+  // Freshness is measured against the BASE TTL, not adaptiveTTL: under critical
+  // rate-limit adaptiveTTL is Infinity, so an age<ttl check would treat an
+  // arbitrarily-old cache as fresh and skip the staleness signal entirely.
+  const baseFresh = cached && Date.now() - cached.ts < GH_ENDPOINT_CACHE_TTL;
+
+  // Critically REST-rate-limited → serve whatever we have (even expired) without
+  // revalidating. MUST precede the cache-hit branch below: adaptiveTTL is
+  // Infinity here, so that branch would otherwise return first and an expired
+  // array would go out with no X-QuadWork-Stale / X-QuadWork-Rate-Limited.
+  if (isRateLimited() && cached) {
+    res.set("X-QuadWork-Rate-Limited", "1");
+    if (!baseFresh || cached.stale) res.set("X-QuadWork-Stale", "1");
     return res.json(cached.data);
   }
-  // Critically REST-rate-limited → serve whatever we have (even expired).
-  if (isRateLimited() && cached) {
-    res.set("X-QuadWork-Stale", "1");
-    res.set("X-QuadWork-Rate-Limited", "1");
+  // Fresh enough (within the adaptive window) → serve as-is.
+  if (cached && Date.now() - cached.ts < adaptiveTTL(GH_ENDPOINT_CACHE_TTL)) {
+    if (cached.stale) res.set("X-QuadWork-Stale", "1");
     return res.json(cached.data);
   }
   // Stale-while-revalidate: serve stale now, refresh the snapshot in background.

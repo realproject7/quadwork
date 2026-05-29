@@ -88,28 +88,48 @@ async function run() {
     ok(panelAccepts(res.body), "stale-flag: GitHubPanel still renders last-known data");
   }
 
-  // 3) REST-rate-limited window → still a bare array (board not blanked).
+  // 3) REST-rate-limited window, cache still within base TTL → bare array +
+  //    X-QuadWork-Rate-Limited, but NOT flagged stale (data is genuinely fresh).
   {
     _rateLimit.remaining = 0; // < RATE_LIMIT_CRITICAL → isRateLimited()
     _ghEndpointCache.set(CACHE_KEY, { ts: Date.now(), data: REPO_ARRAY, stale: false });
     const res = mockRes();
     await serveGithubList(REQ, res, "issues");
-    ok(Array.isArray(res.body), "rate-limited: body is a JSON array");
-    ok(panelAccepts(res.body), "rate-limited: GitHubPanel renders last-known data during the window");
+    ok(Array.isArray(res.body), "rate-limited (fresh): body is a JSON array");
+    ok(res.headers["x-quadwork-rate-limited"] === "1", "rate-limited (fresh): X-QuadWork-Rate-Limited header set");
+    ok(!res.headers["x-quadwork-stale"], "rate-limited (fresh): not flagged stale while within base TTL");
+    ok(panelAccepts(res.body), "rate-limited (fresh): GitHubPanel renders last-known data during the window");
   }
 
-  // 4) Rate-limited AND flagged stale → bare array + stale header.
+  // 4) RE1 #829: critical rate-limit + EXPIRED cached array + stale:false.
+  //    adaptiveTTL is Infinity here, so the rate-limited branch MUST run before
+  //    the adaptive cache-hit branch — otherwise the expired array goes out with
+  //    no headers. Expect a bare array + BOTH headers.
+  {
+    _rateLimit.remaining = 0;
+    // ts well past GH_ENDPOINT_CACHE_TTL (base ~30s) → expired.
+    _ghEndpointCache.set(CACHE_KEY, { ts: Date.now() - 10 * 60 * 1000, data: REPO_ARRAY, stale: false });
+    const res = mockRes();
+    await serveGithubList(REQ, res, "issues");
+    ok(Array.isArray(res.body), "rate-limited (expired): body is a JSON array (not blanked, not spread)");
+    ok(res.headers["x-quadwork-rate-limited"] === "1", "rate-limited (expired): X-QuadWork-Rate-Limited header set");
+    ok(res.headers["x-quadwork-stale"] === "1", "rate-limited (expired): X-QuadWork-Stale header set");
+    ok(panelAccepts(res.body), "rate-limited (expired): GitHubPanel renders last-known data");
+  }
+
+  // 5) Rate-limited AND flagged stale → bare array + both headers.
   {
     _rateLimit.remaining = 0;
     _ghEndpointCache.set(CACHE_KEY, { ts: Date.now(), data: REPO_ARRAY, stale: true });
     const res = mockRes();
     await serveGithubList(REQ, res, "issues");
     ok(Array.isArray(res.body), "rate-limited+stale: body is a JSON array");
+    ok(res.headers["x-quadwork-rate-limited"] === "1", "rate-limited+stale: X-QuadWork-Rate-Limited header set");
     ok(res.headers["x-quadwork-stale"] === "1", "rate-limited+stale: X-QuadWork-Stale header set");
     ok(panelAccepts(res.body), "rate-limited+stale: GitHubPanel renders last-known data");
   }
 
-  // 5) Source guard — covers EVERY branch (incl. stale-while-revalidate, which
+  // 6) Source guard — covers EVERY branch (incl. stale-while-revalidate, which
   //    fires a background refresh and so isn't exercised behaviourally here):
   //    serveGithubList must never spread cached.data, and must use the headers.
   {
