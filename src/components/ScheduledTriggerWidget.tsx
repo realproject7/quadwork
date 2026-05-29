@@ -108,12 +108,14 @@ function minutesToHoursStr(min: number): string {
 
 function defaultMessage(projectId: string) {
   const queuePath = `~/.quadwork/${projectId}/OVERNIGHT-QUEUE.md`;
+  const githubPath = `~/.quadwork/${projectId}/GITHUB.md`;
   return (
 `@head @dev @re1 @re2 — Queue check.
+Discovery: read ${githubPath} (or GET /api/github-parsed?project=${projectId}) for issue/PR state instead of running gh. If it's absent or stale (>2 cycles / _stale), do ONE direct gh read to confirm. GITHUB.md may lag — confirm with a direct gh read before any merge/review decision.
 @head: Merge any PR with both approvals, assign next from ${queuePath}.
 @dev: Work on assigned ticket or address review feedback.
-@re1 & @re2: Review open PRs. If @dev pushed fixes, re-review. Post verdict on PR AND notify @dev here.
-ALL: Communicate via this chat by tagging agents. Your terminal is NOT visible.`
+@re1 & @re2: Review ONLY PRs you were @mentioned on in this chat (not all open PRs). If @dev pushed fixes, re-review. Post verdict on PR AND notify @dev here.
+ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via this chat by tagging agents. Your terminal is NOT visible.`
   );
 }
 

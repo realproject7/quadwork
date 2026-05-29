@@ -1014,10 +1014,11 @@ app.get("/api/butler/status", (_req, res) => {
 const triggers = new Map();
 
 const DEFAULT_MESSAGE = `@head @re1 @re2 @dev — Queue check.
-Head: Merge any PR with both approvals, assign next from queue.
+Discovery: read GITHUB.md (or GET /api/github-parsed) for issue/PR state instead of running gh. If GITHUB.md is absent or stale (>2 cycles / _stale), do ONE direct gh read to confirm. GITHUB.md may lag — confirm with a direct gh read before any merge/review decision.
+Head: Merge any PR with both current-revision approvals, assign next from queue.
 Dev: Work on assigned ticket or address review feedback.
-RE1/RE2: Review open PRs. If Dev pushed fixes, re-review. Post verdict on PR AND notify here.
-ALL: Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
+RE1/RE2: Review ONLY PRs you were @mentioned on in this chat (not all open PRs). If Dev pushed fixes, re-review. Post verdict on PR AND notify here.
+ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
 
 // #518: server-side bridge lifecycle helpers. Stop and start Telegram +
 // Discord bridges so they respond to batch transitions even when the
