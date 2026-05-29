@@ -9,7 +9,7 @@
 // distinct successful cycles.
 
 const assert = require("node:assert/strict");
-const { progressFromSnapshot, countApprovedRoles, evalBatchCompleteConfirmed } = require("./routes");
+const { progressFromSnapshot, countApprovedRoles, evalBatchCompleteConfirmed, buildNoPrRow } = require("./routes");
 
 // Reviews authored by the SHARED reviewer login, distinguished by body marker.
 const review = (marker, state, ts) => ({ state, author: { login: "shared" }, submittedAt: ts, body: `${marker}: ${state}` });
@@ -53,7 +53,7 @@ function run() {
   };
 
   {
-    ok(progressFromSnapshot(snapshot, 1).status === "queued" && progressFromSnapshot(snapshot, 1).progress === 0, "open issue, no PR → queued/0");
+    // PR-backed buckets the snapshot CAN prove (matching in-window PR):
     const r2 = progressFromSnapshot(snapshot, 2);
     ok(r2.status === "in_review" && r2.progress === 20 && r2.pr_number === 102, "open PR, 0 approvals → in_review/20");
     const r3 = progressFromSnapshot(snapshot, 3);
@@ -62,15 +62,30 @@ function run() {
     ok(r4.status === "ready" && r4.progress === 80, "open PR, 2 roles approved → ready/80");
     const r5 = progressFromSnapshot(snapshot, 5);
     ok(r5.status === "merged" && r5.progress === 100 && r5.pr_number === 105, "merged PR + CLOSED issue → merged/100");
-    const r6 = progressFromSnapshot(snapshot, 6);
-    ok(r6.status === "closed" && r6.progress === 100, "CLOSED issue, no PR → closed/100");
+  }
+
+  // ── queued / closed buckets come from buildNoPrRow on the by-number path ──
+  // (progressFromSnapshot never guesses these — see the null cases below).
+  {
+    ok(buildNoPrRow({ number: 1, title: "q", state: "OPEN" }).status === "queued", "buildNoPrRow OPEN → queued/0");
+    ok(buildNoPrRow({ number: 1, title: "q", state: "OPEN" }).progress === 0, "queued is 0%");
+    ok(buildNoPrRow({ number: 6, title: "c", state: "CLOSED" }).status === "closed", "buildNoPrRow CLOSED → closed/100");
+    ok(buildNoPrRow({ number: 6, title: "c", state: "CLOSED" }).progress === 100, "closed is 100%");
   }
 
   // ── merged requires PR-merged AND issue-CLOSED ──
   {
-    // #7 has a merged PR but its issue is still OPEN in the snapshot → NOT merged.
-    const r7 = progressFromSnapshot(snapshot, 7);
-    ok(r7.status !== "merged", "merged PR but issue still OPEN → NOT merged (strict rule)");
+    // #7 has a merged PR in-window but its issue is still OPEN → NOT merged, and
+    // since no OPEN PR matches, the snapshot can't prove the state → null.
+    ok(progressFromSnapshot(snapshot, 7) === null, "merged PR but issue still OPEN → null (by-number resolves it)");
+  }
+
+  // ── re1 regression: issue PRESENT in snapshot but its PR is OUTSIDE the
+  //    window → null, so the route runs the authoritative by-number fetch
+  //    (must NEVER under-report a real in_review/ready/merged item as queued). ──
+  {
+    ok(progressFromSnapshot(snapshot, 1) === null, "open issue in snapshot, no in-window PR → null (NOT queued — PR may be out of window)");
+    ok(progressFromSnapshot(snapshot, 6) === null, "closed issue in snapshot, no in-window PR → null (by-number confirms merged-vs-closed)");
   }
 
   // ── cache miss → null (caller does targeted by-number fetch) ──
@@ -82,7 +97,7 @@ function run() {
   // ── title linking is strict [#N] (no false-positive on substring) ──
   {
     const snap = { issues: [{ number: 80, title: "x", state: "OPEN" }], prs: [{ number: 200, title: "[#807] not 80", state: "OPEN", reviews: [] }], closedIssues: [], mergedPrs: [] };
-    ok(progressFromSnapshot(snap, 80).status === "queued", "#80 not linked to PR titled [#807] — no substring false-positive");
+    ok(progressFromSnapshot(snap, 80) === null, "#80 not linked to PR titled [#807] (no substring match) → null, not a false in_review");
   }
 
   // ── evalBatchCompleteConfirmed: two distinct successful cycles ──

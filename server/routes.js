@@ -1750,10 +1750,14 @@ function countApprovedRoles(reviews) {
 }
 
 // Compute issue `n`'s progress row from the snapshot (no network). Links
-// issue↔PR by the team's `[#<issue>]` PR-title convention. Returns null when
-// the issue/PR is outside the board window so the caller does a targeted
-// by-number fetch — NEVER compute solely from board-window state. Bucket
-// mapping is identical to progressForItemAsync.
+// issue↔PR by the team's `[#<issue>]` PR-title convention, and ONLY returns a
+// row when it found a matching in-window PR — i.e. when the snapshot can prove
+// the item's actual state. It returns null otherwise (including when the issue
+// row is present but no matching PR is in the window), because a partial board
+// window can NEVER prove an issue has no linked PR — a real in_review/ready/
+// merged item could have its PR outside the window. The caller then does the
+// authoritative by-number fetch (progressForItemAsync → closedByPullRequests-
+// References). Bucket mapping is identical to progressForItemAsync.
 function progressFromSnapshot(snapshot, n) {
   if (!snapshot) return null;
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
@@ -1761,25 +1765,26 @@ function progressFromSnapshot(snapshot, n) {
   const mergedPr = (snapshot.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
   const openIssue = (snapshot.issues || []).find((i) => i.number === n);
   const closedIssue = (snapshot.closedIssues || []).find((i) => i.number === n);
+  const title = (openIssue && openIssue.title) || (closedIssue && closedIssue.title) || `#${n}`;
 
-  // merged requires PR merged AND issue CLOSED.
+  // merged requires a matching merged PR in-window AND the issue CLOSED.
   if (mergedPr && closedIssue) {
     return {
       issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url,
       pr_number: mergedPr.number, status: "merged", progress: 100, label: "Merged ✓",
     };
   }
+  // Matching open PR in-window → confident in_review/approved/ready.
   if (openPr) {
-    const title = (openIssue && openIssue.title) || (closedIssue && closedIssue.title) || `#${n}`;
     const approvals = countApprovedRoles(openPr.reviews);
     if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
     if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
     return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
   }
-  // No PR in the window — honor issue state if we have it; else it's a miss.
-  if (closedIssue) return buildNoPrRow({ number: n, title: closedIssue.title, state: "CLOSED", url: closedIssue.url });
-  if (openIssue) return buildNoPrRow({ number: n, title: openIssue.title, state: "OPEN", url: openIssue.url });
-  return null; // outside board window → targeted by-number fetch
+  // No matching PR in the board window. We can't prove the issue has no linked
+  // PR (it may be outside the window), so DON'T guess queued/closed here —
+  // return null and let the by-number fetch resolve it authoritatively.
+  return null;
 }
 
 // Confirmed-complete state machine, per project. `complete` must hold across
