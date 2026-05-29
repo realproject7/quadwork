@@ -49,7 +49,7 @@ const COPY = {
  * layout collapses back to the single-column stack so nothing
  * clips in cramped split-view / mobile.
  */
-export default function OperatorFeaturesPanel({ projectId }: { projectId: string }) {
+export default function OperatorFeaturesPanel({ projectId, idle = false }: { projectId: string; idle?: boolean }) {
   const { locale } = useLocale();
   const t = COPY[locale];
   return (
@@ -69,7 +69,7 @@ export default function OperatorFeaturesPanel({ projectId }: { projectId: string
             any overshoot visually; the right column is the only
             independent scroll container. */}
         <div className="lg:flex-1 lg:min-w-[280px] lg:min-h-0">
-          <ScheduledTriggerWidget projectId={projectId} />
+          <ScheduledTriggerWidget projectId={projectId} idle={idle} />
         </div>
         {/* Vertical divider between the two columns, only at lg+. */}
         <div className="hidden lg:block w-px self-stretch bg-border" />
@@ -77,8 +77,8 @@ export default function OperatorFeaturesPanel({ projectId }: { projectId: string
             History. Scrolls independently of the left column. */}
         <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto flex flex-col gap-2">
           <AgentModelsWidget projectId={projectId} />
-          <TelegramBridgeWidget projectId={projectId} />
-          <DiscordBridgeWidget projectId={projectId} />
+          <TelegramBridgeWidget projectId={projectId} idle={idle} />
+          <DiscordBridgeWidget projectId={projectId} idle={idle} />
           <LoopGuardWidget projectId={projectId} />
           <ProjectHistoryWidget projectId={projectId} />
         </div>

@@ -142,6 +142,7 @@ function ciLabel(rollup: { state: string }[]): string {
 
 interface GitHubPanelProps {
   projectId: string;
+  idle?: boolean;
 }
 
 // #554: rate limit status shape from /api/github/rate-limit
@@ -153,7 +154,7 @@ interface RateLimitInfo {
   critical: boolean;
 }
 
-export default function GitHubPanel({ projectId }: GitHubPanelProps) {
+export default function GitHubPanel({ projectId, idle = false }: GitHubPanelProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -226,10 +227,11 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
   }, []);
 
   useEffect(() => {
+    if (idle) return; // #812: parked project — stop polling issues/PRs (last-known data stays)
     fetchData();
     const interval = setInterval(fetchData, 60000); // #698: 60s (was 30s)
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [fetchData, idle]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -399,7 +401,7 @@ export default function GitHubPanel({ projectId }: GitHubPanelProps) {
           between the issues/PRs lists and the OVERNIGHT-QUEUE.md
           row. Reads /api/batch-progress on its own 30s cadence. */}
       <div className="shrink-0">
-        <BatchProgressPanel projectId={projectId} />
+        <BatchProgressPanel projectId={projectId} idle={idle} />
       </div>
 
       {/* #226: compact OVERNIGHT-QUEUE.md row at the bottom */}

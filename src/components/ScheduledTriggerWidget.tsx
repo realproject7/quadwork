@@ -6,6 +6,7 @@ import { useLocale } from "@/components/LocaleProvider";
 
 interface ScheduledTriggerWidgetProps {
   projectId: string;
+  idle?: boolean;
 }
 
 // #408: batch progress shape from /api/batch-progress
@@ -139,7 +140,7 @@ function formatCountdown(ms: number): string {
  * State is sourced from GET /api/triggers every 5s so reopening the
  * project picks up the last-used message + running status.
  */
-export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWidgetProps) {
+export default function ScheduledTriggerWidget({ projectId, idle = false }: ScheduledTriggerWidgetProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [trigger, setTrigger] = useState<TriggerInfo | null>(null);
@@ -254,10 +255,11 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   }, [initialMessage, message]);
 
   useEffect(() => {
+    if (idle) return; // #812: parked project — stop polling trigger status
     load();
     const id = window.setInterval(load, 5000);
     return () => window.clearInterval(id);
-  }, [load]);
+  }, [load, idle]);
 
   // 1-Hz tick for the live countdown while running.
   useEffect(() => {
@@ -441,11 +443,11 @@ export default function ScheduledTriggerWidget({ projectId }: ScheduledTriggerWi
   }, [projectId, durationHoursDraft, intervalDraft, initialMessage, load, t.autoStopStatus]);
 
   useEffect(() => {
-    if (!autoTrigger) return;
+    if (!autoTrigger || idle) return; // #812: parked project — suppress auto-trigger lifecycle polling
     checkBatchLifecycle();
     const id = window.setInterval(checkBatchLifecycle, AUTO_TRIGGER_POLL_MS);
     return () => window.clearInterval(id);
-  }, [autoTrigger, checkBatchLifecycle]);
+  }, [autoTrigger, checkBatchLifecycle, idle]);
 
   const running = !!trigger?.enabled;
 

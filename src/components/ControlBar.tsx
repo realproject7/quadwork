@@ -307,7 +307,7 @@ function formatTime(seconds: number): string {
 const AWAKE_AUTO_POLL_MS = 30_000;
 const AWAKE_AUTO_DEFAULT_HOURS = 8;
 
-function SystemSection({ projectId }: { projectId: string }) {
+function SystemSection({ projectId, idle = false }: { projectId: string; idle?: boolean }) {
   const { locale } = useLocale();
   const t = COPY[locale].system;
   const [active, setActive] = useState(false);
@@ -493,7 +493,7 @@ function SystemSection({ projectId }: { projectId: string }) {
 
   // #441: Batch lifecycle polling (same pattern as ScheduledTriggerWidget)
   useEffect(() => {
-    if (!awakeAuto) return;
+    if (!awakeAuto || idle) return; // #812: parked project — suppress auto-awake batch-progress polling
     const check = async () => {
       if (!awakeAutoRef.current) return;
       try {
@@ -535,7 +535,7 @@ function SystemSection({ projectId }: { projectId: string }) {
     check();
     const interval = setInterval(check, AWAKE_AUTO_POLL_MS);
     return () => clearInterval(interval);
-  }, [awakeAuto, projectId, autoStart, autoStop, t]);
+  }, [awakeAuto, projectId, autoStart, autoStop, t, idle]);
 
   // #425 / quadwork#311: Keep Awake is now a standalone subsection
   // and renders even on non-darwin (the button just hides). The
@@ -753,9 +753,10 @@ function SystemSection({ projectId }: { projectId: string }) {
 
 interface ControlBarProps {
   projectId: string;
+  idle?: boolean;
 }
 
-export default function ControlBar({ projectId }: ControlBarProps) {
+export default function ControlBar({ projectId, idle = false }: ControlBarProps) {
   // #210: Keep Alive moved to the Scheduled Trigger widget in the
   // bottom-right Operator Features quadrant. ControlBar now only
   // carries the server lifecycle + system controls.
@@ -772,7 +773,7 @@ export default function ControlBar({ projectId }: ControlBarProps) {
       <div className="flex flex-col md:flex-row md:items-start gap-2 md:gap-6">
         <ServerSection projectId={projectId} />
         <div className="border-t border-border/40 md:border-t-0 md:w-px md:h-auto md:self-stretch md:bg-border" />
-        <SystemSection projectId={projectId} />
+        <SystemSection projectId={projectId} idle={idle} />
       </div>
     </div>
   );

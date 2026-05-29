@@ -26,6 +26,7 @@ interface BatchProgressData {
 
 interface BatchProgressPanelProps {
   projectId: string;
+  idle?: boolean;
 }
 
 const COPY = {
@@ -81,7 +82,7 @@ function ProgressBar({ percent }: { percent: number }) {
  * label. Polls every 30s on the same cadence as the rest of the
  * GitHub panel.
  */
-export default function BatchProgressPanel({ projectId }: BatchProgressPanelProps) {
+export default function BatchProgressPanel({ projectId, idle = false }: BatchProgressPanelProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [data, setData] = useState<BatchProgressData | null>(null);
@@ -94,10 +95,11 @@ export default function BatchProgressPanel({ projectId }: BatchProgressPanelProp
   }, [projectId]);
 
   useEffect(() => {
+    if (idle) return; // #812: parked project — stop polling batch progress
     load();
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
-  }, [load]);
+  }, [load, idle]);
 
   if (!data) {
     return (

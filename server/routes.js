@@ -120,9 +120,12 @@ function _ghEnqueueRefresh(cacheKey, ghArgs, transform) {
   _ghDrainQueue();
 }
 
-function cachedGhEndpoint(cacheKey, ghArgs, res, { transform } = {}) {
-  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
+function cachedGhEndpoint(cacheKey, ghArgs, res, { transform, idle } = {}) {
   const cached = _ghEndpointCache.get(cacheKey);
+  // #812: a parked (idle) project must never initiate a gh fetch.
+  // Serve whatever we last cached, or an empty list — never call gh.
+  if (idle) return res.json(cached ? cached.data : []);
+  const ttl = adaptiveTTL(GH_ENDPOINT_CACHE_TTL);
   if (cached && Date.now() - cached.ts < ttl) {
     return res.json(cached.stale ? { ...cached.data, _stale: true } : cached.data);
   }
@@ -850,6 +853,20 @@ router.get("/api/projects", async (req, res) => {
   async function fetchProjectGhData(p) {
     let openPrs = 0;
     let lastActivity = null;
+    // #812: parked (idle) project — no gh calls; return zero/last-known metadata.
+    if (p.idle) {
+      const hasAgentsIdle = p.agents && Object.keys(p.agents).length > 0;
+      return {
+        id: p.id,
+        name: p.name,
+        repo: p.repo,
+        agentCount: hasAgentsIdle ? Object.keys(p.agents).length : 0,
+        openPrs: 0,
+        state: "idle",
+        lastActivity: null,
+        _idle: true,
+      };
+    }
     if (REPO_RE.test(p.repo)) {
       try {
         const [prs, recentPrs] = await Promise.allSettled([
@@ -937,6 +954,20 @@ function getRepo(projectId) {
   }
 }
 
+// #812: per-project Idle toggle. When a project is idle, QuadWork must
+// initiate ZERO project-specific GitHub/API activity for it. Callers
+// (board fetch, per-endpoint handlers, batch-progress, /api/projects)
+// check this before issuing any gh call.
+function isProjectIdle(projectId) {
+  if (!projectId) return false;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    return !!cfg.projects?.find((p) => p.id === projectId)?.idle;
+  } catch {
+    return false;
+  }
+}
+
 // ─── #703: Batched GraphQL layer ──────────────────────────────────────────
 // Instead of spawning individual `gh issue list` / `gh pr list` subprocesses
 // per project per endpoint, we fetch ALL configured projects' GitHub data in
@@ -959,7 +990,7 @@ async function fetchAllProjectsGraphQL() {
   } catch {
     return null;
   }
-  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo));
+  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
   if (projects.length === 0) return null;
 
   // Build aliased repository fields — one per project.
@@ -1238,7 +1269,7 @@ router.get("/api/github/all", async (req, res) => {
   const anyStale = (() => {
     let cfg;
     try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return true; }
-    const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo));
+    const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
     for (const p of projects) {
       const cached = _graphqlCache.get(p.repo);
       if (!cached || Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL)) return true;
@@ -1250,7 +1281,7 @@ router.get("/api/github/all", async (req, res) => {
   // Build response.
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
-  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo));
+  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
 
   const result = {};
   const fallbackNeeded = [];
@@ -1320,6 +1351,7 @@ router.get("/api/github/issues", (req, res) => {
     `issues:${repo}`,
     ["issue", "list", "-R", repo, "--json", "number,title,state,assignees,labels,createdAt,url", "--limit", "50"],
     res,
+    { idle: isProjectIdle(req.query.project || "") },
   );
 });
 
@@ -1330,6 +1362,7 @@ router.get("/api/github/prs", (req, res) => {
     `prs:${repo}`,
     ["pr", "list", "-R", repo, "--json", "number,title,state,author,assignees,reviewDecision,reviews,statusCheckRollup,url,createdAt", "--limit", "50"],
     res,
+    { idle: isProjectIdle(req.query.project || "") },
   );
 });
 
@@ -1351,6 +1384,7 @@ router.get("/api/github/closed-issues", (req, res) => {
     ["issue", "list", "-R", repo, "--state", "closed", "--json", "number,title,state,url,closedAt", "--limit", String(RECENT_FETCH_LIMIT)],
     res,
     {
+      idle: isProjectIdle(req.query.project || ""),
       transform: (items) =>
         Array.isArray(items)
           ? items
@@ -1378,6 +1412,7 @@ router.get("/api/github/merged-prs", (req, res) => {
     ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,title,state,url,mergedAt,author", "--limit", String(RECENT_FETCH_LIMIT)],
     res,
     {
+      idle: isProjectIdle(req.query.project || ""),
       transform: (items) =>
         Array.isArray(items)
           ? items
@@ -1811,6 +1846,12 @@ router.get("/api/batch-progress", async (req, res) => {
   // firing N gh calls per batch item.
   if (isRateLimited() && cached) {
     return res.json({ ...cached.data, _stale: true, _rateLimited: true });
+  }
+  // #812: parked (idle) project — never run batch-progress gh/GraphQL calls.
+  // Serve last-known data (or an empty batch) flagged _idle.
+  if (isProjectIdle(projectId)) {
+    if (cached) return res.json({ ...cached.data, _idle: true });
+    return res.json({ batch_number: null, items: [], summary: "", complete: false, _idle: true });
   }
 
   const repo = getRepo(projectId);
