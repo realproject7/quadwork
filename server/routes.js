@@ -93,7 +93,13 @@ async function refreshRateLimit() {
 function startRateLimitPolling() {
   if (_rateLimitTimer) return;
   refreshRateLimit();
+  // #836: .unref() so this interval doesn't alone pin the event loop.
+  // Production keeps the process alive via the Express HTTP listener, so
+  // cadence/auto-start is unchanged; .unref() only lets test imports and
+  // one-off `node -e` invocations exit cleanly (an unref'd `node -e` poller
+  // ran for 11 days in the wild before this was caught).
   _rateLimitTimer = setInterval(refreshRateLimit, RATE_LIMIT_POLL_MS);
+  _rateLimitTimer.unref();
 }
 
 function isRateLimited() {
@@ -1834,9 +1840,13 @@ async function refreshGraphQLCache() {
 let _graphqlPollTimer = null;
 function startGraphQLPolling() {
   if (_graphqlPollTimer) return;
+  // #836: both the warm-up setTimeout and the steady-state setInterval are
+  // .unref()'d so a test/import process can exit. The Express HTTP listener
+  // keeps prod alive on its own; cadence is unchanged.
   // Initial fetch after a short delay (let rate-limit poll run first).
-  setTimeout(() => refreshGraphQLCache(), 2000);
+  setTimeout(() => refreshGraphQLCache(), 2000).unref();
   _graphqlPollTimer = setInterval(refreshGraphQLCache, GRAPHQL_CACHE_TTL);
+  _graphqlPollTimer.unref();
 }
 
 // ─── #810: batch progress sourced from the REST snapshot ──────────────────
