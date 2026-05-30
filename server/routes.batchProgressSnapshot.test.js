@@ -90,26 +90,48 @@ function run() {
     ok(progressFromSnapshot(snapshot, 6) === null, "closed issue in snapshot, no in-window PR → null (by-number confirms merged-vs-closed)");
   }
 
-  // ── #828 P1: queued classified from the snapshot ONLY when the open-PR
-  //    window is provably complete (openPrsWindowComplete) — and NEVER when it
-  //    may be truncated. No GraphQL/network in either case. ──
+  // ── #828 P1 / #834: queued classified from the snapshot ONLY when BOTH the
+  //    open-PR window AND the closed-PR window are provably complete, and the
+  //    issue isn't linked by any scanned closed PR. No GraphQL/network. ──
   {
-    const complete = { ...snapshot, openPrsWindowComplete: true };
+    // closedPrIssueNums = [5,7] (the [#N] of the scanned closed/merged PRs).
+    const complete = { ...snapshot, openPrsWindowComplete: true, closedPrsWindowComplete: true, closedPrIssueNums: [5, 7] };
     const r1 = progressFromSnapshot(complete, 1);
-    ok(r1 && r1.status === "queued" && r1.progress === 0, "window complete + OPEN issue + no matching PR → queued/0 (no by-number fetch)");
+    ok(r1 && r1.status === "queued" && r1.progress === 0, "both windows complete + OPEN issue + no linked PR → queued/0 (no by-number fetch)");
     ok(r1 && r1.issue_number === 1 && r1.title === "queued one", "queued row carries the snapshot issue's number + title");
-    // Truncated/unknown window must NOT guess queued — falls through to null.
-    ok(progressFromSnapshot({ ...snapshot, openPrsWindowComplete: false }, 1) === null, "window NOT complete → null even for an OPEN no-PR issue (by-number fallback)");
+    // Open-PR window not complete → never queued.
+    ok(progressFromSnapshot({ ...snapshot, openPrsWindowComplete: false }, 1) === null, "open-PR window NOT complete → null even for an OPEN no-PR issue (by-number fallback)");
     // A matching in-window PR still wins over the queued shortcut.
     ok(progressFromSnapshot(complete, 2).status === "in_review", "window complete but a matching open PR exists → in_review (PR proof wins)");
-    // merged-but-open edge: matching merged PR in-window + issue OPEN → still
-    // null (NOT queued) so by-number resolves the merged-vs-in_review state.
-    ok(progressFromSnapshot(complete, 7) === null, "window complete + merged PR in-window but issue OPEN → null (merged-but-open edge, not queued)");
-    // CLOSED issue with no in-window PR → null even when window complete
-    // (open-PR completeness says nothing about merged-out-of-window).
-    ok(progressFromSnapshot(complete, 6) === null, "window complete + CLOSED issue + no in-window PR → null (closed-no-PR vs merged-out-of-window needs by-number)");
-    // Issue absent from the snapshot entirely → null regardless of the flag.
-    ok(progressFromSnapshot(complete, 999) === null, "window complete but issue absent from snapshot → null (by-number fallback)");
+    // #834: issue 7 has a linked merged PR ([#7] ∈ closedPrIssueNums) and is
+    // OPEN → NOT queued (by-number resolves the merged-vs-in_review state).
+    ok(progressFromSnapshot(complete, 7) === null, "OPEN issue with a linked closed/merged PR → null (not queued), via closedPrIssueNums");
+    // CLOSED issue with no in-window PR → null (openIssue absent).
+    ok(progressFromSnapshot(complete, 6) === null, "CLOSED issue + no in-window PR → null (closed-no-PR vs merged needs by-number)");
+    // Issue absent from the snapshot entirely → null regardless of the flags.
+    ok(progressFromSnapshot(complete, 999) === null, "issue absent from snapshot → null (by-number fallback)");
+  }
+
+  // ── #834 headline: an OPEN issue whose linked [#N] PR merged/closed OUTSIDE
+  //    the recent-5 merged display window must NOT be shown queued. The merged
+  //    slice (snapshot.mergedPrs) wouldn't contain it, but closedPrIssueNums —
+  //    parsed from ALL scanned closed pages — does, so we fall back. ──
+  {
+    const base = {
+      issues: [{ number: 8, title: "open, PR merged out of window", state: "OPEN", url: "u8" }],
+      prs: [],
+      closedIssues: [],
+      mergedPrs: [], // PR for #8 merged but PAST the recent-5 display window
+      openPrsWindowComplete: true,
+      closedPrsWindowComplete: true,
+      closedPrIssueNums: [8], // but [#8] WAS seen on a scanned closed page
+    };
+    ok(progressFromSnapshot(base, 8) === null, "OPEN issue + [#8] PR merged OUT of the recent window → null (NOT queued — by-number resolves; the #834 bug)");
+    // Small repo, genuinely no linked PR anywhere → fast-path queued, no network.
+    ok(progressFromSnapshot({ ...base, closedPrIssueNums: [] }, 8).status === "queued", "OPEN issue + no linked PR anywhere (both windows complete) → queued, no network");
+    // Early-stop / cap-hit-while-full: closed-PR window NOT proven complete →
+    // never queued, even though the (partial) closedPrIssueNums lacks the issue.
+    ok(progressFromSnapshot({ ...base, closedPrsWindowComplete: false, closedPrIssueNums: [] }, 8) === null, "closed-PR window NOT complete (early-stop/cap) → null (by-number fallback), never queued");
   }
 
   // ── cache miss → null (caller does targeted by-number fetch) ──
