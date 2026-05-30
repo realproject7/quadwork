@@ -2215,32 +2215,55 @@ async function checkBatchSnapshotFreshness(repo, snapshot) {
 // the live Active Batch contains items the snapshot doesn't); in
 // all other cases the snapshot wins, so items Head moved to Done
 // stay visible until the operator starts the next batch.
-function resolveDisplayedBatch(queueText, projectId, { queueReadOk = true } = {}) {
-  // Queue file deleted / unreadable → fall back to empty state per
-  // #316's edge case. Returning the snapshot here would "heal" a
-  // genuinely missing file into stale data the operator can't
-  // reconcile without nuking ~/.quadwork/{id}/batch-progress-cache.json
-  // manually.
-  if (!queueReadOk) return { batchNumber: null, issueNumbers: [] };
-  const current = parseActiveBatch(queueText);
-  const snapshot = readBatchSnapshot(projectId);
+// Decide whether the displayed batch comes from the LIVE Active Batch parse or
+// the preserved snapshot. A new batch (explicit Batch: N bump OR live items the
+// snapshot doesn't have) → "live"; otherwise a non-empty snapshot wins
+// ("snapshot"), so items Head moved to Done stay visible until the next batch
+// starts. Extracted so #870's type pre-check follows the SAME decision.
+function pickDisplayedSource(current, snapshot) {
   const hasExplicitBump =
     current.batchNumber !== null &&
     (!snapshot || snapshot.batchNumber === null || current.batchNumber > snapshot.batchNumber);
   const hasNewItems =
     current.issueNumbers.length > 0 &&
     (!snapshot || current.issueNumbers.some((n) => !snapshot.issueNumbers.includes(n)));
+  if (hasExplicitBump || hasNewItems) return "live";
+  if (snapshot && Array.isArray(snapshot.issueNumbers) && snapshot.issueNumbers.length > 0) return "snapshot";
+  return "live";
+}
+
+function resolveDisplayedBatch(queueText, projectId, { queueReadOk = true } = {}) {
+  // Queue file deleted / unreadable → fall back to empty state per
+  // #316's edge case. Returning the snapshot here would "heal" a
+  // genuinely missing file into stale data the operator can't
+  // reconcile without nuking ~/.quadwork/{id}/batch-progress-cache.json
+  // manually.
+  if (!queueReadOk) return { batchNumber: null, issueNumbers: [], batch_type: "code", reviewItems: [] };
+  const current = parseActiveBatch(queueText);
+  const snapshot = readBatchSnapshot(projectId);
+  const source = pickDisplayedSource(current, snapshot);
   let next;
-  if (hasExplicitBump || hasNewItems) {
-    next = { batchNumber: current.batchNumber, issueNumbers: current.issueNumbers.slice() };
-  } else if (snapshot && Array.isArray(snapshot.issueNumbers) && snapshot.issueNumbers.length > 0) {
+  if (source === "live") {
+    next = {
+      batchNumber: current.batchNumber,
+      issueNumbers: current.issueNumbers.slice(),
+      // #870: type + per-item review states from the LIVE Active Batch.
+      batch_type: parseBatchType(queueText),
+      reviewItems: parseReviewItems(queueText),
+    };
+  } else {
     next = {
       batchNumber: snapshot.batchNumber ?? null,
       issueNumbers: snapshot.issueNumbers.slice(),
+      // #870: a just-archived review batch keeps its type + review states from
+      // the snapshot, so it renders without GitHub and is NEVER reinterpreted
+      // as code. Absent (legacy / code snapshots) → "code"/[] — back-compatible.
+      batch_type: snapshot.batch_type || "code",
+      reviewItems: Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : [],
     };
-  } else {
-    next = { batchNumber: current.batchNumber, issueNumbers: current.issueNumbers.slice() };
   }
+  // Snapshot persists batchNumber/issueNumbers (existing consumers) PLUS the
+  // additive #870 batch_type/reviewItems.
   if (next.issueNumbers.length > 0) writeBatchSnapshot(projectId, next);
   return next;
 }
@@ -2300,6 +2323,126 @@ function parseActiveBatch(queueText) {
     }
   }
   return { batchNumber, issueNumbers };
+}
+
+// #870: review-batch support. The queue's `## Active Batch` section may carry a
+// `**Batch type:** code | ticket-review | pr-review` line (right after
+// `**Batch:** N`). Absent/unrecognized → "code" (preserves existing behavior
+// exactly). Review batches compute progress from the Active Batch item states
+// alone — no GitHub calls.
+const ACTIVE_BATCH_SECTION_RE = /##\s+Active Batch[\s\S]*?(?=\n##\s|$)/i;
+const REVIEW_BATCH_TYPES = new Set(["ticket-review", "pr-review"]);
+
+function parseBatchType(queueText) {
+  if (typeof queueText !== "string" || !queueText) return "code";
+  const m = queueText.match(ACTIVE_BATCH_SECTION_RE);
+  if (!m) return "code";
+  const tm = m[0].match(/\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\b/i);
+  return tm ? tm[1].toLowerCase() : "code";
+}
+
+// Parse one Active Batch item's review-state annotation — the text after
+// `- #123 — `. Recognizes queued / in-review / in-review (N/2) / approved /
+// changes-requested; the leading separator (`—`, `-`, `:`, `]`, …) is stripped,
+// and anything unrecognized falls back to `queued` (safe default).
+function parseReviewState(raw) {
+  const s = String(raw || "").trim().replace(/^[^a-z0-9]+/i, "").toLowerCase();
+  if (s.startsWith("approved")) return { review_state: "approved", approvals: 2 };
+  if (s.startsWith("changes")) return { review_state: "changes-requested", approvals: 0 };
+  if (s.startsWith("in-review") || s.startsWith("in review")) {
+    const mm = s.match(/\((\d)\s*\/\s*2\)/);
+    return { review_state: "in-review", approvals: mm ? parseInt(mm[1], 10) : 0 };
+  }
+  return { review_state: "queued", approvals: 0 };
+}
+
+// Parse the `## Active Batch` review items: `- #<n> — <state>`. Same line
+// grammar as parseActiveBatch (so the issue set matches exactly), plus the
+// trailing state annotation. Scoped to Active Batch — NEVER `## Done`.
+const REVIEW_ITEM_LINE_RE = /^\s*(?:[-*]\s+|\d+\.\s+)?(?:\[[ xX]\]\s+)?\[?#(\d{1,6})\]?\b(.*)$/;
+function parseReviewItems(queueText) {
+  if (typeof queueText !== "string" || !queueText) return [];
+  const m = queueText.match(ACTIVE_BATCH_SECTION_RE);
+  if (!m) return [];
+  const seen = new Set();
+  const items = [];
+  for (const line of m[0].split("\n")) {
+    const lm = line.match(REVIEW_ITEM_LINE_RE);
+    if (!lm) continue;
+    const n = parseInt(lm[1], 10);
+    if (seen.has(n)) continue;
+    seen.add(n);
+    const { review_state, approvals } = parseReviewState(lm[2]);
+    items.push({ issue: n, review_state, approvals });
+  }
+  return items;
+}
+
+// Map a parsed review state → the batch-progress item, EXTENDING the existing
+// item shape ({ issue_number, title, url, pr_number, status, progress, label })
+// with review_state + approvals. pr-review items ARE PRs → set pr_number;
+// ticket-review omits it (frontend type is pr_number?: number — never null).
+function reviewItemView(ri, batchType, ghIndex) {
+  const n = ri.issue;
+  const meta = ghIndex && ghIndex.get(n);
+  let progress, status, label;
+  if (ri.review_state === "approved") { progress = 100; status = "approved"; label = "Approved ✓"; }
+  else if (ri.review_state === "changes-requested") { progress = 0; status = "changes_requested"; label = "changes requested"; }
+  else if (ri.review_state === "in-review") {
+    if (ri.approvals >= 1) { progress = 50; status = "in_review"; label = `In review · ${ri.approvals}/2 approvals`; }
+    else { progress = 20; status = "in_review"; label = "In review"; }
+  } else { progress = 0; status = "queued"; label = "Queued"; }
+  const item = {
+    issue_number: n,
+    title: (meta && meta.title) || `#${n}`,
+    url: (meta && meta.url) || null,
+    status,
+    progress,
+    label,
+    review_state: ri.review_state,
+    approvals: ri.approvals,
+  };
+  if (batchType === "pr-review") item.pr_number = n;
+  return item;
+}
+
+function summarizeReviewItems(reviewItems) {
+  const total = reviewItems.length;
+  let approved = 0, inReview = 0, changes = 0, queued = 0;
+  for (const r of reviewItems) {
+    if (r.review_state === "approved") approved++;
+    else if (r.review_state === "in-review") inReview++;
+    else if (r.review_state === "changes-requested") changes++;
+    else queued++;
+  }
+  const parts = [`${approved}/${total} approved`];
+  if (inReview > 0) parts.push(`${inReview} in review`);
+  if (changes > 0) parts.push(`${changes} changes requested`);
+  if (queued > 0) parts.push(`${queued} queued`);
+  return parts.join(" · ");
+}
+
+// Build a number → { title, url } index from the project's GITHUB.md (file
+// read only — NO gh call). Resolves review-item titles/urls; absent/unparseable
+// file → empty map and items fall back to `#N` / null url.
+function loadGithubItemIndex(projectId) {
+  const map = new Map();
+  let text;
+  try {
+    text = fs.readFileSync(path.join(CONFIG_DIR, projectId, "GITHUB.md"), "utf-8");
+  } catch {
+    return map;
+  }
+  const parsed = parseGithub(text);
+  if (!parsed || !parsed.ok) return map;
+  for (const list of [parsed.openIssues, parsed.closedIssues, parsed.openPRs, parsed.mergedPrs]) {
+    for (const it of list || []) {
+      if (it && typeof it.number === "number" && !map.has(it.number)) {
+        map.set(it.number, { title: it.title, url: it.url });
+      }
+    }
+  }
+  return map;
 }
 
 // #416 / quadwork#299: async variant used by the parallelized batch
@@ -2552,7 +2695,8 @@ router.get("/api/batch-active", async (req, res) => {
   // items outside the recent window.
   const data = await getOrComputeBatchProgress(projectId);
   const active = isBatchActiveFromProgress(data);
-  return res.json({ active: active === null ? false : active });
+  // #870: surface batch_type so the sidebar can label review vs code batches.
+  return res.json({ active: active === null ? false : active, batch_type: (data && data.batch_type) || "code" });
 });
 
 // #807: parsed view of the server-authored GITHUB.md. Single source of truth is
@@ -2601,7 +2745,7 @@ async function getOrComputeBatchProgress(projectId) {
   // precede the fresh-cache and rate-limit returns below.
   if (isProjectIdle(projectId)) {
     if (cached) return { ...cached.data, _idle: true };
-    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, _idle: true };
+    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _idle: true };
   }
   const batchTTL = adaptiveTTL(BATCH_PROGRESS_TTL_MS);
   if (cached && Date.now() - cached.ts < batchTTL) {
@@ -2645,7 +2789,25 @@ async function getOrComputeBatchProgress(projectId) {
   // when we'd actually rely on the snapshot — i.e. the live queue
   // read succeeded, so the existing #316 bypass for unreadable
   // queue files keeps precedence.
-  if (queueReadOk) {
+  // #870: determine the displayed batch type up front (read-only) so review
+  // batches skip the GitHub snapshot-freshness check AND the merge-state path
+  // below entirely. The displayed type follows the SAME live-vs-snapshot
+  // decision as resolveDisplayedBatch: a just-archived review batch's live
+  // `**Batch type:**` is gone, so its type must come from the persisted snapshot.
+  const _liveActive = parseActiveBatch(queueText);
+  const _existingSnap = queueReadOk ? readBatchSnapshot(projectId) : null;
+  const _displaySource = queueReadOk ? pickDisplayedSource(_liveActive, _existingSnap) : "live";
+  const displayedBatchType =
+    _displaySource === "snapshot"
+      ? (_existingSnap && _existingSnap.batch_type) || "code"
+      : parseBatchType(queueText);
+  const isReviewBatch = REVIEW_BATCH_TYPES.has(displayedBatchType);
+
+  // #334: validate the on-disk snapshot's first issue against GitHub before
+  // resolveDisplayedBatch can serve it — CODE batches only. Review batches must
+  // make ZERO GitHub calls, and their snapshot issue numbers are queue-authored
+  // (not subject to the purged-repo staleness this check guards).
+  if (queueReadOk && !isReviewBatch) {
     const existing = readBatchSnapshot(projectId);
     if (existing && Array.isArray(existing.issueNumbers) && existing.issueNumbers.length > 0) {
       const freshness = await checkBatchSnapshotFreshness(repo, existing);
@@ -2658,7 +2820,7 @@ async function getOrComputeBatchProgress(projectId) {
   // #429 / quadwork#316: resolve the displayed batch through the
   // snapshot-aware helper so merged items stay visible after Head
   // moves them from Active Batch to Done, until a new batch starts.
-  const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
+  const { batchNumber, issueNumbers, batch_type, reviewItems } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
   // #864: lifecycle-signal flag. The displayed batch may be the preserved
   // snapshot (so /api/batch-progress keeps showing it), but lifecycle consumers
   // (/api/batch-active, trigger auto-stop, reseed safe-boundary) must follow
@@ -2672,7 +2834,27 @@ async function getOrComputeBatchProgress(projectId) {
   const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
   if (issueNumbers.length === 0) {
     evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
-    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared };
+    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type };
+    _batchProgressCache.set(projectId, { ts: Date.now(), data });
+    return data;
+  }
+
+  // #870: review batch — progress computed ENTIRELY from the current Active
+  // Batch item states (or the preserved snapshot's), with NO GitHub calls. The
+  // queue is HEAD-authored and authoritative, so completeConfirmed = complete —
+  // do NOT route through evalBatchCompleteConfirmed (its two-cycle distinct-ts
+  // guard never advances without a #806 GraphQL fetch a review batch never makes).
+  if (batch_type === "ticket-review" || batch_type === "pr-review") {
+    // Defensive: a review batch should always carry per-item states, but if the
+    // snapshot somehow has issue numbers without them, treat all as queued.
+    const ri = reviewItems.length > 0
+      ? reviewItems
+      : issueNumbers.map((n) => ({ issue: n, review_state: "queued", approvals: 0 }));
+    const ghIndex = loadGithubItemIndex(projectId);
+    const items = ri.map((r) => reviewItemView(r, batch_type, ghIndex));
+    const summary = summarizeReviewItems(ri);
+    const complete = ri.length > 0 && ri.every((r) => r.review_state === "approved");
+    const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed: complete, liveActiveBatchCleared, batch_type };
     _batchProgressCache.set(projectId, { ts: Date.now(), data });
     return data;
   }
@@ -2705,7 +2887,7 @@ async function getOrComputeBatchProgress(projectId) {
   // before any auto-stop consumer may act on it (never auto-stop on a single
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
-  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared };
+  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
   _batchProgressCache.set(projectId, { ts: Date.now(), data });
   return data;
 }
@@ -3955,6 +4137,12 @@ module.exports = router;
 // outside this file; the export is strictly for the node:assert
 // script at server/routes.parseActiveBatch.test.js.
 module.exports.parseActiveBatch = parseActiveBatch;
+// #870: expose review-batch parsers/helpers for the reviewBatch fixture test.
+module.exports.parseBatchType = parseBatchType;
+module.exports.parseReviewItems = parseReviewItems;
+module.exports.parseReviewState = parseReviewState;
+module.exports.reviewItemView = reviewItemView;
+module.exports.summarizeReviewItems = summarizeReviewItems;
 // #350: same pattern — expose the no-linked-PR row builder and
 // summarizeItems for the batch-progress fixture test.
 module.exports.buildNoPrRow = buildNoPrRow;
