@@ -3019,6 +3019,42 @@ function reseedAgentsMd(existingContent, freshContent) {
   };
 }
 
+// #854: Extract the reviewer token path from a worktree's existing AGENTS.md
+// so the re-seed substitution preserves a custom path instead of resetting
+// it to the default. The re1/re2 seed renders:
+//
+//     export GH_TOKEN=$(cat <path>)
+//
+// Common operator-edited variations are recognized:
+//   • optional `export ` prefix
+//   • optional outer `"$(cat …)"` double-quote wrapping
+//   • optional inner quoting of the path (single or double quotes)
+//   • whitespace tolerated between tokens
+//
+// Returns the raw extracted path (quotes stripped, whitespace trimmed) or
+// `null` when no GH_TOKEN line is present or the line doesn't use the
+// `$(cat …)` form. Pure — no I/O.
+function _extractReviewerTokenPath(existingContent) {
+  if (!existingContent || typeof existingContent !== "string") return null;
+  // First find a GH_TOKEN line. We anchor on the literal name so an operator
+  // comment about token paths can't accidentally seed a stale path.
+  const lineMatch = existingContent.match(/^[ \t]*(?:export[ \t]+)?GH_TOKEN[ \t]*=.*$/m);
+  if (!lineMatch) return null;
+  // Then pull the path out of `$(cat …)` on that line. Non-greedy capture
+  // stops at the first `)` after `cat`, which is the correct boundary for
+  // any well-formed command substitution.
+  const catMatch = lineMatch[0].match(/\$\(\s*cat\s+(.+?)\s*\)/);
+  if (!catMatch) return null;
+  let raw = catMatch[1].trim();
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    raw = raw.slice(1, -1);
+  }
+  return raw || null;
+}
+
 // #855: Map legacy agent config keys to the canonical seed-template names.
 // Older projects (and operator-renamed agents) may use keys like
 // `reviewer1` / `reviewer2` / `t1..t3`; the seed templates only exist for
@@ -3118,7 +3154,7 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
 
   const dirName = path.basename(workingDir);
   const reviewerUser = body.reviewerUser ?? cfg.reviewer_github_user ?? "";
-  const reviewerTokenPath = body.reviewerTokenPath || path.join(os.homedir(), ".quadwork", "reviewer-token");
+  const defaultReviewerTokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
 
   // #855: walk the project's configured agents (resolved by `cwd`) instead of
   // reconstructing sibling paths. Legacy keys (`reviewer1` etc.) still pull
@@ -3136,17 +3172,33 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
         error: `Missing seed template: templates/seeds/${canonical}.AGENTS.md`,
       });
     }
-    let freshContent = fs.readFileSync(seedSrc, "utf-8");
-    freshContent = freshContent
-      .replace(/\{\{reviewer_github_user\}\}/g, reviewerUser)
-      .replace(/\{\{reviewer_token_path\}\}/g, reviewerTokenPath)
-      .replace(/\{\{project_name\}\}/g, dirName);
 
+    // #854: Read the existing AGENTS.md FIRST so the per-agent token path
+    // resolution can see what the operator currently has. Resolution order:
+    //   1. explicit body override (`body.reviewerTokenPath`)
+    //   2. extracted from this worktree's existing AGENTS.md
+    //   3. project/global config (`cfg.reviewer_token_path`)
+    //   4. default `~/.quadwork/reviewer-token`
+    // Head/dev seeds have no GH_TOKEN line, so (2) is `null` for them and
+    // they fall through to the default — the substituted placeholder is
+    // unused in those templates anyway.
     const agentsMd = path.join(wtDir, "AGENTS.md");
     let existing = "";
     if (fs.existsSync(agentsMd)) {
       try { existing = fs.readFileSync(agentsMd, "utf-8"); } catch { existing = ""; }
     }
+    const tokenPath =
+      body.reviewerTokenPath
+      || _extractReviewerTokenPath(existing)
+      || cfg.reviewer_token_path
+      || defaultReviewerTokenPath;
+
+    let freshContent = fs.readFileSync(seedSrc, "utf-8");
+    freshContent = freshContent
+      .replace(/\{\{reviewer_github_user\}\}/g, reviewerUser)
+      .replace(/\{\{reviewer_token_path\}\}/g, tokenPath)
+      .replace(/\{\{project_name\}\}/g, dirName);
+
     const merged = reseedAgentsMd(existing, freshContent);
     fs.writeFileSync(agentsMd, merged.content);
     reseeded.push(`${agentKey}/AGENTS.md`);
@@ -3729,6 +3781,9 @@ module.exports.reseedAgentsMd = reseedAgentsMd;
 // production callers outside this file.
 module.exports._resolveReseedTargets = _resolveReseedTargets;
 module.exports._canonicalAgentSlug = _canonicalAgentSlug;
+// #854: expose the GH_TOKEN path extractor so the parse forms (`export`,
+// double-quoted, inner-quoted, etc.) are exercisable without a temp fs.
+module.exports._extractReviewerTokenPath = _extractReviewerTokenPath;
 // #839 (re1 follow-up): expose the shared compute path plus the caches it
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
