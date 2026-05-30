@@ -112,6 +112,12 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
   ],
   claude: [
     { value: "", label: "(CLI default)" },
+    // #841: CLI-documented aliases (`claude --help` → "alias for the latest
+    // model"). Auto-track new Opus/Sonnet releases without needing a QuadWork
+    // update; pinned `claude-opus-4-X` rows below remain for operators who
+    // want a specific version locked in.
+    { value: "opus", label: "opus (latest)" },
+    { value: "sonnet", label: "sonnet (latest)" },
     { value: "claude-opus-4-8", label: "claude-opus-4-8" },
     { value: "claude-opus-4-7", label: "claude-opus-4-7" },
     { value: "claude-opus-4-6", label: "claude-opus-4-6" },
