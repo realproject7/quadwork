@@ -2323,21 +2323,33 @@ function buildNoPrRow(issue) {
 // though Search's loose `in:title 80` would surface it. Returns the PR number
 // or null. Exported for unit tests.
 //
-// #864: when more than one strict match exists (e.g. a closed-unmerged duplicate
-// opened after the real merged PR for the same issue), prefer a MERGED match
-// over an unmerged one — otherwise the highest-PR-number tie-break picks the
-// duplicate and downstream progress flips a CLOSED issue back to in_review,
-// keeping the batch falsely "active" after Head clears the queue. Within each
-// pool (merged-only when any merged exist, otherwise everything matched) we
-// still tie-break by highest PR number, preserving the existing freshest-wins
-// behavior for non-duplicate cases.
-function pickLinkedPrFromSearch(items, n) {
+// #864: when more than one strict match exists for a CLOSED issue (e.g. a
+// closed-unmerged duplicate opened after the real merged PR for the same
+// issue), prefer a MERGED match over an unmerged one — otherwise the
+// highest-PR-number tie-break picks the duplicate and downstream progress
+// flips a CLOSED issue back to in_review, keeping the batch falsely "active"
+// after Head clears the queue.
+//
+// #864/RE1: the merged-preference is GATED on `opts.issueState === "CLOSED"`.
+// For an OPEN/reopened issue, applying it would let an OLDER merged PR beat a
+// NEWER active duplicate/reopen PR with the same `[#N]` prefix — the picker
+// would return the stale merged PR number and progressForItemRest would fall
+// through to in_review-with-the-wrong-PR (since the `merged && CLOSED` row
+// requires the issue to be closed). The default (no opts → open-by-omission)
+// is the legacy freshest-wins behavior, preserving back-compat for direct
+// callers and tests that don't yet supply issue state.
+function pickLinkedPrFromSearch(items, n, opts = {}) {
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
   const matches = (Array.isArray(items) ? items : []).filter((it) => titleRe.test((it && it.title) || ""));
   if (matches.length === 0) return null;
-  const merged = matches.filter((it) => it && it.pull_request && it.pull_request.merged_at);
-  const pool = merged.length > 0 ? merged : matches;
-  return pool.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
+  const preferMerged = opts.issueState === "CLOSED";
+  if (preferMerged) {
+    const merged = matches.filter((it) => it && it.pull_request && it.pull_request.merged_at);
+    if (merged.length > 0) {
+      return merged.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
+    }
+  }
+  return matches.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
 }
 
 // The actual REST Search call, split out so findLinkedPrByTitle's
@@ -2358,9 +2370,9 @@ async function _searchLinkedPrItems(repo, n) {
 // with a merged PR would render closed). So failure THROWS, and the caller
 // (progressForItemRest, awaiting without a catch) drops the item to the
 // non-authoritative "fetch failed" row, retried on the next cache miss.
-async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems) {
+async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems, opts = {}) {
   const items = await search(repo, n);
-  return pickLinkedPrFromSearch(items, n);
+  return pickLinkedPrFromSearch(items, n, opts);
 }
 
 // Authoritative by-number resolution for an active-batch issue the board
@@ -2382,7 +2394,10 @@ async function progressForItemRest(repo, issueNumber) {
   // Throws (→ route's "fetch failed" row) if Search itself fails, so a
   // could-not-determine is NEVER mistaken for proof of no linked PR. A null
   // here means Search SUCCEEDED with zero strict [#N] matches — authoritative.
-  const prNumber = await findLinkedPrByTitle(repo, issueNumber);
+  // #864/RE1: pass issue.state so the picker only prefers a merged duplicate
+  // for CLOSED issues; OPEN/reopened issues keep legacy freshest-wins, so a
+  // newer active duplicate PR isn't masked by an older merged one.
+  const prNumber = await findLinkedPrByTitle(repo, issueNumber, _searchLinkedPrItems, { issueState: issue.state });
   // No linked PR (authoritative). #350: honor the issue's own state — a CLOSED
   // issue with no linked PR is fully done (superseded/not-planned/runbook) →
   // 100% ✓; only a truly OPEN issue with no PR is queued.
