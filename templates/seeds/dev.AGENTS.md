@@ -153,16 +153,17 @@ Per assigned ticket #<n>:
 For a `pr-review` batch you review **already-merged PRs** — output is a **review-summary comment + follow-up fix tickets**, never a revert or code change.
 
 Per assigned PR #<n>:
-1. **Read context from `GITHUB.md` first.** For the live merged diff + linked issue, use **REST**:
-   - `gh api repos/<repo>/pulls/<n>`
-   - `gh api repos/<repo>/pulls/<n>/files`
-   - `gh api repos/<repo>/issues/<n>` (the linked issue)
+1. **Read context from `GITHUB.md` first.** For the live merged diff, use **REST**:
+   - `gh api repos/<repo>/pulls/<n>` — the merged PR
+   - `gh api repos/<repo>/pulls/<n>/files` — its diff
+2. **Derive the linked TICKET number**, then fetch the ticket — this is the spec the PR was supposed to satisfy. Do **NOT** use `gh api repos/<repo>/issues/<n>` with the PR number: for a PR number that endpoint returns the PR itself (PRs are issues in GitHub's data model), not the ticket. Find the ticket number from `GITHUB.md`, the PR title (`[#<issue>]` convention), or the PR body (`Fixes #<issue>` / `Closes #<issue>`), then:
+   - `gh api repos/<repo>/issues/<linked-ticket>` (+ `/comments` if needed) — the original ticket + acceptance criteria
 
    `git pull` to read the merged code locally. **Do NOT use `gh pr view --json`, `gh pr list`, or `gh issue view --json`** (GraphQL — defeats the API-budget goal).
-2. Post a SINGLE message **@re1 @re2 review merged PR #<n>** with focus points: correctness, regressions, missed edge cases, follow-ups.
-3. Aggregate both verdicts, then:
+3. Post a SINGLE message **@re1 @re2 review merged PR #<n>** with focus points: correctness, regressions, missed edge cases, follow-ups.
+4. Aggregate both verdicts, then:
    - File any follow-up **fix tickets** via REST: `gh api --method POST repos/<repo>/issues -f title='...' -F body=@<file> -f 'labels[]=agent/dev'`.
-   - Post a **review-summary comment** on the PR via REST: `gh api --method POST repos/<repo>/issues/<n>/comments -F body=@<file>` (PR comments use the issues/comments endpoint).
+   - Post a **review-summary comment** on the PR via REST: `gh api --method POST repos/<repo>/issues/<n>/comments -F body=@<file>` (PR comments use the issues/comments endpoint — `<n>` is the PR number here, which is correct).
    - Report `@head PR #<n> review complete — findings captured`.
 
 **Completion differs from ticket-review:** a merged PR is already in `main` and **cannot be "fixed before completion"**. So **REQUEST CHANGES does NOT mean "fix the PR"** — it means **follow-up fix tickets are required**. The item reaches `approved` when **both reviewers agree the findings/follow-ups are captured** (tickets filed + summary comment posted), NOT a claim the merged PR was clean. A clean PR (no findings) also reaches `approved` once both reviewers sign off. **Never revert or push code** in a pr-review batch.
