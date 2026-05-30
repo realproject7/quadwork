@@ -155,16 +155,26 @@ Reference `DESIGN-GUIDE.md` in the workspace for full details on each rule.
 8. On approve, notify @dev (Dev aggregates approvals and notifies Head)
 
 ## Review batches
-When @dev asks you to **review a ticket** (not a PR) — e.g. `@re1 @re2 please review ticket #<n>` — you are reviewing a GitHub *issue spec* that belongs to a `**Batch type:** ticket-review` batch. There is **no PR and no code diff**.
+@dev may ask you to review a **ticket** (a GitHub issue spec, `ticket-review` batch) or a **merged PR** (`pr-review` batch) instead of an open PR. In both: read via `GITHUB.md` / REST `gh api` — **never** `gh issue view --json`, `gh pr view --json`, or `gh pr list` (GraphQL — defeats the API-budget goal). `git pull` first to verify cited files/lines against current `main`. Deliver findings to **@dev**, line-referenced.
 
-1. Read the ticket from `GITHUB.md` / REST `gh api repos/<repo>/issues/<n>` (and `.../issues/<n>/comments`). **Never** `gh issue view --json`, `gh pr view --json`, or `gh pr list` (GraphQL — defeats the API-budget goal). `git pull` first to verify any cited files/lines against current `main`.
+### ticket-review batches
+When @dev asks `@re1 @re2 please review ticket #<n>`, you are reviewing a GitHub *issue spec* — no PR, no code diff.
+
+1. Read the ticket via REST `gh api repos/<repo>/issues/<n>` (and `.../issues/<n>/comments`).
 2. Review against the **required-points rubric**:
    - Scope clear and bounded?
    - Acceptance criteria concrete and testable?
    - Technically feasible against current `main`?
    - Dependencies / ordering correct?
    - Internally consistent (no contradictory sections)?
-3. Deliver to **@dev** a verdict — `## Verdict: APPROVE` or `## Verdict: REQUEST CHANGES` — with specific, **line-referenced** points (quote the ticket section / acceptance criterion). On REQUEST CHANGES, wait for @dev's revised ticket, then re-review the changed sections.
+3. Deliver `## Verdict: APPROVE` or `## Verdict: REQUEST CHANGES` to @dev with specific, line-referenced points (quote the ticket section / acceptance criterion). On REQUEST CHANGES, wait for @dev's revised ticket, then re-review the changed sections.
+
+### pr-review batches (merged PRs)
+When @dev asks `@re1 @re2 review merged PR #<n>`, the PR is **already merged into `main`** — you assess the landed change, you do not block a merge.
+
+1. Read via REST `gh api repos/<repo>/pulls/<n>`, `.../pulls/<n>/files`, and `gh api repos/<repo>/issues/<n>` (the linked issue). `git pull` to read the merged code locally.
+2. Assess against a **merged-PR rubric**: does it do what the ticket asked? regressions introduced? security issues? tests adequate for the change?
+3. Deliver findings to @dev, **line-referenced**. Findings become **follow-up fix tickets** (Dev files them) — there is no "fix this PR" step; the PR is already in `main`. Sign off (APPROVE) once you've assessed the change and any findings are captured as follow-ups.
 
 ### Item-state vocabulary (Head maintains these on the queue)
 `queued | in-review | in-review (N/2) | approved | changes-requested` — annotations on the `## Active Batch` item lines (`- #<n> — <state>`). Your APPROVE / REQUEST CHANGES verdicts are what move a ticket toward `approved`.
