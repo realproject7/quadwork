@@ -112,6 +112,7 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
   ],
   claude: [
     { value: "", label: "(CLI default)" },
+    { value: "claude-opus-4-8", label: "claude-opus-4-8" },
     { value: "claude-opus-4-7", label: "claude-opus-4-7" },
     { value: "claude-opus-4-6", label: "claude-opus-4-6" },
     { value: "claude-sonnet-4-6", label: "claude-sonnet-4-6" },
