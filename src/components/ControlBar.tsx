@@ -25,6 +25,11 @@ const COPY = {
       confirmFullReset: "Reset all projects?",
       fullResetResult: (projects: number, agents: number, ms: number) => `Full reset — ${projects} project${projects !== 1 ? "s" : ""}, ${agents} agent${agents !== 1 ? "s" : ""} (${(ms / 1000).toFixed(1)}s)`,
       fullResetFailed: "Full reset failed",
+      reseed: "Re-seed AGENTS.md",
+      confirmReseed: "Overwrite worktree AGENTS.md?",
+      reseedResult: (n: number) => `Re-seeded ${n} AGENTS.md file${n !== 1 ? "s" : ""} — restart agents to apply`,
+      reseedBlocked: "Batch active — re-seed deferred (restart agents to apply on next batch)",
+      reseedFailed: "Re-seed failed",
       interrupt: "Interrupt",
       interruptAll: "All agents",
       interrupted: (name: string) => `Interrupted ${name}`,
@@ -71,6 +76,11 @@ const COPY = {
       confirmFullReset: "모든 프로젝트를 리셋할까요?",
       fullResetResult: (projects: number, agents: number, ms: number) => `전체 리셋 완료 — ${projects}개 프로젝트, ${agents}개 에이전트 (${(ms / 1000).toFixed(1)}초)`,
       fullResetFailed: "전체 리셋 실패",
+      reseed: "AGENTS.md 재시드",
+      confirmReseed: "워크트리 AGENTS.md를 덮어쓸까요?",
+      reseedResult: (n: number) => `AGENTS.md ${n}개 재시드 완료 — 적용하려면 에이전트를 재시작하세요`,
+      reseedBlocked: "배치 실행 중 — 재시드 보류 (다음 배치 전에 에이전트를 재시작하세요)",
+      reseedFailed: "재시드 실패",
       interrupt: "중단",
       interruptAll: "모든 에이전트",
       interrupted: (name: string) => `${name} 중단됨`,
@@ -116,6 +126,7 @@ function ServerSection({ projectId }: { projectId: string }) {
   const [loading, setLoading] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [confirmFullReset, setConfirmFullReset] = useState(false);
+  const [confirmReseed, setConfirmReseed] = useState(false);
   const [showInterrupt, setShowInterrupt] = useState(false);
   const [agentStates, setAgentStates] = useState<Record<string, string>>({});
   const interruptRef = useRef<HTMLDivElement>(null);
@@ -183,6 +194,12 @@ function ServerSection({ projectId }: { projectId: string }) {
     return () => clearTimeout(timer);
   }, [confirmFullReset]);
 
+  useEffect(() => {
+    if (!confirmReseed) return;
+    const timer = setTimeout(() => setConfirmReseed(false), 4000);
+    return () => clearTimeout(timer);
+  }, [confirmReseed]);
+
   const handleFullReset = async () => {
     if (!confirmFullReset) {
       setConfirmFullReset(true);
@@ -221,6 +238,35 @@ function ServerSection({ projectId }: { projectId: string }) {
     clearFeedback();
   };
 
+  // #845: re-seed worktree AGENTS.md from the current templates without
+  // recreating the project. The server refuses to run mid-batch (HTTP 409
+  // with batchActive flag); the operator can still force via "Re-seed"
+  // again after batch completes. New content only takes effect on the
+  // next agent restart — feedback message tells the operator to restart.
+  const handleReseed = async () => {
+    if (!confirmReseed) { setConfirmReseed(true); return; }
+    setConfirmReseed(false);
+    setLoading("reseed");
+    try {
+      const r = await fetch(
+        `/api/projects/${encodeURIComponent(projectId)}/reseed-agents`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      const d = await r.json();
+      if (d.ok) {
+        setFeedback(t.reseedResult((d.reseeded || []).length));
+      } else if (d.batchActive) {
+        setFeedback(t.reseedBlocked);
+      } else {
+        setFeedback(d.error || t.reseedFailed);
+      }
+    } catch {
+      setFeedback(t.reseedFailed);
+    }
+    setLoading(null);
+    clearFeedback();
+  };
+
   return (
     <div className="flex flex-col gap-1">
       <div className="text-[10px] text-text-muted uppercase tracking-wider font-semibold">
@@ -244,6 +290,18 @@ function ServerSection({ projectId }: { projectId: string }) {
           }`}
         >
           {loading === "fullReset" ? "..." : confirmFullReset ? t.confirmFullReset : t.fullReset}
+        </button>
+        <button
+          onClick={handleReseed}
+          disabled={!!loading}
+          title={t.reseed}
+          className={`px-1.5 py-0.5 text-[10px] border transition-colors disabled:opacity-50 ${
+            confirmReseed
+              ? "text-error border-error/60 bg-error/10 hover:bg-error/20"
+              : "text-text-muted border-border hover:text-accent hover:border-accent/40"
+          }`}
+        >
+          {loading === "reseed" ? "..." : confirmReseed ? t.confirmReseed : t.reseed}
         </button>
         <div className="relative" ref={interruptRef}>
           <button
