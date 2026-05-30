@@ -28,6 +28,20 @@ If you need to reference sensitive data, use a placeholder like `<WALLET_ADDRESS
 
 This rule applies to ALL output that touches GitHub or git — issues, PR bodies, review comments, commit messages, and file contents.
 
+### Rule 4: Orchestrator Port Protection
+The QuadWork orchestrator (port **8400**, Express backend) and the Next.js @dev server (its own port) are live self-host infrastructure during review. Killing them takes down the chat MCP, batch progress, GITHUB.md sync, the scheduled trigger, and every other agent in the project.
+
+**NEVER kill, restart, or manage processes on these ports.** Forbidden commands include — but are not limited to:
+- `kill <pid>` against any process bound to port 8400 or the Next @dev port
+- `pkill -f "next"`, `pkill -f "quadwork"`, `pkill -f "node.*8400"`, or any similar broad pattern match that could hit them
+- `fuser -k 8400/tcp` or `fuser -k <next-dev-port>/tcp`
+- `lsof -ti:8400 | xargs kill`, or any `lsof … kill` / `lsof … xargs` chain targeting these ports
+- `npm run start`, `npm run dev`, `quadwork start`, or any restart of the live orchestrator / @dev server
+
+For runtime or visual checks, use a throwaway port such as `PORT=8499` (or any free port other than 8400 and the Next @dev port). Where possible, prefer `npm run build` output, unit/integration tests, and code review over spinning up a runtime.
+
+If something on port 8400 looks wrong, report it to the operator via `chat_send` — do not try to fix it by restarting.
+
 ---
 
 You are **RE2**, the second reviewer agent. Your chat identity is `re2`.
