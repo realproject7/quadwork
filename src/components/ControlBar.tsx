@@ -29,6 +29,7 @@ const COPY = {
       confirmReseed: "Overwrite worktree AGENTS.md?",
       reseedResult: (n: number) => `Re-seeded ${n} AGENTS.md file${n !== 1 ? "s" : ""} — restart agents to apply`,
       reseedBlocked: "Batch active — re-seed deferred (restart agents to apply on next batch)",
+      reseedUnknown: "Batch state unknown — re-seed aborted; retry in a moment",
       reseedFailed: "Re-seed failed",
       interrupt: "Interrupt",
       interruptAll: "All agents",
@@ -80,6 +81,7 @@ const COPY = {
       confirmReseed: "워크트리 AGENTS.md를 덮어쓸까요?",
       reseedResult: (n: number) => `AGENTS.md ${n}개 재시드 완료 — 적용하려면 에이전트를 재시작하세요`,
       reseedBlocked: "배치 실행 중 — 재시드 보류 (다음 배치 전에 에이전트를 재시작하세요)",
+      reseedUnknown: "배치 상태 확인 불가 — 재시드 중단됨; 잠시 후 다시 시도하세요",
       reseedFailed: "재시드 실패",
       interrupt: "중단",
       interruptAll: "모든 에이전트",
@@ -257,6 +259,8 @@ function ServerSection({ projectId }: { projectId: string }) {
         setFeedback(t.reseedResult((d.reseeded || []).length));
       } else if (d.batchActive) {
         setFeedback(t.reseedBlocked);
+      } else if (d.batchUnknown) {
+        setFeedback(t.reseedUnknown);
       } else {
         setFeedback(d.error || t.reseedFailed);
       }

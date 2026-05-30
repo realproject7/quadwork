@@ -3043,16 +3043,38 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
   if (!workingDir) return res.status(400).json({ ok: false, error: "Project has no working_dir" });
 
   if (!force) {
+    // re1 review on #845: fail CLOSED when batch state can't be computed.
+    // Falling through to a re-seed when the gate is uncertain re-introduces
+    // the exact mid-batch rewrite the gate exists to prevent. Three cases
+    // route to the same "unknown" 503 (operator can retry or pass force:true):
+    //  1. getOrComputeBatchProgress throws (network/IO)
+    //  2. getOrComputeBatchProgress returns null (no repo / no progress data)
+    //  3. isBatchActiveFromProgress returns null (no items payload)
+    let active;
     try {
       const progress = await getOrComputeBatchProgress(projectId);
-      if (isBatchActiveFromProgress(progress)) {
-        return res.status(409).json({
-          ok: false,
-          error: "Batch is active — re-seed deferred to avoid mid-batch instruction drift. Pass force:true to override; new seed content only takes effect on next agent restart.",
-          batchActive: true,
-        });
-      }
-    } catch { /* progress unavailable → fall through and re-seed */ }
+      active = isBatchActiveFromProgress(progress);
+    } catch {
+      return res.status(503).json({
+        ok: false,
+        error: "Could not verify batch state — aborting to avoid a mid-batch re-seed. Retry, or pass force:true to override.",
+        batchUnknown: true,
+      });
+    }
+    if (active === null) {
+      return res.status(503).json({
+        ok: false,
+        error: "Batch state unknown (no progress data) — aborting to avoid a mid-batch re-seed. Retry, or pass force:true to override.",
+        batchUnknown: true,
+      });
+    }
+    if (active) {
+      return res.status(409).json({
+        ok: false,
+        error: "Batch is active — re-seed deferred to avoid mid-batch instruction drift. Pass force:true to override; new seed content only takes effect on next agent restart.",
+        batchActive: true,
+      });
+    }
   }
 
   const dirName = path.basename(workingDir);
