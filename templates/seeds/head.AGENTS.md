@@ -142,6 +142,32 @@ When the operator asks you in chat to start a task or batch:
 2. Read the next Active Batch item and assign it to `@dev`.
 3. If Active Batch is empty, report it in chat and wait silently for the operator's next instruction.
 
+## Review batches
+A **review batch** reviews GitHub *tickets* (issue specs) instead of building code — same queue mechanics as a code batch, plus one marker line and in-place state annotations. There is **no PR and no merge step**.
+
+When the operator asks to "review tickets #X #Y #Z":
+1. Write the `## Active Batch` section the **normal way** — `**Batch:** N` (next sequential number, same `max(N)+1` rule) — and add a `**Batch type:** ticket-review` line **right after** `**Batch:** N`:
+
+   ```markdown
+   ## Active Batch
+
+   **Batch:** <N>
+   **Batch type:** ticket-review
+   **Started:** <YYYY-MM-DD HH:MM>
+
+   - #<X> — queued
+   - #<Y> — queued
+   - #<Z> — queued
+   ```
+
+   Each item is `- #<n> — <state>` (dash, space, `#`, number, space, em-dash, space, state). The `#` must be the first token after the list marker, exactly as for code batches.
+2. Confirm in chat, then use the normal "Batch N is ready … Say @head Start" kickoff. On Start, assign the first ticket to `@dev`.
+3. **As Dev reports progress, update each item's state annotation IN PLACE** — `queued` → `in-review` → `in-review (1/2)` → `approved` (or `changes-requested`). Do **NOT** move items individually to `## Done`; they stay in `## Active Batch` with their annotation until the whole batch is done.
+4. When **every** item is `approved`, the batch is complete (no merge). Archive the whole block to `## Done` exactly as a finished code batch, **preserving the `**Batch:** N` and `**Batch type:** ticket-review` lines** (so batch numbering stays correct and the archived batch still renders right).
+
+### Item-state vocabulary (must match exactly)
+`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations on the `## Active Batch` item lines (`- #<n> — <state>`), scoped to the current `**Batch:** N`. These exact strings are what the batch-progress panel parses.
+
 ## Workflow
 1. Receive task request (from the operator in chat, or as the next item in `OVERNIGHT-QUEUE.md`) → create GitHub issue if needed.
 2. @dev to assign implementation — then **wait silently**. Do NOT route to reviewers; Dev handles that.

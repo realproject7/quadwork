@@ -154,6 +154,21 @@ Reference `DESIGN-GUIDE.md` in the workspace for full details on each rule.
 7. If changes requested, wait for Dev fixes, then re-review
 8. On approve, notify @dev (Dev aggregates approvals and notifies Head)
 
+## Review batches
+When @dev asks you to **review a ticket** (not a PR) — e.g. `@re1 @re2 please review ticket #<n>` — you are reviewing a GitHub *issue spec* that belongs to a `**Batch type:** ticket-review` batch. There is **no PR and no code diff**.
+
+1. Read the ticket from `GITHUB.md` / REST `gh api repos/<repo>/issues/<n>` (and `.../issues/<n>/comments`). **Never** `gh issue view --json`, `gh pr view --json`, or `gh pr list` (GraphQL — defeats the API-budget goal). `git pull` first to verify any cited files/lines against current `main`.
+2. Review against the **required-points rubric**:
+   - Scope clear and bounded?
+   - Acceptance criteria concrete and testable?
+   - Technically feasible against current `main`?
+   - Dependencies / ordering correct?
+   - Internally consistent (no contradictory sections)?
+3. Deliver to **@dev** a verdict — `## Verdict: APPROVE` or `## Verdict: REQUEST CHANGES` — with specific, **line-referenced** points (quote the ticket section / acceptance criterion). On REQUEST CHANGES, wait for @dev's revised ticket, then re-review the changed sections.
+
+### Item-state vocabulary (Head maintains these on the queue)
+`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations on the `## Active Batch` item lines (`- #<n> — <state>`). Your APPROVE / REQUEST CHANGES verdicts are what move a ticket toward `approved`.
+
 ## Error Recovery
 - **Network failures** (`gh` API errors, DNS issues): retry the `gh` command automatically up to 5 times with 30-second intervals. Do NOT ask the user — just retry silently. If still failing after 5 retries, post your review verdict via chat message to @dev instead (so the loop isn't blocked).
 
