@@ -14,8 +14,12 @@
 const IDLE_REJECTION = (project) =>
   new Error(`Project "${project}" is inactive (idle). Un-idle it first, then retry.`);
 
-const BATCH_ACTIVE_CAVEAT =
-  "Trigger-lifecycle decisions depend on /api/batch-active, which (pre-#864) can still report active:true after Head clears the queue — don't treat it as authoritative for 'work remaining'.";
+// #794/#880: post-#864, batch-active is authoritative — it follows the live
+// `## Active Batch` lifecycle (once Head clears the queue it reads not-active);
+// batch-progress may still render a just-completed batch (sticky display). Use
+// batch_status to gauge whether work remains before starting/stopping.
+const BATCH_STATUS_NOTE =
+  "Use batch_status to gauge whether work remains: `active` follows the live Active Batch lifecycle (cleared queue → not active) and is authoritative; `progress` may still show a just-completed batch (sticky display).";
 
 module.exports = {
   defs: [
@@ -23,7 +27,7 @@ module.exports = {
       name: "start_batch",
       description:
         "Start the SCHEDULED trigger that drives a project's batch — fires a trigger message every `interval_min` minutes (default 30), optionally auto-stopping after `duration_min` minutes (default 0 = run indefinitely). The first pulse is at T+interval, not immediately (use trigger_now for an immediate one). Define the batch first with set_batch/append_batch (#793). Only the fields you pass are persisted to the project: an omitted interval/duration/message is NOT saved — later pulses reuse the project's existing trigger_message / interval. Rejected if the project is idle (un-idle it first). " +
-        BATCH_ACTIVE_CAVEAT,
+        BATCH_STATUS_NOTE,
       inputSchema: {
         type: "object",
         properties: {
@@ -39,7 +43,7 @@ module.exports = {
       name: "trigger_now",
       description:
         "Fire ONE trigger pulse immediately for a project (a single send-now, separate from the scheduled cadence). Use after defining a batch when you want to kick it off right away instead of waiting for start_batch's first interval. Rejected if the project is idle. " +
-        BATCH_ACTIVE_CAVEAT,
+        BATCH_STATUS_NOTE,
       inputSchema: {
         type: "object",
         properties: {
