@@ -60,6 +60,13 @@ const COPY = {
         <b>Current Batch</b> — progress tracker for the active batch. Polls GitHub to resolve each issue&apos;s status (queued &rarr; in review &rarr; approved &rarr; merged).
       </>
     ),
+    // #871: review batches are driven by the queue's Active Batch states — no
+    // GitHub polling, no "merged" terminal state.
+    tooltipReview: (
+      <>
+        <b>Current Batch</b> — review progress for the active batch, driven by the queue&apos;s Active Batch states (queued &rarr; in review &rarr; approved).
+      </>
+    ),
   },
   ko: {
     loading: "배치 진행 상황 로딩 중...",
@@ -83,6 +90,12 @@ const COPY = {
     tooltip: (
       <>
         <b>현재 배치</b> - 활성 배치 진행 상황 추적기입니다. GitHub를 조회해 각 이슈 상태를 대기 → 검토 중 → 승인 → 병합 순으로 추적합니다.
+      </>
+    ),
+    // #871: 리뷰 배치는 큐의 Active Batch 상태로 진행됩니다 — GitHub 조회 없음, "병합" 상태 없음.
+    tooltipReview: (
+      <>
+        <b>현재 배치</b> - 큐의 Active Batch 상태로 추적하는 리뷰 진행 상황입니다 (대기 → 검토 중 → 승인).
       </>
     ),
   },
@@ -207,7 +220,7 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
         </span>
         <span className="text-[10px] text-text-muted">{t.itemsCount(data.items.length)}</span>
         <InfoTooltip>
-          {t.tooltip}
+          {isReview ? t.tooltipReview : t.tooltip}
         </InfoTooltip>
       </div>
       <div className="max-h-40 overflow-y-auto">
