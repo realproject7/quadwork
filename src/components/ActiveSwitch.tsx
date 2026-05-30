@@ -25,13 +25,13 @@ export default function ActiveSwitch({ active, onToggle, disabled, title }: Acti
         e.stopPropagation();
         if (!disabled) onToggle();
       }}
-      className={`relative inline-flex h-3.5 w-7 shrink-0 items-center border transition-colors duration-150 disabled:opacity-50 ${
+      className={`relative inline-flex h-3 w-6 shrink-0 items-center border transition-colors duration-150 disabled:opacity-50 ${
         active ? "border-accent bg-accent/15" : "border-border bg-transparent hover:border-text-muted"
       }`}
     >
       <span
-        className={`block h-2.5 w-2.5 transition-transform duration-150 ${
-          active ? "translate-x-[14px] bg-accent" : "translate-x-[2px] bg-text-muted"
+        className={`block h-2 w-2 transition-transform duration-150 ${
+          active ? "translate-x-[12px] bg-accent" : "translate-x-[2px] bg-text-muted"
         }`}
       />
     </button>
