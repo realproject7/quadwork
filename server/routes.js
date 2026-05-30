@@ -2318,14 +2318,37 @@ function buildNoPrRow(issue) {
 // would also surface `[#807]` for n=80), so we re-apply the strict `^\s*\[#N\]`
 // regex the snapshot matcher uses. Returns the freshest matching PR number (or
 // null), treating a search failure as "no linked PR found".
-// Pure: pick the freshest PR (highest number) whose title matches the STRICT
-// `^\s*\[#N\]` convention from a set of REST search items. Guards `[#807]` from
-// matching n=80 even though Search's loose `in:title 80` would surface it.
-// Returns the PR number or null. Exported for unit tests.
-function pickLinkedPrFromSearch(items, n) {
+// Pure: pick the right PR whose title matches the STRICT `^\s*\[#N\]` convention
+// from a set of REST search items. Guards `[#807]` from matching n=80 even
+// though Search's loose `in:title 80` would surface it. Returns the PR number
+// or null. Exported for unit tests.
+//
+// #864: when more than one strict match exists for a CLOSED issue (e.g. a
+// closed-unmerged duplicate opened after the real merged PR for the same
+// issue), prefer a MERGED match over an unmerged one — otherwise the
+// highest-PR-number tie-break picks the duplicate and downstream progress
+// flips a CLOSED issue back to in_review, keeping the batch falsely "active"
+// after Head clears the queue.
+//
+// #864/RE1: the merged-preference is GATED on `opts.issueState === "CLOSED"`.
+// For an OPEN/reopened issue, applying it would let an OLDER merged PR beat a
+// NEWER active duplicate/reopen PR with the same `[#N]` prefix — the picker
+// would return the stale merged PR number and progressForItemRest would fall
+// through to in_review-with-the-wrong-PR (since the `merged && CLOSED` row
+// requires the issue to be closed). The default (no opts → open-by-omission)
+// is the legacy freshest-wins behavior, preserving back-compat for direct
+// callers and tests that don't yet supply issue state.
+function pickLinkedPrFromSearch(items, n, opts = {}) {
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
   const matches = (Array.isArray(items) ? items : []).filter((it) => titleRe.test((it && it.title) || ""));
   if (matches.length === 0) return null;
+  const preferMerged = opts.issueState === "CLOSED";
+  if (preferMerged) {
+    const merged = matches.filter((it) => it && it.pull_request && it.pull_request.merged_at);
+    if (merged.length > 0) {
+      return merged.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
+    }
+  }
   return matches.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
 }
 
@@ -2347,9 +2370,9 @@ async function _searchLinkedPrItems(repo, n) {
 // with a merged PR would render closed). So failure THROWS, and the caller
 // (progressForItemRest, awaiting without a catch) drops the item to the
 // non-authoritative "fetch failed" row, retried on the next cache miss.
-async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems) {
+async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems, opts = {}) {
   const items = await search(repo, n);
-  return pickLinkedPrFromSearch(items, n);
+  return pickLinkedPrFromSearch(items, n, opts);
 }
 
 // Authoritative by-number resolution for an active-batch issue the board
@@ -2371,7 +2394,10 @@ async function progressForItemRest(repo, issueNumber) {
   // Throws (→ route's "fetch failed" row) if Search itself fails, so a
   // could-not-determine is NEVER mistaken for proof of no linked PR. A null
   // here means Search SUCCEEDED with zero strict [#N] matches — authoritative.
-  const prNumber = await findLinkedPrByTitle(repo, issueNumber);
+  // #864/RE1: pass issue.state so the picker only prefers a merged duplicate
+  // for CLOSED issues; OPEN/reopened issues keep legacy freshest-wins, so a
+  // newer active duplicate PR isn't masked by an older merged one.
+  const prNumber = await findLinkedPrByTitle(repo, issueNumber, _searchLinkedPrItems, { issueState: issue.state });
   // No linked PR (authoritative). #350: honor the issue's own state — a CLOSED
   // issue with no linked PR is fully done (superseded/not-planned/runbook) →
   // 100% ✓; only a truly OPEN issue with no PR is queued.
@@ -2464,8 +2490,17 @@ function summarizeItems(items) {
 // Active Batch section. Returns null when there's no progress payload (an
 // undefined input — current callers always pass a value), defensively
 // treated as "not active" at the route.
+//
+// #864: lifecycle consumers (this route, trigger auto-stop, reseed safe-boundary
+// checks via isActiveFromProgress) must NOT consider an explicitly cleared
+// `## Active Batch` section as active. resolveDisplayedBatch still serves the
+// preserved snapshot so /api/batch-progress can render the prior batch for
+// history, but the lifecycle signal must follow the operator's intent. The
+// `liveActiveBatchCleared` flag set by getOrComputeBatchProgress short-circuits
+// the items-based check below.
 function isBatchActiveFromProgress(progress) {
   if (!progress) return null;
+  if (progress.liveActiveBatchCleared) return false;
   const items = Array.isArray(progress.items) ? progress.items : [];
   return items.length > 0 && !progress.complete;
 }
@@ -2592,13 +2627,20 @@ async function getOrComputeBatchProgress(projectId) {
   // snapshot-aware helper so merged items stay visible after Head
   // moves them from Active Batch to Done, until a new batch starts.
   const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
+  // #864: lifecycle-signal flag. The displayed batch may be the preserved
+  // snapshot (so /api/batch-progress keeps showing it), but lifecycle consumers
+  // (/api/batch-active, trigger auto-stop, reseed safe-boundary) must follow
+  // the operator's explicit clear. Compute from the LIVE parse, only when the
+  // queue file actually read OK — the #316 bypass (queueReadOk=false) must NOT
+  // be mistaken for an explicit clear, since the operator never touched it.
+  const liveActiveBatchCleared = queueReadOk && parseActiveBatch(queueText).issueNumbers.length === 0;
   // #828 P2: batch identity = number + issue set. evalBatchCompleteConfirmed
   // resets its streak when this changes, so a new already-complete batch can't
   // inherit the prior batch's first cycle and confirm in one tick.
   const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
   if (issueNumbers.length === 0) {
     evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
-    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false };
+    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared };
     _batchProgressCache.set(projectId, { ts: Date.now(), data });
     return data;
   }
@@ -2631,7 +2673,7 @@ async function getOrComputeBatchProgress(projectId) {
   // before any auto-stop consumer may act on it (never auto-stop on a single
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
-  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed };
+  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared };
   _batchProgressCache.set(projectId, { ts: Date.now(), data });
   return data;
 }

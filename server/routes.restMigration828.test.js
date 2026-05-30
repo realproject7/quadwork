@@ -44,6 +44,60 @@ async function run() {
     ok(pickLinkedPrFromSearch([{ number: 5, title: "  [#42] leading ws" }], 42) === 5, "leading whitespace before [#N] still matches");
   }
 
+  // ── #864: duplicate strict [#N] matches — prefer the MERGED one over a later
+  //    closed-unmerged duplicate ONLY for CLOSED issues. RE1 review: applying
+  //    merged-first globally would let an older merged PR beat a newer active
+  //    duplicate / reopen PR on an OPEN issue. The picker now takes the
+  //    calling issue's state so the merged-preference is scoped to the only
+  //    shape it's needed for (closed-and-done with a stale duplicate).
+  //    Concrete CLOSED shape: issue #836 closed, merged PR #850, later
+  //    closed-unmerged duplicate PR #851 with the same `[#836]` title prefix.
+  {
+    const items = [
+      { number: 850, title: "[#836] real fix", pull_request: { merged_at: "2026-05-20T10:00:00Z" } },
+      { number: 851, title: "[#836] duplicate", pull_request: { merged_at: null } },
+    ];
+    ok(pickLinkedPrFromSearch(items, 836, { issueState: "CLOSED" }) === 850, "CLOSED issue: merged PR #850 wins over later closed-unmerged duplicate #851 (#864)");
+    // Reversed input order: merged should still win regardless of search-result ordering.
+    ok(pickLinkedPrFromSearch([...items].reverse(), 836, { issueState: "CLOSED" }) === 850, "CLOSED issue: merged-preferred selection is order-independent");
+    // Multiple merged + multiple unmerged on a CLOSED issue → among merged, highest # still wins.
+    const multi = [
+      { number: 700, title: "[#42] old merge", pull_request: { merged_at: "2026-01-01T00:00:00Z" } },
+      { number: 705, title: "[#42] newer merge", pull_request: { merged_at: "2026-02-01T00:00:00Z" } },
+      { number: 800, title: "[#42] later dup",  pull_request: { merged_at: null } },
+    ];
+    ok(pickLinkedPrFromSearch(multi, 42, { issueState: "CLOSED" }) === 705, "CLOSED issue: among merged matches, highest PR number still wins; unmerged duplicate ignored");
+    // Zero merged matches on a CLOSED issue → fall back to highest-PR-number across all matches.
+    const noMerged = [
+      { number: 300, title: "[#9] open", pull_request: { merged_at: null } },
+      { number: 305, title: "[#9] newer open", pull_request: { merged_at: null } },
+    ];
+    ok(pickLinkedPrFromSearch(noMerged, 9, { issueState: "CLOSED" }) === 305, "CLOSED issue: no merged candidates → freshest (highest #) wins (legacy fallback)");
+    // Items without `pull_request` (defensive) treated as not-merged.
+    const noPrShape = [
+      { number: 500, title: "[#5] missing pr field" },
+      { number: 510, title: "[#5] also missing" },
+    ];
+    ok(pickLinkedPrFromSearch(noPrShape, 5, { issueState: "CLOSED" }) === 510, "CLOSED issue: missing pull_request field treated as not-merged → falls back to highest #");
+
+    // ── #864/RE1: OPEN issue with an older merged PR + newer active duplicate
+    //    (e.g. a reopened issue where someone is finishing the work in a new
+    //    PR). The picker MUST keep legacy freshest-wins so the active PR's
+    //    in_review/approval status surfaces, not the stale merged PR's data.
+    //    Without this gate, progressForItemRest would pick the merged PR,
+    //    skip the `merged && CLOSED` branch (issue is OPEN), and fall through
+    //    to in_review with the WRONG PR's review data.
+    const openWithStaleMerge = [
+      { number: 850, title: "[#836] old, merged then reopened", pull_request: { merged_at: "2026-05-20T10:00:00Z" } },
+      { number: 870, title: "[#836] new active fix",            pull_request: { merged_at: null } },
+    ];
+    ok(pickLinkedPrFromSearch(openWithStaleMerge, 836, { issueState: "OPEN" }) === 870, "OPEN issue: newer active duplicate wins over older merged PR (legacy freshest-wins preserved)");
+    // Default (no opts) preserves legacy back-compat for any external caller
+    // that hasn't been updated to pass issueState (also exercises the test-only
+    // direct callers in this file's existing P1 block).
+    ok(pickLinkedPrFromSearch(openWithStaleMerge, 836) === 870, "no opts (legacy call shape): freshest-wins preserved → newer active PR (back-compat)");
+  }
+
   // ── #828 / RE1 #830: a Search FAILURE must NOT collapse to an authoritative
   //    no-PR (which would render an out-of-window OPEN issue as queued, or a
   //    CLOSED issue with a merged PR as closed). findLinkedPrByTitle returns
