@@ -31,7 +31,7 @@ export default function ActiveSwitch({ active, onToggle, disabled, title }: Acti
     >
       <span
         className={`block h-2 w-2 transition-transform duration-150 ${
-          active ? "translate-x-[12px] bg-accent" : "translate-x-[2px] bg-text-muted"
+          active ? "translate-x-[14px] bg-accent" : "translate-x-[2px] bg-text-muted"
         }`}
       />
     </button>
