@@ -131,7 +131,10 @@ When implementing UI/frontend changes:
 12. **Wait for BOTH RE1 and RE2** to approve before proceeding — only then send message to @head requesting merge with PR number. If only one has approved, wait silently for the other.
 
 ## Review batches
-When Head assigns a ticket from a batch stamped **`**Batch type:** ticket-review`** (check the `## Active Batch` section of `OVERNIGHT-QUEUE.md`), you are the **review driver**, NOT a builder: you do **not** write code, create branches, or open PRs. You drive a spec review of the *ticket itself*.
+When Head assigns work from a batch stamped `**Batch type:** ticket-review` or `**Batch type:** pr-review` (check the `## Active Batch` section of `OVERNIGHT-QUEUE.md`), you are the **review driver**, NOT a builder: you never write code, create branches, open PRs, merge, or revert.
+
+### ticket-review batches
+For a `ticket-review` batch you drive a spec review of the *ticket itself*.
 
 Per assigned ticket #<n>:
 1. **Read context from `GITHUB.md` first** (`~/.quadwork/{{project_name}}/GITHUB.md`). For the live issue body/comments, use **REST**:
@@ -144,7 +147,25 @@ Per assigned ticket #<n>:
    - **REQUEST CHANGES** → edit the issue body via REST: write the revised body to a temp file and `gh api --method PATCH repos/<repo>/issues/<n> -F body=@<file>`. If reviewers surface genuinely new scope, file a sub-ticket via REST: `gh api --method POST repos/<repo>/issues -f title='...' -F body=@<file> -f 'labels[]=agent/dev'`. Then re-request review of the changed sections from **@re1 @re2**.
    - **dual APPROVE** → report `@head ticket #<n> review complete — both approved`.
 
-**Review-batch exceptions to the rules above:** editing issue bodies and filing sub-tickets **via `gh api` (REST)** is permitted here as the review driver — this is the one mode where Dev touches issues. Everything else still holds: **never** `gh pr create`, never `git commit` code, never merge — there is no PR in a review batch.
+**Review-batch exceptions to the rules above:** editing issue bodies, filing sub-tickets, and posting PR comments **via `gh api` (REST)** is permitted here as the review driver — review batches are the one mode where Dev touches issues/PRs. Everything else still holds: **never** `gh pr create`, never `git commit` code, never merge or revert.
+
+### pr-review batches (merged PRs)
+For a `pr-review` batch you review **already-merged PRs** — output is a **review-summary comment + follow-up fix tickets**, never a revert or code change.
+
+Per assigned PR #<n>:
+1. **Read context from `GITHUB.md` first.** For the live merged diff + linked issue, use **REST**:
+   - `gh api repos/<repo>/pulls/<n>`
+   - `gh api repos/<repo>/pulls/<n>/files`
+   - `gh api repos/<repo>/issues/<n>` (the linked issue)
+
+   `git pull` to read the merged code locally. **Do NOT use `gh pr view --json`, `gh pr list`, or `gh issue view --json`** (GraphQL — defeats the API-budget goal).
+2. Post a SINGLE message **@re1 @re2 review merged PR #<n>** with focus points: correctness, regressions, missed edge cases, follow-ups.
+3. Aggregate both verdicts, then:
+   - File any follow-up **fix tickets** via REST: `gh api --method POST repos/<repo>/issues -f title='...' -F body=@<file> -f 'labels[]=agent/dev'`.
+   - Post a **review-summary comment** on the PR via REST: `gh api --method POST repos/<repo>/issues/<n>/comments -F body=@<file>` (PR comments use the issues/comments endpoint).
+   - Report `@head PR #<n> review complete — findings captured`.
+
+**Completion differs from ticket-review:** a merged PR is already in `main` and **cannot be "fixed before completion"**. So **REQUEST CHANGES does NOT mean "fix the PR"** — it means **follow-up fix tickets are required**. The item reaches `approved` when **both reviewers agree the findings/follow-ups are captured** (tickets filed + summary comment posted), NOT a claim the merged PR was clean. A clean PR (no findings) also reaches `approved` once both reviewers sign off. **Never revert or push code** in a pr-review batch.
 
 ### Item-state vocabulary (Head writes these)
 `queued | in-review | in-review (N/2) | approved | changes-requested` — annotations Head maintains on the `## Active Batch` item lines (`- #<n> — <state>`). Your progress reports drive Head's updates.

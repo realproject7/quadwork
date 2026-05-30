@@ -143,8 +143,9 @@ When the operator asks you in chat to start a task or batch:
 3. If Active Batch is empty, report it in chat and wait silently for the operator's next instruction.
 
 ## Review batches
-A **review batch** reviews GitHub *tickets* (issue specs) instead of building code — same queue mechanics as a code batch, plus one marker line and in-place state annotations. There is **no PR and no merge step**.
+A **review batch** reviews GitHub *tickets* (issue specs, `ticket-review`) or *merged PRs* (`pr-review`) instead of building code — same queue mechanics as a code batch, plus one marker line and in-place state annotations. A review batch never opens a new PR and never merges/lands code.
 
+### ticket-review batches
 When the operator asks to "review tickets #X #Y #Z":
 1. Write the `## Active Batch` section the **normal way** — `**Batch:** N` (next sequential number, same `max(N)+1` rule) — and add a `**Batch type:** ticket-review` line **right after** `**Batch:** N`:
 
@@ -165,8 +166,24 @@ When the operator asks to "review tickets #X #Y #Z":
 3. **As Dev reports progress, update each item's state annotation IN PLACE** — `queued` → `in-review` → `in-review (1/2)` → `approved` (or `changes-requested`). Do **NOT** move items individually to `## Done`; they stay in `## Active Batch` with their annotation until the whole batch is done.
 4. When **every** item is `approved`, the batch is complete (no merge). Archive the whole block to `## Done` exactly as a finished code batch, **preserving the `**Batch:** N` and `**Batch type:** ticket-review` lines** (so batch numbering stays correct and the archived batch still renders right).
 
+### pr-review batches
+When the operator asks to "review merged PRs #X #Y #Z": same as ticket-review but stamp `**Batch type:** pr-review`, and the items are **PR numbers** (`- #<pr> — queued`):
+
+```markdown
+## Active Batch
+
+**Batch:** <N>
+**Batch type:** pr-review
+**Started:** <YYYY-MM-DD HH:MM>
+
+- #<PR-X> — queued
+- #<PR-Y> — queued
+```
+
+Same in-place-annotation lifecycle: items stay in `## Active Batch` with their state until `approved`, then archive the whole block to `## Done` (preserve `**Batch:** N` + `**Batch type:** pr-review`). A merged PR is already in `main`, so `approved` here means **Dev + both reviewers captured the findings** (follow-up fix tickets filed + a summary comment posted) — NOT that the PR was reverted or "fixed". There is no merge step.
+
 ### Item-state vocabulary (must match exactly)
-`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations on the `## Active Batch` item lines (`- #<n> — <state>`), scoped to the current `**Batch:** N`. These exact strings are what the batch-progress panel parses.
+`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations on the `## Active Batch` item lines (`- #<n> — <state>`), scoped to the current `**Batch:** N`. These exact strings are what the batch-progress panel parses (same vocabulary for ticket-review and pr-review).
 
 ## Workflow
 1. Receive task request (from the operator in chat, or as the next item in `OVERNIGHT-QUEUE.md`) → create GitHub issue if needed.
