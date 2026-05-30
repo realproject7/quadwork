@@ -130,6 +130,25 @@ When implementing UI/frontend changes:
 11. Send message to **@re1 AND @re2** (NOT @head): "Fixes pushed for PR #<number>, please re-review"
 12. **Wait for BOTH RE1 and RE2** to approve before proceeding — only then send message to @head requesting merge with PR number. If only one has approved, wait silently for the other.
 
+## Review batches
+When Head assigns a ticket from a batch stamped **`**Batch type:** ticket-review`** (check the `## Active Batch` section of `OVERNIGHT-QUEUE.md`), you are the **review driver**, NOT a builder: you do **not** write code, create branches, or open PRs. You drive a spec review of the *ticket itself*.
+
+Per assigned ticket #<n>:
+1. **Read context from `GITHUB.md` first** (`~/.quadwork/{{project_name}}/GITHUB.md`). For the live issue body/comments, use **REST**:
+   - `gh api repos/<repo>/issues/<n>`
+   - `gh api repos/<repo>/issues/<n>/comments`
+
+   `git pull` to read any cited code/files locally against current `main`. **Do NOT run `gh issue view --json`, `gh pr view --json`, or `gh pr list`** — those are GraphQL-backed and drain the API budget this workflow exists to protect.
+2. Post a SINGLE message **@re1 @re2 please review ticket #<n>** with the key points to check: scope clear? acceptance criteria testable? technically feasible vs current `main`? dependencies/ordering correct? internally consistent (no contradictory sections)?
+3. Aggregate both verdicts:
+   - **REQUEST CHANGES** → edit the issue body via REST: write the revised body to a temp file and `gh api --method PATCH repos/<repo>/issues/<n> -F body=@<file>`. If reviewers surface genuinely new scope, file a sub-ticket via REST: `gh api --method POST repos/<repo>/issues -f title='...' -F body=@<file> -f 'labels[]=agent/dev'`. Then re-request review of the changed sections from **@re1 @re2**.
+   - **dual APPROVE** → report `@head ticket #<n> review complete — both approved`.
+
+**Review-batch exceptions to the rules above:** editing issue bodies and filing sub-tickets **via `gh api` (REST)** is permitted here as the review driver — this is the one mode where Dev touches issues. Everything else still holds: **never** `gh pr create`, never `git commit` code, never merge — there is no PR in a review batch.
+
+### Item-state vocabulary (Head writes these)
+`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations Head maintains on the `## Active Batch` item lines (`- #<n> — <state>`). Your progress reports drive Head's updates.
+
 ## Error Recovery
 - **Network failures** (DNS, GitHub API, git push/pull): retry automatically up to 5 times with 30-second intervals. Do NOT ask the user — just retry silently.
 - **Build failures**: fix the issue and retry. If stuck after 3 attempts, report blocker to @head.
