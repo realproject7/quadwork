@@ -512,7 +512,14 @@ export default function Sidebar() {
       <div className={`h-px bg-border my-2 ${isExpanded ? "" : "w-6 self-center"}`} />
 
       {/* Projects */}
-      <div className={`flex-1 flex flex-col gap-2 overflow-y-auto min-h-0 ${isExpanded ? "" : "items-center"}`}>
+      {/* #863: in the collapsed rail, span the full 64px aside width and hide
+          the scrollbar so the 6px scrollbar gutter (globals.css ::-webkit-scrollbar)
+          stops eating into the 4px pin/status-dot decorations that hang off
+          the right edge of the 40px icon. With w-full + items-center, icons
+          center to the rail axis (matching Home / Settings / Add Project);
+          scrolling still works via wheel / touchpad / keyboard. Expanded
+          behavior unchanged. */}
+      <div className={`flex-1 flex flex-col gap-2 overflow-y-auto min-h-0 ${isExpanded ? "" : "w-full items-center [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"}`}>
         {/* Pinned group */}
         {pinnedProjects.length > 0 && (
           <>
