@@ -3019,6 +3019,45 @@ function reseedAgentsMd(existingContent, freshContent) {
   };
 }
 
+// #855: Map legacy agent config keys to the canonical seed-template names.
+// Older projects (and operator-renamed agents) may use keys like
+// `reviewer1` / `reviewer2` / `t1..t3`; the seed templates only exist for
+// the canonical `head/re1/re2/dev` slugs. Any key not in this table is
+// assumed canonical (so future agent slugs work without a code change).
+const LEGACY_AGENT_KEY_TO_CANONICAL = Object.freeze({
+  t1: "head",
+  t2a: "re1",
+  t2b: "re2",
+  t3: "dev",
+  reviewer1: "re1",
+  reviewer2: "re2",
+});
+
+function _canonicalAgentSlug(agentKey) {
+  return LEGACY_AGENT_KEY_TO_CANONICAL[agentKey] || agentKey;
+}
+
+// #855: Resolve the per-agent re-seed targets for a project. Pulls the
+// worktree path from `project.agents[key].cwd` (the source of truth — the
+// agent process itself spawns there) rather than reconstructing
+// `${dirName}-${key}`, so legacy worktree names like `*-reviewer1` are
+// covered. When a project has no `agents` map at all (very old config),
+// falls back to the canonical sibling layout. Pure — no I/O.
+function _resolveReseedTargets(project) {
+  const workingDir = project?.working_dir;
+  if (!workingDir) return [];
+  const dirName = path.basename(workingDir);
+  const parentDir = path.dirname(workingDir);
+  const agentsCfg = project.agents && typeof project.agents === "object" ? project.agents : null;
+  const keys = agentsCfg ? Object.keys(agentsCfg) : ["head", "re1", "re2", "dev"];
+  return keys.map((agentKey) => {
+    const canonical = _canonicalAgentSlug(agentKey);
+    const configuredCwd = agentsCfg?.[agentKey]?.cwd;
+    const wtDir = configuredCwd || path.join(parentDir, `${dirName}-${canonical}`);
+    return { agentKey, canonical, wtDir };
+  });
+}
+
 // Operator-triggered re-seed of a project's worktree AGENTS.md files from
 // the current `templates/seeds/*.AGENTS.md` templates, using the same
 // placeholder substitution as the setup wizard's `seed-files` step. New
@@ -3078,22 +3117,23 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
   }
 
   const dirName = path.basename(workingDir);
-  const parentDir = path.dirname(workingDir);
   const reviewerUser = body.reviewerUser ?? cfg.reviewer_github_user ?? "";
   const reviewerTokenPath = body.reviewerTokenPath || path.join(os.homedir(), ".quadwork", "reviewer-token");
 
-  const agents = ["head", "re1", "re2", "dev"];
+  // #855: walk the project's configured agents (resolved by `cwd`) instead of
+  // reconstructing sibling paths. Legacy keys (`reviewer1` etc.) still pull
+  // the canonical seed template via `_canonicalAgentSlug`.
+  const targets = _resolveReseedTargets(project);
   const reseeded = [];
   const preserved = {};
   const skipped = [];
-  for (const agent of agents) {
-    const wtDir = path.join(parentDir, `${dirName}-${agent}`);
-    if (!fs.existsSync(wtDir)) { skipped.push(`${agent} (no worktree)`); continue; }
-    const seedSrc = path.join(TEMPLATES_DIR, "seeds", `${agent}.AGENTS.md`);
+  for (const { agentKey, canonical, wtDir } of targets) {
+    if (!fs.existsSync(wtDir)) { skipped.push(`${agentKey} (no worktree)`); continue; }
+    const seedSrc = path.join(TEMPLATES_DIR, "seeds", `${canonical}.AGENTS.md`);
     if (!fs.existsSync(seedSrc)) {
       return res.status(500).json({
         ok: false,
-        error: `Missing seed template: templates/seeds/${agent}.AGENTS.md`,
+        error: `Missing seed template: templates/seeds/${canonical}.AGENTS.md`,
       });
     }
     let freshContent = fs.readFileSync(seedSrc, "utf-8");
@@ -3109,9 +3149,9 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
     }
     const merged = reseedAgentsMd(existing, freshContent);
     fs.writeFileSync(agentsMd, merged.content);
-    reseeded.push(`${agent}/AGENTS.md`);
+    reseeded.push(`${agentKey}/AGENTS.md`);
     if (merged.preservedHeadings.length > 0) {
-      preserved[agent] = merged.preservedHeadings;
+      preserved[agentKey] = merged.preservedHeadings;
     }
   }
   return res.json({
@@ -3683,6 +3723,12 @@ module.exports.isBatchActiveFromProgress = isBatchActiveFromProgress;
 // custom-section preservation contract is exercisable without spinning up a
 // real worktree. Pure function; no production callers outside this file.
 module.exports.reseedAgentsMd = reseedAgentsMd;
+// #855: expose the per-agent target resolver + legacy-key map so the legacy
+// config (`reviewer1` / `reviewer2` / `t1..t3`) → canonical-template mapping
+// is exercisable without spinning up a real worktree. Pure helpers; no
+// production callers outside this file.
+module.exports._resolveReseedTargets = _resolveReseedTargets;
+module.exports._canonicalAgentSlug = _canonicalAgentSlug;
 // #839 (re1 follow-up): expose the shared compute path plus the caches it
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
