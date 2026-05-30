@@ -16,6 +16,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "test": "node server/run-tests.js",
     "start": "node server/",
     "lint": "eslint",
     "server": "node server/",
