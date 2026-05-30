@@ -9,6 +9,7 @@
   --accent-dim: #00cc6a;
   --border: #2a2a2a;
   --error: #ff4444;
+  --warning: #ffaa00; /* #866: amber for rate-limit "warning" state */
 }
 
 @theme inline {
@@ -20,6 +21,7 @@
   --color-accent-dim: var(--accent-dim);
   --color-border: var(--border);
   --color-error: var(--error);
+  --color-warning: var(--warning);
   --font-mono: var(--font-geist-mono);
 }
 
