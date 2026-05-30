@@ -172,6 +172,12 @@ function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onCo
             <PinIcon size={8} />
           </div>
         )}
+        {!project.idle && !expanded && (
+          <div
+            className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent ring-2 ring-bg-surface"
+            aria-label="Active"
+          />
+        )}
       </div>
       {expanded && (
         <span className={`text-xs truncate flex items-center gap-1 ${isActive ? "text-accent" : "text-text-muted"}`}>
