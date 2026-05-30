@@ -3152,8 +3152,37 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
     }
   }
 
+  let result;
+  try {
+    result = _performReseedWrites(project, cfg, {
+      reviewerUser: body.reviewerUser,
+      reviewerTokenPath: body.reviewerTokenPath,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+  return res.json({
+    ok: true,
+    reseeded: result.reseeded,
+    skipped: result.skipped,
+    preserved: result.preserved,
+    note: "Re-seeded files take effect on next agent restart.",
+  });
+});
+
+// #856: Per-target write loop, extracted so the manual route handler and the
+// auto-reseed startup hook share one implementation. Throws on missing seed
+// template (the route handler maps that to a 500). Returns the same shape
+// the endpoint returns so the auto-reseed log can include per-project stats.
+//
+// `opts.reviewerUser` and `opts.reviewerTokenPath` are operator overrides:
+// when set they win over the per-agent extraction / cfg fallback. Auto-reseed
+// passes neither so each project uses the same priority chain manual re-seed
+// uses (per-agent extraction → cfg → default).
+function _performReseedWrites(project, cfg, opts = {}) {
+  const workingDir = project.working_dir;
   const dirName = path.basename(workingDir);
-  const reviewerUser = body.reviewerUser ?? cfg.reviewer_github_user ?? "";
+  const reviewerUser = opts.reviewerUser ?? cfg.reviewer_github_user ?? "";
   const defaultReviewerTokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
 
   // #855: walk the project's configured agents (resolved by `cwd`) instead of
@@ -3167,15 +3196,12 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
     if (!fs.existsSync(wtDir)) { skipped.push(`${agentKey} (no worktree)`); continue; }
     const seedSrc = path.join(TEMPLATES_DIR, "seeds", `${canonical}.AGENTS.md`);
     if (!fs.existsSync(seedSrc)) {
-      return res.status(500).json({
-        ok: false,
-        error: `Missing seed template: templates/seeds/${canonical}.AGENTS.md`,
-      });
+      throw new Error(`Missing seed template: templates/seeds/${canonical}.AGENTS.md`);
     }
 
     // #854: Read the existing AGENTS.md FIRST so the per-agent token path
     // resolution can see what the operator currently has. Resolution order:
-    //   1. explicit body override (`body.reviewerTokenPath`)
+    //   1. explicit opts override (`opts.reviewerTokenPath`)
     //   2. extracted from this worktree's existing AGENTS.md
     //   3. project/global config (`cfg.reviewer_token_path`)
     //   4. default `~/.quadwork/reviewer-token`
@@ -3188,7 +3214,7 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
       try { existing = fs.readFileSync(agentsMd, "utf-8"); } catch { existing = ""; }
     }
     const tokenPath =
-      body.reviewerTokenPath
+      opts.reviewerTokenPath
       || _extractReviewerTokenPath(existing)
       || cfg.reviewer_token_path
       || defaultReviewerTokenPath;
@@ -3206,14 +3232,127 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
       preserved[agentKey] = merged.preservedHeadings;
     }
   }
-  return res.json({
-    ok: true,
-    reseeded,
-    skipped,
-    preserved,
-    note: "Re-seeded files take effect on next agent restart.",
-  });
-});
+  return { reseeded, skipped, preserved };
+}
+
+// ─── #856: Auto-reseed on version upgrade ────────────────────────────────
+//
+// On every server startup we compare the current package version against a
+// per-project completion record in `~/.quadwork/reseed-state.json`. Any
+// project that hasn't been re-seeded for the current version gets re-seeded
+// from the current templates so existing users pick up new seed instructions
+// (e.g. GITHUB.md discovery) without ever clicking the manual button.
+//
+// The per-project state is load-bearing: a project deferred mid-batch stays
+// pending in the state file so the very next startup (or any future safe-
+// boundary hook) retries it. Using a single global "last run version"
+// marker would strand any deferred project — once the marker advanced past
+// the upgrade version, the deferred project would never be re-seeded.
+
+const RESEED_STATE_PATH = path.join(os.homedir(), ".quadwork", "reseed-state.json");
+const PACKAGE_JSON_PATH = path.join(__dirname, "..", "package.json");
+
+function _readPackageVersion(pkgPath = PACKAGE_JSON_PATH) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    return typeof pkg.version === "string" && pkg.version ? pkg.version : "0.0.0";
+  } catch { return "0.0.0"; }
+}
+
+function _loadReseedState(statePath = RESEED_STATE_PATH) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    const map = parsed && typeof parsed === "object" && parsed !== null && parsed.completedByProjectVersion;
+    const completed = map && typeof map === "object" && !Array.isArray(map) ? { ...map } : {};
+    // Drop non-string version values so a corrupt write can't poison the
+    // up-to-date check (which is a string equality).
+    for (const k of Object.keys(completed)) {
+      if (typeof completed[k] !== "string") delete completed[k];
+    }
+    return { completedByProjectVersion: completed };
+  } catch { return { completedByProjectVersion: {} }; }
+}
+
+function _saveReseedState(state, statePath = RESEED_STATE_PATH) {
+  try {
+    const dir = path.dirname(statePath);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {}
+  // Single fs.writeFileSync — write-replace is atomic enough for this
+  // boot-time-only writer (no concurrent writer exists).
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+}
+
+async function autoReseedOnStartup(cfg, opts = {}) {
+  const version = opts.version || _readPackageVersion();
+  const statePath = opts.statePath || RESEED_STATE_PATH;
+  const log = opts.log || ((m) => console.log(m));
+  // Dependency-injected for tests so we don't have to spin up gh.
+  const getProgress = opts.getProgress || getOrComputeBatchProgress;
+  const isActiveFromProgress = opts.isActiveFromProgress || isBatchActiveFromProgress;
+  const performWrites = opts.performWrites || _performReseedWrites;
+
+  const state = _loadReseedState(statePath);
+  const decisions = [];
+  const projects = (cfg?.projects || []).filter((p) => p && p.id && p.working_dir);
+
+  for (const project of projects) {
+    if (state.completedByProjectVersion[project.id] === version) {
+      decisions.push({ projectId: project.id, action: "skip", reason: "already current" });
+      continue;
+    }
+
+    // Fail-closed batch gate, same contract as the manual /reseed-agents
+    // route (#853): a throw OR a null result both mean "we cannot prove the
+    // batch is idle, so we MUST defer rather than risk mid-batch instruction
+    // drift". The deferred state stays pending so the next startup retries.
+    let active;
+    try {
+      const progress = await getProgress(project.id);
+      active = isActiveFromProgress(progress);
+    } catch (err) {
+      decisions.push({ projectId: project.id, action: "deferred", reason: `batch-state check threw: ${err.message}` });
+      log(`[reseed] ${project.id}: deferred — batch state unknown (${err.message}); will retry on next startup`);
+      continue;
+    }
+    if (active === null) {
+      decisions.push({ projectId: project.id, action: "deferred", reason: "batch state unknown" });
+      log(`[reseed] ${project.id}: deferred — batch state unknown; will retry on next startup`);
+      continue;
+    }
+    if (active === true) {
+      decisions.push({ projectId: project.id, action: "deferred", reason: "batch active" });
+      log(`[reseed] ${project.id}: deferred — batch active; will retry on next startup`);
+      continue;
+    }
+
+    let result;
+    try {
+      result = performWrites(project, cfg, {});
+    } catch (err) {
+      decisions.push({ projectId: project.id, action: "error", error: err.message });
+      log(`[reseed] ${project.id}: ERROR — ${err.message}; state NOT advanced, will retry on next startup`);
+      continue;
+    }
+
+    state.completedByProjectVersion[project.id] = version;
+    try {
+      _saveReseedState(state, statePath);
+    } catch (err) {
+      // If we can't persist, the project will re-seed again next boot.
+      // Idempotent (file rewrite + #845 merger) so this is annoying-but-safe.
+      log(`[reseed] ${project.id}: WARN — could not persist reseed-state (${err.message}); will re-seed next startup`);
+    }
+    decisions.push({
+      projectId: project.id, action: "reseeded",
+      reseeded: result.reseeded, skipped: result.skipped, preserved: result.preserved,
+    });
+    log(`[reseed] ${project.id}: reseeded for v${version} — wrote ${result.reseeded.length} file(s)` +
+        (result.skipped.length ? `, skipped ${result.skipped.length}` : ""));
+  }
+
+  return { version, decisions };
+}
 
 // ─── Rename ────────────────────────────────────────────────────────────────
 
@@ -3784,6 +3923,16 @@ module.exports._canonicalAgentSlug = _canonicalAgentSlug;
 // #854: expose the GH_TOKEN path extractor so the parse forms (`export`,
 // double-quoted, inner-quoted, etc.) are exercisable without a temp fs.
 module.exports._extractReviewerTokenPath = _extractReviewerTokenPath;
+// #856: expose the auto-reseed startup hook + supporting state/version
+// helpers. server/index.js calls `autoReseedOnStartup` after config is
+// loaded; the helpers are exposed for unit tests + the integration test
+// (state corruption, version round-trip, per-project decision matrix).
+module.exports.autoReseedOnStartup = autoReseedOnStartup;
+module.exports._loadReseedState = _loadReseedState;
+module.exports._saveReseedState = _saveReseedState;
+module.exports._readPackageVersion = _readPackageVersion;
+module.exports._performReseedWrites = _performReseedWrites;
+module.exports.RESEED_STATE_PATH = RESEED_STATE_PATH;
 // #839 (re1 follow-up): expose the shared compute path plus the caches it
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
