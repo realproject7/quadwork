@@ -48,6 +48,14 @@ fs.readFileSync = function stubReadFileSync(p, ...rest) {
     err.code = "ENOENT";
     throw err;
   }
+  // #886: the module-load startRateLimitPolling() now also polls the reviewer
+  // account, which reads the reviewer-token file. Force ENOENT so no reviewer
+  // gh poll fires and races a gh call into the ZERO-gh-call assertions below.
+  if (typeof p === "string" && p.endsWith("reviewer-token")) {
+    const err = new Error("ENOENT (test stub)");
+    err.code = "ENOENT";
+    throw err;
+  }
   return real.readFileSync(p, ...rest);
 };
 // Capture snapshot writes so we can assert batch_type/reviewItems are persisted.
