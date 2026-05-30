@@ -26,6 +26,16 @@ const ENV_PATH = path.join(CONFIG_DIR, ".env");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
 
+// #837: `gh api` list fetches (closed-PR pages with `-i`, GraphQL repo
+// snapshot, batch progress) can exceed Node's default 1MB execFile maxBuffer.
+// A real `pulls?state=closed&per_page=100` -i page measured ~1.74MB on
+// realproject7/quadwork, which made ghApiConditional reject with
+// ERR_CHILD_PROCESS_STDIO_MAXBUFFER → "Recently Merged PRs" stayed empty AND
+// the #828/#834 queued-from-snapshot fast-path was forced off because
+// closedPagesComplete couldn't ever become true. 32MB is well above today's
+// page sizes and still well under node's hard 2GB cap.
+const GH_LIST_MAX_BUFFER = 32 * 1024 * 1024;
+
 function isLocalhost(ip) {
   return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
 }
@@ -1024,7 +1034,7 @@ async function ghApiConditional(etagKey, apiPath) {
   const args = ["api", apiPath, "-i"];
   if (prev && prev.etag) args.push("-H", `If-None-Match: ${prev.etag}`);
   try {
-    const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 15000 });
+    const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
     const { headerBlock, body } = _parseGhInclude(stdout);
     const etag = _extractEtag(headerBlock);
     let data = null;
@@ -1688,7 +1698,7 @@ fragment repoFields on Repository {
   try {
     const { stdout } = await _execFileAsync("gh", [
       "api", "graphql", "-f", `query=${query}`,
-    ], { encoding: "utf-8", timeout: 15000 });
+    ], { encoding: "utf-8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
     const data = JSON.parse(stdout).data;
     if (!data) return null;
 
@@ -2261,7 +2271,7 @@ function parseActiveBatch(queueText) {
 // errors into the "not found" branch, making the new failure-row
 // fallback unreachable for genuine command failures (t2a review).
 async function ghJsonExecAsync(args) {
-  const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 10000 });
+  const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 10000, maxBuffer: GH_LIST_MAX_BUFFER });
   return JSON.parse(stdout);
 }
 
@@ -3463,6 +3473,10 @@ module.exports.isGraphqlRateLow = isGraphqlRateLow;
 // entry point (#807's file writer consumes the assembled snapshot).
 module.exports.githubStateFetcher = githubStateFetcher;
 module.exports._coalesce = _coalesce;
+// #837: expose ghApiConditional + the shared list-fetch maxBuffer constant for
+// the >1MB closed-PR page regression test.
+module.exports.ghApiConditional = ghApiConditional;
+module.exports.GH_LIST_MAX_BUFFER = GH_LIST_MAX_BUFFER;
 module.exports.restIssueToCanonical = restIssueToCanonical;
 module.exports.restClosedIssueToCanonical = restClosedIssueToCanonical;
 module.exports.restMergedPrToCanonical = restMergedPrToCanonical;
