@@ -17,6 +17,8 @@ const {
   findLinkedPrByTitle,
   gatherClosedPrPages,
   selectRecentMergedPrs,
+  closedPagesComplete,
+  closedPrIssueNumsFromPages,
 } = require("./routes");
 
 const page = (data) => ({ status: "ok", data });
@@ -116,6 +118,33 @@ async function run() {
     // recently-closed-unmerged PRs on page 1 don't bury real merges on page 2.
     ok(!merged.some((m) => m.number === 2), "an older merge is correctly excluded once 5 fresher merges exist on a later page");
     ok(merged.every((m) => m.mergedAt), "every selected row carries mergedAt");
+  }
+
+  // ── #834: closedPagesComplete — the closed-PR window is PROVEN complete only
+  //    when the LAST fetched page came back reliably AND had < 100 items. ──
+  {
+    const full = Array.from({ length: 100 }, (_, i) => unmergedPr(i + 1));
+    const short = [unmergedPr(1), unmergedPr(2)];
+    ok(closedPagesComplete([page(short)]) === true, "single short (<100) ok page → complete (genuine end)");
+    ok(closedPagesComplete([page(full)]) === false, "single full (===100) ok page → NOT complete (more may exist)");
+    ok(closedPagesComplete([page(full), page(short)]) === true, "last page short → complete regardless of earlier full pages");
+    ok(closedPagesComplete([page(full), page(full)]) === false, "cap-hit/early-stop with a full LAST page → NOT complete");
+    ok(closedPagesComplete([{ status: "error", data: null }]) === false, "error last page → NOT complete (can't prove the end)");
+    ok(closedPagesComplete([page(full), { status: "error", data: short }]) === false, "error last page even with short stale data → NOT complete");
+    // A 304 carries the unchanged real data — a short 304 page is a genuine end.
+    ok(closedPagesComplete([{ status: "unchanged", data: short }]) === true, "304 (unchanged) short page → complete (its data is the real, unchanged tail)");
+    ok(closedPagesComplete([{ status: "unchanged", data: full }]) === false, "304 full page → NOT complete");
+  }
+
+  // ── #834: closedPrIssueNumsFromPages — every [#N] linked issue across ALL
+  //    scanned closed pages (strict, start-anchored), not just the displayed 5. ──
+  {
+    const p1 = page([{ title: "[#5] merged a" }, { title: "[#7] closed b" }, { title: "no link here" }]);
+    const p2 = page([{ title: "[#8] merged out-of-window" }, { title: "Fix [#9] mid-title (rejected)" }]);
+    const nums = closedPrIssueNumsFromPages([p1, p2]);
+    ok(nums.includes(5) && nums.includes(7) && nums.includes(8), "collects [#N] across all pages (incl. beyond the displayed 5)");
+    ok(!nums.includes(9), "mid-title [#9] (not start-anchored) is NOT collected");
+    ok(closedPrIssueNumsFromPages([{ status: "error", data: null }]).length === 0, "error/no-data page contributes nothing");
   }
 
   // ── P1/P3 acceptance guard: ZERO `gh issue view` / `gh pr view` (GraphQL)

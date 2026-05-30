@@ -1222,6 +1222,39 @@ function selectRecentMergedPrs(pages) {
     .map(restMergedPrToCanonical);
 }
 
+// #834: whether the closed-PR pagination reached the ACTUAL end of the list —
+// the ONLY proof that no further closed/merged PR exists beyond what we scanned.
+// True iff the LAST fetched page came back reliably (not an "error") AND had
+// < 100 items (a genuine final page; a full 100 means more may exist). This is
+// deliberately stricter than "the loop stopped": stopping early because the
+// display need was met (≥5 merged) or hitting MERGED_PAGE_CAP while pages were
+// still full does NOT prove completeness — those leave a full (===100) last
+// page, so this returns false and the caller falls back to by-number. A 304
+// carries the unchanged real data, so a short (<100) 304 page is a genuine end
+// too; only "error" pages (possibly stale/null data) can't prove it. Pure.
+function closedPagesComplete(pages) {
+  const last = pages[pages.length - 1];
+  return !!last && last.status !== "error" && Array.isArray(last.data) && last.data.length < 100;
+}
+
+// #834: issue numbers linked by the team's `[#N]` PR-title convention across
+// ALL fetched closed-PR pages (not just the 5 displayed merged). Lets
+// progressFromSnapshot prove an OPEN issue has no closed/merged linked PR —
+// even one merged/closed outside the recent-5 window — before classifying it
+// queued. Pure → unit-testable.
+function closedPrIssueNumsFromPages(pages) {
+  const re = /^\s*\[#(\d{1,7})\]/;
+  const nums = [];
+  for (const r of pages) {
+    const arr = Array.isArray(r && r.data) ? r.data : [];
+    for (const p of arr) {
+      const m = ((p && p.title) || "").match(re);
+      if (m) nums.push(parseInt(m[1], 10));
+    }
+  }
+  return nums;
+}
+
 async function githubStateFetcher(repo) {
   const [owner, name] = (repo || "").split("/");
   if (!owner || !name) return { status: "error", data: null };
@@ -1269,6 +1302,13 @@ async function githubStateFetcher(repo) {
   // without a by-number fetch; if exactly 50 came back the window may be
   // truncated and it must NOT guess.
   const openPrsWindowComplete = Array.isArray(openPullsR.data) && openPullsR.data.length < 50;
+  // #834: queued-from-snapshot also requires proving NO closed/merged linked PR
+  // exists. closedPrsWindowComplete = the closed-PR pagination reached an actual
+  // <100 end (not just stopped early); closedPrIssueNums = every [#N] across ALL
+  // scanned closed pages, so a PR merged/closed outside the recent-5 window
+  // still blocks a false "queued". Both are consumed by progressFromSnapshot.
+  const closedPrsWindowComplete = closedPagesComplete(closedPullPages);
+  const closedPrIssueNums = closedPrIssueNumsFromPages(closedPullPages);
 
   const openPullsRaw = Array.isArray(openPullsR.data) ? openPullsR.data : [];
   const prs = await _mapLimited(openPullsRaw, GH_MAX_CONCURRENT, async (p) => {
@@ -1290,7 +1330,7 @@ async function githubStateFetcher(repo) {
 
   return {
     status: changed > 0 ? "ok" : "unchanged",
-    data: { issues, prs, closedIssues, mergedPrs, openPrsWindowComplete },
+    data: { issues, prs, closedIssues, mergedPrs, openPrsWindowComplete, closedPrsWindowComplete, closedPrIssueNums },
   };
 }
 
@@ -1806,13 +1846,15 @@ function countApprovedRoles(reviews) {
 // Compute issue `n`'s progress row from the snapshot (no network). Links
 // issue↔PR by the team's `[#<issue>]` PR-title convention. Returns a row when
 // the snapshot can PROVE the state: a matching in-window PR (in_review/approved/
-// ready/merged), or — #828 P1 — a queued OPEN issue when the open-PR window is
-// provably complete (openPrsWindowComplete: <50 open PRs returned, so a
-// no-match means there genuinely is no open PR). Returns null otherwise (issue
-// absent, window possibly truncated, CLOSED-with-no-in-window-PR, or merged-
-// but-open), because a partial window can't prove the absence of a linked PR —
-// the caller then does the authoritative by-number REST fetch
-// (progressForItemRest). Bucket mapping is identical to progressForItemRest.
+// ready/merged), or — #828 P1 / #834 — a queued OPEN issue when BOTH windows are
+// provably complete: openPrsWindowComplete (<50 open PRs → no open PR exists)
+// AND closedPrsWindowComplete (the closed-PR pagination reached an actual <100
+// end) with the issue absent from closedPrIssueNums (every [#N] across ALL
+// scanned closed pages, so a PR merged/closed even OUTSIDE the recent-5 window
+// is accounted for). Returns null otherwise (either window unproven, issue
+// absent, CLOSED-with-no-in-window-PR, merged-but-open, or a linked closed/
+// merged PR exists) — a partial window can't prove absence of a linked PR, so
+// the caller does the authoritative by-number REST fetch (progressForItemRest).
 function progressFromSnapshot(snapshot, n) {
   if (!snapshot) return null;
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
@@ -1836,18 +1878,25 @@ function progressFromSnapshot(snapshot, n) {
     if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
     return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
   }
-  // No matching PR in the board window. #828 P1: classify queued from the
-  // snapshot ONLY when the open-PR window is provably complete (we saw <50 open
-  // PRs → ALL of them). An OPEN issue with no matching open PR and no matching
-  // merged PR in-window is then genuinely queued — return the row here, NO
-  // GraphQL/network. A CLOSED issue (closed-no-PR vs merged-out-of-window) or a
-  // merged-but-open edge stays null so the by-number REST fetch resolves it; if
-  // the window may be truncated (≥50 open PRs) we never guess.
-  if (snapshot.openPrsWindowComplete && openIssue && !mergedPr) {
+  // No matching open/in-window-merged PR. #828 P1 / #834: classify queued from
+  // the snapshot ONLY when absence of BOTH an open AND a closed/merged linked PR
+  // is proven — openPrsWindowComplete (no open PR) AND closedPrsWindowComplete
+  // (the closed-PR window genuinely ended) AND `n` not in closedPrIssueNums
+  // (no [#N] across ANY scanned closed page, incl. merges past the recent-5
+  // display window). Then an OPEN issue is genuinely queued — NO network. Any
+  // gap (either window unproven, or a linked closed/merged PR exists) → null,
+  // and the by-number REST fetch resolves it authoritatively.
+  if (
+    snapshot.openPrsWindowComplete &&
+    snapshot.closedPrsWindowComplete &&
+    openIssue &&
+    !openPr &&
+    !(snapshot.closedPrIssueNums || []).includes(n)
+  ) {
     return buildNoPrRow({ number: n, title: openIssue.title, state: "OPEN", url: openIssue.url });
   }
-  // Can't prove the issue has no linked PR (window truncated / issue absent) —
-  // return null and let the by-number REST fetch resolve it authoritatively.
+  // Can't prove the issue has no linked PR (a window unproven / issue absent /
+  // linked closed PR) — return null; the by-number REST fetch resolves it.
   return null;
 }
 
@@ -3440,6 +3489,10 @@ module.exports._rateLimit = _rateLimit;
 // picker for unit tests. No production callers outside this file.
 module.exports.gatherClosedPrPages = gatherClosedPrPages;
 module.exports.selectRecentMergedPrs = selectRecentMergedPrs;
+// #834: closed-PR window completeness + linked-issue extraction, for the
+// queued-from-snapshot fix. No production callers outside this file.
+module.exports.closedPagesComplete = closedPagesComplete;
+module.exports.closedPrIssueNumsFromPages = closedPrIssueNumsFromPages;
 module.exports.pickLinkedPrFromSearch = pickLinkedPrFromSearch;
 module.exports.findLinkedPrByTitle = findLinkedPrByTitle;
 // #827: expose the GITHUB.md writer for the idle-no-op regression test. No
