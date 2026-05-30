@@ -20,8 +20,24 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const cp = require("child_process");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
+
+// #864: replace child_process.execFile BEFORE require("./routes") so the
+// util.promisify(execFile) reference bound inside routes.js sees the stub. The
+// snapshot freshness check uses ghJsonExecAsync → execFile(gh ...). For tests
+// we never want to spawn gh: returning a synthetic non-404 error makes
+// checkBatchSnapshotFreshness fall to its "unknown" branch (snapshot preserved,
+// not deleted), which is what the cleared-queue scenario needs.
+const realRunner = cp.execFile;
+cp.execFile = function stubRunner(file, args, opts, cb) {
+  const done = typeof opts === "function" ? opts : cb;
+  const err = new Error("test stub: gh not invoked");
+  err.code = "ENOTEST";
+  if (typeof done === "function") return done(err, "", "");
+  return realRunner.apply(this, arguments);
+};
 
 // ── fs stubs installed BEFORE require("./routes") ──────────────────────────
 // routes.js reads CONFIG_PATH via getRepo/isProjectIdle on every call, and
@@ -37,12 +53,18 @@ const real = {
 };
 let cfgJson = JSON.stringify({ projects: [] });
 let queueText = "";
+// #864: per-test snapshot fixture. Default null → readBatchSnapshot returns
+// null (existing tests rely on this). A test can set this to a JSON string to
+// simulate a preserved snapshot file on disk; checkBatchSnapshotFreshness is
+// also stubbed via _checkBatchSnapshotFreshnessStub below so we don't fire gh.
+let snapshotJson = null;
 fs.readFileSync = function stubReadFileSync(p, ...rest) {
   if (p === CONFIG_PATH) return cfgJson;
   if (typeof p === "string" && p.endsWith("OVERNIGHT-QUEUE.md")) return queueText;
   // batch-progress-cache.json absent → readBatchSnapshot returns null and the
   // upstream checkBatchSnapshotFreshness gh call is skipped entirely.
   if (typeof p === "string" && p.endsWith("batch-progress-cache.json")) {
+    if (snapshotJson !== null) return snapshotJson;
     const err = new Error("ENOENT (test stub)");
     err.code = "ENOENT";
     throw err;
@@ -192,11 +214,103 @@ function inReviewSnapshot(repo, n) {
     _graphqlCache.clear();
     cfgJson = JSON.stringify({ projects: [{ id: "empty-batch-proj", repo: "o/r", idle: false }] });
     queueText = "# Queue\n\n## Active Batch\n\n## Backlog\n";
+    snapshotJson = null;
 
     const data = await getOrComputeBatchProgress("empty-batch-proj");
     ok(data !== null && Array.isArray(data.items) && data.items.length === 0, "B6: empty Active Batch → empty items");
     ok(data.complete === false, "B6: complete === false on empty");
+    ok(data.liveActiveBatchCleared === true, "B6: empty-with-readable-queue → liveActiveBatchCleared:true");
     ok(isBatchActiveFromProgress(data) === false, "B6: empty → not active");
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // C. #864 regression: an explicitly cleared `## Active Batch` section must
+  //    drop /api/batch-active to false even when the preserved snapshot keeps
+  //    the prior batch's items visible for history. Concrete shape from the
+  //    #836 incident: closed issue #836 with merged PR #850 + later closed-
+  //    unmerged duplicate PR #851; Head sets Active Batch to `(none)` so the
+  //    operator-cleared signal must override any items still present from the
+  //    snapshot.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // C1. Pure helper: liveActiveBatchCleared:true short-circuits even when items
+  //     are present and complete is false (the live #836 incident shape).
+  ok(
+    isBatchActiveFromProgress({ items: [{ status: "in_review" }], complete: false, liveActiveBatchCleared: true }) === false,
+    "C1: liveActiveBatchCleared:true → not active even with in-review item (#864)"
+  );
+  ok(
+    isBatchActiveFromProgress({ items: [{ status: "merged" }], complete: true, liveActiveBatchCleared: true }) === false,
+    "C1: liveActiveBatchCleared:true → not active when also complete (consistent)"
+  );
+  ok(
+    isBatchActiveFromProgress({ items: [{ status: "in_review" }], complete: false, liveActiveBatchCleared: false }) === true,
+    "C1: liveActiveBatchCleared:false → unchanged behavior (active with in-review item)"
+  );
+
+  // C2. End-to-end: queue explicitly cleared (`(none)` in Active Batch) but a
+  //     preserved snapshot still holds issue #836. With the picker fix the
+  //     snapshot resolves issue #836 to merged via merged PR #850; even before
+  //     that fix the lifecycle flag alone would force active:false. This test
+  //     covers BOTH the cleared-flag wiring and the snapshot resolution.
+  {
+    _batchProgressCache.clear();
+    _graphqlCache.clear();
+    cfgJson = JSON.stringify({ projects: [{ id: "cleared-836", repo: "o/r", idle: false }] });
+    queueText = "# Queue\n\n## Active Batch\n\n(none)\n\n## Backlog\n";
+    snapshotJson = JSON.stringify({ batchNumber: 9, issueNumbers: [836] });
+    // Pre-populate the GraphQL snapshot with the #836 shape: closed issue +
+    // merged PR #850. The picker fix means progressFromSnapshot finds #850 and
+    // resolves the row as merged, so the snapshot would normally land on
+    // complete:true. But the cleared flag must drop active to false regardless.
+    _graphqlCache.set("o/r", {
+      ts: Date.now(),
+      issues: [],
+      prs: [],
+      closedIssues: [{ number: 836, title: "feat: real fix", url: "https://x/i/836" }],
+      mergedPrs: [{ number: 850, title: "[#836] real fix", url: "https://x/p/850", merged_at: "2026-05-20T10:00:00Z", reviews: [] }],
+      openPrsWindowComplete: true,
+      closedPrsWindowComplete: true,
+      closedPrIssueNums: [836],
+    });
+
+    const data = await getOrComputeBatchProgress("cleared-836");
+    ok(data !== null, "C2: cleared queue + snapshot → non-null payload");
+    ok(data.liveActiveBatchCleared === true, "C2: liveActiveBatchCleared:true reflects the operator's `(none)` clear");
+    ok(Array.isArray(data.items) && data.items.length === 1 && data.items[0].issue_number === 836,
+       "C2: preserved snapshot still surfaces issue #836 for history");
+    ok(data.items[0].status === "merged", "C2: #836 resolves as merged via PR #850 from the GraphQL snapshot");
+    ok(isBatchActiveFromProgress(data) === false,
+       "C2: /api/batch-active reports false on the cleared queue (the #864 fix)");
+  }
+
+  // C3. Unreadable queue file (#316 bypass) must NOT be mistaken for an explicit
+  //     clear — the operator never touched the file, so lifecycle signals must
+  //     not flip off based on a transient read error.
+  {
+    _batchProgressCache.clear();
+    _graphqlCache.clear();
+    cfgJson = JSON.stringify({ projects: [{ id: "queue-missing", repo: "o/r", idle: false }] });
+    // Force the queue read to throw — the routes.js try/catch will set
+    // queueReadOk=false and resolveDisplayedBatch returns the empty state.
+    const prevRead = fs.readFileSync;
+    fs.readFileSync = function (p, ...rest) {
+      if (typeof p === "string" && p.endsWith("OVERNIGHT-QUEUE.md")) {
+        const err = new Error("ENOENT (test stub)");
+        err.code = "ENOENT";
+        throw err;
+      }
+      return prevRead(p, ...rest);
+    };
+    snapshotJson = null;
+
+    const data = await getOrComputeBatchProgress("queue-missing");
+    fs.readFileSync = prevRead;
+    ok(data !== null, "C3: unreadable queue still returns a payload (#316 bypass)");
+    ok(data.liveActiveBatchCleared === false,
+       "C3: unreadable queue → liveActiveBatchCleared:false (distinct from explicit clear)");
+    ok(isBatchActiveFromProgress(data) === false,
+       "C3: empty items short-circuit still keeps it inactive (orthogonal)");
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

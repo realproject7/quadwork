@@ -44,6 +44,41 @@ async function run() {
     ok(pickLinkedPrFromSearch([{ number: 5, title: "  [#42] leading ws" }], 42) === 5, "leading whitespace before [#N] still matches");
   }
 
+  // ── #864: duplicate strict [#N] matches — prefer the MERGED one over a later
+  //    closed-unmerged duplicate (highest-PR-number tie-break would otherwise
+  //    pick the duplicate and the downstream row flips a CLOSED issue to
+  //    in_review, keeping the batch falsely "active" after the queue is cleared).
+  //    Concrete shape: issue #836 closed, merged PR #850, later closed-unmerged
+  //    duplicate PR #851 with the same `[#836]` title prefix.
+  {
+    const items = [
+      { number: 850, title: "[#836] real fix", pull_request: { merged_at: "2026-05-20T10:00:00Z" } },
+      { number: 851, title: "[#836] duplicate", pull_request: { merged_at: null } },
+    ];
+    ok(pickLinkedPrFromSearch(items, 836) === 850, "merged PR #850 wins over later closed-unmerged duplicate #851 (#864)");
+    // Reversed input order: merged should still win regardless of search-result ordering.
+    ok(pickLinkedPrFromSearch([...items].reverse(), 836) === 850, "merged-preferred selection is order-independent");
+    // Multiple merged + multiple unmerged → among merged, highest # still wins.
+    const multi = [
+      { number: 700, title: "[#42] old merge", pull_request: { merged_at: "2026-01-01T00:00:00Z" } },
+      { number: 705, title: "[#42] newer merge", pull_request: { merged_at: "2026-02-01T00:00:00Z" } },
+      { number: 800, title: "[#42] later dup",  pull_request: { merged_at: null } },
+    ];
+    ok(pickLinkedPrFromSearch(multi, 42) === 705, "among merged matches, highest PR number still wins; unmerged duplicate ignored");
+    // Zero merged matches → fall back to highest-PR-number across all matches (legacy behavior).
+    const noMerged = [
+      { number: 300, title: "[#9] open", pull_request: { merged_at: null } },
+      { number: 305, title: "[#9] newer open", pull_request: { merged_at: null } },
+    ];
+    ok(pickLinkedPrFromSearch(noMerged, 9) === 305, "no merged candidates → freshest (highest #) wins (unchanged)");
+    // Items without `pull_request` (defensive) treated as not-merged.
+    const noPrShape = [
+      { number: 500, title: "[#5] missing pr field" },
+      { number: 510, title: "[#5] also missing" },
+    ];
+    ok(pickLinkedPrFromSearch(noPrShape, 5) === 510, "missing pull_request field treated as not-merged → falls back to highest #");
+  }
+
   // ── #828 / RE1 #830: a Search FAILURE must NOT collapse to an authoritative
   //    no-PR (which would render an out-of-window OPEN issue as queued, or a
   //    CLOSED issue with a merged PR as closed). findLinkedPrByTitle returns

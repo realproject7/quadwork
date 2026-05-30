@@ -1128,8 +1128,14 @@ async function sendTriggerMessage(projectId) {
         const bp = await bpRes.json();
         // #810: gate auto-stop on completeConfirmed (two distinct successful
         // fetch cycles), NOT a single transient/stale `complete`.
-        if (bp && bp.completeConfirmed) {
-          console.log(`[auto-trigger] ${projectId}: batch complete (confirmed), auto-stopped`);
+        // #864: also auto-stop on an explicit operator clear (`liveActiveBatchCleared`).
+        // The preserved snapshot may keep `items` non-empty / `complete` mixed, so
+        // `completeConfirmed` alone won't fire when items don't all resolve as
+        // merged/closed (e.g. a duplicate unmerged PR). The cleared flag is the
+        // operator's intent and overrides those signals for lifecycle purposes.
+        const clearedByOperator = !!(bp && bp.liveActiveBatchCleared);
+        if (bp && (bp.completeConfirmed || clearedByOperator)) {
+          console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
           stopTrigger(projectId);
           // Also stop caffeinate if no other triggers remain running
           // (#441 companion fix). caffeinateProcess is global (not
@@ -1724,13 +1730,21 @@ async function autoStopPollingTick() {
       // #810: gate auto-stop on completeConfirmed (two distinct successful fetch
       // cycles), not a single transient/stale `complete`. Track prev on the
       // confirmed value so the bridge-stop transition guard fires on it.
+      // #864: an explicit operator clear (`liveActiveBatchCleared`) ALSO triggers
+      // the stop path, so trigger + bridges shut down when Head sets the Active
+      // Batch section to empty even if the preserved snapshot's items don't all
+      // resolve as merged/closed (e.g. a duplicate unmerged PR keeps the items
+      // in `in_review`). The cleared flag is the operator's intent.
       const confirmed = !!bp.completeConfirmed;
+      const clearedByOperator = !!bp.liveActiveBatchCleared;
+      const shouldStop = confirmed || clearedByOperator;
       const prev = _bridgeBatchPrev.get(project.id);
-      _bridgeBatchPrev.set(project.id, { complete: confirmed, hasItems });
+      _bridgeBatchPrev.set(project.id, { complete: shouldStop, hasItems });
 
-      if (bp && confirmed) {
+      if (bp && shouldStop) {
         if (hasTriggerAuto) {
-          console.log(`[auto-trigger] ${project.id}: batch complete (confirmed), auto-stopped (poller)`);
+          const reason = clearedByOperator ? "cleared by operator" : "complete (confirmed)";
+          console.log(`[auto-trigger] ${project.id}: batch ${reason}, auto-stopped (poller)`);
           stopTrigger(project.id);
           if (caffeinateProcess.process && triggers.size === 0) {
             try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
@@ -1746,7 +1760,9 @@ async function autoStopPollingTick() {
       }
 
       // #518: detect batch-start transition → auto-start bridges
-      if (hasBridgeAuto && hasItems && !bp.complete) {
+      // #864: do NOT auto-start on a cleared queue even though hasItems may be
+      // true from the preserved snapshot — the operator's clear is a stop signal.
+      if (hasBridgeAuto && hasItems && !bp.complete && !clearedByOperator) {
         const isNewBatch = !prev || prev.complete || !prev.hasItems;
         if (isNewBatch) {
           await autoStartBridges(project.id, project, qwPort);

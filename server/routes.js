@@ -2318,15 +2318,26 @@ function buildNoPrRow(issue) {
 // would also surface `[#807]` for n=80), so we re-apply the strict `^\s*\[#N\]`
 // regex the snapshot matcher uses. Returns the freshest matching PR number (or
 // null), treating a search failure as "no linked PR found".
-// Pure: pick the freshest PR (highest number) whose title matches the STRICT
-// `^\s*\[#N\]` convention from a set of REST search items. Guards `[#807]` from
-// matching n=80 even though Search's loose `in:title 80` would surface it.
-// Returns the PR number or null. Exported for unit tests.
+// Pure: pick the right PR whose title matches the STRICT `^\s*\[#N\]` convention
+// from a set of REST search items. Guards `[#807]` from matching n=80 even
+// though Search's loose `in:title 80` would surface it. Returns the PR number
+// or null. Exported for unit tests.
+//
+// #864: when more than one strict match exists (e.g. a closed-unmerged duplicate
+// opened after the real merged PR for the same issue), prefer a MERGED match
+// over an unmerged one — otherwise the highest-PR-number tie-break picks the
+// duplicate and downstream progress flips a CLOSED issue back to in_review,
+// keeping the batch falsely "active" after Head clears the queue. Within each
+// pool (merged-only when any merged exist, otherwise everything matched) we
+// still tie-break by highest PR number, preserving the existing freshest-wins
+// behavior for non-duplicate cases.
 function pickLinkedPrFromSearch(items, n) {
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
   const matches = (Array.isArray(items) ? items : []).filter((it) => titleRe.test((it && it.title) || ""));
   if (matches.length === 0) return null;
-  return matches.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
+  const merged = matches.filter((it) => it && it.pull_request && it.pull_request.merged_at);
+  const pool = merged.length > 0 ? merged : matches;
+  return pool.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
 }
 
 // The actual REST Search call, split out so findLinkedPrByTitle's
@@ -2464,8 +2475,17 @@ function summarizeItems(items) {
 // Active Batch section. Returns null when there's no progress payload (an
 // undefined input — current callers always pass a value), defensively
 // treated as "not active" at the route.
+//
+// #864: lifecycle consumers (this route, trigger auto-stop, reseed safe-boundary
+// checks via isActiveFromProgress) must NOT consider an explicitly cleared
+// `## Active Batch` section as active. resolveDisplayedBatch still serves the
+// preserved snapshot so /api/batch-progress can render the prior batch for
+// history, but the lifecycle signal must follow the operator's intent. The
+// `liveActiveBatchCleared` flag set by getOrComputeBatchProgress short-circuits
+// the items-based check below.
 function isBatchActiveFromProgress(progress) {
   if (!progress) return null;
+  if (progress.liveActiveBatchCleared) return false;
   const items = Array.isArray(progress.items) ? progress.items : [];
   return items.length > 0 && !progress.complete;
 }
@@ -2592,13 +2612,20 @@ async function getOrComputeBatchProgress(projectId) {
   // snapshot-aware helper so merged items stay visible after Head
   // moves them from Active Batch to Done, until a new batch starts.
   const { batchNumber, issueNumbers } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
+  // #864: lifecycle-signal flag. The displayed batch may be the preserved
+  // snapshot (so /api/batch-progress keeps showing it), but lifecycle consumers
+  // (/api/batch-active, trigger auto-stop, reseed safe-boundary) must follow
+  // the operator's explicit clear. Compute from the LIVE parse, only when the
+  // queue file actually read OK — the #316 bypass (queueReadOk=false) must NOT
+  // be mistaken for an explicit clear, since the operator never touched it.
+  const liveActiveBatchCleared = queueReadOk && parseActiveBatch(queueText).issueNumbers.length === 0;
   // #828 P2: batch identity = number + issue set. evalBatchCompleteConfirmed
   // resets its streak when this changes, so a new already-complete batch can't
   // inherit the prior batch's first cycle and confirm in one tick.
   const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
   if (issueNumbers.length === 0) {
     evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
-    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false };
+    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared };
     _batchProgressCache.set(projectId, { ts: Date.now(), data });
     return data;
   }
@@ -2631,7 +2658,7 @@ async function getOrComputeBatchProgress(projectId) {
   // before any auto-stop consumer may act on it (never auto-stop on a single
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
-  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed };
+  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared };
   _batchProgressCache.set(projectId, { ts: Date.now(), data });
   return data;
 }
