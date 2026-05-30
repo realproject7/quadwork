@@ -3,7 +3,8 @@
   "version": "2.2.1",
   "description": "Unified dashboard for multi-agent coding teams — 4 AI agents, one terminal",
   "bin": {
-    "quadwork": "./bin/quadwork.js"
+    "quadwork": "./bin/quadwork.js",
+    "quadwork-mcp-operator": "./server/mcp-operator.js"
   },
   "files": [
     "bin/",
