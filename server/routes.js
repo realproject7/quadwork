@@ -2961,6 +2961,168 @@ router.post("/api/setup", (req, res) => {
   }
 });
 
+// ─── Re-seed agents from current templates (#845) ──────────────────────────
+
+// Split an AGENTS.md into the leading "intro" text (above the first H2) plus
+// one block per `## H2` heading. Lines that begin with `## ` (exactly two
+// hashes + whitespace) start a new block; H1 / H3+ stay inside the current
+// block so subsections nested under an H2 are not orphaned.
+function _splitAgentsMdSections(text) {
+  const blocks = [];
+  let intro = [];
+  let current = null;
+  for (const line of String(text || "").split("\n")) {
+    const m = line.match(/^##\s+(.+?)\s*$/);
+    if (m) {
+      if (current) blocks.push(current);
+      current = { heading: m[1], body: "" };
+    } else if (current) {
+      current.body += (current.body ? "\n" : "") + line;
+    } else {
+      intro.push(line);
+    }
+  }
+  if (current) blocks.push(current);
+  return { intro: intro.join("\n"), blocks };
+}
+
+// Merge a fresh seed template with operator-added sections from the existing
+// worktree AGENTS.md. The fresh template wins for any H2 heading it defines
+// (so canonical role/workflow/communication sections always reflect current
+// rules), and any H2 block in the existing file whose heading is NOT in the
+// template is appended at the end under a marker comment. Heading comparison
+// is case-insensitive and whitespace-normalized.
+//
+// Returns { content, preservedHeadings }. If the existing content is empty
+// or has no custom sections, returns the fresh template verbatim.
+function reseedAgentsMd(existingContent, freshContent) {
+  if (!existingContent || !existingContent.trim()) {
+    return { content: freshContent, preservedHeadings: [] };
+  }
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
+  const fresh = _splitAgentsMdSections(freshContent);
+  const existing = _splitAgentsMdSections(existingContent);
+  const freshHeadings = new Set(fresh.blocks.map((b) => norm(b.heading)));
+  const preserved = existing.blocks.filter((b) => !freshHeadings.has(norm(b.heading)));
+  if (preserved.length === 0) {
+    return { content: freshContent, preservedHeadings: [] };
+  }
+  const trailer =
+    "\n\n<!-- Operator notes preserved from prior AGENTS.md (#845) -->\n\n" +
+    preserved
+      .map((b) => `## ${b.heading}\n${b.body}`.replace(/\s+$/, ""))
+      .join("\n\n");
+  const base = freshContent.replace(/\s+$/, "");
+  return {
+    content: base + trailer + "\n",
+    preservedHeadings: preserved.map((b) => b.heading),
+  };
+}
+
+// Operator-triggered re-seed of a project's worktree AGENTS.md files from
+// the current `templates/seeds/*.AGENTS.md` templates, using the same
+// placeholder substitution as the setup wizard's `seed-files` step. New
+// seed content (e.g. the #809 GITHUB.md discovery instructions) takes
+// effect on the NEXT agent restart — this endpoint only rewrites the file.
+//
+// Guard: refuses to run while the project's batch is active, so a re-seed
+// can't drop new instructions on agents in the middle of a task. Pass
+// `{ force: true }` to override (operator escape hatch — the file is only
+// re-read on next spawn, so even a forced re-seed is harmless to a live
+// session, but the guard makes the safe path obvious).
+router.post("/api/projects/:project/reseed-agents", async (req, res) => {
+  const projectId = req.params.project;
+  const body = req.body || {};
+  const force = body.force === true;
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
+  catch { return res.status(500).json({ ok: false, error: "Failed to read config" }); }
+  const project = cfg.projects?.find((p) => p.id === projectId);
+  if (!project) return res.status(404).json({ ok: false, error: "Project not found" });
+  const workingDir = project.working_dir;
+  if (!workingDir) return res.status(400).json({ ok: false, error: "Project has no working_dir" });
+
+  if (!force) {
+    // re1 review on #845: fail CLOSED when batch state can't be computed.
+    // Falling through to a re-seed when the gate is uncertain re-introduces
+    // the exact mid-batch rewrite the gate exists to prevent. Three cases
+    // route to the same "unknown" 503 (operator can retry or pass force:true):
+    //  1. getOrComputeBatchProgress throws (network/IO)
+    //  2. getOrComputeBatchProgress returns null (no repo / no progress data)
+    //  3. isBatchActiveFromProgress returns null (no items payload)
+    let active;
+    try {
+      const progress = await getOrComputeBatchProgress(projectId);
+      active = isBatchActiveFromProgress(progress);
+    } catch {
+      return res.status(503).json({
+        ok: false,
+        error: "Could not verify batch state — aborting to avoid a mid-batch re-seed. Retry, or pass force:true to override.",
+        batchUnknown: true,
+      });
+    }
+    if (active === null) {
+      return res.status(503).json({
+        ok: false,
+        error: "Batch state unknown (no progress data) — aborting to avoid a mid-batch re-seed. Retry, or pass force:true to override.",
+        batchUnknown: true,
+      });
+    }
+    if (active) {
+      return res.status(409).json({
+        ok: false,
+        error: "Batch is active — re-seed deferred to avoid mid-batch instruction drift. Pass force:true to override; new seed content only takes effect on next agent restart.",
+        batchActive: true,
+      });
+    }
+  }
+
+  const dirName = path.basename(workingDir);
+  const parentDir = path.dirname(workingDir);
+  const reviewerUser = body.reviewerUser ?? cfg.reviewer_github_user ?? "";
+  const reviewerTokenPath = body.reviewerTokenPath || path.join(os.homedir(), ".quadwork", "reviewer-token");
+
+  const agents = ["head", "re1", "re2", "dev"];
+  const reseeded = [];
+  const preserved = {};
+  const skipped = [];
+  for (const agent of agents) {
+    const wtDir = path.join(parentDir, `${dirName}-${agent}`);
+    if (!fs.existsSync(wtDir)) { skipped.push(`${agent} (no worktree)`); continue; }
+    const seedSrc = path.join(TEMPLATES_DIR, "seeds", `${agent}.AGENTS.md`);
+    if (!fs.existsSync(seedSrc)) {
+      return res.status(500).json({
+        ok: false,
+        error: `Missing seed template: templates/seeds/${agent}.AGENTS.md`,
+      });
+    }
+    let freshContent = fs.readFileSync(seedSrc, "utf-8");
+    freshContent = freshContent
+      .replace(/\{\{reviewer_github_user\}\}/g, reviewerUser)
+      .replace(/\{\{reviewer_token_path\}\}/g, reviewerTokenPath)
+      .replace(/\{\{project_name\}\}/g, dirName);
+
+    const agentsMd = path.join(wtDir, "AGENTS.md");
+    let existing = "";
+    if (fs.existsSync(agentsMd)) {
+      try { existing = fs.readFileSync(agentsMd, "utf-8"); } catch { existing = ""; }
+    }
+    const merged = reseedAgentsMd(existing, freshContent);
+    fs.writeFileSync(agentsMd, merged.content);
+    reseeded.push(`${agent}/AGENTS.md`);
+    if (merged.preservedHeadings.length > 0) {
+      preserved[agent] = merged.preservedHeadings;
+    }
+  }
+  return res.json({
+    ok: true,
+    reseeded,
+    skipped,
+    preserved,
+    note: "Re-seeded files take effect on next agent restart.",
+  });
+});
+
 // ─── Rename ────────────────────────────────────────────────────────────────
 
 function replaceInFile(filePath, oldStr, newStr) {
@@ -3517,6 +3679,10 @@ module.exports.ghApiConditional = ghApiConditional;
 module.exports.GH_LIST_MAX_BUFFER = GH_LIST_MAX_BUFFER;
 // #839: expose the completion-aware sidebar-heartbeat helper for unit tests.
 module.exports.isBatchActiveFromProgress = isBatchActiveFromProgress;
+// #845: expose the AGENTS.md re-seed merger so the placeholder substitution +
+// custom-section preservation contract is exercisable without spinning up a
+// real worktree. Pure function; no production callers outside this file.
+module.exports.reseedAgentsMd = reseedAgentsMd;
 // #839 (re1 follow-up): expose the shared compute path plus the caches it
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
