@@ -1904,6 +1904,16 @@ server.listen(PORT, "127.0.0.1", async () => {
 
   runStartupMigrations(startupCfg);
 
+  // #856: Auto-reseed worktree AGENTS.md when the package version changes.
+  // Per-project completion state lives in ~/.quadwork/reseed-state.json, so
+  // projects deferred mid-batch stay pending and retry on the next startup.
+  // Failures here MUST NOT block server boot.
+  try {
+    await routes.autoReseedOnStartup(startupCfg);
+  } catch (err) {
+    console.error(`[reseed] auto-reseed failed: ${err.message}`);
+  }
+
   if (startupCfg.butler && startupCfg.butler.enabled && startupCfg.butler.auto_start) {
     const result = spawnButlerPty();
     if (result.ok) console.log(`[butler] auto-started (PID: ${result.pid})`);
