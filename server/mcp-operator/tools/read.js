@@ -29,7 +29,7 @@ module.exports = {
     {
       name: "batch_status",
       description:
-        "Get a project's overnight-batch status as { active, progress }, merged from /api/batch-active and /api/batch-progress. CAVEAT (#864): `active:true` can persist after Head clears the queue (preserved-snapshot / duplicate-PR edge); do NOT treat active:true as authoritative for 'work remaining' until #864 lands.",
+        "Get a project's overnight-batch status as { active, progress }, merged from /api/batch-active and /api/batch-progress. `active` reflects the live `## Active Batch` lifecycle — once Head clears the queue, active drops to false — so it is authoritative for 'work remaining'. `progress` may keep rendering a just-completed batch (sticky display) even after active is false.",
       inputSchema: {
         type: "object",
         properties: {
