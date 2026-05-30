@@ -172,7 +172,7 @@ When @dev asks `@re1 @re2 please review ticket #<n>`, you are reviewing a GitHub
 ### pr-review batches (merged PRs)
 When @dev asks `@re1 @re2 review merged PR #<n>`, the PR is **already merged into `main`** — you assess the landed change, you do not block a merge.
 
-1. Read via REST `gh api repos/<repo>/pulls/<n>`, `.../pulls/<n>/files`, and `gh api repos/<repo>/issues/<n>` (the linked issue). `git pull` to read the merged code locally.
+1. Read the merged PR + diff via REST `gh api repos/<repo>/pulls/<n>` and `.../pulls/<n>/files`. Then **derive the linked TICKET number** (from `GITHUB.md`, the PR title's `[#<issue>]`, or the PR body's `Fixes #<issue>` / `Closes #<issue>`) and fetch that ticket: `gh api repos/<repo>/issues/<linked-ticket>` (+ `/comments` if needed) — the spec/acceptance criteria to judge the change against. Do NOT use `issues/<pr-number>`: for a PR number that returns the PR itself, not the ticket. `git pull` to read the merged code locally.
 2. Assess against a **merged-PR rubric**: does it do what the ticket asked? regressions introduced? security issues? tests adequate for the change?
 3. Deliver findings to @dev, **line-referenced**. Findings become **follow-up fix tickets** (Dev files them) — there is no "fix this PR" step; the PR is already in `main`. Sign off (APPROVE) once you've assessed the change and any findings are captured as follow-ups.
 
