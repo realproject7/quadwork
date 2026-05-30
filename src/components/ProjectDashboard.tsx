@@ -5,6 +5,7 @@ import PanelHeader from "./PanelHeader";
 import InfoTooltip from "./InfoTooltip";
 import ChatPanel from "./ChatPanel";
 import GitHubPanel from "./GitHubPanel";
+import GitHubRateLimitBadge from "./GitHubRateLimitBadge";
 import ControlBar from "./ControlBar";
 import AgentTerminalsGrid from "./AgentTerminalsGrid";
 import OperatorFeaturesPanel from "./OperatorFeaturesPanel";
@@ -319,7 +320,10 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             <InfoTooltip>
               {t.githubTooltip}
             </InfoTooltip>
-          } />
+          }>
+            {/* #866: always-on rate-limit status badge, top-right of the GITHUB header */}
+            <GitHubRateLimitBadge />
+          </PanelHeader>
           <div className="flex-1 min-h-0">
             <GitHubPanel projectId={projectId} idle={idle} />
           </div>

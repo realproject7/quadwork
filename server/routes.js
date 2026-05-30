@@ -59,6 +59,14 @@ const _graphqlRateLimit = {
   resetAt: 0,        // epoch ms
   updatedAt: 0,      // epoch ms when we last fetched
 };
+// #866: search is a separate, much smaller bucket (30/min). Tracked only for
+// the always-on header badge — no server-side gh call gates on it.
+const _searchRateLimit = {
+  limit: 30,
+  remaining: 30,
+  resetAt: 0,        // epoch ms
+  updatedAt: 0,      // epoch ms when we last fetched
+};
 const RATE_LIMIT_POLL_MS = 60_000;       // refresh every 60s
 const RATE_LIMIT_LOW_THRESHOLD = 200;    // below this → back off
 const RATE_LIMIT_CRITICAL = 50;          // below this → stop all infra gh calls
@@ -66,11 +74,13 @@ let _rateLimitTimer = null;
 
 async function refreshRateLimit() {
   try {
-    // One `gh api rate_limit` call returns every resource bucket; grab both
-    // core (REST) and graphql so each stream can gate on its own budget (#802).
+    // One `gh api rate_limit` call returns every resource bucket; grab core
+    // (REST), graphql and search. core/graphql each gate their own stream
+    // (#802); search is display-only for the header badge (#866). The
+    // rate_limit endpoint is itself exempt — zero budget cost.
     const { stdout } = await _execFileAsync("gh", [
       "api", "rate_limit", "--jq",
-      "{core: (.resources.core | {limit,remaining,reset}), graphql: (.resources.graphql | {limit,remaining,reset})}",
+      "{core: (.resources.core | {limit,remaining,reset}), graphql: (.resources.graphql | {limit,remaining,reset}), search: (.resources.search | {limit,remaining,reset})}",
     ], { encoding: "utf-8", timeout: 10000 });
     const data = JSON.parse(stdout);
     _rateLimit.limit = data.core.limit;
@@ -83,6 +93,12 @@ async function refreshRateLimit() {
       _graphqlRateLimit.remaining = data.graphql.remaining;
       _graphqlRateLimit.resetAt = data.graphql.reset * 1000;
       _graphqlRateLimit.updatedAt = Date.now();
+    }
+    if (data.search) {
+      _searchRateLimit.limit = data.search.limit;
+      _searchRateLimit.remaining = data.search.remaining;
+      _searchRateLimit.resetAt = data.search.reset * 1000;
+      _searchRateLimit.updatedAt = Date.now();
     }
   } catch (err) {
     _rateLimit.error = err.message;
@@ -932,11 +948,23 @@ router.get("/api/projects", async (req, res) => {
 
 // ─── GitHub Rate Limit (#554) ──────────────────────────────────────────────
 
+// #866: expose each bucket as { limit, remaining, resetInMinutes, resetAt }
+// so the header badge can color core / graphql / search independently.
+function bucketView(b) {
+  return {
+    limit: b.limit,
+    remaining: b.remaining,
+    resetAt: b.resetAt,
+    resetInMinutes: b.resetAt > Date.now() ? Math.ceil((b.resetAt - Date.now()) / 60000) : 0,
+  };
+}
+
 router.get("/api/github/rate-limit", (_req, res) => {
   const resetIn = _rateLimit.resetAt > Date.now()
     ? Math.ceil((_rateLimit.resetAt - Date.now()) / 60000)
     : 0;
   res.json({
+    // Top-level fields are core (REST), kept for the existing alert banner.
     limit: _rateLimit.limit,
     remaining: _rateLimit.remaining,
     resetAt: _rateLimit.resetAt,
@@ -945,6 +973,10 @@ router.get("/api/github/rate-limit", (_req, res) => {
     critical: isRateLimited(),
     updatedAt: _rateLimit.updatedAt,
     error: _rateLimit.error,
+    // #866: per-bucket detail for the always-on header badge.
+    core: bucketView(_rateLimit),
+    graphql: bucketView(_graphqlRateLimit),
+    search: bucketView(_searchRateLimit),
   });
 });
 
