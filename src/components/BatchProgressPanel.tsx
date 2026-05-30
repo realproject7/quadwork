@@ -12,9 +12,13 @@ interface BatchProgressItem {
   // #350: "closed" = issue CLOSED with no linked PR (superseded,
   // not planned, or runbook-only). Rendered at 100% like merged
   // but with a distinct label from the server.
-  status: "queued" | "in_review" | "approved1" | "ready" | "merged" | "closed" | "unknown";
+  // #871: review batches add "approved" / "changes_requested" statuses.
+  status: "queued" | "in_review" | "approved1" | "ready" | "merged" | "closed" | "approved" | "changes_requested" | "unknown";
   progress: number; // 0..100
   label: string;
+  // #871: present only on review-batch items (extends the shape from #870).
+  review_state?: "queued" | "in-review" | "approved" | "changes-requested";
+  approvals?: number; // 0..2
 }
 
 interface BatchProgressData {
@@ -22,6 +26,8 @@ interface BatchProgressData {
   items: BatchProgressItem[];
   summary: string;
   complete: boolean;
+  // #870/#871: "code" (default) | "ticket-review" | "pr-review".
+  batch_type?: "code" | "ticket-review" | "pr-review";
 }
 
 interface BatchProgressPanelProps {
@@ -38,7 +44,17 @@ const COPY = {
     currentBatch: (n: number | string) => `Current Batch: Batch ${n}`,
     complete: "✅ COMPLETE",
     allMerged: (n: number) => `All ${n} items merged. Waiting for the next batch.`,
+    // #871: review batches never "merge" — use review wording.
+    allReviewed: (n: number) => `All ${n} items approved. Waiting for the next batch.`,
     itemsCount: (n: number) => `(${n} items)`,
+    // #871: review-state labels (mirror the existing PR approval wording).
+    rs: { queued: "queued", inReview: "in review", oneOfTwo: "1 of 2 approvals", approved: "approved", changesRequested: "changes requested" },
+    reviewSummary: (approved: number, total: number, needSecond: number, changes: number) => {
+      const parts = [`${approved}/${total} reviewed`];
+      if (needSecond > 0) parts.push(`${needSecond} need 2nd approval`);
+      if (changes > 0) parts.push(`${changes} changes requested`);
+      return parts.join(" · ");
+    },
     tooltip: (
       <>
         <b>Current Batch</b> — progress tracker for the active batch. Polls GitHub to resolve each issue&apos;s status (queued &rarr; in review &rarr; approved &rarr; merged).
@@ -53,7 +69,17 @@ const COPY = {
     currentBatch: (n: number | string) => `현재 배치: ${n}번`,
     complete: "✅ 완료",
     allMerged: (n: number) => `${n}개 항목 모두 병합됨. 다음 배치를 기다리는 중.`,
+    // #871: 리뷰 배치는 병합되지 않음 — 리뷰 문구 사용.
+    allReviewed: (n: number) => `${n}개 항목 모두 승인됨. 다음 배치를 기다리는 중.`,
     itemsCount: (n: number) => `(${n}개 항목)`,
+    // #871: 리뷰 상태 라벨.
+    rs: { queued: "대기 중", inReview: "검토 중", oneOfTwo: "2명 중 1명 승인", approved: "승인됨", changesRequested: "변경 요청됨" },
+    reviewSummary: (approved: number, total: number, needSecond: number, changes: number) => {
+      const parts = [`${approved}/${total} 검토됨`];
+      if (needSecond > 0) parts.push(`${needSecond}건 2차 승인 필요`);
+      if (changes > 0) parts.push(`${changes}건 변경 요청`);
+      return parts.join(" · ");
+    },
     tooltip: (
       <>
         <b>현재 배치</b> - 활성 배치 진행 상황 추적기입니다. GitHub를 조회해 각 이슈 상태를 대기 → 검토 중 → 승인 → 병합 순으로 추적합니다.
@@ -61,6 +87,17 @@ const COPY = {
     ),
   },
 } as const;
+
+// #871: localized label for a review-batch item, derived from review_state.
+function reviewLabel(item: BatchProgressItem, rs: { queued: string; inReview: string; oneOfTwo: string; approved: string; changesRequested: string }): string {
+  switch (item.review_state) {
+    case "approved": return rs.approved;
+    case "changes-requested": return rs.changesRequested;
+    case "in-review": return (item.approvals ?? 0) >= 1 ? rs.oneOfTwo : rs.inReview;
+    case "queued":
+    default: return rs.queued;
+  }
+}
 
 const BAR_SEGMENTS = 20;
 
@@ -141,7 +178,11 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
     );
   }
 
-  // Complete state — all items merged.
+  // #871: review batches (ticket-review / pr-review) render review states +
+  // review wording; code batches keep the existing merge-based path.
+  const isReview = data.batch_type === "ticket-review" || data.batch_type === "pr-review";
+
+  // Complete state — all items merged (code) / approved (review).
   if (data.complete) {
     return (
       <div className="border-t border-border">
@@ -152,7 +193,7 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
           <span className="text-[10px] text-accent">{t.complete}</span>
         </div>
         <div className="px-3 pb-2 text-[11px] text-text-muted">
-          {t.allMerged(data.items.length)}
+          {isReview ? t.allReviewed(data.items.length) : t.allMerged(data.items.length)}
         </div>
       </div>
     );
@@ -171,6 +212,12 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
       </div>
       <div className="max-h-40 overflow-y-auto">
         {data.items.map((item) => {
+          // #871: review item → localized review-state label; changes-requested
+          // gets the warning token. Code items (no review_state) use the
+          // server label exactly as before.
+          const isReviewItem = !!item.review_state;
+          const displayLabel = isReviewItem ? reviewLabel(item, t.rs) : item.label;
+          const isChanges = item.review_state === "changes-requested";
           const row = (
             <div className="flex items-center gap-2 px-3 py-1 font-mono">
               <span className="text-[11px] text-text-muted w-8 shrink-0 tabular-nums">
@@ -180,8 +227,8 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
               <span className="text-[11px] text-text-muted tabular-nums shrink-0 w-9 text-right">
                 {item.progress}%
               </span>
-              <span className="text-[11px] text-text truncate flex-1 min-w-0">
-                {item.label}
+              <span className={`text-[11px] truncate flex-1 min-w-0 ${isChanges ? "text-warning" : "text-text"}`}>
+                {displayLabel}
               </span>
             </div>
           );
@@ -201,11 +248,23 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
           );
         })}
       </div>
-      {data.summary && (
-        <div className="px-3 py-1.5 text-[11px] text-text-muted border-t border-border/40">
-          {data.summary}
-        </div>
-      )}
+      {(() => {
+        // #871: review batches show "N/M reviewed · K need 2nd approval"
+        // (computed from review_state/approvals); code batches use the
+        // server-provided summary unchanged.
+        let summaryText = data.summary;
+        if (isReview) {
+          const approved = data.items.filter((it) => it.review_state === "approved").length;
+          const needSecond = data.items.filter((it) => it.review_state === "in-review" && (it.approvals ?? 0) >= 1).length;
+          const changes = data.items.filter((it) => it.review_state === "changes-requested").length;
+          summaryText = t.reviewSummary(approved, data.items.length, needSecond, changes);
+        }
+        return summaryText ? (
+          <div className="px-3 py-1.5 text-[11px] text-text-muted border-t border-border/40">
+            {summaryText}
+          </div>
+        ) : null;
+      })()}
     </div>
   );
 }
