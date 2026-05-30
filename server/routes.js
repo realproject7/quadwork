@@ -2446,10 +2446,37 @@ function summarizeItems(items) {
   return parts.join(" · ");
 }
 
+// #839: derive the sidebar heartbeat-active flag from a batch-progress payload
+// so the pulse means "batch actively in progress", not just "Active Batch
+// section non-empty". Once `complete` is true (every item merged/closed —
+// see /api/batch-progress at items.every(...merged||closed)), the pulse must
+// stop even if Head leaves a parked/blocked ticket lingering in the Active
+// Batch section. Returns null when there's no progress payload, signalling
+// the caller to fall back to the cheap file-only check (so cache-miss
+// projects keep their prior behavior until batch-progress runs once).
+function isBatchActiveFromProgress(progress) {
+  if (!progress) return null;
+  const items = Array.isArray(progress.items) ? progress.items : [];
+  return items.length > 0 && !progress.complete;
+}
+
 router.get("/api/batch-active", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
   if (!getRepo(projectId)) return res.status(400).json({ error: "No repo configured for project" });
+
+  // #839: prefer the batch-progress cache for completion-awareness. Cache is
+  // populated by /api/batch-progress (panel polls) and updated each pass, so
+  // for any project whose panel has been opened we get the same `complete`
+  // truth the panel itself displays. No new gh calls fire from this 30s
+  // sidebar poll — sidebar.Sidebar.tsx polls all projects, so cost matters.
+  const cached = _batchProgressCache.get(projectId);
+  const fromProgress = isBatchActiveFromProgress(cached && cached.data);
+  if (fromProgress !== null) return res.json({ active: fromProgress });
+
+  // Cache-miss fallback (project's progress hasn't been computed yet) —
+  // preserve the prior file-only behavior so this endpoint stays cheap on
+  // first paint. As soon as /api/batch-progress runs once it takes over.
   const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
   let active = false;
   try {
@@ -3477,6 +3504,8 @@ module.exports._coalesce = _coalesce;
 // the >1MB closed-PR page regression test.
 module.exports.ghApiConditional = ghApiConditional;
 module.exports.GH_LIST_MAX_BUFFER = GH_LIST_MAX_BUFFER;
+// #839: expose the completion-aware sidebar-heartbeat helper for unit tests.
+module.exports.isBatchActiveFromProgress = isBatchActiveFromProgress;
 module.exports.restIssueToCanonical = restIssueToCanonical;
 module.exports.restClosedIssueToCanonical = restClosedIssueToCanonical;
 module.exports.restMergedPrToCanonical = restMergedPrToCanonical;
