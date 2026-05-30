@@ -35,6 +35,7 @@ Step-by-step guides for setting up QuadWork, designed for both humans and AI cod
 - **[Windows Installation](docs/install-windows.md)** — local setup via WSL2 (Windows Subsystem for Linux)
 - **[VPS Installation](docs/install-vps.md)** — remote server (Hetzner/Ubuntu) with domain + SSL
 - **[Troubleshooting](docs/troubleshooting.md)** — common issues and fixes
+- **[Operator MCP](docs/operator-mcp.md)** — drive QuadWork from a Claude agent (`claude mcp add quadwork -- quadwork-mcp-operator --port 8400`)
 
 > **For AI agents:** These guides contain complete step-by-step instructions. When your operator asks you to install or troubleshoot QuadWork, read the relevant guide and follow it.
 
