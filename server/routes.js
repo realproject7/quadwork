@@ -67,13 +67,16 @@ const _searchRateLimit = {
   resetAt: 0,        // epoch ms
   updatedAt: 0,      // epoch ms when we last fetched
 };
-// #886: the reviewer-token account is a SEPARATE, per-account GitHub rate-limit
-// budget (reviewers run gh as `reviewer_github_user`). Polled with the reviewer
-// token in a second exempt `rate_limit` call. Null until a reviewer token is
-// configured + resolves — single-account setups stay null and the badge shows
-// nothing extra. Shape: { login, core, graphql, search } where each bucket is
-// { limit, remaining, resetAt(ms) }, plus updatedAt/error.
-let _reviewerRateLimit = null;
+// #886/#893: the reviewer-token account is a SEPARATE, per-account GitHub
+// rate-limit budget (reviewers run gh as a different account). #893 makes this
+// project-aware: the reviewer token path is resolved per project from that
+// project's reviewer worktree AGENTS.md (the path reseed preserves), so a custom
+// per-worktree token is monitored — not just cfg/default. Polled on demand from
+// the /api/github/rate-limit endpoint and cached PER TOKEN PATH (exempt
+// rate_limit call → zero billable cost). Entry shape:
+// { ts, login, core, graphql, search, error } where each bucket is
+// { limit, remaining, resetAt(ms) }.
+const _reviewerRateLimitByPath = new Map(); // tokenPath → entry
 const RATE_LIMIT_POLL_MS = 60_000;       // refresh every 60s
 const RATE_LIMIT_LOW_THRESHOLD = 200;    // below this → back off
 const RATE_LIMIT_CRITICAL = 50;          // below this → stop all infra gh calls
@@ -111,29 +114,50 @@ async function refreshRateLimit() {
     _rateLimit.error = err.message;
     _rateLimit.updatedAt = Date.now();
   }
-  // #886: also poll the reviewer-token account (separate budget). Independent
-  // try/catch inside — a reviewer failure never affects the main poll above.
-  await refreshReviewerRateLimit();
+  // #893: the reviewer-token poll is no longer on the timer — it is project-
+  // aware and driven on demand from the /api/github/rate-limit endpoint.
 }
 
-// #886: second exempt `rate_limit` poll as the reviewer-token account, so the
-// dashboard covers BOTH GitHub budgets (per-account, not aggregated). Resolves
-// the reviewer token path the same way reseed does (configured path → default
-// ~/.quadwork/reviewer-token); no token → clears the reviewer state (omitted
-// from the payload, single-account behavior unchanged). `rate_limit` is exempt,
-// so this adds zero billable cost.
-async function refreshReviewerRateLimit() {
+// #893: resolve the reviewer token path for a request. For a known project,
+// the worktree-extracted path WINS (matches reseed's preservation order — it is
+// the actual path that project's reviewer agents currently use): re1's worktree
+// AGENTS.md first, then re2's. Falls back to cfg.reviewer_token_path → default
+// for a no-project / unknown-project request (backward compatible with #886).
+// Returns { path, source: "worktree" | "config" | "default" }.
+function _resolveReviewerTokenPath(projectId) {
   let cfg = {};
-  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { /* default-config / unreadable → use {} */ }
-  const tokenPath = cfg.reviewer_token_path || path.join(os.homedir(), ".quadwork", "reviewer-token");
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { /* default-config / unreadable */ }
+  const defaultPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
+  const project = projectId ? (cfg.projects || []).find((p) => p.id === projectId) : null;
+  if (project) {
+    const targets = _resolveReseedTargets(project); // [{ canonical, wtDir }, ...]
+    for (const role of ["re1", "re2"]) {
+      const t = targets.find((x) => x.canonical === role);
+      if (!t) continue;
+      try {
+        const agentsMd = fs.readFileSync(path.join(t.wtDir, "AGENTS.md"), "utf-8");
+        const extracted = _extractReviewerTokenPath(agentsMd);
+        if (extracted) return { path: extracted, source: "worktree" };
+      } catch { /* worktree / AGENTS.md missing → try next role */ }
+    }
+  }
+  if (cfg.reviewer_token_path) return { path: cfg.reviewer_token_path, source: "config" };
+  return { path: defaultPath, source: "default" };
+}
+
+// #886/#893: poll one reviewer token path (exempt `rate_limit` call as that
+// token's account) and cache the result keyed by path. No/empty token → drop
+// the cache entry (omitted from the payload). `login` is the label to attach
+// (null when it can't be proven to match a custom token — see getReviewerRateLimit).
+async function refreshReviewerForPath(tokenPath, login) {
   let token = "";
   try {
     token = fs.readFileSync(tokenPath, "utf-8").trim();
   } catch {
-    _reviewerRateLimit = null; // no reviewer token configured → single-account
+    _reviewerRateLimitByPath.delete(tokenPath); // no reviewer token here → omit
     return;
   }
-  if (!token) { _reviewerRateLimit = null; return; }
+  if (!token) { _reviewerRateLimitByPath.delete(tokenPath); return; }
   try {
     const { stdout } = await _execFileAsync("gh", [
       "api", "rate_limit", "--jq",
@@ -141,22 +165,56 @@ async function refreshReviewerRateLimit() {
     ], { encoding: "utf-8", timeout: 10000, env: { ...process.env, GH_TOKEN: token } });
     const data = JSON.parse(stdout);
     const toBucket = (b) => ({ limit: b.limit, remaining: b.remaining, resetAt: b.reset * 1000 });
-    _reviewerRateLimit = {
-      login: cfg.reviewer_github_user || null,
+    _reviewerRateLimitByPath.set(tokenPath, {
+      ts: Date.now(),
+      login: login || null,
       core: data.core ? toBucket(data.core) : null,
       graphql: data.graphql ? toBucket(data.graphql) : null,
       search: data.search ? toBucket(data.search) : null,
-      updatedAt: Date.now(),
       error: null,
-    };
+    });
   } catch (err) {
-    // Preserve prior bucket data if any; just flag the error + timestamp.
-    _reviewerRateLimit = {
-      ...(_reviewerRateLimit || { login: cfg.reviewer_github_user || null, core: null, graphql: null, search: null }),
-      updatedAt: Date.now(),
+    const prev = _reviewerRateLimitByPath.get(tokenPath);
+    _reviewerRateLimitByPath.set(tokenPath, {
+      ...(prev || { core: null, graphql: null, search: null }),
+      ts: Date.now(),
+      login: login || null,
       error: err.message,
-    };
+    });
   }
+}
+
+// #893: resolve the reviewer token path for `projectId`, (re)poll it if the
+// per-path cache is stale, and return the cache entry (or null). Login: only
+// trust cfg.reviewer_github_user for the cfg/default sources — a custom
+// worktree token may be a DIFFERENT account, so omit the label there rather than
+// show a stale/mismatched login.
+async function getReviewerRateLimit(projectId) {
+  const { path: tokenPath, source } = _resolveReviewerTokenPath(projectId);
+  let login = null;
+  if (source !== "worktree") {
+    try { login = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")).reviewer_github_user || null; } catch { /* none */ }
+  }
+  const cached = _reviewerRateLimitByPath.get(tokenPath);
+  if (!cached || Date.now() - cached.ts >= RATE_LIMIT_POLL_MS) {
+    await refreshReviewerForPath(tokenPath, login);
+  } else if (cached.login !== login) {
+    // Path unchanged but the label resolution changed — update without re-polling.
+    _reviewerRateLimitByPath.set(tokenPath, { ...cached, login });
+  }
+  return _reviewerRateLimitByPath.get(tokenPath) || null;
+}
+
+// #886/#893: build the reviewer block from a cache entry, or null when there's
+// no token / no bucket data (key omitted → single-account view unchanged).
+function reviewerRateLimitPayload(entry) {
+  if (!entry || (!entry.core && !entry.graphql && !entry.search)) return null;
+  const out = {};
+  if (entry.login) out.login = entry.login;
+  if (entry.core) out.core = bucketView(entry.core);
+  if (entry.graphql) out.graphql = bucketView(entry.graphql);
+  if (entry.search) out.search = bucketView(entry.search);
+  return out;
 }
 
 function startRateLimitPolling() {
@@ -1012,24 +1070,18 @@ function bucketView(b) {
   };
 }
 
-// #886: build the reviewer-account block for the response, or null when no
-// reviewer token is configured / no bucket data yet (single-account setups →
-// key omitted, badge unchanged).
-function reviewerRateLimitPayload() {
-  const r = _reviewerRateLimit;
-  if (!r || (!r.core && !r.graphql && !r.search)) return null;
-  const out = {};
-  if (r.login) out.login = r.login;
-  if (r.core) out.core = bucketView(r.core);
-  if (r.graphql) out.graphql = bucketView(r.graphql);
-  if (r.search) out.search = bucketView(r.search);
-  return out;
-}
-
-router.get("/api/github/rate-limit", (_req, res) => {
+router.get("/api/github/rate-limit", async (req, res) => {
   const resetIn = _rateLimit.resetAt > Date.now()
     ? Math.ceil((_rateLimit.resetAt - Date.now()) / 60000)
     : 0;
+  // #893: project-aware reviewer budget. `?project=<id>` resolves the reviewer
+  // token from that project's reviewer worktree (custom paths included); no /
+  // unknown project → cfg/default (back-compatible with #886).
+  const projectId = typeof req.query.project === "string" ? req.query.project : null;
+  let reviewer = null;
+  try {
+    reviewer = reviewerRateLimitPayload(await getReviewerRateLimit(projectId));
+  } catch { /* reviewer block is best-effort; never fail the core response */ }
   res.json({
     // Top-level fields are core (REST), kept for the existing alert banner.
     limit: _rateLimit.limit,
@@ -1044,8 +1096,9 @@ router.get("/api/github/rate-limit", (_req, res) => {
     core: bucketView(_rateLimit),
     graphql: bucketView(_graphqlRateLimit),
     search: bucketView(_searchRateLimit),
-    // #886: reviewer-token account (separate budget), present only when configured.
-    ...(reviewerRateLimitPayload() ? { reviewer: reviewerRateLimitPayload() } : {}),
+    // #886/#893: reviewer-token account (separate budget), present only when a
+    // reviewer token resolves for the requested project (or cfg/default).
+    ...(reviewer ? { reviewer } : {}),
   });
 });
 
@@ -4254,8 +4307,10 @@ module.exports._canonicalAgentSlug = _canonicalAgentSlug;
 // #854: expose the GH_TOKEN path extractor so the parse forms (`export`,
 // double-quoted, inner-quoted, etc.) are exercisable without a temp fs.
 module.exports._extractReviewerTokenPath = _extractReviewerTokenPath;
-// #886: expose the reviewer-account rate-limit poll + payload builder for tests.
-module.exports.refreshReviewerRateLimit = refreshReviewerRateLimit;
+// #886/#893: expose the project-aware reviewer rate-limit resolver/poll/payload
+// for tests.
+module.exports._resolveReviewerTokenPath = _resolveReviewerTokenPath;
+module.exports.getReviewerRateLimit = getReviewerRateLimit;
 module.exports.reviewerRateLimitPayload = reviewerRateLimitPayload;
 // #856: expose the auto-reseed startup hook + supporting state/version
 // helpers. server/index.js calls `autoReseedOnStartup` after config is

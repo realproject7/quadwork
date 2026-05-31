@@ -66,13 +66,18 @@ function bucketSpans(items: { label: string; b?: Bucket }[]) {
     ));
 }
 
-export default function GitHubRateLimitBadge() {
+export default function GitHubRateLimitBadge({ projectId }: { projectId?: string }) {
   const [data, setData] = useState<RateLimitResponse | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    // #893: pass the current project so the reviewer budget resolves from THIS
+    // project's reviewer worktree token (custom paths), not an arbitrary one.
+    const url = projectId
+      ? `/api/github/rate-limit?project=${encodeURIComponent(projectId)}`
+      : "/api/github/rate-limit";
     const load = () => {
-      fetch("/api/github/rate-limit")
+      fetch(url)
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
           if (!cancelled && d) setData(d);
@@ -85,7 +90,7 @@ export default function GitHubRateLimitBadge() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [projectId]);
 
   // Degrade gracefully: render nothing until we have data.
   const mainSpans = data

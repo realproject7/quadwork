@@ -322,7 +322,8 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             </InfoTooltip>
           }>
             {/* #866: always-on rate-limit status badge, top-right of the GITHUB header */}
-            <GitHubRateLimitBadge />
+            {/* #893: pass projectId so the reviewer budget resolves per project */}
+            <GitHubRateLimitBadge projectId={projectId} />
           </PanelHeader>
           <div className="flex-1 min-h-0">
             <GitHubPanel projectId={projectId} idle={idle} />
