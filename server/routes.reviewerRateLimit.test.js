@@ -1,10 +1,10 @@
-// #886: reviewer-token rate-limit poll tests. Verifies the second exempt
-// `gh api rate_limit` poll runs as the reviewer token, exposes a `reviewer`
-// payload (separate per-account budget), and is omitted on single-account
-// setups. Plain node:assert script (run with `node ...`).
+// #886/#893: project-aware reviewer rate-limit tests. #893 resolves the reviewer
+// token path from the selected project's reviewer worktree AGENTS.md (custom
+// paths), with worktree winning over cfg, and omits a stale login for a custom
+// token. Plain node:assert-style script.
 //
-// Stubs child_process.execFile (so the gh call is observable + the GH_TOKEN env
-// is captured) and fs.readFileSync (config + token file) BEFORE require.
+// Stubs child_process.execFile (custom-promisify, captures GH_TOKEN) and
+// fs.readFileSync (config + AGENTS.md + token files) BEFORE require.
 
 const cp = require("child_process");
 const fs = require("fs");
@@ -13,7 +13,7 @@ const path = require("path");
 const util = require("util");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
-const FAKE_TOKEN_PATH = "/tmp/__reviewer_token_test__";
+const DEFAULT_PATH = path.join(os.homedir(), ".quadwork", "reviewer-token");
 
 const nowSec = Math.floor(Date.now() / 1000);
 const RATE_JSON = JSON.stringify({
@@ -23,16 +23,9 @@ const RATE_JSON = JSON.stringify({
 });
 
 let capturedEnvToken = null;
-let reviewerPollCalls = 0; // counts ONLY reviewer polls (those carrying GH_TOKEN)
 function handleGh(file, args, options) {
-  // Serves any `gh api rate_limit` (incl. the module-load main poll). Counts
-  // only the reviewer poll, distinguished by the GH_TOKEN env it sets — the
-  // main poll carries no env, so it never affects reviewerPollCalls.
   if (file === "gh" && Array.isArray(args) && args.includes("rate_limit")) {
-    if (options && options.env && options.env.GH_TOKEN) {
-      reviewerPollCalls++;
-      capturedEnvToken = options.env.GH_TOKEN;
-    }
+    if (options && options.env && options.env.GH_TOKEN) capturedEnvToken = options.env.GH_TOKEN;
     return { stdout: RATE_JSON, stderr: "" };
   }
   return null;
@@ -41,92 +34,124 @@ const realExecFile = cp.execFile;
 function stub(file, args, opts, cb) {
   const done = typeof opts === "function" ? opts : cb;
   const options = typeof opts === "function" ? {} : opts || {};
-  const res = handleGh(file, args, options);
-  if (res) return done(null, res.stdout, res.stderr);
+  const r = handleGh(file, args, options);
+  if (r) return done(null, r.stdout, r.stderr);
   return realExecFile.apply(this, arguments);
 }
-// routes.js uses util.promisify(execFile), which resolves via execFile's custom
-// promisify symbol to { stdout, stderr }. Replicate that so the awaited result
-// destructures `stdout` correctly (a plain callback stub would resolve to a
-// bare string and break JSON.parse).
 stub[util.promisify.custom] = (file, args, options) => {
-  const res = handleGh(file, args, options);
-  if (res) return Promise.resolve(res);
-  return Promise.reject(new Error(`unexpected execFile in test: ${file} ${(args || []).join(" ")}`));
+  const r = handleGh(file, args, options);
+  return r ? Promise.resolve(r) : Promise.reject(new Error(`unexpected execFile: ${file}`));
 };
 cp.execFile = stub;
 
-// fs stubs are swapped per-scenario via these mutable refs.
+// fs fixtures — mutable per scenario.
 let configJson = "{}";
-let tokenFileContent = null; // null → ENOENT
+const files = new Map(); // absolute path → content; absent AGENTS.md/token → ENOENT
 const realRead = fs.readFileSync;
 fs.readFileSync = function stubRead(p, ...rest) {
   if (p === CONFIG_PATH) return configJson;
-  if (p === FAKE_TOKEN_PATH || (typeof p === "string" && p.endsWith("reviewer-token"))) {
-    if (tokenFileContent === null) {
-      const err = new Error("ENOENT (test stub)");
-      err.code = "ENOENT";
-      throw err;
-    }
-    return tokenFileContent;
+  if (typeof p === "string" && files.has(p)) return files.get(p);
+  if (typeof p === "string" && (p.endsWith("AGENTS.md") || p.endsWith("reviewer-token"))) {
+    const err = new Error("ENOENT (test stub)");
+    err.code = "ENOENT";
+    throw err;
   }
   return realRead(p, ...rest);
 };
 
-const { refreshReviewerRateLimit, reviewerRateLimitPayload } = require("./routes");
+const { _resolveReviewerTokenPath, getReviewerRateLimit, reviewerRateLimitPayload } = require("./routes");
 
 let passed = 0, failed = 0;
 const ok = (c, m) => { if (c) { passed++; console.log(`  PASS: ${m}`); } else { failed++; console.error(`  FAIL: ${m}`); } };
 
-(async () => {
-  console.log("\n--- #886 reviewer-account rate-limit tests ---\n");
+// A project with re1/re2 worktrees at /wt/<p>-re1 etc.
+const PROJECT = { id: "p", working_dir: "/wt/p", agents: { re1: { cwd: "/wt/p-re1" }, re2: { cwd: "/wt/p-re2" } } };
+const RE1_AGENTS = "/wt/p-re1/AGENTS.md";
+const RE2_AGENTS = "/wt/p-re2/AGENTS.md";
+const ghTokenLine = (p) => `export GH_TOKEN=$(cat ${p})\n`;
 
-  // Let the module-load startRateLimitPolling() → refreshRateLimit() chain
-  // (kicked off with the initial EMPTY config, so it fires no reviewer poll)
-  // fully settle before we mutate the fixtures — otherwise its trailing
-  // refreshReviewerRateLimit could read scenario A's token and race the counter.
+function reset() {
+  files.clear();
+  capturedEnvToken = null;
+}
+
+(async () => {
+  console.log("\n--- #893 project-aware reviewer rate-limit tests ---\n");
+
+  // Let the module-load main poll settle (it makes no reviewer call now).
   await new Promise((r) => setTimeout(r, 100));
 
-  // ── A. Reviewer token configured → polled as the reviewer, payload present ─
-  {
-    capturedEnvToken = null;
-    reviewerPollCalls = 0;
-    configJson = JSON.stringify({ reviewer_token_path: FAKE_TOKEN_PATH, reviewer_github_user: "project7-interns" });
-    tokenFileContent = "ghp_reviewerfaketoken\n";
+  // ── Resolution (pure _resolveReviewerTokenPath — no gh, no cache) ────────
 
-    await refreshReviewerRateLimit();
-    const payload = reviewerRateLimitPayload();
+  // custom worktree path (re1) wins
+  reset();
+  configJson = JSON.stringify({ reviewer_github_user: "interns", projects: [PROJECT] });
+  files.set(RE1_AGENTS, ghTokenLine("/custom/reviewer-token"));
+  let r = _resolveReviewerTokenPath("p");
+  ok(r.path === "/custom/reviewer-token" && r.source === "worktree", "resolves custom worktree token path (re1) with source=worktree");
 
-    ok(reviewerPollCalls === 1, `A: ran exactly one reviewer rate_limit poll (got ${reviewerPollCalls})`);
-    ok(capturedEnvToken === "ghp_reviewerfaketoken", "A: poll used the reviewer token via GH_TOKEN env (trimmed)");
-    ok(payload !== null, "A: reviewer payload present when a token is configured");
-    ok(payload.login === "project7-interns", "A: payload login from cfg.reviewer_github_user");
-    ok(payload.graphql && payload.graphql.remaining === 37, "A: reviewer graphql bucket surfaced (the at-risk budget)");
-    ok(payload.core && payload.core.remaining === 4000, "A: reviewer core bucket surfaced");
-    ok(typeof payload.graphql.resetInMinutes === "number", "A: bucketView shape (resetInMinutes) applied");
-  }
+  // worktree wins over cfg.reviewer_token_path
+  reset();
+  configJson = JSON.stringify({ reviewer_token_path: "/cfg/reviewer-token", projects: [PROJECT] });
+  files.set(RE1_AGENTS, ghTokenLine("/wtwins/reviewer-token"));
+  r = _resolveReviewerTokenPath("p");
+  ok(r.path === "/wtwins/reviewer-token" && r.source === "worktree", "worktree path WINS over cfg.reviewer_token_path (reseed preservation order)");
 
-  // ── B. No reviewer token (file missing) → payload null (single-account) ───
-  {
-    reviewerPollCalls = 0;
-    configJson = "{}";
-    tokenFileContent = null; // ENOENT
+  // re2 fallback when re1 AGENTS.md has no GH_TOKEN line
+  reset();
+  configJson = JSON.stringify({ projects: [PROJECT] });
+  files.set(RE1_AGENTS, "no token here\n");
+  files.set(RE2_AGENTS, ghTokenLine("/re2/reviewer-token"));
+  r = _resolveReviewerTokenPath("p");
+  ok(r.path === "/re2/reviewer-token" && r.source === "worktree", "falls back to re2 worktree when re1 has no GH_TOKEN line");
 
-    await refreshReviewerRateLimit();
-    ok(reviewerRateLimitPayload() === null, "B: no reviewer token → payload null (single-account, no regression)");
-    ok(reviewerPollCalls === 0, "B: no reviewer token → NO second gh poll fired");
-  }
+  // no project → cfg.reviewer_token_path
+  reset();
+  configJson = JSON.stringify({ reviewer_token_path: "/cfg/reviewer-token", projects: [PROJECT] });
+  r = _resolveReviewerTokenPath(null);
+  ok(r.path === "/cfg/reviewer-token" && r.source === "config", "no project → cfg.reviewer_token_path (source=config)");
 
-  // ── C. Empty token file → treated as not configured ──────────────────────
-  {
-    reviewerPollCalls = 0;
-    configJson = JSON.stringify({ reviewer_token_path: FAKE_TOKEN_PATH });
-    tokenFileContent = "   \n";
+  // no project + no cfg → default
+  reset();
+  configJson = JSON.stringify({ projects: [PROJECT] });
+  r = _resolveReviewerTokenPath(null);
+  ok(r.path === DEFAULT_PATH && r.source === "default", "no project + no cfg → default ~/.quadwork/reviewer-token");
 
-    await refreshReviewerRateLimit();
-    ok(reviewerRateLimitPayload() === null, "C: empty token file → payload null");
-    ok(reviewerPollCalls === 0, "C: empty token → NO gh poll");
-  }
+  // unknown project → cfg/default fallback (validated, not arbitrary project)
+  reset();
+  configJson = JSON.stringify({ reviewer_token_path: "/cfg/reviewer-token", projects: [PROJECT] });
+  files.set(RE1_AGENTS, ghTokenLine("/should-not-be-used/reviewer-token"));
+  r = _resolveReviewerTokenPath("ghost");
+  ok(r.path === "/cfg/reviewer-token" && r.source === "config", "unknown project → cfg/default fallback (does not sample project 'p')");
+
+  // ── Poll + payload + login (getReviewerRateLimit + reviewerRateLimitPayload) ─
+
+  // custom worktree token → polled with that token; login OMITTED (stale-login guard)
+  reset();
+  configJson = JSON.stringify({ reviewer_github_user: "interns", projects: [PROJECT] });
+  files.set(RE1_AGENTS, ghTokenLine("/customA/reviewer-token"));
+  files.set("/customA/reviewer-token", "ghp_customA\n");
+  let payload = reviewerRateLimitPayload(await getReviewerRateLimit("p"));
+  ok(capturedEnvToken === "ghp_customA", "polls the CUSTOM worktree token via GH_TOKEN");
+  ok(payload && payload.graphql && payload.graphql.remaining === 37, "custom-path reviewer payload surfaced (graphql bucket)");
+  ok(payload && !("login" in payload), "custom worktree token → login OMITTED (no stale cfg.reviewer_github_user)");
+
+  // default path → login = cfg.reviewer_github_user
+  reset();
+  configJson = JSON.stringify({ reviewer_github_user: "mainacct", projects: [] });
+  files.set(DEFAULT_PATH, "ghp_default\n");
+  payload = reviewerRateLimitPayload(await getReviewerRateLimit(null));
+  ok(payload && payload.login === "mainacct", "default/config source → login = cfg.reviewer_github_user");
+  ok(payload && payload.core && payload.core.remaining === 4000, "default-path reviewer payload surfaced (core bucket)");
+
+  // no token (custom path, token file absent) → payload null
+  reset();
+  capturedEnvToken = null;
+  configJson = JSON.stringify({ projects: [PROJECT] });
+  files.set(RE1_AGENTS, ghTokenLine("/notoken/reviewer-token")); // token file NOT added → ENOENT
+  payload = reviewerRateLimitPayload(await getReviewerRateLimit("p"));
+  ok(payload === null, "no reviewer token at resolved path → payload null (omitted)");
+  ok(capturedEnvToken === null, "no token → NO reviewer gh poll fired");
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);
