@@ -12,7 +12,8 @@
     "!server/**/*.test.js",
     "!server/__tests__/",
     "templates/",
-    "out/"
+    "out/",
+    "docs/operator-mcp.md"
   ],
   "scripts": {
     "dev": "next dev",
