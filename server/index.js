@@ -379,6 +379,8 @@ async function buildAgentArgs(projectId, agentId) {
   // Claude: --model <slug>
   //   reasoning_effort is not wired for Claude — Anthropic's CLI
   //   doesn't expose an equivalent flag.
+  // Gemini: --model <slug> (the Gemini CLI's -m / --model flag)
+  //   reasoning_effort has no Gemini equivalent — model only.
   if (cliBase === "codex") {
     if (agentCfg.model && typeof agentCfg.model === "string") {
       args.push("-c", `model="${agentCfg.model}"`);
@@ -387,6 +389,10 @@ async function buildAgentArgs(projectId, agentId) {
       args.push("-c", `model_reasoning_effort="${agentCfg.reasoning_effort}"`);
     }
   } else if (cliBase === "claude") {
+    if (agentCfg.model && typeof agentCfg.model === "string") {
+      args.push("--model", agentCfg.model);
+    }
+  } else if (cliBase === "gemini") {
     if (agentCfg.model && typeof agentCfg.model === "string") {
       args.push("--model", agentCfg.model);
     }
@@ -1774,7 +1780,14 @@ async function autoStopPollingTick() {
   }
 }
 
-setInterval(autoStopPollingTick, AUTO_STOP_POLL_INTERVAL_MS);
+// QUADWORK_SKIP_LISTEN lets a test `require("./index")` to reach the exported
+// pure helpers (e.g. buildAgentArgs) WITHOUT starting the server, its pollers,
+// or binding the port. Production never sets it; `quadwork start` requires this
+// module for its side effects, so the guard must be an explicit env var (not
+// require.main, which is the bin, not this file).
+if (!process.env.QUADWORK_SKIP_LISTEN) {
+  setInterval(autoStopPollingTick, AUTO_STOP_POLL_INTERVAL_MS);
+}
 
 // #422 / quadwork#310: auto-continue after loop guard.
 //
@@ -1878,7 +1891,7 @@ function runStartupMigrations(cfg) {
 
 }
 
-server.listen(PORT, "127.0.0.1", async () => {
+if (!process.env.QUADWORK_SKIP_LISTEN) server.listen(PORT, "127.0.0.1", async () => {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
   const startupCfg = readConfig();
@@ -1948,4 +1961,4 @@ function shutdown() {
   }
 }
 
-module.exports = { shutdown };
+module.exports = { shutdown, buildAgentArgs, buildAgentEnv };
