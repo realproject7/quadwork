@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
-import { MODEL_OPTIONS, optionsForBackend } from "./AgentModelsWidget";
+import { modelsForBackend, effectiveModel, sanitizeModel } from "@/lib/agentModels";
 import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
@@ -61,11 +61,6 @@ const BACKENDS: { value: string; label: string }[] = [
   { value: "codex", label: "Codex" },
   { value: "gemini", label: "Gemini CLI" },
 ];
-
-function butlerModelsForBackend(backend: string) {
-  const opts = optionsForBackend(backend).filter((o) => o.value !== "");
-  return opts.length > 0 ? opts : optionsForBackend("claude").filter((o) => o.value !== "");
-}
 
 const COPY = {
   en: {
@@ -495,13 +490,30 @@ export default function SettingsPage() {
       // the bottom-right Telegram Bridge widget (#211), which writes
       // its own env-references via /api/telegram?action=save-config.
       // The Settings save path no longer needs to migrate bot tokens.
+      // #931: normalize every per-agent model to one valid for its command
+      // before persisting. This is the catch-all the AC requires ("Saving
+      // persists a model valid for that agent's CLI") — it heals a model left
+      // invalid by the old hardcoded dropdown (e.g. a codex agent saved with
+      // "sonnet") and also covers a new project seeded from DEFAULT_AGENTS with
+      // a non-Claude default command. sanitizeModel keeps "" (CLI default) as-is.
+      const normalizedConfig = {
+        ...config,
+        projects: config.projects.map((p) => {
+          const agents: Record<string, AgentConfig> = {};
+          for (const [id, a] of Object.entries(p.agents)) {
+            agents[id] = { ...a, model: sanitizeModel(a.command || "claude", a.model) };
+          }
+          return { ...p, agents };
+        }),
+      };
       const res = await fetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify(normalizedConfig),
       });
       if (!res.ok) throw new Error(`${res.status}`);
-      savedConfigRef.current = JSON.stringify(config);
+      setConfig(normalizedConfig);
+      savedConfigRef.current = JSON.stringify(normalizedConfig);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -814,7 +826,7 @@ export default function SettingsPage() {
               label={t.butlerCli}
               value={config.butler?.command || "claude"}
               onChange={(v) => {
-                const models = butlerModelsForBackend(v);
+                const models = modelsForBackend(v);
                 const currentModel = config.butler?.model || "opus";
                 const modelValid = models.some((m) => m.value === currentModel);
                 updateButler({ command: v, model: modelValid ? currentModel : models[0].value });
@@ -828,7 +840,7 @@ export default function SettingsPage() {
               label={t.butlerModel}
               value={config.butler?.model || "opus"}
               onChange={(v) => updateButler({ model: v })}
-              options={butlerModelsForBackend(config.butler?.command || "claude")}
+              options={modelsForBackend(config.butler?.command || "claude")}
             />
             <Input
               label={t.butlerCwd}
@@ -949,17 +961,14 @@ export default function SettingsPage() {
                             <select
                               value={agent.command || "claude"}
                               onChange={(e) => {
-                                // #931: changing the command must reset the model to a
-                                // valid option for the new backend (mirror the butler
-                                // dropdown above) — otherwise a Claude model leaks onto
-                                // a codex/gemini agent and is saved/spawned as invalid.
+                                // #931: changing the command must reset the model to one
+                                // valid for the new backend (mirror the butler dropdown
+                                // above) — otherwise a Claude model leaks onto a
+                                // codex/gemini agent and is saved/spawned as invalid.
                                 const command = e.target.value;
-                                const models = butlerModelsForBackend(command);
-                                const currentModel = agent.model || "";
-                                const modelValid = models.some((m) => m.value === currentModel);
                                 updateAgent(idx, agentId, {
                                   command,
-                                  model: modelValid ? currentModel : models[0].value,
+                                  model: effectiveModel(command, agent.model),
                                 });
                               }}
                               className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
@@ -980,14 +989,16 @@ export default function SettingsPage() {
                             </select>
                             <select
                               // #931: provider-aware model options that track the agent's
-                              // command (codex/gemini/claude), the same helper the butler
-                              // dropdown uses. Default to the backend's first option, not a
-                              // hardcoded Claude "sonnet", so non-Claude agents read right.
-                              value={agent.model || butlerModelsForBackend(agent.command || "claude")[0].value}
+                              // command (codex/gemini/claude). effectiveModel shows the
+                              // saved model when valid, else the backend's first option —
+                              // so an unset model or a stale cross-backend value (e.g. a
+                              // codex agent left on "sonnet" by the old hardcoded list)
+                              // never renders blank or as the wrong model.
+                              value={effectiveModel(agent.command || "claude", agent.model)}
                               onChange={(e) => updateAgent(idx, agentId, { model: e.target.value })}
                               className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
                             >
-                              {butlerModelsForBackend(agent.command || "claude").map((m) => (
+                              {modelsForBackend(agent.command || "claude").map((m) => (
                                 <option key={m.value} value={m.value} className="bg-bg-surface">{m.label}</option>
                               ))}
                             </select>
