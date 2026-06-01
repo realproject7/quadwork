@@ -61,7 +61,6 @@ const BACKENDS: { value: string; label: string }[] = [
   { value: "codex", label: "Codex" },
   { value: "gemini", label: "Gemini CLI" },
 ];
-const MODELS = ["opus", "sonnet", "haiku"];
 
 function butlerModelsForBackend(backend: string) {
   const opts = optionsForBackend(backend).filter((o) => o.value !== "");
@@ -949,7 +948,20 @@ export default function SettingsPage() {
                             </div>
                             <select
                               value={agent.command || "claude"}
-                              onChange={(e) => updateAgent(idx, agentId, { command: e.target.value })}
+                              onChange={(e) => {
+                                // #931: changing the command must reset the model to a
+                                // valid option for the new backend (mirror the butler
+                                // dropdown above) — otherwise a Claude model leaks onto
+                                // a codex/gemini agent and is saved/spawned as invalid.
+                                const command = e.target.value;
+                                const models = butlerModelsForBackend(command);
+                                const currentModel = agent.model || "";
+                                const modelValid = models.some((m) => m.value === currentModel);
+                                updateAgent(idx, agentId, {
+                                  command,
+                                  model: modelValid ? currentModel : models[0].value,
+                                });
+                              }}
                               className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
                               title={cliStatus && Object.values(cliStatus).filter(Boolean).length === 1
                                 ? t.oneCliInstalled
@@ -967,12 +979,16 @@ export default function SettingsPage() {
                               ))}
                             </select>
                             <select
-                              value={agent.model || "sonnet"}
+                              // #931: provider-aware model options that track the agent's
+                              // command (codex/gemini/claude), the same helper the butler
+                              // dropdown uses. Default to the backend's first option, not a
+                              // hardcoded Claude "sonnet", so non-Claude agents read right.
+                              value={agent.model || butlerModelsForBackend(agent.command || "claude")[0].value}
                               onChange={(e) => updateAgent(idx, agentId, { model: e.target.value })}
                               className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
                             >
-                              {MODELS.map((m) => (
-                                <option key={m} value={m} className="bg-bg-surface">{m}</option>
+                              {butlerModelsForBackend(agent.command || "claude").map((m) => (
+                                <option key={m.value} value={m.value} className="bg-bg-surface">{m.label}</option>
                               ))}
                             </select>
                             <input
