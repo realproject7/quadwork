@@ -22,6 +22,7 @@
 import { useCallback, useEffect, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
+import { optionsForBackend } from "@/lib/agentModels";
 
 const COPY = {
   en: {
@@ -97,42 +98,9 @@ interface AgentModelsWidgetProps {
 // No xhigh — explicitly excluded per #343 ("capacity-failure hot spot").
 const REASONING_LEVELS = ["minimal", "low", "medium", "high"] as const;
 
-// #343 follow-up: backend-specific model dropdown options.
-// Empty string = use the CLI's own default (no -c / --model flag
-// passed at all). The lists below are the known-good slugs we
-// ship with this release; operators who need something bleeding
-// edge can still override by editing ~/.quadwork/config.json
-// directly — this widget is the guided happy path.
-export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
-  codex: [
-    { value: "", label: "(CLI default)" },
-    { value: "gpt-5.4", label: "gpt-5.4" },
-    { value: "gpt-5", label: "gpt-5" },
-    { value: "gpt-4o", label: "gpt-4o" },
-  ],
-  claude: [
-    { value: "", label: "(CLI default)" },
-    // #841: CLI-documented aliases (`claude --help` → "alias for the latest
-    // model"). Auto-track new Opus/Sonnet releases without needing a QuadWork
-    // update; pinned `claude-opus-4-X` rows below remain for operators who
-    // want a specific version locked in.
-    { value: "opus", label: "opus (latest)" },
-    { value: "sonnet", label: "sonnet (latest)" },
-    { value: "claude-opus-4-8", label: "claude-opus-4-8" },
-    { value: "claude-opus-4-7", label: "claude-opus-4-7" },
-    { value: "claude-opus-4-6", label: "claude-opus-4-6" },
-    { value: "claude-sonnet-4-6", label: "claude-sonnet-4-6" },
-    { value: "claude-haiku-4-5-20251001", label: "claude-haiku-4-5" },
-  ],
-  gemini: [
-    { value: "", label: "(CLI default)" },
-    { value: "gemini-2.5-pro", label: "gemini-2.5-pro" },
-    { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
-  ],
-};
-export function optionsForBackend(backend: string) {
-  return MODEL_OPTIONS[backend] || [{ value: "", label: "(CLI default)" }];
-}
+// #931: the backend model catalog + `optionsForBackend` moved to the pure,
+// React-free `@/lib/agentModels` module so it can be shared with SettingsPage
+// and unit-tested under node. Imported above.
 
 // #367: modal body — the full configuration UI from the original
 // AgentModelsWidget, unchanged except for being wrapped in a
