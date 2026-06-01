@@ -45,12 +45,22 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
     if (!session || !session.term || session.state !== "running") continue;
     if (msg.sender === agentId) continue;
 
-    // #736: skip injection if agent recently sent a message — they're
-    // already active and will read chat via chat_read
+    // An agent is "active" if it is producing PTY output right now (mid-turn)
+    // OR it sent a chat message very recently (#736 — it's likely still in the
+    // turn it sent from and will re-read chat itself). Either way we must not
+    // inject mid-activity.
+    //
+    // #923: but we must NOT drop the mention either. The old code `continue`d
+    // on the recent-send case, so a mention that landed within the suppression
+    // window was lost — stranding a standing-by agent (whose turn had actually
+    // ENDED after it posted) on stale chat until the next scheduled-trigger
+    // pulse re-dispatched it (up to ~15 min). Instead DEFER via a pending wake
+    // that drains once the agent goes quiet, so the mention reliably starts a
+    // new turn within seconds. The scheduled trigger is now only a periodic
+    // backstop, not the primary wake mechanism for direct assignments.
     const lastSent = _lastChatSentAt.get(key);
-    if (lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS)) continue;
-
-    if (isAgentBusy(session)) {
+    const recentlySent = lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS);
+    if (isAgentBusy(session) || recentlySent) {
       queuePendingWake(key, session, deps);
       continue;
     }
@@ -79,9 +89,10 @@ function queuePendingWake(key, session, deps) {
     _pendingWake.delete(key);
     cleanupDrainListener(key);
 
-    const lastSent = _lastChatSentAt.get(key);
-    if (lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS)) return;
-
+    // #923: fire the deferred wake unconditionally once the agent has been
+    // quiet for the idle window. Do NOT re-suppress on a recent send here — a
+    // standing-by agent that just posted (then ended its turn) would otherwise
+    // be stranded again, which is the exact stall this fix removes.
     injectIntoTerm(session.term, buildInjectionPrompt(session.agentId), deps);
   };
 
@@ -141,9 +152,10 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
     const session = agentSessions.get(key);
     if (!session || !session.term || session.state !== "running") return;
 
-    const lastSent = _lastChatSentAt.get(key);
-    if (lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS)) return;
-
+    // #923: the defer-vs-inject decision was already made in dispatchToAgentPTY
+    // (this path is reached only for an idle, not-recently-active agent). Inject
+    // when the coalesce window closes rather than re-suppressing on a recent
+    // send here — re-suppression is what dropped wakes for standing-by agents.
     injectIntoTerm(session.term, buildInjectionPrompt(agentId), deps);
   }, COALESCE_WINDOW_MS);
 

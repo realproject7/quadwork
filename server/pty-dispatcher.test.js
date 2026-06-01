@@ -164,15 +164,24 @@ async function runTests() {
     cleanupSession("proj/dev");
   }
 
-  // --- Test 10: active agent suppression — recently sent message skips injection ---
+  // --- Test 10: #923 — a recently-active agent's mention is DEFERRED, not
+  //     dropped. It must not inject mid-activity, but it must still wake once
+  //     the agent goes quiet (the old behavior dropped it, stranding a
+  //     standing-by agent until the next scheduled-trigger pulse). ---
   {
     const { sessions, written } = makeSessions({ lastOutputAt: 0 });
     const deps = makeDeps();
-    // Simulate dev having sent a message recently
+    // Simulate dev having sent a message recently (then its turn ended → idle).
     _lastChatSentAt.set("proj/dev", Date.now());
     dispatchToAgentPTY("proj", makeMsg({ sender: "head", mentions: ["dev"] }), sessions, deps);
     await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
-    assert(written.length === 0, "recently active agent is not injected");
+    assert(written.length === 0, "recently-active agent is not injected immediately (no mid-activity barge-in)");
+    assert(_pendingWake.has("proj/dev"), "#923: recently-active mention is QUEUED as a pending wake, not dropped");
+    // Fallback drain fires after the idle window with no further PTY output.
+    await new Promise((r) => setTimeout(r, IDLE_THRESHOLD_MS + 100));
+    assert(written.length >= 1, "#923: deferred wake drains once the agent is quiet — no scheduled-trigger pulse needed");
+    assert(written[0].includes("You are @dev"), "drained wake uses the identity prompt");
+    assert(!_pendingWake.has("proj/dev"), "pending wake cleared after drain");
     cleanupSession("proj/dev");
   }
 
