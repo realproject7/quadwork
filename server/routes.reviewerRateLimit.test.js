@@ -124,14 +124,43 @@ function reset() {
   r = _resolveReviewerTokenPath("ghost");
   ok(r.path === "/cfg/reviewer-token" && r.source === "config", "unknown project → cfg/default fallback (does not sample project 'p')");
 
+  // #897: default-seeded `~/.quadwork/reviewer-token` (tilde) → expanded to abs
+  reset();
+  configJson = JSON.stringify({ projects: [PROJECT] });
+  files.set(RE1_AGENTS, ghTokenLine("~/.quadwork/reviewer-token"));
+  r = _resolveReviewerTokenPath("p");
+  ok(r.path === DEFAULT_PATH && r.source === "worktree", "#897: default-seeded ~/.quadwork/reviewer-token expands to the absolute homedir path");
+
+  // #897: ~/ and bare ~ expanded for the config source too; absolute unchanged
+  reset();
+  configJson = JSON.stringify({ reviewer_token_path: "~/cfg-token", projects: [] });
+  ok(_resolveReviewerTokenPath(null).path === path.join(os.homedir(), "cfg-token"), "#897: ~/ in cfg.reviewer_token_path expanded");
+  reset();
+  configJson = JSON.stringify({ reviewer_token_path: "~", projects: [] });
+  ok(_resolveReviewerTokenPath(null).path === os.homedir(), "#897: bare ~ in cfg path expands to homedir");
+  reset();
+  configJson = JSON.stringify({ reviewer_token_path: "/abs/reviewer-token", projects: [] });
+  ok(_resolveReviewerTokenPath(null).path === "/abs/reviewer-token", "#897: absolute cfg path passes through unchanged (no regression)");
+
   // ── Poll + payload + login (getReviewerRateLimit + reviewerRateLimitPayload) ─
+
+  // #897 (P1 regression): a project seeded with the DEFAULT `~/.quadwork/
+  // reviewer-token` shows the badge — the tilde is expanded so the real file is
+  // read, instead of ENOENT → no badge.
+  reset();
+  configJson = JSON.stringify({ reviewer_github_user: "interns", projects: [PROJECT] });
+  files.set(RE1_AGENTS, ghTokenLine("~/.quadwork/reviewer-token"));
+  files.set(DEFAULT_PATH, "ghp_default_seeded\n"); // real file at the EXPANDED path
+  let payload = reviewerRateLimitPayload(await getReviewerRateLimit("p"));
+  ok(capturedEnvToken === "ghp_default_seeded", "#897: polls the token at the EXPANDED default path");
+  ok(payload && payload.graphql && payload.graphql.remaining === 37, "#897: reviewer badge SHOWS for a default-seeded ~/ path (regression fixed)");
 
   // custom worktree token → polled with that token; login OMITTED (stale-login guard)
   reset();
   configJson = JSON.stringify({ reviewer_github_user: "interns", projects: [PROJECT] });
   files.set(RE1_AGENTS, ghTokenLine("/customA/reviewer-token"));
   files.set("/customA/reviewer-token", "ghp_customA\n");
-  let payload = reviewerRateLimitPayload(await getReviewerRateLimit("p"));
+  payload = reviewerRateLimitPayload(await getReviewerRateLimit("p"));
   ok(capturedEnvToken === "ghp_customA", "polls the CUSTOM worktree token via GH_TOKEN");
   ok(payload && payload.graphql && payload.graphql.remaining === 37, "custom-path reviewer payload surfaced (graphql bucket)");
   ok(payload && !("login" in payload), "custom worktree token → login OMITTED (no stale cfg.reviewer_github_user)");
