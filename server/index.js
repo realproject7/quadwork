@@ -547,14 +547,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
     term.onExit(({ exitCode }) => {
       const current = agentSessions.get(key);
       if (current && current.term === term) {
-        cleanupPtyDispatcher(key);
-        current.state = "stopped";
-        current.error = exitCode ? `exit:${exitCode}` : null;
-        current.term = null;
-        for (const v of current.viewers) {
-          if (v.readyState <= 1) v.close(1000, `exited:${exitCode}`);
-        }
-        current.viewers.clear();
+        markSessionExited(key, current, exitCode);
       }
     });
 
@@ -562,6 +555,37 @@ async function spawnAgentPty(project, agent, opts = {}) {
   } catch (err) {
     agentSessions.set(key, { projectId: project, agentId: agent, term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "error", error: err.message });
     return { ok: false, error: err.message };
+  }
+}
+
+// #910: mark a session whose CLI process exited on its own (clean exit OR
+// crash) as stopped, and flag it `exitedUnexpectedly` so the watchdog will
+// auto-respawn it for a non-idle project. Shared by term.onExit and the
+// watchdog liveness probe (which catches the case where onExit never fired and
+// the dashboard was left showing a stale `running`).
+function markSessionExited(key, session, exitCode) {
+  cleanupPtyDispatcher(key);
+  session.state = "stopped";
+  session.error = exitCode ? `exit:${exitCode}` : null;
+  session.term = null;
+  session.exitedUnexpectedly = true;
+  for (const v of session.viewers) {
+    if (v.readyState <= 1) v.close(1000, `exited:${exitCode == null ? "" : exitCode}`);
+  }
+  session.viewers.clear();
+}
+
+// #910: is the PTY's child process still alive? signal 0 probes without
+// delivering a signal: ESRCH → gone, EPERM → alive but not ours. A session can
+// read `running` while its process is already dead if onExit didn't fire; this
+// is how the watchdog detects that and clears the stale state.
+function isPtyAlive(term) {
+  if (!term || typeof term.pid !== "number") return false;
+  try {
+    process.kill(term.pid, 0);
+    return true;
+  } catch (err) {
+    return err && err.code === "EPERM";
   }
 }
 
@@ -594,6 +618,8 @@ async function stopAgentSession(key, { clearSelfHeal = false } = {}) {
   session.viewers.clear();
   session.state = "stopped";
   session.error = null;
+  // #910: a manual stop is intentional — do NOT let the watchdog respawn it.
+  session.exitedUnexpectedly = false;
   const [projectId, agentId] = key.split("/");
   if (projectId && agentId) stopMcpProxy(projectId, agentId);
 }
@@ -1811,16 +1837,56 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
 const WATCHDOG_TIMEOUT_MS = 10 * 60 * 1000;
 let _watchdogHandle = null;
 
-function watchdogCheck() {
+async function watchdogCheck() {
+  const toRespawn = [];
   for (const [key, session] of agentSessions) {
-    if (session.state !== "running" || !session.term) continue;
-    if (!session.lastOutputAt) continue;
-    // #732: skip file-chat projects — idle is normal, PTY dispatch wakes them
-    if (routes.getProjectChatMode(session.projectId) === "file") continue;
-    if (Date.now() - session.lastOutputAt > WATCHDOG_TIMEOUT_MS) {
+    // #910: liveness probe — a session can read `running` while its CLI process
+    // already exited (onExit didn't fire / process died without it), leaving a
+    // false green dot. Detect the dead pid and clear the stale state.
+    if (session.state === "running" && session.term && !isPtyAlive(session.term)) {
+      console.log(`[watchdog] ${key}: PTY process gone while state was 'running' — marking stopped`);
+      markSessionExited(key, session, null);
+    }
+
+    // #797/#825: stuck-agent detection (running but silent) — Ctrl+C nudge.
+    // #732: skip file-chat projects — idle is normal, PTY dispatch wakes them.
+    if (session.state === "running" && session.term && session.lastOutputAt
+        && routes.getProjectChatMode(session.projectId) !== "file"
+        && Date.now() - session.lastOutputAt > WATCHDOG_TIMEOUT_MS) {
       console.log(`[watchdog] ${key}: no output for 10m — sending Ctrl+C`);
       safeWrite(session.term, "\x03");
       session.lastOutputAt = Date.now();
+    }
+
+    // #910: collect agents that exited on their own (clean exit / crash) for
+    // auto-respawn. Operator-stopped agents have exitedUnexpectedly=false.
+    if (session.exitedUnexpectedly && session.state !== "running" && !session.term) {
+      toRespawn.push(key);
+    }
+  }
+
+  // #910: respawn exited agents for non-idle projects, after iterating (spawn
+  // mutates agentSessions). The self-heal respawn breaker caps repeated deaths
+  // so a session that keeps dying isn't loop-respawned.
+  for (const key of toRespawn) {
+    const session = agentSessions.get(key);
+    if (!session || !session.exitedUnexpectedly) continue;
+    const [projectId, agentId] = key.split("/");
+    if (!projectId || !agentId) continue;
+    if (isProjectIdleId(projectId)) continue; // #812: parked project — leave stopped
+    const decision = selfHeal.shouldRespawn(key, {
+      now: Date.now(),
+      onBreaker: (message) => { console.log(`[watchdog] ${key}: ${message}`); emitSystemMessage(projectId, message); },
+    });
+    if (decision !== "respawn") continue; // breaker tripped — leave stopped
+    session.exitedUnexpectedly = false; // consume the flag for this attempt
+    console.log(`[watchdog] ${key}: agent exited — auto-respawning`);
+    try {
+      const result = await spawnAgentPty(projectId, agentId, { suppressLifecycleMsg: true });
+      if (result.ok) emitSystemMessage(projectId, `${agentId} auto-respawned (had exited)`);
+      else console.error(`[watchdog] ${key}: auto-respawn failed: ${result.error}`);
+    } catch (err) {
+      console.error(`[watchdog] ${key}: auto-respawn threw: ${err.message}`);
     }
   }
 }
@@ -1961,4 +2027,4 @@ function shutdown() {
   }
 }
 
-module.exports = { shutdown, buildAgentArgs, buildAgentEnv };
+module.exports = { shutdown, buildAgentArgs, buildAgentEnv, isPtyAlive };

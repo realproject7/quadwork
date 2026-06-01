@@ -142,6 +142,46 @@ function runTests() {
     assert(breakerMsgs.length === 1, "the reset did not re-emit the breaker message");
   }
 
+  // --- Test 8 (#910): respawn breaker allows up to RESPAWN_MAX in-window, then trips ---
+  {
+    selfHeal._respawnState.clear();
+    const { shouldRespawn, respawnBreakerMessage, RESPAWN_MAX, RESPAWN_WINDOW_MS } = selfHeal;
+    let breakerMsgs = [];
+    const onBreaker = (m) => breakerMsgs.push(m);
+
+    // First RESPAWN_MAX exits in the window each get a respawn.
+    let respawns = 0;
+    for (let i = 0; i < RESPAWN_MAX; i++) {
+      if (shouldRespawn(KEY, { now: 1000 + i * 1000, onBreaker }) === "respawn") respawns++;
+    }
+    assert(respawns === RESPAWN_MAX, `respawns up to RESPAWN_MAX (${RESPAWN_MAX}) within the window`);
+
+    // The next exit inside the window trips the breaker.
+    const tripped = shouldRespawn(KEY, { now: 1000 + RESPAWN_MAX * 1000, onBreaker });
+    assert(tripped === "breaker", "exit beyond RESPAWN_MAX in-window → breaker");
+    assert(breakerMsgs.length === 1 && breakerMsgs[0] === respawnBreakerMessage("dev"), "respawn breaker notifies once, names the agent");
+
+    // Still tripped, no re-spam, while inside the window.
+    const again = shouldRespawn(KEY, { now: 1000 + (RESPAWN_MAX + 1) * 1000, onBreaker });
+    assert(again === "breaker" && breakerMsgs.length === 1, "respawn breaker stays tripped without re-spamming");
+
+    // After the window passes, attempts age out and respawn is allowed again.
+    const later = shouldRespawn(KEY, { now: 1000 + RESPAWN_WINDOW_MS + 10_000, onBreaker });
+    assert(later === "respawn", "after the window, old attempts age out → respawn allowed again");
+  }
+
+  // --- Test 9 (#910): clearState resets the respawn breaker too (manual stop) ---
+  {
+    selfHeal._respawnState.clear();
+    const { shouldRespawn, RESPAWN_MAX } = selfHeal;
+    // Trip the breaker: RESPAWN_MAX allowed, then the next refuses.
+    for (let i = 0; i < RESPAWN_MAX; i++) shouldRespawn(KEY, { now: 1000 + i * 1000 });
+    assert(shouldRespawn(KEY, { now: 1000 + RESPAWN_MAX * 1000 }) === "breaker", "precondition: respawn breaker tripped");
+    clearState(KEY);
+    assert(!selfHeal._respawnState.has(KEY), "clearState drops the respawn-breaker state");
+    assert(shouldRespawn(KEY, { now: 1000 + RESPAWN_MAX * 1000 + 1 }) === "respawn", "after clearState, respawn allowed again (manual stop re-enables)");
+  }
+
   console.log(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);
 }
