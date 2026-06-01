@@ -2368,7 +2368,15 @@ function pickDisplayedSource(current, snapshot) {
   return "live";
 }
 
-function resolveDisplayedBatch(queueText, projectId, { queueReadOk = true } = {}) {
+function resolveDisplayedBatch(
+  queueText,
+  projectId,
+  // #899: snapshot I/O is injectable so the live-progression path is unit-
+  // testable without writing to the real ~/.quadwork/{id}/batch-progress-cache.json
+  // (which belongs to the running orchestrator). Production callers pass nothing
+  // and get the real readers/writers.
+  { queueReadOk = true, _readSnapshot = readBatchSnapshot, _writeSnapshot = writeBatchSnapshot } = {},
+) {
   // Queue file deleted / unreadable → fall back to empty state per
   // #316's edge case. Returning the snapshot here would "heal" a
   // genuinely missing file into stale data the operator can't
@@ -2376,7 +2384,7 @@ function resolveDisplayedBatch(queueText, projectId, { queueReadOk = true } = {}
   // manually.
   if (!queueReadOk) return { batchNumber: null, issueNumbers: [], batch_type: "code", reviewItems: [] };
   const current = parseActiveBatch(queueText);
-  const snapshot = readBatchSnapshot(projectId);
+  const snapshot = _readSnapshot(projectId);
   const source = pickDisplayedSource(current, snapshot);
   let next;
   if (source === "live") {
@@ -2397,10 +2405,32 @@ function resolveDisplayedBatch(queueText, projectId, { queueReadOk = true } = {}
       batch_type: snapshot.batch_type || "code",
       reviewItems: Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : [],
     };
+    // #899: snapshot stickiness preserves the displayed issue SET (so items Head
+    // moved to Done stay visible — #316/#429), but a review batch's per-item
+    // state lives in the QUEUE, not on GitHub. When the same batch number +
+    // issue set persist and only review states change in place
+    // (queued → in-review → approved), pickDisplayedSource finds no bump / no
+    // new items and returns "snapshot" — which froze reviewItems at their
+    // first-seen states AND re-persisted them each cycle. So while the live
+    // Active Batch is still present (non-empty), refresh batch_type + reviewItems
+    // from the LIVE queue. We are already in the "snapshot" branch, so a
+    // non-empty live parse here is necessarily the SAME batch (no explicit bump,
+    // every live issue already in the snapshot) — never a newer one. The
+    // snapshot's reviewItems stay authoritative ONLY once the Active Batch is
+    // cleared (archived), where the live parse is empty and this is skipped.
+    // Code batches are unaffected: their live parse yields batch_type "code" /
+    // reviewItems [] — identical to what the snapshot already holds.
+    if (current.issueNumbers.length > 0) {
+      next.batch_type = parseBatchType(queueText);
+      next.reviewItems = parseReviewItems(queueText);
+    }
   }
   // Snapshot persists batchNumber/issueNumbers (existing consumers) PLUS the
-  // additive #870 batch_type/reviewItems.
-  if (next.issueNumbers.length > 0) writeBatchSnapshot(projectId, next);
+  // additive #870 batch_type/reviewItems. With the #899 refresh above, the
+  // snapshot now also captures the LATEST live review states each cycle, so the
+  // post-archive sticky view shows the FINAL states (all approved) rather than
+  // the first-seen ones.
+  if (next.issueNumbers.length > 0) _writeSnapshot(projectId, next);
   return next;
 }
 const BATCH_PROGRESS_TTL_MS = 10000;
@@ -4273,6 +4303,12 @@ module.exports = router;
 // outside this file; the export is strictly for the node:assert
 // script at server/routes.parseActiveBatch.test.js.
 module.exports.parseActiveBatch = parseActiveBatch;
+// #899: expose the live-vs-snapshot resolver + its source picker so the
+// in-place review-state progression path is unit-testable with injected
+// snapshot I/O (no writes to the real ~/.quadwork). No production callers
+// outside this file.
+module.exports.resolveDisplayedBatch = resolveDisplayedBatch;
+module.exports.pickDisplayedSource = pickDisplayedSource;
 // #870: expose review-batch parsers/helpers for the reviewBatch fixture test.
 module.exports.parseBatchType = parseBatchType;
 module.exports.parseReviewItems = parseReviewItems;
