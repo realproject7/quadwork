@@ -124,6 +124,18 @@ async function refreshRateLimit() {
 // AGENTS.md first, then re2's. Falls back to cfg.reviewer_token_path → default
 // for a no-project / unknown-project request (backward compatible with #886).
 // Returns { path, source: "worktree" | "config" | "default" }.
+// #897: expand a leading `~/` (and bare `~`) to os.homedir(). The setup wizard
+// seeds the literal `~/.quadwork/reviewer-token` into reviewer AGENTS.md, and
+// _extractReviewerTokenPath returns it raw (reseed depends on the raw value).
+// Node's fs does NOT expand `~`, so the resolver must normalize before reading /
+// caching — otherwise the default-seeded path ENOENTs and the badge vanishes.
+function _expandTilde(p) {
+  if (typeof p !== "string") return p;
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
 function _resolveReviewerTokenPath(projectId) {
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { /* default-config / unreadable */ }
@@ -137,12 +149,14 @@ function _resolveReviewerTokenPath(projectId) {
       try {
         const agentsMd = fs.readFileSync(path.join(t.wtDir, "AGENTS.md"), "utf-8");
         const extracted = _extractReviewerTokenPath(agentsMd);
-        if (extracted) return { path: extracted, source: "worktree" };
+        // #897: expand `~` here (not in _extractReviewerTokenPath — reseed needs
+        // the raw value) so the read + cache key use an absolute path.
+        if (extracted) return { path: _expandTilde(extracted), source: "worktree" };
       } catch { /* worktree / AGENTS.md missing → try next role */ }
     }
   }
-  if (cfg.reviewer_token_path) return { path: cfg.reviewer_token_path, source: "config" };
-  return { path: defaultPath, source: "default" };
+  if (cfg.reviewer_token_path) return { path: _expandTilde(cfg.reviewer_token_path), source: "config" };
+  return { path: defaultPath, source: "default" }; // already absolute
 }
 
 // #886/#893: poll one reviewer token path (exempt `rate_limit` call as that
