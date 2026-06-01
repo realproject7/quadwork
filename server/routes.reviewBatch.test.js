@@ -72,6 +72,7 @@ const {
   parseBatchType,
   parseReviewItems,
   parseReviewState,
+  reviewItemView,
   isBatchActiveFromProgress,
   getOrComputeBatchProgress,
   _batchProgressCache,
@@ -108,6 +109,21 @@ function reset() {
   ok(parseReviewState("changes-requested").review_state === "changes-requested", "changes-requested state");
   ok(parseReviewState("queued").review_state === "queued", "queued state");
   ok(parseReviewState("garbage").review_state === "queued", "unrecognized → queued");
+  ok(parseReviewState("in-review (2/2)").approvals === 2, "in-review (2/2) → approvals 2");
+
+  // ── #907: in-review (2/2) must NOT render as the contradictory 50% in-review
+  {
+    const both = reviewItemView({ issue: 904, review_state: "in-review", approvals: 2 }, "pr-review", null);
+    ok(both.progress !== 50, "#907: 2/2-approved item is NOT stuck at 50%");
+    ok(both.progress >= 90, `#907: 2/2 → high progress (got ${both.progress})`);
+    ok(both.status === "finalizing", "#907: 2/2 → status 'finalizing'");
+    ok(!/^in review · 2\/2/i.test(both.label) && /2\/2|finaliz/i.test(both.label), `#907: 2/2 label is non-contradictory (got "${both.label}")`);
+    // No regression: 1/2 still 50% in-review, 0 approvals still 20%.
+    const one = reviewItemView({ issue: 905, review_state: "in-review", approvals: 1 }, "pr-review", null);
+    ok(one.progress === 50 && one.status === "in_review", "#907: 1/2 still renders 50% in-review");
+    const zero = reviewItemView({ issue: 906, review_state: "in-review", approvals: 0 }, "ticket-review", null);
+    ok(zero.progress === 20 && zero.status === "in_review", "#907: in-review w/ 0 approvals still 20%");
+  }
 
   // ── parseReviewItems (scoped to Active Batch, with states) ──────────────
   {

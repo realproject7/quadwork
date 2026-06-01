@@ -168,8 +168,14 @@ Per assigned PR #<n>:
 
 **Completion differs from ticket-review:** a merged PR is already in `main` and **cannot be "fixed before completion"**. So **REQUEST CHANGES does NOT mean "fix the PR"** — it means **follow-up fix tickets are required**. The item reaches `approved` when **both reviewers agree the findings/follow-ups are captured** (tickets filed + summary comment posted), NOT a claim the merged PR was clean. A clean PR (no findings) also reaches `approved` once both reviewers sign off. **Never revert or push code** in a pr-review batch.
 
+### Process each item to completion — do NOT batch-consolidate
+A review batch can hold multiple items. Process them **one at a time, each to completion** — never defer findings to the end of the batch:
+- For the current item, request review; when **both** reviewers have posted a verdict, **immediately** file that item's follow-up fix tickets (if any) + post its review-summary comment + report `@head PR #<n> review complete — findings captured`. Head then marks that item `approved`. Only then proceed to the next item.
+- **Never** wait for every item's reviews and then file all the tickets/comments together at the end. End-of-batch consolidation stalls per-item progress, files nothing visible mid-batch, and freezes the progress panel (the failure mode #907 fixes).
+- A finding-bearing item still reaches `approved` once its tickets are filed + summary posted — `approved` means *findings captured*, not *no findings*.
+
 ### Item-state vocabulary (Head writes these)
-`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations Head maintains on the `## Active Batch` item lines (`- #<n> — <state>`). Your progress reports drive Head's updates.
+`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations Head maintains on the `## Active Batch` item lines (`- #<n> — <state>`). Head advances them **as each reviewer's verdict lands in chat** (not only on your final report), so the progress panel tracks review in real time. A briefly-held `in-review (2/2)` (both approved, you're still filing follow-ups) renders as a *finalizing* state, then becomes `approved` once you report the item complete.
 
 ## Error Recovery
 - **Network failures** (DNS, GitHub API, git push/pull): retry automatically up to 5 times with 30-second intervals. Do NOT ask the user — just retry silently.
