@@ -3799,6 +3799,14 @@ function _saveReseedState(state, statePath = RESEED_STATE_PATH) {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
 }
 
+// #922: per-project throttle for the periodic-tick "stuck deferral" log (the
+// batch-state-unknown / threw paths only). Map: projectId -> consecutive
+// periodic error-deferral count. The first occurrence logs immediately, then
+// once every PERIODIC_DEFER_LOG_EVERY ticks — so a persistently-erroring
+// project stays observable without per-tick spam. Exported for test reset.
+const PERIODIC_DEFER_LOG_EVERY = 15; // ~15 min at the 60s retry-tick cadence
+const _periodicDeferStreak = new Map();
+
 async function autoReseedOnStartup(cfg, opts = {}) {
   const version = opts.version || _readPackageVersion();
   const statePath = opts.statePath || RESEED_STATE_PATH;
@@ -3809,11 +3817,31 @@ async function autoReseedOnStartup(cfg, opts = {}) {
   const performWrites = opts.performWrites || _performReseedWrites;
   // #915: `periodic` = invoked from the recurring retry tick, not boot. A
   // still-deferred project is expected on every tick until its batch clears, so
-  // suppress the deferral log there (it would spam) — reseeded/error events
-  // still log. Deferral is otherwise identical: the project stays pending and
-  // is retried on the next tick, NO server restart required.
+  // suppress the BENIGN active-batch deferral log there (it would spam) —
+  // reseeded/error events still log. Deferral semantics are unchanged: the
+  // project stays pending and is retried on the next tick, no restart.
   const periodic = !!opts.periodic;
-  const logDeferred = periodic ? () => {} : log;
+  const logActiveDeferral = periodic ? () => {} : log;
+  // #922: the error/unknown deferral paths (batch-state check threw OR returned
+  // null) are NOT a healthy active batch — they mean we couldn't confirm the
+  // batch state, so the project stays on old seeds. On the periodic tick these
+  // were also fully suppressed, so a persistently-erroring project was stranded
+  // with zero signal between restarts (the silent-stranding class #915 fought).
+  // Keep them visible but THROTTLED per project: log the first occurrence, then
+  // once per PERIODIC_DEFER_LOG_EVERY ticks. On boot (non-periodic) everything
+  // logs every time, exactly as before.
+  const logStuckDeferral = (projectId, message) => {
+    if (!periodic) { log(message); return; }
+    const streak = (_periodicDeferStreak.get(projectId) || 0) + 1;
+    _periodicDeferStreak.set(projectId, streak);
+    if (streak === 1 || streak % PERIODIC_DEFER_LOG_EVERY === 0) {
+      log(`${message} [still deferred after ${streak} periodic check(s) — check the project's batch/GitHub state]`);
+    }
+  };
+  // A project that is no longer error-deferred (current, reseeded, or a benign
+  // active batch) clears its streak, so a fresh stuck episode logs immediately
+  // rather than waiting out a stale counter.
+  const clearStuckStreak = (projectId) => { _periodicDeferStreak.delete(projectId); };
 
   const state = _loadReseedState(statePath);
   const decisions = [];
@@ -3821,6 +3849,7 @@ async function autoReseedOnStartup(cfg, opts = {}) {
 
   for (const project of projects) {
     if (state.completedByProjectVersion[project.id] === version) {
+      clearStuckStreak(project.id);
       decisions.push({ projectId: project.id, action: "skip", reason: "already current" });
       continue;
     }
@@ -3835,19 +3864,23 @@ async function autoReseedOnStartup(cfg, opts = {}) {
       active = isActiveFromProgress(progress);
     } catch (err) {
       decisions.push({ projectId: project.id, action: "deferred", reason: `batch-state check threw: ${err.message}` });
-      logDeferred(`[reseed] ${project.id}: deferred — batch state unknown (${err.message}); will retry automatically once the batch clears (no restart required)`);
+      logStuckDeferral(project.id, `[reseed] ${project.id}: deferred — batch state unknown (${err.message}); will retry automatically once the batch clears (no restart required)`);
       continue;
     }
     if (active === null) {
       decisions.push({ projectId: project.id, action: "deferred", reason: "batch state unknown" });
-      logDeferred(`[reseed] ${project.id}: deferred — batch state unknown; will retry automatically once the batch clears (no restart required)`);
+      logStuckDeferral(project.id, `[reseed] ${project.id}: deferred — batch state unknown; will retry automatically once the batch clears (no restart required)`);
       continue;
     }
     if (active === true) {
+      clearStuckStreak(project.id);
       decisions.push({ projectId: project.id, action: "deferred", reason: "batch active" });
-      logDeferred(`[reseed] ${project.id}: deferred — batch active; will retry automatically once the batch clears (no restart required)`);
+      logActiveDeferral(`[reseed] ${project.id}: deferred — batch active; will retry automatically once the batch clears (no restart required)`);
       continue;
     }
+    // active === false: batch state is definitively known/idle — no longer
+    // error-deferred, so clear any stuck-streak before attempting the reseed.
+    clearStuckStreak(project.id);
 
     let result;
     try {
@@ -4470,6 +4503,8 @@ module.exports.reviewerRateLimitPayload = reviewerRateLimitPayload;
 // (state corruption, version round-trip, per-project decision matrix).
 module.exports.autoReseedOnStartup = autoReseedOnStartup;
 module.exports._loadReseedState = _loadReseedState;
+module.exports._periodicDeferStreak = _periodicDeferStreak;
+module.exports.PERIODIC_DEFER_LOG_EVERY = PERIODIC_DEFER_LOG_EVERY;
 module.exports._saveReseedState = _saveReseedState;
 module.exports._readPackageVersion = _readPackageVersion;
 module.exports._performReseedWrites = _performReseedWrites;
