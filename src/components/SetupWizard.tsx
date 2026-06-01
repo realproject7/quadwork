@@ -357,6 +357,14 @@ export default function SetupWizard() {
         } else if (status.claude && status.codex) {
           // Both Claude + Codex available — mixed defaults for review diversity
           setBackends({ head: "codex", dev: "claude", re1: "codex", re2: "claude" });
+        } else if (installed.length >= 1) {
+          // #908: any other multi-install combo without claude+codex (e.g.
+          // codex+gemini, claude+gemini). Without this the wizard would keep
+          // its initial all-"claude" default — which may be uninstalled here —
+          // and submit worktrees with an uninstalled backend. Default every
+          // agent to an installed CLI instead.
+          const only = installed[0];
+          setBackends({ head: only, re1: only, re2: only, dev: only });
         }
       })
       .catch(() => {});
@@ -778,29 +786,26 @@ export default function SetupWizard() {
                   {t.modelsStep.desc}
                 </p>
 
-                {/* Single-CLI friendly message */}
-                {cliStatus && !cliStatus.claude && cliStatus.codex && (
-                  <div className="border border-accent/20 bg-accent/5 p-3 mb-4 text-[11px]">
-                    <p className="text-text">You have Codex CLI installed — great! All 4 agents will use Codex.</p>
-                    <p className="text-text-muted mt-1.5">
-                      Tip: Installing Claude Code too gives your team different AI perspectives,
-                      which can improve code review quality. You can add it anytime:
-                    </p>
-                    <p className="text-accent mt-1 font-mono text-[10px]">npm install -g @anthropic-ai/claude-code</p>
-                    <p className="text-text-muted mt-1.5">For now, Codex CLI handles everything perfectly. Let&apos;s continue!</p>
-                  </div>
-                )}
-                {cliStatus && cliStatus.claude && !cliStatus.codex && (
-                  <div className="border border-accent/20 bg-accent/5 p-3 mb-4 text-[11px]">
-                    <p className="text-text">You have Claude Code installed — great! All 4 agents will use Claude.</p>
-                    <p className="text-text-muted mt-1.5">
-                      Tip: Installing Codex CLI too gives your team different AI perspectives,
-                      which can improve code review quality. You can add it anytime:
-                    </p>
-                    <p className="text-accent mt-1 font-mono text-[10px]">npm install -g codex</p>
-                    <p className="text-text-muted mt-1.5">For now, Claude Code handles everything perfectly. Let&apos;s continue!</p>
-                  </div>
-                )}
+                {/* #908: single-CLI friendly message — one generic block for
+                    whichever CLI is the only one installed (claude / codex /
+                    gemini). Replaces the old claude-only + codex-only blocks,
+                    which missed gemini-only and mis-fired for multi-install
+                    combos (e.g. codex+gemini) that aren't single-CLI. */}
+                {cliStatus && (() => {
+                  const installed = (["claude", "codex", "gemini"] as const).filter((c) => cliStatus[c]);
+                  if (installed.length !== 1) return null;
+                  const label = BACKENDS.find((b) => b.value === installed[0])?.label || installed[0];
+                  return (
+                    <div className="border border-accent/20 bg-accent/5 p-3 mb-4 text-[11px]">
+                      <p className="text-text">You have {label} installed — great! All 4 agents will use {label}.</p>
+                      <p className="text-text-muted mt-1.5">
+                        Tip: installing another CLI (Claude Code, Codex, or Gemini) gives your team
+                        different AI perspectives, which can improve code review quality. You can add one anytime.
+                      </p>
+                      <p className="text-text-muted mt-1.5">For now, {label} handles everything perfectly. Let&apos;s continue!</p>
+                    </div>
+                  );
+                })()}
 
                 <div className="border border-border mb-4">
                   {AGENTS.map((agent) => (
