@@ -188,6 +188,7 @@ const COPY = {
 const BACKENDS: { value: string; label: string }[] = [
   { value: "claude", label: "Claude Code" },
   { value: "codex", label: "Codex" },
+  { value: "gemini", label: "Gemini CLI" },
 ];
 
 const AGENTS = [
@@ -329,7 +330,7 @@ export default function SetupWizard() {
   const [loading, setLoading] = useState(false);
   const [workspaceLog, setWorkspaceLog] = useState<string[]>([]);
   const [launchStatus, setLaunchStatus] = useState<"idle" | "running" | "done" | "error">("idle");
-  const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean } | null>(null);
+  const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean } | null>(null);
 
   useEffect(() => {
     setSteps((prev) => [
@@ -346,16 +347,15 @@ export default function SetupWizard() {
   useEffect(() => {
     fetch("/api/cli-status")
       .then((r) => r.json())
-      .then((status: { claude: boolean; codex: boolean }) => {
+      .then((status: { claude: boolean; codex: boolean; gemini: boolean }) => {
         setCliStatus(status);
-        // Default all agents to the available CLI when only one is installed
-        const availableCli = status.claude && !status.codex ? "claude"
-          : !status.claude && status.codex ? "codex"
-          : null;
-        if (availableCli) {
-          setBackends({ head: availableCli, re1: availableCli, re2: availableCli, dev: availableCli });
+        // Default all agents to the available CLI when exactly one is installed
+        const installed = (["claude", "codex", "gemini"] as const).filter((c) => status[c]);
+        if (installed.length === 1) {
+          const only = installed[0];
+          setBackends({ head: only, re1: only, re2: only, dev: only });
         } else if (status.claude && status.codex) {
-          // Both available — use mixed defaults for review diversity
+          // Both Claude + Codex available — mixed defaults for review diversity
           setBackends({ head: "codex", dev: "claude", re1: "codex", re2: "claude" });
         }
       })
@@ -1004,7 +1004,7 @@ export default function SetupWizard() {
                     <div key={agent.key} className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 last:border-b-0">
                       <span className="text-[11px] text-text font-semibold">{agent.label}</span>
                       <span className="text-[10px] text-text-muted">{agent.role}</span>
-                      <span className="text-[11px] text-accent">{backends[agent.key] === "claude" ? "Claude Code" : "Codex"}</span>
+                      <span className="text-[11px] text-accent">{BACKENDS.find((b) => b.value === backends[agent.key])?.label || backends[agent.key]}</span>
                     </div>
                   ))}
                 </div>
