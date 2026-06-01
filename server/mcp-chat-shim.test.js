@@ -143,8 +143,16 @@ async function runTests() {
   });
   const readResp = await readResponse(shim);
   assert(readResp.result?.content?.[0]?.type === "text", "chat_read returns text content");
-  const messages = JSON.parse(readResp.result.content[0].text);
-  assert(Array.isArray(messages), "chat_read returns array");
+  const readBody = JSON.parse(readResp.result.content[0].text);
+  // #932: MCP structuredContent must be a record — chat_read's array of
+  // messages is wrapped in an object so gemini's SDK doesn't reject it with
+  // `invalid_type` (expected record, received array).
+  assert(
+    readBody && typeof readBody === "object" && !Array.isArray(readBody),
+    "#932: chat_read returns an object (record), not a bare array",
+  );
+  const messages = readBody.messages;
+  assert(Array.isArray(messages), "#932: chat_read wraps the message array under `messages`");
   assert(messages.length >= 1, "chat_read contains the sent message");
   assert(messages[messages.length - 1]?.text === "hello from shim @user", "chat_read message text matches");
 
@@ -165,7 +173,7 @@ async function runTests() {
     params: { name: "chat_read", arguments: { since_id: lastId } },
   });
   const sinceResp = await readResponse(shim);
-  const sinceMessages = JSON.parse(sinceResp.result.content[0].text);
+  const sinceMessages = JSON.parse(sinceResp.result.content[0].text).messages;
   assert(sinceMessages.length === 1, "chat_read with since_id returns only new messages");
   assert(sinceMessages[0]?.text === "second message", "since_id filtered message matches");
 

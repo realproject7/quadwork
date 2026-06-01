@@ -94,7 +94,11 @@ async function handleToolCall(id, name, params) {
       if (res.status >= 400) {
         return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
       }
-      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+      // #932: MCP structuredContent must be a record, not a top-level array —
+      // gemini's SDK auto-parses the result text and rejects a bare array with
+      // `invalid_type`. chat_read's body is an array of messages, so wrap it in
+      // an object; chat_send's body is already an object → the guard is a no-op.
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(Array.isArray(res.body) ? { messages: res.body } : res.body) }] });
     }
 
     if (name === "chat_read") {
@@ -106,7 +110,11 @@ async function handleToolCall(id, name, params) {
       if (res.status >= 400) {
         return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
       }
-      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+      // #932: MCP structuredContent must be a record, not a top-level array —
+      // gemini's SDK auto-parses the result text and rejects a bare array with
+      // `invalid_type`. chat_read's body is an array of messages, so wrap it in
+      // an object; chat_send's body is already an object → the guard is a no-op.
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(Array.isArray(res.body) ? { messages: res.body } : res.body) }] });
     }
 
     return jsonRpcError(id, -32601, `Unknown tool: ${name}`);
