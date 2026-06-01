@@ -210,6 +210,27 @@ async function runTests() {
     cleanupSession("proj/head");
   }
 
+  // --- Test 13: re1 on #923 — the idle decision can go STALE during the 1s
+  //     coalesce window. If the target posts a message (becomes recently-sent)
+  //     before the timer fires, the wake must be DEFERRED (pending wake), not
+  //     injected mid-activity (#736) and not lost (#923). ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    const deps = makeDeps();
+    // Idle + not-recently-active at dispatch → takes the coalesce path.
+    dispatchToAgentPTY("proj", makeMsg({ sender: "head", mentions: ["dev"] }), sessions, deps);
+    // Agent posts a chat message DURING the coalesce window → now recently-sent.
+    _lastChatSentAt.set("proj/dev", Date.now());
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 0, "stale-coalesce: now-active agent is NOT injected mid-activity (#736 preserved)");
+    assert(_pendingWake.has("proj/dev"), "stale-coalesce: wake is DEFERRED to a pending wake, not dropped (#923)");
+    // Drains once the agent is quiet (no further PTY output).
+    await new Promise((r) => setTimeout(r, IDLE_THRESHOLD_MS + 100));
+    assert(written.length >= 1, "stale-coalesce: deferred wake still fires once the agent goes quiet — not lost");
+    assert(!_pendingWake.has("proj/dev"), "stale-coalesce: pending wake cleared after drain");
+    cleanupSession("proj/dev");
+  }
+
   // --- Test 9: cleanupSession clears all state ---
   {
     _coalesceTimers.set("proj/dev", { timer: setTimeout(() => {}, 10000), messages: [] });

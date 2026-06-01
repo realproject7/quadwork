@@ -152,10 +152,19 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
     const session = agentSessions.get(key);
     if (!session || !session.term || session.state !== "running") return;
 
-    // #923: the defer-vs-inject decision was already made in dispatchToAgentPTY
-    // (this path is reached only for an idle, not-recently-active agent). Inject
-    // when the coalesce window closes rather than re-suppressing on a recent
-    // send here — re-suppression is what dropped wakes for standing-by agents.
+    // re1 on #923: the idle / not-recently-active decision was made at dispatch
+    // time, but it can go stale during the 1s coalesce window — the agent may
+    // have started a turn or posted a message in the meantime. Re-check at fire
+    // time: if it is now active, DEFER via a pending wake (which drains once it
+    // goes quiet) rather than injecting mid-activity (#736). Crucially this
+    // defers, it does NOT drop (#923) — the drain still delivers the wake.
+    const lastSent = _lastChatSentAt.get(key);
+    const recentlySent = lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS);
+    if (isAgentBusy(session) || recentlySent) {
+      queuePendingWake(key, session, deps);
+      return;
+    }
+
     injectIntoTerm(session.term, buildInjectionPrompt(agentId), deps);
   }, COALESCE_WINDOW_MS);
 
