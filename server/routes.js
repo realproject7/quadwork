@@ -2422,7 +2422,22 @@ function resolveDisplayedBatch(
     // reviewItems [] — identical to what the snapshot already holds.
     if (current.issueNumbers.length > 0) {
       next.batch_type = parseBatchType(queueText);
-      next.reviewItems = parseReviewItems(queueText);
+      // re1 on #900: MERGE, don't replace. When Head moves an approved item out
+      // of Active Batch (→ Done) before the whole batch is archived, the snapshot
+      // still preserves its issue number in next.issueNumbers, but the LIVE queue
+      // no longer carries its line. A wholesale `parseReviewItems(queueText)`
+      // would drop that item's final state from the displayed set (and from the
+      // re-persisted snapshot). So derive reviewItems across the preserved issue
+      // set: live state for items still in Active Batch, snapshot state for items
+      // moved to Done, queued as a last-resort default for any issue number with
+      // neither. This keeps the per-item count aligned with next.issueNumbers.
+      const liveByIssue = new Map(parseReviewItems(queueText).map((r) => [r.issue, r]));
+      const snapByIssue = new Map(
+        (Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : []).map((r) => [r.issue, r]),
+      );
+      next.reviewItems = next.issueNumbers.map(
+        (n) => liveByIssue.get(n) || snapByIssue.get(n) || { issue: n, review_state: "queued", approvals: 0 },
+      );
     }
   }
   // Snapshot persists batchNumber/issueNumbers (existing consumers) PLUS the

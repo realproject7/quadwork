@@ -128,6 +128,38 @@ function run() {
     ok(isComplete(res.reviewItems) === true, "fresh stale snapshot + all-approved live queue → complete (would freeze at queued without the fix)");
   }
 
+  // ── re1 on #900: Done-moved review item must NOT be dropped. Snapshot holds
+  //    [A, B] with A already approved; Head moves A to Done so the live Active
+  //    Batch carries only B. B then progresses to approved. The merge must keep
+  //    A (from the snapshot) AND refresh B (from the live queue) across the
+  //    preserved issue set — both visible with final states through to archive. ──
+  {
+    const A = 836, B = 850;
+    const dm = makeStore({
+      batchNumber: 61,
+      issueNumbers: [A, B],
+      batch_type: "ticket-review",
+      // A already approved (its last in-Active state, persisted before the move);
+      // B mid-review at the time the snapshot was last written.
+      reviewItems: [{ issue: A, review_state: "approved", approvals: 2 }, { issue: B, review_state: "in-review", approvals: 1 }],
+    });
+    // Live Active Batch: only B remains (A moved to Done), B now approved.
+    const liveOnlyB = reviewQueue([[B, "approved"]]);
+    const res = resolveDisplayedBatch(liveOnlyB, "proj-dm", dm.opts);
+    ok(res.issueNumbers.length === 2 && res.issueNumbers.includes(A) && res.issueNumbers.includes(B), "done-moved: snapshot keeps BOTH issue numbers (A moved to Done, B live)");
+    ok(res.reviewItems.length === 2, "done-moved: reviewItems still covers both A and B (not just the live line)");
+    ok(stateOf(res.reviewItems, A) === "approved", "done-moved: A keeps its snapshot-preserved approved state (not dropped)");
+    ok(stateOf(res.reviewItems, B) === "approved", "done-moved: B refreshed to its LIVE approved state");
+    ok(isComplete(res.reviewItems) === true, "done-moved: complete reflects BOTH items approved (2/2, not 1/1)");
+    ok(stateOf(dm.get().reviewItems, A) === "approved", "done-moved: snapshot re-persists A's approved state for the next cycle");
+
+    // Now archive: Active Batch cleared. Sticky view must still show A AND B, both approved.
+    const archived = reviewQueue([[A], [B]], { cleared: true });
+    const arch = resolveDisplayedBatch(archived, "proj-dm", dm.opts);
+    ok(arch.reviewItems.length === 2 && stateOf(arch.reviewItems, A) === "approved" && stateOf(arch.reviewItems, B) === "approved", "done-moved → archive: sticky view shows BOTH A and B with final approved states");
+    ok(isComplete(arch.reviewItems) === true, "done-moved → archive: still complete (2/2)");
+  }
+
   // ── Code-batch no-regression: snapshot stickiness still preserves items Head
   //    moved to Done (issueNumbers from the snapshot), and the live refresh is a
   //    no-op (batch_type "code", reviewItems []) for a code queue. ──
