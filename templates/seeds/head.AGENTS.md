@@ -115,7 +115,7 @@ When the operator asks you in chat to start a task or batch:
 
    **Batch:** <N>
    **Started:** <YYYY-MM-DD HH:MM>
-   **Status:** pending kickoff
+   **Status:** active
 
    - #598 Fix duplicate restart
    - #600 Display version in sidebar
@@ -125,17 +125,14 @@ When the operator asks you in chat to start a task or batch:
 
    When you move a batch to Done, **preserve its `Batch: N` line** so the next batch's number computation stays correct.
 3. Reply in chat to confirm what you wrote to the queue file (issue numbers + which section).
-4. **Tell the operator the queue is ready.** Send a chat message like:
+4. **Decide whether to start now or hold — by the operator's intent:**
+   - **Explicit request to run / start / review** (the common case — "run batch", "start", "review tickets/PRs #X", or any message that hands you work to do now): the request *is* the kickoff. Confirm what you wrote to the queue, then **immediately assign the first item to `@dev`** (step 5). Do NOT ask the operator to "Start" again, and do NOT wait for the Scheduled Trigger — a second step is needless friction, especially when the operator is an MCP agent rather than a human at the dashboard. Stamp the Active Batch `**Status:** active`.
+   - **Deliberate pre-stage** ("set up the batch but don't start yet", "queue it for later", "stage it for the overnight trigger"): stamp `**Status:** pending kickoff`, confirm the queue is ready and that you're holding, and send:
 
-   > Batch N is ready with tickets #X, #Y, #Z. Say "@head Start" to begin, or use the Scheduled Trigger for timed operation.
+     > Batch N is ready with tickets #X, #Y, #Z. Say "@head Start" to begin, or use the Scheduled Trigger for timed operation.
 
-   Always send this after step 3, even if the operator only asked for a single ticket.
-5. **Start assigning when EITHER:**
-   - The operator says "Start", "Go", "Begin", or similar in chat addressed to `@head`
-   - The Scheduled Trigger fires
-
-   Do NOT require the Scheduled Trigger — the operator's direct chat command is sufficient. Do NOT start assignments the moment the queue file is written; wait for one of the two signals above.
-6. Once kickoff is signaled, assign the first item to `@dev` following the normal workflow below.
+     Then start assigning only when the operator says "Start"/"Go"/"Begin" addressed to `@head`, OR the Scheduled Trigger fires.
+5. Assign the first Active Batch item to `@dev` following the normal workflow below.
 
 ### After each merge
 1. Move the merged item from **Active Batch** to **Done** in `OVERNIGHT-QUEUE.md`.
@@ -162,7 +159,7 @@ When the operator asks to "review tickets #X #Y #Z":
    ```
 
    Each item is `- #<n> — <state>` (dash, space, `#`, number, space, em-dash, space, state). The `#` must be the first token after the list marker, exactly as for code batches.
-2. Confirm in chat, then use the normal "Batch N is ready … Say @head Start" kickoff. On Start, assign the first ticket to `@dev`.
+2. Confirm in chat, then apply the same kickoff rule as a code batch (Operator → Head flow, step 4): an explicit "review …" request **is** the go-ahead → assign the first item to `@dev` immediately; only a deliberate pre-stage holds for an explicit Start or the Scheduled Trigger.
 3. **Advance each item's state annotation IN PLACE as reviewer verdicts land in chat** — `queued` → `in-review` (Dev requested review) → `in-review (1/2)` (one reviewer approved) → `in-review (2/2)` (both approved, Dev still finalizing) → `approved`. Track this from the **reviewer verdicts you see in chat**, NOT only from Dev's final report — so the progress panel reflects review in real time instead of freezing. Use `changes-requested` if a reviewer asks for changes. Do **NOT** move items individually to `## Done`; they stay in `## Active Batch` with their annotation until the whole batch is done.
    - **Per item, not batch-consolidated:** once both reviewers approve **and** Dev reports the item complete (follow-up tickets filed + summary comment posted), write that item `approved` and let Dev proceed to the next item. Don't wait for the whole batch before advancing states. (`in-review (2/2)` is only a brief finalizing state; the panel renders it sensibly — never a stuck "in review · 2/2".)
 4. When **every** item is `approved`, the batch is complete (no merge). Archive the whole block to `## Done` exactly as a finished code batch, **preserving the `**Batch:** N` and `**Batch type:** ticket-review` lines** (so batch numbering stays correct and the archived batch still renders right).
