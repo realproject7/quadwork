@@ -3604,6 +3604,14 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
+  // #915: a manual reseed writes the current-version seeds, so advance the
+  // auto-reseed marker too — otherwise it read stale (e.g. 2.2.1) after a
+  // manual reseed to 2.3.0 and auto-reseed redundantly re-ran on next boot.
+  try {
+    const state = _loadReseedState();
+    state.completedByProjectVersion[projectId] = _readPackageVersion();
+    _saveReseedState(state);
+  } catch { /* best-effort marker update; auto-reseed re-running is harmless/idempotent */ }
   return res.json({
     ok: true,
     reseeded: result.reseeded,
@@ -3734,6 +3742,13 @@ async function autoReseedOnStartup(cfg, opts = {}) {
   const getProgress = opts.getProgress || getOrComputeBatchProgress;
   const isActiveFromProgress = opts.isActiveFromProgress || isBatchActiveFromProgress;
   const performWrites = opts.performWrites || _performReseedWrites;
+  // #915: `periodic` = invoked from the recurring retry tick, not boot. A
+  // still-deferred project is expected on every tick until its batch clears, so
+  // suppress the deferral log there (it would spam) — reseeded/error events
+  // still log. Deferral is otherwise identical: the project stays pending and
+  // is retried on the next tick, NO server restart required.
+  const periodic = !!opts.periodic;
+  const logDeferred = periodic ? () => {} : log;
 
   const state = _loadReseedState(statePath);
   const decisions = [];
@@ -3755,17 +3770,17 @@ async function autoReseedOnStartup(cfg, opts = {}) {
       active = isActiveFromProgress(progress);
     } catch (err) {
       decisions.push({ projectId: project.id, action: "deferred", reason: `batch-state check threw: ${err.message}` });
-      log(`[reseed] ${project.id}: deferred — batch state unknown (${err.message}); will retry on next startup`);
+      logDeferred(`[reseed] ${project.id}: deferred — batch state unknown (${err.message}); will retry automatically once the batch clears (no restart required)`);
       continue;
     }
     if (active === null) {
       decisions.push({ projectId: project.id, action: "deferred", reason: "batch state unknown" });
-      log(`[reseed] ${project.id}: deferred — batch state unknown; will retry on next startup`);
+      logDeferred(`[reseed] ${project.id}: deferred — batch state unknown; will retry automatically once the batch clears (no restart required)`);
       continue;
     }
     if (active === true) {
       decisions.push({ projectId: project.id, action: "deferred", reason: "batch active" });
-      log(`[reseed] ${project.id}: deferred — batch active; will retry on next startup`);
+      logDeferred(`[reseed] ${project.id}: deferred — batch active; will retry automatically once the batch clears (no restart required)`);
       continue;
     }
 
@@ -3774,7 +3789,7 @@ async function autoReseedOnStartup(cfg, opts = {}) {
       result = performWrites(project, cfg, {});
     } catch (err) {
       decisions.push({ projectId: project.id, action: "error", error: err.message });
-      log(`[reseed] ${project.id}: ERROR — ${err.message}; state NOT advanced, will retry on next startup`);
+      log(`[reseed] ${project.id}: ERROR — ${err.message}; state NOT advanced, will retry automatically (next tick or restart)`);
       continue;
     }
 

@@ -1815,6 +1815,29 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   setInterval(autoStopPollingTick, AUTO_STOP_POLL_INTERVAL_MS);
 }
 
+// #915: retry deferred reseeds without a server restart. A reseed deferred on
+// boot because a project's batch was active used to wait for the next startup —
+// stranding a busy project on old seeds indefinitely. autoReseedOnStartup is
+// idempotent (current projects skip, active ones defer, idle pending ones get
+// re-seeded), so re-running it on a tick re-attempts any pending project once
+// its batch clears, keeping the fail-closed mid-batch guard intact.
+const RESEED_RETRY_INTERVAL_MS = 60_000;
+let _reseedRetryRunning = false;
+async function reseedRetryTick() {
+  if (_reseedRetryRunning) return; // a slow tick must not overlap the next
+  _reseedRetryRunning = true;
+  try {
+    await routes.autoReseedOnStartup(readConfig(), { periodic: true });
+  } catch (err) {
+    console.error(`[reseed] periodic retry failed: ${err.message}`);
+  } finally {
+    _reseedRetryRunning = false;
+  }
+}
+if (!process.env.QUADWORK_SKIP_LISTEN) {
+  setInterval(reseedRetryTick, RESEED_RETRY_INTERVAL_MS);
+}
+
 // #422 / quadwork#310: auto-continue after loop guard.
 //
 // Per opted-in project, poll AC's /api/status every 10s. When we see
