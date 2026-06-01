@@ -193,8 +193,8 @@ function quietLog() {
     assert.deepEqual(out.decisions[0], { projectId: "busy", action: "deferred", reason: "batch active" });
     assert.deepEqual(ctx.writes, []);
     assert.deepEqual(_loadReseedState(ctx.statePath), { completedByProjectVersion: {} });
-    assert.ok(ctx.lines.some((l) => /will retry on next startup/.test(l)),
-      "deferral is logged with retry hint");
+    assert.ok(ctx.lines.some((l) => /will retry automatically once the batch clears/.test(l)),
+      "deferral is logged with the no-restart retry hint");
   }
 
   // 5. Batch state unknown (null result) → defer.
@@ -377,6 +377,64 @@ function quietLog() {
       performWrites: (p) => { writesAgain.push(p.id); return _performReseedWrites(p, cfg); },
     });
     assert.deepEqual(writesAgain, [], "second startup at same version skips already-current projects");
+  }
+
+  // 11. #915: deferred (active) → periodic retry once the batch clears re-seeds
+  //     WITHOUT a server restart. Simulates the recurring reseedRetryTick:
+  //     same statePath re-used across calls, no boot in between.
+  {
+    const cfg = { projects: [{ id: "busy915", working_dir: "/tmp/busy915" }] };
+    const dir = tmp("periodic-retry");
+    const statePath = path.join(dir, "state.json");
+    let batchActive = true;
+    const writes = [];
+    const performWrites = (p) => { writes.push(p.id); return { reseeded: ["head/AGENTS.md"], skipped: [], preserved: {} }; };
+    const getProgress = async () => batchActive
+      ? { items: [{ status: "in_review" }], complete: false }
+      : { items: [], complete: false };
+    const { log, lines } = quietLog();
+    const tick = () => autoReseedOnStartup(cfg, { version: "2.1.0", statePath, getProgress, performWrites, log, periodic: true });
+
+    // Tick 1 + 2 while the batch is active: deferred, state unchanged, NO writes.
+    await tick();
+    await tick();
+    assert.deepEqual(writes, [], "periodic ticks during an active batch never reseed");
+    assert.equal(_loadReseedState(statePath).completedByProjectVersion.busy915, undefined, "state stays pending while deferred");
+    assert.ok(!lines.some((l) => /busy915/.test(l)), "periodic deferral is NOT logged (no per-tick spam)");
+
+    // Batch clears → next tick reseeds, no restart needed.
+    batchActive = false;
+    const out = await tick();
+    assert.equal(out.decisions[0].action, "reseeded");
+    assert.deepEqual(writes, ["busy915"], "reseed runs on the tick after the batch clears");
+    assert.equal(_loadReseedState(statePath).completedByProjectVersion.busy915, "2.1.0", "state advances once reseeded");
+
+    // Further ticks are a no-op skip (idempotent).
+    writes.length = 0;
+    const out2 = await tick();
+    assert.equal(out2.decisions[0].action, "skip");
+    assert.deepEqual(writes, [], "already-current project is skipped on later ticks");
+  }
+
+  // 12. #915: periodic=false (startup) still logs the deferral; periodic=true
+  //     suppresses it — same decision either way.
+  {
+    const cfg = { projects: [{ id: "loud", working_dir: "/tmp/loud" }] };
+    const mk = (periodic) => {
+      const dir = tmp(`log-${periodic}`);
+      const statePath = path.join(dir, "state.json");
+      const { log, lines } = quietLog();
+      return { lines, run: () => autoReseedOnStartup(cfg, {
+        version: "2.1.0", statePath, log, periodic,
+        getProgress: async () => ({ items: [{ status: "in_review" }], complete: false }),
+      }) };
+    };
+    const boot = mk(false); const bootOut = await boot.run();
+    const tickCtx = mk(true); const tickOut = await tickCtx.run();
+    assert.equal(bootOut.decisions[0].action, "deferred");
+    assert.equal(tickOut.decisions[0].action, "deferred");
+    assert.ok(boot.lines.some((l) => /loud/.test(l)), "startup logs the deferral");
+    assert.ok(!tickCtx.lines.some((l) => /loud/.test(l)), "periodic tick suppresses the deferral log");
   }
 
   console.log("routes.autoReseed.test.js: all assertions passed");
