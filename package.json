@@ -13,6 +13,10 @@
     "!server/__tests__/",
     "templates/",
     "out/",
+    "docs/install-mac.md",
+    "docs/install-windows.md",
+    "docs/install-vps.md",
+    "docs/troubleshooting.md",
     "docs/operator-mcp.md",
     "docs/review-batches.md",
     "skills/"
