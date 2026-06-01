@@ -2570,7 +2570,13 @@ function reviewItemView(ri, batchType, ghIndex) {
   if (ri.review_state === "approved") { progress = 100; status = "approved"; label = "Approved ✓"; }
   else if (ri.review_state === "changes-requested") { progress = 0; status = "changes_requested"; label = "changes requested"; }
   else if (ri.review_state === "in-review") {
-    if (ri.approvals >= 1) { progress = 50; status = "in_review"; label = `In review · ${ri.approvals}/2 approvals`; }
+    // #907: a 2/2-approved item that Head hasn't yet written `approved`
+    // (Dev is still filing follow-ups / posting the summary) must NOT render
+    // as "50% · In review · 2/2" — that's self-contradictory. Resolve it to a
+    // high-progress finalizing state with a non-contradictory label. The
+    // batch still only reads complete on the literal `approved` state.
+    if (ri.approvals >= 2) { progress = 90; status = "finalizing"; label = "Approved (2/2) · finalizing"; }
+    else if (ri.approvals === 1) { progress = 50; status = "in_review"; label = "In review · 1/2 approvals"; }
     else { progress = 20; status = "in_review"; label = "In review"; }
   } else { progress = 0; status = "queued"; label = "Queued"; }
   const item = {

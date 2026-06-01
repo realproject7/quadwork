@@ -13,7 +13,8 @@ interface BatchProgressItem {
   // not planned, or runbook-only). Rendered at 100% like merged
   // but with a distinct label from the server.
   // #871: review batches add "approved" / "changes_requested" statuses.
-  status: "queued" | "in_review" | "approved1" | "ready" | "merged" | "closed" | "approved" | "changes_requested" | "unknown";
+  // #907: "finalizing" = both reviewers approved, item not yet written `approved`.
+  status: "queued" | "in_review" | "finalizing" | "approved1" | "ready" | "merged" | "closed" | "approved" | "changes_requested" | "unknown";
   progress: number; // 0..100
   label: string;
   // #871: present only on review-batch items (extends the shape from #870).
@@ -48,7 +49,7 @@ const COPY = {
     allReviewed: (n: number) => `All ${n} items approved. Waiting for the next batch.`,
     itemsCount: (n: number) => `(${n} items)`,
     // #871: review-state labels (mirror the existing PR approval wording).
-    rs: { queued: "queued", inReview: "in review", oneOfTwo: "1 of 2 approvals", approved: "approved", changesRequested: "changes requested" },
+    rs: { queued: "queued", inReview: "in review", oneOfTwo: "1 of 2 approvals", finalizing: "2 of 2 · finalizing", approved: "approved", changesRequested: "changes requested" },
     reviewSummary: (approved: number, total: number, needSecond: number, changes: number) => {
       const parts = [`${approved}/${total} reviewed`];
       if (needSecond > 0) parts.push(`${needSecond} need 2nd approval`);
@@ -80,7 +81,7 @@ const COPY = {
     allReviewed: (n: number) => `${n}개 항목 모두 승인됨. 다음 배치를 기다리는 중.`,
     itemsCount: (n: number) => `(${n}개 항목)`,
     // #871: 리뷰 상태 라벨.
-    rs: { queued: "대기 중", inReview: "검토 중", oneOfTwo: "2명 중 1명 승인", approved: "승인됨", changesRequested: "변경 요청됨" },
+    rs: { queued: "대기 중", inReview: "검토 중", oneOfTwo: "2명 중 1명 승인", finalizing: "2명 모두 승인 · 마무리 중", approved: "승인됨", changesRequested: "변경 요청됨" },
     reviewSummary: (approved: number, total: number, needSecond: number, changes: number) => {
       const parts = [`${approved}/${total} 검토됨`];
       if (needSecond > 0) parts.push(`${needSecond}건 2차 승인 필요`);
@@ -102,11 +103,13 @@ const COPY = {
 } as const;
 
 // #871: localized label for a review-batch item, derived from review_state.
-function reviewLabel(item: BatchProgressItem, rs: { queued: string; inReview: string; oneOfTwo: string; approved: string; changesRequested: string }): string {
+function reviewLabel(item: BatchProgressItem, rs: { queued: string; inReview: string; oneOfTwo: string; finalizing: string; approved: string; changesRequested: string }): string {
   switch (item.review_state) {
     case "approved": return rs.approved;
     case "changes-requested": return rs.changesRequested;
-    case "in-review": return (item.approvals ?? 0) >= 1 ? rs.oneOfTwo : rs.inReview;
+    // #907: 2/2 approvals (not yet written `approved`) is a finalizing state,
+    // never "1 of 2"; 1/2 shows "1 of 2 approvals".
+    case "in-review": return (item.approvals ?? 0) >= 2 ? rs.finalizing : (item.approvals ?? 0) === 1 ? rs.oneOfTwo : rs.inReview;
     case "queued":
     default: return rs.queued;
   }
@@ -268,7 +271,7 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
         let summaryText = data.summary;
         if (isReview) {
           const approved = data.items.filter((it) => it.review_state === "approved").length;
-          const needSecond = data.items.filter((it) => it.review_state === "in-review" && (it.approvals ?? 0) >= 1).length;
+          const needSecond = data.items.filter((it) => it.review_state === "in-review" && (it.approvals ?? 0) === 1).length;
           const changes = data.items.filter((it) => it.review_state === "changes-requested").length;
           summaryText = t.reviewSummary(approved, data.items.length, needSecond, changes);
         }
