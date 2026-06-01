@@ -2438,6 +2438,28 @@ function resolveDisplayedBatch(
       next.reviewItems = next.issueNumbers.map(
         (n) => liveByIssue.get(n) || snapByIssue.get(n) || { issue: n, review_state: "queued", approvals: 0 },
       );
+    } else {
+      // #925: the Active Batch is empty → this is the just-ARCHIVED batch's
+      // sticky display (#870). The snapshot's reviewItems can be frozen at a
+      // pre-final state when the last item's approval + the archive landed
+      // between polls, so the panel never read as complete. Head's matching
+      // `## Done` block holds the authoritative final states — read them for
+      // THIS batch only. Gated on the Done block being a review batch, so code
+      // batches (Done lines carry no state → "queued") are left untouched and
+      // keep using the GitHub-derived path. Merge across the preserved issue
+      // set (Done state first, then snapshot, then queued) to stay aligned with
+      // next.issueNumbers — same shape as the #899/#900 live-refresh above.
+      const doneBatch = parseDoneBatchReviewItems(queueText, next.batchNumber);
+      if (doneBatch && REVIEW_BATCH_TYPES.has(doneBatch.batch_type) && doneBatch.reviewItems.length > 0) {
+        next.batch_type = doneBatch.batch_type;
+        const doneByIssue = new Map(doneBatch.reviewItems.map((r) => [r.issue, r]));
+        const snapByIssue = new Map(
+          (Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : []).map((r) => [r.issue, r]),
+        );
+        next.reviewItems = next.issueNumbers.map(
+          (n) => doneByIssue.get(n) || snapByIssue.get(n) || { issue: n, review_state: "queued", approvals: 0 },
+        );
+      }
     }
   }
   // Snapshot persists batchNumber/issueNumbers (existing consumers) PLUS the
@@ -2557,6 +2579,49 @@ function parseReviewItems(queueText) {
     items.push({ issue: n, review_state, approvals });
   }
   return items;
+}
+
+// #925: parse the per-item review states from the ONE `## Done` block whose
+// `**Batch:** N` matches `batchNumber`. After a review batch is archived the
+// Active Batch is empty, so resolveDisplayedBatch serves the snapshot — whose
+// reviewItems can be frozen at a pre-final state (the final approval + archive
+// happened between the 30s polls). Head's Done block holds the AUTHORITATIVE
+// final states, so for the archived (displayed) batch we read them from there.
+// Scoped to the single matching block — every OTHER Done batch stays ignored
+// (#870: never count `## Done` for progress beyond this one sticky block).
+// Returns { batch_type, reviewItems } or null if no matching block exists.
+const DONE_SECTION_RE = /##\s+Done\b[\s\S]*?(?=\n##\s|$)/i;
+const DONE_BATCH_MARKER_RE = /\*\*Batch:\*\*\s*(\d+)/g;
+function parseDoneBatchReviewItems(queueText, batchNumber) {
+  if (typeof queueText !== "string" || !queueText || !Number.isInteger(batchNumber)) return null;
+  const dm = queueText.match(DONE_SECTION_RE);
+  if (!dm) return null;
+  const done = dm[0];
+  // Split the Done section into per-batch blocks at each `**Batch:** N` marker
+  // (`**Batch type:**` is NOT matched — it has no `:` right after "Batch").
+  const markers = [];
+  let mk;
+  DONE_BATCH_MARKER_RE.lastIndex = 0;
+  while ((mk = DONE_BATCH_MARKER_RE.exec(done)) !== null) {
+    markers.push({ num: parseInt(mk[1], 10), start: mk.index });
+  }
+  const idx = markers.findIndex((b) => b.num === batchNumber);
+  if (idx === -1) return null;
+  const block = done.slice(markers[idx].start, idx + 1 < markers.length ? markers[idx + 1].start : done.length);
+  const tm = block.match(/\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\b/i);
+  const batch_type = tm ? tm[1].toLowerCase() : "code";
+  const seen = new Set();
+  const reviewItems = [];
+  for (const line of block.split("\n")) {
+    const lm = line.match(REVIEW_ITEM_LINE_RE);
+    if (!lm) continue;
+    const n = parseInt(lm[1], 10);
+    if (seen.has(n)) continue;
+    seen.add(n);
+    const { review_state, approvals } = parseReviewState(lm[2]);
+    reviewItems.push({ issue: n, review_state, approvals });
+  }
+  return { batch_type, reviewItems };
 }
 
 // Map a parsed review state → the batch-progress item, EXTENDING the existing
@@ -4348,6 +4413,7 @@ module.exports.pickDisplayedSource = pickDisplayedSource;
 // #870: expose review-batch parsers/helpers for the reviewBatch fixture test.
 module.exports.parseBatchType = parseBatchType;
 module.exports.parseReviewItems = parseReviewItems;
+module.exports.parseDoneBatchReviewItems = parseDoneBatchReviewItems;
 module.exports.parseReviewState = parseReviewState;
 module.exports.reviewItemView = reviewItemView;
 module.exports.summarizeReviewItems = summarizeReviewItems;
