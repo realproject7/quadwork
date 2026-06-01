@@ -215,7 +215,9 @@ cadence → `batch_status` to watch progress.
 > authentication.
 
 Full tool reference, Claude Desktop config, and remote/VPS registration:
-**[docs/operator-mcp.md](docs/operator-mcp.md)**.
+**[docs/operator-mcp.md](docs/operator-mcp.md)**. For an agent-facing operating
+playbook (registration + workflow recipes as a Claude skill), see
+**[skills/quadwork-operator/SKILL.md](skills/quadwork-operator/SKILL.md)**.
 
 ## ─ Review batches
 
