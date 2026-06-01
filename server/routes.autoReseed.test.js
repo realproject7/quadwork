@@ -36,6 +36,8 @@ const {
   _saveReseedState,
   _readPackageVersion,
   _performReseedWrites,
+  _periodicDeferStreak,
+  PERIODIC_DEFER_LOG_EVERY,
 } = require("./routes");
 
 function tmp(label) {
@@ -434,7 +436,91 @@ function quietLog() {
     assert.equal(bootOut.decisions[0].action, "deferred");
     assert.equal(tickOut.decisions[0].action, "deferred");
     assert.ok(boot.lines.some((l) => /loud/.test(l)), "startup logs the deferral");
-    assert.ok(!tickCtx.lines.some((l) => /loud/.test(l)), "periodic tick suppresses the deferral log");
+    assert.ok(!tickCtx.lines.some((l) => /loud/.test(l)), "periodic tick suppresses the benign active-batch deferral log");
+  }
+
+  // 13. #922: periodic + batch-state check THREW → the error deferral is
+  //     visible but THROTTLED — logs on the first occurrence, stays silent
+  //     within the window, then re-logs once per PERIODIC_DEFER_LOG_EVERY ticks.
+  {
+    _periodicDeferStreak.clear();
+    const cfg = { projects: [{ id: "stuck13", working_dir: "/tmp/stuck13" }] };
+    const statePath = path.join(tmp("stuck13"), "state.json");
+    const { log, lines } = quietLog();
+    const tick = () => autoReseedOnStartup(cfg, {
+      version: "2.1.0", statePath, log, periodic: true,
+      getProgress: async () => { throw new Error("gh down"); },
+    });
+    await tick(); // tick 1
+    assert.equal(lines.filter((l) => /stuck13/.test(l)).length, 1, "periodic error-deferral logs on the FIRST occurrence (not silent)");
+    assert.ok(lines.some((l) => /still deferred after 1 periodic/.test(l)), "first stuck log carries the escalation hint");
+    for (let i = 2; i < PERIODIC_DEFER_LOG_EVERY; i++) await tick(); // ticks 2..N-1
+    assert.equal(lines.filter((l) => /stuck13/.test(l)).length, 1, "error-deferrals within the window are throttled (no per-tick spam)");
+    await tick(); // tick N == PERIODIC_DEFER_LOG_EVERY
+    assert.equal(lines.filter((l) => /stuck13/.test(l)).length, 2, "re-logs once per PERIODIC_DEFER_LOG_EVERY ticks");
+    assert.ok(lines.some((l) => new RegExp(`after ${PERIODIC_DEFER_LOG_EVERY} periodic`).test(l)), "escalation log reports the streak length");
+    // Fail-closed unchanged: a thrown batch-state check still defers, never reseeds.
+    const out = await tick();
+    assert.equal(out.decisions[0].action, "deferred", "thrown batch-state check still defers (fail-closed preserved)");
+  }
+
+  // 14. #922: periodic + batch state null (unknown) is ALSO surfaced (throttled),
+  //     not silently dropped — same error class as a throw.
+  {
+    _periodicDeferStreak.clear();
+    const cfg = { projects: [{ id: "null14", working_dir: "/tmp/null14" }] };
+    const statePath = path.join(tmp("null14"), "state.json");
+    const { log, lines } = quietLog();
+    await autoReseedOnStartup(cfg, {
+      version: "2.1.0", statePath, log, periodic: true,
+      getProgress: async () => null, isActiveFromProgress: () => null,
+    });
+    assert.ok(lines.some((l) => /null14.*deferred — batch state unknown/.test(l)), "periodic null-state deferral is visible (throttled), not silent");
+  }
+
+  // 15. #922: a BENIGN active-batch deferral on the periodic tick stays silent
+  //     (no spam) AND does not accumulate a stuck-streak (#915 preserved).
+  {
+    _periodicDeferStreak.clear();
+    const cfg = { projects: [{ id: "busy15", working_dir: "/tmp/busy15" }] };
+    const statePath = path.join(tmp("busy15"), "state.json");
+    const { log, lines } = quietLog();
+    const tick = () => autoReseedOnStartup(cfg, {
+      version: "2.1.0", statePath, log, periodic: true,
+      getProgress: async () => ({ items: [{ status: "in_review" }], complete: false }),
+    });
+    await tick(); await tick(); await tick();
+    assert.ok(!lines.some((l) => /busy15/.test(l)), "benign active-batch deferral is never logged on the periodic tick");
+    assert.ok(!_periodicDeferStreak.has("busy15"), "benign active deferral does not accumulate a stuck-streak");
+  }
+
+  // 16. #922: the stuck-streak RESETS when the project stops error-deferring, so
+  //     a fresh stuck episode logs immediately; and boot (non-periodic) logs
+  //     every error-deferral with no throttle.
+  {
+    _periodicDeferStreak.clear();
+    const cfg = { projects: [{ id: "reset16", working_dir: "/tmp/reset16" }] };
+    const statePath = path.join(tmp("reset16"), "state.json");
+    const { log, lines } = quietLog();
+    let mode = "throw";
+    const tick = () => autoReseedOnStartup(cfg, {
+      version: "2.1.0", statePath, log, periodic: true,
+      getProgress: async () => { if (mode === "throw") throw new Error("blip"); return { items: [{ status: "in_review" }], complete: false }; },
+    });
+    await tick(); // throw → streak 1 → logs
+    assert.equal(lines.filter((l) => /reset16/.test(l)).length, 1, "first stuck episode logs");
+    mode = "active"; await tick(); // benign active → clears streak, silent
+    assert.ok(!_periodicDeferStreak.has("reset16"), "streak cleared once the project is no longer error-deferred");
+    mode = "throw"; await tick(); // fresh episode → logs immediately
+    assert.equal(lines.filter((l) => /reset16/.test(l)).length, 2, "a fresh stuck episode logs immediately (streak reset, not waiting out the window)");
+
+    const { log: blog, lines: blines } = quietLog();
+    const boot = () => autoReseedOnStartup(cfg, {
+      version: "2.1.0", statePath, log: blog, periodic: false,
+      getProgress: async () => { throw new Error("blip"); },
+    });
+    await boot(); await boot(); await boot();
+    assert.equal(blines.filter((l) => /reset16/.test(l)).length, 3, "boot (non-periodic) logs every error-deferral — no throttle");
   }
 
   console.log("routes.autoReseed.test.js: all assertions passed");
