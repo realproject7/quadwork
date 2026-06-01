@@ -187,6 +187,64 @@ Head: merges, picks the next issue
 - 🛑 **Sender lockdown** — chat POSTs can't impersonate an agent (`head`, `dev`, …) from the UI
 - 🗄️ **Auto-snapshot** of chat history to `~/.quadwork/{project}/history-snapshots/` with an in-dashboard **Restore** button
 
+## ─ Operator MCP
+
+Drive QuadWork from an **external Claude agent** — Claude Code or Claude
+Desktop — instead of clicking the dashboard. QuadWork ships a stdio
+[Model Context Protocol](https://modelcontextprotocol.io) server that exposes
+the same operator surface as tools: read team chat and batch progress, define
+and run overnight batches, and control individual agents.
+
+Register it with the bundled bin (one line):
+
+```bash
+claude mcp add quadwork -- quadwork-mcp-operator --port 8400
+```
+
+The tools come in two tiers:
+
+- **Read / observe** — `list_projects`, `read_chat`, `batch_status`, `read_queue`, `list_agents` (no state change).
+- **Act** — `send_message`, `set_batch` / `append_batch` / `ensure_batch`, `start_batch` / `trigger_now` / `stop_batch`, `agent_control`, `interrupt_all`.
+
+A typical flow: `set_batch` to define the work → `start_batch` for a scheduled
+cadence → `batch_status` to watch progress.
+
+> **Security boundary:** the server is **localhost-only with no auth by design**
+> — it talks to `127.0.0.1:8400` and the MCP client must run on the same machine
+> as QuadWork. Don't expose the backend port over a network without adding
+> authentication.
+
+Full tool reference, Claude Desktop config, and remote/VPS registration:
+**[docs/operator-mcp.md](docs/operator-mcp.md)**.
+
+## ─ Review batches
+
+The same Head → Dev → RE1/RE2 → Head loop, but in **review-only** mode — the
+team reviews work instead of building it. **No code, no PRs, no merges.** There
+are two batch types, selected by a `**Batch type:**` marker in
+`OVERNIGHT-QUEUE.md`:
+
+- **`ticket-review`** — review issue specs before they're built.
+- **`pr-review`** — review already-merged PRs and capture findings as follow-up tickets.
+
+**How to use** — ask Head in chat, just like a code batch:
+
+```
+@head review tickets #12 #15 #18
+@head review merged PRs #40 #41
+```
+
+Reviewers assess each item against a rubric; Dev edits issue bodies and files
+follow-up fix tickets via REST; Head marks items approved in the queue. The
+**Current Batch Progress** panel shows review states (*queued · in review · 1 of
+2 approvals · approved*) rather than merge language.
+
+> **GraphQL budget:** review discovery reads the server-authored `GITHUB.md` and
+> the GitHub **REST** API — never the GraphQL-backed `gh pr list` / `gh … view
+> --json` — so a review batch barely touches your hourly API budget.
+
+Queue contract and full state vocabulary: **[docs/review-batches.md](docs/review-batches.md)**.
+
 ## ─ External Tools
 
 QuadWork stands on top of some great open-source work. Explicit thanks:

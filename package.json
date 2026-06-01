@@ -13,7 +13,8 @@
     "!server/__tests__/",
     "templates/",
     "out/",
-    "docs/operator-mcp.md"
+    "docs/operator-mcp.md",
+    "docs/review-batches.md"
   ],
   "scripts": {
     "dev": "next dev",
