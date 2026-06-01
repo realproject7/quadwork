@@ -83,9 +83,53 @@ function observeChunk(key, data, opts = {}) {
   }
 }
 
-// Drop guard state for an agent (e.g. on permanent stop).
+// #910: auto-respawn breaker. Separate concern from the thinking-block restart
+// above: the watchdog calls this when an agent's CLI process has EXITED on its
+// own (clean exit / crash) and the project is non-idle, to bring the long-lived
+// listener back. Its own window/limit so a session that keeps dying immediately
+// isn't loop-respawned forever (which would only mask a deeper failure).
+const RESPAWN_WINDOW_MS = 10 * 60 * 1000;
+const RESPAWN_MAX = 5;
+// key -> { respawns: number[], breakerNotified: boolean }
+const _respawnState = new Map();
+
+function respawnBreakerMessage(agent) {
+  return `${agent} keeps exiting and could not be kept running — auto-respawn paused, manual attention needed`;
+}
+
+// Decide whether to auto-respawn an exited agent, recording the attempt when
+// allowed. Pure decision + per-agent guard state (now injected for tests).
+// Returns "respawn" (caller should spawn) or "breaker" (too many recently —
+// refuse). onBreaker(message) fires once, the first time the breaker trips.
+function shouldRespawn(key, opts = {}) {
+  const now = opts.now;
+  const agent = key.split("/")[1] || key;
+  const st = _respawnState.get(key) || { respawns: [], breakerNotified: false };
+  // Drop attempts older than the window, then refuse if we've already hit MAX.
+  st.respawns = st.respawns.filter((t) => now - t < RESPAWN_WINDOW_MS);
+  if (st.respawns.length >= RESPAWN_MAX) {
+    const firstTrip = !st.breakerNotified;
+    st.breakerNotified = true;
+    _respawnState.set(key, st);
+    if (firstTrip && typeof opts.onBreaker === "function") {
+      try { opts.onBreaker(respawnBreakerMessage(agent)); } catch {}
+    }
+    return "breaker";
+  }
+  st.respawns.push(now);
+  // A successful respawn means the agent is healthy again — let the breaker
+  // re-arm by clearing the one-shot notify flag.
+  st.breakerNotified = false;
+  _respawnState.set(key, st);
+  return "respawn";
+}
+
+// Drop guard state for an agent (e.g. on permanent / manual stop). Clears BOTH
+// the thinking-block window and the respawn window, so a manual stop/restart
+// resets both breakers (#825 + #910).
 function clearState(key) {
   _state.delete(key);
+  _respawnState.delete(key);
 }
 
 module.exports = {
@@ -93,8 +137,13 @@ module.exports = {
   isThinkingBlock400,
   breakerMessage,
   clearState,
+  shouldRespawn,
+  respawnBreakerMessage,
   _state,
+  _respawnState,
   COOLDOWN_MS,
   CIRCUIT_WINDOW_MS,
   CIRCUIT_MAX,
+  RESPAWN_WINDOW_MS,
+  RESPAWN_MAX,
 };
