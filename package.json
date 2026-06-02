@@ -13,6 +13,7 @@
     "!server/__tests__/",
     "templates/",
     "out/",
+    "src/lib/injectMode.js",
     "docs/install-mac.md",
     "docs/install-windows.md",
     "docs/install-vps.md",
