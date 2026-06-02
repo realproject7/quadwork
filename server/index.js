@@ -12,6 +12,7 @@ const fileChat = require("./file-chat");
 const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./pty-dispatcher");
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
+const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const net = require("net");
 const config = readConfig();
@@ -399,7 +400,7 @@ async function buildAgentArgs(projectId, agentId) {
   }
 
   // MCP config injection — file-chat shim
-  const injectMode = agentCfg.mcp_inject || (cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag");
+  const injectMode = agentCfg.mcp_inject || injectModeForCommand(command);
   if (injectMode === "flag") {
     const { filePath: mcpConfigPath } = writeFileChatMcpConfig(projectId, agentId, PORT);
     const mcpFlag = agentCfg.mcp_flag || "--mcp-config";

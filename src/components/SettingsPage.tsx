@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
 import { modelsForBackend, effectiveModel, sanitizeModel } from "@/lib/agentModels";
+import { injectModeForCommand } from "@/lib/injectMode";
 import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
@@ -14,6 +15,10 @@ interface AgentConfig {
   cwd: string;
   model: string;
   agents_md: string;
+  // #937: MCP injection mode (codex→proxy_flag, gemini→env, else flag). Written
+  // by the setup wizard on every agent; the spawn path reads it. The Settings
+  // command-change/save flow must keep it in sync with the command.
+  mcp_inject?: string;
 }
 
 // Per-project Telegram config + Scheduled Trigger fields are still on
@@ -36,6 +41,10 @@ interface ButlerConfig {
   model?: string;
   auto_start?: boolean;
   cwd?: string;
+  // #937: present only if a config carries it (the wizard doesn't write one for
+  // the butler and the butler spawn doesn't consume it). Healed on save only
+  // when already set, so a stale value never re-persists.
+  mcp_inject?: string;
 }
 
 interface Config {
@@ -499,17 +508,34 @@ export default function SettingsPage() {
       // #935: the butler model needs the same guard. Its dropdown is
       // provider-aware and resets on Command-change, but a butler left invalid
       // (hand-edited config, never command-changed) would otherwise re-persist.
+      // #937: reconcile mcp_inject the same way. Every agent carries one (the
+      // wizard writes it and the spawn path reads it), so always re-derive it
+      // from the command — this heals a stale "flag" left on an agent converted
+      // to gemini before this fix, which would otherwise crash the CLI. The
+      // butler is different: its spawn doesn't consume mcp_inject and the wizard
+      // never writes one, so we only heal a value that's already present rather
+      // than fabricate one.
       const normalizedConfig = {
         ...config,
         projects: config.projects.map((p) => {
           const agents: Record<string, AgentConfig> = {};
           for (const [id, a] of Object.entries(p.agents)) {
-            agents[id] = { ...a, model: sanitizeModel(a.command || "claude", a.model) };
+            agents[id] = {
+              ...a,
+              model: sanitizeModel(a.command || "claude", a.model),
+              mcp_inject: injectModeForCommand(a.command || "claude"),
+            };
           }
           return { ...p, agents };
         }),
         butler: config.butler
-          ? { ...config.butler, model: sanitizeModel(config.butler.command || "claude", config.butler.model) }
+          ? {
+              ...config.butler,
+              model: sanitizeModel(config.butler.command || "claude", config.butler.model),
+              ...(config.butler.mcp_inject !== undefined
+                ? { mcp_inject: injectModeForCommand(config.butler.command || "claude") }
+                : {}),
+            }
           : config.butler,
       };
       const res = await fetch("/api/config", {
@@ -835,7 +861,14 @@ export default function SettingsPage() {
                 const models = modelsForBackend(v);
                 const currentModel = config.butler?.model || "opus";
                 const modelValid = models.some((m) => m.value === currentModel);
-                updateButler({ command: v, model: modelValid ? currentModel : models[0].value });
+                // #937: only re-derive mcp_inject if this config actually carries
+                // one — the butler spawn doesn't consume it and the wizard never
+                // writes one, so we heal a stale value without fabricating a field.
+                updateButler({
+                  command: v,
+                  model: modelValid ? currentModel : models[0].value,
+                  ...(config.butler?.mcp_inject !== undefined ? { mcp_inject: injectModeForCommand(v) } : {}),
+                });
               }}
               options={BACKENDS.map((b) => ({
                 value: b.value,
@@ -971,10 +1004,14 @@ export default function SettingsPage() {
                                 // valid for the new backend (mirror the butler dropdown
                                 // above) — otherwise a Claude model leaks onto a
                                 // codex/gemini agent and is saved/spawned as invalid.
+                                // #937: likewise reset mcp_inject to the new backend's
+                                // mode — otherwise converting to gemini leaves a stale
+                                // "flag" and the CLI crashes on launch (--mcp-config).
                                 const command = e.target.value;
                                 updateAgent(idx, agentId, {
                                   command,
                                   model: effectiveModel(command, agent.model),
+                                  mcp_inject: injectModeForCommand(command),
                                 });
                               }}
                               className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"

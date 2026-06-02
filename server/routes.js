@@ -13,6 +13,7 @@ const multer = require("multer");
 const fileChat = require("./file-chat");
 const telegramBridge = require("./bridges/telegram");
 const discordBridge = require("./bridges/discord");
+const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
 
@@ -3433,12 +3434,11 @@ router.post("/api/setup", (req, res) => {
       for (const agentId of ["head", "re1", "re2", "dev"]) {
         const cmd = (backends && backends[agentId]) || "claude";
         const cliBase = cmd.split("/").pop().split(" ")[0];
-        const injectMode = cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag";
         agents[agentId] = {
           cwd: path.join(parentDir, `${dirName}-${agentId}`),
           command: cmd,
           auto_approve: autoApprove,
-          mcp_inject: injectMode,
+          mcp_inject: injectModeForCommand(cmd),
           ...(cliBase === "codex" ? { reasoning_effort: "medium" } : {}),
         };
       }
