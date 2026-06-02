@@ -137,7 +137,7 @@ function shutdownProject(projectId) {
   projectState.delete(projectId);
 }
 
-function appendMessage(projectId, { sender, channel = "general", text, type = "message" }, _skipLoopGuard = false) {
+function appendMessage(projectId, { sender, channel = "general", text, type = "message", attachments } = {}, _skipLoopGuard = false) {
   const state = getState(projectId);
   if (state.nextId === null) {
     throw new Error(`Project ${projectId} not initialized — call initProject first`);
@@ -154,6 +154,7 @@ function appendMessage(projectId, { sender, channel = "general", text, type = "m
     type,
     text: text || "",
     mentions: parseMentions(text),
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
   };
 
   const dir = chatDir(projectId);

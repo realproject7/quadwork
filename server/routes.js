@@ -869,11 +869,32 @@ router.post("/api/chat", (req, res) => {
   } else if (bridgeSender && isLocalhost(req.ip)) {
     sender = bridgeSender;
   }
+  // #940: thread image attachments through. Persist only the `name`
+  // (the absolute server FS `path` must not be stored/broadcast), and
+  // since the name is later used to build a serve path, reject any with
+  // path separators — same guard as the serve route.
+  let attachments;
+  if (req.body?.attachments !== undefined) {
+    if (!Array.isArray(req.body.attachments)) {
+      return res.status(400).json({ error: "attachments must be an array" });
+    }
+    attachments = req.body.attachments.map((att) => {
+      const name = att?.name;
+      if (typeof name !== "string" || !name || /[/\\]/.test(name)) {
+        return null;
+      }
+      return { name };
+    });
+    if (attachments.some((att) => att === null)) {
+      return res.status(400).json({ error: "Invalid attachment name" });
+    }
+  }
   const msg = fileChat.appendMessage(projectId, {
     sender,
     text: normalizeMentions(text, selfMentionSkip),
     channel: req.body?.channel || "general",
     type: "message",
+    attachments,
   });
   // #717: loop guard — count agent hops, pause if threshold reached
   const maxHops = getProjectMaxHops(projectId);
@@ -931,7 +952,7 @@ router.get("/api/uploads/:project/:filename", (req, res) => {
   // #560: pass error callback so Express/send NotFoundError (race between
   // existsSync and sendFile, or stricter file resolution in Express 5's
   // send module) is handled gracefully instead of spamming the server log.
-  res.sendFile(filePath, (err) => {
+  res.sendFile(filePath, { dotfiles: "allow" }, (err) => {
     if (!err || res.headersSent) return;
     if (err.status === 404 || err.code === "ENOENT") {
       res.status(404).json({ error: "Not found" });
