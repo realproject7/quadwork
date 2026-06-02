@@ -56,5 +56,21 @@ ok(sanitizeModel("claude", "claude-opus-4-8") === "claude-opus-4-8", "sanitizeMo
 ok(sanitizeModel("codex", "") === "", "sanitizeModel keeps '' (CLI default) — valid for every CLI, never clobbered");
 ok(sanitizeModel("gemini", undefined) === "", "sanitizeModel maps undefined → '' (CLI default), not a fabricated model");
 
+// ── #935: SettingsPage.save() normalizes the butler model the same way it ──
+// normalizes per-agent models. The save path is a React component (no harness),
+// so we pin the exact expression save() applies to config.butler. A butler left
+// invalid (hand-edited config / never command-changed) must heal on save, while
+// "" (CLI default) is preserved.
+const normalizeButler = (butler) =>
+  butler
+    ? { ...butler, model: sanitizeModel(butler.command || "claude", butler.model) }
+    : butler;
+ok(normalizeButler({ command: "codex", model: "opus" }).model === "gpt-5.4", "#935: save() heals an invalid butler model (codex + 'opus') to the first valid codex model");
+ok(normalizeButler({ command: "gemini", model: "sonnet" }).model === "gemini-2.5-pro", "#935: save() heals a cross-backend butler model (gemini + 'sonnet')");
+ok(normalizeButler({ command: "codex", model: "" }).model === "", "#935: save() preserves '' (CLI default) on the butler");
+ok(normalizeButler({ command: "claude", model: "opus" }).model === "opus", "#935: save() keeps an already-valid butler model");
+ok(normalizeButler({ command: "codex" }).model === "", "#935: save() maps an unset butler model → '' (CLI default), not a fabricated model");
+ok(normalizeButler(undefined) === undefined, "#935: save() leaves a missing butler config untouched");
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

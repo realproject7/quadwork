@@ -496,6 +496,9 @@ export default function SettingsPage() {
       // invalid by the old hardcoded dropdown (e.g. a codex agent saved with
       // "sonnet") and also covers a new project seeded from DEFAULT_AGENTS with
       // a non-Claude default command. sanitizeModel keeps "" (CLI default) as-is.
+      // #935: the butler model needs the same guard. Its dropdown is
+      // provider-aware and resets on Command-change, but a butler left invalid
+      // (hand-edited config, never command-changed) would otherwise re-persist.
       const normalizedConfig = {
         ...config,
         projects: config.projects.map((p) => {
@@ -505,6 +508,9 @@ export default function SettingsPage() {
           }
           return { ...p, agents };
         }),
+        butler: config.butler
+          ? { ...config.butler, model: sanitizeModel(config.butler.command || "claude", config.butler.model) }
+          : config.butler,
       };
       const res = await fetch("/api/config", {
         method: "PUT",
