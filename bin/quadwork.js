@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const readline = require("readline");
+const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -679,8 +680,7 @@ function writeQuadWorkConfig(setup) {
 
   for (const agent of AGENTS) {
     const cmd = (setup.backends && setup.backends[agent]) || setup.backend;
-    const cliBase = cmd.split("/").pop().split(" ")[0];
-    const injectMode = cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag";
+    const injectMode = injectModeForCommand(cmd);
     project.agents[agent] = {
       cwd: setup.worktrees[agent],
       command: cmd,
