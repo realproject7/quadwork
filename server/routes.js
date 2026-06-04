@@ -329,12 +329,96 @@ router.put("/api/config", (req, res) => {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
     ensureSecureDir(dir);
+    // #944: pinned_projects and sidebar_groups are owned by the field-scoped
+    // /api/pins and /api/sidebar-groups endpoints below. A whole-config PUT
+    // (settings save, idle toggle, bridge/queue/trigger widgets) carries a
+    // snapshot the client GET'd earlier, which may be stale for these two keys
+    // — a pin/group added by another save in the meantime. Never let a full PUT
+    // clobber them: always re-read the current on-disk values and keep those.
+    const disk = readConfigFile();
+    if ("pinned_projects" in disk) body.pinned_projects = disk.pinned_projects;
+    else delete body.pinned_projects;
+    if ("sidebar_groups" in disk) body.sidebar_groups = disk.sidebar_groups;
+    else delete body.sidebar_groups;
     writeConfig(body);
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
       req.app.get("syncTriggers")();
     }
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+});
+
+// ─── Pinned projects & sidebar groups (field-scoped, race-free) ─────────────
+// #944: pins/groups used to persist via the whole-config GET→mutate→PUT path,
+// which dropped them whenever any concurrent writer PUT a stale snapshot — and
+// a restart fires several of those at once. These endpoints read the freshest
+// config off disk, set ONLY their own key, and write it back, so a save can
+// never clobber a concurrent one. The whole-config PUT above preserves both
+// keys for the same reason.
+
+// Validate pinned_projects: array of non-empty project-id strings, deduped.
+// Returns the cleaned array, or null if the shape is invalid.
+function validatePinnedProjects(value) {
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  for (const id of value) {
+    if (typeof id !== "string" || !id) return null;
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+// Validate sidebar_groups: array of { name: non-empty string, projects: string[] }.
+// Returns the cleaned array, or null if the shape is invalid.
+function validateSidebarGroups(value) {
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  for (const g of value) {
+    if (!g || typeof g !== "object" || Array.isArray(g)) return null;
+    if (typeof g.name !== "string" || !g.name) return null;
+    if (!Array.isArray(g.projects)) return null;
+    const projects = [];
+    for (const id of g.projects) {
+      if (typeof id !== "string" || !id) return null;
+      projects.push(id);
+    }
+    out.push({ name: g.name, projects });
+  }
+  return out;
+}
+
+router.put("/api/pins", (req, res) => {
+  const pins = validatePinnedProjects(req.body && req.body.pinned_projects);
+  if (pins === null) {
+    return res.status(400).json({ error: "pinned_projects must be an array of project id strings" });
+  }
+  try {
+    const dir = path.dirname(CONFIG_PATH);
+    ensureSecureDir(dir);
+    const cfg = readConfigFile(); // read fresh — never a stale client snapshot
+    cfg.pinned_projects = pins;
+    writeConfig(cfg);
+    res.json({ ok: true, pinned_projects: pins });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+});
+
+router.put("/api/sidebar-groups", (req, res) => {
+  const groups = validateSidebarGroups(req.body && req.body.sidebar_groups);
+  if (groups === null) {
+    return res.status(400).json({ error: "sidebar_groups must be an array of { name, projects } objects" });
+  }
+  try {
+    const dir = path.dirname(CONFIG_PATH);
+    ensureSecureDir(dir);
+    const cfg = readConfigFile(); // read fresh — never a stale client snapshot
+    cfg.sidebar_groups = groups;
+    writeConfig(cfg);
+    res.json({ ok: true, sidebar_groups: groups });
   } catch (err) {
     res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
