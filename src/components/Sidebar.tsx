@@ -396,19 +396,14 @@ export default function Sidebar() {
 
   const persistPins = useCallback((newPins: string[]) => {
     setPinnedIds(newPins);
-    // Re-read latest config before writing to avoid clobbering concurrent changes
-    fetch("/api/config")
-      .then((r) => r.json())
-      .then((latest) => {
-        const updated = { ...latest, pinned_projects: newPins };
-        configRef.current = updated;
-        return fetch("/api/config", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(updated),
-        });
-      })
-      .catch(() => {});
+    // #944: field-scoped write — the server reads the freshest config and
+    // updates only pinned_projects, so a concurrent group/idle/settings save
+    // (or a restart firing several saves at once) can't clobber pins.
+    fetch("/api/pins", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned_projects: newPins }),
+    }).catch(() => {});
   }, []);
 
   const toggleGroupCollapse = (groupName: string) => {
@@ -423,18 +418,13 @@ export default function Sidebar() {
 
   const persistGroups = useCallback((newGroups: SidebarGroup[]) => {
     setGroups(newGroups);
-    fetch("/api/config")
-      .then((r) => r.json())
-      .then((latest) => {
-        const updated = { ...latest, sidebar_groups: newGroups };
-        configRef.current = updated;
-        return fetch("/api/config", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(updated),
-        });
-      })
-      .catch(() => {});
+    // #944: field-scoped write — see persistPins. Server updates only
+    // sidebar_groups against a freshly-read config.
+    fetch("/api/sidebar-groups", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sidebar_groups: newGroups }),
+    }).catch(() => {});
   }, []);
 
   const moveToGroup = (projectId: string, groupName: string) => {
