@@ -2194,6 +2194,76 @@ function progressFromSnapshot(snapshot, n) {
   return null;
 }
 
+// #943: per-ROLE approval count from the PERSISTED GITHUB.md Review Detail,
+// which parseGithub already attributes by body-marker role → { re1?: { state },
+// re2?: { state } }. Mirrors countApprovedRoles' semantics (re1/re2, latest
+// decision APPROVED) but reads the already-attributed parse rather than raw
+// review bodies (the file doesn't carry per-review bodies).
+function approvalsFromReviewDetail(reviewDetail, prNumber) {
+  const rd = (reviewDetail && reviewDetail[prNumber]) || {};
+  return ["re1", "re2"].filter((role) => rd[role] && rd[role].state === "APPROVED").length;
+}
+
+// #943: resolve issue `n`'s progress row from the PERSISTED GITHUB.md parse
+// (parseGithub output) — used when the in-memory _graphqlCache is empty, e.g.
+// just after a server restart. The file survives restarts, so this replaces the
+// post-restart burst of live per-item Searches that mis-rendered queued items
+// as "fetch failed". Mirrors progressFromSnapshot's buckets, with two shape
+// differences: approvals come from the parsed Review Detail, and the merged/
+// closed windows are the file's recent-display slice (open PRs are the full
+// window). An active-batch OPEN issue with no matching [#N] open PR and no
+// in-window merged PR is genuinely queued (NO network). Items the file can't
+// classify (absent, or merged-but-still-open) return null; the caller renders a
+// soft "queued (retrying)" row that firms up once the snapshot repopulates.
+function progressFromGithubFile(parsed, n) {
+  if (!parsed || !parsed.ok) return null;
+  // NOTE: parseGithub's titles come through _sanitizeInline, which STRIPS the
+  // `[` `]` of the `[#N]` convention — so the persisted PR title reads `#N …`,
+  // not `[#N] …` (unlike the in-memory snapshot progressFromSnapshot matches).
+  // Anchor on `#N` + a word boundary so `#80` can't match issue 8.
+  const titleRe = new RegExp(`^\\s*#${n}\\b`);
+  const openPr = (parsed.openPRs || []).find((p) => titleRe.test(p.title || ""));
+  const mergedPr = (parsed.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
+  const openIssue = (parsed.openIssues || []).find((i) => i.number === n);
+  const closedIssue = (parsed.closedIssues || []).find((i) => i.number === n);
+
+  // merged requires a matching merged PR AND the issue CLOSED.
+  if (mergedPr && closedIssue) {
+    return { issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url, pr_number: mergedPr.number, status: "merged", progress: 100, label: "Merged ✓" };
+  }
+  // Matching open PR → in_review/approved/ready from the parsed Review Detail.
+  if (openPr) {
+    const title = (openIssue && openIssue.title) || openPr.title || `#${n}`;
+    const approvals = approvalsFromReviewDetail(parsed.reviewDetail, openPr.number);
+    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
+    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
+    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
+  }
+  // No matching open PR. The persisted board lists the FULL open-PR window, so an
+  // OPEN active-batch issue with no [#N] open PR and no in-window merged PR is
+  // queued — NO network. A merged PR in-window for a still-OPEN issue is the
+  // ambiguous merged-but-open case (mirrors progressFromSnapshot returning null
+  // there) → defer to the authoritative snapshot next cycle.
+  if (openIssue && !mergedPr) {
+    return buildNoPrRow({ number: n, title: openIssue.title, state: "OPEN", url: openIssue.url });
+  }
+  // CLOSED issue with no in-window merged PR → closed (no PR) ✓ (superseded/runbook).
+  if (closedIssue && !mergedPr) {
+    return buildNoPrRow({ number: n, title: closedIssue.title, state: "CLOSED", url: closedIssue.url });
+  }
+  // Absent from the file, or merged-but-open ambiguity → unproven.
+  return null;
+}
+
+// #943: a transient or cold-cache-unproven item degrades to a SOFT "queued
+// (retrying)" row (status "queued", progress 0, retried next cycle) instead of a
+// hard "fetch failed". A queued batch item must never render an alarming error
+// just because the in-memory snapshot is briefly cold (post-restart) or a
+// transient secondary-rate-limit/network blip hit its by-number fetch.
+function softRetryingRow(n, title) {
+  return { issue_number: n, title: title || `#${n}`, url: null, status: "queued", progress: 0, label: "queued (retrying)" };
+}
+
 // Confirmed-complete state machine, per project. `complete` must hold across
 // TWO consecutive SUCCESSFUL fetch cycles with DISTINCT generatedAt (the
 // snapshot ts, which only advances on a real #806 refresh) before we confirm.
@@ -2803,16 +2873,33 @@ function loadGithubItemIndex(projectId) {
   return map;
 }
 
+// #943: load the persisted GITHUB.md board as a parseGithub result (or null if
+// missing / unparseable). The code-batch progress path uses this as the restart-
+// surviving fallback when the in-memory _graphqlCache is empty, so a cold cache
+// never triggers a live per-item Search burst.
+function loadGithubParsed(projectId) {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(CONFIG_DIR, projectId, "GITHUB.md"), "utf-8");
+  } catch {
+    return null;
+  }
+  const parsed = parseGithub(text);
+  return parsed && parsed.ok ? parsed : null;
+}
+
 // #416 / quadwork#299: async variant used by the parallelized batch
 // progress fetcher. Wraps node's execFile in a promise.
 //
 // THROWS on subprocess failure (non-zero exit, timeout, JSON parse,
 // network) so progressForItemRest can decide which subset of
-// failures should bubble up to the Promise.allSettled "fetch failed"
-// row vs. which should fall through to a softer state. The previous
+// failures should bubble up to the route's per-item failure row
+// vs. which should fall through to a softer state. The previous
 // catch-all-and-return-null contract collapsed real subprocess
-// errors into the "not found" branch, making the new failure-row
+// errors into the "not found" branch, making the failure-row
 // fallback unreachable for genuine command failures (t2a review).
+// #943: the route now catches that rejection and renders a SOFT
+// "queued (retrying)" row (retried next cycle), not a hard "fetch failed".
 async function ghJsonExecAsync(args) {
   const { stdout } = await _execFileAsync("gh", args, { encoding: "utf-8", timeout: 10000, maxBuffer: GH_LIST_MAX_BUFFER });
   return JSON.parse(stdout);
@@ -2901,8 +2988,8 @@ async function _searchLinkedPrItems(repo, n) {
 // network / parse) is NOT proof of no PR — it must NOT collapse to null, or an
 // out-of-window OPEN issue with a real PR would render queued (and a CLOSED one
 // with a merged PR would render closed). So failure THROWS, and the caller
-// (progressForItemRest, awaiting without a catch) drops the item to the
-// non-authoritative "fetch failed" row, retried on the next cache miss.
+// (progressForItemRest, awaiting without a catch) lets the rejection reach the
+// route, which (#943) renders a soft "queued (retrying)" row retried next cycle.
 async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems, opts = {}) {
   const items = await search(repo, n);
   return pickLinkedPrFromSearch(items, n, opts);
@@ -2915,8 +3002,8 @@ async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems, opts 
 async function progressForItemRest(repo, issueNumber) {
   // Load-bearing call: the issue's own state via REST. If gh can't read it at
   // all (404, network, auth, timeout) we can't compute a meaningful row — let
-  // the rejection propagate to the route's Promise.allSettled "fetch failed"
-  // row instead of emitting a misleading "queued" entry.
+  // the rejection propagate to the route, which (#943) renders a soft "queued
+  // (retrying)" row instead of emitting a misleading "queued"/"merged" entry.
   const raw = await ghJsonExecAsync(["api", `repos/${repo}/issues/${issueNumber}`]);
   const issue = {
     number: raw.number,
@@ -2924,8 +3011,9 @@ async function progressForItemRest(repo, issueNumber) {
     state: (raw.state || "").toUpperCase(),
     url: raw.html_url,
   };
-  // Throws (→ route's "fetch failed" row) if Search itself fails, so a
-  // could-not-determine is NEVER mistaken for proof of no linked PR. A null
+  // Throws (→ route's soft "queued (retrying)" row, #943) if Search itself
+  // fails, so a could-not-determine is NEVER mistaken for proof of no linked PR.
+  // A null
   // here means Search SUCCEEDED with zero strict [#N] matches — authoritative.
   // #864/RE1: pass issue.state so the picker only prefers a merged duplicate
   // for CLOSED issues; OPEN/reopened issues keep legacy freshest-wins, so a
@@ -3221,21 +3309,33 @@ async function getOrComputeBatchProgress(projectId) {
   // state); #828 P1: fall back to a targeted by-number REST/Search fetch
   // (progressForItemRest, no GraphQL) only for active-batch issues the snapshot
   // can't prove (outside / truncated window, or absent).
+  // #943: when the in-memory snapshot is empty (e.g. just after a restart, until
+  // the next board refresh repopulates it), resolve from the PERSISTED GITHUB.md
+  // board instead of firing an uncapped burst of live per-item Searches. The
+  // file survives restarts, so the post-restart "fetch failed" window disappears.
+  // The live by-number fallback runs ONLY when an in-memory snapshot exists but
+  // can't prove a specific item — now (a) concurrency-capped via _mapLimited and
+  // (b) soft-failing a transient error to "queued (retrying)" rather than a hard
+  // "fetch failed".
   const snapshot = _graphqlCache.get(repo) || null;
-  const settled = await Promise.allSettled(
-    issueNumbers.map(async (n) => progressFromSnapshot(snapshot, n) || progressForItemRest(repo, n)),
-  );
-  const items = settled.map((r, i) => {
-    if (r.status === "fulfilled") return r.value;
-    return {
-      issue_number: issueNumbers[i],
-      title: `#${issueNumbers[i]} (fetch failed)`,
-      url: null,
-      status: "unknown",
-      progress: 0,
-      label: "fetch failed",
-    };
-  });
+  let items;
+  if (snapshot) {
+    items = await _mapLimited(issueNumbers, GH_MAX_CONCURRENT, async (n) => {
+      const fromSnap = progressFromSnapshot(snapshot, n);
+      if (fromSnap) return fromSnap;
+      try {
+        return await progressForItemRest(repo, n);
+      } catch {
+        return softRetryingRow(n); // #943: transient (secondary rate-limit/network) → soft
+      }
+    });
+  } else {
+    // Cold in-memory cache → persisted-snapshot fallback, zero live per-item
+    // Search. Items the file can't classify render soft "queued (retrying)" and
+    // firm up next cycle once _graphqlCache repopulates.
+    const parsed = loadGithubParsed(projectId);
+    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || softRetryingRow(n));
+  }
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
   // so batches that mix runbook/superseded closes with real PRs
@@ -4562,6 +4662,11 @@ module.exports.summarizeItems = summarizeItems;
 // #810: expose batch-progress-from-snapshot helpers for unit tests.
 module.exports.progressFromSnapshot = progressFromSnapshot;
 module.exports.countApprovedRoles = countApprovedRoles;
+// #943: expose the persisted-GITHUB.md fallback helpers for unit tests.
+module.exports.progressFromGithubFile = progressFromGithubFile;
+module.exports.approvalsFromReviewDetail = approvalsFromReviewDetail;
+module.exports.softRetryingRow = softRetryingRow;
+module.exports.loadGithubParsed = loadGithubParsed;
 module.exports.evalBatchCompleteConfirmed = evalBatchCompleteConfirmed;
 // #693: expose normalizeMentions for unit tests
 module.exports.normalizeMentions = normalizeMentions;
