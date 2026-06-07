@@ -3036,9 +3036,33 @@ async function findLinkedPrByTitle(repo, n, search = _searchLinkedPrItems, opts 
   return pickLinkedPrFromSearch(items, n, opts);
 }
 
+function prNumberFromApiUrl(url) {
+  const m = String(url || "").match(/\/pulls\/(\d+)(?:\b|$)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function pickClosingPrFromTimeline(events) {
+  const candidates = [];
+  for (const ev of Array.isArray(events) ? events : []) {
+    if (!ev || ev.event !== "closed") continue;
+    const issue = ev.source && ev.source.issue;
+    const pr = issue && issue.pull_request;
+    const n = (issue && Number.isInteger(issue.number) && pr && issue.number) || prNumberFromApiUrl(pr && pr.url);
+    if (Number.isInteger(n)) candidates.push(n);
+  }
+  if (candidates.length === 0) return null;
+  return candidates.sort((a, b) => b - a)[0];
+}
+
+async function findClosingPrByTimeline(repo, issueNumber) {
+  const events = await ghJsonExecAsync(["api", `repos/${repo}/issues/${issueNumber}/timeline?per_page=100`]);
+  return pickClosingPrFromTimeline(events);
+}
+
 // Authoritative by-number resolution for an active-batch issue the board
-// snapshot can't prove (outside / truncated window, or absent). #828 P1: REST +
-// Search ONLY — zero `gh issue view` / `gh pr view` (GraphQL). Bucket mapping
+// snapshot can't prove (outside / truncated window, or absent). REST-only:
+// issue/PR endpoints + Search/title convention + native issue timeline
+// close-link — zero `gh issue view` / `gh pr view` (GraphQL). Bucket mapping
 // matches progressFromSnapshot exactly.
 async function progressForItemRest(repo, issueNumber) {
   // Load-bearing call: the issue's own state via REST. If gh can't read it at
@@ -3052,14 +3076,22 @@ async function progressForItemRest(repo, issueNumber) {
     state: (raw.state || "").toUpperCase(),
     url: raw.html_url,
   };
-  // Throws (→ route's soft "queued (retrying)" row, #943) if Search itself
-  // fails, so a could-not-determine is NEVER mistaken for proof of no linked PR.
-  // A null
-  // here means Search SUCCEEDED with zero strict [#N] matches — authoritative.
-  // #864/RE1: pass issue.state so the picker only prefers a merged duplicate
-  // for CLOSED issues; OPEN/reopened issues keep legacy freshest-wins, so a
-  // newer active duplicate PR isn't masked by an older merged one.
-  const prNumber = await findLinkedPrByTitle(repo, issueNumber, _searchLinkedPrItems, { issueState: issue.state });
+  // Title convention first; for CLOSED issues, fall back to GitHub's native
+  // issue timeline close-link. A lookup failure must not make a CLOSED issue
+  // flap to "queued (retrying)" — terminal-ness comes from the issue state.
+  let prNumber = null;
+  try {
+    prNumber = await findLinkedPrByTitle(repo, issueNumber, _searchLinkedPrItems, { issueState: issue.state });
+  } catch (err) {
+    if (issue.state !== "CLOSED") throw err;
+  }
+  if (prNumber == null && issue.state === "CLOSED") {
+    try {
+      prNumber = await findClosingPrByTimeline(repo, issueNumber);
+    } catch {
+      // Degrade below to Closed (no PR) ✓. The item is still terminal.
+    }
+  }
   // No linked PR (authoritative). #350: honor the issue's own state — a CLOSED
   // issue with no linked PR is fully done (superseded/not-planned/runbook) →
   // 100% ✓; only a truly OPEN issue with no PR is queued.
@@ -3076,6 +3108,7 @@ async function progressForItemRest(repo, issueNumber) {
     // soft fall-through to the in_review row below
   }
   if (!prData) {
+    if (issue.state === "CLOSED") return buildNoPrRow(issue);
     return {
       issue_number: issue.number,
       title: issue.title,
@@ -4830,6 +4863,8 @@ module.exports.closedPagesComplete = closedPagesComplete;
 module.exports.closedPrIssueNumsFromPages = closedPrIssueNumsFromPages;
 module.exports.pickLinkedPrFromSearch = pickLinkedPrFromSearch;
 module.exports.findLinkedPrByTitle = findLinkedPrByTitle;
+module.exports.pickClosingPrFromTimeline = pickClosingPrFromTimeline;
+module.exports.progressForItemRest = progressForItemRest;
 // #827: expose the GITHUB.md writer for the idle-no-op regression test. No
 // production callers outside this file.
 module.exports.writeGithubFileFromSnapshot = writeGithubFileFromSnapshot;
