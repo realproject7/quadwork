@@ -27,6 +27,7 @@ const real = { readFileSync: fs.readFileSync };
 let cfgJson = JSON.stringify({ projects: [] });
 let queueText = "";
 let snapshotJson = null;
+let githubMd = "";
 fs.readFileSync = function stubReadFileSync(p, ...rest) {
   if (p === CONFIG_PATH) return cfgJson;
   if (typeof p === "string" && p.endsWith("OVERNIGHT-QUEUE.md")) return queueText;
@@ -36,7 +37,7 @@ fs.readFileSync = function stubReadFileSync(p, ...rest) {
     err.code = "ENOENT";
     throw err;
   }
-  if (typeof p === "string" && p.endsWith("GITHUB.md")) return "";
+  if (typeof p === "string" && p.endsWith("GITHUB.md")) return githubMd;
   return real.readFileSync(p, ...rest);
 };
 fs.writeFileSync = function stubWriteFileSync(p, data) {
@@ -54,6 +55,7 @@ const {
   _batchProgressCache,
   _batchProgressRefreshes,
   _graphqlCache,
+  renderGithubMarkdown,
 } = require("./routes");
 
 function mergedRowsSnapshot(repo, nums) {
@@ -99,9 +101,8 @@ function perItemIssueFetches() {
     ok(perItemIssueFetches().length === 0, "A: first snapshot-proven compute made no per-item REST issue fetches");
   }
 
-  // B. Next compute has an incomplete board snapshot that would normally fall
-  // through to progressForItemRest for every item. The persisted terminal rows
-  // short-circuit those per-item fetches; only the existing one-shot snapshot
+  // B1. Next compute has no fresh per-item evidence, so the persisted terminal
+  // rows short-circuit REST fallback; only the existing one-shot snapshot
   // freshness probe is allowed.
   {
     _batchProgressCache.clear();
@@ -110,16 +111,74 @@ function perItemIssueFetches() {
     ghCalls = [];
     _graphqlCache.set("o/r", {
       ts: Date.now(),
-      issues: [10, 11, 12].map((n) => ({ number: n, title: `open ${n}`, state: "OPEN", url: `https://x/i/${n}` })),
+      issues: [],
       prs: [],
       closedIssues: [],
       mergedPrs: [],
     });
 
     const data = await getOrComputeBatchProgress("terminal-proj");
-    ok(data.items.every((it) => it.status === "merged"), "B: persisted terminal rows win over incomplete snapshot");
-    ok(perItemIssueFetches().length === 0, "B: terminal-cache reuse made zero per-item REST issue fetches");
-    ok(ghCalls.length === 1 && ghCalls[0].includes("--jq"), "B: only the snapshot freshness probe ran");
+    ok(data.items.every((it) => it.status === "merged"), "B1: persisted terminal rows fill missing snapshot evidence");
+    ok(perItemIssueFetches().length === 0, "B1: terminal-cache reuse made zero per-item REST issue fetches");
+    ok(ghCalls.length === 1 && ghCalls[0].includes("--jq"), "B1: only the snapshot freshness probe ran");
+  }
+
+  // B2. Fresh snapshot evidence wins over stale terminal cache. A reopened item
+  // must not remain complete indefinitely, and its stale terminal row is evicted
+  // from the persistent cache.
+  {
+    _batchProgressCache.clear();
+    _batchProgressRefreshes.clear();
+    _graphqlCache.clear();
+    ghCalls = [];
+    _graphqlCache.set("o/r", {
+      ts: Date.now(),
+      issues: [{ number: 10, title: "reopened 10", state: "OPEN", url: "https://x/i/10" }],
+      prs: [],
+      closedIssues: [],
+      mergedPrs: [],
+      openPrsWindowComplete: true,
+      closedPrsWindowComplete: true,
+      closedPrIssueNums: [],
+    });
+
+    const data = await getOrComputeBatchProgress("terminal-proj");
+    const row10 = data.items.find((it) => it.issue_number === 10);
+    ok(row10.status === "queued", `B2: fresh reopened snapshot overrides terminal cache (got ${row10.status})`);
+    ok(row10.status !== "merged" && row10.status !== "closed", "B2: reopened item is no longer terminal");
+    ok(!JSON.parse(snapshotJson).terminalItems["10"], "B2: stale terminal row evicted from persistent cache");
+  }
+
+  // B3. The persisted GITHUB.md cold-cache path also wins over stale terminal
+  // cache when it proves an item is open/nonterminal.
+  {
+    _batchProgressCache.clear();
+    _batchProgressRefreshes.clear();
+    _graphqlCache.clear();
+    ghCalls = [];
+    snapshotJson = JSON.stringify({
+      batchNumber: 950,
+      issueNumbers: [10],
+      batch_type: "code",
+      reviewItems: [],
+      terminalItems: {
+        10: { issue_number: 10, title: "done 10", url: "https://x/i/10", pr_number: 1010, status: "merged", progress: 100, label: "Merged ✓" },
+      },
+    });
+    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 950\n\n- #10 reopened\n";
+    githubMd = renderGithubMarkdown(
+      "Proj",
+      "o/r",
+      { issues: [{ number: 10, title: "reopened 10", state: "OPEN", url: "https://x/i/10", assignees: [] }], prs: [], closedIssues: [], mergedPrs: [] },
+      { generatedAt: Date.now(), staleCycles: 0 },
+      "(none)",
+    );
+
+    const data = await getOrComputeBatchProgress("terminal-proj");
+    const row10 = data.items.find((it) => it.issue_number === 10);
+    ok(row10.status === "queued", `B3: persisted GITHUB.md reopened row overrides terminal cache (got ${row10.status})`);
+    ok(!JSON.parse(snapshotJson).terminalItems["10"], "B3: GITHUB.md nonterminal row evicts stale terminal cache");
+    githubMd = "";
   }
 
   // C. A stale rendered payload returns immediately and starts exactly one

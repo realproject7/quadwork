@@ -2509,11 +2509,19 @@ function collectTerminalItems(items, previous = new Map()) {
     if (isTerminalBatchItem(row)) rows[n] = row;
   }
   for (const row of Array.isArray(items) ? items : []) {
-    if (isTerminalBatchItem(row) && Number.isInteger(row.issue_number)) {
-      rows[row.issue_number] = row;
-    }
+    if (!Number.isInteger(row && row.issue_number)) continue;
+    if (isTerminalBatchItem(row)) rows[row.issue_number] = row;
+    else delete rows[row.issue_number];
   }
   return rows;
+}
+
+function snapshotHasOpenIssue(snapshot, n) {
+  return !!(
+    snapshot &&
+    Array.isArray(snapshot.issues) &&
+    snapshot.issues.some((it) => it && it.number === n && it.state === "OPEN")
+  );
 }
 
 // #334: verify the snapshot's first issue number still exists on
@@ -3377,10 +3385,10 @@ async function computeBatchProgress(projectId, repo) {
   let items;
   if (snapshot) {
     items = await _mapLimited(issueNumbers, GH_MAX_CONCURRENT, async (n) => {
-      const fromTerminalCache = terminalRows.get(n);
-      if (fromTerminalCache) return fromTerminalCache;
       const fromSnap = progressFromSnapshot(snapshot, n);
       if (fromSnap) return fromSnap;
+      const fromTerminalCache = terminalRows.get(n);
+      if (fromTerminalCache && !snapshotHasOpenIssue(snapshot, n)) return fromTerminalCache;
       try {
         return await progressForItemRest(repo, n);
       } catch {
@@ -3392,7 +3400,7 @@ async function computeBatchProgress(projectId, repo) {
     // Search. Items the file can't classify render soft "queued (retrying)" and
     // firm up next cycle once _graphqlCache repopulates.
     const parsed = loadGithubParsed(projectId);
-    items = issueNumbers.map((n) => terminalRows.get(n) || progressFromGithubFile(parsed, n) || softRetryingRow(n));
+    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || terminalRows.get(n) || softRetryingRow(n));
   }
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
