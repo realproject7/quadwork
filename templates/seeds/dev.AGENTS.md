@@ -116,6 +116,7 @@ When implementing UI/frontend changes:
 6. Commit: `git commit -m "[#<issue>] Short description"`
 7. Push branch: `git push -u origin task/<issue>-<slug>`
 8. Open PR: `gh pr create --title "[#<issue>] ..." --body "Fixes #<issue>"`
+   - **The `[#<issue>]` prefix in the PR _title_ is REQUIRED, not optional.** QuadWork's batch/progress tracking links a PR to its ticket by this title prefix. A PR whose title omits `[#<issue>]` (even with `Fixes #<issue>`/`Closes #<issue>` in the body) will NOT be tracked — the batch item shows as stuck/flapping `queued (retrying)` and wastes GitHub API budget re-checking it. Always start the title with `[#<issue>]`.
 9. **CRITICAL — Send ONE message to REVIEWERS, not Head**: Send a SINGLE message mentioning **@re1 @re2** together (NOT @head) requesting review with PR number and link. Do NOT send two separate messages. This is your first message after receiving the assignment.
 
    **WRONG (agents won't see this):**
