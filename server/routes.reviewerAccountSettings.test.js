@@ -154,6 +154,14 @@ function req(server, { method = "GET", urlPath, body } = {}) {
     assert.equal(setUser.json.reviewer_github_user, "reviewer-bot", "response returns sanitized username only");
     assert.equal(JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")).reviewer_github_user, "reviewer-bot", "config updated");
 
+    const staleFullSave = await req(server, {
+      method: "PUT",
+      urlPath: "/api/config",
+      body: { port: 8400, reviewer_github_user: "old-reviewer", projects: [] },
+    });
+    assert.equal(staleFullSave.status, 200, "stale whole-config save succeeds");
+    assert.equal(JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")).reviewer_github_user, "reviewer-bot", "scoped reviewer user survives stale whole-config PUT");
+
     const clearUser = await req(server, { method: "PUT", urlPath: "/api/reviewer-github-user", body: { reviewer_github_user: "" } });
     assert.equal(clearUser.status, 200, "blank reviewer user clears value");
     assert.equal(JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")).reviewer_github_user, undefined, "config key removed when blank");

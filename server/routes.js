@@ -329,17 +329,19 @@ router.put("/api/config", (req, res) => {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
     ensureSecureDir(dir);
-    // #944: pinned_projects and sidebar_groups are owned by the field-scoped
-    // /api/pins and /api/sidebar-groups endpoints below. A whole-config PUT
+    // #944/#949: pinned_projects, sidebar_groups, and reviewer_github_user are
+    // owned by field-scoped endpoints below. A whole-config PUT
     // (settings save, idle toggle, bridge/queue/trigger widgets) carries a
-    // snapshot the client GET'd earlier, which may be stale for these two keys
-    // — a pin/group added by another save in the meantime. Never let a full PUT
-    // clobber them: always re-read the current on-disk values and keep those.
+    // snapshot the client GET'd earlier, which may be stale for these keys.
+    // Never let a full PUT clobber them: always re-read the current on-disk
+    // values and keep those.
     const disk = readConfigFile();
     if ("pinned_projects" in disk) body.pinned_projects = disk.pinned_projects;
     else delete body.pinned_projects;
     if ("sidebar_groups" in disk) body.sidebar_groups = disk.sidebar_groups;
     else delete body.sidebar_groups;
+    if ("reviewer_github_user" in disk) body.reviewer_github_user = disk.reviewer_github_user;
+    else delete body.reviewer_github_user;
     writeConfig(body);
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
