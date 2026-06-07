@@ -84,6 +84,83 @@ The operator server speaks to `127.0.0.1:8400` — the loopback of **whatever ma
 
 > ⚠️ **A local Claude Desktop registration reaches THIS device's `127.0.0.1`, not the VPS.** Use SSH or a port-forward so the client and QuadWork share a loopback.
 
+## Direct stdio JSON-RPC invocation
+
+Use this only when your MCP client does not surface tools directly, or when you
+need a short non-interactive status script. This is still the **Operator MCP**
+path: you launch the stdio MCP server and send JSON-RPC MCP messages on stdin.
+It is **not** a raw QuadWork backend API call, and it does not replace the
+tool-first rules above.
+
+The command still follows the same loopback rule as registration:
+`quadwork-mcp-operator --port 8400` connects to `127.0.0.1:8400` from the
+machine where that command runs. For a VPS-hosted QuadWork instance, either run
+the command on the VPS or establish an SSH port-forward first. Do not switch to
+`curl` against backend endpoints, SSH filesystem inspection, or manual queue
+edits.
+
+The minimal flow is:
+
+1. Send `initialize`.
+2. Optionally send `tools/list` to inspect available tools.
+3. Send one or more `tools/call` requests.
+
+Each request is one JSON object. The examples below write newline-delimited
+JSON-RPC requests and pipe them into the installed bin.
+
+### List projects / verify connection
+
+```bash
+python3 - <<'PY'
+import json
+reqs = [
+  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"operator-script","version":"1"}}},
+  {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}},
+  {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_projects","arguments":{}}},
+]
+open('/tmp/qw-list-projects.jsonl','w').write('\n'.join(json.dumps(r) for r in reqs) + '\n')
+PY
+( cat /tmp/qw-list-projects.jsonl; sleep 4 ) | quadwork-mcp-operator --port 8400
+```
+
+If this cannot list projects, fix MCP registration / loopback access first. Do
+not fall back to SSH or HTTP endpoint calls.
+
+### Read status and recent chat
+
+Replace `plotlink-ows` with the `id` returned by `list_projects`.
+
+```bash
+python3 - <<'PY'
+import json
+reqs = [
+  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"operator-script","version":"1"}}},
+  {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"batch_status","arguments":{"project":"plotlink-ows"}}},
+  {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_chat","arguments":{"project":"plotlink-ows","limit":20}}},
+]
+open('/tmp/qw-status.jsonl','w').write('\n'.join(json.dumps(r) for r in reqs) + '\n')
+PY
+( cat /tmp/qw-status.jsonl; sleep 8 ) | quadwork-mcp-operator --port 8400
+```
+
+### Send an operator instruction to HEAD
+
+```bash
+python3 - <<'PY'
+import json
+msg = "@head Start a focused CODE batch for project-x with issue #123 only. Open a PR, require both reviews, and report back."
+reqs = [
+  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"operator-script","version":"1"}}},
+  {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{"project":"project-x","text":msg}}},
+]
+open('/tmp/qw-send.jsonl','w').write('\n'.join(json.dumps(r) for r in reqs) + '\n')
+PY
+( cat /tmp/qw-send.jsonl; sleep 8 ) | quadwork-mcp-operator --port 8400
+```
+
+The message is posted as the operator (`user`) and must use the same routing
+discipline as dashboard chat, for example `@head ...` to wake Head.
+
 ## Tool reference
 
 ### Tier 1 — read / observe (no state change)
