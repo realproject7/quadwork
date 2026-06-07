@@ -67,8 +67,58 @@ function run(cmd, args = [], opts = {}) {
   }
 }
 
+function runResult(cmd, args = [], opts = {}) {
+  try {
+    const out = execFileSync(cmd, args, { encoding: "utf-8", stdio: "pipe", ...opts });
+    return { ok: true, output: out.trim() };
+  } catch (err) {
+    return { ok: false, output: String(err.stderr || err.stdout || err.message || "").trim() };
+  }
+}
+
 function which(cmd) {
   return run("which", [cmd]) !== null;
+}
+
+function ensureGitHeadForSetup(absDir, repo) {
+  if (!fs.existsSync(path.join(absDir, ".git"))) {
+    const clone = runResult("gh", ["repo", "clone", repo, absDir]);
+    if (!clone.ok) return { ok: false, error: `Clone failed: ${clone.output}` };
+  } else {
+    const fetch = runResult("git", ["-C", absDir, "fetch", "origin", "--prune"]);
+    if (!fetch.ok) return { ok: false, error: `Fetch failed: ${fetch.output}` };
+  }
+
+  let headCheck = runResult("git", ["-C", absDir, "rev-parse", "--verify", "HEAD"]);
+  if (!headCheck.ok) {
+    const remoteHead = runResult("git", ["-C", absDir, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+    let remoteBranch = remoteHead.ok ? remoteHead.output.replace(/^origin\//, "") : "";
+    if (!remoteBranch) {
+      for (const candidate of ["main", "master"]) {
+        const hasBranch = runResult("git", ["-C", absDir, "rev-parse", "--verify", `origin/${candidate}`]);
+        if (hasBranch.ok) { remoteBranch = candidate; break; }
+      }
+    }
+    if (remoteBranch) {
+      const checkout = runResult("git", ["-C", absDir, "checkout", "-B", remoteBranch, `origin/${remoteBranch}`]);
+      if (!checkout.ok) return { ok: false, error: `Checkout failed after fetch: ${checkout.output}` };
+      headCheck = runResult("git", ["-C", absDir, "rev-parse", "--verify", "HEAD"]);
+    }
+  }
+  if (headCheck.ok) return { ok: true };
+
+  const seed = runResult("git", [
+    "-C", absDir,
+    "-c", "user.name=QuadWork",
+    "-c", "user.email=quadwork@localhost",
+    "commit", "--allow-empty", "-m", "Initial commit (created by QuadWork setup)",
+  ]);
+  if (!seed.ok) return { ok: false, error: `Repository is empty and could not be initialized: ${seed.output}` };
+  const branchResult = runResult("git", ["-C", absDir, "symbolic-ref", "--short", "HEAD"]);
+  const defaultBranch = branchResult.ok ? branchResult.output : "main";
+  const push = runResult("git", ["-C", absDir, "push", "origin", defaultBranch]);
+  if (!push.ok) return { ok: false, error: `Initial commit created but push failed: ${push.output}` };
+  return { ok: true };
 }
 
 
@@ -537,17 +587,6 @@ async function setupAgents(rl, repo) {
   const projectDir = await ask(rl, "Project directory", process.cwd());
   const absDir = path.resolve(projectDir);
 
-  if (!fs.existsSync(absDir)) {
-    fail(`Directory not found: ${absDir}`);
-    return null;
-  }
-
-  // Check if it's a git repo
-  if (!fs.existsSync(path.join(absDir, ".git"))) {
-    fail(`Not a git repo: ${absDir}`);
-    return null;
-  }
-
   // Prompt for reviewer credentials (optional)
   log("A separate reviewer account lets RE1/RE2 approve PRs independently. You can set this up later in Settings.");
   const wantReviewer = await askYN(rl, "Use a separate GitHub account for reviewers (RE1/RE2)?", false);
@@ -564,12 +603,11 @@ async function setupAgents(rl, repo) {
   log(`Project: ${projectName}`);
   const wtSpinner = spinner("Creating worktrees and seeding files...");
 
-  // Empty repos have no commits — git worktree add requires at least one.
-  const headCheck = run("git", ["-C", absDir, "rev-parse", "HEAD"]);
-  if (!headCheck || headCheck.includes("fatal")) {
-    run("git", ["-C", absDir, "commit", "--allow-empty", "-m", "Initial commit (created by QuadWork setup)"]);
-    const defaultBranch = run("git", ["-C", absDir, "symbolic-ref", "--short", "HEAD"]) || "main";
-    run("git", ["-C", absDir, "push", "origin", defaultBranch]);
+  const ready = ensureGitHeadForSetup(absDir, repo);
+  if (!ready.ok) {
+    wtSpinner.stop(false);
+    fail(ready.error);
+    return null;
   }
 
   const worktrees = {};
@@ -578,7 +616,8 @@ async function setupAgents(rl, repo) {
     const wtDir = path.join(path.dirname(absDir), `${projectName}-${agent}`);
     if (!fs.existsSync(wtDir)) {
       const branchName = `worktree-${agent}`;
-      run("git", ["-C", absDir, "branch", branchName, "HEAD"]);
+      const branch = runResult("git", ["-C", absDir, "branch", branchName, "HEAD"]);
+      if (!branch.ok) { wtFailed = `${agent}: branch failed: ${branch.output}`; break; }
       const result = run("git", ["-C", absDir, "worktree", "add", wtDir, branchName]);
       if (!result) {
         const result2 = run("git", ["-C", absDir, "worktree", "add", "--detach", wtDir, "HEAD"]);

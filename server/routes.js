@@ -3473,8 +3473,53 @@ function exec(cmd, args, opts) {
     const out = execFileSync(cmd, args, { encoding: "utf-8", timeout: 30000, ...opts });
     return { ok: true, output: out.trim() };
   } catch (err) {
-    return { ok: false, output: err.message };
+    return { ok: false, output: String(err.stderr || err.stdout || err.message || "").trim() };
   }
+}
+
+function ensureGitHeadForSetup(workingDir, repo) {
+  const gitDir = path.join(workingDir, ".git");
+  if (!fs.existsSync(gitDir)) {
+    if (!fs.existsSync(workingDir)) ensureSecureDir(workingDir);
+    if (!REPO_RE.test(repo)) return { ok: false, error: "Invalid repo" };
+    const clone = exec("gh", ["repo", "clone", repo, workingDir]);
+    if (!clone.ok) return { ok: false, error: `Clone failed: ${clone.output}` };
+  } else {
+    const fetch = exec("git", ["fetch", "origin", "--prune"], { cwd: workingDir });
+    if (!fetch.ok) return { ok: false, error: `Fetch failed: ${fetch.output}` };
+  }
+
+  let headCheck = exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: workingDir });
+  if (!headCheck.ok) {
+    const remoteHead = exec("git", ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], { cwd: workingDir });
+    let remoteBranch = remoteHead.ok ? remoteHead.output.replace(/^origin\//, "") : "";
+    if (!remoteBranch) {
+      for (const candidate of ["main", "master"]) {
+        const hasBranch = exec("git", ["rev-parse", "--verify", `origin/${candidate}`], { cwd: workingDir });
+        if (hasBranch.ok) { remoteBranch = candidate; break; }
+      }
+    }
+    if (remoteBranch) {
+      const checkout = exec("git", ["checkout", "-B", remoteBranch, `origin/${remoteBranch}`], { cwd: workingDir });
+      if (!checkout.ok) return { ok: false, error: `Checkout failed after fetch: ${checkout.output}` };
+      headCheck = exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: workingDir });
+    }
+  }
+  if (headCheck.ok) return { ok: true };
+
+  const seed = exec("git", [
+    "-c", "user.name=QuadWork",
+    "-c", "user.email=quadwork@localhost",
+    "commit", "--allow-empty", "-m", "Initial commit (created by QuadWork setup)",
+  ], { cwd: workingDir });
+  if (!seed.ok) {
+    return { ok: false, error: `Repository is empty and could not be initialized: ${seed.output}` };
+  }
+  const branchResult = exec("git", ["symbolic-ref", "--short", "HEAD"], { cwd: workingDir });
+  const defaultBranch = branchResult.ok ? branchResult.output : "main";
+  const push = exec("git", ["push", "origin", defaultBranch], { cwd: workingDir });
+  if (!push.ok) return { ok: false, error: `Initial commit created but push failed: ${push.output}` };
+  return { ok: true };
 }
 
 // ─── GitHub helpers for Setup Wizard ──────────────────────────────────────
@@ -3586,20 +3631,8 @@ router.post("/api/setup", (req, res) => {
     case "create-worktrees": {
       const workingDir = body.workingDir;
       if (!workingDir) return res.json({ ok: false, error: "Missing working directory" });
-      if (!fs.existsSync(path.join(workingDir, ".git"))) {
-        if (!fs.existsSync(workingDir)) ensureSecureDir(workingDir);
-        if (!REPO_RE.test(body.repo)) return res.json({ ok: false, error: "Invalid repo" });
-        const clone = exec("gh", ["repo", "clone", body.repo, workingDir]);
-        if (!clone.ok) return res.json({ ok: false, error: `Clone failed: ${clone.output}` });
-      }
-      // Empty repos have no commits — git worktree add requires at least one.
-      const headCheck = exec("git", ["rev-parse", "HEAD"], { cwd: workingDir });
-      if (!headCheck.ok) {
-        exec("git", ["commit", "--allow-empty", "-m", "Initial commit (created by QuadWork setup)"], { cwd: workingDir });
-        const branchResult = exec("git", ["symbolic-ref", "--short", "HEAD"], { cwd: workingDir });
-        const defaultBranch = branchResult.ok ? branchResult.output : "main";
-        exec("git", ["push", "origin", defaultBranch], { cwd: workingDir });
-      }
+      const ready = ensureGitHeadForSetup(workingDir, body.repo);
+      if (!ready.ok) return res.json({ ok: false, error: ready.error });
       // Sibling dirs: ../projectName-head/, ../projectName-re1/, etc. (matches CLI wizard)
       const projectName = path.basename(workingDir);
       const parentDir = path.dirname(workingDir);
@@ -3610,7 +3643,11 @@ router.post("/api/setup", (req, res) => {
         const wtDir = path.join(parentDir, `${projectName}-${agent}`);
         if (fs.existsSync(wtDir)) { created.push(`${agent} (exists)`); continue; }
         const branchName = `worktree-${agent}`;
-        exec("git", ["branch", branchName, "HEAD"], { cwd: workingDir });
+        const branch = exec("git", ["branch", branchName, "HEAD"], { cwd: workingDir });
+        if (!branch.ok) {
+          errors.push(`${agent}: branch failed: ${branch.output}`);
+          continue;
+        }
         const result = exec("git", ["worktree", "add", wtDir, branchName], { cwd: workingDir });
         if (result.ok) {
           created.push(agent);
@@ -4865,6 +4902,7 @@ module.exports.pickLinkedPrFromSearch = pickLinkedPrFromSearch;
 module.exports.findLinkedPrByTitle = findLinkedPrByTitle;
 module.exports.pickClosingPrFromTimeline = pickClosingPrFromTimeline;
 module.exports.progressForItemRest = progressForItemRest;
+module.exports.ensureGitHeadForSetup = ensureGitHeadForSetup;
 // #827: expose the GITHUB.md writer for the idle-no-op regression test. No
 // production callers outside this file.
 module.exports.writeGithubFileFromSnapshot = writeGithubFileFromSnapshot;
