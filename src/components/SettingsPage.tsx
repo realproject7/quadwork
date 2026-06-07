@@ -91,11 +91,20 @@ const COPY = {
     defaultAgentCli: "Default agent CLI",
     reviewerGithubUser: "Reviewer GitHub user",
     reviewerGithubToken: "Reviewer GitHub token",
+    reviewerAccount: "Reviewer Account",
+    reviewerAccountHelp:
+      "Global reviewer credentials for RE1/RE2 across all projects. The token value is written to ~/.quadwork/reviewer-token (mode 0600), is never returned by the API, and is not rendered after save.",
+    reviewerTokenStatus: "Token status",
+    tokenPath: "Token path",
     configured: "Configured",
     notConfigured: "Not configured",
     pasteNewToken: "Paste new token",
+    saveToken: "Save token",
+    saveReviewerUser: "Save reviewer user",
+    tokenSaved: "Token saved",
+    reviewerUserSaved: "Reviewer user saved",
     defaultsHelp:
-      "The default CLI seeds new project agents. The reviewer GitHub user/token are used by RE1/RE2 to post PR review comments without your personal token. The token is written to ~/.quadwork/reviewer-token (mode 0600) and is never returned by the API.",
+      "The default CLI seeds new project agents. Reviewer account credentials are configured in the global Reviewer Account section below.",
     system: "System",
     keepAwake: "Keep Awake",
     on: "on",
@@ -169,11 +178,20 @@ const COPY = {
     defaultAgentCli: "기본 에이전트 CLI",
     reviewerGithubUser: "리뷰어 GitHub 사용자",
     reviewerGithubToken: "리뷰어 GitHub 토큰",
+    reviewerAccount: "리뷰어 계정",
+    reviewerAccountHelp:
+      "모든 프로젝트의 RE1/RE2가 사용하는 전역 리뷰어 인증 정보입니다. 토큰 값은 ~/.quadwork/reviewer-token (권한 0600)에 저장되며 API로 반환되지 않고 저장 후 화면에 표시되지 않습니다.",
+    reviewerTokenStatus: "토큰 상태",
+    tokenPath: "토큰 경로",
     configured: "설정됨",
     notConfigured: "미설정",
     pasteNewToken: "새 토큰 붙여넣기",
+    saveToken: "토큰 저장",
+    saveReviewerUser: "리뷰어 사용자 저장",
+    tokenSaved: "토큰 저장됨",
+    reviewerUserSaved: "리뷰어 사용자 저장됨",
     defaultsHelp:
-      "기본 CLI는 새 프로젝트 에이전트의 초기값으로 사용됩니다. 리뷰어 GitHub 사용자/토큰은 개인 토큰 없이 RE1/RE2가 PR 리뷰 댓글을 남길 때 사용됩니다. 토큰은 ~/.quadwork/reviewer-token (권한 0600)에 저장되며 API로는 반환되지 않습니다.",
+      "기본 CLI는 새 프로젝트 에이전트의 초기값으로 사용됩니다. 리뷰어 계정 인증 정보는 아래 전역 리뷰어 계정 섹션에서 설정합니다.",
     system: "시스템",
     keepAwake: "절전 방지",
     on: "켜짐",
@@ -375,8 +393,13 @@ export default function SettingsPage() {
   // #212: reviewer-token presence + Keep Awake state for the new
   // global Settings sub-sections.
   const [reviewerTokenExists, setReviewerTokenExists] = useState<boolean | null>(null);
+  const [reviewerTokenPath, setReviewerTokenPath] = useState("");
   const [reviewerTokenInput, setReviewerTokenInput] = useState("");
   const [reviewerTokenSaving, setReviewerTokenSaving] = useState(false);
+  const [reviewerTokenMessage, setReviewerTokenMessage] = useState("");
+  const [reviewerUserDraft, setReviewerUserDraft] = useState("");
+  const [reviewerUserSaving, setReviewerUserSaving] = useState(false);
+  const [reviewerUserMessage, setReviewerUserMessage] = useState("");
   const [keepAwakeActive, setKeepAwakeActive] = useState(false);
   const [keepAwakeBusy, setKeepAwakeBusy] = useState(false);
   const [butlerRunning, setButlerRunning] = useState(false);
@@ -384,9 +407,15 @@ export default function SettingsPage() {
 
   const refreshReviewerTokenStatus = useCallback(() => {
     fetch("/api/setup/reviewer-token-status")
-      .then((r) => (r.ok ? r.json() : { exists: false }))
-      .then((d) => setReviewerTokenExists(!!d.exists))
-      .catch(() => setReviewerTokenExists(false));
+      .then((r) => (r.ok ? r.json() : { exists: false, path: "" }))
+      .then((d) => {
+        setReviewerTokenExists(!!d.exists);
+        setReviewerTokenPath(typeof d.path === "string" ? d.path : "");
+      })
+      .catch(() => {
+        setReviewerTokenExists(false);
+        setReviewerTokenPath("");
+      });
   }, []);
 
   const refreshKeepAwake = useCallback(() => {
@@ -415,9 +444,14 @@ export default function SettingsPage() {
     refreshButlerStatus();
   }, [refreshReviewerTokenStatus, refreshKeepAwake, refreshButlerStatus]);
 
+  useEffect(() => {
+    if (config) setReviewerUserDraft(config.reviewer_github_user || "");
+  }, [config?.reviewer_github_user]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const saveReviewerToken = async () => {
     if (!reviewerTokenInput.trim()) return;
     setReviewerTokenSaving(true);
+    setReviewerTokenMessage("");
     try {
       const r = await fetch("/api/setup/save-token", {
         method: "POST",
@@ -427,9 +461,48 @@ export default function SettingsPage() {
       if (r.ok) {
         setReviewerTokenInput("");
         refreshReviewerTokenStatus();
+        setReviewerTokenMessage(t.tokenSaved);
+      } else {
+        const data = await r.json().catch(() => ({}));
+        setReviewerTokenMessage(data.error || "Failed to save token");
       }
+    } catch {
+      setReviewerTokenMessage("Failed to save token");
     } finally {
       setReviewerTokenSaving(false);
+    }
+  };
+
+  const saveReviewerUser = async () => {
+    if (!config) return;
+    setReviewerUserSaving(true);
+    setReviewerUserMessage("");
+    try {
+      const r = await fetch("/api/reviewer-github-user", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reviewer_github_user: reviewerUserDraft.trim() }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setReviewerUserMessage(data.error || "Failed to save reviewer user");
+        return;
+      }
+      const next = { ...config, reviewer_github_user: data.reviewer_github_user || "" };
+      setConfig(next);
+      try {
+        const saved = JSON.parse(savedConfigRef.current || "{}");
+        saved.reviewer_github_user = data.reviewer_github_user || "";
+        savedConfigRef.current = JSON.stringify(saved);
+      } catch {
+        savedConfigRef.current = JSON.stringify(next);
+      }
+      setReviewerUserDraft(data.reviewer_github_user || "");
+      setReviewerUserMessage(t.reviewerUserSaved);
+    } catch {
+      setReviewerUserMessage("Failed to save reviewer user");
+    } finally {
+      setReviewerUserSaving(false);
     }
   };
 
@@ -769,7 +842,7 @@ export default function SettingsPage() {
         </p>
       </section>
 
-      {/* Defaults — default agent CLI + reviewer credentials (#212) */}
+      {/* Defaults — default agent CLI (#212) */}
       <section className="mb-8">
         <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.defaults}</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
@@ -782,41 +855,87 @@ export default function SettingsPage() {
               label: b.label + (cliStatus && !cliStatus[b.value as keyof typeof cliStatus] ? " (not installed)" : ""),
             }))}
           />
-          <Input
-            label={t.reviewerGithubUser}
-            value={config.reviewer_github_user || ""}
-            onChange={(v) => updateGlobal("reviewer_github_user" as keyof Config, v)}
-            placeholder="reviewer-bot"
-          />
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-text-muted uppercase tracking-wider">{t.reviewerGithubToken}</label>
-            <div className="flex items-center gap-2">
-              <span className={`w-1.5 h-1.5 rounded-full ${reviewerTokenExists ? "bg-accent" : "bg-text-muted"}`} />
-              <span className="text-[11px] text-text-muted">
-                {reviewerTokenExists === null ? "…" : reviewerTokenExists ? t.configured : t.notConfigured}
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5 mt-1">
-              <input
-                type="password"
-                value={reviewerTokenInput}
-                onChange={(e) => setReviewerTokenInput(e.target.value)}
-                placeholder={t.pasteNewToken}
-                className="flex-1 bg-transparent border border-border px-2 py-1 text-[11px] text-text outline-none focus:border-accent font-mono"
-              />
-              <button
-                onClick={saveReviewerToken}
-                disabled={reviewerTokenSaving || !reviewerTokenInput.trim()}
-                className="px-2 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 transition-colors"
-              >
-                {reviewerTokenSaving ? t.saving : t.save}
-              </button>
-            </div>
-          </div>
         </div>
         <p className="mt-2 text-[10px] text-text-muted leading-snug">
           {t.defaultsHelp}
         </p>
+      </section>
+
+      <section className="mb-8">
+        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.reviewerAccount}</h2>
+        <div className="border border-border p-4 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(280px,1fr)] gap-4">
+          <div className="flex flex-col gap-3">
+            <div>
+              <div className="text-[11px] text-text-muted uppercase tracking-wider mb-1">{t.reviewerTokenStatus}</div>
+              <div className="flex items-center gap-2">
+                <span className={`w-1.5 h-1.5 rounded-full ${reviewerTokenExists ? "bg-accent" : "bg-text-muted"}`} />
+                <span className="text-[12px] text-text">
+                  {reviewerTokenExists === null ? "…" : reviewerTokenExists ? `${t.configured} ✓` : t.notConfigured}
+                </span>
+              </div>
+              {reviewerTokenPath && (
+                <div className="mt-1 text-[10px] text-text-muted font-mono break-all">
+                  {t.tokenPath}: {reviewerTokenPath}
+                </div>
+              )}
+            </div>
+            <div>
+              <label className="text-[11px] text-text-muted uppercase tracking-wider">{t.reviewerGithubToken}</label>
+              <div className="flex flex-col sm:flex-row gap-2 mt-1">
+                <input
+                  type="password"
+                  value={reviewerTokenInput}
+                  onChange={(e) => {
+                    setReviewerTokenInput(e.target.value);
+                    setReviewerTokenMessage("");
+                  }}
+                  placeholder={t.pasteNewToken}
+                  className="flex-1 min-w-0 bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent font-mono"
+                  autoComplete="new-password"
+                />
+                <button
+                  onClick={saveReviewerToken}
+                  disabled={reviewerTokenSaving || !reviewerTokenInput.trim()}
+                  className="px-3 py-1.5 text-[12px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 transition-colors"
+                >
+                  {reviewerTokenSaving ? t.saving : t.saveToken}
+                </button>
+              </div>
+              {reviewerTokenMessage && (
+                <p className="mt-1 text-[10px] text-text-muted">{reviewerTokenMessage}</p>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-col gap-3">
+            <div>
+              <label className="text-[11px] text-text-muted uppercase tracking-wider">{t.reviewerGithubUser}</label>
+              <div className="flex flex-col sm:flex-row gap-2 mt-1">
+                <input
+                  value={reviewerUserDraft}
+                  onChange={(e) => {
+                    setReviewerUserDraft(e.target.value);
+                    setReviewerUserMessage("");
+                  }}
+                  placeholder="reviewer-bot"
+                  className="flex-1 min-w-0 bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
+                />
+                <button
+                  onClick={saveReviewerUser}
+                  disabled={reviewerUserSaving || reviewerUserDraft.trim() === (config.reviewer_github_user || "")}
+                  className="px-3 py-1.5 text-[12px] border border-border text-text-muted hover:text-text hover:border-accent disabled:opacity-50 transition-colors"
+                >
+                  {reviewerUserSaving ? t.saving : t.save}
+                </button>
+              </div>
+              {reviewerUserMessage && (
+                <p className="mt-1 text-[10px] text-text-muted">{reviewerUserMessage}</p>
+              )}
+            </div>
+            <p className="text-[10px] text-text-muted leading-snug">
+              {t.reviewerAccountHelp}
+            </p>
+          </div>
+        </div>
       </section>
 
       {/* System — Keep Awake (#212) */}

@@ -424,6 +424,31 @@ router.put("/api/sidebar-groups", (req, res) => {
   }
 });
 
+function validateReviewerGithubUser(value) {
+  if (typeof value !== "string") return null;
+  const v = value.trim();
+  if (v === "") return "";
+  return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(v) ? v : null;
+}
+
+router.put("/api/reviewer-github-user", (req, res) => {
+  const reviewer = validateReviewerGithubUser(req.body && req.body.reviewer_github_user);
+  if (reviewer === null) {
+    return res.status(400).json({ error: "reviewer_github_user must be a valid GitHub username or blank" });
+  }
+  try {
+    const dir = path.dirname(CONFIG_PATH);
+    ensureSecureDir(dir);
+    const cfg = readConfigFile();
+    if (reviewer) cfg.reviewer_github_user = reviewer;
+    else delete cfg.reviewer_github_user;
+    writeConfig(cfg);
+    res.json({ ok: true, reviewer_github_user: reviewer });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+});
+
 // ─── Chat (file-based) ────────────────────────────────────────────────────
 
 const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
@@ -3589,7 +3614,7 @@ router.get("/api/setup/detect-clone", (req, res) => {
 // Save reviewer token securely
 router.post("/api/setup/save-token", (req, res) => {
   const { token } = req.body;
-  if (!token) return res.status(400).json({ error: "Missing token" });
+  if (typeof token !== "string" || !token.trim()) return res.status(400).json({ error: "Missing token" });
   const tokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
   const dir = path.dirname(tokenPath);
   ensureSecureDir(dir);
