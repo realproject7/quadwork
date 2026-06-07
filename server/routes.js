@@ -2450,6 +2450,8 @@ router.get("/api/github/merged-prs", (req, res) => serveGithubList(req, res, "me
 // Cached for 10s per project to avoid hammering gh on every poll.
 
 const _batchProgressCache = new Map(); // projectId -> { ts, data }
+const _batchProgressRefreshes = new Map(); // projectId -> Promise
+const BATCH_TERMINAL_STATUSES = new Set(["merged", "closed"]);
 
 // #429 / quadwork#316: persistent batch snapshot on disk so the
 // Batch Progress panel keeps showing merged items after Head moves
@@ -2482,6 +2484,44 @@ function deleteBatchSnapshot(projectId) {
   } catch {
     // Non-fatal — file may already be gone.
   }
+}
+
+function isTerminalBatchItem(item) {
+  return item && BATCH_TERMINAL_STATUSES.has(item.status);
+}
+
+function terminalItemsFromSnapshot(snapshot, batchNumber, issueNumbers) {
+  if (!snapshot || snapshot.batchNumber !== batchNumber || !Array.isArray(issueNumbers)) return new Map();
+  const source = snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {};
+  const wanted = new Set(issueNumbers);
+  const rows = new Map();
+  for (const [rawIssue, row] of Object.entries(source)) {
+    const n = parseInt(rawIssue, 10);
+    if (!wanted.has(n) || !isTerminalBatchItem(row)) continue;
+    rows.set(n, row);
+  }
+  return rows;
+}
+
+function collectTerminalItems(items, previous = new Map()) {
+  const rows = {};
+  for (const [n, row] of previous.entries()) {
+    if (isTerminalBatchItem(row)) rows[n] = row;
+  }
+  for (const row of Array.isArray(items) ? items : []) {
+    if (!Number.isInteger(row && row.issue_number)) continue;
+    if (isTerminalBatchItem(row)) rows[row.issue_number] = row;
+    else delete rows[row.issue_number];
+  }
+  return rows;
+}
+
+function snapshotHasOpenIssue(snapshot, n) {
+  return !!(
+    snapshot &&
+    Array.isArray(snapshot.issues) &&
+    snapshot.issues.some((it) => it && it.number === n && it.state === "OPEN")
+  );
 }
 
 // #334: verify the snapshot's first issue number still exists on
@@ -2580,6 +2620,7 @@ function resolveDisplayedBatch(
       // as code. Absent (legacy / code snapshots) → "code"/[] — back-compatible.
       batch_type: snapshot.batch_type || "code",
       reviewItems: Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : [],
+      terminalItems: snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {},
     };
     // #899: snapshot stickiness preserves the displayed issue SET (so items Head
     // moved to Done stay visible — #316/#429), but a review batch's per-item
@@ -3211,7 +3252,29 @@ async function getOrComputeBatchProgress(projectId) {
 
   const repo = getRepo(projectId);
   if (!repo) return null;
+  if (cached) {
+    startBatchProgressRefresh(projectId, repo);
+    return { ...cached.data, _stale: true, _refreshing: true };
+  }
 
+  return computeBatchProgress(projectId, repo);
+}
+
+function startBatchProgressRefresh(projectId, repo) {
+  if (_batchProgressRefreshes.has(projectId)) return _batchProgressRefreshes.get(projectId);
+  const refresh = computeBatchProgress(projectId, repo)
+    .catch(() => {
+      // Non-fatal: callers already received the last good payload. The next poll
+      // will retry rather than turning a transient gh/GitHub failure into UI lag.
+    })
+    .finally(() => {
+      _batchProgressRefreshes.delete(projectId);
+    });
+  _batchProgressRefreshes.set(projectId, refresh);
+  return refresh;
+}
+
+async function computeBatchProgress(projectId, repo) {
   const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
   let queueText = "";
   let queueReadOk = false;
@@ -3278,6 +3341,7 @@ async function getOrComputeBatchProgress(projectId) {
   // resets its streak when this changes, so a new already-complete batch can't
   // inherit the prior batch's first cycle and confirm in one tick.
   const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
+  const terminalRows = terminalItemsFromSnapshot(readBatchSnapshot(projectId), batchNumber, issueNumbers);
   if (issueNumbers.length === 0) {
     evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
     const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type };
@@ -3323,6 +3387,8 @@ async function getOrComputeBatchProgress(projectId) {
     items = await _mapLimited(issueNumbers, GH_MAX_CONCURRENT, async (n) => {
       const fromSnap = progressFromSnapshot(snapshot, n);
       if (fromSnap) return fromSnap;
+      const fromTerminalCache = terminalRows.get(n);
+      if (fromTerminalCache && !snapshotHasOpenIssue(snapshot, n)) return fromTerminalCache;
       try {
         return await progressForItemRest(repo, n);
       } catch {
@@ -3334,7 +3400,7 @@ async function getOrComputeBatchProgress(projectId) {
     // Search. Items the file can't classify render soft "queued (retrying)" and
     // firm up next cycle once _graphqlCache repopulates.
     const parsed = loadGithubParsed(projectId);
-    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || softRetryingRow(n));
+    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || terminalRows.get(n) || softRetryingRow(n));
   }
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
@@ -3346,6 +3412,13 @@ async function getOrComputeBatchProgress(projectId) {
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
   const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
+  writeBatchSnapshot(projectId, {
+    batchNumber,
+    issueNumbers: issueNumbers.slice(),
+    batch_type,
+    reviewItems,
+    terminalItems: collectTerminalItems(items, terminalRows),
+  });
   _batchProgressCache.set(projectId, { ts: Date.now(), data });
   return data;
 }
@@ -4723,6 +4796,7 @@ module.exports.RESEED_STATE_PATH = RESEED_STATE_PATH;
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
 module.exports._batchProgressCache = _batchProgressCache;
+module.exports._batchProgressRefreshes = _batchProgressRefreshes;
 module.exports._graphqlCache = _graphqlCache;
 module.exports.restIssueToCanonical = restIssueToCanonical;
 module.exports.restClosedIssueToCanonical = restClosedIssueToCanonical;
