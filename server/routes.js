@@ -329,17 +329,19 @@ router.put("/api/config", (req, res) => {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
     ensureSecureDir(dir);
-    // #944: pinned_projects and sidebar_groups are owned by the field-scoped
-    // /api/pins and /api/sidebar-groups endpoints below. A whole-config PUT
+    // #944/#949: pinned_projects, sidebar_groups, and reviewer_github_user are
+    // owned by field-scoped endpoints below. A whole-config PUT
     // (settings save, idle toggle, bridge/queue/trigger widgets) carries a
-    // snapshot the client GET'd earlier, which may be stale for these two keys
-    // — a pin/group added by another save in the meantime. Never let a full PUT
-    // clobber them: always re-read the current on-disk values and keep those.
+    // snapshot the client GET'd earlier, which may be stale for these keys.
+    // Never let a full PUT clobber them: always re-read the current on-disk
+    // values and keep those.
     const disk = readConfigFile();
     if ("pinned_projects" in disk) body.pinned_projects = disk.pinned_projects;
     else delete body.pinned_projects;
     if ("sidebar_groups" in disk) body.sidebar_groups = disk.sidebar_groups;
     else delete body.sidebar_groups;
+    if ("reviewer_github_user" in disk) body.reviewer_github_user = disk.reviewer_github_user;
+    else delete body.reviewer_github_user;
     writeConfig(body);
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
@@ -419,6 +421,31 @@ router.put("/api/sidebar-groups", (req, res) => {
     cfg.sidebar_groups = groups;
     writeConfig(cfg);
     res.json({ ok: true, sidebar_groups: groups });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+});
+
+function validateReviewerGithubUser(value) {
+  if (typeof value !== "string") return null;
+  const v = value.trim();
+  if (v === "") return "";
+  return /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(v) ? v : null;
+}
+
+router.put("/api/reviewer-github-user", (req, res) => {
+  const reviewer = validateReviewerGithubUser(req.body && req.body.reviewer_github_user);
+  if (reviewer === null) {
+    return res.status(400).json({ error: "reviewer_github_user must be a valid GitHub username or blank" });
+  }
+  try {
+    const dir = path.dirname(CONFIG_PATH);
+    ensureSecureDir(dir);
+    const cfg = readConfigFile();
+    if (reviewer) cfg.reviewer_github_user = reviewer;
+    else delete cfg.reviewer_github_user;
+    writeConfig(cfg);
+    res.json({ ok: true, reviewer_github_user: reviewer });
   } catch (err) {
     res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
@@ -3589,7 +3616,7 @@ router.get("/api/setup/detect-clone", (req, res) => {
 // Save reviewer token securely
 router.post("/api/setup/save-token", (req, res) => {
   const { token } = req.body;
-  if (!token) return res.status(400).json({ error: "Missing token" });
+  if (typeof token !== "string" || !token.trim()) return res.status(400).json({ error: "Missing token" });
   const tokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
   const dir = path.dirname(tokenPath);
   ensureSecureDir(dir);
