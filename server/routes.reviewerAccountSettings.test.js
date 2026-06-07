@@ -133,11 +133,12 @@ function req(server, { method = "GET", urlPath, body } = {}) {
     assert.equal(fs.existsSync(TOKEN_PATH), false, "blank token does not create file");
     console.log("  PASS: blank token validation");
 
-    const saved = await req(server, { method: "POST", urlPath: "/api/setup/save-token", body: { token: "ghp_secret_value" } });
+    const placeholderToken = "test-reviewer-token-placeholder";
+    const saved = await req(server, { method: "POST", urlPath: "/api/setup/save-token", body: { token: placeholderToken } });
     assert.equal(saved.status, 200, "token save succeeds");
     assert.equal(saved.json.ok, true, "token save returns ok");
-    assert.ok(!JSON.stringify(saved.json).includes("ghp_secret_value"), "save response does not echo token");
-    assert.equal(fs.readFileSync(TOKEN_PATH, "utf-8"), "ghp_secret_value\n", "token written with newline");
+    assert.ok(!JSON.stringify(saved.json).includes(placeholderToken), "save response does not echo token");
+    assert.equal(fs.readFileSync(TOKEN_PATH, "utf-8"), `${placeholderToken}\n`, "token written with newline");
     assert.equal(fs.statSync(TOKEN_PATH).mode & 0o777, 0o600, "token file mode is 0600");
     status = await req(server, { urlPath: "/api/setup/reviewer-token-status" });
     assert.equal(status.json.exists, true, "saved token reports exists=true");
