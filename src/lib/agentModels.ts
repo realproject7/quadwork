@@ -22,6 +22,11 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     // want a specific version locked in.
     { value: "opus", label: "opus (latest)" },
     { value: "sonnet", label: "sonnet (latest)" },
+    // #958: Fable 5 is a new model family, so the opus/sonnet aliases above
+    // never resolve to it — it needs its own pinned row. Deliberately NOT the
+    // first concrete row: modelsForBackend("claude")[0] ("opus") is the
+    // default/heal target and must stay put (#931).
+    { value: "claude-fable-5", label: "claude-fable-5" },
     { value: "claude-opus-4-8", label: "claude-opus-4-8" },
     { value: "claude-opus-4-7", label: "claude-opus-4-7" },
     { value: "claude-opus-4-6", label: "claude-opus-4-6" },

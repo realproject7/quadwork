@@ -53,6 +53,7 @@ ok(sanitizeModel("codex", "sonnet") === "gpt-5.4", "#931 core: saving a codex ag
 ok(sanitizeModel("gemini", "opus") === "gemini-2.5-pro", "sanitizeModel heals a Claude model on a gemini agent");
 ok(sanitizeModel("codex", "gpt-4o") === "gpt-4o", "sanitizeModel keeps an already-valid codex model");
 ok(sanitizeModel("claude", "claude-opus-4-8") === "claude-opus-4-8", "sanitizeModel keeps a valid pinned claude model");
+ok(sanitizeModel("claude", "claude-fable-5") === "claude-fable-5", "#958: sanitizeModel keeps claude-fable-5 (new family, not covered by the opus/sonnet aliases)");
 ok(sanitizeModel("codex", "") === "", "sanitizeModel keeps '' (CLI default) — valid for every CLI, never clobbered");
 ok(sanitizeModel("gemini", undefined) === "", "sanitizeModel maps undefined → '' (CLI default), not a fabricated model");
 
