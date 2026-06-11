@@ -124,3 +124,29 @@ chmod 440 /etc/sudoers.d/quadwork
 
 See the [VPS Installation Guide](install-vps.md#step-2-create-non-root-user-critical) for full setup.
 
+
+## Every Claude bash command fails silently (exit 1, no output)
+
+**Symptom:** every bash command a `claude` agent runs — even `true` — returns
+exit 1 with empty stdout/stderr. The Read tool still works, a plain shell on
+the host works, and `codex` agents are unaffected. Easily mistaken for a
+bwrap/AppArmor/sandbox failure.
+
+**Cause:** Claude Code keeps its temp under `/tmp/claude-{uid}` and never
+cleans it up. On hosts where `/tmp` is mounted with a per-user quota
+(`usrquota`), that dir grows until the quota is exhausted — after which Claude
+can't write the temp files it needs before executing any command (#957).
+
+**Check:** `du -sh /tmp/claude-$(id -u)` and try `dd if=/dev/zero
+of=/tmp/probe bs=1M count=10` — a "Disk quota exceeded" error confirms it.
+
+**Fix:** QuadWork sweeps stale backend temp automatically (hourly, at boot,
+and on agent teardown; entries older than 72h). If you hit the quota *before*
+a sweep (e.g. the server was down), clear it manually:
+`find /tmp/claude-$(id -u)/* -maxdepth 0 -mmin +60 -exec rm -rf {} +`
+
+Tune or disable via `~/.quadwork/config.json`:
+
+```json
+{ "temp_cleanup": { "enabled": true, "max_age_hours": 72 } }
+```

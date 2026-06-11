@@ -12,6 +12,7 @@ const fileChat = require("./file-chat");
 const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./pty-dispatcher");
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
+const tempCleanup = require("./temp-cleanup");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const net = require("net");
@@ -623,6 +624,34 @@ async function stopAgentSession(key, { clearSelfHeal = false } = {}) {
   session.exitedUnexpectedly = false;
   const [projectId, agentId] = key.split("/");
   if (projectId && agentId) stopMcpProxy(projectId, agentId);
+  // #957: teardown is a known-safe moment to sweep stale backend temp.
+  // Deferred + stale-only, so it never blocks the stop path and never touches
+  // files another live agent (same shared /tmp/claude-{uid}) still uses.
+  setImmediate(backendTempSweepTick);
+}
+
+// #957: sweep stale backend temp entries (/tmp/claude-{uid}, stray gemini
+// crash dumps). On hosts where /tmp has a per-user quota, unbounded Claude
+// temp eventually exhausts it and every Claude bash call fails silently with
+// exit 1 — see the issue for the full post-mortem. Runs on agent teardown and
+// hourly; opt-out / age via config.json `temp_cleanup: {enabled, max_age_hours}`.
+let _tempSweepRunning = false;
+function backendTempSweepTick() {
+  if (_tempSweepRunning) return;
+  _tempSweepRunning = true;
+  try {
+    const settings = tempCleanup.cleanupSettings(readConfig());
+    if (!settings.enabled) return;
+    const r = tempCleanup.sweepBackendTemp({ maxAgeHours: settings.maxAgeHours });
+    if (r.removed.length > 0) {
+      console.log(`[temp-cleanup] removed ${r.removed.length} stale entr${r.removed.length === 1 ? "y" : "ies"} (kept ${r.kept})`);
+    }
+    for (const e of r.errors) console.error(`[temp-cleanup] ${e}`);
+  } catch (err) {
+    console.error(`[temp-cleanup] sweep failed: ${err.message}`);
+  } finally {
+    _tempSweepRunning = false;
+  }
 }
 
 app.get("/api/agents", (_req, res) => {
@@ -1814,6 +1843,14 @@ async function autoStopPollingTick() {
 // require.main, which is the bin, not this file).
 if (!process.env.QUADWORK_SKIP_LISTEN) {
   setInterval(autoStopPollingTick, AUTO_STOP_POLL_INTERVAL_MS);
+}
+
+// #957: hourly stale-temp sweep (plus one at boot — a server that was down
+// for days should reclaim quota immediately, not an hour after start).
+const TEMP_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+if (!process.env.QUADWORK_SKIP_LISTEN) {
+  setImmediate(backendTempSweepTick);
+  setInterval(backendTempSweepTick, TEMP_SWEEP_INTERVAL_MS);
 }
 
 // #915: retry deferred reseeds without a server restart. A reseed deferred on
