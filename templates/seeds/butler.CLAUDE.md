@@ -151,50 +151,58 @@ Save proposals to `~/docs/PROPOSAL-<name>.md`. Include version and date so they 
 
 For large features, create an epic with connected sub-tickets:
 
-**Epic format:**
+The formats below match the Head agent's `## EPIC & Sub-Ticket Authoring` rules — tickets you create must be indistinguishable from Head-authored tickets, or the Dev/reviewer structural gates (which check for these exact sections) will bounce them.
+
+**Epic format** (label `epic`):
 ```
 Title: [Epic] <Feature name>
 Body:
-  ## Vision
-  One paragraph summary.
+  ## Goal
+  1-3 sentences: the end state when the whole epic is done.
 
-  ## Sub-tickets
-  | # | Ticket | Scope | Dependencies |
-  |---|--------|-------|-------------|
-  | #N1 | Sub-ticket title | Server/Frontend/Docs | None |
-  | #N2 | Sub-ticket title | Frontend | #N1 |
+  ## Architecture Direction
+  The intended structure: which modules/layers change, which patterns to extend,
+  what the final shape looks like. ASCII diagram welcome. This is the alignment
+  yardstick for every sub-ticket.
+
+  ## Contracts
+  Interfaces, function signatures, file/module boundaries, API shapes, naming that
+  sub-tickets must respect or expose for later sub-tickets. Be concrete.
+
+  ## Sub-Tickets (ordered)
+  - [ ] #N1 <title> — <one-line role in the epic>
+  - [ ] #N2 <title> — <one-line role> (depends on #N1)
 
   ## Implementation order
   1. #N1 + #N4 (parallel — no dependencies)
   2. #N2 + #N5 (depend on #N1)
-  3. #N3 (depends on #N1 + #N2)
 
-  ## Architecture
-  ASCII diagram or description.
+  ## Non-Goals
+  What this epic deliberately does NOT do — the boundary against scope creep.
 ```
 
-**Sub-ticket format:**
+**Sub-ticket format** (body MUST begin with the `## EPIC Context` block):
 ```
-Title: [#<epic>-N] <Specific task description>
+Title: <Specific task description>
 Body:
-  ## Parent epic: #<epic>
+  ## EPIC Context
+  - **Parent:** #<epic> — <epic title>     (or: none — standalone)
+  - **Epic goal:** <one sentence, condensed from the epic>
+  - **This ticket's role:** <how completing this ticket advances the epic>
+  - **Depends on:** #<a>   **Enables:** #<b>
+  - **Contracts to respect/expose:** <the specific contracts from the epic this ticket touches>
+  - **Out of scope here (later tickets):** #<n> handles <x> — do not implement it
 
-  ## Summary
-  What this sub-ticket does. 2-3 sentences.
-
-  ## Implementation
-  Specific code changes with file paths.
+  ## Scope
+  What this sub-ticket does. Specific code changes with file paths.
   Show code snippets where the change goes.
 
-  ## Acceptance criteria
+  ## Acceptance Criteria
   - [ ] Checkbox 1
   - [ ] Checkbox 2
-
-  ## Dependencies
-  - Requires #N (if any)
 ```
 
-After creating all sub-tickets, update the epic body to link their actual issue numbers.
+After creating all sub-tickets, update the epic body to link their actual issue numbers. For UI sub-tickets, link or embed the design spec (mockup, component structure, token list) — "make it look good" is not a spec.
 
 ## 5. Individual Ticket Creation
 
