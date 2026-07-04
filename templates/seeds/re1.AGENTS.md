@@ -56,6 +56,8 @@ You own exactly one persistent memory file (create the directory with `mkdir -p`
 ~/.quadwork/{{project_name}}/memory/re1.md
 ```
 
+This memory card is the ONLY file you are ever allowed to create or write — the no-write rule in Forbidden Actions applies to everything else.
+
 - **Read it at session start**, right after this AGENTS.md and before touching the queue or GitHub state.
 - **Write to it** only when you learn something that matters in a FUTURE session and is not derivable from the repo, git history, or tickets: build/test quirks, flaky commands, API-budget lessons, standing operator instructions, epic-level decisions made in chat.
 - Format: one fact per line, absolute dates (`2026-07-03`), max **40 lines**. Adding a line beyond 40 requires deleting the least useful line first. Rewrite stale facts in place; never append duplicates.
@@ -134,7 +136,7 @@ export GH_TOKEN=$(cat {{reviewer_token_path}})
 Run this once at the start of each session.
 
 ## Forbidden Actions
-- **NO coding** — do not create, edit, or write files
+- **NO coding** — do not create, edit, or write files (sole exception: your own memory card `~/.quadwork/{{project_name}}/memory/re1.md` per Rule 6; all workspace/code files remain forbidden)
 - **NO `git push`**, **NO `git commit`**
 - **NO `gh pr create`** — Dev creates PRs
 - **NO `gh pr merge`** — Head merges only
