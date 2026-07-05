@@ -137,6 +137,17 @@ function _expandTilde(p) {
   return p;
 }
 
+// #970: a worktree-sourced reviewer-token path comes from agent-writable
+// AGENTS.md (`GH_TOKEN=$(cat <path>)`), so the server would otherwise
+// readFileSync an arbitrary attacker-chosen path — an existence/validity
+// oracle. Confine it to under ~/.quadwork or the project's own worktree.
+function _reviewerTokenPathAllowed(absPath, wtDir) {
+  return [CONFIG_DIR, path.resolve(wtDir)].some((root) => {
+    const rel = path.relative(root, absPath);
+    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  });
+}
+
 function _resolveReviewerTokenPath(projectId) {
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { /* default-config / unreadable */ }
@@ -152,7 +163,15 @@ function _resolveReviewerTokenPath(projectId) {
         const extracted = _extractReviewerTokenPath(agentsMd);
         // #897: expand `~` here (not in _extractReviewerTokenPath — reseed needs
         // the raw value) so the read + cache key use an absolute path.
-        if (extracted) return { path: _expandTilde(extracted), source: "worktree" };
+        if (extracted) {
+          const abs = path.resolve(t.wtDir, _expandTilde(extracted));
+          // #970: only honor the agent-supplied path if it stays under an
+          // allowed root; otherwise ignore it and fall through to the operator
+          // config / default token (a crafted path can't become a read oracle).
+          if (_reviewerTokenPathAllowed(abs, t.wtDir)) {
+            return { path: abs, source: "worktree" };
+          }
+        }
       } catch { /* worktree / AGENTS.md missing → try next role */ }
     }
   }
@@ -843,6 +862,13 @@ function activityLogPath(projectId) {
 router.post("/api/activity/log", (req, res) => {
   const { project, agent, type, timestamp } = req.body || {};
   if (typeof project !== "string" || !project) return res.status(400).json({ error: "Missing project" });
+  // #970: `project` flows into path.join(CONFIG_DIR, project, "activity.jsonl")
+  // (mkdir + appendFileSync). Restrict it to a configured project id so a
+  // crafted value like "../../tmp/x" can't become an arbitrary-path write
+  // primitive (matches the project-scoping other write routes already apply).
+  if (!(readConfigFile().projects || []).some((p) => p.id === project)) {
+    return res.status(400).json({ error: "Invalid project" });
+  }
   if (typeof agent !== "string" || !agent) return res.status(400).json({ error: "Missing agent" });
   if (type !== "start" && type !== "end") return res.status(400).json({ error: "type must be start|end" });
   const ts = typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.now();
@@ -978,6 +1004,13 @@ router.post("/api/chat", (req, res) => {
     sender = shimSender;
     selfMentionSkip = shimSender;
   } else if (bridgeSender && isLocalhost(req.ip)) {
+    // #970: the bridge relays external chat over localhost with no auth token;
+    // it must not be able to post under a reserved agent identity
+    // (head/dev/re1/re2/…), mirroring the reserved-sender denial on the
+    // history-import path.
+    if (RESERVED_HISTORY_SENDERS.has(bridgeSender.toLowerCase())) {
+      return res.status(403).json({ error: "Reserved sender" });
+    }
     sender = bridgeSender;
   }
   // #940: thread image attachments through. Persist only the `name`
@@ -4875,6 +4908,8 @@ module.exports._extractReviewerTokenPath = _extractReviewerTokenPath;
 // #886/#893: expose the project-aware reviewer rate-limit resolver/poll/payload
 // for tests.
 module.exports._resolveReviewerTokenPath = _resolveReviewerTokenPath;
+// #970: expose the reviewer-token-path containment predicate for the guard test.
+module.exports._reviewerTokenPathAllowed = _reviewerTokenPathAllowed;
 module.exports.getReviewerRateLimit = getReviewerRateLimit;
 module.exports.reviewerRateLimitPayload = reviewerRateLimitPayload;
 // #856: expose the auto-reseed startup hook + supporting state/version
