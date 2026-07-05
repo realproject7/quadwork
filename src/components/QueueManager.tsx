@@ -243,7 +243,19 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
                 [&_li]:my-0.5 [&_strong]:text-text
                 [&_code]:text-accent [&_code]:text-[11px] [&_code]:bg-bg [&_code]:px-1
                 [&_a]:text-accent [&_a]:hover:underline">
-                <ReactMarkdown>{content}</ReactMarkdown>
+                <ReactMarkdown
+                  components={{
+                    // Preserve the prior new-tab behavior so clicking a preview
+                    // link doesn't navigate away from (and discard) the queue
+                    // editor. react-markdown still sanitizes the href.
+                    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- drop react-markdown's `node` prop; it's not a valid DOM attr
+                    a: ({ node, ...props }) => (
+                      <a {...props} target="_blank" rel="noopener noreferrer" />
+                    ),
+                  }}
+                >
+                  {content}
+                </ReactMarkdown>
               </div>
             ) : (
               <span className="text-text-muted">Preview will appear here...</span>
