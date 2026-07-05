@@ -1,24 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
-
-/** Simple markdown to HTML for preview (headings, lists, bold, code, links) */
-function renderMarkdown(md: string): string {
-  return md
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/^### (.+)$/gm, '<h3 class="text-sm font-semibold text-text mt-3 mb-1">$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2 class="text-sm font-semibold text-accent mt-4 mb-1">$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1 class="text-base font-bold text-text mt-2 mb-2">$1</h1>')
-    .replace(/^\d+\. (.+)$/gm, '<div class="pl-4 text-text">• $1</div>')
-    .replace(/^- (.+)$/gm, '<div class="pl-4 text-text-muted">– $1</div>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong class="text-text">$1</strong>')
-    .replace(/`([^`]+)`/g, '<code class="text-accent text-[11px] bg-bg px-1">$1</code>')
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" class="text-accent hover:underline">$1</a>')
-    .replace(/\n\n/g, '<div class="h-2"></div>')
-    .replace(/\n/g, "<br>");
-}
+import { useState, useEffect, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
 
 interface Issue {
   number: number;
@@ -124,7 +107,6 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
     URL.revokeObjectURL(url);
   };
 
-  const renderedPreview = useMemo(() => renderMarkdown(content), [content]);
   const prompt = generatePrompt(content, repo);
 
   const copyPrompt = async () => {
@@ -247,7 +229,22 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
           </div>
           <div className="flex-1 overflow-y-auto p-3 text-[12px] text-text">
             {content ? (
-              <div dangerouslySetInnerHTML={{ __html: renderedPreview }} />
+              // react-markdown (no raw-HTML/rehype-raw) renders untrusted GitHub
+              // issue titles inertly — javascript: hrefs are stripped and any raw
+              // HTML is escaped (#969). Mirrors the safe pattern in
+              // OvernightQueueWidget.tsx.
+              <div className="text-[12px] text-text
+                [&_h1]:text-base [&_h1]:font-bold [&_h1]:text-text [&_h1]:mt-2 [&_h1]:mb-2
+                [&_h2]:text-sm [&_h2]:font-semibold [&_h2]:text-accent [&_h2]:mt-4 [&_h2]:mb-1
+                [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-text [&_h3]:mt-3 [&_h3]:mb-1
+                [&_p]:my-1.5
+                [&_ul]:my-1.5 [&_ul]:pl-4 [&_ul]:list-disc [&_ul]:text-text-muted
+                [&_ol]:my-1.5 [&_ol]:pl-4 [&_ol]:list-decimal
+                [&_li]:my-0.5 [&_strong]:text-text
+                [&_code]:text-accent [&_code]:text-[11px] [&_code]:bg-bg [&_code]:px-1
+                [&_a]:text-accent [&_a]:hover:underline">
+                <ReactMarkdown>{content}</ReactMarkdown>
+              </div>
             ) : (
               <span className="text-text-muted">Preview will appear here...</span>
             )}
