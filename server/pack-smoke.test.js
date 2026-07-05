@@ -106,9 +106,44 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
     'src/lib/injectMode.js is require()d by runtime code and must stay in the tarball (#937)',
   );
 
+  // 5) fs-loaded / dynamically-required assets the literal-require scan can't
+  //    see (#976). These are read at runtime by path (seed reseeding reads the
+  //    template files; the operator MCP loads its tool modules dynamically), so
+  //    a `files` regression that drops them wouldn't trip the require scan above
+  //    — it would only surface as a broken install. Assert they ship.
+  const assetTargets = [];
+
+  // Seed templates: every AGENTS.md seed + the top-level CLAUDE.md template.
+  const seedDir = path.join(ROOT, "templates", "seeds");
+  const seedFiles = fs
+    .readdirSync(seedDir)
+    .filter((f) => f.endsWith(".AGENTS.md"))
+    .map((f) => `templates/seeds/${f}`);
+  assert.ok(seedFiles.length > 0, "found template AGENTS.md seeds to check");
+  assetTargets.push(...seedFiles, "templates/CLAUDE.md");
+
+  // Operator MCP tool modules (dynamically loaded, not literal-required).
+  const toolsDir = path.join(ROOT, "server", "mcp-operator", "tools");
+  const toolFiles = fs
+    .readdirSync(toolsDir)
+    .filter((f) => f.endsWith(".js") && !f.endsWith(".test.js"))
+    .map((f) => `server/mcp-operator/tools/${f}`);
+  assert.ok(toolFiles.length > 0, "found operator MCP tool modules to check");
+  assetTargets.push(...toolFiles);
+
+  const missingAssets = assetTargets.filter((t) => !shipped.has(t));
+  assert.deepEqual(
+    missingAssets,
+    [],
+    `Runtime assets missing from the npm tarball — published install would be ` +
+      `broken (#976). Add the path(s) to package.json "files":\n` +
+      missingAssets.map((m) => `  ${m} (NOT in tarball)`).join("\n"),
+  );
+
   console.log(
     `PASS: pack-smoke — ${shippedNodeSrc.length} shipped Node files scanned, ` +
-      `all relative requires resolve inside the tarball`,
+      `all relative requires resolve inside the tarball; ` +
+      `${assetTargets.length} runtime assets present`,
   );
   console.log("server/pack-smoke.test.js: all assertions passed");
   process.exit(0);

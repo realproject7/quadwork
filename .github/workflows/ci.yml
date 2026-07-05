@@ -1,0 +1,22 @@
+# CI test-gate (#976, EPIC #967 Phase 0). Runs the server discovery suite on
+# every PR and on push to main so a red suite blocks merge. Node 24.x matches
+# the VPS runtime. `npm test` runs `node server/run-tests.js`, which includes
+# the pack-smoke guard (#937/#939) that only ran on manual invocation before.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm test
