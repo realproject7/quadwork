@@ -49,7 +49,7 @@ Reference: [plotlink at `pre-design-overhaul`](https://github.com/realproject7/p
 
 - AgentChattr: external dependency, cloned to `~/.quadwork/agentchattr` and run via `.venv/bin/python run.py`
 - Telegram bridge: external (`realproject7/agentchattr-telegram`), optional
-- Any new shared module `require`d by Node runtime code (`bin/`, `server/`) must live under a shipped dir or be added to `package.json` `files` — otherwise it's missing from the published tarball and crash-loops on fresh install (#937/#939). `server/pack-smoke.test.js` guards this in CI.
+- Any new shared module `require`d by Node runtime code (`bin/`, `server/`) must live under a shipped dir or be added to `package.json` `files` — otherwise it's missing from the published tarball and crash-loops on fresh install (#937/#939). `server/pack-smoke.test.js` guards this; CI (`.github/workflows/ci.yml`) runs the suite on every PR and push to main (#976).
 
 ## Running locally
 
