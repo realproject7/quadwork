@@ -236,9 +236,14 @@ function isRunning(projectId) {
   return instances.has(projectId);
 }
 
+// #972: stop every running instance (used on server shutdown).
+function stopAll() {
+  for (const projectId of [...instances.keys()]) stop(projectId);
+}
+
 function getLastError(projectId) {
   const inst = instances.get(projectId);
   return inst?.lastError || null;
 }
 
-module.exports = { start, stop, isRunning, getLastError, readCursor };
+module.exports = { start, stop, stopAll, isRunning, getLastError, readCursor };

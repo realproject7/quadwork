@@ -13,6 +13,8 @@ const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
+const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
+const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 
 const net = require("net");
 const crypto = require("crypto");
@@ -1925,8 +1927,9 @@ async function autoStopPollingTick() {
 // or binding the port. Production never sets it; `quadwork start` requires this
 // module for its side effects, so the guard must be an explicit env var (not
 // require.main, which is the bin, not this file).
+let _autoStopHandle = null; // #972: captured so shutdown() can clear it
 if (!process.env.QUADWORK_SKIP_LISTEN) {
-  setInterval(autoStopPollingTick, AUTO_STOP_POLL_INTERVAL_MS);
+  _autoStopHandle = setInterval(autoStopPollingTick, AUTO_STOP_POLL_INTERVAL_MS);
 }
 
 // #915: retry deferred reseeds without a server restart. A reseed deferred on
@@ -1948,8 +1951,9 @@ async function reseedRetryTick() {
     _reseedRetryRunning = false;
   }
 }
+let _reseedRetryHandle = null; // #972: captured so shutdown() can clear it
 if (!process.env.QUADWORK_SKIP_LISTEN) {
-  setInterval(reseedRetryTick, RESEED_RETRY_INTERVAL_MS);
+  _reseedRetryHandle = setInterval(reseedRetryTick, RESEED_RETRY_INTERVAL_MS);
 }
 
 // #422 / quadwork#310: auto-continue after loop guard.
@@ -2172,7 +2176,38 @@ if (!process.env.QUADWORK_SKIP_LISTEN) server.listen(PORT, "127.0.0.1", async ()
   startWatchdog();
 });
 
+// #972: clean shutdown. Previously only stopped butler + file-chat, so Ctrl+C
+// orphaned the detached caffeinate process (Mac never slept again), left agent
+// PTYs (and their CLI children holding worktree locks) alive, and never cleared
+// the polling/watchdog timers or the bridge/trigger connections. Every step is
+// independently guarded so the function stays idempotent (SIGINT then SIGTERM,
+// or a full-reset re-run, can call it more than once safely).
 function shutdown() {
+  // Polling + watchdog timers.
+  if (_autoStopHandle) { clearInterval(_autoStopHandle); _autoStopHandle = null; }
+  if (_reseedRetryHandle) { clearInterval(_reseedRetryHandle); _reseedRetryHandle = null; }
+  if (_watchdogHandle) { clearInterval(_watchdogHandle); _watchdogHandle = null; }
+
+  // Trigger schedulers (clears each trigger's interval + duration timers).
+  for (const project of [...triggers.keys()]) {
+    try { stopTrigger(project); } catch {}
+  }
+
+  // Message bridges (in-process Discord/Telegram clients).
+  try { telegramBridge.stopAll(); } catch {}
+  try { discordBridge.stopAll(); } catch {}
+
+  // caffeinate is spawned detached+unref, so it survives our exit unless killed.
+  if (caffeinateProcess.process) {
+    try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
+    caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
+  }
+
+  // Agent PTYs (and the CLI children they hold).
+  for (const [, session] of agentSessions) {
+    if (session && session.term) { try { session.term.kill(); } catch {} }
+  }
+
   stopButlerPty();
   const cfg = readConfig();
   for (const p of (cfg.projects || [])) {
@@ -2183,3 +2218,4 @@ function shutdown() {
 }
 
 module.exports = { shutdown, buildAgentArgs, buildAgentEnv, isPtyAlive, watchdogCheck, markSessionExited };
+module.exports.agentSessions = agentSessions; // #972: test seam for shutdown() PTY cleanup
