@@ -355,18 +355,12 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
       prevBatchRef.current = null;
     }
     try {
-      const r = await fetch("/api/config");
-      if (!r.ok) return;
-      const cfg = await r.json();
-      const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
-      if (entry) {
-        entry.trigger_auto = next;
-        await fetch("/api/config", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(cfg),
-        });
-      }
+      // #971: field-scoped write — merges only trigger_auto (no whole-config clobber)
+      await fetch(`/api/projects/${encodeURIComponent(projectId)}/flags`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trigger_auto: next }),
+      });
     } catch { /* non-fatal */ }
   }, [autoTrigger, projectId]);
 

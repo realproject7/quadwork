@@ -169,9 +169,35 @@ function writeSecureFile(filePath, data, extraOpts = {}) {
   try { fs.chmodSync(filePath, 0o600); } catch {}
 }
 
-/** Write config.json atomically with 0o600 permissions. */
+// #971: write config.json ATOMICALLY (write a tmp file, then renameSync onto
+// the target — the same crash-safe pattern migrate-ac.js uses). The old
+// in-place writeFileSync could truncate config.json to zero bytes if the
+// process died mid-write, losing the entire config; rename() is atomic on the
+// same filesystem, so a reader always sees either the old or the new file, never
+// a partial one. The tmp name carries the pid so two processes can't collide.
 function writeConfig(cfg) {
-  writeSecureFile(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  const data = JSON.stringify(cfg, null, 2);
+  const tmpPath = `${CONFIG_PATH}.${process.pid}.tmp`;
+  writeSecureFile(tmpPath, data); // 0o600
+  try {
+    fs.renameSync(tmpPath, CONFIG_PATH); // atomic commit; keeps the tmp's 0o600
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch { /* leave nothing behind */ }
+    throw err;
+  }
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, sanitizeOperatorName, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig };
+// #971: single serialization point for read-modify-write config mutations.
+// Runs synchronously (Node can't interleave a sync block), so it reads the
+// freshest on-disk config, applies `mutator`, and atomically writes — a
+// concurrent caller can't clobber it with a stale whole-config snapshot. Server
+// mutators and the field-scoped endpoints go through here instead of doing their
+// own GET→mutate→writeConfig. Returns the mutated config.
+function updateConfig(mutator) {
+  const cfg = readConfig();
+  mutator(cfg);
+  writeConfig(cfg);
+  return cfg;
+}
+
+module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, sanitizeOperatorName, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, updateConfig };

@@ -368,6 +368,28 @@ router.put("/api/config", (req, res) => {
     // never carries it — re-read and preserve it (same reason as the keys above).
     if ("session_token" in disk) body.session_token = disk.session_token;
     else delete body.session_token;
+    // #971: GET returns the SANITIZED operator_name; if the client PUTs back that
+    // exact sanitized value it did not actually edit it, so keep the raw on-disk
+    // value instead of overwriting it with the sanitized form (routes.js:327).
+    if (typeof body.operator_name === "string" && "operator_name" in disk &&
+        body.operator_name === sanitizeOperatorName(disk.operator_name)) {
+      body.operator_name = disk.operator_name;
+    }
+    // #971: the per-project flag fields are owned by PUT /api/projects/:id/flags.
+    // A whole-config PUT (e.g. SettingsPage.save) carries a possibly-stale
+    // snapshot of them, so re-read each project's flags off disk and keep those —
+    // a Settings save can never revert a concurrent toggle (extends #944).
+    if (Array.isArray(body.projects)) {
+      const diskById = new Map((disk.projects || []).map((p) => [p.id, p]));
+      for (const proj of body.projects) {
+        const dp = diskById.get(proj.id);
+        if (!dp) continue;
+        for (const k of PROJECT_FLAG_KEYS) {
+          if (k in dp) proj[k] = dp[k];
+          else delete proj[k];
+        }
+      }
+    }
     writeConfig(body);
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
@@ -377,6 +399,61 @@ router.put("/api/config", (req, res) => {
   } catch (err) {
     res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
+});
+
+// ─── Per-project flag toggles (field-scoped, race-free) — #971 ──────────────
+// The toggle widgets (idle, awake_auto, trigger_auto, telegram/discord auto,
+// bridge filter, loop-guard auto-continue) used to GET the whole config, flip
+// one field, and PUT the entire object back — so any two overlapping toggles
+// (or a Settings save) clobbered each other with stale snapshots. This endpoint
+// merges ONLY the whitelisted flag(s) into the target project, under the
+// atomic updateConfig() serialization point, so a toggle can never lose an
+// unrelated concurrent write. Booleans, except the loop-guard delay (seconds).
+const PROJECT_FLAG_KEYS = new Set([
+  "idle",
+  "awake_auto",
+  "trigger_auto",
+  "telegram_auto",
+  "discord_auto",
+  "bridge_filter_agents_only",
+  "auto_continue_loop_guard",
+  "auto_continue_delay_sec",
+]);
+
+router.patch("/api/projects/:id/flags", (req, res) => {
+  const { id } = req.params;
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const keys = Object.keys(body);
+  if (keys.length === 0) return res.status(400).json({ error: "No flags provided" });
+
+  const updates = {};
+  for (const k of keys) {
+    if (!PROJECT_FLAG_KEYS.has(k)) return res.status(400).json({ error: `Unknown flag: ${k}` });
+    const v = body[k];
+    if (k === "auto_continue_delay_sec") {
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+        return res.status(400).json({ error: "auto_continue_delay_sec must be a non-negative number" });
+      }
+    } else if (typeof v !== "boolean") {
+      return res.status(400).json({ error: `${k} must be a boolean` });
+    }
+    updates[k] = v;
+  }
+
+  try {
+    updateConfig((cfg) => {
+      const entry = (cfg.projects || []).find((p) => p.id === id);
+      if (!entry) { const e = new Error("not found"); e.code = "QW_NOT_FOUND"; throw e; }
+      Object.assign(entry, updates);
+    });
+  } catch (err) {
+    if (err.code === "QW_NOT_FOUND") return res.status(404).json({ error: `Unknown project: ${id}` });
+    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+
+  // idle / trigger_auto gate the scheduler — resync it (same as the whole PUT).
+  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
+  res.json({ ok: true });
 });
 
 // ─── Pinned projects & sidebar groups (field-scoped, race-free) ─────────────
@@ -479,7 +556,7 @@ router.put("/api/reviewer-github-user", (req, res) => {
 
 // ─── Chat (file-based) ────────────────────────────────────────────────────
 
-const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
+const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig, updateConfig } = require("./config");
 const { findAgentChattr } = require("./install-agentchattr");
 
 /**

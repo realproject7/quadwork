@@ -24,20 +24,15 @@ export function onIdleChange(handler: (detail: IdleChangeDetail) => void): () =>
   return () => window.removeEventListener(IDLE_EVENT, listener);
 }
 
-// Persist a project's idle flag: re-read the latest config, flip ONLY this
-// project's flag (preserving everything else), write it back. Throws on failure
-// so callers can revert their optimistic UI. Broadcasts on success.
+// #971: persist a project's idle flag via the field-scoped endpoint — the
+// server merges ONLY this field under an atomic read-modify-write, so a toggle
+// can't clobber a concurrent write with a stale whole-config snapshot. Throws on
+// failure so callers can revert their optimistic UI. Broadcasts on success.
 export async function persistProjectIdle(projectId: string, idle: boolean): Promise<void> {
-  const r = await fetch("/api/config");
-  if (!r.ok) throw new Error("config read failed");
-  const cfg = await r.json();
-  const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
-  if (!entry) throw new Error("project not found in config");
-  entry.idle = idle;
-  const put = await fetch("/api/config", {
-    method: "PUT",
+  const put = await fetch(`/api/projects/${encodeURIComponent(projectId)}/flags`, {
+    method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(cfg),
+    body: JSON.stringify({ idle }),
   });
   if (!put.ok) throw new Error("config write failed");
   emitIdleChange(projectId, idle);
