@@ -2116,7 +2116,19 @@ function runStartupMigrations(cfg) {
 
 }
 
-if (!process.env.QUADWORK_SKIP_LISTEN) server.listen(PORT, "127.0.0.1", async () => {
+if (!process.env.QUADWORK_SKIP_LISTEN) {
+  // #974: a second `quadwork start` (or anything already bound to PORT) makes
+  // server.listen emit 'error'; with no handler Node throws the raw EADDRINUSE
+  // stack trace. Surface a friendly, actionable message and exit cleanly.
+  server.on("error", (err) => {
+    if (err && err.code === "EADDRINUSE") {
+      console.error(`\nQuadWork: port ${PORT} is already in use — another instance may already be running.`);
+      console.error(`Run 'quadwork stop' first, or change the port in Settings, then retry.\n`);
+      process.exit(1);
+    }
+    throw err;
+  });
+  server.listen(PORT, "127.0.0.1", async () => {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
   const startupCfg = readConfig();
@@ -2174,7 +2186,8 @@ if (!process.env.QUADWORK_SKIP_LISTEN) server.listen(PORT, "127.0.0.1", async ()
     else console.warn(`[butler] auto-start failed: ${result.error}`);
   }
   startWatchdog();
-});
+  });
+}
 
 // #972: clean shutdown. Previously only stopped butler + file-chat, so Ctrl+C
 // orphaned the detached caffeinate process (Mac never slept again), left agent

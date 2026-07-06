@@ -3692,6 +3692,14 @@ function exec(cmd, args, opts) {
   }
 }
 
+// #974: reduce a git remote URL to its canonical `owner/repo` slug (mirrors the
+// CLI helper) so a reused clone can be checked against the entered repo.
+function repoSlugFromRemote(url) {
+  if (!url) return "";
+  const m = url.trim().match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?\/?$/);
+  return m ? m[1].toLowerCase() : "";
+}
+
 function ensureGitHeadForSetup(workingDir, repo) {
   const gitDir = path.join(workingDir, ".git");
   if (!fs.existsSync(gitDir)) {
@@ -3702,6 +3710,18 @@ function ensureGitHeadForSetup(workingDir, repo) {
   } else {
     const fetch = exec("git", ["fetch", "origin", "--prune"], { cwd: workingDir });
     if (!fetch.ok) return { ok: false, error: `Fetch failed: ${fetch.output}` };
+  }
+
+  // #974: fail clearly if the working dir is a clone of a DIFFERENT repo than
+  // the slug entered — otherwise setup silently seeds worktrees into the wrong
+  // project. (Same guard as the CLI wizard.)
+  const originUrl = exec("git", ["remote", "get-url", "origin"], { cwd: workingDir });
+  if (originUrl.ok) {
+    const actual = repoSlugFromRemote(originUrl.output);
+    const expected = String(repo || "").toLowerCase().replace(/\.git$/, "");
+    if (actual && expected && actual !== expected) {
+      return { ok: false, error: `Origin mismatch: working directory points to '${actual}', but the repo entered is '${repo}'. Use the matching clone or correct the repo slug.` };
+    }
   }
 
   let headCheck = exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: workingDir });
@@ -3735,6 +3755,28 @@ function ensureGitHeadForSetup(workingDir, repo) {
   const push = exec("git", ["push", "origin", defaultBranch], { cwd: workingDir });
   if (!push.ok) return { ok: false, error: `Initial commit created but push failed: ${push.output}` };
   return { ok: true };
+}
+
+// #974: create (or re-attach) a single agent worktree. A prior setup can leave
+// the `worktree-<agent>` branch behind after its directory was deleted; the old
+// code ran `git branch <name> HEAD` unconditionally, which fails "already
+// exists" and bricked a re-run with no rollback. Reuse an existing branch
+// instead — prune any stale worktree registration still holding it, then
+// `worktree add` re-attaches. `execFn` is injectable for tests.
+function createAgentWorktree(workingDir, wtDir, branchName, execFn = exec) {
+  const branchExists = execFn("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName}`], { cwd: workingDir }).ok;
+  if (branchExists) {
+    execFn("git", ["worktree", "prune"], { cwd: workingDir });
+  } else {
+    const branch = execFn("git", ["branch", branchName, "HEAD"], { cwd: workingDir });
+    if (!branch.ok) return { ok: false, error: `branch failed: ${branch.output}` };
+  }
+  const result = execFn("git", ["worktree", "add", wtDir, branchName], { cwd: workingDir });
+  if (result.ok) return { ok: true, detached: false };
+  // Fallback: detached worktree (branch may be checked out in a live worktree).
+  const result2 = execFn("git", ["worktree", "add", "--detach", wtDir, "HEAD"], { cwd: workingDir });
+  if (result2.ok) return { ok: true, detached: true };
+  return { ok: false, error: result.output };
 }
 
 // ─── GitHub helpers for Setup Wizard ──────────────────────────────────────
@@ -3858,20 +3900,11 @@ router.post("/api/setup", (req, res) => {
         const wtDir = path.join(parentDir, `${projectName}-${agent}`);
         if (fs.existsSync(wtDir)) { created.push(`${agent} (exists)`); continue; }
         const branchName = `worktree-${agent}`;
-        const branch = exec("git", ["branch", branchName, "HEAD"], { cwd: workingDir });
-        if (!branch.ok) {
-          errors.push(`${agent}: branch failed: ${branch.output}`);
-          continue;
-        }
-        const result = exec("git", ["worktree", "add", wtDir, branchName], { cwd: workingDir });
-        if (result.ok) {
-          created.push(agent);
-        } else {
-          // Fallback: detached worktree
-          const result2 = exec("git", ["worktree", "add", "--detach", wtDir, "HEAD"], { cwd: workingDir });
-          if (result2.ok) created.push(`${agent} (detached)`);
-          else errors.push(`${agent}: ${result.output}`);
-        }
+        // #974: reuse an existing branch (see createAgentWorktree) so a re-run
+        // after a deleted worktree dir no longer aborts on "branch exists".
+        const wt = createAgentWorktree(workingDir, wtDir, branchName);
+        if (!wt.ok) { errors.push(`${agent}: ${wt.error}`); continue; }
+        created.push(wt.detached ? `${agent} (detached)` : agent);
       }
       // Pre-trust worktree directories for Claude Code agents (#599).
       // Running `claude -p` in a directory auto-trusts it for future sessions,
@@ -5120,6 +5153,8 @@ module.exports.findLinkedPrByTitle = findLinkedPrByTitle;
 module.exports.pickClosingPrFromTimeline = pickClosingPrFromTimeline;
 module.exports.progressForItemRest = progressForItemRest;
 module.exports.ensureGitHeadForSetup = ensureGitHeadForSetup;
+module.exports.createAgentWorktree = createAgentWorktree;
+module.exports.repoSlugFromRemote = repoSlugFromRemote;
 // #827: expose the GITHUB.md writer for the idle-no-op regression test. No
 // production callers outside this file.
 module.exports.writeGithubFileFromSnapshot = writeGithubFileFromSnapshot;
