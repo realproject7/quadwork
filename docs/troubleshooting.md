@@ -173,6 +173,54 @@ Read the value on the server with:
 grep session_token ~/.quadwork/config.json
 ```
 
+### Reverse proxy (nginx + Basic Auth): `trusted_dashboard_hosts` — #988
+
+If you serve the dashboard through an **on-box, authenticated reverse proxy** —
+e.g. the [VPS guide](install-vps.md) nginx setup terminating HTTP Basic Auth and
+proxying `https://p7.quadwork.xyz` to `127.0.0.1:8400` — the browser's `Host`
+and `Origin` are the public domain, so `GET /api/session-token` refuses them and
+every terminal WebSocket closes with code `1006`. Rather than set the token by
+hand in each browser, allowlist the proxied host so the dashboard can fetch the
+token itself.
+
+Add the public host(s) to `~/.quadwork/config.json` and restart QuadWork:
+
+```jsonc
+{
+  "port": 8400,
+  "trusted_dashboard_hosts": ["p7.quadwork.xyz"]
+  // ...
+}
+```
+
+With this set, `GET /api/session-token` and the WS upgrade accept a request
+**only** when *both*: (1) the socket is loopback — i.e. the request genuinely
+arrived via the local proxy, not directly off-box — **and** (2) the forwarded
+`Host` and `Origin` are in the allowlist. Anything else (a foreign domain, a
+DNS-rebinding page, an un-allowlisted proxy) still gets `403`, so #968's
+protections are unchanged. The allowlist is **opt-in**: with it unset (the
+default) behaviour is exactly loopback-only as before.
+
+> [!IMPORTANT]
+> The reverse proxy **must** be authenticated (e.g. nginx Basic Auth) and bound
+> so QuadWork only ever receives proxied traffic on loopback. The allowlist
+> tells QuadWork to trust the proxy to have already authenticated the user — it
+> is not itself an authentication layer. Your nginx `server` block must forward
+> the real host and origin, e.g.:
+>
+> ```nginx
+> location / {
+>     auth_basic           "QuadWork";
+>     auth_basic_user_file /etc/nginx/.htpasswd;
+>     proxy_pass           http://127.0.0.1:8400;
+>     proxy_set_header     Host  $host;
+>     proxy_set_header     Origin $http_origin;
+>     proxy_http_version   1.1;
+>     proxy_set_header     Upgrade    $http_upgrade;   # terminal WebSocket
+>     proxy_set_header     Connection $connection_upgrade;
+> }
+> ```
+
 **Security note:** keep `session_token` private and keep QuadWork behind your
 existing network controls (127.0.0.1 bind + SSH tunnel, tailnet ACL, or the
 nginx Basic Auth from the VPS guide). The token + Origin allowlist are
