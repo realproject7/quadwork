@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
+import { sessionTokenParam, sessionTokenHeaders } from "@/lib/sessionToken";
 
 interface Issue {
   number: number;
@@ -121,10 +122,14 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       if (!cfgRes.ok) throw new Error("config");
       const cfg = await cfgRes.json();
 
+      // #968: auth the PTY-driving calls (WS + writes).
+      const auth = await sessionTokenHeaders();
+      const tok = await sessionTokenParam();
+
       // Same-origin: all API calls go to the same host
       let res = await fetch(`/api/agents/${projectId}/head/write`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...auth },
         body: JSON.stringify({ text: prompt + "\n" }),
       });
 
@@ -141,7 +146,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         const wsHost = (currentPort && currentPort !== backendPort)
           ? `${window.location.hostname}:${backendPort}`
           : window.location.host;
-        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=head`;
+        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=head${tok ? `&${tok}` : ""}`;
         const ws = new WebSocket(wsUrl);
         await new Promise<void>((resolve, reject) => {
           ws.onopen = () => resolve();
@@ -155,7 +160,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         // Start the Head agent CLI in the PTY shell
         await fetch(`/api/agents/${projectId}/head/write`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...auth },
           body: JSON.stringify({ text: `${headCommand}\n` }),
         });
 
@@ -165,7 +170,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         // Now write the queue prompt to the running agent
         res = await fetch(`/api/agents/${projectId}/head/write`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...auth },
           body: JSON.stringify({ text: prompt + "\n" }),
         });
       }

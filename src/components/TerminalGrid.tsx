@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import TerminalPanel from "./TerminalPanel";
+import { sessionTokenHeaders } from "@/lib/sessionToken";
 
 // #399 / quadwork#264: how long an agent stays "active" after its
 // last PTY output before the activity ring stops pulsing.
@@ -206,10 +207,12 @@ export default function TerminalGrid({
                 >↻</button>
                 {agentStates[agent.id] === "running" && (
                   <button
-                    onClick={() => {
+                    onClick={async () => {
+                      // #968: auth the PTY write
+                      const auth = await sessionTokenHeaders();
                       fetch(`/api/agents/${encodeURIComponent(projectId)}/${encodeURIComponent(agent.id)}/write`, {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: { "Content-Type": "application/json", ...auth },
                         body: JSON.stringify({ text: "/compact\n" }),
                       }).catch(() => {});
                     }}

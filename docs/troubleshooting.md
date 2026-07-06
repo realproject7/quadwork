@@ -124,3 +124,57 @@ chmod 440 /etc/sudoers.d/quadwork
 
 See the [VPS Installation Guide](install-vps.md#step-2-create-non-root-user-critical) for full setup.
 
+
+---
+
+## Terminals won't attach (session token / cross-origin) — #968
+
+**Background:** The terminal WebSocket (`/ws/terminal`, `/ws/butler`) and the
+PTY-write endpoints (`POST /api/agents/:project/:agent/write`, `/interrupt`)
+are authenticated (#968). Two checks run:
+
+1. **Origin allowlist** — the WebSocket upgrade is rejected unless the browser's
+   `Origin` is a localhost address or matches the server's own host. This blocks
+   a malicious web page you happen to visit from opening a socket to your local
+   QuadWork and injecting keystrokes into an agent shell.
+2. **Session token** — a shared token (`session_token`, auto-generated and stored
+   in `~/.quadwork/config.json` on first start) must accompany every terminal
+   WS and PTY-write request.
+
+**Normal local use needs no action.** When you open the dashboard on
+`http://127.0.0.1:<port>` (or `localhost`) — directly, or through an SSH tunnel
+— the dashboard fetches the token from `GET /api/session-token` and attaches it
+automatically.
+
+`/api/session-token` deliberately hands the token out **only** to a request
+whose socket, `Host`, and `Origin` are all loopback. This is on purpose: a
+malicious page using DNS rebinding, or a reverse proxy forwarding a public
+domain, keeps the socket on `127.0.0.1` while the browser's `Host` is a remote
+name — so IP alone is not enough, and those requests are refused. The token
+never leaves the box automatically.
+
+**Symptom:** Terminals show "connecting…" and never attach, or typing does
+nothing, when you reach the dashboard by anything other than a loopback host —
+a **reverse proxy / domain** (e.g. the nginx setup in the
+[VPS guide](install-vps.md)), a **tailnet / LAN address**, or a separately
+hosted frontend. In those cases `GET /api/session-token` returns 403 by design.
+
+**Fix:** Set the token manually in the browser, once per browser:
+
+```js
+// In the browser devtools console, on the QuadWork tab:
+localStorage.setItem("quadwork_session_token", "<value from ~/.quadwork/config.json>");
+// then reload the page.
+```
+
+Read the value on the server with:
+
+```bash
+grep session_token ~/.quadwork/config.json
+```
+
+**Security note:** keep `session_token` private and keep QuadWork behind your
+existing network controls (127.0.0.1 bind + SSH tunnel, tailnet ACL, or the
+nginx Basic Auth from the VPS guide). The token + Origin allowlist are
+defence-in-depth against browser-based cross-origin attacks, not a substitute
+for network-level access control.

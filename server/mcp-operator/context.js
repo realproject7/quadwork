@@ -7,8 +7,22 @@
 // gives the conflict-free tool modules (#791–#795) a single import surface.
 
 const http = require("http");
+const { readConfig } = require("../config");
 
 const DEFAULT_TIMEOUT_MS = 5000;
+
+// #968: the interrupt / interrupt-all endpoints now require the shared session
+// token. The operator MCP runs on the same host, so it reads the token straight
+// from config.json (no extra HTTP round-trip) and attaches it to every request;
+// unguarded endpoints ignore it. Cached after first read.
+let _sessionToken;
+function sessionToken() {
+  if (_sessionToken === undefined) {
+    try { _sessionToken = readConfig().session_token || ""; }
+    catch { _sessionToken = ""; }
+  }
+  return _sessionToken;
+}
 
 /**
  * Build the context handed to every tool handler.
@@ -28,12 +42,15 @@ function createContext(port, opts = {}) {
   function httpRequest(method, urlPath, body) {
     return new Promise((resolve, reject) => {
       const url = new URL(urlPath, BASE);
+      const headers = { "Content-Type": "application/json" };
+      const t = sessionToken();
+      if (t) headers["X-Session-Token"] = t; // #968
       const reqOpts = {
         hostname: url.hostname,
         port: url.port,
         path: url.pathname + url.search,
         method,
-        headers: { "Content-Type": "application/json" },
+        headers,
         signal: AbortSignal.timeout(timeoutMs),
       };
       const req = http.request(reqOpts, (res) => {

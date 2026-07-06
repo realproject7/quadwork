@@ -4,6 +4,7 @@ import { useEffect, useRef, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { sessionTokenParam } from "@/lib/sessionToken";
 
 interface TerminalPanelProps {
   projectId: string;
@@ -187,7 +188,8 @@ export default function TerminalPanel({
       const base = await resolveBase();
       if (cancelled) return;
 
-      const endpoint = `${base}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agentId)}`;
+      const tok = await sessionTokenParam(); // #968: auth the terminal WS
+      const endpoint = `${base}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agentId)}${tok ? `&${tok}` : ""}`;
       const ws = new WebSocket(endpoint);
       wsRef.current = ws;
 
