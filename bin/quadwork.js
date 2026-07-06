@@ -859,36 +859,67 @@ async function cmdStart() {
   log("Press Ctrl+C to stop.\n");
   const serverExports = require(path.join(serverDir, "index.js"));
 
-  process.on("SIGINT", () => {
+  // #972: record the server PID so `quadwork stop` (which reads server.pid)
+  // actually finds this in-foreground process. Removed again on exit.
+  const serverPidFile = path.join(CONFIG_DIR, "server.pid");
+  try {
+    if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
+    fs.writeFileSync(serverPidFile, String(process.pid));
+  } catch (e) { warn(`could not write server.pid: ${e.message}`); }
+
+  let shuttingDown = false;
+  const cleanExit = () => {
+    if (shuttingDown) return; // idempotent: SIGINT then SIGTERM
+    shuttingDown = true;
     console.log("");
     log("Shutting down...");
     try { serverExports && serverExports.shutdown && serverExports.shutdown(); }
     catch (e) { warn(`shutdown failed: ${e.message}`); }
+    try { fs.unlinkSync(serverPidFile); } catch {}
     ok("Stopped.");
     console.log("");
     log("To restart:");
     log(`  ${c.dim}npx --yes quadwork start${c.reset}`);
     console.log("");
     process.exit(0);
-  });
+  };
+
+  // #972: handle SIGTERM too so `quadwork stop` gets the same clean shutdown
+  // (agent PTYs + caffeinate + timers) as Ctrl+C, not a bare process kill.
+  process.on("SIGINT", cleanExit);
+  process.on("SIGTERM", cleanExit);
 }
 
 // ─── Stop Command ───────────────────────────────────────────────────────────
 
+// #972: a corrupt PID file ("0", "-1", "abc", "") must never reach
+// process.kill — process.kill(0) / kill(-n) signals the CALLER's process group,
+// so a garbage file would take down `quadwork stop` itself. Returns a positive
+// integer PID, or null when the content isn't one.
+function sanitizePid(raw) {
+  const pid = Number(String(raw).trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
 function stopPid(name, pidFileName) {
   const pidFile = path.join(CONFIG_DIR, pidFileName);
-  if (fs.existsSync(pidFile)) {
-    const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
-    try {
-      process.kill(pid, "SIGTERM");
-      ok(`Stopped ${name} (PID: ${pid})`);
-    } catch {
-      warn(`${name} process ${pid} not running`);
-    }
-    fs.unlinkSync(pidFile);
-    return true;
+  if (!fs.existsSync(pidFile)) return false;
+  const pid = sanitizePid(fs.readFileSync(pidFile, "utf-8"));
+  if (pid === null) {
+    // #972: never signal on a corrupt PID; just clean the stale file.
+    warn(`${name}: ignoring corrupt PID file (${pidFileName})`);
+    try { fs.unlinkSync(pidFile); } catch {}
+    return false;
   }
-  return false;
+  try {
+    process.kill(pid, "SIGTERM");
+    ok(`Stopped ${name} (PID: ${pid})`);
+  } catch {
+    warn(`${name} process ${pid} not running`);
+  }
+  // #972: a failed unlink must not abort the rest of cmdStop.
+  try { fs.unlinkSync(pidFile); } catch {}
+  return true;
 }
 
 function cmdStop() {
@@ -1228,6 +1259,10 @@ function cmdAcRestore() {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+// #972: run the CLI dispatch only when invoked directly, so tests can
+// `require("../bin/quadwork")` for the pure helpers (sanitizePid, stopPid)
+// without executing a command.
+if (require.main === module) {
 const command = process.argv[2];
 
 switch (command) {
@@ -1298,3 +1333,7 @@ switch (command) {
 `);
     process.exit(1);
 }
+}
+
+// #972: exported for unit tests (see server/binStop.test.js).
+module.exports = { sanitizePid, stopPid };

@@ -201,13 +201,19 @@ cd /path/to/project-re2 && claude -p "echo ok"
 ## Stopping & Restarting
 
 ```bash
-# Stop the server (Ctrl+C if running in foreground)
-# Or if running in background:
+# Foreground: press Ctrl+C in the `quadwork start` terminal.
+# From another terminal (e.g. a backgrounded server):
 quadwork stop
 
 # Restart
 quadwork start
 ```
+
+Both `Ctrl+C` and `quadwork stop` shut down cleanly: agent PTYs, the
+`caffeinate` sleep-blocker, the polling/watchdog timers, and the chat bridges
+are all stopped (no orphaned `caffeinate` keeping the Mac awake). `quadwork
+start` records its PID in `~/.quadwork/server.pid`, which is how `quadwork stop`
+finds a running server.
 
 For persistent background operation on Mac, consider using pm2:
 ```bash
