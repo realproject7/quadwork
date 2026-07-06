@@ -190,6 +190,15 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
   const isComposingRef = useRef(false);
   const shouldAutoScroll = useRef(true);
   const authRetryRef = useRef(0);
+  // #973: the latest projectId, read by in-flight polls to detect a
+  // project switch. A poll started for the previous project must not
+  // append its messages / advance the cursor after the operator has
+  // switched — the fetch captures the request's project and compares
+  // against this ref on resolve (mirrors the stale-read guard in
+  // ProjectDashboard). Assigned during render so it's current even
+  // before the reset effect below runs.
+  const projectRef = useRef(projectId);
+  projectRef.current = projectId;
 
   // Reset cursor when project changes
   useEffect(() => {
@@ -197,15 +206,27 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
     setMessages([]);
     setLoaded(false);
     initialRetryRef.current = 0;
+    // #973: reset the auth-failure counter so a fresh project starts
+    // clean and doesn't inherit the previous project's 403 tally.
+    authRetryRef.current = 0;
     if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
   }, [projectId]);
 
   // Poll messages via proxy
   const fetchMessages = useCallback(() => {
+    // #973: capture the project this poll is for so a response that
+    // resolves after a project switch is dropped instead of polluting
+    // the new project's message list and cursor.
+    const reqProject = projectId;
     const url = `/api/chat?path=/api/messages&channel=${encodeURIComponent(channel)}&cursor=${cursorRef.current}${projectId ? `&project=${encodeURIComponent(projectId)}` : ""}`;
     fetch(url)
       .then((r) => {
         if (r.status === 403) {
+          // #973: actually count the auth failures — the ref was read
+          // but never incremented, so the banner branch below was dead
+          // code and the "403" warning could never surface. Increment
+          // here so it shows once the retry budget is spent.
+          authRetryRef.current += 1;
           if (authRetryRef.current < 3) setAuthError(null);
           else setAuthError("Chat authentication failed (403). Check project chat configuration in Settings.");
           throw new Error("auth failed");
@@ -214,7 +235,11 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
         return r.json();
       })
       .then((data) => {
+        // #973: a since-switched project — drop this stale response.
+        if (reqProject !== projectRef.current) return;
         setAuthError(null);
+        // #973: a clean poll clears the auth-failure tally.
+        authRetryRef.current = 0;
         const msgs: Message[] = Array.isArray(data) ? data : data.messages || [];
         if (msgs.length > 0) {
           setMessages((prev) => {
@@ -228,6 +253,8 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
         setLoaded(true);
       })
       .catch(() => {
+        // #973: don't schedule a retry into a project we've left.
+        if (reqProject !== projectRef.current) return;
         if (!loaded && initialRetryRef.current < MAX_INITIAL_RETRIES) {
           initialRetryRef.current += 1;
           retryTimerRef.current = setTimeout(fetchMessages, INITIAL_RETRY_DELAY_MS);
@@ -474,9 +501,11 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
               {renderMessageWithMentions(msg.text)}
               {msg.attachments && msg.attachments.length > 0 && (
                 <span className="flex gap-2 mt-1">
-                  {msg.attachments.map((att) => (
+                  {msg.attachments.map((att, i) => (
                     <a
-                      key={att.name}
+                      // #973: name alone collides when a message carries
+                      // two attachments of the same filename — key by index too.
+                      key={`${att.name}-${i}`}
                       href={`/api/uploads/${encodeURIComponent(projectId || "")}/${encodeURIComponent(att.name)}`}
                       target="_blank"
                       rel="noopener noreferrer"
@@ -509,7 +538,10 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
                 const KNOWN_AGENTS = new Set(["head", "dev", "re1", "re2"]);
                 if (KNOWN_AGENTS.has(msg.sender.toLowerCase())) {
                   const prefix = `@${msg.sender} `;
-                  setInput((prev) => (prev.startsWith(prefix) ? prev : prefix));
+                  // #973: prepend the mention rather than replacing the
+                  // buffer — the old assignment discarded whatever draft
+                  // the operator had already typed.
+                  setInput((prev) => (prev.startsWith(prefix) ? prev : prefix + prev));
                 }
                 inputRef.current?.focus();
               }}
@@ -711,7 +743,8 @@ function ChatPanelAPI({ projectId, filterSystem = false }: { projectId?: string;
         {(attachments.length > 0 || uploading) && (
           <div className="flex gap-2 px-2 py-1 flex-wrap">
             {attachments.map((att, i) => (
-              <div key={att.name} className="relative group">
+              // #973: composite key — two pending uploads can share a filename.
+              <div key={`${att.name}-${i}`} className="relative group">
                 <img
                   src={`/api/uploads/${encodeURIComponent(projectId || "")}/${encodeURIComponent(att.name)}`}
                   alt={att.name}
