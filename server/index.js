@@ -194,9 +194,11 @@ function isLocalTokenRequest(req) {
 
 // A cross-origin web page CAN open a WebSocket to 127.0.0.1 (browsers don't
 // enforce same-origin on WS), so the upgrade handler must vet Origin itself.
-// Allow any localhost origin (the local dashboard, incl. dev on :3000) and a
-// request whose Origin host matches the server Host (direct tailnet/LAN access
-// to this very port). Absent Origin → reject (browsers always send it on WS).
+// Allow any localhost origin (the local dashboard, incl. dev on :3000), an
+// allowlisted reverse-proxy origin (#988), and — for a DIRECT (non-loopback)
+// connection only — a request whose Origin host matches the server Host (direct
+// tailnet/LAN access to this very port). Absent Origin → reject (browsers always
+// send it on WS).
 function isAllowedWsOrigin(req) {
   const origin = req.headers.origin;
   if (!origin) return false;
@@ -206,7 +208,15 @@ function isAllowedWsOrigin(req) {
   // #988: an allowlisted reverse-proxy dashboard origin (verified loopback +
   // trusted forwarded Host/Origin) is accepted consistently with the token fetch.
   if (isTrustedProxyRequest(req)) return true;
-  return !!req.headers.host && u.host === req.headers.host;
+  // #968 direct tailnet/LAN access: the browser's Origin host matches the server
+  // Host. #988: honor this ONLY for a genuine direct (non-loopback) connection.
+  // A LOOPBACK socket carrying a non-loopback Host means the request arrived via
+  // an on-box reverse proxy, which MUST be explicitly allowlisted (handled just
+  // above). Without the loopback-socket guard, a forged/foreign Host+Origin pair
+  // (DNS-rebinding page, untrusted proxy) matching each other would slip through
+  // this fallback and, with a token, open the WS — violating #988's invariant.
+  const ip = req.socket && req.socket.remoteAddress;
+  return !isLocalhost(ip) && !!req.headers.host && u.host === req.headers.host;
 }
 
 function tokenMatches(token) {

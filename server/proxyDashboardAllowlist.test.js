@@ -163,6 +163,14 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   const wsSpoof = await tryWs(PORT, `${wsPath}&token=${token}`, { host: TRUSTED, origin: "https://evil.example" });
   ok(wsSpoof.open === false && wsSpoof.status === 403, "(d) WS with trusted Host but foreign Origin → 403, not opened");
 
+  // ── (b) WS: MATCHED foreign Host+Origin (both evil.example) + VALID token ──
+  // The #968 same-host fallback must NOT open the WS here: the socket is loopback
+  // (an on-box/DNS-rebound proxy), the host is not allowlisted, so the forged pair
+  // is rejected despite a valid token. Regression guard for the #988 invariant.
+  const wsForgedMatch = await tryWs(PORT, `${wsPath}&token=${token}`, { host: "evil.example", origin: "http://evil.example" });
+  ok(wsForgedMatch.open === false && wsForgedMatch.status === 403,
+    "(b) WS with matched foreign Host+Origin (not allowlisted) + valid token → 403, not opened");
+
   console.log(`\n${passed} passed`);
   console.log("server/proxyDashboardAllowlist.test.js: all assertions passed");
   process.exit(0);
