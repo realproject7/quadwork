@@ -80,6 +80,32 @@ function which(cmd) {
   return run("which", [cmd]) !== null;
 }
 
+// #974: does a global `npm install -g` need sudo? True only when the npm
+// global prefix dir exists and isn't writable by the current user. Windows
+// never needs sudo; if the prefix can't be determined we keep the safe
+// (sudo) default rather than risk an EACCES mid-install.
+function npmGlobalNeedsSudo() {
+  if (process.platform === "win32") return false;
+  const prefix = run("npm", ["prefix", "-g"]);
+  if (!prefix) return true;
+  try {
+    fs.accessSync(prefix, fs.constants.W_OK);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+// #974: reduce a git remote URL to its canonical `owner/repo` slug so the
+// entered repo can be compared against what a reused clone actually points at.
+// Handles https://github.com/owner/repo(.git), git@github.com:owner/repo(.git),
+// and ssh://… forms.
+function repoSlugFromRemote(url) {
+  if (!url) return "";
+  const m = url.trim().match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?\/?$/);
+  return m ? m[1].toLowerCase() : "";
+}
+
 function ensureGitHeadForSetup(absDir, repo) {
   if (!fs.existsSync(path.join(absDir, ".git"))) {
     const clone = runResult("gh", ["repo", "clone", repo, absDir]);
@@ -87,6 +113,18 @@ function ensureGitHeadForSetup(absDir, repo) {
   } else {
     const fetch = runResult("git", ["-C", absDir, "fetch", "origin", "--prune"]);
     if (!fetch.ok) return { ok: false, error: `Fetch failed: ${fetch.output}` };
+  }
+
+  // #974: fail clearly if the directory is a clone of a DIFFERENT repo than the
+  // slug entered — otherwise setup silently seeds worktrees/branches into the
+  // wrong project.
+  const originUrl = runResult("git", ["-C", absDir, "remote", "get-url", "origin"]);
+  if (originUrl.ok) {
+    const actual = repoSlugFromRemote(originUrl.output);
+    const expected = String(repo || "").toLowerCase().replace(/\.git$/, "");
+    if (actual && expected && actual !== expected) {
+      return { ok: false, error: `Origin mismatch: ${absDir} points to '${actual}', but you entered '${repo}'. Point setup at the matching clone or correct the repo slug.` };
+    }
   }
 
   let headCheck = runResult("git", ["-C", absDir, "rev-parse", "--verify", "HEAD"]);
@@ -250,14 +288,18 @@ async function tryInstall(rl, name, description, commands, { platform } = {}) {
     log("Skipped.");
     return false;
   }
-  const sp = spinner(`Installing ${name}...`);
   const [cmd, ...args] = cmdSpec;
-  const result = run(cmd, args, { timeout: 120000 });
-  if (result !== null) {
-    sp.stop(true);
+  // #974: install commands (esp. `sudo apt install …`) may prompt for a
+  // password or a confirmation on the real TTY. The old `run()` piped stdio,
+  // which swallows the prompt and hangs / fails silently — inherit stdio so
+  // the operator can actually respond. No spinner here: it would fight the
+  // inherited install output for the same stdout.
+  log(`Installing ${name}...`);
+  try {
+    execFileSync(cmd, args, { stdio: "inherit", timeout: 120000 });
+    ok(`${name} installed`);
     return true;
-  } else {
-    sp.stop(false);
+  } catch {
     warn(`Auto-install failed. You can install manually and try again.`);
     return false;
   }
@@ -346,8 +388,11 @@ async function checkPrereqs(rl) {
     console.log("");
   }
 
-  // sudo needed for global npm installs on macOS/Linux
-  const npmPrefix = process.platform === "win32" ? "" : "sudo ";
+  // #974: only escalate with sudo when the global npm prefix isn't writable by
+  // the current user. Node from nvm/fnm/volta/Homebrew puts the prefix under a
+  // user-owned dir where `sudo npm i -g` is unnecessary and often corrupts
+  // ownership. Fall back to sudo only when the prefix genuinely needs root.
+  const npmPrefix = npmGlobalNeedsSudo() ? "sudo " : "";
 
   // Offer to install Claude Code if missing
   if (!hasClaude) {
@@ -597,6 +642,26 @@ async function setupAgents(rl, repo) {
     reviewerUser = await ask(rl, "Reviewer GitHub username", "");
     log("Path to a file containing a GitHub PAT for the reviewer account.");
     reviewerTokenPath = await ask(rl, "Reviewer token file path", path.join(os.homedir(), ".quadwork", "reviewer-token"));
+    // #974: previously we collected the token PATH but never the token itself,
+    // so RE1/RE2 launched pointed at an empty/nonexistent file and PR reviews
+    // failed. Prompt for the token now and write it 0600 (matching the server
+    // save-token endpoint); if the operator skips it, tell them exactly where
+    // to add it later instead of silently leaving reviewing broken.
+    const reviewerToken = await askSecret(rl, "Reviewer GitHub token (paste, or leave blank to set later in Settings)");
+    if (reviewerToken.trim()) {
+      try {
+        const tokenDir = path.dirname(path.resolve(reviewerTokenPath));
+        if (!fs.existsSync(tokenDir)) ensureSecureDir(tokenDir);
+        fs.writeFileSync(reviewerTokenPath, reviewerToken.trim() + "\n", { mode: 0o600 });
+        try { fs.chmodSync(reviewerTokenPath, 0o600); } catch {}
+        ok(`Reviewer token saved to ${reviewerTokenPath} (mode 0600)`);
+      } catch (err) {
+        warn(`Could not write reviewer token to ${reviewerTokenPath}: ${err.message}`);
+        log(`Add it later in Settings → Reviewer Account, or write it to ${reviewerTokenPath} yourself (chmod 600).`);
+      }
+    } else {
+      log(`No token entered — add it later in Settings → Reviewer Account (it saves to ${reviewerTokenPath}, mode 0600).`);
+    }
   }
 
   const projectName = path.basename(absDir);
@@ -616,8 +681,19 @@ async function setupAgents(rl, repo) {
     const wtDir = path.join(path.dirname(absDir), `${projectName}-${agent}`);
     if (!fs.existsSync(wtDir)) {
       const branchName = `worktree-${agent}`;
-      const branch = runResult("git", ["-C", absDir, "branch", branchName, "HEAD"]);
-      if (!branch.ok) { wtFailed = `${agent}: branch failed: ${branch.output}`; break; }
+      // #974: a prior setup can leave the `worktree-<agent>` branch behind after
+      // its directory was deleted. `git branch <name> HEAD` then fails "already
+      // exists" and used to brick the whole re-run with no rollback. Reuse an
+      // existing branch instead: prune any stale worktree registration still
+      // holding it, then `worktree add` re-attaches. Only create the branch when
+      // it doesn't already exist.
+      const branchExists = runResult("git", ["-C", absDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branchName}`]).ok;
+      if (branchExists) {
+        run("git", ["-C", absDir, "worktree", "prune"]);
+      } else {
+        const branch = runResult("git", ["-C", absDir, "branch", branchName, "HEAD"]);
+        if (!branch.ok) { wtFailed = `${agent}: branch failed: ${branch.output}`; break; }
+      }
       const result = run("git", ["-C", absDir, "worktree", "add", wtDir, branchName]);
       if (!result) {
         const result2 = run("git", ["-C", absDir, "worktree", "add", "--detach", wtDir, "HEAD"]);
@@ -629,7 +705,14 @@ async function setupAgents(rl, repo) {
     // Copy AGENTS.md seed with placeholder substitution
     const seedSrc = path.join(TEMPLATES_DIR, "seeds", `${agent}.AGENTS.md`);
     const seedDst = path.join(wtDir, "AGENTS.md");
-    if (fs.existsSync(seedSrc)) {
+    // #974: a missing seed template means the agent's role is undefined —
+    // shipping a worktree with no AGENTS.md is worse than failing. Hard-fail
+    // instead of silently skipping (matches the server seed-files route).
+    if (!fs.existsSync(seedSrc)) {
+      wtFailed = `${agent}: missing AGENTS.md seed template (templates/seeds/${agent}.AGENTS.md)`;
+      break;
+    }
+    {
       let seedContent = fs.readFileSync(seedSrc, "utf-8");
       if (reviewerUser) {
         seedContent = seedContent.replace(/\{\{reviewer_github_user\}\}/g, reviewerUser);
