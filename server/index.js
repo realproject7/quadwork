@@ -39,6 +39,30 @@ if (!SESSION_TOKEN) {
   }
 }
 
+// #988: opt-in allowlist of trusted reverse-proxy dashboard hosts. When the
+// dashboard is served through a LOCAL, AUTHENTICATED reverse proxy (e.g. nginx
+// terminating basic-auth and proxying p7.quadwork.xyz -> 127.0.0.1:8400 with
+// `proxy_set_header Host $host`), the forwarded Host/Origin is a REMOTE name so
+// #968's strict loopback checks 403 the token fetch and every terminal WS dies.
+// Configuring `trusted_dashboard_hosts: ["p7.quadwork.xyz"]` lets those (and
+// ONLY those) forwarded names through, but ONLY when the socket itself is
+// loopback (the request truly arrived via the on-box proxy). Empty/unset (the
+// default) → exactly #968's loopback-only behavior, no change. The proxy MUST
+// be authenticated; see docs/troubleshooting.md.
+const TRUSTED_DASHBOARD_HOSTS = normalizeTrustedDashboardHosts(config.trusted_dashboard_hosts);
+
+function normalizeTrustedDashboardHosts(raw) {
+  const out = new Set();
+  if (!Array.isArray(raw)) return out;
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    // Accept a bare host ("p7.quadwork.xyz[:443]") or a full origin URL.
+    const h = hostnameOfHostHeader(entry) || hostnameOfOrigin(entry);
+    if (h) out.add(h);
+  }
+  return out;
+}
+
 function emitSystemMessage(projectId, text) {
   try {
     if (routes.getProjectChatMode(projectId) !== "file") return;
@@ -79,9 +103,12 @@ app.get("/api/health", (_req, res) => {
 // checks socket IP + Host + Origin are all loopback (see isLocalTokenRequest)
 // so a DNS-rebinding page or a same-host reverse proxy can't pull the token to
 // a remote origin. Non-loopback (tailnet/LAN/proxied) callers get 403 and must
-// configure the token out-of-band — it is never leaked off-box.
+// configure the token out-of-band — it is never leaked off-box. The one
+// exception (#988) is an operator-configured trusted_dashboard_hosts allowlist
+// for an authenticated on-box reverse proxy (see isTrustedProxyRequest).
 app.get("/api/session-token", (req, res) => {
-  if (!isLocalTokenRequest(req)) return res.status(403).json({ error: "Local access only" });
+  if (!isLocalTokenRequest(req) && !isTrustedProxyRequest(req))
+    return res.status(403).json({ error: "Local access only" });
   res.json({ token: SESSION_TOKEN });
 });
 
@@ -102,13 +129,46 @@ function isLocalhost(ip) {
   return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
 }
 
+// Parse the hostname out of a `Host` header value ("name[:port]"). Lowercased
+// for case-insensitive allowlist comparison. Returns null on garbage.
+function hostnameOfHostHeader(host) {
+  if (!host || typeof host !== "string") return null;
+  try { return new URL(`http://${host}`).hostname.toLowerCase(); } catch { return null; }
+}
+
+// Parse the hostname out of an `Origin` header value (a full URL). Lowercased.
+function hostnameOfOrigin(origin) {
+  if (!origin || typeof origin !== "string") return null;
+  try { return new URL(origin).hostname.toLowerCase(); } catch { return null; }
+}
+
 // True when `host` (an `Origin`/`Host` header value, "name[:port]") resolves to
 // a loopback name. Used to keep the session token on-box.
 function isLoopbackHostHeader(host) {
-  if (!host) return false;
-  let hostname;
-  try { hostname = new URL(`http://${host}`).hostname; } catch { return false; }
+  const hostname = hostnameOfHostHeader(host);
   return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+}
+
+// #988: true when the request arrived over loopback (i.e. from the on-box
+// reverse proxy) AND its forwarded Host — and, when the browser sends one, its
+// Origin — are BOTH in the operator's trusted_dashboard_hosts allowlist. An
+// empty allowlist (the default) short-circuits to false, so with no config this
+// is a no-op and the strict #968 loopback checks are the only gate. A foreign
+// Host/Origin (DNS-rebind, untrusted proxy, tailnet name) is never in the
+// allowlist, so it still fails here → 403 / rejected upgrade. Works for both an
+// Express req (req.ip) and a raw upgrade req (req.socket.remoteAddress).
+function isTrustedProxyRequest(req) {
+  if (TRUSTED_DASHBOARD_HOSTS.size === 0) return false;
+  const ip = req.ip || (req.socket && req.socket.remoteAddress);
+  if (!isLocalhost(ip)) return false;
+  const host = hostnameOfHostHeader(req.headers.host);
+  if (!host || !TRUSTED_DASHBOARD_HOSTS.has(host)) return false;
+  const origin = req.headers.origin;
+  if (origin) {
+    const o = hostnameOfOrigin(origin);
+    if (!o || !TRUSTED_DASHBOARD_HOSTS.has(o)) return false;
+  }
+  return true;
 }
 
 // #968 (hardened per review): the session token is a bearer secret, so only
@@ -143,6 +203,9 @@ function isAllowedWsOrigin(req) {
   let u;
   try { u = new URL(origin); } catch { return false; }
   if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1") return true;
+  // #988: an allowlisted reverse-proxy dashboard origin (verified loopback +
+  // trusted forwarded Host/Origin) is accepted consistently with the token fetch.
+  if (isTrustedProxyRequest(req)) return true;
   return !!req.headers.host && u.host === req.headers.host;
 }
 
