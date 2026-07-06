@@ -1006,12 +1006,12 @@ function spawnButlerPty() {
       args.push(...flags);
     }
 
-    // Pre-trust the Butler working directory to avoid blocking trust prompt
-    if (command === "claude") {
-      try {
-        execFileSync("claude", ["-p", "echo ok"], { cwd: docsDir, timeout: 15000, stdio: "pipe" });
-      } catch {}
-    }
+    // #975: the old pre-trust ran `claude -p "echo ok"` synchronously with a
+    // 15s timeout on the event loop — a hung claude blackholed every agent's
+    // WS/HTTP/timers for up to 15s. Dropped: the interactive trust prompt is
+    // already auto-answered by the onData trust-listener installed below (the
+    // same mechanism the agent PTYs rely on), so no synchronous pre-trust is
+    // needed to reach a trusted session.
 
     const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.CLAUDE.md");
     const claudePath = path.join(docsDir, "CLAUDE.md");

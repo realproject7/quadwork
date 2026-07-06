@@ -3683,10 +3683,15 @@ router.get("/api/batch-progress", async (req, res) => {
 
 // ─── Setup ─────────────────────────────────────────────────────────────────
 
-function exec(cmd, args, opts) {
+// #975: setup shell-outs run OFF the event loop via the promisified execFile,
+// so a slow/hung `gh clone` / `git fetch` / `git worktree add` / `claude -p` no
+// longer blocks every agent's WS/HTTP/timers in this single-process server.
+// Returns { ok, output } (the old synchronous exec()'s contract) so call sites
+// only needed an `await`; setup fns take this as an injectable execFn for tests.
+async function execAsync(cmd, args, opts) {
   try {
-    const out = execFileSync(cmd, args, { encoding: "utf-8", timeout: 30000, ...opts });
-    return { ok: true, output: out.trim() };
+    const { stdout } = await _execFileAsync(cmd, args, { encoding: "utf-8", timeout: 30000, ...opts });
+    return { ok: true, output: (stdout || "").trim() };
   } catch (err) {
     return { ok: false, output: String(err.stderr || err.stdout || err.message || "").trim() };
   }
@@ -3700,22 +3705,25 @@ function repoSlugFromRemote(url) {
   return m ? m[1].toLowerCase() : "";
 }
 
-function ensureGitHeadForSetup(workingDir, repo) {
+// #975: async — awaits each git/gh shell-out via the injectable execFn
+// (default execAsync) so the setup route never blocks the event loop. execFn
+// keeps the exec() { ok, output } contract; tests inject a fake.
+async function ensureGitHeadForSetup(workingDir, repo, execFn = execAsync) {
   const gitDir = path.join(workingDir, ".git");
   if (!fs.existsSync(gitDir)) {
     if (!fs.existsSync(workingDir)) ensureSecureDir(workingDir);
     if (!REPO_RE.test(repo)) return { ok: false, error: "Invalid repo" };
-    const clone = exec("gh", ["repo", "clone", repo, workingDir]);
+    const clone = await execFn("gh", ["repo", "clone", repo, workingDir]);
     if (!clone.ok) return { ok: false, error: `Clone failed: ${clone.output}` };
   } else {
-    const fetch = exec("git", ["fetch", "origin", "--prune"], { cwd: workingDir });
+    const fetch = await execFn("git", ["fetch", "origin", "--prune"], { cwd: workingDir });
     if (!fetch.ok) return { ok: false, error: `Fetch failed: ${fetch.output}` };
   }
 
   // #974: fail clearly if the working dir is a clone of a DIFFERENT repo than
   // the slug entered — otherwise setup silently seeds worktrees into the wrong
   // project. (Same guard as the CLI wizard.)
-  const originUrl = exec("git", ["remote", "get-url", "origin"], { cwd: workingDir });
+  const originUrl = await execFn("git", ["remote", "get-url", "origin"], { cwd: workingDir });
   if (originUrl.ok) {
     const actual = repoSlugFromRemote(originUrl.output);
     const expected = String(repo || "").toLowerCase().replace(/\.git$/, "");
@@ -3724,25 +3732,25 @@ function ensureGitHeadForSetup(workingDir, repo) {
     }
   }
 
-  let headCheck = exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: workingDir });
+  let headCheck = await execFn("git", ["rev-parse", "--verify", "HEAD"], { cwd: workingDir });
   if (!headCheck.ok) {
-    const remoteHead = exec("git", ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], { cwd: workingDir });
+    const remoteHead = await execFn("git", ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], { cwd: workingDir });
     let remoteBranch = remoteHead.ok ? remoteHead.output.replace(/^origin\//, "") : "";
     if (!remoteBranch) {
       for (const candidate of ["main", "master"]) {
-        const hasBranch = exec("git", ["rev-parse", "--verify", `origin/${candidate}`], { cwd: workingDir });
+        const hasBranch = await execFn("git", ["rev-parse", "--verify", `origin/${candidate}`], { cwd: workingDir });
         if (hasBranch.ok) { remoteBranch = candidate; break; }
       }
     }
     if (remoteBranch) {
-      const checkout = exec("git", ["checkout", "-B", remoteBranch, `origin/${remoteBranch}`], { cwd: workingDir });
+      const checkout = await execFn("git", ["checkout", "-B", remoteBranch, `origin/${remoteBranch}`], { cwd: workingDir });
       if (!checkout.ok) return { ok: false, error: `Checkout failed after fetch: ${checkout.output}` };
-      headCheck = exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: workingDir });
+      headCheck = await execFn("git", ["rev-parse", "--verify", "HEAD"], { cwd: workingDir });
     }
   }
   if (headCheck.ok) return { ok: true };
 
-  const seed = exec("git", [
+  const seed = await execFn("git", [
     "-c", "user.name=QuadWork",
     "-c", "user.email=quadwork@localhost",
     "commit", "--allow-empty", "-m", "Initial commit (created by QuadWork setup)",
@@ -3750,9 +3758,9 @@ function ensureGitHeadForSetup(workingDir, repo) {
   if (!seed.ok) {
     return { ok: false, error: `Repository is empty and could not be initialized: ${seed.output}` };
   }
-  const branchResult = exec("git", ["symbolic-ref", "--short", "HEAD"], { cwd: workingDir });
+  const branchResult = await execFn("git", ["symbolic-ref", "--short", "HEAD"], { cwd: workingDir });
   const defaultBranch = branchResult.ok ? branchResult.output : "main";
-  const push = exec("git", ["push", "origin", defaultBranch], { cwd: workingDir });
+  const push = await execFn("git", ["push", "origin", defaultBranch], { cwd: workingDir });
   if (!push.ok) return { ok: false, error: `Initial commit created but push failed: ${push.output}` };
   return { ok: true };
 }
@@ -3763,18 +3771,21 @@ function ensureGitHeadForSetup(workingDir, repo) {
 // exists" and bricked a re-run with no rollback. Reuse an existing branch
 // instead — prune any stale worktree registration still holding it, then
 // `worktree add` re-attaches. `execFn` is injectable for tests.
-function createAgentWorktree(workingDir, wtDir, branchName, execFn = exec) {
-  const branchExists = execFn("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName}`], { cwd: workingDir }).ok;
+// #975: async (default execFn = execAsync) so `git worktree add` runs off the
+// event loop. `await execFn(...)` works whether execFn is async (production) or
+// returns a plain object (test fakes).
+async function createAgentWorktree(workingDir, wtDir, branchName, execFn = execAsync) {
+  const branchExists = (await execFn("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName}`], { cwd: workingDir })).ok;
   if (branchExists) {
-    execFn("git", ["worktree", "prune"], { cwd: workingDir });
+    await execFn("git", ["worktree", "prune"], { cwd: workingDir });
   } else {
-    const branch = execFn("git", ["branch", branchName, "HEAD"], { cwd: workingDir });
+    const branch = await execFn("git", ["branch", branchName, "HEAD"], { cwd: workingDir });
     if (!branch.ok) return { ok: false, error: `branch failed: ${branch.output}` };
   }
-  const result = execFn("git", ["worktree", "add", wtDir, branchName], { cwd: workingDir });
+  const result = await execFn("git", ["worktree", "add", wtDir, branchName], { cwd: workingDir });
   if (result.ok) return { ok: true, detached: false };
   // Fallback: detached worktree (branch may be checked out in a live worktree).
-  const result2 = execFn("git", ["worktree", "add", "--detach", wtDir, "HEAD"], { cwd: workingDir });
+  const result2 = await execFn("git", ["worktree", "add", "--detach", wtDir, "HEAD"], { cwd: workingDir });
   if (result2.ok) return { ok: true, detached: true };
   return { ok: false, error: result.output };
 }
@@ -3866,7 +3877,11 @@ router.get("/api/setup/reviewer-token-status", (_req, res) => {
 
 // ─── Setup Wizard ─────────────────────────────────────────────────────────
 
-router.post("/api/setup", (req, res) => {
+// #975: async handler — setup shell-outs (gh/git/claude) now await execAsync
+// so they run off the event loop instead of freezing every agent's WS/HTTP/
+// timers in this single-process server. Express 5 forwards a rejected handler
+// to the default error handler (same 500 the prior sync throws produced).
+router.post("/api/setup", async (req, res) => {
   const step = req.query.step;
   const body = req.body || {};
 
@@ -3874,7 +3889,7 @@ router.post("/api/setup", (req, res) => {
     case "verify-repo": {
       const repo = body.repo;
       if (!repo || !REPO_RE.test(repo)) return res.json({ ok: false, error: "Invalid repo format (use owner/repo)" });
-      const result = exec("gh", ["repo", "view", repo, "--json", "name,owner,viewerPermission"]);
+      const result = await execAsync("gh", ["repo", "view", repo, "--json", "name,owner,viewerPermission"]);
       if (!result.ok) return res.json({ ok: false, error: "Cannot access repo. Check gh auth and repo permissions." });
       try {
         const info = JSON.parse(result.output);
@@ -3888,7 +3903,7 @@ router.post("/api/setup", (req, res) => {
     case "create-worktrees": {
       const workingDir = body.workingDir;
       if (!workingDir) return res.json({ ok: false, error: "Missing working directory" });
-      const ready = ensureGitHeadForSetup(workingDir, body.repo);
+      const ready = await ensureGitHeadForSetup(workingDir, body.repo);
       if (!ready.ok) return res.json({ ok: false, error: ready.error });
       // Sibling dirs: ../projectName-head/, ../projectName-re1/, etc. (matches CLI wizard)
       const projectName = path.basename(workingDir);
@@ -3902,7 +3917,7 @@ router.post("/api/setup", (req, res) => {
         const branchName = `worktree-${agent}`;
         // #974: reuse an existing branch (see createAgentWorktree) so a re-run
         // after a deleted worktree dir no longer aborts on "branch exists".
-        const wt = createAgentWorktree(workingDir, wtDir, branchName);
+        const wt = await createAgentWorktree(workingDir, wtDir, branchName);
         if (!wt.ok) { errors.push(`${agent}: ${wt.error}`); continue; }
         created.push(wt.detached ? `${agent} (detached)` : agent);
       }
@@ -3912,12 +3927,14 @@ router.post("/api/setup", (req, res) => {
       const agentBackends = body.backends || {};
       const claudeAgents = agents.filter((a) => (agentBackends[a] || "claude") === "claude");
       if (claudeAgents.length > 0) {
-        const claudePath = exec("which", ["claude"]);
+        const claudePath = await execAsync("which", ["claude"]);
         if (claudePath.ok) {
           for (const agent of claudeAgents) {
             const wtDir = path.join(parentDir, `${projectName}-${agent}`);
             if (!fs.existsSync(wtDir)) continue;
-            exec("claude", ["-p", "echo ok"], { cwd: wtDir, timeout: 15000, stdio: "pipe" });
+            // #975: await off the event loop. A hung `claude -p` (15s timeout)
+            // per agent used to block the whole server; now it yields.
+            await execAsync("claude", ["-p", "echo ok"], { cwd: wtDir, timeout: 15000, stdio: "pipe" });
           }
         }
       }

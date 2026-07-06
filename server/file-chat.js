@@ -175,7 +175,12 @@ function appendMessage(projectId, { sender, channel = "general", text, type = "m
         console.error(`[file-chat] Append failure for project ${projectId}: ${err.message}`);
         throw err;
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      // #975: retry immediately — no sleep. The previous
+      // Atomics.wait(...,100) was a SYNCHRONOUS 100ms block on the main
+      // thread (up to 300ms per append) on every chat + system message; in
+      // this single-process server that froze every agent's WS/HTTP/timers.
+      // appendFileSync transient failures are rare and not time-dependent, so
+      // the busy-wait bought nothing. Attempt count is unchanged.
     }
   }
 
