@@ -11,6 +11,7 @@ import {
   getNotificationBackgroundOnly,
   setNotificationBackgroundOnly,
 } from "../lib/notificationSound";
+import { sessionTokenHeaders } from "@/lib/sessionToken";
 import { useLocale } from "@/components/LocaleProvider";
 
 const COPY = {
@@ -172,7 +173,7 @@ function ServerSection({ projectId }: { projectId: string }) {
       : `/api/agents/${encodeURIComponent(projectId)}/interrupt-all`;
     setLoading("interrupt");
     try {
-      const r = await fetch(url, { method: "POST" });
+      const r = await fetch(url, { method: "POST", headers: await sessionTokenHeaders() }); // #968
       const d = await r.json();
       if (agent) {
         setFeedback(d.ok ? t.interrupted(agent) : (d.error || t.failed));

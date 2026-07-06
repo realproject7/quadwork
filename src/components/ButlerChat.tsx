@@ -5,6 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { useLocale } from "@/components/LocaleProvider";
+import { sessionTokenParam } from "@/lib/sessionToken";
 
 const COPY = {
   en: {
@@ -162,7 +163,8 @@ export default function ButlerChat() {
       const base = await resolveBase();
       if (cancelled) return;
 
-      const ws = new WebSocket(`${base}/ws/butler`);
+      const tok = await sessionTokenParam(); // #968: auth the butler WS
+      const ws = new WebSocket(`${base}/ws/butler${tok ? `?${tok}` : ""}`);
       wsRef.current = ws;
 
       ws.onopen = () => {

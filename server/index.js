@@ -15,8 +15,27 @@ const selfHeal = require("./self-heal");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const net = require("net");
+const crypto = require("crypto");
 const config = readConfig();
 const PORT = config.port || 8400;
+
+// #968: shared session token gating the PTY-driving surface (/ws/terminal,
+// /ws/butler, /write, /interrupt). Auto-provisioned + persisted to config.json
+// so the LOCAL dashboard attaches it with zero operator friction; tailnet/LAN
+// exposure must supply it out-of-band (see docs/*). Kept out of any response
+// except the localhost-only /api/session-token endpoint.
+let SESSION_TOKEN =
+  typeof config.session_token === "string" && config.session_token
+    ? config.session_token
+    : null;
+if (!SESSION_TOKEN) {
+  SESSION_TOKEN = crypto.randomBytes(32).toString("hex");
+  try {
+    writeConfig({ ...config, session_token: SESSION_TOKEN });
+  } catch (err) {
+    console.warn(`[auth] could not persist session token to config: ${err.message || err}`);
+  }
+}
 
 function emitSystemMessage(projectId, text) {
   try {
@@ -53,6 +72,16 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
+// #968: hand the shared session token to the LOCAL dashboard only, so it can
+// auto-attach it to WS + PTY-write calls with no operator action. Non-localhost
+// callers (tailnet/LAN) get 403 and must configure the token out-of-band — the
+// token is never leaked off-box. `req.ip` is the real socket address because we
+// deliberately do NOT trust proxy headers.
+app.get("/api/session-token", (req, res) => {
+  if (!isLocalhost(req.ip)) return res.status(403).json({ error: "Local access only" });
+  res.json({ token: SESSION_TOKEN });
+});
+
 // --- Safe PTY write helper (#670) ---
 
 function safeWrite(term, data) {
@@ -62,6 +91,37 @@ function safeWrite(term, data) {
     if (err.code === "EIO") return false;
     throw err;
   }
+}
+
+// --- #968: PTY-surface auth (Origin allowlist + shared session token) ---
+
+function isLocalhost(ip) {
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
+// A cross-origin web page CAN open a WebSocket to 127.0.0.1 (browsers don't
+// enforce same-origin on WS), so the upgrade handler must vet Origin itself.
+// Allow any localhost origin (the local dashboard, incl. dev on :3000) and a
+// request whose Origin host matches the server Host (direct tailnet/LAN access
+// to this very port). Absent Origin → reject (browsers always send it on WS).
+function isAllowedWsOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  let u;
+  try { u = new URL(origin); } catch { return false; }
+  if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1") return true;
+  return !!req.headers.host && u.host === req.headers.host;
+}
+
+function tokenMatches(token) {
+  return typeof token === "string" && token.length > 0 && token === SESSION_TOKEN;
+}
+
+// REST guard for the PTY-write endpoints. Token travels in X-Session-Token.
+function requireSessionToken(req, res) {
+  if (tokenMatches(req.headers["x-session-token"])) return true;
+  res.status(401).json({ ok: false, error: "Invalid or missing session token" });
+  return false;
 }
 
 // --- CLI status detection ---
@@ -823,6 +883,7 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
 // --- #706: Manual interrupt — send Ctrl+C to agent PTY ---
 
 app.post("/api/agents/:project/:agent/interrupt", (req, res) => {
+  if (!requireSessionToken(req, res)) return; // #968
   const key = `${req.params.project}/${req.params.agent}`;
   const session = agentSessions.get(key);
   if (!session || !session.term) {
@@ -834,6 +895,7 @@ app.post("/api/agents/:project/:agent/interrupt", (req, res) => {
 });
 
 app.post("/api/agents/:project/interrupt-all", (req, res) => {
+  if (!requireSessionToken(req, res)) return; // #968
   const { project } = req.params;
   let count = 0;
   for (const [key, session] of agentSessions) {
@@ -864,6 +926,7 @@ app.get("/api/sessions", (_req, res) => {
 // --- Write to active PTY session ---
 
 app.post("/api/agents/:project/:agent/write", (req, res) => {
+  if (!requireSessionToken(req, res)) return; // #968
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
   const session = agentSessions.get(key);
@@ -878,7 +941,10 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
   }
 
   try {
-    session.term.write(text);
+    // #968 (C2): route through safeWrite so a write to a just-exited PTY
+    // surfaces EIO as a clean 409 instead of an unhandled 500.
+    const ok = safeWrite(session.term, text);
+    if (!ok) return res.status(409).json({ ok: false, error: "PTY not writable (exited)" });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1526,17 +1592,33 @@ const { scrubSecrets, scrubScrollback } = require("./scrub-secrets");
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  const pathname = new URL(req.url, "http://localhost").pathname;
+  const url = new URL(req.url, "http://localhost");
+  const pathname = url.pathname;
+  if (pathname !== "/ws/terminal" && pathname !== "/ws/butler") {
+    socket.destroy();
+    return;
+  }
+  // #968: a cross-origin page can open a WS to 127.0.0.1 and inject keystrokes
+  // into an agent PTY (remote shell over tailnet). Vet Origin, then require the
+  // shared session token (passed as ?token= since browsers can't set WS headers).
+  if (!isAllowedWsOrigin(req)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  if (!tokenMatches(url.searchParams.get("token"))) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
   if (pathname === "/ws/terminal") {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection:terminal", ws, req);
     });
-  } else if (pathname === "/ws/butler") {
+  } else {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection:butler", ws, req);
     });
-  } else {
-    socket.destroy();
   }
 });
 

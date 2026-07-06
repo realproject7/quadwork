@@ -336,6 +336,9 @@ router.get("/api/config", (_req, res) => {
     // chat actually sends. This also makes a hand-edited file with
     // garbage characters self-correct visibly on next reload.
     parsed.operator_name = sanitizeOperatorName(parsed.operator_name);
+    // #968: never expose the PTY session token here — it's handed to the local
+    // dashboard only, via the localhost-gated GET /api/session-token.
+    delete parsed.session_token;
     res.json(parsed);
   } catch (err) {
     if (err.code === "ENOENT") return res.json(DEFAULT_CONFIG);
@@ -361,6 +364,10 @@ router.put("/api/config", (req, res) => {
     else delete body.sidebar_groups;
     if ("reviewer_github_user" in disk) body.reviewer_github_user = disk.reviewer_github_user;
     else delete body.reviewer_github_user;
+    // #968: session_token is redacted from GET, so a whole-config PUT snapshot
+    // never carries it — re-read and preserve it (same reason as the keys above).
+    if ("session_token" in disk) body.session_token = disk.session_token;
+    else delete body.session_token;
     writeConfig(body);
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
