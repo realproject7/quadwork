@@ -1,6 +1,6 @@
 // #814: shared per-project Active/Inactive (idle) state. The source of truth is
-// `project.idle` in config (#812). Toggling persists via PUT /api/config — the
-// server's syncTriggers hook stops a now-idle project's trigger — and broadcasts
+// `project.idle` in config (#812). Toggling persists via PATCH /api/projects/:id/flags
+// (#971) — the server's syncTriggers hook stops a now-idle project's trigger — and broadcasts
 // a lightweight in-tab signal so every open view (the dashboard's pollers, the
 // sidebar switch, the settings switch) re-syncs without a manual reload.
 

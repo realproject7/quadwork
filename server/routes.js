@@ -401,6 +401,56 @@ router.put("/api/config", (req, res) => {
   }
 });
 
+// #971: section-merge config write for the Settings form — the last frontend
+// caller that used the whole-config PUT. It MERGES the provided sections into the
+// freshest on-disk config under updateConfig (atomic, serialized), so it never
+// does a whole-config read-modify-write and can't clobber a concurrent write:
+//   - top-level keys the client owns are assigned (never the field-scoped-owned
+//     keys pinned_projects/sidebar_groups/reviewer_github_user/session_token,
+//     which have their own endpoints);
+//   - operator_name keeps the raw on-disk value when the client echoes the
+//     sanitized one it GET'd;
+//   - projects are merged by id, PRESERVING each project's field-scoped flag
+//     fields from disk; a project id not on disk is appended (Settings can add
+//     one); on-disk projects absent from the body are left untouched.
+const CONFIG_MERGE_EXCLUDED = new Set([
+  "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token",
+]);
+router.patch("/api/config", (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    updateConfig((cfg) => {
+      for (const [k, v] of Object.entries(body)) {
+        if (CONFIG_MERGE_EXCLUDED.has(k)) continue;
+        if (k === "operator_name" && typeof v === "string" &&
+            "operator_name" in cfg && v === sanitizeOperatorName(cfg.operator_name)) {
+          continue; // unchanged sanitized echo — keep the raw on-disk value
+        }
+        cfg[k] = v;
+      }
+      if (Array.isArray(body.projects)) {
+        if (!Array.isArray(cfg.projects)) cfg.projects = [];
+        const byId = new Map(cfg.projects.map((p) => [p.id, p]));
+        for (const incoming of body.projects) {
+          if (!incoming || typeof incoming !== "object" || !incoming.id) continue;
+          const existing = byId.get(incoming.id);
+          if (existing) {
+            const preserved = {};
+            for (const fk of PROJECT_FLAG_KEYS) if (fk in existing) preserved[fk] = existing[fk];
+            Object.assign(existing, incoming, preserved);
+          } else {
+            cfg.projects.push(incoming);
+          }
+        }
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
+  res.json({ ok: true });
+});
+
 // ─── Per-project flag toggles (field-scoped, race-free) — #971 ──────────────
 // The toggle widgets (idle, awake_auto, trigger_auto, telegram/discord auto,
 // bridge filter, loop-guard auto-continue) used to GET the whole config, flip

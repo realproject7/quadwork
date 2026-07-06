@@ -95,6 +95,31 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     ok(disk.projects[0].idle === true, "whole-config PUT did NOT clobber the field-scoped idle flag (kept disk value)");
     ok(disk.operator_name === "Alice!", "raw operator_name survives a Settings save (not overwritten with sanitized)");
 
+    // ── PATCH /api/config: the section-merge Settings save (no whole-config PUT) ─
+    // Send only owned sections (Settings strips the flags): operator_name echoed
+    // sanitized, a new top-level (butler), and a project with edited agents.
+    const patch = await req(server, { method: "PATCH", urlPath: "/api/config", body: {
+      operator_name: "Alice", // sanitized echo — must keep raw "Alice!"
+      butler: { command: "claude", model: "opus" },
+      projects: [{ id: "lv", name: "Renamed", agents: { head: { command: "codex" } } }],
+    }});
+    ok(patch.status === 200, "PATCH /api/config (section merge) → 200");
+    const d2 = readCfg();
+    ok(d2.operator_name === "Alice!", "PATCH keeps the raw operator_name on a sanitized echo");
+    ok(d2.butler && d2.butler.command === "claude" && d2.butler.model === "opus", "PATCH merges an owned top-level section (butler)");
+    ok(d2.projects[0].name === "Renamed" && d2.projects[0].agents.head.command === "codex", "PATCH merges owned per-project fields (name, agents)");
+    ok(d2.projects[0].idle === true && d2.projects[0].telegram_auto === true, "PATCH preserves the field-scoped flags from disk (no clobber)");
+
+    // PATCH must never touch the field-scoped-owned top-level keys.
+    writeCfg({ ...readCfg(), pinned_projects: ["lv"] });
+    await req(server, { method: "PATCH", urlPath: "/api/config", body: { pinned_projects: [], operator_name: "Bob" } });
+    ok(readCfg().pinned_projects.length === 1, "PATCH ignores field-scoped-owned top-level keys (pinned_projects untouched)");
+
+    // A project id not on disk is appended (Settings can add a project).
+    await req(server, { method: "PATCH", urlPath: "/api/config", body: { projects: [{ id: "new", name: "New" }] } });
+    ok(readCfg().projects.some((p) => p.id === "new") && readCfg().projects.some((p) => p.id === "lv"),
+       "PATCH appends a new project without dropping existing ones");
+
     console.log(`\n${passed} passed`);
     console.log("server/configFlags.test.js: all assertions passed");
   } finally {

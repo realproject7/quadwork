@@ -611,10 +611,27 @@ export default function SettingsPage() {
             }
           : config.butler,
       };
+      // #971: save via the section-merge PATCH (no whole-config PUT). Send only
+      // the sections Settings owns — strip the field-scoped-owned keys so the
+      // payload can never carry a stale flag/pin the server owns via its own
+      // endpoints. The server merges into the freshest config under updateConfig.
+      const FLAG_KEYS = [
+        "idle", "awake_auto", "trigger_auto", "telegram_auto", "discord_auto",
+        "bridge_filter_agents_only", "auto_continue_loop_guard", "auto_continue_delay_sec",
+      ];
+      const patchBody: Record<string, unknown> = { ...normalizedConfig };
+      for (const k of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token"]) {
+        delete patchBody[k];
+      }
+      patchBody.projects = normalizedConfig.projects.map((p) => {
+        const clean: Record<string, unknown> = { ...p };
+        for (const k of FLAG_KEYS) delete clean[k];
+        return clean;
+      });
       const res = await fetch("/api/config", {
-        method: "PUT",
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(normalizedConfig),
+        body: JSON.stringify(patchBody),
       });
       if (!res.ok) throw new Error(`${res.status}`);
       setConfig(normalizedConfig);
