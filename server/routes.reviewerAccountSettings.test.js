@@ -27,6 +27,7 @@ const real = {
   chmodSync: fs.chmodSync,
   statSync: fs.statSync,
   rmSync: fs.rmSync,
+  renameSync: fs.renameSync,
 };
 const files = new Map([[CONFIG_PATH, JSON.stringify({ port: 8400, reviewer_github_user: "old-reviewer", projects: [] }, null, 2)]]);
 const modes = new Map();
@@ -73,6 +74,19 @@ fs.statSync = function stubStatSync(p, ...rest) {
   if (key.startsWith(TEST_DIR)) return { mode: modes.get(key) || 0o600 };
   return real.statSync.call(this, p, ...rest);
 };
+// #971: writeConfig is now atomic (tmp write + renameSync) — model rename in the
+// in-memory store so the config PUT/field-scoped writes still work here.
+fs.renameSync = function stubRenameSync(src, dst) {
+  const s = String(src), d = String(dst);
+  if (s.startsWith(TEST_DIR) || d.startsWith(TEST_DIR)) {
+    if (!files.has(s)) { const err = new Error("ENOENT"); err.code = "ENOENT"; throw err; }
+    files.set(d, files.get(s));
+    if (modes.has(s)) modes.set(d, modes.get(s));
+    files.delete(s); modes.delete(s);
+    return;
+  }
+  return real.renameSync.apply(this, arguments);
+};
 
 const express = require("express");
 const router = require("./routes");
@@ -86,6 +100,7 @@ function cleanup() {
   fs.chmodSync = real.chmodSync;
   fs.statSync = real.statSync;
   fs.rmSync = real.rmSync;
+  fs.renameSync = real.renameSync;
 }
 process.on("exit", cleanup);
 

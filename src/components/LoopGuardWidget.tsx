@@ -111,23 +111,17 @@ export default function LoopGuardWidget({ projectId }: LoopGuardWidgetProps) {
   const saveAutoContinue = async (nextEnabled: boolean, nextDelay: number) => {
     setAutoContinueSaving(true);
     try {
-      const cfgRes = await fetch(`/api/config`);
-      if (!cfgRes.ok) throw new Error(`GET /api/config ${cfgRes.status}`);
-      const cfg = await cfgRes.json();
-      if (!cfg || !Array.isArray(cfg.projects)) throw new Error("config shape");
-      const idx = cfg.projects.findIndex((p: { id: string }) => p.id === projectId);
-      if (idx < 0) throw new Error(`project ${projectId} not found`);
-      cfg.projects[idx] = {
-        ...cfg.projects[idx],
-        auto_continue_loop_guard: nextEnabled,
-        auto_continue_delay_sec: nextDelay,
-      };
-      const putRes = await fetch(`/api/config`, {
-        method: "PUT",
+      // #971: field-scoped write — merges only the two loop-guard fields under an
+      // atomic read-modify-write, so it can't clobber a concurrent toggle.
+      const putRes = await fetch(`/api/projects/${encodeURIComponent(projectId)}/flags`, {
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(cfg),
+        body: JSON.stringify({
+          auto_continue_loop_guard: nextEnabled,
+          auto_continue_delay_sec: nextDelay,
+        }),
       });
-      if (!putRes.ok) throw new Error(`PUT /api/config ${putRes.status}`);
+      if (!putRes.ok) throw new Error(`PATCH flags ${putRes.status}`);
     } finally {
       setAutoContinueSaving(false);
     }

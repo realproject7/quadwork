@@ -368,6 +368,28 @@ router.put("/api/config", (req, res) => {
     // never carries it — re-read and preserve it (same reason as the keys above).
     if ("session_token" in disk) body.session_token = disk.session_token;
     else delete body.session_token;
+    // #971: GET returns the SANITIZED operator_name; if the client PUTs back that
+    // exact sanitized value it did not actually edit it, so keep the raw on-disk
+    // value instead of overwriting it with the sanitized form (routes.js:327).
+    if (typeof body.operator_name === "string" && "operator_name" in disk &&
+        body.operator_name === sanitizeOperatorName(disk.operator_name)) {
+      body.operator_name = disk.operator_name;
+    }
+    // #971: the per-project flag fields are owned by PUT /api/projects/:id/flags.
+    // A whole-config PUT (e.g. SettingsPage.save) carries a possibly-stale
+    // snapshot of them, so re-read each project's flags off disk and keep those —
+    // a Settings save can never revert a concurrent toggle (extends #944).
+    if (Array.isArray(body.projects)) {
+      const diskById = new Map((disk.projects || []).map((p) => [p.id, p]));
+      for (const proj of body.projects) {
+        const dp = diskById.get(proj.id);
+        if (!dp) continue;
+        for (const k of PROJECT_FLAG_KEYS) {
+          if (k in dp) proj[k] = dp[k];
+          else delete proj[k];
+        }
+      }
+    }
     writeConfig(body);
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
@@ -377,6 +399,132 @@ router.put("/api/config", (req, res) => {
   } catch (err) {
     res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
+});
+
+// #971: section-merge config write for the Settings form — the last frontend
+// caller that used the whole-config PUT. It MERGES the provided sections into the
+// freshest on-disk config under updateConfig (atomic, serialized), so it never
+// does a whole-config read-modify-write and can't clobber a concurrent write:
+//   - top-level keys the client owns are assigned (never the field-scoped-owned
+//     keys pinned_projects/sidebar_groups/reviewer_github_user/session_token,
+//     which have their own endpoints);
+//   - operator_name keeps the raw on-disk value when the client echoes the
+//     sanitized one it GET'd;
+//   - projects are merged by id, PRESERVING each project's field-scoped flag
+//     fields from disk; a project id not on disk is appended (Settings can add
+//     one); on-disk projects absent from the body are left untouched.
+const CONFIG_MERGE_EXCLUDED = new Set([
+  "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token",
+]);
+router.patch("/api/config", (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  try {
+    updateConfig((cfg) => {
+      for (const [k, v] of Object.entries(body)) {
+        if (CONFIG_MERGE_EXCLUDED.has(k)) continue;
+        if (k === "operator_name" && typeof v === "string" &&
+            "operator_name" in cfg && v === sanitizeOperatorName(cfg.operator_name)) {
+          continue; // unchanged sanitized echo — keep the raw on-disk value
+        }
+        cfg[k] = v;
+      }
+      if (Array.isArray(body.projects)) {
+        if (!Array.isArray(cfg.projects)) cfg.projects = [];
+        const byId = new Map(cfg.projects.map((p) => [p.id, p]));
+        for (const incoming of body.projects) {
+          if (!incoming || typeof incoming !== "object" || !incoming.id) continue;
+          const existing = byId.get(incoming.id);
+          if (existing) {
+            const preserved = {};
+            for (const fk of PROJECT_FLAG_KEYS) if (fk in existing) preserved[fk] = existing[fk];
+            Object.assign(existing, incoming, preserved);
+          } else {
+            cfg.projects.push(incoming);
+          }
+        }
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
+  res.json({ ok: true });
+});
+
+// ─── Per-project flag toggles (field-scoped, race-free) — #971 ──────────────
+// The toggle widgets (idle, awake_auto, trigger_auto, telegram/discord auto,
+// bridge filter, loop-guard auto-continue) used to GET the whole config, flip
+// one field, and PUT the entire object back — so any two overlapping toggles
+// (or a Settings save) clobbered each other with stale snapshots. This endpoint
+// merges ONLY the whitelisted flag(s) into the target project, under the
+// atomic updateConfig() serialization point, so a toggle can never lose an
+// unrelated concurrent write. Booleans, except the loop-guard delay (seconds).
+const PROJECT_FLAG_KEYS = new Set([
+  "idle",
+  "awake_auto",
+  "trigger_auto",
+  "telegram_auto",
+  "discord_auto",
+  "bridge_filter_agents_only",
+  "auto_continue_loop_guard",
+  "auto_continue_delay_sec",
+]);
+
+router.patch("/api/projects/:id/flags", (req, res) => {
+  const { id } = req.params;
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const keys = Object.keys(body);
+  if (keys.length === 0) return res.status(400).json({ error: "No flags provided" });
+
+  const updates = {};
+  for (const k of keys) {
+    if (!PROJECT_FLAG_KEYS.has(k)) return res.status(400).json({ error: `Unknown flag: ${k}` });
+    const v = body[k];
+    if (k === "auto_continue_delay_sec") {
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+        return res.status(400).json({ error: "auto_continue_delay_sec must be a non-negative number" });
+      }
+    } else if (typeof v !== "boolean") {
+      return res.status(400).json({ error: `${k} must be a boolean` });
+    }
+    updates[k] = v;
+  }
+
+  try {
+    updateConfig((cfg) => {
+      const entry = (cfg.projects || []).find((p) => p.id === id);
+      if (!entry) { const e = new Error("not found"); e.code = "QW_NOT_FOUND"; throw e; }
+      Object.assign(entry, updates);
+    });
+  } catch (err) {
+    if (err.code === "QW_NOT_FOUND") return res.status(404).json({ error: `Unknown project: ${id}` });
+    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+
+  // idle / trigger_auto gate the scheduler — resync it (same as the whole PUT).
+  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
+  res.json({ ok: true });
+});
+
+// #971: field-scoped project removal. The section-merge PATCH above never drops
+// projects (it can't tell "not edited" from "deleted"), so the Settings "Remove"
+// action deletes here — atomically, via updateConfig — instead of relying on a
+// whole-config replace. Mirrors the prior behavior (config entry removed; source
+// clones/worktrees are left for `quadwork cleanup`).
+router.delete("/api/projects/:id", (req, res) => {
+  const { id } = req.params;
+  try {
+    updateConfig((cfg) => {
+      const before = (cfg.projects || []).length;
+      cfg.projects = (cfg.projects || []).filter((p) => p.id !== id);
+      if (cfg.projects.length === before) { const e = new Error("not found"); e.code = "QW_NOT_FOUND"; throw e; }
+    });
+  } catch (err) {
+    if (err.code === "QW_NOT_FOUND") return res.status(404).json({ error: `Unknown project: ${id}` });
+    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
+  res.json({ ok: true });
 });
 
 // ─── Pinned projects & sidebar groups (field-scoped, race-free) ─────────────
@@ -479,7 +627,7 @@ router.put("/api/reviewer-github-user", (req, res) => {
 
 // ─── Chat (file-based) ────────────────────────────────────────────────────
 
-const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
+const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig, updateConfig } = require("./config");
 const { findAgentChattr } = require("./install-agentchattr");
 
 /**

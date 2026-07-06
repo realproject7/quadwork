@@ -232,18 +232,12 @@ export default function TelegramBridgeWidget({ projectId, idle = false }: Telegr
       prevBatchRef.current = null;
     }
     try {
-      const r = await fetch("/api/config");
-      if (!r.ok) return;
-      const cfg = await r.json();
-      const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
-      if (entry) {
-        entry.telegram_auto = next;
-        await fetch("/api/config", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(cfg),
-        });
-      }
+      // #971: field-scoped write — merges only telegram_auto (no whole-config clobber)
+      await fetch(`/api/projects/${encodeURIComponent(projectId)}/flags`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ telegram_auto: next }),
+      });
     } catch { /* non-fatal */ }
   }, [autoTelegram, projectId]);
 

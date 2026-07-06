@@ -211,18 +211,12 @@ export default function DiscordBridgeWidget({ projectId, idle = false }: Discord
       prevBatchRef.current = null;
     }
     try {
-      const r = await fetch("/api/config");
-      if (!r.ok) return;
-      const cfg = await r.json();
-      const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
-      if (entry) {
-        entry.discord_auto = next;
-        await fetch("/api/config", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(cfg),
-        });
-      }
+      // #971: field-scoped write — merges only discord_auto (no whole-config clobber)
+      await fetch(`/api/projects/${encodeURIComponent(projectId)}/flags`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ discord_auto: next }),
+      });
     } catch { /* non-fatal */ }
   }, [autoDiscord, projectId]);
 

@@ -93,22 +93,13 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   const toggleFilter = useCallback(() => {
     setFilterSystem((prev) => {
       const next = !prev;
-      // #525: persist to project config so bridges respect the filter
-      fetch("/api/config")
-        .then((r) => r.ok ? r.json() : null)
-        .then((cfg) => {
-          if (!cfg) return;
-          const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
-          if (entry) {
-            entry.bridge_filter_agents_only = next;
-            return fetch("/api/config", {
-              method: "PUT",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(cfg),
-            });
-          }
-        })
-        .catch(() => {});
+      // #525/#971: persist to project config (field-scoped, no whole-config clobber)
+      // so bridges respect the filter.
+      fetch(`/api/projects/${encodeURIComponent(projectId)}/flags`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bridge_filter_agents_only: next }),
+      }).catch(() => {});
       return next;
     });
   }, [projectId]);

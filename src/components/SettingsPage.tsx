@@ -611,10 +611,27 @@ export default function SettingsPage() {
             }
           : config.butler,
       };
+      // #971: save via the section-merge PATCH (no whole-config PUT). Send only
+      // the sections Settings owns — strip the field-scoped-owned keys so the
+      // payload can never carry a stale flag/pin the server owns via its own
+      // endpoints. The server merges into the freshest config under updateConfig.
+      const FLAG_KEYS = [
+        "idle", "awake_auto", "trigger_auto", "telegram_auto", "discord_auto",
+        "bridge_filter_agents_only", "auto_continue_loop_guard", "auto_continue_delay_sec",
+      ];
+      const patchBody: Record<string, unknown> = { ...normalizedConfig };
+      for (const k of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token"]) {
+        delete patchBody[k];
+      }
+      patchBody.projects = normalizedConfig.projects.map((p) => {
+        const clean: Record<string, unknown> = { ...p };
+        for (const k of FLAG_KEYS) delete clean[k];
+        return clean;
+      });
       const res = await fetch("/api/config", {
-        method: "PUT",
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(normalizedConfig),
+        body: JSON.stringify(patchBody),
       });
       if (!res.ok) throw new Error(`${res.status}`);
       setConfig(normalizedConfig);
@@ -752,11 +769,31 @@ export default function SettingsPage() {
     updateProject(idx, { archived: false });
   };
 
-  const removeProject = (idx: number) => {
+  // #971: removal persists immediately via the field-scoped DELETE endpoint
+  // (the section-merge save never drops projects). Local state + the saved
+  // snapshot both drop it, so any OTHER pending edits stay correctly marked dirty.
+  const removeProject = async (idx: number) => {
     if (!config) return;
-    const projects = config.projects.filter((_, i) => i !== idx);
-    setConfig({ ...config, projects });
+    const target = config.projects[idx];
     setConfirmDelete(null);
+    if (!target) return;
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(target.id)}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
+    } catch (err) {
+      console.error(err);
+      return; // leave the UI unchanged on failure
+    }
+    setConfig({ ...config, projects: config.projects.filter((_, i) => i !== idx) });
+    if (savedConfigRef.current) {
+      try {
+        const saved = JSON.parse(savedConfigRef.current);
+        if (Array.isArray(saved.projects)) {
+          saved.projects = saved.projects.filter((p: { id: string }) => p.id !== target.id);
+          savedConfigRef.current = JSON.stringify(saved);
+        }
+      } catch { /* dirty-tracking best-effort */ }
+    }
   };
 
   if (!config) return <div className="p-6 text-text-muted text-xs">{t.loading}</div>;
