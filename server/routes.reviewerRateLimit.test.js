@@ -84,26 +84,28 @@ function reset() {
   // ── Resolution (pure _resolveReviewerTokenPath — no gh, no cache) ────────
 
   // custom worktree path (re1) wins
+  // #970: the worktree-sourced path is now confined to under the worktree (or
+  // ~/.quadwork), so custom paths in these fixtures live under /wt/p-re1|re2.
   reset();
   configJson = JSON.stringify({ reviewer_github_user: "interns", projects: [PROJECT] });
-  files.set(RE1_AGENTS, ghTokenLine("/custom/reviewer-token"));
+  files.set(RE1_AGENTS, ghTokenLine("/wt/p-re1/reviewer-token"));
   let r = _resolveReviewerTokenPath("p");
-  ok(r.path === "/custom/reviewer-token" && r.source === "worktree", "resolves custom worktree token path (re1) with source=worktree");
+  ok(r.path === "/wt/p-re1/reviewer-token" && r.source === "worktree", "resolves custom worktree token path (re1) with source=worktree");
 
   // worktree wins over cfg.reviewer_token_path
   reset();
   configJson = JSON.stringify({ reviewer_token_path: "/cfg/reviewer-token", projects: [PROJECT] });
-  files.set(RE1_AGENTS, ghTokenLine("/wtwins/reviewer-token"));
+  files.set(RE1_AGENTS, ghTokenLine("/wt/p-re1/wtwins-token"));
   r = _resolveReviewerTokenPath("p");
-  ok(r.path === "/wtwins/reviewer-token" && r.source === "worktree", "worktree path WINS over cfg.reviewer_token_path (reseed preservation order)");
+  ok(r.path === "/wt/p-re1/wtwins-token" && r.source === "worktree", "worktree path WINS over cfg.reviewer_token_path (reseed preservation order)");
 
   // re2 fallback when re1 AGENTS.md has no GH_TOKEN line
   reset();
   configJson = JSON.stringify({ projects: [PROJECT] });
   files.set(RE1_AGENTS, "no token here\n");
-  files.set(RE2_AGENTS, ghTokenLine("/re2/reviewer-token"));
+  files.set(RE2_AGENTS, ghTokenLine("/wt/p-re2/reviewer-token"));
   r = _resolveReviewerTokenPath("p");
-  ok(r.path === "/re2/reviewer-token" && r.source === "worktree", "falls back to re2 worktree when re1 has no GH_TOKEN line");
+  ok(r.path === "/wt/p-re2/reviewer-token" && r.source === "worktree", "falls back to re2 worktree when re1 has no GH_TOKEN line");
 
   // no project → cfg.reviewer_token_path
   reset();
@@ -158,8 +160,8 @@ function reset() {
   // custom worktree token → polled with that token; login OMITTED (stale-login guard)
   reset();
   configJson = JSON.stringify({ reviewer_github_user: "interns", projects: [PROJECT] });
-  files.set(RE1_AGENTS, ghTokenLine("/customA/reviewer-token"));
-  files.set("/customA/reviewer-token", "ghp_customA\n");
+  files.set(RE1_AGENTS, ghTokenLine("/wt/p-re1/customA-token")); // #970: under the worktree
+  files.set("/wt/p-re1/customA-token", "ghp_customA\n");
   payload = reviewerRateLimitPayload(await getReviewerRateLimit("p"));
   ok(capturedEnvToken === "ghp_customA", "polls the CUSTOM worktree token via GH_TOKEN");
   ok(payload && payload.graphql && payload.graphql.remaining === 37, "custom-path reviewer payload surfaced (graphql bucket)");
@@ -177,7 +179,7 @@ function reset() {
   reset();
   capturedEnvToken = null;
   configJson = JSON.stringify({ projects: [PROJECT] });
-  files.set(RE1_AGENTS, ghTokenLine("/notoken/reviewer-token")); // token file NOT added → ENOENT
+  files.set(RE1_AGENTS, ghTokenLine("/wt/p-re1/notoken-token")); // #970: under the worktree; token file NOT added → ENOENT
   payload = reviewerRateLimitPayload(await getReviewerRateLimit("p"));
   ok(payload === null, "no reviewer token at resolved path → payload null (omitted)");
   ok(capturedEnvToken === null, "no token → NO reviewer gh poll fired");
