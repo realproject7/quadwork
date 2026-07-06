@@ -506,6 +506,27 @@ router.patch("/api/projects/:id/flags", (req, res) => {
   res.json({ ok: true });
 });
 
+// #971: field-scoped project removal. The section-merge PATCH above never drops
+// projects (it can't tell "not edited" from "deleted"), so the Settings "Remove"
+// action deletes here — atomically, via updateConfig — instead of relying on a
+// whole-config replace. Mirrors the prior behavior (config entry removed; source
+// clones/worktrees are left for `quadwork cleanup`).
+router.delete("/api/projects/:id", (req, res) => {
+  const { id } = req.params;
+  try {
+    updateConfig((cfg) => {
+      const before = (cfg.projects || []).length;
+      cfg.projects = (cfg.projects || []).filter((p) => p.id !== id);
+      if (cfg.projects.length === before) { const e = new Error("not found"); e.code = "QW_NOT_FOUND"; throw e; }
+    });
+  } catch (err) {
+    if (err.code === "QW_NOT_FOUND") return res.status(404).json({ error: `Unknown project: ${id}` });
+    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+  }
+  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
+  res.json({ ok: true });
+});
+
 // ─── Pinned projects & sidebar groups (field-scoped, race-free) ─────────────
 // #944: pins/groups used to persist via the whole-config GET→mutate→PUT path,
 // which dropped them whenever any concurrent writer PUT a stale snapshot — and

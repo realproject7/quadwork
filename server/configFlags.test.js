@@ -120,6 +120,15 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     ok(readCfg().projects.some((p) => p.id === "new") && readCfg().projects.some((p) => p.id === "lv"),
        "PATCH appends a new project without dropping existing ones");
 
+    // ── DELETE /api/projects/:id — Settings "Remove" persists a deletion ─────
+    // (the section-merge PATCH intentionally never drops projects).
+    ok(readCfg().projects.some((p) => p.id === "new"), "precondition: 'new' project exists");
+    const del = await req(server, { method: "DELETE", urlPath: "/api/projects/new" });
+    ok(del.status === 200, "DELETE /api/projects/new → 200");
+    ok(!readCfg().projects.some((p) => p.id === "new"), "deleted project is removed from disk");
+    ok(readCfg().projects.some((p) => p.id === "lv"), "DELETE leaves other projects intact");
+    ok((await req(server, { method: "DELETE", urlPath: "/api/projects/nope" })).status === 404, "DELETE unknown project → 404");
+
     console.log(`\n${passed} passed`);
     console.log("server/configFlags.test.js: all assertions passed");
   } finally {

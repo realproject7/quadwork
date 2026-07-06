@@ -769,11 +769,31 @@ export default function SettingsPage() {
     updateProject(idx, { archived: false });
   };
 
-  const removeProject = (idx: number) => {
+  // #971: removal persists immediately via the field-scoped DELETE endpoint
+  // (the section-merge save never drops projects). Local state + the saved
+  // snapshot both drop it, so any OTHER pending edits stay correctly marked dirty.
+  const removeProject = async (idx: number) => {
     if (!config) return;
-    const projects = config.projects.filter((_, i) => i !== idx);
-    setConfig({ ...config, projects });
+    const target = config.projects[idx];
     setConfirmDelete(null);
+    if (!target) return;
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(target.id)}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
+    } catch (err) {
+      console.error(err);
+      return; // leave the UI unchanged on failure
+    }
+    setConfig({ ...config, projects: config.projects.filter((_, i) => i !== idx) });
+    if (savedConfigRef.current) {
+      try {
+        const saved = JSON.parse(savedConfigRef.current);
+        if (Array.isArray(saved.projects)) {
+          saved.projects = saved.projects.filter((p: { id: string }) => p.id !== target.id);
+          savedConfigRef.current = JSON.stringify(saved);
+        }
+      } catch { /* dirty-tracking best-effort */ }
+    }
   };
 
   if (!config) return <div className="p-6 text-text-muted text-xs">{t.loading}</div>;
