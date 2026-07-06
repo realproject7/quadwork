@@ -74,6 +74,8 @@ const BACKENDS: { value: string; label: string }[] = [
 const COPY = {
   en: {
     loading: "Loading...",
+    loadError: "Couldn't load settings.",
+    retry: "Retry",
     title: "Settings",
     save: "Save",
     saving: "Saving...",
@@ -161,6 +163,8 @@ const COPY = {
   },
   ko: {
     loading: "로딩 중...",
+    loadError: "설정을 불러오지 못했습니다.",
+    retry: "다시 시도",
     title: "설정",
     save: "저장",
     saving: "저장 중...",
@@ -298,6 +302,10 @@ export default function SettingsPage() {
   const t = COPY[locale];
   const searchParams = useSearchParams();
   const [config, setConfig] = useState<Config | null>(null);
+  // #973: distinguish "still loading" from "load failed" so a failed
+  // initial /api/config read shows an error + Retry instead of the
+  // "Loading..." placeholder spinning forever (the .catch swallowed it).
+  const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const savedConfigRef = useRef<string>("");
@@ -317,6 +325,27 @@ export default function SettingsPage() {
       const saved = JSON.parse(savedConfigRef.current);
       const sp = (saved.projects || []).find((p: { id: string }) => p.id === projectId);
       if (sp) { sp.idle = idle; savedConfigRef.current = JSON.stringify(saved); }
+    } catch { /* no saved snapshot yet */ }
+  }, []);
+
+  // #973: advance the saved snapshot's name after a debounced rename
+  // persists, instead of reloading the whole config. A full load() would
+  // overwrite any unsaved edits the operator made in other fields while
+  // the 800ms debounce was pending; the optimistic update already put the
+  // new name in local state, so this just keeps dirty-tracking honest.
+  const syncSavedProjectName = useCallback((projectId: string, name: string) => {
+    try {
+      const saved = JSON.parse(savedConfigRef.current);
+      const sp = (saved.projects || []).find((p: { id: string }) => p.id === projectId);
+      if (sp) { sp.name = name; savedConfigRef.current = JSON.stringify(saved); }
+    } catch { /* no saved snapshot yet */ }
+  }, []);
+
+  const syncSavedAgentName = useCallback((projectId: string, agentId: string, displayName: string) => {
+    try {
+      const saved = JSON.parse(savedConfigRef.current);
+      const sp = (saved.projects || []).find((p: { id: string }) => p.id === projectId);
+      if (sp?.agents?.[agentId]) { sp.agents[agentId].display_name = displayName; savedConfigRef.current = JSON.stringify(saved); }
     } catch { /* no saved snapshot yet */ }
   }, []);
 
@@ -359,6 +388,7 @@ export default function SettingsPage() {
   const [portDraft, setPortDraft] = useState<string>("8400");
 
   const load = useCallback(() => {
+    setLoadError(false);
     fetch("/api/config")
       .then((r) => {
         if (!r.ok) throw new Error(`${r.status}`);
@@ -377,7 +407,11 @@ export default function SettingsPage() {
         savedConfigRef.current = JSON.stringify(cfg);
         return setConfig(cfg);
       })
-      .catch(() => {});
+      // #973: surface the failure instead of swallowing it — otherwise a
+      // failed initial read leaves config null and the "Loading..."
+      // placeholder spins forever. load() only runs on mount + Retry, so
+      // config is always null here on failure.
+      .catch(() => setLoadError(true));
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -722,7 +756,10 @@ export default function SettingsPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ type: "project", projectId: project.id, oldName, newName }),
         })
-          .then(() => load())
+          // #973: merge just the renamed field into the saved snapshot
+          // rather than load()-ing the whole config, which would clobber
+          // other fields the operator edited during the debounce window.
+          .then(() => syncSavedProjectName(project.id, newName))
           .catch(() => {});
       }
       delete originalNames.current[key];
@@ -751,7 +788,8 @@ export default function SettingsPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ type: "agent", projectId: project.id, agentId, oldName, newName }),
         })
-          .then(() => load())
+          // #973: merge just the renamed field (see renameProject).
+          .then(() => syncSavedAgentName(project.id, agentId, newName))
           .catch(() => {});
       }
       delete originalNames.current[key];
@@ -796,6 +834,22 @@ export default function SettingsPage() {
     }
   };
 
+  // #973: failed initial load → error + Retry instead of an endless spinner.
+  if (!config && loadError) {
+    return (
+      <div className="p-6 flex flex-col items-start gap-3">
+        <div className="border border-error/30 bg-error/5 text-error text-[11px] px-3 py-2">
+          {t.loadError}
+        </div>
+        <button
+          onClick={load}
+          className="px-3 py-1.5 text-[12px] border border-border text-text-muted hover:text-text hover:border-accent transition-colors"
+        >
+          {t.retry}
+        </button>
+      </div>
+    );
+  }
   if (!config) return <div className="p-6 text-text-muted text-xs">{t.loading}</div>;
 
   const isDirty = savedConfigRef.current !== "" && JSON.stringify(config) !== savedConfigRef.current;

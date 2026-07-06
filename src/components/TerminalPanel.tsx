@@ -40,18 +40,29 @@ export default function TerminalPanel({
   const onActivityRef = useRef(onActivity);
   useEffect(() => { onActivityRef.current = onActivity; }, [onActivity]);
 
+  // #973: last dimensions actually sent to the backend. fit() runs once
+  // per animation frame during output bursts, but the terminal size
+  // rarely changes — only send a resize when cols/rows actually differ
+  // so a busy agent doesn't flood the PTY with identical resize frames.
+  const lastSentSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
+
   const fit = useCallback(() => {
     if (fitRef.current && termRef.current && containerRef.current) {
       try {
         fitRef.current.fit();
         // Notify backend of new dimensions
         const ws = wsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        const { cols, rows } = termRef.current;
+        if (
+          ws && ws.readyState === WebSocket.OPEN &&
+          (cols !== lastSentSizeRef.current.cols || rows !== lastSentSizeRef.current.rows)
+        ) {
+          lastSentSizeRef.current = { cols, rows };
           ws.send(
             JSON.stringify({
               type: "resize",
-              cols: termRef.current.cols,
-              rows: termRef.current.rows,
+              cols,
+              rows,
             })
           );
         }
@@ -202,6 +213,9 @@ export default function TerminalPanel({
             rows: term.rows,
           })
         );
+        // #973: record the size just sent so fit()'s change-guard is
+        // seeded against reality and doesn't immediately resend it.
+        lastSentSizeRef.current = { cols: term.cols, rows: term.rows };
         ws.send(JSON.stringify({ type: "replay" }));
       };
 

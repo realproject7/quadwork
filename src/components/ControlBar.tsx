@@ -19,6 +19,7 @@ const COPY = {
     server: {
       title: "Server",
       resetAgents: "Reset Agents",
+      confirmResetAgents: "Reset all 4 agents?",
       failed: "Failed",
       error: "Error",
       resetResult: (restarted: number, total: number) => `Reset — ${restarted} of ${total} agent${total !== 1 ? "s" : ""} restarted`,
@@ -71,6 +72,7 @@ const COPY = {
     server: {
       title: "서버",
       resetAgents: "에이전트 초기화",
+      confirmResetAgents: "에이전트 4개를 모두 초기화할까요?",
       failed: "실패",
       error: "오류",
       resetResult: (restarted: number, total: number) => `초기화 완료 — ${total}개 중 ${restarted}개 에이전트 재시작됨`,
@@ -129,10 +131,17 @@ function ServerSection({ projectId }: { projectId: string }) {
   const [loading, setLoading] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [confirmFullReset, setConfirmFullReset] = useState(false);
+  // #973: two-click confirm for Reset Agents — a single click used to
+  // kill all four agents with no guard, unlike every other destructive
+  // button here (Full Reset, Re-seed).
+  const [confirmReset, setConfirmReset] = useState(false);
   const [confirmReseed, setConfirmReseed] = useState(false);
   const [showInterrupt, setShowInterrupt] = useState(false);
   const [agentStates, setAgentStates] = useState<Record<string, string>>({});
   const interruptRef = useRef<HTMLDivElement>(null);
+  // #973: single feedback-clear timer, cleared before re-arm and on
+  // unmount so rapid actions don't stack timers that setState after unmount.
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const AGENT_IDS = ["head", "dev", "re1", "re2"];
 
@@ -188,8 +197,10 @@ function ServerSection({ projectId }: { projectId: string }) {
   };
 
   const clearFeedback = () => {
-    setTimeout(() => setFeedback(null), 3000);
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = setTimeout(() => setFeedback(null), 3000);
   };
+  useEffect(() => () => { if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current); }, []);
 
   useEffect(() => {
     if (!confirmFullReset) return;
@@ -202,6 +213,14 @@ function ServerSection({ projectId }: { projectId: string }) {
     const timer = setTimeout(() => setConfirmReseed(false), 4000);
     return () => clearTimeout(timer);
   }, [confirmReseed]);
+
+  // #973: auto-clear the Reset Agents confirm prompt after 4s (mirrors
+  // Full Reset / Re-seed) so a stray first click doesn't stay armed.
+  useEffect(() => {
+    if (!confirmReset) return;
+    const timer = setTimeout(() => setConfirmReset(false), 4000);
+    return () => clearTimeout(timer);
+  }, [confirmReset]);
 
   const handleFullReset = async () => {
     if (!confirmFullReset) {
@@ -224,6 +243,11 @@ function ServerSection({ projectId }: { projectId: string }) {
   };
 
   const handleReset = async () => {
+    if (!confirmReset) {
+      setConfirmReset(true);
+      return;
+    }
+    setConfirmReset(false);
     setLoading("reset");
     try {
       const r = await fetch(
@@ -281,9 +305,13 @@ function ServerSection({ projectId }: { projectId: string }) {
         <button
           onClick={handleReset}
           disabled={!!loading}
-          className="px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 transition-colors disabled:opacity-50"
+          className={`px-1.5 py-0.5 text-[10px] border transition-colors disabled:opacity-50 ${
+            confirmReset
+              ? "text-error border-error/60 bg-error/10 hover:bg-error/20"
+              : "text-text-muted border-border hover:text-accent hover:border-accent/40"
+          }`}
         >
-          {loading === "reset" ? "..." : t.resetAgents}
+          {loading === "reset" ? "..." : confirmReset ? t.confirmResetAgents : t.resetAgents}
         </button>
         <button
           onClick={handleFullReset}

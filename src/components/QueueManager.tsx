@@ -148,31 +148,62 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
           : window.location.host;
         const wsUrl = `${wsProto}//${wsHost}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=head${tok ? `&${tok}` : ""}`;
         const ws = new WebSocket(wsUrl);
-        await new Promise<void>((resolve, reject) => {
-          ws.onopen = () => resolve();
-          ws.onerror = () => reject(new Error("WebSocket failed"));
-          setTimeout(() => reject(new Error("WebSocket timeout")), 5000);
-        });
+        try {
+          await new Promise<void>((resolve, reject) => {
+            ws.onopen = () => resolve();
+            ws.onerror = () => reject(new Error("WebSocket failed"));
+            setTimeout(() => reject(new Error("WebSocket timeout")), 5000);
+          });
 
-        // Wait for shell to initialize
-        await new Promise((r) => setTimeout(r, 500));
+          // #973: poll /api/sessions until the PTY the WS just spawned is
+          // registered, instead of a fixed 500ms sleep a slow spawn on a
+          // busy event loop could outrun — which would write the head
+          // command into a shell that isn't ready yet.
+          const sessionReady = await new Promise<boolean>((resolve) => {
+            const deadline = Date.now() + 5000;
+            const probe = async () => {
+              try {
+                const sres = await fetch("/api/sessions");
+                if (sres.ok) {
+                  const list = await sres.json();
+                  if (Array.isArray(list) && list.some((s) => s && s.projectId === projectId && s.agentId === "head")) {
+                    resolve(true);
+                    return;
+                  }
+                }
+              } catch { /* transient — keep probing */ }
+              if (Date.now() < deadline) setTimeout(probe, 150);
+              else resolve(false);
+            };
+            probe();
+          });
+          if (!sessionReady) throw new Error("session did not come up");
 
-        // Start the Head agent CLI in the PTY shell
-        await fetch(`/api/agents/${projectId}/head/write`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...auth },
-          body: JSON.stringify({ text: `${headCommand}\n` }),
-        });
+          // Start the Head agent CLI in the PTY shell
+          await fetch(`/api/agents/${projectId}/head/write`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...auth },
+            body: JSON.stringify({ text: `${headCommand}\n` }),
+          });
 
-        // Wait for agent to initialize
-        await new Promise((r) => setTimeout(r, 3000));
+          // Wait for the agent CLI to initialize before sending the prompt.
+          // There's no liveness signal for CLI readiness (the session is
+          // already live), so this stays a short fixed warm-up.
+          await new Promise((r) => setTimeout(r, 3000));
 
-        // Now write the queue prompt to the running agent
-        res = await fetch(`/api/agents/${projectId}/head/write`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...auth },
-          body: JSON.stringify({ text: prompt + "\n" }),
-        });
+          // Now write the queue prompt to the running agent
+          res = await fetch(`/api/agents/${projectId}/head/write`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...auth },
+            body: JSON.stringify({ text: prompt + "\n" }),
+          });
+        } finally {
+          // #973: the bootstrap WS existed only to spawn the PTY; the real
+          // Head terminal attaches as its own viewer. Close it so it doesn't
+          // leak open for the lifetime of the page. (The server keeps the
+          // PTY alive with zero viewers — it's torn down only on stop/reset.)
+          try { ws.close(); } catch { /* already closing */ }
+        }
       }
 
       if (res.ok) {
