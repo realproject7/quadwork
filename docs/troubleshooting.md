@@ -141,16 +141,23 @@ are authenticated (#968). Two checks run:
    in `~/.quadwork/config.json` on first start) must accompany every terminal
    WS and PTY-write request.
 
-**Normal local use needs no action.** The dashboard fetches the token from the
-localhost-only `GET /api/session-token` endpoint and attaches it automatically.
-This also works behind a same-host reverse proxy (e.g. the nginx setup in the
-[VPS guide](install-vps.md)), because the proxy connects to QuadWork over
-`127.0.0.1`.
+**Normal local use needs no action.** When you open the dashboard on
+`http://127.0.0.1:<port>` (or `localhost`) — directly, or through an SSH tunnel
+— the dashboard fetches the token from `GET /api/session-token` and attaches it
+automatically.
+
+`/api/session-token` deliberately hands the token out **only** to a request
+whose socket, `Host`, and `Origin` are all loopback. This is on purpose: a
+malicious page using DNS rebinding, or a reverse proxy forwarding a public
+domain, keeps the socket on `127.0.0.1` while the browser's `Host` is a remote
+name — so IP alone is not enough, and those requests are refused. The token
+never leaves the box automatically.
 
 **Symptom:** Terminals show "connecting…" and never attach, or typing does
-nothing, when the dashboard is served from a **different origin** than the
-QuadWork API (e.g. a separately hosted frontend, or a proxy that rewrites the
-Origin), so `/api/session-token` isn't reachable same-origin.
+nothing, when you reach the dashboard by anything other than a loopback host —
+a **reverse proxy / domain** (e.g. the nginx setup in the
+[VPS guide](install-vps.md)), a **tailnet / LAN address**, or a separately
+hosted frontend. In those cases `GET /api/session-token` returns 403 by design.
 
 **Fix:** Set the token manually in the browser, once per browser:
 

@@ -112,6 +112,17 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   const token = JSON.parse(tokRes.body).token;
   ok(typeof token === "string" && token.length >= 32, "session token is a non-trivial secret");
 
+  // The token must NOT leak to a request whose Host/Origin is a remote name even
+  // when the socket is loopback (DNS rebinding / same-host reverse proxy).
+  const rebindHost = await httpReq(PORT, { path: "/api/session-token", headers: { host: "evil.example" } });
+  ok(rebindHost.status === 403, "GET /api/session-token with a hostile Host header (DNS-rebind) → 403");
+  const rebindHostPort = await httpReq(PORT, { path: "/api/session-token", headers: { host: "attacker.tld:8400" } });
+  ok(rebindHostPort.status === 403, "GET /api/session-token with a hostile Host:port → 403");
+  const rebindOrigin = await httpReq(PORT, { path: "/api/session-token", headers: { origin: "http://evil.example" } });
+  ok(rebindOrigin.status === 403, "GET /api/session-token with a hostile Origin → 403");
+  const loopbackHost = await httpReq(PORT, { path: "/api/session-token", headers: { host: `localhost:${PORT}` } });
+  ok(loopbackHost.status === 200, "GET /api/session-token with a loopback Host (localhost) → 200 (local dashboard unaffected)");
+
   // ── WS upgrade auth ──────────────────────────────────────────────────────
   const wsPath = `/ws/terminal?project=x&agent=head`;
   const foreign = await tryWs(`ws://127.0.0.1:${PORT}${wsPath}&token=${token}`, { origin: "http://evil.example" });

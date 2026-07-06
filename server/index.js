@@ -73,12 +73,13 @@ app.get("/api/health", (_req, res) => {
 });
 
 // #968: hand the shared session token to the LOCAL dashboard only, so it can
-// auto-attach it to WS + PTY-write calls with no operator action. Non-localhost
-// callers (tailnet/LAN) get 403 and must configure the token out-of-band — the
-// token is never leaked off-box. `req.ip` is the real socket address because we
-// deliberately do NOT trust proxy headers.
+// auto-attach it to WS + PTY-write calls with no operator action. The guard
+// checks socket IP + Host + Origin are all loopback (see isLocalTokenRequest)
+// so a DNS-rebinding page or a same-host reverse proxy can't pull the token to
+// a remote origin. Non-loopback (tailnet/LAN/proxied) callers get 403 and must
+// configure the token out-of-band — it is never leaked off-box.
 app.get("/api/session-token", (req, res) => {
-  if (!isLocalhost(req.ip)) return res.status(403).json({ error: "Local access only" });
+  if (!isLocalTokenRequest(req)) return res.status(403).json({ error: "Local access only" });
   res.json({ token: SESSION_TOKEN });
 });
 
@@ -97,6 +98,36 @@ function safeWrite(term, data) {
 
 function isLocalhost(ip) {
   return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
+
+// True when `host` (an `Origin`/`Host` header value, "name[:port]") resolves to
+// a loopback name. Used to keep the session token on-box.
+function isLoopbackHostHeader(host) {
+  if (!host) return false;
+  let hostname;
+  try { hostname = new URL(`http://${host}`).hostname; } catch { return false; }
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+}
+
+// #968 (hardened per review): the session token is a bearer secret, so only
+// hand it to a request that is unambiguously this machine's own loopback.
+// `req.ip` alone is insufficient — a DNS-rebinding page (attacker domain rebound
+// to 127.0.0.1) or a same-host reverse proxy keeps `req.ip` at 127.0.0.1 while
+// the browser's Host/Origin is a REMOTE name. Require the socket IP AND the Host
+// header AND the Origin (when the browser sends one) to all be loopback.
+// Remote/proxied/tailnet access uses the out-of-band localStorage token instead.
+function isLocalTokenRequest(req) {
+  if (!isLocalhost(req.ip)) return false;
+  if (!isLoopbackHostHeader(req.headers.host)) return false;
+  // Origin (present on cross-origin/CORS requests) is a full URL, not a bare
+  // host — parse it directly and require loopback too.
+  const origin = req.headers.origin;
+  if (origin) {
+    let o;
+    try { o = new URL(origin); } catch { return false; }
+    if (o.hostname !== "127.0.0.1" && o.hostname !== "localhost" && o.hostname !== "::1") return false;
+  }
+  return true;
 }
 
 // A cross-origin web page CAN open a WebSocket to 127.0.0.1 (browsers don't
