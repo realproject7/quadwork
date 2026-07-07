@@ -84,6 +84,45 @@ The operator server speaks to `127.0.0.1:8400` — the loopback of **whatever ma
 
 > ⚠️ **A local Claude Desktop registration reaches THIS device's `127.0.0.1`, not the VPS.** Use SSH or a port-forward so the client and QuadWork share a loopback.
 
+### Remote / VPS troubleshooting
+
+`quadwork-mcp-operator --port 8400` **always** connects to `127.0.0.1:8400` of the machine where that command runs (see [Remote / VPS registration](#remote--vps-registration) above). Most VPS confusion comes from expecting a *direct* connection to the VPS's public IP — which is deliberately closed.
+
+**Expected failures — these are normal, not bugs:**
+
+- `nc -vz <vps-ip> 8400` → *connection refused*, and a browser to `http://<vps-ip>:8400` failing, are **expected** when the backend binds VPS loopback only (the default). Nothing is broken — the port is simply not exposed publicly.
+- **Do not open port 8400 publicly to "fix" this.** The backend is not meant to be a public, internet-facing auth boundary; exposing it is a security regression. Forward it over SSH instead.
+
+**The fix — forward the port over SSH, then connect to the local loopback:**
+
+```bash
+ssh -N -L 8400:127.0.0.1:8400 <ssh-alias-or-user@vps>
+# then, in another local shell:
+quadwork-mcp-operator --port 8400   # now reaches the VPS via the forwarded 127.0.0.1:8400
+```
+
+`-N` opens the tunnel without starting a remote shell; `-L 8400:127.0.0.1:8400` maps your **local** `127.0.0.1:8400` onto the VPS's loopback `8400`. (Alternatively, run the MCP client over SSH *on* the VPS, as in option 1 above — then no forward is needed.)
+
+**Verify each layer independently, bottom-up:**
+
+```bash
+ssh -G <alias> | sed -n '1,20p'           # 1. confirm the alias's user + hostname
+lsof -iTCP:8400 -sTCP:LISTEN -n -P        # 2. is something listening on local 8400 (the tunnel)?
+quadwork-mcp-operator --port 8400         # 3. end-to-end: list_projects should return
+```
+
+> ⚠️ **`ssh <alias>` and `ssh <ip>` can resolve to different users and identity files.** `ssh -G quadwork` may report `user quadwork`, while `ssh -G 178.x.x.x` falls back to your **local** username — so a direct-IP check can silently test the wrong login. Always confirm with `ssh -G` before assuming you're reaching the intended VPS account.
+
+**Symptom → cause → fix:**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `nc -vz <vps-ip> 8400` → refused | Backend binds VPS loopback only (expected) | Not a bug — use the SSH tunnel; do **not** expose 8400 publicly |
+| MCP client can't reach QuadWork from your laptop | The client hits **your laptop's** `127.0.0.1`, not the VPS | `ssh -N -L 8400:127.0.0.1:8400 <vps>`, then rerun the client |
+| `nc -vz <vps-ip> 22` works but MCP still fails | SSH host reachable, but no forward for 8400 | Add `-L 8400:127.0.0.1:8400` (or run the client on the VPS) |
+| `ssh <ip>` uses the wrong user | Direct IP uses your **local** username, not the alias's | Use the alias (`ssh quadwork`) or `user@ip`; confirm with `ssh -G` |
+| stdio JSON-RPC returns nothing | Pipe closed before the server wrote its responses | Keep the trailing `sleep` in the [stdio examples](#direct-stdio-json-rpc-invocation) below (raise it on slow links) |
+
 ## Direct stdio JSON-RPC invocation
 
 Use this only when your MCP client does not surface tools directly, or when you
@@ -107,6 +146,10 @@ The minimal flow is:
 
 Each request is one JSON object. The examples below write newline-delimited
 JSON-RPC requests and pipe them into the installed bin.
+
+The trailing `sleep` in each example keeps stdin open long enough for the MCP
+server to write its responses before the pipe closes — without it you may see
+no output. Raise it for slower links or heavier calls.
 
 ### List projects / verify connection
 
