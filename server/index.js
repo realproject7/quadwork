@@ -12,6 +12,7 @@ const fileChat = require("./file-chat");
 const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./pty-dispatcher");
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
+const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
@@ -789,6 +790,37 @@ async function stopAgentSession(key, { clearSelfHeal = false } = {}) {
   session.exitedUnexpectedly = false;
   const [projectId, agentId] = key.split("/");
   if (projectId && agentId) stopMcpProxy(projectId, agentId);
+  // #957: teardown is a known-safe moment to sweep stale backend temp. It's
+  // deferred (setImmediate) so it never blocks the stop path, and stale-only,
+  // so it never touches files a still-live agent on the shared /tmp/claude-{uid}
+  // is using. This only reads a session's OWN temp when that session is gone.
+  setImmediate(backendTempSweepTick);
+}
+
+// #957: sweep stale backend temp entries (/tmp/claude-{uid}, stray gemini
+// crash dumps). On hosts where /tmp has a per-user quota, unbounded Claude
+// temp eventually exhausts it and every Claude bash call fails silently with
+// exit 1 — see issue #957 for the full post-mortem. Runs on agent teardown and
+// on an hourly timer; opt-out / age via config.json
+// `temp_cleanup: { enabled, max_age_hours }`. The reentrancy guard stops a
+// teardown-triggered sweep from overlapping the periodic one.
+let _tempSweepRunning = false;
+function backendTempSweepTick() {
+  if (_tempSweepRunning) return;
+  _tempSweepRunning = true;
+  try {
+    const settings = tempCleanup.cleanupSettings(readConfig());
+    if (!settings.enabled) return;
+    const r = tempCleanup.sweepBackendTemp({ maxAgeHours: settings.maxAgeHours });
+    if (r.removed.length > 0) {
+      console.log(`[temp-cleanup] removed ${r.removed.length} stale entr${r.removed.length === 1 ? "y" : "ies"} (kept ${r.kept})`);
+    }
+    for (const e of r.errors) console.error(`[temp-cleanup] ${e}`);
+  } catch (err) {
+    console.error(`[temp-cleanup] sweep failed: ${err.message}`);
+  } finally {
+    _tempSweepRunning = false;
+  }
 }
 
 app.get("/api/agents", (_req, res) => {
@@ -2029,6 +2061,16 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   _reseedRetryHandle = setInterval(reseedRetryTick, RESEED_RETRY_INTERVAL_MS);
 }
 
+// #957: hourly stale-temp sweep, plus one at boot — a server that was down for
+// days should reclaim quota immediately, not an hour after start. The handle is
+// captured so shutdown() (#972) clears the timer on Ctrl+C / full reset.
+const TEMP_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+let _tempSweepHandle = null;
+if (!process.env.QUADWORK_SKIP_LISTEN) {
+  setImmediate(backendTempSweepTick);
+  _tempSweepHandle = setInterval(backendTempSweepTick, TEMP_SWEEP_INTERVAL_MS);
+}
+
 // #422 / quadwork#310: auto-continue after loop guard.
 //
 // Per opted-in project, poll AC's /api/status every 10s. When we see
@@ -2272,6 +2314,7 @@ function shutdown() {
   // Polling + watchdog timers.
   if (_autoStopHandle) { clearInterval(_autoStopHandle); _autoStopHandle = null; }
   if (_reseedRetryHandle) { clearInterval(_reseedRetryHandle); _reseedRetryHandle = null; }
+  if (_tempSweepHandle) { clearInterval(_tempSweepHandle); _tempSweepHandle = null; } // #957
   if (_watchdogHandle) { clearInterval(_watchdogHandle); _watchdogHandle = null; }
 
   // Trigger schedulers (clears each trigger's interval + duration timers).

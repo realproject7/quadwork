@@ -362,3 +362,12 @@ chmod 600 ~/.quadwork/.env
 14. Configure nginx reverse proxy + SSL
 15. Add HTTP basic auth
 16. Verify reboot survival: `sudo reboot`, then check `pm2 list`
+
+## Note: /tmp quotas and Claude temp
+
+Some VPS images mount `/tmp` with a per-user quota (`usrquota`). Claude Code
+accumulates temp under `/tmp/claude-{uid}`; if the quota fills up, every
+Claude bash command starts failing silently with exit 1 (see
+[troubleshooting](troubleshooting.md#every-claude-bash-command-fails-silently-exit-1-no-output)).
+QuadWork sweeps stale entries automatically (hourly + on agent teardown,
+72h age) — configurable via `temp_cleanup` in `~/.quadwork/config.json`.
