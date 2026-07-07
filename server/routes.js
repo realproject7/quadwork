@@ -4140,6 +4140,32 @@ function reseedAgentsMd(existingContent, freshContent) {
   };
 }
 
+// #966: Distinctive H2 headings that only appear in QuadWork's seeded
+// `templates/CLAUDE.md`. A worktree CLAUDE.md is treated as QuadWork-seeded
+// (and therefore safe to refresh) ONLY when it contains ALL of these — a
+// project's own hand-authored CLAUDE.md (e.g. this repo's, whose H2s are
+// "What is QuadWork", "Tech Stack", …) won't, so it is never clobbered. These
+// three headings have been stable across template versions, so a file seeded
+// by an older template is still recognized.
+const SEEDED_CLAUDE_SIGNATURE = Object.freeze([
+  "Multi-Agent System",
+  "GitHub Workflow",
+  "Communication Rules",
+]);
+
+// #966: True only when `content` is a QuadWork-seeded CLAUDE.md — i.e. it
+// carries every heading in SEEDED_CLAUDE_SIGNATURE (case-insensitive,
+// whitespace-normalized, same comparison the merger uses). Empty/foreign
+// content returns false so reseed leaves it untouched. Pure — no I/O.
+function _isSeededClaudeMd(content) {
+  if (!content || !content.trim()) return false;
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
+  const headings = new Set(
+    _splitAgentsMdSections(content).blocks.map((b) => norm(b.heading))
+  );
+  return SEEDED_CLAUDE_SIGNATURE.every((h) => headings.has(norm(h)));
+}
+
 // #854: Extract the reviewer token path from a worktree's existing AGENTS.md
 // so the re-seed substitution preserves a custom path instead of resetting
 // it to the default. The re1/re2 seed renders:
@@ -4359,6 +4385,36 @@ function _performReseedWrites(project, cfg, opts = {}) {
     reseeded.push(`${agentKey}/AGENTS.md`);
     if (merged.preservedHeadings.length > 0) {
       preserved[agentKey] = merged.preservedHeadings;
+    }
+
+    // #966: Refresh the worktree CLAUDE.md too — but ONLY when it is provably
+    // QuadWork-seeded, so a project's own hand-authored CLAUDE.md is never
+    // clobbered. Uses the same reseedAgentsMd merge (fresh template wins
+    // per-H2, operator-added H2 sections preserved). Missing or foreign
+    // CLAUDE.md is left byte-identical and recorded in `skipped`.
+    const claudeMd = path.join(wtDir, "CLAUDE.md");
+    if (!fs.existsSync(claudeMd)) {
+      skipped.push(`${agentKey}/CLAUDE.md (none)`);
+    } else {
+      let claudeExisting = "";
+      try { claudeExisting = fs.readFileSync(claudeMd, "utf-8"); } catch { claudeExisting = ""; }
+      if (!_isSeededClaudeMd(claudeExisting)) {
+        skipped.push(`${agentKey}/CLAUDE.md (not QuadWork-seeded)`);
+      } else {
+        const claudeSrc = path.join(TEMPLATES_DIR, "CLAUDE.md");
+        if (!fs.existsSync(claudeSrc)) {
+          skipped.push(`${agentKey}/CLAUDE.md (no template)`);
+        } else {
+          const freshClaude = fs.readFileSync(claudeSrc, "utf-8")
+            .replace(/\{\{project_name\}\}/g, dirName);
+          const mergedClaude = reseedAgentsMd(claudeExisting, freshClaude);
+          fs.writeFileSync(claudeMd, mergedClaude.content);
+          reseeded.push(`${agentKey}/CLAUDE.md`);
+          if (mergedClaude.preservedHeadings.length > 0) {
+            preserved[`${agentKey}/CLAUDE.md`] = mergedClaude.preservedHeadings;
+          }
+        }
+      }
     }
   }
   return { reseeded, skipped, preserved };
@@ -5101,6 +5157,8 @@ module.exports.isBatchActiveFromProgress = isBatchActiveFromProgress;
 // custom-section preservation contract is exercisable without spinning up a
 // real worktree. Pure function; no production callers outside this file.
 module.exports.reseedAgentsMd = reseedAgentsMd;
+// #966: expose the QuadWork-seeded CLAUDE.md predicate for unit tests.
+module.exports._isSeededClaudeMd = _isSeededClaudeMd;
 // #855: expose the per-agent target resolver + legacy-key map so the legacy
 // config (`reviewer1` / `reviewer2` / `t1..t3`) → canonical-template mapping
 // is exercisable without spinning up a real worktree. Pure helpers; no
