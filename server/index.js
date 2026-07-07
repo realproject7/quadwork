@@ -2231,6 +2231,84 @@ function runStartupMigrations(cfg) {
 
 }
 
+// #992: after a restart, respawn agents for projects that were MID-BATCH.
+// #972's shutdown kills agent PTYs cleanly on `pm2 restart` / local restart,
+// but nothing respawned them — so a project driving an active batch stayed
+// `missing` (no dev progress, no reviews) until an operator manually restarted
+// each of head/dev/re1/re2. That bit every v2.5.x upgrade. Here we restore ONLY
+// active-batch projects; idle projects still spawn agents on demand
+// (terminal-connect / batch-start) exactly as before.
+//
+// "Active batch" comes from the SAME getOrComputeBatchProgress +
+// isBatchActiveFromProgress source the /api/batch-active route and the
+// auto-reseed gate use — no new batch/pulse logic. Opt out via config.json
+// `restart_respawn: { enabled: false }` (defaults on).
+//
+// Fail-SAFE direction is the inverse of auto-reseed's fail-CLOSED gate: if we
+// can't prove a batch is active (the check throws or returns null), we do
+// NOTHING and never spawn, so an idle project is never disturbed. Dependencies
+// are injected (getProgress / isActiveFromProgress / spawnAgentPty / log)
+// exactly like autoReseedOnStartup so tests need neither gh nor a real pty.
+async function respawnActiveBatchAgents(cfg, opts = {}) {
+  const log = opts.log || ((m) => console.log(m));
+  const getProgress = opts.getProgress || routes.getOrComputeBatchProgress;
+  const isActiveFromProgress = opts.isActiveFromProgress || routes.isBatchActiveFromProgress;
+  const spawn = opts.spawnAgentPty || spawnAgentPty;
+  const sessions = opts.agentSessions || agentSessions;
+  const decisions = [];
+
+  if (cfg && cfg.restart_respawn && cfg.restart_respawn.enabled === false) {
+    log("[respawn] disabled via config (restart_respawn.enabled: false)");
+    return { decisions };
+  }
+
+  const projects = (cfg?.projects || []).filter((p) => p && p.id && p.working_dir);
+  for (const project of projects) {
+    let active;
+    try {
+      const progress = await getProgress(project.id);
+      active = isActiveFromProgress(progress);
+    } catch (err) {
+      // Fail-safe: an unknowable batch state means DON'T spawn (never disturb
+      // a possibly-idle project). Logged so the skip is observable.
+      decisions.push({ projectId: project.id, action: "skip", reason: `batch-state check threw: ${err.message}` });
+      log(`[respawn] ${project.id}: skipped — batch state unknown (${err.message})`);
+      continue;
+    }
+    if (!active) { // false (no active batch) OR null (unknown) → leave alone
+      decisions.push({ projectId: project.id, action: "skip", reason: active === null ? "batch state unknown" : "no active batch" });
+      continue;
+    }
+
+    // Reuse the project's configured agent keys (covers legacy layouts); fall
+    // back to the canonical four. spawnAgentPty resolves cwd per agent and
+    // returns {ok:false} for an unknown one, so a stray key can't crash boot.
+    const agentKeys = project.agents && typeof project.agents === "object"
+      ? Object.keys(project.agents)
+      : ["head", "re1", "re2", "dev"];
+    const restored = [];
+    for (const agentId of agentKeys) {
+      const key = `${project.id}/${agentId}`;
+      // Idempotent: never double-spawn an agent already live (e.g. one a
+      // terminal-connect raced in first).
+      const existing = sessions.get(key);
+      if (existing && isPtyAlive(existing.term)) continue;
+      try {
+        const r = await spawn(project.id, agentId, { suppressLifecycleMsg: true });
+        if (r && r.ok) restored.push(agentId);
+        else log(`[respawn] ${key}: spawn failed: ${(r && r.error) || "unknown error"}`);
+      } catch (err) {
+        log(`[respawn] ${key}: spawn threw: ${err.message}`);
+      }
+    }
+    if (restored.length > 0) {
+      log(`[respawn] ${project.id}: active batch — restored agents: ${restored.join(", ")}`);
+    }
+    decisions.push({ projectId: project.id, action: "respawned", agents: restored });
+  }
+  return { decisions };
+}
+
 if (!process.env.QUADWORK_SKIP_LISTEN) {
   // #974: a second `quadwork start` (or anything already bound to PORT) makes
   // server.listen emit 'error'; with no handler Node throws the raw EADDRINUSE
@@ -2295,6 +2373,15 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
     console.error(`[reseed] auto-reseed failed: ${err.message}`);
   }
 
+  // #992: restore agents for any project mid-batch (see fn comment). Runs
+  // AFTER auto-reseed (which defers active-batch projects, so their seeds are
+  // untouched) and must never block boot.
+  try {
+    await respawnActiveBatchAgents(startupCfg);
+  } catch (err) {
+    console.error(`[respawn] restart respawn failed: ${err.message}`);
+  }
+
   if (startupCfg.butler && startupCfg.butler.enabled && startupCfg.butler.auto_start) {
     const result = spawnButlerPty();
     if (result.ok) console.log(`[butler] auto-started (PID: ${result.pid})`);
@@ -2348,3 +2435,4 @@ function shutdown() {
 
 module.exports = { shutdown, buildAgentArgs, buildAgentEnv, isPtyAlive, watchdogCheck, markSessionExited };
 module.exports.agentSessions = agentSessions; // #972: test seam for shutdown() PTY cleanup
+module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
