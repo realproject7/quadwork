@@ -13,6 +13,12 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     { value: "gpt-5.4", label: "gpt-5.4" },
     { value: "gpt-5", label: "gpt-5" },
     { value: "gpt-4o", label: "gpt-4o" },
+    // #999: GPT-5.6 Sol/Terra/Luna — new concrete slugs. Appended AFTER the
+    // existing rows so modelsForBackend("codex")[0] stays "gpt-5.4" (the #931
+    // default/heal target). Same append pattern as the #958 Fable-5 row.
+    { value: "gpt-5.6-sol", label: "gpt-5.6-sol" },
+    { value: "gpt-5.6-terra", label: "gpt-5.6-terra" },
+    { value: "gpt-5.6-luna", label: "gpt-5.6-luna" },
   ],
   claude: [
     { value: "", label: "(CLI default)" },
