@@ -31,6 +31,7 @@ const ok = (c, m) => {
 // ── optionsForBackend: raw lists incl. the "" CLI-default row ──
 ok(optionsForBackend("codex").some((o) => o.value === ""), "optionsForBackend(codex) includes the (CLI default) row");
 ok(optionsForBackend("codex").some((o) => o.value === "gpt-5.4"), "optionsForBackend(codex) lists codex models");
+ok(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].every((s) => optionsForBackend("codex").some((o) => o.value === s)), "#999: optionsForBackend(codex) includes the GPT-5.6 Sol/Terra/Luna slugs");
 ok(optionsForBackend("nope").length === 1 && optionsForBackend("nope")[0].value === "", "optionsForBackend(unknown) → single CLI-default row");
 
 // ── modelsForBackend: concrete (non-"") options, claude fallback ──
