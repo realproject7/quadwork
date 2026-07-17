@@ -89,10 +89,10 @@ codex
 npm install -g quadwork@latest
 ```
 
-Verify:
+Verify the install:
 ```bash
-quadwork --version
-# You should see the version number (e.g., 1.14.5)
+npm list -g quadwork
+# You should see the installed version, e.g. quadwork@2.7.0
 ```
 
 ### Troubleshooting: `EACCES: permission denied`
@@ -136,45 +136,41 @@ quadwork init
 quadwork start
 ```
 
-You should see output like:
-```
-QuadWork dashboard: http://localhost:8400
-```
-
-Open the dashboard URL in your browser to access the web UI.
+The dashboard starts on `http://127.0.0.1:8400` (the server binds loopback
+only). QuadWork opens that URL in your default browser automatically; if it
+doesn't, open it yourself to reach the web UI.
 
 ---
 
 ## Create Your First Project
 
-1. Open the dashboard at `http://localhost:8400`
+1. Open the dashboard at `http://127.0.0.1:8400`
 2. Click **"+ New Project"** or navigate to `/setup`
 3. Fill in the project details:
    - **Name:** Your project name
    - **Repo:** GitHub repo in `owner/repo` format
    - **Working directory:** Absolute path to the repo clone
-   - **Agent backends:** Choose Claude, Codex, or Gemini for each agent role
+   - **Agent backends & models:** In the **Agent Models** step, pick a CLI
+     backend — **Claude Code**, **Codex**, or **Gemini CLI** — for each of the
+     four roles (Head, Dev, RE1, RE2), and optionally select a specific model
+     per role (e.g. `opus` / `sonnet` for Claude, `gpt-5.4` / `gpt-5.6-*` for
+     Codex, `gemini-2.5-pro` / `gemini-2.5-flash` for Gemini). Leave a role on
+     **(CLI default)** to use the backend's own default model.
 4. Click **Create**
 
 QuadWork will:
-- Create worktree directories for each agent (e.g., `project-head/`, `project-dev/`, `project-re1/`, `project-re2/`)
-- Seed AGENTS.md files for each role
+- Create a git worktree for each agent next to your repo (e.g., `project-head/`, `project-dev/`, `project-re1/`, `project-re2/`)
+- Seed `AGENTS.md` and `CLAUDE.md` into each role's worktree
 
 ---
 
 ## Trust Prompt (Claude Code)
 
-On first launch, Claude Code agents may get stuck at a "Do you trust this directory?" prompt. QuadWork v1.14.5+ automatically pre-trusts worktree directories for Claude-configured agents during project creation.
-
-**If agents are still stuck** (e.g., upgraded from an older version), manually pre-trust each worktree:
-
-```bash
-# Run in each worktree directory
-cd /path/to/project-head && claude -p "echo ok"
-cd /path/to/project-dev && claude -p "echo ok"
-cd /path/to/project-re1 && claude -p "echo ok"
-cd /path/to/project-re2 && claude -p "echo ok"
-```
+On first launch, Claude Code shows a "Do you trust this directory?" prompt.
+QuadWork auto-answers it: when an agent's terminal starts, a listener watches
+its output for the trust prompt (within the first few seconds) and confirms it
+automatically, so Claude-backed agents reach a trusted session with no operator
+action. No manual pre-trust step is required.
 
 ---
 
