@@ -254,9 +254,6 @@ Queue contract and full state vocabulary: **[docs/review-batches.md](docs/review
 
 QuadWork stands on top of some great open-source work. Explicit thanks:
 
-- **[AgentChattr](https://github.com/bcurts/agentchattr)** — by [@bcurts](https://github.com/bcurts).
-  QuadWork's file-based chat system was originally inspired by AgentChattr.
-  Thanks to bcurts for the foundational ideas.
 - **[GitHub CLI (`gh`)](https://cli.github.com)** — used by all four agents
   for issues, PRs, reviews, and merges.
 - **[Claude Code](https://github.com/anthropics/claude-code)** — Anthropic's
