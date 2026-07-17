@@ -6,20 +6,21 @@ Common issues and fixes, structured as **Symptom > Cause > Fix**. Searchable by 
 
 ## Claude Code trust prompt blocking agents
 
-**Symptom:** Claude Code agents hang on startup. Terminal shows "Do you trust the files in this folder?" and waits for input indefinitely.
+**Symptom:** A Claude Code agent hangs on startup. Its terminal shows "Do you trust the files in this folder?" and waits for input.
 
-**Cause:** Claude Code requires explicit directory trust before running. The `--dangerously-skip-permissions` flag skips permission prompts but does NOT skip the trust gate.
+**Cause:** Claude Code requires explicit directory trust before running, and `--dangerously-skip-permissions` skips permission prompts but NOT the trust gate. QuadWork pre-trusts each Claude-backed agent's worktree automatically during project creation, by running `claude -p` in it once, so the prompt normally never appears. A hang means that pre-trust didn't complete for this worktree — e.g. `claude` wasn't on `PATH` when the project was created, the worktree was recreated afterward, or the pre-trust timed out.
 
-**Fix:** Pre-trust each worktree directory:
+**Fix:** Re-trust the affected worktree(s) manually, then restart the agent from the dashboard:
 
 ```bash
-cd /path/to/project-dev && claude -p "echo ok"
-cd /path/to/project-head && claude -p "echo ok"
-cd /path/to/project-re1 && claude -p "echo ok"
-cd /path/to/project-re2 && claude -p "echo ok"
+# Run once in each affected worktree
+cd /path/to/<project>-head && claude -p "echo ok"
+cd /path/to/<project>-dev  && claude -p "echo ok"
+cd /path/to/<project>-re1  && claude -p "echo ok"
+cd /path/to/<project>-re2  && claude -p "echo ok"
 ```
 
-QuadWork v1.14.5+ automatically pre-trusts worktree directories for Claude-configured agents during project creation. If upgrading from an older version, run the commands above once.
+This is the same command QuadWork runs at project creation; it writes the trust record so the agent's next launch skips the prompt. Re-running project setup also re-applies the pre-trust.
 
 ---
 
@@ -66,16 +67,15 @@ QuadWork v1.14.5+ automatically pre-trusts worktree directories for Claude-confi
 
 **Symptom:** An agent doesn't respond to chat messages. Other agents can send and receive normally.
 
-**Cause:** PTY injection isn't delivering messages to the agent process. The agent's MCP shim may not be configured, or the agent process may not be running.
+**Cause:** Messages reach agents two ways — the chat MCP shim (`server/mcp-chat-shim.js`, exposing `chat_read` / `chat_send`) and PTY injection into the agent's terminal. If the agent process isn't running, or its shim failed to start, delivery stalls. The shim is wired into each agent **automatically at launch** — it isn't configured by hand.
 
 **Fix:**
 1. Check that the agent process is running:
    ```bash
    ps aux | grep -E "claude|codex|gemini"
    ```
-2. Verify the agent's MCP shim is configured in the project's agent settings
-3. Check the agent's terminal in the QuadWork dashboard for errors
-4. Restart the agent from the dashboard if needed
+2. Open the agent's terminal in the QuadWork dashboard and look for MCP errors (e.g. the `chat` server failing to connect) or a stuck prompt.
+3. Restart the agent from the dashboard — this relaunches its terminal and re-provisions the chat MCP shim.
 
 ---
 
