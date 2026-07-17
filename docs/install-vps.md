@@ -111,18 +111,26 @@ sudo apt-get update && sudo apt-get install -y gh
 ```bash
 npm install -g @anthropic-ai/claude-code
 npm install -g @openai/codex
+npm install -g @google/gemini-cli   # only if using Gemini agents
 ```
 
-All binaries (`claude`, `codex`, `quadwork`, `pm2`) live under `~/.nvm/versions/node/v24.x.x/bin/`.
+Install whichever backends your roles will use — each of the four roles can run
+Claude Code, Codex, or Gemini, chosen per role during setup. All binaries
+(`claude`, `codex`, `gemini`, `quadwork`, `pm2`) live under
+`~/.nvm/versions/node/v24.x.x/bin/`.
 
 ### Authenticate CLIs
 
-> **These are interactive steps.** The operator must run these via `ssh quadwork`:
+> **Operator-required, interactive steps.** These each open a browser or
+> one-time-code login and must be completed by the operator via `ssh quadwork`
+> — they cannot be done by an agent. Run only the ones for the backends you
+> installed:
 
 ```bash
 gh auth login     # Follow browser-based auth flow
 claude            # Follow login prompt
 codex             # Follow login prompt
+gemini            # Follow login prompt (only if using Gemini)
 ```
 
 **If migrating from an existing server**, copy auth configs instead:
@@ -143,34 +151,17 @@ ssh quadwork 'cd ~ && tar xzf /tmp/auth-backup.tar.gz && rm /tmp/auth-backup.tar
 npm install -g quadwork@latest
 ```
 
-Optional — pre-create config at `~/.quadwork/config.json`:
-
-```json
-{
-  "port": 3000,
-  "projects": []
-}
-```
-
-Run interactive setup:
+Run interactive setup — this creates `~/.quadwork/config.json`, prompts for the
+dashboard port (default **8400**), and configures your first project:
 
 ```bash
 quadwork init
 ```
 
----
-
-## Migrating from Older Versions (AgentChattr cleanup)
-
-If upgrading from a version that used AgentChattr (the separate Python/FastAPI chat service), remove its pm2 processes:
-
-```bash
-pm2 stop agentchattr-*
-pm2 delete agentchattr-*
-pm2 save
-```
-
-Chat is now file-based (JSONL + MCP shim) and no longer requires a separate service. You can also remove `agentchattr_url` and `agentchattr_dir` from `~/.quadwork/config.json` if present.
+The QuadWork server always binds **loopback only** (`127.0.0.1:8400`); the port
+is never opened to the public network directly. Remote access is added later
+(see [Remote Access](#remote-access)) via an SSH tunnel or an authenticated
+reverse proxy.
 
 ---
 
@@ -226,6 +217,53 @@ pm2 save                          # Save state (always do after start/stop)
 
 ---
 
+## Remote Access
+
+The QuadWork dashboard is a **control surface** — it drives agent terminals,
+chat, and batch state. Keep it behind authentication at all times, and never
+bind or expose the raw `127.0.0.1:8400` port to the public network. There are
+two supported ways to reach it from your laptop.
+
+### Option A — SSH local port-forward (recommended)
+
+The simplest and safest option: tunnel the loopback port over your existing SSH
+connection. Nothing is published publicly and your SSH key is the only
+credential.
+
+```bash
+# From your laptop
+ssh -L 8400:127.0.0.1:8400 quadwork
+```
+
+Leave that session open and browse to `http://127.0.0.1:8400` on your laptop.
+The request reaches QuadWork as a loopback call, so the dashboard works with no
+extra server configuration. This needs no domain, nginx, or basic-auth setup —
+skip the rest of this section unless you want a persistent public URL.
+
+### Option B — Authenticated public dashboard (nginx + SSL)
+
+Use this only if you need a persistent shared URL. It requires **both** an
+authenticating reverse proxy (Step 10 basic auth) **and** an allowlist entry so
+QuadWork accepts the proxied hostname — without the allowlist, QuadWork's
+loopback checks reject the forwarded `Host`/`Origin` and every terminal
+WebSocket dies.
+
+Add your domain to `~/.quadwork/config.json` (create the key if absent), then
+restart QuadWork with `pm2 restart quadwork`:
+
+```json
+{
+  "port": 8400,
+  "trusted_dashboard_hosts": ["app.example.com"],
+  "projects": []
+}
+```
+
+> `trusted_dashboard_hosts` takes effect **only** when the request truly arrives
+> via the on-box loopback proxy (nginx on `127.0.0.1`). It never lets a direct
+> remote connection through, and it is **not** a substitute for the Step 10
+> basic auth — configure both. Steps 9–10 build this authenticated proxy.
+
 ## Step 9: Domain + Nginx + SSL
 
 ### DNS
@@ -246,7 +284,7 @@ server {
     server_name app.example.com;
 
     location / {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:8400;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -352,16 +390,14 @@ chmod 600 ~/.quadwork/.env
 4. Install system packages: `git`, `apache2-utils`
 5. Install nvm + Node.js 24
 6. Install GitHub CLI
-7. Install Claude Code + Codex CLI
-8. Authenticate CLIs (gh, claude, codex)
+7. Install agent CLIs (Claude Code / Codex / Gemini CLI — those you'll use)
+8. Authenticate the installed CLIs (gh, claude, codex, gemini) — operator-required
 9. Install QuadWork + pm2
 10. Run `quadwork init`
 11. Create `~/start-quadwork.sh` wrapper script (loads nvm before exec)
 12. Start with pm2 wrapper, save, configure startup
-13. Set up DNS A record
-14. Configure nginx reverse proxy + SSL
-15. Add HTTP basic auth
-16. Verify reboot survival: `sudo reboot`, then check `pm2 list`
+13. Verify reboot survival: `sudo reboot`, then check `pm2 list`
+14. **Remote access:** either SSH-forward `ssh -L 8400:127.0.0.1:8400 quadwork` (recommended, nothing published), **or** for a persistent public URL: set `trusted_dashboard_hosts` in config, then DNS A record → nginx reverse proxy + SSL → HTTP basic auth (never expose the port unauthenticated)
 
 ## Note: /tmp quotas and Claude temp
 
