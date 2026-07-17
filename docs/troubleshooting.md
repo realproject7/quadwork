@@ -8,9 +8,19 @@ Common issues and fixes, structured as **Symptom > Cause > Fix**. Searchable by 
 
 **Symptom:** A Claude Code agent hangs on startup. Its terminal shows "Do you trust the files in this folder?" and waits for input.
 
-**Cause:** Claude Code requires explicit directory trust before running, and `--dangerously-skip-permissions` skips permission prompts but NOT the trust gate. QuadWork normally handles this for you: when an agent's terminal starts, a listener watches its output and auto-confirms the trust prompt within the first ~10 seconds. A hang means the prompt wasn't caught in that window (e.g. the agent was slow to render it, or was started outside the normal launch flow).
+**Cause:** Claude Code requires explicit directory trust before running, and `--dangerously-skip-permissions` skips permission prompts but NOT the trust gate. QuadWork pre-trusts each Claude-backed agent's worktree automatically during project creation, by running `claude -p` in it once, so the prompt normally never appears. A hang means that pre-trust didn't complete for this worktree — e.g. `claude` wasn't on `PATH` when the project was created, the worktree was recreated afterward, or the pre-trust timed out.
 
-**Fix:** Restart the agent from the QuadWork dashboard. The trust listener re-arms on the fresh terminal and answers the prompt automatically — no manual pre-trust step is required, and QuadWork no longer runs a separate `claude` pre-trust command.
+**Fix:** Re-trust the affected worktree(s) manually, then restart the agent from the dashboard:
+
+```bash
+# Run once in each affected worktree
+cd /path/to/<project>-head && claude -p "echo ok"
+cd /path/to/<project>-dev  && claude -p "echo ok"
+cd /path/to/<project>-re1  && claude -p "echo ok"
+cd /path/to/<project>-re2  && claude -p "echo ok"
+```
+
+This is the same command QuadWork runs at project creation; it writes the trust record so the agent's next launch skips the prompt. Re-running project setup also re-applies the pre-trust.
 
 ---
 
