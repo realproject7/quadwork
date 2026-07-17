@@ -2,7 +2,7 @@
 
 ## What is QuadWork
 
-A unified local dashboard for 4-agent coding teams. Embeds terminals, AgentChattr chat, and GitHub board in one browser tab. See `docs/PROPOSAL.md` for full spec.
+A unified local dashboard for 4-agent coding teams. Embeds terminals, the file-based project chat, and GitHub board in one browser tab. See `README.md` for the full product overview.
 
 ## Tech Stack
 
@@ -47,8 +47,8 @@ Reference: [plotlink at `pre-design-overhaul`](https://github.com/realproject7/p
 
 ## Dependencies
 
-- AgentChattr: external dependency, cloned to `~/.quadwork/agentchattr` and run via `.venv/bin/python run.py`
-- Telegram bridge: external (`realproject7/agentchattr-telegram`), optional
+- Chat: built-in file-based JSONL chat (`server/file-chat.js`), exposed to agents through an MCP shim (`server/mcp-chat-shim.js`) as the `chat_send` / `chat_read` tools — no external chat service
+- Telegram bridge: built-in and optional (`server/bridges/telegram.js`)
 - Any new shared module `require`d by Node runtime code (`bin/`, `server/`) must live under a shipped dir or be added to `package.json` `files` — otherwise it's missing from the published tarball and crash-loops on fresh install (#937/#939). `server/pack-smoke.test.js` guards this; CI (`.github/workflows/ci.yml`) runs the suite on every PR and push to main (#976).
 
 ## Running locally
