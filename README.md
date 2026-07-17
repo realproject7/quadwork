@@ -42,12 +42,14 @@ Step-by-step guides for setting up QuadWork, designed for both humans and AI cod
 ## What is QuadWork?
 
 **QuadWork** is a local-first, open-source automation framework that
-orchestrates a collaborative team of four autonomous AI agents — **Head, Dev,
-and two Reviewers** — to manage a complete, production-grade GitHub workflow.
-By enforcing strict safety rails such as mandatory two-person independent code
-reviews and branch protection, it allows solo founders and engineers to ship
-code 24/7 through a reliable "Issue → Branch → PR → Merge" loop while
-maintaining high code quality without manual oversight.
+orchestrates a team of four AI agents — **Head** (`@head`), **Dev** (`@dev`),
+and two reviewers, **RE1** (`@re1`) and **RE2** (`@re2`) — through a governed
+GitHub workflow. Work moves one ticket at a time: Head assigns an issue, Dev
+opens a branch and PR, RE1 and RE2 each review it independently, and Head
+merges only after both approve before moving to the next ticket. The two
+mandatory independent reviews keep the
+`Issue → Branch → PR → Review × 2 → Merge` loop deliberate rather than
+one-agent-straight-to-`main`.
 
 <video src="https://github.com/user-attachments/assets/d1f6f3d6-27de-4afb-9b58-9fe1f87cddb8" width="720" controls></video>
 
@@ -63,16 +65,16 @@ Issue → Branch → PR → Review × 2 → Merge
   └──────── next ticket ───────────────┘
 ```
 
-Head creates issues and assigns them to Dev. Dev opens a PR. Reviewer 1
-and Reviewer 2 each review independently — approve, request changes, or
-veto. Dev iterates until both approve. Head merges and picks the next
-ticket. The cycle repeats autonomously until the batch is complete.
+Head creates issues and assigns them to Dev one at a time. Dev opens a
+PR. RE1 and RE2 each review it independently — approve, request changes,
+or veto. Dev iterates until both approve. Head merges and picks the next
+ticket. The cycle repeats until the batch queue is empty.
 
 ### Core Value Proposition
 
-- **Autonomous Reliability:** Runs overnight batches using a scheduled trigger, so you can wake up to a queue of successfully merged pull requests.
-- **Multi-Agent Governance:** Unlike single-agent tools, QuadWork uses a system of checks and balances where agents must convince each other through code review before merging to `main`.
-- **Privacy & Control:** Operates as a local Express server on your machine, managing your configured LLMs (Claude, OpenAI, Gemini) and GitHub CLI sessions without third-party proxying.
+- **Unattended batches:** A scheduled trigger advances the queue one ticket at a time, so you can kick off a batch and check back on the PRs it worked through.
+- **Multi-Agent Governance:** Unlike single-agent tools, QuadWork uses a system of checks and balances where a PR must clear two independent reviews before merging to `main`.
+- **Privacy & Control:** Operates as a local Express server on your machine, driving your configured Codex, Claude, or Gemini CLIs and GitHub CLI sessions without third-party proxying.
 - **Complete Visibility:** Features a comprehensive 4-quadrant dashboard with real-time agent terminals, chat history, and progress tracking.
 
 ## Why QuadWork?
@@ -113,13 +115,14 @@ GitHub-native workflow on them:
 
 | Agent | Role | What it does |
 |-------|------|-------------|
-| **Head** | Coordinator | Creates issues, assigns tasks, merges approved PRs |
-| **Dev** | Builder | Writes code, opens PRs, addresses review feedback |
-| **Reviewer1** | Reviewer | Independent code review with veto authority |
-| **Reviewer2** | Reviewer | Independent code review with veto authority |
+| **Head** (`@head`) | Coordinator | Creates issues, assigns them one at a time, merges approved PRs |
+| **Dev** (`@dev`) | Builder | Writes code, opens PRs, addresses review feedback |
+| **RE1** (`@re1`) | Reviewer | Independent code review with veto authority |
+| **RE2** (`@re2`) | Reviewer | Independent code review with veto authority |
 
-Every task follows the same cycle: **Issue → Branch → PR → 2 Reviews → Merge**.
-Branch protection ensures no agent can skip the process.
+Every task follows the same cycle: **Issue → Branch → PR → Review × 2 → Merge**.
+The two-review gate keeps any agent from merging to `main` unreviewed, and you
+can enable GitHub branch protection during setup as a server-side backstop.
 
 ### The full autonomous loop
 
@@ -136,15 +139,15 @@ Head: assigns the first issue to Dev
 Dev: opens a PR with code
      │
      ▼
-Reviewer1 + Reviewer2: independent reviews
+RE1 + RE2: independent reviews
      │
      ▼ (both approve)
 Head: merges, picks the next issue
      │
-     └──── repeat overnight ────┐
+     └──── repeat per ticket ───┐
                                 │
                                 ▼
-                       You wake up to merged PRs
+                       You return to merged PRs
 ```
 
 ### A concrete example
@@ -152,10 +155,10 @@ Head: merges, picks the next issue
 1. You drop a batch of 5 related tickets into chat: `@head start 5 sub-tickets under #123`.
 2. Head files the 5 issues on GitHub, writes them to `OVERNIGHT-QUEUE.md`, and asks you to click **Start Trigger**.
 3. You click it, close the laptop, and sleep.
-4. The Scheduled Trigger pulses the agents every 15 minutes. Each pulse, Head assigns the next queued issue to Dev.
-5. Dev opens a PR. Reviewer1 + Reviewer2 each review independently — approve, request changes, or veto. Dev iterates until both approve.
+4. The Scheduled Trigger pulses the agents on a recurring interval you set (default 30 minutes). Each pulse, Head advances the queue — assigning the next issue only once the current ticket has merged.
+5. Dev opens a PR. RE1 + RE2 each review independently — approve, request changes, or veto. Dev iterates until both approve.
 6. Head merges and picks the next ticket. Loop until the queue is empty or the duration expires.
-7. You wake up to 5 merged PRs, a clean queue, and a chat transcript you can scroll.
+7. You return to up to 5 merged PRs, a clean queue, and a chat transcript you can scroll.
 
 ## ─ Features
 
@@ -182,8 +185,8 @@ Head: merges, picks the next issue
 
 ### Safety
 
-- 🚧 **GitHub branch protection** enforced on `main`
-- ✅ **2-of-2 reviewer approval** required before merge
+- 🚧 **GitHub branch protection** — optional server-side backstop on `main`, enabled from the setup wizard
+- ✅ **2-of-2 reviewer approval** — the agent workflow requires both reviewers to approve before merge
 - 🛑 **Sender lockdown** — chat POSTs can't impersonate an agent (`head`, `dev`, …) from the UI
 - 🗄️ **Auto-snapshot** of chat history to `~/.quadwork/{project}/history-snapshots/` with an in-dashboard **Restore** button
 
