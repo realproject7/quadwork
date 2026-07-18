@@ -4,7 +4,7 @@ QuadWork ships an **MCP operator server** — a stdio [Model Context Protocol](h
 
 It is the same surface a human operator uses from the dashboard, exposed as tools. It talks to the QuadWork backend over `http://127.0.0.1:<port>` (default **8400**) and is launched by the MCP client, **not** by QuadWork itself.
 
-> **The MCP client must run on the same machine as QuadWork.** The server only reaches `127.0.0.1:<port>` — see [Remote / VPS](#remote--vps-registration) below.
+> **The client and QuadWork must share a loopback.** The server only reaches `127.0.0.1:<port>`, so either run the MCP client on the same machine as QuadWork, or bridge the two with the SSH local port-forward in [Remote / VPS](#remote--vps-registration) below.
 
 ## Operating model — read this first
 
