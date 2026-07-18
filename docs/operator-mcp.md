@@ -1,6 +1,6 @@
-# Drive QuadWork from a Claude agent (Operator MCP)
+# Drive QuadWork from an MCP client (Operator MCP)
 
-QuadWork ships an **MCP operator server** — a stdio [Model Context Protocol](https://modelcontextprotocol.io) server that lets a Claude agent (Claude Code or Claude Desktop) **observe and drive** a running QuadWork instance: read team chat and batch progress, define and run overnight batches, and control individual agents.
+QuadWork ships an **MCP operator server** — a stdio [Model Context Protocol](https://modelcontextprotocol.io) server that lets any MCP-capable client (Claude Code, Claude Desktop, Codex, or another MCP agent) **observe and drive** a running QuadWork instance: read team chat and batch progress, define and run overnight batches, and control individual agents.
 
 It is the same surface a human operator uses from the dashboard, exposed as tools. It talks to the QuadWork backend over `http://127.0.0.1:<port>` (default **8400**) and is launched by the MCP client, **not** by QuadWork itself.
 
@@ -39,7 +39,7 @@ you act as the human operator by talking to them.
 
 ## Registration
 
-The package installs a dedicated bin, `quadwork-mcp-operator`. Always register with the bin (never a `<quadwork-dir>/server/...` path — that breaks on global/VPS installs).
+The package installs a dedicated bin, `quadwork-mcp-operator`. Always register with the bin (never a `<quadwork-dir>/server/...` path — that breaks on global/VPS installs). Every client launches the **same** command — `quadwork-mcp-operator --port <port>` — only the registration syntax differs. Examples for common clients follow; any MCP client that can launch a stdio server works the same way.
 
 ### Claude Code (local install)
 
@@ -48,6 +48,17 @@ claude mcp add quadwork -- quadwork-mcp-operator --port 8400
 ```
 
 Then, in a Claude Code session, the `list_projects`, `batch_status`, `start_batch`, … tools are available. Verify with `list_projects` — it should return your configured projects.
+
+### Codex CLI
+
+Codex registers MCP servers with `-c mcp_servers.<name>` config flags — the same mechanism QuadWork uses to attach its chat shim to Codex-backed agents:
+
+```bash
+codex -c 'mcp_servers.quadwork.command="quadwork-mcp-operator"' \
+      -c 'mcp_servers.quadwork.args=["--port","8400"]'
+```
+
+The `quadwork` tools are then available in the Codex session; verify with `list_projects`.
 
 ### Claude Desktop
 
@@ -68,7 +79,7 @@ Restart Claude Desktop. The QuadWork tools appear under the 🔌 tools menu.
 
 ### Remote / VPS registration
 
-The operator server speaks to `127.0.0.1:8400` — the loopback of **whatever machine the MCP client runs on**. If QuadWork runs on a VPS, a Claude Desktop registration on your laptop reaches **your laptop's** `127.0.0.1`, not the VPS. Two ways to register correctly:
+The operator server speaks to `127.0.0.1:8400` — the loopback of **whatever machine the MCP client runs on**. If QuadWork runs on a VPS, a local client registration on your laptop reaches **your laptop's** `127.0.0.1`, not the VPS. Two ways to register correctly:
 
 1. **Run Claude Code over SSH on the VPS host** — register there with the same command; it reaches the VPS's local QuadWork directly.
    ```bash
@@ -82,7 +93,7 @@ The operator server speaks to `127.0.0.1:8400` — the loopback of **whatever ma
    claude mcp add quadwork -- quadwork-mcp-operator --port 8400
    ```
 
-> ⚠️ **A local Claude Desktop registration reaches THIS device's `127.0.0.1`, not the VPS.** Use SSH or a port-forward so the client and QuadWork share a loopback.
+> ⚠️ **A local MCP-client registration reaches THIS device's `127.0.0.1`, not the VPS.** Use SSH or a port-forward so the client and QuadWork share a loopback.
 
 ### Remote / VPS troubleshooting
 
@@ -171,15 +182,15 @@ not fall back to SSH or HTTP endpoint calls.
 
 ### Read status and recent chat
 
-Replace `plotlink-ows` with the `id` returned by `list_projects`.
+Replace `myproject` with the `id` returned by `list_projects`.
 
 ```bash
 python3 - <<'PY'
 import json
 reqs = [
   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"operator-script","version":"1"}}},
-  {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"batch_status","arguments":{"project":"plotlink-ows"}}},
-  {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_chat","arguments":{"project":"plotlink-ows","limit":20}}},
+  {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"batch_status","arguments":{"project":"myproject"}}},
+  {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_chat","arguments":{"project":"myproject","limit":20}}},
 ]
 open('/tmp/qw-status.jsonl','w').write('\n'.join(json.dumps(r) for r in reqs) + '\n')
 PY
@@ -243,7 +254,7 @@ Each is 1–3 tool calls. Start every session with `list_projects` to get the
 
 **Start a code batch** — let HEAD plan and write the queue:
 1. `send_message(project, "@head start a batch for <feature>: #12 #15 #18")` — HEAD files issues + writes `OVERNIGHT-QUEUE.md`, then asks you to start.
-2. Kick it off: `start_batch(project, { interval_min: 15 })` for an overnight cadence (first pulse at T+interval), or `trigger_now(project)` for an immediate first pulse.
+2. Kick it off: `start_batch(project, { interval_min: 30 })` for an overnight cadence (30 min is the default; first pulse at T+interval), or `trigger_now(project)` for an immediate first pulse.
 3. Monitor (below).
 
 **Run a review batch** (review-only — no code, no merges). Just ask HEAD; it stamps the `**Batch type:**` marker — you never touch the queue:
