@@ -13,7 +13,7 @@ const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
-const { injectModeForCommand } = require("../src/lib/injectMode.js");
+const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 
@@ -654,6 +654,12 @@ async function spawnAgentPty(project, agent, opts = {}) {
       lastDims: null,
       state: "running",
       error: null,
+      // #1010: explicit backend identity for the session. The PTY dispatcher
+      // gates its bounded deferred-wake cap on this — Claude only, because only
+      // the Claude TUI repaints continuously while idle. Derived with the same
+      // helper the spawn/arg paths use, so "claude", "/usr/bin/claude" and
+      // "claude --foo" all resolve to "claude".
+      backend: cliBaseFromCommand(command),
       lastOutputAt: Date.now(),
       // #418: ring buffer of recent PTY output so reconnecting WS
       // clients see the terminal state instead of a blank panel.

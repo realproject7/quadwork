@@ -8,6 +8,37 @@ const IDLE_THRESHOLD_MS = 5000;
 const COALESCE_WINDOW_MS = 1000;
 const ACTIVE_SUPPRESSION_MS = 30000;
 
+// #1010: bounded deferred-wake deadline — a Claude-only escape hatch for the
+// starvation below. The Claude Code TUI repaints its status line ~5x/sec even
+// when idle, so the drain's idle timer (reset on every onData) never sees the
+// IDLE_THRESHOLD_MS gap and a deferred wake is starved indefinitely. This
+// deadline is NOT postponed by output. It is deliberately Claude-only: codex
+// and gemini TUIs go quiet between turns, so their defers already drain on
+// genuine quiescence, and a wall-clock deadline would instead barge into a
+// legitimately long streaming turn (build/test output). Idle-gap delivery stays
+// the preferred path for every backend; the cap only breaks the starvation.
+const MAX_DEFER_MS = 10000;
+
+// #1010: after a CAP-driven injection we have no evidence the agent's turn
+// ended — unlike an idle-gap drain, which proves quiescence. So a further cap
+// delivery for that key is held for the same window we already treat an agent's
+// own chat post as "probably still mid-turn" (#736). Held wakes are DEFERRED,
+// never dropped, so repeated mentions during one long turn cannot become a wake
+// storm — which matters because the loop guard pauses the whole project after 30
+// agent-to-agent messages and a paused guard stops wake dispatch entirely.
+const CAP_COOLDOWN_MS = ACTIVE_SUPPRESSION_MS;
+
+// #1010: the timings above are read through this indirection so the dispatcher
+// tests can run the repaint/cap/cooldown regressions at millisecond scale
+// instead of real seconds. Production never calls the setter.
+const DEFAULT_TIMINGS = {
+  idleThresholdMs: IDLE_THRESHOLD_MS,
+  maxDeferMs: MAX_DEFER_MS,
+  capCooldownMs: CAP_COOLDOWN_MS,
+  activeSuppressionMs: ACTIVE_SUPPRESSION_MS,
+};
+let _timings = { ...DEFAULT_TIMINGS };
+
 // Per-agent coalescing timers: key = "project/agent" → timeout handle
 const _coalesceTimers = new Map();
 
@@ -17,8 +48,21 @@ const _lastChatSentAt = new Map();
 // Per-agent pending wake flag: key = "project/agent" → true
 const _pendingWake = new Map();
 
-// Per-agent drain listeners: key = "project/agent" → { disposable, timeoutHandle }
+// Per-agent deferred-wake cycle state: key = "project/agent" →
+// { disposable, idleHandle, capHandle, capRearmed }. #1010: one object owns the
+// whole cycle (listener + both timers) so every terminal path disposes all of
+// it, and a timer that outlives its own cycle can be recognized as stale.
 const _drainListeners = new Map();
+
+// #1010: last CAP-driven injection per key = "project/agent" → epoch ms.
+// Idle-gap deliveries are NOT recorded — they prove the turn ended, so they are
+// not rate-limited.
+const _lastCapInjectedAt = new Map();
+
+// #1010: the delayed submit ("\r") timer per key = "project/agent" → handle.
+// Previously unowned, so stopping a session inside the submit delay left a
+// pending write against a dead term.
+const _submitTimers = new Map();
 
 /**
  * Dispatch a chat message to mentioned agents' PTYs.
@@ -59,9 +103,9 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
     // new turn within seconds. The scheduled trigger is now only a periodic
     // backstop, not the primary wake mechanism for direct assignments.
     const lastSent = _lastChatSentAt.get(key);
-    const recentlySent = lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS);
+    const recentlySent = lastSent && (Date.now() - lastSent < _timings.activeSuppressionMs);
     if (isAgentBusy(session) || recentlySent) {
-      queuePendingWake(key, session, deps);
+      queuePendingWake(key, session, agentSessions, deps);
       continue;
     }
 
@@ -70,60 +114,163 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
 }
 
 function isAgentBusy(session) {
-  return session.lastOutputAt && (Date.now() - session.lastOutputAt < IDLE_THRESHOLD_MS);
+  return session.lastOutputAt && (Date.now() - session.lastOutputAt < _timings.idleThresholdMs);
 }
 
 /**
- * Queue a pending wake using high-water mark (since_id).
- * Hooks term.onData to drain after idle period, with a fallback
- * timer so the wake fires even if no further PTY output arrives.
+ * #1010: may this session's deferred wake use the bounded cap?
+ *
+ * Claude only. `session.backend` is the CLI base name stamped on the session at
+ * spawn (server/index.js). A session without it — an older object, an error
+ * placeholder — is treated as NOT eligible, so the fail-safe direction is the
+ * pre-#1010 behavior (genuine-quiescence-only) rather than a barge-in.
  */
-function queuePendingWake(key, session, deps) {
+function capEligible(session) {
+  return !!session && session.backend === "claude";
+}
+
+/**
+ * Queue a pending wake for a busy/recently-active agent (#923: defer, never
+ * drop). One cycle per key: `term.onData` resets an idle timer, so the wake
+ * drains once the agent has been quiet for the idle window. For Claude a second
+ * timer — the #1010 cap — bounds the wait, because a continuously repainting
+ * TUI means the idle gap never arrives.
+ *
+ * @param {string} key - "project/agent"
+ * @param {object} session - the session that armed the cycle (for backend + term)
+ * @param {Map} agentSessions - re-resolved at fire time; the armed session may be dead by then
+ * @param {object} deps - { isLoopGuardPaused, safeWrite }
+ */
+function queuePendingWake(key, session, agentSessions, deps) {
   _pendingWake.set(key, true);
 
-  const drainFn = () => {
-    if (!_pendingWake.get(key)) {
-      cleanupDrainListener(key);
-      return;
-    }
-    _pendingWake.delete(key);
-    cleanupDrainListener(key);
-
-    // #923: fire the deferred wake unconditionally once the agent has been
-    // quiet for the idle window. Do NOT re-suppress on a recent send here — a
-    // standing-by agent that just posted (then ended its turn) would otherwise
-    // be stranded again, which is the exact stall this fix removes.
-    injectIntoTerm(session.term, buildInjectionPrompt(session.agentId), deps);
-  };
-
+  // A cycle is already armed for this key — the pending flag above is all a
+  // repeat mention needs. Do NOT arm a second listener or a second cap.
   if (_drainListeners.has(key)) return;
 
-  const state = { timeoutHandle: null };
+  const state = { disposable: null, idleHandle: null, capHandle: null, capRearmed: false };
+
+  // #1010: only the cycle currently registered under this key may drain. A
+  // timer that outlived its own cycle (replaced, cleaned up, or already
+  // delivered) holds a stale `state`, so it can never consume or dispose a
+  // later cycle's pending wake.
+  const isCurrentCycle = () => _drainListeners.get(key) === state;
+
+  // #1010: the session captured at arm time may have exited or been respawned
+  // before a timer fires. Re-resolve by key and require a live, running term —
+  // the same check the coalesce path already makes at fire time.
+  const resolveLive = () => {
+    const live = agentSessions.get(key);
+    return live && live.state === "running" && live.term ? live : null;
+  };
+
+  const deliver = (live) => {
+    _pendingWake.delete(key);
+    cleanupDrainListener(key);
+    injectIntoTerm(key, live.term, buildInjectionPrompt(live.agentId), deps);
+  };
+
+  // Shared preamble for both timers: returns the live session, or null if this
+  // cycle should simply stand down.
+  const claimCycle = () => {
+    if (!isCurrentCycle()) return null;
+    if (!_pendingWake.get(key)) {
+      cleanupDrainListener(key);
+      return null;
+    }
+    const live = resolveLive();
+    if (!live) {
+      _pendingWake.delete(key);
+      cleanupDrainListener(key);
+      return null;
+    }
+    return live;
+  };
+
+  const idleDrain = () => {
+    const live = claimCycle();
+    if (!live) return;
+
+    // #923: fire unconditionally once the agent has been quiet for the idle
+    // window. Do NOT re-suppress on a recent send here — a standing-by agent
+    // that just posted (then ended its turn) would otherwise be stranded again,
+    // which is the exact stall this path removes. The quiet gap IS the evidence
+    // the turn ended, so this delivery is not cooldown-limited either.
+    deliver(live);
+  };
+
+  const capDrain = () => {
+    const live = claimCycle();
+    if (!live) return;
+
+    // #1010: re-check eligibility against the LIVE session, not just the one
+    // that armed the cycle. If the agent was respawned onto another backend in
+    // the meantime, stand down and leave the wake to the idle-gap path — a cap
+    // must never inject into a codex/gemini turn. The cycle stays armed, so the
+    // pending wake is still delivered on genuine quiescence.
+    if (!capEligible(live)) return;
+
+    // #736: the cap must not preempt the deliberate active-send suppression
+    // window. If the agent posted recently it is probably still mid-turn, so
+    // re-arm ONCE for whatever remains of that window instead of barging in.
+    const lastSent = _lastChatSentAt.get(key);
+    const remainingSuppression = lastSent
+      ? _timings.activeSuppressionMs - (Date.now() - lastSent)
+      : 0;
+    if (!state.capRearmed && remainingSuppression > 0) {
+      state.capRearmed = true;
+      state.capHandle = setTimeout(capDrain, remainingSuppression);
+      return;
+    }
+
+    // #1010: hold — not drop — a cap delivery inside the cooldown window left
+    // by the previous cap injection. The pending flag stays set, so the wake is
+    // delivered when the window closes (or earlier, if the agent goes genuinely
+    // quiet and the idle timer wins).
+    const lastCap = _lastCapInjectedAt.get(key);
+    const remainingCooldown = lastCap ? _timings.capCooldownMs - (Date.now() - lastCap) : 0;
+    if (remainingCooldown > 0) {
+      state.capHandle = setTimeout(capDrain, remainingCooldown);
+      return;
+    }
+
+    _lastCapInjectedAt.set(key, Date.now());
+    deliver(live);
+  };
 
   function resetIdleTimer() {
-    if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
-    state.timeoutHandle = setTimeout(drainFn, IDLE_THRESHOLD_MS);
+    if (state.idleHandle) clearTimeout(state.idleHandle);
+    state.idleHandle = setTimeout(idleDrain, _timings.idleThresholdMs);
   }
 
-  // Start fallback timer immediately so drain fires even without further output
+  // Start the idle timer immediately so the drain fires even if no further PTY
+  // output arrives at all.
   resetIdleTimer();
 
-  const disposable = session.term.onData(() => {
+  // #1010: the cap deadline. Armed once per cycle, never reset by onData.
+  if (capEligible(session)) {
+    state.capHandle = setTimeout(capDrain, _timings.maxDeferMs);
+  }
+
+  state.disposable = session.term.onData(() => {
     resetIdleTimer();
   });
 
-  _drainListeners.set(key, { disposable, state });
+  _drainListeners.set(key, state);
 }
 
+// #1010: one lifecycle for the whole deferred-wake cycle — the onData listener
+// and BOTH timers. Leaving the cap timer armed is not a benign leak: the drain
+// only checks the pending flag, so a survivor would consume a later cycle's
+// wake and dispose its listener.
 function cleanupDrainListener(key) {
-  const listener = _drainListeners.get(key);
-  if (!listener) return;
-  if (listener.disposable && typeof listener.disposable.dispose === "function") {
-    listener.disposable.dispose();
+  const state = _drainListeners.get(key);
+  if (!state) return;
+  if (state.disposable && typeof state.disposable.dispose === "function") {
+    state.disposable.dispose();
   }
-  if (listener.state && listener.state.timeoutHandle) {
-    clearTimeout(listener.state.timeoutHandle);
-  }
+  if (state.idleHandle) clearTimeout(state.idleHandle);
+  if (state.capHandle) clearTimeout(state.capHandle);
   _drainListeners.delete(key);
 }
 
@@ -159,26 +306,33 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
     // goes quiet) rather than injecting mid-activity (#736). Crucially this
     // defers, it does NOT drop (#923) — the drain still delivers the wake.
     const lastSent = _lastChatSentAt.get(key);
-    const recentlySent = lastSent && (Date.now() - lastSent < ACTIVE_SUPPRESSION_MS);
+    const recentlySent = lastSent && (Date.now() - lastSent < _timings.activeSuppressionMs);
     if (isAgentBusy(session) || recentlySent) {
-      queuePendingWake(key, session, deps);
+      queuePendingWake(key, session, agentSessions, deps);
       return;
     }
 
-    injectIntoTerm(session.term, buildInjectionPrompt(agentId), deps);
+    injectIntoTerm(key, session.term, buildInjectionPrompt(agentId), deps);
   }, COALESCE_WINDOW_MS);
 
   state.timer = timer;
   _coalesceTimers.set(key, state);
 }
 
-function injectIntoTerm(term, text, deps) {
+// #1010: the delayed submit is owned per key so `cleanupSession` can cancel it.
+// Without an owner, stopping a session inside the submit delay left a pending
+// "\r" write against a term that was already killed.
+function injectIntoTerm(key, term, text, deps) {
   const flat = text.replace(/\n/g, " ");
   deps.safeWrite(term, flat);
   const submitDelayMs = Math.max(300, flat.length);
-  setTimeout(() => {
+  const previous = _submitTimers.get(key);
+  if (previous) clearTimeout(previous);
+  const handle = setTimeout(() => {
+    _submitTimers.delete(key);
     try { deps.safeWrite(term, "\r"); } catch {}
   }, submitDelayMs);
+  _submitTimers.set(key, handle);
 }
 
 /**
@@ -193,6 +347,14 @@ function cleanupSession(key) {
   _pendingWake.delete(key);
   _lastChatSentAt.delete(key);
   cleanupDrainListener(key);
+  // #1010: the delayed submit timer and the cap cooldown are part of this
+  // session's state — a stopped/respawned session must not inherit either.
+  const submit = _submitTimers.get(key);
+  if (submit) {
+    clearTimeout(submit);
+    _submitTimers.delete(key);
+  }
+  _lastCapInjectedAt.delete(key);
 }
 
 module.exports = {
@@ -203,7 +365,16 @@ module.exports = {
   _pendingWake,
   _drainListeners,
   _lastChatSentAt,
+  _lastCapInjectedAt,
+  _submitTimers,
   IDLE_THRESHOLD_MS,
   COALESCE_WINDOW_MS,
   ACTIVE_SUPPRESSION_MS,
+  MAX_DEFER_MS,
+  CAP_COOLDOWN_MS,
+  // #1010: lets the dispatcher tests run the repaint/cap/cooldown regressions at
+  // millisecond scale. Call with no argument to restore the shipped timings.
+  _setTimingsForTest: (overrides) => {
+    _timings = { ...DEFAULT_TIMINGS, ...(overrides || {}) };
+  },
 };
