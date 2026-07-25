@@ -33,6 +33,7 @@ fs.writeFileSync(
           gemini_default: { command: "gemini" },
           codex_agent: { command: "codex", model: "gpt-5" },
           claude_agent: { command: "claude", model: "opus" },
+          claude_opus5_agent: { command: "claude", model: "claude-opus-5" },
         },
       },
     ],
@@ -85,6 +86,17 @@ async function runTests() {
     // No regression: claude keeps --model <slug>.
     const { args } = await buildAgentArgs("p1", "claude_agent");
     assert(modelArg(args) === "opus", "claude still forwards --model <slug>");
+  }
+
+  {
+    // #1018: a Claude agent pinned to claude-opus-5 launches with that exact
+    // slug, and the pin does not disturb the permission / MCP arguments that
+    // share this branch.
+    const { args } = await buildAgentArgs("p1", "claude_opus5_agent");
+    assert(modelArg(args) === "claude-opus-5", "#1018: claude forwards the claude-opus-5 pin verbatim as --model <slug>");
+    assert(args.includes("--dangerously-skip-permissions"), "#1018: the pinned claude agent keeps its permission flag");
+    assert(args.includes("--mcp-config"), "#1018: the pinned claude agent keeps its --mcp-config MCP argument");
+    assert(args.indexOf("--mcp-config") + 1 < args.length && args[args.indexOf("--mcp-config") + 1].endsWith(".json"), "#1018: --mcp-config still points at a written config path");
   }
 
   try { fs.rmSync(TMP_HOME, { recursive: true, force: true }); } catch {}

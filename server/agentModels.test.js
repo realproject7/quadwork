@@ -33,6 +33,7 @@ ok(optionsForBackend("codex").some((o) => o.value === ""), "optionsForBackend(co
 ok(optionsForBackend("codex").some((o) => o.value === "gpt-5.4"), "optionsForBackend(codex) lists codex models");
 ok(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].every((s) => optionsForBackend("codex").some((o) => o.value === s)), "#999: optionsForBackend(codex) includes the GPT-5.6 Sol/Terra/Luna slugs");
 ok(optionsForBackend("nope").length === 1 && optionsForBackend("nope")[0].value === "", "optionsForBackend(unknown) → single CLI-default row");
+ok(optionsForBackend("claude").some((o) => o.value === "claude-opus-5"), "#1018: optionsForBackend(claude) includes the claude-opus-5 pin (both selection surfaces read this list)");
 
 // ── modelsForBackend: concrete (non-"") options, claude fallback ──
 ok(modelsForBackend("codex").every((o) => o.value !== ""), "modelsForBackend(codex) strips the (CLI default) row");
@@ -48,6 +49,17 @@ ok(effectiveModel("codex", "sonnet") === "gpt-5.4", "effectiveModel: a stale Cla
 ok(effectiveModel("codex", "") === "gpt-5.4", "effectiveModel: unset model defaults to the backend's first option (#931 AC2 — not 'sonnet')");
 ok(effectiveModel("claude", undefined) === "opus", "effectiveModel: undefined model defaults to the backend's first option");
 ok(effectiveModel("gemini", "gpt-5") === "gemini-2.5-pro", "effectiveModel: a cross-backend value resolves to the gemini first option");
+ok(effectiveModel("claude", "claude-opus-5") === "claude-opus-5", "#1018: effectiveModel displays the claude-opus-5 pin as-is (not the opus alias)");
+
+// ── #1018: deterministic placement. The pin must sit immediately after
+// claude-fable-5 and before the 4.x pins (newest pin first) — and never first,
+// so the #931 default/heal target above stays "opus".
+{
+  const claude = modelsForBackend("claude").map((o) => o.value);
+  ok(claude[claude.indexOf("claude-fable-5") + 1] === "claude-opus-5", "#1018: claude-opus-5 sits immediately after claude-fable-5");
+  ok(claude.indexOf("claude-opus-5") < claude.indexOf("claude-opus-4-8"), "#1018: claude-opus-5 precedes the Opus 4.x pins");
+  ok(claude.indexOf("opus") === 0, "#1018: the opus alias remains the first concrete Claude option");
+}
 
 // ── sanitizeModel: what gets PERSISTED on save ──
 ok(sanitizeModel("codex", "sonnet") === "gpt-5.4", "#931 core: saving a codex agent with 'sonnet' persists the first valid codex model");
@@ -55,6 +67,7 @@ ok(sanitizeModel("gemini", "opus") === "gemini-2.5-pro", "sanitizeModel heals a 
 ok(sanitizeModel("codex", "gpt-4o") === "gpt-4o", "sanitizeModel keeps an already-valid codex model");
 ok(sanitizeModel("claude", "claude-opus-4-8") === "claude-opus-4-8", "sanitizeModel keeps a valid pinned claude model");
 ok(sanitizeModel("claude", "claude-fable-5") === "claude-fable-5", "#958: sanitizeModel keeps claude-fable-5 (new family, not covered by the opus/sonnet aliases)");
+ok(sanitizeModel("claude", "claude-opus-5") === "claude-opus-5", "#1018: sanitizeModel keeps the claude-opus-5 pin (a saved pin is never healed to the alias)");
 ok(sanitizeModel("codex", "") === "", "sanitizeModel keeps '' (CLI default) — valid for every CLI, never clobbered");
 ok(sanitizeModel("gemini", undefined) === "", "sanitizeModel maps undefined → '' (CLI default), not a fabricated model");
 
@@ -73,6 +86,7 @@ ok(normalizeButler({ command: "codex", model: "" }).model === "", "#935: save() 
 ok(normalizeButler({ command: "claude", model: "opus" }).model === "opus", "#935: save() keeps an already-valid butler model");
 ok(normalizeButler({ command: "codex" }).model === "", "#935: save() maps an unset butler model → '' (CLI default), not a fabricated model");
 ok(normalizeButler(undefined) === undefined, "#935: save() leaves a missing butler config untouched");
+ok(normalizeButler({ command: "claude", model: "claude-opus-5" }).model === "claude-opus-5", "#1018: save() preserves a butler pinned to claude-opus-5 (Butler is the React-only surface, so this mirror is its only regression guard)");
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);
