@@ -461,6 +461,43 @@ async function runTests() {
     cleanupSession(KEY);
   }
 
+  // --- Test 20: #1010 — the per-cycle identity guard is load-bearing. A timer
+  //     that outlived its own cycle must not inject, must not dispose the cycle
+  //     that superseded it, and must not consume that cycle's pending wake.
+  //
+  //     @re2 on PR #1020: test 18b asserted this property but could not
+  //     discriminate it — by the time the cap drain returns, cleanupDrainListener
+  //     has already cleared both handles, so no stale timer ever exists and
+  //     replacing the guard with `() => true` left the suite green. This case
+  //     constructs the stale timer explicitly: arm a cycle, supersede it in
+  //     `_drainListeners` while its cap is still pending, then let that cap fire.
+  {
+    _setTimingsForTest({ idleThresholdMs: 800, maxDeferMs: 200, capCooldownMs: 0, activeSuppressionMs: 0 });
+    const { sessions, written, onDataCallbacks } = makeSessions({ backend: "claude", lastOutputAt: Date.now() });
+    const deps = makeDeps();
+    dispatchToAgentPTY("proj", makeMsg({ sender: "head" }), sessions, deps);
+    const stopRepaint = startRepaint(onDataCallbacks, 40);
+
+    // Supersede the armed cycle. Its cap timer is still pending and WILL fire.
+    let sentinelDisposed = false;
+    const sentinel = {
+      disposable: { dispose: () => { sentinelDisposed = true; } },
+      idleHandle: null,
+      capHandle: null,
+      capRearmed: false,
+    };
+    _drainListeners.set(KEY, sentinel);
+
+    await sleep(400); // past the superseded cycle's cap deadline
+    assert(prompts(written) === 0, "#1010 stale-cycle: a cap timer that outlived its cycle performs no injection");
+    assert(_drainListeners.get(KEY) === sentinel && !sentinelDisposed, "#1010 stale-cycle: it does not dispose the cycle that superseded it");
+    assert(_pendingWake.has(KEY), "#1010 stale-cycle: it does not consume the superseding cycle's pending wake");
+
+    stopRepaint();
+    _drainListeners.delete(KEY);
+    cleanupSession(KEY);
+  }
+
   // Restore the shipped timings so nothing after this block runs on test values.
   _setTimingsForTest();
   assert(MAX_DEFER_MS === 10000 && CAP_COOLDOWN_MS === ACTIVE_SUPPRESSION_MS, "#1010: shipped cap is 10s and the cap cooldown matches the active-suppression window");

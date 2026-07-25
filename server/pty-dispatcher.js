@@ -213,6 +213,14 @@ function queuePendingWake(key, session, agentSessions, deps) {
     // #736: the cap must not preempt the deliberate active-send suppression
     // window. If the agent posted recently it is probably still mid-turn, so
     // re-arm ONCE for whatever remains of that window instead of barging in.
+    //
+    // `capRearmed` is per-cycle and spent on first use, so total deferral is
+    // bounded by MAX_DEFER_MS + ACTIVE_SUPPRESSION_MS for a single post. An
+    // agent that posts AGAIN during the re-arm window is injected inside a fresh
+    // suppression window — deliberate: the alternative is re-arming per post,
+    // which a chatty agent could extend indefinitely, recreating the starvation
+    // this cap exists to bound. Safe because the cap is Claude-only and Claude
+    // queues input received mid-turn rather than interrupting.
     const lastSent = _lastChatSentAt.get(key);
     const remainingSuppression = lastSent
       ? _timings.activeSuppressionMs - (Date.now() - lastSent)
