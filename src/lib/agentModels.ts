@@ -33,6 +33,11 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     // first concrete row: modelsForBackend("claude")[0] ("opus") is the
     // default/heal target and must stay put (#931).
     { value: "claude-fable-5", label: "claude-fable-5" },
+    // #1018: Claude Opus 5 pin for operators who need a reproducible version
+    // rather than the moving `opus` alias (which already resolves to it). Sits
+    // after `claude-fable-5` and before the 4.x pins — newest pin first — and
+    // never first, so modelsForBackend("claude")[0] stays "opus" (#931).
+    { value: "claude-opus-5", label: "claude-opus-5" },
     { value: "claude-opus-4-8", label: "claude-opus-4-8" },
     { value: "claude-opus-4-7", label: "claude-opus-4-7" },
     { value: "claude-opus-4-6", label: "claude-opus-4-6" },
