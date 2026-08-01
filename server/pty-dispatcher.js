@@ -229,13 +229,20 @@ function queuePendingWake(key, session, agentSessions, deps) {
     // which a chatty agent could extend indefinitely, recreating the starvation
     // this cap exists to bound.
     //
-    // #1023: that residual injection is tolerable only because a cap-eligible
-    // TUI queues input received mid-turn rather than interrupting on it. That is
-    // established for Claude (#1010). For grok it is NOT yet verified — it is
-    // exactly what the ticket's post-merge PO step exercises by posting to a
-    // live idle grok agent — so this comment no longer claims the old
-    // "safe because the cap is Claude-only" rationale, which stopped being true
-    // the moment a second backend became eligible.
+    // That bounded barge-in is only acceptable because a cap-eligible TUI QUEUES
+    // input received mid-turn rather than interrupting on it — otherwise the cap
+    // would trade a starvation bug for turn corruption. This must be established
+    // per backend, not inherited: it is why the predicate is an explicit set and
+    // not "every backend that repaints".
+    //   - claude (#1010): queues.
+    //   - grok (#1023): queues. Verified by the PO against the CLI's own bundled
+    //     docs, `~/.grok/docs/user-guide/03-keyboard-shortcuts.md:182-183` — a
+    //     plain Enter WITH text in the composer queues a follow-up that runs
+    //     after the current turn ends; only a BARE Enter on an EMPTY composer
+    //     force-sends the top queued item, and cancel-and-send is a separate
+    //     chord. injectIntoTerm (:348-359) always writes the text before its
+    //     single "\r", so the composer is never empty when the CR lands and an
+    //     injection cannot cancel a running grok turn.
     const lastSent = _lastChatSentAt.get(key);
     const remainingSuppression = lastSent
       ? _timings.activeSuppressionMs - (Date.now() - lastSent)

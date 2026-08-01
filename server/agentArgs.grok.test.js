@@ -48,23 +48,31 @@ function git(cwd, args) {
 
 // --- Fixtures (built before the server module is required, so config.json can
 //     name their real paths) ---
+//
+// realpathSync is load-bearing, not tidiness: on macOS `os.tmpdir()` returns
+// /var/folders/…, a SYMLINK to /private/var/folders/…. git canonicalizes the
+// paths it reports, so an expected value built from the unresolved spelling
+// never matches what `git rev-parse` returns, and this suite went red for every
+// Mac operator while staying green on the Linux VPS and in CI. Canonicalizing
+// the fixture ROOT fixes the whole class — every path below derives from it.
 const FIX = path.join(TMP_HOME, "fixtures");
 fs.mkdirSync(FIX, { recursive: true });
+const FIX_REAL = fs.realpathSync(FIX);
 
 // 1. A REAL linked worktree, exactly how QuadWork creates agent cwds
 //    (server/routes.js: `git worktree add`). <cwd>/.git is a file here.
-const REPO = path.join(FIX, "repo");
+const REPO = path.join(FIX_REAL, "repo");
 fs.mkdirSync(REPO, { recursive: true });
 git(REPO, ["init", "-q"]);
 fs.writeFileSync(path.join(REPO, "README.md"), "fixture\n");
 git(REPO, ["add", "README.md"]);
 git(REPO, ["commit", "-q", "-m", "init"]);
-const WORKTREE = path.join(FIX, "wt");
+const WORKTREE = path.join(FIX_REAL, "wt");
 git(REPO, ["worktree", "add", "-q", "-b", "agent", WORKTREE]);
 
 // 2. A PLAIN CLONE — a non-worktree repo, which `git rev-parse
 //    --git-common-dir` answers with a RELATIVE ".git".
-const CLONE = path.join(FIX, "clone");
+const CLONE = path.join(FIX_REAL, "clone");
 fs.mkdirSync(CLONE, { recursive: true });
 git(CLONE, ["init", "-q"]);
 fs.writeFileSync(path.join(CLONE, "README.md"), "fixture\n");
@@ -73,12 +81,12 @@ git(CLONE, ["commit", "-q", "-m", "init"]);
 
 // 3. A plain directory that is not a git repo at all — the exclude step must
 //    degrade quietly rather than throwing and failing the spawn.
-const NOGIT = path.join(FIX, "nogit");
+const NOGIT = path.join(FIX_REAL, "nogit");
 fs.mkdirSync(NOGIT, { recursive: true });
 
 // 4. Scratch dir to chdir into for the plain-clone case, so a naive relative
 //    write lands HERE and not in the developer's/CI's own repo.
-const SCRATCH = path.join(FIX, "scratch");
+const SCRATCH = path.join(FIX_REAL, "scratch");
 fs.mkdirSync(SCRATCH, { recursive: true });
 
 const cfgDir = path.join(TMP_HOME, ".quadwork");
@@ -90,7 +98,7 @@ fs.writeFileSync(
     projects: [
       {
         id: "p1",
-        working_dir: FIX,
+        working_dir: FIX_REAL,
         agents: {
           grok_model: { command: "grok", model: "grok-4.5", cwd: WORKTREE },
           grok_default: { command: "grok", cwd: NOGIT },
@@ -183,8 +191,14 @@ async function runTests() {
   //        where <cwd>/.git is a FILE and a per-worktree exclude is not honored. ---
   {
     assert(fs.statSync(path.join(WORKTREE, ".git")).isFile(), "fixture is a REAL linked worktree (<cwd>/.git is a file, not a dir)");
+    // Both sides realpath'd as well as the root above: git's canonicalization is
+    // the thing under comparison here, so this assertion must not be able to
+    // fail on a path SPELLING difference on any platform.
     const common = commonDir(WORKTREE);
-    assert(common === path.join(REPO, ".git"), "#1023: the worktree's common dir is the MAIN repo's .git, not .git/worktrees/<name>");
+    assert(
+      fs.realpathSync(common) === fs.realpathSync(path.join(REPO, ".git")),
+      "#1023: the worktree's common dir is the MAIN repo's .git, not .git/worktrees/<name>",
+    );
     assert(excludeLines(WORKTREE).includes(".grok/"), "#1023 AC: .grok/ is written to the COMMON-dir exclude");
     const status = git(WORKTREE, ["status", "--porcelain"]);
     assert(!status.includes(".grok"), "#1023 AC: git status in the worktree does NOT list .grok/ — the token file can never be committed");
