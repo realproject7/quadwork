@@ -5,7 +5,6 @@ import { useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
 import { modelsForBackend, effectiveModel, sanitizeModel } from "@/lib/agentModels";
 import { injectModeForCommand } from "@/lib/injectMode";
-import { firstInstalledBackend } from "@/lib/defaultBackend";
 import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
@@ -717,10 +716,11 @@ export default function SettingsPage() {
     // claude/codex chain, which could only ever answer "claude" or "codex" — so
     // a grok-only machine seeded the uninstalled claude, and so did a
     // gemini-only one (the same pre-existing bug, fixed deliberately; see the
-    // ticket's operator ruling). Pinned by server/defaultBackend.test.js.
+    // ticket's operator ruling). A loop over the BACKENDS rows already rendered
+    // above, not a backend registry.
     const defaultCmd = configuredAvailable
       ? configured
-      : firstInstalledBackend(cliStatus, BACKENDS.map((b) => b.value));
+      : (cliStatus && BACKENDS.find((b) => cliStatus[b.value as keyof typeof cliStatus])?.value) || "claude";
     const agents: Record<string, AgentConfig> = {};
     for (const [key, val] of Object.entries(DEFAULT_AGENTS)) {
       agents[key] = { ...val, command: defaultCmd };

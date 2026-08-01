@@ -227,8 +227,15 @@ function queuePendingWake(key, session, agentSessions, deps) {
     // agent that posts AGAIN during the re-arm window is injected inside a fresh
     // suppression window — deliberate: the alternative is re-arming per post,
     // which a chatty agent could extend indefinitely, recreating the starvation
-    // this cap exists to bound. Safe because the cap is Claude-only and Claude
-    // queues input received mid-turn rather than interrupting.
+    // this cap exists to bound.
+    //
+    // #1023: that residual injection is tolerable only because a cap-eligible
+    // TUI queues input received mid-turn rather than interrupting on it. That is
+    // established for Claude (#1010). For grok it is NOT yet verified — it is
+    // exactly what the ticket's post-merge PO step exercises by posting to a
+    // live idle grok agent — so this comment no longer claims the old
+    // "safe because the cap is Claude-only" rationale, which stopped being true
+    // the moment a second backend became eligible.
     const lastSent = _lastChatSentAt.get(key);
     const remainingSuppression = lastSent
       ? _timings.activeSuppressionMs - (Date.now() - lastSent)
