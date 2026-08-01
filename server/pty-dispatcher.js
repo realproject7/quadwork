@@ -8,15 +8,20 @@ const IDLE_THRESHOLD_MS = 5000;
 const COALESCE_WINDOW_MS = 1000;
 const ACTIVE_SUPPRESSION_MS = 30000;
 
-// #1010: bounded deferred-wake deadline — a Claude-only escape hatch for the
-// starvation below. The Claude Code TUI repaints its status line ~5x/sec even
-// when idle, so the drain's idle timer (reset on every onData) never sees the
-// IDLE_THRESHOLD_MS gap and a deferred wake is starved indefinitely. This
-// deadline is NOT postponed by output. It is deliberately Claude-only: codex
-// and gemini TUIs go quiet between turns, so their defers already drain on
-// genuine quiescence, and a wall-clock deadline would instead barge into a
-// legitimately long streaming turn (build/test output). Idle-gap delivery stays
-// the preferred path for every backend; the cap only breaks the starvation.
+// #1010: bounded deferred-wake deadline — an escape hatch for the starvation
+// below, for the backends whose TUI never goes quiet. The Claude Code TUI
+// repaints its status line ~5x/sec even when idle, so the drain's idle timer
+// (reset on every onData) never sees the IDLE_THRESHOLD_MS gap and a deferred
+// wake is starved indefinitely. This deadline is NOT postponed by output.
+//
+// #1023: grok is in the same class — measured under node-pty over a 40 s idle
+// window, its TUI emitted 195 output events with a max quiet gap of 2551 ms,
+// never the 5 s the drain needs (codex control: 0 events / 40000 ms). It is
+// still NOT all backends: codex and gemini TUIs do go quiet between turns, so
+// their defers already drain on genuine quiescence, and a wall-clock deadline
+// would instead barge into a legitimately long streaming turn (build/test
+// output). Idle-gap delivery stays the preferred path for every backend; the
+// cap only breaks the starvation.
 const MAX_DEFER_MS = 10000;
 
 // #1010: after a CAP-driven injection we have no evidence the agent's turn
@@ -120,21 +125,24 @@ function isAgentBusy(session) {
 /**
  * #1010: may this session's deferred wake use the bounded cap?
  *
- * Claude only. `session.backend` is the CLI base name stamped on the session at
- * spawn (server/index.js). A session without it — an older object, an error
+ * The continuously-repainting backends only — claude (#1010) and grok (#1023).
+ * `session.backend` is the CLI base name stamped on the session at spawn
+ * (server/index.js). A session without it — an older object, an error
  * placeholder — is treated as NOT eligible, so the fail-safe direction is the
  * pre-#1010 behavior (genuine-quiescence-only) rather than a barge-in.
  */
+const CAP_ELIGIBLE_BACKENDS = new Set(["claude", "grok"]);
+
 function capEligible(session) {
-  return !!session && session.backend === "claude";
+  return !!session && CAP_ELIGIBLE_BACKENDS.has(session.backend);
 }
 
 /**
  * Queue a pending wake for a busy/recently-active agent (#923: defer, never
  * drop). One cycle per key: `term.onData` resets an idle timer, so the wake
- * drains once the agent has been quiet for the idle window. For Claude a second
- * timer — the #1010 cap — bounds the wait, because a continuously repainting
- * TUI means the idle gap never arrives.
+ * drains once the agent has been quiet for the idle window. For claude and grok
+ * a second timer — the #1010 cap — bounds the wait, because a continuously
+ * repainting TUI means the idle gap never arrives.
  *
  * @param {string} key - "project/agent"
  * @param {object} session - the session that armed the cycle (for backend + term)
@@ -369,6 +377,9 @@ module.exports = {
   dispatchToAgentPTY,
   cleanupSession,
   // Exported for testing
+  capEligible, // #1023: the eligibility predicate is pinned directly, not only
+               // through the repaint regressions, so the fail-safe direction
+               // (an unstamped session stays ineligible) has its own assertion.
   _coalesceTimers,
   _pendingWake,
   _drainListeners,

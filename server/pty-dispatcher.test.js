@@ -3,6 +3,7 @@
 const {
   dispatchToAgentPTY,
   cleanupSession,
+  capEligible,
   _coalesceTimers,
   _pendingWake,
   _drainListeners,
@@ -496,6 +497,42 @@ async function runTests() {
     stopRepaint();
     _drainListeners.delete(KEY);
     cleanupSession(KEY);
+  }
+
+  // --- Test 21: #1023 — grok is the second continuously-repainting backend.
+  //     Measured under node-pty, its TUI emitted 195 output events over a 40 s
+  //     idle window with a max quiet gap of 2551 ms, so the drain's idle gap
+  //     never arrives and EVERY mention to a grok agent takes the defer path.
+  //     Without the cap a grok agent is inert in production while the whole
+  //     suite stays green — the same starvation #1010 fixed for Claude. ---
+  {
+    _setTimingsForTest({ idleThresholdMs: 250, maxDeferMs: 300, capCooldownMs: 1000, activeSuppressionMs: 800 });
+    const { sessions, written, onDataCallbacks } = makeSessions({ backend: "grok", lastOutputAt: Date.now() });
+    const deps = makeDeps();
+    dispatchToAgentPTY("proj", makeMsg({ sender: "head" }), sessions, deps);
+    const stopRepaint = startRepaint(onDataCallbacks, 40);
+    await sleep(150);
+    assert(prompts(written) === 0, "#1023: a repainting grok agent is not injected before the cap");
+    await sleep(400);
+    assert(prompts(written) === 1, "#1023 REGRESSION: a continuously repainting grok TUI receives its wake at the cap (without the grok arm: never)");
+    await sleep(300);
+    assert(prompts(written) === 1, "#1023: the cap delivers exactly once for grok too");
+    stopRepaint();
+    cleanupSession(KEY);
+  }
+
+  // --- Test 22: #1023 — the eligibility predicate itself. Test 15 already
+  //     pins codex/gemini behaviorally; this adds the fail-safe direction,
+  //     which no repaint test can reach: a session with no backend stamp (an
+  //     older object, an error placeholder) must stay ineligible rather than
+  //     barge in. ---
+  {
+    assert(capEligible({ backend: "grok" }) === true, "#1023 AC: capEligible({backend:'grok'}) is true");
+    assert(capEligible({ backend: "claude" }) === true, "#1023: claude stays eligible (#1010 preserved)");
+    assert(capEligible({ backend: "codex" }) === false, "#1023 AC: capEligible({backend:'codex'}) stays false");
+    assert(capEligible({ backend: "gemini" }) === false, "#1023: gemini stays false — its TUI goes quiet between turns");
+    assert(capEligible({}) === false, "#1023 AC: an unstamped session stays INELIGIBLE (fail-safe direction preserved)");
+    assert(capEligible(null) === false, "#1023: a missing session is ineligible, not a crash");
   }
 
   // Restore the shipped timings so nothing after this block runs on test values.

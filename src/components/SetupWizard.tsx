@@ -189,6 +189,7 @@ const BACKENDS: { value: string; label: string }[] = [
   { value: "claude", label: "Claude Code" },
   { value: "codex", label: "Codex" },
   { value: "gemini", label: "Gemini CLI" },
+  { value: "grok", label: "Grok CLI" },
 ];
 
 const AGENTS = [
@@ -330,7 +331,7 @@ export default function SetupWizard() {
   const [loading, setLoading] = useState(false);
   const [workspaceLog, setWorkspaceLog] = useState<string[]>([]);
   const [launchStatus, setLaunchStatus] = useState<"idle" | "running" | "done" | "error">("idle");
-  const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean } | null>(null);
+  const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean; grok: boolean } | null>(null);
 
   useEffect(() => {
     setSteps((prev) => [
@@ -347,10 +348,10 @@ export default function SetupWizard() {
   useEffect(() => {
     fetch("/api/cli-status")
       .then((r) => r.json())
-      .then((status: { claude: boolean; codex: boolean; gemini: boolean }) => {
+      .then((status: { claude: boolean; codex: boolean; gemini: boolean; grok: boolean }) => {
         setCliStatus(status);
         // Default all agents to the available CLI when exactly one is installed
-        const installed = (["claude", "codex", "gemini"] as const).filter((c) => status[c]);
+        const installed = (["claude", "codex", "gemini", "grok"] as const).filter((c) => status[c]);
         if (installed.length === 1) {
           const only = installed[0];
           setBackends({ head: only, re1: only, re2: only, dev: only });
@@ -792,7 +793,7 @@ export default function SetupWizard() {
                     which missed gemini-only and mis-fired for multi-install
                     combos (e.g. codex+gemini) that aren't single-CLI. */}
                 {cliStatus && (() => {
-                  const installed = (["claude", "codex", "gemini"] as const).filter((c) => cliStatus[c]);
+                  const installed = (["claude", "codex", "gemini", "grok"] as const).filter((c) => cliStatus[c]);
                   if (installed.length !== 1) return null;
                   const label = BACKENDS.find((b) => b.value === installed[0])?.label || installed[0];
                   return (

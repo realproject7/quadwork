@@ -49,6 +49,15 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     { value: "gemini-2.5-pro", label: "gemini-2.5-pro" },
     { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
   ],
+  // #1023: xAI Grok Build CLI. `grok models` on an authenticated account lists
+  // exactly one model, which is also the CLI's default; there is no
+  // "latest"-style alias, so the "" row is the only auto-tracking mechanism
+  // here. Append new pins BELOW grok-4.5 so modelsForBackend("grok")[0] — the
+  // #931 default/heal target — stays put.
+  grok: [
+    { value: "", label: "(CLI default)" },
+    { value: "grok-4.5", label: "grok-4.5" },
+  ],
 };
 
 // Raw option list for a backend (includes the "" CLI-default row). Unknown
