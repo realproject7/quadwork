@@ -22,11 +22,19 @@ function cliBaseFromCommand(command) {
 
 /**
  * MCP injection mode for an agent's command:
- *   codex → "proxy_flag", gemini → "env", everything else → "flag".
+ *   codex → "proxy_flag", gemini → "env", grok → "project_toml",
+ *   everything else → "flag".
+ *
+ * #1023: grok has no --mcp-config-style flag at all. Its only "always on" MCP
+ * source is a native TOML config, so the spawn path writes a project-scoped
+ * <cwd>/.grok/config.toml instead of passing a flag.
  */
 function injectModeForCommand(command) {
   const cliBase = cliBaseFromCommand(command);
-  return cliBase === "codex" ? "proxy_flag" : cliBase === "gemini" ? "env" : "flag";
+  if (cliBase === "codex") return "proxy_flag";
+  if (cliBase === "gemini") return "env";
+  if (cliBase === "grok") return "project_toml";
+  return "flag";
 }
 
 module.exports = { cliBaseFromCommand, injectModeForCommand };

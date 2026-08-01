@@ -69,6 +69,7 @@ const BACKENDS: { value: string; label: string }[] = [
   { value: "claude", label: "Claude Code" },
   { value: "codex", label: "Codex" },
   { value: "gemini", label: "Gemini CLI" },
+  { value: "grok", label: "Grok CLI" },
 ];
 
 const COPY = {
@@ -380,7 +381,9 @@ export default function SettingsPage() {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [autoAdded, setAutoAdded] = useState(false);
-  const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean } | null>(null);
+  // #1023: was {claude, codex} — gemini was already missing and grok would have
+  // been too, so every `cliStatus[b.value]` lookup below leaned on a cast.
+  const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean; grok: boolean } | null>(null);
   // #419 / quadwork#308: draft-string mirror for the dashboard port
   // field so the operator can clear it and retype without
   // `parseInt("") || 8400` clobbering the buffer mid-keystroke.
@@ -708,12 +711,16 @@ export default function SettingsPage() {
     // backend isn't actually installed (so we never seed a project
     // with a CLI the user can't run).
     const configured = config.default_backend || "claude";
-    const configuredAvailable = !cliStatus || (cliStatus[configured as "claude" | "codex"] !== false);
+    const configuredAvailable = !cliStatus || (cliStatus[configured as keyof typeof cliStatus] !== false);
+    // #1023: fall back to the first INSTALLED backend rather than a hardcoded
+    // claude/codex chain, which could only ever answer "claude" or "codex" — so
+    // a grok-only machine seeded the uninstalled claude, and so did a
+    // gemini-only one (the same pre-existing bug, fixed deliberately; see the
+    // ticket's operator ruling). A loop over the BACKENDS rows already rendered
+    // above, not a backend registry.
     const defaultCmd = configuredAvailable
       ? configured
-      : (cliStatus && cliStatus.claude && !cliStatus.codex ? "claude"
-        : cliStatus && !cliStatus.claude && cliStatus.codex ? "codex"
-        : "claude");
+      : (cliStatus && BACKENDS.find((b) => cliStatus[b.value as keyof typeof cliStatus])?.value) || "claude";
     const agents: Record<string, AgentConfig> = {};
     for (const [key, val] of Object.entries(DEFAULT_AGENTS)) {
       agents[key] = { ...val, command: defaultCmd };

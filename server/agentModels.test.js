@@ -34,12 +34,14 @@ ok(optionsForBackend("codex").some((o) => o.value === "gpt-5.4"), "optionsForBac
 ok(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].every((s) => optionsForBackend("codex").some((o) => o.value === s)), "#999: optionsForBackend(codex) includes the GPT-5.6 Sol/Terra/Luna slugs");
 ok(optionsForBackend("nope").length === 1 && optionsForBackend("nope")[0].value === "", "optionsForBackend(unknown) → single CLI-default row");
 ok(optionsForBackend("claude").some((o) => o.value === "claude-opus-5"), "#1018: optionsForBackend(claude) includes the claude-opus-5 pin (both selection surfaces read this list)");
+ok(optionsForBackend("grok")[0].value === "" && optionsForBackend("grok").some((o) => o.value === "grok-4.5"), "#1023: optionsForBackend(grok) is the (CLI default) row followed by the grok-4.5 pin");
 
 // ── modelsForBackend: concrete (non-"") options, claude fallback ──
 ok(modelsForBackend("codex").every((o) => o.value !== ""), "modelsForBackend(codex) strips the (CLI default) row");
 ok(modelsForBackend("codex")[0].value === "gpt-5.4", "modelsForBackend(codex)[0] is the first concrete codex model");
 ok(modelsForBackend("gemini")[0].value === "gemini-2.5-pro", "modelsForBackend(gemini)[0] is the first concrete gemini model");
 ok(modelsForBackend("claude")[0].value === "opus", "modelsForBackend(claude)[0] is opus (not the CLI-default row)");
+ok(modelsForBackend("grok")[0].value === "grok-4.5", "#1023: modelsForBackend(grok)[0] is grok-4.5 (the #931 default/heal target)");
 ok(modelsForBackend("nope").length > 0 && modelsForBackend("nope")[0].value === "opus", "modelsForBackend(unknown) falls back to Claude's concrete list");
 
 // ── effectiveModel: what the dropdown DISPLAYS ──
@@ -68,6 +70,10 @@ ok(sanitizeModel("codex", "gpt-4o") === "gpt-4o", "sanitizeModel keeps an alread
 ok(sanitizeModel("claude", "claude-opus-4-8") === "claude-opus-4-8", "sanitizeModel keeps a valid pinned claude model");
 ok(sanitizeModel("claude", "claude-fable-5") === "claude-fable-5", "#958: sanitizeModel keeps claude-fable-5 (new family, not covered by the opus/sonnet aliases)");
 ok(sanitizeModel("claude", "claude-opus-5") === "claude-opus-5", "#1018: sanitizeModel keeps the claude-opus-5 pin (a saved pin is never healed to the alias)");
+ok(sanitizeModel("grok", "sonnet") === "grok-4.5", "#1023 AC: sanitizeModel heals a Claude 'sonnet' on a grok agent → grok-4.5");
+ok(sanitizeModel("grok", "grok-4.5") === "grok-4.5", "#1023: sanitizeModel keeps an already-valid grok model");
+ok(sanitizeModel("grok", "") === "", "#1023 AC: sanitizeModel keeps '' (CLI default) on grok — never clobbered");
+ok(effectiveModel("grok", "opus") === "grok-4.5", "#1023: a stale cross-backend model on a grok agent displays grok-4.5");
 ok(sanitizeModel("codex", "") === "", "sanitizeModel keeps '' (CLI default) — valid for every CLI, never clobbered");
 ok(sanitizeModel("gemini", undefined) === "", "sanitizeModel maps undefined → '' (CLI default), not a fabricated model");
 
