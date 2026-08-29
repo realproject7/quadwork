@@ -10,6 +10,7 @@ const path = require("path");
 
 const {
   END_MARKER,
+  PROTOCOL_VERSION,
   START_MARKER,
   installLocalReviewProtocol,
   protocolBlock,
@@ -27,20 +28,37 @@ function ok(condition, message) {
   console.log(`  PASS: ${message}`);
 }
 
+ok(PROTOCOL_VERSION === 2, "managed protocol version advances for the CI-admission handoff contract");
+
 for (const role of ["dev", "re1", "re2", "head"]) {
   const block = protocolBlock(role);
   ok(block.includes(START_MARKER) && block.includes(END_MARKER), `${role} block has a replaceable managed boundary`);
   ok(block.includes("exact-SHA"), `${role} block names the exact-SHA invariant`);
+  ok(!block.includes("PB_CI_ADMISSION_MODE"), `${role} block does not hardcode a PokerBurn repository variable`);
+  ok(!block.includes("ci:ready") && !block.includes("ci:full"), `${role} block leaves repository trigger names configurable`);
 }
 
 const dev = protocolBlock("dev");
 ok(dev.includes("review candidate") && dev.includes("review publish"), "Dev block moves candidate review before the only publication");
 ok(dev.includes("Never push") || dev.includes("forbidden"), "Dev block explicitly prohibits intermediate push churn");
+ok(dev.includes("remote-evidence handoff") && dev.includes("include `@head`"), "Dev wakes Head when a repository needs exact-SHA CI admission");
+ok(dev.includes("Do not assume `opened` or `synchronize`"), "Dev does not mistake a PR event for expensive CI evidence");
+ok(dev.includes("Local approvals authorize one publication only"), "Dev distinguishes local publication approval from remote merge evidence");
+
 const re1 = protocolBlock("re1");
 ok(re1.includes("--role re1 --in-place") && re1.includes("review verify"), "RE1 block covers local checkout and remote verification");
+ok(re1.includes("local approval authorized publication only") && re1.includes("formal review is separate"), "RE1 distinguishes local approval from formal GitHub evidence");
+ok(re1.includes("do not add/remove CI-admission labels"), "RE1 leaves CI admission to Head");
+
 const re2 = protocolBlock("re2");
 ok(re2.includes("--role re2 --in-place") && re2.includes("review approve"), "RE2 block records its own role-bound approval");
+ok(re2.includes("current SHA") && re2.includes("Head owns exact-SHA admission"), "RE2 reads only the Head-admitted current-SHA evidence");
+
 const head = protocolBlock("head");
+ok(head.includes("before any repository-defined remote CI admission"), "Head verifies the published SHA before starting remote CI");
+ok(head.includes("Persistent label membership is not current-SHA CI evidence"), "Head treats admission as an event bound to the current tip");
+ok(head.includes("formal current-tip GitHub reviews"), "Head does not substitute local approvals for final remote reviews");
+ok(head.includes("would be cancelled") && head.includes("request final evidence once"), "Head sequences candidate and final admissions without cancellation churn");
 ok(head.includes("hard merge stop") && head.includes("nothing here auto-merges"), "Head block keeps verification fail-closed without taking merge authority");
 
 const original = "# Dev — Full-Stack Builder\n\nOld push-first instructions.\n";
@@ -50,9 +68,9 @@ ok(first === second, "managed protocol insertion is idempotent");
 ok((first.match(new RegExp(START_MARKER, "g")) || []).length === 1, "managed protocol never duplicates its start marker");
 ok(first.startsWith(original.trimEnd()), "managed protocol preserves the existing role instructions before the override");
 
-const changedVersion = first.replace("managed v1", "managed v0");
+const changedVersion = first.replace("managed v2", "managed v1");
 const upgraded = upsertManagedBlock(changedVersion, "dev");
-ok(upgraded.includes("managed v1") && !upgraded.includes("managed v0"), "an older managed block is replaced in place");
+ok(upgraded.includes("managed v2") && !upgraded.includes("managed v1"), "the previous managed protocol is replaced in place");
 
 const templates = path.join(TMP, "templates");
 const worktrees = path.join(TMP, "worktrees");

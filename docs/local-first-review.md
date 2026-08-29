@@ -2,7 +2,7 @@
 
 QuadWork's V1 workflow historically published a feature branch before substantive review. Every reviewer finding then produced another push, and repositories that run release-grade CI on every `pull_request.synchronize` multiplied that feedback loop into paid runner minutes.
 
-The local-first review gate moves only the **intermediate review loop** off GitHub:
+The local-first review gate moves the **intermediate review loop** off GitHub:
 
 ```text
 local implementation + tests
@@ -14,10 +14,18 @@ RE2 local review ─┴─ both approve the same SHA
         ↓
 one validated push + PR creation
         ↓
-live CI + formal GitHub reviews + Head merge gate
+Head exact-SHA verification
+        ↓
+automatic PR CI or repository-defined candidate admission
+        ↓
+formal GitHub reviews on the unchanged SHA
+        ↓
+optional repository-defined final/full admission
+        ↓
+Head final verify + merge gate
 ```
 
-It does not weaken the two-reviewer gate, skip GitHub CI, or auto-merge.
+It does not weaken the two-reviewer gate, skip required GitHub CI, or auto-merge. It makes one reviewed candidate—not each exploratory or reviewer-fix commit—the unit of remote work.
 
 ## Commands
 
@@ -36,7 +44,7 @@ Requirements:
 - base is an ancestor of `HEAD`;
 - implementation, tests, and PR body are complete.
 
-Creating a candidate atomically clears RE1, RE2, and publication refs. Any fix therefore needs two fresh approvals.
+Creating a candidate atomically clears RE1, RE2, and publication refs. Any fix therefore needs two fresh local approvals.
 
 ### Reviewer: check out the exact candidate
 
@@ -62,7 +70,7 @@ npx quadwork review approve 123 --role re1 --summary "tests and diff reviewed"
 npx quadwork review approve 123 --role re2 --summary "independent review complete"
 ```
 
-The command refuses `HEAD` when it does not equal the current candidate.
+The command refuses `HEAD` when it does not equal the current candidate. These local approvals authorize one publication; they are not substitutes for formal GitHub reviews or repository-required remote CI evidence.
 
 ### Dev: publish once
 
@@ -83,6 +91,8 @@ Before any remote mutation it verifies:
 
 It then pushes the reviewed branch once, creates or finds the PR, reads the PR back, and records publication only after the remote branch and PR head equal the candidate SHA. Re-running at the same SHA is idempotent.
 
+After publication, Dev sends one remote-evidence handoff naming the PR and exact SHA to both reviewers. When the repository uses Head-owned CI admission, the same handoff must wake Head; a PR `opened` or `synchronize` event may intentionally run no expensive jobs.
+
 ### Reviewer/Head: verify the remote handoff
 
 ```bash
@@ -98,7 +108,47 @@ The command fails unless all of these still agree:
 - remote branch head;
 - open, non-draft PR head and target base.
 
-Reviewers run it before the formal GitHub review. Head runs it immediately before the existing live CI/review/mergeability checks.
+Reviewers run it before submitting formal GitHub reviews. Head runs it before every repository-defined CI admission and again immediately before the existing live CI/review/mergeability checks.
+
+## Repository CI admission compatibility
+
+QuadWork does not prescribe a repository's workflow names, labels, or job topology. It supports two repository policies.
+
+### Automatic PR CI
+
+The validated publication triggers the repository's normal PR workflow. Because the local review loop already converged the candidate, the expected steady state is one publication and one remote candidate run. A real CI or formal-review code finding starts a new local candidate cycle and one replacement publication.
+
+### Head-admitted CI
+
+Some repositories intentionally keep expensive jobs off ordinary `opened` and `synchronize` events. Those source events may run only a cheap classifier/control-plane job. Head then requests remote evidence only after:
+
+1. `quadwork review verify` succeeds for the exact published SHA;
+2. the repository-specific candidate trigger is applied once; and
+3. any later final/full trigger is applied only when the repository's own policy requires distinct final evidence.
+
+A repository may call those triggers `ci:ready` and `ci:full`, use `workflow_dispatch`, or use another fixed mechanism. QuadWork deliberately does not hardcode them.
+
+### Evidence and retip rules
+
+- A label being present is not proof that CI ran for the current SHA. Where the trigger is a `pull_request:labeled` event, a new source SHA requires removing and reapplying the label after exact-SHA verification.
+- Local RE1/RE2 approvals authorize publication only. Formal GitHub reviews on the published current SHA remain the remote review evidence.
+- A new SHA invalidates the previous local approvals, formal reviews, candidate CI, and final/full CI.
+- Reviewers do not mutate CI-admission labels. Head owns the exact-SHA admission sequence.
+- Head must not start a final/full admission if doing so would cancel an unfinished candidate run in the same concurrency group.
+- Final/full admission runs once, after both formal current-tip reviews, when the repository requires it.
+
+### Minimize Actions, not only pushes
+
+The lowest-cost safe policy depends on the repository:
+
+- If one remote workflow can provide all required evidence, admit it once after the local two-reviewer gate.
+- If early deterministic candidate evidence and later release-grade evidence are genuinely different, run each once and keep their job sets non-duplicative where possible.
+- Do not run two labels that repeat the same gates merely because two names exist.
+- Ordinary source events should remain cheap in admission mode.
+- `cancel-in-progress` is a safety net, not a cost-control strategy; work already executed before cancellation is still consumed.
+- Mutation commits, negative controls, speculative fixes, and reviewer-by-reviewer corrections stay local.
+
+This protocol minimizes **remote candidate count**. Repository workflow design still determines **runner-minutes per candidate**; both layers must be efficient to minimize total Actions spend.
 
 ## Push guard
 
@@ -117,6 +167,6 @@ The block is idempotently replaced on start/CLI use, so existing installations r
 
 ## What stays remote
 
-The final candidate still receives the repository's normal PR CI, deployment previews, formal RE1/RE2 GitHub reviews or repository-required attestations, and Head merge checks. CI failures that require code changes create a new local candidate and invalidate both prior approvals.
+The final candidate still receives the repository's configured remote evidence policy: automatic PR CI or exact-SHA Head admission, deployment previews where required, formal RE1/RE2 GitHub reviews or repository-required attestations, and Head merge checks. CI or formal-review findings that require code changes create a new local candidate and invalidate all evidence tied to the prior SHA.
 
 This is intentionally a bounded V1 cost-control layer. It does not implement the server-owned V2 dispatcher and authenticated receipt model in QuadWork issue #1048; that future cutover can replace the managed V1 block atomically.
