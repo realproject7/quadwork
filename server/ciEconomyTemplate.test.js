@@ -33,6 +33,11 @@ assert.match(
 );
 assert.match(
   template,
+  /\[skip ci\][\s\S]*final candidate MUST be a later, real non-skipped commit/,
+  "an unsplit repository must be able to suppress an exceptional intermediate push without suppressing the final candidate",
+);
+assert.match(
+  template,
   /both final approvals must name the same current candidate SHA/,
   "candidate batching must preserve exact-tip two-review evidence",
 );
