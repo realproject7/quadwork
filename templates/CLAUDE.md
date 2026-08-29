@@ -50,11 +50,11 @@ Do not split one review round into “RE1 fix push” and “RE2 fix push.” Do
 Repositories should expose two stable checks:
 
 - **Fast CI** runs on ordinary PR `opened` / `synchronize` events and covers formatting, static analysis, focused unit tests, and other inexpensive deterministic gates.
-- **Full Candidate CI** runs only when the PR becomes ready for review, when the explicit `ci:full` label is added, on `main`, on a scheduled canary, or by manual dispatch. It owns full matrices, complete E2E, container verification, release builds, and other expensive checks.
+- **Full Candidate CI** runs when a non-draft candidate opens, the PR becomes ready for review, or the explicit `ci:full` label is added. It should also run on release tags, scheduled canaries, and manual dispatch; repositories may repeat it on `main` when immediate deployment integrity requires that extra run. It owns full matrices, complete E2E, container verification, release builds, and other expensive checks.
 
 For a revised candidate, remove and re-add `ci:full` only after the consolidated push. Removing the label is not a test request; adding it is. Do not leave a full-CI trigger attached while making intermediate pushes.
 
-If a repository has not adopted split CI yet, the same local-first and one-push-per-round rules still apply; they reduce redundant full runs immediately.
+If a repository has not adopted split CI yet, the same local-first and one-push-per-round rules still apply; they reduce redundant full runs immediately. When an exceptional intermediate remote push is unavoidable in such a repository, add GitHub's `[skip ci]` trailer to that intermediate commit. The final candidate MUST be a later, real non-skipped commit so required checks run on the exact SHA reviewed; never merge a skipped HEAD, and never create remote mutation/revert pairs merely to obtain evidence.
 
 ### Merge evidence
 
