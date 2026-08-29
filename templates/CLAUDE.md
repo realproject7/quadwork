@@ -21,9 +21,51 @@
 5. Dev opens PR with the required body template: `Fixes #<issue>` + `## EPIC Alignment` + `## Self-Verification` (+ `## Design Fidelity` for UI) + `## Deviations`
 6. Dev requests review from **@re1 AND @re2** (NOT Head), one message
 7. RE1/RE2 review independently in order: structural gate → epic context load → Layer 1 EPIC Alignment → Layer 2 Kill-List → Layer 3 Design Fidelity (UI) → evidence-bound verdict to **@dev**. Missing PR-body sections or any kill-list hit = REQUEST CHANGES.
-8. Dev addresses findings, pushes, re-requests; reviewers re-review the delta only
-9. Dev aggregates both evidence-bound approvals, then notifies **@head**
-10. Head runs the **Merge Gate** (live approval re-read + PR-body sections present + both verdicts carry `### Checked (evidence)`), merges; Issue auto-closes; epic checklist updated
+8. Dev addresses findings through the **CI Economy Protocol** below; reviewers re-review only the candidate delta
+9. Dev aggregates both evidence-bound approvals for the same candidate SHA, then notifies **@head**
+10. Head runs the **Merge Gate** (live approval re-read + PR-body sections present + both verdicts carry `### Checked (evidence)` + required candidate checks belong to current HEAD), merges; Issue auto-closes; epic checklist updated
+
+## CI Economy Protocol
+
+This section refines **push and review cadence** without changing role authority, the 2-of-2 review gate, or exact-tip verification.
+
+### Local-first implementation
+
+- Dev may make as many local commits, test mutations, and corrective iterations as needed, but MUST NOT push merely to discover whether CI passes.
+- Mutation testing, negative controls, deliberately broken commits, and their reverts are **local/VPS-only**. Record the command and observed result in the PR; never push the broken state to GitHub.
+- Before the first remote push, Dev runs the repository's local fast checks and the ticket-specific checks. The first push represents a reviewable **candidate**, not work in progress.
+
+### One push per review round
+
+1. Dev pushes candidate SHA `C1`, opens or updates the PR, and sends one joint request to `@re1 @re2` naming `C1`.
+2. RE1 and RE2 review `C1` independently. Dev MUST wait for **both verdicts** before editing or pushing, even when the first verdict already requests changes.
+3. Dev combines both reviewers' findings into one local fix set, runs local verification, and pushes exactly one replacement candidate `C2`.
+4. Dev sends one joint delta-review request naming `C1..C2`. Reviewers inspect only that delta plus their own prior findings.
+5. Repeat only when a reviewer identifies a new blocking defect. A push invalidates approvals for the prior SHA; both final approvals must name the same current candidate SHA.
+
+Do not split one review round into “RE1 fix push” and “RE2 fix push.” Do not send speculative micro-fixes while the second review is still running. A genuinely independent emergency correction may break this rule only when waiting would cause data loss or expose a security secret; state that reason explicitly.
+
+### Fast CI versus full candidate CI
+
+Repositories should expose two stable checks:
+
+- **Fast CI** runs on ordinary PR `opened` / `synchronize` events and covers formatting, static analysis, focused unit tests, and other inexpensive deterministic gates.
+- **Full Candidate CI** runs only when the PR becomes ready for review, when the explicit `ci:full` label is added, on `main`, on a scheduled canary, or by manual dispatch. It owns full matrices, complete E2E, container verification, release builds, and other expensive checks.
+
+For a revised candidate, remove and re-add `ci:full` only after the consolidated push. Removing the label is not a test request; adding it is. Do not leave a full-CI trigger attached while making intermediate pushes.
+
+If a repository has not adopted split CI yet, the same local-first and one-push-per-round rules still apply; they reduce redundant full runs immediately.
+
+### Merge evidence
+
+Head merges only when:
+
+- RE1 and RE2 both approved the current candidate SHA;
+- the repository's required fast checks are green for that SHA;
+- Full Candidate CI is green for that SHA when the repository defines it; and
+- no newer push exists after either approval or candidate check.
+
+A cancelled superseded run is consumed budget, not free work. `cancel-in-progress` is a safety net, never a substitute for batching pushes.
 
 Branch naming (strict): `task/<issue-number>-<short-slug>`
 
@@ -32,6 +74,7 @@ Branch naming (strict): `task/<issue-number>-<short-slug>`
 - Agents may push **feature branches** (`task/*`) autonomously
 - Agents must **NEVER push to `main`** — branch protection enforces this
 - Before push: run build checks, fix all errors
+- Push only a reviewable candidate or one consolidated review revision; ordinary local progress stays local
 
 ## Communication Rules
 
