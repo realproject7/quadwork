@@ -20,6 +20,7 @@
     "docs/troubleshooting.md",
     "docs/operator-mcp.md",
     "docs/review-batches.md",
+    "docs/local-first-review.md",
     "skills/"
   ],
   "scripts": {
