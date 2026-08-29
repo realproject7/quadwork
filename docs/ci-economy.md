@@ -59,11 +59,13 @@ Fast CI is the feedback loop for a candidate push. It is not a smaller copy of t
 
 Triggered by one of:
 
+- a non-draft `pull_request: opened`
 - `pull_request: ready_for_review`
 - `pull_request: labeled` when the added label is `ci:full`
-- `push` to `main`
+- a version/release tag
 - `schedule`
 - `workflow_dispatch`
+- optionally a `main` push when immediate deployment integrity requires a second full run
 
 It owns expensive or broad verification:
 
@@ -86,9 +88,11 @@ name: CI Fast
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
 
 concurrency:
-  group: ci-fast-${{ github.event.pull_request.number }}
+  group: ci-fast-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -110,11 +114,11 @@ name: CI Full Candidate
 
 on:
   pull_request:
-    types: [ready_for_review, labeled]
+    types: [opened, ready_for_review, labeled]
   push:
-    branches: [main]
+    tags: ["v*"]
   schedule:
-    - cron: "17 4 * * *"
+    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 concurrency:
@@ -135,8 +139,12 @@ jobs:
           EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
           LABEL: ${{ github.event.label.name }}
+          DRAFT: ${{ github.event.pull_request.draft }}
         run: |
-          if [ "$EVENT" != pull_request ] || [ "$ACTION" = ready_for_review ] || [ "$LABEL" = ci:full ]; then
+          if [ "$EVENT" != pull_request ] || \
+             [ "$ACTION" = ready_for_review ] || \
+             [ "$LABEL" = ci:full ] || \
+             { [ "$ACTION" = opened ] && [ "$DRAFT" = false ]; }; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
           else
             echo 'run=false' >> "$GITHUB_OUTPUT"
@@ -152,6 +160,20 @@ jobs:
 ```
 
 The small `plan` job is optional when every expensive job can share the same direct `if:` expression. It is useful when a workflow has a large matrix and you want one audited decision point.
+
+## Unsplit-workflow fallback
+
+Some mature repositories have one large, tightly coupled workflow that cannot be split safely in the same change. Candidate batching still cuts its largest waste immediately.
+
+When a genuinely necessary intermediate remote push cannot wait for both reviewers, put GitHub's `[skip ci]` instruction in that intermediate commit message. This suppresses `push` and `pull_request` workflows that honor GitHub skip instructions. Then:
+
+1. continue the review round;
+2. collect both verdicts;
+3. apply one consolidated local fix;
+4. push a **real, non-skipped final candidate commit**; and
+5. require all checks and both approvals on that later SHA.
+
+A skipped HEAD is never mergeable evidence. Do not use an empty remote mutation/revert pair to manufacture a non-skipped run, and do not use skip trailers on the final candidate. This fallback is for exceptional remote coordination, not a replacement for local-first work.
 
 ## Path classification
 
@@ -201,7 +223,7 @@ A repository averaging three PR pushes plus one main run can commonly move from 
 
 - two or fewer fast pipelines,
 - one full candidate pipeline, and
-- one main pipeline or release-train publication.
+- one inexpensive main check or a release-train publication.
 
 Repositories with large OS matrices, E2E shards, or container matrices see the largest reduction. The review standard remains unchanged; only redundant remote execution is removed.
 
