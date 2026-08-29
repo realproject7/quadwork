@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const START_MARKER = "<!-- quadwork-local-first-review:start -->";
 const END_MARKER = "<!-- quadwork-local-first-review:end -->";
 const ROLE_ALIASES = new Map([
@@ -44,7 +44,7 @@ function protocolLines(role) {
       "4. Collect both reviewers' findings before revising where practical. Each fix is a new local commit followed by the same `candidate` command; that atomically invalidates both earlier approvals.",
       "5. Ordinary `git push` of a candidate branch is forbidden. After RE1 and RE2 approve the same local SHA, publish exactly once:",
       "   `npx quadwork review publish <issue> --title \"[#<issue>] ...\" --body-file <file>`",
-      "6. Send one remote-evidence handoff naming the PR number and exact published SHA to `@re1 @re2`; when the repository uses Head-gated CI admission, include `@head` so the verified candidate can be admitted. Do not assume `opened` or `synchronize` started the repository's expensive jobs.",
+      "6. Send one remote-evidence handoff naming the PR number and exact published SHA to `@re1 @re2`; when the repository uses Head-gated CI admission, include `@head`. Do not assume `opened` or `synchronize` started expensive jobs, and do not ask Head to run both candidate and final lanes by default.",
       "7. A CI or formal-review code fix starts a new local candidate cycle. It requires two fresh local approvals before one replacement publication, and it invalidates all remote reviews and CI evidence from the previous SHA.",
       "8. Do not claim pushed, PR-created, CI-admitted, or verified unless the corresponding command or live repository evidence names the exact SHA.",
       "",
@@ -64,7 +64,7 @@ function protocolLines(role) {
       "4. Send an evidence-bound verdict to `@dev`. On APPROVE, record it only after the review is complete:",
       `   \`npx quadwork review approve <issue> --role ${role} --summary \"<short evidence>\"\``,
       "5. A new candidate SHA makes every earlier local approval stale. Refresh and review the delta; never carry approval across a retip.",
-      "6. After Dev publishes the PR, run `npx quadwork review verify <issue> --pr <number>`, then submit the formal GitHub review at that unchanged SHA. The local approval authorized publication only; the formal review is separate remote merge evidence.",
+      "6. After Dev publishes the PR, run `npx quadwork review verify <issue> --pr <number>`, then submit the formal GitHub review at that unchanged SHA. The local approval authorized publication only; the formal review is separate remote merge evidence and may proceed before remote CI unless repository policy explicitly requires otherwise.",
       "7. In a Head-admitted repository, do not add/remove CI-admission labels or dispatch heavy CI yourself. Head owns exact-SHA admission; you read only live checks attached to the verified current SHA.",
       "8. If verify reports draft, base drift, remote mismatch, or PR-head mismatch, do not approve; route the exact error to Dev.",
       "",
@@ -77,10 +77,13 @@ function protocolLines(role) {
     "### Head remote-evidence and merge contract",
     "1. Dev and both reviewers complete the local candidate cycle before the branch is published. Their local approvals authorize publication only, not merge.",
     "2. On every newly published or retipped PR, run `npx quadwork review verify <issue> --pr <number>` before any repository-defined remote CI admission.",
-    "3. If the repository runs automatic PR CI, observe that current-SHA run. If it uses Head-gated admission, apply only the repository-defined candidate trigger after verify succeeds; QuadWork does not invent or hardcode repository labels.",
-    "4. Persistent label membership is not current-SHA CI evidence. When a repository uses label events, a retip requires removing and reapplying the trigger after verify so the event is attached to the new HEAD.",
-    "5. Local approvals never satisfy a final/full-CI policy that requires formal current-tip GitHub reviews. Start that final admission only after both formal reviews name the same verified SHA.",
-    "6. Do not start a final/full admission while an earlier candidate run would be cancelled by the repository's concurrency group. Let the required candidate evidence finish, then request final evidence once.",
+    "3. Choose the cheapest repository-allowed evidence path; do not automatically run both a candidate lane and a final/full lane:",
+    "   - **Automatic CI:** observe the current-SHA run already created by the repository. Do not dispatch an additional candidate run unless repository policy requires a distinct check.",
+    "   - **Single admitted run (preferred):** when one final/full run covers every required check, let both formal reviewers complete on the verified SHA, then admit that one run exactly once.",
+    "   - **Two-stage admission (exception):** run an early candidate lane only when it is required for reviewer/merge evidence or is cheap and non-overlapping. Run a later final/full lane only when it proves genuinely different release evidence.",
+    "4. QuadWork does not invent or hardcode repository labels. Persistent label membership is not current-SHA CI evidence; a label-event repository must remove and reapply its trigger after a retip so the event is attached to the new HEAD.",
+    "5. Local approvals never satisfy a final/full-CI policy that requires formal current-tip GitHub reviews. Start such a final admission only after both formal reviews name the same verified SHA.",
+    "6. Do not start a final/full admission while an earlier required candidate run would be cancelled by the repository's concurrency group. Let required evidence finish, then request the distinct final evidence once.",
     "7. Any new SHA, moved base, or code fix invalidates local approvals, formal reviews, candidate CI, and final/full CI from the previous tip. Return to a new local candidate cycle.",
     "8. Immediately before merge, run `npx quadwork review verify <issue> --pr <number>` again, then perform the existing live required-check, current GitHub review, PR-body, mergeability, and exact-head checks.",
     "9. A non-zero verify or stale/missing current-SHA evidence is a hard merge stop. Head remains the only merger; nothing here auto-merges, mutates repository policy, or advances the queue.",
