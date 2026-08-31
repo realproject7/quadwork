@@ -3,12 +3,31 @@
 import { useEffect, useState, useCallback } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
+import { workItemDisplayLabel, workItemReactKey } from "@/lib/batchIdentity";
 
 interface BatchProgressItem {
+  number: number;
   issue_number: number;
+  repo_key: string;
+  repo: string;
+  work_item_ref: string | { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+  kind: "issue" | "pr";
+  installation_id?: string | null;
+  batch_number?: number | null;
+  assignment_attempt?: string | null;
+  provenance?: "owned" | "foreign" | "unowned" | "legacy_unowned";
+  assignment_key?: string | null;
+  current?: boolean;
+  owned?: boolean;
   title: string;
   url: string | null;
   pr_number?: number;
+  live_pr?: {
+    number: number;
+    url: string;
+    state: "OPEN";
+    tip: string;
+  } | null;
   // #350: "closed" = issue CLOSED with no linked PR (superseded,
   // not planned, or runbook-only). Rendered at 100% like merged
   // but with a distinct label from the server.
@@ -29,6 +48,7 @@ interface BatchProgressData {
   complete: boolean;
   // #870/#871: "code" (default) | "ticket-review" | "pr-review".
   batch_type?: "code" | "ticket-review" | "pr-review";
+  multi_repository?: boolean;
 }
 
 interface BatchProgressPanelProps {
@@ -234,10 +254,12 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
           const isReviewItem = !!item.review_state;
           const displayLabel = isReviewItem ? reviewLabel(item, t.rs) : item.label;
           const isChanges = item.review_state === "changes-requested";
+          const itemKey = workItemReactKey(item);
+          const itemRefLabel = workItemDisplayLabel(item, data.multi_repository === true);
           const row = (
             <div className="flex items-center gap-2 px-3 py-1 font-mono">
-              <span className="text-[11px] text-text-muted w-8 shrink-0 tabular-nums">
-                #{item.issue_number}
+              <span className="text-[11px] text-text-muted shrink-0 tabular-nums whitespace-nowrap">
+                {itemRefLabel}
               </span>
               <ProgressBar percent={item.progress} />
               <span className="text-[11px] text-text-muted tabular-nums shrink-0 w-9 text-right">
@@ -249,11 +271,11 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
             </div>
           );
           if (!item.url) {
-            return <div key={item.issue_number}>{row}</div>;
+            return <div key={itemKey}>{row}</div>;
           }
           return (
             <a
-              key={item.issue_number}
+              key={itemKey}
               href={item.url}
               target="_blank"
               rel="noopener noreferrer"

@@ -3,12 +3,22 @@
 import { useState, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import { sessionTokenParam, sessionTokenHeaders } from "@/lib/sessionToken";
+import { qualifiedQueueToken, sanitizeRemoteTitle } from "@/lib/batchIdentity";
 
 interface Issue {
   number: number;
   title: string;
   state: string;
   labels: { name: string }[];
+  repo_key: string;
+  repo: string;
+  url?: string;
+}
+
+interface Repository {
+  key: string;
+  repo: string;
+  primary?: boolean;
 }
 
 interface QueueManagerProps {
@@ -19,20 +29,41 @@ function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function generateTemplate(issues: Issue[], repo: string): string {
+function generateTemplate(issues: Issue[], repositories: Repository[]): string {
   const date = today();
   const lines: string[] = [
     `# Task Queue — ${date}`,
     "",
-    `Repo: \`${repo}\``,
-    "",
-    "## Batch 1",
-    "",
   ];
 
-  issues.forEach((issue, i) => {
-    lines.push(`${i + 1}. [${repo}#${issue.number}](https://github.com/${repo}/issues/${issue.number}) — ${issue.title} (task/${issue.number}-slug)`);
-  });
+  if (repositories.length === 1) {
+    lines.push(`Repo: \`${repositories[0].repo}\``);
+  } else {
+    lines.push("Repositories:");
+    for (const repository of repositories) lines.push(`- \`${repository.key}\`: \`${repository.repo}\``);
+  }
+
+  lines.push("", "## Active Batch", "", "Batch: 1", "");
+
+  const registered = new Map(repositories.map((repository) => [repository.key, repository.repo]));
+  let omitted = 0;
+  for (const issue of issues) {
+    const token = qualifiedQueueToken(issue);
+    if (!token || registered.get(issue.repo_key) !== issue.repo) {
+      omitted += 1;
+      continue;
+    }
+    lines.push(`- ${token} ${sanitizeRemoteTitle(issue.title)}`);
+  }
+
+  if (issues.length === 0) lines.push("(no open issues)");
+  if (omitted > 0) {
+    lines.push("", `> ${omitted} issue${omitted === 1 ? " was" : "s were"} omitted because repository identity was missing or unregistered.`);
+  }
+
+  lines.push("", "## Holds", "", "(none)");
+  lines.push("", "## Backlog", "", "(none)");
+  lines.push("", "## Done", "", "(none)");
 
   lines.push("");
   lines.push("## Rules");
@@ -50,15 +81,19 @@ function generateTemplate(issues: Issue[], repo: string): string {
   return lines.join("\n");
 }
 
-function generatePrompt(queueContent: string, repo: string): string {
+function generatePrompt(queueContent: string, repositories: Repository[]): string {
+  const repositoryLines = repositories.length > 0
+    ? repositories.map((repository) => `  - ${repository.key}: ${repository.repo}`).join("\n")
+    : "  - No registered repository identity was returned; do not guess or mutate a repository.";
   return `@head Work through this queue top-to-bottom. Assign ONE ticket at a time to
    @dev. After each PR is merged, assign the next ticket immediately.
   All tickets are autonomous — no operator gates.
 
-  IMPORTANT — Repo context:
-  - All work is on repo ${repo}.
-  - Use -R ${repo} for ALL gh commands (issues, PRs, merges).
-  - Branches, PRs, and issues are all on ${repo}.
+  IMPORTANT — Repository context:
+  - Resolve every qualified work token against this registered map:
+${repositoryLines}
+  - Use -R with the repository named by each token for ALL gh commands.
+  - Never guess primary for an unknown, malformed, or ambiguous token.
 
 ${queueContent}
 
@@ -67,18 +102,25 @@ ${queueContent}
 
 export default function QueueManager({ projectId }: QueueManagerProps) {
   const [content, setContent] = useState("");
-  const [repo, setRepo] = useState("");
+  const [repositories, setRepositories] = useState<Repository[]>([]);
   const [showPrompt, setShowPrompt] = useState(false);
   const [copied, setCopied] = useState(false);
   const [sent, setSent] = useState(false);
 
-  // Fetch repo from config
+  // Fetch the canonical repository map. Legacy projects may not persist this
+  // array yet; their /api/github/issues rows still carry the normalized
+  // `primary` binding and hydrate it when Generate Template is clicked.
   useEffect(() => {
+    setRepositories([]);
     fetch("/api/config")
       .then((r) => r.ok ? r.json() : null)
       .then((cfg) => {
         const project = cfg?.projects?.find((p: { id: string }) => p.id === projectId);
-        if (project?.repo) setRepo(project.repo);
+        const configured = Array.isArray(project?.repositories)
+          ? project.repositories.filter((entry: Repository) =>
+            typeof entry?.key === "string" && !!entry.key && typeof entry?.repo === "string" && !!entry.repo)
+          : [];
+        if (configured.length > 0) setRepositories(configured);
       })
       .catch(() => {});
   }, [projectId]);
@@ -91,12 +133,28 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       })
       .then((issues: Issue[]) => {
         const open = issues.filter((i) => i.state === "OPEN");
-        setContent(generateTemplate(open, repo));
+        let resolvedRepositories = repositories;
+        if (resolvedRepositories.length === 0) {
+          // Pre-activation compatibility has exactly one normalized binding on
+          // the GitHub rows. Never learn a multi-repository topology from row
+          // data: activated projects must use the locked config map above.
+          const candidates = new Map<string, Repository>();
+          let conflictingBinding = false;
+          for (const issue of open) {
+            if (typeof issue.repo_key !== "string" || !issue.repo_key || typeof issue.repo !== "string" || !issue.repo) continue;
+            const existing = candidates.get(issue.repo_key);
+            if (existing && existing.repo !== issue.repo) conflictingBinding = true;
+            else candidates.set(issue.repo_key, { key: issue.repo_key, repo: issue.repo, primary: true });
+          }
+          if (!conflictingBinding && candidates.size === 1) resolvedRepositories = [...candidates.values()];
+        }
+        setRepositories(resolvedRepositories);
+        setContent(generateTemplate(open, resolvedRepositories));
       })
       .catch(() => {
-        setContent(generateTemplate([], repo));
+        setContent(generateTemplate([], repositories));
       });
-  }, [projectId, repo]);
+  }, [projectId, repositories]);
 
   const exportMd = () => {
     const blob = new Blob([content], { type: "text/markdown" });
@@ -108,7 +166,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
     URL.revokeObjectURL(url);
   };
 
-  const prompt = generatePrompt(content, repo);
+  const prompt = generatePrompt(content, repositories);
 
   const copyPrompt = async () => {
     await navigator.clipboard.writeText(prompt);
@@ -225,7 +283,9 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-lg font-semibold text-text tracking-tight">Task Queue</h1>
-          <p className="text-xs text-text-muted mt-0.5">{repo || projectId}</p>
+          <p className="text-xs text-text-muted mt-0.5">
+            {repositories.length > 0 ? repositories.map((repository) => repository.repo).join(" · ") : projectId}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <button

@@ -29,7 +29,7 @@ module.exports = {
     {
       name: "batch_status",
       description:
-        "Get a project's overnight-batch status as { active, progress }, merged from /api/batch-active and /api/batch-progress. `active` reflects the live `## Active Batch` lifecycle — once Head clears the queue, active drops to false — so it is authoritative for 'work remaining'. `progress` may keep rendering a just-completed batch (sticky display) even after active is false.",
+        "Get a project's overnight-batch status as { active, progress }, preserving repository-qualified rows and assignment provenance from /api/batch-active and /api/batch-progress without transformation. `active.active` plus matching installation_id, batch_number, opaque assignment_attempt, assignment_key, current, owned, and provenance=owned is the live authority. Each progress row retains separate repo_key, repo, number, kind, a work_item_ref object with those same four fields, the same provenance fields, and an OPEN-only live_pr reference (number, URL, state, tip). Foreign, unowned, legacy_unowned, stale, and sticky completed progress is observational only and never current authority.",
       inputSchema: {
         type: "object",
         properties: {

@@ -41,6 +41,48 @@ const RUNTIME_AGENTS = {
   "plotlink/dev": { state: "stopped", error: null },
 };
 
+const BATCH_IDENTITY = {
+  installation_id: "123e4567-e89b-42d3-a456-426614174000",
+  batch_number: 4,
+  assignment_attempt: "attempt-4-owned",
+  provenance: "owned",
+  assignment_key: "batch-4-attempt-4-owned",
+  current: true,
+  owned: true,
+};
+
+const BATCH_ACTIVE = { active: true, batch_type: "code", ...BATCH_IDENTITY };
+const BATCH_PROGRESS = {
+  complete: false,
+  total: 2,
+  done: 0,
+  multi_repository: true,
+  ...BATCH_IDENTITY,
+  items: [
+    {
+      ...BATCH_IDENTITY,
+      repo_key: "web",
+      repo: "owner/web",
+      number: 42,
+      kind: "issue",
+      work_item_ref: { repo_key: "web", repo: "owner/web", number: 42, kind: "issue" },
+      issue_number: 42,
+      live_pr: { number: 101, url: "https://github.com/owner/web/pull/101", state: "OPEN", tip: "a".repeat(40) },
+    },
+    {
+      ...BATCH_IDENTITY,
+      repo_key: "api",
+      repo: "owner/api",
+      number: 42,
+      kind: "issue",
+      work_item_ref: { repo_key: "api", repo: "owner/api", number: 42, kind: "issue" },
+      issue_number: 42,
+      live_pr: null,
+      historical_pr: { number: 99, url: "https://github.com/owner/api/pull/99", state: "MERGED", tip: "b".repeat(40) },
+    },
+  ],
+};
+
 let passed = 0;
 let failed = 0;
 function assert(cond, msg) {
@@ -65,8 +107,8 @@ function startServer() {
       const url = req.url;
       if (url.startsWith("/api/config")) return send(FAKE_CONFIG);
       if (url.startsWith("/api/chat")) return send(CHAT_MESSAGES);
-      if (url.startsWith("/api/batch-active")) return send({ active: true });
-      if (url.startsWith("/api/batch-progress")) return send({ total: 3, done: 1, items: [{ issue: 791, state: "open" }] });
+      if (url.startsWith("/api/batch-active")) return send(BATCH_ACTIVE);
+      if (url.startsWith("/api/batch-progress")) return send(BATCH_PROGRESS);
       if (url.startsWith("/api/queue")) return send({ ok: true, exists: true, content: "## Active Batch\n- #791\n" });
       if (url.startsWith("/api/agents")) return send(RUNTIME_AGENTS);
       return send({ error: "not found" }, 404);
@@ -110,7 +152,25 @@ async function runTests() {
   // ── batch_status: merge active + progress ───────────────────────────────
   const batch = await handlers.batch_status({ project: "plotlink" }, ctx);
   assert(batch && batch.active && batch.active.active === true, "batch_status includes active");
-  assert(batch && batch.progress && batch.progress.total === 3, "batch_status includes progress (merged)");
+  assert(batch && batch.progress && batch.progress.total === 2, "batch_status includes progress (merged)");
+  assert(
+    batch.active.assignment_attempt === "attempt-4-owned" && batch.progress.assignment_key === BATCH_IDENTITY.assignment_key,
+    "batch_status preserves the opaque assignment identity without rewriting it",
+  );
+  assert(
+    batch.progress.items.length === 2 &&
+      batch.progress.items[0].issue_number === 42 && batch.progress.items[1].issue_number === 42 &&
+      batch.progress.items[0].repo === "owner/web" && batch.progress.items[1].repo === "owner/api",
+    "batch_status keeps same-number work items distinct by repository",
+  );
+  assert(
+    batch.progress.items[0].live_pr.state === "OPEN" && batch.progress.items[0].live_pr.tip === "a".repeat(40),
+    "batch_status preserves the explicit OPEN live PR reference",
+  );
+  assert(
+    batch.progress.items[1].live_pr === null && batch.progress.items[1].historical_pr.state === "MERGED",
+    "batch_status does not promote a merged historical PR to live_pr",
+  );
 
   // ── read_queue: returns markdown ────────────────────────────────────────
   const queue = await handlers.read_queue({ project: "plotlink" }, ctx);

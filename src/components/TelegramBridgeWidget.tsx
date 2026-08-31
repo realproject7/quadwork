@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import TelegramSetupModal from "./TelegramSetupModal";
 import { useLocale } from "@/components/LocaleProvider";
+import { assignmentRequestFields, ownedCurrentBatchSnapshot } from "@/lib/batchIdentity";
 
 const COPY = {
   en: {
@@ -58,7 +59,55 @@ const COPY = {
 
 interface BatchState {
   complete: boolean;
-  items: { issue_number: number }[];
+  completeConfirmed: boolean;
+  liveActiveBatchCleared: boolean;
+  items: Array<{
+    number: number;
+    issue_number: number;
+    repo_key: string;
+    repo: string;
+    work_item_ref: string | { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    kind: "issue" | "pr";
+    installation_id: string;
+    batch_number: number;
+    assignment_attempt: string;
+    provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
+    assignment_key: string;
+    current: boolean;
+    owned: boolean;
+  }>;
+  installation_id: string | null;
+  batch_number: number | null;
+  assignment_attempt: string | null;
+  provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
+  assignment_key: string | null;
+  current: boolean;
+  owned: boolean;
+}
+
+interface BatchActiveState {
+  active: boolean;
+  installation_id: string | null;
+  batch_number: number | null;
+  assignment_attempt: string | null;
+  provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
+  assignment_key: string | null;
+  current: boolean;
+  owned: boolean;
+}
+
+interface OwnedBatchSnapshot {
+  fingerprint: string;
+  active: boolean;
+  complete: boolean;
+  completeConfirmed: boolean;
+  liveActiveBatchCleared: boolean;
+  hasItems: boolean;
+  installation_id: string;
+  batch_number: number;
+  assignment_attempt: string;
+  provenance: "owned";
+  assignment_key: string;
 }
 
 interface TelegramBridgeWidgetProps {
@@ -126,12 +175,14 @@ export default function TelegramBridgeWidget({ projectId, idle = false }: Telegr
   const [autoStatus, setAutoStatus] = useState<string | null>(null);
   const autoTelegramRef = useRef(autoTelegram);
   const runningRef = useRef(false);
+  const prevBatchRef = useRef<OwnedBatchSnapshot | null>(null);
   useEffect(() => { autoTelegramRef.current = autoTelegram; }, [autoTelegram]);
 
   // Load persisted auto setting from config
   const autoLoadedRef = useRef(false);
   useEffect(() => {
     autoLoadedRef.current = false;
+    prevBatchRef.current = null;
     setAutoTelegram(false);
     setAutoStatus(null);
   }, [projectId]);
@@ -243,46 +294,52 @@ export default function TelegramBridgeWidget({ projectId, idle = false }: Telegr
 
   // #518: batch lifecycle polling — auto-start/stop bridge with batch
   const AUTO_POLL_MS = 30_000;
-  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
 
   const checkBatchLifecycle = useCallback(async () => {
     if (!autoTelegramRef.current) return;
     try {
-      const r = await fetch(`/api/batch-progress?project=${encodeURIComponent(projectId)}`);
-      if (!r.ok) return;
-      const data: BatchState = await r.json();
-      const hasItems = data.items.length > 0;
+      const project = encodeURIComponent(projectId);
+      const [activeResponse, progressResponse] = await Promise.all([
+        fetch(`/api/batch-active?project=${project}`),
+        fetch(`/api/batch-progress?project=${project}`),
+      ]);
+      if (!activeResponse.ok || !progressResponse.ok) return;
+      const active: BatchActiveState = await activeResponse.json();
+      const data: BatchState = await progressResponse.json();
+      const next = ownedCurrentBatchSnapshot(active, data) as OwnedBatchSnapshot | null;
+      if (!next) return;
       const prev = prevBatchRef.current;
-      prevBatchRef.current = { complete: data.complete, hasItems };
+      prevBatchRef.current = next;
+      const sameAssignment = prev?.fingerprint === next.fingerprint;
 
       if (!prev) {
-        if (hasItems && !data.complete && !runningRef.current) {
+        if (next.active && next.hasItems && !next.complete && !runningRef.current) {
           setAutoStatus(t.batchActive);
-          await callTelegram("start", { project_id: projectId }).catch(() => {});
+          await callTelegram("start", { project_id: projectId, ...assignmentRequestFields(next) }).catch(() => {});
           await load();
         }
-        if (hasItems && data.complete && runningRef.current) {
+        if ((next.completeConfirmed || next.liveActiveBatchCleared) && runningRef.current) {
           setAutoStatus(t.batchComplete);
           setActionError(null); // #522: clear stale action errors on auto-stop
-          await callTelegram("stop", { project_id: projectId }).catch(() => {});
+          await callTelegram("stop", { project_id: projectId, ...assignmentRequestFields(next) }).catch(() => {});
           await load();
         }
         return;
       }
 
       // Batch just completed → auto-stop
-      if (hasItems && data.complete && !prev.complete && runningRef.current) {
+      if ((next.completeConfirmed || next.liveActiveBatchCleared) && runningRef.current) {
         setAutoStatus(t.batchComplete);
         setActionError(null); // #522: clear stale action errors on auto-stop
-        await callTelegram("stop", { project_id: projectId }).catch(() => {});
+        await callTelegram("stop", { project_id: projectId, ...assignmentRequestFields(next) }).catch(() => {});
         await load();
         return;
       }
 
       // New batch started → auto-start
-      if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !runningRef.current) {
+      if (next.active && next.hasItems && !next.complete && !sameAssignment && !runningRef.current) {
         setAutoStatus(t.newBatch);
-        await callTelegram("start", { project_id: projectId }).catch(() => {});
+        await callTelegram("start", { project_id: projectId, ...assignmentRequestFields(next) }).catch(() => {});
         await load();
       }
     } catch { /* non-fatal */ }
