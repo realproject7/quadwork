@@ -217,17 +217,23 @@ async function rejectsCode(fn, code) {
   // Repository ownership is installation-wide. Two archived projects may each
   // look eligible in isolation, but concurrent unarchives must not both run
   // cleanup before one publishes ownership and makes the other collide.
-  const ownershipStore = inMemoryCommit(config(project("owner-a", true), project("owner-b", true)));
+  const ownerAProject = { ...project("owner-a", true), repoKey: "shared" };
+  const ownerBProject = { ...project("owner-b", true), repoKey: "shared" };
+  const ownershipStore = inMemoryCommit(config(ownerAProject, ownerBProject));
   let releaseOwnerA;
   const ownerAGate = new Promise((resolve) => { releaseOwnerA = resolve; });
   const ownershipCleanup = [];
   const validateSingleOwner = (candidate) => {
-    const active = candidate.projects.filter((entry) => entry.archived !== true);
-    if (active.length > 1) {
-      const error = new Error(`owned by ${active[0].id}`);
-      error.code = "repository_owned_by_active_project";
-      error.owner_project_id = active[0].id;
-      throw error;
+    const owners = new Map();
+    for (const entry of candidate.projects.filter((item) => item.archived !== true)) {
+      const owner = owners.get(entry.repoKey);
+      if (owner) {
+        const error = new Error(`owned by ${owner}`);
+        error.code = "repository_owned_by_active_project";
+        error.owner_project_id = owner;
+        throw error;
+      }
+      owners.set(entry.repoKey, entry.id);
     }
   };
   const ownerAController = createProjectLifecycleController({
@@ -252,18 +258,44 @@ async function rejectsCode(fn, code) {
   const ownerAUnarchive = ownerAController.unarchiveProject("owner-a");
   await new Promise((resolve) => setImmediate(resolve));
   const ownerBUnarchive = ownerBController.unarchiveProject("owner-b");
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(ownershipCleanup, ["owner-a"], "second ownership candidate waits before cleanup");
-  releaseOwnerA();
-  await ownerAUnarchive;
   await assert.rejects(ownerBUnarchive, (error) => {
     assert.equal(error.code, "repository_owned_by_active_project");
     assert.equal(error.owner_project_id, "owner-a");
     return true;
   });
+  assert.deepEqual(ownershipCleanup, ["owner-a"], "second ownership candidate waits before cleanup");
+  releaseOwnerA();
+  await ownerAUnarchive;
   assert.deepEqual(ownershipCleanup, ["owner-a"], "collision leaves the losing project's resources unchanged");
   assert.equal(ownershipStore.read().projects.find((entry) => entry.id === "owner-a").archived, false);
   assert.equal(ownershipStore.read().projects.find((entry) => entry.id === "owner-b").archived, true);
+
+  const disjointStore = inMemoryCommit(config(
+    { ...project("disjoint-a", true), repoKey: "one" },
+    { ...project("disjoint-b", true), repoKey: "two" },
+  ));
+  let releaseDisjointA;
+  let releaseDisjointB;
+  const disjointAGate = new Promise((resolve) => { releaseDisjointA = resolve; });
+  const disjointBGate = new Promise((resolve) => { releaseDisjointB = resolve; });
+  const disjointCleanup = [];
+  const disjointController = (id, gate) => createProjectLifecycleController({
+    commitV2Configuration: disjointStore.commit,
+    readConfig: disjointStore.read,
+    validateV2Configuration: validateSingleOwner,
+    cleanupProject: async () => {
+      disjointCleanup.push(id);
+      await gate;
+      return { ok: true };
+    },
+  });
+  const disjointA = disjointController("disjoint-a", disjointAGate).unarchiveProject("disjoint-a");
+  const disjointB = disjointController("disjoint-b", disjointBGate).unarchiveProject("disjoint-b");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(new Set(disjointCleanup), new Set(["disjoint-a", "disjoint-b"]), "disjoint unarchives clean up concurrently");
+  releaseDisjointA();
+  releaseDisjointB();
+  await Promise.all([disjointA, disjointB]);
 
   const removeStore = inMemoryCommit(config(project("remove")));
   let allowRemove = false;

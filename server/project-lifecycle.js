@@ -6,7 +6,7 @@ const {
 
 const admissionGenerations = new Map();
 const projectLifecycleLocks = new Map();
-let unarchiveOwnershipTail = Promise.resolve();
+const unarchiveOwnershipReservations = new Map();
 
 class ProjectLifecycleError extends Error {
   constructor(code, projectId, message, status = 409) {
@@ -34,7 +34,12 @@ function projectFromConfig(config, projectId) {
   return config.projects.find((project) => project && project.id === projectId) || null;
 }
 
-function unarchiveCandidate(projectId, config, validateConfiguration = validateV2Configuration) {
+function unarchiveCandidate(
+  projectId,
+  config,
+  validateConfiguration = validateV2Configuration,
+  reservations = unarchiveOwnershipReservations,
+) {
   requireProjectId(projectId);
   const project = projectFromConfig(config, projectId);
   if (!project) throw lifecycleError("unknown_project", projectId, "project is not configured", 404);
@@ -48,10 +53,32 @@ function unarchiveCandidate(projectId, config, validateConfiguration = validateV
   // barrier and the stopped-resource set byte-for-byte unchanged.
   const candidate = {
     ...config,
-    projects: config.projects.map((entry) => entry === project ? { ...entry, archived: false } : entry),
+    projects: config.projects.map((entry) => {
+      if (entry === project) return { ...entry, archived: false };
+      const reserved = entry?.id && reservations.get(entry.id);
+      return reserved ? { ...reserved, archived: false } : entry;
+    }),
   };
   validateConfiguration(candidate, { previousConfig: config });
   return { already_unarchived: false };
+}
+
+function reserveUnarchiveOwnership(projectId, config, validateConfiguration) {
+  const state = unarchiveCandidate(projectId, config, validateConfiguration);
+  if (state.already_unarchived) return { ...state, reservation: null };
+  const project = projectFromConfig(config, projectId);
+  const reservation = Object.freeze({ ...project, archived: false });
+  // Acquisition is synchronous. Node cannot interleave another reservation
+  // between validation and this set, while the validation candidate already
+  // contains every earlier reservation as an active owner.
+  unarchiveOwnershipReservations.set(projectId, reservation);
+  return { ...state, reservation };
+}
+
+function releaseUnarchiveOwnership(projectId, reservation) {
+  if (reservation && unarchiveOwnershipReservations.get(projectId) === reservation) {
+    unarchiveOwnershipReservations.delete(projectId);
+  }
 }
 
 function admissionState(projectId, config, options = {}) {
@@ -223,19 +250,6 @@ function createProjectLifecycleController(options = {}) {
     return run;
   }
 
-  function serializeUnarchiveOwnership(operation) {
-    // Repository/path ownership is installation-wide, not project-local. Keep
-    // the potentially asynchronous preflight -> quiesce -> commit sequence
-    // single-file across unarchives so two archived projects cannot both pass
-    // preflight before either publishes its active ownership. Archive/remove
-    // for unrelated projects retain their per-project concurrency.
-    const previous = unarchiveOwnershipTail;
-    const run = previous.catch(() => {}).then(operation);
-    const tail = run.then(() => undefined, () => undefined);
-    unarchiveOwnershipTail = tail;
-    return run;
-  }
-
   async function commitArchived(projectId, archived) {
     let previousArchived = null;
     await commitConfiguration((config) => {
@@ -287,14 +301,14 @@ function createProjectLifecycleController(options = {}) {
   }
 
   function unarchiveProject(projectId) {
-    return serialize(projectId, () => serializeUnarchiveOwnership(async () => {
+    return serialize(projectId, async () => {
       let current;
       try {
         current = readConfiguration();
       } catch {
         throw lifecycleError("project_config_unavailable", projectId, "project configuration is unavailable", 503);
       }
-      const preflight = unarchiveCandidate(projectId, current, validateConfiguration);
+      const preflight = reserveUnarchiveOwnership(projectId, current, validateConfiguration);
       if (preflight.already_unarchived) {
         return {
           ok: true,
@@ -307,33 +321,37 @@ function createProjectLifecycleController(options = {}) {
         };
       }
 
-      // A prior archive may have returned partial cleanup. Re-run the same
-      // idempotent quiesce path while the persisted admission barrier is still
-      // set; only a truthful all-clear may make the project eligible again.
-      const cleanup = await cleanupArchivedProject(projectId);
-      if (!cleanup.ok) {
+      try {
+        // A prior archive may have returned partial cleanup. Re-run the same
+        // idempotent quiesce path while the persisted admission barrier is
+        // still set; only a truthful all-clear may make the project eligible.
+        const cleanup = await cleanupArchivedProject(projectId);
+        if (!cleanup.ok) {
+          return {
+            ok: false,
+            project_id: projectId,
+            archived: true,
+            already_unarchived: false,
+            admission_generation: currentAdmissionGeneration(projectId),
+            resources: cleanup.resources,
+            cleanup_errors: cleanup.cleanup_errors,
+          };
+        }
+
+        await commitArchived(projectId, false);
         return {
-          ok: false,
+          ok: true,
           project_id: projectId,
-          archived: true,
+          archived: false,
           already_unarchived: false,
           admission_generation: currentAdmissionGeneration(projectId),
           resources: cleanup.resources,
-          cleanup_errors: cleanup.cleanup_errors,
+          cleanup_errors: [],
         };
+      } finally {
+        releaseUnarchiveOwnership(projectId, preflight.reservation);
       }
-
-      await commitArchived(projectId, false);
-      return {
-        ok: true,
-        project_id: projectId,
-        archived: false,
-        already_unarchived: false,
-        admission_generation: currentAdmissionGeneration(projectId),
-        resources: cleanup.resources,
-        cleanup_errors: [],
-      };
-    }));
+    });
   }
 
   function removeProject(projectId) {
