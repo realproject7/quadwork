@@ -214,6 +214,57 @@ async function rejectsCode(fn, code) {
     (error) => error.code === "invalid_project_archive_state",
   );
 
+  // Repository ownership is installation-wide. Two archived projects may each
+  // look eligible in isolation, but concurrent unarchives must not both run
+  // cleanup before one publishes ownership and makes the other collide.
+  const ownershipStore = inMemoryCommit(config(project("owner-a", true), project("owner-b", true)));
+  let releaseOwnerA;
+  const ownerAGate = new Promise((resolve) => { releaseOwnerA = resolve; });
+  const ownershipCleanup = [];
+  const validateSingleOwner = (candidate) => {
+    const active = candidate.projects.filter((entry) => entry.archived !== true);
+    if (active.length > 1) {
+      const error = new Error(`owned by ${active[0].id}`);
+      error.code = "repository_owned_by_active_project";
+      error.owner_project_id = active[0].id;
+      throw error;
+    }
+  };
+  const ownerAController = createProjectLifecycleController({
+    commitV2Configuration: ownershipStore.commit,
+    readConfig: ownershipStore.read,
+    validateV2Configuration: validateSingleOwner,
+    cleanupProject: async () => {
+      ownershipCleanup.push("owner-a");
+      await ownerAGate;
+      return { ok: true };
+    },
+  });
+  const ownerBController = createProjectLifecycleController({
+    commitV2Configuration: ownershipStore.commit,
+    readConfig: ownershipStore.read,
+    validateV2Configuration: validateSingleOwner,
+    cleanupProject: async () => {
+      ownershipCleanup.push("owner-b");
+      return { ok: true };
+    },
+  });
+  const ownerAUnarchive = ownerAController.unarchiveProject("owner-a");
+  await new Promise((resolve) => setImmediate(resolve));
+  const ownerBUnarchive = ownerBController.unarchiveProject("owner-b");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(ownershipCleanup, ["owner-a"], "second ownership candidate waits before cleanup");
+  releaseOwnerA();
+  await ownerAUnarchive;
+  await assert.rejects(ownerBUnarchive, (error) => {
+    assert.equal(error.code, "repository_owned_by_active_project");
+    assert.equal(error.owner_project_id, "owner-a");
+    return true;
+  });
+  assert.deepEqual(ownershipCleanup, ["owner-a"], "collision leaves the losing project's resources unchanged");
+  assert.equal(ownershipStore.read().projects.find((entry) => entry.id === "owner-a").archived, false);
+  assert.equal(ownershipStore.read().projects.find((entry) => entry.id === "owner-b").archived, true);
+
   const removeStore = inMemoryCommit(config(project("remove")));
   let allowRemove = false;
   const removeController = createProjectLifecycleController({

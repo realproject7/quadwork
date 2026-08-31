@@ -6,6 +6,7 @@ const {
 
 const admissionGenerations = new Map();
 const projectLifecycleLocks = new Map();
+let unarchiveOwnershipTail = Promise.resolve();
 
 class ProjectLifecycleError extends Error {
   constructor(code, projectId, message, status = 409) {
@@ -222,6 +223,19 @@ function createProjectLifecycleController(options = {}) {
     return run;
   }
 
+  function serializeUnarchiveOwnership(operation) {
+    // Repository/path ownership is installation-wide, not project-local. Keep
+    // the potentially asynchronous preflight -> quiesce -> commit sequence
+    // single-file across unarchives so two archived projects cannot both pass
+    // preflight before either publishes its active ownership. Archive/remove
+    // for unrelated projects retain their per-project concurrency.
+    const previous = unarchiveOwnershipTail;
+    const run = previous.catch(() => {}).then(operation);
+    const tail = run.then(() => undefined, () => undefined);
+    unarchiveOwnershipTail = tail;
+    return run;
+  }
+
   async function commitArchived(projectId, archived) {
     let previousArchived = null;
     await commitConfiguration((config) => {
@@ -273,7 +287,7 @@ function createProjectLifecycleController(options = {}) {
   }
 
   function unarchiveProject(projectId) {
-    return serialize(projectId, async () => {
+    return serialize(projectId, () => serializeUnarchiveOwnership(async () => {
       let current;
       try {
         current = readConfiguration();
@@ -319,7 +333,7 @@ function createProjectLifecycleController(options = {}) {
         resources: cleanup.resources,
         cleanup_errors: [],
       };
-    });
+    }));
   }
 
   function removeProject(projectId) {
