@@ -118,6 +118,35 @@ assert.equal(runtime.ownedBatchAutomationState(
   ownedActive,
 ).authoritative, false, "a row ownership key outside the exact assignment set is rejected");
 
+const legacyProgress = {
+  compatibility_mode: "v1",
+  provenance: "legacy_unowned",
+  owned: false,
+  current: true,
+  multi_repository: false,
+  batch_number: 5,
+  completeConfirmed: false,
+  items: [{
+    repo_key: "primary",
+    repo: "Owner/A",
+    number: 42,
+    issue_number: 42,
+    kind: "issue",
+    work_item_ref: { repo_key: "primary", repo: "Owner/A", number: 42, kind: "issue" },
+  }],
+};
+const legacyActive = { ...legacyProgress, active: true };
+assert.equal(runtime.batchAutomationState(legacyProgress, legacyActive).mode, "v1",
+  "explicit preactivation single-repository mode preserves the V1 automation lifecycle");
+assert.equal(runtime.batchAutomationState(
+  { ...legacyProgress, compatibility_mode: "v2" },
+  { ...legacyActive, compatibility_mode: "v2" },
+).authoritative, false, "activated legacy_unowned rows are never revived through the V1 compatibility path");
+assert.equal(runtime.batchAutomationState(
+  { ...legacyProgress, current: false, items: [], liveActiveBatchCleared: true },
+  { ...legacyActive, current: false, active: false },
+).shouldStop, true, "an explicit live clear remains a V1-compatible stop signal without becoming V2 ownership");
+
 const originalCancelBackground = routes.cancelProjectBackground;
 
 function cleanup() {

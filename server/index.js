@@ -1879,6 +1879,53 @@ function ownedBatchAutomationState(progress, active) {
   };
 }
 
+function legacyV1BatchAutomationState(progress, active) {
+  if (!progress || !active || progress.compatibility_mode !== "v1" || active.compatibility_mode !== "v1" ||
+      progress.provenance !== "legacy_unowned" || active.provenance !== "legacy_unowned" ||
+      progress.owned !== false || active.owned !== false ||
+      progress.multi_repository === true || active.multi_repository === true ||
+      typeof active.active !== "boolean" || progress.batch_number !== active.batch_number) return null;
+  const clearedByOperator = progress.liveActiveBatchCleared === true;
+  if (!clearedByOperator && (progress.current !== true || active.current !== true)) return null;
+  const rows = Array.isArray(progress.items) ? progress.items : [];
+  const rowKeys = [];
+  if (!clearedByOperator) {
+    if (rows.length === 0) return null;
+    const seen = new Set();
+    for (const row of rows) {
+      const ref = row && row.work_item_ref;
+      if (!ref || typeof ref !== "object" || Array.isArray(ref) ||
+          typeof row.repo_key !== "string" || !row.repo_key ||
+          typeof row.repo !== "string" || !row.repo ||
+          !Number.isSafeInteger(row.number) || row.number < 1 ||
+          (row.kind !== "issue" && row.kind !== "pr") ||
+          ref.repo_key !== row.repo_key || ref.repo !== row.repo ||
+          ref.number !== row.number || ref.kind !== row.kind) return null;
+      const key = JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
+      if (seen.has(key)) return null;
+      seen.add(key);
+      rowKeys.push(key);
+    }
+  }
+  rowKeys.sort();
+  return {
+    authoritative: true,
+    mode: "v1",
+    fingerprint: JSON.stringify(["legacy-v1-batch", 1, progress.batch_number ?? null, rowKeys]),
+    active: active.active === true,
+    hasItems: rows.length > 0,
+    clearedByOperator,
+    shouldStop: progress.completeConfirmed === true || clearedByOperator,
+    identity: null,
+  };
+}
+
+function batchAutomationState(progress, active) {
+  const owned = ownedBatchAutomationState(progress, active);
+  if (owned.authoritative) return { ...owned, mode: "v2" };
+  return legacyV1BatchAutomationState(progress, active) || owned;
+}
+
 async function sendTriggerMessage(projectId) {
   let admission;
   try { admission = captureProjectAdmission(projectId); }
@@ -1919,7 +1966,7 @@ async function sendTriggerMessage(projectId) {
         // `completeConfirmed` alone won't fire when items don't all resolve as
         // merged/closed (e.g. a duplicate unmerged PR). The cleared flag is the
         // operator's intent and overrides those signals for lifecycle purposes.
-        const batchState = ownedBatchAutomationState(bp, active);
+        const batchState = batchAutomationState(bp, active);
         const clearedByOperator = batchState.clearedByOperator === true;
         if (batchState.authoritative && batchState.shouldStop) {
           console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
@@ -2736,7 +2783,7 @@ async function autoStopPollingTick() {
         stopTrigger(project.id);
         continue;
       }
-      const batchState = ownedBatchAutomationState(bp, active);
+      const batchState = batchAutomationState(bp, active);
       if (!batchState.authoritative) continue;
       const hasItems = batchState.hasItems;
       // #810: gate auto-stop on completeConfirmed (two distinct successful fetch
@@ -3255,6 +3302,8 @@ module.exports = {
   normalizedAssignmentItems,
   ownedBatchRowMatches,
   ownedBatchAutomationState,
+  legacyV1BatchAutomationState,
+  batchAutomationState,
   registerCaffeinateOwner,
   caffeinateStatus,
   releaseProjectCaffeinate,
