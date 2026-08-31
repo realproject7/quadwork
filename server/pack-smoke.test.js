@@ -131,6 +131,10 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
   assert.ok(toolFiles.length > 0, "found operator MCP tool modules to check");
   assetTargets.push(...toolFiles);
 
+  // Resource policy apply invokes this fixed source-owned helper by path to
+  // obtain Linux renameat2(RENAME_EXCHANGE); it is not visible to require().
+  assetTargets.push("server/resource-rename-exchange-helper.py");
+
   const missingAssets = assetTargets.filter((t) => !shipped.has(t));
   assert.deepEqual(
     missingAssets,

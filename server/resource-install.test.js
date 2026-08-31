@@ -70,11 +70,17 @@ function pathRootHandle({ root, fsImpl }) {
 // implementation; these ordinary-path operations are only used where no
 // directory race is injected.
 function pathConfigDirectoryHandle({ directory, fsImpl }) {
+  const exchange = (from, to) => {
+    const hold = `.resource-install-test-exchange-${process.pid}`;
+    fsImpl.renameSync(path.join(directory, from), path.join(directory, hold));
+    fsImpl.renameSync(path.join(directory, to), path.join(directory, from));
+    fsImpl.renameSync(path.join(directory, hold), path.join(directory, to));
+  };
   return {
     stat: () => fsImpl.lstatSync(directory),
     path: (name) => path.join(directory, name),
-    rename: (from, to) => fsImpl.renameSync(path.join(directory, from), path.join(directory, to)),
-    unlink: (name) => fsImpl.unlinkSync(path.join(directory, name)),
+    assertExchangeAvailable: () => {},
+    exchange,
     fsync: () => {},
     close: () => {},
   };
@@ -119,6 +125,7 @@ reset();
     destination: "~/.quadwork/config.json#runtime_resources",
     preserves_other_config_fields: true,
     creates_missing_config: false,
+    previous_config_recovery: "private_random_sibling",
   });
   assert.equal(fs.readFileSync(configPath, "utf8"), configBefore);
   assert.equal(fs.existsSync(policy().temp_root), false);
@@ -129,10 +136,33 @@ reset();
 // only runtime_resources while preserving unrelated fields and mode 0600.
 {
   const proposal = policyProposal(policyPath);
+  const previous = fs.readFileSync(configPath, "utf8");
+  const previousIdentity = fs.lstatSync(configPath);
+  const helperCalls = [];
+  function fakeExchangeHelper(command, args, options) {
+    helperCalls.push({ command, args: [...args], options });
+    assert.equal(command, "/usr/bin/python3");
+    assert.equal(path.basename(args[0]), "resource-rename-exchange-helper.py");
+    assert.equal(args[2], "3");
+    assert.equal(options.shell, false);
+    assert.equal(options.stdio[3] >= 0, true, "verified parent directory fd is inherited as child fd 3");
+    if (args[1] === "probe") return "";
+    assert.equal(args[1], "exchange");
+    const hold = path.join(configDir, ".resource-install-helper-test-hold");
+    fs.renameSync(path.join(configDir, args[3]), hold);
+    fs.renameSync(path.join(configDir, args[4]), path.join(configDir, args[3]));
+    fs.renameSync(hold, path.join(configDir, args[4]));
+    return "";
+  }
   const result = applyPolicy(
     { policyFile: policyPath, acceptanceSha256: proposal.acceptance.sha256 },
-    { platform: "linux", fsImpl: procFdFsAdapter(configDir) },
+    {
+      platform: "linux",
+      fsImpl: procFdFsAdapter(configDir),
+      execFileSyncImpl: fakeExchangeHelper,
+    },
   );
+  assert.deepEqual(helperCalls.map((call) => call.args[1]), ["probe", "exchange"]);
   assert.equal(result.status, "applied");
   const written = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.equal(written.port, 8400);
@@ -140,7 +170,62 @@ reset();
   assert.deepEqual(written.nested, { value: true });
   assert.deepEqual(written.runtime_resources, policy());
   assert.equal(fs.statSync(configPath).mode & 0o7777, 0o600);
-  assert.deepEqual(fs.readdirSync(configDir), ["config.json"], "atomic apply leaves no temporary sibling");
+  const recoveryEntry = result.result.previous_config_recovery_entry;
+  assert.match(recoveryEntry, /^\.config\.json\.resource-install-\d+-[a-f0-9]{24}\.recovery$/);
+  const recoveryPath = path.join(configDir, recoveryEntry);
+  const recoveryIdentity = fs.lstatSync(recoveryPath);
+  assert.equal(recoveryIdentity.dev, previousIdentity.dev);
+  assert.equal(recoveryIdentity.ino, previousIdentity.ino);
+  assert.equal(recoveryIdentity.mode & 0o7777, 0o600);
+  assert.equal(fs.readFileSync(recoveryPath, "utf8"), previous);
+}
+
+// An unavailable Linux exchange primitive refuses before creating a candidate
+// or changing config. A runtime exchange failure preserves the accepted config
+// and the private candidate for explicit recovery.
+reset();
+{
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const before = fs.readFileSync(configPath, "utf8");
+  const unavailable = new Error("unavailable");
+  unavailable.status = 64;
+  assert.throws(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      {
+        platform: "linux",
+        fsImpl: procFdFsAdapter(configDir),
+        execFileSyncImpl() { throw unavailable; },
+      },
+    ),
+    code("config_exchange_unavailable"),
+  );
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+  assert.deepEqual(fs.readdirSync(configDir), ["config.json"]);
+
+  let calls = 0;
+  const failed = new Error("failed");
+  failed.status = 65;
+  assert.throws(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      {
+        platform: "linux",
+        fsImpl: procFdFsAdapter(configDir),
+        execFileSyncImpl(_command, args) {
+          calls += 1;
+          if (args[1] === "exchange") throw failed;
+          return "";
+        },
+      },
+    ),
+    code("config_exchange_recovery_required"),
+  );
+  assert.equal(calls, 2);
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+  const recoveryEntries = fs.readdirSync(configDir).filter((name) => name.endsWith(".recovery"));
+  assert.equal(recoveryEntries.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(configDir, recoveryEntries[0]), "utf8")).runtime_resources.version, 1);
 }
 
 // The policy and config inputs must not have another hardlink that can retain
@@ -178,17 +263,20 @@ reset();
     return {
       stat: () => fsImpl.lstatSync(anchoredDirectory),
       path: (name) => path.join(anchoredDirectory, name),
-      rename(from, to) {
+      assertExchangeAvailable: () => {},
+      exchange(from, to) {
         fsImpl.renameSync(directory, movedDirectory);
         fsImpl.mkdirSync(outsideDirectory, { mode: 0o700 });
         fsImpl.chmodSync(outsideDirectory, 0o700);
         writePrivate(path.join(outsideDirectory, "config.json"), { marker: "outside-victim" });
         fsImpl.symlinkSync(outsideDirectory, directory, "dir");
         anchoredDirectory = movedDirectory;
-        fsImpl.renameSync(path.join(anchoredDirectory, from), path.join(anchoredDirectory, to));
+        const hold = path.join(anchoredDirectory, ".test-exchange-hold");
+        fsImpl.renameSync(path.join(anchoredDirectory, from), hold);
+        fsImpl.renameSync(path.join(anchoredDirectory, to), path.join(anchoredDirectory, from));
+        fsImpl.renameSync(hold, path.join(anchoredDirectory, to));
         raced = true;
       },
-      unlink: (name) => fsImpl.unlinkSync(path.join(anchoredDirectory, name)),
       fsync: () => {},
       close: () => {},
     };
@@ -198,7 +286,7 @@ reset();
       { policyFile: policyPath, acceptanceSha256: token },
       { configDirectoryHandleFactory: racingHandle },
     ),
-    (err) => err instanceof ResourceInstallError && err.code.startsWith("config_directory_"),
+    code("config_exchange_recovery_required"),
   );
   assert.equal(raced, true);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outsideDirectory, "config.json"), "utf8")), {
@@ -208,6 +296,48 @@ reset();
   fs.unlinkSync(configDir);
   fs.rmSync(movedDirectory, { recursive: true, force: true });
   fs.rmSync(outsideDirectory, { recursive: true, force: true });
+}
+
+// The atomic exchange preserves a destination inode that appears after the
+// accepted reread and refuses to report success. Both exchanged entries remain
+// available for explicit recovery; no path-based cleanup follows the mismatch.
+reset();
+{
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const victim = path.join(configDir, "preexisting-config-victim");
+  const savedOriginal = path.join(configDir, "saved-original-config");
+  writePrivate(victim, "VICTIM");
+  const victimIdentity = fs.lstatSync(victim);
+  let raced = false;
+  function destinationRacingHandle({ directory, fsImpl }) {
+    const base = pathConfigDirectoryHandle({ directory, fsImpl });
+    return {
+      ...base,
+      exchange(from, to) {
+        fsImpl.renameSync(path.join(directory, to), savedOriginal);
+        fsImpl.renameSync(victim, path.join(directory, to));
+        base.exchange(from, to);
+        raced = true;
+      },
+    };
+  }
+  assert.throws(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      { configDirectoryHandleFactory: destinationRacingHandle },
+    ),
+    code("config_exchange_recovery_required"),
+  );
+  assert.equal(raced, true);
+  const entries = fs.readdirSync(configDir);
+  const preservedVictim = entries.find((name) => {
+    const stat = fs.lstatSync(path.join(configDir, name));
+    return stat.dev === victimIdentity.dev && stat.ino === victimIdentity.ino;
+  });
+  assert.ok(preservedVictim, "unexpected destination inode remains recoverable");
+  assert.equal(fs.readFileSync(path.join(configDir, preservedVictim), "utf8"), "VICTIM");
+  assert.equal(JSON.parse(fs.readFileSync(configPath, "utf8")).runtime_resources.version, 1);
+  assert.equal(fs.existsSync(savedOriginal), true, "accepted original inode remains recoverable too");
 }
 
 // A source change makes the proposal stale; no config bytes are replaced.
@@ -287,7 +417,7 @@ reset(undefined, policy());
     minimum_free_bytes: 4096 * 1024 * 1024,
     current_state: "create",
     cleanup_paths: [],
-    failure_rollback: "empty_created_root_only",
+    failure_rollback: "none_preserve_created_root",
   });
   assert.match(proposal.acceptance.sha256, /^[a-f0-9]{64}$/);
   assert.equal(fs.existsSync(policy().temp_root), false);
@@ -322,8 +452,8 @@ reset(undefined, policy());
   fs.rmSync(outside, { recursive: true, force: true });
 }
 
-// A post-acceptance installer failure rolls back only the exact empty root
-// created by this transaction; it never performs recursive cleanup.
+// A post-acceptance installer failure performs no path-based deletion. The
+// exact operation-created root remains available for explicit recovery.
 {
   const proposal = tempInstallProposal({ statfs: diskStatfs });
   assert.throws(
@@ -332,20 +462,59 @@ reset(undefined, policy());
       {
         statfs: diskStatfs,
         rootHandleFactory: pathRootHandle,
-        ensureTempRoot({ tempRoot }) {
-          fs.mkdirSync(tempRoot, { mode: 0o700 });
-          throw new Error("injected verification failure");
-        },
+        ensureTempRoot() { throw new Error("injected verification failure"); },
       },
     ),
-    code("temp_install_failed"),
+    code("temp_install_failed_cleanup_required"),
   );
-  assert.equal(fs.existsSync(policy().temp_root), false, "failed install leaves no created empty root");
-  assert.equal(
-    fs.readdirSync(configDir).some((name) => name.startsWith(".quadwork-resource-install-rollback-")),
-    false,
-    "successful exact rollback leaves no quarantine",
+  assert.equal(fs.existsSync(policy().temp_root), true, "failed install preserves its created root");
+  assert.deepEqual(fs.readdirSync(policy().temp_root), []);
+  fs.rmdirSync(policy().temp_root);
+}
+
+// A would-be quarantine-name replacement cannot authorize deletion because
+// failure recovery creates no quarantine and calls no rmdir at all.
+{
+  const proposal = tempInstallProposal({ statfs: diskStatfs });
+  const victim = path.join(configDir, "preexisting-empty-quarantine-victim");
+  fs.mkdirSync(victim, { mode: 0o700 });
+  const victimIdentity = fs.lstatSync(victim);
+  let quarantineCreateCalls = 0;
+  let rmdirCalls = 0;
+  const guardedFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === "mkdirSync") return (targetPath, options) => {
+        if (path.basename(targetPath).startsWith(".quadwork-resource-install-rollback-")) {
+          quarantineCreateCalls += 1;
+        }
+        return fs.mkdirSync(targetPath, options);
+      };
+      if (property === "rmdirSync") return (...args) => { rmdirCalls += 1; return fs.rmdirSync(...args); };
+      const member = Reflect.get(target, property);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  assert.throws(
+    () => applyTempInstall(
+      { acceptanceSha256: proposal.acceptance.sha256 },
+      {
+        platform: "darwin",
+        fsImpl: guardedFs,
+        statfs: diskStatfs,
+        rootHandleFactory: pathRootHandle,
+        ensureTempRoot() { throw new Error("force preserved recovery"); },
+      },
+    ),
+    code("temp_install_failed_cleanup_required"),
   );
+  const victimAfter = fs.lstatSync(victim);
+  assert.equal(victimAfter.dev, victimIdentity.dev);
+  assert.equal(victimAfter.ino, victimIdentity.ino);
+  assert.equal(quarantineCreateCalls, 0);
+  assert.equal(rmdirCalls, 0);
+  assert.equal(fs.existsSync(policy().temp_root), true);
+  fs.rmdirSync(policy().temp_root);
+  fs.rmdirSync(victim);
 }
 
 // A host-state change also stales the token; the installer will not reinterpret

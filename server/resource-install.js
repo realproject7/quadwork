@@ -8,6 +8,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 const { CONFIG_PATH } = require("./config");
 const { parseRuntimeResources } = require("./resource-policy");
 const { ensureTempRoot, TMPFS_MAGIC, RAMFS_MAGIC } = require("./resource-temp");
@@ -15,6 +16,7 @@ const { ensureTempRoot, TMPFS_MAGIC, RAMFS_MAGIC } = require("./resource-temp");
 const POLICY_FILE_MAX_BYTES = 64 * 1024;
 const CONFIG_FILE_MAX_BYTES = 4 * 1024 * 1024;
 const ACCEPTANCE_RE = /^[a-f0-9]{64}$/;
+const EXCHANGE_HELPER = path.join(__dirname, "resource-rename-exchange-helper.py");
 
 class ResourceInstallError extends Error {
   constructor(code, message) {
@@ -178,7 +180,25 @@ function validateEntryName(name) {
   return name;
 }
 
-function linuxConfigDirectoryHandleFactory({ directory, fsImpl }) {
+function runLinuxExchangeHelper(fd, mode, source, destination, execFileSyncImpl) {
+  try {
+    execFileSyncImpl("/usr/bin/python3", [EXCHANGE_HELPER, mode, "3", source, destination], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe", fd],
+      timeout: 5_000,
+      windowsHide: true,
+    });
+  } catch (err) {
+    if (mode === "probe" || (err && Number(err.status) === 64)) {
+      fail("config_exchange_unavailable", "atomic configuration exchange is unavailable");
+    }
+    fail("config_exchange_failed", "atomic configuration exchange failed");
+  }
+}
+
+function linuxConfigDirectoryHandleFactory({ directory, fsImpl, execFileSyncImpl }) {
   const constants = fsImpl.constants || fs.constants;
   if (!Number.isInteger(constants.O_DIRECTORY) || !Number.isInteger(constants.O_NOFOLLOW)) {
     fail("config_descriptor_anchor_unavailable", "secure configuration updates require a Linux directory descriptor");
@@ -195,11 +215,20 @@ function linuxConfigDirectoryHandleFactory({ directory, fsImpl }) {
     return {
       stat: () => fsImpl.fstatSync(fd),
       path: (name) => path.join(handleRoot, validateEntryName(name)),
-      rename: (from, to) => fsImpl.renameSync(
-        path.join(handleRoot, validateEntryName(from)),
-        path.join(handleRoot, validateEntryName(to)),
+      assertExchangeAvailable: () => runLinuxExchangeHelper(
+        fd,
+        "probe",
+        `.resource-exchange-probe-${crypto.randomBytes(12).toString("hex")}`,
+        `.resource-exchange-probe-${crypto.randomBytes(12).toString("hex")}`,
+        execFileSyncImpl,
       ),
-      unlink: (name) => fsImpl.unlinkSync(path.join(handleRoot, validateEntryName(name))),
+      exchange: (from, to) => runLinuxExchangeHelper(
+        fd,
+        "exchange",
+        validateEntryName(from),
+        validateEntryName(to),
+        execFileSyncImpl,
+      ),
       fsync: () => fsImpl.fsyncSync(fd),
       close: () => fsImpl.closeSync(fd),
     };
@@ -221,11 +250,19 @@ function openConfigDirectoryHandle(directoryIdentity, options = {}) {
   }
   let handle;
   try {
-    handle = factory({ directory: path.dirname(CONFIG_PATH), fsImpl });
+    handle = factory({
+      directory: path.dirname(CONFIG_PATH),
+      fsImpl,
+      execFileSyncImpl: options.execFileSyncImpl || execFileSync,
+    });
     const opened = handle.stat();
     if (!opened.isDirectory() || !sameOwnedNode(directoryIdentity, opened)) {
       fail("config_directory_changed", "QuadWork configuration directory changed before apply");
     }
+    if (typeof handle.assertExchangeAvailable !== "function" || typeof handle.exchange !== "function") {
+      fail("config_exchange_unavailable", "atomic configuration exchange is unavailable");
+    }
+    handle.assertExchangeAvailable();
     return handle;
   } catch (err) {
     if (handle) {
@@ -286,6 +323,7 @@ function policyProposal(policyFile, options = {}) {
       destination: "~/.quadwork/config.json#runtime_resources",
       preserves_other_config_fields: true,
       creates_missing_config: false,
+      previous_config_recovery: "private_random_sibling",
     }),
   });
 }
@@ -315,18 +353,21 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
   if (Buffer.byteLength(data, "utf8") > CONFIG_FILE_MAX_BYTES) {
     fail("config_size_invalid", "updated QuadWork configuration is too large");
   }
-  const temporary = `.config.json.resource-install-${process.pid}-${crypto.randomBytes(12).toString("hex")}.tmp`;
+  const temporary = `.config.json.resource-install-${process.pid}-${crypto.randomBytes(12).toString("hex")}.recovery`;
   const constants = fsImpl.constants || fs.constants;
   if (!Number.isInteger(constants.O_NOFOLLOW)) {
     fail("config_descriptor_anchor_unavailable", "secure configuration updates require O_NOFOLLOW");
   }
   let directoryHandle;
   let fd;
-  let committed = false;
+  let candidateCreated = false;
+  let exchangeAttempted = false;
+  let exchanged = false;
   try {
     directoryHandle = openConfigDirectoryHandle(directoryIdentity, options);
     const temporaryPath = directoryHandle.path(temporary);
     fd = fsImpl.openSync(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    candidateCreated = true;
     fsImpl.writeFileSync(fd, data, "utf8");
     fsImpl.fsyncSync(fd);
     const writtenStat = fsImpl.fstatSync(fd);
@@ -349,11 +390,16 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
       fail("config_changed", "QuadWork configuration changed before apply");
     }
     assertNamedConfigDirectory(fsImpl, uid, directoryIdentity);
-    directoryHandle.rename(temporary, "config.json");
-    committed = true;
+    exchangeAttempted = true;
+    directoryHandle.exchange(temporary, "config.json");
+    exchanged = true;
     const installed = fsImpl.lstatSync(directoryHandle.path("config.json"));
     if (!installed.isFile() || installed.isSymbolicLink() || !sameNode(tempStat, installed)) {
-      fail("config_atomic_write_unsafe", "installed configuration identity could not be verified");
+      fail("config_exchange_recovery_required", "configuration exchange requires explicit recovery");
+    }
+    const displaced = fsImpl.lstatSync(directoryHandle.path(temporary));
+    if (!displaced.isFile() || displaced.isSymbolicLink() || !sameNode(current.identity, displaced)) {
+      fail("config_exchange_recovery_required", "configuration exchange requires explicit recovery");
     }
     directoryHandle.fsync();
     const finalHandleDirectory = directoryHandle.stat();
@@ -361,20 +407,35 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
       fail("config_directory_changed", "QuadWork configuration directory changed during apply");
     }
     assertNamedConfigDirectory(fsImpl, uid, directoryIdentity);
+    const finalInstalled = fsImpl.lstatSync(directoryHandle.path("config.json"));
+    const finalRecovery = fsImpl.lstatSync(directoryHandle.path(temporary));
+    if (!finalInstalled.isFile()
+      || finalInstalled.isSymbolicLink()
+      || !sameNode(tempStat, finalInstalled)
+      || !finalRecovery.isFile()
+      || finalRecovery.isSymbolicLink()
+      || !sameNode(current.identity, finalRecovery)) {
+      fail("config_exchange_recovery_required", "configuration exchange requires explicit recovery");
+    }
   } catch (err) {
+    if (exchangeAttempted) {
+      fail("config_exchange_recovery_required", "configuration exchange requires explicit recovery");
+    }
+    if (candidateCreated) {
+      fail("config_write_failed_cleanup_required", "configuration candidate requires explicit recovery");
+    }
     if (err instanceof ResourceInstallError) throw err;
     fail("config_write_failed", "QuadWork configuration could not be updated atomically");
   } finally {
     if (fd !== undefined) {
       try { fsImpl.closeSync(fd); } catch {}
     }
-    if (!committed) {
-      try { directoryHandle.unlink(temporary); } catch {}
-    }
     if (directoryHandle) {
       try { directoryHandle.close(); } catch {}
     }
   }
+  if (!exchanged) fail("config_exchange_failed", "atomic configuration exchange did not complete");
+  return Object.freeze({ recoveryEntry: temporary });
 }
 
 function applyPolicy({ policyFile, acceptanceSha256 }, options = {}) {
@@ -384,7 +445,7 @@ function applyPolicy({ policyFile, acceptanceSha256 }, options = {}) {
   if (proposal.acceptance.sha256 !== acceptanceSha256) fail("acceptance_mismatch", "policy acceptance token does not match the current policy file");
   const previous = readConfigSecure(options);
   const nextConfig = { ...previous.config, runtime_resources: proposal.policy };
-  writeConfigAtomic(previous, nextConfig, options);
+  const written = writeConfigAtomic(previous, nextConfig, options);
   return Object.freeze({
     ok: true,
     status: "applied",
@@ -392,6 +453,7 @@ function applyPolicy({ policyFile, acceptanceSha256 }, options = {}) {
     acceptance: proposal.acceptance,
     policy: proposal.policy,
     plan: proposal.plan,
+    result: Object.freeze({ previous_config_recovery_entry: written.recoveryEntry }),
   });
 }
 
@@ -470,59 +532,6 @@ function validateTempTarget(policy, options = {}) {
   });
 }
 
-function rollbackEmptyCreatedRoot(fsImpl, parentRoot, entryName, uid, createdIdentity) {
-  const targetPath = path.join(parentRoot, entryName);
-  let quarantinePath = null;
-  let quarantineIdentity = null;
-  let detached = false;
-  try {
-    const stat = fsImpl.lstatSync(targetPath);
-    if (!sameOwnedNode(stat, createdIdentity) || stat.isSymbolicLink() || !stat.isDirectory() || modeOf(stat) !== 0o700) return false;
-    if (uid !== null && stat.uid !== uid) return false;
-    if (fsImpl.readdirSync(targetPath).length !== 0) return false;
-
-    // Reserve a random owner-only container first. If the accepted name is
-    // swapped after the identity check, the second identity check below keeps
-    // that entry quarantined and, critically, never deletes it as ours.
-    const quarantineName = `.quadwork-resource-install-rollback-${crypto.randomBytes(16).toString("hex")}`;
-    quarantinePath = path.join(parentRoot, quarantineName);
-    fsImpl.mkdirSync(quarantinePath, { recursive: false, mode: 0o700 });
-    quarantineIdentity = fsImpl.lstatSync(quarantinePath);
-    if (quarantineIdentity.isSymbolicLink()
-      || !quarantineIdentity.isDirectory()
-      || modeOf(quarantineIdentity) !== 0o700
-      || (uid !== null && quarantineIdentity.uid !== uid)) return false;
-    const detachedPath = path.join(quarantinePath, "created-root");
-    fsImpl.renameSync(targetPath, detachedPath);
-    detached = true;
-    const detachedStat = fsImpl.lstatSync(detachedPath);
-    if (!sameOwnedNode(detachedStat, createdIdentity)
-      || detachedStat.isSymbolicLink()
-      || !detachedStat.isDirectory()
-      || fsImpl.readdirSync(detachedPath).length !== 0) return false;
-    fsImpl.rmdirSync(detachedPath);
-    detached = false;
-    const finalQuarantine = fsImpl.lstatSync(quarantinePath);
-    if (!sameOwnedNode(finalQuarantine, quarantineIdentity) || fsImpl.readdirSync(quarantinePath).length !== 0) return false;
-    fsImpl.rmdirSync(quarantinePath);
-    quarantinePath = null;
-    return true;
-  } catch (err) {
-    return false;
-  } finally {
-    // Only remove our exact still-empty reservation. A detached or replaced
-    // node is preserved for explicit operator recovery.
-    if (!detached && quarantinePath && quarantineIdentity) {
-      try {
-        const stat = fsImpl.lstatSync(quarantinePath);
-        if (sameOwnedNode(stat, quarantineIdentity) && fsImpl.readdirSync(quarantinePath).length === 0) {
-          fsImpl.rmdirSync(quarantinePath);
-        }
-      } catch {}
-    }
-  }
-}
-
 function buildTempInstallProposal(options = {}) {
   const current = readConfigSecure(options);
   let policy;
@@ -541,7 +550,7 @@ function buildTempInstallProposal(options = {}) {
     minimum_free_bytes: target.requiredBytes,
     current_state: target.currentState,
     cleanup_paths: Object.freeze([]),
-    failure_rollback: "empty_created_root_only",
+    failure_rollback: "none_preserve_created_root",
   });
   const proposal = Object.freeze({
     ok: true,
@@ -672,12 +681,10 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
     failure = err instanceof ResourceInstallError
       ? err
       : new ResourceInstallError("temp_install_failed", "resource temp root could not be installed securely");
-    if (createdUnverified
-      || (createdIdentity
-        && !rollbackEmptyCreatedRoot(options.fsImpl || fs, parentRoot, entryName, expectedUid(options), createdIdentity))) {
+    if (createdUnverified || createdIdentity) {
       failure = new ResourceInstallError(
         "temp_install_failed_cleanup_required",
-        "resource temp installation failed and its exact empty-root rollback could not be verified",
+        "resource temp installation failed and the created root was preserved for explicit recovery",
       );
     }
   } finally {

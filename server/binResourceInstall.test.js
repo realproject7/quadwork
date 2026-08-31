@@ -40,11 +40,17 @@ function sink() {
 }
 
 function pathConfigDirectoryHandle({ directory, fsImpl }) {
+  const exchange = (from, to) => {
+    const hold = `.resource-install-cli-test-exchange-${process.pid}`;
+    fsImpl.renameSync(path.join(directory, from), path.join(directory, hold));
+    fsImpl.renameSync(path.join(directory, to), path.join(directory, from));
+    fsImpl.renameSync(path.join(directory, hold), path.join(directory, to));
+  };
   return {
     stat: () => fsImpl.lstatSync(directory),
     path: (name) => path.join(directory, name),
-    rename: (from, to) => fsImpl.renameSync(path.join(directory, from), path.join(directory, to)),
-    unlink: (name) => fsImpl.unlinkSync(path.join(directory, name)),
+    assertExchangeAvailable: () => {},
+    exchange,
     fsync: () => {},
     close: () => {},
   };

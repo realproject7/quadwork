@@ -264,7 +264,15 @@ quadwork resources configure \
 Apply re-reads the private policy file, refuses a stale token, and atomically
 updates only `runtime_resources` in the existing private
 `~/.quadwork/config.json`. It never creates a missing config or changes the
-other config fields.
+other config fields. The Linux apply requires `/usr/bin/python3` and kernel/
+filesystem support for `renameat2(RENAME_EXCHANGE)`; it uses that atomic
+exchange and deliberately
+keeps the previous 0600 config as a randomly named private `.recovery` sibling;
+it never deletes that inode automatically. The JSON result identifies the
+recovery entry. Inspect and remove old recovery entries manually only after the
+new config is verified. If atomic exchange is unavailable or its displaced
+inode does not match the accepted config, apply refuses and preserves every
+entry for explicit recovery.
 
 Next, propose the disk-backed, owner-only temp-root operation derived from the
 persisted policy:
@@ -281,7 +289,10 @@ The first command is read-only. The apply form can create or verify only the
 policy-owned temp root and refuses aliases, memory-backed filesystems, unsafe
 ownership/mode, or insufficient accepted capacity. It does not clean legacy
 `/tmp` paths, assign per-worker `TMPDIR`, install systemd units, restart
-QuadWork, or run pressure tests.
+QuadWork, or run pressure tests. A failed create performs no automatic rename,
+quarantine, or deletion: it returns `temp_install_failed_cleanup_required` and
+leaves the operation-created root and any substituted entries for explicit
+operator recovery.
 
 Run the shipped diagnostic before considering any resource-containment work:
 

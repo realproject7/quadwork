@@ -278,7 +278,10 @@ quadwork resources temp-install \
 
 This command only creates or verifies the temp root fixed by the persisted
 policy. It does not clean `/tmp/claude-*`, relocate an agent's `TMPDIR`, install
-systemd containment, restart a service, or establish staging evidence.
+systemd containment, restart a service, or establish staging evidence. On a
+failed create it intentionally performs no path-based cleanup; a
+`temp_install_failed_cleanup_required` refusal means the created root and any
+replacement entries were preserved for explicit inspection and recovery.
 
 - `proof_refused` means the disposable-host acknowledgement or the separate
   `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has
