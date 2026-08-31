@@ -9,9 +9,7 @@ const { injectModeForCommand } = require("../src/lib/injectMode.js");
 const { readRuntimeResources } = require("../server/config");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const {
-  ResourceInstallError,
-  recoveryEntriesForError,
-  recoveryScopeForError,
+  resourceInstallFailureForError,
   policyProposal,
   applyPolicy,
   tempInstallProposal,
@@ -1337,11 +1335,10 @@ function runResourceInstallCommand(subcommand, args, options = {}) {
         : (options.tempInstallProposal || tempInstallProposal)();
     }
   } catch (err) {
-    const reason = err instanceof ResourceInstallError && typeof err.code === "string"
-      ? err.code
-      : "resource_operation_failed";
-    const recoveryEntries = recoveryEntriesForError(err);
-    const recoveryScope = recoveryScopeForError(err);
+    const errorState = resourceInstallFailureForError(err);
+    const reason = errorState ? errorState.reason : "resource_operation_failed";
+    const recoveryEntries = errorState ? errorState.recoveryEntries : [];
+    const recoveryScope = errorState ? errorState.recoveryScope : null;
     const failure = Object.freeze({
       ok: false,
       status: "refused",

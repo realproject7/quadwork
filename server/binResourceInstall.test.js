@@ -235,6 +235,11 @@ for (const args of [
     scopedError = error;
   }
   assert(scopedError instanceof ResourceInstallError);
+  assert.deepEqual(
+    Reflect.ownKeys(scopedError).filter((key) => typeof key === "symbol"),
+    [],
+    "source-owned recovery attestation is not reflectable",
+  );
 
   const scopedOut = sink();
   assert.equal(runResourcesCommand([
@@ -262,6 +267,56 @@ for (const args of [
   }), 1);
   assert.match(scopedHuman.value(), /Recovery scope: operation_created_entry_unlocated/);
   assert(!scopedHuman.value().includes("PRIVATE"));
+
+  function assertUnattested(candidate, label) {
+    const output = sink();
+    assert.equal(runResourcesCommand(["temp-install", "--json"], {
+      stdout: output.stream,
+      stderr: sink().stream,
+      tempInstallProposal() { throw candidate; },
+    }), 1, label);
+    assert.deepEqual(JSON.parse(output.value()), {
+      ok: false,
+      status: "refused",
+      reason: "resource_operation_failed",
+    }, label);
+    assert(!output.value().includes("PRIVATE"), label);
+  }
+
+  const descriptorClone = Object.create(
+    Object.getPrototypeOf(scopedError),
+    Object.getOwnPropertyDescriptors(scopedError),
+  );
+  assertUnattested(descriptorClone, "descriptor clone");
+
+  const clonedSymbolEntry = Symbol("resourceInstallRecoveryEntries");
+  const clonedSymbolScope = Symbol("resourceInstallRecoveryScope");
+  const forged = Object.create(ResourceInstallError.prototype, {
+    code: { value: "temp_install_failed_cleanup_required", enumerable: true },
+    [clonedSymbolEntry]: { value: ["PRIVATE-forged-entry"] },
+    [clonedSymbolScope]: { value: "operation_created_entry_unlocated" },
+  });
+  assertUnattested(forged, "forged ResourceInstallError with cloned symbols");
+
+  assertUnattested({
+    name: "ResourceInstallError",
+    code: "temp_install_failed_cleanup_required",
+    recovery_entries: ["PRIVATE-lookalike"],
+    recovery_scope: "operation_created_entry_unlocated",
+  }, "lookalike");
+
+  let proxyTrapCalls = 0;
+  const proxied = new Proxy(scopedError, {
+    get() { proxyTrapCalls += 1; throw new Error("PRIVATE proxy get"); },
+    getPrototypeOf() { proxyTrapCalls += 1; throw new Error("PRIVATE proxy prototype"); },
+    ownKeys() { proxyTrapCalls += 1; throw new Error("PRIVATE proxy keys"); },
+  });
+  assertUnattested(proxied, "proxied genuine error");
+  assert.equal(proxyTrapCalls, 0);
+
+  const revocable = Proxy.revocable(scopedError, {});
+  revocable.revoke();
+  assertUnattested(revocable.proxy, "revoked genuine-error proxy");
   fs.rmdirSync(displaced);
 }
 

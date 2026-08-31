@@ -300,7 +300,7 @@ printf 'recovery record: %s\n' "$BEFORE"
 IFS='|' read -r MODE_HEX ENTRY_UID MODE NLINK DEV INO <<EOF
 $BEFORE
 EOF
-[ $((0x$MODE_HEX & 0170000)) -eq 0100000 ] && \
+[ $((0x$MODE_HEX & 0170000)) -eq $((0100000)) ] && \
   [ "$ENTRY_UID" = "$OWNER_UID" ] && \
   [ "$MODE" = '600' ] && [ "$NLINK" = '1' ] || exit 1
 AFTER=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
@@ -360,7 +360,7 @@ printf 'temp recovery record: %s\n' "$BEFORE"
 IFS='|' read -r MODE_HEX ENTRY_UID MODE NLINK DEV INO <<EOF
 $BEFORE
 EOF
-[ $((0x$MODE_HEX & 0170000)) -eq 0040000 ] && \
+[ $((0x$MODE_HEX & 0170000)) -eq $((0040000)) ] && \
   [ "$ENTRY_UID" = "$OWNER_UID" ] && [ "$MODE" = '700' ] || exit 1
 AFTER=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
 [ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'temp recovery inode changed; stop' >&2; exit 1; }

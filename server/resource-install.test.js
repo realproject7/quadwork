@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 const tempHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-install-")));
 const originalHomedir = os.homedir;
@@ -37,16 +38,39 @@ const diskStatfs = () => ({ type: 0xEF53n, bavail: 20_000n, bsize: 1024n * 1024n
   const installGuide = fs.readFileSync(path.join(__dirname, "..", "docs", "install-vps.md"), "utf8");
   const troubleshooting = fs.readFileSync(path.join(__dirname, "..", "docs", "troubleshooting.md"), "utf8");
   assert.match(installGuide, /stat --printf='%f\|%u\|%a\|%h\|%d\|%i\\n'/);
-  assert.match(installGuide, /0x\$MODE_HEX & 0170000\)\) -eq 0100000/);
-  assert.match(installGuide, /0x\$MODE_HEX & 0170000\)\) -eq 0040000/);
+  const regularTypeCheck = installGuide.match(/^\[ \$\(\(0x\$MODE_HEX & 0170000\)\) -eq \$\(\(0100000\)\) \]/m)?.[0];
+  const directoryTypeCheck = installGuide.match(/^\[ \$\(\(0x\$MODE_HEX & 0170000\)\) -eq \$\(\(0040000\)\) \]/m)?.[0];
+  assert.equal(typeof regularTypeCheck, "string");
+  assert.equal(typeof directoryTypeCheck, "string");
   assert.equal(installGuide.includes("stat --printf='%F|"), false);
   assert.match(installGuide, /recovery_scope: operation_created_entry_unlocated/);
   assert.match(installGuide, /ls -lai -- '\/exact\/parent\/from-the-accepted-temp_root'/);
   assert.match(installGuide, /Never use `\*`/);
   assert.match(troubleshooting, /stat --printf='%f\|%u\|%a\|%h\|%d\|%i\\n'/);
   assert.match(troubleshooting, /do not select a cleanup target by wildcard/);
-  assert.equal(parseInt("81a4", 16) & 0o170000, 0o100000, "regular-file type bits");
-  assert.equal(parseInt("41c0", 16) & 0o170000, 0o040000, "directory type bits");
+
+  const emptyFile = path.join(tempHome, "documented-mode-empty");
+  const nonemptyFile = path.join(tempHome, "documented-mode-nonempty");
+  const directory = path.join(tempHome, "documented-mode-directory");
+  fs.writeFileSync(emptyFile, "");
+  fs.writeFileSync(nonemptyFile, "nonempty");
+  fs.mkdirSync(directory);
+  const fixtures = [
+    { target: emptyFile, accepted: regularTypeCheck, refused: directoryTypeCheck },
+    { target: nonemptyFile, accepted: regularTypeCheck, refused: directoryTypeCheck },
+    { target: directory, accepted: directoryTypeCheck, refused: regularTypeCheck },
+  ];
+  for (const shell of ["/bin/sh", "/bin/bash"].filter((candidate) => fs.existsSync(candidate))) {
+    for (const fixture of fixtures) {
+      // lstat.mode rendered as hexadecimal is the same numeric `%f` field the
+      // Ubuntu command assigns to MODE_HEX. Execute the exact documented test.
+      const modeHex = fs.lstatSync(fixture.target).mode.toString(16);
+      const accepted = spawnSync(shell, ["-c", `MODE_HEX=$1; ${fixture.accepted}`, "doc-mode-check", modeHex]);
+      assert.equal(accepted.status, 0, `${shell} accepts ${path.basename(fixture.target)}: ${accepted.stderr}`);
+      const refused = spawnSync(shell, ["-c", `MODE_HEX=$1; ${fixture.refused}`, "doc-mode-check", modeHex]);
+      assert.notEqual(refused.status, 0, `${shell} rejects wrong type for ${path.basename(fixture.target)}`);
+    }
+  }
 }
 
 function policy(overrides = {}) {

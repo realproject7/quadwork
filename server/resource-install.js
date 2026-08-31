@@ -21,17 +21,29 @@ const { ensureTempRoot, TMPFS_MAGIC, RAMFS_MAGIC } = require("./resource-temp");
 const POLICY_FILE_MAX_BYTES = 64 * 1024;
 const CONFIG_FILE_MAX_BYTES = 4 * 1024 * 1024;
 const ACCEPTANCE_RE = /^[a-f0-9]{64}$/;
-const RECOVERY_ENTRIES = Symbol("resourceInstallRecoveryEntries");
-const RECOVERY_SCOPE = Symbol("resourceInstallRecoveryScope");
 const MAX_RECOVERY_ENTRIES = 8;
 const MAX_RECOVERY_ENTRY_BYTES = 255;
 const OPERATION_CREATED_ENTRY_UNLOCATED = "operation_created_entry_unlocated";
+const EMPTY_RECOVERY_ENTRIES = Object.freeze([]);
+const RESOURCE_INSTALL_ERROR_STATE = new WeakMap();
+
+function installErrorState(reason, recoveryEntries = EMPTY_RECOVERY_ENTRIES, recoveryScope = null) {
+  return Object.freeze({
+    reason: typeof reason === "string" ? reason : "resource_operation_failed",
+    recoveryEntries,
+    recoveryScope,
+  });
+}
 
 class ResourceInstallError extends Error {
   constructor(code, message) {
     super(message);
     this.name = "ResourceInstallError";
     this.code = code;
+    // Recovery metadata is authority-bearing operator output. Register every
+    // genuine instance privately, and let only source-owned failure factories
+    // replace the empty bounded state below.
+    RESOURCE_INSTALL_ERROR_STATE.set(this, installErrorState(code));
   }
 }
 
@@ -67,18 +79,11 @@ function normalizeRecoveryScope(scope) {
 
 function createRecoveryError(code, message, entries, scope = null) {
   const error = new ResourceInstallError(code, message);
-  Object.defineProperty(error, RECOVERY_ENTRIES, {
-    configurable: false,
-    enumerable: false,
-    value: normalizeRecoveryEntries(entries),
-    writable: false,
-  });
-  Object.defineProperty(error, RECOVERY_SCOPE, {
-    configurable: false,
-    enumerable: false,
-    value: normalizeRecoveryScope(scope),
-    writable: false,
-  });
+  RESOURCE_INSTALL_ERROR_STATE.set(error, installErrorState(
+    code,
+    normalizeRecoveryEntries(entries),
+    normalizeRecoveryScope(scope),
+  ));
   return error;
 }
 
@@ -86,14 +91,18 @@ function recoveryFailure(code, message, entries) {
   throw createRecoveryError(code, message, entries);
 }
 
+function resourceInstallFailureForError(error) {
+  return RESOURCE_INSTALL_ERROR_STATE.get(error) || null;
+}
+
 function recoveryEntriesForError(error) {
-  if (!(error instanceof ResourceInstallError)) return Object.freeze([]);
-  return normalizeRecoveryEntries(error[RECOVERY_ENTRIES]);
+  const state = resourceInstallFailureForError(error);
+  return state ? state.recoveryEntries : EMPTY_RECOVERY_ENTRIES;
 }
 
 function recoveryScopeForError(error) {
-  if (!(error instanceof ResourceInstallError)) return null;
-  return normalizeRecoveryScope(error[RECOVERY_SCOPE]);
+  const state = resourceInstallFailureForError(error);
+  return state ? state.recoveryScope : null;
 }
 
 function expectedUid(options) {
@@ -856,6 +865,7 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
 
 module.exports = {
   ResourceInstallError,
+  resourceInstallFailureForError,
   recoveryEntriesForError,
   recoveryScopeForError,
   canonicalJson,
