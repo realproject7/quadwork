@@ -164,8 +164,7 @@ function sanitizeTerminalFact(input, oomProvenance) {
     && oomProvenance.generation_id === generationId
     && oomProvenance.resource_class === resourceClass
     && oomProvenance.unit_name === unitName
-    && BigInt(oomProvenance.oom_kill_count) > 0n
-    && Date.parse(oomProvenance.observed_at) >= Date.parse(finishedAt);
+    && BigInt(oomProvenance.oom_kill_count) > 0n;
   if (reason === "oom_kill" && (!hasOomProvenance || !exit.valid || !signal.valid)) normalizedReason = "unknown";
   return Object.freeze({
     project_id: projectId,

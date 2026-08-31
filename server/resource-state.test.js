@@ -245,49 +245,39 @@ function fullState(terminalFacts = [fact(1)]) {
   );
 }
 
-// OOM authority belongs to one exact resource identity and a counter observed
-// no earlier than that identity's terminal fact. Global, unrelated, and stale
-// observations are retained only when well formed and cannot authorize OOM.
+// OOM authority belongs to one exact immutable resource identity. Both the
+// controller's durable pre-collect observation and a post-exit observation are
+// valid; timestamp ordering is not fabricated from those separate events.
 {
   const oomFact = fact(31, { reason: "oom_kill", exit_code: 0, signal: null });
-  const exact = {
+  const exactPreCollect = {
     project_id: oomFact.project_id,
     generation_id: oomFact.generation_id,
     resource_class: oomFact.resource_class,
     unit_name: oomFact.unit_name,
     oom_kill_count: 3,
-    observed_at: oomFact.finished_at,
+    observed_at: "2026-08-01T00:00:00.000Z",
   };
   assert.equal(createResourceSnapshot({
-    last_cgroup_oom: exact,
+    last_cgroup_oom: exactPreCollect,
     terminal_facts: [oomFact],
-  }).terminal_facts[0].reason, "oom_kill");
+  }).terminal_facts[0].reason, "oom_kill", "long-lived generation pre-collect observation authorizes OOM");
+
+  assert.equal(createResourceSnapshot({
+    last_cgroup_oom: { ...exactPreCollect, observed_at: "2026-09-01T00:00:00.000Z" },
+    terminal_facts: [oomFact],
+  }).terminal_facts[0].reason, "oom_kill", "post-exit observation authorizes OOM");
 
   for (const mismatch of [
     { generation_id: "another-generation" },
     { project_id: "another-project" },
     { resource_class: oomFact.resource_class === "worker" ? "control" : "worker" },
     { unit_name: "another-worker.scope" },
-    { observed_at: "2026-08-31T00:00:30.999Z" },
   ]) {
-    const provenance = { ...exact, ...mismatch };
-    if (mismatch.observed_at) {
-      const laterFact = fact(31, {
-        reason: "oom_kill",
-        exit_code: 0,
-        signal: null,
-        finished_at: "2026-08-31T00:00:31.000Z",
-      });
-      assert.equal(createResourceSnapshot({
-        last_cgroup_oom: provenance,
-        terminal_facts: [laterFact],
-      }).terminal_facts[0].reason, "unknown");
-    } else {
-      assert.equal(createResourceSnapshot({
-        last_cgroup_oom: provenance,
-        terminal_facts: [oomFact],
-      }).terminal_facts[0].reason, "unknown");
-    }
+    assert.equal(createResourceSnapshot({
+      last_cgroup_oom: { ...exactPreCollect, ...mismatch },
+      terminal_facts: [oomFact],
+    }).terminal_facts[0].reason, "unknown");
   }
 
   const legacyGlobal = createResourceSnapshot({
