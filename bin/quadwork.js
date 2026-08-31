@@ -8,6 +8,7 @@ const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 const { readRuntimeResources } = require("../server/config");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
+const { configureServiceTempEnvironment } = require("../server/resource-service-env");
 const {
   resourceInstallFailureForError,
   policyProposal,
@@ -910,6 +911,16 @@ async function cmdInit() {
 
 async function cmdStart() {
   console.log("\n  QuadWork Start\n");
+
+  // #1038: before loading the server (and therefore before any agent/control
+  // child spawn), re-verify the explicitly installed service temp root. This
+  // path is read-only and never blocks the diagnostic control plane.
+  const serviceTempFact = configureServiceTempEnvironment();
+  if (serviceTempFact.status === "ready") {
+    ok(`Resource temp environment verified [${serviceTempFact.code}]; containment_ready=false (service temp only).`);
+  } else {
+    warn(`Resource temp environment unavailable [${serviceTempFact.code}]; dashboard diagnostics remain online; containment_ready=false.`);
+  }
 
   const config = readConfig();
   if (config.projects.length === 0) {

@@ -85,7 +85,12 @@ This is the same command QuadWork runs at project creation; it writes the trust 
 
 **Cause:** pm2 strips environment variables from child processes. Even if nvm is loaded when you run `pm2 start`, the QuadWork process inherits a minimal PATH without nvm binaries.
 
-**Fix:** Use a wrapper script that sources nvm before starting QuadWork:
+**Fix:** First complete the explicit `quadwork resources configure --apply` and
+`quadwork resources temp-install --apply` sequence from the VPS guide. Run
+`quadwork resources preflight --json` and inspect the temp-root facts before
+starting pm2. Then use a wrapper that sources nvm and exports the exact accepted
+`runtime_resources.temp_root` as a single-quoted value (never `eval`, a wildcard,
+or a discovered prefix):
 
 ```bash
 cat > ~/start-quadwork.sh << 'EOF'
@@ -93,6 +98,7 @@ cat > ~/start-quadwork.sh << 'EOF'
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 nvm use 24
+export TMPDIR='/home/quadwork/.quadwork/tmp'
 exec quadwork start
 EOF
 chmod +x ~/start-quadwork.sh
@@ -102,6 +108,11 @@ pm2 delete quadwork
 pm2 start ~/start-quadwork.sh --name quadwork --interpreter /bin/bash
 pm2 save
 ```
+
+Replace the example `TMPDIR` only with the exact value accepted in the policy.
+Startup re-verifies it read-only before loading the server. A typed warning keeps
+the dashboard/API diagnostics online but means `containment_ready=false`; do not
+treat the wrapper export or temp-root availability as cgroup/PTY staging proof.
 
 **Do NOT fix with symlinks** (e.g., `ln -s ~/.nvm/.../claude /usr/local/bin/claude`). Symlinks resolve the binary but not the environment — agents still won't find auth credentials.
 

@@ -173,7 +173,17 @@ npm install -g pm2
 
 **IMPORTANT:** pm2 strips PATH from child processes. Even if nvm is loaded, the QuadWork process won't have nvm binaries in PATH. **Do not fix with symlinks** — they resolve the binary but not the environment.
 
-Create a wrapper script:
+Before creating or starting the wrapper, complete the explicit resource-policy
+proposal/apply and `temp-install` proposal/apply sequence in
+[Resource preflight and disposable staging evidence](#resource-preflight-and-disposable-staging-evidence)
+below. Then run `quadwork resources preflight --json` and verify the accepted
+temp-root facts are owner-only, disk-backed, and available. The overall
+preflight remains non-zero while the separate containment staging proof is
+pending; temp-root readiness alone is not containment readiness.
+
+Create a wrapper script. The single-quoted `TMPDIR` value must be copied exactly
+from the accepted `runtime_resources.temp_root`; do not compute it with shell
+interpolation, `eval`, a wildcard, or a directory search:
 
 ```bash
 cat > ~/start-quadwork.sh << 'EOF'
@@ -181,6 +191,7 @@ cat > ~/start-quadwork.sh << 'EOF'
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 nvm use 24
+export TMPDIR='/home/quadwork/.quadwork/tmp'
 exec quadwork start
 EOF
 chmod +x ~/start-quadwork.sh
@@ -192,6 +203,14 @@ Start with pm2:
 pm2 start ~/start-quadwork.sh --name quadwork --interpreter /bin/bash
 pm2 save
 ```
+
+`quadwork start` re-reads the fixed policy and re-verifies that exact root before
+loading the server or spawning descendants. If the root is missing, aliased,
+memory-backed, incorrectly owned/mode-set, or below the accepted capacity, it
+discards the unverified Linux `TMPDIR`, prints a typed warning, and keeps the
+dashboard/API diagnostic plane online. Even a verified service `TMPDIR` reports
+`containment_ready=false`; worker cgroup/PTY containment still requires the
+separate staging proof.
 
 Auto-start on reboot:
 
