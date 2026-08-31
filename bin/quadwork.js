@@ -265,6 +265,16 @@ function readConfig() {
 }
 
 function writeConfig(config) {
+  if (typeof config?.installation_id === "string") {
+    // Every activated CLI writer (init settings, migrations, cleanup metadata,
+    // and legacy helpers) must re-enter the shared fresh-read transaction. A
+    // stale snapshot that predates a server archive can therefore never write
+    // archived=false/absent back over the durable barrier from another process.
+    return commitV2Configuration((fresh) => {
+      for (const key of Object.keys(fresh)) delete fresh[key];
+      Object.assign(fresh, config);
+    });
+  }
   if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
   try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
@@ -1688,5 +1698,6 @@ module.exports = {
   renderResourceInstall,
   runResourceInstallCommand,
   runResourcesCommand,
+  writeConfig,
   writeQuadWorkConfig,
 };

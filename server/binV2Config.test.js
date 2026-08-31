@@ -18,7 +18,7 @@ process.on("exit", () => {
   try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch {}
 });
 
-const { writeQuadWorkConfig } = require("../bin/quadwork");
+const { writeConfig, writeQuadWorkConfig } = require("../bin/quadwork");
 
 const installationId = "installation_cli_v2_123456";
 const setup = (projectName, repo, workingDir) => ({
@@ -49,6 +49,15 @@ fs.writeFileSync(CONFIG_PATH, JSON.stringify({
 }, null, 2));
 
 const before = fs.readFileSync(CONFIG_PATH, "utf8");
+const staleCliSnapshot = JSON.parse(before);
+staleCliSnapshot.projects[0].archived = false;
+assert.throws(
+  () => writeConfig(staleCliSnapshot),
+  (error) => error?.code === "project_ownership_reserved",
+  "every activated CLI writer rechecks the live archived barrier",
+);
+assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), before, "rejected stale CLI writer leaves config byte-identical");
+
 assert.throws(
   () => writeQuadWorkConfig(setup("archived", "Acme/Replacement", replacementDir)),
   (error) => error?.code === "project_ownership_reserved",
