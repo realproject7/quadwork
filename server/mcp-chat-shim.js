@@ -21,8 +21,9 @@ if (!PROJECT || !AGENT || !PORT) {
 }
 
 const BASE = `http://127.0.0.1:${PORT}`;
+const PROJECT_ROLES = new Set(["head", "dev", "re1", "re2"]);
 
-const TOOLS = [
+const CHAT_TOOLS = [
   {
     name: "chat_send",
     description: "Send a message to the project chat",
@@ -48,6 +49,32 @@ const TOOLS = [
     },
   },
 ];
+
+const ISSUE_CONTRACT_REVISION_TOOL = {
+  name: "issue_contract_revision",
+  description: "Read the authenticated live GitHub issue body revision for one registered repository in this project. The server derives project and actor from this role's shim token; callers provide only repo_key and issue.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      repo_key: { type: "string", description: "Registered project repository key" },
+      issue: { type: "integer", minimum: 1 },
+    },
+    required: ["repo_key", "issue"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+};
+
+function toolsForActor() {
+  return PROJECT_ROLES.has(AGENT)
+    ? [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL]
+    : CHAT_TOOLS;
+}
 
 function jsonRpc(id, result) {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
@@ -117,6 +144,19 @@ async function handleToolCall(id, name, params) {
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(Array.isArray(res.body) ? { messages: res.body } : res.body) }] });
     }
 
+    if (name === "issue_contract_revision") {
+      const res = await httpRequest(
+        "POST",
+        "/api/issue-contract-revision",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
     return jsonRpcError(id, -32601, `Unknown tool: ${name}`);
   } catch (err) {
     return jsonRpcError(id, -32000, err.message);
@@ -141,7 +181,7 @@ async function handleMessage(msg) {
   }
 
   if (method === "tools/list") {
-    return jsonRpc(id, { tools: TOOLS });
+    return jsonRpc(id, { tools: toolsForActor() });
   }
 
   if (method === "tools/call") {

@@ -987,6 +987,32 @@ const {
   commitV2Configuration,
 } = require("./config");
 const { findAgentChattr } = require("./install-agentchattr");
+const { createIssueContractRevisionHandler } = require("./issue-contract-revision");
+
+function resolveRegisteredIssueContract(projectId, repoKey, issue) {
+  const context = readLiveBatchContext(projectId);
+  if (!context?.queueReadOk || context.parsed?.errors?.length > 0) return null;
+  if (context.activated &&
+      (context.parsed.provenance !== "owned" || !context.parsed.assignmentKey)) return null;
+  if (!context.activated && context.repositories.length !== 1) return null;
+  const binding = context.repositories.find((entry) => entry.key === repoKey);
+  if (!binding) return null;
+  const registered = context.parsed.workItems.some((item) => {
+    const ref = item.ref || item;
+    return ref.repoKey === repoKey && ref.number === issue && ref.kind === "issue" &&
+      canonicalGithubRepo(ref.repo) === binding.cache_repo;
+  });
+  return registered
+    ? { repo: binding.repo, issue, fingerprint: context.fingerprint }
+    : null;
+}
+
+router.post("/api/issue-contract-revision", createIssueContractRevisionHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  resolveRegisteredIssue: resolveRegisteredIssueContract,
+}));
 
 /**
  * Seed ~/.quadwork/{projectId}/OVERNIGHT-QUEUE.md from the template.
@@ -6928,6 +6954,7 @@ module.exports.RESEED_STATE_PATH = RESEED_STATE_PATH;
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
 module.exports.readLiveBatchContext = readLiveBatchContext;
+module.exports.resolveRegisteredIssueContract = resolveRegisteredIssueContract;
 module.exports.validateCurrentOwnedAssignment = validateCurrentOwnedAssignment;
 module.exports.validateCurrentAutomationRequest = validateCurrentAutomationRequest;
 module.exports.canonicalWorkItemKey = canonicalWorkItemKey;

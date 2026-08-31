@@ -62,6 +62,7 @@ const {
   validateCurrentOwnedAssignment,
   validateCurrentAutomationRequest,
   readLiveBatchContext,
+  resolveRegisteredIssueContract,
   _batchProgressCache,
   _graphqlCache,
 } = routes;
@@ -85,6 +86,19 @@ async function run() {
   assert.equal(parsed.workItems.length, 2);
   assert.notEqual(parsed.workItems[0].key, parsed.workItems[1].key);
   assert.deepEqual(parsed.workItems.map((item) => item.repoKey), ["web", "api"]);
+  const registeredWeb = resolveRegisteredIssueContract("p", "web", 42);
+  assert.equal(registeredWeb.repo, "Acme/Web");
+  assert.equal(registeredWeb.issue, 42);
+  assert.equal(typeof registeredWeb.fingerprint, "string");
+  assert.equal(resolveRegisteredIssueContract("p", "web", 41), null,
+    "an arbitrary issue outside the live assignment is not a registered item");
+  assert.equal(resolveRegisteredIssueContract("p", "missing", 42), null,
+    "a work item cannot escape the project's registered repository bindings");
+
+  queue = active(["- Acme/Web#42 pull request"], { type: "pr-review" });
+  assert.equal(resolveRegisteredIssueContract("p", "web", 42), null,
+    "a PR review row cannot be used as an issue-body digest oracle");
+  queue = active(["- Acme/Web#42 first", "- Acme/API#42 second"]);
 
   // Multi-repo bare, unknown, malformed, and duplicate refs fail the whole parse.
   for (const [line, code] of [
@@ -395,6 +409,10 @@ async function run() {
   assert.equal(payload.owned, false);
   assert.equal(payload.items[0].issue_number, 42);
   assert.equal(typeof payload.batch_observation_fingerprint, "string");
+  const registeredV1 = resolveRegisteredIssueContract("p", "primary", 42);
+  assert.equal(registeredV1.repo, "Acme/Web",
+    "a single-repository V1 live queue item remains registered and compatible");
+  assert.equal(registeredV1.fingerprint, payload.batch_observation_fingerprint);
   const liveV1Fingerprint = payload.batch_observation_fingerprint;
   assert.equal(payload.admission_generation, 0);
   assert.equal(validateCurrentOwnedAssignment("p", { admission_generation: 0 }).ok, false);

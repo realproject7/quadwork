@@ -7,16 +7,25 @@ const fs = require("fs");
 const os = require("os");
 const { ensureSecureDir } = require("./config");
 const fileChat = require("./file-chat");
+const {
+  createIssueContractRevisionHandler,
+  issueContractRevision,
+} = require("./issue-contract-revision");
 
 const crypto = require("crypto");
 
 const PROJECT = "__mcp_shim_test__";
-const AGENT = "test-agent";
+const OTHER_PROJECT = "__mcp_shim_other__";
+const AGENT = "dev";
 const TEST_TOKEN = crypto.randomBytes(16).toString("hex");
 const SHIM = path.join(__dirname, "mcp-chat-shim.js");
+const ROLES = ["head", "dev", "re1", "re2"];
 
 let server;
 let serverPort;
+const issueFetches = [];
+let admissionGeneration = 7;
+let registeredFingerprint = "queue-observation-a";
 
 function sendJsonRpc(proc, msg) {
   proc.stdin.write(JSON.stringify(msg) + "\n");
@@ -38,11 +47,48 @@ function readResponse(proc) {
   });
 }
 
+function spawnShim(project, agent, token) {
+  return spawn("node", [SHIM, "--project", project, "--agent", agent, "--port", String(serverPort), "--token", token], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
+async function stopShim(proc) {
+  proc.stdin.end();
+  await new Promise((resolve) => proc.on("close", resolve));
+}
+
 function startTestServer() {
   return new Promise((resolve) => {
     const express = require("express");
     const app = express();
     app.use(express.json());
+
+    app.post("/api/issue-contract-revision", createIssueContractRevisionHandler({
+      resolveShimPrincipal: fileChat.resolveShimPrincipal,
+      captureProjectAdmission: (projectId) => ({ project_id: projectId, generation: admissionGeneration }),
+      isAdmissionCurrent: (token) => token?.generation === admissionGeneration,
+      resolveRegisteredIssue: (projectId, repoKey, issue) => {
+        if (projectId === PROJECT && repoKey === "web" && issue === 42) {
+          return { repo: "Acme/Web", issue, fingerprint: registeredFingerprint };
+        }
+        if (projectId === OTHER_PROJECT && repoKey === "api" && issue === 42) {
+          return { repo: "Other/API", issue, fingerprint: registeredFingerprint };
+        }
+        return null;
+      },
+      fetchRevision: async ({ repo, issue }) => {
+        issueFetches.push({ repo, issue });
+        return {
+          repo: repo.toLowerCase(),
+          issue,
+          contract_revision: issueContractRevision("Live contract\r\n\r\n"),
+          observed_at: "2026-08-29T12:34:56.000Z",
+          source: "github_authenticated_rest",
+          source_status: "ok",
+        };
+      },
+    }));
 
     app.get("/api/chat", (req, res) => {
       const msgs = fileChat.readMessages(PROJECT, {
@@ -97,9 +143,7 @@ async function runTests() {
   fileChat.registerShimToken(PROJECT, AGENT, TEST_TOKEN);
   await startTestServer();
 
-  const shim = spawn("node", [SHIM, "--project", PROJECT, "--agent", AGENT, "--port", String(serverPort), "--token", TEST_TOKEN], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  const shim = spawnShim(PROJECT, AGENT, TEST_TOKEN);
 
   shim.stderr.on("data", (d) => process.stderr.write(`[shim stderr] ${d}`));
 
@@ -120,6 +164,18 @@ async function runTests() {
   const toolNames = (listResp.result?.tools || []).map((t) => t.name);
   assert(toolNames.includes("chat_send"), "tools/list includes chat_send");
   assert(toolNames.includes("chat_read"), "tools/list includes chat_read");
+  assert(toolNames.includes("issue_contract_revision"), "tools/list exposes issue_contract_revision to dev");
+
+  for (const role of ROLES.filter((role) => role !== AGENT)) {
+    const token = crypto.randomBytes(16).toString("hex");
+    fileChat.registerShimToken(PROJECT, role, token);
+    const roleShim = spawnShim(PROJECT, role, token);
+    sendJsonRpc(roleShim, { jsonrpc: "2.0", id: 20, method: "tools/list", params: {} });
+    const roleList = await readResponse(roleShim);
+    assert((roleList.result?.tools || []).some((tool) => tool.name === "issue_contract_revision"),
+      `tools/list exposes issue_contract_revision to ${role}`);
+    await stopShim(roleShim);
+  }
 
   // Test 3: chat_send
   sendJsonRpc(shim, {
@@ -177,14 +233,114 @@ async function runTests() {
   assert(sinceMessages.length === 1, "chat_read with since_id returns only new messages");
   assert(sinceMessages[0]?.text === "second message", "since_id filtered message matches");
 
+  // The read-only contract tool sends only repo_key+issue. Project, actor, and
+  // canonical repository are derived by the server from token + live config.
+  sendJsonRpc(shim, {
+    jsonrpc: "2.0",
+    id: 8,
+    method: "tools/call",
+    params: { name: "issue_contract_revision", arguments: { repo_key: "web", issue: 42 } },
+  });
+  const revisionResp = await readResponse(shim);
+  const revisionBody = JSON.parse(revisionResp.result.content[0].text);
+  assert(revisionBody.ok === true, "issue_contract_revision succeeds for a registered project repository");
+  assert(revisionBody.repo === "acme/web" && revisionBody.issue === 42,
+    "issue revision returns canonical repository and issue as separate fields");
+  assert(revisionBody.contract_revision === issueContractRevision("Live contract"),
+    "issue revision returns the server-computed canonical digest");
+  assert(revisionBody.observed_at === "2026-08-29T12:34:56.000Z" && revisionBody.source_status === "ok",
+    "issue revision returns observation time and source status");
+  assert(issueFetches.length === 1 && issueFetches[0].repo === "Acme/Web" && issueFetches[0].issue === 42,
+    "server resolves the canonical target from the bound project's live repository registry");
+
+  for (const [label, forged] of [
+    ["caller project", { repo_key: "web", issue: 42, project: OTHER_PROJECT }],
+    ["caller actor", { repo_key: "web", issue: 42, actor: "head" }],
+    ["caller repository", { repo_key: "web", issue: 42, repo: "other/api" }],
+    ["caller body", { repo_key: "web", issue: 42, body: "forged" }],
+  ]) {
+    sendJsonRpc(shim, {
+      jsonrpc: "2.0",
+      id: 30,
+      method: "tools/call",
+      params: { name: "issue_contract_revision", arguments: forged },
+    });
+    const forgedResp = await readResponse(shim);
+    assert(forgedResp.error?.code === -32000 && /API error 400/.test(forgedResp.error.message),
+      `server rejects ${label} identity/body injection`);
+  }
+  assert(issueFetches.length === 1, "rejected identity/body forgeries perform no GitHub read");
+
+  sendJsonRpc(shim, {
+    jsonrpc: "2.0",
+    id: 31,
+    method: "tools/call",
+    params: { name: "issue_contract_revision", arguments: { repo_key: "api", issue: 42 } },
+  });
+  const crossRepoResp = await readResponse(shim);
+  assert(crossRepoResp.error?.code === -32000 && /API error 403/.test(crossRepoResp.error.message),
+    "bound project cannot read another project's registered repository key");
+
+  sendJsonRpc(shim, {
+    jsonrpc: "2.0",
+    id: 35,
+    method: "tools/call",
+    params: { name: "issue_contract_revision", arguments: { repo_key: "web", issue: 41 } },
+  });
+  const unregisteredItemResp = await readResponse(shim);
+  assert(unregisteredItemResp.error?.code === -32000 && /API error 403/.test(unregisteredItemResp.error.message),
+    "registered repository cannot be used as an arbitrary issue digest oracle");
+
+  const nonRole = "observer";
+  const nonRoleToken = crypto.randomBytes(16).toString("hex");
+  fileChat.registerShimToken(PROJECT, nonRole, nonRoleToken);
+  const nonRoleShim = spawnShim(PROJECT, nonRole, nonRoleToken);
+  sendJsonRpc(nonRoleShim, { jsonrpc: "2.0", id: 32, method: "tools/list", params: {} });
+  const nonRoleList = await readResponse(nonRoleShim);
+  assert(!(nonRoleList.result?.tools || []).some((tool) => tool.name === "issue_contract_revision"),
+    "tools/list hides issue_contract_revision from non-project roles");
+  sendJsonRpc(nonRoleShim, {
+    jsonrpc: "2.0",
+    id: 33,
+    method: "tools/call",
+    params: { name: "issue_contract_revision", arguments: { repo_key: "web", issue: 42 } },
+  });
+  const forgedCall = await readResponse(nonRoleShim);
+  assert(forgedCall.error?.code === -32000 && /API error 403/.test(forgedCall.error.message),
+    "forged hidden tools/call is rejected by the server authorization boundary");
+  await stopShim(nonRoleShim);
+
+  const badTokenShim = spawnShim(PROJECT, "head", "forged-token");
+  sendJsonRpc(badTokenShim, {
+    jsonrpc: "2.0",
+    id: 34,
+    method: "tools/call",
+    params: { name: "issue_contract_revision", arguments: { repo_key: "web", issue: 42 } },
+  });
+  const badAuth = await readResponse(badTokenShim);
+  assert(badAuth.error?.code === -32000 && /API error 403/.test(badAuth.error.message),
+    "forged shim token cannot call issue_contract_revision");
+  await stopShim(badTokenShim);
+
+  const oldRotatedToken = crypto.randomBytes(16).toString("hex");
+  const newRotatedToken = crypto.randomBytes(16).toString("hex");
+  fileChat.registerShimToken(OTHER_PROJECT, "head", oldRotatedToken);
+  fileChat.registerShimToken(OTHER_PROJECT, "head", newRotatedToken);
+  assert(fileChat.resolveShimPrincipal(oldRotatedToken) === null,
+    "shim token rotation revokes the old principal secret");
+  assert(fileChat.resolveShimPrincipal(newRotatedToken)?.projectId === OTHER_PROJECT,
+    "shim token reverse lookup derives the current bound project");
+  fileChat.shutdownProject(OTHER_PROJECT);
+  assert(fileChat.resolveShimPrincipal(newRotatedToken) === null,
+    "project shutdown revokes role-tool tokens before same-id reuse");
+
   // Test 6: ping
   sendJsonRpc(shim, { jsonrpc: "2.0", id: 7, method: "ping" });
   const pingResp = await readResponse(shim);
   assert(pingResp.id === 7 && pingResp.result != null, "ping responds");
 
   // Cleanup
-  shim.stdin.end();
-  await new Promise((r) => shim.on("close", r));
+  await stopShim(shim);
   server.close();
   fileChat.shutdownProject(PROJECT);
 

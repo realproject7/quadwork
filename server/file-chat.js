@@ -135,6 +135,12 @@ function initProject(projectId) {
 function shutdownProject(projectId) {
   releaseWriterLock(projectId);
   projectState.delete(projectId);
+  const prefix = `${projectId}:`;
+  for (const [key, token] of _shimTokens) {
+    if (!key.startsWith(prefix)) continue;
+    _shimTokens.delete(key);
+    _shimPrincipals.delete(token);
+  }
 }
 
 function appendMessage(projectId, { sender, channel = "general", text, type = "message", attachments } = {}, _skipLoopGuard = false) {
@@ -293,15 +299,31 @@ function appendMessageInternal(projectId, opts) {
 }
 
 // #715: per-agent shim tokens for authenticated sends.
-// Map<"projectId:agentId", token>
+// Map<"projectId:agentId", token> plus the inverse principal lookup used by
+// read-only role tools. The inverse is load-bearing: those endpoints derive
+// project/actor from the secret itself and never trust caller identity fields.
 const _shimTokens = new Map();
+const _shimPrincipals = new Map();
 
 function registerShimToken(projectId, agentId, token) {
-  _shimTokens.set(`${projectId}:${agentId}`, token);
+  const key = `${projectId}:${agentId}`;
+  const previous = _shimTokens.get(key);
+  if (previous) _shimPrincipals.delete(previous);
+  const collision = _shimPrincipals.get(token);
+  if (collision) _shimTokens.delete(`${collision.projectId}:${collision.agentId}`);
+  _shimTokens.set(key, token);
+  _shimPrincipals.set(token, Object.freeze({ projectId, agentId }));
 }
 
 function validateShimToken(projectId, agentId, token) {
   return _shimTokens.get(`${projectId}:${agentId}`) === token;
+}
+
+function resolveShimPrincipal(token) {
+  if (typeof token !== "string" || !token) return null;
+  const principal = _shimPrincipals.get(token);
+  if (!principal || !validateShimToken(principal.projectId, principal.agentId, token)) return null;
+  return principal;
 }
 
 module.exports = {
@@ -317,6 +339,7 @@ module.exports = {
   resetLoopGuard,
   registerShimToken,
   validateShimToken,
+  resolveShimPrincipal,
   // exposed for testing
   _getState: getState,
   _chatDir: chatDir,
