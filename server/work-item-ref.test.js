@@ -145,6 +145,28 @@ function code(result) {
 // a duplicate composite ref, and retains visible line diagnostics. Partial
 // items never make the result ok:true.
 {
+  for (const line of [
+    "- Owner/Product-Web@#42 malformed suffix",
+    "- Owner@/Product-Web#42 malformed owner",
+    "- [Owner/Product-Web@#42] bracketed",
+    "- [Owner/Product-Web]#42 misplaced marker",
+    "- Owner/Product-Web[#42] misplaced bracket",
+  ]) {
+    assert.equal(code(parseWorkItemLine(line, { repositories })), "invalid_work_item_ref", line);
+  }
+  assert.equal(parseWorkItemLine("- https://example.test/Owner/Product-Web@#42 context", { repositories }).ignored, true);
+  const mixed = parseWorkItemLines([
+    "- Owner/Product-Web#41 valid",
+    "- Owner/Product-Web@#42 malformed",
+    "- owner/product-api#43 valid",
+  ], { repositories });
+  assert.equal(mixed.ok, false);
+  assert.deepEqual(mixed.items.map((item) => item.ref.number), [41, 43]);
+  assert.deepEqual(mixed.diagnostics.map((item) => item.code), ["invalid_work_item_ref"]);
+  assert.equal(mixed.diagnostics[0].line_number, 2);
+}
+
+{
   const parsed = parseWorkItemLines([
     "**Batch:** 12",
     "- Owner/Product-Web#42 web",

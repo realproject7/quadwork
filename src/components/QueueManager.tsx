@@ -81,13 +81,22 @@ function generateTemplate(issues: Issue[], repositories: Repository[]): string {
   return lines.join("\n");
 }
 
-function generatePrompt(queueContent: string, repositories: Repository[]): string {
+function generatePrompt(queueContent: string, repositories: Repository[], allowDirectStart: boolean): string {
   const repositoryLines = repositories.length > 0
     ? repositories.map((repository) => `  - ${repository.key}: ${repository.repo}`).join("\n")
     : "  - No registered repository identity was returned; do not guess or mutate a repository.";
-  return `@head Work through this queue top-to-bottom. Assign ONE ticket at a time to
+  const opening = allowDirectStart
+    ? `@head Work through this queue top-to-bottom. Assign ONE ticket at a time to
    @dev. After each PR is merged, assign the next ticket immediately.
-  All tickets are autonomous — no operator gates.
+  All tickets are autonomous — no operator gates.`
+    : `@head Review this queue as a non-executable draft only. Do not assign a worker,
+  start a batch, or wake any role from this text. This installation is V2-activated;
+  execution requires the server-issued assignment workflow that serializes the
+  current installation, batch, qualified item set, and opaque attempt first.`;
+  const closing = allowDirectStart
+    ? "Start now. Assign the first ticket to @dev."
+    : "Report draft corrections only. Do not start or assign this queue.";
+  return `${opening}
 
   IMPORTANT — Repository context:
   - Resolve every qualified work token against this registered map:
@@ -97,12 +106,13 @@ ${repositoryLines}
 
 ${queueContent}
 
-  Start now. Assign the first ticket to @dev.`;
+  ${closing}`;
 }
 
 export default function QueueManager({ projectId }: QueueManagerProps) {
   const [content, setContent] = useState("");
   const [repositories, setRepositories] = useState<Repository[]>([]);
+  const [v2Activated, setV2Activated] = useState<boolean | null>(null);
   const [showPrompt, setShowPrompt] = useState(false);
   const [copied, setCopied] = useState(false);
   const [sent, setSent] = useState(false);
@@ -112,9 +122,11 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
   // `primary` binding and hydrate it when Generate Template is clicked.
   useEffect(() => {
     setRepositories([]);
+    setV2Activated(null);
     fetch("/api/config")
       .then((r) => r.ok ? r.json() : null)
       .then((cfg) => {
+        setV2Activated(typeof cfg?.installation_id === "string" && cfg.installation_id.length > 0);
         const project = cfg?.projects?.find((p: { id: string }) => p.id === projectId);
         const configured = Array.isArray(project?.repositories)
           ? project.repositories.filter((entry: Repository) =>
@@ -166,12 +178,22 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
     URL.revokeObjectURL(url);
   };
 
-  const prompt = generatePrompt(content, repositories);
+  const directStartBlocked = v2Activated !== false;
+  const prompt = generatePrompt(content, repositories, !directStartBlocked);
 
   const copyPrompt = async () => {
-    await navigator.clipboard.writeText(prompt);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      const cfgRes = await fetch("/api/config");
+      if (!cfgRes.ok) throw new Error("config");
+      const cfg = await cfgRes.json();
+      const activated = typeof cfg?.installation_id === "string" && cfg.installation_id.length > 0;
+      setV2Activated(activated);
+      await navigator.clipboard.writeText(generatePrompt(content, repositories, !activated));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      alert("Could not verify assignment authority. Nothing was copied.");
+    }
   };
 
   const sendToHead = async () => {
@@ -179,6 +201,12 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       const cfgRes = await fetch("/api/config");
       if (!cfgRes.ok) throw new Error("config");
       const cfg = await cfgRes.json();
+      const activated = typeof cfg?.installation_id === "string" && cfg.installation_id.length > 0;
+      setV2Activated(activated);
+      if (activated) {
+        alert("V2 setup is active. Start this queue through the server-issued assignment workflow; no Head session was started or written.");
+        return;
+      }
 
       // #968: auth the PTY-driving calls (WS + writes).
       const auth = await sessionTokenHeaders();
@@ -272,8 +300,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         alert(`Send failed: ${err.error || res.status}`);
       }
     } catch {
-      await copyPrompt();
-      alert("Could not reach backend. Prompt copied to clipboard instead.");
+      alert("Could not verify assignment authority. Nothing was sent or copied.");
     }
   };
 
@@ -362,7 +389,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
 
       {/* Guide */}
       <div className="mb-4 px-3 py-2 border border-border bg-bg-surface text-[11px] text-text-muted">
-        <strong className="text-text">How to use:</strong> Click &quot;Generate Template&quot; to auto-fill from open issues. Edit the queue, organize into batches, then click &quot;Start Queue&quot; to generate and send the Head initiation prompt.
+        <strong className="text-text">How to use:</strong> Click &quot;Generate Template&quot; to auto-fill from open issues. Edit the queue and organize it into batches. {directStartBlocked ? "This V2 queue is a draft until the server-issued assignment workflow starts it." : "Then click Start Queue to generate and send the Head initiation prompt."}
       </div>
 
       {/* Start Queue */}
@@ -386,9 +413,11 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         <div className="flex items-center gap-2 px-3 py-3">
           <button
             onClick={sendToHead}
-            className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors"
+            disabled={directStartBlocked}
+            title={directStartBlocked ? "V2 execution requires a server-issued assignment" : undefined}
+            className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-accent"
           >
-            {sent ? "Sent to Head" : "Send to Head Terminal"}
+            {directStartBlocked ? "Server Assignment Required" : sent ? "Sent to Head" : "Send to Head Terminal"}
           </button>
           <button
             onClick={copyPrompt}
@@ -396,6 +425,11 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
           >
             {copied ? "Copied" : "Copy Prompt"}
           </button>
+          {directStartBlocked && (
+            <span role="status" className="text-[11px] text-text-muted">
+              Direct Head wake is disabled; copy produces a review-only draft.
+            </span>
+          )}
         </div>
       </div>
     </div>

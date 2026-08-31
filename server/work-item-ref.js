@@ -150,6 +150,17 @@ function parseWorkItemToken(token, options = {}) {
 function lineCandidate(content, repositories) {
   if (/^\[?#/.test(content) || /^\[?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#/.test(content)) return true;
   if (/^\[?[A-Za-z0-9._-]+\/[A-Za-z0-9._\/-]*#/.test(content)) return true;
+  // Once the first structural token has both a slash and an issue marker it is
+  // executable-looking even when the repository part contains a forbidden
+  // character. Otherwise `owner/repo@#42` could disappear while valid sibling
+  // rows execute. URLs are the explicit exception: their scheme delimiter is
+  // ordinary prose/link syntax and existing queues use URL anchors freely.
+  const candidateContent = content.startsWith("[") ? content.slice(1) : content;
+  if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(candidateContent)) {
+    const firstStructuralToken = /^[^\s\]]+/.exec(candidateContent)?.[0] || "";
+    if (firstStructuralToken.includes("/") && firstStructuralToken.includes("#")) return true;
+  }
+  if (/^\[[^\]\s]*\/[^\]\s]*\]#/.test(content)) return true;
   // An immediate colon before the issue marker is a malformed qualified work
   // ref, not prose. Keep this deliberately narrower than the token delimiter:
   // URLs and `owner/repo: explanatory prose #42` are not executable candidates.

@@ -265,6 +265,10 @@ assert.match(panel, /validation_errors/, "invalid queue diagnostics are visible 
 const queueManager = fs.readFileSync(path.join(root, "src", "components", "QueueManager.tsx"), "utf8");
 assert.match(queueManager, /qualifiedQueueToken/, "QueueManager emits qualified work tokens");
 assert.match(queueManager, /sanitizeRemoteTitle/, "QueueManager sanitizes remote titles before interpolation");
+assert.match(queueManager, /directStartBlocked = v2Activated !== false/, "QueueManager fails closed until activation state is known");
+assert.match(queueManager, /disabled=\{directStartBlocked\}/, "activated V2 QueueManager cannot wake Head directly");
+assert.match(queueManager, /server-issued assignment workflow/, "blocked QueueManager action explains the authoritative start prerequisite");
+assert.doesNotMatch(queueManager, /await copyPrompt\(\)[\s\S]{0,100}Prompt copied/, "send failure never copies an executable prompt as a fallback");
 
 const chatPresets = fs.readFileSync(path.join(root, "src", "components", "ChatPresets.tsx"), "utf8");
 assert.match(chatPresets, /owner\/repo#<number>/, "queue-format preset preserves V2 repository-qualified identity");
