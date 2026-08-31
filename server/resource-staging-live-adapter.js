@@ -14,8 +14,14 @@ const {
 const { ACK_PREFIX, StagingProofError } = require("./resource-staging-proof");
 
 const LIVE_MARKER_PREFIX = "__QW_RESOURCE_STAGING_V1__";
+const TEMP_PROOF_CONTRACT = "quadwork-effective-temp-proof-v1";
+const MONITOR_PROOF_DOMAIN = "quadwork-monitor-proof-v1";
+const TEMP_PROOF_DOMAIN = "quadwork-temp-proof-v1";
+const TEMP_FACT_PROOF_DOMAIN = "quadwork-temp-fact-proof-v1";
 const MACHINE_ID_RE = /^[a-f0-9]{32}$/;
 const QUALIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const CHALLENGE_RE = /^[a-f0-9]{64}$/;
+const SIGNATURE_RE = /^[A-Za-z0-9_-]{86}$/;
 const GENERATED_WORKER_UNIT_RE = /^quadwork-worker-[a-f0-9]{40}$/;
 const EXPECTED_CANDIDATE_ARGS = Object.freeze(["--user", "--scope", "--collect", "--quiet"]);
 const PHASE_IDS = new Set([
@@ -39,6 +45,19 @@ const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_CLEANUP_TIMEOUT_MS = 2_000;
 const DEFAULT_OOM_POLL_MS = 10;
+const MAX_STAGING_MEMORY_MAX_MIB = 256;
+const MAX_STAGING_SWAP_MAX_MIB = 64;
+const MAX_STAGING_COMBINED_MIB = 320;
+const OOM_ALLOCATION_MARGIN_MIB = 16;
+const MAX_OOM_ALLOCATION_MIB = MAX_STAGING_COMBINED_MIB + OOM_ALLOCATION_MARGIN_MIB;
+const ADAPTER_STATE = new WeakMap();
+const INTERNAL_PHASE_TOKEN = Object.freeze({});
+// Deliberately empty until the disposable staging deployment contributes
+// reviewed, source-owned receipts. Runtime options cannot extend these sets;
+// supplying one's own key or `verify()` function must never mint trust.
+const TRUSTED_MONITOR_AUTHORITY_FINGERPRINTS = Object.freeze(Object.create(null));
+const TRUSTED_TEMP_PROVIDER_FINGERPRINTS = Object.freeze(Object.create(null));
+const TRUSTED_TEMP_FACT_AUTHORITY_FINGERPRINTS = Object.freeze(Object.create(null));
 
 const TTY_SCRIPT = `
 const fs = require("fs");
@@ -70,16 +89,28 @@ process.on("SIGTERM", () => { try { child.kill("SIGTERM"); } catch {} child.once
 setInterval(() => {}, 1000);
 `;
 
-const OOM_SCRIPT = `
+function oomScript(allocationMib) {
+  return `
 const fs = require("fs");
 const prefix = ${JSON.stringify(LIVE_MARKER_PREFIX)};
+const allocationLimitBytes = ${allocationMib} * 1024 * 1024;
+const chunkBytes = 8 * 1024 * 1024;
 const emit = (value) => fs.writeSync(1, prefix + JSON.stringify(value) + "\\n");
 const allocations = [];
 emit({event:"oom_ready"});
 process.stdin.setEncoding("utf8");
-process.stdin.once("data", () => { setInterval(() => allocations.push(Buffer.alloc(8 * 1024 * 1024, 1)), 1); });
+process.stdin.once("data", () => {
+  let allocated = 0;
+  while (allocated < allocationLimitBytes) {
+    const size = Math.min(chunkBytes, allocationLimitBytes - allocated);
+    allocations.push(Buffer.alloc(size, 1));
+    allocated += size;
+  }
+  emit({event:"allocation_complete",allocated_mib:${allocationMib}});
+});
 setInterval(() => {}, 1000);
 `;
+}
 
 function proofError(code, check) {
   return new StagingProofError(code, check);
@@ -126,6 +157,176 @@ function commandSpec(value, field) {
   return Object.freeze({ file, args: Object.freeze(args) });
 }
 
+function signingPublicKey(value, field) {
+  let key;
+  try {
+    key = safeGet(value, "type") === "public" ? value : crypto.createPublicKey(value);
+  } catch { throw new TypeError(`${field} must be a valid public key`); }
+  if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+    throw new TypeError(`${field} must be an Ed25519 public key`);
+  }
+  return key;
+}
+
+function publicKeyFingerprint(key) {
+  try {
+    const der = key.export({ type: "spki", format: "der" });
+    return crypto.createHash("sha256").update(der).digest("hex");
+  } catch {
+    throw new TypeError("authority public key fingerprint is unavailable");
+  }
+}
+
+function signatureBytes(value) {
+  if (typeof value !== "string" || !SIGNATURE_RE.test(value)) return null;
+  try {
+    const bytes = Buffer.from(value, "base64url");
+    return bytes.length === 64 ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+function proofChallenge() {
+  try {
+    const value = crypto.randomBytes(32).toString("hex");
+    if (!CHALLENGE_RE.test(value)) throw new Error("invalid challenge");
+    return value;
+  } catch {
+    throw proofError("proof_unavailable", "live_challenge_unavailable");
+  }
+}
+
+function challengeValue(value, field) {
+  if (typeof value !== "string" || !CHALLENGE_RE.test(value)) {
+    throw new TypeError(`${field} must be a 256-bit lowercase hex challenge`);
+  }
+  return value;
+}
+
+function buildMonitorProofPayload(value = {}) {
+  const probeName = safeGet(value, "probeName");
+  const kind = safeGet(value, "kind");
+  if (!MONITOR_PROBE_NAMES.includes(probeName) || !["health", "counter"].includes(kind)) {
+    throw new TypeError("monitor proof probe or kind is invalid");
+  }
+  const adapterId = qualifier(safeGet(value, "adapterId"), "adapterId");
+  const label = boundedString(safeGet(value, "label"), "label", 512);
+  const healthy = kind === "health" ? safeGet(value, "healthy") : null;
+  const continuous = kind === "health" ? safeGet(value, "continuous") : null;
+  const count = kind === "counter" ? safeCount(safeGet(value, "count")) : null;
+  if ((kind === "health" && (typeof healthy !== "boolean" || typeof continuous !== "boolean"))
+    || (kind === "counter" && count === null)) {
+    throw new TypeError("monitor proof facts are invalid");
+  }
+  return Buffer.from(JSON.stringify([
+    MONITOR_PROOF_DOMAIN,
+    challengeValue(safeGet(value, "runChallenge"), "runChallenge"),
+    challengeValue(safeGet(value, "probeChallenge"), "probeChallenge"),
+    adapterId,
+    probeName,
+    label,
+    kind,
+    healthy,
+    continuous,
+    count,
+  ]), "utf8");
+}
+
+function buildTempProofPayload(value = {}) {
+  const contract = safeGet(value, "contract");
+  if (contract !== TEMP_PROOF_CONTRACT) throw new TypeError("temp proof contract is invalid");
+  const fields = [
+    TEMP_PROOF_DOMAIN,
+    challengeValue(safeGet(value, "runChallenge"), "runChallenge"),
+    challengeValue(safeGet(value, "phaseChallenge"), "phaseChallenge"),
+    qualifier(safeGet(value, "projectId"), "projectId"),
+    qualifier(safeGet(value, "generationId"), "generationId"),
+    qualifier(safeGet(value, "providerId"), "providerId"),
+    contract,
+    boundedString(safeGet(value, "canonicalRoot"), "canonicalRoot", 4096),
+    boundedString(safeGet(value, "generationTempRoot"), "generationTempRoot", 4096),
+    boundedString(safeGet(value, "effectivePath"), "effectivePath", 4096),
+  ];
+  if (fields.slice(7).some((item) => !path.isAbsolute(item))) {
+    throw new TypeError("temp proof paths must be absolute");
+  }
+  return Buffer.from(JSON.stringify(fields), "utf8");
+}
+
+function buildTempFactProofPayload(value = {}) {
+  const fields = [
+    TEMP_FACT_PROOF_DOMAIN,
+    challengeValue(safeGet(value, "runChallenge"), "runChallenge"),
+    qualifier(safeGet(value, "authorityId"), "authorityId"),
+    qualifier(safeGet(value, "projectId"), "projectId"),
+    qualifier(safeGet(value, "generationId"), "generationId"),
+    boundedString(safeGet(value, "canonicalRoot"), "canonicalRoot", 4096),
+    boundedString(safeGet(value, "generationTempRoot"), "generationTempRoot", 4096),
+    safeGet(value, "available"),
+    safeGet(value, "code"),
+    safeGet(value, "diskBacked"),
+  ];
+  if (fields[7] !== true || fields[8] !== "ready" || fields[9] !== true
+    || !path.isAbsolute(fields[5]) || !path.isAbsolute(fields[6])) {
+    throw new TypeError("resource temp fact proof is invalid");
+  }
+  return Buffer.from(JSON.stringify(fields), "utf8");
+}
+
+function verifySignature(publicKey, payload, signature) {
+  const bytes = signatureBytes(signature);
+  if (bytes === null) return false;
+  try { return crypto.verify(null, payload, publicKey, bytes); } catch { return false; }
+}
+
+function normalizeMonitorAuthority(value) {
+  if (!value || typeof value !== "object") return null;
+  const adapterId = qualifier(safeGet(value, "adapterId"), "monitorAuthority.adapterId");
+  const publicKey = signingPublicKey(safeGet(value, "publicKey"), "monitorAuthority.publicKey");
+  const fingerprint = publicKeyFingerprint(publicKey);
+  return Object.freeze({
+    adapterId,
+    publicKey,
+    trusted: safeGet(TRUSTED_MONITOR_AUTHORITY_FINGERPRINTS, adapterId) === fingerprint,
+  });
+}
+
+function normalizeTempFactAuthority(value) {
+  if (!value || typeof value !== "object") return null;
+  const verify = safeGet(value, "verify");
+  if (typeof verify !== "function") throw new TypeError("tempFactAuthority.verify must be a function");
+  const authorityId = qualifier(safeGet(value, "authorityId"), "tempFactAuthority.authorityId");
+  const publicKey = signingPublicKey(safeGet(value, "publicKey"), "tempFactAuthority.publicKey");
+  const fingerprint = publicKeyFingerprint(publicKey);
+  return Object.freeze({
+    authorityId,
+    publicKey,
+    verify,
+    receiver: value,
+    trusted: safeGet(TRUSTED_TEMP_FACT_AUTHORITY_FINGERPRINTS, authorityId) === fingerprint,
+  });
+}
+
+function normalizeTempProbe(value) {
+  if (value === undefined) return null;
+  const command = commandSpec(value, "target.tempProbe");
+  if (command.args.length > 125) throw new TypeError("target.tempProbe.args leaves no room for proof binding");
+  const providerId = qualifier(safeGet(value, "providerId"), "target.tempProbe.providerId");
+  if (safeGet(value, "contract") !== TEMP_PROOF_CONTRACT) {
+    throw new TypeError(`target.tempProbe.contract must be ${TEMP_PROOF_CONTRACT}`);
+  }
+  const publicKey = signingPublicKey(safeGet(value, "publicKey"), "target.tempProbe.publicKey");
+  const fingerprint = publicKeyFingerprint(publicKey);
+  return Object.freeze({
+    ...command,
+    providerId,
+    contract: TEMP_PROOF_CONTRACT,
+    publicKey,
+    trusted: safeGet(TRUSTED_TEMP_PROVIDER_FINGERPRINTS, providerId) === fingerprint,
+  });
+}
+
 function normalizeEnvironment(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("spawnEnv must be an explicitly supplied object");
@@ -167,30 +368,54 @@ function normalizeTarget(value) {
   if (!path.isAbsolute(nodeExecutable) || !path.isAbsolute(cwd) || !path.isAbsolute(generationTempRoot)) {
     throw new TypeError("target executable, cwd, and generation temp root must be absolute");
   }
+  const resolvedGenerationTempRoot = path.resolve(generationTempRoot);
+  if (resolvedGenerationTempRoot !== generationTempRoot
+    || path.parse(resolvedGenerationTempRoot).root === resolvedGenerationTempRoot) {
+    throw new TypeError("target.generationTempRoot must be a normalized non-root path");
+  }
   const limits = safeGet(value, "workerLimits");
   if (!limits || typeof limits !== "object") throw new TypeError("target.workerLimits is required");
   const workerLimits = Object.freeze({
-    memoryHighMib: boundedInteger(safeGet(limits, "memoryHighMib"), "memoryHighMib", 1, 1024 * 1024),
-    memoryMaxMib: boundedInteger(safeGet(limits, "memoryMaxMib"), "memoryMaxMib", 1, 1024 * 1024),
-    swapMaxMib: boundedInteger(safeGet(limits, "swapMaxMib"), "swapMaxMib", 1, 1024 * 1024),
+    memoryHighMib: boundedInteger(
+      safeGet(limits, "memoryHighMib"),
+      "memoryHighMib",
+      1,
+      MAX_STAGING_MEMORY_MAX_MIB,
+    ),
+    memoryMaxMib: boundedInteger(
+      safeGet(limits, "memoryMaxMib"),
+      "memoryMaxMib",
+      1,
+      MAX_STAGING_MEMORY_MAX_MIB,
+    ),
+    swapMaxMib: boundedInteger(
+      safeGet(limits, "swapMaxMib"),
+      "swapMaxMib",
+      1,
+      MAX_STAGING_SWAP_MAX_MIB,
+    ),
   });
   if (workerLimits.memoryHighMib > workerLimits.memoryMaxMib) {
     throw new TypeError("worker memory high exceeds max");
+  }
+  if (!Number.isSafeInteger(workerLimits.memoryMaxMib + workerLimits.swapMaxMib)
+    || workerLimits.memoryMaxMib + workerLimits.swapMaxMib > MAX_STAGING_COMBINED_MIB) {
+    throw new TypeError("worker memory and swap exceed the staging safety envelope");
   }
   // tempProbe is deliberately target-specific: it must invoke the actual
   // provider/client under test and emit one bounded marker shaped as
   // {event:"effective_temp",path:"<its effective temp directory>"}. A generic
   // Node echo would not prove that Claude/Gemini preserves the boundary.
-  const rawTempProbe = safeGet(value, "tempProbe");
   return Object.freeze({
     projectId,
     generationId,
     nodeExecutable,
     cwd,
-    generationTempRoot,
+    generationTempRoot: resolvedGenerationTempRoot,
     workerLimits,
     spawnEnv: normalizeEnvironment(safeGet(value, "spawnEnv")),
-    tempProbe: rawTempProbe === undefined ? null : commandSpec(rawTempProbe, "target.tempProbe"),
+    tempProbe: normalizeTempProbe(safeGet(value, "tempProbe")),
+    tempFact: safeGet(value, "tempFact"),
   });
 }
 
@@ -204,9 +429,9 @@ function createGeneratedWorkerUnitBase(projectId, generationId) {
   return `quadwork-worker-${digest}`;
 }
 
-function phaseIdentity(target, phaseId) {
+function phaseIdentity(target, phaseId, runChallenge, sequence) {
   const generationId = `staging-${crypto.createHash("sha256")
-    .update(JSON.stringify(["staging-phase", target.generationId, phaseId]), "utf8")
+    .update(JSON.stringify(["staging-phase", target.generationId, phaseId, runChallenge, sequence]), "utf8")
     .digest("hex")
     .slice(0, 40)}`;
   const unitBase = createGeneratedWorkerUnitBase(target.projectId, generationId);
@@ -488,12 +713,75 @@ function filesystemType(statfs) {
   throw proofError("proof_unavailable", "temp_filesystem_invalid");
 }
 
+function internalState(adapter) {
+  const state = ADAPTER_STATE.get(adapter);
+  if (!state) throw proofError("proof_unavailable", "live_adapter_state_unavailable");
+  return state;
+}
+
+function requireInternalPhaseToken(token) {
+  if (token !== INTERNAL_PHASE_TOKEN) throw proofError("proof_refused", "internal_phase_boundary_required");
+}
+
+function registerScope(adapter, unitName) {
+  const state = internalState(adapter);
+  if (typeof unitName !== "string" || !GENERATED_WORKER_UNIT_RE.test(unitName.slice(0, -".scope".length))
+    || !unitName.endsWith(".scope") || state.registeredUnits.has(unitName)) {
+    throw proofError("proof_unavailable", "scope_registration_invalid");
+  }
+  state.registeredUnits.add(unitName);
+}
+
+async function cleanupRegisteredScope(adapter, unitName) {
+  const state = internalState(adapter);
+  if (!state.registeredUnits.has(unitName)) return false;
+  let clean = false;
+  try {
+    adapter.execFileSync("systemctl", ["--user", "stop", unitName], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: adapter.cleanupTimeoutMs,
+      maxBuffer: adapter.maximumOutputBytes,
+    });
+    clean = true;
+  } catch {}
+  if (!clean) {
+    try {
+      const output = adapter.execFileSync("systemctl", [
+        "--user",
+        "--property=LoadState",
+        "--property=ActiveState",
+        "--value",
+        "show",
+        unitName,
+      ], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: adapter.cleanupTimeoutMs,
+        maxBuffer: adapter.maximumOutputBytes,
+      });
+      const states = boundedText(output, adapter.maximumOutputBytes, "scope_cleanup_unavailable")
+        .trim()
+        .split(/\r?\n/);
+      clean = states.includes("not-found") && states.includes("inactive");
+    } catch {}
+  }
+  if (clean) state.registeredUnits.delete(unitName);
+  return clean;
+}
+
+function redactedIdentity(value) {
+  return `sha256:${crypto.createHash("sha256").update(value, "utf8").digest("hex").slice(0, 16)}`;
+}
+
 class LiveStagingAdapter {
   constructor(options) {
     this.runPressure = safeGet(options, "runPressure") === true;
     this.acknowledgement = safeGet(options, "acknowledgement");
     this.gateProbe = safeGet(options, "gateProbe");
     this.monitorProbes = safeGet(options, "monitorProbes");
+    this.monitorAuthority = normalizeMonitorAuthority(safeGet(options, "monitorAuthority"));
+    this.tempFactAuthority = normalizeTempFactAuthority(safeGet(options, "tempFactAuthority"));
     this.ptySpawn = safeGet(options, "ptySpawn");
     this.execFileSync = safeGet(options, "execFileSyncImpl");
     this.fs = safeGet(options, "fsImpl");
@@ -535,6 +823,11 @@ class LiveStagingAdapter {
     this.cgroupRoot = path.resolve(cgroupRoot);
     if (path.parse(this.cgroupRoot).root === this.cgroupRoot) throw new TypeError("cgroupRoot cannot be root");
     this.gates = null;
+    ADAPTER_STATE.set(this, {
+      runChallenge: null,
+      nextSequence: 0,
+      registeredUnits: new Set(),
+    });
   }
 
   async inspectGates() {
@@ -550,6 +843,12 @@ class LiveStagingAdapter {
       throw proofError("proof_unavailable", "live_gate_probe_unavailable");
     }
     this.gates = normalizeGateFacts(raw);
+    const state = internalState(this);
+    if (state.registeredUnits.size !== 0) {
+      throw proofError("proof_unavailable", "prior_scope_cleanup_required");
+    }
+    state.runChallenge = proofChallenge();
+    state.nextSequence = 0;
     return this.gates;
   }
 
@@ -560,6 +859,9 @@ class LiveStagingAdapter {
       || this.acknowledgement !== `${ACK_PREFIX}${gates.machineId}`) {
       throw proofError("proof_refused", "disposable_gate_required");
     }
+    if (!CHALLENGE_RE.test(internalState(this).runChallenge || "")) {
+      throw proofError("proof_unavailable", "live_challenge_unavailable");
+    }
     if (!candidateMatches(safeGet(context, "candidate"))) {
       throw proofError("proof_unavailable", "candidate_contract_mismatch");
     }
@@ -567,37 +869,76 @@ class LiveStagingAdapter {
 
   async startContinuousMonitoring(context) {
     this._authorize(context);
-    // Health probes are target-owned continuous observers. At each checkpoint
-    // they return {authenticated:true,healthy:boolean,continuous:boolean}, where
-    // continuous covers the interval since their previous sample. OOM probes
-    // return {authenticated:true,count:<non-negative safe integer>}. The live
-    // adapter never guesses credentials or interprets raw HTTP/WebSocket data.
+    // Each target-owned probe signs its exact checkpoint facts. The configured
+    // Ed25519 public key is the independently trusted adapter capability;
+    // `authenticated:true` or an echoed challenge has no authority by itself.
     const probes = this.monitorProbes;
     const probeFunctions = probes && MONITOR_PROBE_NAMES.map((name) => safeGet(probes, name));
-    if (!probeFunctions || probeFunctions.some((probe) => typeof probe !== "function")) {
+    const authority = this.monitorAuthority;
+    if (!authority || !probeFunctions || probeFunctions.some((probe) => typeof probe !== "function")) {
       throw proofError("proof_unavailable", "authenticated_monitor_probes_required");
     }
+    if (authority.trusted !== true) {
+      throw proofError("proof_unavailable", "staging_monitor_authority_unpinned");
+    }
+    const runChallenge = internalState(this).runChallenge;
     let stopped = false;
     const samples = [];
     const checkpoint = async (label) => {
       if (stopped) throw proofError("proof_unavailable", "monitor_stopped");
+      const boundedLabel = boundedString(label, "monitor label", 512);
+      const challenges = MONITOR_PROBE_NAMES.map(() => proofChallenge());
       const results = await Promise.all(MONITOR_PROBE_NAMES.map((name, index) => callBounded(
-        ({ signal }) => probeFunctions[index](Object.freeze({ signal, label })),
+        ({ signal }) => probeFunctions[index](Object.freeze({
+          signal,
+          label: boundedLabel,
+          probeName: name,
+          runChallenge,
+          probeChallenge: challenges[index],
+        })),
         this.probeTimeoutMs,
         `monitor_${name}_unavailable`,
       )));
-      const health = results.slice(0, 3).map((result) => {
-        const authenticated = safeGet(result, "authenticated");
+      const health = results.slice(0, 3).map((result, index) => {
         const healthy = safeGet(result, "healthy");
         const continuous = safeGet(result, "continuous");
-        if (authenticated !== true || typeof healthy !== "boolean" || typeof continuous !== "boolean") {
+        const signature = safeGet(result, "signature");
+        const bound = safeGet(result, "adapterId") === authority.adapterId
+          && safeGet(result, "runChallenge") === runChallenge
+          && safeGet(result, "probeChallenge") === challenges[index]
+          && typeof healthy === "boolean"
+          && typeof continuous === "boolean";
+        if (!bound || !verifySignature(authority.publicKey, buildMonitorProofPayload({
+          runChallenge,
+          probeChallenge: challenges[index],
+          adapterId: authority.adapterId,
+          probeName: MONITOR_PROBE_NAMES[index],
+          label: boundedLabel,
+          kind: "health",
+          healthy,
+          continuous,
+        }), signature)) {
           throw proofError("proof_unavailable", "authenticated_monitor_result_invalid");
         }
         return healthy && continuous;
       });
-      const counters = results.slice(3).map((result) => {
+      const counters = results.slice(3).map((result, offset) => {
+        const index = offset + 3;
         const count = safeCount(safeGet(result, "count"));
-        if (safeGet(result, "authenticated") !== true || count === null) {
+        const signature = safeGet(result, "signature");
+        const bound = safeGet(result, "adapterId") === authority.adapterId
+          && safeGet(result, "runChallenge") === runChallenge
+          && safeGet(result, "probeChallenge") === challenges[index]
+          && count !== null;
+        if (!bound || !verifySignature(authority.publicKey, buildMonitorProofPayload({
+          runChallenge,
+          probeChallenge: challenges[index],
+          adapterId: authority.adapterId,
+          probeName: MONITOR_PROBE_NAMES[index],
+          label: boundedLabel,
+          kind: "counter",
+          count,
+        }), signature)) {
           throw proofError("proof_unavailable", "authenticated_monitor_result_invalid");
         }
         return count;
@@ -619,6 +960,7 @@ class LiveStagingAdapter {
         api_oom_counter_after: last.counters[0],
         global_oom_counter_before: first.counters[1],
         global_oom_counter_after: last.counters[1],
+        monitor_identity: redactedIdentity(authority.adapterId),
       });
     };
     return Object.freeze({ checkpoint, stop });
@@ -632,7 +974,9 @@ class LiveStagingAdapter {
   }
 
   _invocation(phaseId, command, envExtra = {}) {
-    const identity = phaseIdentity(this.target, phaseId);
+    const state = internalState(this);
+    state.nextSequence += 1;
+    const identity = phaseIdentity(this.target, phaseId, state.runChallenge, state.nextSequence);
     const invocation = buildWorkerScopeInvocation({
       projectId: identity.projectId,
       generationId: identity.generationId,
@@ -652,7 +996,8 @@ class LiveStagingAdapter {
     });
   }
 
-  async _withPty(phaseId, command, handler, envExtra = {}) {
+  async _withPty(phaseId, command, handler, envExtra = {}, internalToken) {
+    requireInternalPhaseToken(internalToken);
     const built = this._invocation(phaseId, command, envExtra);
     let term;
     try {
@@ -664,15 +1009,17 @@ class LiveStagingAdapter {
         env: { ...built.env },
       });
     } catch {
-      const clean = await this._cleanupScope(built.identity.unitName);
-      if (!clean) throw proofError("proof_unavailable", `${phaseId}_cleanup_failed`);
+      // A spawn adapter that throws has not returned ownership evidence. Never
+      // issue a stop for a merely predicted name; only returned launches enter
+      // the private cleanup registry below.
       throw proofError("proof_unavailable", "pty_spawn_unavailable");
     }
+    registerScope(this, built.identity.unitName);
     let session;
     try {
       session = new PtySession(term, this.maximumOutputBytes);
     } catch (error) {
-      const scopeClean = await this._cleanupScope(built.identity.unitName);
+      const scopeClean = await cleanupRegisteredScope(this, built.identity.unitName);
       if (!scopeClean) throw proofError("proof_unavailable", `${phaseId}_cleanup_failed`);
       throw error;
     }
@@ -694,7 +1041,7 @@ class LiveStagingAdapter {
       clearTimeout(timer);
     }
     const ptyClean = await session.cleanup(this.cleanupTimeoutMs);
-    const scopeClean = await this._cleanupScope(built.identity.unitName);
+    const scopeClean = await cleanupRegisteredScope(this, built.identity.unitName);
     if (!ptyClean || !scopeClean) throw proofError("proof_unavailable", `${phaseId}_cleanup_failed`);
     if (failure) throw failure;
     return outcome;
@@ -719,39 +1066,6 @@ class LiveStagingAdapter {
       throw proofError("proof_unavailable", "unit_unavailable");
     }
     return parseCgroupPath(output, this.cgroupRoot, unitName, this.maximumOutputBytes);
-  }
-
-  async _cleanupScope(unitName) {
-    try {
-      this.execFileSync("systemctl", ["--user", "stop", unitName], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: this.cleanupTimeoutMs,
-        maxBuffer: this.maximumOutputBytes,
-      });
-      return true;
-    } catch {}
-    try {
-      const output = this.execFileSync("systemctl", [
-        "--user",
-        "--property=LoadState",
-        "--property=ActiveState",
-        "--value",
-        "show",
-        unitName,
-      ], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: this.cleanupTimeoutMs,
-        maxBuffer: this.maximumOutputBytes,
-      });
-      const states = boundedText(output, this.maximumOutputBytes, "scope_cleanup_unavailable")
-        .trim()
-        .split(/\r?\n/);
-      return states.includes("not-found") && states.includes("inactive");
-    } catch {
-      return false;
-    }
   }
 
   _readCgroup(cgroupPath, name) {
@@ -792,14 +1106,15 @@ class LiveStagingAdapter {
     this._authorize(context);
     if (!PHASE_IDS.has(phaseId)) throw proofError("proof_unavailable", "unknown_live_phase");
     this._requirePhaseDependencies();
-    if (phaseId === "node_pty_controlling_tty") return this._ttyPhase(phaseId);
-    if (phaseId === "resize_signal_exit_propagation") return this._resizePhase(phaseId);
-    if (phaseId === "descendant_cgroup_membership") return this._descendantPhase(phaseId);
-    if (phaseId === "effective_temp_disk_boundary") return this._tempPhase(phaseId);
-    return this._oomPhase(phaseId);
+    if (phaseId === "node_pty_controlling_tty") return this._ttyPhase(phaseId, INTERNAL_PHASE_TOKEN);
+    if (phaseId === "resize_signal_exit_propagation") return this._resizePhase(phaseId, INTERNAL_PHASE_TOKEN);
+    if (phaseId === "descendant_cgroup_membership") return this._descendantPhase(phaseId, INTERNAL_PHASE_TOKEN);
+    if (phaseId === "effective_temp_disk_boundary") return this._tempPhase(phaseId, INTERNAL_PHASE_TOKEN);
+    return this._oomPhase(phaseId, INTERNAL_PHASE_TOKEN);
   }
 
-  _ttyPhase(phaseId) {
+  _ttyPhase(phaseId, internalToken) {
+    requireInternalPhaseToken(internalToken);
     return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", TTY_SCRIPT] }, async (session) => {
       const marker = await session.marker("tty");
       const exit = await session.exit();
@@ -810,10 +1125,11 @@ class LiveStagingAdapter {
         && exit.exitCode === 0
         && (exit.signal === 0 || exit.signal === null);
       return Object.freeze({ status: passed ? "passed" : "failed", controlling_tty: passed });
-    });
+    }, {}, internalToken);
   }
 
-  _resizePhase(phaseId) {
+  _resizePhase(phaseId, internalToken) {
+    requireInternalPhaseToken(internalToken);
     return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", RESIZE_SCRIPT] }, async (session) => {
       await session.marker("ready");
       session.resize(97, 31);
@@ -830,10 +1146,11 @@ class LiveStagingAdapter {
         signal_propagated: signalPropagated,
         exit_propagated: exitPropagated,
       });
-    });
+    }, {}, internalToken);
   }
 
-  _descendantPhase(phaseId) {
+  _descendantPhase(phaseId, internalToken) {
+    requireInternalPhaseToken(internalToken);
     return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", DESCENDANT_SCRIPT] }, async (session, identity) => {
       const marker = await session.marker("descendants");
       const parentPid = safeCount(safeGet(marker, "parent_pid"));
@@ -849,37 +1166,130 @@ class LiveStagingAdapter {
         all_descendants_in_worker_cgroup: contained,
         descendant_count: contained ? 2 : 0,
       });
-    });
+    }, {}, internalToken);
   }
 
-  _tempPhase(phaseId) {
+  async _validatedTempBoundary() {
+    const fact = this.target.tempFact;
+    const authority = this.tempFactAuthority;
+    if (!authority) throw proofError("proof_unavailable", "validated_resource_temp_fact_required");
+    const canonicalRoot = safeGet(fact, "canonicalRoot");
+    if (safeGet(fact, "available") !== true || safeGet(fact, "code") !== "ready"
+      || safeGet(fact, "diskBacked") !== true || typeof canonicalRoot !== "string"
+      || !path.isAbsolute(canonicalRoot) || path.resolve(canonicalRoot) !== canonicalRoot
+      || path.parse(canonicalRoot).root === canonicalRoot) {
+      throw proofError("proof_unavailable", "resource_temp_fact_invalid");
+    }
+    let canonicalRootReal;
+    let generationReal;
+    try {
+      canonicalRootReal = this.fs.realpathSync(canonicalRoot);
+      generationReal = this.fs.realpathSync(this.target.generationTempRoot);
+    } catch {
+      throw proofError("proof_unavailable", "effective_temp_unavailable");
+    }
+    const relative = path.relative(canonicalRootReal, generationReal);
+    if (canonicalRootReal !== canonicalRoot || generationReal !== this.target.generationTempRoot
+      || relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative)) {
+      throw proofError("proof_unavailable", "generation_temp_boundary_invalid");
+    }
+    if (authority.trusted !== true) {
+      throw proofError("proof_unavailable", "resource_temp_fact_authority_unpinned");
+    }
+    const receipt = await callBounded(
+      ({ signal }) => authority.verify.call(authority.receiver, Object.freeze({
+        signal,
+        runChallenge: internalState(this).runChallenge,
+        fact,
+        projectId: this.target.projectId,
+        generationId: this.target.generationId,
+        generationTempRoot: this.target.generationTempRoot,
+      })),
+      this.probeTimeoutMs,
+      "resource_temp_fact_unavailable",
+    );
+    const factPayload = buildTempFactProofPayload({
+      runChallenge: internalState(this).runChallenge,
+      authorityId: authority.authorityId,
+      projectId: this.target.projectId,
+      generationId: this.target.generationId,
+      canonicalRoot,
+      generationTempRoot: generationReal,
+      available: true,
+      code: "ready",
+      diskBacked: true,
+    });
+    if (safeGet(receipt, "valid") !== true
+      || safeGet(receipt, "authorityId") !== authority.authorityId
+      || safeGet(receipt, "runChallenge") !== internalState(this).runChallenge
+      || !verifySignature(authority.publicKey, factPayload, safeGet(receipt, "signature"))) {
+      throw proofError("proof_unavailable", "resource_temp_fact_invalid");
+    }
+    return Object.freeze({ canonicalRoot, generationTempRoot: generationReal });
+  }
+
+  async _tempPhase(phaseId, internalToken) {
+    requireInternalPhaseToken(internalToken);
     if (!this.target.tempProbe || typeof safeGet(this.fs, "realpathSync") !== "function"
       || typeof safeGet(this.fs, "statfsSync") !== "function") {
       throw proofError("proof_unavailable", "target_effective_temp_probe_required");
     }
-    return this._withPty(phaseId, this.target.tempProbe, async (session) => {
+    const boundary = await this._validatedTempBoundary();
+    if (this.target.tempProbe.trusted !== true) {
+      throw proofError("proof_unavailable", "temp_provider_authority_unpinned");
+    }
+    const state = internalState(this);
+    const phaseChallenge = proofChallenge();
+    const command = Object.freeze({
+      file: this.target.tempProbe.file,
+      args: Object.freeze([
+        ...this.target.tempProbe.args,
+        `--quadwork-proof-contract=${TEMP_PROOF_CONTRACT}`,
+        `--quadwork-run-challenge=${state.runChallenge}`,
+        `--quadwork-phase-challenge=${phaseChallenge}`,
+      ]),
+    });
+    return this._withPty(phaseId, command, async (session) => {
       const marker = await session.marker("effective_temp");
       const effective = safeGet(marker, "path");
       if (typeof effective !== "string" || !path.isAbsolute(effective)
-        || effective.includes("\0") || Buffer.byteLength(effective, "utf8") > 4096) {
+        || path.resolve(effective) !== effective || effective.includes("\0")
+        || Buffer.byteLength(effective, "utf8") > 4096
+        || safeGet(marker, "provider_id") !== this.target.tempProbe.providerId
+        || safeGet(marker, "contract") !== TEMP_PROOF_CONTRACT
+        || safeGet(marker, "run_challenge") !== state.runChallenge
+        || safeGet(marker, "phase_challenge") !== phaseChallenge) {
         throw proofError("proof_unavailable", "effective_temp_result_invalid");
       }
-      let expectedReal;
       let effectiveReal;
       let statfs;
       try {
-        expectedReal = this.fs.realpathSync(this.target.generationTempRoot);
         effectiveReal = this.fs.realpathSync(effective);
-        if (typeof expectedReal !== "string" || !path.isAbsolute(expectedReal)
-          || typeof effectiveReal !== "string" || !path.isAbsolute(effectiveReal)) {
+        if (typeof effectiveReal !== "string" || !path.isAbsolute(effectiveReal)
+          || effectiveReal !== effective) {
           throw new Error("canonical temp path is invalid");
         }
         statfs = this.fs.statfsSync(effectiveReal, { bigint: true });
       } catch {
         throw proofError("proof_unavailable", "effective_temp_unavailable");
       }
+      const payload = buildTempProofPayload({
+        runChallenge: state.runChallenge,
+        phaseChallenge,
+        projectId: this.target.projectId,
+        generationId: this.target.generationId,
+        providerId: this.target.tempProbe.providerId,
+        contract: TEMP_PROOF_CONTRACT,
+        canonicalRoot: boundary.canonicalRoot,
+        generationTempRoot: boundary.generationTempRoot,
+        effectivePath: effectiveReal,
+      });
+      if (!verifySignature(this.target.tempProbe.publicKey, payload, safeGet(marker, "signature"))) {
+        throw proofError("proof_unavailable", "effective_temp_provider_unverified");
+      }
       const type = filesystemType(statfs);
-      const within = expectedReal === effectiveReal;
+      const within = boundary.generationTempRoot === effectiveReal;
       const diskBacked = type !== TMPFS_MAGIC && type !== RAMFS_MAGIC;
       const exit = await session.exit();
       const exited = exit.exitCode === 0 && (exit.signal === 0 || exit.signal === null);
@@ -888,16 +1298,28 @@ class LiveStagingAdapter {
         effective_temp_disk_backed: diskBacked,
         effective_temp_within_generation_root: within,
       });
-    }, { TMPDIR: this.target.generationTempRoot });
+    }, { TMPDIR: this.target.generationTempRoot }, internalToken);
   }
 
-  _oomPhase(phaseId) {
-    return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", OOM_SCRIPT] }, async (session, identity) => {
+  _oomPhase(phaseId, internalToken) {
+    requireInternalPhaseToken(internalToken);
+    const testedLimitMib = this.target.workerLimits.memoryMaxMib + this.target.workerLimits.swapMaxMib;
+    const allocationMib = testedLimitMib + OOM_ALLOCATION_MARGIN_MIB;
+    if (!Number.isSafeInteger(allocationMib) || allocationMib <= testedLimitMib
+      || allocationMib > MAX_OOM_ALLOCATION_MIB) {
+      throw proofError("proof_unavailable", "oom_safety_envelope_invalid");
+    }
+    return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", oomScript(allocationMib)] }, async (session, identity) => {
       await session.marker("oom_ready");
       const cgroupPath = this._resolveCgroup(identity.unitName);
       const before = this._readOom(cgroupPath);
       session.write("go\n");
-      const after = await this._pollOomIncrease(cgroupPath, before, session);
+      const after = await Promise.race([
+        this._pollOomIncrease(cgroupPath, before, session),
+        session.marker("allocation_complete").then(() => {
+          throw proofError("proof_unavailable", "bounded_allocator_survived_without_oom");
+        }),
+      ]);
       const exit = await session.exit();
       const bounded = after > before && (exit.exitCode !== 0 || (exit.signal !== 0 && exit.signal !== null));
       return Object.freeze({
@@ -906,7 +1328,7 @@ class LiveStagingAdapter {
         worker_oom_counter_before: before,
         worker_oom_counter_after: after,
       });
-    });
+    }, {}, internalToken);
   }
 }
 
@@ -916,6 +1338,13 @@ function createLiveStagingAdapter(options = {}) {
 
 module.exports = {
   LIVE_MARKER_PREFIX,
+  TEMP_PROOF_CONTRACT,
+  MAX_STAGING_MEMORY_MAX_MIB,
+  MAX_STAGING_SWAP_MAX_MIB,
+  MAX_OOM_ALLOCATION_MIB,
+  buildMonitorProofPayload,
+  buildTempProofPayload,
+  buildTempFactProofPayload,
   createGeneratedWorkerUnitBase,
   createLiveStagingAdapter,
 };

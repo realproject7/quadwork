@@ -4,6 +4,7 @@
 // Every host-facing boundary is dependency-injected and deterministic.
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const {
   ACK_PREFIX,
@@ -12,6 +13,13 @@ const {
 } = require("./resource-staging-proof");
 const {
   LIVE_MARKER_PREFIX,
+  TEMP_PROOF_CONTRACT,
+  MAX_STAGING_MEMORY_MAX_MIB,
+  MAX_STAGING_SWAP_MAX_MIB,
+  MAX_OOM_ALLOCATION_MIB,
+  buildMonitorProofPayload,
+  buildTempProofPayload,
+  buildTempFactProofPayload,
   createGeneratedWorkerUnitBase,
   createLiveStagingAdapter,
 } = require("./resource-staging-live-adapter");
@@ -19,7 +27,21 @@ const {
 const MACHINE_ID = "0123456789abcdef0123456789abcdef";
 const ACK = `${ACK_PREFIX}${MACHINE_ID}`;
 const CGROUP_ROOT = "/test-cgroup-v2";
-const TEMP_ROOT = "/var/lib/quadwork/tmp/generation-live-proof";
+const TEMP_PARENT = "/var/lib/quadwork/tmp";
+const TEMP_ROOT = `${TEMP_PARENT}/generation-live-proof`;
+const TEMP_FACT = Object.freeze({
+  available: true,
+  reason: null,
+  code: "ready",
+  configuredRoot: TEMP_PARENT,
+  canonicalRoot: TEMP_PARENT,
+  diskBacked: true,
+});
+const MONITOR_ID = "quadwork-staging-monitor";
+const TEMP_PROVIDER_ID = "quadwork-provider-temp-probe";
+const monitorKeys = crypto.generateKeyPairSync("ed25519");
+const tempKeys = crypto.generateKeyPairSync("ed25519");
+const tempFactKeys = crypto.generateKeyPairSync("ed25519");
 const CANDIDATE = Object.freeze({
   status: "candidate_pending_staging",
   executable: "systemd-run",
@@ -41,9 +63,62 @@ function target(overrides = {}) {
       XDG_RUNTIME_DIR: "/run/user/1000",
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
     },
-    tempProbe: { file: "/opt/quadwork/bin/provider-effective-temp-probe", args: ["--json-marker-v1"] },
+    tempFact: TEMP_FACT,
+    tempProbe: {
+      file: "/opt/quadwork/bin/provider-effective-temp-probe",
+      args: ["--json-marker-v1"],
+      providerId: TEMP_PROVIDER_ID,
+      contract: TEMP_PROOF_CONTRACT,
+      publicKey: tempKeys.publicKey,
+    },
     ...overrides,
   };
+}
+
+function signedMonitorResult(request, facts, privateKey = monitorKeys.privateKey) {
+  const kind = Object.hasOwn(facts, "count") ? "counter" : "health";
+  const result = {
+    adapterId: MONITOR_ID,
+    runChallenge: request.runChallenge,
+    probeChallenge: request.probeChallenge,
+    ...facts,
+  };
+  result.signature = crypto.sign(null, buildMonitorProofPayload({
+    runChallenge: request.runChallenge,
+    probeChallenge: request.probeChallenge,
+    adapterId: MONITOR_ID,
+    probeName: request.probeName,
+    label: request.label,
+    kind,
+    ...facts,
+  }), privateKey).toString("base64url");
+  return result;
+}
+
+function tempMarkerFromArgs(args, overrides = {}) {
+  const runChallenge = args.find((arg) => arg.startsWith("--quadwork-run-challenge="))?.split("=")[1];
+  const phaseChallenge = args.find((arg) => arg.startsWith("--quadwork-phase-challenge="))?.split("=")[1];
+  const facts = {
+    event: "effective_temp",
+    path: TEMP_ROOT,
+    provider_id: TEMP_PROVIDER_ID,
+    contract: TEMP_PROOF_CONTRACT,
+    run_challenge: runChallenge,
+    phase_challenge: phaseChallenge,
+    ...overrides,
+  };
+  facts.signature = crypto.sign(null, buildTempProofPayload({
+    runChallenge,
+    phaseChallenge,
+    projectId: "quadwork",
+    generationId: "generation-live-proof",
+    providerId: TEMP_PROVIDER_ID,
+    contract: TEMP_PROOF_CONTRACT,
+    canonicalRoot: TEMP_PARENT,
+    generationTempRoot: TEMP_ROOT,
+    effectivePath: facts.path,
+  }), tempKeys.privateKey).toString("base64url");
+  return facts;
 }
 
 class FakePty {
@@ -93,9 +168,9 @@ class FakePty {
     } else if (this.scenario === "descendants") {
       this._marker({ event: "descendants", parent_pid: 101, child_pid: 202 });
     } else if (this.scenario === "temp") {
-      this._marker({ event: "effective_temp", path: TEMP_ROOT });
+      this._marker(this.state.tempMarker);
       this._exit(0);
-    } else if (this.scenario === "oom") {
+    } else if (this.scenario === "oom" || this.scenario === "oom-survives") {
       this._marker({ event: "oom_ready" });
     } else if (this.scenario === "oversized") {
       this.dataHandler("x".repeat(2048));
@@ -112,6 +187,8 @@ class FakePty {
     if (this.scenario === "oom") {
       this.state.oomCounter = 1;
       this._exit(137, 9);
+    } else if (this.scenario === "oom-survives") {
+      this._marker({ event: "allocation_complete", allocated_mib: 144 });
     }
   }
 
@@ -150,13 +227,14 @@ function harness(overrides = {}) {
     kills: [],
     disposals: 0,
     oomCounter: 0,
+    tempMarker: null,
   };
   const monitorProbes = {
-    apiHealth: async ({ label }) => { state.monitorCalls.push(["api", label]); return { authenticated: true, healthy: true, continuous: true }; },
-    primaryChatWebSocket: async ({ label }) => { state.monitorCalls.push(["chat", label]); return { authenticated: true, healthy: true, continuous: true }; },
-    unrelatedWorkerHealth: async ({ label }) => { state.monitorCalls.push(["worker", label]); return { authenticated: true, healthy: true, continuous: true }; },
-    apiOomCounter: async ({ label }) => { state.monitorCalls.push(["api-oom", label]); return { authenticated: true, count: 4 }; },
-    globalOomCounter: async ({ label }) => { state.monitorCalls.push(["global-oom", label]); return { authenticated: true, count: 7 }; },
+    apiHealth: async (request) => { state.monitorCalls.push(["api", request.label]); return signedMonitorResult(request, { healthy: true, continuous: true }); },
+    primaryChatWebSocket: async (request) => { state.monitorCalls.push(["chat", request.label]); return signedMonitorResult(request, { healthy: true, continuous: true }); },
+    unrelatedWorkerHealth: async (request) => { state.monitorCalls.push(["worker", request.label]); return signedMonitorResult(request, { healthy: true, continuous: true }); },
+    apiOomCounter: async (request) => { state.monitorCalls.push(["api-oom", request.label]); return signedMonitorResult(request, { count: 4 }); },
+    globalOomCounter: async (request) => { state.monitorCalls.push(["global-oom", request.label]); return signedMonitorResult(request, { count: 7 }); },
   };
   const fsImpl = {
     readFileSync(filePath, encoding) {
@@ -168,8 +246,8 @@ function harness(overrides = {}) {
       throw error;
     },
     realpathSync(value) {
-      if (value !== TEMP_ROOT) throw new Error("SECRET unexpected temp path");
-      return TEMP_ROOT;
+      if (![TEMP_PARENT, TEMP_ROOT].includes(value)) throw new Error("SECRET unexpected temp path");
+      return value;
     },
     statfsSync(value, options) {
       assert.equal(value, TEMP_ROOT);
@@ -191,8 +269,34 @@ function harness(overrides = {}) {
       return { linux: true, cgroupV2: true, userManager: true, machineId: MACHINE_ID };
     },
     monitorProbes,
+    monitorAuthority: { adapterId: MONITOR_ID, publicKey: monitorKeys.publicKey },
+    tempFactAuthority: {
+      authorityId: "quadwork-resource-temp",
+      publicKey: tempFactKeys.publicKey,
+      verify(request) {
+        const valid = request.fact === TEMP_FACT;
+        const payload = buildTempFactProofPayload({
+          runChallenge: request.runChallenge,
+          authorityId: "quadwork-resource-temp",
+          projectId: request.projectId,
+          generationId: request.generationId,
+          canonicalRoot: TEMP_PARENT,
+          generationTempRoot: request.generationTempRoot,
+          available: true,
+          code: "ready",
+          diskBacked: true,
+        });
+        return {
+          valid,
+          authorityId: "quadwork-resource-temp",
+          runChallenge: request.runChallenge,
+          signature: crypto.sign(null, payload, tempFactKeys.privateKey).toString("base64url"),
+        };
+      },
+    },
     ptySpawn(file, args, options) {
       const scenario = scenarioFromArgs(args);
+      if (scenario === "temp") state.tempMarker = tempMarkerFromArgs(args);
       state.ptyCalls.push({ file, args, options, scenario });
       return new FakePty(scenario, state);
     },
@@ -228,6 +332,23 @@ function harness(overrides = {}) {
   assert.throws(() => harness({
     target: target({ spawnEnv: { PATH: "/usr/bin", NODE_OPTIONS: "--require=/tmp/forged.js" } }),
   }), /may not alter the staging probe runtime/);
+  assert.throws(() => harness({ target: target({ generationTempRoot: "/" }) }), /normalized non-root/);
+  assert.throws(
+    () => harness({ target: target({ generationTempRoot: "/var/lib/quadwork/tmp/../tmp/generation-live-proof" }) }),
+    /normalized non-root/,
+  );
+  assert.throws(
+    () => harness({ target: target({ workerLimits: { memoryHighMib: 64, memoryMaxMib: MAX_STAGING_MEMORY_MAX_MIB + 1, swapMaxMib: 1 } }) }),
+    /supported integer range/,
+  );
+  assert.throws(
+    () => harness({ target: target({ workerLimits: { memoryHighMib: 64, memoryMaxMib: 96, swapMaxMib: MAX_STAGING_SWAP_MAX_MIB + 1 } }) }),
+    /supported integer range/,
+  );
+  assert.throws(
+    () => harness({ target: target({ tempProbe: { file: "/bin/echo", args: [] } }) }),
+    /providerId/,
+  );
 }
 
 // Construction and module loading are inert. The full coordinator path below
@@ -243,16 +364,34 @@ function harness(overrides = {}) {
     runPressure: true,
     acknowledgement: ACK,
   });
-  assert.equal(result.ok, true);
-  assert.equal(result.reason, "proof_passed");
-  assert.equal(result.started_phases.length, 5);
-  assert.equal(result.monitor_checkpoints, 11);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "proof_unavailable");
+  assert.equal(result.started_phases.length, 0);
+  assert.equal(result.monitor_checkpoints, 0);
   assert.equal(state.gateCalls, 1);
-  assert.equal(state.ptyCalls.length, 5);
-  assert.equal(state.monitorCalls.length, 55);
+  assert.equal(state.ptyCalls.length, 0);
+  assert.equal(state.monitorCalls.length, 0);
+
+  // Until reviewed authority fingerprints are pinned in source, the public
+  // factory is deliberately incapable of a PASS. Non-provider machinery is
+  // still exercised directly behind the exact gate with injected fakes.
+  for (const phaseId of [
+    "node_pty_controlling_tty",
+    "resize_signal_exit_propagation",
+    "descendant_cgroup_membership",
+    "bounded_worker_oom_counter",
+  ]) {
+    assert.equal((await adapter.runPhase(phaseId, { candidate: CANDIDATE })).status, "passed");
+  }
+  await assert.rejects(
+    adapter.runPhase("effective_temp_disk_boundary", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "resource_temp_fact_authority_unpinned",
+  );
+  assert.equal(state.ptyCalls.length, 4);
   assert.deepEqual(state.resizes, [{ cols: 97, rows: 31 }]);
   assert.deepEqual(state.writes, ["go\n"]);
-  assert.equal(state.disposals, 10, "both PTY listeners are disposed for every phase");
+  assert.equal(state.disposals, 8, "both PTY listeners are disposed for every launched phase");
+  assert.equal(typeof adapter._cleanupScope, "undefined", "arbitrary public cleanup is not exposed");
 
   const units = new Set();
   for (const call of state.ptyCalls) {
@@ -266,13 +405,18 @@ function harness(overrides = {}) {
     assert.equal(call.options.env.PATH, "/usr/bin:/bin");
     assert.equal(Object.hasOwn(call.options, "shell"), false);
   }
-  assert.equal(units.size, 5, "each disposable phase uses a distinct generated unit");
-  assert.equal(state.ptyCalls.find((call) => call.scenario === "temp").options.env.TMPDIR, TEMP_ROOT);
+  assert.equal(units.size, 4, "each disposable phase uses a distinct generated unit");
+  const oomCall = state.ptyCalls.find((call) => call.scenario === "oom");
+  const oomScriptText = oomCall.args.find((arg) => typeof arg === "string" && arg.includes("allocationLimitBytes"));
+  assert.match(oomScriptText, /allocationLimitBytes = 144 \* 1024 \* 1024/);
+  assert.match(oomScriptText, /while \(allocated < allocationLimitBytes\)/);
+  assert.equal(oomScriptText.includes("setInterval(() => allocations.push"), false);
+  assert(144 <= MAX_OOM_ALLOCATION_MIB);
 
   const observationCalls = state.execCalls.filter((call) => call.args.includes("--property=ControlGroup"));
   const cleanupCalls = state.execCalls.filter((call) => call.args.includes("stop"));
   assert.equal(observationCalls.length, 2);
-  assert.equal(cleanupCalls.length, 5, "every generated scope receives an exact cleanup command");
+  assert.equal(cleanupCalls.length, 4, "every registered scope receives an exact cleanup command");
   for (const call of observationCalls) {
     assert.equal(call.file, "systemctl");
     assert.deepEqual(call.args.slice(0, 4), ["--user", "--property=ControlGroup", "--value", "show"]);
@@ -325,7 +469,41 @@ function harness(overrides = {}) {
   );
   assert.equal(drifted.state.ptyCalls.length, 0);
 
-  // Authenticated probes are mandatory; a mere healthy boolean is not enough.
+  // Underscore-named helpers cannot bypass the public gate: the module-private
+  // token is required before any PTY or cleanup-capable path is entered.
+  const bypass = harness();
+  await bypass.adapter.inspectGates();
+  await assert.rejects(
+    async () => bypass.adapter._ttyPhase("node_pty_controlling_tty"),
+    (error) => error instanceof StagingProofError && error.check === "internal_phase_boundary_required",
+  );
+  await assert.rejects(
+    async () => bypass.adapter._withPty("node_pty_controlling_tty", { file: "/bin/true", args: [] }, async () => ({})),
+    (error) => error instanceof StagingProofError && error.check === "internal_phase_boundary_required",
+  );
+  assert.equal(bypass.state.ptyCalls.length, 0);
+  assert.equal(bypass.state.execCalls.length, 0);
+
+  const spawnFailure = harness({ ptySpawn() { throw new Error("SECRET partial spawn"); } });
+  await spawnFailure.adapter.inspectGates();
+  await assert.rejects(
+    spawnFailure.adapter.runPhase("node_pty_controlling_tty", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "pty_spawn_unavailable",
+  );
+  assert.equal(spawnFailure.state.execCalls.length, 0, "unreturned spawn never authorizes a predicted-unit stop");
+
+  const uniqueRunA = harness();
+  const uniqueRunB = harness();
+  await uniqueRunA.adapter.inspectGates();
+  await uniqueRunB.adapter.inspectGates();
+  await uniqueRunA.adapter.runPhase("node_pty_controlling_tty", { candidate: CANDIDATE });
+  await uniqueRunB.adapter.runPhase("node_pty_controlling_tty", { candidate: CANDIDATE });
+  const uniqueUnitA = uniqueRunA.state.ptyCalls[0].args.find((arg) => arg.startsWith("--unit="));
+  const uniqueUnitB = uniqueRunB.state.ptyCalls[0].args.find((arg) => arg.startsWith("--unit="));
+  assert.notEqual(uniqueUnitA, uniqueUnitB, "per-run challenge makes cleanup ownership unpredictable");
+
+  // Authenticated probes are mandatory; booleans and echoed challenges are not
+  // authority without the independently pinned adapter signature.
   const missingMonitor = harness({ monitorProbes: {} });
   await missingMonitor.adapter.inspectGates();
   await assert.rejects(
@@ -333,28 +511,35 @@ function harness(overrides = {}) {
     (error) => error instanceof StagingProofError && error.check === "authenticated_monitor_probes_required",
   );
 
-  const unauthenticatedProbes = {
-    ...harness().monitorProbes,
-    apiHealth: async () => ({ healthy: true, continuous: true }),
-  };
-  const unauthenticated = harness({ monitorProbes: unauthenticatedProbes });
-  await unauthenticated.adapter.inspectGates();
-  const monitor = await unauthenticated.adapter.startContinuousMonitoring({ candidate: CANDIDATE });
+  // Supplying a fresh key and matching signer is still self-assertion. The
+  // source-owned fingerprint set is intentionally empty, so the public factory
+  // stops before invoking any such probe.
+  const selfAsserted = harness();
+  await selfAsserted.adapter.inspectGates();
   await assert.rejects(
-    monitor.checkpoint("matrix_start"),
-    (error) => error instanceof StagingProofError && error.check === "authenticated_monitor_result_invalid",
+    selfAsserted.adapter.startContinuousMonitoring({ candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "staging_monitor_authority_unpinned",
   );
-  await monitor.stop();
+  assert.equal(selfAsserted.state.monitorCalls.length, 0);
 
-  const gapProbeSet = {
-    ...harness().monitorProbes,
-    primaryChatWebSocket: async () => ({ authenticated: true, healthy: true, continuous: false }),
-  };
-  const gap = harness({ monitorProbes: gapProbeSet });
-  await gap.adapter.inspectGates();
-  const gapMonitor = await gap.adapter.startContinuousMonitoring({ candidate: CANDIDATE });
-  assert.deepEqual(await gapMonitor.checkpoint("matrix_start"), { healthy: false });
-  assert.equal((await gapMonitor.stop()).primary_chat_websocket_continuously_healthy, false);
+  const noMonitorAuthority = harness({ monitorAuthority: null });
+  await noMonitorAuthority.adapter.inspectGates();
+  await assert.rejects(
+    noMonitorAuthority.adapter.startContinuousMonitoring({ candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "authenticated_monitor_probes_required",
+  );
+
+  const firstPayload = buildMonitorProofPayload({
+    runChallenge: "a".repeat(64), probeChallenge: "b".repeat(64), adapterId: MONITOR_ID,
+    probeName: "apiHealth", label: "first", kind: "health", healthy: true, continuous: true,
+  });
+  const secondPayload = buildMonitorProofPayload({
+    runChallenge: "a".repeat(64), probeChallenge: "c".repeat(64), adapterId: MONITOR_ID,
+    probeName: "apiHealth", label: "second", kind: "health", healthy: true, continuous: true,
+  });
+  const firstSignature = crypto.sign(null, firstPayload, monitorKeys.privateKey);
+  assert.equal(crypto.verify(null, secondPayload, monitorKeys.publicKey, firstSignature), false,
+    "a signed probe response cannot replay across challenge or checkpoint");
 
   // Provider-specific effective TMPDIR evidence is never simulated. Without
   // an explicit target probe, the phase fails typed before spawning anything.
@@ -365,6 +550,76 @@ function harness(overrides = {}) {
     (error) => error instanceof StagingProofError && error.check === "target_effective_temp_probe_required",
   );
   assert.equal(noTemp.state.ptyCalls.length, 0);
+
+  const invalidTempFact = harness({ target: target({ tempFact: { ...TEMP_FACT, diskBacked: false } }) });
+  await invalidTempFact.adapter.inspectGates();
+  await assert.rejects(
+    invalidTempFact.adapter.runPhase("effective_temp_disk_boundary", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "resource_temp_fact_invalid",
+  );
+  assert.equal(invalidTempFact.state.ptyCalls.length, 0);
+
+  const identityRealpathFs = {
+    ...harness().fsImpl,
+    realpathSync(value) { return value; },
+  };
+  const outsideTemp = harness({
+    target: target({ generationTempRoot: "/outside/generation-live-proof" }),
+    fsImpl: identityRealpathFs,
+  });
+  await outsideTemp.adapter.inspectGates();
+  await assert.rejects(
+    outsideTemp.adapter.runPhase("effective_temp_disk_boundary", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "generation_temp_boundary_invalid",
+  );
+  assert.equal(outsideTemp.state.ptyCalls.length, 0);
+
+  const aliasPath = `${TEMP_PARENT}/generation-alias`;
+  const aliasTemp = harness({
+    target: target({ generationTempRoot: aliasPath }),
+    fsImpl: {
+      ...harness().fsImpl,
+      realpathSync(value) { return value === aliasPath ? TEMP_ROOT : value; },
+    },
+  });
+  await aliasTemp.adapter.inspectGates();
+  await assert.rejects(
+    aliasTemp.adapter.runPhase("effective_temp_disk_boundary", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "generation_temp_boundary_invalid",
+  );
+  assert.equal(aliasTemp.state.ptyCalls.length, 0);
+
+  const rootFact = Object.freeze({ ...TEMP_FACT, configuredRoot: "/", canonicalRoot: "/" });
+  const rootBoundary = harness({
+    target: target({ tempFact: rootFact }),
+    tempFactAuthority: {
+      authorityId: "root-fact",
+      publicKey: tempFactKeys.publicKey,
+      verify({ fact }) { return fact === rootFact; },
+    },
+  });
+  await rootBoundary.adapter.inspectGates();
+  await assert.rejects(
+    rootBoundary.adapter.runPhase("effective_temp_disk_boundary", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "resource_temp_fact_invalid",
+  );
+  assert.equal(rootBoundary.state.ptyCalls.length, 0);
+
+  const tempPayload = buildTempProofPayload({
+    runChallenge: "d".repeat(64), phaseChallenge: "e".repeat(64),
+    projectId: "quadwork", generationId: "generation-live-proof",
+    providerId: TEMP_PROVIDER_ID, contract: TEMP_PROOF_CONTRACT,
+    canonicalRoot: TEMP_PARENT, generationTempRoot: TEMP_ROOT, effectivePath: TEMP_ROOT,
+  });
+  const tempSignature = crypto.sign(null, tempPayload, tempKeys.privateKey);
+  const replayedTempPayload = buildTempProofPayload({
+    runChallenge: "d".repeat(64), phaseChallenge: "f".repeat(64),
+    projectId: "quadwork", generationId: "generation-live-proof",
+    providerId: TEMP_PROVIDER_ID, contract: TEMP_PROOF_CONTRACT,
+    canonicalRoot: TEMP_PARENT, generationTempRoot: TEMP_ROOT, effectivePath: TEMP_ROOT,
+  });
+  assert.equal(crypto.verify(null, replayedTempPayload, tempKeys.publicKey, tempSignature), false,
+    "a static provider marker cannot replay across the unpredictable phase challenge");
 
   // A mismatched unit path is unavailable, never read, and the live PTY is
   // killed and disposed exactly on the failure path without leaking raw data.
@@ -379,6 +634,20 @@ function harness(overrides = {}) {
   assert.equal(mismatch.state.readCalls.length, 0);
   assert.deepEqual(mismatch.state.kills, [{ scenario: "descendants", signal: "SIGKILL" }]);
   assert.equal(mismatch.state.disposals, 2);
+
+  const oomWithoutContainment = harness({
+    execFileSyncImpl(file, args) {
+      if (args.includes("stop")) return "";
+      return `/user.slice/app.slice/quadwork-worker-${"0".repeat(40)}.scope\n`;
+    },
+  });
+  await oomWithoutContainment.adapter.inspectGates();
+  await assert.rejects(
+    oomWithoutContainment.adapter.runPhase("bounded_worker_oom_counter", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "control_group_invalid",
+  );
+  assert.equal(oomWithoutContainment.state.writes.length, 0, "allocator never starts without exact containment");
+  assert.equal(oomWithoutContainment.state.disposals, 2);
 
   // Bounded output aborts and cleans up a noisy PTY without echoing its bytes.
   const noisy = harness({
@@ -405,24 +674,16 @@ function harness(overrides = {}) {
   assert.deepEqual(silent.state.kills, [{ scenario: "unknown", signal: "SIGKILL" }]);
   assert.equal(silent.state.disposals, 2);
 
-  // A probe that ignores completion is bounded and receives an abort signal.
-  let probeAborted = false;
-  const slowProbeSet = { ...harness().monitorProbes };
-  slowProbeSet.apiHealth = ({ signal }) => new Promise((resolve) => {
-    signal.addEventListener("abort", () => {
-      probeAborted = true;
-      resolve({ authenticated: true, healthy: true, continuous: true });
-    }, { once: true });
+  const survivedPressure = harness({
+    ptySpawn() { return new FakePty("oom-survives", survivedPressure.state); },
   });
-  const slowProbe = harness({ probeTimeoutMs: 10, monitorProbes: slowProbeSet });
-  await slowProbe.adapter.inspectGates();
-  const boundedMonitor = await slowProbe.adapter.startContinuousMonitoring({ candidate: CANDIDATE });
+  await survivedPressure.adapter.inspectGates();
   await assert.rejects(
-    boundedMonitor.checkpoint("matrix_start"),
-    (error) => error instanceof StagingProofError && error.check === "monitor_apiHealth_unavailable",
+    survivedPressure.adapter.runPhase("bounded_worker_oom_counter", { candidate: CANDIDATE }),
+    (error) => error instanceof StagingProofError && error.check === "bounded_allocator_survived_without_oom",
   );
-  assert.equal(probeAborted, true);
-  await boundedMonitor.stop();
+  assert.deepEqual(survivedPressure.state.kills, [{ scenario: "oom-survives", signal: "SIGKILL" }]);
+  assert.equal(survivedPressure.state.disposals, 2);
 
   // Cleanup cannot be waved through: if stop fails and the unit is still
   // loaded/active, an otherwise-successful phase is unavailable.
