@@ -201,7 +201,6 @@ function fixture(overrides = {}) {
     apiObservation: apiObservation(configured),
     controlObservation: controlObservation(configured),
     workerObservations: [workerObservation(identity, configured)],
-    proofAuthority: createResourceRuntimeProofAuthority({ apiUnitName: "pm2-quadwork.service" }),
     ...overrides,
   };
 }
@@ -209,8 +208,11 @@ function fixture(overrides = {}) {
 {
   const input = fixture();
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.status, "ready");
-  assert.deepEqual(snapshot.pressure, { status: "ready", reason: "ok" });
+  assert.equal(snapshot.status, "candidate_pending_staging");
+  assert.deepEqual(snapshot.pressure, {
+    status: "candidate_pending_staging",
+    reason: "proof_authority_unavailable",
+  });
   assert.deepEqual(snapshot.counts, {
     active_worker_scopes: 1,
     active_control_children: 0,
@@ -227,7 +229,6 @@ function fixture(overrides = {}) {
     swap_free_mib: 7000,
     worker_memory_mib: 2,
     control_memory_mib: 2,
-    api_memory_mib: 2,
     static_reservation_mib: 6928,
     static_headroom_mib: 1264,
     configured_swap_mib: 1792,
@@ -242,7 +243,7 @@ function fixture(overrides = {}) {
   assert.equal(snapshot.resource_usage.worker.memory_current_bytes, (MIB_BYTES + 1n).toString(10));
   assert.equal(snapshot.resource_usage.worker.memory_peak_bytes, undefined);
   assert.equal(snapshot.resource_usage.worker.sum_of_scope_peaks_bytes, (3n * MIB_BYTES).toString(10));
-  assert.equal(snapshot.resource_usage.api.unit_name, "pm2-quadwork.service");
+  assert.equal(snapshot.resource_usage.api, undefined);
   assert.deepEqual(snapshot.worker_scopes, [{
     project_id: "quadwork",
     generation_id: "generation-7",
@@ -256,7 +257,7 @@ function fixture(overrides = {}) {
     },
     effective_limits: input.workerObservations[0].limits,
   }]);
-  assert.equal(snapshot.effective_limits.api.memory_low.bytes, (512n * MIB_BYTES).toString(10));
+  assert.equal(snapshot.effective_limits.api, undefined);
   assert.equal(snapshot.effective_limits.control.memory_high.kind, "infinite");
   assert.equal(snapshot.effective_limits.worker.observed_scopes, 1);
   assert.deepEqual(snapshot.last_cgroup_oom, input.controllerSnapshot.last_cgroup_oom);
@@ -268,7 +269,8 @@ function fixture(overrides = {}) {
   assert.equal(Object.isFrozen(snapshot.resource_usage), true);
   assert.equal(Object.isFrozen(snapshot.worker_scopes), true);
   assert.equal(Object.isFrozen(snapshot.worker_scopes[0]), true);
-  assert.equal(createResourceSnapshot(snapshot).status, "ready", "runtime output is ResourceStateStore-compatible");
+  assert.equal(createResourceSnapshot(snapshot).status, "candidate_pending_staging",
+    "runtime output is ResourceStateStore-compatible without an unpinned ready claim");
   const json = JSON.stringify(snapshot);
   assert.equal(json.includes(DEFAULT_RUNTIME_RESOURCE_PROPOSAL.temp_root), false);
   assert.equal(json.includes("command"), false);
@@ -288,8 +290,8 @@ function fixture(overrides = {}) {
   assert.notEqual(snapshot.status, "ready", "read-only staging evidence never flips the controller candidate");
 }
 
-// Raw preflight/controller claims cannot mint staging authority. Only the
-// module-owned opaque capability can promote the same evidence to ready.
+// Raw preflight/controller claims and capability lookalikes cannot mint
+// staging authority. No reviewed receipt/source fingerprint is pinned yet.
 for (const proofAuthority of [undefined, null, {}, "supported", { apiUnitName: "pm2-quadwork.service" }]) {
   const input = fixture({ proofAuthority });
   const snapshot = buildResourceRuntimeSnapshot(input);
@@ -300,23 +302,23 @@ for (const proofAuthority of [undefined, null, {}, "supported", { apiUnitName: "
 {
   const input = fixture();
   input.apiObservation = { ...input.apiObservation, self: false };
-  assert.equal(buildResourceRuntimeSnapshot(input).status, "ready",
-    "API self authority comes from the opaque exact-unit capability, not a raw self flag");
+  assert.equal(buildResourceRuntimeSnapshot(input).status, "candidate_pending_staging",
+    "a raw API self flag cannot replace a source-pinned receipt");
 
-  input.proofAuthority = createResourceRuntimeProofAuthority({ apiUnitName: "other-api.service" });
-  const mismatch = buildResourceRuntimeSnapshot(input);
-  assert.equal(mismatch.status, "containment_unavailable");
-  assert.equal(mismatch.pressure.reason, "api_self_identity_unproven");
-
-  assert.throws(() => createResourceRuntimeProofAuthority({
-    apiUnitName: `${createWorkerUnitBase({ projectId: "quadwork", generationId: "g" })}.scope`,
-  }), (error) => error.code === "QW_INVALID_RESOURCE_PROOF_AUTHORITY");
-  const hostileAuthorityInput = Object.defineProperty({}, "apiUnitName", {
+  const hostileAuthorityInput = Object.defineProperty({}, "receiptBytes", {
     get() { throw new Error("PROOF-AUTHORITY-SECRET"); },
   });
   assert.throws(() => createResourceRuntimeProofAuthority(hostileAuthorityInput), (error) =>
-    error.code === "QW_INVALID_RESOURCE_PROOF_AUTHORITY"
+    error.code === "QW_RESOURCE_PROOF_NOT_PINNED"
       && !error.message.includes("SECRET"));
+  assert.throws(() => createResourceRuntimeProofAuthority({
+    receiptBytes: JSON.stringify({
+      version: 1,
+      status: "proof_passed",
+      controller_source_sha256: "a".repeat(64),
+      api_unit_name: "pm2-quadwork.service",
+    }),
+  }), (error) => error.code === "QW_RESOURCE_PROOF_NOT_PINNED");
 }
 
 {
@@ -370,12 +372,14 @@ for (const [index, mutate] of [
   const input = fixture();
   mutate(input);
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.status, "containment_unavailable");
-  assert.equal(snapshot.pressure.reason, index === 4 || index === 7
-    ? "controller_snapshot_invalid"
-    : index === 5 || index === 6
-      ? "api_self_identity_unproven"
-      : "runtime_observation_inconsistent");
+  assert.equal(snapshot.status, index === 0 ? "candidate_pending_staging" : "containment_unavailable");
+  assert.equal(snapshot.pressure.reason, index === 0
+    ? "proof_authority_unavailable"
+    : index === 4 || index === 7
+      ? "controller_snapshot_invalid"
+      : index === 5 || index === 6
+        ? "api_self_identity_unproven"
+        : "runtime_observation_inconsistent");
   assert.equal(JSON.stringify(snapshot).includes("secret /path"), false);
 }
 
@@ -526,7 +530,7 @@ for (const [index, mutate] of [
     workerObservation(first, input.runtimeResources, { current: MIB_BYTES, peak: 3n * MIB_BYTES }),
   ];
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.status, "ready");
+  assert.equal(snapshot.status, "candidate_pending_staging");
   assert.deepEqual(snapshot.worker_scopes.map((scope) => [scope.project_id, scope.generation_id]), [
     [first.projectId, first.generationId],
     [second.projectId, second.generationId],
@@ -553,7 +557,7 @@ for (const [index, mutate] of [
   const input = fixture();
   input.workerObservations[0].observed_at = "2024-02-29T23:59:59.123-14:00";
   const leap = buildResourceRuntimeSnapshot(input);
-  assert.equal(leap.status, "ready");
+  assert.equal(leap.status, "candidate_pending_staging");
   assert.equal(leap.worker_scopes[0].observed_at, "2024-03-01T13:59:59.123Z");
 }
 
@@ -603,7 +607,6 @@ for (const [index, mutate] of [
     controllerSnapshot,
     apiObservation: apiObservation(configured, { current: 0n, peak: 0n }),
     controlObservation: controlObservation(configured, { current: 0n, peak: 0n }),
-    proofAuthority: createResourceRuntimeProofAuthority({ apiUnitName: "pm2-quadwork.service" }),
     workerObservations: [first, second].map((identity) => workerObservation(identity, configured, {
       current: hugeBytes,
       peak: hugeBytes,
@@ -623,7 +626,7 @@ for (const [index, mutate] of [
   const persisted = persistResourceRuntimeSnapshot(store, snapshot);
   assert.equal(saves, 1);
   assert.equal(savedValue, snapshot);
-  assert.equal(persisted.status, "ready");
+  assert.equal(persisted.status, "candidate_pending_staging");
   assert.equal(Object.hasOwn(persisted, "pressure"), false, "state persistence keeps only its allowlist");
   assert.throws(() => persistResourceRuntimeSnapshot({}, snapshot), (error) =>
     error instanceof ResourceRuntimePersistenceError

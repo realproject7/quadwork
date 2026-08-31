@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("crypto");
 const {
   parseRuntimeResources,
   calculateStaticReservationMib,
@@ -18,6 +19,12 @@ const SYSTEMD_UNIT_RE = /^[a-z][a-z0-9.-]{0,127}$/;
 const API_UNIT_RE = /^[a-z][a-z0-9.-]{0,127}\.(?:service|scope)$/;
 const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 const PROOF_AUTHORITIES = new WeakMap();
+// Intentionally unset until a disposable-host PASS receipt and the exact
+// controller source it exercised are reviewed and pinned in source together.
+// A fingerprint is not a secret; authority comes from requiring receipt bytes
+// whose SHA-256 matches the reviewed pin, rather than trusting a caller claim.
+const PINNED_STAGING_RECEIPT_SHA256 = null;
+const PINNED_CONTROLLER_SOURCE_SHA256 = null;
 const PREFLIGHT_FAILURES = new Set([
   "invalid_resource_policy",
   "containment_unavailable",
@@ -36,11 +43,44 @@ class ResourceRuntimePersistenceError extends Error {
 }
 
 function createResourceRuntimeProofAuthority(options = {}) {
-  const apiUnitName = safeGet(options, "apiUnitName");
+  if (PINNED_STAGING_RECEIPT_SHA256 === null || PINNED_CONTROLLER_SOURCE_SHA256 === null) {
+    const error = new Error("no reviewed staging receipt is pinned in this source");
+    error.code = "QW_RESOURCE_PROOF_NOT_PINNED";
+    throw error;
+  }
+  const receiptBytes = safeGet(options, "receiptBytes");
+  if (typeof receiptBytes !== "string" || Buffer.byteLength(receiptBytes, "utf8") > 16 * 1024) {
+    const error = new TypeError("staging receipt bytes are invalid");
+    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
+    throw error;
+  }
+  const digest = crypto.createHash("sha256").update(receiptBytes, "utf8").digest("hex");
+  if (digest !== PINNED_STAGING_RECEIPT_SHA256) {
+    const error = new TypeError("staging receipt does not match the source pin");
+    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
+    throw error;
+  }
+  let receipt;
+  try {
+    receipt = JSON.parse(receiptBytes);
+  } catch {
+    const error = new TypeError("staging receipt is invalid");
+    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
+    throw error;
+  }
+  if (!hasOnlyKeys(receipt, new Set(["version", "status", "controller_source_sha256", "api_unit_name"]))) {
+    const error = new TypeError("staging receipt schema is invalid");
+    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
+    throw error;
+  }
+  const apiUnitName = safeGet(receipt, "api_unit_name");
   if (typeof apiUnitName !== "string"
     || !API_UNIT_RE.test(apiUnitName)
     || apiUnitName.startsWith("quadwork-worker-")
-    || apiUnitName.startsWith("quadwork-control-")) {
+    || apiUnitName.startsWith("quadwork-control-")
+    || safeGet(receipt, "version") !== 1
+    || safeGet(receipt, "status") !== "proof_passed"
+    || safeGet(receipt, "controller_source_sha256") !== PINNED_CONTROLLER_SOURCE_SHA256) {
     const error = new TypeError("apiUnitName must be an exact systemd service or scope unit");
     error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
     throw error;
@@ -471,10 +511,10 @@ function workerTotals(workers) {
 }
 
 function limitsMatchPolicy(api, control, workers, policy) {
-  if (!finiteLimitEquals(api.limits.low, policy.api.memory_low_mib)
+  if ((api !== null && (!finiteLimitEquals(api.limits.low, policy.api.memory_low_mib)
     || !infiniteLimit(api.limits.high)
     || !finiteLimitEquals(api.limits.max, policy.api.memory_max_mib)
-    || !infiniteLimit(api.limits.swapMax)
+    || !infiniteLimit(api.limits.swapMax)))
     || !zeroLimit(control.limits.low)
     || !infiniteLimit(control.limits.high)
     || !finiteLimitEquals(control.limits.max, policy.control.memory_max_mib)
@@ -577,7 +617,9 @@ function buildResourceRuntimeSnapshot({
   const totals = workers ? workerTotals(workers) : null;
   const evidence = controller ? sanitizeControllerEvidence(controller) : { lastCgroupOom: null, terminalFacts: [] };
 
-  const effectiveConsistent = api && control && workers && totals
+  const workerControlConsistent = control && workers && totals
+    && limitsMatchPolicy(null, control, workers, policy);
+  const effectiveConsistent = api && workerControlConsistent
     && limitsMatchPolicy(api, control, workers, policy);
   const workerMemoryMib = totals ? ceilMib(totals.current) : null;
   const controlMemoryMib = control ? ceilMib(control.current) : null;
@@ -603,14 +645,20 @@ function buildResourceRuntimeSnapshot({
   } else if (controller.protocolStatus !== "supported") {
     status = "containment_unavailable";
     reason = "controller_protocol_unavailable";
+  } else if (!preflight.validForReady || !countsConsistent || !workerControlConsistent
+    || workerMemoryMib === null || controlMemoryMib === null) {
+    status = "containment_unavailable";
+    reason = "runtime_observation_inconsistent";
+  } else if (apiObservedUnit === null) {
+    status = "containment_unavailable";
+    reason = "api_self_identity_unproven";
   } else if (proof === null) {
     status = "candidate_pending_staging";
     reason = "proof_authority_unavailable";
   } else if (apiObservedUnit !== proof.apiUnitName) {
     status = "containment_unavailable";
     reason = "api_self_identity_unproven";
-  } else if (!preflight.validForReady || !countsConsistent || !effectiveConsistent
-    || workerMemoryMib === null || controlMemoryMib === null || apiMemoryMib === null) {
+  } else if (!effectiveConsistent || apiMemoryMib === null) {
     status = "containment_unavailable";
     reason = "runtime_observation_inconsistent";
   } else {
@@ -667,19 +715,19 @@ function buildResourceRuntimeSnapshot({
     terminal_facts: evidence.terminalFacts,
   });
   if (status === "ready" && state.status !== "ready") reason = "runtime_snapshot_inconsistent";
-  const effectiveLimits = api && control && workers ? Object.freeze({
-    api: api.outputLimits,
+  const effectiveLimits = control && workers ? Object.freeze({
+    ...(api ? { api: api.outputLimits } : {}),
     control: control.outputLimits,
     worker: Object.freeze({
       observed_scopes: workers.length,
       limits: workers.length === 0 ? null : workers[0].outputLimits,
     }),
   }) : null;
-  const resourceUsage = api && control && totals ? Object.freeze({
-    api: Object.freeze({
+  const resourceUsage = control && totals ? Object.freeze({
+    ...(api ? { api: Object.freeze({
       unit_name: proof.apiUnitName,
       ...frozenObservationOutput(api),
-    }),
+    }) } : {}),
     control: frozenObservationOutput(control),
     worker: Object.freeze({
       observed_scopes: workers.length,
