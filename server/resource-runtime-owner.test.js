@@ -71,6 +71,7 @@ function makeFs(configValue, facts = {}) {
       : JSON.stringify({ runtime_resources: configValue });
   facts.configReads = 0;
   facts.stateLstats = 0;
+  facts.stateReads = 0;
   facts.nonConfigWrites = 0;
   let statePath = null;
   Object.defineProperties(wrapper, {
@@ -85,6 +86,7 @@ function makeFs(configValue, facts = {}) {
           }
           return configText;
         }
+        if (Number.isInteger(target) && target >= 0) facts.stateReads += 1;
         return fs.readFileSync(target, ...args);
       },
     },
@@ -179,6 +181,7 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
   assert.equal(snapshot.pressure.reason, "policy_invalid_or_absent");
   assert.equal(facts.configReads, 1);
   assert.equal(facts.stateLstats, 0);
+  assert.equal(facts.stateReads, 0);
   assert.equal(facts.nonConfigWrites, 0);
   assert.equal(facts.execCalls || 0, 0);
   assert.equal(legacyGetterCalls, 0);
@@ -207,9 +210,9 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
   assert.equal(first.version, 1);
   assert.equal(typeof first.pressure.reason, "string");
   assert.equal(second.status, first.status);
-  const loadLstats = facts.stateLstats;
+  const loadReads = facts.stateReads;
   owner.snapshot();
-  assert.equal(facts.stateLstats, loadLstats, "state is loaded only at construction");
+  assert.equal(facts.stateReads, loadReads, "state is loaded only at construction");
   assert.equal(fs.existsSync(statePath), false, "snapshot has no implicit persistence");
 
   if (process.platform === "linux") {
@@ -267,11 +270,11 @@ if (process.platform === "linux") {
 
   const restarted = createConfiguredOwner(homeDir);
   const snapshot = restarted.owner.snapshot();
-  const restartLoadLstats = restarted.facts.stateLstats;
-  assert.equal(restartLoadLstats >= 1, true);
+  const restartStateReads = restarted.facts.stateReads;
+  assert.equal(restartStateReads >= 1, true);
   assert.equal(snapshot.terminal_facts.some((fact) => fact.generation_id === "generation-restart"), true);
   restarted.owner.snapshot();
-  assert.equal(restarted.facts.stateLstats, restartLoadLstats);
+  assert.equal(restarted.facts.stateReads, restartStateReads);
 
   const statePath = resourceStateFilePath(homeDir);
   fs.writeFileSync(statePath, "{not-json", { mode: 0o600 });
