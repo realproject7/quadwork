@@ -26,8 +26,22 @@ const REASON_PRIORITY = Object.freeze({
   capacity_exhausted: 3,
 });
 
-function finiteMib(value) {
-  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+function validMib(value) {
+  // Probe adapters already declare MiB units. Rounding a fractional or unsafe
+  // value could turn an over-limit fact into an apparently valid one.
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function checkedNonNegativeProduct(left, right) {
+  if (!Number.isSafeInteger(left) || left < 0 || !Number.isSafeInteger(right) || right < 0) return null;
+  const product = left * right;
+  return Number.isSafeInteger(product) ? product : null;
+}
+
+function checkedNonNegativeSum(left, right) {
+  if (!Number.isSafeInteger(left) || left < 0 || !Number.isSafeInteger(right) || right < 0) return null;
+  const sum = left + right;
+  return Number.isSafeInteger(sum) ? sum : null;
 }
 
 function parseProcMeminfo(text) {
@@ -62,7 +76,9 @@ function cgroupValueToMib(raw) {
   if (text === "max") return null;
   if (!/^\d+$/.test(text)) throw new Error("invalid cgroup memory value");
   const bytes = BigInt(text);
-  const mib = bytes / BigInt(MIB);
+  const mibBytes = BigInt(MIB);
+  if (bytes % mibBytes !== 0n) throw new Error("cgroup memory value is not an exact MiB value");
+  const mib = bytes / mibBytes;
   if (mib > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("cgroup memory value is too large");
   return Number(mib);
 }
@@ -244,13 +260,19 @@ function runResourcePreflight({ runtimeResources, probes, requestedWorkerScopes 
   const activeRaw = safeProbe(probes, "activeScopes");
 
   const memory = memoryRaw ? {
-    totalMib: finiteMib(memoryRaw.totalMib),
-    availableMib: finiteMib(memoryRaw.availableMib),
-    swapTotalMib: finiteMib(memoryRaw.swapTotalMib),
-    swapFreeMib: finiteMib(memoryRaw.swapFreeMib),
+    totalMib: validMib(memoryRaw.totalMib),
+    availableMib: validMib(memoryRaw.availableMib),
+    swapTotalMib: validMib(memoryRaw.swapTotalMib),
+    swapFreeMib: validMib(memoryRaw.swapFreeMib),
   } : null;
-  if (!memory || Object.values(memory).some((value) => value === null)) {
+  const memoryValuesValid = memory && !Object.values(memory).some((value) => value === null);
+  const memoryFactsConsistent = memoryValuesValid
+    && memory.availableMib <= memory.totalMib
+    && memory.swapFreeMib <= memory.swapTotalMib;
+  if (!memoryValuesValid) {
     addReason(reasons, "capacity_exhausted", "host_memory_unavailable");
+  } else if (!memoryFactsConsistent) {
+    addReason(reasons, "capacity_exhausted", "host_memory_contradictory");
   }
 
   const containment = containmentRaw ? {
@@ -270,18 +292,20 @@ function runResourcePreflight({ runtimeResources, probes, requestedWorkerScopes 
     owned: tempRaw.owned === true,
     secureMode: tempRaw.secureMode === true,
     diskBacked: tempRaw.diskBacked === true,
-    freeMib: finiteMib(tempRaw.freeMib),
-    totalMib: finiteMib(tempRaw.totalMib),
+    freeMib: validMib(tempRaw.freeMib),
+    totalMib: validMib(tempRaw.totalMib),
   } : null;
   if (!temp || !temp.exists || !temp.directory || temp.symlink || !temp.owned || !temp.secureMode || !temp.diskBacked) {
     addReason(reasons, "temp_unavailable", "temp_root_unsafe");
-  } else if (temp.freeMib === null || temp.freeMib < policy.temp_min_free_mib) {
+  } else if (temp.freeMib === null || temp.totalMib === null || temp.freeMib > temp.totalMib) {
+    addReason(reasons, "temp_unavailable", "temp_capacity_contradictory");
+  } else if (temp.freeMib < policy.temp_min_free_mib) {
     addReason(reasons, "temp_unavailable", "temp_space_low");
   }
 
   const api = apiRaw ? {
-    memoryLowMib: finiteMib(apiRaw.memoryLowMib),
-    memoryMaxMib: finiteMib(apiRaw.memoryMaxMib),
+    memoryLowMib: validMib(apiRaw.memoryLowMib),
+    memoryMaxMib: validMib(apiRaw.memoryMaxMib),
     oomPolicy: apiRaw.oomPolicy === "continue" ? "continue" : "unverified",
     separateFromWorkers: apiRaw.separateFromWorkers === true,
   } : null;
@@ -300,33 +324,42 @@ function runResourcePreflight({ runtimeResources, probes, requestedWorkerScopes 
   }
 
   let capacity = null;
-  if (memory && !Object.values(memory).some((value) => value === null)) {
+  if (memoryFactsConsistent && admittedScopes !== null) {
     try {
       const configured = validatePolicyCapacity(policy, {
         physicalRamMib: memory.totalMib,
         swapTotalMib: memory.swapTotalMib,
       });
-      const requestedMemoryMib = requestedWorkerScopes * policy.worker.memory_max_mib;
-      const requestedSwapMib = requestedWorkerScopes * policy.worker.swap_max_mib;
-      if (!Number.isSafeInteger(requestedMemoryMib) || !Number.isSafeInteger(requestedSwapMib)) {
+      const requestedMemoryMib = checkedNonNegativeProduct(requestedWorkerScopes, policy.worker.memory_max_mib);
+      const requestedSwapMib = checkedNonNegativeProduct(requestedWorkerScopes, policy.worker.swap_max_mib);
+      if (requestedMemoryMib === null || requestedSwapMib === null) {
         addReason(reasons, "capacity_exhausted", "requested_scope_overflow");
       } else {
-        const liveRequiredMib = policy.host_reserve_mib + requestedMemoryMib;
-        const liveHeadroomMib = memory.availableMib - liveRequiredMib;
-        capacity = {
-          staticReservationMib: configured.staticReservationMib,
-          staticHeadroomMib: configured.staticHeadroomMib,
-          configuredSwapMib: configured.configuredSwapMib,
-          swapHeadroomMib: configured.swapHeadroomMib,
-          requestedWorkerScopes,
-          requestedMemoryMib,
-          requestedSwapMib,
-          liveRequiredMib,
-          liveHeadroomMib,
-        };
-        if (liveHeadroomMib < 0) addReason(reasons, "capacity_exhausted", "live_memory_headroom_low");
-        if (admittedScopes !== null && admittedScopes + requestedWorkerScopes > policy.max_worker_scopes) {
-          addReason(reasons, "capacity_exhausted", "worker_scope_ceiling_reached");
+        const liveRequiredMib = checkedNonNegativeSum(policy.host_reserve_mib, requestedMemoryMib);
+        const requestedAndAdmittedScopes = checkedNonNegativeSum(admittedScopes, requestedWorkerScopes);
+        if (liveRequiredMib === null) {
+          addReason(reasons, "capacity_exhausted", "live_memory_arithmetic_overflow");
+        }
+        if (requestedAndAdmittedScopes === null) {
+          addReason(reasons, "capacity_exhausted", "scope_count_overflow");
+        }
+        if (liveRequiredMib !== null && requestedAndAdmittedScopes !== null) {
+          const liveHeadroomMib = memory.availableMib - liveRequiredMib;
+          capacity = {
+            staticReservationMib: configured.staticReservationMib,
+            staticHeadroomMib: configured.staticHeadroomMib,
+            configuredSwapMib: configured.configuredSwapMib,
+            swapHeadroomMib: configured.swapHeadroomMib,
+            requestedWorkerScopes,
+            requestedMemoryMib,
+            requestedSwapMib,
+            liveRequiredMib,
+            liveHeadroomMib,
+          };
+          if (liveHeadroomMib < 0) addReason(reasons, "capacity_exhausted", "live_memory_headroom_low");
+          if (requestedAndAdmittedScopes > policy.max_worker_scopes) {
+            addReason(reasons, "capacity_exhausted", "worker_scope_ceiling_reached");
+          }
         }
       }
     } catch (err) {

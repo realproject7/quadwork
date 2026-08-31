@@ -89,11 +89,23 @@ function checkedSum(terms, label) {
   return total;
 }
 
-function calculateStaticReservationMib(policy) {
-  const workers = policy.max_worker_scopes * policy.worker.memory_max_mib;
-  if (!Number.isSafeInteger(workers)) {
-    throw new ResourcePolicyError("static RAM reservation exceeds the supported integer range");
+function checkedProduct(left, right, label) {
+  if (!Number.isSafeInteger(left) || left < 0 || !Number.isSafeInteger(right) || right < 0) {
+    throw new ResourcePolicyError(`${label} contains an invalid integer`);
   }
+  const product = left * right;
+  if (!Number.isSafeInteger(product)) {
+    throw new ResourcePolicyError(`${label} exceeds the supported integer range`);
+  }
+  return product;
+}
+
+function calculateStaticReservationMib(policy) {
+  const workers = checkedProduct(
+    policy.max_worker_scopes,
+    policy.worker.memory_max_mib,
+    "static RAM reservation",
+  );
   return checkedSum([
     policy.host_reserve_mib,
     policy.api.memory_max_mib,
@@ -104,10 +116,11 @@ function calculateStaticReservationMib(policy) {
 
 function calculateConfiguredSwapMib(policy) {
   // The approved v1 shape has no API swap field. Do not fabricate one here.
-  const workers = policy.max_worker_scopes * policy.worker.swap_max_mib;
-  if (!Number.isSafeInteger(workers)) {
-    throw new ResourcePolicyError("configured swap reservation exceeds the supported integer range");
-  }
+  const workers = checkedProduct(
+    policy.max_worker_scopes,
+    policy.worker.swap_max_mib,
+    "configured swap reservation",
+  );
   return checkedSum([policy.control.swap_max_mib, workers], "configured swap reservation");
 }
 

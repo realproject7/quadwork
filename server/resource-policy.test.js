@@ -72,6 +72,23 @@ const huge = proposal({
 });
 rejects(huge, /static RAM reservation exceeds the supported integer range/);
 
+const ramAdditionOverflow = proposal({
+  host_reserve_mib: Number.MAX_SAFE_INTEGER,
+  max_worker_scopes: 1,
+  api: { memory_low_mib: 1, memory_max_mib: 1 },
+  worker: { memory_high_mib: 1, memory_max_mib: 1, swap_max_mib: 1 },
+  control: { memory_max_mib: 1, swap_max_mib: 1, max_concurrent_children: 1 },
+  temp_min_free_mib: 1,
+});
+rejects(ramAdditionOverflow, /static RAM reservation exceeds the supported integer range/);
+
+const swapAdditionOverflow = proposal({
+  max_worker_scopes: 1,
+  worker: { ...proposal().worker, swap_max_mib: 1 },
+  control: { ...proposal().control, swap_max_mib: Number.MAX_SAFE_INTEGER },
+});
+rejects(swapAdditionOverflow, /configured swap reservation exceeds the supported integer range/);
+
 assert.throws(
   () => validatePolicyCapacity(parsed, { physicalRamMib: 6927, swapTotalMib: 8192 }),
   /static RAM reservation exceeds physical RAM/,

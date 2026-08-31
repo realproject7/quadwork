@@ -73,13 +73,13 @@ const noProof = runResourcePreflight({
 assert.equal(noProof.reason, "containment_unavailable");
 assert(noProof.reasons.some((item) => item.check === "systemd_scope_unavailable"));
 
-const unsafeApi = runResourcePreflight({
+const unsafeApiInteger = runResourcePreflight({
   runtimeResources: policy(),
   probes: healthyProbes({
     api: () => ({ memoryLowMib: 512, memoryMaxMib: null, oomPolicy: "continue", separateFromWorkers: false }),
   }),
 });
-assert(unsafeApi.reasons.some((item) => item.code === "containment_unavailable" && item.check === "api_limits_unprotected"));
+assert(unsafeApiInteger.reasons.some((item) => item.code === "containment_unavailable" && item.check === "api_limits_unprotected"));
 
 const tmpfs = runResourcePreflight({
   runtimeResources: policy(),
@@ -120,6 +120,130 @@ const lowLiveRam = runResourcePreflight({
   }),
 });
 assert(lowLiveRam.reasons.some((item) => item.code === "capacity_exhausted" && item.check === "live_memory_headroom_low"));
+
+for (const [field, badValue] of [
+  ["totalMib", 8192.5],
+  ["availableMib", Number.MAX_SAFE_INTEGER + 1],
+  ["swapTotalMib", -1],
+  ["swapFreeMib", Infinity],
+]) {
+  const invalidMib = runResourcePreflight({
+    runtimeResources: policy(),
+    probes: healthyProbes({
+      memory: () => ({
+        totalMib: 8192,
+        availableMib: 4000,
+        swapTotalMib: 8192,
+        swapFreeMib: 7000,
+        [field]: badValue,
+      }),
+    }),
+  });
+  assert.equal(invalidMib.capacity, null, `${field} must not be rounded or used in capacity arithmetic`);
+  assert(invalidMib.reasons.some((item) => item.check === "host_memory_unavailable"), `${field} fails closed`);
+}
+
+const availableExceedsTotal = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    memory: () => ({ totalMib: 8192, availableMib: 8193, swapTotalMib: 8192, swapFreeMib: 7000 }),
+  }),
+});
+assert.equal(availableExceedsTotal.capacity, null);
+assert(availableExceedsTotal.reasons.some((item) => item.check === "host_memory_contradictory"));
+
+const swapFreeExceedsTotal = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    memory: () => ({ totalMib: 8192, availableMib: 4000, swapTotalMib: 8192, swapFreeMib: 8193 }),
+  }),
+});
+assert.equal(swapFreeExceedsTotal.capacity, null);
+assert(swapFreeExceedsTotal.reasons.some((item) => item.check === "host_memory_contradictory"));
+
+const tempFreeExceedsTotal = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    temp: () => ({ exists: true, directory: true, symlink: false, owned: true, secureMode: true, diskBacked: true, freeMib: 10001, totalMib: 10000 }),
+  }),
+});
+assert(tempFreeExceedsTotal.reasons.some((item) => item.code === "temp_unavailable" && item.check === "temp_capacity_contradictory"));
+
+const fractionalTemp = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    temp: () => ({ exists: true, directory: true, symlink: false, owned: true, secureMode: true, diskBacked: true, freeMib: 5000.5, totalMib: 10000 }),
+  }),
+});
+assert(fractionalTemp.reasons.some((item) => item.check === "temp_capacity_contradictory"));
+
+const unsafeTempTotal = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    temp: () => ({ exists: true, directory: true, symlink: false, owned: true, secureMode: true, diskBacked: true, freeMib: 5000, totalMib: Number.MAX_SAFE_INTEGER + 1 }),
+  }),
+});
+assert(unsafeTempTotal.reasons.some((item) => item.check === "temp_capacity_contradictory"));
+
+const fractionalApi = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    api: () => ({ memoryLowMib: 512.5, memoryMaxMib: 1280, oomPolicy: "continue", separateFromWorkers: true }),
+  }),
+});
+assert(fractionalApi.reasons.some((item) => item.code === "containment_unavailable" && item.check === "api_limits_unprotected"));
+
+const unsafeApi = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    api: () => ({ memoryLowMib: 512, memoryMaxMib: Number.MAX_SAFE_INTEGER + 1, oomPolicy: "continue", separateFromWorkers: true }),
+  }),
+});
+assert(unsafeApi.reasons.some((item) => item.code === "containment_unavailable" && item.check === "api_limits_unprotected"));
+
+const multiplicationOverflow = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes(),
+  requestedWorkerScopes: Number.MAX_SAFE_INTEGER,
+});
+assert.equal(multiplicationOverflow.capacity, null);
+assert(multiplicationOverflow.reasons.some((item) => item.check === "requested_scope_overflow"));
+
+const tinyPolicy = policy();
+Object.assign(tinyPolicy, {
+  host_reserve_mib: 1,
+  max_worker_scopes: 1,
+  api: { memory_low_mib: 1, memory_max_mib: 1 },
+  worker: { memory_high_mib: 1, memory_max_mib: 1, swap_max_mib: 1 },
+  control: { memory_max_mib: 1, swap_max_mib: 1, max_concurrent_children: 1 },
+  temp_min_free_mib: 1,
+});
+const hugeMemoryProbes = healthyProbes({
+  memory: () => ({
+    totalMib: Number.MAX_SAFE_INTEGER,
+    availableMib: Number.MAX_SAFE_INTEGER,
+    swapTotalMib: Number.MAX_SAFE_INTEGER,
+    swapFreeMib: Number.MAX_SAFE_INTEGER,
+  }),
+  temp: () => ({ exists: true, directory: true, symlink: false, owned: true, secureMode: true, diskBacked: true, freeMib: 1, totalMib: 1 }),
+  api: () => ({ memoryLowMib: 1, memoryMaxMib: 1, oomPolicy: "continue", separateFromWorkers: true }),
+  activeScopes: () => 0,
+});
+const liveAdditionOverflow = runResourcePreflight({
+  runtimeResources: tinyPolicy,
+  probes: hugeMemoryProbes,
+  requestedWorkerScopes: Number.MAX_SAFE_INTEGER,
+});
+assert.equal(liveAdditionOverflow.capacity, null);
+assert(liveAdditionOverflow.reasons.some((item) => item.check === "live_memory_arithmetic_overflow"));
+
+const scopeAdditionOverflow = runResourcePreflight({
+  runtimeResources: tinyPolicy,
+  probes: { ...hugeMemoryProbes, activeScopes: () => 2 },
+  requestedWorkerScopes: Number.MAX_SAFE_INTEGER - 1,
+});
+assert.equal(scopeAdditionOverflow.capacity, null);
+assert(scopeAdditionOverflow.reasons.some((item) => item.check === "scope_count_overflow"));
 
 const secretProbeFailure = runResourcePreflight({
   runtimeResources: policy(),
@@ -198,5 +322,13 @@ assert(execCalls.every(([command, args]) => {
   if (command === "systemd-run") return args.join(" ") === "--user --version";
   return command === "systemctl" && !args.some((arg) => ["start", "stop", "set-property", "enable", "disable"].includes(arg));
 }));
+
+files.set(
+  "/cgroup/system.slice/pm2-quadwork.service/memory.max",
+  String(BigInt(1280 * 1024 * 1024) + 1n),
+);
+const inexactCgroupBytes = runResourcePreflight({ runtimeResources: policy(), probes: adapter });
+assert.equal(inexactCgroupBytes.api, null, "1280 MiB + 1 byte must not be rounded down to 1280 MiB");
+assert(inexactCgroupBytes.reasons.some((item) => item.code === "containment_unavailable" && item.check === "api_limits_unprotected"));
 
 console.log("resource-preflight.test.js: all assertions passed");
