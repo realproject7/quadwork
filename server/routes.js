@@ -301,7 +301,31 @@ const DEFAULT_CONFIG = {
 
 function readConfigFile() {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    // #1029: once an installation is explicitly activated, route-local V1
+    // consumers temporarily receive scalar compatibility values derived from
+    // the canonical primary repository. Keep them non-enumerable so any legacy
+    // read-modify-write path serializes only the canonical array and cannot
+    // recreate a persisted dual source. Legacy pre-activation reads remain
+    // byte-for-byte shaped as before.
+    if (typeof parsed.installation_id === "string" && Array.isArray(parsed.projects)) {
+      parsed.projects = parsed.projects.map((project) => {
+        if (!Array.isArray(project?.repositories)) return project;
+        const compatible = serializeProjectCompatibility(project);
+        for (const field of ["repo", "working_dir"]) {
+          if (!Object.prototype.hasOwnProperty.call(compatible, field)) continue;
+          const value = compatible[field];
+          delete compatible[field];
+          Object.defineProperty(compatible, field, {
+            value,
+            enumerable: false,
+            configurable: true,
+          });
+        }
+        return compatible;
+      });
+    }
+    return parsed;
   } catch (err) {
     if (err.code === "ENOENT") return { ...DEFAULT_CONFIG };
     return { ...DEFAULT_CONFIG };
@@ -346,6 +370,72 @@ router.get("/api/config", (_req, res) => {
   }
 });
 
+function sendV2ConfigurationError(res, err) {
+  if (!(err instanceof ConfigurationValidationError)) return false;
+  const payload = {
+    error: "V2 configuration validation failed",
+    code: err.code,
+    field: err.field,
+  };
+  if (err.owner_project_id !== undefined) payload.owner_project_id = err.owner_project_id;
+  res.status(409).json(payload);
+  return true;
+}
+
+function genericV2ProjectTopology(config) {
+  if (!Array.isArray(config?.projects)) {
+    throw new ConfigurationValidationError(
+      "generic_project_identity_change_forbidden",
+      "projects.id",
+      "generic config routes cannot change activated project identity",
+    );
+  }
+  const topology = new Map();
+  for (const project of config.projects) {
+    if (!project || typeof project.id !== "string" || !project.id || topology.has(project.id)) {
+      throw new ConfigurationValidationError(
+        "generic_project_identity_change_forbidden",
+        "projects.id",
+        "generic config routes cannot change activated project identity",
+      );
+    }
+    if (!Array.isArray(project.repositories)) {
+      // The full V2 validator will return the more specific canonical schema
+      // error. There is no valid key topology to compare here.
+      topology.set(project.id, null);
+      continue;
+    }
+    topology.set(project.id, [...new Set(project.repositories.map((entry) => entry?.key))]
+      .sort((left, right) => String(left).localeCompare(String(right))));
+  }
+  return topology;
+}
+
+function assertGenericV2ProjectTopology(previousTopology, candidateConfig) {
+  const candidateTopology = genericV2ProjectTopology(candidateConfig);
+  const previousIds = [...previousTopology.keys()].sort();
+  const candidateIds = [...candidateTopology.keys()].sort();
+  if (JSON.stringify(previousIds) !== JSON.stringify(candidateIds)) {
+    throw new ConfigurationValidationError(
+      "generic_project_identity_change_forbidden",
+      "projects.id",
+      "generic config routes cannot change activated project identity",
+    );
+  }
+  for (const projectId of previousIds) {
+    const before = previousTopology.get(projectId);
+    const after = candidateTopology.get(projectId);
+    if (before === null || after === null) continue;
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      throw new ConfigurationValidationError(
+        "generic_repository_topology_change_forbidden",
+        "repositories.key",
+        "generic config routes cannot change activated repository key topology",
+      );
+    }
+  }
+}
+
 router.put("/api/config", (req, res) => {
   try {
     const body = req.body;
@@ -358,6 +448,19 @@ router.put("/api/config", (req, res) => {
     // Never let a full PUT clobber them: always re-read the current on-disk
     // values and keep those.
     const disk = readConfigFile();
+    // #1029: installation identity is server-owned. A stale whole-config
+    // snapshot may omit it and must preserve the committed value; a caller may
+    // never introduce or rotate it outside commitV2Configuration().
+    const diskHasInstallationId = Object.prototype.hasOwnProperty.call(disk, "installation_id");
+    const bodyHasInstallationId = Object.prototype.hasOwnProperty.call(body, "installation_id");
+    if (bodyHasInstallationId &&
+        (!diskHasInstallationId || body.installation_id !== disk.installation_id)) {
+      const err = new Error("installation identity rotation rejected");
+      err.code = "QW_INSTALLATION_ID_ROTATION";
+      throw err;
+    }
+    if (diskHasInstallationId) body.installation_id = disk.installation_id;
+    else delete body.installation_id;
     if ("pinned_projects" in disk) body.pinned_projects = disk.pinned_projects;
     else delete body.pinned_projects;
     if ("sidebar_groups" in disk) body.sidebar_groups = disk.sidebar_groups;
@@ -390,13 +493,26 @@ router.put("/api/config", (req, res) => {
         }
       }
     }
-    writeConfig(body);
+    if (diskHasInstallationId) {
+      commitV2Configuration((cfg) => {
+        const previousTopology = genericV2ProjectTopology(cfg);
+        assertGenericV2ProjectTopology(previousTopology, body);
+        for (const key of Object.keys(cfg)) delete cfg[key];
+        Object.assign(cfg, body);
+      });
+    } else {
+      writeConfig(body);
+    }
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
       req.app.get("syncTriggers")();
     }
     res.json({ ok: true });
   } catch (err) {
+    if (sendV2ConfigurationError(res, err)) return;
+    if (err.code === "QW_INSTALLATION_ID_ROTATION") {
+      return res.status(409).json({ error: "installation_id cannot be introduced or replaced here" });
+    }
     res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
 });
@@ -414,12 +530,23 @@ router.put("/api/config", (req, res) => {
 //     fields from disk; a project id not on disk is appended (Settings can add
 //     one); on-disk projects absent from the body are left untouched.
 const CONFIG_MERGE_EXCLUDED = new Set([
-  "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token",
+  "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token", "installation_id",
 ]);
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {
-    updateConfig((cfg) => {
+    const disk = readConfigFile();
+    const activated = Object.prototype.hasOwnProperty.call(disk, "installation_id");
+    const affectsProjects = activated && Array.isArray(body.projects);
+    const mutator = (cfg) => {
+      const previousTopology = affectsProjects ? genericV2ProjectTopology(cfg) : null;
+      if (Object.prototype.hasOwnProperty.call(body, "installation_id") &&
+          (!Object.prototype.hasOwnProperty.call(cfg, "installation_id") ||
+           body.installation_id !== cfg.installation_id)) {
+        const err = new Error("installation identity rotation rejected");
+        err.code = "QW_INSTALLATION_ID_ROTATION";
+        throw err;
+      }
       for (const [k, v] of Object.entries(body)) {
         if (CONFIG_MERGE_EXCLUDED.has(k)) continue;
         if (k === "operator_name" && typeof v === "string" &&
@@ -443,8 +570,15 @@ router.patch("/api/config", (req, res) => {
           }
         }
       }
-    });
+      if (previousTopology) assertGenericV2ProjectTopology(previousTopology, cfg);
+    };
+    if (affectsProjects) commitV2Configuration(mutator);
+    else updateConfig(mutator);
   } catch (err) {
+    if (sendV2ConfigurationError(res, err)) return;
+    if (err.code === "QW_INSTALLATION_ID_ROTATION") {
+      return res.status(409).json({ error: "installation_id cannot be introduced or replaced here" });
+    }
     return res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
   if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
@@ -627,7 +761,16 @@ router.put("/api/reviewer-github-user", (req, res) => {
 
 // ─── Chat (file-based) ────────────────────────────────────────────────────
 
-const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig, updateConfig } = require("./config");
+const {
+  sanitizeOperatorName,
+  ensureSecureDir,
+  writeSecureFile,
+  writeConfig,
+  updateConfig,
+  serializeProjectCompatibility,
+  ConfigurationValidationError,
+  commitV2Configuration,
+} = require("./config");
 const { findAgentChattr } = require("./install-agentchattr");
 
 /**
