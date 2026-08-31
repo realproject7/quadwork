@@ -98,6 +98,35 @@ function dataMethod(receiver, name) {
   return null;
 }
 
+function ignoreAsyncSettlement() {}
+
+function consumeNativePromise(value) {
+  try {
+    // Bypass an overridden or accessor-backed `.then` while performing the
+    // platform brand check. Both branches resolve the derived promise, so the
+    // raw fulfillment/rejection value never crosses this boundary.
+    Reflect.apply(Promise.prototype.then, value, [
+      ignoreAsyncSettlement,
+      ignoreAsyncSettlement,
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function consumeAsyncSnapshot(value) {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
+  if (consumeNativePromise(value)) return true;
+
+  // Arbitrary thenables are recognized only through a descriptor-safe data
+  // method, then discarded without assimilation. Invoking caller-owned `then`
+  // code could itself mutate state, launch work, or throw asynchronously.
+  // Accessors, revoked proxies, and hostile prototype traps are never invoked.
+  const then = dataMethod(value, "then");
+  return then !== null;
+}
+
 function exactKeys(value, allowed, required = allowed) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const keys = Object.keys(value);
@@ -387,6 +416,7 @@ function createResourceHttpHandler(runtimeService) {
     } catch {
       result = null;
     }
+    if (consumeAsyncSnapshot(result)) result = null;
     const bounded = boundedRuntimeSnapshot(result);
     return bounded === null
       ? sendJson(response, 503, ERROR_RESPONSES.snapshot)

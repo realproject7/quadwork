@@ -358,4 +358,111 @@ function assertUnavailable(response, expectedStatus = 503, expectedCode = "QW_RE
   assert.equal(response.body.pressure.reason, "policy_invalid_or_absent");
 }
 
-console.log("resource-http.test.js: all assertions passed");
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function settleUnhandledTurn() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+// Native async results are never awaited and can never send a late response,
+// but both settlement paths are consumed so they cannot create a process-level
+// unhandled rejection. Caller-owned thenables are rejected without invocation.
+(async () => {
+  const secret = "ASYNC-SNAPSHOT-SECRET /private/provider/path";
+  const unhandled = [];
+  const onUnhandled = (reason) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const rejected = invoke({ async snapshot() { throw new Error(secret); } });
+    assertUnavailable(rejected);
+
+    const lateResolve = deferred();
+    const resolvedResponse = invoke({ snapshot() { return lateResolve.promise; } });
+    const resolvedBody = resolvedResponse.body;
+    lateResolve.resolve(candidateSnapshot());
+
+    const lateReject = deferred();
+    const rejectedResponse = invoke({ snapshot() { return lateReject.promise; } });
+    const rejectedBody = rejectedResponse.body;
+    lateReject.reject(new Error(secret));
+
+    let nativeThenGetterCalls = 0;
+    const accessorPromise = Promise.reject(new Error(secret));
+    Object.defineProperty(accessorPromise, "then", {
+      configurable: true,
+      get() {
+        nativeThenGetterCalls += 1;
+        throw new Error(secret);
+      },
+    });
+    const accessorPromiseResponse = invoke({ snapshot() { return accessorPromise; } });
+
+    let thenCalls = 0;
+    let thenableMutations = 0;
+    const customThenable = {
+      then() {
+        thenCalls += 1;
+        thenableMutations += 1;
+        throw new Error(secret);
+      },
+    };
+    const customResponse = invoke({ snapshot() { return customThenable; } });
+
+    let accessorCalls = 0;
+    const accessorThenable = {};
+    Object.defineProperty(accessorThenable, "then", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        throw new Error(secret);
+      },
+    });
+    const accessorResponse = invoke({ snapshot() { return accessorThenable; } });
+
+    const hostileProxy = new Proxy({}, {
+      getOwnPropertyDescriptor() { throw new Error(secret); },
+      getPrototypeOf() { throw new Error(secret); },
+    });
+    const proxyResponse = invoke({ snapshot() { return hostileProxy; } });
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const revokedResponse = invoke({ snapshot() { return revoked.proxy; } });
+
+    await settleUnhandledTurn();
+    assert.deepEqual(unhandled, []);
+    assert.equal(nativeThenGetterCalls, 0, "native Promise consumption bypasses hostile own then accessors");
+    assert.equal(thenCalls, 0, "caller-owned thenables are identified without assimilation");
+    assert.equal(thenableMutations, 0);
+    assert.equal(accessorCalls, 0, "then accessors are rejected without invocation");
+    for (const [response, originalBody] of [
+      [rejected, rejected.body],
+      [resolvedResponse, resolvedBody],
+      [rejectedResponse, rejectedBody],
+      [accessorPromiseResponse, accessorPromiseResponse.body],
+      [customResponse, customResponse.body],
+      [accessorResponse, accessorResponse.body],
+      [proxyResponse, proxyResponse.body],
+      [revokedResponse, revokedResponse.body],
+    ]) {
+      assertUnavailable(response);
+      assert.equal(response.jsonCalls, 1);
+      assert.equal(response.body, originalBody, "late settlement cannot replace the sent body");
+      assert.equal(JSON.stringify(response.body).includes(secret), false);
+    }
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+  console.log("resource-http.test.js: all assertions passed");
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
