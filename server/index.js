@@ -9,7 +9,11 @@ const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
 const routes = require("./routes");
 const fileChat = require("./file-chat");
-const { dispatchToAgentPTY, cleanupSession: cleanupPtyDispatcher } = require("./pty-dispatcher");
+const {
+  dispatchToAgentPTY,
+  cleanupSession: cleanupPtyDispatcher,
+  cancelProject: cancelPtyDispatchProject,
+} = require("./pty-dispatcher");
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
@@ -18,6 +22,14 @@ const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
+const {
+  ProjectLifecycleError,
+  isProjectArchived,
+  assertProjectAdmitted,
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  createProjectLifecycleController,
+} = require("./project-lifecycle");
 
 const net = require("net");
 const crypto = require("crypto");
@@ -68,6 +80,10 @@ function normalizeTrustedDashboardHosts(raw) {
 
 function emitSystemMessage(projectId, text) {
   try {
+    // The persisted archive barrier is also a chatter barrier. Cleanup and
+    // delayed callbacks must not recreate project-scoped activity by logging a
+    // lifecycle message after archive has committed.
+    if (isProjectArchived(projectId)) return;
     if (routes.getProjectChatMode(projectId) !== "file") return;
     fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
   } catch {}
@@ -91,9 +107,37 @@ app.use(routes);
 routes.setPtyDispatchCallback((projectId, msg) => {
   dispatchToAgentPTY(projectId, msg, agentSessions, {
     isLoopGuardPaused: fileChat.isLoopGuardPaused,
+    isProjectAdmitted: (id) => {
+      try { assertProjectAdmitted(id); return true; }
+      catch { return false; }
+    },
     safeWrite,
   });
 });
+
+function lifecycleFailure(error) {
+  if (error instanceof ProjectLifecycleError) {
+    return {
+      status: error.status || 409,
+      body: {
+        ok: false,
+        code: error.code,
+        project_id: error.project_id,
+        error: error.message,
+      },
+    };
+  }
+  console.error("[project-lifecycle] request failed:", error?.message || error);
+  return {
+    status: 500,
+    body: { ok: false, code: "project_lifecycle_failed", error: "Project lifecycle operation failed" },
+  };
+}
+
+function respondLifecycleFailure(res, error, extra = {}) {
+  const failure = lifecycleFailure(error);
+  return res.status(failure.status).json({ ...failure.body, ...extra });
+}
 
 const server = http.createServer(app);
 
@@ -304,46 +348,208 @@ app.get("/api/port-check/auto", async (req, res) => {
 
 // --- Caffeinate (sleep prevention) ---
 
-let caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
+let caffeinateProcess = {
+  process: null,
+  pid: null,
+  startedAt: null,
+  manualOwner: false,
+  manualExpiresAt: null,
+  manualTimer: null,
+  projectOwners: new Map(),
+};
+
+function caffeinateHasOwners() {
+  return caffeinateProcess.manualOwner || caffeinateProcess.projectOwners.size > 0;
+}
+
+function clearCaffeinateProcess(child, { clearOwners = true } = {}) {
+  if (child && caffeinateProcess.process !== child) return;
+  caffeinateProcess.process = null;
+  caffeinateProcess.pid = null;
+  caffeinateProcess.startedAt = null;
+  if (clearOwners) {
+    if (caffeinateProcess.manualTimer) clearTimeout(caffeinateProcess.manualTimer);
+    for (const requirement of caffeinateProcess.projectOwners.values()) {
+      if (requirement.timer) clearTimeout(requirement.timer);
+    }
+    caffeinateProcess.manualOwner = false;
+    caffeinateProcess.manualExpiresAt = null;
+    caffeinateProcess.manualTimer = null;
+    caffeinateProcess.projectOwners.clear();
+  }
+}
+
+function stopCaffeinateWhenUnowned() {
+  if (caffeinateHasOwners()) return { ok: true, stopped: false };
+  if (caffeinateProcess.process) {
+    try {
+      const killed = caffeinateProcess.process.kill("SIGTERM");
+      if (killed === false) throw new Error("caffeinate process did not accept SIGTERM");
+    }
+    catch (err) {
+      console.error("[caffeinate] stop failed:", err?.message || err);
+      return { ok: false, stopped: false };
+    }
+  }
+  clearCaffeinateProcess(null, { clearOwners: false });
+  return { ok: true, stopped: true };
+}
+
+function releaseProjectCaffeinate(projectId) {
+  const requirement = caffeinateProcess.projectOwners.get(projectId);
+  if (!requirement) return { ok: true, removed: false };
+  const removed = caffeinateProcess.projectOwners.delete(projectId);
+  const stopped = stopCaffeinateWhenUnowned();
+  if (!stopped.ok) {
+    caffeinateProcess.projectOwners.set(projectId, { ...requirement, timer: null });
+    return { ok: false, removed: false };
+  }
+  if (requirement.timer) clearTimeout(requirement.timer);
+  return { ok: true, removed };
+}
+
+function releaseManualCaffeinate() {
+  if (!caffeinateProcess.manualOwner) return { ok: true, removed: false };
+  const previous = {
+    expiresAt: caffeinateProcess.manualExpiresAt,
+    timer: caffeinateProcess.manualTimer,
+  };
+  caffeinateProcess.manualOwner = false;
+  caffeinateProcess.manualExpiresAt = null;
+  caffeinateProcess.manualTimer = null;
+  const stopped = stopCaffeinateWhenUnowned();
+  if (!stopped.ok) {
+    caffeinateProcess.manualOwner = true;
+    caffeinateProcess.manualExpiresAt = previous.expiresAt;
+    caffeinateProcess.manualTimer = null;
+    return { ok: false, removed: false };
+  }
+  if (previous.timer) clearTimeout(previous.timer);
+  return { ok: true, removed: true };
+}
+
+function registerCaffeinateOwner(projectId, durationSeconds = 0) {
+  const duration = Number.isFinite(Number(durationSeconds)) && Number(durationSeconds) > 0
+    ? Number(durationSeconds)
+    : 0;
+  const expiresAt = duration > 0 ? Date.now() + duration * 1000 : null;
+  if (projectId) {
+    const previous = caffeinateProcess.projectOwners.get(projectId);
+    if (previous?.timer) clearTimeout(previous.timer);
+    const requirement = { expiresAt, timer: null };
+    if (duration > 0) {
+      requirement.timer = setTimeout(() => {
+        const result = releaseProjectCaffeinate(projectId);
+        if (!result.ok) console.error(`[caffeinate] timed release failed for project ${projectId}`);
+      }, duration * 1000);
+      if (typeof requirement.timer.unref === "function") requirement.timer.unref();
+    }
+    caffeinateProcess.projectOwners.set(projectId, requirement);
+    return;
+  }
+  if (caffeinateProcess.manualTimer) clearTimeout(caffeinateProcess.manualTimer);
+  caffeinateProcess.manualOwner = true;
+  caffeinateProcess.manualExpiresAt = expiresAt;
+  caffeinateProcess.manualTimer = duration > 0
+    ? setTimeout(() => {
+      const result = releaseManualCaffeinate();
+      if (!result.ok) console.error("[caffeinate] timed manual release failed");
+    }, duration * 1000)
+    : null;
+  if (caffeinateProcess.manualTimer && typeof caffeinateProcess.manualTimer.unref === "function") {
+    caffeinateProcess.manualTimer.unref();
+  }
+}
+
+function caffeinateRemainingSeconds() {
+  const expiries = [];
+  if (caffeinateProcess.manualOwner) {
+    if (caffeinateProcess.manualExpiresAt === null) return null;
+    expiries.push(caffeinateProcess.manualExpiresAt);
+  }
+  for (const requirement of caffeinateProcess.projectOwners.values()) {
+    if (requirement.expiresAt === null) return null;
+    expiries.push(requirement.expiresAt);
+  }
+  if (expiries.length === 0) return null;
+  return Math.max(0, Math.ceil((Math.max(...expiries) - Date.now()) / 1000));
+}
+
+function caffeinateStatus(projectId = null) {
+  const processActive = !!(caffeinateProcess.process && caffeinateProcess.pid);
+  const projectRequirement = projectId ? caffeinateProcess.projectOwners.get(projectId) : null;
+  const active = projectId ? processActive && !!projectRequirement : processActive;
+  const remaining = !active
+    ? null
+    : projectRequirement
+      ? projectRequirement.expiresAt === null
+        ? null
+        : Math.max(0, Math.ceil((projectRequirement.expiresAt - Date.now()) / 1000))
+      : caffeinateRemainingSeconds();
+  return { active, remaining };
+}
 
 app.post("/api/caffeinate/start", (req, res) => {
   if (process.platform !== "darwin") {
     return res.status(400).json({ ok: false, error: "Sleep prevention is only available on macOS" });
   }
-  // Kill existing if running
-  if (caffeinateProcess.process) {
-    try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
+  const projectId = typeof req.body?.project_id === "string" ? req.body.project_id : null;
+  if (projectId) {
+    try { assertProjectAdmitted(projectId); }
+    catch (err) { return respondLifecycleFailure(res, err); }
   }
   const duration = req.body?.duration || 0; // seconds, 0 = indefinite
+  registerCaffeinateOwner(projectId, duration);
+  // A second owner shares the existing OS process. Replacing it would turn an
+  // unrelated project's acquire/release into a global sleep-control action.
+  if (caffeinateProcess.process) {
+    return res.json({ ok: true, active: true, pid: caffeinateProcess.pid, duration });
+  }
   const args = ["-d", "-i", "-s"];
-  if (duration > 0) args.push("-t", String(duration));
-  const child = spawn("caffeinate", args, { stdio: "ignore", detached: true });
+  let child;
+  try {
+    child = spawn("caffeinate", args, { stdio: "ignore", detached: true });
+  } catch (err) {
+    console.error("[caffeinate] start failed:", err?.message || err);
+    if (projectId) releaseProjectCaffeinate(projectId);
+    else releaseManualCaffeinate();
+    return res.status(500).json({ ok: false, active: false, error: "Sleep prevention failed to start" });
+  }
   child.unref();
-  child.on("exit", () => {
-    if (caffeinateProcess.process === child) {
-      caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
-    }
+  child.on("error", (err) => {
+    console.error("[caffeinate] process error:", err?.message || err);
+    clearCaffeinateProcess(child);
   });
-  caffeinateProcess = { process: child, pid: child.pid, startedAt: Date.now(), duration: duration || null };
+  child.on("exit", () => {
+    clearCaffeinateProcess(child);
+  });
+  caffeinateProcess.process = child;
+  caffeinateProcess.pid = child.pid;
+  caffeinateProcess.startedAt = Date.now();
   res.json({ ok: true, active: true, pid: child.pid, duration });
 });
 
-app.post("/api/caffeinate/stop", (_req, res) => {
-  if (caffeinateProcess.process) {
-    try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
+app.post("/api/caffeinate/stop", (req, res) => {
+  const projectId = typeof req.body?.project_id === "string" ? req.body.project_id : null;
+  const released = projectId ? releaseProjectCaffeinate(projectId) : releaseManualCaffeinate();
+  if (!released.ok) {
+    return res.status(409).json({ ok: false, active: true, code: "caffeinate_stop_failed", error: "Sleep prevention could not be stopped" });
   }
-  caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
-  res.json({ ok: true, active: false });
+  res.json({ ok: true, active: caffeinateStatus(projectId).active });
 });
 
-app.get("/api/caffeinate/status", (_req, res) => {
-  const active = !!(caffeinateProcess.process && caffeinateProcess.pid);
-  let remaining = null;
-  if (active && caffeinateProcess.duration && caffeinateProcess.startedAt) {
-    const elapsed = Math.floor((Date.now() - caffeinateProcess.startedAt) / 1000);
-    remaining = Math.max(0, caffeinateProcess.duration - elapsed);
-  }
-  res.json({ active, pid: caffeinateProcess.pid, remaining, platform: process.platform });
+app.get("/api/caffeinate/status", (req, res) => {
+  const projectId = typeof req.query?.project === "string" ? req.query.project : null;
+  const { active, remaining } = caffeinateStatus(projectId);
+  res.json({
+    active,
+    pid: active ? caffeinateProcess.pid : null,
+    remaining,
+    platform: process.platform,
+    manual_owner: caffeinateProcess.manualOwner,
+    project_owners: caffeinateProcess.projectOwners.size,
+    ...(projectId ? { project_id: projectId } : {}),
+  });
 });
 
 // --- Unified agent sessions ---
@@ -428,12 +634,32 @@ function updateMcpProxyToken(projectId, agentId, newToken) {
   return true;
 }
 
-function stopMcpProxy(projectId, agentId) {
+async function stopMcpProxy(projectId, agentId) {
   const key = `${projectId}/${agentId}`;
   const proxy = mcpProxies.get(key);
-  if (proxy) {
-    try { proxy.server.close(); } catch {}
+  if (!proxy) return { ok: true, resources: { mcp_proxies: 0 }, cleanup_errors: [] };
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("MCP proxy stop timed out")), proxy.stopTimeoutMs || 5000);
+      try {
+        proxy.server.close((err) => {
+          clearTimeout(timeout);
+          if (err && err.code !== "ERR_SERVER_NOT_RUNNING") reject(err);
+          else resolve();
+        });
+      } catch (err) {
+        clearTimeout(timeout);
+        reject(err);
+      }
+    });
     mcpProxies.delete(key);
+    return { ok: true, resources: { mcp_proxies: 1 }, cleanup_errors: [] };
+  } catch (err) {
+    return {
+      ok: false,
+      resources: { mcp_proxies: 0 },
+      cleanup_errors: [{ resource: "mcp_proxy", code: "proxy_stop_failed", message: err?.message || "MCP proxy stop failed" }],
+    };
   }
 }
 
@@ -728,19 +954,27 @@ function buildAgentEnv(projectId, agentId) {
 async function spawnAgentPty(project, agent, opts = {}) {
   const key = `${project}/${agent}`;
 
-  const cwd = resolveAgentCwd(project, agent);
-  if (!cwd) return { ok: false, error: `Unknown agent: ${key}` };
-
-  const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
-  const extraEnv = buildAgentEnv(project, agent);
-
   try {
+    const captureAdmission = opts.captureProjectAdmission || captureProjectAdmission;
+    const admissionCurrent = opts.isAdmissionCurrent || isAdmissionCurrent;
+    const lease = opts.admissionToken || captureAdmission(project);
+    const cwd = resolveAgentCwd(project, agent);
+    if (!cwd) return { ok: false, error: `Unknown agent: ${key}` };
+
+    const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
+    const extraEnv = buildAgentEnv(project, agent);
     // #565: buildAgentArgs is inside try-catch so registration failures
     // cannot crash the server as an unhandled rejection.
-    const built = await buildAgentArgs(project, agent);
+    const built = await (opts.buildAgentArgs || buildAgentArgs)(project, agent);
+    // Registration and MCP argument construction await remote work. Archive
+    // may commit in that gap, so the lease must still be current immediately
+    // before creating the process owner.
+    if (!admissionCurrent(lease)) {
+      return { ok: false, code: "project_archived", status: 409, error: "project is archived" };
+    }
     const args = built.args;
 
-    const term = pty.spawn(command, args, {
+    const term = (opts.ptySpawn || pty.spawn)(command, args, {
       name: "xterm-256color",
       cols: 120,
       rows: 30,
@@ -830,6 +1064,9 @@ async function spawnAgentPty(project, agent, opts = {}) {
 
     return { ok: true, pid: term.pid };
   } catch (err) {
+    if (err instanceof ProjectLifecycleError) {
+      return { ok: false, code: err.code, status: err.status, error: err.message };
+    }
     agentSessions.set(key, { projectId: project, agentId: agent, term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "error", error: err.message });
     return { ok: false, error: err.message };
   }
@@ -866,7 +1103,11 @@ function isPtyAlive(term) {
   }
 }
 
-async function stopAgentSession(key, { clearSelfHeal = false } = {}) {
+async function stopAgentSession(key, {
+  clearSelfHeal = false,
+  suppressLifecycleMsg = false,
+  removeEntry = false,
+} = {}) {
   // #825 (#797 follow-up): a MANUAL stop/restart/reset must reset the per-agent
   // self-heal circuit-breaker window, so a fresh operator-driven session isn't
   // suppressed by a stale "paused" state from a prior trip. This is gated:
@@ -877,33 +1118,62 @@ async function stopAgentSession(key, { clearSelfHeal = false } = {}) {
   // live session remains (e.g. the agent already exited).
   if (clearSelfHeal) selfHeal.clearState(key);
   const session = agentSessions.get(key);
-  if (!session) {
-    agentSessions.set(key, { projectId: null, agentId: null, term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null });
-    return;
-  }
-  if (session.projectId && session.agentId && !session._suppressLifecycleMsg) {
+  const cleanupErrors = [];
+  const resources = { sessions: 0, ptys: 0, viewers: 0, mcp_proxies: 0 };
+  if (session?.projectId && session?.agentId && !session._suppressLifecycleMsg && !suppressLifecycleMsg) {
     emitSystemMessage(session.projectId, `${session.agentId} left`);
   }
   cleanupPtyDispatcher(key);
-  if (session.term) {
-    try { session.term.kill(); } catch {}
-    session.term = null;
+  if (session?.term) {
+    const term = session.term;
+    try {
+      const killed = term.kill();
+      if (killed === false) throw new Error("PTY did not accept stop signal");
+      if (typeof term.pid === "number") {
+        for (let i = 0; i < 20 && isPtyAlive(term); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        if (isPtyAlive(term)) throw new Error("PTY remained alive after stop");
+      }
+      session.term = null;
+      resources.ptys += 1;
+    } catch (err) {
+      cleanupErrors.push({ resource: "pty", code: "pty_stop_failed", message: err?.message || "PTY stop failed" });
+    }
   }
-  for (const v of session.viewers) {
-    if (v.readyState <= 1) v.close(1000, "stopped");
+  if (session) {
+    const viewers = session.viewers instanceof Set ? session.viewers : new Set();
+    for (const viewer of [...viewers]) {
+      try {
+        if (viewer.readyState <= 1 && typeof viewer.close === "function") viewer.close(1000, "stopped");
+        if (viewer.readyState <= 1 && typeof viewer.terminate === "function") viewer.terminate();
+        viewers.delete(viewer);
+        resources.viewers += 1;
+      } catch (err) {
+        cleanupErrors.push({ resource: "viewer", code: "viewer_stop_failed", message: err?.message || "Terminal viewer stop failed" });
+      }
+    }
+    session.state = "stopped";
+    session.error = null;
+    session.exitedUnexpectedly = false;
   }
-  session.viewers.clear();
-  session.state = "stopped";
-  session.error = null;
-  // #910: a manual stop is intentional — do NOT let the watchdog respawn it.
-  session.exitedUnexpectedly = false;
-  const [projectId, agentId] = key.split("/");
-  if (projectId && agentId) stopMcpProxy(projectId, agentId);
+  const slash = key.indexOf("/");
+  const projectId = slash > 0 ? key.slice(0, slash) : "";
+  const agentId = slash > 0 ? key.slice(slash + 1) : "";
+  if (projectId && agentId) {
+    const proxyResult = await stopMcpProxy(projectId, agentId);
+    resources.mcp_proxies += proxyResult.resources.mcp_proxies;
+    cleanupErrors.push(...proxyResult.cleanup_errors);
+  }
+  if (removeEntry && cleanupErrors.length === 0 && agentSessions.delete(key)) {
+    resources.sessions += 1;
+  }
   // #957: teardown is a known-safe moment to sweep stale backend temp. It's
   // deferred (setImmediate) so it never blocks the stop path, and stale-only,
   // so it never touches files a still-live agent on the shared /tmp/claude-{uid}
   // is using. This only reads a session's OWN temp when that session is gone.
   setImmediate(backendTempSweepTick);
+  return { ok: cleanupErrors.length === 0, resources, cleanup_errors: cleanupErrors };
 }
 
 // #957: sweep stale backend temp entries (/tmp/claude-{uid}, stray gemini
@@ -956,6 +1226,7 @@ app.post("/api/agents/:project/reset", async (req, res) => {
   // deregistered AC slots, which fails with stale tokens after an AC
   // crash and doesn't restart the agent processes.
   try {
+    const admission = captureProjectAdmission(projectId);
     // Build the full agent set: start with configured agents, then
     // merge any tracked sessions that might use a different key.
     const cfg = readConfig();
@@ -979,14 +1250,21 @@ app.post("/api/agents/:project/reset", async (req, res) => {
     for (const agentId of allAgentIds) {
       const s = agentSessions.get(`${projectId}/${agentId}`);
       if (s) s._suppressLifecycleMsg = true;
-      await stopAgentSession(`${projectId}/${agentId}`, { clearSelfHeal: true }); // #825: manual reset resets the self-heal window
+      const stopped = await stopAgentSession(`${projectId}/${agentId}`, { clearSelfHeal: true }); // #825: manual reset resets the self-heal window
+      if (!stopped.ok) throw new Error("Agent cleanup did not complete");
     }
 
     // Respawn all agents with fresh MCP tokens
     let restarted = 0;
     const errors = [];
     for (const agentId of allAgentIds) {
-      const result = await spawnAgentPty(projectId, agentId, { suppressLifecycleMsg: true });
+      if (!isAdmissionCurrent(admission)) {
+        return res.status(409).json({ ok: false, code: "project_archived", error: "project is archived" });
+      }
+      const result = await spawnAgentPty(projectId, agentId, {
+        suppressLifecycleMsg: true,
+        admissionToken: admission,
+      });
       if (result.ok) {
         emitSystemMessage(projectId, `${agentId} restarted`);
         restarted++;
@@ -1002,6 +1280,7 @@ app.post("/api/agents/:project/reset", async (req, res) => {
       ...(errors.length > 0 ? { errors } : {}),
     });
   } catch (err) {
+    if (err instanceof ProjectLifecycleError) return respondLifecycleFailure(res, err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -1013,7 +1292,7 @@ app.post("/api/full-reset", async (_req, res) => {
   console.log("[full-reset] starting...");
   try {
     const cfg = readConfig();
-    const projects = (cfg.projects || []).filter((p) => !p.archived);
+    const projects = (cfg.projects || []).filter((p) => !isProjectArchived(p.id, cfg));
 
     console.log("[full-reset] stopping all agent sessions...");
     const sessionKeys = [...agentSessions.keys()];
@@ -1081,7 +1360,12 @@ app.post("/api/agents/:project/:agent/start", async (req, res) => {
   if (result.ok) {
     res.json({ ok: true, state: "running", pid: result.pid });
   } else {
-    res.status(result.error?.includes("Unknown") ? 400 : 500).json({ ok: false, state: "error", error: result.error });
+    res.status(result.status || (result.error?.includes("Unknown") ? 400 : 500)).json({
+      ok: false,
+      state: "error",
+      ...(result.code ? { code: result.code } : {}),
+      error: result.error,
+    });
   }
 });
 
@@ -1090,7 +1374,10 @@ app.post("/api/agents/:project/:agent/start", async (req, res) => {
 app.post("/api/agents/:project/:agent/stop", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
-  await stopAgentSession(key, { clearSelfHeal: true }); // #825: manual stop resets the self-heal window
+  const result = await stopAgentSession(key, { clearSelfHeal: true }); // #825: manual stop resets the self-heal window
+  if (!result.ok) {
+    return res.status(409).json({ ok: false, state: "stopped", code: "agent_cleanup_incomplete", error: "Agent cleanup did not complete" });
+  }
   res.json({ ok: true, state: "stopped" });
 });
 
@@ -1101,6 +1388,7 @@ app.post("/api/agents/:project/:agent/stop", async (req, res) => {
 // logic. The `reason` is informational (logged by callers).
 async function restartAgentSession(key, { reason, clearSelfHeal = false } = {}) {
   const [project, agent] = key.split("/");
+  const admission = captureProjectAdmission(project);
   console.log(`[restart] ${key}: restarting session (reason: ${reason || "unspecified"})`);
 
   // #241: must await deregister before respawn so the slot frees and
@@ -1109,21 +1397,31 @@ async function restartAgentSession(key, { reason, clearSelfHeal = false } = {}) 
   if (existing) existing._suppressLifecycleMsg = true;
   // #825: forward clearSelfHeal — a manual restart resets the breaker window;
   // the self-heal auto-restart does NOT (preserves the #797 circuit breaker).
-  await stopAgentSession(key, { clearSelfHeal });
+  const stopped = await stopAgentSession(key, { clearSelfHeal });
+  if (!stopped.ok) throw new Error("Agent cleanup did not complete");
+  if (!isAdmissionCurrent(admission)) {
+    return { ok: false, code: "project_admission_changed", status: 409, error: "project admission changed during restart" };
+  }
 
-  return spawnAgentPty(project, agent, { suppressLifecycleMsg: true });
+  return spawnAgentPty(project, agent, { suppressLifecycleMsg: true, admissionToken: admission });
 }
 
 app.post("/api/agents/:project/:agent/restart", async (req, res) => {
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
-  const result = await restartAgentSession(key, { reason: "manual", clearSelfHeal: true }); // #825
-  if (result.ok) {
-    emitSystemMessage(project, `${agent} restarted`);
-    res.json({ ok: true, state: "running", pid: result.pid });
-  } else {
-    res.status(500).json({ ok: false, state: "error", error: result.error });
+  try {
+    const result = await restartAgentSession(key, { reason: "manual", clearSelfHeal: true }); // #825
+    if (result.ok) {
+      emitSystemMessage(project, `${agent} restarted`);
+      res.json({ ok: true, state: "running", pid: result.pid });
+    } else {
+      res.status(result.status || 500).json({ ok: false, state: "error", ...(result.code ? { code: result.code } : {}), error: result.error });
+    }
+  } catch (err) {
+    if (err instanceof ProjectLifecycleError) return respondLifecycleFailure(res, err, { state: "error" });
+    console.error(`[restart] ${key}: failed:`, err?.message || err);
+    return res.status(500).json({ ok: false, state: "error", error: "Agent restart failed" });
   }
 });
 
@@ -1131,6 +1429,8 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
 
 app.post("/api/agents/:project/:agent/interrupt", (req, res) => {
   if (!requireSessionToken(req, res)) return; // #968
+  try { assertProjectAdmitted(req.params.project); }
+  catch (err) { return respondLifecycleFailure(res, err); }
   const key = `${req.params.project}/${req.params.agent}`;
   const session = agentSessions.get(key);
   if (!session || !session.term) {
@@ -1144,6 +1444,8 @@ app.post("/api/agents/:project/:agent/interrupt", (req, res) => {
 app.post("/api/agents/:project/interrupt-all", (req, res) => {
   if (!requireSessionToken(req, res)) return; // #968
   const { project } = req.params;
+  try { assertProjectAdmitted(project); }
+  catch (err) { return respondLifecycleFailure(res, err); }
   let count = 0;
   for (const [key, session] of agentSessions) {
     if (!key.startsWith(`${project}/`)) continue;
@@ -1175,6 +1477,8 @@ app.get("/api/sessions", (_req, res) => {
 app.post("/api/agents/:project/:agent/write", (req, res) => {
   if (!requireSessionToken(req, res)) return; // #968
   const { project, agent } = req.params;
+  try { assertProjectAdmitted(project); }
+  catch (err) { return respondLifecycleFailure(res, err); }
   const key = `${project}/${agent}`;
   const session = agentSessions.get(key);
 
@@ -1383,32 +1687,40 @@ ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via t
 // Discord bridges so they respond to batch transitions even when the
 // operator is on a different project page.
 
-async function autoStopBridges(projectId, project, qwPort) {
+async function autoStopBridges(projectId, project, qwPort, admission = null) {
   if (project?.telegram_auto) {
     try {
-      await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=stop`, {
+      if (admission && !isAdmissionCurrent(admission)) return;
+      const stopped = await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId }),
+        body: JSON.stringify({ project_id: projectId, admission_generation: admission?.generation }),
         signal: AbortSignal.timeout(5000),
       });
-      console.log(`[auto-bridge] ${projectId}: telegram bridge auto-stopped`);
+      if (admission && !isAdmissionCurrent(admission)) return;
+      if (stopped.ok) console.log(`[auto-bridge] ${projectId}: telegram bridge auto-stopped`);
     } catch { /* non-fatal */ }
   }
   if (project?.discord_auto) {
     try {
-      await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=stop`, {
+      if (admission && !isAdmissionCurrent(admission)) return;
+      const stopped = await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId }),
+        body: JSON.stringify({ project_id: projectId, admission_generation: admission?.generation }),
         signal: AbortSignal.timeout(5000),
       });
-      console.log(`[auto-bridge] ${projectId}: discord bridge auto-stopped`);
+      if (admission && !isAdmissionCurrent(admission)) return;
+      if (stopped.ok) console.log(`[auto-bridge] ${projectId}: discord bridge auto-stopped`);
     } catch { /* non-fatal */ }
   }
 }
 
-async function autoStartBridges(projectId, project, qwPort) {
+async function autoStartBridges(projectId, project, qwPort, admissionToken = null) {
+  let admission = admissionToken;
+  try { if (!admission) admission = captureProjectAdmission(projectId); }
+  catch { return; }
+  if (!isAdmissionCurrent(admission)) return;
   if (project?.telegram_auto) {
     try {
       // Check if already running before starting
@@ -1416,18 +1728,24 @@ async function autoStartBridges(projectId, project, qwPort) {
         `http://127.0.0.1:${qwPort}/api/telegram?project=${encodeURIComponent(projectId)}`,
         { signal: AbortSignal.timeout(5000) }
       );
+      let shouldStart = true;
       if (st.ok) {
         const data = await st.json();
-        if (data.running) return; // already running
-        if (!data.configured) return; // not configured — can't start
+        shouldStart = !data.running && !!data.configured;
       }
-      await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId }),
-        signal: AbortSignal.timeout(10000),
-      });
-      console.log(`[auto-bridge] ${projectId}: telegram bridge auto-started`);
+      if (!shouldStart) {
+        // Continue to Discord; the two bridge requirements are independent.
+      } else if (!isAdmissionCurrent(admission)) return;
+      else {
+        const started = await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project_id: projectId, admission_generation: admission.generation }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!isAdmissionCurrent(admission)) return;
+        if (started.ok) console.log(`[auto-bridge] ${projectId}: telegram bridge auto-started`);
+      }
     } catch { /* non-fatal */ }
   }
   if (project?.discord_auto) {
@@ -1436,18 +1754,21 @@ async function autoStartBridges(projectId, project, qwPort) {
         `http://127.0.0.1:${qwPort}/api/discord?project=${encodeURIComponent(projectId)}`,
         { signal: AbortSignal.timeout(5000) }
       );
+      let shouldStart = true;
       if (st.ok) {
         const data = await st.json();
-        if (data.running) return;
-        if (!data.configured) return;
+        shouldStart = !data.running && !!data.configured;
       }
-      await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=start`, {
+      if (!shouldStart) return;
+      if (!isAdmissionCurrent(admission)) return;
+      const started = await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId }),
+        body: JSON.stringify({ project_id: projectId, admission_generation: admission.generation }),
         signal: AbortSignal.timeout(10000),
       });
-      console.log(`[auto-bridge] ${projectId}: discord bridge auto-started`);
+      if (!isAdmissionCurrent(admission)) return;
+      if (started.ok) console.log(`[auto-bridge] ${projectId}: discord bridge auto-started`);
     } catch { /* non-fatal */ }
   }
 }
@@ -1456,6 +1777,12 @@ async function autoStartBridges(projectId, project, qwPort) {
 const _bridgeBatchPrev = new Map();
 
 async function sendTriggerMessage(projectId) {
+  let admission;
+  try { admission = captureProjectAdmission(projectId); }
+  catch {
+    stopTrigger(projectId);
+    return { ok: false, code: "project_not_admitted", sent: false };
+  }
   const cfg = readConfig();
   const project = cfg.projects && cfg.projects.find((p) => p.id === projectId);
 
@@ -1470,8 +1797,16 @@ async function sendTriggerMessage(projectId) {
       const bpRes = await fetch(
         `http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(projectId)}`
       );
+      if (!isAdmissionCurrent(admission)) {
+        stopTrigger(projectId);
+        return { ok: false, code: "project_archived", sent: false };
+      }
       if (bpRes.ok) {
         const bp = await bpRes.json();
+        if (!isAdmissionCurrent(admission)) {
+          stopTrigger(projectId);
+          return { ok: false, code: "project_admission_changed", sent: false };
+        }
         // #810: gate auto-stop on completeConfirmed (two distinct successful
         // fetch cycles), NOT a single transient/stale `complete`.
         // #864: also auto-stop on an explicit operator clear (`liveActiveBatchCleared`).
@@ -1486,9 +1821,8 @@ async function sendTriggerMessage(projectId) {
           // Also stop caffeinate if no other triggers remain running
           // (#441 companion fix). caffeinateProcess is global (not
           // project-scoped), so only kill it when all work is done.
-          if (caffeinateProcess.process && triggers.size === 0) {
-            try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
-            caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
+          const released = releaseProjectCaffeinate(projectId);
+          if (released.removed) {
             console.log(`[auto-trigger] ${projectId}: caffeinate auto-stopped (no active triggers remain)`);
           }
           // #518: also stop bridges when batch completes
@@ -1496,7 +1830,7 @@ async function sendTriggerMessage(projectId) {
           const prev = _bridgeBatchPrev.get(projectId);
           _bridgeBatchPrev.set(projectId, { complete: true, hasItems: !!(bp.items && bp.items.length) });
           if (!prev || !prev.complete) {
-            await autoStopBridges(projectId, project, qwPort);
+            await autoStopBridges(projectId, project, qwPort, admission);
           }
           return;
         }
@@ -1521,6 +1855,10 @@ async function sendTriggerMessage(projectId) {
 
   const info = triggers.get(projectId);
   try {
+    if (!isAdmissionCurrent(admission)) {
+      stopTrigger(projectId);
+      return { ok: false, code: "project_archived", sent: false };
+    }
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1542,6 +1880,7 @@ async function sendTriggerMessage(projectId) {
     info.lastSent = Date.now();
     info.nextAt = Date.now() + info.interval;
   }
+  return { ok: true, sent: true };
 }
 
 app.get("/api/triggers", (_req, res) => {
@@ -1602,15 +1941,180 @@ function isProjectIdleId(projectId) {
 
 function stopTrigger(project) {
   const existing = triggers.get(project);
+  let removed = 0;
   if (existing) {
-    if (existing.timer) clearInterval(existing.timer);
-    if (existing.durationTimer) clearTimeout(existing.durationTimer);
+    if (existing.timer) { clearInterval(existing.timer); removed += 1; }
+    if (existing.durationTimer) { clearTimeout(existing.durationTimer); removed += 1; }
   }
   triggers.delete(project);
+  return { ok: true, resources: { triggers: existing ? 1 : 0, trigger_timers: removed }, cleanup_errors: [] };
 }
+
+function mergeCleanupResult(aggregate, result, fallbackResource) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    aggregate.cleanup_errors.push({
+      resource: fallbackResource,
+      code: "invalid_cleanup_result",
+      message: "Project resource cleanup returned an invalid result",
+    });
+    return;
+  }
+  const resources = result.resources;
+  if (!resources || typeof resources !== "object" || Array.isArray(resources)) {
+    aggregate.cleanup_errors.push({
+      resource: fallbackResource,
+      code: "invalid_cleanup_result",
+      message: "Project resource cleanup returned invalid counts",
+    });
+  } else {
+    for (const [name, value] of Object.entries(resources)) {
+      if (!/^[a-z][a-z0-9_]{0,63}$/.test(name) || !Number.isSafeInteger(value) || value < 0) {
+        aggregate.cleanup_errors.push({
+          resource: fallbackResource,
+          code: "invalid_cleanup_result",
+          message: "Project resource cleanup returned invalid counts",
+        });
+        continue;
+      }
+      aggregate.resources[name] = (aggregate.resources[name] || 0) + value;
+    }
+  }
+  if (!Array.isArray(result.cleanup_errors)) {
+    aggregate.cleanup_errors.push({
+      resource: fallbackResource,
+      code: "invalid_cleanup_result",
+      message: "Project resource cleanup returned an invalid error list",
+    });
+  } else {
+    for (const error of result.cleanup_errors) {
+      const resource = typeof error?.resource === "string" && error.resource ? error.resource.slice(0, 64) : fallbackResource;
+      const code = typeof error?.code === "string" && error.code ? error.code.slice(0, 64) : "cleanup_failed";
+      // Error internals may contain repo paths, tokens, or command strings.
+      // Keep them server-side and expose only typed, retryable metadata.
+      if (error?.message) console.error(`[project-lifecycle] ${resource}/${code}: ${error.message}`);
+      aggregate.cleanup_errors.push({ resource, code, message: "Project resource cleanup failed" });
+    }
+  }
+  if (result.ok !== true && result.cleanup_errors?.length === 0) {
+    aggregate.cleanup_errors.push({
+      resource: fallbackResource,
+      code: "cleanup_incomplete",
+      message: "Project resource cleanup did not complete",
+    });
+  }
+}
+
+async function cleanupProjectRuntime(projectId) {
+  const aggregate = { ok: false, resources: {}, cleanup_errors: [] };
+
+  // This synchronous cancellation is deliberately before the first await.
+  // It closes both deferred wake and delayed-submit timers in the same turn
+  // that follows durable barrier persistence/revocation.
+  mergeCleanupResult(aggregate, cancelPtyDispatchProject(projectId), "deferred_dispatch");
+  mergeCleanupResult(aggregate, selfHeal.clearProject(projectId), "self_heal");
+  mergeCleanupResult(aggregate, stopTrigger(projectId), "trigger");
+  if (_bridgeBatchPrev.delete(projectId)) {
+    aggregate.resources.bridge_batch_states = (aggregate.resources.bridge_batch_states || 0) + 1;
+  }
+
+  // Start every async teardown before the first await. Each primitive marks
+  // its owner stopping/cancels its timers synchronously, preventing a slow
+  // route cleanup from leaving bridge or PTY activity live in the gap.
+  let routeCleanupPromise = null;
+  if (typeof routes.cancelProjectBackground !== "function") {
+    mergeCleanupResult(aggregate, null, "route_background");
+  } else {
+    try {
+      routeCleanupPromise = Promise.resolve(routes.cancelProjectBackground(projectId));
+    } catch (err) {
+      console.error("[project-lifecycle] route background cleanup failed:", err?.message || err);
+      mergeCleanupResult(aggregate, {
+        ok: false,
+        resources: {},
+        cleanup_errors: [{ resource: "route_background", code: "route_cleanup_failed" }],
+      }, "route_background");
+    }
+  }
+  const telegramCleanupPromise = telegramBridge.stop(projectId);
+  const discordCleanupPromise = discordBridge.stop(projectId);
+
+  try {
+    // file-chat exposes its state accessor as a test seam. `nextId !== null`
+    // distinguishes a live initialized engine from the accessor's empty
+    // placeholder, allowing retry/idempotence counts to stay exact.
+    const fileChatWasInitialized = fileChat._getState(projectId).nextId !== null;
+    fileChat.shutdownProject(projectId);
+    aggregate.resources.file_chat_engines = (aggregate.resources.file_chat_engines || 0) + (fileChatWasInitialized ? 1 : 0);
+  } catch (err) {
+    console.error("[project-lifecycle] file chat cleanup failed:", err?.message || err);
+    aggregate.cleanup_errors.push({
+      resource: "file_chat",
+      code: "file_chat_stop_failed",
+      message: "Project resource cleanup failed",
+    });
+  }
+
+  const prefix = `${projectId}/`;
+  const keys = new Set();
+  try {
+    const project = readConfig().projects?.find((entry) => entry?.id === projectId);
+    for (const agentId of Object.keys(project?.agents || {})) keys.add(`${projectId}/${agentId}`);
+  } catch (err) {
+    console.error("[project-lifecycle] config read during cleanup failed:", err?.message || err);
+    aggregate.cleanup_errors.push({
+      resource: "session",
+      code: "project_agents_unavailable",
+      message: "Project resource cleanup failed",
+    });
+  }
+  for (const key of agentSessions.keys()) if (key.startsWith(prefix)) keys.add(key);
+  for (const key of mcpProxies.keys()) if (key.startsWith(prefix)) keys.add(key);
+  const sessionCleanupPromises = [...keys].map((key) => stopAgentSession(key, {
+    clearSelfHeal: true,
+    suppressLifecycleMsg: true,
+    removeEntry: true,
+  }));
+
+  const caffeinateCleanup = releaseProjectCaffeinate(projectId);
+  if (caffeinateCleanup.removed) {
+    aggregate.resources.caffeinate_owners = (aggregate.resources.caffeinate_owners || 0) + 1;
+  }
+  if (!caffeinateCleanup.ok) {
+    aggregate.cleanup_errors.push({
+      resource: "caffeinate",
+      code: "caffeinate_stop_failed",
+      message: "Project resource cleanup failed",
+    });
+  }
+
+  if (routeCleanupPromise) {
+    try {
+      mergeCleanupResult(aggregate, await routeCleanupPromise, "route_background");
+    } catch (err) {
+      console.error("[project-lifecycle] route background cleanup failed:", err?.message || err);
+      mergeCleanupResult(aggregate, {
+        ok: false,
+        resources: {},
+        cleanup_errors: [{ resource: "route_background", code: "route_cleanup_failed" }],
+      }, "route_background");
+    }
+  }
+  mergeCleanupResult(aggregate, await telegramCleanupPromise, "telegram_bridge");
+  mergeCleanupResult(aggregate, await discordCleanupPromise, "discord_bridge");
+  for (const cleanupPromise of sessionCleanupPromises) {
+    mergeCleanupResult(aggregate, await cleanupPromise, "session");
+  }
+  aggregate.ok = aggregate.cleanup_errors.length === 0;
+  return aggregate;
+}
+
+const projectLifecycle = createProjectLifecycleController({ cleanupProject: cleanupProjectRuntime });
+app.set("projectLifecycle", projectLifecycle);
 
 app.post("/api/triggers/:project/start", (req, res) => {
   const { project } = req.params;
+  try { assertProjectAdmitted(project); }
+  catch (err) { return respondLifecycleFailure(res, err, { enabled: false }); }
   // #812: refuse to start a trigger for a parked (idle) project — no
   // timer created, no agents pulsed. Toggle the project off idle first.
   if (isProjectIdleId(project)) {
@@ -1685,14 +2189,17 @@ app.post("/api/triggers/:project/stop", (req, res) => {
   res.json({ ok: true, enabled: false });
 });
 
-app.post("/api/triggers/:project/send-now", (req, res) => {
+app.post("/api/triggers/:project/send-now", async (req, res) => {
   const { project } = req.params;
+  try { assertProjectAdmitted(project); }
+  catch (err) { return respondLifecycleFailure(res, err, { sent: false }); }
   // #812: parked (idle) project — do not pulse agents.
   if (isProjectIdleId(project)) {
     return res.json({ ok: false, idle: true, sent: false });
   }
-  sendTriggerMessage(project);
-  res.json({ ok: true, sent: true });
+  const result = await sendTriggerMessage(project);
+  if (!result.ok) return res.status(409).json(result);
+  res.json(result);
 });
 
 app.post("/api/triggers/sync", (_req, res) => {
@@ -1878,6 +2385,11 @@ wss.on("connection:terminal", async (ws, req) => {
     ws.close(1008, "missing project or agent query params");
     return;
   }
+  try { assertProjectAdmitted(projectId); }
+  catch {
+    ws.close(1008, "project-unavailable");
+    return;
+  }
 
   const sessionKey = `${projectId}/${agentId}`;
   let session = agentSessions.get(sessionKey);
@@ -1886,10 +2398,17 @@ wss.on("connection:terminal", async (ws, req) => {
   if (!session || !session.term) {
     const result = await spawnAgentPty(projectId, agentId);
     if (!result.ok) {
-      ws.close(1011, "pty-spawn-failed");
+      ws.close(result.status === 409 || result.status === 404 || result.status === 503 ? 1008 : 1011,
+        result.code || "pty-spawn-failed");
       return;
     }
     session = agentSessions.get(sessionKey);
+  }
+
+  try { assertProjectAdmitted(projectId); }
+  catch {
+    ws.close(1008, "project-unavailable");
+    return;
   }
 
   session.viewers.add(ws);
@@ -1901,6 +2420,11 @@ wss.on("connection:terminal", async (ws, req) => {
 
   // Client → PTY
   ws.on("message", (msg) => {
+    try { assertProjectAdmitted(projectId); }
+    catch {
+      ws.close(1008, "project-unavailable");
+      return;
+    }
     if (!session.term) return;
     const str = msg.toString();
     try {
@@ -2039,7 +2563,7 @@ function syncTriggersFromConfig() {
       // activeIds also makes the cleanup loop below clear any timer they
       // had — so writing idle:true via PUT /api/config (which calls this)
       // stops a running trigger with no separate stop call.
-      if (project.trigger_enabled && !project.idle) {
+      if (project.trigger_enabled && !project.idle && !isProjectArchived(project.id, cfg)) {
         activeIds.add(project.id);
         const ms = (project.trigger_interval || 30) * 60 * 1000;
         const existing = triggers.get(project.id);
@@ -2077,6 +2601,14 @@ async function autoStopPollingTick() {
   if (!cfg.projects) return;
 
   for (const project of cfg.projects) {
+    if (isProjectArchived(project.id, cfg)) {
+      stopTrigger(project.id);
+      _bridgeBatchPrev.delete(project.id);
+      continue;
+    }
+    let admission;
+    try { admission = captureProjectAdmission(project.id); }
+    catch { continue; }
     if (project.idle) continue; // #812: parked project — no batch-progress polling
     const hasTriggerAuto = project.trigger_auto && triggers.has(project.id);
     const hasBridgeAuto = project.telegram_auto || project.discord_auto;
@@ -2086,8 +2618,16 @@ async function autoStopPollingTick() {
       const res = await fetch(
         `http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(project.id)}`
       );
+      if (!isAdmissionCurrent(admission)) {
+        stopTrigger(project.id);
+        continue;
+      }
       if (!res.ok) continue;
       const bp = await res.json();
+      if (!isAdmissionCurrent(admission)) {
+        stopTrigger(project.id);
+        continue;
+      }
       const hasItems = bp.items && bp.items.length > 0;
       // #810: gate auto-stop on completeConfirmed (two distinct successful fetch
       // cycles), not a single transient/stale `complete`. Track prev on the
@@ -2108,16 +2648,15 @@ async function autoStopPollingTick() {
           const reason = clearedByOperator ? "cleared by operator" : "complete (confirmed)";
           console.log(`[auto-trigger] ${project.id}: batch ${reason}, auto-stopped (poller)`);
           stopTrigger(project.id);
-          if (caffeinateProcess.process && triggers.size === 0) {
-            try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
-            caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
+          const released = releaseProjectCaffeinate(project.id);
+          if (released.removed) {
             console.log(`[auto-trigger] ${project.id}: caffeinate auto-stopped (no active triggers remain)`);
           }
         }
         // #518: also stop bridges when batch completes
         // #542: only fire on the transition (incomplete→complete), not every tick
         if (hasBridgeAuto && (!prev || !prev.complete)) {
-          await autoStopBridges(project.id, project, qwPort);
+          await autoStopBridges(project.id, project, qwPort, admission);
         }
       }
 
@@ -2127,7 +2666,7 @@ async function autoStopPollingTick() {
       if (hasBridgeAuto && hasItems && !bp.complete && !clearedByOperator) {
         const isNewBatch = !prev || prev.complete || !prev.hasItems;
         if (isNewBatch) {
-          await autoStartBridges(project.id, project, qwPort);
+          await autoStartBridges(project.id, project, qwPort, admission);
         }
       }
     } catch {
@@ -2158,7 +2697,12 @@ async function reseedRetryTick() {
   if (_reseedRetryRunning) return; // a slow tick must not overlap the next
   _reseedRetryRunning = true;
   try {
-    await routes.autoReseedOnStartup(readConfig(), { periodic: true });
+    const cfg = readConfig();
+    const admittedCfg = {
+      ...cfg,
+      projects: (cfg.projects || []).filter((project) => project?.id && !isProjectArchived(project.id, cfg)),
+    };
+    await routes.autoReseedOnStartup(admittedCfg, { periodic: true });
   } catch (err) {
     console.error(`[reseed] periodic retry failed: ${err.message}`);
   } finally {
@@ -2220,9 +2764,16 @@ async function watchdogCheck(deps = {}) {
   const now = deps.now || Date.now;
   const log = deps.log || ((m) => console.log(m));
   const errorLog = deps.errorLog || ((m) => console.error(m));
+  const archived = deps.isProjectArchived || isProjectArchived;
+  const captureAdmission = deps.captureProjectAdmission || captureProjectAdmission;
+  const admissionCurrent = deps.isAdmissionCurrent || isAdmissionCurrent;
 
   const toRespawn = [];
+  const admissions = new Map();
   for (const [key, session] of sessions) {
+    if (!session?.projectId || archived(session.projectId)) continue;
+    try { admissions.set(key, captureAdmission(session.projectId)); }
+    catch { continue; }
     // #910: liveness probe — a session can read `running` while its CLI process
     // already exited (onExit didn't fire / process died without it), leaving a
     // false green dot. Detect the dead pid and clear the stale state.
@@ -2256,6 +2807,8 @@ async function watchdogCheck(deps = {}) {
     if (!session || !session.exitedUnexpectedly) continue;
     const [projectId, agentId] = key.split("/");
     if (!projectId || !agentId) continue;
+    const admission = admissions.get(key);
+    if (!admission || !admissionCurrent(admission) || archived(projectId)) continue;
     if (isIdle(projectId)) continue; // #812: parked project — leave stopped
     const decision = shouldRespawn(key, {
       now: now(),
@@ -2265,7 +2818,10 @@ async function watchdogCheck(deps = {}) {
     session.exitedUnexpectedly = false; // consume the flag for this attempt
     log(`[watchdog] ${key}: agent exited — auto-respawning`);
     try {
-      const result = await spawn(projectId, agentId, { suppressLifecycleMsg: true });
+      const result = await spawn(projectId, agentId, {
+        suppressLifecycleMsg: true,
+        admissionToken: admission,
+      });
       if (result.ok) emit(projectId, `${agentId} auto-respawned (had exited)`);
       else errorLog(`[watchdog] ${key}: auto-respawn failed: ${result.error}`);
     } catch (err) {
@@ -2282,7 +2838,7 @@ function startWatchdog() {
 
 // #657: extracted startup migrations so full-reset can re-run them
 function runStartupMigrations(cfg) {
-  const projects = (cfg.projects || []).filter((p) => !p.archived);
+  const projects = (cfg.projects || []).filter((p) => p?.id && !isProjectArchived(p.id, cfg));
 
   // reseed stale slugs
   const SLUG_FIXES = [
@@ -2364,6 +2920,9 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
   const isActiveFromProgress = opts.isActiveFromProgress || routes.isBatchActiveFromProgress;
   const spawn = opts.spawnAgentPty || spawnAgentPty;
   const sessions = opts.agentSessions || agentSessions;
+  const archived = opts.isProjectArchived || isProjectArchived;
+  const captureAdmission = opts.captureProjectAdmission || captureProjectAdmission;
+  const admissionCurrent = opts.isAdmissionCurrent || isAdmissionCurrent;
   const decisions = [];
 
   if (cfg && cfg.restart_respawn && cfg.restart_respawn.enabled === false) {
@@ -2373,9 +2932,24 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
 
   const projects = (cfg?.projects || []).filter((p) => p && p.id && p.working_dir);
   for (const project of projects) {
+    if (archived(project.id, cfg)) {
+      decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
+      continue;
+    }
+    let admission;
+    try {
+      admission = captureAdmission(project.id);
+    } catch {
+      decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
+      continue;
+    }
     let active;
     try {
       const progress = await getProgress(project.id);
+      if (!admissionCurrent(admission) || archived(project.id)) {
+        decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
+        continue;
+      }
       active = isActiveFromProgress(progress);
     } catch (err) {
       // Fail-safe: an unknowable batch state means DON'T spawn (never disturb
@@ -2397,13 +2971,17 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
       : ["head", "re1", "re2", "dev"];
     const restored = [];
     for (const agentId of agentKeys) {
+      if (!admissionCurrent(admission) || archived(project.id)) break;
       const key = `${project.id}/${agentId}`;
       // Idempotent: never double-spawn an agent already live (e.g. one a
       // terminal-connect raced in first).
       const existing = sessions.get(key);
       if (existing && isPtyAlive(existing.term)) continue;
       try {
-        const r = await spawn(project.id, agentId, { suppressLifecycleMsg: true });
+        const r = await spawn(project.id, agentId, {
+          suppressLifecycleMsg: true,
+          admissionToken: admission,
+        });
         if (r && r.ok) restored.push(agentId);
         else log(`[respawn] ${key}: spawn failed: ${(r && r.error) || "unknown error"}`);
       } catch (err) {
@@ -2434,14 +3012,19 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
   const startupCfg = readConfig();
+  const admittedStartupCfg = {
+    ...startupCfg,
+    projects: (startupCfg.projects || []).filter((project) => project?.id && !isProjectArchived(project.id, startupCfg)),
+  };
 
   // #719: Migrate AC chat history to JSONL before initializing file-chat.
-  const migrationFailed = new Set(runAcMigration(startupCfg));
+  const migrationFailed = new Set(runAcMigration(admittedStartupCfg));
 
   // #722: One-time switchover — set all projects to file-based chat.
   if (!startupCfg.file_chat_switchover_done) {
     let switched = false;
     for (const p of (startupCfg.projects || [])) {
+      if (isProjectArchived(p.id, startupCfg)) continue;
       if (p.chat_mode !== "file" && !migrationFailed.has(p.id)) {
         p.chat_mode = "file";
         switched = true;
@@ -2455,6 +3038,7 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
 
   // Initialize file-chat engine for all projects.
   for (const p of (startupCfg.projects || [])) {
+    if (isProjectArchived(p.id, startupCfg)) continue;
     if (p.chat_mode === "file") {
       if (migrationFailed.has(p.id)) {
         console.error(`[startup] ${p.id}: migration failed — skipping file-chat init`);
@@ -2470,14 +3054,14 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
     }
   }
 
-  runStartupMigrations(startupCfg);
+  runStartupMigrations(admittedStartupCfg);
 
   // #856: Auto-reseed worktree AGENTS.md when the package version changes.
   // Per-project completion state lives in ~/.quadwork/reseed-state.json, so
   // projects deferred mid-batch stay pending and retry on the next startup.
   // Failures here MUST NOT block server boot.
   try {
-    await routes.autoReseedOnStartup(startupCfg);
+    await routes.autoReseedOnStartup(admittedStartupCfg);
   } catch (err) {
     console.error(`[reseed] auto-reseed failed: ${err.message}`);
   }
@@ -2486,7 +3070,7 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   // AFTER auto-reseed (which defers active-batch projects, so their seeds are
   // untouched) and must never block boot.
   try {
-    await respawnActiveBatchAgents(startupCfg);
+    await respawnActiveBatchAgents(admittedStartupCfg);
   } catch (err) {
     console.error(`[respawn] restart respawn failed: ${err.message}`);
   }
@@ -2519,13 +3103,13 @@ function shutdown() {
   }
 
   // Message bridges (in-process Discord/Telegram clients).
-  try { telegramBridge.stopAll(); } catch {}
-  try { discordBridge.stopAll(); } catch {}
+  void telegramBridge.stopAll().catch((err) => console.error("[shutdown] Telegram bridge stop failed:", err?.message || err));
+  void discordBridge.stopAll().catch((err) => console.error("[shutdown] Discord bridge stop failed:", err?.message || err));
 
   // caffeinate is spawned detached+unref, so it survives our exit unless killed.
   if (caffeinateProcess.process) {
     try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
-    caffeinateProcess = { process: null, pid: null, startedAt: null, duration: null };
+    clearCaffeinateProcess();
   }
 
   // Agent PTYs (and the CLI children they hold).
@@ -2542,6 +3126,30 @@ function shutdown() {
   }
 }
 
-module.exports = { shutdown, buildAgentArgs, buildAgentEnv, isPtyAlive, watchdogCheck, markSessionExited };
+module.exports = {
+  shutdown,
+  buildAgentArgs,
+  buildAgentEnv,
+  isPtyAlive,
+  watchdogCheck,
+  markSessionExited,
+  spawnAgentPty,
+  stopAgentSession,
+  cleanupProjectRuntime,
+  projectLifecycle,
+  sendTriggerMessage,
+  syncTriggersFromConfig,
+  autoStartBridges,
+  autoStopBridges,
+  autoStopPollingTick,
+  registerCaffeinateOwner,
+  caffeinateStatus,
+  releaseProjectCaffeinate,
+  releaseManualCaffeinate,
+  restartAgentSession,
+};
 module.exports.agentSessions = agentSessions; // #972: test seam for shutdown() PTY cleanup
+module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test seam
+module.exports.triggers = triggers; // #1034: project cleanup ownership test seam
+module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation test seam
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)

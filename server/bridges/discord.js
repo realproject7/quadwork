@@ -6,6 +6,57 @@ const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 
 const instances = new Map();
 
+function isCurrent(projectId, inst) {
+  return !inst.stopping && instances.get(projectId) === inst;
+}
+
+async function track(inst, promise) {
+  if (!inst.inFlight) inst.inFlight = new Set();
+  const owned = Promise.resolve(promise);
+  inst.inFlight.add(owned);
+  try { return await owned; }
+  finally { inst.inFlight.delete(owned); }
+}
+
+async function bridgeFetch(inst, url, options = {}, timeoutMs = 5000) {
+  if (!inst.controllers) inst.controllers = new Set();
+  const controller = new AbortController();
+  inst.controllers.add(controller);
+  try {
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]);
+    return await track(inst, fetch(url, { ...options, signal }));
+  } finally {
+    inst.controllers.delete(controller);
+  }
+}
+
+async function settleInFlight(inst, timeoutMs = 5000) {
+  const pending = [...(inst.inFlight || [])];
+  if (pending.length === 0) return true;
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  const settled = Promise.allSettled(pending).then(() => true);
+  const completed = await Promise.race([settled, timeout]);
+  clearTimeout(timer);
+  return completed;
+}
+
+async function settleOperation(operation, timeoutMs = 5000) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, timeout: true }), timeoutMs);
+  });
+  const settled = Promise.resolve(operation).then(
+    () => ({ ok: true }),
+    (error) => ({ ok: false, error }),
+  );
+  const outcome = await Promise.race([settled, timeout]);
+  clearTimeout(timer);
+  return outcome;
+}
+
 // #782: cursor-lag threshold beyond which a valid cursor is treated as
 // stale (bridge stopped mid-backlog) and reseeded to latest on start.
 // Small lags within this window keep continuity for graceful restarts.
@@ -53,21 +104,24 @@ async function pollLoop(projectId, channelObj, qwPort) {
 
   try {
     let sinceId = inst.cursor;
-    const r = await fetch(
+    const r = await bridgeFetch(inst,
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&since_id=${sinceId}&limit=50`,
-      { signal: AbortSignal.timeout(5000) }
+      {}, 5000,
     );
+    if (!isCurrent(projectId, inst)) return;
     if (!r.ok) throw new Error(`Chat API ${r.status}`);
-    const messages = await r.json();
+    const messages = await track(inst, r.json());
+    if (!isCurrent(projectId, inst)) return;
 
     for (const msg of messages) {
-      if (inst.stopping) return;
+      if (!isCurrent(projectId, inst)) return;
       if (msg.sender === "dc" || msg.sender === "discord-bridge" || (msg.sender && msg.sender.startsWith("dc:"))) continue;
       if (inst.forwardedIds.has(msg.id)) continue;
 
       const text = `**${msg.sender}**: ${msg.text}`;
       const truncated = text.length > 2000 ? text.slice(0, 2000) + "…" : text;
-      await channelObj.send(truncated);
+      await track(inst, channelObj.send(truncated));
+      if (!isCurrent(projectId, inst)) return;
 
       inst.forwardedIds.add(msg.id);
       if (inst.forwardedIds.size > 2000) {
@@ -81,10 +135,10 @@ async function pollLoop(projectId, channelObj, qwPort) {
       }
     }
   } catch (err) {
-    inst.lastError = err.message;
+    if (isCurrent(projectId, inst)) inst.lastError = err.message;
   }
 
-  if (!inst.stopping) {
+  if (isCurrent(projectId, inst)) {
     inst.timer = setTimeout(() => pollLoop(projectId, channelObj, qwPort), 2000);
   }
 }
@@ -117,29 +171,44 @@ async function start(projectId, botToken, channelId, qwPort) {
     startedAt: Date.now(),
     client,
     channelId,
+    controllers: new Set(),
+    inFlight: new Set(),
   };
   instances.set(projectId, inst);
 
   try {
-    await client.login(botToken);
+    await track(inst, client.login(botToken));
   } catch (err) {
     instances.delete(projectId);
     throw new Error(`Discord login failed: ${err.message}`);
   }
 
+  if (inst.stopping || instances.get(projectId) !== inst) {
+    try { await client.destroy(); } catch {}
+    return;
+  }
+
   let channel;
   try {
-    channel = await client.channels.fetch(channelId);
+    channel = await track(inst, client.channels.fetch(channelId));
     if (!channel) throw new Error("Channel not found");
   } catch (err) {
-    client.destroy();
+    try { await client.destroy(); } catch {}
     instances.delete(projectId);
     throw new Error(`Discord channel fetch failed: ${err.message}`);
   }
 
+  // Archive may have stopped this instance while login/channel discovery was
+  // awaiting the network. Never attach handlers or start polling for a stale
+  // instance after that durable barrier won the race.
+  if (inst.stopping || instances.get(projectId) !== inst) {
+    try { await client.destroy(); } catch {}
+    return;
+  }
+
   client.on("messageCreate", async (message) => {
     try {
-      if (inst.stopping) return;
+      if (!isCurrent(projectId, inst)) return;
       if (message.author.bot) return;
       if (message.channel.id !== channelId) return;
 
@@ -148,7 +217,7 @@ async function start(projectId, botToken, channelId, qwPort) {
       if (!message.content) {
         console.warn(`[bridge] discord ${projectId}: empty message content — check MESSAGE_CONTENT intent`);
       }
-      const res = await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
+      const res = await bridgeFetch(inst, `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -159,13 +228,13 @@ async function start(projectId, botToken, channelId, qwPort) {
           text: message.content,
           channel: "general",
         }),
-        signal: AbortSignal.timeout(5000),
-      });
+      }, 5000);
+      if (!isCurrent(projectId, inst)) return;
       if (!res.ok) {
         console.error(`[bridge] discord ${projectId} inbound POST failed: ${res.status}`);
       }
     } catch (err) {
-      if (!inst.stopping) {
+      if (isCurrent(projectId, inst)) {
         console.error(`[bridge] discord ${projectId} inbound error: ${err.message}`);
         inst.lastError = err.message;
       }
@@ -188,12 +257,14 @@ async function start(projectId, botToken, channelId, qwPort) {
   // mid-conversation) keep continuity.
   const cursorFileExists = fs.existsSync(cursorPath(projectId));
   try {
-    const r = await fetch(
+    const r = await bridgeFetch(inst,
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&limit=1`,
-      { signal: AbortSignal.timeout(5000) }
+      {}, 5000,
     );
+    if (!isCurrent(projectId, inst)) return;
     if (r.ok) {
-      const msgs = await r.json();
+      const msgs = await track(inst, r.json());
+      if (!isCurrent(projectId, inst)) return;
       if (msgs.length > 0) {
         const latestId = msgs[msgs.length - 1].id;
         const stale = !cursorFileExists
@@ -210,26 +281,79 @@ async function start(projectId, botToken, channelId, qwPort) {
       console.warn(`[bridge] discord ${projectId}: cursor seed fetch returned ${r.status}`);
     }
   } catch (err) {
-    console.warn(`[bridge] discord ${projectId}: cursor seed failed (${err.message})`);
+    if (isCurrent(projectId, inst)) console.warn(`[bridge] discord ${projectId}: cursor seed failed (${err.message})`);
   }
 
   pollLoop(projectId, channel, qwPort).catch((err) => {
     console.error(`[bridge] discord ${projectId} poll crashed: ${err.message}`);
     inst.lastError = err.message;
-    stop(projectId);
+    void stop(projectId).catch((stopErr) => {
+      console.error(`[bridge] discord ${projectId} stop failed: ${stopErr.message}`);
+    });
   });
 
   console.log(`[bridge] discord ${projectId}: started`);
 }
 
-function stop(projectId) {
+async function stop(projectId) {
   const inst = instances.get(projectId);
-  if (!inst) return;
+  if (!inst) {
+    return {
+      ok: true,
+      resources: { discord_bridges: 0, bridge_timers: 0 },
+      cleanup_errors: [],
+    };
+  }
   inst.stopping = true;
-  if (inst.timer) clearTimeout(inst.timer);
-  try { inst.client.destroy(); } catch {}
-  instances.delete(projectId);
-  console.log(`[bridge] discord ${projectId}: stopped`);
+  for (const controller of inst.controllers || []) {
+    try { controller.abort(); } catch {}
+  }
+  let timers = 0;
+  const cleanupErrors = [];
+  if (inst.timer) {
+    try {
+      clearTimeout(inst.timer);
+      inst.timer = null;
+      timers += 1;
+    } catch (err) {
+      cleanupErrors.push({
+        resource: "discord_bridge",
+        code: "timer_stop_failed",
+        message: err?.message || "Discord bridge timer stop failed",
+      });
+    }
+  }
+  try {
+    if (inst.client) {
+      const outcome = await settleOperation(inst.client.destroy(), inst.stopTimeoutMs || 5000);
+      if (!outcome.ok) throw outcome.error || new Error("Discord client stop timed out");
+    }
+  } catch (err) {
+    cleanupErrors.push({
+      resource: "discord_bridge",
+      code: "client_stop_failed",
+      message: err?.message || "Discord bridge client stop failed",
+    });
+  }
+  if (!(await settleInFlight(inst, inst.stopTimeoutMs || 5000))) {
+    cleanupErrors.push({
+      resource: "discord_bridge",
+      code: "inflight_stop_timeout",
+      message: "Discord bridge in-flight work did not settle",
+    });
+  }
+  if (cleanupErrors.length === 0) {
+    if (instances.get(projectId) === inst) instances.delete(projectId);
+    console.log(`[bridge] discord ${projectId}: stopped`);
+  }
+  return {
+    ok: cleanupErrors.length === 0,
+    resources: {
+      discord_bridges: cleanupErrors.length === 0 ? 1 : 0,
+      bridge_timers: timers,
+    },
+    cleanup_errors: cleanupErrors,
+  };
 }
 
 function isRunning(projectId) {
@@ -237,8 +361,8 @@ function isRunning(projectId) {
 }
 
 // #972: stop every running instance (used on server shutdown).
-function stopAll() {
-  for (const projectId of [...instances.keys()]) stop(projectId);
+async function stopAll() {
+  return Promise.all([...instances.keys()].map((projectId) => stop(projectId)));
 }
 
 function getLastError(projectId) {
@@ -246,4 +370,4 @@ function getLastError(projectId) {
   return inst?.lastError || null;
 }
 
-module.exports = { start, stop, stopAll, isRunning, getLastError, readCursor };
+module.exports = { start, stop, stopAll, isRunning, getLastError, readCursor, _instances: instances, _pollLoop: pollLoop };

@@ -78,6 +78,7 @@ const _submitTimers = new Map();
  * @param {object} deps - { isLoopGuardPaused, safeWrite }
  */
 function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
+  if (!projectAdmitted(deps, projectId)) return;
   if (!msg || msg.type === "system") return;
   if (deps.isLoopGuardPaused(projectId)) return;
   if (!msg.mentions || msg.mentions.length === 0) return;
@@ -116,6 +117,15 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
 
     scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions, deps);
   }
+}
+
+// #1034: delayed dispatcher work must consult the same server-owned archive
+// authority as the immediate mention path. Treat a missing callback as admitted
+// for backwards-compatible unit callers; production always supplies it.
+function projectAdmitted(deps, projectId) {
+  if (!deps || typeof deps.isProjectAdmitted !== "function") return true;
+  try { return deps.isProjectAdmitted(projectId) === true; }
+  catch { return false; }
 }
 
 function isAgentBusy(session) {
@@ -182,6 +192,12 @@ function queuePendingWake(key, session, agentSessions, deps) {
   // cycle should simply stand down.
   const claimCycle = () => {
     if (!isCurrentCycle()) return null;
+    const projectId = key.split("/")[0];
+    if (!projectAdmitted(deps, projectId)) {
+      _pendingWake.delete(key);
+      cleanupDrainListener(key);
+      return null;
+    }
     if (!_pendingWake.get(key)) {
       cleanupDrainListener(key);
       return null;
@@ -326,6 +342,7 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
   const state = { messages: [msg] };
   const timer = setTimeout(() => {
     _coalesceTimers.delete(key);
+    if (!projectAdmitted(deps, projectId)) return;
     const session = agentSessions.get(key);
     if (!session || !session.term || session.state !== "running") return;
 
@@ -353,13 +370,16 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
 // Without an owner, stopping a session inside the submit delay left a pending
 // "\r" write against a term that was already killed.
 function injectIntoTerm(key, term, text, deps) {
+  const projectId = key.split("/")[0];
   const flat = text.replace(/\n/g, " ");
+  if (!projectAdmitted(deps, projectId)) return;
   deps.safeWrite(term, flat);
   const submitDelayMs = Math.max(300, flat.length);
   const previous = _submitTimers.get(key);
   if (previous) clearTimeout(previous);
   const handle = setTimeout(() => {
     _submitTimers.delete(key);
+    if (!projectAdmitted(deps, projectId)) return;
     try { deps.safeWrite(term, "\r"); } catch {}
   }, submitDelayMs);
   _submitTimers.set(key, handle);
@@ -387,9 +407,49 @@ function cleanupSession(key) {
   _lastCapInjectedAt.delete(key);
 }
 
+/**
+ * Cancel every deferred dispatcher owner for one project. This is deliberately
+ * prefix-scoped and synchronous: archive persists the barrier, then calls this
+ * before its first async teardown so no pending timer can inject in the gap.
+ */
+function cancelProject(projectId) {
+  const prefix = `${projectId}/`;
+  const keys = new Set();
+  for (const map of [
+    _coalesceTimers,
+    _pendingWake,
+    _drainListeners,
+    _lastChatSentAt,
+    _lastCapInjectedAt,
+    _submitTimers,
+  ]) {
+    for (const key of map.keys()) if (key.startsWith(prefix)) keys.add(key);
+  }
+  let removed = 0;
+  for (const key of keys) {
+    for (const map of [
+      _coalesceTimers,
+      _pendingWake,
+      _drainListeners,
+      _lastChatSentAt,
+      _lastCapInjectedAt,
+      _submitTimers,
+    ]) {
+      if (map.has(key)) removed += 1;
+    }
+    cleanupSession(key);
+  }
+  return {
+    ok: true,
+    resources: { deferred_dispatches: removed },
+    cleanup_errors: [],
+  };
+}
+
 module.exports = {
   dispatchToAgentPTY,
   cleanupSession,
+  cancelProject,
   // Exported for testing
   capEligible, // #1023: the eligibility predicate is pinned directly, not only
                // through the repaint regressions, so the fail-safe direction

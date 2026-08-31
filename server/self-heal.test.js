@@ -1,7 +1,7 @@
 "use strict";
 
 const selfHeal = require("./self-heal");
-const { observeChunk, isThinkingBlock400, breakerMessage, clearState, _state, COOLDOWN_MS } = selfHeal;
+const { observeChunk, isThinkingBlock400, breakerMessage, clearState, clearProject, _state, COOLDOWN_MS } = selfHeal;
 
 // The real thinking-block 400 line emitted by claude on Opus 4.8.
 const SIGNATURE =
@@ -180,6 +180,22 @@ function runTests() {
     clearState(KEY);
     assert(!selfHeal._respawnState.has(KEY), "clearState drops the respawn-breaker state");
     assert(shouldRespawn(KEY, { now: 1000 + RESPAWN_MAX * 1000 + 1 }) === "respawn", "after clearState, respawn allowed again (manual stop re-enables)");
+  }
+
+  // --- Test 10 (#1034): archive clears every breaker entry for exactly one
+  //     project, including keys no longer represented in agentSessions. ---
+  {
+    _state.clear();
+    selfHeal._respawnState.clear();
+    _state.set("proj/head", { restarts: [1] });
+    _state.set("proj/dev", { restarts: [2] });
+    _state.set("other/dev", { restarts: [3] });
+    selfHeal._respawnState.set("proj/re1", { respawns: [1] });
+    selfHeal._respawnState.set("other/re1", { respawns: [2] });
+    const result = clearProject("proj");
+    assert(result.ok === true && result.resources.self_heal_states === 3, "#1034: clearProject reports all removed guard entries");
+    assert(![..._state.keys(), ...selfHeal._respawnState.keys()].some((key) => key.startsWith("proj/")), "#1034: archived project has no guard state left");
+    assert(_state.has("other/dev") && selfHeal._respawnState.has("other/re1"), "#1034: another project's guard state is preserved");
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

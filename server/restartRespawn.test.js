@@ -47,6 +47,12 @@ function spy() {
   return { fn, calls };
 }
 
+const admitted = {
+  isProjectArchived: () => false,
+  captureProjectAdmission: (projectId) => ({ project_id: projectId, generation: 0 }),
+  isAdmissionCurrent: () => true,
+};
+
 (async () => {
   // ── 1. Active-batch project → all 4 agents respawned, with suppressed
   //       lifecycle msg; decision recorded. ──
@@ -54,6 +60,7 @@ function spy() {
     const { fn: spawn, calls } = spy();
     const cfg = { projects: [{ id: "act", working_dir: "/tmp/act", agents: { head: {}, re1: {}, re2: {}, dev: {} } }] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => ACTIVE, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 4, "active batch → 4 agents spawned");
@@ -69,6 +76,7 @@ function spy() {
     const { fn: spawn, calls } = spy();
     const cfg = { projects: [{ id: "idle", working_dir: "/tmp/idle", agents: { head: {}, re1: {}, re2: {}, dev: {} } }] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => IDLE_COMPLETE, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 0, "idle (complete) project → no agents spawned");
@@ -81,6 +89,7 @@ function spy() {
     const { fn: spawn, calls } = spy();
     const cfg = { projects: [{ id: "cleared", working_dir: "/tmp/cleared" }] };
     await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => IDLE_CLEARED, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 0, "cleared active-batch → no agents spawned");
@@ -91,6 +100,7 @@ function spy() {
     const { fn: spawn, calls } = spy();
     const cfg = { projects: [{ id: "unk", working_dir: "/tmp/unk" }] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => null, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 0, "null progress → never spawns (fail-safe)");
@@ -102,6 +112,7 @@ function spy() {
     const { fn: spawn, calls } = spy();
     const cfg = { projects: [{ id: "err", working_dir: "/tmp/err" }] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => { throw new Error("gh down"); }, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 0, "throwing batch-state check → no spawn");
@@ -113,6 +124,7 @@ function spy() {
     const { fn: spawn, calls } = spy();
     const cfg = { restart_respawn: { enabled: false }, projects: [{ id: "act", working_dir: "/tmp/act" }] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => ACTIVE, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 0, "opt-out → no agents spawned even for an active batch");
@@ -126,6 +138,7 @@ function spy() {
     const sessions = new Map([["act/head", { term: { pid: process.pid } }]]);
     const cfg = { projects: [{ id: "act", working_dir: "/tmp/act", agents: { head: {}, re1: {}, re2: {}, dev: {} } }] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => ACTIVE, spawnAgentPty: spawn, agentSessions: sessions, log: () => {},
     });
     assert.deepEqual(calls.map((c) => c[1]).sort(), ["dev", "re1", "re2"], "already-live head NOT re-spawned; re1/re2/dev are");
@@ -139,6 +152,7 @@ function spy() {
     const logs = [];
     const cfg = { projects: [{ id: "act", working_dir: "/tmp/act", agents: { head: {}, re1: {}, re2: {}, dev: {} } }] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => ACTIVE, spawnAgentPty: spawn, agentSessions: new Map(), log: (m) => logs.push(m),
     });
     assert.ok(!out.decisions[0].agents.includes("re1"), "failed spawn not counted as restored");
@@ -150,12 +164,30 @@ function spy() {
     const { fn: spawn, calls } = spy();
     const cfg = { projects: [{ id: "nowd" }, { working_dir: "/tmp/x" }, null] };
     const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
       getProgress: async () => ACTIVE, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 0, "projects missing id/working_dir are skipped");
     assert.equal(out.decisions.length, 0);
   }
 
-  console.log("restartRespawn.test.js: all assertions passed (8 cases)");
+  // ── 9. Archive wins while batch progress is awaiting: no agent spawn. ──
+  {
+    const { fn: spawn, calls } = spy();
+    const cfg = { projects: [{ id: "archiving", working_dir: "/tmp/archiving", agents: { head: {} } }] };
+    const out = await respawnActiveBatchAgents(cfg, {
+      getProgress: async () => ACTIVE,
+      isProjectArchived: () => false,
+      captureProjectAdmission: (projectId) => ({ project_id: projectId, generation: 0 }),
+      isAdmissionCurrent: () => false,
+      spawnAgentPty: spawn,
+      agentSessions: new Map(),
+      log: () => {},
+    });
+    assert.equal(calls.length, 0, "archive during batch-progress await → zero startup spawn");
+    assert.equal(out.decisions[0].reason, "project archived");
+  }
+
+  console.log("restartRespawn.test.js: all assertions passed (9 cases)");
   process.exit(0);
 })().catch((err) => { console.error(err); process.exit(1); });

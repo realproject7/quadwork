@@ -26,7 +26,7 @@ function run() {
   // stopAgentSession gates the clear behind a clearSelfHeal flag and calls
   // selfHeal.clearState(key) — NOT an unconditional clear (which would reset the
   // #797 breaker on every auto-restart, since restartAgentSession stops first).
-  ok(/stopAgentSession\(key,\s*\{\s*clearSelfHeal\s*=\s*false\s*\}\s*=\s*\{\}\)/.test(stopFn), "stopAgentSession takes { clearSelfHeal = false } (off by default)");
+  ok(/stopAgentSession\(key,\s*\{[\s\S]*?clearSelfHeal\s*=\s*false/.test(stopFn), "stopAgentSession takes { clearSelfHeal = false } (off by default)");
   ok(/if\s*\(clearSelfHeal\)\s*selfHeal\.clearState\(key\)/.test(stopFn), "stopAgentSession clears self-heal state ONLY when clearSelfHeal is set");
 
   // restartAgentSession forwards the flag to its internal stop.

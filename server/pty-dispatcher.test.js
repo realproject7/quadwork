@@ -3,6 +3,7 @@
 const {
   dispatchToAgentPTY,
   cleanupSession,
+  cancelProject,
   capEligible,
   _coalesceTimers,
   _pendingWake,
@@ -533,6 +534,52 @@ async function runTests() {
     assert(capEligible({ backend: "gemini" }) === false, "#1023: gemini stays false — its TUI goes quiet between turns");
     assert(capEligible({}) === false, "#1023 AC: an unstamped session stays INELIGIBLE (fail-safe direction preserved)");
     assert(capEligible(null) === false, "#1023: a missing session is ineligible, not a crash");
+  }
+
+  // --- Test 23 (#1034): the archive barrier is re-checked at the delayed
+  //     coalesce boundary. A mention admitted just before archive must not be
+  //     injected after the durable barrier flips while its timer is pending. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let admitted = true;
+    const deps = { ...makeDeps(), isProjectAdmitted: () => admitted };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    admitted = false;
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 0, "#1034: archive during coalesce suppresses the delayed PTY injection");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 24 (#1034): project cancellation is prefix-scoped and removes
+  //     every deferred-dispatch owner without disturbing another project. ---
+  {
+    const a = makeSessions({ lastOutputAt: Date.now(), backend: "claude" });
+    const b = makeSessions({ projectId: "other", lastOutputAt: Date.now(), backend: "claude" });
+    b.sessions.delete("proj/dev");
+    b.sessions.set("other/dev", b.session);
+    b.session.projectId = "other";
+    dispatchToAgentPTY("proj", makeMsg(), a.sessions, makeDeps());
+    dispatchToAgentPTY("other", makeMsg(), b.sessions, makeDeps());
+    const result = cancelProject("proj");
+    assert(result.ok === true && result.resources.deferred_dispatches >= 1, "#1034: cancelProject reports removed deferred work");
+    assert(!_pendingWake.has("proj/dev") && !_drainListeners.has("proj/dev"), "#1034: archived project deferred state is gone");
+    assert(_pendingWake.has("other/dev") && _drainListeners.has("other/dev"), "#1034: another project's deferred state is untouched");
+    cleanupSession("other/dev");
+  }
+
+  // --- Test 25 (#1034): archive can land after prompt text was written but
+  //     before the delayed submit CR. The timer itself must consult admission. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let admitted = true;
+    const deps = { ...makeDeps(), isProjectAdmitted: () => admitted };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 20));
+    assert(written.length === 1, "#1034: prompt text was written before archive");
+    admitted = false;
+    await new Promise((r) => setTimeout(r, 500));
+    assert(written.length === 1, "#1034: archived project receives no delayed submit CR");
+    cleanupSession("proj/dev");
   }
 
   // Restore the shipped timings so nothing after this block runs on test values.

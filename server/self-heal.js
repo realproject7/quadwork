@@ -132,11 +132,32 @@ function clearState(key) {
   _respawnState.delete(key);
 }
 
+// #1034: archive must also clear guards for sessions that disappeared from the
+// live session map. Scan both module-owned maps by the canonical project/key
+// prefix rather than rebuilding keys from config.
+function clearProject(projectId) {
+  const prefix = `${projectId}/`;
+  let removed = 0;
+  for (const map of [_state, _respawnState]) {
+    for (const key of [...map.keys()]) {
+      if (!key.startsWith(prefix)) continue;
+      map.delete(key);
+      removed += 1;
+    }
+  }
+  return {
+    ok: true,
+    resources: { self_heal_states: removed },
+    cleanup_errors: [],
+  };
+}
+
 module.exports = {
   observeChunk,
   isThinkingBlock400,
   breakerMessage,
   clearState,
+  clearProject,
   shouldRespawn,
   respawnBreakerMessage,
   _state,

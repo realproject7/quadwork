@@ -63,6 +63,9 @@ function makeDeps(over = {}) {
     getProjectChatMode: () => "shim",
     safeWrite: () => true,
     isProjectIdleId: () => false,
+    isProjectArchived: () => false,
+    captureProjectAdmission: (projectId) => ({ project_id: projectId, generation: 0 }),
+    isAdmissionCurrent: () => true,
     shouldRespawn: (key, opts) => { calls.shouldRespawn.push([key, opts]); return "respawn"; },
     spawnAgentPty: async (pid, aid, opts) => { calls.spawn.push([pid, aid, opts]); return { ok: true, pid: 4242 }; },
     emitSystemMessage: (pid, msg) => calls.emit.push([pid, msg]),
@@ -199,6 +202,24 @@ function makeDeps(over = {}) {
     });
     await watchdogCheck(deps);
     assert(!writes.includes("\x03"), "file-chat: silent agent is NOT nudged (PTY dispatch wakes it)");
+  }
+
+  // ── 10. Archived projects are entirely inert: no liveness mutation,
+  //        Ctrl+C nudge, breaker decision, or respawn. ──
+  {
+    const s = session({ state: "stopped", term: null, exitedUnexpectedly: true });
+    const sessions = sessionsOf(s);
+    const writes = [];
+    const { deps, calls } = makeDeps({
+      agentSessions: sessions,
+      isProjectArchived: () => true,
+      safeWrite: (_term, data) => { writes.push(data); return true; },
+    });
+    await watchdogCheck(deps);
+    assert(calls.spawn.length === 0, "#1034 archived: watchdog never respawns an agent");
+    assert(calls.shouldRespawn.length === 0, "#1034 archived: respawn breaker is not consulted");
+    assert(writes.length === 0, "#1034 archived: watchdog never writes to PTY");
+    assert(s.exitedUnexpectedly === true, "#1034 archived: stopped state stays untouched");
   }
 
   try { fs.rmSync(TMP_HOME, { recursive: true, force: true }); } catch {}

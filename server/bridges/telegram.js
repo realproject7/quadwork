@@ -6,6 +6,43 @@ const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 
 const instances = new Map();
 
+function isCurrent(projectId, inst) {
+  return !inst.stopping && instances.get(projectId) === inst;
+}
+
+async function track(inst, promise) {
+  if (!inst.inFlight) inst.inFlight = new Set();
+  const owned = Promise.resolve(promise);
+  inst.inFlight.add(owned);
+  try { return await owned; }
+  finally { inst.inFlight.delete(owned); }
+}
+
+async function bridgeFetch(inst, url, options = {}, timeoutMs = 5000) {
+  if (!inst.controllers) inst.controllers = new Set();
+  const controller = new AbortController();
+  inst.controllers.add(controller);
+  try {
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]);
+    return await track(inst, fetch(url, { ...options, signal }));
+  } finally {
+    inst.controllers.delete(controller);
+  }
+}
+
+async function settleInFlight(inst, timeoutMs = 5000) {
+  const pending = [...(inst.inFlight || [])];
+  if (pending.length === 0) return true;
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  const settled = Promise.allSettled(pending).then(() => true);
+  const completed = await Promise.race([settled, timeout]);
+  clearTimeout(timer);
+  return completed;
+}
+
 // #782: cursor-lag threshold beyond which a valid cursor is treated as
 // stale (bridge stopped mid-backlog) and reseeded to latest on start.
 // Small lags within this window keep continuity for graceful restarts.
@@ -54,14 +91,13 @@ function writeOffset(projectId, offset) {
   } catch {}
 }
 
-async function sendTelegram(botToken, chatId, text) {
+async function sendTelegram(inst, botToken, chatId, text) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const res = await fetch(url, {
+  const res = await bridgeFetch(inst, url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
-    signal: AbortSignal.timeout(10000),
-  });
+  }, 10000);
   if (!res.ok) throw new Error(`Telegram sendMessage ${res.status}`);
 }
 
@@ -71,21 +107,24 @@ async function pollLoop(projectId, botToken, chatId, qwPort) {
 
   try {
     let sinceId = inst.cursor;
-    const r = await fetch(
+    const r = await bridgeFetch(inst,
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&since_id=${sinceId}&limit=50`,
-      { signal: AbortSignal.timeout(5000) }
+      {}, 5000,
     );
+    if (!isCurrent(projectId, inst)) return;
     if (!r.ok) throw new Error(`Chat API ${r.status}`);
-    const messages = await r.json();
+    const messages = await track(inst, r.json());
+    if (!isCurrent(projectId, inst)) return;
 
     for (const msg of messages) {
-      if (inst.stopping) return;
+      if (!isCurrent(projectId, inst)) return;
       if (msg.sender === "tg" || msg.sender === "telegram-bridge" || (msg.sender && msg.sender.startsWith("tg:"))) continue;
       if (inst.forwardedIds.has(msg.id)) continue;
 
       const text = `**${msg.sender}**: ${msg.text}`;
       const truncated = text.length > 4000 ? text.slice(0, 4000) + "…" : text;
-      await sendTelegram(botToken, chatId, truncated);
+      await sendTelegram(inst, botToken, chatId, truncated);
+      if (!isCurrent(projectId, inst)) return;
 
       inst.forwardedIds.add(msg.id);
       if (inst.forwardedIds.size > 2000) {
@@ -99,10 +138,10 @@ async function pollLoop(projectId, botToken, chatId, qwPort) {
       }
     }
   } catch (err) {
-    inst.lastError = err.message;
+    if (isCurrent(projectId, inst)) inst.lastError = err.message;
   }
 
-  if (!inst.stopping) {
+  if (isCurrent(projectId, inst)) {
     inst.timer = setTimeout(() => pollLoop(projectId, botToken, chatId, qwPort), 2000);
   }
 }
@@ -115,16 +154,19 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
   let retryDelay = 500;
 
   async function tick() {
-    if (!inst || inst.stopping) return;
+    if (!isCurrent(projectId, inst)) return;
     try {
       const allowedUpdates = encodeURIComponent(JSON.stringify(["message"]));
       const url = `https://api.telegram.org/bot${botToken}/getUpdates?offset=${offset}&timeout=10&allowed_updates=${allowedUpdates}`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      const res = await bridgeFetch(inst, url, {}, 30000);
+      if (!isCurrent(projectId, inst)) return;
       if (!res.ok) throw new Error(`Telegram getUpdates ${res.status}`);
-      const data = await res.json();
+      const data = await track(inst, res.json());
+      if (!isCurrent(projectId, inst)) return;
       retryDelay = 500;
       if (data.ok && data.result) {
         for (const update of data.result) {
+          if (!isCurrent(projectId, inst)) return;
           offset = update.update_id + 1;
           writeOffset(projectId, offset);
           const text = update.message?.text;
@@ -133,7 +175,8 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
           if (!text || msgChatId !== String(chatId)) continue;
 
           try {
-            const r = await fetch(`http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
+            if (!isCurrent(projectId, inst)) return;
+            const r = await bridgeFetch(inst, `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -144,8 +187,8 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
                 text,
                 channel: "general",
               }),
-              signal: AbortSignal.timeout(5000),
-            });
+            }, 5000);
+            if (!isCurrent(projectId, inst)) return;
             if (!r.ok) {
               console.error(`[bridge] telegram ${projectId} inbound POST failed: ${r.status}`);
             }
@@ -155,13 +198,13 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
         }
       }
     } catch (err) {
-      if (!inst.stopping) {
+      if (isCurrent(projectId, inst)) {
         inst.lastError = err.message;
         retryDelay = Math.min(retryDelay * 2, 30000);
       }
     }
 
-    if (!inst.stopping) {
+    if (isCurrent(projectId, inst)) {
       inst.updateTimer = setTimeout(tick, retryDelay);
     }
   }
@@ -186,6 +229,8 @@ async function start(projectId, botToken, chatId, qwPort) {
     stopping: false,
     lastError: null,
     startedAt: Date.now(),
+    controllers: new Set(),
+    inFlight: new Set(),
   };
   instances.set(projectId, inst);
 
@@ -197,12 +242,14 @@ async function start(projectId, botToken, chatId, qwPort) {
   // mid-conversation) keep continuity.
   const cursorFileExists = fs.existsSync(cursorPath(projectId));
   try {
-    const r = await fetch(
+    const r = await bridgeFetch(inst,
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&limit=1`,
-      { signal: AbortSignal.timeout(5000) }
+      {}, 5000,
     );
+    if (!isCurrent(projectId, inst)) return;
     if (r.ok) {
-      const msgs = await r.json();
+      const msgs = await track(inst, r.json());
+      if (!isCurrent(projectId, inst)) return;
       if (msgs.length > 0) {
         const latestId = msgs[msgs.length - 1].id;
         const stale = !cursorFileExists
@@ -219,13 +266,19 @@ async function start(projectId, botToken, chatId, qwPort) {
       console.warn(`[bridge] telegram ${projectId}: cursor seed fetch returned ${r.status}`);
     }
   } catch (err) {
-    console.warn(`[bridge] telegram ${projectId}: cursor seed failed (${err.message})`);
+    if (isCurrent(projectId, inst)) console.warn(`[bridge] telegram ${projectId}: cursor seed failed (${err.message})`);
   }
+
+  // Archive can stop the instance while cursor seeding awaits. A stale start
+  // must not recreate polling/update owners after cleanup has completed.
+  if (inst.stopping || instances.get(projectId) !== inst) return;
 
   pollLoop(projectId, botToken, chatId, qwPort).catch((err) => {
     console.error(`[bridge] telegram ${projectId} poll crashed: ${err.message}`);
     inst.lastError = err.message;
-    stop(projectId);
+    void stop(projectId).catch((stopErr) => {
+      console.error(`[bridge] telegram ${projectId} stop failed: ${stopErr.message}`);
+    });
   });
 
   startTelegramUpdates(projectId, botToken, chatId, qwPort).catch((err) => {
@@ -236,14 +289,54 @@ async function start(projectId, botToken, chatId, qwPort) {
   console.log(`[bridge] telegram ${projectId}: started`);
 }
 
-function stop(projectId) {
+async function stop(projectId) {
   const inst = instances.get(projectId);
-  if (!inst) return;
+  if (!inst) {
+    return {
+      ok: true,
+      resources: { telegram_bridges: 0, bridge_timers: 0 },
+      cleanup_errors: [],
+    };
+  }
   inst.stopping = true;
-  if (inst.timer) clearTimeout(inst.timer);
-  if (inst.updateTimer) clearTimeout(inst.updateTimer);
-  instances.delete(projectId);
-  console.log(`[bridge] telegram ${projectId}: stopped`);
+  for (const controller of inst.controllers || []) {
+    try { controller.abort(); } catch {}
+  }
+  let timers = 0;
+  const cleanupErrors = [];
+  for (const field of ["timer", "updateTimer"]) {
+    if (!inst[field]) continue;
+    try {
+      clearTimeout(inst[field]);
+      inst[field] = null;
+      timers += 1;
+    } catch (err) {
+      cleanupErrors.push({
+        resource: "telegram_bridge",
+        code: "timer_stop_failed",
+        message: err?.message || "Telegram bridge timer stop failed",
+      });
+    }
+  }
+  if (!(await settleInFlight(inst, inst.stopTimeoutMs || 5000))) {
+    cleanupErrors.push({
+      resource: "telegram_bridge",
+      code: "inflight_stop_timeout",
+      message: "Telegram bridge in-flight work did not settle",
+    });
+  }
+  if (cleanupErrors.length === 0) {
+    if (instances.get(projectId) === inst) instances.delete(projectId);
+    console.log(`[bridge] telegram ${projectId}: stopped`);
+  }
+  return {
+    ok: cleanupErrors.length === 0,
+    resources: {
+      telegram_bridges: cleanupErrors.length === 0 ? 1 : 0,
+      bridge_timers: timers,
+    },
+    cleanup_errors: cleanupErrors,
+  };
 }
 
 function isRunning(projectId) {
@@ -251,8 +344,8 @@ function isRunning(projectId) {
 }
 
 // #972: stop every running instance (used on server shutdown).
-function stopAll() {
-  for (const projectId of [...instances.keys()]) stop(projectId);
+async function stopAll() {
+  return Promise.all([...instances.keys()].map((projectId) => stop(projectId)));
 }
 
 function getLastError(projectId) {
@@ -260,4 +353,4 @@ function getLastError(projectId) {
   return inst?.lastError || null;
 }
 
-module.exports = { start, stop, stopAll, isRunning, getLastError, readCursor };
+module.exports = { start, stop, stopAll, isRunning, getLastError, readCursor, _instances: instances, _pollLoop: pollLoop };
