@@ -17,6 +17,7 @@ const DEFAULT_STALE_HOURS = 72;
 const GENERATION_PREFIX = "generation-";
 const GENERATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const GENERATION_QUARANTINE_RE = /^\.quadwork-generation-quarantine-([A-Za-z0-9][A-Za-z0-9._-]{0,127})-([a-f0-9]{32})$/;
+const LEGACY_QUARANTINE_NAME_RE = /^(?:\.quadwork-legacy-quarantine-[a-f0-9]{32}|gemini-client-error-quadwork-quarantine-(?:nouid|\d+)-[a-f0-9]{32}\.json)$/;
 const FACT_STATE = new WeakMap();
 
 class ResourceTempError extends Error {
@@ -460,6 +461,22 @@ function detachGeneration(handle, generationId) {
 
 // Legacy cleanup compatibility. V2 generation lifecycle never calls this
 // pathname helper; it is descriptor-anchored by detachGeneration above.
+function validateLegacyQuarantineName(name) {
+  if (typeof name !== "string"
+    || name.length === 0
+    || name.includes("\0")
+    || name.includes("/")
+    || name.includes("\\")
+    || name === "."
+    || name === ".."
+    || path.isAbsolute(name)
+    || path.basename(name) !== name
+    || !LEGACY_QUARANTINE_NAME_RE.test(name)) {
+    throw new ResourceTempError("invalid_quarantine_name", "cleanup quarantine name is not supported");
+  }
+  return name;
+}
+
 function removeConfinedPath(root, target, fsImpl = fs, quarantineName = null) {
   if (!path.isAbsolute(root) || !path.isAbsolute(target) || !isWithin(root, target)) {
     throw new ResourceTempError("cleanup_outside_root", "cleanup target is outside the configured root");
@@ -468,11 +485,17 @@ function removeConfinedPath(root, target, fsImpl = fs, quarantineName = null) {
   if (quarantineDir !== root && !isWithin(root, quarantineDir)) {
     throw new ResourceTempError("cleanup_outside_root", "cleanup quarantine is outside the configured root");
   }
-  let quarantine = quarantineName ? path.join(quarantineDir, quarantineName) : null;
+  const explicitName = quarantineName === null ? null : validateLegacyQuarantineName(quarantineName);
+  const resolvedRoot = path.resolve(root);
+  const resolvedQuarantineDir = path.resolve(quarantineDir);
+  let quarantine = null;
   let renamed = false;
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    if (!quarantineName) {
-      quarantine = path.join(quarantineDir, `.quadwork-legacy-quarantine-${crypto.randomBytes(16).toString("hex")}`);
+    const candidateName = explicitName
+      || validateLegacyQuarantineName(`.quadwork-legacy-quarantine-${crypto.randomBytes(16).toString("hex")}`);
+    quarantine = path.resolve(resolvedQuarantineDir, candidateName);
+    if (path.dirname(quarantine) !== resolvedQuarantineDir || !isWithin(resolvedRoot, quarantine)) {
+      throw new ResourceTempError("cleanup_outside_root", "cleanup quarantine is outside the configured root");
     }
     try {
       fsImpl.renameSync(target, quarantine);
@@ -480,7 +503,7 @@ function removeConfinedPath(root, target, fsImpl = fs, quarantineName = null) {
       break;
     } catch (err) {
       if (err && err.code === "ENOENT") return false;
-      if (err && ["EEXIST", "ENOTEMPTY"].includes(err.code)) continue;
+      if (err && ["EEXIST", "ENOTEMPTY"].includes(err.code) && explicitName === null) continue;
       throw err;
     }
   }

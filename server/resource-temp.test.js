@@ -11,6 +11,7 @@ const {
   createGenerationTemp,
   reclaimGenerationTemp,
   sweepStaleGenerationTemps,
+  removeConfinedPath,
 } = require("./resource-temp");
 
 const HOUR = 60 * 60 * 1000;
@@ -54,6 +55,55 @@ function fixture(options = {}) {
 function stamp(target, hoursOld) {
   const time = new Date(NOW - hoursOld * HOUR);
   fs.utimesSync(target, time, time);
+}
+
+// Explicit legacy quarantine names are authority-bearing cleanup paths. Reject
+// every non-basename or unsupported grammar before rename/rm can mutate either
+// the original entry or an outside victim. Generated names use the same guard.
+{
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-temp-quarantine-name-"));
+  const root = path.join(base, "owned-root");
+  const original = path.join(root, "owned-entry");
+  const outside = path.join(base, "outside-victim");
+  fs.mkdirSync(root);
+  fs.writeFileSync(original, "owned");
+  fs.writeFileSync(outside, "outside");
+
+  for (const invalidName of [
+    "../outside-victim",
+    path.join(base, "absolute-victim"),
+    "nested/quarantine",
+    "nested\\quarantine",
+    ".",
+    "..",
+    "quarantine\0name",
+  ]) {
+    assert.throws(
+      () => removeConfinedPath(root, original, fs, invalidName),
+      (err) => err.code === "invalid_quarantine_name",
+      `invalid quarantine rejected: ${JSON.stringify(invalidName)}`,
+    );
+    assert.equal(fs.readFileSync(original, "utf8"), "owned", "invalid name leaves the original entry untouched");
+    assert.equal(fs.readFileSync(outside, "utf8"), "outside", "invalid name leaves the outside victim untouched");
+  }
+
+  const gemini = "gemini-client-error-quadwork-quarantine-1234-0123456789abcdef0123456789abcdef.json";
+  assert.equal(removeConfinedPath(root, original, fs, gemini), true, "supported internal Gemini quarantine is accepted");
+  assert.ok(!fs.existsSync(original));
+
+  const generatedSource = path.join(root, "generated-source");
+  fs.writeFileSync(generatedSource, "owned");
+  let generatedDestination = null;
+  const observingFs = Object.create(fs);
+  observingFs.renameSync = (from, to) => {
+    generatedDestination = to;
+    return fs.renameSync(from, to);
+  };
+  assert.equal(removeConfinedPath(root, generatedSource, observingFs), true);
+  assert.equal(path.dirname(generatedDestination), root, "generated quarantine stays in the target directory");
+  assert.match(path.basename(generatedDestination), /^\.quadwork-legacy-quarantine-[a-f0-9]{32}$/);
+  assert.equal(fs.readFileSync(outside, "utf8"), "outside");
+  fs.rmSync(base, { recursive: true, force: true });
 }
 
 // Read-only facts fail closed for absence, tmpfs, and low capacity.
