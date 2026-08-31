@@ -29,6 +29,8 @@ const {
   serializeProjectCompatibility,
   validateV2Configuration,
   migrateConfigurationToV2,
+  reserveV2ProjectOwnership,
+  releaseV2ProjectOwnership,
   commitV2Configuration,
   writeConfig,
   readConfig,
@@ -73,6 +75,54 @@ function activated(projects) {
 
 function diskBytes() {
   return fs.readFileSync(CONFIG_PATH, "utf8");
+}
+
+// An in-flight unarchive reservation participates in the same authority as
+// every generic V2 commit. A competing activation or identity rewrite fails
+// before it can publish, while the opaque reservation can publish only its own
+// final archived=false transition.
+{
+  const sharedPath = repoDir("reserved-shared");
+  const alternatePath = repoDir("reserved-alternate");
+  writeConfig(activated([
+    project("reserved-a", [repository("primary", "Acme/Reserved", sharedPath)], { archived: true }),
+    project("reserved-b", [repository("primary", "Acme/Reserved", sharedPath)], { archived: true }),
+  ]));
+  const reservation = reserveV2ProjectOwnership("reserved-a", readConfig());
+  try {
+    const before = diskBytes();
+    expectCode(
+      () => commitV2Configuration((cfg) => { cfg.projects[1].archived = false; }),
+      "repository_owned_by_active_project",
+      "generic commit cannot activate an owner that collides with an in-flight unarchive",
+    );
+    assert.equal(diskBytes(), before);
+
+    expectCode(
+      () => commitV2Configuration((cfg) => {
+        cfg.projects[0].repositories[0].repo = "Acme/Alternate";
+        cfg.projects[0].repositories[0].working_dir = alternatePath;
+      }),
+      "project_ownership_reserved",
+      "generic commit cannot rewrite an in-flight reservation identity",
+    );
+    assert.equal(diskBytes(), before);
+
+    expectCode(
+      () => commitV2Configuration((cfg) => { cfg.projects[0].archived = false; }),
+      "project_ownership_reserved",
+      "generic commit cannot publish a reserved activation without its token",
+    );
+    assert.equal(diskBytes(), before);
+
+    commitV2Configuration(
+      (cfg) => { cfg.projects[0].archived = false; },
+      { ownershipReservation: reservation },
+    );
+    ok(readConfig().projects[0].archived === false, "reservation token publishes only the validated activation");
+  } finally {
+    releaseV2ProjectOwnership(reservation);
+  }
 }
 
 // An explicit fresh-install activation does not need an eager default write:

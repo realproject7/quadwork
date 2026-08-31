@@ -2,11 +2,12 @@ const {
   readConfig,
   commitV2Configuration,
   validateV2Configuration,
+  reserveV2ProjectOwnership,
+  releaseV2ProjectOwnership,
 } = require("./config");
 
 const admissionGenerations = new Map();
 const projectLifecycleLocks = new Map();
-const unarchiveOwnershipReservations = new Map();
 
 class ProjectLifecycleError extends Error {
   constructor(code, projectId, message, status = 409) {
@@ -38,7 +39,6 @@ function unarchiveCandidate(
   projectId,
   config,
   validateConfiguration = validateV2Configuration,
-  reservations = unarchiveOwnershipReservations,
 ) {
   requireProjectId(projectId);
   const project = projectFromConfig(config, projectId);
@@ -53,11 +53,7 @@ function unarchiveCandidate(
   // barrier and the stopped-resource set byte-for-byte unchanged.
   const candidate = {
     ...config,
-    projects: config.projects.map((entry) => {
-      if (entry === project) return { ...entry, archived: false };
-      const reserved = entry?.id && reservations.get(entry.id);
-      return reserved ? { ...reserved, archived: false } : entry;
-    }),
+    projects: config.projects.map((entry) => entry === project ? { ...entry, archived: false } : entry),
   };
   validateConfiguration(candidate, { previousConfig: config });
   return { already_unarchived: false };
@@ -66,19 +62,15 @@ function unarchiveCandidate(
 function reserveUnarchiveOwnership(projectId, config, validateConfiguration) {
   const state = unarchiveCandidate(projectId, config, validateConfiguration);
   if (state.already_unarchived) return { ...state, reservation: null };
-  const project = projectFromConfig(config, projectId);
-  const reservation = Object.freeze({ ...project, archived: false });
-  // Acquisition is synchronous. Node cannot interleave another reservation
-  // between validation and this set, while the validation candidate already
-  // contains every earlier reservation as an active owner.
-  unarchiveOwnershipReservations.set(projectId, reservation);
+  const reservation = reserveV2ProjectOwnership(projectId, config, {
+    validateV2Configuration: validateConfiguration,
+  });
   return { ...state, reservation };
 }
 
 function releaseUnarchiveOwnership(projectId, reservation) {
-  if (reservation && unarchiveOwnershipReservations.get(projectId) === reservation) {
-    unarchiveOwnershipReservations.delete(projectId);
-  }
+  void projectId;
+  releaseV2ProjectOwnership(reservation);
 }
 
 function admissionState(projectId, config, options = {}) {
@@ -250,7 +242,7 @@ function createProjectLifecycleController(options = {}) {
     return run;
   }
 
-  async function commitArchived(projectId, archived) {
+  async function commitArchived(projectId, archived, ownershipReservation = null) {
     let previousArchived = null;
     await commitConfiguration((config) => {
       const project = projectFromConfig(config, projectId);
@@ -259,7 +251,7 @@ function createProjectLifecycleController(options = {}) {
       }
       previousArchived = project.archived === true;
       project.archived = archived;
-    });
+    }, ownershipReservation ? { ownershipReservation } : undefined);
     return previousArchived;
   }
 
@@ -338,7 +330,7 @@ function createProjectLifecycleController(options = {}) {
           };
         }
 
-        await commitArchived(projectId, false);
+        await commitArchived(projectId, false, preflight.reservation);
         return {
           ok: true,
           project_id: projectId,

@@ -16,6 +16,11 @@ const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const GITHUB_REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const INSTALLATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const LEGACY_PRIMARY_REPOSITORY_KEY = "primary";
+// Process-wide authority for projects that have passed unarchive ownership
+// validation but are still proving that their archived runtime is quiescent.
+// Every V2 config commit consults this map, so no other mutation path can make
+// a colliding project active or change the reserved identity mid-cleanup.
+const v2OwnershipReservations = new Map();
 
 class ConfigurationValidationError extends Error {
   constructor(code, field, message, ownerProjectId) {
@@ -525,6 +530,89 @@ function migrateConfigurationToV2(config) {
   return { ...cloned, projects };
 }
 
+function reservationProject(config, projectId) {
+  return Array.isArray(config?.projects)
+    ? config.projects.find((project) => project && project.id === projectId) || null
+    : null;
+}
+
+function repositoryOwnershipSignature(project) {
+  return JSON.stringify(normalizeProjectRepositories(project));
+}
+
+function reservationError(projectId, message = "project repository ownership is reserved") {
+  return validationError(
+    "project_ownership_reserved",
+    "projects",
+    message,
+    projectId,
+  );
+}
+
+function assertReservationIdentity(candidate, reservation) {
+  const project = reservationProject(candidate, reservation.project_id);
+  if (!project) {
+    throw reservationError(reservation.project_id, "reserved project cannot be removed");
+  }
+  if (repositoryOwnershipSignature(project) !== reservation.ownership_signature) {
+    throw reservationError(reservation.project_id, "reserved project ownership cannot be changed");
+  }
+  return project;
+}
+
+function candidateWithReservedOwnership(candidate) {
+  const projected = cloneConfigurationValue(candidate);
+  for (const reservation of v2OwnershipReservations.values()) {
+    const project = assertReservationIdentity(projected, reservation);
+    project.archived = false;
+  }
+  return projected;
+}
+
+/**
+ * Synchronously reserve the active repository/path identity for an unarchive.
+ * The returned opaque token is the only authority allowed to publish that
+ * project's archived=false transition while cleanup is in flight.
+ */
+function reserveV2ProjectOwnership(projectId, config, options = {}) {
+  if (typeof projectId !== "string" || !projectId) {
+    throw reservationError(projectId, "project id is required for ownership reservation");
+  }
+  if (v2OwnershipReservations.has(projectId)) {
+    throw reservationError(projectId, "project ownership is already reserved");
+  }
+  const project = reservationProject(config, projectId);
+  if (!project) throw reservationError(projectId, "project is not configured");
+
+  const reservation = Object.freeze({
+    project_id: projectId,
+    ownership_signature: repositoryOwnershipSignature(project),
+  });
+  const projected = cloneConfigurationValue(config);
+  const target = reservationProject(projected, projectId);
+  target.archived = false;
+  for (const existing of v2OwnershipReservations.values()) {
+    assertReservationIdentity(projected, existing).archived = false;
+  }
+
+  const validate = options.validateV2Configuration || validateV2Configuration;
+  validate(projected, {
+    previousConfig: config,
+    fsImpl: options.fsImpl || fs,
+  });
+  // Validation and publication are synchronous, so no competing reservation
+  // or config commit can interleave between them in this Node process.
+  v2OwnershipReservations.set(projectId, reservation);
+  return reservation;
+}
+
+function releaseV2ProjectOwnership(reservation) {
+  if (!reservation || typeof reservation.project_id !== "string") return;
+  if (v2OwnershipReservations.get(reservation.project_id) === reservation) {
+    v2OwnershipReservations.delete(reservation.project_id);
+  }
+}
+
 // Reserved sender names that the operator must NOT be able to claim.
 const RESERVED_OPERATOR_NAMES = new Set([
   "head",
@@ -791,7 +879,17 @@ function commitV2Configuration(mutator = () => {}, options = {}) {
     const candidate = hadInstallationId
       ? cloneConfigurationValue(cfg)
       : migrateConfigurationToV2(cfg);
-    validateV2Configuration(candidate, {
+    const authorizedReservation = options.ownershipReservation;
+    for (const reservation of v2OwnershipReservations.values()) {
+      const project = assertReservationIdentity(candidate, reservation);
+      if (project.archived !== true && authorizedReservation !== reservation) {
+        throw reservationError(
+          reservation.project_id,
+          "reserved project cannot be activated before cleanup completes",
+        );
+      }
+    }
+    validateV2Configuration(candidateWithReservedOwnership(candidate), {
       previousConfig,
       fsImpl: options.fsImpl || fs,
     });
@@ -823,5 +921,7 @@ module.exports = {
   workingDirIdentity,
   validateV2Configuration,
   migrateConfigurationToV2,
+  reserveV2ProjectOwnership,
+  releaseV2ProjectOwnership,
   commitV2Configuration,
 };
