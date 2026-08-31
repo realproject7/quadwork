@@ -16,6 +16,7 @@ const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
+const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
 
 const net = require("net");
 const crypto = require("crypto");
@@ -72,6 +73,7 @@ function emitSystemMessage(projectId, text) {
 }
 
 const app = express();
+const resourceRuntimeOwner = createResourceRuntimeOwner();
 // #412 / quadwork#279: bump the global JSON body limit to 10mb so
 // POST /api/project-history can accept full chat exports. The
 // default ~100kb 413'd long before the route-local parser had a
@@ -79,6 +81,7 @@ const app = express();
 // All other routes are well within 10mb in practice; this is the
 // least invasive fix and matches the documented import ceiling.
 app.use(express.json({ limit: "10mb" }));
+resourceRuntimeOwner.register(app);
 
 // --- Mount migrated API routes (from Next.js) ---
 app.use(routes);
