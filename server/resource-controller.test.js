@@ -15,6 +15,7 @@ const {
   buildControlClassConfiguration,
   buildControlScopeInvocation,
   validateUnitName,
+  getResourceRejectionMetadata,
 } = require("./resource-controller");
 
 let passed = 0;
@@ -285,6 +286,22 @@ async function main() {
   assert.equal(invalidTerminalOom.cgroup_oom_observation.oom_kill_count, "1");
   ok(true, "valid OOM evidence cannot override invalid terminal metadata");
 
+  for (const [index, count] of [0, 1].entries()) {
+    const contradictoryController = new ResourceController({
+      executeProcess: async () => ({ code: 143, signal: "SIGTERM" }),
+      queryScope: async () => observation(count),
+    });
+    const contradictory = await contradictoryController.runWorkerScope(workerSpec({
+      generationId: `contradictory-${index}`,
+      unitName: `qw-worker-contradictory-${index}`,
+    }));
+    assert.equal(contradictory.fact.reason, "unknown");
+    assert.equal(contradictory.fact.exit_code, 143);
+    assert.equal(contradictory.fact.signal, "SIGTERM");
+    assert.equal(contradictoryController.snapshot().terminal_facts[0].reason, "unknown");
+  }
+  ok(true, "contradictory code and signal facts stay unknown across the controller-to-state boundary");
+
   const unknownController = new ResourceController({
     executeProcess: async () => ({ code: 17, signal: null }),
     queryScope: async () => { throw new Error("private host path /secret"); },
@@ -307,8 +324,9 @@ async function main() {
   } catch (error) {
     errorExitZero = error;
   }
-  ok(errorExitZero === originalZeroError && errorExitZero.resourceFact?.reason === "unknown" &&
-     errorExitZero.resourceFact.exit_code === 0,
+  const zeroErrorMetadata = getResourceRejectionMetadata(errorExitZero);
+  ok(errorExitZero === originalZeroError && zeroErrorMetadata?.resourceFact.reason === "unknown" &&
+     zeroErrorMetadata.resourceFact.exit_code === 0,
     "an Error rejection preserves the original Error and remains unknown at exitCode=0");
 
   const rejectedSecret = "REJECTED-VALUE-MUST-NOT-LEAK";
@@ -335,7 +353,7 @@ async function main() {
     assert.equal(rejection.name, "ResourceExecutionError");
     assert.equal(rejection.code, "QW_RESOURCE_EXECUTION_REJECTED");
     assert.equal(rejection.message, "resource process execution rejected with a non-Error value");
-    assert.equal(rejection.resourceFact?.reason, "unknown");
+    assert.equal(getResourceRejectionMetadata(rejection)?.resourceFact.reason, "unknown");
     assert.equal(nonErrorController.snapshot().active_scopes.length, 0);
     assert.equal(nonErrorController.snapshot().control_children.active, 0);
     assert.ok(!JSON.stringify(nonErrorController.snapshot()).includes(rejectedSecret));
@@ -534,7 +552,7 @@ async function main() {
   } catch (error) {
     rawErrorFlag = error;
   }
-  ok(rawErrorFlag?.resourceFact?.reason === "unknown" &&
+  ok(getResourceRejectionMetadata(rawErrorFlag)?.resourceFact.reason === "unknown" &&
      rawErrorFlagController.snapshot().control_children.active === 0,
     "a raw executor-error OOM flag remains unknown and releases its permit");
 
@@ -572,10 +590,11 @@ async function main() {
     preservedHostileError = error;
   }
   assert.equal(preservedHostileError, hostileTerminalError);
-  assert.equal(preservedHostileError.resourceFact.reason, "unknown");
-  assert.equal(preservedHostileError.resourceFact.exit_code, null);
-  assert.equal(preservedHostileError.resourceFact.signal, null);
-  assert.equal(preservedHostileError.cgroup_oom_observation.oom_kill_count, "1");
+  const hostileTerminalMetadata = getResourceRejectionMetadata(preservedHostileError);
+  assert.equal(hostileTerminalMetadata.resourceFact.reason, "unknown");
+  assert.equal(hostileTerminalMetadata.resourceFact.exit_code, null);
+  assert.equal(hostileTerminalMetadata.resourceFact.signal, null);
+  assert.equal(hostileTerminalMetadata.cgroup_oom_observation.oom_kill_count, "1");
   assert.ok(!JSON.stringify(hostileTerminalErrorController.snapshot()).includes(terminalGetterSecret));
   ok(true, "hostile success/Error terminal getters normalize to null without replacing or leaking the original Error");
 
@@ -596,11 +615,72 @@ async function main() {
     rejectedOom = error;
   }
   assert.equal(rejectedOom, rejectedOomError);
-  assert.equal(rejectedOom.resourceFact.reason, "oom_kill");
-  assert.equal(rejectedOom.cgroup_oom_observation.oom_kill_count, "18446744073709551615");
-  assert.deepEqual(rejectedOomController.snapshot().last_cgroup_oom, rejectedOom.cgroup_oom_observation);
+  const rejectedOomMetadata = getResourceRejectionMetadata(rejectedOom);
+  assert.equal(rejectedOomMetadata.resourceFact.reason, "oom_kill");
+  assert.equal(rejectedOomMetadata.cgroup_oom_observation.oom_kill_count, "18446744073709551615");
+  assert.deepEqual(rejectedOomController.snapshot().last_cgroup_oom,
+    rejectedOomMetadata.cgroup_oom_observation);
   assert.ok(!JSON.stringify(rejectedOomController.snapshot()).includes("PRIVATE-EXECUTOR-FAILURE"));
   ok(true, "a rejected execution carries validated durable provenance without leaking its error text");
+
+  let metadataSetterCalls = 0;
+  let metadataProxySetCalls = 0;
+  let metadataProxyDefineCalls = 0;
+  const frozenError = new Error("frozen executor failure");
+  frozenError.exitCode = 9;
+  frozenError.signal = null;
+  Object.freeze(frozenError);
+  const nonExtensibleError = new Error("non-extensible executor failure");
+  nonExtensibleError.exitCode = null;
+  nonExtensibleError.signal = "SIGTERM";
+  Object.preventExtensions(nonExtensibleError);
+  const setterError = new Error("setter executor failure");
+  setterError.exitCode = 8;
+  setterError.signal = null;
+  Object.defineProperties(setterError, {
+    resourceFact: { set() { metadataSetterCalls += 1; throw new Error("setter must not run"); } },
+    cgroup_oom_observation: { set() { metadataSetterCalls += 1; throw new Error("setter must not run"); } },
+  });
+  const proxyTargetError = new Error("proxy executor failure");
+  proxyTargetError.exitCode = null;
+  proxyTargetError.signal = "SIGTERM";
+  const proxyError = new Proxy(proxyTargetError, {
+    set() {
+      metadataProxySetCalls += 1;
+      throw new Error("proxy set trap must not run");
+    },
+    defineProperty() {
+      metadataProxyDefineCalls += 1;
+      throw new Error("proxy define trap must not run");
+    },
+  });
+  const hardenedErrors = [frozenError, nonExtensibleError, setterError, proxyError];
+  let hardenedErrorIndex = 0;
+  const hardenedErrorController = new ResourceController({
+    maxControlChildren: 1,
+    executeProcess: async () => { throw hardenedErrors[hardenedErrorIndex++]; },
+    queryScope: noOom,
+  });
+  for (const [index, expectedError] of hardenedErrors.entries()) {
+    let actualError;
+    try {
+      await hardenedErrorController.runControlChild(controlSpec(`metadata-${index}`));
+    } catch (error) {
+      actualError = error;
+    }
+    assert.equal(actualError, expectedError);
+    const metadata = getResourceRejectionMetadata(actualError);
+    assert.ok(metadata && Object.isFrozen(metadata) && Object.isFrozen(metadata.resourceFact));
+    assert.equal(metadata.resourceFact.reason,
+      expectedError.signal === "SIGTERM" ? "signal" : "unknown");
+    assert.equal(hardenedErrorController.snapshot().active_scopes.length, 0);
+    assert.equal(hardenedErrorController.snapshot().control_children.active, 0);
+  }
+  assert.equal(metadataSetterCalls, 0);
+  assert.equal(metadataProxySetCalls, 0);
+  assert.equal(metadataProxyDefineCalls, 0);
+  assert.equal(getResourceRejectionMetadata({}), null);
+  ok(true, "frozen, non-extensible, setter-backed, and proxied Errors retain identity and release state without mutation");
 
   const throwingCounterController = new ResourceController({
     executeProcess: async () => ({ code: 0, signal: null }),
@@ -645,12 +725,79 @@ async function main() {
   } catch (error) {
     hostileErrorResult = error;
   }
-  ok(hostileErrorResult?.resourceFact?.reason === "unknown" &&
+  ok(getResourceRejectionMetadata(hostileErrorResult)?.resourceFact.reason === "unknown" &&
      hostileErrorController.snapshot().active_scopes.length === 0 &&
      hostileErrorController.snapshot().control_children.active === 0,
     "a hostile error observation getter preserves the original failure and releases state and permit");
 
   const timestampSecret = "TIMESTAMP-TOSTRING-MUST-NOT-RUN";
+  for (const [index, invalidCalendarTime] of [
+    "2026-02-29T00:00:00Z",
+    "2024-02-30T00:00:00Z",
+    "2026-00-01T00:00:00Z",
+    "2026-13-01T00:00:00Z",
+    "2026-01-00T00:00:00Z",
+    "2026-01-32T00:00:00Z",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T00:60:00Z",
+    "2026-01-01T00:00:60Z",
+    "2026-01-01T00:00:00+01:60",
+    "2026-01-01T00:00:00+24:00",
+  ].entries()) {
+    let executeCalls = 0;
+    const invalidCalendarController = new ResourceController({
+      executeProcess: async () => { executeCalls += 1; return { code: 0, signal: null }; },
+      queryScope: noOom,
+      now: () => invalidCalendarTime,
+    });
+    await assert.rejects(
+      invalidCalendarController.runWorkerScope(workerSpec({
+        generationId: `invalid-calendar-${index}`,
+        unitName: `qw-worker-invalid-calendar-${index}`,
+      })),
+      (error) => error?.code === "QW_INVALID_RESOURCE_TIMESTAMP" && error?.field === "started_at",
+    );
+    assert.equal(executeCalls, 0);
+    assert.equal(invalidCalendarController.snapshot().active_scopes.length, 0);
+  }
+  const leapCalendarController = new ResourceController({
+    executeProcess: async () => ({ code: 0, signal: null }),
+    queryScope: noOom,
+    now: () => "2024-02-29T23:59:59.123Z",
+  });
+  const leapCalendar = await leapCalendarController.runWorkerScope(workerSpec());
+  assert.equal(leapCalendar.fact.finished_at, "2024-02-29T23:59:59.123Z");
+  let impossibleFinishClockCalls = 0;
+  const impossibleFinishController = new ResourceController({
+    executeProcess: async () => ({ code: 0, signal: null }),
+    queryScope: noOom,
+    now: () => ++impossibleFinishClockCalls === 1
+      ? "2024-02-29T23:59:59Z"
+      : "2024-02-30T00:00:00Z",
+  });
+  await assert.rejects(
+    impossibleFinishController.runControlChild(controlSpec("impossible-finish")),
+    (error) => error?.code === "QW_INVALID_RESOURCE_TIMESTAMP" && error?.field === "finished_at",
+  );
+  assert.equal(impossibleFinishController.snapshot().active_scopes.length, 0);
+  assert.equal(impossibleFinishController.snapshot().control_children.active, 0);
+  assert.equal(impossibleFinishController.snapshot().terminal_facts.length, 0);
+  const invalidObservationCalendarController = new ResourceController({
+    executeProcess: async () => ({
+      code: null,
+      signal: "SIGKILL",
+      scopeObservation: observation(7, {
+        capturedBeforeCollect: true,
+        observedAt: "2024-02-30T00:00:00Z",
+      }),
+    }),
+    queryScope: noOom,
+  });
+  const invalidObservationCalendar = await invalidObservationCalendarController.runWorkerScope(workerSpec());
+  assert.equal(invalidObservationCalendar.fact.reason, "signal");
+  assert.equal(invalidObservationCalendar.cgroup_oom_observation.oom_kill_count, "0");
+  ok(true, "impossible ISO calendar dates fail closed while valid leap-day timestamps remain canonical");
+
   const nonIsoStartController = new ResourceController({
     executeProcess: async () => ({ code: 0, signal: null }),
     queryScope: noOom,

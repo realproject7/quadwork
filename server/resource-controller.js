@@ -23,10 +23,11 @@ const UNIT_NAME_RE = /^[a-z][a-z0-9-]{0,62}$/;
 const CONTROL_CLASS_NAME_RE = /^[a-z][a-z0-9-]{0,62}\.slice$/;
 const QUALIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SIGNAL_RE = /^SIG[A-Z0-9]{1,30}$/;
-const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 const DEFAULT_CONTROL_CLASS_NAME = "quadwork-control.slice";
 const MAX_OOM_KILL_COUNT = (1n << 64n) - 1n;
 const UNREADABLE = Symbol("unreadable resource process field");
+const REJECTION_METADATA = new WeakMap();
 
 function invalid(field, detail) {
   const error = new Error(`${field} ${detail}`);
@@ -309,7 +310,23 @@ function normalizeObservedAt(value) {
     let millis;
     if (value instanceof Date) millis = value.getTime();
     else if (Number.isSafeInteger(value)) millis = value;
-    else if (typeof value === "string" && value.length <= 64 && ISO_TIMESTAMP_RE.test(value)) {
+    else if (typeof value === "string" && value.length <= 64) {
+      const match = ISO_TIMESTAMP_RE.exec(value);
+      if (match === null) return null;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const hour = Number(match[4]);
+      const minute = Number(match[5]);
+      const second = Number(match[6]);
+      const offsetHour = match[8] === "Z" ? 0 : Number(match[10]);
+      const offsetMinute = match[8] === "Z" ? 0 : Number(match[11]);
+      const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+      const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1] ||
+          hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) {
+        return null;
+      }
       millis = Date.parse(value);
     }
     else return null;
@@ -357,6 +374,10 @@ function qualifyScopeObservation(ids, resourceClass, scopeObservation) {
 function terminalReason(processResult, scopeObservation, executionRejected = false) {
   const count = scopeObservation && scopeObservation.oomKillCount;
   if (!processResult.exitCode.valid || !processResult.signal.valid) return "unknown";
+  // A process cannot authoritatively terminate from both an exit status and a
+  // signal. Retain the normalized pair as evidence, but make the reason
+  // state-compatible and fail closed before considering OOM provenance.
+  if (processResult.exitCode.value !== null && processResult.signal.value !== null) return "unknown";
   if (typeof count === "string" && BigInt(count) > 0n) return "oom_kill";
   if (processResult.signal.value !== null) return "signal";
   if (!executionRejected && processResult.exitCode.value === 0) return "normal_exit";
@@ -397,6 +418,25 @@ function executionRejectionError(value, valueIsError) {
   error.name = "ResourceExecutionError";
   error.code = "QW_RESOURCE_EXECUTION_REJECTED";
   return error;
+}
+
+function rememberResourceRejection(error, fact, oomProvenance) {
+  const metadata = Object.freeze({
+    resourceFact: Object.freeze({ ...fact }),
+    cgroup_oom_observation: oomProvenance === null
+      ? null
+      : Object.freeze({ ...oomProvenance }),
+  });
+  // Never write controller metadata onto an executor-owned Error. Assignment
+  // can invoke inherited setters or Proxy traps, and fails for frozen or
+  // non-extensible errors. WeakMap preserves the exact rejection identity
+  // without inspecting or mutating it.
+  REJECTION_METADATA.set(error, metadata);
+}
+
+function getResourceRejectionMetadata(error) {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return null;
+  return REJECTION_METADATA.get(error) || null;
 }
 
 // systemd --collect may unload a scope before a post-exit query can observe it.
@@ -575,8 +615,7 @@ class ResourceController {
       if (oomProvenance !== null) this.lastCgroupOom = oomProvenance;
 
       if (executionRejected) {
-        executionError.resourceFact = { ...fact };
-        executionError.cgroup_oom_observation = oomProvenance === null ? null : { ...oomProvenance };
+        rememberResourceRejection(executionError, fact, oomProvenance);
         throw executionError;
       }
       return {
@@ -627,4 +666,5 @@ module.exports = {
   buildControlScopeInvocation,
   validateUnitName,
   validateControlClassName,
+  getResourceRejectionMetadata,
 };
