@@ -92,6 +92,7 @@ function currentV2Body() {
   };
   return {
     admission_generation: captureProjectAdmission(PROJECT).generation,
+    batch_observation_fingerprint: context.fingerprint,
     installation_id: INSTALLATION,
     batch_number: parsed.batchNumber,
     assignment_attempt: parsed.assignmentAttempt,

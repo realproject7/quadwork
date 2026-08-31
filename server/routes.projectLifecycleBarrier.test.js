@@ -171,6 +171,7 @@ function request(server, method, pathname, body) {
       installationId: bridgeInstallationId,
     });
     const bridgeAssignment = {
+      batch_observation_fingerprint: router.readLiveBatchContext("alpha").fingerprint,
       installation_id: bridgeInstallationId,
       batch_number: bridgeParsed.batchNumber,
       assignment_attempt: bridgeParsed.assignmentAttempt,

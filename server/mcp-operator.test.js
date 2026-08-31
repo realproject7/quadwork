@@ -116,6 +116,7 @@ function startFullServer() {
   const assignmentItems = [{ work_item_ref: workItemRef, ownership_key: "owned-p-1" }];
   const assignment = {
     admission_generation: 0,
+    batch_observation_fingerprint: "v2-observation-scaffold-1",
     compatibility_mode: "v2",
     installation_id: "installation-p",
     batch_number: 1,

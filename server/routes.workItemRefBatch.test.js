@@ -60,6 +60,7 @@ const {
   progressForItemRest,
   pickLinkedPrFromSearch,
   validateCurrentOwnedAssignment,
+  validateCurrentAutomationRequest,
   readLiveBatchContext,
   _batchProgressCache,
   _graphqlCache,
@@ -302,6 +303,27 @@ async function run() {
   assert.equal(payload.batch_type, "ticket-review", "code cache cannot survive an immediate review-mode rollover");
   assert.ok(payload.items.every((item) => item.review_state === "queued"));
 
+  queue = active(["- Acme/Web#42 — in-review (1/2)"], { type: "ticket-review" });
+  _batchProgressCache.clear();
+  const inReviewV2 = await getOrComputeBatchProgress("p");
+  const staleReviewBody = {
+    admission_generation: inReviewV2.admission_generation,
+    batch_observation_fingerprint: inReviewV2.batch_observation_fingerprint,
+    installation_id: inReviewV2.installation_id,
+    batch_number: inReviewV2.batch_number,
+    assignment_attempt: inReviewV2.assignment_attempt,
+    provenance: inReviewV2.provenance,
+    assignment_key: inReviewV2.assignment_key,
+    assignment_items: inReviewV2.assignment_items,
+  };
+  queue = active(["- Acme/Web#42 — approved"], { type: "ticket-review" });
+  const approvedV2 = await getOrComputeBatchProgress("p");
+  assert.notEqual(approvedV2.batch_observation_fingerprint, inReviewV2.batch_observation_fingerprint,
+    "V2 review-state transition changes the exposed observation receipt");
+  assert.equal(approvedV2.completeConfirmed, true);
+  assert.equal(validateCurrentAutomationRequest("p", staleReviewBody).ok, false,
+    "an in-review V2 receipt cannot authorize after the same assignment becomes approved");
+
   // Attempt rollover invalidates the 10s project cache immediately.
   const oldKey = payload.assignment_key;
   queue = active(["- Acme/Web#42 first", "- Acme/API#42 second"], { attempt: "attempt_b", type: "code" });
@@ -312,6 +334,7 @@ async function run() {
   // Automated callers may send the exact assignment set in any order, but
   // malformed or duplicate per-item identity still fails closed.
   const assignmentBody = {
+    batch_observation_fingerprint: payload.batch_observation_fingerprint,
     installation_id: payload.installation_id,
     batch_number: payload.batch_number,
     assignment_attempt: payload.assignment_attempt,
@@ -348,6 +371,7 @@ async function run() {
   assert.equal(payload.owned, true);
   assert.deepEqual(payload.assignment_items, []);
   assert.equal(validateCurrentOwnedAssignment("p", {
+    batch_observation_fingerprint: payload.batch_observation_fingerprint,
     installation_id: payload.installation_id,
     batch_number: payload.batch_number,
     assignment_attempt: payload.assignment_attempt,

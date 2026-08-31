@@ -23,6 +23,7 @@ const WORK_ITEM_REF = {
 const ASSIGNMENT_ITEMS = [{ work_item_ref: WORK_ITEM_REF, ownership_key: "owned-item-1031" }];
 const ADMISSION_GENERATION = 7;
 const V2_IDENTITY = {
+  batch_observation_fingerprint: "v2-observation-mcp-17-a",
   installation_id: "installation-a",
   batch_number: 17,
   assignment_attempt: "attempt-a",
@@ -214,6 +215,7 @@ function batchReads(requests) {
 
 function hasExactV2Identity(body, expectedItems = ASSIGNMENT_ITEMS) {
   return body && body.admission_generation === ADMISSION_GENERATION &&
+    body.batch_observation_fingerprint === V2_IDENTITY.batch_observation_fingerprint &&
     body.installation_id === V2_IDENTITY.installation_id &&
     body.batch_number === V2_IDENTITY.batch_number &&
     body.assignment_attempt === V2_IDENTITY.assignment_attempt &&

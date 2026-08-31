@@ -265,6 +265,9 @@ function ownedCurrentBatchSnapshot(active, progress) {
   const activeAdmission = admissionGeneration(active.admission_generation);
   const progressAdmission = admissionGeneration(progress.admission_generation);
   if (activeAdmission === null || activeAdmission !== progressAdmission) return null;
+  const activeObservation = nonEmptyString(active.batch_observation_fingerprint);
+  const progressObservation = nonEmptyString(progress.batch_observation_fingerprint);
+  if (!activeObservation || activeObservation !== progressObservation) return null;
   const liveActiveBatchCleared = progress.liveActiveBatchCleared === true;
   if (liveActiveBatchCleared && (active.active !== false || progress.items.length !== 0)) return null;
   const activeIdentity = assignmentIdentity(active, { allowCleared: liveActiveBatchCleared });
@@ -287,6 +290,7 @@ function ownedCurrentBatchSnapshot(active, progress) {
 
   const fingerprint = [
     progressAdmission,
+    progressObservation,
     progressIdentity.installation_id,
     progressIdentity.batch_number,
     progressIdentity.assignment_attempt,
@@ -299,6 +303,7 @@ function ownedCurrentBatchSnapshot(active, progress) {
     compatibility_mode: "v2",
     fingerprint,
     admission_generation: progressAdmission,
+    batch_observation_fingerprint: progressObservation,
     active: active.active === true,
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,
@@ -328,6 +333,7 @@ function assignmentRequestFields(snapshot) {
   if (snapshot.authority !== "v2_owned") return {};
   return {
     admission_generation: snapshot.admission_generation,
+    batch_observation_fingerprint: snapshot.batch_observation_fingerprint,
     installation_id: snapshot.installation_id,
     batch_number: snapshot.batch_number,
     assignment_attempt: snapshot.assignment_attempt,

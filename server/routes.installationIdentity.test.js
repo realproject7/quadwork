@@ -22,7 +22,12 @@ process.on("exit", () => {
 const express = require("express");
 const router = require("./routes");
 const { writeConfig, commitV2Configuration } = require("./config");
-const { createProjectLifecycleController } = require("./project-lifecycle");
+const {
+  createProjectLifecycleController,
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  _admissionGenerations,
+} = require("./project-lifecycle");
 
 const INSTALLATION_ID = "installation_1234567890abcdef";
 
@@ -126,6 +131,10 @@ function request(server, method, urlPath, body) {
     assert.equal(response.status, 200);
     assert.equal(readDisk().projects[0].archived, true,
       "stale active PUT cannot restore a freshly archived project");
+    assert.equal(readDisk().projects[0].admission_generation, archived.admission_generation,
+      "stale active PUT cannot reset the archive's durable admission generation");
+    assert.equal(readDisk().project_admission_generations.p, archived.admission_generation,
+      "stale active PUT cannot reset the installation admission tombstone");
 
     const staleArchivedSnapshot = readDisk();
     const restored = await lifecycle.unarchiveProject("p");
@@ -135,6 +144,10 @@ function request(server, method, urlPath, body) {
     assert.equal(response.status, 200);
     assert.equal(readDisk().projects[0].archived, false,
       "stale archived PUT cannot rearchive a freshly restored project");
+    assert.equal(readDisk().projects[0].admission_generation, restored.admission_generation,
+      "stale archived PUT cannot roll back the unarchive generation");
+    assert.equal(readDisk().project_admission_generations.p, restored.admission_generation,
+      "stale archived PUT cannot roll back the installation admission tombstone");
 
     // Full replacement and section merge both reject rotation without writing.
     for (const method of ["PUT", "PATCH"]) {
@@ -273,11 +286,104 @@ function request(server, method, urlPath, body) {
       assert.equal(readDisk().session_token, "route-test-session-secret");
     }
 
+    const preRemoveToken = captureProjectAdmission("p2");
     const removed = await lifecycle.removeProject("p2");
     assert.equal(removed.ok, true);
     assert.equal(removed.removed, true);
     assert.equal(readDisk().projects.some((project) => project.id === "p2"), false,
       "real lifecycle controller alone can commit archive cleanup and removal");
+    assert.equal(readDisk().project_admission_generations.p2, removed.admission_generation,
+      "removal keeps an installation-scoped admission tombstone");
+
+    commitV2Configuration((cfg) => { cfg.projects.push(secondProject); });
+    const reusedToken = captureProjectAdmission("p2");
+    assert.equal(reusedToken.generation, removed.admission_generation,
+      "same-id recreation inherits the removal high-water mark");
+    response = await request(server, "PATCH", "/api/config", {
+      projects: [{ id: "p2", name: "Project Two Reused" }],
+    });
+    assert.equal(response.status, 200, "ordinary config edits remain available after same-id recreation");
+    assert.equal(readDisk().projects.find((project) => project.id === "p2").name, "Project Two Reused");
+    const reusedArchived = await lifecycle.archiveProject("p2");
+    assert.equal(reusedArchived.ok, true, "same-id recreation can be archived without restarting the process");
+    assert.equal(reusedArchived.admission_generation, removed.admission_generation + 1);
+    const reusedRestored = await lifecycle.unarchiveProject("p2");
+    assert.equal(reusedRestored.ok, true);
+    _admissionGenerations.clear();
+    assert.equal(isAdmissionCurrent(preRemoveToken), false,
+      "process restart cannot resurrect authority from before same-id recreation");
+    assert.equal(captureProjectAdmission("p2").generation, reusedRestored.admission_generation,
+      "restart reads the recreated project's durable installation epoch");
+
+    const magicProject = {
+      id: "__proto__",
+      name: "Prototype-safe Project",
+      repositories: [{
+        key: "primary",
+        repo: "Acme/PrototypeSafe",
+        working_dir: path.join(TEST_HOME, "prototype-safe"),
+        primary: true,
+      }],
+    };
+    commitV2Configuration((cfg) => { cfg.projects.push(magicProject); });
+    const magicOldToken = captureProjectAdmission("__proto__");
+    const magicRemoved = await lifecycle.removeProject("__proto__");
+    assert.equal(magicRemoved.removed, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(readDisk().project_admission_generations, "__proto__"), true,
+      "prototype-magic ids persist an own tombstone through the real config boundary");
+    commitV2Configuration((cfg) => { cfg.projects.push(magicProject); });
+    const magicArchived = await lifecycle.archiveProject("__proto__");
+    assert.equal(magicArchived.ok, true, "prototype-magic same-id recreation remains lifecycle-live");
+    _admissionGenerations.clear();
+    assert.equal(isAdmissionCurrent(magicOldToken), false,
+      "prototype-magic same-id recreation cannot resurrect pre-remove authority after restart");
+
+    const legacyArchived = {
+      id: "legacy-archived",
+      name: "Legacy Archived",
+      archived: true,
+      admission_generation: 4,
+      repositories: [{
+        key: "primary",
+        repo: "Acme/LegacyArchived",
+        working_dir: path.join(TEST_HOME, "legacy-archived"),
+        primary: true,
+      }],
+    };
+    const legacyDocument = readDisk();
+    legacyDocument.projects.push(legacyArchived);
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(legacyDocument, null, 2), { mode: 0o600 });
+    const legacyRetry = await lifecycle.archiveProject("legacy-archived");
+    assert.equal(legacyRetry.ok, true, "legacy archived cleanup can retry while backfilling its tombstone");
+    assert.equal(legacyRetry.admission_generation, 4, "idempotent archive backfill does not mint a new epoch");
+    assert.equal(readDisk().project_admission_generations["legacy-archived"], 4);
+    const legacyRemoved = await lifecycle.removeProject("legacy-archived");
+    assert.equal(legacyRemoved.removed, true, "legacy archived project remains removable after registry upgrade");
+
+    const legacyZero = {
+      id: "legacy-zero",
+      name: "Legacy Zero",
+      archived: true,
+      repositories: [{
+        key: "primary",
+        repo: "Acme/LegacyZero",
+        working_dir: path.join(TEST_HOME, "legacy-zero"),
+        primary: true,
+      }],
+    };
+    const legacyZeroDocument = readDisk();
+    legacyZeroDocument.projects.push(legacyZero);
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(legacyZeroDocument, null, 2), { mode: 0o600 });
+    const preUpgradeZeroToken = Object.freeze({ project_id: "legacy-zero", generation: 0 });
+    const legacyZeroRemoved = await lifecycle.removeProject("legacy-zero");
+    assert.equal(legacyZeroRemoved.removed, true);
+    assert.equal(legacyZeroRemoved.admission_generation, 1,
+      "first lifecycle touch advances a pre-epoch archived project above generation zero");
+    assert.equal(readDisk().project_admission_generations["legacy-zero"], 1);
+    commitV2Configuration((cfg) => { cfg.projects.push({ ...legacyZero, archived: false }); });
+    _admissionGenerations.clear();
+    assert.equal(isAdmissionCurrent(preUpgradeZeroToken), false,
+      "legacy generation-zero authority cannot revive after remove and same-id recreation");
 
     // Before activation, neither full endpoint may accept a caller-supplied ID.
     fs.unlinkSync(CONFIG_PATH);

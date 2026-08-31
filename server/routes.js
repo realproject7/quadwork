@@ -456,15 +456,20 @@ function assertGenericV2ProjectTopology(previousTopology, candidateConfig) {
   }
 }
 
-// #1034: archive state is lifecycle-owned. Generic config snapshots can edit
-// project presentation/settings, but they must never archive, restore, or
-// remove the absence of the lifecycle field on an existing project.
+// #1034/#1031: archive state and its durable admission epoch are lifecycle-owned.
+// Generic config snapshots can edit project presentation/settings, but they
+// must never archive, restore, or roll the epoch backward/forward.
 function preserveProjectArchiveState(existing, incoming) {
   if (!existing || !incoming || typeof incoming !== "object") return;
   if (Object.prototype.hasOwnProperty.call(existing, "archived")) {
     incoming.archived = existing.archived;
   } else {
     delete incoming.archived;
+  }
+  if (Object.prototype.hasOwnProperty.call(existing, "admission_generation")) {
+    incoming.admission_generation = existing.admission_generation;
+  } else {
+    delete incoming.admission_generation;
   }
 }
 
@@ -489,7 +494,7 @@ router.put("/api/config", (req, res) => {
       if (liveHasInstallationId) candidate.installation_id = cfg.installation_id;
       else delete candidate.installation_id;
 
-      for (const key of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token"]) {
+      for (const key of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token", "project_admission_generations"]) {
         if (key in cfg) candidate[key] = cfg[key];
         else delete candidate[key];
       }
@@ -545,6 +550,7 @@ router.put("/api/config", (req, res) => {
 //     one); on-disk projects absent from the body are left untouched.
 const CONFIG_MERGE_EXCLUDED = new Set([
   "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token", "installation_id",
+  "project_admission_generations",
 ]);
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
@@ -578,9 +584,11 @@ router.patch("/api/config", (req, res) => {
           if (existing) {
             const preserved = {};
             for (const fk of PROJECT_FLAG_KEYS) if (fk in existing) preserved[fk] = existing[fk];
-            const lifecycleOwner = Object.prototype.hasOwnProperty.call(existing, "archived")
-              ? { archived: existing.archived }
-              : {};
+            const lifecycleOwner = {};
+            if (Object.prototype.hasOwnProperty.call(existing, "archived")) lifecycleOwner.archived = existing.archived;
+            if (Object.prototype.hasOwnProperty.call(existing, "admission_generation")) {
+              lifecycleOwner.admission_generation = existing.admission_generation;
+            }
             Object.assign(existing, incoming, preserved);
             preserveProjectArchiveState(lifecycleOwner, existing);
           } else {
@@ -805,6 +813,7 @@ function requestedBridgeAssignment(body, projectId, res) {
     }
     : {
       compatibility_mode: "v2",
+      batch_observation_fingerprint: result.context.fingerprint,
       provenance: assignment.provenance,
       assignment_key: assignment.assignment_key,
       installation_id: assignment.installation_id,
@@ -4645,7 +4654,7 @@ function assignmentView(context, { current = true } = {}) {
     multi_repository: (context?.repositories || []).length > 1,
     assignment_items: assignmentItems,
     compatibility_mode: compatibilityMode,
-    ...(compatibilityMode === "v1" && context?.queueReadOk === true && typeof context?.fingerprint === "string"
+    ...(context?.queueReadOk === true && typeof context?.fingerprint === "string"
       ? { batch_observation_fingerprint: context.fingerprint }
       : {}),
   };
@@ -4706,6 +4715,8 @@ function validateCurrentOwnedAssignment(projectId, body = {}) {
     body.installation_id === assignment.installation_id &&
     body.batch_number === assignment.batch_number &&
     typeof body.assignment_attempt === "string" && body.assignment_attempt === assignment.assignment_attempt &&
+    typeof body.batch_observation_fingerprint === "string" &&
+    body.batch_observation_fingerprint === context.fingerprint &&
     requestedItems !== null && liveItems !== null &&
     JSON.stringify(requestedItems) === JSON.stringify(liveItems);
   if (!exact) {

@@ -37,6 +37,7 @@ const V2_IDENTITY = {
 const V2_ITEM = { work_item_ref: REF, ownership_key: "ownership-key-42" };
 const ACTIVE = {
   admission_generation: 0,
+  batch_observation_fingerprint: "v2-observation-restart-12",
   ...V2_IDENTITY,
   current: true,
   owned: true,

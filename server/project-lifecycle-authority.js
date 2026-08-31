@@ -20,6 +20,13 @@ function projectFromConfig(config, projectId) {
     : null;
 }
 
+function registryGeneration(config, projectId) {
+  const registry = config?.project_admission_generations;
+  if (!registry || !Object.prototype.hasOwnProperty.call(registry, projectId)) return 0;
+  const generation = registry[projectId];
+  return Number.isSafeInteger(generation) && generation >= 0 ? generation : 0;
+}
+
 function ownershipSignature(project, normalizeProjectRepositories) {
   return JSON.stringify(normalizeProjectRepositories(project));
 }
@@ -114,6 +121,54 @@ function assertProjectLifecycleTransitions(candidate, previousConfig, token, opt
   const validationError = options.validationError;
   const normalizeProjectRepositories = options.normalizeProjectRepositories;
 
+  const previousIds = new Set((previousConfig?.projects || [])
+    .filter((project) => project && typeof project.id === "string")
+    .map((project) => project.id));
+
+  // Admission epochs are installation-owned tombstones, not project-owned
+  // metadata. A removed id may be recreated, so the high-water mark must
+  // neither disappear nor move except in the same opaque lifecycle commit
+  // that advances the corresponding project barrier.
+  const registryIds = new Set([
+    ...Object.keys(previousConfig?.project_admission_generations || {}),
+    ...Object.keys(candidate?.project_admission_generations || {}),
+  ]);
+  for (const projectId of registryIds) {
+    const previousProject = projectFromConfig(previousConfig, projectId);
+    const previousGeneration = Math.max(
+      registryGeneration(previousConfig, projectId),
+      Number.isSafeInteger(previousProject?.admission_generation) && previousProject.admission_generation >= 0
+        ? previousProject.admission_generation
+        : 0,
+    );
+    const nextGeneration = registryGeneration(candidate, projectId);
+    const previousRegistryGeneration = registryGeneration(previousConfig, projectId);
+    if (nextGeneration === previousRegistryGeneration) continue;
+    const lifecycleTransition = assertCurrentTransition(token, projectId, ["archive", "unarchive", "remove"]);
+    const backfillsHighWater = nextGeneration === previousGeneration;
+    const advancesHighWater = nextGeneration === previousGeneration + 1;
+    if (!lifecycleTransition || (!backfillsHighWater && !advancesHighWater)) {
+      throw transitionError(
+        validationError,
+        "project_lifecycle_transition_required",
+        projectId,
+        "changing the project admission registry requires its lifecycle transition",
+      );
+    }
+  }
+
+  for (const project of candidate?.projects || []) {
+    if (!project || typeof project.id !== "string" || previousIds.has(project.id)) continue;
+    if (project.admission_generation !== undefined && project.admission_generation !== 0) {
+      throw transitionError(
+        validationError,
+        "project_lifecycle_transition_required",
+        project.id,
+        "new projects cannot supply an admission generation",
+      );
+    }
+  }
+
   for (const transition of activeTransitions.values()) {
     if (transition.kind !== "unarchive") continue;
     const project = projectFromConfig(candidate, transition.project_id);
@@ -172,6 +227,29 @@ function assertProjectLifecycleTransitions(candidate, previousConfig, token, opt
 
     const wasArchived = previous.archived === true;
     const isArchived = next.archived === true;
+    const previousProjectGeneration = Number.isSafeInteger(previous.admission_generation) && previous.admission_generation >= 0
+      ? previous.admission_generation
+      : 0;
+    const nextProjectGeneration = Number.isSafeInteger(next.admission_generation) && next.admission_generation >= 0
+      ? next.admission_generation
+      : 0;
+    if (nextProjectGeneration !== previousProjectGeneration) {
+      const previousGeneration = Math.max(
+        previousProjectGeneration,
+        registryGeneration(previousConfig, previous.id),
+      );
+      const lifecycleTransition = assertCurrentTransition(token, previous.id, ["archive", "unarchive", "remove"]);
+      const backfillsHighWater = nextProjectGeneration === previousGeneration;
+      const advancesHighWater = nextProjectGeneration === previousGeneration + 1;
+      if (!lifecycleTransition || (!backfillsHighWater && !advancesHighWater)) {
+        throw transitionError(
+          validationError,
+          "project_lifecycle_transition_required",
+          previous.id,
+          "changing a project admission generation requires its lifecycle transition",
+        );
+      }
+    }
     if (!wasArchived && isArchived && !assertCurrentTransition(token, previous.id, ["archive", "remove"])) {
       throw transitionError(
         validationError,

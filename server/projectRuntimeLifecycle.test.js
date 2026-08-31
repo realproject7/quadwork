@@ -51,6 +51,7 @@ const runtime = require("./index");
 
 const ownedProgress = {
   admission_generation: 0,
+  batch_observation_fingerprint: "v2-observation-runtime-7",
   compatibility_mode: "v2",
   installation_id: "installation-runtime-0001",
   batch_number: 7,
@@ -210,6 +211,7 @@ assert.deepEqual(runtime.bridgeAssignmentBody("a", { generation: 4 }, { ...owned
   project_id: "a",
   admission_generation: 4,
   compatibility_mode: "v2",
+  batch_observation_fingerprint: "v2-observation-runtime-7",
   ...ownedAutomation.identity,
 }, "V2 bridge automation carries the exact assignment set and explicit compatibility mode");
 assert.deepEqual(runtime.bridgeAssignmentBody("a", { generation: 4 }, runtime.batchAutomationState(legacyProgress, legacyActive)), {
@@ -238,6 +240,7 @@ assert.equal(runtime.validateCaffeinateAutomationRequest("a", { assignment_attem
 const identityWithoutProject = {
   admission_generation: 0,
   compatibility_mode: "v2",
+  batch_observation_fingerprint: "v2-observation-runtime-7",
   installation_id: ownedProgress.installation_id,
   batch_number: ownedProgress.batch_number,
   assignment_attempt: ownedProgress.assignment_attempt,
@@ -266,8 +269,8 @@ assert.equal(runtime.isBatchAutomationCurrent("a", {
   identity: { ...ownedAutomation.identity, assignment_attempt: "stale" },
 }), false, "server-side trigger polling rejects a rolled assignment before local mutation");
 assert.deepEqual(triggerValidationCalls, [
-  { projectId: "a", body: { admission_generation: 0, compatibility_mode: "v2", ...ownedAutomation.identity } },
-  { projectId: "a", body: { admission_generation: 0, compatibility_mode: "v2", ...ownedAutomation.identity, assignment_attempt: "stale" } },
+  { projectId: "a", body: { admission_generation: 0, compatibility_mode: "v2", batch_observation_fingerprint: "v2-observation-runtime-7", ...ownedAutomation.identity } },
+  { projectId: "a", body: { admission_generation: 0, compatibility_mode: "v2", batch_observation_fingerprint: "v2-observation-runtime-7", ...ownedAutomation.identity, assignment_attempt: "stale" } },
 ]);
 routes.validateCurrentOwnedAssignment = originalValidateCurrentOwnedAssignment;
 

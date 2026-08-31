@@ -8,6 +8,7 @@ const {
   revokeProjectAdmission,
   unarchiveCandidate,
   createProjectLifecycleController,
+  _admissionGenerations,
 } = require("./project-lifecycle");
 
 function config(...projects) {
@@ -67,6 +68,18 @@ async function rejectsCode(fn, code) {
     "a stale active snapshot cannot mint a lease after the live project is archived",
   );
 
+  for (const registry of [null, [], { lease: -1 }, { lease: "bad" }, { "": 1 }]) {
+    const malformed = config(project("lease"));
+    malformed.project_admission_generations = registry;
+    assert.throws(
+      () => captureProjectAdmission("lease", { readConfig: () => malformed }),
+      (error) => error.code === "invalid_project_admission_registry",
+      "malformed durable registry fails admission closed",
+    );
+    assert.equal(isAdmissionCurrent({ project_id: "lease", generation: 0 }, { readConfig: () => malformed }), false,
+      "malformed durable registry cannot authorize a generation-zero token");
+  }
+
   const ordering = [];
   const durable = inMemoryCommit(config(project("alpha")), ordering);
   const controller = createProjectLifecycleController({
@@ -83,6 +96,33 @@ async function rejectsCode(fn, code) {
   assert.deepEqual(archived.resources, { sessions: 2, viewers: 1 });
   assert.equal(ordering[0].startsWith("commit:"), true, "barrier commits before cleanup");
   assert.equal(ordering[1], "cleanup");
+
+  // The admission epoch is persisted in the same lifecycle commits as the
+  // archive barrier. Clearing all process-local memory simulates a restart;
+  // the pre-archive token must remain stale after the project is reopened.
+  const restartStore = inMemoryCommit(config(project("restart-aba")));
+  const preArchiveToken = captureProjectAdmission("restart-aba", { readConfig: restartStore.read });
+  const restartController = createProjectLifecycleController({
+    commitV2Configuration: restartStore.commit,
+    readConfig: restartStore.read,
+    validateV2Configuration: () => {},
+    cleanupProject: async () => ({ ok: true, resources: {} }),
+  });
+  const restartArchived = await restartController.archiveProject("restart-aba");
+  assert.equal(restartArchived.admission_generation, 1);
+  assert.equal(restartStore.read().projects[0].admission_generation, 1,
+    "archive commits the incremented admission generation durably");
+  _admissionGenerations.clear();
+  assert.equal(isAdmissionCurrent(preArchiveToken, { readConfig: restartStore.read }), false,
+    "process restart cannot reset the durable archived admission generation");
+  const restartRestored = await restartController.unarchiveProject("restart-aba");
+  assert.equal(restartRestored.admission_generation, 2);
+  assert.equal(restartStore.read().projects[0].admission_generation, 2,
+    "unarchive commits a fresh durable generation before reopening authority");
+  const reopenedToken = captureProjectAdmission("restart-aba", { readConfig: restartStore.read });
+  assert.equal(reopenedToken.generation, 2);
+  assert.equal(isAdmissionCurrent(preArchiveToken, { readConfig: restartStore.read }), false,
+    "pre-restart generation never becomes current again after unarchive");
 
   let cleanupAttempt = 0;
   const retryStore = inMemoryCommit(config(project("retry")));
@@ -313,6 +353,50 @@ async function rejectsCode(fn, code) {
   assert.equal(removed.ok, true);
   assert.equal(removed.removed, true);
   assert.equal(removeStore.read().projects.length, 0);
+
+  // Removing metadata must not remove the installation-scoped admission
+  // high-water mark. Reusing the same id remains live in this process and an
+  // old pre-remove token stays stale after process-local memory is cleared.
+  const reuseStore = inMemoryCommit(config(project("reuse")));
+  const preRemoveToken = captureProjectAdmission("reuse", { readConfig: reuseStore.read });
+  const reuseController = createProjectLifecycleController({
+    commitV2Configuration: reuseStore.commit,
+    readConfig: reuseStore.read,
+    validateV2Configuration: () => {},
+    cleanupProject: async () => ({ ok: true, resources: {} }),
+  });
+  const reuseRemoved = await reuseController.removeProject("reuse");
+  assert.equal(reuseRemoved.removed, true);
+  assert.equal(reuseStore.read().project_admission_generations.reuse, 1,
+    "remove preserves the durable admission tombstone after project metadata is deleted");
+  reuseStore.commit((candidate) => { candidate.projects.push(project("reuse")); });
+  const reusedToken = captureProjectAdmission("reuse", { readConfig: reuseStore.read });
+  assert.equal(reusedToken.generation, 1, "same-id recreation inherits the durable high-water mark");
+  assert.equal(isAdmissionCurrent(preRemoveToken, { readConfig: reuseStore.read }), false);
+  const reuseArchived = await reuseController.archiveProject("reuse");
+  assert.equal(reuseArchived.ok, true, "same-id recreation remains lifecycle-live without a restart");
+  assert.equal(reuseArchived.admission_generation, 2);
+  _admissionGenerations.clear();
+  assert.equal(isAdmissionCurrent(preRemoveToken, { readConfig: reuseStore.read }), false,
+    "a restart cannot resurrect a token minted before remove and same-id recreation");
+
+  const magicStore = inMemoryCommit(config(project("__proto__")));
+  const magicOldToken = captureProjectAdmission("__proto__", { readConfig: magicStore.read });
+  const magicController = createProjectLifecycleController({
+    commitV2Configuration: magicStore.commit,
+    readConfig: magicStore.read,
+    validateV2Configuration: () => {},
+    cleanupProject: async () => ({ ok: true, resources: {} }),
+  });
+  await magicController.removeProject("__proto__");
+  const magicRegistry = magicStore.read().project_admission_generations;
+  assert.equal(Object.prototype.hasOwnProperty.call(magicRegistry, "__proto__"), true,
+    "prototype-magic project ids persist as own admission tombstone keys");
+  assert.equal(magicRegistry.__proto__, 1);
+  magicStore.commit((candidate) => { candidate.projects.push(project("__proto__")); });
+  _admissionGenerations.clear();
+  assert.equal(isAdmissionCurrent(magicOldToken, { readConfig: magicStore.read }), false,
+    "prototype-magic ids cannot reset authority after remove and restart");
 
   const serialEvents = [];
   const serialStore = inMemoryCommit(config(project("serial")), serialEvents);

@@ -20,6 +20,7 @@ const ASSIGNMENT_ITEMS = [
 ];
 const identity = {
   admission_generation: 4,
+  batch_observation_fingerprint: "v2-observation-7-a",
   installation_id: "123e4567-e89b-42d3-a456-426614174000",
   batch_number: 7,
   assignment_attempt: "attempt-2",
@@ -88,6 +89,7 @@ assert.equal(current.complete, false);
 assert.equal(current.completeConfirmed, false);
 assert.deepEqual(assignmentRequestFields(current), {
   admission_generation: 4,
+  batch_observation_fingerprint: "v2-observation-7-a",
   installation_id: identity.installation_id,
   batch_number: 7,
   assignment_attempt: "attempt-2",
@@ -102,6 +104,8 @@ for (const [name, activeDelta, progressDelta] of [
   ["historical", { current: false }, { current: false }],
   ["admission mismatch", { admission_generation: 3 }, {}],
   ["missing admission", { admission_generation: undefined }, { admission_generation: undefined }],
+  ["observation mismatch", {}, { batch_observation_fingerprint: "v2-observation-7-stale" }],
+  ["missing observation", { batch_observation_fingerprint: undefined }, { batch_observation_fingerprint: undefined }],
   ["stale active attempt", { assignment_attempt: "attempt-1" }, {}],
   ["stale progress attempt", {}, { assignment_attempt: "attempt-1" }],
   ["invalid matching attempt grammar", { assignment_attempt: "bad attempt" }, { assignment_attempt: "bad attempt" }],

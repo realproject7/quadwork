@@ -122,10 +122,15 @@ function seedConfig(config) {
 // boundary unless lifecycle cleanup first owns the exact reservation token.
 {
   const pathForTokenGate = repoDir("reservation-token-gate");
-  seedConfig(activated([
-    project("token-gate", [repository("primary", "Acme/TokenGate", pathForTokenGate)], { archived: true }),
-    project("active-gate", [repository("primary", "Acme/ActiveGate", repoDir("active-transition-gate"))]),
-  ]));
+  seedConfig({
+    ...activated([
+      project("token-gate", [repository("primary", "Acme/TokenGate", pathForTokenGate)], { archived: true }),
+      project("active-gate", [repository("primary", "Acme/ActiveGate", repoDir("active-transition-gate"))], {
+        admission_generation: 4,
+      }),
+    ]),
+    project_admission_generations: { "active-gate": 4 },
+  });
   const before = diskBytes();
   expectCode(
     () => commitV2Configuration((cfg) => { cfg.projects[0].archived = false; }),
@@ -169,6 +174,44 @@ function seedConfig(config) {
     "public update cannot archive without lifecycle cleanup authority",
   );
   assert.equal(diskBytes(), before);
+
+  expectCode(
+    () => updateConfig((cfg) => { cfg.projects[1].admission_generation = 7; }),
+    "project_lifecycle_transition_required",
+    "public update cannot mint a project admission generation",
+  );
+  assert.equal(diskBytes(), before);
+
+  expectCode(
+    () => updateConfig((cfg) => { cfg.project_admission_generations["active-gate"] = 3; }),
+    "project_lifecycle_transition_required",
+    "public update cannot roll back the installation admission tombstone",
+  );
+  assert.equal(diskBytes(), before);
+
+  expectCode(
+    () => updateConfig((cfg) => { delete cfg.project_admission_generations; }),
+    "project_lifecycle_transition_required",
+    "public update cannot delete the installation admission registry",
+  );
+  assert.equal(diskBytes(), before);
+
+  expectCode(
+    () => validateV2Configuration({
+      ...readConfig(),
+      projects: readConfig().projects.map((entry, index) => index === 1
+        ? { ...entry, admission_generation: -1 }
+        : entry),
+    }),
+    "invalid_project_admission_generation",
+    "project admission generation must be a safe nonnegative integer",
+  );
+
+  expectCode(
+    () => validateV2Configuration({ ...readConfig(), project_admission_generations: { "active-gate": -1 } }),
+    "invalid_project_admission_registry",
+    "installation admission tombstones must be safe nonnegative integers",
+  );
 
   expectCode(
     () => commitV2Configuration((cfg) => { cfg.projects.splice(1, 1); }),

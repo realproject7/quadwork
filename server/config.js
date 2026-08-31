@@ -115,9 +115,11 @@ function hasOwn(value, key) {
 function cloneConfigurationValue(value) {
   if (Array.isArray(value)) return value.map(cloneConfigurationValue);
   if (value && typeof value === "object") {
-    const clone = {};
-    for (const [key, child] of Object.entries(value)) clone[key] = cloneConfigurationValue(child);
-    return clone;
+    // Object.fromEntries defines data properties even for the legacy magic
+    // key `__proto__`; assignment to `{}` would silently lose that own key.
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, cloneConfigurationValue(child)]),
+    );
   }
   return value;
 }
@@ -519,6 +521,26 @@ function validateV2Configuration(config, options = {}) {
     throw validationError("invalid_projects", "projects", "projects must be an array");
   }
 
+  if (hasOwn(config, "project_admission_generations")) {
+    const registry = config.project_admission_generations;
+    if (!registry || typeof registry !== "object" || Array.isArray(registry)) {
+      throw validationError(
+        "invalid_project_admission_registry",
+        "project_admission_generations",
+        "project admission registry must be an object",
+      );
+    }
+    for (const [projectId, generation] of Object.entries(registry)) {
+      if (!projectId || !Number.isSafeInteger(generation) || generation < 0) {
+        throw validationError(
+          "invalid_project_admission_registry",
+          `project_admission_generations.${projectId || "?"}`,
+          "project admission registry entries must be safe nonnegative integers",
+        );
+      }
+    }
+  }
+
   const previousById = new Map(
     Array.isArray(options.previousConfig?.projects)
       ? options.previousConfig.projects
@@ -532,6 +554,14 @@ function validateV2Configuration(config, options = {}) {
   config.projects.forEach((project, index) => {
     if (!project || typeof project !== "object" || Array.isArray(project)) {
       throw validationError("invalid_project", "projects", "project entry is invalid");
+    }
+    if (hasOwn(project, "admission_generation") &&
+        (!Number.isSafeInteger(project.admission_generation) || project.admission_generation < 0)) {
+      throw validationError(
+        "invalid_project_admission_generation",
+        `projects[${index}].admission_generation`,
+        "project admission generation must be a safe nonnegative integer",
+      );
     }
     if (hasOwn(project, "repo") || hasOwn(project, "working_dir")) {
       throw validationError(

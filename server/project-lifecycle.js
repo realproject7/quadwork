@@ -90,10 +90,23 @@ function admissionState(projectId, config, options = {}) {
       return { admitted: false, code: "project_config_unavailable", status: 503, project: null };
     }
   }
+  if (Object.prototype.hasOwnProperty.call(current || {}, "project_admission_generations")) {
+    const registry = current.project_admission_generations;
+    const validShape = !!registry && typeof registry === "object" && !Array.isArray(registry);
+    const validEntries = validShape && Object.entries(registry).every(([id, generation]) =>
+      !!id && Number.isSafeInteger(generation) && generation >= 0);
+    if (!validEntries) {
+      return { admitted: false, code: "invalid_project_admission_registry", status: 503, project: null };
+    }
+  }
   const project = projectFromConfig(current, projectId);
   if (!project) return { admitted: false, code: "unknown_project", status: 404, project: null };
   if (Object.prototype.hasOwnProperty.call(project, "archived") && typeof project.archived !== "boolean") {
     return { admitted: false, code: "invalid_project_archive_state", status: 503, project };
+  }
+  if (Object.prototype.hasOwnProperty.call(project, "admission_generation") &&
+      (!Number.isSafeInteger(project.admission_generation) || project.admission_generation < 0)) {
+    return { admitted: false, code: "invalid_project_admission_generation", status: 503, project };
   }
   if (project.archived === true) {
     return { admitted: false, code: "project_archived", status: 409, project };
@@ -115,6 +128,8 @@ function assertProjectAdmitted(projectId, config, options = {}) {
     unknown_project: "project is not configured",
     project_archived: "project is archived",
     invalid_project_archive_state: "project archive state is invalid",
+    invalid_project_admission_generation: "project admission generation is invalid",
+    invalid_project_admission_registry: "project admission registry is invalid",
   };
   throw lifecycleError(
     state.code,
@@ -124,13 +139,56 @@ function assertProjectAdmitted(projectId, config, options = {}) {
   );
 }
 
-function currentAdmissionGeneration(projectId) {
-  return admissionGenerations.get(projectId) || 0;
+function persistedAdmissionGeneration(project) {
+  return Number.isSafeInteger(project?.admission_generation) && project.admission_generation >= 0
+    ? project.admission_generation
+    : 0;
 }
 
-function revokeProjectAdmission(projectId) {
+function registryAdmissionGeneration(config, projectId) {
+  const registry = config?.project_admission_generations;
+  if (!registry || !Object.prototype.hasOwnProperty.call(registry, projectId)) return 0;
+  const value = registry[projectId];
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function setRegistryAdmissionGeneration(config, projectId, generation) {
+  if (!config.project_admission_generations || typeof config.project_admission_generations !== "object" ||
+      Array.isArray(config.project_admission_generations)) {
+    config.project_admission_generations = {};
+  }
+  // Assignment to a plain object's `__proto__` key invokes its legacy setter
+  // instead of creating an enumerable JSON property. defineProperty keeps every
+  // accepted project id as an own, serializable tombstone key.
+  Object.defineProperty(config.project_admission_generations, projectId, {
+    value: generation,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+function currentAdmissionGeneration(projectId, config, options = {}) {
+  let durable = 0;
+  let current = config;
+  if (current === undefined) {
+    try { current = (options.readConfig || readConfig)(); }
+    catch { current = null; }
+  }
+  durable = Math.max(
+    persistedAdmissionGeneration(projectFromConfig(current, projectId)),
+    registryAdmissionGeneration(current, projectId),
+  );
+  return Math.max(durable, admissionGenerations.get(projectId) || 0);
+}
+
+function revokeProjectAdmission(projectId, options = {}) {
   requireProjectId(projectId);
-  const next = currentAdmissionGeneration(projectId) + 1;
+  const requested = options && options.generation;
+  const current = currentAdmissionGeneration(projectId, undefined, options);
+  const next = Number.isSafeInteger(requested) && requested >= 0
+    ? Math.max(requested, current)
+    : current + 1;
   admissionGenerations.set(projectId, next);
   return next;
 }
@@ -139,10 +197,13 @@ function captureProjectAdmission(projectId, options = {}) {
   // Lease issuance always re-reads the live persisted authority. Accepting a
   // caller snapshot here would let a stale pre-archive config mint a fresh
   // post-revocation token.
-  assertProjectAdmitted(projectId, undefined, options);
+  let config;
+  try { config = (options.readConfig || readConfig)(); }
+  catch { config = undefined; }
+  assertProjectAdmitted(projectId, config, options);
   return Object.freeze({
     project_id: projectId,
-    generation: currentAdmissionGeneration(projectId),
+    generation: currentAdmissionGeneration(projectId, config, options),
   });
 }
 
@@ -150,10 +211,13 @@ function isAdmissionCurrent(token, options = {}) {
   if (!token || typeof token.project_id !== "string" || !Number.isInteger(token.generation)) {
     return false;
   }
-  if (token.generation !== currentAdmissionGeneration(token.project_id)) return false;
+  let config;
+  try { config = (options.readConfig || readConfig)(); }
+  catch { return false; }
+  if (token.generation !== currentAdmissionGeneration(token.project_id, config, options)) return false;
   // As with issuance, completion checks consult live persisted authority. A
   // stale caller snapshot must never re-authorize post-await fan-out or writes.
-  return !isProjectArchived(token.project_id, undefined, options);
+  return !isProjectArchived(token.project_id, config, options);
 }
 
 function safeCleanupError(error, fallbackResource = "project") {
@@ -260,15 +324,31 @@ function createProjectLifecycleController(options = {}) {
 
   async function commitArchived(projectId, archived, lifecycleTransition) {
     let previousArchived = null;
+    let generation = null;
     await commitConfiguration((config) => {
       const project = projectFromConfig(config, projectId);
       if (!project) {
         throw lifecycleError("unknown_project", projectId, "project is not configured", 404);
       }
       previousArchived = project.archived === true;
+      const currentGeneration = currentAdmissionGeneration(projectId, config);
+      // Pre-epoch releases could persist archived:true without any durable
+      // generation. The first lifecycle touch must advance that legacy zero,
+      // otherwise remove + same-id recreation can revive generation-0 work.
+      const needsLegacyArchivedEpoch = archived === true && previousArchived === true && currentGeneration === 0;
+      if (previousArchived !== archived || needsLegacyArchivedEpoch) {
+        if (currentGeneration >= Number.MAX_SAFE_INTEGER) {
+          throw lifecycleError("project_admission_generation_exhausted", projectId, "project admission generation is exhausted", 503);
+        }
+        generation = currentGeneration + 1;
+      } else {
+        generation = currentGeneration;
+      }
+      project.admission_generation = generation;
+      setRegistryAdmissionGeneration(config, projectId, generation);
       project.archived = archived;
     }, lifecycleTransition);
-    return previousArchived;
+    return { previousArchived, generation };
   }
 
   async function cleanupArchivedProject(projectId) {
@@ -290,14 +370,14 @@ function createProjectLifecycleController(options = {}) {
   }
 
   async function archiveUnlocked(projectId, lifecycleTransition) {
-    const wasArchived = await commitArchived(projectId, true, lifecycleTransition);
-    const generation = revokeAdmission(projectId);
+    const committed = await commitArchived(projectId, true, lifecycleTransition);
+    const generation = revokeAdmission(projectId, { generation: committed.generation });
     const cleanup = await cleanupArchivedProject(projectId);
     return {
       ok: cleanup.ok,
       project_id: projectId,
       archived: true,
-      already_archived: wasArchived === true,
+      already_archived: committed.previousArchived === true,
       admission_generation: generation,
       resources: cleanup.resources,
       cleanup_errors: cleanup.cleanup_errors,
@@ -330,7 +410,7 @@ function createProjectLifecycleController(options = {}) {
           project_id: projectId,
           archived: false,
           already_unarchived: true,
-          admission_generation: currentAdmissionGeneration(projectId),
+          admission_generation: currentAdmissionGeneration(projectId, current),
           resources: {},
           cleanup_errors: [],
         };
@@ -347,19 +427,20 @@ function createProjectLifecycleController(options = {}) {
             project_id: projectId,
             archived: true,
             already_unarchived: false,
-            admission_generation: currentAdmissionGeneration(projectId),
+            admission_generation: currentAdmissionGeneration(projectId, current),
             resources: cleanup.resources,
             cleanup_errors: cleanup.cleanup_errors,
           };
         }
 
-        await commitArchived(projectId, false, preflight.reservation);
+        const committed = await commitArchived(projectId, false, preflight.reservation);
+        revokeAdmission(projectId, { generation: committed.generation });
         return {
           ok: true,
           project_id: projectId,
           archived: false,
           already_unarchived: false,
-          admission_generation: currentAdmissionGeneration(projectId),
+          admission_generation: committed.generation,
           resources: cleanup.resources,
           cleanup_errors: [],
         };
@@ -401,4 +482,5 @@ module.exports = {
   revokeProjectAdmission,
   unarchiveCandidate,
   createProjectLifecycleController,
+  _admissionGenerations: admissionGenerations,
 };

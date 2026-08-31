@@ -114,15 +114,27 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     // Once lifecycle has archived a project, a stale generic PUT cannot restore
     // it. The absence of `archived` is also an owned state, not an invitation
     // for a Settings snapshot to introduce the field.
-    writeCfg({ ...readCfg(), projects: readCfg().projects.map((project) => (
-      project.id === "lv" ? { ...project, archived: true } : project
-    )) });
+    writeCfg({
+      ...readCfg(),
+      project_admission_generations: { lv: 5 },
+      projects: readCfg().projects.map((project) => (
+        project.id === "lv" ? { ...project, archived: true, admission_generation: 5 } : project
+      )),
+    });
     const stalePut = readCfg();
-    stalePut.projects.find((project) => project.id === "lv").archived = false;
+    stalePut.project_admission_generations.lv = 0;
+    Object.assign(stalePut.projects.find((project) => project.id === "lv"), {
+      archived: false,
+      admission_generation: 0,
+    });
     ok((await req(server, { method: "PUT", urlPath: "/api/config", body: stalePut })).status === 200,
        "stale whole-config PUT with archived=false succeeds without owning lifecycle");
     ok(readCfg().projects.find((project) => project.id === "lv").archived === true,
        "whole-config PUT cannot restore an archived project");
+    ok(readCfg().projects.find((project) => project.id === "lv").admission_generation === 5,
+       "whole-config PUT cannot roll back the durable admission generation");
+    ok(readCfg().project_admission_generations.lv === 5,
+       "whole-config PUT cannot roll back the installation admission tombstone");
 
     // ── PATCH /api/config: the section-merge Settings save (no whole-config PUT) ─
     // Send only owned sections (Settings strips the flags): operator_name echoed
@@ -139,16 +151,21 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     ok(d2.projects[0].name === "Renamed" && d2.projects[0].agents.head.command === "codex", "PATCH merges owned per-project fields (name, agents)");
     ok(d2.projects[0].idle === true && d2.projects[0].telegram_auto === true, "PATCH preserves the field-scoped flags from disk (no clobber)");
     ok(d2.projects[0].archived === true, "PATCH cannot restore an archived project from a stale body");
+    ok(d2.projects[0].admission_generation === 5, "PATCH preserves the lifecycle-owned admission generation");
+    ok(d2.project_admission_generations.lv === 5, "PATCH preserves the lifecycle-owned admission registry");
 
     await req(server, { method: "PATCH", urlPath: "/api/config", body: {
-      projects: [{ id: "lv", archived: false }],
+      projects: [{ id: "lv", archived: false, admission_generation: 99 }],
     } });
     ok(readCfg().projects.find((project) => project.id === "lv").archived === true,
        "explicit archived=false in generic PATCH remains ignored");
+    ok(readCfg().projects.find((project) => project.id === "lv").admission_generation === 5,
+       "explicit admission generation in generic PATCH remains ignored");
     writeCfg({ ...readCfg(), projects: readCfg().projects.map((project) => {
       if (project.id !== "lv") return project;
       const restored = { ...project };
       delete restored.archived;
+      delete restored.admission_generation;
       return restored;
     }) });
     await req(server, { method: "PATCH", urlPath: "/api/config", body: {

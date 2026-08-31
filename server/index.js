@@ -1903,6 +1903,7 @@ function batchAutomationRequestBody(batchState) {
   return {
     admission_generation: batchState.admissionGeneration,
     compatibility_mode: "v2",
+    batch_observation_fingerprint: batchState.batchObservationFingerprint,
     ...batchState.identity,
   };
 }
@@ -2371,6 +2372,7 @@ function validatedTriggerAutomationBody(validation) {
   return {
     admission_generation: validation.admission?.generation,
     compatibility_mode: "v2",
+    batch_observation_fingerprint: validation.context?.fingerprint,
     installation_id: assignment.installation_id,
     batch_number: assignment.batch_number,
     assignment_attempt: assignment.assignment_attempt,
@@ -3278,7 +3280,7 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
     ...(Number.isSafeInteger(progress?.admission_generation) && progress.admission_generation >= 0
       ? { admission_generation: progress.admission_generation }
       : {}),
-    ...(progress?.compatibility_mode === "v1" && typeof progress?.batch_observation_fingerprint === "string"
+    ...(typeof progress?.batch_observation_fingerprint === "string"
       ? { batch_observation_fingerprint: progress.batch_observation_fingerprint }
       : {}),
   }));
