@@ -3164,8 +3164,9 @@ function runStartupMigrations(cfg) {
 //
 // "Active batch" comes from the SAME getOrComputeBatchProgress +
 // isBatchActiveFromProgress source the /api/batch-active route and the
-// auto-reseed gate use — no new batch/pulse logic. Opt out via config.json
-// `restart_respawn: { enabled: false }` (defaults on).
+// auto-reseed gate use. #1031 additionally joins that lifecycle signal to the
+// exact current assignment authority before any PTY is restored. Opt out via
+// config.json `restart_respawn: { enabled: false }` (defaults on).
 //
 // Fail-SAFE direction is the inverse of auto-reseed's fail-CLOSED gate: if we
 // can't prove a batch is active (the check throws or returns null), we do
@@ -3175,7 +3176,21 @@ function runStartupMigrations(cfg) {
 async function respawnActiveBatchAgents(cfg, opts = {}) {
   const log = opts.log || ((m) => console.log(m));
   const getProgress = opts.getProgress || routes.getOrComputeBatchProgress;
-  const isActiveFromProgress = opts.isActiveFromProgress || routes.isBatchActiveFromProgress;
+  const getActive = opts.getActive || (async (_projectId, progress) => ({
+    active: routes.isBatchActiveFromProgress(progress) === true,
+    batch_type: progress?.batch_type || "code",
+    installation_id: progress?.installation_id || null,
+    batch_number: progress?.batch_number ?? null,
+    assignment_attempt: progress?.assignment_attempt || null,
+    provenance: progress?.provenance || "legacy_unowned",
+    assignment_key: progress?.assignment_key || null,
+    assignment_items: Array.isArray(progress?.assignment_items) ? progress.assignment_items : [],
+    current: progress?.current === true,
+    owned: progress?.owned === true,
+    multi_repository: progress?.multi_repository === true,
+    compatibility_mode: progress?.compatibility_mode === "v1" ? "v1" : "v2",
+  }));
+  const automationCurrent = opts.isBatchAutomationCurrent || isBatchAutomationCurrent;
   const spawn = opts.spawnAgentPty || spawnAgentPty;
   const sessions = opts.agentSessions || agentSessions;
   const archived = opts.isProjectArchived || isProjectArchived;
@@ -3201,14 +3216,15 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
       decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
       continue;
     }
-    let active;
+    let batchState;
     try {
       const progress = await getProgress(project.id);
+      const active = await getActive(project.id, progress);
       if (!admissionCurrent(admission) || archived(project.id)) {
         decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
         continue;
       }
-      active = isActiveFromProgress(progress);
+      batchState = batchAutomationState(progress, active);
     } catch (err) {
       // Fail-safe: an unknowable batch state means DON'T spawn (never disturb
       // a possibly-idle project). Logged so the skip is observable.
@@ -3216,8 +3232,16 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
       log(`[respawn] ${project.id}: skipped — batch state unknown (${err.message})`);
       continue;
     }
-    if (!active) { // false (no active batch) OR null (unknown) → leave alone
-      decisions.push({ projectId: project.id, action: "skip", reason: active === null ? "batch state unknown" : "no active batch" });
+    if (!batchState?.authoritative) {
+      decisions.push({ projectId: project.id, action: "skip", reason: "batch assignment not authoritative" });
+      continue;
+    }
+    if (!batchState.active || !batchState.hasItems || batchState.shouldStop) {
+      decisions.push({ projectId: project.id, action: "skip", reason: "no active batch" });
+      continue;
+    }
+    if (!automationCurrent(project.id, batchState, admission)) {
+      decisions.push({ projectId: project.id, action: "skip", reason: "batch assignment changed" });
       continue;
     }
 
@@ -3230,6 +3254,10 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
     const restored = [];
     for (const agentId of agentKeys) {
       if (!admissionCurrent(admission) || archived(project.id)) break;
+      // The queue can roll over while startup progress or another agent spawn
+      // is awaiting. Revalidate the exact assignment immediately before every
+      // session mutation; a stale startup observation has no wake authority.
+      if (!automationCurrent(project.id, batchState, admission)) break;
       const key = `${project.id}/${agentId}`;
       // Idempotent: never double-spawn an agent already live (e.g. one a
       // terminal-connect raced in first).

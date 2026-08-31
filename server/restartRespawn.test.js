@@ -4,12 +4,10 @@
 // agents for projects that were MID-BATCH when the server restarted, while
 // leaving idle projects untouched.
 //
-// respawnActiveBatchAgents takes a dependency-injection seam (getProgress /
-// isActiveFromProgress / spawnAgentPty / agentSessions / log — defaults wire to
-// the real module fns), so we drive it with stubbed side-effect-free deps and
-// the REAL isBatchActiveFromProgress (via an injected getProgress that returns
-// crafted progress payloads) so the actual active-batch determination is
-// exercised, not mocked. spawnAgentPty is a spy — no real pty.
+// respawnActiveBatchAgents takes dependency-injection seams for observations,
+// current-assignment revalidation, and PTY mutation. Crafted payloads still
+// flow through the real batchAutomationState join; only the live queue lookup
+// behind isBatchAutomationCurrent is stubbed. spawnAgentPty is a spy — no PTY.
 //
 // QUADWORK_SKIP_LISTEN + a temp HOME let us require the server module for the
 // exported helper without starting the server (see watchdog.test.js). Plain
@@ -27,19 +25,72 @@ fs.writeFileSync(path.join(TMP_HOME, ".quadwork", "config.json"), JSON.stringify
 
 const assert = require("node:assert/strict");
 const { respawnActiveBatchAgents } = require("./index");
-const routes = require("./routes");
 
-// The real active-batch predicate — crafted progress payloads flow through it.
-const ACTIVE = { items: [{ id: 1 }], complete: false };          // → true
-const IDLE_COMPLETE = { items: [{ id: 1 }], complete: true };    // → false
-const IDLE_CLEARED = { liveActiveBatchCleared: true, items: [{ id: 1 }] }; // → false
-// null progress → isBatchActiveFromProgress returns null (unknown)
-
-// Sanity: our payloads mean what we think under the REAL predicate.
-assert.equal(routes.isBatchActiveFromProgress(ACTIVE), true);
-assert.equal(routes.isBatchActiveFromProgress(IDLE_COMPLETE), false);
-assert.equal(routes.isBatchActiveFromProgress(IDLE_CLEARED), false);
-assert.equal(routes.isBatchActiveFromProgress(null), null);
+const REF = { repo_key: "repo", repo: "Acme/Repo", number: 42, kind: "issue" };
+const V2_IDENTITY = {
+  installation_id: "installation_0000000000000001",
+  batch_number: 12,
+  assignment_attempt: "attempt_1",
+  provenance: "owned",
+  assignment_key: "assignment-key-12",
+};
+const V2_ITEM = { work_item_ref: REF, ownership_key: "ownership-key-42" };
+const ACTIVE = {
+  ...V2_IDENTITY,
+  current: true,
+  owned: true,
+  multi_repository: false,
+  compatibility_mode: "v2",
+  assignment_items: [V2_ITEM],
+  items: [{
+    ...V2_IDENTITY,
+    current: true,
+    owned: true,
+    repo_key: REF.repo_key,
+    repo: REF.repo,
+    number: REF.number,
+    kind: REF.kind,
+    work_item_ref: REF,
+    ownership_key: V2_ITEM.ownership_key,
+  }],
+  complete: false,
+  completeConfirmed: false,
+};
+const IDLE_COMPLETE = { ...ACTIVE, complete: true, completeConfirmed: true };
+const IDLE_CLEARED = {
+  ...ACTIVE,
+  current: false,
+  assignment_items: [],
+  items: [],
+  complete: false,
+  completeConfirmed: false,
+  liveActiveBatchCleared: true,
+};
+const ACTIVE_V1 = {
+  compatibility_mode: "v1",
+  provenance: "legacy_unowned",
+  owned: false,
+  current: true,
+  multi_repository: false,
+  installation_id: null,
+  batch_number: 3,
+  assignment_attempt: null,
+  assignment_key: null,
+  assignment_items: [],
+  items: [{
+    provenance: "legacy_unowned",
+    owned: false,
+    current: true,
+    batch_number: 3,
+    repo_key: REF.repo_key,
+    repo: REF.repo,
+    number: REF.number,
+    kind: REF.kind,
+    work_item_ref: REF,
+  }],
+  complete: false,
+  completeConfirmed: false,
+};
 
 function spy() {
   const calls = [];
@@ -51,6 +102,7 @@ const admitted = {
   isProjectArchived: () => false,
   captureProjectAdmission: (projectId) => ({ project_id: projectId, generation: 0 }),
   isAdmissionCurrent: () => true,
+  isBatchAutomationCurrent: () => true,
 };
 
 (async () => {
@@ -95,7 +147,18 @@ const admitted = {
     assert.equal(calls.length, 0, "cleared active-batch → no agents spawned");
   }
 
-  // ── 3. Unknown batch state (null progress) → fail-SAFE, do NOTHING. ──
+  // ── 2c. Explicit pre-activation V1 compatibility remains restorable. ──
+  {
+    const { fn: spawn, calls } = spy();
+    const cfg = { projects: [{ id: "v1", working_dir: "/tmp/v1", agents: { head: {} } }] };
+    await respawnActiveBatchAgents(cfg, {
+      ...admitted,
+      getProgress: async () => ACTIVE_V1, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
+    });
+    assert.equal(calls.length, 1, "explicit V1 compatibility batch → agent restored");
+  }
+
+  // ── 3. Unknown/malformed authority → fail-SAFE, do NOTHING. ──
   {
     const { fn: spawn, calls } = spy();
     const cfg = { projects: [{ id: "unk", working_dir: "/tmp/unk" }] };
@@ -104,7 +167,29 @@ const admitted = {
       getProgress: async () => null, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
     });
     assert.equal(calls.length, 0, "null progress → never spawns (fail-safe)");
-    assert.equal(out.decisions[0].reason, "batch state unknown");
+    assert.equal(out.decisions[0].reason, "batch assignment not authoritative");
+  }
+
+  // Activated V2 foreign/stale, unowned, malformed, and sticky snapshots have
+  // no startup wake authority even when they contain a non-complete item.
+  for (const [label, progress, current] of [
+    ["foreign", { ...ACTIVE, installation_id: "installation_foreign" }, false],
+    ["stale", ACTIVE, false],
+    ["unowned", { ...ACTIVE, provenance: "legacy_unowned", owned: false }, true],
+    ["malformed", { ...ACTIVE, assignment_items: [] }, true],
+    ["sticky", { ...ACTIVE, current: false }, true],
+  ]) {
+    const { fn: spawn, calls } = spy();
+    const cfg = { projects: [{ id: label, working_dir: `/tmp/${label}`, agents: { head: {} } }] };
+    await respawnActiveBatchAgents(cfg, {
+      ...admitted,
+      getProgress: async () => progress,
+      isBatchAutomationCurrent: () => current,
+      spawnAgentPty: spawn,
+      agentSessions: new Map(),
+      log: () => {},
+    });
+    assert.equal(calls.length, 0, `${label} assignment → zero startup respawn`);
   }
 
   // ── 4. getProgress throws → skip that project, never spawn, never crash. ──
@@ -188,6 +273,25 @@ const admitted = {
     assert.equal(out.decisions[0].reason, "project archived");
   }
 
-  console.log("restartRespawn.test.js: all assertions passed (9 cases)");
+  // ── 10. Assignment rollover after observation but before the first
+  //         session mutation is revalidated and produces zero respawn. ──
+  {
+    const { fn: spawn, calls } = spy();
+    let checks = 0;
+    const cfg = { projects: [{ id: "rollover", working_dir: "/tmp/rollover", agents: { head: {}, dev: {} } }] };
+    const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
+      getProgress: async () => ACTIVE,
+      isBatchAutomationCurrent: () => ++checks === 1,
+      spawnAgentPty: spawn,
+      agentSessions: new Map(),
+      log: () => {},
+    });
+    assert.equal(checks, 2, "assignment checked after observation and again before mutation");
+    assert.equal(calls.length, 0, "rollover before first session mutation → zero respawn");
+    assert.deepEqual(out.decisions[0].agents, []);
+  }
+
+  console.log("restartRespawn.test.js: all assertions passed (10 groups)");
   process.exit(0);
 })().catch((err) => { console.error(err); process.exit(1); });
