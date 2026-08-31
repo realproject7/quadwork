@@ -211,6 +211,10 @@ assert.equal(runtime.validateTriggerAutomationRequest("a", {}).ok, true,
   "manual trigger controls remain compatible");
 assert.equal(runtime.validateTriggerAutomationRequest("a", { assignment_attempt: "stale" }).ok, false,
   "trigger automation delegates stale assignment rejection to the live queue guard");
+assert.equal(runtime.validateCaffeinateAutomationRequest("a", {}).ok, true,
+  "manual caffeinate controls remain compatible");
+assert.equal(runtime.validateCaffeinateAutomationRequest("a", { assignment_attempt: "stale" }).ok, false,
+  "caffeinate automation delegates stale assignment rejection to the live queue guard");
 assert.equal(runtime.isBatchAutomationCurrent("a", { ...ownedAutomation, mode: "v2" }), true,
   "server-side trigger polling revalidates the exact action identity before local mutation");
 assert.equal(runtime.isBatchAutomationCurrent("a", {
@@ -219,6 +223,8 @@ assert.equal(runtime.isBatchAutomationCurrent("a", {
   identity: { ...ownedAutomation.identity, assignment_attempt: "stale" },
 }), false, "server-side trigger polling rejects a rolled assignment before local mutation");
 assert.deepEqual(triggerValidationCalls, [
+  { projectId: "a", body: {} },
+  { projectId: "a", body: { assignment_attempt: "stale" } },
   { projectId: "a", body: {} },
   { projectId: "a", body: { assignment_attempt: "stale" } },
   { projectId: "a", body: { compatibility_mode: "v2", ...ownedAutomation.identity } },
@@ -397,6 +403,62 @@ process.on("exit", cleanup);
   liveB.telegram_auto = true;
   liveB.discord_auto = true;
   fs.writeFileSync(configPath, JSON.stringify(liveCfg));
+
+  const authorityFetch = global.fetch;
+  let authorityFetches = 0;
+  global.fetch = async (url) => {
+    authorityFetches += 1;
+    if (String(url).includes("/api/batch-progress")) {
+      return { ok: true, json: async () => ({ ...ownedProgress, provenance: "foreign", owned: false }) };
+    }
+    if (String(url).includes("/api/batch-active")) {
+      return { ok: true, json: async () => ({ ...ownedActive, provenance: "foreign", owned: false }) };
+    }
+    throw new Error("non-authoritative trigger must never reach chat mutation");
+  };
+  try {
+    const rejectedAuthority = await runtime.sendTriggerMessage("b");
+    assert.equal(rejectedAuthority.code, "batch_assignment_not_authoritative");
+    assert.equal(rejectedAuthority.sent, false);
+    assert.equal(authorityFetches, 2,
+      "foreign trigger_auto state reads only joined authority and never wakes workers");
+  } finally {
+    global.fetch = authorityFetch;
+  }
+
+  const unavailableFetch = global.fetch;
+  let unavailableFetches = 0;
+  global.fetch = async () => {
+    unavailableFetches += 1;
+    throw new Error("authority unavailable");
+  };
+  try {
+    const unavailableAuthority = await runtime.sendTriggerMessage("b");
+    assert.equal(unavailableAuthority.code, "batch_authority_unavailable");
+    assert.equal(unavailableAuthority.sent, false);
+    assert.equal(unavailableFetches, 2,
+      "trigger_auto authority read failure never falls through to chat mutation");
+  } finally {
+    global.fetch = unavailableFetch;
+  }
+
+  const actionCfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  actionCfg.projects.find((entry) => entry.id === "b").trigger_auto = false;
+  fs.writeFileSync(configPath, JSON.stringify(actionCfg));
+  const staleActionFetch = global.fetch;
+  let staleActionFetches = 0;
+  global.fetch = async () => { staleActionFetches += 1; throw new Error("stale action must not mutate chat"); };
+  try {
+    const staleAction = await runtime.sendTriggerMessage("b", { assignment_attempt: "stale" });
+    assert.equal(staleAction.code, "project_assignment_changed");
+    assert.equal(staleAction.sent, false);
+    assert.equal(staleActionFetches, 0,
+      "an identity-bound send-now revalidates assignment immediately before chat mutation");
+  } finally {
+    global.fetch = staleActionFetch;
+    actionCfg.projects.find((entry) => entry.id === "b").trigger_auto = true;
+    fs.writeFileSync(configPath, JSON.stringify(actionCfg));
+  }
 
   const lifecycleApi = require("./project-lifecycle");
   const staleBridgeAdmission = lifecycleApi.captureProjectAdmission("b");

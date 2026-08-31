@@ -489,6 +489,20 @@ function caffeinateStatus(projectId = null) {
   return { active, remaining };
 }
 
+function validateCaffeinateAutomationRequest(projectId, body = {}) {
+  return routes.validateCurrentOwnedAssignment(projectId, body);
+}
+
+function rejectChangedCaffeinateAssignment(res, result) {
+  return res.status(result?.status || 409).json({
+    ok: false,
+    active: false,
+    error: result?.error || "project assignment changed; refresh and retry",
+    code: result?.code || "project_assignment_changed",
+    project_id: result?.project_id,
+  });
+}
+
 app.post("/api/caffeinate/start", (req, res) => {
   if (process.platform !== "darwin") {
     return res.status(400).json({ ok: false, error: "Sleep prevention is only available on macOS" });
@@ -497,6 +511,8 @@ app.post("/api/caffeinate/start", (req, res) => {
   if (projectId) {
     try { assertProjectAdmitted(projectId); }
     catch (err) { return respondLifecycleFailure(res, err); }
+    const assignment = validateCaffeinateAutomationRequest(projectId, req.body || {});
+    if (!assignment.ok) return rejectChangedCaffeinateAssignment(res, assignment);
   }
   const duration = req.body?.duration || 0; // seconds, 0 = indefinite
   registerCaffeinateOwner(projectId, duration);
@@ -531,6 +547,10 @@ app.post("/api/caffeinate/start", (req, res) => {
 
 app.post("/api/caffeinate/stop", (req, res) => {
   const projectId = typeof req.body?.project_id === "string" ? req.body.project_id : null;
+  if (projectId) {
+    const assignment = validateCaffeinateAutomationRequest(projectId, req.body || {});
+    if (!assignment.ok) return rejectChangedCaffeinateAssignment(res, assignment);
+  }
   const released = projectId ? releaseProjectCaffeinate(projectId) : releaseManualCaffeinate();
   if (!released.ok) {
     return res.status(409).json({ ok: false, active: true, code: "caffeinate_stop_failed", error: "Sleep prevention could not be stopped" });
@@ -1964,7 +1984,7 @@ function isBatchAutomationCurrent(projectId, batchState, admission = null) {
     (!admission || isAdmissionCurrent(admission));
 }
 
-async function sendTriggerMessage(projectId) {
+async function sendTriggerMessage(projectId, automationBody = null) {
   let admission;
   try { admission = captureProjectAdmission(projectId); }
   catch {
@@ -1979,6 +1999,7 @@ async function sendTriggerMessage(projectId) {
   // (plus caffeinate) if the batch is already complete. This covers the
   // case where the operator is on a different page and the client-side
   // ScheduledTriggerWidget is not mounted to detect completion.
+  let autoBatchState = null;
   if (project && project.trigger_auto) {
     const qwPort = cfg.port || 8400;
     try {
@@ -1990,45 +2011,57 @@ async function sendTriggerMessage(projectId) {
         stopTrigger(projectId);
         return { ok: false, code: "project_archived", sent: false };
       }
-      if (bpRes.ok && activeRes.ok) {
-        const bp = await bpRes.json();
-        const active = await activeRes.json();
-        if (!isAdmissionCurrent(admission)) {
-          stopTrigger(projectId);
-          return { ok: false, code: "project_admission_changed", sent: false };
-        }
-        // #810: gate auto-stop on completeConfirmed (two distinct successful
-        // fetch cycles), NOT a single transient/stale `complete`.
-        // #864: also auto-stop on an explicit operator clear (`liveActiveBatchCleared`).
-        // The preserved snapshot may keep `items` non-empty / `complete` mixed, so
-        // `completeConfirmed` alone won't fire when items don't all resolve as
-        // merged/closed (e.g. a duplicate unmerged PR). The cleared flag is the
-        // operator's intent and overrides those signals for lifecycle purposes.
-        const batchState = batchAutomationState(bp, active);
-        const clearedByOperator = batchState.clearedByOperator === true;
-        if (batchState.authoritative && batchState.shouldStop && isBatchAutomationCurrent(projectId, batchState, admission)) {
-          console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
-          stopTrigger(projectId);
-          // Also stop caffeinate if no other triggers remain running
-          // (#441 companion fix). caffeinateProcess is global (not
-          // project-scoped), so only kill it when all work is done.
-          const released = releaseProjectCaffeinate(projectId);
-          if (released.removed) {
-            console.log(`[auto-trigger] ${projectId}: caffeinate auto-stopped (no active triggers remain)`);
-          }
-          // #518: also stop bridges when batch completes
-          // #542: transition guard — only stop if not already stopped for this completion
-          const prev = _bridgeBatchPrev.get(projectId);
-          _bridgeBatchPrev.set(projectId, { fingerprint: batchState.fingerprint, complete: true, hasItems: batchState.hasItems });
-          if (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete) {
-            await autoStopBridges(projectId, project, qwPort, admission, batchState);
-          }
-          return;
-        }
+      if (!bpRes.ok || !activeRes.ok) {
+        stopTrigger(projectId);
+        return { ok: false, code: "batch_authority_unavailable", sent: false };
       }
+      const bp = await bpRes.json();
+      const active = await activeRes.json();
+      if (!isAdmissionCurrent(admission)) {
+        stopTrigger(projectId);
+        return { ok: false, code: "project_admission_changed", sent: false };
+      }
+      // #810: gate auto-stop on completeConfirmed (two distinct successful
+      // fetch cycles), NOT a single transient/stale `complete`.
+      // #864: also auto-stop on an explicit operator clear (`liveActiveBatchCleared`).
+      // #1031: the same joined authority is required for the positive send path;
+      // foreign, unowned, stale, malformed, or unavailable progress must never
+      // wake workers merely because an old trigger timer still exists.
+      const batchState = batchAutomationState(bp, active);
+      if (!batchState.authoritative || !isBatchAutomationCurrent(projectId, batchState, admission)) {
+        stopTrigger(projectId);
+        return { ok: false, code: "batch_assignment_not_authoritative", sent: false };
+      }
+      const clearedByOperator = batchState.clearedByOperator === true;
+      if (batchState.shouldStop) {
+        console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
+        stopTrigger(projectId);
+        // Also stop caffeinate if no other triggers remain running
+        // (#441 companion fix). caffeinateProcess is global (not
+        // project-scoped), so only kill it when all work is done.
+        const released = releaseProjectCaffeinate(projectId);
+        if (released.removed) {
+          console.log(`[auto-trigger] ${projectId}: caffeinate auto-stopped (no active triggers remain)`);
+        }
+        // #518: also stop bridges when batch completes
+        // #542: transition guard — only stop if not already stopped for this completion
+        const prev = _bridgeBatchPrev.get(projectId);
+        _bridgeBatchPrev.set(projectId, { fingerprint: batchState.fingerprint, complete: true, hasItems: batchState.hasItems });
+        if (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete) {
+          await autoStopBridges(projectId, project, qwPort, admission, batchState);
+        }
+        return { ok: true, stopped: true, sent: false };
+      }
+      if (!batchState.active || !batchState.hasItems) {
+        stopTrigger(projectId);
+        return { ok: false, code: "batch_not_active", sent: false };
+      }
+      autoBatchState = batchState;
     } catch (err) {
-      // Non-fatal — if batch-progress fails, proceed with the message
+      // Fail closed: a trigger_auto timer is an automated worker-wake path.
       console.error(`[auto-trigger] ${projectId}: batch-progress check failed:`, err.message);
+      stopTrigger(projectId);
+      return { ok: false, code: "batch_authority_unavailable", sent: false };
     }
   }
 
@@ -2049,6 +2082,16 @@ async function sendTriggerMessage(projectId) {
     if (!isAdmissionCurrent(admission)) {
       stopTrigger(projectId);
       return { ok: false, code: "project_archived", sent: false };
+    }
+    if (automationBody) {
+      const assignment = validateTriggerAutomationRequest(projectId, automationBody);
+      if (!assignment.ok) {
+        return { ok: false, code: assignment.code || "project_assignment_changed", sent: false };
+      }
+    }
+    if (autoBatchState && !isBatchAutomationCurrent(projectId, autoBatchState, admission)) {
+      stopTrigger(projectId);
+      return { ok: false, code: "project_assignment_changed", sent: false };
     }
     const res = await fetch(url, {
       method: "POST",
@@ -2402,11 +2445,13 @@ app.post("/api/triggers/:project/send-now", async (req, res) => {
   const { project } = req.params;
   try { assertProjectAdmitted(project); }
   catch (err) { return respondLifecycleFailure(res, err, { sent: false }); }
+  const assignment = validateTriggerAutomationRequest(project, req.body || {});
+  if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
   // #812: parked (idle) project — do not pulse agents.
   if (isProjectIdleId(project)) {
     return res.json({ ok: false, idle: true, sent: false });
   }
-  const result = await sendTriggerMessage(project);
+  const result = await sendTriggerMessage(project, assignment.manual ? null : (req.body || {}));
   if (!result.ok) return res.status(409).json(result);
   res.json(result);
 });
@@ -3364,6 +3409,7 @@ module.exports = {
   batchAutomationState,
   isBatchAutomationCurrent,
   validateTriggerAutomationRequest,
+  validateCaffeinateAutomationRequest,
   registerCaffeinateOwner,
   caffeinateStatus,
   releaseProjectCaffeinate,

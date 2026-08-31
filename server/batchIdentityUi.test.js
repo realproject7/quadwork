@@ -246,6 +246,7 @@ const components = [
   "ScheduledTriggerWidget.tsx",
   "TelegramBridgeWidget.tsx",
   "DiscordBridgeWidget.tsx",
+  "ControlBar.tsx",
 ];
 for (const component of components) {
   const source = fs.readFileSync(path.join(root, "src", "components", component), "utf8");
@@ -264,5 +265,10 @@ assert.match(panel, /validation_errors/, "invalid queue diagnostics are visible 
 const queueManager = fs.readFileSync(path.join(root, "src", "components", "QueueManager.tsx"), "utf8");
 assert.match(queueManager, /qualifiedQueueToken/, "QueueManager emits qualified work tokens");
 assert.match(queueManager, /sanitizeRemoteTitle/, "QueueManager sanitizes remote titles before interpolation");
+
+const chatPresets = fs.readFileSync(path.join(root, "src", "components", "ChatPresets.tsx"), "utf8");
+assert.match(chatPresets, /owner\/repo#<number>/, "queue-format preset preserves V2 repository-qualified identity");
+assert.match(chatPresets, /pre-activation V1 single-repository/, "queue-format preset keeps the narrow V1 bare-ref compatibility boundary");
+assert.match(chatPresets, /preset\.message === LEGACY_QUEUE_FORMAT_PRESET/, "cached untouched V1 defaults migrate without clobbering user edits");
 
 console.log("batch identity UI tests passed");
