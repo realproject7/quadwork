@@ -11,6 +11,7 @@ interface BatchProgressItem {
   repo_key: string;
   repo: string;
   work_item_ref: string | { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+  ownership_key?: string | null;
   kind: "issue" | "pr";
   installation_id?: string | null;
   batch_number?: number | null;
@@ -50,6 +51,11 @@ interface BatchProgressData {
   batch_type?: "code" | "ticket-review" | "pr-review";
   multi_repository?: boolean;
   validation_errors?: Array<{ code: string; message: string }>;
+  compatibility_mode?: "v1" | "v2";
+  assignment_items?: Array<{
+    work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string;
+  }>;
 }
 
 interface BatchProgressPanelProps {

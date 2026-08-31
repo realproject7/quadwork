@@ -29,7 +29,7 @@ module.exports = {
     {
       name: "batch_status",
       description:
-        "Get a project's overnight-batch status as { active, progress }, preserving repository-qualified rows and assignment provenance from /api/batch-active and /api/batch-progress without transformation. `active.active` plus matching installation_id, batch_number, opaque assignment_attempt, assignment_key, current, owned, and provenance=owned is the live authority. Each progress row retains separate repo_key, repo, number, kind, a work_item_ref object with those same four fields, the same provenance fields, and an OPEN-only live_pr reference (number, URL, state, tip). Foreign, unowned, legacy_unowned, stale, and sticky completed progress is observational only and never current authority.",
+        "Get a project's overnight-batch status as { active, progress }, preserving repository-qualified rows and assignment provenance from /api/batch-active and /api/batch-progress without transformation. Matching installation_id, batch_number, opaque assignment_attempt, aggregate assignment_key, ordered assignment_items, current, owned, and provenance=owned identify the current V2 assignment; active.active is required to start work. Each progress row retains separate repo_key, repo, number, kind, a work_item_ref object with those same four fields, its per-item ownership_key, the same base provenance fields, and an OPEN-only live_pr reference (number, URL, state, tip). Explicit compatibility_mode=v1 identifies preactivation single-repository lifecycle compatibility only; it never grants V2 authority. Foreign, unowned, stale, and sticky completed progress is observational only.",
       inputSchema: {
         type: "object",
         properties: {

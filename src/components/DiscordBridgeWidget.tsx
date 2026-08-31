@@ -67,12 +67,13 @@ interface BatchState {
     repo_key: string;
     repo: string;
     work_item_ref: string | { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string | null;
     kind: "issue" | "pr";
-    installation_id: string;
+    installation_id: string | null;
     batch_number: number;
-    assignment_attempt: string;
+    assignment_attempt: string | null;
     provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
-    assignment_key: string;
+    assignment_key: string | null;
     current: boolean;
     owned: boolean;
   }>;
@@ -81,8 +82,14 @@ interface BatchState {
   assignment_attempt: string | null;
   provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
   assignment_key: string | null;
+  assignment_items: Array<{
+    work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string;
+  }>;
   current: boolean;
   owned: boolean;
+  multi_repository: boolean;
+  compatibility_mode: "v1" | "v2";
 }
 
 interface BatchActiveState {
@@ -92,22 +99,34 @@ interface BatchActiveState {
   assignment_attempt: string | null;
   provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
   assignment_key: string | null;
+  assignment_items: Array<{
+    work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string;
+  }>;
   current: boolean;
   owned: boolean;
+  multi_repository: boolean;
+  compatibility_mode: "v1" | "v2";
 }
 
-interface OwnedBatchSnapshot {
+interface BatchLifecycleSnapshot {
+  authority: "v2_owned" | "legacy_compatibility";
+  compatibility_mode: "v1" | "v2";
   fingerprint: string;
   active: boolean;
   complete: boolean;
   completeConfirmed: boolean;
   liveActiveBatchCleared: boolean;
   hasItems: boolean;
-  installation_id: string;
+  installation_id: string | null;
   batch_number: number;
-  assignment_attempt: string;
-  provenance: "owned";
-  assignment_key: string;
+  assignment_attempt: string | null;
+  provenance: "owned" | "legacy_unowned";
+  assignment_key: string | null;
+  assignment_items: Array<{
+    work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string;
+  }>;
 }
 
 interface DiscordBridgeWidgetProps {
@@ -156,7 +175,7 @@ export default function DiscordBridgeWidget({ projectId, idle = false }: Discord
   // #518: Auto toggle — start/stop bridge with batch lifecycle
   const [autoDiscord, setAutoDiscord] = useState(false);
   const [autoStatus, setAutoStatus] = useState<string | null>(null);
-  const prevBatchRef = useRef<OwnedBatchSnapshot | null>(null);
+  const prevBatchRef = useRef<BatchLifecycleSnapshot | null>(null);
   const autoDiscordRef = useRef(autoDiscord);
   const runningRef = useRef(false);
   useEffect(() => { autoDiscordRef.current = autoDiscord; }, [autoDiscord]);
@@ -283,7 +302,7 @@ export default function DiscordBridgeWidget({ projectId, idle = false }: Discord
       if (!activeResponse.ok || !progressResponse.ok) return;
       const active: BatchActiveState = await activeResponse.json();
       const data: BatchState = await progressResponse.json();
-      const next = ownedCurrentBatchSnapshot(active, data) as OwnedBatchSnapshot | null;
+      const next = ownedCurrentBatchSnapshot(active, data) as BatchLifecycleSnapshot | null;
       if (!next) return;
       const prev = prevBatchRef.current;
       prevBatchRef.current = next;

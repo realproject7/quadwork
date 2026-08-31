@@ -41,14 +41,33 @@ const RUNTIME_AGENTS = {
   "plotlink/dev": { state: "stopped", error: null },
 };
 
+const WEB_REF = { repo_key: "web", repo: "owner/web", number: 42, kind: "issue" };
+const API_REF = { repo_key: "api", repo: "owner/api", number: 42, kind: "issue" };
+const ASSIGNMENT_ITEMS = [
+  { work_item_ref: API_REF, ownership_key: "ownership-api-42" },
+  { work_item_ref: WEB_REF, ownership_key: "ownership-web-42" },
+];
+
 const BATCH_IDENTITY = {
   installation_id: "123e4567-e89b-42d3-a456-426614174000",
   batch_number: 4,
   assignment_attempt: "attempt-4-owned",
   provenance: "owned",
   assignment_key: "batch-4-attempt-4-owned",
+  assignment_items: ASSIGNMENT_ITEMS,
   current: true,
   owned: true,
+  multi_repository: true,
+  compatibility_mode: "v2",
+};
+const ROW_IDENTITY = {
+  installation_id: BATCH_IDENTITY.installation_id,
+  batch_number: BATCH_IDENTITY.batch_number,
+  assignment_attempt: BATCH_IDENTITY.assignment_attempt,
+  provenance: BATCH_IDENTITY.provenance,
+  assignment_key: BATCH_IDENTITY.assignment_key,
+  current: BATCH_IDENTITY.current,
+  owned: BATCH_IDENTITY.owned,
 };
 
 const BATCH_ACTIVE = { active: true, batch_type: "code", ...BATCH_IDENTITY };
@@ -60,22 +79,24 @@ const BATCH_PROGRESS = {
   ...BATCH_IDENTITY,
   items: [
     {
-      ...BATCH_IDENTITY,
+      ...ROW_IDENTITY,
       repo_key: "web",
       repo: "owner/web",
       number: 42,
       kind: "issue",
       work_item_ref: { repo_key: "web", repo: "owner/web", number: 42, kind: "issue" },
+      ownership_key: "ownership-web-42",
       issue_number: 42,
       live_pr: { number: 101, url: "https://github.com/owner/web/pull/101", state: "OPEN", tip: "a".repeat(40) },
     },
     {
-      ...BATCH_IDENTITY,
+      ...ROW_IDENTITY,
       repo_key: "api",
       repo: "owner/api",
       number: 42,
       kind: "issue",
       work_item_ref: { repo_key: "api", repo: "owner/api", number: 42, kind: "issue" },
+      ownership_key: "ownership-api-42",
       issue_number: 42,
       live_pr: null,
       historical_pr: { number: 99, url: "https://github.com/owner/api/pull/99", state: "MERGED", tip: "b".repeat(40) },
@@ -158,10 +179,20 @@ async function runTests() {
     "batch_status preserves the opaque assignment identity without rewriting it",
   );
   assert(
+    JSON.stringify(batch.active.assignment_items) === JSON.stringify(ASSIGNMENT_ITEMS) &&
+      JSON.stringify(batch.progress.assignment_items) === JSON.stringify(ASSIGNMENT_ITEMS),
+    "batch_status preserves ordered aggregate assignment_items",
+  );
+  assert(
     batch.progress.items.length === 2 &&
       batch.progress.items[0].issue_number === 42 && batch.progress.items[1].issue_number === 42 &&
       batch.progress.items[0].repo === "owner/web" && batch.progress.items[1].repo === "owner/api",
     "batch_status keeps same-number work items distinct by repository",
+  );
+  assert(
+    batch.progress.items[0].ownership_key === "ownership-web-42" &&
+      batch.progress.items[1].ownership_key === "ownership-api-42",
+    "batch_status preserves distinct per-item ownership keys",
   );
   assert(
     batch.progress.items[0].live_pr.state === "OPEN" && batch.progress.items[0].live_pr.tip === "a".repeat(40),
