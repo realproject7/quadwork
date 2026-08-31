@@ -130,7 +130,7 @@ function createReadOnlyProbes(options = {}) {
     containment() {
       return {
         cgroupV2: fsImpl.existsSync(path.join(cgroupRoot, "cgroup.controllers")),
-        userManager: commandWorks("systemctl", ["--user", "show", "--property=Version", "--value"]),
+        userManager: commandWorks("systemctl", ["--user", "--property=Version", "--value", "show"]),
         systemdRun: commandWorks("systemd-run", ["--user", "--version"]),
         scopeProof,
       };
@@ -169,7 +169,7 @@ function createReadOnlyProbes(options = {}) {
       let oomPolicy;
       const unit = path.posix.basename(cgroup.relative);
       if (/\.(?:service|scope)$/.test(unit)) {
-        try { oomPolicy = execText("systemctl", ["show", unit, "--property=OOMPolicy", "--value"]); } catch {}
+        try { oomPolicy = execText("systemctl", ["--property=OOMPolicy", "--value", "show", unit]); } catch {}
       }
       return {
         memoryLowMib,
@@ -182,11 +182,11 @@ function createReadOnlyProbes(options = {}) {
     activeScopes() {
       const output = execText("systemctl", [
         "--user",
-        "list-units",
         "--type=scope",
         "--state=running",
         "--no-legend",
         "--plain",
+        "list-units",
       ]);
       if (!output) return 0;
       return output.split(/\r?\n/).filter((line) => {

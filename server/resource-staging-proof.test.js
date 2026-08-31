@@ -235,7 +235,7 @@ async function main() {
       ["read", "/machine-id", "utf8"],
       ["exists", "/cgroup/cgroup.controllers"],
     ]);
-    assert.deepEqual(execCalls, [["systemctl", ["--user", "show", "--property=Version", "--value"]]]);
+    assert.deepEqual(execCalls, [["systemctl", ["--user", "--property=Version", "--value", "show"]]]);
   }
 
   assert.deepEqual(parseCliArgs([]), { acknowledgement: null, runPressure: false, json: false });

@@ -337,6 +337,12 @@ assert(execCalls.every(([command, args]) => {
   if (command === "systemd-run") return args.join(" ") === "--user --version";
   return command === "systemctl" && !args.some((arg) => ["start", "stop", "set-property", "enable", "disable"].includes(arg));
 }));
+assert(execCalls.some(([command, args]) => command === "systemctl"
+  && args.join(" ") === "--user --property=Version --value show"));
+assert(execCalls.some(([command, args]) => command === "systemctl"
+  && args.join(" ") === "--property=OOMPolicy --value show pm2-quadwork.service"));
+assert(execCalls.some(([command, args]) => command === "systemctl"
+  && args.join(" ") === "--user --type=scope --state=running --no-legend --plain list-units"));
 
 files.set(
   "/cgroup/system.slice/pm2-quadwork.service/memory.max",

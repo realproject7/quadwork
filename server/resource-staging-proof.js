@@ -98,7 +98,7 @@ function createDefaultAdapter(options = {}) {
       let userManager = false;
       if (linux && cgroupV2) {
         try {
-          const output = execFileSyncImpl("systemctl", ["--user", "show", "--property=Version", "--value"], {
+          const output = execFileSyncImpl("systemctl", ["--user", "--property=Version", "--value", "show"], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
             timeout: 5000,
