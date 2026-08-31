@@ -121,6 +121,24 @@ const lowSwap = runResourcePreflight({
 });
 assert(lowSwap.reasons.some((item) => item.code === "capacity_exhausted" && item.check === "static_capacity_invalid"));
 
+const lowFreeSwap = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    memory: () => ({ totalMib: 8192, availableMib: 4000, swapTotalMib: 8192, swapFreeMib: 511 }),
+  }),
+});
+assert.equal(lowFreeSwap.reason, "capacity_exhausted");
+assert.equal(lowFreeSwap.capacity.requestedSwapMib, 512);
+assert(lowFreeSwap.reasons.some((item) => item.code === "capacity_exhausted" && item.check === "live_swap_headroom_low"));
+
+const exactFreeSwapBoundary = runResourcePreflight({
+  runtimeResources: policy(),
+  probes: healthyProbes({
+    memory: () => ({ totalMib: 8192, availableMib: 4000, swapTotalMib: 8192, swapFreeMib: 512 }),
+  }),
+});
+assert.equal(exactFreeSwapBoundary.reasons.some((item) => item.check === "live_swap_headroom_low"), false);
+
 const ceiling = runResourcePreflight({
   runtimeResources: policy(),
   probes: healthyProbes({ activeScopes: () => 3 }),

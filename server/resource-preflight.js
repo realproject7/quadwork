@@ -360,6 +360,9 @@ function runResourcePreflight({ runtimeResources, probes, requestedWorkerScopes 
             liveHeadroomMib,
           };
           if (liveHeadroomMib < 0) addReason(reasons, "capacity_exhausted", "live_memory_headroom_low");
+          if (memory.swapFreeMib < requestedSwapMib) {
+            addReason(reasons, "capacity_exhausted", "live_swap_headroom_low");
+          }
           if (requestedAndAdmittedScopes > policy.max_worker_scopes) {
             addReason(reasons, "capacity_exhausted", "worker_scope_ceiling_reached");
           }
