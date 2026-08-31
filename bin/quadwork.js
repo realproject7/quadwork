@@ -10,6 +10,7 @@ const { readRuntimeResources } = require("../server/config");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const {
   ResourceInstallError,
+  recoveryEntriesForError,
   policyProposal,
   applyPolicy,
   tempInstallProposal,
@@ -1296,14 +1297,20 @@ function renderResourceInstall(result) {
     lines.push("Validated policy:", JSON.stringify(result.policy, null, 2));
   }
   lines.push("Plan:", JSON.stringify(result.plan, null, 2));
+  if (result.result) lines.push("Result:", JSON.stringify(result.result, null, 2));
   if (result.status === "proposal") {
     lines.push("No changes were made. Re-run with --apply and the exact SHA-256 token to apply this plan.");
   }
   return `${lines.join("\n")}\n`;
 }
 
-function renderResourceInstallFailure(code) {
-  return `QuadWork resource operation refused: ${code}\n`;
+function renderResourceInstallFailure(code, recoveryEntries = []) {
+  const lines = [`QuadWork resource operation refused: ${code}`];
+  if (recoveryEntries.length > 0) {
+    lines.push("Recovery entries (exact basenames; never use wildcards):");
+    for (const entry of recoveryEntries) lines.push(`  - ${entry}`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function runResourceInstallCommand(subcommand, args, options = {}) {
@@ -1331,9 +1338,15 @@ function runResourceInstallCommand(subcommand, args, options = {}) {
     const reason = err instanceof ResourceInstallError && typeof err.code === "string"
       ? err.code
       : "resource_operation_failed";
-    const failure = Object.freeze({ ok: false, status: "refused", reason });
+    const recoveryEntries = recoveryEntriesForError(err);
+    const failure = Object.freeze({
+      ok: false,
+      status: "refused",
+      reason,
+      ...(recoveryEntries.length > 0 ? { recovery_entries: recoveryEntries } : {}),
+    });
     if (parsed.json) stdout.write(`${JSON.stringify(failure)}\n`);
-    else stderr.write(renderResourceInstallFailure(reason));
+    else stderr.write(renderResourceInstallFailure(reason, recoveryEntries));
     return 1;
   }
   stdout.write(parsed.json ? `${JSON.stringify(result)}\n` : renderResourceInstall(result));

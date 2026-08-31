@@ -15,7 +15,7 @@ process.on("exit", () => {
 });
 
 const { runResourcesCommand } = require("../bin/quadwork");
-const { ResourceInstallError, applyPolicy } = require("./resource-install");
+const { ResourceInstallError, policyProposal, applyPolicy } = require("./resource-install");
 const { DEFAULT_RUNTIME_RESOURCE_PROPOSAL } = require("./resource-policy");
 
 const configDir = path.join(tempHome, ".quadwork");
@@ -135,6 +135,66 @@ for (const args of [
   });
   assert.equal(stderr.value(), "");
   assert(!stdout.value().includes("secret"));
+}
+
+// Source-owned recovery metadata is exposed as bounded exact basenames in JSON
+// and human output. A public ResourceInstallError cannot mint those fields.
+{
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const probeEntries = [
+    ".resource-exchange-probe-111111111111111111111111-a",
+    ".resource-exchange-probe-111111111111111111111111-b",
+  ];
+  function failingHandle({ directory, fsImpl }) {
+    return {
+      ...pathConfigDirectoryHandle({ directory, fsImpl }),
+      assertExchangeAvailable: () => probeEntries,
+      exchange() { throw new Error("/secret/exchange token=do-not-leak"); },
+    };
+  }
+  function applyWithFailure(input) {
+    return applyPolicy(input, { configDirectoryHandleFactory: failingHandle });
+  }
+  const jsonOut = sink();
+  assert.equal(runResourcesCommand([
+    "configure", "--apply", "--policy-file", policyPath,
+    "--accept-sha256", token, "--json",
+  ], {
+    stdout: jsonOut.stream,
+    stderr: sink().stream,
+    applyPolicy: applyWithFailure,
+  }), 1);
+  const failure = JSON.parse(jsonOut.value());
+  assert.equal(failure.reason, "config_exchange_recovery_required");
+  assert.deepEqual(failure.recovery_entries.slice(0, 2), probeEntries);
+  assert.match(failure.recovery_entries[2], /^\.config\.json\.resource-install-\d+-[a-f0-9]{24}\.recovery$/);
+  assert(!jsonOut.value().includes("secret"));
+
+  const humanErr = sink();
+  assert.equal(runResourcesCommand([
+    "configure", "--apply", "--policy-file", policyPath,
+    "--accept-sha256", token,
+  ], {
+    stdout: sink().stream,
+    stderr: humanErr.stream,
+    applyPolicy: applyWithFailure,
+  }), 1);
+  assert.match(humanErr.value(), /Recovery entries \(exact basenames; never use wildcards\):/);
+  assert.match(humanErr.value(), new RegExp(probeEntries[0]));
+  assert(!humanErr.value().includes("secret"));
+
+  const untrustedOut = sink();
+  assert.equal(runResourcesCommand(["temp-install", "--json"], {
+    stdout: untrustedOut.stream,
+    stderr: sink().stream,
+    tempInstallProposal() {
+      const error = new ResourceInstallError("temp_root_low_capacity", "safe");
+      error.recovery_entries = ["secret-token"];
+      throw error;
+    },
+  }), 1);
+  assert.equal(Object.hasOwn(JSON.parse(untrustedOut.value()), "recovery_entries"), false);
+  assert(!untrustedOut.value().includes("secret-token"));
 }
 
 // Temp plan and apply dispatch preserve the exact accepted token and output

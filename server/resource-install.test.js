@@ -15,6 +15,7 @@ process.on("exit", () => {
 
 const {
   ResourceInstallError,
+  recoveryEntriesForError,
   policyProposal,
   applyPolicy,
   tempInstallProposal,
@@ -112,6 +113,19 @@ function code(expected) {
   return (err) => err instanceof ResourceInstallError && err.code === expected;
 }
 
+function captureError(callback, predicate) {
+  let captured;
+  assert.throws(() => {
+    try {
+      return callback();
+    } catch (err) {
+      captured = err;
+      throw err;
+    }
+  }, predicate);
+  return captured;
+}
+
 // Proposal validates and returns the exact strict policy and canonical token,
 // but does not create config, temp paths, or temporary siblings.
 reset();
@@ -126,6 +140,7 @@ reset();
     preserves_other_config_fields: true,
     creates_missing_config: false,
     previous_config_recovery: "private_random_sibling",
+    exchange_probe_recovery: "reported_private_siblings",
   });
   assert.equal(fs.readFileSync(configPath, "utf8"), configBefore);
   assert.equal(fs.existsSync(policy().temp_root), false);
@@ -142,16 +157,24 @@ reset();
   function fakeExchangeHelper(command, args, options) {
     helperCalls.push({ command, args: [...args], options });
     assert.equal(command, "/usr/bin/python3");
-    assert.equal(path.basename(args[0]), "resource-rename-exchange-helper.py");
-    assert.equal(args[2], "3");
+    assert.equal(args.length, 6);
+    assert.equal(args[0], "-I");
+    assert.equal(path.basename(args[1]), "resource-rename-exchange-helper.py");
+    assert.equal(args[3], "3");
     assert.equal(options.shell, false);
+    assert.deepEqual(options.env, { LANG: "C", LC_ALL: "C" });
+    assert.deepEqual(Object.keys(options.env).sort(), ["LANG", "LC_ALL"]);
     assert.equal(options.stdio[3] >= 0, true, "verified parent directory fd is inherited as child fd 3");
-    if (args[1] === "probe") return "";
-    assert.equal(args[1], "exchange");
+    if (args[2] === "probe") {
+      writePrivate(path.join(configDir, args[4]), "");
+      writePrivate(path.join(configDir, args[5]), "");
+    } else {
+      assert.equal(args[2], "exchange");
+    }
     const hold = path.join(configDir, ".resource-install-helper-test-hold");
-    fs.renameSync(path.join(configDir, args[3]), hold);
-    fs.renameSync(path.join(configDir, args[4]), path.join(configDir, args[3]));
-    fs.renameSync(hold, path.join(configDir, args[4]));
+    fs.renameSync(path.join(configDir, args[4]), hold);
+    fs.renameSync(path.join(configDir, args[5]), path.join(configDir, args[4]));
+    fs.renameSync(hold, path.join(configDir, args[5]));
     return "";
   }
   const result = applyPolicy(
@@ -162,7 +185,7 @@ reset();
       execFileSyncImpl: fakeExchangeHelper,
     },
   );
-  assert.deepEqual(helperCalls.map((call) => call.args[1]), ["probe", "exchange"]);
+  assert.deepEqual(helperCalls.map((call) => call.args[2]), ["probe", "exchange"]);
   assert.equal(result.status, "applied");
   const written = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.equal(written.port, 8400);
@@ -178,6 +201,14 @@ reset();
   assert.equal(recoveryIdentity.ino, previousIdentity.ino);
   assert.equal(recoveryIdentity.mode & 0o7777, 0o600);
   assert.equal(fs.readFileSync(recoveryPath, "utf8"), previous);
+  assert.equal(result.result.exchange_probe_recovery_entries.length, 2);
+  for (const entry of result.result.exchange_probe_recovery_entries) {
+    assert.match(entry, /^\.resource-exchange-probe-[a-f0-9]{24}-[ab]$/);
+    const probe = fs.lstatSync(path.join(configDir, entry));
+    assert.equal(probe.isFile(), true);
+    assert.equal(probe.mode & 0o7777, 0o600);
+    assert.equal(probe.nlink, 1);
+  }
 }
 
 // An unavailable Linux exchange primitive refuses before creating a candidate
@@ -189,32 +220,57 @@ reset();
   const before = fs.readFileSync(configPath, "utf8");
   const unavailable = new Error("unavailable");
   unavailable.status = 64;
-  assert.throws(
+  const unavailableError = captureError(
     () => applyPolicy(
       { policyFile: policyPath, acceptanceSha256: token },
       {
         platform: "linux",
         fsImpl: procFdFsAdapter(configDir),
-        execFileSyncImpl() { throw unavailable; },
+        execFileSyncImpl(_command, args, options) {
+          assert.equal(args[0], "-I");
+          assert.equal(args[2], "probe");
+          assert.deepEqual(options.env, { LANG: "C", LC_ALL: "C" });
+          writePrivate(path.join(configDir, args[4]), "");
+          writePrivate(path.join(configDir, args[5]), "");
+          throw unavailable;
+        },
       },
     ),
     code("config_exchange_unavailable"),
   );
   assert.equal(fs.readFileSync(configPath, "utf8"), before);
-  assert.deepEqual(fs.readdirSync(configDir), ["config.json"]);
+  const unavailableRecovery = recoveryEntriesForError(unavailableError);
+  assert.equal(unavailableRecovery.length, 2);
+  assert.deepEqual(
+    fs.readdirSync(configDir).sort(),
+    ["config.json", ...unavailableRecovery].sort(),
+    "unsupported probe leaves only its exact private artifacts, never a config candidate",
+  );
+  assert.equal(fs.readdirSync(configDir).some((name) => name.startsWith(".config.json.resource-install-")), false);
 
+  reset();
+  const retryToken = policyProposal(policyPath).acceptance.sha256;
   let calls = 0;
   const failed = new Error("failed");
   failed.status = 65;
-  assert.throws(
+  const failedError = captureError(
     () => applyPolicy(
-      { policyFile: policyPath, acceptanceSha256: token },
+      { policyFile: policyPath, acceptanceSha256: retryToken },
       {
         platform: "linux",
         fsImpl: procFdFsAdapter(configDir),
         execFileSyncImpl(_command, args) {
           calls += 1;
-          if (args[1] === "exchange") throw failed;
+          if (args[2] === "probe") {
+            writePrivate(path.join(configDir, args[4]), "");
+            writePrivate(path.join(configDir, args[5]), "");
+            const hold = path.join(configDir, ".probe-exchange-hold");
+            fs.renameSync(path.join(configDir, args[4]), hold);
+            fs.renameSync(path.join(configDir, args[5]), path.join(configDir, args[4]));
+            fs.renameSync(hold, path.join(configDir, args[5]));
+            return "";
+          }
+          if (args[2] === "exchange") throw failed;
           return "";
         },
       },
@@ -223,9 +279,67 @@ reset();
   );
   assert.equal(calls, 2);
   assert.equal(fs.readFileSync(configPath, "utf8"), before);
+  assert.equal(recoveryEntriesForError(failedError).length, 3);
   const recoveryEntries = fs.readdirSync(configDir).filter((name) => name.endsWith(".recovery"));
   assert.equal(recoveryEntries.length, 1);
   assert.equal(JSON.parse(fs.readFileSync(path.join(configDir, recoveryEntries[0]), "utf8")).runtime_resources.version, 1);
+}
+
+// A probe-name substitution is detected by the helper contract. The owner
+// reports both exact basenames and never removes the substituted inode or the
+// displaced probe; no config candidate exists because the probe did not pass.
+reset();
+{
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const victim = path.join(configDir, "probe-substitution-victim");
+  const displaced = path.join(configDir, "displaced-exchange-probe");
+  writePrivate(victim, "VICTIM");
+  const victimIdentity = fs.lstatSync(victim);
+  const failed = new Error("probe identity mismatch");
+  failed.status = 65;
+  const error = captureError(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      {
+        platform: "linux",
+        fsImpl: procFdFsAdapter(configDir),
+        execFileSyncImpl(_command, args) {
+          assert.equal(args[2], "probe");
+          writePrivate(path.join(configDir, args[4]), "");
+          writePrivate(path.join(configDir, args[5]), "");
+          fs.renameSync(path.join(configDir, args[4]), displaced);
+          fs.renameSync(victim, path.join(configDir, args[4]));
+          throw failed;
+        },
+      },
+    ),
+    code("config_exchange_probe_failed"),
+  );
+  const reported = recoveryEntriesForError(error);
+  assert.equal(reported.length, 2);
+  const victimAfter = fs.lstatSync(path.join(configDir, reported[0]));
+  assert.equal(victimAfter.dev, victimIdentity.dev);
+  assert.equal(victimAfter.ino, victimIdentity.ino);
+  assert.equal(fs.readFileSync(path.join(configDir, reported[0]), "utf8"), "VICTIM");
+  assert.equal(fs.existsSync(displaced), true);
+  assert.equal(fs.readdirSync(configDir).some((name) => name.startsWith(".config.json.resource-install-")), false);
+}
+
+// A platform without the descriptor-anchored Linux exchange implementation
+// refuses before any probe or candidate entry can be created.
+reset();
+{
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const before = fs.readFileSync(configPath, "utf8");
+  assert.throws(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      { platform: "darwin" },
+    ),
+    code("config_descriptor_anchor_unavailable"),
+  );
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+  assert.deepEqual(fs.readdirSync(configDir), ["config.json"]);
 }
 
 // The policy and config inputs must not have another hardlink that can retain
@@ -470,6 +584,68 @@ reset(undefined, policy());
   assert.equal(fs.existsSync(policy().temp_root), true, "failed install preserves its created root");
   assert.deepEqual(fs.readdirSync(policy().temp_root), []);
   fs.rmdirSync(policy().temp_root);
+}
+
+// mkdir can create its target and still throw through a filesystem wrapper.
+// Creation uncertainty is established before the call, so the new inode is
+// preserved and its exact basename is reported. A throw that leaves no entry
+// retains the precise ordinary install failure and reports no recovery inode.
+{
+  const proposal = tempInstallProposal({ statfs: diskStatfs });
+  const createThenThrowFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === "mkdirSync") return (targetPath, options) => {
+        fs.mkdirSync(targetPath, options);
+        const error = new Error("injected post-mkdir failure");
+        error.code = "EIO";
+        throw error;
+      };
+      const member = Reflect.get(target, property);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  const createdError = captureError(
+    () => applyTempInstall(
+      { acceptanceSha256: proposal.acceptance.sha256 },
+      {
+        platform: "darwin",
+        fsImpl: createThenThrowFs,
+        statfs: diskStatfs,
+        rootHandleFactory: pathRootHandle,
+      },
+    ),
+    code("temp_install_failed_cleanup_required"),
+  );
+  assert.deepEqual(recoveryEntriesForError(createdError), [path.basename(policy().temp_root)]);
+  assert.equal(fs.lstatSync(policy().temp_root).isDirectory(), true);
+  fs.rmdirSync(policy().temp_root);
+
+  const noCreateProposal = tempInstallProposal({ statfs: diskStatfs });
+  const throwWithoutCreateFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === "mkdirSync") return () => {
+        const error = new Error("injected no-create failure");
+        error.code = "EACCES";
+        throw error;
+      };
+      const member = Reflect.get(target, property);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  const noCreateError = captureError(
+    () => applyTempInstall(
+      { acceptanceSha256: noCreateProposal.acceptance.sha256 },
+      {
+        platform: "darwin",
+        fsImpl: throwWithoutCreateFs,
+        statfs: diskStatfs,
+        rootHandleFactory: pathRootHandle,
+      },
+    ),
+    code("temp_install_failed"),
+  );
+  assert.deepEqual(recoveryEntriesForError(noCreateError), []);
+  assert.equal(fs.existsSync(policy().temp_root), false);
 }
 
 // A would-be quarantine-name replacement cannot authorize deletion because

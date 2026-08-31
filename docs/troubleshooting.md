@@ -281,7 +281,14 @@ policy. It does not clean `/tmp/claude-*`, relocate an agent's `TMPDIR`, install
 systemd containment, restart a service, or establish staging evidence. On a
 failed create it intentionally performs no path-based cleanup; a
 `temp_install_failed_cleanup_required` refusal means the created root and any
-replacement entries were preserved for explicit inspection and recovery.
+replacement entries were preserved for explicit inspection and recovery. Its
+JSON `recovery_entries` contains exact basenames only. Use the accepted
+`temp_root` parent, stop all writers, and run the non-dereferencing Ubuntu
+`stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY"` twice for one quoted reported
+basename. Record and compare type, UID, mode, link count, device, and inode
+before any manual move or removal. Never use a wildcard, prefix match,
+`find -delete`, or remove a different entry; see the VPS install guide for the
+complete no-glob recovery sequence.
 
 - `proof_refused` means the disposable-host acknowledgement or the separate
   `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has

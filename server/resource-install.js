@@ -17,6 +17,10 @@ const POLICY_FILE_MAX_BYTES = 64 * 1024;
 const CONFIG_FILE_MAX_BYTES = 4 * 1024 * 1024;
 const ACCEPTANCE_RE = /^[a-f0-9]{64}$/;
 const EXCHANGE_HELPER = path.join(__dirname, "resource-rename-exchange-helper.py");
+const EXCHANGE_HELPER_ENV = Object.freeze({ LANG: "C", LC_ALL: "C" });
+const RECOVERY_ENTRIES = Symbol("resourceInstallRecoveryEntries");
+const MAX_RECOVERY_ENTRIES = 8;
+const MAX_RECOVERY_ENTRY_BYTES = 255;
 
 class ResourceInstallError extends Error {
   constructor(code, message) {
@@ -28,6 +32,48 @@ class ResourceInstallError extends Error {
 
 function fail(code, message) {
   throw new ResourceInstallError(code, message);
+}
+
+function normalizeRecoveryEntries(entries) {
+  if (!Array.isArray(entries)) return Object.freeze([]);
+  const accepted = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    if (accepted.length >= MAX_RECOVERY_ENTRIES) break;
+    if (typeof entry !== "string"
+      || entry.length === 0
+      || Buffer.byteLength(entry, "utf8") > MAX_RECOVERY_ENTRY_BYTES
+      || entry === "."
+      || entry === ".."
+      || entry.includes("\0")
+      || entry.includes("/")
+      || entry.includes("\\")
+      || path.basename(entry) !== entry
+      || seen.has(entry)) continue;
+    seen.add(entry);
+    accepted.push(entry);
+  }
+  return Object.freeze(accepted);
+}
+
+function createRecoveryError(code, message, entries) {
+  const error = new ResourceInstallError(code, message);
+  Object.defineProperty(error, RECOVERY_ENTRIES, {
+    configurable: false,
+    enumerable: false,
+    value: normalizeRecoveryEntries(entries),
+    writable: false,
+  });
+  return error;
+}
+
+function recoveryFailure(code, message, entries) {
+  throw createRecoveryError(code, message, entries);
+}
+
+function recoveryEntriesForError(error) {
+  if (!(error instanceof ResourceInstallError)) return Object.freeze([]);
+  return normalizeRecoveryEntries(error[RECOVERY_ENTRIES]);
 }
 
 function expectedUid(options) {
@@ -181,9 +227,11 @@ function validateEntryName(name) {
 }
 
 function runLinuxExchangeHelper(fd, mode, source, destination, execFileSyncImpl) {
+  const recoveryEntries = mode === "probe" ? [source, destination] : [];
   try {
-    execFileSyncImpl("/usr/bin/python3", [EXCHANGE_HELPER, mode, "3", source, destination], {
+    execFileSyncImpl("/usr/bin/python3", ["-I", EXCHANGE_HELPER, mode, "3", source, destination], {
       encoding: "utf8",
+      env: EXCHANGE_HELPER_ENV,
       maxBuffer: 4 * 1024,
       shell: false,
       stdio: ["ignore", "pipe", "pipe", fd],
@@ -191,8 +239,11 @@ function runLinuxExchangeHelper(fd, mode, source, destination, execFileSyncImpl)
       windowsHide: true,
     });
   } catch (err) {
-    if (mode === "probe" || (err && Number(err.status) === 64)) {
-      fail("config_exchange_unavailable", "atomic configuration exchange is unavailable");
+    if (err && Number(err.status) === 64) {
+      recoveryFailure("config_exchange_unavailable", "atomic configuration exchange is unavailable", recoveryEntries);
+    }
+    if (mode === "probe") {
+      recoveryFailure("config_exchange_probe_failed", "atomic configuration exchange probe requires explicit recovery", recoveryEntries);
     }
     fail("config_exchange_failed", "atomic configuration exchange failed");
   }
@@ -215,13 +266,12 @@ function linuxConfigDirectoryHandleFactory({ directory, fsImpl, execFileSyncImpl
     return {
       stat: () => fsImpl.fstatSync(fd),
       path: (name) => path.join(handleRoot, validateEntryName(name)),
-      assertExchangeAvailable: () => runLinuxExchangeHelper(
-        fd,
-        "probe",
-        `.resource-exchange-probe-${crypto.randomBytes(12).toString("hex")}`,
-        `.resource-exchange-probe-${crypto.randomBytes(12).toString("hex")}`,
-        execFileSyncImpl,
-      ),
+      assertExchangeAvailable: () => {
+        const stem = `.resource-exchange-probe-${crypto.randomBytes(12).toString("hex")}`;
+        const entries = Object.freeze([`${stem}-a`, `${stem}-b`]);
+        runLinuxExchangeHelper(fd, "probe", entries[0], entries[1], execFileSyncImpl);
+        return entries;
+      },
       exchange: (from, to) => runLinuxExchangeHelper(
         fd,
         "exchange",
@@ -262,8 +312,8 @@ function openConfigDirectoryHandle(directoryIdentity, options = {}) {
     if (typeof handle.assertExchangeAvailable !== "function" || typeof handle.exchange !== "function") {
       fail("config_exchange_unavailable", "atomic configuration exchange is unavailable");
     }
-    handle.assertExchangeAvailable();
-    return handle;
+    const probeEntries = normalizeRecoveryEntries(handle.assertExchangeAvailable());
+    return Object.freeze({ handle, probeEntries });
   } catch (err) {
     if (handle) {
       try { handle.close(); } catch {}
@@ -324,6 +374,7 @@ function policyProposal(policyFile, options = {}) {
       preserves_other_config_fields: true,
       creates_missing_config: false,
       previous_config_recovery: "private_random_sibling",
+      exchange_probe_recovery: "reported_private_siblings",
     }),
   });
 }
@@ -360,14 +411,17 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
   }
   let directoryHandle;
   let fd;
-  let candidateCreated = false;
+  let candidateAttempted = false;
   let exchangeAttempted = false;
   let exchanged = false;
+  let probeEntries = Object.freeze([]);
   try {
-    directoryHandle = openConfigDirectoryHandle(directoryIdentity, options);
+    const openedDirectory = openConfigDirectoryHandle(directoryIdentity, options);
+    directoryHandle = openedDirectory.handle;
+    probeEntries = openedDirectory.probeEntries;
     const temporaryPath = directoryHandle.path(temporary);
+    candidateAttempted = true;
     fd = fsImpl.openSync(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    candidateCreated = true;
     fsImpl.writeFileSync(fd, data, "utf8");
     fsImpl.fsyncSync(fd);
     const writtenStat = fsImpl.fstatSync(fd);
@@ -419,10 +473,25 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
     }
   } catch (err) {
     if (exchangeAttempted) {
-      fail("config_exchange_recovery_required", "configuration exchange requires explicit recovery");
+      recoveryFailure(
+        "config_exchange_recovery_required",
+        "configuration exchange requires explicit recovery",
+        [...probeEntries, temporary],
+      );
     }
-    if (candidateCreated) {
-      fail("config_write_failed_cleanup_required", "configuration candidate requires explicit recovery");
+    if (candidateAttempted) {
+      recoveryFailure(
+        "config_write_failed_cleanup_required",
+        "configuration candidate requires explicit recovery",
+        [...probeEntries, temporary],
+      );
+    }
+    if (probeEntries.length > 0) {
+      recoveryFailure(
+        "config_exchange_probe_cleanup_required",
+        "configuration exchange probe requires explicit recovery",
+        probeEntries,
+      );
     }
     if (err instanceof ResourceInstallError) throw err;
     fail("config_write_failed", "QuadWork configuration could not be updated atomically");
@@ -435,7 +504,7 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
     }
   }
   if (!exchanged) fail("config_exchange_failed", "atomic configuration exchange did not complete");
-  return Object.freeze({ recoveryEntry: temporary });
+  return Object.freeze({ recoveryEntry: temporary, probeEntries });
 }
 
 function applyPolicy({ policyFile, acceptanceSha256 }, options = {}) {
@@ -453,7 +522,10 @@ function applyPolicy({ policyFile, acceptanceSha256 }, options = {}) {
     acceptance: proposal.acceptance,
     policy: proposal.policy,
     plan: proposal.plan,
-    result: Object.freeze({ previous_config_recovery_entry: written.recoveryEntry }),
+    result: Object.freeze({
+      previous_config_recovery_entry: written.recoveryEntry,
+      exchange_probe_recovery_entries: written.probeEntries,
+    }),
   });
 }
 
@@ -585,7 +657,7 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
   const entryName = path.basename(proposal.plan.temp_root);
   let ensureRoot = proposal.plan.temp_root;
   let createdIdentity = null;
-  let createdUnverified = false;
+  let creationUncertain = false;
   let expectedRootIdentity = target.rootIdentity;
   let failure = null;
   try {
@@ -622,10 +694,29 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
     if (target.currentState === "create") {
       const fsImpl = options.fsImpl || fs;
       try {
-        fsImpl.mkdirSync(ensureRoot, { recursive: false, mode: 0o700 });
-        createdUnverified = true;
+        fsImpl.lstatSync(ensureRoot);
+        fail("temp_root_changed", "resource temp root appeared before apply");
       } catch (err) {
-        if (err && err.code === "EEXIST") fail("temp_root_changed", "resource temp root appeared before apply");
+        if (err instanceof ResourceInstallError) throw err;
+        if (!err || err.code !== "ENOENT") {
+          fail("temp_root_create_unverified", "resource temp root absence could not be verified before create");
+        }
+      }
+      // A filesystem wrapper can create the directory and still throw. Mark
+      // uncertainty before mkdir and clear it only after an anchored ENOENT or
+      // after the created inode has been captured and verified.
+      creationUncertain = true;
+      try {
+        fsImpl.mkdirSync(ensureRoot, { recursive: false, mode: 0o700 });
+      } catch (err) {
+        try {
+          fsImpl.lstatSync(ensureRoot);
+        } catch (inspectErr) {
+          if (inspectErr && inspectErr.code === "ENOENT") creationUncertain = false;
+        }
+        if (!creationUncertain && err && err.code === "EEXIST") {
+          fail("temp_root_changed", "resource temp root appeared before apply");
+        }
         throw err;
       }
       const created = fsImpl.lstatSync(ensureRoot);
@@ -637,7 +728,7 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
       }
       createdIdentity = created;
       expectedRootIdentity = created;
-      createdUnverified = false;
+      creationUncertain = false;
     } else {
       const existing = (options.fsImpl || fs).lstatSync(ensureRoot);
       if (!sameOwnedNode(existing, expectedRootIdentity)
@@ -681,10 +772,11 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
     failure = err instanceof ResourceInstallError
       ? err
       : new ResourceInstallError("temp_install_failed", "resource temp root could not be installed securely");
-    if (createdUnverified || createdIdentity) {
-      failure = new ResourceInstallError(
+    if (creationUncertain || createdIdentity) {
+      failure = createRecoveryError(
         "temp_install_failed_cleanup_required",
         "resource temp installation failed and the created root was preserved for explicit recovery",
+        [entryName],
       );
     }
   } finally {
@@ -702,6 +794,7 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
 
 module.exports = {
   ResourceInstallError,
+  recoveryEntriesForError,
   canonicalJson,
   sha256,
   policyProposal,

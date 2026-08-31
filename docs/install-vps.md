@@ -265,14 +265,55 @@ Apply re-reads the private policy file, refuses a stale token, and atomically
 updates only `runtime_resources` in the existing private
 `~/.quadwork/config.json`. It never creates a missing config or changes the
 other config fields. The Linux apply requires `/usr/bin/python3` and kernel/
-filesystem support for `renameat2(RENAME_EXCHANGE)`; it uses that atomic
-exchange and deliberately
-keeps the previous 0600 config as a randomly named private `.recovery` sibling;
-it never deletes that inode automatically. The JSON result identifies the
-recovery entry. Inspect and remove old recovery entries manually only after the
-new config is verified. If atomic exchange is unavailable or its displaced
-inode does not match the accepted config, apply refuses and preserves every
-entry for explicit recovery.
+filesystem support for `renameat2(RENAME_EXCHANGE)`. Python runs with `-I`, a
+fixed script and arguments, and only `LANG=C`/`LC_ALL=C`; it does not inherit
+`PATH`, `HOME`, `PYTHONPATH`, `PYTHONHOME`, loader variables, or other user
+environment. Before creating a config candidate, it creates two private 0600
+probe files through the verified config-directory descriptor, exchanges them
+on that exact filesystem, and verifies their moved inode identities. POSIX has
+no inode-conditional unlink, so the probe files are never deleted
+automatically. The JSON result reports them as
+`result.exchange_probe_recovery_entries`.
+
+The config exchange also deliberately keeps the previous 0600 config as a
+randomly named private `.recovery` sibling and reports it as
+`result.previous_config_recovery_entry`. A refusal after probe or candidate
+creation reports every known exact basename in `recovery_entries`. These names
+are recovery candidates, not permission to delete: an exchange race can leave
+an unexpected inode under any reported name. If atomic exchange is unavailable
+or its displaced inode does not match the accepted config, apply never reports
+success and preserves every entry for explicit recovery.
+
+On the target Ubuntu host, stop every process that can write
+`~/.quadwork`, then inspect exactly one reported basename at a time. `stat`
+without `-L` is the required non-dereferencing check. Replace only the quoted
+value below; do not derive it with a wildcard:
+
+```bash
+cd -- "$HOME/.quadwork" || exit 1
+ENTRY='.config.json.resource-install-12345-0123456789abcdef01234567.recovery'
+[ -n "$ENTRY" ] && [ "$ENTRY" != '.' ] && [ "$ENTRY" != '..' ] && \
+  [ "$(basename -- "$ENTRY")" = "$ENTRY" ] || { printf '%s\n' 'invalid recovery basename' >&2; exit 1; }
+OWNER_UID=$(id -u) || exit 1
+BEFORE=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+printf 'recovery record: %s\n' "$BEFORE"
+IFS='|' read -r TYPE ENTRY_UID MODE NLINK DEV INO <<EOF
+$BEFORE
+EOF
+[ "$TYPE" = 'regular file' ] && [ "$ENTRY_UID" = "$OWNER_UID" ] && \
+  [ "$MODE" = '600' ] && [ "$NLINK" = '1' ] || exit 1
+AFTER=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+[ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'recovery inode changed; stop' >&2; exit 1; }
+```
+
+Only after independently identifying the contents and repeating the exact
+`AFTER` check immediately before the action may the operator use an exact
+command such as `rm -- "$ENTRY"`. Never use `*`, a prefix match, `find
+-delete`, or remove a different entry. Run the same record/recheck sequence for
+each reported probe basename; empty content alone is not identity proof.
+A reported basename can be absent if the helper failed before creating it; an
+`ENOENT` for that exact name requires no cleanup and is not permission to inspect
+or delete similarly named entries.
 
 Next, propose the disk-backed, owner-only temp-root operation derived from the
 persisted policy:
@@ -292,7 +333,25 @@ ownership/mode, or insufficient accepted capacity. It does not clean legacy
 QuadWork, or run pressure tests. A failed create performs no automatic rename,
 quarantine, or deletion: it returns `temp_install_failed_cleanup_required` and
 leaves the operation-created root and any substituted entries for explicit
-operator recovery.
+operator recovery. The refusal JSON reports the exact target basename in
+`recovery_entries`. Use the accepted `temp_root` parent and that one basename,
+never a wildcard; record and recheck the non-dereferenced Ubuntu facts before
+any manual action:
+
+```bash
+TEMP_PARENT='/exact/parent/from-the-accepted-temp_root'
+ENTRY='exact-reported-temp-root-basename'
+cd -- "$TEMP_PARENT" || exit 1
+[ -n "$ENTRY" ] && [ "$ENTRY" != '.' ] && [ "$ENTRY" != '..' ] && \
+  [ "$(basename -- "$ENTRY")" = "$ENTRY" ] || { printf '%s\n' 'invalid recovery basename' >&2; exit 1; }
+BEFORE=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+printf 'temp recovery record: %s\n' "$BEFORE"
+AFTER=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+[ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'temp recovery inode changed; stop' >&2; exit 1; }
+```
+
+Do not move or remove it until its owner, type, mode, link count, device, inode,
+and contents are understood and the exact record still matches.
 
 Run the shipped diagnostic before considering any resource-containment work:
 
