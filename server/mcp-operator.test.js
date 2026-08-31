@@ -112,6 +112,20 @@ function sendJsonRpc(proc, msg) {
 function startFullServer() {
   const requests = [];
   const CONFIG = { projects: [{ id: "p", name: "P", repo: "o/r", agents: { dev: {} } }] };
+  const workItemRef = { repo_key: "primary", repo: "o/r", number: 1, kind: "issue" };
+  const assignmentItems = [{ work_item_ref: workItemRef, ownership_key: "owned-p-1" }];
+  const assignment = {
+    compatibility_mode: "v2",
+    installation_id: "installation-p",
+    batch_number: 1,
+    assignment_attempt: "attempt-p",
+    provenance: "owned",
+    assignment_key: "assignment-p",
+    assignment_items: assignmentItems,
+    current: true,
+    owned: true,
+    multi_repository: false,
+  };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       let raw = "";
@@ -125,8 +139,19 @@ function startFullServer() {
         };
         if (req.method === "GET" && pathOnly === "/api/config") return send(CONFIG);
         if (pathOnly === "/api/chat") return req.method === "GET" ? send([]) : send({ ok: true, message: { id: 1, sender: "user" } });
-        if (pathOnly === "/api/batch-active") return send({ active: false });
-        if (pathOnly === "/api/batch-progress") return send({ items: [] });
+        if (pathOnly === "/api/batch-active") return send({ ...assignment, active: true });
+        if (pathOnly === "/api/batch-progress") return send({
+          ...assignment,
+          complete: false,
+          completeConfirmed: false,
+          liveActiveBatchCleared: false,
+          items: [{
+            ...assignment,
+            ...workItemRef,
+            work_item_ref: workItemRef,
+            ownership_key: "owned-p-1",
+          }],
+        });
         if (pathOnly === "/api/queue") {
           if (req.method === "GET") return send({ ok: true, exists: true, content: "x" });
           if (req.method === "PUT") return send({ ok: true });
@@ -338,9 +363,9 @@ async function runTests() {
     { tool: "set_batch", args: { project: "p", content: "x" }, expect: [["PUT", "/api/queue"]] },
     { tool: "append_batch", args: { project: "p", content: "x" }, expect: [["GET", "/api/queue"], ["PUT", "/api/queue"]] },
     { tool: "ensure_batch", args: { project: "p" }, expect: [["POST", "/api/queue"]] },
-    { tool: "start_batch", args: { project: "p" }, expect: [["POST", "/api/triggers/p/start"]] },
-    { tool: "trigger_now", args: { project: "p" }, expect: [["POST", "/api/triggers/p/send-now"]] },
-    { tool: "stop_batch", args: { project: "p" }, expect: [["POST", "/api/triggers/p/stop"]] },
+    { tool: "start_batch", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"], ["POST", "/api/triggers/p/start"]] },
+    { tool: "trigger_now", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"], ["POST", "/api/triggers/p/send-now"]] },
+    { tool: "stop_batch", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"], ["POST", "/api/triggers/p/stop"]] },
     { tool: "agent_control", args: { project: "p", agent: "dev", action: "restart" }, expect: [["POST", "/api/agents/p/dev/restart"]] },
     { tool: "interrupt_all", args: { project: "p" }, expect: [["POST", "/api/agents/p/interrupt-all"]] },
   ];
