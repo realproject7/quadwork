@@ -749,6 +749,7 @@ const AUTOMATION_IDENTITY_FIELDS = Object.freeze([
   "provenance",
   "compatibility_mode",
   "batch_observation_fingerprint",
+  "current_batch_empty",
 ]);
 
 function carriesAutomationIdentity(body) {
@@ -2091,6 +2092,11 @@ function clearProjectBackgroundDemand(projectId) {
   }
   const batchEntry = _batchProgressRefreshes?.get(projectId);
   if (batchEntry && _batchProgressRefreshes.delete(projectId)) resources.batch_progress = 1;
+  if (_batchProgressCache?.has(projectId) || _batchCompleteState?.has(projectId)) resources.batch_progress = 1;
+  // A restart can leave only the durable row-acceleration file behind. Archive
+  // and removal cleanup must retire that presentation state too, even when the
+  // in-memory maps are cold. unlink is idempotent when the file is absent.
+  invalidateCurrentBatchPresentation(projectId, { persistent: true });
   return resources;
 }
 
@@ -3553,7 +3559,7 @@ function bindBatchAdmission(data, admission) {
 }
 
 function cacheBatchProgress(projectId, context, admission, data) {
-  const bound = bindBatchAdmission(data, admission);
+  const bound = bindBatchAdmission({ ...data, active: true }, admission);
   _batchProgressCache.set(projectId, {
     ts: Date.now(),
     fingerprint: context.fingerprint,
@@ -3565,8 +3571,13 @@ function cacheBatchProgress(projectId, context, admission, data) {
 
 function staleBatchObservationPayload(projectId, admission) {
   const latest = readLiveBatchContext(projectId);
+  if (latest?.queueReadOk === true && latest.parsed.workItems.length === 0 && latest.parsed.errors.length === 0) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(latest, admission, { _stale_observation: true });
+  }
   return bindBatchAdmission({
     ...assignmentView(latest, { current: false }),
+    active: false,
     items: [],
     summary: "",
     complete: false,
@@ -3577,12 +3588,39 @@ function staleBatchObservationPayload(projectId, admission) {
   }, admission);
 }
 
-// #429 / quadwork#316: persistent batch snapshot on disk so the
-// Batch Progress panel keeps showing merged items after Head moves
-// them from Active Batch to Done. The in-memory `_batchProgressCache`
-// above is a 10s TTL cache of the rendered rows; this new cache is
-// the *set of issue numbers* we currently consider "the active
-// batch", and it survives restarts + lives across polls.
+function invalidateCurrentBatchPresentation(projectId, { persistent = false } = {}) {
+  _batchProgressCache.delete(projectId);
+  _batchProgressRefreshes.delete(projectId);
+  _batchCompleteState.delete(projectId);
+  if (persistent) deleteBatchSnapshot(projectId);
+}
+
+function emptyCurrentBatchPayload(context, admission, extra = {}) {
+  const observed = assignmentView(context, { current: false });
+  return bindBatchAdmission({
+    ...observed,
+    active: false,
+    installation_id: null,
+    batch_number: null,
+    assignment_attempt: null,
+    provenance: context?.activated === true ? "unowned" : "legacy_unowned",
+    assignment_key: null,
+    current: false,
+    owned: false,
+    assignment_items: [],
+    items: [],
+    summary: "",
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: context?.queueReadOk === true,
+    batch_type: "code",
+    ...extra,
+  }, admission);
+}
+
+// Persistent row cache for the LIVE Current Batch. It may accelerate terminal
+// row resolution after a restart, but it is never current-work authority: the
+// live `## Active Batch` parse owns the displayed batch and item set.
 function batchSnapshotPath(projectId) {
   return path.join(CONFIG_DIR, projectId, "batch-progress-cache.json");
 }
@@ -3605,7 +3643,6 @@ function writeBatchSnapshot(projectId, snapshot) {
 }
 function deleteBatchSnapshot(projectId) {
   try {
-    if (isProjectArchived(projectId)) return;
     fs.unlinkSync(batchSnapshotPath(projectId));
   } catch {
     // Non-fatal — file may already be gone.
@@ -3614,32 +3651,6 @@ function deleteBatchSnapshot(projectId) {
 
 function isTerminalBatchItem(item) {
   return item && BATCH_TERMINAL_STATUSES.has(item.status);
-}
-
-function terminalItemsFromSnapshot(snapshot, batchNumber, issueNumbers) {
-  if (!snapshot || snapshot.batchNumber !== batchNumber || !Array.isArray(issueNumbers)) return new Map();
-  const source = snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {};
-  const wanted = new Set(issueNumbers);
-  const rows = new Map();
-  for (const [rawIssue, row] of Object.entries(source)) {
-    const n = parseInt(rawIssue, 10);
-    if (!wanted.has(n) || !isTerminalBatchItem(row)) continue;
-    rows.set(n, row);
-  }
-  return rows;
-}
-
-function collectTerminalItems(items, previous = new Map()) {
-  const rows = {};
-  for (const [n, row] of previous.entries()) {
-    if (isTerminalBatchItem(row)) rows[n] = row;
-  }
-  for (const row of Array.isArray(items) ? items : []) {
-    if (!Number.isInteger(row && row.issue_number)) continue;
-    if (isTerminalBatchItem(row)) rows[row.issue_number] = row;
-    else delete rows[row.issue_number];
-  }
-  return rows;
 }
 
 function snapshotHasOpenIssue(snapshot, n) {
@@ -3663,168 +3674,24 @@ function githubFileHasOpenIssue(parsed, n, ref = null) {
     item && item.number === n && String(item.state || "OPEN").toUpperCase() === "OPEN");
 }
 
-// #334: verify the snapshot's first issue number still exists on
-// GitHub before trusting the snapshot. A soft existence check is
-// enough — if the first issue genuinely 404s, treat the whole
-// snapshot as stale (most likely a leftover from a prior
-// project/repo that was purged) and let the caller drop it. One
-// gh call per cache miss, wrapped in the existing
-// BATCH_PROGRESS_TTL_MS cache upstream.
-//
-// Returns one of:
-//   "fresh"   — first issue resolved, snapshot is trustworthy
-//   "gone"    — first issue confirmed 404; snapshot should be dropped
-//   "unknown" — transient error (auth/network/timeout); leave
-//               snapshot alone and let the next cache miss retry
-async function checkBatchSnapshotFreshness(repo, snapshot) {
-  if (!snapshot || !Array.isArray(snapshot.issueNumbers) || snapshot.issueNumbers.length === 0) {
-    return "gone";
-  }
-  const first = snapshot.issueNumbers[0];
-  try {
-    // #828 P1: REST, not `gh issue view` (GraphQL). We only need existence, so
-    // the cheap REST issue endpoint suffices and keeps the whole batch-progress
-    // path off GraphQL.
-    await ghJsonExecAsync(["api", `repos/${repo}/issues/${first}`, "--jq", ".number"]);
-    return "fresh";
-  } catch (err) {
-    // gh surfaces a 404 via stderr text on a non-zero exit. Only
-    // the unambiguous "not found" / "could not resolve" shapes
-    // count as genuinely gone; anything else (network, auth,
-    // timeout) is transient and must NOT delete the snapshot.
-    const msg = String((err && (err.stderr || err.message)) || "").toLowerCase();
-    if (msg.includes("could not resolve") || msg.includes("not found") || msg.includes("http 404")) {
-      return "gone";
-    }
-    return "unknown";
-  }
-}
-
-// Decide which batch to render, combining the live parse of
-// OVERNIGHT-QUEUE.md with the persistent snapshot. The snapshot is
-// replaced whenever a new batch starts (explicit Batch: N bump OR
-// the live Active Batch contains items the snapshot doesn't); in
-// all other cases the snapshot wins, so items Head moved to Done
-// stay visible until the operator starts the next batch.
-// Decide whether the displayed batch comes from the LIVE Active Batch parse or
-// the preserved snapshot. A new batch (explicit Batch: N bump OR live items the
-// snapshot doesn't have) → "live"; otherwise a non-empty snapshot wins
-// ("snapshot"), so items Head moved to Done stay visible until the next batch
-// starts. Extracted so #870's type pre-check follows the SAME decision.
-function pickDisplayedSource(current, snapshot) {
-  const hasExplicitBump =
-    current.batchNumber !== null &&
-    (!snapshot || snapshot.batchNumber === null || current.batchNumber > snapshot.batchNumber);
-  const hasNewItems =
-    current.issueNumbers.length > 0 &&
-    (!snapshot || current.issueNumbers.some((n) => !snapshot.issueNumbers.includes(n)));
-  if (hasExplicitBump || hasNewItems) return "live";
-  if (snapshot && Array.isArray(snapshot.issueNumbers) && snapshot.issueNumbers.length > 0) return "snapshot";
-  return "live";
-}
-
 function resolveDisplayedBatch(
   queueText,
   projectId,
-  // #899: snapshot I/O is injectable so the live-progression path is unit-
-  // testable without writing to the real ~/.quadwork/{id}/batch-progress-cache.json
-  // (which belongs to the running orchestrator). Production callers pass nothing
-  // and get the real readers/writers.
-  { queueReadOk = true, _readSnapshot = readBatchSnapshot, _writeSnapshot = writeBatchSnapshot } = {},
+  { queueReadOk = true } = {},
 ) {
-  // Queue file deleted / unreadable → fall back to empty state per
-  // #316's edge case. Returning the snapshot here would "heal" a
-  // genuinely missing file into stale data the operator can't
-  // reconcile without nuking ~/.quadwork/{id}/batch-progress-cache.json
-  // manually.
+  void projectId;
   if (!queueReadOk) return { batchNumber: null, issueNumbers: [], batch_type: "code", reviewItems: [] };
   const current = parseActiveBatch(queueText);
-  const snapshot = _readSnapshot(projectId);
-  const source = pickDisplayedSource(current, snapshot);
-  let next;
-  if (source === "live") {
-    next = {
-      batchNumber: current.batchNumber,
-      issueNumbers: current.issueNumbers.slice(),
-      // #870: type + per-item review states from the LIVE Active Batch.
-      batch_type: parseBatchType(queueText),
-      reviewItems: parseReviewItems(queueText),
-    };
-  } else {
-    next = {
-      batchNumber: snapshot.batchNumber ?? null,
-      issueNumbers: snapshot.issueNumbers.slice(),
-      // #870: a just-archived review batch keeps its type + review states from
-      // the snapshot, so it renders without GitHub and is NEVER reinterpreted
-      // as code. Absent (legacy / code snapshots) → "code"/[] — back-compatible.
-      batch_type: snapshot.batch_type || "code",
-      reviewItems: Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : [],
-      terminalItems: snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {},
-    };
-    // #899: snapshot stickiness preserves the displayed issue SET (so items Head
-    // moved to Done stay visible — #316/#429), but a review batch's per-item
-    // state lives in the QUEUE, not on GitHub. When the same batch number +
-    // issue set persist and only review states change in place
-    // (queued → in-review → approved), pickDisplayedSource finds no bump / no
-    // new items and returns "snapshot" — which froze reviewItems at their
-    // first-seen states AND re-persisted them each cycle. So while the live
-    // Active Batch is still present (non-empty), refresh batch_type + reviewItems
-    // from the LIVE queue. We are already in the "snapshot" branch, so a
-    // non-empty live parse here is necessarily the SAME batch (no explicit bump,
-    // every live issue already in the snapshot) — never a newer one. The
-    // snapshot's reviewItems stay authoritative ONLY once the Active Batch is
-    // cleared (archived), where the live parse is empty and this is skipped.
-    // Code batches are unaffected: their live parse yields batch_type "code" /
-    // reviewItems [] — identical to what the snapshot already holds.
-    if (current.issueNumbers.length > 0) {
-      next.batch_type = parseBatchType(queueText);
-      // re1 on #900: MERGE, don't replace. When Head moves an approved item out
-      // of Active Batch (→ Done) before the whole batch is archived, the snapshot
-      // still preserves its issue number in next.issueNumbers, but the LIVE queue
-      // no longer carries its line. A wholesale `parseReviewItems(queueText)`
-      // would drop that item's final state from the displayed set (and from the
-      // re-persisted snapshot). So derive reviewItems across the preserved issue
-      // set: live state for items still in Active Batch, snapshot state for items
-      // moved to Done, queued as a last-resort default for any issue number with
-      // neither. This keeps the per-item count aligned with next.issueNumbers.
-      const liveByIssue = new Map(parseReviewItems(queueText).map((r) => [r.issue, r]));
-      const snapByIssue = new Map(
-        (Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : []).map((r) => [r.issue, r]),
-      );
-      next.reviewItems = next.issueNumbers.map(
-        (n) => liveByIssue.get(n) || snapByIssue.get(n) || { issue: n, review_state: "queued", approvals: 0 },
-      );
-    } else {
-      // #925: the Active Batch is empty → this is the just-ARCHIVED batch's
-      // sticky display (#870). The snapshot's reviewItems can be frozen at a
-      // pre-final state when the last item's approval + the archive landed
-      // between polls, so the panel never read as complete. Head's matching
-      // `## Done` block holds the authoritative final states — read them for
-      // THIS batch only. Gated on the Done block being a review batch, so code
-      // batches (Done lines carry no state → "queued") are left untouched and
-      // keep using the GitHub-derived path. Merge across the preserved issue
-      // set (Done state first, then snapshot, then queued) to stay aligned with
-      // next.issueNumbers — same shape as the #899/#900 live-refresh above.
-      const doneBatch = parseDoneBatchReviewItems(queueText, next.batchNumber);
-      if (doneBatch && REVIEW_BATCH_TYPES.has(doneBatch.batch_type) && doneBatch.reviewItems.length > 0) {
-        next.batch_type = doneBatch.batch_type;
-        const doneByIssue = new Map(doneBatch.reviewItems.map((r) => [r.issue, r]));
-        const snapByIssue = new Map(
-          (Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : []).map((r) => [r.issue, r]),
-        );
-        next.reviewItems = next.issueNumbers.map(
-          (n) => doneByIssue.get(n) || snapByIssue.get(n) || { issue: n, review_state: "queued", approvals: 0 },
-        );
-      }
-    }
+  const issueNumbers = current.issueNumbers.slice();
+  if (issueNumbers.length === 0) {
+    return { batchNumber: null, issueNumbers: [], batch_type: "code", reviewItems: [] };
   }
-  // Snapshot persists batchNumber/issueNumbers (existing consumers) PLUS the
-  // additive #870 batch_type/reviewItems. With the #899 refresh above, the
-  // snapshot now also captures the LATEST live review states each cycle, so the
-  // post-archive sticky view shows the FINAL states (all approved) rather than
-  // the first-seen ones.
-  if (next.issueNumbers.length > 0) _writeSnapshot(projectId, next);
-  return next;
+  return {
+    batchNumber: current.batchNumber,
+    issueNumbers,
+    batch_type: parseBatchType(queueText),
+    reviewItems: parseReviewItems(queueText),
+  };
 }
 const BATCH_PROGRESS_TTL_MS = 10000;
 
@@ -4042,48 +3909,6 @@ function parseReviewItems(queueText, options = {}) {
     const { review_state, approvals } = parseReviewState(ref.trailing);
     return { issue: ref.number, ref: ref.ref || ref, review_state, approvals };
   });
-}
-
-// #925: parse the per-item review states from the ONE `## Done` block whose
-// `**Batch:** N` matches `batchNumber`. After a review batch is archived the
-// Active Batch is empty, so resolveDisplayedBatch serves the snapshot — whose
-// reviewItems can be frozen at a pre-final state (the final approval + archive
-// happened between the 30s polls). Head's Done block holds the AUTHORITATIVE
-// final states, so for the archived (displayed) batch we read them from there.
-// Scoped to the single matching block — every OTHER Done batch stays ignored
-// (#870: never count `## Done` for progress beyond this one sticky block).
-// Returns { batch_type, reviewItems } or null if no matching block exists.
-const DONE_BATCH_MARKER_RE = /^\s*\*\*Batch:\*\*\s*(\d+)\s*$/gmi;
-function parseDoneBatchReviewItems(queueText, batchNumber, options = {}) {
-  if (typeof queueText !== "string" || !queueText || !Number.isInteger(batchNumber)) return null;
-  const done = sectionByHeading(queueText, "Done");
-  if (!done) return null;
-  // Split the Done section into per-batch blocks at each `**Batch:** N` marker
-  // (`**Batch type:**` is NOT matched — it has no `:` right after "Batch").
-  const markers = [];
-  let mk;
-  DONE_BATCH_MARKER_RE.lastIndex = 0;
-  while ((mk = DONE_BATCH_MARKER_RE.exec(done)) !== null) {
-    markers.push({ num: parseInt(mk[1], 10), start: mk.index });
-  }
-  const idx = markers.findIndex((b) => b.num === batchNumber);
-  if (idx === -1) return null;
-  const block = done.slice(markers[idx].start, idx + 1 < markers.length ? markers[idx + 1].start : done.length);
-  const parsedBatchType = standaloneMetadataValue(
-    block,
-    /^\s*\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\s*$/i,
-  );
-  const batch_type = parsedBatchType ? parsedBatchType.toLowerCase() : "code";
-  const kind = batch_type === "pr-review" ? "pr" : "issue";
-  const parsed = parseQueueWorkItems(block, {
-    repositories: options.repositories || options.bindings || [],
-    kind,
-  });
-  const reviewItems = parsed.workItems.map((ref) => {
-    const { review_state, approvals } = parseReviewState(ref.trailing);
-    return { issue: ref.number, ref: ref.ref || ref, review_state, approvals };
-  });
-  return { batch_type, reviewItems };
 }
 
 function publicWorkItemRef(ref) {
@@ -4519,13 +4344,10 @@ function summarizeItems(items) {
 // undefined input — current callers always pass a value), defensively
 // treated as "not active" at the route.
 //
-// #864: lifecycle consumers (this route, trigger auto-stop, reseed safe-boundary
-// checks via isActiveFromProgress) must NOT consider an explicitly cleared
-// `## Active Batch` section as active. resolveDisplayedBatch still serves the
-// preserved snapshot so /api/batch-progress can render the prior batch for
-// history, but the lifecycle signal must follow the operator's intent. The
-// `liveActiveBatchCleared` flag set by getOrComputeBatchProgress short-circuits
-// the items-based check below.
+// #864/#1050: lifecycle consumers (this route, trigger auto-stop, reseed
+// safe-boundary checks via isActiveFromProgress) must not consider an explicitly
+// cleared `## Active Batch` section active. The live parse is the sole Current
+// Batch authority; `liveActiveBatchCleared` makes that signal explicit.
 function isBatchActiveFromProgress(progress) {
   if (!progress) return null;
   if (progress.liveActiveBatchCleared) return false;
@@ -4776,6 +4598,39 @@ function validateCurrentOwnedAssignment(projectId, body = {}) {
 }
 
 function validateCurrentAutomationRequest(projectId, body = {}) {
+  if (Object.prototype.hasOwnProperty.call(body, "current_batch_empty")) {
+    if (body.current_batch_empty !== true ||
+        ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance"]
+          .some((field) => Object.prototype.hasOwnProperty.call(body, field))) {
+      return {
+        ok: false,
+        status: 409,
+        code: "project_assignment_changed",
+        error: "project assignment changed; refresh and retry",
+        project_id: projectId,
+      };
+    }
+    const generation = body.admission_generation;
+    const admission = projectAdmission(projectId);
+    const context = readLiveBatchContext(projectId);
+    const compatibilityMode = assignmentView(context, { current: false })?.compatibility_mode;
+    const exactEmpty = context?.queueReadOk === true &&
+      context.parsed.workItems.length === 0 && context.parsed.errors.length === 0 &&
+      typeof body.batch_observation_fingerprint === "string" &&
+      body.batch_observation_fingerprint === context.fingerprint &&
+      body.compatibility_mode === compatibilityMode;
+    if (!Number.isSafeInteger(generation) || generation < 0 || !admission ||
+        admission.generation !== generation || !isAdmissionCurrent(admission) || !exactEmpty) {
+      return {
+        ok: false,
+        status: 409,
+        code: "project_assignment_changed",
+        error: "project assignment changed; refresh and retry",
+        project_id: projectId,
+      };
+    }
+    return { ok: true, manual: false, cleared: true, compatibility_mode: compatibilityMode, context, admission };
+  }
   const assignment = validateCurrentOwnedAssignment(projectId, body);
   if (!assignment.ok || assignment.manual === true) return assignment;
   const generation = body.admission_generation;
@@ -4819,6 +4674,7 @@ function diagnosticBatchPayload(context) {
   }, ref.ref || ref, assignment));
   return {
     ...assignment,
+    active: items.length > 0,
     items,
     summary: errors.length > 0 ? "Queue validation failed" : "Assignment is not locally owned",
     complete: false,
@@ -4832,12 +4688,30 @@ function diagnosticBatchPayload(context) {
 async function getOrComputeBatchProgress(projectId) {
   const context = readLiveBatchContext(projectId);
   if (isProjectArchived(projectId)) {
-    return { ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context?.batchType || "code", _archived: true, _readonly: true };
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
   }
   if (!context || context.repositories.length === 0) return null;
   const observedAdmission = projectAdmission(projectId);
   if (!observedAdmission) {
-    return { ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context.batchType, _archived: true, _readonly: true };
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
+  }
+  if (context.queueReadOk !== true ||
+      (context.parsed.workItems.length === 0 && context.parsed.errors.length === 0)) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: context.queueReadOk === true });
+    return emptyCurrentBatchPayload(context, observedAdmission, {
+      liveActiveBatchCleared: context.queueReadOk === true,
+      ...(context.queueReadOk === true ? {} : { _queue_unavailable: true }),
+    });
   }
   const cached = _batchProgressCache.get(projectId);
   const matchingCached = cached &&
@@ -4851,7 +4725,10 @@ async function getOrComputeBatchProgress(projectId) {
   // precede the fresh-cache and rate-limit returns below.
   if (isProjectIdle(projectId)) {
     if (matchingCached) return { ...matchingCached.data, _idle: true };
-    return bindBatchAdmission({ ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context.batchType, _idle: true }, observedAdmission);
+    return emptyCurrentBatchPayload(context, observedAdmission, {
+      liveActiveBatchCleared: false,
+      _idle: true,
+    });
   }
   if (context.activated && (context.parsed.errors.length > 0 || context.parsed.provenance !== "owned" || !context.parsed.assignmentKey)) {
     return bindBatchAdmission(diagnosticBatchPayload(context), observedAdmission);
@@ -4874,7 +4751,12 @@ async function getOrComputeBatchProgress(projectId) {
 
   const admission = projectAdmission(projectId, { demand: true });
   if (!admission) {
-    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
   }
   if (matchingCached) {
     startBatchProgressRefresh(projectId, context, admission);
@@ -4900,15 +4782,42 @@ function startBatchProgressRefresh(projectId, context, admission) {
   return entry.promise;
 }
 
-function ownedTerminalRows(snapshot, context) {
+function cachedRowWorkItemKey(row) {
+  const ref = row?.work_item_ref;
+  if (!ref || typeof ref !== "object") return null;
+  return canonicalWorkItemKey({
+    repoKey: ref.repo_key,
+    repo: ref.repo,
+    number: ref.number,
+    kind: ref.kind,
+  });
+}
+
+function ownedTerminalRows(snapshot, context, admission) {
   const rows = new Map();
   const assignment = assignmentView(context, { current: true });
-  if (!snapshot || snapshot.schema_version !== 2 || snapshot.assignment_key !== context.parsed.assignmentKey ||
+  if (!snapshot || snapshot.schema_version !== 2 ||
+      snapshot.admission_generation !== admission?.generation ||
+      snapshot.batch_observation_fingerprint !== context.fingerprint ||
+      snapshot.installation_id !== assignment.installation_id ||
+      snapshot.batchNumber !== assignment.batch_number ||
+      snapshot.assignment_attempt !== assignment.assignment_attempt ||
+      snapshot.assignment_key !== context.parsed.assignmentKey ||
       JSON.stringify(snapshot.assignment_items || []) !== JSON.stringify(assignment.assignment_items)) return rows;
   const source = snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {};
+  const expectedByKey = new Map(assignment.assignment_items.map((item) => [
+    cachedRowWorkItemKey({ work_item_ref: item.work_item_ref }),
+    item,
+  ]));
   for (const item of context.parsed.workItems) {
     const row = source[item.key];
-    if (isTerminalBatchItem(row)) rows.set(item.key, row);
+    const expected = expectedByKey.get(item.key);
+    if (isTerminalBatchItem(row) && expected && cachedRowWorkItemKey(row) === item.key &&
+        row.ownership_key === expected.ownership_key && row.assignment_key === assignment.assignment_key &&
+        row.installation_id === assignment.installation_id && row.batch_number === assignment.batch_number &&
+        row.assignment_attempt === assignment.assignment_attempt && row.provenance === "owned") {
+      rows.set(item.key, row);
+    }
   }
   return rows;
 }
@@ -4936,8 +4845,8 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
   const assignment = assignmentView(context, { current: refs.length > 0 });
   const liveActiveBatchCleared = refs.length === 0;
   if (refs.length === 0) {
-    const data = { ...assignment, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type: context.batchType };
-    return cacheBatchProgress(projectId, context, admission, data);
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, admission);
   }
 
   if (REVIEW_BATCH_TYPES.has(context.batchType)) {
@@ -4958,7 +4867,7 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
       item.ref,
       assignment,
     ));
-    if (!stillCurrent()) return { ...diagnosticBatchPayload(readLiveBatchContext(projectId)), current: false, owned: false };
+    if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
     const complete = reviewItems.length > 0 && reviewItems.every((item) => item.review_state === "approved");
     const data = {
       ...assignment,
@@ -4969,23 +4878,29 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
       liveActiveBatchCleared,
       batch_type: context.batchType,
     };
-    writeBatchSnapshot(projectId, {
-      schema_version: 2,
-      assignment_key: assignment.assignment_key,
-      installation_id: assignment.installation_id,
-      batchNumber: assignment.batch_number,
-      assignment_attempt: assignment.assignment_attempt,
-      assignment_items: assignment.assignment_items,
-      workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
-      batch_type: context.batchType,
-      reviewItems,
-      terminalItems: {},
-    });
+    if (complete) {
+      deleteBatchSnapshot(projectId);
+    } else {
+      writeBatchSnapshot(projectId, {
+        schema_version: 2,
+        admission_generation: admission.generation,
+        batch_observation_fingerprint: context.fingerprint,
+        assignment_key: assignment.assignment_key,
+        installation_id: assignment.installation_id,
+        batchNumber: assignment.batch_number,
+        assignment_attempt: assignment.assignment_attempt,
+        assignment_items: assignment.assignment_items,
+        workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
+        batch_type: context.batchType,
+        reviewItems,
+        terminalItems: {},
+      });
+    }
     return cacheBatchProgress(projectId, context, admission, data);
   }
 
   const diskSnapshot = readBatchSnapshot(projectId);
-  const terminalRows = ownedTerminalRows(diskSnapshot, context);
+  const terminalRows = ownedTerminalRows(diskSnapshot, context, admission);
   const parsedGithub = loadGithubParsed(projectId);
   const items = await _mapLimited(refs, GH_MAX_CONCURRENT, async (item) => {
     const ref = item.ref || item;
@@ -5009,7 +4924,7 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
     if (!row) row = softRetryingRow(ref.number);
     return decorateBatchRow(row, ref, assignment);
   });
-  if (!stillCurrent()) return { ...diagnosticBatchPayload(readLiveBatchContext(projectId)), current: false, owned: false };
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
   const complete = items.every((item) => isTerminalBatchItem(item));
   const cycle = refs
     .map((item) => _graphqlCache.get(canonicalGithubRepo(item.repo))?.ts || null)
@@ -5026,24 +4941,34 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
     liveActiveBatchCleared,
     batch_type: context.batchType,
   };
-  writeBatchSnapshot(projectId, {
-    schema_version: 2,
-    assignment_key: assignment.assignment_key,
-    installation_id: assignment.installation_id,
-    batchNumber: assignment.batch_number,
-    assignment_attempt: assignment.assignment_attempt,
-    assignment_items: assignment.assignment_items,
-    workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
-    batch_type: context.batchType,
-    reviewItems: [],
-    terminalItems: ownedTerminalSnapshot(items, terminalRows),
-  });
+  if (complete) {
+    deleteBatchSnapshot(projectId);
+  } else {
+    writeBatchSnapshot(projectId, {
+      schema_version: 2,
+      admission_generation: admission.generation,
+      batch_observation_fingerprint: context.fingerprint,
+      assignment_key: assignment.assignment_key,
+      installation_id: assignment.installation_id,
+      batchNumber: assignment.batch_number,
+      assignment_attempt: assignment.assignment_attempt,
+      assignment_items: assignment.assignment_items,
+      workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
+      batch_type: context.batchType,
+      reviewItems: [],
+      terminalItems: ownedTerminalSnapshot(items, terminalRows),
+    });
+  }
   return cacheBatchProgress(projectId, context, admission, data);
 }
 
 async function computeBatchProgress(projectId, contextOrRepo, admission = projectAdmission(projectId, { demand: true })) {
   if (!admission || !isAdmissionCurrent(admission)) {
-    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
+    return emptyCurrentBatchPayload(null, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
   }
   const context = contextOrRepo && typeof contextOrRepo === "object" && contextOrRepo.parsed
     ? contextOrRepo
@@ -5065,77 +4990,30 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
   const queueText = context.queueText;
   const queueReadOk = context.queueReadOk;
 
-  // #334 / quadwork#334: validate the on-disk snapshot against
-  // GitHub before resolveDisplayedBatch can serve it. A snapshot
-  // whose first issue 404s is almost certainly a leftover from a
-  // prior project/repo that was purged; drop the file so the
-  // resolver falls through to the live queue parse (which will
-  // typically also be empty) instead of serving stale data
-  // indefinitely. We only run the check on cache-miss paths (this
-  // route already sits behind BATCH_PROGRESS_TTL_MS) and only
-  // when we'd actually rely on the snapshot — i.e. the live queue
-  // read succeeded, so the existing #316 bypass for unreadable
-  // queue files keeps precedence.
-  // #870: determine the displayed batch type up front (read-only) so review
-  // batches skip the GitHub snapshot-freshness check AND the merge-state path
-  // below entirely. The displayed type follows the SAME live-vs-snapshot
-  // decision as resolveDisplayedBatch: a just-archived review batch's live
-  // `**Batch type:**` is gone, so its type must come from the persisted snapshot.
-  const _liveActive = parseActiveBatch(queueText);
-  const _existingSnap = queueReadOk ? readBatchSnapshot(projectId) : null;
-  const _displaySource = queueReadOk ? pickDisplayedSource(_liveActive, _existingSnap) : "live";
-  const displayedBatchType =
-    _displaySource === "snapshot"
-      ? (_existingSnap && _existingSnap.batch_type) || "code"
-      : parseBatchType(queueText);
-  const isReviewBatch = REVIEW_BATCH_TYPES.has(displayedBatchType);
-
-  // #334: validate the on-disk snapshot's first issue against GitHub before
-  // resolveDisplayedBatch can serve it — CODE batches only. Review batches must
-  // make ZERO GitHub calls, and their snapshot issue numbers are queue-authored
-  // (not subject to the purged-repo staleness this check guards).
-  if (queueReadOk && !isReviewBatch) {
-    const existing = readBatchSnapshot(projectId);
-    if (existing && Array.isArray(existing.issueNumbers) && existing.issueNumbers.length > 0) {
-      const freshness = await checkBatchSnapshotFreshness(repo, existing);
-      if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
-      if (freshness === "gone") deleteBatchSnapshot(projectId);
-      // "unknown" → leave the file alone; transient failure will
-      // retry on the next cache miss.
-    }
-  }
-
-  // #429 / quadwork#316: resolve the displayed batch through the
-  // snapshot-aware helper so merged items stay visible after Head
-  // moves them from Active Batch to Done, until a new batch starts.
   const { batchNumber, issueNumbers, batch_type, reviewItems } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
-  // #864: lifecycle-signal flag. The displayed batch may be the preserved
-  // snapshot (so /api/batch-progress keeps showing it), but lifecycle consumers
-  // (/api/batch-active, trigger auto-stop, reseed safe-boundary) must follow
-  // the operator's explicit clear. Compute from the LIVE parse, only when the
-  // queue file actually read OK — the #316 bypass (queueReadOk=false) must NOT
-  // be mistaken for an explicit clear, since the operator never touched it.
-  const liveActiveBatchCleared = queueReadOk && parseActiveBatch(queueText).issueNumbers.length === 0;
+  const liveActiveBatchCleared = issueNumbers.length === 0;
   // #828 P2: batch identity = number + issue set. evalBatchCompleteConfirmed
   // resets its streak when this changes, so a new already-complete batch can't
   // inherit the prior batch's first cycle and confirm in one tick.
   const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
-  const terminalRows = terminalItemsFromSnapshot(readBatchSnapshot(projectId), batchNumber, issueNumbers);
   if (issueNumbers.length === 0) {
     if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
-    evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
-    const data = { ...legacyAssignment, batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type };
-    return cacheBatchProgress(projectId, context, admission, data);
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, admission);
   }
 
+  // Legacy numeric snapshots cannot prove a composite WorkItemRef identity.
+  // Retire them on first live observation; V1 remains live-queue driven and
+  // falls back to the GitHub sources instead of reusing ambiguous rows.
+  deleteBatchSnapshot(projectId);
+
   // #870: review batch — progress computed ENTIRELY from the current Active
-  // Batch item states (or the preserved snapshot's), with NO GitHub calls. The
+  // Batch item states, with NO GitHub calls. The
   // queue is HEAD-authored and authoritative, so completeConfirmed = complete —
   // do NOT route through evalBatchCompleteConfirmed (its two-cycle distinct-ts
   // guard never advances without a #806 GraphQL fetch a review batch never makes).
   if (batch_type === "ticket-review" || batch_type === "pr-review") {
-    // Defensive: a review batch should always carry per-item states, but if the
-    // snapshot somehow has issue numbers without them, treat all as queued.
+    // Defensive: a review batch should always carry per-item states.
     const ri = reviewItems.length > 0
       ? reviewItems
       : issueNumbers.map((n) => ({ issue: n, review_state: "queued", approvals: 0 }));
@@ -5171,8 +5049,6 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
       if (!stillCurrent()) return softRetryingRow(n);
       const fromSnap = progressFromSnapshot(snapshot, n);
       if (fromSnap) return fromSnap;
-      const fromTerminalCache = terminalRows.get(n);
-      if (fromTerminalCache && !snapshotHasOpenIssue(snapshot, n)) return fromTerminalCache;
       try {
         return await progressForItemRest(repo, n, stillCurrent);
       } catch {
@@ -5184,7 +5060,7 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
     // Search. Items the file can't classify render soft "queued (retrying)" and
     // firm up next cycle once _graphqlCache repopulates.
     const parsed = loadGithubParsed(projectId);
-    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || terminalRows.get(n) || softRetryingRow(n));
+    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || softRetryingRow(n));
   }
   if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
   const legacyRefByNumber = new Map(context.parsed.workItems.map((item) => [item.number, item.ref || item]));
@@ -5202,14 +5078,6 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
   const data = { ...legacyAssignment, batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
-  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
-  writeBatchSnapshot(projectId, {
-    batchNumber,
-    issueNumbers: issueNumbers.slice(),
-    batch_type,
-    reviewItems,
-    terminalItems: collectTerminalItems(items, terminalRows),
-  });
   if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
   return cacheBatchProgress(projectId, context, admission, data);
 }
@@ -6918,16 +6786,11 @@ module.exports = router;
 // outside this file; the export is strictly for the node:assert
 // script at server/routes.parseActiveBatch.test.js.
 module.exports.parseActiveBatch = parseActiveBatch;
-// #899: expose the live-vs-snapshot resolver + its source picker so the
-// in-place review-state progression path is unit-testable with injected
-// snapshot I/O (no writes to the real ~/.quadwork). No production callers
-// outside this file.
+// Expose the live Current Batch resolver for deterministic queue fixtures.
 module.exports.resolveDisplayedBatch = resolveDisplayedBatch;
-module.exports.pickDisplayedSource = pickDisplayedSource;
 // #870: expose review-batch parsers/helpers for the reviewBatch fixture test.
 module.exports.parseBatchType = parseBatchType;
 module.exports.parseReviewItems = parseReviewItems;
-module.exports.parseDoneBatchReviewItems = parseDoneBatchReviewItems;
 module.exports.parseReviewState = parseReviewState;
 module.exports.reviewItemView = reviewItemView;
 module.exports.summarizeReviewItems = summarizeReviewItems;

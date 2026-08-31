@@ -40,7 +40,9 @@ fs.writeFileSync = function writeStub(file, data) {
 fs.mkdirSync = () => {};
 fs.statSync = () => ({ mode: 0o700, isDirectory: () => true });
 fs.renameSync = () => {};
-fs.unlinkSync = () => {};
+fs.unlinkSync = (file) => {
+  if (typeof file === "string" && file.endsWith("batch-progress-cache.json")) writtenSnapshot = null;
+};
 cp.execFile = function execStub(file, args, opts, callback) {
   ghCalls += 1;
   const cb = typeof opts === "function" ? opts : callback;
@@ -222,6 +224,8 @@ async function run() {
     payload.assignment_items.map((item) => item.ownership_key).sort(),
   );
   assert.equal(writtenSnapshot.schema_version, 2);
+  assert.equal(writtenSnapshot.admission_generation, payload.admission_generation);
+  assert.equal(writtenSnapshot.batch_observation_fingerprint, payload.batch_observation_fingerprint);
   assert.equal(Object.keys(writtenSnapshot.terminalItems).length, 1);
   assert.equal(ghCalls, 0);
 
@@ -233,6 +237,20 @@ async function run() {
   const webTerminalKey = workItemKey({ repoKey: "web", repo: "Acme/Web", number: 42, kind: "issue" });
   const webOwnershipKey = terminalSnapshot.assignment_items.find((entry) =>
     entry.work_item_ref.repo_key === "web").ownership_key;
+
+  // A row stored under another live item's composite key is still rejected
+  // unless its own WorkItemRef and per-item ownership receipt match that key.
+  const crossRepoSnapshot = JSON.parse(JSON.stringify(terminalSnapshot));
+  crossRepoSnapshot.terminalItems[webTerminalKey] = {
+    ...crossRepoSnapshot.terminalItems[apiTerminalKey],
+  };
+  writtenSnapshot = crossRepoSnapshot;
+  _batchProgressCache.clear();
+  _graphqlCache.clear();
+  payload = await getOrComputeBatchProgress("p");
+  assert.notEqual(payload.items.find((item) => item.repo_key === "web").status, "merged",
+    "same-number terminal row from another repository cannot cross composite identity");
+
   terminalSnapshot.terminalItems[webTerminalKey] = {
     ...terminalSnapshot.terminalItems[apiTerminalKey],
     repo_key: "web",
@@ -335,6 +353,7 @@ async function run() {
   assert.notEqual(approvedV2.batch_observation_fingerprint, inReviewV2.batch_observation_fingerprint,
     "V2 review-state transition changes the exposed observation receipt");
   assert.equal(approvedV2.completeConfirmed, true);
+  assert.equal(writtenSnapshot, null, "completed V2 review batches retire their durable Current Batch row cache");
   assert.equal(validateCurrentAutomationRequest("p", staleReviewBody).ok, false,
     "an in-review V2 receipt cannot authorize after the same assignment becomes approved");
 
@@ -375,15 +394,20 @@ async function run() {
   assert.notEqual(afterForeignRollover.fingerprint, beforeForeignRollover.fingerprint,
     "TOCTOU fingerprint includes serialized installation/provenance changes");
 
-  // An explicit activated clear is an exact owned empty-set assignment. It is
-  // inactive/current:false but remains route-revalidatable for stop actions.
+  // #1050: an explicit activated clear is no Current Batch assignment. The
+  // live observation remains diagnostic, but display/consumer identity is
+  // canonical inactive/null/empty and persisted row residue is retired.
   queue = active([], { attempt: "attempt_b" });
   _batchProgressCache.clear();
   payload = await getOrComputeBatchProgress("p");
+  assert.equal(payload.active, false);
+  assert.equal(payload.batch_number, null);
+  assert.deepEqual(payload.items, []);
   assert.equal(payload.liveActiveBatchCleared, true);
   assert.equal(payload.current, false);
-  assert.equal(payload.owned, true);
+  assert.equal(payload.owned, false);
   assert.deepEqual(payload.assignment_items, []);
+  assert.equal(writtenSnapshot, null, "clear invalidates the persisted Current Batch row cache");
   assert.equal(validateCurrentOwnedAssignment("p", {
     batch_observation_fingerprint: payload.batch_observation_fingerprint,
     installation_id: payload.installation_id,
@@ -392,7 +416,19 @@ async function run() {
     provenance: payload.provenance,
     assignment_key: payload.assignment_key,
     assignment_items: payload.assignment_items,
-  }).ok, true);
+  }).ok, false, "empty Current Batch presentation fields cannot mint assignment authority");
+  const emptyReceipt = {
+    admission_generation: payload.admission_generation,
+    compatibility_mode: payload.compatibility_mode,
+    batch_observation_fingerprint: payload.batch_observation_fingerprint,
+    current_batch_empty: true,
+  };
+  assert.equal(validateCurrentAutomationRequest("p", emptyReceipt).cleared, true,
+    "the exact empty observation can authorize cleanup without minting an assignment");
+  queue = active(["- Acme/Web#42 replacement"], { attempt: "attempt_c" });
+  assert.equal(validateCurrentAutomationRequest("p", emptyReceipt).ok, false,
+    "an empty observation receipt cannot stop a later live assignment");
+  queue = active([], { attempt: "attempt_b" });
   parsed = parseActiveBatch(active([], { attempt: "bad!" }), { repositories, installationId: INSTALLATION_ID });
   assert.equal(parsed.assignmentKey, null, "empty-set clear still validates opaque assignment-attempt syntax");
   assert.notEqual(parsed.provenance, "owned");

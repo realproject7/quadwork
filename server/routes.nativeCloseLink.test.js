@@ -1,7 +1,7 @@
 // #951: batch-progress must link CLOSED issues to PRs via GitHub's native
 // close-link, not only the `[#N]` title convention. It must also keep CLOSED
-// issues terminal when lookup fails, and #950's terminal cache must stop
-// repeated Search calls after a settled native-linked item is cached.
+// issues terminal when lookup fails. #1050 retires the Current Batch row cache
+// when the whole batch completes, so a later cold compute revalidates live.
 //
 // Plain node:assert script — run with
 // `node server/routes.nativeCloseLink.test.js`.
@@ -155,8 +155,9 @@ function searchCalls() {
     ghCalls = [];
     _batchProgressCache.clear();
     const second = await getOrComputeBatchProgress("native-proj");
-    ok(second.items[0].status === "merged" && second.items[0].pr_number === 491, "D: second compute stays merged from terminal cache");
-    ok(searchCalls().length === 0, "D: terminal cache prevents repeated Search calls after native-linked item is settled");
+    ok(second.items[0].status === "merged" && second.items[0].pr_number === 491, "D: second cold compute revalidates the native-linked merge");
+    ok(searchCalls().length === 1, "D: completed Current Batch does not retain a durable terminal-row cache");
+    ok(snapshotJson === null, "D: completed Current Batch leaves no sticky presentation snapshot");
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

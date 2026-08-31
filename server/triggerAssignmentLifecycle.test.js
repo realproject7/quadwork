@@ -64,6 +64,17 @@ function writeV2Queue(attempt) {
   ].join("\n"));
 }
 
+function writeV2ClearQueue(attempt) {
+  fs.writeFileSync(QUEUE_PATH, [
+    "## Active Batch",
+    "**Batch:** 7",
+    "**Batch type:** code",
+    `**Installation ID:** ${INSTALLATION}`,
+    `**Assignment attempt:** ${attempt}`,
+    "(none)",
+  ].join("\n"));
+}
+
 function writeV1Queue() {
   fs.writeFileSync(QUEUE_PATH, [
     "## Active Batch",
@@ -265,6 +276,57 @@ process.on("exit", cleanup);
     assert.equal(reboundChatBody.assignment_attempt, "attempt_auto_b");
     assert.equal(runtime.triggers.get(PROJECT).automationBody.assignment_attempt, "attempt_auto_b",
       "timer stores the newly joined B identity for subsequent pulses");
+  } finally {
+    global.fetch = originalFetch;
+    runtime.triggers.clear();
+  }
+
+  // A durable empty Active Batch is not an assignment, but its exact joined
+  // observation must retire an existing auto cadence on the poller tick. It
+  // cannot be used to create a replacement timer.
+  writeConfig({ activated: true, triggerAuto: true });
+  writeV2ClearQueue("attempt_empty");
+  routes._batchProgressCache.clear();
+  const emptyProgress = await routes.getOrComputeBatchProgress(PROJECT);
+  const emptyActive = {
+    active: false,
+    admission_generation: emptyProgress.admission_generation,
+    compatibility_mode: emptyProgress.compatibility_mode,
+    batch_observation_fingerprint: emptyProgress.batch_observation_fingerprint,
+    installation_id: null,
+    batch_number: null,
+    assignment_attempt: null,
+    provenance: "unowned",
+    assignment_key: null,
+    assignment_items: [],
+    current: false,
+    owned: false,
+    multi_repository: false,
+  };
+  const emptyReceipt = {
+    admission_generation: emptyProgress.admission_generation,
+    compatibility_mode: emptyProgress.compatibility_mode,
+    batch_observation_fingerprint: emptyProgress.batch_observation_fingerprint,
+    current_batch_empty: true,
+  };
+  const rejectedEmptyStart = responseSpy();
+  runtime.startTriggerSchedule({ params: { project: PROJECT }, body: { interval: 1, ...emptyReceipt } }, rejectedEmptyStart);
+  assert.equal(rejectedEmptyStart.statusCode, 409);
+  assert.equal(runtime.triggers.has(PROJECT), false, "empty observation cannot create a trigger timer");
+  runtime.triggers.set(PROJECT, {
+    interval: 60_000,
+    timer: { empty_test_timer: true },
+    durationTimer: null,
+    automationBody: null,
+    autoFollow: true,
+  });
+  global.fetch = async (url) => String(url).includes("/api/batch-progress")
+    ? { ok: true, json: async () => emptyProgress }
+    : { ok: true, json: async () => emptyActive };
+  try {
+    await runtime.autoStopPollingTick();
+    assert.equal(runtime.triggers.has(PROJECT), false,
+      "canonical empty Current Batch retires the existing auto timer on the poller tick");
   } finally {
     global.fetch = originalFetch;
     runtime.triggers.clear();

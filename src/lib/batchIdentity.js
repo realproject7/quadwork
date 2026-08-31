@@ -189,6 +189,52 @@ function sameAssignment(left, right) {
     JSON.stringify(left.assignment_items) === JSON.stringify(right.assignment_items);
 }
 
+function emptyCurrentBatchSnapshot(active, progress) {
+  if (!active || !progress || active.active !== false || progress.active !== false ||
+      progress.liveActiveBatchCleared !== true || progress.complete !== false ||
+      progress.completeConfirmed !== false || progress.items.length !== 0) return null;
+  const activeAdmission = admissionGeneration(active.admission_generation);
+  const progressAdmission = admissionGeneration(progress.admission_generation);
+  const activeObservation = nonEmptyString(active.batch_observation_fingerprint);
+  const progressObservation = nonEmptyString(progress.batch_observation_fingerprint);
+  const compatibilityMode = active.compatibility_mode;
+  const expectedProvenance = compatibilityMode === "v1" ? "legacy_unowned" : "unowned";
+  if (activeAdmission === null || activeAdmission !== progressAdmission ||
+      !activeObservation || activeObservation !== progressObservation ||
+      (compatibilityMode !== "v1" && compatibilityMode !== "v2") ||
+      progress.compatibility_mode !== compatibilityMode ||
+      active.current !== false || progress.current !== false ||
+      active.owned !== false || progress.owned !== false ||
+      active.provenance !== expectedProvenance || progress.provenance !== expectedProvenance ||
+      active.installation_id != null || progress.installation_id != null ||
+      active.batch_number != null || progress.batch_number != null ||
+      active.assignment_attempt != null || progress.assignment_attempt != null ||
+      active.assignment_key != null || progress.assignment_key != null ||
+      !Array.isArray(active.assignment_items) || active.assignment_items.length !== 0 ||
+      !Array.isArray(progress.assignment_items) || progress.assignment_items.length !== 0 ||
+      typeof active.multi_repository !== "boolean" ||
+      active.multi_repository !== progress.multi_repository) return null;
+  return {
+    authority: "empty_current",
+    compatibility_mode: compatibilityMode,
+    fingerprint: ["empty", progressAdmission, progressObservation]
+      .map((part) => encodeURIComponent(String(part))).join(":"),
+    batch_observation_fingerprint: progressObservation,
+    admission_generation: progressAdmission,
+    active: false,
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: true,
+    hasItems: false,
+    installation_id: null,
+    batch_number: null,
+    assignment_attempt: null,
+    provenance: expectedProvenance,
+    assignment_key: null,
+    assignment_items: [],
+  };
+}
+
 function legacyV1BatchSnapshot(active, progress) {
   const activeAdmission = admissionGeneration(active.admission_generation);
   const progressAdmission = admissionGeneration(progress.admission_generation);
@@ -211,25 +257,19 @@ function legacyV1BatchSnapshot(active, progress) {
   const activeBatch = positiveInteger(active.batch_number);
   const progressBatch = positiveInteger(progress.batch_number);
   if (!activeBatch || activeBatch !== progressBatch) return null;
-  const liveActiveBatchCleared = progress.liveActiveBatchCleared === true;
-  if (progress.items.length === 0 && !liveActiveBatchCleared) return null;
-  if (liveActiveBatchCleared) {
-    if (active.active !== false || progress.current !== false) return null;
-  } else {
-    if (progress.items.length > 0 && progress.current !== true) return null;
-    const seenRows = new Set();
-    for (const row of progress.items) {
-      if (
-        row.provenance !== "legacy_unowned" ||
-        row.owned !== false || row.current !== true || row.batch_number !== progressBatch ||
-        row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
-        row.ownership_key != null || !ownedWorkItemIdentityMatches(row)
-      ) return null;
-      const ref = normalizeWorkItemRef(row.work_item_ref);
-      const key = `${ref.repo_key}\u0000${ref.repo}\u0000${ref.number}\u0000${ref.kind}`;
-      if (seenRows.has(key)) return null;
-      seenRows.add(key);
-    }
+  if (progress.liveActiveBatchCleared === true || progress.items.length === 0 || progress.current !== true) return null;
+  const seenRows = new Set();
+  for (const row of progress.items) {
+    if (
+      row.provenance !== "legacy_unowned" ||
+      row.owned !== false || row.current !== true || row.batch_number !== progressBatch ||
+      row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
+      row.ownership_key != null || !ownedWorkItemIdentityMatches(row)
+    ) return null;
+    const ref = normalizeWorkItemRef(row.work_item_ref);
+    const key = `${ref.repo_key}\u0000${ref.repo}\u0000${ref.number}\u0000${ref.kind}`;
+    if (seenRows.has(key)) return null;
+    seenRows.add(key);
   }
   return {
     authority: "legacy_compatibility",
@@ -240,8 +280,8 @@ function legacyV1BatchSnapshot(active, progress) {
     active: active.active === true,
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,
-    liveActiveBatchCleared,
-    hasItems: liveActiveBatchCleared ? false : progress.items.length > 0,
+    liveActiveBatchCleared: false,
+    hasItems: true,
     installation_id: null,
     batch_number: progressBatch,
     assignment_attempt: null,
@@ -258,6 +298,8 @@ function legacyV1BatchSnapshot(active, progress) {
  */
 function ownedCurrentBatchSnapshot(active, progress) {
   if (!active || typeof active.active !== "boolean" || !progress || !Array.isArray(progress.items)) return null;
+  const empty = emptyCurrentBatchSnapshot(active, progress);
+  if (empty) return empty;
   if (active.compatibility_mode === "v1" || progress.compatibility_mode === "v1") {
     return legacyV1BatchSnapshot(active, progress);
   }
@@ -268,12 +310,11 @@ function ownedCurrentBatchSnapshot(active, progress) {
   const activeObservation = nonEmptyString(active.batch_observation_fingerprint);
   const progressObservation = nonEmptyString(progress.batch_observation_fingerprint);
   if (!activeObservation || activeObservation !== progressObservation) return null;
-  const liveActiveBatchCleared = progress.liveActiveBatchCleared === true;
-  if (liveActiveBatchCleared && (active.active !== false || progress.items.length !== 0)) return null;
-  const activeIdentity = assignmentIdentity(active, { allowCleared: liveActiveBatchCleared });
-  const progressIdentity = assignmentIdentity(progress, { allowCleared: liveActiveBatchCleared });
+  if (progress.liveActiveBatchCleared === true) return null;
+  const activeIdentity = assignmentIdentity(active);
+  const progressIdentity = assignmentIdentity(progress);
   if (!sameAssignment(activeIdentity, progressIdentity)) return null;
-  if (progress.items.length === 0 && !liveActiveBatchCleared) return null;
+  if (progress.items.length === 0) return null;
 
   const expectedByOwnership = new Map(progressIdentity.assignment_items.map((item) => [item.ownership_key, item.work_item_ref]));
   if (progress.items.length > 0 && progress.items.length !== expectedByOwnership.size) return null;
@@ -307,7 +348,7 @@ function ownedCurrentBatchSnapshot(active, progress) {
     active: active.active === true,
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,
-    liveActiveBatchCleared,
+    liveActiveBatchCleared: false,
     hasItems: progress.items.length > 0,
     installation_id: progressIdentity.installation_id,
     batch_number: progressIdentity.batch_number,
@@ -323,6 +364,14 @@ function ownedCurrentBatchSnapshot(active, progress) {
 
 function assignmentRequestFields(snapshot) {
   if (!snapshot) return {};
+  if (snapshot.authority === "empty_current") {
+    return {
+      admission_generation: snapshot.admission_generation,
+      compatibility_mode: snapshot.compatibility_mode,
+      batch_observation_fingerprint: snapshot.batch_observation_fingerprint,
+      current_batch_empty: true,
+    };
+  }
   if (snapshot.authority === "legacy_compatibility" && snapshot.compatibility_mode === "v1") {
     return {
       admission_generation: snapshot.admission_generation,

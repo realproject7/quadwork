@@ -61,12 +61,11 @@ function requireStoppableBatch(project, snapshot) {
   ) throw AUTHORITY_REJECTION(project);
 }
 
-// #794/#880: post-#864, batch-active is authoritative — it follows the live
-// `## Active Batch` lifecycle (once Head clears the queue it reads not-active);
-// batch-progress may still render a just-completed batch (sticky display). Use
-// batch_status to gauge whether work remains before starting/stopping.
+// #794/#1050: both endpoints now project only the live `## Active Batch`.
+// An exact inactive/null/empty observation can authorize cleanup, but it is not
+// an assignment and can never start work.
 const BATCH_STATUS_NOTE =
-  "Use batch_status to gauge whether work remains: `active` follows the live Active Batch lifecycle (cleared queue → not active) and is authoritative; `progress` may still show a just-completed batch (sticky display).";
+  "Use batch_status to gauge whether work remains: both `active` and `progress` follow the live Active Batch lifecycle, and a cleared queue reports no current work.";
 
 module.exports = {
   defs: [

@@ -515,6 +515,7 @@ const CAFFEINATE_AUTOMATION_FIELDS = [
   "batch_number",
   "assignment_attempt",
   "provenance",
+  "current_batch_empty",
 ];
 
 function caffeinateRequestAuthority(body = {}) {
@@ -540,6 +541,9 @@ function caffeinateRequestAuthority(body = {}) {
 function startCaffeinate(req, res) {
   const authority = caffeinateRequestAuthority(req.body || {});
   if (!authority.ok) return rejectChangedCaffeinateAssignment(res, authority);
+  if (authority.cleared === true) {
+    return res.status(409).json({ ok: false, active: false, code: "batch_not_active", error: "Current Batch is empty" });
+  }
   if (process.platform !== "darwin") {
     return res.status(400).json({ ok: false, error: "Sleep prevention is only available on macOS" });
   }
@@ -1849,10 +1853,12 @@ function unavailableBatchAutomationState() {
 function automationStateFromSnapshot(snapshot) {
   if (!snapshot) return unavailableBatchAutomationState();
   const legacy = snapshot.authority === "legacy_compatibility";
+  const empty = snapshot.authority === "empty_current";
   const requestFields = assignmentRequestFields(snapshot);
   return {
     authoritative: true,
-    mode: legacy ? "v1" : "v2",
+    mode: empty ? "empty" : (legacy ? "v1" : "v2"),
+    compatibilityMode: snapshot.compatibility_mode,
     fingerprint: snapshot.fingerprint,
     admissionGeneration: requestFields.admission_generation,
     batchObservationFingerprint: requestFields.batch_observation_fingerprint || null,
@@ -1860,7 +1866,7 @@ function automationStateFromSnapshot(snapshot) {
     hasItems: snapshot.hasItems === true,
     clearedByOperator: snapshot.liveActiveBatchCleared === true,
     shouldStop: snapshot.completeConfirmed === true || snapshot.liveActiveBatchCleared === true,
-    identity: legacy ? null : {
+    identity: legacy || empty ? null : {
       installation_id: requestFields.installation_id,
       batch_number: requestFields.batch_number,
       assignment_attempt: requestFields.assignment_attempt,
@@ -1899,6 +1905,14 @@ function batchAutomationRequestBody(batchState) {
       batch_observation_fingerprint: batchState.batchObservationFingerprint,
     };
   }
+  if (batchState.mode === "empty" && typeof batchState.batchObservationFingerprint === "string" && batchState.batchObservationFingerprint) {
+    return {
+      admission_generation: batchState.admissionGeneration,
+      compatibility_mode: batchState.compatibilityMode,
+      batch_observation_fingerprint: batchState.batchObservationFingerprint,
+      current_batch_empty: true,
+    };
+  }
   if (batchState.mode !== "v2" || !batchState.identity) return null;
   return {
     admission_generation: batchState.admissionGeneration,
@@ -1913,7 +1927,10 @@ function isBatchAutomationCurrent(projectId, batchState, admission = null) {
   const body = batchAutomationRequestBody(batchState);
   if (!body) return false;
   if (admission && body.admission_generation !== admission.generation) return false;
-  return routes.validateCurrentOwnedAssignment(projectId, body).ok === true &&
+  const validation = batchState.mode === "empty"
+    ? routes.validateCurrentAutomationRequest(projectId, body)
+    : routes.validateCurrentOwnedAssignment(projectId, body);
+  return validation.ok === true &&
     (!admission || isAdmissionCurrent(admission));
 }
 
@@ -2000,7 +2017,7 @@ async function sendTriggerMessage(projectId, automationBody = null) {
         }
         // #518: also stop bridges when batch completes
         // #542: transition guard — only stop if not already stopped for this completion
-        if (project.telegram_auto || project.discord_auto) {
+        if (batchState.mode !== "empty" && (project.telegram_auto || project.discord_auto)) {
           const prev = _bridgeBatchPrev.get(projectId);
           if (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete) {
             const stopped = await autoStopBridges(projectId, project, qwPort, admission, batchState);
@@ -2352,6 +2369,14 @@ function validateTriggerAutomationRequest(projectId, body = {}) {
 function validatedTriggerAutomationBody(validation) {
   if (!validation || validation.ok !== true) return undefined;
   if (validation.manual === true) return null;
+  if (validation.cleared === true) {
+    return {
+      admission_generation: validation.admission?.generation,
+      compatibility_mode: validation.compatibility_mode,
+      batch_observation_fingerprint: validation.context?.fingerprint,
+      current_batch_empty: true,
+    };
+  }
   if (validation.legacy === true || validation.assignment?.compatibility_mode === "v1") {
     const fingerprint = validation.context?.fingerprint;
     return typeof fingerprint === "string" && fingerprint
@@ -2401,6 +2426,9 @@ function startTriggerSchedule(req, res) {
   catch (err) { return respondLifecycleFailure(res, err, { enabled: false }); }
   const assignment = validateTriggerAutomationRequest(project, req.body || {});
   if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
+  if (assignment.cleared === true) {
+    return res.status(409).json({ ok: false, enabled: false, code: "batch_not_active", error: "Current Batch is empty" });
+  }
   const automationBody = validatedTriggerAutomationBody(assignment);
   if (assignment.manual !== true && !automationBody) {
     return rejectChangedTriggerAssignment(res, { project_id: project });
@@ -2969,11 +2997,10 @@ async function autoStopPollingTick() {
       // #810: gate auto-stop on completeConfirmed (two distinct successful fetch
       // cycles), not a single transient/stale `complete`. Track prev on the
       // confirmed value so the bridge-stop transition guard fires on it.
-      // #864: an explicit operator clear (`liveActiveBatchCleared`) ALSO triggers
-      // the stop path, so trigger + bridges shut down when Head sets the Active
-      // Batch section to empty even if the preserved snapshot's items don't all
-      // resolve as merged/closed (e.g. a duplicate unmerged PR keeps the items
-      // in `in_review`). The cleared flag is the operator's intent.
+      // #864/#1050: an exact empty live observation also enters the cleanup
+      // path. It carries no assignment key: local trigger/caffeinate owners can
+      // be retired after synchronous observation revalidation, while keyed
+      // bridges self-retire when their former assignment stops being current.
       const clearedByOperator = batchState.clearedByOperator === true;
       const shouldStop = batchState.shouldStop;
       const prev = _bridgeBatchPrev.get(project.id);
@@ -2993,15 +3020,14 @@ async function autoStopPollingTick() {
         }
         // #518: also stop bridges when batch completes
         // #542: only fire on the transition (incomplete→complete), not every tick
-        if (hasBridgeAuto && (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete)) {
+        if (batchState.mode !== "empty" && hasBridgeAuto && (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete)) {
           bridgeTransitionAttempted = true;
           bridgeTransitionSucceeded = await autoStopBridges(project.id, project, qwPort, admission, batchState);
         }
       }
 
       // #518: detect batch-start transition → auto-start bridges
-      // #864: do NOT auto-start on a cleared queue even though hasItems may be
-      // true from the preserved snapshot — the operator's clear is a stop signal.
+      // An empty live queue has no rows and can never auto-start a bridge.
       if (hasBridgeAuto && !shouldStop && batchState.active && hasItems && !bp.complete && !clearedByOperator) {
         const isNewBatch = !prev || prev.fingerprint !== batchState.fingerprint || prev.complete || !prev.hasItems;
         if (isNewBatch) {

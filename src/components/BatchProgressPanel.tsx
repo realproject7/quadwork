@@ -43,6 +43,7 @@ interface BatchProgressItem {
 }
 
 interface BatchProgressData {
+  active?: boolean;
   batch_number: number | null;
   items: BatchProgressItem[];
   summary: string;
@@ -223,8 +224,10 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
     );
   }
 
-  // Empty state — no active batch in OVERNIGHT-QUEUE.md.
-  if (!data.items || data.items.length === 0) {
+  // Current Batch is explicitly empty when the server's live-queue authority
+  // says inactive. Defensive item checks keep older servers compatible, but a
+  // stale row array can never override active:false.
+  if (data.active === false || !data.items || data.items.length === 0) {
     return (
       <div className="border-t border-border">
         <div className="px-3 py-1.5 flex items-center gap-2">

@@ -24,12 +24,8 @@ const cp = require("child_process");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 
-// #864: replace child_process.execFile BEFORE require("./routes") so the
-// util.promisify(execFile) reference bound inside routes.js sees the stub. The
-// snapshot freshness check uses ghJsonExecAsync → execFile(gh ...). For tests
-// we never want to spawn gh: returning a synthetic non-404 error makes
-// checkBatchSnapshotFreshness fall to its "unknown" branch (snapshot preserved,
-// not deleted), which is what the cleared-queue scenario needs.
+// Replace child_process.execFile before require("./routes") so an accidental
+// GitHub lookup stays visible and cannot escape the deterministic fixture.
 const realRunner = cp.execFile;
 cp.execFile = function stubRunner(file, args, opts, cb) {
   const done = typeof opts === "function" ? opts : cb;
@@ -53,16 +49,14 @@ const real = {
 };
 let cfgJson = JSON.stringify({ projects: [] });
 let queueText = "";
-// #864: per-test snapshot fixture. Default null → readBatchSnapshot returns
-// null (existing tests rely on this). A test can set this to a JSON string to
-// simulate a preserved snapshot file on disk; checkBatchSnapshotFreshness is
-// also stubbed via _checkBatchSnapshotFreshnessStub below so we don't fire gh.
+// #864/#1050: per-test snapshot residue. A test can set this to a JSON string
+// to prove it cannot supply Current Batch rows after the live queue is empty.
 let snapshotJson = null;
+let deletedSnapshots = 0;
 fs.readFileSync = function stubReadFileSync(p, ...rest) {
   if (p === CONFIG_PATH) return cfgJson;
   if (typeof p === "string" && p.endsWith("OVERNIGHT-QUEUE.md")) return queueText;
-  // batch-progress-cache.json absent → readBatchSnapshot returns null and the
-  // upstream checkBatchSnapshotFreshness gh call is skipped entirely.
+  // batch-progress-cache.json absent → readBatchSnapshot returns null.
   if (typeof p === "string" && p.endsWith("batch-progress-cache.json")) {
     if (snapshotJson !== null) return snapshotJson;
     const err = new Error("ENOENT (test stub)");
@@ -74,7 +68,9 @@ fs.readFileSync = function stubReadFileSync(p, ...rest) {
 fs.writeFileSync = () => {};
 fs.mkdirSync = () => {};
 fs.statSync = () => ({ mode: 0o700, isDirectory: () => true });
-fs.unlinkSync = () => {};
+fs.unlinkSync = (p) => {
+  if (typeof p === "string" && p.endsWith("batch-progress-cache.json")) deletedSnapshots += 1;
+};
 
 const {
   isBatchActiveFromProgress,
@@ -228,13 +224,8 @@ function inReviewSnapshot(repo, n) {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // C. #864 regression: an explicitly cleared `## Active Batch` section must
-  //    drop /api/batch-active to false even when the preserved snapshot keeps
-  //    the prior batch's items visible for history. Concrete shape from the
-  //    #836 incident: closed issue #836 with merged PR #850 + later closed-
-  //    unmerged duplicate PR #851; Head sets Active Batch to `(none)` so the
-  //    operator-cleared signal must override any items still present from the
-  //    snapshot.
+  // C. #1050 regression: a cleared live Active Batch is the canonical empty
+  //    Current Batch even when a legacy snapshot still contains rows.
   // ─────────────────────────────────────────────────────────────────────────
 
   // C1. Pure helper: liveActiveBatchCleared:true short-circuits even when items
@@ -252,21 +243,19 @@ function inReviewSnapshot(repo, n) {
     "C1: liveActiveBatchCleared:false → unchanged behavior (active with in-review item)"
   );
 
-  // C2. End-to-end: queue explicitly cleared (`(none)` in Active Batch) but a
-  //     preserved snapshot still holds issue #836. With the picker fix the
-  //     snapshot resolves issue #836 to merged via merged PR #850; even before
-  //     that fix the lifecycle flag alone would force active:false. This test
-  //     covers BOTH the cleared-flag wiring and the snapshot resolution.
+  // C2. End-to-end Batch 139 incident shape: the saved snapshot contains a
+  //     completed item plus a held row, but live Active Batch is `(none)`.
   {
     _batchProgressCache.clear();
     _graphqlCache.clear();
     cfgJson = JSON.stringify({ projects: [{ id: "cleared-836", repo: "o/r", idle: false }] });
     queueText = "# Queue\n\n## Active Batch\n\n(none)\n\n## Backlog\n";
-    snapshotJson = JSON.stringify({ batchNumber: 9, issueNumbers: [836] });
-    // Pre-populate the GraphQL snapshot with the #836 shape: closed issue +
-    // merged PR #850. The picker fix means progressFromSnapshot finds #850 and
-    // resolves the row as merged, so the snapshot would normally land on
-    // complete:true. But the cleared flag must drop active to false regardless.
+    snapshotJson = JSON.stringify({
+      batchNumber: 139,
+      issueNumbers: [589, 370],
+      terminalItems: { 589: { issue_number: 589, status: "merged" } },
+    });
+    deletedSnapshots = 0;
     _graphqlCache.set("o/r", {
       ts: Date.now(),
       issues: [],
@@ -280,12 +269,14 @@ function inReviewSnapshot(repo, n) {
 
     const data = await getOrComputeBatchProgress("cleared-836");
     ok(data !== null, "C2: cleared queue + snapshot → non-null payload");
+    ok(data.active === false, "C2: canonical Current Batch is inactive");
+    ok(data.batch_number === null, "C2: canonical Current Batch has null batch_number");
     ok(data.liveActiveBatchCleared === true, "C2: liveActiveBatchCleared:true reflects the operator's `(none)` clear");
-    ok(Array.isArray(data.items) && data.items.length === 1 && data.items[0].issue_number === 836,
-       "C2: preserved snapshot still surfaces issue #836 for history");
-    ok(data.items[0].status === "merged", "C2: #836 resolves as merged via PR #850 from the GraphQL snapshot");
+    ok(Array.isArray(data.items) && data.items.length === 0,
+       "C2: Batch 139 snapshot rows #589/#370 cannot enter Current Batch");
+    ok(deletedSnapshots === 1, "C2: durable live clear idempotently retires the persisted Current Batch cache");
     ok(isBatchActiveFromProgress(data) === false,
-       "C2: /api/batch-active reports false on the cleared queue (the #864 fix)");
+       "C2: /api/batch-active reports false on the cleared queue");
   }
 
   // C3. Unreadable queue file (#316 bypass) must NOT be mistaken for an explicit

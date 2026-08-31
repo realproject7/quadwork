@@ -1,64 +1,57 @@
-// #950: batch-progress must not refetch terminal items every cycle, and stale
-// rendered payloads should return immediately while one background refresh runs.
-//
-// Plain node:assert script — run with
-// `node server/routes.batchProgressTerminalCache.test.js`.
+// #1050: legacy numeric terminal caches are never Current Batch authority;
+// in-memory rendered rows remain an observation-keyed performance cache.
 
+const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const cp = require("child_process");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
-
-let ghCalls = [];
-let delayGh = false;
-let deferGh = false;
-let deferredGhFinishes = [];
-let deferIssueNumber = null;
-let deferredIssueFinish = null;
-const realRunner = cp.execFile;
-cp.execFile = function stubRunner(file, args, opts, cb) {
-  const done = typeof opts === "function" ? opts : cb;
-  if (file !== "gh" || typeof done !== "function") return realRunner.apply(this, arguments);
-  ghCalls.push(args.slice());
-  const issueTarget = args.find((arg) => typeof arg === "string" && /repos\/o\/r\/issues\/\d+$/.test(arg));
-  if (deferIssueNumber !== null && issueTarget?.endsWith(`/issues/${deferIssueNumber}`) && !args.includes("--jq")) {
-    deferredIssueFinish = () => done(new Error("deferred issue lookup failed"), "", "transient");
-    return;
-  }
-  const finish = () => done(null, JSON.stringify({ number: 10 }), "");
-  if (deferGh) deferredGhFinishes.push(finish);
-  else if (delayGh) setTimeout(finish, 80);
-  else setImmediate(finish);
-};
-
-const real = { readFileSync: fs.readFileSync };
-let cfgJson = JSON.stringify({ projects: [] });
+const realRead = fs.readFileSync;
+let cfgJson = JSON.stringify({ projects: [{ id: "terminal-proj", repo: "o/r", idle: false }] });
 let queueText = "";
 let snapshotJson = null;
-let githubMd = "";
-fs.readFileSync = function stubReadFileSync(p, ...rest) {
-  if (p === CONFIG_PATH) return cfgJson;
-  if (typeof p === "string" && p.endsWith("OVERNIGHT-QUEUE.md")) return queueText;
-  if (typeof p === "string" && p.endsWith("batch-progress-cache.json")) {
-    if (snapshotJson !== null) return snapshotJson;
-    const err = new Error("ENOENT (test stub)");
-    err.code = "ENOENT";
-    throw err;
+let deletedSnapshots = 0;
+let holdIssueLookup = false;
+let releaseIssueLookup = null;
+
+const realExecFile = cp.execFile;
+cp.execFile = function execStub(file, args, options, callback) {
+  const done = typeof options === "function" ? options : callback;
+  if (file !== "gh" || typeof done !== "function") return realExecFile.apply(this, arguments);
+  const target = args.find((arg) => typeof arg === "string" && arg === "repos/o/r/issues/10");
+  if (holdIssueLookup && target) {
+    releaseIssueLookup = () => done(new Error("held lookup released"), "", "transient");
+    return undefined;
   }
-  if (typeof p === "string" && p.endsWith("GITHUB.md")) return githubMd;
-  return real.readFileSync(p, ...rest);
+  setImmediate(() => done(new Error("unexpected test gh call"), "", "test"));
+  return undefined;
 };
-fs.writeFileSync = function stubWriteFileSync(p, data) {
-  if (typeof p === "string" && p.endsWith("batch-progress-cache.json")) {
-    snapshotJson = String(data);
+
+fs.readFileSync = function readStub(file, ...rest) {
+  if (file === CONFIG_PATH) return cfgJson;
+  if (typeof file === "string" && file.endsWith("OVERNIGHT-QUEUE.md")) return queueText;
+  if (typeof file === "string" && file.endsWith("batch-progress-cache.json")) {
+    if (snapshotJson !== null) return snapshotJson;
+    const error = new Error("missing snapshot"); error.code = "ENOENT"; throw error;
   }
+  if (typeof file === "string" && file.endsWith("GITHUB.md")) {
+    const error = new Error("missing board"); error.code = "ENOENT"; throw error;
+  }
+  return realRead.call(this, file, ...rest);
+};
+fs.writeFileSync = function writeStub(file, data) {
+  if (typeof file === "string" && file.endsWith("batch-progress-cache.json")) snapshotJson = String(data);
 };
 fs.mkdirSync = () => {};
 fs.statSync = () => ({ mode: 0o700, isDirectory: () => true });
-fs.renameSync = () => {};
-fs.unlinkSync = () => { snapshotJson = null; };
+fs.unlinkSync = (file) => {
+  if (typeof file === "string" && file.endsWith("batch-progress-cache.json")) {
+    deletedSnapshots += 1;
+    snapshotJson = null;
+  }
+};
 
 const {
   getOrComputeBatchProgress,
@@ -66,263 +59,116 @@ const {
   _batchProgressCache,
   _batchProgressRefreshes,
   _graphqlCache,
-  renderGithubMarkdown,
+  cancelProjectBackground,
 } = require("./routes");
 
-function mergedRowsSnapshot(repo, nums) {
-  _graphqlCache.set(repo, {
-    ts: Date.now(),
-    issues: [],
-    prs: [],
-    closedIssues: nums.map((n) => ({ number: n, title: `done ${n}`, url: `https://x/i/${n}` })),
-    mergedPrs: nums.map((n) => ({ number: n + 1000, title: `[#${n}] done ${n}`, url: `https://x/p/${n + 1000}`, reviews: [] })),
-    openPrsWindowComplete: true,
-    closedPrsWindowComplete: true,
-    closedPrIssueNums: nums.slice(),
-  });
+function liveQueue() {
+  return "# Queue\n\n## Active Batch\n\n**Batch:** 950\n\n- #10 live\n";
 }
 
-function perItemIssueFetches() {
-  return ghCalls.filter((args) => {
-    const target = args.find((a) => typeof a === "string" && /repos\/o\/r\/issues\/\d+$/.test(a));
-    return target && !args.includes("--jq");
+function openSnapshot(ts = Date.now()) {
+  _graphqlCache.set("o/r", {
+    ts,
+    issues: [{ number: 10, title: "live 10", state: "OPEN", url: "https://x/i/10" }],
+    prs: [], closedIssues: [], mergedPrs: [],
+    openPrsWindowComplete: true,
+    closedPrsWindowComplete: true,
+    closedPrIssueNums: [],
   });
 }
 
 (async () => {
-  let passed = 0, failed = 0;
-  const ok = (c, m) => { if (c) { passed++; console.log(`  PASS: ${m}`); } else { failed++; console.error(`  FAIL: ${m}`); } };
+  queueText = liveQueue();
+  snapshotJson = JSON.stringify({
+    batchNumber: 950,
+    issueNumbers: [10],
+    terminalItems: { 10: { issue_number: 10, status: "merged", progress: 100, label: "Merged" } },
+  });
+  deletedSnapshots = 0;
+  _batchProgressCache.clear();
+  _graphqlCache.clear();
+  openSnapshot();
 
-  // A. First compute resolves terminal rows from the in-memory board snapshot
-  // and persists them to batch-progress-cache.json.
-  {
-    _batchProgressCache.clear();
-    _batchProgressRefreshes.clear();
-    _graphqlCache.clear();
-    ghCalls = [];
-    snapshotJson = null;
-    cfgJson = JSON.stringify({ projects: [{ id: "terminal-proj", repo: "o/r", idle: false }] });
-    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 950\n\n- #10 done\n- #11 done\n- #12 done\n";
-    mergedRowsSnapshot("o/r", [10, 11, 12]);
+  let data = await getOrComputeBatchProgress("terminal-proj");
+  assert.equal(data.items[0].status, "queued", "ambiguous legacy terminal row cannot override live evidence");
+  assert.equal(snapshotJson, null, "first live observation retires the non-composite legacy snapshot");
+  assert.equal(deletedSnapshots, 1);
 
-    const data = await getOrComputeBatchProgress("terminal-proj");
-    ok(data.items.length === 3, "A: three items resolved");
-    ok(data.items.every((it) => it.status === "merged"), "A: all rows are terminal merged rows");
-    ok(snapshotJson && JSON.parse(snapshotJson).terminalItems["10"].status === "merged", "A: terminal row persisted to batch-progress-cache.json");
-    ok(perItemIssueFetches().length === 0, "A: first snapshot-proven compute made no per-item REST issue fetches");
-  }
-
-  // B1. Next compute has no fresh per-item evidence, so the persisted terminal
-  // rows short-circuit REST fallback; only the existing one-shot snapshot
-  // freshness probe is allowed.
-  {
-    _batchProgressCache.clear();
-    _batchProgressRefreshes.clear();
-    _graphqlCache.clear();
-    ghCalls = [];
-    _graphqlCache.set("o/r", {
-      ts: Date.now(),
-      issues: [],
-      prs: [],
-      closedIssues: [],
-      mergedPrs: [],
-    });
-
-    const data = await getOrComputeBatchProgress("terminal-proj");
-    ok(data.items.every((it) => it.status === "merged"), "B1: persisted terminal rows fill missing snapshot evidence");
-    ok(perItemIssueFetches().length === 0, "B1: terminal-cache reuse made zero per-item REST issue fetches");
-    ok(ghCalls.length === 1 && ghCalls[0].includes("--jq"), "B1: only the snapshot freshness probe ran");
-  }
-
-  // B2. Fresh snapshot evidence wins over stale terminal cache. A reopened item
-  // must not remain complete indefinitely, and its stale terminal row is evicted
-  // from the persistent cache.
-  {
-    _batchProgressCache.clear();
-    _batchProgressRefreshes.clear();
-    _graphqlCache.clear();
-    ghCalls = [];
-    _graphqlCache.set("o/r", {
-      ts: Date.now(),
-      issues: [{ number: 10, title: "reopened 10", state: "OPEN", url: "https://x/i/10" }],
-      prs: [],
-      closedIssues: [],
-      mergedPrs: [],
-      openPrsWindowComplete: true,
-      closedPrsWindowComplete: true,
-      closedPrIssueNums: [],
-    });
-
-    const data = await getOrComputeBatchProgress("terminal-proj");
-    const row10 = data.items.find((it) => it.issue_number === 10);
-    ok(row10.status === "queued", `B2: fresh reopened snapshot overrides terminal cache (got ${row10.status})`);
-    ok(row10.status !== "merged" && row10.status !== "closed", "B2: reopened item is no longer terminal");
-    ok(!JSON.parse(snapshotJson).terminalItems["10"], "B2: stale terminal row evicted from persistent cache");
-  }
-
-  // B3. The persisted GITHUB.md cold-cache path also wins over stale terminal
-  // cache when it proves an item is open/nonterminal.
-  {
-    _batchProgressCache.clear();
-    _batchProgressRefreshes.clear();
-    _graphqlCache.clear();
-    ghCalls = [];
-    snapshotJson = JSON.stringify({
-      batchNumber: 950,
-      issueNumbers: [10],
-      batch_type: "code",
-      reviewItems: [],
-      terminalItems: {
-        10: { issue_number: 10, title: "done 10", url: "https://x/i/10", pr_number: 1010, status: "merged", progress: 100, label: "Merged ✓" },
-      },
-    });
-    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 950\n\n- #10 reopened\n";
-    githubMd = renderGithubMarkdown(
-      "Proj",
-      "o/r",
-      { issues: [{ number: 10, title: "reopened 10", state: "OPEN", url: "https://x/i/10", assignees: [] }], prs: [], closedIssues: [], mergedPrs: [] },
-      { generatedAt: Date.now(), staleCycles: 0 },
-      "(none)",
-    );
-
-    const data = await getOrComputeBatchProgress("terminal-proj");
-    const row10 = data.items.find((it) => it.issue_number === 10);
-    ok(row10.status === "queued", `B3: persisted GITHUB.md reopened row overrides terminal cache (got ${row10.status})`);
-    ok(!JSON.parse(snapshotJson).terminalItems["10"], "B3: GITHUB.md nonterminal row evicts stale terminal cache");
-    githubMd = "";
-  }
-
-  // C. A stale rendered payload returns immediately and starts exactly one
-  // background refresh. This keeps the panel responsive on large batches.
-  {
-    _batchProgressCache.clear();
-    _batchProgressRefreshes.clear();
-    _graphqlCache.clear();
-    ghCalls = [];
-    delayGh = true;
-    _batchProgressCache.set("terminal-proj", {
-      ts: Date.now() - 60_000,
-      fingerprint: readLiveBatchContext("terminal-proj").fingerprint,
+  // A stale rendered payload is still safe to serve because it is keyed by the
+  // exact live observation fingerprint and admission generation.
+  _batchProgressCache.clear();
+  _batchProgressRefreshes.clear();
+  openSnapshot(Date.now() + 1);
+  _batchProgressCache.set("terminal-proj", {
+    ts: Date.now() - 60_000,
+    fingerprint: readLiveBatchContext("terminal-proj").fingerprint,
+    admission_generation: 0,
+    data: {
+      active: true,
       admission_generation: 0,
-      data: { admission_generation: 0, batch_number: 950, items: [{ issue_number: 10, status: "merged" }], summary: "1/1 merged", complete: true, completeConfirmed: true, batch_type: "code" },
-    });
-
-    const start = Date.now();
-    const data = await getOrComputeBatchProgress("terminal-proj");
-    const elapsed = Date.now() - start;
-    ok(elapsed < 50, `C: stale cache returned immediately (${elapsed}ms)`);
-    ok(data._stale === true && data._refreshing === true, "C: stale response is marked refreshing");
-    ok(_batchProgressRefreshes.has("terminal-proj"), "C: background refresh started");
-
-    const again = await getOrComputeBatchProgress("terminal-proj");
-    ok(_batchProgressRefreshes.size === 1, "C: second stale poll did not start another refresh");
-    ok(again._refreshing === true, "C: second stale poll still serves cache");
-
-    await _batchProgressRefreshes.get("terminal-proj").promise;
-    ok(!_batchProgressRefreshes.has("terminal-proj"), "C: refresh gate clears after completion");
-    delayGh = false;
-  }
-
-  // D. An older V1 observation may finish its async snapshot probe after a
-  // newer queue observation has already completed. The older refresh must
-  // return a stale marker without replacing either B's rendered cache or B's
-  // persisted snapshot.
-  {
-    _batchProgressCache.clear();
-    _batchProgressRefreshes.clear();
-    _graphqlCache.clear();
-    ghCalls = [];
-    deferredGhFinishes = [];
-    deferGh = true;
-    cfgJson = JSON.stringify({ projects: [{ id: "terminal-proj", repo: "o/r", idle: false }] });
-    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 950\n\n- #10 old observation\n";
-    snapshotJson = JSON.stringify({
-      batchNumber: 950,
-      issueNumbers: [10],
+      batch_number: 950,
+      items: [{ issue_number: 10, status: "queued" }],
+      summary: "1 queued",
+      complete: false,
+      completeConfirmed: false,
       batch_type: "code",
-      reviewItems: [],
-      terminalItems: {},
-    });
-    mergedRowsSnapshot("o/r", [10, 11]);
+    },
+  });
+  data = await getOrComputeBatchProgress("terminal-proj");
+  assert.equal(data._stale, true);
+  assert.equal(data._refreshing, true);
+  assert.equal(_batchProgressRefreshes.size, 1, "one background refresh owns the stale observation");
+  await _batchProgressRefreshes.get("terminal-proj").promise;
+  assert.equal(_batchProgressRefreshes.size, 0);
 
-    const older = getOrComputeBatchProgress("terminal-proj");
-    await new Promise((resolve) => setImmediate(resolve));
-    ok(deferredGhFinishes.length === 1, "D: observation A is held at its async freshness probe");
+  // A durable clear invalidates both memory and persistent presentation state.
+  snapshotJson = JSON.stringify({ batchNumber: 950, issueNumbers: [10] });
+  queueText = "## Active Batch\n\n(none)\n\n## Done\n- #10 complete\n";
+  data = await getOrComputeBatchProgress("terminal-proj");
+  assert.equal(data.active, false);
+  assert.equal(data.batch_number, null);
+  assert.deepEqual(data.items, []);
+  assert.equal(snapshotJson, null);
+  assert.equal(_batchProgressCache.has("terminal-proj"), false);
 
-    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 951\n\n- #11 current observation\n";
-    const currentFingerprint = readLiveBatchContext("terminal-proj").fingerprint;
-    const newer = getOrComputeBatchProgress("terminal-proj");
-    await new Promise((resolve) => setImmediate(resolve));
-    ok(deferredGhFinishes.length === 2, "D: observation B reaches an independent freshness probe");
+  // Archive/removal cleanup also retires a restart-surviving file when there
+  // is no corresponding in-memory entry to hint that it exists.
+  snapshotJson = JSON.stringify({ batchNumber: 950, issueNumbers: [10] });
+  _batchProgressCache.clear();
+  await cancelProjectBackground("terminal-proj");
+  assert.equal(snapshotJson, null, "lifecycle cleanup deletes a cold durable Current Batch cache");
 
-    deferredGhFinishes.splice(1, 1)[0]();
-    const newerData = await newer;
-    ok(newerData.batch_number === 951 && newerData.items[0]?.issue_number === 11,
-      "D: observation B completes first with its own rows");
+  // A computation that began on live assignment A cannot republish A after a
+  // durable clear wins while its GitHub lookup is in flight. Its own response
+  // also converges to the canonical empty projection.
+  queueText = liveQueue();
+  _batchProgressCache.clear();
+  _graphqlCache.set("o/r", {
+    ts: Date.now() + 2,
+    issues: [], prs: [], closedIssues: [], mergedPrs: [],
+    openPrsWindowComplete: false,
+    closedPrsWindowComplete: false,
+    closedPrIssueNums: [],
+  });
+  holdIssueLookup = true;
+  const staleCompute = getOrComputeBatchProgress("terminal-proj");
+  while (typeof releaseIssueLookup !== "function") await new Promise((resolve) => setImmediate(resolve));
+  snapshotJson = JSON.stringify({ batchNumber: 950, issueNumbers: [10] });
+  queueText = "## Active Batch\n\n(none)\n";
+  const clearData = await getOrComputeBatchProgress("terminal-proj");
+  assert.equal(clearData.active, false);
+  releaseIssueLookup();
+  const staleData = await staleCompute;
+  assert.equal(staleData._stale_observation, true);
+  assert.equal(staleData.active, false);
+  assert.equal(staleData.batch_number, null);
+  assert.deepEqual(staleData.items, []);
+  assert.equal(snapshotJson, null, "late A cannot restore durable presentation after clear");
+  assert.equal(_batchProgressCache.has("terminal-proj"), false, "late A cannot restore memory presentation after clear");
+  holdIssueLookup = false;
 
-    deferredGhFinishes.shift()();
-    const olderData = await older;
-    ok(olderData._stale_observation === true && olderData.current === false,
-      "D: late observation A is rejected after its await boundary");
-    const cached = _batchProgressCache.get("terminal-proj");
-    ok(cached?.fingerprint === currentFingerprint && cached.data.items[0]?.issue_number === 11,
-      "D: late observation A cannot overwrite B's memory cache");
-    ok(JSON.parse(snapshotJson).batchNumber === 951 && JSON.parse(snapshotJson).issueNumbers[0] === 11,
-      "D: late observation A cannot overwrite B's persisted snapshot");
-    deferGh = false;
-    deferredGhFinishes = [];
-  }
-
-  // E. Cover the final publication guard too: hold A inside a per-item REST
-  // lookup (past the freshness check), let a proven B publish, then release A.
-  // The late item result must still be discarded before snapshot/cache writes.
-  {
-    _batchProgressCache.clear();
-    _batchProgressRefreshes.clear();
-    _graphqlCache.clear();
-    ghCalls = [];
-    snapshotJson = null;
-    deferredIssueFinish = null;
-    deferIssueNumber = 10;
-    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 952\n\n- #10 slow item\n";
-    _graphqlCache.set("o/r", {
-      ts: Date.now(),
-      issues: [],
-      prs: [],
-      closedIssues: [],
-      mergedPrs: [],
-      openPrsWindowComplete: false,
-      closedPrsWindowComplete: false,
-      closedPrIssueNums: [],
-    });
-
-    const older = getOrComputeBatchProgress("terminal-proj");
-    await new Promise((resolve) => setImmediate(resolve));
-    ok(typeof deferredIssueFinish === "function", "E: observation A is held inside per-item REST work");
-
-    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 953\n\n- #11 current item\n";
-    const currentFingerprint = readLiveBatchContext("terminal-proj").fingerprint;
-    mergedRowsSnapshot("o/r", [11]);
-    const newerData = await getOrComputeBatchProgress("terminal-proj");
-    ok(newerData.batch_number === 953 && newerData.items[0]?.issue_number === 11,
-      "E: observation B publishes while A's item lookup is pending");
-
-    deferredIssueFinish();
-    const olderData = await older;
-    ok(olderData._stale_observation === true,
-      "E: late per-item observation A is rejected before publication");
-    const cached = _batchProgressCache.get("terminal-proj");
-    ok(cached?.fingerprint === currentFingerprint && cached.data.items[0]?.issue_number === 11,
-      "E: late per-item observation A cannot overwrite B's memory cache");
-    ok(JSON.parse(snapshotJson).batchNumber === 953 && JSON.parse(snapshotJson).issueNumbers[0] === 11,
-      "E: late per-item observation A cannot overwrite B's persisted snapshot");
-    deferIssueNumber = null;
-    deferredIssueFinish = null;
-  }
-
-  console.log(`\n${passed} passed, ${failed} failed\n`);
-  process.exit(failed > 0 ? 1 : 0);
-})().catch((err) => {
-  console.error("test crashed:", err);
+  console.log("routes.batchProgressTerminalCache.test.js: all assertions passed");
+})().catch((error) => {
+  console.error(error);
   process.exit(1);
 });

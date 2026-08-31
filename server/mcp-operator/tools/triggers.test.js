@@ -43,6 +43,7 @@ function v2LiveState(overrides = {}) {
     multi_repository: false,
   };
   const progress = {
+    active: true,
     admission_generation: ADMISSION_GENERATION,
     compatibility_mode: "v2",
     ...V2_IDENTITY,
@@ -68,7 +69,15 @@ function v2LiveState(overrides = {}) {
 }
 
 function v2ClearedState() {
-  const clearedIdentity = { ...V2_IDENTITY, assignment_items: [] };
+  const clearedIdentity = {
+    batch_observation_fingerprint: "v2-observation-mcp-empty",
+    installation_id: null,
+    batch_number: null,
+    assignment_attempt: null,
+    provenance: "unowned",
+    assignment_key: null,
+    assignment_items: [],
+  };
   return {
     active: {
       active: false,
@@ -76,15 +85,16 @@ function v2ClearedState() {
       compatibility_mode: "v2",
       ...clearedIdentity,
       current: false,
-      owned: true,
+      owned: false,
       multi_repository: false,
     },
     progress: {
       admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v2",
       ...clearedIdentity,
+      active: false,
       current: false,
-      owned: true,
+      owned: false,
       multi_repository: false,
       complete: false,
       completeConfirmed: false,
@@ -129,9 +139,13 @@ function v1LiveState() {
 function v1ClearedState() {
   const state = v1LiveState();
   return {
-    active: { ...state.active, active: false, current: false },
+    active: { ...state.active, active: false, batch_number: null, current: false,
+      batch_observation_fingerprint: "legacy-observation-mcp-empty" },
     progress: {
       ...state.progress,
+      active: false,
+      batch_number: null,
+      batch_observation_fingerprint: "legacy-observation-mcp-empty",
       current: false,
       complete: false,
       completeConfirmed: false,
@@ -267,7 +281,12 @@ async function runTests() {
     requests.length = 0;
     await handlers.stop_batch({ project: "plotlink" }, ctx);
     const post = triggerPosts(requests)[0];
-    assert(post && post.body.assignment_items.length === 0 && hasExactV2Identity(post.body, []), "stop_batch accepts and forwards the authoritative V2 explicit-clear identity before completion confirmation");
+    assert(JSON.stringify(post?.body) === JSON.stringify({
+      admission_generation: ADMISSION_GENERATION,
+      compatibility_mode: "v2",
+      batch_observation_fingerprint: "v2-observation-mcp-empty",
+      current_batch_empty: true,
+    }), "stop_batch forwards only the authoritative V2 empty-observation receipt");
     server.close();
   }
 
@@ -278,8 +297,9 @@ async function runTests() {
     assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({
       admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v1",
-      batch_observation_fingerprint: "legacy-observation-mcp-4",
-    }), "legacy stop_batch carries its exact observation lease without inventing V2 authority");
+      batch_observation_fingerprint: "legacy-observation-mcp-empty",
+      current_batch_empty: true,
+    }), "legacy stop_batch carries its empty-observation lease without inventing assignment authority");
     server.close();
   }
 

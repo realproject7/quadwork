@@ -12,6 +12,7 @@ interface ScheduledTriggerWidgetProps {
 
 // #408: batch progress shape from /api/batch-progress
 interface BatchState {
+  active: boolean;
   complete: boolean;
   completeConfirmed: boolean;
   liveActiveBatchCleared: boolean;
@@ -69,7 +70,7 @@ interface BatchActiveState {
 }
 
 interface BatchLifecycleSnapshot {
-  authority: "v2_owned" | "legacy_compatibility";
+  authority: "v2_owned" | "legacy_compatibility" | "empty_current";
   compatibility_mode: "v1" | "v2";
   fingerprint: string;
   admission_generation: number;
@@ -80,9 +81,9 @@ interface BatchLifecycleSnapshot {
   liveActiveBatchCleared: boolean;
   hasItems: boolean;
   installation_id: string | null;
-  batch_number: number;
+  batch_number: number | null;
   assignment_attempt: string | null;
-  provenance: "owned" | "legacy_unowned";
+  provenance: "owned" | "unowned" | "legacy_unowned";
   assignment_key: string | null;
   assignment_items: Array<{
     work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };

@@ -60,9 +60,19 @@ const ACTIVE = {
 };
 const IDLE_COMPLETE = { ...ACTIVE, complete: true, completeConfirmed: true };
 const IDLE_CLEARED = {
-  ...ACTIVE,
+  admission_generation: 0,
+  batch_observation_fingerprint: "v2-observation-restart-empty",
+  compatibility_mode: "v2",
+  installation_id: null,
+  batch_number: null,
+  assignment_attempt: null,
+  provenance: "unowned",
+  assignment_key: null,
   current: false,
+  owned: false,
+  multi_repository: false,
   assignment_items: [],
+  active: false,
   items: [],
   complete: false,
   completeConfirmed: false,

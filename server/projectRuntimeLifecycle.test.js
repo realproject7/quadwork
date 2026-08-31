@@ -149,20 +149,31 @@ assert.equal(runtime.ownedBatchAutomationState(
 ).authoritative, false, "server automation uses the shared order-sensitive assignment join");
 
 const clearedOwnedProgress = {
-  ...ownedProgress,
+  admission_generation: ownedProgress.admission_generation,
+  batch_observation_fingerprint: "v2-observation-runtime-empty",
+  compatibility_mode: "v2",
+  installation_id: null,
+  batch_number: null,
+  assignment_attempt: null,
+  provenance: "unowned",
+  assignment_key: null,
+  owned: false,
   current: false,
-  assignment_key: "assignment-7-2-cleared",
+  multi_repository: false,
   assignment_items: [],
+  active: false,
   items: [],
+  complete: false,
+  completeConfirmed: false,
   liveActiveBatchCleared: true,
 };
 const clearedOwnedState = runtime.batchAutomationState(
   clearedOwnedProgress,
   { ...clearedOwnedProgress, active: false },
 );
-assert.equal(clearedOwnedState.mode, "v2");
+assert.equal(clearedOwnedState.mode, "empty");
 assert.equal(clearedOwnedState.shouldStop, true,
-  "an exact inactive V2 empty-set assignment authorizes explicit-clear stop");
+  "an exact inactive V2 empty observation authorizes cleanup without creating an assignment");
 
 const legacyProgress = {
   admission_generation: 0,
@@ -203,9 +214,9 @@ assert.equal(runtime.batchAutomationState(
   { ...legacyActive, compatibility_mode: "v2" },
 ).authoritative, false, "activated legacy_unowned rows are never revived through the V1 compatibility path");
 assert.equal(runtime.batchAutomationState(
-  { ...legacyProgress, current: false, items: [], liveActiveBatchCleared: true },
-  { ...legacyActive, current: false, active: false },
-).shouldStop, true, "an explicit live clear remains a V1-compatible stop signal without becoming V2 ownership");
+  { ...legacyProgress, active: false, batch_number: null, current: false, items: [], complete: false, completeConfirmed: false, liveActiveBatchCleared: true },
+  { ...legacyActive, batch_number: null, current: false, active: false },
+).shouldStop, true, "an explicit live clear remains a V1 empty-observation stop signal without becoming ownership");
 
 assert.deepEqual(runtime.bridgeAssignmentBody("a", { generation: 4 }, { ...ownedAutomation, mode: "v2" }), {
   project_id: "a",
@@ -261,6 +272,30 @@ for (const [label, handler] of [["start", runtime.startCaffeinate], ["stop", run
 }
 assert.equal(runtime.caffeinateProcess.manualOwner, false,
   "rejected identity cannot acquire or release the global manual owner");
+const originalValidateCurrentAutomationRequest = routes.validateCurrentAutomationRequest;
+routes.validateCurrentAutomationRequest = () => ({
+  ok: true,
+  manual: false,
+  cleared: true,
+  compatibility_mode: "v2",
+  admission: { generation: 0 },
+  context: { fingerprint: "v2-observation-runtime-empty" },
+});
+for (const [label, handler, expectedStatus] of [
+  ["start", runtime.startCaffeinate, 409],
+  ["stop", runtime.stopCaffeinate, 200],
+]) {
+  const response = {
+    statusCode: 200,
+    payload: null,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.payload = payload; return this; },
+  };
+  handler({ body: { project_id: "a", admission_generation: 0, compatibility_mode: "v2",
+    batch_observation_fingerprint: "v2-observation-runtime-empty", current_batch_empty: true } }, response);
+  assert.equal(response.statusCode, expectedStatus, `empty observation ${label} preserves cleanup-only caffeinate semantics`);
+}
+routes.validateCurrentAutomationRequest = originalValidateCurrentAutomationRequest;
 assert.equal(runtime.isBatchAutomationCurrent("a", { ...ownedAutomation, mode: "v2" }), true,
   "server-side trigger polling revalidates the exact action identity before local mutation");
 assert.equal(runtime.isBatchAutomationCurrent("a", {

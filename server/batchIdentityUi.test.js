@@ -136,21 +136,39 @@ const confirmed = ownedCurrentBatchSnapshot(
 assert.ok(confirmed && confirmed.completeConfirmed, "confirmed completion can authorize an identity-bound stop");
 
 const clearedIdentity = {
-  ...identity,
+  admission_generation: identity.admission_generation,
+  batch_observation_fingerprint: "v2-observation-empty",
+  installation_id: null,
+  batch_number: null,
+  assignment_attempt: null,
+  provenance: "unowned",
   current: false,
-  assignment_key: "batch-7-attempt-2-cleared",
+  owned: false,
+  multi_repository: true,
+  compatibility_mode: "v2",
+  assignment_key: null,
   assignment_items: [],
 };
 const cleared = ownedCurrentBatchSnapshot(
   { ...clearedIdentity, active: false },
-  { ...clearedIdentity, items: [], complete: false, completeConfirmed: false, liveActiveBatchCleared: true },
+  { ...clearedIdentity, active: false, items: [], complete: false, completeConfirmed: false, liveActiveBatchCleared: true },
 );
-assert.ok(cleared && cleared.liveActiveBatchCleared && !cleared.hasItems, "explicit live clear survives an empty progress row set");
-assert.deepEqual(assignmentRequestFields(cleared).assignment_items, [], "V2 clear carries the exact empty assignment set for route revalidation");
+assert.ok(cleared && cleared.authority === "empty_current" && cleared.liveActiveBatchCleared && !cleared.hasItems,
+  "canonical live clear is an exact observation proof, never an assignment");
+assert.deepEqual(assignmentRequestFields(cleared), {
+  admission_generation: 4,
+  compatibility_mode: "v2",
+  batch_observation_fingerprint: "v2-observation-empty",
+  current_batch_empty: true,
+}, "V2 clear carries only the empty-observation receipt for stop-side revalidation");
 assert.equal(ownedCurrentBatchSnapshot(
   { ...clearedIdentity, active: true },
-  { ...clearedIdentity, items: [], liveActiveBatchCleared: true },
+  { ...clearedIdentity, active: false, items: [], complete: false, completeConfirmed: false, liveActiveBatchCleared: true },
 ), null, "a V2 clear cannot authorize stop while batch-active still reports active");
+assert.equal(ownedCurrentBatchSnapshot(
+  { ...identity, current: false, assignment_items: [], active: false },
+  { ...identity, current: false, assignment_items: [], items: [], complete: false, completeConfirmed: false, liveActiveBatchCleared: true },
+), null, "a pre-#1050 identity-bearing sticky clear cannot masquerade as the canonical empty state");
 assert.equal(
   ownedCurrentBatchSnapshot(active, {
     ...progress,
@@ -248,14 +266,24 @@ const legacyEdited = ownedCurrentBatchSnapshot(
 );
 assert.notEqual(legacyEdited.fingerprint, legacy.fingerprint,
   "V1 same-batch row-set edits retain their historical transition identity");
+const legacyEmpty = {
+  ...legacyTop,
+  batch_observation_fingerprint: "legacy-observation-empty",
+  batch_number: null,
+  current: false,
+};
 const legacyCleared = ownedCurrentBatchSnapshot(
-  { ...legacyTop, current: false, active: false },
-  { ...legacyTop, current: false, complete: false, completeConfirmed: false, liveActiveBatchCleared: true, items: [legacyRow] },
+  { ...legacyEmpty, active: false },
+  { ...legacyEmpty, active: false, complete: false, completeConfirmed: false, liveActiveBatchCleared: true, items: [] },
 );
 assert.ok(
-  legacyCleared && legacyCleared.liveActiveBatchCleared && !legacyCleared.hasItems,
-  "explicit V1 clear ignores sticky display rows and keeps the identity-free auto-stop path",
+  legacyCleared && legacyCleared.authority === "empty_current" && legacyCleared.liveActiveBatchCleared && !legacyCleared.hasItems,
+  "explicit V1 clear is an identity-free empty observation proof",
 );
+assert.equal(ownedCurrentBatchSnapshot(
+  { ...legacyTop, current: false, active: false },
+  { ...legacyTop, current: false, complete: false, completeConfirmed: false, liveActiveBatchCleared: true, items: [legacyRow] },
+), null, "legacy sticky display rows cannot authorize a Current Batch transition");
 for (const [name, activeDelta, progressDelta] of [
   ["postactivation legacy", { compatibility_mode: "v2" }, { compatibility_mode: "v2" }],
   ["one-sided compatibility", {}, { compatibility_mode: "v2" }],
@@ -303,6 +331,7 @@ assert.match(panel, /workItemReactKey/, "BatchProgressPanel uses composite keys"
 assert.match(panel, /workItemDisplayLabel/, "BatchProgressPanel uses text repository labels");
 assert.match(panel, /multi_repository/, "repository label is controlled by project topology");
 assert.match(panel, /validation_errors/, "invalid queue diagnostics are visible instead of rendering an empty batch");
+assert.match(panel, /data\.active\s*===\s*false\s*\|\|/, "BatchProgressPanel renders the explicit inactive Current Batch state before any stale rows");
 
 const queueManager = fs.readFileSync(path.join(root, "src", "components", "QueueManager.tsx"), "utf8");
 assert.match(queueManager, /qualifiedQueueToken/, "QueueManager emits qualified work tokens");
