@@ -569,6 +569,24 @@ function candidateWithReservedOwnership(candidate) {
   return projected;
 }
 
+function assertV2OwnershipReservationCommit(candidate, options = {}) {
+  if (v2OwnershipReservations.size === 0) return;
+  const authorizedReservation = options.ownershipReservation;
+  for (const reservation of v2OwnershipReservations.values()) {
+    const project = assertReservationIdentity(candidate, reservation);
+    if (project.archived !== true && authorizedReservation !== reservation) {
+      throw reservationError(
+        reservation.project_id,
+        "reserved project cannot be activated before cleanup completes",
+      );
+    }
+  }
+  validateV2Configuration(candidateWithReservedOwnership(candidate), {
+    previousConfig: options.previousConfig || candidate,
+    fsImpl: options.fsImpl || fs,
+  });
+}
+
 /**
  * Synchronously reserve the active repository/path identity for an unarchive.
  * The returned opaque token is the only authority allowed to publish that
@@ -814,7 +832,11 @@ function writeSecureFile(filePath, data, extraOpts = {}) {
 // process died mid-write, losing the entire config; rename() is atomic on the
 // same filesystem, so a reader always sees either the old or the new file, never
 // a partial one. The tmp name carries the pid so two processes can't collide.
-function writeConfig(cfg) {
+function writeConfig(cfg, options = {}) {
+  // Legacy field-scoped writers still converge here. While an unarchive owns
+  // a reservation, make this low-level atomic boundary enforce the same
+  // authority so a stale whole-document write cannot bypass V2 commits.
+  assertV2OwnershipReservationCommit(cfg, options);
   const data = JSON.stringify(cfg, null, 2);
   const tmpPath = `${CONFIG_PATH}.${process.pid}.tmp`;
   writeSecureFile(tmpPath, data); // 0o600
@@ -832,14 +854,15 @@ function writeConfig(cfg) {
 // concurrent caller can't clobber it with a stale whole-config snapshot. Server
 // mutators and the field-scoped endpoints go through here instead of doing their
 // own GET→mutate→writeConfig. Returns the mutated config.
-function updateConfig(mutator) {
+function updateConfig(mutator, options = {}) {
   const { config: cfg, missing } = readConfigDocument();
   // Apply the old agent-key migration in memory. A failed mutator must not
   // trigger readConfig()'s eager legacy write before the candidate validates.
   migrateAgentKeys(cfg, { persist: false });
+  const previousConfig = cloneConfigurationValue(cfg);
   mutator(cfg);
   if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
-  writeConfig(cfg);
+  writeConfig(cfg, { ...options, previousConfig });
   return cfg;
 }
 
@@ -879,22 +902,20 @@ function commitV2Configuration(mutator = () => {}, options = {}) {
     const candidate = hadInstallationId
       ? cloneConfigurationValue(cfg)
       : migrateConfigurationToV2(cfg);
-    const authorizedReservation = options.ownershipReservation;
-    for (const reservation of v2OwnershipReservations.values()) {
-      const project = assertReservationIdentity(candidate, reservation);
-      if (project.archived !== true && authorizedReservation !== reservation) {
-        throw reservationError(
-          reservation.project_id,
-          "reserved project cannot be activated before cleanup completes",
-        );
-      }
-    }
-    validateV2Configuration(candidateWithReservedOwnership(candidate), {
+    assertV2OwnershipReservationCommit(candidate, {
+      previousConfig,
+      ownershipReservation: options.ownershipReservation,
+      fsImpl: options.fsImpl || fs,
+    });
+    validateV2Configuration(candidate, {
       previousConfig,
       fsImpl: options.fsImpl || fs,
     });
     for (const key of Object.keys(cfg)) delete cfg[key];
     Object.assign(cfg, candidate);
+  }, {
+    ownershipReservation: options.ownershipReservation,
+    fsImpl: options.fsImpl || fs,
   });
 }
 

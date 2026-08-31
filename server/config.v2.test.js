@@ -115,6 +115,15 @@ function diskBytes() {
     );
     assert.equal(diskBytes(), before);
 
+    const staleWholeDocument = readConfig();
+    staleWholeDocument.projects[1].archived = false;
+    expectCode(
+      () => writeConfig(staleWholeDocument),
+      "repository_owned_by_active_project",
+      "low-level stale write cannot bypass an in-flight ownership reservation",
+    );
+    assert.equal(diskBytes(), before);
+
     commitV2Configuration(
       (cfg) => { cfg.projects[0].archived = false; },
       { ownershipReservation: reservation },
