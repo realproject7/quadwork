@@ -28,6 +28,7 @@ const { TMPFS_MAGIC } = require("./resource-temp");
 
 const configDir = path.join(tempHome, ".quadwork");
 const configPath = path.join(configDir, "config.json");
+const configLockPath = path.join(configDir, "config.lock");
 const policyPath = path.join(tempHome, "resource-policy.json");
 const diskStatfs = () => ({ type: 0xEF53n, bavail: 20_000n, bsize: 1024n * 1024n });
 
@@ -549,6 +550,26 @@ reset();
   assert.throws(() => applyPolicy({ policyFile: policyPath, acceptanceSha256: token }), code("acceptance_mismatch"));
   assert.equal(fs.readFileSync(configPath, "utf8"), before);
   assert.deepEqual(fs.readdirSync(configDir), ["config.json"]);
+}
+
+// Runtime policy exchange participates in the same config.lock transaction as
+// server and CLI writers. Neither a live nor stale-looking lock is deleted or
+// bypassed, and no candidate/recovery entry is created before refusal.
+for (const owner of [
+  { pid: process.pid, token: "live-resource-writer" },
+  { pid: -1, token: "stale-resource-writer" },
+]) {
+  reset();
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const before = fs.readFileSync(configPath, "utf8");
+  writePrivate(configLockPath, owner);
+  assert.throws(
+    () => applyPolicy({ policyFile: policyPath, acceptanceSha256: token }),
+    code("config_write_busy"),
+  );
+  assert.equal(fs.readFileSync(configPath, "utf8"), before);
+  assert.equal(fs.existsSync(configLockPath), true);
+  assert.deepEqual(fs.readdirSync(configDir).sort(), ["config.json", "config.lock"].sort());
 }
 
 // Policy source and fixed destination reject aliases and unsafe permissions.

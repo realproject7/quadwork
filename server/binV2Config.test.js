@@ -18,7 +18,11 @@ process.on("exit", () => {
   try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch {}
 });
 
-const { writeConfig, writeQuadWorkConfig } = require("../bin/quadwork");
+const {
+  cleanupLegacyProjectAfterConfirmation,
+  writeConfig,
+  writeQuadWorkConfig,
+} = require("../bin/quadwork");
 
 const installationId = "installation_cli_v2_123456";
 const setup = (projectName, repo, workingDir) => ({
@@ -68,6 +72,23 @@ assert.throws(
 );
 assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), before, "identity-omission bypass leaves config byte-identical");
 
+const archivedRuntimeDir = path.join(CONFIG_DIR, "archived");
+fs.mkdirSync(archivedRuntimeDir, { recursive: true });
+fs.writeFileSync(path.join(archivedRuntimeDir, "keep.txt"), "runtime-state");
+assert.throws(
+  () => cleanupLegacyProjectAfterConfirmation("archived"),
+  (error) => error?.code === "v2_cleanup_requires_lifecycle",
+  "post-confirm cleanup rechecks live activation before deleting a project directory",
+);
+assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), before, "cleanup activation refusal leaves config byte-identical");
+assert.equal(fs.readFileSync(path.join(archivedRuntimeDir, "keep.txt"), "utf8"), "runtime-state",
+  "cleanup activation refusal leaves the project directory untouched");
+assert.throws(
+  () => cleanupLegacyProjectAfterConfirmation(".."),
+  (error) => error?.code === "invalid_project_id",
+  "cleanup rejects a target outside the direct QuadWork project directory",
+);
+
 assert.throws(
   () => writeQuadWorkConfig(setup("archived", "Acme/Replacement", replacementDir)),
   (error) => error?.code === "project_ownership_reserved",
@@ -87,5 +108,23 @@ assert.deepEqual(added.repositories, [{
   working_dir: newDir,
   primary: true,
 }]);
+
+// The same post-confirm boundary still supports V1 cleanup and operates on the
+// fresh locked snapshot rather than the stale preview shown before a prompt.
+fs.unlinkSync(CONFIG_PATH);
+const legacyTargetDir = path.join(CONFIG_DIR, "legacy-target");
+fs.mkdirSync(legacyTargetDir, { recursive: true });
+fs.writeFileSync(CONFIG_PATH, JSON.stringify({
+  port: 8400,
+  concurrent_field: "preserve",
+  projects: [{ id: "keep" }, { id: "legacy-target" }],
+}, null, 2));
+const cleanup = cleanupLegacyProjectAfterConfirmation("legacy-target");
+assert.equal(cleanup.removedDirectory, true);
+assert.equal(cleanup.removedConfigEntry, true);
+const legacyCommitted = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+assert.deepEqual(legacyCommitted.projects, [{ id: "keep" }]);
+assert.equal(legacyCommitted.concurrent_field, "preserve");
+assert.equal(fs.existsSync(legacyTargetDir), false);
 
 console.log("bin V2 config boundary: PASS");

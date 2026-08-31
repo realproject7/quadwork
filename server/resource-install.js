@@ -9,7 +9,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
-const { CONFIG_PATH } = require("./config");
+const { CONFIG_PATH, withSerializedConfigWrite } = require("./config");
 const { parseRuntimeResources } = require("./resource-policy");
 const {
   SecureResourceDirectoryError,
@@ -549,9 +549,23 @@ function applyPolicy({ policyFile, acceptanceSha256 }, options = {}) {
   // Re-read and re-validate the source only after the apply invocation.
   const proposal = policyProposal(policyFile, options);
   if (proposal.acceptance.sha256 !== acceptanceSha256) fail("acceptance_mismatch", "policy acceptance token does not match the current policy file");
-  const previous = readConfigSecure(options);
-  const nextConfig = { ...previous.config, runtime_resources: proposal.policy };
-  const written = writeConfigAtomic(previous, nextConfig, options);
+  // Refuse an unsafe config directory before the shared lock helper can create
+  // its private lock entry. The authoritative bytes are read again below while
+  // the lock is held.
+  readConfigSecure(options);
+  let written;
+  try {
+    written = withSerializedConfigWrite(() => {
+      const previous = readConfigSecure(options);
+      const nextConfig = { ...previous.config, runtime_resources: proposal.policy };
+      return writeConfigAtomic(previous, nextConfig, options);
+    }, { hardenDirectory: false });
+  } catch (error) {
+    if (error?.code === "config_write_busy") {
+      fail("config_write_busy", error.message);
+    }
+    throw error;
+  }
   return Object.freeze({
     ok: true,
     status: "applied",

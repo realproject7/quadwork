@@ -15,6 +15,7 @@ const path = require("path");
 const TMP = path.join(os.tmpdir(), `config-atomic-${process.pid}-${Date.now()}`);
 const CONFIG_DIR = path.join(TMP, ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const CONFIG_LOCK_PATH = path.join(CONFIG_DIR, "config.lock");
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
 const origHome = os.homedir;
@@ -78,6 +79,42 @@ ok(after.flags.a === 1 && after.flags.b === 2, "sequential updateConfig calls on
 // A mutator that reads a value written by a prior updateConfig sees it (fresh read).
 updateConfig((c) => { c.flags.c = (c.flags.a || 0) + 10; });
 ok(readConfig().flags.c === 11, "updateConfig sees the freshest on-disk state");
+
+// Read-time legacy migration is serialized through the same lock and atomic
+// rename path. A competing writer leaves the persisted snapshot untouched.
+{
+  const legacy = { port: 8400, projects: [{ id: "legacy", agents: { t1: { command: "old" } } }] };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(legacy, null, 2), { mode: 0o600 });
+  const before = fs.readFileSync(CONFIG_PATH, "utf8");
+  fs.writeFileSync(CONFIG_LOCK_PATH, JSON.stringify({ pid: process.pid, token: "migration-writer" }), { mode: 0o600 });
+  assert.throws(() => readConfig(), (error) => error?.code === "config_write_busy");
+  ok(true, "legacy migration fails closed while another configuration writer owns the transaction");
+  ok(fs.readFileSync(CONFIG_PATH, "utf8") === before, "busy migration never writes config.json in place or over a concurrent writer");
+  fs.unlinkSync(CONFIG_LOCK_PATH);
+
+  const origRename = fs.renameSync;
+  let renamed = false;
+  fs.renameSync = (from, to) => {
+    if (to === CONFIG_PATH) renamed = true;
+    return origRename(from, to);
+  };
+  try { readConfig(); } finally { fs.renameSync = origRename; }
+  const persisted = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  ok(renamed && persisted.projects[0].agents.head.command === "old" && !persisted.projects[0].agents.t1,
+    "successful legacy migration persists only through atomic rename");
+}
+
+// Missing-config initialization also fails closed behind a writer rather than
+// publishing a default snapshot observed before that writer acquired authority.
+{
+  fs.unlinkSync(CONFIG_PATH);
+  fs.writeFileSync(CONFIG_LOCK_PATH, JSON.stringify({ pid: process.pid, token: "initializer-writer" }), { mode: 0o600 });
+  assert.throws(() => readConfig(), (error) => error?.code === "config_write_busy");
+  ok(fs.existsSync(CONFIG_PATH) === false, "busy missing-config initialization cannot overwrite another writer");
+  fs.unlinkSync(CONFIG_LOCK_PATH);
+  const initialized = readConfig();
+  ok(initialized.port === 8400 && fs.existsSync(CONFIG_PATH), "missing config initializes after explicit lock release");
+}
 
 console.log(`\n${passed} passed`);
 console.log("server/config.atomicWrite.test.js: all assertions passed");

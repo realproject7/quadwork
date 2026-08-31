@@ -460,69 +460,50 @@ router.put("/api/config", (req, res) => {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
     ensureSecureDir(dir);
-    // #944/#949: pinned_projects, sidebar_groups, and reviewer_github_user are
-    // owned by field-scoped endpoints below. A whole-config PUT
-    // (settings save, idle toggle, bridge/queue/trigger widgets) carries a
-    // snapshot the client GET'd earlier, which may be stale for these keys.
-    // Never let a full PUT clobber them: always re-read the current on-disk
-    // values and keep those.
-    const disk = readConfigFile();
-    // #1029: installation identity is server-owned. A stale whole-config
-    // snapshot may omit it and must preserve the committed value; a caller may
-    // never introduce or rotate it outside commitV2Configuration().
-    const diskHasInstallationId = Object.prototype.hasOwnProperty.call(disk, "installation_id");
-    const bodyHasInstallationId = Object.prototype.hasOwnProperty.call(body, "installation_id");
-    if (bodyHasInstallationId &&
-        (!diskHasInstallationId || body.installation_id !== disk.installation_id)) {
-      const err = new Error("installation identity rotation rejected");
-      err.code = "QW_INSTALLATION_ID_ROTATION";
-      throw err;
-    }
-    if (diskHasInstallationId) body.installation_id = disk.installation_id;
-    else delete body.installation_id;
-    if ("pinned_projects" in disk) body.pinned_projects = disk.pinned_projects;
-    else delete body.pinned_projects;
-    if ("sidebar_groups" in disk) body.sidebar_groups = disk.sidebar_groups;
-    else delete body.sidebar_groups;
-    if ("reviewer_github_user" in disk) body.reviewer_github_user = disk.reviewer_github_user;
-    else delete body.reviewer_github_user;
-    // #968: session_token is redacted from GET, so a whole-config PUT snapshot
-    // never carries it — re-read and preserve it (same reason as the keys above).
-    if ("session_token" in disk) body.session_token = disk.session_token;
-    else delete body.session_token;
-    // #971: GET returns the SANITIZED operator_name; if the client PUTs back that
-    // exact sanitized value it did not actually edit it, so keep the raw on-disk
-    // value instead of overwriting it with the sanitized form (routes.js:327).
-    if (typeof body.operator_name === "string" && "operator_name" in disk &&
-        body.operator_name === sanitizeOperatorName(disk.operator_name)) {
-      body.operator_name = disk.operator_name;
-    }
-    // #971: the per-project flag fields are owned by PUT /api/projects/:id/flags.
-    // A whole-config PUT (e.g. SettingsPage.save) carries a possibly-stale
-    // snapshot of them, so re-read each project's flags off disk and keep those —
-    // a Settings save can never revert a concurrent toggle (extends #944).
-    if (Array.isArray(body.projects)) {
-      const diskById = new Map((disk.projects || []).map((p) => [p.id, p]));
-      for (const proj of body.projects) {
-        const dp = diskById.get(proj.id);
-        if (!dp) continue;
-        preserveProjectArchiveState(dp, proj);
-        for (const k of PROJECT_FLAG_KEYS) {
-          if (k in dp) proj[k] = dp[k];
-          else delete proj[k];
+    // Reconcile the caller snapshot only after updateConfig has acquired the
+    // shared lock and read the live document. This closes both stale lifecycle
+    // overwrite and V1→V2 activation races between request parsing and commit.
+    updateConfig((cfg) => {
+      const candidate = JSON.parse(JSON.stringify(body));
+      const liveHasInstallationId = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
+      const bodyHasInstallationId = Object.prototype.hasOwnProperty.call(candidate, "installation_id");
+      if (bodyHasInstallationId &&
+          (!liveHasInstallationId || candidate.installation_id !== cfg.installation_id)) {
+        const err = new Error("installation identity rotation rejected");
+        err.code = "QW_INSTALLATION_ID_ROTATION";
+        throw err;
+      }
+      if (liveHasInstallationId) candidate.installation_id = cfg.installation_id;
+      else delete candidate.installation_id;
+
+      for (const key of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token"]) {
+        if (key in cfg) candidate[key] = cfg[key];
+        else delete candidate[key];
+      }
+      if (typeof candidate.operator_name === "string" && "operator_name" in cfg &&
+          candidate.operator_name === sanitizeOperatorName(cfg.operator_name)) {
+        candidate.operator_name = cfg.operator_name;
+      }
+
+      if (Array.isArray(candidate.projects)) {
+        const liveById = new Map((cfg.projects || []).map((project) => [project.id, project]));
+        for (const project of candidate.projects) {
+          const liveProject = liveById.get(project.id);
+          if (!liveProject) continue;
+          preserveProjectArchiveState(liveProject, project);
+          for (const key of PROJECT_FLAG_KEYS) {
+            if (key in liveProject) project[key] = liveProject[key];
+            else delete project[key];
+          }
         }
       }
-    }
-    if (diskHasInstallationId) {
-      commitV2Configuration((cfg) => {
-        const previousTopology = genericV2ProjectTopology(cfg);
-        assertGenericV2ProjectTopology(previousTopology, body);
-        for (const key of Object.keys(cfg)) delete cfg[key];
-        Object.assign(cfg, body);
-      });
-    } else {
-      writeConfig(body);
-    }
+
+      if (liveHasInstallationId) {
+        assertGenericV2ProjectTopology(genericV2ProjectTopology(cfg), candidate);
+      }
+      for (const key of Object.keys(cfg)) delete cfg[key];
+      Object.assign(cfg, candidate);
+    });
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
       req.app.get("syncTriggers")();

@@ -22,6 +22,7 @@ process.on("exit", () => {
 const express = require("express");
 const router = require("./routes");
 const { writeConfig, commitV2Configuration } = require("./config");
+const { createProjectLifecycleController } = require("./project-lifecycle");
 
 const INSTALLATION_ID = "installation_1234567890abcdef";
 
@@ -45,10 +46,13 @@ function request(server, method, urlPath, body) {
     }, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => resolve({
-        status: res.statusCode,
-        json: JSON.parse(Buffer.concat(chunks).toString()),
-      }));
+      res.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        let json;
+        try { json = JSON.parse(raw); }
+        catch { return reject(new Error(`non-JSON response ${res.statusCode}: ${raw.slice(0, 500)}`)); }
+        resolve({ status: res.statusCode, json });
+      });
     });
     req.on("error", reject);
     if (payload) req.write(payload);
@@ -108,6 +112,29 @@ function request(server, method, urlPath, body) {
     assert.equal(response.status, 200);
     assert.equal(readDisk().installation_id, INSTALLATION_ID);
     assert.equal(readDisk().session_token, "route-test-session-secret");
+
+    // Whole-config reconciliation uses the fresh state read under config.lock,
+    // not the snapshot captured before a lifecycle transition.
+    const lifecycle = createProjectLifecycleController({
+      cleanupProject: async () => ({ ok: true, resources: {} }),
+    });
+    const staleActiveSnapshot = readDisk();
+    const archived = await lifecycle.archiveProject("p");
+    assert.equal(archived.ok, true);
+    staleActiveSnapshot.port = 8403;
+    response = await request(server, "PUT", "/api/config", staleActiveSnapshot);
+    assert.equal(response.status, 200);
+    assert.equal(readDisk().projects[0].archived, true,
+      "stale active PUT cannot restore a freshly archived project");
+
+    const staleArchivedSnapshot = readDisk();
+    const restored = await lifecycle.unarchiveProject("p");
+    assert.equal(restored.ok, true);
+    staleArchivedSnapshot.port = 8404;
+    response = await request(server, "PUT", "/api/config", staleArchivedSnapshot);
+    assert.equal(response.status, 200);
+    assert.equal(readDisk().projects[0].archived, false,
+      "stale archived PUT cannot rearchive a freshly restored project");
 
     // Full replacement and section merge both reject rotation without writing.
     for (const method of ["PUT", "PATCH"]) {
@@ -246,7 +273,14 @@ function request(server, method, urlPath, body) {
       assert.equal(readDisk().session_token, "route-test-session-secret");
     }
 
+    const removed = await lifecycle.removeProject("p2");
+    assert.equal(removed.ok, true);
+    assert.equal(removed.removed, true);
+    assert.equal(readDisk().projects.some((project) => project.id === "p2"), false,
+      "real lifecycle controller alone can commit archive cleanup and removal");
+
     // Before activation, neither full endpoint may accept a caller-supplied ID.
+    fs.unlinkSync(CONFIG_PATH);
     writeConfig({ port: 8400, projects: [] });
     for (const method of ["PUT", "PATCH"]) {
       const before = bytes();

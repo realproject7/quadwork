@@ -1,10 +1,14 @@
 const {
   readConfig,
-  commitV2Configuration,
   validateV2Configuration,
-  reserveV2ProjectOwnership,
-  releaseV2ProjectOwnership,
+  normalizeProjectRepositories,
+  ConfigurationValidationError,
 } = require("./config");
+const {
+  beginProjectLifecycleTransition,
+  releaseProjectLifecycleTransition,
+  commitProjectLifecycleConfiguration,
+} = require("./project-lifecycle-authority");
 
 const admissionGenerations = new Map();
 const projectLifecycleLocks = new Map();
@@ -62,15 +66,18 @@ function unarchiveCandidate(
 function reserveUnarchiveOwnership(projectId, config, validateConfiguration) {
   const state = unarchiveCandidate(projectId, config, validateConfiguration);
   if (state.already_unarchived) return { ...state, reservation: null };
-  const reservation = reserveV2ProjectOwnership(projectId, config, {
+  const reservation = beginProjectLifecycleTransition("unarchive", projectId, config, {
     validateV2Configuration: validateConfiguration,
+    normalizeProjectRepositories,
+    validationError: (code, field, message, ownerProjectId) =>
+      new ConfigurationValidationError(code, field, message, ownerProjectId),
   });
   return { ...state, reservation };
 }
 
 function releaseUnarchiveOwnership(projectId, reservation) {
   void projectId;
-  releaseV2ProjectOwnership(reservation);
+  releaseProjectLifecycleTransition(reservation);
 }
 
 function admissionState(projectId, config, options = {}) {
@@ -224,7 +231,7 @@ function normalizeCleanupResult(result) {
 }
 
 function createProjectLifecycleController(options = {}) {
-  const commitConfiguration = options.commitV2Configuration || commitV2Configuration;
+  const commitConfiguration = options.commitV2Configuration || commitProjectLifecycleConfiguration;
   const cleanupProject = options.cleanupProject;
   const revokeAdmission = options.revokeProjectAdmission || revokeProjectAdmission;
   const readConfiguration = options.readConfig || readConfig;
@@ -242,7 +249,16 @@ function createProjectLifecycleController(options = {}) {
     return run;
   }
 
-  async function commitArchived(projectId, archived, ownershipReservation = null) {
+  function beginTransition(kind, projectId) {
+    return beginProjectLifecycleTransition(kind, projectId, null, {
+      normalizeProjectRepositories,
+      validateV2Configuration: validateConfiguration,
+      validationError: (code, field, message, ownerProjectId) =>
+        new ConfigurationValidationError(code, field, message, ownerProjectId),
+    });
+  }
+
+  async function commitArchived(projectId, archived, lifecycleTransition) {
     let previousArchived = null;
     await commitConfiguration((config) => {
       const project = projectFromConfig(config, projectId);
@@ -251,7 +267,7 @@ function createProjectLifecycleController(options = {}) {
       }
       previousArchived = project.archived === true;
       project.archived = archived;
-    }, ownershipReservation ? { ownershipReservation } : undefined);
+    }, lifecycleTransition);
     return previousArchived;
   }
 
@@ -273,8 +289,8 @@ function createProjectLifecycleController(options = {}) {
     }
   }
 
-  async function archiveUnlocked(projectId) {
-    const wasArchived = await commitArchived(projectId, true);
+  async function archiveUnlocked(projectId, lifecycleTransition) {
+    const wasArchived = await commitArchived(projectId, true, lifecycleTransition);
     const generation = revokeAdmission(projectId);
     const cleanup = await cleanupArchivedProject(projectId);
     return {
@@ -289,7 +305,14 @@ function createProjectLifecycleController(options = {}) {
   }
 
   function archiveProject(projectId) {
-    return serialize(projectId, () => archiveUnlocked(projectId));
+    return serialize(projectId, async () => {
+      const transition = beginTransition("archive", projectId);
+      try {
+        return await archiveUnlocked(projectId, transition);
+      } finally {
+        releaseProjectLifecycleTransition(transition);
+      }
+    });
   }
 
   function unarchiveProject(projectId) {
@@ -348,16 +371,21 @@ function createProjectLifecycleController(options = {}) {
 
   function removeProject(projectId) {
     return serialize(projectId, async () => {
-      const archived = await archiveUnlocked(projectId);
-      if (!archived.ok) return { ...archived, removed: false };
-      await commitConfiguration((config) => {
-        const before = Array.isArray(config.projects) ? config.projects.length : 0;
-        config.projects = (config.projects || []).filter((project) => project && project.id !== projectId);
-        if (config.projects.length === before) {
-          throw lifecycleError("unknown_project", projectId, "project is not configured", 404);
-        }
-      });
-      return { ...archived, removed: true };
+      const transition = beginTransition("remove", projectId);
+      try {
+        const archived = await archiveUnlocked(projectId, transition);
+        if (!archived.ok) return { ...archived, removed: false };
+        await commitConfiguration((config) => {
+          const before = Array.isArray(config.projects) ? config.projects.length : 0;
+          config.projects = (config.projects || []).filter((project) => project && project.id !== projectId);
+          if (config.projects.length === before) {
+            throw lifecycleError("unknown_project", projectId, "project is not configured", 404);
+          }
+        }, transition);
+        return { ...archived, removed: true };
+      } finally {
+        releaseProjectLifecycleTransition(transition);
+      }
     });
   }
 

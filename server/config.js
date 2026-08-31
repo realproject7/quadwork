@@ -3,6 +3,10 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { parseRuntimeResources } = require("./resource-policy");
+const {
+  assertProjectLifecycleTransitions,
+  registerProjectLifecycleCommitter,
+} = require("./project-lifecycle-authority");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 const CONFIG_LOCK_PATH = path.join(os.homedir(), ".quadwork", "config.lock");
@@ -19,11 +23,6 @@ const INSTALLATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const LEGACY_PRIMARY_REPOSITORY_KEY = "primary";
 const INTERNAL_CONFIG_WRITE = Symbol("internalConfigWrite");
 const INTERNAL_CONFIG_WRITE_AUTHORITY = Object.freeze({});
-// Process-wide authority for projects that have passed unarchive ownership
-// validation but are still proving that their archived runtime is quiescent.
-// Every V2 config commit consults this map, so no other mutation path can make
-// a colliding project active or change the reserved identity mid-cleanup.
-const v2OwnershipReservations = new Map();
 let configWriteLockDepth = 0;
 
 class ConfigurationValidationError extends Error {
@@ -59,8 +58,8 @@ function readConfigLockOwner() {
   }
 }
 
-function acquireConfigWriteLock() {
-  ensureSecureDir(path.dirname(CONFIG_LOCK_PATH));
+function acquireConfigWriteLock(options = {}) {
+  if (options.hardenDirectory !== false) ensureSecureDir(path.dirname(CONFIG_LOCK_PATH));
   const token = crypto.randomUUID();
   const payload = JSON.stringify({ pid: process.pid, token });
   const candidatePath = `${CONFIG_LOCK_PATH}.${process.pid}.${token}.tmp`;
@@ -92,9 +91,9 @@ function releaseConfigWriteLock(token) {
   try { fs.unlinkSync(CONFIG_LOCK_PATH); } catch {}
 }
 
-function withConfigWriteLock(operation) {
+function withConfigWriteLock(operation, options = {}) {
   if (configWriteLockDepth > 0) return operation();
-  const token = acquireConfigWriteLock();
+  const token = acquireConfigWriteLock(options);
   configWriteLockDepth = 1;
   try {
     return operation();
@@ -102,6 +101,11 @@ function withConfigWriteLock(operation) {
     configWriteLockDepth = 0;
     releaseConfigWriteLock(token);
   }
+}
+
+function withSerializedConfigWrite(operation, options = {}) {
+  if (typeof operation !== "function") throw new TypeError("configuration operation must be a function");
+  return withConfigWriteLock(operation, options);
 }
 
 function hasOwn(value, key) {
@@ -598,128 +602,6 @@ function migrateConfigurationToV2(config) {
   return { ...cloned, projects };
 }
 
-function reservationProject(config, projectId) {
-  return Array.isArray(config?.projects)
-    ? config.projects.find((project) => project && project.id === projectId) || null
-    : null;
-}
-
-function repositoryOwnershipSignature(project) {
-  return JSON.stringify(normalizeProjectRepositories(project));
-}
-
-function reservationError(projectId, message = "project repository ownership is reserved") {
-  return validationError(
-    "project_ownership_reserved",
-    "projects",
-    message,
-    projectId,
-  );
-}
-
-function assertReservationIdentity(candidate, reservation) {
-  const project = reservationProject(candidate, reservation.project_id);
-  if (!project) {
-    throw reservationError(reservation.project_id, "reserved project cannot be removed");
-  }
-  if (repositoryOwnershipSignature(project) !== reservation.ownership_signature) {
-    throw reservationError(reservation.project_id, "reserved project ownership cannot be changed");
-  }
-  return project;
-}
-
-function candidateWithReservedOwnership(candidate) {
-  const projected = cloneConfigurationValue(candidate);
-  for (const reservation of v2OwnershipReservations.values()) {
-    const project = assertReservationIdentity(projected, reservation);
-    project.archived = false;
-  }
-  return projected;
-}
-
-function assertV2OwnershipReservationCommit(candidate, options = {}) {
-  const authorizedReservation = options.ownershipReservation;
-  if (v2OwnershipReservations.size > 0) {
-    for (const reservation of v2OwnershipReservations.values()) {
-      const project = assertReservationIdentity(candidate, reservation);
-      if (project.archived !== true && authorizedReservation !== reservation) {
-        throw reservationError(
-          reservation.project_id,
-          "reserved project cannot be activated before cleanup completes",
-        );
-      }
-    }
-    // Project every in-flight reservation as active while validating other
-    // mutations. This makes a colliding activation fail before its own token
-    // check and, critically, before any config bytes are written.
-    validateV2Configuration(candidateWithReservedOwnership(candidate), {
-      previousConfig: options.previousConfig || candidate,
-      fsImpl: options.fsImpl || fs,
-    });
-  }
-
-  // An existing archived project may become active only through the exact
-  // reservation that proved collision safety before cleanup. New projects are
-  // intentionally outside this transition rule, and removal remains legal
-  // after archive cleanup because there is no active candidate to publish.
-  for (const previous of options.previousConfig?.projects || []) {
-    if (!previous || previous.archived !== true || typeof previous.id !== "string") continue;
-    const next = reservationProject(candidate, previous.id);
-    if (!next || next.archived === true) continue;
-    const reservation = v2OwnershipReservations.get(previous.id);
-    if (!reservation || authorizedReservation !== reservation) {
-      throw reservationError(
-        previous.id,
-        "archived project activation requires its cleanup reservation",
-      );
-    }
-  }
-}
-
-/**
- * Synchronously reserve the active repository/path identity for an unarchive.
- * The returned opaque token is the only authority allowed to publish that
- * project's archived=false transition while cleanup is in flight.
- */
-function reserveV2ProjectOwnership(projectId, config, options = {}) {
-  if (typeof projectId !== "string" || !projectId) {
-    throw reservationError(projectId, "project id is required for ownership reservation");
-  }
-  if (v2OwnershipReservations.has(projectId)) {
-    throw reservationError(projectId, "project ownership is already reserved");
-  }
-  const project = reservationProject(config, projectId);
-  if (!project) throw reservationError(projectId, "project is not configured");
-
-  const reservation = Object.freeze({
-    project_id: projectId,
-    ownership_signature: repositoryOwnershipSignature(project),
-  });
-  const projected = cloneConfigurationValue(config);
-  const target = reservationProject(projected, projectId);
-  target.archived = false;
-  for (const existing of v2OwnershipReservations.values()) {
-    assertReservationIdentity(projected, existing).archived = false;
-  }
-
-  const validate = options.validateV2Configuration || validateV2Configuration;
-  validate(projected, {
-    previousConfig: config,
-    fsImpl: options.fsImpl || fs,
-  });
-  // Validation and publication are synchronous, so no competing reservation
-  // or config commit can interleave between them in this Node process.
-  v2OwnershipReservations.set(projectId, reservation);
-  return reservation;
-}
-
-function releaseV2ProjectOwnership(reservation) {
-  if (!reservation || typeof reservation.project_id !== "string") return;
-  if (v2OwnershipReservations.get(reservation.project_id) === reservation) {
-    v2OwnershipReservations.delete(reservation.project_id);
-  }
-}
-
 // Reserved sender names that the operator must NOT be able to claim.
 const RESERVED_OPERATOR_NAMES = new Set([
   "head",
@@ -766,9 +648,7 @@ function migrateAgentKeys(config, options = {}) {
     }
   }
   if (changed && options.persist !== false) {
-    try {
-      writeSecureFile(CONFIG_PATH, JSON.stringify(config, null, 2));
-    } catch {}
+    writeConfig(config);
   }
   return config;
 }
@@ -797,7 +677,7 @@ function readConfig() {
     // Config file doesn't exist — preserve the historical startup behavior.
     const dir = path.dirname(CONFIG_PATH);
     if (!fs.existsSync(dir)) ensureSecureDir(dir);
-    writeSecureFile(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
+    writeConfig(cloneConfigurationValue(DEFAULT_CONFIG));
     return config;
   }
   return migrateAgentKeys(config);
@@ -926,26 +806,45 @@ function writeConfig(cfg, options = {}) {
 }
 
 function writeConfigUnlocked(cfg, options = {}) {
-  // Legacy field-scoped writers still converge here. While an unarchive owns
-  // a reservation, make this low-level atomic boundary enforce the same
-  // authority so a stale whole-document write cannot bypass V2 commits.
+  // Every writer establishes the authoritative prior state while holding the
+  // cross-process lock. Public callers cannot select legacy validation with a
+  // stale snapshot or smuggle lifecycle authority through an options object.
   const internalWrite = options[INTERNAL_CONFIG_WRITE] === INTERNAL_CONFIG_WRITE_AUTHORITY;
-  let previousConfig = internalWrite ? options.previousConfig : null;
-  if (!previousConfig && typeof cfg?.installation_id === "string") {
-    try {
-      previousConfig = readConfigDocument().config;
-    } catch (error) {
-      // Once activated, inability to establish the live previous state must
-      // never downgrade into an unchecked low-level overwrite.
-      if (!error || error.code !== "ENOENT") throw error;
-    }
+  const liveDocument = internalWrite ? null : readConfigDocument();
+  const previousConfig = internalWrite
+    ? options.previousConfig
+    : liveDocument.config;
+  // Validate exactly the enumerable JSON representation that will be written.
+  // Route compatibility accessors expose legacy scalar conveniences as
+  // non-enumerable properties; those must remain usable in memory without
+  // becoming false persisted-schema violations at the atomic boundary.
+  const candidate = cloneConfigurationValue(cfg);
+  const lifecycleTransition = internalWrite ? options.lifecycleTransition : null;
+  const wasActivated = hasOwn(previousConfig || {}, "installation_id");
+  const isActivated = hasOwn(candidate || {}, "installation_id");
+
+  if (wasActivated && (!isActivated || candidate.installation_id !== previousConfig.installation_id)) {
+    throw validationError(
+      "installation_id_rotation_forbidden",
+      "installation_id",
+      "installation_id cannot be deleted or replaced",
+    );
   }
-  assertV2OwnershipReservationCommit(cfg, {
-    previousConfig,
-    ownershipReservation: internalWrite ? options.ownershipReservation : null,
-    fsImpl: internalWrite ? options.fsImpl : fs,
-  });
-  const data = JSON.stringify(cfg, null, 2);
+  if (isActivated) {
+    validateV2Configuration(candidate, {
+      previousConfig: previousConfig || candidate,
+      fsImpl: internalWrite ? options.fsImpl || fs : fs,
+    });
+  }
+  if (wasActivated || isActivated) {
+    assertProjectLifecycleTransitions(candidate, previousConfig, lifecycleTransition, {
+      validationError,
+      normalizeProjectRepositories,
+      validateV2Configuration,
+      fsImpl: internalWrite ? options.fsImpl || fs : fs,
+    });
+  }
+  const data = JSON.stringify(candidate, null, 2);
   const tmpPath = `${CONFIG_PATH}.${process.pid}.tmp`;
   writeSecureFile(tmpPath, data); // 0o600
   try {
@@ -962,7 +861,7 @@ function writeConfigUnlocked(cfg, options = {}) {
 // concurrent caller can't clobber it with a stale whole-config snapshot. Server
 // mutators and the field-scoped endpoints go through here instead of doing their
 // own GET→mutate→writeConfig. Returns the mutated config.
-function updateConfig(mutator, options = {}) {
+function updateConfigInternal(mutator, options = {}) {
   return withConfigWriteLock(() => {
     const { config: cfg, missing } = readConfigDocument();
     // Apply the old agent-key migration in memory. A failed mutator must not
@@ -972,12 +871,17 @@ function updateConfig(mutator, options = {}) {
     mutator(cfg);
     if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
     writeConfig(cfg, {
-      ...options,
       previousConfig,
+      lifecycleTransition: options.lifecycleTransition || null,
+      fsImpl: options.fsImpl || fs,
       [INTERNAL_CONFIG_WRITE]: INTERNAL_CONFIG_WRITE_AUTHORITY,
     });
     return cfg;
   });
+}
+
+function updateConfig(mutator) {
+  return updateConfigInternal(mutator);
 }
 
 /**
@@ -989,12 +893,12 @@ function updateConfig(mutator, options = {}) {
  * atomic write used by updateConfig(). It is intentionally not wired to any
  * startup/read/route path in #1029.
  */
-function commitV2Configuration(mutator = () => {}, options = {}) {
+function commitV2ConfigurationInternal(mutator = () => {}, options = {}) {
   if (typeof mutator !== "function") throw new TypeError("mutator must be a function");
   const idGenerator = options.idGenerator || (() => crypto.randomUUID());
   if (typeof idGenerator !== "function") throw new TypeError("idGenerator must be a function");
 
-  return updateConfig((cfg) => {
+  return updateConfigInternal((cfg) => {
     const previousConfig = cloneConfigurationValue(cfg);
     const hadInstallationId = hasOwn(cfg, "installation_id");
     const committedInstallationId = hadInstallationId ? cfg.installation_id : idGenerator();
@@ -1020,18 +924,32 @@ function commitV2Configuration(mutator = () => {}, options = {}) {
       previousConfig,
       fsImpl: options.fsImpl || fs,
     });
-    assertV2OwnershipReservationCommit(candidate, {
-      previousConfig,
-      ownershipReservation: options.ownershipReservation,
-      fsImpl: options.fsImpl || fs,
-    });
     for (const key of Object.keys(cfg)) delete cfg[key];
     Object.assign(cfg, candidate);
   }, {
-    ownershipReservation: options.ownershipReservation,
+    lifecycleTransition: options.lifecycleTransition || null,
     fsImpl: options.fsImpl || fs,
   });
 }
+
+function commitV2Configuration(mutator = () => {}, options = {}) {
+  return commitV2ConfigurationInternal(mutator, {
+    idGenerator: options.idGenerator,
+    fsImpl: options.fsImpl,
+  });
+}
+
+// Package-internal lifecycle port. Its opaque transition object is minted by
+// project-lifecycle-authority.js and checked by object identity at commit time.
+function commitV2ProjectLifecycleConfiguration(mutator, lifecycleTransition, options = {}) {
+  return commitV2ConfigurationInternal(mutator, {
+    idGenerator: options.idGenerator,
+    fsImpl: options.fsImpl,
+    lifecycleTransition,
+  });
+}
+
+registerProjectLifecycleCommitter(commitV2ProjectLifecycleConfiguration);
 
 /**
  * Compatibility boundary for legacy CLI writers. Activation is decided from
@@ -1065,6 +983,7 @@ module.exports = {
   CONFIG_PATH,
   ensureSecureDir,
   writeSecureFile,
+  withSerializedConfigWrite,
   writeConfig,
   updateConfig,
   ConfigurationValidationError,
@@ -1077,8 +996,6 @@ module.exports = {
   workingDirIdentity,
   validateV2Configuration,
   migrateConfigurationToV2,
-  reserveV2ProjectOwnership,
-  releaseV2ProjectOwnership,
   commitV2Configuration,
   commitConfigurationSnapshot,
 };

@@ -8,6 +8,7 @@ const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 const {
   readRuntimeResources,
+  updateConfig,
   commitV2Configuration,
   commitConfigurationSnapshot,
 } = require("../server/config");
@@ -273,6 +274,45 @@ function writeConfig(config) {
   // A caller cannot select the legacy branch by omitting installation_id from
   // a stale snapshot.
   return commitConfigurationSnapshot(config);
+}
+
+function projectRuntimeDirectory(projectId) {
+  if (typeof projectId !== "string" || !projectId || projectId === "." || projectId === ".." || path.basename(projectId) !== projectId) {
+    const error = new Error("project id must name one direct QuadWork config directory");
+    error.code = "invalid_project_id";
+    throw error;
+  }
+  const configRoot = path.resolve(CONFIG_DIR);
+  const projectDir = path.resolve(CONFIG_DIR, projectId);
+  if (path.dirname(projectDir) !== configRoot) {
+    const error = new Error("project cleanup target is outside the QuadWork config directory");
+    error.code = "invalid_project_id";
+    throw error;
+  }
+  return projectDir;
+}
+
+function cleanupLegacyProjectAfterConfirmation(projectId) {
+  const projectDir = projectRuntimeDirectory(projectId);
+  let removedDirectory = false;
+  let removedConfigEntry = false;
+  updateConfig((fresh) => {
+    if (Object.prototype.hasOwnProperty.call(fresh, "installation_id")) {
+      const error = new Error("Activated V2 projects must be removed from the dashboard so lifecycle cleanup can run.");
+      error.code = "v2_cleanup_requires_lifecycle";
+      throw error;
+    }
+    const freshIdx = (fresh.projects || []).findIndex((project) => project.id === projectId);
+    if (fs.existsSync(projectDir)) {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+      removedDirectory = true;
+    }
+    if (freshIdx >= 0) {
+      fresh.projects.splice(freshIdx, 1);
+      removedConfigEntry = true;
+    }
+  });
+  return { projectDir, removedDirectory, removedConfigEntry };
 }
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────
@@ -1160,7 +1200,9 @@ async function cmdCleanup() {
         return;
       }
       const idx = (config.projects || []).findIndex((p) => p.id === projectId);
-      const projectDir = path.join(CONFIG_DIR, projectId);
+      let projectDir;
+      try { projectDir = projectRuntimeDirectory(projectId); }
+      catch (error) { fail(error.message); return; }
       if (idx < 0 && !fs.existsSync(projectDir)) {
         warn(`No project '${projectId}' in config and no directory at ${projectDir}.`);
         return;
@@ -1172,15 +1214,20 @@ async function cmdCleanup() {
       const confirm = await askYN(rl, `Delete ${projectDir} and remove the config entry?`, false);
       if (!confirm) { warn("Aborted."); return; }
 
-      if (fs.existsSync(projectDir)) {
-        try { fs.rmSync(projectDir, { recursive: true, force: true }); ok(`Removed ${projectDir}`); }
-        catch (e) { fail(`Could not remove ${projectDir}: ${e.message}`); return; }
+      let cleanup;
+      try {
+        // Confirmation is an await boundary. Re-read under the shared config
+        // lock before any deletion so activation or a concurrent V1 edit during
+        // the prompt cannot turn this legacy command into a V2 lifecycle bypass.
+        cleanup = cleanupLegacyProjectAfterConfirmation(projectId);
+      } catch (error) {
+        fail(error?.code === "v2_cleanup_requires_lifecycle"
+          ? error.message
+          : `Could not clean up project: ${error.message}`);
+        return;
       }
-      if (idx >= 0) {
-        config.projects.splice(idx, 1);
-        try { writeConfig(config); ok(`Updated ${CONFIG_PATH}`); }
-        catch (e) { fail(`Could not write config: ${e.message}`); return; }
-      }
+      if (cleanup.removedDirectory) ok(`Removed ${cleanup.projectDir}`);
+      if (cleanup.removedConfigEntry) ok(`Updated ${CONFIG_PATH}`);
       return;
     }
 
@@ -1697,6 +1744,7 @@ module.exports = {
   renderResourceInstall,
   runResourceInstallCommand,
   runResourcesCommand,
+  cleanupLegacyProjectAfterConfirmation,
   writeConfig,
   writeQuadWorkConfig,
 };

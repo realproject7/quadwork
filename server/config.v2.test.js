@@ -30,11 +30,10 @@ const {
   serializeProjectCompatibility,
   validateV2Configuration,
   migrateConfigurationToV2,
-  reserveV2ProjectOwnership,
-  releaseV2ProjectOwnership,
   commitV2Configuration,
   commitConfigurationSnapshot,
   writeConfig,
+  updateConfig,
   readConfig,
 } = configApi;
 
@@ -79,6 +78,11 @@ function diskBytes() {
   return fs.readFileSync(CONFIG_PATH, "utf8");
 }
 
+function seedConfig(config) {
+  try { fs.unlinkSync(CONFIG_PATH); } catch {}
+  writeConfig(config);
+}
+
 // Cross-process writers serialize the entire fresh-read/validate/rename
 // transaction. Live and stale-looking locks both fail closed; stale recovery
 // is an explicit operator action because automatic read→unlink is racy.
@@ -110,8 +114,9 @@ function diskBytes() {
 // boundary unless lifecycle cleanup first owns the exact reservation token.
 {
   const pathForTokenGate = repoDir("reservation-token-gate");
-  writeConfig(activated([
+  seedConfig(activated([
     project("token-gate", [repository("primary", "Acme/TokenGate", pathForTokenGate)], { archived: true }),
+    project("active-gate", [repository("primary", "Acme/ActiveGate", repoDir("active-transition-gate"))]),
   ]));
   const before = diskBytes();
   expectCode(
@@ -149,63 +154,48 @@ function diskBytes() {
     "Proxy cannot forge the private internal write authority",
   );
   assert.equal(diskBytes(), before);
+
+  expectCode(
+    () => updateConfig((cfg) => { cfg.projects[1].archived = true; }),
+    "project_lifecycle_transition_required",
+    "public update cannot archive without lifecycle cleanup authority",
+  );
+  assert.equal(diskBytes(), before);
+
+  expectCode(
+    () => commitV2Configuration((cfg) => { cfg.projects.splice(1, 1); }),
+    "project_lifecycle_transition_required",
+    "public V2 commit cannot remove a project without lifecycle cleanup authority",
+  );
+  assert.equal(diskBytes(), before);
+
+  const staleWithoutIdentity = readConfig();
+  delete staleWithoutIdentity.installation_id;
+  expectCode(
+    () => writeConfig(staleWithoutIdentity),
+    "installation_id_rotation_forbidden",
+    "activated live configuration cannot be downgraded by a stale legacy snapshot",
+  );
+  assert.equal(diskBytes(), before);
 }
 
-// An in-flight unarchive reservation participates in the same authority as
-// every generic V2 commit. A competing activation or identity rewrite fails
-// before it can publish, while the opaque reservation can publish only its own
-// final archived=false transition.
+// Lifecycle authority is absent from the public config surface. Supplying
+// copied/fake option objects never turns an ordinary V2 commit into a cleanup
+// transition.
 {
-  const sharedPath = repoDir("reserved-shared");
-  const alternatePath = repoDir("reserved-alternate");
-  writeConfig(activated([
-    project("reserved-a", [repository("primary", "Acme/Reserved", sharedPath)], { archived: true }),
-    project("reserved-b", [repository("primary", "Acme/Reserved", sharedPath)], { archived: true }),
-  ]));
-  const reservation = reserveV2ProjectOwnership("reserved-a", readConfig());
-  try {
-    const before = diskBytes();
-    expectCode(
-      () => commitV2Configuration((cfg) => { cfg.projects[1].archived = false; }),
-      "repository_owned_by_active_project",
-      "generic commit cannot activate an owner that collides with an in-flight unarchive",
-    );
-    assert.equal(diskBytes(), before);
-
-    expectCode(
-      () => commitV2Configuration((cfg) => {
-        cfg.projects[0].repositories[0].repo = "Acme/Alternate";
-        cfg.projects[0].repositories[0].working_dir = alternatePath;
-      }),
-      "project_ownership_reserved",
-      "generic commit cannot rewrite an in-flight reservation identity",
-    );
-    assert.equal(diskBytes(), before);
-
-    expectCode(
-      () => commitV2Configuration((cfg) => { cfg.projects[0].archived = false; }),
-      "project_ownership_reserved",
-      "generic commit cannot publish a reserved activation without its token",
-    );
-    assert.equal(diskBytes(), before);
-
-    const staleWholeDocument = readConfig();
-    staleWholeDocument.projects[1].archived = false;
-    expectCode(
-      () => writeConfig(staleWholeDocument),
-      "repository_owned_by_active_project",
-      "low-level stale write cannot bypass an in-flight ownership reservation",
-    );
-    assert.equal(diskBytes(), before);
-
-    commitV2Configuration(
+  assert.equal(configApi.reserveV2ProjectOwnership, undefined);
+  assert.equal(configApi.releaseV2ProjectOwnership, undefined);
+  const before = diskBytes();
+  expectCode(
+    () => commitV2Configuration(
       (cfg) => { cfg.projects[0].archived = false; },
-      { ownershipReservation: reservation },
-    );
-    ok(readConfig().projects[0].archived === false, "reservation token publishes only the validated activation");
-  } finally {
-    releaseV2ProjectOwnership(reservation);
-  }
+      { ownershipReservation: Object.freeze({ project_id: "token-gate" }) },
+    ),
+    "project_ownership_reserved",
+    "fake public reservation options cannot mint lifecycle authority",
+  );
+  assert.equal(diskBytes(), before);
+  ok(true, "config public exports do not expose lifecycle reservation minting");
 }
 
 // An explicit fresh-install activation does not need an eager default write:
@@ -514,7 +504,7 @@ function diskBytes() {
     "unarchive candidate re-runs ownership validation",
   );
 
-  writeConfig(previous);
+  seedConfig(previous);
   const before = diskBytes();
   expectCode(
     () => commitV2Configuration((cfg) => {
@@ -567,7 +557,7 @@ function diskBytes() {
 // single rename. Subsequent commits never call RNG and retain the identity.
 {
   const legacyPath = repoDir("commit-legacy");
-  writeConfig({
+  seedConfig({
     port: 8400,
     session_token: "preserve-me",
     unknown: { deep: [1, 2] },
@@ -635,7 +625,7 @@ function diskBytes() {
 // eager startup migration write or any other byte change.
 {
   const immutablePath = repoDir("immutable");
-  writeConfig(activated([project("immutable", [repository("stable", "Acme/Stable", immutablePath)])]));
+  seedConfig(activated([project("immutable", [repository("stable", "Acme/Stable", immutablePath)])]));
   let before = diskBytes();
   expectCode(
     () => commitV2Configuration((cfg) => { cfg.projects[0].repositories[0].key = "rotated"; }),
@@ -644,7 +634,7 @@ function diskBytes() {
   );
   assert.equal(diskBytes(), before);
 
-  writeConfig({
+  seedConfig({
     projects: [{
       id: "legacy-invalid",
       repo: "not a github repo",

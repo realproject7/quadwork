@@ -1397,7 +1397,7 @@ function runSelfFixtures() {
 // Pre-activation ownership ledger.  #1030/#1031/#1032/#1053 remove their
 // entries as they migrate consumers; the activated V2 target is an empty map.
 const EXPECTED_PRE_ACTIVATION_LEDGER = Object.freeze({
-  "bin/quadwork.js :: owner=cmdCleanup :: call=cmdCleanup :: binding=config.projects[idx] :: repo:property :: at=b5ee77fe2c04#212:log(` Config entry: ${projectId} (${config.projects[idx]": 1,
+  "bin/quadwork.js :: owner=cmdCleanup :: call=cmdCleanup :: binding=config.projects[idx] :: repo:property :: at=b5ee77fe2c04#226:log(` Config entry: ${projectId} (${config.projects[idx]": 1,
   "bin/quadwork.js :: owner=cmdDoctor :: call=cmdDoctor :: binding=p :: working_dir:property :: at=ab866067533d#109:console.log(` project:${p.id || \"(unnamed)\"} chat_mode=$": 1,
   "server/index.js :: owner=post(\"/api/queue\")#arg1 :: call=post(\"/api/queue\")#arg1 :: binding=project :: repo:property :: at=446a7568f90c#136:content = content.replace(/\\{\\{repo\\}\\}/g, project.repo ": 1,
   "server/index.js :: owner=respawnActiveBatchAgents :: call=respawnActiveBatchAgents > filter()#arg0 :: binding=p :: working_dir:property :: at=d43a64b6da2e#12:const projects = (cfg?.projects || []).filter((p) => p &": 1,
