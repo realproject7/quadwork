@@ -51,6 +51,7 @@ const MAX_STAGING_COMBINED_MIB = 320;
 const OOM_ALLOCATION_MARGIN_MIB = 16;
 const MAX_OOM_ALLOCATION_MIB = MAX_STAGING_COMBINED_MIB + OOM_ALLOCATION_MARGIN_MIB;
 const ADAPTER_STATE = new WeakMap();
+const INTERNAL_ADAPTER_CONSTRUCTION_TOKEN = Object.freeze({});
 const INTERNAL_PHASE_TOKEN = Object.freeze({});
 // Deliberately empty until the disposable staging deployment contributes
 // reviewed, source-owned receipts. Runtime options cannot extend these sets;
@@ -58,6 +59,14 @@ const INTERNAL_PHASE_TOKEN = Object.freeze({});
 const TRUSTED_MONITOR_AUTHORITY_FINGERPRINTS = Object.freeze(Object.create(null));
 const TRUSTED_TEMP_PROVIDER_FINGERPRINTS = Object.freeze(Object.create(null));
 const TRUSTED_TEMP_FACT_AUTHORITY_FINGERPRINTS = Object.freeze(Object.create(null));
+
+function sourceAuthoritiesPinned() {
+  return [
+    TRUSTED_MONITOR_AUTHORITY_FINGERPRINTS,
+    TRUSTED_TEMP_PROVIDER_FINGERPRINTS,
+    TRUSTED_TEMP_FACT_AUTHORITY_FINGERPRINTS,
+  ].every((authorities) => Object.keys(authorities).length > 0);
+}
 
 const TTY_SCRIPT = `
 const fs = require("fs");
@@ -327,6 +336,37 @@ function normalizeTempProbe(value) {
   });
 }
 
+function normalizeMonitorProbes(value) {
+  if (!value || typeof value !== "object") return null;
+  const probes = MONITOR_PROBE_NAMES.map((name) => safeGet(value, name));
+  return probes.every((probe) => typeof probe === "function") ? Object.freeze(probes) : null;
+}
+
+function normalizeTempFact(value) {
+  if (!value || typeof value !== "object") return null;
+  return Object.freeze({
+    available: safeGet(value, "available"),
+    code: safeGet(value, "code"),
+    diskBacked: safeGet(value, "diskBacked"),
+    canonicalRoot: safeGet(value, "canonicalRoot"),
+  });
+}
+
+function normalizeFileSystem(value) {
+  if (!value || typeof value !== "object") return Object.freeze({});
+  const bind = (name) => {
+    const operation = safeGet(value, name);
+    return typeof operation === "function"
+      ? (...args) => Reflect.apply(operation, value, args)
+      : null;
+  };
+  return Object.freeze({
+    readFileSync: bind("readFileSync"),
+    realpathSync: bind("realpathSync"),
+    statfsSync: bind("statfsSync"),
+  });
+}
+
 function normalizeEnvironment(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("spawnEnv must be an explicitly supplied object");
@@ -415,7 +455,7 @@ function normalizeTarget(value) {
     workerLimits,
     spawnEnv: normalizeEnvironment(safeGet(value, "spawnEnv")),
     tempProbe: normalizeTempProbe(safeGet(value, "tempProbe")),
-    tempFact: safeGet(value, "tempFact"),
+    tempFact: normalizeTempFact(safeGet(value, "tempFact")),
   });
 }
 
@@ -719,12 +759,20 @@ function internalState(adapter) {
   return state;
 }
 
+function adapterConfig(adapter) {
+  return internalState(adapter).config;
+}
+
+function adapterRunState(adapter) {
+  return internalState(adapter).run;
+}
+
 function requireInternalPhaseToken(token) {
   if (token !== INTERNAL_PHASE_TOKEN) throw proofError("proof_refused", "internal_phase_boundary_required");
 }
 
 function registerScope(adapter, unitName) {
-  const state = internalState(adapter);
+  const state = adapterRunState(adapter);
   if (typeof unitName !== "string" || !GENERATED_WORKER_UNIT_RE.test(unitName.slice(0, -".scope".length))
     || !unitName.endsWith(".scope") || state.registeredUnits.has(unitName)) {
     throw proofError("proof_unavailable", "scope_registration_invalid");
@@ -733,21 +781,22 @@ function registerScope(adapter, unitName) {
 }
 
 async function cleanupRegisteredScope(adapter, unitName) {
-  const state = internalState(adapter);
+  const { execFileSync, cleanupTimeoutMs, maximumOutputBytes } = adapterConfig(adapter);
+  const state = adapterRunState(adapter);
   if (!state.registeredUnits.has(unitName)) return false;
   let clean = false;
   try {
-    adapter.execFileSync("systemctl", ["--user", "stop", unitName], {
+    execFileSync("systemctl", ["--user", "stop", unitName], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: adapter.cleanupTimeoutMs,
-      maxBuffer: adapter.maximumOutputBytes,
+      timeout: cleanupTimeoutMs,
+      maxBuffer: maximumOutputBytes,
     });
     clean = true;
   } catch {}
   if (!clean) {
     try {
-      const output = adapter.execFileSync("systemctl", [
+      const output = execFileSync("systemctl", [
         "--user",
         "--property=LoadState",
         "--property=ActiveState",
@@ -757,10 +806,10 @@ async function cleanupRegisteredScope(adapter, unitName) {
       ], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: adapter.cleanupTimeoutMs,
-        maxBuffer: adapter.maximumOutputBytes,
+        timeout: cleanupTimeoutMs,
+        maxBuffer: maximumOutputBytes,
       });
-      const states = boundedText(output, adapter.maximumOutputBytes, "scope_cleanup_unavailable")
+      const states = boundedText(output, maximumOutputBytes, "scope_cleanup_unavailable")
         .trim()
         .split(/\r?\n/);
       clean = states.includes("not-found") && states.includes("inactive");
@@ -775,42 +824,35 @@ function redactedIdentity(value) {
 }
 
 class LiveStagingAdapter {
-  constructor(options) {
-    this.runPressure = safeGet(options, "runPressure") === true;
-    this.acknowledgement = safeGet(options, "acknowledgement");
-    this.gateProbe = safeGet(options, "gateProbe");
-    this.monitorProbes = safeGet(options, "monitorProbes");
-    this.monitorAuthority = normalizeMonitorAuthority(safeGet(options, "monitorAuthority"));
-    this.tempFactAuthority = normalizeTempFactAuthority(safeGet(options, "tempFactAuthority"));
-    this.ptySpawn = safeGet(options, "ptySpawn");
-    this.execFileSync = safeGet(options, "execFileSyncImpl");
-    this.fs = safeGet(options, "fsImpl");
-    this.target = normalizeTarget(safeGet(options, "target"));
-    this.phaseTimeoutMs = boundedInteger(
+  constructor(options, constructionToken) {
+    if (constructionToken !== INTERNAL_ADAPTER_CONSTRUCTION_TOKEN) {
+      throw proofError("proof_refused", "internal_adapter_construction_required");
+    }
+    const phaseTimeoutMs = boundedInteger(
       safeGet(options, "phaseTimeoutMs") ?? DEFAULT_PHASE_TIMEOUT_MS,
       "phaseTimeoutMs",
       10,
       120_000,
     );
-    this.probeTimeoutMs = boundedInteger(
+    const probeTimeoutMs = boundedInteger(
       safeGet(options, "probeTimeoutMs") ?? DEFAULT_PROBE_TIMEOUT_MS,
       "probeTimeoutMs",
       10,
       60_000,
     );
-    this.cleanupTimeoutMs = boundedInteger(
+    const cleanupTimeoutMs = boundedInteger(
       safeGet(options, "cleanupTimeoutMs") ?? DEFAULT_CLEANUP_TIMEOUT_MS,
       "cleanupTimeoutMs",
       10,
       10_000,
     );
-    this.oomPollMs = boundedInteger(
+    const oomPollMs = boundedInteger(
       safeGet(options, "oomPollMs") ?? DEFAULT_OOM_POLL_MS,
       "oomPollMs",
       1,
       1_000,
     );
-    this.maximumOutputBytes = boundedInteger(
+    const maximumOutputBytes = boundedInteger(
       safeGet(options, "maximumOutputBytes") ?? DEFAULT_OUTPUT_BYTES,
       "maximumOutputBytes",
       1024,
@@ -820,46 +862,71 @@ class LiveStagingAdapter {
     if (typeof cgroupRoot !== "string" || !path.isAbsolute(cgroupRoot)) {
       throw new TypeError("cgroupRoot must be absolute");
     }
-    this.cgroupRoot = path.resolve(cgroupRoot);
-    if (path.parse(this.cgroupRoot).root === this.cgroupRoot) throw new TypeError("cgroupRoot cannot be root");
-    this.gates = null;
-    ADAPTER_STATE.set(this, {
-      runChallenge: null,
-      nextSequence: 0,
-      registeredUnits: new Set(),
+    const resolvedCgroupRoot = path.resolve(cgroupRoot);
+    if (path.parse(resolvedCgroupRoot).root === resolvedCgroupRoot) throw new TypeError("cgroupRoot cannot be root");
+    const config = Object.freeze({
+      runPressure: safeGet(options, "runPressure") === true,
+      acknowledgement: safeGet(options, "acknowledgement"),
+      gateProbe: safeGet(options, "gateProbe"),
+      monitorProbes: normalizeMonitorProbes(safeGet(options, "monitorProbes")),
+      monitorAuthority: normalizeMonitorAuthority(safeGet(options, "monitorAuthority")),
+      tempFactAuthority: normalizeTempFactAuthority(safeGet(options, "tempFactAuthority")),
+      ptySpawn: safeGet(options, "ptySpawn"),
+      execFileSync: safeGet(options, "execFileSyncImpl"),
+      fs: normalizeFileSystem(safeGet(options, "fsImpl")),
+      target: normalizeTarget(safeGet(options, "target")),
+      phaseTimeoutMs,
+      probeTimeoutMs,
+      cleanupTimeoutMs,
+      oomPollMs,
+      maximumOutputBytes,
+      cgroupRoot: resolvedCgroupRoot,
     });
+    ADAPTER_STATE.set(this, Object.freeze({
+      config,
+      run: {
+        gates: null,
+        runChallenge: null,
+        nextSequence: 0,
+        registeredUnits: new Set(),
+      },
+    }));
+    Object.freeze(this);
   }
 
   async inspectGates() {
-    if (typeof this.gateProbe !== "function") throw proofError("proof_unavailable", "live_gate_probe_required");
+    const { gateProbe, probeTimeoutMs } = adapterConfig(this);
+    if (typeof gateProbe !== "function") throw proofError("proof_unavailable", "live_gate_probe_required");
     let raw;
     try {
       raw = await callBounded(
-        ({ signal }) => this.gateProbe(Object.freeze({ signal })),
-        this.probeTimeoutMs,
+        ({ signal }) => gateProbe(Object.freeze({ signal })),
+        probeTimeoutMs,
         "live_gate_probe_unavailable",
       );
     } catch {
       throw proofError("proof_unavailable", "live_gate_probe_unavailable");
     }
-    this.gates = normalizeGateFacts(raw);
-    const state = internalState(this);
+    const state = adapterRunState(this);
+    state.gates = normalizeGateFacts(raw);
     if (state.registeredUnits.size !== 0) {
       throw proofError("proof_unavailable", "prior_scope_cleanup_required");
     }
     state.runChallenge = proofChallenge();
     state.nextSequence = 0;
-    return this.gates;
+    return state.gates;
   }
 
   _authorize(context) {
-    const gates = this.gates;
-    if (!this.runPressure || !gates || !gates.machineId
+    const { runPressure, acknowledgement } = adapterConfig(this);
+    const state = adapterRunState(this);
+    const gates = state.gates;
+    if (!runPressure || !gates || !gates.machineId
       || !gates.linux || !gates.cgroupV2 || !gates.userManager
-      || this.acknowledgement !== `${ACK_PREFIX}${gates.machineId}`) {
+      || acknowledgement !== `${ACK_PREFIX}${gates.machineId}`) {
       throw proofError("proof_refused", "disposable_gate_required");
     }
-    if (!CHALLENGE_RE.test(internalState(this).runChallenge || "")) {
+    if (!CHALLENGE_RE.test(state.runChallenge || "")) {
       throw proofError("proof_unavailable", "live_challenge_unavailable");
     }
     if (!candidateMatches(safeGet(context, "candidate"))) {
@@ -872,16 +939,14 @@ class LiveStagingAdapter {
     // Each target-owned probe signs its exact checkpoint facts. The configured
     // Ed25519 public key is the independently trusted adapter capability;
     // `authenticated:true` or an echoed challenge has no authority by itself.
-    const probes = this.monitorProbes;
-    const probeFunctions = probes && MONITOR_PROBE_NAMES.map((name) => safeGet(probes, name));
-    const authority = this.monitorAuthority;
-    if (!authority || !probeFunctions || probeFunctions.some((probe) => typeof probe !== "function")) {
+    const { monitorProbes: probeFunctions, monitorAuthority: authority, probeTimeoutMs } = adapterConfig(this);
+    if (!authority || !probeFunctions) {
       throw proofError("proof_unavailable", "authenticated_monitor_probes_required");
     }
     if (authority.trusted !== true) {
       throw proofError("proof_unavailable", "staging_monitor_authority_unpinned");
     }
-    const runChallenge = internalState(this).runChallenge;
+    const runChallenge = adapterRunState(this).runChallenge;
     let stopped = false;
     const samples = [];
     const checkpoint = async (label) => {
@@ -896,7 +961,7 @@ class LiveStagingAdapter {
           runChallenge,
           probeChallenge: challenges[index],
         })),
-        this.probeTimeoutMs,
+        probeTimeoutMs,
         `monitor_${name}_unavailable`,
       )));
       const health = results.slice(0, 3).map((result, index) => {
@@ -967,23 +1032,25 @@ class LiveStagingAdapter {
   }
 
   _requirePhaseDependencies() {
-    if (typeof this.ptySpawn !== "function" || typeof this.execFileSync !== "function"
-      || typeof safeGet(this.fs, "readFileSync") !== "function") {
+    const { ptySpawn, execFileSync, fs } = adapterConfig(this);
+    if (typeof ptySpawn !== "function" || typeof execFileSync !== "function"
+      || typeof fs.readFileSync !== "function") {
       throw proofError("proof_unavailable", "live_phase_dependencies_required");
     }
   }
 
   _invocation(phaseId, command, envExtra = {}) {
-    const state = internalState(this);
+    const { target } = adapterConfig(this);
+    const state = adapterRunState(this);
     state.nextSequence += 1;
-    const identity = phaseIdentity(this.target, phaseId, state.runChallenge, state.nextSequence);
+    const identity = phaseIdentity(target, phaseId, state.runChallenge, state.nextSequence);
     const invocation = buildWorkerScopeInvocation({
       projectId: identity.projectId,
       generationId: identity.generationId,
       unitName: identity.unitBase,
       command: command.file,
       args: command.args,
-      limits: this.target.workerLimits,
+      limits: target.workerLimits,
     });
     if (invocation.candidateStatus !== "candidate_pending_staging"
       || invocation.file !== "systemd-run") {
@@ -992,20 +1059,27 @@ class LiveStagingAdapter {
     return Object.freeze({
       identity,
       invocation,
-      env: Object.freeze({ ...this.target.spawnEnv, ...envExtra }),
+      env: Object.freeze({ ...target.spawnEnv, ...envExtra }),
     });
   }
 
   async _withPty(phaseId, command, handler, envExtra = {}, internalToken) {
     requireInternalPhaseToken(internalToken);
+    const {
+      ptySpawn,
+      target,
+      maximumOutputBytes,
+      phaseTimeoutMs,
+      cleanupTimeoutMs,
+    } = adapterConfig(this);
     const built = this._invocation(phaseId, command, envExtra);
     let term;
     try {
-      term = this.ptySpawn(built.invocation.file, [...built.invocation.args], {
+      term = ptySpawn(built.invocation.file, [...built.invocation.args], {
         name: "xterm-256color",
         cols: 80,
         rows: 24,
-        cwd: this.target.cwd,
+        cwd: target.cwd,
         env: { ...built.env },
       });
     } catch {
@@ -1017,7 +1091,7 @@ class LiveStagingAdapter {
     registerScope(this, built.identity.unitName);
     let session;
     try {
-      session = new PtySession(term, this.maximumOutputBytes);
+      session = new PtySession(term, maximumOutputBytes);
     } catch (error) {
       const scopeClean = await cleanupRegisteredScope(this, built.identity.unitName);
       if (!scopeClean) throw proofError("proof_unavailable", `${phaseId}_cleanup_failed`);
@@ -1031,7 +1105,7 @@ class LiveStagingAdapter {
         const error = proofError("proof_unavailable", `${phaseId}_timeout`);
         session.abort(error);
         reject(error);
-      }, this.phaseTimeoutMs);
+      }, phaseTimeoutMs);
     });
     try {
       outcome = await Promise.race([handler(session, built.identity), timeout]);
@@ -1040,7 +1114,7 @@ class LiveStagingAdapter {
     } finally {
       clearTimeout(timer);
     }
-    const ptyClean = await session.cleanup(this.cleanupTimeoutMs);
+    const ptyClean = await session.cleanup(cleanupTimeoutMs);
     const scopeClean = await cleanupRegisteredScope(this, built.identity.unitName);
     if (!ptyClean || !scopeClean) throw proofError("proof_unavailable", `${phaseId}_cleanup_failed`);
     if (failure) throw failure;
@@ -1048,9 +1122,10 @@ class LiveStagingAdapter {
   }
 
   _resolveCgroup(unitName) {
+    const { execFileSync, probeTimeoutMs, maximumOutputBytes, cgroupRoot } = adapterConfig(this);
     let output;
     try {
-      output = this.execFileSync("systemctl", [
+      output = execFileSync("systemctl", [
         "--user",
         "--property=ControlGroup",
         "--value",
@@ -1059,20 +1134,21 @@ class LiveStagingAdapter {
       ], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: this.probeTimeoutMs,
-        maxBuffer: this.maximumOutputBytes,
+        timeout: probeTimeoutMs,
+        maxBuffer: maximumOutputBytes,
       });
     } catch {
       throw proofError("proof_unavailable", "unit_unavailable");
     }
-    return parseCgroupPath(output, this.cgroupRoot, unitName, this.maximumOutputBytes);
+    return parseCgroupPath(output, cgroupRoot, unitName, maximumOutputBytes);
   }
 
   _readCgroup(cgroupPath, name) {
+    const { fs, maximumOutputBytes } = adapterConfig(this);
     try {
       return boundedText(
-        this.fs.readFileSync(path.join(cgroupPath, name), "utf8"),
-        this.maximumOutputBytes,
+        fs.readFileSync(path.join(cgroupPath, name), "utf8"),
+        maximumOutputBytes,
         "cgroup_data_invalid",
       );
     } catch (error) {
@@ -1082,22 +1158,24 @@ class LiveStagingAdapter {
   }
 
   _readOom(cgroupPath) {
+    const { maximumOutputBytes } = adapterConfig(this);
     try {
-      return parseOomCounter(this._readCgroup(cgroupPath, "memory.events.local"), this.maximumOutputBytes);
+      return parseOomCounter(this._readCgroup(cgroupPath, "memory.events.local"), maximumOutputBytes);
     } catch (error) {
       if (!(error instanceof StagingProofError) || error.check !== "cgroup_unavailable") throw error;
-      return parseOomCounter(this._readCgroup(cgroupPath, "memory.events"), this.maximumOutputBytes);
+      return parseOomCounter(this._readCgroup(cgroupPath, "memory.events"), maximumOutputBytes);
     }
   }
 
   async _pollOomIncrease(cgroupPath, before, session) {
-    const deadline = Date.now() + this.phaseTimeoutMs;
+    const { phaseTimeoutMs, oomPollMs } = adapterConfig(this);
+    const deadline = Date.now() + phaseTimeoutMs;
     while (Date.now() < deadline) {
       if (session.failure) throw session.failure;
       const after = this._readOom(cgroupPath);
       if (after > before) return after;
       if (session.exited) throw proofError("proof_unavailable", "oom_counter_not_observed_before_collect");
-      await new Promise((resolve) => setTimeout(resolve, this.oomPollMs));
+      await new Promise((resolve) => setTimeout(resolve, oomPollMs));
     }
     throw proofError("proof_unavailable", "oom_counter_not_observed_before_collect");
   }
@@ -1115,7 +1193,8 @@ class LiveStagingAdapter {
 
   _ttyPhase(phaseId, internalToken) {
     requireInternalPhaseToken(internalToken);
-    return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", TTY_SCRIPT] }, async (session) => {
+    const { target } = adapterConfig(this);
+    return this._withPty(phaseId, { file: target.nodeExecutable, args: ["-e", TTY_SCRIPT] }, async (session) => {
       const marker = await session.marker("tty");
       const exit = await session.exit();
       const passed = safeGet(marker, "stdin") === true
@@ -1130,7 +1209,8 @@ class LiveStagingAdapter {
 
   _resizePhase(phaseId, internalToken) {
     requireInternalPhaseToken(internalToken);
-    return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", RESIZE_SCRIPT] }, async (session) => {
+    const { target } = adapterConfig(this);
+    return this._withPty(phaseId, { file: target.nodeExecutable, args: ["-e", RESIZE_SCRIPT] }, async (session) => {
       await session.marker("ready");
       session.resize(97, 31);
       const resized = await session.marker("resized");
@@ -1151,13 +1231,14 @@ class LiveStagingAdapter {
 
   _descendantPhase(phaseId, internalToken) {
     requireInternalPhaseToken(internalToken);
-    return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", DESCENDANT_SCRIPT] }, async (session, identity) => {
+    const { target, maximumOutputBytes } = adapterConfig(this);
+    return this._withPty(phaseId, { file: target.nodeExecutable, args: ["-e", DESCENDANT_SCRIPT] }, async (session, identity) => {
       const marker = await session.marker("descendants");
       const parentPid = safeCount(safeGet(marker, "parent_pid"));
       const childPid = safeCount(safeGet(marker, "child_pid"));
       if (!parentPid || !childPid) throw proofError("proof_unavailable", "descendant_marker_invalid");
       const cgroupPath = this._resolveCgroup(identity.unitName);
-      const processes = parseCgroupProcs(this._readCgroup(cgroupPath, "cgroup.procs"), this.maximumOutputBytes);
+      const processes = parseCgroupProcs(this._readCgroup(cgroupPath, "cgroup.procs"), maximumOutputBytes);
       const contained = processes.has(parentPid) && processes.has(childPid);
       session.kill("SIGTERM");
       await session.exit();
@@ -1170,8 +1251,8 @@ class LiveStagingAdapter {
   }
 
   async _validatedTempBoundary() {
-    const fact = this.target.tempFact;
-    const authority = this.tempFactAuthority;
+    const { target, tempFactAuthority: authority, fs, probeTimeoutMs } = adapterConfig(this);
+    const fact = target.tempFact;
     if (!authority) throw proofError("proof_unavailable", "validated_resource_temp_fact_required");
     const canonicalRoot = safeGet(fact, "canonicalRoot");
     if (safeGet(fact, "available") !== true || safeGet(fact, "code") !== "ready"
@@ -1183,13 +1264,13 @@ class LiveStagingAdapter {
     let canonicalRootReal;
     let generationReal;
     try {
-      canonicalRootReal = this.fs.realpathSync(canonicalRoot);
-      generationReal = this.fs.realpathSync(this.target.generationTempRoot);
+      canonicalRootReal = fs.realpathSync(canonicalRoot);
+      generationReal = fs.realpathSync(target.generationTempRoot);
     } catch {
       throw proofError("proof_unavailable", "effective_temp_unavailable");
     }
     const relative = path.relative(canonicalRootReal, generationReal);
-    if (canonicalRootReal !== canonicalRoot || generationReal !== this.target.generationTempRoot
+    if (canonicalRootReal !== canonicalRoot || generationReal !== target.generationTempRoot
       || relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`)
       || path.isAbsolute(relative)) {
       throw proofError("proof_unavailable", "generation_temp_boundary_invalid");
@@ -1200,20 +1281,20 @@ class LiveStagingAdapter {
     const receipt = await callBounded(
       ({ signal }) => authority.verify.call(authority.receiver, Object.freeze({
         signal,
-        runChallenge: internalState(this).runChallenge,
+        runChallenge: adapterRunState(this).runChallenge,
         fact,
-        projectId: this.target.projectId,
-        generationId: this.target.generationId,
-        generationTempRoot: this.target.generationTempRoot,
+        projectId: target.projectId,
+        generationId: target.generationId,
+        generationTempRoot: target.generationTempRoot,
       })),
-      this.probeTimeoutMs,
+      probeTimeoutMs,
       "resource_temp_fact_unavailable",
     );
     const factPayload = buildTempFactProofPayload({
-      runChallenge: internalState(this).runChallenge,
+      runChallenge: adapterRunState(this).runChallenge,
       authorityId: authority.authorityId,
-      projectId: this.target.projectId,
-      generationId: this.target.generationId,
+      projectId: target.projectId,
+      generationId: target.generationId,
       canonicalRoot,
       generationTempRoot: generationReal,
       available: true,
@@ -1222,7 +1303,7 @@ class LiveStagingAdapter {
     });
     if (safeGet(receipt, "valid") !== true
       || safeGet(receipt, "authorityId") !== authority.authorityId
-      || safeGet(receipt, "runChallenge") !== internalState(this).runChallenge
+      || safeGet(receipt, "runChallenge") !== adapterRunState(this).runChallenge
       || !verifySignature(authority.publicKey, factPayload, safeGet(receipt, "signature"))) {
       throw proofError("proof_unavailable", "resource_temp_fact_invalid");
     }
@@ -1231,20 +1312,21 @@ class LiveStagingAdapter {
 
   async _tempPhase(phaseId, internalToken) {
     requireInternalPhaseToken(internalToken);
-    if (!this.target.tempProbe || typeof safeGet(this.fs, "realpathSync") !== "function"
-      || typeof safeGet(this.fs, "statfsSync") !== "function") {
+    const { target, fs } = adapterConfig(this);
+    if (!target.tempProbe || typeof fs.realpathSync !== "function"
+      || typeof fs.statfsSync !== "function") {
       throw proofError("proof_unavailable", "target_effective_temp_probe_required");
     }
     const boundary = await this._validatedTempBoundary();
-    if (this.target.tempProbe.trusted !== true) {
+    if (target.tempProbe.trusted !== true) {
       throw proofError("proof_unavailable", "temp_provider_authority_unpinned");
     }
-    const state = internalState(this);
+    const state = adapterRunState(this);
     const phaseChallenge = proofChallenge();
     const command = Object.freeze({
-      file: this.target.tempProbe.file,
+      file: target.tempProbe.file,
       args: Object.freeze([
-        ...this.target.tempProbe.args,
+        ...target.tempProbe.args,
         `--quadwork-proof-contract=${TEMP_PROOF_CONTRACT}`,
         `--quadwork-run-challenge=${state.runChallenge}`,
         `--quadwork-phase-challenge=${phaseChallenge}`,
@@ -1256,7 +1338,7 @@ class LiveStagingAdapter {
       if (typeof effective !== "string" || !path.isAbsolute(effective)
         || path.resolve(effective) !== effective || effective.includes("\0")
         || Buffer.byteLength(effective, "utf8") > 4096
-        || safeGet(marker, "provider_id") !== this.target.tempProbe.providerId
+        || safeGet(marker, "provider_id") !== target.tempProbe.providerId
         || safeGet(marker, "contract") !== TEMP_PROOF_CONTRACT
         || safeGet(marker, "run_challenge") !== state.runChallenge
         || safeGet(marker, "phase_challenge") !== phaseChallenge) {
@@ -1265,27 +1347,27 @@ class LiveStagingAdapter {
       let effectiveReal;
       let statfs;
       try {
-        effectiveReal = this.fs.realpathSync(effective);
+        effectiveReal = fs.realpathSync(effective);
         if (typeof effectiveReal !== "string" || !path.isAbsolute(effectiveReal)
           || effectiveReal !== effective) {
           throw new Error("canonical temp path is invalid");
         }
-        statfs = this.fs.statfsSync(effectiveReal, { bigint: true });
+        statfs = fs.statfsSync(effectiveReal, { bigint: true });
       } catch {
         throw proofError("proof_unavailable", "effective_temp_unavailable");
       }
       const payload = buildTempProofPayload({
         runChallenge: state.runChallenge,
         phaseChallenge,
-        projectId: this.target.projectId,
-        generationId: this.target.generationId,
-        providerId: this.target.tempProbe.providerId,
+        projectId: target.projectId,
+        generationId: target.generationId,
+        providerId: target.tempProbe.providerId,
         contract: TEMP_PROOF_CONTRACT,
         canonicalRoot: boundary.canonicalRoot,
         generationTempRoot: boundary.generationTempRoot,
         effectivePath: effectiveReal,
       });
-      if (!verifySignature(this.target.tempProbe.publicKey, payload, safeGet(marker, "signature"))) {
+      if (!verifySignature(target.tempProbe.publicKey, payload, safeGet(marker, "signature"))) {
         throw proofError("proof_unavailable", "effective_temp_provider_unverified");
       }
       const type = filesystemType(statfs);
@@ -1298,18 +1380,19 @@ class LiveStagingAdapter {
         effective_temp_disk_backed: diskBacked,
         effective_temp_within_generation_root: within,
       });
-    }, { TMPDIR: this.target.generationTempRoot }, internalToken);
+    }, { TMPDIR: target.generationTempRoot }, internalToken);
   }
 
   _oomPhase(phaseId, internalToken) {
     requireInternalPhaseToken(internalToken);
-    const testedLimitMib = this.target.workerLimits.memoryMaxMib + this.target.workerLimits.swapMaxMib;
+    const { target } = adapterConfig(this);
+    const testedLimitMib = target.workerLimits.memoryMaxMib + target.workerLimits.swapMaxMib;
     const allocationMib = testedLimitMib + OOM_ALLOCATION_MARGIN_MIB;
     if (!Number.isSafeInteger(allocationMib) || allocationMib <= testedLimitMib
       || allocationMib > MAX_OOM_ALLOCATION_MIB) {
       throw proofError("proof_unavailable", "oom_safety_envelope_invalid");
     }
-    return this._withPty(phaseId, { file: this.target.nodeExecutable, args: ["-e", oomScript(allocationMib)] }, async (session, identity) => {
+    return this._withPty(phaseId, { file: target.nodeExecutable, args: ["-e", oomScript(allocationMib)] }, async (session, identity) => {
       await session.marker("oom_ready");
       const cgroupPath = this._resolveCgroup(identity.unitName);
       const before = this._readOom(cgroupPath);
@@ -1332,8 +1415,23 @@ class LiveStagingAdapter {
   }
 }
 
+Object.freeze(LiveStagingAdapter.prototype);
+
+// This constructor is intentionally not exported. The test suite instruments
+// its own in-memory copy of this module to exercise pure injected phase fakes;
+// production callers cannot use it to bypass the source-owned pin gate.
+function createLiveStagingAdapterForTests(options = {}) {
+  return new LiveStagingAdapter(options, INTERNAL_ADAPTER_CONSTRUCTION_TOKEN);
+}
+
 function createLiveStagingAdapter(options = {}) {
-  return new LiveStagingAdapter(options);
+  // Refuse before reading any caller option or invoking any injected boundary.
+  // The public adapter becomes constructible only after all three reviewed
+  // authority sets are pinned in source together.
+  if (!sourceAuthoritiesPinned()) {
+    throw proofError("proof_unavailable", "live_staging_authorities_unpinned");
+  }
+  return new LiveStagingAdapter(options, INTERNAL_ADAPTER_CONSTRUCTION_TOKEN);
 }
 
 module.exports = {

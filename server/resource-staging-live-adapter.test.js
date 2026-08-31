@@ -5,6 +5,8 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const Module = require("node:module");
 const path = require("node:path");
 const {
   ACK_PREFIX,
@@ -23,6 +25,23 @@ const {
   createGeneratedWorkerUnitBase,
   createLiveStagingAdapter,
 } = require("./resource-staging-live-adapter");
+
+function loadInternalTestFactory() {
+  const filename = require.resolve("./resource-staging-live-adapter");
+  const instrumented = new Module(filename, module);
+  instrumented.filename = filename;
+  instrumented.paths = Module._nodeModulePaths(path.dirname(filename));
+  instrumented._compile(
+    `${fs.readFileSync(filename, "utf8")}\nmodule.exports.__testFactory = createLiveStagingAdapterForTests;`,
+    filename,
+  );
+  return instrumented.exports.__testFactory;
+}
+
+// This test-only handle does not exist on the production module exports. It is
+// obtained from an isolated in-memory compilation so phase fakes cannot become
+// a runtime authority bypass.
+const createLiveStagingAdapterForTests = loadInternalTestFactory();
 
 const MACHINE_ID = "0123456789abcdef0123456789abcdef";
 const ACK = `${ACK_PREFIX}${MACHINE_ID}`;
@@ -255,7 +274,7 @@ function harness(overrides = {}) {
       return { type: 0xef53n, bavail: 10_000n, bsize: 4096n };
     },
   };
-  const adapter = createLiveStagingAdapter({
+  const adapter = createLiveStagingAdapterForTests({
     runPressure: true,
     acknowledgement: ACK,
     target: target(),
@@ -312,6 +331,33 @@ function harness(overrides = {}) {
   return { adapter, state, monitorProbes, fsImpl };
 }
 
+// With all source-owned pin sets empty, the public factory refuses at the
+// construction boundary before it reads options or can call any host adapter.
+{
+  let optionReads = 0;
+  let boundaryCalls = 0;
+  const options = new Proxy({
+    gateProbe() { boundaryCalls += 1; },
+    ptySpawn() { boundaryCalls += 1; },
+    execFileSyncImpl() { boundaryCalls += 1; },
+    fsImpl: { readFileSync() { boundaryCalls += 1; } },
+  }, {
+    get(targetValue, key, receiver) {
+      optionReads += 1;
+      return Reflect.get(targetValue, key, receiver);
+    },
+  });
+  assert.throws(
+    () => createLiveStagingAdapter(options),
+    (error) => error instanceof StagingProofError
+      && error.code === "proof_unavailable"
+      && error.check === "live_staging_authorities_unpinned",
+  );
+  assert.equal(optionReads, 0);
+  assert.equal(boundaryCalls, 0);
+  assert.equal(Object.hasOwn(require("./resource-staging-live-adapter"), "createLiveStagingAdapterForTests"), false);
+}
+
 // Unit identities use the same domain-separated worker format, remain bounded,
 // and do not admit delimiter ambiguity or plausible sample collisions.
 {
@@ -355,6 +401,22 @@ function harness(overrides = {}) {
 // executes only injected fakes after both exact disposable gates pass.
 (async () => {
   const { adapter, state } = harness();
+  assert.equal(Object.isFrozen(adapter), true);
+  assert.equal(Object.isFrozen(Object.getPrototypeOf(adapter)), true);
+  assert.deepEqual(Object.keys(adapter), []);
+  for (const [key, forged] of [
+    ["runPressure", false],
+    ["acknowledgement", `${ACK}x`],
+    ["target", target({ nodeExecutable: "/tmp/forged-node" })],
+    ["monitorAuthority", { trusted: true }],
+    ["tempFactAuthority", { trusted: true }],
+    ["ptySpawn", () => { throw new Error("forged"); }],
+  ]) {
+    assert.equal(Reflect.set(adapter, key, forged), false, `${key} cannot shadow private adapter state`);
+  }
+  assert.throws(() => Object.defineProperty(adapter, "gates", { value: {
+    linux: true, cgroupV2: true, userManager: true, machineId: MACHINE_ID,
+  } }), TypeError);
   assert.equal(state.gateCalls, 0);
   assert.equal(state.ptyCalls.length, 0);
   assert.equal(state.monitorCalls.length, 0);
