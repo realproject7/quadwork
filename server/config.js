@@ -18,6 +18,7 @@ const GITHUB_REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const INSTALLATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const LEGACY_PRIMARY_REPOSITORY_KEY = "primary";
 const INTERNAL_CONFIG_WRITE = Symbol("internalConfigWrite");
+const INTERNAL_CONFIG_WRITE_AUTHORITY = Object.freeze({});
 // Process-wide authority for projects that have passed unarchive ownership
 // validation but are still proving that their archived runtime is quiescent.
 // Every V2 config commit consults this map, so no other mutation path can make
@@ -62,41 +63,26 @@ function acquireConfigWriteLock() {
   ensureSecureDir(path.dirname(CONFIG_LOCK_PATH));
   const token = crypto.randomUUID();
   const payload = JSON.stringify({ pid: process.pid, token });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const candidatePath = `${CONFIG_LOCK_PATH}.${process.pid}.${token}.tmp`;
-    try {
-      writeSecureFile(candidatePath, payload);
-      // Link a fully-written inode into the fixed lock name. Unlike open+write,
-      // another process can never observe an empty/partial owner record and
-      // misclassify a live acquisition as corrupt.
-      fs.linkSync(candidatePath, CONFIG_LOCK_PATH);
-      return token;
-    } catch (error) {
-      if (!error || error.code !== "EEXIST") throw error;
-      const owner = readConfigLockOwner();
-      if (owner && liveProcess(owner.pid)) {
-        throw validationError(
-          "config_write_busy",
-          "config",
-          "configuration is being updated; retry the operation",
-        );
-      }
-      // Corrupt or dead-owner locks are stale. Remove only after observing the
-      // owner as non-live, then make one bounded exclusive-create retry.
-      try { fs.unlinkSync(CONFIG_LOCK_PATH); } catch (unlinkError) {
-        if (!unlinkError || unlinkError.code !== "ENOENT") {
-          throw validationError(
-            "config_write_busy",
-            "config",
-            "configuration write lock could not be recovered",
-          );
-        }
-      }
-    } finally {
-      try { fs.unlinkSync(candidatePath); } catch {}
-    }
+  const candidatePath = `${CONFIG_LOCK_PATH}.${process.pid}.${token}.tmp`;
+  try {
+    writeSecureFile(candidatePath, payload);
+    // Link a fully-written inode into the fixed lock name. Unlike open+write,
+    // another process can never observe an empty/partial owner record.
+    fs.linkSync(candidatePath, CONFIG_LOCK_PATH);
+    return token;
+  } catch (error) {
+    if (!error || error.code !== "EEXIST") throw error;
+    const owner = readConfigLockOwner();
+    const message = owner && liveProcess(owner.pid)
+      ? "configuration is being updated; retry the operation"
+      : "configuration write lock is stale; verify no QuadWork writer is running, then remove config.lock";
+    // Never auto-delete a stale-looking lock: read→unlink has an unavoidable
+    // cross-process replacement race without an OS advisory-lock primitive.
+    // Fail closed and require an explicit operator recovery instead.
+    throw validationError("config_write_busy", "config", message);
+  } finally {
+    try { fs.unlinkSync(candidatePath); } catch {}
   }
-  throw validationError("config_write_busy", "config", "configuration is being updated; retry the operation");
 }
 
 function releaseConfigWriteLock(token) {
@@ -943,7 +929,7 @@ function writeConfigUnlocked(cfg, options = {}) {
   // Legacy field-scoped writers still converge here. While an unarchive owns
   // a reservation, make this low-level atomic boundary enforce the same
   // authority so a stale whole-document write cannot bypass V2 commits.
-  const internalWrite = options[INTERNAL_CONFIG_WRITE] === true;
+  const internalWrite = options[INTERNAL_CONFIG_WRITE] === INTERNAL_CONFIG_WRITE_AUTHORITY;
   let previousConfig = internalWrite ? options.previousConfig : null;
   if (!previousConfig && typeof cfg?.installation_id === "string") {
     try {
@@ -985,7 +971,11 @@ function updateConfig(mutator, options = {}) {
     const previousConfig = cloneConfigurationValue(cfg);
     mutator(cfg);
     if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
-    writeConfig(cfg, { ...options, previousConfig, [INTERNAL_CONFIG_WRITE]: true });
+    writeConfig(cfg, {
+      ...options,
+      previousConfig,
+      [INTERNAL_CONFIG_WRITE]: INTERNAL_CONFIG_WRITE_AUTHORITY,
+    });
     return cfg;
   });
 }
@@ -1043,6 +1033,27 @@ function commitV2Configuration(mutator = () => {}, options = {}) {
   });
 }
 
+/**
+ * Compatibility boundary for legacy CLI writers. Activation is decided from
+ * the live document while the cross-process lock is held, never from the
+ * caller's potentially stale snapshot.
+ */
+function commitConfigurationSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new TypeError("configuration snapshot must be an object");
+  }
+  return withConfigWriteLock(() => {
+    const { config: live } = readConfigDocument();
+    if (hasOwn(live, "installation_id")) {
+      return commitV2Configuration((fresh) => {
+        for (const key of Object.keys(fresh)) delete fresh[key];
+        Object.assign(fresh, cloneConfigurationValue(snapshot));
+      });
+    }
+    return writeConfig(cloneConfigurationValue(snapshot));
+  });
+}
+
 module.exports = {
   readConfig,
   readRuntimeResources,
@@ -1069,4 +1080,5 @@ module.exports = {
   reserveV2ProjectOwnership,
   releaseV2ProjectOwnership,
   commitV2Configuration,
+  commitConfigurationSnapshot,
 };

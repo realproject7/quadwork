@@ -33,6 +33,7 @@ const {
   reserveV2ProjectOwnership,
   releaseV2ProjectOwnership,
   commitV2Configuration,
+  commitConfigurationSnapshot,
   writeConfig,
   readConfig,
 } = configApi;
@@ -79,8 +80,8 @@ function diskBytes() {
 }
 
 // Cross-process writers serialize the entire fresh-read/validate/rename
-// transaction. A live owner fails closed without mutation; a dead-owner lock
-// is recovered by one bounded exclusive-create retry.
+// transaction. Live and stale-looking locks both fail closed; stale recovery
+// is an explicit operator action because automatic read→unlink is racy.
 {
   writeConfig({ port: 8400, projects: [] });
   const before = diskBytes();
@@ -92,11 +93,17 @@ function diskBytes() {
   );
   assert.equal(diskBytes(), before);
   fs.unlinkSync(CONFIG_LOCK_PATH);
-
   fs.writeFileSync(CONFIG_LOCK_PATH, JSON.stringify({ pid: -1, token: "stale" }));
+  expectCode(
+    () => writeConfig({ port: 8402, projects: [] }),
+    "config_write_busy",
+    "stale-looking config lock fails closed without racy automatic deletion",
+  );
+  assert.equal(diskBytes(), before);
+  assert.equal(fs.existsSync(CONFIG_LOCK_PATH), true);
+  fs.unlinkSync(CONFIG_LOCK_PATH); // explicit operator recovery in the fixture
   writeConfig({ port: 8402, projects: [] });
-  assert.equal(readConfig().port, 8402);
-  ok(!fs.existsSync(CONFIG_LOCK_PATH), "dead-owner config lock is recovered and released");
+  ok(readConfig().port === 8402, "writes resume after explicit stale-lock recovery");
 }
 
 // Existing archived projects cannot be activated through either public config
@@ -127,6 +134,19 @@ function diskBytes() {
     () => writeConfig(staleWholeDocument, { previousConfig: staleWholeDocument }),
     "project_ownership_reserved",
     "exported low-level writer ignores a caller-forged previous snapshot",
+  );
+  assert.equal(diskBytes(), before);
+
+  const forgedOptions = new Proxy({ previousConfig: staleWholeDocument }, {
+    get(target, property) {
+      if (typeof property === "symbol") return true;
+      return target[property];
+    },
+  });
+  expectCode(
+    () => writeConfig(staleWholeDocument, forgedOptions),
+    "project_ownership_reserved",
+    "Proxy cannot forge the private internal write authority",
   );
   assert.equal(diskBytes(), before);
 }

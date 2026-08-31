@@ -6,7 +6,11 @@ const path = require("path");
 const os = require("os");
 const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
-const { readRuntimeResources, commitV2Configuration } = require("../server/config");
+const {
+  readRuntimeResources,
+  commitV2Configuration,
+  commitConfigurationSnapshot,
+} = require("../server/config");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const { configureServiceTempEnvironment } = require("../server/resource-service-env");
 const {
@@ -265,19 +269,10 @@ function readConfig() {
 }
 
 function writeConfig(config) {
-  if (typeof config?.installation_id === "string") {
-    // Every activated CLI writer (init settings, migrations, cleanup metadata,
-    // and legacy helpers) must re-enter the shared fresh-read transaction. A
-    // stale snapshot that predates a server archive can therefore never write
-    // archived=false/absent back over the durable barrier from another process.
-    return commitV2Configuration((fresh) => {
-      for (const key of Object.keys(fresh)) delete fresh[key];
-      Object.assign(fresh, config);
-    });
-  }
-  if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
+  // The shared transaction determines activation from the locked live file.
+  // A caller cannot select the legacy branch by omitting installation_id from
+  // a stale snapshot.
+  return commitConfigurationSnapshot(config);
 }
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────
@@ -1160,6 +1155,10 @@ async function cmdCleanup() {
 
     // --- Per-project cleanup ---
     if (projectId) {
+      if (typeof config.installation_id === "string") {
+        fail("Activated V2 projects must be removed from the dashboard so lifecycle cleanup can run.");
+        return;
+      }
       const idx = (config.projects || []).findIndex((p) => p.id === projectId);
       const projectDir = path.join(CONFIG_DIR, projectId);
       if (idx < 0 && !fs.existsSync(projectDir)) {

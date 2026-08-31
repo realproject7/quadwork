@@ -58,6 +58,16 @@ assert.throws(
 );
 assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), before, "rejected stale CLI writer leaves config byte-identical");
 
+const missingIdentitySnapshot = JSON.parse(before);
+delete missingIdentitySnapshot.installation_id;
+missingIdentitySnapshot.projects[0].archived = false;
+assert.throws(
+  () => writeConfig(missingIdentitySnapshot),
+  (error) => error?.code === "installation_id_rotation_forbidden",
+  "stale CLI snapshot cannot select the legacy writer by omitting installation_id",
+);
+assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), before, "identity-omission bypass leaves config byte-identical");
+
 assert.throws(
   () => writeQuadWorkConfig(setup("archived", "Acme/Replacement", replacementDir)),
   (error) => error?.code === "project_ownership_reserved",
