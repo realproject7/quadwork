@@ -120,6 +120,9 @@ assert.deepEqual(added.repositories, [{
   working_dir: newDir,
   primary: true,
 }]);
+const cliPlaybookPath = path.join(CONFIG_DIR, "new-project", "HEAD-PO-PLAYBOOK.md");
+assert.equal(fs.existsSync(cliPlaybookPath), true, "CLI setup seeds the Head PO playbook");
+assert.match(fs.readFileSync(cliPlaybookPath, "utf8"), /\*\*Playbook version:\*\*\s+1\.0\.0/);
 
 // The same post-confirm boundary still supports V1 cleanup and operates on the
 // fresh locked snapshot rather than the stale preview shown before a prompt.

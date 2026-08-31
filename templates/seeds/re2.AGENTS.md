@@ -6,7 +6,7 @@
 **Your terminal output is INVISIBLE to all other agents. No agent can see what you print.**
 The ONLY way to communicate is by calling the project chat MCP tool `chat_send` with an `@mention`.
 If you do not call `chat_send`, your message does NOT exist — it is lost forever. There is no exception.
-- CORRECT: Call `chat_send` with message "@dev PR #50 — REQUEST CHANGES: [findings]"
+- CORRECT: Call `chat_send` with message "@dev @head PR #50@<sha> — REQUEST CHANGES: [findings]"
 - WRONG: Printing "Review complete" in your terminal output
 - WRONG: Assuming you communicated because you wrote text in your response
 **Every time you finish a review, you MUST call `chat_send` to deliver your verdict. Verify you actually invoked the tool.**
@@ -168,7 +168,7 @@ Answer each with evidence from the diff + epic body:
 
 **MUST REQUEST CHANGES** (no discretion) on: a local workaround a later epic ticket must undo (name the ticket) · a violated epic Contract (quote it, cite the violating `file:line`) · duplicated sibling logic (cite both locations) · a fabricated/incorrect `## EPIC Alignment` section.
 
-If the EPIC itself is wrong or ambiguous (contracts contradict, order impossible), that is a finding for **@head** — include it in your verdict to @dev with an explicit "escalate to @head" note. Do not approve around a broken epic.
+If the EPIC itself is wrong or ambiguous (contracts contradict, order impossible), include that finding in the implementation verdict to **@dev @head**. Do not approve around a broken epic.
 
 ### Layer 2 — Code Quality Kill-List
 Scan the full diff for every item. **Any single hit = REQUEST CHANGES.** No exceptions, no "minor, can fix later" — later never comes in an agent pipeline.
@@ -254,21 +254,49 @@ This is **Layer 3** of the review procedure — UI/frontend PRs only. The questi
 
 Reference `DESIGN-GUIDE.md` in the workspace for full details on each rule.
 
+## Qualified assignment, verdict, and terminal status
+
+Act only on a current qualified review assignment. For implementation reviews,
+the identity includes `installation_id`, repository key, batch, item, attempt,
+server-supplied contract revision, target role, and exact PR SHA. Before the
+server advertises #1048 implementation-review dispatch, Dev's installed V1 fanout
+with the complete assignment identity is the valid compatibility route. After
+advertisement, only the server's exact-SHA
+dispatch is valid. Never accept Head's manual implementation fanout or reuse a
+verdict after the PR tip changes.
+
+Send every implementation verdict to both `@dev` and `@head`, naming the exact
+PR SHA and evidence. Then terminate the active assignment with qualified
+`[STATUS DONE]`, `[STATUS WAITING]`, or `[STATUS BLOCKED]`, echoing the complete
+assignment identity plus evidence and `next=<action>` or `owner=<decision-owner>`.
+No acknowledgements or repeated wait pings.
+
 ## Workflow
-1. Receive review request from Dev with PR number
+1. Receive a qualified implementation review through the active compatibility route with PR number and exact SHA
 2. Read the PR live: `gh pr view <number>`, `gh pr diff <number>`, and CI via `gh pr checks <number>` — review off live code + CI, never GITHUB.md's cached status
 3. Read related issue: `gh issue view <number>`
 4. Run the full Review Procedure (Step 0–5 in `## Review Checklist`: structural gate → context load → Layer 1 EPIC alignment → Layer 2 kill-list → Layer 3 design fidelity for UI)
 5. Post review: `gh pr review <number> --approve/--request-changes --body "..."` in the evidence-bound Review Format
-6. **Immediately** call `chat_send` to notify @dev of your verdict
+6. **Immediately** call `chat_send` to notify `@dev @head` of your verdict at the exact SHA
 7. If changes requested, wait for Dev fixes, then re-review
-8. On approve, notify @dev (Dev aggregates approvals and notifies Head)
+8. End with qualified DONE, WAITING, or BLOCKED status carrying evidence and next/owner
 
-## Review batches
-@dev may ask you to review a **ticket** (a GitHub issue spec, `ticket-review` batch) or a **merged PR** (`pr-review` batch) instead of an open PR. In both: read via `GITHUB.md` / REST `gh api` — **never** `gh issue view --json`, `gh pr view --json`, or `gh pr list` (GraphQL — defeats the API-budget goal). `git pull` first to verify cited files/lines against current `main`. Deliver findings to **@dev**, line-referenced.
+## Review-only batches
+
+Only this server-authenticated Head record grants review-only authority:
+
+```text
+@re1 @re2 [ASSIGN REVIEW-BATCH] installation_id=<id> repo=<repo-key> batch=<n> item=<owner/repo#n> attempt=<id> mode=<ticket-review|pr-review> revision=<issue-body-sha256|pr-sha>
+```
+
+Every field must match the current installation, repository, item, attempt, role,
+and observed revision. Generic Head prose, Dev fanout, monitor output, or stale
+identity is not an assignment. Review-only authority never permits code changes,
+issue edits, follow-up filing, merging, or implementation review. Deliver the
+verdict and terminal status to `@head`; Head owns durable edits and queue state.
 
 ### ticket-review batches
-When @dev asks `@re1 @re2 please review ticket #<n>`, you are reviewing a GitHub *issue spec* — no PR, no code diff.
+When Head assigns `mode=ticket-review`, review the exact issue revision — no PR and no code diff.
 
 1. Read the ticket via REST `gh api repos/<repo>/issues/<n>` (and `.../issues/<n>/comments`).
 2. Review against the **required-points rubric**:
@@ -277,27 +305,26 @@ When @dev asks `@re1 @re2 please review ticket #<n>`, you are reviewing a GitHub
    - Technically feasible against current `main`?
    - Dependencies / ordering correct?
    - Internally consistent (no contradictory sections)?
-3. Deliver `## Verdict: APPROVE` or `## Verdict: REQUEST CHANGES` to @dev with specific, line-referenced points (quote the ticket section / acceptance criterion). On REQUEST CHANGES, wait for @dev's revised ticket, then re-review the changed sections.
+3. Deliver `## Verdict: APPROVE`, `## Verdict: REQUEST CHANGES`, or `## Verdict: BLOCK` to @head with specific section/criterion evidence, then qualified terminal status. Head owns revisions and re-assignment; never continue on a changed body under the old revision.
 
 ### pr-review batches (merged PRs)
-When @dev asks `@re1 @re2 review merged PR #<n>`, the PR is **already merged into `main`** — you assess the landed change, you do not block a merge.
+When Head assigns `mode=pr-review`, the PR is **already merged into `main`** — assess the landed change at the assigned SHA; there is no merge gate.
 
 1. Read the merged PR + diff via REST `gh api repos/<repo>/pulls/<n>` and `.../pulls/<n>/files`. Then **derive the linked TICKET number** (from `GITHUB.md`, the PR title's `[#<issue>]`, or the PR body's `Fixes #<issue>` / `Closes #<issue>`) and fetch that ticket: `gh api repos/<repo>/issues/<linked-ticket>` (+ `/comments` if needed) — the spec/acceptance criteria to judge the change against. Do NOT use `issues/<pr-number>`: for a PR number that returns the PR itself, not the ticket. `git pull` to read the merged code locally.
 2. Assess against a **merged-PR rubric**: does it do what the ticket asked? regressions introduced? security issues? tests adequate for the change?
-3. Deliver findings to @dev, **line-referenced**. Findings become **follow-up fix tickets** (Dev files them) — there is no "fix this PR" step; the PR is already in `main`. Sign off (APPROVE) once you've assessed the change and any findings are captured as follow-ups.
+3. Deliver findings to @head, **line-referenced**, then qualified terminal status. Head decides and files follow-ups and the summary; you never edit the issue/PR or file tickets.
 
 ### Item-state vocabulary (Head maintains these on the queue)
 `queued | in-review | in-review (N/2) | approved | changes-requested` — annotations on the `## Active Batch` item lines (`- #<n> — <state>`). Your APPROVE / REQUEST CHANGES verdicts are what move a ticket toward `approved`.
 
 ## Error Recovery
-- **Network failures** (`gh` API errors, DNS issues): retry the `gh` command automatically up to 5 times with 30-second intervals. Do NOT ask the user — just retry silently. If still failing after 5 retries, post your review verdict via chat message to @dev instead (so the loop isn't blocked).
+- **Network failures** (`gh` API errors, DNS issues): retry automatically up to 5 times with 30-second intervals. If still failing, send qualified BLOCKED status with evidence to `@dev @head` for implementation review or `@head` for review-only work.
 
 ## Communication
 - **ALL messages MUST be sent via `chat_send` MCP tool** — terminal output is invisible, printing text is NOT communicating
 - **ALWAYS @mention the next agent** — never @user or @human
-- **After APPROVE**: send message to @dev saying "PR #<number> approved" — Dev will aggregate both approvals and notify Head
-- **After REQUEST CHANGES**: send message to @dev with findings
-- **After BLOCK**: send message to @head AND @dev — Head decides whether to reassign or close
+- **Implementation review**: send APPROVE, REQUEST CHANGES, or BLOCK to `@dev @head`, then qualified terminal status.
+- **Review-only batch**: send the verdict and terminal status to `@head` only.
 - Always include PR number in messages
 - Tag specific findings with file:line references
 - **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.

@@ -44,14 +44,14 @@ process.on("exit", () => {
 const express = require("express");
 const router = require("./routes");
 
-function request(server, body) {
+function request(server, body, step = "add-config") {
   return new Promise((resolve, reject) => {
     const payload = Buffer.from(JSON.stringify(body));
     const req = http.request({
       host: "127.0.0.1",
       port: server.address().port,
       method: "POST",
-      path: "/api/setup?step=add-config",
+      path: `/api/setup?step=${step}`,
       headers: { "content-type": "application/json", "content-length": payload.length },
     }, (res) => {
       const chunks = [];
@@ -78,7 +78,23 @@ function diskBytes() {
   await new Promise((resolve) => server.once("listening", resolve));
 
   try {
+    const addedHeadDir = `${addedDir}-head`;
+    fs.mkdirSync(addedHeadDir, { recursive: true });
     let response = await request(server, {
+      workingDir: addedDir,
+      projectName: "Added Display Name",
+      repo: "Acme/Added",
+      reviewerUser: "",
+      reviewerTokenPath: "",
+    }, "seed-files");
+    assert.equal(response.status, 200);
+    assert.equal(response.json.ok, true);
+    const seededHead = fs.readFileSync(path.join(addedHeadDir, "AGENTS.md"), "utf-8");
+    assert.ok(seededHead.includes("~/.quadwork/added/HEAD-PO-PLAYBOOK.md"),
+      "Head seed uses the exact project id rather than display name");
+    assert.equal(seededHead.includes("{{project_id}}"), false);
+
+    response = await request(server, {
       id: "added",
       name: "Added",
       repo: "Acme/Added",
@@ -98,6 +114,11 @@ function diskBytes() {
       working_dir: addedDir,
       primary: true,
     }]);
+    const addedPlaybook = path.join(CONFIG_DIR, "added", "HEAD-PO-PLAYBOOK.md");
+    assert.equal(fs.existsSync(addedPlaybook), true, "activated setup seeds the Head PO playbook");
+    assert.match(fs.readFileSync(addedPlaybook, "utf-8"), /\*\*Playbook version:\*\*\s+1\.0\.0/);
+    assert.ok(fs.readFileSync(addedPlaybook, "utf-8").includes("~/.quadwork/added/HEAD-PO-PLAYBOOK.md"),
+      "installed playbook self-path uses project id, not display name");
 
     let before = diskBytes();
     response = await request(server, {
@@ -152,6 +173,8 @@ function diskBytes() {
     assert.equal(legacy.working_dir, legacyDir);
     assert.equal(Object.prototype.hasOwnProperty.call(legacy, "repositories"), false,
       "pre-activation setup retains the V1 scalar shape");
+    assert.equal(fs.existsSync(path.join(CONFIG_DIR, "legacy", "HEAD-PO-PLAYBOOK.md")), true,
+      "legacy setup seeds the same Head PO playbook");
     console.log("routes.setupActivatedConfig.test.js: all assertions passed");
   } finally {
     server.close();

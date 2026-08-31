@@ -838,6 +838,7 @@ async function setupAgents(rl, repo) {
       }
       // Batch 25 / #205: substitute the per-project queue file path.
       seedContent = seedContent.replace(/\{\{project_name\}\}/g, projectName);
+      seedContent = seedContent.replace(/\{\{project_id\}\}/g, projectName);
       fs.writeFileSync(seedDst, seedContent);
     }
   }
@@ -889,6 +890,30 @@ function writeOvernightQueueFile(projectName, repo) {
   content = content.replace(/\{\{repo\}\}/g, repo || "");
   fs.writeFileSync(queuePath, content);
   ok(`Wrote ${queuePath}`);
+  return true;
+}
+
+/**
+ * Seed the versioned Head PO playbook beside the project queue. Idempotent:
+ * existing operator content is preserved on CLI setup; server reseed owns
+ * version refreshes.
+ */
+function writeHeadPoPlaybook(projectName) {
+  const playbookDir = path.join(CONFIG_DIR, projectName);
+  const playbookPath = path.join(playbookDir, "HEAD-PO-PLAYBOOK.md");
+  if (fs.existsSync(playbookPath)) return false;
+  try { ensureSecureDir(playbookDir); }
+  catch (e) { warn(`Could not create ${playbookDir}: ${e.message}`); return false; }
+  const templatePath = path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md");
+  if (!fs.existsSync(templatePath)) {
+    warn(`HEAD-PO-PLAYBOOK.md template missing at ${templatePath}`);
+    return false;
+  }
+  const content = fs.readFileSync(templatePath, "utf-8")
+    .replace(/\{\{project_id\}\}/g, projectName || "")
+    .replace(/\{\{project_name\}\}/g, projectName || "");
+  fs.writeFileSync(playbookPath, content);
+  ok(`Wrote ${playbookPath}`);
   return true;
 }
 
@@ -949,6 +974,7 @@ function writeQuadWorkConfig(setup) {
   // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md. Idempotent — if the file
   // already exists, preserve the user's / Head agent's edits.
   writeOvernightQueueFile(setup.projectName, setup.repo);
+  writeHeadPoPlaybook(setup.projectName);
 
   if (activated) {
     // Re-enter the shared fresh-read/validate/atomic-write boundary instead of
@@ -1809,4 +1835,5 @@ module.exports = {
   cleanupLegacyAgentChattrAfterConfirmation,
   writeConfig,
   writeQuadWorkConfig,
+  writeHeadPoPlaybook,
 };

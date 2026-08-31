@@ -1052,6 +1052,24 @@ function writeGithubFileSafe(projectId, projectName, repo) {
   } catch { /* non-fatal */ }
 }
 
+// #1033: install the generic, versioned Head PO playbook beside the project
+// queue. Fresh setup is preservation-safe: an existing playbook is never
+// overwritten here. Manual/automatic reseed refreshes canonical sections via
+// _performReseedWrites while preserving operator-added H2 sections.
+function writeHeadPoPlaybookSafe(projectId, projectName) {
+  try {
+    const playbookPath = path.join(CONFIG_DIR, projectId, "HEAD-PO-PLAYBOOK.md");
+    if (fs.existsSync(playbookPath)) return;
+    const tpl = path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md");
+    if (!fs.existsSync(tpl)) return;
+    ensureSecureDir(path.dirname(playbookPath));
+    const content = fs.readFileSync(tpl, "utf-8")
+      .replace(/\{\{project_id\}\}/g, projectId || "")
+      .replace(/\{\{project_name\}\}/g, projectName || projectId || "");
+    fs.writeFileSync(playbookPath, content);
+  } catch { /* non-fatal setup documentation seed */ }
+}
+
 function getProjectMaxHops(projectId) {
   if (!projectId) return 30;
   const cfg = readConfigFile();
@@ -5500,6 +5518,7 @@ router.post("/api/setup", async (req, res) => {
         agentsContent = agentsContent.replace(/\{\{reviewer_token_path\}\}/g, reviewerTokenPath);
         // Batch 25 / #205: substitute the per-project queue file path.
         agentsContent = agentsContent.replace(/\{\{project_name\}\}/g, dirName);
+        agentsContent = agentsContent.replace(/\{\{project_id\}\}/g, dirName);
         fs.writeFileSync(agentsMd, agentsContent);
         seeded.push(`${agent}/AGENTS.md`);
 
@@ -5562,6 +5581,7 @@ router.post("/api/setup", async (req, res) => {
         const existingRepo = primaryRepository(existing)?.repo || "";
         writeOvernightQueueFileSafe(id, existing?.name || id, existingRepo);
         writeGithubFileSafe(id, existing?.name || id, existingRepo);
+        writeHeadPoPlaybookSafe(id, existing?.name || id);
         return res.json({ ok: true, message: "Project already in config" });
       }
       // Match CLI wizard agent structure: { cwd, command, auto_approve, mcp_inject }
@@ -5609,6 +5629,7 @@ router.post("/api/setup", async (req, res) => {
             const existingRepo = primaryRepository(existing)?.repo || "";
             writeOvernightQueueFileSafe(id, existing?.name || id, existingRepo);
             writeGithubFileSafe(id, existing?.name || id, existingRepo);
+            writeHeadPoPlaybookSafe(id, existing?.name || id);
             return res.json({ ok: true, message: "Project already in config" });
           }
           if (sendV2ConfigurationError(res, err)) return;
@@ -5633,6 +5654,7 @@ router.post("/api/setup", async (req, res) => {
       writeOvernightQueueFileSafe(id, name || id, repo);
       // #807: seed the per-project GITHUB.md alongside it.
       writeGithubFileSafe(id, name || id, repo);
+      writeHeadPoPlaybookSafe(id, name || id);
 
       return res.json({ ok: true });
     }
@@ -5786,7 +5808,7 @@ function _canonicalAgentSlug(agentKey) {
 // covered. When a project has no `agents` map at all (very old config),
 // falls back to the canonical sibling layout. Pure — no I/O.
 function _resolveReseedTargets(project) {
-  const workingDir = project?.working_dir;
+  const workingDir = primaryRepository(project)?.working_dir;
   if (!workingDir) return [];
   const dirName = path.basename(workingDir);
   const parentDir = path.dirname(workingDir);
@@ -5823,7 +5845,7 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
   catch { return res.status(500).json({ ok: false, error: "Failed to read config" }); }
   const project = cfg.projects?.find((p) => p.id === projectId);
   if (!project) return res.status(404).json({ ok: false, error: "Project not found" });
-  const workingDir = project.working_dir;
+  const workingDir = primaryRepository(project)?.working_dir;
   if (!workingDir) return res.status(400).json({ ok: false, error: "Project has no working_dir" });
 
   if (!force) {
@@ -5901,7 +5923,7 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
 // passes neither so each project uses the same priority chain manual re-seed
 // uses (per-agent extraction → cfg → default).
 function _performReseedWrites(project, cfg, opts = {}) {
-  const workingDir = project.working_dir;
+  const workingDir = primaryRepository(project)?.working_dir;
   const dirName = path.basename(workingDir);
   const reviewerUser = opts.reviewerUser ?? cfg.reviewer_github_user ?? "";
   const defaultReviewerTokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
@@ -5944,7 +5966,8 @@ function _performReseedWrites(project, cfg, opts = {}) {
     freshContent = freshContent
       .replace(/\{\{reviewer_github_user\}\}/g, reviewerUser)
       .replace(/\{\{reviewer_token_path\}\}/g, tokenPath)
-      .replace(/\{\{project_name\}\}/g, dirName);
+      .replace(/\{\{project_name\}\}/g, dirName)
+      .replace(/\{\{project_id\}\}/g, project.id || dirName);
 
     const merged = reseedAgentsMd(existing, freshContent);
     fs.writeFileSync(agentsMd, merged.content);
@@ -5982,6 +6005,30 @@ function _performReseedWrites(project, cfg, opts = {}) {
         }
       }
     }
+  }
+
+  // #1033: the Head playbook is a per-project seed, not a worktree seed.
+  // Refresh the shipped sections on every reseed, preserving operator-added
+  // H2 sections with the same merger used for AGENTS.md. `configDir` is an
+  // internal test seam; production always uses CONFIG_DIR.
+  const playbookSrc = path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md");
+  if (!fs.existsSync(playbookSrc)) {
+    throw new Error("Missing seed template: templates/seeds/HEAD-PO-PLAYBOOK.md");
+  }
+  const playbookPath = path.join(opts.configDir || CONFIG_DIR, project.id, "HEAD-PO-PLAYBOOK.md");
+  ensureSecureDir(path.dirname(playbookPath));
+  let playbookExisting = "";
+  if (fs.existsSync(playbookPath)) {
+    try { playbookExisting = fs.readFileSync(playbookPath, "utf-8"); } catch { playbookExisting = ""; }
+  }
+  const playbookFresh = fs.readFileSync(playbookSrc, "utf-8")
+    .replace(/\{\{project_id\}\}/g, project.id || dirName)
+    .replace(/\{\{project_name\}\}/g, project.name || project.id || dirName);
+  const mergedPlaybook = reseedAgentsMd(playbookExisting, playbookFresh);
+  fs.writeFileSync(playbookPath, mergedPlaybook.content);
+  reseeded.push("HEAD-PO-PLAYBOOK.md");
+  if (mergedPlaybook.preservedHeadings.length > 0) {
+    preserved["HEAD-PO-PLAYBOOK.md"] = mergedPlaybook.preservedHeadings;
   }
   return { reseeded, skipped, preserved };
 }
@@ -6082,7 +6129,9 @@ async function autoReseedOnStartup(cfg, opts = {}) {
 
   const state = _loadReseedState(statePath);
   const decisions = [];
-  const projects = (cfg?.projects || []).filter((p) => p && p.id && p.working_dir);
+  const projects = (cfg?.projects || []).filter(
+    (p) => p && p.id && primaryRepository(p)?.working_dir,
+  );
 
   for (const project of projects) {
     if (state.completedByProjectVersion[project.id] === version) {

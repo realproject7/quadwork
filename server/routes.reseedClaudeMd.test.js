@@ -17,6 +17,14 @@ const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
 
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "qw-966-home-"));
+const originalHomedir = os.homedir;
+os.homedir = () => TEST_HOME;
+process.on("exit", () => {
+  os.homedir = originalHomedir;
+  try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch {}
+});
+
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 

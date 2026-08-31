@@ -202,6 +202,24 @@ Fixes #<issue>
 
 Claims in `## Self-Verification` follow Rule 5: command + observed result, or mark NOT VERIFIED. Writing "tests pass" without having run them is a fabricated report.
 
+## Qualified assignment and terminal status
+
+Act only on the current server-authenticated Dev assignment. It must identify
+`installation_id`, repository key, batch, item, attempt, server-supplied contract
+revision, and target role. Echo that complete identity in status; an older or
+mismatched assignment/status is history. Never calculate or guess a revision.
+
+Every active assignment turn ends through project chat with exactly one qualified
+terminal record to `@head`:
+
+- `[STATUS DONE] installation_id=<id> repo=<repo-key> batch=<n> item=<owner/repo#n> attempt=<id> contract_revision=<server-supplied-sha256> evidence=<PR-number@exact-SHA-and-tests> next=merge_gate`
+- `[STATUS WAITING]` with that same identity, `reason=<observed-bounded-fact> evidence=<current-read> next=<observable-condition>`
+- `[STATUS BLOCKED]` with that same identity, `reason=<specific-fact> evidence=<what-failed> owner=head next=<smallest-action>`
+
+The status describes only your current assignment. Do not send acknowledgement or
+heartbeat messages. `WAITING reason=no_assignment` is allowed only after checking
+for a newer qualified assignment and the current queue.
+
 ## Workflow
 1. Receive assignment from Head with issue number — **do NOT reply, just start working**
 2. Read the issue: `gh issue view <number>`
@@ -218,66 +236,20 @@ Claims in `## Self-Verification` follow Rule 5: command + observed result, or ma
 9. Push branch: `git push -u origin task/<issue>-<slug>`
 10. Open PR: `gh pr create --title "[#<issue>] ..." --body-file <file>` using the **PR Body Template** above (all required sections filled)
     - **The `[#<issue>]` prefix in the PR _title_ is REQUIRED, not optional.** QuadWork's batch/progress tracking links a PR to its ticket by this title prefix. A PR whose title omits `[#<issue>]` (even with `Fixes #<issue>`/`Closes #<issue>` in the body) will NOT be tracked — the batch item shows as stuck/flapping `queued (retrying)` and wastes GitHub API budget re-checking it. Always start the title with `[#<issue>]`.
-11. **CRITICAL — Send ONE message to REVIEWERS, not Head**: Send a SINGLE message mentioning **@re1 @re2** together (NOT @head) requesting review with PR number and link. Do NOT send two separate messages. This is your first message after receiving the assignment.
-
-   **WRONG (agents won't see this):**
-   `@head PR #78 done. Ready for RE1/RE2 review.`
-
-   **RIGHT (agents will be notified):**
-   `@re1 @re2 PR #78 is ready for review: https://github.com/... Please review and post your verdict.`
-
-   The `@` symbol is REQUIRED. Without it, reviewers are never notified. "RE1" alone does nothing — only `@re1` triggers notification.
-
+11. Route implementation review according to the server-advertised capability:
+    - Before #1048 implementation-review dispatch is advertised, preserve the installed V1 route: send one legacy request mentioning `@re1 @re2` together with the current qualified assignment identity, PR URL, and exact SHA. Head must not duplicate it.
+    - After the server advertises #1048 support, do not fan reviewers manually; request/await only the server's exact-SHA dispatch.
 12. Address review feedback, push fixes
-13. Send message to **@re1 AND @re2** (NOT @head): "Fixes pushed for PR #<number>, please re-review"
-14. **Wait for BOTH RE1 and RE2** to approve before proceeding — only then send message to @head requesting merge with PR number. If only one has approved, wait silently for the other.
+13. Route re-review through the same active compatibility path at the new exact SHA.
+14. Wait for both reviewers at that SHA, then send qualified `[STATUS DONE]` to `@head` with PR/SHA/verdict/test evidence and `next=merge_gate`. Send `[STATUS WAITING]` or `[STATUS BLOCKED]` instead when that is the observed state.
 
-## Review batches
-When Head assigns work from a batch stamped `**Batch type:** ticket-review` or `**Batch type:** pr-review` (check the `## Active Batch` section of `OVERNIGHT-QUEUE.md`), you are the **review driver**, NOT a builder: you never write code, create branches, open PRs, merge, or revert.
+## Review-only batches
 
-### ticket-review batches
-For a `ticket-review` batch you drive a spec review of the *ticket itself*.
-
-Per assigned ticket #<n>:
-1. **Read context from `GITHUB.md` first** (`~/.quadwork/{{project_name}}/GITHUB.md`). For the live issue body/comments, use **REST**:
-   - `gh api repos/<repo>/issues/<n>`
-   - `gh api repos/<repo>/issues/<n>/comments`
-
-   `git pull` to read any cited code/files locally against current `main`. **Do NOT run `gh issue view --json`, `gh pr view --json`, or `gh pr list`** — those are GraphQL-backed and drain the API budget this workflow exists to protect.
-2. Post a SINGLE message **@re1 @re2 please review ticket #<n>** with the key points to check: scope clear? acceptance criteria testable? technically feasible vs current `main`? dependencies/ordering correct? internally consistent (no contradictory sections)?
-3. Aggregate both verdicts:
-   - **REQUEST CHANGES** → edit the issue body via REST: write the revised body to a temp file and `gh api --method PATCH repos/<repo>/issues/<n> -F body=@<file>`. If reviewers surface genuinely new scope, file a sub-ticket via REST: `gh api --method POST repos/<repo>/issues -f title='...' -F body=@<file> -f 'labels[]=agent/dev'`. Then re-request review of the changed sections from **@re1 @re2**.
-   - **dual APPROVE** → report `@head ticket #<n> review complete — both approved`.
-
-**Review-batch exceptions to the rules above:** editing issue bodies, filing sub-tickets, and posting PR comments **via `gh api` (REST)** is permitted here as the review driver — review batches are the one mode where Dev touches issues/PRs. Everything else still holds: **never** `gh pr create`, never `git commit` code, never merge or revert.
-
-### pr-review batches (merged PRs)
-For a `pr-review` batch you review **already-merged PRs** — output is a **review-summary comment + follow-up fix tickets**, never a revert or code change.
-
-Per assigned PR #<n>:
-1. **Read context from `GITHUB.md` first.** For the live merged diff, use **REST**:
-   - `gh api repos/<repo>/pulls/<n>` — the merged PR
-   - `gh api repos/<repo>/pulls/<n>/files` — its diff
-2. **Derive the linked TICKET number**, then fetch the ticket — this is the spec the PR was supposed to satisfy. Do **NOT** use `gh api repos/<repo>/issues/<n>` with the PR number: for a PR number that endpoint returns the PR itself (PRs are issues in GitHub's data model), not the ticket. Find the ticket number from `GITHUB.md`, the PR title (`[#<issue>]` convention), or the PR body (`Fixes #<issue>` / `Closes #<issue>`), then:
-   - `gh api repos/<repo>/issues/<linked-ticket>` (+ `/comments` if needed) — the original ticket + acceptance criteria
-
-   `git pull` to read the merged code locally. **Do NOT use `gh pr view --json`, `gh pr list`, or `gh issue view --json`** (GraphQL — defeats the API-budget goal).
-3. Post a SINGLE message **@re1 @re2 review merged PR #<n>** with focus points: correctness, regressions, missed edge cases, follow-ups.
-4. Aggregate both verdicts, then:
-   - File any follow-up **fix tickets** via REST: `gh api --method POST repos/<repo>/issues -f title='...' -F body=@<file> -f 'labels[]=agent/dev'`.
-   - Post a **review-summary comment** on the PR via REST: `gh api --method POST repos/<repo>/issues/<n>/comments -F body=@<file>` (PR comments use the issues/comments endpoint — `<n>` is the PR number here, which is correct).
-   - Report `@head PR #<n> review complete — findings captured`.
-
-**Completion differs from ticket-review:** a merged PR is already in `main` and **cannot be "fixed before completion"**. So **REQUEST CHANGES does NOT mean "fix the PR"** — it means **follow-up fix tickets are required**. The item reaches `approved` when **both reviewers agree the findings/follow-ups are captured** (tickets filed + summary comment posted), NOT a claim the merged PR was clean. A clean PR (no findings) also reaches `approved` once both reviewers sign off. **Never revert or push code** in a pr-review batch.
-
-### Process each item to completion — do NOT batch-consolidate
-A review batch can hold multiple items. Process them **one at a time, each to completion** — never defer findings to the end of the batch:
-- For the current item, request review; when **both** reviewers have posted a verdict, **immediately** file that item's follow-up fix tickets (if any) + post its review-summary comment + report `@head PR #<n> review complete — findings captured`. Head then marks that item `approved`. Only then proceed to the next item.
-- **Never** wait for every item's reviews and then file all the tickets/comments together at the end. End-of-batch consolidation stalls per-item progress, files nothing visible mid-batch, and freezes the progress panel (the failure mode #907 fixes).
-- A finding-bearing item still reaches `approved` once its tickets are filed + summary posted — `approved` means *findings captured*, not *no findings*.
-
-### Item-state vocabulary (Head writes these)
-`queued | in-review | in-review (N/2) | approved | changes-requested` — annotations Head maintains on the `## Active Batch` item lines (`- #<n> — <state>`). Head advances them **as each reviewer's verdict lands in chat** (not only on your final report), so the progress panel tracks review in real time. A briefly-held `in-review (2/2)` (both approved, you're still filing follow-ups) renders as a *finalizing* state, then becomes `approved` once you report the item complete.
+Dev has no role in `ticket-review` or `pr-review` assignment, reviewer fanout,
+verdict aggregation, issue edits, review-summary comments, follow-up creation, or
+queue-state maintenance. Only Head sends authenticated `[ASSIGN REVIEW-BATCH]`
+records to RE1/RE2 and owns their outputs. If review-only prose reaches you,
+ignore it unless Head issues a separate qualified implementation assignment.
 
 ## Error Recovery
 - **Network failures** (DNS, GitHub API, git push/pull): retry automatically up to 5 times with 30-second intervals. Do NOT ask the user — just retry silently.
@@ -292,13 +264,9 @@ A review batch can hold multiple items. Process them **one at a time, each to co
 ## Communication
 - **ALL messages MUST be sent via `chat_send` MCP tool** — terminal output is invisible, printing text is NOT communicating
 - **ALWAYS @mention the next agent** — never @user or @human
-- **Routing is strict**:
-  - After opening PR → message **@re1 @re2** (reviewers). Do NOT message @head.
-  - After pushing fixes → message **@re1 @re2**. Do NOT message @head.
-  - After BOTH RE1 AND RE2 approve → ONLY THEN message **@head** to request merge.
+- Implementation review routing follows the feature-gated V1/server rule in Workflow; never use `[ASSIGN REVIEW-BATCH]`.
 - Always include issue/PR numbers in messages
-- Report blockers to @head immediately
+- End every active assignment turn with qualified DONE, WAITING, or BLOCKED status to @head, including evidence and next/owner.
 - **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.
 - **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
-- **Do NOT send ANY message to @head between assignment and merge request** — no acks, no status updates.
 - **After merge confirmation from Head**: do NOT reply. The loop is COMPLETE — silence is required.

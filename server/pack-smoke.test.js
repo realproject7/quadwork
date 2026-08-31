@@ -124,7 +124,14 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
     .filter((f) => f.endsWith(".AGENTS.md"))
     .map((f) => `templates/seeds/${f}`);
   assert.ok(seedFiles.length > 0, "found template AGENTS.md seeds to check");
-  assetTargets.push(...seedFiles, "templates/CLAUDE.md");
+  assetTargets.push(
+    ...seedFiles,
+    "templates/seeds/HEAD-PO-PLAYBOOK.md",
+    "templates/CLAUDE.md",
+  );
+  const playbook = fs.readFileSync(path.join(seedDir, "HEAD-PO-PLAYBOOK.md"), "utf8");
+  assert.match(playbook, /\*\*Playbook version:\*\*\s+\d+\.\d+\.\d+/,
+    "Head PO playbook carries a visible semantic version");
 
   // Operator MCP tool modules (dynamically loaded, not literal-required).
   const toolsDir = path.join(ROOT, "server", "mcp-operator", "tools");
