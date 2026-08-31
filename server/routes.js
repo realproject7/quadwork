@@ -25,6 +25,13 @@ const {
   parseProjectGithubMarkdown,
   extractGithubNotes,
 } = require("./github-state-markdown");
+const {
+  parseWorkItemLines,
+  assertWorkItemRef,
+  serializeWorkItemRefApi,
+  workItemKey,
+  ownershipKey,
+} = require("./work-item-ref");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
@@ -747,6 +754,26 @@ function requestedBridgeAdmission(body, projectId, res) {
     return null;
   }
   return admission;
+}
+
+function requestedBridgeAssignment(body, projectId, res) {
+  const identityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "compatibility_mode"];
+  const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
+    identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  // Only a body carrying no automation identity at all is a manual V1/operator
+  // action. Partial assignment identity fails closed below.
+  if (!automated) return undefined;
+  const result = validateCurrentOwnedAssignment(projectId, body);
+  if (!result.ok) {
+    res.status(409).json({
+      ok: false,
+      error: "project assignment changed; refresh and retry",
+      code: "project_assignment_changed",
+      project_id: projectId,
+    });
+    return null;
+  }
+  return result.context;
 }
 
 // #1034: archive/unarchive is a lifecycle barrier. The injected controller is
@@ -2144,6 +2171,7 @@ function restPullBaseToCanonical(p) {
     author: p.user ? { login: p.user.login } : null,
     assignees: (p.assignees || []).map((a) => ({ login: a.login })),
     createdAt: p.created_at,
+    tip: p.head && p.head.sha ? p.head.sha : null,
   };
 }
 
@@ -2783,7 +2811,7 @@ fragment repoFields on Repository {
     nodes { number title url state closedAt }
   }
   openPRs: pullRequests(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-    nodes { number title url state author { login } reviews(last: 100) { nodes { state author { login } submittedAt body } } createdAt }
+    nodes { number title url state headRefOid author { login } reviews(last: 100) { nodes { state author { login } submittedAt body } } createdAt }
   }
   mergedPRs: pullRequests(first: ${RECENT_FETCH_LIMIT}, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
     nodes { number title url state mergedAt author { login } }
@@ -2831,6 +2859,7 @@ fragment repoFields on Repository {
           body: r.body || "",
         })),
         createdAt: n.createdAt,
+        tip: n.headRefOid || null,
       }));
 
       const closedIssues = (repoData.closedIssues?.nodes || [])
@@ -2967,6 +2996,22 @@ function countApprovedRoles(reviews) {
   return ["re1", "re2"].filter((r) => roles[r] && roles[r].state === "APPROVED").length;
 }
 
+function livePrReference(pr) {
+  if (!pr || String(pr.state || "OPEN").toUpperCase() !== "OPEN") return null;
+  return {
+    number: pr.number,
+    url: pr.url || pr.html_url || null,
+    state: "OPEN",
+    tip: pr.tip || pr.head?.sha || pr.headRefOid || null,
+  };
+}
+
+function historicalPrReference(pr) {
+  if (!pr) return null;
+  const state = pr.merged === true || String(pr.state || "").toUpperCase() === "MERGED" ? "MERGED" : "CLOSED";
+  return { number: pr.number, url: pr.url || pr.html_url || null, state, tip: pr.tip || pr.head?.sha || pr.headRefOid || null };
+}
+
 // Compute issue `n`'s progress row from the snapshot (no network). Links
 // issue↔PR by the team's `[#<issue>]` PR-title convention. Returns a row when
 // the snapshot can PROVE the state: a matching in-window PR (in_review/approved/
@@ -2982,7 +3027,8 @@ function countApprovedRoles(reviews) {
 function progressFromSnapshot(snapshot, n) {
   if (!snapshot) return null;
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
-  const openPr = (snapshot.prs || []).find((p) => titleRe.test(p.title || ""));
+  const openPr = (snapshot.prs || []).find((p) =>
+    titleRe.test(p.title || "") && (!p.state || String(p.state).toUpperCase() === "OPEN"));
   const mergedPr = (snapshot.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
   const openIssue = (snapshot.issues || []).find((i) => i.number === n);
   const closedIssue = (snapshot.closedIssues || []).find((i) => i.number === n);
@@ -2992,15 +3038,16 @@ function progressFromSnapshot(snapshot, n) {
   if (mergedPr && closedIssue) {
     return {
       issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url,
-      pr_number: mergedPr.number, status: "merged", progress: 100, label: "Merged ✓",
+      pr_number: mergedPr.number, live_pr: null, historical_pr: historicalPrReference(mergedPr), status: "merged", progress: 100, label: "Merged ✓",
     };
   }
   // Matching open PR in-window → confident in_review/approved/ready.
   if (openPr) {
     const approvals = countApprovedRoles(openPr.reviews);
-    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
-    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
-    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
+    const live_pr = livePrReference(openPr);
+    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
+    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
+    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
   }
   // No matching open/in-window-merged PR. #828 P1 / #834: classify queued from
   // the snapshot ONLY when absence of BOTH an open AND a closed/merged linked PR
@@ -3045,29 +3092,44 @@ function approvalsFromReviewDetail(reviewDetail, prNumber) {
 // in-window merged PR is genuinely queued (NO network). Items the file can't
 // classify (absent, or merged-but-still-open) return null; the caller renders a
 // soft "queued (retrying)" row that firms up once the snapshot repopulates.
-function progressFromGithubFile(parsed, n) {
+function progressFromGithubFile(parsed, n, ref = null) {
   if (!parsed || !parsed.ok) return null;
+  let source = parsed;
+  if (ref && Array.isArray(parsed.repositories)) {
+    const repository = parsed.repositories.find((entry) =>
+      entry.repo_key === ref.repoKey && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(ref.repo));
+    if (!repository) return null;
+    source = {
+      openIssues: repository.issues,
+      openPRs: repository.prs,
+      closedIssues: repository.closedIssues,
+      mergedPrs: repository.mergedPrs,
+      reviewDetail: repository.reviewDetail,
+    };
+  }
   // NOTE: parseGithub's titles come through _sanitizeInline, which STRIPS the
   // `[` `]` of the `[#N]` convention — so the persisted PR title reads `#N …`,
   // not `[#N] …` (unlike the in-memory snapshot progressFromSnapshot matches).
   // Anchor on `#N` + a word boundary so `#80` can't match issue 8.
   const titleRe = new RegExp(`^\\s*#${n}\\b`);
-  const openPr = (parsed.openPRs || []).find((p) => titleRe.test(p.title || ""));
-  const mergedPr = (parsed.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
-  const openIssue = (parsed.openIssues || []).find((i) => i.number === n);
-  const closedIssue = (parsed.closedIssues || []).find((i) => i.number === n);
+  const openPr = (source.openPRs || []).find((p) => titleRe.test(p.title || ""));
+  const mergedPr = (source.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
+  const openIssue = (source.openIssues || []).find((i) => i.number === n);
+  const closedIssue = (source.closedIssues || []).find((i) => i.number === n);
 
   // merged requires a matching merged PR AND the issue CLOSED.
   if (mergedPr && closedIssue) {
-    return { issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url, pr_number: mergedPr.number, status: "merged", progress: 100, label: "Merged ✓" };
+    return { issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url, pr_number: mergedPr.number, live_pr: null, historical_pr: historicalPrReference(mergedPr), status: "merged", progress: 100, label: "Merged ✓" };
   }
   // Matching open PR → in_review/approved/ready from the parsed Review Detail.
   if (openPr) {
     const title = (openIssue && openIssue.title) || openPr.title || `#${n}`;
-    const approvals = approvalsFromReviewDetail(parsed.reviewDetail, openPr.number);
-    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
-    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
-    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
+    const reviewKey = ref ? `${ref.repoKey}#${openPr.number}` : openPr.number;
+    const approvals = approvalsFromReviewDetail(source.reviewDetail, reviewKey);
+    const live_pr = livePrReference(openPr);
+    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
+    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
+    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
   }
   // No matching open PR. The persisted board lists the FULL open-PR window, so an
   // OPEN active-batch issue with no [#N] open PR and no in-window merged PR is
@@ -3091,7 +3153,7 @@ function progressFromGithubFile(parsed, n) {
 // just because the in-memory snapshot is briefly cold (post-restart) or a
 // transient secondary-rate-limit/network blip hit its by-number fetch.
 function softRetryingRow(n, title) {
-  return { issue_number: n, title: title || `#${n}`, url: null, status: "queued", progress: 0, label: "queued (retrying)" };
+  return { issue_number: n, title: title || `#${n}`, url: null, live_pr: null, status: "queued", progress: 0, label: "queued (retrying)" };
 }
 
 // Confirmed-complete state machine, per project. `complete` must hold across
@@ -3587,14 +3649,77 @@ function resolveDisplayedBatch(
 }
 const BATCH_PROGRESS_TTL_MS = 10000;
 
-function parseActiveBatch(queueText) {
+// #1031 route adapter around the pure work-item-ref identity module.  This
+// layer owns queue sections and installation provenance; the module owns token
+// validation, canonical serialization, and collision-free keys.
+function canonicalWorkItemKey(ref) {
+  try { return workItemKey(ref); }
+  catch { return null; }
+}
+
+function assignmentKeyFor({ installationId, batchNumber, assignmentAttempt, workItems }) {
+  if (!installationId || !Number.isSafeInteger(batchNumber) || !assignmentAttempt) return null;
+  try {
+    const provenance = {
+      installation_id: installationId,
+      batch_number: batchNumber,
+      assignment_attempt: assignmentAttempt,
+    };
+    const refs = (Array.isArray(workItems) ? workItems : [])
+      .map((item) => ownershipKey(provenance, item.ref || item))
+      .sort();
+    return JSON.stringify(["batch-assignment", 1, installationId, batchNumber, assignmentAttempt, refs]);
+  } catch { return null; }
+}
+
+function queueAssignmentMetadata(section, installationId, batchNumber) {
+  const installationMatch = section.match(
+    /\*\*(?:Installation(?: ID)?|installation_id):\*\*\s*([^\s]+)/i,
+  );
+  const attemptMatch = section.match(
+    /\*\*(?:Assignment attempt|assignment_attempt|Attempt):\*\*\s*([^\s]+)/i,
+  );
+  const serializedInstallation = installationMatch ? installationMatch[1] : null;
+  const assignmentAttempt = attemptMatch ? attemptMatch[1] : null;
+  let provenance = "legacy_unowned";
+  if (installationId) {
+    if (!serializedInstallation || !assignmentAttempt || !Number.isSafeInteger(batchNumber)) provenance = "unowned";
+    else if (serializedInstallation !== installationId) provenance = "foreign";
+    else provenance = "owned";
+  }
+  return { installationId: installationId || null, serializedInstallation, assignmentAttempt, provenance };
+}
+
+function parseQueueWorkItems(section, { repositories = [], kind = "issue" } = {}) {
+  const bindings = Array.isArray(repositories) && repositories.length > 0
+    ? repositories
+    : [{ key: "primary", repo: "legacy/unknown", primary: true }];
+  const itemLines = section.split("\n").filter((line) => !/^\s*#{1,6}\s/.test(line));
+  const parsed = parseWorkItemLines(itemLines, {
+    repositories: bindings,
+    kind,
+    allowLegacyBare: bindings.length === 1,
+  });
+  return {
+    workItems: parsed.items.map((item) => ({
+      ...item.ref,
+      ref: item.ref,
+      key: workItemKey(item.ref),
+      trailing: item.remainder,
+      legacyUnowned: item.legacyUnowned === true,
+    })),
+    errors: parsed.diagnostics,
+  };
+}
+
+function parseActiveBatch(queueText, options = {}) {
   if (typeof queueText !== "string" || !queueText) {
-    return { batchNumber: null, issueNumbers: [] };
+    return { batchNumber: null, issueNumbers: [], workItems: [], errors: [], provenance: "legacy_unowned", assignmentAttempt: null, assignmentKey: null };
   }
   // Pull just the Active Batch section so a stray `#123` in Backlog
   // or Done doesn't leak into the active list.
   const m = queueText.match(/##\s+Active Batch[\s\S]*?(?=\n##\s|$)/i);
-  if (!m) return { batchNumber: null, issueNumbers: [] };
+  if (!m) return { batchNumber: null, issueNumbers: [], workItems: [], errors: [], provenance: "legacy_unowned", assignmentAttempt: null, assignmentKey: null };
   const section = m[0];
   const batchMatch = section.match(/\*\*Batch:\*\*\s*(\d+)/i) || section.match(/Batch:\s*(\d+)/i);
   const batchNumber = batchMatch ? parseInt(batchMatch[1], 10) : null;
@@ -3628,19 +3753,28 @@ function parseActiveBatch(queueText) {
   // used GFM checkbox syntax produced zero issue numbers and the
   // Current Batch panel showed empty. #341 adds an explicit optional
   // checkbox token after the list marker.
-  const ITEM_LINE_RE = /^\s*(?:[-*]\s+|\d+\.\s+)?(?:\[[ xX]\]\s+)?\[?#(\d{1,6})\]?\b/;
-  const seen = new Set();
-  const issueNumbers = [];
-  for (const line of section.split("\n")) {
-    const lineMatch = line.match(ITEM_LINE_RE);
-    if (!lineMatch) continue;
-    const n = parseInt(lineMatch[1], 10);
-    if (!seen.has(n)) {
-      seen.add(n);
-      issueNumbers.push(n);
-    }
-  }
-  return { batchNumber, issueNumbers };
+  const kind = options.kind || (parseBatchType(queueText) === "pr-review" ? "pr" : "issue");
+  const repositories = options.repositories || options.bindings || [];
+  const { workItems, errors } = parseQueueWorkItems(section, { repositories, kind });
+  const metadata = queueAssignmentMetadata(section, options.installationId || null, batchNumber);
+  if (options.installationId && workItems.some((item) => item.legacyUnowned)) metadata.provenance = "unowned";
+  const assignmentKey = assignmentKeyFor({
+    installationId: metadata.provenance === "owned" ? metadata.serializedInstallation : null,
+    batchNumber,
+    assignmentAttempt: metadata.assignmentAttempt,
+    workItems,
+  });
+  if (metadata.provenance === "owned" && !assignmentKey) metadata.provenance = "unowned";
+  return {
+    batchNumber,
+    issueNumbers: workItems.map((item) => item.number),
+    workItems,
+    errors,
+    installationId: metadata.serializedInstallation,
+    assignmentAttempt: metadata.assignmentAttempt,
+    provenance: metadata.provenance,
+    assignmentKey,
+  };
 }
 
 // #870: review-batch support. The queue's `## Active Batch` section may carry a
@@ -3677,23 +3811,19 @@ function parseReviewState(raw) {
 // Parse the `## Active Batch` review items: `- #<n> — <state>`. Same line
 // grammar as parseActiveBatch (so the issue set matches exactly), plus the
 // trailing state annotation. Scoped to Active Batch — NEVER `## Done`.
-const REVIEW_ITEM_LINE_RE = /^\s*(?:[-*]\s+|\d+\.\s+)?(?:\[[ xX]\]\s+)?\[?#(\d{1,6})\]?\b(.*)$/;
-function parseReviewItems(queueText) {
+function parseReviewItems(queueText, options = {}) {
   if (typeof queueText !== "string" || !queueText) return [];
   const m = queueText.match(ACTIVE_BATCH_SECTION_RE);
   if (!m) return [];
-  const seen = new Set();
-  const items = [];
-  for (const line of m[0].split("\n")) {
-    const lm = line.match(REVIEW_ITEM_LINE_RE);
-    if (!lm) continue;
-    const n = parseInt(lm[1], 10);
-    if (seen.has(n)) continue;
-    seen.add(n);
-    const { review_state, approvals } = parseReviewState(lm[2]);
-    items.push({ issue: n, review_state, approvals });
-  }
-  return items;
+  const kind = options.kind || (parseBatchType(queueText) === "pr-review" ? "pr" : "issue");
+  const parsed = parseQueueWorkItems(m[0], {
+    repositories: options.repositories || options.bindings || [],
+    kind,
+  });
+  return parsed.workItems.map((ref) => {
+    const { review_state, approvals } = parseReviewState(ref.trailing);
+    return { issue: ref.number, ref, review_state, approvals };
+  });
 }
 
 // #925: parse the per-item review states from the ONE `## Done` block whose
@@ -3707,7 +3837,7 @@ function parseReviewItems(queueText) {
 // Returns { batch_type, reviewItems } or null if no matching block exists.
 const DONE_SECTION_RE = /##\s+Done\b[\s\S]*?(?=\n##\s|$)/i;
 const DONE_BATCH_MARKER_RE = /\*\*Batch:\*\*\s*(\d+)/g;
-function parseDoneBatchReviewItems(queueText, batchNumber) {
+function parseDoneBatchReviewItems(queueText, batchNumber, options = {}) {
   if (typeof queueText !== "string" || !queueText || !Number.isInteger(batchNumber)) return null;
   const dm = queueText.match(DONE_SECTION_RE);
   if (!dm) return null;
@@ -3725,18 +3855,53 @@ function parseDoneBatchReviewItems(queueText, batchNumber) {
   const block = done.slice(markers[idx].start, idx + 1 < markers.length ? markers[idx + 1].start : done.length);
   const tm = block.match(/\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\b/i);
   const batch_type = tm ? tm[1].toLowerCase() : "code";
-  const seen = new Set();
-  const reviewItems = [];
-  for (const line of block.split("\n")) {
-    const lm = line.match(REVIEW_ITEM_LINE_RE);
-    if (!lm) continue;
-    const n = parseInt(lm[1], 10);
-    if (seen.has(n)) continue;
-    seen.add(n);
-    const { review_state, approvals } = parseReviewState(lm[2]);
-    reviewItems.push({ issue: n, review_state, approvals });
-  }
+  const kind = batch_type === "pr-review" ? "pr" : "issue";
+  const parsed = parseQueueWorkItems(block, {
+    repositories: options.repositories || options.bindings || [],
+    kind,
+  });
+  const reviewItems = parsed.workItems.map((ref) => {
+    const { review_state, approvals } = parseReviewState(ref.trailing);
+    return { issue: ref.number, ref, review_state, approvals };
+  });
   return { batch_type, reviewItems };
+}
+
+function publicWorkItemRef(ref) {
+  try { return serializeWorkItemRefApi(ref); }
+  catch { return null; }
+}
+
+function decorateBatchRow(row, ref, assignment = null) {
+  const publicRef = publicWorkItemRef(ref);
+  const decorated = {
+    ...row,
+    ...(publicRef ? {
+      repo_key: publicRef.repo_key,
+      repo: publicRef.repo,
+      number: publicRef.number,
+      kind: publicRef.kind,
+      work_item_ref: publicRef,
+      live_pr: row.live_pr || null,
+    } : {}),
+  };
+  if (assignment) {
+    decorated.installation_id = assignment.installation_id;
+    decorated.batch_number = assignment.batch_number;
+    decorated.assignment_attempt = assignment.assignment_attempt;
+    decorated.provenance = assignment.provenance;
+    decorated.assignment_key = assignment.assignment_key;
+    decorated.current = assignment.current === true;
+    decorated.owned = assignment.owned === true;
+    decorated.ownership_key = assignment.owned === true
+      ? ownershipKey({
+        installation_id: assignment.installation_id,
+        batch_number: assignment.batch_number,
+        assignment_attempt: assignment.assignment_attempt,
+      }, ref)
+      : null;
+  }
+  return decorated;
 }
 
 // Map a parsed review state → the batch-progress item, EXTENDING the existing
@@ -3745,7 +3910,8 @@ function parseDoneBatchReviewItems(queueText, batchNumber) {
 // ticket-review omits it (frontend type is pr_number?: number — never null).
 function reviewItemView(ri, batchType, ghIndex) {
   const n = ri.issue;
-  const meta = ghIndex && ghIndex.get(n);
+  const ref = ri.ref || null;
+  const meta = ghIndex && ghIndex.get(ref ? canonicalWorkItemKey(ref) : n);
   let progress, status, label;
   if (ri.review_state === "approved") { progress = 100; status = "approved"; label = "Approved ✓"; }
   else if (ri.review_state === "changes-requested") { progress = 0; status = "changes_requested"; label = "changes requested"; }
@@ -3770,7 +3936,7 @@ function reviewItemView(ri, batchType, ghIndex) {
     approvals: ri.approvals,
   };
   if (batchType === "pr-review") item.pr_number = n;
-  return item;
+  return ref ? decorateBatchRow(item, ref) : item;
 }
 
 function summarizeReviewItems(reviewItems) {
@@ -3802,10 +3968,17 @@ function loadGithubItemIndex(projectId) {
   }
   const parsed = parseGithub(text);
   if (!parsed || !parsed.ok) return map;
-  for (const list of [parsed.openIssues, parsed.closedIssues, parsed.openPRs, parsed.mergedPrs]) {
+  for (const [kind, list] of [["issue", parsed.openIssues], ["issue", parsed.closedIssues], ["pr", parsed.openPRs], ["pr", parsed.mergedPrs]]) {
     for (const it of list || []) {
-      if (it && typeof it.number === "number" && !map.has(it.number)) {
-        map.set(it.number, { title: it.title, url: it.url });
+      if (it && typeof it.number === "number") {
+        const ref = { repoKey: it.repo_key, repo: it.repo, number: it.number, kind };
+        const key = canonicalWorkItemKey(ref);
+        if (key && !map.has(key)) map.set(key, { title: it.title, url: it.url });
+        if (!map.has(it.number)) {
+          // One-repository legacy projection only; qualified callers always
+          // use the composite key above.
+          map.set(it.number, { title: it.title, url: it.url });
+        }
       }
     }
   }
@@ -3855,6 +4028,7 @@ function buildNoPrRow(issue) {
       issue_number: issue.number,
       title: issue.title,
       url: issue.url,
+      live_pr: null,
       status: "closed",
       progress: 100,
       label: "Closed (no PR) ✓",
@@ -3864,6 +4038,7 @@ function buildNoPrRow(issue) {
     issue_number: issue.number,
     title: issue.title,
     url: issue.url,
+    live_pr: null,
     status: "queued",
     progress: 0,
     label: "Issue · queued",
@@ -3907,6 +4082,12 @@ function pickLinkedPrFromSearch(items, n, opts = {}) {
     if (merged.length > 0) {
       return merged.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
     }
+  }
+  // An active issue's old merged/closed PR is historical. Prefer a currently
+  // OPEN replacement even when its number is lower than a recently closed PR.
+  if (!preferMerged) {
+    const open = matches.filter((it) => String(it && it.state || "").toUpperCase() === "OPEN");
+    if (open.length > 0) return open.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
   }
   return matches.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
 }
@@ -4027,24 +4208,14 @@ async function progressForItemRest(repo, issueNumber, stillCurrent = () => true,
   }
   if (!prData) {
     if (issue.state === "CLOSED") return buildNoPrRow(issue);
-    return {
-      issue_number: issue.number,
-      title: issue.title,
-      url: issue.url,
-      pr_number: prNumber,
-      status: "in_review",
-      progress: 20,
-      label: `PR #${prNumber} · waiting on review`,
-    };
+    return softRetryingRow(issue.number, issue.title);
   }
-  let reviews = [];
-  try {
-    stopIfRevoked();
-    const rv = await execJson(["api", `repos/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
-    stopIfRevoked();
-    reviews = mapReviews(Array.isArray(rv) ? rv : []);
-  } catch {
-    // soft — reviews stay [], so the row degrades to in_review, never "failed"
+  const prState = String(prData.state || "").toUpperCase();
+  if (issue.state === "OPEN" && prState !== "OPEN") {
+    return {
+      ...buildNoPrRow(issue),
+      historical_pr: historicalPrReference(prData),
+    };
   }
   const url = prData.html_url || issue.url;
   // REST: a merged PR is state "closed" with `merged: true`. merged requires
@@ -4055,21 +4226,36 @@ async function progressForItemRest(repo, issueNumber, stillCurrent = () => true,
       title: issue.title,
       url,
       pr_number: prData.number,
+      historical_pr: historicalPrReference(prData),
+      live_pr: null,
       status: "merged",
       progress: 100,
       label: "Merged ✓",
     };
   }
+  if (prState !== "OPEN") {
+    return { ...buildNoPrRow(issue), historical_pr: historicalPrReference(prData) };
+  }
+  let reviews = [];
+  try {
+    stopIfRevoked();
+    const rv = await execJson(["api", `repos/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
+    stopIfRevoked();
+    reviews = mapReviews(Array.isArray(rv) ? rv : []);
+  } catch {
+    // soft — reviews stay [], so the row degrades to in_review, never "failed"
+  }
   // #810: count APPROVED reviews per body-marker ROLE (re1/re2 share one login),
   // latest decision-affecting review per role — no stale double-count.
   const approvalCount = countApprovedRoles(reviews);
+  const live_pr = livePrReference({ ...prData, state: prState, url });
   if (approvalCount >= 2) {
-    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "ready", progress: 80, label: `PR #${prData.number} · 2 approvals · ready` };
+    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, live_pr, status: "ready", progress: 80, label: `PR #${prData.number} · 2 approvals · ready` };
   }
   if (approvalCount === 1) {
-    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "approved1", progress: 50, label: `PR #${prData.number} · 1 approval` };
+    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, live_pr, status: "approved1", progress: 50, label: `PR #${prData.number} · 1 approval` };
   }
-  return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "in_review", progress: 20, label: `PR #${prData.number} · waiting on review` };
+  return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, live_pr, status: "in_review", progress: 20, label: `PR #${prData.number} · waiting on review` };
 }
 
 function summarizeItems(items) {
@@ -4123,7 +4309,7 @@ function isBatchActiveFromProgress(progress) {
 router.get("/api/batch-active", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
-  if (!getRepo(projectId)) return res.status(400).json({ error: "No repo configured for project" });
+  if (getProjectRepositoryBindings(projectId).length === 0) return res.status(400).json({ error: "No repo configured for project" });
 
   // #839 (re1 follow-up on #844): share the same compute path that
   // /api/batch-progress uses so the completion-aware answer is available on
@@ -4136,7 +4322,20 @@ router.get("/api/batch-active", async (req, res) => {
   const data = await getOrComputeBatchProgress(projectId);
   const active = isBatchActiveFromProgress(data);
   // #870: surface batch_type so the sidebar can label review vs code batches.
-  return res.json({ active: active === null ? false : active, batch_type: (data && data.batch_type) || "code" });
+  return res.json({
+    active: active === null ? false : active,
+    batch_type: (data && data.batch_type) || "code",
+    installation_id: data?.installation_id || null,
+    batch_number: data?.batch_number ?? null,
+    assignment_attempt: data?.assignment_attempt || null,
+    provenance: data?.provenance || "legacy_unowned",
+    assignment_key: data?.assignment_key || null,
+    assignment_items: Array.isArray(data?.assignment_items) ? data.assignment_items : [],
+    current: data?.current === true,
+    owned: data?.owned === true,
+    multi_repository: data?.multi_repository === true,
+    compatibility_mode: data?.compatibility_mode === "v1" ? "v1" : "v2",
+  });
 });
 
 // #807: parsed view of the server-authored GITHUB.md. Single source of truth is
@@ -4187,54 +4386,229 @@ router.get("/api/github-parsed", (req, res) => {
 // successful response, or null to signal "no repo configured for project"
 // (caller's 400). Hits/populates _batchProgressCache so concurrent panel +
 // sidebar polls share the work via the BATCH_PROGRESS_TTL_MS cache.
-async function getOrComputeBatchProgress(projectId) {
-  const cached = _batchProgressCache.get(projectId);
-  if (isProjectArchived(projectId)) {
-    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
+function readLiveBatchContext(projectId) {
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
+  catch { return null; }
+  const project = cfg.projects?.find((entry) => entry?.id === projectId);
+  if (!project) return null;
+  const repositories = projectRepositoryBindings(project);
+  let queueText = "";
+  let queueReadOk = false;
+  try {
+    queueText = fs.readFileSync(path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md"), "utf-8");
+    queueReadOk = true;
+  } catch { /* missing queue is represented explicitly below */ }
+  const installationId = typeof cfg.installation_id === "string" ? cfg.installation_id : null;
+  const batchType = parseBatchType(queueText);
+  const parsed = parseActiveBatch(queueText, {
+    repositories,
+    installationId,
+    kind: batchType === "pr-review" ? "pr" : "issue",
+  });
+  const fingerprint = JSON.stringify([
+    "queue-assignment-observation", 1,
+    installationId,
+    parsed.batchNumber,
+    parsed.assignmentAttempt,
+    parsed.workItems.map((item) => item.key).sort(),
+    parsed.errors.map((entry) => [entry.code, entry.line_number || entry.line || null]),
+  ]);
+  return { cfg, project, repositories, queueText, queueReadOk, activated: !!installationId, installationId, batchType, parsed, fingerprint };
+}
+
+function assignmentView(context, { current = true } = {}) {
+  const parsed = context?.parsed || {};
+  const owned = parsed.provenance === "owned" && parsed.errors?.length === 0 && !!parsed.assignmentKey;
+  const provenance = {
+    installation_id: parsed.installationId || null,
+    batch_number: parsed.batchNumber ?? null,
+    assignment_attempt: parsed.assignmentAttempt || null,
+  };
+  const assignmentItems = owned
+    ? parsed.workItems.map((item) => {
+      const ref = item.ref || item;
+      return {
+        work_item_ref: serializeWorkItemRefApi(ref),
+        ownership_key: ownershipKey(provenance, ref),
+        _work_item_key: workItemKey(ref),
+      };
+    }).sort((a, b) => a._work_item_key.localeCompare(b._work_item_key))
+      .map(({ _work_item_key, ...item }) => item)
+    : [];
+  const compatibilityMode = context?.activated !== true && (context?.repositories || []).length === 1 &&
+    parsed.errors?.length === 0 &&
+    (parsed.workItems?.length === 0 || parsed.workItems.every((item) => item.legacyUnowned === true))
+    ? "v1"
+    : "v2";
+  return {
+    ...provenance,
+    provenance: parsed.provenance || "legacy_unowned",
+    assignment_key: parsed.assignmentKey || null,
+    current: current === true,
+    owned,
+    multi_repository: (context?.repositories || []).length > 1,
+    assignment_items: assignmentItems,
+    compatibility_mode: compatibilityMode,
+  };
+}
+
+function canonicalAssignmentItems(items) {
+  if (!Array.isArray(items)) return null;
+  const seen = new Set();
+  const normalized = [];
+  try {
+    for (const item of items) {
+      if (!item || typeof item !== "object" || Array.isArray(item) ||
+          Object.keys(item).sort().join(",") !== "ownership_key,work_item_ref") return null;
+      const apiRef = item.work_item_ref;
+      if (!apiRef || typeof apiRef !== "object" || Array.isArray(apiRef) ||
+          Object.keys(apiRef).sort().join(",") !== "kind,number,repo,repo_key") return null;
+      const ref = {
+        repoKey: apiRef.repo_key,
+        repo: apiRef.repo,
+        number: apiRef.number,
+        kind: apiRef.kind,
+      };
+      assertWorkItemRef(ref);
+      if (typeof item.ownership_key !== "string") return null;
+      const key = workItemKey(ref);
+      if (seen.has(key)) return null;
+      seen.add(key);
+      normalized.push({ key, value: { work_item_ref: serializeWorkItemRefApi(ref), ownership_key: item.ownership_key } });
+    }
+  } catch {
+    return null;
   }
+  return normalized.sort((a, b) => a.key.localeCompare(b.key)).map((entry) => entry.value);
+}
+
+function validateCurrentOwnedAssignment(projectId, body = {}) {
+  const v2IdentityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt"];
+  const identityFields = [...v2IdentityFields, "compatibility_mode"];
+  const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
+    identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  if (!automated) return { ok: true, manual: true, context: null };
+  const context = readLiveBatchContext(projectId);
+  const assignment = assignmentView(context, { current: true });
+  const carriesV2Identity = v2IdentityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  const requestsLegacy = body.compatibility_mode === "v1" ||
+    (!Object.prototype.hasOwnProperty.call(body, "compatibility_mode") &&
+      Object.prototype.hasOwnProperty.call(body, "admission_generation"));
+  if (!carriesV2Identity && requestsLegacy &&
+      context?.queueReadOk === true && assignment.compatibility_mode === "v1") {
+    return { ok: true, manual: false, legacy: true, context, assignment };
+  }
+  const requestedItems = canonicalAssignmentItems(body.assignment_items);
+  const liveItems = canonicalAssignmentItems(assignment.assignment_items);
+  const exact = context?.queueReadOk === true && assignment.owned === true &&
+    (body.compatibility_mode === undefined || body.compatibility_mode === "v2") &&
+    typeof body.assignment_key === "string" && body.assignment_key === assignment.assignment_key &&
+    body.installation_id === assignment.installation_id &&
+    body.batch_number === assignment.batch_number &&
+    typeof body.assignment_attempt === "string" && body.assignment_attempt === assignment.assignment_attempt &&
+    requestedItems !== null && liveItems !== null &&
+    JSON.stringify(requestedItems) === JSON.stringify(liveItems);
+  if (!exact) {
+    return {
+      ok: false,
+      status: 409,
+      code: "project_assignment_changed",
+      error: "project assignment changed; refresh and retry",
+      project_id: projectId,
+    };
+  }
+  return { ok: true, manual: false, context, assignment };
+}
+
+function isExactAssignmentCurrent(projectId, fingerprint, admission = null) {
+  if (admission && !isAdmissionCurrent(admission)) return false;
+  const current = readLiveBatchContext(projectId);
+  return !!current && current.queueReadOk && current.fingerprint === fingerprint;
+}
+
+function diagnosticBatchPayload(context) {
+  const errors = (context?.parsed?.errors || []).map((entry) => ({
+    code: typeof entry?.code === "string" ? entry.code : "invalid_work_item_ref",
+    message: typeof entry?.message === "string" ? entry.message.slice(0, 200) : "work item reference is invalid",
+    line_number: Number.isSafeInteger(entry?.line_number) ? entry.line_number : null,
+    token: typeof entry?.token === "string" ? entry.token.slice(0, 200) : null,
+  }));
+  const hasLiveDeclaration = (context?.parsed?.workItems || []).length > 0 || errors.length > 0;
+  const assignment = assignmentView(context, { current: context?.queueReadOk === true && hasLiveDeclaration });
+  const status = errors.length > 0 ? "invalid" : assignment.provenance;
+  const items = (context?.parsed?.workItems || []).map((ref) => decorateBatchRow({
+    issue_number: ref.number,
+    title: `${ref.repo || "?"}#${ref.number}`,
+    url: null,
+    status,
+    progress: 0,
+    label: errors.length > 0 ? "Invalid queue item" : "Assignment is not locally owned",
+  }, ref.ref || ref, assignment));
+  return {
+    ...assignment,
+    items,
+    summary: errors.length > 0 ? "Queue validation failed" : "Assignment is not locally owned",
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: items.length === 0 && errors.length === 0,
+    batch_type: context?.batchType || "code",
+    validation_errors: errors,
+  };
+}
+
+async function getOrComputeBatchProgress(projectId) {
+  const context = readLiveBatchContext(projectId);
+  if (isProjectArchived(projectId)) {
+    return { ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context?.batchType || "code", _archived: true, _readonly: true };
+  }
+  if (!context || context.repositories.length === 0) return null;
+  const cached = _batchProgressCache.get(projectId);
+  const matchingCached = cached && (!context.activated || cached.fingerprint === context.fingerprint) ? cached : null;
   // #812: parked (idle) project — never run batch-progress gh/GraphQL calls,
   // and ALWAYS flag the payload _idle (even on a fresh cache hit), so the
   // endpoint contract is consistent regardless of cache freshness. This must
   // precede the fresh-cache and rate-limit returns below.
   if (isProjectIdle(projectId)) {
-    if (cached) return { ...cached.data, _idle: true };
-    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _idle: true };
+    if (matchingCached) return { ...matchingCached.data, _idle: true };
+    return { ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context.batchType, _idle: true };
+  }
+  if (context.activated && (context.parsed.errors.length > 0 || context.parsed.provenance !== "owned" || !context.parsed.assignmentKey)) {
+    return diagnosticBatchPayload(context);
   }
   const batchTTL = adaptiveTTL(BATCH_PROGRESS_TTL_MS);
-  if (cached && Date.now() - cached.ts < batchTTL) {
-    return cached.data;
+  if (matchingCached && Date.now() - matchingCached.ts < batchTTL) {
+    return matchingCached.data;
   }
   // #554: if critically rate-limited, serve stale cache instead of
   // firing N gh calls per batch item.
-  if (isRateLimited() && cached) {
-    return { ...cached.data, _stale: true, _rateLimited: true };
+  if (isRateLimited() && matchingCached) {
+    return { ...matchingCached.data, _stale: true, _rateLimited: true };
   }
   // #802: GraphQL budget exhausted (separate from REST) — prefer serving the
   // existing cache (even stale) over the GraphQL query below. With no cache we
   // fall through to the REST gh-CLI fallback path (gated on its own bucket).
-  if (isGraphqlRateLimited() && cached) {
-    return { ...cached.data, _stale: true, _rateLimited: true };
+  if (isGraphqlRateLimited() && matchingCached) {
+    return { ...matchingCached.data, _stale: true, _rateLimited: true };
   }
 
-  const repo = getRepo(projectId);
-  if (!repo) return null;
   const admission = projectAdmission(projectId, { demand: true });
   if (!admission) {
     return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
   }
-  if (cached) {
-    startBatchProgressRefresh(projectId, repo, admission);
-    return { ...cached.data, _stale: true, _refreshing: true };
+  if (matchingCached) {
+    startBatchProgressRefresh(projectId, context, admission);
+    return { ...matchingCached.data, _stale: true, _refreshing: true };
   }
 
-  return computeBatchProgress(projectId, repo, admission);
+  return computeBatchProgress(projectId, context, admission);
 }
 
-function startBatchProgressRefresh(projectId, repo, admission) {
+function startBatchProgressRefresh(projectId, context, admission) {
   const existing = _batchProgressRefreshes.get(projectId);
-  if (existing && isAdmissionCurrent(existing.admission)) return existing.promise;
-  const entry = { admission, promise: null };
-  entry.promise = computeBatchProgress(projectId, repo, admission)
+  if (existing && existing.fingerprint === context.fingerprint && isAdmissionCurrent(existing.admission)) return existing.promise;
+  const entry = { admission, fingerprint: context.fingerprint, promise: null };
+  entry.promise = computeBatchProgress(projectId, context, admission)
     .catch(() => {
       // Non-fatal: callers already received the last good payload. The next poll
       // will retry rather than turning a transient gh/GitHub failure into UI lag.
@@ -4246,10 +4620,158 @@ function startBatchProgressRefresh(projectId, repo, admission) {
   return entry.promise;
 }
 
-async function computeBatchProgress(projectId, repo, admission = projectAdmission(projectId, { demand: true })) {
+function ownedTerminalRows(snapshot, context) {
+  const rows = new Map();
+  const assignment = assignmentView(context, { current: true });
+  if (!snapshot || snapshot.schema_version !== 2 || snapshot.assignment_key !== context.parsed.assignmentKey ||
+      JSON.stringify(snapshot.assignment_items || []) !== JSON.stringify(assignment.assignment_items)) return rows;
+  const source = snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {};
+  for (const item of context.parsed.workItems) {
+    const row = source[item.key];
+    if (isTerminalBatchItem(row)) rows.set(item.key, row);
+  }
+  return rows;
+}
+
+function ownedTerminalSnapshot(items, previous = new Map()) {
+  const rows = {};
+  for (const [key, row] of previous) if (isTerminalBatchItem(row)) rows[key] = row;
+  for (const row of items) {
+    const key = row?.work_item_ref && canonicalWorkItemKey({
+      repoKey: row.work_item_ref.repo_key,
+      repo: row.work_item_ref.repo,
+      number: row.work_item_ref.number,
+      kind: row.work_item_ref.kind,
+    });
+    if (!key) continue;
+    if (isTerminalBatchItem(row)) rows[key] = row;
+    else delete rows[key];
+  }
+  return rows;
+}
+
+async function computeOwnedBatchProgress(projectId, context, admission) {
+  const stillCurrent = () => isExactAssignmentCurrent(projectId, context.fingerprint, admission);
+  const refs = context.parsed.workItems;
+  const assignment = assignmentView(context, { current: refs.length > 0 });
+  const liveActiveBatchCleared = refs.length === 0;
+  if (refs.length === 0) {
+    const data = { ...assignment, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type: context.batchType };
+    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
+    return data;
+  }
+
+  if (REVIEW_BATCH_TYPES.has(context.batchType)) {
+    const parsedReviewItems = parseReviewItems(context.queueText, {
+      repositories: context.repositories,
+      kind: context.batchType === "pr-review" ? "pr" : "issue",
+    });
+    const byKey = new Map(parsedReviewItems.map((item) => [item.ref.key || canonicalWorkItemKey(item.ref), item]));
+    const reviewItems = refs.map((item) => byKey.get(item.key) || {
+      issue: item.number,
+      ref: item.ref || item,
+      review_state: "queued",
+      approvals: 0,
+    });
+    const ghIndex = loadGithubItemIndex(projectId);
+    const items = reviewItems.map((item) => decorateBatchRow(
+      reviewItemView(item, context.batchType, ghIndex),
+      item.ref,
+      assignment,
+    ));
+    if (!stillCurrent()) return { ...diagnosticBatchPayload(readLiveBatchContext(projectId)), current: false, owned: false };
+    const complete = reviewItems.length > 0 && reviewItems.every((item) => item.review_state === "approved");
+    const data = {
+      ...assignment,
+      items,
+      summary: summarizeReviewItems(reviewItems),
+      complete,
+      completeConfirmed: complete,
+      liveActiveBatchCleared,
+      batch_type: context.batchType,
+    };
+    writeBatchSnapshot(projectId, {
+      schema_version: 2,
+      assignment_key: assignment.assignment_key,
+      installation_id: assignment.installation_id,
+      batchNumber: assignment.batch_number,
+      assignment_attempt: assignment.assignment_attempt,
+      assignment_items: assignment.assignment_items,
+      workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
+      batch_type: context.batchType,
+      reviewItems,
+      terminalItems: {},
+    });
+    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
+    return data;
+  }
+
+  const diskSnapshot = readBatchSnapshot(projectId);
+  const terminalRows = ownedTerminalRows(diskSnapshot, context);
+  const parsedGithub = loadGithubParsed(projectId);
+  const items = await _mapLimited(refs, GH_MAX_CONCURRENT, async (item) => {
+    const ref = item.ref || item;
+    if (!stillCurrent()) return decorateBatchRow(softRetryingRow(ref.number), ref, { ...assignment, current: false, owned: false });
+    const snapshot = _graphqlCache.get(canonicalGithubRepo(ref.repo)) || null;
+    let row = snapshot ? progressFromSnapshot(snapshot, ref.number) : progressFromGithubFile(parsedGithub, ref.number, ref);
+    if (!row) row = terminalRows.get(item.key) || null;
+    if (!row && snapshot) {
+      try { row = await progressForItemRest(ref.repo, ref.number, stillCurrent); }
+      catch { row = softRetryingRow(ref.number); }
+    }
+    if (!row) row = softRetryingRow(ref.number);
+    return decorateBatchRow(row, ref, assignment);
+  });
+  if (!stillCurrent()) return { ...diagnosticBatchPayload(readLiveBatchContext(projectId)), current: false, owned: false };
+  const complete = items.every((item) => isTerminalBatchItem(item));
+  const cycle = refs
+    .map((item) => _graphqlCache.get(canonicalGithubRepo(item.repo))?.ts || null)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b)
+    .join(":") || null;
+  const completeConfirmed = evalBatchCompleteConfirmed(projectId, assignment.assignment_key, complete, cycle);
+  const data = {
+    ...assignment,
+    items,
+    summary: summarizeItems(items),
+    complete,
+    completeConfirmed,
+    liveActiveBatchCleared,
+    batch_type: context.batchType,
+  };
+  writeBatchSnapshot(projectId, {
+    schema_version: 2,
+    assignment_key: assignment.assignment_key,
+    installation_id: assignment.installation_id,
+    batchNumber: assignment.batch_number,
+    assignment_attempt: assignment.assignment_attempt,
+    assignment_items: assignment.assignment_items,
+    workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
+    batch_type: context.batchType,
+    reviewItems: [],
+    terminalItems: ownedTerminalSnapshot(items, terminalRows),
+  });
+  _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
+  return data;
+}
+
+async function computeBatchProgress(projectId, contextOrRepo, admission = projectAdmission(projectId, { demand: true })) {
   if (!admission || !isAdmissionCurrent(admission)) {
     return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
   }
+  const context = contextOrRepo && typeof contextOrRepo === "object" && contextOrRepo.parsed
+    ? contextOrRepo
+    : readLiveBatchContext(projectId);
+  if (!context) return null;
+  if (context.activated) {
+    if (context.parsed.errors.length > 0 || context.parsed.provenance !== "owned" || !context.parsed.assignmentKey) return diagnosticBatchPayload(context);
+    return computeOwnedBatchProgress(projectId, context, admission);
+  }
+  const legacyAssignment = assignmentView(context, { current: context.queueReadOk && context.parsed.workItems.length > 0 });
+  const repo = typeof contextOrRepo === "string"
+    ? contextOrRepo
+    : (context.repositories.find((entry) => entry.primary) || context.repositories[0])?.repo;
+  if (!repo) return null;
   const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
   let queueText = "";
   let queueReadOk = false;
@@ -4322,8 +4844,8 @@ async function computeBatchProgress(projectId, repo, admission = projectAdmissio
   const terminalRows = terminalItemsFromSnapshot(readBatchSnapshot(projectId), batchNumber, issueNumbers);
   if (issueNumbers.length === 0) {
     evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
-    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type };
-    _batchProgressCache.set(projectId, { ts: Date.now(), data });
+    const data = { ...legacyAssignment, batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type };
+    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
     return data;
   }
 
@@ -4339,11 +4861,15 @@ async function computeBatchProgress(projectId, repo, admission = projectAdmissio
       ? reviewItems
       : issueNumbers.map((n) => ({ issue: n, review_state: "queued", approvals: 0 }));
     const ghIndex = loadGithubItemIndex(projectId);
-    const items = ri.map((r) => reviewItemView(r, batch_type, ghIndex));
+    const refByNumber = new Map(context.parsed.workItems.map((item) => [item.number, item.ref || item]));
+    const items = ri.map((r) => {
+      const ref = refByNumber.get(r.issue);
+      return ref ? decorateBatchRow(reviewItemView(r, batch_type, ghIndex), ref, legacyAssignment) : reviewItemView(r, batch_type, ghIndex);
+    });
     const summary = summarizeReviewItems(ri);
     const complete = ri.length > 0 && ri.every((r) => r.review_state === "approved");
-    const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed: complete, liveActiveBatchCleared, batch_type };
-    _batchProgressCache.set(projectId, { ts: Date.now(), data });
+    const data = { ...legacyAssignment, batch_number: batchNumber, items, summary, complete, completeConfirmed: complete, liveActiveBatchCleared, batch_type };
+    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
     return data;
   }
 
@@ -4384,6 +4910,11 @@ async function computeBatchProgress(projectId, repo, admission = projectAdmissio
   if (!isAdmissionCurrent(admission)) {
     return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
   }
+  const legacyRefByNumber = new Map(context.parsed.workItems.map((item) => [item.number, item.ref || item]));
+  items = items.map((row) => {
+    const ref = legacyRefByNumber.get(row.issue_number);
+    return ref ? decorateBatchRow(row, ref, legacyAssignment) : row;
+  });
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
   // so batches that mix runbook/superseded closes with real PRs
@@ -4393,7 +4924,7 @@ async function computeBatchProgress(projectId, repo, admission = projectAdmissio
   // before any auto-stop consumer may act on it (never auto-stop on a single
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
-  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
+  const data = { ...legacyAssignment, batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
   writeBatchSnapshot(projectId, {
     batchNumber,
     issueNumbers: issueNumbers.slice(),
@@ -4401,7 +4932,7 @@ async function computeBatchProgress(projectId, repo, admission = projectAdmissio
     reviewItems,
     terminalItems: collectTerminalItems(items, terminalRows),
   });
-  _batchProgressCache.set(projectId, { ts: Date.now(), data });
+  _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
   return data;
 }
 
@@ -5613,6 +6144,8 @@ router.post("/api/telegram", async (req, res) => {
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
       const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
       if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
       const admission = requestedAdmission || projectAdmission(projectId);
       if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
       if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
@@ -5622,13 +6155,21 @@ router.post("/api/telegram", async (req, res) => {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
         await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort);
-        if (!isAdmissionCurrent(admission)) {
+        const admissionStale = !isAdmissionCurrent(admission);
+        const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
+        if (admissionStale || assignmentStale) {
           const stopped = await telegramBridge.stop(projectId);
           if (stopped?.ok !== true) {
             const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
             return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
           }
-          return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId, cleanup_errors: stopped?.cleanup_errors || [] });
+          return res.status(409).json({
+            ok: false,
+            error: assignmentStale ? "project assignment changed; refresh and retry" : "project is archived",
+            code: assignmentStale ? "project_assignment_changed" : "project_archived",
+            project_id: projectId,
+            cleanup_errors: stopped?.cleanup_errors || [],
+          });
         }
         emitSystemMessage(projectId, "Telegram bridge connected");
         return res.json({ ok: true, running: true });
@@ -5641,7 +6182,12 @@ router.post("/api/telegram", async (req, res) => {
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
       const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
       if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
       try {
+        if (requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, requestedAdmission)) {
+          return res.status(409).json({ ok: false, error: "project assignment changed; refresh and retry", code: "project_assignment_changed", project_id: projectId });
+        }
         const stopped = await telegramBridge.stop(projectId);
         if (stopped?.ok !== true) {
           const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
@@ -5818,6 +6364,8 @@ router.post("/api/discord", async (req, res) => {
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
       const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
       if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
       const admission = requestedAdmission || projectAdmission(projectId);
       if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
       if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
@@ -5827,9 +6375,21 @@ router.post("/api/discord", async (req, res) => {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
         await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort);
-        if (!isAdmissionCurrent(admission)) {
+        const admissionStale = !isAdmissionCurrent(admission);
+        const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
+        if (admissionStale || assignmentStale) {
           const stopped = await discordBridge.stop(projectId);
-          return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId, cleanup_errors: stopped?.cleanup_errors || [] });
+          if (stopped?.ok !== true) {
+            const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId) });
+          }
+          return res.status(409).json({
+            ok: false,
+            error: assignmentStale ? "project assignment changed; refresh and retry" : "project is archived",
+            code: assignmentStale ? "project_assignment_changed" : "project_archived",
+            project_id: projectId,
+            cleanup_errors: stopped?.cleanup_errors || [],
+          });
         }
         emitSystemMessage(projectId, "Discord bridge connected");
         return res.json({ ok: true, running: true });
@@ -5842,7 +6402,12 @@ router.post("/api/discord", async (req, res) => {
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
       const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
       if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
       try {
+        if (requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, requestedAdmission)) {
+          return res.status(409).json({ ok: false, error: "project assignment changed; refresh and retry", code: "project_assignment_changed", project_id: projectId });
+        }
         const stopped = await discordBridge.stop(projectId);
         if (stopped?.ok !== true) {
           const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
@@ -6052,6 +6617,9 @@ module.exports.RESEED_STATE_PATH = RESEED_STATE_PATH;
 // #839 (re1 follow-up): expose the shared compute path plus the caches it
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
+module.exports.readLiveBatchContext = readLiveBatchContext;
+module.exports.validateCurrentOwnedAssignment = validateCurrentOwnedAssignment;
+module.exports.canonicalWorkItemKey = canonicalWorkItemKey;
 module.exports._batchProgressCache = _batchProgressCache;
 module.exports._batchProgressRefreshes = _batchProgressRefreshes;
 module.exports._graphqlCache = _graphqlCache;

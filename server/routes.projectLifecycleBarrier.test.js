@@ -28,6 +28,7 @@ const telegramBridge = require("./bridges/telegram");
 const discordBridge = require("./bridges/discord");
 const { ProjectLifecycleError, captureProjectAdmission, revokeProjectAdmission } = require("./project-lifecycle");
 const { ConfigurationValidationError } = require("./config");
+const { ownershipKey, serializeWorkItemRefApi } = require("./work-item-ref");
 
 function request(server, method, pathname, body) {
   return new Promise((resolve, reject) => {
@@ -144,13 +145,44 @@ function request(server, method, pathname, body) {
     }
 
     const bridgeConfigPath = path.join(TMP, ".quadwork", "config.json");
-    fs.writeFileSync(bridgeConfigPath, JSON.stringify({ projects: [{
+    const bridgeInstallationId = "installation_bridge_00000001";
+    const bridgeRepositories = [{ key: "primary", repo: "Acme/Alpha", working_dir: "/tmp/alpha", primary: true }];
+    const bridgeQueue = [
+      "## Active Batch",
+      "**Batch:** 7",
+      "**Batch type:** code",
+      `**Installation ID:** ${bridgeInstallationId}`,
+      "**Assignment attempt:** bridge_attempt_a",
+      "- Acme/Alpha#42 active",
+    ].join("\n");
+    fs.mkdirSync(path.join(TMP, ".quadwork", "alpha"), { recursive: true });
+    fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
+    fs.writeFileSync(bridgeConfigPath, JSON.stringify({ installation_id: bridgeInstallationId, projects: [{
       id: "alpha",
       name: "Alpha",
       archived: false,
+      repositories: bridgeRepositories,
       telegram: { bot_token: "telegram-token", chat_id: "chat" },
       discord: { bot_token: "discord-token", channel_id: "channel" },
     }] }));
+    const bridgeParsed = router.parseActiveBatch(bridgeQueue, {
+      repositories: bridgeRepositories,
+      installationId: bridgeInstallationId,
+    });
+    const bridgeAssignment = {
+      installation_id: bridgeInstallationId,
+      batch_number: bridgeParsed.batchNumber,
+      assignment_attempt: bridgeParsed.assignmentAttempt,
+      assignment_key: bridgeParsed.assignmentKey,
+      assignment_items: bridgeParsed.workItems.map((item) => ({
+        work_item_ref: serializeWorkItemRefApi(item.ref),
+        ownership_key: ownershipKey({
+          installation_id: bridgeInstallationId,
+          batch_number: bridgeParsed.batchNumber,
+          assignment_attempt: bridgeParsed.assignmentAttempt,
+        }, item.ref),
+      })).sort((a, b) => a.ownership_key.localeCompare(b.ownership_key)),
+    };
     for (const [name, bridge] of [["telegram", telegramBridge], ["discord", discordBridge]]) {
       const original = { start: bridge.start, stop: bridge.stop, isRunning: bridge.isRunning };
       const bridgeCalls = { start: 0, stop: 0, isRunning: 0 };
@@ -163,17 +195,98 @@ function request(server, method, pathname, body) {
         response = await request(server, "POST", `/api/${name}?action=start`, {
           project_id: "alpha",
           admission_generation: currentAdmission.generation,
+          ...bridgeAssignment,
         });
         assert.equal(response.status, 200, `${name} current-generation start succeeds`);
         assert.equal(response.json.ok, true);
         response = await request(server, "POST", `/api/${name}?action=stop`, {
           project_id: "alpha",
           admission_generation: currentAdmission.generation,
+          ...bridgeAssignment,
         });
         assert.equal(response.status, 200, `${name} current-generation stop succeeds`);
         assert.equal(response.json.ok, true);
         assert.equal(bridgeCalls.start, 1);
         assert.equal(bridgeCalls.stop, 1);
+
+        const beforeMissingAssignment = { ...bridgeCalls };
+        response = await request(server, "POST", `/api/${name}?action=start`, {
+          project_id: "alpha",
+          admission_generation: currentAdmission.generation,
+        });
+        assert.equal(response.status, 409, `${name} automated start requires exact assignment identity`);
+        assert.equal(response.json.code, "project_assignment_changed");
+        assert.deepEqual(bridgeCalls, beforeMissingAssignment, `${name} missing assignment makes zero bridge calls`);
+        response = await request(server, "POST", `/api/${name}?action=stop`, {
+          project_id: "alpha",
+          admission_generation: currentAdmission.generation,
+          ...bridgeAssignment,
+          assignment_items: [],
+        });
+        assert.equal(response.status, 409, `${name} rejects a mismatched per-item ownership set`);
+        assert.equal(response.json.code, "project_assignment_changed");
+        assert.deepEqual(bridgeCalls, beforeMissingAssignment, `${name} ownership mismatch makes zero bridge calls`);
+
+        bridge.start = async () => {
+          bridgeCalls.start += 1;
+          fs.writeFileSync(
+            path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"),
+            bridgeQueue.replace("bridge_attempt_a", "bridge_attempt_b"),
+          );
+          return { ok: true };
+        };
+        response = await request(server, "POST", `/api/${name}?action=start`, {
+          project_id: "alpha",
+          admission_generation: currentAdmission.generation,
+          ...bridgeAssignment,
+        });
+        assert.equal(response.status, 409, `${name} start rejects an assignment rollover during await`);
+        assert.equal(response.json.code, "project_assignment_changed", `${name} rollover is not mislabeled archived`);
+        assert.equal(bridgeCalls.stop, 2, `${name} rolls back the just-started stale bridge`);
+        fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
+        bridge.start = async () => { bridgeCalls.start += 1; return { ok: true }; };
+
+        // Preactivation, single-repository bare queues retain the legacy
+        // compatibility-mode automation contract. They are never promoted to V2
+        // ownership, while activated/unowned queues above remain fail-closed.
+        const legacyQueue = [
+          "## Active Batch",
+          "**Batch:** 7",
+          "**Batch type:** code",
+          "- #42 active",
+        ].join("\n");
+        fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), legacyQueue);
+        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ projects: [{
+          id: "alpha",
+          name: "Alpha",
+          archived: false,
+          repo: "Acme/Alpha",
+          working_dir: "/tmp/alpha",
+          telegram: { bot_token: "telegram-token", chat_id: "chat" },
+          discord: { bot_token: "discord-token", channel_id: "channel" },
+        }] }));
+        const beforeLegacy = { ...bridgeCalls };
+        response = await request(server, "POST", `/api/${name}?action=start`, {
+          project_id: "alpha",
+          compatibility_mode: "v1",
+        });
+        assert.equal(response.status, 200, `${name} V1 admission-only automated start remains compatible`);
+        response = await request(server, "POST", `/api/${name}?action=stop`, {
+          project_id: "alpha",
+          compatibility_mode: "v1",
+        });
+        assert.equal(response.status, 200, `${name} V1 admission-only automated stop remains compatible`);
+        assert.equal(bridgeCalls.start, beforeLegacy.start + 1);
+        assert.equal(bridgeCalls.stop, beforeLegacy.stop + 1);
+        fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
+        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ installation_id: bridgeInstallationId, projects: [{
+          id: "alpha",
+          name: "Alpha",
+          archived: false,
+          repositories: bridgeRepositories,
+          telegram: { bot_token: "telegram-token", chat_id: "chat" },
+          discord: { bot_token: "discord-token", channel_id: "channel" },
+        }] }));
 
         response = await request(server, "POST", `/api/${name}?action=start`, {
           project_id: "alpha",
@@ -184,11 +297,12 @@ function request(server, method, pathname, body) {
 
         const staleAdmission = captureProjectAdmission("alpha");
         revokeProjectAdmission("alpha");
-        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ projects: [{ id: "alpha", archived: true }] }));
-        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ projects: [{
+        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ installation_id: bridgeInstallationId, projects: [{ id: "alpha", archived: true, repositories: bridgeRepositories }] }));
+        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ installation_id: bridgeInstallationId, projects: [{
           id: "alpha",
           name: "Alpha",
           archived: false,
+          repositories: bridgeRepositories,
           telegram: { bot_token: "telegram-token", chat_id: "chat" },
           discord: { bot_token: "discord-token", channel_id: "channel" },
         }] }));
@@ -197,6 +311,7 @@ function request(server, method, pathname, body) {
           response = await request(server, "POST", `/api/${name}?action=${action}`, {
             project_id: "alpha",
             admission_generation: staleAdmission.generation,
+            ...bridgeAssignment,
           });
           assert.equal(response.status, 409, `${name} stale ${action} is rejected after archive→unarchive`);
           assert.deepEqual(response.json, {
