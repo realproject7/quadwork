@@ -177,6 +177,8 @@ async function main() {
   const normal = await normalController.runWorkerScope(workerSpec());
   ok(normal.fact.reason === "normal_exit" && normal.fact.exit_code === 0 && queryCalls === 1,
     "normal worker exit is project/generation qualified and scope-query backed");
+  assert.equal(Object.hasOwn(normal.fact, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(normal.fact, "oom_observed_at"), false);
   assert.equal(normal.cgroup_oom_observation.oom_kill_count, "0");
   assert.equal(normalController.snapshot().last_cgroup_oom.oom_kill_count, "0");
 
@@ -263,6 +265,8 @@ async function main() {
   const oom = await oomController.runWorkerScope(workerSpec());
   ok(oom.fact.reason === "oom_kill" && oom.fact.signal === "SIGKILL",
     "confirmed cgroup OOM wins classification without dropping its signal");
+  assert.equal(oom.fact.oom_kill_count, "1");
+  assert.equal(oom.fact.oom_observed_at, "2026-08-31T00:30:00.000Z");
   assert.deepEqual(oom.cgroup_oom_observation, {
     project_id: "quadwork",
     generation_id: "gen-7",
@@ -283,6 +287,8 @@ async function main() {
   assert.equal(invalidTerminalOom.fact.reason, "unknown");
   assert.equal(invalidTerminalOom.fact.exit_code, null);
   assert.equal(invalidTerminalOom.fact.signal, null);
+  assert.equal(Object.hasOwn(invalidTerminalOom.fact, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(invalidTerminalOom.fact, "oom_observed_at"), false);
   assert.equal(invalidTerminalOom.cgroup_oom_observation.oom_kill_count, "1");
   ok(true, "valid OOM evidence cannot override invalid terminal metadata");
 
@@ -528,6 +534,89 @@ async function main() {
   assert.equal(retainedObservationController.snapshot().last_cgroup_oom.generation_id, "global-g1");
   assert.equal(retainedObservationController.snapshot().last_cgroup_oom.oom_kill_count, "4");
   ok(true, "current observation output is distinct from the retained latest global provenance");
+
+  const oomThenZeroController = new ResourceController({
+    executeProcess: async ({ generationId }) => generationId === "oom-zero-g1"
+      ? { code: null, signal: "SIGKILL" }
+      : { code: 0, signal: null },
+    queryScope: async ({ generationId }) => generationId === "oom-zero-g1"
+      ? observation(2, { observedAt: "2026-08-31T09:10:00+09:00" })
+      : observation(0, { observedAt: "2026-08-31T00:11:00Z" }),
+  });
+  await oomThenZeroController.runWorkerScope(workerSpec({
+    generationId: "oom-zero-g1",
+    unitName: "qw-worker-oom-zero-g1",
+  }));
+  await oomThenZeroController.runWorkerScope(workerSpec({
+    generationId: "oom-zero-g2",
+    unitName: "qw-worker-oom-zero-g2",
+  }));
+  const oomThenZero = oomThenZeroController.snapshot();
+  assert.equal(oomThenZero.last_cgroup_oom.generation_id, "oom-zero-g2");
+  assert.equal(oomThenZero.last_cgroup_oom.oom_kill_count, "0");
+  assert.equal(oomThenZero.last_cgroup_oom.observed_at, "2026-08-31T00:11:00.000Z");
+  assert.equal(oomThenZero.terminal_facts[0].reason, "oom_kill");
+  assert.equal(oomThenZero.terminal_facts[0].oom_kill_count, "2");
+  assert.equal(oomThenZero.terminal_facts[0].oom_observed_at, "2026-08-31T00:10:00.000Z");
+  assert.equal(oomThenZero.terminal_facts[1].reason, "normal_exit");
+  assert.equal(Object.hasOwn(oomThenZero.terminal_facts[1], "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(oomThenZero.terminal_facts[1], "oom_observed_at"), false);
+  const oomThenZeroJson = JSON.parse(JSON.stringify(oomThenZero));
+  assert.equal(oomThenZeroJson.terminal_facts[0].oom_kill_count, "2");
+  assert.equal(oomThenZeroJson.terminal_facts[0].oom_observed_at, "2026-08-31T00:10:00.000Z");
+  ok(true, "an OOM fact retains its own canonical authority after a later zero observation becomes global latest");
+
+  const oomThenOomController = new ResourceController({
+    executeProcess: async () => ({ code: null, signal: "SIGKILL" }),
+    queryScope: async ({ generationId }) => generationId === "oom-oom-g1"
+      ? observation(3, { observedAt: "2026-08-31T00:20:00Z" })
+      : observation(7, { observedAt: "2026-08-31T00:21:00Z" }),
+  });
+  await oomThenOomController.runWorkerScope(workerSpec({
+    generationId: "oom-oom-g1",
+    unitName: "qw-worker-oom-oom-g1",
+  }));
+  await oomThenOomController.runWorkerScope(workerSpec({
+    generationId: "oom-oom-g2",
+    unitName: "qw-worker-oom-oom-g2",
+  }));
+  const oomThenOom = oomThenOomController.snapshot();
+  assert.deepEqual(oomThenOom.terminal_facts.map((fact) => ({
+    generation_id: fact.generation_id,
+    oom_kill_count: fact.oom_kill_count,
+    oom_observed_at: fact.oom_observed_at,
+  })), [
+    { generation_id: "oom-oom-g1", oom_kill_count: "3", oom_observed_at: "2026-08-31T00:20:00.000Z" },
+    { generation_id: "oom-oom-g2", oom_kill_count: "7", oom_observed_at: "2026-08-31T00:21:00.000Z" },
+  ]);
+  assert.equal(oomThenOom.last_cgroup_oom.generation_id, "oom-oom-g2");
+  assert.equal(oomThenOom.last_cgroup_oom.oom_kill_count, "7");
+  ok(true, "successive generation OOM facts carry independent canonical provenance pairs");
+
+  const retainedFactController = new ResourceController({
+    terminalFactLimit: 1,
+    executeProcess: async ({ generationId }) => generationId === "retention-g1"
+      ? { code: null, signal: "SIGKILL" }
+      : { code: 0, signal: null },
+    queryScope: async ({ generationId }) => generationId === "retention-g1"
+      ? observation(1, { observedAt: "2026-08-31T00:30:00Z" })
+      : observation(0, { observedAt: "2026-08-31T00:31:00Z" }),
+  });
+  await retainedFactController.runWorkerScope(workerSpec({
+    generationId: "retention-g1",
+    unitName: "qw-worker-retention-g1",
+  }));
+  await retainedFactController.runWorkerScope(workerSpec({
+    generationId: "retention-g2",
+    unitName: "qw-worker-retention-g2",
+  }));
+  const retainedFact = retainedFactController.snapshot();
+  assert.equal(retainedFact.terminal_facts.length, 1);
+  assert.equal(retainedFact.terminal_facts[0].generation_id, "retention-g2");
+  assert.equal(Object.hasOwn(retainedFact.terminal_facts[0], "oom_kill_count"), false);
+  assert.equal(retainedFact.last_cgroup_oom.generation_id, "retention-g2");
+  assert.equal(retainedFact.last_cgroup_oom.oom_kill_count, "0");
+  ok(true, "terminal retention truncates whole per-fact OOM authority while global latest still advances to zero");
 
   const rawResultFlagController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: "SIGKILL", oomKilled: true }),

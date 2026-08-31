@@ -384,9 +384,17 @@ function terminalReason(processResult, scopeObservation, executionRejected = fal
   return "unknown";
 }
 
-function terminalFact({ ids, resourceClass, processResult, scopeObservation, executionRejected, now }) {
+function terminalFact({
+  ids,
+  resourceClass,
+  processResult,
+  scopeObservation,
+  oomProvenance,
+  executionRejected,
+  now,
+}) {
   const reason = terminalReason(processResult, scopeObservation, executionRejected);
-  return {
+  const fact = {
     project_id: ids.projectId,
     generation_id: ids.generationId,
     resource_class: resourceClass,
@@ -396,6 +404,16 @@ function terminalFact({ ids, resourceClass, processResult, scopeObservation, exe
     signal: processResult.signal.value,
     finished_at: timestamp(now, "finished_at"),
   };
+  // Snapshot-level last_cgroup_oom is the latest observation and can advance
+  // to another generation (including a zero counter). Bind positive OOM
+  // authority to its own terminal fact so earlier generations survive that
+  // advance and a state store can validate every retained fact independently.
+  if (reason === "oom_kill" && oomProvenance !== null &&
+      BigInt(oomProvenance.oom_kill_count) > 0n) {
+    fact.oom_kill_count = oomProvenance.oom_kill_count;
+    fact.oom_observed_at = oomProvenance.observed_at;
+  }
+  return fact;
 }
 
 function durableScopeObservation(value) {
@@ -601,15 +619,16 @@ class ResourceController {
         scopeObservation = normalizeScopeObservation(fallbackObservation);
       }
 
+      const oomProvenance = qualifyScopeObservation(ids, resourceClass, scopeObservation);
       const fact = terminalFact({
         ids,
         resourceClass,
         processResult,
         scopeObservation,
+        oomProvenance,
         executionRejected,
         now: this.now,
       });
-      const oomProvenance = qualifyScopeObservation(ids, resourceClass, scopeObservation);
       this.terminalFacts.push(fact);
       if (this.terminalFacts.length > this.terminalFactLimit) this.terminalFacts.shift();
       if (oomProvenance !== null) this.lastCgroupOom = oomProvenance;
