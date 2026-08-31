@@ -193,6 +193,16 @@ function seedConfig(config) {
 {
   assert.equal(configApi.reserveV2ProjectOwnership, undefined);
   assert.equal(configApi.releaseV2ProjectOwnership, undefined);
+  for (const subpath of [
+    "quadwork/server/project-lifecycle",
+    "quadwork/server/project-lifecycle-authority",
+  ]) {
+    assert.throws(
+      () => require(subpath),
+      (error) => error?.code === "ERR_PACKAGE_PATH_NOT_EXPORTED",
+      `${subpath} remains package-internal`,
+    );
+  }
   const before = diskBytes();
   expectCode(
     () => commitV2Configuration(

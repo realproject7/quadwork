@@ -19,6 +19,7 @@ process.on("exit", () => {
 });
 
 const {
+  cleanupLegacyAgentChattrAfterConfirmation,
   cleanupLegacyProjectAfterConfirmation,
   writeConfig,
   writeQuadWorkConfig,
@@ -88,6 +89,17 @@ assert.throws(
   (error) => error?.code === "invalid_project_id",
   "cleanup rejects a target outside the direct QuadWork project directory",
 );
+for (const reserved of [".env", "config.lock"]) {
+  const reservedPath = path.join(CONFIG_DIR, reserved);
+  fs.writeFileSync(reservedPath, "control-state", { mode: 0o600 });
+  assert.throws(
+    () => cleanupLegacyProjectAfterConfirmation(reserved),
+    (error) => error?.code === "invalid_project_id",
+    `cleanup rejects reserved control entry ${reserved}`,
+  );
+  assert.equal(fs.readFileSync(reservedPath, "utf8"), "control-state");
+  fs.unlinkSync(reservedPath);
+}
 
 assert.throws(
   () => writeQuadWorkConfig(setup("archived", "Acme/Replacement", replacementDir)),
@@ -126,5 +138,25 @@ const legacyCommitted = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
 assert.deepEqual(legacyCommitted.projects, [{ id: "keep" }]);
 assert.equal(legacyCommitted.concurrent_field, "preserve");
 assert.equal(fs.existsSync(legacyTargetDir), false);
+
+const legacyInstallDir = path.join(CONFIG_DIR, "agentchattr");
+fs.mkdirSync(legacyInstallDir, { recursive: true });
+fs.writeFileSync(path.join(legacyInstallDir, "keep.txt"), "legacy-runtime");
+assert.throws(
+  () => cleanupLegacyAgentChattrAfterConfirmation(),
+  (error) => error?.code === "legacy_agentchattr_still_required" && error.project_ids.includes("keep"),
+  "post-confirm legacy cleanup rechecks fresh project dependencies under config lock",
+);
+assert.equal(fs.readFileSync(path.join(legacyInstallDir, "keep.txt"), "utf8"), "legacy-runtime");
+
+const keepClone = path.join(CONFIG_DIR, "keep", "agentchattr");
+for (const entry of ["run.py", "config.toml", path.join(".venv", "bin", "python")]) {
+  const target = path.join(keepClone, entry);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, "ready");
+}
+const legacyCleanup = cleanupLegacyAgentChattrAfterConfirmation();
+assert.equal(legacyCleanup.removed, true);
+assert.equal(fs.existsSync(legacyInstallDir), false);
 
 console.log("bin V2 config boundary: PASS");

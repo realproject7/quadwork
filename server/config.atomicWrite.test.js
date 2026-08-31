@@ -116,6 +116,59 @@ ok(readConfig().flags.c === 11, "updateConfig sees the freshest on-disk state");
   ok(initialized.port === 8400 && fs.existsSync(CONFIG_PATH), "missing config initializes after explicit lock release");
 }
 
+// A peer may finish after the optimistic read but before this process acquires
+// config.lock. The locked re-read must migrate the peer's document, not publish
+// the stale observation.
+{
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify({
+    port: 8400,
+    projects: [{ id: "legacy-race", agents: { t1: { command: "old" } } }],
+  }, null, 2), { mode: 0o600 });
+  const peer = {
+    port: 9999,
+    concurrent_field: "preserve",
+    projects: [{ id: "legacy-race", agents: { t1: { command: "peer" } } }],
+  };
+  const origLink = fs.linkSync;
+  let injected = false;
+  fs.linkSync = (from, to) => {
+    if (!injected && to === CONFIG_LOCK_PATH) {
+      injected = true;
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(peer, null, 2), { mode: 0o600 });
+    }
+    return origLink(from, to);
+  };
+  let migrated;
+  try { migrated = readConfig(); } finally { fs.linkSync = origLink; }
+  ok(injected && migrated.port === 9999 && migrated.concurrent_field === "preserve",
+    "migration re-reads and preserves a peer transaction completed before lock acquisition");
+  const persisted = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  ok(persisted.projects[0].agents.head.command === "peer" && !persisted.projects[0].agents.t1,
+    "migration applies only to the peer's freshest locked document");
+}
+
+// The same completed-peer race on an initial ENOENT observation must preserve
+// the peer-created V1 document instead of replacing it with defaults.
+{
+  fs.unlinkSync(CONFIG_PATH);
+  const peer = { port: 7777, concurrent_field: "created-by-peer", projects: [{ id: "peer" }] };
+  const origLink = fs.linkSync;
+  let injected = false;
+  fs.linkSync = (from, to) => {
+    if (!injected && to === CONFIG_LOCK_PATH) {
+      injected = true;
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(peer, null, 2), { mode: 0o600 });
+    }
+    return origLink(from, to);
+  };
+  let observed;
+  try { observed = readConfig(); } finally { fs.linkSync = origLink; }
+  ok(injected && observed.port === 7777 && observed.concurrent_field === "created-by-peer",
+    "missing initialization preserves a peer document created before lock acquisition");
+  ok(fs.readFileSync(CONFIG_PATH, "utf8") === JSON.stringify(peer, null, 2),
+    "missing initialization performs no stale default write after the peer wins");
+}
+
 console.log(`\n${passed} passed`);
 console.log("server/config.atomicWrite.test.js: all assertions passed");
 process.exit(0);

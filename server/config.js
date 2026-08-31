@@ -633,7 +633,7 @@ function sanitizeOperatorName(value) {
 // installs transition to the canonical head/dev/re1/re2 slugs.
 const AGENT_KEY_MAP = { t1: "head", t2a: "re1", t2b: "re2", t3: "dev", reviewer1: "re1", reviewer2: "re2" };
 
-function migrateAgentKeys(config, options = {}) {
+function migrateAgentKeysInMemory(config) {
   let changed = false;
   if (config.projects) {
     for (const project of config.projects) {
@@ -647,10 +647,7 @@ function migrateAgentKeys(config, options = {}) {
       }
     }
   }
-  if (changed && options.persist !== false) {
-    writeConfig(config);
-  }
-  return config;
+  return changed;
 }
 
 function readConfigDocument() {
@@ -672,15 +669,26 @@ function readConfigDocument() {
 }
 
 function readConfig() {
-  const { config, missing } = readConfigDocument();
-  if (missing) {
-    // Config file doesn't exist — preserve the historical startup behavior.
-    const dir = path.dirname(CONFIG_PATH);
-    if (!fs.existsSync(dir)) ensureSecureDir(dir);
-    writeConfig(cloneConfigurationValue(DEFAULT_CONFIG));
+  const observed = readConfigDocument();
+  const observedConfig = cloneConfigurationValue(observed.config);
+  const observedNeedsMigration = migrateAgentKeysInMemory(observedConfig);
+  if (!observed.missing && !observedNeedsMigration) return observedConfig;
+
+  // Missing initialization and read-time migrations are read-modify-write
+  // operations. Re-read after acquiring config.lock so a peer transaction that
+  // completed after the optimistic observation is never overwritten.
+  return withConfigWriteLock(() => {
+    const fresh = readConfigDocument();
+    const config = cloneConfigurationValue(fresh.config);
+    const changed = migrateAgentKeysInMemory(config);
+    if (fresh.missing) {
+      ensureSecureDir(path.dirname(CONFIG_PATH));
+      writeConfig(config);
+    } else if (changed) {
+      writeConfig(config);
+    }
     return config;
-  }
-  return migrateAgentKeys(config);
+  });
 }
 
 // #1038: strict, side-effect-free runtime resource policy access. This path is
@@ -873,7 +881,7 @@ function updateConfigInternal(mutator, options = {}) {
     const { config: cfg, missing } = readConfigDocument();
     // Apply the old agent-key migration in memory. A failed mutator must not
     // trigger readConfig()'s eager legacy write before the candidate validates.
-    migrateAgentKeys(cfg, { persist: false });
+    migrateAgentKeysInMemory(cfg);
     const previousConfig = cloneConfigurationValue(cfg);
     mutator(cfg);
     if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));

@@ -6,6 +6,13 @@
     "quadwork": "./bin/quadwork.js",
     "quadwork-mcp-operator": "./server/mcp-operator.js"
   },
+  "exports": {
+    "./server/project-lifecycle": null,
+    "./server/project-lifecycle.js": null,
+    "./server/project-lifecycle-authority": null,
+    "./server/project-lifecycle-authority.js": null,
+    "./*": "./*"
+  },
   "files": [
     "bin/",
     "server/",

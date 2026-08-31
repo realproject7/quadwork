@@ -536,11 +536,11 @@ const CONFIG_MERGE_EXCLUDED = new Set([
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {
-    const disk = readConfigFile();
-    const activated = Object.prototype.hasOwnProperty.call(disk, "installation_id");
-    const affectsProjects = activated && Array.isArray(body.projects);
     const mutator = (cfg) => {
-      const previousTopology = affectsProjects ? genericV2ProjectTopology(cfg) : null;
+      const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
+      const previousTopology = activated && Array.isArray(body.projects)
+        ? genericV2ProjectTopology(cfg)
+        : null;
       if (Object.prototype.hasOwnProperty.call(body, "installation_id") &&
           (!Object.prototype.hasOwnProperty.call(cfg, "installation_id") ||
            body.installation_id !== cfg.installation_id)) {
@@ -577,8 +577,7 @@ router.patch("/api/config", (req, res) => {
       }
       if (previousTopology) assertGenericV2ProjectTopology(previousTopology, cfg);
     };
-    if (affectsProjects) commitV2Configuration(mutator);
-    else updateConfig(mutator);
+    updateConfig(mutator);
   } catch (err) {
     if (sendV2ConfigurationError(res, err)) return;
     if (err.code === "QW_INSTALLATION_ID_ROTATION") {

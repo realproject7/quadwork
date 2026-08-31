@@ -7,8 +7,10 @@ const os = require("os");
 const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 const {
+  readConfig: readSharedConfig,
   readRuntimeResources,
   updateConfig,
+  withSerializedConfigWrite,
   commitV2Configuration,
   commitConfigurationSnapshot,
 } = require("../server/config");
@@ -277,8 +279,22 @@ function writeConfig(config) {
 }
 
 function projectRuntimeDirectory(projectId) {
+  const reservedEntries = new Set([
+    ".env",
+    "agentchattr",
+    "config.json",
+    "config.lock",
+    "reseed-state.json",
+    "reviewer-token",
+    "server.pid",
+  ]);
   if (typeof projectId !== "string" || !projectId || projectId === "." || projectId === ".." || path.basename(projectId) !== projectId) {
     const error = new Error("project id must name one direct QuadWork config directory");
+    error.code = "invalid_project_id";
+    throw error;
+  }
+  if (reservedEntries.has(projectId)) {
+    const error = new Error("project cleanup target is a reserved QuadWork control entry");
     error.code = "invalid_project_id";
     throw error;
   }
@@ -304,6 +320,12 @@ function cleanupLegacyProjectAfterConfirmation(projectId) {
     }
     const freshIdx = (fresh.projects || []).findIndex((project) => project.id === projectId);
     if (fs.existsSync(projectDir)) {
+      const target = fs.lstatSync(projectDir);
+      if (!target.isDirectory() || target.isSymbolicLink()) {
+        const error = new Error("project cleanup target must be a real project directory");
+        error.code = "invalid_project_cleanup_target";
+        throw error;
+      }
       fs.rmSync(projectDir, { recursive: true, force: true });
       removedDirectory = true;
     }
@@ -313,6 +335,42 @@ function cleanupLegacyProjectAfterConfirmation(projectId) {
     }
   });
   return { projectDir, removedDirectory, removedConfigEntry };
+}
+
+function legacyAgentChattrDependents(config) {
+  const stillDepends = [];
+  for (const project of config.projects || []) {
+    if (!project.id) continue;
+    const dir = project.agentchattr_dir || path.join(CONFIG_DIR, project.id, "agentchattr");
+    const ready = fs.existsSync(path.join(dir, "run.py")) &&
+      fs.existsSync(path.join(dir, ".venv", "bin", "python")) &&
+      fs.existsSync(path.join(dir, "config.toml"));
+    if (!ready) stillDepends.push(project.id);
+  }
+  return stillDepends;
+}
+
+function cleanupLegacyAgentChattrAfterConfirmation() {
+  const legacyDir = path.join(CONFIG_DIR, "agentchattr");
+  return withSerializedConfigWrite(() => {
+    const fresh = readSharedConfig();
+    const stillDepends = legacyAgentChattrDependents(fresh);
+    if (stillDepends.length > 0) {
+      const error = new Error("one or more projects still depend on the legacy AgentChattr install");
+      error.code = "legacy_agentchattr_still_required";
+      error.project_ids = stillDepends;
+      throw error;
+    }
+    if (!fs.existsSync(legacyDir)) return { legacyDir, removed: false };
+    const target = fs.lstatSync(legacyDir);
+    if (!target.isDirectory() || target.isSymbolicLink()) {
+      const error = new Error("legacy AgentChattr cleanup target must be a real directory");
+      error.code = "invalid_legacy_cleanup_target";
+      throw error;
+    }
+    fs.rmSync(legacyDir, { recursive: true, force: true });
+    return { legacyDir, removed: true };
+  });
 }
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────
@@ -1243,15 +1301,7 @@ async function cmdCleanup() {
       // Refuse if any project still depends on the legacy install — i.e.
       // any project without its own working per-project clone (run.py +
       // venv + config.toml at ROOT). Mirrors #186's resolution ladder.
-      const stillDepends = [];
-      for (const p of config.projects || []) {
-        if (!p.id) continue;
-        const dir = p.agentchattr_dir || path.join(CONFIG_DIR, p.id, "agentchattr");
-        const ok = fs.existsSync(path.join(dir, "run.py")) &&
-                   fs.existsSync(path.join(dir, ".venv", "bin", "python")) &&
-                   fs.existsSync(path.join(dir, "config.toml"));
-        if (!ok) stillDepends.push(p.id);
-      }
+      const stillDepends = legacyAgentChattrDependents(config);
       if (stillDepends.length > 0) {
         fail(`Refusing to remove legacy install — these projects still depend on it:`);
         for (const id of stillDepends) console.log(`    - ${id}`);
@@ -1264,8 +1314,19 @@ async function cmdCleanup() {
       const confirm = await askYN(rl, `Delete ${legacyDir}?`, false);
       if (!confirm) { warn("Aborted."); return; }
 
-      try { fs.rmSync(legacyDir, { recursive: true, force: true }); ok(`Removed ${legacyDir}`); }
-      catch (e) { fail(`Could not remove ${legacyDir}: ${e.message}`); return; }
+      try {
+        const cleanup = cleanupLegacyAgentChattrAfterConfirmation();
+        if (cleanup.removed) ok(`Removed ${cleanup.legacyDir}`);
+      } catch (error) {
+        if (error?.code === "legacy_agentchattr_still_required") {
+          fail("Refusing to remove legacy install — these projects still depend on it:");
+          for (const id of error.project_ids) console.log(`    - ${id}`);
+          warn(`Run 'npx quadwork start' to migrate them (#188), then re-run cleanup --legacy.`);
+        } else {
+          fail(`Could not remove ${legacyDir}: ${error.message}`);
+        }
+        return;
+      }
     }
   } finally {
     rl.close();
@@ -1745,6 +1806,7 @@ module.exports = {
   runResourceInstallCommand,
   runResourcesCommand,
   cleanupLegacyProjectAfterConfirmation,
+  cleanupLegacyAgentChattrAfterConfirmation,
   writeConfig,
   writeQuadWorkConfig,
 };
