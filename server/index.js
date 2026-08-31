@@ -1689,6 +1689,9 @@ ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via t
 
 function bridgeAssignmentBody(projectId, admission, batchState) {
   const body = { project_id: projectId, admission_generation: admission?.generation };
+  if (batchState?.mode === "v1" || batchState?.mode === "v2") {
+    body.compatibility_mode = batchState.mode;
+  }
   if (batchState && batchState.authoritative && batchState.identity) {
     Object.assign(body, batchState.identity);
   }
