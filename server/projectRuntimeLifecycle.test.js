@@ -57,7 +57,20 @@ const ownedProgress = {
   assignment_key: "assignment-7-2",
   owned: true,
   current: true,
-  items: [{ repo_key: "primary", number: 42 }],
+  items: [{
+    installation_id: "installation-runtime-0001",
+    batch_number: 7,
+    assignment_attempt: "attempt_0002",
+    provenance: "owned",
+    assignment_key: "assignment-7-2",
+    owned: true,
+    current: true,
+    repo_key: "primary",
+    repo: "Owner/A",
+    number: 42,
+    kind: "issue",
+    work_item_ref: { repo_key: "primary", repo: "Owner/A", number: 42, kind: "issue" },
+  }],
   completeConfirmed: false,
 };
 const ownedActive = { ...ownedProgress, active: true };
@@ -83,6 +96,17 @@ assert.equal(runtime.ownedBatchAutomationState(
   ownedProgress,
   { ...ownedActive, current: false },
 ).authoritative, false, "historical progress cannot become current authority");
+assert.equal(runtime.ownedBatchAutomationState(
+  { ...ownedProgress, items: [{ ...ownedProgress.items[0], assignment_attempt: "attempt_0001" }] },
+  ownedActive,
+).authoritative, false, "one stale row rejects the whole automation transition");
+assert.equal(runtime.ownedBatchAutomationState(
+  { ...ownedProgress, items: [{
+    ...ownedProgress.items[0],
+    work_item_ref: { repo_key: "other", repo: "Owner/B", number: 42, kind: "issue" },
+  }] },
+  ownedActive,
+).authoritative, false, "a row/ref repository mismatch rejects the whole automation transition");
 
 const originalCancelBackground = routes.cancelProjectBackground;
 

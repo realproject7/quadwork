@@ -1802,6 +1802,19 @@ function ownedBatchFingerprint(payload) {
   ].join("::");
 }
 
+function ownedBatchRowMatches(row, assignment) {
+  if (!row || typeof row !== "object" || !assignment) return false;
+  if (ownedBatchFingerprint(row) !== ownedBatchFingerprint(assignment)) return false;
+  const ref = row.work_item_ref;
+  if (!ref || typeof ref !== "object" || Array.isArray(ref)) return false;
+  return typeof row.repo_key === "string" && row.repo_key !== "" &&
+    typeof row.repo === "string" && row.repo !== "" &&
+    Number.isSafeInteger(row.number) && row.number > 0 &&
+    (row.kind === "issue" || row.kind === "pr") &&
+    ref.repo_key === row.repo_key && ref.repo === row.repo &&
+    ref.number === row.number && ref.kind === row.kind;
+}
+
 function ownedBatchAutomationState(progress, active) {
   const progressFingerprint = ownedBatchFingerprint(progress);
   const activeFingerprint = ownedBatchFingerprint(active);
@@ -1809,6 +1822,9 @@ function ownedBatchAutomationState(progress, active) {
     return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
   }
   const hasItems = Array.isArray(progress.items) && progress.items.length > 0;
+  if (hasItems && progress.items.some((row) => !ownedBatchRowMatches(row, progress))) {
+    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
+  }
   const clearedByOperator = !!progress.liveActiveBatchCleared;
   const shouldStop = !!progress.completeConfirmed || clearedByOperator;
   return {
@@ -3201,6 +3217,7 @@ module.exports = {
   autoStopBridges,
   autoStopPollingTick,
   ownedBatchFingerprint,
+  ownedBatchRowMatches,
   ownedBatchAutomationState,
   registerCaffeinateOwner,
   caffeinateStatus,
