@@ -431,6 +431,82 @@ transient `--collect` scopes; do not install a persistent unit or copy candidate
 properties into production. A report is evidence only when every matrix check
 is `passed`; this guide does not claim that such a PASS has occurred.
 
+### Resource upgrade and rollback
+
+Treat a package upgrade, a resource-policy change, and a staging-proof change
+as three separate operator actions. A successful proof belongs to the exact
+reviewed QuadWork source/package candidate and disposable-host record; do not
+carry it forward to a different version or policy.
+
+Before an upgrade, record the currently installed package version and run the
+read-only checks without redirecting them into the QuadWork state directory:
+
+```bash
+npm list -g quadwork --depth=0
+quadwork resources preflight --json
+quadwork resources temp-install --json
+pm2 describe quadwork
+```
+
+Keep the exact previously accepted `runtime_resources` JSON, its package
+version, and the single-quoted `TMPDIR` used by `~/start-quadwork.sh` in the
+operator change record. Do not use a config-directory wildcard or infer a
+rollback policy from a `.recovery` filename.
+
+Install only the explicitly approved version, then repeat the policy and temp
+proposal/apply sequence above if the accepted policy changes. Every apply must
+use the SHA-256 token printed by its immediately preceding proposal; a token
+from an older file or version is invalid. Update the wrapper's single-quoted
+`TMPDIR` only when the newly accepted policy has a different exact
+`temp_root`:
+
+```bash
+npm install -g quadwork@'<approved-version>'
+quadwork resources configure \
+  --policy-file "$HOME/quadwork-resource-policy.json" \
+  --json
+quadwork resources temp-install --json
+pm2 restart quadwork
+pm2 save
+```
+
+The commands shown above deliberately stop at proposal mode. If the proposal
+diff is intended, run the documented `--apply --accept-sha256 '<exact-token>'`
+form separately, inspect its JSON recovery fields, and only then restart. After
+restart, validate the exact accepted root and the loopback resource endpoint:
+
+```bash
+TEMP_ROOT='/exact/accepted/runtime_resources.temp_root'
+stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$TEMP_ROOT"
+findmnt --noheadings --output TARGET,FSTYPE,OPTIONS --target "$TEMP_ROOT"
+quadwork resources preflight --json
+curl --fail --silent --show-error 'http://127.0.0.1:8400/api/resources'
+```
+
+Rollback is also explicit. Reinstall the exact prior package version, restore
+the prior policy through a fresh token-bound `resources configure` proposal and
+apply (never by overwriting `config.json`), verify or create only its accepted
+temp root through `resources temp-install`, restore the wrapper's exact prior
+single-quoted `TMPDIR`, and restart:
+
+```bash
+npm install -g quadwork@'<previous-version>'
+quadwork resources configure \
+  --policy-file "$HOME/quadwork-resource-policy.previous.json" \
+  --json
+quadwork resources temp-install --json
+pm2 restart quadwork
+pm2 save
+```
+
+Again, proposal mode makes no resource-policy/temp mutation; use only the fresh
+printed tokens in separately reviewed apply commands. A rollback does not
+delete the newer temp root, exchange probes, previous-config recovery entry, or
+any worker data. Inspect only exact reported recovery basenames with the
+non-dereferencing procedure above. Containment remains unavailable until the
+rolled-back exact source and policy have their own complete disposable-staging
+PASS; production receives read-only verification only.
+
 ---
 
 ## Remote Access

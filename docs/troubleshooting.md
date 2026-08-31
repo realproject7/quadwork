@@ -351,3 +351,10 @@ from the disposable run record, stop only those units, wait for their process
 trees to exit, and compare the recorded API/global OOM counters. The candidate
 flags remain `candidate_pending_staging`; there is no automatic install/repair
 or supported-production fallback in this command.
+
+For package or resource-policy regressions, use the VPS guide's
+**Resource upgrade and rollback** procedure. Rollback means reinstalling one
+exact prior package version and re-accepting one exact prior policy through a
+fresh proposal token. Do not copy a guessed `.recovery` entry over
+`config.json`, reuse an old acceptance token, delete a newer temp root, or treat
+an earlier staging PASS as evidence for a different package/policy candidate.

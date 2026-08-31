@@ -46,9 +46,15 @@ const diskStatfs = () => ({ type: 0xEF53n, bavail: 20_000n, bsize: 1024n * 1024n
   assert.match(installGuide, /recovery_scope: operation_created_entry_unlocated/);
   assert.match(installGuide, /ls -lai -- '\/exact\/parent\/from-the-accepted-temp_root'/);
   assert.match(installGuide, /Never use `\*`/);
+  assert.match(installGuide, /### Resource upgrade and rollback/);
+  assert.match(installGuide, /npm install -g quadwork@'<approved-version>'/);
+  assert.match(installGuide, /npm install -g quadwork@'<previous-version>'/);
+  assert.match(installGuide, /do not[\s\S]*carry it forward to a different version or policy/);
   assert.match(troubleshooting, /stat --printf='%f\|%u\|%a\|%h\|%d\|%i\\n'/);
   assert.match(troubleshooting, /do not select a cleanup target by wildcard/);
   assert.match(troubleshooting, /temp-install` does not clean this legacy/);
+  assert.match(troubleshooting, /Resource upgrade and rollback/);
+  assert.match(troubleshooting, /Do not copy a guessed `\.recovery` entry/);
 
   function activeShellSnippets(markdown) {
     const snippets = [];
