@@ -7,11 +7,7 @@
     "quadwork-mcp-operator": "./server/mcp-operator.js"
   },
   "exports": {
-    "./server/project-lifecycle": null,
-    "./server/project-lifecycle.js": null,
-    "./server/project-lifecycle-authority": null,
-    "./server/project-lifecycle-authority.js": null,
-    "./*": "./*"
+    "./package.json": "./package.json"
   },
   "files": [
     "bin/",

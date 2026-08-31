@@ -195,7 +195,9 @@ function seedConfig(config) {
   assert.equal(configApi.releaseV2ProjectOwnership, undefined);
   for (const subpath of [
     "quadwork/server/project-lifecycle",
+    "quadwork/server/project-LIFECYCLE.js",
     "quadwork/server/project-lifecycle-authority",
+    "quadwork/server/project-lifecycle-authority.JS",
   ]) {
     assert.throws(
       () => require(subpath),
