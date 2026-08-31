@@ -579,6 +579,11 @@ server {
     listen 80;
     server_name app.example.com;
 
+    # Host-capacity facts are operator-local even when the dashboard is public.
+    location = /api/resources {
+        return 404;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8400;
         proxy_http_version 1.1;
@@ -594,6 +599,9 @@ server {
 ```
 
 `proxy_read_timeout 86400` and WebSocket headers are required for live agent terminal connections.
+Keep the exact `/api/resources` exclusion when adding Step 10 authentication or
+when Certbot rewrites this server block; basic auth does not make host-capacity
+facts part of the public dashboard surface.
 
 ```bash
 sudo ln -sf /etc/nginx/sites-available/app.example.com /etc/nginx/sites-enabled/
