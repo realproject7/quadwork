@@ -16,6 +16,7 @@ process.on("exit", () => {
 const {
   ResourceInstallError,
   recoveryEntriesForError,
+  recoveryScopeForError,
   policyProposal,
   applyPolicy,
   tempInstallProposal,
@@ -28,6 +29,25 @@ const configDir = path.join(tempHome, ".quadwork");
 const configPath = path.join(configDir, "config.json");
 const policyPath = path.join(tempHome, "resource-policy.json");
 const diskStatfs = () => ({ type: 0xEF53n, bavail: 20_000n, bsize: 1024n * 1024n });
+
+// The Ubuntu recovery guide uses numeric mode-type bits, so both empty and
+// nonempty regular probe/config files pass the same check. Recovery commands
+// remain exact-basename only and document the unlocated-inode scope.
+{
+  const installGuide = fs.readFileSync(path.join(__dirname, "..", "docs", "install-vps.md"), "utf8");
+  const troubleshooting = fs.readFileSync(path.join(__dirname, "..", "docs", "troubleshooting.md"), "utf8");
+  assert.match(installGuide, /stat --printf='%f\|%u\|%a\|%h\|%d\|%i\\n'/);
+  assert.match(installGuide, /0x\$MODE_HEX & 0170000\)\) -eq 0100000/);
+  assert.match(installGuide, /0x\$MODE_HEX & 0170000\)\) -eq 0040000/);
+  assert.equal(installGuide.includes("stat --printf='%F|"), false);
+  assert.match(installGuide, /recovery_scope: operation_created_entry_unlocated/);
+  assert.match(installGuide, /ls -lai -- '\/exact\/parent\/from-the-accepted-temp_root'/);
+  assert.match(installGuide, /Never use `\*`/);
+  assert.match(troubleshooting, /stat --printf='%f\|%u\|%a\|%h\|%d\|%i\\n'/);
+  assert.match(troubleshooting, /do not select a cleanup target by wildcard/);
+  assert.equal(parseInt("81a4", 16) & 0o170000, 0o100000, "regular-file type bits");
+  assert.equal(parseInt("41c0", 16) & 0o170000, 0o040000, "directory type bits");
+}
 
 function policy(overrides = {}) {
   return {
@@ -594,8 +614,9 @@ reset(undefined, policy());
 
 // mkdir can create its target and still throw through a filesystem wrapper.
 // Creation uncertainty is established before the call, so the new inode is
-// preserved and its exact basename is reported. A throw that leaves no entry
-// retains the precise ordinary install failure and reports no recovery inode.
+// preserved and its exact basename is reported. Once an injectable mkdir has
+// been attempted, even a throw that leaves no accepted-name entry remains a
+// cleanup-required refusal because the created inode may have moved elsewhere.
 {
   const proposal = tempInstallProposal({ statfs: diskStatfs });
   const createThenThrowFs = new Proxy(fs, {
@@ -623,6 +644,7 @@ reset(undefined, policy());
     code("temp_install_failed_cleanup_required"),
   );
   assert.deepEqual(recoveryEntriesForError(createdError), [path.basename(policy().temp_root)]);
+  assert.equal(recoveryScopeForError(createdError), "operation_created_entry_unlocated");
   assert.equal(fs.lstatSync(policy().temp_root).isDirectory(), true);
   fs.rmdirSync(policy().temp_root);
 
@@ -648,10 +670,49 @@ reset(undefined, policy());
         rootHandleFactory: pathRootHandle,
       },
     ),
-    code("temp_install_failed"),
+    code("temp_install_failed_cleanup_required"),
   );
   assert.deepEqual(recoveryEntriesForError(noCreateError), []);
+  assert.equal(recoveryScopeForError(noCreateError), "operation_created_entry_unlocated");
   assert.equal(fs.existsSync(policy().temp_root), false);
+}
+
+// ENOENT after mkdir throws cannot clear creation uncertainty. The wrapper can
+// move the operation-created inode to an unknowable sibling before surfacing
+// EIO; the refusal reports no invented basename and exposes a bounded scope.
+{
+  const proposal = tempInstallProposal({ statfs: diskStatfs });
+  const displaced = path.join(configDir, "unlocated-operation-created-root");
+  const createMoveThenThrowFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === "mkdirSync") return (targetPath, options) => {
+        fs.mkdirSync(targetPath, options);
+        fs.renameSync(targetPath, displaced);
+        const error = new Error("injected post-move mkdir failure");
+        error.code = "EIO";
+        throw error;
+      };
+      const member = Reflect.get(target, property);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  const unlocatedError = captureError(
+    () => applyTempInstall(
+      { acceptanceSha256: proposal.acceptance.sha256 },
+      {
+        platform: "darwin",
+        fsImpl: createMoveThenThrowFs,
+        statfs: diskStatfs,
+        rootHandleFactory: pathRootHandle,
+      },
+    ),
+    code("temp_install_failed_cleanup_required"),
+  );
+  assert.deepEqual(recoveryEntriesForError(unlocatedError), []);
+  assert.equal(recoveryScopeForError(unlocatedError), "operation_created_entry_unlocated");
+  assert.equal(fs.existsSync(policy().temp_root), false);
+  assert.equal(fs.lstatSync(displaced).isDirectory(), true);
+  fs.rmdirSync(displaced);
 }
 
 // A would-be quarantine-name replacement cannot authorize deletion because
@@ -676,7 +737,7 @@ reset(undefined, policy());
       return typeof member === "function" ? member.bind(target) : member;
     },
   });
-  assert.throws(
+  const preservedError = captureError(
     () => applyTempInstall(
       { acceptanceSha256: proposal.acceptance.sha256 },
       {
@@ -689,6 +750,8 @@ reset(undefined, policy());
     ),
     code("temp_install_failed_cleanup_required"),
   );
+  assert.deepEqual(recoveryEntriesForError(preservedError), [path.basename(policy().temp_root)]);
+  assert.equal(recoveryScopeForError(preservedError), null);
   const victimAfter = fs.lstatSync(victim);
   assert.equal(victimAfter.dev, victimIdentity.dev);
   assert.equal(victimAfter.ino, victimIdentity.ino);
@@ -724,7 +787,7 @@ reset(undefined, policy());
   fs.mkdirSync(victim, { mode: 0o700 });
   fs.chmodSync(victim, 0o700);
   const victimIdentity = fs.lstatSync(victim);
-  assert.throws(
+  const replacementError = captureError(
     () => applyTempInstall(
       { acceptanceSha256: proposal.acceptance.sha256 },
       {
@@ -739,6 +802,8 @@ reset(undefined, policy());
     ),
     code("temp_install_failed_cleanup_required"),
   );
+  assert.deepEqual(recoveryEntriesForError(replacementError), [path.basename(policy().temp_root)]);
+  assert.equal(recoveryScopeForError(replacementError), "operation_created_entry_unlocated");
   const preserved = fs.lstatSync(policy().temp_root);
   assert.equal(preserved.dev, victimIdentity.dev);
   assert.equal(preserved.ino, victimIdentity.ino);

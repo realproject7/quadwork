@@ -15,7 +15,13 @@ process.on("exit", () => {
 });
 
 const { runResourcesCommand } = require("../bin/quadwork");
-const { ResourceInstallError, policyProposal, applyPolicy } = require("./resource-install");
+const {
+  ResourceInstallError,
+  policyProposal,
+  applyPolicy,
+  tempInstallProposal,
+  applyTempInstall,
+} = require("./resource-install");
 const { DEFAULT_RUNTIME_RESOURCE_PROPOSAL } = require("./resource-policy");
 
 const configDir = path.join(tempHome, ".quadwork");
@@ -190,11 +196,73 @@ for (const args of [
     tempInstallProposal() {
       const error = new ResourceInstallError("temp_root_low_capacity", "safe");
       error.recovery_entries = ["secret-token"];
+      error.recovery_scope = "operation_created_entry_unlocated";
       throw error;
     },
   }), 1);
   assert.equal(Object.hasOwn(JSON.parse(untrustedOut.value()), "recovery_entries"), false);
+  assert.equal(Object.hasOwn(JSON.parse(untrustedOut.value()), "recovery_scope"), false);
   assert(!untrustedOut.value().includes("secret-token"));
+
+  const diskStatfs = () => ({ type: 0xEF53n, bavail: 20_000n, bsize: 1024n * 1024n });
+  const tempProposal = tempInstallProposal({ statfs: diskStatfs });
+  const displaced = path.join(configDir, "cli-unlocated-created-root");
+  const createMoveThenThrowFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === "mkdirSync") return (targetPath, mkdirOptions) => {
+        fs.mkdirSync(targetPath, mkdirOptions);
+        fs.renameSync(targetPath, displaced);
+        const error = new Error("PRIVATE moved root /private/temp");
+        error.code = "EIO";
+        throw error;
+      };
+      const member = Reflect.get(target, property);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  let scopedError;
+  try {
+    applyTempInstall(
+      { acceptanceSha256: tempProposal.acceptance.sha256 },
+      {
+        platform: "darwin",
+        fsImpl: createMoveThenThrowFs,
+        statfs: diskStatfs,
+        rootHandleFactory() { throw new Error("must not reach"); },
+      },
+    );
+  } catch (error) {
+    scopedError = error;
+  }
+  assert(scopedError instanceof ResourceInstallError);
+
+  const scopedOut = sink();
+  assert.equal(runResourcesCommand([
+    "temp-install", "--apply", "--accept-sha256", tempProposal.acceptance.sha256, "--json",
+  ], {
+    stdout: scopedOut.stream,
+    stderr: sink().stream,
+    applyTempInstall() { throw scopedError; },
+  }), 1);
+  assert.deepEqual(JSON.parse(scopedOut.value()), {
+    ok: false,
+    status: "refused",
+    reason: "temp_install_failed_cleanup_required",
+    recovery_scope: "operation_created_entry_unlocated",
+  });
+  assert(!scopedOut.value().includes("PRIVATE"));
+
+  const scopedHuman = sink();
+  assert.equal(runResourcesCommand([
+    "temp-install", "--apply", "--accept-sha256", tempProposal.acceptance.sha256,
+  ], {
+    stdout: sink().stream,
+    stderr: scopedHuman.stream,
+    applyTempInstall() { throw scopedError; },
+  }), 1);
+  assert.match(scopedHuman.value(), /Recovery scope: operation_created_entry_unlocated/);
+  assert(!scopedHuman.value().includes("PRIVATE"));
+  fs.rmdirSync(displaced);
 }
 
 // Temp plan and apply dispatch preserve the exact accepted token and output

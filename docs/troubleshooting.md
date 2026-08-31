@@ -284,11 +284,16 @@ failed create it intentionally performs no path-based cleanup; a
 replacement entries were preserved for explicit inspection and recovery. Its
 JSON `recovery_entries` contains exact basenames only. Use the accepted
 `temp_root` parent, stop all writers, and run the non-dereferencing Ubuntu
-`stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY"` twice for one quoted reported
-basename. Record and compare type, UID, mode, link count, device, and inode
+`stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY"` twice for one quoted reported
+basename. Mask the hexadecimal mode with `0170000` to verify its file type;
+this works for both empty and nonempty files. Record and compare type bits,
+UID, mode, link count, device, and inode
 before any manual move or removal. Never use a wildcard, prefix match,
 `find -delete`, or remove a different entry; see the VPS install guide for the
-complete no-glob recovery sequence.
+complete no-glob recovery sequence. A refusal with
+`recovery_scope: operation_created_entry_unlocated` means no exact remaining
+basename can be reported. Stop all writers and inspect the accepted parent, but
+do not select a cleanup target by wildcard, prefix, timestamp, or guesswork.
 
 - `proof_refused` means the disposable-host acknowledgement or the separate
   `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has

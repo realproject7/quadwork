@@ -295,14 +295,15 @@ ENTRY='.config.json.resource-install-12345-0123456789abcdef01234567.recovery'
 [ -n "$ENTRY" ] && [ "$ENTRY" != '.' ] && [ "$ENTRY" != '..' ] && \
   [ "$(basename -- "$ENTRY")" = "$ENTRY" ] || { printf '%s\n' 'invalid recovery basename' >&2; exit 1; }
 OWNER_UID=$(id -u) || exit 1
-BEFORE=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+BEFORE=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
 printf 'recovery record: %s\n' "$BEFORE"
-IFS='|' read -r TYPE ENTRY_UID MODE NLINK DEV INO <<EOF
+IFS='|' read -r MODE_HEX ENTRY_UID MODE NLINK DEV INO <<EOF
 $BEFORE
 EOF
-[ "$TYPE" = 'regular file' ] && [ "$ENTRY_UID" = "$OWNER_UID" ] && \
+[ $((0x$MODE_HEX & 0170000)) -eq 0100000 ] && \
+  [ "$ENTRY_UID" = "$OWNER_UID" ] && \
   [ "$MODE" = '600' ] && [ "$NLINK" = '1' ] || exit 1
-AFTER=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+AFTER=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
 [ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'recovery inode changed; stop' >&2; exit 1; }
 ```
 
@@ -336,7 +337,16 @@ leaves the operation-created root and any substituted entries for explicit
 operator recovery. The refusal JSON reports the exact target basename in
 `recovery_entries`. Use the accepted `temp_root` parent and that one basename,
 never a wildcard; record and recheck the non-dereferenced Ubuntu facts before
-any manual action:
+any manual action. If no exact basename remains knowable, JSON instead reports
+`recovery_scope: operation_created_entry_unlocated`; stop all writers and
+inspect the accepted parent as a whole, but do not infer a deletion target from
+a prefix, timestamp, inode order, or other heuristic:
+
+```bash
+ls -lai -- '/exact/parent/from-the-accepted-temp_root'
+```
+
+When an exact basename is reported, use this per-entry sequence:
 
 ```bash
 TEMP_PARENT='/exact/parent/from-the-accepted-temp_root'
@@ -344,9 +354,15 @@ ENTRY='exact-reported-temp-root-basename'
 cd -- "$TEMP_PARENT" || exit 1
 [ -n "$ENTRY" ] && [ "$ENTRY" != '.' ] && [ "$ENTRY" != '..' ] && \
   [ "$(basename -- "$ENTRY")" = "$ENTRY" ] || { printf '%s\n' 'invalid recovery basename' >&2; exit 1; }
-BEFORE=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+OWNER_UID=$(id -u) || exit 1
+BEFORE=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
 printf 'temp recovery record: %s\n' "$BEFORE"
-AFTER=$(stat --printf='%F|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+IFS='|' read -r MODE_HEX ENTRY_UID MODE NLINK DEV INO <<EOF
+$BEFORE
+EOF
+[ $((0x$MODE_HEX & 0170000)) -eq 0040000 ] && \
+  [ "$ENTRY_UID" = "$OWNER_UID" ] && [ "$MODE" = '700' ] || exit 1
+AFTER=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
 [ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'temp recovery inode changed; stop' >&2; exit 1; }
 ```
 

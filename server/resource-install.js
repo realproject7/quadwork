@@ -22,8 +22,10 @@ const POLICY_FILE_MAX_BYTES = 64 * 1024;
 const CONFIG_FILE_MAX_BYTES = 4 * 1024 * 1024;
 const ACCEPTANCE_RE = /^[a-f0-9]{64}$/;
 const RECOVERY_ENTRIES = Symbol("resourceInstallRecoveryEntries");
+const RECOVERY_SCOPE = Symbol("resourceInstallRecoveryScope");
 const MAX_RECOVERY_ENTRIES = 8;
 const MAX_RECOVERY_ENTRY_BYTES = 255;
+const OPERATION_CREATED_ENTRY_UNLOCATED = "operation_created_entry_unlocated";
 
 class ResourceInstallError extends Error {
   constructor(code, message) {
@@ -59,12 +61,22 @@ function normalizeRecoveryEntries(entries) {
   return Object.freeze(accepted);
 }
 
-function createRecoveryError(code, message, entries) {
+function normalizeRecoveryScope(scope) {
+  return scope === OPERATION_CREATED_ENTRY_UNLOCATED ? scope : null;
+}
+
+function createRecoveryError(code, message, entries, scope = null) {
   const error = new ResourceInstallError(code, message);
   Object.defineProperty(error, RECOVERY_ENTRIES, {
     configurable: false,
     enumerable: false,
     value: normalizeRecoveryEntries(entries),
+    writable: false,
+  });
+  Object.defineProperty(error, RECOVERY_SCOPE, {
+    configurable: false,
+    enumerable: false,
+    value: normalizeRecoveryScope(scope),
     writable: false,
   });
   return error;
@@ -77,6 +89,11 @@ function recoveryFailure(code, message, entries) {
 function recoveryEntriesForError(error) {
   if (!(error instanceof ResourceInstallError)) return Object.freeze([]);
   return normalizeRecoveryEntries(error[RECOVERY_ENTRIES]);
+}
+
+function recoveryScopeForError(error) {
+  if (!(error instanceof ResourceInstallError)) return null;
+  return normalizeRecoveryScope(error[RECOVERY_SCOPE]);
 }
 
 function expectedUid(options) {
@@ -649,6 +666,34 @@ function tempInstallProposal(options = {}) {
   return buildTempInstallProposal(options).proposal;
 }
 
+function tempRecoveryMetadata(fsImpl, target, ensureRoot, entryName, createdIdentity) {
+  try {
+    const namedParent = fsImpl.lstatSync(target.parent);
+    if (!sameOwnedNode(namedParent, target.parentIdentity)) {
+      return Object.freeze({
+        entries: Object.freeze([]),
+        scope: OPERATION_CREATED_ENTRY_UNLOCATED,
+      });
+    }
+    const namedEntry = fsImpl.lstatSync(ensureRoot);
+    if (!createdIdentity || !sameOwnedNode(namedEntry, createdIdentity)) {
+      return Object.freeze({
+        entries: Object.freeze([entryName]),
+        scope: OPERATION_CREATED_ENTRY_UNLOCATED,
+      });
+    }
+    return Object.freeze({ entries: Object.freeze([entryName]), scope: null });
+  } catch {
+    // Once mkdir has been attempted, ENOENT proves only that the accepted name
+    // is currently absent. The operation-created inode may have been moved to
+    // an unknowable sibling before a filesystem wrapper surfaced its error.
+    return Object.freeze({
+      entries: Object.freeze([]),
+      scope: OPERATION_CREATED_ENTRY_UNLOCATED,
+    });
+  }
+}
+
 function applyTempInstall({ acceptanceSha256 }, options = {}) {
   if (!ACCEPTANCE_RE.test(acceptanceSha256 || "")) fail("acceptance_invalid", "an exact lowercase SHA-256 acceptance token is required");
   const built = buildTempInstallProposal(options);
@@ -668,7 +713,7 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
   const entryName = path.basename(proposal.plan.temp_root);
   let ensureRoot = proposal.plan.temp_root;
   let createdIdentity = null;
-  let creationUncertain = false;
+  let mkdirAttempted = false;
   let expectedRootIdentity = target.rootIdentity;
   let failure = null;
   try {
@@ -713,19 +758,18 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
           fail("temp_root_create_unverified", "resource temp root absence could not be verified before create");
         }
       }
-      // A filesystem wrapper can create the directory and still throw. Mark
-      // uncertainty before mkdir and clear it only after an anchored ENOENT or
-      // after the created inode has been captured and verified.
-      creationUncertain = true;
+      // A filesystem wrapper can create the directory, move that inode to an
+      // unknowable sibling, and then throw. From the instant mkdir is called,
+      // no later pathname ENOENT can prove that the operation created nothing.
+      mkdirAttempted = true;
       try {
         fsImpl.mkdirSync(ensureRoot, { recursive: false, mode: 0o700 });
       } catch (err) {
-        try {
-          fsImpl.lstatSync(ensureRoot);
-        } catch (inspectErr) {
-          if (inspectErr && inspectErr.code === "ENOENT") creationUncertain = false;
-        }
-        if (!creationUncertain && err && err.code === "EEXIST") {
+        // The native EEXIST result is the one trusted post-attempt outcome that
+        // proves mkdir itself created nothing. Injectable filesystem wrappers
+        // are not allowed to mint that proof.
+        if (fsImpl === fs && err && err.code === "EEXIST") {
+          mkdirAttempted = false;
           fail("temp_root_changed", "resource temp root appeared before apply");
         }
         throw err;
@@ -739,7 +783,6 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
       }
       createdIdentity = created;
       expectedRootIdentity = created;
-      creationUncertain = false;
     } else {
       const existing = (options.fsImpl || fs).lstatSync(ensureRoot);
       if (!sameOwnedNode(existing, expectedRootIdentity)
@@ -783,11 +826,19 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
     failure = err instanceof ResourceInstallError
       ? err
       : new ResourceInstallError("temp_install_failed", "resource temp root could not be installed securely");
-    if (creationUncertain || createdIdentity) {
+    if (mkdirAttempted || createdIdentity) {
+      const recovery = tempRecoveryMetadata(
+        options.fsImpl || fs,
+        target,
+        ensureRoot,
+        entryName,
+        createdIdentity,
+      );
       failure = createRecoveryError(
         "temp_install_failed_cleanup_required",
-        "resource temp installation failed and the created root was preserved for explicit recovery",
-        [entryName],
+        "resource temp installation may have created an entry and requires explicit recovery",
+        recovery.entries,
+        recovery.scope,
       );
     }
   } finally {
@@ -806,6 +857,7 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
 module.exports = {
   ResourceInstallError,
   recoveryEntriesForError,
+  recoveryScopeForError,
   canonicalJson,
   sha256,
   policyProposal,

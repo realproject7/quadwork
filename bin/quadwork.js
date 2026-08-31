@@ -11,6 +11,7 @@ const { createReadOnlyProbes, runResourcePreflight } = require("../server/resour
 const {
   ResourceInstallError,
   recoveryEntriesForError,
+  recoveryScopeForError,
   policyProposal,
   applyPolicy,
   tempInstallProposal,
@@ -1304,12 +1305,13 @@ function renderResourceInstall(result) {
   return `${lines.join("\n")}\n`;
 }
 
-function renderResourceInstallFailure(code, recoveryEntries = []) {
+function renderResourceInstallFailure(code, recoveryEntries = [], recoveryScope = null) {
   const lines = [`QuadWork resource operation refused: ${code}`];
   if (recoveryEntries.length > 0) {
     lines.push("Recovery entries (exact basenames; never use wildcards):");
     for (const entry of recoveryEntries) lines.push(`  - ${entry}`);
   }
+  if (recoveryScope) lines.push(`Recovery scope: ${recoveryScope}`);
   return `${lines.join("\n")}\n`;
 }
 
@@ -1339,14 +1341,16 @@ function runResourceInstallCommand(subcommand, args, options = {}) {
       ? err.code
       : "resource_operation_failed";
     const recoveryEntries = recoveryEntriesForError(err);
+    const recoveryScope = recoveryScopeForError(err);
     const failure = Object.freeze({
       ok: false,
       status: "refused",
       reason,
       ...(recoveryEntries.length > 0 ? { recovery_entries: recoveryEntries } : {}),
+      ...(recoveryScope ? { recovery_scope: recoveryScope } : {}),
     });
     if (parsed.json) stdout.write(`${JSON.stringify(failure)}\n`);
-    else stderr.write(renderResourceInstallFailure(reason, recoveryEntries));
+    else stderr.write(renderResourceInstallFailure(reason, recoveryEntries, recoveryScope));
     return 1;
   }
   stdout.write(parsed.json ? `${JSON.stringify(result)}\n` : renderResourceInstall(result));
