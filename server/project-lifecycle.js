@@ -1,6 +1,7 @@
 const {
   readConfig,
   commitV2Configuration,
+  validateV2Configuration,
 } = require("./config");
 
 const admissionGenerations = new Map();
@@ -30,6 +31,26 @@ function requireProjectId(projectId) {
 function projectFromConfig(config, projectId) {
   if (!config || !Array.isArray(config.projects)) return null;
   return config.projects.find((project) => project && project.id === projectId) || null;
+}
+
+function unarchiveCandidate(projectId, config, validateConfiguration = validateV2Configuration) {
+  requireProjectId(projectId);
+  const project = projectFromConfig(config, projectId);
+  if (!project) throw lifecycleError("unknown_project", projectId, "project is not configured", 404);
+  if (Object.prototype.hasOwnProperty.call(project, "archived") && typeof project.archived !== "boolean") {
+    throw lifecycleError("invalid_project_archive_state", projectId, "project archive state is invalid", 503);
+  }
+  if (project.archived !== true) return { already_unarchived: true };
+
+  // Validate the active ownership candidate before touching any remaining
+  // archived runtime. A repository/path collision must leave both the durable
+  // barrier and the stopped-resource set byte-for-byte unchanged.
+  const candidate = {
+    ...config,
+    projects: config.projects.map((entry) => entry === project ? { ...entry, archived: false } : entry),
+  };
+  validateConfiguration(candidate, { previousConfig: config });
+  return { already_unarchived: false };
 }
 
 function admissionState(projectId, config, options = {}) {
@@ -186,6 +207,8 @@ function createProjectLifecycleController(options = {}) {
   const commitConfiguration = options.commitV2Configuration || commitV2Configuration;
   const cleanupProject = options.cleanupProject;
   const revokeAdmission = options.revokeProjectAdmission || revokeProjectAdmission;
+  const readConfiguration = options.readConfig || readConfig;
+  const validateConfiguration = options.validateV2Configuration || validateV2Configuration;
 
   function serialize(projectId, operation) {
     requireProjectId(projectId);
@@ -251,14 +274,49 @@ function createProjectLifecycleController(options = {}) {
 
   function unarchiveProject(projectId) {
     return serialize(projectId, async () => {
-      const wasArchived = await commitArchived(projectId, false);
+      let current;
+      try {
+        current = readConfiguration();
+      } catch {
+        throw lifecycleError("project_config_unavailable", projectId, "project configuration is unavailable", 503);
+      }
+      const preflight = unarchiveCandidate(projectId, current, validateConfiguration);
+      if (preflight.already_unarchived) {
+        return {
+          ok: true,
+          project_id: projectId,
+          archived: false,
+          already_unarchived: true,
+          admission_generation: currentAdmissionGeneration(projectId),
+          resources: {},
+          cleanup_errors: [],
+        };
+      }
+
+      // A prior archive may have returned partial cleanup. Re-run the same
+      // idempotent quiesce path while the persisted admission barrier is still
+      // set; only a truthful all-clear may make the project eligible again.
+      const cleanup = await cleanupArchivedProject(projectId);
+      if (!cleanup.ok) {
+        return {
+          ok: false,
+          project_id: projectId,
+          archived: true,
+          already_unarchived: false,
+          admission_generation: currentAdmissionGeneration(projectId),
+          resources: cleanup.resources,
+          cleanup_errors: cleanup.cleanup_errors,
+        };
+      }
+
+      await commitArchived(projectId, false);
       return {
         ok: true,
         project_id: projectId,
         archived: false,
-        already_unarchived: wasArchived === false,
+        already_unarchived: false,
         admission_generation: currentAdmissionGeneration(projectId),
-        resources: {},
+        resources: cleanup.resources,
         cleanup_errors: [],
       };
     });
@@ -289,5 +347,6 @@ module.exports = {
   captureProjectAdmission,
   isAdmissionCurrent,
   revokeProjectAdmission,
+  unarchiveCandidate,
   createProjectLifecycleController,
 };

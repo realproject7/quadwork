@@ -6,6 +6,7 @@ const {
   captureProjectAdmission,
   isAdmissionCurrent,
   revokeProjectAdmission,
+  unarchiveCandidate,
   createProjectLifecycleController,
 } = require("./project-lifecycle");
 
@@ -142,13 +143,44 @@ async function rejectsCode(fn, code) {
   let cleanupCalls = 0;
   const restoreController = createProjectLifecycleController({
     commitV2Configuration: restoreStore.commit,
-    cleanupProject: async () => { cleanupCalls += 1; return { ok: true }; },
+    readConfig: restoreStore.read,
+    validateV2Configuration: () => {},
+    cleanupProject: async () => { cleanupCalls += 1; return { ok: true, resources: { sessions: 0 } }; },
   });
   const restored = await restoreController.unarchiveProject("restore");
   assert.equal(restored.ok, true);
   assert.equal(restored.archived, false);
-  assert.equal(cleanupCalls, 0, "unarchive starts no runtime work");
+  assert.equal(cleanupCalls, 1, "unarchive verifies the archived runtime is fully quiesced");
+  assert.deepEqual(restored.resources, { sessions: 0 });
   assert.equal(restoreStore.read().projects[0].archived, false);
+
+  const dirtyRestoreStore = inMemoryCommit(config(project("dirty-restore", true)));
+  const dirtyRestore = createProjectLifecycleController({
+    commitV2Configuration: dirtyRestoreStore.commit,
+    readConfig: dirtyRestoreStore.read,
+    validateV2Configuration: () => {},
+    cleanupProject: async () => ({
+      ok: false,
+      resources: { sessions: 1 },
+      cleanup_errors: [{ resource: "pty", code: "kill_failed", message: "retry" }],
+    }),
+  });
+  const heldRestore = await dirtyRestore.unarchiveProject("dirty-restore");
+  assert.equal(heldRestore.ok, false);
+  assert.equal(heldRestore.archived, true, "partial cleanup keeps the admission barrier set");
+  assert.equal(dirtyRestoreStore.read().projects[0].archived, true);
+
+  const alreadyOpenStore = inMemoryCommit(config(project("already-open", false)));
+  let alreadyOpenCleanupCalls = 0;
+  const alreadyOpen = createProjectLifecycleController({
+    commitV2Configuration: alreadyOpenStore.commit,
+    readConfig: alreadyOpenStore.read,
+    validateV2Configuration: () => {},
+    cleanupProject: async () => { alreadyOpenCleanupCalls += 1; return { ok: true }; },
+  });
+  const alreadyRestored = await alreadyOpen.unarchiveProject("already-open");
+  assert.equal(alreadyRestored.already_unarchived, true);
+  assert.equal(alreadyOpenCleanupCalls, 0, "idempotent unarchive never stops a live project");
 
   const collisionStore = inMemoryCommit(config(project("owner"), project("collision", true)));
   const beforeCollision = JSON.stringify(collisionStore.read());
@@ -161,7 +193,14 @@ async function rejectsCode(fn, code) {
       error.owner_project_id = "owner";
       throw error;
     },
-    cleanupProject: async () => ({ ok: true }),
+    readConfig: collisionStore.read,
+    validateV2Configuration: () => {
+      const error = new Error("owned by owner");
+      error.code = "repository_owned_by_active_project";
+      error.owner_project_id = "owner";
+      throw error;
+    },
+    cleanupProject: async () => { throw new Error("collision must fail before cleanup"); },
   });
   await assert.rejects(() => collisionController.unarchiveProject("collision"), (error) => {
     assert.equal(error.code, "repository_owned_by_active_project");
@@ -169,6 +208,11 @@ async function rejectsCode(fn, code) {
     return true;
   });
   assert.equal(JSON.stringify(collisionStore.read()), beforeCollision);
+
+  assert.throws(
+    () => unarchiveCandidate("bad", config({ id: "bad", archived: "true", repositories: [] }), () => {}),
+    (error) => error.code === "invalid_project_archive_state",
+  );
 
   const removeStore = inMemoryCommit(config(project("remove")));
   let allowRemove = false;
@@ -202,6 +246,8 @@ async function rejectsCode(fn, code) {
   });
   const serialRestoreController = createProjectLifecycleController({
     commitV2Configuration: serialStore.commit,
+    readConfig: serialStore.read,
+    validateV2Configuration: () => {},
     cleanupProject: async () => ({ ok: true }),
   });
   const first = serialArchiveController.archiveProject("serial");
