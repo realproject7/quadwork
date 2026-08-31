@@ -10,6 +10,8 @@ const { createWorkerUnitBase, scopeUnitFromBase } = require("./resource-unit");
 const {
   MIB_BYTES,
   UINT64_MAX,
+  ResourceRuntimePersistenceError,
+  createResourceRuntimeProofAuthority,
   buildResourceRuntimeSnapshot,
   persistResourceRuntimeSnapshot,
 } = require("./resource-runtime-snapshot");
@@ -169,12 +171,12 @@ function controller(identity, configured = policy(), overrides = {}) {
       generation_id: identity.generationId,
       resource_class: "worker",
       unit_name: identity.unitBase,
+      started_at: "2026-08-31T03:59:00.000Z",
       limits: {
         memory_high_mib: configured.worker.memory_high_mib,
         memory_max_mib: configured.worker.memory_max_mib,
         swap_max_mib: configured.worker.swap_max_mib,
       },
-      started_at: "2026-08-31T03:59:00.000Z",
     }],
     last_cgroup_oom: {
       project_id: identity.projectId,
@@ -199,6 +201,7 @@ function fixture(overrides = {}) {
     apiObservation: apiObservation(configured),
     controlObservation: controlObservation(configured),
     workerObservations: [workerObservation(identity, configured)],
+    proofAuthority: createResourceRuntimeProofAuthority({ apiUnitName: "pm2-quadwork.service" }),
     ...overrides,
   };
 }
@@ -237,14 +240,34 @@ function fixture(overrides = {}) {
     requested_worker_scopes: 1,
   });
   assert.equal(snapshot.resource_usage.worker.memory_current_bytes, (MIB_BYTES + 1n).toString(10));
+  assert.equal(snapshot.resource_usage.worker.memory_peak_bytes, undefined);
+  assert.equal(snapshot.resource_usage.worker.sum_of_scope_peaks_bytes, (3n * MIB_BYTES).toString(10));
+  assert.equal(snapshot.resource_usage.api.unit_name, "pm2-quadwork.service");
+  assert.deepEqual(snapshot.worker_scopes, [{
+    project_id: "quadwork",
+    generation_id: "generation-7",
+    unit_base: input.controllerSnapshot.active_scopes[0].unit_name,
+    unit_name: input.workerObservations[0].unit_name,
+    observed_at: OBSERVED_AT,
+    usage: {
+      memory_current_bytes: (MIB_BYTES + 1n).toString(10),
+      memory_peak_bytes: (3n * MIB_BYTES).toString(10),
+      memory_swap_current_bytes: "0",
+    },
+    effective_limits: input.workerObservations[0].limits,
+  }]);
   assert.equal(snapshot.effective_limits.api.memory_low.bytes, (512n * MIB_BYTES).toString(10));
   assert.equal(snapshot.effective_limits.control.memory_high.kind, "infinite");
   assert.equal(snapshot.effective_limits.worker.observed_scopes, 1);
   assert.deepEqual(snapshot.last_cgroup_oom, input.controllerSnapshot.last_cgroup_oom);
   assert.equal(snapshot.terminal_facts[0].reason, "oom_kill");
+  assert.equal(snapshot.terminal_facts[0].oom_kill_count, "1");
+  assert.equal(snapshot.terminal_facts[0].oom_observed_at, OBSERVED_AT);
   assert.equal(Object.isFrozen(snapshot), true);
   assert.equal(Object.isFrozen(snapshot.pressure), true);
   assert.equal(Object.isFrozen(snapshot.resource_usage), true);
+  assert.equal(Object.isFrozen(snapshot.worker_scopes), true);
+  assert.equal(Object.isFrozen(snapshot.worker_scopes[0]), true);
   assert.equal(createResourceSnapshot(snapshot).status, "ready", "runtime output is ResourceStateStore-compatible");
   const json = JSON.stringify(snapshot);
   assert.equal(json.includes(DEFAULT_RUNTIME_RESOURCE_PROPOSAL.temp_root), false);
@@ -263,6 +286,37 @@ function fixture(overrides = {}) {
     reason: "staging_proof_pending",
   });
   assert.notEqual(snapshot.status, "ready", "read-only staging evidence never flips the controller candidate");
+}
+
+// Raw preflight/controller claims cannot mint staging authority. Only the
+// module-owned opaque capability can promote the same evidence to ready.
+for (const proofAuthority of [undefined, null, {}, "supported", { apiUnitName: "pm2-quadwork.service" }]) {
+  const input = fixture({ proofAuthority });
+  const snapshot = buildResourceRuntimeSnapshot(input);
+  assert.equal(snapshot.status, "candidate_pending_staging");
+  assert.equal(snapshot.pressure.reason, "proof_authority_unavailable");
+}
+
+{
+  const input = fixture();
+  input.apiObservation = { ...input.apiObservation, self: false };
+  assert.equal(buildResourceRuntimeSnapshot(input).status, "ready",
+    "API self authority comes from the opaque exact-unit capability, not a raw self flag");
+
+  input.proofAuthority = createResourceRuntimeProofAuthority({ apiUnitName: "other-api.service" });
+  const mismatch = buildResourceRuntimeSnapshot(input);
+  assert.equal(mismatch.status, "containment_unavailable");
+  assert.equal(mismatch.pressure.reason, "api_self_identity_unproven");
+
+  assert.throws(() => createResourceRuntimeProofAuthority({
+    apiUnitName: `${createWorkerUnitBase({ projectId: "quadwork", generationId: "g" })}.scope`,
+  }), (error) => error.code === "QW_INVALID_RESOURCE_PROOF_AUTHORITY");
+  const hostileAuthorityInput = Object.defineProperty({}, "apiUnitName", {
+    get() { throw new Error("PROOF-AUTHORITY-SECRET"); },
+  });
+  assert.throws(() => createResourceRuntimeProofAuthority(hostileAuthorityInput), (error) =>
+    error.code === "QW_INVALID_RESOURCE_PROOF_AUTHORITY"
+      && !error.message.includes("SECRET"));
 }
 
 {
@@ -319,7 +373,9 @@ for (const [index, mutate] of [
   assert.equal(snapshot.status, "containment_unavailable");
   assert.equal(snapshot.pressure.reason, index === 4 || index === 7
     ? "controller_snapshot_invalid"
-    : "runtime_observation_inconsistent");
+    : index === 5 || index === 6
+      ? "api_self_identity_unproven"
+      : "runtime_observation_inconsistent");
   assert.equal(JSON.stringify(snapshot).includes("secret /path"), false);
 }
 
@@ -377,13 +433,128 @@ for (const [index, mutate] of [
     ],
   };
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.last_cgroup_oom, null, "stale provenance cannot remain the qualified latest observation");
-  assert.equal(snapshot.terminal_facts[0].reason, "unknown", "stale global provenance cannot authorize an old OOM fact");
+  assert.equal(snapshot.last_cgroup_oom.generation_id, old.generationId,
+    "latest qualified cgroup observation is independent of terminal-fact tail order");
+  assert.equal(snapshot.terminal_facts[0].reason, "oom_kill",
+    "matching legacy provenance upgrades an old OOM fact with inline evidence");
+  assert.equal(snapshot.terminal_facts[0].oom_kill_count, "2");
   assert.equal(snapshot.terminal_facts[1].reason, "normal_exit");
 
   input.controllerSnapshot.last_cgroup_oom = { oom_kill_count: "7", observed_at: OBSERVED_AT };
   const legacy = buildResourceRuntimeSnapshot(input);
   assert.equal(legacy.last_cgroup_oom, null, "legacy unqualified OOM data is rejected");
+}
+
+{
+  const input = fixture();
+  const old = workerIdentity("quadwork", "history-old");
+  const current = workerIdentity();
+  input.controllerSnapshot = {
+    ...input.controllerSnapshot,
+    last_cgroup_oom: {
+      project_id: current.projectId,
+      generation_id: current.generationId,
+      resource_class: "worker",
+      unit_name: current.unitBase,
+      oom_kill_count: "0",
+      observed_at: OBSERVED_AT,
+    },
+    terminal_facts: [
+      terminalFact(old, {
+        oom_kill_count: "7",
+        oom_observed_at: "2026-08-31T03:00:00.000Z",
+      }),
+      terminalFact(current, { reason: "normal_exit", exit_code: 0, signal: null }),
+    ],
+  };
+  const afterZero = buildResourceRuntimeSnapshot(input);
+  assert.deepEqual(afterZero.terminal_facts.map((fact) => fact.reason), ["oom_kill", "normal_exit"]);
+  assert.equal(afterZero.terminal_facts[0].oom_kill_count, "7");
+  assert.equal(afterZero.last_cgroup_oom.generation_id, current.generationId);
+  assert.equal(afterZero.last_cgroup_oom.oom_kill_count, "0");
+  assert.deepEqual(createResourceSnapshot(afterZero).terminal_facts, afterZero.terminal_facts);
+
+  const newest = workerIdentity("quadwork", "history-new");
+  input.controllerSnapshot.last_cgroup_oom = {
+    project_id: newest.projectId,
+    generation_id: newest.generationId,
+    resource_class: "worker",
+    unit_name: newest.unitBase,
+    oom_kill_count: "9",
+    observed_at: "2026-08-31T03:30:00.000Z",
+  };
+  input.controllerSnapshot.terminal_facts = [
+    input.controllerSnapshot.terminal_facts[0],
+    terminalFact(newest, {
+      finished_at: "2026-08-31T03:30:01.000Z",
+      oom_kill_count: "9",
+      oom_observed_at: "2026-08-31T03:30:00.000Z",
+    }),
+  ];
+  const afterOom = buildResourceRuntimeSnapshot(input);
+  assert.deepEqual(afterOom.terminal_facts.map((fact) => [fact.reason, fact.oom_kill_count]), [
+    ["oom_kill", "7"],
+    ["oom_kill", "9"],
+  ]);
+  assert.equal(afterOom.last_cgroup_oom.generation_id, newest.generationId);
+}
+
+{
+  const input = fixture();
+  const first = workerIdentity();
+  const second = workerIdentity("another-project", "another-generation");
+  input.preflightReport = runResourcePreflight({
+    runtimeResources: input.runtimeResources,
+    probes: probes({ activeScopes: () => 2 }),
+  });
+  input.controllerSnapshot = controller(first, input.runtimeResources, {
+    active_scopes: [first, second].map((identity) => ({
+      project_id: identity.projectId,
+      generation_id: identity.generationId,
+      resource_class: "worker",
+      unit_name: identity.unitBase,
+      started_at: "2026-08-31T03:59:00.000Z",
+      limits: {
+        memory_high_mib: input.runtimeResources.worker.memory_high_mib,
+        memory_max_mib: input.runtimeResources.worker.memory_max_mib,
+        swap_max_mib: input.runtimeResources.worker.swap_max_mib,
+      },
+    })),
+  });
+  input.workerObservations = [
+    workerObservation(second, input.runtimeResources, { current: 2n * MIB_BYTES, peak: 4n * MIB_BYTES }),
+    workerObservation(first, input.runtimeResources, { current: MIB_BYTES, peak: 3n * MIB_BYTES }),
+  ];
+  const snapshot = buildResourceRuntimeSnapshot(input);
+  assert.equal(snapshot.status, "ready");
+  assert.deepEqual(snapshot.worker_scopes.map((scope) => [scope.project_id, scope.generation_id]), [
+    [first.projectId, first.generationId],
+    [second.projectId, second.generationId],
+  ], "per-worker output is bounded and follows the controller's qualified order");
+  assert.deepEqual(snapshot.worker_scopes.map((scope) => scope.usage.memory_peak_bytes), [
+    (3n * MIB_BYTES).toString(10),
+    (4n * MIB_BYTES).toString(10),
+  ]);
+  assert.equal(snapshot.resource_usage.worker.sum_of_scope_peaks_bytes, (7n * MIB_BYTES).toString(10));
+  assert.equal(Object.hasOwn(snapshot.resource_usage.worker, "memory_peak_bytes"), false);
+}
+
+{
+  for (const [mutate, expectedReason] of [
+    [(input) => { input.workerObservations[0].observed_at = "2026-02-29T00:00:00Z"; }, "runtime_observation_inconsistent"],
+    [(input) => { input.controllerSnapshot.active_scopes[0].started_at = "2026-04-31T00:00:00+09:00"; }, "controller_snapshot_invalid"],
+  ]) {
+    const input = fixture();
+    mutate(input);
+    const snapshot = buildResourceRuntimeSnapshot(input);
+    assert.equal(snapshot.status, "containment_unavailable");
+    assert.equal(snapshot.pressure.reason, expectedReason);
+  }
+  const input = fixture();
+  input.workerObservations[0].observed_at = "2024-02-29T23:59:59.123-14:00";
+  const leap = buildResourceRuntimeSnapshot(input);
+  assert.equal(leap.status, "ready");
+  assert.equal(leap.worker_scopes[0].observed_at, "2024-03-01T13:59:59.123Z");
 }
 
 {
@@ -416,6 +587,7 @@ for (const [index, mutate] of [
       generation_id: identity.generationId,
       resource_class: "worker",
       unit_name: identity.unitBase,
+      started_at: "2026-08-31T03:59:00.000Z",
       limits: {
         memory_high_mib: configured.worker.memory_high_mib,
         memory_max_mib: configured.worker.memory_max_mib,
@@ -431,6 +603,7 @@ for (const [index, mutate] of [
     controllerSnapshot,
     apiObservation: apiObservation(configured, { current: 0n, peak: 0n }),
     controlObservation: controlObservation(configured, { current: 0n, peak: 0n }),
+    proofAuthority: createResourceRuntimeProofAuthority({ apiUnitName: "pm2-quadwork.service" }),
     workerObservations: [first, second].map((identity) => workerObservation(identity, configured, {
       current: hugeBytes,
       peak: hugeBytes,
@@ -452,9 +625,23 @@ for (const [index, mutate] of [
   assert.equal(savedValue, snapshot);
   assert.equal(persisted.status, "ready");
   assert.equal(Object.hasOwn(persisted, "pressure"), false, "state persistence keeps only its allowlist");
-  assert.throws(() => persistResourceRuntimeSnapshot({}, snapshot), /store\.save/);
+  assert.throws(() => persistResourceRuntimeSnapshot({}, snapshot), (error) =>
+    error instanceof ResourceRuntimePersistenceError
+      && error.code === "QW_RESOURCE_PERSISTENCE_INVALID_STORE"
+      && !error.message.includes("SECRET"));
   const hostileStore = Object.defineProperty({}, "save", { get() { throw new Error("STORE-SECRET"); } });
-  assert.throws(() => persistResourceRuntimeSnapshot(hostileStore, snapshot), /store\.save/);
+  assert.throws(() => persistResourceRuntimeSnapshot(hostileStore, snapshot), (error) =>
+    error instanceof ResourceRuntimePersistenceError
+      && error.code === "QW_RESOURCE_PERSISTENCE_INVALID_STORE"
+      && !error.message.includes("STORE-SECRET"));
+  const callableProxy = new Proxy(function save() {}, {
+    apply() { throw new Error("CALLABLE-PROXY-SECRET /private/path"); },
+  });
+  assert.throws(() => persistResourceRuntimeSnapshot({ save: callableProxy }, snapshot), (error) =>
+    error instanceof ResourceRuntimePersistenceError
+      && error.code === "QW_RESOURCE_PERSISTENCE_FAILED"
+      && !error.message.includes("SECRET")
+      && !JSON.stringify(error).includes("private/path"));
 }
 
 console.log("resource-runtime-snapshot.test.js: all assertions passed");

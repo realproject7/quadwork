@@ -15,12 +15,48 @@ const INVALID = Symbol("invalid runtime resource field");
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const UNIT_BASE_RE = /^quadwork-worker-[a-f0-9]{40}$/;
 const SYSTEMD_UNIT_RE = /^[a-z][a-z0-9.-]{0,127}$/;
+const API_UNIT_RE = /^[a-z][a-z0-9.-]{0,127}\.(?:service|scope)$/;
+const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
+const PROOF_AUTHORITIES = new WeakMap();
 const PREFLIGHT_FAILURES = new Set([
   "invalid_resource_policy",
   "containment_unavailable",
   "temp_unavailable",
   "capacity_exhausted",
 ]);
+
+class ResourceRuntimePersistenceError extends Error {
+  constructor(code) {
+    super(code === "QW_RESOURCE_PERSISTENCE_FAILED"
+      ? "resource snapshot persistence failed"
+      : "resource snapshot persistence store is invalid");
+    this.name = "ResourceRuntimePersistenceError";
+    this.code = code;
+  }
+}
+
+function createResourceRuntimeProofAuthority(options = {}) {
+  const apiUnitName = safeGet(options, "apiUnitName");
+  if (typeof apiUnitName !== "string"
+    || !API_UNIT_RE.test(apiUnitName)
+    || apiUnitName.startsWith("quadwork-worker-")
+    || apiUnitName.startsWith("quadwork-control-")) {
+    const error = new TypeError("apiUnitName must be an exact systemd service or scope unit");
+    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
+    throw error;
+  }
+  // The object deliberately carries no serializable claim. Only this module's
+  // private WeakMap can recognize it; configuration, HTTP input, preflight
+  // strings, and lookalike objects cannot mint staging authority.
+  const authority = Object.freeze(Object.create(null));
+  PROOF_AUTHORITIES.set(authority, Object.freeze({ apiUnitName }));
+  return authority;
+}
+
+function proofAuthorityMetadata(value) {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return null;
+  return PROOF_AUTHORITIES.get(value) || null;
+}
 
 function safeGet(value, key) {
   if ((typeof value !== "object" && typeof value !== "function") || value === null) return INVALID;
@@ -94,6 +130,21 @@ function uint64(value) {
 
 function normalizedTime(value) {
   if (typeof value !== "string" || value.length > 64) return null;
+  const match = ISO_TIMESTAMP_RE.exec(value);
+  if (match === null) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === "Z" ? 0 : Number(match[10]);
+  const offsetMinute = match[8] === "Z" ? 0 : Number(match[11]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]
+    || hour > 23 || minute > 59 || second > 59
+    || offsetHour > 23 || offsetMinute > 59) return null;
   const millis = Date.parse(value);
   if (!Number.isFinite(millis)) return null;
   try {
@@ -162,9 +213,9 @@ function normalizeObservation(raw, expected) {
   if (safeGet(raw, "resource_class") !== expected.resourceClass
     || safeGet(raw, "unit_base") !== expected.unitBase
     || safeGet(raw, "unit_name") !== expected.unitName) return null;
-  if (expected.self === true && safeGet(raw, "self") !== true) return null;
   if (expected.aggregate === true && safeGet(raw, "aggregate") !== true) return null;
-  if (normalizedTime(safeGet(raw, "observed_at")) === null) return null;
+  const observedAt = normalizedTime(safeGet(raw, "observed_at"));
+  if (observedAt === null) return null;
 
   const usageRaw = safeGet(raw, "usage");
   const current = uint64(safeGet(usageRaw, "memory_current_bytes"));
@@ -193,6 +244,7 @@ function normalizeObservation(raw, expected) {
     current,
     peak,
     swapCurrent,
+    observedAt,
     limits: Object.freeze({ low, high, max, swapMax }),
     outputLimits: Object.freeze({
       memory_low: low.output,
@@ -346,7 +398,8 @@ function normalizeController(snapshot, policy) {
     const projectId = identifier(safeGet(entry, "project_id"));
     const generationId = identifier(safeGet(entry, "generation_id"));
     const observedUnit = unitName(safeGet(entry, "unit_name"));
-    if (!projectId || !generationId || !observedUnit) return null;
+    const startedAt = normalizedTime(safeGet(entry, "started_at"));
+    if (!projectId || !generationId || !observedUnit || startedAt === null) return null;
     if (resourceClass === "worker") {
       let expectedBase;
       try {
@@ -359,7 +412,12 @@ function normalizeController(snapshot, policy) {
         || safeGet(limits, "memory_high_mib") !== policy.worker.memory_high_mib
         || safeGet(limits, "memory_max_mib") !== policy.worker.memory_max_mib
         || safeGet(limits, "swap_max_mib") !== policy.worker.swap_max_mib) return null;
-      workers.push({ projectId, generationId, unitBase: expectedBase, unitName: scopeUnitFromBase(expectedBase) });
+      workers.push(Object.freeze({
+        projectId,
+        generationId,
+        unitBase: expectedBase,
+        unitName: scopeUnitFromBase(expectedBase),
+      }));
     } else if (resourceClass === "control") {
       if (safeGet(entry, "control_class") !== controlClassName) return null;
       activeControlScopes += 1;
@@ -382,7 +440,7 @@ function normalizeWorkers(raw, workers, policy) {
   const list = safeArray(raw, Math.min(MAX_RUNTIME_ITEMS, policy.max_worker_scopes));
   if (!list || list.length !== workers.length) return null;
   const expected = new Map(workers.map((worker) => [worker.unitBase, worker]));
-  const observations = [];
+  const observations = new Map();
   for (const rawObservation of list) {
     const base = safeGet(rawObservation, "unit_base");
     if (typeof base !== "string" || !UNIT_BASE_RE.test(base) || !expected.has(base)) return null;
@@ -394,22 +452,22 @@ function normalizeWorkers(raw, workers, policy) {
       unitName: worker.unitName,
     });
     if (!observation) return null;
-    observations.push(observation);
+    observations.set(base, Object.freeze({ ...worker, ...observation }));
   }
-  return expected.size === 0 ? observations : null;
+  return expected.size === 0 ? workers.map((worker) => observations.get(worker.unitBase)) : null;
 }
 
 function workerTotals(workers) {
   let current = 0n;
-  let peak = 0n;
+  let sumOfScopePeaks = 0n;
   let swapCurrent = 0n;
   for (const worker of workers) {
     current = addUint64(current, worker.current);
-    peak = addUint64(peak, worker.peak);
+    sumOfScopePeaks = addUint64(sumOfScopePeaks, worker.peak);
     swapCurrent = addUint64(swapCurrent, worker.swapCurrent);
-    if (current === null || peak === null || swapCurrent === null) return null;
+    if (current === null || sumOfScopePeaks === null || swapCurrent === null) return null;
   }
-  return { current, peak, swapCurrent };
+  return { current, sumOfScopePeaks, swapCurrent };
 }
 
 function limitsMatchPolicy(api, control, workers, policy) {
@@ -435,26 +493,14 @@ function limitsMatchPolicy(api, control, workers, policy) {
   ));
 }
 
-function sameIdentity(left, right) {
-  return left && right
-    && left.project_id === right.project_id
-    && left.generation_id === right.generation_id
-    && left.resource_class === right.resource_class
-    && left.unit_name === right.unit_name;
-}
-
 function sanitizeControllerEvidence(controller) {
   const sanitized = createResourceSnapshot({
     status: "unknown",
     last_cgroup_oom: controller.lastCgroupOom,
     terminal_facts: controller.terminalFacts,
   });
-  const latestFact = sanitized.terminal_facts.at(-1) || null;
-  const latestObservation = sameIdentity(sanitized.last_cgroup_oom, latestFact)
-    ? sanitized.last_cgroup_oom
-    : null;
   return {
-    lastCgroupOom: latestObservation,
+    lastCgroupOom: sanitized.last_cgroup_oom,
     terminalFacts: sanitized.terminal_facts,
   };
 }
@@ -467,6 +513,18 @@ function frozenObservationOutput(observation) {
   });
 }
 
+function frozenWorkerScopeOutput(worker) {
+  return Object.freeze({
+    project_id: worker.projectId,
+    generation_id: worker.generationId,
+    unit_base: worker.unitBase,
+    unit_name: worker.unitName,
+    observed_at: worker.observedAt,
+    usage: frozenObservationOutput(worker),
+    effective_limits: worker.outputLimits,
+  });
+}
+
 function buildResourceRuntimeSnapshot({
   runtimeResources,
   preflightReport,
@@ -474,6 +532,7 @@ function buildResourceRuntimeSnapshot({
   apiObservation,
   controlObservation,
   workerObservations = [],
+  proofAuthority,
 } = {}) {
   let policy;
   try {
@@ -490,6 +549,7 @@ function buildResourceRuntimeSnapshot({
       effective_limits: null,
       resource_usage: null,
       scope_capacity: null,
+      worker_scopes: null,
     });
   }
 
@@ -500,12 +560,12 @@ function buildResourceRuntimeSnapshot({
     preflight = null;
   }
   const controller = normalizeController(controllerSnapshot, policy);
+  const proof = proofAuthorityMetadata(proofAuthority);
   const apiObservedUnit = observedSystemdUnit(safeGet(apiObservation, "unit_name"));
-  const api = apiObservedUnit === null ? null : normalizeObservation(apiObservation, {
+  const api = proof === null || apiObservedUnit !== proof.apiUnitName ? null : normalizeObservation(apiObservation, {
     resourceClass: "api",
     unitBase: null,
-    unitName: apiObservedUnit,
-    self: true,
+    unitName: proof.apiUnitName,
   });
   const control = controller ? normalizeObservation(controlObservation, {
     resourceClass: "control",
@@ -543,6 +603,12 @@ function buildResourceRuntimeSnapshot({
   } else if (controller.protocolStatus !== "supported") {
     status = "containment_unavailable";
     reason = "controller_protocol_unavailable";
+  } else if (proof === null) {
+    status = "candidate_pending_staging";
+    reason = "proof_authority_unavailable";
+  } else if (apiObservedUnit !== proof.apiUnitName) {
+    status = "containment_unavailable";
+    reason = "api_self_identity_unproven";
   } else if (!preflight.validForReady || !countsConsistent || !effectiveConsistent
     || workerMemoryMib === null || controlMemoryMib === null || apiMemoryMib === null) {
     status = "containment_unavailable";
@@ -610,15 +676,21 @@ function buildResourceRuntimeSnapshot({
     }),
   }) : null;
   const resourceUsage = api && control && totals ? Object.freeze({
-    api: frozenObservationOutput(api),
+    api: Object.freeze({
+      unit_name: proof.apiUnitName,
+      ...frozenObservationOutput(api),
+    }),
     control: frozenObservationOutput(control),
     worker: Object.freeze({
       observed_scopes: workers.length,
       memory_current_bytes: totals.current.toString(10),
-      memory_peak_bytes: totals.peak.toString(10),
+      sum_of_scope_peaks_bytes: totals.sumOfScopePeaks.toString(10),
       memory_swap_current_bytes: totals.swapCurrent.toString(10),
     }),
   }) : null;
+  const workerScopes = workers === null
+    ? null
+    : Object.freeze(workers.map(frozenWorkerScopeOutput));
   const scopeCapacity = preflight && preflight.scopes ? Object.freeze({
     admitted_worker_scopes: preflight.scopes.admitted,
     reserved_worker_scopes: policy.max_worker_scopes,
@@ -631,20 +703,27 @@ function buildResourceRuntimeSnapshot({
     effective_limits: effectiveLimits,
     resource_usage: resourceUsage,
     scope_capacity: scopeCapacity,
+    worker_scopes: workerScopes,
   });
 }
 
 function persistResourceRuntimeSnapshot(store, snapshot) {
   const save = safeGet(store, "save");
   if (typeof save !== "function") {
-    throw new TypeError("store.save must be an explicit persistence function");
+    throw new ResourceRuntimePersistenceError("QW_RESOURCE_PERSISTENCE_INVALID_STORE");
   }
-  return save.call(store, snapshot);
+  try {
+    return Reflect.apply(save, store, [snapshot]);
+  } catch {
+    throw new ResourceRuntimePersistenceError("QW_RESOURCE_PERSISTENCE_FAILED");
+  }
 }
 
 module.exports = {
   MIB_BYTES,
   UINT64_MAX,
+  ResourceRuntimePersistenceError,
+  createResourceRuntimeProofAuthority,
   buildResourceRuntimeSnapshot,
   persistResourceRuntimeSnapshot,
 };
