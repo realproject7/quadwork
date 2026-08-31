@@ -1802,7 +1802,28 @@ function ownedBatchFingerprint(payload) {
   ].join("::");
 }
 
-function ownedBatchRowMatches(row, assignment) {
+function normalizedAssignmentItems(payload) {
+  if (!payload || !Array.isArray(payload.assignment_items)) return null;
+  const seen = new Set();
+  const items = [];
+  for (const item of payload.assignment_items) {
+    const ref = item && item.work_item_ref;
+    if (!ref || typeof ref !== "object" || Array.isArray(ref) ||
+        typeof ref.repo_key !== "string" || !ref.repo_key ||
+        typeof ref.repo !== "string" || !ref.repo ||
+        !Number.isSafeInteger(ref.number) || ref.number < 1 ||
+        (ref.kind !== "issue" && ref.kind !== "pr") ||
+        typeof item.ownership_key !== "string" || !item.ownership_key) return null;
+    const key = JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
+    if (seen.has(key)) return null;
+    seen.add(key);
+    items.push({ key, ownership_key: item.ownership_key, work_item_ref: { ...ref } });
+  }
+  items.sort((left, right) => left.key.localeCompare(right.key));
+  return items;
+}
+
+function ownedBatchRowMatches(row, assignment, assignmentItems) {
   if (!row || typeof row !== "object" || !assignment) return false;
   if (ownedBatchFingerprint(row) !== ownedBatchFingerprint(assignment)) return false;
   const ref = row.work_item_ref;
@@ -1812,7 +1833,10 @@ function ownedBatchRowMatches(row, assignment) {
     Number.isSafeInteger(row.number) && row.number > 0 &&
     (row.kind === "issue" || row.kind === "pr") &&
     ref.repo_key === row.repo_key && ref.repo === row.repo &&
-    ref.number === row.number && ref.kind === row.kind;
+    ref.number === row.number && ref.kind === row.kind &&
+    typeof row.ownership_key === "string" && !!row.ownership_key &&
+    assignmentItems.some((item) => item.key === JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]) &&
+      item.ownership_key === row.ownership_key);
 }
 
 function ownedBatchAutomationState(progress, active) {
@@ -1821,8 +1845,15 @@ function ownedBatchAutomationState(progress, active) {
   if (!progressFingerprint || progressFingerprint !== activeFingerprint) {
     return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
   }
+  const progressAssignmentItems = normalizedAssignmentItems(progress);
+  const activeAssignmentItems = normalizedAssignmentItems(active);
+  if (!progressAssignmentItems || !activeAssignmentItems ||
+      JSON.stringify(progressAssignmentItems) !== JSON.stringify(activeAssignmentItems)) {
+    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
+  }
   const hasItems = Array.isArray(progress.items) && progress.items.length > 0;
-  if (hasItems && progress.items.some((row) => !ownedBatchRowMatches(row, progress))) {
+  if (hasItems && (progress.items.length !== progressAssignmentItems.length ||
+      progress.items.some((row) => !ownedBatchRowMatches(row, progress, progressAssignmentItems)))) {
     return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
   }
   const clearedByOperator = !!progress.liveActiveBatchCleared;
@@ -1840,6 +1871,10 @@ function ownedBatchAutomationState(progress, active) {
       assignment_attempt: progress.assignment_attempt,
       provenance: "owned",
       assignment_key: progress.assignment_key,
+      assignment_items: progressAssignmentItems.map((item) => ({
+        work_item_ref: item.work_item_ref,
+        ownership_key: item.ownership_key,
+      })),
     },
   };
 }
@@ -3217,6 +3252,7 @@ module.exports = {
   autoStopBridges,
   autoStopPollingTick,
   ownedBatchFingerprint,
+  normalizedAssignmentItems,
   ownedBatchRowMatches,
   ownedBatchAutomationState,
   registerCaffeinateOwner,

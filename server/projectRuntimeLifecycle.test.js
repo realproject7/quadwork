@@ -57,6 +57,10 @@ const ownedProgress = {
   assignment_key: "assignment-7-2",
   owned: true,
   current: true,
+  assignment_items: [{
+    work_item_ref: { repo_key: "primary", repo: "Owner/A", number: 42, kind: "issue" },
+    ownership_key: "owner-a-42-attempt-2",
+  }],
   items: [{
     installation_id: "installation-runtime-0001",
     batch_number: 7,
@@ -70,6 +74,7 @@ const ownedProgress = {
     number: 42,
     kind: "issue",
     work_item_ref: { repo_key: "primary", repo: "Owner/A", number: 42, kind: "issue" },
+    ownership_key: "owner-a-42-attempt-2",
   }],
   completeConfirmed: false,
 };
@@ -83,6 +88,7 @@ assert.deepEqual(ownedAutomation.identity, {
   assignment_attempt: "attempt_0002",
   provenance: "owned",
   assignment_key: "assignment-7-2",
+  assignment_items: ownedProgress.assignment_items,
 }, "authoritative automation carries the exact assignment identity into route-side guards");
 assert.equal(runtime.ownedBatchAutomationState(
   ownedProgress,
@@ -107,6 +113,10 @@ assert.equal(runtime.ownedBatchAutomationState(
   }] },
   ownedActive,
 ).authoritative, false, "a row/ref repository mismatch rejects the whole automation transition");
+assert.equal(runtime.ownedBatchAutomationState(
+  { ...ownedProgress, items: [{ ...ownedProgress.items[0], ownership_key: "stale-row-owner" }] },
+  ownedActive,
+).authoritative, false, "a row ownership key outside the exact assignment set is rejected");
 
 const originalCancelBackground = routes.cancelProjectBackground;
 
