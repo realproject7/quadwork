@@ -10,6 +10,55 @@ function isCurrent(projectId, inst) {
   return !inst.stopping && instances.get(projectId) === inst;
 }
 
+function retireStaleInstance(projectId, inst) {
+  if (!inst || inst.stopping) return;
+  inst.stopping = true;
+  for (const controller of inst.controllers || []) {
+    try { controller.abort(); } catch {}
+  }
+  if (inst.timer) {
+    try { clearTimeout(inst.timer); } catch {}
+    inst.timer = null;
+  }
+  if (inst.client) {
+    let operation;
+    try { operation = inst.client.destroy(); }
+    catch (err) {
+      inst.retirementError = err;
+      return;
+    }
+    inst.retirement = Promise.resolve(operation);
+    inst.retirement.then(
+      () => {
+        inst.retirement = null;
+        inst.retirementError = null;
+        if (instances.get(projectId) === inst) instances.delete(projectId);
+      },
+      (err) => {
+        inst.retirement = null;
+        inst.retirementError = err;
+      },
+    );
+    return;
+  }
+  if (instances.get(projectId) === inst) instances.delete(projectId);
+}
+
+function isAuthorizedCurrent(projectId, inst) {
+  if (!isCurrent(projectId, inst)) return false;
+  if (typeof inst.isAuthorityCurrent !== "function") return true;
+  let authorized = false;
+  try { authorized = inst.isAuthorityCurrent() === true; } catch {}
+  if (!authorized) retireStaleInstance(projectId, inst);
+  return authorized;
+}
+
+function staleAuthorityError() {
+  const error = new Error("bridge assignment or admission changed");
+  error.code = "bridge_authority_changed";
+  return error;
+}
+
 async function track(inst, promise) {
   if (!inst.inFlight) inst.inFlight = new Set();
   const owned = Promise.resolve(promise);
@@ -19,6 +68,7 @@ async function track(inst, promise) {
 }
 
 async function bridgeFetch(inst, url, options = {}, timeoutMs = 5000) {
+  if (!isAuthorizedCurrent(inst.projectId, inst)) throw staleAuthorityError();
   if (!inst.controllers) inst.controllers = new Set();
   const controller = new AbortController();
   inst.controllers.add(controller);
@@ -100,7 +150,9 @@ function getDiscordLib() {
 
 async function pollLoop(projectId, channelObj, qwPort) {
   const inst = instances.get(projectId);
-  if (!inst || inst.stopping) return;
+  if (!inst) return;
+  if (!inst.projectId) inst.projectId = projectId;
+  if (!isAuthorizedCurrent(projectId, inst)) return;
 
   try {
     let sinceId = inst.cursor;
@@ -108,20 +160,21 @@ async function pollLoop(projectId, channelObj, qwPort) {
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&since_id=${sinceId}&limit=50`,
       {}, 5000,
     );
-    if (!isCurrent(projectId, inst)) return;
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     if (!r.ok) throw new Error(`Chat API ${r.status}`);
     const messages = await track(inst, r.json());
-    if (!isCurrent(projectId, inst)) return;
+    if (!isAuthorizedCurrent(projectId, inst)) return;
 
     for (const msg of messages) {
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       if (msg.sender === "dc" || msg.sender === "discord-bridge" || (msg.sender && msg.sender.startsWith("dc:"))) continue;
       if (inst.forwardedIds.has(msg.id)) continue;
 
       const text = `**${msg.sender}**: ${msg.text}`;
       const truncated = text.length > 2000 ? text.slice(0, 2000) + "…" : text;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       await track(inst, channelObj.send(truncated));
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
 
       inst.forwardedIds.add(msg.id);
       if (inst.forwardedIds.size > 2000) {
@@ -130,21 +183,34 @@ async function pollLoop(projectId, channelObj, qwPort) {
       }
 
       if (msg.id > inst.cursor) {
+        if (!isAuthorizedCurrent(projectId, inst)) return;
         inst.cursor = msg.id;
         writeCursor(projectId, inst.cursor);
       }
     }
   } catch (err) {
-    if (isCurrent(projectId, inst)) inst.lastError = err.message;
+    if (isAuthorizedCurrent(projectId, inst)) inst.lastError = err.message;
   }
 
-  if (isCurrent(projectId, inst)) {
+  if (isAuthorizedCurrent(projectId, inst)) {
     inst.timer = setTimeout(() => pollLoop(projectId, channelObj, qwPort), 2000);
   }
 }
 
-async function start(projectId, botToken, channelId, qwPort) {
+async function start(projectId, botToken, channelId, qwPort, options = {}) {
   if (instances.has(projectId)) return;
+
+  const isAuthorityCurrent = typeof options.isAuthorityCurrent === "function"
+    ? options.isAuthorityCurrent
+    : null;
+  const automationIdentity = options.automationIdentity && typeof options.automationIdentity === "object"
+    ? Object.freeze({ ...options.automationIdentity })
+    : null;
+  if (isAuthorityCurrent) {
+    let authorized = false;
+    try { authorized = isAuthorityCurrent() === true; } catch {}
+    if (!authorized) return;
+  }
 
   const oldCursor = path.join(CONFIG_DIR, `discord-bridge-cursor-${projectId}.json`);
   const newCursor = cursorPath(projectId);
@@ -163,6 +229,7 @@ async function start(projectId, botToken, channelId, qwPort) {
   });
 
   const inst = {
+    projectId,
     cursor: readCursor(projectId),
     forwardedIds: new Set(),
     timer: null,
@@ -173,26 +240,29 @@ async function start(projectId, botToken, channelId, qwPort) {
     channelId,
     controllers: new Set(),
     inFlight: new Set(),
+    isAuthorityCurrent,
+    automationIdentity,
   };
   instances.set(projectId, inst);
 
   try {
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     await track(inst, client.login(botToken));
   } catch (err) {
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     instances.delete(projectId);
     throw new Error(`Discord login failed: ${err.message}`);
   }
 
-  if (inst.stopping || instances.get(projectId) !== inst) {
-    try { await client.destroy(); } catch {}
-    return;
-  }
+  if (!isAuthorizedCurrent(projectId, inst)) return;
 
   let channel;
   try {
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     channel = await track(inst, client.channels.fetch(channelId));
     if (!channel) throw new Error("Channel not found");
   } catch (err) {
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     try { await client.destroy(); } catch {}
     instances.delete(projectId);
     throw new Error(`Discord channel fetch failed: ${err.message}`);
@@ -201,14 +271,12 @@ async function start(projectId, botToken, channelId, qwPort) {
   // Archive may have stopped this instance while login/channel discovery was
   // awaiting the network. Never attach handlers or start polling for a stale
   // instance after that durable barrier won the race.
-  if (inst.stopping || instances.get(projectId) !== inst) {
-    try { await client.destroy(); } catch {}
-    return;
-  }
+  if (!isAuthorizedCurrent(projectId, inst)) return;
 
+  if (!isAuthorizedCurrent(projectId, inst)) return;
   client.on("messageCreate", async (message) => {
     try {
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       if (message.author.bot) return;
       if (message.channel.id !== channelId) return;
 
@@ -227,23 +295,26 @@ async function start(projectId, botToken, channelId, qwPort) {
           project: projectId,
           text: message.content,
           channel: "general",
+          ...(inst.automationIdentity || {}),
         }),
       }, 5000);
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       if (!res.ok) {
         console.error(`[bridge] discord ${projectId} inbound POST failed: ${res.status}`);
       }
     } catch (err) {
-      if (isCurrent(projectId, inst)) {
+      if (isAuthorizedCurrent(projectId, inst)) {
         console.error(`[bridge] discord ${projectId} inbound error: ${err.message}`);
         inst.lastError = err.message;
       }
     }
   });
 
+  if (!isAuthorizedCurrent(projectId, inst)) return;
   client.on("error", (err) => {
     console.error(`[bridge] discord ${projectId} client error: ${err?.message || err}`);
   });
+  if (!isAuthorizedCurrent(projectId, inst)) return;
   client.on("warn", (msg) => {
     console.warn(`[bridge] discord ${projectId} client warn: ${msg}`);
   });
@@ -261,16 +332,17 @@ async function start(projectId, botToken, channelId, qwPort) {
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&limit=1`,
       {}, 5000,
     );
-    if (!isCurrent(projectId, inst)) return;
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     if (r.ok) {
       const msgs = await track(inst, r.json());
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       if (msgs.length > 0) {
         const latestId = msgs[msgs.length - 1].id;
         const stale = !cursorFileExists
           || inst.cursor === 0
           || (latestId - inst.cursor) > STALE_CURSOR_THRESHOLD;
         if (stale) {
+          if (!isAuthorizedCurrent(projectId, inst)) return;
           inst.cursor = latestId;
           writeCursor(projectId, inst.cursor);
         }
@@ -281,9 +353,10 @@ async function start(projectId, botToken, channelId, qwPort) {
       console.warn(`[bridge] discord ${projectId}: cursor seed fetch returned ${r.status}`);
     }
   } catch (err) {
-    if (isCurrent(projectId, inst)) console.warn(`[bridge] discord ${projectId}: cursor seed failed (${err.message})`);
+    if (isAuthorizedCurrent(projectId, inst)) console.warn(`[bridge] discord ${projectId}: cursor seed failed (${err.message})`);
   }
 
+  if (!isAuthorizedCurrent(projectId, inst)) return;
   pollLoop(projectId, channel, qwPort).catch((err) => {
     console.error(`[bridge] discord ${projectId} poll crashed: ${err.message}`);
     inst.lastError = err.message;
@@ -325,8 +398,10 @@ async function stop(projectId) {
   }
   try {
     if (inst.client) {
-      const outcome = await settleOperation(inst.client.destroy(), inst.stopTimeoutMs || 5000);
+      const operation = inst.retirement || inst.client.destroy();
+      const outcome = await settleOperation(operation, inst.stopTimeoutMs || 5000);
       if (!outcome.ok) throw outcome.error || new Error("Discord client stop timed out");
+      inst.retirementError = null;
     }
   } catch (err) {
     cleanupErrors.push({
@@ -370,4 +445,18 @@ function getLastError(projectId) {
   return inst?.lastError || null;
 }
 
-module.exports = { start, stop, stopAll, isRunning, getLastError, readCursor, _instances: instances, _pollLoop: pollLoop };
+function setDiscordLibForTest(lib) {
+  Discord = lib;
+}
+
+module.exports = {
+  start,
+  stop,
+  stopAll,
+  isRunning,
+  getLastError,
+  readCursor,
+  _instances: instances,
+  _pollLoop: pollLoop,
+  _setDiscordLibForTest: setDiscordLibForTest,
+};

@@ -129,6 +129,14 @@ async function run() {
   assert.equal(parsed.batchNumber, null, "mixed accepted Batch syntaxes are one duplicate metadata namespace");
   assert.notEqual(parsed.provenance, "owned");
 
+  const conflictingBatchTypes = [
+    "## Active Batch", "**Batch:** 12", "**Batch type:** pr-review", "**Batch type:** code",
+    `**Installation ID:** ${INSTALLATION_ID}`, "**Assignment attempt:** attempt_a", "- Acme/Web#42 valid",
+  ].join("\n");
+  parsed = parseActiveBatch(conflictingBatchTypes, { repositories, installationId: INSTALLATION_ID });
+  assert.equal(parsed.errors[0]?.code, "duplicate_batch_type");
+  assert.notEqual(parsed.provenance, "owned", "ambiguous execution mode must never mint an owned assignment");
+
   // A compact single-repo token remains parse-compatible but is never stamped
   // as V2-owned merely because installation metadata exists.
   parsed = parseActiveBatch(active(["- #42 legacy"]), { repositories: [repositories[0]], installationId: INSTALLATION_ID });
@@ -155,6 +163,14 @@ async function run() {
   assert.equal(payload.validation_errors[0].code, "bare_ref_forbidden");
   assert.equal(payload.multi_repository, true);
   assert.equal(ghCalls, 0);
+
+  queue = conflictingBatchTypes;
+  _batchProgressCache.clear();
+  payload = await getOrComputeBatchProgress("p");
+  assert.equal(payload.current, true);
+  assert.equal(payload.owned, false);
+  assert.equal(payload.validation_errors[0]?.code, "duplicate_batch_type");
+  assert.equal(ghCalls, 0, "ambiguous batch type must not perform execution-side GitHub work");
 
   // Owned code rows resolve each same-number item from its own repository cache.
   queue = active(["- Acme/Web#42 first", "- Acme/API#42 second"]);

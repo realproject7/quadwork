@@ -10,6 +10,35 @@ function isCurrent(projectId, inst) {
   return !inst.stopping && instances.get(projectId) === inst;
 }
 
+function retireStaleInstance(projectId, inst) {
+  if (!inst || inst.stopping) return;
+  inst.stopping = true;
+  for (const controller of inst.controllers || []) {
+    try { controller.abort(); } catch {}
+  }
+  for (const field of ["timer", "updateTimer"]) {
+    if (!inst[field]) continue;
+    try { clearTimeout(inst[field]); } catch {}
+    inst[field] = null;
+  }
+  if (instances.get(projectId) === inst) instances.delete(projectId);
+}
+
+function isAuthorizedCurrent(projectId, inst) {
+  if (!isCurrent(projectId, inst)) return false;
+  if (typeof inst.isAuthorityCurrent !== "function") return true;
+  let authorized = false;
+  try { authorized = inst.isAuthorityCurrent() === true; } catch {}
+  if (!authorized) retireStaleInstance(projectId, inst);
+  return authorized;
+}
+
+function staleAuthorityError() {
+  const error = new Error("bridge assignment or admission changed");
+  error.code = "bridge_authority_changed";
+  return error;
+}
+
 async function track(inst, promise) {
   if (!inst.inFlight) inst.inFlight = new Set();
   const owned = Promise.resolve(promise);
@@ -19,6 +48,7 @@ async function track(inst, promise) {
 }
 
 async function bridgeFetch(inst, url, options = {}, timeoutMs = 5000) {
+  if (!isAuthorizedCurrent(inst.projectId, inst)) throw staleAuthorityError();
   if (!inst.controllers) inst.controllers = new Set();
   const controller = new AbortController();
   inst.controllers.add(controller);
@@ -103,7 +133,9 @@ async function sendTelegram(inst, botToken, chatId, text) {
 
 async function pollLoop(projectId, botToken, chatId, qwPort) {
   const inst = instances.get(projectId);
-  if (!inst || inst.stopping) return;
+  if (!inst) return;
+  if (!inst.projectId) inst.projectId = projectId;
+  if (!isAuthorizedCurrent(projectId, inst)) return;
 
   try {
     let sinceId = inst.cursor;
@@ -111,20 +143,21 @@ async function pollLoop(projectId, botToken, chatId, qwPort) {
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&since_id=${sinceId}&limit=50`,
       {}, 5000,
     );
-    if (!isCurrent(projectId, inst)) return;
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     if (!r.ok) throw new Error(`Chat API ${r.status}`);
     const messages = await track(inst, r.json());
-    if (!isCurrent(projectId, inst)) return;
+    if (!isAuthorizedCurrent(projectId, inst)) return;
 
     for (const msg of messages) {
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       if (msg.sender === "tg" || msg.sender === "telegram-bridge" || (msg.sender && msg.sender.startsWith("tg:"))) continue;
       if (inst.forwardedIds.has(msg.id)) continue;
 
       const text = `**${msg.sender}**: ${msg.text}`;
       const truncated = text.length > 4000 ? text.slice(0, 4000) + "…" : text;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       await sendTelegram(inst, botToken, chatId, truncated);
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
 
       inst.forwardedIds.add(msg.id);
       if (inst.forwardedIds.size > 2000) {
@@ -133,41 +166,45 @@ async function pollLoop(projectId, botToken, chatId, qwPort) {
       }
 
       if (msg.id > inst.cursor) {
+        if (!isAuthorizedCurrent(projectId, inst)) return;
         inst.cursor = msg.id;
         writeCursor(projectId, inst.cursor);
       }
     }
   } catch (err) {
-    if (isCurrent(projectId, inst)) inst.lastError = err.message;
+    if (isAuthorizedCurrent(projectId, inst)) inst.lastError = err.message;
   }
 
-  if (isCurrent(projectId, inst)) {
+  if (isAuthorizedCurrent(projectId, inst)) {
     inst.timer = setTimeout(() => pollLoop(projectId, botToken, chatId, qwPort), 2000);
   }
 }
 
 async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
   const inst = instances.get(projectId);
-  if (!inst || inst.stopping) return;
+  if (!inst) return;
+  if (!inst.projectId) inst.projectId = projectId;
+  if (!isAuthorizedCurrent(projectId, inst)) return;
 
   let offset = readOffset(projectId);
   let retryDelay = 500;
 
   async function tick() {
-    if (!isCurrent(projectId, inst)) return;
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     try {
       const allowedUpdates = encodeURIComponent(JSON.stringify(["message"]));
       const url = `https://api.telegram.org/bot${botToken}/getUpdates?offset=${offset}&timeout=10&allowed_updates=${allowedUpdates}`;
       const res = await bridgeFetch(inst, url, {}, 30000);
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       if (!res.ok) throw new Error(`Telegram getUpdates ${res.status}`);
       const data = await track(inst, res.json());
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       retryDelay = 500;
       if (data.ok && data.result) {
         for (const update of data.result) {
-          if (!isCurrent(projectId, inst)) return;
+          if (!isAuthorizedCurrent(projectId, inst)) return;
           offset = update.update_id + 1;
+          if (!isAuthorizedCurrent(projectId, inst)) return;
           writeOffset(projectId, offset);
           const text = update.message?.text;
           const from = update.message?.from?.username || update.message?.from?.first_name || "unknown";
@@ -175,7 +212,7 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
           if (!text || msgChatId !== String(chatId)) continue;
 
           try {
-            if (!isCurrent(projectId, inst)) return;
+            if (!isAuthorizedCurrent(projectId, inst)) return;
             const r = await bridgeFetch(inst, `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`, {
               method: "POST",
               headers: {
@@ -186,9 +223,10 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
                 project: projectId,
                 text,
                 channel: "general",
+                ...(inst.automationIdentity || {}),
               }),
             }, 5000);
-            if (!isCurrent(projectId, inst)) return;
+            if (!isAuthorizedCurrent(projectId, inst)) return;
             if (!r.ok) {
               console.error(`[bridge] telegram ${projectId} inbound POST failed: ${r.status}`);
             }
@@ -198,13 +236,13 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
         }
       }
     } catch (err) {
-      if (isCurrent(projectId, inst)) {
+      if (isAuthorizedCurrent(projectId, inst)) {
         inst.lastError = err.message;
         retryDelay = Math.min(retryDelay * 2, 30000);
       }
     }
 
-    if (isCurrent(projectId, inst)) {
+    if (isAuthorizedCurrent(projectId, inst)) {
       inst.updateTimer = setTimeout(tick, retryDelay);
     }
   }
@@ -212,8 +250,20 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
   tick();
 }
 
-async function start(projectId, botToken, chatId, qwPort) {
+async function start(projectId, botToken, chatId, qwPort, options = {}) {
   if (instances.has(projectId)) return;
+
+  const isAuthorityCurrent = typeof options.isAuthorityCurrent === "function"
+    ? options.isAuthorityCurrent
+    : null;
+  const automationIdentity = options.automationIdentity && typeof options.automationIdentity === "object"
+    ? Object.freeze({ ...options.automationIdentity })
+    : null;
+  if (isAuthorityCurrent) {
+    let authorized = false;
+    try { authorized = isAuthorityCurrent() === true; } catch {}
+    if (!authorized) return;
+  }
 
   const oldCursor = path.join(CONFIG_DIR, `telegram-bridge-cursor-${projectId}.json`);
   const newCursor = cursorPath(projectId);
@@ -222,6 +272,7 @@ async function start(projectId, botToken, chatId, qwPort) {
   }
 
   const inst = {
+    projectId,
     cursor: readCursor(projectId),
     forwardedIds: new Set(),
     timer: null,
@@ -231,6 +282,8 @@ async function start(projectId, botToken, chatId, qwPort) {
     startedAt: Date.now(),
     controllers: new Set(),
     inFlight: new Set(),
+    isAuthorityCurrent,
+    automationIdentity,
   };
   instances.set(projectId, inst);
 
@@ -246,16 +299,17 @@ async function start(projectId, botToken, chatId, qwPort) {
       `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}&limit=1`,
       {}, 5000,
     );
-    if (!isCurrent(projectId, inst)) return;
+    if (!isAuthorizedCurrent(projectId, inst)) return;
     if (r.ok) {
       const msgs = await track(inst, r.json());
-      if (!isCurrent(projectId, inst)) return;
+      if (!isAuthorizedCurrent(projectId, inst)) return;
       if (msgs.length > 0) {
         const latestId = msgs[msgs.length - 1].id;
         const stale = !cursorFileExists
           || inst.cursor === 0
           || (latestId - inst.cursor) > STALE_CURSOR_THRESHOLD;
         if (stale) {
+          if (!isAuthorizedCurrent(projectId, inst)) return;
           inst.cursor = latestId;
           writeCursor(projectId, inst.cursor);
         }
@@ -266,13 +320,14 @@ async function start(projectId, botToken, chatId, qwPort) {
       console.warn(`[bridge] telegram ${projectId}: cursor seed fetch returned ${r.status}`);
     }
   } catch (err) {
-    if (isCurrent(projectId, inst)) console.warn(`[bridge] telegram ${projectId}: cursor seed failed (${err.message})`);
+    if (isAuthorizedCurrent(projectId, inst)) console.warn(`[bridge] telegram ${projectId}: cursor seed failed (${err.message})`);
   }
 
   // Archive can stop the instance while cursor seeding awaits. A stale start
   // must not recreate polling/update owners after cleanup has completed.
-  if (inst.stopping || instances.get(projectId) !== inst) return;
+  if (!isAuthorizedCurrent(projectId, inst)) return;
 
+  if (!isAuthorizedCurrent(projectId, inst)) return;
   pollLoop(projectId, botToken, chatId, qwPort).catch((err) => {
     console.error(`[bridge] telegram ${projectId} poll crashed: ${err.message}`);
     inst.lastError = err.message;
@@ -281,6 +336,7 @@ async function start(projectId, botToken, chatId, qwPort) {
     });
   });
 
+  if (!isAuthorizedCurrent(projectId, inst)) return;
   startTelegramUpdates(projectId, botToken, chatId, qwPort).catch((err) => {
     console.error(`[bridge] telegram ${projectId} updates crashed: ${err.message}`);
     inst.lastError = err.message;

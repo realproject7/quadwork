@@ -774,7 +774,22 @@ function requestedBridgeAssignment(body, projectId, res) {
     });
     return null;
   }
-  return result.context;
+  const assignment = result.assignment || {};
+  const automationIdentity = result.legacy === true
+    ? { compatibility_mode: "v1" }
+    : {
+      compatibility_mode: "v2",
+      provenance: assignment.provenance,
+      assignment_key: assignment.assignment_key,
+      installation_id: assignment.installation_id,
+      batch_number: assignment.batch_number,
+      assignment_attempt: assignment.assignment_attempt,
+      assignment_items: assignment.assignment_items,
+    };
+  return {
+    fingerprint: result.context.fingerprint,
+    automationIdentity,
+  };
 }
 
 // #1034: archive/unarchive is a lifecycle barrier. The injected controller is
@@ -1493,6 +1508,26 @@ router.post("/api/chat", (req, res) => {
       return res.status(400).json({ error: "Invalid attachment name" });
     }
   }
+  // #1031: an automated sender validates before its HTTP fetch, but the queue
+  // can roll over while that fetch is in flight. Revalidate the carried exact
+  // assignment at the receiver immediately before the irreversible chat append
+  // and PTY dispatch. Bodies without an automation discriminator remain manual.
+  const bridgeAdmission = requestedBridgeAdmission(req.body || {}, projectId, res);
+  if (bridgeAdmission === null) return;
+  const assignment = validateCurrentOwnedAssignment(projectId, req.body || {});
+  if (!assignment.ok) {
+    return res.status(assignment.status || 409).json({
+      ok: false,
+      error: assignment.error || "project assignment changed; refresh and retry",
+      code: assignment.code || "project_assignment_changed",
+      project_id: assignment.project_id || projectId,
+    });
+  }
+  const assignmentBound = assignment.manual !== true;
+  const isChatAuthorityCurrent = () => {
+    if (bridgeAdmission && !isAdmissionCurrent(bridgeAdmission)) return false;
+    return !assignmentBound || validateCurrentOwnedAssignment(projectId, req.body || {}).ok === true;
+  };
   const msg = fileChat.appendMessage(projectId, {
     sender,
     text: normalizeMentions(text, selfMentionSkip),
@@ -1501,10 +1536,12 @@ router.post("/api/chat", (req, res) => {
     attachments,
   });
   // #717: loop guard — count agent hops, pause if threshold reached
-  const maxHops = getProjectMaxHops(projectId);
-  fileChat.checkLoopGuard(projectId, msg, maxHops);
-  if (!fileChat.isLoopGuardPaused(projectId)) {
-    if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
+  if (isChatAuthorityCurrent()) {
+    const maxHops = getProjectMaxHops(projectId);
+    fileChat.checkLoopGuard(projectId, msg, maxHops);
+    if (!fileChat.isLoopGuardPaused(projectId) && isChatAuthorityCurrent()) {
+      if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
+    }
   }
   return res.json({ ok: true, message: msg });
 });
@@ -3802,7 +3839,20 @@ function parseActiveBatch(queueText, options = {}) {
   const kind = options.kind || (parseBatchType(queueText) === "pr-review" ? "pr" : "issue");
   const repositories = options.repositories || options.bindings || [];
   const { workItems, errors } = parseQueueWorkItems(section, { repositories, kind });
+  const batchTypeLines = section.split(/\r?\n/)
+    .map((line, index) => ({ line, lineNumber: index + 1 }))
+    .filter(({ line }) => /^\s*\*\*Batch type:\*\*/i.test(line));
+  if (batchTypeLines.length > 1) {
+    const duplicate = batchTypeLines[1];
+    errors.push({
+      code: "duplicate_batch_type",
+      message: "Active Batch contains multiple Batch type declarations",
+      line_number: duplicate.lineNumber,
+      token: duplicate.line.trim(),
+    });
+  }
   const metadata = queueAssignmentMetadata(section, options.installationId || null, batchNumber);
+  if (batchTypeLines.length > 1 && metadata.provenance === "owned") metadata.provenance = "unowned";
   if (options.installationId && workItems.some((item) => item.legacyUnowned)) metadata.provenance = "unowned";
   const assignmentKey = assignmentKeyFor({
     installationId: metadata.provenance === "owned" ? metadata.serializedInstallation : null,
@@ -6225,7 +6275,15 @@ router.post("/api/telegram", async (req, res) => {
       try {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
-        await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort);
+        const isBridgeAuthorityCurrent = () => isAdmissionCurrent(admission) &&
+          (!requestedAssignment || isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission));
+        const automationIdentity = requestedAssignment
+          ? { admission_generation: admission.generation, ...requestedAssignment.automationIdentity }
+          : null;
+        await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort, {
+          isAuthorityCurrent: isBridgeAuthorityCurrent,
+          automationIdentity,
+        });
         const admissionStale = !isAdmissionCurrent(admission);
         const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
         if (admissionStale || assignmentStale) {
@@ -6445,7 +6503,15 @@ router.post("/api/discord", async (req, res) => {
       try {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
-        await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort);
+        const isBridgeAuthorityCurrent = () => isAdmissionCurrent(admission) &&
+          (!requestedAssignment || isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission));
+        const automationIdentity = requestedAssignment
+          ? { admission_generation: admission.generation, ...requestedAssignment.automationIdentity }
+          : null;
+        await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort, {
+          isAuthorityCurrent: isBridgeAuthorityCurrent,
+          automationIdentity,
+        });
         const admissionStale = !isAdmissionCurrent(admission);
         const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
         if (admissionStale || assignmentStale) {

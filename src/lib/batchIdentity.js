@@ -13,7 +13,8 @@ function positiveInteger(value) {
 }
 
 function assignmentAttempt(value) {
-  return nonEmptyString(value);
+  const normalized = nonEmptyString(value);
+  return normalized && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(normalized) ? normalized : null;
 }
 
 /**
@@ -206,6 +207,7 @@ function legacyV1BatchSnapshot(active, progress) {
     if (active.active !== false || progress.current !== false) return null;
   } else {
     if (progress.items.length > 0 && progress.current !== true) return null;
+    const seenRows = new Set();
     for (const row of progress.items) {
       if (
         row.provenance !== "legacy_unowned" ||
@@ -213,12 +215,25 @@ function legacyV1BatchSnapshot(active, progress) {
         row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
         row.ownership_key != null || !ownedWorkItemIdentityMatches(row)
       ) return null;
+      const ref = normalizeWorkItemRef(row.work_item_ref);
+      const key = `${ref.repo_key}\u0000${ref.repo}\u0000${ref.number}\u0000${ref.kind}`;
+      if (seenRows.has(key)) return null;
+      seenRows.add(key);
     }
   }
+  const rowKeys = liveActiveBatchCleared
+    ? []
+    : progress.items.map((row) => {
+      const ref = normalizeWorkItemRef(row.work_item_ref);
+      return JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
+    }).sort();
   return {
     authority: "legacy_compatibility",
     compatibility_mode: "v1",
-    fingerprint: `legacy-v1:${progressBatch}`,
+    // Preserve V1's historical edit-in-place transition identity, but derive
+    // it only after the shared join has validated every row and rejected
+    // duplicate composite refs.
+    fingerprint: JSON.stringify(["legacy-v1-batch", 1, progressBatch, rowKeys]),
     active: active.active === true,
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,

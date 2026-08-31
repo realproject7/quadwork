@@ -50,6 +50,7 @@ const dispatcher = require("./pty-dispatcher");
 const runtime = require("./index");
 
 const ownedProgress = {
+  compatibility_mode: "v2",
   installation_id: "installation-runtime-0001",
   batch_number: 7,
   assignment_attempt: "attempt_0002",
@@ -121,6 +122,13 @@ const secondAssignmentItem = {
   work_item_ref: { repo_key: "secondary", repo: "Owner/B", number: 42, kind: "issue" },
   ownership_key: "owner-b-42-attempt-2",
 };
+const secondOwnedRow = {
+  ...ownedProgress.items[0],
+  repo_key: "secondary",
+  repo: "Owner/B",
+  work_item_ref: secondAssignmentItem.work_item_ref,
+  ownership_key: secondAssignmentItem.ownership_key,
+};
 assert.equal(runtime.ownedBatchAutomationState(
   {
     ...ownedProgress,
@@ -129,6 +137,14 @@ assert.equal(runtime.ownedBatchAutomationState(
   },
   { ...ownedActive, assignment_items: [...ownedProgress.assignment_items, secondAssignmentItem] },
 ).authoritative, false, "a duplicated row cannot hide a missing same-number repository assignment");
+assert.equal(runtime.ownedBatchAutomationState(
+  {
+    ...ownedProgress,
+    assignment_items: [...ownedProgress.assignment_items, secondAssignmentItem],
+    items: [ownedProgress.items[0], secondOwnedRow],
+  },
+  { ...ownedActive, assignment_items: [secondAssignmentItem, ...ownedProgress.assignment_items] },
+).authoritative, false, "server automation uses the shared order-sensitive assignment join");
 
 const clearedOwnedProgress = {
   ...ownedProgress,

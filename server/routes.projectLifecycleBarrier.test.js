@@ -24,6 +24,7 @@ process.on("exit", () => {
 
 const express = require("express");
 const router = require("./routes");
+const fileChat = require("./file-chat");
 const telegramBridge = require("./bridges/telegram");
 const discordBridge = require("./bridges/discord");
 const { ProjectLifecycleError, captureProjectAdmission, revokeProjectAdmission } = require("./project-lifecycle");
@@ -187,8 +188,13 @@ function request(server, method, pathname, body) {
     for (const [name, bridge] of [["telegram", telegramBridge], ["discord", discordBridge]]) {
       const original = { start: bridge.start, stop: bridge.stop, isRunning: bridge.isRunning };
       const bridgeCalls = { start: 0, stop: 0, isRunning: 0 };
+      let latestStartOptions = null;
       try {
-        bridge.start = async () => { bridgeCalls.start += 1; return { ok: true }; };
+        bridge.start = async (...args) => {
+          bridgeCalls.start += 1;
+          latestStartOptions = args[4];
+          return { ok: true };
+        };
         bridge.stop = async () => { bridgeCalls.stop += 1; return { ok: true, resources: {}, cleanup_errors: [] }; };
         bridge.isRunning = () => { bridgeCalls.isRunning += 1; return false; };
 
@@ -200,6 +206,14 @@ function request(server, method, pathname, body) {
         });
         assert.equal(response.status, 200, `${name} current-generation start succeeds`);
         assert.equal(response.json.ok, true);
+        assert.equal(typeof latestStartOptions?.isAuthorityCurrent, "function",
+          `${name} start injects a persistent runtime authority guard`);
+        assert.equal(latestStartOptions.isAuthorityCurrent(), true,
+          `${name} injected authority is current before rollover`);
+        assert.equal(latestStartOptions.automationIdentity.admission_generation, currentAdmission.generation);
+        assert.equal(latestStartOptions.automationIdentity.compatibility_mode, "v2");
+        assert.equal(latestStartOptions.automationIdentity.assignment_key, bridgeAssignment.assignment_key,
+          `${name} carries the server-validated assignment identity to inbound chat`);
         response = await request(server, "POST", `/api/${name}?action=stop`, {
           project_id: "alpha",
           admission_generation: currentAdmission.generation,
@@ -228,12 +242,14 @@ function request(server, method, pathname, body) {
         assert.equal(response.json.code, "project_assignment_changed");
         assert.deepEqual(bridgeCalls, beforeMissingAssignment, `${name} ownership mismatch makes zero bridge calls`);
 
-        bridge.start = async () => {
+        let rolloverGuardCurrent = true;
+        bridge.start = async (...args) => {
           bridgeCalls.start += 1;
           fs.writeFileSync(
             path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"),
             bridgeQueue.replace("bridge_attempt_a", "bridge_attempt_b"),
           );
+          rolloverGuardCurrent = args[4].isAuthorityCurrent();
           return { ok: true };
         };
         response = await request(server, "POST", `/api/${name}?action=start`, {
@@ -243,6 +259,7 @@ function request(server, method, pathname, body) {
         });
         assert.equal(response.status, 409, `${name} start rejects an assignment rollover during await`);
         assert.equal(response.json.code, "project_assignment_changed", `${name} rollover is not mislabeled archived`);
+        assert.equal(rolloverGuardCurrent, false, `${name} runtime guard observes assignment-attempt rollover`);
         assert.equal(bridgeCalls.stop, 2, `${name} rolls back the just-started stale bridge`);
         fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
 
@@ -263,7 +280,11 @@ function request(server, method, pathname, body) {
         assert.equal(response.json.code, "project_assignment_changed");
         assert.equal(bridgeCalls.stop, 3, `${name} rolls back a bridge started under stale installation provenance`);
         fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
-        bridge.start = async () => { bridgeCalls.start += 1; return { ok: true }; };
+        bridge.start = async (...args) => {
+          bridgeCalls.start += 1;
+          latestStartOptions = args[4];
+          return { ok: true };
+        };
 
         // Preactivation, single-repository bare queues retain the legacy
         // compatibility-mode automation contract. They are never promoted to V2
@@ -290,6 +311,11 @@ function request(server, method, pathname, body) {
           compatibility_mode: "v1",
         });
         assert.equal(response.status, 200, `${name} V1 admission-only automated start remains compatible`);
+        assert.equal(latestStartOptions.isAuthorityCurrent(), true,
+          `${name} V1 automation receives a live compatibility guard`);
+        assert.equal(latestStartOptions.automationIdentity.compatibility_mode, "v1");
+        assert.equal(latestStartOptions.automationIdentity.admission_generation, currentAdmission.generation,
+          `${name} V1 inbound carry remains admission-bound`);
         response = await request(server, "POST", `/api/${name}?action=stop`, {
           project_id: "alpha",
           compatibility_mode: "v1",
@@ -344,12 +370,43 @@ function request(server, method, pathname, body) {
 
         response = await request(server, "POST", `/api/${name}?action=start`, { project_id: "alpha" });
         assert.equal(response.status, 200, `${name} manual start without a generation remains compatible`);
+        assert.equal(latestStartOptions.automationIdentity, null,
+          `${name} true manual start keeps inbound chat unbound`);
+        assert.equal(latestStartOptions.isAuthorityCurrent(), true,
+          `${name} manual runtime remains protected by project admission`);
       } finally {
         bridge.start = original.start;
         bridge.stop = original.stop;
         bridge.isRunning = original.isRunning;
       }
     }
+
+    // A carried admission generation closes the archive→unarchive receiver
+    // race even when the assignment text itself is restored byte-for-byte.
+    fileChat.initProject("alpha");
+    let staleInboundDispatches = 0;
+    router.setPtyDispatchCallback(() => { staleInboundDispatches += 1; });
+    const staleInboundAdmission = captureProjectAdmission("alpha");
+    revokeProjectAdmission("alpha");
+    fs.writeFileSync(bridgeConfigPath, JSON.stringify({ installation_id: bridgeInstallationId, projects: [{
+      id: "alpha",
+      name: "Alpha",
+      archived: false,
+      repositories: bridgeRepositories,
+    }] }));
+    const beforeStaleInbound = fileChat.readMessages("alpha", {}).length;
+    response = await request(server, "POST", "/api/chat?project=alpha", {
+      project: "alpha",
+      text: "stale bridge inbound",
+      admission_generation: staleInboundAdmission.generation,
+      ...bridgeAssignment,
+    });
+    assert.equal(response.status, 409, "stale bridge admission is rejected at the chat receiver");
+    assert.equal(response.json.code, "project_admission_changed");
+    assert.equal(fileChat.readMessages("alpha", {}).length, beforeStaleInbound,
+      "stale admission performs zero chat append");
+    assert.equal(staleInboundDispatches, 0, "stale admission performs zero PTY dispatch");
+    router.setPtyDispatchCallback(null);
 
     const settings = fs.readFileSync(path.join(__dirname, "..", "src", "components", "SettingsPage.tsx"), "utf-8");
     assert.match(settings, /projectLifecyclePending/);

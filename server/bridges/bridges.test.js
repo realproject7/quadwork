@@ -11,6 +11,16 @@ os.homedir = () => TEST_DIR;
 const telegramBridge = require("./telegram");
 const discordBridge = require("./discord");
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function cleanup() {
   os.homedir = origHome;
   try { fs.rmSync(TEST_DIR, { recursive: true, force: true }); } catch {}
@@ -233,6 +243,276 @@ async function runLifecycleTests() {
   assert.equal(timedOut.cleanup_errors[0].code, "client_stop_failed");
   assert.equal(discordBridge.isRunning("dc-timeout"), true, "Discord timeout retains ownership for retry");
   discordBridge._instances.delete("dc-timeout");
+}
+
+// #1031: assignment/admission authority is a lifetime property, not only a
+// route-entry check. A rollover while Telegram cursor startup is awaiting must
+// retire the instance before either polling owner can be created.
+{
+  const originalFetch = global.fetch;
+  const fetchStarted = deferred();
+  const seedResponse = deferred();
+  let authorized = true;
+  let fetches = 0;
+  try {
+    global.fetch = async () => {
+      fetches += 1;
+      fetchStarted.resolve();
+      return seedResponse.promise;
+    };
+    const starting = telegramBridge.start("tg-authority-start", "token", "chat", 8400, {
+      isAuthorityCurrent: () => authorized,
+    });
+    await fetchStarted.promise;
+    authorized = false;
+    seedResponse.resolve({ ok: true, json: async () => [] });
+    await starting;
+    assert.equal(fetches, 1, "Telegram rollover during cursor startup starts no poll/update fetch");
+    assert.equal(telegramBridge.isRunning("tg-authority-start"), false, "stale Telegram startup retires its instance");
+  } finally {
+    global.fetch = originalFetch;
+    await telegramBridge.stop("tg-authority-start");
+  }
+}
+
+// A later rollover while the chat response is being decoded must also suppress
+// the outbound network send and cursor mutation.
+{
+  const originalFetch = global.fetch;
+  const messages = deferred();
+  const jsonStarted = deferred();
+  let authorized = true;
+  let sends = 0;
+  try {
+    global.fetch = async (url) => {
+      if (String(url).includes("sendMessage")) {
+        sends += 1;
+        return { ok: true };
+      }
+      return {
+        ok: true,
+        json: async () => {
+          jsonStarted.resolve();
+          return messages.promise;
+        },
+      };
+    };
+    telegramBridge._instances.set("tg-authority-loop", {
+      projectId: "tg-authority-loop",
+      cursor: 0,
+      forwardedIds: new Set(),
+      timer: null,
+      updateTimer: null,
+      stopping: false,
+      controllers: new Set(),
+      inFlight: new Set(),
+      isAuthorityCurrent: () => authorized,
+    });
+    const polling = telegramBridge._pollLoop("tg-authority-loop", "token", "chat", 8400);
+    await jsonStarted.promise;
+    authorized = false;
+    messages.resolve([{ id: 12, sender: "head", text: "stale" }]);
+    await polling;
+    assert.equal(sends, 0, "Telegram rollover during chat decode performs zero stale external send");
+    assert.equal(telegramBridge.readCursor("tg-authority-loop"), 0, "Telegram stale loop persists no cursor");
+    assert.equal(telegramBridge.isRunning("tg-authority-loop"), false, "Telegram stale loop retires its instance");
+  } finally {
+    global.fetch = originalFetch;
+    await telegramBridge.stop("tg-authority-loop");
+  }
+}
+
+// Automated inbound messages carry the server-canonical identity all the way
+// to /api/chat, where the receiver performs the final exact revalidation.
+{
+  const originalFetch = global.fetch;
+  const inboundPosted = deferred();
+  const identity = {
+    admission_generation: 3,
+    compatibility_mode: "v2",
+    provenance: "owned",
+    assignment_key: "assignment-key",
+    installation_id: "installation_1234567890",
+    batch_number: 7,
+    assignment_attempt: "attempt-a",
+    assignment_items: [],
+  };
+  let inboundBody = null;
+  let updatesServed = false;
+  try {
+    global.fetch = async (url, options = {}) => {
+      const value = String(url);
+      if (value.includes("getUpdates")) {
+        if (updatesServed) return { ok: true, json: async () => ({ ok: true, result: [] }) };
+        updatesServed = true;
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            result: [{
+              update_id: 1,
+              message: { text: "hello", from: { username: "operator" }, chat: { id: "chat" } },
+            }],
+          }),
+        };
+      }
+      if (options.method === "POST" && value.includes("/api/chat")) {
+        inboundBody = JSON.parse(options.body);
+        inboundPosted.resolve();
+        return { ok: true };
+      }
+      return { ok: true, json: async () => [] };
+    };
+    await telegramBridge.start("tg-identity", "token", "chat", 8400, {
+      isAuthorityCurrent: () => true,
+      automationIdentity: identity,
+    });
+    await inboundPosted.promise;
+    assert.deepEqual(
+      Object.fromEntries(Object.keys(identity).map((key) => [key, inboundBody[key]])),
+      identity,
+      "Telegram inbound POST carries canonical automation identity",
+    );
+  } finally {
+    await telegramBridge.stop("tg-identity");
+    global.fetch = originalFetch;
+  }
+}
+
+// Discord login is itself asynchronous. Rollover before it resolves must
+// destroy the logged-in client without channel discovery or handler attach.
+{
+  const loginStarted = deferred();
+  const loginResult = deferred();
+  let authorized = true;
+  let channelFetches = 0;
+  let handlerAttaches = 0;
+  let destroys = 0;
+  class DeferredClient {
+    constructor() {
+      this.channels = {
+        fetch: async () => {
+          channelFetches += 1;
+          return { send: async () => {} };
+        },
+      };
+    }
+    login() {
+      loginStarted.resolve();
+      return loginResult.promise;
+    }
+    on() { handlerAttaches += 1; }
+    async destroy() { destroys += 1; }
+  }
+  discordBridge._setDiscordLibForTest({
+    Client: DeferredClient,
+    GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 4 },
+  });
+  const starting = discordBridge.start("dc-authority-start", "token", "channel", 8400, {
+    isAuthorityCurrent: () => authorized,
+  });
+  await loginStarted.promise;
+  authorized = false;
+  loginResult.resolve("ok");
+  await starting;
+  await Promise.resolve();
+  assert.equal(channelFetches, 0, "Discord rollover during login performs no channel fetch");
+  assert.equal(handlerAttaches, 0, "Discord rollover during login attaches no handlers");
+  assert.equal(destroys, 1, "Discord stale login destroys its client");
+  assert.equal(discordBridge.isRunning("dc-authority-start"), false, "Discord stale startup retires its instance");
+}
+
+// The persistent guard remains active after startup and blocks a channel send
+// if authority changes while an outbound chat response is awaiting decode.
+{
+  const originalFetch = global.fetch;
+  const messages = deferred();
+  const jsonStarted = deferred();
+  let authorized = true;
+  let sends = 0;
+  let destroys = 0;
+  try {
+    global.fetch = async () => ({
+      ok: true,
+      json: async () => {
+        jsonStarted.resolve();
+        return messages.promise;
+      },
+    });
+    discordBridge._instances.set("dc-authority-loop", {
+      projectId: "dc-authority-loop",
+      cursor: 0,
+      forwardedIds: new Set(),
+      timer: null,
+      stopping: false,
+      controllers: new Set(),
+      inFlight: new Set(),
+      isAuthorityCurrent: () => authorized,
+      client: { destroy: async () => { destroys += 1; } },
+    });
+    const polling = discordBridge._pollLoop("dc-authority-loop", {
+      send: async () => { sends += 1; },
+    }, 8400);
+    await jsonStarted.promise;
+    authorized = false;
+    messages.resolve([{ id: 13, sender: "head", text: "stale" }]);
+    await polling;
+    await Promise.resolve();
+    assert.equal(sends, 0, "Discord rollover during chat decode performs zero stale channel send");
+    assert.equal(discordBridge.readCursor("dc-authority-loop"), 0, "Discord stale loop persists no cursor");
+    assert.equal(destroys, 1, "Discord stale loop destroys its client");
+    assert.equal(discordBridge.isRunning("dc-authority-loop"), false, "Discord stale loop retires its instance");
+  } finally {
+    global.fetch = originalFetch;
+    await discordBridge.stop("dc-authority-loop");
+  }
+}
+
+// Discord's attached inbound handler must carry the same canonical identity.
+{
+  const originalFetch = global.fetch;
+  const handlers = new Map();
+  let inboundBody = null;
+  const identity = {
+    admission_generation: 4,
+    compatibility_mode: "v1",
+  };
+  class IdentityClient {
+    constructor() {
+      this.channels = { fetch: async () => ({ send: async () => {} }) };
+    }
+    async login() {}
+    on(name, handler) { handlers.set(name, handler); }
+    async destroy() {}
+  }
+  discordBridge._setDiscordLibForTest({
+    Client: IdentityClient,
+    GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 4 },
+  });
+  try {
+    global.fetch = async (url, options = {}) => {
+      if (options.method === "POST" && String(url).includes("/api/chat")) {
+        inboundBody = JSON.parse(options.body);
+        return { ok: true };
+      }
+      return { ok: true, json: async () => [] };
+    };
+    await discordBridge.start("dc-identity", "token", "channel", 8400, {
+      isAuthorityCurrent: () => true,
+      automationIdentity: identity,
+    });
+    await handlers.get("messageCreate")({
+      author: { bot: false, username: "operator" },
+      channel: { id: "channel" },
+      content: "hello",
+    });
+    assert.equal(inboundBody.admission_generation, identity.admission_generation);
+    assert.equal(inboundBody.compatibility_mode, identity.compatibility_mode,
+      "Discord inbound POST carries canonical V1 automation identity");
+  } finally {
+    await discordBridge.stop("dc-identity");
+    global.fetch = originalFetch;
+  }
 }
 
 console.log("\nAll bridge tests passed.");

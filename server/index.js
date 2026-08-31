@@ -18,6 +18,7 @@ const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
+const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
@@ -1807,179 +1808,65 @@ async function autoStartBridges(projectId, project, qwPort, admissionToken = nul
 // Track previous batch state per project for bridge auto-start detection
 const _bridgeBatchPrev = new Map();
 
-// #1031: automation is allowed to act only on the exact current assignment
-// owned by this installation. Progress can preserve an older snapshot for
-// display, so it is never lifecycle authority on its own. The live
-// /api/batch-active response must carry the same immutable assignment identity.
-function ownedBatchFingerprint(payload, { allowCleared = false } = {}) {
-  if (!payload || payload.provenance !== "owned" || payload.owned !== true ||
-      (allowCleared ? payload.current !== false : payload.current !== true)) return null;
-  if (typeof payload.installation_id !== "string" || !payload.installation_id) return null;
-  if (!Number.isSafeInteger(payload.batch_number) || payload.batch_number < 1) return null;
-  if (typeof payload.assignment_attempt !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(payload.assignment_attempt)) return null;
-  if (typeof payload.assignment_key !== "string" || !payload.assignment_key) return null;
-  return [
-    payload.installation_id,
-    payload.batch_number,
-    payload.assignment_attempt,
-    payload.assignment_key,
-  ].join("::");
+// #1031: UI and server automation share one fail-closed authority join. This
+// adapter keeps the server's established runtime shape; it must not duplicate
+// provenance, membership, row, or V1 compatibility validation.
+function unavailableBatchAutomationState() {
+  return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
 }
 
-function normalizedAssignmentItems(payload) {
-  if (!payload || !Array.isArray(payload.assignment_items)) return null;
-  const seen = new Set();
-  const items = [];
-  for (const item of payload.assignment_items) {
-    const ref = item && item.work_item_ref;
-    if (!ref || typeof ref !== "object" || Array.isArray(ref) ||
-        typeof ref.repo_key !== "string" || !ref.repo_key ||
-        typeof ref.repo !== "string" || !ref.repo ||
-        !Number.isSafeInteger(ref.number) || ref.number < 1 ||
-        (ref.kind !== "issue" && ref.kind !== "pr") ||
-        typeof item.ownership_key !== "string" || !item.ownership_key) return null;
-    const key = JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
-    if (seen.has(key)) return null;
-    seen.add(key);
-    items.push({ key, ownership_key: item.ownership_key, work_item_ref: { ...ref } });
-  }
-  items.sort((left, right) => left.key.localeCompare(right.key));
-  return items;
-}
-
-function ownedBatchRowMatches(row, assignment, assignmentItems) {
-  if (!row || typeof row !== "object" || !assignment) return false;
-  if (ownedBatchFingerprint(row) !== ownedBatchFingerprint(assignment)) return false;
-  const ref = row.work_item_ref;
-  if (!ref || typeof ref !== "object" || Array.isArray(ref)) return false;
-  return typeof row.repo_key === "string" && row.repo_key !== "" &&
-    typeof row.repo === "string" && row.repo !== "" &&
-    Number.isSafeInteger(row.number) && row.number > 0 &&
-    (row.kind === "issue" || row.kind === "pr") &&
-    ref.repo_key === row.repo_key && ref.repo === row.repo &&
-    ref.number === row.number && ref.kind === row.kind &&
-    typeof row.ownership_key === "string" && !!row.ownership_key &&
-    assignmentItems.some((item) => item.key === JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]) &&
-      item.ownership_key === row.ownership_key);
-}
-
-function ownedBatchAutomationState(progress, active) {
-  const clearedByOperator = progress?.liveActiveBatchCleared === true;
-  if (clearedByOperator && (active?.active !== false || !Array.isArray(progress?.items) || progress.items.length !== 0)) {
-    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
-  }
-  const progressFingerprint = ownedBatchFingerprint(progress, { allowCleared: clearedByOperator });
-  const activeFingerprint = ownedBatchFingerprint(active, { allowCleared: clearedByOperator });
-  if (!progressFingerprint || progressFingerprint !== activeFingerprint) {
-    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
-  }
-  const progressAssignmentItems = normalizedAssignmentItems(progress);
-  const activeAssignmentItems = normalizedAssignmentItems(active);
-  if (!progressAssignmentItems || !activeAssignmentItems ||
-      JSON.stringify(progressAssignmentItems) !== JSON.stringify(activeAssignmentItems)) {
-    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
-  }
-  if (clearedByOperator && (progressAssignmentItems.length !== 0 || activeAssignmentItems.length !== 0)) {
-    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
-  }
-  const hasItems = Array.isArray(progress.items) && progress.items.length > 0;
-  if (hasItems) {
-    const seenRows = new Set();
-    const rowsValid = progress.items.length === progressAssignmentItems.length && progress.items.every((row) => {
-      if (!ownedBatchRowMatches(row, progress, progressAssignmentItems)) return false;
-      const ref = row.work_item_ref;
-      const key = JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
-      if (seenRows.has(key)) return false;
-      seenRows.add(key);
-      return true;
-    });
-    if (!rowsValid || seenRows.size !== progressAssignmentItems.length) {
-      return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
-    }
-  }
-  const shouldStop = !!progress.completeConfirmed || clearedByOperator;
+function automationStateFromSnapshot(snapshot) {
+  if (!snapshot) return unavailableBatchAutomationState();
+  const legacy = snapshot.authority === "legacy_compatibility";
+  const requestFields = assignmentRequestFields(snapshot);
   return {
     authoritative: true,
-    fingerprint: progressFingerprint,
-    active: active.active === true,
-    hasItems,
-    clearedByOperator,
-    shouldStop,
-    identity: {
-      installation_id: progress.installation_id,
-      batch_number: progress.batch_number,
-      assignment_attempt: progress.assignment_attempt,
-      provenance: "owned",
-      assignment_key: progress.assignment_key,
-      assignment_items: progressAssignmentItems.map((item) => ({
-        work_item_ref: item.work_item_ref,
-        ownership_key: item.ownership_key,
-      })),
+    mode: legacy ? "v1" : "v2",
+    fingerprint: snapshot.fingerprint,
+    active: snapshot.active === true,
+    hasItems: snapshot.hasItems === true,
+    clearedByOperator: snapshot.liveActiveBatchCleared === true,
+    shouldStop: snapshot.completeConfirmed === true || snapshot.liveActiveBatchCleared === true,
+    identity: legacy ? null : {
+      installation_id: requestFields.installation_id,
+      batch_number: requestFields.batch_number,
+      assignment_attempt: requestFields.assignment_attempt,
+      provenance: requestFields.provenance,
+      assignment_key: requestFields.assignment_key,
+      assignment_items: requestFields.assignment_items,
     },
   };
 }
 
+function ownedBatchAutomationState(progress, active) {
+  const snapshot = ownedCurrentBatchSnapshot(active, progress);
+  return snapshot?.authority === "v2_owned"
+    ? automationStateFromSnapshot(snapshot)
+    : unavailableBatchAutomationState();
+}
+
 function legacyV1BatchAutomationState(progress, active) {
-  if (!progress || !active || progress.compatibility_mode !== "v1" || active.compatibility_mode !== "v1" ||
-      progress.provenance !== "legacy_unowned" || active.provenance !== "legacy_unowned" ||
-      progress.owned !== false || active.owned !== false ||
-      progress.installation_id != null || active.installation_id != null ||
-      progress.assignment_attempt != null || active.assignment_attempt != null ||
-      progress.assignment_key != null || active.assignment_key != null ||
-      !Array.isArray(progress.assignment_items) || progress.assignment_items.length !== 0 ||
-      !Array.isArray(active.assignment_items) || active.assignment_items.length !== 0 ||
-      progress.multi_repository !== false || active.multi_repository !== false ||
-      typeof active.active !== "boolean" || progress.batch_number !== active.batch_number) return null;
-  const clearedByOperator = progress.liveActiveBatchCleared === true;
-  if (clearedByOperator && (active.active !== false || progress.current !== false || active.current !== false)) return null;
-  if (!clearedByOperator && (progress.current !== true || active.current !== true)) return null;
-  const rows = Array.isArray(progress.items) ? progress.items : [];
-  const rowKeys = [];
-  if (!clearedByOperator) {
-    if (rows.length === 0) return null;
-    const seen = new Set();
-    for (const row of rows) {
-      const ref = row && row.work_item_ref;
-      if (!ref || typeof ref !== "object" || Array.isArray(ref) ||
-          row.provenance !== "legacy_unowned" || row.owned !== false || row.current !== true ||
-          row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
-          row.ownership_key != null || row.batch_number !== progress.batch_number ||
-          typeof row.repo_key !== "string" || !row.repo_key ||
-          typeof row.repo !== "string" || !row.repo ||
-          !Number.isSafeInteger(row.number) || row.number < 1 ||
-          (row.kind !== "issue" && row.kind !== "pr") ||
-          ref.repo_key !== row.repo_key || ref.repo !== row.repo ||
-          ref.number !== row.number || ref.kind !== row.kind) return null;
-      const key = JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
-      if (seen.has(key)) return null;
-      seen.add(key);
-      rowKeys.push(key);
-    }
-  }
-  rowKeys.sort();
-  return {
-    authoritative: true,
-    mode: "v1",
-    fingerprint: JSON.stringify(["legacy-v1-batch", 1, progress.batch_number ?? null, rowKeys]),
-    active: active.active === true,
-    hasItems: rows.length > 0,
-    clearedByOperator,
-    shouldStop: progress.completeConfirmed === true || clearedByOperator,
-    identity: null,
-  };
+  const snapshot = ownedCurrentBatchSnapshot(active, progress);
+  return snapshot?.authority === "legacy_compatibility"
+    ? automationStateFromSnapshot(snapshot)
+    : null;
 }
 
 function batchAutomationState(progress, active) {
-  const owned = ownedBatchAutomationState(progress, active);
-  if (owned.authoritative) return { ...owned, mode: "v2" };
-  return legacyV1BatchAutomationState(progress, active) || owned;
+  return automationStateFromSnapshot(ownedCurrentBatchSnapshot(active, progress));
+}
+
+function batchAutomationRequestBody(batchState) {
+  if (!batchState?.authoritative) return null;
+  if (batchState.mode === "v1") return { compatibility_mode: "v1" };
+  if (batchState.mode !== "v2" || !batchState.identity) return null;
+  return { compatibility_mode: "v2", ...batchState.identity };
 }
 
 function isBatchAutomationCurrent(projectId, batchState, admission = null) {
   if (!batchState?.authoritative || (admission && !isAdmissionCurrent(admission))) return false;
-  const body = batchState.mode === "v1"
-    ? { compatibility_mode: "v1" }
-    : { compatibility_mode: "v2", ...(batchState.identity || {}) };
+  const body = batchAutomationRequestBody(batchState);
+  if (!body) return false;
   return routes.validateCurrentOwnedAssignment(projectId, body).ok === true &&
     (!admission || isAdmissionCurrent(admission));
 }
@@ -2078,6 +1965,7 @@ async function sendTriggerMessage(projectId, automationBody = null) {
   const url = `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`;
 
   const info = triggers.get(projectId);
+  let chatAutomationBody = null;
   try {
     if (!isAdmissionCurrent(admission)) {
       stopTrigger(projectId);
@@ -2086,28 +1974,49 @@ async function sendTriggerMessage(projectId, automationBody = null) {
     if (automationBody) {
       const assignment = validateTriggerAutomationRequest(projectId, automationBody);
       if (!assignment.ok) {
+        stopTrigger(projectId);
         return { ok: false, code: assignment.code || "project_assignment_changed", sent: false };
+      }
+      chatAutomationBody = validatedTriggerAutomationBody(assignment);
+      if (!chatAutomationBody) {
+        stopTrigger(projectId);
+        return { ok: false, code: "project_assignment_changed", sent: false };
       }
     }
     if (autoBatchState && !isBatchAutomationCurrent(projectId, autoBatchState, admission)) {
       stopTrigger(projectId);
       return { ok: false, code: "project_assignment_changed", sent: false };
     }
+    if (!chatAutomationBody && autoBatchState) {
+      chatAutomationBody = batchAutomationRequestBody(autoBatchState);
+      if (!chatAutomationBody) {
+        stopTrigger(projectId);
+        return { ok: false, code: "project_assignment_changed", sent: false };
+      }
+    }
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: message, channel: "general" }),
+      // #1031: the receiver revalidates this exact discriminator immediately
+      // before appendMessage/PTY dispatch, closing rollover during fetch await.
+      body: JSON.stringify({ text: message, channel: "general", ...(chatAutomationBody || {}) }),
     });
     if (!res.ok) {
       const err = await res.text().catch(() => "");
       console.error(`Trigger send failed for ${projectId}: ${res.status} ${err}`);
       if (info) info.lastError = `${res.status}: ${err.slice(0, 100)}`;
+      return {
+        ok: false,
+        code: res.status === 409 ? "project_assignment_changed" : "trigger_send_failed",
+        sent: false,
+      };
     } else {
       if (info) info.lastError = null;
     }
   } catch (err) {
     console.error(`Trigger send error for ${projectId}:`, err.message);
     if (info) info.lastError = err.message;
+    return { ok: false, code: "trigger_send_failed", sent: false };
   }
 
   if (info) {
@@ -2349,6 +2258,37 @@ function validateTriggerAutomationRequest(projectId, body = {}) {
   return routes.validateCurrentOwnedAssignment(projectId, body);
 }
 
+// Store only the server-validated assignment discriminator in a scheduled
+// trigger. UI options/message are deliberately excluded. A manual start stays
+// unbound (null); pre-activation V1 remains explicit; V2 is copied from the
+// canonical live assignment returned by the validator, never trusted raw.
+function validatedTriggerAutomationBody(validation) {
+  if (!validation || validation.ok !== true) return undefined;
+  if (validation.manual === true) return null;
+  if (validation.legacy === true || validation.assignment?.compatibility_mode === "v1") {
+    return { compatibility_mode: "v1" };
+  }
+  const assignment = validation.assignment;
+  if (!assignment || assignment.compatibility_mode !== "v2" || assignment.owned !== true ||
+      assignment.provenance !== "owned" || typeof assignment.installation_id !== "string" ||
+      !assignment.installation_id || !Number.isSafeInteger(assignment.batch_number) ||
+      typeof assignment.assignment_attempt !== "string" || !assignment.assignment_attempt ||
+      typeof assignment.assignment_key !== "string" || !assignment.assignment_key ||
+      !Array.isArray(assignment.assignment_items)) return undefined;
+  return {
+    compatibility_mode: "v2",
+    installation_id: assignment.installation_id,
+    batch_number: assignment.batch_number,
+    assignment_attempt: assignment.assignment_attempt,
+    provenance: "owned",
+    assignment_key: assignment.assignment_key,
+    assignment_items: assignment.assignment_items.map((item) => ({
+      work_item_ref: { ...item.work_item_ref },
+      ownership_key: item.ownership_key,
+    })),
+  };
+}
+
 function rejectChangedTriggerAssignment(res, result) {
   return res.status(result?.status || 409).json({
     ok: false,
@@ -2359,12 +2299,16 @@ function rejectChangedTriggerAssignment(res, result) {
   });
 }
 
-app.post("/api/triggers/:project/start", (req, res) => {
+function startTriggerSchedule(req, res) {
   const { project } = req.params;
   try { assertProjectAdmitted(project); }
   catch (err) { return respondLifecycleFailure(res, err, { enabled: false }); }
   const assignment = validateTriggerAutomationRequest(project, req.body || {});
   if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
+  const automationBody = validatedTriggerAutomationBody(assignment);
+  if (assignment.manual !== true && !automationBody) {
+    return rejectChangedTriggerAssignment(res, { project_id: project });
+  }
   // #812: refuse to start a trigger for a parked (idle) project — no
   // timer created, no agents pulsed. Toggle the project off idle first.
   if (isProjectIdleId(project)) {
@@ -2409,7 +2353,7 @@ app.post("/api/triggers/:project/start", (req, res) => {
   // whatever agents are currently mid-task. The explicit "send now"
   // path still lives at /api/triggers/:project/send-now for the
   // rare case an operator actually wants to kick things off.
-  const timer = setInterval(() => sendTriggerMessage(project), ms);
+  const timer = setInterval(() => sendTriggerMessage(project, automationBody), ms);
   const expiresAt = durationMs > 0 ? Date.now() + durationMs : null;
 
   const triggerInfo = {
@@ -2420,6 +2364,7 @@ app.post("/api/triggers/:project/start", (req, res) => {
     lastError: null,
     expiresAt,
     durationTimer: null,
+    automationBody,
   };
 
   // Auto-stop after duration
@@ -2431,12 +2376,18 @@ app.post("/api/triggers/:project/start", (req, res) => {
 
   triggers.set(project, triggerInfo);
   res.json({ ok: true, enabled: true, interval: ms, nextAt: Date.now() + ms, expiresAt });
-});
+}
+
+app.post("/api/triggers/:project/start", startTriggerSchedule);
 
 app.post("/api/triggers/:project/stop", (req, res) => {
   const { project } = req.params;
   const assignment = validateTriggerAutomationRequest(project, req.body || {});
   if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
+  const automationBody = validatedTriggerAutomationBody(assignment);
+  if (assignment.manual !== true && !automationBody) {
+    return rejectChangedTriggerAssignment(res, { project_id: project });
+  }
   stopTrigger(project);
   res.json({ ok: true, enabled: false });
 });
@@ -2447,11 +2398,15 @@ app.post("/api/triggers/:project/send-now", async (req, res) => {
   catch (err) { return respondLifecycleFailure(res, err, { sent: false }); }
   const assignment = validateTriggerAutomationRequest(project, req.body || {});
   if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
+  const automationBody = validatedTriggerAutomationBody(assignment);
+  if (assignment.manual !== true && !automationBody) {
+    return rejectChangedTriggerAssignment(res, { project_id: project });
+  }
   // #812: parked (idle) project — do not pulse agents.
   if (isProjectIdleId(project)) {
     return res.json({ ok: false, idle: true, sent: false });
   }
-  const result = await sendTriggerMessage(project, assignment.manual ? null : (req.body || {}));
+  const result = await sendTriggerMessage(project, automationBody);
   if (!result.ok) return res.status(409).json(result);
   res.json(result);
 });
@@ -2824,7 +2779,9 @@ function syncTriggersFromConfig() {
         if (!existing || existing.interval !== ms) {
           if (existing && existing.timer) clearInterval(existing.timer);
           const timer = setInterval(() => sendTriggerMessage(project.id), ms);
-          triggers.set(project.id, { interval: ms, timer, lastSent: null, nextAt: Date.now() + ms, lastError: null });
+          // Config sync has no live assignment receipt. Preserve legacy/manual
+          // scheduling without fabricating V2 ownership on reload.
+          triggers.set(project.id, { interval: ms, timer, lastSent: null, nextAt: Date.now() + ms, lastError: null, automationBody: null });
         }
       }
     }
@@ -3429,14 +3386,14 @@ module.exports = {
   autoStopBridges,
   bridgeAssignmentBody,
   autoStopPollingTick,
-  ownedBatchFingerprint,
-  normalizedAssignmentItems,
-  ownedBatchRowMatches,
   ownedBatchAutomationState,
   legacyV1BatchAutomationState,
   batchAutomationState,
+  batchAutomationRequestBody,
   isBatchAutomationCurrent,
   validateTriggerAutomationRequest,
+  validatedTriggerAutomationBody,
+  startTriggerSchedule,
   validateCaffeinateAutomationRequest,
   registerCaffeinateOwner,
   caffeinateStatus,

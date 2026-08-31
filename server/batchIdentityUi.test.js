@@ -100,8 +100,11 @@ for (const [name, activeDelta, progressDelta] of [
   ["historical", { current: false }, { current: false }],
   ["stale active attempt", { assignment_attempt: "attempt-1" }, {}],
   ["stale progress attempt", {}, { assignment_attempt: "attempt-1" }],
+  ["invalid matching attempt grammar", { assignment_attempt: "bad attempt" }, { assignment_attempt: "bad attempt" }],
   ["aggregate membership mismatch", { assignment_items: [ASSIGNMENT_ITEMS[0]] }, {}],
   ["aggregate order mismatch", { assignment_items: [...ASSIGNMENT_ITEMS].reverse() }, {}],
+  ["duplicate ownership key", { assignment_items: [ASSIGNMENT_ITEMS[0], { ...ASSIGNMENT_ITEMS[1], ownership_key: ASSIGNMENT_ITEMS[0].ownership_key }] },
+    { assignment_items: [ASSIGNMENT_ITEMS[0], { ...ASSIGNMENT_ITEMS[1], ownership_key: ASSIGNMENT_ITEMS[0].ownership_key }] }],
 ]) {
   assert.equal(
     ownedCurrentBatchSnapshot({ ...active, ...activeDelta }, { ...progress, ...progressDelta }),
@@ -215,6 +218,26 @@ assert.deepEqual(
   { compatibility_mode: "v1" },
   "legacy auto action sends only the explicit compatibility discriminator and never fabricates V2 authority",
 );
+assert.equal(
+  ownedCurrentBatchSnapshot(
+    { ...legacyTop, active: true },
+    { ...legacyTop, complete: false, items: [legacyRow, { ...legacyRow }] },
+  ),
+  null,
+  "V1 duplicate composite rows fail closed in the shared authority join",
+);
+const legacyEditedRow = {
+  ...legacyRow,
+  number: 10,
+  issue_number: 10,
+  work_item_ref: { ...legacyRow.work_item_ref, number: 10 },
+};
+const legacyEdited = ownedCurrentBatchSnapshot(
+  { ...legacyTop, active: true },
+  { ...legacyTop, complete: false, items: [legacyEditedRow] },
+);
+assert.notEqual(legacyEdited.fingerprint, legacy.fingerprint,
+  "V1 same-batch row-set edits retain their historical transition identity");
 const legacyCleared = ownedCurrentBatchSnapshot(
   { ...legacyTop, current: false, active: false },
   { ...legacyTop, current: false, complete: false, completeConfirmed: false, liveActiveBatchCleared: true, items: [legacyRow] },
@@ -242,6 +265,13 @@ for (const [name, activeDelta, progressDelta] of [
 }
 
 const root = path.resolve(__dirname, "..");
+const serverIndex = fs.readFileSync(path.join(root, "server", "index.js"), "utf8");
+assert.match(serverIndex, /require\("\.\.\/src\/lib\/batchIdentity\.js"\)/,
+  "server automation imports the shared batch authority join");
+assert.match(serverIndex, /ownedCurrentBatchSnapshot\(active, progress\)/,
+  "server adapter preserves the shared helper's active/progress argument order");
+assert.doesNotMatch(serverIndex, /function\s+(?:ownedBatchFingerprint|normalizedAssignmentItems|ownedBatchRowMatches)\b/,
+  "server does not reintroduce a second batch authority state machine");
 const components = [
   "ScheduledTriggerWidget.tsx",
   "TelegramBridgeWidget.tsx",
