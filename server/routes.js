@@ -889,6 +889,7 @@ const {
   writeConfig,
   updateConfig,
   serializeProjectCompatibility,
+  allRepositories,
   primaryRepository,
   ConfigurationValidationError,
   commitV2Configuration,
@@ -1610,13 +1611,16 @@ router.get("/api/projects", async (req, res) => {
   async function fetchProjectGhData(p) {
     let openPrs = 0;
     let lastActivity = null;
-    const configuredRepo = getRepo(p.id);
+    const bindings = projectRepositoryBindings(p);
+    const configuredRepo = bindings.find((binding) => binding.primary)?.repo || null;
+    let repositories = bindings.map((binding) => repositoryState(binding));
     if (isProjectArchived(p.id, cfg)) {
       const hasArchivedAgents = p.agents && Object.keys(p.agents).length > 0;
       return {
         id: p.id,
         name: p.name,
         repo: configuredRepo,
+        repositories,
         agentCount: hasArchivedAgents ? Object.keys(p.agents).length : 0,
         openPrs: 0,
         state: "archived",
@@ -1632,6 +1636,7 @@ router.get("/api/projects", async (req, res) => {
         id: p.id,
         name: p.name,
         repo: configuredRepo,
+        repositories,
         agentCount: hasAgentsIdle ? Object.keys(p.agents).length : 0,
         openPrs: 0,
         state: "idle",
@@ -1641,30 +1646,60 @@ router.get("/api/projects", async (req, res) => {
     }
     const admission = projectAdmission(p.id, { demand: true });
     if (!admission) {
-      return { id: p.id, name: p.name, repo: configuredRepo, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
+      return { id: p.id, name: p.name, repo: configuredRepo, repositories, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
     }
     projectResultAdmissions.set(p.id, admission);
-    if (configuredRepo && REPO_RE.test(configuredRepo)) {
-      try {
-        // #806: REST + ETag instead of `gh pr list` (GraphQL-backed). Open-PR
-        // count + latest cross-state PR activity; both conditional (mostly 304).
-        const stillAdmitted = () => isAdmissionCurrent(admission);
-        const [prs, recentPrs] = await Promise.all([
-          ghApiConditional(`${configuredRepo}#projects-open-pulls`, `repos/${configuredRepo}/pulls?state=open&per_page=100`, stillAdmitted),
-          ghApiConditional(`${configuredRepo}#projects-last-activity`, `repos/${configuredRepo}/pulls?state=all&sort=updated&direction=desc&per_page=1`, stillAdmitted),
-        ]);
-        if (Array.isArray(prs.data)) openPrs = prs.data.length;
-        if (Array.isArray(recentPrs.data) && recentPrs.data[0]) lastActivity = recentPrs.data[0].updated_at || null;
-      } catch {}
+    if (bindings.length > 0) {
+      // #806/#1030: REST + ETag instead of `gh pr list` (GraphQL-backed).
+      // Bindings share one exact project admission token, while each request
+      // and ETag is isolated by canonical repository identity.
+      const stillAdmitted = () => isAdmissionCurrent(admission);
+      const metrics = await _mapLimited(bindings, GH_MAX_CONCURRENT, async (binding) => {
+        try {
+          const [prs, recentPrs] = await Promise.all([
+            ghApiConditional(`${binding.cache_repo}#projects-open-pulls`, `repos/${binding.cache_repo}/pulls?state=open&per_page=100`, stillAdmitted),
+            ghApiConditional(`${binding.cache_repo}#projects-last-activity`, `repos/${binding.cache_repo}/pulls?state=all&sort=updated&direction=desc&per_page=1`, stillAdmitted),
+          ]);
+          if (!stillAdmitted()) return null;
+          const failed = prs.status === "error" || recentPrs.status === "error";
+          return {
+            binding,
+            openPrs: Array.isArray(prs.data) ? prs.data.length : 0,
+            lastActivity: Array.isArray(recentPrs.data) && recentPrs.data[0] ? recentPrs.data[0].updated_at || null : null,
+            status: failed ? "error" : (prs.status === "ok" || recentPrs.status === "ok" ? "ok" : "unchanged"),
+          };
+        } catch {
+          return { binding, openPrs: 0, lastActivity: null, status: "error" };
+        }
+      });
+      const metricsByKey = new Map(metrics.filter(Boolean).map((metric) => [metric.binding.key, metric]));
+      repositories = bindings.map((binding) => {
+        const metric = metricsByKey.get(binding.key);
+        if (!metric) return { ...repositoryState(binding), stale: true };
+        const previous = repositoryState(binding);
+        return {
+          ...publicRepositoryBinding(binding),
+          openPrs: metric.openPrs,
+          lastActivity: metric.lastActivity,
+          status: metric.status,
+          stale: metric.status === "error",
+          last_good_at: metric.status === "error" ? previous.last_good_at : new Date().toISOString(),
+        };
+      });
+      for (const metric of metrics.filter(Boolean)) {
+        openPrs += metric.openPrs;
+        if (metric.lastActivity && (!lastActivity || Date.parse(metric.lastActivity) > Date.parse(lastActivity))) lastActivity = metric.lastActivity;
+      }
     }
     if (!isAdmissionCurrent(admission)) {
-      return { id: p.id, name: p.name, repo: configuredRepo, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
+      return { id: p.id, name: p.name, repo: configuredRepo, repositories, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
     }
     const hasAgents = p.agents && Object.keys(p.agents).length > 0;
     return {
       id: p.id,
       name: p.name,
       repo: configuredRepo,
+      repositories,
       agentCount: p.agents ? Object.keys(p.agents).length : 0,
       openPrs,
       state: hasAgents && activeProjectIds.has(p.id) ? "active" : "idle",
@@ -1681,7 +1716,7 @@ router.get("/api/projects", async (req, res) => {
   const recentEvents = [];
   for (const m of workflowMsgs) {
     // First: try text match against repo/project name
-    let projectName = (cfg.projects || []).find((p) => m.text.includes(getRepo(p.id) || "") || m.text.includes(p.name))?.name;
+    let projectName = (cfg.projects || []).find((p) => projectRepositoryBindings(p).some((binding) => m.text.includes(binding.repo)) || m.text.includes(p.name))?.name;
     // Second: use the AC instance the message came from
     if (!projectName) projectName = msgToProject.get(m);
     // Fallback: single-project installs
@@ -1768,6 +1803,64 @@ function getRepo(projectId) {
   }
 }
 
+function canonicalGithubRepo(repo) {
+  if (typeof repo !== "string") return null;
+  const normalized = repo.trim();
+  return REPO_RE.test(normalized) ? normalized.toLowerCase() : null;
+}
+
+// #1030: repository keys are project-local bindings while GitHub's repository
+// identity is global and case-insensitive. Shared caches use cache_repo only;
+// repo_key is added later, when a cached row is projected for one project.
+function projectRepositoryBindings(project) {
+  return allRepositories(project)
+    .map((entry) => {
+      const repo = typeof entry?.repo === "string" ? entry.repo.trim() : "";
+      const cacheRepo = canonicalGithubRepo(repo);
+      if (!cacheRepo || typeof entry?.key !== "string" || !entry.key) return null;
+      return {
+        key: entry.key,
+        repo,
+        primary: entry.primary === true,
+        cache_repo: cacheRepo,
+      };
+    })
+    .filter(Boolean);
+}
+
+function configuredProject(projectId, cfg = null) {
+  if (!projectId) return null;
+  try {
+    const source = cfg || JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    return source.projects?.find((project) => project?.id === projectId) || null;
+  } catch {
+    return null;
+  }
+}
+
+function getProjectRepositoryBindings(projectId, cfg = null) {
+  const project = configuredProject(projectId, cfg);
+  return project ? projectRepositoryBindings(project) : [];
+}
+
+function projectUnavailableForGithub(project, cfg) {
+  return !project?.id || project.idle || !_githubDemandedProjects.has(project.id) ||
+    isProjectArchived(project.id, cfg) || projectRepositoryBindings(project).length === 0;
+}
+
+function publicRepositoryBinding(binding) {
+  return { key: binding.key, repo: binding.repo, primary: binding.primary };
+}
+
+function decorateGithubRows(rows, binding) {
+  return (Array.isArray(rows) ? rows : []).map((row) => ({
+    ...row,
+    repo_key: binding.key,
+    repo: binding.repo,
+    number: row?.number,
+  }));
+}
+
 // #812: per-project Idle toggle. When a project is idle, QuadWork must
 // initiate ZERO project-specific GitHub/API activity for it. Callers
 // (board fetch, per-endpoint handlers, batch-progress, /api/projects)
@@ -1815,10 +1908,8 @@ function clearProjectBackgroundDemand(projectId) {
   return resources;
 }
 
-function archivedGithubLists(cached) {
-  return cached
-    ? { issues: cached.issues, prs: cached.prs, closedIssues: cached.closedIssues, mergedPrs: cached.mergedPrs, _archived: true, _readonly: true }
-    : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _archived: true, _readonly: true };
+function archivedGithubLists(project) {
+  return aggregateProjectGithubState(project, { _archived: true, _readonly: true });
 }
 
 async function cancelProjectBackground(projectId) {
@@ -1832,8 +1923,47 @@ async function cancelProjectBackground(projectId) {
 // emergency fallback, gated on the GraphQL budget. Name kept for minimal churn.
 
 const _graphqlCache = new Map(); // repo → { ts, issues, prs, closedIssues, mergedPrs }
+// canonical repo → { status, checkedAt, lastGoodAt }. A failed refresh never
+// deletes the repo's last-good snapshot, so one broken repository cannot blank
+// healthy siblings in a multi-repository project.
+const _githubRepoStatus = new Map();
 const GRAPHQL_CACHE_TTL = 60_000; // same as GH_ENDPOINT_CACHE_TTL
 let _graphqlRefreshInFlight = false;
+
+function repositoryState(binding, now = Date.now()) {
+  const cached = _graphqlCache.get(binding.cache_repo);
+  const observed = _githubRepoStatus.get(binding.cache_repo);
+  const lastGoodAt = observed?.lastGoodAt || cached?.ts || null;
+  const stale = !cached || now - cached.ts > GRAPHQL_CACHE_TTL || observed?.status === "error";
+  return {
+    ...publicRepositoryBinding(binding),
+    status: observed?.status || (cached ? "last_good" : "missing"),
+    stale,
+    last_good_at: lastGoodAt ? new Date(lastGoodAt).toISOString() : null,
+  };
+}
+
+function aggregateProjectGithubState(project, flags = {}) {
+  const bindings = projectRepositoryBindings(project);
+  const result = {
+    issues: [],
+    prs: [],
+    closedIssues: [],
+    mergedPrs: [],
+    repositories: bindings.map((binding) => repositoryState(binding)),
+    ...flags,
+  };
+  for (const binding of bindings) {
+    const cached = _graphqlCache.get(binding.cache_repo);
+    if (!cached) continue;
+    result.issues.push(...decorateGithubRows(cached.issues, binding));
+    result.prs.push(...decorateGithubRows(cached.prs, binding));
+    result.closedIssues.push(...decorateGithubRows(cached.closedIssues, binding));
+    result.mergedPrs.push(...decorateGithubRows(cached.mergedPrs, binding));
+  }
+  result._stale = result.repositories.some((repository) => repository.stale);
+  return result;
+}
 
 const RECENT_FETCH_LIMIT = 20;
 const RECENT_DISPLAY_LIMIT = 5;
@@ -2128,6 +2258,7 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
   if (!owner || !name || !isCurrent()) return { status: "cancelled", data: null };
   const base = `repos/${owner}/${name}`;
   let changed = 0;
+  let hadError = false;
 
   const [openPullsR, openIssuesR, closedIssuesR, closedPulls1R] = await Promise.all([
     ghApiConditional(`${repo}#pulls-open`, `${base}/pulls?state=open&per_page=50&sort=updated&direction=desc`, isCurrent),
@@ -2153,6 +2284,7 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
   let anyTopData = false;
   for (const r of [openPullsR, openIssuesR, closedIssuesR, ...closedPullPages]) {
     if (r.status === "ok") changed++;
+    if (r.status === "error") hadError = true;
     if (Array.isArray(r.data)) anyTopData = true;
   }
   // No list data at all (first run, every call failed) → don't fabricate a
@@ -2197,6 +2329,7 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
     ]);
     if (!isCurrent()) return null;
     if (reviewsR.status === "ok" || checkRunsR.status === "ok" || statusR.status === "ok") changed++;
+    if (reviewsR.status === "error" || (sha && (checkRunsR.status === "error" || statusR.status === "error"))) hadError = true;
     const reviews = mapReviews(Array.isArray(reviewsR.data) ? reviewsR.data : []);
     return {
       ...restPullBaseToCanonical(p),
@@ -2209,7 +2342,7 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
   if (!isCurrent()) return { status: "cancelled", data: null };
 
   return {
-    status: changed > 0 ? "ok" : "unchanged",
+    status: hadError ? "error" : changed > 0 ? "ok" : "unchanged",
     data: { issues, prs: prs.filter(Boolean), closedIssues, mergedPrs, openPrsWindowComplete, closedPrsWindowComplete, closedPrIssueNums },
   };
 }
@@ -2219,7 +2352,9 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
 // a background stale refresh overlapping an on-demand one) joins and awaits the
 // SAME in-flight pass, so by the time it resolves the slice caches are written.
 function refreshRepoRest(repo, ownerTokens = [], fetcher = githubStateFetcher) {
-  const existing = _restRefreshing.get(repo);
+  const cacheRepo = canonicalGithubRepo(repo);
+  if (!cacheRepo) return Promise.resolve({ status: "error", data: null });
+  const existing = _restRefreshing.get(cacheRepo);
   if (existing) {
     for (const token of ownerTokens) {
       if (token?.project_id) existing.owners.add(token);
@@ -2235,31 +2370,53 @@ function refreshRepoRest(repo, ownerTokens = [], fetcher = githubStateFetcher) {
   entry.promise = (async () => {
     let result;
     try {
-      const { status, data } = await fetcher(repo, hasCurrentOwner);
+      const { status, data } = await fetcher(cacheRepo, hasCurrentOwner);
       if (!hasCurrentOwner()) return { status: "cancelled", data: null };
-      if (data) {
+      if (data && status !== "error") {
         const now = Date.now();
-        _graphqlCache.set(repo, { ts: now, ...data });
-        _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: data.issues, stale: false });
-        _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: data.prs, stale: false });
-        _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: data.closedIssues, stale: false });
-        _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: data.mergedPrs, stale: false });
+        _graphqlCache.set(cacheRepo, { ts: now, ...data });
+        _githubRepoStatus.set(cacheRepo, {
+          status,
+          checkedAt: now,
+          lastGoodAt: now,
+        });
+        _ghEndpointCache.set(`issues:${cacheRepo}`, { ts: now, data: data.issues, stale: false });
+        _ghEndpointCache.set(`prs:${cacheRepo}`, { ts: now, data: data.prs, stale: false });
+        _ghEndpointCache.set(`closed-issues:${cacheRepo}`, { ts: now, data: data.closedIssues, stale: false });
+        _ghEndpointCache.set(`merged-prs:${cacheRepo}`, { ts: now, data: data.mergedPrs, stale: false });
+      } else {
+        const now = Date.now();
+        const previous = _githubRepoStatus.get(cacheRepo);
+        _githubRepoStatus.set(cacheRepo, { status, checkedAt: now, lastGoodAt: previous?.lastGoodAt || _graphqlCache.get(cacheRepo)?.ts || null });
+        for (const kind of ["issues", "prs", "closed-issues", "merged-prs"]) {
+          const key = `${kind}:${cacheRepo}`;
+          const cached = _ghEndpointCache.get(key);
+          if (cached) _ghEndpointCache.set(key, { ...cached, stale: true });
+        }
       }
       result = { status, data };
     } catch {
       result = { status: "error", data: null };
+      const now = Date.now();
+      const previous = _githubRepoStatus.get(cacheRepo);
+      _githubRepoStatus.set(cacheRepo, { status: "error", checkedAt: now, lastGoodAt: previous?.lastGoodAt || _graphqlCache.get(cacheRepo)?.ts || null });
+      for (const kind of ["issues", "prs", "closed-issues", "merged-prs"]) {
+        const key = `${kind}:${cacheRepo}`;
+        const cached = _ghEndpointCache.get(key);
+        if (cached) _ghEndpointCache.set(key, { ...cached, stale: true });
+      }
     }
     // #807: the server is the sole author of GITHUB.md's machine sections —
     // regenerate it from this completed pass's snapshot (success or error so
     // staleCycles advances). Non-fatal; never affects the board cache result.
     if (hasCurrentOwner()) {
-      try { syncGithubFilesForRepo(repo, result.status, entry.owners); } catch { /* non-fatal */ }
+      try { syncGithubFilesForRepo(cacheRepo, result.status, entry.owners); } catch { /* non-fatal */ }
     }
     return result;
   })().finally(() => {
-    if (_restRefreshing.get(repo) === entry) _restRefreshing.delete(repo);
+    if (_restRefreshing.get(cacheRepo) === entry) _restRefreshing.delete(cacheRepo);
   });
-  _restRefreshing.set(repo, entry);
+  _restRefreshing.set(cacheRepo, entry);
   return entry.promise;
 }
 
@@ -2470,10 +2627,10 @@ function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, sta
 function syncGithubFilesForRepo(repo, status, ownerTokens = new Set()) {
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
-  const snapshot = _graphqlCache.get(repo) || null;
+  const snapshot = _graphqlCache.get(canonicalGithubRepo(repo)) || null;
   for (const p of cfg.projects || []) {
     const token = [...ownerTokens].find((candidate) => candidate?.project_id === p.id && isAdmissionCurrent(candidate));
-    if (getRepo(p.id) !== repo || p.idle || !token || !isAdmissionCurrent(token)) continue;
+    if (canonicalGithubRepo(getRepo(p.id)) !== repo || p.idle || !token || !isAdmissionCurrent(token)) continue;
     writeGithubFileFromSnapshot(p.id, p.name || p.id, repo, snapshot, status);
   }
 }
@@ -2553,32 +2710,34 @@ async function fetchAllProjectsGraphQL() {
   } catch {
     return null;
   }
-  const projects = (cfg.projects || []).filter((p) => {
-    const repo = getRepo(p.id);
-    return repo && REPO_RE.test(repo) && !p.idle &&
-      _githubDemandedProjects.has(p.id) && !isProjectArchived(p.id, cfg);
-  }); // #812/#1034: skip idle, archived, and not-yet-demanded projects
-  const admissions = new Map();
-  const admittedProjects = [];
-  for (const project of projects) {
+  const admittedBindings = [];
+  for (const project of cfg.projects || []) {
+    if (projectUnavailableForGithub(project, cfg)) continue;
     const admission = projectAdmission(project.id);
     if (!admission) continue;
-    admissions.set(project.id, admission);
-    admittedProjects.push(project);
+    for (const binding of projectRepositoryBindings(project)) {
+      admittedBindings.push({ binding, admission });
+    }
   }
-  if (admittedProjects.length === 0) return null;
+  if (admittedBindings.length === 0) return null;
 
-  // Build aliased repository fields — one per project.
-  // Alias must be a valid GraphQL identifier: letters/digits/underscore only.
-  const seen = new Set();
+  // One deterministic index alias per canonical repository avoids collisions
+  // such as owner/a-b and owner/a_b while shared bindings still fetch once.
+  const repositories = new Map();
+  for (const { binding, admission } of admittedBindings) {
+    let entry = repositories.get(binding.cache_repo);
+    if (!entry) {
+      entry = { binding, admissions: [] };
+      repositories.set(binding.cache_repo, entry);
+    }
+    entry.admissions.push(admission);
+  }
   const fragments = [];
-  for (const p of admittedProjects) {
-    const repo = getRepo(p.id);
-    const [owner, name] = repo.split("/");
-    const alias = repo.replace(/[^a-zA-Z0-9]/g, "_");
-    if (seen.has(alias)) continue; // skip duplicate repos
-    seen.add(alias);
-    fragments.push(`${alias}: repository(owner: "${owner}", name: "${name}") { ...repoFields }`);
+  let repositoryIndex = 0;
+  for (const entry of repositories.values()) {
+    const [owner, name] = entry.binding.cache_repo.split("/");
+    entry.alias = `repo_${repositoryIndex++}`;
+    fragments.push(`${entry.alias}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ...repoFields }`);
   }
 
   const query = `query {
@@ -2607,11 +2766,9 @@ fragment repoFields on Repository {
     if (!data) return null;
 
     const result = new Map();
-    for (const p of admittedProjects) {
-      if (!isAdmissionCurrent(admissions.get(p.id))) continue;
-      const repo = getRepo(p.id);
-      const alias = repo.replace(/[^a-zA-Z0-9]/g, "_");
-      const repoData = data[alias];
+    for (const [repo, entry] of repositories) {
+      if (!entry.admissions.some((admission) => isAdmissionCurrent(admission))) continue;
+      const repoData = data[entry.alias];
       if (!repoData) continue;
 
       // Transform GraphQL nodes into the same shape as gh CLI JSON output.
@@ -2698,20 +2855,20 @@ async function refreshGraphQLCache() {
   try {
     let cfg;
     try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
-    const seen = new Set();
     const repos = [];
     const ownersByRepo = new Map();
     for (const p of cfg.projects || []) {
-      const repo = getRepo(p.id);
-      if (!repo || !REPO_RE.test(repo) || p.idle) continue; // #812: skip idle
-      if (!_githubDemandedProjects.has(p.id) || isProjectArchived(p.id, cfg)) continue;
-      const token = repo && projectAdmission(p.id);
-      if (!repo || !token) continue;
-      if (!ownersByRepo.has(repo)) ownersByRepo.set(repo, []);
-      ownersByRepo.get(repo).push(token);
-      if (seen.has(repo)) continue;
-      seen.add(repo);
-      repos.push(repo);
+      if (projectUnavailableForGithub(p, cfg)) continue;
+      const token = projectAdmission(p.id);
+      if (!token) continue;
+      for (const binding of projectRepositoryBindings(p)) {
+        const repo = binding.cache_repo;
+        if (!ownersByRepo.has(repo)) {
+          ownersByRepo.set(repo, []);
+          repos.push(repo);
+        }
+        ownersByRepo.get(repo).push(token);
+      }
     }
     const results = await _mapLimited(repos, GH_MAX_CONCURRENT, (repo) =>
       refreshRepoRest(repo, ownersByRepo.get(repo)).then((r) => ({ repo, status: r.status })),
@@ -2731,6 +2888,7 @@ async function refreshGraphQLCache() {
           const d = gql.get(repo);
           if (!d) continue;
           _graphqlCache.set(repo, { ts: now, ...d });
+          _githubRepoStatus.set(repo, { status: "fallback", checkedAt: now, lastGoodAt: now });
           _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: d.issues, stale: false });
           _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: d.prs, stale: false });
           _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: d.closedIssues, stale: false });
@@ -2931,101 +3089,73 @@ function evalBatchCompleteConfirmed(projectId, batchKey, complete, generatedAt) 
 // with on-demand refresh if stale.
 router.get("/api/github/all", async (req, res) => {
   const projectFilter = req.query.project || "";
-
-  if (projectFilter && isProjectArchived(projectFilter)) {
-    const repo = getRepo(projectFilter);
-    return res.json({ [projectFilter]: archivedGithubLists(repo ? _graphqlCache.get(repo) : null) });
-  }
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
+  let projects = (cfg.projects || []).filter((project) =>
+    projectRepositoryBindings(project).length > 0 && (!projectFilter || project.id === projectFilter));
 
   if (projectFilter) {
-    projectAdmission(projectFilter, { demand: true });
-  } else {
-    try {
-      const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-      for (const project of cfg.projects || []) {
-        if (!project?.id || project.idle || isProjectArchived(project.id, cfg)) continue;
-        projectAdmission(project.id, { demand: true });
-      }
-    } catch {}
+    const filtered = projects[0];
+    if (filtered && isProjectArchived(filtered.id, cfg)) {
+      return res.json({ [projectFilter]: archivedGithubLists(filtered) });
+    }
+  }
+
+  const admissions = new Map();
+  for (const project of projects) {
+    if (project.idle || isProjectArchived(project.id, cfg)) continue;
+    const admission = projectAdmission(project.id, { demand: true });
+    if (admission) admissions.set(project.id, admission);
   }
 
   // Ensure cache is populated.
-  const anyStale = (() => {
-    let cfg;
-    try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return true; }
-    const projects = (cfg.projects || []).filter((p) => {
-      const repo = getRepo(p.id);
-      return repo && REPO_RE.test(repo) && !p.idle &&
-        _githubDemandedProjects.has(p.id) && !isProjectArchived(p.id, cfg);
-    }); // #812/#1034: skip idle, archived, and undemanded projects
-    for (const p of projects) {
-      const cached = _graphqlCache.get(getRepo(p.id));
-      if (!cached || Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL)) return true;
-    }
-    return false;
-  })();
+  const anyStale = projects.some((project) => !project.idle && !isProjectArchived(project.id, cfg) &&
+    projectRepositoryBindings(project).some((binding) => {
+      const cached = _graphqlCache.get(binding.cache_repo);
+      return !cached || Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL);
+    }));
   if (anyStale) await refreshGraphQLCache();
 
-  // Build response.
-  let cfg;
+  // Re-read after the await so an archive committed during refresh is reflected
+  // in the response as well as being rejected by its exact admission token.
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
-  const projects = (cfg.projects || []).filter((p) => {
-    const repo = getRepo(p.id);
-    return repo && REPO_RE.test(repo);
-  }); // #812: include idle projects — served stale below, never fetched
+  projects = (cfg.projects || []).filter((project) =>
+    projectRepositoryBindings(project).length > 0 && (!projectFilter || project.id === projectFilter));
 
   const result = {};
   const fallbackNeeded = [];
   for (const p of projects) {
-    if (projectFilter && p.id !== projectFilter) continue;
-    const cached = _graphqlCache.get(getRepo(p.id));
     if (isProjectArchived(p.id, cfg)) {
-      result[p.id] = archivedGithubLists(cached);
+      result[p.id] = archivedGithubLists(p);
       continue;
     }
     // #812: idle (parked) project — serve last-known data flagged _idle,
     // never trigger a fetch or fall back to gh.
     if (p.idle) {
-      result[p.id] = cached
-        ? { issues: cached.issues, prs: cached.prs, closedIssues: cached.closedIssues, mergedPrs: cached.mergedPrs, _idle: true }
-        : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _idle: true };
+      result[p.id] = aggregateProjectGithubState(p, { _idle: true });
       continue;
     }
-    if (cached) {
-      result[p.id] = {
-        issues: cached.issues,
-        prs: cached.prs,
-        closedIssues: cached.closedIssues,
-        mergedPrs: cached.mergedPrs,
-        _stale: Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL),
-      };
-    } else {
-      const admission = projectAdmission(p.id);
-      if (admission) fallbackNeeded.push({ project: p, admission });
-    }
+    result[p.id] = aggregateProjectGithubState(p);
+    const missing = projectRepositoryBindings(p).filter((binding) => !_graphqlCache.has(binding.cache_repo));
+    const admission = admissions.get(p.id) || projectAdmission(p.id);
+    if (missing.length > 0 && admission) fallbackNeeded.push({ project: p, admission, bindings: missing });
   }
 
   // #806: fallback for still-missing repos goes through the REST+ETag snapshot
   // (refreshRepoRest), NOT `gh pr list`/`gh issue list`. Concurrency-limited so
   // a cold multi-project load doesn't drain the core budget.
   if (fallbackNeeded.length > 0 && !isRateLimited()) {
-    await _mapLimited(fallbackNeeded, GH_MAX_CONCURRENT, ({ project, admission }) => refreshRepoRest(getRepo(project.id), [admission]));
+    const missingRepos = [];
+    for (const item of fallbackNeeded) {
+      for (const binding of item.bindings) missingRepos.push({ binding, admission: item.admission });
+    }
+    await _mapLimited(missingRepos, GH_MAX_CONCURRENT, ({ binding, admission }) => refreshRepoRest(binding.cache_repo, [admission]));
     for (const { project: p, admission } of fallbackNeeded) {
-      const repo = getRepo(p.id);
-      const cached = repo ? _graphqlCache.get(repo) : null;
       if (!isAdmissionCurrent(admission)) {
-        result[p.id] = archivedGithubLists(cached);
+        result[p.id] = archivedGithubLists(p);
         continue;
       }
-      result[p.id] = cached
-        ? {
-            issues: cached.issues,
-            prs: cached.prs,
-            closedIssues: cached.closedIssues,
-            mergedPrs: cached.mergedPrs,
-            _fallback: true,
-          }
-        : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _fallback: true };
+      result[p.id] = aggregateProjectGithubState(p, { _fallback: true });
     }
   }
 
@@ -3039,28 +3169,61 @@ router.get("/api/github/all", async (req, res) => {
 // RECENT_DISPLAY_LIMIT there). On a warm cache we serve instantly; cold misses
 // fetch the whole snapshot once via refreshRepoRest — no `gh pr list`/`gh issue
 // list` (those are GraphQL-backed). Idle projects never fetch.
-async function serveGithubList(req, res, kind) {
-  const project = req.query.project || "";
-  const repo = getRepo(project);
-  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  const cacheKey = `${kind}:${repo}`;
-  const cached = _ghEndpointCache.get(cacheKey);
+function githubEndpointEntries(bindings, kind) {
+  return bindings.map((binding) => ({
+    binding,
+    cached: _ghEndpointCache.get(`${kind}:${binding.cache_repo}`) || null,
+    observed: _githubRepoStatus.get(binding.cache_repo) || null,
+  }));
+}
 
-  if (isProjectArchived(project)) {
+function aggregateGithubEndpointRows(entries) {
+  const rows = [];
+  for (const { binding, cached } of entries) {
+    rows.push(...decorateGithubRows(cached?.data, binding));
+  }
+  return rows;
+}
+
+function setGithubRepositoryHeaders(res, entries, { rateLimited = false } = {}) {
+  const stale = entries.filter(({ cached, observed }) =>
+    !cached || cached.stale || Date.now() - cached.ts >= GH_ENDPOINT_CACHE_TTL || observed?.status === "error");
+  const failed = entries.filter(({ observed }) => observed?.status === "error");
+  if (rateLimited) res.set("X-QuadWork-Rate-Limited", "1");
+  if (stale.length > 0) {
+    res.set("X-QuadWork-Stale", "1");
+    res.set("X-QuadWork-Stale-Repositories", stale.map(({ binding }) => binding.key).join(","));
+  }
+  if (failed.length > 0) {
+    res.set("X-QuadWork-Failed-Repositories", failed.map(({ binding }) => binding.key).join(","));
+  }
+}
+
+async function serveGithubList(req, res, kind) {
+  const projectId = req.query.project || "";
+  const project = configuredProject(projectId);
+  const bindings = project ? projectRepositoryBindings(project) : [];
+  if (bindings.length === 0) return res.status(400).json({ error: "No repo configured for project" });
+  let entries = githubEndpointEntries(bindings, kind);
+
+  if (isProjectArchived(projectId)) {
     res.set("X-QuadWork-Archived", "1");
     res.set("X-QuadWork-Readonly", "1");
-    return res.json(cached ? cached.data : []);
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
 
   // #812: a parked (idle) project must never initiate a fetch.
-  if (isProjectIdle(project)) {
+  if (project.idle) {
     res.set("X-QuadWork-Idle", "1");
-    return res.json(cached ? cached.data : []);
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
-  const admission = projectAdmission(project, { demand: true });
+  const admission = projectAdmission(projectId, { demand: true });
   if (!admission) {
     res.set("X-QuadWork-Archived", "1");
-    return res.json(cached ? cached.data : []);
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
 
   // #824: these four endpoints serve a BARE ARRAY (cached.data is an array).
@@ -3073,37 +3236,48 @@ async function serveGithubList(req, res, kind) {
   // Freshness is measured against the BASE TTL, not adaptiveTTL: under critical
   // rate-limit adaptiveTTL is Infinity, so an age<ttl check would treat an
   // arbitrarily-old cache as fresh and skip the staleness signal entirely.
-  const baseFresh = cached && Date.now() - cached.ts < GH_ENDPOINT_CACHE_TTL;
+  const allBaseFresh = entries.every(({ cached }) => cached && Date.now() - cached.ts < GH_ENDPOINT_CACHE_TTL && !cached.stale);
 
   // Critically REST-rate-limited → serve whatever we have (even expired) without
   // revalidating. MUST precede the cache-hit branch below: adaptiveTTL is
   // Infinity here, so that branch would otherwise return first and an expired
   // array would go out with no X-QuadWork-Stale / X-QuadWork-Rate-Limited.
-  if (isRateLimited() && cached) {
-    res.set("X-QuadWork-Rate-Limited", "1");
-    if (!baseFresh || cached.stale) res.set("X-QuadWork-Stale", "1");
-    return res.json(cached.data);
+  if (isRateLimited()) {
+    setGithubRepositoryHeaders(res, entries, { rateLimited: true });
+    return res.json(aggregateGithubEndpointRows(entries));
   }
   // Fresh enough (within the adaptive window) → serve as-is.
-  if (cached && Date.now() - cached.ts < adaptiveTTL(GH_ENDPOINT_CACHE_TTL)) {
-    if (cached.stale) res.set("X-QuadWork-Stale", "1");
-    return res.json(cached.data);
+  const allAdaptivelyFresh = entries.every(({ cached }) =>
+    cached && Date.now() - cached.ts < adaptiveTTL(GH_ENDPOINT_CACHE_TTL) && !cached.stale);
+  if (allAdaptivelyFresh) {
+    if (!allBaseFresh) setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
   // Stale-while-revalidate: serve stale now, refresh the snapshot in background.
-  if (cached) {
-    refreshRepoRest(repo, [admission]);
-    res.set("X-QuadWork-Stale", "1");
-    return res.json(cached.data);
+  if (entries.every(({ cached }) => !!cached)) {
+    for (const { binding, cached } of entries) {
+      if (cached.stale || Date.now() - cached.ts >= adaptiveTTL(GH_ENDPOINT_CACHE_TTL)) {
+        refreshRepoRest(binding.cache_repo, [admission]);
+      }
+    }
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
-  // Cold: assemble the snapshot synchronously, then serve this slice.
-  await refreshRepoRest(repo, [admission]);
+  // Cold/partial: assemble every missing slice synchronously. Existing stale
+  // siblings remain available even if one repository fails.
+  const needsRefresh = entries.filter(({ cached }) => !cached).map(({ binding }) => binding);
+  await _mapLimited(needsRefresh, GH_MAX_CONCURRENT, (binding) => refreshRepoRest(binding.cache_repo, [admission]));
   if (!isAdmissionCurrent(admission)) {
     res.set("X-QuadWork-Archived", "1");
-    const lastKnown = _ghEndpointCache.get(cacheKey);
-    return res.json(lastKnown ? lastKnown.data : []);
+    entries = githubEndpointEntries(bindings, kind);
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
-  const fresh = _ghEndpointCache.get(cacheKey);
-  if (fresh) return res.json(fresh.data);
+  entries = githubEndpointEntries(bindings, kind);
+  if (entries.some(({ cached }) => !!cached)) {
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
+  }
   return res.status(502).json({ error: "gh call failed" });
 }
 
@@ -4138,7 +4312,7 @@ async function computeBatchProgress(projectId, repo, admission = projectAdmissio
   // can't prove a specific item — now (a) concurrency-capped via _mapLimited and
   // (b) soft-failing a transient error to "queued (retrying)" rather than a hard
   // "fetch failed".
-  const snapshot = _graphqlCache.get(repo) || null;
+  const snapshot = _graphqlCache.get(canonicalGithubRepo(repo)) || null;
   let items;
   if (snapshot) {
     items = await _mapLimited(issueNumbers, GH_MAX_CONCURRENT, async (n) => {
@@ -5832,6 +6006,14 @@ module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
 module.exports._batchProgressCache = _batchProgressCache;
 module.exports._batchProgressRefreshes = _batchProgressRefreshes;
 module.exports._graphqlCache = _graphqlCache;
+module.exports._githubRepoStatus = _githubRepoStatus;
+module.exports.projectRepositoryBindings = projectRepositoryBindings;
+module.exports.getProjectRepositoryBindings = getProjectRepositoryBindings;
+module.exports.decorateGithubRows = decorateGithubRows;
+module.exports.aggregateProjectGithubState = aggregateProjectGithubState;
+module.exports.repositoryState = repositoryState;
+module.exports.refreshGraphQLCache = refreshGraphQLCache;
+module.exports.fetchAllProjectsGraphQL = fetchAllProjectsGraphQL;
 module.exports.restIssueToCanonical = restIssueToCanonical;
 module.exports.restClosedIssueToCanonical = restClosedIssueToCanonical;
 module.exports.restMergedPrToCanonical = restMergedPrToCanonical;
