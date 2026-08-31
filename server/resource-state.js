@@ -15,6 +15,7 @@ const INVALID = Symbol("invalid resource state field");
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const UNIT_RE = /^[a-z][a-z0-9.-]{0,127}$/;
 const SIGNAL_RE = /^SIG[A-Z0-9]{1,30}$/;
+const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 const RESOURCE_CLASSES = new Set(["worker", "control", "api"]);
 const TERMINAL_REASONS = new Set(["normal_exit", "signal", "oom_kill", "unknown"]);
 const STATUSES = new Set([
@@ -78,6 +79,15 @@ function safeArray(value) {
   }
 }
 
+function safeHasOwn(value, key) {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return INVALID;
+  try {
+    return Object.prototype.hasOwnProperty.call(value, key);
+  } catch {
+    return INVALID;
+  }
+}
+
 function validTerminalFactLimit(value) {
   return Number.isSafeInteger(value) && value > 0 && value <= MAX_TERMINAL_FACT_LIMIT;
 }
@@ -120,6 +130,21 @@ function sanitizeSignal(value) {
 
 function sanitizeTime(value) {
   if (typeof value !== "string" || value.length > 64) return null;
+  const match = ISO_TIMESTAMP_RE.exec(value);
+  if (match === null) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === "Z" ? 0 : Number(match[10]);
+  const offsetMinute = match[8] === "Z" ? 0 : Number(match[11]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]
+    || hour > 23 || minute > 59 || second > 59
+    || offsetHour > 23 || offsetMinute > 59) return null;
   const millis = Date.parse(value);
   if (!Number.isFinite(millis)) return null;
   try {
@@ -127,6 +152,35 @@ function sanitizeTime(value) {
   } catch {
     return null;
   }
+}
+
+function sanitizeInlineOom(input) {
+  const hasCount = safeHasOwn(input, "oom_kill_count");
+  const hasObservedAt = safeHasOwn(input, "oom_observed_at");
+  if (hasCount === false && hasObservedAt === false) return { present: false, value: null };
+  if (hasCount !== true || hasObservedAt !== true) return { present: true, value: null };
+  const count = sanitizeOomKillCount(safeGet(input, "oom_kill_count"));
+  const observedAt = sanitizeTime(safeGet(input, "oom_observed_at"));
+  if (count === null || BigInt(count) === 0n || observedAt === null) {
+    return { present: true, value: null };
+  }
+  return {
+    present: true,
+    value: Object.freeze({ oom_kill_count: count, oom_observed_at: observedAt }),
+  };
+}
+
+function legacyOomForFact(oomProvenance, { projectId, generationId, resourceClass, unitName }) {
+  if (oomProvenance === null
+    || oomProvenance.project_id !== projectId
+    || oomProvenance.generation_id !== generationId
+    || oomProvenance.resource_class !== resourceClass
+    || oomProvenance.unit_name !== unitName
+    || BigInt(oomProvenance.oom_kill_count) === 0n) return null;
+  return Object.freeze({
+    oom_kill_count: oomProvenance.oom_kill_count,
+    oom_observed_at: oomProvenance.observed_at,
+  });
 }
 
 function sanitizeTerminalFact(input, oomProvenance) {
@@ -156,16 +210,17 @@ function sanitizeTerminalFact(input, oomProvenance) {
     && (!exit.valid || exit.value !== 0 || !signal.valid || signal.value !== null)) normalizedReason = "unknown";
   if (reason === "signal"
     && (!exit.valid || exit.value !== null || !signal.valid || signal.value === null)) normalizedReason = "unknown";
-  // The validated cgroup observation is the OOM authority. Wrapper exit/signal
-  // metadata may be empty (for example, a descendant was killed) and cannot
-  // override it, but malformed non-null metadata still fails closed.
-  const hasOomProvenance = oomProvenance !== null
-    && oomProvenance.project_id === projectId
-    && oomProvenance.generation_id === generationId
-    && oomProvenance.resource_class === resourceClass
-    && oomProvenance.unit_name === unitName
-    && BigInt(oomProvenance.oom_kill_count) > 0n;
-  if (reason === "oom_kill" && (!hasOomProvenance || !exit.valid || !signal.valid)) normalizedReason = "unknown";
+  // New snapshots bind positive cgroup evidence to each OOM fact so multiple
+  // generations survive independently. A v1 fact with no inline fields may
+  // still use the exact matching positive global observation; sanitization
+  // upgrades that legacy pair into the inline representation on its next save.
+  const inlineOom = sanitizeInlineOom(input);
+  const oomEvidence = inlineOom.present
+    ? inlineOom.value
+    : legacyOomForFact(oomProvenance, { projectId, generationId, resourceClass, unitName });
+  if (reason === "oom_kill" && (oomEvidence === null || !exit.valid || !signal.valid)) {
+    normalizedReason = "unknown";
+  }
   return Object.freeze({
     project_id: projectId,
     generation_id: generationId,
@@ -175,6 +230,7 @@ function sanitizeTerminalFact(input, oomProvenance) {
     exit_code: exit.value,
     signal: signal.value,
     finished_at: finishedAt,
+    ...(normalizedReason === "oom_kill" ? oomEvidence : {}),
   });
 }
 

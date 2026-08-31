@@ -38,6 +38,17 @@ function fact(index, extra = {}) {
   };
 }
 
+function oomProvenanceFor(terminalFact, count, observedAt) {
+  return {
+    project_id: terminalFact.project_id,
+    generation_id: terminalFact.generation_id,
+    resource_class: terminalFact.resource_class,
+    unit_name: terminalFact.unit_name,
+    oom_kill_count: count,
+    observed_at: observedAt,
+  };
+}
+
 function fullState(terminalFacts = [fact(1)]) {
   return {
     status: "ready",
@@ -286,6 +297,211 @@ function fullState(terminalFacts = [fact(1)]) {
   });
   assert.equal(legacyGlobal.last_cgroup_oom, null);
   assert.equal(legacyGlobal.terminal_facts[0].reason, "unknown");
+}
+
+// Every historical OOM carries its own qualified counter/time pair. A later
+// zero observation remains the latest global observation without invalidating
+// the earlier fact, and re-sanitization is idempotent.
+{
+  const first = fact(32, {
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    oom_kill_count: 7,
+    oom_observed_at: "2026-08-31T09:00:32+09:00",
+  });
+  const second = fact(33);
+  const snapshot = createResourceSnapshot({
+    last_cgroup_oom: oomProvenanceFor(second, 0, "2026-08-31T00:00:33Z"),
+    terminal_facts: [first, second],
+  });
+  assert.deepEqual(snapshot.terminal_facts[0], {
+    project_id: first.project_id,
+    generation_id: first.generation_id,
+    resource_class: first.resource_class,
+    unit_name: first.unit_name,
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    finished_at: first.finished_at,
+    oom_kill_count: "7",
+    oom_observed_at: "2026-08-31T00:00:32.000Z",
+  });
+  assert.equal(snapshot.last_cgroup_oom.generation_id, second.generation_id);
+  assert.equal(snapshot.last_cgroup_oom.oom_kill_count, "0");
+  assert.deepEqual(createResourceSnapshot(snapshot), snapshot);
+}
+
+// Multiple OOM generations, including exact counters above Number.MAX_SAFE_INTEGER,
+// survive JSON persistence independently of the one latest global observation.
+{
+  const { filePath } = fixture();
+  const first = fact(34, {
+    reason: "oom_kill",
+    exit_code: 0,
+    signal: null,
+    oom_kill_count: 9_007_199_254_740_993n,
+    oom_observed_at: "2026-08-01T00:00:34.001Z",
+  });
+  const second = fact(35, {
+    reason: "oom_kill",
+    exit_code: null,
+    signal: 9,
+    oom_kill_count: "18446744073709551615",
+    oom_observed_at: "2026-08-02T00:00:35.002Z",
+  });
+  const store = new ResourceStateStore({ filePath });
+  const saved = store.save({
+    status: "candidate_pending_staging",
+    last_cgroup_oom: oomProvenanceFor(second, "18446744073709551615", second.oom_observed_at),
+    terminal_facts: [first, second],
+  });
+  assert.deepEqual(saved.terminal_facts.map((entry) => [entry.reason, entry.oom_kill_count]), [
+    ["oom_kill", "9007199254740993"],
+    ["oom_kill", "18446744073709551615"],
+  ]);
+  assert.doesNotThrow(() => JSON.parse(fs.readFileSync(filePath, "utf8")));
+  assert.deepEqual(new ResourceStateStore({ filePath }).load(), saved);
+}
+
+// Retention bounds apply to inline-provenance facts without coupling retained
+// entries to the latest global identity.
+{
+  const oomFacts = [36, 37, 38].map((index) => fact(index, {
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    oom_kill_count: index,
+    oom_observed_at: `2026-08-01T00:00:${index}.000Z`,
+  }));
+  const snapshot = createResourceSnapshot({
+    last_cgroup_oom: oomProvenanceFor(oomFacts[2], 38, oomFacts[2].oom_observed_at),
+    terminal_facts: oomFacts,
+  }, { terminalFactLimit: 2 });
+  assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.generation_id), [
+    "generation-37", "generation-38",
+  ]);
+  assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.oom_kill_count), ["37", "38"]);
+}
+
+// Malformed or attempted inline evidence fails closed and cannot fall through
+// to a matching legacy global observation. Non-OOM facts never retain it.
+{
+  const matching = fact(39, { reason: "oom_kill", exit_code: null, signal: "SIGKILL" });
+  const global = oomProvenanceFor(matching, 5, "2026-08-31T00:00:39Z");
+  const invalidInline = [
+    { oom_kill_count: 0, oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: "01", oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: "18446744073709551616", oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: -1, oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: 1 },
+    { oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: 1, oom_observed_at: "2026-02-29T00:00:00Z" },
+  ];
+  for (const inline of invalidInline) {
+    const output = createResourceSnapshot({
+      last_cgroup_oom: global,
+      terminal_facts: [{ ...matching, ...inline }],
+    }).terminal_facts[0];
+    assert.equal(output.reason, "unknown");
+    assert.equal(Object.hasOwn(output, "oom_kill_count"), false);
+    assert.equal(Object.hasOwn(output, "oom_observed_at"), false);
+  }
+
+  const inheritedInline = Object.create({
+    oom_kill_count: 9,
+    oom_observed_at: "2026-08-31T00:00:39Z",
+  });
+  Object.assign(inheritedInline, matching);
+  const inheritedOutput = createResourceSnapshot({ terminal_facts: [inheritedInline] }).terminal_facts[0];
+  assert.equal(inheritedOutput.reason, "unknown");
+  assert.equal(Object.hasOwn(inheritedOutput, "oom_kill_count"), false);
+
+  const secret = "INLINE-OOM-GETTER-SECRET";
+  const hostile = { ...matching, oom_observed_at: "2026-08-31T00:00:39Z" };
+  Object.defineProperty(hostile, "oom_kill_count", {
+    enumerable: true,
+    get() { throw new Error(secret); },
+  });
+  const hostileSnapshot = createResourceSnapshot({ last_cgroup_oom: global, terminal_facts: [hostile] });
+  assert.equal(hostileSnapshot.terminal_facts[0].reason, "unknown");
+  assert.ok(!JSON.stringify(hostileSnapshot).includes(secret));
+
+  const normal = createResourceSnapshot({ terminal_facts: [fact(40, {
+    oom_kill_count: "9",
+    oom_observed_at: "2026-08-31T00:00:40Z",
+    oom_project_id: "forged-project",
+  })] }).terminal_facts[0];
+  assert.equal(Object.hasOwn(normal, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(normal, "oom_observed_at"), false);
+  assert.equal(Object.hasOwn(normal, "oom_project_id"), false);
+}
+
+// Legacy v1 facts with no inline fields migrate from one exact matching global
+// observation, then remain authoritative when the latest global observation changes.
+{
+  const legacy = fact(41, { reason: "oom_kill", exit_code: null, signal: "SIGKILL" });
+  const legacyDocument = {
+    version: 1,
+    status: "candidate_pending_staging",
+    last_cgroup_oom: oomProvenanceFor(legacy, 11, "2026-08-31T09:00:41+09:00"),
+    terminal_facts: [legacy],
+  };
+  const { filePath } = fixture();
+  fs.writeFileSync(filePath, JSON.stringify(legacyDocument), { mode: 0o600 });
+  const upgraded = new ResourceStateStore({ filePath }).load();
+  assert.equal(upgraded.terminal_facts[0].reason, "oom_kill");
+  assert.equal(upgraded.terminal_facts[0].oom_kill_count, "11");
+  assert.equal(upgraded.terminal_facts[0].oom_observed_at, "2026-08-31T00:00:41.000Z");
+  const newest = fact(42);
+  const afterZero = createResourceSnapshot({
+    ...upgraded,
+    last_cgroup_oom: oomProvenanceFor(newest, 0, "2026-08-31T00:00:42Z"),
+  });
+  assert.equal(afterZero.terminal_facts[0].reason, "oom_kill");
+  assert.equal(afterZero.terminal_facts[0].oom_kill_count, "11");
+}
+
+// Calendar rollover is rejected consistently for terminal, global, and inline
+// timestamps; a real leap day and numeric offset canonicalize normally.
+{
+  for (const [index, invalidTime] of [
+    "2026-02-29T00:00:00Z",
+    "2024-02-30T00:00:00Z",
+    "2026-04-31T00:00:00Z",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T00:60:00Z",
+    "2026-01-01T00:00:60Z",
+    "2026-01-01T00:00:00+24:00",
+    "2026-01-01T00:00:00+01:60",
+  ].entries()) {
+    const invalidFinished = createResourceSnapshot({
+      terminal_facts: [fact(43, { finished_at: invalidTime })],
+    });
+    assert.equal(invalidFinished.terminal_facts.length, 0, `invalid finished_at ${index}`);
+    const invalidGlobal = createResourceSnapshot({
+      last_cgroup_oom: oomProvenanceFor(fact(43), 1, invalidTime),
+    });
+    assert.equal(invalidGlobal.last_cgroup_oom, null, `invalid observed_at ${index}`);
+    const invalidInline = createResourceSnapshot({ terminal_facts: [fact(43, {
+      reason: "oom_kill",
+      exit_code: null,
+      signal: "SIGKILL",
+      oom_kill_count: 1,
+      oom_observed_at: invalidTime,
+    })] });
+    assert.equal(invalidInline.terminal_facts[0].reason, "unknown", `invalid inline time ${index}`);
+  }
+  const leap = createResourceSnapshot({ terminal_facts: [fact(44, {
+    finished_at: "2024-02-29T23:59:59.123+14:00",
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    oom_kill_count: 1,
+    oom_observed_at: "2024-02-29T23:59:59.123-14:00",
+  })] }).terminal_facts[0];
+  assert.equal(leap.finished_at, "2024-02-29T09:59:59.123Z");
+  assert.equal(leap.oom_observed_at, "2024-03-01T13:59:59.123Z");
 }
 
 // `ready` is authority-bearing. It survives only when every required fact is
