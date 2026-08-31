@@ -9,11 +9,16 @@ const {
   createControlUnitBase,
   scopeUnitFromBase,
 } = require("./resource-unit");
+const {
+  DEFAULT_CONTROL_CLASS_NAME,
+  validateControlClassName,
+} = require("./resource-controller");
 
 const UINT64_MAX = (1n << 64n) - 1n;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024;
 const MAX_FILE_VALUE_BYTES = 64 * 1024;
+const MAX_PROC_CGROUP_BYTES = 64 * 1024;
 
 class ObservationFailure extends Error {
   constructor(code) {
@@ -22,7 +27,7 @@ class ObservationFailure extends Error {
   }
 }
 
-function unavailable(resourceClass, unitBase, unitName, reason) {
+function unavailable(resourceClass, unitBase, unitName, reason, qualifiers = {}) {
   return Object.freeze({
     available: false,
     status: "unavailable",
@@ -30,6 +35,7 @@ function unavailable(resourceClass, unitBase, unitName, reason) {
     resource_class: resourceClass,
     unit_base: unitBase,
     unit_name: unitName,
+    ...qualifiers,
   });
 }
 
@@ -97,12 +103,22 @@ function freezeObservation(observation) {
   return Object.freeze(observation);
 }
 
+function validateAggregateControlClassName(value) {
+  const validated = validateControlClassName(value);
+  if (!/^quadwork-control(?:-[a-z0-9]+)*\.slice$/.test(validated)) {
+    throw new TypeError("controlClassName must be a QuadWork control slice");
+  }
+  return validated;
+}
+
 class ResourceObservationProvider {
   constructor({
     fsImpl = fs,
     execFileSyncImpl,
     clock = () => new Date(),
     cgroupRoot = "/sys/fs/cgroup",
+    procSelfCgroupPath = "/proc/self/cgroup",
+    controlClassName = DEFAULT_CONTROL_CLASS_NAME,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
   } = {}) {
@@ -115,6 +131,9 @@ class ResourceObservationProvider {
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     if (typeof cgroupRoot !== "string" || !path.isAbsolute(cgroupRoot)) {
       throw new TypeError("cgroupRoot must be an absolute path");
+    }
+    if (typeof procSelfCgroupPath !== "string" || !path.isAbsolute(procSelfCgroupPath)) {
+      throw new TypeError("procSelfCgroupPath must be an absolute path");
     }
     const resolvedRoot = path.resolve(cgroupRoot);
     if (path.parse(resolvedRoot).root === resolvedRoot) {
@@ -130,6 +149,8 @@ class ResourceObservationProvider {
     this.execFileSync = execFileSyncImpl;
     this.clock = clock;
     this.cgroupRoot = resolvedRoot;
+    this.procSelfCgroupPath = path.resolve(procSelfCgroupPath);
+    this.controlClassName = validateAggregateControlClassName(controlClassName);
     this.timeoutMs = timeoutMs;
     this.maxOutputBytes = maxOutputBytes;
   }
@@ -144,15 +165,80 @@ class ResourceObservationProvider {
     return this._observe("control", unitBase, CONTROL_UNIT_PREFIX);
   }
 
+  observeApiSelf() {
+    let resolved;
+    try {
+      resolved = this._resolveSelfControlGroup();
+    } catch (error) {
+      const reason = error instanceof ObservationFailure ? error.code : "observation_unavailable";
+      return unavailable("api", null, null, reason, { self: true });
+    }
+    return this._observeCgroup("api", null, resolved.unitName, resolved.cgroupPath, { self: true });
+  }
+
+  observeControlAggregate() {
+    return this._observeUnit("control", null, this.controlClassName, { aggregate: true });
+  }
+
+  _resolveCgroupPath(controlGroup, expectedUnitName = null) {
+    if (!controlGroup.startsWith("/")
+      || controlGroup === "/"
+      || controlGroup.includes("\0")
+      || controlGroup.includes("\r")
+      || controlGroup.includes("\n")
+      || controlGroup.endsWith("/")
+      || path.posix.normalize(controlGroup) !== controlGroup) {
+      throw new ObservationFailure("control_group_invalid");
+    }
+    const unitName = path.posix.basename(controlGroup);
+    if ((expectedUnitName !== null && unitName !== expectedUnitName)
+      || unitName === "."
+      || unitName === ".."
+      || unitName.length > 255
+      || /[\u0000-\u001f\u007f]/.test(unitName)
+      || !/\.(?:service|scope|slice)$/.test(unitName)) {
+      throw new ObservationFailure("control_group_invalid");
+    }
+    const resolved = path.resolve(this.cgroupRoot, `.${controlGroup}`);
+    if (!resolved.startsWith(`${this.cgroupRoot}${path.sep}`)) {
+      throw new ObservationFailure("control_group_invalid");
+    }
+    return { cgroupPath: resolved, unitName };
+  }
+
+  _resolveSelfControlGroup() {
+    let raw;
+    try {
+      raw = this.fs.readFileSync(this.procSelfCgroupPath, "utf8");
+    } catch {
+      throw new ObservationFailure("self_cgroup_unavailable");
+    }
+    const text = boundedText(raw, MAX_PROC_CGROUP_BYTES, "self_cgroup_invalid");
+    const line = text.endsWith("\n") ? text.slice(0, -1) : text;
+    if (line.length === 0 || line.includes("\r") || line.includes("\n")) {
+      throw new ObservationFailure("self_cgroup_invalid");
+    }
+    const match = line.match(/^0::(\/.+)$/);
+    if (!match) throw new ObservationFailure("self_cgroup_invalid");
+    try {
+      return this._resolveCgroupPath(match[1]);
+    } catch (error) {
+      if (error instanceof ObservationFailure) {
+        throw new ObservationFailure("self_cgroup_invalid");
+      }
+      throw error;
+    }
+  }
+
   _resolveControlGroup(unitName) {
     let output;
     try {
       output = this.execFileSync("systemctl", [
         "--user",
-        "show",
-        unitName,
         "--property=ControlGroup",
         "--value",
+        "show",
+        unitName,
       ], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
@@ -163,21 +249,11 @@ class ResourceObservationProvider {
       throw new ObservationFailure("unit_unavailable");
     }
     const text = boundedText(output, this.maxOutputBytes, "unit_unavailable");
-    if (!text.endsWith("\n") && text.includes("\n")) throw new ObservationFailure("control_group_invalid");
-    const controlGroup = text.trim();
-    if (!controlGroup.startsWith("/")
-      || controlGroup === "/"
-      || controlGroup.includes("\r")
-      || controlGroup.includes("\n")
-      || path.posix.normalize(controlGroup) !== controlGroup
-      || path.posix.basename(controlGroup) !== unitName) {
+    const controlGroup = text.endsWith("\n") ? text.slice(0, -1) : text;
+    if (controlGroup.length === 0 || controlGroup.includes("\r") || controlGroup.includes("\n")) {
       throw new ObservationFailure("control_group_invalid");
     }
-    const resolved = path.resolve(this.cgroupRoot, `.${controlGroup}`);
-    if (!resolved.startsWith(`${this.cgroupRoot}${path.sep}`)) {
-      throw new ObservationFailure("control_group_invalid");
-    }
-    return resolved;
+    return this._resolveCgroupPath(controlGroup, unitName).cgroupPath;
   }
 
   _read(cgroupPath, name) {
@@ -213,8 +289,22 @@ class ResourceObservationProvider {
     if (!unitBase.startsWith(expectedPrefix)) {
       return unavailable(resourceClass, unitBase, unitName, "unit_identity_invalid");
     }
+    return this._observeUnit(resourceClass, unitBase, unitName);
+  }
+
+  _observeUnit(resourceClass, unitBase, unitName, qualifiers = {}) {
+    let cgroupPath;
     try {
-      const cgroupPath = this._resolveControlGroup(unitName);
+      cgroupPath = this._resolveControlGroup(unitName);
+    } catch (error) {
+      const reason = error instanceof ObservationFailure ? error.code : "observation_unavailable";
+      return unavailable(resourceClass, unitBase, unitName, reason, qualifiers);
+    }
+    return this._observeCgroup(resourceClass, unitBase, unitName, cgroupPath, qualifiers);
+  }
+
+  _observeCgroup(resourceClass, unitBase, unitName, cgroupPath, qualifiers = {}) {
+    try {
       const oom = this._readOomCounter(cgroupPath);
       return freezeObservation({
         available: true,
@@ -223,6 +313,7 @@ class ResourceObservationProvider {
         resource_class: resourceClass,
         unit_base: unitBase,
         unit_name: unitName,
+        ...qualifiers,
         observed_at: observedAt(this.clock),
         usage: {
           memory_current_bytes: parseUint64Text(this._read(cgroupPath, "memory.current")),
@@ -230,6 +321,7 @@ class ResourceObservationProvider {
           memory_swap_current_bytes: parseUint64Text(this._read(cgroupPath, "memory.swap.current")),
         },
         limits: {
+          memory_low: parseLimit(this._read(cgroupPath, "memory.low")),
           memory_high: parseLimit(this._read(cgroupPath, "memory.high")),
           memory_max: parseLimit(this._read(cgroupPath, "memory.max")),
           memory_swap_max: parseLimit(this._read(cgroupPath, "memory.swap.max")),
@@ -241,7 +333,7 @@ class ResourceObservationProvider {
       });
     } catch (error) {
       const reason = error instanceof ObservationFailure ? error.code : "observation_unavailable";
-      return unavailable(resourceClass, unitBase, unitName, reason);
+      return unavailable(resourceClass, unitBase, unitName, reason, qualifiers);
     }
   }
 }

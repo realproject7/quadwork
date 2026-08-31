@@ -15,6 +15,7 @@ const {
 } = require("./resource-observation");
 
 const CGROUP_ROOT = "/test-cgroup-v2";
+const PROC_SELF_CGROUP = "/test-proc/self/cgroup";
 const NOW = new Date("2026-08-31T01:02:03.456Z");
 const workerIdentity = { projectId: "project-one", generationId: "generation-7" };
 const workerBase = createWorkerUnitBase(workerIdentity);
@@ -28,6 +29,7 @@ function fixtureFiles(cgroupPath = workerPath, overrides = {}) {
     "memory.current": "1048577\n",
     "memory.peak": "2097153\n",
     "memory.swap.current": "17\n",
+    "memory.low": "4096\n",
     "memory.high": "max\n",
     "memory.max": `${UINT64_MAX}\n`,
     "memory.swap.max": "max\n",
@@ -48,6 +50,7 @@ function createHarness({
   execError = null,
   execOutput,
   clock = () => NOW,
+  controlClassName,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
 } = {}) {
@@ -73,6 +76,8 @@ function createHarness({
       execFileSyncImpl,
       clock,
       cgroupRoot: CGROUP_ROOT,
+      procSelfCgroupPath: PROC_SELF_CGROUP,
+      ...(controlClassName === undefined ? {} : { controlClassName }),
       timeoutMs,
       maxOutputBytes,
     }),
@@ -96,6 +101,7 @@ function createHarness({
       memory_swap_current_bytes: "17",
     },
     limits: {
+      memory_low: { kind: "finite", bytes: "4096" },
       memory_high: { kind: "infinite" },
       memory_max: { kind: "finite", bytes: UINT64_MAX.toString(10) },
       memory_swap_max: { kind: "infinite" },
@@ -107,7 +113,7 @@ function createHarness({
   assert.equal(Object.isFrozen(observation.limits.memory_max), true);
   assert.deepEqual(calls.exec, [{
     command: "systemctl",
-    args: ["--user", "show", workerUnit, "--property=ControlGroup", "--value"],
+    args: ["--user", "--property=ControlGroup", "--value", "show", workerUnit],
     options: {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -116,7 +122,7 @@ function createHarness({
     },
   }]);
   assert.equal(Object.hasOwn(calls.exec[0].options, "shell"), false, "systemctl never uses a shell");
-  assert.equal(calls.read.length, 7);
+  assert.equal(calls.read.length, 8);
   assert.equal(JSON.stringify(observation).includes(CGROUP_ROOT), false);
   assert.equal(JSON.stringify(observation).includes("user.slice"), false);
 }
@@ -131,6 +137,7 @@ function createHarness({
     "memory.current": "1",
     "memory.peak": "2",
     "memory.swap.current": "3",
+    "memory.low": "0",
     "memory.high": "4",
     "memory.max": "5",
     "memory.swap.max": "6",
@@ -144,6 +151,89 @@ function createHarness({
 }
 
 {
+  const apiControlGroup = "/system.slice/pm2-quadwork.service";
+  const apiPath = path.join(CGROUP_ROOT, apiControlGroup);
+  const files = fixtureFiles(apiPath, {
+    "memory.events.local": "oom_kill 0\n",
+    "memory.current": "1000001",
+    "memory.peak": "2000001",
+    "memory.swap.current": "3000001",
+    "memory.low": "4000001",
+    "memory.high": "5000001",
+    "memory.max": "6000001",
+    "memory.swap.max": "7000001",
+  });
+  files.set(PROC_SELF_CGROUP, `0::${apiControlGroup}\n`);
+  const { provider, calls } = createHarness({ files });
+  const observation = provider.observeApiSelf();
+  assert.deepEqual(observation, {
+    available: true,
+    status: "ready",
+    reason: null,
+    resource_class: "api",
+    unit_base: null,
+    unit_name: "pm2-quadwork.service",
+    self: true,
+    observed_at: NOW.toISOString(),
+    usage: {
+      memory_current_bytes: "1000001",
+      memory_peak_bytes: "2000001",
+      memory_swap_current_bytes: "3000001",
+    },
+    limits: {
+      memory_low: { kind: "finite", bytes: "4000001" },
+      memory_high: { kind: "finite", bytes: "5000001" },
+      memory_max: { kind: "finite", bytes: "6000001" },
+      memory_swap_max: { kind: "finite", bytes: "7000001" },
+    },
+    counters: { oom_kill: "0", source: "local" },
+  });
+  assert.equal(calls.exec.length, 0, "API self observation is resolved from injected proc data");
+  assert.deepEqual(calls.read[0], { filePath: PROC_SELF_CGROUP, encoding: "utf8" });
+  const serialized = JSON.stringify(observation);
+  assert.equal(serialized.includes(CGROUP_ROOT), false);
+  assert.equal(serialized.includes("system.slice"), false);
+}
+
+{
+  const controlUnit = "quadwork-control.slice";
+  const controlGroup = `/user.slice/user-1000.slice/user@1000.service/app.slice/${controlUnit}`;
+  const controlPath = path.join(CGROUP_ROOT, controlGroup);
+  const files = fixtureFiles(controlPath, {
+    "memory.events.local": "oom_kill 11\n",
+    "memory.low": "max",
+  });
+  const { provider, calls } = createHarness({ controlGroup, files });
+  const observation = provider.observeControlAggregate();
+  assert.equal(observation.resource_class, "control");
+  assert.equal(observation.aggregate, true);
+  assert.equal(observation.unit_base, null);
+  assert.equal(observation.unit_name, controlUnit);
+  assert.deepEqual(observation.limits.memory_low, { kind: "infinite" });
+  assert.deepEqual(observation.counters, { oom_kill: "11", source: "local" });
+  assert.deepEqual(calls.exec, [{
+    command: "systemctl",
+    args: ["--user", "--property=ControlGroup", "--value", "show", controlUnit],
+    options: {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: DEFAULT_TIMEOUT_MS,
+      maxBuffer: DEFAULT_MAX_OUTPUT_BYTES,
+    },
+  }], "aggregate observation pins canonical options-before-command argv");
+  assert.equal(Object.hasOwn(calls.exec[0].options, "shell"), false);
+  assert.notEqual(observation.unit_name, workerUnit, "aggregate control is not inferred from a child");
+}
+
+{
+  const controlUnit = "quadwork-control-refresh.slice";
+  const controlGroup = `/user.slice/app.slice/${controlUnit}`;
+  const files = fixtureFiles(path.join(CGROUP_ROOT, controlGroup));
+  const { provider } = createHarness({ controlGroup, files, controlClassName: controlUnit });
+  assert.equal(provider.observeControlAggregate().unit_name, controlUnit);
+}
+
+{
   const files = fixtureFiles();
   files.delete(path.join(workerPath, "memory.events.local"));
   files.set(path.join(workerPath, "memory.events"), "oom 9\noom_kill 8\n");
@@ -151,11 +241,80 @@ function createHarness({
   assert.deepEqual(observation.counters, { oom_kill: "8", source: "hierarchical" });
 }
 
+{
+  const apiControlGroup = "/system.slice/pm2-quadwork.service";
+  const apiPath = path.join(CGROUP_ROOT, apiControlGroup);
+  const files = fixtureFiles(apiPath);
+  files.set(PROC_SELF_CGROUP, `0::${apiControlGroup}\n`);
+  files.delete(path.join(apiPath, "memory.events.local"));
+  files.set(path.join(apiPath, "memory.events"), "oom 2\noom_kill 1\n");
+  const observation = createHarness({ files }).provider.observeApiSelf();
+  assert.deepEqual(observation.counters, { oom_kill: "1", source: "hierarchical" });
+}
+
+for (const procValue of [
+  "",
+  "0::/",
+  "0::relative",
+  "0:://system.slice/pm2-quadwork.service",
+  "0::/system.slice/./pm2-quadwork.service",
+  "0::/system.slice/child/../pm2-quadwork.service",
+  "0::/system.slice/pm2-quadwork.service/",
+  "0::/system.slice/not-a-unit",
+  "0::/system.slice/bad\tname.service",
+  " 0::/system.slice/pm2-quadwork.service",
+  "0::/system.slice/pm2-quadwork.service ",
+  "0::/system.slice/pm2-quadwork.service\n\n",
+  "0::/system.slice/pm2-quadwork.service\n0::/other.slice/other.service",
+  "1:name=/system.slice/legacy.service\n0::/system.slice/pm2-quadwork.service",
+]) {
+  const files = new Map([[PROC_SELF_CGROUP, procValue]]);
+  const { provider, calls } = createHarness({ files });
+  const observation = provider.observeApiSelf();
+  assert.equal(observation.available, false);
+  assert.equal(observation.reason, "self_cgroup_invalid", `invalid proc value ${JSON.stringify(procValue)}`);
+  assert.equal(observation.self, true);
+  assert.equal(observation.unit_name, null);
+  assert.equal(calls.exec.length, 0);
+  assert.equal(calls.read.length, 1, "invalid lexical self path is never used for cgroup reads");
+  assert.equal(JSON.stringify(observation).includes("system.slice"), false);
+}
+
+{
+  const { provider } = createHarness({ files: new Map() });
+  const observation = provider.observeApiSelf();
+  assert.equal(observation.reason, "self_cgroup_unavailable");
+  assert.equal(JSON.stringify(observation).includes("SECRET_PATH"), false);
+}
+
+{
+  const apiControlGroup = "/system.slice/pm2-quadwork.service";
+  const apiPath = path.join(CGROUP_ROOT, apiControlGroup);
+  const files = fixtureFiles(apiPath);
+  files.set(PROC_SELF_CGROUP, `0::${apiControlGroup}\n`);
+  files.delete(path.join(apiPath, "memory.low"));
+  const observation = createHarness({ files }).provider.observeApiSelf();
+  assert.equal(observation.reason, "cgroup_unavailable");
+  assert.equal(observation.unit_name, "pm2-quadwork.service");
+  assert.equal(JSON.stringify(observation).includes(apiControlGroup), false);
+}
+
+{
+  const hostile = { toString() { throw new Error("secret hostile proc value"); } };
+  const files = new Map([[PROC_SELF_CGROUP, hostile]]);
+  const observation = createHarness({ files }).provider.observeApiSelf();
+  assert.equal(observation.reason, "self_cgroup_invalid");
+  assert.equal(JSON.stringify(observation).includes("secret"), false);
+}
+
 for (const controlGroup of [
   `/../../etc/${workerUnit}`,
   "/user.slice/other.scope",
   "/",
   "relative/path",
+  ` ${workerControlGroup}`,
+  `${workerControlGroup} `,
+  `${workerControlGroup}\n`,
   `${workerControlGroup}\n/second/${workerUnit}`,
 ]) {
   const { provider, calls } = createHarness({ controlGroup });
@@ -231,5 +390,16 @@ assert.throws(
   () => new ResourceObservationProvider({ execFileSyncImpl() {}, maxOutputBytes: 63 }),
   /maxOutputBytes/,
 );
+for (const controlClassName of [
+  "other.slice",
+  "quadwork-control.service",
+  "quadwork-control/escape.slice",
+  "QuadWork-control.slice",
+]) {
+  assert.throws(
+    () => new ResourceObservationProvider({ execFileSyncImpl() {}, controlClassName }),
+    /controlClassName/,
+  );
+}
 
 console.log("resource-observation.test.js: all assertions passed");
