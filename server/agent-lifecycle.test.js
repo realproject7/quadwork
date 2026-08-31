@@ -99,6 +99,19 @@ function governor(options = {}) {
     assert.equal(stale.reason, "stale_expected_generation");
   }
 
+  // A project archive that wins while a launch callback is awaiting remains an
+  // authoritative admission rejection, not a misleading generic PTY failure.
+  {
+    const g = governor();
+    const archived = await g.launch({
+      projectId: "archive-race", role: "dev", source: "operator_start", operatorAuthorized: true,
+      launch: async () => ({ ok: false, code: "project_archived" }),
+    });
+    assert.equal(archived.status, "rejected");
+    assert.equal(archived.reason, "project_archived");
+    assert.equal(g.snapshot("archive-race", "dev").state, "rejected");
+  }
+
   // A resource kill opens immediately and automatic sources cannot create a
   // hidden retry. The record retains only redacted correlation evidence.
   {

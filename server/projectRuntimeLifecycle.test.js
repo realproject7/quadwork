@@ -457,6 +457,9 @@ process.on("exit", cleanup);
   const spawnPromise = runtime.spawnAgentPty("b", "dev", {
     captureProjectAdmission: () => ({ project_id: "b", generation: 0 }),
     isAdmissionCurrent: () => admitted,
+    lifecycleSource: "operator_start",
+    operatorAuthorized: true,
+    explicitRole: true,
     buildAgentArgs: async () => { await buildGate; return { args: [] }; },
     ptySpawn: () => { ptySpawns += 1; throw new Error("must not spawn"); },
   });

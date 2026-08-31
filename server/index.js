@@ -1231,6 +1231,23 @@ function recordAgentSpawnedLifecycle(project, agent, operation) {
 // startup restoration. Its private launch callback receives server-generated
 // immutable IDs only after the durable reservation succeeds.
 async function spawnAgentPty(project, agent, opts = {}) {
+  // Preserve the project lifecycle barrier before evaluating source authority:
+  // an archived/revoked project is never reported as merely an unauthorised
+  // operator action, and its existing admission lease is reused below.
+  const captureAdmission = opts.captureProjectAdmission || captureProjectAdmission;
+  const admissionCurrent = opts.isAdmissionCurrent || isAdmissionCurrent;
+  let admission;
+  try {
+    admission = opts.admissionToken || captureAdmission(project);
+    if (!admissionCurrent(admission)) {
+      return { ok: false, code: "project_archived", status: 409, error: "project is archived", lifecycle: null };
+    }
+  } catch (err) {
+    if (err instanceof ProjectLifecycleError) {
+      return { ok: false, code: err.code, status: err.status, error: err.message, lifecycle: null };
+    }
+    return { ok: false, code: "project_archived", status: 409, error: "project is archived", lifecycle: null };
+  }
   let roleConfigured = false;
   try {
     const projectConfig = readConfig().projects?.find((entry) => entry?.id === project);
@@ -1258,6 +1275,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
     containedLaunch: false,
     launch: ({ operation_id, generation_id }) => launchAgentPty(project, agent, {
       ...opts,
+      admissionToken: admission,
       operationId: operation_id,
       generationId: generation_id,
     }),

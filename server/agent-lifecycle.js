@@ -277,8 +277,8 @@ class AgentLifecycleGovernor {
       const isAutomatic = AUTOMATIC_SOURCES.has(source);
       const isOperator = OPERATOR_SOURCES.has(source);
       if (!isAutomatic && !isOperator) return this._rejected("source_not_authorized");
-      if (isOperator && input.operatorAuthorized !== true) return this._rejected("operator_authorization_required");
       if (this.projectEligible(projectId) !== true) return this._rejected("project_unavailable");
+      if (isOperator && input.operatorAuthorized !== true) return this._rejected("operator_authorization_required");
 
       const work = await this.currentWork(projectId, role);
       const current = work && work.current === true;
@@ -452,7 +452,20 @@ class AgentLifecycleGovernor {
     try {
       const launched = await input.launch({ operation_id: operation.operation_id, generation_id: operation.generation_id });
       if (!launched || launched.ok !== true) {
-        return this.transition({ projectId: input.projectId, role: input.role, operationId: operation.operation_id, generationId: operation.generation_id, status: "launch_failed" });
+        const terminal = await this.transition({
+          projectId: input.projectId,
+          role: input.role,
+          operationId: operation.operation_id,
+          generationId: operation.generation_id,
+          status: launched?.code === "project_archived" ? "rejected" : "launch_failed",
+        });
+        // Lifecycle state says this generation was rejected; the public
+        // response retains the authoritative admission barrier rather than
+        // mislabelling an archive race as a generic launch failure.
+        if (launched?.code === "project_archived") {
+          return Object.freeze({ status: "rejected", reason: "project_archived", operation: terminal.operation || null });
+        }
+        return terminal;
       }
       const spawned = await this.transition({ projectId: input.projectId, role: input.role, operationId: operation.operation_id, generationId: operation.generation_id, status: "spawned", health: "unknown" });
       return Object.freeze({ ...spawned, pid: Number.isSafeInteger(launched.pid) ? launched.pid : null });
