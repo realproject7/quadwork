@@ -161,6 +161,7 @@ async function main() {
     }]);
     assert.equal(observations.workerBoundaries.length, 1);
     assert.equal(observations.workerBoundaries[0].signal instanceof AbortSignal, true);
+    assert.equal(observations.workerBoundaries[0].signal.aborted, true);
     assert.equal(observations.workerBoundaries[0].timeoutMs, 250);
     assert.equal(Number.isSafeInteger(observations.workerBoundaries[0].deadline), true);
     assert.equal(observations.workerBoundaries[0].deadline <= Date.now() + 250, true);
@@ -356,6 +357,27 @@ async function main() {
       maxControlChildren: 999,
     }), assertAdapterError);
     ok(true, "hostile accessors and factory-level authority overrides fail with redacted stable errors");
+  }
+
+  {
+    const revokedOptions = Proxy.revocable({}, {});
+    revokedOptions.revoke();
+    assert.throws(() => createResourceControllerAdapter(revokedOptions.proxy), assertAdapterError);
+
+    const { adapter } = harness();
+    const revokedWorker = Proxy.revocable(workerInput(), {});
+    revokedWorker.revoke();
+    await assert.rejects(adapter.runWorker(revokedWorker.proxy), assertAdapterError);
+
+    const revokedControl = Proxy.revocable(controlInput("revoked"), {});
+    revokedControl.revoke();
+    await assert.rejects(adapter.runControl(revokedControl.proxy), assertAdapterError);
+
+    const revokedArgs = Proxy.revocable(["SECRET_REVOKED_ARG"], {});
+    revokedArgs.revoke();
+    await assert.rejects(adapter.runWorker(workerInput({ args: revokedArgs.proxy })), assertAdapterError);
+    assert.equal(adapter.snapshot().active_scopes.length, 0);
+    ok(true, "revoked options, run records, and argument arrays fail only with the redacted adapter error");
   }
 
   {
@@ -758,6 +780,39 @@ async function main() {
       signal: new AbortController().signal,
     }));
     ok(true, "provider timeout is below the controller boundary and cancellation ends observation before identity reuse");
+  }
+
+  {
+    let providerSignal;
+    let providerDeadline;
+    let providerCompleted = false;
+    const { adapter } = harness({
+      providerTimeoutMs: 20,
+      executeProcess: async () => ({ code: null, signal: "SIGKILL" }),
+      async observeWorker(identity, boundary) {
+        providerSignal = boundary.signal;
+        providerDeadline = boundary.deadline;
+        await new Promise((resolve) => setTimeout(resolve, 123));
+        providerCompleted = true;
+        return readyObservation("worker", identity, {
+          counters: { oom_kill: "1", source: "local" },
+        });
+      },
+    });
+    const startedAt = Date.now();
+    const output = await adapter.runWorker(workerInput());
+    const elapsed = Date.now() - startedAt;
+    assert.equal(output.fact.reason, "signal");
+    assert.equal(output.cgroup_oom_observation, null);
+    assert.equal(providerSignal instanceof AbortSignal, true);
+    assert.equal(providerSignal.aborted, true);
+    assert.equal(providerDeadline <= startedAt + 40, true);
+    assert.equal(elapsed < 100, true, `provider boundary took ${elapsed}ms`);
+    assert.equal(providerCompleted, false);
+    assert.equal(adapter.snapshot().active_scopes.length, 0);
+    await new Promise((resolve) => setTimeout(resolve, 130));
+    assert.equal(providerCompleted, true);
+    ok(true, "a declared 20ms provider is cut off internally and cannot retain a live boundary signal");
   }
 
   {

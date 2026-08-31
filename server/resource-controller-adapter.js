@@ -49,6 +49,7 @@ const UINT64_MAX = (1n << 64n) - 1n;
 const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 const MAX_PROCESS_ARGS = 10_000;
 const CONTROLLER_QUERY_TIMEOUT_MS = 1_000;
+const PROVIDER_UNAVAILABLE = Symbol("resource observation provider unavailable");
 
 class ResourceControllerAdapterError extends Error {
   constructor(field) {
@@ -64,8 +65,8 @@ function invalid(field) {
 }
 
 function exactDataRecord(value, allowed, required, field) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid(field);
   try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid(field);
     const prototype = Reflect.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) throw invalid(field);
     const keys = Reflect.ownKeys(value);
@@ -82,6 +83,57 @@ function exactDataRecord(value, allowed, required, field) {
     return Object.freeze(output);
   } catch {
     throw invalid(field);
+  }
+}
+
+async function observeWithBoundary(method, receiver, identity, requestSignal, timeoutMs) {
+  const controller = new AbortController();
+  let timer = null;
+  let onRequestAbort = null;
+  let finishBoundary = null;
+  try {
+    const abortedGetter = Reflect.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+    abortedGetter.call(requestSignal);
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
+    if (!Number.isSafeInteger(startedAt) || !Number.isSafeInteger(deadline)) return PROVIDER_UNAVAILABLE;
+
+    const boundary = new Promise((resolve) => {
+      finishBoundary = resolve;
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve(PROVIDER_UNAVAILABLE);
+      }, timeoutMs);
+      onRequestAbort = () => {
+        controller.abort();
+        resolve(PROVIDER_UNAVAILABLE);
+      };
+      EventTarget.prototype.addEventListener.call(requestSignal, "abort", onRequestAbort, { once: true });
+      // Close the race where the controller request aborts between the first
+      // brand check and listener installation.
+      if (abortedGetter.call(requestSignal)) onRequestAbort();
+    });
+    if (controller.signal.aborted) return PROVIDER_UNAVAILABLE;
+    const queryBoundary = Object.freeze({
+      signal: controller.signal,
+      deadline,
+      timeoutMs,
+    });
+    const provider = Promise.resolve()
+      .then(() => Reflect.apply(method, receiver, [identity, queryBoundary]))
+      .catch(() => PROVIDER_UNAVAILABLE);
+    return await Promise.race([provider, boundary]);
+  } catch {
+    return PROVIDER_UNAVAILABLE;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (onRequestAbort !== null) {
+      try {
+        EventTarget.prototype.removeEventListener.call(requestSignal, "abort", onRequestAbort);
+      } catch {}
+    }
+    controller.abort();
+    if (finishBoundary !== null) finishBoundary(PROVIDER_UNAVAILABLE);
   }
 }
 
@@ -352,16 +404,14 @@ function createResourceControllerAdapter(options = {}) {
             generationId: context.generationId,
             operationId: context.operationId,
           });
-      const deadline = Date.now() + providerTimeoutMs;
-      if (!Number.isSafeInteger(deadline)) return null;
-      const queryBoundary = Object.freeze({
-        signal: request.signal,
-        deadline,
-        timeoutMs: providerTimeoutMs,
-      });
-      const observation = context.resourceClass === "worker"
-        ? await Reflect.apply(observeWorker, observationProvider, [identity, queryBoundary])
-        : await Reflect.apply(observeControl, observationProvider, [identity, queryBoundary]);
+      const observation = await observeWithBoundary(
+        context.resourceClass === "worker" ? observeWorker : observeControl,
+        observationProvider,
+        identity,
+        request.signal,
+        providerTimeoutMs,
+      );
+      if (observation === PROVIDER_UNAVAILABLE) return null;
       return mapObservation(observation, context);
     } catch {
       return null;
