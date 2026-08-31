@@ -252,3 +252,29 @@ Tune or disable via `~/.quadwork/config.json`:
 ```json
 { "temp_cleanup": { "enabled": true, "max_age_hours": 72 } }
 ```
+
+## Resource staging matrix does not pass
+
+Start with the read-only diagnostic; do not begin by changing systemd or
+creating a temp directory:
+
+```bash
+quadwork resources preflight
+quadwork resources preflight --json
+```
+
+- `proof_refused` means the disposable-host acknowledgement or the separate
+  `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has
+  started.
+- `proof_unavailable` means a host gate or required live adapter is unavailable.
+  The bundled adapter intentionally returns this result rather than simulating
+  node-pty, WebSocket, cgroup, temp, health, or OOM evidence.
+- `proof_failed` means monitoring or a started phase failed. The coordinator
+  stops starting new phases and closes continuous monitoring.
+
+Do not retry a pressure phase on production and do not treat capability flags
+as proof. Preserve the redacted JSON, identify the exact candidate unit names
+from the disposable run record, stop only those units, wait for their process
+trees to exit, and compare the recorded API/global OOM counters. The candidate
+flags remain `candidate_pending_staging`; there is no automatic install/repair
+or supported-production fallback in this command.

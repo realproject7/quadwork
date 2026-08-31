@@ -215,6 +215,50 @@ pm2 restart quadwork              # Restart
 pm2 save                          # Save state (always do after start/stop)
 ```
 
+### Resource preflight and disposable staging evidence
+
+Run the shipped diagnostic before considering any resource-containment work:
+
+```bash
+quadwork resources preflight
+quadwork resources preflight --json
+```
+
+This preflight is read-only. A non-zero result is expected while the policy,
+temp boundary, or staging proof is unavailable; it does not install, repair,
+create, or modify systemd units. The current `systemd-run --user --scope
+--collect --quiet` contract remains `candidate_pending_staging` and is not a
+supported production launch path.
+
+Never run memory pressure or fault injection on production. The source checkout
+contains an opt-in staging coordinator for a disposable VPS, but its bundled
+adapter deliberately returns `proof_unavailable` instead of launching a fake or
+incomplete test. A deployment-specific live adapter must provide authenticated
+API, Primary Chat-WebSocket, unrelated-worker, cgroup, node-pty, and temp probes.
+Even then, every phase remains blocked until Linux, cgroup v2, the user manager,
+the separate run flag, and this exact acknowledgement all match:
+
+```bash
+machine_id="$(tr -d '\n' < /etc/machine-id)"
+npm run resource:staging-proof -- \
+  --json \
+  --run-pressure-matrix \
+  --ack-disposable-host "DISPOSABLE-STAGING:${machine_id}"
+```
+
+Run that command only from the matching QuadWork source checkout on the named
+disposable machine. Omitting either opt-in, copying an acknowledgement from a
+different machine, or lacking a live adapter starts no matrix phase.
+
+Before a live-adapter run, record the disposable VPS identifier, candidate unit
+names, current API/global OOM counters, and the redacted JSON report in the test
+change record. On any failure, stop only the exact candidate units recorded by
+that run, wait for their process trees to exit, and verify with read-only
+`systemctl --user show <recorded-unit>` and cgroup counters. The candidate uses
+transient `--collect` scopes; do not install a persistent unit or copy candidate
+properties into production. A report is evidence only when every matrix check
+is `passed`; this guide does not claim that such a PASS has occurred.
+
 ---
 
 ## Remote Access
