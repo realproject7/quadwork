@@ -1822,6 +1822,7 @@ function ownedBatchAutomationState(progress, active) {
       installation_id: progress.installation_id,
       batch_number: progress.batch_number,
       assignment_attempt: progress.assignment_attempt,
+      provenance: "owned",
       assignment_key: progress.assignment_key,
     },
   };

@@ -53,8 +53,8 @@ const ownedProgress = {
   installation_id: "installation-runtime-0001",
   batch_number: 7,
   assignment_attempt: "attempt_0002",
-  assignment_key: "assignment-7-2",
   provenance: "owned",
+  assignment_key: "assignment-7-2",
   owned: true,
   current: true,
   items: [{ repo_key: "primary", number: 42 }],
@@ -68,6 +68,7 @@ assert.deepEqual(ownedAutomation.identity, {
   installation_id: "installation-runtime-0001",
   batch_number: 7,
   assignment_attempt: "attempt_0002",
+  provenance: "owned",
   assignment_key: "assignment-7-2",
 }, "authoritative automation carries the exact assignment identity into route-side guards");
 assert.equal(runtime.ownedBatchAutomationState(
