@@ -49,6 +49,7 @@ interface BatchProgressData {
   // #870/#871: "code" (default) | "ticket-review" | "pr-review".
   batch_type?: "code" | "ticket-review" | "pr-review";
   multi_repository?: boolean;
+  validation_errors?: Array<{ code: string; message: string }>;
 }
 
 interface BatchProgressPanelProps {
@@ -62,6 +63,7 @@ const COPY = {
     idlePaused: "Project is idle — batch progress polling is paused.",
     currentBatchNone: "Current Batch: (none)",
     noActiveBatch: "No active batch. Ask Head to start one via the chat.",
+    invalidQueue: "Queue validation failed",
     currentBatch: (n: number | string) => `Current Batch: Batch ${n}`,
     complete: "✅ COMPLETE",
     allMerged: (n: number) => `All ${n} items merged. Waiting for the next batch.`,
@@ -94,6 +96,7 @@ const COPY = {
     idlePaused: "프로젝트가 유휴 상태입니다 — 배치 진행 폴링이 일시 중지되었습니다.",
     currentBatchNone: "현재 배치: (없음)",
     noActiveBatch: "활성 배치가 없습니다. 채팅에서 Head에게 시작을 요청하세요.",
+    invalidQueue: "큐 검증 실패",
     currentBatch: (n: number | string) => `현재 배치: ${n}번`,
     complete: "✅ 완료",
     allMerged: (n: number) => `${n}개 항목 모두 병합됨. 다음 배치를 기다리는 중.`,
@@ -194,6 +197,21 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
     return (
       <div className="px-3 py-1.5 text-[11px] text-text-muted border-t border-border">
         {t.loading}
+      </div>
+    );
+  }
+
+  if (Array.isArray(data.validation_errors) && data.validation_errors.length > 0) {
+    return (
+      <div className="border-t border-border" role="alert">
+        <div className="px-3 py-1.5 text-[10px] text-text-muted uppercase tracking-wider">
+          {t.invalidQueue}
+        </div>
+        <ul className="px-3 pb-2 space-y-1 text-[11px] text-text-muted font-mono">
+          {data.validation_errors.slice(0, 4).map((error, index) => (
+            <li key={`${error.code}:${index}`}>{error.code}: {error.message}</li>
+          ))}
+        </ul>
       </div>
     );
   }

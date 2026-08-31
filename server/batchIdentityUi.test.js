@@ -149,6 +149,7 @@ const panel = fs.readFileSync(path.join(root, "src", "components", "BatchProgres
 assert.match(panel, /workItemReactKey/, "BatchProgressPanel uses composite keys");
 assert.match(panel, /workItemDisplayLabel/, "BatchProgressPanel uses text repository labels");
 assert.match(panel, /multi_repository/, "repository label is controlled by project topology");
+assert.match(panel, /validation_errors/, "invalid queue diagnostics are visible instead of rendering an empty batch");
 
 const queueManager = fs.readFileSync(path.join(root, "src", "components", "QueueManager.tsx"), "utf8");
 assert.match(queueManager, /qualifiedQueueToken/, "QueueManager emits qualified work tokens");
