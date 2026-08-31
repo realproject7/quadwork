@@ -52,7 +52,7 @@ const runtime = require("./index");
 const ownedProgress = {
   installation_id: "installation-runtime-0001",
   batch_number: 7,
-  assignment_attempt: 2,
+  assignment_attempt: "attempt_0002",
   assignment_key: "assignment-7-2",
   provenance: "owned",
   owned: true,
@@ -67,12 +67,12 @@ assert.equal(ownedAutomation.authoritative, true,
 assert.deepEqual(ownedAutomation.identity, {
   installation_id: "installation-runtime-0001",
   batch_number: 7,
-  assignment_attempt: 2,
+  assignment_attempt: "attempt_0002",
   assignment_key: "assignment-7-2",
 }, "authoritative automation carries the exact assignment identity into route-side guards");
 assert.equal(runtime.ownedBatchAutomationState(
   ownedProgress,
-  { ...ownedActive, assignment_attempt: 3, assignment_key: "assignment-7-3" },
+  { ...ownedActive, assignment_attempt: "attempt_0003", assignment_key: "assignment-7-3" },
 ).authoritative, false, "a stale assignment attempt cannot drive automation");
 assert.equal(runtime.ownedBatchAutomationState(
   { ...ownedProgress, provenance: "legacy_unowned", owned: false },

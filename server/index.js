@@ -1791,7 +1791,8 @@ const _bridgeBatchPrev = new Map();
 function ownedBatchFingerprint(payload) {
   if (!payload || payload.provenance !== "owned" || payload.owned !== true || payload.current !== true) return null;
   if (typeof payload.installation_id !== "string" || !payload.installation_id) return null;
-  if (!Number.isInteger(payload.batch_number) || !Number.isInteger(payload.assignment_attempt)) return null;
+  if (!Number.isSafeInteger(payload.batch_number) || payload.batch_number < 1) return null;
+  if (typeof payload.assignment_attempt !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(payload.assignment_attempt)) return null;
   if (typeof payload.assignment_key !== "string" || !payload.assignment_key) return null;
   return [
     payload.installation_id,
