@@ -6,7 +6,7 @@ const os = require("os");
 const { WebSocketServer, WebSocket } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, primaryRepository } = require("./config");
 const routes = require("./routes");
 const fileChat = require("./file-chat");
 const {
@@ -1687,14 +1687,22 @@ ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via t
 // Discord bridges so they respond to batch transitions even when the
 // operator is on a different project page.
 
-async function autoStopBridges(projectId, project, qwPort, admission = null) {
+function bridgeAssignmentBody(projectId, admission, batchState) {
+  const body = { project_id: projectId, admission_generation: admission?.generation };
+  if (batchState && batchState.authoritative && batchState.identity) {
+    Object.assign(body, batchState.identity);
+  }
+  return body;
+}
+
+async function autoStopBridges(projectId, project, qwPort, admission = null, batchState = null) {
   if (project?.telegram_auto) {
     try {
       if (admission && !isAdmissionCurrent(admission)) return;
       const stopped = await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId, admission_generation: admission?.generation }),
+        body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
         signal: AbortSignal.timeout(5000),
       });
       if (admission && !isAdmissionCurrent(admission)) return;
@@ -1707,7 +1715,7 @@ async function autoStopBridges(projectId, project, qwPort, admission = null) {
       const stopped = await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId, admission_generation: admission?.generation }),
+        body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
         signal: AbortSignal.timeout(5000),
       });
       if (admission && !isAdmissionCurrent(admission)) return;
@@ -1716,7 +1724,7 @@ async function autoStopBridges(projectId, project, qwPort, admission = null) {
   }
 }
 
-async function autoStartBridges(projectId, project, qwPort, admissionToken = null) {
+async function autoStartBridges(projectId, project, qwPort, admissionToken = null, batchState = null) {
   let admission = admissionToken;
   try { if (!admission) admission = captureProjectAdmission(projectId); }
   catch { return; }
@@ -1740,7 +1748,7 @@ async function autoStartBridges(projectId, project, qwPort, admissionToken = nul
         const started = await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=start`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_id: projectId, admission_generation: admission.generation }),
+          body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
           signal: AbortSignal.timeout(10000),
         });
         if (!isAdmissionCurrent(admission)) return;
@@ -1764,7 +1772,7 @@ async function autoStartBridges(projectId, project, qwPort, admissionToken = nul
       const started = await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId, admission_generation: admission.generation }),
+        body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
         signal: AbortSignal.timeout(10000),
       });
       if (!isAdmissionCurrent(admission)) return;
@@ -1775,6 +1783,48 @@ async function autoStartBridges(projectId, project, qwPort, admissionToken = nul
 
 // Track previous batch state per project for bridge auto-start detection
 const _bridgeBatchPrev = new Map();
+
+// #1031: automation is allowed to act only on the exact current assignment
+// owned by this installation. Progress can preserve an older snapshot for
+// display, so it is never lifecycle authority on its own. The live
+// /api/batch-active response must carry the same immutable assignment identity.
+function ownedBatchFingerprint(payload) {
+  if (!payload || payload.provenance !== "owned" || payload.owned !== true || payload.current !== true) return null;
+  if (typeof payload.installation_id !== "string" || !payload.installation_id) return null;
+  if (!Number.isInteger(payload.batch_number) || !Number.isInteger(payload.assignment_attempt)) return null;
+  if (typeof payload.assignment_key !== "string" || !payload.assignment_key) return null;
+  return [
+    payload.installation_id,
+    payload.batch_number,
+    payload.assignment_attempt,
+    payload.assignment_key,
+  ].join("::");
+}
+
+function ownedBatchAutomationState(progress, active) {
+  const progressFingerprint = ownedBatchFingerprint(progress);
+  const activeFingerprint = ownedBatchFingerprint(active);
+  if (!progressFingerprint || progressFingerprint !== activeFingerprint) {
+    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
+  }
+  const hasItems = Array.isArray(progress.items) && progress.items.length > 0;
+  const clearedByOperator = !!progress.liveActiveBatchCleared;
+  const shouldStop = !!progress.completeConfirmed || clearedByOperator;
+  return {
+    authoritative: true,
+    fingerprint: progressFingerprint,
+    active: active.active === true,
+    hasItems,
+    clearedByOperator,
+    shouldStop,
+    identity: {
+      installation_id: progress.installation_id,
+      batch_number: progress.batch_number,
+      assignment_attempt: progress.assignment_attempt,
+      assignment_key: progress.assignment_key,
+    },
+  };
+}
 
 async function sendTriggerMessage(projectId) {
   let admission;
@@ -1794,15 +1844,17 @@ async function sendTriggerMessage(projectId) {
   if (project && project.trigger_auto) {
     const qwPort = cfg.port || 8400;
     try {
-      const bpRes = await fetch(
-        `http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(projectId)}`
-      );
+      const [bpRes, activeRes] = await Promise.all([
+        fetch(`http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(projectId)}`),
+        fetch(`http://127.0.0.1:${qwPort}/api/batch-active?project=${encodeURIComponent(projectId)}`),
+      ]);
       if (!isAdmissionCurrent(admission)) {
         stopTrigger(projectId);
         return { ok: false, code: "project_archived", sent: false };
       }
-      if (bpRes.ok) {
+      if (bpRes.ok && activeRes.ok) {
         const bp = await bpRes.json();
+        const active = await activeRes.json();
         if (!isAdmissionCurrent(admission)) {
           stopTrigger(projectId);
           return { ok: false, code: "project_admission_changed", sent: false };
@@ -1814,8 +1866,9 @@ async function sendTriggerMessage(projectId) {
         // `completeConfirmed` alone won't fire when items don't all resolve as
         // merged/closed (e.g. a duplicate unmerged PR). The cleared flag is the
         // operator's intent and overrides those signals for lifecycle purposes.
-        const clearedByOperator = !!(bp && bp.liveActiveBatchCleared);
-        if (bp && (bp.completeConfirmed || clearedByOperator)) {
+        const batchState = ownedBatchAutomationState(bp, active);
+        const clearedByOperator = batchState.clearedByOperator === true;
+        if (batchState.authoritative && batchState.shouldStop) {
           console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
           stopTrigger(projectId);
           // Also stop caffeinate if no other triggers remain running
@@ -1828,9 +1881,9 @@ async function sendTriggerMessage(projectId) {
           // #518: also stop bridges when batch completes
           // #542: transition guard — only stop if not already stopped for this completion
           const prev = _bridgeBatchPrev.get(projectId);
-          _bridgeBatchPrev.set(projectId, { complete: true, hasItems: !!(bp.items && bp.items.length) });
-          if (!prev || !prev.complete) {
-            await autoStopBridges(projectId, project, qwPort, admission);
+          _bridgeBatchPrev.set(projectId, { fingerprint: batchState.fingerprint, complete: true, hasItems: batchState.hasItems });
+          if (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete) {
+            await autoStopBridges(projectId, project, qwPort, admission, batchState);
           }
           return;
         }
@@ -2258,7 +2311,7 @@ app.post("/api/queue", (req, res) => {
   try {
     let content = fs.readFileSync(tpl, "utf-8");
     content = content.replace(/\{\{project_name\}\}/g, project.name || projectId);
-    content = content.replace(/\{\{repo\}\}/g, project.repo || "");
+    content = content.replace(/\{\{repo\}\}/g, primaryRepository(project)?.repo || "");
     ensureSecureDir(path.dirname(p));
     fs.writeFileSync(p, content);
     return res.json({ ok: true, existed: false });
@@ -2615,20 +2668,24 @@ async function autoStopPollingTick() {
     if (!hasTriggerAuto && !hasBridgeAuto) continue;
     const qwPort = cfg.port || 8400;
     try {
-      const res = await fetch(
-        `http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(project.id)}`
-      );
+      const [res, activeRes] = await Promise.all([
+        fetch(`http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(project.id)}`),
+        fetch(`http://127.0.0.1:${qwPort}/api/batch-active?project=${encodeURIComponent(project.id)}`),
+      ]);
       if (!isAdmissionCurrent(admission)) {
         stopTrigger(project.id);
         continue;
       }
-      if (!res.ok) continue;
+      if (!res.ok || !activeRes.ok) continue;
       const bp = await res.json();
+      const active = await activeRes.json();
       if (!isAdmissionCurrent(admission)) {
         stopTrigger(project.id);
         continue;
       }
-      const hasItems = bp.items && bp.items.length > 0;
+      const batchState = ownedBatchAutomationState(bp, active);
+      if (!batchState.authoritative) continue;
+      const hasItems = batchState.hasItems;
       // #810: gate auto-stop on completeConfirmed (two distinct successful fetch
       // cycles), not a single transient/stale `complete`. Track prev on the
       // confirmed value so the bridge-stop transition guard fires on it.
@@ -2637,11 +2694,10 @@ async function autoStopPollingTick() {
       // Batch section to empty even if the preserved snapshot's items don't all
       // resolve as merged/closed (e.g. a duplicate unmerged PR keeps the items
       // in `in_review`). The cleared flag is the operator's intent.
-      const confirmed = !!bp.completeConfirmed;
-      const clearedByOperator = !!bp.liveActiveBatchCleared;
-      const shouldStop = confirmed || clearedByOperator;
+      const clearedByOperator = batchState.clearedByOperator === true;
+      const shouldStop = batchState.shouldStop;
       const prev = _bridgeBatchPrev.get(project.id);
-      _bridgeBatchPrev.set(project.id, { complete: shouldStop, hasItems });
+      _bridgeBatchPrev.set(project.id, { fingerprint: batchState.fingerprint, complete: shouldStop, hasItems });
 
       if (bp && shouldStop) {
         if (hasTriggerAuto) {
@@ -2655,18 +2711,18 @@ async function autoStopPollingTick() {
         }
         // #518: also stop bridges when batch completes
         // #542: only fire on the transition (incomplete→complete), not every tick
-        if (hasBridgeAuto && (!prev || !prev.complete)) {
-          await autoStopBridges(project.id, project, qwPort, admission);
+        if (hasBridgeAuto && (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete)) {
+          await autoStopBridges(project.id, project, qwPort, admission, batchState);
         }
       }
 
       // #518: detect batch-start transition → auto-start bridges
       // #864: do NOT auto-start on a cleared queue even though hasItems may be
       // true from the preserved snapshot — the operator's clear is a stop signal.
-      if (hasBridgeAuto && hasItems && !bp.complete && !clearedByOperator) {
-        const isNewBatch = !prev || prev.complete || !prev.hasItems;
+      if (hasBridgeAuto && batchState.active && hasItems && !bp.complete && !clearedByOperator) {
+        const isNewBatch = !prev || prev.fingerprint !== batchState.fingerprint || prev.complete || !prev.hasItems;
         if (isNewBatch) {
-          await autoStartBridges(project.id, project, qwPort, admission);
+          await autoStartBridges(project.id, project, qwPort, admission, batchState);
         }
       }
     } catch {
@@ -3142,6 +3198,8 @@ module.exports = {
   autoStartBridges,
   autoStopBridges,
   autoStopPollingTick,
+  ownedBatchFingerprint,
+  ownedBatchAutomationState,
   registerCaffeinateOwner,
   caffeinateStatus,
   releaseProjectCaffeinate,

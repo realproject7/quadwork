@@ -49,6 +49,40 @@ const discordBridge = require("./bridges/discord");
 const dispatcher = require("./pty-dispatcher");
 const runtime = require("./index");
 
+const ownedProgress = {
+  installation_id: "installation-runtime-0001",
+  batch_number: 7,
+  assignment_attempt: 2,
+  assignment_key: "assignment-7-2",
+  provenance: "owned",
+  owned: true,
+  current: true,
+  items: [{ repo_key: "primary", number: 42 }],
+  completeConfirmed: false,
+};
+const ownedActive = { ...ownedProgress, active: true };
+const ownedAutomation = runtime.ownedBatchAutomationState(ownedProgress, ownedActive);
+assert.equal(ownedAutomation.authoritative, true,
+  "matching current locally-owned progress and active payloads are authoritative");
+assert.deepEqual(ownedAutomation.identity, {
+  installation_id: "installation-runtime-0001",
+  batch_number: 7,
+  assignment_attempt: 2,
+  assignment_key: "assignment-7-2",
+}, "authoritative automation carries the exact assignment identity into route-side guards");
+assert.equal(runtime.ownedBatchAutomationState(
+  ownedProgress,
+  { ...ownedActive, assignment_attempt: 3, assignment_key: "assignment-7-3" },
+).authoritative, false, "a stale assignment attempt cannot drive automation");
+assert.equal(runtime.ownedBatchAutomationState(
+  { ...ownedProgress, provenance: "legacy_unowned", owned: false },
+  ownedActive,
+).authoritative, false, "legacy rows are diagnostic-only and never locally claimed");
+assert.equal(runtime.ownedBatchAutomationState(
+  ownedProgress,
+  { ...ownedActive, current: false },
+).authoritative, false, "historical progress cannot become current authority");
+
 const originalCancelBackground = routes.cancelProjectBackground;
 
 function cleanup() {
@@ -232,10 +266,13 @@ process.on("exit", cleanup);
     return { ok: true };
   };
   try {
-    await runtime.autoStopBridges("b", liveB, 8400, staleBridgeAdmission);
+    await runtime.autoStopBridges("b", liveB, 8400, staleBridgeAdmission, ownedAutomation);
     assert.equal(directBridgeFetches, 2);
     assert.ok(stopBodies.every((body) => body.admission_generation === staleBridgeAdmission.generation),
       "auto-stop requests carry the captured lease for route-side stale-cycle rejection");
+    assert.ok(stopBodies.every((body) => body.assignment_key === ownedProgress.assignment_key &&
+      body.assignment_attempt === ownedProgress.assignment_attempt),
+    "auto-stop requests carry the exact queue assignment for route-side rollover rejection");
     directBridgeFetches = 0;
     lifecycleApi.revokeProjectAdmission("b");
     await runtime.autoStartBridges("b", liveB, 8400, staleBridgeAdmission);
@@ -261,10 +298,10 @@ process.on("exit", cleanup);
   try {
     const staleTrigger = await runtime.sendTriggerMessage("b");
     assert.equal(staleTrigger.code, "project_admission_changed");
-    assert.equal(staleFetches, 1, "stale trigger decision never reaches its chat write");
+    assert.equal(staleFetches, 2, "stale trigger decision fetches only progress + active authority and never reaches its chat write");
     staleFetches = 0;
     await runtime.autoStopPollingTick();
-    assert.equal(staleFetches, 1, "stale batch poll never reaches bridge auto-start after generation change");
+    assert.equal(staleFetches, 2, "stale batch poll fetches only progress + active authority and never reaches bridge auto-start");
   } finally {
     global.fetch = savedFetch;
   }
