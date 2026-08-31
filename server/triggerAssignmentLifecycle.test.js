@@ -91,6 +91,7 @@ function currentV2Body() {
     assignment_attempt: parsed.assignmentAttempt,
   };
   return {
+    admission_generation: captureProjectAdmission(PROJECT).generation,
     installation_id: INSTALLATION,
     batch_number: parsed.batchNumber,
     assignment_attempt: parsed.assignmentAttempt,
@@ -183,11 +184,12 @@ process.on("exit", cleanup);
     assert.equal(posts.length, 1);
     assert.ok(Number.isSafeInteger(posts[0].body.admission_generation));
     const { admission_generation: _admissionGeneration, ...postedBody } = posts[0].body;
+    const { admission_generation: _observedGeneration, ...v2AssignmentBody } = v2Body;
     assert.deepEqual(postedBody, {
       text: "queue pulse",
       channel: "general",
       compatibility_mode: "v2",
-      ...v2Body,
+      ...v2AssignmentBody,
     }, "each cadence pulse carries the exact V2 discriminator to /api/chat");
 
     posts.length = 0;
@@ -220,6 +222,7 @@ process.on("exit", cleanup);
   writeV2Queue("attempt_auto_b");
   const autoBBody = currentV2Body();
   const autoTop = {
+    admission_generation: captureProjectAdmission(PROJECT).generation,
     compatibility_mode: "v2",
     ...autoBBody,
     owned: true,
@@ -266,9 +269,142 @@ process.on("exit", cleanup);
     runtime.triggers.clear();
   }
 
+  // The interval callback reads the trigger's live authority instead of
+  // capturing A forever. After an auto A→B rebind, disabling auto-follow
+  // converts the same cadence to manual mode and the next pulse still sends.
+  writeConfig({ activated: true, triggerEnabled: true, triggerAuto: true });
+  writeV2Queue("attempt_toggle_a");
+  const toggleA = currentV2Body();
+  let togglePulse = null;
+  global.setInterval = (callback) => { togglePulse = callback; return { test_timer: "toggle" }; };
+  const toggleStart = responseSpy();
+  try {
+    runtime.startTriggerSchedule({
+      params: { project: PROJECT },
+      body: { interval: 1, ...toggleA },
+    }, toggleStart);
+  } finally {
+    global.setInterval = originalSetInterval;
+  }
+  assert.equal(toggleStart.statusCode, 200);
+  writeV2Queue("attempt_toggle_b");
+  const toggleB = currentV2Body();
+  const toggleRef = toggleB.assignment_items[0].work_item_ref;
+  const toggleTop = {
+    ...toggleB,
+    compatibility_mode: "v2",
+    owned: true,
+    current: true,
+    multi_repository: false,
+  };
+  const toggleProgress = {
+    ...toggleTop,
+    complete: false,
+    completeConfirmed: false,
+    items: [{
+      installation_id: toggleB.installation_id,
+      batch_number: toggleB.batch_number,
+      assignment_attempt: toggleB.assignment_attempt,
+      provenance: "owned",
+      assignment_key: toggleB.assignment_key,
+      owned: true,
+      current: true,
+      repo_key: toggleRef.repo_key,
+      repo: toggleRef.repo,
+      number: toggleRef.number,
+      kind: toggleRef.kind,
+      work_item_ref: toggleRef,
+      ownership_key: toggleB.assignment_items[0].ownership_key,
+    }],
+  };
+  let toggleChatBodies = [];
+  global.fetch = async (url, options = {}) => {
+    const target = String(url);
+    if (target.includes("/api/batch-progress")) return { ok: true, json: async () => toggleProgress };
+    if (target.includes("/api/batch-active")) return { ok: true, json: async () => ({ ...toggleTop, active: true }) };
+    toggleChatBodies.push(JSON.parse(options.body));
+    return { ok: true, status: 200, text: async () => "" };
+  };
+  try {
+    assert.equal((await togglePulse()).sent, true);
+    assert.equal(runtime.triggers.get(PROJECT).automationBody.assignment_attempt, "attempt_toggle_b");
+    writeConfig({ activated: true, triggerEnabled: true, triggerAuto: false });
+    runtime.syncTriggersFromConfig();
+    assert.equal(runtime.triggers.get(PROJECT).automationBody, null,
+      "turning trigger_auto off converts the retained interval to manual cadence");
+    assert.equal((await togglePulse()).sent, true,
+      "the retained interval reads its live manual authority instead of captured A");
+    assert.equal(toggleChatBodies.length, 2);
+    assert.equal(Object.prototype.hasOwnProperty.call(toggleChatBodies[1], "assignment_key"), false,
+      "the post-toggle manual pulse carries no stale automated identity");
+  } finally {
+    global.fetch = originalFetch;
+    runtime.triggers.clear();
+  }
+
+  // If auto-follow is disabled while an earlier pulse is awaiting batch
+  // authority, that pulse must not restore its assignment body or delete the
+  // cadence. The retained timer becomes manual and its next pulse has no
+  // automation identity.
+  writeConfig({ activated: true, triggerEnabled: true, triggerAuto: true });
+  writeV2Queue("attempt_toggle_race");
+  const toggleRaceBody = currentV2Body();
+  let toggleRacePulse = null;
+  global.setInterval = (callback) => { toggleRacePulse = callback; return { test_timer: "toggle-race" }; };
+  const toggleRaceStart = responseSpy();
+  try {
+    runtime.startTriggerSchedule({
+      params: { project: PROJECT },
+      body: { interval: 1, ...toggleRaceBody },
+    }, toggleRaceStart);
+  } finally {
+    global.setInterval = originalSetInterval;
+  }
+  let releaseProgress;
+  global.fetch = async (url, options = {}) => {
+    const target = String(url);
+    if (target.includes("/api/batch-progress")) {
+      return new Promise((resolve) => {
+        releaseProgress = () => resolve({ ok: true, json: async () => toggleProgress });
+      });
+    }
+    if (target.includes("/api/batch-active")) return { ok: true, json: async () => ({ ...toggleTop, active: true }) };
+    throw new Error(`unexpected blocked auto request: ${target} ${options.method || "GET"}`);
+  };
+  try {
+    const blockedPulse = toggleRacePulse();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof releaseProgress, "function", "auto pulse is held at the batch authority await");
+    writeConfig({ activated: true, triggerEnabled: true, triggerAuto: false });
+    runtime.syncTriggersFromConfig();
+    const retained = runtime.triggers.get(PROJECT);
+    assert.ok(retained, "auto-off retains the configured cadence");
+    assert.equal(retained.automationBody, null);
+    releaseProgress();
+    const stalePulse = await blockedPulse;
+    assert.equal(stalePulse.code, "trigger_auto_disabled");
+    assert.equal(runtime.triggers.get(PROJECT), retained,
+      "late auto pulse neither replaces nor removes the manual cadence");
+    assert.equal(retained.automationBody, null,
+      "late auto pulse cannot restore its assignment receipt");
+
+    let manualBody = null;
+    global.fetch = async (_url, options = {}) => {
+      manualBody = JSON.parse(options.body);
+      return { ok: true, status: 200, text: async () => "" };
+    };
+    assert.equal((await toggleRacePulse()).sent, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(manualBody, "assignment_key"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(manualBody, "admission_generation"), false);
+  } finally {
+    global.fetch = originalFetch;
+    runtime.triggers.clear();
+  }
+
   // Completion uses the same retryable bridge transition ledger as the poller.
   // HTTP 200 with {ok:false} must not mark the assignment stopped.
   writeConfig({ activated: true, triggerAuto: true, telegramAuto: true, discordAuto: true });
+  writeV2Queue("attempt_auto_b");
   const completedProgress = { ...autoProgress, complete: true, completeConfirmed: true };
   const bridgeStopUrls = [];
   let failFirstTelegramStop = true;
@@ -305,9 +441,10 @@ process.on("exit", cleanup);
   writeConfig({ activated: false });
   writeV1Queue();
   const v1Fingerprint = routes.readLiveBatchContext(PROJECT).fingerprint;
+  const v1AdmissionGeneration = captureProjectAdmission(PROJECT).generation;
   for (const [label, requestBody, expectedAuthority] of [
-    ["v1", { interval: 1, compatibility_mode: "v1", batch_observation_fingerprint: v1Fingerprint },
-      { compatibility_mode: "v1", batch_observation_fingerprint: v1Fingerprint }],
+    ["v1", { interval: 1, admission_generation: v1AdmissionGeneration, compatibility_mode: "v1", batch_observation_fingerprint: v1Fingerprint },
+      { admission_generation: v1AdmissionGeneration, compatibility_mode: "v1", batch_observation_fingerprint: v1Fingerprint }],
     ["manual", { interval: 1 }, null],
   ]) {
     let pulse = null;
@@ -330,7 +467,7 @@ process.on("exit", cleanup);
     finally { global.fetch = originalFetch; runtime.triggers.clear(); }
     assert.deepEqual(
       Object.fromEntries(Object.entries(chatBody).filter(([key]) =>
-        key === "compatibility_mode" || key === "batch_observation_fingerprint")),
+        key === "admission_generation" || key === "compatibility_mode" || key === "batch_observation_fingerprint")),
       expectedAuthority || {},
       `${label} chat pulse does not fabricate V2 identity`,
     );
@@ -455,6 +592,7 @@ process.on("exit", cleanup);
     writeV1Queue();
     response = await request(server, {
       text: "owned V1",
+      admission_generation: captureProjectAdmission(PROJECT).generation,
       compatibility_mode: "v1",
       batch_observation_fingerprint: routes.readLiveBatchContext(PROJECT).fingerprint,
     });
@@ -467,6 +605,30 @@ process.on("exit", cleanup);
     assert.equal(dispatches, 3);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+  }
+
+  // Automated trigger/caffeinate receivers require the same project-admission
+  // generation that was joined with the batch observation. Identical queue
+  // bytes after archive→unarchive must not re-authorize the prior receipt, and
+  // omitting only the generation must not downgrade an automated body to manual.
+  writeConfig({ activated: true });
+  writeV2Queue("attempt_validator_admission");
+  const staleAdmissionBody = currentV2Body();
+  revokeProjectAdmission(PROJECT);
+  captureProjectAdmission(PROJECT);
+  for (const validate of [runtime.validateTriggerAutomationRequest, runtime.validateCaffeinateAutomationRequest]) {
+    const stale = validate(PROJECT, staleAdmissionBody);
+    assert.equal(stale.ok, false, "archive→unarchive rejects the prior automated admission receipt");
+    assert.equal(stale.code, "project_admission_changed");
+
+    const { admission_generation: _omitted, ...missingGenerationBody } = currentV2Body();
+    const missing = validate(PROJECT, missingGenerationBody);
+    assert.equal(missing.ok, false, "automated identity without admission generation is rejected");
+    assert.equal(missing.code, "project_admission_changed");
+
+    const manual = validate(PROJECT, {});
+    assert.equal(manual.ok, true, "identity-free manual request remains compatible");
+    assert.equal(manual.manual, true);
   }
 
   console.log("triggerAssignmentLifecycle.test.js: all assertions passed");

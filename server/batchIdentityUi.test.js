@@ -19,6 +19,7 @@ const ASSIGNMENT_ITEMS = [
   { work_item_ref: WEB_REF, ownership_key: "ownership-web-42" },
 ];
 const identity = {
+  admission_generation: 4,
   installation_id: "123e4567-e89b-42d3-a456-426614174000",
   batch_number: 7,
   assignment_attempt: "attempt-2",
@@ -86,6 +87,7 @@ assert.equal(current.active, true);
 assert.equal(current.complete, false);
 assert.equal(current.completeConfirmed, false);
 assert.deepEqual(assignmentRequestFields(current), {
+  admission_generation: 4,
   installation_id: identity.installation_id,
   batch_number: 7,
   assignment_attempt: "attempt-2",
@@ -98,6 +100,8 @@ for (const [name, activeDelta, progressDelta] of [
   ["foreign", { provenance: "foreign", owned: false }, { provenance: "foreign", owned: false }],
   ["unowned", { provenance: "unowned", owned: false }, { provenance: "unowned", owned: false }],
   ["historical", { current: false }, { current: false }],
+  ["admission mismatch", { admission_generation: 3 }, {}],
+  ["missing admission", { admission_generation: undefined }, { admission_generation: undefined }],
   ["stale active attempt", { assignment_attempt: "attempt-1" }, {}],
   ["stale progress attempt", {}, { assignment_attempt: "attempt-1" }],
   ["invalid matching attempt grammar", { assignment_attempt: "bad attempt" }, { assignment_attempt: "bad attempt" }],
@@ -187,6 +191,7 @@ const legacyStringRow = { ...row("web", "owner/web"), work_item_ref: "owner/web#
 assert.match(workItemReactKey(legacyStringRow), /owner%2Fweb%2342/, "legacy string refs remain render-key compatible");
 
 const legacyTop = {
+  admission_generation: 9,
   compatibility_mode: "v1",
   provenance: "legacy_unowned",
   installation_id: null,
@@ -216,7 +221,7 @@ const legacy = ownedCurrentBatchSnapshot(
 assert.ok(legacy && legacy.authority === "legacy_compatibility", "explicit preactivation V1 keeps legacy auto lifecycle compatible");
 assert.deepEqual(
   assignmentRequestFields(legacy),
-  { compatibility_mode: "v1", batch_observation_fingerprint: "legacy-observation-3-a" },
+  { admission_generation: 9, compatibility_mode: "v1", batch_observation_fingerprint: "legacy-observation-3-a" },
   "legacy auto action sends only the explicit compatibility discriminator and never fabricates V2 authority",
 );
 assert.equal(
@@ -251,6 +256,7 @@ for (const [name, activeDelta, progressDelta] of [
   ["postactivation legacy", { compatibility_mode: "v2" }, { compatibility_mode: "v2" }],
   ["one-sided compatibility", {}, { compatibility_mode: "v2" }],
   ["legacy observation mismatch", {}, { batch_observation_fingerprint: "legacy-observation-3-stale" }],
+  ["legacy admission mismatch", {}, { admission_generation: 8 }],
   ["legacy current mismatch", {}, { current: false }],
   ["multi-repository legacy", { multi_repository: true }, { multi_repository: true }],
   ["legacy claimed owned", { owned: true }, { owned: true }],

@@ -372,14 +372,20 @@ async function run() {
   assert.equal(payload.items[0].issue_number, 42);
   assert.equal(typeof payload.batch_observation_fingerprint, "string");
   const liveV1Fingerprint = payload.batch_observation_fingerprint;
+  assert.equal(payload.admission_generation, 0);
   assert.equal(validateCurrentOwnedAssignment("p", { admission_generation: 0 }).ok, false);
   assert.equal(validateCurrentOwnedAssignment("p", {
     compatibility_mode: "v1",
     batch_observation_fingerprint: payload.batch_observation_fingerprint,
   }).legacy, true);
 
+  queue = ["## Active Batch", "**Batch:** 13", "- #43 replacement"].join("\n");
+  payload = await getOrComputeBatchProgress("p");
+  assert.equal(payload.items[0].issue_number, 43,
+    "a fresh V1 cache entry cannot survive an immediate queue observation change");
+  assert.notEqual(payload.batch_observation_fingerprint, liveV1Fingerprint);
+
   queue = ["## Active Batch", "**Batch:** 13"].join("\n");
-  _batchProgressCache.clear();
   payload = await getOrComputeBatchProgress("p");
   assert.equal(payload.compatibility_mode, "v1");
   assert.equal(payload.liveActiveBatchCleared, true);
@@ -393,6 +399,31 @@ async function run() {
     compatibility_mode: "v1",
     batch_observation_fingerprint: payload.batch_observation_fingerprint,
   }).legacy, true);
+
+  queue = [
+    "## Active Batch", "**Batch:** 13", "**Batch type:** ticket-review",
+    "- #42 — in-review (1/2)",
+  ].join("\n");
+  _batchProgressCache.clear();
+  payload = await getOrComputeBatchProgress("p");
+  const inReviewFingerprint = payload.batch_observation_fingerprint;
+  assert.equal(payload.complete, false);
+  assert.equal(payload.items[0].review_state, "in-review");
+
+  queue = [
+    "## Active Batch", "**Batch:** 13", "**Batch type:** ticket-review",
+    "- #42 — approved",
+  ].join("\n");
+  payload = await getOrComputeBatchProgress("p");
+  assert.notEqual(payload.batch_observation_fingerprint, inReviewFingerprint,
+    "V1 review-state changes participate in the live observation fingerprint");
+  assert.equal(payload.complete, true,
+    "an in-review V1 cache entry cannot survive the same-item approved transition");
+  assert.equal(payload.completeConfirmed, true);
+  assert.equal(validateCurrentOwnedAssignment("p", {
+    compatibility_mode: "v1",
+    batch_observation_fingerprint: inReviewFingerprint,
+  }).ok, false, "the earlier V1 review-state receipt cannot authorize after approval");
 
   queue = ["## Active Batch", "**Batch:** 13", "- Acme/Web#42 qualified"].join("\n");
   const qualifiedLegacy = validateCurrentOwnedAssignment("p", { admission_generation: 0 });

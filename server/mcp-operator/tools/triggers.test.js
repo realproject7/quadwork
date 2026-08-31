@@ -21,6 +21,7 @@ const WORK_ITEM_REF = {
   kind: "issue",
 };
 const ASSIGNMENT_ITEMS = [{ work_item_ref: WORK_ITEM_REF, ownership_key: "owned-item-1031" }];
+const ADMISSION_GENERATION = 7;
 const V2_IDENTITY = {
   installation_id: "installation-a",
   batch_number: 17,
@@ -33,6 +34,7 @@ const V2_IDENTITY = {
 function v2LiveState(overrides = {}) {
   const active = {
     active: true,
+    admission_generation: ADMISSION_GENERATION,
     compatibility_mode: "v2",
     ...V2_IDENTITY,
     current: true,
@@ -40,6 +42,7 @@ function v2LiveState(overrides = {}) {
     multi_repository: false,
   };
   const progress = {
+    admission_generation: ADMISSION_GENERATION,
     compatibility_mode: "v2",
     ...V2_IDENTITY,
     current: true,
@@ -68,6 +71,7 @@ function v2ClearedState() {
   return {
     active: {
       active: false,
+      admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v2",
       ...clearedIdentity,
       current: false,
@@ -75,6 +79,7 @@ function v2ClearedState() {
       multi_repository: false,
     },
     progress: {
+      admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v2",
       ...clearedIdentity,
       current: false,
@@ -90,6 +95,7 @@ function v2ClearedState() {
 
 function v1LiveState() {
   const base = {
+    admission_generation: ADMISSION_GENERATION,
     compatibility_mode: "v1",
     installation_id: null,
     batch_number: 4,
@@ -207,7 +213,8 @@ function batchReads(requests) {
 }
 
 function hasExactV2Identity(body, expectedItems = ASSIGNMENT_ITEMS) {
-  return body && body.installation_id === V2_IDENTITY.installation_id &&
+  return body && body.admission_generation === ADMISSION_GENERATION &&
+    body.installation_id === V2_IDENTITY.installation_id &&
     body.batch_number === V2_IDENTITY.batch_number &&
     body.assignment_attempt === V2_IDENTITY.assignment_attempt &&
     body.provenance === "owned" &&
@@ -267,6 +274,7 @@ async function runTests() {
     const ctx = createContext(port);
     await handlers.stop_batch({ project: "plotlink" }, ctx);
     assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({
+      admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v1",
       batch_observation_fingerprint: "legacy-observation-mcp-4",
     }), "legacy stop_batch carries its exact observation lease without inventing V2 authority");
@@ -282,6 +290,7 @@ async function runTests() {
     assert(post.body.message === "@head go" && !("interval" in post.body) && !("duration" in post.body), "start_batch sends only the provided trigger option");
     assert(JSON.stringify(post.body) === JSON.stringify({
       message: "@head go",
+      admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v1",
       batch_observation_fingerprint: "legacy-observation-mcp-4",
     }), "legacy start sends explicit V1 authority plus its observation lease");
@@ -289,6 +298,7 @@ async function runTests() {
     requests.length = 0;
     await handlers.trigger_now({ project: "plotlink" }, ctx);
     assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({
+      admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v1",
       batch_observation_fingerprint: "legacy-observation-mcp-4",
     }), "legacy trigger_now carries the exact V1 observation lease");
@@ -296,6 +306,7 @@ async function runTests() {
     requests.length = 0;
     await handlers.stop_batch({ project: "plotlink" }, ctx);
     assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({
+      admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v1",
       batch_observation_fingerprint: "legacy-observation-mcp-4",
     }), "legacy stop_batch carries the exact V1 observation lease");

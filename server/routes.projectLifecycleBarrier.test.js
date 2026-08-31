@@ -343,10 +343,11 @@ function request(server, method, pathname, body) {
         const beforeLegacy = { ...bridgeCalls };
         response = await request(server, "POST", `/api/${name}?action=start`, {
           project_id: "alpha",
+          admission_generation: currentAdmission.generation,
           compatibility_mode: "v1",
           batch_observation_fingerprint: legacyFingerprint,
         });
-        assert.equal(response.status, 200, `${name} V1 admission-only automated start remains compatible`);
+        assert.equal(response.status, 200, `${name} V1 admission-bound automated start remains compatible`);
         assert.equal(latestStartOptions.isAuthorityCurrent(), true,
           `${name} V1 automation receives a live compatibility guard`);
         assert.equal(latestStartOptions.automationIdentity.compatibility_mode, "v1");
@@ -359,10 +360,11 @@ function request(server, method, pathname, body) {
         }, `${name} explicit V1 runtime keeps its observation authority`);
         response = await request(server, "POST", `/api/${name}?action=stop`, {
           project_id: "alpha",
+          admission_generation: currentAdmission.generation,
           compatibility_mode: "v1",
           batch_observation_fingerprint: legacyFingerprint,
         });
-        assert.equal(response.status, 200, `${name} V1 admission-only automated stop remains compatible`);
+        assert.equal(response.status, 200, `${name} V1 admission-bound automated stop remains compatible`);
         assert.equal(bridgeCalls.start, beforeLegacy.start + 1);
         assert.equal(bridgeCalls.stop, beforeLegacy.stop + 1);
         assert.deepEqual(latestStopAuthorityKey, latestStartOptions.authorityKey,

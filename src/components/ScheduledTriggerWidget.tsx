@@ -45,6 +45,7 @@ interface BatchState {
   owned: boolean;
   multi_repository: boolean;
   compatibility_mode: "v1" | "v2";
+  admission_generation: number;
   batch_observation_fingerprint?: string;
 }
 
@@ -63,6 +64,7 @@ interface BatchActiveState {
   owned: boolean;
   multi_repository: boolean;
   compatibility_mode: "v1" | "v2";
+  admission_generation: number;
   batch_observation_fingerprint?: string;
 }
 
@@ -70,6 +72,8 @@ interface BatchLifecycleSnapshot {
   authority: "v2_owned" | "legacy_compatibility";
   compatibility_mode: "v1" | "v2";
   fingerprint: string;
+  admission_generation: number;
+  batch_observation_fingerprint?: string;
   active: boolean;
   complete: boolean;
   completeConfirmed: boolean;

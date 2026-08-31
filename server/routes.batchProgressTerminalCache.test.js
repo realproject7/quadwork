@@ -13,13 +13,23 @@ const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 
 let ghCalls = [];
 let delayGh = false;
+let deferGh = false;
+let deferredGhFinishes = [];
+let deferIssueNumber = null;
+let deferredIssueFinish = null;
 const realRunner = cp.execFile;
 cp.execFile = function stubRunner(file, args, opts, cb) {
   const done = typeof opts === "function" ? opts : cb;
   if (file !== "gh" || typeof done !== "function") return realRunner.apply(this, arguments);
   ghCalls.push(args.slice());
+  const issueTarget = args.find((arg) => typeof arg === "string" && /repos\/o\/r\/issues\/\d+$/.test(arg));
+  if (deferIssueNumber !== null && issueTarget?.endsWith(`/issues/${deferIssueNumber}`) && !args.includes("--jq")) {
+    deferredIssueFinish = () => done(new Error("deferred issue lookup failed"), "", "transient");
+    return;
+  }
   const finish = () => done(null, JSON.stringify({ number: 10 }), "");
-  if (delayGh) setTimeout(finish, 80);
+  if (deferGh) deferredGhFinishes.push(finish);
+  else if (delayGh) setTimeout(finish, 80);
   else setImmediate(finish);
 };
 
@@ -52,6 +62,7 @@ fs.unlinkSync = () => { snapshotJson = null; };
 
 const {
   getOrComputeBatchProgress,
+  readLiveBatchContext,
   _batchProgressCache,
   _batchProgressRefreshes,
   _graphqlCache,
@@ -191,7 +202,9 @@ function perItemIssueFetches() {
     delayGh = true;
     _batchProgressCache.set("terminal-proj", {
       ts: Date.now() - 60_000,
-      data: { batch_number: 950, items: [{ issue_number: 10, status: "merged" }], summary: "1/1 merged", complete: true, completeConfirmed: true, batch_type: "code" },
+      fingerprint: readLiveBatchContext("terminal-proj").fingerprint,
+      admission_generation: 0,
+      data: { admission_generation: 0, batch_number: 950, items: [{ issue_number: 10, status: "merged" }], summary: "1/1 merged", complete: true, completeConfirmed: true, batch_type: "code" },
     });
 
     const start = Date.now();
@@ -208,6 +221,103 @@ function perItemIssueFetches() {
     await _batchProgressRefreshes.get("terminal-proj").promise;
     ok(!_batchProgressRefreshes.has("terminal-proj"), "C: refresh gate clears after completion");
     delayGh = false;
+  }
+
+  // D. An older V1 observation may finish its async snapshot probe after a
+  // newer queue observation has already completed. The older refresh must
+  // return a stale marker without replacing either B's rendered cache or B's
+  // persisted snapshot.
+  {
+    _batchProgressCache.clear();
+    _batchProgressRefreshes.clear();
+    _graphqlCache.clear();
+    ghCalls = [];
+    deferredGhFinishes = [];
+    deferGh = true;
+    cfgJson = JSON.stringify({ projects: [{ id: "terminal-proj", repo: "o/r", idle: false }] });
+    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 950\n\n- #10 old observation\n";
+    snapshotJson = JSON.stringify({
+      batchNumber: 950,
+      issueNumbers: [10],
+      batch_type: "code",
+      reviewItems: [],
+      terminalItems: {},
+    });
+    mergedRowsSnapshot("o/r", [10, 11]);
+
+    const older = getOrComputeBatchProgress("terminal-proj");
+    await new Promise((resolve) => setImmediate(resolve));
+    ok(deferredGhFinishes.length === 1, "D: observation A is held at its async freshness probe");
+
+    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 951\n\n- #11 current observation\n";
+    const currentFingerprint = readLiveBatchContext("terminal-proj").fingerprint;
+    const newer = getOrComputeBatchProgress("terminal-proj");
+    await new Promise((resolve) => setImmediate(resolve));
+    ok(deferredGhFinishes.length === 2, "D: observation B reaches an independent freshness probe");
+
+    deferredGhFinishes.splice(1, 1)[0]();
+    const newerData = await newer;
+    ok(newerData.batch_number === 951 && newerData.items[0]?.issue_number === 11,
+      "D: observation B completes first with its own rows");
+
+    deferredGhFinishes.shift()();
+    const olderData = await older;
+    ok(olderData._stale_observation === true && olderData.current === false,
+      "D: late observation A is rejected after its await boundary");
+    const cached = _batchProgressCache.get("terminal-proj");
+    ok(cached?.fingerprint === currentFingerprint && cached.data.items[0]?.issue_number === 11,
+      "D: late observation A cannot overwrite B's memory cache");
+    ok(JSON.parse(snapshotJson).batchNumber === 951 && JSON.parse(snapshotJson).issueNumbers[0] === 11,
+      "D: late observation A cannot overwrite B's persisted snapshot");
+    deferGh = false;
+    deferredGhFinishes = [];
+  }
+
+  // E. Cover the final publication guard too: hold A inside a per-item REST
+  // lookup (past the freshness check), let a proven B publish, then release A.
+  // The late item result must still be discarded before snapshot/cache writes.
+  {
+    _batchProgressCache.clear();
+    _batchProgressRefreshes.clear();
+    _graphqlCache.clear();
+    ghCalls = [];
+    snapshotJson = null;
+    deferredIssueFinish = null;
+    deferIssueNumber = 10;
+    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 952\n\n- #10 slow item\n";
+    _graphqlCache.set("o/r", {
+      ts: Date.now(),
+      issues: [],
+      prs: [],
+      closedIssues: [],
+      mergedPrs: [],
+      openPrsWindowComplete: false,
+      closedPrsWindowComplete: false,
+      closedPrIssueNums: [],
+    });
+
+    const older = getOrComputeBatchProgress("terminal-proj");
+    await new Promise((resolve) => setImmediate(resolve));
+    ok(typeof deferredIssueFinish === "function", "E: observation A is held inside per-item REST work");
+
+    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 953\n\n- #11 current item\n";
+    const currentFingerprint = readLiveBatchContext("terminal-proj").fingerprint;
+    mergedRowsSnapshot("o/r", [11]);
+    const newerData = await getOrComputeBatchProgress("terminal-proj");
+    ok(newerData.batch_number === 953 && newerData.items[0]?.issue_number === 11,
+      "E: observation B publishes while A's item lookup is pending");
+
+    deferredIssueFinish();
+    const olderData = await older;
+    ok(olderData._stale_observation === true,
+      "E: late per-item observation A is rejected before publication");
+    const cached = _batchProgressCache.get("terminal-proj");
+    ok(cached?.fingerprint === currentFingerprint && cached.data.items[0]?.issue_number === 11,
+      "E: late per-item observation A cannot overwrite B's memory cache");
+    ok(JSON.parse(snapshotJson).batchNumber === 953 && JSON.parse(snapshotJson).issueNumbers[0] === 11,
+      "E: late per-item observation A cannot overwrite B's persisted snapshot");
+    deferIssueNumber = null;
+    deferredIssueFinish = null;
   }
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

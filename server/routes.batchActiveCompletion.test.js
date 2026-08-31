@@ -79,6 +79,7 @@ fs.unlinkSync = () => {};
 const {
   isBatchActiveFromProgress,
   getOrComputeBatchProgress,
+  readLiveBatchContext,
   _batchProgressCache,
   _graphqlCache,
 } = require("./routes");
@@ -173,9 +174,12 @@ function inReviewSnapshot(repo, n) {
     _batchProgressCache.clear();
     _graphqlCache.clear(); // ensure no snapshot — proves the cache hit is what answers
     cfgJson = JSON.stringify({ projects: [{ id: "cached-proj", repo: "o/r", idle: false }] });
+    queueText = "# Queue\n\n## Active Batch\n\n**Batch:** 42\n\n- #200 cached\n";
     _batchProgressCache.set("cached-proj", {
       ts: Date.now(),
-      data: { batch_number: 42, items: [{ status: "merged" }], summary: "1/1 merged", complete: true, completeConfirmed: true },
+      fingerprint: readLiveBatchContext("cached-proj").fingerprint,
+      admission_generation: 0,
+      data: { admission_generation: 0, batch_number: 42, items: [{ status: "merged" }], summary: "1/1 merged", complete: true, completeConfirmed: true },
     });
 
     const data = await getOrComputeBatchProgress("cached-proj");

@@ -12,6 +12,10 @@ function positiveInteger(value) {
   return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
+function admissionGeneration(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 function assignmentAttempt(value) {
   const normalized = nonEmptyString(value);
   return normalized && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(normalized) ? normalized : null;
@@ -186,7 +190,10 @@ function sameAssignment(left, right) {
 }
 
 function legacyV1BatchSnapshot(active, progress) {
+  const activeAdmission = admissionGeneration(active.admission_generation);
+  const progressAdmission = admissionGeneration(progress.admission_generation);
   if (
+    activeAdmission === null || activeAdmission !== progressAdmission ||
     active.compatibility_mode !== "v1" || progress.compatibility_mode !== "v1" ||
     active.provenance !== "legacy_unowned" || progress.provenance !== "legacy_unowned" ||
     active.owned !== false || progress.owned !== false ||
@@ -227,7 +234,9 @@ function legacyV1BatchSnapshot(active, progress) {
   return {
     authority: "legacy_compatibility",
     compatibility_mode: "v1",
-    fingerprint: progressObservation,
+    fingerprint: `${encodeURIComponent(progressObservation)}:${progressAdmission}`,
+    batch_observation_fingerprint: progressObservation,
+    admission_generation: progressAdmission,
     active: active.active === true,
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,
@@ -253,6 +262,9 @@ function ownedCurrentBatchSnapshot(active, progress) {
     return legacyV1BatchSnapshot(active, progress);
   }
   if (active.compatibility_mode !== "v2" || progress.compatibility_mode !== "v2") return null;
+  const activeAdmission = admissionGeneration(active.admission_generation);
+  const progressAdmission = admissionGeneration(progress.admission_generation);
+  if (activeAdmission === null || activeAdmission !== progressAdmission) return null;
   const liveActiveBatchCleared = progress.liveActiveBatchCleared === true;
   if (liveActiveBatchCleared && (active.active !== false || progress.items.length !== 0)) return null;
   const activeIdentity = assignmentIdentity(active, { allowCleared: liveActiveBatchCleared });
@@ -274,6 +286,7 @@ function ownedCurrentBatchSnapshot(active, progress) {
   if (progress.items.length > 0 && expectedByOwnership.size !== 0) return null;
 
   const fingerprint = [
+    progressAdmission,
     progressIdentity.installation_id,
     progressIdentity.batch_number,
     progressIdentity.assignment_attempt,
@@ -285,6 +298,7 @@ function ownedCurrentBatchSnapshot(active, progress) {
     authority: "v2_owned",
     compatibility_mode: "v2",
     fingerprint,
+    admission_generation: progressAdmission,
     active: active.active === true,
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,
@@ -306,12 +320,14 @@ function assignmentRequestFields(snapshot) {
   if (!snapshot) return {};
   if (snapshot.authority === "legacy_compatibility" && snapshot.compatibility_mode === "v1") {
     return {
+      admission_generation: snapshot.admission_generation,
       compatibility_mode: "v1",
-      batch_observation_fingerprint: snapshot.fingerprint,
+      batch_observation_fingerprint: snapshot.batch_observation_fingerprint,
     };
   }
   if (snapshot.authority !== "v2_owned") return {};
   return {
+    admission_generation: snapshot.admission_generation,
     installation_id: snapshot.installation_id,
     batch_number: snapshot.batch_number,
     assignment_attempt: snapshot.assignment_attempt,

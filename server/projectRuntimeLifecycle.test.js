@@ -50,6 +50,7 @@ const dispatcher = require("./pty-dispatcher");
 const runtime = require("./index");
 
 const ownedProgress = {
+  admission_generation: 0,
   compatibility_mode: "v2",
   installation_id: "installation-runtime-0001",
   batch_number: 7,
@@ -163,6 +164,7 @@ assert.equal(clearedOwnedState.shouldStop, true,
   "an exact inactive V2 empty-set assignment authorizes explicit-clear stop");
 
 const legacyProgress = {
+  admission_generation: 0,
   compatibility_mode: "v1",
   installation_id: null,
   provenance: "legacy_unowned",
@@ -233,6 +235,29 @@ assert.equal(runtime.validateCaffeinateAutomationRequest("a", {}).ok, true,
   "manual caffeinate controls remain compatible");
 assert.equal(runtime.validateCaffeinateAutomationRequest("a", { assignment_attempt: "stale" }).ok, false,
   "caffeinate automation delegates stale assignment rejection to the live queue guard");
+const identityWithoutProject = {
+  admission_generation: 0,
+  compatibility_mode: "v2",
+  installation_id: ownedProgress.installation_id,
+  batch_number: ownedProgress.batch_number,
+  assignment_attempt: ownedProgress.assignment_attempt,
+  provenance: "owned",
+  assignment_key: ownedProgress.assignment_key,
+  assignment_items: ownedProgress.assignment_items,
+};
+for (const [label, handler] of [["start", runtime.startCaffeinate], ["stop", runtime.stopCaffeinate]]) {
+  const response = {
+    statusCode: 200,
+    payload: null,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.payload = payload; return this; },
+  };
+  handler({ body: identityWithoutProject }, response);
+  assert.equal(response.statusCode, 409, `${label} rejects automated identity without project_id`);
+  assert.equal(response.payload.code, "project_id_required");
+}
+assert.equal(runtime.caffeinateProcess.manualOwner, false,
+  "rejected identity cannot acquire or release the global manual owner");
 assert.equal(runtime.isBatchAutomationCurrent("a", { ...ownedAutomation, mode: "v2" }), true,
   "server-side trigger polling revalidates the exact action identity before local mutation");
 assert.equal(runtime.isBatchAutomationCurrent("a", {
@@ -241,12 +266,8 @@ assert.equal(runtime.isBatchAutomationCurrent("a", {
   identity: { ...ownedAutomation.identity, assignment_attempt: "stale" },
 }), false, "server-side trigger polling rejects a rolled assignment before local mutation");
 assert.deepEqual(triggerValidationCalls, [
-  { projectId: "a", body: {} },
-  { projectId: "a", body: { assignment_attempt: "stale" } },
-  { projectId: "a", body: {} },
-  { projectId: "a", body: { assignment_attempt: "stale" } },
-  { projectId: "a", body: { compatibility_mode: "v2", ...ownedAutomation.identity } },
-  { projectId: "a", body: { compatibility_mode: "v2", ...ownedAutomation.identity, assignment_attempt: "stale" } },
+  { projectId: "a", body: { admission_generation: 0, compatibility_mode: "v2", ...ownedAutomation.identity } },
+  { projectId: "a", body: { admission_generation: 0, compatibility_mode: "v2", ...ownedAutomation.identity, assignment_attempt: "stale" } },
 ]);
 routes.validateCurrentOwnedAssignment = originalValidateCurrentOwnedAssignment;
 
@@ -567,6 +588,7 @@ process.on("exit", cleanup);
   let failFirstTelegramStart = true;
   let failFirstTelegramStop = true;
   let bridgeBatchComplete = false;
+  const bridgeAdmissionGeneration = lifecycleApi.captureProjectAdmission("b").generation;
   routes.validateCurrentOwnedAssignment = () => ({ ok: true, manual: false });
   global.fetch = async (url, options = {}) => {
     const target = String(url);
@@ -574,16 +596,16 @@ process.on("exit", cleanup);
       return {
         ok: true,
         json: async () => bridgeBatchComplete
-          ? { ...ownedProgress, complete: true, completeConfirmed: true }
-          : ownedProgress,
+          ? { ...ownedProgress, admission_generation: bridgeAdmissionGeneration, complete: true, completeConfirmed: true }
+          : { ...ownedProgress, admission_generation: bridgeAdmissionGeneration },
       };
     }
     if (target.includes("/api/batch-active")) {
       return {
         ok: true,
         json: async () => bridgeBatchComplete
-          ? { ...ownedActive, complete: true, completeConfirmed: true }
-          : ownedActive,
+          ? { ...ownedActive, admission_generation: bridgeAdmissionGeneration, complete: true, completeConfirmed: true }
+          : { ...ownedActive, admission_generation: bridgeAdmissionGeneration },
       };
     }
     if (!options.body && (target.includes("/api/telegram?") || target.includes("/api/discord?"))) {

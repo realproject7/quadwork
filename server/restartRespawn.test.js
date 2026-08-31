@@ -36,6 +36,7 @@ const V2_IDENTITY = {
 };
 const V2_ITEM = { work_item_ref: REF, ownership_key: "ownership-key-42" };
 const ACTIVE = {
+  admission_generation: 0,
   ...V2_IDENTITY,
   current: true,
   owned: true,
@@ -67,6 +68,7 @@ const IDLE_CLEARED = {
   liveActiveBatchCleared: true,
 };
 const ACTIVE_V1 = {
+  admission_generation: 0,
   compatibility_mode: "v1",
   provenance: "legacy_unowned",
   owned: false,

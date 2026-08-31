@@ -115,6 +115,7 @@ function startFullServer() {
   const workItemRef = { repo_key: "primary", repo: "o/r", number: 1, kind: "issue" };
   const assignmentItems = [{ work_item_ref: workItemRef, ownership_key: "owned-p-1" }];
   const assignment = {
+    admission_generation: 0,
     compatibility_mode: "v2",
     installation_id: "installation-p",
     batch_number: 1,

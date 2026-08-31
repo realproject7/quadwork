@@ -492,7 +492,7 @@ function caffeinateStatus(projectId = null) {
 }
 
 function validateCaffeinateAutomationRequest(projectId, body = {}) {
-  return routes.validateCurrentOwnedAssignment(projectId, body);
+  return routes.validateCurrentAutomationRequest(projectId, body);
 }
 
 function rejectChangedCaffeinateAssignment(res, result) {
@@ -505,16 +505,48 @@ function rejectChangedCaffeinateAssignment(res, result) {
   });
 }
 
-app.post("/api/caffeinate/start", (req, res) => {
+const CAFFEINATE_AUTOMATION_FIELDS = [
+  "admission_generation",
+  "compatibility_mode",
+  "batch_observation_fingerprint",
+  "assignment_key",
+  "assignment_items",
+  "installation_id",
+  "batch_number",
+  "assignment_attempt",
+  "provenance",
+];
+
+function caffeinateRequestAuthority(body = {}) {
+  const projectId = typeof body.project_id === "string" && body.project_id.trim()
+    ? body.project_id
+    : null;
+  const automated = CAFFEINATE_AUTOMATION_FIELDS.some((field) =>
+    Object.prototype.hasOwnProperty.call(body, field));
+  if (!projectId && automated) {
+    return {
+      ok: false,
+      status: 409,
+      code: "project_id_required",
+      error: "project_id is required for automated sleep-prevention actions",
+      project_id: null,
+    };
+  }
+  if (!projectId) return { ok: true, manual: true, projectId: null };
+  const assignment = validateCaffeinateAutomationRequest(projectId, body);
+  return { ...assignment, projectId };
+}
+
+function startCaffeinate(req, res) {
+  const authority = caffeinateRequestAuthority(req.body || {});
+  if (!authority.ok) return rejectChangedCaffeinateAssignment(res, authority);
   if (process.platform !== "darwin") {
     return res.status(400).json({ ok: false, error: "Sleep prevention is only available on macOS" });
   }
-  const projectId = typeof req.body?.project_id === "string" ? req.body.project_id : null;
+  const projectId = authority.projectId;
   if (projectId) {
     try { assertProjectAdmitted(projectId); }
     catch (err) { return respondLifecycleFailure(res, err); }
-    const assignment = validateCaffeinateAutomationRequest(projectId, req.body || {});
-    if (!assignment.ok) return rejectChangedCaffeinateAssignment(res, assignment);
   }
   const duration = req.body?.duration || 0; // seconds, 0 = indefinite
   registerCaffeinateOwner(projectId, duration);
@@ -545,20 +577,22 @@ app.post("/api/caffeinate/start", (req, res) => {
   caffeinateProcess.pid = child.pid;
   caffeinateProcess.startedAt = Date.now();
   res.json({ ok: true, active: true, pid: child.pid, duration });
-});
+}
 
-app.post("/api/caffeinate/stop", (req, res) => {
-  const projectId = typeof req.body?.project_id === "string" ? req.body.project_id : null;
-  if (projectId) {
-    const assignment = validateCaffeinateAutomationRequest(projectId, req.body || {});
-    if (!assignment.ok) return rejectChangedCaffeinateAssignment(res, assignment);
-  }
+app.post("/api/caffeinate/start", startCaffeinate);
+
+function stopCaffeinate(req, res) {
+  const authority = caffeinateRequestAuthority(req.body || {});
+  if (!authority.ok) return rejectChangedCaffeinateAssignment(res, authority);
+  const projectId = authority.projectId;
   const released = projectId ? releaseProjectCaffeinate(projectId) : releaseManualCaffeinate();
   if (!released.ok) {
     return res.status(409).json({ ok: false, active: true, code: "caffeinate_stop_failed", error: "Sleep prevention could not be stopped" });
   }
   res.json({ ok: true, active: caffeinateStatus(projectId).active });
-});
+}
+
+app.post("/api/caffeinate/stop", stopCaffeinate);
 
 app.get("/api/caffeinate/status", (req, res) => {
   const projectId = typeof req.query?.project === "string" ? req.query.project : null;
@@ -1710,8 +1744,9 @@ ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via t
 // operator is on a different project page.
 
 function bridgeAssignmentBody(projectId, admission, batchState) {
-  const body = { project_id: projectId, admission_generation: admission?.generation };
+  const body = { project_id: projectId };
   Object.assign(body, batchAutomationRequestBody(batchState) || {});
+  body.admission_generation = admission?.generation;
   return body;
 }
 
@@ -1819,6 +1854,8 @@ function automationStateFromSnapshot(snapshot) {
     authoritative: true,
     mode: legacy ? "v1" : "v2",
     fingerprint: snapshot.fingerprint,
+    admissionGeneration: requestFields.admission_generation,
+    batchObservationFingerprint: requestFields.batch_observation_fingerprint || null,
     active: snapshot.active === true,
     hasItems: snapshot.hasItems === true,
     clearedByOperator: snapshot.liveActiveBatchCleared === true,
@@ -1854,22 +1891,37 @@ function batchAutomationState(progress, active) {
 
 function batchAutomationRequestBody(batchState) {
   if (!batchState?.authoritative) return null;
-  if (batchState.mode === "v1" && typeof batchState.fingerprint === "string" && batchState.fingerprint) {
+  if (!Number.isSafeInteger(batchState.admissionGeneration) || batchState.admissionGeneration < 0) return null;
+  if (batchState.mode === "v1" && typeof batchState.batchObservationFingerprint === "string" && batchState.batchObservationFingerprint) {
     return {
+      admission_generation: batchState.admissionGeneration,
       compatibility_mode: "v1",
-      batch_observation_fingerprint: batchState.fingerprint,
+      batch_observation_fingerprint: batchState.batchObservationFingerprint,
     };
   }
   if (batchState.mode !== "v2" || !batchState.identity) return null;
-  return { compatibility_mode: "v2", ...batchState.identity };
+  return {
+    admission_generation: batchState.admissionGeneration,
+    compatibility_mode: "v2",
+    ...batchState.identity,
+  };
 }
 
 function isBatchAutomationCurrent(projectId, batchState, admission = null) {
   if (!batchState?.authoritative || (admission && !isAdmissionCurrent(admission))) return false;
   const body = batchAutomationRequestBody(batchState);
   if (!body) return false;
+  if (admission && body.admission_generation !== admission.generation) return false;
   return routes.validateCurrentOwnedAssignment(projectId, body).ok === true &&
     (!admission || isAdmissionCurrent(admission));
+}
+
+function triggerAutoEnabled(projectId) {
+  try {
+    return readConfig().projects?.find((entry) => entry?.id === projectId)?.trigger_auto === true;
+  } catch {
+    return false;
+  }
 }
 
 async function sendTriggerMessage(projectId, automationBody = null) {
@@ -1881,6 +1933,14 @@ async function sendTriggerMessage(projectId, automationBody = null) {
   }
   const cfg = readConfig();
   const project = cfg.projects && cfg.projects.find((p) => p.id === projectId);
+  const triggerEntryAtStart = triggers.get(projectId) || null;
+  const triggerModeEpoch = triggerEntryAtStart?.modeEpoch || 0;
+  const autoLeaseCurrent = () => {
+    if (!triggerAutoEnabled(projectId)) return false;
+    if (!triggerEntryAtStart) return true;
+    const live = triggers.get(projectId);
+    return live === triggerEntryAtStart && (live.modeEpoch || 0) === triggerModeEpoch && live.autoFollow !== false;
+  };
 
   // #516: server-side auto-stop — check batch progress before sending.
   // When trigger_auto is enabled, skip the message and stop the trigger
@@ -1895,6 +1955,9 @@ async function sendTriggerMessage(projectId, automationBody = null) {
         fetch(`http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(projectId)}`),
         fetch(`http://127.0.0.1:${qwPort}/api/batch-active?project=${encodeURIComponent(projectId)}`),
       ]);
+      if (!autoLeaseCurrent()) {
+        return { ok: false, code: "trigger_auto_disabled", sent: false };
+      }
       if (!isAdmissionCurrent(admission)) {
         stopTrigger(projectId);
         return { ok: false, code: "project_archived", sent: false };
@@ -1905,6 +1968,9 @@ async function sendTriggerMessage(projectId, automationBody = null) {
       }
       const bp = await bpRes.json();
       const active = await activeRes.json();
+      if (!autoLeaseCurrent()) {
+        return { ok: false, code: "trigger_auto_disabled", sent: false };
+      }
       if (!isAdmissionCurrent(admission)) {
         stopTrigger(projectId);
         return { ok: false, code: "project_admission_changed", sent: false };
@@ -1954,6 +2020,9 @@ async function sendTriggerMessage(projectId, automationBody = null) {
       }
       autoBatchState = batchState;
     } catch (err) {
+      if (!autoLeaseCurrent()) {
+        return { ok: false, code: "trigger_auto_disabled", sent: false };
+      }
       // Fail closed: a trigger_auto timer is an automated worker-wake path.
       console.error(`[auto-trigger] ${projectId}: batch-progress check failed:`, err.message);
       stopTrigger(projectId);
@@ -2015,7 +2084,7 @@ async function sendTriggerMessage(projectId, automationBody = null) {
       body: JSON.stringify({
         text: message,
         channel: "general",
-        ...(chatAutomationBody ? { admission_generation: admission.generation, ...chatAutomationBody } : {}),
+        ...(chatAutomationBody ? { ...chatAutomationBody, admission_generation: admission.generation } : {}),
       }),
     });
     if (!res.ok) {
@@ -2272,7 +2341,7 @@ const projectLifecycle = createProjectLifecycleController({ cleanupProject: clea
 app.set("projectLifecycle", projectLifecycle);
 
 function validateTriggerAutomationRequest(projectId, body = {}) {
-  return routes.validateCurrentOwnedAssignment(projectId, body);
+  return routes.validateCurrentAutomationRequest(projectId, body);
 }
 
 // Store only the server-validated assignment discriminator in a scheduled
@@ -2285,7 +2354,11 @@ function validatedTriggerAutomationBody(validation) {
   if (validation.legacy === true || validation.assignment?.compatibility_mode === "v1") {
     const fingerprint = validation.context?.fingerprint;
     return typeof fingerprint === "string" && fingerprint
-      ? { compatibility_mode: "v1", batch_observation_fingerprint: fingerprint }
+      ? {
+        admission_generation: validation.admission?.generation,
+        compatibility_mode: "v1",
+        batch_observation_fingerprint: fingerprint,
+      }
       : undefined;
   }
   const assignment = validation.assignment;
@@ -2296,6 +2369,7 @@ function validatedTriggerAutomationBody(validation) {
       typeof assignment.assignment_key !== "string" || !assignment.assignment_key ||
       !Array.isArray(assignment.assignment_items)) return undefined;
   return {
+    admission_generation: validation.admission?.generation,
     compatibility_mode: "v2",
     installation_id: assignment.installation_id,
     batch_number: assignment.batch_number,
@@ -2373,7 +2447,10 @@ function startTriggerSchedule(req, res) {
   // whatever agents are currently mid-task. The explicit "send now"
   // path still lives at /api/triggers/:project/send-now for the
   // rare case an operator actually wants to kick things off.
-  const timer = setInterval(() => sendTriggerMessage(project, automationBody), ms);
+  const timer = setInterval(() => {
+    const current = triggers.get(project);
+    return sendTriggerMessage(project, current?.automationBody || null);
+  }, ms);
   const expiresAt = durationMs > 0 ? Date.now() + durationMs : null;
 
   const triggerInfo = {
@@ -2385,6 +2462,8 @@ function startTriggerSchedule(req, res) {
     expiresAt,
     durationTimer: null,
     automationBody,
+    autoFollow: triggerAutoEnabled(project),
+    modeEpoch: 0,
   };
 
   // Auto-stop after duration
@@ -2801,7 +2880,27 @@ function syncTriggersFromConfig() {
           const timer = setInterval(() => sendTriggerMessage(project.id), ms);
           // Config sync has no live assignment receipt. Preserve legacy/manual
           // scheduling without fabricating V2 ownership on reload.
-          triggers.set(project.id, { interval: ms, timer, lastSent: null, nextAt: Date.now() + ms, lastError: null, automationBody: null });
+          triggers.set(project.id, {
+            interval: ms,
+            timer,
+            lastSent: null,
+            nextAt: Date.now() + ms,
+            lastError: null,
+            automationBody: null,
+            autoFollow: project.trigger_auto === true,
+            modeEpoch: 0,
+          });
+        } else {
+          const nextAutoFollow = project.trigger_auto === true;
+          if (existing.autoFollow !== undefined && existing.autoFollow !== nextAutoFollow) {
+            existing.modeEpoch = (existing.modeEpoch || 0) + 1;
+          }
+          existing.autoFollow = nextAutoFollow;
+          if (nextAutoFollow) continue;
+          // Turning auto-follow off converts the existing cadence back to its
+          // explicit manual mode. The interval callback reads this live field,
+          // so a prior A→B receipt cannot later stop the manual schedule.
+          existing.automationBody = null;
         }
       }
     }
@@ -3176,6 +3275,9 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
     owned: progress?.owned === true,
     multi_repository: progress?.multi_repository === true,
     compatibility_mode: progress?.compatibility_mode === "v1" ? "v1" : "v2",
+    ...(Number.isSafeInteger(progress?.admission_generation) && progress.admission_generation >= 0
+      ? { admission_generation: progress.admission_generation }
+      : {}),
     ...(progress?.compatibility_mode === "v1" && typeof progress?.batch_observation_fingerprint === "string"
       ? { batch_observation_fingerprint: progress.batch_observation_fingerprint }
       : {}),
@@ -3428,6 +3530,9 @@ module.exports = {
   validatedTriggerAutomationBody,
   startTriggerSchedule,
   validateCaffeinateAutomationRequest,
+  caffeinateRequestAuthority,
+  startCaffeinate,
+  stopCaffeinate,
   registerCaffeinateOwner,
   caffeinateStatus,
   releaseProjectCaffeinate,

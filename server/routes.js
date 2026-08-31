@@ -732,8 +732,33 @@ function projectLifecycleController(req, res, projectId) {
   return null;
 }
 
+const AUTOMATION_IDENTITY_FIELDS = Object.freeze([
+  "assignment_key",
+  "assignment_items",
+  "installation_id",
+  "batch_number",
+  "assignment_attempt",
+  "provenance",
+  "compatibility_mode",
+  "batch_observation_fingerprint",
+]);
+
+function carriesAutomationIdentity(body) {
+  return Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
+    AUTOMATION_IDENTITY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+}
+
 function requestedBridgeAdmission(body, projectId, res) {
-  if (!Object.prototype.hasOwnProperty.call(body, "admission_generation")) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(body, "admission_generation")) {
+    if (!carriesAutomationIdentity(body)) return undefined;
+    res.status(409).json({
+      ok: false,
+      error: "project admission changed; refresh and retry",
+      code: "project_admission_changed",
+      project_id: projectId,
+    });
+    return null;
+  }
   const generation = body.admission_generation;
   if (!Number.isSafeInteger(generation) || generation < 0) {
     res.status(400).json({
@@ -758,9 +783,7 @@ function requestedBridgeAdmission(body, projectId, res) {
 }
 
 function requestedBridgeAssignment(body, projectId, res) {
-  const identityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance", "compatibility_mode", "batch_observation_fingerprint"];
-  const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
-    identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  const automated = carriesAutomationIdentity(body);
   // Only a body carrying no automation identity at all is a manual V1/operator
   // action. Partial assignment identity fails closed below.
   if (!automated) return undefined;
@@ -3471,6 +3494,36 @@ const _batchProgressCache = new Map(); // projectId -> { ts, data }
 const _batchProgressRefreshes = new Map(); // projectId -> { admission, promise }
 const BATCH_TERMINAL_STATUSES = new Set(["merged", "closed"]);
 
+function bindBatchAdmission(data, admission) {
+  if (!data || !Number.isSafeInteger(admission?.generation) || admission.generation < 0) return data;
+  return { ...data, admission_generation: admission.generation };
+}
+
+function cacheBatchProgress(projectId, context, admission, data) {
+  const bound = bindBatchAdmission(data, admission);
+  _batchProgressCache.set(projectId, {
+    ts: Date.now(),
+    fingerprint: context.fingerprint,
+    admission_generation: admission.generation,
+    data: bound,
+  });
+  return bound;
+}
+
+function staleBatchObservationPayload(projectId, admission) {
+  const latest = readLiveBatchContext(projectId);
+  return bindBatchAdmission({
+    ...assignmentView(latest, { current: false }),
+    items: [],
+    summary: "",
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: false,
+    batch_type: latest?.batchType || "code",
+    _stale_observation: true,
+  }, admission);
+}
+
 // #429 / quadwork#316: persistent batch snapshot on disk so the
 // Batch Progress panel keeps showing merged items after Head moves
 // them from Active Batch to Done. The in-memory `_batchProgressCache`
@@ -4456,6 +4509,9 @@ router.get("/api/batch-active", async (req, res) => {
     owned: data?.owned === true,
     multi_repository: data?.multi_repository === true,
     compatibility_mode: data?.compatibility_mode === "v1" ? "v1" : "v2",
+    ...(Number.isSafeInteger(data?.admission_generation) && data.admission_generation >= 0
+      ? { admission_generation: data.admission_generation }
+      : {}),
     ...(typeof data?.batch_observation_fingerprint === "string"
       ? { batch_observation_fingerprint: data.batch_observation_fingerprint }
       : {}),
@@ -4530,6 +4586,16 @@ function readLiveBatchContext(projectId) {
     installationId,
     kind: batchType === "pr-review" ? "pr" : "issue",
   });
+  const reviewObservation = REVIEW_BATCH_TYPES.has(batchType)
+    ? parseReviewItems(queueText, {
+      repositories,
+      kind: batchType === "pr-review" ? "pr" : "issue",
+    }).map((item) => [
+      workItemKey(item.ref),
+      item.review_state,
+      item.approvals,
+    ]).sort((a, b) => a[0].localeCompare(b[0]))
+    : [];
   const fingerprint = JSON.stringify([
     "queue-assignment-observation", 1,
     installationId,
@@ -4540,6 +4606,7 @@ function readLiveBatchContext(projectId) {
     parsed.batchNumber,
     parsed.assignmentAttempt,
     parsed.workItems.map((item) => item.key).sort(),
+    reviewObservation,
     parsed.errors.map((entry) => [entry.code, entry.line_number || entry.line || null]),
   ]);
   return { cfg, project, repositories, queueText, queueReadOk, activated: !!installationId, installationId, batchType, parsed, fingerprint };
@@ -4653,6 +4720,24 @@ function validateCurrentOwnedAssignment(projectId, body = {}) {
   return { ok: true, manual: false, context, assignment };
 }
 
+function validateCurrentAutomationRequest(projectId, body = {}) {
+  const assignment = validateCurrentOwnedAssignment(projectId, body);
+  if (!assignment.ok || assignment.manual === true) return assignment;
+  const generation = body.admission_generation;
+  const admission = projectAdmission(projectId);
+  if (!Number.isSafeInteger(generation) || generation < 0 || !admission ||
+      admission.generation !== generation || !isAdmissionCurrent(admission)) {
+    return {
+      ok: false,
+      status: 409,
+      code: "project_admission_changed",
+      error: "project admission changed; refresh and retry",
+      project_id: projectId,
+    };
+  }
+  return { ...assignment, admission };
+}
+
 function isExactAssignmentCurrent(projectId, fingerprint, admission = null) {
   if (admission && !isAdmissionCurrent(admission)) return false;
   const current = readLiveBatchContext(projectId);
@@ -4695,18 +4780,26 @@ async function getOrComputeBatchProgress(projectId) {
     return { ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context?.batchType || "code", _archived: true, _readonly: true };
   }
   if (!context || context.repositories.length === 0) return null;
+  const observedAdmission = projectAdmission(projectId);
+  if (!observedAdmission) {
+    return { ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context.batchType, _archived: true, _readonly: true };
+  }
   const cached = _batchProgressCache.get(projectId);
-  const matchingCached = cached && (!context.activated || cached.fingerprint === context.fingerprint) ? cached : null;
+  const matchingCached = cached &&
+    cached.fingerprint === context.fingerprint &&
+    cached.admission_generation === observedAdmission.generation
+    ? cached
+    : null;
   // #812: parked (idle) project — never run batch-progress gh/GraphQL calls,
   // and ALWAYS flag the payload _idle (even on a fresh cache hit), so the
   // endpoint contract is consistent regardless of cache freshness. This must
   // precede the fresh-cache and rate-limit returns below.
   if (isProjectIdle(projectId)) {
     if (matchingCached) return { ...matchingCached.data, _idle: true };
-    return { ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context.batchType, _idle: true };
+    return bindBatchAdmission({ ...assignmentView(context, { current: false }), items: [], summary: "", complete: false, completeConfirmed: false, batch_type: context.batchType, _idle: true }, observedAdmission);
   }
   if (context.activated && (context.parsed.errors.length > 0 || context.parsed.provenance !== "owned" || !context.parsed.assignmentKey)) {
-    return diagnosticBatchPayload(context);
+    return bindBatchAdmission(diagnosticBatchPayload(context), observedAdmission);
   }
   const batchTTL = adaptiveTTL(BATCH_PROGRESS_TTL_MS);
   if (matchingCached && Date.now() - matchingCached.ts < batchTTL) {
@@ -4789,8 +4882,7 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
   const liveActiveBatchCleared = refs.length === 0;
   if (refs.length === 0) {
     const data = { ...assignment, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type: context.batchType };
-    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
-    return data;
+    return cacheBatchProgress(projectId, context, admission, data);
   }
 
   if (REVIEW_BATCH_TYPES.has(context.batchType)) {
@@ -4834,8 +4926,7 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
       reviewItems,
       terminalItems: {},
     });
-    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
-    return data;
+    return cacheBatchProgress(projectId, context, admission, data);
   }
 
   const diskSnapshot = readBatchSnapshot(projectId);
@@ -4892,8 +4983,7 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
     reviewItems: [],
     terminalItems: ownedTerminalSnapshot(items, terminalRows),
   });
-  _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
-  return data;
+  return cacheBatchProgress(projectId, context, admission, data);
 }
 
 async function computeBatchProgress(projectId, contextOrRepo, admission = projectAdmission(projectId, { demand: true })) {
@@ -4908,22 +4998,17 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
     if (context.parsed.errors.length > 0 || context.parsed.provenance !== "owned" || !context.parsed.assignmentKey) return diagnosticBatchPayload(context);
     return computeOwnedBatchProgress(projectId, context, admission);
   }
+  const stillCurrent = () => isExactAssignmentCurrent(projectId, context.fingerprint, admission);
   const legacyAssignment = assignmentView(context, { current: context.queueReadOk && context.parsed.workItems.length > 0 });
   const repo = typeof contextOrRepo === "string"
     ? contextOrRepo
     : (context.repositories.find((entry) => entry.primary) || context.repositories[0])?.repo;
   if (!repo) return null;
-  const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
-  let queueText = "";
-  let queueReadOk = false;
-  try {
-    queueText = fs.readFileSync(queuePath, "utf-8");
-    queueReadOk = true;
-  } catch {
-    // Missing / unreadable file — pass queueReadOk=false so the
-    // resolver bypasses the snapshot and returns the empty state
-    // per #316's edge case.
-  }
+  // Bind the whole V1 computation to the exact queue observation captured by
+  // readLiveBatchContext. Re-reading here could combine A's fingerprint with
+  // B's rows and publish the hybrid under A's cache key.
+  const queueText = context.queueText;
+  const queueReadOk = context.queueReadOk;
 
   // #334 / quadwork#334: validate the on-disk snapshot against
   // GitHub before resolveDisplayedBatch can serve it. A snapshot
@@ -4958,9 +5043,7 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
     const existing = readBatchSnapshot(projectId);
     if (existing && Array.isArray(existing.issueNumbers) && existing.issueNumbers.length > 0) {
       const freshness = await checkBatchSnapshotFreshness(repo, existing);
-      if (!isAdmissionCurrent(admission)) {
-        return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
-      }
+      if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
       if (freshness === "gone") deleteBatchSnapshot(projectId);
       // "unknown" → leave the file alone; transient failure will
       // retry on the next cache miss.
@@ -4984,10 +5067,10 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
   const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
   const terminalRows = terminalItemsFromSnapshot(readBatchSnapshot(projectId), batchNumber, issueNumbers);
   if (issueNumbers.length === 0) {
+    if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
     evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
     const data = { ...legacyAssignment, batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type };
-    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
-    return data;
+    return cacheBatchProgress(projectId, context, admission, data);
   }
 
   // #870: review batch — progress computed ENTIRELY from the current Active
@@ -5009,9 +5092,9 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
     });
     const summary = summarizeReviewItems(ri);
     const complete = ri.length > 0 && ri.every((r) => r.review_state === "approved");
+    if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
     const data = { ...legacyAssignment, batch_number: batchNumber, items, summary, complete, completeConfirmed: complete, liveActiveBatchCleared, batch_type };
-    _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
-    return data;
+    return cacheBatchProgress(projectId, context, admission, data);
   }
 
   // #810: compute each item from the #806 REST snapshot (no GraphQL in steady
@@ -5030,13 +5113,13 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
   let items;
   if (snapshot) {
     items = await _mapLimited(issueNumbers, GH_MAX_CONCURRENT, async (n) => {
-      if (!isAdmissionCurrent(admission)) return softRetryingRow(n);
+      if (!stillCurrent()) return softRetryingRow(n);
       const fromSnap = progressFromSnapshot(snapshot, n);
       if (fromSnap) return fromSnap;
       const fromTerminalCache = terminalRows.get(n);
       if (fromTerminalCache && !snapshotHasOpenIssue(snapshot, n)) return fromTerminalCache;
       try {
-        return await progressForItemRest(repo, n, () => isAdmissionCurrent(admission));
+        return await progressForItemRest(repo, n, stillCurrent);
       } catch {
         return softRetryingRow(n); // #943: transient (secondary rate-limit/network) → soft
       }
@@ -5048,9 +5131,7 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
     const parsed = loadGithubParsed(projectId);
     items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || terminalRows.get(n) || softRetryingRow(n));
   }
-  if (!isAdmissionCurrent(admission)) {
-    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
-  }
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
   const legacyRefByNumber = new Map(context.parsed.workItems.map((item) => [item.number, item.ref || item]));
   items = items.map((row) => {
     const ref = legacyRefByNumber.get(row.issue_number);
@@ -5066,6 +5147,7 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
   const data = { ...legacyAssignment, batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
   writeBatchSnapshot(projectId, {
     batchNumber,
     issueNumbers: issueNumbers.slice(),
@@ -5073,8 +5155,8 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
     reviewItems,
     terminalItems: collectTerminalItems(items, terminalRows),
   });
-  _batchProgressCache.set(projectId, { ts: Date.now(), fingerprint: context.fingerprint, data });
-  return data;
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+  return cacheBatchProgress(projectId, context, admission, data);
 }
 
 router.get("/api/batch-progress", async (req, res) => {
@@ -6836,6 +6918,7 @@ module.exports.RESEED_STATE_PATH = RESEED_STATE_PATH;
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
 module.exports.readLiveBatchContext = readLiveBatchContext;
 module.exports.validateCurrentOwnedAssignment = validateCurrentOwnedAssignment;
+module.exports.validateCurrentAutomationRequest = validateCurrentAutomationRequest;
 module.exports.canonicalWorkItemKey = canonicalWorkItemKey;
 module.exports._batchProgressCache = _batchProgressCache;
 module.exports._batchProgressRefreshes = _batchProgressRefreshes;
