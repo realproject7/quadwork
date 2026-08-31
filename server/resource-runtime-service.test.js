@@ -241,6 +241,7 @@ function createHarness({
     admitted_worker_scopes: 0,
     reserved_worker_scopes: 3,
     requested_worker_scopes: 0,
+    live_swap_headroom_mib: 7000,
   });
   assert.deepEqual(snapshot.worker_scopes, []);
   assert.equal(snapshot.effective_limits.worker.observed_scopes, 0);

@@ -322,6 +322,10 @@ function mibRecord(value, fields) {
   return output;
 }
 
+function signedSafeInteger(value) {
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 function normalizePreflight(report, policy) {
   const ok = safeGet(report, "ok");
   const reason = safeGet(report, "reason");
@@ -352,7 +356,8 @@ function normalizePreflight(report, policy) {
     ["staticCeiling", "staticCeiling"],
     ["requested", "requested"],
   ]);
-  const capacity = mibRecord(safeGet(report, "capacity"), [
+  const capacityRaw = safeGet(report, "capacity");
+  const capacityBase = mibRecord(capacityRaw, [
     ["staticReservationMib", "staticReservation"],
     ["staticHeadroomMib", "staticHeadroom"],
     ["configuredSwapMib", "configuredSwap"],
@@ -362,13 +367,36 @@ function normalizePreflight(report, policy) {
     ["requestedSwapMib", "requestedSwap"],
     ["liveRequiredMib", "liveRequired"],
     ["liveHeadroomMib", "liveHeadroom"],
-    ["liveSwapHeadroomMib", "liveSwapHeadroom"],
   ]);
+  const liveSwapHeadroom = signedSafeInteger(safeGet(capacityRaw, "liveSwapHeadroomMib"));
+  const capacity = capacityBase !== null && liveSwapHeadroom !== null
+    ? { ...capacityBase, liveSwapHeadroom }
+    : null;
   const containment = safeGet(report, "containment");
   const api = safeGet(report, "api");
   const expectedStatic = calculateStaticReservationMib(policy);
   const expectedSwap = calculateConfiguredSwapMib(policy);
   const readyReasons = safeArray(safeGet(report, "reasons"));
+  const capacityKeysValid = hasOnlyKeys(capacityRaw, new Set([
+    "staticReservationMib", "staticHeadroomMib", "configuredSwapMib", "swapHeadroomMib",
+    "requestedWorkerScopes", "requestedMemoryMib", "requestedSwapMib", "liveRequiredMib", "liveHeadroomMib",
+    "liveSwapHeadroomMib",
+  ]));
+  const capacityConsistent = capacity !== null
+    && capacityKeysValid
+    && host !== null
+    && scopes !== null
+    && capacity.staticReservation === expectedStatic
+    && capacity.staticHeadroom === host.total - expectedStatic
+    && capacity.configuredSwap === expectedSwap
+    && capacity.swapHeadroom === host.swapTotal - expectedSwap
+    && capacity.requestedWorkerScopes === scopes.requested
+    && capacity.requestedMemory === scopes.requested * policy.worker.memory_max_mib
+    && capacity.requestedSwap === scopes.requested * policy.worker.swap_max_mib
+    && capacity.liveRequired === policy.host_reserve_mib + capacity.requestedMemory
+    && capacity.liveHeadroom === host.available - capacity.liveRequired
+    && capacity.liveSwapHeadroom === host.swapFree - capacity.requestedSwap;
+  const normalizedCapacity = capacityConsistent ? capacity : null;
 
   const validForReady = ok === true
     && reason === "ok"
@@ -384,11 +412,7 @@ function normalizePreflight(report, policy) {
     && hasOnlyKeys(tempRaw, new Set(["exists", "directory", "symlink", "owned", "secureMode", "diskBacked", "freeMib", "totalMib"]))
     && hasOnlyKeys(api, new Set(["memoryLowMib", "memoryMaxMib", "oomPolicy", "separateFromWorkers"]))
     && hasOnlyKeys(scopesRaw, new Set(["admitted", "staticCeiling", "requested"]))
-    && hasOnlyKeys(safeGet(report, "capacity"), new Set([
-      "staticReservationMib", "staticHeadroomMib", "configuredSwapMib", "swapHeadroomMib",
-      "requestedWorkerScopes", "requestedMemoryMib", "requestedSwapMib", "liveRequiredMib", "liveHeadroomMib",
-      "liveSwapHeadroomMib",
-    ]))
+    && capacityKeysValid
     && readyReasons !== null && readyReasons.length === 0
     && policyReportMatches(safeGet(report, "policy"), policy)
     && host !== null
@@ -397,17 +421,7 @@ function normalizePreflight(report, policy) {
     && scopes.staticCeiling === policy.max_worker_scopes
     && scopes.admitted <= scopes.staticCeiling
     && scopes.requested <= scopes.staticCeiling
-    && capacity !== null
-    && capacity.staticReservation === expectedStatic
-    && capacity.staticHeadroom === host.total - expectedStatic
-    && capacity.configuredSwap === expectedSwap
-    && capacity.swapHeadroom === host.swapTotal - expectedSwap
-    && capacity.requestedWorkerScopes === scopes.requested
-    && capacity.requestedMemory === scopes.requested * policy.worker.memory_max_mib
-    && capacity.requestedSwap === scopes.requested * policy.worker.swap_max_mib
-    && capacity.liveRequired === policy.host_reserve_mib + capacity.requestedMemory
-    && capacity.liveHeadroom === host.available - capacity.liveRequired
-    && capacity.liveSwapHeadroom === host.swapFree - capacity.requestedSwap
+    && capacityConsistent
     && safeGet(containment, "cgroupV2") === true
     && safeGet(containment, "userManager") === true
     && safeGet(containment, "systemdRun") === true
@@ -418,7 +432,7 @@ function normalizePreflight(report, policy) {
     && safeGet(api, "separateFromWorkers") === true;
 
   const failure = ok === false && PREFLIGHT_FAILURES.has(reason) ? reason : null;
-  return { ok, reason, failure, host, temp, scopes, capacity, validForReady };
+  return { ok, reason, failure, host, temp, scopes, capacity: normalizedCapacity, validForReady };
 }
 
 function normalizeController(snapshot, policy) {
@@ -742,10 +756,11 @@ function buildResourceRuntimeSnapshot({
   const workerScopes = workers === null
     ? null
     : Object.freeze(workers.map(frozenWorkerScopeOutput));
-  const scopeCapacity = preflight && preflight.scopes ? Object.freeze({
+  const scopeCapacity = preflight && preflight.scopes && preflight.capacity ? Object.freeze({
     admitted_worker_scopes: preflight.scopes.admitted,
     reserved_worker_scopes: policy.max_worker_scopes,
     requested_worker_scopes: preflight.scopes.requested,
+    live_swap_headroom_mib: preflight.capacity.liveSwapHeadroom,
   }) : null;
 
   return Object.freeze({

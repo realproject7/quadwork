@@ -316,11 +316,24 @@ function validResourceUsage(value) {
 
 function validScopeCapacity(value) {
   if (value === null) return true;
-  const fields = new Set([
+  const countFields = new Set([
     "admitted_worker_scopes", "reserved_worker_scopes", "requested_worker_scopes",
   ]);
-  return exactKeys(value, fields)
-    && [...fields].every((field) => Number.isSafeInteger(value[field]) && value[field] >= 0);
+  return exactKeys(value, new Set([...countFields, "live_swap_headroom_mib"]))
+    && [...countFields].every((field) => Number.isSafeInteger(value[field]) && value[field] >= 0)
+    && Number.isSafeInteger(value.live_swap_headroom_mib);
+}
+
+function scopeCapacityConsistent(snapshot) {
+  const capacity = snapshot.scope_capacity;
+  if (capacity === null) return true;
+  const swapFree = snapshot.usage && snapshot.usage.swap_free_mib;
+  const workerSwapMax = snapshot.limits && snapshot.limits.worker_swap_max_mib;
+  if (!Number.isSafeInteger(swapFree) || swapFree < 0
+    || !Number.isSafeInteger(workerSwapMax) || workerSwapMax < 0) return false;
+  const requestedSwap = capacity.requested_worker_scopes * workerSwapMax;
+  return Number.isSafeInteger(requestedSwap)
+    && capacity.live_swap_headroom_mib === swapFree - requestedSwap;
 }
 
 function validWorkerScopes(value) {
@@ -366,6 +379,7 @@ function validRuntimeSnapshot(snapshot) {
     || !validEffectiveLimits(snapshot.effective_limits)
     || !validResourceUsage(snapshot.resource_usage)
     || !validScopeCapacity(snapshot.scope_capacity)
+    || !scopeCapacityConsistent(snapshot)
     || !validWorkerScopes(snapshot.worker_scopes)) return false;
   if (snapshot.worker_scopes !== null && snapshot.effective_limits !== null
     && snapshot.worker_scopes.length !== snapshot.effective_limits.worker.observed_scopes) return false;

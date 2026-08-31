@@ -239,6 +239,7 @@ function fixture(overrides = {}) {
     admitted_worker_scopes: 1,
     reserved_worker_scopes: 3,
     requested_worker_scopes: 1,
+    live_swap_headroom_mib: 6488,
   });
   assert.equal(snapshot.resource_usage.worker.memory_current_bytes, (MIB_BYTES + 1n).toString(10));
   assert.equal(snapshot.resource_usage.worker.memory_peak_bytes, undefined);
@@ -288,6 +289,36 @@ function fixture(overrides = {}) {
     reason: "staging_proof_pending",
   });
   assert.notEqual(snapshot.status, "ready", "read-only staging evidence never flips the controller candidate");
+}
+
+{
+  const input = fixture();
+  input.preflightReport = runResourcePreflight({
+    runtimeResources: input.runtimeResources,
+    probes: probes({
+      memory: () => ({ totalMib: 8192, availableMib: 4000, swapTotalMib: 8192, swapFreeMib: 511 }),
+    }),
+  });
+  const snapshot = buildResourceRuntimeSnapshot(input);
+  assert.equal(snapshot.status, "capacity_exhausted");
+  assert.equal(snapshot.scope_capacity.live_swap_headroom_mib, -1);
+}
+
+for (const mutate of [
+  (capacity) => { delete capacity.liveSwapHeadroomMib; },
+  (capacity) => { capacity.liveSwapHeadroomMib += 1; },
+  (capacity) => { capacity.private_field = 1; },
+]) {
+  const input = fixture();
+  input.preflightReport = {
+    ...input.preflightReport,
+    capacity: { ...input.preflightReport.capacity },
+  };
+  mutate(input.preflightReport.capacity);
+  const snapshot = buildResourceRuntimeSnapshot(input);
+  assert.equal(snapshot.status, "containment_unavailable");
+  assert.equal(snapshot.pressure.reason, "runtime_observation_inconsistent");
+  assert.equal(snapshot.scope_capacity, null);
 }
 
 // Raw preflight/controller claims and capability lookalikes cannot mint

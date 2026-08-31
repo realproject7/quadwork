@@ -112,6 +112,7 @@ function candidateSnapshot() {
       admitted_worker_scopes: 1,
       reserved_worker_scopes: 3,
       requested_worker_scopes: 0,
+      live_swap_headroom_mib: 7000,
     },
     worker_scopes: [{
       project_id: projectId,
@@ -287,8 +288,35 @@ function assertUnavailable(response, expectedStatus = 503, expectedCode = "QW_RE
   const missing = candidateSnapshot();
   delete missing.resource_usage;
   attacks.push(missing);
+  const missingSwapHeadroom = candidateSnapshot();
+  delete missingSwapHeadroom.scope_capacity.live_swap_headroom_mib;
+  attacks.push(missingSwapHeadroom);
+  const unknownSwapHeadroom = candidateSnapshot();
+  unknownSwapHeadroom.scope_capacity.private_field = 1;
+  attacks.push(unknownSwapHeadroom);
+  const inconsistentSwapHeadroom = candidateSnapshot();
+  inconsistentSwapHeadroom.scope_capacity.live_swap_headroom_mib = 6999;
+  attacks.push(inconsistentSwapHeadroom);
   for (const attack of attacks) assert.equal(captureResourceHttpSnapshot(attack), null);
   assert.equal(accessorCalls, 0);
+}
+
+for (const [swapFree, requested, expectedHeadroom] of [
+  [7000, 0, 7000],
+  [0, 0, 0],
+  [1023, 1, -1],
+]) {
+  const source = candidateSnapshot();
+  const candidate = {
+    ...source,
+    usage: { ...source.usage, swap_free_mib: swapFree },
+    scope_capacity: {
+      ...source.scope_capacity,
+      requested_worker_scopes: requested,
+      live_swap_headroom_mib: expectedHeadroom,
+    },
+  };
+  assert.equal(captureResourceHttpSnapshot(candidate)?.scope_capacity.live_swap_headroom_mib, expectedHeadroom);
 }
 
 // A genuine missing-policy owner publishes one canonical synchronous snapshot.
