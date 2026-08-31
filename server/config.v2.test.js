@@ -77,6 +77,31 @@ function diskBytes() {
   return fs.readFileSync(CONFIG_PATH, "utf8");
 }
 
+// Existing archived projects cannot be activated through either public config
+// boundary unless lifecycle cleanup first owns the exact reservation token.
+{
+  const pathForTokenGate = repoDir("reservation-token-gate");
+  writeConfig(activated([
+    project("token-gate", [repository("primary", "Acme/TokenGate", pathForTokenGate)], { archived: true }),
+  ]));
+  const before = diskBytes();
+  expectCode(
+    () => commitV2Configuration((cfg) => { cfg.projects[0].archived = false; }),
+    "project_ownership_reserved",
+    "public V2 commit cannot unarchive without a cleanup reservation token",
+  );
+  assert.equal(diskBytes(), before);
+
+  const staleWholeDocument = readConfig();
+  staleWholeDocument.projects[0].archived = false;
+  expectCode(
+    () => writeConfig(staleWholeDocument),
+    "project_ownership_reserved",
+    "low-level write cannot unarchive without a cleanup reservation token",
+  );
+  assert.equal(diskBytes(), before);
+}
+
 // An in-flight unarchive reservation participates in the same authority as
 // every generic V2 commit. A competing activation or identity rewrite fails
 // before it can publish, while the opaque reservation can publish only its own

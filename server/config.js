@@ -570,21 +570,42 @@ function candidateWithReservedOwnership(candidate) {
 }
 
 function assertV2OwnershipReservationCommit(candidate, options = {}) {
-  if (v2OwnershipReservations.size === 0) return;
   const authorizedReservation = options.ownershipReservation;
-  for (const reservation of v2OwnershipReservations.values()) {
-    const project = assertReservationIdentity(candidate, reservation);
-    if (project.archived !== true && authorizedReservation !== reservation) {
+  if (v2OwnershipReservations.size > 0) {
+    for (const reservation of v2OwnershipReservations.values()) {
+      const project = assertReservationIdentity(candidate, reservation);
+      if (project.archived !== true && authorizedReservation !== reservation) {
+        throw reservationError(
+          reservation.project_id,
+          "reserved project cannot be activated before cleanup completes",
+        );
+      }
+    }
+    // Project every in-flight reservation as active while validating other
+    // mutations. This makes a colliding activation fail before its own token
+    // check and, critically, before any config bytes are written.
+    validateV2Configuration(candidateWithReservedOwnership(candidate), {
+      previousConfig: options.previousConfig || candidate,
+      fsImpl: options.fsImpl || fs,
+    });
+  }
+
+  // An existing archived project may become active only through the exact
+  // reservation that proved collision safety before cleanup. New projects are
+  // intentionally outside this transition rule, and removal remains legal
+  // after archive cleanup because there is no active candidate to publish.
+  for (const previous of options.previousConfig?.projects || []) {
+    if (!previous || previous.archived !== true || typeof previous.id !== "string") continue;
+    const next = reservationProject(candidate, previous.id);
+    if (!next || next.archived === true) continue;
+    const reservation = v2OwnershipReservations.get(previous.id);
+    if (!reservation || authorizedReservation !== reservation) {
       throw reservationError(
-        reservation.project_id,
-        "reserved project cannot be activated before cleanup completes",
+        previous.id,
+        "archived project activation requires its cleanup reservation",
       );
     }
   }
-  validateV2Configuration(candidateWithReservedOwnership(candidate), {
-    previousConfig: options.previousConfig || candidate,
-    fsImpl: options.fsImpl || fs,
-  });
 }
 
 /**
@@ -836,7 +857,11 @@ function writeConfig(cfg, options = {}) {
   // Legacy field-scoped writers still converge here. While an unarchive owns
   // a reservation, make this low-level atomic boundary enforce the same
   // authority so a stale whole-document write cannot bypass V2 commits.
-  assertV2OwnershipReservationCommit(cfg, options);
+  let previousConfig = options.previousConfig;
+  if (!previousConfig && typeof cfg?.installation_id === "string") {
+    try { previousConfig = readConfigDocument().config; } catch { previousConfig = null; }
+  }
+  assertV2OwnershipReservationCommit(cfg, { ...options, previousConfig });
   const data = JSON.stringify(cfg, null, 2);
   const tmpPath = `${CONFIG_PATH}.${process.pid}.tmp`;
   writeSecureFile(tmpPath, data); // 0o600
@@ -902,13 +927,13 @@ function commitV2Configuration(mutator = () => {}, options = {}) {
     const candidate = hadInstallationId
       ? cloneConfigurationValue(cfg)
       : migrateConfigurationToV2(cfg);
+    validateV2Configuration(candidate, {
+      previousConfig,
+      fsImpl: options.fsImpl || fs,
+    });
     assertV2OwnershipReservationCommit(candidate, {
       previousConfig,
       ownershipReservation: options.ownershipReservation,
-      fsImpl: options.fsImpl || fs,
-    });
-    validateV2Configuration(candidate, {
-      previousConfig,
       fsImpl: options.fsImpl || fs,
     });
     for (const key of Object.keys(cfg)) delete cfg[key];
