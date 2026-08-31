@@ -105,6 +105,10 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
     shipped.has("src/lib/injectMode.js"),
     'src/lib/injectMode.js is require()d by runtime code and must stay in the tarball (#937)',
   );
+  assert.ok(
+    shipped.has("src/lib/batchIdentity.js"),
+    "Operator MCP batch actions require the shared assignment-identity helper in installed packages (#1031)",
+  );
 
   // 5) fs-loaded / dynamically-required assets the literal-require scan can't
   //    see (#976). These are read at runtime by path (seed reseeding reads the
