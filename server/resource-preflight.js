@@ -348,6 +348,7 @@ function runResourcePreflight({ runtimeResources, probes, requestedWorkerScopes 
         }
         if (liveRequiredMib !== null && requestedAndAdmittedScopes !== null) {
           const liveHeadroomMib = memory.availableMib - liveRequiredMib;
+          const liveSwapHeadroomMib = memory.swapFreeMib - requestedSwapMib;
           capacity = {
             staticReservationMib: configured.staticReservationMib,
             staticHeadroomMib: configured.staticHeadroomMib,
@@ -358,9 +359,10 @@ function runResourcePreflight({ runtimeResources, probes, requestedWorkerScopes 
             requestedSwapMib,
             liveRequiredMib,
             liveHeadroomMib,
+            liveSwapHeadroomMib,
           };
           if (liveHeadroomMib < 0) addReason(reasons, "capacity_exhausted", "live_memory_headroom_low");
-          if (memory.swapFreeMib < requestedSwapMib) {
+          if (liveSwapHeadroomMib < 0) {
             addReason(reasons, "capacity_exhausted", "live_swap_headroom_low");
           }
           if (requestedAndAdmittedScopes > policy.max_worker_scopes) {

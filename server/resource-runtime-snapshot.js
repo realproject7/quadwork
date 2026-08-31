@@ -362,6 +362,7 @@ function normalizePreflight(report, policy) {
     ["requestedSwapMib", "requestedSwap"],
     ["liveRequiredMib", "liveRequired"],
     ["liveHeadroomMib", "liveHeadroom"],
+    ["liveSwapHeadroomMib", "liveSwapHeadroom"],
   ]);
   const containment = safeGet(report, "containment");
   const api = safeGet(report, "api");
@@ -386,6 +387,7 @@ function normalizePreflight(report, policy) {
     && hasOnlyKeys(safeGet(report, "capacity"), new Set([
       "staticReservationMib", "staticHeadroomMib", "configuredSwapMib", "swapHeadroomMib",
       "requestedWorkerScopes", "requestedMemoryMib", "requestedSwapMib", "liveRequiredMib", "liveHeadroomMib",
+      "liveSwapHeadroomMib",
     ]))
     && readyReasons !== null && readyReasons.length === 0
     && policyReportMatches(safeGet(report, "policy"), policy)
@@ -405,6 +407,7 @@ function normalizePreflight(report, policy) {
     && capacity.requestedSwap === scopes.requested * policy.worker.swap_max_mib
     && capacity.liveRequired === policy.host_reserve_mib + capacity.requestedMemory
     && capacity.liveHeadroom === host.available - capacity.liveRequired
+    && capacity.liveSwapHeadroom === host.swapFree - capacity.requestedSwap
     && safeGet(containment, "cgroupV2") === true
     && safeGet(containment, "userManager") === true
     && safeGet(containment, "systemdRun") === true

@@ -1256,6 +1256,7 @@ function renderResourcePreflight(report) {
     `Requested worker swap: ${mib(capacity.requestedSwapMib)}`,
     `Live RAM reserve plus request: ${mib(capacity.liveRequiredMib)}`,
     `Live RAM headroom: ${signedMib(capacity.liveHeadroomMib)}`,
+    `Live swap headroom: ${signedMib(capacity.liveSwapHeadroomMib)}`,
   ];
   if (Array.isArray(report.reasons) && report.reasons.length > 0) {
     lines.push("Checks:");

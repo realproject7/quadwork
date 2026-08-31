@@ -71,6 +71,7 @@ assert.equal(ok.capacity.configuredSwapMib, 1792);
 assert.equal(ok.capacity.requestedMemoryMib, 1200);
 assert.equal(ok.capacity.liveRequiredMib, 2736);
 assert.equal(ok.capacity.liveHeadroomMib, 1264);
+assert.equal(ok.capacity.liveSwapHeadroomMib, 6488);
 assert.deepEqual(ok.scopes, { admitted: 1, staticCeiling: 3, requested: 1 });
 assert(!JSON.stringify(ok).includes(DEFAULT_RUNTIME_RESOURCE_PROPOSAL.temp_root), "report must redact configured host paths");
 
@@ -129,6 +130,7 @@ const lowFreeSwap = runResourcePreflight({
 });
 assert.equal(lowFreeSwap.reason, "capacity_exhausted");
 assert.equal(lowFreeSwap.capacity.requestedSwapMib, 512);
+assert.equal(lowFreeSwap.capacity.liveSwapHeadroomMib, -1);
 assert(lowFreeSwap.reasons.some((item) => item.code === "capacity_exhausted" && item.check === "live_swap_headroom_low"));
 
 const exactFreeSwapBoundary = runResourcePreflight({
@@ -138,6 +140,19 @@ const exactFreeSwapBoundary = runResourcePreflight({
   }),
 });
 assert.equal(exactFreeSwapBoundary.reasons.some((item) => item.check === "live_swap_headroom_low"), false);
+assert.equal(exactFreeSwapBoundary.capacity.liveSwapHeadroomMib, 0);
+
+const zeroRequestedSwap = runResourcePreflight({
+  runtimeResources: policy(),
+  requestedWorkerScopes: 0,
+  probes: healthyProbes({
+    memory: () => ({ totalMib: 8192, availableMib: 4000, swapTotalMib: 8192, swapFreeMib: 0 }),
+    activeScopes: () => 0,
+  }),
+});
+assert.equal(zeroRequestedSwap.reasons.some((item) => item.check === "live_swap_headroom_low"), false);
+assert.equal(zeroRequestedSwap.capacity.requestedSwapMib, 0);
+assert.equal(zeroRequestedSwap.capacity.liveSwapHeadroomMib, 0);
 
 const ceiling = runResourcePreflight({
   runtimeResources: policy(),

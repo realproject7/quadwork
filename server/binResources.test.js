@@ -164,6 +164,7 @@ function sink() {
     "Requested worker swap: 512 MiB",
     "Live RAM reserve plus request: 2736 MiB",
     "Live RAM headroom: 1264 MiB",
+    "Live swap headroom: 6488 MiB",
     "",
   ].join("\n"));
   assert(!stdout.value().includes(DEFAULT_RUNTIME_RESOURCE_PROPOSAL.temp_root), "human output never prints the configured temp path");
@@ -230,6 +231,7 @@ function sink() {
     "Requested worker swap: unavailable",
     "Live RAM reserve plus request: unavailable",
     "Live RAM headroom: unavailable",
+    "Live swap headroom: unavailable",
     "Checks:",
     "  - invalid_resource_policy/policy_invalid: Configure and explicitly accept a valid runtime_resources v1 policy, then rerun preflight.",
     "",
