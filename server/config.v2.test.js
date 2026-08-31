@@ -100,6 +100,13 @@ function diskBytes() {
     "low-level write cannot unarchive without a cleanup reservation token",
   );
   assert.equal(diskBytes(), before);
+
+  expectCode(
+    () => writeConfig(staleWholeDocument, { previousConfig: staleWholeDocument }),
+    "project_ownership_reserved",
+    "exported low-level writer ignores a caller-forged previous snapshot",
+  );
+  assert.equal(diskBytes(), before);
 }
 
 // An in-flight unarchive reservation participates in the same authority as

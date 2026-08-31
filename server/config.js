@@ -16,6 +16,7 @@ const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const GITHUB_REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const INSTALLATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const LEGACY_PRIMARY_REPOSITORY_KEY = "primary";
+const INTERNAL_CONFIG_WRITE = Symbol("internalConfigWrite");
 // Process-wide authority for projects that have passed unarchive ownership
 // validation but are still proving that their archived runtime is quiescent.
 // Every V2 config commit consults this map, so no other mutation path can make
@@ -857,11 +858,22 @@ function writeConfig(cfg, options = {}) {
   // Legacy field-scoped writers still converge here. While an unarchive owns
   // a reservation, make this low-level atomic boundary enforce the same
   // authority so a stale whole-document write cannot bypass V2 commits.
-  let previousConfig = options.previousConfig;
+  const internalWrite = options[INTERNAL_CONFIG_WRITE] === true;
+  let previousConfig = internalWrite ? options.previousConfig : null;
   if (!previousConfig && typeof cfg?.installation_id === "string") {
-    try { previousConfig = readConfigDocument().config; } catch { previousConfig = null; }
+    try {
+      previousConfig = readConfigDocument().config;
+    } catch (error) {
+      // Once activated, inability to establish the live previous state must
+      // never downgrade into an unchecked low-level overwrite.
+      if (!error || error.code !== "ENOENT") throw error;
+    }
   }
-  assertV2OwnershipReservationCommit(cfg, { ...options, previousConfig });
+  assertV2OwnershipReservationCommit(cfg, {
+    previousConfig,
+    ownershipReservation: internalWrite ? options.ownershipReservation : null,
+    fsImpl: internalWrite ? options.fsImpl : fs,
+  });
   const data = JSON.stringify(cfg, null, 2);
   const tmpPath = `${CONFIG_PATH}.${process.pid}.tmp`;
   writeSecureFile(tmpPath, data); // 0o600
@@ -887,7 +899,7 @@ function updateConfig(mutator, options = {}) {
   const previousConfig = cloneConfigurationValue(cfg);
   mutator(cfg);
   if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
-  writeConfig(cfg, { ...options, previousConfig });
+  writeConfig(cfg, { ...options, previousConfig, [INTERNAL_CONFIG_WRITE]: true });
   return cfg;
 }
 
