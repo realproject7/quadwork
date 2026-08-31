@@ -205,7 +205,7 @@ function perItemIssueFetches() {
     ok(_batchProgressRefreshes.size === 1, "C: second stale poll did not start another refresh");
     ok(again._refreshing === true, "C: second stale poll still serves cache");
 
-    await _batchProgressRefreshes.get("terminal-proj");
+    await _batchProgressRefreshes.get("terminal-proj").promise;
     ok(!_batchProgressRefreshes.has("terminal-proj"), "C: refresh gate clears after completion");
     delayGh = false;
   }

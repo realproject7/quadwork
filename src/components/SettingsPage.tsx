@@ -148,6 +148,8 @@ const COPY = {
     archived: "Archived",
     restore: "Restore",
     confirmRemove: "Confirm Remove",
+    lifecycleFailed: "Project lifecycle operation failed",
+    retryCleanup: "Retry cleanup",
     newProject: "New Project",
     butlerAgent: "Butler Agent",
     butlerEnabled: "Enabled",
@@ -237,6 +239,8 @@ const COPY = {
     archived: "보관됨",
     restore: "복원",
     confirmRemove: "제거 확인",
+    lifecycleFailed: "프로젝트 상태 변경에 실패했습니다",
+    retryCleanup: "정리 다시 시도",
     newProject: "새 프로젝트",
     butlerAgent: "버틀러 에이전트",
     butlerEnabled: "활성",
@@ -380,6 +384,8 @@ export default function SettingsPage() {
   // gate the project body on it — every project is open by default.
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [projectLifecyclePending, setProjectLifecyclePending] = useState<Record<string, "archive" | "restore" | "remove">>({});
+  const [projectLifecycleErrors, setProjectLifecycleErrors] = useState<Record<string, string>>({});
   const [autoAdded, setAutoAdded] = useState(false);
   // #1023: was {claude, codex} — gemini was already missing and grok would have
   // been too, so every `cliStatus[b.value]` lookup below leaned on a cast.
@@ -804,15 +810,83 @@ export default function SettingsPage() {
     }, 800);
   };
 
-  const archiveProject = (idx: number) => {
-    if (!config) return;
-    updateProject(idx, { archived: true });
+  const lifecycleErrorMessage = (payload: Record<string, unknown>, status: number) => {
+    const cleanupErrors = Array.isArray(payload.cleanup_errors) ? payload.cleanup_errors : [];
+    if (cleanupErrors.length > 0) {
+      return cleanupErrors.map((entry) => {
+        const error = entry && typeof entry === "object" ? entry as Record<string, unknown> : {};
+        const resource = typeof error.resource === "string" ? error.resource : "project";
+        const code = typeof error.code === "string" ? error.code : "cleanup_failed";
+        const message = typeof error.message === "string" ? error.message : t.lifecycleFailed;
+        return `${resource} [${code}]: ${message}`;
+      }).join(" · ");
+    }
+    const message = typeof payload.error === "string" ? payload.error : t.lifecycleFailed;
+    const code = typeof payload.code === "string" ? payload.code : `http_${status}`;
+    const field = typeof payload.field === "string" ? ` · ${payload.field}` : "";
+    const owner = typeof payload.owner_project_id === "string" ? ` · owner: ${payload.owner_project_id}` : "";
+    return `${message} [${code}]${field}${owner}`;
   };
 
-  const restoreProject = (idx: number) => {
-    if (!config) return;
-    updateProject(idx, { archived: false });
+  const commitLifecycleState = (projectId: string, update: { archived?: boolean; removed?: boolean }) => {
+    setConfig((prev) => prev ? {
+      ...prev,
+      projects: update.removed
+        ? prev.projects.filter((project) => project.id !== projectId)
+        : prev.projects.map((project) => project.id === projectId && typeof update.archived === "boolean"
+          ? { ...project, archived: update.archived }
+          : project),
+    } : prev);
+    try {
+      const saved = JSON.parse(savedConfigRef.current);
+      if (Array.isArray(saved.projects)) {
+        saved.projects = update.removed
+          ? saved.projects.filter((project: { id: string }) => project.id !== projectId)
+          : saved.projects.map((project: ProjectConfig) => project.id === projectId && typeof update.archived === "boolean"
+            ? { ...project, archived: update.archived }
+            : project);
+        savedConfigRef.current = JSON.stringify(saved);
+      }
+    } catch { /* dirty-tracking best-effort */ }
   };
+
+  const setLifecycleError = (projectId: string, message?: string) => {
+    setProjectLifecycleErrors((prev) => {
+      const next = { ...prev };
+      if (message) next[projectId] = message;
+      else delete next[projectId];
+      return next;
+    });
+  };
+
+  const setProjectArchived = async (idx: number, archived: boolean) => {
+    if (!config) return;
+    const target = config.projects[idx];
+    if (!target || projectLifecyclePending[target.id]) return;
+    setProjectLifecyclePending((prev) => ({ ...prev, [target.id]: archived ? "archive" : "restore" }));
+    setLifecycleError(target.id);
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(target.id)}/archive`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived }),
+      });
+      const payload = await res.json().catch(() => ({})) as Record<string, unknown>;
+      if (typeof payload.archived === "boolean") commitLifecycleState(target.id, { archived: payload.archived });
+      if (!res.ok || payload.ok !== true) setLifecycleError(target.id, lifecycleErrorMessage(payload, res.status));
+    } catch {
+      setLifecycleError(target.id, `${t.lifecycleFailed} [network_error]`);
+    } finally {
+      setProjectLifecyclePending((prev) => {
+        const next = { ...prev };
+        delete next[target.id];
+        return next;
+      });
+    }
+  };
+
+  const archiveProject = (idx: number) => setProjectArchived(idx, true);
+  const restoreProject = (idx: number) => setProjectArchived(idx, false);
 
   // #971: removal persists immediately via the field-scoped DELETE endpoint
   // (the section-merge save never drops projects). Local state + the saved
@@ -820,24 +894,26 @@ export default function SettingsPage() {
   const removeProject = async (idx: number) => {
     if (!config) return;
     const target = config.projects[idx];
+    if (!target || projectLifecyclePending[target.id]) return;
     setConfirmDelete(null);
-    if (!target) return;
+    setProjectLifecyclePending((prev) => ({ ...prev, [target.id]: "remove" }));
+    setLifecycleError(target.id);
     try {
       const res = await fetch(`/api/projects/${encodeURIComponent(target.id)}`, { method: "DELETE" });
-      if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
-    } catch (err) {
-      console.error(err);
-      return; // leave the UI unchanged on failure
-    }
-    setConfig({ ...config, projects: config.projects.filter((_, i) => i !== idx) });
-    if (savedConfigRef.current) {
-      try {
-        const saved = JSON.parse(savedConfigRef.current);
-        if (Array.isArray(saved.projects)) {
-          saved.projects = saved.projects.filter((p: { id: string }) => p.id !== target.id);
-          savedConfigRef.current = JSON.stringify(saved);
-        }
-      } catch { /* dirty-tracking best-effort */ }
+      const payload = await res.json().catch(() => ({})) as Record<string, unknown>;
+      if (payload.removed === true) commitLifecycleState(target.id, { removed: true });
+      else if (typeof payload.archived === "boolean") commitLifecycleState(target.id, { archived: payload.archived });
+      if (!res.ok || payload.ok !== true || payload.removed !== true) {
+        setLifecycleError(target.id, lifecycleErrorMessage(payload, res.status));
+      }
+    } catch {
+      setLifecycleError(target.id, `${t.lifecycleFailed} [network_error]`);
+    } finally {
+      setProjectLifecyclePending((prev) => {
+        const next = { ...prev };
+        delete next[target.id];
+        return next;
+      });
     }
   };
 
@@ -1141,6 +1217,7 @@ export default function SettingsPage() {
 
         {config.projects.filter((p) => !p.archived).map((project) => {
           const idx = config.projects.indexOf(project);
+          const lifecyclePending = projectLifecyclePending[project.id];
 
           return (
             <div key={project.id} className="border border-border mb-3">
@@ -1298,20 +1375,27 @@ export default function SettingsPage() {
                        the project page. */}
 
                   {/* Remove project */}
+                  {projectLifecycleErrors[project.id] && (
+                    <div role="alert" className="mt-4 border border-error/30 bg-error/5 px-3 py-2 text-[10px] text-error break-words">
+                      {projectLifecycleErrors[project.id]}
+                    </div>
+                  )}
                   <div className="mt-4 flex justify-end gap-3">
                     {project.archived ? (
                       <button
                         onClick={() => restoreProject(idx)}
-                        className="text-[11px] text-accent hover:underline"
+                        disabled={!!lifecyclePending}
+                        className="text-[11px] text-accent hover:underline disabled:opacity-50 disabled:no-underline"
                       >
-                        {t.restoreProject}
+                        {lifecyclePending === "restore" ? `${t.restoreProject}…` : t.restoreProject}
                       </button>
                     ) : (
                       <button
                         onClick={() => archiveProject(idx)}
-                        className="text-[11px] text-text-muted hover:text-text transition-colors"
+                        disabled={!!lifecyclePending}
+                        className="text-[11px] text-text-muted hover:text-text transition-colors disabled:opacity-50"
                       >
-                        {t.archive}
+                        {lifecyclePending === "archive" ? `${t.archive}…` : t.archive}
                       </button>
                     )}
                     {confirmDelete === project.id ? (
@@ -1319,13 +1403,15 @@ export default function SettingsPage() {
                         <span className="text-[11px] text-error">{t.removeQuestion}</span>
                         <button
                           onClick={() => removeProject(idx)}
-                          className="px-2 py-1 text-[11px] bg-error text-bg font-semibold"
+                          disabled={!!lifecyclePending}
+                          className="px-2 py-1 text-[11px] bg-error text-bg font-semibold disabled:opacity-50"
                         >
-                          {t.confirm}
+                          {lifecyclePending === "remove" ? `${t.confirm}…` : t.confirm}
                         </button>
                         <button
                           onClick={() => setConfirmDelete(null)}
-                          className="px-2 py-1 text-[11px] text-text-muted border border-border"
+                          disabled={!!lifecyclePending}
+                          className="px-2 py-1 text-[11px] text-text-muted border border-border disabled:opacity-50"
                         >
                           {t.cancel}
                         </button>
@@ -1333,7 +1419,8 @@ export default function SettingsPage() {
                     ) : (
                       <button
                         onClick={() => setConfirmDelete(project.id)}
-                        className="text-[11px] text-error hover:text-text transition-colors"
+                        disabled={!!lifecyclePending}
+                        className="text-[11px] text-error hover:text-text transition-colors disabled:opacity-50"
                       >
                         {t.remove}
                       </button>
@@ -1360,31 +1447,61 @@ export default function SettingsPage() {
             <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.archived}</h2>
             {config.projects.filter((p) => p.archived).map((project) => {
               const idx = config.projects.indexOf(project);
+              const lifecyclePending = projectLifecyclePending[project.id];
               return (
                 <div key={project.id} className="border border-border mb-3 opacity-60">
                   <div className="flex items-center justify-between px-3 py-2">
                     <span className="text-[12px] text-text-muted">{project.name}</span>
                     <div className="flex items-center gap-2">
+                      {projectLifecycleErrors[project.id] && (
+                        <button
+                          onClick={() => archiveProject(idx)}
+                          disabled={!!lifecyclePending}
+                          className="text-[11px] text-text-muted hover:text-text hover:underline disabled:opacity-50"
+                        >
+                          {lifecyclePending === "archive" ? `${t.retryCleanup}…` : t.retryCleanup}
+                        </button>
+                      )}
                       <button
                         onClick={() => restoreProject(idx)}
-                        className="text-[11px] text-accent hover:underline"
+                        disabled={!!lifecyclePending}
+                        className="text-[11px] text-accent hover:underline disabled:opacity-50 disabled:no-underline"
                       >
-                        {t.restore}
+                        {lifecyclePending === "restore" ? `${t.restore}…` : t.restore}
                       </button>
-                      <button
-                        onClick={() => {
-                          if (confirmDelete === project.id) {
-                            removeProject(idx);
-                          } else {
-                            setConfirmDelete(project.id);
-                          }
-                        }}
-                        className="text-[11px] text-error hover:underline"
-                      >
-                        {confirmDelete === project.id ? t.confirmRemove : t.remove}
-                      </button>
+                      {confirmDelete === project.id ? (
+                        <>
+                          <button
+                            onClick={() => removeProject(idx)}
+                            disabled={!!lifecyclePending}
+                            className="px-2 py-1 text-[11px] bg-error text-bg font-semibold disabled:opacity-50"
+                          >
+                            {lifecyclePending === "remove" ? `${t.confirmRemove}…` : t.confirmRemove}
+                          </button>
+                          <button
+                            onClick={() => setConfirmDelete(null)}
+                            disabled={!!lifecyclePending}
+                            className="px-2 py-1 text-[11px] text-text-muted border border-border disabled:opacity-50"
+                          >
+                            {t.cancel}
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmDelete(project.id)}
+                          disabled={!!lifecyclePending}
+                          className="text-[11px] text-error hover:underline disabled:opacity-50"
+                        >
+                          {t.remove}
+                        </button>
+                      )}
                     </div>
                   </div>
+                  {projectLifecycleErrors[project.id] && (
+                    <div role="alert" className="mx-3 mb-3 border border-error/30 bg-error/5 px-3 py-2 text-[10px] text-error break-words">
+                      {projectLifecycleErrors[project.id]}
+                    </div>
+                  )}
                 </div>
               );
             })}

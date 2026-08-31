@@ -49,6 +49,19 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
 (async () => {
   const app = express();
   app.use(express.json());
+  app.set("projectLifecycle", {
+    async removeProject(id) {
+      const cfg = readCfg();
+      const before = (cfg.projects || []).length;
+      cfg.projects = (cfg.projects || []).filter((project) => project.id !== id);
+      if (cfg.projects.length === before) {
+        const { ProjectLifecycleError } = require("./project-lifecycle");
+        throw new ProjectLifecycleError("unknown_project", id, "project is not configured", 404);
+      }
+      writeCfg(cfg);
+      return { ok: true, project_id: id, archived: true, removed: true, resources: {}, cleanup_errors: [] };
+    },
+  });
   app.use(router);
   const server = app.listen(0, "127.0.0.1");
   await new Promise((r) => server.once("listening", r));
@@ -89,11 +102,27 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     const getCfg = JSON.parse((await req(server, { urlPath: "/api/config" })).body);
     ok(getCfg.operator_name === "Alice", "GET /api/config returns the SANITIZED operator_name");
     getCfg.projects[0].idle = false; // stale — a concurrent PATCH set it true
+    getCfg.projects[0].archived = true; // lifecycle-owned; generic PUT cannot introduce it
     const put = await req(server, { method: "PUT", urlPath: "/api/config", body: getCfg });
     ok(put.status === 200, "whole-config PUT succeeds");
     const disk = readCfg();
     ok(disk.projects[0].idle === true, "whole-config PUT did NOT clobber the field-scoped idle flag (kept disk value)");
     ok(disk.operator_name === "Alice!", "raw operator_name survives a Settings save (not overwritten with sanitized)");
+    ok(!Object.prototype.hasOwnProperty.call(disk.projects[0], "archived"),
+       "whole-config PUT cannot archive a project whose lifecycle field is absent");
+
+    // Once lifecycle has archived a project, a stale generic PUT cannot restore
+    // it. The absence of `archived` is also an owned state, not an invitation
+    // for a Settings snapshot to introduce the field.
+    writeCfg({ ...readCfg(), projects: readCfg().projects.map((project) => (
+      project.id === "lv" ? { ...project, archived: true } : project
+    )) });
+    const stalePut = readCfg();
+    stalePut.projects.find((project) => project.id === "lv").archived = false;
+    ok((await req(server, { method: "PUT", urlPath: "/api/config", body: stalePut })).status === 200,
+       "stale whole-config PUT with archived=false succeeds without owning lifecycle");
+    ok(readCfg().projects.find((project) => project.id === "lv").archived === true,
+       "whole-config PUT cannot restore an archived project");
 
     // ── PATCH /api/config: the section-merge Settings save (no whole-config PUT) ─
     // Send only owned sections (Settings strips the flags): operator_name echoed
@@ -109,6 +138,24 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     ok(d2.butler && d2.butler.command === "claude" && d2.butler.model === "opus", "PATCH merges an owned top-level section (butler)");
     ok(d2.projects[0].name === "Renamed" && d2.projects[0].agents.head.command === "codex", "PATCH merges owned per-project fields (name, agents)");
     ok(d2.projects[0].idle === true && d2.projects[0].telegram_auto === true, "PATCH preserves the field-scoped flags from disk (no clobber)");
+    ok(d2.projects[0].archived === true, "PATCH cannot restore an archived project from a stale body");
+
+    await req(server, { method: "PATCH", urlPath: "/api/config", body: {
+      projects: [{ id: "lv", archived: false }],
+    } });
+    ok(readCfg().projects.find((project) => project.id === "lv").archived === true,
+       "explicit archived=false in generic PATCH remains ignored");
+    writeCfg({ ...readCfg(), projects: readCfg().projects.map((project) => {
+      if (project.id !== "lv") return project;
+      const restored = { ...project };
+      delete restored.archived;
+      return restored;
+    }) });
+    await req(server, { method: "PATCH", urlPath: "/api/config", body: {
+      projects: [{ id: "lv", archived: true }],
+    } });
+    ok(!Object.prototype.hasOwnProperty.call(readCfg().projects.find((project) => project.id === "lv"), "archived"),
+       "generic PATCH cannot archive when lifecycle owns an absent archived field");
 
     // PATCH must never touch the field-scoped-owned top-level keys.
     writeCfg({ ...readCfg(), pinned_projects: ["lv"] });

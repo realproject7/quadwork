@@ -463,7 +463,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
   };
 
   const poll = useCallback(() => {
-    fetch("/api/caffeinate/status")
+    fetch(`/api/caffeinate/status?project=${encodeURIComponent(projectId)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (!data) return;
@@ -472,7 +472,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
         setPlatform(data.platform);
       })
       .catch(() => {});
-  }, []);
+  }, [projectId]);
 
   useEffect(() => {
     poll();
@@ -484,7 +484,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
     fetch("/api/caffeinate/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ duration: seconds }),
+      body: JSON.stringify({ project_id: projectId, duration: seconds }),
     })
       .then((r) => r.json())
       .then((data) => {
@@ -500,7 +500,11 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
   const stop = () => {
     // #441: track manual stop so auto doesn't re-start until next batch transition
     manualStopRef.current = true;
-    fetch("/api/caffeinate/stop", { method: "POST" })
+    fetch("/api/caffeinate/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: projectId }),
+    })
       .then(() => {
         setActive(false);
         setRemaining(null);
@@ -553,7 +557,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
     fetch("/api/caffeinate/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ duration: seconds }),
+      body: JSON.stringify({ project_id: projectId, duration: seconds }),
     })
       .then((r) => r.json())
       .then((data) => {
@@ -564,17 +568,21 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
         }
       })
       .catch(() => {});
-  }, [hoursDraft]);
+  }, [hoursDraft, projectId]);
 
   // #441: Auto stop helper
   const autoStop = useCallback(() => {
-    fetch("/api/caffeinate/stop", { method: "POST" })
+    fetch("/api/caffeinate/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: projectId }),
+    })
       .then(() => {
         setActive(false);
         setRemaining(null);
       })
       .catch(() => {});
-  }, []);
+  }, [projectId]);
 
   // #441: Batch lifecycle polling (same pattern as ScheduledTriggerWidget)
   useEffect(() => {

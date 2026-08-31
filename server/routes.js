@@ -13,6 +13,13 @@ const multer = require("multer");
 const fileChat = require("./file-chat");
 const telegramBridge = require("./bridges/telegram");
 const discordBridge = require("./bridges/discord");
+const {
+  ProjectLifecycleError,
+  isProjectArchived,
+  assertProjectAdmitted,
+  captureProjectAdmission,
+  isAdmissionCurrent,
+} = require("./project-lifecycle");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
@@ -436,6 +443,18 @@ function assertGenericV2ProjectTopology(previousTopology, candidateConfig) {
   }
 }
 
+// #1034: archive state is lifecycle-owned. Generic config snapshots can edit
+// project presentation/settings, but they must never archive, restore, or
+// remove the absence of the lifecycle field on an existing project.
+function preserveProjectArchiveState(existing, incoming) {
+  if (!existing || !incoming || typeof incoming !== "object") return;
+  if (Object.prototype.hasOwnProperty.call(existing, "archived")) {
+    incoming.archived = existing.archived;
+  } else {
+    delete incoming.archived;
+  }
+}
+
 router.put("/api/config", (req, res) => {
   try {
     const body = req.body;
@@ -487,6 +506,7 @@ router.put("/api/config", (req, res) => {
       for (const proj of body.projects) {
         const dp = diskById.get(proj.id);
         if (!dp) continue;
+        preserveProjectArchiveState(dp, proj);
         for (const k of PROJECT_FLAG_KEYS) {
           if (k in dp) proj[k] = dp[k];
           else delete proj[k];
@@ -564,7 +584,11 @@ router.patch("/api/config", (req, res) => {
           if (existing) {
             const preserved = {};
             for (const fk of PROJECT_FLAG_KEYS) if (fk in existing) preserved[fk] = existing[fk];
+            const lifecycleOwner = Object.prototype.hasOwnProperty.call(existing, "archived")
+              ? { archived: existing.archived }
+              : {};
             Object.assign(existing, incoming, preserved);
+            preserveProjectArchiveState(lifecycleOwner, existing);
           } else {
             cfg.projects.push(incoming);
           }
@@ -640,25 +664,117 @@ router.patch("/api/projects/:id/flags", (req, res) => {
   res.json({ ok: true });
 });
 
-// #971: field-scoped project removal. The section-merge PATCH above never drops
-// projects (it can't tell "not edited" from "deleted"), so the Settings "Remove"
-// action deletes here — atomically, via updateConfig — instead of relying on a
-// whole-config replace. Mirrors the prior behavior (config entry removed; source
-// clones/worktrees are left for `quadwork cleanup`).
-router.delete("/api/projects/:id", (req, res) => {
-  const { id } = req.params;
-  try {
-    updateConfig((cfg) => {
-      const before = (cfg.projects || []).length;
-      cfg.projects = (cfg.projects || []).filter((p) => p.id !== id);
-      if (cfg.projects.length === before) { const e = new Error("not found"); e.code = "QW_NOT_FOUND"; throw e; }
-    });
-  } catch (err) {
-    if (err.code === "QW_NOT_FOUND") return res.status(404).json({ error: `Unknown project: ${id}` });
-    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+function safeProjectLifecyclePayload(result, projectId) {
+  const source = result && typeof result === "object" ? result : {};
+  const payload = {
+    ok: source.ok === true,
+    project_id: typeof source.project_id === "string" ? source.project_id : projectId,
+    resources: {},
+    cleanup_errors: [],
+  };
+  for (const key of ["archived", "removed", "already_archived", "already_unarchived"]) {
+    if (typeof source[key] === "boolean") payload[key] = source[key];
   }
-  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
-  res.json({ ok: true });
+  if (Number.isSafeInteger(source.admission_generation) && source.admission_generation >= 0) {
+    payload.admission_generation = source.admission_generation;
+  }
+  if (source.resources && typeof source.resources === "object" && !Array.isArray(source.resources)) {
+    for (const [key, value] of Object.entries(source.resources)) {
+      if (/^[a-z][a-z0-9_]{0,63}$/.test(key) && Number.isSafeInteger(value) && value >= 0) {
+        payload.resources[key] = value;
+      }
+    }
+  }
+  if (Array.isArray(source.cleanup_errors)) {
+    payload.cleanup_errors = source.cleanup_errors.map((entry) => ({
+      resource: typeof entry?.resource === "string" ? entry.resource.slice(0, 64) : "project",
+      code: typeof entry?.code === "string" ? entry.code.slice(0, 64) : "cleanup_failed",
+      message: typeof entry?.message === "string"
+        ? entry.message.replace(/[\r\n\t]+/g, " ").slice(0, 300)
+        : "project cleanup failed",
+    }));
+  }
+  if (!payload.ok && payload.cleanup_errors.length > 0) payload.code = "project_cleanup_incomplete";
+  return payload;
+}
+
+function sendProjectLifecycleException(res, err, projectId) {
+  if (err instanceof ProjectLifecycleError) {
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status <= 599 ? err.status : 409;
+    return res.status(status).json({
+      ok: false,
+      error: String(err.message || "project lifecycle operation failed").replace(/[\r\n\t]+/g, " ").slice(0, 300),
+      code: typeof err.code === "string" ? err.code : "project_lifecycle_failed",
+      project_id: typeof err.project_id === "string" ? err.project_id : projectId,
+    });
+  }
+  if (err instanceof ConfigurationValidationError) {
+    const payload = {
+      ok: false,
+      error: "V2 configuration validation failed",
+      code: err.code,
+      field: err.field,
+      project_id: projectId,
+    };
+    if (err.owner_project_id !== undefined) payload.owner_project_id = err.owner_project_id;
+    return res.status(409).json(payload);
+  }
+  return res.status(500).json({
+    ok: false,
+    error: "Project lifecycle operation failed",
+    code: "project_lifecycle_failed",
+    project_id: projectId,
+  });
+}
+
+function projectLifecycleController(req, res, projectId) {
+  const controller = req.app.get("projectLifecycle");
+  if (controller) return controller;
+  res.status(503).json({
+    ok: false,
+    error: "Project lifecycle controller is unavailable",
+    code: "project_lifecycle_unavailable",
+    project_id: projectId,
+  });
+  return null;
+}
+
+// #1034: archive/unarchive is a lifecycle barrier. The injected controller is
+// the sole mutation authority; route-local config mutation is forbidden.
+router.put("/api/projects/:id/archive", async (req, res) => {
+  const { id } = req.params;
+  if (typeof req.body?.archived !== "boolean") {
+    return res.status(400).json({ ok: false, error: "archived must be a boolean", code: "invalid_archive_state", project_id: id });
+  }
+  const controller = projectLifecycleController(req, res, id);
+  if (!controller) return;
+  try {
+    const result = req.body.archived
+      ? await controller.archiveProject(id)
+      : await controller.unarchiveProject(id);
+    const payload = safeProjectLifecyclePayload(result, id);
+    if (payload.archived === true) clearProjectBackgroundDemand(id);
+    else if (payload.archived === false) {
+      _projectsCache = null;
+      _projectsCacheTs = 0;
+    }
+    return res.status(payload.ok ? 200 : 503).json(payload);
+  } catch (err) {
+    return sendProjectLifecycleException(res, err, id);
+  }
+});
+
+router.delete("/api/projects/:id", async (req, res) => {
+  const { id } = req.params;
+  const controller = projectLifecycleController(req, res, id);
+  if (!controller) return;
+  try {
+    const payload = safeProjectLifecyclePayload(await controller.removeProject(id), id);
+    if (payload.archived === true || payload.removed === true) clearProjectBackgroundDemand(id);
+    return res.status(payload.ok && payload.removed === true ? 200 : 503).json(payload);
+  } catch (err) {
+    return sendProjectLifecycleException(res, err, id);
+  }
 });
 
 // ─── Pinned projects & sidebar groups (field-scoped, race-free) ─────────────
@@ -768,6 +884,7 @@ const {
   writeConfig,
   updateConfig,
   serializeProjectCompatibility,
+  primaryRepository,
   ConfigurationValidationError,
   commitV2Configuration,
 } = require("./config");
@@ -1286,6 +1403,12 @@ router.get("/api/activity/stats", (_req, res) => {
 router.post("/api/chat", (req, res) => {
   const projectId = req.query.project || req.body.project;
 
+  try {
+    assertProjectAdmitted(projectId);
+  } catch (err) {
+    return sendProjectLifecycleException(res, err, projectId);
+  }
+
   const text = typeof req.body?.text === "string" ? req.body.text : "";
   if (!text) return res.status(400).json({ error: "text required" });
   const shimSender = req.headers["x-chat-sender"];
@@ -1373,7 +1496,15 @@ const upload = multer({
   },
 });
 
-router.post("/api/upload", upload.single("file"), (req, res) => {
+router.post("/api/upload", (req, res, next) => {
+  const projectId = req.query.project || "";
+  try {
+    assertProjectAdmitted(projectId);
+    next();
+  } catch (err) {
+    sendProjectLifecycleException(res, err, projectId);
+  }
+}, upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   return res.json({
     ok: true,
@@ -1412,6 +1543,15 @@ let _projectsCache = null;
 let _projectsCacheTs = 0;
 const PROJECTS_CACHE_TTL = 60_000;
 
+function shouldPublishProjectsCache(projectResults, admissions) {
+  return projectResults.every((project) => {
+    const currentlyArchived = isProjectArchived(project.id);
+    if (currentlyArchived !== (project._archived === true)) return false;
+    const admission = admissions.get(project.id);
+    return !admission || isAdmissionCurrent(admission);
+  });
+}
+
 router.get("/api/projects", async (req, res) => {
   if (_projectsCache && Date.now() - _projectsCacheTs < adaptiveTTL(PROJECTS_CACHE_TTL)) {
     return res.json(_projectsCache);
@@ -1422,6 +1562,7 @@ router.get("/api/projects", async (req, res) => {
   }
 
   const cfg = readConfigFile();
+  const projectResultAdmissions = new Map();
 
   // Fetch active sessions from our own in-memory state (only running PTYs)
   const activeSessions = req.app.get("activeSessions") || new Map();
@@ -1464,13 +1605,28 @@ router.get("/api/projects", async (req, res) => {
   async function fetchProjectGhData(p) {
     let openPrs = 0;
     let lastActivity = null;
+    const configuredRepo = getRepo(p.id);
+    if (isProjectArchived(p.id, cfg)) {
+      const hasArchivedAgents = p.agents && Object.keys(p.agents).length > 0;
+      return {
+        id: p.id,
+        name: p.name,
+        repo: configuredRepo,
+        agentCount: hasArchivedAgents ? Object.keys(p.agents).length : 0,
+        openPrs: 0,
+        state: "archived",
+        lastActivity: null,
+        _archived: true,
+        _readonly: true,
+      };
+    }
     // #812: parked (idle) project — no gh calls; return zero/last-known metadata.
     if (p.idle) {
       const hasAgentsIdle = p.agents && Object.keys(p.agents).length > 0;
       return {
         id: p.id,
         name: p.name,
-        repo: p.repo,
+        repo: configuredRepo,
         agentCount: hasAgentsIdle ? Object.keys(p.agents).length : 0,
         openPrs: 0,
         state: "idle",
@@ -1478,23 +1634,32 @@ router.get("/api/projects", async (req, res) => {
         _idle: true,
       };
     }
-    if (REPO_RE.test(p.repo)) {
+    const admission = projectAdmission(p.id, { demand: true });
+    if (!admission) {
+      return { id: p.id, name: p.name, repo: configuredRepo, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
+    }
+    projectResultAdmissions.set(p.id, admission);
+    if (configuredRepo && REPO_RE.test(configuredRepo)) {
       try {
         // #806: REST + ETag instead of `gh pr list` (GraphQL-backed). Open-PR
         // count + latest cross-state PR activity; both conditional (mostly 304).
+        const stillAdmitted = () => isAdmissionCurrent(admission);
         const [prs, recentPrs] = await Promise.all([
-          ghApiConditional(`${p.repo}#projects-open-pulls`, `repos/${p.repo}/pulls?state=open&per_page=100`),
-          ghApiConditional(`${p.repo}#projects-last-activity`, `repos/${p.repo}/pulls?state=all&sort=updated&direction=desc&per_page=1`),
+          ghApiConditional(`${configuredRepo}#projects-open-pulls`, `repos/${configuredRepo}/pulls?state=open&per_page=100`, stillAdmitted),
+          ghApiConditional(`${configuredRepo}#projects-last-activity`, `repos/${configuredRepo}/pulls?state=all&sort=updated&direction=desc&per_page=1`, stillAdmitted),
         ]);
         if (Array.isArray(prs.data)) openPrs = prs.data.length;
         if (Array.isArray(recentPrs.data) && recentPrs.data[0]) lastActivity = recentPrs.data[0].updated_at || null;
       } catch {}
     }
+    if (!isAdmissionCurrent(admission)) {
+      return { id: p.id, name: p.name, repo: configuredRepo, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
+    }
     const hasAgents = p.agents && Object.keys(p.agents).length > 0;
     return {
       id: p.id,
       name: p.name,
-      repo: p.repo,
+      repo: configuredRepo,
       agentCount: p.agents ? Object.keys(p.agents).length : 0,
       openPrs,
       state: hasAgents && activeProjectIds.has(p.id) ? "active" : "idle",
@@ -1511,7 +1676,7 @@ router.get("/api/projects", async (req, res) => {
   const recentEvents = [];
   for (const m of workflowMsgs) {
     // First: try text match against repo/project name
-    let projectName = (cfg.projects || []).find((p) => m.text.includes(p.repo) || m.text.includes(p.name))?.name;
+    let projectName = (cfg.projects || []).find((p) => m.text.includes(getRepo(p.id) || "") || m.text.includes(p.name))?.name;
     // Second: use the AC instance the message came from
     if (!projectName) projectName = msgToProject.get(m);
     // Fallback: single-project installs
@@ -1530,8 +1695,10 @@ router.get("/api/projects", async (req, res) => {
   }
 
   const result = { projects: projectResults, recentEvents };
-  _projectsCache = result;
-  _projectsCacheTs = Date.now();
+  if (shouldPublishProjectsCache(projectResults, projectResultAdmissions)) {
+    _projectsCache = result;
+    _projectsCacheTs = Date.now();
+  }
   res.json(result);
 });
 
@@ -1557,9 +1724,11 @@ router.get("/api/github/rate-limit", async (req, res) => {
   // unknown project → cfg/default (back-compatible with #886).
   const projectId = typeof req.query.project === "string" ? req.query.project : null;
   let reviewer = null;
-  try {
-    reviewer = reviewerRateLimitPayload(await getReviewerRateLimit(projectId));
-  } catch { /* reviewer block is best-effort; never fail the core response */ }
+  if (!projectId || !isProjectArchived(projectId)) {
+    try {
+      reviewer = reviewerRateLimitPayload(await getReviewerRateLimit(projectId));
+    } catch { /* reviewer block is best-effort; never fail the core response */ }
+  }
   res.json({
     // Top-level fields are core (REST), kept for the existing alert banner.
     limit: _rateLimit.limit,
@@ -1586,7 +1755,7 @@ function getRepo(projectId) {
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     const project = cfg.projects?.find((p) => p.id === projectId);
-    const repo = project?.repo;
+    const repo = primaryRepository(project)?.repo;
     if (repo && REPO_RE.test(repo)) return repo;
     return null;
   } catch {
@@ -1606,6 +1775,49 @@ function isProjectIdle(projectId) {
   } catch {
     return false;
   }
+}
+
+// #1034: background GitHub work is demand-driven per project. Archiving clears
+// demand; restoring does not recreate it, so polling stays stopped until a
+// real consumer asks for that project again.
+const _githubDemandedProjects = new Set();
+
+function projectAdmission(projectId, { demand = false } = {}) {
+  try {
+    const token = captureProjectAdmission(projectId);
+    if (demand) _githubDemandedProjects.add(projectId);
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+function clearProjectBackgroundDemand(projectId) {
+  const resources = {
+    github_demand: _githubDemandedProjects.delete(projectId) ? 1 : 0,
+    github_leases: 0,
+    batch_progress: 0,
+  };
+  _projectsCache = null;
+  _projectsCacheTs = 0;
+  for (const entry of _restRefreshing.values()) {
+    for (const owner of entry?.owners || []) {
+      if (owner?.project_id === projectId && entry.owners.delete(owner)) resources.github_leases += 1;
+    }
+  }
+  const batchEntry = _batchProgressRefreshes?.get(projectId);
+  if (batchEntry && _batchProgressRefreshes.delete(projectId)) resources.batch_progress = 1;
+  return resources;
+}
+
+function archivedGithubLists(cached) {
+  return cached
+    ? { issues: cached.issues, prs: cached.prs, closedIssues: cached.closedIssues, mergedPrs: cached.mergedPrs, _archived: true, _readonly: true }
+    : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _archived: true, _readonly: true };
+}
+
+async function cancelProjectBackground(projectId) {
+  return { ok: true, resources: clearProjectBackgroundDemand(projectId), cleanup_errors: [] };
 }
 
 // ─── #703 / #806: shared board cache ──────────────────────────────────────
@@ -1638,7 +1850,7 @@ const _etagStore = new Map();
 // Per-repo in-flight refresh: repo → Promise. Concurrent callers AWAIT the same
 // refresh (not just skip it) so a cold first load — where GitHubPanel fires the
 // four list endpoints in parallel — never races ahead of the populated cache.
-const _restRefreshing = new Map();
+const _restRefreshing = new Map(); // repo → { owners: Set<exact admission token>, promise }
 
 // Split a `gh api -i` response into its header block and JSON body. gh emits
 // HTTP headers (CRLF) then a blank line then the body.
@@ -1667,7 +1879,8 @@ function _is304Error(err) {
 // Conditional `gh api` GET. Reuses the stored ETag; on 304 returns the cached
 // payload (status "unchanged", zero budget cost). Never throws — a hard
 // failure returns the last good payload (if any) with status "error".
-async function ghApiConditional(etagKey, apiPath) {
+async function ghApiConditional(etagKey, apiPath, isCurrent = () => true) {
+  if (!isCurrent()) return { status: "cancelled", data: null, changed: false };
   const prev = _etagStore.get(etagKey);
   const args = ["api", apiPath, "-i"];
   if (prev && prev.etag) args.push("-H", `If-None-Match: ${prev.etag}`);
@@ -1677,6 +1890,7 @@ async function ghApiConditional(etagKey, apiPath) {
     const etag = _extractEtag(headerBlock);
     let data = null;
     try { data = body ? JSON.parse(body) : null; } catch { data = null; }
+    if (!isCurrent()) return { status: "cancelled", data: null, changed: false };
     _etagStore.set(etagKey, { etag, data });
     return { status: "ok", data, changed: true };
   } catch (err) {
@@ -1845,12 +2059,13 @@ function buildStatusCheckRollup(checkRunsResp, statusResp) {
 // is FULL (more pages may exist) AND short on merges. `fetchPage(page)` returns
 // the same { status, data } shape as ghApiConditional. Pure control flow over
 // an injected fetcher → unit-testable without network.
-async function gatherClosedPrPages(firstPage, fetchPage) {
+async function gatherClosedPrPages(firstPage, fetchPage, isCurrent = () => true) {
   const pages = [firstPage];
   const mergedCount = (r) => (Array.isArray(r && r.data) ? r.data : []).filter((p) => p.merged_at).length;
   let mergedSoFar = mergedCount(firstPage);
   let lastLen = Array.isArray(firstPage && firstPage.data) ? firstPage.data.length : 0;
   for (let page = 2; page <= MERGED_PAGE_CAP && mergedSoFar < RECENT_DISPLAY_LIMIT && lastLen === 100; page++) {
+    if (!isCurrent()) break;
     const r = await fetchPage(page);
     pages.push(r);
     mergedSoFar += mergedCount(r);
@@ -1903,24 +2118,32 @@ function closedPrIssueNumsFromPages(pages) {
   return nums;
 }
 
-async function githubStateFetcher(repo) {
+async function githubStateFetcher(repo, isCurrent = () => true) {
   const [owner, name] = (repo || "").split("/");
-  if (!owner || !name) return { status: "error", data: null };
+  if (!owner || !name || !isCurrent()) return { status: "cancelled", data: null };
   const base = `repos/${owner}/${name}`;
   let changed = 0;
 
   const [openPullsR, openIssuesR, closedIssuesR, closedPulls1R] = await Promise.all([
-    ghApiConditional(`${repo}#pulls-open`, `${base}/pulls?state=open&per_page=50&sort=updated&direction=desc`),
-    ghApiConditional(`${repo}#issues-open`, `${base}/issues?state=open&per_page=50&sort=updated&direction=desc`),
-    ghApiConditional(`${repo}#issues-closed`, `${base}/issues?state=closed&per_page=100&sort=updated&direction=desc`),
-    ghApiConditional(`${repo}#pulls-closed`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc`),
+    ghApiConditional(`${repo}#pulls-open`, `${base}/pulls?state=open&per_page=50&sort=updated&direction=desc`, isCurrent),
+    ghApiConditional(`${repo}#issues-open`, `${base}/issues?state=open&per_page=50&sort=updated&direction=desc`, isCurrent),
+    ghApiConditional(`${repo}#issues-closed`, `${base}/issues?state=closed&per_page=100&sort=updated&direction=desc`, isCurrent),
+    ghApiConditional(`${repo}#pulls-closed`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc`, isCurrent),
   ]);
+  if (!isCurrent()) return { status: "cancelled", data: null };
 
   // #828 P3: extend the closed-PR window across pages only when needed (each
   // page conditional/ETag'd, so steady-state extra pages cost nothing on a 304).
-  const closedPullPages = await gatherClosedPrPages(closedPulls1R, (page) =>
-    ghApiConditional(`${repo}#pulls-closed-p${page}`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc&page=${page}`),
+  const closedPullPages = await gatherClosedPrPages(
+    closedPulls1R,
+    (page) => ghApiConditional(
+      `${repo}#pulls-closed-p${page}`,
+      `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc&page=${page}`,
+      isCurrent,
+    ),
+    isCurrent,
   );
+  if (!isCurrent()) return { status: "cancelled", data: null };
 
   let anyTopData = false;
   for (const r of [openPullsR, openIssuesR, closedIssuesR, ...closedPullPages]) {
@@ -1960,12 +2183,14 @@ async function githubStateFetcher(repo) {
 
   const openPullsRaw = Array.isArray(openPullsR.data) ? openPullsR.data : [];
   const prs = await _mapLimited(openPullsRaw, GH_MAX_CONCURRENT, async (p) => {
+    if (!isCurrent()) return null;
     const sha = p.head && p.head.sha;
     const [reviewsR, checkRunsR, statusR] = await Promise.all([
-      ghApiConditional(`${repo}#reviews-${p.number}`, `${base}/pulls/${p.number}/reviews?per_page=100`),
-      sha ? ghApiConditional(`${repo}#checkruns-${sha}`, `${base}/commits/${sha}/check-runs?per_page=100`) : Promise.resolve({ status: "error", data: null }),
-      sha ? ghApiConditional(`${repo}#status-${sha}`, `${base}/commits/${sha}/status`) : Promise.resolve({ status: "error", data: null }),
+      ghApiConditional(`${repo}#reviews-${p.number}`, `${base}/pulls/${p.number}/reviews?per_page=100`, isCurrent),
+      sha ? ghApiConditional(`${repo}#checkruns-${sha}`, `${base}/commits/${sha}/check-runs?per_page=100`, isCurrent) : Promise.resolve({ status: "error", data: null }),
+      sha ? ghApiConditional(`${repo}#status-${sha}`, `${base}/commits/${sha}/status`, isCurrent) : Promise.resolve({ status: "error", data: null }),
     ]);
+    if (!isCurrent()) return null;
     if (reviewsR.status === "ok" || checkRunsR.status === "ok" || statusR.status === "ok") changed++;
     const reviews = mapReviews(Array.isArray(reviewsR.data) ? reviewsR.data : []);
     return {
@@ -1976,9 +2201,11 @@ async function githubStateFetcher(repo) {
     };
   });
 
+  if (!isCurrent()) return { status: "cancelled", data: null };
+
   return {
     status: changed > 0 ? "ok" : "unchanged",
-    data: { issues, prs, closedIssues, mergedPrs, openPrsWindowComplete, closedPrsWindowComplete, closedPrIssueNums },
+    data: { issues, prs: prs.filter(Boolean), closedIssues, mergedPrs, openPrsWindowComplete, closedPrsWindowComplete, closedPrIssueNums },
   };
 }
 
@@ -1986,11 +2213,25 @@ async function githubStateFetcher(repo) {
 // concurrent caller (e.g. the parallel cold-load of all four list endpoints, or
 // a background stale refresh overlapping an on-demand one) joins and awaits the
 // SAME in-flight pass, so by the time it resolves the slice caches are written.
-function refreshRepoRest(repo) {
-  return _coalesce(_restRefreshing, repo, async () => {
+function refreshRepoRest(repo, ownerTokens = [], fetcher = githubStateFetcher) {
+  const existing = _restRefreshing.get(repo);
+  if (existing) {
+    for (const token of ownerTokens) {
+      if (token?.project_id) existing.owners.add(token);
+    }
+    return existing.promise;
+  }
+  const entry = { owners: new Set(), promise: null };
+  for (const token of ownerTokens) {
+    if (token?.project_id) entry.owners.add(token);
+  }
+  const hasCurrentOwner = () => [...entry.owners].some((token) => isAdmissionCurrent(token));
+  if (!hasCurrentOwner()) return Promise.resolve({ status: "cancelled", data: null });
+  entry.promise = (async () => {
     let result;
     try {
-      const { status, data } = await githubStateFetcher(repo);
+      const { status, data } = await fetcher(repo, hasCurrentOwner);
+      if (!hasCurrentOwner()) return { status: "cancelled", data: null };
       if (data) {
         const now = Date.now();
         _graphqlCache.set(repo, { ts: now, ...data });
@@ -2006,9 +2247,15 @@ function refreshRepoRest(repo) {
     // #807: the server is the sole author of GITHUB.md's machine sections —
     // regenerate it from this completed pass's snapshot (success or error so
     // staleCycles advances). Non-fatal; never affects the board cache result.
-    try { syncGithubFilesForRepo(repo, result.status); } catch { /* non-fatal */ }
+    if (hasCurrentOwner()) {
+      try { syncGithubFilesForRepo(repo, result.status, entry.owners); } catch { /* non-fatal */ }
+    }
     return result;
+  })().finally(() => {
+    if (_restRefreshing.get(repo) === entry) _restRefreshing.delete(repo);
   });
+  _restRefreshing.set(repo, entry);
+  return entry.promise;
 }
 
 // ─── #807 (#805 step 2): server-authored GITHUB.md ────────────────────────
@@ -2187,7 +2434,7 @@ function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, sta
     // filtered on a config snapshot taken earlier, so an idle-flip concurrent
     // with a setup-seed/refresh pass could otherwise still write a parked
     // project's GITHUB.md. Defensive; idle projects must author nothing.
-    if (isProjectIdle(projectId)) return;
+    if (isProjectIdle(projectId) || isProjectArchived(projectId)) return;
     const dir = path.join(CONFIG_DIR, projectId);
     const filePath = path.join(dir, "GITHUB.md");
     // Cold + total failure with nothing cached: leave the seeded template be.
@@ -2215,12 +2462,13 @@ function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, sta
 
 // Regenerate GITHUB.md for every non-idle project bound to this repo, from the
 // last-good snapshot in _graphqlCache. Idle projects are never regenerated.
-function syncGithubFilesForRepo(repo, status) {
+function syncGithubFilesForRepo(repo, status, ownerTokens = new Set()) {
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
   const snapshot = _graphqlCache.get(repo) || null;
   for (const p of cfg.projects || []) {
-    if (p.repo !== repo || p.idle) continue;
+    const token = [...ownerTokens].find((candidate) => candidate?.project_id === p.id && isAdmissionCurrent(candidate));
+    if (getRepo(p.id) !== repo || p.idle || !token || !isAdmissionCurrent(token)) continue;
     writeGithubFileFromSnapshot(p.id, p.name || p.id, repo, snapshot, status);
   }
 }
@@ -2300,16 +2548,29 @@ async function fetchAllProjectsGraphQL() {
   } catch {
     return null;
   }
-  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
-  if (projects.length === 0) return null;
+  const projects = (cfg.projects || []).filter((p) => {
+    const repo = getRepo(p.id);
+    return repo && REPO_RE.test(repo) && !p.idle &&
+      _githubDemandedProjects.has(p.id) && !isProjectArchived(p.id, cfg);
+  }); // #812/#1034: skip idle, archived, and not-yet-demanded projects
+  const admissions = new Map();
+  const admittedProjects = [];
+  for (const project of projects) {
+    const admission = projectAdmission(project.id);
+    if (!admission) continue;
+    admissions.set(project.id, admission);
+    admittedProjects.push(project);
+  }
+  if (admittedProjects.length === 0) return null;
 
   // Build aliased repository fields — one per project.
   // Alias must be a valid GraphQL identifier: letters/digits/underscore only.
   const seen = new Set();
   const fragments = [];
-  for (const p of projects) {
-    const [owner, name] = p.repo.split("/");
-    const alias = p.repo.replace(/[^a-zA-Z0-9]/g, "_");
+  for (const p of admittedProjects) {
+    const repo = getRepo(p.id);
+    const [owner, name] = repo.split("/");
+    const alias = repo.replace(/[^a-zA-Z0-9]/g, "_");
     if (seen.has(alias)) continue; // skip duplicate repos
     seen.add(alias);
     fragments.push(`${alias}: repository(owner: "${owner}", name: "${name}") { ...repoFields }`);
@@ -2341,8 +2602,10 @@ fragment repoFields on Repository {
     if (!data) return null;
 
     const result = new Map();
-    for (const p of projects) {
-      const alias = p.repo.replace(/[^a-zA-Z0-9]/g, "_");
+    for (const p of admittedProjects) {
+      if (!isAdmissionCurrent(admissions.get(p.id))) continue;
+      const repo = getRepo(p.id);
+      const alias = repo.replace(/[^a-zA-Z0-9]/g, "_");
       const repoData = data[alias];
       if (!repoData) continue;
 
@@ -2409,7 +2672,7 @@ fragment repoFields on Repository {
           author: n.author ? { login: n.author.login } : null,
         }));
 
-      result.set(p.repo, { issues, prs, closedIssues, mergedPrs });
+      result.set(repo, { issues, prs, closedIssues, mergedPrs });
     }
     return result;
   } catch {
@@ -2432,14 +2695,21 @@ async function refreshGraphQLCache() {
     try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
     const seen = new Set();
     const repos = [];
+    const ownersByRepo = new Map();
     for (const p of cfg.projects || []) {
-      if (!p.repo || !REPO_RE.test(p.repo) || p.idle) continue; // #812: skip idle
-      if (seen.has(p.repo)) continue;
-      seen.add(p.repo);
-      repos.push(p.repo);
+      const repo = getRepo(p.id);
+      if (!repo || !REPO_RE.test(repo) || p.idle) continue; // #812: skip idle
+      if (!_githubDemandedProjects.has(p.id) || isProjectArchived(p.id, cfg)) continue;
+      const token = repo && projectAdmission(p.id);
+      if (!repo || !token) continue;
+      if (!ownersByRepo.has(repo)) ownersByRepo.set(repo, []);
+      ownersByRepo.get(repo).push(token);
+      if (seen.has(repo)) continue;
+      seen.add(repo);
+      repos.push(repo);
     }
     const results = await _mapLimited(repos, GH_MAX_CONCURRENT, (repo) =>
-      refreshRepoRest(repo).then((r) => ({ repo, status: r.status })),
+      refreshRepoRest(repo, ownersByRepo.get(repo)).then((r) => ({ repo, status: r.status })),
     );
 
     // #805/#806 emergency fallback: if REST could not assemble a snapshot for
@@ -2451,6 +2721,8 @@ async function refreshGraphQLCache() {
       if (gql) {
         const now = Date.now();
         for (const repo of failed) {
+          const currentOwners = ownersByRepo.get(repo) || [];
+          if (!currentOwners.some((token) => isAdmissionCurrent(token))) continue;
           const d = gql.get(repo);
           if (!d) continue;
           _graphqlCache.set(repo, { ts: now, ...d });
@@ -2655,13 +2927,34 @@ function evalBatchCompleteConfirmed(projectId, batchKey, complete, generatedAt) 
 router.get("/api/github/all", async (req, res) => {
   const projectFilter = req.query.project || "";
 
+  if (projectFilter && isProjectArchived(projectFilter)) {
+    const repo = getRepo(projectFilter);
+    return res.json({ [projectFilter]: archivedGithubLists(repo ? _graphqlCache.get(repo) : null) });
+  }
+
+  if (projectFilter) {
+    projectAdmission(projectFilter, { demand: true });
+  } else {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+      for (const project of cfg.projects || []) {
+        if (!project?.id || project.idle || isProjectArchived(project.id, cfg)) continue;
+        projectAdmission(project.id, { demand: true });
+      }
+    } catch {}
+  }
+
   // Ensure cache is populated.
   const anyStale = (() => {
     let cfg;
     try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return true; }
-    const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
+    const projects = (cfg.projects || []).filter((p) => {
+      const repo = getRepo(p.id);
+      return repo && REPO_RE.test(repo) && !p.idle &&
+        _githubDemandedProjects.has(p.id) && !isProjectArchived(p.id, cfg);
+    }); // #812/#1034: skip idle, archived, and undemanded projects
     for (const p of projects) {
-      const cached = _graphqlCache.get(p.repo);
+      const cached = _graphqlCache.get(getRepo(p.id));
       if (!cached || Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL)) return true;
     }
     return false;
@@ -2671,13 +2964,20 @@ router.get("/api/github/all", async (req, res) => {
   // Build response.
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
-  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo)); // #812: include idle projects — served stale below, never fetched
+  const projects = (cfg.projects || []).filter((p) => {
+    const repo = getRepo(p.id);
+    return repo && REPO_RE.test(repo);
+  }); // #812: include idle projects — served stale below, never fetched
 
   const result = {};
   const fallbackNeeded = [];
   for (const p of projects) {
     if (projectFilter && p.id !== projectFilter) continue;
-    const cached = _graphqlCache.get(p.repo);
+    const cached = _graphqlCache.get(getRepo(p.id));
+    if (isProjectArchived(p.id, cfg)) {
+      result[p.id] = archivedGithubLists(cached);
+      continue;
+    }
     // #812: idle (parked) project — serve last-known data flagged _idle,
     // never trigger a fetch or fall back to gh.
     if (p.idle) {
@@ -2695,7 +2995,8 @@ router.get("/api/github/all", async (req, res) => {
         _stale: Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL),
       };
     } else {
-      fallbackNeeded.push(p);
+      const admission = projectAdmission(p.id);
+      if (admission) fallbackNeeded.push({ project: p, admission });
     }
   }
 
@@ -2703,9 +3004,14 @@ router.get("/api/github/all", async (req, res) => {
   // (refreshRepoRest), NOT `gh pr list`/`gh issue list`. Concurrency-limited so
   // a cold multi-project load doesn't drain the core budget.
   if (fallbackNeeded.length > 0 && !isRateLimited()) {
-    await _mapLimited(fallbackNeeded, GH_MAX_CONCURRENT, (p) => refreshRepoRest(p.repo));
-    for (const p of fallbackNeeded) {
-      const cached = _graphqlCache.get(p.repo);
+    await _mapLimited(fallbackNeeded, GH_MAX_CONCURRENT, ({ project, admission }) => refreshRepoRest(getRepo(project.id), [admission]));
+    for (const { project: p, admission } of fallbackNeeded) {
+      const repo = getRepo(p.id);
+      const cached = repo ? _graphqlCache.get(repo) : null;
+      if (!isAdmissionCurrent(admission)) {
+        result[p.id] = archivedGithubLists(cached);
+        continue;
+      }
       result[p.id] = cached
         ? {
             issues: cached.issues,
@@ -2735,9 +3041,20 @@ async function serveGithubList(req, res, kind) {
   const cacheKey = `${kind}:${repo}`;
   const cached = _ghEndpointCache.get(cacheKey);
 
+  if (isProjectArchived(project)) {
+    res.set("X-QuadWork-Archived", "1");
+    res.set("X-QuadWork-Readonly", "1");
+    return res.json(cached ? cached.data : []);
+  }
+
   // #812: a parked (idle) project must never initiate a fetch.
   if (isProjectIdle(project)) {
     res.set("X-QuadWork-Idle", "1");
+    return res.json(cached ? cached.data : []);
+  }
+  const admission = projectAdmission(project, { demand: true });
+  if (!admission) {
+    res.set("X-QuadWork-Archived", "1");
     return res.json(cached ? cached.data : []);
   }
 
@@ -2769,12 +3086,17 @@ async function serveGithubList(req, res, kind) {
   }
   // Stale-while-revalidate: serve stale now, refresh the snapshot in background.
   if (cached) {
-    refreshRepoRest(repo);
+    refreshRepoRest(repo, [admission]);
     res.set("X-QuadWork-Stale", "1");
     return res.json(cached.data);
   }
   // Cold: assemble the snapshot synchronously, then serve this slice.
-  await refreshRepoRest(repo);
+  await refreshRepoRest(repo, [admission]);
+  if (!isAdmissionCurrent(admission)) {
+    res.set("X-QuadWork-Archived", "1");
+    const lastKnown = _ghEndpointCache.get(cacheKey);
+    return res.json(lastKnown ? lastKnown.data : []);
+  }
   const fresh = _ghEndpointCache.get(cacheKey);
   if (fresh) return res.json(fresh.data);
   return res.status(502).json({ error: "gh call failed" });
@@ -2808,7 +3130,7 @@ router.get("/api/github/merged-prs", (req, res) => serveGithubList(req, res, "me
 // Cached for 10s per project to avoid hammering gh on every poll.
 
 const _batchProgressCache = new Map(); // projectId -> { ts, data }
-const _batchProgressRefreshes = new Map(); // projectId -> Promise
+const _batchProgressRefreshes = new Map(); // projectId -> { admission, promise }
 const BATCH_TERMINAL_STATUSES = new Set(["merged", "closed"]);
 
 // #429 / quadwork#316: persistent batch snapshot on disk so the
@@ -2829,6 +3151,7 @@ function readBatchSnapshot(projectId) {
 }
 function writeBatchSnapshot(projectId, snapshot) {
   try {
+    if (isProjectArchived(projectId)) return;
     const p = batchSnapshotPath(projectId);
     ensureSecureDir(path.dirname(p));
     fs.writeFileSync(p, JSON.stringify(snapshot));
@@ -2838,6 +3161,7 @@ function writeBatchSnapshot(projectId, snapshot) {
 }
 function deleteBatchSnapshot(projectId) {
   try {
+    if (isProjectArchived(projectId)) return;
     fs.unlinkSync(batchSnapshotPath(projectId));
   } catch {
     // Non-fatal — file may already be gone.
@@ -3422,12 +3746,21 @@ async function findClosingPrByTimeline(repo, issueNumber) {
 // issue/PR endpoints + Search/title convention + native issue timeline
 // close-link — zero `gh issue view` / `gh pr view` (GraphQL). Bucket mapping
 // matches progressFromSnapshot exactly.
-async function progressForItemRest(repo, issueNumber) {
+async function progressForItemRest(repo, issueNumber, stillCurrent = () => true, deps = {}) {
+  const execJson = deps.ghJsonExecAsync || ghJsonExecAsync;
+  const stopIfRevoked = () => {
+    if (stillCurrent()) return;
+    const error = new Error("project admission revoked");
+    error.code = "project_admission_revoked";
+    throw error;
+  };
+  stopIfRevoked();
   // Load-bearing call: the issue's own state via REST. If gh can't read it at
   // all (404, network, auth, timeout) we can't compute a meaningful row — let
   // the rejection propagate to the route, which (#943) renders a soft "queued
   // (retrying)" row instead of emitting a misleading "queued"/"merged" entry.
-  const raw = await ghJsonExecAsync(["api", `repos/${repo}/issues/${issueNumber}`]);
+  const raw = await execJson(["api", `repos/${repo}/issues/${issueNumber}`]);
+  stopIfRevoked();
   const issue = {
     number: raw.number,
     title: raw.title,
@@ -3439,14 +3772,22 @@ async function progressForItemRest(repo, issueNumber) {
   // flap to "queued (retrying)" — terminal-ness comes from the issue state.
   let prNumber = null;
   try {
-    prNumber = await findLinkedPrByTitle(repo, issueNumber, _searchLinkedPrItems, { issueState: issue.state });
+    stopIfRevoked();
+    const search = deps.searchLinkedPrItems || _searchLinkedPrItems;
+    prNumber = await findLinkedPrByTitle(repo, issueNumber, search, { issueState: issue.state });
+    stopIfRevoked();
   } catch (err) {
+    if (err?.code === "project_admission_revoked") throw err;
     if (issue.state !== "CLOSED") throw err;
   }
   if (prNumber == null && issue.state === "CLOSED") {
     try {
-      prNumber = await findClosingPrByTimeline(repo, issueNumber);
+      stopIfRevoked();
+      const events = await execJson(["api", `repos/${repo}/issues/${issueNumber}/timeline?per_page=100`]);
+      stopIfRevoked();
+      prNumber = pickClosingPrFromTimeline(events);
     } catch {
+      stopIfRevoked();
       // Degrade below to Closed (no PR) ✓. The item is still terminal.
     }
   }
@@ -3461,8 +3802,11 @@ async function progressForItemRest(repo, issueNumber) {
   // than dropping the whole item to "fetch failed".
   let prData = null;
   try {
-    prData = await ghJsonExecAsync(["api", `repos/${repo}/pulls/${prNumber}`]);
+    stopIfRevoked();
+    prData = await execJson(["api", `repos/${repo}/pulls/${prNumber}`]);
+    stopIfRevoked();
   } catch {
+    stopIfRevoked();
     // soft fall-through to the in_review row below
   }
   if (!prData) {
@@ -3479,7 +3823,9 @@ async function progressForItemRest(repo, issueNumber) {
   }
   let reviews = [];
   try {
-    const rv = await ghJsonExecAsync(["api", `repos/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
+    stopIfRevoked();
+    const rv = await execJson(["api", `repos/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
+    stopIfRevoked();
     reviews = mapReviews(Array.isArray(rv) ? rv : []);
   } catch {
     // soft — reviews stay [], so the row degrades to in_review, never "failed"
@@ -3617,6 +3963,9 @@ router.get("/api/github-parsed", (req, res) => {
 // sidebar polls share the work via the BATCH_PROGRESS_TTL_MS cache.
 async function getOrComputeBatchProgress(projectId) {
   const cached = _batchProgressCache.get(projectId);
+  if (isProjectArchived(projectId)) {
+    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
+  }
   // #812: parked (idle) project — never run batch-progress gh/GraphQL calls,
   // and ALWAYS flag the payload _idle (even on a fresh cache hit), so the
   // endpoint contract is consistent regardless of cache freshness. This must
@@ -3643,29 +3992,38 @@ async function getOrComputeBatchProgress(projectId) {
 
   const repo = getRepo(projectId);
   if (!repo) return null;
+  const admission = projectAdmission(projectId, { demand: true });
+  if (!admission) {
+    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
+  }
   if (cached) {
-    startBatchProgressRefresh(projectId, repo);
+    startBatchProgressRefresh(projectId, repo, admission);
     return { ...cached.data, _stale: true, _refreshing: true };
   }
 
-  return computeBatchProgress(projectId, repo);
+  return computeBatchProgress(projectId, repo, admission);
 }
 
-function startBatchProgressRefresh(projectId, repo) {
-  if (_batchProgressRefreshes.has(projectId)) return _batchProgressRefreshes.get(projectId);
-  const refresh = computeBatchProgress(projectId, repo)
+function startBatchProgressRefresh(projectId, repo, admission) {
+  const existing = _batchProgressRefreshes.get(projectId);
+  if (existing && isAdmissionCurrent(existing.admission)) return existing.promise;
+  const entry = { admission, promise: null };
+  entry.promise = computeBatchProgress(projectId, repo, admission)
     .catch(() => {
       // Non-fatal: callers already received the last good payload. The next poll
       // will retry rather than turning a transient gh/GitHub failure into UI lag.
     })
     .finally(() => {
-      _batchProgressRefreshes.delete(projectId);
+      if (_batchProgressRefreshes.get(projectId) === entry) _batchProgressRefreshes.delete(projectId);
     });
-  _batchProgressRefreshes.set(projectId, refresh);
-  return refresh;
+  _batchProgressRefreshes.set(projectId, entry);
+  return entry.promise;
 }
 
-async function computeBatchProgress(projectId, repo) {
+async function computeBatchProgress(projectId, repo, admission = projectAdmission(projectId, { demand: true })) {
+  if (!admission || !isAdmissionCurrent(admission)) {
+    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
+  }
   const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
   let queueText = "";
   let queueReadOk = false;
@@ -3711,6 +4069,9 @@ async function computeBatchProgress(projectId, repo) {
     const existing = readBatchSnapshot(projectId);
     if (existing && Array.isArray(existing.issueNumbers) && existing.issueNumbers.length > 0) {
       const freshness = await checkBatchSnapshotFreshness(repo, existing);
+      if (!isAdmissionCurrent(admission)) {
+        return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
+      }
       if (freshness === "gone") deleteBatchSnapshot(projectId);
       // "unknown" → leave the file alone; transient failure will
       // retry on the next cache miss.
@@ -3776,12 +4137,13 @@ async function computeBatchProgress(projectId, repo) {
   let items;
   if (snapshot) {
     items = await _mapLimited(issueNumbers, GH_MAX_CONCURRENT, async (n) => {
+      if (!isAdmissionCurrent(admission)) return softRetryingRow(n);
       const fromSnap = progressFromSnapshot(snapshot, n);
       if (fromSnap) return fromSnap;
       const fromTerminalCache = terminalRows.get(n);
       if (fromTerminalCache && !snapshotHasOpenIssue(snapshot, n)) return fromTerminalCache;
       try {
-        return await progressForItemRest(repo, n);
+        return await progressForItemRest(repo, n, () => isAdmissionCurrent(admission));
       } catch {
         return softRetryingRow(n); // #943: transient (secondary rate-limit/network) → soft
       }
@@ -3792,6 +4154,9 @@ async function computeBatchProgress(projectId, repo) {
     // firm up next cycle once _graphqlCache repopulates.
     const parsed = loadGithubParsed(projectId);
     items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || terminalRows.get(n) || softRetryingRow(n));
+  }
+  if (!isAdmissionCurrent(admission)) {
+    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _archived: true, _readonly: true };
   }
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
@@ -4399,6 +4764,9 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
   const projectId = req.params.project;
   const body = req.body || {};
   const force = body.force === true;
+  let admission;
+  try { admission = captureProjectAdmission(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
   catch { return res.status(500).json({ ok: false, error: "Failed to read config" }); }
@@ -4440,6 +4808,10 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
         batchActive: true,
       });
     }
+  }
+
+  if (!isAdmissionCurrent(admission)) {
+    return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
   }
 
   let result;
@@ -4627,6 +4999,8 @@ async function autoReseedOnStartup(cfg, opts = {}) {
   const getProgress = opts.getProgress || getOrComputeBatchProgress;
   const isActiveFromProgress = opts.isActiveFromProgress || isBatchActiveFromProgress;
   const performWrites = opts.performWrites || _performReseedWrites;
+  const captureAdmission = opts.captureAdmission || ((projectId) => projectAdmission(projectId));
+  const admissionCurrent = opts.admissionCurrent || ((token) => isAdmissionCurrent(token));
   // #915: `periodic` = invoked from the recurring retry tick, not boot. A
   // still-deferred project is expected on every tick until its batch clears, so
   // suppress the BENIGN active-batch deferral log there (it would spam) —
@@ -4666,6 +5040,14 @@ async function autoReseedOnStartup(cfg, opts = {}) {
       continue;
     }
 
+    let admission = null;
+    try { admission = captureAdmission(project.id); } catch {}
+    if (!admission) {
+      clearStuckStreak(project.id);
+      decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
+      continue;
+    }
+
     // Fail-closed batch gate, same contract as the manual /reseed-agents
     // route (#853): a throw OR a null result both mean "we cannot prove the
     // batch is idle, so we MUST defer rather than risk mid-batch instruction
@@ -4693,6 +5075,11 @@ async function autoReseedOnStartup(cfg, opts = {}) {
     // active === false: batch state is definitively known/idle — no longer
     // error-deferred, so clear any stuck-streak before attempting the reseed.
     clearStuckStreak(project.id);
+
+    if (!admissionCurrent(admission)) {
+      decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
+      continue;
+    }
 
     let result;
     try {
@@ -4849,6 +5236,22 @@ function resolveToken(value) {
   return value;
 }
 
+function cacheBridgeBotUsername(projectId, bridgeKey, expectedToken, username, admission) {
+  if (!isAdmissionCurrent(admission)) return false;
+  let committed = false;
+  try {
+    updateConfig((fresh) => {
+      const current = fresh.projects?.find((entry) => entry.id === projectId);
+      const bridge = current?.[bridgeKey];
+      if (!current || current.archived || !bridge || bridge.bot_token !== expectedToken ||
+          !isAdmissionCurrent(admission)) return;
+      bridge.bot_username = username;
+      committed = true;
+    });
+  } catch {}
+  return committed;
+}
+
 function envKeyForProject(projectId) {
   return `TELEGRAM_BOT_TOKEN_${projectId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
 }
@@ -4870,6 +5273,10 @@ function getProjectTelegram(projectId) {
 router.get("/api/telegram", async (req, res) => {
   const projectId = req.query.project || "";
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const admission = projectAdmission(projectId);
+  if (!admission) {
+    return res.json({ running: false, configured: false, chat_id: "", bot_username: "", bridge_installed: true, last_error: "", archived: true });
+  }
   // #211: expose whether credentials are configured + the chat_id
   // and the bot's @username (fetched from Telegram's getMe, cached
   // on the project entry). Never returns the raw bot token.
@@ -4877,10 +5284,9 @@ router.get("/api/telegram", async (req, res) => {
   let chatId = "";
   let botUsername = "";
   let bridgeInstalled = false;
-  let cfg = null;
   let project = null;
   try {
-    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     project = cfg.projects?.find((p) => p.id === projectId) || null;
     if (project?.telegram?.bot_token && project?.telegram?.chat_id) {
       configured = true;
@@ -4889,16 +5295,16 @@ router.get("/api/telegram", async (req, res) => {
     }
     bridgeInstalled = true;
   } catch {}
-  if (configured && !botUsername && project?.telegram?.bot_token && cfg) {
+  if (configured && !botUsername && project?.telegram?.bot_token) {
     try {
-      const resolved = resolveToken(project.telegram.bot_token);
+      const expectedToken = project.telegram.bot_token;
+      const resolved = resolveToken(expectedToken);
       if (resolved) {
         const r = await fetch(`https://api.telegram.org/bot${resolved}/getMe`);
         const data = await r.json();
-        if (data && data.ok && data.result && typeof data.result.username === "string") {
+        if (data && data.ok && data.result && typeof data.result.username === "string" &&
+            cacheBridgeBotUsername(projectId, "telegram", expectedToken, data.result.username, admission)) {
           botUsername = data.result.username;
-          project.telegram.bot_username = botUsername;
-          try { writeConfig(cfg); } catch {}
         }
       }
     } catch {}
@@ -4918,6 +5324,11 @@ router.get("/api/telegram", async (req, res) => {
 router.post("/api/telegram", async (req, res) => {
   const action = req.query.action;
   const body = req.body || {};
+
+  if (body.project_id && action !== "stop") {
+    try { assertProjectAdmitted(body.project_id); }
+    catch (err) { return sendProjectLifecycleException(res, err, body.project_id); }
+  }
 
   switch (action) {
     case "test": {
@@ -4939,6 +5350,8 @@ router.post("/api/telegram", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      const admission = projectAdmission(projectId);
+      if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
       if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
@@ -4946,6 +5359,14 @@ router.post("/api/telegram", async (req, res) => {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
         await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort);
+        if (!isAdmissionCurrent(admission)) {
+          const stopped = await telegramBridge.stop(projectId);
+          if (stopped?.ok !== true) {
+            const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
+          }
+          return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId, cleanup_errors: stopped?.cleanup_errors || [] });
+        }
         emitSystemMessage(projectId, "Telegram bridge connected");
         return res.json({ ok: true, running: true });
       } catch (err) {
@@ -4956,15 +5377,22 @@ router.post("/api/telegram", async (req, res) => {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
       try {
-        telegramBridge.stop(projectId);
-        emitSystemMessage(projectId, "Telegram bridge disconnected");
-        return res.json({ ok: true, running: false });
+        const stopped = await telegramBridge.stop(projectId);
+        if (stopped?.ok !== true) {
+          const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
+        }
+        if (!isProjectArchived(projectId)) emitSystemMessage(projectId, "Telegram bridge disconnected");
+        return res.json({ ...stopped, ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
       }
     }
-    case "status":
-      return res.json({ running: telegramBridge.isRunning(body.project_id || "") });
+    case "status": {
+      const projectId = body.project_id || "";
+      if (projectId && isProjectArchived(projectId)) return res.json({ running: false, archived: true });
+      return res.json({ running: telegramBridge.isRunning(projectId) });
+    }
     case "save-token": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
@@ -5043,6 +5471,10 @@ function getProjectDiscord(projectId) {
 router.get("/api/discord", async (req, res) => {
   const projectId = req.query.project || "";
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const admission = projectAdmission(projectId);
+  if (!admission) {
+    return res.json({ running: false, configured: false, channel_id: "", bot_username: "", bridge_installed: true, last_error: "", archived: true });
+  }
   let configured = false;
   let channelId = "";
   let botUsername = "";
@@ -5064,10 +5496,9 @@ router.get("/api/discord", async (req, res) => {
             headers: { Authorization: `Bot ${resolved}` },
           });
           const data = await r.json();
-          if (r.ok && data.username) {
+          if (r.ok && data.username &&
+              cacheBridgeBotUsername(projectId, "discord", project.discord.bot_token, data.username, admission)) {
             botUsername = data.username;
-            project.discord.bot_username = botUsername;
-            try { writeConfig(cfg); } catch {}
           }
         }
       } catch {}
@@ -5088,6 +5519,11 @@ router.get("/api/discord", async (req, res) => {
 router.post("/api/discord", async (req, res) => {
   const action = req.query.action;
   const body = req.body || {};
+
+  if (body.project_id && action !== "stop") {
+    try { assertProjectAdmitted(body.project_id); }
+    catch (err) { return sendProjectLifecycleException(res, err, body.project_id); }
+  }
 
   switch (action) {
     case "test": {
@@ -5114,6 +5550,8 @@ router.post("/api/discord", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      const admission = projectAdmission(projectId);
+      if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
       if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const dc = getProjectDiscord(projectId);
       if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
@@ -5121,6 +5559,10 @@ router.post("/api/discord", async (req, res) => {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
         await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort);
+        if (!isAdmissionCurrent(admission)) {
+          const stopped = await discordBridge.stop(projectId);
+          return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId, cleanup_errors: stopped?.cleanup_errors || [] });
+        }
         emitSystemMessage(projectId, "Discord bridge connected");
         return res.json({ ok: true, running: true });
       } catch (err) {
@@ -5131,15 +5573,22 @@ router.post("/api/discord", async (req, res) => {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
       try {
-        discordBridge.stop(projectId);
-        emitSystemMessage(projectId, "Discord bridge disconnected");
-        return res.json({ ok: true, running: false });
+        const stopped = await discordBridge.stop(projectId);
+        if (stopped?.ok !== true) {
+          const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId) });
+        }
+        if (!isProjectArchived(projectId)) emitSystemMessage(projectId, "Discord bridge disconnected");
+        return res.json({ ...stopped, ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
       }
     }
-    case "status":
-      return res.json({ running: discordBridge.isRunning(body.project_id || "") });
+    case "status": {
+      const projectId = body.project_id || "";
+      if (projectId && isProjectArchived(projectId)) return res.json({ running: false, archived: true });
+      return res.json({ running: discordBridge.isRunning(projectId) });
+    }
     case "save-config": {
       const projectId = body.project_id;
       const bot_token = typeof body.bot_token === "string" ? body.bot_token.trim() : "";
@@ -5376,3 +5825,10 @@ module.exports.repoSlugFromRemote = repoSlugFromRemote;
 // #827: expose the GITHUB.md writer for the idle-no-op regression test. No
 // production callers outside this file.
 module.exports.writeGithubFileFromSnapshot = writeGithubFileFromSnapshot;
+// #1034: lifecycle cleanup contract consumed by project-lifecycle wiring, plus
+// narrow observability hooks for the admission/ownership regression fixture.
+module.exports.cancelProjectBackground = cancelProjectBackground;
+module.exports.refreshRepoRest = refreshRepoRest;
+module.exports._restRefreshing = _restRefreshing;
+module.exports._githubDemandedProjects = _githubDemandedProjects;
+module.exports.shouldPublishProjectsCache = shouldPublishProjectsCache;

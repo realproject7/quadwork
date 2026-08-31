@@ -31,7 +31,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const {
-  autoReseedOnStartup,
+  autoReseedOnStartup: autoReseedOnStartupRaw,
   _loadReseedState,
   _saveReseedState,
   _readPackageVersion,
@@ -39,6 +39,12 @@ const {
   _periodicDeferStreak,
   PERIODIC_DEFER_LOG_EVERY,
 } = require("./routes");
+
+const autoReseedOnStartup = (cfg, options = {}) => autoReseedOnStartupRaw(cfg, {
+  captureAdmission: (projectId) => ({ project_id: projectId, generation: 0 }),
+  admissionCurrent: () => true,
+  ...options,
+});
 
 function tmp(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `qw-856-${label}-`));
