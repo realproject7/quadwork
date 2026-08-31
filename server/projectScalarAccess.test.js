@@ -1409,8 +1409,6 @@ const EXPECTED_PRE_ACTIVATION_LEDGER = Object.freeze({
   "server/routes.js :: owner=post(\"/api/projects/:project/reseed-agents\")#arg1 :: call=post(\"/api/projects/:project/reseed-agents\")#arg1 :: binding=project :: working_dir:property :: at=8aff8d1c3cdd#142:const workingDir = project.working_dir;": 1,
   "server/routes.js :: owner=post(\"/api/rename\")#arg1 :: call=post(\"/api/rename\")#arg1 :: binding=project :: working_dir:property :: at=204b9f7500f3#77:const workDir = project.working_dir || \"\";": 1,
   "src/components/HomeDashboard.tsx :: owner=HomeDashboard :: call=HomeDashboard > map()#arg0 :: binding=project :: repo:property :: at=959278b1fae5#226:return ( <div className=\"h-full overflow-y-auto lg:overf": 1,
-  "src/components/QueueManager.tsx :: owner=QueueManager :: call=QueueManager > useEffect()#arg0 > then()#arg0 :: binding=project :: repo:optional-property :: at=80cac6e2afec#32:if (project?.repo) setRepo(project.repo);": 1,
-  "src/components/QueueManager.tsx :: owner=QueueManager :: call=QueueManager > useEffect()#arg0 > then()#arg0 :: binding=project :: repo:property :: at=dae063fd2fe3#39:setRepo(project.repo);": 1,
   "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: repo:property :: at=8437f5a87eb7#202:return ( <div key={project.id} className=\"border border-": 1,
   "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: working_dir:property :: at=8437f5a87eb7#236:return ( <div key={project.id} className=\"border border-": 1,
 });
