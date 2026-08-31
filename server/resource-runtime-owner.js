@@ -24,7 +24,9 @@ const OBSERVATION_TIMEOUT_MS = 1_000;
 const OWNER_STATE = new WeakMap();
 const OWNER_ATTESTATIONS = new WeakMap();
 const SOURCE_RUNTIME_SNAPSHOT = ResourceRuntimeService.prototype.snapshot;
+const SOURCE_STATE_LOAD = ResourceStateStore.prototype.load;
 const SOURCE_STATE_SAVE = ResourceStateStore.prototype.save;
+const SOURCE_STATE_SNAPSHOT = ResourceStateStore.prototype.snapshot;
 
 class ResourceRuntimeOwnerError extends Error {
   constructor(code, message) {
@@ -199,9 +201,19 @@ class ResourceRuntimeOwner {
         fsImpl,
         terminalFactLimit: DEFAULT_TERMINAL_FACT_LIMIT,
       });
+      // Source load/save historically dispatch through `this.snapshot()`. Pin
+      // that internal edge on the fresh private instance before either method
+      // runs so later prototype replacement cannot inject a Promise/result.
+      Object.defineProperty(stateStore, "snapshot", {
+        value: () => Reflect.apply(SOURCE_STATE_SNAPSHOT, stateStore, []),
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      });
       // Durable state is read exactly once during owner construction. Runtime
       // GETs never touch the state path.
-      persistedEvidence = evidenceOnly(stateStore.load());
+      Reflect.apply(SOURCE_STATE_LOAD, stateStore, []);
+      persistedEvidence = evidenceOnly(Reflect.apply(SOURCE_STATE_SNAPSHOT, stateStore, []));
     } catch {
       stateStore = null;
     }
@@ -260,15 +272,15 @@ class ResourceRuntimeOwner {
       throw persistenceError("QW_RESOURCE_PERSISTENCE_UNAVAILABLE");
     }
     const input = arguments.length === 0 ? this.snapshot() : snapshot;
-    let saved;
     try {
-      saved = Reflect.apply(SOURCE_STATE_SAVE, state.stateStore, [input]);
+      Reflect.apply(SOURCE_STATE_SAVE, state.stateStore, [input]);
     } catch {
       throw persistenceError("QW_RESOURCE_PERSISTENCE_FAILED");
     }
     let canonical;
     try {
-      canonical = createResourceSnapshot(saved, { terminalFactLimit: DEFAULT_TERMINAL_FACT_LIMIT });
+      const sourceSnapshot = Reflect.apply(SOURCE_STATE_SNAPSHOT, state.stateStore, []);
+      canonical = createResourceSnapshot(sourceSnapshot, { terminalFactLimit: DEFAULT_TERMINAL_FACT_LIMIT });
       state.persistedEvidence = evidenceOnly(canonical);
     } catch {
       throw persistenceError("QW_RESOURCE_PERSISTENCE_FAILED");

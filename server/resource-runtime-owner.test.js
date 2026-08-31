@@ -9,6 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { CONFIG_PATH } = require("./config");
 const { DEFAULT_RUNTIME_RESOURCE_PROPOSAL } = require("./resource-policy");
+const { ResourceStateStore } = require("./resource-state");
 const {
   OBSERVATION_TIMEOUT_MS,
   ResourceRuntimeOwner,
@@ -355,6 +356,59 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
   } finally {
     process.removeListener("unhandledRejection", listener);
     fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+
+  // Source store methods were captured before this prototype sabotage. The
+  // fresh instance pins its own source snapshot closure, so neither load nor
+  // save can dispatch into these hostile replacements.
+  const patchedHome = fs.mkdtempSync(path.join(os.tmpdir(), "qw-owner-store-prototype-"));
+  fs.mkdirSync(path.join(patchedHome, ".quadwork"), { mode: 0o700 });
+  const patchedFacts = {};
+  const patchedFs = makeFs(policy(), patchedFacts);
+  patchedFs.setStatePath(resourceStateFilePath(patchedHome));
+  const originalLoad = ResourceStateStore.prototype.load;
+  const originalSave = ResourceStateStore.prototype.save;
+  const originalStoreSnapshot = ResourceStateStore.prototype.snapshot;
+  const patchedCalls = { load: 0, save: 0, snapshot: 0 };
+  const patchedUnhandled = [];
+  const patchedListener = (reason) => patchedUnhandled.push(reason);
+  process.on("unhandledRejection", patchedListener);
+  try {
+    ResourceStateStore.prototype.load = function hostileLoad() {
+      patchedCalls.load += 1;
+      return Promise.reject(new Error("PRIVATE patched load /private/state"));
+    };
+    ResourceStateStore.prototype.save = function hostileSave() {
+      patchedCalls.save += 1;
+      return Promise.reject(new Error("PRIVATE patched save /private/state"));
+    };
+    ResourceStateStore.prototype.snapshot = function hostileSnapshot() {
+      patchedCalls.snapshot += 1;
+      return Promise.reject(new Error("PRIVATE patched snapshot /private/state"));
+    };
+
+    const owner = createResourceRuntimeOwner({
+      fsImpl: patchedFs,
+      execFileSyncImpl: unavailableExec(patchedFacts),
+      homeDir: patchedHome,
+      createRuntimeService() { throw new Error("PRIVATE legacy service"); },
+      createStateStore() { throw new Error("PRIVATE legacy store"); },
+    });
+    const snapshot = owner.snapshot();
+    const saved = owner.persist(snapshot);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(patchedCalls, { load: 0, save: 0, snapshot: 0 });
+    assert.deepEqual(patchedUnhandled, []);
+    assert.equal(saved.status, snapshot.status);
+    assert.equal(patchedFacts.stateRenames, 1, "captured source save commits exactly once");
+    assert.equal(JSON.stringify(saved).includes("PRIVATE"), false);
+  } finally {
+    ResourceStateStore.prototype.load = originalLoad;
+    ResourceStateStore.prototype.save = originalSave;
+    ResourceStateStore.prototype.snapshot = originalStoreSnapshot;
+    process.removeListener("unhandledRejection", patchedListener);
+    fs.rmSync(patchedHome, { recursive: true, force: true });
   }
 
   // Production composition is owned by index: construct once, then register

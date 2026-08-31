@@ -333,7 +333,66 @@ function assertUnavailable(response, expectedStatus = 503, expectedCode = "QW_RE
     () => registerResourceHttp(app, missingConfigOwner()),
     (error) => error.code === "QW_RESOURCE_HTTP_ALREADY_REGISTERED",
   );
-  assert.throws(() => registerResourceHttp({}, owner), /app\.get must be a function/);
+  assert.throws(() => registerResourceHttp({}, missingConfigOwner()), /app\.get must be a function/);
+}
+
+// app.get may synchronously reenter registration. The pending reservation is
+// visible before the external call, so the same pair receives the exact outer
+// handler and conflicting owner/app pairs are refused without another mount.
+{
+  const owner = missingConfigOwner();
+  const otherOwner = missingConfigOwner();
+  const otherApp = fakeApp();
+  let mounts = 0;
+  let reentrantHandler = null;
+  const app = {
+    get(routePath, handler) {
+      mounts += 1;
+      assert.equal(routePath, RESOURCE_HTTP_PATH);
+      reentrantHandler = registerResourceHttp(app, owner);
+      assert.equal(reentrantHandler, handler);
+      assert.throws(
+        () => registerResourceHttp(otherApp, owner),
+        (error) => error.code === "QW_RESOURCE_HTTP_ALREADY_REGISTERED",
+      );
+      assert.throws(
+        () => registerResourceHttp(app, otherOwner),
+        (error) => error.code === "QW_RESOURCE_HTTP_ALREADY_REGISTERED",
+      );
+    },
+  };
+  const outerHandler = registerResourceHttp(app, owner);
+  assert.equal(outerHandler, reentrantHandler);
+  assert.equal(registerResourceHttp(app, owner), outerHandler);
+  assert.equal(mounts, 1);
+}
+
+// A throwing mount removes only its exact pending owner/app reservations. The
+// next clean retry installs once and then becomes idempotent.
+{
+  const owner = missingConfigOwner();
+  let calls = 0;
+  let shouldThrow = true;
+  let failedHandler = null;
+  const app = {
+    get(_routePath, handler) {
+      calls += 1;
+      if (shouldThrow) {
+        failedHandler = handler;
+        assert.equal(registerResourceHttp(app, owner), handler);
+        throw new Error("PRIVATE mount failure /private/express");
+      }
+    },
+  };
+  assert.throws(
+    () => registerResourceHttp(app, owner),
+    (error) => error.message === "PRIVATE mount failure /private/express",
+  );
+  shouldThrow = false;
+  const installed = registerResourceHttp(app, owner);
+  assert.notEqual(installed, failedHandler, "failed pending handler is not reused");
+  assert.equal(registerResourceHttp(app, owner), installed);
+  assert.equal(calls, 2, "one failed attempt plus one successful mount");
 }
 
 // The public registrar cannot brand arbitrary providers or owner lookalikes.

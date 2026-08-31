@@ -467,8 +467,6 @@ function registrationError() {
 }
 
 function registerResourceHttp(app, runtimeOwner) {
-  const get = dataMethod(app, "get");
-  if (get === null) throw new TypeError("app.get must be a function");
   // Owner attestation is minted only after the owner module recognizes its
   // private WeakMap state. Plain lookalikes, functions, and proxies cannot turn
   // the exported registrar into a publisher-brand oracle.
@@ -478,14 +476,31 @@ function registerResourceHttp(app, runtimeOwner) {
     if (existing.app !== app) throw registrationError();
     return existing.handler;
   }
-  const appOwner = RESOURCE_HTTP_APPS.get(app);
-  if (appOwner && appOwner !== runtimeOwner) throw registrationError();
+  const appRegistration = RESOURCE_HTTP_APPS.get(app);
+  if (appRegistration && appRegistration.owner !== runtimeOwner) throw registrationError();
+
+  const get = dataMethod(app, "get");
+  if (get === null) throw new TypeError("app.get must be a function");
 
   const publisher = createResourceHttpPublisher(ownerAttestation);
   const handler = createResourceHttpHandler(publisher);
-  Reflect.apply(get, app, [RESOURCE_HTTP_PATH, handler]);
-  RESOURCE_HTTP_REGISTRATIONS.set(runtimeOwner, Object.freeze({ app, handler }));
-  RESOURCE_HTTP_APPS.set(app, runtimeOwner);
+  const registration = { owner: runtimeOwner, app, handler, status: "pending" };
+  // Reserve both identities before invoking caller-owned Express code. A
+  // same-pair reentrant call observes and returns this exact pending handler;
+  // every conflicting pair fails without a second mount.
+  RESOURCE_HTTP_REGISTRATIONS.set(runtimeOwner, registration);
+  RESOURCE_HTTP_APPS.set(app, registration);
+  try {
+    Reflect.apply(get, app, [RESOURCE_HTTP_PATH, handler]);
+  } catch (error) {
+    if (RESOURCE_HTTP_REGISTRATIONS.get(runtimeOwner) === registration) {
+      RESOURCE_HTTP_REGISTRATIONS.delete(runtimeOwner);
+    }
+    if (RESOURCE_HTTP_APPS.get(app) === registration) RESOURCE_HTTP_APPS.delete(app);
+    throw error;
+  }
+  registration.status = "installed";
+  Object.freeze(registration);
   return handler;
 }
 
