@@ -404,6 +404,27 @@ process.on("exit", cleanup);
   liveB.discord_auto = true;
   fs.writeFileSync(configPath, JSON.stringify(liveCfg));
 
+  const liveAuthorityFetch = global.fetch;
+  const liveAuthorityValidation = routes.validateCurrentOwnedAssignment;
+  const liveAuthorityUrls = [];
+  routes.validateCurrentOwnedAssignment = () => ({ ok: true, manual: false });
+  global.fetch = async (url) => {
+    liveAuthorityUrls.push(String(url));
+    if (String(url).includes("/api/batch-progress")) return { ok: true, json: async () => ownedProgress };
+    if (String(url).includes("/api/batch-active")) return { ok: true, json: async () => ownedActive };
+    if (String(url).includes("/api/chat")) return { ok: true };
+    throw new Error(`unexpected trigger URL: ${url}`);
+  };
+  try {
+    const sentWithAuthority = await runtime.sendTriggerMessage("b");
+    assert.equal(sentWithAuthority.sent, true);
+    assert.equal(liveAuthorityUrls.filter((url) => url.includes("/api/chat")).length, 1,
+      "an exact live owned assignment still permits one trigger_auto worker wake");
+  } finally {
+    global.fetch = liveAuthorityFetch;
+    routes.validateCurrentOwnedAssignment = liveAuthorityValidation;
+  }
+
   const authorityFetch = global.fetch;
   let authorityFetches = 0;
   global.fetch = async (url) => {
