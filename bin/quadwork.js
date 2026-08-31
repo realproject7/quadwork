@@ -6,7 +6,7 @@ const path = require("path");
 const os = require("os");
 const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
-const { readRuntimeResources } = require("../server/config");
+const { readRuntimeResources, commitV2Configuration } = require("../server/config");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const { configureServiceTempEnvironment } = require("../server/resource-service-env");
 const {
@@ -805,10 +805,20 @@ function writeQuadWorkConfig(setup) {
   const project = {
     id: setup.projectName,
     name: setup.projectName,
-    repo: setup.repo,
-    working_dir: setup.absDir,
     agents: {},
   };
+  const activated = typeof config.installation_id === "string";
+  if (activated) {
+    project.repositories = [{
+      key: "primary",
+      repo: setup.repo,
+      working_dir: setup.absDir,
+      primary: true,
+    }];
+  } else {
+    project.repo = setup.repo;
+    project.working_dir = setup.absDir;
+  }
 
   for (const agent of AGENTS) {
     const cmd = (setup.backends && setup.backends[agent]) || setup.backend;
@@ -832,18 +842,29 @@ function writeQuadWorkConfig(setup) {
   // All new projects use file-based chat (AC is deprecated).
   project.chat_mode = "file";
 
-  const existingIdx = config.projects.findIndex((p) => p.id === setup.projectName);
-
   // Batch 25 / #204: seed the per-project OVERNIGHT-QUEUE.md at
   // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md. Idempotent — if the file
   // already exists, preserve the user's / Head agent's edits.
   writeOvernightQueueFile(setup.projectName, setup.repo);
 
-  // Upsert project
-  if (existingIdx >= 0) config.projects[existingIdx] = project;
-  else config.projects.push(project);
-
-  writeConfig(config);
+  if (activated) {
+    // Re-enter the shared fresh-read/validate/atomic-write boundary instead of
+    // publishing the wizard's stale whole-document snapshot. In particular,
+    // replacing an archived project would be a true→active transition and is
+    // rejected without the server lifecycle's cleanup reservation token, even
+    // though this CLI is a separate process.
+    commitV2Configuration((fresh) => {
+      if (typeof fresh.operator_name !== "string") fresh.operator_name = "user";
+      const existingIdx = fresh.projects.findIndex((entry) => entry.id === setup.projectName);
+      if (existingIdx >= 0) fresh.projects[existingIdx] = project;
+      else fresh.projects.push(project);
+    });
+  } else {
+    const existingIdx = config.projects.findIndex((entry) => entry.id === setup.projectName);
+    if (existingIdx >= 0) config.projects[existingIdx] = project;
+    else config.projects.push(project);
+    writeConfig(config);
+  }
   ok(`Wrote ${CONFIG_PATH}`);
 }
 
@@ -1667,4 +1688,5 @@ module.exports = {
   renderResourceInstall,
   runResourceInstallCommand,
   runResourcesCommand,
+  writeQuadWorkConfig,
 };
