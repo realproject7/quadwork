@@ -1181,26 +1181,58 @@ async function cmdCleanup() {
 
 const RESOURCE_PREFLIGHT_USAGE = "Usage: quadwork resources preflight [--json]";
 
+function renderBooleanFact(value) {
+  if (value === true) return "yes";
+  if (value === false) return "no";
+  return "unavailable";
+}
+
+function renderIntegerFact(value, suffix = "", allowNegative = false) {
+  return Number.isSafeInteger(value) && (allowNegative || value >= 0) ? `${value}${suffix}` : "unavailable";
+}
+
+function renderOomPolicy(value) {
+  return value === "continue" || value === "unverified" ? value : "unavailable";
+}
+
 function renderResourcePreflight(report) {
+  const policy = report.policy || {};
+  const host = report.host || {};
+  const containment = report.containment || {};
+  const temp = report.temp || {};
+  const api = report.api || {};
+  const scopes = report.scopes || {};
+  const capacity = report.capacity || {};
+  const mib = (value) => renderIntegerFact(value, " MiB");
+  const signedMib = (value) => renderIntegerFact(value, " MiB", true);
   const lines = [
     "QuadWork resource preflight",
     "===========================",
     `Status: ${report.ok ? "PASS" : "FAIL"}`,
     `Primary reason: ${report.reason}`,
-    `Policy configured: ${report.policy && report.policy.configured === true ? "yes" : "no"}`,
+    `Policy configured: ${renderBooleanFact(policy.configured)}`,
+    `Configured API limits: low ${mib(policy.apiMemoryLowMib)}; max ${mib(policy.apiMemoryMaxMib)}`,
+    `Configured worker limits: high ${mib(policy.workerMemoryHighMib)}; max ${mib(policy.workerMemoryMaxMib)}; swap max ${mib(policy.workerSwapMaxMib)}`,
+    `Configured control limits: max ${mib(policy.controlMemoryMaxMib)}; swap max ${mib(policy.controlSwapMaxMib)}; concurrent children ${renderIntegerFact(policy.maxConcurrentChildren)}`,
+    `Configured host reserve: ${mib(policy.hostReserveMib)}`,
+    `Configured worker scope ceiling: ${renderIntegerFact(policy.maxWorkerScopes)}`,
+    `Configured temp free threshold: ${mib(policy.tempMinFreeMib)}`,
+    `Host memory: available ${mib(host.availableMib)}; total ${mib(host.totalMib)}`,
+    `Host swap: free ${mib(host.swapFreeMib)}; total ${mib(host.swapTotalMib)}`,
+    `Containment: cgroup v2 ${renderBooleanFact(containment.cgroupV2)}; user manager ${renderBooleanFact(containment.userManager)}; systemd-run ${renderBooleanFact(containment.systemdRun)}; scope proof ${renderBooleanFact(containment.scopeProof)}`,
+    `Temp root: exists ${renderBooleanFact(temp.exists)}; directory ${renderBooleanFact(temp.directory)}; symlink ${renderBooleanFact(temp.symlink)}; owned ${renderBooleanFact(temp.owned)}; mode 0700 ${renderBooleanFact(temp.secureMode)}; disk-backed ${renderBooleanFact(temp.diskBacked)}`,
+    `Temp capacity: free ${mib(temp.freeMib)}; total ${mib(temp.totalMib)}`,
+    `Observed API limits: low ${mib(api.memoryLowMib)}; max ${mib(api.memoryMaxMib)}; OOM policy ${renderOomPolicy(api.oomPolicy)}; separate from workers ${renderBooleanFact(api.separateFromWorkers)}`,
+    `Worker scopes: ${renderIntegerFact(scopes.admitted)} active; ${renderIntegerFact(scopes.requested)} requested; ${renderIntegerFact(scopes.staticCeiling)} static ceiling`,
+    `Static RAM reservation: ${mib(capacity.staticReservationMib)}`,
+    `Static RAM headroom: ${mib(capacity.staticHeadroomMib)}`,
+    `Configured swap reservation: ${mib(capacity.configuredSwapMib)}`,
+    `Configured swap headroom: ${mib(capacity.swapHeadroomMib)}`,
+    `Requested worker RAM: ${mib(capacity.requestedMemoryMib)}`,
+    `Requested worker swap: ${mib(capacity.requestedSwapMib)}`,
+    `Live RAM reserve plus request: ${mib(capacity.liveRequiredMib)}`,
+    `Live RAM headroom: ${signedMib(capacity.liveHeadroomMib)}`,
   ];
-  if (report.host) {
-    lines.push(`Host memory: ${report.host.availableMib}/${report.host.totalMib} MiB available`);
-    lines.push(`Host swap: ${report.host.swapFreeMib}/${report.host.swapTotalMib} MiB free`);
-  }
-  if (report.scopes) {
-    lines.push(`Worker scopes: ${report.scopes.admitted ?? "unavailable"}/${report.scopes.staticCeiling} active; ${report.scopes.requested} requested`);
-  }
-  if (report.capacity) {
-    lines.push(`Static RAM headroom: ${report.capacity.staticHeadroomMib} MiB`);
-    lines.push(`Live RAM headroom: ${report.capacity.liveHeadroomMib} MiB`);
-    lines.push(`Configured swap headroom: ${report.capacity.swapHeadroomMib} MiB`);
-  }
   if (Array.isArray(report.reasons) && report.reasons.length > 0) {
     lines.push("Checks:");
     for (const reason of report.reasons) {

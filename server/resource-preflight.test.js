@@ -50,7 +50,22 @@ assert.throws(() => parseProcMeminfo("MemTotal: 1024 kB\n"), /missing MemAvailab
 const ok = runResourcePreflight({ runtimeResources: policy(), probes: healthyProbes() });
 assert.equal(ok.ok, true);
 assert.equal(ok.reason, "ok");
-assert.equal(ok.policy.configured, true);
+assert.deepEqual(ok.policy, {
+  configured: true,
+  version: 1,
+  mode: "systemd-user-v1",
+  hostReserveMib: 1536,
+  maxWorkerScopes: 3,
+  apiMemoryLowMib: 512,
+  apiMemoryMaxMib: 1280,
+  workerMemoryHighMib: 1024,
+  workerMemoryMaxMib: 1200,
+  workerSwapMaxMib: 512,
+  controlMemoryMaxMib: 512,
+  controlSwapMaxMib: 256,
+  maxConcurrentChildren: 2,
+  tempMinFreeMib: 4096,
+});
 assert.equal(ok.capacity.staticReservationMib, 6928);
 assert.equal(ok.capacity.configuredSwapMib, 1792);
 assert.equal(ok.capacity.requestedMemoryMib, 1200);
