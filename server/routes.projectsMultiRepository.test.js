@@ -26,12 +26,15 @@ fs.writeFileSync(path.join(tmp, ".quadwork", "config.json"), JSON.stringify({
   installation_id: "00000000-0000-4000-8000-000000000001",
   projects: [
     { id: "active", name: "Active", repositories: repositories("Acme"), agents: {} },
+    { id: "active-two", name: "Active Two", repositories: repositories("Beta"), agents: {} },
     { id: "idle", name: "Idle", idle: true, repositories: repositories("IdleCo"), agents: {} },
     { id: "archived", name: "Archived", archived: true, repositories: repositories("OldCo"), agents: {} },
   ],
 }));
 
 const ghCalls = [];
+let activeProjectCalls = 0;
+let maxActiveProjectCalls = 0;
 function fakeExecFile() {}
 fakeExecFile[util.promisify.custom] = async (_command, args) => {
   ghCalls.push(args.slice());
@@ -41,15 +44,30 @@ fakeExecFile[util.promisify.custom] = async (_command, args) => {
       openIssues: { nodes: [] }, closedIssues: { nodes: [] },
       openPRs: { nodes: [] }, mergedPRs: { nodes: [] },
     };
-    return { stdout: JSON.stringify({ data: { repo_0: emptyRepo, repo_1: emptyRepo } }), stderr: "" };
+    return { stdout: JSON.stringify({ data: {
+      repo_0: emptyRepo, repo_1: emptyRepo, repo_2: emptyRepo, repo_3: emptyRepo,
+    } }), stderr: "" };
   }
-  let data = [];
-  if (endpoint.includes("repos/acme/app/pulls?state=open")) data = [{ number: 1 }, { number: 2 }];
-  else if (endpoint.includes("repos/acme/api/pulls?state=open")) data = [{ number: 3 }];
-  else if (endpoint.includes("repos/acme/app/pulls?state=all")) data = [{ updated_at: "2026-08-01T00:00:00Z" }];
-  else if (endpoint.includes("repos/acme/api/pulls?state=all")) data = [{ updated_at: "2026-08-02T00:00:00Z" }];
-  else throw new Error(`unexpected GitHub call: ${endpoint}`);
-  return { stdout: `HTTP/2 200\netag: fixture-${ghCalls.length}\n\n${JSON.stringify(data)}`, stderr: "" };
+  activeProjectCalls += 1;
+  maxActiveProjectCalls = Math.max(maxActiveProjectCalls, activeProjectCalls);
+  try {
+    // Make overlap observable: the route must still hold the process-wide pass
+    // to its existing GH_MAX_CONCURRENT=2 bound across every project/repo.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    let data = [];
+    if (endpoint.includes("repos/acme/app/pulls?state=open")) data = [{ number: 1 }, { number: 2 }];
+    else if (endpoint.includes("repos/acme/api/pulls?state=open")) data = [{ number: 3 }];
+    else if (endpoint.includes("repos/acme/app/pulls?state=all")) data = [{ updated_at: "2026-08-01T00:00:00Z" }];
+    else if (endpoint.includes("repos/acme/api/pulls?state=all")) data = [{ updated_at: "2026-08-02T00:00:00Z" }];
+    else if (endpoint.includes("repos/beta/app/pulls?state=open")) data = [{ number: 4 }];
+    else if (endpoint.includes("repos/beta/api/pulls?state=open")) data = [];
+    else if (endpoint.includes("repos/beta/app/pulls?state=all")) data = [{ updated_at: "2026-08-03T00:00:00Z" }];
+    else if (endpoint.includes("repos/beta/api/pulls?state=all")) data = [{ updated_at: "2026-08-04T00:00:00Z" }];
+    else throw new Error(`unexpected GitHub call: ${endpoint}`);
+    return { stdout: `HTTP/2 200\netag: fixture-${ghCalls.length}\n\n${JSON.stringify(data)}`, stderr: "" };
+  } finally {
+    activeProjectCalls -= 1;
+  }
 };
 childProcess.execFile = fakeExecFile;
 
@@ -81,6 +99,9 @@ function request(server, pathname) {
     assert.deepEqual(active.repositories.map((repo) => repo.key), ["app", "api"]);
     assert.equal(active.openPrs, 3, "open PR count is summed across repositories");
     assert.equal(active.lastActivity, "2026-08-02T00:00:00Z", "latest activity is the max across repositories");
+    const activeTwo = response.json.projects.find((item) => item.id === "active-two");
+    assert.equal(activeTwo.openPrs, 1);
+    assert.equal(activeTwo.lastActivity, "2026-08-04T00:00:00Z");
 
     const idle = response.json.projects.find((item) => item.id === "idle");
     const archived = response.json.projects.find((item) => item.id === "archived");
@@ -89,15 +110,17 @@ function request(server, pathname) {
     assert.equal(archived.repositories.length, 2);
     assert.equal(archived._archived, true);
     const projectCalls = ghCalls.filter((args) => (args[1] || "").startsWith("repos/"));
-    assert.equal(projectCalls.length, 4, "only two metrics for each active repository are fetched");
-    assert.ok(projectCalls.every((args) => (args[1] || "").startsWith("repos/acme/")), "idle/archive repositories make zero GitHub calls");
+    assert.equal(projectCalls.length, 8, "only two metrics for each active repository are fetched");
+    assert.ok(maxActiveProjectCalls <= 2, `GitHub metric concurrency stays globally bounded (observed ${maxActiveProjectCalls})`);
+    assert.ok(projectCalls.every((args) => /^repos\/(?:acme|beta)\//.test(args[1] || "")), "idle/archive repositories make zero GitHub calls");
 
     const fallback = await routes.fetchAllProjectsGraphQL();
-    assert.deepEqual([...fallback.keys()], ["acme/app", "acme/api"], "GraphQL fallback includes every canonical repository");
+    assert.deepEqual([...fallback.keys()], ["acme/app", "acme/api", "beta/app", "beta/api"], "GraphQL fallback includes every canonical repository");
     const gqlCall = ghCalls.find((args) => args[1] === "graphql");
     const queryArg = gqlCall.find((arg) => arg.startsWith("query="));
     assert.match(queryArg, /repo_0: repository/);
     assert.match(queryArg, /repo_1: repository/);
+    assert.match(queryArg, /repo_3: repository/);
     console.log("routes.projectsMultiRepository.test.js: all assertions passed");
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));

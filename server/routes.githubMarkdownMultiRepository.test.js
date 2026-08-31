@@ -47,7 +47,11 @@ const appSnapshot = {
 };
 const apiSnapshot = {
   issues: [{ number: 42, title: "api issue", state: "OPEN", url: "https://github.com/Acme/API/issues/42", assignees: [] }],
-  prs: [], closedIssues: [], mergedPrs: [],
+  prs: [{
+    number: 7, title: "api pr", state: "OPEN", url: "https://github.com/Acme/API/pull/7", assignees: [],
+    reviews: [{ state: "APPROVED", submittedAt: "2026-08-31T00:00:00.000Z", body: "RE2: approved" }],
+  }],
+  closedIssues: [], mergedPrs: [],
 };
 
 try {
@@ -61,6 +65,7 @@ try {
   assert.equal(parsed.ok, true);
   assert.deepEqual(parsed.repositories.map((repository) => repository.repo_key), ["app", "api"]);
   assert.deepEqual(parsed.openIssues.map((row) => `${row.repo_key}#${row.number}`), ["app#42", "api#42"]);
+  assert.equal(parsed.reviewDetail["api#7"].re2.state, "APPROVED");
   assert.match(parsed.notes, /## Decision\nkeep both repositories/);
   assert.equal(fs.existsSync(path.join(projectDir, `.GITHUB.md.tmp-${process.pid}`)), false, "atomic temp is renamed away");
 
@@ -71,6 +76,32 @@ try {
   assert.equal(parsed.repositories.find((repository) => repository.repo_key === "app").stale, true);
   assert.equal(parsed.repositories.find((repository) => repository.repo_key === "api").stale, false);
   assert.deepEqual(parsed.openIssues.map((row) => `${row.repo_key}#${row.number}`), ["app#42", "api#42"]);
+  assert.match(parsed.notes, /keep both repositories/);
+
+  // Simulate a server restart: memory is cold but the previous strict file is
+  // present. The first app refresh must carry forward the API group, metadata,
+  // same-number row, and persisted review attribution.
+  routes._graphqlCache.clear();
+  routes._githubMeta.clear();
+  const restartedApp = {
+    ...appSnapshot,
+    issues: [{ ...appSnapshot.issues[0], title: "app issue after restart" }],
+  };
+  routes._graphqlCache.set("acme/app", { ts: Date.now(), ...restartedApp });
+  routes.writeGithubFileFromSnapshot("multi", "Multi", "acme/app", restartedApp, "ok");
+  parsed = routes.parseGithub(fs.readFileSync(githubPath, "utf-8"));
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.openIssues.find((row) => row.repo_key === "app").title, "app issue after restart");
+  assert.equal(parsed.openIssues.find((row) => row.repo_key === "api").title, "api issue");
+  assert.equal(parsed.reviewDetail["api#7"].re2.state, "APPROVED");
+  assert.notEqual(parsed.repositories.find((repository) => repository.repo_key === "api").generatedAt, null);
+  assert.match(parsed.notes, /keep both repositories/);
+
+  routes.writeGithubFileFromSnapshot("multi", "Multi", "acme/api", null, "error");
+  parsed = routes.parseGithub(fs.readFileSync(githubPath, "utf-8"));
+  assert.equal(parsed.openIssues.find((row) => row.repo_key === "api").title, "api issue");
+  assert.equal(parsed.reviewDetail["api#7"].re2.state, "APPROVED");
+  assert.equal(parsed.repositories.find((repository) => repository.repo_key === "api").stale, true);
   assert.match(parsed.notes, /keep both repositories/);
 
   console.log("routes.githubMarkdownMultiRepository.test.js: all assertions passed");

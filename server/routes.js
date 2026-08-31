@@ -1610,6 +1610,55 @@ router.get("/api/projects", async (req, res) => {
     for (const m of msgs) msgToProject.set(m, projectIdToName[pid]);
   }
 
+  // #1030: flatten every active project/repository metric pass through one
+  // limiter. A per-project limiter combined with Promise.all(projects) would
+  // multiply GH_MAX_CONCURRENT by the number of projects (and by the two
+  // metric calls), defeating the existing rate-limit safety bound.
+  const projectMetricAdmissions = new Map();
+  const projectMetricJobs = [];
+  for (const project of cfg.projects || []) {
+    if (!project?.id || project.idle || isProjectArchived(project.id, cfg)) continue;
+    const admission = projectAdmission(project.id, { demand: true });
+    if (!admission) continue;
+    projectMetricAdmissions.set(project.id, admission);
+    projectResultAdmissions.set(project.id, admission);
+    for (const binding of projectRepositoryBindings(project)) {
+      projectMetricJobs.push({ projectId: project.id, binding, admission });
+    }
+  }
+  const projectMetricResults = await _mapLimited(projectMetricJobs, GH_MAX_CONCURRENT, async (job) => {
+    const stillAdmitted = () => isAdmissionCurrent(job.admission);
+    try {
+      // Keep the two calls sequential inside each globally-limited binding job;
+      // at most GH_MAX_CONCURRENT gh processes can exist for this aggregation.
+      const prs = await ghApiConditional(
+        `${job.binding.cache_repo}#projects-open-pulls`,
+        `repos/${job.binding.cache_repo}/pulls?state=open&per_page=100`,
+        stillAdmitted,
+      );
+      const recentPrs = await ghApiConditional(
+        `${job.binding.cache_repo}#projects-last-activity`,
+        `repos/${job.binding.cache_repo}/pulls?state=all&sort=updated&direction=desc&per_page=1`,
+        stillAdmitted,
+      );
+      if (!stillAdmitted()) return null;
+      const failed = prs.status === "error" || recentPrs.status === "error";
+      return {
+        ...job,
+        openPrs: Array.isArray(prs.data) ? prs.data.length : 0,
+        lastActivity: Array.isArray(recentPrs.data) && recentPrs.data[0] ? recentPrs.data[0].updated_at || null : null,
+        status: failed ? "error" : (prs.status === "ok" || recentPrs.status === "ok" ? "ok" : "unchanged"),
+      };
+    } catch {
+      return { ...job, openPrs: 0, lastActivity: null, status: "error" };
+    }
+  });
+  const projectMetrics = new Map();
+  for (const metric of projectMetricResults.filter(Boolean)) {
+    if (!projectMetrics.has(metric.projectId)) projectMetrics.set(metric.projectId, new Map());
+    projectMetrics.get(metric.projectId).set(metric.binding.key, metric);
+  }
+
   // #512: parallelize gh CLI calls across projects using async exec.
   // Only fetch open PR count and most recent PR activity — drop the
   // allPrs/allIssues calls that were only used for numberToProject.
@@ -1649,35 +1698,12 @@ router.get("/api/projects", async (req, res) => {
         _idle: true,
       };
     }
-    const admission = projectAdmission(p.id, { demand: true });
+    const admission = projectMetricAdmissions.get(p.id);
     if (!admission) {
       return { id: p.id, name: p.name, repo: configuredRepo, repositories, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
     }
-    projectResultAdmissions.set(p.id, admission);
     if (bindings.length > 0) {
-      // #806/#1030: REST + ETag instead of `gh pr list` (GraphQL-backed).
-      // Bindings share one exact project admission token, while each request
-      // and ETag is isolated by canonical repository identity.
-      const stillAdmitted = () => isAdmissionCurrent(admission);
-      const metrics = await _mapLimited(bindings, GH_MAX_CONCURRENT, async (binding) => {
-        try {
-          const [prs, recentPrs] = await Promise.all([
-            ghApiConditional(`${binding.cache_repo}#projects-open-pulls`, `repos/${binding.cache_repo}/pulls?state=open&per_page=100`, stillAdmitted),
-            ghApiConditional(`${binding.cache_repo}#projects-last-activity`, `repos/${binding.cache_repo}/pulls?state=all&sort=updated&direction=desc&per_page=1`, stillAdmitted),
-          ]);
-          if (!stillAdmitted()) return null;
-          const failed = prs.status === "error" || recentPrs.status === "error";
-          return {
-            binding,
-            openPrs: Array.isArray(prs.data) ? prs.data.length : 0,
-            lastActivity: Array.isArray(recentPrs.data) && recentPrs.data[0] ? recentPrs.data[0].updated_at || null : null,
-            status: failed ? "error" : (prs.status === "ok" || recentPrs.status === "ok" ? "ok" : "unchanged"),
-          };
-        } catch {
-          return { binding, openPrs: 0, lastActivity: null, status: "error" };
-        }
-      });
-      const metricsByKey = new Map(metrics.filter(Boolean).map((metric) => [metric.binding.key, metric]));
+      const metricsByKey = projectMetrics.get(p.id) || new Map();
       repositories = bindings.map((binding) => {
         const metric = metricsByKey.get(binding.key);
         if (!metric) return { ...repositoryState(binding), stale: true };
@@ -1691,7 +1717,7 @@ router.get("/api/projects", async (req, res) => {
           last_good_at: metric.status === "error" ? previous.last_good_at : new Date().toISOString(),
         };
       });
-      for (const metric of metrics.filter(Boolean)) {
+      for (const metric of metricsByKey.values()) {
         openPrs += metric.openPrs;
         if (metric.lastActivity && (!lastActivity || Date.parse(metric.lastActivity) > Date.parse(lastActivity))) lastActivity = metric.lastActivity;
       }
@@ -2549,6 +2575,31 @@ function _extractNotesBody(text) {
   return extractGithubNotes(text || "") || _GITHUB_DEFAULT_NOTES;
 }
 
+function snapshotFromParsedGithubRepository(repository) {
+  const reviewDetail = repository?.reviewDetail || {};
+  const prs = (repository?.prs || []).map((pr) => {
+    const detail = reviewDetail[`${repository.repo_key}#${pr.number}`]
+      || reviewDetail[String(pr.number)]
+      || {};
+    const reviews = [];
+    for (const role of ["re1", "re2"]) {
+      if (!detail[role]) continue;
+      reviews.push({
+        state: detail[role].state,
+        submittedAt: detail[role].submittedAt,
+        body: `${role.toUpperCase()}: persisted GITHUB.md state`,
+      });
+    }
+    return { ...pr, reviews };
+  });
+  return {
+    issues: repository?.issues || [],
+    prs,
+    closedIssues: repository?.closedIssues || [],
+    mergedPrs: repository?.mergedPrs || [],
+  };
+}
+
 // Write one project's GITHUB.md atomically (temp + rename) from a snapshot,
 // preserving its `## Notes`. status drives the freshness meta.
 function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, status) {
@@ -2568,22 +2619,55 @@ function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, sta
     const refreshedBinding = bindings.find((binding) => binding.cache_repo === refreshedRepo);
     if (!refreshedBinding) return;
 
-    // Cold + total failure with nothing cached: leave the seeded template be.
-    const hasAnySnapshot = bindings.some((binding) =>
-      binding.cache_repo === refreshedRepo ? !!snapshot : _graphqlCache.has(binding.cache_repo));
-    if (!hasAnySnapshot && status === "error") return;
     ensureSecureDir(dir);
 
     let notesBody = _GITHUB_DEFAULT_NOTES;
-    try { notesBody = _extractNotesBody(fs.readFileSync(filePath, "utf-8")); } catch { /* seed defaults */ }
+    const persistedRepositories = new Map();
+    try {
+      const existingText = fs.readFileSync(filePath, "utf-8");
+      notesBody = _extractNotesBody(existingText);
+      const parsed = parseProjectGithubMarkdown(existingText);
+      if (parsed.ok) {
+        for (const repository of parsed.repositories || []) {
+          const canonicalRepo = canonicalGithubRepo(repository.repo);
+          if (!canonicalRepo) continue;
+          persistedRepositories.set(canonicalRepo, {
+            snapshot: snapshotFromParsedGithubRepository(repository),
+            meta: {
+              generatedAt: repository.generatedAt || 0,
+              staleCycles: repository.staleCycles || 0,
+              stale: repository.stale === true,
+            },
+          });
+        }
+      }
+    } catch { /* seed defaults */ }
+
+    // A restart clears memory caches. Treat the last strict-parsed file as a
+    // persisted last-good source so the first completing repository cannot
+    // blank cold siblings before their own refresh finishes.
+    const snapshots = new Map();
+    for (const binding of bindings) {
+      const persisted = persistedRepositories.get(binding.cache_repo)?.snapshot || null;
+      const cached = _graphqlCache.get(binding.cache_repo) || null;
+      const refreshed = binding.cache_repo === refreshedRepo;
+      const selected = refreshed && status !== "error"
+        ? (snapshot || cached || persisted)
+        : (cached || persisted);
+      if (selected) snapshots.set(binding.cache_repo, selected);
+    }
+    if (snapshots.size === 0 && status === "error") return;
 
     const refreshedMetaKey = `${projectId}:${refreshedBinding.key}`;
-    const meta = { ...(_githubMeta.get(refreshedMetaKey) || { generatedAt: 0, staleCycles: 0 }) };
+    const persistedRefreshedMeta = persistedRepositories.get(refreshedRepo)?.meta;
+    const meta = { ...(_githubMeta.get(refreshedMetaKey) || persistedRefreshedMeta || { generatedAt: 0, staleCycles: 0 }) };
     if (status === "error") {
       meta.staleCycles += 1; // keep last generatedAt — never stamp a failed cycle fresh
+      meta.stale = true;
     } else {
       meta.generatedAt = Date.now();
       meta.staleCycles = 0;
+      meta.stale = false;
     }
     _githubMeta.set(refreshedMetaKey, meta);
 
@@ -2591,10 +2675,10 @@ function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, sta
       repo_key: binding.key,
       repo: binding.repo,
       primary: binding.primary,
-      snapshot: binding.cache_repo === refreshedRepo
-        ? (snapshot || _graphqlCache.get(binding.cache_repo) || {})
-        : (_graphqlCache.get(binding.cache_repo) || {}),
-      meta: _githubMeta.get(`${projectId}:${binding.key}`) || { generatedAt: 0, staleCycles: 0 },
+      snapshot: snapshots.get(binding.cache_repo) || {},
+      meta: _githubMeta.get(`${projectId}:${binding.key}`)
+        || persistedRepositories.get(binding.cache_repo)?.meta
+        || { generatedAt: 0, staleCycles: 0 },
     }));
     const content = renderProjectGithubMarkdown(projectName, repositoryStates, notesBody);
     const tmp = path.join(dir, `.GITHUB.md.tmp-${process.pid}`);
@@ -2841,6 +2925,11 @@ async function refreshGraphQLCache() {
           _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: d.prs, stale: false });
           _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: d.closedIssues, stale: false });
           _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: d.mergedPrs, stale: false });
+          // The failed REST pass already authored an error/stale cycle. A
+          // successful fallback is a new last-good snapshot and must rewrite
+          // the same complete project document so only this repository group
+          // becomes fresh while every sibling and Notes block remain intact.
+          try { syncGithubFilesForRepo(repo, "ok", currentOwners); } catch { /* non-fatal */ }
         }
       }
     }
@@ -5967,6 +6056,7 @@ module.exports._batchProgressCache = _batchProgressCache;
 module.exports._batchProgressRefreshes = _batchProgressRefreshes;
 module.exports._graphqlCache = _graphqlCache;
 module.exports._githubRepoStatus = _githubRepoStatus;
+module.exports._githubMeta = _githubMeta;
 module.exports.projectRepositoryBindings = projectRepositoryBindings;
 module.exports.getProjectRepositoryBindings = getProjectRepositoryBindings;
 module.exports.decorateGithubRows = decorateGithubRows;
