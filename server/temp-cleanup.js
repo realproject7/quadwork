@@ -27,6 +27,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { removeTreeNoFollow } = require("./resource-temp");
 
 const DEFAULT_MAX_AGE_HOURS = 72;
 
@@ -37,7 +38,7 @@ function newestTimeMs(st) {
 
 // Remove `entry` (file or dir) if its newest timestamp is older than the
 // cutoff. Returns "removed" | "kept" | "error".
-function removeIfStale(entry, cutoffMs, result) {
+function removeIfStale(root, entry, cutoffMs, result) {
   let st;
   try {
     st = fs.lstatSync(entry);
@@ -49,7 +50,7 @@ function removeIfStale(entry, cutoffMs, result) {
     return "kept";
   }
   try {
-    fs.rmSync(entry, { recursive: true, force: true });
+    removeTreeNoFollow(root, entry, fs);
     result.removed.push(entry);
     return "removed";
   } catch (err) {
@@ -80,29 +81,43 @@ function sweepBackendTemp(opts = {}) {
     const uid = typeof opts.uid === "number"
       ? opts.uid
       : (typeof process.getuid === "function" ? process.getuid() : null);
-    if (uid !== null) {
-      const claudeDir = path.join(tmpRoot, `claude-${uid}`);
+    let canonicalRoot = null;
+    try {
+      canonicalRoot = fs.realpathSync(tmpRoot);
+    } catch {
+      canonicalRoot = null;
+    }
+
+    if (uid !== null && canonicalRoot) {
+      const claudeDir = path.join(canonicalRoot, `claude-${uid}`);
       let entries = [];
       try {
-        entries = fs.readdirSync(claudeDir);
+        const claudeStat = fs.lstatSync(claudeDir);
+        // A symlink here used to let the sweep enumerate and delete entries in
+        // an arbitrary external directory. Never traverse it.
+        if (claudeStat.isDirectory() && !claudeStat.isSymbolicLink()) {
+          entries = fs.readdirSync(claudeDir);
+        } else if (claudeStat.isSymbolicLink()) {
+          result.errors.push(`${claudeDir}: refusing symlinked claude temp directory`);
+        }
       } catch {
         entries = []; // no dir → nothing to do
       }
       for (const name of entries) {
-        removeIfStale(path.join(claudeDir, name), cutoffMs, result);
+        removeIfStale(canonicalRoot, path.join(claudeDir, name), cutoffMs, result);
       }
     }
 
     // Gemini: stray crash dumps written directly to the temp root.
     let rootEntries = [];
     try {
-      rootEntries = fs.readdirSync(tmpRoot);
+      rootEntries = canonicalRoot ? fs.readdirSync(canonicalRoot) : [];
     } catch {
       rootEntries = [];
     }
     for (const name of rootEntries) {
       if (name.startsWith("gemini-client-error-") && name.endsWith(".json")) {
-        removeIfStale(path.join(tmpRoot, name), cutoffMs, result);
+        removeIfStale(canonicalRoot, path.join(canonicalRoot, name), cutoffMs, result);
       }
     }
   } catch (err) {
