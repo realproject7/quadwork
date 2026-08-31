@@ -90,6 +90,13 @@ function startTestServer() {
       },
     }));
 
+    // CI-less handler authorization/persistence is exercised directly in
+    // ci-less-evidence.test.js.  This shim fixture verifies the role-specific
+    // tool list and that a forged hidden tools/call still reaches a server
+    // boundary which rejects it.
+    app.post("/api/ci-evidence", (req, res) => res.status(403).json({ ok: false, code: "ci_evidence_forbidden" }));
+    app.post("/api/ci-evidence/read", (req, res) => res.status(404).json({ ok: false, code: "ci_evidence_record_not_found" }));
+
     app.get("/api/chat", (req, res) => {
       const msgs = fileChat.readMessages(PROJECT, {
         since_id: Number(req.query.since_id) || 0,
@@ -165,6 +172,8 @@ async function runTests() {
   assert(toolNames.includes("chat_send"), "tools/list includes chat_send");
   assert(toolNames.includes("chat_read"), "tools/list includes chat_read");
   assert(toolNames.includes("issue_contract_revision"), "tools/list exposes issue_contract_revision to dev");
+  assert(toolNames.includes("submit_ci_evidence"), "tools/list exposes submit_ci_evidence only to dev");
+  assert(toolNames.includes("read_ci_evidence"), "tools/list exposes redacted CI evidence reads to dev");
 
   for (const role of ROLES.filter((role) => role !== AGENT)) {
     const token = crypto.randomBytes(16).toString("hex");
@@ -174,6 +183,10 @@ async function runTests() {
     const roleList = await readResponse(roleShim);
     assert((roleList.result?.tools || []).some((tool) => tool.name === "issue_contract_revision"),
       `tools/list exposes issue_contract_revision to ${role}`);
+    assert((roleList.result?.tools || []).some((tool) => tool.name === "read_ci_evidence"),
+      `tools/list exposes read_ci_evidence to ${role}`);
+    assert(!(roleList.result?.tools || []).some((tool) => tool.name === "submit_ci_evidence"),
+      `tools/list hides submit_ci_evidence from ${role}`);
     await stopShim(roleShim);
   }
 
@@ -299,6 +312,10 @@ async function runTests() {
   const nonRoleList = await readResponse(nonRoleShim);
   assert(!(nonRoleList.result?.tools || []).some((tool) => tool.name === "issue_contract_revision"),
     "tools/list hides issue_contract_revision from non-project roles");
+  assert(!(nonRoleList.result?.tools || []).some((tool) => tool.name === "submit_ci_evidence"),
+    "tools/list hides submit_ci_evidence from non-project roles");
+  assert(!(nonRoleList.result?.tools || []).some((tool) => tool.name === "read_ci_evidence"),
+    "tools/list hides read_ci_evidence from non-project roles");
   sendJsonRpc(nonRoleShim, {
     jsonrpc: "2.0",
     id: 33,
@@ -308,6 +325,15 @@ async function runTests() {
   const forgedCall = await readResponse(nonRoleShim);
   assert(forgedCall.error?.code === -32000 && /API error 403/.test(forgedCall.error.message),
     "forged hidden tools/call is rejected by the server authorization boundary");
+  sendJsonRpc(nonRoleShim, {
+    jsonrpc: "2.0",
+    id: 36,
+    method: "tools/call",
+    params: { name: "submit_ci_evidence", arguments: {} },
+  });
+  const forgedCiSubmit = await readResponse(nonRoleShim);
+  assert(forgedCiSubmit.error?.code === -32000 && /API error 403/.test(forgedCiSubmit.error.message),
+    "forged hidden CI evidence tools/call is rejected at the server boundary");
   await stopShim(nonRoleShim);
 
   const badTokenShim = spawnShim(PROJECT, "head", "forged-token");

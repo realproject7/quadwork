@@ -33,6 +33,7 @@ const {
   validateAssignmentProvenance,
   ownershipKey,
 } = require("./work-item-ref");
+const { normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha } = require("./ci-evidence-policy");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
@@ -984,11 +985,21 @@ const {
   serializeProjectCompatibility,
   allRepositories,
   primaryRepository,
+  repositoryCiPolicy,
   ConfigurationValidationError,
   commitV2Configuration,
 } = require("./config");
 const { findAgentChattr } = require("./install-agentchattr");
-const { createIssueContractRevisionHandler } = require("./issue-contract-revision");
+const {
+  createIssueContractRevisionHandler,
+  fetchIssueContractRevision,
+} = require("./issue-contract-revision");
+const {
+  CiEvidenceError,
+  CiEvidenceStore,
+  createCiLessEvidenceSubmitHandler,
+  createCiLessEvidenceReadHandler,
+} = require("./ci-less-evidence");
 
 function resolveRegisteredIssueContract(projectId, repoKey, issue) {
   const context = readLiveBatchContext(projectId);
@@ -1013,6 +1024,106 @@ router.post("/api/issue-contract-revision", createIssueContractRevisionHandler({
   captureProjectAdmission,
   isAdmissionCurrent,
   resolveRegisteredIssue: resolveRegisteredIssueContract,
+}));
+
+function ciEvidenceContext(projectId, request) {
+  const context = readLiveBatchContext(projectId);
+  if (!context?.queueReadOk || context.parsed?.errors?.length > 0 || !context.activated ||
+      context.parsed?.provenance !== "owned" || !context.parsed?.assignmentAttempt ||
+      context.parsed.assignmentAttempt !== request.assignment_attempt ||
+      typeof context.installationId !== "string" || !context.installationId) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "current V2 assignment changed", 409);
+  }
+  const binding = context.repositories.find((entry) => entry.key === request.repo_key);
+  if (!binding) throw new CiEvidenceError("ci_evidence_target_changed", "current repository binding changed", 409);
+  const item = context.parsed.workItems.find((entry) => {
+    const ref = entry.ref || entry;
+    return ref?.repoKey === request.item.repo_key && ref.repo === request.item.repo &&
+      ref.number === request.item.number && ref.kind === request.item.kind;
+  });
+  if (!item) throw new CiEvidenceError("ci_evidence_target_changed", "current assignment item changed", 409);
+  let policy;
+  try { policy = repositoryCiPolicy(context.project, request.repo_key); } catch {
+    throw new CiEvidenceError("ci_evidence_policy_unavailable", "repository CI policy is invalid", 409);
+  }
+  if (!policy || policy.mode !== "ci-less" || policy.version !== request.policy_version) {
+    throw new CiEvidenceError("ci_evidence_policy_changed", "repository CI policy changed", 409);
+  }
+  return { context, binding, policy };
+}
+
+async function fetchOpenPullTip(repo, number) {
+  const canonicalRepo = canonicalGithubRepo(repo);
+  if (!canonicalRepo || !Number.isSafeInteger(number) || number < 1) {
+    throw new CiEvidenceError("ci_evidence_target_unavailable", "live pull request target is invalid", 503);
+  }
+  let payload;
+  try {
+    const { stdout } = await _execFileAsync("gh", ["api", `repos/${canonicalRepo}/pulls/${number}`], {
+      encoding: "utf8",
+      timeout: 15000,
+      maxBuffer: GH_LIST_MAX_BUFFER,
+    });
+    payload = JSON.parse(stdout);
+  } catch {
+    throw new CiEvidenceError("ci_evidence_live_read_failed", "live pull request could not be read", 502);
+  }
+  const tip = canonicalSha(payload?.head?.sha);
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+      payload.number !== number || String(payload.state || "").toLowerCase() !== "open" || !tip) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "live pull request is no longer open", 409);
+  }
+  return { exact_sha: tip };
+}
+
+// This action derives every authority field from the bound shim principal and
+// re-reads the V2 assignment, contract revision, and open PR tip. Client data
+// can only match that target; it cannot choose a project, actor, policy key, or
+// executable command.
+async function resolveCurrentCiEvidenceTarget(projectId, request) {
+  const before = ciEvidenceContext(projectId, request);
+  const [revision, pull] = await Promise.all([
+    fetchIssueContractRevision({ repo: before.binding.repo, issue: request.item.number }),
+    fetchOpenPullTip(before.binding.repo, request.pr_number),
+  ]);
+  if (revision.contract_revision !== request.contract_revision || pull.exact_sha !== request.exact_sha) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "current contract revision or PR tip changed", 409);
+  }
+  // A queue/config mutation while the authenticated GitHub reads were in
+  // flight invalidates the write. The record therefore never claims authority
+  // for an earlier queue observation.
+  const after = ciEvidenceContext(projectId, request);
+  if (after.context.fingerprint !== before.context.fingerprint ||
+      after.binding.repo !== before.binding.repo ||
+      JSON.stringify(after.policy) !== JSON.stringify(before.policy)) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "current assignment or policy changed", 409);
+  }
+  return {
+    project_id: projectId,
+    installation_id: after.context.installationId,
+    repo_key: after.binding.key,
+    repo: after.binding.repo,
+    item: request.item,
+    assignment_attempt: request.assignment_attempt,
+    contract_revision: request.contract_revision,
+    pr_number: request.pr_number,
+    exact_sha: request.exact_sha,
+    policy_version: after.policy.version,
+    policy: after.policy,
+  };
+}
+
+const _ciEvidenceStore = new CiEvidenceStore();
+router.post("/api/ci-evidence", createCiLessEvidenceSubmitHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  resolveCurrentTarget: resolveCurrentCiEvidenceTarget,
+  store: _ciEvidenceStore,
+}));
+router.post("/api/ci-evidence/read", createCiLessEvidenceReadHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  store: _ciEvidenceStore,
 }));
 
 /**
@@ -2010,6 +2121,7 @@ function projectRepositoryBindings(project) {
         repo,
         primary: entry.primary === true,
         cache_repo: cacheRepo,
+        ci_policy: Object.prototype.hasOwnProperty.call(entry, "ci_policy") ? entry.ci_policy : null,
       };
     })
     .filter(Boolean);
@@ -2036,7 +2148,12 @@ function projectUnavailableForGithub(project, cfg) {
 }
 
 function publicRepositoryBinding(binding) {
-  return { key: binding.key, repo: binding.repo, primary: binding.primary };
+  return {
+    key: binding.key,
+    repo: binding.repo,
+    primary: binding.primary,
+    ci_policy: redactedCiPolicy(binding.ci_policy),
+  };
 }
 
 function decorateGithubRows(rows, binding) {
@@ -2524,11 +2641,17 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
     if (reviewsR.status === "ok" || checkRunsR.status === "ok" || statusR.status === "ok") changed++;
     if (reviewsR.status === "error" || (sha && (checkRunsR.status === "error" || statusR.status === "error"))) hadError = true;
     const reviews = mapReviews(Array.isArray(reviewsR.data) ? reviewsR.data : []);
+    const checkEvidence = normalizeGithubCheckEvidence(checkRunsR.data, {
+      exact_sha: sha,
+      observed_at: new Date().toISOString(),
+      source_status: (checkRunsR.status === "ok" || checkRunsR.status === "unchanged") ? "ok" : "unavailable",
+    });
     return {
       ...restPullBaseToCanonical(p),
       reviews,
       reviewDecision: deriveReviewDecision(reviews),
       statusCheckRollup: buildStatusCheckRollup(checkRunsR.data, statusR.data),
+      checkEvidence,
     };
   });
 
@@ -6889,6 +7012,8 @@ module.exports.restPullBaseToCanonical = restPullBaseToCanonical;
 module.exports.mapReviews = mapReviews;
 module.exports.deriveReviewDecision = deriveReviewDecision;
 module.exports.buildStatusCheckRollup = buildStatusCheckRollup;
+module.exports.fetchOpenPullTip = fetchOpenPullTip;
+module.exports.resolveCurrentCiEvidenceTarget = resolveCurrentCiEvidenceTarget;
 // #807: expose the GITHUB.md parser/renderer + role attribution for unit tests.
 // No production callers outside this file.
 module.exports.parseGithub = parseGithub;

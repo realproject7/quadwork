@@ -7,6 +7,7 @@ const {
   assertProjectLifecycleTransitions,
   registerProjectLifecycleCommitter,
 } = require("./project-lifecycle-authority");
+const { normalizeCiPolicy, CiEvidencePolicyError } = require("./ci-evidence-policy");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 const CONFIG_LOCK_PATH = path.join(os.homedir(), ".quadwork", "config.lock");
@@ -183,6 +184,16 @@ function repositoryByCanonicalName(project, repo) {
   const canonical = canonicalRepositoryName(repo);
   if (!canonical) return null;
   return allRepositories(project).find((entry) => canonicalRepositoryName(entry && entry.repo) === canonical) || null;
+}
+
+// Absence is meaningful: legacy repositories retain no inferred policy and
+// evaluators report `missing_policy` until an operator explicitly configures
+// one.  This accessor is intentionally repository-key scoped so callers cannot
+// borrow a primary repository's policy for a sibling binding.
+function repositoryCiPolicy(project, key) {
+  const repository = repositoryByKey(project, key);
+  if (!repository || !hasOwn(repository, "ci_policy")) return null;
+  return normalizeCiPolicy(repository.ci_policy);
 }
 
 /**
@@ -445,6 +456,21 @@ function validateRepositoryEntries(project, projectIndex, fsImpl, options = {}) 
         "repositories.repo",
         "repositories.repo must be an owner/name value",
       );
+    }
+    if (hasOwn(entry, "ci_policy")) {
+      try {
+        normalizeCiPolicy(entry.ci_policy);
+      } catch (error) {
+        if (error instanceof CiEvidencePolicyError) {
+          throw validationError(
+            error.code,
+            "repositories.ci_policy",
+            error.message,
+            ownerId,
+          );
+        }
+        throw error;
+      }
     }
     const canonicalRepo = canonicalRepositoryName(entry.repo);
     if (repos.has(canonicalRepo)) {
@@ -1037,6 +1063,7 @@ module.exports = {
   primaryRepository,
   repositoryByKey,
   repositoryByCanonicalName,
+  repositoryCiPolicy,
   serializeProjectCompatibility,
   workingDirIdentity,
   validateV2Configuration,

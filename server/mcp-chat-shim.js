@@ -70,10 +70,77 @@ const ISSUE_CONTRACT_REVISION_TOOL = {
   },
 };
 
+const SUBMIT_CI_EVIDENCE_TOOL = {
+  name: "submit_ci_evidence",
+  description: "Submit bounded CI-less evidence for the authenticated Dev role's current assignment. Evidence labels are data only; this operation never executes commands.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      assignment_attempt: { type: "string" },
+      contract_revision: { type: "string" },
+      repo_key: { type: "string" },
+      item: {
+        type: "object",
+        properties: {
+          repo_key: { type: "string" },
+          repo: { type: "string" },
+          number: { type: "integer", minimum: 1 },
+          kind: { type: "string", enum: ["issue"] },
+        },
+        required: ["repo_key", "repo", "number", "kind"],
+        additionalProperties: false,
+      },
+      pr_number: { type: "integer", minimum: 1 },
+      exact_sha: { type: "string" },
+      policy_version: { type: "integer", minimum: 1 },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            key: { type: "string" },
+            outcome: { type: "string", enum: ["pass", "fail"] },
+            exit_code: { type: "integer", minimum: 0, maximum: 255 },
+            evidence_ref: { type: "string" },
+          },
+          required: ["key", "outcome", "exit_code", "evidence_ref"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["assignment_attempt", "contract_revision", "repo_key", "item", "pr_number", "exact_sha", "policy_version", "results"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
+const READ_CI_EVIDENCE_TOOL = {
+  name: "read_ci_evidence",
+  description: "Read one redacted, server-authenticated CI-less evidence receipt for this project.",
+  inputSchema: {
+    type: "object",
+    properties: { record_id: { type: "string" } },
+    required: ["record_id"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
 function toolsForActor() {
-  return PROJECT_ROLES.has(AGENT)
-    ? [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL]
-    : CHAT_TOOLS;
+  if (!PROJECT_ROLES.has(AGENT)) return CHAT_TOOLS;
+  const tools = [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL, READ_CI_EVIDENCE_TOOL];
+  if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL);
+  return tools;
 }
 
 function jsonRpc(id, result) {
@@ -148,6 +215,32 @@ async function handleToolCall(id, name, params) {
       const res = await httpRequest(
         "POST",
         "/api/issue-contract-revision",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_ci_evidence") {
+      const res = await httpRequest(
+        "POST",
+        "/api/ci-evidence",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "read_ci_evidence") {
+      const res = await httpRequest(
+        "POST",
+        "/api/ci-evidence/read",
         params,
         TOKEN ? { "X-Chat-Token": TOKEN } : {},
       );
