@@ -6,6 +6,10 @@ const path = require("path");
 
 const RESOURCE_STATE_VERSION = 1;
 const DEFAULT_TERMINAL_FACT_LIMIT = 100;
+const MAX_TERMINAL_FACT_LIMIT = 1_000;
+const TERMINAL_FACT_SCAN_FACTOR = 10;
+const MAX_STATE_BYTES = 1024 * 1024;
+const MAX_OOM_KILL_COUNT = (1n << 64n) - 1n;
 const INVALID = Symbol("invalid resource state field");
 
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -74,6 +78,10 @@ function safeArray(value) {
   }
 }
 
+function validTerminalFactLimit(value) {
+  return Number.isSafeInteger(value) && value > 0 && value <= MAX_TERMINAL_FACT_LIMIT;
+}
+
 function nonNegativeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -97,10 +105,17 @@ function removeContradictoryPairs(output, pairs) {
   return output;
 }
 
+function sanitizeExitCode(value) {
+  if (value === null) return { valid: true, value: null };
+  if (Number.isSafeInteger(value) && value >= 0 && value <= 255) return { valid: true, value };
+  return { valid: false, value: null };
+}
+
 function sanitizeSignal(value) {
-  if (value === null || value === undefined || value === INVALID) return null;
-  if (Number.isSafeInteger(value) && value > 0) return value;
-  return typeof value === "string" && SIGNAL_RE.test(value) ? value : null;
+  if (value === null) return { valid: true, value: null };
+  if (Number.isSafeInteger(value) && value > 0) return { valid: true, value };
+  if (typeof value === "string" && SIGNAL_RE.test(value)) return { valid: true, value };
+  return { valid: false, value: null };
 }
 
 function sanitizeTime(value) {
@@ -114,7 +129,8 @@ function sanitizeTime(value) {
   }
 }
 
-function sanitizeTerminalFact(input) {
+function sanitizeTerminalFact(input, hasOomProvenance) {
+  if (input === INVALID) return null;
   const projectId = safeGet(input, "project_id");
   const generationId = safeGet(input, "generation_id");
   const resourceClass = safeGet(input, "resource_class");
@@ -129,33 +145,45 @@ function sanitizeTerminalFact(input) {
     || finishedAt === null) {
     return null;
   }
-  const rawExitCode = safeGet(input, "exit_code");
-  const exitCode = rawExitCode === null
-    ? null
-    : (Number.isSafeInteger(rawExitCode) && rawExitCode >= 0 && rawExitCode <= 255 ? rawExitCode : null);
+  const exit = sanitizeExitCode(safeGet(input, "exit_code"));
+  const signal = sanitizeSignal(safeGet(input, "signal"));
+  let normalizedReason = reason;
+  // Terminal authority is deliberately strict. A normal exit has one exact
+  // representation. Signal exits retain no competing exit code. OOM authority
+  // comes from the separately validated cgroup observation below. Other
+  // contradictory claims remain redacted evidence but downgrade to unknown.
+  if (reason === "normal_exit"
+    && (!exit.valid || exit.value !== 0 || !signal.valid || signal.value !== null)) normalizedReason = "unknown";
+  if (reason === "signal"
+    && (!exit.valid || exit.value !== null || !signal.valid || signal.value === null)) normalizedReason = "unknown";
+  // The validated cgroup observation is the OOM authority. Wrapper exit/signal
+  // metadata may be empty (for example, a descendant was killed) and cannot
+  // override it, but malformed non-null metadata still fails closed.
+  if (reason === "oom_kill" && (!hasOomProvenance || !exit.valid || !signal.valid)) normalizedReason = "unknown";
   return Object.freeze({
     project_id: projectId,
     generation_id: generationId,
     resource_class: resourceClass,
     unit_name: unitName,
-    reason,
-    exit_code: exitCode,
-    signal: sanitizeSignal(safeGet(input, "signal")),
+    reason: normalizedReason,
+    exit_code: exit.value,
+    signal: signal.value,
     finished_at: finishedAt,
   });
 }
 
-function sanitizeTerminalFacts(input, limit) {
+function sanitizeTerminalFacts(input, limit, hasOomProvenance) {
   if (!safeArray(input)) return [];
   const rawLength = safeGet(input, "length");
   if (!Number.isSafeInteger(rawLength) || rawLength < 0) return [];
   const facts = [];
-  const start = Math.max(0, rawLength - limit);
-  for (let index = start; index < rawLength; index += 1) {
-    const fact = sanitizeTerminalFact(safeGet(input, index));
+  const scanBudget = Math.min(rawLength, limit * TERMINAL_FACT_SCAN_FACTOR);
+  const stop = rawLength - scanBudget;
+  for (let index = rawLength - 1; index >= stop && facts.length < limit; index -= 1) {
+    const fact = sanitizeTerminalFact(safeGet(input, index), hasOomProvenance);
     if (fact) facts.push(fact);
   }
-  return facts.slice(-limit);
+  return facts.reverse();
 }
 
 function sanitizeTemp(input) {
@@ -165,6 +193,86 @@ function sanitizeTemp(input) {
   const totalMib = nonNegativeInteger(safeGet(input, "total_mib"));
   if (freeMib === null || totalMib === null || freeMib > totalMib) return null;
   return Object.freeze({ disk_backed: diskBacked, free_mib: freeMib, total_mib: totalMib });
+}
+
+function sanitizeOomKillCount(value) {
+  let count;
+  try {
+    if (typeof value === "bigint") count = value;
+    else if (Number.isSafeInteger(value) && value >= 0) count = BigInt(value);
+    else if (typeof value === "string" && /^(?:0|[1-9]\d{0,19})$/.test(value)) count = BigInt(value);
+    else return null;
+  } catch {
+    return null;
+  }
+  return count >= 0n && count <= MAX_OOM_KILL_COUNT ? count.toString(10) : null;
+}
+
+function sanitizeLastCgroupOom(input) {
+  const count = sanitizeOomKillCount(safeGet(input, "oom_kill_count"));
+  const observedAt = sanitizeTime(safeGet(input, "observed_at"));
+  if (count === null || observedAt === null) return null;
+  return Object.freeze({ oom_kill_count: count, observed_at: observedAt });
+}
+
+function hasEveryField(value, fields) {
+  return fields.every((field) => Object.prototype.hasOwnProperty.call(value, field));
+}
+
+function checkedProduct(left, right) {
+  if (!Number.isSafeInteger(left) || left < 0 || !Number.isSafeInteger(right) || right < 0) return null;
+  const result = left * right;
+  return Number.isSafeInteger(result) ? result : null;
+}
+
+function checkedSum(values) {
+  let result = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0 || !Number.isSafeInteger(result + value)) return null;
+    result += value;
+  }
+  return result;
+}
+
+function completeReadySnapshot({ counts, limits, usage, temp }) {
+  if (!hasEveryField(counts, COUNT_FIELDS)
+    || !hasEveryField(limits, LIMIT_FIELDS)
+    || !hasEveryField(usage, USAGE_FIELDS)
+    || !temp
+    || temp.disk_backed !== true
+    || temp.free_mib < limits.temp_min_free_mib
+    || counts.active_worker_scopes > limits.max_worker_scopes
+    || counts.active_control_children > limits.max_control_children
+    || usage.control_memory_mib > limits.control_memory_max_mib
+    || usage.api_memory_mib > limits.api_memory_max_mib) {
+    return false;
+  }
+  const workerCapacity = checkedProduct(limits.max_worker_scopes, limits.worker_memory_max_mib);
+  const expectedStatic = checkedSum([
+    limits.host_reserve_mib,
+    limits.api_memory_max_mib,
+    limits.control_memory_max_mib,
+    workerCapacity,
+  ]);
+  const expectedSwap = checkedSum([
+    limits.control_swap_max_mib,
+    checkedProduct(limits.max_worker_scopes, limits.worker_swap_max_mib),
+  ]);
+  const observedMemory = checkedSum([
+    usage.worker_memory_mib,
+    usage.control_memory_mib,
+    usage.api_memory_mib,
+  ]);
+  return workerCapacity !== null
+    && usage.worker_memory_mib <= workerCapacity
+    && expectedStatic !== null
+    && usage.static_reservation_mib === expectedStatic
+    && checkedSum([usage.static_reservation_mib, usage.static_headroom_mib]) === usage.host_memory_total_mib
+    && expectedSwap !== null
+    && usage.configured_swap_mib === expectedSwap
+    && checkedSum([usage.configured_swap_mib, usage.swap_headroom_mib]) === usage.swap_total_mib
+    && observedMemory !== null
+    && observedMemory <= usage.host_memory_total_mib;
 }
 
 function freezeState(state) {
@@ -179,8 +287,8 @@ function createResourceSnapshot(input = {}, options = {}) {
   const limit = options.terminalFactLimit === undefined
     ? DEFAULT_TERMINAL_FACT_LIMIT
     : options.terminalFactLimit;
-  if (!Number.isSafeInteger(limit) || limit <= 0) {
-    throw new TypeError("terminalFactLimit must be a positive safe integer");
+  if (!validTerminalFactLimit(limit)) {
+    throw new TypeError(`terminalFactLimit must be an integer from 1 to ${MAX_TERMINAL_FACT_LIMIT}`);
   }
   const rawStatus = safeGet(input, "status");
   const counts = sanitizeIntegerFields(safeGet(input, "counts"), COUNT_FIELDS);
@@ -192,15 +300,21 @@ function createResourceSnapshot(input = {}, options = {}) {
     sanitizeIntegerFields(safeGet(input, "usage"), USAGE_FIELDS),
     [["host_memory_available_mib", "host_memory_total_mib"], ["swap_free_mib", "swap_total_mib"]],
   );
-  return freezeState({
+  const temp = sanitizeTemp(safeGet(input, "temp"));
+  const lastCgroupOom = sanitizeLastCgroupOom(safeGet(input, "last_cgroup_oom"));
+  const hasOomProvenance = lastCgroupOom !== null && BigInt(lastCgroupOom.oom_kill_count) > 0n;
+  const state = {
     version: RESOURCE_STATE_VERSION,
     status: typeof rawStatus === "string" && STATUSES.has(rawStatus) ? rawStatus : "unknown",
     counts,
     limits,
     usage,
-    temp: sanitizeTemp(safeGet(input, "temp")),
-    terminal_facts: sanitizeTerminalFacts(safeGet(input, "terminal_facts"), limit),
-  });
+    temp,
+    last_cgroup_oom: lastCgroupOom,
+    terminal_facts: sanitizeTerminalFacts(safeGet(input, "terminal_facts"), limit, hasOomProvenance),
+  };
+  if (state.status === "ready" && !completeReadySnapshot(state)) state.status = "unknown";
+  return freezeState(state);
 }
 
 function cloneSnapshot(state, terminalFactLimit) {
@@ -208,27 +322,61 @@ function cloneSnapshot(state, terminalFactLimit) {
 }
 
 class ResourceStateStore {
-  constructor({ filePath, fsImpl = fs, terminalFactLimit = DEFAULT_TERMINAL_FACT_LIMIT } = {}) {
+  constructor({
+    filePath,
+    fsImpl = fs,
+    terminalFactLimit = DEFAULT_TERMINAL_FACT_LIMIT,
+    expectedUid = typeof process.getuid === "function" ? process.getuid() : null,
+  } = {}) {
     if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
       throw new TypeError("filePath must be an absolute path");
     }
-    if (!Number.isSafeInteger(terminalFactLimit) || terminalFactLimit <= 0) {
-      throw new TypeError("terminalFactLimit must be a positive safe integer");
+    if (!validTerminalFactLimit(terminalFactLimit)) {
+      throw new TypeError(`terminalFactLimit must be an integer from 1 to ${MAX_TERMINAL_FACT_LIMIT}`);
+    }
+    if (expectedUid !== null && (!Number.isSafeInteger(expectedUid) || expectedUid < 0)) {
+      throw new TypeError("expectedUid must be a non-negative safe integer or null");
     }
     this.filePath = filePath;
     this.fs = fsImpl;
     this.terminalFactLimit = terminalFactLimit;
+    this.expectedUid = expectedUid;
     this.state = createResourceSnapshot({}, { terminalFactLimit });
   }
 
   load() {
     let parsed;
+    let fd = null;
     try {
-      parsed = JSON.parse(this.fs.readFileSync(this.filePath, "utf8"));
+      const before = this.fs.lstatSync(this.filePath);
+      if (before.isSymbolicLink()
+        || !before.isFile()
+        || (Number(before.mode) & 0o7777) !== 0o600
+        || (this.expectedUid !== null && Number(before.uid) !== this.expectedUid)
+        || !Number.isInteger(this.fs.constants.O_NOFOLLOW)) {
+        throw new Error("untrusted state file");
+      }
+      fd = this.fs.openSync(this.filePath, this.fs.constants.O_RDONLY | this.fs.constants.O_NOFOLLOW);
+      const opened = this.fs.fstatSync(fd);
+      if (!opened.isFile()
+        || (Number(opened.mode) & 0o7777) !== 0o600
+        || (this.expectedUid !== null && Number(opened.uid) !== this.expectedUid)
+        || String(before.dev) !== String(opened.dev)
+        || String(before.ino) !== String(opened.ino)) {
+        throw new Error("state file identity changed");
+      }
+      if (!Number.isSafeInteger(opened.size) || opened.size < 0 || opened.size > MAX_STATE_BYTES) {
+        throw new Error("state file size is unsupported");
+      }
+      parsed = JSON.parse(this.fs.readFileSync(fd, "utf8"));
       if (safeGet(parsed, "version") !== RESOURCE_STATE_VERSION) throw new Error("unsupported state version");
     } catch {
       this.state = createResourceSnapshot({}, { terminalFactLimit: this.terminalFactLimit });
       return this.snapshot();
+    } finally {
+      if (fd !== null) {
+        try { this.fs.closeSync(fd); } catch {}
+      }
     }
     this.state = createResourceSnapshot(parsed, { terminalFactLimit: this.terminalFactLimit });
     return this.snapshot();
@@ -237,8 +385,12 @@ class ResourceStateStore {
   save(input) {
     const next = createResourceSnapshot(input, { terminalFactLimit: this.terminalFactLimit });
     const tmpPath = `${this.filePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
+    const serialized = `${JSON.stringify(next, null, 2)}\n`;
+    if (Buffer.byteLength(serialized, "utf8") > MAX_STATE_BYTES) {
+      throw new RangeError("resource state exceeds the maximum serialized size");
+    }
     try {
-      this.fs.writeFileSync(tmpPath, `${JSON.stringify(next, null, 2)}\n`, {
+      this.fs.writeFileSync(tmpPath, serialized, {
         encoding: "utf8",
         flag: "wx",
         mode: 0o600,
@@ -261,6 +413,8 @@ class ResourceStateStore {
 module.exports = {
   RESOURCE_STATE_VERSION,
   DEFAULT_TERMINAL_FACT_LIMIT,
+  MAX_TERMINAL_FACT_LIMIT,
+  MAX_STATE_BYTES,
   ResourceStateStore,
   createResourceSnapshot,
 };
