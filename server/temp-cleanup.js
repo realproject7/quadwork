@@ -27,7 +27,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { removeTreeNoFollow } = require("./resource-temp");
+const { removeConfinedPath } = require("./resource-temp");
 
 const DEFAULT_MAX_AGE_HOURS = 72;
 
@@ -50,7 +50,7 @@ function removeIfStale(root, entry, cutoffMs, result) {
     return "kept";
   }
   try {
-    removeTreeNoFollow(root, entry, fs);
+    removeConfinedPath(root, entry, fs);
     result.removed.push(entry);
     return "removed";
   } catch (err) {

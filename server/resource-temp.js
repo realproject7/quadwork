@@ -8,6 +8,7 @@
 // override TMPDIR; creating a directory here is not evidence of relocation.
 
 const fs = require("fs");
+const crypto = require("crypto");
 const path = require("path");
 
 const TMPFS_MAGIC = 0x01021994n;
@@ -15,6 +16,8 @@ const RAMFS_MAGIC = 0x858458f6n;
 const DEFAULT_STALE_HOURS = 72;
 const GENERATION_PREFIX = "generation-";
 const GENERATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const QUARANTINE_PREFIX = ".quadwork-delete-";
+const FACT_STATE = new WeakMap();
 
 class ResourceTempError extends Error {
   constructor(code, message, facts = null) {
@@ -56,14 +59,41 @@ function numberToBigInt(value) {
   throw new TypeError("filesystem fact is not numeric");
 }
 
-function defaultStatfs(target) {
-  return fs.statfsSync(target, { bigint: true });
+function statIdentity(st) {
+  if (st.dev === undefined || st.ino === undefined) throw new TypeError("filesystem identity is unavailable");
+  return Object.freeze({
+    dev: String(st.dev),
+    ino: String(st.ino),
+    uid: st.uid === undefined ? null : Number(st.uid),
+    mode: Number(st.mode) & 0o7777,
+  });
+}
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function readFilesystemState(statfsProbe, target) {
+  const statfs = statfsProbe(target);
+  const filesystemTypeBig = BigInt.asUintN(32, numberToBigInt(statfs.type));
+  const availableBytesBig = numberToBigInt(statfs.bavail) * numberToBigInt(statfs.bsize);
+  if (availableBytesBig < 0n || availableBytesBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new TypeError("filesystem capacity is outside the supported range");
+  }
+  return Object.freeze({
+    typeBig: filesystemTypeBig,
+    type: `0x${filesystemTypeBig.toString(16)}`,
+    availableBytesBig,
+    availableBytes: Number(availableBytesBig),
+    diskBacked: filesystemTypeBig !== TMPFS_MAGIC && filesystemTypeBig !== RAMFS_MAGIC,
+  });
 }
 
 // Read-only inspection. It deliberately does not create, chmod, or clean any
 // path. Call ensureTempRoot explicitly when host mutation is intended.
 function inspectTempRoot(options = {}) {
   const fsImpl = options.fsImpl || fs;
+  const statfsProbe = options.statfs || ((target) => fsImpl.statfsSync(target, { bigint: true }));
   const configuredRoot = options.tempRoot;
   const minimumFreeBytesBig = Number.isFinite(options.minimumFreeBytes) && options.minimumFreeBytes >= 0
     ? BigInt(Math.trunc(options.minimumFreeBytes))
@@ -121,45 +151,51 @@ function inspectTempRoot(options = {}) {
     });
   }
 
-  let statfs;
+  let filesystem;
   try {
-    statfs = (options.statfs || defaultStatfs)(canonicalRoot);
+    filesystem = readFilesystemState(statfsProbe, canonicalRoot);
   } catch {
     return unavailable(configuredRoot, "statfs_failed", { canonicalRoot, minimumFreeBytes });
   }
-
-  let filesystemTypeBig;
-  let availableBytesBig;
+  let finalStat;
+  let finalIdentity;
+  let finalRealpath;
   try {
-    filesystemTypeBig = numberToBigInt(statfs.type);
-    availableBytesBig = numberToBigInt(statfs.bavail) * numberToBigInt(statfs.bsize);
+    finalStat = fsImpl.lstatSync(canonicalRoot);
+    finalIdentity = statIdentity(finalStat);
+    finalRealpath = realpathSync(fsImpl, canonicalRoot);
   } catch {
-    return unavailable(configuredRoot, "statfs_invalid", { canonicalRoot, minimumFreeBytes });
+    return unavailable(configuredRoot, "root_identity_lost", { canonicalRoot, minimumFreeBytes });
   }
-  // Facts are JSON-safe so they can be consumed by a later API snapshot.
-  const filesystemType = `0x${filesystemTypeBig.toString(16)}`;
-  const availableBytes = Number(availableBytesBig);
-  const diskBacked = filesystemTypeBig !== TMPFS_MAGIC && filesystemTypeBig !== RAMFS_MAGIC;
-  if (!diskBacked) {
+  const initialIdentity = statIdentity(rootStat);
+  if (!sameIdentity(initialIdentity, finalIdentity)
+    || initialIdentity.uid !== finalIdentity.uid
+    || initialIdentity.mode !== finalIdentity.mode
+    || finalStat.isSymbolicLink()
+    || !finalStat.isDirectory()
+    || finalRealpath !== canonicalRoot) {
+    return unavailable(configuredRoot, "root_identity_changed", { canonicalRoot, minimumFreeBytes });
+  }
+  if (!filesystem.diskBacked) {
     return unavailable(configuredRoot, "root_is_memory_backed", {
       canonicalRoot,
-      filesystemType,
-      availableBytes,
+      filesystemType: filesystem.type,
+      availableBytes: filesystem.availableBytes,
       minimumFreeBytes,
       diskBacked: false,
     });
   }
-  if (availableBytesBig < minimumFreeBytesBig) {
+  if (filesystem.availableBytesBig < minimumFreeBytesBig) {
     return unavailable(configuredRoot, "insufficient_free_space", {
       canonicalRoot,
-      filesystemType,
-      availableBytes,
+      filesystemType: filesystem.type,
+      availableBytes: filesystem.availableBytes,
       minimumFreeBytes,
       diskBacked: true,
     });
   }
 
-  return Object.freeze({
+  const facts = Object.freeze({
     available: true,
     reason: null,
     code: "ready",
@@ -167,11 +203,20 @@ function inspectTempRoot(options = {}) {
     canonicalRoot,
     mode,
     ownerUid: rootStat.uid,
-    filesystemType,
-    availableBytes,
+    filesystemType: filesystem.type,
+    availableBytes: filesystem.availableBytes,
     minimumFreeBytes,
     diskBacked: true,
   });
+  FACT_STATE.set(facts, Object.freeze({
+    fsImpl,
+    statfsProbe,
+    identity: initialIdentity,
+    expectedUid,
+    filesystemTypeBig: filesystem.typeBig,
+    minimumFreeBytesBig,
+  }));
+  return facts;
 }
 
 function throwFromFacts(facts) {
@@ -201,7 +246,9 @@ function ensureTempRoot(options = {}) {
     if (expectedUid !== null && st.uid !== expectedUid) {
       throw new ResourceTempError("root_owner_mismatch", "resource temp root has an unexpected owner");
     }
-    fsImpl.chmodSync(configuredRoot, 0o700);
+    if ((Number(st.mode) & 0o7777) !== 0o700) {
+      throw new ResourceTempError("root_mode_unsafe", "resource temp root must be created with mode 0700");
+    }
   } catch (err) {
     if (err instanceof ResourceTempError) throw err;
     throw new ResourceTempError("root_create_failed", `cannot create resource temp root: ${err.message}`);
@@ -218,29 +265,52 @@ function validateGenerationId(generationId) {
   return generationId;
 }
 
-function requireAvailableFacts(facts) {
-  if (!facts || facts.available !== true || !path.isAbsolute(facts.canonicalRoot || "")) {
-    throw new ResourceTempError("root_not_ready", "available resource temp facts are required", facts || null);
+function requireAvailableFacts(facts, fsImpl) {
+  const state = facts && FACT_STATE.get(facts);
+  if (!state || facts.available !== true || !path.isAbsolute(facts.canonicalRoot || "")) {
+    throw new ResourceTempError("facts_untrusted", "authentic available resource temp facts are required", null);
   }
-  return facts;
+  if (state.fsImpl !== fsImpl) {
+    throw new ResourceTempError("facts_filesystem_mismatch", "resource temp facts belong to a different filesystem adapter", facts);
+  }
+  return state;
 }
 
-function assertRootIdentity(facts, fsImpl) {
+function assertRootSafety(facts, fsImpl, { requireFreeSpace }) {
+  const state = requireAvailableFacts(facts, fsImpl);
   let st;
+  let identity;
   let currentRealpath;
+  let filesystem;
   try {
     st = fsImpl.lstatSync(facts.canonicalRoot);
+    identity = statIdentity(st);
     currentRealpath = realpathSync(fsImpl, facts.canonicalRoot);
+    filesystem = readFilesystemState(state.statfsProbe, facts.canonicalRoot);
   } catch (err) {
     throw new ResourceTempError("root_identity_lost", `resource temp root is no longer available: ${err.message}`, facts);
   }
-  if (st.isSymbolicLink() || !st.isDirectory() || currentRealpath !== facts.canonicalRoot) {
+  if (st.isSymbolicLink()
+    || !st.isDirectory()
+    || currentRealpath !== facts.canonicalRoot
+    || !sameIdentity(identity, state.identity)) {
     throw new ResourceTempError("root_identity_changed", "resource temp root identity changed", facts);
   }
+  if (identity.uid !== state.identity.uid
+    || (state.expectedUid !== null && identity.uid !== state.expectedUid)
+    || identity.mode !== 0o700) {
+    throw new ResourceTempError("root_permissions_changed", "resource temp root ownership or mode changed", facts);
+  }
+  if (!filesystem.diskBacked || filesystem.typeBig !== state.filesystemTypeBig) {
+    throw new ResourceTempError("root_filesystem_changed", "resource temp filesystem class changed", facts);
+  }
+  if (requireFreeSpace && filesystem.availableBytesBig < state.minimumFreeBytesBig) {
+    throw new ResourceTempError("insufficient_free_space", "resource temp root no longer has required free space", facts);
+  }
+  return state;
 }
 
 function generationPath(facts, generationId) {
-  requireAvailableFacts(facts);
   validateGenerationId(generationId);
   const candidate = path.join(facts.canonicalRoot, `${GENERATION_PREFIX}${generationId}`);
   if (!isWithin(facts.canonicalRoot, candidate)) {
@@ -251,15 +321,19 @@ function generationPath(facts, generationId) {
 
 function createGenerationTemp(options = {}) {
   const fsImpl = options.fsImpl || fs;
-  const facts = requireAvailableFacts(options.facts);
-  assertRootIdentity(facts, fsImpl);
+  const facts = options.facts;
+  const state = assertRootSafety(facts, fsImpl, { requireFreeSpace: true });
   const generationId = validateGenerationId(options.generationId);
   const target = generationPath(facts, generationId);
   try {
     fsImpl.mkdirSync(target, { recursive: false, mode: 0o700 });
-    fsImpl.chmodSync(target, 0o700);
     const st = fsImpl.lstatSync(target);
-    if (st.isSymbolicLink() || !st.isDirectory() || (st.mode & 0o7777) !== 0o700) {
+    const identity = statIdentity(st);
+    if (st.isSymbolicLink()
+      || !st.isDirectory()
+      || identity.mode !== 0o700
+      || identity.uid !== state.identity.uid
+      || identity.dev !== state.identity.dev) {
       throw new ResourceTempError("generation_path_unsafe", "generation temp path is not a real directory", facts);
     }
     const canonicalTarget = realpathSync(fsImpl, target);
@@ -281,38 +355,41 @@ function createGenerationTemp(options = {}) {
   return Object.freeze({ generationId, path: target, mode: 0o700 });
 }
 
-// Remove a tree without following symbolic links. `target` and every recursive
-// child are lexical descendants of the already-canonical root. A symlink is
-// unlinked as an entry; its target is never traversed.
-function removeTreeNoFollow(root, target, fsImpl = fs) {
+// Atomically detach an owned entry from its caller-visible path, then delegate
+// recursive disposal to Node's native fs.rm implementation. Unlike a custom
+// lstat/readdir/unlink walk, the native primitive treats symlinks as entries
+// and does not recurse through their targets. A swap before rename moves the
+// swapped entry into quarantine; a swap after rename can only replace the
+// unguessable quarantine entry and is likewise removed as an entry.
+function removeConfinedPath(root, target, fsImpl = fs) {
   if (!path.isAbsolute(root) || !path.isAbsolute(target) || !isWithin(root, target)) {
     throw new ResourceTempError("cleanup_outside_root", "cleanup target is outside the configured root");
   }
-  let st;
-  try {
-    st = fsImpl.lstatSync(target);
-  } catch (err) {
-    if (err && err.code === "ENOENT") return false;
-    throw err;
-  }
-  if (st.isSymbolicLink() || !st.isDirectory()) {
-    fsImpl.unlinkSync(target);
-    return true;
-  }
-  for (const name of fsImpl.readdirSync(target)) {
-    const child = path.join(target, name);
-    if (!isWithin(root, child)) {
-      throw new ResourceTempError("cleanup_outside_root", "cleanup child is outside the configured root");
+  let quarantine = null;
+  let renamed = false;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    quarantine = path.join(root, `${QUARANTINE_PREFIX}${process.pid}-${crypto.randomBytes(16).toString("hex")}`);
+    try {
+      fsImpl.renameSync(target, quarantine);
+      renamed = true;
+      break;
+    } catch (err) {
+      if (err && err.code === "ENOENT") return false;
+      if (err && ["EEXIST", "ENOTEMPTY"].includes(err.code)) continue;
+      throw err;
     }
-    removeTreeNoFollow(root, child, fsImpl);
   }
-  fsImpl.rmdirSync(target);
+  if (!renamed || !quarantine) {
+    throw new ResourceTempError("cleanup_quarantine_failed", "could not quarantine cleanup target");
+  }
+  fsImpl.rmSync(quarantine, { recursive: true, force: true, maxRetries: 2 });
   return true;
 }
 
 function reclaimGenerationTemp(options = {}) {
   const fsImpl = options.fsImpl || fs;
-  const facts = requireAvailableFacts(options.facts);
+  const facts = options.facts;
+  requireAvailableFacts(facts, fsImpl);
   const generationId = validateGenerationId(options.generationId);
   if (options.confirmedProcessTreeExit !== true) {
     return Object.freeze({
@@ -321,9 +398,9 @@ function reclaimGenerationTemp(options = {}) {
       reason: "process_tree_exit_unconfirmed",
     });
   }
-  assertRootIdentity(facts, fsImpl);
+  assertRootSafety(facts, fsImpl, { requireFreeSpace: false });
   const target = generationPath(facts, generationId);
-  const removed = removeTreeNoFollow(facts.canonicalRoot, target, fsImpl);
+  const removed = removeConfinedPath(facts.canonicalRoot, target, fsImpl);
   return Object.freeze({ generationId, reclaimed: true, alreadyAbsent: !removed });
 }
 
@@ -335,14 +412,20 @@ function newestTimeMs(st) {
 // root are candidates; known-live generations are excluded even if old.
 function sweepStaleGenerationTemps(options = {}) {
   const fsImpl = options.fsImpl || fs;
-  const facts = requireAvailableFacts(options.facts);
-  assertRootIdentity(facts, fsImpl);
+  const facts = options.facts;
+  requireAvailableFacts(facts, fsImpl);
+  const suppliedLive = options.liveGenerationIds;
+  if (!Array.isArray(suppliedLive) && !(suppliedLive instanceof Set)) {
+    throw new ResourceTempError("live_generation_set_required", "an authoritative array or Set of live generation ids is required", facts);
+  }
+  const live = new Set();
+  for (const generationId of suppliedLive) live.add(validateGenerationId(generationId));
+  assertRootSafety(facts, fsImpl, { requireFreeSpace: false });
   const now = typeof options.now === "number" ? options.now : Date.now();
   const maxAgeHours = Number.isFinite(options.maxAgeHours) && options.maxAgeHours > 0
     ? options.maxAgeHours
     : DEFAULT_STALE_HOURS;
   const cutoffMs = now - maxAgeHours * 60 * 60 * 1000;
-  const live = new Set(options.liveGenerationIds || []);
   const result = { removed: [], kept: [], errors: [] };
 
   let names;
@@ -363,7 +446,7 @@ function sweepStaleGenerationTemps(options = {}) {
         result.kept.push(generationId);
         continue;
       }
-      removeTreeNoFollow(facts.canonicalRoot, target, fsImpl);
+      removeConfinedPath(facts.canonicalRoot, target, fsImpl);
       result.removed.push(generationId);
     } catch (err) {
       result.errors.push(`${generationId}: ${err.message}`);
@@ -381,5 +464,5 @@ module.exports = {
   createGenerationTemp,
   reclaimGenerationTemp,
   sweepStaleGenerationTemps,
-  removeTreeNoFollow,
+  removeConfinedPath,
 };
