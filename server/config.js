@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const { parseRuntimeResources } = require("./resource-policy");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
+const CONFIG_LOCK_PATH = path.join(os.homedir(), ".quadwork", "config.lock");
 
 const DEFAULT_CONFIG = {
   port: 8400,
@@ -22,6 +23,7 @@ const INTERNAL_CONFIG_WRITE = Symbol("internalConfigWrite");
 // Every V2 config commit consults this map, so no other mutation path can make
 // a colliding project active or change the reserved identity mid-cleanup.
 const v2OwnershipReservations = new Map();
+let configWriteLockDepth = 0;
 
 class ConfigurationValidationError extends Error {
   constructor(code, field, message, ownerProjectId) {
@@ -35,6 +37,85 @@ class ConfigurationValidationError extends Error {
 
 function validationError(code, field, message, ownerProjectId) {
   return new ConfigurationValidationError(code, field, message, ownerProjectId);
+}
+
+function liveProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !!error && error.code === "EPERM";
+  }
+}
+
+function readConfigLockOwner() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_LOCK_PATH, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function acquireConfigWriteLock() {
+  ensureSecureDir(path.dirname(CONFIG_LOCK_PATH));
+  const token = crypto.randomUUID();
+  const payload = JSON.stringify({ pid: process.pid, token });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const candidatePath = `${CONFIG_LOCK_PATH}.${process.pid}.${token}.tmp`;
+    try {
+      writeSecureFile(candidatePath, payload);
+      // Link a fully-written inode into the fixed lock name. Unlike open+write,
+      // another process can never observe an empty/partial owner record and
+      // misclassify a live acquisition as corrupt.
+      fs.linkSync(candidatePath, CONFIG_LOCK_PATH);
+      return token;
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") throw error;
+      const owner = readConfigLockOwner();
+      if (owner && liveProcess(owner.pid)) {
+        throw validationError(
+          "config_write_busy",
+          "config",
+          "configuration is being updated; retry the operation",
+        );
+      }
+      // Corrupt or dead-owner locks are stale. Remove only after observing the
+      // owner as non-live, then make one bounded exclusive-create retry.
+      try { fs.unlinkSync(CONFIG_LOCK_PATH); } catch (unlinkError) {
+        if (!unlinkError || unlinkError.code !== "ENOENT") {
+          throw validationError(
+            "config_write_busy",
+            "config",
+            "configuration write lock could not be recovered",
+          );
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(candidatePath); } catch {}
+    }
+  }
+  throw validationError("config_write_busy", "config", "configuration is being updated; retry the operation");
+}
+
+function releaseConfigWriteLock(token) {
+  if (!token) return;
+  const owner = readConfigLockOwner();
+  if (!owner || owner.pid !== process.pid || owner.token !== token) return;
+  try { fs.unlinkSync(CONFIG_LOCK_PATH); } catch {}
+}
+
+function withConfigWriteLock(operation) {
+  if (configWriteLockDepth > 0) return operation();
+  const token = acquireConfigWriteLock();
+  configWriteLockDepth = 1;
+  try {
+    return operation();
+  } finally {
+    configWriteLockDepth = 0;
+    releaseConfigWriteLock(token);
+  }
 }
 
 function hasOwn(value, key) {
@@ -855,6 +936,10 @@ function writeSecureFile(filePath, data, extraOpts = {}) {
 // same filesystem, so a reader always sees either the old or the new file, never
 // a partial one. The tmp name carries the pid so two processes can't collide.
 function writeConfig(cfg, options = {}) {
+  return withConfigWriteLock(() => writeConfigUnlocked(cfg, options));
+}
+
+function writeConfigUnlocked(cfg, options = {}) {
   // Legacy field-scoped writers still converge here. While an unarchive owns
   // a reservation, make this low-level atomic boundary enforce the same
   // authority so a stale whole-document write cannot bypass V2 commits.
@@ -892,15 +977,17 @@ function writeConfig(cfg, options = {}) {
 // mutators and the field-scoped endpoints go through here instead of doing their
 // own GET→mutate→writeConfig. Returns the mutated config.
 function updateConfig(mutator, options = {}) {
-  const { config: cfg, missing } = readConfigDocument();
-  // Apply the old agent-key migration in memory. A failed mutator must not
-  // trigger readConfig()'s eager legacy write before the candidate validates.
-  migrateAgentKeys(cfg, { persist: false });
-  const previousConfig = cloneConfigurationValue(cfg);
-  mutator(cfg);
-  if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
-  writeConfig(cfg, { ...options, previousConfig, [INTERNAL_CONFIG_WRITE]: true });
-  return cfg;
+  return withConfigWriteLock(() => {
+    const { config: cfg, missing } = readConfigDocument();
+    // Apply the old agent-key migration in memory. A failed mutator must not
+    // trigger readConfig()'s eager legacy write before the candidate validates.
+    migrateAgentKeys(cfg, { persist: false });
+    const previousConfig = cloneConfigurationValue(cfg);
+    mutator(cfg);
+    if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
+    writeConfig(cfg, { ...options, previousConfig, [INTERNAL_CONFIG_WRITE]: true });
+    return cfg;
+  });
 }
 
 /**

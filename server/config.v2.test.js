@@ -9,6 +9,7 @@ const path = require("path");
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-config-v2-"));
 const CONFIG_DIR = path.join(TEST_HOME, ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const CONFIG_LOCK_PATH = path.join(CONFIG_DIR, "config.lock");
 const REPOS_DIR = path.join(TEST_HOME, "repos");
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 fs.mkdirSync(REPOS_DIR, { recursive: true });
@@ -75,6 +76,27 @@ function activated(projects) {
 
 function diskBytes() {
   return fs.readFileSync(CONFIG_PATH, "utf8");
+}
+
+// Cross-process writers serialize the entire fresh-read/validate/rename
+// transaction. A live owner fails closed without mutation; a dead-owner lock
+// is recovered by one bounded exclusive-create retry.
+{
+  writeConfig({ port: 8400, projects: [] });
+  const before = diskBytes();
+  fs.writeFileSync(CONFIG_LOCK_PATH, JSON.stringify({ pid: process.pid, token: "other-process" }));
+  expectCode(
+    () => writeConfig({ port: 8401, projects: [] }),
+    "config_write_busy",
+    "live cross-process config writer blocks a competing transaction",
+  );
+  assert.equal(diskBytes(), before);
+  fs.unlinkSync(CONFIG_LOCK_PATH);
+
+  fs.writeFileSync(CONFIG_LOCK_PATH, JSON.stringify({ pid: -1, token: "stale" }));
+  writeConfig({ port: 8402, projects: [] });
+  assert.equal(readConfig().port, 8402);
+  ok(!fs.existsSync(CONFIG_LOCK_PATH), "dead-owner config lock is recovered and released");
 }
 
 // Existing archived projects cannot be activated through either public config
