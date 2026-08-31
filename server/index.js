@@ -2267,10 +2267,26 @@ async function cleanupProjectRuntime(projectId) {
 const projectLifecycle = createProjectLifecycleController({ cleanupProject: cleanupProjectRuntime });
 app.set("projectLifecycle", projectLifecycle);
 
+function validateTriggerAutomationRequest(projectId, body = {}) {
+  return routes.validateCurrentOwnedAssignment(projectId, body);
+}
+
+function rejectChangedTriggerAssignment(res, result) {
+  return res.status(result?.status || 409).json({
+    ok: false,
+    enabled: false,
+    error: result?.error || "project assignment changed; refresh and retry",
+    code: result?.code || "project_assignment_changed",
+    project_id: result?.project_id,
+  });
+}
+
 app.post("/api/triggers/:project/start", (req, res) => {
   const { project } = req.params;
   try { assertProjectAdmitted(project); }
   catch (err) { return respondLifecycleFailure(res, err, { enabled: false }); }
+  const assignment = validateTriggerAutomationRequest(project, req.body || {});
+  if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
   // #812: refuse to start a trigger for a parked (idle) project — no
   // timer created, no agents pulsed. Toggle the project off idle first.
   if (isProjectIdleId(project)) {
@@ -2341,6 +2357,8 @@ app.post("/api/triggers/:project/start", (req, res) => {
 
 app.post("/api/triggers/:project/stop", (req, res) => {
   const { project } = req.params;
+  const assignment = validateTriggerAutomationRequest(project, req.body || {});
+  if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
   stopTrigger(project);
   res.json({ ok: true, enabled: false });
 });
@@ -3300,6 +3318,7 @@ module.exports = {
   syncTriggersFromConfig,
   autoStartBridges,
   autoStopBridges,
+  bridgeAssignmentBody,
   autoStopPollingTick,
   ownedBatchFingerprint,
   normalizedAssignmentItems,
@@ -3307,6 +3326,7 @@ module.exports = {
   ownedBatchAutomationState,
   legacyV1BatchAutomationState,
   batchAutomationState,
+  validateTriggerAutomationRequest,
   registerCaffeinateOwner,
   caffeinateStatus,
   releaseProjectCaffeinate,

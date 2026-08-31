@@ -147,6 +147,36 @@ assert.equal(runtime.batchAutomationState(
   { ...legacyActive, current: false, active: false },
 ).shouldStop, true, "an explicit live clear remains a V1-compatible stop signal without becoming V2 ownership");
 
+assert.deepEqual(runtime.bridgeAssignmentBody("a", { generation: 4 }, { ...ownedAutomation, mode: "v2" }), {
+  project_id: "a",
+  admission_generation: 4,
+  compatibility_mode: "v2",
+  ...ownedAutomation.identity,
+}, "V2 bridge automation carries the exact assignment set and explicit compatibility mode");
+assert.deepEqual(runtime.bridgeAssignmentBody("a", { generation: 4 }, runtime.batchAutomationState(legacyProgress, legacyActive)), {
+  project_id: "a",
+  admission_generation: 4,
+  compatibility_mode: "v1",
+}, "V1 bridge automation stays explicitly compatible without inventing V2 ownership");
+
+const originalValidateCurrentOwnedAssignment = routes.validateCurrentOwnedAssignment;
+const triggerValidationCalls = [];
+routes.validateCurrentOwnedAssignment = (projectId, body) => {
+  triggerValidationCalls.push({ projectId, body });
+  return body.assignment_attempt === "stale"
+    ? { ok: false, status: 409, code: "project_assignment_changed", project_id: projectId }
+    : { ok: true, manual: !body.assignment_attempt };
+};
+assert.equal(runtime.validateTriggerAutomationRequest("a", {}).ok, true,
+  "manual trigger controls remain compatible");
+assert.equal(runtime.validateTriggerAutomationRequest("a", { assignment_attempt: "stale" }).ok, false,
+  "trigger automation delegates stale assignment rejection to the live queue guard");
+assert.deepEqual(triggerValidationCalls, [
+  { projectId: "a", body: {} },
+  { projectId: "a", body: { assignment_attempt: "stale" } },
+]);
+routes.validateCurrentOwnedAssignment = originalValidateCurrentOwnedAssignment;
+
 const originalCancelBackground = routes.cancelProjectBackground;
 
 function cleanup() {
