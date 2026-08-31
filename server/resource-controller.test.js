@@ -291,6 +291,33 @@ async function main() {
   }
   ok(true, "invalid fallback counters and unverified observation flags never claim OOM");
 
+  const rawResultFlagController = new ResourceController({
+    executeProcess: async () => ({ code: null, signal: "SIGKILL", oomKilled: true }),
+    queryScope: async () => ({ oomKillCount: -1 }),
+  });
+  const rawResultFlag = await rawResultFlagController.runWorkerScope(workerSpec());
+  ok(rawResultFlag.fact.reason === "signal",
+    "a raw executor-result OOM flag cannot replace validated cgroup observation provenance");
+
+  let rawErrorFlag;
+  const rawErrorFlagController = new ResourceController({
+    executeProcess: async () => {
+      const error = new Error("raw error OOM assertion");
+      error.exitCode = 0;
+      error.oomKilled = true;
+      throw error;
+    },
+    queryScope: async () => ({ oomKillCount: "invalid" }),
+  });
+  try {
+    await rawErrorFlagController.runControlChild(controlSpec("88"));
+  } catch (error) {
+    rawErrorFlag = error;
+  }
+  ok(rawErrorFlag?.resourceFact?.reason === "unknown" &&
+     rawErrorFlagController.snapshot().control_children.active === 0,
+    "a raw executor-error OOM flag remains unknown and releases its permit");
+
   const throwingCounterController = new ResourceController({
     executeProcess: async () => ({ code: 0, signal: null }),
     queryScope: async () => Object.defineProperty({}, "oomKillCount", {
@@ -301,6 +328,63 @@ async function main() {
   ok(throwingCounter.fact.reason === "normal_exit" &&
      throwingCounterController.snapshot().active_scopes.length === 0,
     "an unreadable fallback counter is invalid and cannot strand active state");
+
+  const hostileResultObservation = { code: 0, signal: null };
+  Object.defineProperty(hostileResultObservation, "scopeObservation", {
+    get() { throw new Error("hostile result observation getter"); },
+  });
+  const hostileResultController = new ResourceController({
+    executeProcess: async () => hostileResultObservation,
+    queryScope: noOom,
+  });
+  const hostileResult = await hostileResultController.runControlChild(controlSpec("87"));
+  ok(hostileResult.fact.reason === "normal_exit" &&
+     hostileResultController.snapshot().active_scopes.length === 0 &&
+     hostileResultController.snapshot().control_children.active === 0,
+    "a hostile result observation getter falls back without retaining state or permit");
+
+  let hostileErrorResult;
+  const hostileErrorController = new ResourceController({
+    executeProcess: async () => {
+      const error = new Error("hostile error observation getter");
+      error.exitCode = 9;
+      Object.defineProperty(error, "scopeObservation", {
+        get() { throw new Error("must stay inside observation boundary"); },
+      });
+      throw error;
+    },
+    queryScope: noOom,
+  });
+  try {
+    await hostileErrorController.runControlChild(controlSpec("86"));
+  } catch (error) {
+    hostileErrorResult = error;
+  }
+  ok(hostileErrorResult?.resourceFact?.reason === "unknown" &&
+     hostileErrorController.snapshot().active_scopes.length === 0 &&
+     hostileErrorController.snapshot().control_children.active === 0,
+    "a hostile error observation getter preserves the original failure and releases state and permit");
+
+  let factClockCalls = 0;
+  const terminalThrowController = new ResourceController({
+    executeProcess: async () => ({ code: 0, signal: null }),
+    queryScope: noOom,
+    now: () => {
+      factClockCalls += 1;
+      if (factClockCalls === 2) throw new Error("terminal fact clock failed");
+      return "2026-08-31T00:00:00.000Z";
+    },
+  });
+  await assert.rejects(
+    terminalThrowController.runControlChild(controlSpec("85")),
+    /terminal fact clock failed/,
+  );
+  assert.equal(terminalThrowController.snapshot().active_scopes.length, 0);
+  assert.equal(terminalThrowController.snapshot().control_children.active, 0);
+  const afterTerminalThrow = await terminalThrowController.runControlChild(controlSpec("84"));
+  ok(afterTerminalThrow.fact.reason === "normal_exit" &&
+     terminalThrowController.snapshot().control_children.active === 0,
+    "terminal-fact failure releases outer active state and the leaf permit for the next child");
 
   let queryAbortObserved = false;
   const hungQueryController = new ResourceController({

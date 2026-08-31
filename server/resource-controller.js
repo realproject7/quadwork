@@ -279,8 +279,7 @@ function normalizeScopeObservation(observation, requirePreCollectCapture = false
 
 function terminalReason(result, scopeObservation, executionRejected = false) {
   const count = scopeObservation && scopeObservation.oomKillCount;
-  if (result?.oomKilled === true ||
-      (validOomKillCount(count) && (typeof count === "bigint" ? count > 0n : count > 0))) {
+  if (validOomKillCount(count) && (typeof count === "bigint" ? count > 0n : count > 0)) {
     return "oom_kill";
   }
   if (normalizeSignal(result?.signal) !== null) return "signal";
@@ -303,7 +302,12 @@ function terminalFact({ ids, resourceClass, result, scopeObservation, executionR
 }
 
 function durableScopeObservation(value) {
-  const observation = value && value.scopeObservation;
+  let observation;
+  try {
+    observation = value && value.scopeObservation;
+  } catch {
+    return null;
+  }
   return normalizeScopeObservation(observation, true);
 }
 
@@ -420,47 +424,45 @@ class ResourceController {
       started_at: timestamp(this.now),
     });
 
-    let result = null;
-    let executionError = null;
-    let scopeObservation = null;
     try {
-      result = await this.executeProcess({
-        file: built.file,
-        args: [...built.args],
-        signal,
-        projectId: ids.projectId,
-        generationId: ids.generationId,
-        unitName: ids.unitName,
-        resourceClass,
-        controlClassName: resourceClass === "control" ? controlClassName : null,
-      });
-      scopeObservation = durableScopeObservation(result);
-    } catch (error) {
-      executionError = error;
-      result = {
-        code: Number.isInteger(error?.exitCode) ? error.exitCode : null,
-        signal: normalizeSignal(error?.signal),
-        oomKilled: error?.oomKilled === true,
-      };
-      scopeObservation = durableScopeObservation(error);
-    }
+      let result = null;
+      let executionError = null;
+      let scopeObservation = null;
+      try {
+        result = await this.executeProcess({
+          file: built.file,
+          args: [...built.args],
+          signal,
+          projectId: ids.projectId,
+          generationId: ids.generationId,
+          unitName: ids.unitName,
+          resourceClass,
+          controlClassName: resourceClass === "control" ? controlClassName : null,
+        });
+        scopeObservation = durableScopeObservation(result);
+      } catch (error) {
+        executionError = error;
+        result = {
+          code: Number.isInteger(error?.exitCode) ? error.exitCode : null,
+          signal: normalizeSignal(error?.signal),
+        };
+        scopeObservation = durableScopeObservation(error);
+      }
 
-    if (scopeObservation === null) {
-      const fallbackObservation = await queryScopeBounded(this.queryScope, {
-        projectId: ids.projectId,
-        generationId: ids.generationId,
-        unitName: ids.unitName,
-        resourceClass,
-      }, {
-        timeoutMs: this.scopeQueryTimeoutMs,
-        signal,
-      });
-      scopeObservation = normalizeScopeObservation(fallbackObservation);
-    }
+      if (scopeObservation === null) {
+        const fallbackObservation = await queryScopeBounded(this.queryScope, {
+          projectId: ids.projectId,
+          generationId: ids.generationId,
+          unitName: ids.unitName,
+          resourceClass,
+        }, {
+          timeoutMs: this.scopeQueryTimeoutMs,
+          signal,
+        });
+        scopeObservation = normalizeScopeObservation(fallbackObservation);
+      }
 
-    let fact;
-    try {
-      fact = terminalFact({
+      const fact = terminalFact({
         ids,
         resourceClass,
         result,
@@ -470,18 +472,18 @@ class ResourceController {
       });
       this.terminalFacts.push(fact);
       if (this.terminalFacts.length > this.terminalFactLimit) this.terminalFacts.shift();
+
+      if (executionError) {
+        executionError.resourceFact = { ...fact };
+        throw executionError;
+      }
+      return { result, fact: { ...fact } };
     } finally {
-      // Observation/classification failures must not strand an active scope in
-      // the redacted controller state. The control limiter releases separately
-      // in its own finally block.
+      // Execute, observation, normalization, and terminal-fact failures all
+      // converge here. runControlChild's leaf limiter has its own outer finally,
+      // so a thrown controller dependency cannot retain either state or permit.
       this.activeScopes.delete(ids.unitName);
     }
-
-    if (executionError) {
-      executionError.resourceFact = { ...fact };
-      throw executionError;
-    }
-    return { result, fact: { ...fact } };
   }
 
   snapshot() {
