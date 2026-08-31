@@ -115,6 +115,32 @@ function code(result) {
   assert.equal(code(parseWorkItemLine("- [Owner/Product-Web#42", { repositories })), "invalid_work_item_line");
 }
 
+// Obvious immediate repo-colon-hash variants are executable-looking malformed
+// refs and must remain visible to the fail-closed batch parser. URLs and a
+// colon followed by intervening prose are ordinary non-executable text.
+{
+  for (const line of [
+    "Owner/Web:#42",
+    "[Owner/Web:#42]",
+    "Other/Repo:#42",
+    "Owner/Web: #42",
+  ]) {
+    assert.equal(code(parseWorkItemLine(line, { repositories })), "invalid_work_item_ref", line);
+  }
+  assert.equal(parseWorkItemLine("https://example.test/Owner/Web:#42", { repositories }).ignored, true);
+  assert.equal(parseWorkItemLine("Owner/Web: see #42 in prose", { repositories }).ignored, true);
+
+  const mixed = parseWorkItemLines([
+    "- Owner/Product-Web#41 valid",
+    "- Owner/Product-Web:#42 malformed",
+    "- owner/product-api#43 valid",
+  ], { repositories });
+  assert.equal(mixed.ok, false);
+  assert.deepEqual(mixed.items.map((item) => item.ref.number), [41, 43]);
+  assert.deepEqual(mixed.diagnostics.map((item) => item.code), ["invalid_work_item_ref"]);
+  assert.equal(mixed.diagnostics[0].line_number, 2);
+}
+
 // Batch line parsing permits same numbers in different repositories, rejects
 // a duplicate composite ref, and retains visible line diagnostics. Partial
 // items never make the result ok:true.

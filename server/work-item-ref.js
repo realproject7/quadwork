@@ -150,6 +150,10 @@ function parseWorkItemToken(token, options = {}) {
 function lineCandidate(content, repositories) {
   if (/^\[?#/.test(content) || /^\[?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#/.test(content)) return true;
   if (/^\[?[A-Za-z0-9._-]+\/[A-Za-z0-9._\/-]*#/.test(content)) return true;
+  // An immediate colon before the issue marker is a malformed qualified work
+  // ref, not prose. Keep this deliberately narrower than the token delimiter:
+  // URLs and `owner/repo: explanatory prose #42` are not executable candidates.
+  if (/^\[?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+:\s*#/.test(content)) return true;
   // Diagnose the common immediate `owner/repo #42` split. Path/URL prose where
   // the issue mention is not the second token remains ignored below.
   const separated = /^\[?([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)\s+#/.exec(content);
