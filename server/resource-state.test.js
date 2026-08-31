@@ -462,6 +462,68 @@ function fullState(terminalFacts = [fact(1)]) {
   assert.equal(afterZero.terminal_facts[0].oom_kill_count, "11");
 }
 
+// OOM provenance never authorizes contradictory process metadata. An exit code
+// and a signal cannot both be terminal authority, whether the observation is
+// carried inline or migrated from an exact legacy global observation.
+{
+  const inline = fact(45, {
+    reason: "oom_kill",
+    exit_code: 137,
+    signal: "SIGKILL",
+    oom_kill_count: 1,
+    oom_observed_at: "2026-08-31T00:00:44.000Z",
+  });
+  const inlineOutput = createResourceSnapshot({ terminal_facts: [inline] }).terminal_facts[0];
+  assert.equal(inlineOutput.reason, "unknown");
+  assert.equal(Object.hasOwn(inlineOutput, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(inlineOutput, "oom_observed_at"), false);
+
+  const legacy = fact(46, { reason: "oom_kill", exit_code: 137, signal: "SIGKILL" });
+  const legacyOutput = createResourceSnapshot({
+    last_cgroup_oom: oomProvenanceFor(legacy, 1, "2026-08-31T00:00:45.000Z"),
+    terminal_facts: [legacy],
+  }).terminal_facts[0];
+  assert.equal(legacyOutput.reason, "unknown");
+  assert.equal(Object.hasOwn(legacyOutput, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(legacyOutput, "oom_observed_at"), false);
+}
+
+// A full controller-shaped snapshot is still treated as untrusted persisted
+// input. Forging an OOM reason and inline evidence cannot make contradictory
+// exit/signal metadata authoritative.
+{
+  const controllerSnapshot = {
+    protocol_status: "candidate_pending_staging",
+    control_children: { limit: 1, active: 0, queued: 0 },
+    control_class: { unit_name: "quadwork-control.slice", aggregate: true },
+    active_scopes: [],
+    last_cgroup_oom: {
+      project_id: "quadwork",
+      generation_id: "controller-generation",
+      resource_class: "worker",
+      unit_name: "qw-worker-controller.scope",
+      oom_kill_count: "1",
+      observed_at: "2026-08-31T00:00:46.000Z",
+    },
+    terminal_facts: [{
+      project_id: "quadwork",
+      generation_id: "controller-generation",
+      resource_class: "worker",
+      unit_name: "qw-worker-controller.scope",
+      reason: "oom_kill",
+      exit_code: 137,
+      signal: "SIGKILL",
+      finished_at: "2026-08-31T00:00:47.000Z",
+      oom_kill_count: "1",
+      oom_observed_at: "2026-08-31T00:00:46.000Z",
+    }],
+  };
+  const output = createResourceSnapshot(controllerSnapshot);
+  assert.equal(output.terminal_facts[0].reason, "unknown");
+  assert.equal(Object.hasOwn(output.terminal_facts[0], "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(output.terminal_facts[0], "oom_observed_at"), false);
+}
+
 // Calendar rollover is rejected consistently for terminal, global, and inline
 // timestamps; a real leap day and numeric offset canonicalize normally.
 {

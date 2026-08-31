@@ -218,7 +218,11 @@ function sanitizeTerminalFact(input, oomProvenance) {
   const oomEvidence = inlineOom.present
     ? inlineOom.value
     : legacyOomForFact(oomProvenance, { projectId, generationId, resourceClass, unitName });
-  if (reason === "oom_kill" && (oomEvidence === null || !exit.valid || !signal.valid)) {
+  if (reason === "oom_kill"
+    && (oomEvidence === null
+      || !exit.valid
+      || !signal.valid
+      || (exit.value !== null && signal.value !== null))) {
     normalizedReason = "unknown";
   }
   return Object.freeze({
