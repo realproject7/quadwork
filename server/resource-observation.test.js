@@ -261,6 +261,9 @@ for (const procValue of [
   "0::/system.slice/child/../pm2-quadwork.service",
   "0::/system.slice/pm2-quadwork.service/",
   "0::/system.slice/not-a-unit",
+  "0::/system.slice/.service",
+  "0::/system.slice/.scope",
+  "0::/system.slice/.slice",
   "0::/system.slice/bad\tname.service",
   " 0::/system.slice/pm2-quadwork.service",
   "0::/system.slice/pm2-quadwork.service ",
@@ -278,6 +281,17 @@ for (const procValue of [
   assert.equal(calls.exec.length, 0);
   assert.equal(calls.read.length, 1, "invalid lexical self path is never used for cgroup reads");
   assert.equal(JSON.stringify(observation).includes("system.slice"), false);
+}
+
+{
+  const escapedUnit = "quadwork\\x2dapi@blue.service";
+  const escapedControlGroup = `/system.slice/${escapedUnit}`;
+  const escapedPath = path.join(CGROUP_ROOT, escapedControlGroup);
+  const files = fixtureFiles(escapedPath, { "memory.events.local": "oom_kill 0\n" });
+  files.set(PROC_SELF_CGROUP, `0::${escapedControlGroup}\n`);
+  const observation = createHarness({ files }).provider.observeApiSelf();
+  assert.equal(observation.available, true);
+  assert.equal(observation.unit_name, escapedUnit);
 }
 
 {

@@ -19,6 +19,7 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024;
 const MAX_FILE_VALUE_BYTES = 64 * 1024;
 const MAX_PROC_CGROUP_BYTES = 64 * 1024;
+const SYSTEMD_UNIT_STEM_RE = /^(?:[A-Za-z0-9:_.@-]|\\x[0-9A-Fa-f]{2})+$/;
 
 class ObservationFailure extends Error {
   constructor(code) {
@@ -191,12 +192,17 @@ class ResourceObservationProvider {
       throw new ObservationFailure("control_group_invalid");
     }
     const unitName = path.posix.basename(controlGroup);
+    const unitMatch = unitName.match(/^(.+)\.(service|scope|slice)$/);
+    const unitStem = unitMatch && unitMatch[1];
     if ((expectedUnitName !== null && unitName !== expectedUnitName)
       || unitName === "."
       || unitName === ".."
       || unitName.length > 255
       || /[\u0000-\u001f\u007f]/.test(unitName)
-      || !/\.(?:service|scope|slice)$/.test(unitName)) {
+      || unitStem === null
+      || unitStem === "."
+      || unitStem === ".."
+      || !SYSTEMD_UNIT_STEM_RE.test(unitStem)) {
       throw new ObservationFailure("control_group_invalid");
     }
     const resolved = path.resolve(this.cgroupRoot, `.${controlGroup}`);
