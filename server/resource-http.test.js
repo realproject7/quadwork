@@ -150,7 +150,9 @@ function request(overrides = {}) {
 
 function invoke(service, requestValue = request()) {
   const response = new FakeResponse();
-  const result = createResourceHttpHandler(service)(requestValue, response);
+  let handler;
+  registerResourceHttp({ get(_path, mountedHandler) { handler = mountedHandler; } }, service);
+  const result = handler(requestValue, response);
   assert.equal(result, response);
   assert.equal(response.jsonCalls, 1);
   assert.equal(response.headers["cache-control"], "no-store, no-cache, must-revalidate");
@@ -331,6 +333,9 @@ function assertUnavailable(response, expectedStatus = 503, expectedCode = "QW_RE
   assert.equal(mounted.path, RESOURCE_HTTP_PATH);
   assert.equal(mounted.handler, handler);
   assert.equal(snapshots, 0);
+  service.snapshot = async function replacementSnapshot() {
+    throw new Error("a post-mount replacement must not cross the publisher boundary");
+  };
   const response = new FakeResponse();
   handler(request(), response);
   assert.equal(response.statusCode, 200);
@@ -373,17 +378,32 @@ async function settleUnhandledTurn() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-// Native async results are never awaited and can never send a late response,
-// but both settlement paths are consumed so they cannot create a process-level
-// unhandled rejection. Caller-owned thenables are rejected without invocation.
+// Detectable AsyncFunctions and unbranded providers are never invoked. A
+// source-owned synchronous publisher may still accidentally return a normal
+// Promise; both settlement paths are consumed without sending a late response.
+// Caller-owned thenables are rejected without assimilation.
 (async () => {
   const secret = "ASYNC-SNAPSHOT-SECRET /private/provider/path";
   const unhandled = [];
+  const handledLate = [];
   const onUnhandled = (reason) => { unhandled.push(reason); };
+  const onHandledLate = (promise) => { handledLate.push(promise); };
   process.on("unhandledRejection", onUnhandled);
+  process.on("rejectionHandled", onHandledLate);
   try {
-    const rejected = invoke({ async snapshot() { throw new Error(secret); } });
+    let asyncCalls = 0;
+    const rejected = invoke({ async snapshot() { asyncCalls += 1; throw new Error(secret); } });
     assertUnavailable(rejected);
+    assert.equal(asyncCalls, 0, "AsyncFunction providers fail before invocation");
+
+    for (const snapshot of [
+      (async function boundAsyncSnapshot() { asyncCalls += 1; throw new Error(secret); }).bind(null),
+      new Proxy(async function proxiedAsyncSnapshot() { asyncCalls += 1; throw new Error(secret); }, {}),
+      Object.freeze(async function frozenAsyncSnapshot() { asyncCalls += 1; throw new Error(secret); }),
+    ]) {
+      assertUnavailable(invoke({ snapshot }));
+    }
+    assert.equal(asyncCalls, 0, "bound, proxied, and frozen AsyncFunctions also fail before invocation");
 
     const lateResolve = deferred();
     const resolvedResponse = invoke({ snapshot() { return lateResolve.promise; } });
@@ -405,6 +425,14 @@ async function settleUnhandledTurn() {
       },
     });
     const accessorPromiseResponse = invoke({ snapshot() { return accessorPromise; } });
+
+    const frozenPromise = Object.freeze(Promise.reject(new Error(secret)));
+    const frozenPromiseResponse = invoke({ snapshot() { return frozenPromise; } });
+
+    const normalRejectedPromise = Promise.reject(new Error(secret));
+    const normalFunctionPromiseResponse = invoke({ snapshot: function snapshot() {
+      return normalRejectedPromise;
+    } });
 
     let thenCalls = 0;
     let thenableMutations = 0;
@@ -437,21 +465,85 @@ async function settleUnhandledTurn() {
     revoked.revoke();
     const revokedResponse = invoke({ snapshot() { return revoked.proxy; } });
 
+    // A rejected Promise whose constructor or species lookup throws cannot be
+    // consumed after the fact without mutating it. Such providers stay outside
+    // the private publisher brand, so HTTP never invokes them or creates their
+    // hostile Promise in the first place.
+    let constructorProviderCalls = 0;
+    let constructorGetterCalls = 0;
+    const constructorProvider = {
+      snapshot() {
+        constructorProviderCalls += 1;
+        const promise = Promise.reject(new Error(secret));
+        Object.defineProperty(promise, "constructor", {
+          get() {
+            constructorGetterCalls += 1;
+            throw new Error(secret);
+          },
+        });
+        return promise;
+      },
+    };
+    const constructorResponse = new FakeResponse();
+    createResourceHttpHandler(constructorProvider)(request(), constructorResponse);
+
+    let speciesProviderCalls = 0;
+    let speciesGetterCalls = 0;
+    const speciesProvider = {
+      snapshot() {
+        speciesProviderCalls += 1;
+        const promise = Promise.reject(new Error(secret));
+        Object.defineProperty(promise, "constructor", {
+          value: Object.defineProperty({}, Symbol.species, {
+            get() {
+              speciesGetterCalls += 1;
+              throw new Error(secret);
+            },
+          }),
+        });
+        return promise;
+      },
+    };
+    const speciesResponse = new FakeResponse();
+    createResourceHttpHandler(speciesProvider)(request(), speciesResponse);
+
+    let revokedProviderCalls = 0;
+    const revokedProvider = Proxy.revocable({
+      snapshot() {
+        revokedProviderCalls += 1;
+        return Promise.reject(new Error(secret));
+      },
+    }, {});
+    revokedProvider.revoke();
+    const revokedProviderResponse = new FakeResponse();
+    createResourceHttpHandler(revokedProvider.proxy)(request(), revokedProviderResponse);
+
     await settleUnhandledTurn();
     assert.deepEqual(unhandled, []);
+    assert.deepEqual(handledLate, []);
     assert.equal(nativeThenGetterCalls, 0, "native Promise consumption bypasses hostile own then accessors");
     assert.equal(thenCalls, 0, "caller-owned thenables are identified without assimilation");
     assert.equal(thenableMutations, 0);
     assert.equal(accessorCalls, 0, "then accessors are rejected without invocation");
+    assert.equal(constructorProviderCalls, 0);
+    assert.equal(constructorGetterCalls, 0);
+    assert.equal(speciesProviderCalls, 0);
+    assert.equal(speciesGetterCalls, 0);
+    assert.equal(revokedProviderCalls, 0);
     for (const [response, originalBody] of [
       [rejected, rejected.body],
       [resolvedResponse, resolvedBody],
       [rejectedResponse, rejectedBody],
       [accessorPromiseResponse, accessorPromiseResponse.body],
+      [frozenPromiseResponse, frozenPromiseResponse.body],
+      [normalFunctionPromiseResponse, normalFunctionPromiseResponse.body],
       [customResponse, customResponse.body],
       [accessorResponse, accessorResponse.body],
       [proxyResponse, proxyResponse.body],
       [revokedResponse, revokedResponse.body],
+      [constructorResponse, constructorResponse.body],
+      [speciesResponse, speciesResponse.body],
+      [revokedProviderResponse, revokedProviderResponse.body],
     ]) {
       assertUnavailable(response);
       assert.equal(response.jsonCalls, 1);
@@ -460,6 +552,7 @@ async function settleUnhandledTurn() {
     }
   } finally {
     process.removeListener("unhandledRejection", onUnhandled);
+    process.removeListener("rejectionHandled", onHandledLate);
   }
   console.log("resource-http.test.js: all assertions passed");
 })().catch((error) => {

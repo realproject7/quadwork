@@ -4,6 +4,7 @@ const {
   RESOURCE_STATE_VERSION,
   createResourceSnapshot,
 } = require("./resource-state");
+const { types: utilTypes } = require("node:util");
 
 const RESOURCE_HTTP_PATH = "/api/resources";
 const MAX_RESOURCE_HTTP_BYTES = 1024 * 1024;
@@ -50,6 +51,8 @@ const WORKER_UNIT_BASE_RE = /^quadwork-worker-[a-f0-9]{40}$/;
 const SYSTEMD_UNIT_RE = /^[a-z][a-z0-9.-]{0,127}\.(?:service|scope)$/;
 const UINT64_RE = /^(?:0|[1-9]\d{0,19})$/;
 const UINT64_MAX = (1n << 64n) - 1n;
+const ASYNC_FUNCTION_PROTOTYPE = Reflect.getPrototypeOf(async function resourceHttpAsyncMarker() {});
+const RESOURCE_HTTP_PUBLISHERS = new WeakMap();
 
 const ERROR_RESPONSES = Object.freeze({
   method: Object.freeze({
@@ -96,6 +99,27 @@ function dataMethod(receiver, name) {
     return null;
   }
   return null;
+}
+
+function isDetectableAsyncFunction(value) {
+  try {
+    return utilTypes.isAsyncFunction(value)
+      || Reflect.getPrototypeOf(value) === ASYNC_FUNCTION_PROTOTYPE;
+  } catch {
+    return true;
+  }
+}
+
+function createResourceHttpPublisher(runtimeService) {
+  const method = dataMethod(runtimeService, "snapshot");
+  // HTTP is a strictly synchronous, server-owned publication boundary. An
+  // AsyncFunction necessarily creates a Promise before its result can be
+  // rejected. Refuse it before invocation so even a sabotaged native Promise
+  // cannot escape as an unhandled rejection.
+  const snapshot = method !== null && !isDetectableAsyncFunction(method) ? method : null;
+  const publisher = Object.freeze(Object.create(null));
+  RESOURCE_HTTP_PUBLISHERS.set(publisher, Object.freeze({ runtimeService, snapshot }));
+  return publisher;
 }
 
 function ignoreAsyncSettlement() {}
@@ -404,15 +428,17 @@ function sendJson(response, statusCode, body, { allowGet = false } = {}) {
   return Reflect.apply(targetJson, target, [body]);
 }
 
-function createResourceHttpHandler(runtimeService) {
-  const snapshot = dataMethod(runtimeService, "snapshot");
+function createResourceHttpHandler(resourcePublisher) {
+  const publisher = RESOURCE_HTTP_PUBLISHERS.get(resourcePublisher) || null;
   return function resourceHttpHandler(request, response) {
     const method = safeGet(request, "method");
     if (method !== "GET") return sendJson(response, 405, ERROR_RESPONSES.method, { allowGet: true });
     if (requestHasBody(request)) return sendJson(response, 400, ERROR_RESPONSES.body);
     let result;
     try {
-      result = snapshot === null ? null : Reflect.apply(snapshot, runtimeService, []);
+      result = publisher === null || publisher.snapshot === null
+        ? null
+        : Reflect.apply(publisher.snapshot, publisher.runtimeService, []);
     } catch {
       result = null;
     }
@@ -427,7 +453,10 @@ function createResourceHttpHandler(runtimeService) {
 function registerResourceHttp(app, runtimeService) {
   const get = dataMethod(app, "get");
   if (get === null) throw new TypeError("app.get must be a function");
-  const handler = createResourceHttpHandler(runtimeService);
+  // This mount is the sole production branding point. Its runtime service is
+  // supplied by the server owner during startup, never by an HTTP caller.
+  const publisher = createResourceHttpPublisher(runtimeService);
+  const handler = createResourceHttpHandler(publisher);
   Reflect.apply(get, app, [RESOURCE_HTTP_PATH, handler]);
   return handler;
 }
