@@ -240,6 +240,68 @@ async function main() {
      durableQueryCalls === 0,
     "durable pre-collect observation wins and skips the post-exit query fallback");
 
+  let unmarkedFallbackCalls = 0;
+  const unmarkedDurableController = new ResourceController({
+    executeProcess: async () => ({
+      code: null,
+      signal: "SIGKILL",
+      scopeObservation: { oomKillCount: 9 },
+    }),
+    queryScope: async () => {
+      unmarkedFallbackCalls += 1;
+      return { oomKillCount: 0 };
+    },
+  });
+  const unmarkedDurable = await unmarkedDurableController.runWorkerScope(workerSpec());
+  ok(unmarkedFallbackCalls === 1 && unmarkedDurable.fact.reason === "signal",
+    "an unmarked executor observation cannot skip the bounded fallback or claim OOM");
+
+  let invalidDurableFallbackCalls = 0;
+  const invalidDurableController = new ResourceController({
+    executeProcess: async () => ({
+      code: 17,
+      signal: null,
+      scopeObservation: { capturedBeforeCollect: true, oomKillCount: -1 },
+    }),
+    queryScope: async () => {
+      invalidDurableFallbackCalls += 1;
+      return { oomKillCount: 2n };
+    },
+  });
+  const invalidDurable = await invalidDurableController.runWorkerScope(workerSpec());
+  ok(invalidDurableFallbackCalls === 1 && invalidDurable.fact.reason === "oom_kill",
+    "an invalid durable counter falls back to a valid bounded-query counter");
+
+  const invalidFallbackCases = [
+    { counter: -1, result: { code: null, signal: "SIGKILL" }, reason: "signal" },
+    { counter: 1.5, result: { code: 0, signal: null }, reason: "normal_exit" },
+    { counter: Number.MAX_SAFE_INTEGER + 1, result: { code: 17, signal: null }, reason: "unknown" },
+    { counter: "1", result: { code: 17, signal: null }, reason: "unknown" },
+  ];
+  for (const [index, testCase] of invalidFallbackCases.entries()) {
+    const invalidFallbackController = new ResourceController({
+      executeProcess: async () => testCase.result,
+      queryScope: async () => ({ oomKillCount: testCase.counter, oomKilled: true }),
+    });
+    const classified = await invalidFallbackController.runWorkerScope(workerSpec({
+      generationId: `invalid-counter-${index}`,
+      unitName: `qw-worker-invalid-counter-${index}`,
+    }));
+    assert.equal(classified.fact.reason, testCase.reason);
+  }
+  ok(true, "invalid fallback counters and unverified observation flags never claim OOM");
+
+  const throwingCounterController = new ResourceController({
+    executeProcess: async () => ({ code: 0, signal: null }),
+    queryScope: async () => Object.defineProperty({}, "oomKillCount", {
+      get() { throw new Error("untrusted counter getter"); },
+    }),
+  });
+  const throwingCounter = await throwingCounterController.runWorkerScope(workerSpec());
+  ok(throwingCounter.fact.reason === "normal_exit" &&
+     throwingCounterController.snapshot().active_scopes.length === 0,
+    "an unreadable fallback counter is invalid and cannot strand active state");
+
   let queryAbortObserved = false;
   const hungQueryController = new ResourceController({
     maxControlChildren: 1,

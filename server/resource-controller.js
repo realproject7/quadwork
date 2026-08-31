@@ -254,10 +254,35 @@ function normalizeSignal(value) {
   return null;
 }
 
+function validOomKillCount(value) {
+  return (typeof value === "bigint" && value >= 0n) ||
+    (Number.isSafeInteger(value) && value >= 0);
+}
+
+function normalizeScopeObservation(observation, requirePreCollectCapture = false) {
+  if (!observation || typeof observation !== "object") return null;
+  let capturedBeforeCollect;
+  let oomKillCount;
+  try {
+    capturedBeforeCollect = observation.capturedBeforeCollect;
+    oomKillCount = observation.oomKillCount;
+  } catch {
+    return null;
+  }
+  if (requirePreCollectCapture && capturedBeforeCollect !== true) return null;
+  if (!validOomKillCount(oomKillCount)) return null;
+  // Retain only the counter used for classification. An injected query or
+  // executor cannot smuggle paths, environment, or an unverified oomKilled
+  // assertion into controller state through an observation object.
+  return Object.freeze({ oomKillCount });
+}
+
 function terminalReason(result, scopeObservation, executionRejected = false) {
   const count = scopeObservation && scopeObservation.oomKillCount;
-  if (result?.oomKilled === true || scopeObservation?.oomKilled === true ||
-      (typeof count === "bigint" ? count > 0n : Number.isFinite(count) && count > 0)) return "oom_kill";
+  if (result?.oomKilled === true ||
+      (validOomKillCount(count) && (typeof count === "bigint" ? count > 0n : count > 0))) {
+    return "oom_kill";
+  }
   if (normalizeSignal(result?.signal) !== null) return "signal";
   if (!executionRejected && result?.code === 0) return "normal_exit";
   return "unknown";
@@ -279,7 +304,7 @@ function terminalFact({ ids, resourceClass, result, scopeObservation, executionR
 
 function durableScopeObservation(value) {
   const observation = value && value.scopeObservation;
-  return observation && typeof observation === "object" ? observation : null;
+  return normalizeScopeObservation(observation, true);
 }
 
 // systemd --collect may unload a scope before a post-exit query can observe it.
@@ -421,7 +446,7 @@ class ResourceController {
     }
 
     if (scopeObservation === null) {
-      scopeObservation = await queryScopeBounded(this.queryScope, {
+      const fallbackObservation = await queryScopeBounded(this.queryScope, {
         projectId: ids.projectId,
         generationId: ids.generationId,
         unitName: ids.unitName,
@@ -430,6 +455,7 @@ class ResourceController {
         timeoutMs: this.scopeQueryTimeoutMs,
         signal,
       });
+      scopeObservation = normalizeScopeObservation(fallbackObservation);
     }
 
     let fact;
