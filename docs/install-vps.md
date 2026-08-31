@@ -217,6 +217,72 @@ pm2 save                          # Save state (always do after start/stop)
 
 ### Resource preflight and disposable staging evidence
 
+Resource setup is deliberately two-step and is never performed by `start`,
+`init`, or `preflight`. First create a private policy file containing one exact
+`runtime_resources` v1 policy object (not a whole QuadWork config):
+
+```bash
+install -m 600 /dev/null "$HOME/quadwork-resource-policy.json"
+${EDITOR:-vi} "$HOME/quadwork-resource-policy.json"
+quadwork resources configure \
+  --policy-file "$HOME/quadwork-resource-policy.json" \
+  --json
+```
+
+For the measured 8 GiB reference VPS, the v1 proposal shape is:
+
+```json
+{
+  "version": 1,
+  "mode": "systemd-user-v1",
+  "temp_root": "/home/quadwork/.quadwork/tmp",
+  "host_reserve_mib": 1536,
+  "max_worker_scopes": 3,
+  "api": { "memory_low_mib": 512, "memory_max_mib": 1280 },
+  "worker": { "memory_high_mib": 1024, "memory_max_mib": 1200, "swap_max_mib": 512 },
+  "control": { "memory_max_mib": 512, "swap_max_mib": 256, "max_concurrent_children": 2 },
+  "temp_min_free_mib": 4096
+}
+```
+
+This is an operator-visible proposal, not a hidden default. Confirm the account
+path and measured host/swap capacity before accepting it; the strict parser
+rejects omitted or additional fields.
+
+The proposal validates the strict schema, prints the exact policy and a
+SHA-256 token, and makes no changes. Inspect it, then copy that exact token into
+the explicit apply form:
+
+```bash
+quadwork resources configure \
+  --apply \
+  --policy-file "$HOME/quadwork-resource-policy.json" \
+  --accept-sha256 '<exact-token-from-the-proposal>' \
+  --json
+```
+
+Apply re-reads the private policy file, refuses a stale token, and atomically
+updates only `runtime_resources` in the existing private
+`~/.quadwork/config.json`. It never creates a missing config or changes the
+other config fields.
+
+Next, propose the disk-backed, owner-only temp-root operation derived from the
+persisted policy:
+
+```bash
+quadwork resources temp-install --json
+quadwork resources temp-install \
+  --apply \
+  --accept-sha256 '<exact-token-from-the-temp-proposal>' \
+  --json
+```
+
+The first command is read-only. The apply form can create or verify only the
+policy-owned temp root and refuses aliases, memory-backed filesystems, unsafe
+ownership/mode, or insufficient accepted capacity. It does not clean legacy
+`/tmp` paths, assign per-worker `TMPDIR`, install systemd units, restart
+QuadWork, or run pressure tests.
+
 Run the shipped diagnostic before considering any resource-containment work:
 
 ```bash
@@ -226,7 +292,8 @@ quadwork resources preflight --json
 
 This preflight is read-only. A non-zero result is expected while the policy,
 temp boundary, or staging proof is unavailable; it does not install, repair,
-create, or modify systemd units. The current `systemd-run --user --scope
+create, or modify systemd units. Policy/temp acceptance alone is not
+containment proof. The current `systemd-run --user --scope
 --collect --quiet` contract remains `candidate_pending_staging` and is not a
 supported production launch path.
 

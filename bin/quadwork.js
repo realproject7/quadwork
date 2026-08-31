@@ -8,6 +8,13 @@ const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 const { readRuntimeResources } = require("../server/config");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
+const {
+  ResourceInstallError,
+  policyProposal,
+  applyPolicy,
+  tempInstallProposal,
+  applyTempInstall,
+} = require("../server/resource-install");
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -1179,7 +1186,13 @@ async function cmdCleanup() {
 
 // ─── Resource Preflight (#1038) ────────────────────────────────────────────
 
-const RESOURCE_PREFLIGHT_USAGE = "Usage: quadwork resources preflight [--json]";
+const RESOURCE_PREFLIGHT_USAGE = [
+  "Usage: quadwork resources preflight [--json]",
+  "       quadwork resources configure [--apply] --policy-file ABS [--accept-sha256 HASH] [--json]",
+  "       quadwork resources temp-install [--apply] [--accept-sha256 HASH] [--json]",
+].join("\n");
+const RESOURCE_CONFIGURE_USAGE = "Usage: quadwork resources configure [--apply] --policy-file ABS [--accept-sha256 HASH] [--json]";
+const RESOURCE_TEMP_INSTALL_USAGE = "Usage: quadwork resources temp-install [--apply] [--accept-sha256 HASH] [--json]";
 
 function renderBooleanFact(value) {
   if (value === true) return "yes";
@@ -1242,6 +1255,91 @@ function renderResourcePreflight(report) {
   return `${lines.join("\n")}\n`;
 }
 
+function parseResourceInstallArgs(args, { needsPolicyFile }) {
+  const parsed = { apply: false, json: false, policyFile: null, acceptanceSha256: null };
+  const seen = new Set();
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    if (flag === "--apply" || flag === "--json") {
+      if (seen.has(flag)) return null;
+      seen.add(flag);
+      parsed[flag === "--apply" ? "apply" : "json"] = true;
+      continue;
+    }
+    if (flag === "--policy-file" || flag === "--accept-sha256") {
+      if (seen.has(flag) || index + 1 >= args.length) return null;
+      seen.add(flag);
+      const value = args[++index];
+      if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) return null;
+      parsed[flag === "--policy-file" ? "policyFile" : "acceptanceSha256"] = value;
+      continue;
+    }
+    return null;
+  }
+  if (needsPolicyFile !== Boolean(parsed.policyFile)) return null;
+  if (!parsed.apply && parsed.acceptanceSha256 !== null) return null;
+  if (parsed.apply !== Boolean(parsed.acceptanceSha256)) return null;
+  return parsed;
+}
+
+function renderResourceInstall(result) {
+  const lines = [
+    result.action === "configure_runtime_resources"
+      ? "QuadWork resource policy"
+      : "QuadWork resource temp root",
+    "==============================",
+    `Status: ${result.status.toUpperCase()}`,
+    `Action: ${result.action}`,
+    `Accept SHA-256: ${result.acceptance.sha256}`,
+  ];
+  if (result.policy) {
+    lines.push("Validated policy:", JSON.stringify(result.policy, null, 2));
+  }
+  lines.push("Plan:", JSON.stringify(result.plan, null, 2));
+  if (result.status === "proposal") {
+    lines.push("No changes were made. Re-run with --apply and the exact SHA-256 token to apply this plan.");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function renderResourceInstallFailure(code) {
+  return `QuadWork resource operation refused: ${code}\n`;
+}
+
+function runResourceInstallCommand(subcommand, args, options = {}) {
+  const stdout = options.stdout || process.stdout;
+  const stderr = options.stderr || process.stderr;
+  const usage = subcommand === "configure" ? RESOURCE_CONFIGURE_USAGE : RESOURCE_TEMP_INSTALL_USAGE;
+  const parsed = parseResourceInstallArgs(args, { needsPolicyFile: subcommand === "configure" });
+  if (!parsed) {
+    stderr.write(`${usage}\n`);
+    return 2;
+  }
+
+  let result;
+  try {
+    if (subcommand === "configure") {
+      result = parsed.apply
+        ? (options.applyPolicy || applyPolicy)({ policyFile: parsed.policyFile, acceptanceSha256: parsed.acceptanceSha256 })
+        : (options.policyProposal || policyProposal)(parsed.policyFile);
+    } else {
+      result = parsed.apply
+        ? (options.applyTempInstall || applyTempInstall)({ acceptanceSha256: parsed.acceptanceSha256 })
+        : (options.tempInstallProposal || tempInstallProposal)();
+    }
+  } catch (err) {
+    const reason = err instanceof ResourceInstallError && typeof err.code === "string"
+      ? err.code
+      : "resource_operation_failed";
+    const failure = Object.freeze({ ok: false, status: "refused", reason });
+    if (parsed.json) stdout.write(`${JSON.stringify(failure)}\n`);
+    else stderr.write(renderResourceInstallFailure(reason));
+    return 1;
+  }
+  stdout.write(parsed.json ? `${JSON.stringify(result)}\n` : renderResourceInstall(result));
+  return 0;
+}
+
 // Minimal injectable handler: the command never imports config writers and
 // never accepts a flag that could fabricate the still-pending staging proof.
 function runResourcesCommand(args, options = {}) {
@@ -1251,6 +1349,10 @@ function runResourcesCommand(args, options = {}) {
   const makeProbes = options.createReadOnlyProbes || createReadOnlyProbes;
   const preflight = options.runResourcePreflight || runResourcePreflight;
   const commandArgs = Array.isArray(args) ? args : [];
+
+  if (commandArgs[0] === "configure" || commandArgs[0] === "temp-install") {
+    return runResourceInstallCommand(commandArgs[0], commandArgs.slice(1), options);
+  }
 
   if (commandArgs[0] !== "preflight"
     || commandArgs.slice(1).some((arg) => arg !== "--json")
@@ -1505,7 +1607,7 @@ switch (command) {
     add-project   Add a project via CLI (alternative to web UI /setup)
     cleanup       Reclaim disk space (--project <id> or --legacy)
     doctor        Report project configuration status
-    resources     Read-only resource preflight (resources preflight [--json])
+    resources     Resource policy/temp setup and read-only preflight
     migrate-agent-slugs  Rename reviewer1/reviewer2 → re1/re2 in existing projects
     ac-restore           Restore file-chat JSONL back to AC format
 
@@ -1523,6 +1625,8 @@ switch (command) {
     npx quadwork stop
     npx quadwork cleanup --project my-project
     npx quadwork cleanup --legacy
+    npx quadwork resources configure --policy-file /absolute/policy.json --json
+    npx quadwork resources temp-install --json
     npx quadwork resources preflight --json
 `);
     process.exit(1);
@@ -1530,4 +1634,11 @@ switch (command) {
 }
 
 // #972: exported for unit tests (see server/binStop.test.js).
-module.exports = { sanitizePid, stopPid, renderResourcePreflight, runResourcesCommand };
+module.exports = {
+  sanitizePid,
+  stopPid,
+  renderResourcePreflight,
+  renderResourceInstall,
+  runResourceInstallCommand,
+  runResourcesCommand,
+};

@@ -263,6 +263,23 @@ quadwork resources preflight
 quadwork resources preflight --json
 ```
 
+If it reports `policy_absent`, use the explicit policy proposal/apply sequence
+from the VPS install guide. If it reports an unavailable temp boundary after
+the policy is accepted, use the token-bound commands below; the first command
+is read-only and the second accepts only its exact current plan:
+
+```bash
+quadwork resources temp-install --json
+quadwork resources temp-install \
+  --apply \
+  --accept-sha256 '<exact-token-from-the-temp-proposal>' \
+  --json
+```
+
+This command only creates or verifies the temp root fixed by the persisted
+policy. It does not clean `/tmp/claude-*`, relocate an agent's `TMPDIR`, install
+systemd containment, restart a service, or establish staging evidence.
+
 - `proof_refused` means the disposable-host acknowledgement or the separate
   `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has
   started.
