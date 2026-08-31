@@ -157,7 +157,7 @@ reset();
   function fakeExchangeHelper(command, args, options) {
     helperCalls.push({ command, args: [...args], options });
     assert.equal(command, "/usr/bin/python3");
-    assert.equal(args.length, 6);
+    assert.equal(args.length, args[2] === "exchange" ? 11 : 6);
     assert.equal(args[0], "-I");
     assert.equal(path.basename(args[1]), "resource-rename-exchange-helper.py");
     assert.equal(args[3], "3");
@@ -170,6 +170,12 @@ reset();
       writePrivate(path.join(configDir, args[5]), "");
     } else {
       assert.equal(args[2], "exchange");
+      assert.deepEqual(args.slice(6, 10), [
+        String(fs.lstatSync(path.join(configDir, args[4])).dev),
+        String(fs.lstatSync(path.join(configDir, args[4])).ino),
+        String(fs.lstatSync(path.join(configDir, args[5])).dev),
+        String(fs.lstatSync(path.join(configDir, args[5])).ino),
+      ]);
     }
     const hold = path.join(configDir, ".resource-install-helper-test-hold");
     fs.renameSync(path.join(configDir, args[4]), hold);

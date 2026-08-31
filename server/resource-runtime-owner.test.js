@@ -23,6 +23,10 @@ const {
 const OBSERVED_AT = "2026-08-31T00:00:00.000Z";
 const MISSING = Symbol("missing config");
 
+function canonicalTemp(prefix) {
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+}
+
 function policy() {
   return {
     ...DEFAULT_RUNTIME_RESOURCE_PROPOSAL,
@@ -67,9 +71,7 @@ function makeFs(configValue, facts = {}) {
       : JSON.stringify({ runtime_resources: configValue });
   facts.configReads = 0;
   facts.stateLstats = 0;
-  facts.stateRenames = 0;
   facts.nonConfigWrites = 0;
-  facts.failStateRename = false;
   let statePath = null;
   Object.defineProperties(wrapper, {
     readFileSync: {
@@ -96,15 +98,6 @@ function makeFs(configValue, facts = {}) {
       value(target, ...args) {
         facts.nonConfigWrites += 1;
         return fs.writeFileSync(target, ...args);
-      },
-    },
-    renameSync: {
-      value(source, target) {
-        if (statePath !== null && String(target) === statePath) {
-          facts.stateRenames += 1;
-          if (facts.failStateRename) throw new Error("PRIVATE rename failure /private/state");
-        }
-        return fs.renameSync(source, target);
       },
     },
     setStatePath: {
@@ -165,7 +158,7 @@ assert.equal(OBSERVATION_TIMEOUT_MS, 1_000);
 // no state/probe/controller/service/write work. Legacy authority factories are
 // ignored without even reading accessor properties.
 for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-owner-invalid-"));
+  const homeDir = canonicalTemp("qw-owner-invalid-");
   const facts = {};
   const fsImpl = makeFs(configValue, facts);
   fsImpl.setStatePath(resourceStateFilePath(homeDir));
@@ -174,6 +167,7 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
   for (const name of [
     "loadRuntimeResources", "createReadOnlyProbes", "createObservationProvider",
     "createControllerAdapter", "createRuntimeService", "createStateStore", "registerHttp",
+    "stateDirectoryHandleFactory",
   ]) {
     Object.defineProperty(options, name, {
       get() { legacyGetterCalls += 1; throw new Error(`PRIVATE ${name} /private/factory`); },
@@ -200,12 +194,11 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
 // state store. Read-only host failures remain redacted non-ready facts; snapshots
 // never create state, while explicit persistence is one atomic save.
 {
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-owner-configured-"));
+  const homeDir = canonicalTemp("qw-owner-configured-");
   fs.mkdirSync(path.join(homeDir, ".quadwork"), { mode: 0o700 });
   const { owner, facts } = createConfiguredOwner(homeDir);
   const statePath = resourceStateFilePath(homeDir);
   assert.equal(facts.configReads, 1);
-  assert.equal(facts.stateLstats, 1);
   assert.equal(fs.existsSync(statePath), false);
 
   const first = owner.snapshot();
@@ -214,29 +207,40 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
   assert.equal(first.version, 1);
   assert.equal(typeof first.pressure.reason, "string");
   assert.equal(second.status, first.status);
-  assert.equal(facts.stateLstats, 1, "state is loaded only at construction");
+  const loadLstats = facts.stateLstats;
+  owner.snapshot();
+  assert.equal(facts.stateLstats, loadLstats, "state is loaded only at construction");
   assert.equal(fs.existsSync(statePath), false, "snapshot has no implicit persistence");
 
-  const saved = owner.persist(first);
-  assert.equal(saved.status, first.status);
-  assert.equal(facts.stateRenames, 1, "one authentic state save commits before success");
-  assert.equal(fs.statSync(statePath).mode & 0o777, 0o600);
+  if (process.platform === "linux") {
+    const saved = owner.persist(first);
+    assert.equal(saved.status, first.status);
+    assert.equal(fs.statSync(statePath).mode & 0o777, 0o600);
+  } else {
+    assert.throws(
+      () => owner.persist(first),
+      (error) => error instanceof ResourceRuntimeOwnerError
+        && error.code === "QW_RESOURCE_PERSISTENCE_FAILED",
+      "unsupported platforms expose a redacted refusal rather than a path fallback",
+    );
+    assert.equal(fs.existsSync(statePath), false);
+  }
   fs.rmSync(homeDir, { recursive: true, force: true });
 }
 
 // Evidence advances only after a successful source store commit. A failed
 // second rename returns one stable typed error and leaves the first evidence.
 {
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-owner-evidence-"));
+  const homeDir = canonicalTemp("qw-owner-evidence-");
   fs.mkdirSync(path.join(homeDir, ".quadwork"), { mode: 0o700 });
   const { owner, facts } = createConfiguredOwner(homeDir);
   const firstFact = terminalFact("generation-first", "a");
-  owner.persist({ ...owner.snapshot(), terminal_facts: [firstFact] });
-  assert.equal(facts.stateRenames, 1);
-  assert.equal(owner.snapshot().terminal_facts.some((fact) => fact.generation_id === "generation-first"), true);
-
-  facts.failStateRename = true;
   const secondFact = terminalFact("generation-second", "b");
+  if (process.platform === "linux") {
+    owner.persist({ ...owner.snapshot(), terminal_facts: [firstFact] });
+    assert.equal(owner.snapshot().terminal_facts.some((fact) => fact.generation_id === "generation-first"), true);
+    fs.chmodSync(path.join(homeDir, ".quadwork"), 0o755);
+  }
   assert.throws(
     () => owner.persist({ ...owner.snapshot(), terminal_facts: [secondFact] }),
     (error) => error instanceof ResourceRuntimeOwnerError
@@ -244,25 +248,30 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
       && !error.message.includes("PRIVATE"),
   );
   const afterFailure = owner.snapshot();
-  assert.equal(afterFailure.terminal_facts.some((fact) => fact.generation_id === "generation-first"), true);
+  assert.equal(
+    afterFailure.terminal_facts.some((fact) => fact.generation_id === "generation-first"),
+    process.platform === "linux",
+  );
   assert.equal(afterFailure.terminal_facts.some((fact) => fact.generation_id === "generation-second"), false);
+  if (process.platform === "linux") fs.chmodSync(path.join(homeDir, ".quadwork"), 0o700);
   fs.rmSync(homeDir, { recursive: true, force: true });
 }
 
 // Durable evidence is loaded once on restart. Corrupt state is ignored without
 // rewrite or repair during construction/snapshot.
-{
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-owner-restart-"));
+if (process.platform === "linux") {
+  const homeDir = canonicalTemp("qw-owner-restart-");
   fs.mkdirSync(path.join(homeDir, ".quadwork"), { mode: 0o700 });
   const first = createConfiguredOwner(homeDir);
   first.owner.persist({ ...first.owner.snapshot(), terminal_facts: [terminalFact("generation-restart", "c")] });
 
   const restarted = createConfiguredOwner(homeDir);
   const snapshot = restarted.owner.snapshot();
-  assert.equal(restarted.facts.stateLstats, 1);
+  const restartLoadLstats = restarted.facts.stateLstats;
+  assert.equal(restartLoadLstats >= 1, true);
   assert.equal(snapshot.terminal_facts.some((fact) => fact.generation_id === "generation-restart"), true);
   restarted.owner.snapshot();
-  assert.equal(restarted.facts.stateLstats, 1);
+  assert.equal(restarted.facts.stateLstats, restartLoadLstats);
 
   const statePath = resourceStateFilePath(homeDir);
   fs.writeFileSync(statePath, "{not-json", { mode: 0o600 });
@@ -305,7 +314,7 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
 // Hostile legacy service/store factories cannot create a Promise, intercept a
 // save, or become publisher authority through a genuine owner.
 (async () => {
-  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-owner-legacy-"));
+  const homeDir = canonicalTemp("qw-owner-legacy-");
   fs.mkdirSync(path.join(homeDir, ".quadwork"), { mode: 0o700 });
   const facts = {};
   const fsImpl = makeFs(policy(), facts);
@@ -347,12 +356,16 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
     });
     const snapshot = owner.snapshot();
     assert.notEqual(snapshot.status, "invalid_resource_policy");
-    owner.persist(snapshot);
+    if (process.platform === "linux") owner.persist(snapshot);
+    else assert.throws(
+      () => owner.persist(snapshot),
+      (error) => error.code === "QW_RESOURCE_PERSISTENCE_FAILED",
+    );
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(calls, { service: 0, store: 0, constructor: 0, species: 0 });
     assert.deepEqual(unhandled, []);
-    assert.equal(facts.stateRenames, 1, "source store, not the legacy factory, commits persistence");
+    assert.equal(fs.existsSync(resourceStateFilePath(homeDir)), process.platform === "linux");
   } finally {
     process.removeListener("unhandledRejection", listener);
     fs.rmSync(homeDir, { recursive: true, force: true });
@@ -361,7 +374,7 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
   // Source store methods were captured before this prototype sabotage. The
   // fresh instance pins its own source snapshot closure, so neither load nor
   // save can dispatch into these hostile replacements.
-  const patchedHome = fs.mkdtempSync(path.join(os.tmpdir(), "qw-owner-store-prototype-"));
+  const patchedHome = canonicalTemp("qw-owner-store-prototype-");
   fs.mkdirSync(path.join(patchedHome, ".quadwork"), { mode: 0o700 });
   const patchedFacts = {};
   const patchedFs = makeFs(policy(), patchedFacts);
@@ -395,13 +408,17 @@ for (const configValue of [MISSING, "{not-json", { version: 999 }]) {
       createStateStore() { throw new Error("PRIVATE legacy store"); },
     });
     const snapshot = owner.snapshot();
-    const saved = owner.persist(snapshot);
+    let saved = null;
+    if (process.platform === "linux") saved = owner.persist(snapshot);
+    else assert.throws(
+      () => owner.persist(snapshot),
+      (error) => error.code === "QW_RESOURCE_PERSISTENCE_FAILED",
+    );
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(patchedCalls, { load: 0, save: 0, snapshot: 0 });
     assert.deepEqual(patchedUnhandled, []);
-    assert.equal(saved.status, snapshot.status);
-    assert.equal(patchedFacts.stateRenames, 1, "captured source save commits exactly once");
+    if (saved !== null) assert.equal(saved.status, snapshot.status);
     assert.equal(JSON.stringify(saved).includes("PRIVATE"), false);
   } finally {
     ResourceStateStore.prototype.load = originalLoad;

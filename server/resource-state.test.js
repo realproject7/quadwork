@@ -4,14 +4,17 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { SecureResourceDirectoryError } = require("./resource-secure-directory");
 const {
   MAX_STATE_BYTES,
   RESOURCE_STATE_VERSION,
+  ResourceStatePersistenceError,
   ResourceStateStore,
   createResourceSnapshot,
 } = require("./resource-state");
 
 const fixtures = [];
+let exchangeCounter = 0;
 process.on("exit", () => {
   for (const fixture of fixtures) {
     try { fs.rmSync(fixture, { recursive: true, force: true }); } catch {}
@@ -19,9 +22,46 @@ process.on("exit", () => {
 });
 
 function fixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-state-"));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-state-")));
+  fs.chmodSync(dir, 0o700);
   fixtures.push(dir);
   return { dir, filePath: path.join(dir, "resource-state.json") };
+}
+
+function pathDirectoryHandleFactory({ directory, directoryIdentity, fsImpl }) {
+  return {
+    stat: () => fsImpl.lstatSync(directory),
+    path: (name) => path.join(directory, name),
+    assertAvailable: () => {},
+    commit({ mode, source, destination, sourceIdentity, destinationIdentity }) {
+      const sourcePath = path.join(directory, source);
+      const destinationPath = path.join(directory, destination);
+      const sourceBefore = fsImpl.lstatSync(sourcePath);
+      assert.equal(String(sourceBefore.dev), String(sourceIdentity.dev));
+      assert.equal(String(sourceBefore.ino), String(sourceIdentity.ino));
+      if (mode === "noreplace") {
+        assert.throws(() => fsImpl.lstatSync(destinationPath), (error) => error.code === "ENOENT");
+        fsImpl.renameSync(sourcePath, destinationPath);
+        return;
+      }
+      const destinationBefore = fsImpl.lstatSync(destinationPath);
+      assert.equal(String(destinationBefore.dev), String(destinationIdentity.dev));
+      assert.equal(String(destinationBefore.ino), String(destinationIdentity.ino));
+      const hold = path.join(directory, `.resource-state-test-exchange-${exchangeCounter += 1}`);
+      fsImpl.renameSync(sourcePath, hold);
+      fsImpl.renameSync(destinationPath, sourcePath);
+      fsImpl.renameSync(hold, destinationPath);
+    },
+    fsync: () => {},
+    close: () => {},
+  };
+}
+
+function stateStore(options) {
+  return new ResourceStateStore({
+    directoryHandleFactory: pathDirectoryHandleFactory,
+    ...options,
+  });
 }
 
 function fact(index, extra = {}) {
@@ -91,11 +131,11 @@ function fullState(terminalFacts = [fact(1)]) {
 // Atomic 0600 persistence survives process-local store recreation.
 {
   const { filePath } = fixture();
-  const first = new ResourceStateStore({ filePath, terminalFactLimit: 3 });
+  const first = stateStore({ filePath, terminalFactLimit: 3 });
   const saved = first.save(fullState([fact(1), fact(2)]));
   assert.equal(saved.version, RESOURCE_STATE_VERSION);
   assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
-  const reloaded = new ResourceStateStore({ filePath, terminalFactLimit: 3 }).load();
+  const reloaded = stateStore({ filePath, terminalFactLimit: 3 }).load();
   assert.deepEqual(reloaded, saved);
   assert.ok(Object.isFrozen(reloaded));
   assert.ok(Object.isFrozen(reloaded.terminal_facts));
@@ -105,7 +145,7 @@ function fullState(terminalFacts = [fact(1)]) {
 {
   const { filePath } = fixture();
   fs.writeFileSync(filePath, "{not json", { mode: 0o600 });
-  const store = new ResourceStateStore({ filePath });
+  const store = stateStore({ filePath });
   assert.deepEqual(store.load(), createResourceSnapshot({}));
   fs.writeFileSync(filePath, JSON.stringify({ version: 999, terminal_facts: [fact(1)] }), { mode: 0o600 });
   assert.deepEqual(store.load(), createResourceSnapshot({}));
@@ -131,7 +171,7 @@ function fullState(terminalFacts = [fact(1)]) {
   input.limits.private_path = `/tmp/${secret}`;
   input.usage.raw = secret;
   input.temp.path = `/private/tmp/${secret}`;
-  const snapshot = new ResourceStateStore({ filePath }).save(input);
+  const snapshot = stateStore({ filePath }).save(input);
   const serialized = fs.readFileSync(filePath, "utf8");
   assert.ok(!serialized.includes(secret));
   assert.deepEqual(Object.keys(snapshot), [
@@ -152,7 +192,7 @@ function fullState(terminalFacts = [fact(1)]) {
 {
   const { filePath } = fixture();
   const facts = [fact(0), fact(1), fact(2), fact(3), fact(4)];
-  const snapshot = new ResourceStateStore({ filePath, terminalFactLimit: 3 }).save(fullState(facts));
+  const snapshot = stateStore({ filePath, terminalFactLimit: 3 }).save(fullState(facts));
   assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.generation_id), [
     "generation-2", "generation-3", "generation-4",
   ]);
@@ -350,7 +390,7 @@ function fullState(terminalFacts = [fact(1)]) {
     oom_kill_count: "18446744073709551615",
     oom_observed_at: "2026-08-02T00:00:35.002Z",
   });
-  const store = new ResourceStateStore({ filePath });
+  const store = stateStore({ filePath });
   const saved = store.save({
     status: "candidate_pending_staging",
     last_cgroup_oom: oomProvenanceFor(second, "18446744073709551615", second.oom_observed_at),
@@ -361,7 +401,7 @@ function fullState(terminalFacts = [fact(1)]) {
     ["oom_kill", "18446744073709551615"],
   ]);
   assert.doesNotThrow(() => JSON.parse(fs.readFileSync(filePath, "utf8")));
-  assert.deepEqual(new ResourceStateStore({ filePath }).load(), saved);
+  assert.deepEqual(stateStore({ filePath }).load(), saved);
 }
 
 // Retention bounds apply to inline-provenance facts without coupling retained
@@ -449,7 +489,7 @@ function fullState(terminalFacts = [fact(1)]) {
   };
   const { filePath } = fixture();
   fs.writeFileSync(filePath, JSON.stringify(legacyDocument), { mode: 0o600 });
-  const upgraded = new ResourceStateStore({ filePath }).load();
+  const upgraded = stateStore({ filePath }).load();
   assert.equal(upgraded.terminal_facts[0].reason, "oom_kill");
   assert.equal(upgraded.terminal_facts[0].oom_kill_count, "11");
   assert.equal(upgraded.terminal_facts[0].oom_observed_at, "2026-08-31T00:00:41.000Z");
@@ -596,7 +636,7 @@ function fullState(terminalFacts = [fact(1)]) {
 
   const { filePath } = fixture();
   fs.writeFileSync(filePath, JSON.stringify({ version: 1, status: "ready", counts: {} }), { mode: 0o600 });
-  assert.equal(new ResourceStateStore({ filePath }).load().status, "unknown", "reload revalidates ready authority");
+  assert.equal(stateStore({ filePath }).load().status, "unknown", "reload revalidates ready authority");
 }
 
 // The last cgroup OOM counter/time pair is all-or-none and uses a canonical
@@ -613,7 +653,7 @@ function fullState(terminalFacts = [fact(1)]) {
     observed_at: "2026-08-31T09:15:00+09:00",
     raw_path: "/sys/fs/cgroup/private/memory.events",
   };
-  const store = new ResourceStateStore({ filePath });
+  const store = stateStore({ filePath });
   const saved = store.save(input);
   assert.deepEqual(saved.last_cgroup_oom, {
     project_id: "quadwork",
@@ -624,7 +664,7 @@ function fullState(terminalFacts = [fact(1)]) {
     observed_at: "2026-08-31T00:15:00.000Z",
   });
   assert.doesNotThrow(() => JSON.parse(fs.readFileSync(filePath, "utf8")), "no bigint crosses JSON encoding");
-  assert.deepEqual(new ResourceStateStore({ filePath }).load().last_cgroup_oom, saved.last_cgroup_oom);
+  assert.deepEqual(stateStore({ filePath }).load().last_cgroup_oom, saved.last_cgroup_oom);
   assert.ok(!fs.readFileSync(filePath, "utf8").includes("/sys/fs"));
 
   const identity = {
@@ -643,7 +683,7 @@ function fullState(terminalFacts = [fact(1)]) {
 // A failed atomic commit preserves both the prior file and in-memory snapshot.
 {
   const { dir, filePath } = fixture();
-  const baselineStore = new ResourceStateStore({ filePath });
+  const baselineStore = stateStore({ filePath });
   const baseline = baselineStore.save(fullState([fact(1)]));
   const originalBytes = fs.readFileSync(filePath, "utf8");
   const failingFs = Object.create(fs);
@@ -652,43 +692,271 @@ function fullState(terminalFacts = [fact(1)]) {
     error.code = "ENOSPC";
     throw error;
   };
-  const failingStore = new ResourceStateStore({ filePath, fsImpl: failingFs });
+  const failingStore = stateStore({ filePath, fsImpl: failingFs });
   assert.deepEqual(failingStore.load(), baseline);
-  assert.throws(() => failingStore.save(fullState([fact(2)])), /injected rename failure/);
+  assert.throws(
+    () => failingStore.save(fullState([fact(2)])),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED"
+      && error.recoveryEntries.length === 2,
+  );
   assert.equal(fs.readFileSync(filePath, "utf8"), originalBytes);
   assert.deepEqual(failingStore.snapshot(), baseline);
-  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")), []);
+  assert.equal(fs.readdirSync(dir).includes(".resource-state.json.previous"), true);
 }
 
-// A successful rename is the sole commit point. No post-rename pathname
-// verification may report failure after disk state has already advanced.
+// Repeated saves reuse exactly one fixed previous-state sibling. The current
+// file is always the newest verified snapshot and the sibling is its immediate
+// predecessor; no successful save needs pathname deletion.
 {
-  const { filePath } = fixture();
-  const commitFs = Object.create(fs);
-  let renamed = false;
-  let finalLstatCalls = 0;
-  commitFs.renameSync = (source, destination) => {
-    fs.renameSync(source, destination);
-    renamed = true;
-  };
-  commitFs.lstatSync = (target) => {
-    if (renamed && target === filePath) {
-      finalLstatCalls += 1;
-      throw new Error("post-rename lstat must not run");
-    }
-    return fs.lstatSync(target);
-  };
-  const store = new ResourceStateStore({ filePath, fsImpl: commitFs });
-  const saved = store.save(fullState([fact(2)]));
-  assert.equal(renamed, true);
-  assert.equal(finalLstatCalls, 0);
-  assert.deepEqual(store.snapshot(), saved);
-  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")), saved);
+  const { dir, filePath } = fixture();
+  const store = stateStore({ filePath });
+  const first = store.save(fullState([fact(1)]));
+  assert.deepEqual(fs.readdirSync(dir), ["resource-state.json"]);
+  const second = store.save(fullState([fact(2)]));
+  const recoveryPath = path.join(dir, ".resource-state.json.previous");
+  assert.deepEqual(JSON.parse(fs.readFileSync(recoveryPath, "utf8")), first);
+  const third = store.save(fullState([fact(3)]));
+  assert.deepEqual(JSON.parse(fs.readFileSync(recoveryPath, "utf8")), second);
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")), third);
+  assert.deepEqual(fs.readdirSync(dir).sort(), [
+    ".resource-state.json.previous",
+    "resource-state.json",
+  ]);
+  const restarted = stateStore({ filePath });
+  assert.deepEqual(restarted.load(), third, "restart loads only the verified current state");
+  const fourth = restarted.save(fullState([fact(4)]));
+  assert.deepEqual(JSON.parse(fs.readFileSync(recoveryPath, "utf8")), third);
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")), fourth);
+  assert.equal(fs.readdirSync(dir).length, 2, "restart preserves the same bounded two-entry layout");
 }
 
-// Swapping the freshly written temp pathname to a symlink is detected before
-// rename. Cleanup unlinks only the symlink entry and never chmods or writes the
-// target outside the state store.
+// A parent alias is rejected during construction before any state leaf is read
+// or written. The outside directory remains byte-for-byte untouched.
+{
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "qw-state-parent-link-")));
+  fixtures.push(root);
+  const outside = path.join(root, "outside");
+  const parent = path.join(root, "state-parent");
+  fs.mkdirSync(outside, { mode: 0o700 });
+  const outsideState = path.join(outside, "resource-state.json");
+  fs.writeFileSync(outsideState, "OUTSIDE\n", { mode: 0o600 });
+  fs.symlinkSync(outside, parent, "dir");
+  let reads = 0;
+  let writes = 0;
+  const guardedFs = Object.create(fs);
+  guardedFs.readFileSync = (...args) => { reads += 1; return fs.readFileSync(...args); };
+  guardedFs.writeFileSync = (...args) => { writes += 1; return fs.writeFileSync(...args); };
+  assert.throws(
+    () => stateStore({ filePath: path.join(parent, "resource-state.json"), fsImpl: guardedFs }),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_PARENT_UNSAFE",
+  );
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+  assert.equal(fs.readFileSync(outsideState, "utf8"), "OUTSIDE\n");
+}
+
+// Replacing the accepted parent after its handle is opened cannot redirect a
+// write. The descriptor-backed fixture writes only into the moved original and
+// the public symlink target remains untouched; commit never starts.
+{
+  const { dir, filePath } = fixture();
+  const moved = `${dir}.moved`;
+  const outside = `${dir}.outside`;
+  fixtures.push(moved, outside);
+  let commitCalls = 0;
+  function parentSwapFactory({ directory, directoryIdentity, fsImpl }) {
+    let anchored = directory;
+    return {
+      stat: () => fsImpl.lstatSync(anchored),
+      path: (name) => path.join(anchored, name),
+      assertAvailable() {
+        fs.renameSync(directory, moved);
+        fs.mkdirSync(outside, { mode: 0o700 });
+        fs.symlinkSync(outside, directory, "dir");
+        anchored = moved;
+      },
+      commit() { commitCalls += 1; },
+      fsync: () => {},
+      close: () => {},
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: parentSwapFactory });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+  );
+  assert.equal(commitCalls, 0);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  assert.deepEqual(fs.readdirSync(moved), [".resource-state.json.previous"]);
+}
+
+// Helper/platform refusal happens before the fixed candidate is created.
+{
+  const { dir, filePath } = fixture();
+  function unavailableFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      assertAvailable() {
+        throw new SecureResourceDirectoryError(
+          "rename_unavailable",
+          "PRIVATE helper unavailable /private/helper",
+        );
+      },
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: unavailableFactory });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_PERSISTENCE_UNAVAILABLE"
+      && !error.message.includes("PRIVATE"),
+  );
+  assert.deepEqual(fs.readdirSync(dir), []);
+  assert.equal(store.snapshot().status, "unknown");
+}
+
+// A no-replace conflict preserves both the unexpected destination and the
+// fully written fixed candidate. No cleanup path is invoked.
+{
+  const { dir, filePath } = fixture();
+  const recoveryPath = path.join(dir, ".resource-state.json.previous");
+  const guardedFs = Object.create(fs);
+  let unlinks = 0;
+  guardedFs.unlinkSync = () => { unlinks += 1; throw new Error("unlink forbidden"); };
+  function conflictFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit() {
+        fs.writeFileSync(filePath, "DESTINATION-VICTIM\n", { mode: 0o600 });
+        throw new SecureResourceDirectoryError("destination_exists", "destination appeared");
+      },
+    };
+  }
+  const store = new ResourceStateStore({
+    filePath,
+    fsImpl: guardedFs,
+    directoryHandleFactory: conflictFactory,
+  });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+  );
+  assert.equal(fs.readFileSync(filePath, "utf8"), "DESTINATION-VICTIM\n");
+  assert.doesNotThrow(() => JSON.parse(fs.readFileSync(recoveryPath, "utf8")));
+  assert.equal(unlinks, 0);
+}
+
+// Source substitution after Node's final candidate check is rejected by the
+// identity-bound helper seam. The symlink and intended candidate inode remain;
+// neither the current state nor the outside target is touched.
+{
+  const { dir, filePath } = fixture();
+  const baselineStore = stateStore({ filePath });
+  const baseline = baselineStore.save(fullState([fact(1)]));
+  const baselineBytes = fs.readFileSync(filePath, "utf8");
+  const outside = path.join(dir, "outside-source.txt");
+  fs.writeFileSync(outside, "OUTSIDE-SOURCE\n", { mode: 0o600 });
+  let orphan = null;
+  function sourceSwapFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit({ source }) {
+        const sourcePath = path.join(dir, source);
+        orphan = `${sourcePath}.orphan`;
+        fs.renameSync(sourcePath, orphan);
+        fs.symlinkSync(outside, sourcePath);
+        throw new SecureResourceDirectoryError("rename_failed", "source identity changed", [source]);
+      },
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: sourceSwapFactory });
+  assert.deepEqual(store.load(), baseline);
+  assert.throws(() => store.save(fullState([fact(2)])), (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED");
+  assert.equal(fs.readFileSync(filePath, "utf8"), baselineBytes);
+  assert.equal(fs.readFileSync(outside, "utf8"), "OUTSIDE-SOURCE\n");
+  assert.equal(fs.lstatSync(path.join(dir, ".resource-state.json.previous")).isSymbolicLink(), true);
+  assert.equal(fs.existsSync(orphan), true);
+  assert.deepEqual(store.snapshot(), baseline);
+}
+
+// Destination file/symlink/directory substitutions immediately before helper
+// commit are preserved with the accepted old state and candidate. No unlink is
+// permitted, and in-memory evidence remains at the loaded baseline.
+for (const replacementType of ["file", "symlink", "directory"]) {
+  const { dir, filePath } = fixture();
+  const baselineStore = stateStore({ filePath });
+  const baseline = baselineStore.save(fullState([fact(1)]));
+  const savedOld = path.join(dir, `accepted-${replacementType}.json`);
+  const outside = path.join(dir, `outside-${replacementType}.txt`);
+  fs.writeFileSync(outside, `OUTSIDE-${replacementType}\n`, { mode: 0o600 });
+  let unlinks = 0;
+  const guardedFs = Object.create(fs);
+  guardedFs.unlinkSync = () => { unlinks += 1; throw new Error("unlink forbidden"); };
+  function destinationSwapFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit() {
+        fs.renameSync(filePath, savedOld);
+        if (replacementType === "file") {
+          fs.writeFileSync(filePath, "DESTINATION-FILE\n", { mode: 0o600 });
+        } else if (replacementType === "symlink") {
+          fs.symlinkSync(outside, filePath);
+        } else {
+          fs.mkdirSync(filePath, { mode: 0o700 });
+        }
+        throw new SecureResourceDirectoryError("rename_failed", "destination identity changed");
+      },
+    };
+  }
+  const store = new ResourceStateStore({
+    filePath,
+    fsImpl: guardedFs,
+    directoryHandleFactory: destinationSwapFactory,
+  });
+  assert.deepEqual(store.load(), baseline);
+  assert.throws(() => store.save(fullState([fact(2)])), (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED");
+  assert.equal(fs.existsSync(savedOld), true);
+  assert.equal(fs.existsSync(path.join(dir, ".resource-state.json.previous")), true);
+  assert.equal(fs.readFileSync(outside, "utf8"), `OUTSIDE-${replacementType}\n`);
+  assert.equal(unlinks, 0);
+  assert.deepEqual(store.snapshot(), baseline);
+}
+
+// A helper that completed exchange but reports an ambiguous post-check leaves
+// current and previous entries intact while the process-local snapshot stays
+// at the last verified state.
+{
+  const { dir, filePath } = fixture();
+  const baselineStore = stateStore({ filePath });
+  const baseline = baselineStore.save(fullState([fact(1)]));
+  function ambiguousFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit(args) {
+        base.commit(args);
+        throw new SecureResourceDirectoryError("recovery_required", "post-commit receipt unavailable");
+      },
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: ambiguousFactory });
+  assert.deepEqual(store.load(), baseline);
+  assert.throws(() => store.save(fullState([fact(2)])), (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED");
+  assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).terminal_facts[0].generation_id, "generation-2");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".resource-state.json.previous"), "utf8")).terminal_facts[0].generation_id, "generation-1");
+  assert.deepEqual(store.snapshot(), baseline);
+}
+
+// Swapping the freshly written candidate pathname to a symlink is detected
+// before commit. The uncertain symlink and displaced inode are both preserved;
+// the target outside the state store is never chmodded, written, or removed.
 {
   const { dir, filePath } = fixture();
   const outside = path.join(dir, "outside.txt");
@@ -703,19 +971,26 @@ function fullState(terminalFacts = [fact(1)]) {
     return fs.openSync(target, flags, mode);
   };
   swapFs.writeFileSync = (target, data, options) => {
-    fs.writeFileSync(target, data, options);
     const orphan = `${tmpPath}.orphan`;
     fs.renameSync(tmpPath, orphan);
     fs.symlinkSync(outside, tmpPath);
     swapped = true;
+    // The source writes through the already verified fd, never through the
+    // substituted pathname. The external symlink target must remain untouched.
+    fs.writeFileSync(target, data, options);
   };
-  const store = new ResourceStateStore({ filePath, fsImpl: swapFs });
-  assert.throws(() => store.save(fullState()), /temporary state file identity changed/);
+  const store = stateStore({ filePath, fsImpl: swapFs });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+  );
   assert.equal(swapped, true);
   assert.equal(fs.readFileSync(outside, "utf8"), outsideBytes);
   assert.equal(fs.statSync(outside).mode & 0o777, 0o644);
   assert.equal(fs.existsSync(filePath), false);
-  assert.equal(fs.existsSync(tmpPath), false);
+  assert.equal(fs.lstatSync(tmpPath).isSymbolicLink(), true, "uncertain name is preserved, never unlinked");
+  assert.equal(fs.existsSync(`${tmpPath}.orphan`), true, "intended candidate inode is preserved");
   assert.equal(store.snapshot().status, "unknown");
 }
 
@@ -764,19 +1039,19 @@ function fullState(terminalFacts = [fact(1)]) {
   const insecure = fixture();
   fs.writeFileSync(insecure.filePath, JSON.stringify({ version: 1, ...fullState() }), { mode: 0o644 });
   fs.chmodSync(insecure.filePath, 0o644);
-  assert.deepEqual(new ResourceStateStore({ filePath: insecure.filePath }).load(), expectedEmpty);
+  assert.deepEqual(stateStore({ filePath: insecure.filePath }).load(), expectedEmpty);
   assert.equal(fs.statSync(insecure.filePath).mode & 0o777, 0o644);
 
   const symlinked = fixture();
   const realState = path.join(symlinked.dir, "real-state.json");
   fs.writeFileSync(realState, JSON.stringify({ version: 1, ...fullState() }), { mode: 0o600 });
   fs.symlinkSync(realState, symlinked.filePath);
-  assert.deepEqual(new ResourceStateStore({ filePath: symlinked.filePath }).load(), expectedEmpty);
+  assert.deepEqual(stateStore({ filePath: symlinked.filePath }).load(), expectedEmpty);
   assert.equal(fs.lstatSync(symlinked.filePath).isSymbolicLink(), true);
 
   const directory = fixture();
   fs.mkdirSync(directory.filePath, { mode: 0o600 });
-  assert.deepEqual(new ResourceStateStore({ filePath: directory.filePath }).load(), expectedEmpty);
+  assert.deepEqual(stateStore({ filePath: directory.filePath }).load(), expectedEmpty);
 
   const wrongOwner = fixture();
   fs.writeFileSync(wrongOwner.filePath, JSON.stringify({ version: 1, ...fullState() }), { mode: 0o600 });
@@ -786,14 +1061,14 @@ function fullState(terminalFacts = [fact(1)]) {
     const st = fs.lstatSync(target);
     return new Proxy(st, {
       get(object, property) {
-        if (property === "uid") return Number(object.uid) + 1;
+        if (property === "uid" && String(target) === wrongOwner.filePath) return Number(object.uid) + 1;
         const value = Reflect.get(object, property);
         return typeof value === "function" ? value.bind(object) : value;
       },
     });
   };
   ownerFs.openSync = (...args) => { ownerOpenCalls += 1; return fs.openSync(...args); };
-  assert.deepEqual(new ResourceStateStore({ filePath: wrongOwner.filePath, fsImpl: ownerFs }).load(), expectedEmpty);
+  assert.deepEqual(stateStore({ filePath: wrongOwner.filePath, fsImpl: ownerFs }).load(), expectedEmpty);
   assert.equal(ownerOpenCalls, 0, "wrong ownership fails before the pathname is opened");
 
   const swapped = fixture();
@@ -811,7 +1086,7 @@ function fullState(terminalFacts = [fact(1)]) {
     }
     return fs.openSync(target, flags);
   };
-  assert.deepEqual(new ResourceStateStore({ filePath: swapped.filePath, fsImpl: swapFs }).load(), expectedEmpty);
+  assert.deepEqual(stateStore({ filePath: swapped.filePath, fsImpl: swapFs }).load(), expectedEmpty);
 
   const oversized = fixture();
   fs.writeFileSync(oversized.filePath, "", { mode: 0o600 });
@@ -819,7 +1094,7 @@ function fullState(terminalFacts = [fact(1)]) {
   const boundedFs = Object.create(fs);
   let reads = 0;
   boundedFs.readFileSync = (...args) => { reads += 1; return fs.readFileSync(...args); };
-  assert.deepEqual(new ResourceStateStore({ filePath: oversized.filePath, fsImpl: boundedFs }).load(), expectedEmpty);
+  assert.deepEqual(stateStore({ filePath: oversized.filePath, fsImpl: boundedFs }).load(), expectedEmpty);
   assert.equal(reads, 0, "oversized trusted files are rejected before read/JSON parse");
 }
 

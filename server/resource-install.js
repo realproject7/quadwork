@@ -11,13 +11,16 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 const { CONFIG_PATH } = require("./config");
 const { parseRuntimeResources } = require("./resource-policy");
+const {
+  SecureResourceDirectoryError,
+  createLinuxSecureDirectoryHandle,
+  validateEntryName,
+} = require("./resource-secure-directory");
 const { ensureTempRoot, TMPFS_MAGIC, RAMFS_MAGIC } = require("./resource-temp");
 
 const POLICY_FILE_MAX_BYTES = 64 * 1024;
 const CONFIG_FILE_MAX_BYTES = 4 * 1024 * 1024;
 const ACCEPTANCE_RE = /^[a-f0-9]{64}$/;
-const EXCHANGE_HELPER = path.join(__dirname, "resource-rename-exchange-helper.py");
-const EXCHANGE_HELPER_ENV = Object.freeze({ LANG: "C", LC_ALL: "C" });
 const RECOVERY_ENTRIES = Symbol("resourceInstallRecoveryEntries");
 const MAX_RECOVERY_ENTRIES = 8;
 const MAX_RECOVERY_ENTRY_BYTES = 255;
@@ -212,79 +215,86 @@ function assertSafeConfigDirectory(fsImpl, uid) {
   return stat;
 }
 
-function validateEntryName(name) {
-  if (typeof name !== "string"
-    || name.length === 0
-    || name === "."
-    || name === ".."
-    || name.includes("\0")
-    || name.includes("/")
-    || name.includes("\\")
-    || path.basename(name) !== name) {
+function translateConfigDirectoryError(error) {
+  if (!(error instanceof SecureResourceDirectoryError)) throw error;
+  if (error.code === "entry_invalid") {
     fail("config_entry_invalid", "configuration entry name is invalid");
   }
-  return name;
-}
-
-function runLinuxExchangeHelper(fd, mode, source, destination, execFileSyncImpl) {
-  const recoveryEntries = mode === "probe" ? [source, destination] : [];
-  try {
-    execFileSyncImpl("/usr/bin/python3", ["-I", EXCHANGE_HELPER, mode, "3", source, destination], {
-      encoding: "utf8",
-      env: EXCHANGE_HELPER_ENV,
-      maxBuffer: 4 * 1024,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe", fd],
-      timeout: 5_000,
-      windowsHide: true,
-    });
-  } catch (err) {
-    if (err && Number(err.status) === 64) {
-      recoveryFailure("config_exchange_unavailable", "atomic configuration exchange is unavailable", recoveryEntries);
-    }
-    if (mode === "probe") {
-      recoveryFailure("config_exchange_probe_failed", "atomic configuration exchange probe requires explicit recovery", recoveryEntries);
-    }
+  if (error.code === "rename_unavailable") {
+    recoveryFailure(
+      "config_exchange_unavailable",
+      "atomic configuration exchange is unavailable",
+      error.recoveryEntries,
+    );
+  }
+  if (error.code === "rename_probe_failed") {
+    recoveryFailure(
+      "config_exchange_probe_failed",
+      "atomic configuration exchange probe requires explicit recovery",
+      error.recoveryEntries,
+    );
+  }
+  if (error.code === "rename_failed") {
     fail("config_exchange_failed", "atomic configuration exchange failed");
   }
+  fail("config_descriptor_anchor_unavailable", "configuration directory descriptor could not be opened securely");
 }
 
-function linuxConfigDirectoryHandleFactory({ directory, fsImpl, execFileSyncImpl }) {
-  const constants = fsImpl.constants || fs.constants;
-  if (!Number.isInteger(constants.O_DIRECTORY) || !Number.isInteger(constants.O_NOFOLLOW)) {
-    fail("config_descriptor_anchor_unavailable", "secure configuration updates require a Linux directory descriptor");
-  }
-  let fd;
+function configHandleCall(callback) {
   try {
-    fd = fsImpl.openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-    const handleRoot = `/proc/self/fd/${fd}`;
-    const opened = fsImpl.fstatSync(fd);
-    const anchored = fsImpl.statSync(handleRoot);
-    if (!opened.isDirectory() || !sameOwnedNode(opened, anchored) || fsImpl.realpathSync(handleRoot) !== directory) {
-      fail("config_descriptor_anchor_unavailable", "configuration directory descriptor could not be verified");
-    }
+    return callback();
+  } catch (error) {
+    return translateConfigDirectoryError(error);
+  }
+}
+
+function linuxConfigDirectoryHandleFactory({ directory, fsImpl, execFileSyncImpl, expectedUid: uid }) {
+  let secureHandle;
+  try {
+    const directoryIdentity = fsImpl.lstatSync(directory);
+    secureHandle = createLinuxSecureDirectoryHandle({
+      directory,
+      directoryIdentity,
+      fsImpl,
+      execFileSyncImpl,
+      platform: "linux",
+    });
     return {
-      stat: () => fsImpl.fstatSync(fd),
-      path: (name) => path.join(handleRoot, validateEntryName(name)),
+      stat: () => configHandleCall(() => secureHandle.stat()),
+      path: (name) => configHandleCall(() => secureHandle.path(validateEntryName(name))),
       assertExchangeAvailable: () => {
         const stem = `.resource-exchange-probe-${crypto.randomBytes(12).toString("hex")}`;
         const entries = Object.freeze([`${stem}-a`, `${stem}-b`]);
-        runLinuxExchangeHelper(fd, "probe", entries[0], entries[1], execFileSyncImpl);
+        configHandleCall(() => secureHandle.probeExchange(entries[0], entries[1]));
         return entries;
       },
-      exchange: (from, to) => runLinuxExchangeHelper(
-        fd,
-        "exchange",
-        validateEntryName(from),
-        validateEntryName(to),
-        execFileSyncImpl,
+      exchange: (from, to, sourceIdentity, destinationIdentity) => configHandleCall(
+        () => secureHandle.commit({
+          mode: "exchange",
+          source: validateEntryName(from),
+          destination: validateEntryName(to),
+          sourceIdentity,
+          destinationIdentity,
+          expectedUid: uid,
+        }),
       ),
-      fsync: () => fsImpl.fsyncSync(fd),
-      close: () => fsImpl.closeSync(fd),
+      fsync: () => configHandleCall(() => secureHandle.fsync()),
+      close: () => secureHandle.close(),
     };
   } catch (err) {
-    if (fd !== undefined) {
-      try { fsImpl.closeSync(fd); } catch {}
+    if (secureHandle) {
+      try { secureHandle.close(); } catch {}
+    }
+    if (err instanceof SecureResourceDirectoryError) {
+      if (err.code === "rename_unavailable") {
+        recoveryFailure("config_exchange_unavailable", "atomic configuration exchange is unavailable", err.recoveryEntries);
+      }
+      if (err.code === "rename_probe_failed") {
+        recoveryFailure("config_exchange_probe_failed", "atomic configuration exchange probe requires explicit recovery", err.recoveryEntries);
+      }
+      if (err.code === "rename_failed") {
+        fail("config_exchange_failed", "atomic configuration exchange failed");
+      }
     }
     if (err instanceof ResourceInstallError) throw err;
     fail("config_descriptor_anchor_unavailable", "configuration directory descriptor could not be opened securely");
@@ -304,6 +314,7 @@ function openConfigDirectoryHandle(directoryIdentity, options = {}) {
       directory: path.dirname(CONFIG_PATH),
       fsImpl,
       execFileSyncImpl: options.execFileSyncImpl || execFileSync,
+      expectedUid: expectedUid(options),
     });
     const opened = handle.stat();
     if (!opened.isDirectory() || !sameOwnedNode(directoryIdentity, opened)) {
@@ -445,7 +456,7 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
     }
     assertNamedConfigDirectory(fsImpl, uid, directoryIdentity);
     exchangeAttempted = true;
-    directoryHandle.exchange(temporary, "config.json");
+    directoryHandle.exchange(temporary, "config.json", tempStat, current.identity);
     exchanged = true;
     const installed = fsImpl.lstatSync(directoryHandle.path("config.json"));
     if (!installed.isFile() || installed.isSymbolicLink() || !sameNode(tempStat, installed)) {

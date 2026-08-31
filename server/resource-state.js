@@ -1,8 +1,19 @@
 "use strict";
 
-const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
+const {
+  SecureResourceDirectoryError,
+  createLinuxSecureDirectoryHandle,
+  hasSingleLink,
+  modeOf,
+  normalizeRecoveryEntries,
+  sameOwnedNode,
+  sameRegularNode,
+  validateCanonicalDirectory,
+  validateEntryName,
+} = require("./resource-secure-directory");
 
 const RESOURCE_STATE_VERSION = 1;
 const DEFAULT_TERMINAL_FACT_LIMIT = 100;
@@ -11,6 +22,9 @@ const TERMINAL_FACT_SCAN_FACTOR = 10;
 const MAX_STATE_BYTES = 1024 * 1024;
 const MAX_OOM_KILL_COUNT = (1n << 64n) - 1n;
 const INVALID = Symbol("invalid resource state field");
+const UNOBSERVED_IDENTITY = Symbol("unobserved resource state identity");
+const UNTRUSTED_IDENTITY = Symbol("untrusted resource state identity");
+const STORE_STATE = new WeakMap();
 
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const UNIT_RE = /^[a-z][a-z0-9.-]{0,127}$/;
@@ -403,15 +417,311 @@ function cloneSnapshot(state, terminalFactLimit) {
   return createResourceSnapshot(state, { terminalFactLimit });
 }
 
+class ResourceStatePersistenceError extends Error {
+  constructor(code, message, recoveryEntries = []) {
+    super(message);
+    this.name = "ResourceStatePersistenceError";
+    this.code = code;
+    Object.defineProperty(this, "recoveryEntries", {
+      configurable: false,
+      enumerable: false,
+      value: normalizeRecoveryEntries(recoveryEntries),
+      writable: false,
+    });
+  }
+}
+
+function stateFailure(code, message, recoveryEntries = []) {
+  throw new ResourceStatePersistenceError(code, message, recoveryEntries);
+}
+
+function isMissing(error) {
+  return Boolean(error && error.code === "ENOENT");
+}
+
+function trustedRegular(stat, state) {
+  return stat
+    && !stat.isSymbolicLink()
+    && stat.isFile()
+    && hasSingleLink(stat)
+    && modeOf(stat) === 0o600
+    && (state.expectedUid === null || Number(stat.uid) === state.expectedUid);
+}
+
+function identityMatches(expected, observed) {
+  return expected !== null
+    && observed !== null
+    && sameRegularNode(expected, observed)
+    && Number(expected.size) === Number(observed.size);
+}
+
+function translateDirectoryFailure(error, recoveryEntries = []) {
+  if (error instanceof ResourceStatePersistenceError) throw error;
+  if (error instanceof SecureResourceDirectoryError) {
+    if (error.code === "descriptor_anchor_unavailable" || error.code === "rename_unavailable") {
+      stateFailure(
+        "QW_RESOURCE_STATE_PERSISTENCE_UNAVAILABLE",
+        "secure resource state persistence is unavailable",
+        recoveryEntries,
+      );
+    }
+    stateFailure(
+      "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+      "resource state persistence requires explicit recovery",
+      [...recoveryEntries, ...error.recoveryEntries],
+    );
+  }
+  if (recoveryEntries.length > 0) {
+    stateFailure(
+      "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+      "resource state persistence requires explicit recovery",
+      recoveryEntries,
+    );
+  }
+  stateFailure(
+    "QW_RESOURCE_STATE_PERSISTENCE_FAILED",
+    "resource state persistence failed",
+    recoveryEntries,
+  );
+}
+
+function namedParentMatches(state) {
+  const named = validateCanonicalDirectory(state.parent, {
+    fsImpl: state.fs,
+    expectedUid: state.expectedUid,
+  });
+  return sameOwnedNode(named, state.parentIdentity);
+}
+
+function openStoreDirectory(state, { requireRename = false } = {}) {
+  if (typeof state.directoryHandleFactory !== "function") {
+    stateFailure(
+      "QW_RESOURCE_STATE_PERSISTENCE_UNAVAILABLE",
+      "secure resource state persistence is unavailable",
+    );
+  }
+  let handle;
+  try {
+    handle = state.directoryHandleFactory({
+      directory: state.parent,
+      directoryIdentity: state.parentIdentity,
+      fsImpl: state.fs,
+      execFileSyncImpl: state.execFileSyncImpl,
+      platform: state.platform,
+    });
+    if (!handle
+      || typeof handle.stat !== "function"
+      || typeof handle.path !== "function"
+      || typeof handle.fsync !== "function"
+      || typeof handle.close !== "function"
+      || (requireRename && (typeof handle.assertAvailable !== "function"
+        || typeof handle.commit !== "function"))) {
+      throw new SecureResourceDirectoryError(
+        "descriptor_anchor_unavailable",
+        "secure resource state directory handle is incomplete",
+      );
+    }
+    const anchored = handle.stat();
+    if (!anchored.isDirectory()
+      || modeOf(anchored) !== 0o700
+      || (state.expectedUid !== null && Number(anchored.uid) !== state.expectedUid)
+      || !sameOwnedNode(anchored, state.parentIdentity)
+      || !namedParentMatches(state)) {
+      throw new SecureResourceDirectoryError(
+        "descriptor_anchor_changed",
+        "secure resource state parent changed",
+      );
+    }
+    if (requireRename) handle.assertAvailable();
+    return handle;
+  } catch (error) {
+    if (handle) {
+      try { handle.close(); } catch {}
+    }
+    return translateDirectoryFailure(error);
+  }
+}
+
+function pathStat(state, handle, name) {
+  try {
+    const stat = state.fs.lstatSync(handle.path(name));
+    if (!trustedRegular(stat, state)) {
+      stateFailure(
+        "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+        "resource state entry is not a trusted private file",
+        [name],
+      );
+    }
+    return stat;
+  } catch (error) {
+    if (isMissing(error)) return null;
+    throw error;
+  }
+}
+
+function openNamedLeaf(state, handle, { writable = false } = {}) {
+  const before = pathStat(state, handle, state.basename);
+  if (before === null) return null;
+  const constants = state.fs.constants || fs.constants;
+  if (!Number.isInteger(constants.O_NOFOLLOW)) {
+    stateFailure(
+      "QW_RESOURCE_STATE_PERSISTENCE_UNAVAILABLE",
+      "secure resource state leaf flags are unavailable",
+    );
+  }
+  let fd;
+  try {
+    fd = state.fs.openSync(
+      handle.path(state.basename),
+      (writable ? constants.O_RDWR : constants.O_RDONLY) | constants.O_NOFOLLOW,
+    );
+    const opened = state.fs.fstatSync(fd);
+    const named = pathStat(state, handle, state.basename);
+    if (!trustedRegular(opened, state)
+      || !identityMatches(before, opened)
+      || !identityMatches(opened, named)) {
+      stateFailure(
+        "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+        "resource state identity changed while opening",
+        [state.basename],
+      );
+    }
+    return { fd, identity: opened };
+  } catch (error) {
+    if (fd !== undefined) {
+      try { state.fs.closeSync(fd); } catch {}
+    }
+    throw error;
+  }
+}
+
+function closeFd(state, fd) {
+  if (fd === null || fd === undefined) return;
+  try { state.fs.closeSync(fd); } catch {}
+}
+
+function expectedDestination(state, observed) {
+  if (state.namedIdentity === UNTRUSTED_IDENTITY) {
+    stateFailure(
+      "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+      "resource state destination is untrusted",
+      [state.basename],
+    );
+  }
+  if (state.namedIdentity === UNOBSERVED_IDENTITY) return;
+  if (state.namedIdentity === null && observed === null) return;
+  if (state.namedIdentity !== null && observed !== null
+    && identityMatches(state.namedIdentity, observed.identity)) return;
+  stateFailure(
+    "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+    "resource state destination changed",
+    [state.basename],
+  );
+}
+
+function acquireCandidate(state, handle, destination) {
+  const name = state.recoveryName;
+  const before = pathStat(state, handle, name);
+  if (destination === null && before !== null) {
+    stateFailure(
+      "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+      "a previous resource state candidate requires explicit recovery",
+      [name],
+    );
+  }
+  const constants = state.fs.constants || fs.constants;
+  if (!Number.isInteger(constants.O_NOFOLLOW)) {
+    stateFailure(
+      "QW_RESOURCE_STATE_PERSISTENCE_UNAVAILABLE",
+      "secure resource state leaf flags are unavailable",
+    );
+  }
+  let fd;
+  try {
+    if (before !== null) {
+      fd = state.fs.openSync(handle.path(name), constants.O_RDWR | constants.O_NOFOLLOW);
+      const opened = state.fs.fstatSync(fd);
+      const named = pathStat(state, handle, name);
+      if (!trustedRegular(opened, state)
+        || !identityMatches(before, opened)
+        || !identityMatches(opened, named)
+        || (destination !== null && identityMatches(destination.identity, opened))) {
+        stateFailure(
+          "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+          "resource state recovery entry identity changed",
+          [name],
+        );
+      }
+      return { name, fd, identity: opened, reused: true };
+    }
+    fd = state.fs.openSync(
+      handle.path(name),
+      constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    return { name, fd, identity: null, reused: false };
+  } catch (error) {
+    if (fd !== undefined) closeFd(state, fd);
+    stateFailure(
+      "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+      "resource state candidate requires explicit recovery",
+      [name],
+    );
+  }
+}
+
+function writeCandidate(state, handle, candidate, serialized) {
+  try {
+    if (candidate.reused) state.fs.ftruncateSync(candidate.fd, 0);
+    state.fs.writeFileSync(candidate.fd, serialized, { encoding: "utf8" });
+    state.fs.fsyncSync(candidate.fd);
+    const opened = state.fs.fstatSync(candidate.fd);
+    const named = pathStat(state, handle, candidate.name);
+    if (!trustedRegular(opened, state)
+      || Number(opened.size) !== Buffer.byteLength(serialized, "utf8")
+      || !identityMatches(opened, named)) {
+      stateFailure(
+        "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+        "resource state candidate identity changed",
+        [candidate.name],
+      );
+    }
+    candidate.identity = opened;
+  } catch (error) {
+    if (error instanceof ResourceStatePersistenceError) throw error;
+    stateFailure(
+      "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+      "resource state candidate requires explicit recovery",
+      [candidate.name],
+    );
+  }
+}
+
+function verifyDestinationBeforeCommit(state, handle, expected) {
+  const named = pathStat(state, handle, state.basename);
+  if (expected === null && named === null) return;
+  if (expected !== null && named !== null && identityMatches(expected, named)) return;
+  stateFailure(
+    "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+    "resource state destination changed before commit",
+    [state.basename],
+  );
+}
+
 class ResourceStateStore {
   constructor({
     filePath,
     fsImpl = fs,
     terminalFactLimit = DEFAULT_TERMINAL_FACT_LIMIT,
     expectedUid = typeof process.getuid === "function" ? process.getuid() : null,
+    directoryHandleFactory,
+    execFileSyncImpl = execFileSync,
+    platform = process.platform,
   } = {}) {
-    if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
-      throw new TypeError("filePath must be an absolute path");
+    if (typeof filePath !== "string"
+      || !path.isAbsolute(filePath)
+      || path.normalize(filePath) !== filePath) {
+      throw new TypeError("filePath must be a normalized absolute path");
     }
     if (!validTerminalFactLimit(terminalFactLimit)) {
       throw new TypeError(`terminalFactLimit must be an integer from 1 to ${MAX_TERMINAL_FACT_LIMIT}`);
@@ -419,101 +729,182 @@ class ResourceStateStore {
     if (expectedUid !== null && (!Number.isSafeInteger(expectedUid) || expectedUid < 0)) {
       throw new TypeError("expectedUid must be a non-negative safe integer or null");
     }
-    this.filePath = filePath;
-    this.fs = fsImpl;
-    this.terminalFactLimit = terminalFactLimit;
-    this.expectedUid = expectedUid;
-    this.state = createResourceSnapshot({}, { terminalFactLimit });
+    const parent = path.dirname(filePath);
+    const basename = validateEntryName(path.basename(filePath));
+    let parentIdentity;
+    try {
+      parentIdentity = validateCanonicalDirectory(parent, { fsImpl, expectedUid });
+    } catch {
+      stateFailure(
+        "QW_RESOURCE_STATE_PARENT_UNSAFE",
+        "resource state parent must be a canonical owner-only directory",
+      );
+    }
+    STORE_STATE.set(this, {
+      basename,
+      directoryHandleFactory: directoryHandleFactory
+        || (platform === "linux" ? createLinuxSecureDirectoryHandle : null),
+      execFileSyncImpl,
+      expectedUid,
+      fs: fsImpl,
+      namedIdentity: UNOBSERVED_IDENTITY,
+      parent,
+      parentIdentity,
+      platform,
+      recoveryName: validateEntryName(`.${basename}.previous`),
+      state: createResourceSnapshot({}, { terminalFactLimit }),
+      terminalFactLimit,
+    });
   }
 
   load() {
-    let parsed;
-    let fd = null;
+    const state = STORE_STATE.get(this);
+    if (!state) throw new TypeError("ResourceStateStore receiver is invalid");
+    let handle = null;
+    let leaf = null;
     try {
-      const before = this.fs.lstatSync(this.filePath);
-      if (before.isSymbolicLink()
-        || !before.isFile()
-        || (Number(before.mode) & 0o7777) !== 0o600
-        || (this.expectedUid !== null && Number(before.uid) !== this.expectedUid)
-        || !Number.isInteger(this.fs.constants.O_NOFOLLOW)) {
-        throw new Error("untrusted state file");
+      handle = openStoreDirectory(state);
+      leaf = openNamedLeaf(state, handle);
+      if (leaf === null) {
+        state.namedIdentity = null;
+        state.state = createResourceSnapshot({}, { terminalFactLimit: state.terminalFactLimit });
+        return this.snapshot();
       }
-      fd = this.fs.openSync(this.filePath, this.fs.constants.O_RDONLY | this.fs.constants.O_NOFOLLOW);
-      const opened = this.fs.fstatSync(fd);
-      if (!opened.isFile()
-        || (Number(opened.mode) & 0o7777) !== 0o600
-        || (this.expectedUid !== null && Number(opened.uid) !== this.expectedUid)
-        || String(before.dev) !== String(opened.dev)
-        || String(before.ino) !== String(opened.ino)) {
-        throw new Error("state file identity changed");
-      }
-      if (!Number.isSafeInteger(opened.size) || opened.size < 0 || opened.size > MAX_STATE_BYTES) {
+      if (!Number.isSafeInteger(leaf.identity.size)
+        || leaf.identity.size < 0
+        || leaf.identity.size > MAX_STATE_BYTES) {
         throw new Error("state file size is unsupported");
       }
-      parsed = JSON.parse(this.fs.readFileSync(fd, "utf8"));
-      if (safeGet(parsed, "version") !== RESOURCE_STATE_VERSION) throw new Error("unsupported state version");
+      const raw = state.fs.readFileSync(leaf.fd, "utf8");
+      const after = state.fs.fstatSync(leaf.fd);
+      const named = pathStat(state, handle, state.basename);
+      if (!identityMatches(leaf.identity, after)
+        || !identityMatches(after, named)
+        || Buffer.byteLength(raw, "utf8") !== Number(after.size)
+        || !namedParentMatches(state)) {
+        throw new Error("state file identity changed");
+      }
+      state.namedIdentity = after;
+      const parsed = JSON.parse(raw);
+      if (safeGet(parsed, "version") !== RESOURCE_STATE_VERSION) {
+        throw new Error("unsupported state version");
+      }
+      state.state = createResourceSnapshot(parsed, { terminalFactLimit: state.terminalFactLimit });
     } catch {
-      this.state = createResourceSnapshot({}, { terminalFactLimit: this.terminalFactLimit });
+      // A failed reload never leaves an older pathname identity authoritative.
+      // Even a same-inode/same-size malformed rewrite is not a trusted commit.
+      state.namedIdentity = UNTRUSTED_IDENTITY;
+      state.state = createResourceSnapshot({}, { terminalFactLimit: state.terminalFactLimit });
       return this.snapshot();
     } finally {
-      if (fd !== null) {
-        try { this.fs.closeSync(fd); } catch {}
+      if (leaf) closeFd(state, leaf.fd);
+      if (handle) {
+        try { handle.close(); } catch {}
       }
     }
-    this.state = createResourceSnapshot(parsed, { terminalFactLimit: this.terminalFactLimit });
     return this.snapshot();
   }
 
   save(input) {
-    const next = createResourceSnapshot(input, { terminalFactLimit: this.terminalFactLimit });
-    const tmpPath = `${this.filePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
+    const state = STORE_STATE.get(this);
+    if (!state) throw new TypeError("ResourceStateStore receiver is invalid");
+    const next = createResourceSnapshot(input, { terminalFactLimit: state.terminalFactLimit });
     const serialized = `${JSON.stringify(next, null, 2)}\n`;
     if (Buffer.byteLength(serialized, "utf8") > MAX_STATE_BYTES) {
       throw new RangeError("resource state exceeds the maximum serialized size");
     }
-    let fd = null;
-    let opened = null;
+    let handle = null;
+    let destination = null;
+    let candidate = null;
+    let commitAttempted = false;
     try {
-      fd = this.fs.openSync(
-        tmpPath,
-        this.fs.constants.O_WRONLY | this.fs.constants.O_CREAT | this.fs.constants.O_EXCL,
-        0o600,
-      );
-      this.fs.writeFileSync(fd, serialized, { encoding: "utf8" });
-      opened = this.fs.fstatSync(fd);
-      if (!opened.isFile()
-        || (Number(opened.mode) & 0o7777) !== 0o600
-        || (this.expectedUid !== null && Number(opened.uid) !== this.expectedUid)) {
-        throw new Error("untrusted temporary state file");
+      handle = openStoreDirectory(state, { requireRename: true });
+      destination = openNamedLeaf(state, handle);
+      expectedDestination(state, destination);
+      candidate = acquireCandidate(state, handle, destination);
+      writeCandidate(state, handle, candidate, serialized);
+      verifyDestinationBeforeCommit(state, handle, destination && destination.identity);
+      if (!namedParentMatches(state)) {
+        stateFailure(
+          "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+          "resource state parent changed before commit",
+          [candidate.name],
+        );
       }
-      this.fs.closeSync(fd);
-      fd = null;
-      const beforeRename = this.fs.lstatSync(tmpPath);
-      if (beforeRename.isSymbolicLink()
-        || !beforeRename.isFile()
-        || (Number(beforeRename.mode) & 0o7777) !== 0o600
-        || (this.expectedUid !== null && Number(beforeRename.uid) !== this.expectedUid)
-        || String(beforeRename.dev) !== String(opened.dev)
-        || String(beforeRename.ino) !== String(opened.ino)) {
-        throw new Error("temporary state file identity changed");
+      commitAttempted = true;
+      handle.commit({
+        mode: destination === null ? "noreplace" : "exchange",
+        source: candidate.name,
+        destination: state.basename,
+        sourceIdentity: candidate.identity,
+        destinationIdentity: destination && destination.identity,
+        expectedUid: state.expectedUid === null
+          ? Number(candidate.identity.uid)
+          : state.expectedUid,
+      });
+
+      let installed = pathStat(state, handle, state.basename);
+      if (!identityMatches(candidate.identity, installed)) {
+        stateFailure(
+          "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+          "installed resource state identity is uncertain",
+          [state.basename, candidate.name],
+        );
       }
-      // The state parent directory is an owner-controlled boundary. After the
-      // final fd/path identity check, successful POSIX rename is the single
-      // commit point; no fallible or destructive pathname rollback follows it.
-      this.fs.renameSync(tmpPath, this.filePath);
+      if (destination === null) {
+        if (pathStat(state, handle, candidate.name) !== null) {
+          stateFailure(
+            "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+            "first resource state commit left an uncertain candidate",
+            [state.basename, candidate.name],
+          );
+        }
+      } else {
+        const displaced = pathStat(state, handle, candidate.name);
+        if (!identityMatches(destination.identity, displaced)) {
+          stateFailure(
+            "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+            "displaced resource state identity is uncertain",
+            [state.basename, candidate.name],
+          );
+        }
+      }
+      handle.fsync();
+      installed = pathStat(state, handle, state.basename);
+      if (!identityMatches(candidate.identity, installed)
+        || !namedParentMatches(state)
+        || (destination !== null
+          && !identityMatches(destination.identity, pathStat(state, handle, candidate.name)))) {
+        stateFailure(
+          "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+          "resource state commit requires explicit recovery",
+          [state.basename, candidate.name],
+        );
+      }
+      state.state = next;
+      state.namedIdentity = installed;
     } catch (error) {
-      if (fd !== null) {
-        try { this.fs.closeSync(fd); } catch {}
+      const recoveryEntries = candidate === null
+        ? []
+        : commitAttempted
+          ? [state.basename, candidate.name]
+          : [candidate.name];
+      if (commitAttempted) state.namedIdentity = UNTRUSTED_IDENTITY;
+      return translateDirectoryFailure(error, recoveryEntries);
+    } finally {
+      if (candidate) closeFd(state, candidate.fd);
+      if (destination) closeFd(state, destination.fd);
+      if (handle) {
+        try { handle.close(); } catch {}
       }
-      try { this.fs.unlinkSync(tmpPath); } catch {}
-      throw error;
     }
-    this.state = next;
     return this.snapshot();
   }
 
   snapshot() {
-    return cloneSnapshot(this.state, this.terminalFactLimit);
+    const state = STORE_STATE.get(this);
+    if (!state) throw new TypeError("ResourceStateStore receiver is invalid");
+    return cloneSnapshot(state.state, state.terminalFactLimit);
   }
 }
 
@@ -522,6 +913,7 @@ module.exports = {
   DEFAULT_TERMINAL_FACT_LIMIT,
   MAX_TERMINAL_FACT_LIMIT,
   MAX_STATE_BYTES,
+  ResourceStatePersistenceError,
   ResourceStateStore,
   createResourceSnapshot,
 };
