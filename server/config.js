@@ -823,6 +823,13 @@ function writeConfigUnlocked(cfg, options = {}) {
   const wasActivated = hasOwn(previousConfig || {}, "installation_id");
   const isActivated = hasOwn(candidate || {}, "installation_id");
 
+  if (!internalWrite && !wasActivated && isActivated) {
+    throw validationError(
+      "installation_id_introduction_forbidden",
+      "installation_id",
+      "installation_id can be introduced only by the V2 activation boundary",
+    );
+  }
   if (wasActivated && (!isActivated || candidate.installation_id !== previousConfig.installation_id)) {
     throw validationError(
       "installation_id_rotation_forbidden",

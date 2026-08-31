@@ -80,7 +80,7 @@ function diskBytes() {
 
 function seedConfig(config) {
   try { fs.unlinkSync(CONFIG_PATH); } catch {}
-  writeConfig(config);
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 // Cross-process writers serialize the entire fresh-read/validate/rename
@@ -108,6 +108,14 @@ function seedConfig(config) {
   fs.unlinkSync(CONFIG_LOCK_PATH); // explicit operator recovery in the fixture
   writeConfig({ port: 8402, projects: [] });
   ok(readConfig().port === 8402, "writes resume after explicit stale-lock recovery");
+
+  const beforeActivationBypass = diskBytes();
+  expectCode(
+    () => writeConfig(activated([])),
+    "installation_id_introduction_forbidden",
+    "public low-level writer cannot introduce V2 installation identity",
+  );
+  assert.equal(diskBytes(), beforeActivationBypass);
 }
 
 // Existing archived projects cannot be activated through either public config

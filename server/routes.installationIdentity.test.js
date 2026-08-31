@@ -79,12 +79,12 @@ function request(server, method, urlPath, body) {
         primary: true,
       }],
     };
-    writeConfig({
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify({
       installation_id: INSTALLATION_ID,
       session_token: "route-test-session-secret",
       port: 8400,
       projects: [canonicalProject],
-    });
+    }, null, 2), { mode: 0o600 });
 
     // The route-local reader derives V1 scalar compatibility from the primary
     // entry, but a legacy read-modify-write never persists those derived fields.
