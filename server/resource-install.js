@@ -47,6 +47,10 @@ function modeOf(stat) {
   return Number(stat.mode) & 0o7777;
 }
 
+function hasSingleLink(stat) {
+  return stat.nlink === undefined || Number(stat.nlink) === 1;
+}
+
 function sameIdentity(left, right) {
   return left && right
     && left.dev === right.dev
@@ -66,13 +70,21 @@ function sameOwnedNode(left, right) {
     && modeOf(left) === modeOf(right);
 }
 
+function sameNode(left, right) {
+  return sameOwnedNode(left, right)
+    && left.size === right.size
+    && hasSingleLink(left)
+    && hasSingleLink(right);
+}
+
 function validateOwner(stat, uid, code) {
   if (uid !== null && stat.uid !== uid) fail(code, "resource input has an unexpected owner");
 }
 
 function openNoFollow(fsImpl, filePath) {
   const constants = fsImpl.constants || fs.constants;
-  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW || 0);
+  if (!Number.isInteger(constants.O_NOFOLLOW)) throw new Error("O_NOFOLLOW is unavailable");
+  const flags = constants.O_RDONLY | constants.O_NOFOLLOW;
   return fsImpl.openSync(filePath, flags);
 }
 
@@ -85,6 +97,7 @@ function readSecureRegularFile(filePath, { fsImpl = fs, maxBytes, kind, uid }) {
     fail(`${kind}_unreadable`, `${kind} cannot be inspected`);
   }
   if (before.isSymbolicLink() || !before.isFile()) fail(`${kind}_unsafe_type`, `${kind} must be a regular file`);
+  if (!hasSingleLink(before)) fail(`${kind}_hardlink_unsafe`, `${kind} must have exactly one link`);
   validateOwner(before, uid, `${kind}_owner_mismatch`);
   if (modeOf(before) !== 0o600) fail(`${kind}_mode_unsafe`, `${kind} must use mode 0600`);
   if (!Number.isSafeInteger(before.size) || before.size < 1 || before.size > maxBytes) {
@@ -95,14 +108,16 @@ function readSecureRegularFile(filePath, { fsImpl = fs, maxBytes, kind, uid }) {
   try {
     fd = openNoFollow(fsImpl, filePath);
     const opened = fsImpl.fstatSync(fd);
-    if (!opened.isFile() || !sameIdentity(before, opened)) fail(`${kind}_identity_changed`, `${kind} changed while opening`);
+    if (!opened.isFile() || !hasSingleLink(opened) || !sameIdentity(before, opened)) {
+      fail(`${kind}_identity_changed`, `${kind} changed while opening`);
+    }
     const raw = fsImpl.readFileSync(fd, "utf8");
     const after = fsImpl.fstatSync(fd);
-    if (!sameIdentity(opened, after) || Buffer.byteLength(raw, "utf8") !== opened.size) {
+    if (!hasSingleLink(after) || !sameIdentity(opened, after) || Buffer.byteLength(raw, "utf8") !== opened.size) {
       fail(`${kind}_identity_changed`, `${kind} changed while reading`);
     }
     const named = fsImpl.lstatSync(filePath);
-    if (!sameIdentity(after, named)) fail(`${kind}_identity_changed`, `${kind} changed while reading`);
+    if (!hasSingleLink(named) || !sameIdentity(after, named)) fail(`${kind}_identity_changed`, `${kind} changed while reading`);
     return Object.freeze({ raw, identity: after });
   } catch (err) {
     if (err instanceof ResourceInstallError) throw err;
@@ -139,7 +154,93 @@ function assertSafeConfigDirectory(fsImpl, uid) {
   }
   validateOwner(stat, uid, "config_directory_owner_mismatch");
   if (modeOf(stat) !== 0o700) fail("config_directory_mode_unsafe", "QuadWork configuration directory must use mode 0700");
+  let canonical;
+  try {
+    canonical = fsImpl.realpathSync(dir);
+  } catch {
+    fail("config_directory_unreadable", "QuadWork configuration directory cannot be resolved");
+  }
+  if (canonical !== dir) fail("config_directory_aliased", "QuadWork configuration directory cannot contain path aliases");
   return stat;
+}
+
+function validateEntryName(name) {
+  if (typeof name !== "string"
+    || name.length === 0
+    || name === "."
+    || name === ".."
+    || name.includes("\0")
+    || name.includes("/")
+    || name.includes("\\")
+    || path.basename(name) !== name) {
+    fail("config_entry_invalid", "configuration entry name is invalid");
+  }
+  return name;
+}
+
+function linuxConfigDirectoryHandleFactory({ directory, fsImpl }) {
+  const constants = fsImpl.constants || fs.constants;
+  if (!Number.isInteger(constants.O_DIRECTORY) || !Number.isInteger(constants.O_NOFOLLOW)) {
+    fail("config_descriptor_anchor_unavailable", "secure configuration updates require a Linux directory descriptor");
+  }
+  let fd;
+  try {
+    fd = fsImpl.openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const handleRoot = `/proc/self/fd/${fd}`;
+    const opened = fsImpl.fstatSync(fd);
+    const anchored = fsImpl.statSync(handleRoot);
+    if (!opened.isDirectory() || !sameOwnedNode(opened, anchored) || fsImpl.realpathSync(handleRoot) !== directory) {
+      fail("config_descriptor_anchor_unavailable", "configuration directory descriptor could not be verified");
+    }
+    return {
+      stat: () => fsImpl.fstatSync(fd),
+      path: (name) => path.join(handleRoot, validateEntryName(name)),
+      rename: (from, to) => fsImpl.renameSync(
+        path.join(handleRoot, validateEntryName(from)),
+        path.join(handleRoot, validateEntryName(to)),
+      ),
+      unlink: (name) => fsImpl.unlinkSync(path.join(handleRoot, validateEntryName(name))),
+      fsync: () => fsImpl.fsyncSync(fd),
+      close: () => fsImpl.closeSync(fd),
+    };
+  } catch (err) {
+    if (fd !== undefined) {
+      try { fsImpl.closeSync(fd); } catch {}
+    }
+    if (err instanceof ResourceInstallError) throw err;
+    fail("config_descriptor_anchor_unavailable", "configuration directory descriptor could not be opened securely");
+  }
+}
+
+function openConfigDirectoryHandle(directoryIdentity, options = {}) {
+  const fsImpl = options.fsImpl || fs;
+  const factory = options.configDirectoryHandleFactory
+    || ((options.platform || process.platform) === "linux" ? linuxConfigDirectoryHandleFactory : null);
+  if (typeof factory !== "function") {
+    fail("config_descriptor_anchor_unavailable", "secure configuration updates require a Linux directory descriptor");
+  }
+  let handle;
+  try {
+    handle = factory({ directory: path.dirname(CONFIG_PATH), fsImpl });
+    const opened = handle.stat();
+    if (!opened.isDirectory() || !sameOwnedNode(directoryIdentity, opened)) {
+      fail("config_directory_changed", "QuadWork configuration directory changed before apply");
+    }
+    return handle;
+  } catch (err) {
+    if (handle) {
+      try { handle.close(); } catch {}
+    }
+    if (err instanceof ResourceInstallError) throw err;
+    fail("config_descriptor_anchor_unavailable", "configuration directory descriptor could not be verified");
+  }
+}
+
+function assertNamedConfigDirectory(fsImpl, uid, expected) {
+  const named = assertSafeConfigDirectory(fsImpl, uid);
+  if (!sameOwnedNode(expected, named)) {
+    fail("config_directory_changed", "QuadWork configuration directory changed during apply");
+  }
 }
 
 function readPolicyFile(policyFile, options = {}) {
@@ -189,70 +290,77 @@ function policyProposal(policyFile, options = {}) {
   });
 }
 
-function readConfigSecure(options = {}) {
+function readConfigSecure(options = {}, directoryHandle = null) {
   const fsImpl = options.fsImpl || fs;
   const uid = expectedUid(options);
-  assertSafeConfigDirectory(fsImpl, uid);
-  const secure = readSecureRegularFile(CONFIG_PATH, {
+  if (!directoryHandle) assertSafeConfigDirectory(fsImpl, uid);
+  const secure = readSecureRegularFile(
+    directoryHandle ? directoryHandle.path("config.json") : CONFIG_PATH,
+    {
     fsImpl,
     maxBytes: CONFIG_FILE_MAX_BYTES,
     kind: "config",
     uid,
-  });
+    },
+  );
   const config = parseJsonObject(secure.raw, "config_json_invalid", "QuadWork configuration JSON is invalid");
   return Object.freeze({ ...secure, config });
-}
-
-function fsyncDirectory(fsImpl, directory) {
-  const constants = fsImpl.constants || fs.constants;
-  let fd;
-  try {
-    fd = fsImpl.openSync(directory, constants.O_RDONLY | (constants.O_DIRECTORY || 0));
-    fsImpl.fsyncSync(fd);
-  } catch {
-    // The file fsync + same-filesystem rename is the required atomic boundary;
-    // directory fsync is best-effort on filesystems that do not expose it.
-  } finally {
-    if (fd !== undefined) {
-      try { fsImpl.closeSync(fd); } catch {}
-    }
-  }
 }
 
 function writeConfigAtomic(previous, nextConfig, options = {}) {
   const fsImpl = options.fsImpl || fs;
   const uid = expectedUid(options);
-  const directory = path.dirname(CONFIG_PATH);
-  assertSafeConfigDirectory(fsImpl, uid);
+  const directoryIdentity = assertSafeConfigDirectory(fsImpl, uid);
   const data = JSON.stringify(nextConfig, null, 2);
   if (Buffer.byteLength(data, "utf8") > CONFIG_FILE_MAX_BYTES) {
     fail("config_size_invalid", "updated QuadWork configuration is too large");
   }
-  const temporary = path.join(directory, `.config.json.resource-install-${process.pid}-${crypto.randomBytes(12).toString("hex")}.tmp`);
+  const temporary = `.config.json.resource-install-${process.pid}-${crypto.randomBytes(12).toString("hex")}.tmp`;
   const constants = fsImpl.constants || fs.constants;
+  if (!Number.isInteger(constants.O_NOFOLLOW)) {
+    fail("config_descriptor_anchor_unavailable", "secure configuration updates require O_NOFOLLOW");
+  }
+  let directoryHandle;
   let fd;
   let committed = false;
   try {
-    fd = fsImpl.openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+    directoryHandle = openConfigDirectoryHandle(directoryIdentity, options);
+    const temporaryPath = directoryHandle.path(temporary);
+    fd = fsImpl.openSync(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     fsImpl.writeFileSync(fd, data, "utf8");
     fsImpl.fsyncSync(fd);
+    const writtenStat = fsImpl.fstatSync(fd);
+    if (!writtenStat.isFile() || !hasSingleLink(writtenStat) || modeOf(writtenStat) !== 0o600) {
+      fail("config_atomic_write_unsafe", "secure temporary configuration could not be established");
+    }
+    validateOwner(writtenStat, uid, "config_atomic_write_owner_mismatch");
     fsImpl.closeSync(fd);
     fd = undefined;
-    const tempStat = fsImpl.lstatSync(temporary);
-    if (!tempStat.isFile() || tempStat.isSymbolicLink() || modeOf(tempStat) !== 0o600) {
+    const tempStat = fsImpl.lstatSync(temporaryPath);
+    if (!tempStat.isFile() || tempStat.isSymbolicLink() || !sameNode(writtenStat, tempStat) || modeOf(tempStat) !== 0o600) {
       fail("config_atomic_write_unsafe", "secure temporary configuration could not be established");
     }
     validateOwner(tempStat, uid, "config_atomic_write_owner_mismatch");
 
     // Re-open and compare the exact old bytes immediately before commit. A
     // stale read-modify-write never replaces a concurrent config update.
-    const current = readConfigSecure(options);
+    const current = readConfigSecure(options, directoryHandle);
     if (current.raw !== previous.raw || !sameIdentity(current.identity, previous.identity)) {
       fail("config_changed", "QuadWork configuration changed before apply");
     }
-    fsImpl.renameSync(temporary, CONFIG_PATH);
+    assertNamedConfigDirectory(fsImpl, uid, directoryIdentity);
+    directoryHandle.rename(temporary, "config.json");
     committed = true;
-    fsyncDirectory(fsImpl, directory);
+    const installed = fsImpl.lstatSync(directoryHandle.path("config.json"));
+    if (!installed.isFile() || installed.isSymbolicLink() || !sameNode(tempStat, installed)) {
+      fail("config_atomic_write_unsafe", "installed configuration identity could not be verified");
+    }
+    directoryHandle.fsync();
+    const finalHandleDirectory = directoryHandle.stat();
+    if (!finalHandleDirectory.isDirectory() || !sameOwnedNode(directoryIdentity, finalHandleDirectory)) {
+      fail("config_directory_changed", "QuadWork configuration directory changed during apply");
+    }
+    assertNamedConfigDirectory(fsImpl, uid, directoryIdentity);
   } catch (err) {
     if (err instanceof ResourceInstallError) throw err;
     fail("config_write_failed", "QuadWork configuration could not be updated atomically");
@@ -261,7 +369,10 @@ function writeConfigAtomic(previous, nextConfig, options = {}) {
       try { fsImpl.closeSync(fd); } catch {}
     }
     if (!committed) {
-      try { fsImpl.unlinkSync(temporary); } catch {}
+      try { directoryHandle.unlink(temporary); } catch {}
+    }
+    if (directoryHandle) {
+      try { directoryHandle.close(); } catch {}
     }
   }
 }
@@ -353,21 +464,62 @@ function validateTempTarget(policy, options = {}) {
     root,
     parent,
     parentIdentity: parentStat,
+    rootIdentity: rootStat,
     requiredBytes,
     currentState: rootStat ? "ready" : "create",
   });
 }
 
-function rollbackEmptyCreatedRoot(fsImpl, targetPath, uid) {
+function rollbackEmptyCreatedRoot(fsImpl, parentRoot, entryName, uid, createdIdentity) {
+  const targetPath = path.join(parentRoot, entryName);
+  let quarantinePath = null;
+  let quarantineIdentity = null;
+  let detached = false;
   try {
     const stat = fsImpl.lstatSync(targetPath);
-    if (stat.isSymbolicLink() || !stat.isDirectory() || modeOf(stat) !== 0o700) return false;
+    if (!sameOwnedNode(stat, createdIdentity) || stat.isSymbolicLink() || !stat.isDirectory() || modeOf(stat) !== 0o700) return false;
     if (uid !== null && stat.uid !== uid) return false;
     if (fsImpl.readdirSync(targetPath).length !== 0) return false;
-    fsImpl.rmdirSync(targetPath);
+
+    // Reserve a random owner-only container first. If the accepted name is
+    // swapped after the identity check, the second identity check below keeps
+    // that entry quarantined and, critically, never deletes it as ours.
+    const quarantineName = `.quadwork-resource-install-rollback-${crypto.randomBytes(16).toString("hex")}`;
+    quarantinePath = path.join(parentRoot, quarantineName);
+    fsImpl.mkdirSync(quarantinePath, { recursive: false, mode: 0o700 });
+    quarantineIdentity = fsImpl.lstatSync(quarantinePath);
+    if (quarantineIdentity.isSymbolicLink()
+      || !quarantineIdentity.isDirectory()
+      || modeOf(quarantineIdentity) !== 0o700
+      || (uid !== null && quarantineIdentity.uid !== uid)) return false;
+    const detachedPath = path.join(quarantinePath, "created-root");
+    fsImpl.renameSync(targetPath, detachedPath);
+    detached = true;
+    const detachedStat = fsImpl.lstatSync(detachedPath);
+    if (!sameOwnedNode(detachedStat, createdIdentity)
+      || detachedStat.isSymbolicLink()
+      || !detachedStat.isDirectory()
+      || fsImpl.readdirSync(detachedPath).length !== 0) return false;
+    fsImpl.rmdirSync(detachedPath);
+    detached = false;
+    const finalQuarantine = fsImpl.lstatSync(quarantinePath);
+    if (!sameOwnedNode(finalQuarantine, quarantineIdentity) || fsImpl.readdirSync(quarantinePath).length !== 0) return false;
+    fsImpl.rmdirSync(quarantinePath);
+    quarantinePath = null;
     return true;
   } catch (err) {
-    return Boolean(err && err.code === "ENOENT");
+    return false;
+  } finally {
+    // Only remove our exact still-empty reservation. A detached or replaced
+    // node is preserved for explicit operator recovery.
+    if (!detached && quarantinePath && quarantineIdentity) {
+      try {
+        const stat = fsImpl.lstatSync(quarantinePath);
+        if (sameOwnedNode(stat, quarantineIdentity) && fsImpl.readdirSync(quarantinePath).length === 0) {
+          fsImpl.rmdirSync(quarantinePath);
+        }
+      } catch {}
+    }
   }
 }
 
@@ -420,21 +572,70 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
   }
   let facts;
   let parentFd;
+  let parentRoot = target.parent;
+  const entryName = path.basename(proposal.plan.temp_root);
   let ensureRoot = proposal.plan.temp_root;
+  let createdIdentity = null;
+  let createdUnverified = false;
+  let expectedRootIdentity = target.rootIdentity;
   let failure = null;
   try {
     if (platform === "linux") {
       const fsImpl = options.fsImpl || fs;
       const constants = fsImpl.constants || fs.constants;
+      if (!Number.isInteger(constants.O_DIRECTORY) || !Number.isInteger(constants.O_NOFOLLOW)) {
+        fail("temp_descriptor_anchor_unavailable", "secure resource temp installation requires a Linux directory descriptor");
+      }
       parentFd = fsImpl.openSync(
         target.parent,
-        constants.O_RDONLY | (constants.O_DIRECTORY || 0) | (constants.O_NOFOLLOW || 0),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
       );
       const anchoredParent = fsImpl.fstatSync(parentFd);
       if (!anchoredParent.isDirectory() || !sameOwnedNode(target.parentIdentity, anchoredParent)) {
         fail("temp_parent_identity_changed", "resource temp parent changed before apply");
       }
-      ensureRoot = `/proc/self/fd/${parentFd}/${path.basename(proposal.plan.temp_root)}`;
+      parentRoot = `/proc/self/fd/${parentFd}`;
+      let procParent;
+      let canonicalProcParent;
+      try {
+        procParent = fsImpl.statSync(parentRoot);
+        canonicalProcParent = fsImpl.realpathSync(parentRoot);
+      } catch {
+        fail("temp_descriptor_anchor_unavailable", "resource temp parent descriptor could not be verified");
+      }
+      if (!procParent.isDirectory()
+        || !sameOwnedNode(anchoredParent, procParent)
+        || canonicalProcParent !== target.parent) {
+        fail("temp_descriptor_anchor_unavailable", "resource temp parent descriptor does not match the accepted parent");
+      }
+      ensureRoot = path.join(parentRoot, entryName);
+    }
+    if (target.currentState === "create") {
+      const fsImpl = options.fsImpl || fs;
+      try {
+        fsImpl.mkdirSync(ensureRoot, { recursive: false, mode: 0o700 });
+        createdUnverified = true;
+      } catch (err) {
+        if (err && err.code === "EEXIST") fail("temp_root_changed", "resource temp root appeared before apply");
+        throw err;
+      }
+      const created = fsImpl.lstatSync(ensureRoot);
+      if (created.isSymbolicLink()
+        || !created.isDirectory()
+        || modeOf(created) !== 0o700
+        || (expectedUid(options) !== null && created.uid !== expectedUid(options))) {
+        fail("temp_root_create_unverified", "new resource temp root identity could not be verified");
+      }
+      createdIdentity = created;
+      expectedRootIdentity = created;
+      createdUnverified = false;
+    } else {
+      const existing = (options.fsImpl || fs).lstatSync(ensureRoot);
+      if (!sameOwnedNode(existing, expectedRootIdentity)
+        || existing.isSymbolicLink()
+        || !existing.isDirectory()) {
+        fail("temp_root_identity_changed", "resource temp root changed before apply");
+      }
     }
     facts = (options.ensureTempRoot || ensureTempRoot)({
       tempRoot: ensureRoot,
@@ -447,15 +648,33 @@ function applyTempInstall({ acceptanceSha256 }, options = {}) {
     if (!facts || facts.available !== true || facts.canonicalRoot !== policy.temp_root || facts.mode !== 0o700 || facts.diskBacked !== true) {
       fail("temp_install_unverified", "resource temp root installation could not be verified");
     }
+    const installedRoot = (options.fsImpl || fs).lstatSync(ensureRoot);
+    if (!sameOwnedNode(installedRoot, expectedRootIdentity)
+      || installedRoot.isSymbolicLink()
+      || !installedRoot.isDirectory()) {
+      fail("temp_root_identity_changed", "resource temp root changed during apply");
+    }
     let finalParent;
     try { finalParent = (options.fsImpl || fs).lstatSync(target.parent); } catch { fail("temp_parent_identity_changed", "resource temp parent changed during apply"); }
     if (!sameOwnedNode(target.parentIdentity, finalParent)) fail("temp_parent_identity_changed", "resource temp parent changed during apply");
+    const finalRoot = (options.fsImpl || fs).lstatSync(target.root);
+    if (!sameOwnedNode(finalRoot, expectedRootIdentity)
+      || finalRoot.isSymbolicLink()
+      || !finalRoot.isDirectory()) {
+      fail("temp_root_identity_changed", "resource temp root changed during apply");
+    }
+    const finalConfig = readConfigSecure(options);
+    if (finalConfig.raw !== built.configSnapshot.raw
+      || !sameIdentity(finalConfig.identity, built.configSnapshot.identity)) {
+      fail("config_changed", "QuadWork configuration changed during temp-root apply");
+    }
   } catch (err) {
     failure = err instanceof ResourceInstallError
       ? err
       : new ResourceInstallError("temp_install_failed", "resource temp root could not be installed securely");
-    if (target.currentState === "create"
-      && !rollbackEmptyCreatedRoot(options.fsImpl || fs, ensureRoot, expectedUid(options))) {
+    if (createdUnverified
+      || (createdIdentity
+        && !rollbackEmptyCreatedRoot(options.fsImpl || fs, parentRoot, entryName, expectedUid(options), createdIdentity))) {
       failure = new ResourceInstallError(
         "temp_install_failed_cleanup_required",
         "resource temp installation failed and its exact empty-root rollback could not be verified",

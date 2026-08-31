@@ -15,7 +15,7 @@ process.on("exit", () => {
 });
 
 const { runResourcesCommand } = require("../bin/quadwork");
-const { ResourceInstallError } = require("./resource-install");
+const { ResourceInstallError, applyPolicy } = require("./resource-install");
 const { DEFAULT_RUNTIME_RESOURCE_PROPOSAL } = require("./resource-policy");
 
 const configDir = path.join(tempHome, ".quadwork");
@@ -37,6 +37,17 @@ fs.chmodSync(policyPath, 0o600);
 function sink() {
   let output = "";
   return { stream: { write(chunk) { output += String(chunk); } }, value: () => output };
+}
+
+function pathConfigDirectoryHandle({ directory, fsImpl }) {
+  return {
+    stat: () => fsImpl.lstatSync(directory),
+    path: (name) => path.join(directory, name),
+    rename: (from, to) => fsImpl.renameSync(path.join(directory, from), path.join(directory, to)),
+    unlink: (name) => fsImpl.unlinkSync(path.join(directory, name)),
+    fsync: () => {},
+    close: () => {},
+  };
 }
 
 // Dry-run JSON has an exact token/policy/plan, writes nothing, and exits 0.
@@ -65,7 +76,11 @@ function sink() {
     result.acceptance.sha256,
     "--policy-file",
     policyPath,
-  ], { stdout: appliedOut.stream, stderr: sink().stream }), 0);
+  ], {
+    stdout: appliedOut.stream,
+    stderr: sink().stream,
+    applyPolicy: (input) => applyPolicy(input, { configDirectoryHandleFactory: pathConfigDirectoryHandle }),
+  }), 0);
   assert.equal(JSON.parse(appliedOut.value()).status, "applied");
   const written = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.equal(written.preserved, "yes");

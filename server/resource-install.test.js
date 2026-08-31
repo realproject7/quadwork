@@ -66,6 +66,42 @@ function pathRootHandle({ root, fsImpl }) {
   };
 }
 
+// Non-Linux unit-test seam. Production apply uses the Linux /proc/self/fd
+// implementation; these ordinary-path operations are only used where no
+// directory race is injected.
+function pathConfigDirectoryHandle({ directory, fsImpl }) {
+  return {
+    stat: () => fsImpl.lstatSync(directory),
+    path: (name) => path.join(directory, name),
+    rename: (from, to) => fsImpl.renameSync(path.join(directory, from), path.join(directory, to)),
+    unlink: (name) => fsImpl.unlinkSync(path.join(directory, name)),
+    fsync: () => {},
+    close: () => {},
+  };
+}
+
+// Exercise the production Linux handle on this non-Linux unit-test host by
+// mapping only its /proc/self/fd/<dirfd> child paths back to the same directory.
+function procFdFsAdapter(directory) {
+  function mapped(value) {
+    if (typeof value !== "string") return value;
+    const match = value.match(/^\/proc\/self\/fd\/\d+(?:\/(.*))?$/);
+    if (!match) return value;
+    return match[1] ? path.join(directory, match[1]) : directory;
+  }
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "realpathSync") return (value) => fs.realpathSync(mapped(value));
+      if (property === "renameSync") return (from, to) => fs.renameSync(mapped(from), mapped(to));
+      if (["openSync", "statSync", "lstatSync", "unlinkSync", "mkdirSync", "readdirSync", "rmdirSync", "rmSync"].includes(property)) {
+        return (value, ...args) => fs[property](mapped(value), ...args);
+      }
+      const member = Reflect.get(target, property);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+}
+
 function code(expected) {
   return (err) => err instanceof ResourceInstallError && err.code === expected;
 }
@@ -93,7 +129,10 @@ reset();
 // only runtime_resources while preserving unrelated fields and mode 0600.
 {
   const proposal = policyProposal(policyPath);
-  const result = applyPolicy({ policyFile: policyPath, acceptanceSha256: proposal.acceptance.sha256 });
+  const result = applyPolicy(
+    { policyFile: policyPath, acceptanceSha256: proposal.acceptance.sha256 },
+    { platform: "linux", fsImpl: procFdFsAdapter(configDir) },
+  );
   assert.equal(result.status, "applied");
   const written = JSON.parse(fs.readFileSync(configPath, "utf8"));
   assert.equal(written.port, 8400);
@@ -102,6 +141,73 @@ reset();
   assert.deepEqual(written.runtime_resources, policy());
   assert.equal(fs.statSync(configPath).mode & 0o7777, 0o600);
   assert.deepEqual(fs.readdirSync(configDir), ["config.json"], "atomic apply leaves no temporary sibling");
+}
+
+// The policy and config inputs must not have another hardlink that can retain
+// or mutate the accepted inode under an unverified name.
+reset();
+{
+  const policyLink = path.join(tempHome, "resource-policy-hardlink.json");
+  fs.linkSync(policyPath, policyLink);
+  assert.throws(() => policyProposal(policyPath), code("policy_file_hardlink_unsafe"));
+  fs.unlinkSync(policyLink);
+
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const configLink = path.join(tempHome, "config-hardlink.json");
+  fs.linkSync(configPath, configLink);
+  assert.throws(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      { configDirectoryHandleFactory: pathConfigDirectoryHandle },
+    ),
+    code("config_hardlink_unsafe"),
+  );
+  fs.unlinkSync(configLink);
+}
+
+// A final-path swap after the fresh config reread cannot redirect the anchored
+// rename into an outside directory and cannot return a false applied result.
+reset();
+{
+  const token = policyProposal(policyPath).acceptance.sha256;
+  const movedDirectory = path.join(tempHome, "moved-config-directory");
+  const outsideDirectory = path.join(tempHome, "outside-config-directory");
+  let raced = false;
+  function racingHandle({ directory, fsImpl }) {
+    let anchoredDirectory = directory;
+    return {
+      stat: () => fsImpl.lstatSync(anchoredDirectory),
+      path: (name) => path.join(anchoredDirectory, name),
+      rename(from, to) {
+        fsImpl.renameSync(directory, movedDirectory);
+        fsImpl.mkdirSync(outsideDirectory, { mode: 0o700 });
+        fsImpl.chmodSync(outsideDirectory, 0o700);
+        writePrivate(path.join(outsideDirectory, "config.json"), { marker: "outside-victim" });
+        fsImpl.symlinkSync(outsideDirectory, directory, "dir");
+        anchoredDirectory = movedDirectory;
+        fsImpl.renameSync(path.join(anchoredDirectory, from), path.join(anchoredDirectory, to));
+        raced = true;
+      },
+      unlink: (name) => fsImpl.unlinkSync(path.join(anchoredDirectory, name)),
+      fsync: () => {},
+      close: () => {},
+    };
+  }
+  assert.throws(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      { configDirectoryHandleFactory: racingHandle },
+    ),
+    (err) => err instanceof ResourceInstallError && err.code.startsWith("config_directory_"),
+  );
+  assert.equal(raced, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outsideDirectory, "config.json"), "utf8")), {
+    marker: "outside-victim",
+  });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(movedDirectory, "config.json"), "utf8")).runtime_resources.version, 1);
+  fs.unlinkSync(configDir);
+  fs.rmSync(movedDirectory, { recursive: true, force: true });
+  fs.rmSync(outsideDirectory, { recursive: true, force: true });
 }
 
 // A source change makes the proposal stale; no config bytes are replaced.
@@ -137,6 +243,23 @@ reset();
   assert.throws(
     () => applyPolicy({ policyFile: policyPath, acceptanceSha256: token }),
     code("config_directory_mode_unsafe"),
+  );
+  fs.chmodSync(configDir, 0o700);
+  const aliasedFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === "realpathSync") {
+        return (value) => value === configDir ? `${configDir}-alias-target` : fs.realpathSync(value);
+      }
+      const member = Reflect.get(target, property);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  assert.throws(
+    () => applyPolicy(
+      { policyFile: policyPath, acceptanceSha256: token },
+      { fsImpl: aliasedFs, configDirectoryHandleFactory: pathConfigDirectoryHandle },
+    ),
+    code("config_directory_aliased"),
   );
 }
 
@@ -218,6 +341,11 @@ reset(undefined, policy());
     code("temp_install_failed"),
   );
   assert.equal(fs.existsSync(policy().temp_root), false, "failed install leaves no created empty root");
+  assert.equal(
+    fs.readdirSync(configDir).some((name) => name.startsWith(".quadwork-resource-install-rollback-")),
+    false,
+    "successful exact rollback leaves no quarantine",
+  );
 }
 
 // A host-state change also stales the token; the installer will not reinterpret
@@ -235,14 +363,53 @@ reset(undefined, policy());
   fs.rmSync(policy().temp_root, { recursive: true, force: true });
 }
 
+// Rollback is bound to the exact inode created by this apply. If an attacker
+// swaps another empty owner-only directory into the accepted name, it remains
+// untouched and the displaced transaction inode is reported for recovery.
+{
+  const proposal = tempInstallProposal({ statfs: diskStatfs });
+  const victim = path.join(configDir, "preexisting-empty-victim");
+  const displaced = path.join(configDir, "displaced-created-root");
+  fs.mkdirSync(victim, { mode: 0o700 });
+  fs.chmodSync(victim, 0o700);
+  const victimIdentity = fs.lstatSync(victim);
+  assert.throws(
+    () => applyTempInstall(
+      { acceptanceSha256: proposal.acceptance.sha256 },
+      {
+        statfs: diskStatfs,
+        rootHandleFactory: pathRootHandle,
+        ensureTempRoot({ tempRoot }) {
+          fs.renameSync(tempRoot, displaced);
+          fs.renameSync(victim, tempRoot);
+          throw new Error("injected root-name replacement");
+        },
+      },
+    ),
+    code("temp_install_failed_cleanup_required"),
+  );
+  const preserved = fs.lstatSync(policy().temp_root);
+  assert.equal(preserved.dev, victimIdentity.dev);
+  assert.equal(preserved.ino, victimIdentity.ino);
+  assert.equal(fs.existsSync(displaced), true);
+  fs.rmdirSync(policy().temp_root);
+  fs.rmdirSync(displaced);
+}
+
 // Exact acceptance creates and verifies only the policy-owned root. The config
 // remains byte-identical and no cleanup path is accepted or executed.
 {
   const configBefore = fs.readFileSync(configPath, "utf8");
   const proposal = tempInstallProposal({ statfs: diskStatfs });
+  const linuxFs = procFdFsAdapter(configDir);
   const result = applyTempInstall(
     { acceptanceSha256: proposal.acceptance.sha256 },
-    { statfs: diskStatfs, rootHandleFactory: pathRootHandle },
+    {
+      platform: "linux",
+      fsImpl: linuxFs,
+      statfs: diskStatfs,
+      rootHandleFactory: pathRootHandle,
+    },
   );
   assert.equal(result.status, "applied");
   assert.deepEqual(result.result, { ready: true, mode: "0700", disk_backed: true });
