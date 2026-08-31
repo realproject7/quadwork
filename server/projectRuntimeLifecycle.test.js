@@ -172,6 +172,7 @@ const legacyProgress = {
   owned: false,
   current: true,
   multi_repository: false,
+  batch_observation_fingerprint: "legacy-observation-runtime-5",
   batch_number: 5,
   completeConfirmed: false,
   items: [{
@@ -213,6 +214,7 @@ assert.deepEqual(runtime.bridgeAssignmentBody("a", { generation: 4 }, runtime.ba
   project_id: "a",
   admission_generation: 4,
   compatibility_mode: "v1",
+  batch_observation_fingerprint: "legacy-observation-runtime-5",
 }, "V1 bridge automation stays explicitly compatible without inventing V2 ownership");
 
 const originalValidateCurrentOwnedAssignment = routes.validateCurrentOwnedAssignment;
@@ -500,24 +502,34 @@ process.on("exit", cleanup);
   const lifecycleApi = require("./project-lifecycle");
   const staleBridgeAdmission = lifecycleApi.captureProjectAdmission("b");
   let directBridgeFetches = 0;
-  const stopBodies = [];
+  const bridgeBodies = [];
   const bridgeFetch = global.fetch;
-  global.fetch = async (_url, options = {}) => {
+  global.fetch = async (url, options = {}) => {
     directBridgeFetches += 1;
-    if (options.body) stopBodies.push(JSON.parse(options.body));
-    return { ok: true };
+    if (!options.body) {
+      return { ok: true, json: async () => ({ configured: true, running: true }) };
+    }
+    bridgeBodies.push({ url: String(url), body: JSON.parse(options.body) });
+    return {
+      ok: true,
+      json: async () => ({ ok: true, running: String(url).includes("action=start") }),
+    };
   };
   try {
+    assert.equal(await runtime.autoStartBridges("b", liveB, 8400, staleBridgeAdmission, ownedAutomation), true);
     await runtime.autoStopBridges("b", liveB, 8400, staleBridgeAdmission, ownedAutomation);
-    assert.equal(directBridgeFetches, 2);
-    assert.ok(stopBodies.every((body) => body.admission_generation === staleBridgeAdmission.generation),
+    assert.equal(directBridgeFetches, 6,
+      "auto-start asks the authority-aware route to reconcile both bridges even when status says running");
+    assert.equal(bridgeBodies.filter((entry) => entry.url.includes("action=start")).length, 2,
+      "a running assignment-A bridge cannot suppress assignment-B replacement");
+    assert.ok(bridgeBodies.every(({ body }) => body.admission_generation === staleBridgeAdmission.generation),
       "auto-stop requests carry the captured lease for route-side stale-cycle rejection");
-    assert.ok(stopBodies.every((body) => body.assignment_key === ownedProgress.assignment_key &&
+    assert.ok(bridgeBodies.every(({ body }) => body.assignment_key === ownedProgress.assignment_key &&
       body.assignment_attempt === ownedProgress.assignment_attempt),
-    "auto-stop requests carry the exact queue assignment for route-side rollover rejection");
+    "bridge reconciliation requests carry the exact queue assignment for route-side rollover rejection");
     directBridgeFetches = 0;
     lifecycleApi.revokeProjectAdmission("b");
-    await runtime.autoStartBridges("b", liveB, 8400, staleBridgeAdmission);
+    assert.equal(await runtime.autoStartBridges("b", liveB, 8400, staleBridgeAdmission), false);
     await runtime.autoStopBridges("b", liveB, 8400, staleBridgeAdmission);
     assert.equal(directBridgeFetches, 0,
       "stale generation blocks both auto-start and auto-stop bridge decisions");
@@ -546,6 +558,76 @@ process.on("exit", cleanup);
     assert.equal(staleFetches, 2, "stale batch poll fetches only progress + active authority and never reaches bridge auto-start");
   } finally {
     global.fetch = savedFetch;
+  }
+
+  const retryBridgeFetch = global.fetch;
+  const retryBridgeValidation = routes.validateCurrentOwnedAssignment;
+  const bridgeStartCalls = [];
+  const bridgeStopCalls = [];
+  let failFirstTelegramStart = true;
+  let failFirstTelegramStop = true;
+  let bridgeBatchComplete = false;
+  routes.validateCurrentOwnedAssignment = () => ({ ok: true, manual: false });
+  global.fetch = async (url, options = {}) => {
+    const target = String(url);
+    if (target.includes("/api/batch-progress")) {
+      return {
+        ok: true,
+        json: async () => bridgeBatchComplete
+          ? { ...ownedProgress, complete: true, completeConfirmed: true }
+          : ownedProgress,
+      };
+    }
+    if (target.includes("/api/batch-active")) {
+      return {
+        ok: true,
+        json: async () => bridgeBatchComplete
+          ? { ...ownedActive, complete: true, completeConfirmed: true }
+          : ownedActive,
+      };
+    }
+    if (!options.body && (target.includes("/api/telegram?") || target.includes("/api/discord?"))) {
+      return { ok: true, json: async () => ({ configured: true, running: true }) };
+    }
+    if (target.includes("action=start")) {
+      bridgeStartCalls.push(target);
+      if (target.includes("/api/telegram") && failFirstTelegramStart) {
+        failFirstTelegramStart = false;
+        return { ok: true, json: async () => ({ ok: false, running: false }) };
+      }
+      return { ok: true, json: async () => ({ ok: true, running: true }) };
+    }
+    if (target.includes("action=stop")) {
+      bridgeStopCalls.push(target);
+      if (target.includes("/api/telegram") && failFirstTelegramStop) {
+        failFirstTelegramStop = false;
+        return { ok: true, json: async () => ({ ok: false, running: true }) };
+      }
+      return { ok: true, json: async () => ({ ok: true, running: false }) };
+    }
+    throw new Error(`unexpected bridge retry URL: ${target}`);
+  };
+  try {
+    await runtime.autoStopPollingTick();
+    assert.equal(bridgeStartCalls.length, 2, "the first A→B reconciliation attempts both bridges");
+    await runtime.autoStopPollingTick();
+    assert.equal(bridgeStartCalls.length, 4,
+      "a partial bridge replacement failure keeps the new assignment transition retryable");
+    await runtime.autoStopPollingTick();
+    assert.equal(bridgeStartCalls.length, 4,
+      "the bridge transition fingerprint advances only after confirmed reconciliation");
+    bridgeBatchComplete = true;
+    await runtime.autoStopPollingTick();
+    assert.equal(bridgeStopCalls.length, 2, "the completion transition attempts both bridge stops");
+    await runtime.autoStopPollingTick();
+    assert.equal(bridgeStopCalls.length, 4,
+      "HTTP 200 with an application stop failure keeps the completion transition retryable");
+    await runtime.autoStopPollingTick();
+    assert.equal(bridgeStopCalls.length, 4,
+      "the completion fingerprint advances only after both stop bodies confirm success");
+  } finally {
+    global.fetch = retryBridgeFetch;
+    routes.validateCurrentOwnedAssignment = retryBridgeValidation;
   }
 
   let proxyClose;

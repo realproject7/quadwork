@@ -52,6 +52,7 @@ interface BatchProgressData {
   multi_repository?: boolean;
   validation_errors?: Array<{ code: string; message: string }>;
   compatibility_mode?: "v1" | "v2";
+  batch_observation_fingerprint?: string;
   assignment_items?: Array<{
     work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
     ownership_key: string;

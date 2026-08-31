@@ -197,6 +197,7 @@ const legacyTop = {
   current: true,
   owned: false,
   multi_repository: false,
+  batch_observation_fingerprint: "legacy-observation-3-a",
 };
 const legacyRow = {
   ...legacyTop,
@@ -215,7 +216,7 @@ const legacy = ownedCurrentBatchSnapshot(
 assert.ok(legacy && legacy.authority === "legacy_compatibility", "explicit preactivation V1 keeps legacy auto lifecycle compatible");
 assert.deepEqual(
   assignmentRequestFields(legacy),
-  { compatibility_mode: "v1" },
+  { compatibility_mode: "v1", batch_observation_fingerprint: "legacy-observation-3-a" },
   "legacy auto action sends only the explicit compatibility discriminator and never fabricates V2 authority",
 );
 assert.equal(
@@ -233,8 +234,8 @@ const legacyEditedRow = {
   work_item_ref: { ...legacyRow.work_item_ref, number: 10 },
 };
 const legacyEdited = ownedCurrentBatchSnapshot(
-  { ...legacyTop, active: true },
-  { ...legacyTop, complete: false, items: [legacyEditedRow] },
+  { ...legacyTop, batch_observation_fingerprint: "legacy-observation-3-b", active: true },
+  { ...legacyTop, batch_observation_fingerprint: "legacy-observation-3-b", complete: false, items: [legacyEditedRow] },
 );
 assert.notEqual(legacyEdited.fingerprint, legacy.fingerprint,
   "V1 same-batch row-set edits retain their historical transition identity");
@@ -249,6 +250,7 @@ assert.ok(
 for (const [name, activeDelta, progressDelta] of [
   ["postactivation legacy", { compatibility_mode: "v2" }, { compatibility_mode: "v2" }],
   ["one-sided compatibility", {}, { compatibility_mode: "v2" }],
+  ["legacy observation mismatch", {}, { batch_observation_fingerprint: "legacy-observation-3-stale" }],
   ["legacy current mismatch", {}, { current: false }],
   ["multi-repository legacy", { multi_repository: true }, { multi_repository: true }],
   ["legacy claimed owned", { owned: true }, { owned: true }],

@@ -5,43 +5,174 @@ const os = require("os");
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 
 const instances = new Map();
+const startOperations = new Map();
+const stopRequests = new Map();
+const MANUAL_AUTHORITY_FINGERPRINT = "manual";
+
+function normalizeAuthorityKey(authorityKey) {
+  const admissionGeneration = authorityKey?.admission_generation;
+  const assignmentFingerprint = authorityKey?.assignment_fingerprint;
+  return Object.freeze({
+    admission_generation: Number.isSafeInteger(admissionGeneration) && admissionGeneration >= 0
+      ? admissionGeneration
+      : null,
+    assignment_fingerprint: typeof assignmentFingerprint === "string" && assignmentFingerprint
+      ? assignmentFingerprint
+      : MANUAL_AUTHORITY_FINGERPRINT,
+  });
+}
+
+function sameAuthority(left, right) {
+  return !!left && !!right &&
+    left.admission_generation === right.admission_generation &&
+    left.assignment_fingerprint === right.assignment_fingerprint;
+}
+
+function registerStopRequest(projectId, authorityKey) {
+  const request = { authorityKey };
+  const requests = stopRequests.get(projectId) || new Set();
+  requests.add(request);
+  stopRequests.set(projectId, requests);
+  return request;
+}
+
+function unregisterStopRequest(projectId, request) {
+  const requests = stopRequests.get(projectId);
+  if (!requests) return;
+  requests.delete(request);
+  if (requests.size === 0) stopRequests.delete(projectId);
+}
+
+function startCancelled(projectId, authorityKey) {
+  const requests = stopRequests.get(projectId);
+  if (!requests) return false;
+  return [...requests].some((request) =>
+    request.authorityKey === null || sameAuthority(request.authorityKey, authorityKey));
+}
 
 function isCurrent(projectId, inst) {
   return !inst.stopping && instances.get(projectId) === inst;
 }
 
-function retireStaleInstance(projectId, inst) {
-  if (!inst || inst.stopping) return;
+function retirementFailure(result) {
+  const error = new Error("Discord bridge cleanup is incomplete; retry the operation");
+  error.code = "bridge_cleanup_incomplete";
+  error.retryable = true;
+  error.cleanupResult = result;
+  return error;
+}
+
+async function performRetirement(projectId, inst) {
   inst.stopping = true;
+  if (typeof inst.cancelRetirement === "function") {
+    inst.cancelRetirement();
+    inst.cancelRetirement = null;
+  }
+  let timers = 0;
+  const cleanupErrors = [];
   for (const controller of inst.controllers || []) {
-    try { controller.abort(); } catch {}
+    try {
+      controller.abort();
+      inst.controllers.delete(controller);
+    }
+    catch (err) {
+      cleanupErrors.push({
+        resource: "discord_bridge",
+        code: "fetch_abort_failed",
+        message: err?.message || "Discord bridge fetch abort failed",
+        retryable: true,
+      });
+    }
   }
   if (inst.timer) {
-    try { clearTimeout(inst.timer); } catch {}
-    inst.timer = null;
-  }
-  if (inst.client) {
-    let operation;
-    try { operation = inst.client.destroy(); }
-    catch (err) {
-      inst.retirementError = err;
-      return;
+    try {
+      clearTimeout(inst.timer);
+      inst.timer = null;
+      timers += 1;
+    } catch (err) {
+      cleanupErrors.push({
+        resource: "discord_bridge",
+        code: "timer_stop_failed",
+        message: err?.message || "Discord bridge timer stop failed",
+        retryable: true,
+      });
     }
-    inst.retirement = Promise.resolve(operation);
-    inst.retirement.then(
-      () => {
-        inst.retirement = null;
-        inst.retirementError = null;
-        if (instances.get(projectId) === inst) instances.delete(projectId);
-      },
-      (err) => {
-        inst.retirement = null;
-        inst.retirementError = err;
-      },
-    );
-    return;
   }
-  if (instances.get(projectId) === inst) instances.delete(projectId);
+  if (inst.client && !inst.clientRetired) {
+    let outcome;
+    try {
+      if (!inst.clientRetirementOperation) {
+        inst.clientRetirementOperation = Promise.resolve(inst.client.destroy());
+      }
+      outcome = await settleOperation(inst.clientRetirementOperation, inst.stopTimeoutMs || 5000);
+    } catch (error) {
+      outcome = { ok: false, error };
+    }
+    if (!outcome.ok) {
+      cleanupErrors.push({
+        resource: "discord_bridge",
+        code: outcome.timeout ? "client_stop_timeout" : "client_stop_failed",
+        message: outcome.timeout
+          ? "Discord bridge client stop timed out"
+          : (outcome.error?.message || "Discord bridge client stop failed"),
+        retryable: true,
+      });
+      if (!outcome.timeout) inst.clientRetirementOperation = null;
+    } else {
+      inst.clientRetired = true;
+      inst.clientRetirementOperation = null;
+    }
+  }
+  if (!(await settleInFlight(inst, inst.stopTimeoutMs || 5000))) {
+    cleanupErrors.push({
+      resource: "discord_bridge",
+      code: "inflight_stop_timeout",
+      message: "Discord bridge in-flight work did not settle",
+      retryable: true,
+    });
+  }
+  const ok = cleanupErrors.length === 0;
+  if (ok && instances.get(projectId) === inst) {
+    instances.delete(projectId);
+    console.log(`[bridge] discord ${projectId}: stopped`);
+  }
+  return {
+    ok,
+    resources: {
+      discord_bridges: ok ? 1 : 0,
+      bridge_timers: timers,
+    },
+    cleanup_errors: cleanupErrors,
+  };
+}
+
+function retireInstance(projectId, inst) {
+  if (!inst) return Promise.resolve({
+    ok: true,
+    resources: { discord_bridges: 0, bridge_timers: 0 },
+    cleanup_errors: [],
+  });
+  if (inst.retirement) return inst.retirement;
+  const retirement = performRetirement(projectId, inst).catch((err) => ({
+    ok: false,
+    resources: { discord_bridges: 0, bridge_timers: 0 },
+    cleanup_errors: [{
+      resource: "discord_bridge",
+      code: "retirement_failed",
+      message: err?.message || "Discord bridge retirement failed",
+      retryable: true,
+    }],
+  }));
+  inst.retirement = retirement;
+  retirement.then(() => {
+    if (inst.retirement === retirement) inst.retirement = null;
+  });
+  return retirement;
+}
+
+function retireStaleInstance(projectId, inst) {
+  if (!inst || inst.retirement) return;
+  void retireInstance(projectId, inst);
 }
 
 function isAuthorizedCurrent(projectId, inst) {
@@ -63,8 +194,15 @@ async function track(inst, promise) {
   if (!inst.inFlight) inst.inFlight = new Set();
   const owned = Promise.resolve(promise);
   inst.inFlight.add(owned);
-  try { return await owned; }
-  finally { inst.inFlight.delete(owned); }
+  owned.then(
+    () => inst.inFlight.delete(owned),
+    () => inst.inFlight.delete(owned),
+  );
+  if (!inst.retirementSignal) return owned;
+  return Promise.race([
+    owned,
+    inst.retirementSignal.then(() => { throw staleAuthorityError(); }),
+  ]);
 }
 
 async function bridgeFetch(inst, url, options = {}, timeoutMs = 5000) {
@@ -197,9 +335,7 @@ async function pollLoop(projectId, channelObj, qwPort) {
   }
 }
 
-async function start(projectId, botToken, channelId, qwPort, options = {}) {
-  if (instances.has(projectId)) return;
-
+async function startInstance(projectId, botToken, channelId, qwPort, options, authorityKey) {
   const isAuthorityCurrent = typeof options.isAuthorityCurrent === "function"
     ? options.isAuthorityCurrent
     : null;
@@ -228,6 +364,8 @@ async function start(projectId, botToken, channelId, qwPort, options = {}) {
     ],
   });
 
+  let cancelRetirement;
+  const retirementSignal = new Promise((resolve) => { cancelRetirement = resolve; });
   const inst = {
     projectId,
     cursor: readCursor(projectId),
@@ -242,7 +380,12 @@ async function start(projectId, botToken, channelId, qwPort, options = {}) {
     inFlight: new Set(),
     isAuthorityCurrent,
     automationIdentity,
+    retirement: null,
+    retirementSignal,
+    cancelRetirement,
+    ready: false,
   };
+  Object.defineProperty(inst, "authorityKey", { value: authorityKey, enumerable: true });
   instances.set(projectId, inst);
 
   try {
@@ -250,7 +393,8 @@ async function start(projectId, botToken, channelId, qwPort, options = {}) {
     await track(inst, client.login(botToken));
   } catch (err) {
     if (!isAuthorizedCurrent(projectId, inst)) return;
-    instances.delete(projectId);
+    const retired = await retireInstance(projectId, inst);
+    if (!retired.ok) throw retirementFailure(retired);
     throw new Error(`Discord login failed: ${err.message}`);
   }
 
@@ -263,8 +407,8 @@ async function start(projectId, botToken, channelId, qwPort, options = {}) {
     if (!channel) throw new Error("Channel not found");
   } catch (err) {
     if (!isAuthorizedCurrent(projectId, inst)) return;
-    try { await client.destroy(); } catch {}
-    instances.delete(projectId);
+    const retired = await retireInstance(projectId, inst);
+    if (!retired.ok) throw retirementFailure(retired);
     throw new Error(`Discord channel fetch failed: ${err.message}`);
   }
 
@@ -365,74 +509,93 @@ async function start(projectId, botToken, channelId, qwPort, options = {}) {
     });
   });
 
+  inst.ready = true;
   console.log(`[bridge] discord ${projectId}: started`);
+  return { ok: true, running: true, already_running: false };
 }
 
-async function stop(projectId) {
-  const inst = instances.get(projectId);
-  if (!inst) {
-    return {
-      ok: true,
-      resources: { discord_bridges: 0, bridge_timers: 0 },
-      cleanup_errors: [],
-    };
+async function start(projectId, botToken, channelId, qwPort, options = {}) {
+  const authorityKey = normalizeAuthorityKey(options.authorityKey);
+  const live = instances.get(projectId);
+  if (live) {
+    const exactCurrent = !live.stopping && sameAuthority(live.authorityKey, authorityKey) &&
+      isAuthorizedCurrent(projectId, live);
+    if (!exactCurrent) void retireInstance(projectId, live);
   }
-  inst.stopping = true;
-  for (const controller of inst.controllers || []) {
-    try { controller.abort(); } catch {}
-  }
-  let timers = 0;
-  const cleanupErrors = [];
-  if (inst.timer) {
-    try {
-      clearTimeout(inst.timer);
-      inst.timer = null;
-      timers += 1;
-    } catch (err) {
-      cleanupErrors.push({
-        resource: "discord_bridge",
-        code: "timer_stop_failed",
-        message: err?.message || "Discord bridge timer stop failed",
-      });
+  const previous = startOperations.get(projectId) || Promise.resolve();
+  const operation = previous.catch(() => {}).then(async () => {
+    if (startCancelled(projectId, authorityKey)) return undefined;
+    const existing = instances.get(projectId);
+    if (existing) {
+      if (existing.ready !== false && !existing.stopping && sameAuthority(existing.authorityKey, authorityKey) &&
+          isAuthorizedCurrent(projectId, existing)) {
+        return { ok: true, running: true, already_running: true };
+      }
+      const retired = await retireInstance(projectId, existing);
+      if (startCancelled(projectId, authorityKey)) return undefined;
+      if (!retired.ok) throw retirementFailure(retired);
     }
+    if (startCancelled(projectId, authorityKey)) return undefined;
+    return startInstance(projectId, botToken, channelId, qwPort, options, authorityKey);
+  });
+  startOperations.set(projectId, operation);
+  try {
+    return await operation;
+  } finally {
+    if (startOperations.get(projectId) === operation) startOperations.delete(projectId);
+  }
+}
+
+async function stop(projectId, authorityKey = undefined) {
+  const requestedAuthority = authorityKey === undefined ? null : normalizeAuthorityKey(authorityKey);
+  const stopRequest = registerStopRequest(projectId, requestedAuthority);
+  async function retireCurrent() {
+    const inst = instances.get(projectId);
+    if (!inst) {
+      return {
+        ok: true,
+        resources: { discord_bridges: 0, bridge_timers: 0 },
+        cleanup_errors: [],
+      };
+    }
+    if (requestedAuthority !== null && !sameAuthority(inst.authorityKey, requestedAuthority)) {
+      return {
+        ok: true,
+        resources: { discord_bridges: 0, bridge_timers: 0 },
+        cleanup_errors: [],
+      };
+    }
+    return retireInstance(projectId, inst);
   }
   try {
-    if (inst.client) {
-      const operation = inst.retirement || inst.client.destroy();
-      const outcome = await settleOperation(operation, inst.stopTimeoutMs || 5000);
-      if (!outcome.ok) throw outcome.error || new Error("Discord client stop timed out");
-      inst.retirementError = null;
+    const live = instances.get(projectId);
+    if (live && (requestedAuthority === null || sameAuthority(live.authorityKey, requestedAuthority))) {
+      void retireInstance(projectId, live);
     }
-  } catch (err) {
-    cleanupErrors.push({
-      resource: "discord_bridge",
-      code: "client_stop_failed",
-      message: err?.message || "Discord bridge client stop failed",
-    });
+    const previous = startOperations.get(projectId);
+    if (!previous) return await retireCurrent();
+    const operation = previous.catch(() => {}).then(retireCurrent);
+    startOperations.set(projectId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (startOperations.get(projectId) === operation) startOperations.delete(projectId);
+    }
+  } finally {
+    unregisterStopRequest(projectId, stopRequest);
   }
-  if (!(await settleInFlight(inst, inst.stopTimeoutMs || 5000))) {
-    cleanupErrors.push({
-      resource: "discord_bridge",
-      code: "inflight_stop_timeout",
-      message: "Discord bridge in-flight work did not settle",
-    });
-  }
-  if (cleanupErrors.length === 0) {
-    if (instances.get(projectId) === inst) instances.delete(projectId);
-    console.log(`[bridge] discord ${projectId}: stopped`);
-  }
-  return {
-    ok: cleanupErrors.length === 0,
-    resources: {
-      discord_bridges: cleanupErrors.length === 0 ? 1 : 0,
-      bridge_timers: timers,
-    },
-    cleanup_errors: cleanupErrors,
-  };
 }
 
-function isRunning(projectId) {
-  return instances.has(projectId);
+function isRunning(projectId, authorityKey = undefined) {
+  const inst = instances.get(projectId);
+  if (!inst) return false;
+  if (authorityKey === undefined) {
+    if (inst.stopping) return !inst.retirement;
+    return inst.ready !== false && isAuthorizedCurrent(projectId, inst);
+  }
+  return inst.ready !== false && !inst.stopping &&
+    sameAuthority(inst.authorityKey, normalizeAuthorityKey(authorityKey)) &&
+    isAuthorizedCurrent(projectId, inst);
 }
 
 // #972: stop every running instance (used on server shutdown).

@@ -74,7 +74,7 @@ module.exports = {
       name: "start_batch",
       description:
         "Start the SCHEDULED trigger that drives a project's batch — fires a trigger message every `interval_min` minutes (default 30), optionally auto-stopping after `duration_min` minutes (default 0 = run indefinitely). The first pulse is at T+interval, not immediately (use trigger_now for an immediate one). Define the batch first with set_batch/append_batch (#793). Only the fields you pass are persisted to the project: an omitted interval/duration/message is NOT saved — later pulses reuse the project's existing trigger_message / interval. Rejected if the project is idle (un-idle it first). " +
-        BATCH_STATUS_NOTE + " Requires the exact current owned V2 assignment, or explicit preactivation V1 compatibility, from both live batch endpoints.",
+        BATCH_STATUS_NOTE + " Requires the exact current owned V2 assignment, or explicit preactivation V1 compatibility with matching batch_observation_fingerprint, from both live batch endpoints.",
       inputSchema: {
         type: "object",
         properties: {
@@ -90,7 +90,7 @@ module.exports = {
       name: "trigger_now",
       description:
         "Fire ONE trigger pulse immediately for a project (a single send-now, separate from the scheduled cadence). Use after defining a batch when you want to kick it off right away instead of waiting for start_batch's first interval. Rejected if the project is idle. " +
-        BATCH_STATUS_NOTE + " Requires the exact current owned V2 assignment, or explicit preactivation V1 compatibility, from both live batch endpoints.",
+        BATCH_STATUS_NOTE + " Requires the exact current owned V2 assignment, or explicit preactivation V1 compatibility with matching batch_observation_fingerprint, from both live batch endpoints.",
       inputSchema: {
         type: "object",
         properties: {

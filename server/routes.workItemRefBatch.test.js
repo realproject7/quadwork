@@ -370,16 +370,29 @@ async function run() {
   assert.equal(payload.provenance, "legacy_unowned");
   assert.equal(payload.owned, false);
   assert.equal(payload.items[0].issue_number, 42);
-  assert.equal(validateCurrentOwnedAssignment("p", { admission_generation: 0 }).legacy, true);
-  assert.equal(validateCurrentOwnedAssignment("p", { compatibility_mode: "v1" }).legacy, true);
+  assert.equal(typeof payload.batch_observation_fingerprint, "string");
+  const liveV1Fingerprint = payload.batch_observation_fingerprint;
+  assert.equal(validateCurrentOwnedAssignment("p", { admission_generation: 0 }).ok, false);
+  assert.equal(validateCurrentOwnedAssignment("p", {
+    compatibility_mode: "v1",
+    batch_observation_fingerprint: payload.batch_observation_fingerprint,
+  }).legacy, true);
 
   queue = ["## Active Batch", "**Batch:** 13"].join("\n");
   _batchProgressCache.clear();
   payload = await getOrComputeBatchProgress("p");
   assert.equal(payload.compatibility_mode, "v1");
   assert.equal(payload.liveActiveBatchCleared, true);
-  assert.equal(validateCurrentOwnedAssignment("p", { admission_generation: 0 }).legacy, true);
-  assert.equal(validateCurrentOwnedAssignment("p", { compatibility_mode: "v1" }).legacy, true);
+  assert.notEqual(payload.batch_observation_fingerprint, liveV1Fingerprint);
+  assert.equal(validateCurrentOwnedAssignment("p", {
+    compatibility_mode: "v1",
+    batch_observation_fingerprint: liveV1Fingerprint,
+  }).ok, false, "an earlier V1 observation cannot reauthorize against the next queue state");
+  assert.equal(validateCurrentOwnedAssignment("p", { compatibility_mode: "v1" }).ok, false);
+  assert.equal(validateCurrentOwnedAssignment("p", {
+    compatibility_mode: "v1",
+    batch_observation_fingerprint: payload.batch_observation_fingerprint,
+  }).legacy, true);
 
   queue = ["## Active Batch", "**Batch:** 13", "- Acme/Web#42 qualified"].join("\n");
   const qualifiedLegacy = validateCurrentOwnedAssignment("p", { admission_generation: 0 });

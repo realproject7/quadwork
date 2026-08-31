@@ -100,6 +100,7 @@ function v1LiveState() {
     current: true,
     owned: false,
     multi_repository: false,
+    batch_observation_fingerprint: "legacy-observation-mcp-4",
   };
   return {
     active: { ...base, active: true },
@@ -265,7 +266,10 @@ async function runTests() {
     const { server, port, requests } = await startServer({ state: v1ClearedState() });
     const ctx = createContext(port);
     await handlers.stop_batch({ project: "plotlink" }, ctx);
-    assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({ compatibility_mode: "v1" }), "legacy stop_batch accepts an exact explicit clear without inventing V2 authority");
+    assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: "legacy-observation-mcp-4",
+    }), "legacy stop_batch carries its exact observation lease without inventing V2 authority");
     server.close();
   }
 
@@ -276,15 +280,25 @@ async function runTests() {
     await handlers.start_batch({ project: "plotlink", message: "@head go" }, ctx);
     const post = triggerPosts(requests)[0];
     assert(post.body.message === "@head go" && !("interval" in post.body) && !("duration" in post.body), "start_batch sends only the provided trigger option");
-    assert(JSON.stringify(post.body) === JSON.stringify({ message: "@head go", compatibility_mode: "v1" }), "legacy start sends only explicit compatibility_mode=v1 authority");
+    assert(JSON.stringify(post.body) === JSON.stringify({
+      message: "@head go",
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: "legacy-observation-mcp-4",
+    }), "legacy start sends explicit V1 authority plus its observation lease");
 
     requests.length = 0;
     await handlers.trigger_now({ project: "plotlink" }, ctx);
-    assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({ compatibility_mode: "v1" }), "legacy trigger_now sends only explicit compatibility_mode=v1 authority");
+    assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: "legacy-observation-mcp-4",
+    }), "legacy trigger_now carries the exact V1 observation lease");
 
     requests.length = 0;
     await handlers.stop_batch({ project: "plotlink" }, ctx);
-    assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({ compatibility_mode: "v1" }), "legacy stop_batch sends only explicit compatibility_mode=v1 authority");
+    assert(JSON.stringify(triggerPosts(requests)[0].body) === JSON.stringify({
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: "legacy-observation-mcp-4",
+    }), "legacy stop_batch carries the exact V1 observation lease");
     server.close();
   }
 

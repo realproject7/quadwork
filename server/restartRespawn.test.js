@@ -72,6 +72,7 @@ const ACTIVE_V1 = {
   owned: false,
   current: true,
   multi_repository: false,
+  batch_observation_fingerprint: "legacy-observation-restart-3",
   installation_id: null,
   batch_number: 3,
   assignment_attempt: null,

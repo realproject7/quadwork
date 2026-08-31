@@ -78,7 +78,7 @@ const _submitTimers = new Map();
  * @param {object} deps - { isLoopGuardPaused, safeWrite }
  */
 function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
-  if (!projectAdmitted(deps, projectId)) return;
+  if (!dispatchAuthorized(deps, projectId)) return;
   if (!msg || msg.type === "system") return;
   if (deps.isLoopGuardPaused(projectId)) return;
   if (!msg.mentions || msg.mentions.length === 0) return;
@@ -128,6 +128,43 @@ function projectAdmitted(deps, projectId) {
   catch { return false; }
 }
 
+// #1031: an identity-bound chat can remain queued behind coalescing, busy-agent
+// drains, or the delayed submit after its receiver check. Revalidate the same
+// assignment lease at every actual PTY mutation; manual callers omit the hook.
+function dispatchAuthorized(deps, projectId) {
+  if (!projectAdmitted(deps, projectId)) return false;
+  if (!deps || typeof deps.isActionCurrent !== "function") return true;
+  try { return deps.isActionCurrent() === true; }
+  catch { return false; }
+}
+
+function rememberWakeAuthority(state, deps) {
+  if (!state.authority) state.authority = { manual: null, automated: null };
+  if (deps && typeof deps.isActionCurrent === "function") state.authority.automated = deps;
+  else state.authority.manual = deps;
+}
+
+function currentWakeAuthority(state, projectId) {
+  const automated = state?.authority?.automated;
+  if (automated && dispatchAuthorized(automated, projectId)) return automated;
+  const manual = state?.authority?.manual;
+  if (manual && dispatchAuthorized(manual, projectId)) return manual;
+  return null;
+}
+
+function wakeMutationDeps(state, projectId) {
+  const selected = currentWakeAuthority(state, projectId);
+  if (!selected) return null;
+  return {
+    ...selected,
+    // A coalesced/pending cycle can represent both an identity-bound wake and
+    // a manual one. Re-evaluate the composite set at prompt and submit time so
+    // rollover of the selected automated lease cannot suppress a still-valid
+    // manual wake's Enter key.
+    isActionCurrent: () => currentWakeAuthority(state, projectId) !== null,
+  };
+}
+
 function isAgentBusy(session) {
   return session.lastOutputAt && (Date.now() - session.lastOutputAt < _timings.idleThresholdMs);
 }
@@ -164,9 +201,14 @@ function queuePendingWake(key, session, agentSessions, deps) {
 
   // A cycle is already armed for this key — the pending flag above is all a
   // repeat mention needs. Do NOT arm a second listener or a second cap.
-  if (_drainListeners.has(key)) return;
+  const existing = _drainListeners.get(key);
+  if (existing) {
+    rememberWakeAuthority(existing, deps);
+    return;
+  }
 
   const state = { disposable: null, idleHandle: null, capHandle: null, capRearmed: false };
+  rememberWakeAuthority(state, deps);
 
   // #1010: only the cycle currently registered under this key may drain. A
   // timer that outlived its own cycle (replaced, cleaned up, or already
@@ -182,10 +224,10 @@ function queuePendingWake(key, session, agentSessions, deps) {
     return live && live.state === "running" && live.term ? live : null;
   };
 
-  const deliver = (live) => {
+  const deliver = (live, authorityDeps) => {
     _pendingWake.delete(key);
     cleanupDrainListener(key);
-    injectIntoTerm(key, live.term, buildInjectionPrompt(live.agentId), deps);
+    injectIntoTerm(key, live.term, buildInjectionPrompt(live.agentId), authorityDeps);
   };
 
   // Shared preamble for both timers: returns the live session, or null if this
@@ -193,7 +235,8 @@ function queuePendingWake(key, session, agentSessions, deps) {
   const claimCycle = () => {
     if (!isCurrentCycle()) return null;
     const projectId = key.split("/")[0];
-    if (!projectAdmitted(deps, projectId)) {
+    const authorityDeps = wakeMutationDeps(state, projectId);
+    if (!authorityDeps) {
       _pendingWake.delete(key);
       cleanupDrainListener(key);
       return null;
@@ -208,24 +251,25 @@ function queuePendingWake(key, session, agentSessions, deps) {
       cleanupDrainListener(key);
       return null;
     }
-    return live;
+    return { live, authorityDeps };
   };
 
   const idleDrain = () => {
-    const live = claimCycle();
-    if (!live) return;
+    const claimed = claimCycle();
+    if (!claimed) return;
 
     // #923: fire unconditionally once the agent has been quiet for the idle
     // window. Do NOT re-suppress on a recent send here — a standing-by agent
     // that just posted (then ended its turn) would otherwise be stranded again,
     // which is the exact stall this path removes. The quiet gap IS the evidence
     // the turn ended, so this delivery is not cooldown-limited either.
-    deliver(live);
+    deliver(claimed.live, claimed.authorityDeps);
   };
 
   const capDrain = () => {
-    const live = claimCycle();
-    if (!live) return;
+    const claimed = claimCycle();
+    if (!claimed) return;
+    const { live, authorityDeps } = claimed;
 
     // #1010: re-check eligibility against the LIVE session, not just the one
     // that armed the cycle. If the agent was respawned onto another backend in
@@ -281,7 +325,7 @@ function queuePendingWake(key, session, agentSessions, deps) {
     }
 
     _lastCapInjectedAt.set(key, Date.now());
-    deliver(live);
+    deliver(live, authorityDeps);
   };
 
   function resetIdleTimer() {
@@ -336,13 +380,16 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
   const existing = _coalesceTimers.get(key);
   if (existing) {
     existing.messages.push(msg);
+    rememberWakeAuthority(existing, deps);
     return;
   }
 
   const state = { messages: [msg] };
+  rememberWakeAuthority(state, deps);
   const timer = setTimeout(() => {
     _coalesceTimers.delete(key);
-    if (!projectAdmitted(deps, projectId)) return;
+    const authorityDeps = wakeMutationDeps(state, projectId);
+    if (!authorityDeps) return;
     const session = agentSessions.get(key);
     if (!session || !session.term || session.state !== "running") return;
 
@@ -355,11 +402,11 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
     const lastSent = _lastChatSentAt.get(key);
     const recentlySent = lastSent && (Date.now() - lastSent < _timings.activeSuppressionMs);
     if (isAgentBusy(session) || recentlySent) {
-      queuePendingWake(key, session, agentSessions, deps);
+      queuePendingWake(key, session, agentSessions, authorityDeps);
       return;
     }
 
-    injectIntoTerm(key, session.term, buildInjectionPrompt(agentId), deps);
+    injectIntoTerm(key, session.term, buildInjectionPrompt(agentId), authorityDeps);
   }, COALESCE_WINDOW_MS);
 
   state.timer = timer;
@@ -372,14 +419,14 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
 function injectIntoTerm(key, term, text, deps) {
   const projectId = key.split("/")[0];
   const flat = text.replace(/\n/g, " ");
-  if (!projectAdmitted(deps, projectId)) return;
+  if (!dispatchAuthorized(deps, projectId)) return;
   deps.safeWrite(term, flat);
   const submitDelayMs = Math.max(300, flat.length);
   const previous = _submitTimers.get(key);
   if (previous) clearTimeout(previous);
   const handle = setTimeout(() => {
     _submitTimers.delete(key);
-    if (!projectAdmitted(deps, projectId)) return;
+    if (!dispatchAuthorized(deps, projectId)) return;
     try { deps.safeWrite(term, "\r"); } catch {}
   }, submitDelayMs);
   _submitTimers.set(key, handle);

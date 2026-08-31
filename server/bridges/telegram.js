@@ -5,23 +5,150 @@ const os = require("os");
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 
 const instances = new Map();
+const startOperations = new Map();
+const stopRequests = new Map();
+const MANUAL_AUTHORITY_FINGERPRINT = "manual";
+
+function normalizeAuthorityKey(authorityKey) {
+  const admissionGeneration = authorityKey?.admission_generation;
+  const assignmentFingerprint = authorityKey?.assignment_fingerprint;
+  return Object.freeze({
+    admission_generation: Number.isSafeInteger(admissionGeneration) && admissionGeneration >= 0
+      ? admissionGeneration
+      : null,
+    assignment_fingerprint: typeof assignmentFingerprint === "string" && assignmentFingerprint
+      ? assignmentFingerprint
+      : MANUAL_AUTHORITY_FINGERPRINT,
+  });
+}
+
+function sameAuthority(left, right) {
+  return !!left && !!right &&
+    left.admission_generation === right.admission_generation &&
+    left.assignment_fingerprint === right.assignment_fingerprint;
+}
+
+function registerStopRequest(projectId, authorityKey) {
+  const request = { authorityKey };
+  const requests = stopRequests.get(projectId) || new Set();
+  requests.add(request);
+  stopRequests.set(projectId, requests);
+  return request;
+}
+
+function unregisterStopRequest(projectId, request) {
+  const requests = stopRequests.get(projectId);
+  if (!requests) return;
+  requests.delete(request);
+  if (requests.size === 0) stopRequests.delete(projectId);
+}
+
+function startCancelled(projectId, authorityKey) {
+  const requests = stopRequests.get(projectId);
+  if (!requests) return false;
+  return [...requests].some((request) =>
+    request.authorityKey === null || sameAuthority(request.authorityKey, authorityKey));
+}
 
 function isCurrent(projectId, inst) {
   return !inst.stopping && instances.get(projectId) === inst;
 }
 
-function retireStaleInstance(projectId, inst) {
-  if (!inst || inst.stopping) return;
+function retirementFailure(result) {
+  const error = new Error("Telegram bridge cleanup is incomplete; retry the operation");
+  error.code = "bridge_cleanup_incomplete";
+  error.retryable = true;
+  error.cleanupResult = result;
+  return error;
+}
+
+async function performRetirement(projectId, inst) {
   inst.stopping = true;
+  if (typeof inst.cancelRetirement === "function") {
+    inst.cancelRetirement();
+    inst.cancelRetirement = null;
+  }
+  let timers = 0;
+  const cleanupErrors = [];
   for (const controller of inst.controllers || []) {
-    try { controller.abort(); } catch {}
+    try {
+      controller.abort();
+      inst.controllers.delete(controller);
+    }
+    catch (err) {
+      cleanupErrors.push({
+        resource: "telegram_bridge",
+        code: "fetch_abort_failed",
+        message: err?.message || "Telegram bridge fetch abort failed",
+        retryable: true,
+      });
+    }
   }
   for (const field of ["timer", "updateTimer"]) {
     if (!inst[field]) continue;
-    try { clearTimeout(inst[field]); } catch {}
-    inst[field] = null;
+    try {
+      clearTimeout(inst[field]);
+      inst[field] = null;
+      timers += 1;
+    } catch (err) {
+      cleanupErrors.push({
+        resource: "telegram_bridge",
+        code: "timer_stop_failed",
+        message: err?.message || "Telegram bridge timer stop failed",
+        retryable: true,
+      });
+    }
   }
-  if (instances.get(projectId) === inst) instances.delete(projectId);
+  if (!(await settleInFlight(inst, inst.stopTimeoutMs || 5000))) {
+    cleanupErrors.push({
+      resource: "telegram_bridge",
+      code: "inflight_stop_timeout",
+      message: "Telegram bridge in-flight work did not settle",
+      retryable: true,
+    });
+  }
+  const ok = cleanupErrors.length === 0;
+  if (ok && instances.get(projectId) === inst) {
+    instances.delete(projectId);
+    console.log(`[bridge] telegram ${projectId}: stopped`);
+  }
+  return {
+    ok,
+    resources: {
+      telegram_bridges: ok ? 1 : 0,
+      bridge_timers: timers,
+    },
+    cleanup_errors: cleanupErrors,
+  };
+}
+
+function retireInstance(projectId, inst) {
+  if (!inst) return Promise.resolve({
+    ok: true,
+    resources: { telegram_bridges: 0, bridge_timers: 0 },
+    cleanup_errors: [],
+  });
+  if (inst.retirement) return inst.retirement;
+  const retirement = performRetirement(projectId, inst).catch((err) => ({
+    ok: false,
+    resources: { telegram_bridges: 0, bridge_timers: 0 },
+    cleanup_errors: [{
+      resource: "telegram_bridge",
+      code: "retirement_failed",
+      message: err?.message || "Telegram bridge retirement failed",
+      retryable: true,
+    }],
+  }));
+  inst.retirement = retirement;
+  retirement.then(() => {
+    if (inst.retirement === retirement) inst.retirement = null;
+  });
+  return retirement;
+}
+
+function retireStaleInstance(projectId, inst) {
+  if (!inst || inst.retirement) return;
+  void retireInstance(projectId, inst);
 }
 
 function isAuthorizedCurrent(projectId, inst) {
@@ -43,8 +170,15 @@ async function track(inst, promise) {
   if (!inst.inFlight) inst.inFlight = new Set();
   const owned = Promise.resolve(promise);
   inst.inFlight.add(owned);
-  try { return await owned; }
-  finally { inst.inFlight.delete(owned); }
+  owned.then(
+    () => inst.inFlight.delete(owned),
+    () => inst.inFlight.delete(owned),
+  );
+  if (!inst.retirementSignal) return owned;
+  return Promise.race([
+    owned,
+    inst.retirementSignal.then(() => { throw staleAuthorityError(); }),
+  ]);
 }
 
 async function bridgeFetch(inst, url, options = {}, timeoutMs = 5000) {
@@ -250,9 +384,7 @@ async function startTelegramUpdates(projectId, botToken, chatId, qwPort) {
   tick();
 }
 
-async function start(projectId, botToken, chatId, qwPort, options = {}) {
-  if (instances.has(projectId)) return;
-
+async function startInstance(projectId, botToken, chatId, qwPort, options, authorityKey) {
   const isAuthorityCurrent = typeof options.isAuthorityCurrent === "function"
     ? options.isAuthorityCurrent
     : null;
@@ -271,6 +403,8 @@ async function start(projectId, botToken, chatId, qwPort, options = {}) {
     try { fs.renameSync(oldCursor, newCursor); } catch {}
   }
 
+  let cancelRetirement;
+  const retirementSignal = new Promise((resolve) => { cancelRetirement = resolve; });
   const inst = {
     projectId,
     cursor: readCursor(projectId),
@@ -284,7 +418,12 @@ async function start(projectId, botToken, chatId, qwPort, options = {}) {
     inFlight: new Set(),
     isAuthorityCurrent,
     automationIdentity,
+    retirement: null,
+    retirementSignal,
+    cancelRetirement,
+    ready: false,
   };
+  Object.defineProperty(inst, "authorityKey", { value: authorityKey, enumerable: true });
   instances.set(projectId, inst);
 
   // #782: seed cursor to latest on first enable (no cursor file, or
@@ -342,61 +481,96 @@ async function start(projectId, botToken, chatId, qwPort, options = {}) {
     inst.lastError = err.message;
   });
 
+  inst.ready = true;
   console.log(`[bridge] telegram ${projectId}: started`);
+  return { ok: true, running: true, already_running: false };
 }
 
-async function stop(projectId) {
-  const inst = instances.get(projectId);
-  if (!inst) {
-    return {
-      ok: true,
-      resources: { telegram_bridges: 0, bridge_timers: 0 },
-      cleanup_errors: [],
-    };
+async function start(projectId, botToken, chatId, qwPort, options = {}) {
+  const authorityKey = normalizeAuthorityKey(options.authorityKey);
+  const live = instances.get(projectId);
+  if (live) {
+    const exactCurrent = !live.stopping && sameAuthority(live.authorityKey, authorityKey) &&
+      isAuthorizedCurrent(projectId, live);
+    if (!exactCurrent) void retireInstance(projectId, live);
   }
-  inst.stopping = true;
-  for (const controller of inst.controllers || []) {
-    try { controller.abort(); } catch {}
-  }
-  let timers = 0;
-  const cleanupErrors = [];
-  for (const field of ["timer", "updateTimer"]) {
-    if (!inst[field]) continue;
-    try {
-      clearTimeout(inst[field]);
-      inst[field] = null;
-      timers += 1;
-    } catch (err) {
-      cleanupErrors.push({
-        resource: "telegram_bridge",
-        code: "timer_stop_failed",
-        message: err?.message || "Telegram bridge timer stop failed",
-      });
+  const previous = startOperations.get(projectId) || Promise.resolve();
+  const operation = previous.catch(() => {}).then(async () => {
+    if (startCancelled(projectId, authorityKey)) return undefined;
+    const existing = instances.get(projectId);
+    if (existing) {
+      if (existing.ready !== false && !existing.stopping && sameAuthority(existing.authorityKey, authorityKey) &&
+          isAuthorizedCurrent(projectId, existing)) {
+        return { ok: true, running: true, already_running: true };
+      }
+      const retired = await retireInstance(projectId, existing);
+      if (startCancelled(projectId, authorityKey)) return undefined;
+      if (!retired.ok) throw retirementFailure(retired);
     }
+    if (startCancelled(projectId, authorityKey)) return undefined;
+    return startInstance(projectId, botToken, chatId, qwPort, options, authorityKey);
+  });
+  startOperations.set(projectId, operation);
+  try {
+    return await operation;
+  } finally {
+    if (startOperations.get(projectId) === operation) startOperations.delete(projectId);
   }
-  if (!(await settleInFlight(inst, inst.stopTimeoutMs || 5000))) {
-    cleanupErrors.push({
-      resource: "telegram_bridge",
-      code: "inflight_stop_timeout",
-      message: "Telegram bridge in-flight work did not settle",
-    });
-  }
-  if (cleanupErrors.length === 0) {
-    if (instances.get(projectId) === inst) instances.delete(projectId);
-    console.log(`[bridge] telegram ${projectId}: stopped`);
-  }
-  return {
-    ok: cleanupErrors.length === 0,
-    resources: {
-      telegram_bridges: cleanupErrors.length === 0 ? 1 : 0,
-      bridge_timers: timers,
-    },
-    cleanup_errors: cleanupErrors,
-  };
 }
 
-function isRunning(projectId) {
-  return instances.has(projectId);
+async function stop(projectId, authorityKey = undefined) {
+  const requestedAuthority = authorityKey === undefined ? null : normalizeAuthorityKey(authorityKey);
+  const stopRequest = registerStopRequest(projectId, requestedAuthority);
+  async function retireCurrent() {
+    const inst = instances.get(projectId);
+    if (!inst) {
+      return {
+        ok: true,
+        resources: { telegram_bridges: 0, bridge_timers: 0 },
+        cleanup_errors: [],
+      };
+    }
+    if (requestedAuthority !== null && !sameAuthority(inst.authorityKey, requestedAuthority)) {
+      return {
+        ok: true,
+        resources: { telegram_bridges: 0, bridge_timers: 0 },
+        cleanup_errors: [],
+      };
+    }
+    return retireInstance(projectId, inst);
+  }
+  try {
+    const live = instances.get(projectId);
+    if (live && (requestedAuthority === null || sameAuthority(live.authorityKey, requestedAuthority))) {
+      void retireInstance(projectId, live);
+    }
+    const previous = startOperations.get(projectId);
+    if (!previous) return await retireCurrent();
+    const operation = previous.catch(() => {}).then(retireCurrent);
+    startOperations.set(projectId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (startOperations.get(projectId) === operation) startOperations.delete(projectId);
+    }
+  } finally {
+    unregisterStopRequest(projectId, stopRequest);
+  }
+}
+
+function isRunning(projectId, authorityKey = undefined) {
+  const inst = instances.get(projectId);
+  if (!inst) return false;
+  // Calls without a key are ownership/status probes. Preserve the retained
+  // tombstone signal after a failed teardown, while a live stale owner is
+  // retired and no longer reported as running.
+  if (authorityKey === undefined) {
+    if (inst.stopping) return !inst.retirement;
+    return inst.ready !== false && isAuthorizedCurrent(projectId, inst);
+  }
+  return inst.ready !== false && !inst.stopping &&
+    sameAuthority(inst.authorityKey, normalizeAuthorityKey(authorityKey)) &&
+    isAuthorizedCurrent(projectId, inst);
 }
 
 // #972: stop every running instance (used on server shutdown).

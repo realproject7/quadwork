@@ -27,7 +27,14 @@ const REPOSITORY = { key: "primary", repo: "Owner/Repo", working_dir: path.join(
 fs.mkdirSync(path.dirname(QUEUE_PATH), { recursive: true });
 fs.mkdirSync(REPOSITORY.working_dir, { recursive: true });
 
-function writeConfig({ activated = true, triggerEnabled = false, port = 8400 } = {}) {
+function writeConfig({
+  activated = true,
+  triggerEnabled = false,
+  triggerAuto = false,
+  telegramAuto = false,
+  discordAuto = false,
+  port = 8400,
+} = {}) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify({
     ...(activated ? { installation_id: INSTALLATION } : {}),
     port,
@@ -36,7 +43,9 @@ function writeConfig({ activated = true, triggerEnabled = false, port = 8400 } =
       archived: false,
       repositories: [REPOSITORY],
       agents: { head: {} },
-      trigger_auto: false,
+      trigger_auto: triggerAuto,
+      telegram_auto: telegramAuto,
+      discord_auto: discordAuto,
       trigger_enabled: triggerEnabled,
       trigger_interval: 1,
       trigger_message: "queue pulse",
@@ -69,6 +78,7 @@ writeV2Queue("attempt_a");
 
 const routes = require("./routes");
 const fileChat = require("./file-chat");
+const { captureProjectAdmission, revokeProjectAdmission } = require("./project-lifecycle");
 const { ownershipKey, serializeWorkItemRefApi } = require("./work-item-ref");
 const runtime = require("./index");
 
@@ -171,7 +181,9 @@ process.on("exit", cleanup);
     const sent = await scheduledPulse();
     assert.equal(sent.sent, true);
     assert.equal(posts.length, 1);
-    assert.deepEqual(posts[0].body, {
+    assert.ok(Number.isSafeInteger(posts[0].body.admission_generation));
+    const { admission_generation: _admissionGeneration, ...postedBody } = posts[0].body;
+    assert.deepEqual(postedBody, {
       text: "queue pulse",
       channel: "general",
       compatibility_mode: "v2",
@@ -191,12 +203,111 @@ process.on("exit", cleanup);
     runtime.triggers.clear();
   }
 
+  // trigger_auto owns cadence across batch transitions. When A rolls directly
+  // to B, the timer must rebind to the freshly joined B identity rather than
+  // treating its captured A body as a reason to stop permanently.
+  writeConfig({ activated: true, triggerAuto: true });
+  writeV2Queue("attempt_auto_a");
+  const autoABody = currentV2Body();
+  runtime.triggers.set(PROJECT, {
+    interval: 60_000,
+    timer: null,
+    lastSent: null,
+    nextAt: Date.now() + 60_000,
+    lastError: null,
+    automationBody: { compatibility_mode: "v2", ...autoABody },
+  });
+  writeV2Queue("attempt_auto_b");
+  const autoBBody = currentV2Body();
+  const autoTop = {
+    compatibility_mode: "v2",
+    ...autoBBody,
+    owned: true,
+    current: true,
+    multi_repository: false,
+  };
+  const autoRef = autoBBody.assignment_items[0].work_item_ref;
+  const autoProgress = {
+    ...autoTop,
+    complete: false,
+    completeConfirmed: false,
+    items: [{
+      installation_id: autoBBody.installation_id,
+      batch_number: autoBBody.batch_number,
+      assignment_attempt: autoBBody.assignment_attempt,
+      provenance: "owned",
+      assignment_key: autoBBody.assignment_key,
+      owned: true,
+      current: true,
+      repo_key: autoRef.repo_key,
+      repo: autoRef.repo,
+      number: autoRef.number,
+      kind: autoRef.kind,
+      work_item_ref: autoRef,
+      ownership_key: autoBBody.assignment_items[0].ownership_key,
+    }],
+  };
+  let reboundChatBody = null;
+  global.fetch = async (url, options = {}) => {
+    const target = String(url);
+    if (target.includes("/api/batch-progress")) return { ok: true, json: async () => autoProgress };
+    if (target.includes("/api/batch-active")) return { ok: true, json: async () => ({ ...autoTop, active: true }) };
+    reboundChatBody = JSON.parse(options.body);
+    return { ok: true, status: 200, text: async () => "" };
+  };
+  try {
+    const rebound = await runtime.sendTriggerMessage(PROJECT, { compatibility_mode: "v2", ...autoABody });
+    assert.equal(rebound.sent, true, "trigger_auto cadence survives direct A→B rollover");
+    assert.equal(reboundChatBody.assignment_attempt, "attempt_auto_b");
+    assert.equal(runtime.triggers.get(PROJECT).automationBody.assignment_attempt, "attempt_auto_b",
+      "timer stores the newly joined B identity for subsequent pulses");
+  } finally {
+    global.fetch = originalFetch;
+    runtime.triggers.clear();
+  }
+
+  // Completion uses the same retryable bridge transition ledger as the poller.
+  // HTTP 200 with {ok:false} must not mark the assignment stopped.
+  writeConfig({ activated: true, triggerAuto: true, telegramAuto: true, discordAuto: true });
+  const completedProgress = { ...autoProgress, complete: true, completeConfirmed: true };
+  const bridgeStopUrls = [];
+  let failFirstTelegramStop = true;
+  global.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("/api/batch-progress")) return { ok: true, json: async () => completedProgress };
+    if (target.includes("/api/batch-active")) return { ok: true, json: async () => ({ ...autoTop, active: true }) };
+    if (target.includes("action=stop")) {
+      bridgeStopUrls.push(target);
+      if (target.includes("/api/telegram") && failFirstTelegramStop) {
+        failFirstTelegramStop = false;
+        return { ok: true, json: async () => ({ ok: false, running: true }) };
+      }
+      return { ok: true, json: async () => ({ ok: true, running: false }) };
+    }
+    throw new Error(`unexpected completion URL: ${target}`);
+  };
+  try {
+    assert.equal((await runtime.sendTriggerMessage(PROJECT)).stopped, true);
+    assert.equal(bridgeStopUrls.length, 2);
+    assert.equal((await runtime.sendTriggerMessage(PROJECT)).stopped, true);
+    assert.equal(bridgeStopUrls.length, 4,
+      "trigger completion retries both bridges after one application-level stop failure");
+    assert.equal((await runtime.sendTriggerMessage(PROJECT)).stopped, true);
+    assert.equal(bridgeStopUrls.length, 4,
+      "trigger completion advances its stop fingerprint only after both bodies confirm success");
+  } finally {
+    global.fetch = originalFetch;
+    runtime.triggers.clear();
+  }
+
   // Explicit V1 remains identity-bound as compatibility_mode=v1; manual starts
   // remain intentionally unbound. Neither path invents V2 ownership.
   writeConfig({ activated: false });
   writeV1Queue();
+  const v1Fingerprint = routes.readLiveBatchContext(PROJECT).fingerprint;
   for (const [label, requestBody, expectedAuthority] of [
-    ["v1", { interval: 1, compatibility_mode: "v1" }, { compatibility_mode: "v1" }],
+    ["v1", { interval: 1, compatibility_mode: "v1", batch_observation_fingerprint: v1Fingerprint },
+      { compatibility_mode: "v1", batch_observation_fingerprint: v1Fingerprint }],
     ["manual", { interval: 1 }, null],
   ]) {
     let pulse = null;
@@ -218,7 +329,8 @@ process.on("exit", cleanup);
     try { assert.equal((await pulse()).sent, true); }
     finally { global.fetch = originalFetch; runtime.triggers.clear(); }
     assert.deepEqual(
-      Object.fromEntries(Object.entries(chatBody).filter(([key]) => key === "compatibility_mode")),
+      Object.fromEntries(Object.entries(chatBody).filter(([key]) =>
+        key === "compatibility_mode" || key === "batch_observation_fingerprint")),
       expectedAuthority || {},
       `${label} chat pulse does not fabricate V2 identity`,
     );
@@ -240,7 +352,11 @@ process.on("exit", cleanup);
   // appendMessage/PTY dispatch, so the stale request leaves both counts fixed.
   fileChat.initProject(PROJECT);
   let dispatches = 0;
-  routes.setPtyDispatchCallback(() => { dispatches += 1; });
+  let lastDispatchGuard = null;
+  routes.setPtyDispatchCallback((_projectId, _message, guard) => {
+    dispatches += 1;
+    lastDispatchGuard = guard;
+  });
   const app = express();
   app.use(express.json());
   app.use(routes);
@@ -275,8 +391,10 @@ process.on("exit", cleanup);
     assert.equal(response.status, 200, "current V2 chat authority succeeds");
     assert.equal(fileChat.readMessages(PROJECT, {}).length, 1);
     assert.equal(dispatches, 1);
+    assert.equal(typeof lastDispatchGuard, "function", "identity-bound chat delegates its live guard to delayed PTY work");
 
     writeV2Queue("attempt_receiver_d");
+    assert.equal(lastDispatchGuard(), false, "delegated PTY guard observes assignment rollover after receiver dispatch");
     response = await request(server, { text: "stale V2", ...freshReceiverBody });
     assert.equal(response.status, 409, "rolled V2 chat authority is rejected at the receiver");
     assert.equal(response.json.code, "project_assignment_changed");
@@ -307,12 +425,44 @@ process.on("exit", cleanup);
     assert.equal(dispatches, dispatchesBeforeAppendBoundary,
       "rollover between chat append and PTY boundary suppresses stale dispatch");
 
+    // The local admission lease also crosses the HTTP hop. Archive→unarchive
+    // can restore identical queue bytes, so assignment identity alone cannot
+    // distinguish a request issued by the prior project generation.
+    writeConfig({ activated: true, port: server.address().port });
+    writeV2Queue("attempt_admission");
+    const admissionBody = currentV2Body();
+    const beforeAdmissionRollover = fileChat.readMessages(PROJECT, {}).length;
+    const dispatchesBeforeAdmissionRollover = dispatches;
+    global.fetch = async (...args) => {
+      revokeProjectAdmission(PROJECT);
+      writeConfig({ activated: true, port: server.address().port });
+      captureProjectAdmission(PROJECT);
+      return transportFetch(...args);
+    };
+    try {
+      const staleAdmission = await runtime.sendTriggerMessage(PROJECT, admissionBody);
+      assert.equal(staleAdmission.sent, false);
+      assert.equal(staleAdmission.code, "project_assignment_changed");
+    } finally {
+      global.fetch = transportFetch;
+    }
+    assert.equal(fileChat.readMessages(PROJECT, {}).length, beforeAdmissionRollover,
+      "archive→unarchive during transport performs zero stale append");
+    assert.equal(dispatches, dispatchesBeforeAdmissionRollover,
+      "archive→unarchive during transport performs zero stale PTY dispatch");
+
     writeConfig({ activated: false, port: server.address().port });
     writeV1Queue();
-    response = await request(server, { text: "owned V1", compatibility_mode: "v1" });
+    response = await request(server, {
+      text: "owned V1",
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: routes.readLiveBatchContext(PROJECT).fingerprint,
+    });
     assert.equal(response.status, 200, "current explicit V1 chat authority succeeds");
     response = await request(server, { text: "manual chat" });
     assert.equal(response.status, 200, "manual chat without identity remains compatible");
+    assert.equal(lastDispatchGuard, null,
+      "manual chat keeps only the project-admission delayed guard and is not misclassified as assignment-bound");
     assert.equal(fileChat.readMessages(PROJECT, {}).length, 4);
     assert.equal(dispatches, 3);
   } finally {

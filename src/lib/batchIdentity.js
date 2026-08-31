@@ -198,6 +198,9 @@ function legacyV1BatchSnapshot(active, progress) {
     !Array.isArray(active.assignment_items) || active.assignment_items.length !== 0 ||
     !Array.isArray(progress.assignment_items) || progress.assignment_items.length !== 0
   ) return null;
+  const activeObservation = nonEmptyString(active.batch_observation_fingerprint);
+  const progressObservation = nonEmptyString(progress.batch_observation_fingerprint);
+  if (!activeObservation || activeObservation !== progressObservation) return null;
   const activeBatch = positiveInteger(active.batch_number);
   const progressBatch = positiveInteger(progress.batch_number);
   if (!activeBatch || activeBatch !== progressBatch) return null;
@@ -221,19 +224,10 @@ function legacyV1BatchSnapshot(active, progress) {
       seenRows.add(key);
     }
   }
-  const rowKeys = liveActiveBatchCleared
-    ? []
-    : progress.items.map((row) => {
-      const ref = normalizeWorkItemRef(row.work_item_ref);
-      return JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
-    }).sort();
   return {
     authority: "legacy_compatibility",
     compatibility_mode: "v1",
-    // Preserve V1's historical edit-in-place transition identity, but derive
-    // it only after the shared join has validated every row and rejected
-    // duplicate composite refs.
-    fingerprint: JSON.stringify(["legacy-v1-batch", 1, progressBatch, rowKeys]),
+    fingerprint: progressObservation,
     active: active.active === true,
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,
@@ -311,7 +305,10 @@ function ownedCurrentBatchSnapshot(active, progress) {
 function assignmentRequestFields(snapshot) {
   if (!snapshot) return {};
   if (snapshot.authority === "legacy_compatibility" && snapshot.compatibility_mode === "v1") {
-    return { compatibility_mode: "v1" };
+    return {
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: snapshot.fingerprint,
+    };
   }
   if (snapshot.authority !== "v2_owned") return {};
   return {

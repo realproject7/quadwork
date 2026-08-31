@@ -230,19 +230,25 @@ async function runLifecycleTests() {
 
 
 {
+  const pendingDestroy = deferred();
+  let destroyAttempts = 0;
   discordBridge._instances.set("dc-timeout", {
     timer: null,
     stopping: false,
     controllers: new Set(),
     inFlight: new Set(),
     stopTimeoutMs: 10,
-    client: { destroy: () => new Promise(() => {}) },
+    client: { destroy: () => { destroyAttempts += 1; return pendingDestroy.promise; } },
   });
   const timedOut = await discordBridge.stop("dc-timeout");
   assert.equal(timedOut.ok, false, "Discord never reports success while client teardown remains pending");
-  assert.equal(timedOut.cleanup_errors[0].code, "client_stop_failed");
+  assert.equal(timedOut.cleanup_errors[0].code, "client_stop_timeout");
   assert.equal(discordBridge.isRunning("dc-timeout"), true, "Discord timeout retains ownership for retry");
-  discordBridge._instances.delete("dc-timeout");
+  assert.equal(destroyAttempts, 1);
+  pendingDestroy.resolve();
+  const retried = await discordBridge.stop("dc-timeout");
+  assert.equal(retried.ok, true);
+  assert.equal(destroyAttempts, 1, "Discord retry joins the pending destroy instead of invoking it twice");
 }
 
 // #1031: assignment/admission authority is a lifetime property, not only a
@@ -266,7 +272,8 @@ async function runLifecycleTests() {
     await fetchStarted.promise;
     authorized = false;
     seedResponse.resolve({ ok: true, json: async () => [] });
-    await starting;
+    assert.equal(await starting, undefined,
+      "Telegram canceled startup reports non-success to its route caller");
     assert.equal(fetches, 1, "Telegram rollover during cursor startup starts no poll/update fetch");
     assert.equal(telegramBridge.isRunning("tg-authority-start"), false, "stale Telegram startup retires its instance");
   } finally {
@@ -476,6 +483,7 @@ async function runLifecycleTests() {
   const identity = {
     admission_generation: 4,
     compatibility_mode: "v1",
+    batch_observation_fingerprint: "legacy-observation-bridge-4",
   };
   class IdentityClient {
     constructor() {
@@ -511,6 +519,403 @@ async function runLifecycleTests() {
       "Discord inbound POST carries canonical V1 automation identity");
   } finally {
     await discordBridge.stop("dc-identity");
+    global.fetch = originalFetch;
+  }
+}
+
+// A later assignment must never inherit A's "already running" result. The
+// per-project start barrier retires A completely before installing B, and the
+// stored authority value cannot be mutated after admission.
+{
+  const originalFetch = global.fetch;
+  const keyA = { admission_generation: 21, assignment_fingerprint: "assignment-a" };
+  const keyB = { admission_generation: 21, assignment_fingerprint: "assignment-b" };
+  let aborts = 0;
+  try {
+    global.fetch = async (url) => ({
+      ok: true,
+      json: async () => String(url).includes("getUpdates") ? { ok: true, result: [] } : [],
+    });
+    telegramBridge._instances.set("tg-replace", {
+      projectId: "tg-replace",
+      cursor: 0,
+      forwardedIds: new Set(),
+      timer: setTimeout(() => {}, 60_000),
+      updateTimer: null,
+      stopping: false,
+      controllers: new Set([{ abort: () => { aborts += 1; } }]),
+      inFlight: new Set(),
+      isAuthorityCurrent: () => true,
+      authorityKey: Object.freeze({ ...keyA }),
+    });
+    const started = await telegramBridge.start("tg-replace", "token-b", "chat", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    });
+    assert.equal(started.already_running, false);
+    assert.equal(aborts, 1, "Telegram A is retired once before B starts");
+    assert.equal(telegramBridge.isRunning("tg-replace", keyA), false);
+    assert.equal(telegramBridge.isRunning("tg-replace", keyB), true);
+    const runtimeKey = telegramBridge._instances.get("tg-replace").authorityKey;
+    assert.equal(Object.isFrozen(runtimeKey), true, "Telegram stores a frozen runtime authority key");
+    assert.equal(runtimeKey.assignment_fingerprint, "assignment-b");
+  } finally {
+    await telegramBridge.stop("tg-replace");
+    global.fetch = originalFetch;
+  }
+}
+
+{
+  const originalFetch = global.fetch;
+  const keyA = { admission_generation: 22, assignment_fingerprint: "assignment-a" };
+  const keyB = { admission_generation: 22, assignment_fingerprint: "assignment-b" };
+  let oldDestroys = 0;
+  class ReplacementClient {
+    constructor() {
+      this.channels = { fetch: async () => ({ send: async () => {} }) };
+    }
+    async login() {}
+    on() {}
+    async destroy() {}
+  }
+  discordBridge._setDiscordLibForTest({
+    Client: ReplacementClient,
+    GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 4 },
+  });
+  try {
+    global.fetch = async () => ({ ok: true, json: async () => [] });
+    discordBridge._instances.set("dc-replace", {
+      projectId: "dc-replace",
+      cursor: 0,
+      forwardedIds: new Set(),
+      timer: null,
+      stopping: false,
+      controllers: new Set(),
+      inFlight: new Set(),
+      isAuthorityCurrent: () => true,
+      authorityKey: Object.freeze({ ...keyA }),
+      client: { destroy: async () => { oldDestroys += 1; } },
+    });
+    const started = await discordBridge.start("dc-replace", "token-b", "channel", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    });
+    assert.equal(started.already_running, false);
+    assert.equal(oldDestroys, 1, "Discord A is destroyed before B starts");
+    assert.equal(discordBridge.isRunning("dc-replace", keyA), false);
+    assert.equal(discordBridge.isRunning("dc-replace", keyB), true);
+    const runtimeKey = discordBridge._instances.get("dc-replace").authorityKey;
+    assert.equal(Object.isFrozen(runtimeKey), true, "Discord stores a frozen runtime authority key");
+    assert.equal(runtimeKey.assignment_fingerprint, "assignment-b");
+  } finally {
+    await discordBridge.stop("dc-replace");
+    global.fetch = originalFetch;
+  }
+}
+
+// A lifecycle action must be able to cancel an in-progress startup before the
+// startup promise settles. Otherwise a hung seed/login would sit in front of
+// stop and replacement forever.
+{
+  const originalFetch = global.fetch;
+  const fetchStarted = deferred();
+  const pendingFetch = deferred();
+  const keyA = { admission_generation: 25, assignment_fingerprint: "assignment-a" };
+  try {
+    global.fetch = async () => {
+      fetchStarted.resolve();
+      return pendingFetch.promise;
+    };
+    const starting = telegramBridge.start("tg-start-stop-race", "token", "chat", 8400, {
+      authorityKey: keyA,
+      isAuthorityCurrent: () => true,
+    });
+    await fetchStarted.promise;
+    const owner = telegramBridge._instances.get("tg-start-stop-race");
+    owner.stopTimeoutMs = 1000;
+    const stopping = telegramBridge.stop("tg-start-stop-race");
+    assert.equal(owner.stopping, true, "Telegram stop synchronously cancels a pending startup owner");
+    pendingFetch.resolve({ ok: true, json: async () => [] });
+    assert.equal((await stopping).ok, true);
+    await starting;
+    assert.equal(telegramBridge.isRunning("tg-start-stop-race"), false,
+      "Telegram pending startup cannot recreate ownership after stop");
+  } finally {
+    pendingFetch.resolve({ ok: true, json: async () => [] });
+    await telegramBridge.stop("tg-start-stop-race");
+    global.fetch = originalFetch;
+  }
+}
+
+{
+  const originalFetch = global.fetch;
+  const loginStarted = deferred();
+  const pendingLogin = deferred();
+  const keyA = { admission_generation: 26, assignment_fingerprint: "assignment-a" };
+  const keyB = { admission_generation: 26, assignment_fingerprint: "assignment-b" };
+  let clients = 0;
+  let destroys = 0;
+  class StartupRaceClient {
+    constructor() {
+      this.index = clients++;
+      this.channels = { fetch: async () => ({ send: async () => {} }) };
+    }
+    login() {
+      if (this.index === 0) {
+        loginStarted.resolve();
+        return pendingLogin.promise;
+      }
+      return Promise.resolve();
+    }
+    on() {}
+    async destroy() { destroys += 1; }
+  }
+  discordBridge._setDiscordLibForTest({
+    Client: StartupRaceClient,
+    GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 4 },
+  });
+  try {
+    global.fetch = async () => ({ ok: true, json: async () => [] });
+    const startingA = discordBridge.start("dc-start-replace-race", "token-a", "channel", 8400, {
+      authorityKey: keyA,
+      isAuthorityCurrent: () => true,
+    });
+    await loginStarted.promise;
+    const owner = discordBridge._instances.get("dc-start-replace-race");
+    owner.stopTimeoutMs = 1000;
+    const startingB = discordBridge.start("dc-start-replace-race", "token-b", "channel", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    });
+    assert.equal(owner.stopping, true, "Discord B synchronously cancels A's pending login");
+    assert.equal(destroys, 1, "Discord teardown begins before A's login promise settles");
+    pendingLogin.resolve();
+    await startingA;
+    const startedB = await startingB;
+    assert.equal(startedB.ok, true);
+    assert.equal(discordBridge.isRunning("dc-start-replace-race", keyB), true,
+      "Discord B starts after strict A retirement");
+  } finally {
+    pendingLogin.resolve();
+    await discordBridge.stop("dc-start-replace-race");
+    global.fetch = originalFetch;
+  }
+}
+
+// A keyed stop can target B while only A exists and is retiring. The stop
+// intent must cancel the queued future owner before B creates any runtime.
+{
+  const originalFetch = global.fetch;
+  const pendingA = deferred();
+  const keyA = { admission_generation: 27, assignment_fingerprint: "assignment-a" };
+  const keyB = { admission_generation: 27, assignment_fingerprint: "assignment-b" };
+  let bFetches = 0;
+  try {
+    global.fetch = async () => {
+      bFetches += 1;
+      return { ok: true, json: async () => [] };
+    };
+    telegramBridge._instances.set("tg-future-stop", {
+      projectId: "tg-future-stop",
+      timer: null,
+      updateTimer: null,
+      stopping: false,
+      controllers: new Set(),
+      inFlight: new Set([pendingA.promise]),
+      stopTimeoutMs: 1000,
+      isAuthorityCurrent: () => true,
+      authorityKey: Object.freeze({ ...keyA }),
+    });
+    const startingB = telegramBridge.start("tg-future-stop", "token-b", "chat", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    });
+    const stoppingB = telegramBridge.stop("tg-future-stop", keyB);
+    assert.equal(await startingB, undefined,
+      "Telegram future keyed stop supersedes B before startInstance");
+    assert.equal((await stoppingB).ok, true);
+    assert.equal(bFetches, 0, "Telegram stopped future owner creates no bridge fetch");
+    assert.equal(telegramBridge.isRunning("tg-future-stop", keyB), false);
+  } finally {
+    pendingA.resolve();
+    await telegramBridge.stop("tg-future-stop");
+    global.fetch = originalFetch;
+  }
+}
+
+{
+  const originalFetch = global.fetch;
+  const pendingA = deferred();
+  const keyA = { admission_generation: 28, assignment_fingerprint: "assignment-a" };
+  const keyB = { admission_generation: 28, assignment_fingerprint: "assignment-b" };
+  let clients = 0;
+  class FutureStopClient {
+    constructor() {
+      clients += 1;
+      this.channels = { fetch: async () => ({ send: async () => {} }) };
+    }
+    async login() {}
+    on() {}
+    async destroy() {}
+  }
+  discordBridge._setDiscordLibForTest({
+    Client: FutureStopClient,
+    GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 4 },
+  });
+  try {
+    global.fetch = async () => ({ ok: true, json: async () => [] });
+    discordBridge._instances.set("dc-future-stop", {
+      projectId: "dc-future-stop",
+      timer: null,
+      stopping: false,
+      controllers: new Set(),
+      inFlight: new Set([pendingA.promise]),
+      stopTimeoutMs: 1000,
+      isAuthorityCurrent: () => true,
+      authorityKey: Object.freeze({ ...keyA }),
+      client: { destroy: async () => {} },
+    });
+    const startingB = discordBridge.start("dc-future-stop", "token-b", "channel", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    });
+    const stoppingB = discordBridge.stop("dc-future-stop", keyB);
+    assert.equal(await startingB, undefined,
+      "Discord future keyed stop supersedes B before client creation");
+    assert.equal((await stoppingB).ok, true);
+    assert.equal(clients, 0, "Discord stopped future owner never enters login");
+    assert.equal(discordBridge.isRunning("dc-future-stop", keyB), false);
+  } finally {
+    pendingA.resolve();
+    await discordBridge.stop("dc-future-stop");
+    global.fetch = originalFetch;
+  }
+}
+
+// An unabortable owned operation makes replacement fail closed. A concurrent
+// stop supersedes the queued replacement and joins the exact same retirement
+// attempt (one abort/destroy). Ownership remains installed after timeout, and a
+// later retry can finish replacement after the old operation settles.
+{
+  const originalFetch = global.fetch;
+  const keyA = { admission_generation: 23, assignment_fingerprint: "assignment-a" };
+  const keyB = { admission_generation: 23, assignment_fingerprint: "assignment-b" };
+  const pending = deferred();
+  let aborts = 0;
+  try {
+    global.fetch = async (url) => ({
+      ok: true,
+      json: async () => String(url).includes("getUpdates") ? { ok: true, result: [] } : [],
+    });
+    const owner = {
+      projectId: "tg-replace-timeout",
+      cursor: 0,
+      forwardedIds: new Set(),
+      timer: null,
+      updateTimer: null,
+      stopping: false,
+      controllers: new Set([{ abort: () => { aborts += 1; } }]),
+      inFlight: new Set([pending.promise]),
+      stopTimeoutMs: 10,
+      isAuthorityCurrent: () => true,
+      authorityKey: Object.freeze({ ...keyA }),
+    };
+    telegramBridge._instances.set("tg-replace-timeout", owner);
+    const replacing = telegramBridge.start("tg-replace-timeout", "token-b", "chat", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    await Promise.resolve();
+    const stopping = telegramBridge.stop("tg-replace-timeout");
+    const [replacementError, stopped] = await Promise.all([replacing, stopping]);
+    assert.equal(replacementError, null, "Telegram stop supersedes the queued replacement");
+    assert.equal(stopped.ok, false);
+    assert.equal(stopped.cleanup_errors[0].code, "inflight_stop_timeout");
+    assert.equal(stopped.cleanup_errors[0].retryable, true);
+    assert.equal(aborts, 1, "Telegram replacement and stop share one retirement promise");
+    assert.equal(telegramBridge._instances.get("tg-replace-timeout"), owner,
+      "Telegram retains A until every owned operation settles");
+    pending.resolve();
+    owner.inFlight.delete(pending.promise);
+    const retried = await telegramBridge.start("tg-replace-timeout", "token-b", "chat", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    });
+    assert.equal(retried.ok, true);
+    assert.equal(telegramBridge.isRunning("tg-replace-timeout", keyB), true);
+  } finally {
+    pending.resolve();
+    await telegramBridge.stop("tg-replace-timeout");
+    global.fetch = originalFetch;
+  }
+}
+
+{
+  const originalFetch = global.fetch;
+  const keyA = { admission_generation: 24, assignment_fingerprint: "assignment-a" };
+  const keyB = { admission_generation: 24, assignment_fingerprint: "assignment-b" };
+  const pending = deferred();
+  let aborts = 0;
+  let oldDestroys = 0;
+  class RetryClient {
+    constructor() {
+      this.channels = { fetch: async () => ({ send: async () => {} }) };
+    }
+    async login() {}
+    on() {}
+    async destroy() {}
+  }
+  discordBridge._setDiscordLibForTest({
+    Client: RetryClient,
+    GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 4 },
+  });
+  try {
+    global.fetch = async () => ({ ok: true, json: async () => [] });
+    const owner = {
+      projectId: "dc-replace-timeout",
+      cursor: 0,
+      forwardedIds: new Set(),
+      timer: null,
+      stopping: false,
+      controllers: new Set([{ abort: () => { aborts += 1; } }]),
+      inFlight: new Set([pending.promise]),
+      stopTimeoutMs: 10,
+      isAuthorityCurrent: () => true,
+      authorityKey: Object.freeze({ ...keyA }),
+      client: { destroy: async () => { oldDestroys += 1; } },
+    };
+    discordBridge._instances.set("dc-replace-timeout", owner);
+    const replacing = discordBridge.start("dc-replace-timeout", "token-b", "channel", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    }).then(
+      () => null,
+      (error) => error,
+    );
+    await Promise.resolve();
+    const stopping = discordBridge.stop("dc-replace-timeout");
+    const [replacementError, stopped] = await Promise.all([replacing, stopping]);
+    assert.equal(replacementError, null, "Discord stop supersedes the queued replacement");
+    assert.equal(stopped.cleanup_errors[0].code, "inflight_stop_timeout");
+    assert.equal(aborts, 1, "Discord replacement and stop share one retirement promise");
+    assert.equal(oldDestroys, 1, "Discord destroy belongs to the shared retirement promise");
+    assert.equal(discordBridge._instances.get("dc-replace-timeout"), owner,
+      "Discord retains A after a retryable in-flight timeout");
+    pending.resolve();
+    owner.inFlight.delete(pending.promise);
+    const retried = await discordBridge.start("dc-replace-timeout", "token-b", "channel", 8400, {
+      authorityKey: keyB,
+      isAuthorityCurrent: () => true,
+    });
+    assert.equal(retried.ok, true);
+    assert.equal(oldDestroys, 1, "Discord retry preserves the already-completed client teardown");
+    assert.equal(discordBridge.isRunning("dc-replace-timeout", keyB), true);
+  } finally {
+    pending.resolve();
+    await discordBridge.stop("dc-replace-timeout");
     global.fetch = originalFetch;
   }
 }

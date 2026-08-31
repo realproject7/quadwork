@@ -189,14 +189,27 @@ function request(server, method, pathname, body) {
       const original = { start: bridge.start, stop: bridge.stop, isRunning: bridge.isRunning };
       const bridgeCalls = { start: 0, stop: 0, isRunning: 0 };
       let latestStartOptions = null;
+      let latestRunningAuthorityKey = null;
+      let latestStopAuthorityKey = null;
+      let bridgeRunning = false;
       try {
         bridge.start = async (...args) => {
           bridgeCalls.start += 1;
           latestStartOptions = args[4];
-          return { ok: true };
+          bridgeRunning = true;
+          return { ok: true, running: true };
         };
-        bridge.stop = async () => { bridgeCalls.stop += 1; return { ok: true, resources: {}, cleanup_errors: [] }; };
-        bridge.isRunning = () => { bridgeCalls.isRunning += 1; return false; };
+        bridge.stop = async (_projectId, authorityKey) => {
+          bridgeCalls.stop += 1;
+          latestStopAuthorityKey = authorityKey;
+          bridgeRunning = false;
+          return { ok: true, resources: {}, cleanup_errors: [] };
+        };
+        bridge.isRunning = (_projectId, authorityKey) => {
+          bridgeCalls.isRunning += 1;
+          latestRunningAuthorityKey = authorityKey;
+          return bridgeRunning;
+        };
 
         const currentAdmission = captureProjectAdmission("alpha");
         response = await request(server, "POST", `/api/${name}?action=start`, {
@@ -214,6 +227,22 @@ function request(server, method, pathname, body) {
         assert.equal(latestStartOptions.automationIdentity.compatibility_mode, "v2");
         assert.equal(latestStartOptions.automationIdentity.assignment_key, bridgeAssignment.assignment_key,
           `${name} carries the server-validated assignment identity to inbound chat`);
+        assert.equal(Object.isFrozen(latestStartOptions.authorityKey), true,
+          `${name} route freezes the runtime authority key`);
+        assert.deepEqual(latestStartOptions.authorityKey, {
+          admission_generation: currentAdmission.generation,
+          assignment_fingerprint: router.readLiveBatchContext("alpha").fingerprint,
+        }, `${name} runtime authority binds admission and exact assignment`);
+        assert.deepEqual(latestRunningAuthorityKey, latestStartOptions.authorityKey,
+          `${name} already-running check uses the requested authority`);
+        response = await request(server, "POST", `/api/${name}?action=status`, {
+          project_id: "alpha",
+          admission_generation: currentAdmission.generation,
+          ...bridgeAssignment,
+        });
+        assert.equal(response.status, 200);
+        assert.deepEqual(latestRunningAuthorityKey, latestStartOptions.authorityKey,
+          `${name} status checks the exact requested authority`);
         response = await request(server, "POST", `/api/${name}?action=stop`, {
           project_id: "alpha",
           admission_generation: currentAdmission.generation,
@@ -223,6 +252,8 @@ function request(server, method, pathname, body) {
         assert.equal(response.json.ok, true);
         assert.equal(bridgeCalls.start, 1);
         assert.equal(bridgeCalls.stop, 1);
+        assert.deepEqual(latestStopAuthorityKey, latestStartOptions.authorityKey,
+          `${name} automated stop is keyed to the exact runtime assignment`);
 
         const beforeMissingAssignment = { ...bridgeCalls };
         response = await request(server, "POST", `/api/${name}?action=start`, {
@@ -245,12 +276,13 @@ function request(server, method, pathname, body) {
         let rolloverGuardCurrent = true;
         bridge.start = async (...args) => {
           bridgeCalls.start += 1;
+          bridgeRunning = true;
           fs.writeFileSync(
             path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"),
             bridgeQueue.replace("bridge_attempt_a", "bridge_attempt_b"),
           );
           rolloverGuardCurrent = args[4].isAuthorityCurrent();
-          return { ok: true };
+          return { ok: true, running: true };
         };
         response = await request(server, "POST", `/api/${name}?action=start`, {
           project_id: "alpha",
@@ -265,11 +297,12 @@ function request(server, method, pathname, body) {
 
         bridge.start = async () => {
           bridgeCalls.start += 1;
+          bridgeRunning = true;
           fs.writeFileSync(
             path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"),
             bridgeQueue.replace(bridgeInstallationId, "installation_bridge_foreign01"),
           );
-          return { ok: true };
+          return { ok: true, running: true };
         };
         response = await request(server, "POST", `/api/${name}?action=start`, {
           project_id: "alpha",
@@ -283,7 +316,8 @@ function request(server, method, pathname, body) {
         bridge.start = async (...args) => {
           bridgeCalls.start += 1;
           latestStartOptions = args[4];
-          return { ok: true };
+          bridgeRunning = true;
+          return { ok: true, running: true };
         };
 
         // Preactivation, single-repository bare queues retain the legacy
@@ -305,24 +339,34 @@ function request(server, method, pathname, body) {
           telegram: { bot_token: "telegram-token", chat_id: "chat" },
           discord: { bot_token: "discord-token", channel_id: "channel" },
         }] }));
+        const legacyFingerprint = router.readLiveBatchContext("alpha").fingerprint;
         const beforeLegacy = { ...bridgeCalls };
         response = await request(server, "POST", `/api/${name}?action=start`, {
           project_id: "alpha",
           compatibility_mode: "v1",
+          batch_observation_fingerprint: legacyFingerprint,
         });
         assert.equal(response.status, 200, `${name} V1 admission-only automated start remains compatible`);
         assert.equal(latestStartOptions.isAuthorityCurrent(), true,
           `${name} V1 automation receives a live compatibility guard`);
         assert.equal(latestStartOptions.automationIdentity.compatibility_mode, "v1");
+        assert.equal(latestStartOptions.automationIdentity.batch_observation_fingerprint, legacyFingerprint);
         assert.equal(latestStartOptions.automationIdentity.admission_generation, currentAdmission.generation,
           `${name} V1 inbound carry remains admission-bound`);
+        assert.deepEqual(latestStartOptions.authorityKey, {
+          admission_generation: currentAdmission.generation,
+          assignment_fingerprint: legacyFingerprint,
+        }, `${name} explicit V1 runtime keeps its observation authority`);
         response = await request(server, "POST", `/api/${name}?action=stop`, {
           project_id: "alpha",
           compatibility_mode: "v1",
+          batch_observation_fingerprint: legacyFingerprint,
         });
         assert.equal(response.status, 200, `${name} V1 admission-only automated stop remains compatible`);
         assert.equal(bridgeCalls.start, beforeLegacy.start + 1);
         assert.equal(bridgeCalls.stop, beforeLegacy.stop + 1);
+        assert.deepEqual(latestStopAuthorityKey, latestStartOptions.authorityKey,
+          `${name} V1 automated stop cannot retire a replacement assignment`);
         fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
         fs.writeFileSync(bridgeConfigPath, JSON.stringify({ installation_id: bridgeInstallationId, projects: [{
           id: "alpha",
@@ -374,6 +418,30 @@ function request(server, method, pathname, body) {
           `${name} true manual start keeps inbound chat unbound`);
         assert.equal(latestStartOptions.isAuthorityCurrent(), true,
           `${name} manual runtime remains protected by project admission`);
+        assert.deepEqual(latestStartOptions.authorityKey, {
+          admission_generation: captureProjectAdmission("alpha").generation,
+          assignment_fingerprint: "manual",
+        }, `${name} manual runtime uses an explicit non-assignment authority key`);
+
+        bridgeRunning = false;
+        bridge.start = async () => {
+          const error = new Error("old bridge cleanup is incomplete");
+          error.code = "bridge_cleanup_incomplete";
+          error.cleanupResult = {
+            ok: false,
+            resources: { [`${name}_bridges`]: 0 },
+            cleanup_errors: [{
+              resource: `${name}_bridge`,
+              code: "inflight_stop_timeout",
+              message: "owned operation did not settle",
+            }],
+          };
+          throw error;
+        };
+        response = await request(server, "POST", `/api/${name}?action=start`, { project_id: "alpha" });
+        assert.equal(response.status, 503, `${name} replacement cleanup timeout is retryable at the route boundary`);
+        assert.equal(response.json.code, "bridge_cleanup_incomplete");
+        assert.equal(response.json.cleanup_errors[0].code, "inflight_stop_timeout");
       } finally {
         bridge.start = original.start;
         bridge.stop = original.stop;

@@ -105,9 +105,10 @@ registerResourceHttp(app, resourceRuntimeOwner);
 app.use(routes);
 
 // #730: wire PTY injection dispatcher into the chat route
-routes.setPtyDispatchCallback((projectId, msg) => {
+routes.setPtyDispatchCallback((projectId, msg, isMessageCurrent = null) => {
   dispatchToAgentPTY(projectId, msg, agentSessions, {
     isLoopGuardPaused: fileChat.isLoopGuardPaused,
+    isActionCurrent: typeof isMessageCurrent === "function" ? isMessageCurrent : undefined,
     isProjectAdmitted: (id) => {
       try { assertProjectAdmitted(id); return true; }
       catch { return false; }
@@ -1710,99 +1711,94 @@ ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via t
 
 function bridgeAssignmentBody(projectId, admission, batchState) {
   const body = { project_id: projectId, admission_generation: admission?.generation };
-  if (batchState?.mode === "v1" || batchState?.mode === "v2") {
-    body.compatibility_mode = batchState.mode;
-  }
-  if (batchState && batchState.authoritative && batchState.identity) {
-    Object.assign(body, batchState.identity);
-  }
+  Object.assign(body, batchAutomationRequestBody(batchState) || {});
   return body;
 }
 
+async function bridgeMutationSucceeded(response, expectedRunning) {
+  if (!response?.ok || typeof response.json !== "function") return false;
+  try {
+    const payload = await response.json();
+    return payload?.ok === true && payload.running === expectedRunning;
+  } catch {
+    return false;
+  }
+}
+
 async function autoStopBridges(projectId, project, qwPort, admission = null, batchState = null) {
+  let allStopped = true;
   if (project?.telegram_auto) {
     try {
-      if (admission && !isAdmissionCurrent(admission)) return;
+      if (admission && !isAdmissionCurrent(admission)) return false;
       const stopped = await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
         signal: AbortSignal.timeout(5000),
       });
-      if (admission && !isAdmissionCurrent(admission)) return;
-      if (stopped.ok) console.log(`[auto-bridge] ${projectId}: telegram bridge auto-stopped`);
-    } catch { /* non-fatal */ }
+      const stoppedOk = await bridgeMutationSucceeded(stopped, false);
+      if (admission && !isAdmissionCurrent(admission)) return false;
+      if (stoppedOk) console.log(`[auto-bridge] ${projectId}: telegram bridge auto-stopped`);
+      else allStopped = false;
+    } catch { allStopped = false; }
   }
   if (project?.discord_auto) {
     try {
-      if (admission && !isAdmissionCurrent(admission)) return;
+      if (admission && !isAdmissionCurrent(admission)) return false;
       const stopped = await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
         signal: AbortSignal.timeout(5000),
       });
-      if (admission && !isAdmissionCurrent(admission)) return;
-      if (stopped.ok) console.log(`[auto-bridge] ${projectId}: discord bridge auto-stopped`);
-    } catch { /* non-fatal */ }
+      const stoppedOk = await bridgeMutationSucceeded(stopped, false);
+      if (admission && !isAdmissionCurrent(admission)) return false;
+      if (stoppedOk) console.log(`[auto-bridge] ${projectId}: discord bridge auto-stopped`);
+      else allStopped = false;
+    } catch { allStopped = false; }
   }
+  return allStopped;
 }
 
 async function autoStartBridges(projectId, project, qwPort, admissionToken = null, batchState = null) {
   let admission = admissionToken;
   try { if (!admission) admission = captureProjectAdmission(projectId); }
-  catch { return; }
-  if (!isAdmissionCurrent(admission)) return;
-  if (project?.telegram_auto) {
-    try {
-      // Check if already running before starting
-      const st = await fetch(
-        `http://127.0.0.1:${qwPort}/api/telegram?project=${encodeURIComponent(projectId)}`,
-        { signal: AbortSignal.timeout(5000) }
-      );
-      let shouldStart = true;
-      if (st.ok) {
-        const data = await st.json();
-        shouldStart = !data.running && !!data.configured;
-      }
-      if (!shouldStart) {
-        // Continue to Discord; the two bridge requirements are independent.
-      } else if (!isAdmissionCurrent(admission)) return;
-      else {
-        const started = await fetch(`http://127.0.0.1:${qwPort}/api/telegram?action=start`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
-          signal: AbortSignal.timeout(10000),
-        });
-        if (!isAdmissionCurrent(admission)) return;
-        if (started.ok) console.log(`[auto-bridge] ${projectId}: telegram bridge auto-started`);
-      }
-    } catch { /* non-fatal */ }
-  }
-  if (project?.discord_auto) {
+  catch { return false; }
+  if (!isAdmissionCurrent(admission)) return false;
+
+  async function startConfiguredBridge(kind) {
     try {
       const st = await fetch(
-        `http://127.0.0.1:${qwPort}/api/discord?project=${encodeURIComponent(projectId)}`,
+        `http://127.0.0.1:${qwPort}/api/${kind}?project=${encodeURIComponent(projectId)}`,
         { signal: AbortSignal.timeout(5000) }
       );
-      let shouldStart = true;
-      if (st.ok) {
-        const data = await st.json();
-        shouldStart = !data.running && !!data.configured;
-      }
-      if (!shouldStart) return;
-      if (!isAdmissionCurrent(admission)) return;
-      const started = await fetch(`http://127.0.0.1:${qwPort}/api/discord?action=start`, {
+      if (!st.ok || !isAdmissionCurrent(admission)) return false;
+      const status = await st.json();
+      if (!isAdmissionCurrent(admission)) return false;
+      if (status?.configured !== true) return status?.configured === false;
+
+      // A running bridge may still belong to assignment A. Always let the
+      // authority-aware route reconcile it with B; only that layer can decide
+      // whether this is an idempotent start or a strict replacement.
+      const started = await fetch(`http://127.0.0.1:${qwPort}/api/${kind}?action=start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(bridgeAssignmentBody(projectId, admission, batchState)),
         signal: AbortSignal.timeout(10000),
       });
-      if (!isAdmissionCurrent(admission)) return;
-      if (started.ok) console.log(`[auto-bridge] ${projectId}: discord bridge auto-started`);
-    } catch { /* non-fatal */ }
+      const startedOk = await bridgeMutationSucceeded(started, true);
+      if (!isAdmissionCurrent(admission)) return false;
+      if (startedOk) console.log(`[auto-bridge] ${projectId}: ${kind} bridge auto-started`);
+      return startedOk;
+    } catch {
+      return false;
+    }
   }
+
+  let allStarted = true;
+  if (project?.telegram_auto) allStarted = await startConfiguredBridge("telegram") && allStarted;
+  if (project?.discord_auto) allStarted = await startConfiguredBridge("discord") && allStarted;
+  return allStarted;
 }
 
 // Track previous batch state per project for bridge auto-start detection
@@ -1858,7 +1854,12 @@ function batchAutomationState(progress, active) {
 
 function batchAutomationRequestBody(batchState) {
   if (!batchState?.authoritative) return null;
-  if (batchState.mode === "v1") return { compatibility_mode: "v1" };
+  if (batchState.mode === "v1" && typeof batchState.fingerprint === "string" && batchState.fingerprint) {
+    return {
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: batchState.fingerprint,
+    };
+  }
   if (batchState.mode !== "v2" || !batchState.identity) return null;
   return { compatibility_mode: "v2", ...batchState.identity };
 }
@@ -1932,10 +1933,18 @@ async function sendTriggerMessage(projectId, automationBody = null) {
         }
         // #518: also stop bridges when batch completes
         // #542: transition guard — only stop if not already stopped for this completion
-        const prev = _bridgeBatchPrev.get(projectId);
-        _bridgeBatchPrev.set(projectId, { fingerprint: batchState.fingerprint, complete: true, hasItems: batchState.hasItems });
-        if (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete) {
-          await autoStopBridges(projectId, project, qwPort, admission, batchState);
+        if (project.telegram_auto || project.discord_auto) {
+          const prev = _bridgeBatchPrev.get(projectId);
+          if (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete) {
+            const stopped = await autoStopBridges(projectId, project, qwPort, admission, batchState);
+            if (stopped) {
+              _bridgeBatchPrev.set(projectId, {
+                fingerprint: batchState.fingerprint,
+                complete: true,
+                hasItems: batchState.hasItems,
+              });
+            }
+          }
         }
         return { ok: true, stopped: true, sent: false };
       }
@@ -1971,7 +1980,22 @@ async function sendTriggerMessage(projectId, automationBody = null) {
       stopTrigger(projectId);
       return { ok: false, code: "project_archived", sent: false };
     }
-    if (automationBody) {
+    // trigger_auto follows the newly joined live assignment across A→B. The
+    // old timer remains the cadence owner, but its action identity is rebound
+    // before any chat mutation; a non-auto schedule stays pinned to the exact
+    // assignment captured when it was started.
+    if (autoBatchState) {
+      if (!isBatchAutomationCurrent(projectId, autoBatchState, admission)) {
+        stopTrigger(projectId);
+        return { ok: false, code: "project_assignment_changed", sent: false };
+      }
+      chatAutomationBody = batchAutomationRequestBody(autoBatchState);
+      if (!chatAutomationBody) {
+        stopTrigger(projectId);
+        return { ok: false, code: "project_assignment_changed", sent: false };
+      }
+      if (info) info.automationBody = chatAutomationBody;
+    } else if (automationBody) {
       const assignment = validateTriggerAutomationRequest(projectId, automationBody);
       if (!assignment.ok) {
         stopTrigger(projectId);
@@ -1983,23 +2007,16 @@ async function sendTriggerMessage(projectId, automationBody = null) {
         return { ok: false, code: "project_assignment_changed", sent: false };
       }
     }
-    if (autoBatchState && !isBatchAutomationCurrent(projectId, autoBatchState, admission)) {
-      stopTrigger(projectId);
-      return { ok: false, code: "project_assignment_changed", sent: false };
-    }
-    if (!chatAutomationBody && autoBatchState) {
-      chatAutomationBody = batchAutomationRequestBody(autoBatchState);
-      if (!chatAutomationBody) {
-        stopTrigger(projectId);
-        return { ok: false, code: "project_assignment_changed", sent: false };
-      }
-    }
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // #1031: the receiver revalidates this exact discriminator immediately
       // before appendMessage/PTY dispatch, closing rollover during fetch await.
-      body: JSON.stringify({ text: message, channel: "general", ...(chatAutomationBody || {}) }),
+      body: JSON.stringify({
+        text: message,
+        channel: "general",
+        ...(chatAutomationBody ? { admission_generation: admission.generation, ...chatAutomationBody } : {}),
+      }),
     });
     if (!res.ok) {
       const err = await res.text().catch(() => "");
@@ -2266,7 +2283,10 @@ function validatedTriggerAutomationBody(validation) {
   if (!validation || validation.ok !== true) return undefined;
   if (validation.manual === true) return null;
   if (validation.legacy === true || validation.assignment?.compatibility_mode === "v1") {
-    return { compatibility_mode: "v1" };
+    const fingerprint = validation.context?.fingerprint;
+    return typeof fingerprint === "string" && fingerprint
+      ? { compatibility_mode: "v1", batch_observation_fingerprint: fingerprint }
+      : undefined;
   }
   const assignment = validation.assignment;
   if (!assignment || assignment.compatibility_mode !== "v2" || assignment.owned !== true ||
@@ -2856,7 +2876,9 @@ async function autoStopPollingTick() {
       const clearedByOperator = batchState.clearedByOperator === true;
       const shouldStop = batchState.shouldStop;
       const prev = _bridgeBatchPrev.get(project.id);
-      _bridgeBatchPrev.set(project.id, { fingerprint: batchState.fingerprint, complete: shouldStop, hasItems });
+      const nextBridgeState = { fingerprint: batchState.fingerprint, complete: shouldStop, hasItems };
+      let bridgeTransitionAttempted = false;
+      let bridgeTransitionSucceeded = true;
 
       if (bp && shouldStop) {
         if (hasTriggerAuto) {
@@ -2871,18 +2893,26 @@ async function autoStopPollingTick() {
         // #518: also stop bridges when batch completes
         // #542: only fire on the transition (incomplete→complete), not every tick
         if (hasBridgeAuto && (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete)) {
-          await autoStopBridges(project.id, project, qwPort, admission, batchState);
+          bridgeTransitionAttempted = true;
+          bridgeTransitionSucceeded = await autoStopBridges(project.id, project, qwPort, admission, batchState);
         }
       }
 
       // #518: detect batch-start transition → auto-start bridges
       // #864: do NOT auto-start on a cleared queue even though hasItems may be
       // true from the preserved snapshot — the operator's clear is a stop signal.
-      if (hasBridgeAuto && batchState.active && hasItems && !bp.complete && !clearedByOperator) {
+      if (hasBridgeAuto && !shouldStop && batchState.active && hasItems && !bp.complete && !clearedByOperator) {
         const isNewBatch = !prev || prev.fingerprint !== batchState.fingerprint || prev.complete || !prev.hasItems;
         if (isNewBatch) {
-          await autoStartBridges(project.id, project, qwPort, admission, batchState);
+          bridgeTransitionAttempted = true;
+          bridgeTransitionSucceeded = await autoStartBridges(project.id, project, qwPort, admission, batchState);
         }
+      }
+      // Failed reconciliation must be retried on the next poll. Advancing the
+      // observed fingerprint before the route confirms replacement can strand
+      // assignment B after assignment A self-retires.
+      if (hasBridgeAuto && (!bridgeTransitionAttempted || bridgeTransitionSucceeded)) {
+        _bridgeBatchPrev.set(project.id, nextBridgeState);
       }
     } catch {
       // Non-fatal — retry on next tick
@@ -3146,6 +3176,9 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
     owned: progress?.owned === true,
     multi_repository: progress?.multi_repository === true,
     compatibility_mode: progress?.compatibility_mode === "v1" ? "v1" : "v2",
+    ...(progress?.compatibility_mode === "v1" && typeof progress?.batch_observation_fingerprint === "string"
+      ? { batch_observation_fingerprint: progress.batch_observation_fingerprint }
+      : {}),
   }));
   const automationCurrent = opts.isBatchAutomationCurrent || isBatchAutomationCurrent;
   const spawn = opts.spawnAgentPty || spawnAgentPty;

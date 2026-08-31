@@ -582,6 +582,89 @@ async function runTests() {
     cleanupSession("proj/dev");
   }
 
+  // --- Test 26 (#1031): assignment authority is re-checked when the delayed
+  //     coalesce actually mutates the PTY, not only when /api/chat schedules it.
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let current = true;
+    const deps = { ...makeDeps(), isActionCurrent: () => current };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    current = false;
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 0, "#1031: assignment rollover during coalesce suppresses stale PTY text");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 27 (#1031): rollover after prompt text but before delayed submit
+  //     cannot press Enter in a new assignment generation.
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let current = true;
+    const deps = { ...makeDeps(), isActionCurrent: () => current };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 20));
+    assert(written.length === 1, "#1031: prompt text was written while assignment was current");
+    current = false;
+    await new Promise((r) => setTimeout(r, 500));
+    assert(written.length === 1, "#1031: rolled assignment receives no delayed submit CR");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 28 (#1031): A's stale coalesce owner cannot consume a later,
+  //     current B mention that joined the same per-agent timer. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let aCurrent = true;
+    let bCurrent = true;
+    const depsA = { ...makeDeps(), isActionCurrent: () => aCurrent };
+    const depsB = { ...makeDeps(), isActionCurrent: () => bCurrent };
+    dispatchToAgentPTY("proj", makeMsg({ id: 28 }), sessions, depsA);
+    aCurrent = false;
+    dispatchToAgentPTY("proj", makeMsg({ id: 29 }), sessions, depsB);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 1,
+      "#1031: a current B wake survives a stale A owner in the same coalesce cycle");
+    bCurrent = false;
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 29 (#1031): the already-armed busy-agent drain also adopts the
+  //     later current authority instead of deleting the whole wake cycle. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: Date.now(), backend: "codex" });
+    let aCurrent = true;
+    let bCurrent = true;
+    const depsA = { ...makeDeps(), isActionCurrent: () => aCurrent };
+    const depsB = { ...makeDeps(), isActionCurrent: () => bCurrent };
+    dispatchToAgentPTY("proj", makeMsg({ id: 30 }), sessions, depsA);
+    aCurrent = false;
+    dispatchToAgentPTY("proj", makeMsg({ id: 31 }), sessions, depsB);
+    await new Promise((r) => setTimeout(r, 350));
+    assert(written.length === 1,
+      "#1031: a current B wake survives a stale A owner in the same pending-drain cycle");
+    bCurrent = false;
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 30 (#1031): a manual wake sharing the coalesce cycle remains
+  //     authorized through delayed submit even if the automated lease rolls. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let automatedCurrent = true;
+    dispatchToAgentPTY("proj", makeMsg({ id: 32 }), sessions, {
+      ...makeDeps(),
+      isActionCurrent: () => automatedCurrent,
+    });
+    dispatchToAgentPTY("proj", makeMsg({ id: 33 }), sessions, makeDeps());
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 20));
+    assert(written.length === 1, "#1031: mixed manual/automated wake writes one prompt");
+    automatedCurrent = false;
+    await new Promise((r) => setTimeout(r, 500));
+    assert(written.length === 2 && written[1] === "\r",
+      "#1031: valid manual authority preserves delayed submit after automated rollover");
+    cleanupSession("proj/dev");
+  }
+
   // Restore the shipped timings so nothing after this block runs on test values.
   _setTimingsForTest();
   assert(MAX_DEFER_MS === 10000 && CAP_COOLDOWN_MS === ACTIVE_SUPPRESSION_MS, "#1010: shipped cap is 10s and the cap cooldown matches the active-suppression window");

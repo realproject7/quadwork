@@ -758,7 +758,7 @@ function requestedBridgeAdmission(body, projectId, res) {
 }
 
 function requestedBridgeAssignment(body, projectId, res) {
-  const identityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance", "compatibility_mode"];
+  const identityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance", "compatibility_mode", "batch_observation_fingerprint"];
   const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
     identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
   // Only a body carrying no automation identity at all is a manual V1/operator
@@ -776,7 +776,10 @@ function requestedBridgeAssignment(body, projectId, res) {
   }
   const assignment = result.assignment || {};
   const automationIdentity = result.legacy === true
-    ? { compatibility_mode: "v1" }
+    ? {
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: result.context.fingerprint,
+    }
     : {
       compatibility_mode: "v2",
       provenance: assignment.provenance,
@@ -790,6 +793,15 @@ function requestedBridgeAssignment(body, projectId, res) {
     fingerprint: result.context.fingerprint,
     automationIdentity,
   };
+}
+
+function bridgeRuntimeAuthorityKey(admission, requestedAssignment) {
+  return Object.freeze({
+    admission_generation: admission.generation,
+    assignment_fingerprint: requestedAssignment
+      ? requestedAssignment.fingerprint
+      : "manual",
+  });
 }
 
 // #1034: archive/unarchive is a lifecycle barrier. The injected controller is
@@ -1540,7 +1552,9 @@ router.post("/api/chat", (req, res) => {
     const maxHops = getProjectMaxHops(projectId);
     fileChat.checkLoopGuard(projectId, msg, maxHops);
     if (!fileChat.isLoopGuardPaused(projectId) && isChatAuthorityCurrent()) {
-      if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
+      if (_ptyDispatchCallback) {
+        _ptyDispatchCallback(projectId, msg, assignmentBound ? isChatAuthorityCurrent : null);
+      }
     }
   }
   return res.json({ ok: true, message: msg });
@@ -4442,6 +4456,9 @@ router.get("/api/batch-active", async (req, res) => {
     owned: data?.owned === true,
     multi_repository: data?.multi_repository === true,
     compatibility_mode: data?.compatibility_mode === "v1" ? "v1" : "v2",
+    ...(typeof data?.batch_observation_fingerprint === "string"
+      ? { batch_observation_fingerprint: data.batch_observation_fingerprint }
+      : {}),
   });
 });
 
@@ -4561,6 +4578,9 @@ function assignmentView(context, { current = true } = {}) {
     multi_repository: (context?.repositories || []).length > 1,
     assignment_items: assignmentItems,
     compatibility_mode: compatibilityMode,
+    ...(compatibilityMode === "v1" && context?.queueReadOk === true && typeof context?.fingerprint === "string"
+      ? { batch_observation_fingerprint: context.fingerprint }
+      : {}),
   };
 }
 
@@ -4596,18 +4616,18 @@ function canonicalAssignmentItems(items) {
 
 function validateCurrentOwnedAssignment(projectId, body = {}) {
   const v2IdentityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance"];
-  const identityFields = [...v2IdentityFields, "compatibility_mode"];
+  const identityFields = [...v2IdentityFields, "compatibility_mode", "batch_observation_fingerprint"];
   const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
     identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
   if (!automated) return { ok: true, manual: true, context: null };
   const context = readLiveBatchContext(projectId);
   const assignment = assignmentView(context, { current: true });
   const carriesV2Identity = v2IdentityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
-  const requestsLegacy = body.compatibility_mode === "v1" ||
-    (!Object.prototype.hasOwnProperty.call(body, "compatibility_mode") &&
-      Object.prototype.hasOwnProperty.call(body, "admission_generation"));
+  const requestsLegacy = body.compatibility_mode === "v1";
   if (!carriesV2Identity && requestsLegacy &&
-      context?.queueReadOk === true && assignment.compatibility_mode === "v1") {
+      context?.queueReadOk === true && assignment.compatibility_mode === "v1" &&
+      typeof body.batch_observation_fingerprint === "string" &&
+      body.batch_observation_fingerprint === context.fingerprint) {
     return { ok: true, manual: false, legacy: true, context, assignment };
   }
   const requestedItems = canonicalAssignmentItems(body.assignment_items);
@@ -6269,7 +6289,8 @@ router.post("/api/telegram", async (req, res) => {
       if (requestedAssignment === null) return;
       const admission = requestedAdmission || projectAdmission(projectId);
       if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
-      if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
+      const authorityKey = bridgeRuntimeAuthorityKey(admission, requestedAssignment);
+      if (telegramBridge.isRunning(projectId, authorityKey)) return res.json({ ok: true, running: true, message: "Already running" });
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
       try {
@@ -6280,17 +6301,18 @@ router.post("/api/telegram", async (req, res) => {
         const automationIdentity = requestedAssignment
           ? { admission_generation: admission.generation, ...requestedAssignment.automationIdentity }
           : null;
-        await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort, {
+        const started = await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort, {
           isAuthorityCurrent: isBridgeAuthorityCurrent,
           automationIdentity,
+          authorityKey,
         });
         const admissionStale = !isAdmissionCurrent(admission);
         const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
         if (admissionStale || assignmentStale) {
-          const stopped = await telegramBridge.stop(projectId);
+          const stopped = await telegramBridge.stop(projectId, authorityKey);
           if (stopped?.ok !== true) {
             const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
-            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
+            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId, authorityKey) });
           }
           return res.status(409).json({
             ok: false,
@@ -6300,9 +6322,23 @@ router.post("/api/telegram", async (req, res) => {
             cleanup_errors: stopped?.cleanup_errors || [],
           });
         }
+        if (started?.ok !== true || started.running !== true ||
+            !telegramBridge.isRunning(projectId, authorityKey)) {
+          return res.status(409).json({
+            ok: false,
+            running: false,
+            code: "bridge_start_superseded",
+            error: "bridge start was superseded by a newer lifecycle action",
+            project_id: projectId,
+          });
+        }
         emitSystemMessage(projectId, "Telegram bridge connected");
         return res.json({ ok: true, running: true });
       } catch (err) {
+        if (err?.code === "bridge_cleanup_incomplete" && err.cleanupResult) {
+          const payload = safeProjectLifecyclePayload({ ...err.cleanupResult, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
+        }
         return res.json({ ok: false, error: err.message || "Start failed" });
       }
     }
@@ -6317,7 +6353,13 @@ router.post("/api/telegram", async (req, res) => {
         if (requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, requestedAdmission)) {
           return res.status(409).json({ ok: false, error: "project assignment changed; refresh and retry", code: "project_assignment_changed", project_id: projectId });
         }
-        const stopped = await telegramBridge.stop(projectId);
+        const stopAdmission = requestedAssignment
+          ? (requestedAdmission || projectAdmission(projectId))
+          : null;
+        const authorityKey = requestedAssignment && stopAdmission
+          ? bridgeRuntimeAuthorityKey(stopAdmission, requestedAssignment)
+          : undefined;
+        const stopped = await telegramBridge.stop(projectId, authorityKey);
         if (stopped?.ok !== true) {
           const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
           return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
@@ -6331,7 +6373,15 @@ router.post("/api/telegram", async (req, res) => {
     case "status": {
       const projectId = body.project_id || "";
       if (projectId && isProjectArchived(projectId)) return res.json({ running: false, archived: true });
-      return res.json({ running: telegramBridge.isRunning(projectId) });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
+      const authorityKey = admission
+        ? bridgeRuntimeAuthorityKey(admission, requestedAssignment)
+        : undefined;
+      return res.json({ running: telegramBridge.isRunning(projectId, authorityKey) });
     }
     case "save-token": {
       const projectId = body.project_id;
@@ -6497,7 +6547,8 @@ router.post("/api/discord", async (req, res) => {
       if (requestedAssignment === null) return;
       const admission = requestedAdmission || projectAdmission(projectId);
       if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
-      if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
+      const authorityKey = bridgeRuntimeAuthorityKey(admission, requestedAssignment);
+      if (discordBridge.isRunning(projectId, authorityKey)) return res.json({ ok: true, running: true, message: "Already running" });
       const dc = getProjectDiscord(projectId);
       if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
       try {
@@ -6508,17 +6559,18 @@ router.post("/api/discord", async (req, res) => {
         const automationIdentity = requestedAssignment
           ? { admission_generation: admission.generation, ...requestedAssignment.automationIdentity }
           : null;
-        await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort, {
+        const started = await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort, {
           isAuthorityCurrent: isBridgeAuthorityCurrent,
           automationIdentity,
+          authorityKey,
         });
         const admissionStale = !isAdmissionCurrent(admission);
         const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
         if (admissionStale || assignmentStale) {
-          const stopped = await discordBridge.stop(projectId);
+          const stopped = await discordBridge.stop(projectId, authorityKey);
           if (stopped?.ok !== true) {
             const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
-            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId) });
+            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId, authorityKey) });
           }
           return res.status(409).json({
             ok: false,
@@ -6528,9 +6580,23 @@ router.post("/api/discord", async (req, res) => {
             cleanup_errors: stopped?.cleanup_errors || [],
           });
         }
+        if (started?.ok !== true || started.running !== true ||
+            !discordBridge.isRunning(projectId, authorityKey)) {
+          return res.status(409).json({
+            ok: false,
+            running: false,
+            code: "bridge_start_superseded",
+            error: "bridge start was superseded by a newer lifecycle action",
+            project_id: projectId,
+          });
+        }
         emitSystemMessage(projectId, "Discord bridge connected");
         return res.json({ ok: true, running: true });
       } catch (err) {
+        if (err?.code === "bridge_cleanup_incomplete" && err.cleanupResult) {
+          const payload = safeProjectLifecyclePayload({ ...err.cleanupResult, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId) });
+        }
         return res.json({ ok: false, error: err.message || "Start failed" });
       }
     }
@@ -6545,7 +6611,13 @@ router.post("/api/discord", async (req, res) => {
         if (requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, requestedAdmission)) {
           return res.status(409).json({ ok: false, error: "project assignment changed; refresh and retry", code: "project_assignment_changed", project_id: projectId });
         }
-        const stopped = await discordBridge.stop(projectId);
+        const stopAdmission = requestedAssignment
+          ? (requestedAdmission || projectAdmission(projectId))
+          : null;
+        const authorityKey = requestedAssignment && stopAdmission
+          ? bridgeRuntimeAuthorityKey(stopAdmission, requestedAssignment)
+          : undefined;
+        const stopped = await discordBridge.stop(projectId, authorityKey);
         if (stopped?.ok !== true) {
           const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
           return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId) });
@@ -6559,7 +6631,15 @@ router.post("/api/discord", async (req, res) => {
     case "status": {
       const projectId = body.project_id || "";
       if (projectId && isProjectArchived(projectId)) return res.json({ running: false, archived: true });
-      return res.json({ running: discordBridge.isRunning(projectId) });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
+      const authorityKey = admission
+        ? bridgeRuntimeAuthorityKey(admission, requestedAssignment)
+        : undefined;
+      return res.json({ running: discordBridge.isRunning(projectId, authorityKey) });
     }
     case "save-config": {
       const projectId = body.project_id;
