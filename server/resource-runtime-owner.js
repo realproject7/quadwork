@@ -8,18 +8,23 @@ const { readRuntimeResources } = require("./config");
 const { createReadOnlyProbes } = require("./resource-preflight");
 const { ResourceObservationProvider } = require("./resource-observation");
 const { createResourceControllerAdapter } = require("./resource-controller-adapter");
-const { createResourceRuntimeService } = require("./resource-runtime-service");
+const {
+  ResourceRuntimeService,
+  createResourceRuntimeService,
+} = require("./resource-runtime-service");
 const { parseRuntimeResources } = require("./resource-policy");
 const {
   DEFAULT_TERMINAL_FACT_LIMIT,
   ResourceStateStore,
   createResourceSnapshot,
 } = require("./resource-state");
-const { registerResourceHttp } = require("./resource-http");
 
 const RESOURCE_STATE_FILENAME = "resource-state.json";
 const OBSERVATION_TIMEOUT_MS = 1_000;
 const OWNER_STATE = new WeakMap();
+const OWNER_ATTESTATIONS = new WeakMap();
+const SOURCE_RUNTIME_SNAPSHOT = ResourceRuntimeService.prototype.snapshot;
+const SOURCE_STATE_SAVE = ResourceStateStore.prototype.save;
 
 class ResourceRuntimeOwnerError extends Error {
   constructor(code, message) {
@@ -49,6 +54,18 @@ function safeGet(value, key) {
     return Reflect.get(value, key);
   } catch {
     return undefined;
+  }
+}
+
+function optionData(options, key, fallback) {
+  if (!options || (typeof options !== "object" && typeof options !== "function")) return fallback;
+  try {
+    const descriptor = Reflect.getOwnPropertyDescriptor(options, key);
+    return descriptor && "value" in descriptor && descriptor.value !== undefined
+      ? descriptor.value
+      : fallback;
+  } catch {
+    return fallback;
   }
 }
 
@@ -92,6 +109,15 @@ function persistenceError(code) {
       ? "resource snapshot persistence failed"
       : "resource persistence is unavailable without a safe runtime service and state store",
   );
+}
+
+function ownerSnapshot(state) {
+  if (state.runtimeService === null) return state.fallbackSnapshot;
+  try {
+    return Reflect.apply(SOURCE_RUNTIME_SNAPSHOT, state.runtimeService, []);
+  } catch {
+    return state.fallbackSnapshot;
+  }
 }
 
 function evidenceOnly(value) {
@@ -140,22 +166,16 @@ function mergeControllerEvidence(controllerSnapshot, persistedEvidence) {
 
 class ResourceRuntimeOwner {
   constructor(options = {}) {
-    const loadPolicy = options.loadRuntimeResources || readRuntimeResources;
-    const makeProbes = options.createReadOnlyProbes || createReadOnlyProbes;
-    const makeObservationProvider = options.createObservationProvider
-      || ((providerOptions) => new ResourceObservationProvider(providerOptions));
-    const makeControllerAdapter = options.createControllerAdapter || createResourceControllerAdapter;
-    const makeService = options.createRuntimeService || createResourceRuntimeService;
-    const makeStore = options.createStateStore
-      || ((storeOptions) => new ResourceStateStore(storeOptions));
-    const registerHttp = options.registerHttp || registerResourceHttp;
-    const fsImpl = options.fsImpl || fs;
-    const execFileSyncImpl = options.execFileSyncImpl || execFileSync;
-    const homeDir = options.homeDir || os.homedir();
+    // Only low-level, read-only I/O seams remain injectable for deterministic
+    // fixtures. Legacy factory options are deliberately never read or invoked;
+    // they cannot become snapshot, publisher, or persistence authority.
+    const fsImpl = optionData(options, "fsImpl", fs);
+    const execFileSyncImpl = optionData(options, "execFileSyncImpl", execFileSync);
+    const homeDir = optionData(options, "homeDir", os.homedir());
 
     let policy = null;
     try {
-      policy = parseRuntimeResources(loadPolicy());
+      policy = parseRuntimeResources(readRuntimeResources({ fsImpl }));
     } catch {
       policy = null;
     }
@@ -163,13 +183,9 @@ class ResourceRuntimeOwner {
     if (policy === null) {
       OWNER_STATE.set(this, {
         fallbackSnapshot: canonicalFallbackSnapshot(false),
-        snapshotMethod: null,
-        persistMethod: null,
+        runtimeService: null,
         stateStore: null,
         persistedEvidence: evidenceOnly(null),
-        registerHttp,
-        registeredApp: null,
-        httpHandler: null,
       });
       Object.freeze(this);
       return;
@@ -178,20 +194,14 @@ class ResourceRuntimeOwner {
     let stateStore = null;
     let persistedEvidence = evidenceOnly(null);
     try {
-      const candidateStore = makeStore({
+      stateStore = new ResourceStateStore({
         filePath: resourceStateFilePath(homeDir),
         fsImpl,
         terminalFactLimit: DEFAULT_TERMINAL_FACT_LIMIT,
       });
-      const loadState = captureDataMethod(candidateStore, "load");
-      const saveState = captureDataMethod(candidateStore, "save");
-      if (loadState === null || saveState === null) throw new TypeError("resource state store is unavailable");
       // Durable state is read exactly once during owner construction. Runtime
       // GETs never touch the state path.
-      persistedEvidence = evidenceOnly(loadState());
-      // Runtime persistence receives only this source-owned facade. It cannot
-      // trigger a caller-owned save accessor while validating the store.
-      stateStore = Object.freeze({ save: (snapshot) => saveState(snapshot) });
+      persistedEvidence = evidenceOnly(stateStore.load());
     } catch {
       stateStore = null;
     }
@@ -199,26 +209,22 @@ class ResourceRuntimeOwner {
     const fallbackSnapshot = canonicalFallbackSnapshot(true);
     const state = {
       fallbackSnapshot,
-      snapshotMethod: null,
-      persistMethod: null,
+      runtimeService: null,
       stateStore,
       persistedEvidence,
-      registerHttp,
-      registeredApp: null,
-      httpHandler: null,
     };
     try {
-      const probes = makeProbes({
+      const probes = createReadOnlyProbes({
         fsImpl,
         execFileSyncImpl,
         scopeProof: false,
       });
-      const observationProvider = makeObservationProvider({
+      const observationProvider = new ResourceObservationProvider({
         fsImpl,
         execFileSyncImpl,
         timeoutMs: OBSERVATION_TIMEOUT_MS,
       });
-      const controller = makeControllerAdapter({
+      const controller = createResourceControllerAdapter({
         policy,
         observationProvider,
         executeProcess: unavailableExecutor,
@@ -228,19 +234,14 @@ class ResourceRuntimeOwner {
       const snapshotOnlyController = Object.freeze({
         snapshot: () => mergeControllerEvidence(controllerSnapshot(), state.persistedEvidence),
       });
-      const runtimeService = makeService({
+      state.runtimeService = createResourceRuntimeService({
         runtimeResources: policy,
         probes,
         controllerAdapter: snapshotOnlyController,
         observationProvider,
       });
-      const snapshotMethod = captureDataMethod(runtimeService, "snapshot");
-      if (snapshotMethod === null) throw new TypeError("runtime service snapshot is unavailable");
-      state.snapshotMethod = snapshotMethod;
-      state.persistMethod = captureDataMethod(runtimeService, "persist");
     } catch {
-      // The source-owned fallback is already installed. Never retry a failed
-      // dependency factory or expose its error through the owner boundary.
+      state.runtimeService = null;
     }
     OWNER_STATE.set(this, state);
     Object.freeze(this);
@@ -249,24 +250,19 @@ class ResourceRuntimeOwner {
   snapshot() {
     const state = OWNER_STATE.get(this);
     if (!state) throw new TypeError("ResourceRuntimeOwner receiver is invalid");
-    if (state.snapshotMethod === null) return state.fallbackSnapshot;
-    try {
-      return state.snapshotMethod();
-    } catch {
-      return state.fallbackSnapshot;
-    }
+    return ownerSnapshot(state);
   }
 
   persist(snapshot) {
     const state = OWNER_STATE.get(this);
     if (!state) throw new TypeError("ResourceRuntimeOwner receiver is invalid");
-    if (state.stateStore === null || state.persistMethod === null) {
+    if (state.stateStore === null || state.runtimeService === null) {
       throw persistenceError("QW_RESOURCE_PERSISTENCE_UNAVAILABLE");
     }
     const input = arguments.length === 0 ? this.snapshot() : snapshot;
     let saved;
     try {
-      saved = state.persistMethod(input, state.stateStore);
+      saved = Reflect.apply(SOURCE_STATE_SAVE, state.stateStore, [input]);
     } catch {
       throw persistenceError("QW_RESOURCE_PERSISTENCE_FAILED");
     }
@@ -279,28 +275,28 @@ class ResourceRuntimeOwner {
     }
     return canonical;
   }
-
-  register(app) {
-    const state = OWNER_STATE.get(this);
-    if (!state) throw new TypeError("ResourceRuntimeOwner receiver is invalid");
-    if (state.registeredApp !== null) {
-      if (state.registeredApp !== app) {
-        throw new ResourceRuntimeOwnerError(
-          "QW_RESOURCE_HTTP_ALREADY_REGISTERED",
-          "resource HTTP endpoint is already registered",
-        );
-      }
-      return state.httpHandler;
-    }
-    const handler = state.registerHttp(app, this);
-    state.registeredApp = app;
-    state.httpHandler = handler;
-    return handler;
-  }
 }
 
 function createResourceRuntimeOwner(options) {
   return new ResourceRuntimeOwner(options);
+}
+
+function captureResourceRuntimeOwner(owner) {
+  const state = OWNER_STATE.get(owner);
+  if (!state) {
+    throw new ResourceRuntimeOwnerError(
+      "QW_RESOURCE_OWNER_INVALID",
+      "resource HTTP publication requires a genuine runtime owner",
+    );
+  }
+  let attestation = OWNER_ATTESTATIONS.get(owner);
+  if (!attestation) {
+    attestation = Object.freeze(Object.assign(Object.create(null), {
+      snapshot: () => ownerSnapshot(state),
+    }));
+    OWNER_ATTESTATIONS.set(owner, attestation);
+  }
+  return attestation;
 }
 
 module.exports = {
@@ -309,6 +305,7 @@ module.exports = {
   ResourceRuntimeOwnerError,
   ResourceRuntimeOwner,
   createResourceRuntimeOwner,
+  captureResourceRuntimeOwner,
   resourceStateFilePath,
   mergeControllerEvidence,
 };

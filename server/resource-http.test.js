@@ -1,15 +1,25 @@
 "use strict";
 
-// Pure HTTP-boundary tests: no socket, filesystem, process, probe, persistence,
-// configuration, or host mutation is used.
+// Pure boundary tests use fake Express objects and read-only fs/exec fixtures.
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { CONFIG_PATH } = require("./config");
+const { DEFAULT_RUNTIME_RESOURCE_PROPOSAL } = require("./resource-policy");
 const { createResourceSnapshot } = require("./resource-state");
-const { createResourceRuntimeService } = require("./resource-runtime-service");
 const { createWorkerUnitBase, scopeUnitFromBase } = require("./resource-unit");
+const {
+  ResourceRuntimeOwner,
+  ResourceRuntimeOwnerError,
+  createResourceRuntimeOwner,
+  resourceStateFilePath,
+} = require("./resource-runtime-owner");
 const {
   RESOURCE_HTTP_PATH,
   MAX_RESOURCE_HTTP_BYTES,
+  captureResourceHttpSnapshot,
   createResourceHttpHandler,
   registerResourceHttp,
 } = require("./resource-http");
@@ -47,11 +57,7 @@ function candidateSnapshot() {
   const unitBase = createWorkerUnitBase({ projectId, generationId });
   const state = createResourceSnapshot({
     status: "candidate_pending_staging",
-    counts: {
-      active_worker_scopes: 1,
-      active_control_children: 0,
-      queued_control_children: 0,
-    },
+    counts: { active_worker_scopes: 1, active_control_children: 0, queued_control_children: 0 },
     limits: {
       host_reserve_mib: 1024,
       max_worker_scopes: 3,
@@ -148,10 +154,60 @@ function request(overrides = {}) {
   return { method: "GET", headers: {}, ...overrides };
 }
 
-function invoke(service, requestValue = request()) {
+function fakeApp() {
+  const registrations = [];
+  return {
+    registrations,
+    get(routePath, handler) { registrations.push({ routePath, handler }); },
+  };
+}
+
+function missingConfigOwner() {
+  const fsImpl = Object.create(fs);
+  Object.defineProperty(fsImpl, "readFileSync", {
+    value(target, ...args) {
+      if (String(target) === CONFIG_PATH) {
+        const error = new Error("missing config");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return fs.readFileSync(target, ...args);
+    },
+  });
+  return createResourceRuntimeOwner({ fsImpl, homeDir: "/tmp" });
+}
+
+function configuredOwner(homeDir) {
+  const fsImpl = Object.create(fs);
+  Object.defineProperty(fsImpl, "readFileSync", {
+    value(target, ...args) {
+      if (String(target) === CONFIG_PATH) {
+        return JSON.stringify({ runtime_resources: DEFAULT_RUNTIME_RESOURCE_PROPOSAL });
+      }
+      return fs.readFileSync(target, ...args);
+    },
+  });
+  return createResourceRuntimeOwner({
+    fsImpl,
+    homeDir,
+    execFileSyncImpl() {
+      const error = new Error("read-only provider unavailable");
+      error.code = "ENOENT";
+      throw error;
+    },
+  });
+}
+
+function mount(owner, app = fakeApp()) {
+  const handler = registerResourceHttp(app, owner);
+  assert.equal(app.registrations.length, 1);
+  assert.equal(app.registrations[0].routePath, RESOURCE_HTTP_PATH);
+  assert.equal(app.registrations[0].handler, handler);
+  return { app, handler };
+}
+
+function invoke(handler, requestValue = request()) {
   const response = new FakeResponse();
-  let handler;
-  registerResourceHttp({ get(_path, mountedHandler) { handler = mountedHandler; } }, service);
   const result = handler(requestValue, response);
   assert.equal(result, response);
   assert.equal(response.jsonCalls, 1);
@@ -175,132 +231,51 @@ function assertUnavailable(response, expectedStatus = 503, expectedCode = "QW_RE
   });
 }
 
-// A candidate is a valid observable state, not an HTTP error. All runtime
-// additions survive the boundary and no persistence-like method is touched.
+// Schema capture is a pure, authority-free operation. A valid candidate is
+// copied without dropping runtime fields and remains within the response cap.
 {
   const source = candidateSnapshot();
-  let snapshots = 0;
-  let writes = 0;
-  const service = {
-    snapshot() {
-      snapshots += 1;
-      return source;
-    },
-    persist() {
-      writes += 1;
-      throw new Error("HTTP must never persist");
-    },
-  };
-  const response = invoke(service);
-  assert.equal(response.statusCode, 200);
-  assert.equal(response.body.status, "candidate_pending_staging");
-  assert.deepEqual(response.body.worker_scopes, source.worker_scopes);
-  assert.deepEqual(response.body.effective_limits, source.effective_limits);
-  assert.deepEqual(response.body.resource_usage, source.resource_usage);
-  assert.notEqual(response.body, source, "the response is a descriptor-snapshotted copy");
-  assert.equal(snapshots, 1);
-  assert.equal(writes, 0);
-  assert(Buffer.byteLength(JSON.stringify(response.body), "utf8") < MAX_RESOURCE_HTTP_BYTES);
+  const captured = captureResourceHttpSnapshot(source);
+  assert(captured);
+  assert.notEqual(captured, source);
+  assert.equal(captured.status, "candidate_pending_staging");
+  assert.deepEqual(captured.worker_scopes, source.worker_scopes);
+  assert.deepEqual(captured.effective_limits, source.effective_limits);
+  assert(Buffer.byteLength(JSON.stringify(captured), "utf8") < MAX_RESOURCE_HTTP_BYTES);
 }
 
-// Direct invocation still enforces GET-only and bodyless semantics before the
-// service is called. Express registration additionally publishes Allow: GET.
+// Unknown fields, accessors, exotic prototypes, proxies, invalid state, cycles,
+// and oversized values fail schema capture without invoking accessors/toJSON.
 {
-  let snapshots = 0;
-  const service = { snapshot() { snapshots += 1; return candidateSnapshot(); } };
-  const method = invoke(service, request({ method: "POST" }));
-  assertUnavailable(method, 405, "QW_RESOURCE_HTTP_METHOD_NOT_ALLOWED");
-  assert.equal(method.headers.allow, "GET");
-  const body = invoke(service, request({ body: {} }));
-  assertUnavailable(body, 400, "QW_RESOURCE_HTTP_BODY_NOT_ALLOWED");
-  const contentLength = invoke(service, request({ headers: { "content-length": "1" } }));
-  assertUnavailable(contentLength, 400, "QW_RESOURCE_HTTP_BODY_NOT_ALLOWED");
-  const transfer = invoke(service, request({ headers: { "transfer-encoding": "chunked" } }));
-  assertUnavailable(transfer, 400, "QW_RESOURCE_HTTP_BODY_NOT_ALLOWED");
-  assert.equal(snapshots, 0);
-}
-
-// Exceptions and accessor/proxy failures collapse to one typed response. No
-// raw failure string, host path, or getter-derived value is retained.
-{
-  const secret = "SECRET_RUNTIME_TOKEN /private/runtime/path";
-  const thrown = invoke({ snapshot() { throw new Error(secret); } });
-  assertUnavailable(thrown);
-  assert.equal(JSON.stringify(thrown.body).includes(secret), false);
-
-  let getterCalls = 0;
-  const getterService = {};
-  Object.defineProperty(getterService, "snapshot", {
-    get() {
-      getterCalls += 1;
-      throw new Error(secret);
-    },
-  });
-  assertUnavailable(invoke(getterService));
-  assert.equal(getterCalls, 0);
-
-  const proxyService = {
-    snapshot: new Proxy(function snapshot() {}, {
-      apply() { throw new Error(secret); },
-    }),
-  };
-  assertUnavailable(invoke(proxyService));
-}
-
-// The service cannot smuggle fields through a valid-looking top-level status,
-// nested metadata, toJSON hook, accessor, symbolic key, or exotic prototype.
-{
-  const secret = "SECRET_RESULT /sys/fs/cgroup/private";
+  const secret = "SECRET_SCHEMA /private/runtime";
   const attacks = [];
-
   attacks.push({ ...candidateSnapshot(), secret });
   const nested = candidateSnapshot();
   nested.pressure = { ...nested.pressure, secret };
   attacks.push(nested);
-
   const accessor = candidateSnapshot();
   let accessorCalls = 0;
   Object.defineProperty(accessor, "pressure", {
     enumerable: true,
-    get() {
-      accessorCalls += 1;
-      return { status: "ready", reason: secret };
-    },
+    get() { accessorCalls += 1; throw new Error(secret); },
   });
   attacks.push(accessor);
-
   const symbolic = candidateSnapshot();
   symbolic[Symbol("secret")] = secret;
   attacks.push(symbolic);
-
   const hooked = candidateSnapshot();
   hooked.toJSON = () => ({ secret });
   attacks.push(hooked);
-
-  const exotic = Object.assign(Object.create({ secret }), candidateSnapshot());
-  attacks.push(exotic);
-
-  attacks.push(new Proxy(candidateSnapshot(), {
-    ownKeys() { throw new Error(secret); },
-  }));
-
-  for (const attack of attacks) {
-    const response = invoke({ snapshot() { return attack; } });
-    assertUnavailable(response);
-    assert.equal(JSON.stringify(response.body).includes(secret), false);
-  }
-  assert.equal(accessorCalls, 0);
-}
-
-// Circular and oversized graphs fail before res.json sees them. Invalid
-// version/status/missing keys and Promise-like service results are also 503.
-{
+  attacks.push(Object.assign(Object.create({ secret }), candidateSnapshot()));
+  attacks.push(new Proxy(candidateSnapshot(), { ownKeys() { throw new Error(secret); } }));
   const circular = candidateSnapshot();
   circular.pressure.self = circular;
+  attacks.push(circular);
   const oversized = candidateSnapshot();
   oversized.worker_scopes[0].project_id = "x".repeat(MAX_RESOURCE_HTTP_BYTES + 1);
-  const invalidVersion = { ...candidateSnapshot(), version: 2 };
-  const invalidStatus = { ...candidateSnapshot(), status: "supported" };
+  attacks.push(oversized);
+  attacks.push({ ...candidateSnapshot(), version: 2 });
+  attacks.push({ ...candidateSnapshot(), status: "supported" });
   const fakeReady = {
     ...candidateSnapshot(),
     status: "ready",
@@ -308,69 +283,95 @@ function assertUnavailable(response, expectedStatus = 503, expectedCode = "QW_RE
     effective_limits: null,
     resource_usage: null,
   };
+  attacks.push(fakeReady);
   const missing = candidateSnapshot();
   delete missing.resource_usage;
-  for (const value of [
-    circular, oversized, invalidVersion, invalidStatus, fakeReady, missing,
-    Promise.resolve(candidateSnapshot()),
-  ]) {
-    assertUnavailable(invoke({ snapshot() { return value; } }));
-  }
+  attacks.push(missing);
+  for (const attack of attacks) assert.equal(captureResourceHttpSnapshot(attack), null);
+  assert.equal(accessorCalls, 0);
 }
 
-// Registration is a pure mount operation and returns the exact handler for
-// later composition by index/routes without collecting a snapshot.
+// A genuine missing-policy owner publishes one canonical synchronous snapshot.
+// Method/body rejection occurs before publication and always sets no-cache.
 {
-  let mounted;
-  let snapshots = 0;
-  const app = {
-    get(path, handler) {
-      mounted = { path, handler };
-    },
-  };
-  const service = { snapshot() { snapshots += 1; return candidateSnapshot(); } };
-  const handler = registerResourceHttp(app, service);
-  assert.equal(mounted.path, RESOURCE_HTTP_PATH);
-  assert.equal(mounted.handler, handler);
-  assert.equal(snapshots, 0);
-  service.snapshot = async function replacementSnapshot() {
-    throw new Error("a post-mount replacement must not cross the publisher boundary");
-  };
-  const response = new FakeResponse();
-  handler(request(), response);
-  assert.equal(response.statusCode, 200);
-  assert.equal(snapshots, 1);
-  assert.throws(() => registerResourceHttp({}, service), /app\.get must be a function/);
-}
-
-// The production service's canonical invalid-policy snapshot is still a valid
-// read-only observation and therefore remains HTTP 200 rather than being
-// confused with a service/serialization failure.
-{
-  const service = createResourceRuntimeService({
-    runtimeResources: null,
-    probes: {},
-    controllerAdapter: { snapshot() { return null; } },
-    observationProvider: {
-      observeApiSelf() { return null; },
-      observeControlAggregate() { return null; },
-      observeWorker() { return null; },
-    },
-  });
-  const response = invoke(service);
+  const owner = missingConfigOwner();
+  const { handler } = mount(owner);
+  const response = invoke(handler);
   assert.equal(response.statusCode, 200);
   assert.equal(response.body.status, "invalid_resource_policy");
   assert.equal(response.body.pressure.reason, "policy_invalid_or_absent");
+
+  const method = invoke(handler, request({ method: "POST" }));
+  assertUnavailable(method, 405, "QW_RESOURCE_HTTP_METHOD_NOT_ALLOWED");
+  assert.equal(method.headers.allow, "GET");
+  assertUnavailable(invoke(handler, request({ body: {} })), 400, "QW_RESOURCE_HTTP_BODY_NOT_ALLOWED");
+  assertUnavailable(
+    invoke(handler, request({ headers: { "content-length": "1" } })),
+    400,
+    "QW_RESOURCE_HTTP_BODY_NOT_ALLOWED",
+  );
+  assertUnavailable(
+    invoke(handler, request({ headers: { "transfer-encoding": "chunked" } })),
+    400,
+    "QW_RESOURCE_HTTP_BODY_NOT_ALLOWED",
+  );
 }
 
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
+// Registration is owner- and app-idempotent. The same owner cannot move to a
+// second app and the same app cannot be rebound to a second owner.
+{
+  const owner = missingConfigOwner();
+  const app = fakeApp();
+  const first = registerResourceHttp(app, owner);
+  assert.equal(registerResourceHttp(app, owner), first);
+  assert.equal(app.registrations.length, 1);
+  assert.throws(
+    () => registerResourceHttp(fakeApp(), owner),
+    (error) => error.code === "QW_RESOURCE_HTTP_ALREADY_REGISTERED",
+  );
+  assert.throws(
+    () => registerResourceHttp(app, missingConfigOwner()),
+    (error) => error.code === "QW_RESOURCE_HTTP_ALREADY_REGISTERED",
+  );
+  assert.throws(() => registerResourceHttp({}, owner), /app\.get must be a function/);
+}
+
+// The public registrar cannot brand arbitrary providers or owner lookalikes.
+// Low-level handler construction remains inert and never invokes them.
+{
+  let providerCalls = 0;
+  const provider = { snapshot() { providerCalls += 1; return candidateSnapshot(); } };
+  const lookalike = Object.create(ResourceRuntimeOwner.prototype);
+  const proxy = new Proxy(missingConfigOwner(), {});
+  const revoked = Proxy.revocable(missingConfigOwner(), {});
+  revoked.revoke();
+  for (const candidate of [provider, function fakeOwner() {}, lookalike, proxy, revoked.proxy]) {
+    const app = fakeApp();
+    assert.throws(
+      () => registerResourceHttp(app, candidate),
+      (error) => error instanceof ResourceRuntimeOwnerError
+        && error.code === "QW_RESOURCE_OWNER_INVALID",
+    );
+    assert.equal(app.registrations.length, 0);
+  }
+  const lowLevel = createResourceHttpHandler(provider);
+  assertUnavailable(invoke(lowLevel));
+  assert.equal(providerCalls, 0);
+}
+
+// A configured genuine owner remains synchronous and read-only at HTTP: its
+// typed non-ready snapshot is HTTP 200 and GET never creates durable state.
+{
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-http-owner-"));
+  fs.mkdirSync(path.join(homeDir, ".quadwork"), { mode: 0o700 });
+  const owner = configuredOwner(homeDir);
+  const statePath = resourceStateFilePath(homeDir);
+  const { handler } = mount(owner);
+  const response = invoke(handler);
+  assert.equal(response.statusCode, 200);
+  assert.notEqual(response.body.status, "invalid_resource_policy");
+  assert.equal(fs.existsSync(statePath), false);
+  fs.rmSync(homeDir, { recursive: true, force: true });
 }
 
 async function settleUnhandledTurn() {
@@ -378,179 +379,75 @@ async function settleUnhandledTurn() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-// Detectable AsyncFunctions and unbranded providers are never invoked. A
-// source-owned synchronous publisher may still accidentally return a normal
-// Promise; both settlement paths are consumed without sending a late response.
-// Caller-owned thenables are rejected without assimilation.
+// Post-mount prototype replacement is ignored because the handler owns the
+// private attestation closure. Rejected-Promise factories on unrecognized
+// providers are never invoked, so constructor/species access and unhandled
+// rejection events remain at zero.
 (async () => {
-  const secret = "ASYNC-SNAPSHOT-SECRET /private/provider/path";
+  const secret = "PRIVATE_ASYNC /private/provider";
   const unhandled = [];
   const handledLate = [];
-  const onUnhandled = (reason) => { unhandled.push(reason); };
-  const onHandledLate = (promise) => { handledLate.push(promise); };
+  const onUnhandled = (reason) => unhandled.push(reason);
+  const onHandledLate = (promise) => handledLate.push(promise);
   process.on("unhandledRejection", onUnhandled);
   process.on("rejectionHandled", onHandledLate);
+  const originalSnapshot = ResourceRuntimeOwner.prototype.snapshot;
   try {
-    let asyncCalls = 0;
-    const rejected = invoke({ async snapshot() { asyncCalls += 1; throw new Error(secret); } });
-    assertUnavailable(rejected);
-    assert.equal(asyncCalls, 0, "AsyncFunction providers fail before invocation");
-
-    for (const snapshot of [
-      (async function boundAsyncSnapshot() { asyncCalls += 1; throw new Error(secret); }).bind(null),
-      new Proxy(async function proxiedAsyncSnapshot() { asyncCalls += 1; throw new Error(secret); }, {}),
-      Object.freeze(async function frozenAsyncSnapshot() { asyncCalls += 1; throw new Error(secret); }),
-    ]) {
-      assertUnavailable(invoke({ snapshot }));
-    }
-    assert.equal(asyncCalls, 0, "bound, proxied, and frozen AsyncFunctions also fail before invocation");
-
-    const lateResolve = deferred();
-    const resolvedResponse = invoke({ snapshot() { return lateResolve.promise; } });
-    const resolvedBody = resolvedResponse.body;
-    lateResolve.resolve(candidateSnapshot());
-
-    const lateReject = deferred();
-    const rejectedResponse = invoke({ snapshot() { return lateReject.promise; } });
-    const rejectedBody = rejectedResponse.body;
-    lateReject.reject(new Error(secret));
-
-    let nativeThenGetterCalls = 0;
-    const accessorPromise = Promise.reject(new Error(secret));
-    Object.defineProperty(accessorPromise, "then", {
-      configurable: true,
-      get() {
-        nativeThenGetterCalls += 1;
-        throw new Error(secret);
-      },
-    });
-    const accessorPromiseResponse = invoke({ snapshot() { return accessorPromise; } });
-
-    const frozenPromise = Object.freeze(Promise.reject(new Error(secret)));
-    const frozenPromiseResponse = invoke({ snapshot() { return frozenPromise; } });
-
-    const normalRejectedPromise = Promise.reject(new Error(secret));
-    const normalFunctionPromiseResponse = invoke({ snapshot: function snapshot() {
-      return normalRejectedPromise;
-    } });
-
-    let thenCalls = 0;
-    let thenableMutations = 0;
-    const customThenable = {
-      then() {
-        thenCalls += 1;
-        thenableMutations += 1;
-        throw new Error(secret);
-      },
+    const owner = missingConfigOwner();
+    const { handler } = mount(owner);
+    let replacementCalls = 0;
+    ResourceRuntimeOwner.prototype.snapshot = function hostileReplacement() {
+      replacementCalls += 1;
+      return Promise.reject(new Error(secret));
     };
-    const customResponse = invoke({ snapshot() { return customThenable; } });
+    const response = invoke(handler);
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.status, "invalid_resource_policy");
+    assert.equal(replacementCalls, 0);
 
-    let accessorCalls = 0;
-    const accessorThenable = {};
-    Object.defineProperty(accessorThenable, "then", {
-      enumerable: true,
-      get() {
-        accessorCalls += 1;
-        throw new Error(secret);
-      },
-    });
-    const accessorResponse = invoke({ snapshot() { return accessorThenable; } });
-
-    const hostileProxy = new Proxy({}, {
-      getOwnPropertyDescriptor() { throw new Error(secret); },
-      getPrototypeOf() { throw new Error(secret); },
-    });
-    const proxyResponse = invoke({ snapshot() { return hostileProxy; } });
-    const revoked = Proxy.revocable({}, {});
-    revoked.revoke();
-    const revokedResponse = invoke({ snapshot() { return revoked.proxy; } });
-
-    // A rejected Promise whose constructor or species lookup throws cannot be
-    // consumed after the fact without mutating it. Such providers stay outside
-    // the private publisher brand, so HTTP never invokes them or creates their
-    // hostile Promise in the first place.
-    let constructorProviderCalls = 0;
-    let constructorGetterCalls = 0;
+    const calls = { provider: 0, constructor: 0, species: 0 };
     const constructorProvider = {
       snapshot() {
-        constructorProviderCalls += 1;
+        calls.provider += 1;
         const promise = Promise.reject(new Error(secret));
         Object.defineProperty(promise, "constructor", {
-          get() {
-            constructorGetterCalls += 1;
-            throw new Error(secret);
-          },
+          get() { calls.constructor += 1; throw new Error(secret); },
         });
         return promise;
       },
     };
-    const constructorResponse = new FakeResponse();
-    createResourceHttpHandler(constructorProvider)(request(), constructorResponse);
-
-    let speciesProviderCalls = 0;
-    let speciesGetterCalls = 0;
     const speciesProvider = {
       snapshot() {
-        speciesProviderCalls += 1;
-        const promise = Promise.reject(new Error(secret));
-        Object.defineProperty(promise, "constructor", {
-          value: Object.defineProperty({}, Symbol.species, {
-            get() {
-              speciesGetterCalls += 1;
-              throw new Error(secret);
-            },
-          }),
+        calls.provider += 1;
+        const constructor = Object.defineProperty({}, Symbol.species, {
+          get() { calls.species += 1; throw new Error(secret); },
         });
+        const promise = Promise.reject(new Error(secret));
+        Object.defineProperty(promise, "constructor", { value: constructor });
         return promise;
       },
     };
-    const speciesResponse = new FakeResponse();
-    createResourceHttpHandler(speciesProvider)(request(), speciesResponse);
-
-    let revokedProviderCalls = 0;
-    const revokedProvider = Proxy.revocable({
-      snapshot() {
-        revokedProviderCalls += 1;
-        return Promise.reject(new Error(secret));
-      },
-    }, {});
-    revokedProvider.revoke();
-    const revokedProviderResponse = new FakeResponse();
-    createResourceHttpHandler(revokedProvider.proxy)(request(), revokedProviderResponse);
+    for (const provider of [
+      constructorProvider,
+      speciesProvider,
+      { async snapshot() { calls.provider += 1; throw new Error(secret); } },
+      { snapshot() { calls.provider += 1; return Promise.reject(new Error(secret)); } },
+    ]) {
+      assert.throws(
+        () => registerResourceHttp(fakeApp(), provider),
+        (error) => error.code === "QW_RESOURCE_OWNER_INVALID",
+      );
+      assertUnavailable(invoke(createResourceHttpHandler(provider)));
+    }
 
     await settleUnhandledTurn();
+    assert.deepEqual(calls, { provider: 0, constructor: 0, species: 0 });
     assert.deepEqual(unhandled, []);
     assert.deepEqual(handledLate, []);
-    assert.equal(nativeThenGetterCalls, 0, "native Promise consumption bypasses hostile own then accessors");
-    assert.equal(thenCalls, 0, "caller-owned thenables are identified without assimilation");
-    assert.equal(thenableMutations, 0);
-    assert.equal(accessorCalls, 0, "then accessors are rejected without invocation");
-    assert.equal(constructorProviderCalls, 0);
-    assert.equal(constructorGetterCalls, 0);
-    assert.equal(speciesProviderCalls, 0);
-    assert.equal(speciesGetterCalls, 0);
-    assert.equal(revokedProviderCalls, 0);
-    for (const [response, originalBody] of [
-      [rejected, rejected.body],
-      [resolvedResponse, resolvedBody],
-      [rejectedResponse, rejectedBody],
-      [accessorPromiseResponse, accessorPromiseResponse.body],
-      [frozenPromiseResponse, frozenPromiseResponse.body],
-      [normalFunctionPromiseResponse, normalFunctionPromiseResponse.body],
-      [customResponse, customResponse.body],
-      [accessorResponse, accessorResponse.body],
-      [proxyResponse, proxyResponse.body],
-      [revokedResponse, revokedResponse.body],
-      [constructorResponse, constructorResponse.body],
-      [speciesResponse, speciesResponse.body],
-      [revokedProviderResponse, revokedProviderResponse.body],
-    ]) {
-      assertUnavailable(response);
-      assert.equal(response.jsonCalls, 1);
-      assert.equal(response.body, originalBody, "late settlement cannot replace the sent body");
-      assert.equal(JSON.stringify(response.body).includes(secret), false);
-    }
+    assert.equal(response.jsonCalls, 1);
+    assert.equal(JSON.stringify(response.body).includes(secret), false);
   } finally {
+    ResourceRuntimeOwner.prototype.snapshot = originalSnapshot;
     process.removeListener("unhandledRejection", onUnhandled);
     process.removeListener("rejectionHandled", onHandledLate);
   }

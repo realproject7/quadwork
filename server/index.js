@@ -17,6 +17,7 @@ const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectM
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
+const { registerResourceHttp } = require("./resource-http");
 
 const net = require("net");
 const crypto = require("crypto");
@@ -81,7 +82,7 @@ const resourceRuntimeOwner = createResourceRuntimeOwner();
 // All other routes are well within 10mb in practice; this is the
 // least invasive fix and matches the documented import ceiling.
 app.use(express.json({ limit: "10mb" }));
-resourceRuntimeOwner.register(app);
+registerResourceHttp(app, resourceRuntimeOwner);
 
 // --- Mount migrated API routes (from Next.js) ---
 app.use(routes);

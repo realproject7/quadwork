@@ -5,6 +5,7 @@ const {
   createResourceSnapshot,
 } = require("./resource-state");
 const { types: utilTypes } = require("node:util");
+const { captureResourceRuntimeOwner } = require("./resource-runtime-owner");
 
 const RESOURCE_HTTP_PATH = "/api/resources";
 const MAX_RESOURCE_HTTP_BYTES = 1024 * 1024;
@@ -53,6 +54,8 @@ const UINT64_RE = /^(?:0|[1-9]\d{0,19})$/;
 const UINT64_MAX = (1n << 64n) - 1n;
 const ASYNC_FUNCTION_PROTOTYPE = Reflect.getPrototypeOf(async function resourceHttpAsyncMarker() {});
 const RESOURCE_HTTP_PUBLISHERS = new WeakMap();
+const RESOURCE_HTTP_REGISTRATIONS = new WeakMap();
+const RESOURCE_HTTP_APPS = new WeakMap();
 
 const ERROR_RESPONSES = Object.freeze({
   method: Object.freeze({
@@ -110,15 +113,15 @@ function isDetectableAsyncFunction(value) {
   }
 }
 
-function createResourceHttpPublisher(runtimeService) {
-  const method = dataMethod(runtimeService, "snapshot");
+function createResourceHttpPublisher(ownerAttestation) {
+  const method = dataMethod(ownerAttestation, "snapshot");
   // HTTP is a strictly synchronous, server-owned publication boundary. An
   // AsyncFunction necessarily creates a Promise before its result can be
   // rejected. Refuse it before invocation so even a sabotaged native Promise
   // cannot escape as an unhandled rejection.
   const snapshot = method !== null && !isDetectableAsyncFunction(method) ? method : null;
   const publisher = Object.freeze(Object.create(null));
-  RESOURCE_HTTP_PUBLISHERS.set(publisher, Object.freeze({ runtimeService, snapshot }));
+  RESOURCE_HTTP_PUBLISHERS.set(publisher, Object.freeze({ ownerAttestation, snapshot }));
   return publisher;
 }
 
@@ -392,6 +395,12 @@ function boundedRuntimeSnapshot(value) {
   return captured;
 }
 
+// Authority-free schema capture for diagnostics and boundary tests. This does
+// not publish, invoke a provider, or mint a RESOURCE_HTTP_PUBLISHERS entry.
+function captureResourceHttpSnapshot(value) {
+  return boundedRuntimeSnapshot(value);
+}
+
 function requestHasBody(request) {
   const body = safeGet(request, "body");
   if (body === INVALID) return true;
@@ -438,7 +447,7 @@ function createResourceHttpHandler(resourcePublisher) {
     try {
       result = publisher === null || publisher.snapshot === null
         ? null
-        : Reflect.apply(publisher.snapshot, publisher.runtimeService, []);
+        : Reflect.apply(publisher.snapshot, publisher.ownerAttestation, []);
     } catch {
       result = null;
     }
@@ -450,20 +459,40 @@ function createResourceHttpHandler(resourcePublisher) {
   };
 }
 
-function registerResourceHttp(app, runtimeService) {
+function registrationError() {
+  const error = new Error("resource HTTP endpoint is already registered");
+  error.name = "ResourceHttpRegistrationError";
+  error.code = "QW_RESOURCE_HTTP_ALREADY_REGISTERED";
+  return error;
+}
+
+function registerResourceHttp(app, runtimeOwner) {
   const get = dataMethod(app, "get");
   if (get === null) throw new TypeError("app.get must be a function");
-  // This mount is the sole production branding point. Its runtime service is
-  // supplied by the server owner during startup, never by an HTTP caller.
-  const publisher = createResourceHttpPublisher(runtimeService);
+  // Owner attestation is minted only after the owner module recognizes its
+  // private WeakMap state. Plain lookalikes, functions, and proxies cannot turn
+  // the exported registrar into a publisher-brand oracle.
+  const ownerAttestation = captureResourceRuntimeOwner(runtimeOwner);
+  const existing = RESOURCE_HTTP_REGISTRATIONS.get(runtimeOwner);
+  if (existing) {
+    if (existing.app !== app) throw registrationError();
+    return existing.handler;
+  }
+  const appOwner = RESOURCE_HTTP_APPS.get(app);
+  if (appOwner && appOwner !== runtimeOwner) throw registrationError();
+
+  const publisher = createResourceHttpPublisher(ownerAttestation);
   const handler = createResourceHttpHandler(publisher);
   Reflect.apply(get, app, [RESOURCE_HTTP_PATH, handler]);
+  RESOURCE_HTTP_REGISTRATIONS.set(runtimeOwner, Object.freeze({ app, handler }));
+  RESOURCE_HTTP_APPS.set(app, runtimeOwner);
   return handler;
 }
 
 module.exports = {
   RESOURCE_HTTP_PATH,
   MAX_RESOURCE_HTTP_BYTES,
+  captureResourceHttpSnapshot,
   createResourceHttpHandler,
   registerResourceHttp,
 };
