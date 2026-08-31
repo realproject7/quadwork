@@ -176,8 +176,25 @@ async function main() {
   const normal = await normalController.runWorkerScope(workerSpec());
   ok(normal.fact.reason === "normal_exit" && normal.fact.exit_code === 0 && queryCalls === 1,
     "normal worker exit is project/generation qualified and scope-query backed");
-  assert.equal(normal.last_cgroup_oom.oom_kill_count, "0");
+  assert.equal(normal.cgroup_oom_observation.oom_kill_count, "0");
   assert.equal(normalController.snapshot().last_cgroup_oom.oom_kill_count, "0");
+
+  let releaseIsoExecution;
+  const isoTimes = ["2026-08-31T09:00:00+09:00", "2026-08-31T09:00:01+09:00"];
+  const isoController = new ResourceController({
+    executeProcess: async () => new Promise((resolve) => {
+      releaseIsoExecution = () => resolve({ code: 0, signal: null });
+    }),
+    queryScope: noOom,
+    now: () => isoTimes.shift(),
+  });
+  const isoRun = isoController.runWorkerScope(workerSpec());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(isoController.snapshot().active_scopes[0].started_at, "2026-08-31T00:00:00.000Z");
+  releaseIsoExecution();
+  const isoResult = await isoRun;
+  assert.equal(isoResult.fact.finished_at, "2026-08-31T00:00:01.000Z");
+  ok(true, "started and finished timestamps cross the controller boundary as canonical ISO values");
 
   const signalController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: "SIGTERM" }),
@@ -195,6 +212,46 @@ async function main() {
   ok(numericSignal.fact.reason === "signal" && numericSignal.fact.signal === 15,
     "numeric node-pty signals are preserved instead of being normalized away");
 
+  for (const [index, invalidSignal] of [
+    "TERM", "sigterm", "SIG", "SIGTERM!", `SIG${"A".repeat(31)}`,
+    0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, undefined,
+  ].entries()) {
+    const invalidSignalController = new ResourceController({
+      executeProcess: async () => ({ code: null, signal: invalidSignal }),
+      queryScope: noOom,
+    });
+    const invalidSignalResult = await invalidSignalController.runWorkerScope(workerSpec({
+      generationId: `invalid-signal-${index}`,
+      unitName: `qw-worker-invalid-signal-${index}`,
+    }));
+    assert.equal(invalidSignalResult.fact.reason, "unknown");
+    assert.equal(invalidSignalResult.fact.signal, null);
+  }
+  ok(true, "signals outside the state-compatible name/integer boundary become null unknown facts");
+
+  for (const [index, invalidCode] of [
+    -1, 256, 1.5, Number.MAX_SAFE_INTEGER + 1, "0", undefined,
+  ].entries()) {
+    const invalidCodeController = new ResourceController({
+      executeProcess: async () => ({ code: invalidCode, signal: null }),
+      queryScope: noOom,
+    });
+    const invalidCodeResult = await invalidCodeController.runWorkerScope(workerSpec({
+      generationId: `invalid-exit-${index}`,
+      unitName: `qw-worker-invalid-exit-${index}`,
+    }));
+    assert.equal(invalidCodeResult.fact.reason, "unknown");
+    assert.equal(invalidCodeResult.fact.exit_code, null);
+  }
+  const exit255Controller = new ResourceController({
+    executeProcess: async () => ({ code: 255, signal: null }),
+    queryScope: noOom,
+  });
+  const exit255 = await exit255Controller.runWorkerScope(workerSpec());
+  assert.equal(exit255.fact.reason, "unknown");
+  assert.equal(exit255.fact.exit_code, 255);
+  ok(true, "exit codes normalize once to null or the inclusive safe 0..255 range");
+
   const oomController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: "SIGKILL" }),
     queryScope: async () => observation(1, {
@@ -205,7 +262,7 @@ async function main() {
   const oom = await oomController.runWorkerScope(workerSpec());
   ok(oom.fact.reason === "oom_kill" && oom.fact.signal === "SIGKILL",
     "confirmed cgroup OOM wins classification without dropping its signal");
-  assert.deepEqual(oom.last_cgroup_oom, {
+  assert.deepEqual(oom.cgroup_oom_observation, {
     project_id: "quadwork",
     generation_id: "gen-7",
     resource_class: "worker",
@@ -213,9 +270,20 @@ async function main() {
     oom_kill_count: "1",
     observed_at: "2026-08-31T00:30:00.000Z",
   });
-  assert.deepEqual(oomController.snapshot().last_cgroup_oom, oom.last_cgroup_oom);
+  assert.deepEqual(oomController.snapshot().last_cgroup_oom, oom.cgroup_oom_observation);
   ok(!JSON.stringify(oomController.snapshot()).includes("must-not-survive-normalization"),
     "qualified OOM provenance maps directly to resource-state without injected-field leakage");
+
+  const invalidTerminalOomController = new ResourceController({
+    executeProcess: async () => ({ code: 999, signal: "KILL" }),
+    queryScope: async () => observation(1),
+  });
+  const invalidTerminalOom = await invalidTerminalOomController.runWorkerScope(workerSpec());
+  assert.equal(invalidTerminalOom.fact.reason, "unknown");
+  assert.equal(invalidTerminalOom.fact.exit_code, null);
+  assert.equal(invalidTerminalOom.fact.signal, null);
+  assert.equal(invalidTerminalOom.cgroup_oom_observation.oom_kill_count, "1");
+  ok(true, "valid OOM evidence cannot override invalid terminal metadata");
 
   const unknownController = new ResourceController({
     executeProcess: async () => ({ code: 17, signal: null }),
@@ -298,8 +366,8 @@ async function main() {
   ok(durable.fact.reason === "oom_kill" && durable.fact.signal === "SIGKILL" &&
      durableQueryCalls === 0,
     "durable pre-collect observation wins and skips the post-exit query fallback");
-  assert.equal(durable.last_cgroup_oom.oom_kill_count, "1");
-  assert.equal(durable.last_cgroup_oom.observed_at, "2026-08-30T23:59:59.000Z");
+  assert.equal(durable.cgroup_oom_observation.oom_kill_count, "1");
+  assert.equal(durable.cgroup_oom_observation.observed_at, "2026-08-30T23:59:59.000Z");
 
   let unmarkedFallbackCalls = 0;
   const unmarkedDurableController = new ResourceController({
@@ -351,8 +419,8 @@ async function main() {
   const invalidTimeFallback = await invalidTimeController.runWorkerScope(workerSpec());
   assert.equal(invalidTimeFallbackCalls, 1);
   assert.equal(invalidTimeFallback.fact.reason, "oom_kill");
-  assert.equal(invalidTimeFallback.last_cgroup_oom.oom_kill_count, "3");
-  assert.equal(invalidTimeFallback.last_cgroup_oom.observed_at, "2026-08-31T03:04:05.000Z");
+  assert.equal(invalidTimeFallback.cgroup_oom_observation.oom_kill_count, "3");
+  assert.equal(invalidTimeFallback.cgroup_oom_observation.observed_at, "2026-08-31T03:04:05.000Z");
   ok(true, "a durable observation with invalid time has no authority and uses the validated fallback");
 
   const hugeCounter = (1n << 64n) - 1n;
@@ -362,7 +430,7 @@ async function main() {
   });
   const huge = await hugeController.runWorkerScope(workerSpec());
   assert.equal(huge.fact.reason, "oom_kill");
-  assert.equal(huge.last_cgroup_oom.oom_kill_count, "18446744073709551615");
+  assert.equal(huge.cgroup_oom_observation.oom_kill_count, "18446744073709551615");
   assert.doesNotThrow(() => JSON.stringify(hugeController.snapshot()));
   ok(true, "the full uint64 OOM counter survives output and snapshot JSON without precision loss");
 
@@ -381,7 +449,7 @@ async function main() {
   const hostileTimeResult = await hostileTimeController.runWorkerScope(workerSpec());
   assert.equal(hostileTimeFallbackCalls, 1);
   assert.equal(hostileTimeResult.fact.reason, "signal");
-  assert.equal(hostileTimeResult.last_cgroup_oom.oom_kill_count, "0");
+  assert.equal(hostileTimeResult.cgroup_oom_observation.oom_kill_count, "0");
   assert.ok(!JSON.stringify(hostileTimeController.snapshot()).includes("HOSTILE-TIME-MUST-NOT-LEAK"));
   ok(true, "hostile observation getters fail closed, fall back, and do not leak their errors");
 
@@ -415,10 +483,33 @@ async function main() {
   });
   const invalidFallbackTime = await invalidFallbackTimeController.runWorkerScope(workerSpec());
   assert.equal(invalidFallbackTime.fact.reason, "signal");
-  assert.equal(invalidFallbackTime.last_cgroup_oom, null);
+  assert.equal(invalidFallbackTime.cgroup_oom_observation, null);
   assert.equal(invalidFallbackTimeController.snapshot().last_cgroup_oom, null);
   assert.ok(!JSON.stringify(invalidFallbackTimeController.snapshot()).includes("PRIVATE-OBSERVATION-DETAIL"));
   ok(true, "an invalid fallback timestamp cannot authorize or emit OOM provenance");
+
+  const retainedObservationController = new ResourceController({
+    executeProcess: async ({ generationId }) => generationId === "global-g1"
+      ? { code: null, signal: "SIGKILL" }
+      : { code: 0, signal: null },
+    queryScope: async ({ generationId }) => generationId === "global-g1"
+      ? observation(4)
+      : { oomKillCount: 9, observedAt: "invalid" },
+  });
+  const globalG1 = await retainedObservationController.runWorkerScope(workerSpec({
+    generationId: "global-g1",
+    unitName: "qw-worker-global-g1",
+  }));
+  const globalG2 = await retainedObservationController.runWorkerScope(workerSpec({
+    generationId: "global-g2",
+    unitName: "qw-worker-global-g2",
+  }));
+  assert.equal(globalG1.cgroup_oom_observation.generation_id, "global-g1");
+  assert.equal(globalG2.cgroup_oom_observation, null);
+  assert.equal(Object.hasOwn(globalG2, "last_cgroup_oom"), false);
+  assert.equal(retainedObservationController.snapshot().last_cgroup_oom.generation_id, "global-g1");
+  assert.equal(retainedObservationController.snapshot().last_cgroup_oom.oom_kill_count, "4");
+  ok(true, "current observation output is distinct from the retained latest global provenance");
 
   const rawResultFlagController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: "SIGKILL", oomKilled: true }),
@@ -447,7 +538,49 @@ async function main() {
      rawErrorFlagController.snapshot().control_children.active === 0,
     "a raw executor-error OOM flag remains unknown and releases its permit");
 
+  const terminalGetterSecret = "TERMINAL-GETTER-MUST-NOT-LEAK";
+  const hostileSuccessResult = { scopeObservation: null };
+  Object.defineProperties(hostileSuccessResult, {
+    code: { get() { throw new Error(terminalGetterSecret); } },
+    signal: { get() { throw new Error(terminalGetterSecret); } },
+  });
+  const hostileSuccessController = new ResourceController({
+    executeProcess: async () => hostileSuccessResult,
+    queryScope: noOom,
+  });
+  const hostileSuccess = await hostileSuccessController.runWorkerScope(workerSpec());
+  assert.equal(hostileSuccess.result, hostileSuccessResult);
+  assert.equal(hostileSuccess.fact.reason, "unknown");
+  assert.equal(hostileSuccess.fact.exit_code, null);
+  assert.equal(hostileSuccess.fact.signal, null);
+  assert.ok(!JSON.stringify(hostileSuccessController.snapshot()).includes(terminalGetterSecret));
+
+  const hostileTerminalError = new Error("original executor failure");
+  Object.defineProperties(hostileTerminalError, {
+    exitCode: { get() { throw new Error(terminalGetterSecret); } },
+    signal: { get() { throw new Error(terminalGetterSecret); } },
+    scopeObservation: { value: observation(1, { capturedBeforeCollect: true }) },
+  });
+  const hostileTerminalErrorController = new ResourceController({
+    executeProcess: async () => { throw hostileTerminalError; },
+    queryScope: async () => { throw new Error("durable observation should skip fallback"); },
+  });
+  let preservedHostileError;
+  try {
+    await hostileTerminalErrorController.runWorkerScope(workerSpec());
+  } catch (error) {
+    preservedHostileError = error;
+  }
+  assert.equal(preservedHostileError, hostileTerminalError);
+  assert.equal(preservedHostileError.resourceFact.reason, "unknown");
+  assert.equal(preservedHostileError.resourceFact.exit_code, null);
+  assert.equal(preservedHostileError.resourceFact.signal, null);
+  assert.equal(preservedHostileError.cgroup_oom_observation.oom_kill_count, "1");
+  assert.ok(!JSON.stringify(hostileTerminalErrorController.snapshot()).includes(terminalGetterSecret));
+  ok(true, "hostile success/Error terminal getters normalize to null without replacing or leaking the original Error");
+
   const rejectedOomError = new Error("PRIVATE-EXECUTOR-FAILURE");
+  rejectedOomError.exitCode = null;
   rejectedOomError.signal = "SIGKILL";
   rejectedOomError.scopeObservation = observation("18446744073709551615", {
     capturedBeforeCollect: true,
@@ -464,8 +597,8 @@ async function main() {
   }
   assert.equal(rejectedOom, rejectedOomError);
   assert.equal(rejectedOom.resourceFact.reason, "oom_kill");
-  assert.equal(rejectedOom.last_cgroup_oom.oom_kill_count, "18446744073709551615");
-  assert.deepEqual(rejectedOomController.snapshot().last_cgroup_oom, rejectedOom.last_cgroup_oom);
+  assert.equal(rejectedOom.cgroup_oom_observation.oom_kill_count, "18446744073709551615");
+  assert.deepEqual(rejectedOomController.snapshot().last_cgroup_oom, rejectedOom.cgroup_oom_observation);
   assert.ok(!JSON.stringify(rejectedOomController.snapshot()).includes("PRIVATE-EXECUTOR-FAILURE"));
   ok(true, "a rejected execution carries validated durable provenance without leaking its error text");
 
@@ -516,6 +649,59 @@ async function main() {
      hostileErrorController.snapshot().active_scopes.length === 0 &&
      hostileErrorController.snapshot().control_children.active === 0,
     "a hostile error observation getter preserves the original failure and releases state and permit");
+
+  const timestampSecret = "TIMESTAMP-TOSTRING-MUST-NOT-RUN";
+  const nonIsoStartController = new ResourceController({
+    executeProcess: async () => ({ code: 0, signal: null }),
+    queryScope: noOom,
+    now: () => "August 31, 2026",
+  });
+  await assert.rejects(nonIsoStartController.runWorkerScope(workerSpec()), (error) =>
+    error?.code === "QW_INVALID_RESOURCE_TIMESTAMP" && error?.field === "started_at");
+
+  let invalidStartExecuteCalls = 0;
+  const invalidStartController = new ResourceController({
+    executeProcess: async () => {
+      invalidStartExecuteCalls += 1;
+      return { code: 0, signal: null };
+    },
+    queryScope: noOom,
+    now: () => ({ toString() { throw new Error(timestampSecret); } }),
+  });
+  let invalidStartError;
+  try {
+    await invalidStartController.runWorkerScope(workerSpec());
+  } catch (error) {
+    invalidStartError = error;
+  }
+  assert.equal(invalidStartError?.code, "QW_INVALID_RESOURCE_TIMESTAMP");
+  assert.equal(invalidStartError?.field, "started_at");
+  assert.ok(!invalidStartError.message.includes(timestampSecret));
+  assert.equal(invalidStartExecuteCalls, 0);
+  assert.equal(invalidStartController.snapshot().active_scopes.length, 0);
+
+  let invalidFinishClockCalls = 0;
+  const invalidFinishController = new ResourceController({
+    executeProcess: async () => ({ code: 0, signal: null }),
+    queryScope: noOom,
+    now: () => {
+      invalidFinishClockCalls += 1;
+      return invalidFinishClockCalls === 1 ? OBSERVED_AT : { private: timestampSecret };
+    },
+  });
+  let invalidFinishError;
+  try {
+    await invalidFinishController.runControlChild(controlSpec("bad-time"));
+  } catch (error) {
+    invalidFinishError = error;
+  }
+  assert.equal(invalidFinishError?.code, "QW_INVALID_RESOURCE_TIMESTAMP");
+  assert.equal(invalidFinishError?.field, "finished_at");
+  assert.equal(invalidFinishController.snapshot().active_scopes.length, 0);
+  assert.equal(invalidFinishController.snapshot().control_children.active, 0);
+  assert.equal(invalidFinishController.snapshot().terminal_facts.length, 0);
+  assert.ok(!JSON.stringify(invalidFinishController.snapshot()).includes(timestampSecret));
+  ok(true, "invalid timestamp values fail closed with typed redacted errors and release active state");
 
   let factClockCalls = 0;
   const terminalThrowController = new ResourceController({
@@ -624,6 +810,7 @@ async function main() {
         signal.addEventListener("abort", () => {
           const error = new Error("cancelled");
           error.name = "AbortError";
+          error.exitCode = null;
           error.signal = "SIGTERM";
           reject(error);
         }, { once: true });

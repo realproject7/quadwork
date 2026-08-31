@@ -22,8 +22,11 @@ const SYSTEMD_CONTROL_CLASS_CANDIDATE = Object.freeze({
 const UNIT_NAME_RE = /^[a-z][a-z0-9-]{0,62}$/;
 const CONTROL_CLASS_NAME_RE = /^[a-z][a-z0-9-]{0,62}\.slice$/;
 const QUALIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const SIGNAL_RE = /^SIG[A-Z0-9]{1,30}$/;
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 const DEFAULT_CONTROL_CLASS_NAME = "quadwork-control.slice";
 const MAX_OOM_KILL_COUNT = (1n << 64n) - 1n;
+const UNREADABLE = Symbol("unreadable resource process field");
 
 function invalid(field, detail) {
   const error = new Error(`${field} ${detail}`);
@@ -240,19 +243,52 @@ class LeafChildLimiter {
   }
 }
 
-function timestamp(now) {
-  const value = now();
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value === "number") return new Date(value).toISOString();
-  return String(value);
+function timestamp(now, field) {
+  const normalized = normalizeObservedAt(now());
+  if (normalized !== null) return normalized;
+  const error = new Error(`${field} must be a valid timestamp`);
+  error.code = "QW_INVALID_RESOURCE_TIMESTAMP";
+  error.field = field;
+  throw error;
 }
 
 function normalizeSignal(value) {
-  if (typeof value === "string" && value) return value;
+  if (value === null) return Object.freeze({ valid: true, value: null });
+  if (typeof value === "string" && SIGNAL_RE.test(value)) {
+    return Object.freeze({ valid: true, value });
+  }
   // node-pty reports numeric signals while child_process reports names such as
   // SIGTERM. Preserve either representation for the later #1053 adapter.
-  if (Number.isSafeInteger(value) && value > 0) return value;
-  return null;
+  if (Number.isSafeInteger(value) && value > 0) {
+    return Object.freeze({ valid: true, value });
+  }
+  return Object.freeze({ valid: false, value: null });
+}
+
+function normalizeExitCode(value) {
+  if (value === null) return Object.freeze({ valid: true, value: null });
+  if (Number.isSafeInteger(value) && value >= 0 && value <= 255) {
+    return Object.freeze({ valid: true, value });
+  }
+  return Object.freeze({ valid: false, value: null });
+}
+
+function safeProperty(value, key) {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return UNREADABLE;
+  try {
+    return value[key];
+  } catch {
+    return UNREADABLE;
+  }
+}
+
+function normalizeProcessResult(value, exitCodeField = "code") {
+  const exitCode = safeProperty(value, exitCodeField);
+  const signal = safeProperty(value, "signal");
+  return Object.freeze({
+    exitCode: normalizeExitCode(exitCode === UNREADABLE ? undefined : exitCode),
+    signal: normalizeSignal(signal === UNREADABLE ? undefined : signal),
+  });
 }
 
 function normalizeOomKillCount(value) {
@@ -272,8 +308,10 @@ function normalizeObservedAt(value) {
   try {
     let millis;
     if (value instanceof Date) millis = value.getTime();
-    else if (typeof value === "number") millis = value;
-    else if (typeof value === "string" && value.length <= 64) millis = Date.parse(value);
+    else if (Number.isSafeInteger(value)) millis = value;
+    else if (typeof value === "string" && value.length <= 64 && ISO_TIMESTAMP_RE.test(value)) {
+      millis = Date.parse(value);
+    }
     else return null;
     if (!Number.isFinite(millis)) return null;
     return new Date(millis).toISOString();
@@ -316,40 +354,45 @@ function qualifyScopeObservation(ids, resourceClass, scopeObservation) {
   });
 }
 
-function terminalReason(result, scopeObservation, executionRejected = false) {
+function terminalReason(processResult, scopeObservation, executionRejected = false) {
   const count = scopeObservation && scopeObservation.oomKillCount;
+  if (!processResult.exitCode.valid || !processResult.signal.valid) return "unknown";
   if (typeof count === "string" && BigInt(count) > 0n) return "oom_kill";
-  if (normalizeSignal(result?.signal) !== null) return "signal";
-  if (!executionRejected && result?.code === 0) return "normal_exit";
+  if (processResult.signal.value !== null) return "signal";
+  if (!executionRejected && processResult.exitCode.value === 0) return "normal_exit";
   return "unknown";
 }
 
-function terminalFact({ ids, resourceClass, result, scopeObservation, executionRejected, now }) {
-  const reason = terminalReason(result, scopeObservation, executionRejected);
+function terminalFact({ ids, resourceClass, processResult, scopeObservation, executionRejected, now }) {
+  const reason = terminalReason(processResult, scopeObservation, executionRejected);
   return {
     project_id: ids.projectId,
     generation_id: ids.generationId,
     resource_class: resourceClass,
     unit_name: ids.unitName,
     reason,
-    exit_code: Number.isInteger(result?.code) ? result.code : null,
-    signal: normalizeSignal(result?.signal),
-    finished_at: timestamp(now),
+    exit_code: processResult.exitCode.value,
+    signal: processResult.signal.value,
+    finished_at: timestamp(now, "finished_at"),
   };
 }
 
 function durableScopeObservation(value) {
-  let observation;
-  try {
-    observation = value && value.scopeObservation;
-  } catch {
-    return null;
-  }
+  const observation = safeProperty(value, "scopeObservation");
+  if (observation === UNREADABLE) return null;
   return normalizeScopeObservation(observation, true);
 }
 
-function executionRejectionError(value) {
-  if (value instanceof Error) return value;
+function isError(value) {
+  try {
+    return value instanceof Error;
+  } catch {
+    return false;
+  }
+}
+
+function executionRejectionError(value, valueIsError) {
+  if (valueIsError) return value;
   const error = new Error("resource process execution rejected with a non-Error value");
   error.name = "ResourceExecutionError";
   error.code = "QW_RESOURCE_EXECUTION_REJECTED";
@@ -467,7 +510,7 @@ class ResourceController {
             swap_max_mib: limits.swapMaxMib,
           } }
         : { control_class: controlClassName }),
-      started_at: timestamp(this.now),
+      started_at: timestamp(this.now, "started_at"),
     });
 
     try {
@@ -475,6 +518,7 @@ class ResourceController {
       let executionError = null;
       let executionRejected = false;
       let scopeObservation = null;
+      let processResult;
       try {
         result = await this.executeProcess({
           file: built.file,
@@ -486,20 +530,20 @@ class ResourceController {
           resourceClass,
           controlClassName: resourceClass === "control" ? controlClassName : null,
         });
+        processResult = normalizeProcessResult(result);
         scopeObservation = durableScopeObservation(result);
       } catch (rejectedValue) {
         executionRejected = true;
-        executionError = executionRejectionError(rejectedValue);
-        if (rejectedValue instanceof Error) {
-          result = {
-            code: Number.isInteger(rejectedValue.exitCode) ? rejectedValue.exitCode : null,
-            signal: normalizeSignal(rejectedValue.signal),
-          };
+        const rejectedValueIsError = isError(rejectedValue);
+        executionError = executionRejectionError(rejectedValue, rejectedValueIsError);
+        if (rejectedValueIsError) {
+          processResult = normalizeProcessResult(rejectedValue, "exitCode");
           scopeObservation = durableScopeObservation(rejectedValue);
         } else {
           // Do not inspect, stringify, retain, or expose arbitrary rejected
           // values. They may contain credentials or terminal/process output.
           result = { code: null, signal: null };
+          processResult = normalizeProcessResult(result);
           scopeObservation = null;
         }
       }
@@ -520,7 +564,7 @@ class ResourceController {
       const fact = terminalFact({
         ids,
         resourceClass,
-        result,
+        processResult,
         scopeObservation,
         executionRejected,
         now: this.now,
@@ -532,13 +576,13 @@ class ResourceController {
 
       if (executionRejected) {
         executionError.resourceFact = { ...fact };
-        executionError.last_cgroup_oom = oomProvenance === null ? null : { ...oomProvenance };
+        executionError.cgroup_oom_observation = oomProvenance === null ? null : { ...oomProvenance };
         throw executionError;
       }
       return {
         result,
         fact: { ...fact },
-        last_cgroup_oom: oomProvenance === null ? null : { ...oomProvenance },
+        cgroup_oom_observation: oomProvenance === null ? null : { ...oomProvenance },
       };
     } finally {
       // Execute, observation, normalization, and terminal-fact failures all
