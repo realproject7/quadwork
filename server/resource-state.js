@@ -129,7 +129,7 @@ function sanitizeTime(value) {
   }
 }
 
-function sanitizeTerminalFact(input, hasOomProvenance) {
+function sanitizeTerminalFact(input, oomProvenance) {
   if (input === INVALID) return null;
   const projectId = safeGet(input, "project_id");
   const generationId = safeGet(input, "generation_id");
@@ -159,6 +159,13 @@ function sanitizeTerminalFact(input, hasOomProvenance) {
   // The validated cgroup observation is the OOM authority. Wrapper exit/signal
   // metadata may be empty (for example, a descendant was killed) and cannot
   // override it, but malformed non-null metadata still fails closed.
+  const hasOomProvenance = oomProvenance !== null
+    && oomProvenance.project_id === projectId
+    && oomProvenance.generation_id === generationId
+    && oomProvenance.resource_class === resourceClass
+    && oomProvenance.unit_name === unitName
+    && BigInt(oomProvenance.oom_kill_count) > 0n
+    && Date.parse(oomProvenance.observed_at) >= Date.parse(finishedAt);
   if (reason === "oom_kill" && (!hasOomProvenance || !exit.valid || !signal.valid)) normalizedReason = "unknown";
   return Object.freeze({
     project_id: projectId,
@@ -172,7 +179,7 @@ function sanitizeTerminalFact(input, hasOomProvenance) {
   });
 }
 
-function sanitizeTerminalFacts(input, limit, hasOomProvenance) {
+function sanitizeTerminalFacts(input, limit, oomProvenance) {
   if (!safeArray(input)) return [];
   const rawLength = safeGet(input, "length");
   if (!Number.isSafeInteger(rawLength) || rawLength < 0) return [];
@@ -180,7 +187,7 @@ function sanitizeTerminalFacts(input, limit, hasOomProvenance) {
   const scanBudget = Math.min(rawLength, limit * TERMINAL_FACT_SCAN_FACTOR);
   const stop = rawLength - scanBudget;
   for (let index = rawLength - 1; index >= stop && facts.length < limit; index -= 1) {
-    const fact = sanitizeTerminalFact(safeGet(input, index), hasOomProvenance);
+    const fact = sanitizeTerminalFact(safeGet(input, index), oomProvenance);
     if (fact) facts.push(fact);
   }
   return facts.reverse();
@@ -209,10 +216,27 @@ function sanitizeOomKillCount(value) {
 }
 
 function sanitizeLastCgroupOom(input) {
+  const projectId = safeGet(input, "project_id");
+  const generationId = safeGet(input, "generation_id");
+  const resourceClass = safeGet(input, "resource_class");
+  const unitName = safeGet(input, "unit_name");
   const count = sanitizeOomKillCount(safeGet(input, "oom_kill_count"));
   const observedAt = sanitizeTime(safeGet(input, "observed_at"));
-  if (count === null || observedAt === null) return null;
-  return Object.freeze({ oom_kill_count: count, observed_at: observedAt });
+  if (typeof projectId !== "string" || !IDENTIFIER_RE.test(projectId)
+    || typeof generationId !== "string" || !IDENTIFIER_RE.test(generationId)
+    || typeof resourceClass !== "string" || !RESOURCE_CLASSES.has(resourceClass)
+    || typeof unitName !== "string" || !UNIT_RE.test(unitName)
+    || count === null || observedAt === null) {
+    return null;
+  }
+  return Object.freeze({
+    project_id: projectId,
+    generation_id: generationId,
+    resource_class: resourceClass,
+    unit_name: unitName,
+    oom_kill_count: count,
+    observed_at: observedAt,
+  });
 }
 
 function hasEveryField(value, fields) {
@@ -302,7 +326,6 @@ function createResourceSnapshot(input = {}, options = {}) {
   );
   const temp = sanitizeTemp(safeGet(input, "temp"));
   const lastCgroupOom = sanitizeLastCgroupOom(safeGet(input, "last_cgroup_oom"));
-  const hasOomProvenance = lastCgroupOom !== null && BigInt(lastCgroupOom.oom_kill_count) > 0n;
   const state = {
     version: RESOURCE_STATE_VERSION,
     status: typeof rawStatus === "string" && STATUSES.has(rawStatus) ? rawStatus : "unknown",
@@ -311,7 +334,7 @@ function createResourceSnapshot(input = {}, options = {}) {
     usage,
     temp,
     last_cgroup_oom: lastCgroupOom,
-    terminal_facts: sanitizeTerminalFacts(safeGet(input, "terminal_facts"), limit, hasOomProvenance),
+    terminal_facts: sanitizeTerminalFacts(safeGet(input, "terminal_facts"), limit, lastCgroupOom),
   };
   if (state.status === "ready" && !completeReadySnapshot(state)) state.status = "unknown";
   return freezeState(state);
@@ -389,15 +412,47 @@ class ResourceStateStore {
     if (Buffer.byteLength(serialized, "utf8") > MAX_STATE_BYTES) {
       throw new RangeError("resource state exceeds the maximum serialized size");
     }
+    let fd = null;
+    let opened = null;
     try {
-      this.fs.writeFileSync(tmpPath, serialized, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      this.fs.chmodSync(tmpPath, 0o600);
+      fd = this.fs.openSync(
+        tmpPath,
+        this.fs.constants.O_WRONLY | this.fs.constants.O_CREAT | this.fs.constants.O_EXCL,
+        0o600,
+      );
+      this.fs.writeFileSync(fd, serialized, { encoding: "utf8" });
+      opened = this.fs.fstatSync(fd);
+      if (!opened.isFile()
+        || (Number(opened.mode) & 0o7777) !== 0o600
+        || (this.expectedUid !== null && Number(opened.uid) !== this.expectedUid)) {
+        throw new Error("untrusted temporary state file");
+      }
+      this.fs.closeSync(fd);
+      fd = null;
+      const beforeRename = this.fs.lstatSync(tmpPath);
+      if (beforeRename.isSymbolicLink()
+        || !beforeRename.isFile()
+        || (Number(beforeRename.mode) & 0o7777) !== 0o600
+        || (this.expectedUid !== null && Number(beforeRename.uid) !== this.expectedUid)
+        || String(beforeRename.dev) !== String(opened.dev)
+        || String(beforeRename.ino) !== String(opened.ino)) {
+        throw new Error("temporary state file identity changed");
+      }
       this.fs.renameSync(tmpPath, this.filePath);
+      const committed = this.fs.lstatSync(this.filePath);
+      if (committed.isSymbolicLink()
+        || !committed.isFile()
+        || (Number(committed.mode) & 0o7777) !== 0o600
+        || (this.expectedUid !== null && Number(committed.uid) !== this.expectedUid)
+        || String(committed.dev) !== String(opened.dev)
+        || String(committed.ino) !== String(opened.ino)) {
+        try { this.fs.unlinkSync(this.filePath); } catch {}
+        throw new Error("committed state file identity changed");
+      }
     } catch (error) {
+      if (fd !== null) {
+        try { this.fs.closeSync(fd); } catch {}
+      }
       try { this.fs.unlinkSync(tmpPath); } catch {}
       throw error;
     }

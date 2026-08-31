@@ -202,13 +202,20 @@ function fullState(terminalFacts = [fact(1)]) {
     fact(28, { reason: "oom_kill", exit_code: null, signal: "invalid-signal" }),
   );
   const output = createResourceSnapshot({
-    last_cgroup_oom: { oom_kill_count: 1, observed_at: "2026-08-31T00:00:00Z" },
+    last_cgroup_oom: {
+      project_id: "quadwork",
+      generation_id: "generation-19",
+      resource_class: "control",
+      unit_name: "qw-worker-19.scope",
+      oom_kill_count: 1,
+      observed_at: "2026-08-31T00:00:19Z",
+    },
     terminal_facts: matrix,
   }, { terminalFactLimit: 20 }).terminal_facts;
   assert.deepEqual(output.map((entry) => entry.reason), [
     "normal_exit", "unknown", "unknown",
     "signal", "unknown", "unknown",
-    "oom_kill", "oom_kill", "oom_kill", "oom_kill", "oom_kill", "oom_kill",
+    "unknown", "unknown", "unknown", "oom_kill", "unknown", "unknown",
     "unknown", "unknown",
     "unknown", "unknown", "unknown", "unknown",
   ]);
@@ -219,14 +226,76 @@ function fullState(terminalFacts = [fact(1)]) {
     "unknown",
     "OOM without a validated persisted counter is not authoritative",
   );
+  const zeroObservation = createResourceSnapshot({
+    last_cgroup_oom: {
+      project_id: "quadwork",
+      generation_id: "generation-29",
+      resource_class: "control",
+      unit_name: "qw-worker-29.scope",
+      oom_kill_count: 0,
+      observed_at: "2026-08-31T00:00:29Z",
+    },
+    terminal_facts: [fact(29, { reason: "oom_kill", exit_code: 0, signal: null })],
+  });
+  assert.equal(zeroObservation.last_cgroup_oom.oom_kill_count, "0", "a valid zero observation persists");
   assert.equal(
-    createResourceSnapshot({
-      last_cgroup_oom: { oom_kill_count: 0, observed_at: "2026-08-31T00:00:00Z" },
-      terminal_facts: [fact(29, { reason: "oom_kill", exit_code: 0, signal: null })],
-    }).terminal_facts[0].reason,
+    zeroObservation.terminal_facts[0].reason,
     "unknown",
-    "a valid zero counter is retained but cannot claim an OOM",
+    "a valid zero counter cannot claim an OOM",
   );
+}
+
+// OOM authority belongs to one exact resource identity and a counter observed
+// no earlier than that identity's terminal fact. Global, unrelated, and stale
+// observations are retained only when well formed and cannot authorize OOM.
+{
+  const oomFact = fact(31, { reason: "oom_kill", exit_code: 0, signal: null });
+  const exact = {
+    project_id: oomFact.project_id,
+    generation_id: oomFact.generation_id,
+    resource_class: oomFact.resource_class,
+    unit_name: oomFact.unit_name,
+    oom_kill_count: 3,
+    observed_at: oomFact.finished_at,
+  };
+  assert.equal(createResourceSnapshot({
+    last_cgroup_oom: exact,
+    terminal_facts: [oomFact],
+  }).terminal_facts[0].reason, "oom_kill");
+
+  for (const mismatch of [
+    { generation_id: "another-generation" },
+    { project_id: "another-project" },
+    { resource_class: oomFact.resource_class === "worker" ? "control" : "worker" },
+    { unit_name: "another-worker.scope" },
+    { observed_at: "2026-08-31T00:00:30.999Z" },
+  ]) {
+    const provenance = { ...exact, ...mismatch };
+    if (mismatch.observed_at) {
+      const laterFact = fact(31, {
+        reason: "oom_kill",
+        exit_code: 0,
+        signal: null,
+        finished_at: "2026-08-31T00:00:31.000Z",
+      });
+      assert.equal(createResourceSnapshot({
+        last_cgroup_oom: provenance,
+        terminal_facts: [laterFact],
+      }).terminal_facts[0].reason, "unknown");
+    } else {
+      assert.equal(createResourceSnapshot({
+        last_cgroup_oom: provenance,
+        terminal_facts: [oomFact],
+      }).terminal_facts[0].reason, "unknown");
+    }
+  }
+
+  const legacyGlobal = createResourceSnapshot({
+    last_cgroup_oom: { oom_kill_count: 7, observed_at: oomFact.finished_at },
+    terminal_facts: [oomFact],
+  });
+  assert.equal(legacyGlobal.last_cgroup_oom, null);
+  assert.equal(legacyGlobal.terminal_facts[0].reason, "unknown");
 }
 
 // `ready` is authority-bearing. It survives only when every required fact is
@@ -268,6 +337,10 @@ function fullState(terminalFacts = [fact(1)]) {
   const { filePath } = fixture();
   const input = fullState();
   input.last_cgroup_oom = {
+    project_id: "quadwork",
+    generation_id: "generation-1",
+    resource_class: "control",
+    unit_name: "qw-worker-1.scope",
     oom_kill_count: 9_007_199_254_740_993n,
     observed_at: "2026-08-31T09:15:00+09:00",
     raw_path: "/sys/fs/cgroup/private/memory.events",
@@ -275,6 +348,10 @@ function fullState(terminalFacts = [fact(1)]) {
   const store = new ResourceStateStore({ filePath });
   const saved = store.save(input);
   assert.deepEqual(saved.last_cgroup_oom, {
+    project_id: "quadwork",
+    generation_id: "generation-1",
+    resource_class: "control",
+    unit_name: "qw-worker-1.scope",
     oom_kill_count: "9007199254740993",
     observed_at: "2026-08-31T00:15:00.000Z",
   });
@@ -282,11 +359,17 @@ function fullState(terminalFacts = [fact(1)]) {
   assert.deepEqual(new ResourceStateStore({ filePath }).load().last_cgroup_oom, saved.last_cgroup_oom);
   assert.ok(!fs.readFileSync(filePath, "utf8").includes("/sys/fs"));
 
-  assert.equal(createResourceSnapshot({ last_cgroup_oom: { oom_kill_count: 1 } }).last_cgroup_oom, null);
-  assert.equal(createResourceSnapshot({ last_cgroup_oom: { observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
-  assert.equal(createResourceSnapshot({ last_cgroup_oom: { oom_kill_count: -1, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
-  assert.equal(createResourceSnapshot({ last_cgroup_oom: { oom_kill_count: "01", observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
-  assert.equal(createResourceSnapshot({ last_cgroup_oom: { oom_kill_count: 1n << 64n, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+  const identity = {
+    project_id: "quadwork",
+    generation_id: "generation-1",
+    resource_class: "control",
+    unit_name: "qw-worker-1.scope",
+  };
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: 1 } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: -1, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: "01", observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: 1n << 64n, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
 }
 
 // A failed atomic commit preserves both the prior file and in-memory snapshot.
@@ -307,6 +390,39 @@ function fullState(terminalFacts = [fact(1)]) {
   assert.equal(fs.readFileSync(filePath, "utf8"), originalBytes);
   assert.deepEqual(failingStore.snapshot(), baseline);
   assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")), []);
+}
+
+// Swapping the freshly written temp pathname to a symlink is detected before
+// rename. Cleanup unlinks only the symlink entry and never chmods or writes the
+// target outside the state store.
+{
+  const { dir, filePath } = fixture();
+  const outside = path.join(dir, "outside.txt");
+  const outsideBytes = "outside-content-must-survive\n";
+  fs.writeFileSync(outside, outsideBytes, { mode: 0o644 });
+  fs.chmodSync(outside, 0o644);
+  const swapFs = Object.create(fs);
+  let tmpPath = null;
+  let swapped = false;
+  swapFs.openSync = (target, flags, mode) => {
+    tmpPath = target;
+    return fs.openSync(target, flags, mode);
+  };
+  swapFs.writeFileSync = (target, data, options) => {
+    fs.writeFileSync(target, data, options);
+    const orphan = `${tmpPath}.orphan`;
+    fs.renameSync(tmpPath, orphan);
+    fs.symlinkSync(outside, tmpPath);
+    swapped = true;
+  };
+  const store = new ResourceStateStore({ filePath, fsImpl: swapFs });
+  assert.throws(() => store.save(fullState()), /temporary state file identity changed/);
+  assert.equal(swapped, true);
+  assert.equal(fs.readFileSync(outside, "utf8"), outsideBytes);
+  assert.equal(fs.statSync(outside).mode & 0o777, 0o644);
+  assert.equal(fs.existsSync(filePath), false);
+  assert.equal(fs.existsSync(tmpPath), false);
+  assert.equal(store.snapshot().status, "unknown");
 }
 
 // Throwing getters and contradictory/unsafe numeric facts are invalid input,
