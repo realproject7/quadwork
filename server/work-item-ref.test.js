@@ -159,6 +159,9 @@ function code(result) {
     assignment_attempt: "attempt_0001",
   };
   const key = ownershipKey(base, web);
+  assert.deepEqual(JSON.parse(key).slice(0, 5), [
+    "work-item-owner", 1, "installation_alpha_0001", 12, "attempt_0001",
+  ]);
   assert.notEqual(key, ownershipKey({ ...base, installation_id: "installation_bravo_0002" }, web));
   assert.notEqual(key, ownershipKey({ ...base, batch_number: 13 }, web));
   assert.notEqual(key, ownershipKey({ ...base, assignment_attempt: "attempt_0002" }, web));
