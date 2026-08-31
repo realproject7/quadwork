@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { parseRuntimeResources } = require("./resource-policy");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 
@@ -86,6 +87,37 @@ function readConfig() {
   } catch (err) {
     throw new Error(`Invalid JSON in ${CONFIG_PATH}: ${err.message}`);
   }
+}
+
+// #1038: strict, side-effect-free runtime resource policy access. This path is
+// intentionally separate from readConfig(): readConfig creates a default file
+// and may persist legacy migrations, while resource preflight must be read-only.
+// Absence is meaningful and remains null; the proposal is never injected here.
+function getRuntimeResources(config) {
+  const raw = config && typeof config === "object" && !Array.isArray(config)
+    ? config.runtime_resources
+    : undefined;
+  return parseRuntimeResources(raw);
+}
+
+function readRuntimeResources(options = {}) {
+  const fsImpl = options.fsImpl || fs;
+  const configPath = options.configPath || CONFIG_PATH;
+  let raw;
+  try {
+    raw = fsImpl.readFileSync(configPath, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    throw new Error("Cannot read runtime_resources configuration");
+  }
+
+  let config;
+  try {
+    config = JSON.parse(raw);
+  } catch {
+    throw new Error("Invalid QuadWork configuration JSON");
+  }
+  return getRuntimeResources(config);
 }
 
 /**
@@ -200,4 +232,17 @@ function updateConfig(mutator) {
   return cfg;
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, sanitizeOperatorName, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, updateConfig };
+module.exports = {
+  readConfig,
+  readRuntimeResources,
+  getRuntimeResources,
+  resolveAgentCwd,
+  resolveAgentCommand,
+  resolveProjectChattr,
+  sanitizeOperatorName,
+  CONFIG_PATH,
+  ensureSecureDir,
+  writeSecureFile,
+  writeConfig,
+  updateConfig,
+};

@@ -6,6 +6,8 @@ const path = require("path");
 const os = require("os");
 const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
+const { readRuntimeResources } = require("../server/config");
+const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -1175,6 +1177,78 @@ async function cmdCleanup() {
   }
 }
 
+// ─── Resource Preflight (#1038) ────────────────────────────────────────────
+
+const RESOURCE_PREFLIGHT_USAGE = "Usage: quadwork resources preflight [--json]";
+
+function renderResourcePreflight(report) {
+  const lines = [
+    "QuadWork resource preflight",
+    "===========================",
+    `Status: ${report.ok ? "PASS" : "FAIL"}`,
+    `Primary reason: ${report.reason}`,
+    `Policy configured: ${report.policy && report.policy.configured === true ? "yes" : "no"}`,
+  ];
+  if (report.host) {
+    lines.push(`Host memory: ${report.host.availableMib}/${report.host.totalMib} MiB available`);
+    lines.push(`Host swap: ${report.host.swapFreeMib}/${report.host.swapTotalMib} MiB free`);
+  }
+  if (report.scopes) {
+    lines.push(`Worker scopes: ${report.scopes.admitted ?? "unavailable"}/${report.scopes.staticCeiling} active; ${report.scopes.requested} requested`);
+  }
+  if (report.capacity) {
+    lines.push(`Static RAM headroom: ${report.capacity.staticHeadroomMib} MiB`);
+    lines.push(`Live RAM headroom: ${report.capacity.liveHeadroomMib} MiB`);
+    lines.push(`Configured swap headroom: ${report.capacity.swapHeadroomMib} MiB`);
+  }
+  if (Array.isArray(report.reasons) && report.reasons.length > 0) {
+    lines.push("Checks:");
+    for (const reason of report.reasons) {
+      lines.push(`  - ${reason.code}/${reason.check}: ${reason.message}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+// Minimal injectable handler: the command never imports config writers and
+// never accepts a flag that could fabricate the still-pending staging proof.
+function runResourcesCommand(args, options = {}) {
+  const stdout = options.stdout || process.stdout;
+  const stderr = options.stderr || process.stderr;
+  const loadPolicy = options.readRuntimeResources || readRuntimeResources;
+  const makeProbes = options.createReadOnlyProbes || createReadOnlyProbes;
+  const preflight = options.runResourcePreflight || runResourcePreflight;
+  const commandArgs = Array.isArray(args) ? args : [];
+
+  if (commandArgs[0] !== "preflight"
+    || commandArgs.slice(1).some((arg) => arg !== "--json")
+    || commandArgs.filter((arg) => arg === "--json").length > 1) {
+    stderr.write(`${RESOURCE_PREFLIGHT_USAGE}\n`);
+    return 2;
+  }
+
+  const json = commandArgs.includes("--json");
+  let report;
+  try {
+    const runtimeResources = loadPolicy();
+    // scopeProof deliberately defaults false. There is no CLI override until
+    // the fixed PTY/systemd staging matrix has established real proof.
+    const probes = makeProbes();
+    report = preflight({ runtimeResources, probes });
+  } catch {
+    // Reduce config/read failures to the same redacted typed policy failure.
+    // A non-object sentinel makes the canonical preflight parser fail closed.
+    report = runResourcePreflight({ runtimeResources: false, probes: Object.freeze({}) });
+  }
+
+  stdout.write(json ? `${JSON.stringify(report)}\n` : renderResourcePreflight(report));
+  return report.ok ? 0 : 1;
+}
+
+function cmdResources() {
+  process.exitCode = runResourcesCommand(process.argv.slice(3));
+}
+
 // ─── Doctor ─────────────────────────────────────────────────────────────────
 
 function cmdDoctor() {
@@ -1367,6 +1441,9 @@ switch (command) {
   case "doctor":
     cmdDoctor();
     break;
+  case "resources":
+    cmdResources();
+    break;
   case "migrate-agent-slugs":
     cmdMigrateAgentSlugs();
     break;
@@ -1396,6 +1473,7 @@ switch (command) {
     add-project   Add a project via CLI (alternative to web UI /setup)
     cleanup       Reclaim disk space (--project <id> or --legacy)
     doctor        Report project configuration status
+    resources     Read-only resource preflight (resources preflight [--json])
     migrate-agent-slugs  Rename reviewer1/reviewer2 → re1/re2 in existing projects
     ac-restore           Restore file-chat JSONL back to AC format
 
@@ -1413,10 +1491,11 @@ switch (command) {
     npx quadwork stop
     npx quadwork cleanup --project my-project
     npx quadwork cleanup --legacy
+    npx quadwork resources preflight --json
 `);
     process.exit(1);
 }
 }
 
 // #972: exported for unit tests (see server/binStop.test.js).
-module.exports = { sanitizePid, stopPid };
+module.exports = { sanitizePid, stopPid, renderResourcePreflight, runResourcesCommand };
