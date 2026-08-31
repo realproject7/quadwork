@@ -10,8 +10,19 @@ const SYSTEMD_SCOPE_CANDIDATE = Object.freeze({
   fixedArgs: Object.freeze(["--user", "--scope", "--collect", "--quiet"]),
 });
 
+// The control-plane budget is host-wide, not a per-child allowance. This pure
+// builder describes the separate, explicit candidate command that would set a
+// shared slice's aggregate properties. Nothing in this module executes it.
+const SYSTEMD_CONTROL_CLASS_CANDIDATE = Object.freeze({
+  status: "candidate_pending_staging",
+  executable: "systemctl",
+  fixedArgs: Object.freeze(["--user", "--runtime", "set-property"]),
+});
+
 const UNIT_NAME_RE = /^[a-z][a-z0-9-]{0,62}$/;
+const CONTROL_CLASS_NAME_RE = /^[a-z][a-z0-9-]{0,62}\.slice$/;
 const QUALIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const DEFAULT_CONTROL_CLASS_NAME = "quadwork-control.slice";
 
 function invalid(field, detail) {
   const error = new Error(`${field} ${detail}`);
@@ -23,6 +34,13 @@ function invalid(field, detail) {
 function validateUnitName(value) {
   if (typeof value !== "string" || !UNIT_NAME_RE.test(value)) {
     throw invalid("unitName", "must match ^[a-z][a-z0-9-]{0,62}$");
+  }
+  return value;
+}
+
+function validateControlClassName(value) {
+  if (typeof value !== "string" || !CONTROL_CLASS_NAME_RE.test(value)) {
+    throw invalid("controlClassName", "must be a lowercase systemd slice unit ending in .slice");
   }
   return value;
 }
@@ -79,44 +97,70 @@ function qualification(spec) {
   };
 }
 
-function invocation(spec, resourceClass) {
+function buildWorkerScopeInvocation(spec) {
   const ids = qualification(spec);
   validateCommand(spec.command, spec.args || []);
-  const limits = resourceClass === "worker"
-    ? normalizeWorkerLimits(spec.limits)
-    : normalizeControlLimits(spec.limits);
-  const properties = resourceClass === "worker"
-    ? [
-        `MemoryHigh=${limits.memoryHighMib}M`,
-        `MemoryMax=${limits.memoryMaxMib}M`,
-        `MemorySwapMax=${limits.swapMaxMib}M`,
-      ]
-    : [
-        `MemoryMax=${limits.memoryMaxMib}M`,
-        `MemorySwapMax=${limits.swapMaxMib}M`,
-      ];
+  const limits = normalizeWorkerLimits(spec.limits);
   const args = [
     ...SYSTEMD_SCOPE_CANDIDATE.fixedArgs,
     `--unit=${ids.unitName}`,
   ];
-  for (const property of properties) args.push("-p", property);
+  for (const property of [
+    `MemoryHigh=${limits.memoryHighMib}M`,
+    `MemoryMax=${limits.memoryMaxMib}M`,
+    `MemorySwapMax=${limits.swapMaxMib}M`,
+  ]) args.push("-p", property);
   args.push("--", spec.command, ...(spec.args || []));
   return {
     file: SYSTEMD_SCOPE_CANDIDATE.executable,
     args,
     candidateStatus: SYSTEMD_SCOPE_CANDIDATE.status,
-    resourceClass,
+    resourceClass: "worker",
     ids,
     limits,
   };
 }
 
-function buildWorkerScopeInvocation(spec) {
-  return invocation(spec, "worker");
+function buildControlClassConfiguration(spec = {}) {
+  const controlClassName = validateControlClassName(spec.controlClassName);
+  const limits = normalizeControlLimits(spec.limits);
+  return {
+    file: SYSTEMD_CONTROL_CLASS_CANDIDATE.executable,
+    args: [
+      ...SYSTEMD_CONTROL_CLASS_CANDIDATE.fixedArgs,
+      controlClassName,
+      `MemoryMax=${limits.memoryMaxMib}M`,
+      `MemorySwapMax=${limits.swapMaxMib}M`,
+    ],
+    candidateStatus: SYSTEMD_CONTROL_CLASS_CANDIDATE.status,
+    resourceClass: "control",
+    controlClassName,
+    limits,
+  };
 }
 
 function buildControlScopeInvocation(spec) {
-  return invocation(spec, "control");
+  const ids = qualification(spec);
+  validateCommand(spec.command, spec.args || []);
+  if (Object.prototype.hasOwnProperty.call(spec, "limits")) {
+    throw invalid("limits", "must be configured once on the shared control class, not on a child");
+  }
+  const controlClassName = validateControlClassName(spec.controlClassName);
+  return {
+    file: SYSTEMD_SCOPE_CANDIDATE.executable,
+    args: [
+      ...SYSTEMD_SCOPE_CANDIDATE.fixedArgs,
+      `--unit=${ids.unitName}`,
+      `--slice=${controlClassName}`,
+      "--",
+      spec.command,
+      ...(spec.args || []),
+    ],
+    candidateStatus: SYSTEMD_SCOPE_CANDIDATE.status,
+    resourceClass: "control",
+    controlClassName,
+    ids,
+  };
 }
 
 function abortError() {
@@ -210,17 +254,17 @@ function normalizeSignal(value) {
   return null;
 }
 
-function terminalReason(result, scopeObservation) {
+function terminalReason(result, scopeObservation, executionRejected = false) {
   const count = scopeObservation && scopeObservation.oomKillCount;
   if (result?.oomKilled === true || scopeObservation?.oomKilled === true ||
       (typeof count === "bigint" ? count > 0n : Number.isFinite(count) && count > 0)) return "oom_kill";
   if (normalizeSignal(result?.signal) !== null) return "signal";
-  if (result?.code === 0) return "normal_exit";
+  if (!executionRejected && result?.code === 0) return "normal_exit";
   return "unknown";
 }
 
-function terminalFact({ ids, resourceClass, result, scopeObservation, now }) {
-  const reason = terminalReason(result, scopeObservation);
+function terminalFact({ ids, resourceClass, result, scopeObservation, executionRejected, now }) {
+  const reason = terminalReason(result, scopeObservation, executionRejected);
   return {
     project_id: ids.projectId,
     generation_id: ids.generationId,
@@ -233,11 +277,57 @@ function terminalFact({ ids, resourceClass, result, scopeObservation, now }) {
   };
 }
 
+function durableScopeObservation(value) {
+  const observation = value && value.scopeObservation;
+  return observation && typeof observation === "object" ? observation : null;
+}
+
+// systemd --collect may unload a scope before a post-exit query can observe it.
+// Executors can therefore return a durable scopeObservation captured while the
+// scope still existed. This bounded query is only the fallback, and its derived
+// signal lets an injected query implementation stop its own I/O on timeout or
+// caller cancellation. Promise.race still bounds callers that ignore signals.
+async function queryScopeBounded(queryScope, request, { timeoutMs, signal }) {
+  if (signal?.aborted) return null;
+
+  const controller = new AbortController();
+  let timer = null;
+  let onAbort = null;
+  let finishBoundary;
+  const boundary = new Promise((resolve) => {
+    finishBoundary = resolve;
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve(null);
+    }, timeoutMs);
+    if (signal) {
+      onAbort = () => {
+        controller.abort();
+        resolve(null);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+  const query = Promise.resolve()
+    .then(() => queryScope({ ...request, signal: controller.signal }))
+    .catch(() => null);
+
+  try {
+    return await Promise.race([query, boundary]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    finishBoundary(null);
+  }
+}
+
 class ResourceController {
   constructor({
     executeProcess,
     queryScope,
     maxControlChildren = 1,
+    controlClassName = DEFAULT_CONTROL_CLASS_NAME,
+    scopeQueryTimeoutMs = 1_000,
     now = () => new Date(),
     terminalFactLimit = 100,
   } = {}) {
@@ -245,11 +335,16 @@ class ResourceController {
       throw invalid("executeProcess", "must be dependency-injected");
     }
     if (typeof queryScope !== "function") throw invalid("queryScope", "must be a function");
+    if (!Number.isSafeInteger(scopeQueryTimeoutMs) || scopeQueryTimeoutMs <= 0) {
+      throw invalid("scopeQueryTimeoutMs", "must be a positive integer number of milliseconds");
+    }
     if (!Number.isSafeInteger(terminalFactLimit) || terminalFactLimit <= 0) {
       throw invalid("terminalFactLimit", "must be a positive integer");
     }
     this.executeProcess = executeProcess;
     this.queryScope = queryScope;
+    this.controlClassName = validateControlClassName(controlClassName);
+    this.scopeQueryTimeoutMs = scopeQueryTimeoutMs;
     this.now = now;
     this.terminalFactLimit = terminalFactLimit;
     this.controlLimiter = new LeafChildLimiter(maxControlChildren);
@@ -265,14 +360,21 @@ class ResourceController {
     // Only this leaf method owns a control permit. Orchestrators remain outside
     // the semaphore, so nested repository/PR fan-out cannot consume permits
     // while waiting for the child calls it still needs to schedule.
+    if (Object.prototype.hasOwnProperty.call(spec, "controlClassName") &&
+        spec.controlClassName !== this.controlClassName) {
+      throw invalid("controlClassName", "must match the controller's host-wide control class");
+    }
     return this.controlLimiter.runLeaf(
-      () => this._runScope(buildControlScopeInvocation(spec), spec.signal),
+      () => this._runScope(buildControlScopeInvocation({
+        ...spec,
+        controlClassName: this.controlClassName,
+      }), spec.signal),
       spec.signal,
     );
   }
 
   async _runScope(built, signal) {
-    const { ids, resourceClass, limits } = built;
+    const { ids, resourceClass, limits, controlClassName } = built;
     if (this.activeScopes.has(ids.unitName)) {
       const error = new Error(`resource scope is already active: ${ids.unitName}`);
       error.code = "QW_RESOURCE_SCOPE_ACTIVE";
@@ -283,16 +385,13 @@ class ResourceController {
       generation_id: ids.generationId,
       resource_class: resourceClass,
       unit_name: ids.unitName,
-      limits: resourceClass === "worker"
-        ? {
+      ...(resourceClass === "worker"
+        ? { limits: {
             memory_high_mib: limits.memoryHighMib,
             memory_max_mib: limits.memoryMaxMib,
             swap_max_mib: limits.swapMaxMib,
-          }
-        : {
-            memory_max_mib: limits.memoryMaxMib,
-            swap_max_mib: limits.swapMaxMib,
-          },
+          } }
+        : { control_class: controlClassName }),
       started_at: timestamp(this.now),
     });
 
@@ -308,7 +407,9 @@ class ResourceController {
         generationId: ids.generationId,
         unitName: ids.unitName,
         resourceClass,
+        controlClassName: resourceClass === "control" ? controlClassName : null,
       });
+      scopeObservation = durableScopeObservation(result);
     } catch (error) {
       executionError = error;
       result = {
@@ -316,24 +417,31 @@ class ResourceController {
         signal: normalizeSignal(error?.signal),
         oomKilled: error?.oomKilled === true,
       };
+      scopeObservation = durableScopeObservation(error);
     }
 
-    try {
-      scopeObservation = await this.queryScope({
+    if (scopeObservation === null) {
+      scopeObservation = await queryScopeBounded(this.queryScope, {
         projectId: ids.projectId,
         generationId: ids.generationId,
         unitName: ids.unitName,
         resourceClass,
+      }, {
+        timeoutMs: this.scopeQueryTimeoutMs,
+        signal,
       });
-    } catch {
-      // Query failure is represented by an `unknown` terminal fact when exit
-      // data also cannot classify the result. Never leak the query error text.
-      scopeObservation = null;
     }
 
     let fact;
     try {
-      fact = terminalFact({ ids, resourceClass, result, scopeObservation, now: this.now });
+      fact = terminalFact({
+        ids,
+        resourceClass,
+        result,
+        scopeObservation,
+        executionRejected: executionError !== null,
+        now: this.now,
+      });
       this.terminalFacts.push(fact);
       if (this.terminalFacts.length > this.terminalFactLimit) this.terminalFacts.shift();
     } finally {
@@ -358,9 +466,13 @@ class ResourceController {
         active: this.controlLimiter.active,
         queued: this.controlLimiter.queued,
       },
+      control_class: {
+        unit_name: this.controlClassName,
+        aggregate: true,
+      },
       active_scopes: [...this.activeScopes.values()].map((entry) => ({
         ...entry,
-        limits: { ...entry.limits },
+        ...(entry.limits ? { limits: { ...entry.limits } } : {}),
       })),
       terminal_facts: this.terminalFacts.map((fact) => ({ ...fact })),
     };
@@ -369,8 +481,12 @@ class ResourceController {
 
 module.exports = {
   SYSTEMD_SCOPE_CANDIDATE,
+  SYSTEMD_CONTROL_CLASS_CANDIDATE,
+  DEFAULT_CONTROL_CLASS_NAME,
   ResourceController,
   buildWorkerScopeInvocation,
+  buildControlClassConfiguration,
   buildControlScopeInvocation,
   validateUnitName,
+  validateControlClassName,
 };

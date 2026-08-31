@@ -8,8 +8,11 @@
 const assert = require("node:assert/strict");
 const {
   SYSTEMD_SCOPE_CANDIDATE,
+  SYSTEMD_CONTROL_CLASS_CANDIDATE,
+  DEFAULT_CONTROL_CLASS_NAME,
   ResourceController,
   buildWorkerScopeInvocation,
+  buildControlClassConfiguration,
   buildControlScopeInvocation,
   validateUnitName,
 } = require("./resource-controller");
@@ -41,7 +44,7 @@ function controlSpec(index, overrides = {}) {
     unitName: `qw-control-${index}`,
     command: "gh",
     args: ["api", `repos/realproject7/quadwork/issues/${index}`],
-    limits: { memoryMaxMib: 512, swapMaxMib: 256 },
+    controlClassName: DEFAULT_CONTROL_CLASS_NAME,
     ...overrides,
   };
 }
@@ -64,13 +67,29 @@ async function main() {
   ok(worker.args.at(-1) === "ticket; echo-not-a-shell" && !worker.shell,
     "command data remains one argument and no shell option exists");
 
-  const control = buildControlScopeInvocation(controlSpec(1));
-  assert.deepEqual(control.args.slice(0, 10), [
-    "--user", "--scope", "--collect", "--quiet", "--unit=qw-control-1",
-    "-p", "MemoryMax=512M", "-p", "MemorySwapMax=256M", "--",
+  const controlClass = buildControlClassConfiguration({
+    controlClassName: DEFAULT_CONTROL_CLASS_NAME,
+    limits: { memoryMaxMib: 512, swapMaxMib: 256 },
+  });
+  assert.deepEqual(controlClass.args, [
+    "--user", "--runtime", "set-property", "quadwork-control.slice",
+    "MemoryMax=512M", "MemorySwapMax=256M",
   ]);
-  ok(!control.args.some((arg) => arg.startsWith("MemoryHigh=")),
-    "control class applies only its configured max and swap limits");
+  ok(controlClass.file === "systemctl" &&
+     controlClass.candidateStatus === SYSTEMD_CONTROL_CLASS_CANDIDATE.status,
+    "control aggregate limits have one separate explicit candidate builder");
+
+  const control = buildControlScopeInvocation(controlSpec(1));
+  assert.deepEqual(control.args.slice(0, 8), [
+    "--user", "--scope", "--collect", "--quiet", "--unit=qw-control-1",
+    "--slice=quadwork-control.slice", "--", "gh",
+  ]);
+  ok(!control.args.some((arg) => /^Memory(?:High|Max|SwapMax)=/.test(arg)),
+    "a control child joins the shared class without repeating aggregate limits");
+  assert.throws(() => buildControlScopeInvocation(controlSpec(2, {
+    limits: { memoryMaxMib: 512, swapMaxMib: 256 },
+  })), { code: "QW_INVALID_RESOURCE_ARGUMENT" });
+  ok(true, "per-child control limits are rejected instead of being silently duplicated");
 
   for (const bad of ["", "Upper", "has space", "has/slash", "x;rm", `a${"b".repeat(63)}`]) {
     assert.throws(() => validateUnitName(bad), { code: "QW_INVALID_RESOURCE_ARGUMENT" });
@@ -91,9 +110,11 @@ async function main() {
   let active = 0;
   let maxActive = 0;
   const releases = [];
+  const controlInvocations = [];
   const fanoutController = new ResourceController({
     maxControlChildren: 2,
-    executeProcess: async () => {
+    executeProcess: async ({ args }) => {
+      controlInvocations.push(args);
       active += 1;
       maxActive = Math.max(maxActive, active);
       await new Promise((resolve) => releases.push(resolve));
@@ -114,6 +135,12 @@ async function main() {
   ok(fanoutController.snapshot().control_children.active === 2 &&
      fanoutController.snapshot().control_children.queued === 2,
     "nested high-level fan-out queues only leaf children at the host-wide limit");
+  assert.equal(controlInvocations.length, 2);
+  for (const args of controlInvocations) {
+    assert.ok(args.includes("--slice=quadwork-control.slice"));
+    assert.ok(!args.some((arg) => /^Memory(?:High|Max|SwapMax)=/.test(arg)));
+  }
+  ok(true, "two simultaneous control children share one slice without multiplying its limits");
   while (releases.length > 0) {
     releases.shift()();
     await new Promise((resolve) => setImmediate(resolve));
@@ -178,6 +205,56 @@ async function main() {
   ok(unknown.fact.reason === "unknown" && unknown.fact.exit_code === 17,
     "unclassified non-zero exit is unknown and query failures stay internal");
 
+  let errorExitZero;
+  const rejectedZeroController = new ResourceController({
+    executeProcess: async () => {
+      const error = new Error("executor rejected despite zero exit metadata");
+      error.exitCode = 0;
+      throw error;
+    },
+    queryScope: noOom,
+  });
+  try {
+    await rejectedZeroController.runControlChild(controlSpec("90"));
+  } catch (error) {
+    errorExitZero = error;
+  }
+  ok(errorExitZero?.resourceFact?.reason === "unknown" &&
+     errorExitZero.resourceFact.exit_code === 0,
+    "an executor rejection with exitCode=0 remains unknown");
+
+  let durableQueryCalls = 0;
+  const durableController = new ResourceController({
+    executeProcess: async () => ({
+      code: null,
+      signal: "SIGKILL",
+      scopeObservation: { oomKillCount: 1, capturedBeforeCollect: true },
+    }),
+    queryScope: async () => {
+      durableQueryCalls += 1;
+      return { oomKillCount: 0 };
+    },
+  });
+  const durable = await durableController.runWorkerScope(workerSpec());
+  ok(durable.fact.reason === "oom_kill" && durable.fact.signal === "SIGKILL" &&
+     durableQueryCalls === 0,
+    "durable pre-collect observation wins and skips the post-exit query fallback");
+
+  let queryAbortObserved = false;
+  const hungQueryController = new ResourceController({
+    maxControlChildren: 1,
+    scopeQueryTimeoutMs: 10,
+    executeProcess: async () => ({ code: 0, signal: null }),
+    queryScope: async ({ signal }) => new Promise(() => {
+      signal.addEventListener("abort", () => { queryAbortObserved = true; }, { once: true });
+    }),
+  });
+  const afterHungQuery = await hungQueryController.runControlChild(controlSpec("89"));
+  ok(afterHungQuery.fact.reason === "normal_exit" && queryAbortObserved &&
+     hungQueryController.snapshot().control_children.active === 0 &&
+     hungQueryController.snapshot().active_scopes.length === 0,
+    "a never-resolving scope query is cancelled and cannot retain active state or a permit");
+
   const secret = "TOKEN-DO-NOT-LEAK";
   let unblock;
   const redactedController = new ResourceController({
@@ -195,7 +272,7 @@ async function main() {
     "active snapshots are project and generation qualified");
   ok(!liveJson.includes(secret) && !liveJson.includes("/private/operator/path") &&
      !liveJson.includes("command") && !liveJson.includes("args"),
-    "snapshots expose limits and identity without command, arguments, environment, or paths");
+    "snapshots expose class and identity without command, arguments, environment, or paths");
   unblock();
   await running;
 
