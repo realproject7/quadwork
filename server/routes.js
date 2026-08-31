@@ -3489,8 +3489,21 @@ function snapshotHasOpenIssue(snapshot, n) {
   return !!(
     snapshot &&
     Array.isArray(snapshot.issues) &&
-    snapshot.issues.some((it) => it && it.number === n && it.state === "OPEN")
+    snapshot.issues.some((it) => it && it.number === n && String(it.state || "").toUpperCase() === "OPEN")
   );
+}
+
+function githubFileHasOpenIssue(parsed, n, ref = null) {
+  if (!parsed || !parsed.ok) return false;
+  let issues = parsed.openIssues;
+  if (ref && Array.isArray(parsed.repositories)) {
+    const repository = parsed.repositories.find((entry) =>
+      entry.repo_key === ref.repoKey && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(ref.repo));
+    if (!repository) return false;
+    issues = repository.issues;
+  }
+  return Array.isArray(issues) && issues.some((item) =>
+    item && item.number === n && String(item.state || "OPEN").toUpperCase() === "OPEN");
 }
 
 // #334: verify the snapshot's first issue number still exists on
@@ -4763,7 +4776,16 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
     if (!stillCurrent()) return decorateBatchRow(softRetryingRow(ref.number), ref, { ...assignment, current: false, owned: false });
     const snapshot = _graphqlCache.get(canonicalGithubRepo(ref.repo)) || null;
     let row = snapshot ? progressFromSnapshot(snapshot, ref.number, { requireLiveRef: true }) : progressFromGithubFile(parsedGithub, ref.number, ref);
-    if (!row) row = terminalRows.get(item.key) || null;
+    // A terminal cache row is only a fallback for an item whose current source
+    // has no contradictory live evidence. Reopening keeps the same composite
+    // WorkItemRef and assignment identity, so an OPEN issue must evict the old
+    // merged/closed row even when an incomplete snapshot (or merged-but-open
+    // persisted board) cannot yet derive a replacement progress row.
+    const hasOpenIssue = snapshot
+      ? snapshotHasOpenIssue(snapshot, ref.number)
+      : githubFileHasOpenIssue(parsedGithub, ref.number, ref);
+    if (hasOpenIssue) terminalRows.delete(item.key);
+    if (!row && !hasOpenIssue) row = terminalRows.get(item.key) || null;
     if (!row && snapshot) {
       try { row = await progressForItemRest(ref.repo, ref.number, stillCurrent); }
       catch { row = softRetryingRow(ref.number); }

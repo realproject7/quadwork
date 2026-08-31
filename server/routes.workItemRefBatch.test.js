@@ -16,6 +16,7 @@ const repositories = [
 let config = { installation_id: INSTALLATION_ID, projects: [{ id: "p", repositories }] };
 let queue = "";
 let writtenSnapshot = null;
+let githubFileText = null;
 let ghCalls = 0;
 
 const realRead = fs.readFileSync;
@@ -28,6 +29,7 @@ fs.readFileSync = function readStub(file, ...rest) {
     const error = new Error("missing snapshot"); error.code = "ENOENT"; throw error;
   }
   if (typeof file === "string" && file.endsWith("GITHUB.md")) {
+    if (githubFileText !== null) return githubFileText;
     const error = new Error("missing board"); error.code = "ENOENT"; throw error;
   }
   return realRead.call(this, file, ...rest);
@@ -47,6 +49,8 @@ cp.execFile = function execStub(file, args, opts, callback) {
 };
 
 const routes = require("./routes");
+const { renderProjectGithubMarkdown } = require("./github-state-markdown");
+const { workItemKey } = require("./work-item-ref");
 const {
   parseActiveBatch,
   parseReviewItems,
@@ -189,6 +193,90 @@ async function run() {
   assert.equal(writtenSnapshot.schema_version, 2);
   assert.equal(Object.keys(writtenSnapshot.terminalItems).length, 1);
   assert.equal(ghCalls, 0);
+
+  // Reopening preserves the same owned assignment and composite WorkItemRef.
+  // An incomplete live snapshot cannot fully classify the row, but its OPEN
+  // issue signal must still defeat and evict the prior merged terminal cache.
+  const terminalSnapshot = JSON.parse(JSON.stringify(writtenSnapshot));
+  const apiTerminalKey = Object.keys(terminalSnapshot.terminalItems)[0];
+  const webTerminalKey = workItemKey({ repoKey: "web", repo: "Acme/Web", number: 42, kind: "issue" });
+  const webOwnershipKey = terminalSnapshot.assignment_items.find((entry) =>
+    entry.work_item_ref.repo_key === "web").ownership_key;
+  terminalSnapshot.terminalItems[webTerminalKey] = {
+    ...terminalSnapshot.terminalItems[apiTerminalKey],
+    repo_key: "web",
+    repo: "Acme/Web",
+    title: "web terminal evidence",
+    ownership_key: webOwnershipKey,
+    work_item_ref: { repo_key: "web", repo: "Acme/Web", number: 42, kind: "issue" },
+  };
+  writtenSnapshot = JSON.parse(JSON.stringify(terminalSnapshot));
+  _batchProgressCache.clear();
+  _graphqlCache.set("acme/web", {
+    ts: 101,
+    issues: [], prs: [], closedIssues: [], mergedPrs: [],
+    openPrsWindowComplete: false, closedPrsWindowComplete: false, closedPrIssueNums: [],
+  });
+  _graphqlCache.set("acme/api", {
+    ts: 101,
+    issues: [{ number: 42, title: "api issue reopened", state: "OPEN", url: "https://x/api/42" }],
+    prs: [], closedIssues: [], mergedPrs: [],
+    openPrsWindowComplete: false, closedPrsWindowComplete: false, closedPrIssueNums: [],
+  });
+  payload = await getOrComputeBatchProgress("p");
+  let reopenedApi = payload.items.find((item) => item.repo_key === "api");
+  assert.equal(reopenedApi.status, "queued");
+  assert.equal(reopenedApi.live_pr, null);
+  assert.equal(writtenSnapshot.terminalItems[apiTerminalKey], undefined,
+    "live OPEN snapshot evidence evicts the stale composite terminal row");
+  assert.equal(payload.items.find((item) => item.repo_key === "web").status, "merged");
+  assert.ok(writtenSnapshot.terminalItems[webTerminalKey],
+    "same-number terminal evidence for another repository remains isolated");
+
+  // The cold persisted-board path has the same rule. A recently merged PR can
+  // make row derivation ambiguous while the issue is OPEN; that ambiguity must
+  // degrade to retrying, never resurrect the cached merged result.
+  writtenSnapshot = JSON.parse(JSON.stringify(terminalSnapshot));
+  _batchProgressCache.clear();
+  _graphqlCache.clear();
+  githubFileText = renderProjectGithubMarkdown("P", [
+    {
+      repo_key: "web", repo: "Acme/Web", primary: true,
+      snapshot: { issues: [], prs: [], closedIssues: [], mergedPrs: [] },
+      meta: { generatedAt: Date.now(), staleCycles: 0 },
+    },
+    {
+      repo_key: "api", repo: "Acme/API", primary: false,
+      snapshot: {
+        issues: [{ number: 42, title: "api issue reopened", state: "OPEN", url: "https://x/api/42", assignees: [] }],
+        prs: [], closedIssues: [],
+        mergedPrs: [{ number: 77, title: "[#42] old merge", state: "MERGED", url: "https://x/api/pr/77", assignees: [] }],
+      },
+      meta: { generatedAt: Date.now(), staleCycles: 0 },
+    },
+  ], "(none)");
+  payload = await getOrComputeBatchProgress("p");
+  reopenedApi = payload.items.find((item) => item.repo_key === "api");
+  assert.equal(reopenedApi.status, "queued");
+  assert.equal(reopenedApi.live_pr, null);
+  assert.equal(writtenSnapshot.terminalItems[apiTerminalKey], undefined,
+    "persisted OPEN evidence evicts the stale composite terminal row");
+  assert.ok(writtenSnapshot.terminalItems[webTerminalKey],
+    "persisted evidence eviction remains scoped to the qualified repository");
+  githubFileText = null;
+  _graphqlCache.set("acme/web", {
+    ts: 100,
+    issues: [{ number: 42, title: "web issue", state: "OPEN", url: "https://x/web/42" }],
+    prs: [], closedIssues: [], mergedPrs: [],
+    openPrsWindowComplete: true, closedPrsWindowComplete: true, closedPrIssueNums: [],
+  });
+  _graphqlCache.set("acme/api", {
+    ts: 100,
+    issues: [], prs: [],
+    closedIssues: [{ number: 42, title: "api issue", state: "CLOSED", url: "https://x/api/42" }],
+    mergedPrs: [{ number: 77, title: "[#42] api", state: "MERGED", url: "https://x/api/pr/77" }],
+    openPrsWindowComplete: true, closedPrsWindowComplete: true, closedPrIssueNums: [42],
+  });
 
   const codeFingerprint = readLiveBatchContext("p").fingerprint;
   queue = active(["- Acme/Web#42 queued", "- Acme/API#42 queued"], { type: "ticket-review" });
