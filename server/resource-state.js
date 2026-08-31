@@ -437,17 +437,10 @@ class ResourceStateStore {
         || String(beforeRename.ino) !== String(opened.ino)) {
         throw new Error("temporary state file identity changed");
       }
+      // The state parent directory is an owner-controlled boundary. After the
+      // final fd/path identity check, successful POSIX rename is the single
+      // commit point; no fallible or destructive pathname rollback follows it.
       this.fs.renameSync(tmpPath, this.filePath);
-      const committed = this.fs.lstatSync(this.filePath);
-      if (committed.isSymbolicLink()
-        || !committed.isFile()
-        || (Number(committed.mode) & 0o7777) !== 0o600
-        || (this.expectedUid !== null && Number(committed.uid) !== this.expectedUid)
-        || String(committed.dev) !== String(opened.dev)
-        || String(committed.ino) !== String(opened.ino)) {
-        try { this.fs.unlinkSync(this.filePath); } catch {}
-        throw new Error("committed state file identity changed");
-      }
     } catch (error) {
       if (fd !== null) {
         try { this.fs.closeSync(fd); } catch {}

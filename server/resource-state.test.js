@@ -382,6 +382,32 @@ function fullState(terminalFacts = [fact(1)]) {
   assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")), []);
 }
 
+// A successful rename is the sole commit point. No post-rename pathname
+// verification may report failure after disk state has already advanced.
+{
+  const { filePath } = fixture();
+  const commitFs = Object.create(fs);
+  let renamed = false;
+  let finalLstatCalls = 0;
+  commitFs.renameSync = (source, destination) => {
+    fs.renameSync(source, destination);
+    renamed = true;
+  };
+  commitFs.lstatSync = (target) => {
+    if (renamed && target === filePath) {
+      finalLstatCalls += 1;
+      throw new Error("post-rename lstat must not run");
+    }
+    return fs.lstatSync(target);
+  };
+  const store = new ResourceStateStore({ filePath, fsImpl: commitFs });
+  const saved = store.save(fullState([fact(2)]));
+  assert.equal(renamed, true);
+  assert.equal(finalLstatCalls, 0);
+  assert.deepEqual(store.snapshot(), saved);
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")), saved);
+}
+
 // Swapping the freshly written temp pathname to a symlink is detected before
 // rename. Cleanup unlinks only the symlink entry and never chmods or writes the
 // target outside the state store.
