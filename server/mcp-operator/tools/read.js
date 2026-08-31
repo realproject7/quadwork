@@ -53,7 +53,7 @@ module.exports = {
     {
       name: "list_agents",
       description:
-        "List agents and their state. Returns EVERY configured agent (config ∪ runtime) as { project, agent, state, error } — state is running/stopped/missing, so stopped or untracked agents are included, not just live sessions. Omit `project` to list all projects, or pass one to filter.",
+        "List agents and their lifecycle observation. Returns EVERY configured agent (config ∪ runtime) with canonical state, raw health/timestamps, operation_id, generation_id, verification_state, last_observation, and redacted circuit facts. Missing/stopped roles remain visible; this tool never starts a role.",
       inputSchema: {
         type: "object",
         properties: {
@@ -117,6 +117,17 @@ module.exports = {
             agent,
             state: session ? session.state : "missing",
             error: session ? session.error || null : null,
+            operation_id: session ? session.operation_id || null : null,
+            generation_id: session ? session.generation_id || null : null,
+            verification_state: session ? session.verification_state || "unconfirmed" : "unconfirmed",
+            health: session ? session.health || "unknown" : "unknown",
+            pid: session && Number.isSafeInteger(session.pid) ? session.pid : null,
+            started_at: session ? session.started_at || null : null,
+            last_output_at: session ? session.last_output_at || null : null,
+            last_chat_at: session ? session.last_chat_at || null : null,
+            last_exit: session ? session.last_exit || null : null,
+            last_observation: session ? session.last_observation || null : null,
+            circuit: session ? session.circuit || null : null,
           });
         }
       }

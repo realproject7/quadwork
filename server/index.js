@@ -17,6 +17,7 @@ const {
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
+const { createAgentLifecycleGovernor } = require("./agent-lifecycle");
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
 const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
@@ -617,6 +618,59 @@ app.get("/api/caffeinate/status", (req, res) => {
 // PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
 const agentSessions = new Map();
 
+// #1053: every production PTY creation goes through this one governor.  Its
+// Current Batch read deliberately mirrors /api/batch-active's own object so
+// sticky historical progress cannot mint worker admission authority.
+async function currentWorkForLifecycle(projectId) {
+  try {
+    const progress = await routes.getOrComputeBatchProgress(projectId);
+    const active = {
+      active: routes.isBatchActiveFromProgress(progress) === true,
+      batch_type: progress?.batch_type || "code",
+      installation_id: progress?.installation_id || null,
+      batch_number: progress?.batch_number ?? null,
+      assignment_attempt: progress?.assignment_attempt || null,
+      provenance: progress?.provenance || "legacy_unowned",
+      assignment_key: progress?.assignment_key || null,
+      assignment_items: Array.isArray(progress?.assignment_items) ? progress.assignment_items : [],
+      current: progress?.current === true,
+      owned: progress?.owned === true,
+      multi_repository: progress?.multi_repository === true,
+      compatibility_mode: progress?.compatibility_mode === "v1" ? "v1" : "v2",
+      ...(Number.isSafeInteger(progress?.admission_generation) && progress.admission_generation >= 0
+        ? { admission_generation: progress.admission_generation }
+        : {}),
+      ...(typeof progress?.batch_observation_fingerprint === "string"
+        ? { batch_observation_fingerprint: progress.batch_observation_fingerprint }
+        : {}),
+    };
+    const batch = batchAutomationState(progress, active);
+    if (!batch.authoritative || !batch.active || !batch.hasItems || batch.shouldStop) {
+      return { current: false, assignment: null };
+    }
+    return {
+      current: true,
+      assignment: {
+        assignment_key: batch.identity?.assignment_key || null,
+        assignment_attempt: batch.identity?.assignment_attempt || null,
+        // #1033's exact per-issue digest is consumed by delivery/recovery
+        // callers when available. The batch fingerprint is not substituted.
+        issue_contract_digest: null,
+      },
+    };
+  } catch {
+    return { current: false, assignment: null };
+  }
+}
+
+const lifecycleGovernor = createAgentLifecycleGovernor({
+  resourceSnapshot: () => resourceRuntimeOwner.snapshot(),
+  currentWork: currentWorkForLifecycle,
+  projectEligible: (projectId) => {
+    try { return !isProjectArchived(projectId); } catch { return false; }
+  },
+});
+
 // #631: Butler session — single global PTY (not per-project, no AC integration)
 let butlerSession = { term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
 
@@ -1010,8 +1064,9 @@ function buildAgentEnv(projectId, agentId) {
   return env;
 }
 
-// Helper: spawn a PTY for a project/agent and register in agentSessions
-async function spawnAgentPty(project, agent, opts = {}) {
+// Private PTY construction. It is intentionally not a lifecycle authority;
+// spawnAgentPty below is the only public/server call path and reserves first.
+async function launchAgentPty(project, agent, opts = {}) {
   const key = `${project}/${agent}`;
 
   try {
@@ -1050,6 +1105,12 @@ async function spawnAgentPty(project, agent, opts = {}) {
       viewerDims: new Map(),
       lastDims: null,
       state: "running",
+      lifecycleState: "spawned",
+      operationId: opts.operationId || null,
+      generationId: opts.generationId || null,
+      _lifecycleSpawnRecorded: false,
+      _lifecycleVerificationPending: false,
+      startedAt: new Date().toISOString(),
       error: null,
       // #1010: explicit backend identity for the session. The PTY dispatcher
       // gates its bounded deferred-wake cap on this — Claude only, because only
@@ -1075,6 +1136,14 @@ async function spawnAgentPty(project, agent, opts = {}) {
     const SCROLLBACK_SIZE = 64 * 1024;
     term.onData((data) => {
       session.lastOutputAt = Date.now();
+      // The first bytes from THIS PTY are a runtime-ready observation. They
+      // prove neither task completion nor semantic agent health, but they do
+      // distinguish spawned from verified without trusting a pid/map entry.
+      if (session.lifecycleState === "spawned" && session.operationId && session.generationId) {
+        session.lifecycleState = "verified";
+        session._lifecycleVerificationPending = true;
+        flushPendingLifecycleVerification(session);
+      }
       const chunk = Buffer.from(data);
       session.scrollback = Buffer.concat([session.scrollback, chunk]);
       if (session.scrollback.length > SCROLLBACK_SIZE) {
@@ -1093,7 +1162,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
             console.log(`[self-heal] ${key}: thinking-block 400 detected — restarting session`);
             // #825: NO clearSelfHeal here — the breaker window must persist
             // across auto-restarts so repeated trips can pause auto-recovery.
-            restartAgentSession(key, { reason: "thinking-block-400" })
+            restartAgentSession(key, { reason: "thinking-block-400", lifecycleSource: "self_heal" })
               .then((result) => {
                 if (result && result.ok) {
                   emitSystemMessage(project, `${agent} auto-restarted (recovered from thinking-block API error)`);
@@ -1132,6 +1201,93 @@ async function spawnAgentPty(project, agent, opts = {}) {
   }
 }
 
+// node-pty can emit initial bytes before the awaiting public wrapper records
+// its durable `spawned` transition. Do not let that ordering regress a real
+// ready observation back to spawned; hold it in the session until the record
+// exists, then make exactly one generation-matched transition.
+function flushPendingLifecycleVerification(session) {
+  if (!session?._lifecycleSpawnRecorded || !session._lifecycleVerificationPending
+    || !session.operationId || !session.generationId) return;
+  session._lifecycleVerificationPending = false;
+  lifecycleGovernor.transition({
+    projectId: session.projectId,
+    role: session.agentId,
+    operationId: session.operationId,
+    generationId: session.generationId,
+    status: "verified",
+    health: "running",
+  }).catch(() => { session.lifecycleState = "unknown"; });
+}
+
+function recordAgentSpawnedLifecycle(project, agent, operation) {
+  if (!operation?.operation_id || !operation?.generation_id) return;
+  const session = agentSessions.get(`${project}/${agent}`);
+  if (!session || session.operationId !== operation.operation_id || session.generationId !== operation.generation_id) return;
+  session._lifecycleSpawnRecorded = true;
+  flushPendingLifecycleVerification(session);
+}
+
+// The single admission path used by routes, restart/recovery, watchdog and
+// startup restoration. Its private launch callback receives server-generated
+// immutable IDs only after the durable reservation succeeds.
+async function spawnAgentPty(project, agent, opts = {}) {
+  let roleConfigured = false;
+  try {
+    const projectConfig = readConfig().projects?.find((entry) => entry?.id === project);
+    roleConfigured = !!projectConfig?.agents && Object.prototype.hasOwnProperty.call(projectConfig.agents, agent);
+  } catch {}
+  if (!roleConfigured) {
+    return { ok: false, code: "role_ineligible", status: 404, error: "agent role is not configured", lifecycle: null };
+  }
+  const source = opts.lifecycleSource || "operator_start";
+  const result = await lifecycleGovernor.launch({
+    projectId: project,
+    role: agent,
+    source,
+    operatorAuthorized: opts.operatorAuthorized === true,
+    allowHeadIntake: opts.allowHeadIntake === true,
+    explicitRole: opts.explicitRole === true,
+    fullReset: opts.fullReset === true,
+    operationId: opts.operationId,
+    expectedGeneration: opts.expectedGeneration,
+    lossCorrelation: opts.lossCorrelation,
+    liveSession: isPtyAlive(agentSessions.get(`${project}/${agent}`)?.term),
+    // #1038 has no pinned supported PTY scope in this source yet. This
+    // node-pty launch must therefore never satisfy Linux containment by an
+    // option supplied from a route or recovery caller.
+    containedLaunch: false,
+    launch: ({ operation_id, generation_id }) => launchAgentPty(project, agent, {
+      ...opts,
+      operationId: operation_id,
+      generationId: generation_id,
+    }),
+  });
+  if (result.status === "spawned") recordAgentSpawnedLifecycle(project, agent, result.operation);
+  if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation };
+  if (result.status === "verified") return { ok: true, lifecycle: result.operation };
+  return {
+    ok: false,
+    code: result.reason || result.status,
+    status: result.status === "rejected" ? 409 : 503,
+    error: result.reason || "agent lifecycle launch failed",
+    lifecycle: result.operation || null,
+  };
+}
+
+function hasTrustedResourceKill(session) {
+  if (!session?.projectId || !session?.generationId) return false;
+  try {
+    const facts = resourceRuntimeOwner.snapshot()?.terminal_facts;
+    return Array.isArray(facts) && facts.some((fact) => fact
+      && fact.project_id === session.projectId
+      && fact.generation_id === session.generationId
+      && fact.resource_class === "worker"
+      && fact.reason === "oom_kill");
+  } catch {
+    return false;
+  }
+}
+
 // #910: mark a session whose CLI process exited on its own (clean exit OR
 // crash) as stopped, and flag it `exitedUnexpectedly` so the watchdog will
 // auto-respawn it for a non-idle project. Shared by term.onExit and the
@@ -1143,6 +1299,20 @@ function markSessionExited(key, session, exitCode) {
   session.error = exitCode ? `exit:${exitCode}` : null;
   session.term = null;
   session.exitedUnexpectedly = true;
+  session.lastExitAt = new Date().toISOString();
+  session.exitReason = exitCode == null ? "unknown" : "exit";
+  const resourceKilled = hasTrustedResourceKill(session);
+  session.lifecycleState = resourceKilled ? "resource_killed" : "exited";
+  if (session.operationId && session.generationId) {
+    lifecycleGovernor.transition({
+      projectId: session.projectId,
+      role: session.agentId,
+      operationId: session.operationId,
+      generationId: session.generationId,
+      status: session.lifecycleState,
+      health: "unknown",
+    }).catch(() => { session.lifecycleState = "unknown"; });
+  }
   for (const v of session.viewers) {
     if (v.readyState <= 1) v.close(1000, `exited:${exitCode == null ? "" : exitCode}`);
   }
@@ -1216,6 +1386,21 @@ async function stopAgentSession(key, {
     session.state = "stopped";
     session.error = null;
     session.exitedUnexpectedly = false;
+    session.lifecycleState = "stopped";
+    if (session.operationId && session.generationId) {
+      try {
+        await lifecycleGovernor.transition({
+          projectId: session.projectId,
+          role: session.agentId,
+          operationId: session.operationId,
+          generationId: session.generationId,
+          status: "stopped",
+          health: "unknown",
+        });
+      } catch {
+        cleanupErrors.push({ resource: "lifecycle", code: "lifecycle_stop_persist_failed", message: "Lifecycle state could not record stop" });
+      }
+    }
   }
   const slash = key.indexOf("/");
   const projectId = slash > 0 ? key.slice(0, slash) : "";
@@ -1262,10 +1447,47 @@ function backendTempSweepTick() {
   }
 }
 
+function publicAgentLifecycleFacts(session, lifecycle) {
+  const state = lifecycle?.state || (session?.lifecycleState && [
+    "rejected", "reserved", "launch_failed", "spawned", "verified",
+    "exited", "unresponsive", "timed_out", "resource_killed", "stopped",
+  ].includes(session.lifecycleState)
+    ? session.lifecycleState
+    : (session?.state === "running" ? "spawned" : "stopped"));
+  const live = session?.state === "running" && !!session.term;
+  return {
+    state,
+    error: session?.error || null,
+    operation_id: lifecycle?.operation_id || session?.operationId || null,
+    generation_id: lifecycle?.generation_id || session?.generationId || null,
+    verification_state: lifecycle?.verification_state || (session?.lifecycleState === "verified" ? "verified" : "unconfirmed"),
+    health: live && state === "verified" ? "running" : (session?.lastExitAt ? "exited" : "unknown"),
+    pid: Number.isSafeInteger(session?.term?.pid) ? session.term.pid : null,
+    started_at: session?.startedAt || null,
+    last_output_at: session?.lastOutputAt ? new Date(session.lastOutputAt).toISOString() : null,
+    last_chat_at: session?.lastChatAt || null,
+    last_exit: session?.lastExitAt ? { at: session.lastExitAt, reason: session.exitReason || "unknown" } : null,
+    last_observation: lifecycle?.last_observation || null,
+    circuit: lifecycle?.circuit || null,
+  };
+}
+
 app.get("/api/agents", (_req, res) => {
   const agents = {};
+  const cfg = readConfig();
+  for (const project of (cfg.projects || [])) {
+    if (!project?.id || isProjectArchived(project.id, cfg)) continue;
+    for (const agentId of Object.keys(project.agents || {})) {
+      const key = `${project.id}/${agentId}`;
+      const session = agentSessions.get(key);
+      let lifecycle = null;
+      try { lifecycle = lifecycleGovernor.snapshot(project.id, agentId); } catch {}
+      agents[key] = publicAgentLifecycleFacts(session, lifecycle);
+    }
+  }
   for (const [key, session] of agentSessions) {
-    agents[key] = { state: session.state, error: session.error || null };
+    if (agents[key]) continue;
+    agents[key] = publicAgentLifecycleFacts(session, null);
   }
   res.json(agents);
 });
@@ -1277,6 +1499,7 @@ async function handleAgentChattr(_req, res) {
   return res.status(410).json({ ok: false, error: "AgentChattr removed in Phase 3" });
 }
 app.post("/api/agents/:project/reset", async (req, res) => {
+  if (!requireSessionToken(req, res)) return;
   const projectId = req.params.project;
 
   // #417: Reset Agents now stops and respawns all agent sessions for
@@ -1324,6 +1547,9 @@ app.post("/api/agents/:project/reset", async (req, res) => {
       const result = await spawnAgentPty(projectId, agentId, {
         suppressLifecycleMsg: true,
         admissionToken: admission,
+        lifecycleSource: "operator_reset",
+        operatorAuthorized: true,
+        fullReset: true,
       });
       if (result.ok) {
         emitSystemMessage(projectId, `${agentId} restarted`);
@@ -1348,6 +1574,7 @@ app.post("/api/agents/:project/reset", async (req, res) => {
 // --- Full Reset: restart all agents across all projects (#657) ---
 
 app.post("/api/full-reset", async (_req, res) => {
+  if (!requireSessionToken(_req, res)) return;
   const start = Date.now();
   console.log("[full-reset] starting...");
   try {
@@ -1372,6 +1599,7 @@ app.post("/api/full-reset", async (_req, res) => {
       try {
         const resetResp = await fetch(`http://127.0.0.1:${PORT}/api/agents/${encodeURIComponent(project.id)}/reset`, {
           method: "POST",
+          headers: { "X-Session-Token": SESSION_TOKEN },
         });
         const resetData = await resetResp.json();
         if (resetData.ok) {
@@ -1408,23 +1636,34 @@ app.post("/api/full-reset", async (_req, res) => {
 // --- Lifecycle: start spawns PTY (visible in terminal panel) ---
 
 app.post("/api/agents/:project/:agent/start", async (req, res) => {
+  if (!requireSessionToken(req, res)) return;
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
   const existing = agentSessions.get(key);
   if (existing && existing.state === "running" && existing.term) {
-    return res.json({ ok: true, state: "running", message: "Already running" });
+    let lifecycle = null;
+    try { lifecycle = lifecycleGovernor.snapshot(project, agent); } catch {}
+    return res.json({ ok: true, state: lifecycle?.state || "unknown", lifecycle, message: "Already running" });
   }
 
-  const result = await spawnAgentPty(project, agent);
+  const result = await spawnAgentPty(project, agent, {
+    lifecycleSource: "operator_start",
+    operatorAuthorized: true,
+    allowHeadIntake: true,
+    explicitRole: true,
+    expectedGeneration: typeof req.body?.expected_generation === "string" ? req.body.expected_generation : null,
+    lossCorrelation: typeof req.body?.loss_correlation === "string" ? req.body.loss_correlation : null,
+  });
   if (result.ok) {
-    res.json({ ok: true, state: "running", pid: result.pid });
+    res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null });
   } else {
     res.status(result.status || (result.error?.includes("Unknown") ? 400 : 500)).json({
       ok: false,
-      state: "error",
+      state: result.lifecycle?.state || "rejected",
       ...(result.code ? { code: result.code } : {}),
       error: result.error,
+      ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}),
     });
   }
 });
@@ -1432,13 +1671,16 @@ app.post("/api/agents/:project/:agent/start", async (req, res) => {
 // --- Lifecycle: stop kills PTY + closes WS ---
 
 app.post("/api/agents/:project/:agent/stop", async (req, res) => {
+  if (!requireSessionToken(req, res)) return;
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
   const result = await stopAgentSession(key, { clearSelfHeal: true }); // #825: manual stop resets the self-heal window
   if (!result.ok) {
     return res.status(409).json({ ok: false, state: "stopped", code: "agent_cleanup_incomplete", error: "Agent cleanup did not complete" });
   }
-  res.json({ ok: true, state: "stopped" });
+  let lifecycle = null;
+  try { lifecycle = lifecycleGovernor.snapshot(project, agent); } catch {}
+  res.json({ ok: true, state: lifecycle?.state || "stopped", lifecycle });
 });
 
 // --- Lifecycle: restart ---
@@ -1446,7 +1688,15 @@ app.post("/api/agents/:project/:agent/stop", async (req, res) => {
 // #797: shared restart sequence, used by both the manual restart route and
 // the self-heal detector. Exactly the prior route body — no new lifecycle
 // logic. The `reason` is informational (logged by callers).
-async function restartAgentSession(key, { reason, clearSelfHeal = false } = {}) {
+async function restartAgentSession(key, {
+  reason,
+  clearSelfHeal = false,
+  lifecycleSource = "operator_restart",
+  operatorAuthorized = false,
+  explicitRole = false,
+  expectedGeneration = null,
+  lossCorrelation = null,
+} = {}) {
   const [project, agent] = key.split("/");
   const admission = captureProjectAdmission(project);
   console.log(`[restart] ${key}: restarting session (reason: ${reason || "unspecified"})`);
@@ -1463,20 +1713,37 @@ async function restartAgentSession(key, { reason, clearSelfHeal = false } = {}) 
     return { ok: false, code: "project_admission_changed", status: 409, error: "project admission changed during restart" };
   }
 
-  return spawnAgentPty(project, agent, { suppressLifecycleMsg: true, admissionToken: admission });
+  return spawnAgentPty(project, agent, {
+    suppressLifecycleMsg: true,
+    admissionToken: admission,
+    lifecycleSource,
+    operatorAuthorized,
+    explicitRole,
+    ...(expectedGeneration ? { expectedGeneration } : {}),
+    ...(lossCorrelation ? { lossCorrelation } : {}),
+  });
 }
 
 app.post("/api/agents/:project/:agent/restart", async (req, res) => {
+  if (!requireSessionToken(req, res)) return;
   const { project, agent } = req.params;
   const key = `${project}/${agent}`;
 
   try {
-    const result = await restartAgentSession(key, { reason: "manual", clearSelfHeal: true }); // #825
+    const result = await restartAgentSession(key, {
+      reason: "manual",
+      clearSelfHeal: true,
+      lifecycleSource: "operator_restart",
+      operatorAuthorized: true,
+      explicitRole: true,
+      expectedGeneration: typeof req.body?.expected_generation === "string" ? req.body.expected_generation : null,
+      lossCorrelation: typeof req.body?.loss_correlation === "string" ? req.body.loss_correlation : null,
+    }); // #825
     if (result.ok) {
       emitSystemMessage(project, `${agent} restarted`);
-      res.json({ ok: true, state: "running", pid: result.pid });
+      res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null });
     } else {
-      res.status(result.status || 500).json({ ok: false, state: "error", ...(result.code ? { code: result.code } : {}), error: result.error });
+      res.status(result.status || 500).json({ ok: false, state: result.lifecycle?.state || "rejected", ...(result.code ? { code: result.code } : {}), error: result.error, ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}) });
     }
   } catch (err) {
     if (err instanceof ProjectLifecycleError) return respondLifecycleFailure(res, err, { state: "error" });
@@ -2260,6 +2527,7 @@ async function cleanupProjectRuntime(projectId) {
   mergeCleanupResult(aggregate, cancelPtyDispatchProject(projectId), "deferred_dispatch");
   mergeCleanupResult(aggregate, selfHeal.clearProject(projectId), "self_heal");
   mergeCleanupResult(aggregate, stopTrigger(projectId), "trigger");
+  const lifecycleCancelPromise = lifecycleGovernor.cancelProject(projectId);
   if (_bridgeBatchPrev.delete(projectId)) {
     aggregate.resources.bridge_batch_states = (aggregate.resources.bridge_batch_states || 0) + 1;
   }
@@ -2350,6 +2618,15 @@ async function cleanupProjectRuntime(projectId) {
   mergeCleanupResult(aggregate, await discordCleanupPromise, "discord_bridge");
   for (const cleanupPromise of sessionCleanupPromises) {
     mergeCleanupResult(aggregate, await cleanupPromise, "session");
+  }
+  try {
+    await lifecycleCancelPromise;
+  } catch {
+    aggregate.cleanup_errors.push({
+      resource: "lifecycle",
+      code: "lifecycle_cancel_failed",
+      message: "Project resource cleanup failed",
+    });
   }
   aggregate.ok = aggregate.cleanup_errors.length === 0;
   return aggregate;
@@ -2678,8 +2955,8 @@ app.use((req, res, next) => {
 const { scrubSecrets, scrubScrollback } = require("./scrub-secrets");
 
 // --- WebSocket + PTY ---
-// WS connects to an existing PTY session (started via lifecycle API)
-// or spawns a new one if none exists.
+// WS is observation/attachment only. A browser reconnect must never reserve or
+// start a role; lifecycle routes are the sole PTY spawn authority.
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -2732,15 +3009,12 @@ wss.on("connection:terminal", async (ws, req) => {
   const sessionKey = `${projectId}/${agentId}`;
   let session = agentSessions.get(sessionKey);
 
-  // If no active PTY, spawn one
+  // A dashboard load/reconnect is not an operator lifecycle action.
   if (!session || !session.term) {
-    const result = await spawnAgentPty(projectId, agentId);
-    if (!result.ok) {
-      ws.close(result.status === 409 || result.status === 404 || result.status === 503 ? 1008 : 1011,
-        result.code || "pty-spawn-failed");
-      return;
-    }
-    session = agentSessions.get(sessionKey);
+    let lifecycle = null;
+    try { lifecycle = lifecycleGovernor.snapshot(projectId, agentId); } catch {}
+    ws.close(1008, lifecycle?.state || "stopped");
+    return;
   }
 
   try { assertProjectAdmitted(projectId); }
@@ -3193,6 +3467,7 @@ async function watchdogCheck(deps = {}) {
       const result = await spawn(projectId, agentId, {
         suppressLifecycleMsg: true,
         admissionToken: admission,
+        lifecycleSource: "watchdog",
       });
       if (result.ok) emit(projectId, `${agentId} auto-respawned (had exited)`);
       else errorLog(`[watchdog] ${key}: auto-respawn failed: ${result.error}`);
@@ -3368,9 +3643,16 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
     // Reuse the project's configured agent keys (covers legacy layouts); fall
     // back to the canonical four. spawnAgentPty resolves cwd per agent and
     // returns {ok:false} for an unknown one, so a stray key can't crash boot.
-    const agentKeys = project.agents && typeof project.agents === "object"
+    const configuredAgentKeys = project.agents && typeof project.agents === "object"
       ? Object.keys(project.agents)
       : ["head", "re1", "re2", "dev"];
+    // Restore the coordinator first. Worker admission is rechecked before
+    // each subsequent role, so capacity/assignment drift cannot recreate the
+    // historical all-four spawn from a sticky batch snapshot.
+    const agentKeys = [
+      ...configuredAgentKeys.filter((agentId) => agentId === "head"),
+      ...configuredAgentKeys.filter((agentId) => agentId !== "head"),
+    ];
     const restored = [];
     for (const agentId of agentKeys) {
       if (!admissionCurrent(admission) || archived(project.id)) break;
@@ -3387,6 +3669,7 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
         const r = await spawn(project.id, agentId, {
           suppressLifecycleMsg: true,
           admissionToken: admission,
+          lifecycleSource: "startup_restore",
         });
         if (r && r.ok) restored.push(agentId);
         else log(`[respawn] ${key}: spawn failed: ${(r && r.error) || "unknown error"}`);

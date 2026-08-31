@@ -37,7 +37,13 @@ const CHAT_MESSAGES = [
 // /api/agents returns ONLY live sessions: head running, dev stopped. re1/re2
 // are configured but absent → must surface as "missing".
 const RUNTIME_AGENTS = {
-  "plotlink/head": { state: "running", error: null },
+  "plotlink/head": {
+    state: "verified", error: null, operation_id: "operation-head", generation_id: "generation-head",
+    verification_state: "verified", health: "running", pid: 4242,
+    started_at: "2026-09-01T00:00:00.000Z", last_output_at: "2026-09-01T00:00:01.000Z",
+    last_chat_at: null, last_exit: null, last_observation: { at: "2026-09-01T00:00:01.000Z", health: "running" },
+    circuit: { open: false },
+  },
   "plotlink/dev": { state: "stopped", error: null },
 };
 
@@ -224,10 +230,13 @@ async function runTests() {
   const plAgents = await handlers.list_agents({ project: "plotlink" }, ctx);
   const byAgent = Object.fromEntries(plAgents.map((a) => [a.agent, a.state]));
   assert(plAgents.length === 4, "list_agents (filtered) returns all 4 configured agents");
-  assert(byAgent.head === "running", "list_agents shows runtime state for a live agent (head=running)");
+  assert(byAgent.head === "verified", "list_agents shows canonical runtime state for a live agent (head=verified)");
   assert(byAgent.dev === "stopped", "list_agents shows runtime state for a stopped agent (dev=stopped)");
   assert(byAgent.re1 === "missing" && byAgent.re2 === "missing", "list_agents includes configured-but-untracked agents as 'missing'");
   assert(plAgents.every((a) => a.project === "plotlink"), "list_agents filters to the requested project");
+  const observedHead = plAgents.find((a) => a.agent === "head");
+  assert(observedHead && observedHead.health === "running" && observedHead.pid === 4242
+    && observedHead.generation_id === "generation-head", "list_agents preserves redacted generation and raw health observations");
 
   server.close();
   console.log(`\n${passed} passed, ${failed} failed\n`);

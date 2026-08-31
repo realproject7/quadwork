@@ -35,7 +35,7 @@ function startServer() {
       let raw = "";
       req.on("data", (c) => (raw += c));
       req.on("end", () => {
-        requests.push({ method: req.method, url: req.url });
+        requests.push({ method: req.method, url: req.url, raw });
         const send = (obj, status = 200) => {
           res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify(obj));
@@ -82,6 +82,18 @@ async function runTests() {
     const post = requests.find((r) => r.method === "POST" && r.url.includes("/api/agents/"));
     assert(post && post.url === `/api/agents/plotlink/dev/${action}`, `agent_control '${action}' POSTs to /api/agents/plotlink/dev/${action}`);
     assert(res && res.ok === true, `agent_control '${action}' returns the endpoint response`);
+  }
+
+  // An Operator can forward the two server-observed circuit anchors for a
+  // one-at-a-time start/restart trial; the tool never invents either value.
+  {
+    requests.length = 0;
+    await handlers.agent_control({
+      project: "plotlink", agent: "dev", action: "start",
+      expected_generation: "generation-observed", loss_correlation: "loss-observed",
+    }, ctx);
+    const post = requests.find((r) => r.method === "POST" && r.url.endsWith("/start"));
+    assert(post && post.raw === JSON.stringify({ expected_generation: "generation-observed", loss_correlation: "loss-observed" }), "circuit-open start forwards only observed generation and loss correlation");
   }
 
   // ── invalid action → rejected BEFORE any HTTP call ──────────────────────

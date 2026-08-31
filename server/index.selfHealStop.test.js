@@ -11,7 +11,7 @@ const path = require("path");
 
 const src = fs.readFileSync(path.join(__dirname, "index.js"), "utf-8");
 
-function span(marker, len = 1400) {
+function span(marker, len = 2200) {
   const s = src.indexOf(marker);
   return s === -1 ? "" : src.slice(s, s + len);
 }
@@ -29,15 +29,19 @@ function run() {
   ok(/stopAgentSession\(key,\s*\{[\s\S]*?clearSelfHeal\s*=\s*false/.test(stopFn), "stopAgentSession takes { clearSelfHeal = false } (off by default)");
   ok(/if\s*\(clearSelfHeal\)\s*selfHeal\.clearState\(key\)/.test(stopFn), "stopAgentSession clears self-heal state ONLY when clearSelfHeal is set");
 
-  // restartAgentSession forwards the flag to its internal stop.
-  ok(/restartAgentSession\(key,\s*\{\s*reason,\s*clearSelfHeal\s*=\s*false\s*\}/.test(restartFn), "restartAgentSession takes clearSelfHeal (default false)");
+  // #1053 keeps the old breaker flag but makes source/authorization explicit:
+  // a caller cannot accidentally turn an automatic recovery into an operator
+  // restart merely by reusing the helper.
+  ok(/restartAgentSession\(key,\s*\{\s*reason,\s*clearSelfHeal\s*=\s*false,\s*lifecycleSource\s*=\s*"operator_restart",\s*operatorAuthorized\s*=\s*false/.test(restartFn), "restartAgentSession distinguishes default operator source from unauthorized automatic recovery");
   ok(/stopAgentSession\(key,\s*\{\s*clearSelfHeal\s*\}\)/.test(restartFn), "restartAgentSession forwards clearSelfHeal to stopAgentSession");
 
-  // The self-heal AUTO-restart must NOT clear (breaker window must persist).
-  ok(/restartAgentSession\(key,\s*\{\s*reason:\s*"thinking-block-400"\s*\}\)/.test(src), "auto-restart (thinking-block-400) does NOT pass clearSelfHeal → breaker preserved");
+  // The self-heal AUTO-restart must retain an automatic source and must NOT
+  // clear the breaker. Its actual process request is later governed by #1053.
+  ok(/restartAgentSession\(key,\s*\{\s*reason:\s*"thinking-block-400",\s*lifecycleSource:\s*"self_heal"\s*\}\)/.test(src), "auto-restart uses self_heal source and does NOT pass clearSelfHeal → breaker preserved");
 
-  // Manual intervention paths DO reset the window.
-  ok(/restartAgentSession\(key,\s*\{\s*reason:\s*"manual",\s*clearSelfHeal:\s*true\s*\}\)/.test(src), "manual restart route passes clearSelfHeal: true");
+  // Manual intervention paths alone carry the operator source/authority and
+  // may reset the legacy detector window.
+  ok(/reason:\s*"manual",[\s\S]*?clearSelfHeal:\s*true,[\s\S]*?lifecycleSource:\s*"operator_restart",[\s\S]*?operatorAuthorized:\s*true/.test(src), "manual restart carries operator authority and clearSelfHeal: true");
   ok(/stopAgentSession\(key,\s*\{\s*clearSelfHeal:\s*true\s*\}\)/.test(src), "manual stop / full-reset passes clearSelfHeal: true");
   ok(/stopAgentSession\(`\$\{projectId\}\/\$\{agentId\}`,\s*\{\s*clearSelfHeal:\s*true\s*\}\)/.test(src), "project reset loop passes clearSelfHeal: true");
 
