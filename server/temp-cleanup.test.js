@@ -125,6 +125,36 @@ function touch(p, ageHours, { dir = false } = {}) {
   fs.rmSync(external, { recursive: true, force: true });
 }
 
+// ── failed Gemini quarantine disposal is rediscovered and retried ────────
+{
+  const { root } = makeFixture();
+  const staleDump = path.join(root, "gemini-client-error-retry.json");
+  touch(staleDump, 100);
+  const fixtureUid = typeof process.getuid === "function" ? process.getuid() : null;
+  const owner = fixtureUid === null ? "nouid" : String(fixtureUid);
+  const realRmSync = fs.rmSync;
+  let injected = false;
+  fs.rmSync = function hookedRmSync(target, options) {
+    if (!injected && path.basename(target).startsWith(`gemini-client-error-quadwork-quarantine-${owner}-`)) {
+      injected = true;
+      throw new Error("injected quarantine disposal failure");
+    }
+    return realRmSync.call(fs, target, options);
+  };
+  const first = sweepBackendTemp({ tmpRoot: root, uid: fixtureUid, now: NOW, maxAgeHours: 72 });
+  fs.rmSync = realRmSync;
+  assert.equal(first.errors.length, 1);
+  assert.ok(!fs.existsSync(staleDump), "failed disposal still detaches the original Gemini name");
+  const quarantine = fs.readdirSync(root)
+    .find((name) => name.startsWith(`gemini-client-error-quadwork-quarantine-${owner}-`));
+  assert.ok(quarantine, "UID-qualified Gemini quarantine remains discoverable");
+
+  const second = sweepBackendTemp({ tmpRoot: root, uid: fixtureUid, now: NOW, maxAgeHours: 72 });
+  assert.ok(!fs.existsSync(path.join(root, quarantine)), "later legacy sweep retries the owned quarantine");
+  assert.equal(second.removed.length, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 // ── cleanupSettings: defaults + opt-out + custom/invalid age + null cfg ───
 {
   assert.equal(cleanupSettings({}).enabled, true, "default: enabled");

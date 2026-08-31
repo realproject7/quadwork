@@ -16,7 +16,7 @@ const RAMFS_MAGIC = 0x858458f6n;
 const DEFAULT_STALE_HOURS = 72;
 const GENERATION_PREFIX = "generation-";
 const GENERATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const QUARANTINE_PREFIX = ".quadwork-delete-";
+const GENERATION_QUARANTINE_RE = /^\.quadwork-generation-quarantine-([A-Za-z0-9][A-Za-z0-9._-]{0,127})-([a-f0-9]{32})$/;
 const FACT_STATE = new WeakMap();
 
 class ResourceTempError extends Error {
@@ -89,11 +89,52 @@ function readFilesystemState(statfsProbe, target) {
   });
 }
 
+function joinHandlePath(handleRoot, name) {
+  if (typeof name !== "string" || name.length === 0 || name.includes(path.sep) || name === "." || name === "..") {
+    throw new ResourceTempError("invalid_handle_entry", "descriptor-relative entry name is invalid");
+  }
+  return path.join(handleRoot, name);
+}
+
+function linuxRootHandleFactory({ root, fsImpl }) {
+  if (process.platform !== "linux"
+    || !Number.isInteger(fsImpl.constants.O_DIRECTORY)
+    || !Number.isInteger(fsImpl.constants.O_NOFOLLOW)) {
+    throw new ResourceTempError("descriptor_anchor_unavailable", "Linux descriptor-relative root access is unavailable");
+  }
+  const flags = fsImpl.constants.O_RDONLY | fsImpl.constants.O_DIRECTORY | fsImpl.constants.O_NOFOLLOW;
+  const fd = fsImpl.openSync(root, flags);
+  const handleRoot = `/proc/self/fd/${fd}`;
+  try {
+    const opened = statIdentity(fsImpl.fstatSync(fd));
+    const anchored = statIdentity(fsImpl.statSync(handleRoot));
+    if (!sameIdentity(opened, anchored)) {
+      throw new ResourceTempError("descriptor_anchor_unavailable", "proc-fd root identity does not match the opened directory");
+    }
+  } catch (err) {
+    try { fsImpl.closeSync(fd); } catch {}
+    if (err instanceof ResourceTempError) throw err;
+    throw new ResourceTempError("descriptor_anchor_unavailable", `cannot verify proc-fd root anchor: ${err.message}`);
+  }
+  return {
+    stat: () => fsImpl.fstatSync(fd),
+    statfsPath: handleRoot,
+    mkdir: (name, options) => fsImpl.mkdirSync(joinHandlePath(handleRoot, name), options),
+    lstat: (name) => fsImpl.lstatSync(joinHandlePath(handleRoot, name)),
+    readdir: () => fsImpl.readdirSync(handleRoot),
+    rename: (from, to) => fsImpl.renameSync(joinHandlePath(handleRoot, from), joinHandlePath(handleRoot, to)),
+    rm: (name) => fsImpl.rmSync(joinHandlePath(handleRoot, name), { recursive: true, force: true, maxRetries: 2 }),
+    close: () => fsImpl.closeSync(fd),
+  };
+}
+
 // Read-only inspection. It deliberately does not create, chmod, or clean any
 // path. Call ensureTempRoot explicitly when host mutation is intended.
 function inspectTempRoot(options = {}) {
   const fsImpl = options.fsImpl || fs;
   const statfsProbe = options.statfs || ((target) => fsImpl.statfsSync(target, { bigint: true }));
+  const rootHandleFactory = options.rootHandleFactory
+    || (process.platform === "linux" ? linuxRootHandleFactory : null);
   const configuredRoot = options.tempRoot;
   const minimumFreeBytesBig = Number.isFinite(options.minimumFreeBytes) && options.minimumFreeBytes >= 0
     ? BigInt(Math.trunc(options.minimumFreeBytes))
@@ -194,6 +235,15 @@ function inspectTempRoot(options = {}) {
       diskBacked: true,
     });
   }
+  if (typeof rootHandleFactory !== "function") {
+    return unavailable(configuredRoot, "descriptor_anchor_unavailable", {
+      canonicalRoot,
+      filesystemType: filesystem.type,
+      availableBytes: filesystem.availableBytes,
+      minimumFreeBytes,
+      diskBacked: true,
+    });
+  }
 
   const facts = Object.freeze({
     available: true,
@@ -211,6 +261,7 @@ function inspectTempRoot(options = {}) {
   FACT_STATE.set(facts, Object.freeze({
     fsImpl,
     statfsProbe,
+    rootHandleFactory,
     identity: initialIdentity,
     expectedUid,
     filesystemTypeBig: filesystem.typeBig,
@@ -276,38 +327,64 @@ function requireAvailableFacts(facts, fsImpl) {
   return state;
 }
 
-function assertRootSafety(facts, fsImpl, { requireFreeSpace }) {
+function withRootHandle(facts, fsImpl, { requireFreeSpace }, operation) {
   const state = requireAvailableFacts(facts, fsImpl);
+  let handle;
+  try {
+    handle = state.rootHandleFactory({ root: facts.canonicalRoot, fsImpl });
+  } catch (err) {
+    if (err instanceof ResourceTempError) throw err;
+    throw new ResourceTempError("descriptor_anchor_unavailable", `cannot open resource temp root descriptor: ${err.message}`, facts);
+  }
   let st;
   let identity;
-  let currentRealpath;
   let filesystem;
   try {
-    st = fsImpl.lstatSync(facts.canonicalRoot);
+    st = handle.stat();
     identity = statIdentity(st);
-    currentRealpath = realpathSync(fsImpl, facts.canonicalRoot);
-    filesystem = readFilesystemState(state.statfsProbe, facts.canonicalRoot);
+    filesystem = readFilesystemState(state.statfsProbe, handle.statfsPath);
   } catch (err) {
+    try { handle.close(); } catch {}
     throw new ResourceTempError("root_identity_lost", `resource temp root is no longer available: ${err.message}`, facts);
   }
-  if (st.isSymbolicLink()
-    || !st.isDirectory()
-    || currentRealpath !== facts.canonicalRoot
-    || !sameIdentity(identity, state.identity)) {
+  if (!st.isDirectory() || !sameIdentity(identity, state.identity)) {
+    try { handle.close(); } catch {}
     throw new ResourceTempError("root_identity_changed", "resource temp root identity changed", facts);
   }
   if (identity.uid !== state.identity.uid
     || (state.expectedUid !== null && identity.uid !== state.expectedUid)
     || identity.mode !== 0o700) {
+    try { handle.close(); } catch {}
     throw new ResourceTempError("root_permissions_changed", "resource temp root ownership or mode changed", facts);
   }
   if (!filesystem.diskBacked || filesystem.typeBig !== state.filesystemTypeBig) {
+    try { handle.close(); } catch {}
     throw new ResourceTempError("root_filesystem_changed", "resource temp filesystem class changed", facts);
   }
   if (requireFreeSpace && filesystem.availableBytesBig < state.minimumFreeBytesBig) {
+    try { handle.close(); } catch {}
     throw new ResourceTempError("insufficient_free_space", "resource temp root no longer has required free space", facts);
   }
-  return state;
+  try {
+    return operation(handle, state);
+  } finally {
+    try { handle.close(); } catch {}
+  }
+}
+
+function namespaceStillOwnsRoot(facts, state, fsImpl) {
+  try {
+    const st = fsImpl.lstatSync(facts.canonicalRoot);
+    const identity = statIdentity(st);
+    return !st.isSymbolicLink()
+      && st.isDirectory()
+      && sameIdentity(identity, state.identity)
+      && identity.uid === state.identity.uid
+      && identity.mode === 0o700
+      && realpathSync(fsImpl, facts.canonicalRoot) === facts.canonicalRoot;
+  } catch {
+    return false;
+  }
 }
 
 function generationPath(facts, generationId) {
@@ -322,53 +399,81 @@ function generationPath(facts, generationId) {
 function createGenerationTemp(options = {}) {
   const fsImpl = options.fsImpl || fs;
   const facts = options.facts;
-  const state = assertRootSafety(facts, fsImpl, { requireFreeSpace: true });
   const generationId = validateGenerationId(options.generationId);
+  const entryName = `${GENERATION_PREFIX}${generationId}`;
   const target = generationPath(facts, generationId);
-  try {
-    fsImpl.mkdirSync(target, { recursive: false, mode: 0o700 });
-    const st = fsImpl.lstatSync(target);
-    const identity = statIdentity(st);
-    if (st.isSymbolicLink()
-      || !st.isDirectory()
-      || identity.mode !== 0o700
-      || identity.uid !== state.identity.uid
-      || identity.dev !== state.identity.dev) {
-      throw new ResourceTempError("generation_path_unsafe", "generation temp path is not a real directory", facts);
-    }
-    const canonicalTarget = realpathSync(fsImpl, target);
-    if (!isWithin(facts.canonicalRoot, canonicalTarget)) {
-      throw new ResourceTempError("generation_outside_root", "generation path resolves outside the configured root", facts);
-    }
-  } catch (err) {
-    if (err instanceof ResourceTempError) throw err;
-    let code = "generation_create_failed";
-    if (err && err.code === "EEXIST") {
-      try {
-        code = fsImpl.lstatSync(target).isSymbolicLink() ? "generation_path_unsafe" : "generation_exists";
-      } catch {
-        code = "generation_exists";
+  return withRootHandle(facts, fsImpl, { requireFreeSpace: true }, (handle, state) => {
+    try {
+      handle.mkdir(entryName, { recursive: false, mode: 0o700 });
+      const st = handle.lstat(entryName);
+      const identity = statIdentity(st);
+      if (st.isSymbolicLink()
+        || !st.isDirectory()
+        || identity.mode !== 0o700
+        || identity.uid !== state.identity.uid
+        || identity.dev !== state.identity.dev) {
+        throw new ResourceTempError("generation_path_unsafe", "generation temp path is not a real directory", facts);
       }
+      if (!namespaceStillOwnsRoot(facts, state, fsImpl)) {
+        try { handle.rm(entryName); } catch {}
+        throw new ResourceTempError("root_identity_changed", "resource temp root pathname changed during generation creation", facts);
+      }
+    } catch (err) {
+      if (err instanceof ResourceTempError) throw err;
+      let code = "generation_create_failed";
+      if (err && err.code === "EEXIST") {
+        try {
+          code = handle.lstat(entryName).isSymbolicLink() ? "generation_path_unsafe" : "generation_exists";
+        } catch {
+          code = "generation_exists";
+        }
+      }
+      throw new ResourceTempError(code, `cannot create generation temp directory: ${err.message}`, facts);
     }
-    throw new ResourceTempError(code, `cannot create generation temp directory: ${err.message}`, facts);
-  }
-  return Object.freeze({ generationId, path: target, mode: 0o700 });
+    return Object.freeze({ generationId, path: target, mode: 0o700 });
+  });
 }
 
-// Atomically detach an owned entry from its caller-visible path, then delegate
-// recursive disposal to Node's native fs.rm implementation. Unlike a custom
-// lstat/readdir/unlink walk, the native primitive treats symlinks as entries
-// and does not recurse through their targets. A swap before rename moves the
-// swapped entry into quarantine; a swap after rename can only replace the
-// unguessable quarantine entry and is likewise removed as an entry.
-function removeConfinedPath(root, target, fsImpl = fs) {
+function generationQuarantineName(generationId) {
+  return `.quadwork-generation-quarantine-${validateGenerationId(generationId)}-${crypto.randomBytes(16).toString("hex")}`;
+}
+
+// Detach and dispose using only descriptor-relative direct-child operations.
+// If disposal fails, the exact reserved quarantine grammar preserves the
+// generation owner for a later authoritative stale sweep.
+function detachGeneration(handle, generationId) {
+  const source = `${GENERATION_PREFIX}${validateGenerationId(generationId)}`;
+  const quarantine = generationQuarantineName(generationId);
+  try {
+    handle.rename(source, quarantine);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return false;
+    throw err;
+  }
+  try {
+    handle.rm(quarantine);
+  } catch {
+    throw new ResourceTempError("quarantine_pending", "generation was detached but quarantine disposal remains pending");
+  }
+  return true;
+}
+
+// Legacy cleanup compatibility. V2 generation lifecycle never calls this
+// pathname helper; it is descriptor-anchored by detachGeneration above.
+function removeConfinedPath(root, target, fsImpl = fs, quarantineName = null) {
   if (!path.isAbsolute(root) || !path.isAbsolute(target) || !isWithin(root, target)) {
     throw new ResourceTempError("cleanup_outside_root", "cleanup target is outside the configured root");
   }
-  let quarantine = null;
+  const quarantineDir = path.dirname(target);
+  if (quarantineDir !== root && !isWithin(root, quarantineDir)) {
+    throw new ResourceTempError("cleanup_outside_root", "cleanup quarantine is outside the configured root");
+  }
+  let quarantine = quarantineName ? path.join(quarantineDir, quarantineName) : null;
   let renamed = false;
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    quarantine = path.join(root, `${QUARANTINE_PREFIX}${process.pid}-${crypto.randomBytes(16).toString("hex")}`);
+    if (!quarantineName) {
+      quarantine = path.join(quarantineDir, `.quadwork-legacy-quarantine-${crypto.randomBytes(16).toString("hex")}`);
+    }
     try {
       fsImpl.renameSync(target, quarantine);
       renamed = true;
@@ -398,10 +503,10 @@ function reclaimGenerationTemp(options = {}) {
       reason: "process_tree_exit_unconfirmed",
     });
   }
-  assertRootSafety(facts, fsImpl, { requireFreeSpace: false });
-  const target = generationPath(facts, generationId);
-  const removed = removeConfinedPath(facts.canonicalRoot, target, fsImpl);
-  return Object.freeze({ generationId, reclaimed: true, alreadyAbsent: !removed });
+  return withRootHandle(facts, fsImpl, { requireFreeSpace: false }, (handle) => {
+    const removed = detachGeneration(handle, generationId);
+    return Object.freeze({ generationId, reclaimed: true, alreadyAbsent: !removed });
+  });
 }
 
 function newestTimeMs(st) {
@@ -420,39 +525,66 @@ function sweepStaleGenerationTemps(options = {}) {
   }
   const live = new Set();
   for (const generationId of suppliedLive) live.add(validateGenerationId(generationId));
-  assertRootSafety(facts, fsImpl, { requireFreeSpace: false });
   const now = typeof options.now === "number" ? options.now : Date.now();
   const maxAgeHours = Number.isFinite(options.maxAgeHours) && options.maxAgeHours > 0
     ? options.maxAgeHours
     : DEFAULT_STALE_HOURS;
   const cutoffMs = now - maxAgeHours * 60 * 60 * 1000;
-  const result = { removed: [], kept: [], errors: [] };
-
-  let names;
-  try {
-    names = fsImpl.readdirSync(facts.canonicalRoot);
-  } catch (err) {
-    result.errors.push(err.message);
-    return result;
-  }
-  for (const name of names) {
-    if (!name.startsWith(GENERATION_PREFIX)) continue;
-    const generationId = name.slice(GENERATION_PREFIX.length);
-    if (!GENERATION_ID_RE.test(generationId)) continue;
-    const target = path.join(facts.canonicalRoot, name);
+  return withRootHandle(facts, fsImpl, { requireFreeSpace: false }, (handle, state) => {
+    const result = { removed: [], kept: [], recoveredQuarantines: [], pendingQuarantines: [], errors: [] };
+    let names;
     try {
-      const st = fsImpl.lstatSync(target);
-      if (live.has(generationId) || newestTimeMs(st) >= cutoffMs) {
-        result.kept.push(generationId);
+      names = handle.readdir();
+    } catch (err) {
+      result.errors.push(err.message);
+      return result;
+    }
+    for (const name of names) {
+      const quarantineMatch = name.match(GENERATION_QUARANTINE_RE);
+      if (quarantineMatch) {
+        const generationId = quarantineMatch[1];
+        try {
+          const st = handle.lstat(name);
+          const identity = statIdentity(st);
+          if (identity.uid !== state.identity.uid || identity.dev !== state.identity.dev) {
+            result.errors.push(`${generationId}: quarantine ownership mismatch`);
+            continue;
+          }
+          if (live.has(generationId) || newestTimeMs(st) >= cutoffMs) {
+            result.pendingQuarantines.push(generationId);
+          } else {
+            handle.rm(name);
+            result.recoveredQuarantines.push(generationId);
+          }
+        } catch (err) {
+          result.errors.push(`${generationId}: ${err.message}`);
+        }
         continue;
       }
-      removeConfinedPath(facts.canonicalRoot, target, fsImpl);
-      result.removed.push(generationId);
-    } catch (err) {
-      result.errors.push(`${generationId}: ${err.message}`);
+      if (!name.startsWith(GENERATION_PREFIX)) continue;
+      const generationId = name.slice(GENERATION_PREFIX.length);
+      if (!GENERATION_ID_RE.test(generationId)) continue;
+      try {
+        const st = handle.lstat(name);
+        const identity = statIdentity(st);
+        if (identity.uid !== state.identity.uid
+          || identity.dev !== state.identity.dev
+          || (!st.isSymbolicLink() && (!st.isDirectory() || identity.mode !== 0o700))) {
+          result.errors.push(`${generationId}: generation ownership mismatch`);
+          continue;
+        }
+        if (live.has(generationId) || newestTimeMs(st) >= cutoffMs) {
+          result.kept.push(generationId);
+          continue;
+        }
+        detachGeneration(handle, generationId);
+        result.removed.push(generationId);
+      } catch (err) {
+        result.errors.push(`${generationId}: ${err.message}`);
+      }
     }
-  }
-  return result;
+    return result;
+  });
 }
 
 module.exports = {

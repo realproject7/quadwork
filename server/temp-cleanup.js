@@ -25,6 +25,7 @@
 //   matches nothing where those files don't exist.
 
 const fs = require("fs");
+const crypto = require("crypto");
 const os = require("os");
 const path = require("path");
 const { removeConfinedPath } = require("./resource-temp");
@@ -38,7 +39,7 @@ function newestTimeMs(st) {
 
 // Remove `entry` (file or dir) if its newest timestamp is older than the
 // cutoff. Returns "removed" | "kept" | "error".
-function removeIfStale(root, entry, cutoffMs, result) {
+function removeIfStale(root, entry, cutoffMs, result, quarantineName = null, alreadyQuarantined = false, expectedUid = null) {
   let st;
   try {
     st = fs.lstatSync(entry);
@@ -49,8 +50,16 @@ function removeIfStale(root, entry, cutoffMs, result) {
     result.kept += 1;
     return "kept";
   }
+  if (alreadyQuarantined && expectedUid !== null && Number(st.uid) !== expectedUid) {
+    result.errors.push(`${entry}: quarantine ownership mismatch`);
+    return "error";
+  }
   try {
-    removeConfinedPath(root, entry, fs);
+    if (alreadyQuarantined) {
+      fs.rmSync(entry, { recursive: true, force: true, maxRetries: 2 });
+    } else {
+      removeConfinedPath(root, entry, fs, quarantineName);
+    }
     result.removed.push(entry);
     return "removed";
   } catch (err) {
@@ -116,8 +125,18 @@ function sweepBackendTemp(opts = {}) {
       rootEntries = [];
     }
     for (const name of rootEntries) {
+      const quarantineMatch = name.match(/^gemini-client-error-quadwork-quarantine-(nouid|\d+)-([a-f0-9]{32})\.json$/);
+      if (quarantineMatch) {
+        if ((uid === null && quarantineMatch[1] === "nouid")
+          || (uid !== null && Number(quarantineMatch[1]) === uid)) {
+          removeIfStale(canonicalRoot, path.join(canonicalRoot, name), cutoffMs, result, null, true, uid);
+        }
+        continue;
+      }
       if (name.startsWith("gemini-client-error-") && name.endsWith(".json")) {
-        removeIfStale(canonicalRoot, path.join(canonicalRoot, name), cutoffMs, result);
+        const owner = uid === null ? "nouid" : String(uid);
+        const quarantineName = `gemini-client-error-quadwork-quarantine-${owner}-${crypto.randomBytes(16).toString("hex")}.json`;
+        removeIfStale(canonicalRoot, path.join(canonicalRoot, name), cutoffMs, result, quarantineName);
       }
     }
   } catch (err) {

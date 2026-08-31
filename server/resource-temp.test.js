@@ -18,6 +18,26 @@ const NOW = 1_800_000_000_000;
 const DISK = { type: 0xEF53n, bavail: 10_000n, bsize: 4096n };
 const diskStatfs = () => DISK;
 
+// Portable fixture implementation of the descriptor-relative seam. Production
+// uses the Linux proc-fd provider; tests inject this narrow directory adapter
+// because macOS /dev/fd directory descriptors cannot be traversed as paths.
+function pathRootHandle(root, fsImpl) {
+  return {
+    stat: () => fsImpl.lstatSync(root),
+    statfsPath: root,
+    mkdir: (name, options) => fsImpl.mkdirSync(path.join(root, name), options),
+    lstat: (name) => fsImpl.lstatSync(path.join(root, name)),
+    readdir: () => fsImpl.readdirSync(root),
+    rename: (from, to) => fsImpl.renameSync(path.join(root, from), path.join(root, to)),
+    rm: (name) => fsImpl.rmSync(path.join(root, name), { recursive: true, force: true }),
+    close: () => {},
+  };
+}
+
+function fixtureRootHandleFactory({ root, fsImpl }) {
+  return pathRootHandle(root, fsImpl);
+}
+
 function fixture(options = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-temp-"));
   const root = path.join(base, "configured", "temp");
@@ -26,6 +46,7 @@ function fixture(options = {}) {
     statfs: options.statfs || diskStatfs,
     fsImpl: options.fsImpl,
     minimumFreeBytes: options.minimumFreeBytes,
+    rootHandleFactory: options.rootHandleFactory || fixtureRootHandleFactory,
   });
   return { base, root, facts };
 }
@@ -61,6 +82,11 @@ function stamp(target, hoursOld) {
   assert.equal(lowSpace.reason, "temp_unavailable");
   assert.equal(lowSpace.code, "insufficient_free_space");
   assert.doesNotThrow(() => JSON.stringify(lowSpace), "resource facts remain API-serializable");
+
+  if (process.platform !== "linux") {
+    const unsupportedAnchor = inspectTempRoot({ tempRoot: missing, statfs: diskStatfs });
+    assert.equal(unsupportedAnchor.code, "descriptor_anchor_unavailable", "no pathname mutation fallback on unsupported hosts");
+  }
 
   const rootAlias = path.join(base, "root-alias");
   fs.symlinkSync(missing, rootAlias, "dir");
@@ -118,6 +144,73 @@ function stamp(target, hoursOld) {
   fs.rmSync(external, { recursive: true, force: true });
 }
 
+// The root pathname can be replaced after the conceptual descriptor open. All
+// mutation remains bound to the original inode, the new generation is rolled
+// back, and the external replacement receives no persistent data.
+{
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-temp-root-swap-external-"));
+  const survivor = path.join(external, "must-survive");
+  fs.writeFileSync(survivor, "safe");
+  let pinnedRoot = null;
+  function swappingFactory({ root, fsImpl }) {
+    pinnedRoot = `${root}-descriptor-pinned`;
+    fs.renameSync(root, pinnedRoot);
+    fs.symlinkSync(external, root, "dir");
+    return pathRootHandle(pinnedRoot, fsImpl);
+  }
+  const { base, facts } = fixture({ rootHandleFactory: swappingFactory });
+  assert.throws(
+    () => createGenerationTemp({ facts, generationId: "root-swap" }),
+    (err) => err.code === "root_identity_changed",
+  );
+  assert.equal(fs.readFileSync(survivor, "utf8"), "safe");
+  assert.ok(!fs.existsSync(path.join(external, "generation-root-swap")), "replacement root was never mutated");
+  assert.ok(!fs.existsSync(path.join(pinnedRoot, "generation-root-swap")), "failed admission rolled back via pinned root");
+  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(external, { recursive: true, force: true });
+}
+
+// Confirmed reclaim and stale sweep remain pinned to the original inode if the
+// public root pathname is swapped between operations.
+{
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-temp-cleanup-root-swap-"));
+  const survivor = path.join(external, "must-survive");
+  fs.writeFileSync(survivor, "safe");
+  let attack = false;
+  let pinnedRoot = null;
+  function switchableFactory({ root, fsImpl }) {
+    if (attack && !pinnedRoot) {
+      pinnedRoot = `${root}-descriptor-pinned`;
+      fs.renameSync(root, pinnedRoot);
+      fs.symlinkSync(external, root, "dir");
+    }
+    return pathRootHandle(pinnedRoot || root, fsImpl);
+  }
+  const { base, facts } = fixture({ rootHandleFactory: switchableFactory });
+  const reclaim = createGenerationTemp({ facts, generationId: "reclaim-root-swap" });
+  const stale = createGenerationTemp({ facts, generationId: "sweep-root-swap" });
+  stamp(stale.path, 100);
+  attack = true;
+  assert.equal(reclaimGenerationTemp({
+    facts,
+    generationId: "reclaim-root-swap",
+    confirmedProcessTreeExit: true,
+  }).reclaimed, true);
+  const swept = sweepStaleGenerationTemps({
+    facts,
+    now: NOW,
+    maxAgeHours: 72,
+    liveGenerationIds: [],
+  });
+  assert.ok(swept.removed.includes("sweep-root-swap"));
+  assert.equal(fs.readFileSync(survivor, "utf8"), "safe");
+  assert.deepEqual(fs.readdirSync(external), ["must-survive"], "replacement root receives no cleanup mutation");
+  assert.ok(!fs.existsSync(path.join(pinnedRoot, "generation-reclaim-root-swap")));
+  assert.ok(!fs.existsSync(path.join(pinnedRoot, "generation-sweep-root-swap")));
+  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(external, { recursive: true, force: true });
+}
+
 // Canonical identity handles an aliased parent (the macOS /var -> /private/var
 // shape) while generation containment remains rooted in the real directory.
 {
@@ -127,7 +220,11 @@ function stamp(target, hoursOld) {
   fs.mkdirSync(actualParent);
   fs.symlinkSync(actualParent, aliasParent, "dir");
   const configuredViaAlias = path.join(aliasParent, "temp");
-  const facts = ensureTempRoot({ tempRoot: configuredViaAlias, statfs: diskStatfs });
+  const facts = ensureTempRoot({
+    tempRoot: configuredViaAlias,
+    statfs: diskStatfs,
+    rootHandleFactory: fixtureRootHandleFactory,
+  });
   assert.equal(facts.canonicalRoot, fs.realpathSync(path.join(actualParent, "temp")));
   const generation = createGenerationTemp({ facts, generationId: "alias-safe" });
   assert.equal(path.dirname(generation.path), facts.canonicalRoot);
@@ -248,6 +345,56 @@ function stamp(target, hoursOld) {
     () => createGenerationTemp({ facts, fsImpl: hookedFs, generationId: "wrong-owner" }),
     (err) => err.code === "root_permissions_changed",
   );
+  fs.rmSync(base, { recursive: true, force: true });
+}
+
+// A failed post-detach disposal leaves an owner-qualified quarantine. A later
+// authoritative sweep preserves it for a live generation, then retries it once
+// the generation is non-live and stale.
+{
+  let failDisposal = true;
+  function failingDisposerFactory({ root, fsImpl }) {
+    const handle = pathRootHandle(root, fsImpl);
+    return {
+      ...handle,
+      rm(name) {
+        if (failDisposal && name.startsWith(".quadwork-generation-quarantine-")) {
+          failDisposal = false;
+          throw new Error("injected disposal failure");
+        }
+        return handle.rm(name);
+      },
+    };
+  }
+  const { base, facts } = fixture({ rootHandleFactory: failingDisposerFactory });
+  const generation = createGenerationTemp({ facts, generationId: "orphan-retry" });
+  assert.throws(
+    () => reclaimGenerationTemp({ facts, generationId: "orphan-retry", confirmedProcessTreeExit: true }),
+    (err) => err.code === "quarantine_pending",
+  );
+  assert.ok(!fs.existsSync(generation.path), "failed disposal is already detached from the active generation name");
+  const quarantine = fs.readdirSync(facts.canonicalRoot)
+    .find((name) => name.startsWith(".quadwork-generation-quarantine-orphan-retry-"));
+  assert.ok(quarantine, "owner-qualified quarantine remains discoverable");
+  stamp(path.join(facts.canonicalRoot, quarantine), 100);
+
+  const stillLive = sweepStaleGenerationTemps({
+    facts,
+    now: NOW,
+    maxAgeHours: 72,
+    liveGenerationIds: ["orphan-retry"],
+  });
+  assert.deepEqual(stillLive.pendingQuarantines, ["orphan-retry"]);
+  assert.ok(fs.existsSync(path.join(facts.canonicalRoot, quarantine)));
+
+  const recovered = sweepStaleGenerationTemps({
+    facts,
+    now: NOW,
+    maxAgeHours: 72,
+    liveGenerationIds: [],
+  });
+  assert.deepEqual(recovered.recoveredQuarantines, ["orphan-retry"]);
+  assert.ok(!fs.existsSync(path.join(facts.canonicalRoot, quarantine)));
   fs.rmSync(base, { recursive: true, force: true });
 }
 
