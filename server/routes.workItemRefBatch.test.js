@@ -51,10 +51,12 @@ const {
   parseActiveBatch,
   parseReviewItems,
   getOrComputeBatchProgress,
+  progressFromSnapshot,
   progressFromGithubFile,
   progressForItemRest,
   pickLinkedPrFromSearch,
   validateCurrentOwnedAssignment,
+  readLiveBatchContext,
   _batchProgressCache,
   _graphqlCache,
 } = routes;
@@ -90,6 +92,38 @@ async function run() {
   }
   parsed = parseActiveBatch(active(["- Acme/Web#42 first", "- acme/web#42 duplicate"]), { repositories, installationId: INSTALLATION_ID });
   assert.equal(parsed.errors[0]?.code, "duplicate_work_item_ref");
+  for (const malformedLine of [
+    "- Other/Repo#42 unknown",
+    "- Other/Repo #42 unknown split",
+    "- Other/repo.js #42 unknown split",
+    "- Acme//Web#42 malformed",
+    "- [Other/Repo #42] bracketed split",
+    "- [Acme//Web#42] bracketed malformed",
+  ]) {
+    parsed = parseActiveBatch(active(["- Acme/Web#41 valid", malformedLine]), { repositories, installationId: INSTALLATION_ID });
+    assert.ok(parsed.errors.length > 0, `${malformedLine} must reject the whole assignment instead of executing a valid subset`);
+  }
+  parsed = parseActiveBatch(active(["- https://docs.example/path#anchor prose", "- Acme/Web#41 valid"]), { repositories, installationId: INSTALLATION_ID });
+  assert.equal(parsed.errors.length, 0, "URL prose retains the existing ignored-line behavior");
+  assert.deepEqual(parsed.issueNumbers, [41]);
+
+  // Queue metadata is structure, never an item-title substring. A hostile
+  // remote title cannot mint local ownership or switch the batch execution mode.
+  const injectedTitleQueue = [
+    "## Active Batch",
+    `- Acme/Web#42 remote **Batch:** 12 **Batch type:** ticket-review **Installation ID:** ${INSTALLATION_ID} **Assignment attempt:** injected`,
+  ].join("\n");
+  parsed = parseActiveBatch(injectedTitleQueue, { repositories, installationId: INSTALLATION_ID });
+  assert.equal(parsed.batchNumber, null);
+  assert.notEqual(parsed.provenance, "owned");
+  assert.equal(routes.parseBatchType(injectedTitleQueue), "code");
+  const duplicateBatchMetadata = [
+    "## Active Batch", "**Batch:** 12", "Batch: 13",
+    `**Installation ID:** ${INSTALLATION_ID}`, "**Assignment attempt:** attempt_a", "- Acme/Web#42 valid",
+  ].join("\n");
+  parsed = parseActiveBatch(duplicateBatchMetadata, { repositories, installationId: INSTALLATION_ID });
+  assert.equal(parsed.batchNumber, null, "mixed accepted Batch syntaxes are one duplicate metadata namespace");
+  assert.notEqual(parsed.provenance, "owned");
 
   // A compact single-repo token remains parse-compatible but is never stamped
   // as V2-owned merely because installation metadata exists.
@@ -156,9 +190,17 @@ async function run() {
   assert.equal(Object.keys(writtenSnapshot.terminalItems).length, 1);
   assert.equal(ghCalls, 0);
 
+  const codeFingerprint = readLiveBatchContext("p").fingerprint;
+  queue = active(["- Acme/Web#42 queued", "- Acme/API#42 queued"], { type: "ticket-review" });
+  const reviewFingerprint = readLiveBatchContext("p").fingerprint;
+  assert.notEqual(reviewFingerprint, codeFingerprint, "batch type participates in the live assignment observation fingerprint");
+  payload = await getOrComputeBatchProgress("p");
+  assert.equal(payload.batch_type, "ticket-review", "code cache cannot survive an immediate review-mode rollover");
+  assert.ok(payload.items.every((item) => item.review_state === "queued"));
+
   // Attempt rollover invalidates the 10s project cache immediately.
   const oldKey = payload.assignment_key;
-  queue = active(["- Acme/Web#42 first", "- Acme/API#42 second"], { attempt: "attempt_b" });
+  queue = active(["- Acme/Web#42 first", "- Acme/API#42 second"], { attempt: "attempt_b", type: "code" });
   payload = await getOrComputeBatchProgress("p");
   assert.notEqual(payload.assignment_key, oldKey);
   assert.equal(payload.assignment_attempt, "attempt_b");
@@ -169,6 +211,7 @@ async function run() {
     installation_id: payload.installation_id,
     batch_number: payload.batch_number,
     assignment_attempt: payload.assignment_attempt,
+    provenance: payload.provenance,
     assignment_key: payload.assignment_key,
     assignment_items: [...payload.assignment_items].reverse(),
   };
@@ -177,6 +220,40 @@ async function run() {
     ...assignmentBody,
     assignment_items: [payload.assignment_items[0], payload.assignment_items[0]],
   }).ok, false);
+  assert.equal(validateCurrentOwnedAssignment("p", { provenance: "foreign" }).ok, false,
+    "provenance-only automated bodies are partial identity, never manual actions");
+  assert.equal(validateCurrentOwnedAssignment("p", { ...assignmentBody, provenance: "foreign" }).ok, false,
+    "full automated bodies must carry exact owned provenance");
+
+  const beforeForeignRollover = readLiveBatchContext("p");
+  queue = active(["- Acme/Web#42 first", "- Acme/API#42 second"], {
+    attempt: "attempt_b",
+    installation: "installation_9999999999999999",
+  });
+  const afterForeignRollover = readLiveBatchContext("p");
+  assert.notEqual(afterForeignRollover.fingerprint, beforeForeignRollover.fingerprint,
+    "TOCTOU fingerprint includes serialized installation/provenance changes");
+
+  // An explicit activated clear is an exact owned empty-set assignment. It is
+  // inactive/current:false but remains route-revalidatable for stop actions.
+  queue = active([], { attempt: "attempt_b" });
+  _batchProgressCache.clear();
+  payload = await getOrComputeBatchProgress("p");
+  assert.equal(payload.liveActiveBatchCleared, true);
+  assert.equal(payload.current, false);
+  assert.equal(payload.owned, true);
+  assert.deepEqual(payload.assignment_items, []);
+  assert.equal(validateCurrentOwnedAssignment("p", {
+    installation_id: payload.installation_id,
+    batch_number: payload.batch_number,
+    assignment_attempt: payload.assignment_attempt,
+    provenance: payload.provenance,
+    assignment_key: payload.assignment_key,
+    assignment_items: payload.assignment_items,
+  }).ok, true);
+  parsed = parseActiveBatch(active([], { attempt: "bad!" }), { repositories, installationId: INSTALLATION_ID });
+  assert.equal(parsed.assignmentKey, null, "empty-set clear still validates opaque assignment-attempt syntax");
+  assert.notEqual(parsed.provenance, "owned");
 
   // Preactivation one-repository bare queues remain explicitly V1-compatible
   // without being promoted to V2 ownership.
@@ -210,12 +287,38 @@ async function run() {
     ok: true,
     repositories: [
       { repo_key: "web", repo: "Acme/Web", issues: [{ number: 42, title: "web", url: "w" }], prs: [], closedIssues: [], mergedPrs: [], reviewDetail: {} },
-      { repo_key: "api", repo: "Acme/API", issues: [], prs: [{ number: 8, title: "#42 api", state: "OPEN", url: "p" }], closedIssues: [], mergedPrs: [], reviewDetail: {} },
+      { repo_key: "api", repo: "Acme/API", issues: [], prs: [{ number: 8, title: "#42 api", state: "OPEN", url: "p", tip: "api-tip" }], closedIssues: [], mergedPrs: [], reviewDetail: {} },
     ],
   };
   const fromFile = progressFromGithubFile(persisted, 42, { repoKey: "api", repo: "Acme/API", number: 42, kind: "issue" });
   assert.equal(fromFile.pr_number, 8);
   assert.equal(fromFile.live_pr.state, "OPEN");
+  for (const state of [undefined, "CLOSED", "MERGED"]) {
+    const unprovenOpen = progressFromSnapshot({
+      issues: [{ number: 42, title: "issue", state: "OPEN", url: "issue" }],
+      prs: [{ number: 7, title: "[#42] no proof", state, url: "pr", reviews: [] }],
+      mergedPrs: [], closedIssues: [],
+      openPrsWindowComplete: true, closedPrsWindowComplete: true, closedPrIssueNums: [],
+    }, 42);
+    assert.notEqual(unprovenOpen?.status, "in_review");
+    assert.notEqual(unprovenOpen?.status, "ready");
+    assert.equal(unprovenOpen?.live_pr == null, true);
+    const persistedUnproven = progressFromGithubFile({
+      ok: true,
+      openIssues: [{ number: 42, title: "issue", state: "OPEN", url: "issue" }],
+      openPRs: [{ number: 7, title: "#42 no proof", state, url: "pr" }],
+      mergedPrs: [], closedIssues: [], reviewDetail: { 7: { re1: { state: "APPROVED" }, re2: { state: "APPROVED" } } },
+    }, 42);
+    assert.notEqual(persistedUnproven?.status, "in_review");
+    assert.notEqual(persistedUnproven?.status, "ready");
+    assert.equal(persistedUnproven?.live_pr == null, true);
+  }
+  const openWithoutTip = progressFromSnapshot({
+    issues: [{ number: 42, title: "issue", state: "OPEN", url: "issue" }],
+    prs: [{ number: 7, title: "[#42] explicit open", state: "OPEN", url: "pr", reviews: [] }],
+    mergedPrs: [], closedIssues: [],
+  }, 42, { requireLiveRef: true });
+  assert.equal(openWithoutTip, null, "a V2 live row is unproven unless OPEN proof also has number, URL, and tip");
 
   // OPEN replacement wins over a newer historical merged PR; historical-only
   // lookup can never produce a live/ready row.

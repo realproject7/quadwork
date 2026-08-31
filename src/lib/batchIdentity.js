@@ -74,8 +74,8 @@ function sameWorkItemRef(left, right) {
     left.number === right.number && left.kind === right.kind;
 }
 
-function normalizeAssignmentItems(value) {
-  if (!Array.isArray(value) || value.length === 0) return null;
+function normalizeAssignmentItems(value, { allowEmpty = false } = {}) {
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) return null;
   const seenOwnership = new Set();
   const seenRefs = new Set();
   const normalized = [];
@@ -129,16 +129,17 @@ function workItemDisplayLabel(row, multiRepository) {
   return repoKey ? `[${repoKey}] ${bare}` : `[?] ${bare}`;
 }
 
-function assignmentIdentity(value) {
+function assignmentIdentity(value, { allowCleared = false } = {}) {
   if (!value || typeof value !== "object") return null;
   const installationId = nonEmptyString(value.installation_id);
   const batchNumber = positiveInteger(value.batch_number);
   const attempt = assignmentAttempt(value.assignment_attempt);
   const assignmentKey = nonEmptyString(value.assignment_key);
-  const assignmentItems = normalizeAssignmentItems(value.assignment_items);
+  const assignmentItems = normalizeAssignmentItems(value.assignment_items, { allowEmpty: allowCleared });
   if (
     !installationId || !batchNumber || !attempt || !assignmentKey || !assignmentItems ||
-    value.provenance !== OWNED_PROVENANCE || value.current !== true || value.owned !== true
+    value.provenance !== OWNED_PROVENANCE || value.owned !== true ||
+    (allowCleared ? value.current !== false : value.current !== true)
   ) return null;
   return {
     installation_id: installationId,
@@ -201,14 +202,18 @@ function legacyV1BatchSnapshot(active, progress) {
   if (!activeBatch || activeBatch !== progressBatch) return null;
   const liveActiveBatchCleared = progress.liveActiveBatchCleared === true;
   if (progress.items.length === 0 && !liveActiveBatchCleared) return null;
-  if (progress.items.length > 0 && progress.current !== true) return null;
-  for (const row of progress.items) {
-    if (
-      row.provenance !== "legacy_unowned" ||
-      row.owned !== false || row.current !== true || row.batch_number !== progressBatch ||
-      row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
-      row.ownership_key != null || !ownedWorkItemIdentityMatches(row)
-    ) return null;
+  if (liveActiveBatchCleared) {
+    if (active.active !== false || progress.current !== false) return null;
+  } else {
+    if (progress.items.length > 0 && progress.current !== true) return null;
+    for (const row of progress.items) {
+      if (
+        row.provenance !== "legacy_unowned" ||
+        row.owned !== false || row.current !== true || row.batch_number !== progressBatch ||
+        row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
+        row.ownership_key != null || !ownedWorkItemIdentityMatches(row)
+      ) return null;
+    }
   }
   return {
     authority: "legacy_compatibility",
@@ -218,7 +223,7 @@ function legacyV1BatchSnapshot(active, progress) {
     complete: progress.complete === true,
     completeConfirmed: progress.completeConfirmed === true,
     liveActiveBatchCleared,
-    hasItems: progress.items.length > 0,
+    hasItems: liveActiveBatchCleared ? false : progress.items.length > 0,
     installation_id: null,
     batch_number: progressBatch,
     assignment_attempt: null,
@@ -239,10 +244,11 @@ function ownedCurrentBatchSnapshot(active, progress) {
     return legacyV1BatchSnapshot(active, progress);
   }
   if (active.compatibility_mode !== "v2" || progress.compatibility_mode !== "v2") return null;
-  const activeIdentity = assignmentIdentity(active);
-  const progressIdentity = assignmentIdentity(progress);
-  if (!sameAssignment(activeIdentity, progressIdentity)) return null;
   const liveActiveBatchCleared = progress.liveActiveBatchCleared === true;
+  if (liveActiveBatchCleared && (active.active !== false || progress.items.length !== 0)) return null;
+  const activeIdentity = assignmentIdentity(active, { allowCleared: liveActiveBatchCleared });
+  const progressIdentity = assignmentIdentity(progress, { allowCleared: liveActiveBatchCleared });
+  if (!sameAssignment(activeIdentity, progressIdentity)) return null;
   if (progress.items.length === 0 && !liveActiveBatchCleared) return null;
 
   const expectedByOwnership = new Map(progressIdentity.assignment_items.map((item) => [item.ownership_key, item.work_item_ref]));

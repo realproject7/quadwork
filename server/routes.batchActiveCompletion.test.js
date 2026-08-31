@@ -100,7 +100,7 @@ function inReviewSnapshot(repo, n) {
   _graphqlCache.set(repo, {
     ts: Date.now(),
     issues: [{ number: n, title: `feat: in progress ${n}`, url: `https://x/i/${n}`, labels: [], assignees: [], createdAt: "2026-01-01T00:00:00Z" }],
-    prs: [{ number: n + 1, title: `[#${n}] feat: in progress ${n}`, url: `https://x/p/${n + 1}`, reviews: [] }],
+    prs: [{ number: n + 1, title: `[#${n}] feat: in progress ${n}`, state: "OPEN", url: `https://x/p/${n + 1}`, tip: `tip-${n + 1}`, reviews: [] }],
     closedIssues: [],
     mergedPrs: [],
     openPrsWindowComplete: true,

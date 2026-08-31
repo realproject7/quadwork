@@ -124,11 +124,22 @@ const confirmed = ownedCurrentBatchSnapshot(
 );
 assert.ok(confirmed && confirmed.completeConfirmed, "confirmed completion can authorize an identity-bound stop");
 
+const clearedIdentity = {
+  ...identity,
+  current: false,
+  assignment_key: "batch-7-attempt-2-cleared",
+  assignment_items: [],
+};
 const cleared = ownedCurrentBatchSnapshot(
-  { ...active, active: false },
-  { ...progress, items: [], liveActiveBatchCleared: true },
+  { ...clearedIdentity, active: false },
+  { ...clearedIdentity, items: [], complete: false, completeConfirmed: false, liveActiveBatchCleared: true },
 );
 assert.ok(cleared && cleared.liveActiveBatchCleared && !cleared.hasItems, "explicit live clear survives an empty progress row set");
+assert.deepEqual(assignmentRequestFields(cleared).assignment_items, [], "V2 clear carries the exact empty assignment set for route revalidation");
+assert.equal(ownedCurrentBatchSnapshot(
+  { ...clearedIdentity, active: true },
+  { ...clearedIdentity, items: [], liveActiveBatchCleared: true },
+), null, "a V2 clear cannot authorize stop while batch-active still reports active");
 assert.equal(
   ownedCurrentBatchSnapshot(active, {
     ...progress,
@@ -206,11 +217,11 @@ assert.deepEqual(
 );
 const legacyCleared = ownedCurrentBatchSnapshot(
   { ...legacyTop, current: false, active: false },
-  { ...legacyTop, current: false, complete: false, completeConfirmed: false, liveActiveBatchCleared: true, items: [] },
+  { ...legacyTop, current: false, complete: false, completeConfirmed: false, liveActiveBatchCleared: true, items: [legacyRow] },
 );
 assert.ok(
   legacyCleared && legacyCleared.liveActiveBatchCleared && !legacyCleared.hasItems,
-  "explicit V1 clear keeps the existing identity-free auto-stop path",
+  "explicit V1 clear ignores sticky display rows and keeps the identity-free auto-stop path",
 );
 for (const [name, activeDelta, progressDelta] of [
   ["postactivation legacy", { compatibility_mode: "v2" }, { compatibility_mode: "v2" }],

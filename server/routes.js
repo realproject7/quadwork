@@ -30,6 +30,7 @@ const {
   assertWorkItemRef,
   serializeWorkItemRefApi,
   workItemKey,
+  validateAssignmentProvenance,
   ownershipKey,
 } = require("./work-item-ref");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
@@ -757,7 +758,7 @@ function requestedBridgeAdmission(body, projectId, res) {
 }
 
 function requestedBridgeAssignment(body, projectId, res) {
-  const identityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "compatibility_mode"];
+  const identityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance", "compatibility_mode"];
   const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
     identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
   // Only a body carrying no automation identity at all is a manual V1/operator
@@ -2997,12 +2998,17 @@ function countApprovedRoles(reviews) {
 }
 
 function livePrReference(pr) {
-  if (!pr || String(pr.state || "OPEN").toUpperCase() !== "OPEN") return null;
+  if (!pr || String(pr.state || "").toUpperCase() !== "OPEN") return null;
+  const number = Number.isSafeInteger(pr.number) && pr.number > 0 ? pr.number : null;
+  const url = typeof (pr.url || pr.html_url) === "string" && (pr.url || pr.html_url) ? (pr.url || pr.html_url) : null;
+  const tip = typeof (pr.tip || pr.head?.sha || pr.headRefOid) === "string" &&
+    (pr.tip || pr.head?.sha || pr.headRefOid) ? (pr.tip || pr.head?.sha || pr.headRefOid) : null;
+  if (!number || !url || !tip) return null;
   return {
-    number: pr.number,
-    url: pr.url || pr.html_url || null,
+    number,
+    url,
     state: "OPEN",
-    tip: pr.tip || pr.head?.sha || pr.headRefOid || null,
+    tip,
   };
 }
 
@@ -3024,11 +3030,11 @@ function historicalPrReference(pr) {
 // absent, CLOSED-with-no-in-window-PR, merged-but-open, or a linked closed/
 // merged PR exists) — a partial window can't prove absence of a linked PR, so
 // the caller does the authoritative by-number REST fetch (progressForItemRest).
-function progressFromSnapshot(snapshot, n) {
+function progressFromSnapshot(snapshot, n, { requireLiveRef = false } = {}) {
   if (!snapshot) return null;
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
   const openPr = (snapshot.prs || []).find((p) =>
-    titleRe.test(p.title || "") && (!p.state || String(p.state).toUpperCase() === "OPEN"));
+    titleRe.test(p.title || "") && String(p.state || "").toUpperCase() === "OPEN");
   const mergedPr = (snapshot.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
   const openIssue = (snapshot.issues || []).find((i) => i.number === n);
   const closedIssue = (snapshot.closedIssues || []).find((i) => i.number === n);
@@ -3045,6 +3051,7 @@ function progressFromSnapshot(snapshot, n) {
   if (openPr) {
     const approvals = countApprovedRoles(openPr.reviews);
     const live_pr = livePrReference(openPr);
+    if (requireLiveRef && !live_pr) return null;
     if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
     if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
     return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
@@ -3112,7 +3119,8 @@ function progressFromGithubFile(parsed, n, ref = null) {
   // not `[#N] …` (unlike the in-memory snapshot progressFromSnapshot matches).
   // Anchor on `#N` + a word boundary so `#80` can't match issue 8.
   const titleRe = new RegExp(`^\\s*#${n}\\b`);
-  const openPr = (source.openPRs || []).find((p) => titleRe.test(p.title || ""));
+  const openPr = (source.openPRs || []).find((p) =>
+    titleRe.test(p.title || "") && String(p.state || "").toUpperCase() === "OPEN");
   const mergedPr = (source.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
   const openIssue = (source.openIssues || []).find((i) => i.number === n);
   const closedIssue = (source.closedIssues || []).find((i) => i.number === n);
@@ -3127,6 +3135,7 @@ function progressFromGithubFile(parsed, n, ref = null) {
     const reviewKey = ref ? `${ref.repoKey}#${openPr.number}` : openPr.number;
     const approvals = approvalsFromReviewDetail(source.reviewDetail, reviewKey);
     const live_pr = livePrReference(openPr);
+    if (ref && !live_pr) return null;
     if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
     if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
     return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
@@ -3665,6 +3674,7 @@ function assignmentKeyFor({ installationId, batchNumber, assignmentAttempt, work
       batch_number: batchNumber,
       assignment_attempt: assignmentAttempt,
     };
+    if (!validateAssignmentProvenance(provenance).ok) return null;
     const refs = (Array.isArray(workItems) ? workItems : [])
       .map((item) => ownershipKey(provenance, item.ref || item))
       .sort();
@@ -3672,15 +3682,39 @@ function assignmentKeyFor({ installationId, batchNumber, assignmentAttempt, work
   } catch { return null; }
 }
 
+function sectionByHeading(queueText, heading) {
+  if (typeof queueText !== "string") return null;
+  const lines = queueText.split(/\r?\n/);
+  const headingRe = new RegExp(`^##[ \\t]+${heading}[ \\t]*$`, "i");
+  const start = lines.findIndex((line) => headingRe.test(line));
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^##[ \t]+\S/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+function standaloneMetadataValue(section, pattern) {
+  if (typeof section !== "string") return null;
+  const matches = section.split(/\r?\n/)
+    .map((line) => line.match(pattern))
+    .filter(Boolean);
+  return matches.length === 1 ? matches[0][1] : null;
+}
+
 function queueAssignmentMetadata(section, installationId, batchNumber) {
-  const installationMatch = section.match(
-    /\*\*(?:Installation(?: ID)?|installation_id):\*\*\s*([^\s]+)/i,
+  const serializedInstallation = standaloneMetadataValue(
+    section,
+    /^\s*\*\*(?:Installation(?: ID)?|installation_id):\*\*\s*([^\s]+)\s*$/i,
   );
-  const attemptMatch = section.match(
-    /\*\*(?:Assignment attempt|assignment_attempt|Attempt):\*\*\s*([^\s]+)/i,
+  const assignmentAttempt = standaloneMetadataValue(
+    section,
+    /^\s*\*\*(?:Assignment attempt|assignment_attempt|Attempt):\*\*\s*([^\s]+)\s*$/i,
   );
-  const serializedInstallation = installationMatch ? installationMatch[1] : null;
-  const assignmentAttempt = attemptMatch ? attemptMatch[1] : null;
   let provenance = "legacy_unowned";
   if (installationId) {
     if (!serializedInstallation || !assignmentAttempt || !Number.isSafeInteger(batchNumber)) provenance = "unowned";
@@ -3718,11 +3752,10 @@ function parseActiveBatch(queueText, options = {}) {
   }
   // Pull just the Active Batch section so a stray `#123` in Backlog
   // or Done doesn't leak into the active list.
-  const m = queueText.match(/##\s+Active Batch[\s\S]*?(?=\n##\s|$)/i);
-  if (!m) return { batchNumber: null, issueNumbers: [], workItems: [], errors: [], provenance: "legacy_unowned", assignmentAttempt: null, assignmentKey: null };
-  const section = m[0];
-  const batchMatch = section.match(/\*\*Batch:\*\*\s*(\d+)/i) || section.match(/Batch:\s*(\d+)/i);
-  const batchNumber = batchMatch ? parseInt(batchMatch[1], 10) : null;
+  const section = sectionByHeading(queueText, "Active Batch");
+  if (!section) return { batchNumber: null, issueNumbers: [], workItems: [], errors: [], provenance: "legacy_unowned", assignmentAttempt: null, assignmentKey: null };
+  const batchValue = standaloneMetadataValue(section, /^\s*(?:\*\*Batch:\*\*|Batch:)\s*(\d+)\s*$/i);
+  const batchNumber = batchValue ? parseInt(batchValue, 10) : null;
   // Only collect issue numbers from lines that look like list-item
   // entries — i.e. lines whose first content token is either `#N`
   // or `[#N]` after an optional list marker, and optionally after
@@ -3782,15 +3815,17 @@ function parseActiveBatch(queueText, options = {}) {
 // `**Batch:** N`). Absent/unrecognized → "code" (preserves existing behavior
 // exactly). Review batches compute progress from the Active Batch item states
 // alone — no GitHub calls.
-const ACTIVE_BATCH_SECTION_RE = /##\s+Active Batch[\s\S]*?(?=\n##\s|$)/i;
 const REVIEW_BATCH_TYPES = new Set(["ticket-review", "pr-review"]);
 
 function parseBatchType(queueText) {
   if (typeof queueText !== "string" || !queueText) return "code";
-  const m = queueText.match(ACTIVE_BATCH_SECTION_RE);
-  if (!m) return "code";
-  const tm = m[0].match(/\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\b/i);
-  return tm ? tm[1].toLowerCase() : "code";
+  const section = sectionByHeading(queueText, "Active Batch");
+  if (!section) return "code";
+  const batchType = standaloneMetadataValue(
+    section,
+    /^\s*\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\s*$/i,
+  );
+  return batchType ? batchType.toLowerCase() : "code";
 }
 
 // Parse one Active Batch item's review-state annotation — the text after
@@ -3813,16 +3848,16 @@ function parseReviewState(raw) {
 // trailing state annotation. Scoped to Active Batch — NEVER `## Done`.
 function parseReviewItems(queueText, options = {}) {
   if (typeof queueText !== "string" || !queueText) return [];
-  const m = queueText.match(ACTIVE_BATCH_SECTION_RE);
-  if (!m) return [];
+  const section = sectionByHeading(queueText, "Active Batch");
+  if (!section) return [];
   const kind = options.kind || (parseBatchType(queueText) === "pr-review" ? "pr" : "issue");
-  const parsed = parseQueueWorkItems(m[0], {
+  const parsed = parseQueueWorkItems(section, {
     repositories: options.repositories || options.bindings || [],
     kind,
   });
   return parsed.workItems.map((ref) => {
     const { review_state, approvals } = parseReviewState(ref.trailing);
-    return { issue: ref.number, ref, review_state, approvals };
+    return { issue: ref.number, ref: ref.ref || ref, review_state, approvals };
   });
 }
 
@@ -3835,13 +3870,11 @@ function parseReviewItems(queueText, options = {}) {
 // Scoped to the single matching block — every OTHER Done batch stays ignored
 // (#870: never count `## Done` for progress beyond this one sticky block).
 // Returns { batch_type, reviewItems } or null if no matching block exists.
-const DONE_SECTION_RE = /##\s+Done\b[\s\S]*?(?=\n##\s|$)/i;
-const DONE_BATCH_MARKER_RE = /\*\*Batch:\*\*\s*(\d+)/g;
+const DONE_BATCH_MARKER_RE = /^\s*\*\*Batch:\*\*\s*(\d+)\s*$/gmi;
 function parseDoneBatchReviewItems(queueText, batchNumber, options = {}) {
   if (typeof queueText !== "string" || !queueText || !Number.isInteger(batchNumber)) return null;
-  const dm = queueText.match(DONE_SECTION_RE);
-  if (!dm) return null;
-  const done = dm[0];
+  const done = sectionByHeading(queueText, "Done");
+  if (!done) return null;
   // Split the Done section into per-batch blocks at each `**Batch:** N` marker
   // (`**Batch type:**` is NOT matched — it has no `:` right after "Batch").
   const markers = [];
@@ -3853,8 +3886,11 @@ function parseDoneBatchReviewItems(queueText, batchNumber, options = {}) {
   const idx = markers.findIndex((b) => b.num === batchNumber);
   if (idx === -1) return null;
   const block = done.slice(markers[idx].start, idx + 1 < markers.length ? markers[idx + 1].start : done.length);
-  const tm = block.match(/\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\b/i);
-  const batch_type = tm ? tm[1].toLowerCase() : "code";
+  const parsedBatchType = standaloneMetadataValue(
+    block,
+    /^\s*\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\s*$/i,
+  );
+  const batch_type = parsedBatchType ? parsedBatchType.toLowerCase() : "code";
   const kind = batch_type === "pr-review" ? "pr" : "issue";
   const parsed = parseQueueWorkItems(block, {
     repositories: options.repositories || options.bindings || [],
@@ -3862,7 +3898,7 @@ function parseDoneBatchReviewItems(queueText, batchNumber, options = {}) {
   });
   const reviewItems = parsed.workItems.map((ref) => {
     const { review_state, approvals } = parseReviewState(ref.trailing);
-    return { issue: ref.number, ref, review_state, approvals };
+    return { issue: ref.number, ref: ref.ref || ref, review_state, approvals };
   });
   return { batch_type, reviewItems };
 }
@@ -4249,6 +4285,14 @@ async function progressForItemRest(repo, issueNumber, stillCurrent = () => true,
   // latest decision-affecting review per role — no stale double-count.
   const approvalCount = countApprovedRoles(reviews);
   const live_pr = livePrReference({ ...prData, state: prState, url });
+  if (!live_pr) {
+    return {
+      ...softRetryingRow(issue.number),
+      title: issue.title || `#${issue.number}`,
+      url: issue.html_url || issue.url || null,
+      live_pr: null,
+    };
+  }
   if (approvalCount >= 2) {
     return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, live_pr, status: "ready", progress: 80, label: `PR #${prData.number} · 2 approvals · ready` };
   }
@@ -4409,6 +4453,10 @@ function readLiveBatchContext(projectId) {
   const fingerprint = JSON.stringify([
     "queue-assignment-observation", 1,
     installationId,
+    parsed.installationId,
+    parsed.provenance,
+    parsed.assignmentKey,
+    batchType,
     parsed.batchNumber,
     parsed.assignmentAttempt,
     parsed.workItems.map((item) => item.key).sort(),
@@ -4484,7 +4532,7 @@ function canonicalAssignmentItems(items) {
 }
 
 function validateCurrentOwnedAssignment(projectId, body = {}) {
-  const v2IdentityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt"];
+  const v2IdentityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance"];
   const identityFields = [...v2IdentityFields, "compatibility_mode"];
   const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
     identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
@@ -4503,6 +4551,7 @@ function validateCurrentOwnedAssignment(projectId, body = {}) {
   const liveItems = canonicalAssignmentItems(assignment.assignment_items);
   const exact = context?.queueReadOk === true && assignment.owned === true &&
     (body.compatibility_mode === undefined || body.compatibility_mode === "v2") &&
+    body.provenance === "owned" && body.provenance === assignment.provenance &&
     typeof body.assignment_key === "string" && body.assignment_key === assignment.assignment_key &&
     body.installation_id === assignment.installation_id &&
     body.batch_number === assignment.batch_number &&
@@ -4713,7 +4762,7 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
     const ref = item.ref || item;
     if (!stillCurrent()) return decorateBatchRow(softRetryingRow(ref.number), ref, { ...assignment, current: false, owned: false });
     const snapshot = _graphqlCache.get(canonicalGithubRepo(ref.repo)) || null;
-    let row = snapshot ? progressFromSnapshot(snapshot, ref.number) : progressFromGithubFile(parsedGithub, ref.number, ref);
+    let row = snapshot ? progressFromSnapshot(snapshot, ref.number, { requireLiveRef: true }) : progressFromGithubFile(parsedGithub, ref.number, ref);
     if (!row) row = terminalRows.get(item.key) || null;
     if (!row && snapshot) {
       try { row = await progressForItemRest(ref.repo, ref.number, stillCurrent); }

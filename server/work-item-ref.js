@@ -149,13 +149,14 @@ function parseWorkItemToken(token, options = {}) {
 
 function lineCandidate(content, repositories) {
   if (/^\[?#/.test(content) || /^\[?[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#/.test(content)) return true;
-  // Diagnose the common accidental `owner/repo #42` split only when the first
-  // token names a registered repository. Arbitrary path/URL prose remains
-  // ignored exactly like the legacy parser's first-token rule.
-  const separated = /^([^\s]+)\s+#/.exec(content);
+  if (/^\[?[A-Za-z0-9._-]+\/[A-Za-z0-9._\/-]*#/.test(content)) return true;
+  // Diagnose the common immediate `owner/repo #42` split. Path/URL prose where
+  // the issue mention is not the second token remains ignored below.
+  const separated = /^\[?([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)\s+#/.exec(content);
   if (!separated || !Array.isArray(repositories)) return false;
   const canonical = canonicalRepository(separated[1]);
-  return !!canonical && repositories.some((entry) => canonicalRepository(entry && entry.repo) === canonical);
+  if (!canonical) return false;
+  return true;
 }
 
 function parseWorkItemLine(line, options = {}) {
@@ -237,9 +238,8 @@ function workItemKey(ref) {
   return JSON.stringify(["work-item-ref", 1, ref.repoKey, ref.repo.toLowerCase(), ref.number, ref.kind]);
 }
 
-function validateOwnershipProvenance(provenance, ref) {
+function validateAssignmentProvenance(provenance) {
   try {
-    assertWorkItemRef(ref);
     if (!exactFields(provenance, PROVENANCE_FIELDS)) {
       fail(
         "invalid_ownership_provenance",
@@ -262,6 +262,22 @@ function validateOwnershipProvenance(provenance, ref) {
         installation_id: provenance.installation_id,
         batch_number: provenance.batch_number,
         assignment_attempt: provenance.assignment_attempt,
+      }),
+    };
+  } catch (error) {
+    return parsedError(error);
+  }
+}
+
+function validateOwnershipProvenance(provenance, ref) {
+  try {
+    assertWorkItemRef(ref);
+    const assignment = validateAssignmentProvenance(provenance);
+    if (!assignment.ok) fail(assignment.diagnostic.code, assignment.diagnostic.message);
+    return {
+      ok: true,
+      value: Object.freeze({
+        ...assignment.value,
         ref: Object.freeze({ ...ref }),
       }),
     };
@@ -293,6 +309,7 @@ module.exports = {
   serializeWorkItemRef,
   serializeWorkItemRefApi,
   workItemKey,
+  validateAssignmentProvenance,
   validateOwnershipProvenance,
   ownershipKey,
 };

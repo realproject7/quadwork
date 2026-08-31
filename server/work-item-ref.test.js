@@ -13,6 +13,7 @@ const {
   serializeWorkItemRef,
   serializeWorkItemRefApi,
   workItemKey,
+  validateAssignmentProvenance,
   validateOwnershipProvenance,
   ownershipKey,
 } = require("./work-item-ref");
@@ -104,6 +105,13 @@ function code(result) {
   assert.equal(parseWorkItemLine("- docs/runbook.md changed; see #42", { repositories }).ignored, true);
   assert.equal(parseWorkItemLine("- https://example.test/docs#42 context", { repositories }).ignored, true);
   assert.equal(code(parseWorkItemLine("- Owner/Product-Web #42", { repositories })), "invalid_work_item_ref");
+  assert.equal(code(parseWorkItemLine("- Other/Repo #42", { repositories })), "invalid_work_item_ref");
+  assert.equal(code(parseWorkItemLine("- Other/repo.js #42", { repositories })), "invalid_work_item_ref");
+  assert.equal(code(parseWorkItemLine("- Owner//Product-Web#42", { repositories })), "invalid_work_item_ref");
+  assert.equal(parseWorkItemLine("- https://docs.example/path #42 context", { repositories }).ignored, true);
+  assert.equal(code(parseWorkItemLine("- [Owner/Product-Web #42]", { repositories })), "invalid_work_item_ref");
+  assert.equal(code(parseWorkItemLine("- [Other/Repo #42]", { repositories })), "invalid_work_item_ref");
+  assert.equal(code(parseWorkItemLine("- [Owner//Product-Web#42]", { repositories })), "invalid_work_item_ref");
   assert.equal(code(parseWorkItemLine("- [Owner/Product-Web#42", { repositories })), "invalid_work_item_line");
 }
 
@@ -139,6 +147,7 @@ function code(result) {
   const valid = validateOwnershipProvenance(provenance, ref);
   assert.equal(valid.ok, true);
   assert.deepEqual(valid.value.ref, ref);
+  assert.equal(validateAssignmentProvenance(provenance).ok, true);
   assert.equal(code(validateOwnershipProvenance({ ...provenance, review_id: 7 }, ref)), "invalid_ownership_provenance");
   assert.equal(code(validateOwnershipProvenance({ ...provenance, installation_id: "short" }, ref)), "invalid_installation_id");
   assert.equal(code(validateOwnershipProvenance({ ...provenance, batch_number: 0 }, ref)), "invalid_batch_number");

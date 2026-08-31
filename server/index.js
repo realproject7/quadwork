@@ -1791,8 +1791,9 @@ const _bridgeBatchPrev = new Map();
 // owned by this installation. Progress can preserve an older snapshot for
 // display, so it is never lifecycle authority on its own. The live
 // /api/batch-active response must carry the same immutable assignment identity.
-function ownedBatchFingerprint(payload) {
-  if (!payload || payload.provenance !== "owned" || payload.owned !== true || payload.current !== true) return null;
+function ownedBatchFingerprint(payload, { allowCleared = false } = {}) {
+  if (!payload || payload.provenance !== "owned" || payload.owned !== true ||
+      (allowCleared ? payload.current !== false : payload.current !== true)) return null;
   if (typeof payload.installation_id !== "string" || !payload.installation_id) return null;
   if (!Number.isSafeInteger(payload.batch_number) || payload.batch_number < 1) return null;
   if (typeof payload.assignment_attempt !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(payload.assignment_attempt)) return null;
@@ -1843,8 +1844,12 @@ function ownedBatchRowMatches(row, assignment, assignmentItems) {
 }
 
 function ownedBatchAutomationState(progress, active) {
-  const progressFingerprint = ownedBatchFingerprint(progress);
-  const activeFingerprint = ownedBatchFingerprint(active);
+  const clearedByOperator = progress?.liveActiveBatchCleared === true;
+  if (clearedByOperator && (active?.active !== false || !Array.isArray(progress?.items) || progress.items.length !== 0)) {
+    return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
+  }
+  const progressFingerprint = ownedBatchFingerprint(progress, { allowCleared: clearedByOperator });
+  const activeFingerprint = ownedBatchFingerprint(active, { allowCleared: clearedByOperator });
   if (!progressFingerprint || progressFingerprint !== activeFingerprint) {
     return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
   }
@@ -1854,12 +1859,24 @@ function ownedBatchAutomationState(progress, active) {
       JSON.stringify(progressAssignmentItems) !== JSON.stringify(activeAssignmentItems)) {
     return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
   }
-  const hasItems = Array.isArray(progress.items) && progress.items.length > 0;
-  if (hasItems && (progress.items.length !== progressAssignmentItems.length ||
-      progress.items.some((row) => !ownedBatchRowMatches(row, progress, progressAssignmentItems)))) {
+  if (clearedByOperator && (progressAssignmentItems.length !== 0 || activeAssignmentItems.length !== 0)) {
     return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
   }
-  const clearedByOperator = !!progress.liveActiveBatchCleared;
+  const hasItems = Array.isArray(progress.items) && progress.items.length > 0;
+  if (hasItems) {
+    const seenRows = new Set();
+    const rowsValid = progress.items.length === progressAssignmentItems.length && progress.items.every((row) => {
+      if (!ownedBatchRowMatches(row, progress, progressAssignmentItems)) return false;
+      const ref = row.work_item_ref;
+      const key = JSON.stringify([ref.repo_key, ref.repo, ref.number, ref.kind]);
+      if (seenRows.has(key)) return false;
+      seenRows.add(key);
+      return true;
+    });
+    if (!rowsValid || seenRows.size !== progressAssignmentItems.length) {
+      return { authoritative: false, fingerprint: null, active: false, hasItems: false, shouldStop: false };
+    }
+  }
   const shouldStop = !!progress.completeConfirmed || clearedByOperator;
   return {
     authoritative: true,
@@ -1886,9 +1903,15 @@ function legacyV1BatchAutomationState(progress, active) {
   if (!progress || !active || progress.compatibility_mode !== "v1" || active.compatibility_mode !== "v1" ||
       progress.provenance !== "legacy_unowned" || active.provenance !== "legacy_unowned" ||
       progress.owned !== false || active.owned !== false ||
-      progress.multi_repository === true || active.multi_repository === true ||
+      progress.installation_id != null || active.installation_id != null ||
+      progress.assignment_attempt != null || active.assignment_attempt != null ||
+      progress.assignment_key != null || active.assignment_key != null ||
+      !Array.isArray(progress.assignment_items) || progress.assignment_items.length !== 0 ||
+      !Array.isArray(active.assignment_items) || active.assignment_items.length !== 0 ||
+      progress.multi_repository !== false || active.multi_repository !== false ||
       typeof active.active !== "boolean" || progress.batch_number !== active.batch_number) return null;
   const clearedByOperator = progress.liveActiveBatchCleared === true;
+  if (clearedByOperator && (active.active !== false || progress.current !== false || active.current !== false)) return null;
   if (!clearedByOperator && (progress.current !== true || active.current !== true)) return null;
   const rows = Array.isArray(progress.items) ? progress.items : [];
   const rowKeys = [];
@@ -1898,6 +1921,9 @@ function legacyV1BatchAutomationState(progress, active) {
     for (const row of rows) {
       const ref = row && row.work_item_ref;
       if (!ref || typeof ref !== "object" || Array.isArray(ref) ||
+          row.provenance !== "legacy_unowned" || row.owned !== false || row.current !== true ||
+          row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
+          row.ownership_key != null || row.batch_number !== progress.batch_number ||
           typeof row.repo_key !== "string" || !row.repo_key ||
           typeof row.repo !== "string" || !row.repo ||
           !Number.isSafeInteger(row.number) || row.number < 1 ||
@@ -1927,6 +1953,15 @@ function batchAutomationState(progress, active) {
   const owned = ownedBatchAutomationState(progress, active);
   if (owned.authoritative) return { ...owned, mode: "v2" };
   return legacyV1BatchAutomationState(progress, active) || owned;
+}
+
+function isBatchAutomationCurrent(projectId, batchState, admission = null) {
+  if (!batchState?.authoritative || (admission && !isAdmissionCurrent(admission))) return false;
+  const body = batchState.mode === "v1"
+    ? { compatibility_mode: "v1" }
+    : { compatibility_mode: "v2", ...(batchState.identity || {}) };
+  return routes.validateCurrentOwnedAssignment(projectId, body).ok === true &&
+    (!admission || isAdmissionCurrent(admission));
 }
 
 async function sendTriggerMessage(projectId) {
@@ -1971,7 +2006,7 @@ async function sendTriggerMessage(projectId) {
         // operator's intent and overrides those signals for lifecycle purposes.
         const batchState = batchAutomationState(bp, active);
         const clearedByOperator = batchState.clearedByOperator === true;
-        if (batchState.authoritative && batchState.shouldStop) {
+        if (batchState.authoritative && batchState.shouldStop && isBatchAutomationCurrent(projectId, batchState, admission)) {
           console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
           stopTrigger(projectId);
           // Also stop caffeinate if no other triggers remain running
@@ -2806,6 +2841,7 @@ async function autoStopPollingTick() {
       }
       const batchState = batchAutomationState(bp, active);
       if (!batchState.authoritative) continue;
+      if (!isBatchAutomationCurrent(project.id, batchState, admission)) continue;
       const hasItems = batchState.hasItems;
       // #810: gate auto-stop on completeConfirmed (two distinct successful fetch
       // cycles), not a single transient/stale `complete`. Track prev on the
@@ -3326,6 +3362,7 @@ module.exports = {
   ownedBatchAutomationState,
   legacyV1BatchAutomationState,
   batchAutomationState,
+  isBatchAutomationCurrent,
   validateTriggerAutomationRequest,
   registerCaffeinateOwner,
   caffeinateStatus,

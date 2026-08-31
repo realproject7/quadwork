@@ -117,16 +117,56 @@ assert.equal(runtime.ownedBatchAutomationState(
   { ...ownedProgress, items: [{ ...ownedProgress.items[0], ownership_key: "stale-row-owner" }] },
   ownedActive,
 ).authoritative, false, "a row ownership key outside the exact assignment set is rejected");
+const secondAssignmentItem = {
+  work_item_ref: { repo_key: "secondary", repo: "Owner/B", number: 42, kind: "issue" },
+  ownership_key: "owner-b-42-attempt-2",
+};
+assert.equal(runtime.ownedBatchAutomationState(
+  {
+    ...ownedProgress,
+    assignment_items: [...ownedProgress.assignment_items, secondAssignmentItem],
+    items: [ownedProgress.items[0], { ...ownedProgress.items[0] }],
+  },
+  { ...ownedActive, assignment_items: [...ownedProgress.assignment_items, secondAssignmentItem] },
+).authoritative, false, "a duplicated row cannot hide a missing same-number repository assignment");
+
+const clearedOwnedProgress = {
+  ...ownedProgress,
+  current: false,
+  assignment_key: "assignment-7-2-cleared",
+  assignment_items: [],
+  items: [],
+  liveActiveBatchCleared: true,
+};
+const clearedOwnedState = runtime.batchAutomationState(
+  clearedOwnedProgress,
+  { ...clearedOwnedProgress, active: false },
+);
+assert.equal(clearedOwnedState.mode, "v2");
+assert.equal(clearedOwnedState.shouldStop, true,
+  "an exact inactive V2 empty-set assignment authorizes explicit-clear stop");
 
 const legacyProgress = {
   compatibility_mode: "v1",
+  installation_id: null,
   provenance: "legacy_unowned",
+  assignment_attempt: null,
+  assignment_key: null,
+  assignment_items: [],
   owned: false,
   current: true,
   multi_repository: false,
   batch_number: 5,
   completeConfirmed: false,
   items: [{
+    installation_id: null,
+    batch_number: 5,
+    assignment_attempt: null,
+    provenance: "legacy_unowned",
+    assignment_key: null,
+    current: true,
+    owned: false,
+    ownership_key: null,
     repo_key: "primary",
     repo: "Owner/A",
     number: 42,
@@ -135,7 +175,7 @@ const legacyProgress = {
     work_item_ref: { repo_key: "primary", repo: "Owner/A", number: 42, kind: "issue" },
   }],
 };
-const legacyActive = { ...legacyProgress, active: true };
+const legacyActive = { ...legacyProgress, items: undefined, active: true };
 assert.equal(runtime.batchAutomationState(legacyProgress, legacyActive).mode, "v1",
   "explicit preactivation single-repository mode preserves the V1 automation lifecycle");
 assert.equal(runtime.batchAutomationState(
@@ -171,9 +211,18 @@ assert.equal(runtime.validateTriggerAutomationRequest("a", {}).ok, true,
   "manual trigger controls remain compatible");
 assert.equal(runtime.validateTriggerAutomationRequest("a", { assignment_attempt: "stale" }).ok, false,
   "trigger automation delegates stale assignment rejection to the live queue guard");
+assert.equal(runtime.isBatchAutomationCurrent("a", { ...ownedAutomation, mode: "v2" }), true,
+  "server-side trigger polling revalidates the exact action identity before local mutation");
+assert.equal(runtime.isBatchAutomationCurrent("a", {
+  ...ownedAutomation,
+  mode: "v2",
+  identity: { ...ownedAutomation.identity, assignment_attempt: "stale" },
+}), false, "server-side trigger polling rejects a rolled assignment before local mutation");
 assert.deepEqual(triggerValidationCalls, [
   { projectId: "a", body: {} },
   { projectId: "a", body: { assignment_attempt: "stale" } },
+  { projectId: "a", body: { compatibility_mode: "v2", ...ownedAutomation.identity } },
+  { projectId: "a", body: { compatibility_mode: "v2", ...ownedAutomation.identity, assignment_attempt: "stale" } },
 ]);
 routes.validateCurrentOwnedAssignment = originalValidateCurrentOwnedAssignment;
 

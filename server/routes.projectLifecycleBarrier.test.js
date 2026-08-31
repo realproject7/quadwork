@@ -173,6 +173,7 @@ function request(server, method, pathname, body) {
       installation_id: bridgeInstallationId,
       batch_number: bridgeParsed.batchNumber,
       assignment_attempt: bridgeParsed.assignmentAttempt,
+      provenance: "owned",
       assignment_key: bridgeParsed.assignmentKey,
       assignment_items: bridgeParsed.workItems.map((item) => ({
         work_item_ref: serializeWorkItemRefApi(item.ref),
@@ -243,6 +244,24 @@ function request(server, method, pathname, body) {
         assert.equal(response.status, 409, `${name} start rejects an assignment rollover during await`);
         assert.equal(response.json.code, "project_assignment_changed", `${name} rollover is not mislabeled archived`);
         assert.equal(bridgeCalls.stop, 2, `${name} rolls back the just-started stale bridge`);
+        fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
+
+        bridge.start = async () => {
+          bridgeCalls.start += 1;
+          fs.writeFileSync(
+            path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"),
+            bridgeQueue.replace(bridgeInstallationId, "installation_bridge_foreign01"),
+          );
+          return { ok: true };
+        };
+        response = await request(server, "POST", `/api/${name}?action=start`, {
+          project_id: "alpha",
+          admission_generation: currentAdmission.generation,
+          ...bridgeAssignment,
+        });
+        assert.equal(response.status, 409, `${name} start rejects an installation provenance rollover during await`);
+        assert.equal(response.json.code, "project_assignment_changed");
+        assert.equal(bridgeCalls.stop, 3, `${name} rolls back a bridge started under stale installation provenance`);
         fs.writeFileSync(path.join(TMP, ".quadwork", "alpha", "OVERNIGHT-QUEUE.md"), bridgeQueue);
         bridge.start = async () => { bridgeCalls.start += 1; return { ok: true }; };
 
