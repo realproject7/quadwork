@@ -311,6 +311,14 @@ function durableScopeObservation(value) {
   return normalizeScopeObservation(observation, true);
 }
 
+function executionRejectionError(value) {
+  if (value instanceof Error) return value;
+  const error = new Error("resource process execution rejected with a non-Error value");
+  error.name = "ResourceExecutionError";
+  error.code = "QW_RESOURCE_EXECUTION_REJECTED";
+  return error;
+}
+
 // systemd --collect may unload a scope before a post-exit query can observe it.
 // Executors can therefore return a durable scopeObservation captured while the
 // scope still existed. This bounded query is only the fallback, and its derived
@@ -427,6 +435,7 @@ class ResourceController {
     try {
       let result = null;
       let executionError = null;
+      let executionRejected = false;
       let scopeObservation = null;
       try {
         result = await this.executeProcess({
@@ -440,13 +449,21 @@ class ResourceController {
           controlClassName: resourceClass === "control" ? controlClassName : null,
         });
         scopeObservation = durableScopeObservation(result);
-      } catch (error) {
-        executionError = error;
-        result = {
-          code: Number.isInteger(error?.exitCode) ? error.exitCode : null,
-          signal: normalizeSignal(error?.signal),
-        };
-        scopeObservation = durableScopeObservation(error);
+      } catch (rejectedValue) {
+        executionRejected = true;
+        executionError = executionRejectionError(rejectedValue);
+        if (rejectedValue instanceof Error) {
+          result = {
+            code: Number.isInteger(rejectedValue.exitCode) ? rejectedValue.exitCode : null,
+            signal: normalizeSignal(rejectedValue.signal),
+          };
+          scopeObservation = durableScopeObservation(rejectedValue);
+        } else {
+          // Do not inspect, stringify, retain, or expose arbitrary rejected
+          // values. They may contain credentials or terminal/process output.
+          result = { code: null, signal: null };
+          scopeObservation = null;
+        }
       }
 
       if (scopeObservation === null) {
@@ -467,13 +484,13 @@ class ResourceController {
         resourceClass,
         result,
         scopeObservation,
-        executionRejected: executionError !== null,
+        executionRejected,
         now: this.now,
       });
       this.terminalFacts.push(fact);
       if (this.terminalFacts.length > this.terminalFactLimit) this.terminalFacts.shift();
 
-      if (executionError) {
+      if (executionRejected) {
         executionError.resourceFact = { ...fact };
         throw executionError;
       }

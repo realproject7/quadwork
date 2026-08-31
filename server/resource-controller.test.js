@@ -206,11 +206,11 @@ async function main() {
     "unclassified non-zero exit is unknown and query failures stay internal");
 
   let errorExitZero;
+  const originalZeroError = new Error("executor rejected despite zero exit metadata");
+  originalZeroError.exitCode = 0;
   const rejectedZeroController = new ResourceController({
     executeProcess: async () => {
-      const error = new Error("executor rejected despite zero exit metadata");
-      error.exitCode = 0;
-      throw error;
+      throw originalZeroError;
     },
     queryScope: noOom,
   });
@@ -219,9 +219,45 @@ async function main() {
   } catch (error) {
     errorExitZero = error;
   }
-  ok(errorExitZero?.resourceFact?.reason === "unknown" &&
+  ok(errorExitZero === originalZeroError && errorExitZero.resourceFact?.reason === "unknown" &&
      errorExitZero.resourceFact.exit_code === 0,
-    "an executor rejection with exitCode=0 remains unknown");
+    "an Error rejection preserves the original Error and remains unknown at exitCode=0");
+
+  const rejectedSecret = "REJECTED-VALUE-MUST-NOT-LEAK";
+  const nonErrorRejections = [null, undefined, false, 0, rejectedSecret];
+  for (const [index, rejectedValue] of nonErrorRejections.entries()) {
+    let calls = 0;
+    const nonErrorController = new ResourceController({
+      maxControlChildren: 1,
+      executeProcess: async () => {
+        calls += 1;
+        if (calls === 1) return Promise.reject(rejectedValue);
+        return { code: 0, signal: null };
+      },
+      queryScope: noOom,
+    });
+    const spec = controlSpec(`nonerror-${index}`);
+    let rejection;
+    try {
+      await nonErrorController.runControlChild(spec);
+    } catch (error) {
+      rejection = error;
+    }
+    assert.ok(rejection instanceof Error);
+    assert.equal(rejection.name, "ResourceExecutionError");
+    assert.equal(rejection.code, "QW_RESOURCE_EXECUTION_REJECTED");
+    assert.equal(rejection.message, "resource process execution rejected with a non-Error value");
+    assert.equal(rejection.resourceFact?.reason, "unknown");
+    assert.equal(nonErrorController.snapshot().active_scopes.length, 0);
+    assert.equal(nonErrorController.snapshot().control_children.active, 0);
+    assert.ok(!JSON.stringify(nonErrorController.snapshot()).includes(rejectedSecret));
+    assert.ok(!rejection.message.includes(rejectedSecret));
+
+    const reused = await nonErrorController.runControlChild(spec);
+    assert.equal(reused.fact.reason, "normal_exit", "the same unit is reusable after non-Error rejection");
+    assert.equal(nonErrorController.snapshot().control_children.active, 0);
+  }
+  ok(true, "null, undefined, false, zero, and secret-bearing non-Error rejections stay rejected without leaks");
 
   let durableQueryCalls = 0;
   const durableController = new ResourceController({
