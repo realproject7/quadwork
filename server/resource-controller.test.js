@@ -18,7 +18,11 @@ const {
 } = require("./resource-controller");
 
 let passed = 0;
-const noOom = async () => ({ oomKillCount: 0 });
+const OBSERVED_AT = "2026-08-31T00:00:00.000Z";
+function observation(oomKillCount, extras = {}) {
+  return { oomKillCount, observedAt: OBSERVED_AT, ...extras };
+}
+const noOom = async () => observation(0);
 function ok(condition, message) {
   assert.ok(condition, message);
   passed += 1;
@@ -165,17 +169,19 @@ async function main() {
       assert.equal(projectId, "quadwork");
       assert.equal(generationId, "gen-7");
       assert.equal(unitName, "qw-worker-quadwork-gen-7");
-      return { oomKillCount: 0 };
+      return observation(0);
     },
     now: () => times.shift(),
   });
   const normal = await normalController.runWorkerScope(workerSpec());
   ok(normal.fact.reason === "normal_exit" && normal.fact.exit_code === 0 && queryCalls === 1,
     "normal worker exit is project/generation qualified and scope-query backed");
+  assert.equal(normal.last_cgroup_oom.oom_kill_count, "0");
+  assert.equal(normalController.snapshot().last_cgroup_oom.oom_kill_count, "0");
 
   const signalController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: "SIGTERM" }),
-    queryScope: async () => ({ oomKillCount: 0 }),
+    queryScope: noOom,
   });
   const signalled = await signalController.runWorkerScope(workerSpec());
   ok(signalled.fact.reason === "signal" && signalled.fact.signal === "SIGTERM",
@@ -183,7 +189,7 @@ async function main() {
 
   const numericSignalController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: 15 }),
-    queryScope: async () => ({ oomKillCount: 0n }),
+    queryScope: async () => observation(0n),
   });
   const numericSignal = await numericSignalController.runWorkerScope(workerSpec());
   ok(numericSignal.fact.reason === "signal" && numericSignal.fact.signal === 15,
@@ -191,11 +197,25 @@ async function main() {
 
   const oomController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: "SIGKILL" }),
-    queryScope: async () => ({ oomKillCount: 1 }),
+    queryScope: async () => observation(1, {
+      observedAt: "2026-08-31T09:30:00+09:00",
+      secret: "must-not-survive-normalization",
+    }),
   });
   const oom = await oomController.runWorkerScope(workerSpec());
   ok(oom.fact.reason === "oom_kill" && oom.fact.signal === "SIGKILL",
     "confirmed cgroup OOM wins classification without dropping its signal");
+  assert.deepEqual(oom.last_cgroup_oom, {
+    project_id: "quadwork",
+    generation_id: "gen-7",
+    resource_class: "worker",
+    unit_name: "qw-worker-quadwork-gen-7",
+    oom_kill_count: "1",
+    observed_at: "2026-08-31T00:30:00.000Z",
+  });
+  assert.deepEqual(oomController.snapshot().last_cgroup_oom, oom.last_cgroup_oom);
+  ok(!JSON.stringify(oomController.snapshot()).includes("must-not-survive-normalization"),
+    "qualified OOM provenance maps directly to resource-state without injected-field leakage");
 
   const unknownController = new ResourceController({
     executeProcess: async () => ({ code: 17, signal: null }),
@@ -264,28 +284,33 @@ async function main() {
     executeProcess: async () => ({
       code: null,
       signal: "SIGKILL",
-      scopeObservation: { oomKillCount: 1, capturedBeforeCollect: true },
+      scopeObservation: observation(1, {
+        capturedBeforeCollect: true,
+        observedAt: "2026-08-30T23:59:59Z",
+      }),
     }),
     queryScope: async () => {
       durableQueryCalls += 1;
-      return { oomKillCount: 0 };
+      return observation(0);
     },
   });
   const durable = await durableController.runWorkerScope(workerSpec());
   ok(durable.fact.reason === "oom_kill" && durable.fact.signal === "SIGKILL" &&
      durableQueryCalls === 0,
     "durable pre-collect observation wins and skips the post-exit query fallback");
+  assert.equal(durable.last_cgroup_oom.oom_kill_count, "1");
+  assert.equal(durable.last_cgroup_oom.observed_at, "2026-08-30T23:59:59.000Z");
 
   let unmarkedFallbackCalls = 0;
   const unmarkedDurableController = new ResourceController({
     executeProcess: async () => ({
       code: null,
       signal: "SIGKILL",
-      scopeObservation: { oomKillCount: 9 },
+      scopeObservation: observation(9),
     }),
     queryScope: async () => {
       unmarkedFallbackCalls += 1;
-      return { oomKillCount: 0 };
+      return observation(0);
     },
   });
   const unmarkedDurable = await unmarkedDurableController.runWorkerScope(workerSpec());
@@ -297,27 +322,80 @@ async function main() {
     executeProcess: async () => ({
       code: 17,
       signal: null,
-      scopeObservation: { capturedBeforeCollect: true, oomKillCount: -1 },
+      scopeObservation: observation(-1, { capturedBeforeCollect: true }),
     }),
     queryScope: async () => {
       invalidDurableFallbackCalls += 1;
-      return { oomKillCount: 2n };
+      return observation(2n);
     },
   });
   const invalidDurable = await invalidDurableController.runWorkerScope(workerSpec());
   ok(invalidDurableFallbackCalls === 1 && invalidDurable.fact.reason === "oom_kill",
     "an invalid durable counter falls back to a valid bounded-query counter");
 
+  let invalidTimeFallbackCalls = 0;
+  const invalidTimeController = new ResourceController({
+    executeProcess: async () => ({
+      code: null,
+      signal: "SIGKILL",
+      scopeObservation: observation(7, {
+        capturedBeforeCollect: true,
+        observedAt: "not-a-time",
+      }),
+    }),
+    queryScope: async () => {
+      invalidTimeFallbackCalls += 1;
+      return observation(3, { observedAt: "2026-08-31T03:04:05Z" });
+    },
+  });
+  const invalidTimeFallback = await invalidTimeController.runWorkerScope(workerSpec());
+  assert.equal(invalidTimeFallbackCalls, 1);
+  assert.equal(invalidTimeFallback.fact.reason, "oom_kill");
+  assert.equal(invalidTimeFallback.last_cgroup_oom.oom_kill_count, "3");
+  assert.equal(invalidTimeFallback.last_cgroup_oom.observed_at, "2026-08-31T03:04:05.000Z");
+  ok(true, "a durable observation with invalid time has no authority and uses the validated fallback");
+
+  const hugeCounter = (1n << 64n) - 1n;
+  const hugeController = new ResourceController({
+    executeProcess: async () => ({ code: null, signal: "SIGKILL" }),
+    queryScope: async () => observation(hugeCounter),
+  });
+  const huge = await hugeController.runWorkerScope(workerSpec());
+  assert.equal(huge.fact.reason, "oom_kill");
+  assert.equal(huge.last_cgroup_oom.oom_kill_count, "18446744073709551615");
+  assert.doesNotThrow(() => JSON.stringify(hugeController.snapshot()));
+  ok(true, "the full uint64 OOM counter survives output and snapshot JSON without precision loss");
+
+  let hostileTimeFallbackCalls = 0;
+  const hostileTime = observation(4, { capturedBeforeCollect: true });
+  Object.defineProperty(hostileTime, "observedAt", {
+    get() { throw new Error("HOSTILE-TIME-MUST-NOT-LEAK"); },
+  });
+  const hostileTimeController = new ResourceController({
+    executeProcess: async () => ({ code: null, signal: "SIGKILL", scopeObservation: hostileTime }),
+    queryScope: async () => {
+      hostileTimeFallbackCalls += 1;
+      return observation(0);
+    },
+  });
+  const hostileTimeResult = await hostileTimeController.runWorkerScope(workerSpec());
+  assert.equal(hostileTimeFallbackCalls, 1);
+  assert.equal(hostileTimeResult.fact.reason, "signal");
+  assert.equal(hostileTimeResult.last_cgroup_oom.oom_kill_count, "0");
+  assert.ok(!JSON.stringify(hostileTimeController.snapshot()).includes("HOSTILE-TIME-MUST-NOT-LEAK"));
+  ok(true, "hostile observation getters fail closed, fall back, and do not leak their errors");
+
   const invalidFallbackCases = [
     { counter: -1, result: { code: null, signal: "SIGKILL" }, reason: "signal" },
     { counter: 1.5, result: { code: 0, signal: null }, reason: "normal_exit" },
     { counter: Number.MAX_SAFE_INTEGER + 1, result: { code: 17, signal: null }, reason: "unknown" },
-    { counter: "1", result: { code: 17, signal: null }, reason: "unknown" },
+    { counter: "01", result: { code: 17, signal: null }, reason: "unknown" },
+    { counter: 1n << 64n, result: { code: 17, signal: null }, reason: "unknown" },
   ];
   for (const [index, testCase] of invalidFallbackCases.entries()) {
     const invalidFallbackController = new ResourceController({
       executeProcess: async () => testCase.result,
-      queryScope: async () => ({ oomKillCount: testCase.counter, oomKilled: true }),
+      queryScope: async () => observation(testCase.counter, { oomKilled: true }),
     });
     const classified = await invalidFallbackController.runWorkerScope(workerSpec({
       generationId: `invalid-counter-${index}`,
@@ -327,9 +405,24 @@ async function main() {
   }
   ok(true, "invalid fallback counters and unverified observation flags never claim OOM");
 
+  const invalidFallbackTimeController = new ResourceController({
+    executeProcess: async () => ({ code: null, signal: "SIGKILL" }),
+    queryScope: async () => ({
+      oomKillCount: 5,
+      observedAt: "invalid",
+      detail: "PRIVATE-OBSERVATION-DETAIL",
+    }),
+  });
+  const invalidFallbackTime = await invalidFallbackTimeController.runWorkerScope(workerSpec());
+  assert.equal(invalidFallbackTime.fact.reason, "signal");
+  assert.equal(invalidFallbackTime.last_cgroup_oom, null);
+  assert.equal(invalidFallbackTimeController.snapshot().last_cgroup_oom, null);
+  assert.ok(!JSON.stringify(invalidFallbackTimeController.snapshot()).includes("PRIVATE-OBSERVATION-DETAIL"));
+  ok(true, "an invalid fallback timestamp cannot authorize or emit OOM provenance");
+
   const rawResultFlagController = new ResourceController({
     executeProcess: async () => ({ code: null, signal: "SIGKILL", oomKilled: true }),
-    queryScope: async () => ({ oomKillCount: -1 }),
+    queryScope: async () => observation(-1),
   });
   const rawResultFlag = await rawResultFlagController.runWorkerScope(workerSpec());
   ok(rawResultFlag.fact.reason === "signal",
@@ -343,7 +436,7 @@ async function main() {
       error.oomKilled = true;
       throw error;
     },
-    queryScope: async () => ({ oomKillCount: "invalid" }),
+    queryScope: async () => observation("invalid"),
   });
   try {
     await rawErrorFlagController.runControlChild(controlSpec("88"));
@@ -354,10 +447,33 @@ async function main() {
      rawErrorFlagController.snapshot().control_children.active === 0,
     "a raw executor-error OOM flag remains unknown and releases its permit");
 
+  const rejectedOomError = new Error("PRIVATE-EXECUTOR-FAILURE");
+  rejectedOomError.signal = "SIGKILL";
+  rejectedOomError.scopeObservation = observation("18446744073709551615", {
+    capturedBeforeCollect: true,
+  });
+  const rejectedOomController = new ResourceController({
+    executeProcess: async () => { throw rejectedOomError; },
+    queryScope: async () => { throw new Error("fallback must not run"); },
+  });
+  let rejectedOom;
+  try {
+    await rejectedOomController.runWorkerScope(workerSpec());
+  } catch (error) {
+    rejectedOom = error;
+  }
+  assert.equal(rejectedOom, rejectedOomError);
+  assert.equal(rejectedOom.resourceFact.reason, "oom_kill");
+  assert.equal(rejectedOom.last_cgroup_oom.oom_kill_count, "18446744073709551615");
+  assert.deepEqual(rejectedOomController.snapshot().last_cgroup_oom, rejectedOom.last_cgroup_oom);
+  assert.ok(!JSON.stringify(rejectedOomController.snapshot()).includes("PRIVATE-EXECUTOR-FAILURE"));
+  ok(true, "a rejected execution carries validated durable provenance without leaking its error text");
+
   const throwingCounterController = new ResourceController({
     executeProcess: async () => ({ code: 0, signal: null }),
-    queryScope: async () => Object.defineProperty({}, "oomKillCount", {
-      get() { throw new Error("untrusted counter getter"); },
+    queryScope: async () => Object.defineProperties({}, {
+      oomKillCount: { get() { throw new Error("untrusted counter getter"); } },
+      observedAt: { value: OBSERVED_AT },
     }),
   });
   const throwingCounter = await throwingCounterController.runWorkerScope(workerSpec());

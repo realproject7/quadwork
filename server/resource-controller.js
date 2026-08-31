@@ -23,6 +23,7 @@ const UNIT_NAME_RE = /^[a-z][a-z0-9-]{0,62}$/;
 const CONTROL_CLASS_NAME_RE = /^[a-z][a-z0-9-]{0,62}\.slice$/;
 const QUALIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const DEFAULT_CONTROL_CLASS_NAME = "quadwork-control.slice";
+const MAX_OOM_KILL_COUNT = (1n << 64n) - 1n;
 
 function invalid(field, detail) {
   const error = new Error(`${field} ${detail}`);
@@ -254,34 +255,70 @@ function normalizeSignal(value) {
   return null;
 }
 
-function validOomKillCount(value) {
-  return (typeof value === "bigint" && value >= 0n) ||
-    (Number.isSafeInteger(value) && value >= 0);
+function normalizeOomKillCount(value) {
+  let count;
+  try {
+    if (typeof value === "bigint") count = value;
+    else if (Number.isSafeInteger(value) && value >= 0) count = BigInt(value);
+    else if (typeof value === "string" && /^(?:0|[1-9]\d{0,19})$/.test(value)) count = BigInt(value);
+    else return null;
+  } catch {
+    return null;
+  }
+  return count >= 0n && count <= MAX_OOM_KILL_COUNT ? count.toString(10) : null;
+}
+
+function normalizeObservedAt(value) {
+  try {
+    let millis;
+    if (value instanceof Date) millis = value.getTime();
+    else if (typeof value === "number") millis = value;
+    else if (typeof value === "string" && value.length <= 64) millis = Date.parse(value);
+    else return null;
+    if (!Number.isFinite(millis)) return null;
+    return new Date(millis).toISOString();
+  } catch {
+    return null;
+  }
 }
 
 function normalizeScopeObservation(observation, requirePreCollectCapture = false) {
   if (!observation || typeof observation !== "object") return null;
   let capturedBeforeCollect;
   let oomKillCount;
+  let observedAt;
   try {
     capturedBeforeCollect = observation.capturedBeforeCollect;
     oomKillCount = observation.oomKillCount;
+    observedAt = observation.observedAt;
   } catch {
     return null;
   }
   if (requirePreCollectCapture && capturedBeforeCollect !== true) return null;
-  if (!validOomKillCount(oomKillCount)) return null;
-  // Retain only the counter used for classification. An injected query or
-  // executor cannot smuggle paths, environment, or an unverified oomKilled
-  // assertion into controller state through an observation object.
-  return Object.freeze({ oomKillCount });
+  const normalizedCount = normalizeOomKillCount(oomKillCount);
+  const normalizedObservedAt = normalizeObservedAt(observedAt);
+  if (normalizedCount === null || normalizedObservedAt === null) return null;
+  // Retain only the counter and observation time used for classification. An
+  // injected query or executor cannot smuggle paths, environment, or an
+  // unverified oomKilled assertion into controller state through this object.
+  return Object.freeze({ oomKillCount: normalizedCount, observedAt: normalizedObservedAt });
+}
+
+function qualifyScopeObservation(ids, resourceClass, scopeObservation) {
+  if (scopeObservation === null) return null;
+  return Object.freeze({
+    project_id: ids.projectId,
+    generation_id: ids.generationId,
+    resource_class: resourceClass,
+    unit_name: ids.unitName,
+    oom_kill_count: scopeObservation.oomKillCount,
+    observed_at: scopeObservation.observedAt,
+  });
 }
 
 function terminalReason(result, scopeObservation, executionRejected = false) {
   const count = scopeObservation && scopeObservation.oomKillCount;
-  if (validOomKillCount(count) && (typeof count === "bigint" ? count > 0n : count > 0)) {
-    return "oom_kill";
-  }
+  if (typeof count === "string" && BigInt(count) > 0n) return "oom_kill";
   if (normalizeSignal(result?.signal) !== null) return "signal";
   if (!executionRejected && result?.code === 0) return "normal_exit";
   return "unknown";
@@ -387,6 +424,7 @@ class ResourceController {
     this.controlLimiter = new LeafChildLimiter(maxControlChildren);
     this.activeScopes = new Map();
     this.terminalFacts = [];
+    this.lastCgroupOom = null;
   }
 
   runWorkerScope(spec) {
@@ -487,14 +525,21 @@ class ResourceController {
         executionRejected,
         now: this.now,
       });
+      const oomProvenance = qualifyScopeObservation(ids, resourceClass, scopeObservation);
       this.terminalFacts.push(fact);
       if (this.terminalFacts.length > this.terminalFactLimit) this.terminalFacts.shift();
+      if (oomProvenance !== null) this.lastCgroupOom = oomProvenance;
 
       if (executionRejected) {
         executionError.resourceFact = { ...fact };
+        executionError.last_cgroup_oom = oomProvenance === null ? null : { ...oomProvenance };
         throw executionError;
       }
-      return { result, fact: { ...fact } };
+      return {
+        result,
+        fact: { ...fact },
+        last_cgroup_oom: oomProvenance === null ? null : { ...oomProvenance },
+      };
     } finally {
       // Execute, observation, normalization, and terminal-fact failures all
       // converge here. runControlChild's leaf limiter has its own outer finally,
@@ -519,6 +564,10 @@ class ResourceController {
         ...entry,
         ...(entry.limits ? { limits: { ...entry.limits } } : {}),
       })),
+      // This shape is intentionally identical to resource-state's
+      // last_cgroup_oom input. The controller supplies immutable identity; the
+      // injected observation supplies only its validated uint64/time pair.
+      last_cgroup_oom: this.lastCgroupOom === null ? null : { ...this.lastCgroupOom },
       terminal_facts: this.terminalFacts.map((fact) => ({ ...fact })),
     };
   }
