@@ -366,11 +366,11 @@ function normalizePreflight(report, policy) {
     ["requestedMemoryMib", "requestedMemory"],
     ["requestedSwapMib", "requestedSwap"],
     ["liveRequiredMib", "liveRequired"],
-    ["liveHeadroomMib", "liveHeadroom"],
   ]);
+  const liveHeadroom = signedSafeInteger(safeGet(capacityRaw, "liveHeadroomMib"));
   const liveSwapHeadroom = signedSafeInteger(safeGet(capacityRaw, "liveSwapHeadroomMib"));
-  const capacity = capacityBase !== null && liveSwapHeadroom !== null
-    ? { ...capacityBase, liveSwapHeadroom }
+  const capacity = capacityBase !== null && liveHeadroom !== null && liveSwapHeadroom !== null
+    ? { ...capacityBase, liveHeadroom, liveSwapHeadroom }
     : null;
   const containment = safeGet(report, "containment");
   const api = safeGet(report, "api");

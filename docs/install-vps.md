@@ -475,6 +475,10 @@ diff is intended, run the documented `--apply --accept-sha256 '<exact-token>'`
 form separately, inspect its JSON recovery fields, and only then restart. After
 restart, validate the exact accepted root and the loopback resource endpoint:
 
+Keep `/api/resources` on the loopback-only operator surface. Do not expose or
+proxy it publicly: even though secrets and raw paths are redacted, the response
+reports host memory, swap, temp-capacity, and worker-scope capacity facts.
+
 ```bash
 TEMP_ROOT='/exact/accepted/runtime_resources.temp_root'
 stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$TEMP_ROOT"

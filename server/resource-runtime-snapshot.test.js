@@ -305,6 +305,10 @@ function fixture(overrides = {}) {
 }
 
 for (const mutate of [
+  (capacity) => { delete capacity.liveHeadroomMib; },
+  (capacity) => { capacity.liveHeadroomMib += 1; },
+  (capacity) => { capacity.liveHeadroomMib = -1.5; },
+  (capacity) => { capacity.liveHeadroomMib = Number.MAX_SAFE_INTEGER + 1; },
   (capacity) => { delete capacity.liveSwapHeadroomMib; },
   (capacity) => { capacity.liveSwapHeadroomMib += 1; },
   (capacity) => { capacity.private_field = 1; },
@@ -371,10 +375,18 @@ for (const proofAuthority of [undefined, null, {}, "supported", { apiUnitName: "
       memory: () => ({ totalMib: 8192, availableMib: 2735, swapTotalMib: 8192, swapFreeMib: 7000 }),
     }),
   });
+  assert.equal(input.preflightReport.capacity.liveHeadroomMib, -1);
   const snapshot = buildResourceRuntimeSnapshot(input);
   assert.equal(snapshot.status, "capacity_exhausted");
   assert.equal(snapshot.usage.host_memory_available_mib, 2735, "non-ready snapshots retain redacted host facts");
-  assert.equal(Object.hasOwn(snapshot.usage, "static_headroom_mib"), false);
+  assert.equal(snapshot.usage.static_headroom_mib, 1264,
+    "validated capacity facts remain available during live memory exhaustion");
+  assert.deepEqual(snapshot.scope_capacity, {
+    admitted_worker_scopes: 1,
+    reserved_worker_scopes: 3,
+    requested_worker_scopes: 1,
+    live_swap_headroom_mib: 6488,
+  }, "negative live memory headroom retains measured admission and swap capacity facts");
 }
 
 for (const [index, mutate] of [

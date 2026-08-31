@@ -319,6 +319,36 @@ for (const [swapFree, requested, expectedHeadroom] of [
   assert.equal(captureResourceHttpSnapshot(candidate)?.scope_capacity.live_swap_headroom_mib, expectedHeadroom);
 }
 
+{
+  const source = candidateSnapshot();
+  const candidate = {
+    ...source,
+    status: "capacity_exhausted",
+    pressure: { status: "capacity_exhausted", reason: "preflight_capacity_exhausted" },
+    limits: {
+      ...source.limits,
+      worker_memory_high_mib: 1024,
+      worker_memory_max_mib: 1200,
+      worker_swap_max_mib: 512,
+    },
+    usage: { ...source.usage, host_memory_available_mib: 2223 },
+    scope_capacity: {
+      ...source.scope_capacity,
+      requested_worker_scopes: 1,
+      live_swap_headroom_mib: 6488,
+    },
+  };
+  const captured = captureResourceHttpSnapshot(candidate);
+  assert.equal(
+    captured.usage.host_memory_available_mib
+      - captured.limits.host_reserve_mib
+      - captured.scope_capacity.requested_worker_scopes * captured.limits.worker_memory_max_mib,
+    -1,
+  );
+  assert.deepEqual(captured.scope_capacity, candidate.scope_capacity,
+    "capacity exhaustion keeps measured scope capacity at the HTTP boundary");
+}
+
 // A genuine missing-policy owner publishes one canonical synchronous snapshot.
 // Method/body rejection occurs before publication and always sets no-cache.
 {
