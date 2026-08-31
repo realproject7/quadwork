@@ -48,6 +48,36 @@ const diskStatfs = () => ({ type: 0xEF53n, bavail: 20_000n, bsize: 1024n * 1024n
   assert.match(installGuide, /Never use `\*`/);
   assert.match(troubleshooting, /stat --printf='%f\|%u\|%a\|%h\|%d\|%i\\n'/);
   assert.match(troubleshooting, /do not select a cleanup target by wildcard/);
+  assert.match(troubleshooting, /temp-install` does not clean this legacy/);
+
+  function activeShellSnippets(markdown) {
+    const snippets = [];
+    for (const match of markdown.matchAll(/```(?:bash|sh|shell|console)?\s*\n([\s\S]*?)```/g)) {
+      snippets.push(match[1]);
+    }
+    for (const match of markdown.matchAll(/`([^`\n]+)`/g)) snippets.push(match[1]);
+    return snippets.join("\n");
+  }
+
+  function unsafeCleanupRecipes(markdown) {
+    const active = activeShellSnippets(markdown);
+    return [
+      /\bfind\s+\/tmp\b[^\n]*(?:-exec|-delete)\b/,
+      /\brm\b[^\n]*(?:^|\s)(?:--recursive\b|-[A-Za-z]*r[A-Za-z]*\b)/m,
+      /\b(?:dd\b[^\n]*\bof=|truncate\s+|touch\s+|rmdir\s+)["']?\/tmp\b/,
+      /\b(?:rm|rmdir)\b[^\n]*(?:\/tmp\/[^\s"']*(?:\*|\?|\[)|\/tmp\/[^\s"']*prefix)/,
+    ].filter((pattern) => pattern.test(active));
+  }
+
+  for (const [name, document] of [["install-vps", installGuide], ["troubleshooting", troubleshooting]]) {
+    assert.deepEqual(unsafeCleanupRecipes(document), [], `${name} has no active broad cleanup recipe`);
+  }
+  assert.equal(unsafeCleanupRecipes("Never run find /tmp/x/* -exec rm -rf {} +.").length, 0);
+  assert.notEqual(unsafeCleanupRecipes("`find /tmp/x/* -exec rm -rf {} +`").length, 0);
+  assert.notEqual(unsafeCleanupRecipes("```bash\nrm -rf /tmp/prefix-*\n```").length, 0);
+  assert.notEqual(unsafeCleanupRecipes("```sh\nrm --force --recursive /tmp/prefix-one\n```").length, 0);
+  assert.notEqual(unsafeCleanupRecipes("`dd if=/dev/zero of=/tmp/probe bs=1 count=1`").length, 0);
+  assert.equal(unsafeCleanupRecipes("`rm -- /tmp/auth-backup.tar.gz`").length, 0);
 
   const emptyFile = path.join(tempHome, "documented-mode-empty");
   const nonemptyFile = path.join(tempHome, "documented-mode-nonempty");
