@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -91,6 +92,86 @@ function stamp(target, hoursOld) {
   assert.equal(removeConfinedPath(root, original, fs, gemini), true, "supported internal Gemini quarantine is accepted");
   assert.ok(!fs.existsSync(original));
 
+  // POSIX rename would silently replace this existing file. The exclusive
+  // container reservation must instead fail after one mkdir and before rename.
+  const collisionSource = path.join(root, "collision-source");
+  const collisionName = "gemini-client-error-quadwork-quarantine-1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+  const collisionDestination = path.join(root, collisionName);
+  fs.writeFileSync(collisionSource, "source-bytes");
+  fs.writeFileSync(collisionDestination, "destination-bytes");
+  let collisionMkdirCalls = 0;
+  let collisionRenameCalls = 0;
+  const collisionFs = Object.create(fs);
+  collisionFs.mkdirSync = (...args) => {
+    collisionMkdirCalls += 1;
+    return fs.mkdirSync(...args);
+  };
+  collisionFs.renameSync = (...args) => {
+    collisionRenameCalls += 1;
+    return fs.renameSync(...args);
+  };
+  assert.throws(
+    () => removeConfinedPath(root, collisionSource, collisionFs, collisionName),
+    (err) => err.code === "cleanup_quarantine_collision",
+  );
+  assert.equal(collisionMkdirCalls, 1, "explicit collision makes one bounded reservation attempt");
+  assert.equal(collisionRenameCalls, 0, "collision is detected before detach");
+  assert.equal(fs.readFileSync(collisionSource, "utf8"), "source-bytes");
+  assert.equal(fs.readFileSync(collisionDestination, "utf8"), "destination-bytes");
+
+  // A pre-detach failure rolls back only the empty owned reservation and
+  // preserves the source. No recursive cleanup is attempted on partial state.
+  const partialSource = path.join(root, "partial-source");
+  const partialName = "gemini-client-error-quadwork-quarantine-1234-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json";
+  const partialDestination = path.join(root, partialName);
+  fs.writeFileSync(partialSource, "partial-source-bytes");
+  let partialRenameCalls = 0;
+  const partialFs = Object.create(fs);
+  partialFs.renameSync = () => {
+    partialRenameCalls += 1;
+    const err = new Error("injected pre-detach failure");
+    err.code = "EIO";
+    throw err;
+  };
+  assert.throws(() => removeConfinedPath(root, partialSource, partialFs, partialName), /injected pre-detach failure/);
+  assert.equal(partialRenameCalls, 1);
+  assert.equal(fs.readFileSync(partialSource, "utf8"), "partial-source-bytes");
+  assert.ok(!fs.existsSync(partialDestination), "empty reservation is rolled back without recursive disposal");
+
+  // Generated destinations use the same real mkdir no-replace semantics and
+  // stop after the fixed eight-attempt collision budget.
+  const generatedCollisionSource = path.join(root, "generated-collision-source");
+  fs.writeFileSync(generatedCollisionSource, "generated-source-bytes");
+  const fixedRandom = Buffer.alloc(16, 0xcc);
+  const generatedCollisionName = `.quadwork-legacy-quarantine-${fixedRandom.toString("hex")}`;
+  const generatedCollisionDestination = path.join(root, generatedCollisionName);
+  fs.writeFileSync(generatedCollisionDestination, "generated-destination-bytes");
+  const originalRandomBytes = crypto.randomBytes;
+  let generatedMkdirCalls = 0;
+  let generatedRenameCalls = 0;
+  const generatedCollisionFs = Object.create(fs);
+  generatedCollisionFs.mkdirSync = (...args) => {
+    generatedMkdirCalls += 1;
+    return fs.mkdirSync(...args);
+  };
+  generatedCollisionFs.renameSync = (...args) => {
+    generatedRenameCalls += 1;
+    return fs.renameSync(...args);
+  };
+  crypto.randomBytes = () => Buffer.from(fixedRandom);
+  try {
+    assert.throws(
+      () => removeConfinedPath(root, generatedCollisionSource, generatedCollisionFs),
+      (err) => err.code === "cleanup_quarantine_failed",
+    );
+  } finally {
+    crypto.randomBytes = originalRandomBytes;
+  }
+  assert.equal(generatedMkdirCalls, 8, "generated collision retry budget is bounded");
+  assert.equal(generatedRenameCalls, 0, "generated collisions never reach rename");
+  assert.equal(fs.readFileSync(generatedCollisionSource, "utf8"), "generated-source-bytes");
+  assert.equal(fs.readFileSync(generatedCollisionDestination, "utf8"), "generated-destination-bytes");
+
   const generatedSource = path.join(root, "generated-source");
   fs.writeFileSync(generatedSource, "owned");
   let generatedDestination = null;
@@ -100,8 +181,10 @@ function stamp(target, hoursOld) {
     return fs.renameSync(from, to);
   };
   assert.equal(removeConfinedPath(root, generatedSource, observingFs), true);
-  assert.equal(path.dirname(generatedDestination), root, "generated quarantine stays in the target directory");
-  assert.match(path.basename(generatedDestination), /^\.quadwork-legacy-quarantine-[a-f0-9]{32}$/);
+  const generatedContainer = path.dirname(generatedDestination);
+  assert.equal(path.dirname(generatedContainer), root, "generated quarantine stays in the target directory");
+  assert.match(path.basename(generatedContainer), /^\.quadwork-legacy-quarantine-[a-f0-9]{32}$/);
+  assert.equal(path.basename(generatedDestination), "entry", "detach occurs only inside the exclusive container");
   assert.equal(fs.readFileSync(outside, "utf8"), "outside");
   fs.rmSync(base, { recursive: true, force: true });
 }

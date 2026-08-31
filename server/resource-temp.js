@@ -489,7 +489,7 @@ function removeConfinedPath(root, target, fsImpl = fs, quarantineName = null) {
   const resolvedRoot = path.resolve(root);
   const resolvedQuarantineDir = path.resolve(quarantineDir);
   let quarantine = null;
-  let renamed = false;
+  let reserved = false;
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const candidateName = explicitName
       || validateLegacyQuarantineName(`.quadwork-legacy-quarantine-${crypto.randomBytes(16).toString("hex")}`);
@@ -497,18 +497,48 @@ function removeConfinedPath(root, target, fsImpl = fs, quarantineName = null) {
     if (path.dirname(quarantine) !== resolvedQuarantineDir || !isWithin(resolvedRoot, quarantine)) {
       throw new ResourceTempError("cleanup_outside_root", "cleanup quarantine is outside the configured root");
     }
+    let created = false;
     try {
-      fsImpl.renameSync(target, quarantine);
-      renamed = true;
+      // Reserving a fresh container is the no-replace primitive. POSIX rename
+      // silently overwrites an existing file, while mkdir is atomic and fails
+      // with EEXIST for every existing entry type.
+      fsImpl.mkdirSync(quarantine, { recursive: false, mode: 0o700 });
+      created = true;
+      const st = fsImpl.lstatSync(quarantine);
+      const expectedUid = typeof process.getuid === "function" ? process.getuid() : null;
+      if (st.isSymbolicLink()
+        || !st.isDirectory()
+        || (Number(st.mode) & 0o7777) !== 0o700
+        || (expectedUid !== null && Number(st.uid) !== expectedUid)) {
+        throw new ResourceTempError("cleanup_quarantine_unsafe", "cleanup quarantine reservation is unsafe");
+      }
+      reserved = true;
       break;
     } catch (err) {
-      if (err && err.code === "ENOENT") return false;
-      if (err && ["EEXIST", "ENOTEMPTY"].includes(err.code) && explicitName === null) continue;
+      if (created) {
+        // Never recurse during rollback: only our still-empty reservation may
+        // be removed. Any unexpected contents remain for owned recovery.
+        try { fsImpl.rmdirSync(quarantine); } catch {}
+      }
+      if (err && err.code === "EEXIST") {
+        if (explicitName === null) continue;
+        throw new ResourceTempError("cleanup_quarantine_collision", "cleanup quarantine already exists");
+      }
       throw err;
     }
   }
-  if (!renamed || !quarantine) {
+  if (!reserved || !quarantine) {
     throw new ResourceTempError("cleanup_quarantine_failed", "could not quarantine cleanup target");
+  }
+  const detachedEntry = path.join(quarantine, "entry");
+  try {
+    fsImpl.renameSync(target, detachedEntry);
+  } catch (err) {
+    // Only remove the reservation if it is still empty. A failed rollback
+    // leaves an exact owned container for the later legacy recovery sweep.
+    try { fsImpl.rmdirSync(quarantine); } catch {}
+    if (err && err.code === "ENOENT") return false;
+    throw err;
   }
   fsImpl.rmSync(quarantine, { recursive: true, force: true, maxRetries: 2 });
   return true;
