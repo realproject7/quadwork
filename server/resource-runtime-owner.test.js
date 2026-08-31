@@ -214,18 +214,27 @@ function controllerSnapshot(overrides = {}) {
 }
 
 // Missing or invalid resource policy never constructs probes, providers,
-// controllers, state stores, or writers. The read endpoint remains typed.
-for (const loadRuntimeResources of [() => null, () => { throw new Error("SECRET config failure"); }]) {
-  const calls = { probes: 0, provider: 0, controller: 0, store: 0 };
+// controllers, state stores, service factories, or writers. The read endpoint
+// remains source-owned and typed even if the injected factory would throw.
+for (const loadRuntimeResources of [
+  () => null,
+  () => ({ version: 999, secret: "/private/invalid-policy" }),
+  () => { throw new Error("SECRET config failure /private/config"); },
+]) {
+  const calls = { probes: 0, provider: 0, controller: 0, store: 0, service: 0 };
   const owner = createResourceRuntimeOwner({
     loadRuntimeResources,
     createReadOnlyProbes() { calls.probes += 1; throw new Error("unexpected probe"); },
     createObservationProvider() { calls.provider += 1; throw new Error("unexpected provider"); },
     createControllerAdapter() { calls.controller += 1; throw new Error("unexpected controller"); },
     createStateStore() { calls.store += 1; throw new Error("unexpected state"); },
+    createRuntimeService() {
+      calls.service += 1;
+      throw new Error("SECRET factory failure /private/factory");
+    },
   });
   assert.equal(owner.snapshot().status, "invalid_resource_policy");
-  assert.deepEqual(calls, { probes: 0, provider: 0, controller: 0, store: 0 });
+  assert.deepEqual(calls, { probes: 0, provider: 0, controller: 0, store: 0, service: 0 });
   assert.equal(owner.runWorker, undefined);
   assert.equal(owner.runControl, undefined);
   assert.throws(
@@ -244,6 +253,189 @@ for (const loadRuntimeResources of [() => null, () => { throw new Error("SECRET 
   assert.equal(response.statusCode, 200);
   assert.equal(response.body.status, "invalid_resource_policy");
   assert.ok(!JSON.stringify(response.body).includes("SECRET"));
+}
+
+// A configured composition calls the injected service factory at most once.
+// Factory failure cannot be retried as a fallback or escape through snapshot,
+// HTTP, or explicit persistence.
+{
+  const secret = "SECRET factory failure /private/runtime-service";
+  const calls = { factory: 0, load: 0, save: 0 };
+  const composition = fakeComposition({
+    createStateStore() {
+      return {
+        load() { calls.load += 1; return {}; },
+        save() { calls.save += 1; throw new Error("unexpected writer"); },
+      };
+    },
+    createRuntimeService() {
+      calls.factory += 1;
+      throw new Error(secret);
+    },
+  });
+  const owner = createResourceRuntimeOwner(composition.options);
+  const first = owner.snapshot();
+  const second = owner.snapshot();
+  assert.equal(first.status, "unavailable");
+  assert.equal(first.pressure.reason, "preflight_report_invalid");
+  assert.equal(first, second, "source-owned fallback is stable");
+  assert.equal(JSON.stringify(first).includes(secret), false);
+  assert.deepEqual(calls, { factory: 1, load: 1, save: 0 });
+  assert.throws(
+    () => owner.persist(first),
+    (error) => error instanceof ResourceRuntimeOwnerError
+      && error.code === "QW_RESOURCE_PERSISTENCE_UNAVAILABLE"
+      && !error.message.includes(secret),
+  );
+  assert.equal(calls.save, 0);
+
+  const app = fakeApp();
+  owner.register(app);
+  const response = fakeResponse();
+  app.registrations[0].handler({ method: "GET", headers: {} }, response);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.status, "unavailable");
+  assert.equal(JSON.stringify(response.body).includes(secret), false);
+}
+
+// Runtime-service authority is captured once from data descriptors. Accessor,
+// proxy, revoked-proxy, and revoked-callable results all fail closed without
+// invoking getters or leaking their private errors.
+{
+  const secret = "SECRET service boundary /private/service";
+  const cases = [];
+
+  let snapshotGetterCalls = 0;
+  let persistGetterCalls = 0;
+  const accessorService = {};
+  Object.defineProperty(accessorService, "snapshot", {
+    get() { snapshotGetterCalls += 1; throw new Error(secret); },
+  });
+  Object.defineProperty(accessorService, "persist", {
+    get() { persistGetterCalls += 1; throw new Error(secret); },
+  });
+  cases.push(accessorService);
+
+  let persistOnlyGetterCalls = 0;
+  const persistAccessorService = {
+    snapshot() { throw new Error(secret); },
+  };
+  Object.defineProperty(persistAccessorService, "persist", {
+    get() { persistOnlyGetterCalls += 1; throw new Error(secret); },
+  });
+  cases.push(persistAccessorService);
+
+  let proxyTrapCalls = 0;
+  cases.push(new Proxy({}, {
+    getOwnPropertyDescriptor() {
+      proxyTrapCalls += 1;
+      throw new Error(secret);
+    },
+  }));
+
+  const revokedService = Proxy.revocable({}, {});
+  revokedService.revoke();
+  cases.push(revokedService.proxy);
+
+  const revokedSnapshot = Proxy.revocable(function snapshot() {}, {});
+  revokedSnapshot.revoke();
+  cases.push({ snapshot: revokedSnapshot.proxy });
+
+  for (const service of cases) {
+    let factoryCalls = 0;
+    let saveCalls = 0;
+    const composition = fakeComposition({
+      createStateStore() {
+        return {
+          load() { return {}; },
+          save() { saveCalls += 1; throw new Error("unexpected writer"); },
+        };
+      },
+      createRuntimeService() { factoryCalls += 1; return service; },
+    });
+    const owner = createResourceRuntimeOwner(composition.options);
+    const snapshot = owner.snapshot();
+    assert.equal(snapshot.status, "unavailable");
+    assert.equal(snapshot.pressure.reason, "preflight_report_invalid");
+    assert.equal(JSON.stringify(snapshot).includes(secret), false);
+    assert.equal(factoryCalls, 1);
+    assert.throws(
+      () => owner.persist(snapshot),
+      (error) => error instanceof ResourceRuntimeOwnerError
+        && error.code === "QW_RESOURCE_PERSISTENCE_UNAVAILABLE"
+        && !error.message.includes(secret),
+    );
+    assert.equal(saveCalls, 0);
+  }
+  assert.equal(snapshotGetterCalls, 0, "snapshot accessor is never invoked");
+  assert.equal(persistGetterCalls, 0, "persist accessor is never invoked");
+  assert.equal(persistOnlyGetterCalls, 0, "persist-only accessor is never invoked");
+  assert.equal(proxyTrapCalls, 1, "hostile proxy inspection is bounded to one failed capture");
+}
+
+// A captured method can still throw when called. Both snapshot and persistence
+// calls redact the raw error; persistence failure does not update evidence or
+// invoke the store behind the hostile service.
+{
+  const secret = "SECRET method failure /private/method";
+  const calls = { snapshot: 0, persist: 0, storeSave: 0 };
+  const composition = fakeComposition({
+    createStateStore() {
+      return {
+        load() { return {}; },
+        save() { calls.storeSave += 1; throw new Error("unexpected direct write"); },
+      };
+    },
+    createRuntimeService() {
+      return {
+        snapshot() { calls.snapshot += 1; throw new Error(secret); },
+        persist() { calls.persist += 1; throw new Error(secret); },
+      };
+    },
+  });
+  const owner = createResourceRuntimeOwner(composition.options);
+  const snapshot = owner.snapshot();
+  assert.equal(snapshot.status, "unavailable");
+  assert.equal(JSON.stringify(snapshot).includes(secret), false);
+  assert.throws(
+    () => owner.persist(snapshot),
+    (error) => error instanceof ResourceRuntimeOwnerError
+      && error.code === "QW_RESOURCE_PERSISTENCE_FAILED"
+      && !error.message.includes(secret),
+  );
+  assert.deepEqual(calls, { snapshot: 1, persist: 1, storeSave: 0 });
+}
+
+// State-store authority is also reduced to source-owned data-method facades.
+// A hostile load/save accessor is never invoked and explicit persistence is
+// unavailable without touching a writer.
+{
+  const secret = "SECRET store accessor /private/state";
+  let loadGetterCalls = 0;
+  let saveGetterCalls = 0;
+  const hostileStore = {};
+  Object.defineProperty(hostileStore, "load", {
+    get() { loadGetterCalls += 1; throw new Error(secret); },
+  });
+  Object.defineProperty(hostileStore, "save", {
+    get() { saveGetterCalls += 1; throw new Error(secret); },
+  });
+  const composition = fakeComposition({
+    createStateStore() { return hostileStore; },
+  });
+  const owner = createResourceRuntimeOwner(composition.options);
+  const snapshot = owner.snapshot();
+  assert.equal(snapshot.status, "candidate_pending_staging");
+  assert.equal(loadGetterCalls, 0);
+  assert.equal(saveGetterCalls, 0);
+  assert.throws(
+    () => owner.persist(snapshot),
+    (error) => error instanceof ResourceRuntimeOwnerError
+      && error.code === "QW_RESOURCE_PERSISTENCE_UNAVAILABLE"
+      && !error.message.includes(secret),
+  );
+  assert.equal(loadGetterCalls, 0);
+  assert.equal(saveGetterCalls, 0);
 }
 
 // Configured composition is read-only, pins scopeProof=false at its factory
