@@ -25,6 +25,7 @@ process.on("exit", () => {
 const express = require("express");
 const router = require("./routes");
 const telegramBridge = require("./bridges/telegram");
+const discordBridge = require("./bridges/discord");
 const { ProjectLifecycleError, captureProjectAdmission, revokeProjectAdmission } = require("./project-lifecycle");
 const { ConfigurationValidationError } = require("./config");
 
@@ -142,6 +143,80 @@ function request(server, method, pathname, body) {
       telegramBridge.stop = originalTelegramStop;
     }
 
+    const bridgeConfigPath = path.join(TMP, ".quadwork", "config.json");
+    fs.writeFileSync(bridgeConfigPath, JSON.stringify({ projects: [{
+      id: "alpha",
+      name: "Alpha",
+      archived: false,
+      telegram: { bot_token: "telegram-token", chat_id: "chat" },
+      discord: { bot_token: "discord-token", channel_id: "channel" },
+    }] }));
+    for (const [name, bridge] of [["telegram", telegramBridge], ["discord", discordBridge]]) {
+      const original = { start: bridge.start, stop: bridge.stop, isRunning: bridge.isRunning };
+      const bridgeCalls = { start: 0, stop: 0, isRunning: 0 };
+      try {
+        bridge.start = async () => { bridgeCalls.start += 1; return { ok: true }; };
+        bridge.stop = async () => { bridgeCalls.stop += 1; return { ok: true, resources: {}, cleanup_errors: [] }; };
+        bridge.isRunning = () => { bridgeCalls.isRunning += 1; return false; };
+
+        const currentAdmission = captureProjectAdmission("alpha");
+        response = await request(server, "POST", `/api/${name}?action=start`, {
+          project_id: "alpha",
+          admission_generation: currentAdmission.generation,
+        });
+        assert.equal(response.status, 200, `${name} current-generation start succeeds`);
+        assert.equal(response.json.ok, true);
+        response = await request(server, "POST", `/api/${name}?action=stop`, {
+          project_id: "alpha",
+          admission_generation: currentAdmission.generation,
+        });
+        assert.equal(response.status, 200, `${name} current-generation stop succeeds`);
+        assert.equal(response.json.ok, true);
+        assert.equal(bridgeCalls.start, 1);
+        assert.equal(bridgeCalls.stop, 1);
+
+        response = await request(server, "POST", `/api/${name}?action=start`, {
+          project_id: "alpha",
+          admission_generation: -1,
+        });
+        assert.equal(response.status, 400, `${name} rejects an invalid admission generation`);
+        assert.equal(response.json.code, "invalid_admission_generation");
+
+        const staleAdmission = captureProjectAdmission("alpha");
+        revokeProjectAdmission("alpha");
+        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ projects: [{ id: "alpha", archived: true }] }));
+        fs.writeFileSync(bridgeConfigPath, JSON.stringify({ projects: [{
+          id: "alpha",
+          name: "Alpha",
+          archived: false,
+          telegram: { bot_token: "telegram-token", chat_id: "chat" },
+          discord: { bot_token: "discord-token", channel_id: "channel" },
+        }] }));
+        const beforeStale = { ...bridgeCalls };
+        for (const action of ["start", "stop"]) {
+          response = await request(server, "POST", `/api/${name}?action=${action}`, {
+            project_id: "alpha",
+            admission_generation: staleAdmission.generation,
+          });
+          assert.equal(response.status, 409, `${name} stale ${action} is rejected after archive→unarchive`);
+          assert.deepEqual(response.json, {
+            ok: false,
+            error: "project admission changed; refresh and retry",
+            code: "project_admission_changed",
+            project_id: "alpha",
+          });
+        }
+        assert.deepEqual(bridgeCalls, beforeStale, `${name} stale start/stop make zero bridge calls`);
+
+        response = await request(server, "POST", `/api/${name}?action=start`, { project_id: "alpha" });
+        assert.equal(response.status, 200, `${name} manual start without a generation remains compatible`);
+      } finally {
+        bridge.start = original.start;
+        bridge.stop = original.stop;
+        bridge.isRunning = original.isRunning;
+      }
+    }
+
     const settings = fs.readFileSync(path.join(__dirname, "..", "src", "components", "SettingsPage.tsx"), "utf-8");
     assert.match(settings, /projectLifecyclePending/);
     assert.match(settings, /cleanup_errors/);
@@ -165,7 +240,6 @@ function request(server, method, pathname, body) {
     // Username discovery is an external await. An archive→unarchive cycle
     // invalidates its admission generation, so the stale response must not
     // overwrite the fresh config (and archived status reads make zero calls).
-    const bridgeConfigPath = path.join(TMP, ".quadwork", "config.json");
     const originalFetch = global.fetch;
     try {
       for (const bridge of ["telegram", "discord"]) {

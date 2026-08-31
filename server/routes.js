@@ -739,6 +739,31 @@ function projectLifecycleController(req, res, projectId) {
   return null;
 }
 
+function requestedBridgeAdmission(body, projectId, res) {
+  if (!Object.prototype.hasOwnProperty.call(body, "admission_generation")) return undefined;
+  const generation = body.admission_generation;
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    res.status(400).json({
+      ok: false,
+      error: "admission_generation must be a safe nonnegative integer",
+      code: "invalid_admission_generation",
+      project_id: projectId,
+    });
+    return null;
+  }
+  const admission = projectAdmission(projectId);
+  if (!admission || admission.generation !== generation || !isAdmissionCurrent(admission)) {
+    res.status(409).json({
+      ok: false,
+      error: "project admission changed; refresh and retry",
+      code: "project_admission_changed",
+      project_id: projectId,
+    });
+    return null;
+  }
+  return admission;
+}
+
 // #1034: archive/unarchive is a lifecycle barrier. The injected controller is
 // the sole mutation authority; route-local config mutation is forbidden.
 router.put("/api/projects/:id/archive", async (req, res) => {
@@ -4534,7 +4559,8 @@ router.post("/api/setup", async (req, res) => {
       let cfg;
       try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
       catch { cfg = { port: 8400, projects: [] }; }
-      if (cfg.projects.some((p) => p.id === id)) {
+      const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
+      if (!activated && cfg.projects.some((p) => p.id === id)) {
         // Project already saved, but still (idempotently) seed the
         // OVERNIGHT-QUEUE.md in case a previous run failed to write
         // it or the operator deleted it. writeOvernightQueueFileSafe
@@ -4563,13 +4589,44 @@ router.post("/api/setup", async (req, res) => {
           ...(cliBase === "codex" ? { reasoning_effort: "medium" } : {}),
         };
       }
-      cfg.projects.push({
-        id, name, repo, working_dir: workingDir, agents,
-        chat_mode: "file",
-      });
       const dir = path.dirname(CONFIG_PATH);
       ensureSecureDir(dir);
-      writeConfig(cfg);
+      if (activated) {
+        try {
+          commitV2Configuration((fresh) => {
+            if ((fresh.projects || []).some((project) => project.id === id)) {
+              const error = new Error("Project already in config");
+              error.code = "QW_PROJECT_ALREADY_CONFIGURED";
+              throw error;
+            }
+            if (!Array.isArray(fresh.projects)) fresh.projects = [];
+            fresh.projects.push({
+              id,
+              name,
+              repositories: [{ key: "primary", repo, working_dir: workingDir, primary: true }],
+              agents,
+              chat_mode: "file",
+            });
+          });
+        } catch (err) {
+          if (err.code === "QW_PROJECT_ALREADY_CONFIGURED") {
+            const fresh = readConfigFile();
+            const existing = (fresh.projects || []).find((project) => project.id === id);
+            const existingRepo = primaryRepository(existing)?.repo || "";
+            writeOvernightQueueFileSafe(id, existing?.name || id, existingRepo);
+            writeGithubFileSafe(id, existing?.name || id, existingRepo);
+            return res.json({ ok: true, message: "Project already in config" });
+          }
+          if (sendV2ConfigurationError(res, err)) return;
+          throw err;
+        }
+      } else {
+        cfg.projects.push({
+          id, name, repo, working_dir: workingDir, agents,
+          chat_mode: "file",
+        });
+        writeConfig(cfg);
+      }
 
       // #775: initialize file-chat for the new project so the first
       // chat send doesn't error with "Project not initialized" before
@@ -5325,7 +5382,8 @@ router.post("/api/telegram", async (req, res) => {
   const action = req.query.action;
   const body = req.body || {};
 
-  if (body.project_id && action !== "stop") {
+  if (body.project_id && action !== "stop" &&
+      !(action === "start" && Object.prototype.hasOwnProperty.call(body, "admission_generation"))) {
     try { assertProjectAdmitted(body.project_id); }
     catch (err) { return sendProjectLifecycleException(res, err, body.project_id); }
   }
@@ -5350,7 +5408,9 @@ router.post("/api/telegram", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      const admission = projectAdmission(projectId);
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
       if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
       if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const tg = getProjectTelegram(projectId);
@@ -5376,6 +5436,8 @@ router.post("/api/telegram", async (req, res) => {
     case "stop": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
       try {
         const stopped = await telegramBridge.stop(projectId);
         if (stopped?.ok !== true) {
@@ -5520,7 +5582,8 @@ router.post("/api/discord", async (req, res) => {
   const action = req.query.action;
   const body = req.body || {};
 
-  if (body.project_id && action !== "stop") {
+  if (body.project_id && action !== "stop" &&
+      !(action === "start" && Object.prototype.hasOwnProperty.call(body, "admission_generation"))) {
     try { assertProjectAdmitted(body.project_id); }
     catch (err) { return sendProjectLifecycleException(res, err, body.project_id); }
   }
@@ -5550,7 +5613,9 @@ router.post("/api/discord", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      const admission = projectAdmission(projectId);
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
       if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
       if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
       const dc = getProjectDiscord(projectId);
@@ -5572,6 +5637,8 @@ router.post("/api/discord", async (req, res) => {
     case "stop": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
       try {
         const stopped = await discordBridge.stop(projectId);
         if (stopped?.ok !== true) {
