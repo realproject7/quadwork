@@ -92,7 +92,9 @@ function initialized(directory, options = {}) {
   const state = store.initialize({ expected: initialExpected(manifest), manifest, pipeline });
   return { store, manifest, pipeline, state };
 }
-function event(kind, event_id, fields = {}) { return { version: 1, kind, event_id, ...fields }; }
+function event(kind, event_id, fields = {}) {
+  return { version: 1, kind, event_id, ...(kind === "assign_build" ? { base_sha } : {}), ...fields };
+}
 function persist(store, state, nextEvent, terminal_disposition = null) {
   const plan = planWorkTaskPipelineEvent(state.pipeline, nextEvent);
   return store.applyPlan({ expected: currentExpected(state), plan, terminal_disposition });

@@ -148,7 +148,7 @@ function applyPipelineEvent(directory, state, event, terminal_disposition = null
 function advanceToAccepted(directory, initial) {
   const ref = initial.manifest.tasks[0].ref;
   let state = applyPipelineEvent(directory, initial, {
-    version: 1, kind: "assign_build", event_id: "domain_assign_build", work_task_ref: copy(ref), assignment_id: "domain_assignment",
+    version: 1, kind: "assign_build", event_id: "domain_assign_build", work_task_ref: copy(ref), assignment_id: "domain_assignment", base_sha: baseSha,
   });
   const candidate = exactCandidate(ref);
   state = applyPipelineEvent(directory, state, { version: 1, kind: "record_candidate", event_id: "domain_record_candidate", candidate });

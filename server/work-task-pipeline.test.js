@@ -66,14 +66,14 @@ function refs(manifestValue) {
 function slot(pipeline, taskRef) {
   return pipeline.tasks.find((entry) => entry.work_task_ref.task_revision === taskRef.task_revision);
 }
-function candidateFor(taskRef, marker) {
+function candidateFor(taskRef, marker, candidateBase = base_sha) {
   const candidate_sha = marker.repeat(64);
   const worktree_id = `wt_${taskRef.repository_key}_${taskRef.task_key}_${marker}`;
   const worktreePath = `/private/var/tmp/quadwork-${taskRef.repository_key}-${taskRef.task_key}-${marker}`;
   return buildWorkTaskCandidate({
     version: 1,
     work_task_ref: copy(taskRef),
-    base_sha,
+    base_sha: candidateBase,
     candidate_sha,
     branch: `task/${taskRef.repository_key}-${taskRef.task_key}-${marker}`,
     worktree: { repository_key: taskRef.repository_key, worktree_id, path: worktreePath },
@@ -102,7 +102,9 @@ function candidateFor(taskRef, marker) {
     },
   });
 }
-function event(kind, event_id, fields = {}) { return { version: 1, kind, event_id, ...fields }; }
+function event(kind, event_id, fields = {}) {
+  return { version: 1, kind, event_id, ...(kind === "assign_build" ? { base_sha } : {}), ...fields };
+}
 function apply(pipeline, nextEvent) {
   const plan = planWorkTaskPipelineEvent(pipeline, nextEvent);
   assert.equal(Object.isFrozen(plan), true);
@@ -117,6 +119,23 @@ function moveToCandidate(pipeline, taskRef, marker, prefix) {
   let next = apply(pipeline, event("assign_build", `${prefix}_build`, { work_task_ref: copy(taskRef), assignment_id: `${prefix}_assignment` }));
   next = apply(next, event("record_candidate", `${prefix}_candidate`, { candidate }));
   return { pipeline: next, candidate };
+}
+
+// A candidate may only begin review from the immutable base SHA issued with
+// the current Head build assignment.  Candidate validation alone cannot infer
+// that authoritative assignment context.
+{
+  const batch = manifest();
+  const workRefs = refs(batch);
+  let work = buildWorkTaskPipeline(batch);
+  work = apply(work, event("assign_build", "base_pin_build", {
+    work_task_ref: copy(workRefs.core), assignment_id: "base_pin_assignment",
+  }));
+  const foreignBase = "f".repeat(64);
+  const wrongBaseCandidate = candidateFor(workRefs.core, "b", foreignBase);
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("record_candidate", "base_pin_mismatch", {
+    candidate: wrongBaseCandidate,
+  })), "work_task_candidate_base_mismatch");
 }
 function moveToAccepted(pipeline, taskRef, marker, prefix) {
   const built = moveToCandidate(pipeline, taskRef, marker, prefix);

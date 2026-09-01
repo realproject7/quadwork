@@ -126,8 +126,9 @@ function pipelineDigest(pipeline) { return hash(pipelinePayload(pipeline)); }
 function withDigest(pipeline) { return freeze({ ...pipeline, pipeline_digest: pipelineDigest(pipeline) }); }
 
 function assertAssignment(value, code) {
-  exact(value, ["assignment_id"], code);
+  exact(value, ["assignment_id", "base_sha"], code);
   identifier(value.assignment_id, code);
+  sha(value.base_sha, code);
   return value;
 }
 function assertReviewAssignment(value, currentCandidate, state, code) {
@@ -261,9 +262,9 @@ function parseEvent(pipeline, event) {
   const code = "invalid_work_task_pipeline_event";
   switch (event.kind) {
     case "assign_build":
-      exact(event, ["version", "kind", "event_id", "work_task_ref", "assignment_id"], code);
+      exact(event, ["version", "kind", "event_id", "work_task_ref", "assignment_id", "base_sha"], code);
       if (event.version !== VERSION) fail(code, "event version is invalid");
-      return { version: VERSION, kind: event.kind, event_id: identifier(event.event_id, code), work_task_ref: canonicalTaskRef(pipeline, event.work_task_ref, code), assignment_id: identifier(event.assignment_id, code) };
+      return { version: VERSION, kind: event.kind, event_id: identifier(event.event_id, code), work_task_ref: canonicalTaskRef(pipeline, event.work_task_ref, code), assignment_id: identifier(event.assignment_id, code), base_sha: sha(event.base_sha, code) };
     case "record_candidate": {
       exact(event, ["version", "kind", "event_id", "candidate"], code);
       if (event.version !== VERSION) fail(code, "event version is invalid");
@@ -398,13 +399,16 @@ function deriveTransition(pipeline, event) {
       const from = slot.state;
       slot.state = "building";
       slot.blocked_from = null;
-      slot.build_assignment = { assignment_id: event.assignment_id };
+      slot.build_assignment = { assignment_id: event.assignment_id, base_sha: event.base_sha };
       effect(slot, from);
       break;
     }
     case "record_candidate": {
       const slot = locate(event.candidate.work_task_ref);
       requireState(slot, "building");
+      if (!slot.build_assignment || slot.build_assignment.base_sha !== event.candidate.base_sha) {
+        fail("work_task_candidate_base_mismatch", "candidate base is not the server-issued assignment base");
+      }
       if (slot.candidate && slot.candidate.candidate_digest === event.candidate.candidate_digest) {
         fail("work_task_candidate_not_changed", "replacement candidate must be exact and new");
       }
