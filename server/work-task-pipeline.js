@@ -119,6 +119,7 @@ function pipelinePayload(pipeline) {
     manifest_digest: pipeline.manifest_digest,
     manifest_frozen: pipeline.manifest_frozen,
     archived: pipeline.archived,
+    repository_bases: pipeline.repository_bases,
     history: pipeline.history,
     tasks: pipeline.tasks,
   };
@@ -201,14 +202,29 @@ function assertSlot(slot, code) {
   });
   return slot;
 }
+function assertRepositoryBases(value, tasks, code) {
+  if (!Array.isArray(value) || value.length > MAX_TASKS) fail(code, "repository base records are invalid");
+  const known = new Set(tasks.map((slot) => slot.work_task_ref.repository_key));
+  const parsed = value.map((entry) => {
+    exact(entry, ["repository_key", "base_sha"], code);
+    if (typeof entry.repository_key !== "string" || !known.has(entry.repository_key)) fail(code, "repository base repository is invalid");
+    return { repository_key: entry.repository_key, base_sha: sha(entry.base_sha, code) };
+  });
+  if (new Set(parsed.map((entry) => entry.repository_key)).size !== parsed.length ||
+      parsed.some((entry, index) => index > 0 && parsed[index - 1].repository_key.localeCompare(entry.repository_key) >= 0)) {
+    fail(code, "repository base records are not canonical");
+  }
+  return parsed;
+}
 
 function assertWorkTaskPipeline(pipeline) {
-  exact(pipeline, ["version", "manifest_digest", "manifest_frozen", "archived", "history", "tasks", "pipeline_digest"], "invalid_work_task_pipeline");
+  exact(pipeline, ["version", "manifest_digest", "manifest_frozen", "archived", "repository_bases", "history", "tasks", "pipeline_digest"], "invalid_work_task_pipeline");
   if (pipeline.version !== VERSION || !SHA_RE.test(pipeline.manifest_digest) || typeof pipeline.manifest_frozen !== "boolean" || typeof pipeline.archived !== "boolean" ||
       !Array.isArray(pipeline.tasks) || pipeline.tasks.length === 0 || pipeline.tasks.length > MAX_TASKS || !Array.isArray(pipeline.history) || pipeline.history.length > MAX_HISTORY || !SHA_RE.test(pipeline.pipeline_digest)) {
     fail("invalid_work_task_pipeline", "pipeline shape is invalid");
   }
   const tasks = pipeline.tasks.map((slot) => assertSlot(slot, "invalid_work_task_pipeline"));
+  assertRepositoryBases(pipeline.repository_bases, tasks, "invalid_work_task_pipeline");
   const taskKeys = tasks.map((slot) => workTaskKey(slot.work_task_ref));
   if (new Set(taskKeys).size !== taskKeys.length) fail("invalid_work_task_pipeline", "pipeline task identity is duplicated");
   const known = new Set(taskKeys);
@@ -250,6 +266,7 @@ function buildWorkTaskPipeline(manifest, options) {
     manifest_digest: manifest.manifest_digest,
     manifest_frozen: manifest.frozen !== null,
     archived: normalizedOptions.archived,
+    repository_bases: [],
     history: [],
     tasks,
   });
@@ -388,6 +405,28 @@ function assertDependenciesReady(tasks, slot) {
     if (!DEPENDENCY_READY_STATES.has(parent.state)) fail("work_task_dependencies_not_ready", "declared dependency is not ready");
   }
 }
+function assignedRepositoryBase(repositoryBases, repositoryKey) {
+  return repositoryBases.find((entry) => entry.repository_key === repositoryKey) || null;
+}
+function expectedBuildBase(tasks, repositoryBases, slot) {
+  // A bounded correction keeps the original task base. It cannot quietly
+  // absorb a later unrelated integration tip.
+  if (slot.candidate !== null) return slot.candidate.base_sha;
+  const sameRepositoryDependencies = slot.dependency_refs
+    .map((dependency) => slotFor(tasks, dependency, "invalid_work_task_pipeline_state"))
+    .filter((dependency) => dependency.work_task_ref.repository_key === slot.work_task_ref.repository_key);
+  if (sameRepositoryDependencies.length > 1) {
+    fail("work_task_dependency_base_ambiguous", "task has multiple same-repository predecessor bases");
+  }
+  if (sameRepositoryDependencies.length === 1) {
+    const predecessor = sameRepositoryDependencies[0];
+    if (!predecessor.candidate || !DEPENDENCY_READY_STATES.has(predecessor.state)) {
+      fail("work_task_dependencies_not_ready", "same-repository predecessor has no accepted exact candidate");
+    }
+    return predecessor.candidate.candidate_sha;
+  }
+  return assignedRepositoryBase(repositoryBases, slot.work_task_ref.repository_key)?.base_sha || null;
+}
 function pathsOverlap(left, right) {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
@@ -409,6 +448,7 @@ function assertReviewBoundariesDisjoint(tasks, next) {
 // the exact plan can be recreated from the current pipeline state.
 function deriveTransition(pipeline, event) {
   const tasks = clone(pipeline.tasks);
+  const repositoryBases = clone(pipeline.repository_bases);
   const effects = [];
   let archived = pipeline.archived;
   const effect = (slot, fromState) => effects.push(eventEffect(slot, fromState));
@@ -423,6 +463,14 @@ function deriveTransition(pipeline, event) {
       requireState(slot, "queued");
       assertDependenciesReady(tasks, slot);
       assertReviewBoundariesDisjoint(tasks, slot);
+      const requiredBase = expectedBuildBase(tasks, repositoryBases, slot);
+      if (requiredBase !== null && event.base_sha !== requiredBase) {
+        fail("work_task_assigned_base_mismatch", "build base does not match the frozen repository/task predecessor base");
+      }
+      if (requiredBase === null) {
+        repositoryBases.push({ repository_key: slot.work_task_ref.repository_key, base_sha: event.base_sha });
+        repositoryBases.sort((left, right) => left.repository_key.localeCompare(right.repository_key));
+      }
       const from = slot.state;
       slot.state = "building";
       slot.blocked_from = null;
@@ -639,7 +687,7 @@ function deriveTransition(pipeline, event) {
     default:
       fail("invalid_work_task_pipeline_event", "event kind is unsupported");
   }
-  return { tasks, archived, effects };
+  return { tasks, repositoryBases, archived, effects };
 }
 
 function precondition(pipeline) {
@@ -712,6 +760,7 @@ function applyWorkTaskPipelinePlan(pipeline, plan) {
     manifest_digest: pipeline.manifest_digest,
     manifest_frozen: pipeline.manifest_frozen,
     archived: transition.archived,
+    repository_bases: transition.repositoryBases,
     history: [...pipeline.history, { event_id: expected.event.event_id, kind: expected.event.kind }],
     tasks,
   });

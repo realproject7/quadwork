@@ -150,6 +150,9 @@ function moveToCandidate(pipeline, taskRef, marker, prefix) {
   work = apply(work, event("assign_independent_review", "boundary_alpha_review", {
     work_task_ref: copy(workRefs.alpha), review_round_id: "boundary_alpha_round", candidate_digest: alpha.candidate_digest,
   }));
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("assign_build", "boundary_beta_wrong_base", {
+    work_task_ref: copy(workRefs.beta), assignment_id: "boundary_beta_wrong_assignment", base_sha: "f".repeat(64),
+  })), "work_task_assigned_base_mismatch");
   work = apply(work, event("assign_build", "boundary_beta_build", {
     work_task_ref: copy(workRefs.beta), assignment_id: "boundary_beta_assignment",
   }));
@@ -240,9 +243,47 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
     work_task_ref: copy(workRefs.core), review_round_id: "overlap_core_round", candidate_digest: coreCandidate.candidate_digest, resolution: "accepted",
   }));
   work = apply(work, event("assign_build", "dependent_after_ready", {
-    work_task_ref: copy(workRefs["api-client"]), assignment_id: "dependent_assignment",
+    work_task_ref: copy(workRefs["api-client"]), assignment_id: "dependent_assignment", base_sha: coreCandidate.candidate_sha,
   }));
   assert.equal(slot(work, workRefs["api-client"]).state, "building");
+}
+
+// The first task records the repository's frozen base. An independent sibling
+// reuses it, while a same-repository dependency must use its accepted exact
+// predecessor SHA rather than a caller-selected branch tip.
+{
+  const parent = sourceTask("parent", "api", 10, [], "parent", ["server/parent.js"]);
+  const child = sourceTask("child", "api", 11, [{ repository_key: "api", work_item: copy(parent.work_item), task_key: "parent" }], "child", ["server/child.js"]);
+  const batch = manifestForTasks([parent, child]);
+  const workRefs = refs(batch);
+  let work = buildWorkTaskPipeline(batch);
+  const parentCandidate = candidateFor(workRefs.parent, "b");
+  work = apply(work, event("assign_build", "base_parent_build", {
+    work_task_ref: copy(workRefs.parent), assignment_id: "base_parent_assignment",
+  }));
+  work = apply(work, event("record_candidate", "base_parent_candidate", {
+    assignment_id: "base_parent_assignment", candidate: parentCandidate,
+  }));
+  work = apply(work, event("assign_independent_review", "base_parent_review", {
+    work_task_ref: copy(workRefs.parent), review_round_id: "base_parent_round", candidate_digest: parentCandidate.candidate_digest,
+  }));
+  work = apply(work, event("record_review_verdict", "base_parent_verdict", {
+    work_task_ref: copy(workRefs.parent), review_round_id: "base_parent_round", candidate_digest: parentCandidate.candidate_digest, verdict: "approved",
+  }));
+  work = apply(work, event("reconcile_review", "base_parent_accept", {
+    work_task_ref: copy(workRefs.parent), review_round_id: "base_parent_round", candidate_digest: parentCandidate.candidate_digest, resolution: "accepted",
+  }));
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("assign_build", "base_child_wrong", {
+    work_task_ref: copy(workRefs.child), assignment_id: "base_child_assignment", base_sha,
+  })), "work_task_assigned_base_mismatch");
+  const childCandidate = candidateFor(workRefs.child, "c", parentCandidate.candidate_sha);
+  work = apply(work, event("assign_build", "base_child_build", {
+    work_task_ref: copy(workRefs.child), assignment_id: "base_child_assignment", base_sha: parentCandidate.candidate_sha,
+  }));
+  work = apply(work, event("record_candidate", "base_child_candidate", {
+    assignment_id: "base_child_assignment", candidate: childCandidate,
+  }));
+  assert.deepEqual(work.repository_bases, [{ repository_key: "api", base_sha }]);
 }
 
 // A corrected exact candidate retires the bounded correction authority. The
