@@ -33,7 +33,7 @@ const {
   validateAssignmentProvenance,
   ownershipKey,
 } = require("./work-item-ref");
-const { normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha } = require("./ci-evidence-policy");
+const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha } = require("./ci-evidence-policy");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
@@ -404,6 +404,28 @@ function sendV2ConfigurationError(res, err) {
   return true;
 }
 
+function genericRepositoryRecord(entry) {
+  const repository = entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+  const repo = typeof repository.repo === "string" ? repository.repo.trim().toLowerCase() : null;
+  const workingDir = typeof repository.working_dir === "string" && path.isAbsolute(repository.working_dir)
+    ? path.normalize(path.resolve(repository.working_dir))
+    : null;
+  let policy;
+  if (!Object.prototype.hasOwnProperty.call(repository, "ci_policy")) {
+    policy = "missing";
+  } else {
+    try { policy = JSON.stringify(normalizeCiPolicy(repository.ci_policy)); }
+    catch { policy = JSON.stringify(repository.ci_policy); }
+  }
+  return Object.freeze({
+    key: typeof repository.key === "string" ? repository.key : null,
+    repo,
+    working_dir: workingDir,
+    primary: repository.primary === true,
+    ci_policy: policy,
+  });
+}
+
 function genericV2ProjectTopology(config) {
   if (!Array.isArray(config?.projects)) {
     throw new ConfigurationValidationError(
@@ -427,8 +449,10 @@ function genericV2ProjectTopology(config) {
       topology.set(project.id, null);
       continue;
     }
-    topology.set(project.id, [...new Set(project.repositories.map((entry) => entry?.key))]
-      .sort((left, right) => String(left).localeCompare(String(right))));
+    // Activated generic config routes may edit presentation/configuration but
+    // cannot retarget a stable repository record under the same key. Preserve
+    // record order too: topology changes belong to explicit V2 activation.
+    topology.set(project.id, project.repositories.map(genericRepositoryRecord));
   }
   return topology;
 }
@@ -451,8 +475,8 @@ function assertGenericV2ProjectTopology(previousTopology, candidateConfig) {
     if (JSON.stringify(before) !== JSON.stringify(after)) {
       throw new ConfigurationValidationError(
         "generic_repository_topology_change_forbidden",
-        "repositories.key",
-        "generic config routes cannot change activated repository key topology",
+        "repositories",
+        "generic config routes cannot change activated repository records",
       );
     }
   }
@@ -989,8 +1013,23 @@ const {
   primaryRepository,
   repositoryCiPolicy,
   ConfigurationValidationError,
+  migrateConfigurationToV2,
   commitV2Configuration,
 } = require("./config");
+const { projectV2Readiness } = require("./project-v2-readiness");
+const {
+  RepositoryProvisionError,
+  assertProjectId,
+  assertRepositoryList,
+  configuredRepositoryOwnership,
+  provisionRepositoryWorktrees,
+  renderProjectRepositoryMap,
+  writeProjectRepositoryMap,
+} = require("./repository-provisioning");
+const {
+  firstActivationLegacyGuard,
+  targetActivationGuard,
+} = require("./project-v2-activation");
 const { findAgentChattr } = require("./install-agentchattr");
 const {
   createIssueContractRevisionHandler,
@@ -5417,11 +5456,268 @@ router.get("/api/setup/reviewer-token-status", (_req, res) => {
 // so they run off the event loop instead of freezing every agent's WS/HTTP/
 // timers in this single-process server. Express 5 forwards a rejected handler
 // to the default error handler (same 500 the prior sync throws produced).
+class V2SetupActivationError extends Error {
+  constructor(result) {
+    super(result.code || "v2_setup_activation_blocked");
+    this.name = "V2SetupActivationError";
+    this.result = result;
+  }
+}
+
+function v2SetupExecutionState(project) {
+  if (!project || typeof project.id !== "string" || !project.id) return { state: "state_unavailable" };
+  let context;
+  try { context = readLiveBatchContext(project.id); }
+  catch { return { state: "state_unavailable" }; }
+  if (!context || context.queueReadOk !== true || !context.parsed || context.parsed.errors?.length > 0) {
+    return { state: "state_unavailable" };
+  }
+  if (context.parsed.assignmentKey) return { state: "open_assignment" };
+  if (Array.isArray(context.parsed.workItems) && context.parsed.workItems.length > 0) {
+    return {
+      state: context.parsed.workItems.some((item) => item.legacyUnowned === true)
+        ? "legacy_unowned_executable"
+        : "active_batch",
+    };
+  }
+  return { state: "clear" };
+}
+
+function v2RepositoryRecords(repositories) {
+  return assertRepositoryList(repositories).map((entry) => ({
+    key: entry.key,
+    repo: entry.repo,
+    working_dir: entry.working_dir,
+    primary: entry.primary,
+    ...(Object.prototype.hasOwnProperty.call(entry, "ci_policy") ? { ci_policy: entry.ci_policy } : {}),
+  }));
+}
+
+function v2SetupProjectId(body) {
+  try {
+    return { ok: true, project_id: assertProjectId(body?.id) };
+  } catch (error) {
+    return {
+      ok: false,
+      code: error instanceof RepositoryProvisionError ? error.code : "invalid_project_id",
+    };
+  }
+}
+
+async function verifyV2RepositoryAccess(repositories) {
+  for (const repository of repositories) {
+    const result = await execAsync("gh", ["repo", "view", repository.repo, "--json", "nameWithOwner,viewerPermission,defaultBranchRef"]);
+    if (!result.ok) return { ok: false, code: "repository_access_unavailable", repo_key: repository.key };
+    let info;
+    try { info = JSON.parse(result.output); }
+    catch { return { ok: false, code: "repository_identity_unavailable", repo_key: repository.key }; }
+    const canonical = typeof info.nameWithOwner === "string" ? info.nameWithOwner.toLowerCase() : null;
+    if (!canonical || canonical !== repository.repo.toLowerCase()) {
+      return { ok: false, code: "repository_identity_mismatch", repo_key: repository.key };
+    }
+    if (!new Set(["ADMIN", "MAINTAIN", "WRITE"]).has(info.viewerPermission)) {
+      return { ok: false, code: "repository_push_access_required", repo_key: repository.key };
+    }
+  }
+  return { ok: true };
+}
+
+function activeTargetSession(projectId, activeSessions) {
+  if (!activeSessions || typeof activeSessions[Symbol.iterator] !== "function") return { ok: true };
+  for (const [sessionKey, session] of activeSessions) {
+    if (!session || session.projectId !== projectId || session.state !== "running") continue;
+    const role = typeof session.agentId === "string" && session.agentId.length > 0
+      ? session.agentId
+      : (typeof sessionKey === "string" && sessionKey.includes("/") ? sessionKey.split("/").at(-1) : "unknown");
+    return { ok: false, code: "active_session", role };
+  }
+  return { ok: true };
+}
+
+function existingV2TopologyGuard(project, activeSessions) {
+  const targetGate = targetActivationGuard(project, v2SetupExecutionState);
+  if (!targetGate.ok) return targetGate;
+  return activeTargetSession(project.id, activeSessions);
+}
+
+function v2CandidateProject(existing, body, repositories) {
+  const candidate = existing
+    // Keep scalar removal in #1029's canonical, pure migration helper. This
+    // avoids a second route-local scalar compatibility rule while retaining
+    // every unrelated project field for the final transaction.
+    ? { ...migrateConfigurationToV2({ projects: [existing] }).projects[0], repositories }
+    : {
+      id: body.id,
+      name: typeof body.name === "string" && body.name ? body.name : body.id,
+      agents: body.agents && typeof body.agents === "object" ? body.agents : {},
+      chat_mode: "file",
+      repositories,
+    };
+  return candidate;
+}
+
+function primaryAgentCwds(existing, repositories) {
+  const previousPrimary = primaryRepository(existing);
+  const requestedPrimary = repositories.find((entry) => entry.primary === true);
+  if (!previousPrimary || !requestedPrimary ||
+      String(previousPrimary.repo || "").trim().toLowerCase() !== String(requestedPrimary.repo || "").trim().toLowerCase()) {
+    return {};
+  }
+  const agentCwds = {};
+  for (const role of ["head", "re1", "re2", "dev"]) {
+    const cwd = existing?.agents?.[role]?.cwd;
+    if (typeof cwd === "string" && path.isAbsolute(cwd)) agentCwds[role] = cwd;
+  }
+  return agentCwds;
+}
+
+function publicProvisioningResult(result) {
+  return {
+    created: result.created || [],
+    reused: result.reused || [],
+    repositories: (result.repositories || []).map((repository) => ({
+      key: repository.key,
+      repo: repository.repo,
+      primary: repository.primary,
+      default_branch: repository.default_branch,
+      base_clone: repository.working_dir,
+      worktrees: repository.worktrees,
+    })),
+  };
+}
+
+async function provisionV2Repositories(config, candidate, repositories, existing = null) {
+  return provisionRepositoryWorktrees({
+    projectId: candidate.id,
+    repositories,
+    config,
+    primaryAgentCwds: primaryAgentCwds(existing, repositories),
+    runner: execAsync,
+    fsImpl: fs,
+  });
+}
+
 router.post("/api/setup", async (req, res) => {
   const step = req.query.step;
   const body = req.body || {};
 
   switch (step) {
+    case "verify-repositories": {
+      const projectId = v2SetupProjectId(body);
+      if (!projectId.ok) return res.status(400).json(projectId);
+      let repositories;
+      try { repositories = v2RepositoryRecords(body.repositories); }
+      catch (error) {
+        const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
+        return res.json({ ok: false, code, error: error.message });
+      }
+      const readiness = projectV2Readiness({ id: projectId.project_id, repositories });
+      if (!readiness.ready) return res.json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
+      const access = await verifyV2RepositoryAccess(repositories);
+      if (!access.ok) return res.json(access);
+      return res.json({ ok: true, repositories: repositories.map((entry) => ({ key: entry.key, repo: entry.repo, primary: entry.primary })) });
+    }
+    case "provision-repositories": {
+      const projectId = v2SetupProjectId(body);
+      if (!projectId.ok) return res.status(400).json(projectId);
+      let repositories;
+      try { repositories = v2RepositoryRecords(body.repositories); }
+      catch (error) {
+        const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
+        return res.json({ ok: false, code, error: error.message });
+      }
+      const cfg = readConfigFile();
+      const existing = (cfg.projects || []).find((project) => project?.id === projectId.project_id) || null;
+      const candidate = v2CandidateProject(existing, { ...body, id: projectId.project_id }, repositories);
+      const readiness = projectV2Readiness(candidate);
+      if (!readiness.ready) return res.json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
+      const activeSessions = req.app.get("activeSessions") || new Map();
+      if (existing) {
+        const targetGate = existingV2TopologyGuard(existing, activeSessions);
+        if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
+      }
+      const access = await verifyV2RepositoryAccess(repositories);
+      if (!access.ok) return res.status(409).json({ ok: false, ...access });
+      const ownership = configuredRepositoryOwnership(cfg, candidate.id, repositories);
+      if (!ownership.ok) return res.json({ ok: false, ...ownership });
+      const provisioned = await provisionV2Repositories(cfg, candidate, repositories, existing);
+      if (!provisioned.ok) return res.status(409).json({ ok: false, ...publicProvisioningResult(provisioned), code: provisioned.code, repo_key: provisioned.repo_key, role: provisioned.role, error: provisioned.error });
+      return res.json({ ok: true, ...publicProvisioningResult(provisioned) });
+    }
+    case "activate-v2": {
+      if (body.confirm !== true) return res.status(400).json({ ok: false, code: "operator_confirmation_required" });
+      const projectId = v2SetupProjectId(body);
+      if (!projectId.ok) return res.status(400).json(projectId);
+      let repositories;
+      try { repositories = v2RepositoryRecords(body.repositories); }
+      catch (error) {
+        const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
+        return res.status(400).json({ ok: false, code, error: error.message });
+      }
+      const cfg = readConfigFile();
+      const existing = (cfg.projects || []).find((project) => project?.id === projectId.project_id) || null;
+      const candidate = v2CandidateProject(existing, { ...body, id: projectId.project_id }, repositories);
+      const readiness = projectV2Readiness(candidate);
+      if (!readiness.ready) return res.status(409).json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
+      const firstActivation = firstActivationLegacyGuard(cfg, candidate.id, v2SetupExecutionState);
+      if (!firstActivation.ok) return res.status(409).json({ ok: false, ...firstActivation });
+      const activeSessions = req.app.get("activeSessions") || new Map();
+      if (existing) {
+        const targetGate = existingV2TopologyGuard(existing, activeSessions);
+        if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
+      }
+      const access = await verifyV2RepositoryAccess(repositories);
+      if (!access.ok) return res.status(409).json({ ok: false, ...access });
+      const ownership = configuredRepositoryOwnership(cfg, candidate.id, repositories);
+      if (!ownership.ok) return res.status(409).json({ ok: false, ...ownership });
+      const provisioned = await provisionV2Repositories(cfg, candidate, repositories, existing);
+      if (!provisioned.ok) return res.status(409).json({ ok: false, ...publicProvisioningResult(provisioned), code: provisioned.code, repo_key: provisioned.repo_key, role: provisioned.role, error: provisioned.error });
+      try {
+        commitV2Configuration((fresh) => {
+          const currentFirstGuard = firstActivationLegacyGuard(fresh, candidate.id, v2SetupExecutionState);
+          if (!currentFirstGuard.ok) throw new V2SetupActivationError(currentFirstGuard);
+          const index = (fresh.projects || []).findIndex((project) => project?.id === candidate.id);
+          const current = index >= 0 ? fresh.projects[index] : null;
+          const currentGate = current ? existingV2TopologyGuard(current, activeSessions) : { ok: true };
+          if (!currentGate.ok) throw new V2SetupActivationError(currentGate);
+          const currentOwnership = configuredRepositoryOwnership(fresh, candidate.id, repositories);
+          if (!currentOwnership.ok) throw new V2SetupActivationError(currentOwnership);
+          const persisted = v2CandidateProject(current, body, repositories);
+          const oldPrimary = primaryRepository(current);
+          const newPrimary = persisted.repositories.find((entry) => entry.primary === true);
+          if (current && oldPrimary && newPrimary &&
+              String(oldPrimary.repo || "").trim().toLowerCase() !== String(newPrimary.repo || "").trim().toLowerCase()) {
+            const nextPrimary = provisioned.repositories.find((entry) => entry.primary === true);
+            persisted.agents = { ...(current.agents || {}) };
+            for (const role of ["head", "re1", "re2", "dev"]) {
+              if (!persisted.agents[role]) continue;
+              persisted.agents[role] = { ...persisted.agents[role], cwd: nextPrimary.worktrees[role] };
+            }
+          }
+          if (!Array.isArray(fresh.projects)) fresh.projects = [];
+          if (index >= 0) fresh.projects[index] = persisted;
+          else fresh.projects.push(persisted);
+        });
+      } catch (error) {
+        if (error instanceof V2SetupActivationError) return res.status(409).json({ ok: false, ...error.result, ...publicProvisioningResult(provisioned) });
+        if (sendV2ConfigurationError(res, error)) return;
+        return res.status(409).json({ ok: false, code: "v2_activation_commit_failed" });
+      }
+      const persistedConfig = readConfigFile();
+      const persistedProject = (persistedConfig.projects || []).find((project) => project?.id === candidate.id);
+      try {
+        const map = renderProjectRepositoryMap({ projectId: candidate.id, repositories: provisioned.repositories });
+        writeProjectRepositoryMap({ configDir: CONFIG_DIR, projectId: candidate.id, content: map });
+      } catch {
+        return res.status(409).json({ ok: false, code: "repository_map_write_failed", activation_committed: true, ...publicProvisioningResult(provisioned) });
+      }
+      try {
+        const reseed = _performReseedWrites(persistedProject, persistedConfig);
+        return res.json({ ok: true, activation_committed: true, ...publicProvisioningResult(provisioned), reseeded: reseed.reseeded, preserved: reseed.preserved, skipped: reseed.skipped });
+      } catch {
+        return res.status(409).json({ ok: false, code: "repository_seed_failed", activation_committed: true, ...publicProvisioningResult(provisioned) });
+      }
+    }
     case "verify-repo": {
       const repo = body.repo;
       if (!repo || !REPO_RE.test(repo)) return res.json({ ok: false, error: "Invalid repo format (use owner/repo)" });
@@ -5555,7 +5851,7 @@ router.post("/api/setup", async (req, res) => {
       return res.json({ ok: true, seeded });
     }
     case "add-config": {
-      const { id, name, repo, workingDir, backends } = body;
+      const { id, name, repo, workingDir, backends, ci_policy: ciPolicy } = body;
       const autoApprove = body.auto_approve !== false; // default true
       // Use directory basename for sibling paths (matches CLI wizard)
       const dirName = path.basename(workingDir);
@@ -5576,6 +5872,9 @@ router.post("/api/setup", async (req, res) => {
         writeGithubFileSafe(id, existing?.name || id, existingRepo);
         writeHeadPoPlaybookSafe(id, existing?.name || id);
         return res.json({ ok: true, message: "Project already in config" });
+      }
+      if (activated && !Object.prototype.hasOwnProperty.call(body, "ci_policy")) {
+        return res.status(409).json({ ok: false, code: "v2_policy_required", error: "An explicit repository CI policy is required for a new V2 project" });
       }
       // Match CLI wizard agent structure: { cwd, command, auto_approve, mcp_inject }
       // #343: default Codex-backed agents to reasoning_effort="medium"
@@ -5610,7 +5909,7 @@ router.post("/api/setup", async (req, res) => {
             fresh.projects.push({
               id,
               name,
-              repositories: [{ key: "primary", repo, working_dir: workingDir, primary: true }],
+              repositories: [{ key: "primary", repo, working_dir: workingDir, primary: true, ci_policy: ciPolicy }],
               agents,
               chat_mode: "file",
             });
@@ -5815,6 +6114,35 @@ function _resolveReseedTargets(project) {
   });
 }
 
+// #1032: a project has four role sessions, not four sessions per repository.
+// Each role nevertheless owns a same-role worktree in every registered
+// repository. The primary repository keeps any legacy/custom cwd from config;
+// secondary repositories use only their deterministic same-role reserved path.
+function _resolveRepositoryReseedTargets(project) {
+  const primaryTargets = _resolveReseedTargets(project);
+  const repositories = allRepositories(project).filter((entry) => entry && typeof entry === "object");
+  if (repositories.length === 0) return [];
+  const targets = [];
+  for (const repository of repositories) {
+    if (typeof repository.working_dir !== "string" || !repository.working_dir) continue;
+    const repositoryKey = typeof repository.key === "string" && repository.key ? repository.key : "primary";
+    const parentDir = path.dirname(repository.working_dir);
+    const dirName = path.basename(repository.working_dir);
+    for (const target of primaryTargets) {
+      targets.push({
+        ...target,
+        wtDir: repository.primary === true
+          ? target.wtDir
+          : path.join(parentDir, `${dirName}-${target.canonical}`),
+        repositoryKey,
+        repositoryWorkingDir: repository.working_dir,
+        primaryRepository: repository.primary === true,
+      });
+    }
+  }
+  return targets;
+}
+
 // Operator-triggered re-seed of a project's worktree AGENTS.md files from
 // the current `templates/seeds/*.AGENTS.md` templates, using the same
 // placeholder substitution as the setup wizard's `seed-files` step. New
@@ -5921,15 +6249,16 @@ function _performReseedWrites(project, cfg, opts = {}) {
   const reviewerUser = opts.reviewerUser ?? cfg.reviewer_github_user ?? "";
   const defaultReviewerTokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
 
-  // #855: walk the project's configured agents (resolved by `cwd`) instead of
-  // reconstructing sibling paths. Legacy keys (`reviewer1` etc.) still pull
-  // the canonical seed template via `_canonicalAgentSlug`.
-  const targets = _resolveReseedTargets(project);
+  // #1032: seed the same configured role in every registered repository. This
+  // leaves the role/session count at four and never writes a role into another
+  // role's worktree.
+  const targets = _resolveRepositoryReseedTargets(project);
   const reseeded = [];
   const preserved = {};
   const skipped = [];
-  for (const { agentKey, canonical, wtDir } of targets) {
-    if (!fs.existsSync(wtDir)) { skipped.push(`${agentKey} (no worktree)`); continue; }
+  for (const { agentKey, canonical, wtDir, repositoryKey, repositoryWorkingDir, primaryRepository: isPrimaryRepository } of targets) {
+    const targetLabel = isPrimaryRepository ? agentKey : `${repositoryKey}/${agentKey}`;
+    if (!fs.existsSync(wtDir)) { skipped.push(`${targetLabel} (no worktree)`); continue; }
     const seedSrc = path.join(TEMPLATES_DIR, "seeds", `${canonical}.AGENTS.md`);
     if (!fs.existsSync(seedSrc)) {
       throw new Error(`Missing seed template: templates/seeds/${canonical}.AGENTS.md`);
@@ -5959,14 +6288,14 @@ function _performReseedWrites(project, cfg, opts = {}) {
     freshContent = freshContent
       .replace(/\{\{reviewer_github_user\}\}/g, reviewerUser)
       .replace(/\{\{reviewer_token_path\}\}/g, tokenPath)
-      .replace(/\{\{project_name\}\}/g, dirName)
+      .replace(/\{\{project_name\}\}/g, path.basename(repositoryWorkingDir || workingDir))
       .replace(/\{\{project_id\}\}/g, project.id || dirName);
 
     const merged = reseedAgentsMd(existing, freshContent);
     fs.writeFileSync(agentsMd, merged.content);
-    reseeded.push(`${agentKey}/AGENTS.md`);
+    reseeded.push(`${targetLabel}/AGENTS.md`);
     if (merged.preservedHeadings.length > 0) {
-      preserved[agentKey] = merged.preservedHeadings;
+      preserved[targetLabel] = merged.preservedHeadings;
     }
 
     // #966: Refresh the worktree CLAUDE.md too — but ONLY when it is provably
@@ -5976,24 +6305,24 @@ function _performReseedWrites(project, cfg, opts = {}) {
     // CLAUDE.md is left byte-identical and recorded in `skipped`.
     const claudeMd = path.join(wtDir, "CLAUDE.md");
     if (!fs.existsSync(claudeMd)) {
-      skipped.push(`${agentKey}/CLAUDE.md (none)`);
+      skipped.push(`${targetLabel}/CLAUDE.md (none)`);
     } else {
       let claudeExisting = "";
       try { claudeExisting = fs.readFileSync(claudeMd, "utf-8"); } catch { claudeExisting = ""; }
       if (!_isSeededClaudeMd(claudeExisting)) {
-        skipped.push(`${agentKey}/CLAUDE.md (not QuadWork-seeded)`);
+        skipped.push(`${targetLabel}/CLAUDE.md (not QuadWork-seeded)`);
       } else {
         const claudeSrc = path.join(TEMPLATES_DIR, "CLAUDE.md");
         if (!fs.existsSync(claudeSrc)) {
-          skipped.push(`${agentKey}/CLAUDE.md (no template)`);
+          skipped.push(`${targetLabel}/CLAUDE.md (no template)`);
         } else {
           const freshClaude = fs.readFileSync(claudeSrc, "utf-8")
-            .replace(/\{\{project_name\}\}/g, dirName);
+            .replace(/\{\{project_name\}\}/g, path.basename(repositoryWorkingDir || workingDir));
           const mergedClaude = reseedAgentsMd(claudeExisting, freshClaude);
           fs.writeFileSync(claudeMd, mergedClaude.content);
-          reseeded.push(`${agentKey}/CLAUDE.md`);
+          reseeded.push(`${targetLabel}/CLAUDE.md`);
           if (mergedClaude.preservedHeadings.length > 0) {
-            preserved[`${agentKey}/CLAUDE.md`] = mergedClaude.preservedHeadings;
+            preserved[`${targetLabel}/CLAUDE.md`] = mergedClaude.preservedHeadings;
           }
         }
       }
@@ -6964,6 +7293,7 @@ module.exports._isSeededClaudeMd = _isSeededClaudeMd;
 // is exercisable without spinning up a real worktree. Pure helpers; no
 // production callers outside this file.
 module.exports._resolveReseedTargets = _resolveReseedTargets;
+module.exports._resolveRepositoryReseedTargets = _resolveRepositoryReseedTargets;
 module.exports._canonicalAgentSlug = _canonicalAgentSlug;
 // #854: expose the GH_TOKEN path extractor so the parse forms (`export`,
 // double-quoted, inner-quoted, etc.) are exercisable without a temp fs.

@@ -14,6 +14,7 @@ const {
   commitV2Configuration,
   commitConfigurationSnapshot,
 } = require("../server/config");
+const { normalizeCiPolicy } = require("../server/ci-evidence-policy");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const { configureServiceTempEnvironment } = require("../server/resource-service-env");
 const {
@@ -95,6 +96,17 @@ function runResult(cmd, args = [], opts = {}) {
 
 function which(cmd) {
   return run("which", [cmd]) !== null;
+}
+
+// #1032: this is an availability list, not a backend registry. The wizard
+// only needs to know which supported executable names are on PATH; model and
+// command semantics remain owned by the existing agent configuration surface.
+function installedAgentCliBackends(whichFn = which) {
+  return ["claude", "codex", "gemini", "grok"].filter((backend) => whichFn(backend));
+}
+
+function validateInstalledBackendChoice(choice, available) {
+  return typeof choice === "string" && available.includes(choice) ? choice : null;
 }
 
 // #974: does a global `npm install -g` need sudo? True only when the npm
@@ -490,11 +502,15 @@ async function checkPrereqs(rl) {
   // ── 6. AI CLIs — at least one required (independent) ──
   let hasClaude = which("claude");
   let hasCodex = which("codex");
+  const hasGemini = which("gemini");
+  const hasGrok = which("grok");
 
   if (hasClaude) ok("Claude Code");
   if (hasCodex) ok("Codex CLI");
+  if (hasGemini) ok("Gemini CLI");
+  if (hasGrok) ok("Grok CLI");
 
-  if (!hasClaude && !hasCodex) {
+  if (installedAgentCliBackends().length === 0) {
     console.log("");
     warn("You need at least one AI CLI to power your agents.");
     log("Choose one (or both) to install:");
@@ -509,7 +525,7 @@ async function checkPrereqs(rl) {
 
   // Offer to install Claude Code if missing
   if (!hasClaude) {
-    const isRequired = !hasCodex;
+    const isRequired = installedAgentCliBackends().length === 0;
     log("Claude Code — Anthropic's AI coding assistant");
     const installClaude = await askYN(rl, "Install Claude Code?", isRequired);
     if (installClaude) {
@@ -531,7 +547,7 @@ async function checkPrereqs(rl) {
 
   // Offer to install Codex CLI if missing
   if (!hasCodex) {
-    const isRequired = !hasClaude;
+    const isRequired = installedAgentCliBackends().length === 0;
     if (hasClaude) {
       console.log("");
       log("Tip: Installing Codex CLI too gives your team different AI perspectives.");
@@ -555,8 +571,8 @@ async function checkPrereqs(rl) {
     }
   }
 
-  if (!hasClaude && !hasCodex) {
-    fail("At least one AI CLI is required (Claude Code or Codex CLI).");
+  if (installedAgentCliBackends().length === 0) {
+    fail("At least one AI CLI is required (Claude Code, Codex CLI, Gemini CLI, or Grok CLI).");
     log("Install one and re-run: npx quadwork init");
     allOk = false;
   }
@@ -688,38 +704,79 @@ async function setupGitHub(rl) {
   return repo;
 }
 
+async function setupV2CiPolicy(rl) {
+  header("V2 Repository CI Policy");
+  log("Every new V2 repository needs an explicit policy. QuadWork never guesses CI checks.");
+  const mode = await ask(rl, "CI policy mode (github-checks/ci-less)", "github-checks");
+  let candidate;
+  if (mode === "ci-less") {
+    const keys = (await ask(rl, "CI-less evidence keys (comma-separated)", "operator"))
+      .split(",").map((value) => value.trim()).filter(Boolean);
+    candidate = { version: 1, mode, evidence_keys: keys };
+  } else if (mode === "github-checks") {
+    const names = (await ask(rl, "Required exact check names (comma-separated)", "test"))
+      .split(",").map((value) => value.trim()).filter(Boolean);
+    const checks = [];
+    for (const name of names) {
+      const kind = await ask(rl, `${name} classification (product/control-plane)`, "product");
+      if (kind !== "product" && kind !== "control-plane") {
+        fail("Check classification must be 'product' or 'control-plane'");
+        return null;
+      }
+      const requirement = await ask(rl, `${name} requirement (required/advisory)`, "required");
+      if (requirement !== "required" && requirement !== "advisory") {
+        fail("Check requirement must be 'required' or 'advisory'");
+        return null;
+      }
+      checks.push({ name, required: requirement === "required", kind });
+    }
+    const grace = Number(await ask(rl, "Registration grace seconds", "300"));
+    const retry = Number(await ask(rl, "Same-SHA retry budget", "1"));
+    candidate = {
+      version: 1,
+      mode,
+      registration_grace_seconds: grace,
+      same_sha_retry_budget: retry,
+      checks,
+    };
+  } else {
+    fail("CI policy mode must be 'github-checks' or 'ci-less'");
+    return null;
+  }
+  try { return normalizeCiPolicy(candidate); }
+  catch (error) {
+    fail(`Invalid V2 CI policy: ${error.message}`);
+    return null;
+  }
+}
+
 // ─── Agent Configuration ────────────────────────────────────────────────────
 
 async function setupAgents(rl, repo) {
   header("Step 3: Agent Configuration");
 
-  // Detect available CLIs
-  const hasClaude = which("claude");
-  const hasCodex = which("codex");
-  const bothAvailable = hasClaude && hasCodex;
-  const onlyOneCli = (hasClaude && !hasCodex) || (!hasClaude && hasCodex);
-  let defaultBackend = hasClaude ? "claude" : "codex";
+  // Detect every supported installed CLI. A terminal wizard must be usable on
+  // a Gemini-only or Grok-only machine as well as the older two-CLI cases.
+  const available = installedAgentCliBackends();
+  const onlyOneCli = available.length === 1;
+  let defaultBackend = available[0] || null;
 
   const backends = {};
 
   if (onlyOneCli) {
     // Single-CLI mode: default all agents, no prompt needed
-    const cliName = hasClaude ? "Claude Code" : "Codex CLI";
-    const otherName = hasClaude ? "Codex CLI" : "Claude Code";
-    const installCmd = hasClaude ? "npm install -g @openai/codex" : "npm install -g @anthropic-ai/claude-code";
+    const cliName = defaultBackend;
     ok(`${cliName} detected — all 4 agents will use ${cliName}.`);
     console.log("");
-    log(`Tip: Installing ${otherName} too gives your team different AI perspectives,`);
-    log(`which can improve code review quality. You can add it anytime:`);
-    log(`  → ${installCmd}`);
+    log("Installing an additional supported CLI later can give reviews a different perspective.");
     console.log("");
     for (const agent of AGENTS) backends[agent] = defaultBackend;
-  } else if (bothAvailable) {
-    log("Both Claude Code and Codex CLI are available.");
+  } else if (available.length > 1) {
+    log(`Available agent CLIs: ${available.join(", ")}.`);
     log("Choose which AI CLI to run in agent terminals.");
-    const backend = await ask(rl, "Default CLI backend (claude/codex)", defaultBackend);
-    if (backend !== "claude" && backend !== "codex") {
-      fail("Backend must be 'claude' or 'codex'");
+    const backend = await ask(rl, `Default CLI backend (${available.join("/")})`, defaultBackend);
+    if (!validateInstalledBackendChoice(backend, available)) {
+      fail(`Backend must be one of the installed CLIs: ${available.join(", ")}`);
       return null;
     }
     defaultBackend = backend;
@@ -730,15 +787,24 @@ async function setupAgents(rl, repo) {
       for (const agent of AGENTS) backends[agent] = backend;
     } else {
       for (const agent of AGENTS) {
-        const agentBackend = await ask(rl, `${agent.toUpperCase()} backend (claude/codex)`, backend);
-        backends[agent] = (agentBackend === "claude" || agentBackend === "codex") ? agentBackend : backend;
+        const agentBackend = await ask(rl, `${agent.toUpperCase()} backend (${available.join("/")})`, backend);
+        if (!validateInstalledBackendChoice(agentBackend, available)) {
+          fail(`${agent.toUpperCase()} backend must be one of the installed CLIs: ${available.join(", ")}`);
+          return null;
+        }
+        backends[agent] = agentBackend;
       }
     }
   } else {
-    fail("No AI CLI found — install Claude Code or Codex CLI first.");
+    fail("No AI CLI found — install Claude Code, Codex CLI, Gemini CLI, or Grok CLI first.");
     return null;
   }
   const backend = defaultBackend;
+  const activatedConfig = typeof readConfig().installation_id === "string";
+  const ciPolicy = activatedConfig
+    ? await setupV2CiPolicy(rl)
+    : null;
+  if (activatedConfig && !ciPolicy) return null;
 
   log("Path to your local clone of the repo. Four worktrees will be created next to it");
   log("(e.g., project-head/, project-re1/, project-re2/, project-dev/).");
@@ -864,7 +930,7 @@ async function setupAgents(rl, repo) {
 
   wtSpinner.stop(true);
 
-  return { projectName, absDir, worktrees, repo, backend, backends };
+  return { projectName, absDir, worktrees, repo, backend, backends, ciPolicy };
 }
 
 // ─── Write QuadWork Config ──────────────────────────────────────────────────
@@ -937,11 +1003,17 @@ function writeQuadWorkConfig(setup) {
   };
   const activated = typeof config.installation_id === "string";
   if (activated) {
+    if (!setup.ciPolicy) {
+      const error = new Error("An explicit V2 repository CI policy is required. Configure it in the V2 setup flow before adding this project.");
+      error.code = "v2_policy_required";
+      throw error;
+    }
     project.repositories = [{
       key: "primary",
       repo: setup.repo,
       working_dir: setup.absDir,
       primary: true,
+      ci_policy: setup.ciPolicy,
     }];
   } else {
     project.repo = setup.repo;
@@ -1836,4 +1908,6 @@ module.exports = {
   writeConfig,
   writeQuadWorkConfig,
   writeHeadPoPlaybook,
+  installedAgentCliBackends,
+  validateInstalledBackendChoice,
 };

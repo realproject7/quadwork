@@ -82,6 +82,7 @@ function request(server, method, urlPath, body) {
         repo: "Acme/Project",
         working_dir: path.join(TEST_HOME, "project"),
         primary: true,
+        ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
       }],
     };
     fs.writeFileSync(CONFIG_PATH, JSON.stringify({
@@ -193,6 +194,26 @@ function request(server, method, urlPath, body) {
       assert.equal(response.json.code, "legacy_repository_scalars_persisted");
     }
 
+    // An unchanged key cannot be used as a generic-route escape hatch for a
+    // repository retarget, base move, primary flip, or CI-policy change. The
+    // explicit quiesced V2 topology transaction is the only writer for each.
+    for (const [field, method, mutate] of [
+      ["repo", "PUT", (entry) => { entry.repo = "Acme/Retargeted"; }],
+      ["working_dir", "PATCH", (entry) => { entry.working_dir = path.join(TEST_HOME, "moved-project"); }],
+      ["primary", "PUT", (entry) => { entry.primary = false; }],
+      ["ci_policy", "PATCH", (entry) => { entry.ci_policy = { version: 1, mode: "ci-less", evidence_keys: ["release"] }; }],
+    ]) {
+      const disk = readDisk();
+      const incoming = JSON.parse(JSON.stringify(disk.projects[0]));
+      mutate(incoming.repositories[0]);
+      const before = bytes();
+      response = await request(server, method, "/api/config", method === "PUT"
+        ? { ...disk, projects: [incoming] }
+        : { projects: [incoming] });
+      expectSafeConflict(response, before, `same-key ${field} ${method}`);
+      assert.equal(response.json.code, "generic_repository_topology_change_forbidden");
+    }
+
     // Generic activated routes freeze the existing key topology. Rotating key,
     // repo and path together cannot disguise the key change as remove+add.
     {
@@ -246,8 +267,9 @@ function request(server, method, urlPath, body) {
       assert.equal(response.json.code, "generic_project_identity_change_forbidden");
     }
 
-    // Add a second project through the explicit controlled boundary, then prove
-    // canonical repo and path ownership collisions are atomic in generic PATCH.
+    // Add a second project through the explicit controlled boundary. Generic
+    // PATCH now rejects any repository-record mutation before it can become an
+    // ownership collision, keeping topology exclusive to explicit activation.
     const secondProject = {
       id: "p2",
       name: "Project Two",
@@ -261,28 +283,27 @@ function request(server, method, urlPath, body) {
     };
     commitV2Configuration((cfg) => { cfg.projects.push(secondProject); });
     assert.equal(readDisk().session_token, "route-test-session-secret");
-    for (const [field, value, expectedCode] of [
-      ["repo", "acme/PROJECT", "repository_owned_by_active_project"],
-      ["working_dir", path.join(TEST_HOME, "project"), "repository_working_dir_owned_by_active_project"],
+    for (const [field, value] of [
+      ["repo", "acme/PROJECT"],
+      ["working_dir", path.join(TEST_HOME, "project")],
     ]) {
       const incoming = JSON.parse(JSON.stringify(readDisk().projects.find((entry) => entry.id === "p2")));
       incoming.repositories[0][field] = value;
       const before = bytes();
       response = await request(server, "PATCH", "/api/config", { projects: [incoming] });
-      expectSafeConflict(response, before, `${field} ownership collision`, [String(value)]);
-      assert.equal(response.json.code, expectedCode);
-      assert.equal(response.json.owner_project_id, "p");
+      expectSafeConflict(response, before, `${field} generic topology mutation`, [String(value)]);
+      assert.equal(response.json.code, "generic_repository_topology_change_forbidden");
     }
 
-    // Invalid canonical candidates are likewise rejected without echoing their
-    // values or changing any unrelated top-level/session data.
+    // An invalid generic repository rewrite is blocked as topology drift
+    // before schema validation, without echoing values or changing state.
     {
       const candidate = readDisk();
       candidate.projects[1].repositories[0].repo = "private-invalid-repository-value";
       const before = bytes();
       response = await request(server, "PUT", "/api/config", candidate);
       expectSafeConflict(response, before, "invalid canonical PUT", ["private-invalid-repository-value"]);
-      assert.equal(response.json.code, "invalid_repository_name");
+      assert.equal(response.json.code, "generic_repository_topology_change_forbidden");
       assert.equal(readDisk().session_token, "route-test-session-secret");
     }
 

@@ -94,11 +94,24 @@ function diskBytes() {
       "Head seed uses the exact project id rather than display name");
     assert.equal(seededHead.includes("{{project_id}}"), false);
 
+    let before = diskBytes();
+    response = await request(server, {
+      id: "policy-required",
+      name: "Policy Required",
+      repo: "Acme/PolicyRequired",
+      workingDir: path.join(TMP, "policy-required"),
+      backends: {},
+    });
+    assert.equal(response.status, 409);
+    assert.equal(response.json.code, "v2_policy_required");
+    assert.equal(diskBytes(), before, "activated legacy setup cannot create a policy-less project");
+
     response = await request(server, {
       id: "added",
       name: "Added",
       repo: "Acme/Added",
       workingDir: addedDir,
+      ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
       backends: { head: "codex", re1: "codex", re2: "codex", dev: "codex" },
     });
     assert.equal(response.status, 200);
@@ -113,6 +126,7 @@ function diskBytes() {
       repo: "Acme/Added",
       working_dir: addedDir,
       primary: true,
+      ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
     }]);
     const addedPlaybook = path.join(CONFIG_DIR, "added", "HEAD-PO-PLAYBOOK.md");
     assert.equal(fs.existsSync(addedPlaybook), true, "activated setup seeds the Head PO playbook");
@@ -120,12 +134,13 @@ function diskBytes() {
     assert.ok(fs.readFileSync(addedPlaybook, "utf-8").includes("~/.quadwork/added/HEAD-PO-PLAYBOOK.md"),
       "installed playbook self-path uses project id, not display name");
 
-    let before = diskBytes();
+    before = diskBytes();
     response = await request(server, {
       id: "invalid",
       name: "Invalid",
       repo: "not-a-repository",
       workingDir: invalidDir,
+      ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
       backends: {},
     });
     assert.equal(response.status, 409);
@@ -138,6 +153,7 @@ function diskBytes() {
       name: "Collision",
       repo: "acme/existing",
       workingDir: collisionDir,
+      ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
       backends: {},
     });
     assert.equal(response.status, 409);
@@ -150,6 +166,7 @@ function diskBytes() {
       name: "Stale Duplicate",
       repo: "Acme/Different",
       workingDir: collisionDir,
+      ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
       backends: {},
     });
     assert.equal(response.status, 200);

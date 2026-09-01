@@ -32,6 +32,7 @@ const setup = (projectName, repo, workingDir) => ({
   absDir: workingDir,
   backend: "codex",
   backends: {},
+  ciPolicy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
   worktrees: Object.fromEntries(
     ["head", "re1", "re2", "dev"].map((agent) => [agent, `${workingDir}-${agent}`]),
   ),
@@ -119,6 +120,7 @@ assert.deepEqual(added.repositories, [{
   repo: "Acme/NewProject",
   working_dir: newDir,
   primary: true,
+  ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
 }]);
 const cliPlaybookPath = path.join(CONFIG_DIR, "new-project", "HEAD-PO-PLAYBOOK.md");
 assert.equal(fs.existsSync(cliPlaybookPath), true, "CLI setup seeds the Head PO playbook");
