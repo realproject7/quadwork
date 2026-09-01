@@ -110,6 +110,34 @@ const BATCH_PROGRESS = {
   ],
 };
 
+const WORK_TASK_BATCH = {
+  ok: true,
+  active: true,
+  projection: {
+    version: 1,
+    batch_manifest_digest: "a".repeat(64),
+    delivery_mode: "integrated",
+    frozen: true,
+    repositories: [{
+      repository_key: "web",
+      base_sha: "b".repeat(64),
+      work_items: [{
+        work_item: { repoKey: "web", repo: "owner/web", number: 42, kind: "issue" },
+        issue_body_revision: "c".repeat(64),
+        tasks: [{
+          work_task_ref: { repository_key: "web", task_key: "build" },
+          task_key: "build",
+          goal: "build the read projection",
+          file_boundary: ["server/work-task-projection.js"],
+          validation: ["node:test"],
+          state: "independent_review",
+          candidate: { candidate_digest: "d".repeat(64), base_sha: "b".repeat(64), candidate_sha: "e".repeat(64) },
+        }],
+      }],
+    }],
+  },
+};
+
 let passed = 0;
 let failed = 0;
 function assert(cond, msg) {
@@ -136,6 +164,7 @@ function startServer() {
       if (url.startsWith("/api/chat")) return send(CHAT_MESSAGES);
       if (url.startsWith("/api/batch-active")) return send(BATCH_ACTIVE);
       if (url.startsWith("/api/batch-progress")) return send(BATCH_PROGRESS);
+      if (url.startsWith("/api/work-task-batch")) return send(WORK_TASK_BATCH);
       if (url.startsWith("/api/queue")) return send({ ok: true, exists: true, content: "## Active Batch\n- #791\n" });
       if (url.startsWith("/api/agents")) return send(RUNTIME_AGENTS);
       return send({ error: "not found" }, 404);
@@ -208,6 +237,16 @@ async function runTests() {
     batch.progress.items[1].live_pr === null && batch.progress.items[1].historical_pr.state === "MERGED",
     "batch_status does not promote a merged historical PR to live_pr",
   );
+
+  // ── read_work_task_batch: fixed nested projection ───────────────────────
+  requests.length = 0;
+  const workTasks = await handlers.read_work_task_batch({ project: "plotlink" }, ctx);
+  assert(workTasks.active === true && workTasks.projection?.frozen === true,
+    "read_work_task_batch returns the fixed V2 projection without treating it as an action");
+  assert(workTasks.projection.repositories[0].work_items[0].tasks[0].candidate.candidate_sha === "e".repeat(64),
+    "read_work_task_batch preserves the exact candidate SHA for independent review");
+  assert(requests.filter((request) => request.includes("/api/work-task-batch")).length === 1,
+    "read_work_task_batch makes exactly one authenticated local read");
 
   // ── read_queue: returns markdown ────────────────────────────────────────
   const queue = await handlers.read_queue({ project: "plotlink" }, ctx);

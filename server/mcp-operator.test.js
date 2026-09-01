@@ -154,6 +154,7 @@ function startFullServer() {
             ownership_key: "owned-p-1",
           }],
         });
+        if (pathOnly === "/api/work-task-batch") return send({ ok: true, active: false, projection: null });
         if (pathOnly === "/api/queue") {
           if (req.method === "GET") return send({ ok: true, exists: true, content: "x" });
           if (req.method === "PUT") return send({ ok: true });
@@ -359,6 +360,7 @@ async function runTests() {
     { tool: "list_projects", args: {}, expect: [["GET", "/api/config"]] },
     { tool: "read_chat", args: { project: "p", since_id: 1, limit: 5 }, expect: [["GET", "/api/chat"]] },
     { tool: "batch_status", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"]] },
+    { tool: "read_work_task_batch", args: { project: "p" }, expect: [["GET", "/api/work-task-batch"]] },
     { tool: "read_queue", args: { project: "p" }, expect: [["GET", "/api/queue"]] },
     { tool: "list_agents", args: { project: "p" }, expect: [["GET", "/api/agents"]] },
     { tool: "send_message", args: { project: "p", text: "hi" }, expect: [["POST", "/api/chat"]] },

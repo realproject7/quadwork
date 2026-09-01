@@ -39,6 +39,18 @@ module.exports = {
       },
     },
     {
+      name: "read_work_task_batch",
+      description:
+        "Read the fixed V2 nested Current Batch projection for one project. Returns { active, projection }; projection preserves repository-qualified WorkItem and WorkTask identities, ordered task state, and redacted candidate SHA/base metadata only. It never creates a batch, initializes missing state, assigns work, opens a PR, or publishes a Delivery Candidate.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: { type: "string", description: "Project id (from list_projects)." },
+        },
+        required: ["project"],
+      },
+    },
+    {
       name: "read_queue",
       description:
         "Read a project's OVERNIGHT-QUEUE.md. Returns { exists, content } where content is the raw markdown (empty string when the file does not exist).",
@@ -82,6 +94,16 @@ module.exports = {
         ctx.httpRequest("GET", `/api/batch-progress?project=${p}`),
       ]);
       return { active, progress };
+    },
+
+    read_work_task_batch: async (params, ctx) => {
+      const { project } = params;
+      await ctx.assertKnownProject(project);
+      const result = await ctx.httpRequest("GET", `/api/work-task-batch?project=${encodeURIComponent(project)}`);
+      return {
+        active: result?.active === true,
+        projection: result?.projection ?? null,
+      };
     },
 
     read_queue: async (params, ctx) => {
