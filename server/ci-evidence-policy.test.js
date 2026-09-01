@@ -135,8 +135,14 @@ const rerun = evaluate({ check_runs: [run("gates", 1, "completed", "success"), r
 assert.equal(rerun.state, "product_failure");
 assert.equal(rerun.checks.find((check) => check.name === "gates").run.attempt, 2);
 ok(true, "newer same-name rerun failure cannot be hidden by an older success");
-assert.equal(evaluate({ check_runs: [run("gates", 1, "completed", "skipped"), run("classify", 1)] }).state, "pending");
-ok(true, "skipped required check is neither pass nor product failure");
+const skippedRequired = evaluate({ check_runs: [run("gates", 1, "completed", "skipped"), run("classify", 1)] });
+assert.equal(skippedRequired.state, "missing_required");
+assert.equal(skippedRequired.checks.find((check) => check.name === "gates").state, "not_success");
+assert.equal(skippedRequired.retry.owner, "head");
+const neutralRequired = evaluate({ check_runs: [run("gates", 1, "completed", "neutral"), run("classify", 1)] });
+assert.equal(neutralRequired.state, "missing_required");
+assert.equal(neutralRequired.retry.owner, "head");
+ok(true, "skipped or neutral required checks never pass and use the Head-owned fail-closed resolution path");
 assert.equal(evaluate({ check_runs: [run("gates", 1), run("classify", 1), run("e2e", 1, "completed", "failure")] }).state, "pass");
 ok(true, "advisory E2E failure remains visible but cannot block the registry");
 assert.equal(evaluate({ check_runs: [run("gates", 1, "completed", "failure"), run("classify", 1)] }).state, "product_failure");

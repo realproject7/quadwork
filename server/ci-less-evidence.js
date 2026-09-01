@@ -21,10 +21,6 @@ class CiEvidenceError extends Error {
   }
 }
 
-function own(value, key) {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -200,6 +196,10 @@ class CiEvidenceStore {
     this.rootDir = options.rootDir || path.join(os.homedir(), ".quadwork");
     this.fs = options.fsImpl || fs;
     this.now = options.now || (() => new Date());
+    // One process owns the HTTP server. Serialize receipt transactions per
+    // project so two different Dev submissions cannot both read an old
+    // document and atomically replace one another's record.
+    this._projectWrites = new Map();
   }
 
   filePath(projectId) {
@@ -239,6 +239,29 @@ class CiEvidenceStore {
     } catch (error) {
       if (error instanceof CiEvidenceError) throw error;
       throw new CiEvidenceError("ci_evidence_store_write_failed", "CI evidence store could not be persisted", 503);
+    }
+  }
+
+  /**
+   * Serialize the complete read/validate/write transaction for one project.
+   * The caller keeps its final authority validation inside this critical
+   * section immediately before `upsert`, so a rejected admission never leaves
+   * a durable receipt behind. This does not accept a path from the caller.
+   */
+  async withProjectWrite(projectId, operation) {
+    if (typeof operation !== "function") throw new TypeError("CI evidence write operation must be a function");
+    this.filePath(projectId); // validate the server-derived map key up front
+    const previous = this._projectWrites.get(projectId) || Promise.resolve();
+    let release;
+    const completion = new Promise((resolve) => { release = resolve; });
+    const chain = previous.catch(() => {}).then(() => completion);
+    this._projectWrites.set(projectId, chain);
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this._projectWrites.get(projectId) === chain) this._projectWrites.delete(projectId);
     }
   }
 
@@ -306,19 +329,32 @@ function createCiLessEvidenceSubmitHandler(options = {}) {
       const request = normalizedSubmitRequest(req.body);
       const admission = captureProjectAdmission(principal.projectId);
       if (!isAdmissionCurrent(admission)) throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
-      const target = normalizedTarget(
-        await resolveCurrentTarget(principal.projectId, request),
-        request,
-        principal.projectId,
-      );
-      if (!isAdmissionCurrent(admission)) throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
-      const results = normalizedResults(request.results, target.policy);
-      const record = store.upsert(target, results);
-      const readBack = store.readByIdentity(target);
-      if (!readBack || readBack.record_id !== record.record_id || readBack.record_digest !== record.record_digest) {
-        throw new CiEvidenceError("ci_evidence_store_readback_failed", "CI evidence persistence could not be verified", 503);
-      }
-      if (!isAdmissionCurrent(admission)) throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
+      const readBack = await store.withProjectWrite(principal.projectId, async () => {
+        // This resolver performs the live assignment/contract/PR re-read. It
+        // must occur inside the serialized transaction because a request can
+        // have waited behind another Dev receipt for this project.
+        const target = normalizedTarget(
+          await resolveCurrentTarget(principal.projectId, request),
+          request,
+          principal.projectId,
+        );
+        if (!isAdmissionCurrent(admission)) {
+          throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
+        }
+        const results = normalizedResults(request.results, target.policy);
+        // No await occurs between this final authority check and the atomic
+        // replacement. In-process lifecycle changes therefore cannot leave a
+        // rejected request's receipt on disk.
+        if (!isAdmissionCurrent(admission)) {
+          throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
+        }
+        const record = store.upsert(target, results);
+        const persisted = store.readByIdentity(target);
+        if (!persisted || persisted.record_id !== record.record_id || persisted.record_digest !== record.record_digest) {
+          throw new CiEvidenceError("ci_evidence_store_readback_failed", "CI evidence persistence could not be verified", 503);
+        }
+        return persisted;
+      });
       return res.json({ ok: true, record: redactedRecord(readBack) });
     } catch (error) {
       const failure = error instanceof CiEvidenceError

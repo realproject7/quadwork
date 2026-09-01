@@ -190,6 +190,92 @@ function ok(value, message) {
   assert.equal(Object.keys(store.readDocument("p1").records).length, 2);
   ok(true, "a changed SHA creates a distinct historical identity instead of reusing prior evidence");
 
+  // Two different submissions start together. The first holds the live-target
+  // read open; the second must not even begin its target read until the first
+  // receipt commits, otherwise two read-modify-write snapshots could lose one
+  // record despite each replacement being individually atomic.
+  const concurrencyStore = new CiEvidenceStore({ rootDir: path.join(ROOT, "concurrency") });
+  let targetReads = 0;
+  let markFirstTargetRead;
+  let releaseFirstTargetRead;
+  const firstTargetRead = new Promise((resolve) => { markFirstTargetRead = resolve; });
+  const firstTargetGate = new Promise((resolve) => { releaseFirstTargetRead = resolve; });
+  const concurrentSubmit = createCiLessEvidenceSubmitHandler({
+    resolveShimPrincipal: (token) => principalByToken.get(token) || null,
+    captureProjectAdmission: (projectId) => ({ project_id: projectId, generation: 1 }),
+    isAdmissionCurrent: (admission) => admission?.generation === 1,
+    resolveCurrentTarget: async (projectId, submitted) => {
+      targetReads += 1;
+      if (targetReads === 1) {
+        markFirstTargetRead();
+        await firstTargetGate;
+      }
+      return {
+        project_id: projectId,
+        installation_id: "installation_1234567890abcdef",
+        repo_key: "web",
+        repo: "Acme/Web",
+        item: submitted.item,
+        assignment_attempt: submitted.assignment_attempt,
+        contract_revision: submitted.contract_revision,
+        pr_number: submitted.pr_number,
+        exact_sha: submitted.exact_sha,
+        policy_version: submitted.policy_version,
+        policy: POLICY,
+      };
+    },
+    store: concurrencyStore,
+  });
+  const parallelOne = responseCapture();
+  const firstWrite = concurrentSubmit(request(undefined, { exact_sha: "1".repeat(40) }), parallelOne);
+  await firstTargetRead;
+  const parallelTwo = responseCapture();
+  const secondWrite = concurrentSubmit(request(undefined, { exact_sha: "2".repeat(40) }), parallelTwo);
+  await Promise.resolve();
+  assert.equal(targetReads, 1, "second target read waits behind the first project receipt transaction");
+  releaseFirstTargetRead();
+  await Promise.all([firstWrite, secondWrite]);
+  assert.equal(parallelOne.statusCode, 200);
+  assert.equal(parallelTwo.statusCode, 200);
+  assert.equal(Object.keys(concurrencyStore.readDocument("p1").records).length, 2);
+  assert.equal(concurrencyStore._projectWrites.size, 0);
+  ok(true, "concurrent different identities serialize without losing either durable receipt");
+
+  // A final admission change after the initial preflight but before the
+  // serialized write must reject without creating any persistent receipt.
+  const rejectedStoreRoot = path.join(ROOT, "rejected-admission");
+  const rejectedStore = new CiEvidenceStore({ rootDir: rejectedStoreRoot });
+  let rejectedGeneration = 1;
+  const rejectOnFinalAdmission = createCiLessEvidenceSubmitHandler({
+    resolveShimPrincipal: (token) => principalByToken.get(token) || null,
+    captureProjectAdmission: (projectId) => ({ project_id: projectId, generation: rejectedGeneration }),
+    isAdmissionCurrent: (admission) => admission?.generation === rejectedGeneration,
+    resolveCurrentTarget: async (projectId, submitted) => {
+      rejectedGeneration = 2;
+      return {
+        project_id: projectId,
+        installation_id: "installation_1234567890abcdef",
+        repo_key: "web",
+        repo: "Acme/Web",
+        item: submitted.item,
+        assignment_attempt: submitted.assignment_attempt,
+        contract_revision: submitted.contract_revision,
+        pr_number: submitted.pr_number,
+        exact_sha: submitted.exact_sha,
+        policy_version: submitted.policy_version,
+        policy: POLICY,
+      };
+    },
+    store: rejectedStore,
+  });
+  const rejectedAdmission = responseCapture();
+  await rejectOnFinalAdmission(request(undefined, { exact_sha: "3".repeat(40) }), rejectedAdmission);
+  assert.equal(rejectedAdmission.statusCode, 409);
+  assert.equal(rejectedAdmission.payload.code, "ci_evidence_admission_changed");
+  assert.equal(fs.existsSync(path.join(rejectedStoreRoot, "p1", "ci-evidence.json")), false);
+  assert.deepEqual(rejectedStore.readDocument("p1").records, {});
+  ok(true, "a rejected final admission leaves no durable evidence receipt");
+
   const beforeRecords = Object.keys(store.readDocument("p1").records).length;
   generation += 1;
   const admissionChanged = responseCapture();

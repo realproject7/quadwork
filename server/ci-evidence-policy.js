@@ -26,10 +26,6 @@ function fail(code, message) {
   throw new CiEvidencePolicyError(code, message);
 }
 
-function own(value, key) {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function exactKeys(value, keys, code) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     fail(code, "CI policy value must be an object");
@@ -204,7 +200,8 @@ function runOutcome(run) {
   if (conclusion === "cancelled" || conclusion === "timed_out") return "cancelled";
   if (["failure", "startup_failure", "action_required", "stale"].includes(conclusion)) return "failure";
   // GitHub's neutral/skipped/SKIPPING conclusions are deliberately not success
-  // and not a product failure.  They leave a required gate non-passing.
+  // and not a product failure. They retain a distinct per-check diagnostic;
+  // the aggregate maps them to the Head-owned missing_required resolution path.
   return "not_success";
 }
 
@@ -321,7 +318,11 @@ function evaluateCiEvidence(input = {}) {
   else if (required.some((check) => check.state === "failure" && check.kind === "control-plane")) state = "control_plane_failure";
   else if (required.some((check) => check.state === "cancelled")) state = "cancelled";
   else if (required.some((check) => check.state === "missing_required")) state = "missing_required";
-  else if (required.some((check) => ["pending", "pending_registration", "not_success"].includes(check.state))) state = "pending";
+  // A terminal skipped/neutral required check is not a live pending run and
+  // can never pass by waiting. It uses the existing Head-owned, fail-closed
+  // missing_required outcome while retaining `not_success` on that check.
+  else if (required.some((check) => check.state === "not_success")) state = "missing_required";
+  else if (required.some((check) => ["pending", "pending_registration"].includes(check.state))) state = "pending";
   return evaluationBase(policy, exactSha, observedAt, state, evidence, input.retry_count);
 }
 
