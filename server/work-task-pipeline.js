@@ -367,6 +367,9 @@ function blockSlot(slot) {
 function ensureCandidate(slot, digest) {
   if (!slot.candidate || slot.candidate.candidate_digest !== digest) fail("stale_work_task_candidate", "candidate is not current for this task");
 }
+function ensureNoCorrectionAuthority(slot) {
+  if (slot.correction !== null) fail("unresolved_work_task_correction", "candidate retains local correction authority");
+}
 function assertDependenciesReady(tasks, slot) {
   for (const dependency of slot.dependency_refs) {
     const parent = slotFor(tasks, dependency, "invalid_work_task_pipeline_state");
@@ -489,6 +492,7 @@ function deriveTransition(pipeline, event) {
       const slot = locate(event.work_task_ref);
       requireState(slot, "accepted");
       ensureCandidate(slot, event.candidate_digest);
+      ensureNoCorrectionAuthority(slot);
       const from = slot.state;
       slot.state = "staged";
       effect(slot, from);
@@ -497,6 +501,7 @@ function deriveTransition(pipeline, event) {
     case "integrated_cut": {
       const indexByKey = new Map(tasks.map((slot, index) => [workTaskKey(slot.work_task_ref), index]));
       const selected = new Set();
+      const cutByKey = new Map();
       let previousIndex = -1;
       for (const cut of event.tasks) {
         const slot = locate(cut.work_task_ref);
@@ -505,8 +510,27 @@ function deriveTransition(pipeline, event) {
         if (index <= previousIndex || selected.has(key)) fail("integrated_cut_order_invalid", "integrated cut must preserve manifest order");
         previousIndex = index;
         selected.add(key);
+        cutByKey.set(key, cut);
+      }
+      // A cut advances the declared integrated sequence only through the last
+      // accepted compatible task. Every earlier task must be included, already
+      // cut, or explicitly deferred; a queued/reviewing task cannot be jumped.
+      for (let index = 0; index <= previousIndex; index++) {
+        const slot = tasks[index];
+        const key = workTaskKey(slot.work_task_ref);
+        const cut = cutByKey.get(key);
+        if (!cut) {
+          if (slot.state !== "staged" && slot.state !== "deferred") {
+            fail("integrated_cut_prefix_incomplete", "cut skips an unresolved earlier manifest task");
+          }
+          continue;
+        }
         requireState(slot, "accepted");
         ensureCandidate(slot, cut.candidate_digest);
+        ensureNoCorrectionAuthority(slot);
+      }
+      for (const cut of event.tasks) {
+        const slot = locate(cut.work_task_ref);
         for (const dependency of dependencyKeys(slot)) {
           const parent = tasks[indexByKey.get(dependency)];
           if (parent.state !== "staged" && !selected.has(dependency)) fail("integrated_cut_dependency_not_ready", "cut omits an un-staged dependency");

@@ -307,8 +307,9 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   assert.equal(slot(work, workRefs.ops).candidate.candidate_digest, ops.candidate.candidate_digest);
 }
 
-// An integrated cut accepts only canonical manifest order, carries each exact
-// candidate, and appends to task history without replacing task identity.
+// An integrated cut reaches only the last accepted compatible prefix. It carries
+// exact candidates, retains prior defer/cut dispositions, and appends history
+// without replacing task identity.
 {
   const batch = manifest();
   const workRefs = refs(batch);
@@ -325,15 +326,25 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
       { work_task_ref: copy(workRefs.core), candidate_digest: core.candidate.candidate_digest },
     ],
   })), "integrated_cut_order_invalid");
-  work = apply(work, event("integrated_cut", "cut_right_order", {
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("integrated_cut", "cut_prefix_skip", {
     tasks: [
       { work_task_ref: copy(workRefs.core), candidate_digest: core.candidate.candidate_digest },
       { work_task_ref: copy(workRefs.ops), candidate_digest: ops.candidate.candidate_digest },
     ],
+  })), "integrated_cut_prefix_incomplete");
+  // `accepted`/`staged` slots can never retain correction authority, so even a
+  // forged object is rejected before it could enter a delivery cut.
+  const malformed = copy(work);
+  slot(malformed, workRefs.core).correction = { checkpoint_id: "forged_checkpoint", count: 1 };
+  throwsCode(() => assertWorkTaskPipeline(malformed), "invalid_work_task_pipeline");
+  work = apply(work, event("integrated_cut", "cut_right_order", {
+    tasks: [
+      { work_task_ref: copy(workRefs.core), candidate_digest: core.candidate.candidate_digest },
+    ],
   }));
   assert.deepEqual(work.tasks.map((entry) => entry.work_task_ref.task_revision), identityOrder);
   assert.equal(slot(work, workRefs.core).state, "staged");
-  assert.equal(slot(work, workRefs.ops).state, "staged");
+  assert.equal(slot(work, workRefs.ops).state, "accepted");
   assert.equal(slot(work, workRefs.core).history.length, historyBefore + 1);
   assert.deepEqual(slot(work, workRefs.core).history.at(-1), { event_id: "cut_right_order", kind: "integrated_cut" });
 }
