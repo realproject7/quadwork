@@ -23,6 +23,7 @@ const {
   WorkTaskPipelineStoreError,
   createWorkTaskPipelineStore,
 } = require("./work-task-pipeline-store");
+const { projectWorkTaskBatch } = require("./work-task-projection");
 
 const SCHEMA_VERSION = 1;
 const FILE_MODE = 0o600;
@@ -571,6 +572,28 @@ function createHeadControlWorkTaskDomain(options) {
     const current = prepared();
     return statusFor(current.state, current.pipeline);
   }
+  // Private runtime read for the operator's nested Current Batch surface. It
+  // is intentionally not a plane callback: it accepts no caller-selected
+  // project, role, path, or state transition. The fixed public Head plane
+  // remains four callbacks, while runtime composition can derive a redacted
+  // projection from this domain's already-owned durable state.
+  function project_current_batch() {
+    const current = prepared();
+    if (current.state.stage === "empty") return null;
+    let pipeline;
+    try {
+      pipeline = current.pipeline === null
+        ? buildWorkTaskPipeline(current.state.manifest)
+        : current.pipeline.pipeline;
+    } catch {
+      fail("head_control_work_task_pipeline_corrupt", "Current Batch projection pipeline is invalid");
+    }
+    try {
+      return projectWorkTaskBatch({ version: 1, manifest: current.state.manifest, pipeline });
+    } catch {
+      fail("head_control_work_task_projection_unavailable", "Current Batch projection is unavailable");
+    }
+  }
   function put_batch_manifest(command) {
     const input = assertInvocation(command, "put_batch_manifest", owner);
     prepared();
@@ -664,6 +687,7 @@ function createHeadControlWorkTaskDomain(options) {
   // still has an explicit durable bootstrap with no fifth control action.
   const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch };
   Object.defineProperty(domain, "initialize", { value: initialize, enumerable: false });
+  Object.defineProperty(domain, "project_current_batch", { value: project_current_batch, enumerable: false });
   return freeze(domain);
 }
 

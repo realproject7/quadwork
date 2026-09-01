@@ -251,6 +251,9 @@ withDirectory((directory) => {
   current.initialize();
   const batch = manifest();
   current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(batch) }));
+  const proposed = current.project_current_batch();
+  assert.equal(proposed.frozen, false);
+  assert.deepEqual(proposed.repositories[0].work_items[0].tasks.map((task) => task.state), ["queued"]);
   const frozen = current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
   assert.equal(frozen.revision, 2);
   const pipelineStore = createWorkTaskPipelineStore({ config_dir: directory, fs });
@@ -258,6 +261,11 @@ withDirectory((directory) => {
   const observed = current.get_pipeline_status(request("get_pipeline_status", null));
   assert.equal(observed.revision, 3);
   assert.equal(observed.cut_safe, true);
+  const nested = current.project_current_batch();
+  assert.equal(nested.frozen, true);
+  assert.equal(nested.repositories[0].work_items[0].tasks[0].state, "accepted");
+  assert.equal(nested.repositories[0].work_items[0].tasks[0].candidate.candidate_sha, candidateSha);
+  assert.doesNotMatch(JSON.stringify(nested), /managed_worktree|canonical_path|task-build/);
   throwsCode(() => current.cut_batch(request("cut_batch", 3, { cut: { tasks: [{ work_task_ref: copy(advanced.ref), candidate_digest: "e".repeat(64) }] } })),
     "head_control_work_task_cut_invalid");
   assert.equal(current.get_pipeline_status(request("get_pipeline_status", null)).revision, 3);
