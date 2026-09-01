@@ -30,8 +30,26 @@ interface ProjectConfig {
   name: string;
   agents: Record<string, AgentConfig>;
   repositories?: V2Repository[];
+  environment_bindings?: EnvironmentBinding[];
+  coordination_repo_key?: string;
+  watch_batch_requests?: boolean;
   archived?: boolean;
   idle?: boolean;
+}
+
+type EnvironmentClass = "local" | "vps" | "other";
+
+interface EnvironmentBinding {
+  installation_id: string;
+  project_id: string;
+  label: string;
+  environment_class: EnvironmentClass;
+}
+
+interface EnvironmentDraft {
+  environment_bindings: EnvironmentBinding[];
+  coordination_repo_key: string;
+  watch_batch_requests: boolean;
 }
 
 type CiPolicyMode = "" | "github-checks" | "ci-less";
@@ -126,6 +144,33 @@ function policyDraftFromRepository(repository: V2Repository): CiPolicyDraft {
 function repositoryDraftFromConfig(repositories: V2Repository[] | undefined): V2RepositoryDraft[] {
   if (!Array.isArray(repositories) || repositories.length === 0) return [blankRepository()];
   return repositories.map((repository) => ({ ...repository, policy: policyDraftFromRepository(repository) }));
+}
+
+function environmentDraftFromConfig(project: ProjectConfig): EnvironmentDraft {
+  const environment_bindings = Array.isArray(project.environment_bindings)
+    ? project.environment_bindings
+      .filter((binding): binding is EnvironmentBinding => !!binding && typeof binding === "object" &&
+        typeof binding.installation_id === "string" && typeof binding.project_id === "string" &&
+        typeof binding.label === "string" && (binding.environment_class === "local" || binding.environment_class === "vps" || binding.environment_class === "other"))
+      .map((binding) => ({ ...binding }))
+    : [];
+  return {
+    environment_bindings,
+    coordination_repo_key: typeof project.coordination_repo_key === "string" ? project.coordination_repo_key : "",
+    watch_batch_requests: project.watch_batch_requests === true,
+  };
+}
+
+function blankEnvironmentBinding(): EnvironmentBinding {
+  return { installation_id: "", project_id: "", label: "", environment_class: "other" };
+}
+
+function environmentFieldId(projectId: string, field?: string): string {
+  const bindingField = /^environment_bindings\[(\d+)\]\.(installation_id|project_id|label|environment_class)$/.exec(field || "");
+  if (bindingField) return `environment-${projectId}-${bindingField[2]}-${bindingField[1]}`;
+  if (field === "coordination_repo_key") return `environment-${projectId}-coordination-repo`;
+  if (field === "watch_batch_requests") return `environment-${projectId}-watch-batch-requests`;
+  return `environment-${projectId}-save`;
 }
 
 function policyFromDraft(draft: CiPolicyDraft): Record<string, unknown> | undefined {
@@ -500,6 +545,10 @@ export default function SettingsPage() {
   const [v2Drafts, setV2Drafts] = useState<Record<string, V2RepositoryDraft[]>>({});
   const [v2Flows, setV2Flows] = useState<Record<string, V2Flow>>({});
   const [v2ActivationConfirmations, setV2ActivationConfirmations] = useState<Record<string, boolean>>({});
+  const [environmentDrafts, setEnvironmentDrafts] = useState<Record<string, EnvironmentDraft>>({});
+  const [environmentSaving, setEnvironmentSaving] = useState<Record<string, boolean>>({});
+  const [environmentMessages, setEnvironmentMessages] = useState<Record<string, { text: string; error: boolean }>>({});
+  const [environmentRemovalConfirm, setEnvironmentRemovalConfirm] = useState<{ projectId: string; index: number } | null>(null);
   // #1023: was {claude, codex} — gemini was already missing and grok would have
   // been too, so every `cliStatus[b.value]` lookup below leaned on a cast.
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean; grok: boolean } | null>(null);
@@ -508,6 +557,23 @@ export default function SettingsPage() {
   // `parseInt("") || 8400` clobbering the buffer mid-keystroke.
   // Kept in sync with config.port on load + blur commit.
   const [portDraft, setPortDraft] = useState<string>("8400");
+
+  // Environment bindings are intentionally saved through their narrow endpoint
+  // rather than the generic Settings form. Warn before a browser navigation can
+  // discard a typed peer record that has not reached that atomic boundary yet.
+  useEffect(() => {
+    if (!config) return;
+    const hasUnsavedEnvironmentDraft = config.projects.some((project) =>
+      JSON.stringify(environmentDrafts[project.id] || environmentDraftFromConfig(project)) !==
+      JSON.stringify(environmentDraftFromConfig(project)));
+    if (!hasUnsavedEnvironmentDraft) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [config, environmentDrafts]);
 
   const load = useCallback((options?: { preserveV2Flow?: boolean }) => {
     setLoadError(false);
@@ -529,6 +595,12 @@ export default function SettingsPage() {
           project.id,
           repositoryDraftFromConfig(project.repositories),
         ])));
+        setEnvironmentDrafts(Object.fromEntries(cfg.projects.map((project: ProjectConfig) => [
+          project.id,
+          environmentDraftFromConfig(project),
+        ])));
+        setEnvironmentMessages({});
+        setEnvironmentRemovalConfirm(null);
         if (!options?.preserveV2Flow) setV2Flows({});
         setV2ActivationConfirmations({});
         savedConfigRef.current = JSON.stringify(cfg);
@@ -811,6 +883,102 @@ export default function SettingsPage() {
       [projectId]: (previous[projectId] || [blankRepository()]).map((repository, index) => ({ ...repository, primary: index === repositoryIndex })),
     }));
     setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "idle" } }));
+  };
+
+  const updateEnvironmentDraft = (projectId: string, update: (current: EnvironmentDraft) => EnvironmentDraft) => {
+    setEnvironmentDrafts((previous) => {
+      const current = previous[projectId] || { environment_bindings: [], coordination_repo_key: "", watch_batch_requests: false };
+      return { ...previous, [projectId]: update(current) };
+    });
+    setEnvironmentMessages((previous) => {
+      const next = { ...previous };
+      delete next[projectId];
+      return next;
+    });
+  };
+
+  const updateEnvironmentBinding = (projectId: string, bindingIndex: number, updates: Partial<EnvironmentBinding>) => {
+    updateEnvironmentDraft(projectId, (current) => ({
+      ...current,
+      environment_bindings: current.environment_bindings.map((binding, index) =>
+        index === bindingIndex ? { ...binding, ...updates } : binding),
+    }));
+  };
+
+  const saveEnvironmentSettings = async (project: ProjectConfig) => {
+    const projectId = project.id;
+    const draft = environmentDrafts[projectId] || environmentDraftFromConfig(project);
+    setEnvironmentSaving((previous) => ({ ...previous, [projectId]: true }));
+    setEnvironmentMessages((previous) => {
+      const next = { ...previous };
+      delete next[projectId];
+      return next;
+    });
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/environment-settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          environment_bindings: draft.environment_bindings.map((binding) => ({
+            installation_id: binding.installation_id,
+            project_id: binding.project_id,
+            label: binding.label,
+            environment_class: binding.environment_class,
+          })),
+          coordination_repo_key: draft.coordination_repo_key || null,
+          watch_batch_requests: draft.watch_batch_requests,
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as {
+        ok?: boolean;
+        code?: string;
+        field?: string;
+        error?: string;
+        environment_bindings?: EnvironmentBinding[];
+        coordination_repo_key?: string | null;
+        watch_batch_requests?: boolean;
+      };
+      if (!response.ok || result.ok !== true) {
+        const message = result.error || `Project Environments need attention${result.code ? ` [${result.code}]` : ""}.`;
+        setEnvironmentMessages((previous) => ({ ...previous, [projectId]: { text: message, error: true } }));
+        window.requestAnimationFrame(() => document.getElementById(environmentFieldId(projectId, result.field))?.focus());
+        return;
+      }
+      const committed: EnvironmentDraft = {
+        environment_bindings: Array.isArray(result.environment_bindings) ? result.environment_bindings.map((binding) => ({ ...binding })) : [],
+        coordination_repo_key: typeof result.coordination_repo_key === "string" ? result.coordination_repo_key : "",
+        watch_batch_requests: result.watch_batch_requests === true,
+      };
+      setEnvironmentDrafts((previous) => ({ ...previous, [projectId]: committed }));
+      setConfig((previous) => previous ? {
+        ...previous,
+        projects: previous.projects.map((entry) => entry.id === projectId ? {
+          ...entry,
+          environment_bindings: committed.environment_bindings,
+          coordination_repo_key: committed.coordination_repo_key || undefined,
+          watch_batch_requests: committed.watch_batch_requests,
+        } : entry),
+      } : previous);
+      try {
+        const saved = JSON.parse(savedConfigRef.current || "{}") as Config;
+        const savedProject = saved.projects?.find((entry) => entry.id === projectId);
+        if (savedProject) {
+          savedProject.environment_bindings = committed.environment_bindings;
+          savedProject.coordination_repo_key = committed.coordination_repo_key || undefined;
+          savedProject.watch_batch_requests = committed.watch_batch_requests;
+          savedConfigRef.current = JSON.stringify(saved);
+        }
+      } catch { /* UI draft remains usable; a later general save remains scoped */ }
+      setEnvironmentMessages((previous) => ({ ...previous, [projectId]: { text: "Project Environments saved.", error: false } }));
+    } catch {
+      setEnvironmentMessages((previous) => ({ ...previous, [projectId]: { text: "Could not save Project Environments. Check the connection and retry.", error: true } }));
+    } finally {
+      setEnvironmentSaving((previous) => {
+        const next = { ...previous };
+        delete next[projectId];
+        return next;
+      });
+    }
   };
 
   const runV2Flow = async (project: ProjectConfig, step: "verify-repositories" | "provision-repositories" | "activate-v2") => {
@@ -1261,6 +1429,9 @@ export default function SettingsPage() {
           const v2Flow = v2Flows[project.id] || { phase: "idle" as const };
           const isV2Configured = Array.isArray(project.repositories) && project.repositories.length > 0;
           const activationConfirmed = v2ActivationConfirmations[project.id] === true;
+          const environmentDraft = environmentDrafts[project.id] || environmentDraftFromConfig(project);
+          const environmentMessage = environmentMessages[project.id];
+          const environmentIsSaving = environmentSaving[project.id] === true;
 
           return (
             <div key={project.id} id={`project-${project.id}`} className="border border-border mb-3 scroll-mt-4">
@@ -1405,6 +1576,96 @@ export default function SettingsPage() {
                           </div>
                         ))}
                       </div>
+                    )}
+                  </div>
+
+                  {/* #1045: persisted peer bindings only. This intentionally
+                      has no discovery, capability, reachability, remote-control,
+                      or watcher-runtime controls; it configures local metadata. */}
+                  <div className="mt-4 border border-border bg-bg-surface p-3" aria-describedby={`environment-help-${project.id}`}>
+                    <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
+                      <div className="min-w-0">
+                        <h3 className="text-[10px] text-text-muted uppercase tracking-wider">Project Environments</h3>
+                        <p id={`environment-help-${project.id}`} className="mt-1 text-[10px] text-text-muted leading-snug break-words">
+                          Register ordered peer identities and the local coordination repository. Saving writes local settings only; it does not discover or control remote environments.
+                        </p>
+                      </div>
+                      <span className="shrink-0 text-[10px] text-text-muted">Local metadata</span>
+                    </div>
+
+                    {!isV2Configured ? (
+                      <p className="mt-3 text-[10px] text-[#ffcc00]" role="status" aria-live="polite">
+                        Activate V2 repository setup before configuring Project Environments.
+                      </p>
+                    ) : (
+                      <>
+                        <div className="mt-3 space-y-2">
+                          {environmentDraft.environment_bindings.map((binding, bindingIndex) => {
+                            const confirmRemoval = environmentRemovalConfirm?.projectId === project.id && environmentRemovalConfirm.index === bindingIndex;
+                            return (
+                              <div key={`${project.id}-environment-${bindingIndex}`} className="border border-border p-2 min-w-0">
+                                <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+                                  <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`environment-${project.id}-installation_id-${bindingIndex}`}>Installation ID
+                                    <input id={`environment-${project.id}-installation_id-${bindingIndex}`} name={`environment-${project.id}-installation-${bindingIndex}`} autoComplete="off" spellCheck={false} value={binding.installation_id} onChange={(event) => updateEnvironmentBinding(project.id, bindingIndex, { installation_id: event.target.value })} className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text font-mono outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" />
+                                  </label>
+                                  <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`environment-${project.id}-project_id-${bindingIndex}`}>Project ID
+                                    <input id={`environment-${project.id}-project_id-${bindingIndex}`} name={`environment-${project.id}-project-${bindingIndex}`} autoComplete="off" spellCheck={false} value={binding.project_id} onChange={(event) => updateEnvironmentBinding(project.id, bindingIndex, { project_id: event.target.value })} className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text font-mono outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" />
+                                  </label>
+                                  <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`environment-${project.id}-label-${bindingIndex}`}>Display label
+                                    <input id={`environment-${project.id}-label-${bindingIndex}`} name={`environment-${project.id}-label-${bindingIndex}`} autoComplete="off" value={binding.label} onChange={(event) => updateEnvironmentBinding(project.id, bindingIndex, { label: event.target.value })} className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" />
+                                  </label>
+                                  <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`environment-${project.id}-environment_class-${bindingIndex}`}>Environment class
+                                    <select id={`environment-${project.id}-environment_class-${bindingIndex}`} name={`environment-${project.id}-class-${bindingIndex}`} value={binding.environment_class} onChange={(event) => updateEnvironmentBinding(project.id, bindingIndex, { environment_class: event.target.value as EnvironmentClass })} className="min-w-0 bg-bg-surface border border-border px-2 py-1.5 text-[11px] text-text outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
+                                      <option value="local">Local</option>
+                                      <option value="vps">VPS</option>
+                                      <option value="other">Other</option>
+                                    </select>
+                                  </label>
+                                </div>
+                                <div className="mt-2 flex items-center justify-end gap-2">
+                                  {confirmRemoval ? (
+                                    <>
+                                      <span className="min-w-0 text-[10px] text-error break-words">Remove this local peer binding? Save to apply.</span>
+                                      <button type="button" onClick={() => { updateEnvironmentDraft(project.id, (current) => ({ ...current, environment_bindings: current.environment_bindings.filter((_, index) => index !== bindingIndex) })); setEnvironmentRemovalConfirm(null); }} className="px-2 py-1 text-[10px] bg-error text-bg font-semibold hover:opacity-90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">Confirm removal</button>
+                                      <button type="button" onClick={() => setEnvironmentRemovalConfirm(null)} className="px-2 py-1 text-[10px] border border-border text-text-muted hover:text-text hover:border-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">Cancel</button>
+                                    </>
+                                  ) : (
+                                    <button type="button" onClick={() => setEnvironmentRemovalConfirm({ projectId: project.id, index: bindingIndex })} className="text-[10px] text-error hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">Remove peer</button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <button type="button" onClick={() => updateEnvironmentDraft(project.id, (current) => ({ ...current, environment_bindings: [...current.environment_bindings, blankEnvironmentBinding()] }))} className="mt-3 px-2 py-1 text-[10px] border border-border text-text-muted hover:text-text hover:border-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">Add peer environment</button>
+
+                        <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3 mt-3 border-t border-border pt-3">
+                          <label className="min-w-0 text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`environment-${project.id}-coordination-repo`}>Coordination repository
+                            <select id={`environment-${project.id}-coordination-repo`} name={`environment-${project.id}-coordination-repo`} value={environmentDraft.coordination_repo_key} onChange={(event) => updateEnvironmentDraft(project.id, (current) => ({ ...current, coordination_repo_key: event.target.value, watch_batch_requests: event.target.value ? current.watch_batch_requests : false }))} className="min-w-0 bg-bg-surface border border-border px-2 py-1.5 text-[11px] text-text outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
+                              <option value="">No coordination repository</option>
+                              {(project.repositories || []).map((repository) => (
+                                <option key={repository.key} value={repository.key}>{repository.key} · {repository.repo}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="mt-5 flex min-w-0 items-start gap-2 cursor-pointer text-[10px] text-text-muted">
+                            <input id={`environment-${project.id}-watch-batch-requests`} name={`environment-${project.id}-watch-batch-requests`} type="checkbox" checked={environmentDraft.watch_batch_requests} disabled={!environmentDraft.coordination_repo_key} onChange={(event) => updateEnvironmentDraft(project.id, (current) => ({ ...current, watch_batch_requests: event.target.checked }))} className="mt-0.5 accent-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50" />
+                            <span className="min-w-0 break-words">Watch Batch Request Tickets on this local environment</span>
+                          </label>
+                        </div>
+
+                        <div className="mt-3 flex flex-col sm:flex-row sm:items-center gap-2">
+                          <button id={`environment-${project.id}-save`} type="button" onClick={() => saveEnvironmentSettings(project)} disabled={environmentIsSaving} className="px-3 py-1.5 text-[11px] font-semibold border border-accent text-accent hover:bg-accent hover:text-bg focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50">
+                            {environmentIsSaving ? "Saving…" : "Save Project Environments"}
+                          </button>
+                          <span className="text-[10px] text-text-muted">Peer removal only blocks future local validation; it never changes remote work.</span>
+                        </div>
+                        {environmentMessage && (
+                          <p role="status" aria-live="polite" className={`mt-2 text-[10px] break-words ${environmentMessage.error ? "text-error" : "text-accent"}`}>
+                            {environmentMessage.text}
+                          </p>
+                        )}
+                      </>
                     )}
                   </div>
 

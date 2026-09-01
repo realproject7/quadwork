@@ -81,11 +81,15 @@ async function rejectsCode(fn, code) {
   }
 
   const ordering = [];
-  const durable = inMemoryCommit(config(project("alpha")), ordering);
+  const alpha = project("alpha");
+  alpha.watch_batch_requests = true;
+  const durable = inMemoryCommit(config(alpha), ordering);
   const controller = createProjectLifecycleController({
     commitV2Configuration: durable.commit,
     cleanupProject: async (projectId) => {
       assert.equal(durable.read().projects.find((entry) => entry.id === projectId).archived, true);
+      assert.equal(durable.read().projects.find((entry) => entry.id === projectId).watch_batch_requests, false,
+        "archive disables the local watcher in the durable barrier before cleanup");
       ordering.push("cleanup");
       return { ok: true, resources: { sessions: 2, viewers: 1 } };
     },
@@ -179,7 +183,9 @@ async function rejectsCode(fn, code) {
   }
 
   const restoreEvents = [];
-  const restoreStore = inMemoryCommit(config(project("restore", true)), restoreEvents);
+  const restoreProject = project("restore", true);
+  restoreProject.watch_batch_requests = true;
+  const restoreStore = inMemoryCommit(config(restoreProject), restoreEvents);
   let cleanupCalls = 0;
   const restoreController = createProjectLifecycleController({
     commitV2Configuration: restoreStore.commit,
@@ -193,6 +199,8 @@ async function rejectsCode(fn, code) {
   assert.equal(cleanupCalls, 1, "unarchive verifies the archived runtime is fully quiesced");
   assert.deepEqual(restored.resources, { sessions: 0 });
   assert.equal(restoreStore.read().projects[0].archived, false);
+  assert.equal(restoreStore.read().projects[0].watch_batch_requests, false,
+    "unarchive does not revive the archived project's local watcher");
 
   const dirtyRestoreStore = inMemoryCommit(config(project("dirty-restore", true)));
   const dirtyRestore = createProjectLifecycleController({

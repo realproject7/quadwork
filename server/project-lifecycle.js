@@ -9,6 +9,10 @@ const {
   releaseProjectLifecycleTransition,
   commitProjectLifecycleConfiguration,
 } = require("./project-lifecycle-authority");
+const {
+  archiveProjectEnvironmentSettings,
+  unarchiveProjectEnvironmentSettings,
+} = require("./project-environment-bindings");
 
 const admissionGenerations = new Map();
 const projectLifecycleLocks = new Map();
@@ -346,6 +350,14 @@ function createProjectLifecycleController(options = {}) {
       }
       project.admission_generation = generation;
       setRegistryAdmissionGeneration(config, projectId, generation);
+      // The local watcher is part of the durable project state, so archive
+      // disables it in the same commit that closes admission—before any
+      // asynchronous cleanup/teardown begins. Restore deliberately does not
+      // revive it; a later Settings action must opt in again.
+      const governedEnvironmentSettings = archived
+        ? archiveProjectEnvironmentSettings(project)
+        : unarchiveProjectEnvironmentSettings(project);
+      project.watch_batch_requests = governedEnvironmentSettings.watch_batch_requests;
       project.archived = archived;
     }, lifecycleTransition);
     return { previousArchived, generation };

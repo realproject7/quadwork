@@ -499,6 +499,24 @@ function preserveProjectArchiveState(existing, incoming) {
   }
 }
 
+// Environment topology is Settings-bound and validated through the dedicated
+// M1 endpoint below. Generic config snapshots must preserve these fields just
+// as they preserve lifecycle authority, so a stale whole-form save cannot add,
+// remove, or retarget a peer binding or local watcher.
+const PROJECT_ENVIRONMENT_SETTING_KEYS = Object.freeze([
+  "environment_bindings",
+  "coordination_repo_key",
+  "watch_batch_requests",
+]);
+
+function preserveProjectEnvironmentSettings(existing, incoming) {
+  if (!existing || !incoming || typeof incoming !== "object") return;
+  for (const key of PROJECT_ENVIRONMENT_SETTING_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(existing, key)) incoming[key] = existing[key];
+    else delete incoming[key];
+  }
+}
+
 router.put("/api/config", (req, res) => {
   try {
     const body = req.body;
@@ -536,6 +554,7 @@ router.put("/api/config", (req, res) => {
           const liveProject = liveById.get(project.id);
           if (!liveProject) continue;
           preserveProjectArchiveState(liveProject, project);
+          preserveProjectEnvironmentSettings(liveProject, project);
           for (const key of PROJECT_FLAG_KEYS) {
             if (key in liveProject) project[key] = liveProject[key];
             else delete project[key];
@@ -616,8 +635,11 @@ router.patch("/api/config", (req, res) => {
             if (Object.prototype.hasOwnProperty.call(existing, "admission_generation")) {
               lifecycleOwner.admission_generation = existing.admission_generation;
             }
+            const environmentOwner = {};
+            preserveProjectEnvironmentSettings(existing, environmentOwner);
             Object.assign(existing, incoming, preserved);
             preserveProjectArchiveState(lifecycleOwner, existing);
+            preserveProjectEnvironmentSettings(environmentOwner, existing);
           } else {
             cfg.projects.push(incoming);
           }
@@ -1016,6 +1038,11 @@ const {
   migrateConfigurationToV2,
   commitV2Configuration,
 } = require("./config");
+const {
+  ProjectEnvironmentBindingError,
+  normalizeProjectEnvironmentSettings,
+} = require("./project-environment-bindings");
+const { writeProjectEnvironmentsMap } = require("./project-environments-map");
 const { projectV2Readiness } = require("./project-v2-readiness");
 const {
   RepositoryProvisionError,
@@ -1046,6 +1073,153 @@ const { ReviewCycleStore, deriveLegacyReviewTarget } = require("./review-cycle")
 const { ReviewCycleDispatcher } = require("./review-cycle-dispatcher");
 const { currentContractObservation } = require("./review-cycle-contract-observation");
 const { verifyActionContract } = require("./review-cycle-action-contract");
+
+function projectEnvironmentSettingsInput(config, project) {
+  return {
+    installation_id: config.installation_id,
+    project,
+    resolveCanonicalRepository: (candidateProject, key) => {
+      const repository = allRepositories(candidateProject).find((entry) => entry?.key === key);
+      return typeof repository?.repo === "string" ? repository.repo.trim().toLowerCase() : null;
+    },
+  };
+}
+
+function environmentSettingsResponse(config, project) {
+  const normalized = normalizeProjectEnvironmentSettings(projectEnvironmentSettingsInput(config, project));
+  return {
+    project_id: normalized.current_identity.project_id,
+    environment_bindings: normalized.project.environment_bindings.map((binding) => ({
+      installation_id: binding.installation_id,
+      project_id: binding.project_id,
+      label: binding.label,
+      environment_class: binding.environment_class,
+    })),
+    coordination_repo_key: normalized.coordination_repository?.key || null,
+    watch_batch_requests: normalized.project.watch_batch_requests,
+    // The selector is deliberately derived only from the canonical repository
+    // records already stored on this project. No network discovery, probe, or
+    // capability state is surfaced here.
+    repositories: allRepositories(project).map((repository) => ({
+      key: repository.key,
+      canonical_repository: typeof repository.repo === "string" ? repository.repo.trim().toLowerCase() : "",
+    })),
+  };
+}
+
+function projectEnvironmentPayloadError(res, error, status = 409) {
+  if (error instanceof ProjectEnvironmentBindingError) {
+    res.status(status).json({ ok: false, code: error.code, field: error.field, error: error.message });
+    return true;
+  }
+  return false;
+}
+
+function projectEnvironmentMutationCandidate(project, body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    const error = new ProjectEnvironmentBindingError(
+      "invalid_environment_settings",
+      "environment_settings",
+      "environment settings must be an object",
+    );
+    throw error;
+  }
+  const allowed = new Set(PROJECT_ENVIRONMENT_SETTING_KEYS);
+  for (const key of Object.keys(body)) {
+    if (!allowed.has(key)) {
+      throw new ProjectEnvironmentBindingError(
+        "invalid_environment_settings_field",
+        key,
+        "environment settings contains an unsupported field",
+      );
+    }
+  }
+  for (const key of ["environment_bindings", "coordination_repo_key", "watch_batch_requests"]) {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) {
+      throw new ProjectEnvironmentBindingError(
+        "missing_environment_settings_field",
+        key,
+        "environment settings must include all Settings fields",
+      );
+    }
+  }
+  const candidate = {
+    ...project,
+    environment_bindings: body.environment_bindings,
+    watch_batch_requests: body.watch_batch_requests,
+  };
+  // The M1 contract represents no selected coordination repository by field
+  // absence. The Settings API accepts only null as its explicit clear value.
+  if (body.coordination_repo_key === null) delete candidate.coordination_repo_key;
+  else candidate.coordination_repo_key = body.coordination_repo_key;
+  return candidate;
+}
+
+// #1045: the only Settings-bound environment topology mutation. The router is
+// mounted behind the same authenticated dashboard boundary as the rest of the
+// Settings APIs; generic config routes retain these fields but cannot author
+// them. This is persistence only—no peer discovery, remote control, session,
+// or watcher execution is introduced here.
+router.get("/api/projects/:id/environment-settings", (req, res) => {
+  const config = readConfigFile();
+  if (typeof config.installation_id !== "string") {
+    return res.status(409).json({ ok: false, code: "v2_environment_settings_unavailable", error: "activate V2 before configuring project environments" });
+  }
+  const project = (config.projects || []).find((entry) => entry?.id === req.params.id);
+  if (!project) return res.status(404).json({ ok: false, code: "unknown_project", error: "project is not configured" });
+  try {
+    return res.json({ ok: true, ...environmentSettingsResponse(config, project) });
+  } catch (error) {
+    if (projectEnvironmentPayloadError(res, error)) return;
+    return res.status(500).json({ ok: false, code: "environment_settings_unavailable", error: "could not read project environment settings" });
+  }
+});
+
+router.put("/api/projects/:id/environment-settings", (req, res) => {
+  let committed;
+  let response;
+  try {
+    const current = readConfigFile();
+    if (typeof current.installation_id !== "string") {
+      return res.status(409).json({ ok: false, code: "v2_environment_settings_unavailable", error: "activate V2 before configuring project environments" });
+    }
+    const existing = (current.projects || []).find((entry) => entry?.id === req.params.id);
+    if (!existing) return res.status(404).json({ ok: false, code: "unknown_project", error: "project is not configured" });
+    // Validate the exact Settings payload before acquiring the write boundary
+    // so malformed inputs cannot produce a partial config/map update.
+    const requested = projectEnvironmentMutationCandidate(existing, req.body);
+    normalizeProjectEnvironmentSettings(projectEnvironmentSettingsInput(current, requested));
+    committed = commitV2Configuration((config) => {
+      const project = (config.projects || []).find((entry) => entry?.id === req.params.id);
+      if (!project) {
+        throw new ProjectEnvironmentBindingError("unknown_project", "project_id", "project is not configured");
+      }
+      const candidate = projectEnvironmentMutationCandidate(project, req.body);
+      const normalized = normalizeProjectEnvironmentSettings(projectEnvironmentSettingsInput(config, candidate));
+      project.environment_bindings = normalized.project.environment_bindings;
+      project.watch_batch_requests = normalized.project.watch_batch_requests;
+      if (normalized.coordination_repository) project.coordination_repo_key = normalized.coordination_repository.key;
+      else delete project.coordination_repo_key;
+    });
+    const project = (committed.projects || []).find((entry) => entry?.id === req.params.id);
+    response = environmentSettingsResponse(committed, project);
+  } catch (error) {
+    if (projectEnvironmentPayloadError(res, error)) return;
+    if (sendV2ConfigurationError(res, error)) return;
+    return res.status(500).json({ ok: false, code: "environment_settings_write_failed", error: "could not save project environment settings" });
+  }
+
+  try {
+    writeProjectEnvironmentsMap(committed, (committed.projects || []).find((entry) => entry?.id === req.params.id), {
+      configDir: CONFIG_DIR,
+    });
+  } catch {
+    // Config has committed atomically. A later explicit/automatic reseed is
+    // safe and idempotent, but do not pretend that the Head map is current.
+    return res.status(503).json({ ok: false, config_committed: true, code: "project_environments_map_write_failed", error: "settings saved; retry to refresh the environment map" });
+  }
+  return res.json({ ok: true, ...response });
+});
 
 function resolveRegisteredIssueContract(projectId, repoKey, issue) {
   const context = readLiveBatchContext(projectId);
@@ -6538,6 +6712,28 @@ function _performReseedWrites(project, cfg, opts = {}) {
   reseeded.push("HEAD-PO-PLAYBOOK.md");
   if (mergedPlaybook.preservedHeadings.length > 0) {
     preserved["HEAD-PO-PLAYBOOK.md"] = mergedPlaybook.preservedHeadings;
+  }
+  // #1045: V2 projects also receive a private, allow-listed environment map.
+  // Its generated section is atomic and preserves any operator-owned H2
+  // sections; it has no worktree/path/network discovery surface.
+  if (typeof cfg?.installation_id === "string") {
+    try {
+      const environmentMap = writeProjectEnvironmentsMap(cfg, project, {
+        configDir: opts.configDir || CONFIG_DIR,
+      });
+      reseeded.push("PROJECT-ENVIRONMENTS.md");
+      if (environmentMap.preserved_operator_sections) {
+        preserved["PROJECT-ENVIRONMENTS.md"] = ["operator-owned sections"];
+      }
+    } catch (error) {
+      // Keep legacy prototype-magic project ids lifecycle-compatible. They are
+      // not valid M1 peer identities, so no environment map is authored until
+      // an explicit future identity migration. All other seed errors remain
+      // fail-closed and visible to the caller.
+      if (error?.code !== "invalid_project_id" || error?.field !== "project.id") {
+        throw error;
+      }
+    }
   }
   return { reseeded, skipped, preserved };
 }

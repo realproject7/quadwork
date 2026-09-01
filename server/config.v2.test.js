@@ -715,6 +715,47 @@ function seedConfig(config) {
   ok(JSON.parse(before).projects[0].agents.t1.command === "old-head", "failed activation leaves original config byte-valid and byte-identical");
 }
 
+// #1045: activated V2 persistence normalizes the environment-binding schema in
+// the same atomic write as every other project change. Missing old fields get
+// safe defaults, unrelated values survive, and malformed topology never leaks
+// a partial write.
+{
+  const environmentPath = repoDir("environment-settings");
+  seedConfig(activated([project("environment", [repository("primary", "Acme/Environment", environmentPath)], {
+    unrelated: { preserve: ["yes"] },
+  })]));
+  commitV2Configuration((cfg) => { cfg.feature = "normalize-environments"; });
+  let persisted = JSON.parse(diskBytes());
+  assert.deepEqual(persisted.projects[0].environment_bindings, []);
+  assert.equal(persisted.projects[0].watch_batch_requests, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(persisted.projects[0], "coordination_repo_key"), false);
+  ok(persisted.projects[0].unrelated.preserve[0] === "yes", "atomic V2 normalization adds safe environment defaults without dropping unrelated project fields");
+
+  commitV2Configuration((cfg) => {
+    cfg.projects[0].environment_bindings = [{
+      installation_id: "peerinstall_1234567890abcdef",
+      project_id: "remote-project",
+      label: "Remote VPS",
+      environment_class: "vps",
+    }];
+    cfg.projects[0].coordination_repo_key = "primary";
+    cfg.projects[0].watch_batch_requests = true;
+  });
+  persisted = JSON.parse(diskBytes());
+  assert.equal(persisted.projects[0].environment_bindings[0].label, "Remote VPS");
+  assert.equal(persisted.projects[0].coordination_repo_key, "primary");
+  assert.equal(persisted.projects[0].watch_batch_requests, true);
+  ok(true, "V2 atomic commit accepts a peer binding only with a registered canonical repository key");
+
+  const before = diskBytes();
+  expectCode(
+    () => commitV2Configuration((cfg) => { cfg.projects[0].coordination_repo_key = "removed"; }),
+    "coordination_repository_not_found",
+    "removed canonical repository key rejects the whole atomic environment update",
+  );
+  assert.equal(diskBytes(), before);
+}
+
 console.log(`\n${passed} passed`);
 console.log("server/config.v2.test.js: all assertions passed");
 process.exit(0);

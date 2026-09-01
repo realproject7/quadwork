@@ -8,6 +8,11 @@ const {
   registerProjectLifecycleCommitter,
 } = require("./project-lifecycle-authority");
 const { normalizeCiPolicy, CiEvidencePolicyError } = require("./ci-evidence-policy");
+const {
+  ProjectEnvironmentBindingError,
+  normalizeProjectEnvironmentSettings,
+  validateProjectEnvironmentSettings,
+} = require("./project-environment-bindings");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
 const CONFIG_LOCK_PATH = path.join(os.homedir(), ".quadwork", "config.lock");
@@ -195,6 +200,62 @@ function repositoryByCanonicalName(project, repo) {
   const canonical = canonicalRepositoryName(repo);
   if (!canonical) return null;
   return allRepositories(project).find((entry) => canonicalRepositoryName(entry && entry.repo) === canonical) || null;
+}
+
+// Project Environments may name only an already registered canonical
+// repository record. This deliberately derives no value from a path, remote,
+// probe, or live capability: the V2 repository record is the sole authority.
+function resolveCanonicalProjectRepository(project, key) {
+  const repository = repositoryByKey(project, key);
+  return repository && typeof repository.repo === "string"
+    ? canonicalRepositoryName(repository.repo)
+    : null;
+}
+
+function rethrowProjectEnvironmentValidation(error) {
+  if (error instanceof ProjectEnvironmentBindingError) {
+    throw validationError(error.code, error.field, error.message);
+  }
+  throw error;
+}
+
+// Historic project ids may include prototype-magic spellings that the M1 peer
+// identity grammar intentionally rejects. They remain valid configured V2
+// projects for lifecycle/tombstone compatibility, but cannot opt into Project
+// Environments until renamed through a future explicit identity migration.
+// Do not use this compatibility exception for peer fields: only the current
+// project identity error is tolerated, and only at the config boundary.
+function isLegacyCurrentProjectIdentityError(error) {
+  return error instanceof ProjectEnvironmentBindingError &&
+    error.code === "invalid_project_id" && error.field === "project.id";
+}
+
+function projectEnvironmentValidationInput(config, project) {
+  return {
+    installation_id: config.installation_id,
+    project,
+    resolveCanonicalRepository: resolveCanonicalProjectRepository,
+  };
+}
+
+// Normalize the V2-only settings at the same serialized boundary that writes
+// config.json. This makes missing legacy fields become explicit safe defaults,
+// retains unrelated project fields, and prevents a generic write from ever
+// reintroducing a scalar repository representation as a side effect.
+function normalizeV2ProjectEnvironmentSettings(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config) ||
+      !Array.isArray(config.projects) || !hasOwn(config, "installation_id")) {
+    return config;
+  }
+  const projects = config.projects.map((project) => {
+    try {
+      return normalizeProjectEnvironmentSettings(projectEnvironmentValidationInput(config, project)).project;
+    } catch (error) {
+      if (isLegacyCurrentProjectIdentityError(error)) return cloneConfigurationValue(project);
+      return rethrowProjectEnvironmentValidation(error);
+    }
+  });
+  return { ...config, projects };
 }
 
 // Absence is meaningful: legacy repositories retain no inferred policy and
@@ -617,6 +678,21 @@ function validateV2Configuration(config, options = {}) {
       fsImpl,
       { resolveIdentity },
     );
+    try {
+      const environmentSettings = validateProjectEnvironmentSettings(
+        projectEnvironmentValidationInput(config, project),
+      );
+      if (!environmentSettings.ok) {
+        throw new ProjectEnvironmentBindingError(
+          environmentSettings.error.code,
+          environmentSettings.error.field,
+          environmentSettings.error.message,
+        );
+      }
+    } catch (error) {
+      if (isLegacyCurrentProjectIdentityError(error)) return;
+      rethrowProjectEnvironmentValidation(error);
+    }
 
     // `idle` is an execution flag, not archival state. Only explicit archived
     // projects release their repository/path ownership claim.
@@ -667,7 +743,7 @@ function migrateConfigurationToV2(config) {
         return migrated;
       })
     : cloned.projects;
-  return { ...cloned, projects };
+  return normalizeV2ProjectEnvironmentSettings({ ...cloned, projects });
 }
 
 // Reserved sender names that the operator must NOT be able to claim.
@@ -894,7 +970,7 @@ function writeConfigUnlocked(cfg, options = {}) {
   // Route compatibility accessors expose legacy scalar conveniences as
   // non-enumerable properties; those must remain usable in memory without
   // becoming false persisted-schema violations at the atomic boundary.
-  const candidate = cloneConfigurationValue(cfg);
+  let candidate = cloneConfigurationValue(cfg);
   removeRetiredGlobalAgentMetadata(candidate);
   const lifecycleTransition = internalWrite ? options.lifecycleTransition : null;
   const wasActivated = hasOwn(previousConfig || {}, "installation_id");
@@ -915,6 +991,7 @@ function writeConfigUnlocked(cfg, options = {}) {
     );
   }
   if (isActivated) {
+    candidate = normalizeV2ProjectEnvironmentSettings(candidate);
     validateV2Configuration(candidate, {
       previousConfig: previousConfig || candidate,
       fsImpl: internalWrite ? options.fsImpl || fs : fs,
@@ -1077,6 +1154,7 @@ module.exports = {
   primaryRepository,
   repositoryByKey,
   repositoryByCanonicalName,
+  resolveCanonicalProjectRepository,
   repositoryCiPolicy,
   serializeProjectCompatibility,
   workingDirIdentity,
