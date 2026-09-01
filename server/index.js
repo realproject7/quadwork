@@ -729,6 +729,22 @@ app.post("/api/head-control", (req, res) => {
   return res.status(status).json(response);
 });
 
+// #1058 M7: the operator's nested Current Batch surface is a fixed local
+// read. Unlike the Head-control plane it uses the dashboard session boundary,
+// but project/config/admission state and every returned task identity remain
+// server-derived by the durable runtime.
+app.get("/api/work-task-batch", (req, res) => {
+  if (!requireSessionToken(req, res)) return;
+  const projectId = typeof req.query?.project === "string" ? req.query.project : null;
+  if (projectId === null) return res.status(400).json({ ok: false, error: "Missing project" });
+  try {
+    const batch = headControlRuntime.readCurrentBatchProjection({ project_id: projectId });
+    return res.json({ ok: true, ...batch });
+  } catch {
+    return res.status(503).json({ ok: false, error: "WorkTask Current Batch is unavailable" });
+  }
+});
+
 // #1047 is intentionally a single fixed, Head-token-authenticated read route.
 // It has no project selector, no generic history parameters, and no endpoint
 // diagnostic leakage; the MCP client further redacts the same denial.
