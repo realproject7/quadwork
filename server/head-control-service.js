@@ -198,6 +198,47 @@ function appendReceipt(value, expected, owner) {
     fail("head_control_audit_unavailable", "durable audit append did not retain the control decision");
   }
 }
+function originalAudit(record) {
+  return freeze({
+    version: VERSION,
+    binding: freeze(clone(record.binding)),
+    action: record.action,
+    correlation_id: record.correlation_id,
+    idempotency_key: record.idempotency_key,
+    expected_revision: record.preconditions.expected_revision,
+    decision: record.decision,
+    code: record.code,
+    result: record.result === null ? null : freeze(clone(record.result)),
+  });
+}
+function replay(record) {
+  const audit = originalAudit(record);
+  return freeze({
+    version: VERSION,
+    decision: freeze({ kind: "replayed", code: "head_control_duplicate_retry" }),
+    result: audit.result === null ? null : freeze(clone(audit.result)),
+    audit,
+  });
+}
+function commandFingerprint(value) {
+  try { return stable(value); } catch { return null; }
+}
+function commandMatchesDurablePayloadlessRecord(command, record, owner) {
+  const code = "head_control_durable_replay_ambiguous";
+  exact(command, ["version", "action", "principal", "expected_revision", "idempotency_key", "correlation_id", "payload"], code);
+  if (command.version !== VERSION || command.action !== record.action ||
+      (command.action !== "get_pipeline_status" && command.action !== "freeze_batch_manifest") ||
+      command.payload !== null || record.decision !== "accepted") {
+    return false;
+  }
+  const commandBinding = binding(command.principal, code);
+  const expectedRevision = revision(command.expected_revision, code, command.action === "get_pipeline_status");
+  const idempotencyKey = identifier(command.idempotency_key, code);
+  const correlationId = identifier(command.correlation_id, code);
+  return sameBinding(commandBinding, owner) &&
+    expectedRevision === record.preconditions.expected_revision &&
+    idempotencyKey === record.idempotency_key && correlationId === record.correlation_id;
+}
 
 function createHeadControlService(options) {
   exact(options, ["binding", "domain", "audit_store"], "invalid_head_control_service_options");
@@ -206,16 +247,26 @@ function createHeadControlService(options) {
   // The closed M1 plane validates the exact domain callback keys and is the
   // only component that can invoke them.
   const plane = createHeadControlPlane({ binding: owner, domain: options.domain });
+  const localIdempotencies = new Map();
+  const localCorrelations = new Map();
 
   function readAuditOrFail() {
     try { return durableAuditSnapshot(store.read(owner), owner); }
     catch { fail("head_control_audit_unavailable", "durable Head-control audit is unavailable"); }
   }
-  function persistOrFail(result) {
+  function remember(command, record) {
+    const fingerprint = commandFingerprint(command);
+    if (fingerprint === null) return;
+    const local = freeze({ fingerprint, record: freeze(clone(record)) });
+    localIdempotencies.set(record.idempotency_key, local);
+    localCorrelations.set(record.correlation_id, local);
+  }
+  function persistOrFail(result, command) {
     const expected = resultAuditProjection(result.audit, owner);
     try {
       const receipt = store.append({ binding: owner, audit: result.audit });
       appendReceipt(receipt, expected, owner);
+      remember(command, expected);
     } catch {
       // The domain result is intentionally not returned without its required
       // receipt. A later exact retry can re-read the plane receipt and append
@@ -223,12 +274,36 @@ function createHeadControlService(options) {
       fail("head_control_audit_unavailable", "durable Head-control audit is unavailable");
     }
   }
+  function durableReplayOrFail(command, records) {
+    if (!plain(command)) return null;
+    const byCorrelation = records.find((record) => record.correlation_id === command.correlation_id) || null;
+    const byIdempotency = records.find((record) => record.idempotency_key === command.idempotency_key) || null;
+    if (byCorrelation === null && byIdempotency === null) return null;
+    if (byCorrelation === null || byIdempotency === null || byCorrelation !== byIdempotency) {
+      fail("head_control_durable_identity_collision", "durable Head-control identity is already used");
+    }
+    const record = byCorrelation;
+    const localByCorrelation = localCorrelations.get(record.correlation_id);
+    const localByIdempotency = localIdempotencies.get(record.idempotency_key);
+    const fingerprint = commandFingerprint(command);
+    if (localByCorrelation && localByCorrelation === localByIdempotency &&
+        same(localByCorrelation.record, record) && fingerprint !== null && localByCorrelation.fingerprint === fingerprint) {
+      return replay(record);
+    }
+    if (commandMatchesDurablePayloadlessRecord(command, record, owner)) return replay(record);
+    // The durable format deliberately omits payloads.  Any request that is
+    // not exactly provable from the fixed receipt, including put/cut after a
+    // restart, remains ambiguous and must not reach the domain.
+    fail("head_control_durable_replay_ambiguous", "durable Head-control receipt cannot prove this retry");
+  }
   function execute(command) {
     // This preflight happens before the plane can reach a domain callback.
     // It also rejects corrupt, substituted, or unavailable durable state.
-    readAuditOrFail();
+    const records = readAuditOrFail();
+    const durableReplay = durableReplayOrFail(command, records);
+    if (durableReplay !== null) return durableReplay;
     const result = plane.execute(command);
-    persistOrFail(result);
+    persistOrFail(result, command);
     return result;
   }
   function recentAudit() {

@@ -110,6 +110,9 @@ function service(initial) {
 function expectServiceFailure(fn) {
   assert.throws(fn, (error) => error instanceof HeadControlServiceError && error.code === "head_control_audit_unavailable");
 }
+function expectServiceCode(fn, code) {
+  assert.throws(fn, (error) => error instanceof HeadControlServiceError && error.code === code);
+}
 
 let passed = 0;
 function ok(condition, message) {
@@ -193,35 +196,85 @@ function ok(condition, message) {
   assert.deepEqual(again, once);
   assert.equal(auditStore.read(BINDING).length, 1);
 
-  // A reused identity would require a second durable record with a duplicate
-  // identity. The store refuses that ambiguity and the service exposes no
-  // unaudited decision; the owning freeze action is never reached.
-  expectServiceFailure(() => core.execute(request("freeze_batch_manifest", {
+  // A one-sided reused identity is rejected by the durable preflight before
+  // either the plane or the owning freeze action can run.
+  expectServiceCode(() => core.execute(request("freeze_batch_manifest", {
     expected_revision: 1, idempotency_key: "idem_retry_001", correlation_id: "corr_collision_001",
-  })));
+  })), "head_control_durable_identity_collision");
   assert.equal(calls.freeze_batch_manifest, 0);
   assert.equal(core.recentAudit().length, 1);
   ok(true, "duplicate retries re-read one durable receipt while identity collisions fail closed");
 }
 
-// A new service instance can read the same bounded redacted receipt state
-// after restart without needing to reconstruct a payload-bearing command log.
+// Combining the correlation from one receipt with the idempotency key from
+// another cannot name a replay and is stopped before an owned status read.
+{
+  const { core, calls } = service();
+  core.execute(request("get_pipeline_status", {
+    idempotency_key: "idem_identity_one", correlation_id: "corr_identity_one",
+  }));
+  core.execute(request("get_pipeline_status", {
+    idempotency_key: "idem_identity_two", correlation_id: "corr_identity_two",
+  }));
+  expectServiceCode(() => core.execute(request("get_pipeline_status", {
+    idempotency_key: "idem_identity_two", correlation_id: "corr_identity_one",
+  })), "head_control_durable_identity_collision");
+  assert.equal(calls.get_pipeline_status, 2);
+  ok(true, "split durable correlation and idempotency identities cannot reach the domain");
+}
+
+// Restart safety is stricter than the in-memory plane. A payload-bearing
+// durable receipt cannot prove that an arriving payload matches it, so a new
+// service rejects even a byte-for-byte retry before the domain. A changed
+// payload with the same identities is rejected by the same fail-closed gate.
 {
   const fake = domain();
   const configDir = configDirectory();
   const firstStore = createHeadControlAuditStore({ config_dir: configDir, fs });
   const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: firstStore });
-  first.execute(request("put_batch_manifest", {
+  const firstRequest = request("put_batch_manifest", {
     idempotency_key: "idem_restart_001", correlation_id: "corr_restart_001", expected_revision: 0,
-  }));
+  });
+  first.execute(firstRequest);
+  assert.equal(fake.calls.put_batch_manifest, 1);
   const secondStore = createHeadControlAuditStore({ config_dir: configDir, fs });
   const afterRestart = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: secondStore });
+  expectServiceCode(() => afterRestart.execute(clone(firstRequest)), "head_control_durable_replay_ambiguous");
+  expectServiceCode(() => afterRestart.execute({
+    ...clone(firstRequest),
+    payload: { manifest: { version: 1, tasks: [{ exact_task: "changed-payload" }] } },
+  }), "head_control_durable_replay_ambiguous");
+  assert.equal(fake.calls.put_batch_manifest, 1);
   const readBack = afterRestart.recentAudit();
   assert.equal(readBack.length, 1);
   assert.equal(readBack[0].correlation_id, "corr_restart_001");
   assert.equal(Object.hasOwn(readBack[0], "expected_revision"), false);
   assert.equal(Object.hasOwn(readBack[0], "payload"), false);
-  ok(true, "durable recent-audit reads survive service restart with only fixed redacted fields");
+  ok(true, "restart retries and changed-payload identity collisions cannot reach the domain");
+}
+
+// The redacted receipt fully represents successful no-payload commands, so
+// those can be re-read deterministically after restart without a domain read.
+{
+  const fake = domain();
+  const configDir = configDirectory();
+  const firstStore = createHeadControlAuditStore({ config_dir: configDir, fs });
+  const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: firstStore });
+  const statusRequest = request("get_pipeline_status", {
+    idempotency_key: "idem_status_restart", correlation_id: "corr_status_restart",
+  });
+  first.execute(statusRequest);
+  assert.equal(fake.calls.get_pipeline_status, 1);
+  const afterRestart = createHeadControlService({
+    binding: BINDING,
+    domain: fake.actions,
+    audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }),
+  });
+  const replay = afterRestart.execute(clone(statusRequest));
+  assert.equal(replay.decision.kind, "replayed");
+  assert.equal(replay.result.status.revision, 0);
+  assert.equal(fake.calls.get_pipeline_status, 1);
+  ok(true, "a fully provable payloadless receipt replays safely after restart");
 }
 
 // An unavailable or malformed audit state is checked before the plane can
