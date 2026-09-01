@@ -17,9 +17,9 @@ const ATTEMPT_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const RECEIPT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const FINDING_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const REVIEWER_ROLES = new Set(["re1", "re2"]);
+const VERDICTS = new Set(["approve", "request_changes"]);
 const SEVERITIES = new Set(["blocking", "non_blocking"]);
 const PROPAGATION_SCOPES = new Set(["local", "propagating"]);
-const DECLARATIONS = new Set(["declared", "not_declared"]);
 const CANCELLATION_CAUSES = new Set(["candidate_invalidated", "project_archived"]);
 const MAX_FINDINGS = 32;
 
@@ -144,21 +144,16 @@ function roundRefFor(input) {
 }
 
 function finding(value, code = "invalid_task_review_finding") {
-  exact(value, ["finding_id", "severity", "propagation", "summary", "declaration"], code);
+  exact(value, ["finding_id", "severity", "propagation", "summary"], code);
   if (!FINDING_ID_RE.test(value.finding_id) || !SEVERITIES.has(value.severity) || !PROPAGATION_SCOPES.has(value.propagation)) {
     fail(code, "finding classification is invalid");
   }
   text(value.summary, code, 480);
-  exact(value.declaration, ["overlap", "agreement"], code);
-  if (!DECLARATIONS.has(value.declaration.overlap) || !DECLARATIONS.has(value.declaration.agreement)) {
-    fail(code, "finding declaration is invalid");
-  }
-  // We preserve the reviewer-declared values verbatim: no cross-receipt
-  // comparison or inferred agreement/overlap is permitted in this foundation.
-  return {
-    finding_id: value.finding_id, severity: value.severity, propagation: value.propagation,
-    summary: value.summary, declaration: clone(value.declaration),
-  };
+  // M1 deliberately carries no overlap/agreement field.  Before both sealed
+  // receipts exist, such a field would claim peer semantic equivalence.  A
+  // later reconciliation seam must introduce an explicit, trusted comparison
+  // contract; this module neither exposes nor infers one.
+  return { finding_id: value.finding_id, severity: value.severity, propagation: value.propagation, summary: value.summary };
 }
 
 function receiptPayload(value) {
@@ -166,13 +161,14 @@ function receiptPayload(value) {
     version: VERSION,
     review_round_ref: clone(value.review_round_ref),
     receipt_id: value.receipt_id,
+    verdict: value.verdict,
     findings: value.findings.map(clone),
   };
 }
 
 function receiptInput(value) {
-  exact(value, ["version", "review_round_ref", "receipt_id", "receipt_digest", "findings"], "invalid_task_review_receipt");
-  if (value.version !== VERSION || !RECEIPT_ID_RE.test(value.receipt_id) || !SHA_RE.test(value.receipt_digest) ||
+  exact(value, ["version", "review_round_ref", "receipt_id", "verdict", "receipt_digest", "findings"], "invalid_task_review_receipt");
+  if (value.version !== VERSION || !RECEIPT_ID_RE.test(value.receipt_id) || !VERDICTS.has(value.verdict) || !SHA_RE.test(value.receipt_digest) ||
       !Array.isArray(value.findings) || value.findings.length > MAX_FINDINGS) {
     fail("invalid_task_review_receipt", "review receipt is invalid");
   }
@@ -181,7 +177,7 @@ function receiptInput(value) {
   if (new Set(findings.map((entry) => entry.finding_id)).size !== findings.length) fail("duplicate_task_review_finding", "finding identity is duplicated");
   const normalized = {
     version: VERSION, review_round_ref: clone(value.review_round_ref), receipt_id: value.receipt_id,
-    receipt_digest: value.receipt_digest, findings,
+    verdict: value.verdict, receipt_digest: value.receipt_digest, findings,
   };
   if (normalized.receipt_digest !== hash(receiptPayload(normalized))) fail("task_review_receipt_digest_mismatch", "receipt digest does not authenticate its exact contents");
   return normalized;
