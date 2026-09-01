@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, type ReactNode } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
 import { workItemDisplayLabel, workItemReactKey } from "@/lib/batchIdentity";
+import { sessionTokenHeaders } from "@/lib/sessionToken";
 
 interface BatchProgressItem {
   number: number;
@@ -60,6 +61,45 @@ interface BatchProgressData {
   }>;
 }
 
+type WorkTaskState =
+  | "queued" | "building" | "candidate_ready" | "independent_review"
+  | "reconcile" | "changes_requested" | "accepted" | "staged"
+  | "blocked" | "deferred";
+
+interface WorkTaskBatchProjection {
+  version: number;
+  batch_manifest_digest: string;
+  delivery_mode: "integrated" | "isolated";
+  frozen: boolean;
+  repositories: Array<{
+    repository_key: string;
+    base_sha: string | null;
+    work_items: Array<{
+      work_item: { repoKey: string; repo: string; number: number; kind: "issue" | "pr" };
+      issue_body_revision: string;
+      tasks: Array<{
+        work_task_ref: { repository_key: string; task_key: string };
+        task_key: string;
+        goal: string;
+        state: WorkTaskState;
+      }>;
+    }>;
+  }>;
+}
+
+interface WorkTaskBatchData {
+  ok?: boolean;
+  active: boolean;
+  projection: WorkTaskBatchProjection | null;
+}
+
+interface WorkTaskCopy {
+  currentBatch: (n: number | string) => string;
+  workTasks: (n: number) => string;
+  workTaskTooltip: ReactNode;
+  workTaskStates: Record<WorkTaskState, string>;
+}
+
 interface BatchProgressPanelProps {
   projectId: string;
   idle?: boolean;
@@ -98,6 +138,17 @@ const COPY = {
         <b>Current Batch</b> — review progress for the active batch, driven by the queue&apos;s Active Batch states (queued &rarr; in review &rarr; approved).
       </>
     ),
+    workTasks: (n: number) => `(${n} tasks)`,
+    workTaskTooltip: (
+      <>
+        <b>Work Tasks</b> — immutable local slices inside each ticket. Their state is independent of PR delivery; candidate and review details remain server-bound.
+      </>
+    ),
+    workTaskStates: {
+      queued: "queued", building: "building", candidate_ready: "candidate ready", independent_review: "independent review",
+      reconcile: "reconciling", changes_requested: "changes requested", accepted: "accepted", staged: "staged",
+      blocked: "blocked", deferred: "deferred",
+    },
   },
   ko: {
     loading: "배치 진행 상황 로딩 중...",
@@ -130,6 +181,17 @@ const COPY = {
         <b>현재 배치</b> - 큐의 Active Batch 상태로 추적하는 리뷰 진행 상황입니다 (대기 → 검토 중 → 승인).
       </>
     ),
+    workTasks: (n: number) => `(${n}개 작업)`,
+    workTaskTooltip: (
+      <>
+        <b>작업 단위</b> - 각 티켓 안의 불변 로컬 작업 단위입니다. 상태는 PR 전달과 독립적이며, 후보 및 리뷰 상세는 서버 경계 안에 유지됩니다.
+      </>
+    ),
+    workTaskStates: {
+      queued: "대기", building: "빌드 중", candidate_ready: "후보 준비", independent_review: "독립 검토 중",
+      reconcile: "조정 중", changes_requested: "변경 요청", accepted: "승인", staged: "스테이징",
+      blocked: "차단됨", deferred: "보류됨",
+    },
   },
 } as const;
 
@@ -159,6 +221,62 @@ function ProgressBar({ percent }: { percent: number }) {
   );
 }
 
+function workTaskStateClass(state: WorkTaskState): string {
+  if (state === "accepted" || state === "staged") return "text-accent";
+  if (state === "changes_requested" || state === "blocked") return "text-error";
+  if (state === "independent_review" || state === "reconcile") return "text-warning";
+  return "text-text-muted";
+}
+
+function WorkTaskBatch({
+  batch,
+  batchNumber,
+  t,
+}: {
+  batch: WorkTaskBatchProjection;
+  batchNumber: number | null | undefined;
+  t: WorkTaskCopy;
+}) {
+  const taskCount = batch.repositories.reduce((count, repository) =>
+    count + repository.work_items.reduce((itemCount, item) => itemCount + item.tasks.length, 0), 0);
+  return (
+    <div className="border-t border-border">
+      <div className="px-3 py-1.5 flex items-center gap-2 border-b border-border/40">
+        <span className="text-[10px] text-text-muted uppercase tracking-wider">
+          {t.currentBatch(batchNumber ?? "—")}
+        </span>
+        <span className="text-[10px] text-text-muted">{t.workTasks(taskCount)}</span>
+        <InfoTooltip>{t.workTaskTooltip}</InfoTooltip>
+      </div>
+      <div className="max-h-52 overflow-y-auto" role="list" aria-label={t.workTasks(taskCount)}>
+        {batch.repositories.map((repository) => (
+          <section key={repository.repository_key} className="border-b border-border/30 last:border-b-0" role="listitem">
+            <div className="px-3 py-1 text-[10px] text-text-muted font-mono truncate" title={repository.repository_key}>
+              [{repository.repository_key}]
+            </div>
+            {repository.work_items.map((item) => (
+              <div key={`${repository.repository_key}:${item.work_item.repo}:${item.work_item.kind}:${item.work_item.number}`} className="pb-1">
+                <div className="px-3 py-0.5 text-[11px] text-text font-mono truncate" title={`${item.work_item.repo}#${item.work_item.number}`}>
+                  {item.work_item.repo}#{item.work_item.number}
+                </div>
+                <div role="list" aria-label={`${item.work_item.repo} work tasks`}>
+                  {item.tasks.map((task) => (
+                    <div key={`${repository.repository_key}:${item.work_item.repo}:${item.work_item.number}:${task.task_key}`} role="listitem" className="flex items-center gap-2 px-3 py-1 pl-6 font-mono">
+                      <span className="text-[11px] text-text shrink-0">{task.task_key}</span>
+                      <span className={`text-[10px] shrink-0 ${workTaskStateClass(task.state)}`}>{t.workTaskStates[task.state]}</span>
+                      <span className="text-[11px] text-text-muted truncate min-w-0" title={task.goal}>{task.goal}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /**
  * #413 / quadwork#282: Current Batch Progress panel.
  *
@@ -172,12 +290,30 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
   const { locale } = useLocale();
   const t = COPY[locale];
   const [data, setData] = useState<BatchProgressData | null>(null);
+  const [workTaskBatch, setWorkTaskBatch] = useState<WorkTaskBatchData | null>(null);
 
-  const load = useCallback(() => {
-    fetch(`/api/batch-progress?project=${encodeURIComponent(projectId)}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (d) setData(d); })
-      .catch(() => {});
+  const load = useCallback(async () => {
+    const project = encodeURIComponent(projectId);
+    try {
+      const [progressResponse, workTaskResponse] = await Promise.all([
+        fetch(`/api/batch-progress?project=${project}`),
+        sessionTokenHeaders().then((headers) => fetch(`/api/work-task-batch?project=${project}`, { headers })),
+      ]);
+      if (progressResponse.ok) {
+        const progress = await progressResponse.json();
+        if (progress) setData(progress);
+      }
+      if (workTaskResponse.ok) {
+        const nested = await workTaskResponse.json();
+        if (nested?.ok === true && typeof nested.active === "boolean") {
+          setWorkTaskBatch({ active: nested.active, projection: nested.projection ?? null });
+          return;
+        }
+      }
+      setWorkTaskBatch(null);
+    } catch {
+      setWorkTaskBatch(null);
+    }
   }, [projectId]);
 
   useEffect(() => {
@@ -186,6 +322,10 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
   }, [load, idle]);
+
+  if (workTaskBatch?.active === true && workTaskBatch.projection !== null) {
+    return <WorkTaskBatch batch={workTaskBatch.projection} batchNumber={data?.batch_number} t={t} />;
+  }
 
   if (!data) {
     // #812: a project that is already idle on open has no cached batch data

@@ -332,6 +332,10 @@ assert.match(panel, /workItemDisplayLabel/, "BatchProgressPanel uses text reposi
 assert.match(panel, /multi_repository/, "repository label is controlled by project topology");
 assert.match(panel, /validation_errors/, "invalid queue diagnostics are visible instead of rendering an empty batch");
 assert.match(panel, /data\.active\s*===\s*false\s*\|\|/, "BatchProgressPanel renders the explicit inactive Current Batch state before any stale rows");
+assert.match(panel, /api\/work-task-batch/, "BatchProgressPanel reads the fixed nested WorkTask projection on the existing cadence");
+assert.match(panel, /sessionTokenHeaders/, "the nested WorkTask read stays on the dashboard session boundary");
+assert.match(panel, /repository\.work_items/, "the nested panel preserves repository-qualified ticket grouping");
+assert.match(panel, /task\.task_key/, "the nested panel renders immutable WorkTask keys rather than PR identity");
 
 const queueManager = fs.readFileSync(path.join(root, "src", "components", "QueueManager.tsx"), "utf8");
 assert.match(queueManager, /qualifiedQueueToken/, "QueueManager emits qualified work tokens");
