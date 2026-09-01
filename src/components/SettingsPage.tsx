@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
 import { modelsForBackend, effectiveModel, sanitizeModel } from "@/lib/agentModels";
 import { injectModeForCommand } from "@/lib/injectMode";
@@ -28,11 +28,164 @@ interface AgentConfig {
 interface ProjectConfig {
   id: string;
   name: string;
-  repo: string;
-  working_dir: string;
   agents: Record<string, AgentConfig>;
+  repositories?: V2Repository[];
   archived?: boolean;
   idle?: boolean;
+}
+
+type CiPolicyMode = "" | "github-checks" | "ci-less";
+
+interface CiPolicyDraft {
+  mode: CiPolicyMode;
+  requiredChecks: string;
+  advisoryChecks: string;
+  checkKind: "product" | "control-plane";
+  registrationGraceSeconds: string;
+  sameShaRetryBudget: string;
+  evidenceKeys: string;
+}
+
+interface V2Repository {
+  key: string;
+  repo: string;
+  working_dir: string;
+  primary: boolean;
+  ci_policy?: Record<string, unknown>;
+}
+
+interface V2RepositoryDraft extends V2Repository {
+  policy: CiPolicyDraft;
+}
+
+interface V2SetupResult {
+  ok?: boolean;
+  code?: string;
+  reasons?: Array<{ code?: string; repo_key?: string }>;
+  repositories?: Array<{
+    key?: string;
+    repo?: string;
+    primary?: boolean;
+    default_branch?: string;
+    base_clone?: string;
+    worktrees?: Record<string, string>;
+  }>;
+}
+
+interface V2Flow {
+  phase: "idle" | "verifying" | "verified" | "provisioning" | "provisioned" | "activating" | "activated" | "error";
+  message?: string;
+  result?: V2SetupResult;
+}
+
+const V2_ROLES = ["head", "re1", "re2", "dev"] as const;
+
+function listFromInput(value: string) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function blankPolicy(): CiPolicyDraft {
+  return {
+    mode: "",
+    requiredChecks: "",
+    advisoryChecks: "",
+    checkKind: "product",
+    registrationGraceSeconds: "300",
+    sameShaRetryBudget: "0",
+    evidenceKeys: "",
+  };
+}
+
+function blankRepository(key = "primary", primary = true): V2RepositoryDraft {
+  return { key, repo: "", working_dir: "", primary, policy: blankPolicy() };
+}
+
+function policyDraftFromRepository(repository: V2Repository): CiPolicyDraft {
+  const policy = repository.ci_policy;
+  if (policy?.mode === "ci-less" && Array.isArray(policy.evidence_keys)) {
+    return { ...blankPolicy(), mode: "ci-less", evidenceKeys: policy.evidence_keys.filter((key): key is string => typeof key === "string").join(", ") };
+  }
+  if (policy?.mode === "github-checks" && Array.isArray(policy.checks)) {
+    const checks = policy.checks.filter((check): check is { name: string; required: boolean; kind: "product" | "control-plane" } =>
+      !!check && typeof check === "object" && typeof check.name === "string" && typeof check.required === "boolean" &&
+      (check.kind === "product" || check.kind === "control-plane"),
+    );
+    return {
+      ...blankPolicy(),
+      mode: "github-checks",
+      requiredChecks: checks.filter((check) => check.required).map((check) => check.name).join(", "),
+      advisoryChecks: checks.filter((check) => !check.required).map((check) => check.name).join(", "),
+      checkKind: checks[0]?.kind || "product",
+      registrationGraceSeconds: String(policy.registration_grace_seconds ?? 300),
+      sameShaRetryBudget: String(policy.same_sha_retry_budget ?? 0),
+    };
+  }
+  return blankPolicy();
+}
+
+function repositoryDraftFromConfig(repositories: V2Repository[] | undefined): V2RepositoryDraft[] {
+  if (!Array.isArray(repositories) || repositories.length === 0) return [blankRepository()];
+  return repositories.map((repository) => ({ ...repository, policy: policyDraftFromRepository(repository) }));
+}
+
+function policyFromDraft(draft: CiPolicyDraft): Record<string, unknown> | undefined {
+  if (draft.mode === "ci-less") {
+    const evidenceKeys = listFromInput(draft.evidenceKeys);
+    return evidenceKeys.length > 0 ? { version: 1, mode: "ci-less", evidence_keys: evidenceKeys } : undefined;
+  }
+  if (draft.mode === "github-checks") {
+    const required = listFromInput(draft.requiredChecks);
+    const advisory = listFromInput(draft.advisoryChecks);
+    const grace = Number(draft.registrationGraceSeconds);
+    const retryBudget = Number(draft.sameShaRetryBudget);
+    return required.length > 0 && Number.isSafeInteger(grace) && grace >= 0 && Number.isSafeInteger(retryBudget) && retryBudget >= 0
+      ? {
+        version: 1,
+        mode: "github-checks",
+        registration_grace_seconds: grace,
+        same_sha_retry_budget: retryBudget,
+        checks: [
+          ...required.map((name) => ({ name, required: true, kind: draft.checkKind })),
+          ...advisory.map((name) => ({ name, required: false, kind: draft.checkKind })),
+        ],
+      }
+      : undefined;
+  }
+  return undefined;
+}
+
+function requestRepositories(drafts: V2RepositoryDraft[]): V2Repository[] {
+  return drafts.map((draft) => {
+    // Rebuild the exact policy payload from visible draft fields. Retaining a
+    // prior persisted ci_policy here would let a cleared/edited form submit a
+    // stale topology field through the explicit transaction.
+    const repository = {
+      key: draft.key,
+      repo: draft.repo,
+      working_dir: draft.working_dir,
+      primary: draft.primary,
+    };
+    const ciPolicy = policyFromDraft(draft.policy);
+    return ciPolicy ? { ...repository, ci_policy: ciPolicy } : repository;
+  });
+}
+
+function v2Message(result: V2SetupResult): string {
+  const code = result.reasons?.[0]?.code || result.code || "setup_request_failed";
+  const labels: Record<string, string> = {
+    legacy_scalar: "Replace the legacy repository record through this V2 setup flow.",
+    repositories_required: "Add at least one repository.",
+    missing_policy: "Choose and complete a CI evidence policy for every repository.",
+    invalid_ci_policy: "Complete the selected CI evidence policy with valid values.",
+    invalid_primary_repository_count: "Select exactly one primary repository.",
+    repository_push_access_required: "GitHub write, maintain, or admin access is required.",
+    repository_identity_mismatch: "GitHub returned a different canonical repository identity.",
+    active_session: "Stop the active role session before changing repository topology.",
+    project_not_quiesced: "Quiesce this project before changing repository topology.",
+    first_activation_legacy_project_blocked: "Quiesce the identified legacy project, then retry the first V2 activation.",
+    operator_confirmation_required: "Confirm final V2 activation before continuing.",
+  };
+  return labels[code] || `V2 setup needs attention [${code}].`;
 }
 
 interface Config {
@@ -44,13 +197,6 @@ interface Config {
   operator_name?: string;
   projects: ProjectConfig[];
 }
-
-const DEFAULT_AGENTS: Record<string, AgentConfig> = {
-  head: { display_name: "Head", command: "claude", cwd: "", model: "opus", agents_md: "" },
-  re1: { display_name: "RE1", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
-  re2: { display_name: "RE2", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
-  dev: { display_name: "Dev", command: "claude", cwd: "", model: "sonnet", agents_md: "" },
-};
 
 const BACKENDS: { value: string; label: string }[] = [
   { value: "claude", label: "Claude Code" },
@@ -270,6 +416,7 @@ function Select({ label, value, onChange, options }: {
 export default function SettingsPage() {
   const { locale, setLocale } = useLocale();
   const t = COPY[locale];
+  const router = useRouter();
   const searchParams = useSearchParams();
   const [config, setConfig] = useState<Config | null>(null);
   // #973: distinguish "still loading" from "load failed" so a failed
@@ -350,7 +497,9 @@ export default function SettingsPage() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [projectLifecyclePending, setProjectLifecyclePending] = useState<Record<string, "archive" | "restore" | "remove">>({});
   const [projectLifecycleErrors, setProjectLifecycleErrors] = useState<Record<string, string>>({});
-  const [autoAdded, setAutoAdded] = useState(false);
+  const [v2Drafts, setV2Drafts] = useState<Record<string, V2RepositoryDraft[]>>({});
+  const [v2Flows, setV2Flows] = useState<Record<string, V2Flow>>({});
+  const [v2ActivationConfirmations, setV2ActivationConfirmations] = useState<Record<string, boolean>>({});
   // #1023: was {claude, codex} — gemini was already missing and grok would have
   // been too, so every `cliStatus[b.value]` lookup below leaned on a cast.
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean; grok: boolean } | null>(null);
@@ -360,7 +509,7 @@ export default function SettingsPage() {
   // Kept in sync with config.port on load + blur commit.
   const [portDraft, setPortDraft] = useState<string>("8400");
 
-  const load = useCallback(() => {
+  const load = useCallback((options?: { preserveV2Flow?: boolean }) => {
     setLoadError(false);
     fetch("/api/config")
       .then((r) => {
@@ -376,6 +525,12 @@ export default function SettingsPage() {
           operator_name: data.operator_name || "user",
           projects: data.projects || [],
         };
+        setV2Drafts(Object.fromEntries(cfg.projects.map((project: ProjectConfig) => [
+          project.id,
+          repositoryDraftFromConfig(project.repositories),
+        ])));
+        if (!options?.preserveV2Flow) setV2Flows({});
+        setV2ActivationConfirmations({});
         savedConfigRef.current = JSON.stringify(cfg);
         return setConfig(cfg);
       })
@@ -511,13 +666,14 @@ export default function SettingsPage() {
     }
   };
 
-  // Auto-add project when navigated with ?add=true
+  // Project topology is created only through the explicit V2 setup route;
+  // preserve old deep links by taking the operator to that route instead of
+  // creating a generic PATCH-able scalar project here.
   useEffect(() => {
-    if (config && searchParams.get("add") === "true" && !autoAdded) {
-      setAutoAdded(true);
-      addProject();
+    if (searchParams.get("add") === "true") {
+      router.replace("/setup");
     }
-  }, [config, searchParams, autoAdded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [router, searchParams]);
 
   useEffect(() => {
     if (!config) return;
@@ -540,8 +696,7 @@ export default function SettingsPage() {
       // before persisting. This is the catch-all the AC requires ("Saving
       // persists a model valid for that agent's CLI") — it heals a model left
       // invalid by the old hardcoded dropdown (e.g. a codex agent saved with
-      // "sonnet") and also covers a new project seeded from DEFAULT_AGENTS with
-      // a non-Claude default command. sanitizeModel keeps "" (CLI default) as-is.
+      // "sonnet"). sanitizeModel keeps "" (CLI default) as-is.
       // #937: reconcile mcp_inject the same way. Every agent carries one (the
       // wizard writes it and the spawn path reads it), so always re-derive it
       // from the command — this heals a stale "flag" left on an agent converted
@@ -564,19 +719,18 @@ export default function SettingsPage() {
       // the sections Settings owns — strip the field-scoped-owned keys so the
       // payload can never carry a stale flag/pin the server owns via its own
       // endpoints. The server merges into the freshest config under updateConfig.
-      const FLAG_KEYS = [
-        "idle", "awake_auto", "trigger_auto", "telegram_auto", "discord_auto",
-        "bridge_filter_agents_only", "auto_continue_loop_guard", "auto_continue_delay_sec",
-      ];
       const patchBody: Record<string, unknown> = { ...normalizedConfig };
       for (const k of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token"]) {
         delete patchBody[k];
       }
-      patchBody.projects = normalizedConfig.projects.map((p) => {
-        const clean: Record<string, unknown> = { ...p };
-        for (const k of FLAG_KEYS) delete clean[k];
-        return clean;
-      });
+      patchBody.projects = normalizedConfig.projects.map((project) => ({
+        // Settings owns only project metadata and agent configuration. An
+        // allowlist, rather than stripping scalar fields after a spread,
+        // guarantees the generic PATCH can never carry repository topology.
+        id: project.id,
+        name: project.name,
+        agents: project.agents,
+      }));
       const res = await fetch("/api/config", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -615,37 +769,87 @@ export default function SettingsPage() {
   };
 
 
-  const addProject = () => {
-    if (!config) return;
-    const id = `project-${Date.now()}`;
-    // #212: honor the saved Default agent CLI setting first. Fall
-    // back to CLI-status-aware availability only when the configured
-    // backend isn't actually installed (so we never seed a project
-    // with a CLI the user can't run).
-    const configured = config.default_backend || "claude";
-    const configuredAvailable = !cliStatus || (cliStatus[configured as keyof typeof cliStatus] !== false);
-    // #1023: fall back to the first INSTALLED backend rather than a hardcoded
-    // claude/codex chain, which could only ever answer "claude" or "codex" — so
-    // a grok-only machine seeded the uninstalled claude, and so did a
-    // gemini-only one (the same pre-existing bug, fixed deliberately; see the
-    // ticket's operator ruling). A loop over the BACKENDS rows already rendered
-    // above, not a backend registry.
-    const defaultCmd = configuredAvailable
-      ? configured
-      : (cliStatus && BACKENDS.find((b) => cliStatus[b.value as keyof typeof cliStatus])?.value) || "claude";
-    const agents: Record<string, AgentConfig> = {};
-    for (const [key, val] of Object.entries(DEFAULT_AGENTS)) {
-      agents[key] = { ...val, command: defaultCmd };
+  const updateV2Repository = (projectId: string, repositoryIndex: number, updates: Partial<V2RepositoryDraft>) => {
+    setV2Drafts((previous) => {
+      const entries = [...(previous[projectId] || [blankRepository()])];
+      entries[repositoryIndex] = { ...entries[repositoryIndex], ...updates };
+      return { ...previous, [projectId]: entries };
+    });
+    setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "idle" } }));
+  };
+
+  const updateV2Policy = (projectId: string, repositoryIndex: number, updates: Partial<CiPolicyDraft>) => {
+    setV2Drafts((previous) => {
+      const entries = [...(previous[projectId] || [blankRepository()])];
+      const current = entries[repositoryIndex] || blankRepository();
+      entries[repositoryIndex] = { ...current, policy: { ...current.policy, ...updates } };
+      return { ...previous, [projectId]: entries };
+    });
+    setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "idle" } }));
+  };
+
+  const addV2Repository = (projectId: string) => {
+    setV2Drafts((previous) => {
+      const entries = previous[projectId] || [blankRepository()];
+      const nextKey = `repo-${entries.length + 1}`;
+      return { ...previous, [projectId]: [...entries, blankRepository(nextKey, false)] };
+    });
+    setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "idle" } }));
+  };
+
+  const removeV2Repository = (projectId: string, repositoryIndex: number) => {
+    setV2Drafts((previous) => {
+      const entries = (previous[projectId] || [blankRepository()]).filter((_, index) => index !== repositoryIndex);
+      return { ...previous, [projectId]: entries.length > 0 ? entries : [blankRepository()] };
+    });
+    setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "idle" } }));
+  };
+
+  const setPrimaryV2Repository = (projectId: string, repositoryIndex: number) => {
+    setV2Drafts((previous) => ({
+      ...previous,
+      [projectId]: (previous[projectId] || [blankRepository()]).map((repository, index) => ({ ...repository, primary: index === repositoryIndex })),
+    }));
+    setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "idle" } }));
+  };
+
+  const runV2Flow = async (project: ProjectConfig, step: "verify-repositories" | "provision-repositories" | "activate-v2") => {
+    const projectId = project.id;
+    const drafts = v2Drafts[projectId] || [blankRepository()];
+    const phase = step === "verify-repositories" ? "verifying" : step === "provision-repositories" ? "provisioning" : "activating";
+    setV2Flows((previous) => ({ ...previous, [projectId]: { phase } }));
+    try {
+      const response = await fetch(`/api/setup?step=${step}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: project.id,
+          name: project.name,
+          repositories: requestRepositories(drafts),
+          ...(step === "activate-v2" ? { confirm: true } : {}),
+        }),
+      });
+      const result = await response.json() as V2SetupResult;
+      if (!result.ok) {
+        setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "error", message: v2Message(result), result } }));
+        return;
+      }
+      const nextPhase = step === "verify-repositories" ? "verified" : step === "provision-repositories" ? "provisioned" : "activated";
+      setV2Flows((previous) => ({ ...previous, [projectId]: { phase: nextPhase, result } }));
+      if (step === "activate-v2") {
+        setConfig((previous) => previous ? {
+          ...previous,
+          projects: previous.projects.map((entry) => entry.id === projectId
+            ? { ...entry, repositories: requestRepositories(drafts) }
+            : entry),
+        } : previous);
+        // Reload the authoritative committed array-only configuration without
+        // discarding the activation receipt currently visible to the operator.
+        load({ preserveV2Flow: true });
+      }
+    } catch {
+      setV2Flows((previous) => ({ ...previous, [projectId]: { phase: "error", message: "V2 setup request failed [network_error]." } }));
     }
-    const newProject: ProjectConfig = {
-      id,
-      name: t.newProject,
-      repo: "owner/repo",
-      working_dir: "",
-      agents,
-    };
-    setConfig({ ...config, projects: [...config.projects, newProject] });
-    setExpanded({ ...expanded, [id]: true });
   };
 
   // Track original names for debounced rename propagation
@@ -831,7 +1035,7 @@ export default function SettingsPage() {
           {t.loadError}
         </div>
         <button
-          onClick={load}
+          onClick={() => load()}
           className="px-3 py-1.5 text-[12px] border border-border text-text-muted hover:text-text hover:border-accent transition-colors"
         >
           {t.retry}
@@ -1053,12 +1257,16 @@ export default function SettingsPage() {
         {config.projects.filter((p) => !p.archived).map((project) => {
           const idx = config.projects.indexOf(project);
           const lifecyclePending = projectLifecyclePending[project.id];
+          const repositoryDrafts = v2Drafts[project.id] || [blankRepository()];
+          const v2Flow = v2Flows[project.id] || { phase: "idle" as const };
+          const isV2Configured = Array.isArray(project.repositories) && project.repositories.length > 0;
+          const activationConfirmed = v2ActivationConfirmations[project.id] === true;
 
           return (
-            <div key={project.id} className="border border-border mb-3">
+            <div key={project.id} id={`project-${project.id}`} className="border border-border mb-3 scroll-mt-4">
               {/* Header — #212: no accordion, body always visible */}
               <div className="flex items-center justify-between px-3 py-2">
-                <span className="text-[12px] text-text font-semibold">{project.name}</span>
+                <span className="min-w-0 truncate text-[12px] text-text font-semibold" title={project.name}>{project.name}</span>
                 {/* #814: per-project Active/Inactive status + switch (same source
                     of truth + confirmation as the sidebar). */}
                 <div className="flex items-center gap-2">
@@ -1070,26 +1278,134 @@ export default function SettingsPage() {
               </div>
 
               {(
-                <div className="px-3 pb-3 border-t border-border">
+                  <div className="px-3 pb-3 border-t border-border">
                   {/* Basic project info */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
                     <Input
                       label={t.projectName}
                       value={project.name}
                       onChange={(v) => renameProject(idx, v)}
                     />
-                    <Input
-                      label={t.githubRepo}
-                      value={project.repo}
-                      onChange={(v) => updateProject(idx, { repo: v })}
-                      placeholder="owner/repo"
-                    />
-                    <Input
-                      label={t.workingDirectory}
-                      value={project.working_dir || ""}
-                      onChange={(v) => updateProject(idx, { working_dir: v })}
-                      placeholder="/path/to/project"
-                    />
+                  </div>
+
+                  <div className="mt-4 border border-border bg-bg-surface p-3" aria-describedby={`v2-repository-help-${project.id}`}>
+                    <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
+                      <div className="min-w-0">
+                        <h3 className="text-[10px] text-text-muted uppercase tracking-wider">V2 repository setup</h3>
+                        <p id={`v2-repository-help-${project.id}`} className="mt-1 text-[10px] text-text-muted leading-snug">
+                          {isV2Configured || v2Flow.phase === "activated"
+                            ? "Repository topology is managed through this explicit V2 flow, not the generic Settings save."
+                            : "This legacy project needs an explicit repository topology and CI policy before V2 activation."}
+                        </p>
+                      </div>
+                      <span className={`shrink-0 text-[10px] ${isV2Configured || v2Flow.phase === "activated" ? "text-accent" : "text-[#ffcc00]"}`}>
+                        {isV2Configured || v2Flow.phase === "activated" ? "V2 configured" : "V2 setup required"}
+                      </span>
+                    </div>
+
+                    <div className="mt-3 space-y-3">
+                      {repositoryDrafts.map((repository, repositoryIndex) => (
+                        <div key={`${project.id}-${repositoryIndex}`} className="border border-border p-3 min-w-0">
+                          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3">
+                            <span className="text-[11px] text-text font-semibold">Repository {repositoryIndex + 1}</span>
+                            <div className="flex items-center gap-3">
+                              <label className="flex items-center gap-1.5 text-[10px] text-text-muted cursor-pointer">
+                                <input type="radio" name={`primary-repository-${project.id}`} checked={repository.primary} onChange={() => setPrimaryV2Repository(project.id, repositoryIndex)} className="accent-accent" />
+                                Primary
+                              </label>
+                              {repositoryDrafts.length > 1 && (
+                                <button type="button" onClick={() => removeV2Repository(project.id, repositoryIndex)} className="text-[10px] text-error hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent transition-colors">Remove</button>
+                              )}
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                            <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`repo-key-${project.id}-${repositoryIndex}`}>Repository key
+                              <input id={`repo-key-${project.id}-${repositoryIndex}`} value={repository.key} onChange={(e) => updateV2Repository(project.id, repositoryIndex, { key: e.target.value })} placeholder="primary" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                            </label>
+                            <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`repo-name-${project.id}-${repositoryIndex}`}>Canonical GitHub repository
+                              <input id={`repo-name-${project.id}-${repositoryIndex}`} value={repository.repo} onChange={(e) => updateV2Repository(project.id, repositoryIndex, { repo: e.target.value })} placeholder="owner/repo" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                            </label>
+                            <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`repo-base-${project.id}-${repositoryIndex}`}>Verified base clone
+                              <input id={`repo-base-${project.id}-${repositoryIndex}`} value={repository.working_dir} onChange={(e) => updateV2Repository(project.id, repositoryIndex, { working_dir: e.target.value })} placeholder="/absolute/path/to/repository" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text font-mono outline-none focus:border-accent" />
+                            </label>
+                          </div>
+                          <div className="border-t border-border mt-3 pt-3">
+                            <label className="text-[10px] text-text-muted block mb-1" htmlFor={`policy-mode-${project.id}-${repositoryIndex}`}>CI evidence policy</label>
+                            <select id={`policy-mode-${project.id}-${repositoryIndex}`} value={repository.policy.mode} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { mode: e.target.value as CiPolicyMode })} className="w-full md:w-72 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent">
+                              <option value="" className="bg-bg-surface">Choose evidence policy…</option>
+                              <option value="github-checks" className="bg-bg-surface">GitHub exact check registry</option>
+                              <option value="ci-less" className="bg-bg-surface">CI-less Dev evidence receipt</option>
+                            </select>
+                            {repository.policy.mode === "github-checks" && (
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
+                                <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`required-checks-${project.id}-${repositoryIndex}`}>Required exact check names
+                                  <input id={`required-checks-${project.id}-${repositoryIndex}`} value={repository.policy.requiredChecks} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { requiredChecks: e.target.value })} placeholder="unit, typecheck" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                                </label>
+                                <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`advisory-checks-${project.id}-${repositoryIndex}`}>Advisory exact check names
+                                  <input id={`advisory-checks-${project.id}-${repositoryIndex}`} value={repository.policy.advisoryChecks} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { advisoryChecks: e.target.value })} placeholder="coverage" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                                </label>
+                                <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`check-kind-${project.id}-${repositoryIndex}`}>Required check ownership
+                                  <select id={`check-kind-${project.id}-${repositoryIndex}`} value={repository.policy.checkKind} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { checkKind: e.target.value as "product" | "control-plane" })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent">
+                                    <option value="product" className="bg-bg-surface">Product</option>
+                                    <option value="control-plane" className="bg-bg-surface">Control plane</option>
+                                  </select>
+                                </label>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`grace-${project.id}-${repositoryIndex}`}>Registration grace
+                                    <input id={`grace-${project.id}-${repositoryIndex}`} inputMode="numeric" value={repository.policy.registrationGraceSeconds} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { registrationGraceSeconds: e.target.value })} className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                                  </label>
+                                  <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`retry-${project.id}-${repositoryIndex}`}>Same-SHA retry budget
+                                    <input id={`retry-${project.id}-${repositoryIndex}`} inputMode="numeric" value={repository.policy.sameShaRetryBudget} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { sameShaRetryBudget: e.target.value })} className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                                  </label>
+                                </div>
+                              </div>
+                            )}
+                            {repository.policy.mode === "ci-less" && (
+                              <div className="mt-2 max-w-md">
+                                <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`evidence-keys-${project.id}-${repositoryIndex}`}>Required Dev evidence keys
+                                  <input id={`evidence-keys-${project.id}-${repositoryIndex}`} value={repository.policy.evidenceKeys} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { evidenceKeys: e.target.value })} placeholder="unit, typecheck" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                                </label>
+                                <p className="mt-1 text-[10px] text-text-muted">Comma-separated data identifiers; evidence is not a command.</p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <button type="button" onClick={() => addV2Repository(project.id)} className="mt-3 px-2 py-1 text-[10px] border border-border text-text-muted hover:text-text hover:border-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent transition-colors">Add repository</button>
+
+                    <div className="mt-3 border-t border-border pt-3 flex flex-col sm:flex-row sm:items-center gap-2">
+                      <button type="button" onClick={() => runV2Flow(project, "verify-repositories")} disabled={["verifying", "provisioning", "activating"].includes(v2Flow.phase)} className="px-3 py-1.5 text-[11px] font-semibold border border-border text-text hover:border-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 transition-colors">
+                        {v2Flow.phase === "verifying" ? "Verifying V2 access…" : v2Flow.phase === "verified" ? "V2 access verified" : "Verify V2 repository access"}
+                      </button>
+                      <button type="button" onClick={() => runV2Flow(project, "provision-repositories")} disabled={v2Flow.phase !== "verified"} className="px-3 py-1.5 text-[11px] font-semibold bg-accent text-bg hover:bg-accent-dim focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 transition-colors">
+                        {v2Flow.phase === "provisioning" ? "Provisioning V2 worktrees…" : v2Flow.phase === "provisioned" ? "V2 worktrees provisioned" : "Provision four role worktrees"}
+                      </button>
+                    </div>
+                    <label className="mt-3 flex items-start gap-2 cursor-pointer">
+                      <input type="checkbox" checked={activationConfirmed} onChange={(e) => setV2ActivationConfirmations((previous) => ({ ...previous, [project.id]: e.target.checked }))} className="mt-0.5 accent-accent" />
+                      <span className="text-[10px] text-text-muted">I confirm this topology is correct and the project is quiesced. Activate V2 without starting agents.</span>
+                    </label>
+                    <button type="button" onClick={() => runV2Flow(project, "activate-v2")} disabled={v2Flow.phase !== "provisioned" || !activationConfirmed} className="mt-2 px-3 py-1.5 text-[11px] font-semibold border border-accent text-accent hover:bg-accent hover:text-bg focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 transition-colors">
+                      {v2Flow.phase === "activating" ? "Activating V2…" : v2Flow.phase === "activated" ? "V2 activated" : "Confirm and activate V2"}
+                    </button>
+                    {(v2Flow.message || v2Flow.phase === "activated") && (
+                      <p role={v2Flow.message ? "alert" : "status"} aria-live="polite" className={`mt-3 text-[10px] ${v2Flow.message ? "text-error" : "text-accent"}`}>
+                        {v2Flow.message || "V2 configuration activated. No agent was started or restarted."}
+                      </p>
+                    )}
+                    {v2Flow.result?.repositories && (
+                      <div className="mt-3 border-t border-border pt-3 space-y-2">
+                        <p className="text-[10px] uppercase tracking-wider text-text-muted">Verified repository topology</p>
+                        {v2Flow.result.repositories.map((repository) => (
+                          <div key={repository.key || repository.repo} className="min-w-0 text-[10px]">
+                            <p className="truncate text-text" title={repository.repo}>{repository.repo || repository.key}</p>
+                            <p className="truncate text-text-muted font-mono" title={repository.base_clone}>{repository.base_clone || "Base clone pending"}{repository.default_branch ? ` · ${repository.default_branch}` : ""}</p>
+                            <p className="mt-0.5 text-text-muted">Roles: {V2_ROLES.map((role) => repository.worktrees?.[role] ? role.toUpperCase() : `${role.toUpperCase()} pending`).join(" · ")}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   {/* Agents table */}
@@ -1266,12 +1582,13 @@ export default function SettingsPage() {
           );
         })}
 
-        {/* Add project */}
+        {/* New repository topology is always created in the explicit V2 flow. */}
         <button
-          onClick={addProject}
+          type="button"
+          onClick={() => router.push("/setup")}
           className="w-full border border-dashed border-border py-2 text-[12px] text-text-muted hover:text-text hover:border-text-muted transition-colors"
         >
-          {t.addProject}
+          {t.addProject} (V2 setup)
         </button>
 
         {/* Archived projects */}

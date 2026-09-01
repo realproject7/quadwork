@@ -1394,8 +1394,9 @@ function runSelfFixtures() {
   runDiscoveryFixture();
 }
 
-// Pre-activation ownership ledger.  #1030/#1031/#1032/#1053 remove their
-// entries as they migrate consumers; the activated V2 target is an empty map.
+// Pre-activation ownership ledger. #1032 has moved Settings and Home to
+// repository-array records, so no dashboard scalar compatibility consumer
+// remains; the activated V2 target is an empty map.
 const EXPECTED_PRE_ACTIVATION_LEDGER = Object.freeze({
   "bin/quadwork.js :: owner=cmdCleanup :: call=cmdCleanup :: binding=config.projects[idx] :: repo:property :: at=b5ee77fe2c04#226:log(` Config entry: ${projectId} (${config.projects[idx]": 1,
   "bin/quadwork.js :: owner=cmdDoctor :: call=cmdDoctor :: binding=p :: working_dir:property :: at=ab866067533d#109:console.log(` project:${p.id || \"(unnamed)\"} chat_mode=$": 1,
@@ -1404,9 +1405,6 @@ const EXPECTED_PRE_ACTIVATION_LEDGER = Object.freeze({
   "server/index.js :: owner=runStartupMigrations :: call=runStartupMigrations :: binding=p :: working_dir:property :: at=76de06f21223#273:if (!p.working_dir) continue;": 1,
   "server/index.js :: owner=runStartupMigrations :: call=runStartupMigrations :: binding=p :: working_dir:property :: at=7da5876fe50f#285:const dirName = path.basename(p.working_dir);": 1,
   "server/routes.js :: owner=post(\"/api/rename\")#arg1 :: call=post(\"/api/rename\")#arg1 :: binding=project :: working_dir:property :: at=204b9f7500f3#77:const workDir = project.working_dir || \"\";": 1,
-  "src/components/HomeDashboard.tsx :: owner=HomeDashboard :: call=HomeDashboard > map()#arg0 :: binding=project :: repo:property :: at=ee51ba45cecd#226:return ( <div className=\"h-full overflow-y-auto lg:overf": 1,
-  "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: repo:property :: at=2d0f4b9880bd#202:return ( <div key={project.id} className=\"border border-": 1,
-  "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: working_dir:property :: at=2d0f4b9880bd#236:return ( <div key={project.id} className=\"border border-": 1,
 });
 
 function runProductionScan() {
@@ -1421,11 +1419,8 @@ function runProductionScan() {
     const key = `${violation.file}:${violation.field}`;
     dashboardScalarReads[key] = (dashboardScalarReads[key] || 0) + 1;
   }
-  assert.deepEqual(dashboardScalarReads, {
-    "src/components/HomeDashboard.tsx:repo": 1,
-    "src/components/SettingsPage.tsx:repo": 1,
-    "src/components/SettingsPage.tsx:working_dir": 1,
-  }, "Home/Settings have no additional persisted scalar project consumers");
+  assert.deepEqual(dashboardScalarReads, {},
+    "Home/Settings render only repository-array records, never persisted scalar compatibility fields");
   assert.deepEqual(
     actualLedger,
     EXPECTED_PRE_ACTIVATION_LEDGER,
