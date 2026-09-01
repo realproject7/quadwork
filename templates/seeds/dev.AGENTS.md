@@ -236,9 +236,11 @@ for a newer qualified assignment and the current queue.
 9. Push branch: `git push -u origin task/<issue>-<slug>`
 10. Open PR: `gh pr create --title "[#<issue>] ..." --body-file <file>` using the **PR Body Template** above (all required sections filled)
     - **The `[#<issue>]` prefix in the PR _title_ is REQUIRED, not optional.** QuadWork's batch/progress tracking links a PR to its ticket by this title prefix. A PR whose title omits `[#<issue>]` (even with `Fixes #<issue>`/`Closes #<issue>` in the body) will NOT be tracked — the batch item shows as stuck/flapping `queued (retrying)` and wastes GitHub API budget re-checking it. Always start the title with `[#<issue>]`.
-11. Keep incomplete PRs draft. Once GitHub shows the final non-draft exact SHA, do not fan reviewers manually: the server-owned #1048 exact-SHA cycle dispatches and records review requests. Dev/Head/chat prose cannot substitute for that record.
+11. Route implementation review according to the server-advertised capability:
+    - Before #1048 implementation-review dispatch is advertised, preserve the installed V1 route: send one legacy request mentioning `@re1 @re2` together with the current qualified assignment identity, PR URL, and exact SHA. Head must not duplicate it.
+    - After the server advertises #1048 support, do not fan reviewers manually; request/await only the server's exact-SHA dispatch.
 12. Address review feedback, push fixes
-13. A new exact SHA creates a fresh server-owned review cycle; await its canonical request rather than re-fanning reviewers.
+13. Route re-review through the same active compatibility path at the new exact SHA.
 14. Wait for both reviewers at that SHA, then send qualified `[STATUS DONE]` to `@head` with PR/SHA/verdict/test evidence and `next=merge_gate`. Send `[STATUS WAITING]` or `[STATUS BLOCKED]` instead when that is the observed state.
 
 ## Review-only batches
@@ -262,7 +264,7 @@ ignore it unless Head issues a separate qualified implementation assignment.
 ## Communication
 - **ALL messages MUST be sent via `chat_send` MCP tool** — terminal output is invisible, printing text is NOT communicating
 - **ALWAYS @mention the next agent** — never @user or @human
-- Implementation review routing is server-owned; never use `[ASSIGN REVIEW-BATCH]` (that remains review-only).
+- Implementation review routing follows the feature-gated V1/server rule in Workflow; never use `[ASSIGN REVIEW-BATCH]`.
 - Always include issue/PR numbers in messages
 - End every active assignment turn with qualified DONE, WAITING, or BLOCKED status to @head, including evidence and next/owner.
 - **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.

@@ -1,6 +1,5 @@
-// #1033/#1048: shipped Head/worker seeds must agree on PO authority, review
-// routing, terminal status, and the atomic implementation-review cutover.
-// Plain node:assert.
+// #1033: shipped Head/worker seeds must agree on PO authority, review routing,
+// terminal status, and feature-gated compatibility. Plain node:assert.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -38,18 +37,10 @@ assert.ok(!dev.includes("you are the **review driver**"));
 assert.ok(reviewDocs.includes("Head-driven, review-only"));
 assert.ok(reviewDocs.includes("Dev has no review-driver"));
 
-for (const text of [dev, playbook, reviewDocs]) {
+for (const text of [dev, re1, re2, head, playbook, reviewDocs]) {
   assert.ok(text.includes("#1048"), "implementation route cutover is explicitly feature-gated");
+  assert.match(text, /installed V1|V1 route|V1 fanout/i, "pre-#1048 compatibility remains documented");
 }
-assert.match(dev, /implementation review routing is server-owned/i,
-  "Dev documents that it no longer owns implementation-review fanout");
-for (const [name, text] of [["head", head], ["re1", re1], ["re2", re2], ["playbook", playbook]]) {
-  assert.match(text, /server(?:'s|-originated|[- ]owned).*\[REVIEW REQUEST\]|\[REVIEW REQUEST\].*server/i,
-    `${name} documents the post-#1048 server-owned exact-SHA review route`);
-}
-assert.doesNotMatch([head, dev, re1, re2, playbook].join("\n"),
-  /\[ASSIGN REVIEW\](?!-BATCH)/,
-  "post-#1048 implementation seeds contain no legacy free-form review fanout");
 assert.match(playbook, /\*\*Playbook version:\*\*\s+\d+\.\d+\.\d+/);
 for (const phase of ["Intake and proposal", "EPIC and ticket founding", "Ticket-review phase", "PR gate and merge", "Release and operator gates", "Terminal handoff"]) {
   assert.ok(playbook.includes(phase), `playbook includes ${phase}`);

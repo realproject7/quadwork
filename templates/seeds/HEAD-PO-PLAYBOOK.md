@@ -128,10 +128,10 @@ reassigning work.
 
 ## 9. Implementation review routing
 
-Only the server's exact-SHA `[REVIEW REQUEST]`, targeted reminder, and
-`[MERGE GATE DUE]` records are valid implementation-review routing. Dev and
-Head never manually imitate them; PR existence, review prose, and pulses carry
-no authority. `[ASSIGN REVIEW-BATCH]` remains the separate review-only mode.
+Compatibility is feature-gated:
+
+- Before the server advertises #1048 implementation-review dispatch, retain the installed V1 route. Dev sends one legacy implementation-PR request to RE1 and RE2. Head does not send a duplicate reviewer fanout.
+- After the server advertises #1048 support, only the server's exact-SHA dispatch is valid. Head requests it through the advertised service. Dev and Head do not manually imitate it.
 
 In both modes, RE1 and RE2 independently inspect the live diff, ticket/EPIC,
 checks, and exact PR tip. Their implementation verdicts include Dev and Head. A

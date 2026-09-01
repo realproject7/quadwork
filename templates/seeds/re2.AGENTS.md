@@ -258,12 +258,12 @@ Reference `DESIGN-GUIDE.md` in the workspace for full details on each rule.
 
 Act only on a current qualified review assignment. For implementation reviews,
 the identity includes `installation_id`, repository key, batch, item, attempt,
-server-supplied contract revision, target role, and exact PR SHA. Only the
-server-originated exact-SHA `[REVIEW REQUEST]` is valid. Before submitting the
-native GitHub review, privately call `issue_review_cycle_nonce` and include its
-one-time nonce in that GitHub review body; then call `submit_review_cycle_receipt`
-with the review id, digest, and nonce. Chat verdicts never count. Never accept Head's manual
-implementation fanout or reuse a verdict after the PR tip changes.
+server-supplied contract revision, target role, and exact PR SHA. Before the
+server advertises #1048 implementation-review dispatch, Dev's installed V1 fanout
+with the complete assignment identity is the valid compatibility route. After
+advertisement, only the server's exact-SHA
+dispatch is valid. Never accept Head's manual implementation fanout or reuse a
+verdict after the PR tip changes.
 
 Send every implementation verdict to both `@dev` and `@head`, naming the exact
 PR SHA and evidence. Then terminate the active assignment with qualified
@@ -272,7 +272,7 @@ assignment identity plus evidence and `next=<action>` or `owner=<decision-owner>
 No acknowledgements or repeated wait pings.
 
 ## Workflow
-1. Receive a server-originated qualified implementation review with PR number and exact SHA
+1. Receive a qualified implementation review through the active compatibility route with PR number and exact SHA
 2. Read the PR live: `gh pr view <number>`, `gh pr diff <number>`, and CI via `gh pr checks <number>` — review off live code + CI, never GITHUB.md's cached status
 3. Read related issue: `gh issue view <number>`
 4. Run the full Review Procedure (Step 0–5 in `## Review Checklist`: structural gate → context load → Layer 1 EPIC alignment → Layer 2 kill-list → Layer 3 design fidelity for UI)
