@@ -457,6 +457,9 @@ function deriveTransition(pipeline, event) {
       if (!slot.candidate || !new Set(["candidate_ready", "independent_review", "reconcile", "changes_requested", "accepted", "staged"]).has(slot.state)) {
         fail("invalid_work_task_pipeline_state", "candidate replacement is not valid in this state");
       }
+      if (slot.candidate.base_sha !== event.candidate.base_sha) {
+        fail("work_task_candidate_base_mismatch", "replacement candidate base is not the existing task base");
+      }
       if (slot.candidate.candidate_digest === event.candidate.candidate_digest) fail("work_task_candidate_not_changed", "replacement candidate must be exact and new");
       const from = slot.state;
       slot.candidate = clone(event.candidate);

@@ -288,6 +288,10 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   work = apply(work, event("assign_independent_review", "direct_replace_review", {
     work_task_ref: copy(workRefs.core), review_round_id: "direct_replace_round", candidate_digest: first.candidate_digest,
   }));
+  const wrongBase = candidateFor(workRefs.core, "d", "f".repeat(64));
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("replace_candidate", "direct_replace_wrong_base", {
+    candidate: wrongBase,
+  })), "work_task_candidate_base_mismatch");
   work = apply(work, event("replace_candidate", "direct_replace_second", { candidate: second }));
   assert.equal(slot(work, workRefs.core).state, "candidate_ready");
   assert.equal(slot(work, workRefs.core).review_assignment, null);
