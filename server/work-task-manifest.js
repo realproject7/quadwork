@@ -303,4 +303,4 @@ function adaptLegacyFlatCodeBatch(input, options = {}) {
   return buildBatchManifest({ version: VERSION, installation_id: input.installation_id, project_id: input.project_id, delivery_mode: input.delivery_mode, tasks }, options);
 }
 
-module.exports = { VERSION, WorkTaskManifestError, assertWorkTaskRef: assertRef, workTaskKey, buildBatchManifest, freezeBatchManifest, assertManifestRegisteredCurrent, planManifestTransition, applyManifestTransition, adaptLegacyFlatCodeBatch };
+module.exports = { VERSION, WorkTaskManifestError, assertWorkTaskRef: assertRef, assertBatchManifest: assertManifest, workTaskKey, buildBatchManifest, freezeBatchManifest, assertManifestRegisteredCurrent, planManifestTransition, applyManifestTransition, adaptLegacyFlatCodeBatch };
