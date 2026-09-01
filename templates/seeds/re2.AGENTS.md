@@ -126,6 +126,8 @@ Operating stance:
 - `gh pr review --approve`, `gh pr review --request-changes`, `gh pr review --comment`
 - `gh issue view` (live, by number)
 - `gh issue list` — **fallback only**, when GITHUB.md is absent or stale (see GitHub State above)
+- `gh api --method GET` for an assigned ticket, its comments, and the assigned repository's `main` ref — only while validating a current `ticket-review` assignment
+- One explicitly gated `gh issue comment` for the current `ticket-review` assignment, exactly as defined in `### ticket-review batches` below
 - Read any file in the workspace
 
 ## GitHub Authentication
@@ -141,6 +143,8 @@ Run this once at the start of each session.
 - **NO `gh pr create`** — Dev creates PRs
 - **NO `gh pr merge`** — Head merges only
 - **NO branch creation** — Dev creates branches
+- For a `ticket-review` assignment, except for the one gated verdict comment below, **NO GitHub write**: do not use `gh issue edit`, `gh issue close`, `gh issue reopen`, `gh issue lock`, `gh issue transfer`, `gh pr create`, `gh pr merge`, or mutating `gh api` methods. The separately qualified #1048 implementation-review route is unchanged and is not authorized by this assignment.
+- **NO source-control write** — do not commit, push, create branches or tags, merge, rebase, or alter repository history.
 
 ## Review Checklist
 
@@ -298,14 +302,37 @@ verdict and terminal status to `@head`; Head owns durable edits and queue state.
 ### ticket-review batches
 When Head assigns `mode=ticket-review`, review the exact issue revision — no PR and no code diff.
 
-1. Read the ticket via REST `gh api repos/<repo>/issues/<n>` (and `.../issues/<n>/comments`).
+1. Verify that the record is current, server-authenticated, Head-qualified, and complete. Read the live issue contract by number for review evidence, but **never** reproduce, hash, or derive its revision locally and never treat a `gh` body read as revision authority.
 2. Review against the **required-points rubric**:
    - Scope clear and bounded?
    - Acceptance criteria concrete and testable?
    - Technically feasible against current `main`?
    - Dependencies / ordering correct?
    - Internally consistent (no contradictory sections)?
-3. Deliver `## Verdict: APPROVE`, `## Verdict: REQUEST CHANGES`, or `## Verdict: BLOCK` to @head with specific section/criterion evidence, then qualified terminal status. Head owns revisions and re-assignment; never continue on a changed body under the old revision.
+3. Immediately before any permitted comment, run the final write gate: call the existing project/agent-bound `issue_contract_revision` operation with only `repo_key` and `issue`. Require its current server-issued `contract_revision` to exactly equal the qualified assignment's `revision`, and require its canonical repository, issue, `ok`, and source status to match the assignment. A missing, ambiguous, changed, or failed result is stale: do not write a comment and send `BLOCK` to Head.
+4. In that same final write gate, read the live comments and the live `main` ref SHA for the assigned repository. Neither cached GitHub state nor a prior main SHA can satisfy this check. Use the server-issued `contract_revision` from step 3 in every marker, identity field, idempotency comparison, and read-back; never substitute a locally derived value.
+5. Before any write, search the live comments for this exact idempotency marker (substituting the complete assignment identity, the server-issued `contract_revision`, and your role):
+
+   ```text
+   <!-- quadwork-ticket-review-v1 installation_id=<id> repo=<repo-key> batch=<n> item=<owner/repo#n> attempt=<id> mode=ticket-review revision=<issue-body-sha256> reviewer=RE2 -->
+   ```
+
+   If exactly one matching comment already exists, do **not** call `gh issue comment`; use the live read-back against that server-issued revision as the idempotent result and report it to Head. If duplicate, conflicting, or unverifiable matching comments exist, do not mutate and report `BLOCK`.
+6. Only after steps 1–5 pass, make **at most one** `gh issue comment` call for this full assignment identity. Its body must contain this marker plus all required fields; no credential, raw ticket-body dump, or unrelated content:
+
+   ```markdown
+   <!-- quadwork-ticket-review-v1 installation_id=<id> repo=<repo-key> batch=<n> item=<owner/repo#n> attempt=<id> mode=ticket-review revision=<issue-body-sha256> reviewer=RE2 -->
+   ## QuadWork ticket-review verdict
+   - Role: RE2
+   - Identity: installation_id=<id>; repo=<repo-key>; batch=<n>; item=<owner/repo#n>; attempt=<id>; mode=ticket-review; revision=<issue-body-sha256>
+   - Verdict: APPROVE | REQUEST CHANGES | BLOCK
+   - Main SHA: <live-main-sha>
+   - Evidence: <up to five concise section/criterion findings>
+   ```
+
+7. Immediately re-read live comments against the server-issued revision from step 3. Proceed only if exactly one matching marker and complete body are observable; otherwise report `BLOCK` to Head. This comment is durable reviewer evidence only: it never changes queue state, accepts a ticket, edits the issue, or closes a review batch. Head remains the review-batch closer and sole owner of revisions, re-assignment, state changes, and closure.
+
+This is a bounded operational policy, not a server comment proxy and not a claim of credential-level enforcement. A `ticket-review` assignment does not authorize implementation-PR comments or reviews; #1048 implementation-PR routing remains unchanged.
 
 ### pr-review batches (merged PRs)
 When Head assigns `mode=pr-review`, the PR is **already merged into `main`** — assess the landed change at the assigned SHA; there is no merge gate.

@@ -133,6 +133,35 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
   assert.match(playbook, /\*\*Playbook version:\*\*\s+\d+\.\d+\.\d+/,
     "Head PO playbook carries a visible semantic version");
 
+  // #1051: the reviewer ticket-review comment policy lives in reseeded assets,
+  // so a packaged install must contain both reviewer contracts and the public
+  // review-batch guide rather than silently falling back to an older policy.
+  const ticketReviewPolicyAssets = [
+    "templates/seeds/re1.AGENTS.md",
+    "templates/seeds/re2.AGENTS.md",
+    "templates/seeds/HEAD-PO-PLAYBOOK.md",
+    "docs/review-batches.md",
+  ];
+  for (const asset of ticketReviewPolicyAssets) {
+    assert.ok(shipped.has(asset), `ticket-review policy asset ships: ${asset}`);
+  }
+  for (const reviewerSeed of ticketReviewPolicyAssets.slice(0, 2)) {
+    const policy = fs.readFileSync(path.join(ROOT, reviewerSeed), "utf8");
+    assert.match(policy, /quadwork-ticket-review-v1/,
+      `${reviewerSeed} carries the ticket-review idempotency marker`);
+    assert.match(policy, /issue_contract_revision/,
+      `${reviewerSeed} carries the server-issued revision gate`);
+    assert.match(policy, /never\*\* reproduce, hash, or derive its revision locally/,
+      `${reviewerSeed} does not locally derive the issue revision`);
+    assert.match(policy, /Head remains the review-batch closer/,
+      `${reviewerSeed} preserves Head-owned batch closure`);
+  }
+  assert.match(
+    fs.readFileSync(path.join(ROOT, "docs/review-batches.md"), "utf8"),
+    /comment exception is an operational reviewer policy/,
+    "shipped review-batch documentation explains the bounded comment policy",
+  );
+
   // Operator MCP tool modules (dynamically loaded, not literal-required).
   const toolsDir = path.join(ROOT, "server", "mcp-operator", "tools");
   const toolFiles = fs

@@ -48,9 +48,15 @@ not the implementation-review dispatcher.
 
 1. Head obtains the canonical issue revision through the server service and sends the authenticated review assignment.
 2. RE1 and RE2 independently read that exact issue body plus bounded current-code/dependency evidence.
-3. Each reviewer returns an evidence-bound APPROVE, REQUEST CHANGES, or BLOCK verdict to Head and terminates the assignment with qualified DONE or BLOCKED status.
-4. On REQUEST CHANGES, Head edits the issue, obtains a new revision, advances the attempt, and reassigns. Verdicts on the old revision expire.
-5. On two APPROVEs at the same revision, Head marks the item approved. Only Head creates any required follow-up ticket.
+3. Immediately before a permitted comment, each reviewer calls the existing project/agent-bound `issue_contract_revision` operation with only `repo_key` and `issue`, then requires its current server-issued `contract_revision`, canonical repository/issue, and successful source status to match the assignment. Reviewers read the live issue body for review evidence but never derive or hash its revision locally. A stale, missing, conflicting, or failed server-issued identity/revision is `BLOCK` and authorizes no write.
+4. For a current Head-qualified assignment only, each reviewer may make one `gh issue comment` call. After the server-issued revision read, the reviewer reads the live repository `main` SHA and scans live issue comments for that reviewer's complete assignment marker using that server-issued revision. The comment must carry the reviewer role, full assignment identity, APPROVE/REQUEST CHANGES/BLOCK verdict, bounded criterion evidence, and the live main SHA. Before posting, a matching marker makes the operation idempotent (no new comment); after posting, a live read-back against the same server-issued revision must show exactly one complete matching comment.
+5. A verdict comment is supplemental durable evidence, not an issue edit or acceptance. It cannot change queue state or close an item. Head verifies both current comments, then alone updates state, edits the issue, advances/reassigns attempts, accepts an item, creates follow-ups, and closes the batch.
+6. On REQUEST CHANGES, Head edits the issue, obtains a new revision, advances the attempt, and reassigns. Verdicts on the old revision expire.
+7. On two APPROVEs at the same revision, Head marks the item approved. Only Head creates any required follow-up ticket.
+
+The comment exception is an operational reviewer policy, not a server comment
+proxy or a claim of credential-level enforcement. It does not modify the #1048
+implementation-PR route; Head remains the review-batch closer.
 
 ## Merged-PR review loop
 

@@ -37,6 +37,64 @@ assert.ok(!dev.includes("you are the **review driver**"));
 assert.ok(reviewDocs.includes("Head-driven, review-only"));
 assert.ok(reviewDocs.includes("Dev has no review-driver"));
 
+// #1051: RE1 and RE2 have the same narrowly-scoped, idempotent ticket-review
+// comment policy. It is evidence only: Head still owns state transitions and
+// batch closure, and the policy must not be mistaken for a credential control.
+for (const [name, seed, role] of [["re1", re1, "RE1"], ["re2", re2, "RE2"]]) {
+  assert.ok(seed.includes("One explicitly gated `gh issue comment`"),
+    `${name} allows only the explicit ticket-review comment exception`);
+  assert.ok(seed.includes("server-authenticated, Head-qualified"),
+    `${name} requires a current Head-qualified assignment`);
+  assert.ok(seed.includes("issue_contract_revision"),
+    `${name} calls the project/agent-bound issue revision operation`);
+  assert.ok(seed.includes("current server-issued `contract_revision`"),
+    `${name} requires the current server-issued revision`);
+  assert.ok(seed.includes("only `repo_key` and `issue`"),
+    `${name} supplies only the role-bound revision inputs`);
+  assert.ok(seed.includes("never** reproduce, hash, or derive its revision locally"),
+    `${name} never derives the issue revision locally`);
+  assert.ok(seed.includes("live `main` ref SHA"),
+    `${name} records a live main SHA`);
+  assert.ok(seed.includes("quadwork-ticket-review-v1"),
+    `${name} carries the idempotency marker`);
+  assert.ok(seed.includes(`reviewer=${role}`),
+    `${name} binds the marker to its reviewer identity`);
+  assert.ok(seed.includes(`- Role: ${role}`),
+    `${name} requires an explicit reviewer role in the verdict body`);
+  assert.ok(seed.includes("make **at most one** `gh issue comment` call"),
+    `${name} limits a full assignment identity to one comment write`);
+  assert.ok(seed.includes("Immediately re-read live comments"),
+    `${name} requires an idempotent read-back`);
+  assert.ok(seed.includes("against the server-issued revision"),
+    `${name} binds idempotency and read-back to the server-issued revision`);
+  assert.ok(seed.includes("Head remains the review-batch closer"),
+    `${name} preserves Head as batch closer`);
+  assert.ok(seed.includes("not a server comment proxy and not a claim of credential-level enforcement"),
+    `${name} does not claim credential-level enforcement`);
+  assert.match(seed, /NO GitHub write[\s\S]*gh issue edit[\s\S]*mutating `gh api` methods/,
+    `${name} forbids unrelated GitHub writes`);
+}
+const ticketReviewPolicy = (seed) => seed.slice(
+  seed.indexOf("### ticket-review batches\n"),
+  seed.indexOf("### pr-review batches\n"),
+);
+assert.equal(
+  ticketReviewPolicy(re1).replaceAll("RE1", "REVIEWER"),
+  ticketReviewPolicy(re2).replaceAll("RE2", "REVIEWER"),
+  "RE1 and RE2 carry symmetric ticket-review comment policies",
+);
+for (const [name, text] of [["playbook", playbook], ["docs", reviewDocs]]) {
+  assert.ok(text.includes("credential-level enforcement"),
+    `${name} describes the limited policy without an enforcement claim`);
+  assert.ok(text.includes("issue_contract_revision"),
+    `${name} requires the project/agent-bound revision operation`);
+  assert.ok(text.includes("never derive or hash"),
+    `${name} rejects local revision derivation`);
+  assert.match(text, /Head remains the review-batch\s+closer/,
+    `${name} keeps Head as the review-batch closer`);
+  assert.ok(text.includes("#1048"), `${name} preserves implementation-review routing`);
+}
+
 for (const text of [dev, re1, re2, head, playbook, reviewDocs]) {
   assert.ok(text.includes("#1048"), "implementation route cutover is explicitly feature-gated");
   assert.match(text, /installed V1|V1 route|V1 fanout/i, "pre-#1048 compatibility remains documented");
