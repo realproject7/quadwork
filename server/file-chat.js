@@ -214,21 +214,29 @@ function appendMessage(projectId, { sender, channel = "general", text, type = "m
   return appendRecord(projectId, { sender, channel, text, type, attachments });
 }
 
-function sameTrustedEvent(projectId, record, envelope) {
+function sameTrustedEvent(projectId, record, envelope, resumeStructural) {
   const event = record?.trusted_event;
   if (!event || typeof event !== "object" || event.correlation_id !== envelope.correlation_id) return null;
   let persisted;
   try { persisted = envelopeFor(projectId, event.kind, event.anchors); }
   catch { throw new Error("trusted monitor correlation collision"); }
-  const matches = event.version === envelope.version && persisted.correlation_id === envelope.correlation_id
-    && record.sender === "system" && record.type === "system" && record.text === envelope.text;
+  const sameEnvelope = event.version === envelope.version && persisted.correlation_id === envelope.correlation_id &&
+    record.sender === "system" && record.text === envelope.text;
+  // Pre-V2 Monitor receipts were sealed through this same private transport,
+  // but had no resume label and used `system` rather than the envelope type.
+  // Keep them as non-resumable duplicates so installing V2 never replays or
+  // suppresses an already-recorded Monitor signal. Any present structural tag
+  // must be exact; it may not be silently retargeted to a different batch.
+  const legacy = record.resume_structural === undefined && record.type === "system";
+  const current = record.type === envelope.type && JSON.stringify(record.resume_structural) === JSON.stringify(resumeStructural);
+  const matches = sameEnvelope && (legacy || current);
   if (!matches) throw new Error("trusted monitor correlation collision");
   return record;
 }
 
-function findTrustedMonitorEvent(projectId, state, envelope) {
+function findTrustedMonitorEvent(projectId, state, envelope, resumeStructural) {
   for (const record of state.cache) {
-    const match = sameTrustedEvent(projectId, record, envelope);
+    const match = sameTrustedEvent(projectId, record, envelope, resumeStructural);
     if (match) return match;
   }
   const filePath = chatFile(projectId);
@@ -240,7 +248,7 @@ function findTrustedMonitorEvent(projectId, state, envelope) {
     if (!line.trim()) continue;
     try {
       const record = JSON.parse(line);
-      const match = sameTrustedEvent(projectId, record, envelope);
+      const match = sameTrustedEvent(projectId, record, envelope, resumeStructural);
       if (match) return match;
     } catch (error) {
       if (error?.message === "trusted monitor correlation collision") throw error;
@@ -356,7 +364,10 @@ function findTrustedHeadLifecycle(projectId, state, notice) {
 // recipient lists, or arbitrary JSONL metadata. Ordinary system messages keep
 // using appendMessage and are never eligible for the trusted PTY path.
 function appendTrustedMonitorEventOnce(projectId, candidate) {
-  if (!candidate || typeof candidate !== "object") throw new Error("trusted monitor envelope required");
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+      Object.keys(candidate).sort().join(",") !== "anchors,correlation_id,kind,project_id,recipients,resume,sender,text,type,version") {
+    throw new Error("trusted monitor envelope required");
+  }
   const envelope = envelopeFor(projectId, candidate.kind, candidate.anchors);
   if (candidate.project_id !== envelope.project_id || candidate.correlation_id !== envelope.correlation_id
     || candidate.version !== envelope.version || candidate.sender !== envelope.sender
@@ -364,9 +375,26 @@ function appendTrustedMonitorEventOnce(projectId, candidate) {
     || !Array.isArray(candidate.recipients) || candidate.recipients.length !== 1 || candidate.recipients[0] !== "head") {
     throw new Error("trusted monitor envelope invalid");
   }
+  const resume = candidate.resume;
+  if (!resume || typeof resume !== "object" || Array.isArray(resume) ||
+      Object.keys(resume).sort().join(",") !== "batch_id,head_generation" ||
+      !Number.isSafeInteger(resume.head_generation) || resume.head_generation < 0 ||
+      (resume.batch_id !== null && (typeof resume.batch_id !== "string" || !/^[a-z][a-z0-9_-]{2,95}$/.test(resume.batch_id)))) {
+    throw new Error("trusted monitor resume context invalid");
+  }
+  const resumeStructural = Object.freeze({
+    version: 1,
+    project_id: projectId,
+    trusted: true,
+    tag: "monitor_terminal",
+    batch_id: resume.batch_id,
+    head_generation: resume.head_generation,
+    target: "head",
+    server_authored: true,
+  });
   const state = getState(projectId);
   if (state.nextId === null) throw new Error(`Project ${projectId} not initialized — call initProject first`);
-  const existing = findTrustedMonitorEvent(projectId, state, envelope);
+  const existing = findTrustedMonitorEvent(projectId, state, envelope, resumeStructural);
   if (existing) return { ok: true, id: existing.id, duplicate: true };
   const metadata = Object.freeze({
     version: envelope.version,
@@ -377,9 +405,9 @@ function appendTrustedMonitorEventOnce(projectId, candidate) {
   const record = appendRecord(projectId, {
     sender: "system",
     channel: "general",
-    type: "system",
+    type: envelope.type,
     text: envelope.text,
-  }, metadata);
+  }, metadata, resumeStructural);
   return { ok: true, id: record.id, duplicate: false };
 }
 
@@ -540,17 +568,18 @@ function readPrimaryChatResumeRecords(projectId) {
   return { freshness: "live", records: records.slice(-MAX_RESUME_SOURCE_RECORDS) };
 }
 
-// A current V2 batch needs a server-issued qualified Head assignment before a
-// resume feed can claim an active-batch start boundary.  Missing or historical
-// records are intentionally represented by null; the runtime then withholds
-// the feed rather than manufacturing a boundary from queue prose or wall time.
+// An active feed starts only at a server-tagged, exact-batch Head instruction:
+// either an authenticated operator-to-Head request or a later qualified Head
+// assignment. Missing or historical records remain null, so the runtime never
+// manufactures a boundary from queue prose or wall time.
 function findPrimaryChatResumeBatchStart(projectId, batchId, headGeneration) {
   if (typeof batchId !== "string" || !Number.isSafeInteger(headGeneration) || headGeneration < 0) return null;
   const source = readPrimaryChatResumeRecords(projectId);
   for (const record of source.records) {
     const structural = record?.resume_structural;
     if (structural?.version === 1 && structural.project_id === projectId && structural.trusted === true &&
-        structural.tag === "head_assignment" && structural.batch_id === batchId &&
+        (structural.tag === "operator_head_mention" || structural.tag === "head_assignment") &&
+        structural.batch_id === batchId &&
         structural.head_generation === headGeneration && structural.target === "head" &&
         structural.server_authored === false && Number.isSafeInteger(record?.id) && record.id > 0) {
       return record.id - 1;

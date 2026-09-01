@@ -252,12 +252,14 @@ function batchRequestPlan(projectId, overrides = {}) {
   const record = fileChat.appendTrustedOperatorHeadMention(operatorProject, {
     text: "@head please inspect the exact queued item",
     attachments: [{ name: "evidence.png" }],
-    batch_id: null,
+    batch_id: "batch-1047",
     head_generation: 0,
   });
   assert.equal(record.sender, "user");
   assert.equal(record.resume_structural.tag, "operator_head_mention");
   assert.equal(record.resume_structural.server_authored, false);
+  assert.equal(fileChat.findPrimaryChatResumeBatchStart(operatorProject, "batch-1047", 0), 0,
+    "an authenticated operator-to-Head request provides the active resume boundary");
   assert.throws(() => fileChat.appendTrustedOperatorHeadMention(operatorProject, {
     text: "please inspect the exact queued item",
     attachments: null,

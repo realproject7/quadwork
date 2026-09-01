@@ -833,7 +833,16 @@ const trustedMonitorTransport = createTrustedEventTransport({
   stateStore: monitorStateStore,
   appendTrustedEventOnce: async (envelope) => {
     if (routes.getProjectChatMode(envelope.project_id) !== "file") return { ok: false };
-    return fileChat.appendTrustedMonitorEventOnce(envelope.project_id, envelope);
+    const admission = captureProjectAdmission(envelope.project_id);
+    if (!isAdmissionCurrent(admission)) return { ok: false };
+    const installationId = readConfig()?.installation_id;
+    return fileChat.appendTrustedMonitorEventOnce(envelope.project_id, {
+      ...envelope,
+      resume: {
+        batch_id: typeof installationId === "string" ? currentRecoveryBatchId(envelope.project_id, installationId) : null,
+        head_generation: admission.generation,
+      },
+    });
   },
   isProjectAdmitted: (projectId) => {
     try { assertProjectAdmitted(projectId); return true; }

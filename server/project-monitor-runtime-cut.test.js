@@ -53,7 +53,10 @@ let wakeCalls = 0;
 const transport = createTrustedEventTransport({
   stateStore: store,
   isProjectAdmitted: () => true,
-  appendTrustedEventOnce: (envelope) => fileChat.appendTrustedMonitorEventOnce(projectId, envelope),
+  appendTrustedEventOnce: (envelope) => fileChat.appendTrustedMonitorEventOnce(projectId, {
+    ...envelope,
+    resume: { batch_id: "batch-1047", head_generation: 0 },
+  }),
   currentTrustedRecipientGeneration: ({ envelope }) => {
     const session = sessions.get(`${projectId}/head`);
     if (!session || session.lifecycleState !== "verified") return null;
