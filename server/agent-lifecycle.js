@@ -246,6 +246,7 @@ class AgentLifecycleGovernor {
     this.resourceSnapshot = options.resourceSnapshot || (() => null);
     this.currentWork = options.currentWork || (async () => ({ current: false, assignment: null }));
     this.projectEligible = options.projectEligible || (() => true);
+    this.testOverrideFor = options.testOverrideFor || null;
     this._tail = Promise.resolve();
     this._reservations = new Set();
   }
@@ -346,9 +347,18 @@ class AgentLifecycleGovernor {
         return this._rejected("circuit_open", state.roles[role]);
       }
 
+      const testOverride = typeof this.testOverrideFor === "function"
+        ? this.testOverrideFor(input.testFixture)
+        : null;
+      const runtimePlatform = testOverride?.runtimePlatform === "linux" || testOverride?.runtimePlatform === "darwin"
+        ? testOverride.runtimePlatform
+        : this.platform;
+      const snapshotReader = typeof testOverride?.resourceSnapshot === "function"
+        ? testOverride.resourceSnapshot
+        : this.resourceSnapshot;
       let snapshot = null;
-      try { snapshot = this.resourceSnapshot(); } catch {}
-      const resource = resourceDecision(this.platform, snapshot, this._reservations.size, input.containedLaunch);
+      try { snapshot = snapshotReader(); } catch {}
+      const resource = resourceDecision(runtimePlatform, snapshot, this._reservations.size, input.containedLaunch);
       if (!resource.ok) return this._rejected(resource.reason, previous, resource.facts);
 
       const operationId = input.operationId || randomId(this.randomUUID, "operation_id");

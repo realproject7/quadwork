@@ -618,6 +618,42 @@ app.get("/api/caffeinate/status", (req, res) => {
 // PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
 const agentSessions = new Map();
 
+// Deterministic server-test containment fixtures. They are an in-process
+// capability, not a route/config/environment setting: production callers
+// cannot turn an uncontained PTY into a contained one. The fixture exists so
+// Linux CI can still exercise lifecycle/cleanup behavior while #1038 remains
+// candidate_pending_staging; it is not VPS or staging evidence.
+const _lifecycleTestFixtures = new Map();
+const _lifecycleTestFixtureCapabilities = new WeakSet();
+const _containedLifecycleTestSnapshot = Object.freeze({
+  status: "ready",
+  pressure: Object.freeze({ status: "ready", reason: "test_contained_fixture" }),
+  scope_capacity: Object.freeze({ admitted_worker_scopes: 0, reserved_worker_scopes: 3 }),
+});
+function installLifecycleTestFixture(projectId, agentId, mode) {
+  if (typeof projectId !== "string" || typeof agentId !== "string"
+    || !["linux-uncontained", "linux-contained"].includes(mode)) {
+    throw new Error("invalid lifecycle test fixture");
+  }
+  const key = `${projectId}/${agentId}`;
+  const prior = _lifecycleTestFixtures.get(key) || null;
+  const fixture = Object.freeze({
+    runtimePlatform: "linux",
+    containedLaunch: mode === "linux-contained",
+    resourceSnapshot: mode === "linux-contained" ? () => _containedLifecycleTestSnapshot : null,
+  });
+  _lifecycleTestFixtureCapabilities.add(fixture);
+  _lifecycleTestFixtures.set(key, fixture);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (_lifecycleTestFixtures.get(key) !== fixture) return;
+    if (prior) _lifecycleTestFixtures.set(key, prior);
+    else _lifecycleTestFixtures.delete(key);
+  };
+}
+
 // #1053: every production PTY creation goes through this one governor.  Its
 // Current Batch read deliberately mirrors /api/batch-active's own object so
 // sticky historical progress cannot mint worker admission authority.
@@ -669,6 +705,9 @@ const lifecycleGovernor = createAgentLifecycleGovernor({
   projectEligible: (projectId) => {
     try { return !isProjectArchived(projectId); } catch { return false; }
   },
+  // This resolver accepts only identities made by installLifecycleTestFixture.
+  // It is intentionally not a general runtime override hook.
+  testOverrideFor: (fixture) => _lifecycleTestFixtureCapabilities.has(fixture) ? fixture : null,
 });
 
 // #631: Butler session — single global PTY (not per-project, no AC integration)
@@ -1256,6 +1295,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
   if (!roleConfigured) {
     return { ok: false, code: "role_ineligible", status: 404, error: "agent role is not configured", lifecycle: null };
   }
+  const testFixture = _lifecycleTestFixtures.get(`${project}/${agent}`) || null;
   const source = opts.lifecycleSource || "operator_start";
   const result = await lifecycleGovernor.launch({
     projectId: project,
@@ -1269,10 +1309,14 @@ async function spawnAgentPty(project, agent, opts = {}) {
     expectedGeneration: opts.expectedGeneration,
     lossCorrelation: opts.lossCorrelation,
     liveSession: isPtyAlive(agentSessions.get(`${project}/${agent}`)?.term),
+    // Only the private in-process fixture registry can set this capability.
+    // HTTP, config, environment, and ordinary internal opts always reach the
+    // real resource owner with containedLaunch:false below.
+    testFixture,
     // #1038 has no pinned supported PTY scope in this source yet. This
     // node-pty launch must therefore never satisfy Linux containment by an
     // option supplied from a route or recovery caller.
-    containedLaunch: false,
+    containedLaunch: testFixture?.containedLaunch === true,
     launch: ({ operation_id, generation_id }) => launchAgentPty(project, agent, {
       ...opts,
       admissionToken: admission,
@@ -3867,6 +3911,7 @@ module.exports = {
   releaseProjectCaffeinate,
   releaseManualCaffeinate,
   restartAgentSession,
+  _test: Object.freeze({ installLifecycleTestFixture }),
 };
 module.exports.agentSessions = agentSessions; // #972: test seam for shutdown() PTY cleanup
 module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test seam

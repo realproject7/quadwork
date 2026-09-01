@@ -9,7 +9,9 @@
 // process.kill("SIGTERM") path exercised by the PTY teardown below.)
 //
 // Run in its own child process by the test runner, so requiring index.js — which
-// starts the server + pollers — is isolated. Plain node:assert script.
+// starts the server + pollers — is isolated. Plain node:assert script. Linux
+// containment uses index.js's server-owned deterministic test fixture only;
+// it is not reachable from an HTTP/config/environment input.
 
 const assert = require("node:assert/strict");
 const http = require("http");
@@ -85,8 +87,23 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   ok(stoppedViewer.opened && stoppedViewer.code === 1008, "terminal WS reports the stopped lifecycle without spawning");
   ok(!idx.agentSessions.get("lv/head")?.term, "terminal WS connection created no PTY");
 
+  // F2: force the Linux admission branch without granting any proof. A normal
+  // route start remains rejected while containedLaunch is false.
+  const releaseUncontained = idx._test.installLifecycleTestFixture("lv", "head", "linux-uncontained");
+  try {
+    const rejected = await post(PORT, "/api/agents/lv/head/start", { "X-Session-Token": token });
+    const rejectedBody = JSON.parse(rejected.body);
+    assert.equal(rejected.status, 409, rejected.body);
+    assert.equal(rejectedBody.code, "containment_unavailable");
+    ok(!idx.agentSessions.get("lv/head")?.term, "normal Linux API start remains containment-unavailable");
+  } finally {
+    releaseUncontained();
+  }
+
   // The authenticated lifecycle API, rather than the dashboard viewer, starts
-  // the disposable bash PTY that this shutdown test owns.
+  // the disposable bash PTY that this shutdown test owns through the scoped
+  // test fixture. This exercises shutdown ownership, not production authority.
+  const releaseContained = idx._test.installLifecycleTestFixture("lv", "head", "linux-contained");
   const started = await post(PORT, "/api/agents/lv/head/start", { "X-Session-Token": token });
   assert.equal(started.status, 200, started.body);
 
@@ -118,6 +135,7 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   // Idempotent: a second shutdown() (SIGINT then SIGTERM, or full-reset) is safe.
   assert.doesNotThrow(() => idx.shutdown(), "shutdown() is idempotent");
   ok(true, "shutdown() is idempotent (second call does not throw)");
+  releaseContained();
 
   console.log(`\n${passed} passed`);
   console.log("server/shutdownCleanup.test.js: all assertions passed");

@@ -450,24 +450,68 @@ process.on("exit", cleanup);
   assert.equal(runtime.caffeinateProcess.manualOwner, true, "duration expiry preserves the manual owner");
   assert.deepEqual(caffeinateKills, [], "one owner's duration expiry cannot stop the shared OS process");
 
-  let releaseBuild;
-  const buildGate = new Promise((resolve) => { releaseBuild = resolve; });
-  let admitted = true;
+  // F1: a real Linux production-shaped request stays failed closed before it
+  // can prepare or spawn an uncontained PTY. The fixture only forces Linux
+  // observation; it supplies no containment evidence.
   let ptySpawns = 0;
-  const spawnPromise = runtime.spawnAgentPty("b", "dev", {
-    captureProjectAdmission: () => ({ project_id: "b", generation: 0 }),
-    isAdmissionCurrent: () => admitted,
-    lifecycleSource: "operator_start",
-    operatorAuthorized: true,
-    explicitRole: true,
-    buildAgentArgs: async () => { await buildGate; return { args: [] }; },
-    ptySpawn: () => { ptySpawns += 1; throw new Error("must not spawn"); },
-  });
-  admitted = false;
-  releaseBuild();
-  const raced = await spawnPromise;
-  assert.equal(raced.code, "project_archived");
-  assert.equal(ptySpawns, 0, "archive during awaited spawn preparation creates no PTY");
+  const releaseUncontained = runtime._test.installLifecycleTestFixture("b", "dev", "linux-uncontained");
+  try {
+    const uncontained = await runtime.spawnAgentPty("b", "dev", {
+      lifecycleSource: "operator_start",
+      operatorAuthorized: true,
+      explicitRole: true,
+      ptySpawn: () => { ptySpawns += 1; throw new Error("must not spawn"); },
+    });
+    assert.equal(uncontained.code, "containment_unavailable");
+    assert.equal(ptySpawns, 0, "Linux rejects the normal uncontained spawn before PTY preparation");
+  } finally {
+    releaseUncontained();
+  }
+
+  // A project that is already archived reports its archive barrier before any
+  // Linux resource gate. This is distinct from the entry-admitted race below.
+  const releaseArchived = runtime._test.installLifecycleTestFixture("a", "dev", "linux-uncontained");
+  try {
+    const steadyArchived = await runtime.spawnAgentPty("a", "dev", {
+      lifecycleSource: "operator_start",
+      operatorAuthorized: true,
+      explicitRole: true,
+      ptySpawn: () => { ptySpawns += 1; throw new Error("must not spawn"); },
+    });
+    assert.equal(steadyArchived.code, "project_archived");
+    assert.equal(ptySpawns, 0, "steady archived project never reaches a Linux spawn path");
+  } finally {
+    releaseArchived();
+  }
+
+  // Only a server-owned deterministic fixture can let Linux CI enter the
+  // preparation phase. It is released below and is unreachable from a route,
+  // config, or environment value; it cannot grant production authority.
+  const releaseContained = runtime._test.installLifecycleTestFixture("b", "dev", "linux-contained");
+  try {
+    let releaseBuild;
+    const buildGate = new Promise((resolve) => { releaseBuild = resolve; });
+    let admitted = true;
+    let preparationEntered = false;
+    const spawnPromise = runtime.spawnAgentPty("b", "dev", {
+      captureProjectAdmission: () => ({ project_id: "b", generation: 0 }),
+      isAdmissionCurrent: () => admitted,
+      lifecycleSource: "operator_start",
+      operatorAuthorized: true,
+      explicitRole: true,
+      buildAgentArgs: async () => { preparationEntered = true; await buildGate; return { args: [] }; },
+      ptySpawn: () => { ptySpawns += 1; throw new Error("must not spawn"); },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(preparationEntered, true, "contained test fixture reaches asynchronous spawn preparation");
+    admitted = false;
+    releaseBuild();
+    const raced = await spawnPromise;
+    assert.equal(raced.code, "project_archived");
+    assert.equal(ptySpawns, 0, "archive after entry admission creates no PTY");
+  } finally {
+    releaseContained();
+  }
 
   const beforeUnarchiveSessions = runtime.agentSessions.size;
   const restored = await runtime.projectLifecycle.unarchiveProject("a");
