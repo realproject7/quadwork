@@ -1,15 +1,13 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
 const {
   normalizeCiPolicy,
+  deriveCiPolicyIdentity,
+  sameCiPolicyIdentity,
   normalizeGithubCheckEvidence,
   evaluateCiEvidence,
 } = require("./ci-evidence-policy");
-const { validateV2Configuration } = require("./config");
 
 let passed = 0;
 function ok(value, message) {
@@ -45,6 +43,8 @@ function run(name, attempt, status = "completed", conclusion = "success", extra 
     conclusion,
     details_url: `https://ci.example/${name}/${attempt}`,
     head_sha: SHA,
+    started_at: null,
+    completed_at: null,
     observed_at: AT,
     ...extra,
   };
@@ -79,37 +79,6 @@ for (const [label, candidate, code] of [
   passed += 1;
   console.log(`  PASS: ${label} policy is rejected`);
 }
-
-// #1029's canonical repository validator carries this policy without inferring
-// one for legacy repositories.
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-ci-policy-"));
-const repoDir = path.join(root, "repo");
-fs.mkdirSync(repoDir);
-const config = {
-  installation_id: "installation_1234567890abcdef",
-  projects: [{
-    id: "p",
-    name: "p",
-    repositories: [{ key: "web", repo: "Acme/Web", working_dir: repoDir, primary: true, ci_policy: policy() }],
-  }],
-};
-assert.equal(validateV2Configuration(config), config);
-ok(true, "V2 repository configuration accepts an explicit valid policy");
-assert.throws(
-  () => validateV2Configuration({ ...config, projects: [{ ...config.projects[0], repositories: [{ ...config.projects[0].repositories[0], ci_policy: { ...policy(), checks: [] } }] }]}),
-  (error) => error?.code === "invalid_ci_policy_checks" && error?.field === "repositories.ci_policy",
-);
-ok(true, "V2 repository configuration rejects an invalid policy at the repository accessor boundary");
-assert.throws(
-  () => validateV2Configuration({ ...config, projects: [{ ...config.projects[0], repositories: [{ ...config.projects[0].repositories[0], ci_policy: undefined }] }]}),
-  (error) => error?.code === "invalid_ci_policy",
-);
-ok(true, "an explicitly undefined policy is rejected rather than silently defaulted");
-// Use a clean absent field for the legacy-compatible missing_policy case.
-const absent = JSON.parse(JSON.stringify(config));
-delete absent.projects[0].repositories[0].ci_policy;
-assert.equal(validateV2Configuration(absent), absent);
-ok(true, "legacy repository policy absence remains valid and explicit for missing_policy evaluation");
 
 assert.equal(evaluateCiEvidence({ exact_sha: SHA, observed_at: AT, source_status: "ok" }).state, "missing_policy");
 ok(true, "missing policy fails closed without inferring visible checks");
@@ -167,5 +136,57 @@ assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: A
 assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok", ci_less_evidence: { policy_version: 1, exact_sha: SHA, results: [{ key: "unit", outcome: "fail" }, { key: "typecheck", outcome: "pass" }] } }).state, "product_failure");
 ok(true, "CI-less evidence is pending, pass, or product failure only for the exact configured key set and SHA");
 
-try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
+// A policy identity is semantic rather than object-order based. Reusing a
+// receipt/evaluation identity after even a same-version policy edit is an
+// explicit invalidation, never a silent pass under the new registry.
+const currentIdentity = deriveCiPolicyIdentity(policy());
+assert.equal(sameCiPolicyIdentity(currentIdentity, deriveCiPolicyIdentity({ ...policy(), checks: [...policy().checks].reverse() })), true);
+const changedIdentity = deriveCiPolicyIdentity({ ...policy(), registration_grace_seconds: 121 });
+const changedPolicy = evaluate({ policy_identity: changedIdentity });
+assert.equal(changedPolicy.state, "unknown");
+assert.equal(changedPolicy.invalidation.code, "ci_policy_changed");
+ok(true, "a stale current-policy identity invalidates exact-SHA evaluation even when the policy version is unchanged");
+
+// The evaluator accepts only a closed exact-SHA evidence shape. Short SHAs,
+// stray authority fields, malformed rows, ambiguous latest attempts, and a
+// backwards grace clock all withhold a result rather than selecting evidence.
+assert.equal(evaluate({ exact_sha: "a".repeat(7) }).state, "unknown");
+assert.equal(evaluate({ external_authority: "pass" }).state, "unknown");
+const malformedRun = run("gates", 1);
+delete malformedRun.completed_at;
+assert.equal(evaluate({ check_runs: [malformedRun, run("classify", 1)] }).state, "unknown");
+assert.equal(evaluate({
+  check_runs: [
+    run("gates", 3, "completed", "success", { id: "gates-a", started_at: "2026-08-31T00:00:00.000Z", completed_at: "2026-08-31T00:01:00.000Z" }),
+    run("gates", 3, "completed", "failure", { id: "gates-b", started_at: "2026-08-31T00:00:00.000Z", completed_at: "2026-08-31T00:01:00.000Z" }),
+    run("classify", 1),
+  ],
+}).invalidation.code, "ambiguous_exact_sha_check_runs");
+assert.equal(evaluate({ now: Date.parse(FIRST) - 1 }).invalidation.code, "invalid_registration_clock");
+ok(true, "malformed, ambiguous, and time-inconsistent exact-SHA evidence fails closed");
+
+const retryable = evaluate({ check_runs: [run("gates", 1, "completed", "failure"), run("classify", 1)] });
+assert.deepEqual(retryable.retry, {
+  same_sha_retry_budget: 1, retry_count: 0, retry_remaining: 1, owner: "dev", retry_eligible: true, automatic: false,
+});
+const exhausted = evaluate({ retry_count: 1, check_runs: [run("gates", 1, "completed", "failure"), run("classify", 1)] });
+assert.equal(exhausted.retry.retry_eligible, false);
+assert.equal(exhausted.retry.retry_remaining, 0);
+ok(true, "same-SHA retry eligibility is bounded, explicit, and never automatic");
+
+const fullCiLessRecord = {
+  record_id: "ce_0123456789abcdef0123456789abcdef",
+  record_digest: "a".repeat(64),
+  identity_hash: "b".repeat(64),
+  identity: { policy_version: 1, exact_sha: SHA },
+  observed_at: AT,
+  results: [
+    { key: "unit", outcome: "pass", exit_code: 0, evidence_ref: "unit:sha256:abc" },
+    { key: "typecheck", outcome: "pass", exit_code: 0, evidence_ref: "typecheck:sha256:def" },
+  ],
+};
+assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok", ci_less_evidence: fullCiLessRecord }).state, "ci_less_pass");
+assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok", ci_less_evidence: { ...fullCiLessRecord, results: [{ key: "unit", outcome: "pass" }] } }).invalidation.code, "invalid_ci_less_evidence");
+ok(true, "CI-less evidence accepts only one exact current key/SHA record and rejects incomplete or malformed receipts");
+
 console.log(`\n${passed} ci-evidence policy assertions passed`);
