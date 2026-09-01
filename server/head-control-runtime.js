@@ -84,6 +84,46 @@ function createHeadControlRuntime(options) {
   const tokenByProject = new Map();
   const services = new Map();
 
+  function currentReadBinding(projectId) {
+    if (typeof projectId !== "string" || !PROJECT_RE.test(projectId)) {
+      throw new TypeError("Current Batch project is invalid");
+    }
+    // Read admission both sides of config inspection. This is a local read
+    // capability for the operator surface, not a Head launch capability, but
+    // it must still fail closed across archive/recreate transitions.
+    const before = options.capture_project_admission(projectId);
+    const config = options.read_config();
+    const after = options.capture_project_admission(projectId);
+    if (!plain(before) || !plain(after) || before.project_id !== projectId || after.project_id !== projectId ||
+        !Number.isSafeInteger(before.generation) || before.generation < 0 || before.generation !== after.generation ||
+        !plain(config) || typeof config.installation_id !== "string" || !INSTALLATION_RE.test(config.installation_id) ||
+        !Array.isArray(config.projects) || options.is_project_archived(projectId, config) ||
+        config.projects.filter((entry) => plain(entry) && entry.id === projectId && entry.archived !== true).length !== 1) {
+      throw new TypeError("Current Batch project is unavailable");
+    }
+    return binding({
+      installation_id: config.installation_id,
+      project_id: projectId,
+      role: "head",
+      generation: before.generation,
+    });
+  }
+
+  function resolveOwnedDomain(owner) {
+    const resolver = createLiveWorkTaskIdentityResolver({
+      read_live_batch_context: options.read_live_batch_context,
+      read_repository_state: options.read_repository_state,
+      read_cached_repository_snapshot: options.read_cached_repository_snapshot,
+    });
+    return createHeadControlWorkTaskDomain({
+      binding: owner,
+      config_dir: options.config_dir,
+      fs: options.fs,
+      resolve_registered_identity: resolver,
+      now: options.now,
+    });
+  }
+
   function registerHeadToken(value) {
     exact(value, ["project_id", "generation", "token"]);
     if (typeof value.project_id !== "string" || !PROJECT_RE.test(value.project_id) ||
@@ -158,24 +198,32 @@ function createHeadControlRuntime(options) {
     const key = runtimeKey(owner);
     const existing = services.get(key);
     if (existing) return existing;
-    const resolver = createLiveWorkTaskIdentityResolver({
-      read_live_batch_context: options.read_live_batch_context,
-      read_repository_state: options.read_repository_state,
-      read_cached_repository_snapshot: options.read_cached_repository_snapshot,
-    });
-    const domain = createHeadControlWorkTaskDomain({
-      binding: owner,
-      config_dir: options.config_dir,
-      fs: options.fs,
-      resolve_registered_identity: resolver,
-      now: options.now,
-    });
+    const domain = resolveOwnedDomain(owner);
     // Bootstrap is private runtime composition, never a fifth MCP operation.
     domain.initialize();
     const audit_store = createHeadControlAuditStore({ config_dir: options.config_dir, fs: options.fs });
     const service = createHeadControlService({ binding: owner, domain, audit_store });
     services.set(key, service);
     return service;
+  }
+
+  // This is intentionally a fixed, read-only runtime seam for the local
+  // operator surface. It does not require a running Head or a launch token,
+  // cannot initialize missing state, and exposes only the redacted nested
+  // projection owned by the durable Head domain.
+  function readCurrentBatchProjection(value) {
+    exact(value, ["project_id"]);
+    const owner = currentReadBinding(value.project_id);
+    const domain = resolveOwnedDomain(owner);
+    try {
+      const projection = domain.project_current_batch();
+      return Object.freeze({ active: projection !== null, projection });
+    } catch (error) {
+      if (error && error.code === "head_control_work_task_state_missing") {
+        return Object.freeze({ active: false, projection: null });
+      }
+      throw error;
+    }
   }
 
   function revokeProject(projectId) {
@@ -197,7 +245,7 @@ function createHeadControlRuntime(options) {
   }
 
   const http = createHeadControlHttpService({ authenticateToken, resolveLaunchBinding, resolveHeadControlService });
-  return Object.freeze({ registerHeadToken, revokeProject, handle: http.handle });
+  return Object.freeze({ registerHeadToken, revokeProject, readCurrentBatchProjection, handle: http.handle });
 }
 
 module.exports = { createHeadControlRuntime };

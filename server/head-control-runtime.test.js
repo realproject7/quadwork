@@ -55,6 +55,7 @@ function fixture() {
   });
   return {
     runtime,
+    config_dir,
     sessions,
     archive() { archived = true; },
     cleanup() { fs.rmSync(config_dir, { recursive: true, force: true }); },
@@ -71,6 +72,11 @@ function ok(value, message) {
 {
   const live = fixture();
   try {
+    const absent = live.runtime.readCurrentBatchProjection({ project_id });
+    assert.deepEqual(absent, { active: false, projection: null });
+    assert.deepEqual(fs.readdirSync(live.config_dir), [], "a Current Batch read must not bootstrap durable state");
+    ok(true, "the operator read seam reports no V2 batch without a Head token or durable-state bootstrap");
+
     assert.deepEqual(live.runtime.registerHeadToken({ project_id, generation, token }), { project_id, actor: "head", generation });
     const first = live.runtime.handle(request(), { token });
     assert.equal(first.ok, true);
