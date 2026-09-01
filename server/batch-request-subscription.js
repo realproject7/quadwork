@@ -208,13 +208,16 @@ function normalizeIssueUrl(value, repository, number) {
   if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== expectedIssuePath(repository, number)) {
     fail("invalid_batch_request_issue_url", "issue URL does not identify the exact repository issue");
   }
-  return value;
+  // Preserve the exact Issue identity while normalizing the URL representation
+  // itself.  Query/hash/user-info are rejected above, so this cannot carry
+  // context or a worker-directed instruction into the closed Head plan.
+  return parsed.toString();
 }
 function normalizeIssueFixture(value) {
   exact(value, ["repository", "issue_number", "issue_url", "pull_request", "labels", "body", "etag", "cursor"], "invalid_batch_request_issue_fixture");
   const repository = canonicalRepository(value.repository, "invalid_batch_request_issue_fixture");
   const number = issueNumber(value.issue_number, "invalid_batch_request_issue_fixture");
-  normalizeIssueUrl(value.issue_url, repository, number);
+  const issueUrl = normalizeIssueUrl(value.issue_url, repository, number);
   if ((value.pull_request !== null && !plain(value.pull_request)) || !Array.isArray(value.labels) || value.labels.length > 32 ||
       !value.labels.every((label) => typeof label === "string" && label.length > 0 && label.length <= 100 && !/[\r\n\u0000]/.test(label))) {
     fail("invalid_batch_request_issue_fixture", "issue fixture shape is invalid");
@@ -225,6 +228,7 @@ function normalizeIssueFixture(value) {
   return {
     repository,
     issue_number: number,
+    issue_url: issueUrl,
     body: value.body,
     is_pull_request: value.pull_request !== null,
     has_request_label: value.labels.includes(REQUEST_LABEL),
@@ -269,13 +273,15 @@ function eventPlanFor(contract, fixture) {
     authority_digest: contract.digest,
   };
   // This is deliberately a closed Head wake-up plan.  It contains only the
-  // strict authority schema and correlation anchors, never Issue prose, URL,
-  // ETag/cursor, labels, or any worker-facing diagnostics.
+  // strict authority schema, exact canonical Issue URL, and correlation
+  // anchors.  It never contains Issue prose, title, ETag/cursor, labels, or
+  // any worker-facing diagnostics.
   return freeze({
     version: VERSION,
     kind: "BATCH REQUEST",
     recipients: ["head"],
     correlation_key: dedupeKey(fixture.repository, fixture.issue_number, authority.request_id, contract.digest),
+    issue_url: fixture.issue_url,
     anchors,
     authority: clone(authority),
   });

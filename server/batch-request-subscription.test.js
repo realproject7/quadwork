@@ -79,8 +79,8 @@ function ok(condition, message) {
 }
 
 // A fully admitted Issue produces one closed, Head-only BATCH REQUEST plan.
-// The plan carries the canonical contract but never the Issue's prose, URL,
-// cursor, ETag, labels, or any private decision diagnostics.
+// The plan carries the canonical contract and exact canonical Issue URL, but
+// never Issue prose, title, cursor, ETag, labels, or private diagnostics.
 {
   const result = reconcileBatchRequestSubscription(input());
   assert.equal(result.version, VERSION);
@@ -88,6 +88,8 @@ function ok(condition, message) {
   assert.deepEqual(result.event_plan.recipients, ["head"]);
   assert.equal(result.event_plan.authority.request_id, REQUEST_ID);
   assert.equal(result.event_plan.anchors.coordination_repo, "acme/coordination");
+  assert.equal(result.event_plan.issue_url, "https://api.github.com/repos/acme/coordination/issues/73");
+  assert.deepEqual(Object.keys(result.event_plan).sort(), ["anchors", "authority", "correlation_key", "issue_url", "kind", "recipients", "version"]);
   assert.equal(result.next_state.records.length, 1);
   assert.equal(result.next_state.records[0].status, "delivered");
   ok(result.event_plan.correlation_key === result.next_state.records[0].dedupe_key,
@@ -96,8 +98,14 @@ function ok(condition, message) {
      Object.isFrozen(result.event_plan.authority), "reconciliation output and its closed event plan are deeply frozen");
   assert.throws(() => result.next_state.records.push({}), TypeError);
   const serializedPlan = JSON.stringify(result.event_plan);
-  ok(!/Human-only context|Untrusted completion|api\.github|issues:73:first|first|operator-visible|internal_diagnostics/.test(serializedPlan),
-    "event plan retains no Issue prose, URL, label, ETag/cursor, or diagnostics");
+  ok(!/Human-only context|Untrusted completion|issues:73:first|first|operator-visible|internal_diagnostics/.test(serializedPlan),
+    "event plan retains only canonical Issue URL, never prose, labels, ETag/cursor, or diagnostics");
+
+  const normalizedUrl = reconcileBatchRequestSubscription(input({
+    issue: issue({ issue_url: "https://API.GITHUB.COM:443/repos/acme/coordination/issues/73" }),
+  }));
+  ok(normalizedUrl.event_plan.issue_url === "https://api.github.com/repos/acme/coordination/issues/73",
+    "closed plan normalizes the exact validated Issue URL before durable delivery");
 }
 
 // PR-shaped fixtures and unlabeled Issues are never interpreted as a batch
