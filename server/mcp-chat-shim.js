@@ -136,10 +136,39 @@ const READ_CI_EVIDENCE_TOOL = {
   },
 };
 
+const SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL = {
+  name: "submit_review_cycle_receipt",
+  description: "Bind this authenticated reviewer's one current GitHub review object to the server-owned exact-SHA review cycle. Chat claims and prose are not accepted.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      target_identity_digest: { type: "string" },
+      review_id: { type: ["string", "integer"] },
+      nonce: { type: "string" },
+    },
+    required: ["target_identity_digest", "review_id", "nonce"],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+};
+
+const ISSUE_REVIEW_CYCLE_NONCE_TOOL = {
+  name: "issue_review_cycle_nonce",
+  description: "Read this authenticated reviewer's one private, one-time nonce for the current server-owned review cycle. Put it in the GitHub review body before submitting the receipt.",
+  inputSchema: {
+    type: "object",
+    properties: { target_identity_digest: { type: "string" } },
+    required: ["target_identity_digest"],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
 function toolsForActor() {
   if (!PROJECT_ROLES.has(AGENT)) return CHAT_TOOLS;
   const tools = [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL, READ_CI_EVIDENCE_TOOL];
   if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL);
+  if (AGENT === "re1" || AGENT === "re2") tools.push(ISSUE_REVIEW_CYCLE_NONCE_TOOL, SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL);
   return tools;
 }
 
@@ -247,6 +276,20 @@ async function handleToolCall(id, name, params) {
       if (res.status >= 400) {
         return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
       }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_review_cycle_receipt") {
+      const res = await httpRequest("POST", "/api/review-cycle-receipt", params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {});
+      if (res.status >= 400) return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "issue_review_cycle_nonce") {
+      const res = await httpRequest("POST", "/api/review-cycle-nonce", params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {});
+      if (res.status >= 400) return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
     }
 

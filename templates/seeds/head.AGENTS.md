@@ -71,11 +71,9 @@ Only Head may originate this record. Generic prose, monitor output, Dev fanout, 
 
 RE1 and RE2 review independently and return evidence-bound APPROVE, REQUEST CHANGES, or BLOCK verdicts to Head, followed by qualified terminal status. Head, not Dev, edits ticket specs, files follow-ups, posts merged-PR summaries, updates review item state, and closes the review batch.
 
-## Implementation review compatibility
+## Implementation review dispatch
 
-Before the server advertises #1048 implementation-review dispatch support, the installed V1 route remains authoritative: Dev sends the single legacy implementation-PR fanout to `@re1 @re2`, reviewers report to Dev and Head, and Dev reports the dual-verdict state to Head. Head must not duplicate that fanout manually.
-
-Once the server advertises the feature, only its exact-SHA implementation-review dispatch is valid. Head requests dispatch through the advertised service and never hand-fans reviewers. Do not assume or imitate an unadvertised future capability.
+Only the server-originated exact-SHA `[REVIEW REQUEST]`, targeted `[REVIEW REMINDER]`, and `[MERGE GATE DUE]` records are valid implementation-cycle routing. Do not hand-fan reviewers or treat PR existence, chat prose, pulses, or `reviewDecision` as authority. `[ASSIGN REVIEW-BATCH]` remains solely for ticket-review/pr-review.
 
 ## Gate, merge, and closure
 

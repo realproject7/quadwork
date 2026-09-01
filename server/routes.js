@@ -33,7 +33,7 @@ const {
   validateAssignmentProvenance,
   ownershipKey,
 } = require("./work-item-ref");
-const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha } = require("./ci-evidence-policy");
+const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence } = require("./ci-evidence-policy");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
@@ -1034,6 +1034,7 @@ const { findAgentChattr } = require("./install-agentchattr");
 const {
   createIssueContractRevisionHandler,
   fetchIssueContractRevision,
+  issueContractRevision,
 } = require("./issue-contract-revision");
 const {
   CiEvidenceError,
@@ -1041,6 +1042,10 @@ const {
   createCiLessEvidenceSubmitHandler,
   createCiLessEvidenceReadHandler,
 } = require("./ci-less-evidence");
+const { ReviewCycleStore, deriveLegacyReviewTarget } = require("./review-cycle");
+const { ReviewCycleDispatcher } = require("./review-cycle-dispatcher");
+const { currentContractObservation } = require("./review-cycle-contract-observation");
+const { verifyActionContract } = require("./review-cycle-action-contract");
 
 function resolveRegisteredIssueContract(projectId, repoKey, issue) {
   const context = readLiveBatchContext(projectId);
@@ -1155,6 +1160,8 @@ async function resolveCurrentCiEvidenceTarget(projectId, request) {
 }
 
 const _ciEvidenceStore = new CiEvidenceStore();
+const _reviewCycleStore = new ReviewCycleStore();
+const _reviewCycleDispatcher = new ReviewCycleDispatcher({ store: _reviewCycleStore });
 router.post("/api/ci-evidence", createCiLessEvidenceSubmitHandler({
   resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
   captureProjectAdmission,
@@ -1166,6 +1173,111 @@ router.post("/api/ci-evidence/read", createCiLessEvidenceReadHandler({
   resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
   store: _ciEvidenceStore,
 }));
+
+// Reviewer-only native receipt admission.  Chat wording is deliberately not an
+// input.  The bound role supplies only a durable review id + current digest;
+// the server re-reads the GitHub review and records its exact SHA/verdict.
+function targetFromStoredReviewCycle(projectId, cycle) {
+  const project = configuredProject(projectId);
+  return deriveLegacyReviewTarget({
+    installation_id: cycle.target.installation_id, project_id: projectId,
+    repository: { key: cycle.target.repo_key, repo: cycle.target.repo, ci_policy: cycle.target.policy_version === null ? null : repositoryCiPolicy(project, cycle.target.repo_key) },
+    work_item: cycle.target.work_item,
+    pr: { number: cycle.target.pr_number, exact_sha: cycle.target.exact_sha, draft: false, mergeable: cycle.mergeable },
+    issue_contract: { contract_revision: cycle.target.contract_revision }, assignment_attempt: cycle.target.assignment_attempt,
+  });
+}
+
+function currentReviewCycleForPrincipal(principal, digest) {
+  const document = _reviewCycleStore.load(principal.projectId);
+  const cycle = Object.values(document.cycles).find((entry) => entry?.state === "current" && entry.target_identity_digest === digest);
+  if (!cycle || isProjectArchived(principal.projectId)) return null;
+  const context = readLiveBatchContext(principal.projectId);
+  const stillAssigned = context?.activated && context.parsed?.provenance === "owned" &&
+    context.installationId === cycle.target.installation_id && context.parsed.assignmentAttempt === cycle.target.assignment_attempt &&
+    context.parsed.workItems.some((item) => (item.ref || item).repoKey === cycle.target.repo_key && (item.ref || item).number === cycle.target.work_item.number);
+  return stillAssigned ? cycle : null;
+}
+
+// Action-time, not scheduler-time, #1033 contract verification. The caller
+// has initiated a nonce/receipt operation; a fresh authenticated read closes
+// the gap between a bounded REST cache observation and durable admission.
+async function verifyCurrentReviewCycleContract(principal, digest, cycle) {
+  return verifyActionContract(cycle,
+    () => currentReviewCycleForPrincipal(principal, digest),
+    fetchIssueContractRevision);
+}
+
+router.post("/api/review-cycle-nonce", async (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || !["re1", "re2"].includes(principal.agentId) || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).sort().join(",") !== "target_identity_digest" || !/^[a-f0-9]{64}$/.test(body.target_identity_digest)) {
+    return res.status(400).json({ ok: false, code: "invalid_review_cycle_nonce_request" });
+  }
+  try {
+    const cycle = currentReviewCycleForPrincipal(principal, body.target_identity_digest);
+    if (!cycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    const binding = getProjectRepositoryBindings(principal.projectId)
+      .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
+    const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
+    if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
+      return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    }
+    const verifiedCycle = await verifyCurrentReviewCycleContract(principal, body.target_identity_digest, cycle);
+    if (!verifiedCycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    const issued = _reviewCycleStore.issueReviewNonce(principal.projectId, targetFromStoredReviewCycle(principal.projectId, verifiedCycle), principal.agentId);
+    return res.json({ ok: true, cycle_id: issued.cycle_id, target_identity_digest: issued.target_identity_digest, nonce: issued.nonce });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "review_cycle_nonce_unavailable" });
+  }
+});
+
+router.post("/api/review-cycle-receipt", async (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || !["re1", "re2"].includes(principal.agentId) || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).sort().join(",") !== "nonce,review_id,target_identity_digest" ||
+      typeof body.target_identity_digest !== "string" || !/^[a-f0-9]{64}$/.test(body.target_identity_digest) ||
+      typeof body.nonce !== "string" || !/^qwrc_[a-f0-9]{32}$/.test(body.nonce) ||
+      !(typeof body.review_id === "string" || Number.isSafeInteger(body.review_id))) {
+    return res.status(400).json({ ok: false, code: "invalid_review_cycle_receipt" });
+  }
+  try {
+    const cycle = currentReviewCycleForPrincipal(principal, body.target_identity_digest);
+    if (!cycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    const binding = getProjectRepositoryBindings(principal.projectId)
+      .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
+    const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
+    if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
+      return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    }
+    const { stdout } = await _execFileAsync("gh", ["api", `repos/${cycle.target.repo}/pulls/${cycle.target.pr_number}/reviews/${body.review_id}`], {
+      encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER,
+    });
+    const review = JSON.parse(stdout);
+    const verdict = review?.state === "APPROVED" ? "approved" : review?.state === "CHANGES_REQUESTED" ? "changes_requested" : null;
+    if (!verdict || String(review?.commit_id || "").toLowerCase() !== cycle.target.exact_sha ||
+        String(review?.pull_request_url || "").endsWith(`/pulls/${cycle.target.pr_number}`) === false ||
+        !review?.submitted_at || review.id === undefined || typeof review.body !== "string" || !review.body.includes(body.nonce)) {
+      return res.status(409).json({ ok: false, code: "review_cycle_review_not_admitted" });
+    }
+    const verifiedCycle = await verifyCurrentReviewCycleContract(principal, body.target_identity_digest, cycle);
+    if (!verifiedCycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    const target = targetFromStoredReviewCycle(principal.projectId, verifiedCycle);
+    const updated = _reviewCycleStore.recordReviewReceiptWithNonce(principal.projectId, target, {
+      reviewer_role: principal.agentId, review_id: review.id, verdict, submitted_at: review.submitted_at,
+      target_identity_digest: body.target_identity_digest,
+    }, body.nonce);
+    const gate = _reviewCycleStore.planHeadGate(principal.projectId, target);
+    if (gate && !isProjectArchived(principal.projectId) && getProjectChatMode(principal.projectId) === "file") {
+      fileChat.appendTrustedReviewCycleEventOnce(principal.projectId, { project_id: principal.projectId, cycle: updated, plan: gate });
+    }
+    return res.json({ ok: true, review: updated.review_state, head_gate_due: updated.head_gate_due });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "review_cycle_receipt_unavailable" });
+  }
+});
 
 /**
  * Seed ~/.quadwork/{projectId}/OVERNIGHT-QUEUE.md from the template.
@@ -2420,7 +2532,7 @@ async function _mapLimited(items, limit, fn) {
 // gh-CLI path and GitHubPanel.tsx's `state === "OPEN"` dot (the prior GraphQL
 // transform lowercased to "open", an inconsistency this pins). ──
 function restIssueToCanonical(it) {
-  return {
+  const result = {
     number: it.number,
     title: it.title,
     state: (it.state || "").toUpperCase(),
@@ -2429,6 +2541,12 @@ function restIssueToCanonical(it) {
     assignees: (it.assignees || []).map((a) => ({ login: a.login })),
     createdAt: it.created_at,
   };
+  // The existing conditional /issues refresh is the only contract-observation
+  // source used by #1048 progress dispatch.  Missing body data fails closed.
+  if (Object.prototype.hasOwnProperty.call(it, "body") && (it.body === null || typeof it.body === "string")) {
+    result.contract_revision = issueContractRevision(it.body);
+  }
+  return result;
 }
 
 function restClosedIssueToCanonical(it) {
@@ -2464,6 +2582,10 @@ function restPullBaseToCanonical(p) {
     assignees: (p.assignees || []).map((a) => ({ login: a.login })),
     createdAt: p.created_at,
     tip: p.head && p.head.sha ? p.head.sha : null,
+    draft: p.draft === true,
+    // List snapshots do not promise mergeability.  Absence remains false and
+    // suppresses the Head gate rather than guessing from PR existence.
+    mergeable: p.mergeable === true,
   };
 }
 
@@ -3109,7 +3231,7 @@ fragment repoFields on Repository {
     nodes { number title url state closedAt }
   }
   openPRs: pullRequests(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-    nodes { number title url state headRefOid author { login } reviews(last: 100) { nodes { state author { login } submittedAt body } } createdAt }
+    nodes { number title url state headRefOid isDraft mergeable author { login } reviews(last: 100) { nodes { state author { login } submittedAt body } } createdAt }
   }
   mergedPRs: pullRequests(first: ${RECENT_FETCH_LIMIT}, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
     nodes { number title url state mergedAt author { login } }
@@ -3158,6 +3280,8 @@ fragment repoFields on Repository {
         })),
         createdAt: n.createdAt,
         tip: n.headRefOid || null,
+        draft: n.isDraft === true,
+        mergeable: n.mergeable === "MERGEABLE",
       }));
 
       const closedIssues = (repoData.closedIssues?.nodes || [])
@@ -3858,6 +3982,10 @@ function resolveDisplayedBatch(
   };
 }
 const BATCH_PROGRESS_TTL_MS = 10000;
+// Bound #1048's contract observations to the same server conditional REST
+// cache. A cold/stale/missing issue body is never replaced with a direct gh
+// read from the progress path; it simply withholds review dispatch.
+const REVIEW_CONTRACT_MAX_AGE_MS = 90_000;
 
 // #1031 route adapter around the pure work-item-ref identity module.  This
 // layer owns queue sections and installation provenance; the module owns token
@@ -4957,6 +5085,63 @@ function cachedRowWorkItemKey(row) {
   });
 }
 
+// #1048 observes only a fresh server REST cache row paired with the current
+// owned code assignment.  Persisted GITHUB.md/cold-cache rows, public chat,
+// and generic pulses never enter this adapter. Contract revisions come only
+// from the bounded existing conditional REST observation; absence withholds
+// a new dispatch instead of starting an extra read/poll loop.
+async function attachReviewCycleHandoffs(projectId, context, admission, items, stillCurrent) {
+  if (context.batchType !== "code" || context.parsed.provenance !== "owned" || !context.parsed.assignmentAttempt ||
+      !context.installationId || isProjectArchived(projectId)) return;
+  for (const row of items) {
+    const ref = row?.work_item_ref;
+    const live = row?.live_pr;
+    if (!ref || ref.kind !== "issue" || !live || !canonicalSha(live.tip) || !/^[a-f0-9]{40}$/i.test(live.tip)) continue;
+    const binding = context.repositories.find((entry) => entry.key === ref.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(ref.repo));
+    const snapshot = binding ? _graphqlCache.get(binding.cache_repo) : null;
+    const pr = snapshot?.prs?.find((entry) => entry?.number === live.number && canonicalSha(entry.tip) === canonicalSha(live.tip));
+    // A persisted/cold/partial row cannot establish current dispatch identity.
+    if (!binding || !pr?.checkEvidence || !stillCurrent() || !isAdmissionCurrent(admission)) continue;
+    const contractObservation = currentContractObservation(snapshot, ref.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS);
+    if (!contractObservation ||
+        !stillCurrent() || !isAdmissionCurrent(admission)) continue;
+    let target;
+    try {
+      target = deriveLegacyReviewTarget({
+        installation_id: context.installationId,
+        project_id: projectId,
+        repository: { key: binding.key, repo: binding.repo, ci_policy: binding.ci_policy ?? null },
+        work_item: { repoKey: ref.repo_key, repo: ref.repo, number: ref.number, kind: "issue" },
+        pr: { number: live.number, exact_sha: canonicalSha(live.tip), draft: pr.draft === true, mergeable: pr.mergeable === true },
+        issue_contract: { contract_revision: contractObservation.contract_revision },
+        assignment_attempt: context.parsed.assignmentAttempt,
+      });
+      // Persist the first-observed timestamp in the cycle before applying
+      // #1049's grace evaluator; restart reads the same durable timestamp.
+      const pre = _reviewCycleStore.reconcile(projectId, target).cycle;
+      const ciLess = binding.ci_policy?.mode === "ci-less" ? _ciEvidenceStore.readByIdentity({
+        project_id: projectId, installation_id: context.installationId, repo_key: binding.key, repo: binding.repo,
+        item: { repo_key: ref.repo_key, repo: ref.repo, number: ref.number, kind: "issue" },
+        assignment_attempt: context.parsed.assignmentAttempt, contract_revision: contractObservation.contract_revision,
+        pr_number: live.number, exact_sha: canonicalSha(live.tip), policy_version: binding.ci_policy.version,
+      }) : null;
+      const ci = evaluateCiEvidence({
+        policy: binding.ci_policy ?? null, exact_sha: canonicalSha(live.tip), observed_at: pr.checkEvidence.observed_at,
+        first_observed_at: pre.created_at, source_status: pr.checkEvidence.source_status,
+        check_runs: pr.checkEvidence.check_runs, ci_less_evidence: ciLess, now: Date.now(),
+      });
+      const observation = _reviewCycleDispatcher.observe({ project_id: projectId, target, ci_state: ci.state, archived: false });
+      row.review_handoff = observation.handoff;
+      if (getProjectChatMode(projectId) === "file" && stillCurrent() && isAdmissionCurrent(admission) && !isProjectArchived(projectId)) {
+        _reviewCycleDispatcher.deliver(projectId, observation,
+          (candidate) => fileChat.appendTrustedReviewCycleEventOnce(projectId, candidate));
+      }
+    } catch {
+      // Authoritative input failures are fail-closed: no handoff and no chat.
+    }
+  }
+}
+
 function ownedTerminalRows(snapshot, context, admission) {
   const rows = new Map();
   const assignment = assignmentView(context, { current: true });
@@ -5088,6 +5273,8 @@ async function computeOwnedBatchProgress(projectId, context, admission) {
     if (!row) row = softRetryingRow(ref.number);
     return decorateBatchRow(row, ref, assignment);
   });
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+  await attachReviewCycleHandoffs(projectId, context, admission, items, stillCurrent);
   if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
   const complete = items.every((item) => isTerminalBatchItem(item));
   const cycle = refs

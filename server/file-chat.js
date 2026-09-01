@@ -3,6 +3,7 @@ const path = require("path");
 const os = require("os");
 const { ensureSecureDir, writeSecureFile } = require("./config");
 const { envelopeFor } = require("./trusted-event-transport");
+const { envelopeFor: reviewCycleEnvelopeFor } = require("./review-cycle-event");
 
 const MENTION_RE = /@(\w[\w-]*)/g;
 
@@ -242,6 +243,39 @@ function findTrustedMonitorEvent(projectId, state, envelope) {
   return null;
 }
 
+function sameTrustedReviewCycleEvent(record, envelope) {
+  const event = record?.trusted_event;
+  if (!event || typeof event !== "object" || event.scope !== "review_cycle" || event.correlation_id !== envelope.correlation_id) return null;
+  const matches = event.version === envelope.version && event.kind === envelope.kind &&
+    JSON.stringify(event.anchors) === JSON.stringify(envelope.anchors) &&
+    record.sender === "system" && record.type === "system" && record.text === envelope.text;
+  if (!matches) throw new Error("trusted review-cycle correlation collision");
+  return record;
+}
+
+function findTrustedReviewCycleEvent(projectId, state, envelope) {
+  for (const record of state.cache) {
+    const match = sameTrustedReviewCycleEvent(record, envelope);
+    if (match) return match;
+  }
+  const filePath = chatFile(projectId);
+  if (!fs.existsSync(filePath)) return null;
+  let content;
+  try { content = fs.readFileSync(filePath, "utf8"); }
+  catch (error) { throw new Error(`trusted review-cycle event read failed: ${error.message}`); }
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line);
+      const match = sameTrustedReviewCycleEvent(record, envelope);
+      if (match) return match;
+    } catch (error) {
+      if (error?.message === "trusted review-cycle correlation collision") throw error;
+    }
+  }
+  return null;
+}
+
 // Server-only closed append seam for the Monitor transport. It deliberately
 // reconstructs the canonical envelope rather than accepting caller prose,
 // recipient lists, or arbitrary JSONL metadata. Ordinary system messages keep
@@ -260,6 +294,37 @@ function appendTrustedMonitorEventOnce(projectId, candidate) {
   const existing = findTrustedMonitorEvent(projectId, state, envelope);
   if (existing) return { ok: true, id: existing.id, duplicate: true };
   const metadata = Object.freeze({
+    version: envelope.version,
+    correlation_id: envelope.correlation_id,
+    kind: envelope.kind,
+    anchors: envelope.anchors,
+  });
+  const record = appendRecord(projectId, {
+    sender: "system",
+    channel: "general",
+    type: "system",
+    text: envelope.text,
+  }, metadata);
+  return { ok: true, id: record.id, duplicate: false };
+}
+
+// #1048's private #1036 append seam.  The dispatcher supplies only a durable
+// cycle snapshot and M1 event plan; this function reconstructs the fixed text,
+// recipients, anchors and system identity.  Public chat routes never expose
+// either argument shape, so prose/pulses cannot mint a cycle delivery.
+function appendTrustedReviewCycleEventOnce(projectId, candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+      Object.keys(candidate).sort().join(",") !== "cycle,plan,project_id") {
+    throw new Error("trusted review-cycle envelope required");
+  }
+  const envelope = reviewCycleEnvelopeFor(projectId, candidate.cycle, candidate.plan);
+  if (candidate.project_id !== envelope.project_id) throw new Error("trusted review-cycle envelope invalid");
+  const state = getState(projectId);
+  if (state.nextId === null) throw new Error(`Project ${projectId} not initialized — call initProject first`);
+  const existing = findTrustedReviewCycleEvent(projectId, state, envelope);
+  if (existing) return { ok: true, id: existing.id, duplicate: true };
+  const metadata = Object.freeze({
+    scope: "review_cycle",
     version: envelope.version,
     correlation_id: envelope.correlation_id,
     kind: envelope.kind,
@@ -408,6 +473,7 @@ module.exports = {
   appendMessage,
   // Private server composition seam. No route/MCP surface exposes it.
   appendTrustedMonitorEventOnce,
+  appendTrustedReviewCycleEventOnce,
   readMessages,
   getNextId,
   parseMentions,

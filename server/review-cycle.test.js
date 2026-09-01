@@ -120,6 +120,47 @@ assert.equal(store.planReviewRequest(PROJECT, canonical).correlation_id, dispatc
 assert.equal(store.planReviewRequest(PROJECT, canonical).created, false);
 ok(true, "ready plus pending CI records one stable server-transport correlation without sending prose");
 
+// Shared GitHub principals cannot claim each other's review object: each role
+// gets a private one-time cycle nonce, which is consumed against one review id.
+const nonceRe1 = store.issueReviewNonce(PROJECT, canonical, "re1");
+assert.equal(store.issueReviewNonce(PROJECT, canonical, "re1").nonce, nonceRe1.nonce);
+const nonceRe2 = store.issueReviewNonce(PROJECT, canonical, "re2");
+assert.notEqual(nonceRe1.nonce, nonceRe2.nonce);
+assert.throws(
+  () => store.recordReviewReceiptWithNonce(PROJECT, canonical, receipt("re2", 101, "approved", { target_identity_digest: canonical.target_identity_digest }), nonceRe1.nonce),
+  (error) => error.code === "review_cycle_nonce_invalid",
+);
+assert.throws(
+  () => store.recordReviewReceiptWithNonce(PROJECT, canonical, receipt("re1", 101, "approved", { target_identity_digest: canonical.target_identity_digest }), "qwrc_" + "0".repeat(32)),
+  (error) => error.code === "review_cycle_nonce_invalid",
+);
+store.recordReviewReceiptWithNonce(PROJECT, canonical, receipt("re1", 101, "approved", { target_identity_digest: canonical.target_identity_digest }), nonceRe1.nonce);
+assert.equal(store.recordReviewReceiptWithNonce(PROJECT, canonical, receipt("re1", 101, "approved", { target_identity_digest: canonical.target_identity_digest }), nonceRe1.nonce).review_state, "1/2");
+assert.throws(
+  () => store.recordReviewReceiptWithNonce(PROJECT, canonical, receipt("re1", 102, "approved", { target_identity_digest: canonical.target_identity_digest }), nonceRe1.nonce),
+  (error) => error.code === "review_cycle_nonce_consumed",
+);
+ok(true, "private reviewer nonces reject cross-role, missing/wrong, and reused-review claims");
+
+// A crash/failing atomic replace cannot burn a valid nonce before its receipt
+// exists. The old document remains fully retryable (nonce unconsumed, no role
+// receipt) because the combined operation has exactly one durable write.
+const failingFs = new Proxy(fs, {
+  get(targetFs, property) {
+    if (property === "renameSync") return () => { throw new Error("simulated crash before replace"); };
+    return targetFs[property];
+  },
+});
+const failingStore = new ReviewCycleStore({ rootDir: ROOT, now, fsImpl: failingFs });
+assert.throws(
+  () => failingStore.recordReviewReceiptWithNonce(PROJECT, canonical, receipt("re2", 202, "approved", { target_identity_digest: canonical.target_identity_digest }), nonceRe2.nonce),
+  (error) => error.code === "review_cycle_store_write_failed",
+);
+const afterFailedWrite = freshStore().current(PROJECT, canonical);
+assert.equal(afterFailedWrite.receipts.re2, null);
+assert.equal(afterFailedWrite.review_nonces.re2.consumed_at, null);
+ok(true, "failed receipt write preserves nonce and receipt together for retry");
+
 cycle = store.recordReviewReceipt(PROJECT, canonical, receipt("re1", 101, "approved", {
   target_identity_digest: canonical.target_identity_digest,
 }));

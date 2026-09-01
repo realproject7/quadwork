@@ -1,0 +1,11 @@
+"use strict";
+const assert = require("node:assert/strict");
+const { currentContractObservation } = require("./review-cycle-contract-observation");
+const revision = "a".repeat(64);
+const now = 1_800_000_000_000;
+const fresh = { ts: now - 1_000, issues: [{ number: 42, contract_revision: revision }] };
+assert.equal(currentContractObservation(fresh, 42, now)?.contract_revision, revision, "fresh conditional observation is usable");
+assert.equal(currentContractObservation({ ts: now - 91_000, issues: fresh.issues }, 42, now), null, "stale cache cannot dispatch");
+assert.equal(currentContractObservation({ ts: now, issues: [{ number: 42 }] }, 42, now), null, "missing issue contract cannot dispatch");
+assert.equal(currentContractObservation(null, 42, now), null, "cold cache cannot dispatch");
+console.log("review-cycle-contract-observation.test.js: all assertions passed");

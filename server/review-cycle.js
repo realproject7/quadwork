@@ -13,7 +13,10 @@ const path = require("path");
 const { assertWorkItemRef } = require("./work-item-ref");
 const { canonicalSha, normalizeCiPolicy } = require("./ci-evidence-policy");
 
-const REVIEW_CYCLE_STORE_VERSION = 1;
+// V2 adds the persisted, bounded reviewer lease/reminder facts required by
+// the server dispatcher.  V1 documents are migrated in-memory on read; the
+// next normal atomic write seals the V2 form.  No history is discarded.
+const REVIEW_CYCLE_STORE_VERSION = 3;
 const REVIEW_CYCLE_FILENAME = "review-cycles.json";
 const LEGACY_REVIEW_TARGET_KIND = "legacy_work_item_pr";
 
@@ -24,9 +27,11 @@ const REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const ASSIGNMENT_ATTEMPT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CONTRACT_REVISION_RE = /^[a-f0-9]{64}$/;
 const DIGEST_RE = /^[a-f0-9]{64}$/;
+const EXACT_SHA_RE = /^[a-f0-9]{40}$/;
 const CYCLE_ID_RE = /^rc_[a-f0-9]{32}$/;
 const CORRELATION_ID_RE = /^rc_evt_[a-f0-9]{40}$/;
 const REVIEW_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const REVIEW_NONCE_RE = /^qwrc_[a-f0-9]{32}$/;
 
 const READINESS_STATES = new Set(["draft_or_not_ready", "contract_changed", "ready"]);
 const CI_STATES = new Set([
@@ -43,7 +48,7 @@ const CI_STATES = new Set([
 ]);
 const REVIEW_STATES = new Set(["not_dispatched", "0/2", "1/2", "2/2", "changes_requested"]);
 const CYCLE_STATES = new Set(["current", "invalidated", "terminal"]);
-const EVENT_KINDS = new Set(["review_request", "head_gate_due", "contract_changed"]);
+const EVENT_KINDS = new Set(["review_request", "review_reminder", "head_gate_due", "contract_changed"]);
 const REVIEWER_ROLES = new Set(["re1", "re2"]);
 const VERDICTS = new Set(["approved", "changes_requested"]);
 const DISPATCHABLE_CI_STATES = new Set(["pending", "pass", "ci_less_pending", "ci_less_pass"]);
@@ -201,7 +206,7 @@ function assertTargetIdentity(identity, code = "invalid_review_cycle_target") {
   if (!INSTALLATION_ID_RE.test(identity.installation_id) || !validProjectId(identity.project_id) ||
       !REPOSITORY_KEY_RE.test(identity.repo_key) || !canonicalRepository(identity.repo) ||
       !Number.isSafeInteger(identity.pr_number) || identity.pr_number < 1 ||
-      !canonicalSha(identity.exact_sha) || !CONTRACT_REVISION_RE.test(identity.contract_revision) ||
+      !canonicalSha(identity.exact_sha) || !EXACT_SHA_RE.test(identity.exact_sha) || !CONTRACT_REVISION_RE.test(identity.contract_revision) ||
       !ASSIGNMENT_ATTEMPT_RE.test(identity.assignment_attempt)) {
     fail(code, "legacy review target identity is invalid");
   }
@@ -243,7 +248,7 @@ function deriveLegacyReviewTarget(source) {
       !REPOSITORY_KEY_RE.test(source.repository.key) || !canonicalRepository(source.repository.repo) ||
       !ASSIGNMENT_ATTEMPT_RE.test(source.assignment_attempt) ||
       !Number.isSafeInteger(source.pr.number) || source.pr.number < 1 ||
-      !canonicalSha(source.pr.exact_sha) || typeof source.pr.draft !== "boolean" ||
+      !canonicalSha(source.pr.exact_sha) || !EXACT_SHA_RE.test(source.pr.exact_sha) || typeof source.pr.draft !== "boolean" ||
       typeof source.pr.mergeable !== "boolean" || !CONTRACT_REVISION_RE.test(source.issue_contract.contract_revision)) {
     fail("invalid_review_cycle_source", "server-derived legacy review source is invalid");
   }
@@ -309,9 +314,13 @@ function assertDerivedTarget(target) {
   return target;
 }
 
-function eventCorrelation(cycleId, kind) {
-  if (!CYCLE_ID_RE.test(cycleId) || !EVENT_KINDS.has(kind)) fail("invalid_review_cycle_event", "review-cycle event is invalid");
-  return `rc_evt_${crypto.createHash("sha256").update(`${cycleId}:${kind}`, "utf8").digest("hex").slice(0, 40)}`;
+function eventCorrelation(cycleId, kind, recipient = null) {
+  if (!CYCLE_ID_RE.test(cycleId) || !EVENT_KINDS.has(kind) ||
+      (kind === "review_reminder" ? !REVIEWER_ROLES.has(recipient) : recipient !== null)) {
+    fail("invalid_review_cycle_event", "review-cycle event is invalid");
+  }
+  const suffix = recipient === null ? "" : `:${recipient}`;
+  return `rc_evt_${crypto.createHash("sha256").update(`${cycleId}:${kind}${suffix}`, "utf8").digest("hex").slice(0, 40)}`;
 }
 
 function reviewState(cycle) {
@@ -339,13 +348,39 @@ function emptyDocument() {
   return { version: REVIEW_CYCLE_STORE_VERSION, cycles: {}, slots: {} };
 }
 
-function eventRecord(value, cycleId, kind) {
+function eventRecord(value, cycleId, kind, recipient = null) {
   if (value === null) return null;
   exactKeys(value, ["correlation_id", "created_at"], "review_cycle_store_invalid");
-  if (value.correlation_id !== eventCorrelation(cycleId, kind) || !validIsoTimestamp(value.created_at)) {
+  if (value.correlation_id !== eventCorrelation(cycleId, kind, recipient) || !validIsoTimestamp(value.created_at)) {
     fail("review_cycle_store_invalid", "review-cycle event record is invalid");
   }
   return { correlation_id: value.correlation_id, created_at: validIsoTimestamp(value.created_at) };
+}
+
+function reviewLease(value, reviewRequest) {
+  if (value === null) {
+    if (reviewRequest !== null) fail("review_cycle_store_invalid", "review-cycle request requires a review lease");
+    return null;
+  }
+  exactKeys(value, ["started_at", "reminder_due_at"], "review_cycle_store_invalid");
+  const startedAt = validIsoTimestamp(value.started_at);
+  const reminderDueAt = validIsoTimestamp(value.reminder_due_at);
+  if (!startedAt || !reminderDueAt || Date.parse(reminderDueAt) < Date.parse(startedAt)) {
+    fail("review_cycle_store_invalid", "review-cycle lease is invalid");
+  }
+  return { started_at: startedAt, reminder_due_at: reminderDueAt };
+}
+
+function reviewNonce(value, role, digest) {
+  if (value === null) return null;
+  exactKeys(value, ["nonce", "issued_at", "consumed_at", "review_id"], "review_cycle_store_invalid");
+  const issuedAt = validIsoTimestamp(value.issued_at);
+  const consumedAt = value.consumed_at === null ? null : validIsoTimestamp(value.consumed_at);
+  const normalizedReviewId = value.review_id === null ? null : reviewId(value.review_id);
+  if (!REVIEW_NONCE_RE.test(value.nonce) || !issuedAt || (consumedAt === null) !== (normalizedReviewId === null)) {
+    fail("review_cycle_store_invalid", "review-cycle reviewer nonce is invalid");
+  }
+  return { nonce: value.nonce, issued_at: issuedAt, consumed_at: consumedAt, review_id: normalizedReviewId };
 }
 
 function normalizedReceipt(value, role, digest) {
@@ -379,11 +414,13 @@ function normalizeCycle(value, expectedId) {
     "state",
     "invalidation",
     "events",
+    "review_lease",
+    "review_nonces",
     "receipts",
     "created_at",
     "updated_at",
   ], "review_cycle_store_invalid");
-  if (value.version !== 1 || value.cycle_id !== expectedId || !CYCLE_ID_RE.test(value.cycle_id) ||
+  if (value.version !== REVIEW_CYCLE_STORE_VERSION || value.cycle_id !== expectedId || !CYCLE_ID_RE.test(value.cycle_id) ||
       !DIGEST_RE.test(value.slot_digest) || !DIGEST_RE.test(value.target_identity_digest) ||
       !READINESS_STATES.has(value.readiness) || !CI_STATES.has(value.ci_state) ||
       typeof value.mergeable !== "boolean" || !CYCLE_STATES.has(value.state) ||
@@ -394,8 +431,10 @@ function normalizeCycle(value, expectedId) {
   if (value.target_identity_digest !== targetIdentityDigest(value.target) || value.slot_digest !== targetSlotDigest(value.target)) {
     fail("review_cycle_store_invalid", "review-cycle target digest is invalid");
   }
-  exactKeys(value.events, ["review_request", "head_gate_due", "contract_changed"], "review_cycle_store_invalid");
+  exactKeys(value.events, ["review_request", "review_reminder", "head_gate_due", "contract_changed"], "review_cycle_store_invalid");
+  exactKeys(value.events.review_reminder, ["re1", "re2"], "review_cycle_store_invalid");
   exactKeys(value.receipts, ["re1", "re2"], "review_cycle_store_invalid");
+  exactKeys(value.review_nonces, ["re1", "re2"], "review_cycle_store_invalid");
   let invalidation = null;
   if (value.invalidation !== null) {
     exactKeys(value.invalidation, ["reasons", "at"], "review_cycle_store_invalid");
@@ -415,7 +454,7 @@ function normalizeCycle(value, expectedId) {
     fail("review_cycle_store_invalid", "invalidated review cycle requires a reason");
   }
   return {
-    version: 1,
+    version: REVIEW_CYCLE_STORE_VERSION,
     cycle_id: value.cycle_id,
     slot_digest: value.slot_digest,
     target: clone(value.target),
@@ -427,8 +466,17 @@ function normalizeCycle(value, expectedId) {
     invalidation,
     events: {
       review_request: eventRecord(value.events.review_request, value.cycle_id, "review_request"),
+      review_reminder: {
+        re1: eventRecord(value.events.review_reminder.re1, value.cycle_id, "review_reminder", "re1"),
+        re2: eventRecord(value.events.review_reminder.re2, value.cycle_id, "review_reminder", "re2"),
+      },
       head_gate_due: eventRecord(value.events.head_gate_due, value.cycle_id, "head_gate_due"),
       contract_changed: eventRecord(value.events.contract_changed, value.cycle_id, "contract_changed"),
+    },
+    review_lease: reviewLease(value.review_lease, value.events.review_request),
+    review_nonces: {
+      re1: reviewNonce(value.review_nonces.re1, "re1", value.target_identity_digest),
+      re2: reviewNonce(value.review_nonces.re2, "re2", value.target_identity_digest),
     },
     receipts: {
       re1: normalizedReceipt(value.receipts.re1, "re1", value.target_identity_digest),
@@ -439,7 +487,51 @@ function normalizeCycle(value, expectedId) {
   };
 }
 
+function migrateV1Document(value) {
+  exactKeys(value, ["version", "cycles", "slots"], "review_cycle_store_invalid");
+  if (value.version !== 1 || !isPlainObject(value.cycles) || !isPlainObject(value.slots)) {
+    fail("review_cycle_store_invalid", "review-cycle document is invalid");
+  }
+  const cycles = {};
+  for (const [cycleId, raw] of Object.entries(value.cycles)) {
+    if (!isPlainObject(raw)) fail("review_cycle_store_invalid", "review-cycle record is invalid");
+    const events = isPlainObject(raw.events) ? raw.events : null;
+    if (!events) fail("review_cycle_store_invalid", "review-cycle record is invalid");
+    const request = events.review_request || null;
+    cycles[cycleId] = {
+      ...clone(raw),
+      version: 2,
+      events: {
+        review_request: request,
+        review_reminder: { re1: null, re2: null },
+        head_gate_due: events.head_gate_due || null,
+        contract_changed: events.contract_changed || null,
+      },
+      // A historic request had no dispatch-time lease.  Preserve its original
+      // timestamp and make it immediately eligible for one measured reminder;
+      // this is safer than silently losing a pending reviewer on upgrade.
+      review_lease: request ? { started_at: request.created_at, reminder_due_at: request.created_at } : null,
+    };
+  }
+  return { version: 2, cycles, slots: clone(value.slots) };
+}
+
+function migrateV2Document(value) {
+  exactKeys(value, ["version", "cycles", "slots"], "review_cycle_store_invalid");
+  if (value.version !== 2 || !isPlainObject(value.cycles) || !isPlainObject(value.slots)) {
+    fail("review_cycle_store_invalid", "review-cycle document is invalid");
+  }
+  const cycles = Object.fromEntries(Object.entries(value.cycles).map(([id, raw]) => [id, {
+    ...clone(raw),
+    version: REVIEW_CYCLE_STORE_VERSION,
+    review_nonces: { re1: null, re2: null },
+  }]));
+  return { version: REVIEW_CYCLE_STORE_VERSION, cycles, slots: clone(value.slots) };
+}
+
 function normalizeDocument(value) {
+  if (isPlainObject(value) && value.version === 1) value = migrateV1Document(value);
+  if (isPlainObject(value) && value.version === 2) value = migrateV2Document(value);
   exactKeys(value, ["version", "cycles", "slots"], "review_cycle_store_invalid");
   if (value.version !== REVIEW_CYCLE_STORE_VERSION || !isPlainObject(value.cycles) || !isPlainObject(value.slots)) {
     fail("review_cycle_store_invalid", "review-cycle document is invalid");
@@ -497,13 +589,14 @@ function verifyDirectory(fsImpl, directory) {
   }
 }
 
-function eventPlan(cycle, kind, created) {
-  const event = cycle.events[kind];
+function eventPlan(cycle, kind, created, recipient = null) {
+  const event = kind === "review_reminder" ? cycle.events.review_reminder[recipient] : cycle.events[kind];
   return deepFreeze({
     kind,
     cycle_id: cycle.cycle_id,
     target_identity_digest: cycle.target_identity_digest,
     correlation_id: event.correlation_id,
+    ...(recipient ? { recipient } : {}),
     created,
   });
 }
@@ -530,6 +623,9 @@ class ReviewCycleStore {
     this.fs = options.fsImpl || fs;
     this.now = options.now || (() => new Date());
     this.randomBytes = options.randomBytes || crypto.randomBytes;
+    this.reviewLeaseMs = Number.isSafeInteger(options.reviewLeaseMs) && options.reviewLeaseMs >= 0
+      ? options.reviewLeaseMs
+      : 30 * 60 * 1000;
   }
 
   pathFor(projectId) {
@@ -594,7 +690,7 @@ class ReviewCycleStore {
     if (!Buffer.isBuffer(entropy) || entropy.length < 16) fail("review_cycle_store_write_failed", "review-cycle entropy is unavailable");
     const now = clockIso(this.now);
     return {
-      version: 1,
+      version: REVIEW_CYCLE_STORE_VERSION,
       cycle_id: `rc_${entropy.subarray(0, 16).toString("hex")}`,
       slot_digest: target.slot_digest,
       target: clone(target.identity),
@@ -604,7 +700,9 @@ class ReviewCycleStore {
       mergeable: target.observed.mergeable,
       state: "current",
       invalidation: null,
-      events: { review_request: null, head_gate_due: null, contract_changed: null },
+      events: { review_request: null, review_reminder: { re1: null, re2: null }, head_gate_due: null, contract_changed: null },
+      review_lease: null,
+      review_nonces: { re1: null, re2: null },
       receipts: { re1: null, re2: null },
       created_at: now,
       updated_at: now,
@@ -641,6 +739,19 @@ class ReviewCycleStore {
     const document = this._read(projectId);
     const cycle = this._requireCurrent(document, projectId, target);
     return safeCycleSnapshot(cycle);
+  }
+
+  // Delivery code needs a tiny stale-observation guard without reconstructing
+  // a caller-controlled target envelope.  It can ask only whether a durable
+  // cycle id/digest remains the slot's current authority.
+  isCurrentCycle(projectId, cycleId, digest) {
+    if (!validProjectId(projectId) || !CYCLE_ID_RE.test(cycleId) || !DIGEST_RE.test(digest)) {
+      fail("invalid_review_cycle_target", "review-cycle identity is invalid");
+    }
+    const document = this._read(projectId);
+    const cycle = document.cycles[cycleId];
+    return !!cycle && cycle.state === "current" && cycle.target_identity_digest === digest &&
+      document.slots[cycle.slot_digest] === cycleId;
   }
 
   /**
@@ -697,6 +808,7 @@ class ReviewCycleStore {
       invalidated = {
         cycle_id: current.cycle_id,
         reasons: [...reasons],
+        cycle: safeCycleSnapshot(current),
         contract_change: current.events.contract_changed ? eventPlan(current, "contract_changed", true) : null,
       };
     }
@@ -764,9 +876,60 @@ class ReviewCycleStore {
       correlation_id: eventCorrelation(cycle.cycle_id, "review_request"),
       created_at: at,
     };
+    cycle.review_lease = {
+      started_at: at,
+      reminder_due_at: new Date(Date.parse(at) + this.reviewLeaseMs).toISOString(),
+    };
     cycle.updated_at = at;
     this._write(projectId, document);
     return eventPlan(cycle, "review_request", true);
+  }
+
+  // Nonces are issued only through the authenticated reviewer-private path.
+  // They are durable, role-bound, cycle-bound, and never copied into chat or
+  // the public handoff summary.  Reissuing to the same role is idempotent;
+  // the other role can never read or consume it.
+  issueReviewNonce(projectId, target, role) {
+    if (!REVIEWER_ROLES.has(role)) fail("invalid_review_cycle_reviewer", "reviewer role is invalid");
+    const document = this._read(projectId);
+    const cycle = this._requireCurrent(document, projectId, target);
+    if (cycle.readiness !== "ready" || !cycle.events.review_request || cycle.receipts[role]) {
+      fail("review_cycle_review_not_admitted", "reviewer nonce is not admitted for this cycle");
+    }
+    if (cycle.review_nonces[role]) return deepFreeze({ nonce: cycle.review_nonces[role].nonce, cycle_id: cycle.cycle_id, target_identity_digest: cycle.target_identity_digest });
+    const entropy = this.randomBytes(16);
+    if (!Buffer.isBuffer(entropy) || entropy.length < 16) fail("review_cycle_store_write_failed", "review-cycle entropy is unavailable");
+    const at = clockIso(this.now);
+    cycle.review_nonces[role] = { nonce: `qwrc_${entropy.subarray(0, 16).toString("hex")}`, issued_at: at, consumed_at: null, review_id: null };
+    cycle.updated_at = at;
+    this._write(projectId, document);
+    return deepFreeze({ nonce: cycle.review_nonces[role].nonce, cycle_id: cycle.cycle_id, target_identity_digest: cycle.target_identity_digest });
+  }
+
+  /**
+   * A cycle has one persisted lease and at most one reminder per still-missing
+   * role.  The dispatcher supplies no prose or recipient list: this method
+   * derives both from durable cycle facts and is harmless before the deadline.
+   */
+  planReviewReminder(projectId, target, role) {
+    if (!REVIEWER_ROLES.has(role)) fail("invalid_review_cycle_reviewer", "reviewer role is invalid");
+    const document = this._read(projectId);
+    const cycle = this._requireCurrent(document, projectId, target);
+    const existing = cycle.events.review_reminder[role];
+    if (existing) return eventPlan(cycle, "review_reminder", false, role);
+    if (cycle.readiness !== "ready" || !DISPATCHABLE_CI_STATES.has(cycle.ci_state) || !cycle.events.review_request || !cycle.review_lease ||
+        cycle.receipts[role] || reviewState(cycle) === "changes_requested" ||
+        Date.parse(clockIso(this.now)) < Date.parse(cycle.review_lease.reminder_due_at)) {
+      return null;
+    }
+    const at = clockIso(this.now);
+    cycle.events.review_reminder[role] = {
+      correlation_id: eventCorrelation(cycle.cycle_id, "review_reminder", role),
+      created_at: at,
+    };
+    cycle.updated_at = at;
+    this._write(projectId, document);
+    return eventPlan(cycle, "review_reminder", true, role);
   }
 
   recordReviewReceipt(projectId, target, receipt) {
@@ -807,6 +970,52 @@ class ReviewCycleStore {
     }
     cycle.receipts[role] = normalized;
     cycle.updated_at = clockIso(this.now);
+    this._write(projectId, document);
+    return safeCycleSnapshot(cycle);
+  }
+
+  // Receipt and nonce consumption share one read/validate/write transaction.
+  // A failed atomic write leaves both durable fields untouched; an exact retry
+  // after success is idempotent, while every conflicting claim fails before
+  // the nonce is marked consumed.
+  recordReviewReceiptWithNonce(projectId, target, receipt, nonce) {
+    exactKeys(receipt, ["reviewer_role", "review_id", "verdict", "submitted_at", "target_identity_digest"], "invalid_review_cycle_receipt");
+    const role = receipt.reviewer_role;
+    const normalizedId = reviewId(receipt.review_id);
+    const submittedAt = validIsoTimestamp(receipt.submitted_at);
+    if (!REVIEWER_ROLES.has(role) || !normalizedId || !VERDICTS.has(receipt.verdict) || !submittedAt ||
+        !DIGEST_RE.test(receipt.target_identity_digest) || !REVIEW_NONCE_RE.test(nonce)) {
+      fail("invalid_review_cycle_receipt", "review receipt nonce is invalid");
+    }
+    const document = this._read(projectId);
+    const cycle = this._requireCurrent(document, projectId, target);
+    if (receipt.target_identity_digest !== cycle.target_identity_digest) fail("review_cycle_stale_target", "review receipt does not bind the current cycle identity");
+    if (cycle.readiness !== "ready" || !cycle.events.review_request) fail("review_cycle_review_not_admitted", "review receipt is not admitted for this cycle");
+    const nonceRecord = cycle.review_nonces[role];
+    if (!nonceRecord || nonceRecord.nonce !== nonce) fail("review_cycle_nonce_invalid", "reviewer nonce is missing or belongs to another role");
+    const normalized = {
+      reviewer_role: role, review_id: normalizedId, verdict: receipt.verdict,
+      submitted_at: submittedAt, target_identity_digest: cycle.target_identity_digest,
+    };
+    const existing = cycle.receipts[role];
+    if (nonceRecord.consumed_at !== null) {
+      if (nonceRecord.review_id === normalizedId && existing && stableJson(existing) === stableJson(normalized)) return safeCycleSnapshot(cycle);
+      fail("review_cycle_nonce_consumed", "reviewer nonce was already consumed");
+    }
+    if (existing) {
+      if (stableJson(existing) === stableJson(normalized)) fail("review_cycle_nonce_invalid", "a nonce is required for the recorded role receipt");
+      fail("review_cycle_role_already_receipted", "reviewer role already has a distinct receipt for this cycle");
+    }
+    for (const priorCycle of Object.values(document.cycles)) {
+      for (const priorReceipt of Object.values(priorCycle.receipts)) {
+        if (priorReceipt?.review_id === normalizedId) fail("review_cycle_review_id_already_bound", "review ID is already bound to another role or cycle");
+      }
+    }
+    const at = clockIso(this.now);
+    nonceRecord.consumed_at = at;
+    nonceRecord.review_id = normalizedId;
+    cycle.receipts[role] = normalized;
+    cycle.updated_at = at;
     this._write(projectId, document);
     return safeCycleSnapshot(cycle);
   }
@@ -852,6 +1061,7 @@ module.exports = {
   assertDerivedTarget,
   targetIdentityDigest,
   targetSlotDigest,
+  eventCorrelation,
   reviewState,
   headGateDue,
 };
