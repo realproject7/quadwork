@@ -164,9 +164,42 @@ const ISSUE_REVIEW_CYCLE_NONCE_TOOL = {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
 
+// The Head resume path intentionally has no caller-selected project, agent,
+// generation, source, or endpoint.  The server derives that authority from
+// the per-role shim token and its current Head binding.
+const CHAT_RESUME_TOOL = {
+  name: "chat_resume",
+  description: "Resume the authenticated Head's bounded Primary Chat evidence page. The server derives the active Head binding from this shim token.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      cursor: { type: ["string", "null"], maxLength: 2048 },
+      limit: { type: "integer", minimum: 1, maximum: 64 },
+    },
+    required: ["cursor", "limit"],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+function plainRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function parseChatResumeArguments(value) {
+  if (!plainRecord(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== "cursor" || keys[1] !== "limit") return null;
+  if (value.cursor !== null && (typeof value.cursor !== "string" || value.cursor.length > 2048)) return null;
+  if (!Number.isSafeInteger(value.limit) || value.limit < 1 || value.limit > 64) return null;
+  return { cursor: value.cursor, limit: value.limit };
+}
+
 function toolsForActor() {
   if (!PROJECT_ROLES.has(AGENT)) return CHAT_TOOLS;
   const tools = [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL, READ_CI_EVIDENCE_TOOL];
+  if (AGENT === "head" && TOKEN) tools.push(CHAT_RESUME_TOOL);
   if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL);
   if (AGENT === "re1" || AGENT === "re2") tools.push(ISSUE_REVIEW_CYCLE_NONCE_TOOL, SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL);
   return tools;
@@ -209,6 +242,23 @@ function httpRequest(method, urlPath, body, extraHeaders) {
 
 async function handleToolCall(id, name, params) {
   try {
+    if (name === "chat_resume") {
+      // Hidden calls from every non-Head shim are rejected locally.  A Head
+      // process must also have the token that the fixed endpoint authenticates.
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: chat_resume");
+      const request = parseChatResumeArguments(params);
+      if (!request) return jsonRpcError(id, -32602, "Invalid chat_resume arguments");
+      try {
+        const res = await httpRequest("POST", "/api/chat-resume", request, { "X-Chat-Token": TOKEN });
+        // The server's diagnostic payload can contain authorization or source
+        // details.  This fixed client boundary returns no such details.
+        if (res.status >= 400) return jsonRpcError(id, -32000, "chat_resume unavailable");
+        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+      } catch {
+        return jsonRpcError(id, -32000, "chat_resume unavailable");
+      }
+    }
+
     if (name === "chat_send") {
       const res = await httpRequest("POST", `/api/chat?project=${encodeURIComponent(PROJECT)}`, {
         text: params.message || "",

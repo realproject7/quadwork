@@ -18,12 +18,15 @@ const PROJECT = "__mcp_shim_test__";
 const OTHER_PROJECT = "__mcp_shim_other__";
 const AGENT = "dev";
 const TEST_TOKEN = crypto.randomBytes(16).toString("hex");
+const HEAD_RESUME_TOKEN = crypto.randomBytes(16).toString("hex");
 const SHIM = path.join(__dirname, "mcp-chat-shim.js");
 const ROLES = ["head", "dev", "re1", "re2"];
 
 let server;
 let serverPort;
 const issueFetches = [];
+const chatResumeRequests = [];
+let chatResumeFailure = false;
 let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
 
@@ -96,6 +99,25 @@ function startTestServer() {
     // boundary which rejects it.
     app.post("/api/ci-evidence", (req, res) => res.status(403).json({ ok: false, code: "ci_evidence_forbidden" }));
     app.post("/api/ci-evidence/read", (req, res) => res.status(404).json({ ok: false, code: "ci_evidence_record_not_found" }));
+
+    app.post("/api/chat-resume", (req, res) => {
+      const token = req.headers["x-chat-token"];
+      const principal = fileChat.resolveShimPrincipal(token);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") {
+        return res.status(403).json({ error: `bad token=${token}`, path: "/private/chat-resume" });
+      }
+      if (chatResumeFailure) {
+        return res.status(503).json({ error: `source secret=${token}`, path: "/private/chat-resume" });
+      }
+      chatResumeRequests.push({
+        body: req.body,
+        headers: {
+          token,
+          sender: req.headers["x-chat-sender"],
+        },
+      });
+      res.json({ ok: true, records: [], next_cursor: null });
+    });
 
     app.get("/api/chat", (req, res) => {
       const msgs = fileChat.readMessages(PROJECT, {
@@ -174,6 +196,7 @@ async function runTests() {
   assert(toolNames.includes("issue_contract_revision"), "tools/list exposes issue_contract_revision to dev");
   assert(toolNames.includes("submit_ci_evidence"), "tools/list exposes submit_ci_evidence only to dev");
   assert(toolNames.includes("read_ci_evidence"), "tools/list exposes redacted CI evidence reads to dev");
+  assert(!toolNames.includes("chat_resume"), "tools/list hides Head-only chat_resume from dev");
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
     "tools/list hides reviewer-only review-cycle receipt tools from dev");
 
@@ -191,12 +214,61 @@ async function runTests() {
       `tools/list hides submit_ci_evidence from ${role}`);
     const roleToolNames = (roleList.result?.tools || []).map((tool) => tool.name);
     const reviewerRole = role === "re1" || role === "re2";
+    assert(roleToolNames.includes("chat_resume") === (role === "head"),
+      `tools/list exposes chat_resume only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("issue_review_cycle_nonce") === reviewerRole,
       `tools/list exposes review-cycle nonce issuance only to reviewer role ${role}`);
     assert(roleToolNames.includes("submit_review_cycle_receipt") === reviewerRole,
       `tools/list exposes review-cycle receipt submission only to reviewer role ${role}`);
     await stopShim(roleShim);
   }
+
+  // The Head-only call forwards only the two page arguments and the existing
+  // shim token.  It must not grow a caller-selected identity/endpoint surface.
+  fileChat.registerShimToken(PROJECT, "head", HEAD_RESUME_TOKEN);
+  const headShim = spawnShim(PROJECT, "head", HEAD_RESUME_TOKEN);
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 21, method: "tools/call", params: {
+    name: "chat_resume", arguments: { cursor: null, limit: 2 },
+  } });
+  const resumeResp = await readResponse(headShim);
+  assert(resumeResp.result?.content?.[0]?.type === "text", "authenticated Head can call chat_resume");
+  assert(JSON.parse(resumeResp.result.content[0].text).ok === true, "chat_resume returns the fixed endpoint response");
+  assert(chatResumeRequests.length === 1 && JSON.stringify(chatResumeRequests[0].body) === JSON.stringify({ cursor: null, limit: 2 }),
+    "chat_resume forwards only the exact cursor and bounded limit arguments");
+  assert(chatResumeRequests[0].headers.token === HEAD_RESUME_TOKEN && chatResumeRequests[0].headers.sender === undefined,
+    "chat_resume authenticates with the existing shim token only");
+
+  for (const invalid of [
+    {},
+    { cursor: null, limit: 0 },
+    { cursor: null, limit: 65 },
+    { cursor: 7, limit: 1 },
+    { cursor: null, limit: 1, project: OTHER_PROJECT },
+  ]) {
+    sendJsonRpc(headShim, { jsonrpc: "2.0", id: 22, method: "tools/call", params: { name: "chat_resume", arguments: invalid } });
+    const invalidResp = await readResponse(headShim);
+    assert(invalidResp.error?.code === -32602 && invalidResp.error.message === "Invalid chat_resume arguments",
+      "chat_resume rejects malformed or identity-injecting arguments before transport");
+  }
+  assert(chatResumeRequests.length === 1, "invalid chat_resume arguments never reach the fixed endpoint");
+
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 23, method: "tools/call", params: {
+    name: "chat_resume", arguments: { cursor: null, limit: 1 },
+  } });
+  const hiddenResume = await readResponse(shim);
+  assert(hiddenResume.error?.code === -32601, "non-Head hidden chat_resume calls are denied locally");
+  assert(chatResumeRequests.length === 1, "non-Head chat_resume calls never reach the fixed endpoint");
+
+  chatResumeFailure = true;
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 24, method: "tools/call", params: {
+    name: "chat_resume", arguments: { cursor: null, limit: 1 },
+  } });
+  const failedResume = await readResponse(headShim);
+  assert(failedResume.error?.code === -32000 && failedResume.error.message === "chat_resume unavailable",
+    "chat_resume redacts endpoint failures");
+  assert(!JSON.stringify(failedResume).includes(HEAD_RESUME_TOKEN) && !JSON.stringify(failedResume).includes("/private/chat-resume"),
+    "chat_resume never exposes token or endpoint diagnostics");
+  await stopShim(headShim);
 
   // Test 3: chat_send
   sendJsonRpc(shim, {
