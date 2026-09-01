@@ -171,6 +171,23 @@ function assertNoRoleWorktreeCreation(label) {
     assert.equal(commandCalls.filter((call) => call.cmd === "git").length, 0, "read-only activation never reaches git provisioning");
     console.log("  PASS: direct activation independently rejects read-only repository access");
 
+    // The preliminary access check cannot be reused after asynchronous
+    // provisioning: this injects a revocation during provision. The final
+    // recheck fails before the synchronous config commit. (A revocation after
+    // that recheck but before rename remains an explicit local-commit window.)
+    githubMode = "ok";
+    writeConfig({ projects: [legacyProject("target", paths)] });
+    writeQueue("target");
+    before = readBytes();
+    provisionHook = () => { githubMode = "readonly"; };
+    commandCalls = [];
+    response = await post(server, "/api/setup?step=activate-v2", requestBody);
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, { ok: false, code: "repository_push_access_required", repo_key: "primary" });
+    assert.equal(readBytes(), before, "post-provision access revocation leaves configuration byte-identical");
+    assert.ok(commandCalls.some((call) => call.cmd === "git"), "revocation is injected after provision begins");
+    console.log("  PASS: post-provision access revocation is rechecked before the local activation commit");
+
     // Provisioning also has its own canonical GitHub identity gate; it cannot
     // rely on the Setup UI having called verify-repositories first.
     githubMode = "identity-mismatch";

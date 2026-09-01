@@ -102,11 +102,22 @@ function releaseConfigWriteLock(token) {
 }
 
 function withConfigWriteLock(operation, options = {}) {
-  if (configWriteLockDepth > 0) return operation();
+  // The lock deliberately protects only synchronous read-modify-write work.
+  // Releasing it after an async operation returns would let that operation
+  // resume without mutual exclusion, so reject thenables before release.
+  const runSynchronousOperation = () => {
+    const result = operation();
+    if (result && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
+      throw new TypeError("configuration write operation must complete synchronously; thenables are not supported");
+    }
+    return result;
+  };
+
+  if (configWriteLockDepth > 0) return runSynchronousOperation();
   const token = acquireConfigWriteLock(options);
   configWriteLockDepth = 1;
   try {
-    return operation();
+    return runSynchronousOperation();
   } finally {
     configWriteLockDepth = 0;
     releaseConfigWriteLock(token);

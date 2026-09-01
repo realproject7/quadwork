@@ -6033,6 +6033,14 @@ router.post("/api/setup", async (req, res) => {
       if (!ownership.ok) return res.status(409).json({ ok: false, ...ownership });
       const provisioned = await provisionV2Repositories(cfg, candidate, repositories, existing);
       if (!provisioned.ok) return res.status(409).json({ ok: false, ...publicProvisioningResult(provisioned), code: provisioned.code, repo_key: provisioned.repo_key, role: provisioned.role, error: provisioned.error });
+
+      // Provisioning may take a long time. Re-check canonical repository
+      // identity and push access immediately before the synchronous local
+      // configuration commit, but do not await it while config.lock is held.
+      // A revocation in the remaining tiny check-to-rename interval cannot be
+      // made atomic with this local commit; no GitHub write occurs in it.
+      const postProvisionAccess = await verifyV2RepositoryAccess(repositories);
+      if (!postProvisionAccess.ok) return res.status(409).json({ ok: false, ...postProvisionAccess });
       try {
         commitV2Configuration((fresh) => {
           const currentFirstGuard = firstActivationLegacyGuard(fresh, candidate.id, v2SetupExecutionState);

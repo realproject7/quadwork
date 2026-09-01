@@ -34,6 +34,7 @@ const {
   commitConfigurationSnapshot,
   writeConfig,
   updateConfig,
+  withSerializedConfigWrite,
   readConfig,
 } = configApi;
 
@@ -108,6 +109,22 @@ function seedConfig(config) {
   fs.unlinkSync(CONFIG_LOCK_PATH); // explicit operator recovery in the fixture
   writeConfig({ port: 8402, projects: [] });
   ok(readConfig().port === 8402, "writes resume after explicit stale-lock recovery");
+
+  // The filesystem lock protects synchronous work only. Returning a thenable
+  // must fail before the lock is released rather than allowing later async
+  // continuation to run outside the transaction.
+  const beforeThenable = diskBytes();
+  let lockObserved = false;
+  let thenInvoked = false;
+  assert.throws(
+    () => withSerializedConfigWrite(() => {
+      lockObserved = fs.existsSync(CONFIG_LOCK_PATH);
+      return { then() { thenInvoked = true; } };
+    }),
+    /must complete synchronously; thenables are not supported/,
+  );
+  ok(lockObserved && !thenInvoked, "serialized config lock rejects a thenable synchronously before it can outlive the lock");
+  ok(diskBytes() === beforeThenable && !fs.existsSync(CONFIG_LOCK_PATH), "rejected thenable leaves config unchanged and releases the lock");
 
   const beforeActivationBypass = diskBytes();
   expectCode(
