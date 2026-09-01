@@ -322,13 +322,14 @@ function handoff(value, code) {
 function applyResult(value, expected, code) {
   exact(value, ["version", "scope", "status", "input_tree_sha", "result_tree_sha", "applied_patch_digest"], code);
   if (value.version !== VERSION || value.scope !== expected.scope || value.status !== "applied" ||
-      value.input_tree_sha !== expected.input_tree_sha || value.result_tree_sha !== expected.result_tree_sha ||
+      value.input_tree_sha !== expected.input_tree_sha || !SHA_RE.test(value.result_tree_sha) ||
+      (expected.result_tree_sha !== null && value.result_tree_sha !== expected.result_tree_sha) ||
       value.applied_patch_digest !== expected.patch_digest) {
     fail(code, "patch application was not an exact clean apply");
   }
   return { result_tree_sha: value.result_tree_sha };
 }
-function applyPatch(options, repo, manifest, stage, patch, input, result, scope, predecessorHandoffs, code) {
+function applyPatch(options, repo, manifest, stage, patch, input, expectedResult, scope, predecessorHandoffs, code) {
   const request = {
     version: VERSION,
     repository: repo,
@@ -338,7 +339,12 @@ function applyPatch(options, repo, manifest, stage, patch, input, result, scope,
     sequence: stage === null ? 0 : stage.sequence,
     work_task_ref: stage === null ? null : clone(stage.work_task_ref),
     input_tree_sha: input.tree_sha,
-    expected_result_tree_sha: result.tree_sha,
+    // Intermediate Git tree object IDs are not predictable from a patch
+    // digest.  The adapter must return its observed object ID, which this
+    // module immediately reads and checks against the deterministic file map.
+    // Only candidate verification, full delivery verification, and the final
+    // composition output have an exact known result-tree pin.
+    expected_result_tree_sha: expectedResult === null ? null : expectedResult.tree_sha,
     patch: clone(patch),
     predecessor_handoffs: predecessorHandoffs.map(clone),
   };
@@ -346,7 +352,7 @@ function applyPatch(options, repo, manifest, stage, patch, input, result, scope,
   return applyResult(observed, {
     scope,
     input_tree_sha: input.tree_sha,
-    result_tree_sha: result.tree_sha,
+    result_tree_sha: expectedResult === null ? null : expectedResult.tree_sha,
     patch_digest: patch.patch_digest,
   }, code);
 }
@@ -488,6 +494,23 @@ function assertProofAgainstManifest(proof, manifestValue, prepared = null) {
   if (details.steps.length !== contracts.stages.length) fail("composition_proof_manifest_mismatch", "proof task count differs from frozen delivery cut");
   const byProofKey = new Map(details.steps.map((step) => [taskKey(step.work_task_ref, "invalid_composition_proof"), step]));
   const sequenceByKey = new Map(contracts.stages.map((entry) => [entry.key, entry.stage.sequence]));
+  for (let index = 0; index < details.steps.length; index += 1) {
+    const step = details.steps[index];
+    const prior = index === 0 ? {
+      tree_sha: details.base.tree_sha,
+      tree_digest: snapshotDigest(details.base),
+    } : {
+      tree_sha: details.steps[index - 1].output_tree_sha,
+      tree_digest: details.steps[index - 1].output_tree_digest,
+    };
+    if (step.input_tree_sha !== prior.tree_sha || step.input_tree_digest !== prior.tree_digest) {
+      fail("composition_proof_manifest_mismatch", "proof composition tree chain is disconnected");
+    }
+    if (index === details.steps.length - 1 &&
+        (step.output_tree_sha !== details.result.tree_sha || step.output_tree_digest !== snapshotDigest(details.result))) {
+      fail("composition_proof_manifest_mismatch", "proof final composition tree is not the pinned delivery result");
+    }
+  }
   for (const entry of contracts.stages) {
     const step = byProofKey.get(entry.key);
     if (!step || step.sequence !== entry.stage.sequence || step.candidate_digest !== entry.stage.candidate.candidate_digest ||
@@ -599,16 +622,11 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
     if (candidateApplied.result_tree_sha !== entry.candidateTree.tree_sha) fail("candidate_apply_not_clean", "candidate patch did not produce exact candidate tree");
 
     const predecessorHandoffs = expectedHandoffs(entry.contract, completed, sequenceByKey);
-    const outputTreeSha = index === prepared.length - 1 ? resultTree.tree_sha : hash({
-      version: VERSION,
-      input_tree_sha: currentTree.tree_sha,
-      patch_digest: entry.patch.patch_digest,
-      predecessor_handoffs: predecessorHandoffs,
-    });
-    const expectedTree = expectedAppliedTree(currentTree, entry.patch.files, outputTreeSha);
-    const applied = applyPatch(options, repo, manifest, stage, entry.patch, currentTree, expectedTree,
+    const finalOutput = index === prepared.length - 1 ? resultTree : null;
+    const applied = applyPatch(options, repo, manifest, stage, entry.patch, currentTree, finalOutput,
       "composition", predecessorHandoffs, "composition_apply_not_clean");
     const outputTree = readTree(options, repo, applied.result_tree_sha, "composition_output_tree_invalid");
+    const expectedTree = expectedAppliedTree(currentTree, entry.patch.files, outputTree.tree_sha);
     if (!same(outputTree.entries, expectedTree.entries)) fail("composition_apply_tree_mismatch", "composition apply changed an unexpected blob or path");
     const step = {
       sequence: stage.sequence,

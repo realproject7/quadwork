@@ -26,6 +26,7 @@ const base_tree_sha = "a".repeat(64);
 const alpha_tree_sha = "b".repeat(64);
 const bravo_tree_sha = "c".repeat(64);
 const result_tree_sha = "d".repeat(64);
+const intermediate_tree_sha = "0123456789abcdef".repeat(4);
 const alpha_candidate_sha = "1".repeat(64);
 const bravo_candidate_sha = "2".repeat(64);
 const web42 = { repoKey: "web", repo: "Owner/Product-Web", number: 42, kind: "issue" };
@@ -318,7 +319,7 @@ function createOperations(fixture, overrides = {}) {
     if (request.scope === "candidate_verification" || request.scope === "delivery_verification") {
       outputTreeSha = request.patch.result_tree_sha;
     } else {
-      outputTreeSha = request.expected_result_tree_sha;
+      outputTreeSha = request.expected_result_tree_sha || intermediate_tree_sha;
       const input = fixture.trees.get(request.input_tree_sha);
       fixture.trees.set(outputTreeSha, applyToTree(input, request.patch.files, outputTreeSha));
     }
@@ -388,8 +389,15 @@ function createOperations(fixture, overrides = {}) {
   assert.deepEqual(proof.steps.map((step) => step.sequence), [1, 2]);
   assert.deepEqual(proof.steps.map((step) => step.work_task_ref.task_key), ["alpha", "bravo"]);
   assert.deepEqual(proof.steps.map((step) => step.predecessor_handoffs), [[], []]);
+  assert.equal(proof.steps[0].output_tree_sha, intermediate_tree_sha,
+    "the first composed tree is the adapter-observed object ID, not a synthesized hash");
   assert.equal(proof.result.tree_sha, result_tree_sha);
   assert.equal(first.applyCalls.filter((request) => request.scope === "composition").length, 2);
+  const composeRequests = first.applyCalls.filter((request) => request.scope === "composition");
+  assert.equal(composeRequests[0].expected_result_tree_sha, null,
+    "intermediate composition does not invent a Git object ID");
+  assert.equal(composeRequests[1].expected_result_tree_sha, result_tree_sha,
+    "only the final composition step is pinned to the Delivery Candidate result tree");
 
   const secondFixture = buildFixture();
   const second = createOperations(secondFixture);
@@ -407,6 +415,7 @@ function createOperations(fixture, overrides = {}) {
   assert.equal(proof.steps[1].predecessor_handoffs[0].work_task_ref.task_key, "alpha");
   const dependencyApply = operations.applyCalls.find((request) => request.scope === "composition" && request.sequence === 2);
   assert.deepEqual(dependencyApply.predecessor_handoffs, proof.steps[1].predecessor_handoffs);
+  assert.equal(proof.steps[0].output_tree_sha, intermediate_tree_sha);
 }
 
 // Even if a malicious object adapter presents two independent patches with
@@ -483,6 +492,20 @@ function createOperations(fixture, overrides = {}) {
   throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "delivery_apply_not_clean");
 }
 
+// Intermediate composition output IDs are adapter-observed, but the last
+// output is always pinned to the candidate result tree and cannot drift.
+{
+  const fixture = buildFixture();
+  const operations = createOperations(fixture, {
+    applyPatch(request, response) {
+      return request.scope === "composition" && request.sequence === 2
+        ? { ...response, result_tree_sha: intermediate_tree_sha }
+        : response;
+    },
+  });
+  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "composition_apply_not_clean");
+}
+
 // The manifest's frozen order is checked by its M1 validator before the
 // adapter reads an object.  A reordering cannot get a new composition proof.
 {
@@ -509,6 +532,12 @@ function createOperations(fixture, overrides = {}) {
   }];
   tampered.composition_proof_digest = deliveryCompositionProofDigest(tampered);
   throwsCode(() => assertDeliveryCompositionProof(tampered, fixture.manifest), "composition_proof_manifest_mismatch");
+
+  const wrongFinal = copy(proof);
+  wrongFinal.steps[1].output_tree_sha = intermediate_tree_sha;
+  wrongFinal.steps[1].output_tree_digest = wrongFinal.steps[0].output_tree_digest;
+  wrongFinal.composition_proof_digest = deliveryCompositionProofDigest(wrongFinal);
+  throwsCode(() => assertDeliveryCompositionProof(wrongFinal, fixture.manifest), "composition_proof_manifest_mismatch");
 
   const source = fs.readFileSync(path.join(__dirname, "delivery-composer.js"), "utf8");
   assert.doesNotMatch(source, /require\(["'](?:node:)?(?:fs|child_process|net|http|https)["']\)/);
