@@ -1,0 +1,538 @@
+"use strict";
+
+// #1059 M2: a deliberately narrow, durable store for the already-sealed
+// TaskReviewRound contract.  It owns one owner-only document per registered
+// installation/project scope.  It is not a generic persistence layer: callers
+// can open an exact round, submit through a trusted reviewer context, read
+// only their own sealed receipt, or cancel the exact round from trusted
+// archive/candidate state.  There is intentionally no pruning or delivery
+// authority here.
+
+const crypto = require("crypto");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const {
+  assertTaskReviewRoundRef,
+  taskReviewRoundKey,
+  assertTaskReviewRound,
+  openTaskReviewRound,
+  submitTaskReviewReceipt,
+  viewTaskReviewRound,
+  cancelTaskReviewRound,
+} = require("./task-review-round");
+
+const TASK_REVIEW_ROUND_STORE_VERSION = 1;
+const TASK_REVIEW_ROUND_STORE_DIRECTORY = "task-review-rounds";
+const TASK_REVIEW_ROUND_STORE_FILENAME_SUFFIX = ".json";
+const DIGEST_RE = /^[a-f0-9]{64}$/;
+const MAX_ROUNDS_PER_PROJECT = 64;
+const MAX_DOCUMENT_BYTES = 1024 * 1024;
+
+class TaskReviewRoundStoreError extends Error {
+  constructor(code, message = code) {
+    super(message);
+    this.name = "TaskReviewRoundStoreError";
+    this.code = code;
+  }
+}
+
+function fail(code, message) { throw new TaskReviewRoundStoreError(code, message); }
+function plain(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+function exact(value, fields, code) {
+  if (!plain(value)) fail(code, "value must be an object");
+  const actual = Object.keys(value).sort(), expected = [...fields].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    fail(code, "value has an unknown or missing field");
+  }
+}
+function clone(value) {
+  if (Array.isArray(value)) return value.map(clone);
+  if (plain(value)) return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, clone(child)]));
+  return value;
+}
+function freeze(value) {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) freeze(child);
+  }
+  return value;
+}
+function stable(value) {
+  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+  if (plain(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+function hash(value) { return crypto.createHash("sha256").update(stable(value), "utf8").digest("hex"); }
+function cloneFreeze(value) { return freeze(clone(value)); }
+
+function absoluteDirectory(value) {
+  if (typeof value !== "string" || value.length < 2 || value.length > 1024 || !path.isAbsolute(value) || /[\u0000\r\n]/.test(value)) {
+    fail("task_review_round_store_root_invalid", "store root must be a bounded absolute path");
+  }
+  const normalized = path.resolve(value);
+  if (normalized === path.parse(normalized).root) {
+    fail("task_review_round_store_root_invalid", "store root must not be a filesystem root");
+  }
+  return normalized;
+}
+
+function scopeFromRef(ref, code = "invalid_task_review_round_store_scope") {
+  try { assertTaskReviewRoundRef(ref, code); }
+  catch (error) {
+    if (error instanceof TaskReviewRoundStoreError) throw error;
+    fail(code, "review-round scope is invalid");
+  }
+  return { installation_id: ref.installation_id, project_id: ref.project_id };
+}
+
+function candidateDigest(value, code = "invalid_task_review_round_store_candidate") {
+  if (typeof value !== "string" || !DIGEST_RE.test(value)) fail(code, "candidate digest is invalid");
+  return value;
+}
+
+function scopeFilename(scope) {
+  return `${hash({ version: TASK_REVIEW_ROUND_STORE_VERSION, installation_id: scope.installation_id, project_id: scope.project_id })}${TASK_REVIEW_ROUND_STORE_FILENAME_SUFFIX}`;
+}
+
+function recordKey(ref, digest) {
+  const scope = scopeFromRef(ref);
+  return hash({
+    version: TASK_REVIEW_ROUND_STORE_VERSION,
+    installation_id: scope.installation_id,
+    project_id: scope.project_id,
+    review_round_key: taskReviewRoundKey(ref),
+    candidate_digest: candidateDigest(digest),
+  });
+}
+
+function documentPayload(document) {
+  return {
+    version: document.version,
+    installation_id: document.installation_id,
+    project_id: document.project_id,
+    records: clone(document.records),
+  };
+}
+
+function emptyDocument(scope) {
+  return {
+    version: TASK_REVIEW_ROUND_STORE_VERSION,
+    installation_id: scope.installation_id,
+    project_id: scope.project_id,
+    records: Object.create(null),
+    document_digest: null,
+  };
+}
+
+function finalizeDocument(value) {
+  const next = {
+    version: value.version,
+    installation_id: value.installation_id,
+    project_id: value.project_id,
+    records: clone(value.records),
+  };
+  next.document_digest = hash(documentPayload(next));
+  assertDocument(next, { installation_id: next.installation_id, project_id: next.project_id });
+  return next;
+}
+
+function assertRecord(value, scope, key) {
+  exact(value, ["round"], "task_review_round_store_invalid");
+  try { assertTaskReviewRound(value.round); }
+  catch { fail("task_review_round_store_invalid", "stored round is invalid"); }
+  const round = value.round;
+  if (round.review_round_ref.installation_id !== scope.installation_id || round.review_round_ref.project_id !== scope.project_id ||
+      recordKey(round.review_round_ref, round.candidate_digest) !== key) {
+    fail("task_review_round_store_invalid", "stored round identity does not match its project scope");
+  }
+  return { round: clone(round) };
+}
+
+function assertDocument(value, scope) {
+  exact(value, ["version", "installation_id", "project_id", "records", "document_digest"], "task_review_round_store_invalid");
+  if (value.version !== TASK_REVIEW_ROUND_STORE_VERSION || value.installation_id !== scope.installation_id || value.project_id !== scope.project_id ||
+      !plain(value.records) || !DIGEST_RE.test(value.document_digest)) {
+    fail("task_review_round_store_invalid", "stored document identity is invalid");
+  }
+  const entries = Object.entries(value.records);
+  if (entries.length > MAX_ROUNDS_PER_PROJECT) fail("task_review_round_store_invalid", "stored document exceeds its round bound");
+  const records = Object.create(null);
+  for (const [key, entry] of entries) {
+    if (!DIGEST_RE.test(key)) fail("task_review_round_store_invalid", "stored round key is invalid");
+    records[key] = assertRecord(entry, scope, key);
+  }
+  const normalized = {
+    version: value.version,
+    installation_id: value.installation_id,
+    project_id: value.project_id,
+    records,
+    document_digest: value.document_digest,
+  };
+  if (normalized.document_digest !== hash(documentPayload(normalized))) {
+    fail("task_review_round_store_invalid", "stored document digest is invalid");
+  }
+  return normalized;
+}
+
+function ownerUid() {
+  try { return typeof process.getuid === "function" ? process.getuid() : null; }
+  catch { return null; }
+}
+
+function secureDirectory(fsImpl, directory) {
+  try { fsImpl.mkdirSync(directory, { recursive: true, mode: 0o700 }); }
+  catch { fail("task_review_round_store_persist_failed", "could not create store directory"); }
+  let stat;
+  try { stat = fsImpl.lstatSync(directory); }
+  catch { fail("task_review_round_store_persist_failed", "could not inspect store directory"); }
+  const uid = ownerUid();
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (uid !== null && stat.uid !== uid)) {
+    fail("task_review_round_store_unsafe", "store directory is unsafe");
+  }
+  try { fsImpl.chmodSync(directory, 0o700); }
+  catch { fail("task_review_round_store_persist_failed", "could not secure store directory"); }
+  try { stat = fsImpl.lstatSync(directory); }
+  catch { fail("task_review_round_store_persist_failed", "could not recheck store directory"); }
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 || (uid !== null && stat.uid !== uid)) {
+    fail("task_review_round_store_unsafe", "store directory permissions are unsafe");
+  }
+}
+
+function verifyExistingDirectory(fsImpl, directory) {
+  let stat;
+  try { stat = fsImpl.lstatSync(directory); }
+  catch { fail("task_review_round_store_unreadable", "store directory is unreadable"); }
+  const uid = ownerUid();
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 || (uid !== null && stat.uid !== uid)) {
+    fail("task_review_round_store_unsafe", "store directory is unsafe");
+  }
+}
+
+function verifyExistingFile(fsImpl, filePath) {
+  let stat;
+  try { stat = fsImpl.lstatSync(filePath); }
+  catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    fail("task_review_round_store_unreadable", "store file is unreadable");
+  }
+  const uid = ownerUid();
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600 || (uid !== null && stat.uid !== uid)) {
+    fail("task_review_round_store_unsafe", "store file is unsafe");
+  }
+  if (!Number.isSafeInteger(stat.size) || stat.size < 2 || stat.size > MAX_DOCUMENT_BYTES) {
+    fail("task_review_round_store_invalid", "store file exceeds its hard bound");
+  }
+  return stat;
+}
+
+function safeReadDocument(fsImpl, rootDir, scope) {
+  const directory = path.join(rootDir, TASK_REVIEW_ROUND_STORE_DIRECTORY);
+  const filePath = path.join(directory, scopeFilename(scope));
+  const file = verifyExistingFile(fsImpl, filePath);
+  if (file === null) return { document: emptyDocument(scope), exists: false, filePath };
+  verifyExistingDirectory(fsImpl, rootDir);
+  verifyExistingDirectory(fsImpl, directory);
+  let raw;
+  try { raw = fsImpl.readFileSync(filePath, "utf8"); }
+  catch { fail("task_review_round_store_unreadable", "store file could not be read"); }
+  if (Buffer.byteLength(raw, "utf8") > MAX_DOCUMENT_BYTES) fail("task_review_round_store_invalid", "store document exceeds its hard bound");
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { fail("task_review_round_store_invalid", "store document is not valid JSON"); }
+  return { document: assertDocument(parsed, scope), exists: true, filePath };
+}
+
+function secureStoreDirectories(fsImpl, rootDir) {
+  secureDirectory(fsImpl, rootDir);
+  const directory = path.join(rootDir, TASK_REVIEW_ROUND_STORE_DIRECTORY);
+  secureDirectory(fsImpl, directory);
+  return directory;
+}
+
+function lockPathFor(directory, scope) {
+  return path.join(directory, `${scopeFilename(scope)}.lock`);
+}
+
+function lockStat(fsImpl, lockPath) {
+  let stat;
+  try { stat = fsImpl.lstatSync(lockPath); }
+  catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    fail("task_review_round_store_unreadable", "project writer lock is unreadable");
+  }
+  const uid = ownerUid();
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600 || (uid !== null && stat.uid !== uid)) {
+    fail("task_review_round_store_unsafe", "project writer lock is unsafe");
+  }
+  return stat;
+}
+
+function sameFile(left, right) {
+  return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) && left.dev === right.dev && left.ino === right.ino;
+}
+
+function acquireProjectWriterLock(fsImpl, rootDir, scope) {
+  const directory = secureStoreDirectories(fsImpl, rootDir);
+  const lockPath = lockPathFor(directory, scope);
+  let fd = null;
+  let ownStat = null;
+  try {
+    fd = fsImpl.openSync(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (error && error.code === "EEXIST") {
+      // A lock is deliberately never age-reaped.  The next explicit recovery
+      // action must inspect it; silently deleting a possibly live writer lock
+      // would reintroduce the exact lost-update race this guard prevents.
+      lockStat(fsImpl, lockPath);
+      fail("task_review_round_store_locked", "project has an exclusive writer lock");
+    }
+    fail("task_review_round_store_persist_failed", "could not acquire project writer lock");
+  }
+  try {
+    fsImpl.chmodSync(lockPath, 0o600);
+    fsImpl.fsyncSync(fd);
+    ownStat = fsImpl.fstatSync(fd);
+    const pathStat = lockStat(fsImpl, lockPath);
+    if (!sameFile(ownStat, pathStat)) fail("task_review_round_store_unsafe", "project writer lock changed during acquisition");
+    return { fd, lock_path: lockPath, stat: ownStat };
+  } catch (error) {
+    try { fsImpl.closeSync(fd); } catch {}
+    // This cleanup is only for the just-created, never-returned lock.  It is
+    // not stale-lock reaping: a mismatched replacement is retained fail-closed.
+    try {
+      const current = lockStat(fsImpl, lockPath);
+      if (sameFile(ownStat, current)) fsImpl.unlinkSync(lockPath);
+    } catch {}
+    if (error instanceof TaskReviewRoundStoreError) throw error;
+    fail("task_review_round_store_persist_failed", "could not initialize project writer lock");
+  }
+}
+
+function releaseProjectWriterLock(fsImpl, lock) {
+  let closeError = null;
+  try { fsImpl.closeSync(lock.fd); }
+  catch (error) { closeError = error; }
+  try {
+    const current = lockStat(fsImpl, lock.lock_path);
+    if (!sameFile(lock.stat, current)) fail("task_review_round_store_unsafe", "project writer lock changed before release");
+    fsImpl.unlinkSync(lock.lock_path);
+  } catch (error) {
+    if (error instanceof TaskReviewRoundStoreError) throw error;
+    fail("task_review_round_store_persist_failed", "could not release project writer lock");
+  }
+  if (closeError) fail("task_review_round_store_persist_failed", "could not close project writer lock");
+}
+
+function withProjectWriterLock(fsImpl, rootDir, scope, action) {
+  const lock = acquireProjectWriterLock(fsImpl, rootDir, scope);
+  let result;
+  let actionError = null;
+  try { result = action(); }
+  catch (error) { actionError = error; }
+  try { releaseProjectWriterLock(fsImpl, lock); }
+  catch (releaseError) {
+    // Preserve the primary transition result/error.  A failed release leaves a
+    // 0600 lock behind, which every later mutation fails closed rather than
+    // guessing that it is stale.
+    if (actionError) throw actionError;
+    throw releaseError;
+  }
+  if (actionError) throw actionError;
+  return result;
+}
+
+function writeDocument(fsImpl, rootDir, scope, document, randomBytes) {
+  const normalized = finalizeDocument(document);
+  const serialized = JSON.stringify(normalized);
+  if (Buffer.byteLength(serialized, "utf8") > MAX_DOCUMENT_BYTES) {
+    fail("task_review_round_store_over_bound", "store document exceeds its hard bound");
+  }
+  let temporary = null;
+  try {
+    const directory = secureStoreDirectories(fsImpl, rootDir);
+    const filePath = path.join(directory, scopeFilename(scope));
+    const entropy = randomBytes(16);
+    if (!Buffer.isBuffer(entropy) || entropy.length < 16) throw new Error("random bytes unavailable");
+    temporary = `${filePath}.${process.pid}.${entropy.subarray(0, 16).toString("hex")}.tmp`;
+    const fd = fsImpl.openSync(temporary, "wx", 0o600);
+    try {
+      fsImpl.writeFileSync(fd, serialized, { encoding: "utf8" });
+      fsImpl.fsyncSync(fd);
+    } finally {
+      fsImpl.closeSync(fd);
+    }
+    fsImpl.chmodSync(temporary, 0o600);
+    const temporaryStat = fsImpl.lstatSync(temporary);
+    if (!temporaryStat.isFile() || temporaryStat.isSymbolicLink() || (temporaryStat.mode & 0o777) !== 0o600) {
+      fail("task_review_round_store_unsafe", "temporary store file is unsafe");
+    }
+    fsImpl.renameSync(temporary, filePath);
+    temporary = null;
+    fsImpl.chmodSync(filePath, 0o600);
+    const finalStat = verifyExistingFile(fsImpl, filePath);
+    if (finalStat === null) fail("task_review_round_store_persist_failed", "atomic replace did not create the store file");
+    return cloneFreeze(normalized);
+  } catch (error) {
+    if (temporary !== null) {
+      try { fsImpl.unlinkSync(temporary); } catch {}
+    }
+    if (error instanceof TaskReviewRoundStoreError) throw error;
+    fail("task_review_round_store_persist_failed", "could not atomically persist review-round state");
+  }
+}
+
+function statusProjection(round) {
+  return cloneFreeze({
+    version: TASK_REVIEW_ROUND_STORE_VERSION,
+    status: round.status,
+    review_round_ref: clone(round.review_round_ref),
+    candidate_digest: round.candidate_digest,
+  });
+}
+
+function sameOpening(existing, opened) {
+  return stable({
+    review_round_ref: existing.review_round_ref,
+    candidate_digest: existing.candidate_digest,
+    opened_at: existing.opened_at,
+    reviewer_assignments: existing.reviewer_assignments,
+  }) === stable({
+    review_round_ref: opened.review_round_ref,
+    candidate_digest: opened.candidate_digest,
+    opened_at: opened.opened_at,
+    reviewer_assignments: opened.reviewer_assignments,
+  });
+}
+
+function releaseProjection(round) {
+  return {
+    version: TASK_REVIEW_ROUND_STORE_VERSION,
+    transaction: "two_current_sealed_receipts",
+    candidate_digest: round.candidate_digest,
+    released_at: round.release.released_at,
+  };
+}
+
+function ownReceiptProjection(round, trustedContext) {
+  // Let the pure contract authenticate the trusted role/generation before this
+  // store projects anything.  Its released view is intentionally discarded:
+  // the durable store never exposes a peer receipt or peer finding through a
+  // reviewer read path.
+  const validated = viewTaskReviewRound(round, trustedContext);
+  if (validated.status === "sealed" || validated.status === "cancelled") return cloneFreeze(validated);
+  const own = round.receipts.find((entry) => entry.reviewer_role === trustedContext.reviewer_role);
+  return cloneFreeze({
+    version: TASK_REVIEW_ROUND_STORE_VERSION,
+    status: "released",
+    review_round_ref: clone(round.review_round_ref),
+    own_receipt: own ? clone(own.receipt) : null,
+    release: releaseProjection(round),
+  });
+}
+
+function recordFor(document, ref, digest) {
+  const key = recordKey(ref, digest);
+  const record = document.records[key];
+  if (!record) fail("task_review_round_not_found", "no exact persisted review round exists");
+  return { key, round: record.round };
+}
+
+class TaskReviewRoundStore {
+  constructor(options = {}) {
+    this.fs = options.fsImpl || fs;
+    this.rootDir = absoluteDirectory(options.rootDir || path.join(os.homedir(), ".quadwork"));
+    this.randomBytes = options.randomBytes || crypto.randomBytes;
+  }
+
+  pathFor(reviewRoundRef) {
+    const scope = scopeFromRef(reviewRoundRef);
+    return path.join(this.rootDir, TASK_REVIEW_ROUND_STORE_DIRECTORY, scopeFilename(scope));
+  }
+
+  openRound(input, trustedAssignments) {
+    const opened = openTaskReviewRound(input, trustedAssignments);
+    const scope = scopeFromRef(opened.review_round_ref);
+    return withProjectWriterLock(this.fs, this.rootDir, scope, () => {
+      // State is intentionally re-read only after this project-scoped lock is
+      // held.  A concurrent opener/receipt/cancellation can therefore never
+      // publish a newer document between our read and atomic replace.
+      const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+      const key = recordKey(opened.review_round_ref, opened.candidate_digest);
+      const prior = loaded.document.records[key];
+      if (prior) {
+        // Receipt/release/cancellation state is expected to change after the
+        // immutable opening.  Retrying that same exact opening must not replace
+        // it or turn a later sealed state into a conflict.
+        if (!sameOpening(prior.round, opened)) {
+          fail("task_review_round_conflict", "an exact review-round key already has different immutable opening state");
+        }
+        return statusProjection(prior.round);
+      }
+      if (Object.keys(loaded.document.records).length >= MAX_ROUNDS_PER_PROJECT) {
+        fail("task_review_round_store_over_bound", "project has reached its sealed review-round bound");
+      }
+      const next = clone(loaded.document);
+      next.records[key] = { round: clone(opened) };
+      writeDocument(this.fs, this.rootDir, scope, next, this.randomBytes);
+      return statusProjection(opened);
+    });
+  }
+
+  submitTrustedReceipt(reviewRoundRef, digest, receipt, trustedReviewerContext) {
+    const scope = scopeFromRef(reviewRoundRef);
+    return withProjectWriterLock(this.fs, this.rootDir, scope, () => {
+      const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+      const located = recordFor(loaded.document, reviewRoundRef, candidateDigest(digest));
+      const transition = submitTaskReviewReceipt(located.round, receipt, trustedReviewerContext);
+      if (transition.outcome !== "idempotent") {
+        const next = clone(loaded.document);
+        next.records[located.key] = { round: clone(transition.round) };
+        writeDocument(this.fs, this.rootDir, scope, next, this.randomBytes);
+      }
+      return cloneFreeze({ outcome: transition.outcome, view: ownReceiptProjection(transition.round, trustedReviewerContext) });
+    });
+  }
+
+  readForTrustedReviewer(reviewRoundRef, digest, trustedReviewerContext) {
+    const scope = scopeFromRef(reviewRoundRef);
+    const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+    const located = recordFor(loaded.document, reviewRoundRef, candidateDigest(digest));
+    return ownReceiptProjection(located.round, trustedReviewerContext);
+  }
+
+  cancelFromTrustedState(cancellation) {
+    if (!plain(cancellation)) fail("invalid_task_review_cancellation", "trusted cancellation is invalid");
+    const scope = scopeFromRef(cancellation.review_round_ref, "invalid_task_review_cancellation");
+    return withProjectWriterLock(this.fs, this.rootDir, scope, () => {
+      const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+      const located = recordFor(loaded.document, cancellation.review_round_ref, candidateDigest(cancellation.candidate_digest, "invalid_task_review_cancellation"));
+      const nextRound = cancelTaskReviewRound(located.round, cancellation);
+      if (nextRound.round_digest !== located.round.round_digest) {
+        const next = clone(loaded.document);
+        next.records[located.key] = { round: clone(nextRound) };
+        writeDocument(this.fs, this.rootDir, scope, next, this.randomBytes);
+      }
+      return statusProjection(nextRound);
+    });
+  }
+}
+
+function createTaskReviewRoundStore(options) {
+  return new TaskReviewRoundStore(options);
+}
+
+module.exports = {
+  TASK_REVIEW_ROUND_STORE_VERSION,
+  TASK_REVIEW_ROUND_STORE_DIRECTORY,
+  TASK_REVIEW_ROUND_STORE_FILENAME_SUFFIX,
+  MAX_ROUNDS_PER_PROJECT,
+  MAX_DOCUMENT_BYTES,
+  TaskReviewRoundStoreError,
+  TaskReviewRoundStore,
+  createTaskReviewRoundStore,
+};
