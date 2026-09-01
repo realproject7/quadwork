@@ -19,6 +19,7 @@ const {
 const VERSION = 1;
 const SHA_RE = /^[a-f0-9]{64}$/;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
+const FILE_BOUNDARY_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=-]{1,240}$/;
 const TASK_STATES = new Set([
   "queued",
   "building",
@@ -131,6 +132,14 @@ function assertAssignment(value, code) {
   sha(value.base_sha, code);
   return value;
 }
+function fileBoundary(value, code) {
+  if (!Array.isArray(value) || value.length > 32 ||
+      !value.every((entry) => typeof entry === "string" && FILE_BOUNDARY_PATH_RE.test(entry)) ||
+      new Set(value).size !== value.length) {
+    fail(code, "file boundary is invalid");
+  }
+  return value;
+}
 function assertReviewAssignment(value, currentCandidate, state, code) {
   if (value === null) {
     if (state === "independent_review" || state === "reconcile") fail(code, "review assignment is required");
@@ -154,8 +163,9 @@ function assertCorrection(value, currentCandidate, state, code) {
   return value;
 }
 function assertSlot(slot, code) {
-  exact(slot, ["work_task_ref", "dependency_refs", "state", "candidate", "build_assignment", "review_assignment", "correction", "blocked_from", "history"], code);
+  exact(slot, ["work_task_ref", "dependency_refs", "file_boundary", "state", "candidate", "build_assignment", "review_assignment", "correction", "blocked_from", "history"], code);
   ref(slot.work_task_ref, code);
+  fileBoundary(slot.file_boundary, code);
   if (!Array.isArray(slot.dependency_refs) || slot.dependency_refs.length > MAX_TASKS) fail(code, "dependency references are invalid");
   const dependencyKeys = slot.dependency_refs.map((entry) => workTaskKey(ref(entry, code)));
   if (new Set(dependencyKeys).size !== dependencyKeys.length || dependencyKeys.includes(workTaskKey(slot.work_task_ref))) fail(code, "dependency references are duplicated or self-referential");
@@ -226,6 +236,7 @@ function buildWorkTaskPipeline(manifest, options) {
   const tasks = entries.map((entry) => ({
     work_task_ref: clone(entry.ref),
     dependency_refs: entry.contract.dependencies.map(clone),
+    file_boundary: clone(entry.contract.file_boundary),
     state: "queued",
     candidate: null,
     build_assignment: null,
@@ -377,6 +388,21 @@ function assertDependenciesReady(tasks, slot) {
     if (!DEPENDENCY_READY_STATES.has(parent.state)) fail("work_task_dependencies_not_ready", "declared dependency is not ready");
   }
 }
+function pathsOverlap(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+function assertReviewBoundariesDisjoint(tasks, next) {
+  // A legacy task has no declared boundary, so it cannot prove safe overlap.
+  // Boundaries from different repositories are never comparable.
+  for (const active of tasks) {
+    if (active === next || active.work_task_ref.repository_key !== next.work_task_ref.repository_key ||
+        !new Set(["independent_review", "reconcile"]).has(active.state)) continue;
+    if (active.file_boundary.length === 0 || next.file_boundary.length === 0 ||
+        active.file_boundary.some((left) => next.file_boundary.some((right) => pathsOverlap(left, right)))) {
+      fail("work_task_review_boundary_overlap", "new build boundary overlaps a candidate under review");
+    }
+  }
+}
 
 // This function clones in-memory values only; it does not mutate the supplied
 // pipeline.  Planning discards `tasks`; application uses it only after proving
@@ -396,6 +422,7 @@ function deriveTransition(pipeline, event) {
       const slot = locate(event.work_task_ref);
       requireState(slot, "queued");
       assertDependenciesReady(tasks, slot);
+      assertReviewBoundariesDisjoint(tasks, slot);
       const from = slot.state;
       slot.state = "building";
       slot.blocked_from = null;

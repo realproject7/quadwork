@@ -35,13 +35,13 @@ function resolveRegisteredIdentity(input) {
     issue_body_revision: ({ api: "c", web: "d", ops: "e" })[input.repository_key].repeat(64),
   };
 }
-function sourceTask(task_key, repository_key, number, dependencies = [], goal = `implement-${task_key}`) {
+function sourceTask(task_key, repository_key, number, dependencies = [], goal = `implement-${task_key}`, file_boundary = [`server/${repository_key}-${task_key}.js`]) {
   return {
     task_key,
     repository_key,
     work_item: item(repository_key, number),
     goal,
-    file_boundary: [`server/${repository_key}-${task_key}.js`],
+    file_boundary,
     validation: ["node:test"],
     dependencies,
   };
@@ -59,6 +59,15 @@ function manifest(frozen = true, coreGoal = "implement-core") {
     tasks: [core, web, api, ops],
   }, { resolveRegisteredIdentity });
   return frozen ? freezeBatchManifest(built, "2026-09-01T00:00:00Z") : built;
+}
+function manifestForTasks(tasks) {
+  return freezeBatchManifest(buildBatchManifest({
+    version: 1,
+    installation_id,
+    project_id,
+    delivery_mode: "integrated",
+    tasks,
+  }, { resolveRegisteredIdentity }), "2026-09-01T00:00:00Z");
 }
 function refs(manifestValue) {
   return Object.fromEntries(manifestValue.tasks.map((entry) => [entry.ref.task_key, entry.ref]));
@@ -119,6 +128,42 @@ function moveToCandidate(pipeline, taskRef, marker, prefix) {
   let next = apply(pipeline, event("assign_build", `${prefix}_build`, { work_task_ref: copy(taskRef), assignment_id: `${prefix}_assignment` }));
   next = apply(next, event("record_candidate", `${prefix}_candidate`, { candidate }));
   return { pipeline: next, candidate };
+}
+
+// Review/build overlap is allowed only for independent tasks whose declared
+// boundaries are provably disjoint in the same repository.  The one Dev lane
+// is still serialized; this protects the exact candidate under review.
+{
+  const batch = manifestForTasks([
+    sourceTask("alpha", "api", 10, [], "alpha", ["server/alpha.js"]),
+    sourceTask("beta", "api", 10, [], "beta", ["server/beta.js"]),
+    sourceTask("overlap", "api", 10, [], "overlap", ["server/alpha.js/helpers"]),
+    sourceTask("legacy", "api", 10, [], "legacy", []),
+  ]);
+  const workRefs = refs(batch);
+  let work = buildWorkTaskPipeline(batch);
+  const alpha = candidateFor(workRefs.alpha, "b");
+  work = apply(work, event("assign_build", "boundary_alpha_build", {
+    work_task_ref: copy(workRefs.alpha), assignment_id: "boundary_alpha_assignment",
+  }));
+  work = apply(work, event("record_candidate", "boundary_alpha_candidate", { candidate: alpha }));
+  work = apply(work, event("assign_independent_review", "boundary_alpha_review", {
+    work_task_ref: copy(workRefs.alpha), review_round_id: "boundary_alpha_round", candidate_digest: alpha.candidate_digest,
+  }));
+  work = apply(work, event("assign_build", "boundary_beta_build", {
+    work_task_ref: copy(workRefs.beta), assignment_id: "boundary_beta_assignment",
+  }));
+  assert.equal(slot(work, workRefs.beta).state, "building");
+
+  work = apply(work, event("block", "boundary_beta_stop", {
+    work_task_ref: copy(workRefs.beta), block_code: "validation",
+  }));
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("assign_build", "boundary_overlap_build", {
+    work_task_ref: copy(workRefs.overlap), assignment_id: "boundary_overlap_assignment",
+  })), "work_task_review_boundary_overlap");
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("assign_build", "boundary_legacy_build", {
+    work_task_ref: copy(workRefs.legacy), assignment_id: "boundary_legacy_assignment",
+  })), "work_task_review_boundary_overlap");
 }
 
 // A candidate may only begin review from the immutable base SHA issued with
