@@ -48,7 +48,7 @@ function tagged(id, tag = "head_assignment", overrides = {}) {
     defaults.raw = { sender: "system", type: "trusted_event" };
     defaults.structural = { server_authored: true };
   }
-  if (["batch_request", "head_lifecycle"].includes(tag)) {
+  if (["review_cycle", "batch_request", "head_lifecycle"].includes(tag)) {
     defaults.raw = { sender: "system", type: "system" };
     defaults.structural = { server_authored: true };
   }
@@ -57,6 +57,7 @@ function tagged(id, tag = "head_assignment", overrides = {}) {
     resume_structural: structural(tag, { ...(defaults.structural || {}), ...(overrides.structural || {}) }),
   };
 }
+
 function window(records, overrides = {}) {
   return { freshness: "live", records, ...overrides };
 }
@@ -99,6 +100,14 @@ function ok(value, message) {
   assert.ok(value, message);
   passed += 1;
   console.log(`  PASS: ${message}`);
+}
+
+{
+  const review = tagged(1, "review_cycle");
+  const snapshot = source(() => window([review])).read_snapshot(request());
+  assert.equal(snapshot.records[0].structural.tag, "review_cycle");
+  assert.deepEqual(projection(snapshot).records.map((entry) => entry.id), [1]);
+  ok(true, "sealed review-cycle system records remain projection-ready evidence");
 }
 
 // A durable tag is carried exactly, while legacy prose that happens to say

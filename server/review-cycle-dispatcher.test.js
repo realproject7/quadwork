@@ -54,7 +54,11 @@ const first = dispatcher.observe({ project_id: PROJECT, target: current, ci_stat
 assert.equal(first.handoff.ci, "pending");
 assert.equal(first.handoff.review, "0/2");
 assert.deepEqual(first.plans.map((entry) => entry.plan.kind), ["review_request"]);
-const delivered = dispatcher.deliver(PROJECT, first, (candidate) => fileChat.appendTrustedReviewCycleEventOnce(PROJECT, candidate));
+const appendReviewCycleEvent = (candidate) => fileChat.appendTrustedReviewCycleEventOnce(PROJECT, {
+  ...candidate,
+  resume: { batch_id: "batch-1048", head_generation: 0 },
+});
+const delivered = dispatcher.deliver(PROJECT, first, appendReviewCycleEvent);
 assert.equal(delivered[0].ok, true);
 assert.throws(() => fileChat.appendTrustedReviewCycleEventOnce(PROJECT, {
   project_id: PROJECT, cycle: first.cycle, plan: first.plans[0].plan, text: "@re1 arbitrary prose",
@@ -64,12 +68,16 @@ assert.equal(records.length, 1);
 assert.equal(records[0].sender, "system");
 assert.equal(records[0].type, "system");
 assert.equal(records[0].trusted_event.scope, "review_cycle");
+assert.deepEqual(records[0].resume_structural, {
+  version: 1, project_id: PROJECT, trusted: true, tag: "review_cycle", batch_id: "batch-1048",
+  head_generation: 0, target: "head", server_authored: true,
+});
 assert.equal(envelopeFor(PROJECT, first.cycle, first.plans[0].plan).type, "system", "sealed and persisted event types agree");
 assert.equal(JSON.stringify({ handoff: first.handoff, record: records[0] }).includes("qwrc_"), false, "private reviewer nonces never enter handoff or Primary Chat");
 assert.match(records[0].text, /^@re1 @re2 \[REVIEW REQUEST\] repo=web issue=42 contract=[a-f0-9]{64} pr=99 sha=[a-f0-9]{40} cycle=rc_/);
 
 const second = dispatcher.observe({ project_id: PROJECT, target: current, ci_state: "pending", archived: false });
-const repeated = dispatcher.deliver(PROJECT, second, (candidate) => fileChat.appendTrustedReviewCycleEventOnce(PROJECT, candidate));
+const repeated = dispatcher.deliver(PROJECT, second, appendReviewCycleEvent);
 assert.equal(repeated[0].duplicate, true);
 assert.equal(fileChat.readMessages(PROJECT, { since_id: 0, limit: 10 }).length, 1);
 
@@ -92,7 +100,7 @@ assert.equal(archived.plans.length, 0);
 const stalePlan = second;
 const retipped = target(SHA_B);
 dispatcher.observe({ project_id: PROJECT, target: retipped, ci_state: "pending", archived: false });
-const stale = dispatcher.deliver(PROJECT, stalePlan, (candidate) => fileChat.appendTrustedReviewCycleEventOnce(PROJECT, candidate));
+const stale = dispatcher.deliver(PROJECT, stalePlan, appendReviewCycleEvent);
 assert.equal(stale[0].code, "review_cycle_stale_delivery");
 
 fileChat.shutdownProject(PROJECT);

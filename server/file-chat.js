@@ -251,19 +251,20 @@ function findTrustedMonitorEvent(projectId, state, envelope) {
   return null;
 }
 
-function sameTrustedReviewCycleEvent(record, envelope) {
+function sameTrustedReviewCycleEvent(record, envelope, resumeStructural) {
   const event = record?.trusted_event;
   if (!event || typeof event !== "object" || event.scope !== "review_cycle" || event.correlation_id !== envelope.correlation_id) return null;
   const matches = event.version === envelope.version && event.kind === envelope.kind &&
     JSON.stringify(event.anchors) === JSON.stringify(envelope.anchors) &&
-    record.sender === "system" && record.type === "system" && record.text === envelope.text;
+    record.sender === "system" && record.type === "system" && record.text === envelope.text &&
+    JSON.stringify(record.resume_structural) === JSON.stringify(resumeStructural);
   if (!matches) throw new Error("trusted review-cycle correlation collision");
   return record;
 }
 
-function findTrustedReviewCycleEvent(projectId, state, envelope) {
+function findTrustedReviewCycleEvent(projectId, state, envelope, resumeStructural) {
   for (const record of state.cache) {
-    const match = sameTrustedReviewCycleEvent(record, envelope);
+    const match = sameTrustedReviewCycleEvent(record, envelope, resumeStructural);
     if (match) return match;
   }
   const filePath = chatFile(projectId);
@@ -275,7 +276,7 @@ function findTrustedReviewCycleEvent(projectId, state, envelope) {
     if (!line.trim()) continue;
     try {
       const record = JSON.parse(line);
-      const match = sameTrustedReviewCycleEvent(record, envelope);
+      const match = sameTrustedReviewCycleEvent(record, envelope, resumeStructural);
       if (match) return match;
     } catch (error) {
       if (error?.message === "trusted review-cycle correlation collision") throw error;
@@ -383,19 +384,37 @@ function appendTrustedMonitorEventOnce(projectId, candidate) {
 }
 
 // #1048's private #1036 append seam.  The dispatcher supplies only a durable
-// cycle snapshot and M1 event plan; this function reconstructs the fixed text,
-// recipients, anchors and system identity.  Public chat routes never expose
-// either argument shape, so prose/pulses cannot mint a cycle delivery.
+// cycle snapshot, M1 event plan, and the server's current project-generation
+// context; this function reconstructs the fixed text, recipients, anchors and
+// recovery tag. Public chat routes never expose either argument shape, so
+// prose/pulses cannot mint a cycle delivery.
 function appendTrustedReviewCycleEventOnce(projectId, candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
-      Object.keys(candidate).sort().join(",") !== "cycle,plan,project_id") {
+      Object.keys(candidate).sort().join(",") !== "cycle,plan,project_id,resume") {
     throw new Error("trusted review-cycle envelope required");
   }
   const envelope = reviewCycleEnvelopeFor(projectId, candidate.cycle, candidate.plan);
   if (candidate.project_id !== envelope.project_id) throw new Error("trusted review-cycle envelope invalid");
+  const resume = candidate.resume;
+  if (!resume || typeof resume !== "object" || Array.isArray(resume) ||
+      Object.keys(resume).sort().join(",") !== "batch_id,head_generation" ||
+      !Number.isSafeInteger(resume.head_generation) || resume.head_generation < 0 ||
+      (resume.batch_id !== null && (typeof resume.batch_id !== "string" || !/^[a-z][a-z0-9_-]{2,95}$/.test(resume.batch_id)))) {
+    throw new Error("trusted review-cycle resume context invalid");
+  }
+  const resumeStructural = Object.freeze({
+    version: 1,
+    project_id: projectId,
+    trusted: true,
+    tag: "review_cycle",
+    batch_id: resume.batch_id,
+    head_generation: resume.head_generation,
+    target: "head",
+    server_authored: true,
+  });
   const state = getState(projectId);
   if (state.nextId === null) throw new Error(`Project ${projectId} not initialized — call initProject first`);
-  const existing = findTrustedReviewCycleEvent(projectId, state, envelope);
+  const existing = findTrustedReviewCycleEvent(projectId, state, envelope, resumeStructural);
   if (existing) return { ok: true, id: existing.id, duplicate: true };
   const metadata = Object.freeze({
     scope: "review_cycle",
@@ -409,7 +428,7 @@ function appendTrustedReviewCycleEventOnce(projectId, candidate) {
     channel: "general",
     type: "system",
     text: envelope.text,
-  }, metadata);
+  }, metadata, resumeStructural);
   return { ok: true, id: record.id, duplicate: false };
 }
 

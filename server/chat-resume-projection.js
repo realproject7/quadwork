@@ -29,6 +29,7 @@ const TAGS = new Set([
   "worker_terminal",
   "ci_terminal",
   "monitor_terminal",
+  "review_cycle",
   "batch_request",
   "head_lifecycle",
 ]);
@@ -40,6 +41,7 @@ const IDLE_HIGH_SIGNAL_TAGS = new Set([
   "worker_terminal",
   "ci_terminal",
   "monitor_terminal",
+  "review_cycle",
   "batch_request",
   "head_lifecycle",
 ]);
@@ -170,8 +172,8 @@ function tagMatchesRaw(raw, structural) {
   if (["head_assignment", "head_hold", "head_block"].includes(tag)) return raw.sender === "head" && raw.type === "message" && structural.server_authored === false;
   if (tag === "worker_terminal") return ["dev", "re1", "re2"].includes(raw.sender) && raw.type === "message" && structural.server_authored === false;
   if (["ci_terminal", "monitor_terminal"].includes(tag)) return raw.sender === "system" && raw.type === "trusted_event" && structural.server_authored === true;
-  if (tag === "batch_request") return raw.sender === "system" && raw.type === "system" && structural.server_authored === true;
-  return tag === "head_lifecycle" && raw.sender === "system" && raw.type === "system" && structural.server_authored === true;
+  return ["review_cycle", "batch_request", "head_lifecycle"].includes(tag) &&
+    raw.sender === "system" && raw.type === "system" && structural.server_authored === true;
 }
 
 function diagnostic(recordId, code) {

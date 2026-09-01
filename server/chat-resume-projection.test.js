@@ -49,7 +49,7 @@ function record(id, tag = "head_assignment", options = {}) {
   } else if (["ci_terminal", "monitor_terminal"].includes(tag)) {
     defaults.raw = { sender: "system", type: "trusted_event" };
     defaults.structural = { server_authored: true };
-  } else if (["batch_request", "head_lifecycle"].includes(tag)) {
+  } else if (["review_cycle", "batch_request", "head_lifecycle"].includes(tag)) {
     defaults.raw = { sender: "system", type: "system" };
     defaults.structural = { server_authored: true };
   }
@@ -58,6 +58,7 @@ function record(id, tag = "head_assignment", options = {}) {
     structural: structural(tag, { ...(defaults.structural || {}), ...(options.structural || {}) }),
   };
 }
+
 function source(max, overrides = {}) {
   return {
     source_id: "primary-chat",
@@ -92,6 +93,17 @@ function ok(value, message) {
   assert.ok(value, message);
   passed += 1;
   console.log(`  PASS: ${message}`);
+}
+
+// #1048's sealed request/reminder/gate records use one system-only recovery
+// tag. A quoted lookalike cannot enter the active feed without that tag.
+{
+  const request = record(1, "review_cycle");
+  const lookalike = record(2, "review_cycle", { raw: { sender: "head", type: "message" } });
+  const result = projectChatResume(input([request, lookalike], { limit: 8 }));
+  assert.deepEqual(result.records.map((item) => item.id), [1]);
+  assert.ok(result.diagnostics.some((item) => item.record_id === 2 && item.code === "untrusted_type_or_tag"));
+  ok(true, "server-originated review-cycle evidence survives reset without trusting quoted prose");
 }
 
 // Active pages preserve source order.  The cursor is bound to the immutable

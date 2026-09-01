@@ -1456,7 +1456,15 @@ router.post("/api/review-cycle-receipt", async (req, res) => {
     }, body.nonce);
     const gate = _reviewCycleStore.planHeadGate(principal.projectId, target);
     if (gate && !isProjectArchived(principal.projectId) && getProjectChatMode(principal.projectId) === "file") {
-      fileChat.appendTrustedReviewCycleEventOnce(principal.projectId, { project_id: principal.projectId, cycle: updated, plan: gate });
+      const admission = captureProjectAdmission(principal.projectId);
+      if (isAdmissionCurrent(admission)) {
+        fileChat.appendTrustedReviewCycleEventOnce(principal.projectId, {
+          project_id: principal.projectId,
+          cycle: updated,
+          plan: gate,
+          resume: { batch_id: currentChatResumeBatchId(principal.projectId), head_generation: admission.generation },
+        });
+      }
     }
     return res.json({ ok: true, review: updated.review_state, head_gate_due: updated.head_gate_due });
   } catch (error) {
@@ -5476,7 +5484,10 @@ async function attachReviewCycleHandoffs(projectId, context, admission, items, s
       row.review_handoff = observation.handoff;
       if (getProjectChatMode(projectId) === "file" && stillCurrent() && isAdmissionCurrent(admission) && !isProjectArchived(projectId)) {
         _reviewCycleDispatcher.deliver(projectId, observation,
-          (candidate) => fileChat.appendTrustedReviewCycleEventOnce(projectId, candidate));
+          (candidate) => fileChat.appendTrustedReviewCycleEventOnce(projectId, {
+            ...candidate,
+            resume: { batch_id: currentChatResumeBatchId(projectId), head_generation: admission.generation },
+          }));
       }
     } catch {
       // Authoritative input failures are fail-closed: no handoff and no chat.
