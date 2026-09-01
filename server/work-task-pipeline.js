@@ -277,10 +277,10 @@ function parseEvent(pipeline, event) {
       if (event.version !== VERSION) fail(code, "event version is invalid");
       return { version: VERSION, kind: event.kind, event_id: identifier(event.event_id, code), work_task_ref: canonicalTaskRef(pipeline, event.work_task_ref, code), assignment_id: identifier(event.assignment_id, code), base_sha: sha(event.base_sha, code) };
     case "record_candidate": {
-      exact(event, ["version", "kind", "event_id", "candidate"], code);
+      exact(event, ["version", "kind", "event_id", "assignment_id", "candidate"], code);
       if (event.version !== VERSION) fail(code, "event version is invalid");
       candidate(event.candidate, code);
-      return { version: VERSION, kind: event.kind, event_id: identifier(event.event_id, code), candidate: clone(event.candidate) };
+      return { version: VERSION, kind: event.kind, event_id: identifier(event.event_id, code), assignment_id: identifier(event.assignment_id, code), candidate: clone(event.candidate) };
     }
     case "replace_candidate": {
       exact(event, ["version", "kind", "event_id", "candidate"], code);
@@ -433,6 +433,9 @@ function deriveTransition(pipeline, event) {
     case "record_candidate": {
       const slot = locate(event.candidate.work_task_ref);
       requireState(slot, "building");
+      if (!slot.build_assignment || slot.build_assignment.assignment_id !== event.assignment_id) {
+        fail("work_task_candidate_assignment_mismatch", "candidate is not bound to the active Dev assignment");
+      }
       if (!slot.build_assignment || slot.build_assignment.base_sha !== event.candidate.base_sha) {
         fail("work_task_candidate_base_mismatch", "candidate base is not the server-issued assignment base");
       }

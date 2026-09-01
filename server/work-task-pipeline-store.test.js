@@ -314,7 +314,7 @@ withDirectory((directory) => {
   const ref = initial.manifest.tasks[0].ref;
   const candidate = candidateFor(ref);
   let state = persist(store, initial, event("assign_build", "cut_build", { work_task_ref: copy(ref), assignment_id: "cut_assignment" }));
-  state = persist(store, state, event("record_candidate", "cut_candidate", { candidate }));
+  state = persist(store, state, event("record_candidate", "cut_candidate", { assignment_id: "cut_assignment", candidate }));
   state = persist(store, state, event("assign_independent_review", "cut_review", {
     work_task_ref: copy(ref), review_round_id: "cut_round", candidate_digest: candidate.candidate_digest,
   }));

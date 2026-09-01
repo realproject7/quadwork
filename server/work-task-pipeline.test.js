@@ -126,7 +126,7 @@ function apply(pipeline, nextEvent) {
 function moveToCandidate(pipeline, taskRef, marker, prefix) {
   const candidate = candidateFor(taskRef, marker);
   let next = apply(pipeline, event("assign_build", `${prefix}_build`, { work_task_ref: copy(taskRef), assignment_id: `${prefix}_assignment` }));
-  next = apply(next, event("record_candidate", `${prefix}_candidate`, { candidate }));
+  next = apply(next, event("record_candidate", `${prefix}_candidate`, { assignment_id: `${prefix}_assignment`, candidate }));
   return { pipeline: next, candidate };
 }
 
@@ -146,7 +146,7 @@ function moveToCandidate(pipeline, taskRef, marker, prefix) {
   work = apply(work, event("assign_build", "boundary_alpha_build", {
     work_task_ref: copy(workRefs.alpha), assignment_id: "boundary_alpha_assignment",
   }));
-  work = apply(work, event("record_candidate", "boundary_alpha_candidate", { candidate: alpha }));
+  work = apply(work, event("record_candidate", "boundary_alpha_candidate", { assignment_id: "boundary_alpha_assignment", candidate: alpha }));
   work = apply(work, event("assign_independent_review", "boundary_alpha_review", {
     work_task_ref: copy(workRefs.alpha), review_round_id: "boundary_alpha_round", candidate_digest: alpha.candidate_digest,
   }));
@@ -176,10 +176,14 @@ function moveToCandidate(pipeline, taskRef, marker, prefix) {
   work = apply(work, event("assign_build", "base_pin_build", {
     work_task_ref: copy(workRefs.core), assignment_id: "base_pin_assignment",
   }));
+  const currentBaseCandidate = candidateFor(workRefs.core, "c");
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("record_candidate", "base_pin_stale_attempt", {
+    assignment_id: "base_pin_old_assignment", candidate: currentBaseCandidate,
+  })), "work_task_candidate_assignment_mismatch");
   const foreignBase = "f".repeat(64);
   const wrongBaseCandidate = candidateFor(workRefs.core, "b", foreignBase);
   throwsCode(() => planWorkTaskPipelineEvent(work, event("record_candidate", "base_pin_mismatch", {
-    candidate: wrongBaseCandidate,
+    assignment_id: "base_pin_assignment", candidate: wrongBaseCandidate,
   })), "work_task_candidate_base_mismatch");
 }
 function moveToAccepted(pipeline, taskRef, marker, prefix) {
@@ -217,7 +221,7 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   throwsCode(() => planWorkTaskPipelineEvent(work, event("assign_build", "overlap_ops_too_soon", {
     work_task_ref: copy(workRefs.ops), assignment_id: "overlap_ops_assignment",
   })), "active_build_task_exists");
-  work = apply(work, event("record_candidate", "overlap_core_candidate", { candidate: coreCandidate }));
+  work = apply(work, event("record_candidate", "overlap_core_candidate", { assignment_id: "overlap_core_assignment", candidate: coreCandidate }));
   work = apply(work, event("assign_independent_review", "overlap_core_review", {
     work_task_ref: copy(workRefs.core), review_round_id: "overlap_core_round", candidate_digest: coreCandidate.candidate_digest,
   }));
@@ -225,7 +229,7 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   assert.equal(slot(work, workRefs.core).state, "independent_review");
   assert.equal(slot(work, workRefs.ops).state, "building");
   const opsCandidate = candidateFor(workRefs.ops, "c");
-  work = apply(work, event("record_candidate", "overlap_ops_candidate", { candidate: opsCandidate }));
+  work = apply(work, event("record_candidate", "overlap_ops_candidate", { assignment_id: "overlap_ops_assignment", candidate: opsCandidate }));
   throwsCode(() => planWorkTaskPipelineEvent(work, event("assign_build", "dependent_before_ready", {
     work_task_ref: copy(workRefs["api-client"]), assignment_id: "dependent_assignment",
   })), "work_task_dependencies_not_ready");
@@ -250,7 +254,7 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   const second = candidateFor(workRefs.core, "c");
   let work = buildWorkTaskPipeline(batch);
   work = apply(work, event("assign_build", "replace_build_one", { work_task_ref: copy(workRefs.core), assignment_id: "replace_assignment_one" }));
-  work = apply(work, event("record_candidate", "replace_candidate_one", { candidate: first }));
+  work = apply(work, event("record_candidate", "replace_candidate_one", { assignment_id: "replace_assignment_one", candidate: first }));
   work = apply(work, event("assign_independent_review", "replace_review_one", {
     work_task_ref: copy(workRefs.core), review_round_id: "replace_round_one", candidate_digest: first.candidate_digest,
   }));
@@ -263,7 +267,7 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   work = apply(work, event("queue_local_correction", "replace_checkpoint", { work_task_ref: copy(workRefs.core), checkpoint_id: "replace_checkpoint_one" }));
   assert.deepEqual(slot(work, workRefs.core).correction, { checkpoint_id: "replace_checkpoint_one", count: 1 });
   work = apply(work, event("assign_build", "replace_build_two", { work_task_ref: copy(workRefs.core), assignment_id: "replace_assignment_two" }));
-  work = apply(work, event("record_candidate", "replace_candidate_two", { candidate: second }));
+  work = apply(work, event("record_candidate", "replace_candidate_two", { assignment_id: "replace_assignment_two", candidate: second }));
   assert.equal(slot(work, workRefs.core).candidate.candidate_digest, second.candidate_digest);
   assert.equal(slot(work, workRefs.core).correction, null);
   throwsCode(() => planWorkTaskPipelineEvent(work, event("record_review_verdict", "replace_stale_verdict", {
@@ -284,7 +288,7 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   const second = candidateFor(workRefs.core, "c");
   let work = buildWorkTaskPipeline(batch);
   work = apply(work, event("assign_build", "direct_replace_build", { work_task_ref: copy(workRefs.core), assignment_id: "direct_replace_assignment" }));
-  work = apply(work, event("record_candidate", "direct_replace_first", { candidate: first }));
+  work = apply(work, event("record_candidate", "direct_replace_first", { assignment_id: "direct_replace_assignment", candidate: first }));
   work = apply(work, event("assign_independent_review", "direct_replace_review", {
     work_task_ref: copy(workRefs.core), review_round_id: "direct_replace_round", candidate_digest: first.candidate_digest,
   }));
