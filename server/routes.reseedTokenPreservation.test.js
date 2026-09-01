@@ -113,6 +113,9 @@ function makeTempProject(label, agentsLayout) {
   }
   const re1Seed = realReadFileSync(path.join(TEMPLATES_DIR, "seeds", "re1.AGENTS.md"), "utf-8");
   const re2Seed = realReadFileSync(path.join(TEMPLATES_DIR, "seeds", "re2.AGENTS.md"), "utf-8");
+  const playbookSeed = realReadFileSync(path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md"), "utf-8");
+  const playbookVersion = playbookSeed.match(/^\*\*Playbook version:\*\*\s+(\d+\.\d+\.\d+)$/m);
+  assert.ok(playbookVersion, "canonical playbook seed carries a semantic version");
   // The seeds must contain the {{reviewer_token_path}} placeholder for the
   // preservation contract to be meaningful. Asserted up front so a future
   // template refactor that drops the placeholder fails this test loudly.
@@ -186,8 +189,8 @@ function makeTempProject(label, agentsLayout) {
     assert.ok(!headAfter.includes("GH_TOKEN=$(cat"), "head seed should have no GH_TOKEN line");
     assert.ok(!devAfter.includes("GH_TOKEN=$(cat"),  "dev seed should have no GH_TOKEN line");
     const playbookAfter = realReadFileSync(playbookPath, "utf-8");
-    assert.match(playbookAfter, /\*\*Playbook version:\*\*\s+1\.0\.0/,
-      "manual reseed refreshes the canonical playbook version");
+    assert.ok(playbookAfter.includes(playbookVersion[0]),
+      `manual reseed refreshes the canonical playbook version (${playbookVersion[1]})`);
     assert.ok(!playbookAfter.includes("stale canonical body"));
     assert.ok(playbookAfter.includes("preserve this note"),
       "manual reseed preserves operator-added playbook sections");
