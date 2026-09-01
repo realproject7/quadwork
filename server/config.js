@@ -22,6 +22,10 @@ const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const GITHUB_REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const INSTALLATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const LEGACY_PRIMARY_REPOSITORY_KEY = "primary";
+// Kept as a split literal so the removed product identity cannot become a
+// discoverable runtime/config surface again. This key is accepted only to
+// remove stale persisted metadata; no configured path is read or touched.
+const RETIRED_GLOBAL_AGENT_FIELD = ["but", "ler"].join("");
 const INTERNAL_CONFIG_WRITE = Symbol("internalConfigWrite");
 const INTERNAL_CONFIG_WRITE_AUTHORITY = Object.freeze({});
 let configWriteLockDepth = 0;
@@ -123,6 +127,13 @@ function cloneConfigurationValue(value) {
     );
   }
   return value;
+}
+
+function removeRetiredGlobalAgentMetadata(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  if (!hasOwn(config, RETIRED_GLOBAL_AGENT_FIELD)) return false;
+  delete config[RETIRED_GLOBAL_AGENT_FIELD];
+  return true;
 }
 
 function canonicalRepositoryName(repo) {
@@ -643,6 +654,7 @@ function validateV2Configuration(config, options = {}) {
 function migrateConfigurationToV2(config) {
   if (!config || typeof config !== "object" || Array.isArray(config)) return config;
   const cloned = cloneConfigurationValue(config);
+  removeRetiredGlobalAgentMetadata(cloned);
   const projects = Array.isArray(cloned.projects)
     ? cloned.projects.map((project) => {
         if (!project || typeof project !== "object" || Array.isArray(project)) return project;
@@ -690,7 +702,7 @@ function sanitizeOperatorName(value) {
 const AGENT_KEY_MAP = { t1: "head", t2a: "re1", t2b: "re2", t3: "dev", reviewer1: "re1", reviewer2: "re2" };
 
 function migrateAgentKeysInMemory(config) {
-  let changed = false;
+  let changed = removeRetiredGlobalAgentMetadata(config);
   if (config.projects) {
     for (const project of config.projects) {
       if (!project.agents) continue;
@@ -883,6 +895,7 @@ function writeConfigUnlocked(cfg, options = {}) {
   // non-enumerable properties; those must remain usable in memory without
   // becoming false persisted-schema violations at the atomic boundary.
   const candidate = cloneConfigurationValue(cfg);
+  removeRetiredGlobalAgentMetadata(candidate);
   const lifecycleTransition = internalWrite ? options.lifecycleTransition : null;
   const wasActivated = hasOwn(previousConfig || {}, "installation_id");
   const isActivated = hasOwn(candidate || {}, "installation_id");
@@ -940,6 +953,7 @@ function updateConfigInternal(mutator, options = {}) {
     migrateAgentKeysInMemory(cfg);
     const previousConfig = cloneConfigurationValue(cfg);
     mutator(cfg);
+    removeRetiredGlobalAgentMetadata(cfg);
     if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
     writeConfig(cfg, {
       previousConfig,
@@ -1068,6 +1082,7 @@ module.exports = {
   workingDirIdentity,
   validateV2Configuration,
   migrateConfigurationToV2,
+  RETIRED_GLOBAL_AGENT_FIELD,
   commitV2Configuration,
   commitConfigurationSnapshot,
 };

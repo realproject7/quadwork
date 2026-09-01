@@ -1,4 +1,4 @@
-// #968: shared session token for the PTY-driving surface (terminal/butler
+// #968: shared session token for the PTY-driving surface (terminal
 // WebSockets + /write + /interrupt). The server auto-provisions it and hands it
 // to the LOCAL dashboard via GET /api/session-token, so the operator sees no
 // change. For tailnet/LAN access (where that endpoint 403s), set

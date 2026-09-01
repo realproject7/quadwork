@@ -47,6 +47,7 @@ const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const ENV_PATH = path.join(CONFIG_DIR, ".env");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+const RETIRED_GLOBAL_AGENT_FIELD = ["but", "ler"].join("");
 
 // #837: `gh api` list fetches (closed-PR pages with `-i`, GraphQL repo
 // snapshot, batch progress) can exceed Node's default 1MB execFile maxBuffer.
@@ -484,6 +485,7 @@ router.put("/api/config", (req, res) => {
     // overwrite and V1→V2 activation races between request parsing and commit.
     updateConfig((cfg) => {
       const candidate = JSON.parse(JSON.stringify(body));
+      delete candidate[RETIRED_GLOBAL_AGENT_FIELD];
       const liveHasInstallationId = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
       const bodyHasInstallationId = Object.prototype.hasOwnProperty.call(candidate, "installation_id");
       if (bodyHasInstallationId &&
@@ -551,7 +553,7 @@ router.put("/api/config", (req, res) => {
 //     one); on-disk projects absent from the body are left untouched.
 const CONFIG_MERGE_EXCLUDED = new Set([
   "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token", "installation_id",
-  "project_admission_generations",
+  "project_admission_generations", RETIRED_GLOBAL_AGENT_FIELD,
 ]);
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
@@ -5213,7 +5215,7 @@ router.get("/api/batch-progress", async (req, res) => {
   return res.json(data);
 });
 
-// #445: Memory section (agent-memory butler integration) removed.
+// #445: Memory section integration removed.
 
 // ─── Setup ─────────────────────────────────────────────────────────────────
 

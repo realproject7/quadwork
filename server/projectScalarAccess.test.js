@@ -1404,9 +1404,9 @@ const EXPECTED_PRE_ACTIVATION_LEDGER = Object.freeze({
   "server/index.js :: owner=runStartupMigrations :: call=runStartupMigrations :: binding=p :: working_dir:property :: at=76de06f21223#273:if (!p.working_dir) continue;": 1,
   "server/index.js :: owner=runStartupMigrations :: call=runStartupMigrations :: binding=p :: working_dir:property :: at=7da5876fe50f#285:const dirName = path.basename(p.working_dir);": 1,
   "server/routes.js :: owner=post(\"/api/rename\")#arg1 :: call=post(\"/api/rename\")#arg1 :: binding=project :: working_dir:property :: at=204b9f7500f3#77:const workDir = project.working_dir || \"\";": 1,
-  "src/components/HomeDashboard.tsx :: owner=HomeDashboard :: call=HomeDashboard > map()#arg0 :: binding=project :: repo:property :: at=959278b1fae5#226:return ( <div className=\"h-full overflow-y-auto lg:overf": 1,
-  "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: repo:property :: at=8437f5a87eb7#202:return ( <div key={project.id} className=\"border border-": 1,
-  "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: working_dir:property :: at=8437f5a87eb7#236:return ( <div key={project.id} className=\"border border-": 1,
+  "src/components/HomeDashboard.tsx :: owner=HomeDashboard :: call=HomeDashboard > map()#arg0 :: binding=project :: repo:property :: at=ee51ba45cecd#226:return ( <div className=\"h-full overflow-y-auto lg:overf": 1,
+  "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: repo:property :: at=2d0f4b9880bd#202:return ( <div key={project.id} className=\"border border-": 1,
+  "src/components/SettingsPage.tsx :: owner=SettingsPage :: call=SettingsPage > map()#arg0 :: binding=project :: working_dir:property :: at=2d0f4b9880bd#236:return ( <div key={project.id} className=\"border border-": 1,
 });
 
 function runProductionScan() {
@@ -1414,6 +1414,18 @@ function runProductionScan() {
   const sourceTextByFile = new Map(files.map((fileName) => [normalizeFileName(fileName), fs.readFileSync(fileName, "utf8")]));
   const violations = analyzeSources(sourceTextByFile, ROOT);
   const actualLedger = ledgerFor(violations);
+  const dashboardScalarReads = {};
+  for (const violation of violations) {
+    if (violation.file !== "src/components/HomeDashboard.tsx" &&
+        violation.file !== "src/components/SettingsPage.tsx") continue;
+    const key = `${violation.file}:${violation.field}`;
+    dashboardScalarReads[key] = (dashboardScalarReads[key] || 0) + 1;
+  }
+  assert.deepEqual(dashboardScalarReads, {
+    "src/components/HomeDashboard.tsx:repo": 1,
+    "src/components/SettingsPage.tsx:repo": 1,
+    "src/components/SettingsPage.tsx:working_dir": 1,
+  }, "Home/Settings have no additional persisted scalar project consumers");
   assert.deepEqual(
     actualLedger,
     EXPECTED_PRE_ACTIVATION_LEDGER,

@@ -1,5 +1,5 @@
-// #972: shutdown() must actually tear down the orchestrator, not just butler +
-// file-chat. This boots the real server in-process on a THROWAWAY port (temp
+// #972: shutdown() must actually tear down the orchestrator and file-chat.
+// This boots the real server in-process on a THROWAWAY port (temp
 // HOME, one bash-backed project, never port 8400), spawns an agent PTY through
 // the authed terminal WebSocket, then calls the exported shutdown() and asserts:
 //   - the agent PTY child process is killed (no orphan holding a worktree lock),

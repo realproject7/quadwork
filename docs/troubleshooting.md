@@ -140,7 +140,7 @@ See the [VPS Installation Guide](install-vps.md#step-2-create-non-root-user-crit
 
 ## Terminals won't attach (session token / cross-origin) — #968
 
-**Background:** The terminal WebSocket (`/ws/terminal`, `/ws/butler`) and the
+**Background:** The terminal WebSocket (`/ws/terminal`) and the
 PTY-write endpoints (`POST /api/agents/:project/:agent/write`, `/interrupt`)
 are authenticated (#968). Two checks run:
 

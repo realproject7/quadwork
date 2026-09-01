@@ -43,7 +43,7 @@ const config = readConfig();
 const PORT = config.port || 8400;
 
 // #968: shared session token gating the PTY-driving surface (/ws/terminal,
-// /ws/butler, /write, /interrupt). Auto-provisioned + persisted to config.json
+// /write, /interrupt). Auto-provisioned + persisted to config.json
 // so the LOCAL dashboard attaches it with zero operator friction; tailnet/LAN
 // exposure must supply it out-of-band (see docs/*). Kept out of any response
 // except the localhost-only /api/session-token endpoint.
@@ -846,9 +846,6 @@ const lifecycleGovernor = createAgentLifecycleGovernor({
   // It is intentionally not a general runtime override hook.
   testOverrideFor: (fixture) => _lifecycleTestFixtureCapabilities.has(fixture) ? fixture : null,
 });
-
-// #631: Butler session — single global PTY (not per-project, no AC integration)
-let butlerSession = { term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
 
 // --- MCP auth proxy for Codex (can't pass headers via -c flag) ---
 // Maps "project/agent" → { server, port }
@@ -1801,9 +1798,6 @@ app.post("/api/full-reset", async (_req, res) => {
       await stopAgentSession(key, { clearSelfHeal: true }); // #825: manual full-reset resets the self-heal window
     }
 
-    console.log("[full-reset] stopping Butler...");
-    stopButlerPty();
-
     console.log("[full-reset] running startup migrations...");
     runStartupMigrations(cfg);
 
@@ -1824,12 +1818,6 @@ app.post("/api/full-reset", async (_req, res) => {
       } catch (err) {
         errors.push(`${project.id}: agent reset — ${err.message}`);
       }
-    }
-
-    if (cfg.butler?.enabled) {
-      console.log("[full-reset] restarting Butler...");
-      const result = spawnButlerPty();
-      if (!result.ok) errors.push(`butler: ${result.error}`);
     }
 
     const duration = Date.now() - start;
@@ -2041,176 +2029,6 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
-});
-
-// --- Butler agent (#631) ---
-
-function spawnButlerPty() {
-  if (butlerSession.term) return { ok: true, pid: butlerSession.term.pid };
-
-  try {
-    const cfg = readConfig();
-    const butlerCfg = cfg.butler || {};
-    const cwdRaw = butlerCfg.cwd || "~/docs/";
-    const docsDir = cwdRaw.startsWith("~/") ? path.join(os.homedir(), cwdRaw.slice(2)) : cwdRaw;
-    if (!fs.existsSync(docsDir)) {
-      fs.mkdirSync(docsDir, { recursive: true, mode: 0o700 });
-    }
-
-    const command = butlerCfg.command || "claude";
-    const args = [];
-    if (butlerCfg.model) args.push("--model", butlerCfg.model);
-    if (butlerCfg.auto_approve !== false) {
-      const flags = PERMISSION_FLAGS[command] || [];
-      args.push(...flags);
-    }
-
-    // #975: the old pre-trust ran `claude -p "echo ok"` synchronously with a
-    // 15s timeout on the event loop — a hung claude blackholed every agent's
-    // WS/HTTP/timers for up to 15s. Dropped: the interactive trust prompt is
-    // already auto-answered by the onData trust-listener installed below (the
-    // same mechanism the agent PTYs rely on), so no synchronous pre-trust is
-    // needed to reach a trusted session.
-
-    const seedPath = path.join(__dirname, "..", "templates", "seeds", "butler.CLAUDE.md");
-    const claudePath = path.join(docsDir, "CLAUDE.md");
-    if (!fs.existsSync(claudePath)) {
-      const legacyPath = path.join(docsDir, "AGENTS.md");
-      if (fs.existsSync(legacyPath)) {
-        fs.copyFileSync(legacyPath, claudePath);
-      } else if (fs.existsSync(seedPath)) {
-        fs.copyFileSync(seedPath, claudePath);
-      }
-    }
-
-    // #635: seed README.md explaining ~/docs/ folder purpose
-    const readmePath = path.join(docsDir, "README.md");
-    if (!fs.existsSync(readmePath)) {
-      fs.writeFileSync(readmePath, [
-        "# ~/docs/",
-        "",
-        "Butler's working directory — cross-project operator notes and artifacts.",
-        "Not git-tracked; operator-local.",
-        "",
-        "## File types",
-        "",
-        "| Prefix | Purpose |",
-        "|--------|---------|",
-        "| `PROPOSAL-<name>.md` | Feature proposals with phases and operator gates |",
-        "| `REVIEW-<batch>.md` | PR review summaries |",
-        "| `INFO-<topic>.md` | Research notes |",
-        "| `PROGRESS-<project>.md` | Per-project progress (one file per project) |",
-        "",
-      ].join("\n"));
-    }
-
-    const term = pty.spawn(command, args, {
-      name: "xterm-256color",
-      cols: 120,
-      rows: 30,
-      cwd: docsDir,
-      env: { ...process.env },
-    });
-
-    butlerSession = {
-      term,
-      viewers: new Set(),
-      viewerDims: new Map(),
-      lastDims: null,
-      state: "running",
-      error: null,
-      scrollback: Buffer.alloc(0),
-      command,
-      model: butlerCfg.model || "",
-    };
-
-    const SCROLLBACK_SIZE = 64 * 1024;
-    term.onData((data) => {
-      const chunk = Buffer.from(data);
-      butlerSession.scrollback = Buffer.concat([butlerSession.scrollback, chunk]);
-      if (butlerSession.scrollback.length > SCROLLBACK_SIZE) {
-        butlerSession.scrollback = butlerSession.scrollback.slice(-SCROLLBACK_SIZE);
-      }
-    });
-
-    // Auto-answer Claude's trust prompt if it appears within the first 10s
-    if (command === "claude") {
-      let trustHandled = false;
-      const trustListener = term.onData((data) => {
-        if (trustHandled) return;
-        if (data.includes("trust") || data.includes("Yes,") || data.includes("1.")) {
-          setTimeout(() => {
-            if (!trustHandled && butlerSession.term === term) {
-              safeWrite(term, "1\r");
-              trustHandled = true;
-            }
-          }, 500);
-        }
-      });
-      setTimeout(() => { trustListener.dispose(); trustHandled = true; }, 10000);
-    }
-
-    term.onExit(({ exitCode }) => {
-      if (butlerSession.term === term) {
-        butlerSession.state = "stopped";
-        butlerSession.error = exitCode ? `exit:${exitCode}` : null;
-        butlerSession.term = null;
-        for (const v of butlerSession.viewers) {
-          if (v.readyState <= 1) v.close(1000, `exited:${exitCode}`);
-        }
-        butlerSession.viewers.clear();
-      }
-    });
-
-    console.log(`[butler] spawned (PID: ${term.pid}, cwd: ${docsDir})`);
-    return { ok: true, pid: term.pid };
-  } catch (err) {
-    butlerSession = { term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "error", error: err.message, scrollback: Buffer.alloc(0) };
-    return { ok: false, error: err.message };
-  }
-}
-
-function stopButlerPty() {
-  if (butlerSession.term) {
-    try { butlerSession.term.kill(); } catch {}
-    butlerSession.term = null;
-  }
-  for (const v of butlerSession.viewers) {
-    if (v.readyState <= 1) v.close(1000, "stopped");
-  }
-  butlerSession = { term: null, viewers: new Set(), viewerDims: new Map(), lastDims: null, state: "stopped", error: null, scrollback: Buffer.alloc(0) };
-}
-
-app.post("/api/butler/start", (_req, res) => {
-  const result = spawnButlerPty();
-  if (result.ok) {
-    try {
-      const cfg = readConfig();
-      cfg.butler = { ...cfg.butler, enabled: true };
-      writeConfig(cfg);
-    } catch {}
-  }
-  res.json(result);
-});
-
-app.post("/api/butler/stop", (_req, res) => {
-  stopButlerPty();
-  try {
-    const cfg = readConfig();
-    cfg.butler = { ...cfg.butler, enabled: false };
-    writeConfig(cfg);
-  } catch {}
-  res.json({ ok: true });
-});
-
-app.get("/api/butler/status", (_req, res) => {
-  const running = butlerSession.state === "running" && !!butlerSession.term;
-  res.json({
-    running,
-    pid: butlerSession.term ? butlerSession.term.pid : null,
-    command: running ? butlerSession.command : undefined,
-    model: running ? butlerSession.model : undefined,
-  });
 });
 
 // --- Scheduled Triggers ---
@@ -3179,7 +2997,7 @@ const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, "http://localhost");
   const pathname = url.pathname;
-  if (pathname !== "/ws/terminal" && pathname !== "/ws/butler") {
+  if (pathname !== "/ws/terminal") {
     socket.destroy();
     return;
   }
@@ -3196,15 +3014,9 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  if (pathname === "/ws/terminal") {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection:terminal", ws, req);
-    });
-  } else {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection:butler", ws, req);
-    });
-  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection:terminal", ws, req);
+  });
 });
 
 wss.on("connection:terminal", async (ws, req) => {
@@ -3302,78 +3114,6 @@ wss.on("connection:terminal", async (ws, req) => {
       if (merged.cols !== session.lastDims?.cols || merged.rows !== session.lastDims?.rows) {
         session.term.resize(merged.cols, merged.rows);
         session.lastDims = merged;
-      }
-    }
-  });
-});
-
-// --- Butler WebSocket (#631) ---
-
-wss.on("connection:butler", async (ws) => {
-  if (!butlerSession.term) {
-    const result = spawnButlerPty();
-    if (!result.ok) {
-      ws.close(1011, "pty-spawn-failed");
-      return;
-    }
-  }
-
-  butlerSession.viewers.add(ws);
-
-  const dataHandler = butlerSession.term.onData((data) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(scrubSecrets(data));
-  });
-
-  ws.on("message", (msg) => {
-    if (!butlerSession.term) return;
-    const str = msg.toString();
-    try {
-      const parsed = JSON.parse(str);
-      if (parsed.type === "resize") {
-        if (typeof parsed.cols === "number" && typeof parsed.rows === "number" &&
-            Number.isFinite(parsed.cols) && Number.isFinite(parsed.rows) &&
-            parsed.cols >= 1 && parsed.cols <= 500 &&
-            parsed.rows >= 1 && parsed.rows <= 500) {
-          butlerSession.viewerDims.set(ws, { cols: parsed.cols, rows: parsed.rows });
-          const dims = [...butlerSession.viewerDims.values()];
-          const merged = {
-            cols: Math.min(...dims.map(d => d.cols)),
-            rows: Math.min(...dims.map(d => d.rows)),
-          };
-          if (!butlerSession.lastDims ||
-              merged.cols !== butlerSession.lastDims.cols ||
-              merged.rows !== butlerSession.lastDims.rows) {
-            butlerSession.term.resize(merged.cols, merged.rows);
-            butlerSession.lastDims = merged;
-          }
-        }
-        return;
-      }
-      if (parsed.type === "replay") {
-        if (butlerSession.scrollback && butlerSession.scrollback.length > 0) {
-          ws.send(scrubScrollback(butlerSession.scrollback));
-        } else {
-          ws.send(`\x1b[2m[butler online — waiting for input]\x1b[0m\r\n`);
-        }
-        return;
-      }
-    } catch {}
-    safeWrite(butlerSession.term, str);
-  });
-
-  ws.on("close", () => {
-    dataHandler.dispose();
-    butlerSession.viewers.delete(ws);
-    butlerSession.viewerDims.delete(ws);
-    if (butlerSession.viewerDims.size > 0 && butlerSession.term) {
-      const dims = [...butlerSession.viewerDims.values()];
-      const merged = {
-        cols: Math.min(...dims.map(d => d.cols)),
-        rows: Math.min(...dims.map(d => d.rows)),
-      };
-      if (merged.cols !== butlerSession.lastDims?.cols || merged.rows !== butlerSession.lastDims?.rows) {
-        butlerSession.term.resize(merged.cols, merged.rows);
-        butlerSession.lastDims = merged;
       }
     }
   });
@@ -3990,17 +3730,12 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
     console.error(`[respawn] restart respawn failed: ${err.message}`);
   }
 
-  if (startupCfg.butler && startupCfg.butler.enabled && startupCfg.butler.auto_start) {
-    const result = spawnButlerPty();
-    if (result.ok) console.log(`[butler] auto-started (PID: ${result.pid})`);
-    else console.warn(`[butler] auto-start failed: ${result.error}`);
-  }
   startWatchdog();
   });
 }
 
-// #972: clean shutdown. Previously only stopped butler + file-chat, so Ctrl+C
-// orphaned the detached caffeinate process (Mac never slept again), left agent
+// #972: clean shutdown. Ctrl+C previously orphaned the detached caffeinate
+// process (Mac never slept again), left agent
 // PTYs (and their CLI children holding worktree locks) alive, and never cleared
 // the polling/watchdog timers or the bridge/trigger connections. Every step is
 // independently guarded so the function stays idempotent (SIGINT then SIGTERM,
@@ -4042,7 +3777,6 @@ function shutdown() {
     if (session && session.term) { try { session.term.kill(); } catch {} }
   }
 
-  stopButlerPty();
   const cfg = readConfig();
   for (const p of (cfg.projects || [])) {
     if (p.chat_mode === "file") {

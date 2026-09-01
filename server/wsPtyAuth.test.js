@@ -139,6 +139,11 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
 
   const good = await tryWs(`ws://127.0.0.1:${PORT}${wsPath}&token=${token}`, { origin });
   ok(good.open === true, "WS with valid Origin + token → upgrade accepted (opens)");
+  const normalRoleUpgrades = await Promise.all(["head", "re1", "re2", "dev"].map((agent) =>
+    tryWs(`ws://127.0.0.1:${PORT}/ws/terminal?project=x&agent=${agent}&token=${token}`, { origin }),
+  ));
+  ok(normalRoleUpgrades.every((result) => result.open === true),
+    "all four normal agent terminal WS roles retain the authenticated upgrade path");
 
   // ── REST PTY-write auth ──────────────────────────────────────────────────
   const writeNoTok = await httpReq(PORT, { method: "POST", path: "/api/agents/x/head/write", body: JSON.stringify({ text: "hi\n" }) });

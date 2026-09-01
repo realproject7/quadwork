@@ -35,18 +35,6 @@ interface ProjectConfig {
   idle?: boolean;
 }
 
-interface ButlerConfig {
-  enabled?: boolean;
-  command?: string;
-  model?: string;
-  auto_start?: boolean;
-  cwd?: string;
-  // #937: present only if a config carries it (the wizard doesn't write one for
-  // the butler and the butler spawn doesn't consume it). Healed on save only
-  // when already set, so a stale value never re-persists.
-  mcp_inject?: string;
-}
-
 interface Config {
   port: number;
   default_backend?: string;
@@ -55,7 +43,6 @@ interface Config {
   // dashboard-originated messages. Defaults to "user" server-side.
   operator_name?: string;
   projects: ProjectConfig[];
-  butler?: ButlerConfig;
 }
 
 const DEFAULT_AGENTS: Record<string, AgentConfig> = {
@@ -151,18 +138,7 @@ const COPY = {
     lifecycleFailed: "Project lifecycle operation failed",
     retryCleanup: "Retry cleanup",
     newProject: "New Project",
-    butlerAgent: "Butler Agent",
-    butlerEnabled: "Enabled",
-    butlerDisabled: "Disabled",
-    butlerCli: "CLI",
-    butlerModel: "Model",
-    butlerAutoStart: "Auto-start on boot",
-    butlerCwd: "Working directory",
-    butlerHelp: "Butler is a cross-project operator assistant that runs in ~/docs/. It helps manage tickets, proposals, reviews, and releases across all projects.",
-    enable: "Enable",
-    disable: "Disable",
     unsavedChanges: "Unsaved changes",
-    butlerRestartHint: "Butler is running with previous settings. Disable and re-enable to apply changes.",
   },
   ko: {
     loading: "로딩 중...",
@@ -242,18 +218,7 @@ const COPY = {
     lifecycleFailed: "프로젝트 상태 변경에 실패했습니다",
     retryCleanup: "정리 다시 시도",
     newProject: "새 프로젝트",
-    butlerAgent: "버틀러 에이전트",
-    butlerEnabled: "활성",
-    butlerDisabled: "비활성",
-    butlerCli: "CLI",
-    butlerModel: "모델",
-    butlerAutoStart: "서버 시작 시 자동 실행",
-    butlerCwd: "작업 디렉터리",
-    butlerHelp: "버틀러는 ~/docs/에서 실행되는 크로스 프로젝트 운영자 어시스턴트입니다. 모든 프로젝트의 티켓, 제안서, 리뷰, 릴리스 관리를 지원합니다.",
-    enable: "활성화",
-    disable: "비활성화",
     unsavedChanges: "저장되지 않은 변경사항",
-    butlerRestartHint: "버틀러가 이전 설정으로 실행 중입니다. 변경사항을 적용하려면 비활성화 후 다시 활성화하세요.",
   },
 } as const;
 
@@ -314,7 +279,6 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const savedConfigRef = useRef<string>("");
-  const [butlerStartConfig, setButlerStartConfig] = useState<{ command: string; model: string } | null>(null);
   // #814: pending "Set Inactive?" confirmation (null = no modal).
   const [idleConfirm, setIdleConfirm] = useState<{ id: string; name: string } | null>(null);
   // #826: project ids with an idle PUT in flight — disable the switch for them
@@ -411,7 +375,6 @@ export default function SettingsPage() {
           reviewer_github_user: data.reviewer_github_user || "",
           operator_name: data.operator_name || "user",
           projects: data.projects || [],
-          butler: data.butler || {},
         };
         savedConfigRef.current = JSON.stringify(cfg);
         return setConfig(cfg);
@@ -445,8 +408,6 @@ export default function SettingsPage() {
   const [reviewerUserMessage, setReviewerUserMessage] = useState("");
   const [keepAwakeActive, setKeepAwakeActive] = useState(false);
   const [keepAwakeBusy, setKeepAwakeBusy] = useState(false);
-  const [butlerRunning, setButlerRunning] = useState(false);
-  const [butlerBusy, setButlerBusy] = useState(false);
 
   const refreshReviewerTokenStatus = useCallback(() => {
     fetch("/api/setup/reviewer-token-status")
@@ -468,24 +429,10 @@ export default function SettingsPage() {
       .catch(() => {});
   }, []);
 
-  const refreshButlerStatus = useCallback(() => {
-    fetch("/api/butler/status")
-      .then((r) => (r.ok ? r.json() : { running: false }))
-      .then((d) => {
-        setButlerRunning(!!d.running);
-        if (d.running && d.command) {
-          setButlerStartConfig({ command: d.command, model: d.model || "" });
-        }
-        if (!d.running) setButlerStartConfig(null);
-      })
-      .catch(() => {});
-  }, []);
-
   useEffect(() => {
     refreshReviewerTokenStatus();
     refreshKeepAwake();
-    refreshButlerStatus();
-  }, [refreshReviewerTokenStatus, refreshKeepAwake, refreshButlerStatus]);
+  }, [refreshReviewerTokenStatus, refreshKeepAwake]);
 
   useEffect(() => {
     if (config) setReviewerUserDraft(config.reviewer_github_user || "");
@@ -564,32 +511,6 @@ export default function SettingsPage() {
     }
   };
 
-  const updateButler = (updates: Partial<ButlerConfig>) => {
-    if (!config) return;
-    setConfig({ ...config, butler: { ...config.butler, ...updates } });
-  };
-
-  const toggleButler = async () => {
-    setButlerBusy(true);
-    try {
-      const stopping = butlerRunning;
-      const url = stopping ? "/api/butler/stop" : "/api/butler/start";
-      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      if (r.ok) {
-        const data = await r.json();
-        if (stopping || data.ok) {
-          if (stopping) {
-            setButlerStartConfig(null);
-          }
-          refreshButlerStatus();
-          updateButler({ enabled: !stopping });
-        }
-      }
-    } finally {
-      setButlerBusy(false);
-    }
-  };
-
   // Auto-add project when navigated with ?add=true
   useEffect(() => {
     if (config && searchParams.get("add") === "true" && !autoAdded) {
@@ -621,16 +542,10 @@ export default function SettingsPage() {
       // invalid by the old hardcoded dropdown (e.g. a codex agent saved with
       // "sonnet") and also covers a new project seeded from DEFAULT_AGENTS with
       // a non-Claude default command. sanitizeModel keeps "" (CLI default) as-is.
-      // #935: the butler model needs the same guard. Its dropdown is
-      // provider-aware and resets on Command-change, but a butler left invalid
-      // (hand-edited config, never command-changed) would otherwise re-persist.
       // #937: reconcile mcp_inject the same way. Every agent carries one (the
       // wizard writes it and the spawn path reads it), so always re-derive it
       // from the command — this heals a stale "flag" left on an agent converted
-      // to gemini before this fix, which would otherwise crash the CLI. The
-      // butler is different: its spawn doesn't consume mcp_inject and the wizard
-      // never writes one, so we only heal a value that's already present rather
-      // than fabricate one.
+      // to gemini before this fix, which would otherwise crash the CLI.
       const normalizedConfig = {
         ...config,
         projects: config.projects.map((p) => {
@@ -644,15 +559,6 @@ export default function SettingsPage() {
           }
           return { ...p, agents };
         }),
-        butler: config.butler
-          ? {
-              ...config.butler,
-              model: sanitizeModel(config.butler.command || "claude", config.butler.model),
-              ...(config.butler.mcp_inject !== undefined
-                ? { mcp_inject: injectModeForCommand(config.butler.command || "claude") }
-                : {}),
-            }
-          : config.butler,
       };
       // #971: save via the section-merge PATCH (no whole-config PUT). Send only
       // the sections Settings owns — strip the field-scoped-owned keys so the
@@ -936,11 +842,6 @@ export default function SettingsPage() {
   if (!config) return <div className="p-6 text-text-muted text-xs">{t.loading}</div>;
 
   const isDirty = savedConfigRef.current !== "" && JSON.stringify(config) !== savedConfigRef.current;
-  const butlerConfigChanged = butlerRunning && butlerStartConfig != null && (
-    (config.butler?.command || "claude") !== butlerStartConfig.command ||
-    (config.butler?.model || "") !== butlerStartConfig.model
-  );
-
   return (
     <div className="h-full w-full overflow-y-auto p-6">
       <div className="flex items-center justify-between mb-6">
@@ -1131,72 +1032,6 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      {/* Butler Agent (#632) */}
-      <section id="butler" className="mb-8">
-        <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.butlerAgent}</h2>
-        <div className="border border-border p-3 space-y-3">
-          <div className="flex items-center gap-3">
-            <span className={`w-1.5 h-1.5 rounded-full ${butlerRunning ? "bg-accent" : "bg-text-muted"}`} />
-            <span className="text-[11px] text-text">{butlerRunning ? t.butlerEnabled : t.butlerDisabled}</span>
-            <button
-              onClick={toggleButler}
-              disabled={butlerBusy}
-              className="px-2 py-1 text-[11px] border border-border text-text-muted hover:text-text hover:border-accent disabled:opacity-50 transition-colors"
-            >
-              {butlerBusy ? "…" : butlerRunning ? t.disable : t.enable}
-            </button>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <Select
-              label={t.butlerCli}
-              value={config.butler?.command || "claude"}
-              onChange={(v) => {
-                const models = modelsForBackend(v);
-                const currentModel = config.butler?.model || "opus";
-                const modelValid = models.some((m) => m.value === currentModel);
-                // #937: only re-derive mcp_inject if this config actually carries
-                // one — the butler spawn doesn't consume it and the wizard never
-                // writes one, so we heal a stale value without fabricating a field.
-                updateButler({
-                  command: v,
-                  model: modelValid ? currentModel : models[0].value,
-                  ...(config.butler?.mcp_inject !== undefined ? { mcp_inject: injectModeForCommand(v) } : {}),
-                });
-              }}
-              options={BACKENDS.map((b) => ({
-                value: b.value,
-                label: b.label + (cliStatus && !cliStatus[b.value as keyof typeof cliStatus] ? " (not installed)" : ""),
-              }))}
-            />
-            <Select
-              label={t.butlerModel}
-              value={config.butler?.model || "opus"}
-              onChange={(v) => updateButler({ model: v })}
-              options={modelsForBackend(config.butler?.command || "claude")}
-            />
-            <Input
-              label={t.butlerCwd}
-              value={config.butler?.cwd || "~/docs/"}
-              onChange={(v) => updateButler({ cwd: v })}
-              placeholder="~/docs/"
-            />
-          </div>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={config.butler?.auto_start ?? false}
-              onChange={(e) => updateButler({ auto_start: e.target.checked })}
-              className="accent-accent"
-            />
-            <span className="text-[11px] text-text">{t.butlerAutoStart}</span>
-          </label>
-          <p className="text-[10px] text-text-muted leading-snug">{t.butlerHelp}</p>
-          {butlerConfigChanged && (
-            <p className="text-[10px] text-yellow-500 leading-snug mt-1">⚠ {t.butlerRestartHint}</p>
-          )}
-        </div>
-      </section>
-
       {/* Cleanup commands (#212 / #189) */}
       <section className="mb-8">
         <h2 className="text-[11px] text-text-muted uppercase tracking-wider mb-3">{t.cleanup}</h2>
@@ -1295,8 +1130,7 @@ export default function SettingsPage() {
                               value={agent.command || "claude"}
                               onChange={(e) => {
                                 // #931: changing the command must reset the model to one
-                                // valid for the new backend (mirror the butler dropdown
-                                // above) — otherwise a Claude model leaks onto a
+                                // valid for the new backend — otherwise a Claude model leaks onto a
                                 // codex/gemini agent and is saved/spawned as invalid.
                                 // #937: likewise reset mcp_inject to the new backend's
                                 // mode — otherwise converting to gemini leaves a stale

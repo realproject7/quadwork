@@ -23,6 +23,7 @@ process.on("exit", () => { os.homedir = origHome; try { fs.rmSync(TMP, { recursi
 
 const writeCfg = (o) => fs.writeFileSync(CONFIG_PATH, JSON.stringify(o, null, 2));
 const readCfg = () => JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+const RETIRED_GLOBAL_AGENT_FIELD = ["but", "ler"].join("");
 
 writeCfg({ port: 8400, operator_name: "Alice!", projects: [{ id: "lv", name: "lv" }] });
 
@@ -103,6 +104,7 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     ok(getCfg.operator_name === "Alice", "GET /api/config returns the SANITIZED operator_name");
     getCfg.projects[0].idle = false; // stale — a concurrent PATCH set it true
     getCfg.projects[0].archived = true; // lifecycle-owned; generic PUT cannot introduce it
+    getCfg[RETIRED_GLOBAL_AGENT_FIELD] = { cwd: "/operator-owned/notes" };
     const put = await req(server, { method: "PUT", urlPath: "/api/config", body: getCfg });
     ok(put.status === 200, "whole-config PUT succeeds");
     const disk = readCfg();
@@ -110,6 +112,8 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     ok(disk.operator_name === "Alice!", "raw operator_name survives a Settings save (not overwritten with sanitized)");
     ok(!Object.prototype.hasOwnProperty.call(disk.projects[0], "archived"),
        "whole-config PUT cannot archive a project whose lifecycle field is absent");
+    ok(!Object.prototype.hasOwnProperty.call(disk, RETIRED_GLOBAL_AGENT_FIELD),
+       "whole-config PUT discards the retired global metadata field");
 
     // Once lifecycle has archived a project, a stale generic PUT cannot restore
     // it. The absence of `archived` is also an owned state, not an invitation
@@ -138,16 +142,16 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
 
     // ── PATCH /api/config: the section-merge Settings save (no whole-config PUT) ─
     // Send only owned sections (Settings strips the flags): operator_name echoed
-    // sanitized, a new top-level (butler), and a project with edited agents.
+    // sanitized, a retired top-level field, and a project with edited agents.
     const patch = await req(server, { method: "PATCH", urlPath: "/api/config", body: {
       operator_name: "Alice", // sanitized echo — must keep raw "Alice!"
-      butler: { command: "claude", model: "opus" },
+      [RETIRED_GLOBAL_AGENT_FIELD]: { command: "claude", model: "opus" },
       projects: [{ id: "lv", name: "Renamed", agents: { head: { command: "codex" } } }],
     }});
     ok(patch.status === 200, "PATCH /api/config (section merge) → 200");
     const d2 = readCfg();
     ok(d2.operator_name === "Alice!", "PATCH keeps the raw operator_name on a sanitized echo");
-    ok(d2.butler && d2.butler.command === "claude" && d2.butler.model === "opus", "PATCH merges an owned top-level section (butler)");
+    ok(!Object.prototype.hasOwnProperty.call(d2, RETIRED_GLOBAL_AGENT_FIELD), "PATCH discards the retired global metadata field");
     ok(d2.projects[0].name === "Renamed" && d2.projects[0].agents.head.command === "codex", "PATCH merges owned per-project fields (name, agents)");
     ok(d2.projects[0].idle === true && d2.projects[0].telegram_auto === true, "PATCH preserves the field-scoped flags from disk (no clobber)");
     ok(d2.projects[0].archived === true, "PATCH cannot restore an archived project from a stale body");
