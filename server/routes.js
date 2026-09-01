@@ -1534,6 +1534,22 @@ function getProjectChatMode(projectId) {
   return project?.chat_mode === "ac" ? "ac" : "file";
 }
 
+// This only labels the current parsed V2 queue for the recovery ledger.  It
+// neither starts a batch nor makes queue prose an action authority; the resume
+// runtime independently re-reads and proves the same live context.
+function currentChatResumeBatchId(projectId) {
+  try {
+    const context = readLiveBatchContext(projectId);
+    const parsed = context?.parsed;
+    if (context?.activated !== true || context?.queueReadOk !== true || !parsed || parsed.provenance !== "owned" ||
+        !Number.isSafeInteger(parsed.batchNumber) || parsed.batchNumber < 1 || !Array.isArray(parsed.errors) || parsed.errors.length !== 0 ||
+        !Array.isArray(parsed.workItems) || parsed.workItems.length === 0) return null;
+    return `batch-${parsed.batchNumber}`;
+  } catch {
+    return null;
+  }
+}
+
 function emitSystemMessage(projectId, text) {
   try {
     fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
@@ -2066,13 +2082,36 @@ router.post("/api/chat", (req, res) => {
     if (bridgeAdmission && !isAdmissionCurrent(bridgeAdmission)) return false;
     return !assignmentBound || validateCurrentOwnedAssignment(projectId, req.body || {}).ok === true;
   };
-  const msg = fileChat.appendMessage(projectId, {
-    sender,
-    text: normalizeMentions(text, selfMentionSkip),
-    channel: req.body?.channel || "general",
-    type: "message",
-    attachments,
-  });
+  const normalizedText = normalizeMentions(text, selfMentionSkip);
+  let msg;
+  // Only a genuine operator/user message that explicitly names Head receives
+  // the #1047 structural recovery tag. Bridge and shim agents retain their
+  // ordinary chat path; neither arbitrary prose nor a caller-selected tag can
+  // become a recovery instruction.
+  if (sender === "user" && (req.body?.channel || "general") === "general" && fileChat.parseMentions(normalizedText).includes("head")) {
+    try {
+      const admission = captureProjectAdmission(projectId);
+      if (!isAdmissionCurrent(admission)) throw new Error("project admission changed");
+      msg = fileChat.appendTrustedOperatorHeadMention(projectId, {
+        text: normalizedText,
+        attachments: attachments || null,
+        batch_id: currentChatResumeBatchId(projectId),
+        head_generation: admission.generation,
+      });
+    } catch {
+      // Preserve the established ordinary-chat availability path if the
+      // optional recovery label cannot be safely minted at this instant.
+    }
+  }
+  if (!msg) {
+    msg = fileChat.appendMessage(projectId, {
+      sender,
+      text: normalizedText,
+      channel: req.body?.channel || "general",
+      type: "message",
+      attachments,
+    });
+  }
   // #717: loop guard — count agent hops, pause if threshold reached
   if (isChatAuthorityCurrent()) {
     const maxHops = getProjectMaxHops(projectId);

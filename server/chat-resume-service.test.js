@@ -212,6 +212,9 @@ function ok(value, message) {
   const stale = service({ snapshot: { source: source(1, { freshness: "stale" }), records: [record(1)] } }).core.resume(request());
   assert.equal(stale.freshness, "stale");
   expectCode(() => service({ snapshot: { source: source(3), records: [record(1), record(2)] } }).core.resume(request()), "chat_resume_source_boundary_stale");
+  expectCode(() => service({
+    snapshot: { source: source(3, { first_record_id: 2 }), records: [record(2), record(3)] },
+  }).core.resume(request()), "chat_resume_source_history_truncated");
   ok(true, "stale freshness is explicit and stale source boundaries fail closed");
 }
 

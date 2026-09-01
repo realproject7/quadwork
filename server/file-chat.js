@@ -5,6 +5,7 @@ const { ensureSecureDir, writeSecureFile } = require("./config");
 const { envelopeFor } = require("./trusted-event-transport");
 const { envelopeFor: reviewCycleEnvelopeFor } = require("./review-cycle-event");
 const { batchRequestNotice } = require("./batch-request-notice");
+const { headLifecycleNotice } = require("./head-lifecycle-notice");
 
 const MENTION_RE = /@(\w[\w-]*)/g;
 
@@ -105,6 +106,8 @@ function recoverNextId(projectId) {
 // --- Core functions ---
 
 const CACHE_SIZE = 200;
+const MAX_RESUME_SOURCE_RECORDS = 2048;
+const MAX_RESUME_SOURCE_BYTES = 128 * 1024 * 1024;
 
 function initProject(projectId) {
   const dir = chatDir(projectId);
@@ -314,6 +317,39 @@ function findTrustedBatchRequest(projectId, state, notice) {
   return null;
 }
 
+function sameTrustedHeadLifecycle(record, notice) {
+  const event = record?.trusted_event;
+  if (!event || typeof event !== "object" || event.scope !== "head_lifecycle" || event.correlation_key !== notice.correlation_key) return null;
+  const matches = event.version === notice.trusted_event.version && JSON.stringify(event.anchors) === JSON.stringify(notice.trusted_event.anchors) &&
+    record.sender === notice.sender && record.channel === notice.channel && record.type === notice.type && record.text === notice.text &&
+    JSON.stringify(record.resume_structural) === JSON.stringify(notice.resume_structural);
+  if (!matches) throw new Error("trusted Head lifecycle correlation collision");
+  return record;
+}
+
+function findTrustedHeadLifecycle(projectId, state, notice) {
+  for (const record of state.cache) {
+    const match = sameTrustedHeadLifecycle(record, notice);
+    if (match) return match;
+  }
+  const filePath = chatFile(projectId);
+  if (!fs.existsSync(filePath)) return null;
+  let content;
+  try { content = fs.readFileSync(filePath, "utf8"); }
+  catch (error) { throw new Error(`trusted Head lifecycle event read failed: ${error.message}`); }
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line);
+      const match = sameTrustedHeadLifecycle(record, notice);
+      if (match) return match;
+    } catch (error) {
+      if (error?.message === "trusted Head lifecycle correlation collision") throw error;
+    }
+  }
+  return null;
+}
+
 // Server-only closed append seam for the Monitor transport. It deliberately
 // reconstructs the canonical envelope rather than accepting caller prose,
 // recipient lists, or arbitrary JSONL metadata. Ordinary system messages keep
@@ -399,6 +435,109 @@ function appendTrustedBatchRequestOnce(projectId, candidate) {
     text: notice.text,
   }, notice.trusted_event, notice.resume_structural);
   return { ok: true, id: record.id, duplicate: false };
+}
+
+// #1047's only server-owned recovery write.  A lifecycle operation has already
+// produced the opaque operation/session generation before this seam runs.  It
+// cannot append an arbitrary system message or tag another agent's session.
+function appendTrustedHeadLifecycleOnce(projectId, candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new Error("trusted Head lifecycle receipt required");
+  }
+  const notice = headLifecycleNotice(candidate);
+  if (notice.project_id !== projectId) throw new Error("trusted Head lifecycle project mismatch");
+  const state = getState(projectId);
+  if (state.nextId === null) throw new Error(`Project ${projectId} not initialized — call initProject first`);
+  const existing = findTrustedHeadLifecycle(projectId, state, notice);
+  if (existing) return { ok: true, id: existing.id, duplicate: true };
+  const record = appendRecord(projectId, {
+    sender: notice.sender,
+    channel: notice.channel,
+    type: notice.type,
+    text: notice.text,
+  }, notice.trusted_event, notice.resume_structural);
+  return { ok: true, id: record.id, duplicate: false };
+}
+
+// #1047's one ordinary-message recovery tag. The HTTP chat route has already
+// authenticated this as an operator/user message; this narrow seam cannot tag
+// an agent, choose a different tag, or mint an executable instruction from
+// unmentioned prose. User text remains opaque evidence in the raw record.
+function appendTrustedOperatorHeadMention(projectId, candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+      Object.keys(candidate).sort().join(",") !== "attachments,batch_id,head_generation,text") {
+    throw new Error("trusted operator Head mention required");
+  }
+  if (typeof candidate.text !== "string" || Buffer.byteLength(candidate.text, "utf8") > 64 * 1024 ||
+      !parseMentions(candidate.text).includes("head") || !Number.isSafeInteger(candidate.head_generation) || candidate.head_generation < 0 ||
+      (candidate.batch_id !== null && (typeof candidate.batch_id !== "string" || !/^[a-z][a-z0-9_-]{2,95}$/.test(candidate.batch_id))) ||
+      (candidate.attachments !== null && (!Array.isArray(candidate.attachments) || candidate.attachments.some((item) =>
+        !item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).sort().join(",") !== "name" ||
+        typeof item.name !== "string" || !item.name || /[/\\]/.test(item.name))))) {
+    throw new Error("trusted operator Head mention invalid");
+  }
+  const state = getState(projectId);
+  if (state.nextId === null) throw new Error(`Project ${projectId} not initialized — call initProject first`);
+  return appendRecord(projectId, {
+    sender: "user",
+    channel: "general",
+    type: "message",
+    text: candidate.text,
+    ...(candidate.attachments && candidate.attachments.length ? { attachments: candidate.attachments } : {}),
+  }, null, Object.freeze({
+    version: 1,
+    project_id: projectId,
+    trusted: true,
+    tag: "operator_head_mention",
+    batch_id: candidate.batch_id,
+    head_generation: candidate.head_generation,
+    target: "head",
+    server_authored: false,
+  }));
+}
+
+// A resume source is deliberately not `readMessages()`: that public helper
+// tail-slices and skips malformed historical JSONL for panel availability.
+// Recovery requires a stable, complete bounded suffix.  A malformed line or a
+// file too large to inspect fails closed instead of silently dropping history.
+function readPrimaryChatResumeRecords(projectId) {
+  const filePath = chatFile(projectId);
+  if (!fs.existsSync(filePath)) return { freshness: "live", records: [] };
+  let stats;
+  try { stats = fs.statSync(filePath); }
+  catch (error) { throw new Error(`Primary Chat source stat failed: ${error.message}`); }
+  if (!stats.isFile() || stats.size > MAX_RESUME_SOURCE_BYTES) {
+    throw new Error("Primary Chat source is unavailable");
+  }
+  let content;
+  try { content = fs.readFileSync(filePath, "utf8"); }
+  catch (error) { throw new Error(`Primary Chat source read failed: ${error.message}`); }
+  const records = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try { records.push(JSON.parse(line)); }
+    catch { throw new Error("Primary Chat source has a malformed record"); }
+  }
+  return { freshness: "live", records: records.slice(-MAX_RESUME_SOURCE_RECORDS) };
+}
+
+// A current V2 batch needs a server-issued qualified Head assignment before a
+// resume feed can claim an active-batch start boundary.  Missing or historical
+// records are intentionally represented by null; the runtime then withholds
+// the feed rather than manufacturing a boundary from queue prose or wall time.
+function findPrimaryChatResumeBatchStart(projectId, batchId, headGeneration) {
+  if (typeof batchId !== "string" || !Number.isSafeInteger(headGeneration) || headGeneration < 0) return null;
+  const source = readPrimaryChatResumeRecords(projectId);
+  for (const record of source.records) {
+    const structural = record?.resume_structural;
+    if (structural?.version === 1 && structural.project_id === projectId && structural.trusted === true &&
+        structural.tag === "head_assignment" && structural.batch_id === batchId &&
+        structural.head_generation === headGeneration && structural.target === "head" &&
+        structural.server_authored === false && Number.isSafeInteger(record?.id) && record.id > 0) {
+      return record.id - 1;
+    }
+  }
+  return null;
 }
 
 function readMessages(projectId, { since_id = 0, limit = 50 } = {}) {
@@ -537,6 +676,12 @@ module.exports = {
   appendTrustedMonitorEventOnce,
   appendTrustedReviewCycleEventOnce,
   appendTrustedBatchRequestOnce,
+  appendTrustedHeadLifecycleOnce,
+  appendTrustedOperatorHeadMention,
+  // Private recovery-source seams. They are not mounted as general history
+  // APIs and retain the source's strict corruption semantics.
+  readPrimaryChatResumeRecords,
+  findPrimaryChatResumeBatchStart,
   readMessages,
   getNextId,
   parseMentions,

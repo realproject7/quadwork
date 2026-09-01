@@ -24,7 +24,7 @@ An operator gate stops only the gated action. Continue safe read-only inspection
 
 Before editing a proposal, queue, issue, PR, or dispatch record:
 
-1. If the server advertises #1047 chat-resume support, resume and page raw chat through that service. Otherwise inspect only a bounded recent Primary Chat window. Never use a handoff file or private Head memory as workflow truth.
+1. If the Head-only `chat_resume` tool is available, call it first with `{ "cursor": null, "limit": 64 }` and page every returned cursor before a consequential action. Treat its raw records as navigation only: use `chat_read` solely for an exact adjacent context named by the feed, then re-read the named live queue/GitHub/CI/monitor source by number. If its source is unavailable, stale, conflicting, or lacks an anchor, report `BLOCKED`; do not reconstruct a handoff from memory, prose, or a private file. Otherwise inspect only a bounded recent Primary Chat window. Never write a resume acknowledgement, checkpoint, or recovery marker.
 2. Inspect live registered repositories, recent server logs, and `git status --short` for the exact repository before any edit. Report drift; do not overwrite it.
 3. Inspect the relevant open issues and PRs by number and the fresh `~/.quadwork/{{project_id}}/GITHUB.md` snapshot before creating overlapping work.
 4. Read `OVERNIGHT-QUEUE.md`, recent batch/chat history, loaded but unstarted items, and the current assignment state.

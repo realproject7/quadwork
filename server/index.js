@@ -31,6 +31,7 @@ const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { createHeadControlRuntime } = require("./head-control-runtime");
 const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
+const { createChatResumeRuntime } = require("./chat-resume-runtime");
 const {
   ProjectLifecycleError,
   isProjectArchived,
@@ -642,6 +643,33 @@ const headControlRuntime = createHeadControlRuntime({
   now: () => new Date(),
 });
 
+// #1047: Head's recovery cursor secret is stable across Head process/token
+// rotation but never crosses the server boundary.  It derives from the already
+// persisted local session secret and one project ID; neither value is returned
+// by the resume route or MCP shim.
+function primaryChatResumeCursorSecret(projectId) {
+  return crypto.createHmac("sha256", SESSION_TOKEN)
+    .update(`quadwork:v2:primary-chat-resume:${projectId}`, "utf8")
+    .digest("base64url");
+}
+
+const chatResumeRuntime = createChatResumeRuntime({
+  read_config: readConfig,
+  capture_project_admission: captureProjectAdmission,
+  is_admission_current: isAdmissionCurrent,
+  is_project_archived: isProjectArchived,
+  resolve_shim_principal: fileChat.resolveShimPrincipal,
+  agent_sessions: agentSessions,
+  read_live_batch_context: routes.readLiveBatchContext,
+  read_primary_chat_source: (projectId) => {
+    if (routes.getProjectChatMode(projectId) !== "file") throw new TypeError("Primary Chat source is unavailable");
+    return fileChat.readPrimaryChatResumeRecords(projectId);
+  },
+  find_active_batch_start: ({ project_id, batch_id, head_generation }) =>
+    fileChat.findPrimaryChatResumeBatchStart(project_id, batch_id, head_generation),
+  read_cursor_secret: primaryChatResumeCursorSecret,
+});
+
 // #1046: one narrow local owner, composed only from the already-existing
 // lifecycle, Primary Chat, PTY, and fixed REST-read seams. The GitHub refresh
 // observer below is a bounded reconciliation backstop; it does not start a
@@ -700,6 +728,61 @@ app.post("/api/head-control", (req, res) => {
   const status = response?.ok === true ? 200 : type === "not_found" ? 404 : type === "authentication_failed" ? 401 : 400;
   return res.status(status).json(response);
 });
+
+// #1047 is intentionally a single fixed, Head-token-authenticated read route.
+// It has no project selector, no generic history parameters, and no endpoint
+// diagnostic leakage; the MCP client further redacts the same denial.
+app.post("/api/chat-resume", (req, res) => {
+  const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
+  const response = chatResumeRuntime.handle({ method: req.method, path: req.path, body: req.body }, { token });
+  return res.status(response.ok === true ? 200 : 403).json(response);
+});
+
+function currentRecoveryBatchId(projectId, installationId) {
+  try {
+    const context = routes.readLiveBatchContext(projectId);
+    const parsed = context?.parsed;
+    if (context?.activated !== true || context?.queueReadOk !== true || context?.installationId !== installationId ||
+        !parsed || parsed.provenance !== "owned" || !Number.isSafeInteger(parsed.batchNumber) || parsed.batchNumber < 1 ||
+        !Array.isArray(parsed.errors) || parsed.errors.length !== 0 || !Array.isArray(parsed.workItems) || parsed.workItems.length === 0) {
+      return null;
+    }
+    return `batch-${parsed.batchNumber}`;
+  } catch {
+    return null;
+  }
+}
+
+// The actual lifecycle governor has already reserved a unique operation and
+// fresh session generation before this private append runs.  Reconnects never
+// invoke this function, and the JSONL seam independently dedupes the same
+// pair.  Archive/admission is re-proved immediately before the irreversible
+// record so delayed lifecycle callbacks cannot recreate project activity.
+function appendHeadRecoveryLifecycle(projectId, operation, reason) {
+  try {
+    if (!operation?.operation_id || !operation?.generation_id || typeof reason !== "string") return false;
+    const admission = captureProjectAdmission(projectId);
+    if (!isAdmissionCurrent(admission) || routes.getProjectChatMode(projectId) !== "file") return false;
+    const config = readConfig();
+    const installationId = config?.installation_id;
+    const session = agentSessions.get(`${projectId}/head`);
+    if (!session || session.projectId !== projectId || session.agentId !== "head" || session.state !== "running" || !session.term ||
+        session.operationId !== operation.operation_id || session.generationId !== operation.generation_id) return false;
+    fileChat.appendTrustedHeadLifecycleOnce(projectId, {
+      version: 1,
+      project_id: projectId,
+      installation_id: installationId,
+      head_generation: admission.generation,
+      operation_id: operation.operation_id,
+      session_generation: operation.generation_id,
+      reason,
+      batch_id: currentRecoveryBatchId(projectId, installationId),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // M2 composition only: #1032 owns the explicit readiness/start control plane.
 // Consequently these helpers never enable a monitor from a runtime fact. They
@@ -1574,7 +1657,13 @@ async function spawnAgentPty(project, agent, opts = {}) {
       generationId: generation_id,
     }),
   });
-  if (result.status === "spawned") recordAgentSpawnedLifecycle(project, agent, result.operation);
+  if (result.status === "spawned") {
+    recordAgentSpawnedLifecycle(project, agent, result.operation);
+    // A Head reset is observable even if it crashes before it can send a
+    // single agent-authored message.  Failure to persist the navigation aid
+    // never changes the lifecycle outcome or initiates a replacement action.
+    if (agent === "head") appendHeadRecoveryLifecycle(project, result.operation, source);
+  }
   if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation };
   if (result.status === "verified") return { ok: true, lifecycle: result.operation };
   return {
@@ -2665,6 +2754,7 @@ async function cleanupProjectRuntime(projectId) {
   mergeCleanupResult(aggregate, cancelPtyDispatchProject(projectId), "deferred_dispatch");
   mergeCleanupResult(aggregate, archiveProjectMonitor(projectId), "project_monitor");
   mergeCleanupResult(aggregate, headControlRuntime.revokeProject(projectId), "head_control");
+  mergeCleanupResult(aggregate, chatResumeRuntime.revokeProject(projectId), "chat_resume");
   mergeCleanupResult(aggregate, batchRequestRuntimeOwner.revokeProject(projectId), "batch_request");
   mergeCleanupResult(aggregate, selfHeal.clearProject(projectId), "self_heal");
   mergeCleanupResult(aggregate, stopTrigger(projectId), "trigger");

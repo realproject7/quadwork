@@ -214,5 +214,59 @@ function batchRequestPlan(projectId, overrides = {}) {
   fileChat.shutdownProject(batchProject);
 }
 
+// #1047: lifecycle receipts are fixed server records, deduped by the actual
+// Head operation/session generation rather than reconnect count.  The private
+// recovery reader rejects corrupt history instead of following readMessages'
+// availability-first malformed-line skip behaviour.
+{
+  const lifecycleProject = "file-chat-head-lifecycle";
+  fileChat.initProject(lifecycleProject);
+  const candidate = {
+    version: 1,
+    project_id: lifecycleProject,
+    installation_id: "installation1047a",
+    head_generation: 0,
+    operation_id: "operation-1047-a",
+    session_generation: "generation-1047-a",
+    reason: "operator_restart",
+    batch_id: null,
+  };
+  assert.deepEqual(fileChat.appendTrustedHeadLifecycleOnce(lifecycleProject, candidate), { ok: true, id: 1, duplicate: false });
+  assert.deepEqual(fileChat.appendTrustedHeadLifecycleOnce(lifecycleProject, candidate), { ok: true, id: 1, duplicate: true });
+  const source = fileChat.readPrimaryChatResumeRecords(lifecycleProject);
+  assert.equal(source.freshness, "live");
+  assert.equal(source.records.length, 1);
+  assert.equal(source.records[0].resume_structural.tag, "head_lifecycle");
+  assert.equal(source.records[0].resume_structural.head_generation, 0);
+  assert.equal(fileChat.findPrimaryChatResumeBatchStart(lifecycleProject, "batch-1047", 0), null);
+  const lifecycleChatFile = path.join(os.homedir(), ".quadwork", lifecycleProject, "chat", "general.jsonl");
+  fs.appendFileSync(lifecycleChatFile, "{malformed\n");
+  assert.throws(() => fileChat.readPrimaryChatResumeRecords(lifecycleProject), /malformed/);
+  console.log("PASS: Head lifecycle receipt and strict Primary Chat resume source");
+  fileChat.shutdownProject(lifecycleProject);
+}
+
+{
+  const operatorProject = "file-chat-operator-mention";
+  fileChat.initProject(operatorProject);
+  const record = fileChat.appendTrustedOperatorHeadMention(operatorProject, {
+    text: "@head please inspect the exact queued item",
+    attachments: [{ name: "evidence.png" }],
+    batch_id: null,
+    head_generation: 0,
+  });
+  assert.equal(record.sender, "user");
+  assert.equal(record.resume_structural.tag, "operator_head_mention");
+  assert.equal(record.resume_structural.server_authored, false);
+  assert.throws(() => fileChat.appendTrustedOperatorHeadMention(operatorProject, {
+    text: "please inspect the exact queued item",
+    attachments: null,
+    batch_id: null,
+    head_generation: 0,
+  }));
+  console.log("PASS: explicit operator-to-Head recovery tag");
+  fileChat.shutdownProject(operatorProject);
+}
+
 console.log("\nAll file-chat tests passed.");
 cleanup();

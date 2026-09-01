@@ -226,6 +226,13 @@ function snapshotOrFail(access, owner, batch) {
     if (batch.starts_after_id > source.max_record_id) {
       fail("chat_resume_batch_boundary_stale", "batch boundary is newer than this snapshot");
     }
+    // A bounded source suffix is safe for an idle high-signal tail.  It is
+    // not safe for an active batch if it begins after the server-issued batch
+    // boundary: that would silently omit an earlier matching record.  Refuse
+    // the feed until the caller can provide the complete active window.
+    if (batch.state === "active" && source.first_record_id > batch.starts_after_id + 1) {
+      fail("chat_resume_source_history_truncated", "active batch history predates the source window");
+    }
   } catch (error) {
     if (error instanceof ChatResumeServiceError) throw error;
     fail("chat_resume_source_unavailable", "Primary Chat snapshot cannot be read");
