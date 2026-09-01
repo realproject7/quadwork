@@ -3,7 +3,8 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { VERSION, REQUEST_LABEL } = require("./batch-request-watcher");
+const { VERSION } = require("./batch-request-watcher");
+const { REQUEST_LABEL } = require("./batch-request-subscription");
 const {
   LiveBatchRequestSubscriptionError,
   createLiveBatchRequestSubscription,

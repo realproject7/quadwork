@@ -8,6 +8,7 @@ const IDLE_THRESHOLD_MS = 5000;
 const COALESCE_WINDOW_MS = 1000;
 const ACTIVE_SUPPRESSION_MS = 30000;
 const { envelopeFor } = require("./trusted-event-transport");
+const { batchRequestNotice } = require("./batch-request-notice");
 
 // #1010: bounded deferred-wake deadline — an escape hatch for the starvation
 // below, for the backends whose TUI never goes quiet. The Claude Code TUI
@@ -167,6 +168,36 @@ function dispatchTrustedMonitorEvent(projectId, candidate, agentSessions, deps) 
     return { ok: true, deferred: true, delivery_generation: session.generationId };
   }
   scheduleCoalescedInjection(key, projectId, "head", envelope, agentSessions, trustedDeps);
+  return { ok: true, deferred: true, delivery_generation: session.generationId };
+}
+
+// #1046 uses its own durable watcher state rather than the Project Monitor's
+// delivery table, but retains the same Head-only deferred wake discipline.
+// The input is the strict watcher plan, never a generic chat message; the
+// notice is reconstructed here before either its target or its text is used.
+function dispatchTrustedBatchRequest(projectId, candidate, agentSessions, deps) {
+  let notice;
+  try { notice = batchRequestNotice(candidate); }
+  catch { return { ok: false, code: "batch_request_notice_invalid" }; }
+  if (notice.project_id !== projectId || !deps || typeof deps.safeWrite !== "function" ||
+      typeof deps.isTrustedBatchRequestCurrent !== "function") {
+    return { ok: false, code: "batch_request_notice_invalid" };
+  }
+  const key = `${projectId}/head`;
+  const isCurrent = () => {
+    const session = agentSessions.get(key);
+    if (!isVerifiedHead(session) || !dispatchAuthorized(deps, projectId)) return false;
+    try { return deps.isTrustedBatchRequestCurrent(notice, session) === true; }
+    catch { return false; }
+  };
+  if (!isCurrent()) return { ok: false, code: "batch_request_not_current" };
+  const session = agentSessions.get(key);
+  const trustedDeps = { ...deps, isActionCurrent: isCurrent };
+  if (isAgentBusy(session)) {
+    queuePendingWake(key, session, agentSessions, trustedDeps);
+    return { ok: true, deferred: true, delivery_generation: session.generationId };
+  }
+  scheduleCoalescedInjection(key, projectId, "head", notice, agentSessions, trustedDeps);
   return { ok: true, deferred: true, delivery_generation: session.generationId };
 }
 
@@ -547,6 +578,7 @@ function cancelProject(projectId) {
 module.exports = {
   dispatchToAgentPTY,
   dispatchTrustedMonitorEvent,
+  dispatchTrustedBatchRequest,
   cleanupSession,
   cancelProject,
   // Exported for testing

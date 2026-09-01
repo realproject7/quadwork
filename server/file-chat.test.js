@@ -11,6 +11,8 @@ const origHome = os.homedir;
 os.homedir = () => TEST_DIR;
 
 const fileChat = require("./file-chat");
+const { canonicalizeBatchRequestAuthority } = require("./batch-request-contract");
+const { VERSION: BATCH_REQUEST_VERSION, dedupeKey } = require("./batch-request-subscription");
 
 function cleanup() {
   os.homedir = origHome;
@@ -20,6 +22,34 @@ function cleanup() {
 process.on("exit", cleanup);
 
 const PROJECT = "test-project";
+
+function batchRequestPlan(projectId, overrides = {}) {
+  const repository = "acme/coordination";
+  const requestId = "123e4567-e89b-42d3-a456-426614174000";
+  const authority = {
+    schema: "quadwork-batch-request/v1",
+    request_id: requestId,
+    source_installation_id: "installation_source_0001",
+    source_project_id: "source-project",
+    target_installation_id: "installation_target_0001",
+    target_project_id: projectId,
+    coordination_repo: repository,
+    mode: "implementation",
+    work_refs: ["acme/web#42"],
+    start_policy: "next-available",
+  };
+  const digest = canonicalizeBatchRequestAuthority(authority).digest;
+  return {
+    version: BATCH_REQUEST_VERSION,
+    kind: "BATCH REQUEST",
+    recipients: ["head"],
+    correlation_key: dedupeKey(repository, 42, requestId, digest),
+    issue_url: `https://api.github.com/repos/${repository}/issues/42`,
+    anchors: { coordination_repo: repository, issue_number: 42, request_id: requestId, authority_digest: digest },
+    authority,
+    ...overrides,
+  };
+}
 
 // --- Test: Monotonic ID property ---
 {
@@ -151,6 +181,37 @@ const PROJECT = "test-project";
   assert.equal(fileStat.mode & 0o777, 0o600, "chat file should have 0600 permissions");
   console.log("PASS: file permissions (0700 dir, 0600 file)");
   fileChat.shutdownProject(PROJECT);
+}
+
+// --- Test: closed Batch Request notice append + exact correlation dedupe ---
+{
+  const batchProject = "test-batch-request";
+  const candidate = {
+    project_id: batchProject,
+    head_generation: 0,
+    notification: batchRequestPlan(batchProject),
+  };
+  fileChat.initProject(batchProject);
+  const first = fileChat.appendTrustedBatchRequestOnce(batchProject, candidate);
+  const second = fileChat.appendTrustedBatchRequestOnce(batchProject, candidate);
+  assert.deepEqual(first, { ok: true, id: 1, duplicate: false });
+  assert.deepEqual(second, { ok: true, id: 1, duplicate: true });
+  const [record] = fileChat.readMessages(batchProject, { limit: 10 });
+  assert.equal(record.sender, "system");
+  assert.equal(record.type, "system");
+  assert.deepEqual(record.mentions, ["head"]);
+  assert.equal(record.resume_structural.tag, "batch_request");
+  assert.equal(record.resume_structural.head_generation, 0);
+  assert.equal(record.resume_structural.trusted, true);
+  assert.equal(record.trusted_event.scope, "batch_request");
+  assert.equal(JSON.stringify(record).includes("work_refs"), false);
+  assert.throws(() => fileChat.appendTrustedBatchRequestOnce(batchProject, {
+    ...candidate,
+    notification: batchRequestPlan(batchProject, { recipients: ["head", "dev"] }),
+  }));
+  assert.equal(fileChat.readMessages(batchProject, { limit: 10 }).length, 1);
+  console.log("PASS: closed Batch Request notice append, resume tagging, and exact dedupe");
+  fileChat.shutdownProject(batchProject);
 }
 
 console.log("\nAll file-chat tests passed.");

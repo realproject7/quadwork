@@ -12,7 +12,11 @@ const {
 } = require("./batch-request-contract");
 
 const VERSION = 1;
-const REQUEST_LABEL = "quadwork-batch-request";
+// Discovery is deliberately a fixed, human-visible GitHub label.  It is not
+// the authority (the fenced v1 body is), but it must still match the published
+// subscription contract exactly so the narrow REST query neither misses nor
+// broadens the watched set.
+const REQUEST_LABEL = "quadwork:batch-request";
 const MAX_RECORDS = 128;
 const MAX_ETAG_LENGTH = 512;
 const MAX_CURSOR_LENGTH = 512;

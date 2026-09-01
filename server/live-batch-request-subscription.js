@@ -8,7 +8,8 @@
 
 const { allRepositories } = require("./config");
 const { normalizeProjectEnvironmentSettings } = require("./project-environment-bindings");
-const { VERSION, REQUEST_LABEL } = require("./batch-request-watcher");
+const { VERSION } = require("./batch-request-watcher");
+const { REQUEST_LABEL } = require("./batch-request-subscription");
 
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;

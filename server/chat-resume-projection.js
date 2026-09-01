@@ -103,14 +103,18 @@ function jsonValue(value, depth = 0) {
 
 function parseHead(value) {
   exact(value, ["agent_id", "generation"], "chat_resume_head_invalid");
-  if (value.agent_id !== "head" || !positiveInteger(value.generation)) fail("chat_resume_head_invalid", "Head identity is invalid");
+  // Project-admission generations are zero-based in the lifecycle authority.
+  // A newly configured project therefore legitimately starts at generation 0;
+  // rejecting it would make the reset feed unavailable until an unrelated
+  // archive/unarchive transition occurred.
+  if (value.agent_id !== "head" || !nonnegativeInteger(value.generation)) fail("chat_resume_head_invalid", "Head identity is invalid");
   return freeze({ agent_id: "head", generation: value.generation });
 }
 
 function parseBatch(value, source) {
   exact(value, ["state", "batch_id", "starts_after_id", "head_generation"], "chat_resume_batch_invalid");
   if (!new Set(["active", "idle"]).has(value.state) || !nonnegativeInteger(value.starts_after_id) ||
-      !positiveInteger(value.head_generation) || value.head_generation !== source.head_generation) {
+      !nonnegativeInteger(value.head_generation) || value.head_generation !== source.head_generation) {
     fail("chat_resume_batch_invalid", "batch boundary is invalid");
   }
   if (value.starts_after_id > source.max_record_id) fail("chat_resume_batch_boundary_stale", "batch boundary is newer than the source snapshot");
@@ -153,7 +157,7 @@ function parseRaw(value) {
 function parseStructural(value) {
   exact(value, ["version", "project_id", "trusted", "tag", "batch_id", "head_generation", "target", "server_authored"], "chat_resume_structural_invalid");
   if (value.version !== VERSION || typeof value.project_id !== "string" || !PROJECT_ID_RE.test(value.project_id) || typeof value.trusted !== "boolean" ||
-      !TAGS.has(value.tag) || !positiveInteger(value.head_generation) || value.target !== "head" || typeof value.server_authored !== "boolean" ||
+      !TAGS.has(value.tag) || !nonnegativeInteger(value.head_generation) || value.target !== "head" || typeof value.server_authored !== "boolean" ||
       (value.batch_id !== null && (typeof value.batch_id !== "string" || !BATCH_ID_RE.test(value.batch_id)))) {
     fail("chat_resume_structural_invalid", "structural tag is invalid");
   }
@@ -339,7 +343,7 @@ function decodeCursor(value, secret) {
   if (parsed.version !== VERSION || typeof parsed.project_id !== "string" || !PROJECT_ID_RE.test(parsed.project_id) || parsed.source_id !== SOURCE_ID ||
       typeof parsed.snapshot_id !== "string" || !SNAPSHOT_ID_RE.test(parsed.snapshot_id) || !nonnegativeInteger(parsed.first_record_id) ||
       !nonnegativeInteger(parsed.max_record_id) || !new Set(["active", "idle"]).has(parsed.batch_state) ||
-      (parsed.batch_id !== null && (typeof parsed.batch_id !== "string" || !BATCH_ID_RE.test(parsed.batch_id))) || !positiveInteger(parsed.head_generation) ||
+      (parsed.batch_id !== null && (typeof parsed.batch_id !== "string" || !BATCH_ID_RE.test(parsed.batch_id))) || !nonnegativeInteger(parsed.head_generation) ||
       typeof parsed.selection_digest !== "string" || !/^[a-f0-9]{64}$/.test(parsed.selection_digest) || !nonnegativeInteger(parsed.after_id)) {
     fail("chat_resume_cursor_invalid", "cursor payload is invalid");
   }

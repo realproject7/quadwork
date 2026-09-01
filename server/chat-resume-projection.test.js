@@ -182,6 +182,19 @@ function ok(value, message) {
   ok(true, "source freshness is explicit for stale cached input");
 }
 
+// The lifecycle registry begins at generation zero.  It is a real binding,
+// not an absent Head, so its structurally tagged records must project exactly
+// like later generations.
+{
+  const initial = record(1, "head_assignment", { structural: { head_generation: 0 } });
+  const result = projectChatResume(input([initial], {
+    head: { agent_id: "head", generation: 0 },
+    batch: { state: "active", batch_id: BATCH, starts_after_id: 0, head_generation: 0 },
+  }));
+  assert.deepEqual(result.records.map((entry) => entry.id), [1]);
+  ok(true, "the initial zero-based admission generation projects safely");
+}
+
 // Cross-project records, malformed rows, archive state, cursor substitution,
 // and non-monotonic source rows each fail closed or leave an explicit receipt.
 {

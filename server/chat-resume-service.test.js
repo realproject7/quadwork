@@ -156,6 +156,30 @@ function ok(value, message) {
   ok(true, "active Head pages resume deterministically after a service restart");
 }
 
+// Project-admission lifecycle generations start at zero. The integration must
+// therefore be able to construct the same Head-only service before an archive
+// transition has ever occurred.
+{
+  const zeroBinding = { ...BINDING, generation: 0 };
+  const zeroRecord = record(1);
+  zeroRecord.structural.head_generation = 0;
+  const core = createChatResumeService({
+    binding: zeroBinding,
+    access: {
+      authorize: () => clone(zeroBinding),
+      read_facts: () => ({
+        project_id: BINDING.project_id,
+        archived: false,
+        head: { agent_id: "head", generation: 0 },
+        batch: { state: "active", batch_id: BATCH, starts_after_id: 0, head_generation: 0 },
+      }),
+      read_snapshot: () => ({ source: source(1), records: [zeroRecord] }),
+    },
+  });
+  assert.deepEqual(core.resume({ principal: zeroBinding, cursor: null, limit: 2 }).records.map((entry) => entry.id), [1]);
+  ok(true, "the initial zero-based admission generation is a valid service binding");
+}
+
 // Idle is intentionally not an unbounded transcript replay. It retains the
 // latest operator instruction plus the projection's bounded high-signal tail.
 {

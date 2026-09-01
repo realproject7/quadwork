@@ -4,6 +4,7 @@ const os = require("os");
 const { ensureSecureDir, writeSecureFile } = require("./config");
 const { envelopeFor } = require("./trusted-event-transport");
 const { envelopeFor: reviewCycleEnvelopeFor } = require("./review-cycle-event");
+const { batchRequestNotice } = require("./batch-request-notice");
 
 const MENTION_RE = /@(\w[\w-]*)/g;
 
@@ -145,7 +146,7 @@ function shutdownProject(projectId) {
   }
 }
 
-function appendRecord(projectId, { sender, channel = "general", text, type = "message", attachments } = {}, trustedEvent = null) {
+function appendRecord(projectId, { sender, channel = "general", text, type = "message", attachments } = {}, trustedEvent = null, resumeStructural = null) {
   const state = getState(projectId);
   if (state.nextId === null) {
     throw new Error(`Project ${projectId} not initialized — call initProject first`);
@@ -164,6 +165,10 @@ function appendRecord(projectId, { sender, channel = "general", text, type = "me
     mentions: parseMentions(text),
     ...(attachments && attachments.length > 0 ? { attachments } : {}),
     ...(trustedEvent ? { trusted_event: trustedEvent } : {}),
+    // Structural resume tags are an internal, server-authored field.  The
+    // public append API deliberately has no parameter for it; closed append
+    // seams below reconstruct it from their own typed event contracts.
+    ...(resumeStructural ? { resume_structural: resumeStructural } : {}),
   };
 
   const dir = chatDir(projectId);
@@ -276,6 +281,39 @@ function findTrustedReviewCycleEvent(projectId, state, envelope) {
   return null;
 }
 
+function sameTrustedBatchRequest(record, notice) {
+  const event = record?.trusted_event;
+  if (!event || typeof event !== "object" || event.scope !== "batch_request" || event.correlation_key !== notice.correlation_key) return null;
+  const matches = event.version === notice.trusted_event.version && JSON.stringify(event.anchors) === JSON.stringify(notice.trusted_event.anchors) &&
+    record.sender === notice.sender && record.channel === notice.channel && record.type === notice.type && record.text === notice.text &&
+    JSON.stringify(record.resume_structural) === JSON.stringify(notice.resume_structural);
+  if (!matches) throw new Error("trusted batch-request correlation collision");
+  return record;
+}
+
+function findTrustedBatchRequest(projectId, state, notice) {
+  for (const record of state.cache) {
+    const match = sameTrustedBatchRequest(record, notice);
+    if (match) return match;
+  }
+  const filePath = chatFile(projectId);
+  if (!fs.existsSync(filePath)) return null;
+  let content;
+  try { content = fs.readFileSync(filePath, "utf8"); }
+  catch (error) { throw new Error(`trusted batch-request event read failed: ${error.message}`); }
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line);
+      const match = sameTrustedBatchRequest(record, notice);
+      if (match) return match;
+    } catch (error) {
+      if (error?.message === "trusted batch-request correlation collision") throw error;
+    }
+  }
+  return null;
+}
+
 // Server-only closed append seam for the Monitor transport. It deliberately
 // reconstructs the canonical envelope rather than accepting caller prose,
 // recipient lists, or arbitrary JSONL metadata. Ordinary system messages keep
@@ -336,6 +374,30 @@ function appendTrustedReviewCycleEventOnce(projectId, candidate) {
     type: "system",
     text: envelope.text,
   }, metadata);
+  return { ok: true, id: record.id, duplicate: false };
+}
+
+// #1046's closed Batch Request delivery seam. The reconciliation runtime has
+// already durably admitted exactly one Head plan before it reaches here; this
+// function does not accept title/body prose, a recipient list, or a generic
+// chat payload. It records the fixed notice exactly once and carries the
+// matching structural tag needed by #1047's resume source.
+function appendTrustedBatchRequestOnce(projectId, candidate) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new Error("trusted batch-request envelope required");
+  }
+  const notice = batchRequestNotice(candidate);
+  if (notice.project_id !== projectId) throw new Error("trusted batch-request project mismatch");
+  const state = getState(projectId);
+  if (state.nextId === null) throw new Error(`Project ${projectId} not initialized — call initProject first`);
+  const existing = findTrustedBatchRequest(projectId, state, notice);
+  if (existing) return { ok: true, id: existing.id, duplicate: true };
+  const record = appendRecord(projectId, {
+    sender: notice.sender,
+    channel: notice.channel,
+    type: notice.type,
+    text: notice.text,
+  }, notice.trusted_event, notice.resume_structural);
   return { ok: true, id: record.id, duplicate: false };
 }
 
@@ -474,6 +536,7 @@ module.exports = {
   // Private server composition seam. No route/MCP surface exposes it.
   appendTrustedMonitorEventOnce,
   appendTrustedReviewCycleEventOnce,
+  appendTrustedBatchRequestOnce,
   readMessages,
   getNextId,
   parseMentions,

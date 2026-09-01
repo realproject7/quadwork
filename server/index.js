@@ -12,6 +12,7 @@ const fileChat = require("./file-chat");
 const {
   dispatchToAgentPTY,
   dispatchTrustedMonitorEvent,
+  dispatchTrustedBatchRequest,
   cleanupSession: cleanupPtyDispatcher,
   cancelProject: cancelPtyDispatchProject,
 } = require("./pty-dispatcher");
@@ -29,6 +30,7 @@ const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { createHeadControlRuntime } = require("./head-control-runtime");
+const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
 const {
   ProjectLifecycleError,
   isProjectArchived,
@@ -639,6 +641,49 @@ const headControlRuntime = createHeadControlRuntime({
   read_cached_repository_snapshot: (cacheRepo) => routes._graphqlCache.get(cacheRepo),
   now: () => new Date(),
 });
+
+// #1046: one narrow local owner, composed only from the already-existing
+// lifecycle, Primary Chat, PTY, and fixed REST-read seams. The GitHub refresh
+// observer below is a bounded reconciliation backstop; it does not start a
+// batch, route Dev/reviewers, or create any additional polling loop.
+function currentBatchRequestNotice(notice, session) {
+  try {
+    if (!notice || notice.project_id !== session?.projectId || session?.agentId !== "head" ||
+        session.state !== "running" || !session.term || session.lifecycleState !== "verified") return false;
+    const admission = captureProjectAdmission(notice.project_id);
+    return admission.generation === notice.head_generation && isAdmissionCurrent(admission);
+  } catch {
+    return false;
+  }
+}
+
+const batchRequestRuntimeOwner = createBatchRequestRuntimeOwner({
+  config_dir: path.dirname(CONFIG_PATH),
+  fs,
+  read_config: readConfig,
+  capture_project_admission: captureProjectAdmission,
+  is_admission_current: isAdmissionCurrent,
+  is_project_archived: isProjectArchived,
+  read_coordination_issues: routes.readBatchRequestIssues,
+  append_trusted_batch_request_once: (candidate) => {
+    const projectId = candidate?.project_id;
+    if (typeof projectId !== "string") throw new TypeError("Batch Request project is invalid");
+    const admission = captureProjectAdmission(projectId);
+    if (admission.generation !== candidate.head_generation || !isAdmissionCurrent(admission) || routes.getProjectChatMode(projectId) !== "file") {
+      throw new TypeError("Batch Request target is no longer admitted to Primary Chat");
+    }
+    return fileChat.appendTrustedBatchRequestOnce(projectId, candidate);
+  },
+  wake_trusted_batch_request: async (candidate) => dispatchTrustedBatchRequest(candidate.project_id, candidate, agentSessions, {
+    isProjectAdmitted: (projectId) => {
+      try { assertProjectAdmitted(projectId); return true; }
+      catch { return false; }
+    },
+    isTrustedBatchRequestCurrent: currentBatchRequestNotice,
+    safeWrite,
+  }),
+});
+routes.setBatchRequestRefreshObserver((projectId) => batchRequestRuntimeOwner.reconcileProject(projectId));
 
 // A deliberately fixed adapter route. It does not mount a generic command
 // endpoint and exposes only the typed, redacted response already produced by
@@ -2620,6 +2665,7 @@ async function cleanupProjectRuntime(projectId) {
   mergeCleanupResult(aggregate, cancelPtyDispatchProject(projectId), "deferred_dispatch");
   mergeCleanupResult(aggregate, archiveProjectMonitor(projectId), "project_monitor");
   mergeCleanupResult(aggregate, headControlRuntime.revokeProject(projectId), "head_control");
+  mergeCleanupResult(aggregate, batchRequestRuntimeOwner.revokeProject(projectId), "batch_request");
   mergeCleanupResult(aggregate, selfHeal.clearProject(projectId), "self_heal");
   mergeCleanupResult(aggregate, stopTrigger(projectId), "trigger");
   const lifecycleCancelPromise = lifecycleGovernor.cancelProject(projectId);

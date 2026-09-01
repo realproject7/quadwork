@@ -34,6 +34,7 @@ const {
   ownershipKey,
 } = require("./work-item-ref");
 const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence } = require("./ci-evidence-policy");
+const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
@@ -41,6 +42,16 @@ const router = express.Router();
 // #730: PTY dispatch callback — set by index.js at startup
 let _ptyDispatchCallback = null;
 function setPtyDispatchCallback(fn) { _ptyDispatchCallback = fn; }
+
+// #1046 reuses this already-bounded REST refresh as its only reconciliation
+// cadence. It is intentionally one private observer, not a generic hook bus
+// and not a second project-wide timer; the callback receives only project ids
+// whose normal GitHub state was already considered by this refresh pass.
+let _batchRequestRefreshObserver = null;
+function setBatchRequestRefreshObserver(fn) {
+  if (fn !== null && typeof fn !== "function") throw new TypeError("Batch Request refresh observer must be a function or null");
+  _batchRequestRefreshObserver = fn;
+}
 
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
@@ -2474,6 +2485,20 @@ function projectUnavailableForGithub(project, cfg) {
     isProjectArchived(project.id, cfg) || projectRepositoryBindings(project).length === 0;
 }
 
+// #1046 is an explicit local opt-in, independent from the dashboard's active
+// batch demand. This intentionally returns only project ids—not repository,
+// label, or remote selectors—because the runtime owner derives and revalidates
+// those details from the current canonical subscription on every attempt.
+function batchRequestRefreshProjectIds(cfg) {
+  if (!cfg || !Array.isArray(cfg.projects)) return [];
+  const ids = new Set();
+  for (const project of cfg.projects) {
+    if (typeof project?.id !== "string" || project.watch_batch_requests !== true || isProjectArchived(project.id, cfg)) continue;
+    ids.add(project.id);
+  }
+  return [...ids];
+}
+
 function publicRepositoryBinding(binding) {
   return {
     key: binding.key,
@@ -2670,6 +2695,94 @@ async function ghApiConditional(etagKey, apiPath, isCurrent = () => true) {
     }
     return { status: "error", data: prev ? prev.data : null, changed: false };
   }
+}
+
+// #1046's only GitHub-read seam. This deliberately does not reuse the broad
+// dashboard Issue projection: Batch Request reconciliation needs the raw body
+// (for its fenced authority parser), a fixed label query, and an ETag that is
+// bound to one canonical coordination repository. Callers receive no generic
+// API path, title, command, or GitHub selector capability.
+function _batchRequestReaderInput(value) {
+  const plain = (entry) => !!entry && typeof entry === "object" && !Array.isArray(entry) &&
+    (Object.getPrototypeOf(entry) === Object.prototype || Object.getPrototypeOf(entry) === null);
+  const exact = (entry, fields) => plain(entry) && (() => {
+    const actual = Object.keys(entry).sort();
+    const expected = [...fields].sort();
+    return actual.length === expected.length && actual.every((field, index) => field === expected[index]);
+  })();
+  if (!exact(value, ["version", "target", "coordination_repository", "request_label", "cache"]) || value.version !== 1 ||
+      !exact(value.target, ["installation_id", "project_id"]) ||
+      typeof value.target.installation_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/.test(value.target.installation_id) ||
+      typeof value.target.project_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.target.project_id) ||
+      typeof value.coordination_repository !== "string" || canonicalGithubRepo(value.coordination_repository) !== value.coordination_repository ||
+      value.request_label !== BATCH_REQUEST_LABEL || !exact(value.cache, ["etag", "cursor"]) ||
+      ![null, "string"].includes(value.cache.etag === null ? null : typeof value.cache.etag) ||
+      ![null, "string"].includes(value.cache.cursor === null ? null : typeof value.cache.cursor) ||
+      (typeof value.cache.etag === "string" && (value.cache.etag.length === 0 || value.cache.etag.length > 512 || /[\r\n\0]/.test(value.cache.etag))) ||
+      (typeof value.cache.cursor === "string" && (value.cache.cursor.length === 0 || value.cache.cursor.length > 512 || /[\r\n\0]/.test(value.cache.cursor)))) {
+    throw new TypeError("invalid Batch Request Issue reader request");
+  }
+  return Object.freeze({
+    version: 1,
+    target: Object.freeze({ installation_id: value.target.installation_id, project_id: value.target.project_id }),
+    coordination_repository: value.coordination_repository,
+    request_label: BATCH_REQUEST_LABEL,
+    cache: Object.freeze({ etag: value.cache.etag, cursor: value.cache.cursor }),
+  });
+}
+
+function _batchRequestIssueRows(repository, rawRows, etag) {
+  if (!Array.isArray(rawRows) || rawRows.length > 64 || (etag !== null && (typeof etag !== "string" || etag.length === 0 || etag.length > 512 || /[\r\n\0]/.test(etag)))) {
+    throw new TypeError("Batch Request Issue reader response is invalid");
+  }
+  const seen = new Set();
+  return rawRows.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item) || !Number.isSafeInteger(item.number) || item.number < 1 || item.number > 9_999_999) {
+      throw new TypeError("Batch Request Issue row is invalid");
+    }
+    if (seen.has(item.number)) throw new TypeError("Batch Request Issue row is duplicated");
+    seen.add(item.number);
+    const labels = Array.isArray(item.labels)
+      ? item.labels.map((label) => typeof label === "string" ? label : label?.name).filter((label) => typeof label === "string" && label.length > 0 && label.length <= 100 && !/[\r\n\0]/.test(label))
+      : [];
+    return Object.freeze({
+      repository,
+      issue_number: item.number,
+      issue_url: `https://api.github.com/repos/${repository}/issues/${item.number}`,
+      pull_request: item.pull_request && typeof item.pull_request === "object" && !Array.isArray(item.pull_request) ? {} : null,
+      labels: Object.freeze(labels),
+      body: typeof item.body === "string" ? item.body : "",
+      etag,
+      // The ETag is the conditional list representation; this opaque marker
+      // only names the fixed query class and is never a page/remote selector.
+      cursor: "open-labelled-issues-v1",
+    });
+  });
+}
+
+async function readBatchRequestIssues(value) {
+  const request = _batchRequestReaderInput(value);
+  if (isRateLimited()) throw new Error("Batch Request REST budget is unavailable");
+  const [owner, name] = request.coordination_repository.split("/");
+  const etagKey = `batch-request:${request.coordination_repository}:${request.request_label}`;
+  const apiPath = `repos/${owner}/${name}/issues?state=open&labels=${encodeURIComponent(request.request_label)}&per_page=64&sort=created&direction=asc`;
+  const response = await ghApiConditional(etagKey, apiPath);
+  if (!response || !["ok", "unchanged"].includes(response.status) || !Array.isArray(response.data)) {
+    throw new Error("Batch Request Issue read is unavailable");
+  }
+  const etag = _etagStore.get(etagKey)?.etag ?? null;
+  const issues = _batchRequestIssueRows(request.coordination_repository, response.data, etag);
+  return Object.freeze({
+    version: 1,
+    target: request.target,
+    coordination_repository: request.coordination_repository,
+    request_label: BATCH_REQUEST_LABEL,
+    // The runtime requires this to echo the exact recovered durable cache.
+    // New ETag/cursor facts belong to each parsed Issue and become durable only
+    // through its subsequent watcher/state-store compare-and-swap.
+    cache: request.cache,
+    issues: Object.freeze(issues),
+  });
 }
 
 // Coalesce concurrent async work by key: a caller arriving while a call for the
@@ -3509,9 +3622,15 @@ async function refreshGraphQLCache() {
   // serve stale. (Name kept so the module-scope auto-start stays untouched.)
   if (isRateLimited()) return;
   _graphqlRefreshInFlight = true;
+  const observedProjectIds = new Set();
   try {
     let cfg;
     try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
+    // An explicitly enabled Batch Request subscription is allowed to remain
+    // active while its project has no implementation batch and therefore no
+    // dashboard GitHub demand. It still shares this existing bounded cadence;
+    // the owner re-proves its own repository/label/admission before it reads.
+    for (const projectId of batchRequestRefreshProjectIds(cfg)) observedProjectIds.add(projectId);
     const repos = [];
     const ownersByRepo = new Map();
     for (const p of cfg.projects || []) {
@@ -3562,6 +3681,16 @@ async function refreshGraphQLCache() {
     // Non-fatal — consumers serve last-known cache.
   } finally {
     _graphqlRefreshInFlight = false;
+    // Do not await an auxiliary local watcher from the dashboard cache pass.
+    // Its own owner re-proves enablement/admission before its separate fixed
+    // ETag read, and a failure must never stall or retry the shared refresh.
+    const observer = _batchRequestRefreshObserver;
+    if (observer) {
+      for (const projectId of observedProjectIds) {
+        try { void Promise.resolve(observer(projectId)).catch(() => {}); }
+        catch { /* observer is non-authoritative */ }
+      }
+    }
   }
 }
 
@@ -7774,6 +7903,11 @@ module.exports.writeGithubFileFromSnapshot = writeGithubFileFromSnapshot;
 // narrow observability hooks for the admission/ownership regression fixture.
 module.exports.cancelProjectBackground = cancelProjectBackground;
 module.exports.refreshRepoRest = refreshRepoRest;
+module.exports.readBatchRequestIssues = readBatchRequestIssues;
+module.exports._batchRequestReaderInput = _batchRequestReaderInput;
+module.exports._batchRequestIssueRows = _batchRequestIssueRows;
+module.exports.setBatchRequestRefreshObserver = setBatchRequestRefreshObserver;
+module.exports.batchRequestRefreshProjectIds = batchRequestRefreshProjectIds;
 module.exports._restRefreshing = _restRefreshing;
 module.exports._githubDemandedProjects = _githubDemandedProjects;
 module.exports.shouldPublishProjectsCache = shouldPublishProjectsCache;

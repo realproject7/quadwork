@@ -170,6 +170,18 @@ ok(true, "forged, foreign, malformed, and raw-incompatible persisted tags fail c
   ok(true, "snapshot id deterministically binds raw evidence, structural authority, and Head generation");
 }
 
+// Admission generations are zero-based.  The first live Head must be able to
+// obtain a source cut before an archive lifecycle transition has incremented
+// that durable generation.
+{
+  const first = tagged(1, "head_assignment");
+  first.resume_structural.head_generation = 0;
+  const snapshot = source(() => window([first])).read_snapshot(request({ head: { agent_id: "head", generation: 0 } }));
+  assert.equal(snapshot.records[0].structural.head_generation, 0);
+  assert.match(snapshot.source.snapshot_id, /^pcs1-[a-f0-9]{64}$/);
+  ok(true, "the initial zero-based admission generation remains a valid Head resume binding");
+}
+
 // A stale or malformed read is not a valid cursor cut.  Input selectors are
 // likewise validated before either reader receives a project id.
 for (const read_records of [

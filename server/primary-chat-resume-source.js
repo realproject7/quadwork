@@ -56,6 +56,7 @@ function exact(value, fields, code) {
   }
 }
 function positiveInteger(value) { return Number.isSafeInteger(value) && value > 0; }
+function nonnegativeInteger(value) { return Number.isSafeInteger(value) && value >= 0; }
 function isIsoTimestamp(value) {
   if (typeof value !== "string" || value.length !== 24 || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)) return false;
   const parsed = Date.parse(value);
@@ -136,7 +137,10 @@ function input(value) {
     fail("invalid_primary_chat_resume_source_input", "project identity is invalid");
   }
   exact(value.head, ["agent_id", "generation"], "invalid_primary_chat_resume_source_input");
-  if (value.head.agent_id !== "head" || !positiveInteger(value.head.generation)) {
+  // This number is the project-admission generation, whose initial durable
+  // value is zero.  Record ids remain strictly positive; only the lifecycle
+  // generation is zero-based.
+  if (value.head.agent_id !== "head" || !nonnegativeInteger(value.head.generation)) {
     fail("invalid_primary_chat_resume_source_input", "Head identity is invalid");
   }
   return freeze({ project_id: value.project_id, head: freeze({ agent_id: "head", generation: value.head.generation }) });

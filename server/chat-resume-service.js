@@ -72,7 +72,7 @@ function binding(value, code, fixedHead = false) {
   exact(value, ["installation_id", "project_id", "agent_id", "generation"], code);
   if (typeof value.installation_id !== "string" || !INSTALLATION_RE.test(value.installation_id) ||
       typeof value.project_id !== "string" || !PROJECT_RE.test(value.project_id) ||
-      typeof value.agent_id !== "string" || !AGENT_RE.test(value.agent_id) || !positiveInteger(value.generation)) {
+      typeof value.agent_id !== "string" || !AGENT_RE.test(value.agent_id) || !nonnegativeInteger(value.generation)) {
     fail(code, "Head binding is invalid");
   }
   if (fixedHead && value.agent_id !== "head") fail(code, "service must be bound to Head");
@@ -168,13 +168,13 @@ function authorizeOrFail(access, principal, owner) {
 }
 function parseHeadFact(value) {
   exact(value, ["agent_id", "generation"], "chat_resume_facts_unavailable");
-  if (value.agent_id !== "head" || !positiveInteger(value.generation)) fail("chat_resume_facts_unavailable", "Head fact is invalid");
+  if (value.agent_id !== "head" || !nonnegativeInteger(value.generation)) fail("chat_resume_facts_unavailable", "Head fact is invalid");
   return freeze({ agent_id: "head", generation: value.generation });
 }
 function parseBatchFact(value, generation) {
   exact(value, ["state", "batch_id", "starts_after_id", "head_generation"], "chat_resume_facts_unavailable");
   if (!new Set(["active", "idle"]).has(value.state) || !nonnegativeInteger(value.starts_after_id) ||
-      !positiveInteger(value.head_generation) || value.head_generation !== generation) {
+      !nonnegativeInteger(value.head_generation) || value.head_generation !== generation) {
     fail("chat_resume_facts_unavailable", "batch fact is invalid");
   }
   if (value.state === "active") {
