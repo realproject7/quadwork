@@ -98,7 +98,15 @@ function observer(overrides = {}) {
   assert.deepEqual(subject.value.canonicalizePath({ version: 1, path: "/var/repos/web-dev" }), {
     version: 1, canonical_path: "/private/var/repos/web-dev",
   });
-  const actual = subject.value.inspectManagedWorktree({ version: 1, work_task_ref: taskRef(), expected: expected() });
+  const ref = taskRef();
+  assert.deepEqual(subject.value.resolveDevWorktree({ version: 1, work_task_ref: ref }), {
+    version: 1,
+    repository_key: "web",
+    worktree_id: "wt_web_dev",
+    path: "/private/var/repos/web-dev",
+    branch: "worktree-dev",
+  });
+  const actual = subject.value.inspectManagedWorktree({ version: 1, work_task_ref: ref, expected: expected() });
   assert.equal(actual.worktree_id, "wt_web_dev");
   assert.equal(actual.head_sha, candidate_sha);
   assert.equal(actual.base_sha, base_sha);

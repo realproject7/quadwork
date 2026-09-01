@@ -163,6 +163,20 @@ function createManagedWorktreeObserver(options) {
     if (request.version !== VERSION) fail("invalid_managed_worktree_canonical_request", "canonical request version is invalid");
     return freeze({ version: VERSION, canonical_path: canonicalPath(options.canonicalize_path, request.path, "invalid_managed_worktree_canonical_request") });
   }
+  function resolveDevWorktree(request) {
+    exact(request, ["version", "work_task_ref"], "invalid_managed_worktree_resolution_request");
+    if (request.version !== VERSION) fail("invalid_managed_worktree_resolution_request", "resolution request version is invalid");
+    const ref = taskRef(request.work_task_ref, "invalid_managed_worktree_resolution_request");
+    const repository = repositories.get(ref.repository_key);
+    if (!repository) fail("managed_worktree_repository_unregistered", "task repository is not registered");
+    return freeze({
+      version: VERSION,
+      repository_key: repository.key,
+      worktree_id: worktreeId(repository.key),
+      path: repository.dev_path,
+      branch: roleBranch("dev"),
+    });
+  }
   function inspectManagedWorktree(request) {
     const requested = observationRequest(request);
     const repository = repositories.get(requested.work_task_ref.repository_key);
@@ -203,7 +217,7 @@ function createManagedWorktreeObserver(options) {
     });
   }
 
-  return freeze({ canonicalizePath, inspectManagedWorktree, worktreeId });
+  return freeze({ canonicalizePath, resolveDevWorktree, inspectManagedWorktree, worktreeId });
 }
 
 module.exports = {
