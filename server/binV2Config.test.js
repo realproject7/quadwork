@@ -6,6 +6,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
+const playbookSeed = fs.readFileSync(path.join(__dirname, "..", "templates", "seeds", "HEAD-PO-PLAYBOOK.md"), "utf8");
+const playbookVersion = playbookSeed.match(/^\*\*Playbook version:\*\*\s+(\d+\.\d+\.\d+)$/m);
+assert.ok(playbookVersion, "canonical playbook seed carries a semantic version");
+
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-bin-v2-"));
 const CONFIG_DIR = path.join(TEST_HOME, ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
@@ -124,7 +128,8 @@ assert.deepEqual(added.repositories, [{
 }]);
 const cliPlaybookPath = path.join(CONFIG_DIR, "new-project", "HEAD-PO-PLAYBOOK.md");
 assert.equal(fs.existsSync(cliPlaybookPath), true, "CLI setup seeds the Head PO playbook");
-assert.match(fs.readFileSync(cliPlaybookPath, "utf8"), /\*\*Playbook version:\*\*\s+1\.0\.0/);
+assert.ok(fs.readFileSync(cliPlaybookPath, "utf8").includes(playbookVersion[0]),
+  `CLI setup seeds the canonical Head PO playbook version (${playbookVersion[1]})`);
 
 // The same post-confirm boundary still supports V1 cleanup and operates on the
 // fresh locked snapshot rather than the stale preview shown before a prompt.

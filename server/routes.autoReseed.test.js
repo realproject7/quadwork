@@ -30,6 +30,10 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 
+const playbookSeed = fs.readFileSync(path.join(__dirname, "..", "templates", "seeds", "HEAD-PO-PLAYBOOK.md"), "utf-8");
+const playbookVersion = playbookSeed.match(/^\*\*Playbook version:\*\*\s+(\d+\.\d+\.\d+)$/m);
+assert.ok(playbookVersion, "canonical playbook seed carries a semantic version");
+
 const {
   autoReseedOnStartup: autoReseedOnStartupRaw,
   _loadReseedState,
@@ -392,8 +396,8 @@ function quietLog() {
     assert.ok(!re1After.includes("Use `gh pr list` to find open PRs in this repo."),
       "re1 stale positive instruction replaced");
     const playbookAfter = fs.readFileSync(installedPlaybook, "utf-8");
-    assert.match(playbookAfter, /\*\*Playbook version:\*\*\s+1\.0\.0/,
-      "auto-reseed refreshes the installed Head PO playbook version");
+    assert.ok(playbookAfter.includes(playbookVersion[0]),
+      `auto-reseed refreshes the canonical Head PO playbook version (${playbookVersion[1]})`);
     assert.ok(!playbookAfter.includes("stale canonical instructions"),
       "auto-reseed replaces canonical playbook sections");
     assert.ok(playbookAfter.includes("keep this deployment-specific note"),

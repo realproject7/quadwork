@@ -7,6 +7,10 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 
+const playbookSeed = fs.readFileSync(path.join(__dirname, "..", "templates", "seeds", "HEAD-PO-PLAYBOOK.md"), "utf-8");
+const playbookVersion = playbookSeed.match(/^\*\*Playbook version:\*\*\s+(\d+\.\d+\.\d+)$/m);
+assert.ok(playbookVersion, "canonical playbook seed carries a semantic version");
+
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "qw-setup-v2-"));
 const CONFIG_DIR = path.join(TMP, ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
@@ -130,7 +134,8 @@ function diskBytes() {
     }]);
     const addedPlaybook = path.join(CONFIG_DIR, "added", "HEAD-PO-PLAYBOOK.md");
     assert.equal(fs.existsSync(addedPlaybook), true, "activated setup seeds the Head PO playbook");
-    assert.match(fs.readFileSync(addedPlaybook, "utf-8"), /\*\*Playbook version:\*\*\s+1\.0\.0/);
+    assert.ok(fs.readFileSync(addedPlaybook, "utf-8").includes(playbookVersion[0]),
+      `activated setup seeds the canonical Head PO playbook version (${playbookVersion[1]})`);
     assert.ok(fs.readFileSync(addedPlaybook, "utf-8").includes("~/.quadwork/added/HEAD-PO-PLAYBOOK.md"),
       "installed playbook self-path uses project id, not display name");
 
