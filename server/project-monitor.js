@@ -14,7 +14,8 @@ class ProjectMonitorController {
     if (!options.stateStore || typeof options.stateStore.load !== "function" || typeof options.stateStore.save !== "function") {
       throw new TypeError("monitor_state_store_required");
     }
-    if (!options.transport || typeof options.transport.publish !== "function" || typeof options.transport.resume !== "function") {
+    if (!options.transport || typeof options.transport.recordAll !== "function"
+      || typeof options.transport.publish !== "function" || typeof options.transport.resume !== "function") {
       throw new TypeError("monitor_transport_required");
     }
     this.stateStore = options.stateStore;
@@ -92,7 +93,19 @@ class ProjectMonitorController {
     }
     const next = cloneMonitorState(current);
     delete next.unresolved[conditionKey];
-    let state = this._save(projectId, next);
+    // Never durably retire a deadline on its own.  The closed transport
+    // records its correlation-keyed delivery receipt using this same state
+    // snapshot, so the receipt and retirement become visible together before
+    // any chat/PTY side effect.  If that durable write never happens, the old
+    // unresolved deadline survives and recovery schedules it again; if it
+    // does happen, `resumePending` owns exactly-once delivery recovery.
+    const prepared = await this.transport.recordAll({
+      project_id: projectId,
+      events: [{ kind: condition.kind, anchors: condition.anchors }],
+      state: next,
+    });
+    let state = cloneMonitorState(prepared.state);
+    this._states.set(projectId, state);
     const delivered = await this.transport.publish({
       project_id: projectId,
       kind: condition.kind,
@@ -202,13 +215,27 @@ class ProjectMonitorController {
         }
       }
     }
-    let state = this._save(projectId, next);
+    const immediate = evaluation.conditions.filter((condition) => condition.immediate);
+    // Persist all immediate delivery authorities in the same state write as
+    // the observation/deadlines.  Recording one then acting before recording
+    // the next would leave a later immediate condition crash-lost.
+    let state;
+    if (immediate.length > 0) {
+      const prepared = await this.transport.recordAll({
+        project_id: projectId,
+        events: immediate.map((condition) => ({ kind: condition.kind, anchors: condition.anchors })),
+        state: next,
+      });
+      state = cloneMonitorState(prepared.state);
+      this._states.set(projectId, state);
+    } else {
+      state = this._save(projectId, next);
+    }
     this._reschedule(projectId, state);
 
     const deliveries = [];
     if (state.mode === "enabled" && evaluation.observation.readiness && evaluation.observation.assignment) {
-      for (const condition of evaluation.conditions) {
-        if (!condition.immediate) continue;
+      for (const condition of immediate) {
         const result = await this.transport.publish({
           project_id: projectId,
           kind: condition.kind,
@@ -228,6 +255,10 @@ class ProjectMonitorController {
     const result = await this.transport.resume(projectId, current);
     const state = cloneMonitorState(result.state);
     this._states.set(projectId, state);
+    // Recovery also reinstates the only permitted reconciliation handles.  A
+    // timer whose initial durable receipt cut did not complete therefore gets
+    // another deadline attempt, rather than being silently lost on restart.
+    this._reschedule(projectId, state);
     return { ...result, state };
   }
 

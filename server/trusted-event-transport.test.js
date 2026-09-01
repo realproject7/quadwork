@@ -72,6 +72,39 @@ function memoryStore(initial, options = {}) {
   assert.equal(wakes.length, 1);
 }
 
+// Several immediate Monitor conditions may be prepared together.  Their
+// receipt authorities are one durable state write before the first external
+// append/wake, so a cut between siblings cannot lose a later condition.
+{
+  const store = memoryStore(initialMonitorState("enabled"));
+  const rows = new Map();
+  const transport = createTrustedEventTransport({
+    stateStore: store,
+    isProjectAdmitted: () => true,
+    appendTrustedEventOnce: async (event) => {
+      if (!rows.has(event.correlation_id)) rows.set(event.correlation_id, `chat-${rows.size + 1}`);
+      return { ok: true, id: rows.get(event.correlation_id) };
+    },
+    wakeTrustedRecipient: async () => ({ ok: true, session_generation: "head-gen-recorded" }),
+  });
+  const prepared = transport.recordAll({
+    project_id: "alpha",
+    events: [
+      { kind: "terminal_red_check", anchors },
+      { kind: "blocked", anchors },
+    ],
+    state: store.state,
+  });
+  assert.equal(Object.keys(prepared.state.deliveries).length, 2);
+  assert.equal(rows.size, 0, "preparation performs no external append");
+  assert.equal(store.saves, 1, "all delivery authorities share one durable write");
+
+  const first = await transport.publish({ project_id: "alpha", kind: "terminal_red_check", anchors, state: prepared.state });
+  const second = await transport.publish({ project_id: "alpha", kind: "blocked", anchors, state: first.state });
+  assert.equal(second.ok, true);
+  assert.equal(rows.size, 2);
+}
+
 // Crash cut: append succeeded but the following durable phase write failed.
 // Restarting from the recorded receipt invokes append-once with the identical
 // correlation; it recovers the original row rather than writing another one.

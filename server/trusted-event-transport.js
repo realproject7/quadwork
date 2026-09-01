@@ -142,21 +142,61 @@ class TrustedEventTransport {
     return this._save(projectId, next);
   }
 
+  _recordEnvelopes(projectId, state, envelopes) {
+    let working = cloneMonitorState(state);
+    let changed = false;
+    for (const envelope of envelopes) {
+      const correlationId = envelope.correlation_id;
+      let delivery = working.deliveries[correlationId] || null;
+      if (!delivery) {
+        delivery = deliveryFromEnvelope(envelope);
+        working.deliveries[correlationId] = delivery;
+        changed = true;
+      }
+      if (delivery.kind !== envelope.kind || delivery.anchor_hash !== hash(envelope.anchors)) {
+        throw new TrustedEventTransportError("trusted_event_correlation_collision");
+      }
+    }
+    if (changed) working = this._save(projectId, working);
+    return { state: working, changed };
+  }
+
+  // This closed preparation boundary exists for server-owned callers that
+  // need several delivery authorities to become durable before the first
+  // external side effect.  It accepts the same fixed kind/anchor grammar as
+  // publish; it cannot create chat text, recipients, or arbitrary events.
+  recordAll(input = {}) {
+    if (!isPlainObject(input) || !Object.keys(input).every((key) => new Set(["project_id", "events", "state"]).has(key))) {
+      throw new TrustedEventTransportError("trusted_event_input_invalid");
+    }
+    const projectId = identifier(input.project_id, PROJECT_ID_RE);
+    if (!projectId) throw new TrustedEventTransportError("trusted_event_project_invalid");
+    if (!isPlainObject(input.state) || !Array.isArray(input.events) || input.events.length < 1 || input.events.length > 16) {
+      throw new TrustedEventTransportError("trusted_event_input_invalid");
+    }
+    const envelopes = input.events.map((event) => {
+      if (!isPlainObject(event) || !Object.keys(event).every((key) => new Set(["kind", "anchors"]).has(key))) {
+        throw new TrustedEventTransportError("trusted_event_input_invalid");
+      }
+      return envelopeFor(projectId, event.kind, event.anchors);
+    });
+    const recorded = this._recordEnvelopes(projectId, input.state, envelopes);
+    return {
+      ok: true,
+      duplicate: recorded.changed !== true,
+      state: recorded.state,
+      envelopes: Object.freeze(envelopes),
+    };
+  }
+
   async _deliver(projectId, state, envelope) {
     const correlationId = envelope.correlation_id;
-    let working = state;
-    let delivery = working.deliveries[correlationId] || null;
-    if (!delivery) {
-      delivery = deliveryFromEnvelope(envelope);
-      // This write intentionally precedes every chat/PTY action.  A crash
-      // after it can recover the same correlation without inventing a second
-      // event identity.
-      working = this._persistDelivery(projectId, working, correlationId, delivery);
-      delivery = working.deliveries[correlationId];
-    }
-    if (delivery.kind !== envelope.kind || delivery.anchor_hash !== hash(envelope.anchors)) {
-      throw new TrustedEventTransportError("trusted_event_correlation_collision");
-    }
+    // This write intentionally precedes every chat/PTY action.  A crash after
+    // it can recover the same correlation without inventing a second event
+    // identity.  `recordAll` may already have made this exact receipt durable.
+    const recorded = this._recordEnvelopes(projectId, state, [envelope]);
+    let working = recorded.state;
+    let delivery = working.deliveries[correlationId];
     if (delivery.phase === "woken") return { ok: true, duplicate: true, state: working, envelope };
     if (!this._admitted(projectId, envelope.anchors)) {
       return { ok: false, code: "project_not_admitted", state: working, envelope };
