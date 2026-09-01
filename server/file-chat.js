@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { ensureSecureDir, writeSecureFile } = require("./config");
+const { envelopeFor } = require("./trusted-event-transport");
 
 const MENTION_RE = /@(\w[\w-]*)/g;
 
@@ -143,7 +144,7 @@ function shutdownProject(projectId) {
   }
 }
 
-function appendMessage(projectId, { sender, channel = "general", text, type = "message", attachments } = {}, _skipLoopGuard = false) {
+function appendRecord(projectId, { sender, channel = "general", text, type = "message", attachments } = {}, trustedEvent = null) {
   const state = getState(projectId);
   if (state.nextId === null) {
     throw new Error(`Project ${projectId} not initialized — call initProject first`);
@@ -161,6 +162,7 @@ function appendMessage(projectId, { sender, channel = "general", text, type = "m
     text: text || "",
     mentions: parseMentions(text),
     ...(attachments && attachments.length > 0 ? { attachments } : {}),
+    ...(trustedEvent ? { trusted_event: trustedEvent } : {}),
   };
 
   const dir = chatDir(projectId);
@@ -196,6 +198,80 @@ function appendMessage(projectId, { sender, channel = "general", text, type = "m
   }
 
   return record;
+}
+
+function appendMessage(projectId, { sender, channel = "general", text, type = "message", attachments } = {}, _skipLoopGuard = false) {
+  void _skipLoopGuard;
+  return appendRecord(projectId, { sender, channel, text, type, attachments });
+}
+
+function sameTrustedEvent(projectId, record, envelope) {
+  const event = record?.trusted_event;
+  if (!event || typeof event !== "object" || event.correlation_id !== envelope.correlation_id) return null;
+  let persisted;
+  try { persisted = envelopeFor(projectId, event.kind, event.anchors); }
+  catch { throw new Error("trusted monitor correlation collision"); }
+  const matches = event.version === envelope.version && persisted.correlation_id === envelope.correlation_id
+    && record.sender === "system" && record.type === "system" && record.text === envelope.text;
+  if (!matches) throw new Error("trusted monitor correlation collision");
+  return record;
+}
+
+function findTrustedMonitorEvent(projectId, state, envelope) {
+  for (const record of state.cache) {
+    const match = sameTrustedEvent(projectId, record, envelope);
+    if (match) return match;
+  }
+  const filePath = chatFile(projectId);
+  if (!fs.existsSync(filePath)) return null;
+  let content;
+  try { content = fs.readFileSync(filePath, "utf8"); }
+  catch (error) { throw new Error(`trusted monitor event read failed: ${error.message}`); }
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line);
+      const match = sameTrustedEvent(projectId, record, envelope);
+      if (match) return match;
+    } catch (error) {
+      if (error?.message === "trusted monitor correlation collision") throw error;
+      // Existing file-chat recovery already treats a corrupt historical JSONL
+      // line as non-authoritative. It cannot become a new trusted receipt.
+    }
+  }
+  return null;
+}
+
+// Server-only closed append seam for the Monitor transport. It deliberately
+// reconstructs the canonical envelope rather than accepting caller prose,
+// recipient lists, or arbitrary JSONL metadata. Ordinary system messages keep
+// using appendMessage and are never eligible for the trusted PTY path.
+function appendTrustedMonitorEventOnce(projectId, candidate) {
+  if (!candidate || typeof candidate !== "object") throw new Error("trusted monitor envelope required");
+  const envelope = envelopeFor(projectId, candidate.kind, candidate.anchors);
+  if (candidate.project_id !== envelope.project_id || candidate.correlation_id !== envelope.correlation_id
+    || candidate.version !== envelope.version || candidate.sender !== envelope.sender
+    || candidate.type !== envelope.type || candidate.text !== envelope.text
+    || !Array.isArray(candidate.recipients) || candidate.recipients.length !== 1 || candidate.recipients[0] !== "head") {
+    throw new Error("trusted monitor envelope invalid");
+  }
+  const state = getState(projectId);
+  if (state.nextId === null) throw new Error(`Project ${projectId} not initialized — call initProject first`);
+  const existing = findTrustedMonitorEvent(projectId, state, envelope);
+  if (existing) return { ok: true, id: existing.id, duplicate: true };
+  const metadata = Object.freeze({
+    version: envelope.version,
+    correlation_id: envelope.correlation_id,
+    kind: envelope.kind,
+    anchors: envelope.anchors,
+  });
+  const record = appendRecord(projectId, {
+    sender: "system",
+    channel: "general",
+    type: "system",
+    text: envelope.text,
+  }, metadata);
+  return { ok: true, id: record.id, duplicate: false };
 }
 
 function readMessages(projectId, { since_id = 0, limit = 50 } = {}) {
@@ -330,6 +406,8 @@ module.exports = {
   initProject,
   shutdownProject,
   appendMessage,
+  // Private server composition seam. No route/MCP surface exposes it.
+  appendTrustedMonitorEventOnce,
   readMessages,
   getNextId,
   parseMentions,

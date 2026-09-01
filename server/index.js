@@ -11,9 +11,13 @@ const routes = require("./routes");
 const fileChat = require("./file-chat");
 const {
   dispatchToAgentPTY,
+  dispatchTrustedMonitorEvent,
   cleanupSession: cleanupPtyDispatcher,
   cancelProject: cancelPtyDispatchProject,
 } = require("./pty-dispatcher");
+const { createProjectMonitorStateStore } = require("./project-monitor-state");
+const { createTrustedEventTransport } = require("./trusted-event-transport");
+const { createProjectMonitorController } = require("./project-monitor");
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
@@ -618,6 +622,139 @@ app.get("/api/caffeinate/status", (req, res) => {
 // PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
 const agentSessions = new Map();
 
+// M2 composition only: #1032 owns the explicit readiness/start control plane.
+// Consequently these helpers never enable a monitor from a runtime fact. They
+// merely resume a persisted explicit enable and deliver server-created events.
+const monitorStateStore = createProjectMonitorStateStore();
+const monitorModes = new Map();
+const monitorIdentities = new Map();
+const monitorKnownProjects = new Set();
+
+function monitorIdentityFromAnchors(anchors) {
+  if (!anchors || typeof anchors !== "object" || typeof anchors.assignment_key !== "string"
+    || typeof anchors.subject_key !== "string") return null;
+  return Object.freeze({
+    assignment_key: anchors.assignment_key,
+    subject_key: anchors.subject_key,
+    cycle_id: typeof anchors.cycle_id === "string" ? anchors.cycle_id : null,
+  });
+}
+
+function hydrateProjectMonitor(projectId) {
+  if (monitorModes.has(projectId)) return monitorModes.get(projectId);
+  let state;
+  try { state = monitorStateStore.load(projectId); }
+  catch { return "archived"; }
+  monitorKnownProjects.add(projectId);
+  monitorModes.set(projectId, state.mode);
+  // A persisted undelivered event is the sole restart recovery authority. If
+  // several pending receipts disagree on assignment/cycle, fail closed until a
+  // later server-owned structured fact establishes one current identity.
+  const pending = Object.values(state.deliveries || {}).filter((delivery) => delivery?.phase !== "woken");
+  const identities = pending.map((delivery) => monitorIdentityFromAnchors(delivery.anchors)).filter(Boolean);
+  if (identities.length > 0 && identities.every((entry) => entry.assignment_key === identities[0].assignment_key
+    && entry.subject_key === identities[0].subject_key && entry.cycle_id === identities[0].cycle_id)) {
+    monitorIdentities.set(projectId, identities[0]);
+  }
+  return state.mode;
+}
+
+function trustedMonitorEventCurrent(envelope, session) {
+  const identity = monitorIdentities.get(envelope?.project_id);
+  if (!identity || session?.agentId !== "head" || session.lifecycleState !== "verified") return false;
+  const anchors = envelope.anchors || {};
+  return anchors.assignment_key === identity.assignment_key && anchors.subject_key === identity.subject_key
+    && (identity.cycle_id === null || anchors.cycle_id === identity.cycle_id);
+}
+
+const trustedMonitorTransport = createTrustedEventTransport({
+  stateStore: monitorStateStore,
+  appendTrustedEventOnce: async (envelope) => {
+    if (routes.getProjectChatMode(envelope.project_id) !== "file") return { ok: false };
+    return fileChat.appendTrustedMonitorEventOnce(envelope.project_id, envelope);
+  },
+  isProjectAdmitted: (projectId) => {
+    try { assertProjectAdmitted(projectId); return true; }
+    catch { return false; }
+  },
+  currentTrustedRecipientGeneration: ({ project_id: projectId, envelope }) => {
+    const session = agentSessions.get(`${projectId}/head`);
+    if (!session || session.state !== "running" || !session.term || session.lifecycleState !== "verified"
+      || typeof session.generationId !== "string" || !trustedMonitorEventCurrent(envelope, session)) return null;
+    return session.generationId;
+  },
+  wakeTrustedRecipient: async ({ project_id: projectId, envelope }) => dispatchTrustedMonitorEvent(projectId, envelope, agentSessions, {
+    isProjectAdmitted: (id) => {
+      try { assertProjectAdmitted(id); return true; }
+      catch { return false; }
+    },
+    isTrustedEventCurrent: trustedMonitorEventCurrent,
+    safeWrite,
+  }),
+});
+const projectMonitor = createProjectMonitorController({
+  stateStore: monitorStateStore,
+  transport: trustedMonitorTransport,
+});
+
+async function resumePersistedProjectMonitor(projectId) {
+  if (hydrateProjectMonitor(projectId) !== "enabled") return { ok: true, resumed: 0, skipped: true };
+  const result = await projectMonitor.resumePending(projectId);
+  monitorModes.set(projectId, result.state.mode);
+  return result;
+}
+
+function archiveProjectMonitor(projectId) {
+  hydrateProjectMonitor(projectId);
+  monitorIdentities.delete(projectId);
+  monitorKnownProjects.add(projectId);
+  try {
+    const state = projectMonitor.archive(projectId);
+    monitorModes.set(projectId, state.mode);
+    return { ok: true, resources: { project_monitor: 1 }, cleanup_errors: [] };
+  } catch {
+    return {
+      ok: false,
+      resources: {},
+      cleanup_errors: [{ resource: "project_monitor", code: "monitor_archive_failed" }],
+    };
+  }
+}
+
+function clearProjectMonitorTerminal(projectId, fingerprint) {
+  if (hydrateProjectMonitor(projectId) !== "enabled") return { ok: true, skipped: true };
+  const prior = clearProjectMonitorTerminal._fingerprints.get(projectId);
+  if (prior === fingerprint) return { ok: true, skipped: true };
+  try {
+    const state = projectMonitor.clearTerminal(projectId);
+    clearProjectMonitorTerminal._fingerprints.set(projectId, fingerprint);
+    monitorIdentities.delete(projectId);
+    return state;
+  } catch {
+    return { ok: false, skipped: true };
+  }
+}
+clearProjectMonitorTerminal._fingerprints = new Map();
+
+async function observeProjectMonitorExit(session) {
+  const projectId = session?.projectId;
+  if (!projectId || hydrateProjectMonitor(projectId) !== "enabled") return { ok: true, skipped: true };
+  const identity = monitorIdentities.get(projectId);
+  if (!identity) return { ok: true, skipped: true };
+  const result = await projectMonitor.observe({
+    project_id: projectId,
+    readiness: true,
+    assignment: {
+      assignment_key: identity.assignment_key,
+      subject_key: identity.subject_key,
+      ...(identity.cycle_id ? { cycle_id: identity.cycle_id } : {}),
+    },
+    runtime: { process_exited: true, status_confirmed: false },
+  });
+  monitorModes.set(projectId, result.state.mode);
+  return result;
+}
+
 // Deterministic server-test containment fixtures. They are an in-process
 // capability, not a route/config/environment setting: production callers
 // cannot turn an uncontained PTY into a contained one. The fixture exists so
@@ -1183,6 +1320,17 @@ async function launchAgentPty(project, agent, opts = {}) {
         session._lifecycleVerificationPending = true;
         flushPendingLifecycleVerification(session);
       }
+      // A verified Head generation is a local lifecycle fact. It may recover
+      // one durable trusted receipt after a crash, but it never starts a
+      // suspended monitor or creates a repeating health/pulse loop.
+      if (agent === "head" && session.lifecycleState === "verified"
+        && session._monitorResumeGeneration !== session.generationId && !session._monitorResumeInFlight) {
+        session._monitorResumeInFlight = true;
+        void resumePersistedProjectMonitor(project).catch(() => {}).finally(() => {
+          session._monitorResumeGeneration = session.generationId;
+          session._monitorResumeInFlight = false;
+        });
+      }
       const chunk = Buffer.from(data);
       session.scrollback = Buffer.concat([session.scrollback, chunk]);
       if (session.scrollback.length > SCROLLBACK_SIZE) {
@@ -1375,6 +1523,10 @@ function markSessionExited(key, session, exitCode) {
       health: "unknown",
     }).catch(() => { session.lifecycleState = "unknown"; });
   }
+  // Exit observation is monitor-only: it cannot restart, reassign, merge, or
+  // enable monitoring. It is ignored unless a persisted enabled Monitor has a
+  // current trusted assignment/cycle receipt to bind the event.
+  void observeProjectMonitorExit(session).catch(() => {});
   for (const v of session.viewers) {
     if (v.readyState <= 1) v.close(1000, `exited:${exitCode == null ? "" : exitCode}`);
   }
@@ -2335,6 +2487,7 @@ async function sendTriggerMessage(projectId, automationBody = null) {
       }
       const clearedByOperator = batchState.clearedByOperator === true;
       if (batchState.shouldStop) {
+        clearProjectMonitorTerminal(projectId, batchState.fingerprint || "terminal");
         console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
         stopTrigger(projectId);
         // Also stop caffeinate if no other triggers remain running
@@ -2587,6 +2740,7 @@ async function cleanupProjectRuntime(projectId) {
   // It closes both deferred wake and delayed-submit timers in the same turn
   // that follows durable barrier persistence/revocation.
   mergeCleanupResult(aggregate, cancelPtyDispatchProject(projectId), "deferred_dispatch");
+  mergeCleanupResult(aggregate, archiveProjectMonitor(projectId), "project_monitor");
   mergeCleanupResult(aggregate, selfHeal.clearProject(projectId), "self_heal");
   mergeCleanupResult(aggregate, stopTrigger(projectId), "trigger");
   const lifecycleCancelPromise = lifecycleGovernor.cancelProject(projectId);
@@ -3345,6 +3499,7 @@ async function autoStopPollingTick() {
       let bridgeTransitionSucceeded = true;
 
       if (bp && shouldStop) {
+        clearProjectMonitorTerminal(project.id, batchState.fingerprint || "terminal");
         if (hasTriggerAuto) {
           const reason = clearedByOperator ? "cleared by operator" : "complete (confirmed)";
           console.log(`[auto-trigger] ${project.id}: batch ${reason}, auto-stopped (poller)`);
@@ -3805,6 +3960,15 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
     }
   }
 
+  // Recovery scans only durable Monitor receipts during startup; it does not
+  // evaluate GitHub/queue state or start a suspended monitor. A pending receipt
+  // may be re-delivered only when its fixed Head recipient is already verified.
+  for (const p of admittedStartupCfg.projects) {
+    if (p.chat_mode !== "file" || fileChat._getState(p.id).nextId === null) continue;
+    try { await resumePersistedProjectMonitor(p.id); }
+    catch (err) { console.error(`[monitor] ${p.id}: trusted delivery recovery deferred: ${err.message}`); }
+  }
+
   runStartupMigrations(admittedStartupCfg);
 
   // #856: Auto-reseed worktree AGENTS.md when the package version changes.
@@ -3852,6 +4016,16 @@ function shutdown() {
   for (const project of [...triggers.keys()]) {
     try { stopTrigger(project); } catch {}
   }
+
+  // Project Monitor owns only condition-specific timeout handles. Cancel them
+  // synchronously on shutdown; no monitor state is evaluated or rewritten.
+  for (const project of [...monitorKnownProjects]) {
+    try { projectMonitor.shutdown(project); } catch {}
+  }
+  monitorKnownProjects.clear();
+  monitorModes.clear();
+  monitorIdentities.clear();
+  clearProjectMonitorTerminal._fingerprints.clear();
 
   // Message bridges (in-process Discord/Telegram clients).
   void telegramBridge.stopAll().catch((err) => console.error("[shutdown] Telegram bridge stop failed:", err?.message || err));

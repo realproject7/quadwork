@@ -99,6 +99,54 @@ function memoryStore(initial, options = {}) {
   assert.equal(wakeCalls, 1);
 }
 
+// A dispatcher queue acknowledgement is not a PTY-write receipt. It remains
+// appended, but its target generation prevents duplicate resumes for the same
+// Head. Once that Head is gone, the next verified generation gets one retry of
+// the same correlation and the append-once boundary still has one JSONL row.
+{
+  const store = memoryStore(initialMonitorState("enabled"));
+  const rows = new Map();
+  let headGeneration = "head-gen-old";
+  let wakeCalls = 0;
+  const transport = createTrustedEventTransport({
+    stateStore: store,
+    isProjectAdmitted: () => true,
+    currentTrustedRecipientGeneration: () => headGeneration,
+    appendTrustedEventOnce: async (event) => {
+      if (!rows.has(event.correlation_id)) rows.set(event.correlation_id, "chat-queued-1");
+      return { ok: true, id: rows.get(event.correlation_id) };
+    },
+    wakeTrustedRecipient: async () => {
+      wakeCalls += 1;
+      return { ok: true, deferred: true, delivery_generation: headGeneration };
+    },
+  });
+  const first = await transport.publish({ project_id: "alpha", kind: "terminal_red_check", anchors, state: store.state });
+  assert.equal(first.queued, true);
+  assert.equal(first.state.deliveries[first.envelope.correlation_id].phase, "appended");
+  assert.equal(first.state.deliveries[first.envelope.correlation_id].delivery_generation, "head-gen-old");
+  assert.equal(rows.size, 1);
+  assert.equal(wakeCalls, 1);
+
+  const sameGeneration = await transport.resume("alpha", first.state);
+  assert.equal(sameGeneration.resumed, 0);
+  assert.equal(wakeCalls, 1, "same verified generation is not queued twice");
+  assert.equal(rows.size, 1);
+
+  headGeneration = "head-gen-new";
+  const nextGeneration = await transport.resume("alpha", sameGeneration.state);
+  assert.equal(nextGeneration.resumed, 1);
+  assert.equal(nextGeneration.state.deliveries[first.envelope.correlation_id].phase, "appended");
+  assert.equal(nextGeneration.state.deliveries[first.envelope.correlation_id].delivery_generation, "head-gen-new");
+  assert.equal(wakeCalls, 2, "new verified Head generation receives one retry");
+  assert.equal(rows.size, 1, "retry reuses the one JSONL event");
+
+  const duplicateNewGeneration = await transport.resume("alpha", nextGeneration.state);
+  assert.equal(duplicateNewGeneration.resumed, 0);
+  assert.equal(wakeCalls, 2);
+  assert.equal(rows.size, 1);
+}
+
 console.log("trusted-event-transport.test.js: all assertions passed");
 })().catch((error) => {
   console.error(error);

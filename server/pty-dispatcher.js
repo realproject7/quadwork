@@ -7,6 +7,7 @@
 const IDLE_THRESHOLD_MS = 5000;
 const COALESCE_WINDOW_MS = 1000;
 const ACTIVE_SUPPRESSION_MS = 30000;
+const { envelopeFor } = require("./trusted-event-transport");
 
 // #1010: bounded deferred-wake deadline — an escape hatch for the starvation
 // below, for the backends whose TUI never goes quiet. The Claude Code TUI
@@ -117,6 +118,56 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
 
     scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions, deps);
   }
+}
+
+function verifiedTrustedMonitorEnvelope(projectId, candidate) {
+  if (!candidate || typeof candidate !== "object") return null;
+  let envelope;
+  try { envelope = envelopeFor(projectId, candidate.kind, candidate.anchors); }
+  catch { return null; }
+  if (candidate.project_id !== envelope.project_id || candidate.correlation_id !== envelope.correlation_id
+    || candidate.version !== envelope.version || candidate.sender !== envelope.sender
+    || candidate.type !== envelope.type || candidate.text !== envelope.text
+    || !Array.isArray(candidate.recipients) || candidate.recipients.length !== 1 || candidate.recipients[0] !== "head") {
+    return null;
+  }
+  return envelope;
+}
+
+function isVerifiedHead(session) {
+  return !!session && session.agentId === "head" && session.state === "running" && !!session.term
+    && session.lifecycleState === "verified" && typeof session.generationId === "string" && session.generationId.length > 0;
+}
+
+// A dedicated server-only trusted-event path. Unlike ordinary chat dispatch it
+// bypasses the conversational loop guard, but it still uses every PTY safety
+// rule: admission/current-identity checks, verified Head generation, busy
+// deferral, coalescing and project cancellation. It never writes a terminal
+// directly; only the shared injection lifecycle may do that later.
+function dispatchTrustedMonitorEvent(projectId, candidate, agentSessions, deps) {
+  const envelope = verifiedTrustedMonitorEnvelope(projectId, candidate);
+  if (!envelope || !deps || typeof deps.safeWrite !== "function" || typeof deps.isTrustedEventCurrent !== "function") {
+    return { ok: false, code: "trusted_event_invalid" };
+  }
+  const key = `${projectId}/head`;
+  const isCurrent = () => {
+    const session = agentSessions.get(key);
+    if (!isVerifiedHead(session) || !dispatchAuthorized(deps, projectId)) return false;
+    try { return deps.isTrustedEventCurrent(envelope, session) === true; }
+    catch { return false; }
+  };
+  if (!isCurrent()) return { ok: false, code: "trusted_event_not_current" };
+  const session = agentSessions.get(key);
+  const trustedDeps = {
+    ...deps,
+    isActionCurrent: isCurrent,
+  };
+  if (isAgentBusy(session)) {
+    queuePendingWake(key, session, agentSessions, trustedDeps);
+    return { ok: true, deferred: true, delivery_generation: session.generationId };
+  }
+  scheduleCoalescedInjection(key, projectId, "head", envelope, agentSessions, trustedDeps);
+  return { ok: true, deferred: true, delivery_generation: session.generationId };
 }
 
 // #1034: delayed dispatcher work must consult the same server-owned archive
@@ -495,6 +546,7 @@ function cancelProject(projectId) {
 
 module.exports = {
   dispatchToAgentPTY,
+  dispatchTrustedMonitorEvent,
   cleanupSession,
   cancelProject,
   // Exported for testing

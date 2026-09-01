@@ -112,6 +112,8 @@ class TrustedEventTransport {
     this.stateStore = options.stateStore;
     this.appendTrustedEventOnce = typeof options.appendTrustedEventOnce === "function" ? options.appendTrustedEventOnce : null;
     this.wakeTrustedRecipient = typeof options.wakeTrustedRecipient === "function" ? options.wakeTrustedRecipient : null;
+    this.currentTrustedRecipientGeneration = typeof options.currentTrustedRecipientGeneration === "function"
+      ? options.currentTrustedRecipientGeneration : null;
     this.isProjectAdmitted = typeof options.isProjectAdmitted === "function" ? options.isProjectAdmitted : (() => false);
   }
 
@@ -122,6 +124,16 @@ class TrustedEventTransport {
   _admitted(projectId, anchors) {
     try { return this.isProjectAdmitted(projectId, anchors) === true; }
     catch { return false; }
+  }
+
+  _currentRecipientGeneration(projectId, envelope) {
+    if (!this.currentTrustedRecipientGeneration) return null;
+    try {
+      const generation = this.currentTrustedRecipientGeneration(Object.freeze({ project_id: projectId, envelope }));
+      return normalizeChatEventId(generation);
+    } catch {
+      return null;
+    }
   }
 
   _persistDelivery(projectId, state, correlationId, delivery) {
@@ -174,6 +186,14 @@ class TrustedEventTransport {
     if (!this.wakeTrustedRecipient) {
       return { ok: false, code: "trusted_event_wake_unavailable", state: working, envelope };
     }
+    // A deferred dispatcher result only means this correlation was queued for
+    // a verified Head generation; it is not evidence that a PTY write landed.
+    // Do not enqueue it twice for that same generation. A later verified Head
+    // generation is intentionally eligible to receive the exact same receipt.
+    const currentGeneration = this._currentRecipientGeneration(projectId, envelope);
+    if (currentGeneration && delivery.delivery_generation === currentGeneration) {
+      return { ok: true, duplicate: true, queued: true, state: working, envelope };
+    }
     let wakeResult;
     try {
       wakeResult = await this.wakeTrustedRecipient(Object.freeze({
@@ -191,9 +211,16 @@ class TrustedEventTransport {
     if ((wakeResult.delivery_generation !== undefined || wakeResult.session_generation !== undefined) && !deliveryGeneration) {
       return { ok: false, code: "trusted_event_wake_failed", state: working, envelope };
     }
+    if (wakeResult.deferred === true) {
+      // `delivery_generation` is a queued target only. It must never be read as
+      // proof that the shared coalescer/deferred PTY write has completed.
+      delivery = { ...delivery, phase: "appended", delivery_generation: deliveryGeneration };
+      working = this._persistDelivery(projectId, working, correlationId, delivery);
+      return { ok: true, duplicate: false, queued: true, retried: true, state: working, envelope };
+    }
     delivery = { ...delivery, phase: "woken", delivery_generation: deliveryGeneration };
     working = this._persistDelivery(projectId, working, correlationId, delivery);
-    return { ok: true, duplicate: false, state: working, envelope };
+    return { ok: true, duplicate: false, retried: true, state: working, envelope };
   }
 
   async publish(input = {}) {
@@ -220,7 +247,7 @@ class TrustedEventTransport {
       if (envelope.correlation_id !== correlationId) throw new TrustedEventTransportError("trusted_event_correlation_collision");
       const result = await this._deliver(projectId, current, envelope);
       current = result.state;
-      if (result.ok) resumed += 1;
+      if (result.retried === true) resumed += 1;
     }
     return { ok: true, resumed, state: current };
   }
