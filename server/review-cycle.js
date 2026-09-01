@@ -14,9 +14,10 @@ const { assertWorkItemRef } = require("./work-item-ref");
 const { canonicalSha, normalizeCiPolicy } = require("./ci-evidence-policy");
 
 // V2 adds the persisted, bounded reviewer lease/reminder facts required by
-// the server dispatcher.  V1 documents are migrated in-memory on read; the
-// next normal atomic write seals the V2 form.  No history is discarded.
-const REVIEW_CYCLE_STORE_VERSION = 3;
+// the server dispatcher. Earlier documents are migrated in-memory on read;
+// the next normal atomic write seals the current V4 form. No history is
+// discarded.
+const REVIEW_CYCLE_STORE_VERSION = 4;
 const REVIEW_CYCLE_FILENAME = "review-cycles.json";
 const LEGACY_REVIEW_TARGET_KIND = "legacy_work_item_pr";
 
@@ -144,7 +145,10 @@ function targetDigestIdentity(identity) {
     repo_key: identity.repo_key,
     repo: canonicalRepository(identity.repo),
     work_item: {
-      repo_key: identity.work_item.repo_key,
+      // WorkItemRef is intentionally camel-cased (`repoKey`). Keep the
+      // canonical registered item identity in the digest rather than silently
+      // serializing an undefined legacy field.
+      repo_key: identity.work_item.repoKey,
       repo: canonicalRepository(identity.work_item.repo),
       number: identity.work_item.number,
       kind: identity.work_item.kind,
@@ -167,7 +171,7 @@ function slotDigestIdentity(identity) {
     repo_key: identity.repo_key,
     repo: canonicalRepository(identity.repo),
     work_item: {
-      repo_key: identity.work_item.repo_key,
+      repo_key: identity.work_item.repoKey,
       repo: canonicalRepository(identity.work_item.repo),
       number: identity.work_item.number,
       kind: identity.work_item.kind,
@@ -183,6 +187,52 @@ function targetIdentityDigest(identity) {
 function targetSlotDigest(identity) {
   return sha256(slotDigestIdentity(identity));
 }
+
+// The V3 digest representation accidentally looked for `repo_key` on a
+// WorkItemRef. Keep this private legacy form solely to verify a persisted V3
+// document before its deterministic V4 rebind; it is never emitted for a new
+// target or accepted as current authority.
+function v3TargetDigestIdentity(identity) {
+  return {
+    version: identity.version,
+    target_kind: identity.target_kind,
+    installation_id: identity.installation_id,
+    project_id: identity.project_id,
+    repo_key: identity.repo_key,
+    repo: canonicalRepository(identity.repo),
+    work_item: {
+      repo_key: identity.work_item.repo_key,
+      repo: canonicalRepository(identity.work_item.repo),
+      number: identity.work_item.number,
+      kind: identity.work_item.kind,
+    },
+    pr_number: identity.pr_number,
+    exact_sha: identity.exact_sha,
+    contract_revision: identity.contract_revision,
+    policy_version: identity.policy_version,
+    policy_digest: identity.policy_digest,
+    assignment_attempt: identity.assignment_attempt,
+  };
+}
+function v3SlotDigestIdentity(identity) {
+  return {
+    version: identity.version,
+    target_kind: identity.target_kind,
+    installation_id: identity.installation_id,
+    project_id: identity.project_id,
+    repo_key: identity.repo_key,
+    repo: canonicalRepository(identity.repo),
+    work_item: {
+      repo_key: identity.work_item.repo_key,
+      repo: canonicalRepository(identity.work_item.repo),
+      number: identity.work_item.number,
+      kind: identity.work_item.kind,
+    },
+    pr_number: identity.pr_number,
+  };
+}
+function v3TargetIdentityDigest(identity) { return sha256(v3TargetDigestIdentity(identity)); }
+function v3TargetSlotDigest(identity) { return sha256(v3SlotDigestIdentity(identity)); }
 
 function assertTargetIdentity(identity, code = "invalid_review_cycle_target") {
   exactKeys(identity, [
@@ -523,15 +573,86 @@ function migrateV2Document(value) {
   }
   const cycles = Object.fromEntries(Object.entries(value.cycles).map(([id, raw]) => [id, {
     ...clone(raw),
-    version: REVIEW_CYCLE_STORE_VERSION,
+    version: 3,
     review_nonces: { re1: null, re2: null },
   }]));
-  return { version: REVIEW_CYCLE_STORE_VERSION, cycles, slots: clone(value.slots) };
+  return { version: 3, cycles, slots: clone(value.slots) };
+}
+
+// V3 constructed target and slot digests with the old WorkItemRef field name
+// (`repo_key` instead of `repoKey`). Recompute every derived digest from the
+// validated canonical target and rebuild only the current-slot index. Review
+// receipts retain their immutable role/review facts while being rebound to the
+// same canonical target's corrected digest; no successor, event, or review
+// authority is invented during migration.
+function migrateV3Document(value) {
+  exactKeys(value, ["version", "cycles", "slots"], "review_cycle_store_invalid");
+  if (value.version !== 3 || !isPlainObject(value.cycles) || !isPlainObject(value.slots)) {
+    fail("review_cycle_store_invalid", "review-cycle document is invalid");
+  }
+  const cycles = {};
+  const slots = {};
+  const expectedLegacySlots = {};
+  for (const [cycleId, raw] of Object.entries(value.cycles)) {
+    if (!CYCLE_ID_RE.test(cycleId) || !isPlainObject(raw) || !isPlainObject(raw.target)) {
+      fail("review_cycle_store_invalid", "review-cycle record is invalid");
+    }
+    try { assertTargetIdentity(raw.target, "review_cycle_store_invalid"); }
+    catch (error) { if (error instanceof ReviewCycleError) throw error; fail("review_cycle_store_invalid", "review-cycle target is invalid"); }
+    const legacyTargetDigest = v3TargetIdentityDigest(raw.target);
+    const legacySlotDigest = v3TargetSlotDigest(raw.target);
+    if (raw.target_identity_digest !== legacyTargetDigest || raw.slot_digest !== legacySlotDigest) {
+      fail("review_cycle_store_invalid", "V3 review-cycle target digest is invalid");
+    }
+    if (isPlainObject(raw.receipts)) {
+      for (const role of REVIEWER_ROLES) {
+        if (isPlainObject(raw.receipts[role]) && raw.receipts[role].target_identity_digest !== legacyTargetDigest) {
+          fail("review_cycle_store_invalid", "V3 review-cycle receipt target is invalid");
+        }
+      }
+    }
+    const target = clone(raw.target);
+    const targetDigest = targetIdentityDigest(target);
+    const slotDigest = targetSlotDigest(target);
+    const cycle = {
+      ...clone(raw),
+      version: REVIEW_CYCLE_STORE_VERSION,
+      target,
+      target_identity_digest: targetDigest,
+      slot_digest: slotDigest,
+    };
+    if (isPlainObject(cycle.receipts)) {
+      for (const role of REVIEWER_ROLES) {
+        if (isPlainObject(cycle.receipts[role])) {
+          cycle.receipts[role] = { ...cycle.receipts[role], target_identity_digest: targetDigest };
+        }
+      }
+    }
+    if (cycle.state === "current") {
+      if (expectedLegacySlots[legacySlotDigest]) fail("review_cycle_store_invalid", "current review cycle legacy slot collision during migration");
+      expectedLegacySlots[legacySlotDigest] = cycleId;
+      if (slots[slotDigest]) fail("review_cycle_store_invalid", "current review cycle slot collision during migration");
+      slots[slotDigest] = cycleId;
+    }
+    cycles[cycleId] = cycle;
+  }
+  const actualLegacySlots = Object.keys(value.slots).sort();
+  const expectedLegacySlotKeys = Object.keys(expectedLegacySlots).sort();
+  if (actualLegacySlots.length !== expectedLegacySlotKeys.length || actualLegacySlots.some((slot, index) => slot !== expectedLegacySlotKeys[index]) ||
+      actualLegacySlotKeysHaveDifferentCycle(value.slots, expectedLegacySlots)) {
+    fail("review_cycle_store_invalid", "V3 review-cycle slot index is invalid");
+  }
+  return { version: REVIEW_CYCLE_STORE_VERSION, cycles, slots };
+}
+
+function actualLegacySlotKeysHaveDifferentCycle(actual, expected) {
+  return Object.keys(expected).some((slot) => actual[slot] !== expected[slot]);
 }
 
 function normalizeDocument(value) {
   if (isPlainObject(value) && value.version === 1) value = migrateV1Document(value);
   if (isPlainObject(value) && value.version === 2) value = migrateV2Document(value);
+  if (isPlainObject(value) && value.version === 3) value = migrateV3Document(value);
   exactKeys(value, ["version", "cycles", "slots"], "review_cycle_store_invalid");
   if (value.version !== REVIEW_CYCLE_STORE_VERSION || !isPlainObject(value.cycles) || !isPlainObject(value.slots)) {
     fail("review_cycle_store_invalid", "review-cycle document is invalid");

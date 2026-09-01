@@ -1,13 +1,17 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const {
   LEGACY_REVIEW_TARGET_KIND,
+  REVIEW_CYCLE_STORE_VERSION,
   ReviewCycleStore,
   deriveLegacyReviewTarget,
+  targetIdentityDigest,
+  targetSlotDigest,
 } = require("./review-cycle");
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-review-cycle-"));
@@ -70,6 +74,35 @@ function receipt(role, reviewId, verdict = "approved", overrides = {}) {
   };
 }
 
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+function legacyHash(value) { return crypto.createHash("sha256").update(stableJson(value), "utf8").digest("hex"); }
+function legacyV3TargetDigest(identity) {
+  return legacyHash({
+    version: identity.version, target_kind: identity.target_kind,
+    installation_id: identity.installation_id, project_id: identity.project_id,
+    repo_key: identity.repo_key, repo: identity.repo.toLowerCase(),
+    work_item: { repo_key: identity.work_item.repo_key, repo: identity.work_item.repo.toLowerCase(), number: identity.work_item.number, kind: identity.work_item.kind },
+    pr_number: identity.pr_number, exact_sha: identity.exact_sha,
+    contract_revision: identity.contract_revision, policy_version: identity.policy_version,
+    policy_digest: identity.policy_digest, assignment_attempt: identity.assignment_attempt,
+  });
+}
+function legacyV3SlotDigest(identity) {
+  return legacyHash({
+    version: identity.version, target_kind: identity.target_kind,
+    installation_id: identity.installation_id, project_id: identity.project_id,
+    repo_key: identity.repo_key, repo: identity.repo.toLowerCase(),
+    work_item: { repo_key: identity.work_item.repo_key, repo: identity.work_item.repo.toLowerCase(), number: identity.work_item.number, kind: identity.work_item.kind },
+    pr_number: identity.pr_number,
+  });
+}
+
 function freshStore() {
   return new ReviewCycleStore({ rootDir: ROOT, now });
 }
@@ -94,6 +127,7 @@ for (const [label, candidate] of [
   ["untrusted prose", source({ prose: "@re1 @re2 REVIEW REQUEST" })],
   ["PR item", source({ work_item: { kind: "pr" } })],
   ["foreign repo item", source({ work_item: { repoKey: "api", repo: "Acme/API" } })],
+  ["abbreviated exact SHA", source({ pr: { exact_sha: "a".repeat(39) } })],
 ]) {
   assert.throws(
     () => deriveLegacyReviewTarget(candidate),
@@ -109,6 +143,24 @@ assert.equal(cycle.ci_state, "unknown");
 assert.equal(cycle.review_state, "not_dispatched");
 ok(true, "new cycle starts with orthogonal ready/unknown/not-dispatched facts");
 
+// A draft PR cannot open receipt authority. The same exact PR/SHA becomes
+// review-ready only after a server observation marks it non-draft; CI remains
+// a separate fact and no replacement cycle is invented for that readiness
+// transition.
+const draftTarget = target({ pr: { number: 98, draft: true } });
+let draftCycle = store.reconcile(PROJECT, draftTarget).cycle;
+assert.equal(draftCycle.readiness, "draft_or_not_ready");
+store.setCiState(PROJECT, draftTarget, "pending");
+assert.equal(store.planReviewRequest(PROJECT, draftTarget), null);
+const openedTarget = target({ pr: { number: 98, draft: false } });
+const opened = store.reconcile(PROJECT, openedTarget);
+assert.equal(opened.created, false);
+assert.equal(opened.cycle.cycle_id, draftCycle.cycle_id);
+assert.equal(opened.cycle.readiness, "ready");
+assert.equal(opened.cycle.ci_state, "pending");
+assert.equal(store.planReviewRequest(PROJECT, openedTarget).kind, "review_request");
+ok(true, "non-draft readiness opens one current exact-PR/SHA cycle without inheriting draft authority");
+
 assert.equal(store.planReviewRequest(PROJECT, canonical), null);
 cycle = store.setCiState(PROJECT, canonical, "pending");
 assert.equal(cycle.ci_state, "pending");
@@ -119,6 +171,21 @@ assert.match(dispatch.correlation_id, /^rc_evt_[a-f0-9]{40}$/);
 assert.equal(store.planReviewRequest(PROJECT, canonical).correlation_id, dispatch.correlation_id);
 assert.equal(store.planReviewRequest(PROJECT, canonical).created, false);
 ok(true, "ready plus pending CI records one stable server-transport correlation without sending prose");
+
+// Reminder state is bounded to one current-cycle record per missing reviewer.
+// It cannot fan out from chat prose or grow a second reminder for the role.
+const reminderProject = "project-reminder";
+const reminderTarget = target({ project_id: reminderProject, pr: { number: 97, exact_sha: SHA_B } });
+const reminderStore = new ReviewCycleStore({ rootDir: ROOT, now, reviewLeaseMs: 0 });
+reminderStore.reconcile(reminderProject, reminderTarget);
+reminderStore.setCiState(reminderProject, reminderTarget, "pending");
+reminderStore.planReviewRequest(reminderProject, reminderTarget);
+const reminderRe1 = reminderStore.planReviewReminder(reminderProject, reminderTarget, "re1");
+assert.equal(reminderRe1.created, true);
+assert.equal(reminderStore.planReviewReminder(reminderProject, reminderTarget, "re1").created, false);
+assert.equal(reminderStore.planReviewReminder(reminderProject, reminderTarget, "re2").created, true);
+assert.deepEqual(Object.keys(reminderStore.current(reminderProject, reminderTarget).events.review_reminder).sort(), ["re1", "re2"]);
+ok(true, "review reminders remain one bounded role-specific record per current cycle");
 
 // Shared GitHub principals cannot claim each other's review object: each role
 // gets a private one-time cycle nonce, which is consumed against one review id.
@@ -312,6 +379,48 @@ assert.throws(
   (error) => error.code === "review_cycle_store_invalid",
 );
 ok(true, "corrupt cycle state is rejected without a recovery overwrite");
+
+// A V3 persisted document is migrated only after proving its old derivation.
+// The V4 canonical WorkItemRef `repoKey` participates in both target and slot
+// digests, and existing exact role receipts are rebound to that same target.
+const migrationProject = "project-migration";
+const migrationTarget = target({ project_id: migrationProject, pr: { number: 102, exact_sha: SHA_B } });
+const migrationStore = freshStore();
+migrationStore.reconcile(migrationProject, migrationTarget);
+migrationStore.setCiState(migrationProject, migrationTarget, "pass");
+migrationStore.planReviewRequest(migrationProject, migrationTarget);
+migrationStore.recordReviewReceipt(migrationProject, migrationTarget, receipt("re1", 601, "approved", {
+  target_identity_digest: migrationTarget.target_identity_digest,
+}));
+const migrationPath = migrationStore.pathFor(migrationProject);
+const v3 = JSON.parse(fs.readFileSync(migrationPath, "utf8"));
+const migrationCycleId = Object.keys(v3.cycles)[0];
+const v3Cycle = v3.cycles[migrationCycleId];
+const legacyTargetDigest = legacyV3TargetDigest(v3Cycle.target);
+const legacySlotDigest = legacyV3SlotDigest(v3Cycle.target);
+v3.version = 3;
+v3Cycle.version = 3;
+v3Cycle.target_identity_digest = legacyTargetDigest;
+v3Cycle.slot_digest = legacySlotDigest;
+v3Cycle.receipts.re1.target_identity_digest = legacyTargetDigest;
+v3.slots = { [legacySlotDigest]: migrationCycleId };
+fs.writeFileSync(migrationPath, `${JSON.stringify(v3)}\n`, { encoding: "utf8", mode: 0o600, flag: "w" });
+const migrated = freshStore().load(migrationProject);
+const migratedCycle = migrated.cycles[migrationCycleId];
+assert.equal(migrated.version, REVIEW_CYCLE_STORE_VERSION);
+assert.equal(migratedCycle.target_identity_digest, targetIdentityDigest(migrationTarget.identity));
+assert.equal(migratedCycle.slot_digest, targetSlotDigest(migrationTarget.identity));
+assert.equal(migratedCycle.receipts.re1.target_identity_digest, migrationTarget.target_identity_digest);
+assert.equal(migrated.slots[migrationTarget.slot_digest], migrationCycleId);
+assert.equal(freshStore().current(migrationProject, migrationTarget).cycle_id, migrationCycleId);
+const malformedV3 = JSON.parse(JSON.stringify(v3));
+malformedV3.cycles[migrationCycleId].target_identity_digest = "0".repeat(64);
+fs.writeFileSync(migrationPath, `${JSON.stringify(malformedV3)}\n`, { encoding: "utf8", mode: 0o600, flag: "w" });
+assert.throws(
+  () => freshStore().load(migrationProject),
+  (error) => error.code === "review_cycle_store_invalid",
+);
+ok(true, "V3 review cycles migrate only from verified legacy digests into canonical WorkItemRef exact-SHA identity");
 
 const terminal = restarted.markTerminal(PROJECT, ciLess);
 assert.equal(terminal.state, "terminal");
