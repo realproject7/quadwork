@@ -211,29 +211,82 @@ class BatchRequestRuntime {
     return result(snapshot, target, false, "none", []);
   }
 
-  // One caller-controlled attempt: recover, read canonical facts, reconcile,
-  // durably apply the exact result, then deliver at most one closed Head note.
-  // There is no retry after a callback uncertainty because the committed
-  // delivery record makes attempting it again indistinguishable from a
-  // duplicate external delivery.
-  reconcile(input) {
+  // One caller-controlled async attempt. State-store operations and the
+  // canonical subscription projection remain synchronous local boundaries;
+  // the one coordination Issue read and one Head delivery callback may return
+  // either a value or a Promise. There is no retry after a callback
+  // uncertainty because the committed delivery record makes attempting it
+  // again indistinguishable from a duplicate external delivery.
+  async reconcile(input) {
     const target = runtimeInput(input, "invalid_batch_request_runtime_reconcile");
     const recovered = this.stateStore.readRecoverySnapshot(target);
-    const watcher = createBatchRequestWatcher({
-      resolveCanonicalSubscription: this.resolveCanonicalSubscription,
-      fetchIssueRecords: (watcherRequest) => {
-        const request = freeze({
-          version: VERSION,
-          target: freeze(clone(target)),
-          coordination_repository: repository(watcherRequest.coordination_repository, "invalid_batch_request_runtime_watcher_request"),
-          request_label: watcherRequest.request_label,
-          cache: cacheFact(recovered, watcherRequest.coordination_repository),
-        });
-        let response;
-        try { response = this.readCoordinationIssues(request); }
-        catch { fail("batch_request_runtime_issue_read_unavailable", "canonical issue read failed"); }
-        return assertIssueReadResponse(response, request);
+
+    // The existing watcher is intentionally synchronous. Preflight it with an
+    // empty, locally constructed response to prove the fixed route and capture
+    // the one canonical Issue-read request before awaiting an external seam.
+    // Disabled/archived subscriptions never reach that seam.
+    let preflightRequest = null;
+    let subscriptionFact = null;
+    const preflightWatcher = createBatchRequestWatcher({
+      resolveCanonicalSubscription: (request) => {
+        const fact = this.resolveCanonicalSubscription(request);
+        if (fact && typeof fact.then === "function") {
+          fail("batch_request_runtime_subscription_async_unsupported", "canonical subscription accessor must be synchronous");
+        }
+        subscriptionFact = clone(fact);
+        return fact;
       },
+      fetchIssueRecords: (watcherRequest) => {
+        preflightRequest = freeze(clone(watcherRequest));
+        return freeze({
+          version: WATCHER_VERSION,
+          target: clone(watcherRequest.target),
+          coordination_repository: watcherRequest.coordination_repository,
+          request_label: watcherRequest.request_label,
+          issues: [],
+        });
+      },
+    });
+    const preflight = preflightWatcher.reconcile({
+      version: WATCHER_VERSION,
+      target: clone(target),
+      state: recovered.subscription_state,
+    });
+    if (preflightRequest === null) {
+      const applied = this.stateStore.applyWatcherResult({
+        expected: freeze({ ...target, revision: recovered.revision }),
+        result: preflight,
+      });
+      return result(applied.snapshot, target, applied.persisted, "none", preflight.internal_diagnostics.map((entry) => entry.code));
+    }
+
+    const readRequest = freeze({
+      version: VERSION,
+      target: freeze(clone(target)),
+      coordination_repository: repository(preflightRequest.coordination_repository, "invalid_batch_request_runtime_watcher_request"),
+      request_label: preflightRequest.request_label,
+      cache: cacheFact(recovered, preflightRequest.coordination_repository),
+    });
+    let issueResponse;
+    try { issueResponse = await this.readCoordinationIssues(readRequest); }
+    catch { fail("batch_request_runtime_issue_read_unavailable", "canonical issue read failed"); }
+    const fetched = assertIssueReadResponse(issueResponse, readRequest);
+
+    let confirmedSubscription;
+    try {
+      confirmedSubscription = this.resolveCanonicalSubscription(freeze({ version: WATCHER_VERSION, target: freeze(clone(target)) }));
+    } catch {
+      fail("batch_request_runtime_subscription_unavailable", "canonical subscription accessor failed during Issue read");
+    }
+    if (confirmedSubscription && typeof confirmedSubscription.then === "function") {
+      fail("batch_request_runtime_subscription_async_unsupported", "canonical subscription accessor must be synchronous");
+    }
+    if (!sameJson(confirmedSubscription, subscriptionFact)) {
+      fail("batch_request_runtime_subscription_changed_during_read", "canonical subscription changed during Issue read");
+    }
+    const watcher = createBatchRequestWatcher({
+      resolveCanonicalSubscription: () => confirmedSubscription,
+      fetchIssueRecords: () => fetched,
     });
     const reconciled = watcher.reconcile({
       version: WATCHER_VERSION,
@@ -250,7 +303,7 @@ class BatchRequestRuntime {
     const notification = assertHeadNotification(applied.head_plan, target);
     const request = freeze({ version: VERSION, target: freeze(clone(target)), notification });
     try {
-      const receipt = this.deliverHeadNotification(request);
+      const receipt = await this.deliverHeadNotification(request);
       assertDeliveryReceipt(receipt);
     } catch (error) {
       if (error instanceof BatchRequestRuntimeError && error.code === "invalid_batch_request_runtime_delivery_receipt") {

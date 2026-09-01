@@ -17,12 +17,12 @@ const SOURCE_INSTALLATION = "installation_source_123456";
 const REQUEST_A = "550e8400-e29b-41d4-a716-446655440000";
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
-function code(fn, expected) {
-  assert.throws(fn, (error) => error instanceof BatchRequestRuntimeError && error.code === expected);
+async function code(fn, expected) {
+  await assert.rejects(fn, (error) => error instanceof BatchRequestRuntimeError && error.code === expected);
 }
-function withDirectory(run) {
+async function withDirectory(run) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-batch-request-runtime-"));
-  try { return run(directory); } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  try { return await run(directory); } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
 function authority(overrides = {}) {
   return {
@@ -132,10 +132,12 @@ function ok(value, message) {
   console.log(`  PASS: ${message}`);
 }
 
+async function main() {
+
 // Explicit initialization and recovery bind only a project identity and
 // durable counters. A recreated runtime sees the same store without a new
 // notification opportunity.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   const first = runtime(directory);
   const initialized = first.runtime.initialize(input());
   assert.deepEqual(initialized, {
@@ -160,9 +162,12 @@ withDirectory((directory) => {
 // The Head callback receives the closed immutable plan only after the state
 // store applies the exact CAS result. A duplicate reconciliation has no plan
 // and therefore cannot notify Head a second time.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   const lane = runtime(directory, {
-    onDelivery(request) {
+    async onIssueRead(request) {
+      return issueResponse(request, [issue()]);
+    },
+    async onDelivery(request) {
       assert.deepEqual(Object.keys(request).sort(), ["notification", "target", "version"]);
       assert.equal(request.notification.kind, "BATCH REQUEST");
       assert.deepEqual(request.notification.recipients, ["head"]);
@@ -171,12 +176,12 @@ withDirectory((directory) => {
     },
   });
   lane.runtime.initialize(input());
-  const first = lane.runtime.reconcile(input());
+  const first = await lane.runtime.reconcile(input());
   assert.equal(first.snapshot.revision, 1);
   assert.equal(first.persisted, true);
   assert.equal(first.delivery, "delivered");
   assert.deepEqual(first.diagnostics, []);
-  const duplicate = lane.runtime.reconcile(input());
+  const duplicate = await lane.runtime.reconcile(input());
   assert.equal(duplicate.delivery, "none");
   assert.equal(duplicate.persisted, false);
   assert.equal(lane.calls.delivery, 1);
@@ -186,24 +191,49 @@ withDirectory((directory) => {
 // The callback may have accepted a notification before reporting an error.
 // The runtime commits first and then treats that boundary as at-most-once:
 // after ambiguity it does not issue an automatic replacement notification.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   const failing = runtime(directory, {
-    onDelivery() { throw new Error("transport ended after write"); },
+    async onDelivery() { throw new Error("transport ended after write"); },
   });
   failing.runtime.initialize(input());
-  code(() => failing.runtime.reconcile(input()), "batch_request_notification_delivery_ambiguous");
+  await code(() => failing.runtime.reconcile(input()), "batch_request_notification_delivery_ambiguous");
   assert.equal(failing.calls.delivery, 1);
   assert.deepEqual(failing.runtime.recover(input()).snapshot, { revision: 1, record_count: 1, has_cursor: true });
   const restarted = runtime(directory);
-  const retry = restarted.runtime.reconcile(input());
+  const retry = await restarted.runtime.reconcile(input());
   assert.equal(retry.delivery, "none");
   assert.equal(restarted.calls.delivery, 0);
   ok(true, "a failed callback is typed as delivery ambiguity and durable state prevents automatic redelivery");
 });
 
+// Promise rejection at the Issue-read boundary happens before the CAS, while
+// an invalid asynchronous delivery acknowledgement happens after it. Both are
+// explicitly fail-closed, and neither path schedules a second callback.
+await withDirectory(async (directory) => {
+  const unavailableRead = runtime(directory, {
+    async onIssueRead() { throw new Error("conditional read unavailable"); },
+  });
+  unavailableRead.runtime.initialize(input());
+  await code(() => unavailableRead.runtime.reconcile(input()), "batch_request_runtime_issue_read_unavailable");
+  assert.equal(unavailableRead.calls.issue, 1);
+  assert.equal(unavailableRead.calls.delivery, 0);
+  assert.deepEqual(unavailableRead.runtime.recover(input()).snapshot, { revision: 0, record_count: 0, has_cursor: false });
+
+  const invalidDelivery = runtime(path.join(directory, "invalid-delivery"), {
+    async onDelivery() { return { version: VERSION, accepted: false }; },
+  });
+  invalidDelivery.runtime.initialize(input());
+  await code(() => invalidDelivery.runtime.reconcile(input()), "batch_request_notification_delivery_ambiguous");
+  assert.equal(invalidDelivery.calls.delivery, 1);
+  const afterInvalid = runtime(path.join(directory, "invalid-delivery"));
+  assert.equal((await afterInvalid.runtime.reconcile(input())).delivery, "none");
+  assert.equal(afterInvalid.calls.delivery, 0);
+  ok(true, "async read rejection and invalid async delivery acknowledgement cannot create duplicate transport calls");
+});
+
 // A concurrent writer makes the CAS stale before notification. The callback
 // does not run, and the newly durable record still prevents a later replay.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   const base = createBatchRequestStateStore({ config_dir: directory, fs });
   const racingStore = {
     initialize: base.initialize,
@@ -215,10 +245,10 @@ withDirectory((directory) => {
   };
   const lane = runtime(directory, { stateStore: racingStore });
   lane.runtime.initialize(input());
-  assert.throws(() => lane.runtime.reconcile(input()), (error) => error && error.code === "stale_batch_request_state_store_revision");
+  await assert.rejects(() => lane.runtime.reconcile(input()), (error) => error && error.code === "stale_batch_request_state_store_revision");
   assert.equal(lane.calls.delivery, 0);
   const recovered = runtime(directory);
-  assert.equal(recovered.runtime.reconcile(input()).delivery, "none");
+  assert.equal((await recovered.runtime.reconcile(input())).delivery, "none");
   assert.equal(recovered.calls.delivery, 0);
   ok(true, "stale CAS fails before any Head callback and cannot be replayed after recovery");
 });
@@ -226,22 +256,22 @@ withDirectory((directory) => {
 // Each pre-delivery negative is fail-closed. Archive and disabled facts avoid
 // the issue read entirely; a PR-shaped record may advance only its durable
 // cursor and never reaches the Head transport.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   const archived = runtime(directory, { subscription: subscription({ archived: true }) });
   archived.runtime.initialize(input());
-  const archivedResult = archived.runtime.reconcile(input());
+  const archivedResult = await archived.runtime.reconcile(input());
   assert.equal(archivedResult.diagnostics[0].code, "batch_request_subscription_archived");
   assert.deepEqual(archived.calls, { subscription: 1, issue: 0, delivery: 0, caches: [], notifications: [] });
 
   const disabled = runtime(path.join(directory, "disabled"), { subscription: subscription({ enabled: false }) });
   disabled.runtime.initialize(input());
-  const disabledResult = disabled.runtime.reconcile(input());
+  const disabledResult = await disabled.runtime.reconcile(input());
   assert.equal(disabledResult.diagnostics[0].code, "batch_request_subscription_disabled");
   assert.equal(disabled.calls.issue, 0);
 
   const pullRequest = runtime(path.join(directory, "pr"), { issues: [issue({ pull_request: { url: "https://api.github.com/repos/acme/coordination/pulls/73" } })] });
   pullRequest.runtime.initialize(input());
-  const prResult = pullRequest.runtime.reconcile(input());
+  const prResult = await pullRequest.runtime.reconcile(input());
   assert.equal(prResult.diagnostics[0].code, "batch_request_pull_request_unsupported");
   assert.equal(prResult.delivery, "none");
   assert.equal(pullRequest.calls.delivery, 0);
@@ -250,17 +280,17 @@ withDirectory((directory) => {
 
 // Canonical accessors cannot change the target, repository, label, or cached
 // request context. The adapter strips the cache echo before the pure watcher.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   const mismatchedSubscription = runtime(directory, { subscription: subscription({ target: { installation_id: TARGET.installation_id, project_id: "other-project" } }) });
   mismatchedSubscription.runtime.initialize(input());
-  assert.throws(() => mismatchedSubscription.runtime.reconcile(input()), (error) => error && error.code === "batch_request_watcher_target_mismatch");
+  await assert.rejects(() => mismatchedSubscription.runtime.reconcile(input()), (error) => error && error.code === "batch_request_watcher_target_mismatch");
   assert.equal(mismatchedSubscription.calls.issue, 0);
 
   const malformedRead = runtime(path.join(directory, "malformed"), {
     onIssueRead(request) { return issueResponse(request, [issue()], { cache: { etag: "other", cursor: null } }); },
   });
   malformedRead.runtime.initialize(input());
-  assert.throws(() => malformedRead.runtime.reconcile(input()), (error) => error && error.code === "batch_request_watcher_fetch_unavailable");
+  await assert.rejects(() => malformedRead.runtime.reconcile(input()), (error) => error && error.code === "invalid_batch_request_runtime_issue_read");
   assert.equal(malformedRead.calls.delivery, 0);
   ok(true, "identity and cache/context mutations fail closed before durable application or notification");
 });
@@ -268,7 +298,7 @@ withDirectory((directory) => {
 // An ETag/cursor-only edit is supplied through the one fixed-label issue read
 // with its previous cache fact. It updates durable cursor state but retains the
 // delivered authority record and cannot emit another Head notification.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   let revision = 0;
   const lane = runtime(directory, {
     onIssueRead(request) {
@@ -278,9 +308,9 @@ withDirectory((directory) => {
     },
   });
   lane.runtime.initialize(input());
-  assert.equal(lane.runtime.reconcile(input()).delivery, "delivered");
+  assert.equal((await lane.runtime.reconcile(input())).delivery, "delivered");
   revision = 1;
-  const contextOnly = lane.runtime.reconcile(input());
+  const contextOnly = await lane.runtime.reconcile(input());
   assert.equal(contextOnly.delivery, "none");
   assert.equal(contextOnly.persisted, true);
   assert.equal(contextOnly.diagnostics[0].code, "batch_request_duplicate");
@@ -290,7 +320,7 @@ withDirectory((directory) => {
 
 // The request id represents immutable authority. A digest mutation becomes a
 // durable terminal record; it cannot replace a notification already admitted.
-withDirectory((directory) => {
+await withDirectory(async (directory) => {
   let changed = false;
   const lane = runtime(directory, {
     onIssueRead(request) {
@@ -298,9 +328,9 @@ withDirectory((directory) => {
     },
   });
   lane.runtime.initialize(input());
-  assert.equal(lane.runtime.reconcile(input()).delivery, "delivered");
+  assert.equal((await lane.runtime.reconcile(input())).delivery, "delivered");
   changed = true;
-  const mutated = lane.runtime.reconcile(input());
+  const mutated = await lane.runtime.reconcile(input());
   assert.equal(mutated.delivery, "none");
   assert.equal(mutated.diagnostics[0].code, "batch_request_authority_mutated_after_delivery");
   assert.equal(lane.calls.delivery, 1);
@@ -318,3 +348,9 @@ withDirectory((directory) => {
 }
 
 console.log(`\n${passed} runtime assertions passed`);
+}
+
+main().catch((error) => {
+  console.error(error.stack || error);
+  process.exitCode = 1;
+});
