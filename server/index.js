@@ -32,7 +32,10 @@ const { registerResourceHttp } = require("./resource-http");
 const { createHeadControlRuntime } = require("./head-control-runtime");
 const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identity-resolver");
 const { createManagedWorktreeObserver } = require("./work-task-managed-worktree");
+const { createRegisteredWorkTaskBaseObserver } = require("./registered-work-task-base");
 const { createWorkTaskDevCandidateService } = require("./work-task-dev-candidate-service");
+const { createWorkTaskBuildAssignmentService } = require("./work-task-build-assignment-service");
+const { createWorkTaskBuildRuntime } = require("./work-task-build-runtime");
 const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
 const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 const { createWorkTaskReviewRuntime } = require("./work-task-review-runtime");
@@ -677,6 +680,31 @@ function devCandidateServiceForProject(projectId) {
   return createWorkTaskDevCandidateService({ config_dir: path.dirname(CONFIG_PATH), fs, managed_worktree: observer, read_canonical_installed_state: readCanonicalInstalledState });
 }
 
+// #1058 M9: build bases are observed only from the registered clone for the
+// authenticated Head's project.  The WorkTask request contributes no cwd,
+// repository remote, branch, or base SHA.
+function registeredWorkTaskBaseForProject(projectId) {
+  const cfg = readConfig();
+  const project = cfg.projects?.find((entry) => entry?.id === projectId && entry.archived !== true);
+  if (!project) throw new TypeError("V2 build project is unavailable");
+  const primary = primaryRepository(project);
+  const primaryAgentCwds = {};
+  if (primary) {
+    for (const role of ["head", "re1", "re2", "dev"]) {
+      const cwd = project.agents?.[role]?.cwd;
+      if (typeof cwd === "string" && path.isAbsolute(cwd)) primaryAgentCwds[role] = cwd;
+    }
+  }
+  return createRegisteredWorkTaskBaseObserver({
+    repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
+    canonicalize_path: (request) => fs.realpathSync(request.path),
+    run_git: (request) => {
+      try { return { ok: true, output: execFileSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
+      catch { return { ok: false, output: "" }; }
+    },
+  });
+}
+
 function activeDevCandidatePrincipal(req) {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   const principal = fileChat.resolveShimPrincipal(token);
@@ -707,6 +735,25 @@ const workTaskReviewRuntime = createWorkTaskReviewRuntime({
   create_live_identity_resolver: createLiveWorkTaskIdentityResolver,
   create_review_service: createWorkTaskIndependentReviewService,
   create_reconciliation_service: createWorkTaskReviewReconciliationService,
+});
+
+// #1058 M9: a build assignment is a separate fixed Head-token action, not a
+// fifth Head-control-plane command.  The transport binds one live WorkTask to
+// its observed registered base and requires the assigned Dev session to be
+// verified before durable state can transition to building.
+const workTaskBuildRuntime = createWorkTaskBuildRuntime({
+  config_dir: path.dirname(CONFIG_PATH),
+  fs,
+  capture_project_admission: captureProjectAdmission,
+  is_admission_current: isAdmissionCurrent,
+  resolve_shim_principal: fileChat.resolveShimPrincipal,
+  agent_sessions: agentSessions,
+  read_live_batch_context: routes.readLiveBatchContext,
+  read_repository_state: routes.repositoryState,
+  read_cached_repository_snapshot: (cacheRepo) => routes._graphqlCache.get(cacheRepo),
+  create_live_identity_resolver: createLiveWorkTaskIdentityResolver,
+  create_assignment_service: createWorkTaskBuildAssignmentService,
+  read_registered_base: (projectId, request) => registeredWorkTaskBaseForProject(projectId).readRegisteredBase(request),
 });
 
 // #1047: Head's recovery cursor secret is stable across Head process/token
@@ -828,6 +875,18 @@ app.post("/api/work-task-candidate", (req, res) => {
     return res.json({ ok: true, ...result });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "work_task_candidate_unavailable" });
+  }
+});
+
+// #1058 M9: Head can request only an exact current task's server-owned build
+// assignment.  Its token fixes project/role; the runtime independently reads
+// the registered base and verifies the assigned Dev before it persists.
+app.post("/api/work-task-build", (req, res) => {
+  const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
+  try {
+    return res.json({ ok: true, ...workTaskBuildRuntime.assign({ token, body: req.body }) });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "work_task_build_unavailable" });
   }
 });
 

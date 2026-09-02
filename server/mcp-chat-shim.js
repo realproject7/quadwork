@@ -147,6 +147,17 @@ const SUBMIT_WORK_TASK_CANDIDATE_TOOL = {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
 
+const ASSIGN_WORK_TASK_BUILD_TOOL = {
+  name: "assign_work_task_build",
+  description: "Assign one exact current WorkTask to the verified Dev role from the server-observed registered base. The server derives the project, base SHA, and assignment identity; this does not create a worktree, push, create a PR, or start CI.",
+  inputSchema: {
+    type: "object",
+    properties: { event_id: { type: "string" }, work_task_ref: { type: "object" } },
+    required: ["event_id", "work_task_ref"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
 const OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL = {
   name: "open_work_task_independent_review",
   description: "Open the authenticated Head's exact WorkTask candidate for two independent reviewers. The server derives both reviewer roles, their current epoch, the project, and opening time; this does not reconcile, publish, or merge.",
@@ -250,7 +261,7 @@ function parseChatResumeArguments(value) {
 function toolsForActor() {
   if (!PROJECT_ROLES.has(AGENT)) return CHAT_TOOLS;
   const tools = [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL, READ_CI_EVIDENCE_TOOL];
-  if (AGENT === "head" && TOKEN) tools.push(CHAT_RESUME_TOOL, OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL, RECONCILE_WORK_TASK_REVIEW_TOOL);
+  if (AGENT === "head" && TOKEN) tools.push(CHAT_RESUME_TOOL, ASSIGN_WORK_TASK_BUILD_TOOL, OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL, RECONCILE_WORK_TASK_REVIEW_TOOL);
   if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL, SUBMIT_WORK_TASK_CANDIDATE_TOOL);
   if (AGENT === "re1" || AGENT === "re2") tools.push(ISSUE_REVIEW_CYCLE_NONCE_TOOL, SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL, SUBMIT_WORK_TASK_REVIEW_RECEIPT_TOOL);
   return tools;
@@ -384,6 +395,13 @@ async function handleToolCall(id, name, params) {
       if (AGENT !== "dev" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: submit_work_task_candidate");
       const res = await httpRequest("POST", "/api/work-task-candidate", params, { "X-Chat-Token": TOKEN });
       if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "assign_work_task_build") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: assign_work_task_build");
+      const res = await httpRequest("POST", "/api/work-task-build", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask build assignment unavailable");
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
     }
 

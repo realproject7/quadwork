@@ -27,6 +27,7 @@ let serverPort;
 const issueFetches = [];
 const chatResumeRequests = [];
 const workTaskReviewRequests = [];
+const workTaskBuildRequests = [];
 let chatResumeFailure = false;
 let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
@@ -126,6 +127,12 @@ function startTestServer() {
       workTaskReviewRequests.push({ kind: "open", token: req.headers["x-chat-token"], body: req.body });
       res.json({ ok: true, outcome: "opened" });
     });
+    app.post("/api/work-task-build", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
+      workTaskBuildRequests.push({ token: req.headers["x-chat-token"], body: req.body });
+      res.json({ ok: true, outcome: "assigned" });
+    });
     app.post("/api/work-task-review/receipt", (req, res) => {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
       if (!principal || principal.projectId !== PROJECT || !["re1", "re2"].includes(principal.agentId)) return res.status(403).json({ ok: false });
@@ -218,6 +225,7 @@ async function runTests() {
   assert(toolNames.includes("submit_work_task_candidate"), "tools/list exposes the local-only WorkTask candidate receipt only to dev");
   assert(toolNames.includes("read_ci_evidence"), "tools/list exposes redacted CI evidence reads to dev");
   assert(!toolNames.includes("chat_resume"), "tools/list hides Head-only chat_resume from dev");
+  assert(!toolNames.includes("assign_work_task_build"), "tools/list hides Head-only WorkTask build assignment from dev");
   assert(!toolNames.includes("open_work_task_independent_review"), "tools/list hides Head-only WorkTask review opening from dev");
   assert(!toolNames.includes("reconcile_work_task_review"), "tools/list hides Head-only WorkTask review reconciliation from dev");
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
@@ -242,6 +250,8 @@ async function runTests() {
     const reviewerRole = role === "re1" || role === "re2";
     assert(roleToolNames.includes("chat_resume") === (role === "head"),
       `tools/list exposes chat_resume only to authenticated Head role ${role}`);
+    assert(roleToolNames.includes("assign_work_task_build") === (role === "head"),
+      `tools/list exposes WorkTask build assignment only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("open_work_task_independent_review") === (role === "head"),
       `tools/list exposes WorkTask review opening only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("reconcile_work_task_review") === (role === "head"),
@@ -269,6 +279,17 @@ async function runTests() {
     "chat_resume forwards only the exact cursor and bounded limit arguments");
   assert(chatResumeRequests[0].headers.token === HEAD_RESUME_TOKEN && chatResumeRequests[0].headers.sender === undefined,
     "chat_resume authenticates with the existing shim token only");
+
+  const buildArguments = { event_id: "assign_build_001", work_task_ref: { task_key: "build" } };
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 210, method: "tools/call", params: {
+    name: "assign_work_task_build", arguments: buildArguments,
+  } });
+  const buildResp = await readResponse(headShim);
+  assert(JSON.parse(buildResp.result?.content?.[0]?.text || "{}").outcome === "assigned",
+    "authenticated Head can call the fixed WorkTask build assignment endpoint");
+  assert(workTaskBuildRequests.length === 1 && workTaskBuildRequests[0].token === HEAD_RESUME_TOKEN &&
+    JSON.stringify(workTaskBuildRequests[0].body) === JSON.stringify(buildArguments),
+  "Head build assignment forwards only its typed arguments and existing shim token");
 
   const openArguments = { event_id: "open_review_001", work_task_ref: { task_key: "review" }, attempt: "attempt_001", round: 1 };
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 211, method: "tools/call", params: {
@@ -312,6 +333,13 @@ async function runTests() {
   const hiddenResume = await readResponse(shim);
   assert(hiddenResume.error?.code === -32601, "non-Head hidden chat_resume calls are denied locally");
   assert(chatResumeRequests.length === 1, "non-Head chat_resume calls never reach the fixed endpoint");
+
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 230, method: "tools/call", params: {
+    name: "assign_work_task_build", arguments: buildArguments,
+  } });
+  const hiddenBuild = await readResponse(shim);
+  assert(hiddenBuild.error?.code === -32601, "non-Head hidden WorkTask build assignment calls are denied locally");
+  assert(workTaskBuildRequests.length === 1, "non-Head build assignment calls never reach the fixed endpoint");
 
   sendJsonRpc(shim, { jsonrpc: "2.0", id: 231, method: "tools/call", params: {
     name: "open_work_task_independent_review", arguments: openArguments,
