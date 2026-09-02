@@ -1078,6 +1078,7 @@ const {
   CiEvidenceError,
   CiEvidenceStore,
   createCiLessEvidenceSubmitHandler,
+  createDeliveryCandidateCiLessEvidenceSubmitHandler,
   createCiLessEvidenceReadHandler,
 } = require("./ci-less-evidence");
 const { ReviewCycleStore, deriveLegacyReviewTarget } = require("./review-cycle");
@@ -1357,6 +1358,13 @@ router.post("/api/ci-evidence", createCiLessEvidenceSubmitHandler({
   resolveCurrentTarget: resolveCurrentCiEvidenceTarget,
   store: _ciEvidenceStore,
 }));
+router.post("/api/delivery-candidate/ci-evidence", createDeliveryCandidateCiLessEvidenceSubmitHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  resolveCurrentTarget: resolveCurrentDeliveryCandidateCiEvidenceTarget,
+  store: _ciEvidenceStore,
+}));
 router.post("/api/ci-evidence/read", createCiLessEvidenceReadHandler({
   resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
   store: _ciEvidenceStore,
@@ -1406,6 +1414,29 @@ function deliveryFinalReviewContext(projectId, deliveryCandidateRef, prNumber) {
     throw new Error("delivery_final_review_binding_mismatch");
   }
   return { target, binding, pr: observedPr };
+}
+
+function deliveryCandidateCiEvidenceTarget(current) {
+  return {
+    version: 1,
+    target_kind: DELIVERY_REVIEW_TARGET_KIND,
+    project_id: current.target.identity.project_id,
+    installation_id: current.target.identity.installation_id,
+    repo_key: current.target.identity.repo_key,
+    repo: current.target.identity.repo,
+    delivery_candidate_ref: current.target.identity.delivery_candidate_ref,
+    delivery_manifest_digest: current.target.identity.delivery_manifest_digest,
+    pr_number: current.target.identity.pr_number,
+    exact_sha: current.target.identity.exact_sha,
+    policy_version: current.target.identity.policy_version,
+    policy: current.binding.ci_policy ?? null,
+  };
+}
+
+function resolveCurrentDeliveryCandidateCiEvidenceTarget(projectId, request) {
+  return deliveryCandidateCiEvidenceTarget(
+    deliveryFinalReviewContext(projectId, request.delivery_candidate_ref, request.pr_number),
+  );
 }
 
 function targetFromStoredReviewCycle(projectId, cycle) {
@@ -1481,16 +1512,26 @@ router.post("/api/delivery-candidate/final-review", (req, res) => {
     const current = deliveryFinalReviewContext(principal.projectId, body.delivery_candidate_ref, body.pr_number);
     const pre = _reviewCycleStore.reconcile(principal.projectId, current.target).cycle;
     const evidence = current.pr.checkEvidence;
-    const ci = evidence ? evaluateCiEvidence({
-      policy: current.binding.ci_policy ?? null,
-      exact_sha: current.target.identity.exact_sha,
-      observed_at: evidence.observed_at,
-      first_observed_at: pre.created_at,
-      source_status: evidence.source_status,
-      check_runs: evidence.check_runs,
-      ci_less_evidence: null,
-      now: Date.now(),
-    }) : { state: "unknown" };
+    const policy = current.binding.ci_policy ?? null;
+    const ci = policy?.mode === "ci-less"
+      ? evaluateCiEvidence({
+        policy,
+        exact_sha: current.target.identity.exact_sha,
+        observed_at: evidence?.observed_at || new Date().toISOString(),
+        source_status: "ok",
+        ci_less_evidence: _ciEvidenceStore.readByIdentity(deliveryCandidateCiEvidenceTarget(current)),
+        now: Date.now(),
+      })
+      : evidence ? evaluateCiEvidence({
+        policy,
+        exact_sha: current.target.identity.exact_sha,
+        observed_at: evidence.observed_at,
+        first_observed_at: pre.created_at,
+        source_status: evidence.source_status,
+        check_runs: evidence.check_runs,
+        ci_less_evidence: null,
+        now: Date.now(),
+      }) : { state: "unknown" };
     const observation = _reviewCycleDispatcher.observe({ project_id: principal.projectId, target: current.target, ci_state: ci.state, archived: false });
     if (getProjectChatMode(principal.projectId) === "file" && isAdmissionCurrent(admission) && !isProjectArchived(principal.projectId)) {
       _reviewCycleDispatcher.deliver(principal.projectId, observation,

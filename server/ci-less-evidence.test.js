@@ -7,6 +7,7 @@ const path = require("path");
 const {
   CiEvidenceStore,
   createCiLessEvidenceSubmitHandler,
+  createDeliveryCandidateCiLessEvidenceSubmitHandler,
   createCiLessEvidenceReadHandler,
 } = require("./ci-less-evidence");
 
@@ -14,6 +15,17 @@ const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-ci-less-"));
 const SHA = "b".repeat(40);
 const REVISION = "c".repeat(64);
 const POLICY = { version: 1, mode: "ci-less", evidence_keys: ["unit", "typecheck"] };
+const DELIVERY_REF = Object.freeze({
+  version: 1,
+  installation_id: "installation_1234567890abcdef",
+  project_id: "p1",
+  repository_key: "web",
+  batch_manifest_digest: "d".repeat(64),
+  delivery_mode: "integrated",
+  base_sha: "a".repeat(40),
+  result_sha: SHA,
+  cut_id: "cut_ci_delivery",
+});
 const principalByToken = new Map([
   ["dev-token", { projectId: "p1", agentId: "dev" }],
   ["head-token", { projectId: "p1", agentId: "head" }],
@@ -22,6 +34,7 @@ const principalByToken = new Map([
 ]);
 let generation = 4;
 let targetMode = "current";
+let deliveryTargetMode = "current";
 const store = new CiEvidenceStore({ rootDir: ROOT, now: () => new Date("2026-08-31T01:02:03.000Z") });
 
 function responseCapture() {
@@ -73,11 +86,56 @@ function targetFor(projectId, submitted) {
   return target;
 }
 
+function deliveryRequest(results, overrides = {}) {
+  return {
+    headers: { "x-chat-token": "dev-token" },
+    query: {},
+    body: {
+      delivery_candidate_ref: DELIVERY_REF,
+      pr_number: 100,
+      exact_sha: SHA,
+      policy_version: 1,
+      results: results || [
+        { key: "unit", outcome: "pass", exit_code: 0, evidence_ref: "unit:sha256:delivery" },
+        { key: "typecheck", outcome: "pass", exit_code: 0, evidence_ref: "typecheck:sha256:delivery" },
+      ],
+      ...overrides,
+    },
+  };
+}
+
+function deliveryTargetFor(projectId, submitted) {
+  const target = {
+    version: 1,
+    target_kind: "delivery_candidate_pr",
+    project_id: projectId,
+    installation_id: "installation_1234567890abcdef",
+    repo_key: "web",
+    repo: "Acme/Web",
+    delivery_candidate_ref: submitted.delivery_candidate_ref,
+    delivery_manifest_digest: "e".repeat(64),
+    pr_number: submitted.pr_number,
+    exact_sha: submitted.exact_sha,
+    policy_version: submitted.policy_version,
+    policy: POLICY,
+  };
+  if (deliveryTargetMode === "retipped") return { ...target, exact_sha: "f".repeat(40) };
+  if (deliveryTargetMode === "foreign") return { ...target, delivery_candidate_ref: { ...target.delivery_candidate_ref, project_id: "p2" } };
+  return target;
+}
+
 const submit = createCiLessEvidenceSubmitHandler({
   resolveShimPrincipal: (token) => principalByToken.get(token) || null,
   captureProjectAdmission: (projectId) => ({ project_id: projectId, generation }),
   isAdmissionCurrent: (admission) => admission?.generation === generation,
   resolveCurrentTarget: async (projectId, submitted) => targetFor(projectId, submitted),
+  store,
+});
+const submitDelivery = createDeliveryCandidateCiLessEvidenceSubmitHandler({
+  resolveShimPrincipal: (token) => principalByToken.get(token) || null,
+  captureProjectAdmission: (projectId) => ({ project_id: projectId, generation }),
+  isAdmissionCurrent: (admission) => admission?.generation === generation,
+  resolveCurrentTarget: async (projectId, submitted) => deliveryTargetFor(projectId, submitted),
   store,
 });
 const read = createCiLessEvidenceReadHandler({
@@ -189,6 +247,30 @@ function ok(value, message) {
   assert.equal(changedCandidate.payload.record.identity.exact_sha, changedSha);
   assert.equal(Object.keys(store.readDocument("p1").records).length, 2);
   ok(true, "a changed SHA creates a distinct historical identity instead of reusing prior evidence");
+
+  const deliveryEvidence = responseCapture();
+  await submitDelivery(deliveryRequest(), deliveryEvidence);
+  assert.equal(deliveryEvidence.statusCode, 200);
+  assert.equal(deliveryEvidence.payload.record.identity.target_kind, "delivery_candidate_pr");
+  assert.equal(deliveryEvidence.payload.record.identity.delivery_manifest_digest, "e".repeat(64));
+  assert.equal(store.readByIdentity(deliveryTargetFor("p1", deliveryRequest().body))?.record_id, deliveryEvidence.payload.record.record_id);
+  ok(true, "a composed Delivery Candidate stores its final CI-less evidence in the same atomic project receipt ledger");
+
+  deliveryTargetMode = "retipped";
+  const staleDelivery = responseCapture();
+  await submitDelivery(deliveryRequest(), staleDelivery);
+  assert.equal(staleDelivery.statusCode, 409);
+  assert.equal(staleDelivery.payload.code, "delivery_ci_evidence_target_changed");
+  deliveryTargetMode = "foreign";
+  const foreignDelivery = responseCapture();
+  await submitDelivery(deliveryRequest(), foreignDelivery);
+  assert.equal(foreignDelivery.statusCode, 409);
+  assert.equal(foreignDelivery.payload.code, "delivery_ci_evidence_target_changed");
+  deliveryTargetMode = "current";
+  const headDelivery = responseCapture();
+  await submitDelivery({ ...deliveryRequest(), headers: { "x-chat-token": "head-token" } }, headDelivery);
+  assert.equal(headDelivery.statusCode, 403);
+  ok(true, "retipped, foreign, and non-Dev Delivery Candidate evidence submissions fail before persistence");
 
   // Two different submissions start together. The first holds the live-target
   // read open; the second must not even begin its target read until the first

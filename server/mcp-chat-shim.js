@@ -119,6 +119,42 @@ const SUBMIT_CI_EVIDENCE_TOOL = {
   },
 };
 
+const SUBMIT_DELIVERY_CANDIDATE_CI_EVIDENCE_TOOL = {
+  name: "submit_delivery_candidate_ci_evidence",
+  description: "Submit bounded CI-less evidence for the authenticated Dev role's already-published Delivery Candidate PR. The server rechecks the composed candidate and exact PR SHA; this operation never executes commands.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      delivery_candidate_ref: { type: "object" },
+      pr_number: { type: "integer", minimum: 1 },
+      exact_sha: { type: "string" },
+      policy_version: { type: "integer", minimum: 1 },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            key: { type: "string" },
+            outcome: { type: "string", enum: ["pass", "fail"] },
+            exit_code: { type: "integer", minimum: 0, maximum: 255 },
+            evidence_ref: { type: "string" },
+          },
+          required: ["key", "outcome", "exit_code", "evidence_ref"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["delivery_candidate_ref", "pr_number", "exact_sha", "policy_version", "results"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
 const READ_CI_EVIDENCE_TOOL = {
   name: "read_ci_evidence",
   description: "Read one redacted, server-authenticated CI-less evidence receipt for this project.",
@@ -308,7 +344,7 @@ function toolsForActor() {
     COMPOSE_DELIVERY_CANDIDATE_TOOL,
     OPEN_DELIVERY_CANDIDATE_FINAL_REVIEW_TOOL,
   );
-  if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL, SUBMIT_WORK_TASK_CANDIDATE_TOOL);
+  if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL, SUBMIT_DELIVERY_CANDIDATE_CI_EVIDENCE_TOOL, SUBMIT_WORK_TASK_CANDIDATE_TOOL);
   if (AGENT === "re1" || AGENT === "re2") tools.push(ISSUE_REVIEW_CYCLE_NONCE_TOOL, SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL, SUBMIT_WORK_TASK_REVIEW_RECEIPT_TOOL);
   return tools;
 }
@@ -415,6 +451,19 @@ async function handleToolCall(id, name, params) {
       const res = await httpRequest(
         "POST",
         "/api/ci-evidence",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_delivery_candidate_ci_evidence") {
+      const res = await httpRequest(
+        "POST",
+        "/api/delivery-candidate/ci-evidence",
         params,
         TOKEN ? { "X-Chat-Token": TOKEN } : {},
       );

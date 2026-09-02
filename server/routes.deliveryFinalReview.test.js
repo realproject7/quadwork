@@ -31,4 +31,9 @@ ok(/router\.post\("\/api\/review-cycle-nonce",[\s\S]*?cycle\.target\.target_kind
   /router\.post\("\/api\/review-cycle-receipt",[\s\S]*?cycle\.target\.target_kind !== DELIVERY_REVIEW_TARGET_KIND[\s\S]*?verifyCurrentReviewCycleContract[\s\S]*?recordReviewReceiptWithNonce/.test(source),
   "legacy contract reads are bypassed only for the separately revalidated Delivery Candidate target kind");
 
+ok(/router\.post\("\/api\/delivery-candidate\/ci-evidence",[\s\S]*?createDeliveryCandidateCiLessEvidenceSubmitHandler[\s\S]*?resolveCurrentTarget: resolveCurrentDeliveryCandidateCiEvidenceTarget[\s\S]*?store: _ciEvidenceStore/.test(source) &&
+  /function deliveryCandidateCiEvidenceTarget\(current\)[\s\S]*?delivery_candidate_ref: current\.target\.identity\.delivery_candidate_ref[\s\S]*?delivery_manifest_digest: current\.target\.identity\.delivery_manifest_digest/.test(source) &&
+  /policy\?\.mode === "ci-less"[\s\S]*?_ciEvidenceStore\.readByIdentity\(deliveryCandidateCiEvidenceTarget\(current\)\)/.test(source),
+  "Delivery Candidate CI-less evidence uses the existing atomic receipt store and only the current composed PR identity");
+
 console.log(`routes.deliveryFinalReview.test.js: ${passed} assertions passed`);
