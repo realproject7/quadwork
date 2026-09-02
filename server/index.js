@@ -34,6 +34,7 @@ const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identit
 const { createManagedWorktreeObserver } = require("./work-task-managed-worktree");
 const { createWorkTaskDevCandidateService } = require("./work-task-dev-candidate-service");
 const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
+const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 const { createWorkTaskReviewRuntime } = require("./work-task-review-runtime");
 const { createCanonicalInstalledStateReader } = require("./canonical-installed-state");
 const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
@@ -690,8 +691,8 @@ function activeDevCandidatePrincipal(req) {
 // #1059 M4: the review adapter is intentionally outside the four-action Head
 // control plane.  It has two fixed role-token paths only: Head opens a sealed
 // two-reviewer round, then the assigned reviewer seals its own receipt.  The
-// adapter derives reviewer epochs and live task identity; it cannot publish or
-// reconcile a delivery verdict.
+// adapter derives reviewer epochs and live task identity; its released-round
+// reconciliation remains distinct from delivery composition or publication.
 const workTaskReviewRuntime = createWorkTaskReviewRuntime({
   config_dir: path.dirname(CONFIG_PATH),
   fs,
@@ -705,6 +706,7 @@ const workTaskReviewRuntime = createWorkTaskReviewRuntime({
   now: () => new Date(),
   create_live_identity_resolver: createLiveWorkTaskIdentityResolver,
   create_review_service: createWorkTaskIndependentReviewService,
+  create_reconciliation_service: createWorkTaskReviewReconciliationService,
 });
 
 // #1047: Head's recovery cursor secret is stable across Head process/token
@@ -847,6 +849,15 @@ app.post("/api/work-task-review/receipt", (req, res) => {
     return res.json({ ok: true, ...workTaskReviewRuntime.submit({ token, body: req.body }) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "work_task_review_receipt_unavailable" });
+  }
+});
+
+app.post("/api/work-task-review/reconcile", (req, res) => {
+  const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
+  try {
+    return res.json({ ok: true, ...workTaskReviewRuntime.reconcile({ token, body: req.body }) });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "work_task_review_reconciliation_unavailable" });
   }
 });
 

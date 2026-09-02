@@ -56,6 +56,9 @@ function fixture(options = {}) {
       openIndependentReview: (input) => { calls.push({ kind: "open", input: copy(input) }); return { outcome: "opened", review_round_ref: copy(review_round_ref), candidate_digest: "e".repeat(64) }; },
       submitTrustedReceipt: (input, context) => { calls.push({ kind: "submit", input: copy(input), context: copy(context) }); return { outcome: "sealed", view: { status: "sealed" } }; },
     }),
+    create_reconciliation_service: () => ({
+      reconcileReleasedReview: (input) => { calls.push({ kind: "reconcile", input: copy(input) }); return { outcome: "reconciled", resolution: "accepted" }; },
+    }),
   });
   return { runtime, calls, sessions };
 }
@@ -94,6 +97,18 @@ function fixture(options = {}) {
 
 {
   const current = fixture();
+  const reconciled = current.runtime.reconcile({ token: "head-token", body: {
+    work_task_ref: copy(ref), review_round_ref: copy(review_round_ref), candidate_digest: "e".repeat(64),
+  } });
+  assert.equal(reconciled.resolution, "accepted");
+  assert.deepEqual(current.calls[0], { kind: "reconcile", input: {
+    version: 1, work_task_ref: copy(ref), review_round_ref: copy(review_round_ref), candidate_digest: "e".repeat(64),
+  } });
+  console.log("  PASS: authenticated Head alone can invoke the released-round reconciliation seam");
+}
+
+{
+  const current = fixture();
   current.sessions.set(`${project_id}/re2`, session("re2", false));
   throwsCode(() => current.runtime.open({ token: "head-token", body: { event_id: "open_runtime_002", work_task_ref: copy(ref), attempt: "attempt_001", round: 1 } }), "work_task_reviewer_assignment_unavailable");
   assert.equal(current.calls.length, 0);
@@ -113,8 +128,8 @@ function fixture(options = {}) {
 {
   const source = fs.readFileSync(path.join(__dirname, "work-task-review-runtime.js"), "utf8");
   assert.doesNotMatch(source, /require\s*\(\s*["']\.\/(?:index|routes|file-chat|mcp|pty-dispatcher)["']\s*\)/);
-  assert.doesNotMatch(source, /(?:execFile|spawn\s*\(|reconcile_review|record_review_verdict)/);
-  console.log("  PASS: fixed review transport has no publication, process, or reconciliation authority");
+  assert.doesNotMatch(source, /(?:execFile|spawn\s*\(|planWorkTaskPipelineEvent|delivery-candidate)/);
+  console.log("  PASS: fixed review transport has no publication, process, or direct pipeline authority");
 }
 
 console.log("work-task-review-runtime.test.js: all assertions passed");

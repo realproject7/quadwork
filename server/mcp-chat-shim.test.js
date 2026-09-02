@@ -132,6 +132,12 @@ function startTestServer() {
       workTaskReviewRequests.push({ kind: "receipt", role: principal.agentId, token: req.headers["x-chat-token"], body: req.body });
       res.json({ ok: true, outcome: "sealed", view: { status: "sealed" } });
     });
+    app.post("/api/work-task-review/reconcile", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
+      workTaskReviewRequests.push({ kind: "reconcile", token: req.headers["x-chat-token"], body: req.body });
+      res.json({ ok: true, outcome: "reconciled", resolution: "accepted" });
+    });
 
     app.get("/api/chat", (req, res) => {
       const msgs = fileChat.readMessages(PROJECT, {
@@ -213,6 +219,7 @@ async function runTests() {
   assert(toolNames.includes("read_ci_evidence"), "tools/list exposes redacted CI evidence reads to dev");
   assert(!toolNames.includes("chat_resume"), "tools/list hides Head-only chat_resume from dev");
   assert(!toolNames.includes("open_work_task_independent_review"), "tools/list hides Head-only WorkTask review opening from dev");
+  assert(!toolNames.includes("reconcile_work_task_review"), "tools/list hides Head-only WorkTask review reconciliation from dev");
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
     "tools/list hides reviewer-only review-cycle receipt tools from dev");
   assert(!toolNames.includes("submit_work_task_review_receipt"), "tools/list hides independent WorkTask review receipts from dev");
@@ -237,6 +244,8 @@ async function runTests() {
       `tools/list exposes chat_resume only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("open_work_task_independent_review") === (role === "head"),
       `tools/list exposes WorkTask review opening only to authenticated Head role ${role}`);
+    assert(roleToolNames.includes("reconcile_work_task_review") === (role === "head"),
+      `tools/list exposes WorkTask review reconciliation only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("issue_review_cycle_nonce") === reviewerRole,
       `tools/list exposes review-cycle nonce issuance only to reviewer role ${role}`);
     assert(roleToolNames.includes("submit_review_cycle_receipt") === reviewerRole,
@@ -272,6 +281,17 @@ async function runTests() {
     workTaskReviewRequests[0].token === HEAD_RESUME_TOKEN && JSON.stringify(workTaskReviewRequests[0].body) === JSON.stringify(openArguments),
   "Head review opening forwards only its typed arguments and existing shim token");
 
+  const reconcileArguments = { work_task_ref: { task_key: "review" }, review_round_ref: { attempt: "attempt_001" }, candidate_digest: "e".repeat(64) };
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 212, method: "tools/call", params: {
+    name: "reconcile_work_task_review", arguments: reconcileArguments,
+  } });
+  const reconcileReviewResp = await readResponse(headShim);
+  assert(JSON.parse(reconcileReviewResp.result?.content?.[0]?.text || "{}").outcome === "reconciled",
+    "authenticated Head can call the fixed WorkTask review reconciliation endpoint");
+  assert(workTaskReviewRequests.length === 2 && workTaskReviewRequests[1].kind === "reconcile" &&
+    workTaskReviewRequests[1].token === HEAD_RESUME_TOKEN && JSON.stringify(workTaskReviewRequests[1].body) === JSON.stringify(reconcileArguments),
+  "Head review reconciliation forwards only its typed arguments and existing shim token");
+
   for (const invalid of [
     {},
     { cursor: null, limit: 0 },
@@ -298,7 +318,7 @@ async function runTests() {
   } });
   const hiddenOpen = await readResponse(shim);
   assert(hiddenOpen.error?.code === -32601, "non-Head hidden WorkTask review opening calls are denied locally");
-  assert(workTaskReviewRequests.length === 1, "non-Head review opening calls never reach the fixed endpoint");
+  assert(workTaskReviewRequests.length === 2, "non-Head review opening calls never reach the fixed endpoint");
 
   chatResumeFailure = true;
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 24, method: "tools/call", params: {
@@ -321,8 +341,8 @@ async function runTests() {
   const receiptResp = await readResponse(re1Shim);
   assert(JSON.parse(receiptResp.result?.content?.[0]?.text || "{}").outcome === "sealed",
     "authenticated reviewer can seal through the fixed WorkTask receipt endpoint");
-  assert(workTaskReviewRequests.length === 2 && workTaskReviewRequests[1].kind === "receipt" && workTaskReviewRequests[1].role === "re1" &&
-    workTaskReviewRequests[1].token === re1ReceiptToken && JSON.stringify(workTaskReviewRequests[1].body) === JSON.stringify(receiptArguments),
+  assert(workTaskReviewRequests.length === 3 && workTaskReviewRequests[2].kind === "receipt" && workTaskReviewRequests[2].role === "re1" &&
+    workTaskReviewRequests[2].token === re1ReceiptToken && JSON.stringify(workTaskReviewRequests[2].body) === JSON.stringify(receiptArguments),
   "review receipt forwards only its typed arguments and existing reviewer token");
   await stopShim(re1Shim);
 

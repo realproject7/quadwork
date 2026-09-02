@@ -418,6 +418,30 @@ function releaseProjection(round) {
   };
 }
 
+// This is the sole non-reviewer projection of a released round.  It is for a
+// later server-internal reconciliation service only, so it intentionally
+// carries verdict anchors but not peer findings or receipt bodies.  The public
+// reviewer read path below remains restricted to the caller's own receipt.
+function reconciliationProjection(round) {
+  if (round.status !== "released" || round.release === null || round.receipts.length !== 2) {
+    fail("task_review_round_not_released", "review round has no terminal sealed release");
+  }
+  return cloneFreeze({
+    version: TASK_REVIEW_ROUND_STORE_VERSION,
+    review_round_ref: clone(round.review_round_ref),
+    candidate_digest: round.candidate_digest,
+    round_digest: round.round_digest,
+    released_at: round.release.released_at,
+    receipt_verdicts: round.release.receipts.map((sealed) => ({
+      reviewer_role: sealed.reviewer_role,
+      reviewer_generation: sealed.reviewer_generation,
+      receipt_id: sealed.receipt.receipt_id,
+      receipt_digest: sealed.receipt.receipt_digest,
+      verdict: sealed.receipt.verdict,
+    })),
+  });
+}
+
 function ownReceiptProjection(round, trustedContext) {
   // Let the pure contract authenticate the trusted role/generation before this
   // store projects anything.  Its released view is intentionally discarded:
@@ -503,6 +527,13 @@ class TaskReviewRoundStore {
     const loaded = safeReadDocument(this.fs, this.rootDir, scope);
     const located = recordFor(loaded.document, reviewRoundRef, candidateDigest(digest));
     return ownReceiptProjection(located.round, trustedReviewerContext);
+  }
+
+  readReleasedForReconciliation(reviewRoundRef, digest) {
+    const scope = scopeFromRef(reviewRoundRef);
+    const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+    const located = recordFor(loaded.document, reviewRoundRef, candidateDigest(digest));
+    return reconciliationProjection(located.round);
   }
 
   cancelFromTrustedState(cancellation) {

@@ -5,13 +5,15 @@
 // launch-token principal, derives reviewer assignments from current server
 // sessions, and rechecks the live Issue contract before touching durable
 // state.  Neither request body can select a reviewer role, generation, or
-// project.  This module deliberately stops at receipt sealing: reconciliation,
-// delivery composition, publication, and process control remain elsewhere.
+// project.  Head may request the released-round reconciliation through its
+// separate durable service, but delivery composition, publication, and process
+// control remain elsewhere.
 
 const { assertWorkTaskRef } = require("./work-task-manifest");
 const { workItemKey } = require("./work-item-ref");
 const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identity-resolver");
 const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
+const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 
 const VERSION = 1;
 const REVIEWER_ROLES = new Set(["re1", "re2"]);
@@ -74,14 +76,15 @@ function options(value) {
     "config_dir", "fs", "capture_project_admission", "is_admission_current",
     "resolve_shim_principal", "agent_sessions", "read_live_batch_context",
     "read_repository_state", "read_cached_repository_snapshot", "now",
-    "create_live_identity_resolver", "create_review_service",
+    "create_live_identity_resolver", "create_review_service", "create_reconciliation_service",
   ], "invalid_work_task_review_runtime_options");
   if (typeof value.config_dir !== "string" || !value.fs || typeof value.capture_project_admission !== "function" ||
       typeof value.is_admission_current !== "function" || typeof value.resolve_shim_principal !== "function" ||
       !value.agent_sessions || typeof value.agent_sessions.get !== "function" ||
       typeof value.read_live_batch_context !== "function" || typeof value.read_repository_state !== "function" ||
       typeof value.read_cached_repository_snapshot !== "function" || typeof value.now !== "function" ||
-      typeof value.create_live_identity_resolver !== "function" || typeof value.create_review_service !== "function") {
+      typeof value.create_live_identity_resolver !== "function" || typeof value.create_review_service !== "function" ||
+      typeof value.create_reconciliation_service !== "function") {
     fail("invalid_work_task_review_runtime_options", "runtime dependencies are invalid");
   }
   return value;
@@ -177,6 +180,11 @@ function createWorkTaskReviewRuntime(value) {
     catch (error) { fail(safeCode(error, "work_task_review_service_unavailable"), "review service is unavailable"); }
   }
 
+  function reconciliationService() {
+    try { return deps.create_reconciliation_service({ config_dir: deps.config_dir, fs: deps.fs }); }
+    catch (error) { fail(safeCode(error, "work_task_review_reconciliation_unavailable"), "review reconciliation is unavailable"); }
+  }
+
   function open(rawRequest) {
     if (!plain(rawRequest)) fail("invalid_work_task_review_runtime_request", "review request is invalid");
     const principal = activePrincipal(rawRequest.token, new Set(["head"]));
@@ -221,7 +229,30 @@ function createWorkTaskReviewRuntime(value) {
     }
   }
 
-  return freeze({ open, submit });
+  function reconcile(rawRequest) {
+    if (!plain(rawRequest)) fail("invalid_work_task_review_runtime_request", "review request is invalid");
+    const principal = activePrincipal(rawRequest.token, new Set(["head"]));
+    const body = rawRequest.body;
+    const ref = reference(body?.work_task_ref, "invalid_work_task_review_reconciliation_request");
+    const round = body?.review_round_ref;
+    if (ref.project_id !== principal.project_id || !round || round.project_id !== ref.project_id ||
+        round.installation_id !== ref.installation_id) {
+      fail("stale_work_task_review_authority", "WorkTask project is not current");
+    }
+    assertLiveCurrent(ref);
+    try {
+      return reconciliationService().reconcileReleasedReview({
+        version: VERSION,
+        work_task_ref: ref,
+        review_round_ref: clone(round),
+        candidate_digest: body?.candidate_digest,
+      });
+    } catch (error) {
+      fail(safeCode(error, "work_task_review_reconciliation_failed"), "review reconciliation failed");
+    }
+  }
+
+  return freeze({ open, submit, reconcile });
 }
 
 module.exports = {

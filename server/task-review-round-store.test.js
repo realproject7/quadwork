@@ -138,6 +138,10 @@ function rawStoredRound(store, ref) {
   assert.equal(released.view.own_receipt.receipt_id, "receipt_re1_01");
   assert.deepEqual(Object.keys(released.view.release).sort(), ["candidate_digest", "released_at", "transaction", "version"]);
   assert.doesNotMatch(JSON.stringify(released.view), /receipt_re2_01|finding_re2_01|re2/);
+  const reconciliation = restarted.readReleasedForReconciliation(opened.review_round_ref, opened.candidate_digest);
+  assert.deepEqual(Object.keys(reconciliation).sort(), ["candidate_digest", "receipt_verdicts", "released_at", "review_round_ref", "round_digest", "version"]);
+  assert.deepEqual(reconciliation.receipt_verdicts.map((entry) => [entry.reviewer_role, entry.verdict]), [["re1", "approve"], ["re2", "request_changes"]]);
+  assert.doesNotMatch(JSON.stringify(reconciliation), /finding_re1_01|finding_re2_01/);
   const stored = rawStoredRound(restarted, opened.review_round_ref);
   assert.equal(stored.status, "released");
   assert.equal(stored.receipts.length, 2);
