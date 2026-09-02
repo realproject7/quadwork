@@ -6,7 +6,7 @@ const os = require("os");
 const { WebSocketServer, WebSocket } = require("ws");
 const pty = require("node-pty");
 const { spawn } = require("child_process");
-const { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, primaryRepository } = require("./config");
+const { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, primaryRepository, allRepositories } = require("./config");
 const routes = require("./routes");
 const fileChat = require("./file-chat");
 const {
@@ -30,6 +30,10 @@ const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { createHeadControlRuntime } = require("./head-control-runtime");
+const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identity-resolver");
+const { createManagedWorktreeObserver } = require("./work-task-managed-worktree");
+const { createWorkTaskDevCandidateService } = require("./work-task-dev-candidate-service");
+const { createCanonicalInstalledStateReader } = require("./canonical-installed-state");
 const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
 const { createChatResumeRuntime } = require("./chat-resume-runtime");
 const {
@@ -643,6 +647,44 @@ const headControlRuntime = createHeadControlRuntime({
   now: () => new Date(),
 });
 
+// #1058 M8: one fixed server composition for Dev's local-only candidate
+// receipt.  The endpoint below authenticates Dev separately; this helper never
+// accepts a caller-selected repository, path, branch, base, or worktree.
+function devCandidateServiceForProject(projectId) {
+  const cfg = readConfig();
+  const project = cfg.projects?.find((entry) => entry?.id === projectId && entry.archived !== true);
+  if (!project || typeof cfg.installation_id !== "string") throw new TypeError("V2 candidate project is unavailable");
+  const primary = primaryRepository(project);
+  const primaryAgentCwds = {};
+  if (primary) {
+    for (const role of ["head", "re1", "re2", "dev"]) {
+      const cwd = project.agents?.[role]?.cwd;
+      if (typeof cwd === "string" && path.isAbsolute(cwd)) primaryAgentCwds[role] = cwd;
+    }
+  }
+  const observer = createManagedWorktreeObserver({
+    repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
+    canonicalize_path: (request) => fs.realpathSync(request.path),
+    run_git: (request) => {
+      try { return { ok: true, output: execFileSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
+      catch { return { ok: false, output: "" }; }
+    },
+  });
+  const readCanonicalInstalledState = createCanonicalInstalledStateReader({ read_config: readConfig });
+  return createWorkTaskDevCandidateService({ config_dir: path.dirname(CONFIG_PATH), fs, managed_worktree: observer, read_canonical_installed_state: readCanonicalInstalledState });
+}
+
+function activeDevCandidatePrincipal(req) {
+  const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
+  const principal = fileChat.resolveShimPrincipal(token);
+  if (!principal || principal.agentId !== "dev") return null;
+  const admission = captureProjectAdmission(principal.projectId);
+  const session = agentSessions.get(`${principal.projectId}/dev`);
+  if (!isAdmissionCurrent(admission) || !session || session.projectId !== principal.projectId || session.agentId !== "dev" ||
+      session.state !== "running" || !session.term || session.lifecycleState !== "verified") return null;
+  return principal;
+}
+
 // #1047: Head's recovery cursor secret is stable across Head process/token
 // rotation but never crosses the server boundary.  It derives from the already
 // persisted local session secret and one project ID; neither value is returned
@@ -742,6 +784,26 @@ app.get("/api/work-task-batch", (req, res) => {
     return res.json({ ok: true, ...batch });
   } catch {
     return res.status(503).json({ ok: false, error: "WorkTask Current Batch is unavailable" });
+  }
+});
+
+// #1058 M8: Dev can attest only the clean HEAD SHA of the server-owned Dev
+// worktree.  The server re-proves current task identity, derives every other
+// candidate field, and records no publication intent.
+app.post("/api/work-task-candidate", (req, res) => {
+  const principal = activeDevCandidatePrincipal(req);
+  if (!principal) return res.status(403).json({ ok: false, code: "work_task_candidate_forbidden" });
+  try {
+    const resolveLiveIdentity = createLiveWorkTaskIdentityResolver({
+      read_live_batch_context: routes.readLiveBatchContext,
+      read_repository_state: routes.repositoryState,
+      read_cached_repository_snapshot: (cacheRepo) => routes._graphqlCache.get(cacheRepo),
+    });
+    resolveLiveIdentity(req.body?.work_task_ref);
+    const result = devCandidateServiceForProject(principal.projectId).submitDevCandidate(req.body);
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "work_task_candidate_unavailable" });
   }
 });
 

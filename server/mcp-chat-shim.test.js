@@ -195,6 +195,7 @@ async function runTests() {
   assert(toolNames.includes("chat_read"), "tools/list includes chat_read");
   assert(toolNames.includes("issue_contract_revision"), "tools/list exposes issue_contract_revision to dev");
   assert(toolNames.includes("submit_ci_evidence"), "tools/list exposes submit_ci_evidence only to dev");
+  assert(toolNames.includes("submit_work_task_candidate"), "tools/list exposes the local-only WorkTask candidate receipt only to dev");
   assert(toolNames.includes("read_ci_evidence"), "tools/list exposes redacted CI evidence reads to dev");
   assert(!toolNames.includes("chat_resume"), "tools/list hides Head-only chat_resume from dev");
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
@@ -212,6 +213,8 @@ async function runTests() {
       `tools/list exposes read_ci_evidence to ${role}`);
     assert(!(roleList.result?.tools || []).some((tool) => tool.name === "submit_ci_evidence"),
       `tools/list hides submit_ci_evidence from ${role}`);
+    assert(!(roleList.result?.tools || []).some((tool) => tool.name === "submit_work_task_candidate"),
+      `tools/list hides WorkTask candidate receipt from ${role}`);
     const roleToolNames = (roleList.result?.tools || []).map((tool) => tool.name);
     const reviewerRole = role === "re1" || role === "re2";
     assert(roleToolNames.includes("chat_resume") === (role === "head"),

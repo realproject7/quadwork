@@ -136,6 +136,17 @@ const READ_CI_EVIDENCE_TOOL = {
   },
 };
 
+const SUBMIT_WORK_TASK_CANDIDATE_TOOL = {
+  name: "submit_work_task_candidate",
+  description: "Record the authenticated Dev role's clean local WorkTask candidate SHA. The server derives the current task, base, branch, and managed worktree; this does not push, create a PR, or start CI.",
+  inputSchema: {
+    type: "object",
+    properties: { event_id: { type: "string" }, work_task_ref: { type: "object" }, candidate_sha: { type: "string" } },
+    required: ["event_id", "work_task_ref", "candidate_sha"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
 const SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL = {
   name: "submit_review_cycle_receipt",
   description: "Bind this authenticated reviewer's one current GitHub review object to the server-owned exact-SHA review cycle. Chat claims and prose are not accepted.",
@@ -200,7 +211,7 @@ function toolsForActor() {
   if (!PROJECT_ROLES.has(AGENT)) return CHAT_TOOLS;
   const tools = [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL, READ_CI_EVIDENCE_TOOL];
   if (AGENT === "head" && TOKEN) tools.push(CHAT_RESUME_TOOL);
-  if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL);
+  if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL, SUBMIT_WORK_TASK_CANDIDATE_TOOL);
   if (AGENT === "re1" || AGENT === "re2") tools.push(ISSUE_REVIEW_CYCLE_NONCE_TOOL, SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL);
   return tools;
 }
@@ -326,6 +337,13 @@ async function handleToolCall(id, name, params) {
       if (res.status >= 400) {
         return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
       }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_work_task_candidate") {
+      if (AGENT !== "dev" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: submit_work_task_candidate");
+      const res = await httpRequest("POST", "/api/work-task-candidate", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
     }
 

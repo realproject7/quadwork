@@ -22,6 +22,8 @@ ok(/app\.post\("\/api\/head-control",[\s\S]*?X-Head-Control-Token[\s\S]*?headCon
   "the fixed Head-control route forwards one token header and no caller-derived authority");
 ok(/app\.get\("\/api\/work-task-batch",[\s\S]*?requireSessionToken\(req, res\)[\s\S]*?headControlRuntime\.readCurrentBatchProjection\(\{ project_id: projectId \}\)/.test(source),
   "the nested WorkTask Current Batch endpoint is session-bound and delegates identity resolution to the runtime");
+ok(/app\.post\("\/api\/work-task-candidate",[\s\S]*?activeDevCandidatePrincipal\(req\)[\s\S]*?createLiveWorkTaskIdentityResolver[\s\S]*?devCandidateServiceForProject\(principal\.projectId\)\.submitDevCandidate\(req\.body\)/.test(source),
+  "the fixed Dev candidate endpoint re-proves live task identity before durable local-only recording");
 ok(/function headControlMcpEntry\(projectId, agentId, serverPort, token\)\s*\{[\s\S]*?if \(agentId !== "head"\) return null;[\s\S]*?captureProjectAdmission\(projectId\)[\s\S]*?registerHeadToken/.test(source),
   "only an admitted Head receives a bound Head-control MCP launch entry");
 ok(/head_control:\s*headControl/.test(source) && /mcp_servers\.head_control\.command/.test(source) && /\[mcp_servers\.head_control\]/.test(source),
