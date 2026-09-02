@@ -158,6 +158,12 @@ function startTestServer() {
       deliveryCandidateRequests.push({ kind: "compose", token: req.headers["x-chat-token"], body: req.body });
       res.json({ ok: true, outcome: "composed" });
     });
+    app.post("/api/delivery-candidate/final-review", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
+      deliveryCandidateRequests.push({ kind: "final-review", token: req.headers["x-chat-token"], body: req.body });
+      res.json({ ok: true, outcome: "final-review-opened" });
+    });
 
     app.get("/api/chat", (req, res) => {
       const msgs = fileChat.readMessages(PROJECT, {
@@ -241,7 +247,7 @@ async function runTests() {
   assert(!toolNames.includes("assign_work_task_build"), "tools/list hides Head-only WorkTask build assignment from dev");
   assert(!toolNames.includes("open_work_task_independent_review"), "tools/list hides Head-only WorkTask review opening from dev");
   assert(!toolNames.includes("reconcile_work_task_review"), "tools/list hides Head-only WorkTask review reconciliation from dev");
-  assert(!toolNames.includes("prepare_delivery_candidate") && !toolNames.includes("compose_delivery_candidate"),
+  assert(!toolNames.includes("prepare_delivery_candidate") && !toolNames.includes("compose_delivery_candidate") && !toolNames.includes("open_delivery_candidate_final_review"),
     "tools/list hides Head-only Delivery Candidate tools from dev");
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
     "tools/list hides reviewer-only review-cycle receipt tools from dev");
@@ -272,8 +278,9 @@ async function runTests() {
     assert(roleToolNames.includes("reconcile_work_task_review") === (role === "head"),
       `tools/list exposes WorkTask review reconciliation only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("prepare_delivery_candidate") === (role === "head") &&
-      roleToolNames.includes("compose_delivery_candidate") === (role === "head"),
-    `tools/list exposes Delivery Candidate preparation/composition only to authenticated Head role ${role}`);
+      roleToolNames.includes("compose_delivery_candidate") === (role === "head") &&
+      roleToolNames.includes("open_delivery_candidate_final_review") === (role === "head"),
+    `tools/list exposes Delivery Candidate preparation/composition/final-review only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("issue_review_cycle_nonce") === reviewerRole,
       `tools/list exposes review-cycle nonce issuance only to reviewer role ${role}`);
     assert(roleToolNames.includes("submit_review_cycle_receipt") === reviewerRole,
@@ -353,6 +360,17 @@ async function runTests() {
     deliveryCandidateRequests[1].token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests[1].body) === JSON.stringify(composeArguments),
   "Delivery Candidate composition forwards only its typed candidate revision and existing Head token");
 
+  const finalReviewArguments = { delivery_candidate_ref: { version: 1 }, pr_number: 1062 };
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 215, method: "tools/call", params: {
+    name: "open_delivery_candidate_final_review", arguments: finalReviewArguments,
+  } });
+  const finalReview = await readResponse(headShim);
+  assert(JSON.parse(finalReview.result?.content?.[0]?.text || "{}").outcome === "final-review-opened",
+    "authenticated Head can open the fixed Delivery Candidate final-review endpoint");
+  assert(deliveryCandidateRequests.length === 3 && deliveryCandidateRequests[2].kind === "final-review" &&
+    deliveryCandidateRequests[2].token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests[2].body) === JSON.stringify(finalReviewArguments),
+  "Delivery Candidate final review forwards only its typed reference/PR number and existing Head token");
+
   for (const invalid of [
     {},
     { cursor: null, limit: 0 },
@@ -393,7 +411,7 @@ async function runTests() {
   } });
   const hiddenPrepare = await readResponse(shim);
   assert(hiddenPrepare.error?.code === -32601, "non-Head hidden Delivery Candidate preparation is denied locally");
-  assert(deliveryCandidateRequests.length === 2, "non-Head Delivery Candidate preparation never reaches the fixed endpoint");
+  assert(deliveryCandidateRequests.length === 3, "non-Head Delivery Candidate preparation never reaches the fixed endpoint");
 
   chatResumeFailure = true;
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 24, method: "tools/call", params: {

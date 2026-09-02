@@ -105,7 +105,7 @@ for (const phase of ["Intake and proposal", "EPIC and ticket founding", "Ticket-
 }
 assert.doesNotMatch(allContracts, /task_key/i,
   "later execution schema internals are not predeclared in role contracts");
-assert.ok(head.includes("prepare_delivery_candidate") && head.includes("compose_delivery_candidate"),
+assert.ok(head.includes("prepare_delivery_candidate") && head.includes("compose_delivery_candidate") && head.includes("open_delivery_candidate_final_review"),
   "Head seed documents the advertised Delivery Candidate tools without exposing their internal schema");
 assert.ok(head.includes("Never construct a Delivery Candidate reference"),
   "Head seed keeps Git evidence and candidate identity server-derived");

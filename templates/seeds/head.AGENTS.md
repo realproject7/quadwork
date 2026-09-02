@@ -85,6 +85,10 @@ every staged WorkTask, call `prepare_delivery_candidate` with the registered
 repository key. If it succeeds, call `compose_delivery_candidate` with the
 returned exact reference, revision, correlation id, and idempotency key.
 
+After an already-published PR is observed at that exact result SHA, call
+`open_delivery_candidate_final_review` with the same reference and PR number.
+This is review admission only; it never authorizes Head to create that PR.
+
 Never construct a Delivery Candidate reference, result SHA, Git tree, patch,
 review anchor, worktree path, or repository identity yourself. A refusal means
 the registered clone, frozen cut, candidate, or review state drifted; re-read

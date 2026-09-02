@@ -1084,6 +1084,9 @@ const { ReviewCycleStore, deriveLegacyReviewTarget } = require("./review-cycle")
 const { ReviewCycleDispatcher } = require("./review-cycle-dispatcher");
 const { currentContractObservation } = require("./review-cycle-contract-observation");
 const { verifyActionContract } = require("./review-cycle-action-contract");
+const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
+const { createDeliveryFinalReviewService } = require("./delivery-final-review-service");
+const { TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND } = require("./delivery-review-target");
 
 function projectEnvironmentSettingsInput(config, project) {
   return {
@@ -1362,7 +1365,60 @@ router.post("/api/ci-evidence/read", createCiLessEvidenceReadHandler({
 // Reviewer-only native receipt admission.  Chat wording is deliberately not an
 // input.  The bound role supplies only a durable review id + current digest;
 // the server re-reads the GitHub review and records its exact SHA/verdict.
+function deliveryFinalReviewContext(projectId, deliveryCandidateRef, prNumber) {
+  const cfg = readConfigFile();
+  const project = (cfg.projects || []).find((entry) => entry?.id === projectId && entry.archived !== true);
+  const repositoryKey = deliveryCandidateRef?.repository_key;
+  if (!project || typeof cfg.installation_id !== "string") throw new Error("delivery_final_review_unavailable");
+  // Keep this value repository-only: a truthy `project && binding` expression
+  // makes static provenance guards conservatively treat the binding as a
+  // persisted project as well as a registered repository record.
+  const binding = getProjectRepositoryBindings(projectId, cfg).find((entry) => entry.key === repositoryKey);
+  if (!binding) throw new Error("delivery_final_review_unavailable");
+  let observedPr = null;
+  const service = createDeliveryFinalReviewService({
+    read_candidate_snapshot: (request) => {
+      const snapshot = createDeliveryCandidateStore({ config_dir: CONFIG_DIR, fs }).readSnapshot(request.delivery_candidate_ref);
+      return {
+        delivery_candidate_ref: snapshot.delivery_candidate_ref,
+        lifecycle: snapshot.lifecycle,
+        delivery_manifest: snapshot.delivery_manifest,
+        composition_proof: snapshot.composition_proof,
+      };
+    },
+    read_pr: (request) => {
+      const cached = _graphqlCache.get(binding.cache_repo);
+      if (!Number.isFinite(cached?.ts) || Date.now() - cached.ts > REVIEW_CONTRACT_MAX_AGE_MS) throw new Error("delivery_final_review_pr_stale");
+      const row = Array.isArray(cached.prs) ? cached.prs.find((entry) => entry?.number === request.pr_number) : null;
+      if (!row || !canonicalSha(row.tip)) throw new Error("delivery_final_review_pr_unavailable");
+      observedPr = row;
+      return { number: row.number, exact_sha: canonicalSha(row.tip), draft: row.draft === true, mergeable: row.mergeable === true };
+    },
+    read_ci_policy: () => binding.ci_policy ?? null,
+  });
+  const target = service.open({
+    version: 1,
+    head_binding: { installation_id: cfg.installation_id, project_id: projectId, role: "head", generation: 0 },
+    delivery_candidate_ref: deliveryCandidateRef,
+    pr_number: prNumber,
+  });
+  if (canonicalGithubRepo(target.identity.repo) !== canonicalGithubRepo(binding.repo) || target.identity.repo_key !== binding.key || !observedPr) {
+    throw new Error("delivery_final_review_binding_mismatch");
+  }
+  return { target, binding, pr: observedPr };
+}
+
 function targetFromStoredReviewCycle(projectId, cycle) {
+  if (cycle.target.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    return {
+      version: 1,
+      target_kind: DELIVERY_REVIEW_TARGET_KIND,
+      identity: cycle.target,
+      target_identity_digest: cycle.target_identity_digest,
+      slot_digest: cycle.slot_digest,
+      observed: { draft: cycle.readiness === "draft_or_not_ready", mergeable: cycle.mergeable },
+    };
+  }
   const project = configuredProject(projectId);
   return deriveLegacyReviewTarget({
     installation_id: cycle.target.installation_id, project_id: projectId,
@@ -1377,6 +1433,14 @@ function currentReviewCycleForPrincipal(principal, digest) {
   const document = _reviewCycleStore.load(principal.projectId);
   const cycle = Object.values(document.cycles).find((entry) => entry?.state === "current" && entry.target_identity_digest === digest);
   if (!cycle || isProjectArchived(principal.projectId)) return null;
+  if (cycle.target.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    try {
+      const current = deliveryFinalReviewContext(principal.projectId, cycle.target.delivery_candidate_ref, cycle.target.pr_number).target;
+      return current.target_identity_digest === cycle.target_identity_digest ? cycle : null;
+    } catch {
+      return null;
+    }
+  }
   const context = readLiveBatchContext(principal.projectId);
   const stillAssigned = context?.activated && context.parsed?.provenance === "owned" &&
     context.installationId === cycle.target.installation_id && context.parsed.assignmentAttempt === cycle.target.assignment_attempt &&
@@ -1388,10 +1452,58 @@ function currentReviewCycleForPrincipal(principal, digest) {
 // has initiated a nonce/receipt operation; a fresh authenticated read closes
 // the gap between a bounded REST cache observation and durable admission.
 async function verifyCurrentReviewCycleContract(principal, digest, cycle) {
+  if (cycle?.target?.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    return currentReviewCycleForPrincipal(principal, digest);
+  }
   return verifyActionContract(cycle,
     () => currentReviewCycleForPrincipal(principal, digest),
     fetchIssueContractRevision);
 }
+
+// A Head can admit only a composed local Delivery Candidate whose already
+// published PR is present in the fresh server cache at the identical result
+// SHA. This route creates neither branch nor PR; it only opens the existing
+// durable exact-SHA review cycle and emits its sealed reviewer handoff.
+router.post("/api/delivery-candidate/final-review", (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || principal.agentId !== "head" || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).sort().join(",") !== "delivery_candidate_ref,pr_number" || !Number.isSafeInteger(body.pr_number) || body.pr_number < 1) {
+    return res.status(400).json({ ok: false, code: "invalid_delivery_final_review_request" });
+  }
+  let admission;
+  try { admission = captureProjectAdmission(principal.projectId); }
+  catch { return res.status(409).json({ ok: false, code: "delivery_final_review_unavailable" }); }
+  if (!isAdmissionCurrent(admission) || isProjectArchived(principal.projectId)) {
+    return res.status(409).json({ ok: false, code: "delivery_final_review_unavailable" });
+  }
+  try {
+    const current = deliveryFinalReviewContext(principal.projectId, body.delivery_candidate_ref, body.pr_number);
+    const pre = _reviewCycleStore.reconcile(principal.projectId, current.target).cycle;
+    const evidence = current.pr.checkEvidence;
+    const ci = evidence ? evaluateCiEvidence({
+      policy: current.binding.ci_policy ?? null,
+      exact_sha: current.target.identity.exact_sha,
+      observed_at: evidence.observed_at,
+      first_observed_at: pre.created_at,
+      source_status: evidence.source_status,
+      check_runs: evidence.check_runs,
+      ci_less_evidence: null,
+      now: Date.now(),
+    }) : { state: "unknown" };
+    const observation = _reviewCycleDispatcher.observe({ project_id: principal.projectId, target: current.target, ci_state: ci.state, archived: false });
+    if (getProjectChatMode(principal.projectId) === "file" && isAdmissionCurrent(admission) && !isProjectArchived(principal.projectId)) {
+      _reviewCycleDispatcher.deliver(principal.projectId, observation,
+        (candidate) => fileChat.appendTrustedReviewCycleEventOnce(principal.projectId, {
+          ...candidate,
+          resume: { batch_id: currentChatResumeBatchId(principal.projectId), head_generation: admission.generation },
+        }));
+    }
+    return res.json({ ok: true, cycle_id: observation.cycle?.cycle_id || null, handoff: observation.handoff });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "delivery_final_review_unavailable" });
+  }
+});
 
 router.post("/api/review-cycle-nonce", async (req, res) => {
   const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
@@ -1403,11 +1515,13 @@ router.post("/api/review-cycle-nonce", async (req, res) => {
   try {
     const cycle = currentReviewCycleForPrincipal(principal, body.target_identity_digest);
     if (!cycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
-    const binding = getProjectRepositoryBindings(principal.projectId)
-      .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
-    const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
-    if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
-      return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    if (cycle.target.target_kind !== DELIVERY_REVIEW_TARGET_KIND) {
+      const binding = getProjectRepositoryBindings(principal.projectId)
+        .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
+      const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
+      if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
+        return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+      }
     }
     const verifiedCycle = await verifyCurrentReviewCycleContract(principal, body.target_identity_digest, cycle);
     if (!verifiedCycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
@@ -1431,11 +1545,13 @@ router.post("/api/review-cycle-receipt", async (req, res) => {
   try {
     const cycle = currentReviewCycleForPrincipal(principal, body.target_identity_digest);
     if (!cycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
-    const binding = getProjectRepositoryBindings(principal.projectId)
-      .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
-    const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
-    if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
-      return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    if (cycle.target.target_kind !== DELIVERY_REVIEW_TARGET_KIND) {
+      const binding = getProjectRepositoryBindings(principal.projectId)
+        .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
+      const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
+      if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
+        return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+      }
     }
     const { stdout } = await _execFileAsync("gh", ["api", `repos/${cycle.target.repo}/pulls/${cycle.target.pr_number}/reviews/${body.review_id}`], {
       encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER,
