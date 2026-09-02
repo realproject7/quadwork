@@ -157,16 +157,27 @@ function reviewAnchor(round, candidate) {
 }
 
 function stagedTaskInput(value, sequence) {
-  exact(value, ["candidate", "review_round"], "invalid_delivery_staged_task");
+  if (!plain(value)) fail("invalid_delivery_staged_task", "staged task is invalid");
+  const keys = Object.keys(value).sort().join(",");
+  if (keys !== "candidate,review_round" && keys !== "candidate,terminal_review") {
+    fail("invalid_delivery_staged_task", "staged task has an unknown or missing field");
+  }
   try { assertWorkTaskCandidate(value.candidate); } catch { fail("invalid_delivery_staged_task", "staged task candidate is invalid"); }
   const candidate = clone(value.candidate);
-  return {
+  const stage = {
     sequence,
     work_task_ref: clone(candidate.work_task_ref),
     work_item: clone(candidate.work_task_ref.work_item),
     candidate,
-    terminal_review: reviewAnchor(value.review_round, candidate),
+    terminal_review: null,
   };
+  if (keys === "candidate,terminal_review") {
+    stage.terminal_review = clone(value.terminal_review);
+    assertTerminalReview(stage.terminal_review, stage, "invalid_delivery_staged_task");
+    return stage;
+  }
+  stage.terminal_review = reviewAnchor(value.review_round, candidate);
+  return stage;
 }
 
 function deferredExclusion(value) {

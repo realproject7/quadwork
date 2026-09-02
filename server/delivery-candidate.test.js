@@ -183,6 +183,23 @@ function integratedFixture() {
   assert.deepEqual(buildDeliveryManifest(copy(fixture.input), options()), manifest, "same frozen provenance yields same digest");
 }
 
+// A runtime may use a server-internal released-round anchor instead of raw
+// receipt bodies. The resulting manifest remains deterministic and never
+// retains reviewer findings.
+{
+  const fixture = integratedFixture();
+  const source = copy(fixture.input);
+  const canonical = buildDeliveryManifest(fixture.input, options());
+  source.staged_tasks = fixture.input.staged_tasks.map((entry) => {
+    const stage = canonical.staged_tasks.find((value) =>
+      value.candidate.candidate_digest === entry.candidate.candidate_digest);
+    return { candidate: copy(entry.candidate), terminal_review: copy(stage.terminal_review) };
+  });
+  const manifest = buildDeliveryManifest(source, options());
+  assert.deepEqual(manifest, canonical, "released receipt anchors produce the same sealed Delivery Manifest");
+  assert.doesNotMatch(JSON.stringify(manifest), /private finding/, "anchor-based delivery provenance contains no reviewer findings");
+}
+
 // An isolated cut is one exact candidate/result with every frozen-batch peer
 // listed as an explicit deferred exclusion; it cannot quietly absorb a peer.
 {

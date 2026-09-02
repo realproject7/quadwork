@@ -142,6 +142,10 @@ function rawStoredRound(store, ref) {
   assert.deepEqual(Object.keys(reconciliation).sort(), ["candidate_digest", "receipt_verdicts", "released_at", "review_round_ref", "round_digest", "version"]);
   assert.deepEqual(reconciliation.receipt_verdicts.map((entry) => [entry.reviewer_role, entry.verdict]), [["re1", "approve"], ["re2", "request_changes"]]);
   assert.doesNotMatch(JSON.stringify(reconciliation), /finding_re1_01|finding_re2_01/);
+  const delivery = restarted.readReleasedForDelivery({ version: 1, work_task_ref: candidateValue.work_task_ref, candidate_digest: opened.candidate_digest });
+  assert.deepEqual(Object.keys(delivery).sort(), ["candidate_digest", "current_sha", "receipt_anchors", "review_round_ref", "round_digest", "status", "version"]);
+  assert.deepEqual(delivery.receipt_anchors.map((entry) => [entry.reviewer_role, entry.verdict]), [["re1", "approve"], ["re2", "request_changes"]]);
+  assert.doesNotMatch(JSON.stringify(delivery), /finding_re1_01|finding_re2_01/);
   const stored = rawStoredRound(restarted, opened.review_round_ref);
   assert.equal(stored.status, "released");
   assert.equal(stored.receipts.length, 2);
@@ -205,6 +209,7 @@ function rawStoredRound(store, ref) {
   crossInstallationRef.work_task_ref.installation_id = "installation_beta_00001";
   throwsCode(() => store.readForTrustedReviewer(crossInstallationRef, opened.candidate_digest, reviewer("re1", 11, "2026-09-01T06:06:00.000Z")), "task_review_round_not_found");
   throwsCode(() => store.readForTrustedReviewer(opened.review_round_ref, "8".repeat(64), reviewer("re1", 11, "2026-09-01T06:06:00.000Z")), "task_review_round_not_found");
+  throwsCode(() => store.readReleasedForDelivery({ version: 1, work_task_ref: staleRef.work_task_ref, candidate_digest: opened.candidate_digest }), "task_review_round_not_found");
   assert.equal(fs.readFileSync(store.pathFor(opened.review_round_ref), "utf8"), before);
 }
 
@@ -325,8 +330,9 @@ function rawStoredRound(store, ref) {
   assert.deepEqual(fs.readdirSync(external), []);
 }
 
-// The durable layer may use filesystem primitives, but it deliberately has no
-// route, config, MCP, chat, pipeline, or delivery hook and no pruning API.
+// The durable layer may use filesystem primitives and an internal redacted
+// released-anchor read, but has no route, config, MCP, chat, pipeline,
+// publication, or pruning API.
 {
   const source = fs.readFileSync(path.join(__dirname, "task-review-round-store.js"), "utf8");
   assert.doesNotMatch(source, /require\s*\(\s*["']\.\/(?:routes|index|config|mcp|file-chat|work-task-pipeline|review-cycle)["']\s*\)/);

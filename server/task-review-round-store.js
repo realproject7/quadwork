@@ -13,6 +13,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const {
+  assertWorkTaskRef,
+  workTaskKey,
+} = require("./work-task-manifest");
+const {
   assertTaskReviewRoundRef,
   taskReviewRoundKey,
   assertTaskReviewRound,
@@ -442,6 +446,42 @@ function reconciliationProjection(round) {
   });
 }
 
+// A Delivery Candidate needs exact released-round provenance anchors, but
+// never reviewer findings or receipt bodies. This server-internal read seam
+// has no HTTP/MCP route; reviewer reads below remain own-receipt-only.
+function deliveryProjection(round) {
+  if (round.status !== "released" || round.release === null || round.receipts.length !== 2) {
+    fail("task_review_round_not_released", "review round has no terminal sealed release");
+  }
+  return cloneFreeze({
+    version: TASK_REVIEW_ROUND_STORE_VERSION,
+    status: "released",
+    review_round_ref: clone(round.review_round_ref),
+    round_digest: round.round_digest,
+    candidate_digest: round.candidate_digest,
+    current_sha: round.review_round_ref.candidate_sha,
+    receipt_anchors: round.release.receipts.map((sealed) => ({
+      reviewer_role: sealed.reviewer_role,
+      reviewer_generation: sealed.reviewer_generation,
+      receipt_id: sealed.receipt.receipt_id,
+      receipt_digest: sealed.receipt.receipt_digest,
+      verdict: sealed.receipt.verdict,
+    })),
+  });
+}
+function deliveryRequest(value) {
+  exact(value, ["version", "work_task_ref", "candidate_digest"], "invalid_task_review_delivery_request");
+  if (value.version !== TASK_REVIEW_ROUND_STORE_VERSION) {
+    fail("invalid_task_review_delivery_request", "delivery request version is invalid");
+  }
+  try { assertWorkTaskRef(value.work_task_ref); }
+  catch { fail("invalid_task_review_delivery_request", "delivery work task reference is invalid"); }
+  return {
+    work_task_ref: clone(value.work_task_ref),
+    candidate_digest: candidateDigest(value.candidate_digest, "invalid_task_review_delivery_request"),
+  };
+}
+
 function ownReceiptProjection(round, trustedContext) {
   // Let the pure contract authenticate the trusted role/generation before this
   // store projects anything.  Its released view is intentionally discarded:
@@ -534,6 +574,22 @@ class TaskReviewRoundStore {
     const loaded = safeReadDocument(this.fs, this.rootDir, scope);
     const located = recordFor(loaded.document, reviewRoundRef, candidateDigest(digest));
     return reconciliationProjection(located.round);
+  }
+
+  readReleasedForDelivery(value) {
+    const request = deliveryRequest(value);
+    const scope = {
+      installation_id: request.work_task_ref.installation_id,
+      project_id: request.work_task_ref.project_id,
+    };
+    const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+    const matches = Object.values(loaded.document.records)
+      .map((record) => record.round)
+      .filter((round) => round.candidate_digest === request.candidate_digest &&
+        workTaskKey(round.review_round_ref.work_task_ref) === workTaskKey(request.work_task_ref));
+    if (matches.length === 0) fail("task_review_round_not_found", "no exact persisted review round exists");
+    if (matches.length !== 1) fail("task_review_round_delivery_ambiguous", "multiple review rounds match one delivery task");
+    return deliveryProjection(matches[0]);
   }
 
   cancelFromTrustedState(cancellation) {
