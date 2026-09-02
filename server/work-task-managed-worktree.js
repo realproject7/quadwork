@@ -13,7 +13,7 @@ const {
 } = require("./repository-provisioning");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const WORKTREE_ID_RE = /^[a-z][a-z0-9_-]{2,63}$/;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const BRANCH_RE = /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\/\/)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;

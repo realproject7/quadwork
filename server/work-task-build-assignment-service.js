@@ -12,7 +12,7 @@ const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
 
 const VERSION = 1;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 class WorkTaskBuildAssignmentServiceError extends Error {
   constructor(code, message = code) { super(message); this.name = "WorkTaskBuildAssignmentServiceError"; this.code = code; }

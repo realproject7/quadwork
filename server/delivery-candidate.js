@@ -13,7 +13,7 @@ const { assertWorkTaskCandidate } = require("./work-task-candidate");
 const { assertTaskReviewRoundRef, assertTaskReviewRound } = require("./task-review-round");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;

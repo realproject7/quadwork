@@ -12,6 +12,7 @@ const {
 const installation_id = "installation_alpha_0001";
 const project_id = "quadwork";
 const base_sha = "a".repeat(64);
+const sha1_base = "b".repeat(40);
 const repositories = [{ key: "web", repo: "Owner/Product-Web", working_dir: "/var/repos/web", primary: true }];
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
@@ -74,6 +75,12 @@ function observer(overrides = {}) {
   });
   assert.equal(subject.git.calls.length, 4);
   console.log("  PASS: registered clean base resolves a server-owned SHA");
+}
+
+{
+  const subject = observer({ git: { "rev-parse --verify HEAD": { output: sha1_base } } });
+  assert.equal(subject.value.readRegisteredBase({ version: 1, work_task_ref: taskRef() }).base_sha, sha1_base);
+  console.log("  PASS: registered clean base accepts a native SHA-1 Git object ID");
 }
 
 for (const [label, git, code] of [

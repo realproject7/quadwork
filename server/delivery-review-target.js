@@ -14,7 +14,7 @@ const { normalizeCiPolicy, deriveCiPolicyIdentity, canonicalSha } = require("./c
 const VERSION = 1;
 const TARGET_KIND = "delivery_candidate_pr";
 const REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 class DeliveryReviewTargetError extends Error {
   constructor(code, message = code) { super(message); this.name = "DeliveryReviewTargetError"; this.code = code; }

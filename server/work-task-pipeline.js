@@ -17,7 +17,7 @@ const {
 } = require("./work-task-candidate");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const FILE_BOUNDARY_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=-]{1,240}$/;
 const TASK_STATES = new Set([

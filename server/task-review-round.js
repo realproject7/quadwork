@@ -12,7 +12,7 @@ const { assertWorkTaskRef, workTaskKey } = require("./work-task-manifest");
 const { assertWorkTaskCandidate } = require("./work-task-candidate");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const ATTEMPT_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const RECEIPT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const FINDING_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;

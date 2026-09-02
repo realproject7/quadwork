@@ -10,7 +10,7 @@ const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 
 class WorkTaskDeliverySourceError extends Error {

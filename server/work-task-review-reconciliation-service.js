@@ -16,7 +16,7 @@ const { reconcileReleasedTaskReview } = require("./task-review-reconciliation");
 const { reviewRoundId } = require("./work-task-independent-review-service");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 class WorkTaskReviewReconciliationServiceError extends Error {
   constructor(code, message = code) { super(message); this.name = "WorkTaskReviewReconciliationServiceError"; this.code = code; }

@@ -17,8 +17,8 @@ const {
 
 const installation_id = "installation_alpha_0001";
 const project_id = "quadwork";
-const base_sha = "a".repeat(64);
-const candidate_sha = "b".repeat(64);
+const base_sha = "a".repeat(40);
+const candidate_sha = "b".repeat(40);
 const web42 = { repoKey: "web", repo: "Owner/Product-Web", number: 42, kind: "issue" };
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }

@@ -25,7 +25,7 @@ const DIRECTORY_MODE = 0o700;
 const MAX_TERMINAL_AUDIT = 64;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const TERMINAL_KINDS = new Set(["archive", "integrated_cut", "contract_change"]);
 

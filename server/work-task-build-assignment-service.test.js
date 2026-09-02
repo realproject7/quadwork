@@ -5,7 +5,7 @@ const { buildBatchManifest, freezeBatchManifest } = require("./work-task-manifes
 const { buildWorkTaskPipeline } = require("./work-task-pipeline");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
 const { createWorkTaskBuildAssignmentService, WorkTaskBuildAssignmentServiceError } = require("./work-task-build-assignment-service");
-const installation_id = "installation_build_service_0001", project_id = "quadwork", base_sha = "a".repeat(64);
+const installation_id = "installation_build_service_0001", project_id = "quadwork", base_sha = "a".repeat(40);
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
 function withDir(run) { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-build-service-")); try { return run(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); } }
 function fixture(dir) {

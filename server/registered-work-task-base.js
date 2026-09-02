@@ -12,7 +12,9 @@ const {
 } = require("./repository-provisioning");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+// Git may use SHA-1 (40) or SHA-256 (64) object IDs. Durable content
+// digests remain 64 hex and are still recomputed by their owning contracts.
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 class RegisteredWorkTaskBaseError extends Error {
   constructor(code, message = code) {

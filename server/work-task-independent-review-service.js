@@ -16,7 +16,7 @@ const { assertTaskReviewRoundRef, taskReviewRoundKey } = require("./task-review-
 
 const VERSION = 1;
 const IDENTIFIER_RE = /^[a-z][a-z0-9_-]{2,95}$/;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 class WorkTaskIndependentReviewServiceError extends Error {
   constructor(code, message = code) { super(message); this.name = "WorkTaskIndependentReviewServiceError"; this.code = code; }
