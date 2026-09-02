@@ -7,7 +7,8 @@
 // the later #1048 target-union integration will admit.
 
 const crypto = require("node:crypto");
-const { assertDeliveryManifest, deliveryCandidateKey } = require("./delivery-candidate");
+const { assertDeliveryManifest, assertDeliveryCandidateRef, deliveryCandidateKey } = require("./delivery-candidate");
+const { assertWorkItemRef } = require("./work-item-ref");
 const { normalizeCiPolicy, deriveCiPolicyIdentity, canonicalSha } = require("./ci-evidence-policy");
 
 const VERSION = 1;
@@ -70,8 +71,8 @@ function identityFor(manifest, prFact, policy) {
     work_items,
     pr_number: prFact.number,
     exact_sha: prFact.exact_sha,
-    policy_version: policy_identity === null ? null : policy_identity.version,
-    policy_digest: policy_identity === null ? null : policy_identity.digest,
+    policy_version: policy_identity === null ? null : policy_identity.policy_version,
+    policy_digest: policy_identity === null ? null : policy_identity.policy_digest,
   };
 }
 function identityDigest(identity) {
@@ -87,12 +88,57 @@ function slotDigest(identity) {
   return hash({ version: identity.version, target_kind: identity.target_kind, installation_id: identity.installation_id,
     project_id: identity.project_id, repo_key: identity.repo_key, repo: identity.repo, pr_number: identity.pr_number });
 }
+function assertDeliveryReviewTargetIdentity(identity, code = "invalid_delivery_review_target") {
+  exact(identity, ["version", "target_kind", "installation_id", "project_id", "repo_key", "repo", "delivery_candidate_ref", "delivery_candidate_key", "delivery_manifest_digest", "work_items", "pr_number", "exact_sha", "policy_version", "policy_digest"], code);
+  if (identity.version !== VERSION || identity.target_kind !== TARGET_KIND || typeof identity.installation_id !== "string" || identity.installation_id.length === 0 ||
+      typeof identity.project_id !== "string" || identity.project_id.length === 0 || typeof identity.repo_key !== "string" || identity.repo_key.length === 0 ||
+      !canonicalRepository(identity.repo, code) || !Number.isSafeInteger(identity.pr_number) || identity.pr_number < 1 || !canonicalSha(identity.exact_sha) ||
+      !SHA_RE.test(identity.delivery_manifest_digest) || !Array.isArray(identity.work_items) || identity.work_items.length === 0) {
+    fail(code, "Delivery Candidate review target identity is invalid");
+  }
+  let ref;
+  try { ref = assertDeliveryCandidateRef(identity.delivery_candidate_ref); }
+  catch { fail(code, "Delivery Candidate reference is invalid"); }
+  if (ref.installation_id !== identity.installation_id || ref.project_id !== identity.project_id || ref.repository_key !== identity.repo_key ||
+      identity.delivery_candidate_key !== deliveryCandidateKey(ref)) {
+    fail(code, "Delivery Candidate review target reference does not match its identity");
+  }
+  if ((identity.policy_version === null) !== (identity.policy_digest === null) ||
+      !(identity.policy_version === null || (Number.isSafeInteger(identity.policy_version) && identity.policy_version >= 1)) ||
+      !(identity.policy_digest === null || SHA_RE.test(identity.policy_digest))) {
+    fail(code, "Delivery Candidate policy identity is invalid");
+  }
+  const workItemKeys = new Set();
+  for (const item of identity.work_items) {
+    try { assertWorkItemRef(item); } catch { fail(code, "Delivery Candidate work item is invalid"); }
+    if (item.repoKey !== identity.repo_key || canonicalRepository(item.repo, code) !== canonicalRepository(identity.repo, code)) fail(code, "Delivery Candidate work item repository is invalid");
+    const key = `${item.repoKey}:${item.number}:${item.kind}`;
+    if (workItemKeys.has(key)) fail(code, "Delivery Candidate work items are duplicated");
+    workItemKeys.add(key);
+  }
+  return identity;
+}
+function assertDerivedDeliveryReviewTarget(target, code = "invalid_delivery_review_target") {
+  exact(target, ["version", "target_kind", "identity", "target_identity_digest", "slot_digest", "observed"], code);
+  if (target.version !== VERSION || target.target_kind !== TARGET_KIND || !SHA_RE.test(target.target_identity_digest) || !SHA_RE.test(target.slot_digest)) {
+    fail(code, "Delivery Candidate review target envelope is invalid");
+  }
+  assertDeliveryReviewTargetIdentity(target.identity, code);
+  exact(target.observed, ["draft", "mergeable"], code);
+  if (typeof target.observed.draft !== "boolean" || typeof target.observed.mergeable !== "boolean" ||
+      target.target_identity_digest !== identityDigest(target.identity) || target.slot_digest !== slotDigest(target.identity)) {
+    fail(code, "Delivery Candidate review target digest or observation is invalid");
+  }
+  return target;
+}
 function deriveDeliveryReviewTarget(value) {
   const input = source(value);
   const identity = identityFor(input.manifest, input.pr, input.policy);
   if (!SHA_RE.test(identity.delivery_manifest_digest)) fail("invalid_delivery_review_target_source", "Delivery Candidate manifest digest is invalid");
-  return freeze({ version: VERSION, target_kind: TARGET_KIND, identity: freeze(identity), target_identity_digest: identityDigest(identity), slot_digest: slotDigest(identity),
-    observed: freeze({ draft: input.pr.draft, mergeable: input.pr.mergeable }) });
+  const target = { version: VERSION, target_kind: TARGET_KIND, identity, target_identity_digest: identityDigest(identity), slot_digest: slotDigest(identity),
+    observed: { draft: input.pr.draft, mergeable: input.pr.mergeable } };
+  assertDerivedDeliveryReviewTarget(target, "invalid_delivery_review_target_source");
+  return freeze(target);
 }
 
-module.exports = { VERSION, TARGET_KIND, DeliveryReviewTargetError, deriveDeliveryReviewTarget, identityDigest, slotDigest };
+module.exports = { VERSION, TARGET_KIND, DeliveryReviewTargetError, deriveDeliveryReviewTarget, assertDeliveryReviewTargetIdentity, assertDerivedDeliveryReviewTarget, identityDigest, slotDigest };

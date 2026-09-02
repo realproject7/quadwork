@@ -33,12 +33,10 @@ function publicHandoff(cycle) {
   // Deliberately no review prose, findings, review body, nonce, path, or
   // generic chat content.  The UI/replay consumer gets the exact identity and
   // orthogonal facts only.
-  return Object.freeze({
+  const common = {
     target_kind: cycle.target.target_kind,
     installation_id: cycle.target.installation_id,
     repo_key: cycle.target.repo_key,
-    issue: cycle.target.work_item.number,
-    contract_revision: cycle.target.contract_revision,
     pr_number: cycle.target.pr_number,
     exact_sha: cycle.target.exact_sha,
     policy_version: cycle.target.policy_version,
@@ -50,7 +48,16 @@ function publicHandoff(cycle) {
     mergeable: cycle.mergeable,
     head_gate_due: cycle.head_gate_due,
     dev_fix_owner: cycle.review_state === "changes_requested" || cycle.ci_state === "product_failure",
-  });
+  };
+  if (cycle.target.target_kind === "delivery_candidate_pr") {
+    return Object.freeze({
+      ...common,
+      delivery_candidate_ref: cycle.target.delivery_candidate_ref,
+      delivery_manifest_digest: cycle.target.delivery_manifest_digest,
+      work_items: cycle.target.work_items,
+    });
+  }
+  return Object.freeze({ ...common, issue: cycle.target.work_item.number, contract_revision: cycle.target.contract_revision });
 }
 
 class ReviewCycleDispatcher {

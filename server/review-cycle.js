@@ -12,6 +12,13 @@ const os = require("os");
 const path = require("path");
 const { assertWorkItemRef } = require("./work-item-ref");
 const { canonicalSha, normalizeCiPolicy } = require("./ci-evidence-policy");
+const {
+  TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND,
+  assertDeliveryReviewTargetIdentity,
+  assertDerivedDeliveryReviewTarget,
+  identityDigest: deliveryTargetIdentityDigest,
+  slotDigest: deliveryTargetSlotDigest,
+} = require("./delivery-review-target");
 
 // V2 adds the persisted, bounded reviewer lease/reminder facts required by
 // the server dispatcher. Earlier documents are migrated in-memory on read;
@@ -137,6 +144,7 @@ function reviewId(value) {
 }
 
 function targetDigestIdentity(identity) {
+  if (identity?.target_kind === DELIVERY_REVIEW_TARGET_KIND) return null;
   return {
     version: identity.version,
     target_kind: identity.target_kind,
@@ -163,6 +171,7 @@ function targetDigestIdentity(identity) {
 }
 
 function slotDigestIdentity(identity) {
+  if (identity?.target_kind === DELIVERY_REVIEW_TARGET_KIND) return null;
   return {
     version: identity.version,
     target_kind: identity.target_kind,
@@ -181,10 +190,12 @@ function slotDigestIdentity(identity) {
 }
 
 function targetIdentityDigest(identity) {
+  if (identity?.target_kind === DELIVERY_REVIEW_TARGET_KIND) return deliveryTargetIdentityDigest(identity);
   return sha256(targetDigestIdentity(identity));
 }
 
 function targetSlotDigest(identity) {
+  if (identity?.target_kind === DELIVERY_REVIEW_TARGET_KIND) return deliveryTargetSlotDigest(identity);
   return sha256(slotDigestIdentity(identity));
 }
 
@@ -235,6 +246,13 @@ function v3TargetIdentityDigest(identity) { return sha256(v3TargetDigestIdentity
 function v3TargetSlotDigest(identity) { return sha256(v3SlotDigestIdentity(identity)); }
 
 function assertTargetIdentity(identity, code = "invalid_review_cycle_target") {
+  if (!isPlainObject(identity) || typeof identity.target_kind !== "string") {
+    fail(code, "review target identity is invalid");
+  }
+  if (identity.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    try { return assertDeliveryReviewTargetIdentity(identity, code); }
+    catch { fail(code, "Delivery Candidate review target identity is invalid"); }
+  }
   exactKeys(identity, [
     "version",
     "target_kind",
@@ -349,6 +367,13 @@ function deriveLegacyReviewTarget(source) {
 }
 
 function assertDerivedTarget(target) {
+  if (!isPlainObject(target) || typeof target.target_kind !== "string") {
+    fail("invalid_review_cycle_target", "review target envelope is invalid");
+  }
+  if (target.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    try { return assertDerivedDeliveryReviewTarget(target, "invalid_review_cycle_target"); }
+    catch { fail("invalid_review_cycle_target", "Delivery Candidate review target is invalid"); }
+  }
   exactKeys(target, ["version", "target_kind", "identity", "target_identity_digest", "slot_digest", "observed"], "invalid_review_cycle_target");
   if (target.version !== 1 || target.target_kind !== LEGACY_REVIEW_TARGET_KIND || !DIGEST_RE.test(target.target_identity_digest) ||
       !DIGEST_RE.test(target.slot_digest)) {
@@ -492,7 +517,7 @@ function normalizeCycle(value, expectedId) {
         value.invalidation.reasons.length > 4 || !validIsoTimestamp(value.invalidation.at)) {
       fail("review_cycle_store_invalid", "review-cycle invalidation is invalid");
     }
-    const allowed = new Set(["exact_sha_changed", "contract_changed", "policy_changed", "assignment_changed"]);
+    const allowed = new Set(["exact_sha_changed", "contract_changed", "policy_changed", "assignment_changed", "delivery_candidate_changed"]);
     const reasons = [...new Set(value.invalidation.reasons)];
     if (reasons.length !== value.invalidation.reasons.length || reasons.some((reason) => !allowed.has(reason))) {
       fail("review_cycle_store_invalid", "review-cycle invalidation reason is invalid");
@@ -596,6 +621,9 @@ function migrateV3Document(value) {
   for (const [cycleId, raw] of Object.entries(value.cycles)) {
     if (!CYCLE_ID_RE.test(cycleId) || !isPlainObject(raw) || !isPlainObject(raw.target)) {
       fail("review_cycle_store_invalid", "review-cycle record is invalid");
+    }
+    if (raw.target.target_kind !== LEGACY_REVIEW_TARGET_KIND) {
+      fail("review_cycle_store_invalid", "V3 review-cycle target kind is invalid");
     }
     try { assertTargetIdentity(raw.target, "review_cycle_store_invalid"); }
     catch (error) { if (error instanceof ReviewCycleError) throw error; fail("review_cycle_store_invalid", "review-cycle target is invalid"); }
@@ -730,11 +758,18 @@ function initialReadiness(target, requiresFreshAttempt) {
 function invalidationReasons(previous, next) {
   const reasons = [];
   if (previous.target.exact_sha !== next.identity.exact_sha) reasons.push("exact_sha_changed");
-  if (previous.target.contract_revision !== next.identity.contract_revision) reasons.push("contract_changed");
+  if (previous.target.target_kind === LEGACY_REVIEW_TARGET_KIND && next.identity.target_kind === LEGACY_REVIEW_TARGET_KIND &&
+      previous.target.contract_revision !== next.identity.contract_revision) reasons.push("contract_changed");
+  if (previous.target.target_kind === DELIVERY_REVIEW_TARGET_KIND && next.identity.target_kind === DELIVERY_REVIEW_TARGET_KIND &&
+      (previous.target.delivery_manifest_digest !== next.identity.delivery_manifest_digest ||
+       previous.target.delivery_candidate_key !== next.identity.delivery_candidate_key)) {
+    reasons.push("delivery_candidate_changed");
+  }
   if (previous.target.policy_version !== next.identity.policy_version || previous.target.policy_digest !== next.identity.policy_digest) {
     reasons.push("policy_changed");
   }
-  if (previous.target.assignment_attempt !== next.identity.assignment_attempt) reasons.push("assignment_changed");
+  if (previous.target.target_kind === LEGACY_REVIEW_TARGET_KIND && next.identity.target_kind === LEGACY_REVIEW_TARGET_KIND &&
+      previous.target.assignment_attempt !== next.identity.assignment_attempt) reasons.push("assignment_changed");
   return reasons;
 }
 
@@ -922,7 +957,9 @@ class ReviewCycleStore {
           correlation_id: eventCorrelation(current.cycle_id, "contract_changed"),
           created_at: at,
         };
-        requiresFreshAttempt = current.target.assignment_attempt === target.identity.assignment_attempt;
+        requiresFreshAttempt = current.target.target_kind === LEGACY_REVIEW_TARGET_KIND &&
+          target.identity.target_kind === LEGACY_REVIEW_TARGET_KIND &&
+          current.target.assignment_attempt === target.identity.assignment_attempt;
       }
       current.updated_at = at;
       delete document.slots[current.slot_digest];

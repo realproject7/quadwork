@@ -3,12 +3,16 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { buildBatchManifest, freezeBatchManifest } = require("./work-task-manifest");
 const { buildWorkTaskCandidate } = require("./work-task-candidate");
 const { openTaskReviewRound, submitTaskReviewReceipt } = require("./task-review-round");
 const { buildDeliveryManifest } = require("./delivery-candidate");
 const { DeliveryReviewTargetError, TARGET_KIND, deriveDeliveryReviewTarget } = require("./delivery-review-target");
+const { ReviewCycleStore } = require("./review-cycle");
+const { ReviewCycleDispatcher } = require("./review-cycle-dispatcher");
+const { envelopeFor } = require("./review-cycle-event");
 
 const installation_id = "installation_delivery_target_01", project_id = "quadwork";
 const base_sha = "a".repeat(64), candidate_sha = "b".repeat(64), result_sha = "c".repeat(64);
@@ -57,6 +61,31 @@ function manifest() {
   assert.equal(first.slot_digest, retip.slot_digest);
   assert.throws(() => deriveDeliveryReviewTarget({ ...value, pr: { ...value.pr, exact_sha: "nope" } }), (error) => error instanceof DeliveryReviewTargetError && error.code === "invalid_delivery_review_target_source");
   console.log("  PASS: tip changes invalidate final target identity without changing its PR slot");
+}
+
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-delivery-review-cycle-"));
+  try {
+    const observed = { delivery_manifest: manifest(), pr: { number: 88, exact_sha: "2".repeat(40), draft: false, mergeable: true }, ci_policy: { version: 1, mode: "github-checks", registration_grace_seconds: 60, same_sha_retry_budget: 1, checks: [{ name: "test", required: true, kind: "product" }] } };
+    const current = deriveDeliveryReviewTarget(observed);
+    const store = new ReviewCycleStore({ rootDir: root, now: () => new Date("2026-09-02T03:00:00.000Z") });
+    assert.equal(store.reconcile(project_id, current).cycle.readiness, "ready");
+    store.setCiState(project_id, current, "pending");
+    assert.equal(store.planReviewRequest(project_id, current).kind, "review_request");
+    assert.equal(new ReviewCycleStore({ rootDir: root }).current(project_id, current).target.target_kind, TARGET_KIND);
+    const retipped = deriveDeliveryReviewTarget({ ...observed, pr: { ...observed.pr, exact_sha: "3".repeat(40) } });
+    assert.deepEqual(store.reconcile(project_id, retipped).invalidated.reasons, ["exact_sha_changed"]);
+    const dispatched = new ReviewCycleDispatcher({ store }).observe({ project_id, target: retipped, ci_state: "pending", archived: false });
+    assert.equal(dispatched.handoff.delivery_manifest_digest, retipped.identity.delivery_manifest_digest);
+    assert.deepEqual(dispatched.handoff.work_items, retipped.identity.work_items);
+    const envelope = envelopeFor(project_id, dispatched.cycle, dispatched.plans[0].plan);
+    assert.match(envelope.text, /^@re1 @re2 \[DELIVERY REVIEW REQUEST\] repo=web delivery=cut_delivery_target manifest=[a-f0-9]{64} items=web#42:issue pr=88 sha=[a-f0-9]{40} cycle=rc_/);
+    assert.equal(envelope.anchors.issue, undefined);
+    assert.equal(envelope.anchors.contract_revision, undefined);
+    console.log("  PASS: exact-SHA review-cycle state accepts, persists, and retip-invalidates a sealed Delivery Candidate target");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
 
 {

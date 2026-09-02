@@ -5,6 +5,7 @@
 // never message text, a recipient list, or arbitrary metadata.
 
 const { eventCorrelation } = require("./review-cycle");
+const { TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND } = require("./delivery-review-target");
 
 const VERSION = 1;
 const PROJECT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -35,10 +36,32 @@ function exactKeys(value, keys) {
 function cycleAnchors(projectId, cycle) {
   if (!PROJECT_ID_RE.test(projectId) || !isPlainObject(cycle) || !isPlainObject(cycle.target)) fail("review_cycle_event_invalid");
   const target = cycle.target;
-  if (!REPO_KEY_RE.test(target.repo_key) || !Number.isSafeInteger(target.work_item?.number) || target.work_item.number < 1 ||
-      !Number.isSafeInteger(target.pr_number) || target.pr_number < 1 || !SHA_RE.test(target.exact_sha) ||
-      !DIGEST_RE.test(target.contract_revision) || !CYCLE_RE.test(cycle.cycle_id) ||
+  if (!REPO_KEY_RE.test(target.repo_key) || !Number.isSafeInteger(target.pr_number) || target.pr_number < 1 ||
+      !SHA_RE.test(target.exact_sha) || !CYCLE_RE.test(cycle.cycle_id) ||
       !DIGEST_RE.test(cycle.target_identity_digest) || target.project_id !== projectId) {
+    fail("review_cycle_event_invalid");
+  }
+  if (target.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    const items = target.work_items;
+    if (!isPlainObject(target.delivery_candidate_ref) || typeof target.delivery_candidate_ref.cut_id !== "string" ||
+        !DIGEST_RE.test(target.delivery_manifest_digest) || !Array.isArray(items) || items.length === 0 ||
+        items.some((item) => !isPlainObject(item) || item.repoKey !== target.repo_key || !Number.isSafeInteger(item.number) || item.number < 1 || typeof item.kind !== "string")) {
+      fail("review_cycle_event_invalid");
+    }
+    return Object.freeze({
+      target_kind: target.target_kind,
+      project_id: projectId,
+      repo_key: target.repo_key,
+      delivery_cut: target.delivery_candidate_ref.cut_id,
+      delivery_manifest_digest: target.delivery_manifest_digest,
+      work_items: items.map((item) => `${item.repoKey}#${item.number}:${item.kind}`),
+      pr: String(target.pr_number),
+      sha: target.exact_sha,
+      cycle_id: cycle.cycle_id,
+      target_identity_digest: cycle.target_identity_digest,
+    });
+  }
+  if (!Number.isSafeInteger(target.work_item?.number) || target.work_item.number < 1 || !DIGEST_RE.test(target.contract_revision)) {
     fail("review_cycle_event_invalid");
   }
   return Object.freeze({
@@ -63,6 +86,13 @@ function eventRecipient(kind, plan) {
 }
 
 function fixedText(kind, anchors, recipients) {
+  if (anchors.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    const base = `repo=${anchors.repo_key} delivery=${anchors.delivery_cut} manifest=${anchors.delivery_manifest_digest} items=${anchors.work_items.join(",")} pr=${anchors.pr} sha=${anchors.sha} cycle=${anchors.cycle_id}`;
+    if (kind === "review_request") return `@re1 @re2 [DELIVERY REVIEW REQUEST] ${base}`;
+    if (kind === "review_reminder") return `@${recipients[0]} [DELIVERY REVIEW REMINDER] ${base}`;
+    if (kind === "head_gate_due") return `@head [DELIVERY MERGE GATE DUE] ${base}`;
+    return `@head [DELIVERY CANDIDATE CHANGED] ${base}`;
+  }
   const base = `repo=${anchors.repo_key} issue=${anchors.issue} contract=${anchors.contract_revision} pr=${anchors.pr} sha=${anchors.sha} cycle=${anchors.cycle_id}`;
   if (kind === "review_request") return `@re1 @re2 [REVIEW REQUEST] ${base}`;
   if (kind === "review_reminder") return `@${recipients[0]} [REVIEW REMINDER] ${base}`;
