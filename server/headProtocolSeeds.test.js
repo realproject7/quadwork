@@ -103,7 +103,11 @@ assert.match(playbook, /\*\*Playbook version:\*\*\s+\d+\.\d+\.\d+/);
 for (const phase of ["Intake and proposal", "EPIC and ticket founding", "Ticket-review phase", "PR gate and merge", "Release and operator gates", "Terminal handoff"]) {
   assert.ok(playbook.includes(phase), `playbook includes ${phase}`);
 }
-assert.doesNotMatch(allContracts, /task_key|delivery[_ -]candidate/i,
-  "later execution/delivery schemas are not predeclared");
+assert.doesNotMatch(allContracts, /task_key/i,
+  "later execution schema internals are not predeclared in role contracts");
+assert.ok(head.includes("prepare_delivery_candidate") && head.includes("compose_delivery_candidate"),
+  "Head seed documents the advertised Delivery Candidate tools without exposing their internal schema");
+assert.ok(head.includes("Never construct a Delivery Candidate reference"),
+  "Head seed keeps Git evidence and candidate identity server-derived");
 
 console.log("headProtocolSeeds.test.js: all assertions passed");

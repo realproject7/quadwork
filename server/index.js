@@ -39,6 +39,11 @@ const { createWorkTaskBuildRuntime } = require("./work-task-build-runtime");
 const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
 const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 const { createWorkTaskReviewRuntime } = require("./work-task-review-runtime");
+const { createWorkTaskDeliverySource } = require("./work-task-delivery-source");
+const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
+const { createDeliveryCompositionService } = require("./delivery-composition-service");
+const { createDeliveryCandidateRuntime } = require("./delivery-candidate-runtime");
+const { createDeliveryGitObjectAdapter } = require("./delivery-git-object-adapter");
 const { createCanonicalInstalledStateReader } = require("./canonical-installed-state");
 const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
 const { createChatResumeRuntime } = require("./chat-resume-runtime");
@@ -705,6 +710,69 @@ function registeredWorkTaskBaseForProject(projectId) {
   });
 }
 
+// #1060 M6: Delivery Candidate provenance is reconstructed only from the
+// same registered repository configuration as WorkTask build bases. Head
+// never supplies a filesystem path, remote, result SHA, or object accessor.
+function registeredDeliveryRepository(projectId, request) {
+  const cfg = readConfig();
+  const project = cfg.projects?.find((entry) => entry?.id === projectId && entry.archived !== true);
+  const registered = project ? allRepositories(project).find((entry) => entry?.key === request?.repository_key) : null;
+  if (!project || !registered || request?.installation_id !== cfg.installation_id || request?.project_id !== projectId) {
+    throw new TypeError("V2 delivery repository is unavailable");
+  }
+  return {
+    version: 1,
+    installation_id: cfg.installation_id,
+    project_id: projectId,
+    repository_key: registered.key,
+    repository: registered.repo,
+  };
+}
+
+function deliverySourceForProject(projectId) {
+  return createWorkTaskDeliverySource({
+    config_dir: path.dirname(CONFIG_PATH),
+    fs,
+    read_registered_repository: (request) => registeredDeliveryRepository(projectId, request),
+  });
+}
+
+function deliveryGitObjectsForProject(projectId) {
+  const cfg = readConfig();
+  const project = cfg.projects?.find((entry) => entry?.id === projectId && entry.archived !== true);
+  if (!project || typeof cfg.installation_id !== "string") throw new TypeError("V2 delivery project is unavailable");
+  const primary = primaryRepository(project);
+  const primaryAgentCwds = {};
+  if (primary) {
+    for (const role of ["head", "re1", "re2", "dev"]) {
+      const cwd = project.agents?.[role]?.cwd;
+      if (typeof cwd === "string" && path.isAbsolute(cwd)) primaryAgentCwds[role] = cwd;
+    }
+  }
+  return createDeliveryGitObjectAdapter({
+    repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
+    canonicalize_path: (request) => fs.realpathSync(request.path),
+    run_git: (request) => {
+      try {
+        return {
+          ok: true,
+          output: execFileSync("git", request.args, {
+            cwd: request.cwd,
+            encoding: "utf8",
+            stdio: "pipe",
+            timeout: 5000,
+            maxBuffer: 4 * 1024 * 1024,
+            ...(typeof request.input === "string" ? { input: request.input } : {}),
+          }),
+        };
+      } catch {
+        return { ok: false, output: "" };
+      }
+    },
+    read_delivery_source: (request) => deliverySourceForProject(projectId).readStagedSource(request),
+  });
+}
+
 function activeDevCandidatePrincipal(req) {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   const principal = fileChat.resolveShimPrincipal(token);
@@ -754,6 +822,25 @@ const workTaskBuildRuntime = createWorkTaskBuildRuntime({
   create_live_identity_resolver: createLiveWorkTaskIdentityResolver,
   create_assignment_service: createWorkTaskBuildAssignmentService,
   read_registered_base: (projectId, request) => registeredWorkTaskBaseForProject(projectId).readRegisteredBase(request),
+});
+
+// #1060 M7: one fixed Head-token bridge for local Delivery Candidate
+// preparation and object-level composition. The route/MCP caller can choose
+// only a registered repository key or an already server-derived candidate
+// reference; all durable pipeline state and Git evidence remain server-owned.
+const deliveryCandidateRuntime = createDeliveryCandidateRuntime({
+  config_dir: path.dirname(CONFIG_PATH),
+  fs,
+  read_config: readConfig,
+  capture_project_admission: captureProjectAdmission,
+  is_admission_current: isAdmissionCurrent,
+  resolve_shim_principal: fileChat.resolveShimPrincipal,
+  agent_sessions: agentSessions,
+  read_delivery_source: (request) => deliverySourceForProject(request.project_id).readStagedSource(request),
+  read_delivery_evidence: (request) => deliveryGitObjectsForProject(request.head_binding.project_id).readDeliveryEvidence(request),
+  create_candidate_store: createDeliveryCandidateStore,
+  create_composition_service: createDeliveryCompositionService,
+  repository_objects_for: (request) => deliveryGitObjectsForProject(request.head_binding.project_id).repositoryObjectsFor(request),
 });
 
 // #1047: Head's recovery cursor secret is stable across Head process/token
@@ -917,6 +1004,28 @@ app.post("/api/work-task-review/reconcile", (req, res) => {
     return res.json({ ok: true, ...workTaskReviewRuntime.reconcile({ token, body: req.body }) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "work_task_review_reconciliation_unavailable" });
+  }
+});
+
+// #1060 M7: two fixed Head-only Delivery Candidate transitions. Preparation
+// observes the current registered-clone HEAD; composition only records a
+// deterministic local Git-object proof. Neither endpoint publishes a branch,
+// creates a PR, starts CI, or merges.
+app.post("/api/delivery-candidate/prepare", (req, res) => {
+  const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
+  try {
+    return res.json({ ok: true, ...deliveryCandidateRuntime.prepare({ token, body: req.body }) });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_prepare_unavailable" });
+  }
+});
+
+app.post("/api/delivery-candidate/compose", (req, res) => {
+  const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
+  try {
+    return res.json({ ok: true, ...deliveryCandidateRuntime.compose({ token, body: req.body }) });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_compose_unavailable" });
   }
 });
 

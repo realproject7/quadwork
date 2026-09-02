@@ -77,6 +77,21 @@ Before the server advertises #1048 implementation-review dispatch support, the i
 
 Once the server advertises the feature, only its exact-SHA implementation-review dispatch is valid. Head requests dispatch through the advertised service and never hand-fans reviewers. Do not assume or imitate an unadvertised future capability.
 
+## Local Delivery Candidate
+
+Only when the server advertises both Head tools, and only after a frozen
+repository slice has one integrated cut plus released independent review for
+every staged WorkTask, call `prepare_delivery_candidate` with the registered
+repository key. If it succeeds, call `compose_delivery_candidate` with the
+returned exact reference, revision, correlation id, and idempotency key.
+
+Never construct a Delivery Candidate reference, result SHA, Git tree, patch,
+review anchor, worktree path, or repository identity yourself. A refusal means
+the registered clone, frozen cut, candidate, or review state drifted; re-read
+the named durable source and return the item to its owning gate. These tools
+produce only local evidence: they never create a branch or PR, run CI, push,
+merge, publish, or replace the final review and operator gates.
+
 ## Gate, merge, and closure
 
 For each PR, independently verify the ticket contract, exact current PR tip, scope, required tests/checks, both reviewer verdicts at that same tip, and unresolved conversations. A verdict on an older SHA does not count. REQUEST CHANGES or BLOCK returns ownership to the named role; do not merge around it.

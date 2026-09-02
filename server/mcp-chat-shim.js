@@ -198,6 +198,33 @@ const RECONCILE_WORK_TASK_REVIEW_TOOL = {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
 
+const PREPARE_DELIVERY_CANDIDATE_TOOL = {
+  name: "prepare_delivery_candidate",
+  description: "Prepare the authenticated Head's local Delivery Candidate for one registered repository. The server derives the frozen cut, result SHA, review anchors, Git-object evidence, and candidate identity; this does not push, create a PR, start CI, or merge.",
+  inputSchema: {
+    type: "object",
+    properties: { repository_key: { type: "string" } },
+    required: ["repository_key"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const COMPOSE_DELIVERY_CANDIDATE_TOOL = {
+  name: "compose_delivery_candidate",
+  description: "Record the authenticated Head's deterministic local Git-object composition proof for an already prepared Delivery Candidate. This has no branch, PR, CI, merge, or publication authority.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      delivery_candidate_ref: { type: "object" },
+      expected_revision: { type: "integer", minimum: 0 },
+      correlation_id: { type: "string" },
+      idempotency_key: { type: "string" },
+    },
+    required: ["delivery_candidate_ref", "expected_revision", "correlation_id", "idempotency_key"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
 const SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL = {
   name: "submit_review_cycle_receipt",
   description: "Bind this authenticated reviewer's one current GitHub review object to the server-owned exact-SHA review cycle. Chat claims and prose are not accepted.",
@@ -261,7 +288,14 @@ function parseChatResumeArguments(value) {
 function toolsForActor() {
   if (!PROJECT_ROLES.has(AGENT)) return CHAT_TOOLS;
   const tools = [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL, READ_CI_EVIDENCE_TOOL];
-  if (AGENT === "head" && TOKEN) tools.push(CHAT_RESUME_TOOL, ASSIGN_WORK_TASK_BUILD_TOOL, OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL, RECONCILE_WORK_TASK_REVIEW_TOOL);
+  if (AGENT === "head" && TOKEN) tools.push(
+    CHAT_RESUME_TOOL,
+    ASSIGN_WORK_TASK_BUILD_TOOL,
+    OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL,
+    RECONCILE_WORK_TASK_REVIEW_TOOL,
+    PREPARE_DELIVERY_CANDIDATE_TOOL,
+    COMPOSE_DELIVERY_CANDIDATE_TOOL,
+  );
   if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL, SUBMIT_WORK_TASK_CANDIDATE_TOOL);
   if (AGENT === "re1" || AGENT === "re2") tools.push(ISSUE_REVIEW_CYCLE_NONCE_TOOL, SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL, SUBMIT_WORK_TASK_REVIEW_RECEIPT_TOOL);
   return tools;
@@ -423,6 +457,20 @@ async function handleToolCall(id, name, params) {
       if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: reconcile_work_task_review");
       const res = await httpRequest("POST", "/api/work-task-review/reconcile", params, { "X-Chat-Token": TOKEN });
       if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask review reconciliation unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "prepare_delivery_candidate") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: prepare_delivery_candidate");
+      const res = await httpRequest("POST", "/api/delivery-candidate/prepare", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate preparation unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "compose_delivery_candidate") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: compose_delivery_candidate");
+      const res = await httpRequest("POST", "/api/delivery-candidate/compose", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate composition unavailable");
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
     }
 
