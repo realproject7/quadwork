@@ -328,8 +328,16 @@ function assertCutContents(ref, repository, batch, staged, deferred, evidence) {
   }
 
   if (ref.delivery_mode === "integrated") {
-    if (entries.some((entry) => entry.ref.repository_key !== ref.repository_key)) fail("integrated_delivery_requires_single_repository", "integrated delivery cannot span registered repositories");
-    if (staged.length !== entries.length || deferredEntries.length !== 0) fail("integrated_delivery_requires_complete_batch", "integrated delivery must cut the whole frozen batch");
+    // An integrated cut is whole-repository, not necessarily whole-batch:
+    // V2 freezes one project batch that can contain independent registered
+    // repositories.  Each repository gets its own final candidate, while the
+    // closed dependency check above still rejects a staged task whose required
+    // predecessor is deferred in another repository.
+    const repositoryEntries = entries.filter((entry) => entry.ref.repository_key === ref.repository_key);
+    if (repositoryEntries.length === 0 || staged.length !== repositoryEntries.length ||
+        deferredEntries.some((entry) => entry.work_task_ref.repository_key === ref.repository_key)) {
+      fail("integrated_delivery_requires_complete_batch", "integrated delivery must cut every frozen task for its registered repository");
+    }
     if (staged.some((stage) => stage.candidate.base_sha !== ref.base_sha)) fail("integrated_delivery_base_mismatch", "integrated candidates must share the delivery base SHA");
   } else {
     if (staged.length !== 1 || deferredEntries.length !== entries.length - 1) fail("isolated_delivery_requires_single_task", "isolated delivery must stage one task and defer all peers");

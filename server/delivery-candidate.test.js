@@ -258,8 +258,9 @@ function integratedFixture() {
   throwsCode(() => buildDeliveryManifest(stale, options()), "stale_delivery_review_anchor");
 }
 
-// Integrated cuts must cover one repository's entire frozen batch. Duplicate
-// tasks, reordered provenance, and undeclared peers cannot become a partial cut.
+// Integrated cuts must cover their registered repository's entire frozen
+// batch slice. Duplicate tasks, reordered provenance, and undeclared same-repo
+// peers cannot become a partial cut.
 {
   const fixture = integratedFixture();
   const duplicate = copy(fixture.input);
@@ -273,6 +274,40 @@ function integratedFixture() {
   const reversed = copy(fixture.input);
   reversed.staged_tasks.reverse();
   throwsCode(() => buildDeliveryManifest(reversed, options()), "invalid_delivery_task_order");
+}
+
+// One frozen project batch may contain separate registered repositories. A
+// Delivery Candidate may stage one whole repository slice and defer the other
+// slice, but it may not use that split to omit a cross-repository prerequisite.
+{
+  const split = frozenBatch([
+    task({ task_key: "web", work_item: web42, boundary: ["server/web.js"] }),
+    task({ task_key: "api", work_item: api42, boundary: ["server/api.js"] }),
+  ]);
+  const web = candidate(split.tasks[0].ref, "b".repeat(64), "wt_split_web");
+  const ref = candidateRef(split, "integrated", "f".repeat(64), "cut-split");
+  const input = {
+    version: 1, delivery_candidate_ref: ref, frozen_batch_manifest: split,
+    staged_tasks: [{ candidate: web, review_round: releasedRound(web, "split") }],
+    deferred_exclusions: [{ work_task_ref: copy(split.tasks[1].ref), reason: "separate_repository_delivery_candidate" }],
+    evidence: evidence(ref, ["server/web.js"]),
+  };
+  const manifest = buildDeliveryManifest(input, options());
+  assert.equal(manifest.staged_tasks.length, 1);
+  assert.equal(manifest.deferred_exclusions[0].work_task_ref.repository_key, "api");
+
+  const dependent = frozenBatch([
+    task({ task_key: "api", work_item: api42, boundary: ["server/api.js"] }),
+    task({ task_key: "web", work_item: web42, boundary: ["server/web.js"], dependencies: [dependency(api42, "api")] }),
+  ]);
+  const dependentWeb = candidate(dependent.tasks[1].ref, "c".repeat(64), "wt_split_dependency");
+  const dependentRef = candidateRef(dependent, "integrated", "f".repeat(64), "cut-split-dependent");
+  throwsCode(() => buildDeliveryManifest({
+    version: 1, delivery_candidate_ref: dependentRef, frozen_batch_manifest: dependent,
+    staged_tasks: [{ candidate: dependentWeb, review_round: releasedRound(dependentWeb, "split-dependency") }],
+    deferred_exclusions: [{ work_task_ref: copy(dependent.tasks[0].ref), reason: "separate_repository_delivery_candidate" }],
+    evidence: evidence(dependentRef, ["server/web.js"]),
+  }, options()), "unsafe_partial_delivery_cut");
 }
 
 // Independent WorkTasks may not claim the same declared boundary. A staged
