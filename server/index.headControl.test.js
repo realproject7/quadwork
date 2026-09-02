@@ -24,6 +24,10 @@ ok(/app\.get\("\/api\/work-task-batch",[\s\S]*?requireSessionToken\(req, res\)[\
   "the nested WorkTask Current Batch endpoint is session-bound and delegates identity resolution to the runtime");
 ok(/app\.post\("\/api\/work-task-candidate",[\s\S]*?activeDevCandidatePrincipal\(req\)[\s\S]*?createLiveWorkTaskIdentityResolver[\s\S]*?devCandidateServiceForProject\(principal\.projectId\)\.submitDevCandidate\(req\.body\)/.test(source),
   "the fixed Dev candidate endpoint re-proves live task identity before durable local-only recording");
+ok(/createWorkTaskReviewRuntime\(\{[\s\S]*?capture_project_admission:\s*captureProjectAdmission,[\s\S]*?resolve_shim_principal:\s*fileChat\.resolveShimPrincipal,[\s\S]*?agent_sessions:\s*agentSessions,[\s\S]*?create_review_service:\s*createWorkTaskIndependentReviewService/.test(source),
+  "the server composes independent review transport from admission, live identity, and current sessions only");
+ok(/app\.post\("\/api\/work-task-review\/open",[\s\S]*?X-Chat-Token[\s\S]*?workTaskReviewRuntime\.open\(\{ token, body: req\.body \}\)[\s\S]*?app\.post\("\/api\/work-task-review\/receipt",[\s\S]*?X-Chat-Token[\s\S]*?workTaskReviewRuntime\.submit\(\{ token, body: req\.body \}\)/.test(source),
+  "fixed Head-open and reviewer-receipt routes expose no caller-selected project or role");
 ok(/function headControlMcpEntry\(projectId, agentId, serverPort, token\)\s*\{[\s\S]*?if \(agentId !== "head"\) return null;[\s\S]*?captureProjectAdmission\(projectId\)[\s\S]*?registerHeadToken/.test(source),
   "only an admitted Head receives a bound Head-control MCP launch entry");
 ok(/head_control:\s*headControl/.test(source) && /mcp_servers\.head_control\.command/.test(source) && /\[mcp_servers\.head_control\]/.test(source),

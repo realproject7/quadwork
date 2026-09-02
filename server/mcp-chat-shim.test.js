@@ -26,6 +26,7 @@ let server;
 let serverPort;
 const issueFetches = [];
 const chatResumeRequests = [];
+const workTaskReviewRequests = [];
 let chatResumeFailure = false;
 let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
@@ -119,6 +120,19 @@ function startTestServer() {
       res.json({ ok: true, records: [], next_cursor: null });
     });
 
+    app.post("/api/work-task-review/open", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
+      workTaskReviewRequests.push({ kind: "open", token: req.headers["x-chat-token"], body: req.body });
+      res.json({ ok: true, outcome: "opened" });
+    });
+    app.post("/api/work-task-review/receipt", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || !["re1", "re2"].includes(principal.agentId)) return res.status(403).json({ ok: false });
+      workTaskReviewRequests.push({ kind: "receipt", role: principal.agentId, token: req.headers["x-chat-token"], body: req.body });
+      res.json({ ok: true, outcome: "sealed", view: { status: "sealed" } });
+    });
+
     app.get("/api/chat", (req, res) => {
       const msgs = fileChat.readMessages(PROJECT, {
         since_id: Number(req.query.since_id) || 0,
@@ -198,8 +212,10 @@ async function runTests() {
   assert(toolNames.includes("submit_work_task_candidate"), "tools/list exposes the local-only WorkTask candidate receipt only to dev");
   assert(toolNames.includes("read_ci_evidence"), "tools/list exposes redacted CI evidence reads to dev");
   assert(!toolNames.includes("chat_resume"), "tools/list hides Head-only chat_resume from dev");
+  assert(!toolNames.includes("open_work_task_independent_review"), "tools/list hides Head-only WorkTask review opening from dev");
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
     "tools/list hides reviewer-only review-cycle receipt tools from dev");
+  assert(!toolNames.includes("submit_work_task_review_receipt"), "tools/list hides independent WorkTask review receipts from dev");
 
   for (const role of ROLES.filter((role) => role !== AGENT)) {
     const token = crypto.randomBytes(16).toString("hex");
@@ -219,10 +235,14 @@ async function runTests() {
     const reviewerRole = role === "re1" || role === "re2";
     assert(roleToolNames.includes("chat_resume") === (role === "head"),
       `tools/list exposes chat_resume only to authenticated Head role ${role}`);
+    assert(roleToolNames.includes("open_work_task_independent_review") === (role === "head"),
+      `tools/list exposes WorkTask review opening only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("issue_review_cycle_nonce") === reviewerRole,
       `tools/list exposes review-cycle nonce issuance only to reviewer role ${role}`);
     assert(roleToolNames.includes("submit_review_cycle_receipt") === reviewerRole,
       `tools/list exposes review-cycle receipt submission only to reviewer role ${role}`);
+    assert(roleToolNames.includes("submit_work_task_review_receipt") === reviewerRole,
+      `tools/list exposes independent WorkTask receipt sealing only to reviewer role ${role}`);
     await stopShim(roleShim);
   }
 
@@ -240,6 +260,17 @@ async function runTests() {
     "chat_resume forwards only the exact cursor and bounded limit arguments");
   assert(chatResumeRequests[0].headers.token === HEAD_RESUME_TOKEN && chatResumeRequests[0].headers.sender === undefined,
     "chat_resume authenticates with the existing shim token only");
+
+  const openArguments = { event_id: "open_review_001", work_task_ref: { task_key: "review" }, attempt: "attempt_001", round: 1 };
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 211, method: "tools/call", params: {
+    name: "open_work_task_independent_review", arguments: openArguments,
+  } });
+  const openReviewResp = await readResponse(headShim);
+  assert(JSON.parse(openReviewResp.result?.content?.[0]?.text || "{}").outcome === "opened",
+    "authenticated Head can open the fixed WorkTask review endpoint");
+  assert(workTaskReviewRequests.length === 1 && workTaskReviewRequests[0].kind === "open" &&
+    workTaskReviewRequests[0].token === HEAD_RESUME_TOKEN && JSON.stringify(workTaskReviewRequests[0].body) === JSON.stringify(openArguments),
+  "Head review opening forwards only its typed arguments and existing shim token");
 
   for (const invalid of [
     {},
@@ -262,6 +293,13 @@ async function runTests() {
   assert(hiddenResume.error?.code === -32601, "non-Head hidden chat_resume calls are denied locally");
   assert(chatResumeRequests.length === 1, "non-Head chat_resume calls never reach the fixed endpoint");
 
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 231, method: "tools/call", params: {
+    name: "open_work_task_independent_review", arguments: openArguments,
+  } });
+  const hiddenOpen = await readResponse(shim);
+  assert(hiddenOpen.error?.code === -32601, "non-Head hidden WorkTask review opening calls are denied locally");
+  assert(workTaskReviewRequests.length === 1, "non-Head review opening calls never reach the fixed endpoint");
+
   chatResumeFailure = true;
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 24, method: "tools/call", params: {
     name: "chat_resume", arguments: { cursor: null, limit: 1 },
@@ -272,6 +310,21 @@ async function runTests() {
   assert(!JSON.stringify(failedResume).includes(HEAD_RESUME_TOKEN) && !JSON.stringify(failedResume).includes("/private/chat-resume"),
     "chat_resume never exposes token or endpoint diagnostics");
   await stopShim(headShim);
+
+  const re1ReceiptToken = crypto.randomBytes(16).toString("hex");
+  fileChat.registerShimToken(PROJECT, "re1", re1ReceiptToken);
+  const re1Shim = spawnShim(PROJECT, "re1", re1ReceiptToken);
+  const receiptArguments = { review_round_ref: { work_task_ref: { task_key: "review" } }, candidate_digest: "e".repeat(64), receipt: { receipt_id: "receipt_re1_01" } };
+  sendJsonRpc(re1Shim, { jsonrpc: "2.0", id: 241, method: "tools/call", params: {
+    name: "submit_work_task_review_receipt", arguments: receiptArguments,
+  } });
+  const receiptResp = await readResponse(re1Shim);
+  assert(JSON.parse(receiptResp.result?.content?.[0]?.text || "{}").outcome === "sealed",
+    "authenticated reviewer can seal through the fixed WorkTask receipt endpoint");
+  assert(workTaskReviewRequests.length === 2 && workTaskReviewRequests[1].kind === "receipt" && workTaskReviewRequests[1].role === "re1" &&
+    workTaskReviewRequests[1].token === re1ReceiptToken && JSON.stringify(workTaskReviewRequests[1].body) === JSON.stringify(receiptArguments),
+  "review receipt forwards only its typed arguments and existing reviewer token");
+  await stopShim(re1Shim);
 
   // Test 3: chat_send
   sendJsonRpc(shim, {
