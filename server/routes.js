@@ -1087,6 +1087,7 @@ const { currentContractObservation } = require("./review-cycle-contract-observat
 const { verifyActionContract } = require("./review-cycle-action-contract");
 const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
 const { createDeliveryFinalReviewService } = require("./delivery-final-review-service");
+const { createDeliveryPublicationPlanService } = require("./delivery-publication-plan");
 const { TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND } = require("./delivery-review-target");
 
 function projectEnvironmentSettingsInput(config, project) {
@@ -1433,6 +1434,32 @@ function deliveryCandidateCiEvidenceTarget(current) {
   };
 }
 
+function deliveryPublicationPlanContext(projectId, deliveryCandidateRef) {
+  const cfg = readConfigFile();
+  const project = (cfg.projects || []).find((entry) => entry?.id === projectId && entry.archived !== true);
+  if (!project || typeof cfg.installation_id !== "string") throw new Error("delivery_publication_unavailable");
+  const service = createDeliveryPublicationPlanService({
+    read_candidate_snapshot: (request) => {
+      const snapshot = createDeliveryCandidateStore({ config_dir: CONFIG_DIR, fs }).readSnapshot(request.delivery_candidate_ref);
+      return {
+        delivery_candidate_ref: snapshot.delivery_candidate_ref,
+        lifecycle: snapshot.lifecycle,
+        delivery_manifest: snapshot.delivery_manifest,
+        composition_proof: snapshot.composition_proof,
+      };
+    },
+  });
+  const plan = service.plan({
+    version: 1,
+    head_binding: { installation_id: cfg.installation_id, project_id: projectId, role: "head", generation: 0 },
+    delivery_candidate_ref: deliveryCandidateRef,
+  });
+  const binding = getProjectRepositoryBindings(projectId, cfg)
+    .find((entry) => entry.key === plan.delivery_candidate_ref.repository_key && canonicalGithubRepo(entry.repo) === plan.repository);
+  if (!binding) throw new Error("delivery_publication_binding_mismatch");
+  return plan;
+}
+
 function resolveCurrentDeliveryCandidateCiEvidenceTarget(projectId, request) {
   return deliveryCandidateCiEvidenceTarget(
     deliveryFinalReviewContext(projectId, request.delivery_candidate_ref, request.pr_number),
@@ -1543,6 +1570,30 @@ router.post("/api/delivery-candidate/final-review", (req, res) => {
     return res.json({ ok: true, cycle_id: observation.cycle?.cycle_id || null, handoff: observation.handoff });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_final_review_unavailable" });
+  }
+});
+
+// This is intentionally only the last local preflight. It derives an exact
+// branch/PR proposal from a sealed candidate but cannot transfer a branch or
+// open a PR; those are explicit operator-gated external actions.
+router.post("/api/delivery-candidate/publication-plan", (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || principal.agentId !== "head" || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).length !== 1 || !Object.hasOwn(body, "delivery_candidate_ref")) {
+    return res.status(400).json({ ok: false, code: "invalid_delivery_publication_plan_request" });
+  }
+  let admission;
+  try { admission = captureProjectAdmission(principal.projectId); }
+  catch { return res.status(409).json({ ok: false, code: "delivery_publication_unavailable" }); }
+  if (!isAdmissionCurrent(admission) || isProjectArchived(principal.projectId)) {
+    return res.status(409).json({ ok: false, code: "delivery_publication_unavailable" });
+  }
+  try {
+    const plan = deliveryPublicationPlanContext(principal.projectId, body.delivery_candidate_ref);
+    return res.json({ ok: true, plan });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "delivery_publication_unavailable" });
   }
 });
 

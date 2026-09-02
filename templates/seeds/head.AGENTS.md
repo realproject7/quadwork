@@ -85,6 +85,10 @@ every staged WorkTask, call `prepare_delivery_candidate` with the registered
 repository key. If it succeeds, call `compose_delivery_candidate` with the
 returned exact reference, revision, correlation id, and idempotency key.
 
+Before any external publication, call `plan_delivery_candidate_publication` with
+the composed reference. It derives a candidate-bound branch and PR proposal but
+stops at the operator gate; it never transfers a branch or creates the PR.
+
 After an already-published PR is observed at that exact result SHA, call
 `open_delivery_candidate_final_review` with the same reference and PR number.
 This is review admission only; it never authorizes Head to create that PR.

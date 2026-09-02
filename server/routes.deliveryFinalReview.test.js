@@ -36,4 +36,8 @@ ok(/router\.post\("\/api\/delivery-candidate\/ci-evidence",[\s\S]*?createDeliver
   /policy\?\.mode === "ci-less"[\s\S]*?_ciEvidenceStore\.readByIdentity\(deliveryCandidateCiEvidenceTarget\(current\)\)/.test(source),
   "Delivery Candidate CI-less evidence uses the existing atomic receipt store and only the current composed PR identity");
 
+ok(/router\.post\("\/api\/delivery-candidate\/publication-plan",[\s\S]*?principal\.agentId !== "head"[\s\S]*?captureProjectAdmission\(principal\.projectId\)[\s\S]*?deliveryPublicationPlanContext\(principal\.projectId, body\.delivery_candidate_ref\)[\s\S]*?return res\.json\(\{ ok: true, plan \}\)/.test(source) &&
+  /function deliveryPublicationPlanContext\(projectId, deliveryCandidateRef\)[\s\S]*?createDeliveryPublicationPlanService[\s\S]*?createDeliveryCandidateStore\(\{ config_dir: CONFIG_DIR, fs \}\)\.readSnapshot/.test(source),
+  "the Head can derive a composed Delivery Candidate publication plan without a branch or PR write path");
+
 console.log(`routes.deliveryFinalReview.test.js: ${passed} assertions passed`);

@@ -272,6 +272,17 @@ const OPEN_DELIVERY_CANDIDATE_FINAL_REVIEW_TOOL = {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
 
+const PLAN_DELIVERY_CANDIDATE_PUBLICATION_TOOL = {
+  name: "plan_delivery_candidate_publication",
+  description: "Derive the authenticated Head's operator-gated publication proposal for one composed Delivery Candidate. This is read-only: it never transfers a branch, opens a PR, starts CI, or merges.",
+  inputSchema: {
+    type: "object",
+    properties: { delivery_candidate_ref: { type: "object" } },
+    required: ["delivery_candidate_ref"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
 const SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL = {
   name: "submit_review_cycle_receipt",
   description: "Bind this authenticated reviewer's one current GitHub review object to the server-owned exact-SHA review cycle. Chat claims and prose are not accepted.",
@@ -342,6 +353,7 @@ function toolsForActor() {
     RECONCILE_WORK_TASK_REVIEW_TOOL,
     PREPARE_DELIVERY_CANDIDATE_TOOL,
     COMPOSE_DELIVERY_CANDIDATE_TOOL,
+    PLAN_DELIVERY_CANDIDATE_PUBLICATION_TOOL,
     OPEN_DELIVERY_CANDIDATE_FINAL_REVIEW_TOOL,
   );
   if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL, SUBMIT_DELIVERY_CANDIDATE_CI_EVIDENCE_TOOL, SUBMIT_WORK_TASK_CANDIDATE_TOOL);
@@ -539,6 +551,13 @@ async function handleToolCall(id, name, params) {
       if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: open_delivery_candidate_final_review");
       const res = await httpRequest("POST", "/api/delivery-candidate/final-review", params, { "X-Chat-Token": TOKEN });
       if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate final review unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "plan_delivery_candidate_publication") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: plan_delivery_candidate_publication");
+      const res = await httpRequest("POST", "/api/delivery-candidate/publication-plan", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate publication plan unavailable");
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
     }
 
