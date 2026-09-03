@@ -10,6 +10,9 @@ export interface Preset {
 
 const STORAGE_KEY = "qw-chat-presets";
 
+const LEGACY_QUEUE_FORMAT_PRESET = `@head Check your OVERNIGHT-QUEUE.md formatting. Each Active Batch item must start with \`- #<number>\` (dash, space, hash, issue number). Do NOT use \`- Issue #598\` format — only \`- #598 description\`. The Current Batch panel won't recognize items in any other format. Fix if needed and confirm.`;
+const QUALIFIED_QUEUE_FORMAT_PRESET = `@head Check your OVERNIGHT-QUEUE.md formatting without changing repository identity. In V2, each Active Batch item must use the registered repository's exact \`- owner/repo#<number> description\` form. Never rewrite a qualified reference as bare \`#<number>\`; the same number may exist in multiple repositories. Only a pre-activation V1 single-repository queue may retain \`- #<number> description\`. Fix malformed items if needed and report any unknown repository visibly.`;
+
 const DEFAULT_PRESETS: Preset[] = [
   {
     id: "default-1",
@@ -29,7 +32,7 @@ ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via t
   {
     id: "default-3",
     title: "Check Queue Format",
-    message: `@head Check your OVERNIGHT-QUEUE.md formatting. Each Active Batch item must start with \`- #<number>\` (dash, space, hash, issue number). Do NOT use \`- Issue #598\` format — only \`- #598 description\`. The Current Batch panel won't recognize items in any other format. Fix if needed and confirm.`,
+    message: QUALIFIED_QUEUE_FORMAT_PRESET,
   },
   {
     id: "default-4",
@@ -46,7 +49,20 @@ function loadPresets(): Preset[] {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULT_PRESETS));
       return DEFAULT_PRESETS;
     }
-    return JSON.parse(raw);
+    const parsed: Preset[] = JSON.parse(raw);
+    // Migrate only the untouched built-in V1 instruction. A user-edited preset
+    // keeps its content, while installations that cached the old default stop
+    // instructing Head to destroy V2 repository-qualified identity.
+    let migrated = false;
+    const presets = parsed.map((preset) => {
+      if (preset.id === "default-3" && preset.message === LEGACY_QUEUE_FORMAT_PRESET) {
+        migrated = true;
+        return { ...preset, message: QUALIFIED_QUEUE_FORMAT_PRESET };
+      }
+      return preset;
+    });
+    if (migrated) localStorage.setItem(STORAGE_KEY, JSON.stringify(presets));
+    return presets;
   } catch {
     return DEFAULT_PRESETS;
   }

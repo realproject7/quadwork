@@ -3,7 +3,6 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import HomeEmptyState from "./HomeEmptyState";
-import ButlerChat from "./ButlerChat";
 import { useLocale } from "@/components/LocaleProvider";
 
 const COPY = {
@@ -30,10 +29,11 @@ const COPY = {
     joinLink: "Join Hunt Town",
     joinSuffix: "and find @project7.",
     recentActivity: "Recent Activity",
-    butlerCtaTitle: "Butler Agent",
-    butlerCtaNew: "NEW",
-    butlerCtaDesc: "Your cross-project AI assistant.",
-    butlerCtaLink: "Enable in Settings →",
+    v2Configured: "V2 repository configured",
+    v2SetupRequired: "V2 repository setup required",
+    v2Unavailable: "V2 repository state unavailable",
+    configureV2: "Configure V2 →",
+    repositories: (count: number) => `${count} repos`,
   },
   ko: {
     loading: "대시보드 로딩 중...",
@@ -58,21 +58,38 @@ const COPY = {
     joinLink: "Hunt Town 참여",
     joinSuffix: "에서 @project7을 찾아보세요.",
     recentActivity: "최근 활동",
-    butlerCtaTitle: "Butler Agent",
-    butlerCtaNew: "NEW",
-    butlerCtaDesc: "크로스 프로젝트 AI 어시스턴트.",
-    butlerCtaLink: "설정에서 활성화 →",
+    v2Configured: "V2 저장소 설정됨",
+    v2SetupRequired: "V2 저장소 설정 필요",
+    v2Unavailable: "V2 저장소 상태를 불러올 수 없음",
+    configureV2: "V2 설정 →",
+    repositories: (count: number) => `${count}개 저장소`,
   },
 } as const;
 
 interface Project {
   id: string;
   name: string;
-  repo: string;
   agentCount: number;
   openPrs: number;
   state: "active" | "idle";
   lastActivity: string | null;
+}
+
+interface DashboardRepository {
+  key?: string;
+  repo?: string;
+  primary?: boolean;
+}
+
+interface DashboardConfigProject {
+  id?: string;
+  repositories?: DashboardRepository[];
+}
+
+interface V2ProjectSummary {
+  state: "configured" | "setup_required" | "unavailable";
+  primaryRepository: string | null;
+  repositoryCount: number;
 }
 
 interface ActivityEvent {
@@ -101,6 +118,18 @@ function timeAgo(iso: string, t: typeof COPY["en"] | typeof COPY["ko"]): string 
   return t.daysAgo(days);
 }
 
+function v2Summary(project: DashboardConfigProject | undefined): V2ProjectSummary {
+  if (!project) return { state: "unavailable", primaryRepository: null, repositoryCount: 0 };
+  const repositories = Array.isArray(project.repositories) ? project.repositories : [];
+  if (repositories.length === 0) return { state: "setup_required", primaryRepository: null, repositoryCount: 0 };
+  const primary = repositories.find((repository) => repository?.primary === true) || repositories[0];
+  return {
+    state: "configured",
+    primaryRepository: typeof primary?.repo === "string" ? primary.repo : null,
+    repositoryCount: repositories.length,
+  };
+}
+
 /**
  * Main landing page (#208).
  *
@@ -114,35 +143,35 @@ export default function HomeDashboard() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [projectsState, setProjectsState] = useState<"loading" | "loaded" | "error">("loading");
-  const [butlerEnabled, setButlerEnabled] = useState(false);
-  const [butlerCtaDismissed, setButlerCtaDismissed] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return localStorage.getItem("qw-butler-cta-dismissed") === "1";
-  });
+  const [v2Projects, setV2Projects] = useState<Record<string, V2ProjectSummary>>({});
 
   useEffect(() => {
-    fetch("/api/projects")
-      .then((r) => {
-        if (!r.ok) throw new Error(`${r.status}`);
-        return r.json();
-      })
-      .then((data) => {
+    const projectRequest = fetch("/api/projects").then((r) => {
+      if (!r.ok) throw new Error(`${r.status}`);
+      return r.json();
+    });
+    // /api/config is used only for canonical V2 repository records. The
+    // dashboard intentionally does not fall back to legacy scalar fields.
+    const configRequest = fetch("/api/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    Promise.all([projectRequest, configRequest])
+      .then(([data, config]) => {
         if (data.projects && Array.isArray(data.projects))
           setProjects(data.projects.filter((p: Project & { archived?: boolean }) => !p.archived));
         if (data.recentEvents && Array.isArray(data.recentEvents))
           setActivity(data.recentEvents);
+        if (config && Array.isArray(config.projects)) {
+          const entries = config.projects as DashboardConfigProject[];
+          setV2Projects(Object.fromEntries(entries
+            .filter((project) => typeof project.id === "string")
+            .map((project) => [project.id as string, v2Summary(project)])));
+        }
         setProjectsState("loaded");
       })
       .catch(() => {
         setProjectsState("error");
       });
-
-    fetch("/api/config")
-      .then((r) => r.ok ? r.json() : null)
-      .then((cfg) => {
-        if (cfg?.butler?.enabled) setButlerEnabled(true);
-      })
-      .catch(() => {});
   }, []);
 
   if (projectsState === "loading") {
@@ -158,37 +187,8 @@ export default function HomeDashboard() {
       <div className="lg:grid lg:grid-cols-[1fr_340px] lg:gap-6 lg:flex-1 lg:min-h-0">
         {/* Left column: hero + header + project cards */}
         <div className="lg:overflow-y-auto lg:min-h-0">
-          {/* #633: Butler chat replaces hero when enabled */}
-          {butlerEnabled ? (
-            <ButlerChat />
-          ) : projectsState === "loaded" ? (
+          {projectsState === "loaded" ? (
             <>
-              {!butlerCtaDismissed && (
-                <div className="mb-3 border border-border bg-bg-surface px-4 py-3 flex items-center justify-between">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <span className="text-[11px] font-semibold text-text">{t.butlerCtaTitle}</span>
-                    <span className="text-[9px] font-semibold text-accent border border-accent/30 px-1.5 py-0.5 leading-none">{t.butlerCtaNew}</span>
-                    <span className="text-[11px] text-text-muted hidden sm:inline">{t.butlerCtaDesc}</span>
-                    <Link
-                      href="/settings#butler"
-                      className="text-[11px] text-accent hover:text-accent-dim transition-colors shrink-0"
-                    >
-                      {t.butlerCtaLink}
-                    </Link>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      localStorage.setItem("qw-butler-cta-dismissed", "1");
-                      setButlerCtaDismissed(true);
-                    }}
-                    className="text-text-muted hover:text-text text-[11px] ml-3 shrink-0 transition-colors"
-                    aria-label="Dismiss"
-                  >
-                    ×
-                  </button>
-                </div>
-              )}
               <div className="mb-6">
                 <HomeEmptyState hasProjects={projects.length > 0} />
               </div>
@@ -210,30 +210,34 @@ export default function HomeDashboard() {
 
           {/* Project cards grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 mb-8 lg:mb-0">
-            {projects.map((project) => (
-              <Link
-                key={project.id}
-                href={`/project/${project.id}`}
-                className="block border border-border bg-bg-surface p-4 hover:bg-[#1a1a1a] transition-colors group"
-              >
-                <div className="flex items-center justify-between mb-3">
-                  <div className="flex items-center gap-2">
+            {projects.map((project) => {
+              const repository = v2Projects[project.id] || { state: "unavailable" as const, primaryRepository: null, repositoryCount: 0 };
+              const v2Label = repository.state === "configured"
+                ? t.v2Configured
+                : repository.state === "setup_required"
+                  ? t.v2SetupRequired
+                  : t.v2Unavailable;
+              return (
+              <div key={project.id} className="border border-border bg-bg-surface hover:bg-[#1a1a1a] transition-colors group min-w-0">
+                <Link href={`/project/${project.id}`} className="block p-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
+                  <div className="flex items-center justify-between gap-3 mb-3">
+                  <div className="flex items-center gap-2 min-w-0">
                     <span
                       className={`w-1.5 h-1.5 rounded-full ${
                         project.state === "active" ? "bg-accent" : "bg-text-muted"
                       }`}
                     />
-                    <span className="text-sm font-semibold text-text">{project.name}</span>
-                    <span className="text-[10px] text-text-muted">
+                    <span className="min-w-0 truncate text-sm font-semibold text-text" title={project.name}>{project.name}</span>
+                    <span className="shrink-0 text-[10px] text-text-muted">
                       {project.state}
                     </span>
                   </div>
-                  <span className="text-[10px] text-text-muted opacity-0 group-hover:opacity-100 transition-opacity">
+                  <span className="shrink-0 text-[10px] text-text-muted opacity-0 group-hover:opacity-100 transition-opacity">
                     {t.open}
                   </span>
-                </div>
+                  </div>
 
-                <div className="flex gap-4 text-[11px] mb-2">
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] mb-2">
                   <div>
                     <span className="text-text-muted">{t.agents}</span>
                     <span className="ml-1.5 text-text">{project.agentCount}</span>
@@ -244,8 +248,12 @@ export default function HomeDashboard() {
                   </div>
                   <div>
                     <span className="text-text-muted">{t.repo}</span>
-                    <span className="ml-1.5 text-text">{project.repo}</span>
+                    <span className="ml-1.5 text-text break-all">{repository.primaryRepository || "—"}</span>
                   </div>
+                </div>
+
+                <div className={`text-[10px] ${repository.state === "configured" ? "text-accent" : "text-[#ffcc00]"}`}>
+                  {v2Label}{repository.state === "configured" && ` · ${t.repositories(repository.repositoryCount)}`}
                 </div>
 
                 {project.lastActivity && (
@@ -253,8 +261,15 @@ export default function HomeDashboard() {
                     {t.lastActivity}: {timeAgo(project.lastActivity, t)}
                   </div>
                 )}
-              </Link>
-            ))}
+                </Link>
+                {repository.state === "setup_required" && (
+                  <Link href={`/settings#project-${encodeURIComponent(project.id)}`} className="block border-t border-border px-4 py-2 text-[10px] text-accent hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent transition-colors">
+                    {t.configureV2}
+                  </Link>
+                )}
+              </div>
+              );
+            })}
 
             {/* + New Project */}
             <Link

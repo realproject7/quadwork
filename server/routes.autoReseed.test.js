@@ -30,8 +30,12 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 
+const playbookSeed = fs.readFileSync(path.join(__dirname, "..", "templates", "seeds", "HEAD-PO-PLAYBOOK.md"), "utf-8");
+const playbookVersion = playbookSeed.match(/^\*\*Playbook version:\*\*\s+(\d+\.\d+\.\d+)$/m);
+assert.ok(playbookVersion, "canonical playbook seed carries a semantic version");
+
 const {
-  autoReseedOnStartup,
+  autoReseedOnStartup: autoReseedOnStartupRaw,
   _loadReseedState,
   _saveReseedState,
   _readPackageVersion,
@@ -39,6 +43,12 @@ const {
   _periodicDeferStreak,
   PERIODIC_DEFER_LOG_EVERY,
 } = require("./routes");
+
+const autoReseedOnStartup = (cfg, options = {}) => autoReseedOnStartupRaw(cfg, {
+  captureAdmission: (projectId) => ({ project_id: projectId, generation: 0 }),
+  admissionCurrent: () => true,
+  ...options,
+});
 
 function tmp(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `qw-856-${label}-`));
@@ -344,17 +354,32 @@ function quietLog() {
       stale.replace("# Reviewer 1", "# Reviewer 2"));
 
     const cfg = { projects: [{
-      id: projId, name: "E2E", working_dir: workingDir,
+      id: projId, name: "E2E",
+      repositories: [{ key: "primary", repo: "Acme/E2E", working_dir: workingDir, primary: true }],
       agents: { re1: { cwd: re1Dir }, re2: { cwd: re2Dir } },
     }] };
     const dir = tmp("e2e-state");
     const statePath = path.join(dir, "state.json");
     const { log } = quietLog();
+    const projectConfigDir = path.join(root, ".quadwork");
+    const installedPlaybook = path.join(projectConfigDir, projId, "HEAD-PO-PLAYBOOK.md");
+    fs.mkdirSync(path.dirname(installedPlaybook), { recursive: true });
+    fs.writeFileSync(installedPlaybook, [
+      "# Old Head Playbook",
+      "",
+      "## 1. Operating model",
+      "stale canonical instructions",
+      "",
+      "## Operator Runbook Notes",
+      "keep this deployment-specific note",
+      "",
+    ].join("\n"));
 
     const out = await autoReseedOnStartup(cfg, {
       version: "9.9.9", statePath, log,
       // No batch infra in this temp project — short-circuit to "idle".
       getProgress: async () => ({ items: [], complete: false }),
+      performWrites: (p) => _performReseedWrites(p, cfg, { configDir: projectConfigDir }),
     });
     assert.equal(out.decisions[0].action, "reseeded");
     assert.equal(_loadReseedState(statePath).completedByProjectVersion[projId], "9.9.9");
@@ -370,13 +395,23 @@ function quietLog() {
     // fresh template's `**fallback only**` sentence).
     assert.ok(!re1After.includes("Use `gh pr list` to find open PRs in this repo."),
       "re1 stale positive instruction replaced");
+    const playbookAfter = fs.readFileSync(installedPlaybook, "utf-8");
+    assert.ok(playbookAfter.includes(playbookVersion[0]),
+      `auto-reseed refreshes the canonical Head PO playbook version (${playbookVersion[1]})`);
+    assert.ok(!playbookAfter.includes("stale canonical instructions"),
+      "auto-reseed replaces canonical playbook sections");
+    assert.ok(playbookAfter.includes("keep this deployment-specific note"),
+      "auto-reseed preserves operator-added playbook sections");
 
     // Second auto-reseed call → no-op.
     const writesAgain = [];
     await autoReseedOnStartup(cfg, {
       version: "9.9.9", statePath, log,
       getProgress: async () => ({ items: [], complete: false }),
-      performWrites: (p) => { writesAgain.push(p.id); return _performReseedWrites(p, cfg); },
+      performWrites: (p) => {
+        writesAgain.push(p.id);
+        return _performReseedWrites(p, cfg, { configDir: projectConfigDir });
+      },
     });
     assert.deepEqual(writesAgain, [], "second startup at same version skips already-current projects");
   }

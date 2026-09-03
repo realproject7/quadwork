@@ -22,6 +22,98 @@ interface Repo {
   isPrivate?: boolean;
 }
 
+type CiPolicyMode = "" | "github-checks" | "ci-less";
+
+interface CiPolicyDraft {
+  mode: CiPolicyMode;
+  requiredChecks: string;
+  advisoryChecks: string;
+  checkKind: "product" | "control-plane";
+  registrationGraceSeconds: string;
+  sameShaRetryBudget: string;
+  evidenceKeys: string;
+}
+
+interface V2RepositoryDraft {
+  key: string;
+  repo: string;
+  working_dir: string;
+  primary: boolean;
+  ci_policy?: Record<string, unknown>;
+}
+
+interface V2SetupResult {
+  ok?: boolean;
+  code?: string;
+  reasons?: Array<{ code?: string; repo_key?: string }>;
+  repositories?: Array<{
+    key?: string;
+    repo?: string;
+    primary?: boolean;
+    default_branch?: string;
+    base_clone?: string;
+    worktrees?: Record<string, string>;
+  }>;
+}
+
+const V2_ROLES = ["head", "re1", "re2", "dev"] as const;
+
+function listFromInput(value: string) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function v2PolicyFromDraft(draft: CiPolicyDraft): Record<string, unknown> | undefined {
+  if (draft.mode === "ci-less") {
+    const evidenceKeys = listFromInput(draft.evidenceKeys);
+    return evidenceKeys.length > 0
+      ? { version: 1, mode: "ci-less", evidence_keys: evidenceKeys }
+      : undefined;
+  }
+  if (draft.mode === "github-checks") {
+    const required = listFromInput(draft.requiredChecks);
+    const advisory = listFromInput(draft.advisoryChecks);
+    const grace = Number(draft.registrationGraceSeconds);
+    const retryBudget = Number(draft.sameShaRetryBudget);
+    return required.length > 0 && Number.isSafeInteger(grace) && grace >= 0 &&
+      Number.isSafeInteger(retryBudget) && retryBudget >= 0
+      ? {
+        version: 1,
+        mode: "github-checks",
+        registration_grace_seconds: grace,
+        same_sha_retry_budget: retryBudget,
+        checks: [
+          ...required.map((name) => ({ name, required: true, kind: draft.checkKind })),
+          ...advisory.map((name) => ({ name, required: false, kind: draft.checkKind })),
+        ],
+      }
+      : undefined;
+  }
+  return undefined;
+}
+
+function v2SetupMessage(result: V2SetupResult): string {
+  const reason = result.reasons?.[0];
+  const code = reason?.code || result.code || "setup_request_failed";
+  const labels: Record<string, string> = {
+    legacy_scalar: "Replace the legacy repository fields with the explicit V2 repository record.",
+    repositories_required: "Add at least one repository.",
+    missing_policy: "Choose and complete a CI evidence policy for every repository.",
+    invalid_ci_policy: "Complete the selected CI evidence policy with valid values.",
+    invalid_primary_repository_count: "Select exactly one primary repository.",
+    repository_push_access_required: "GitHub write, maintain, or admin access is required for this repository.",
+    repository_identity_mismatch: "GitHub returned a different canonical repository identity. Recheck the repository.",
+    operator_confirmation_required: "Confirm the final V2 activation before continuing.",
+    active_session: "Stop the active role session before changing repository topology.",
+    project_not_quiesced: "Quiesce this project before changing repository topology.",
+    first_activation_legacy_project_blocked: "Quiesce the listed legacy project, then retry the first V2 activation.",
+  };
+  return labels[code] || `V2 setup needs attention [${code}].`;
+}
+
+function isAbsoluteLocalPath(value: string) {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
 /* ── Constants ─────────────────────────────────────────────────────────── */
 
 const COPY = {
@@ -65,11 +157,11 @@ const COPY = {
       enterManually: "Enter manually instead",
       backToList: "Back to repo list",
       private: "private",
-      enableProtection: (repo: string) => <>Enable branch protection on <code className="text-accent">main</code></>,
+      enableProtection: (repo: string) => <>Enable branch protection on <code className="text-accent">{repo || "this repository"}/main</code></>,
       protectionDesc: "Run this after setup, or configure in GitHub UI:",
       copy: "copy",
-      verifying: "Verifying...",
-      verify: "Verify & Continue",
+      verifying: "Continuing...",
+      verify: "Continue to V2 preflight",
     },
     modelsStep: {
       title: "Configure agent CLI backends",
@@ -144,11 +236,11 @@ const COPY = {
       enterManually: "직접 입력하기",
       backToList: "저장소 목록으로 돌아가기",
       private: "비공개",
-      enableProtection: (repo: string) => <> <code className="text-accent">main</code> 브랜치 보호 사용</>,
+      enableProtection: (repo: string) => <> <code className="text-accent">{repo || "이 저장소"}/main</code> 브랜치 보호 사용</>,
       protectionDesc: "설치 후 이 명령을 실행하거나 GitHub UI에서 직접 설정하세요:",
       copy: "복사",
-      verifying: "확인 중...",
-      verify: "확인 후 계속",
+      verifying: "계속 진행 중...",
+      verify: "V2 사전 확인으로 계속",
     },
     modelsStep: {
       title: "에이전트 CLI 백엔드 구성",
@@ -238,7 +330,7 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
           <p className="text-accent font-semibold mb-1">{t.found}</p>
           <p className="text-text font-mono">{detected.path}</p>
           <div className="flex gap-2 mt-2">
-            <button onClick={onNext} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors">
+            <button onClick={onNext} disabled={!isAbsoluteLocalPath(workingDir)} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
               {t.useThis}
             </button>
             <button onClick={() => { setShowManual(true); setWorkingDir(""); }} className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text transition-colors">
@@ -252,9 +344,9 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
         <div className="border border-border bg-bg-surface p-3 mb-4 text-[11px]">
           <p className="text-text-muted mb-1">{t.noClone(repo)}</p>
           <p className="text-text-muted mb-2">{t.setupWillClone}</p>
-          <p className="text-text font-mono mb-2">{detected?.suggested || `~/Projects/${slug}`}</p>
+          <p className="text-text font-mono mb-2">{detected?.suggested || `/absolute/path/to/${slug}`}</p>
           <div className="flex gap-2">
-            <button onClick={onNext} disabled={!workingDir.trim()} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
+            <button onClick={onNext} disabled={!isAbsoluteLocalPath(workingDir)} className="px-3 py-1 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
               {t.cloneHere}
             </button>
             <button onClick={() => setShowManual(true)} className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-text transition-colors">
@@ -269,16 +361,19 @@ function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
           <input
             value={workingDir}
             onChange={(e) => setWorkingDir(e.target.value)}
-            placeholder={`~/Projects/${slug}`}
+            placeholder={`/absolute/path/to/${slug}`}
             className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent mb-2"
           />
-          <button onClick={onNext} disabled={!workingDir.trim()} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
+          <button onClick={onNext} disabled={!isAbsoluteLocalPath(workingDir)} className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50">
             {t.next}
           </button>
         </>
       )}
 
       {error && <p className="text-[11px] text-error mt-2">{error}</p>}
+      {workingDir && !isAbsoluteLocalPath(workingDir) && (
+        <p role="alert" className="text-[11px] text-[#ffcc00] mt-2">Use an absolute local path before V2 provisioning.</p>
+      )}
 
       <div className="border border-border bg-bg-surface p-3 mt-4 text-[11px] text-text-muted font-mono space-y-0.5">
         <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1 font-sans">{t.layout}</p>
@@ -332,6 +427,43 @@ export default function SetupWizard() {
   const [workspaceLog, setWorkspaceLog] = useState<string[]>([]);
   const [launchStatus, setLaunchStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean; grok: boolean } | null>(null);
+  // V2 keeps policy selection explicit. We intentionally do not derive a
+  // policy from visible GitHub checks or from a legacy project setting.
+  const [ciPolicy, setCiPolicy] = useState<CiPolicyDraft>({
+    mode: "",
+    requiredChecks: "",
+    advisoryChecks: "",
+    checkKind: "product",
+    registrationGraceSeconds: "300",
+    sameShaRetryBudget: "0",
+    evidenceKeys: "",
+  });
+  const [v2VerifyStatus, setV2VerifyStatus] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [v2ProvisionStatus, setV2ProvisionStatus] = useState<"idle" | "running" | "done" | "error">("idle");
+  const [v2ActivationConfirmed, setV2ActivationConfirmed] = useState(false);
+  const [v2Result, setV2Result] = useState<V2SetupResult | null>(null);
+  const [v2Message, setV2Message] = useState("");
+
+  const updateCiPolicy = (updates: Partial<CiPolicyDraft>) => {
+    setCiPolicy((previous) => ({ ...previous, ...updates }));
+    // Each result binds the exact submitted topology and policy. Editing it
+    // invalidates preflight/provision state and requires a fresh confirmation.
+    setV2VerifyStatus("idle");
+    setV2ProvisionStatus("idle");
+    setV2ActivationConfirmed(false);
+    setV2Result(null);
+    setV2Message("");
+  };
+
+  useEffect(() => {
+    // Repository identity, base clone, and role configuration participate in
+    // the submitted activation candidate just like policy does.
+    setV2VerifyStatus("idle");
+    setV2ProvisionStatus("idle");
+    setV2ActivationConfirmed(false);
+    setV2Result(null);
+    setV2Message("");
+  }, [repo, workingDir, backends, autoApprove]);
 
   useEffect(() => {
     setSteps((prev) => [
@@ -455,90 +587,126 @@ export default function SetupWizard() {
     }
   };
 
-  // Step: verify repo
-  const verifyRepo = async () => {
-    const result = await apiCall("verify-repo", { repo });
-    if (result.ok) {
-      goNext();
-    } else {
-      updateStep(currentStep, { status: "error", error: result.error });
-    }
+  const projectId = (workingDir.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || projectName)
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .slice(0, 64);
+
+  const v2Repositories = (): V2RepositoryDraft[] => {
+    const policy = v2PolicyFromDraft(ciPolicy);
+    return [{
+      key: "primary",
+      repo: repo.trim(),
+      working_dir: workingDir.trim(),
+      primary: true,
+      ...(policy ? { ci_policy: policy } : {}),
+    }];
   };
 
-  // Step: create workspaces (worktrees + seed files in sequence)
-  const createWorkspaces = async () => {
-    setLoading(true);
-    setWorkspaceLog([]);
+  const v2Agents = () => {
+    // These paths mirror the server-owned, deterministic role plan. They are
+    // configuration data only; the server still proves every path is the
+    // canonical clean worktree before it writes an activation.
+    const base = workingDir.trim().replace(/[\\/]+$/, "");
+    const separator = base.includes("\\") && !base.includes("/") ? "\\" : "/";
+    const boundary = Math.max(base.lastIndexOf("/"), base.lastIndexOf("\\"));
+    const parent = boundary > 0 ? base.slice(0, boundary) : "";
+    const basename = boundary >= 0 ? base.slice(boundary + 1) : base;
+    return Object.fromEntries(V2_ROLES.map((role) => [role, {
+      command: backends[role],
+      auto_approve: autoApprove,
+      cwd: parent ? `${parent}${separator}${basename}-${role}` : "",
+    }]));
+  };
 
-    // Save reviewer token first if pasted
-    if (showReviewerCreds && reviewerTokenMode === "paste" && reviewerTokenValue) {
-      setWorkspaceLog((l) => [...l, "Saving reviewer token..."]);
-      try {
-        const tokenRes = await fetch("/api/setup/save-token", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: reviewerTokenValue }),
-        });
-        const tokenData = await tokenRes.json();
-        if (tokenData.ok) {
-          setWorkspaceLog((l) => [...l, `Token saved to ${tokenData.path}`]);
-        }
-      } catch {}
-    }
+  const runV2Step = async (step: "verify-repositories" | "provision-repositories" | "activate-v2") => {
+    const result = await apiCall(step, {
+      id: projectId,
+      name: projectName.trim(),
+      repositories: v2Repositories(),
+      agents: v2Agents(),
+      ...(step === "activate-v2" ? { confirm: true } : {}),
+    }) as V2SetupResult;
+    setV2Result(result);
+    setV2Message(result.ok ? "" : v2SetupMessage(result));
+    return result;
+  };
 
-    // 1. Create worktrees
-    setWorkspaceLog((l) => [...l, "Creating worktrees..."]);
-    const wtResult = await apiCall("create-worktrees", { workingDir, repo, backends });
-    if (!wtResult.ok) {
-      setWorkspaceLog((l) => [...l, `Error: ${wtResult.errors?.join(", ") || wtResult.error}`]);
-      updateStep(currentStep, { status: "error", error: wtResult.errors?.join(", ") || wtResult.error });
-      setLoading(false);
-      return;
-    }
-    setWorkspaceLog((l) => [...l, "Worktrees created."]);
-
-    // 2. Seed files
-    setWorkspaceLog((l) => [...l, "Writing seed files..."]);
-    const effectiveTokenPath = showReviewerCreds
-      ? (reviewerTokenMode === "file" ? reviewerTokenPath : "~/.quadwork/reviewer-token")
-      : "";
-    const seedResult = await apiCall("seed-files", {
-      workingDir,
-      projectName,
-      repo,
-      reviewerUser: showReviewerCreds ? reviewerUser : "",
-      reviewerTokenPath: effectiveTokenPath,
-    });
-    if (!seedResult.ok) {
-      setWorkspaceLog((l) => [...l, `Error: ${seedResult.error}`]);
-      updateStep(currentStep, { status: "error", error: seedResult.error });
-      setLoading(false);
-      return;
-    }
-    setWorkspaceLog((l) => [...l, "Seed files written."]);
-    setWorkspaceLog((l) => [...l, "Done."]);
-    setLoading(false);
+  // Repository selection is intentionally separate from V2 preflight: V2
+  // validates the final repository, base clone, and explicit CI policy only
+  // after the operator has provided all three on the workspace step.
+  const verifyRepo = async () => {
     goNext();
   };
 
-  // Step: launch (add-config + redirect)
+  const verifyV2Repositories = async () => {
+    setV2VerifyStatus("running");
+    const result = await runV2Step("verify-repositories");
+    if (result.ok) {
+      setV2VerifyStatus("done");
+      updateStep(currentStep, { status: "active", error: undefined });
+    } else {
+      setV2VerifyStatus("error");
+      updateStep(currentStep, { status: "error", error: v2SetupMessage(result) });
+    }
+  };
+
+  // Step: provision the V2 repository worktrees. Activation reseeds and
+  // commits the config later; provisioning alone never starts an agent.
+  const createWorkspaces = async () => {
+    setV2ProvisionStatus("running");
+    setWorkspaceLog([]);
+    setWorkspaceLog((l) => [...l, "Provisioning four V2 role worktrees..."]);
+    const result = await runV2Step("provision-repositories");
+    if (!result.ok) {
+      const message = v2SetupMessage(result);
+      setWorkspaceLog((l) => [...l, `V2 provisioning blocked: ${message}`]);
+      setV2ProvisionStatus("error");
+      updateStep(currentStep, { status: "error", error: message });
+      return;
+    }
+    setWorkspaceLog((l) => [...l, "V2 worktree topology is ready. Final activation will write the project map and seed files."]);
+    setV2ProvisionStatus("done");
+    goNext();
+  };
+
+  const saveReviewerTokenIfRequested = async () => {
+    if (!showReviewerCreds || reviewerTokenMode !== "paste" || !reviewerTokenValue) return true;
+    try {
+      const response = await fetch("/api/setup/save-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: reviewerTokenValue }),
+      });
+      const result = await response.json();
+      return result.ok === true;
+    } catch {
+      return false;
+    }
+  };
+
+  // Final activation is the only config mutation in this UI flow. It is
+  // explicitly confirmed and deliberately does not launch or restart agents.
   const launchProject = async () => {
+    if (!v2ActivationConfirmed) {
+      setV2Message("Confirm the final V2 activation before continuing.");
+      return;
+    }
     setLaunchStatus("running");
-
-    // Save config
-    const id = workingDir.split("/").pop() || projectName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
-    const configResult = await apiCall("add-config", {
-      id, name: projectName, repo, workingDir, backends, auto_approve: autoApprove,
-      chat_mode: "file",
-    });
-
-    if (configResult.ok) {
+    if (!await saveReviewerTokenIfRequested()) {
+      setLaunchStatus("error");
+      setV2Message("Reviewer credential storage failed [reviewer_token_save_failed]. Retry activation after checking the credential.");
+      return;
+    }
+    const result = await runV2Step("activate-v2");
+    if (result.ok) {
       setLaunchStatus("done");
       updateStep(currentStep, { status: "done" });
-      setTimeout(() => router.push(`/project/${id}`), 1200);
+      setTimeout(() => router.push(`/project/${projectId}`), 1200);
     } else {
       setLaunchStatus("error");
-      updateStep(currentStep, { status: "error", error: configResult.error });
+      updateStep(currentStep, { status: "error", error: v2SetupMessage(result) });
     }
   };
 
@@ -971,34 +1139,105 @@ export default function SetupWizard() {
             {/* Step 5: Create Workspaces */}
             {step?.id === "workspaces" && (
               <div>
-                <h2 className="text-sm font-semibold text-text mb-1">{t.workspacesStep.title}</h2>
+                <h2 className="text-sm font-semibold text-text mb-1">V2 repository preflight</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  {t.workspacesStep.desc}
+                  Choose an explicit CI evidence policy, verify canonical GitHub access, then provision the four role worktrees. Provisioning does not activate or start agents.
                 </p>
-                {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
+                <div className="border border-border bg-bg-surface p-3 mb-4 space-y-3">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div>
+                      <label className="text-[10px] uppercase tracking-wider text-text-muted block mb-1" htmlFor="v2-project-id">Project ID</label>
+                      <input id="v2-project-id" value={projectId} readOnly className="w-full min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text-muted font-mono outline-none" />
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-[10px] uppercase tracking-wider text-text-muted block mb-1">Repository identity</span>
+                      <p className="truncate text-[11px] text-text" title={repo}>{repo || "Choose a repository first"}</p>
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-[10px] uppercase tracking-wider text-text-muted block mb-1">Base clone</span>
+                      <p className="truncate text-[11px] text-text font-mono" title={workingDir}>{workingDir || "Choose a local path first"}</p>
+                    </div>
+                  </div>
+                  <div className="border-t border-border pt-3">
+                    <label className="text-[10px] uppercase tracking-wider text-text-muted block mb-2" htmlFor="v2-policy-mode">CI evidence policy</label>
+                    <select
+                      id="v2-policy-mode"
+                      value={ciPolicy.mode}
+                      onChange={(e) => updateCiPolicy({ mode: e.target.value as CiPolicyMode })}
+                      className="w-full md:w-72 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent"
+                    >
+                      <option value="" className="bg-bg-surface">Choose evidence policy…</option>
+                      <option value="github-checks" className="bg-bg-surface">GitHub exact check registry</option>
+                      <option value="ci-less" className="bg-bg-surface">CI-less Dev evidence receipt</option>
+                    </select>
+                    {ciPolicy.mode === "github-checks" && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                        <div>
+                          <label className="text-[10px] text-text-muted block mb-1" htmlFor="v2-required-checks">Required exact check names</label>
+                          <input id="v2-required-checks" value={ciPolicy.requiredChecks} onChange={(e) => updateCiPolicy({ requiredChecks: e.target.value })} placeholder="unit, typecheck" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-text-muted block mb-1" htmlFor="v2-advisory-checks">Advisory exact check names (optional)</label>
+                          <input id="v2-advisory-checks" value={ciPolicy.advisoryChecks} onChange={(e) => updateCiPolicy({ advisoryChecks: e.target.value })} placeholder="coverage" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                        </div>
+                        <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor="v2-check-kind">Required check ownership
+                          <select id="v2-check-kind" value={ciPolicy.checkKind} onChange={(e) => updateCiPolicy({ checkKind: e.target.value as "product" | "control-plane" })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent">
+                            <option value="product" className="bg-bg-surface">Product</option>
+                            <option value="control-plane" className="bg-bg-surface">Control plane</option>
+                          </select>
+                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor="v2-grace">Registration grace (seconds)
+                            <input id="v2-grace" inputMode="numeric" value={ciPolicy.registrationGraceSeconds} onChange={(e) => updateCiPolicy({ registrationGraceSeconds: e.target.value })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                          </label>
+                          <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor="v2-retry-budget">Same-SHA retry budget
+                            <input id="v2-retry-budget" inputMode="numeric" value={ciPolicy.sameShaRetryBudget} onChange={(e) => updateCiPolicy({ sameShaRetryBudget: e.target.value })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                          </label>
+                        </div>
+                      </div>
+                    )}
+                    {ciPolicy.mode === "ci-less" && (
+                      <div className="mt-3 max-w-md">
+                        <label className="text-[10px] text-text-muted block mb-1" htmlFor="v2-evidence-keys">Required Dev evidence keys</label>
+                        <input id="v2-evidence-keys" value={ciPolicy.evidenceKeys} onChange={(e) => updateCiPolicy({ evidenceKeys: e.target.value })} placeholder="unit, typecheck" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                        <p className="text-[10px] text-text-muted mt-1">Comma-separated data identifiers; no command is stored or executed.</p>
+                      </div>
+                    )}
+                  </div>
+                  <div className="border-t border-border pt-3 flex flex-col sm:flex-row gap-2">
+                    <button
+                      onClick={verifyV2Repositories}
+                      disabled={loading || v2VerifyStatus === "running"}
+                      className="px-3 py-1.5 text-[11px] font-semibold border border-border text-text hover:border-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 transition-colors"
+                    >
+                      {v2VerifyStatus === "running" ? "Verifying V2 access…" : v2VerifyStatus === "done" ? "V2 access verified" : "Verify V2 repository access"}
+                    </button>
+                    <button
+                      onClick={createWorkspaces}
+                      disabled={loading || v2VerifyStatus !== "done" || v2ProvisionStatus === "running"}
+                      className="px-3 py-1.5 bg-accent text-bg text-[11px] font-semibold hover:bg-accent-dim focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 transition-colors"
+                    >
+                      {v2ProvisionStatus === "running" ? "Provisioning V2 worktrees…" : v2ProvisionStatus === "done" ? "V2 worktrees provisioned" : "Provision four role worktrees"}
+                    </button>
+                  </div>
+                </div>
+                {(step.error || v2Message) && <p role="alert" aria-live="polite" className="text-[11px] text-error mb-2">{v2Message || step.error}</p>}
                 {workspaceLog.length > 0 && (
-                  <div className="border border-border bg-bg-surface p-3 mb-4 text-[11px] text-text-muted space-y-0.5 font-mono">
+                  <div aria-live="polite" className="border border-border bg-bg-surface p-3 mb-4 text-[11px] text-text-muted space-y-0.5 font-mono">
                     {workspaceLog.map((line, i) => (
                       <p key={i}>{line}</p>
                     ))}
                   </div>
                 )}
-                <button
-                  onClick={createWorkspaces}
-                  disabled={loading}
-                  className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
-                >
-                  {loading ? t.workspacesStep.creating : t.workspacesStep.create}
-                </button>
               </div>
             )}
 
             {/* Step 6: Ready to Launch */}
             {step?.id === "launch" && (
               <div>
-                <h2 className="text-sm font-semibold text-text mb-1">{t.launchStep.title}</h2>
+                <h2 className="text-sm font-semibold text-text mb-1">Final V2 activation</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  {t.launchStep.desc}
+                  Review the prepared topology, then explicitly activate its repository configuration. This writes the project map and seed files; it does not start or restart an agent.
                 </p>
 
                 {/* Team roster */}
@@ -1015,20 +1254,36 @@ export default function SetupWizard() {
                   ))}
                 </div>
 
-                {step.error && <p className="text-[11px] text-error mb-2">{step.error}</p>}
+                {v2Result?.repositories && (
+                  <div className="border border-border bg-bg-surface p-3 mb-4 space-y-2">
+                    <p className="text-[10px] uppercase tracking-wider text-text-muted">Prepared repository topology</p>
+                    {v2Result.repositories.map((entry) => (
+                      <div key={entry.key || entry.repo} className="border-t border-border pt-2 first:border-t-0 first:pt-0 min-w-0">
+                        <p className="text-[11px] text-text truncate" title={entry.repo}>{entry.repo || entry.key}</p>
+                        <p className="text-[10px] text-text-muted truncate font-mono" title={entry.base_clone}>{entry.base_clone || "Base clone pending"}{entry.default_branch ? ` · ${entry.default_branch}` : ""}</p>
+                        <p className="text-[10px] text-text-muted mt-1">Roles: {V2_ROLES.map((role) => entry.worktrees?.[role] ? role.toUpperCase() : `${role.toUpperCase()} pending`).join(" · ")}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <label className="flex items-start gap-2 mb-3 cursor-pointer">
+                  <input type="checkbox" checked={v2ActivationConfirmed} onChange={(e) => setV2ActivationConfirmed(e.target.checked)} className="accent-accent mt-0.5" />
+                  <span className="text-[11px] text-text-muted">I confirm this V2 repository topology is correct and the project is quiesced. Activate without starting agents.</span>
+                </label>
+                {(step.error || v2Message) && <p role="alert" aria-live="polite" className="text-[11px] text-error mb-2">{v2Message || step.error}</p>}
                 {launchStatus === "done" && (
-                  <p className="text-[11px] text-accent mb-2">{t.launchStep.redirecting}</p>
+                  <p aria-live="polite" className="text-[11px] text-accent mb-2">V2 configuration activated. Redirecting to the project dashboard…</p>
                 )}
                 <button
                   onClick={launchProject}
-                  disabled={launchStatus === "running" || launchStatus === "done"}
-                  className="px-5 py-2 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
+                  disabled={!v2ActivationConfirmed || launchStatus === "running" || launchStatus === "done"}
+                  className="px-5 py-2 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-50 transition-colors"
                 >
                   {launchStatus === "running"
-                    ? t.launchStep.launching
+                    ? "Activating V2…"
                     : launchStatus === "done"
-                      ? t.launchStep.launched
-                      : t.launchStep.launch}
+                      ? "V2 activated"
+                      : "Confirm and activate V2"}
                 </button>
               </div>
             )}

@@ -72,7 +72,8 @@ async function run() {
     const res = mockRes();
     await serveGithubList(REQ, res, "issues");
     ok(Array.isArray(res.body), "fresh: body is a JSON array");
-    ok(res.body === REPO_ARRAY, "fresh: serves the cached array verbatim");
+    ok(res.body.length === 1 && res.body[0].number === 1, "fresh: serves every cached row");
+    ok(res.body[0].repo_key === "primary" && res.body[0].repo === "owner/repo", "fresh: adds project repository identity");
     ok(!res.headers["x-quadwork-stale"], "fresh: no X-QuadWork-Stale header");
     ok(panelAccepts(res.body), "fresh: GitHubPanel renders last-known data");
   }
@@ -137,9 +138,12 @@ async function run() {
     const start = src.indexOf("async function serveGithubList(");
     const end = src.indexOf("\n}", start);
     const fnBody = src.slice(start, end);
+    const headerStart = src.indexOf("function setGithubRepositoryHeaders(");
+    const headerEnd = src.indexOf("\n}\n", headerStart);
+    const headerBody = src.slice(headerStart, headerEnd);
     ok(!fnBody.includes("{ ...cached.data"), "serveGithubList never spreads cached.data into an object");
-    ok(fnBody.includes('res.set("X-QuadWork-Stale"'), "serveGithubList signals stale via X-QuadWork-Stale header");
-    ok(fnBody.includes('res.set("X-QuadWork-Rate-Limited"'), "serveGithubList signals rate-limit via X-QuadWork-Rate-Limited header");
+    ok(headerBody.includes('res.set("X-QuadWork-Stale"'), "serveGithubList signals stale via X-QuadWork-Stale header");
+    ok(headerBody.includes('res.set("X-QuadWork-Rate-Limited"'), "serveGithubList signals rate-limit via X-QuadWork-Rate-Limited header");
   }
 
   fs.readFileSync = realReadFileSync;

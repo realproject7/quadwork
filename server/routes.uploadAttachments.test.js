@@ -19,12 +19,17 @@ const TEST_DIR = path.join(os.tmpdir(), `routes-uploads-test-${process.pid}-${Da
 const origHome = os.homedir;
 os.homedir = () => TEST_DIR;
 
+const CONFIG_DIR = path.join(TEST_DIR, ".quadwork");
+const PROJECT = "uploads-test-project";
+fs.mkdirSync(CONFIG_DIR, { recursive: true });
+fs.writeFileSync(path.join(CONFIG_DIR, "config.json"), JSON.stringify({
+  projects: [{ id: PROJECT, archived: false }],
+}));
+
 const fileChat = require("./file-chat");
 const router = require("./routes");
 const express = require("express");
 
-const CONFIG_DIR = path.join(TEST_DIR, ".quadwork");
-const PROJECT = "uploads-test-project";
 const UPLOAD_NAME = "upload-12345.png";
 // 1x1 transparent PNG
 const PNG_BYTES = Buffer.from(

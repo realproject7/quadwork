@@ -1,5 +1,5 @@
-// #972: shutdown() must actually tear down the orchestrator, not just butler +
-// file-chat. This boots the real server in-process on a THROWAWAY port (temp
+// #972: shutdown() must actually tear down the orchestrator and file-chat.
+// This boots the real server in-process on a THROWAWAY port (temp
 // HOME, one bash-backed project, never port 8400), spawns an agent PTY through
 // the authed terminal WebSocket, then calls the exported shutdown() and asserts:
 //   - the agent PTY child process is killed (no orphan holding a worktree lock),
@@ -9,7 +9,9 @@
 // process.kill("SIGTERM") path exercised by the PTY teardown below.)
 //
 // Run in its own child process by the test runner, so requiring index.js — which
-// starts the server + pollers — is isolated. Plain node:assert script.
+// starts the server + pollers — is isolated. Plain node:assert script. Linux
+// containment uses index.js's server-owned deterministic test fixture only;
+// it is not reachable from an HTTP/config/environment input.
 
 const assert = require("node:assert/strict");
 const http = require("http");
@@ -39,6 +41,13 @@ const get = (port, p) => new Promise((resolve, reject) => {
     const c = []; r.on("data", (d) => c.push(d)); r.on("end", () => resolve({ status: r.statusCode, body: Buffer.concat(c).toString() }));
   }).on("error", reject);
 });
+const post = (port, p, headers = {}) => new Promise((resolve, reject) => {
+  const req = http.request({ host: "127.0.0.1", port, path: p, method: "POST", headers }, (r) => {
+    const c = []; r.on("data", (d) => c.push(d)); r.on("end", () => resolve({ status: r.statusCode, body: Buffer.concat(c).toString() }));
+  });
+  req.on("error", reject);
+  req.end();
+});
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -65,7 +74,40 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   const origin = `http://127.0.0.1:${PORT}`;
   const token = JSON.parse((await get(PORT, "/api/session-token")).body).token;
 
-  // Attach the terminal WS → spawns the bash agent PTY.
+  // A terminal viewer must remain attachment-only: its connection observes the
+  // stopped lifecycle but cannot create an agent process.
+  const stoppedViewer = await new Promise((resolve, reject) => {
+    let opened = false;
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws/terminal?project=lv&agent=head&token=${token}`, { headers: { origin } });
+    ws.on("open", () => { opened = true; });
+    ws.on("close", (code) => resolve({ opened, code }));
+    ws.on("unexpected-response", (_q, r) => reject(new Error(`WS refused ${r.statusCode}`)));
+    ws.on("error", reject);
+  });
+  ok(stoppedViewer.opened && stoppedViewer.code === 1008, "terminal WS reports the stopped lifecycle without spawning");
+  ok(!idx.agentSessions.get("lv/head")?.term, "terminal WS connection created no PTY");
+
+  // F2: force the Linux admission branch without granting any proof. A normal
+  // route start remains rejected while containedLaunch is false.
+  const releaseUncontained = idx._test.installLifecycleTestFixture("lv", "head", "linux-uncontained");
+  try {
+    const rejected = await post(PORT, "/api/agents/lv/head/start", { "X-Session-Token": token });
+    const rejectedBody = JSON.parse(rejected.body);
+    assert.equal(rejected.status, 409, rejected.body);
+    assert.equal(rejectedBody.code, "containment_unavailable");
+    ok(!idx.agentSessions.get("lv/head")?.term, "normal Linux API start remains containment-unavailable");
+  } finally {
+    releaseUncontained();
+  }
+
+  // The authenticated lifecycle API, rather than the dashboard viewer, starts
+  // the disposable bash PTY that this shutdown test owns through the scoped
+  // test fixture. This exercises shutdown ownership, not production authority.
+  const releaseContained = idx._test.installLifecycleTestFixture("lv", "head", "linux-contained");
+  const started = await post(PORT, "/api/agents/lv/head/start", { "X-Session-Token": token });
+  assert.equal(started.status, 200, started.body);
+
+  // Attach the terminal WS to the already-running PTY.
   await new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws/terminal?project=lv&agent=head&token=${token}`, { headers: { origin } });
     ws.on("open", () => resolve(ws));
@@ -80,7 +122,7 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
     if (s && s.term && s.term.pid) { pid = s.term.pid; break; }
     await sleep(100);
   }
-  ok(pid != null, "agent PTY spawned via the authed terminal WS");
+  ok(pid != null, "agent PTY spawned via the authenticated lifecycle API");
   ok(alive(pid), `agent PTY child (pid ${pid}) is running before shutdown`);
 
   // The fix under test.
@@ -93,6 +135,7 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   // Idempotent: a second shutdown() (SIGINT then SIGTERM, or full-reset) is safe.
   assert.doesNotThrow(() => idx.shutdown(), "shutdown() is idempotent");
   ok(true, "shutdown() is idempotent (second call does not throw)");
+  releaseContained();
 
   console.log(`\n${passed} passed`);
   console.log("server/shutdownCleanup.test.js: all assertions passed");

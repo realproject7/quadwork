@@ -1,14 +1,761 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
+const { parseRuntimeResources } = require("./resource-policy");
+const {
+  assertProjectLifecycleTransitions,
+  registerProjectLifecycleCommitter,
+} = require("./project-lifecycle-authority");
+const { normalizeCiPolicy, CiEvidencePolicyError } = require("./ci-evidence-policy");
+const {
+  ProjectEnvironmentBindingError,
+  normalizeProjectEnvironmentSettings,
+  validateProjectEnvironmentSettings,
+} = require("./project-environment-bindings");
 
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
+const CONFIG_LOCK_PATH = path.join(os.homedir(), ".quadwork", "config.lock");
 
 const DEFAULT_CONFIG = {
   port: 8400,
   operator_name: "user",
   projects: [],
 };
+
+const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
+const GITHUB_REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+const INSTALLATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
+const LEGACY_PRIMARY_REPOSITORY_KEY = "primary";
+// Kept as a split literal so the removed product identity cannot become a
+// discoverable runtime/config surface again. This key is accepted only to
+// remove stale persisted metadata; no configured path is read or touched.
+const RETIRED_GLOBAL_AGENT_FIELD = ["but", "ler"].join("");
+const INTERNAL_CONFIG_WRITE = Symbol("internalConfigWrite");
+const INTERNAL_CONFIG_WRITE_AUTHORITY = Object.freeze({});
+let configWriteLockDepth = 0;
+
+class ConfigurationValidationError extends Error {
+  constructor(code, field, message, ownerProjectId) {
+    super(message);
+    this.name = "ConfigurationValidationError";
+    this.code = code;
+    this.field = field;
+    if (ownerProjectId !== undefined) this.owner_project_id = ownerProjectId;
+  }
+}
+
+function validationError(code, field, message, ownerProjectId) {
+  return new ConfigurationValidationError(code, field, message, ownerProjectId);
+}
+
+function liveProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !!error && error.code === "EPERM";
+  }
+}
+
+function readConfigLockOwner() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_LOCK_PATH, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function acquireConfigWriteLock(options = {}) {
+  if (options.hardenDirectory !== false) ensureSecureDir(path.dirname(CONFIG_LOCK_PATH));
+  const token = crypto.randomUUID();
+  const payload = JSON.stringify({ pid: process.pid, token });
+  const candidatePath = `${CONFIG_LOCK_PATH}.${process.pid}.${token}.tmp`;
+  try {
+    writeSecureFile(candidatePath, payload);
+    // Link a fully-written inode into the fixed lock name. Unlike open+write,
+    // another process can never observe an empty/partial owner record.
+    fs.linkSync(candidatePath, CONFIG_LOCK_PATH);
+    return token;
+  } catch (error) {
+    if (!error || error.code !== "EEXIST") throw error;
+    const owner = readConfigLockOwner();
+    const message = owner && liveProcess(owner.pid)
+      ? "configuration is being updated; retry the operation"
+      : "configuration write lock is stale; verify no QuadWork writer is running, then remove config.lock";
+    // Never auto-delete a stale-looking lock: read→unlink has an unavoidable
+    // cross-process replacement race without an OS advisory-lock primitive.
+    // Fail closed and require an explicit operator recovery instead.
+    throw validationError("config_write_busy", "config", message);
+  } finally {
+    try { fs.unlinkSync(candidatePath); } catch {}
+  }
+}
+
+function releaseConfigWriteLock(token) {
+  if (!token) return;
+  const owner = readConfigLockOwner();
+  if (!owner || owner.pid !== process.pid || owner.token !== token) return;
+  try { fs.unlinkSync(CONFIG_LOCK_PATH); } catch {}
+}
+
+function withConfigWriteLock(operation, options = {}) {
+  // The lock deliberately protects only synchronous read-modify-write work.
+  // Releasing it after an async operation returns would let that operation
+  // resume without mutual exclusion, so reject thenables before release.
+  const runSynchronousOperation = () => {
+    const result = operation();
+    if (result && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
+      throw new TypeError("configuration write operation must complete synchronously; thenables are not supported");
+    }
+    return result;
+  };
+
+  if (configWriteLockDepth > 0) return runSynchronousOperation();
+  const token = acquireConfigWriteLock(options);
+  configWriteLockDepth = 1;
+  try {
+    return runSynchronousOperation();
+  } finally {
+    configWriteLockDepth = 0;
+    releaseConfigWriteLock(token);
+  }
+}
+
+function withSerializedConfigWrite(operation, options = {}) {
+  if (typeof operation !== "function") throw new TypeError("configuration operation must be a function");
+  return withConfigWriteLock(operation, options);
+}
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function cloneConfigurationValue(value) {
+  if (Array.isArray(value)) return value.map(cloneConfigurationValue);
+  if (value && typeof value === "object") {
+    // Object.fromEntries defines data properties even for the legacy magic
+    // key `__proto__`; assignment to `{}` would silently lose that own key.
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, cloneConfigurationValue(child)]),
+    );
+  }
+  return value;
+}
+
+function removeRetiredGlobalAgentMetadata(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  if (!hasOwn(config, RETIRED_GLOBAL_AGENT_FIELD)) return false;
+  delete config[RETIRED_GLOBAL_AGENT_FIELD];
+  return true;
+}
+
+function canonicalRepositoryName(repo) {
+  return typeof repo === "string" ? repo.trim().toLowerCase() : null;
+}
+
+function normalizeAbsoluteWorkingDir(workingDir) {
+  if (typeof workingDir !== "string" || !path.isAbsolute(workingDir)) return workingDir;
+  return path.normalize(path.resolve(workingDir));
+}
+
+/**
+ * Pure compatibility normalizer for a persisted project record.
+ *
+ * A legacy scalar project receives the fixed reserved key `primary`. Deriving a
+ * key from a repository name would make the supposedly immutable identity
+ * change when a repository is renamed. This helper never mutates or persists
+ * its input and never creates an installation identity.
+ */
+function normalizeProjectRepositories(project) {
+  if (!project || typeof project !== "object" || Array.isArray(project)) return [];
+
+  const source = Array.isArray(project.repositories)
+    ? project.repositories
+    : (hasOwn(project, "repo") || hasOwn(project, "working_dir"))
+      ? [{
+          key: LEGACY_PRIMARY_REPOSITORY_KEY,
+          repo: project.repo,
+          working_dir: project.working_dir,
+          primary: true,
+        }]
+      : [];
+
+  return source.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+    return {
+      ...cloneConfigurationValue(entry),
+      repo: typeof entry.repo === "string" ? entry.repo.trim() : entry.repo,
+      working_dir: normalizeAbsoluteWorkingDir(entry.working_dir),
+      primary: entry.primary === true,
+    };
+  });
+}
+
+function allRepositories(project) {
+  return normalizeProjectRepositories(project);
+}
+
+function primaryRepository(project) {
+  return allRepositories(project).find((entry) => entry && entry.primary === true) || null;
+}
+
+function repositoryByKey(project, key) {
+  if (typeof key !== "string") return null;
+  return allRepositories(project).find((entry) => entry && entry.key === key) || null;
+}
+
+function repositoryByCanonicalName(project, repo) {
+  const canonical = canonicalRepositoryName(repo);
+  if (!canonical) return null;
+  return allRepositories(project).find((entry) => canonicalRepositoryName(entry && entry.repo) === canonical) || null;
+}
+
+// Project Environments may name only an already registered canonical
+// repository record. This deliberately derives no value from a path, remote,
+// probe, or live capability: the V2 repository record is the sole authority.
+function resolveCanonicalProjectRepository(project, key) {
+  const repository = repositoryByKey(project, key);
+  return repository && typeof repository.repo === "string"
+    ? canonicalRepositoryName(repository.repo)
+    : null;
+}
+
+function rethrowProjectEnvironmentValidation(error) {
+  if (error instanceof ProjectEnvironmentBindingError) {
+    throw validationError(error.code, error.field, error.message);
+  }
+  throw error;
+}
+
+// Historic project ids may include prototype-magic spellings that the M1 peer
+// identity grammar intentionally rejects. They remain valid configured V2
+// projects for lifecycle/tombstone compatibility, but cannot opt into Project
+// Environments until renamed through a future explicit identity migration.
+// Do not use this compatibility exception for peer fields: only the current
+// project identity error is tolerated, and only at the config boundary.
+function isLegacyCurrentProjectIdentityError(error) {
+  return error instanceof ProjectEnvironmentBindingError &&
+    error.code === "invalid_project_id" && error.field === "project.id";
+}
+
+function projectEnvironmentValidationInput(config, project) {
+  return {
+    installation_id: config.installation_id,
+    project,
+    resolveCanonicalRepository: resolveCanonicalProjectRepository,
+  };
+}
+
+// Normalize the V2-only settings at the same serialized boundary that writes
+// config.json. This makes missing legacy fields become explicit safe defaults,
+// retains unrelated project fields, and prevents a generic write from ever
+// reintroducing a scalar repository representation as a side effect.
+function normalizeV2ProjectEnvironmentSettings(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config) ||
+      !Array.isArray(config.projects) || !hasOwn(config, "installation_id")) {
+    return config;
+  }
+  const projects = config.projects.map((project) => {
+    try {
+      return normalizeProjectEnvironmentSettings(projectEnvironmentValidationInput(config, project)).project;
+    } catch (error) {
+      if (isLegacyCurrentProjectIdentityError(error)) return cloneConfigurationValue(project);
+      return rethrowProjectEnvironmentValidation(error);
+    }
+  });
+  return { ...config, projects };
+}
+
+// Absence is meaningful: legacy repositories retain no inferred policy and
+// evaluators report `missing_policy` until an operator explicitly configures
+// one.  This accessor is intentionally repository-key scoped so callers cannot
+// borrow a primary repository's policy for a sibling binding.
+function repositoryCiPolicy(project, key) {
+  const repository = repositoryByKey(project, key);
+  if (!repository || !hasOwn(repository, "ci_policy")) return null;
+  return normalizeCiPolicy(repository.ci_policy);
+}
+
+/**
+ * The single symbol-scoped scalar compatibility serializer. Persisted V2
+ * records never carry scalar repo/working_dir fields; legacy response consumers
+ * may temporarily receive values derived from the canonical primary entry.
+ */
+function serializeProjectCompatibility(project) {
+  const repositories = allRepositories(project);
+  const primary = primaryRepository({ repositories });
+  const compatible = { ...cloneConfigurationValue(project), repositories };
+  if (primary) {
+    compatible.repo = primary.repo;
+    compatible.working_dir = primary.working_dir;
+  }
+  return compatible;
+}
+
+function projectIdForError(project, index) {
+  return typeof project?.id === "string" && project.id ? project.id : `projects[${index}]`;
+}
+
+function foldPathIdentity(value) {
+  return value.normalize("NFC").toLowerCase();
+}
+
+function callRealpath(fsImpl, value) {
+  const realpath = fsImpl.realpathSync && (fsImpl.realpathSync.native || fsImpl.realpathSync);
+  if (typeof realpath !== "function") throw new Error("realpathSync is unavailable");
+  return realpath.call(fsImpl.realpathSync, value);
+}
+
+function isMissingPathError(err) {
+  return err && (err.code === "ENOENT" || err.code === "ENOTDIR");
+}
+
+// Resolve an existing base directory through symlinks and capture its device /
+// inode identity. For a future path, resolve the nearest existing ancestor and
+// append the missing suffix before normalizing, so a symlinked parent cannot
+// reserve the same future path twice under different spellings.
+function workingDirIdentity(workingDir, fsImpl = fs) {
+  const absolute = normalizeAbsoluteWorkingDir(workingDir);
+  if (typeof absolute !== "string" || !path.isAbsolute(absolute)) {
+    throw validationError(
+      "invalid_repository_working_dir",
+      "repositories.working_dir",
+      "repositories.working_dir must be an absolute path",
+    );
+  }
+
+  let real;
+  try {
+    real = path.normalize(callRealpath(fsImpl, absolute));
+  } catch (err) {
+    if (!isMissingPathError(err)) {
+      throw validationError(
+        "repository_working_dir_identity_unavailable",
+        "repositories.working_dir",
+        "repositories.working_dir identity could not be verified",
+      );
+    }
+  }
+
+  if (real !== undefined) {
+    let stat;
+    try {
+      stat = fsImpl.statSync(real);
+    } catch {
+      // A successful realpath followed by any stat failure is a race or an
+      // unreadable identity. Never downgrade it to a future-path comparison.
+      throw validationError(
+        "repository_working_dir_identity_unavailable",
+        "repositories.working_dir",
+        "repositories.working_dir identity could not be verified",
+      );
+    }
+    if (!stat || stat.dev === undefined || stat.ino === undefined) {
+      throw validationError(
+        "repository_working_dir_identity_unavailable",
+        "repositories.working_dir",
+        "repositories.working_dir identity could not be verified",
+      );
+    }
+    if (typeof stat.isDirectory === "function" && !stat.isDirectory()) {
+      throw validationError(
+        "invalid_repository_working_dir",
+        "repositories.working_dir",
+        "repositories.working_dir must identify a directory",
+      );
+    }
+    // Existing paths use exact realpath plus dev+ino. On case-sensitive Linux,
+    // /A and /a may be different directories and must not be case-folded; on a
+    // case-insensitive filesystem aliases resolve to the same object identity.
+    const identities = new Set([
+      `configured-path:${absolute.normalize("NFC")}`,
+      `canonical-path:${real.normalize("NFC")}`,
+      `realpath:${real.normalize("NFC")}`,
+      `device:${String(stat.dev)}:${String(stat.ino)}`,
+    ]);
+    return {
+      path: absolute,
+      state: "existing",
+      identities,
+      foldedIdentities: new Set([
+        foldPathIdentity(absolute),
+        foldPathIdentity(real),
+      ]),
+    };
+  }
+
+  const suffix = [];
+  let cursor = absolute;
+  while (true) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    suffix.unshift(path.basename(cursor));
+    cursor = parent;
+    try {
+      const realParent = path.normalize(callRealpath(fsImpl, cursor));
+      let parentStat;
+      try {
+        parentStat = fsImpl.statSync(realParent);
+      } catch {
+        throw validationError(
+          "repository_working_dir_identity_unavailable",
+          "repositories.working_dir",
+          "repositories.working_dir identity could not be verified",
+        );
+      }
+      if (typeof parentStat?.isDirectory === "function" && !parentStat.isDirectory()) {
+        throw validationError(
+          "invalid_repository_working_dir",
+          "repositories.working_dir",
+          "repositories.working_dir must have a directory ancestor",
+        );
+      }
+      const future = path.normalize(path.join(realParent, ...suffix));
+      // A future path has no inode. Conservatively case-fold its normalized
+      // identity so a later case-insensitive creation cannot bypass ownership.
+      return {
+        path: absolute,
+        state: "future",
+        identities: new Set([
+          `configured-path:${absolute.normalize("NFC")}`,
+          `canonical-path:${future.normalize("NFC")}`,
+          `future-path:${foldPathIdentity(future)}`,
+        ]),
+        foldedIdentities: new Set([
+          foldPathIdentity(absolute),
+          foldPathIdentity(future),
+        ]),
+      };
+    } catch (err) {
+      if (err instanceof ConfigurationValidationError) throw err;
+      if (!isMissingPathError(err)) {
+        throw validationError(
+          "repository_working_dir_identity_unavailable",
+          "repositories.working_dir",
+          "repositories.working_dir identity could not be verified",
+        );
+      }
+    }
+  }
+
+  return {
+    path: absolute,
+    state: "future",
+    identities: new Set([
+      `configured-path:${absolute.normalize("NFC")}`,
+      `canonical-path:${absolute.normalize("NFC")}`,
+      `future-path:${foldPathIdentity(absolute)}`,
+    ]),
+    foldedIdentities: new Set([foldPathIdentity(absolute)]),
+  };
+}
+
+function identitiesOverlap(left, right) {
+  for (const identity of left.identities) {
+    if (right.identities.has(identity)) return true;
+  }
+  // Existing paths on case-sensitive Linux are distinguished by exact
+  // realpath+dev+ino. If either observation is a future path, no inode exists
+  // to prove case distinction, so conservatively compare the folded canonical
+  // candidates across the state boundary.
+  if (left.state && right.state && left.state !== right.state &&
+      left.foldedIdentities && right.foldedIdentities) {
+    for (const identity of left.foldedIdentities) {
+      if (right.foldedIdentities.has(identity)) return true;
+    }
+  }
+  return false;
+}
+
+function validateInstallationId(value) {
+  if (typeof value !== "string" || !INSTALLATION_ID_RE.test(value)) {
+    throw validationError(
+      "invalid_installation_id",
+      "installation_id",
+      "installation_id is missing or invalid",
+    );
+  }
+  return value;
+}
+
+function inactiveWorkingDirIdentity(workingDir) {
+  const absolute = normalizeAbsoluteWorkingDir(workingDir);
+  if (typeof absolute !== "string" || !path.isAbsolute(absolute)) {
+    throw validationError(
+      "invalid_repository_working_dir",
+      "repositories.working_dir",
+      "repositories.working_dir must be an absolute path",
+    );
+  }
+  return {
+    path: absolute,
+    identities: new Set([`inactive-path:${foldPathIdentity(absolute)}`]),
+  };
+}
+
+function validateRepositoryEntries(project, projectIndex, fsImpl, options = {}) {
+  const ownerId = projectIdForError(project, projectIndex);
+  if (!Array.isArray(project.repositories) || project.repositories.length === 0) {
+    throw validationError(
+      "repositories_required",
+      "repositories",
+      "repositories must contain at least one entry",
+    );
+  }
+
+  const entries = normalizeProjectRepositories(project);
+  const keys = new Set();
+  const repos = new Set();
+  const pathIdentities = [];
+  let primaryCount = 0;
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw validationError("invalid_repository", "repositories", "repository entry is invalid");
+    }
+    if (typeof entry.key !== "string" || !REPOSITORY_KEY_RE.test(entry.key)) {
+      throw validationError(
+        "invalid_repository_key",
+        "repositories.key",
+        "repositories.key is invalid",
+      );
+    }
+    if (keys.has(entry.key)) {
+      throw validationError(
+        "duplicate_repository_key",
+        "repositories.key",
+        `repositories.key is duplicated in project ${JSON.stringify(ownerId)}`,
+        ownerId,
+      );
+    }
+    keys.add(entry.key);
+
+    if (typeof entry.repo !== "string" || !GITHUB_REPOSITORY_RE.test(entry.repo)) {
+      throw validationError(
+        "invalid_repository_name",
+        "repositories.repo",
+        "repositories.repo must be an owner/name value",
+      );
+    }
+    if (hasOwn(entry, "ci_policy")) {
+      try {
+        normalizeCiPolicy(entry.ci_policy);
+      } catch (error) {
+        if (error instanceof CiEvidencePolicyError) {
+          throw validationError(
+            error.code,
+            "repositories.ci_policy",
+            error.message,
+            ownerId,
+          );
+        }
+        throw error;
+      }
+    }
+    const canonicalRepo = canonicalRepositoryName(entry.repo);
+    if (repos.has(canonicalRepo)) {
+      throw validationError(
+        "duplicate_repository",
+        "repositories.repo",
+        `repositories.repo is duplicated in project ${JSON.stringify(ownerId)}`,
+        ownerId,
+      );
+    }
+    repos.add(canonicalRepo);
+
+    const pathIdentity = options.resolveIdentity === false
+      ? inactiveWorkingDirIdentity(entry.working_dir)
+      : workingDirIdentity(entry.working_dir, fsImpl);
+    if (pathIdentities.some((other) => identitiesOverlap(other, pathIdentity))) {
+      throw validationError(
+        "duplicate_repository_working_dir",
+        "repositories.working_dir",
+        `repositories.working_dir is duplicated in project ${JSON.stringify(ownerId)}`,
+        ownerId,
+      );
+    }
+    pathIdentities.push(pathIdentity);
+    if (entry.primary === true) primaryCount += 1;
+  }
+
+  if (primaryCount !== 1) {
+    throw validationError(
+      "invalid_primary_repository_count",
+      "repositories.primary",
+      "repositories must contain exactly one primary entry",
+    );
+  }
+
+  return entries.map((entry, index) => ({
+    entry,
+    canonicalRepo: canonicalRepositoryName(entry.repo),
+    pathIdentity: pathIdentities[index],
+  }));
+}
+
+function validateImmutableRepositoryKeys(candidateProject, candidate, previousProject, projectIndex, fsImpl, options = {}) {
+  if (!previousProject) return;
+  const previousEntries = normalizeProjectRepositories(previousProject);
+  for (const previous of previousEntries) {
+    if (!previous || typeof previous !== "object") continue;
+    const previousRepo = canonicalRepositoryName(previous.repo);
+    const previousPath = options.resolveIdentity === false
+      ? inactiveWorkingDirIdentity(previous.working_dir)
+      : workingDirIdentity(previous.working_dir, fsImpl);
+    const matching = candidate.find(({ canonicalRepo, pathIdentity }) =>
+      (previousRepo && canonicalRepo === previousRepo) ||
+      (previousPath && identitiesOverlap(pathIdentity, previousPath)));
+    if (matching && matching.entry.key !== previous.key) {
+      throw validationError(
+        "immutable_repository_key",
+        "repositories.key",
+        `repositories.key is immutable in project ${JSON.stringify(projectIdForError(candidateProject, projectIndex))}`,
+        projectIdForError(candidateProject, projectIndex),
+      );
+    }
+  }
+}
+
+/** Validate a fully activated (array-only) V2 configuration without mutation. */
+function validateV2Configuration(config, options = {}) {
+  const fsImpl = options.fsImpl || fs;
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw validationError("invalid_configuration", "config", "configuration is invalid");
+  }
+  validateInstallationId(config.installation_id);
+  if (!Array.isArray(config.projects)) {
+    throw validationError("invalid_projects", "projects", "projects must be an array");
+  }
+
+  if (hasOwn(config, "project_admission_generations")) {
+    const registry = config.project_admission_generations;
+    if (!registry || typeof registry !== "object" || Array.isArray(registry)) {
+      throw validationError(
+        "invalid_project_admission_registry",
+        "project_admission_generations",
+        "project admission registry must be an object",
+      );
+    }
+    for (const [projectId, generation] of Object.entries(registry)) {
+      if (!projectId || !Number.isSafeInteger(generation) || generation < 0) {
+        throw validationError(
+          "invalid_project_admission_registry",
+          `project_admission_generations.${projectId || "?"}`,
+          "project admission registry entries must be safe nonnegative integers",
+        );
+      }
+    }
+  }
+
+  const previousById = new Map(
+    Array.isArray(options.previousConfig?.projects)
+      ? options.previousConfig.projects
+        .filter((project) => project && typeof project.id === "string")
+        .map((project) => [project.id, project])
+      : [],
+  );
+  const activeRepos = new Map();
+  const activePaths = [];
+
+  config.projects.forEach((project, index) => {
+    if (!project || typeof project !== "object" || Array.isArray(project)) {
+      throw validationError("invalid_project", "projects", "project entry is invalid");
+    }
+    if (hasOwn(project, "admission_generation") &&
+        (!Number.isSafeInteger(project.admission_generation) || project.admission_generation < 0)) {
+      throw validationError(
+        "invalid_project_admission_generation",
+        `projects[${index}].admission_generation`,
+        "project admission generation must be a safe nonnegative integer",
+      );
+    }
+    if (hasOwn(project, "repo") || hasOwn(project, "working_dir")) {
+      throw validationError(
+        "legacy_repository_scalars_persisted",
+        "repositories",
+        "activated projects must persist repositories without legacy scalar fields",
+      );
+    }
+    const resolveIdentity = project.archived !== true;
+    const validated = validateRepositoryEntries(project, index, fsImpl, { resolveIdentity });
+    validateImmutableRepositoryKeys(
+      project,
+      validated,
+      previousById.get(project.id),
+      index,
+      fsImpl,
+      { resolveIdentity },
+    );
+    try {
+      const environmentSettings = validateProjectEnvironmentSettings(
+        projectEnvironmentValidationInput(config, project),
+      );
+      if (!environmentSettings.ok) {
+        throw new ProjectEnvironmentBindingError(
+          environmentSettings.error.code,
+          environmentSettings.error.field,
+          environmentSettings.error.message,
+        );
+      }
+    } catch (error) {
+      if (isLegacyCurrentProjectIdentityError(error)) return;
+      rethrowProjectEnvironmentValidation(error);
+    }
+
+    // `idle` is an execution flag, not archival state. Only explicit archived
+    // projects release their repository/path ownership claim.
+    if (project.archived === true) return;
+    const ownerId = projectIdForError(project, index);
+    for (const { canonicalRepo, pathIdentity } of validated) {
+      const repoOwner = activeRepos.get(canonicalRepo);
+      if (repoOwner !== undefined) {
+        throw validationError(
+          "repository_owned_by_active_project",
+          "repositories.repo",
+          `repositories.repo is already owned by active project ${JSON.stringify(repoOwner)}`,
+          repoOwner,
+        );
+      }
+      const pathOwner = activePaths.find(({ identity }) =>
+        identitiesOverlap(identity, pathIdentity));
+      if (pathOwner) {
+        throw validationError(
+          "repository_working_dir_owned_by_active_project",
+          "repositories.working_dir",
+          `repositories.working_dir is already owned by active project ${JSON.stringify(pathOwner.ownerId)}`,
+          pathOwner.ownerId,
+        );
+      }
+      activeRepos.set(canonicalRepo, ownerId);
+      activePaths.push({ identity: pathIdentity, ownerId });
+    }
+  });
+
+  return config;
+}
+
+/** Pure, idempotent scalar-to-array migration; it never writes its input. */
+function migrateConfigurationToV2(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return config;
+  const cloned = cloneConfigurationValue(config);
+  removeRetiredGlobalAgentMetadata(cloned);
+  const projects = Array.isArray(cloned.projects)
+    ? cloned.projects.map((project) => {
+        if (!project || typeof project !== "object" || Array.isArray(project)) return project;
+        const migrated = {
+          ...project,
+          repositories: normalizeProjectRepositories(project),
+        };
+        delete migrated.repo;
+        delete migrated.working_dir;
+        return migrated;
+      })
+    : cloned.projects;
+  return normalizeV2ProjectEnvironmentSettings({ ...cloned, projects });
+}
 
 // Reserved sender names that the operator must NOT be able to claim.
 const RESERVED_OPERATOR_NAMES = new Set([
@@ -41,8 +788,8 @@ function sanitizeOperatorName(value) {
 // installs transition to the canonical head/dev/re1/re2 slugs.
 const AGENT_KEY_MAP = { t1: "head", t2a: "re1", t2b: "re2", t3: "dev", reviewer1: "re1", reviewer2: "re2" };
 
-function migrateAgentKeys(config) {
-  let changed = false;
+function migrateAgentKeysInMemory(config) {
+  let changed = removeRetiredGlobalAgentMetadata(config);
   if (config.projects) {
     for (const project of config.projects) {
       if (!project.agents) continue;
@@ -55,37 +802,79 @@ function migrateAgentKeys(config) {
       }
     }
   }
-  if (changed) {
-    try {
-      writeSecureFile(CONFIG_PATH, JSON.stringify(config, null, 2));
-    } catch {}
-  }
-  return config;
+  return changed;
 }
 
-function readConfig() {
+function readConfigDocument() {
   let raw;
   try {
     raw = fs.readFileSync(CONFIG_PATH, "utf-8");
   } catch (err) {
     if (err.code === "ENOENT") {
-      // Config file doesn't exist — create default
-      const dir = path.dirname(CONFIG_PATH);
-      if (!fs.existsSync(dir)) {
-        ensureSecureDir(dir);
-      }
-      writeSecureFile(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
-      return { ...DEFAULT_CONFIG };
+      return { config: cloneConfigurationValue(DEFAULT_CONFIG), missing: true };
     }
     throw new Error(`Cannot read config at ${CONFIG_PATH}: ${err.message}`);
   }
 
   try {
-    const config = JSON.parse(raw);
-    return migrateAgentKeys(config);
+    return { config: JSON.parse(raw), missing: false };
   } catch (err) {
     throw new Error(`Invalid JSON in ${CONFIG_PATH}: ${err.message}`);
   }
+}
+
+function readConfig() {
+  const observed = readConfigDocument();
+  const observedConfig = cloneConfigurationValue(observed.config);
+  const observedNeedsMigration = migrateAgentKeysInMemory(observedConfig);
+  if (!observed.missing && !observedNeedsMigration) return observedConfig;
+
+  // Missing initialization and read-time migrations are read-modify-write
+  // operations. Re-read after acquiring config.lock so a peer transaction that
+  // completed after the optimistic observation is never overwritten.
+  return withConfigWriteLock(() => {
+    const fresh = readConfigDocument();
+    const config = cloneConfigurationValue(fresh.config);
+    const changed = migrateAgentKeysInMemory(config);
+    if (fresh.missing) {
+      ensureSecureDir(path.dirname(CONFIG_PATH));
+      writeConfig(config);
+    } else if (changed) {
+      writeConfig(config);
+    }
+    return config;
+  });
+}
+
+// #1038: strict, side-effect-free runtime resource policy access. This path is
+// intentionally separate from readConfig(): readConfig creates a default file
+// and may persist legacy migrations, while resource preflight must be read-only.
+// Absence is meaningful and remains null; the proposal is never injected here.
+function getRuntimeResources(config) {
+  const raw = config && typeof config === "object" && !Array.isArray(config)
+    ? config.runtime_resources
+    : undefined;
+  return parseRuntimeResources(raw);
+}
+
+function readRuntimeResources(options = {}) {
+  const fsImpl = options.fsImpl || fs;
+  const configPath = options.configPath || CONFIG_PATH;
+  let raw;
+  try {
+    raw = fsImpl.readFileSync(configPath, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    throw new Error("Cannot read runtime_resources configuration");
+  }
+
+  let config;
+  try {
+    config = JSON.parse(raw);
+  } catch {
+    throw new Error("Invalid QuadWork configuration JSON");
+  }
+  return getRuntimeResources(config);
 }
 
 /**
@@ -175,8 +964,59 @@ function writeSecureFile(filePath, data, extraOpts = {}) {
 // process died mid-write, losing the entire config; rename() is atomic on the
 // same filesystem, so a reader always sees either the old or the new file, never
 // a partial one. The tmp name carries the pid so two processes can't collide.
-function writeConfig(cfg) {
-  const data = JSON.stringify(cfg, null, 2);
+function writeConfig(cfg, options = {}) {
+  return withConfigWriteLock(() => writeConfigUnlocked(cfg, options));
+}
+
+function writeConfigUnlocked(cfg, options = {}) {
+  // Every writer establishes the authoritative prior state while holding the
+  // cross-process lock. Public callers cannot select legacy validation with a
+  // stale snapshot or smuggle lifecycle authority through an options object.
+  const internalWrite = options[INTERNAL_CONFIG_WRITE] === INTERNAL_CONFIG_WRITE_AUTHORITY;
+  const liveDocument = internalWrite ? null : readConfigDocument();
+  const previousConfig = internalWrite
+    ? options.previousConfig
+    : liveDocument.config;
+  // Validate exactly the enumerable JSON representation that will be written.
+  // Route compatibility accessors expose legacy scalar conveniences as
+  // non-enumerable properties; those must remain usable in memory without
+  // becoming false persisted-schema violations at the atomic boundary.
+  let candidate = cloneConfigurationValue(cfg);
+  removeRetiredGlobalAgentMetadata(candidate);
+  const lifecycleTransition = internalWrite ? options.lifecycleTransition : null;
+  const wasActivated = hasOwn(previousConfig || {}, "installation_id");
+  const isActivated = hasOwn(candidate || {}, "installation_id");
+
+  if (!internalWrite && !wasActivated && isActivated) {
+    throw validationError(
+      "installation_id_introduction_forbidden",
+      "installation_id",
+      "installation_id can be introduced only by the V2 activation boundary",
+    );
+  }
+  if (wasActivated && (!isActivated || candidate.installation_id !== previousConfig.installation_id)) {
+    throw validationError(
+      "installation_id_rotation_forbidden",
+      "installation_id",
+      "installation_id cannot be deleted or replaced",
+    );
+  }
+  if (isActivated) {
+    candidate = normalizeV2ProjectEnvironmentSettings(candidate);
+    validateV2Configuration(candidate, {
+      previousConfig: previousConfig || candidate,
+      fsImpl: internalWrite ? options.fsImpl || fs : fs,
+    });
+  }
+  if (wasActivated || isActivated) {
+    assertProjectLifecycleTransitions(candidate, previousConfig, lifecycleTransition, {
+      validationError,
+      normalizeProjectRepositories,
+      validateV2Configuration,
+      fsImpl: internalWrite ? options.fsImpl || fs : fs,
+    });
+  }
+  const data = JSON.stringify(candidate, null, 2);
   const tmpPath = `${CONFIG_PATH}.${process.pid}.tmp`;
   writeSecureFile(tmpPath, data); // 0o600
   try {
@@ -193,11 +1033,145 @@ function writeConfig(cfg) {
 // concurrent caller can't clobber it with a stale whole-config snapshot. Server
 // mutators and the field-scoped endpoints go through here instead of doing their
 // own GET→mutate→writeConfig. Returns the mutated config.
-function updateConfig(mutator) {
-  const cfg = readConfig();
-  mutator(cfg);
-  writeConfig(cfg);
-  return cfg;
+function updateConfigInternal(mutator, options = {}) {
+  return withConfigWriteLock(() => {
+    const { config: cfg, missing } = readConfigDocument();
+    // Apply the old agent-key migration in memory. A failed mutator must not
+    // trigger readConfig()'s eager legacy write before the candidate validates.
+    migrateAgentKeysInMemory(cfg);
+    const previousConfig = cloneConfigurationValue(cfg);
+    mutator(cfg);
+    removeRetiredGlobalAgentMetadata(cfg);
+    if (missing) ensureSecureDir(path.dirname(CONFIG_PATH));
+    writeConfig(cfg, {
+      previousConfig,
+      lifecycleTransition: options.lifecycleTransition || null,
+      fsImpl: options.fsImpl || fs,
+      [INTERNAL_CONFIG_WRITE]: INTERNAL_CONFIG_WRITE_AUTHORITY,
+    });
+    return cfg;
+  });
 }
 
-module.exports = { readConfig, resolveAgentCwd, resolveAgentCommand, resolveProjectChattr, sanitizeOperatorName, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, updateConfig };
+function updateConfig(mutator) {
+  return updateConfigInternal(mutator);
+}
+
+/**
+ * Sole serialized V2 activation/mutation boundary.
+ *
+ * It generates an opaque ID exactly once when the persisted field is absent,
+ * rejects deletion/rotation, migrates scalar repositories in memory, validates
+ * the complete candidate against the previous snapshot, then performs the one
+ * atomic write used by updateConfig(). It is intentionally not wired to any
+ * startup/read/route path in #1029.
+ */
+function commitV2ConfigurationInternal(mutator = () => {}, options = {}) {
+  if (typeof mutator !== "function") throw new TypeError("mutator must be a function");
+  const idGenerator = options.idGenerator || (() => crypto.randomUUID());
+  if (typeof idGenerator !== "function") throw new TypeError("idGenerator must be a function");
+
+  return updateConfigInternal((cfg) => {
+    const previousConfig = cloneConfigurationValue(cfg);
+    const hadInstallationId = hasOwn(cfg, "installation_id");
+    const committedInstallationId = hadInstallationId ? cfg.installation_id : idGenerator();
+    cfg.installation_id = committedInstallationId;
+
+    mutator(cfg);
+    if (!hasOwn(cfg, "installation_id") || cfg.installation_id !== committedInstallationId) {
+      throw validationError(
+        "installation_id_rotation_forbidden",
+        "installation_id",
+        "installation_id cannot be deleted or replaced",
+      );
+    }
+
+    // An already-activated installation must remain array-only. Migration is
+    // reserved for the first explicit activation; otherwise a later route
+    // could smuggle legacy scalars into a candidate and have them silently
+    // stripped instead of rejected.
+    const candidate = hadInstallationId
+      ? cloneConfigurationValue(cfg)
+      : migrateConfigurationToV2(cfg);
+    validateV2Configuration(candidate, {
+      previousConfig,
+      fsImpl: options.fsImpl || fs,
+    });
+    for (const key of Object.keys(cfg)) delete cfg[key];
+    Object.assign(cfg, candidate);
+  }, {
+    lifecycleTransition: options.lifecycleTransition || null,
+    fsImpl: options.fsImpl || fs,
+  });
+}
+
+function commitV2Configuration(mutator = () => {}, options = {}) {
+  return commitV2ConfigurationInternal(mutator, {
+    idGenerator: options.idGenerator,
+    fsImpl: options.fsImpl,
+  });
+}
+
+// Package-internal lifecycle port. Its opaque transition object is minted by
+// project-lifecycle-authority.js and checked by object identity at commit time.
+function commitV2ProjectLifecycleConfiguration(mutator, lifecycleTransition, options = {}) {
+  return commitV2ConfigurationInternal(mutator, {
+    idGenerator: options.idGenerator,
+    fsImpl: options.fsImpl,
+    lifecycleTransition,
+  });
+}
+
+registerProjectLifecycleCommitter(commitV2ProjectLifecycleConfiguration);
+
+/**
+ * Compatibility boundary for legacy CLI writers. Activation is decided from
+ * the live document while the cross-process lock is held, never from the
+ * caller's potentially stale snapshot.
+ */
+function commitConfigurationSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new TypeError("configuration snapshot must be an object");
+  }
+  return withConfigWriteLock(() => {
+    const { config: live } = readConfigDocument();
+    if (hasOwn(live, "installation_id")) {
+      return commitV2Configuration((fresh) => {
+        for (const key of Object.keys(fresh)) delete fresh[key];
+        Object.assign(fresh, cloneConfigurationValue(snapshot));
+      });
+    }
+    return writeConfig(cloneConfigurationValue(snapshot));
+  });
+}
+
+module.exports = {
+  readConfig,
+  readRuntimeResources,
+  getRuntimeResources,
+  resolveAgentCwd,
+  resolveAgentCommand,
+  resolveProjectChattr,
+  sanitizeOperatorName,
+  CONFIG_PATH,
+  ensureSecureDir,
+  writeSecureFile,
+  withSerializedConfigWrite,
+  writeConfig,
+  updateConfig,
+  ConfigurationValidationError,
+  normalizeProjectRepositories,
+  allRepositories,
+  primaryRepository,
+  repositoryByKey,
+  repositoryByCanonicalName,
+  resolveCanonicalProjectRepository,
+  repositoryCiPolicy,
+  serializeProjectCompatibility,
+  workingDirIdentity,
+  validateV2Configuration,
+  migrateConfigurationToV2,
+  RETIRED_GLOBAL_AGENT_FIELD,
+  commitV2Configuration,
+  commitConfigurationSnapshot,
+};

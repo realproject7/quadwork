@@ -105,6 +105,10 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
     shipped.has("src/lib/injectMode.js"),
     'src/lib/injectMode.js is require()d by runtime code and must stay in the tarball (#937)',
   );
+  assert.ok(
+    shipped.has("src/lib/batchIdentity.js"),
+    "Operator MCP batch actions require the shared assignment-identity helper in installed packages (#1031)",
+  );
 
   // 5) fs-loaded / dynamically-required assets the literal-require scan can't
   //    see (#976). These are read at runtime by path (seed reseeding reads the
@@ -120,7 +124,43 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
     .filter((f) => f.endsWith(".AGENTS.md"))
     .map((f) => `templates/seeds/${f}`);
   assert.ok(seedFiles.length > 0, "found template AGENTS.md seeds to check");
-  assetTargets.push(...seedFiles, "templates/CLAUDE.md");
+  assetTargets.push(
+    ...seedFiles,
+    "templates/seeds/HEAD-PO-PLAYBOOK.md",
+    "templates/CLAUDE.md",
+  );
+  const playbook = fs.readFileSync(path.join(seedDir, "HEAD-PO-PLAYBOOK.md"), "utf8");
+  assert.match(playbook, /\*\*Playbook version:\*\*\s+\d+\.\d+\.\d+/,
+    "Head PO playbook carries a visible semantic version");
+
+  // #1051: the reviewer ticket-review comment policy lives in reseeded assets,
+  // so a packaged install must contain both reviewer contracts and the public
+  // review-batch guide rather than silently falling back to an older policy.
+  const ticketReviewPolicyAssets = [
+    "templates/seeds/re1.AGENTS.md",
+    "templates/seeds/re2.AGENTS.md",
+    "templates/seeds/HEAD-PO-PLAYBOOK.md",
+    "docs/review-batches.md",
+  ];
+  for (const asset of ticketReviewPolicyAssets) {
+    assert.ok(shipped.has(asset), `ticket-review policy asset ships: ${asset}`);
+  }
+  for (const reviewerSeed of ticketReviewPolicyAssets.slice(0, 2)) {
+    const policy = fs.readFileSync(path.join(ROOT, reviewerSeed), "utf8");
+    assert.match(policy, /quadwork-ticket-review-v1/,
+      `${reviewerSeed} carries the ticket-review idempotency marker`);
+    assert.match(policy, /issue_contract_revision/,
+      `${reviewerSeed} carries the server-issued revision gate`);
+    assert.match(policy, /never\*\* reproduce, hash, or derive its revision locally/,
+      `${reviewerSeed} does not locally derive the issue revision`);
+    assert.match(policy, /Head remains the review-batch closer/,
+      `${reviewerSeed} preserves Head-owned batch closure`);
+  }
+  assert.match(
+    fs.readFileSync(path.join(ROOT, "docs/review-batches.md"), "utf8"),
+    /comment exception is an operational reviewer policy/,
+    "shipped review-batch documentation explains the bounded comment policy",
+  );
 
   // Operator MCP tool modules (dynamically loaded, not literal-required).
   const toolsDir = path.join(ROOT, "server", "mcp-operator", "tools");
@@ -130,6 +170,10 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
     .map((f) => `server/mcp-operator/tools/${f}`);
   assert.ok(toolFiles.length > 0, "found operator MCP tool modules to check");
   assetTargets.push(...toolFiles);
+
+  // Resource policy apply invokes this fixed source-owned helper by path to
+  // obtain Linux renameat2(RENAME_EXCHANGE); it is not visible to require().
+  assetTargets.push("server/resource-rename-exchange-helper.py");
 
   const missingAssets = assetTargets.filter((t) => !shipped.has(t));
   assert.deepEqual(

@@ -1,8 +1,9 @@
 "use strict";
 
 // #790: tests for the MCP operator scaffold.
-//   1. list_projects over stdio proxies GET /api/config → { id, name, repo }
-//      only (the internal `agents` id list is stripped from public output).
+//   1. list_projects over stdio proxies GET /api/config → public-safe
+//      repository summaries plus the primary repo compatibility alias (the
+//      internal `agents` id list and local repository config are stripped).
 //   2. httpRequest maps ECONNREFUSED and a timeout to clean errors.
 //   3. assertKnownProject / assertKnownAgent pass known ids and throw the
 //      clean error for unknown ones — with no further (tool) HTTP call.
@@ -14,14 +15,31 @@ const { createContext } = require("./mcp-operator/context");
 
 const OPERATOR = path.join(__dirname, "mcp-operator.js");
 
-// Config the fake backend serves. `agents` is an OBJECT (mirrors the real
-// config.json) with per-agent fields that MUST NOT leak through the tools.
+// Config the fake backend serves. The canonical project deliberately puts its
+// primary repository second so list_projects cannot derive the compatibility
+// alias from array position. Agent settings, local paths, CI policy, and extra
+// repository fields MUST NOT leak through the tool.
 const FAKE_CONFIG = {
   projects: [
     {
       id: "plotlink",
       name: "PlotLink",
-      repo: "realproject7/plotlink",
+      repositories: [
+        {
+          key: "api",
+          repo: "realproject7/plotlink-api",
+          working_dir: "/private/workspaces/plotlink-api",
+          primary: false,
+          ci_policy: { required: ["secret-check"] },
+          token: "secret-repository-token",
+        },
+        {
+          key: "web",
+          repo: "realproject7/plotlink",
+          working_dir: "/private/workspaces/plotlink-web",
+          primary: true,
+        },
+      ],
       agents: {
         head: { model: "claude-opus-4-8", token: "secret-head" },
         dev: { model: "claude-opus-4-8" },
@@ -33,7 +51,9 @@ const FAKE_CONFIG = {
     {
       id: "quadwork",
       name: "QuadWork",
+      // Legacy scalar remains a supported input until explicit V2 activation.
       repo: "realproject7/quadwork",
+      working_dir: "/private/workspaces/quadwork",
       agents: { head: {}, dev: {}, re1: {}, re2: {} },
     },
   ],
@@ -92,6 +112,22 @@ function sendJsonRpc(proc, msg) {
 function startFullServer() {
   const requests = [];
   const CONFIG = { projects: [{ id: "p", name: "P", repo: "o/r", agents: { dev: {} } }] };
+  const workItemRef = { repo_key: "primary", repo: "o/r", number: 1, kind: "issue" };
+  const assignmentItems = [{ work_item_ref: workItemRef, ownership_key: "owned-p-1" }];
+  const assignment = {
+    admission_generation: 0,
+    batch_observation_fingerprint: "v2-observation-scaffold-1",
+    compatibility_mode: "v2",
+    installation_id: "installation-p",
+    batch_number: 1,
+    assignment_attempt: "attempt-p",
+    provenance: "owned",
+    assignment_key: "assignment-p",
+    assignment_items: assignmentItems,
+    current: true,
+    owned: true,
+    multi_repository: false,
+  };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       let raw = "";
@@ -105,8 +141,20 @@ function startFullServer() {
         };
         if (req.method === "GET" && pathOnly === "/api/config") return send(CONFIG);
         if (pathOnly === "/api/chat") return req.method === "GET" ? send([]) : send({ ok: true, message: { id: 1, sender: "user" } });
-        if (pathOnly === "/api/batch-active") return send({ active: false });
-        if (pathOnly === "/api/batch-progress") return send({ items: [] });
+        if (pathOnly === "/api/batch-active") return send({ ...assignment, active: true });
+        if (pathOnly === "/api/batch-progress") return send({
+          ...assignment,
+          complete: false,
+          completeConfirmed: false,
+          liveActiveBatchCleared: false,
+          items: [{
+            ...assignment,
+            ...workItemRef,
+            work_item_ref: workItemRef,
+            ownership_key: "owned-p-1",
+          }],
+        });
+        if (pathOnly === "/api/work-task-batch") return send({ ok: true, active: false, projection: null });
         if (pathOnly === "/api/queue") {
           if (req.method === "GET") return send({ ok: true, exists: true, content: "x" });
           if (req.method === "PUT") return send({ ok: true });
@@ -192,10 +240,36 @@ async function runTests() {
   assert(callResp.result?.content?.[0]?.type === "text", "list_projects returns text content");
   const projects = JSON.parse(callResp.result.content[0].text);
   assert(Array.isArray(projects) && projects.length === 2, "list_projects returns both projects");
-  assert(projects[0].id === "plotlink" && projects[0].repo === "realproject7/plotlink", "list_projects id/repo correct");
+  assert(projects[0].id === "plotlink" && projects[0].repo === "realproject7/plotlink",
+    "list_projects derives repo alias from the canonical primary, not array position");
   const keys = Object.keys(projects[0]).sort().join(",");
-  assert(keys === "id,name,repo", `list_projects returns only id/name/repo (got ${keys})`);
-  assert(!("agents" in projects[0]) && !("extraField" in projects[0]), "list_projects strips agents + extra fields");
+  assert(keys === "id,name,repo,repositories", `list_projects returns only public project fields (got ${keys})`);
+  assert(
+    projects[0].repositories.map((entry) => entry.repo).join(",")
+      === "realproject7/plotlink-api,realproject7/plotlink",
+    "list_projects returns every configured repository in display order",
+  );
+  assert(
+    projects[0].repositories.every((entry) => Object.keys(entry).sort().join(",") === "key,primary,repo"),
+    "list_projects repository entries expose only key/repo/primary",
+  );
+  assert(
+    projects[1].repo === "realproject7/quadwork"
+      && projects[1].repositories.length === 1
+      && projects[1].repositories[0].key === "primary"
+      && projects[1].repositories[0].primary === true,
+    "list_projects preserves legacy scalar compatibility through canonical normalization",
+  );
+  const publicJson = JSON.stringify(projects);
+  assert(
+    !("agents" in projects[0])
+      && !("extraField" in projects[0])
+      && !publicJson.includes("working_dir")
+      && !publicJson.includes("ci_policy")
+      && !publicJson.includes("secret-head")
+      && !publicJson.includes("secret-repository-token"),
+    "list_projects strips agent config, local paths, CI policy, tokens, and extra fields",
+  );
   assert(requests.some((r) => r.startsWith("GET /api/config")), "list_projects proxied GET /api/config");
 
   // ── 2. unknown tool → JSON-RPC error, loop survives ─────────────────────
@@ -286,15 +360,16 @@ async function runTests() {
     { tool: "list_projects", args: {}, expect: [["GET", "/api/config"]] },
     { tool: "read_chat", args: { project: "p", since_id: 1, limit: 5 }, expect: [["GET", "/api/chat"]] },
     { tool: "batch_status", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"]] },
+    { tool: "read_work_task_batch", args: { project: "p" }, expect: [["GET", "/api/work-task-batch"]] },
     { tool: "read_queue", args: { project: "p" }, expect: [["GET", "/api/queue"]] },
     { tool: "list_agents", args: { project: "p" }, expect: [["GET", "/api/agents"]] },
     { tool: "send_message", args: { project: "p", text: "hi" }, expect: [["POST", "/api/chat"]] },
     { tool: "set_batch", args: { project: "p", content: "x" }, expect: [["PUT", "/api/queue"]] },
     { tool: "append_batch", args: { project: "p", content: "x" }, expect: [["GET", "/api/queue"], ["PUT", "/api/queue"]] },
     { tool: "ensure_batch", args: { project: "p" }, expect: [["POST", "/api/queue"]] },
-    { tool: "start_batch", args: { project: "p" }, expect: [["POST", "/api/triggers/p/start"]] },
-    { tool: "trigger_now", args: { project: "p" }, expect: [["POST", "/api/triggers/p/send-now"]] },
-    { tool: "stop_batch", args: { project: "p" }, expect: [["POST", "/api/triggers/p/stop"]] },
+    { tool: "start_batch", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"], ["POST", "/api/triggers/p/start"]] },
+    { tool: "trigger_now", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"], ["POST", "/api/triggers/p/send-now"]] },
+    { tool: "stop_batch", args: { project: "p" }, expect: [["GET", "/api/batch-active"], ["GET", "/api/batch-progress"], ["POST", "/api/triggers/p/stop"]] },
     { tool: "agent_control", args: { project: "p", agent: "dev", action: "restart" }, expect: [["POST", "/api/agents/p/dev/restart"]] },
     { tool: "interrupt_all", args: { project: "p" }, expect: [["POST", "/api/agents/p/interrupt-all"]] },
   ];
@@ -309,9 +384,17 @@ async function runTests() {
     assert(want.every((w) => got.includes(w)), `${c.tool} proxies to ${want.join(" + ")} (got: ${got.join(", ") || "none"})`);
   }
 
-  // list_projects returns only id/name/repo (no token/other-field leakage)
+  // The consolidated fixture is deliberately legacy: it remains normalized to
+  // one canonical repository while retaining the temporary scalar alias.
   const projOut = await HANDLERS.list_projects({}, fctx);
-  assert(Object.keys(projOut[0]).sort().join(",") === "id,name,repo", "list_projects returns only id/name/repo (no leakage)");
+  assert(Object.keys(projOut[0]).sort().join(",") === "id,name,repo,repositories",
+    "list_projects returns only public project fields (no leakage)");
+  assert(
+    projOut[0].repo === "o/r"
+      && projOut[0].repositories.length === 1
+      && projOut[0].repositories[0].key === "primary",
+    "list_projects normalizes a legacy scalar project in direct handler use",
+  );
 
   // send_message sends no sender header (records as operator "user")
   reqs.length = 0;

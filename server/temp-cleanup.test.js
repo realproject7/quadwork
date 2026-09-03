@@ -90,6 +90,71 @@ function touch(p, ageHours, { dir = false } = {}) {
   assert.ok(Array.isArray(r.removed) && r.removed.length === 0, "bogus tmpRoot → no-op, no throw");
 }
 
+// ── symlink confinement: never enumerate or delete an external target ────
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "qw-957-tempclean-"));
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "qw-957-external-"));
+  const victim = path.join(external, "must-survive");
+  touch(victim, 100);
+  fs.symlinkSync(external, path.join(root, "claude-1234"), "dir");
+
+  const r = sweepBackendTemp({ tmpRoot: root, uid: 1234, now: NOW, maxAgeHours: 72 });
+  assert.ok(fs.existsSync(victim), "symlinked claude directory target is never enumerated or deleted");
+  assert.equal(r.removed.length, 0);
+  assert.equal(r.errors.length, 1, "refusal is observable");
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(external, { recursive: true, force: true });
+}
+
+// ── nested symlink cleanup unlinks the alias, not the external target ────
+{
+  const { root, claudeDir } = makeFixture();
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), "qw-957-external-"));
+  const survivor = path.join(external, "must-survive");
+  fs.writeFileSync(survivor, "safe");
+  const staleDir = path.join(claudeDir, "stale-with-link");
+  fs.mkdirSync(staleDir);
+  fs.symlinkSync(external, path.join(staleDir, "external-link"), "dir");
+  fs.utimesSync(staleDir, new Date(NOW - 100 * HOUR), new Date(NOW - 100 * HOUR));
+
+  const r = sweepBackendTemp({ tmpRoot: root, uid: 1234, now: NOW, maxAgeHours: 72 });
+  assert.ok(!fs.existsSync(staleDir), "owned stale directory removed");
+  assert.equal(fs.readFileSync(survivor, "utf8"), "safe", "nested symlink target survives");
+  assert.equal(r.removed.length, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(external, { recursive: true, force: true });
+}
+
+// ── failed Gemini quarantine disposal is rediscovered and retried ────────
+{
+  const { root } = makeFixture();
+  const staleDump = path.join(root, "gemini-client-error-retry.json");
+  touch(staleDump, 100);
+  const fixtureUid = typeof process.getuid === "function" ? process.getuid() : null;
+  const owner = fixtureUid === null ? "nouid" : String(fixtureUid);
+  const realRmSync = fs.rmSync;
+  let injected = false;
+  fs.rmSync = function hookedRmSync(target, options) {
+    if (!injected && path.basename(target).startsWith(`gemini-client-error-quadwork-quarantine-${owner}-`)) {
+      injected = true;
+      throw new Error("injected quarantine disposal failure");
+    }
+    return realRmSync.call(fs, target, options);
+  };
+  const first = sweepBackendTemp({ tmpRoot: root, uid: fixtureUid, now: NOW, maxAgeHours: 72 });
+  fs.rmSync = realRmSync;
+  assert.equal(first.errors.length, 1);
+  assert.ok(!fs.existsSync(staleDump), "failed disposal still detaches the original Gemini name");
+  const quarantine = fs.readdirSync(root)
+    .find((name) => name.startsWith(`gemini-client-error-quadwork-quarantine-${owner}-`));
+  assert.ok(quarantine, "UID-qualified Gemini quarantine remains discoverable");
+
+  const second = sweepBackendTemp({ tmpRoot: root, uid: fixtureUid, now: NOW, maxAgeHours: 72 });
+  assert.ok(!fs.existsSync(path.join(root, quarantine)), "later legacy sweep retries the owned quarantine");
+  assert.equal(second.removed.length, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 // ── cleanupSettings: defaults + opt-out + custom/invalid age + null cfg ───
 {
   assert.equal(cleanupSettings({}).enabled, true, "default: enabled");

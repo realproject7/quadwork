@@ -29,7 +29,19 @@ module.exports = {
     {
       name: "batch_status",
       description:
-        "Get a project's overnight-batch status as { active, progress }, merged from /api/batch-active and /api/batch-progress. `active` reflects the live `## Active Batch` lifecycle — once Head clears the queue, active drops to false — so it is authoritative for 'work remaining'. `progress` may keep rendering a just-completed batch (sticky display) even after active is false.",
+        "Get a project's overnight-batch status as { active, progress }, preserving repository-qualified rows and assignment provenance from /api/batch-active and /api/batch-progress without transformation. Matching admission_generation and batch_observation_fingerprint values from both endpoints bind every automated action to the exact live queue observation. Matching installation_id, batch_number, opaque assignment_attempt, aggregate assignment_key, ordered assignment_items, current, owned, and provenance=owned additionally identify the current V2 assignment; active.active is required to start work. Each progress row retains separate repo_key, repo, number, kind, a work_item_ref object with those same four fields, its per-item ownership_key, the same base provenance fields, and an OPEN-only live_pr reference (number, URL, state, tip). Explicit compatibility_mode=v1 identifies preactivation single-repository lifecycle compatibility only and never grants V2 authority. Foreign, unowned, stale, and sticky completed progress is observational only.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: { type: "string", description: "Project id (from list_projects)." },
+        },
+        required: ["project"],
+      },
+    },
+    {
+      name: "read_work_task_batch",
+      description:
+        "Read the fixed V2 nested Current Batch projection for one project. Returns { active, projection }; projection preserves repository-qualified WorkItem and WorkTask identities, ordered task state, and redacted candidate SHA/base metadata only. It never creates a batch, initializes missing state, assigns work, opens a PR, or publishes a Delivery Candidate.",
       inputSchema: {
         type: "object",
         properties: {
@@ -53,7 +65,7 @@ module.exports = {
     {
       name: "list_agents",
       description:
-        "List agents and their state. Returns EVERY configured agent (config ∪ runtime) as { project, agent, state, error } — state is running/stopped/missing, so stopped or untracked agents are included, not just live sessions. Omit `project` to list all projects, or pass one to filter.",
+        "List agents and their lifecycle observation. Returns EVERY configured agent (config ∪ runtime) with canonical state, raw health/timestamps, operation_id, generation_id, verification_state, last_observation, and redacted circuit facts. Missing/stopped roles remain visible; this tool never starts a role.",
       inputSchema: {
         type: "object",
         properties: {
@@ -82,6 +94,16 @@ module.exports = {
         ctx.httpRequest("GET", `/api/batch-progress?project=${p}`),
       ]);
       return { active, progress };
+    },
+
+    read_work_task_batch: async (params, ctx) => {
+      const { project } = params;
+      await ctx.assertKnownProject(project);
+      const result = await ctx.httpRequest("GET", `/api/work-task-batch?project=${encodeURIComponent(project)}`);
+      return {
+        active: result?.active === true,
+        projection: result?.projection ?? null,
+      };
     },
 
     read_queue: async (params, ctx) => {
@@ -117,6 +139,17 @@ module.exports = {
             agent,
             state: session ? session.state : "missing",
             error: session ? session.error || null : null,
+            operation_id: session ? session.operation_id || null : null,
+            generation_id: session ? session.generation_id || null : null,
+            verification_state: session ? session.verification_state || "unconfirmed" : "unconfirmed",
+            health: session ? session.health || "unknown" : "unknown",
+            pid: session && Number.isSafeInteger(session.pid) ? session.pid : null,
+            started_at: session ? session.started_at || null : null,
+            last_output_at: session ? session.last_output_at || null : null,
+            last_chat_at: session ? session.last_chat_at || null : null,
+            last_exit: session ? session.last_exit || null : null,
+            last_observation: session ? session.last_observation || null : null,
+            circuit: session ? session.circuit || null : null,
           });
         }
       }

@@ -203,7 +203,8 @@ async function run() {
 
   // ── P1/P3 acceptance guard: ZERO `gh issue view` / `gh pr view` (GraphQL)
   //    remains anywhere in the batch-progress resolution path; the by-number
-  //    fallback and snapshot freshness use REST (`gh api`) + Search. ──
+  //    fallback uses REST (`gh api`) + Search. #1050 removed the old numeric
+  //    snapshot freshness probe with snapshot display authority. ──
   {
     const src = fs.readFileSync(path.join(__dirname, "routes.js"), "utf-8");
     const span = (name) => {
@@ -214,9 +215,8 @@ async function run() {
     const restFallback = span("async function progressForItemRest(");
     const finder = span("async function findLinkedPrByTitle(");
     const search = span("async function _searchLinkedPrItems(");
-    const freshness = span("async function checkBatchSnapshotFreshness(");
-    const all = restFallback + finder + search + freshness;
-    ok(restFallback && finder && search && freshness, "located the by-number-path functions");
+    const all = restFallback + finder + search;
+    ok(restFallback && finder && search, "located the by-number-path functions");
     ok(!/"issue",\s*\n?\s*"view"|"pr",\s*\n?\s*"view"/.test(all), "no `gh issue view` / `gh pr view` (GraphQL) in the by-number path");
     ok(!/closedByPullRequestsReferences/.test(all), "no closedByPullRequestsReferences (GraphQL edge) in the by-number path");
     ok(search.includes("search/issues") && search.includes("-X") && search.includes("GET"), "linked-PR search uses REST `gh api -X GET search/issues`");
@@ -224,7 +224,7 @@ async function run() {
     // pickLinkedPrFromSearch may yield null (on a successful empty result).
     ok(!finder.includes("catch") && !finder.includes("return null"), "findLinkedPrByTitle does not catch/return-null — a Search failure propagates (throws)");
     ok(restFallback.includes("repos/${repo}/issues/") && restFallback.includes("repos/${repo}/pulls/"), "by-number fallback fetches issue + PR via REST `gh api repos/...`");
-    ok(freshness.includes("repos/${repo}/issues/"), "snapshot freshness check uses REST `gh api`, not gh issue view");
+    ok(!src.includes("checkBatchSnapshotFreshness"), "obsolete numeric snapshot freshness probe is removed");
     // And progressForItemAsync (the old GraphQL fallback) is fully gone.
     ok(!src.includes("progressForItemAsync"), "the old GraphQL progressForItemAsync is removed entirely");
   }

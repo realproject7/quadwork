@@ -15,6 +15,7 @@ const path = require("path");
 const TMP = path.join(os.tmpdir(), `config-atomic-${process.pid}-${Date.now()}`);
 const CONFIG_DIR = path.join(TMP, ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const CONFIG_LOCK_PATH = path.join(CONFIG_DIR, "config.lock");
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
 const origHome = os.homedir;
@@ -78,6 +79,95 @@ ok(after.flags.a === 1 && after.flags.b === 2, "sequential updateConfig calls on
 // A mutator that reads a value written by a prior updateConfig sees it (fresh read).
 updateConfig((c) => { c.flags.c = (c.flags.a || 0) + 10; });
 ok(readConfig().flags.c === 11, "updateConfig sees the freshest on-disk state");
+
+// Read-time legacy migration is serialized through the same lock and atomic
+// rename path. A competing writer leaves the persisted snapshot untouched.
+{
+  const legacy = { port: 8400, projects: [{ id: "legacy", agents: { t1: { command: "old" } } }] };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(legacy, null, 2), { mode: 0o600 });
+  const before = fs.readFileSync(CONFIG_PATH, "utf8");
+  fs.writeFileSync(CONFIG_LOCK_PATH, JSON.stringify({ pid: process.pid, token: "migration-writer" }), { mode: 0o600 });
+  assert.throws(() => readConfig(), (error) => error?.code === "config_write_busy");
+  ok(true, "legacy migration fails closed while another configuration writer owns the transaction");
+  ok(fs.readFileSync(CONFIG_PATH, "utf8") === before, "busy migration never writes config.json in place or over a concurrent writer");
+  fs.unlinkSync(CONFIG_LOCK_PATH);
+
+  const origRename = fs.renameSync;
+  let renamed = false;
+  fs.renameSync = (from, to) => {
+    if (to === CONFIG_PATH) renamed = true;
+    return origRename(from, to);
+  };
+  try { readConfig(); } finally { fs.renameSync = origRename; }
+  const persisted = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  ok(renamed && persisted.projects[0].agents.head.command === "old" && !persisted.projects[0].agents.t1,
+    "successful legacy migration persists only through atomic rename");
+}
+
+// Missing-config initialization also fails closed behind a writer rather than
+// publishing a default snapshot observed before that writer acquired authority.
+{
+  fs.unlinkSync(CONFIG_PATH);
+  fs.writeFileSync(CONFIG_LOCK_PATH, JSON.stringify({ pid: process.pid, token: "initializer-writer" }), { mode: 0o600 });
+  assert.throws(() => readConfig(), (error) => error?.code === "config_write_busy");
+  ok(fs.existsSync(CONFIG_PATH) === false, "busy missing-config initialization cannot overwrite another writer");
+  fs.unlinkSync(CONFIG_LOCK_PATH);
+  const initialized = readConfig();
+  ok(initialized.port === 8400 && fs.existsSync(CONFIG_PATH), "missing config initializes after explicit lock release");
+}
+
+// A peer may finish after the optimistic read but before this process acquires
+// config.lock. The locked re-read must migrate the peer's document, not publish
+// the stale observation.
+{
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify({
+    port: 8400,
+    projects: [{ id: "legacy-race", agents: { t1: { command: "old" } } }],
+  }, null, 2), { mode: 0o600 });
+  const peer = {
+    port: 9999,
+    concurrent_field: "preserve",
+    projects: [{ id: "legacy-race", agents: { t1: { command: "peer" } } }],
+  };
+  const origLink = fs.linkSync;
+  let injected = false;
+  fs.linkSync = (from, to) => {
+    if (!injected && to === CONFIG_LOCK_PATH) {
+      injected = true;
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(peer, null, 2), { mode: 0o600 });
+    }
+    return origLink(from, to);
+  };
+  let migrated;
+  try { migrated = readConfig(); } finally { fs.linkSync = origLink; }
+  ok(injected && migrated.port === 9999 && migrated.concurrent_field === "preserve",
+    "migration re-reads and preserves a peer transaction completed before lock acquisition");
+  const persisted = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  ok(persisted.projects[0].agents.head.command === "peer" && !persisted.projects[0].agents.t1,
+    "migration applies only to the peer's freshest locked document");
+}
+
+// The same completed-peer race on an initial ENOENT observation must preserve
+// the peer-created V1 document instead of replacing it with defaults.
+{
+  fs.unlinkSync(CONFIG_PATH);
+  const peer = { port: 7777, concurrent_field: "created-by-peer", projects: [{ id: "peer" }] };
+  const origLink = fs.linkSync;
+  let injected = false;
+  fs.linkSync = (from, to) => {
+    if (!injected && to === CONFIG_LOCK_PATH) {
+      injected = true;
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(peer, null, 2), { mode: 0o600 });
+    }
+    return origLink(from, to);
+  };
+  let observed;
+  try { observed = readConfig(); } finally { fs.linkSync = origLink; }
+  ok(injected && observed.port === 7777 && observed.concurrent_field === "created-by-peer",
+    "missing initialization preserves a peer document created before lock acquisition");
+  ok(fs.readFileSync(CONFIG_PATH, "utf8") === JSON.stringify(peer, null, 2),
+    "missing initialization performs no stale default write after the peer wins");
+}
 
 console.log(`\n${passed} passed`);
 console.log("server/config.atomicWrite.test.js: all assertions passed");

@@ -1,5 +1,5 @@
 // #343/#367/#931: backend-specific model catalog + the helpers that keep a
-// per-agent (and butler) model valid for its CLI. Kept as pure data + logic
+// per-agent model valid for its CLI. Kept as pure data + logic
 // (NO React) so it is shared by AgentModelsWidget + SettingsPage AND can be
 // unit-tested directly under node (see server/agentModels.test.js).
 //

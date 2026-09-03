@@ -3,6 +3,7 @@
 const {
   dispatchToAgentPTY,
   cleanupSession,
+  cancelProject,
   capEligible,
   _coalesceTimers,
   _pendingWake,
@@ -533,6 +534,135 @@ async function runTests() {
     assert(capEligible({ backend: "gemini" }) === false, "#1023: gemini stays false — its TUI goes quiet between turns");
     assert(capEligible({}) === false, "#1023 AC: an unstamped session stays INELIGIBLE (fail-safe direction preserved)");
     assert(capEligible(null) === false, "#1023: a missing session is ineligible, not a crash");
+  }
+
+  // --- Test 23 (#1034): the archive barrier is re-checked at the delayed
+  //     coalesce boundary. A mention admitted just before archive must not be
+  //     injected after the durable barrier flips while its timer is pending. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let admitted = true;
+    const deps = { ...makeDeps(), isProjectAdmitted: () => admitted };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    admitted = false;
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 0, "#1034: archive during coalesce suppresses the delayed PTY injection");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 24 (#1034): project cancellation is prefix-scoped and removes
+  //     every deferred-dispatch owner without disturbing another project. ---
+  {
+    const a = makeSessions({ lastOutputAt: Date.now(), backend: "claude" });
+    const b = makeSessions({ projectId: "other", lastOutputAt: Date.now(), backend: "claude" });
+    b.sessions.delete("proj/dev");
+    b.sessions.set("other/dev", b.session);
+    b.session.projectId = "other";
+    dispatchToAgentPTY("proj", makeMsg(), a.sessions, makeDeps());
+    dispatchToAgentPTY("other", makeMsg(), b.sessions, makeDeps());
+    const result = cancelProject("proj");
+    assert(result.ok === true && result.resources.deferred_dispatches >= 1, "#1034: cancelProject reports removed deferred work");
+    assert(!_pendingWake.has("proj/dev") && !_drainListeners.has("proj/dev"), "#1034: archived project deferred state is gone");
+    assert(_pendingWake.has("other/dev") && _drainListeners.has("other/dev"), "#1034: another project's deferred state is untouched");
+    cleanupSession("other/dev");
+  }
+
+  // --- Test 25 (#1034): archive can land after prompt text was written but
+  //     before the delayed submit CR. The timer itself must consult admission. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let admitted = true;
+    const deps = { ...makeDeps(), isProjectAdmitted: () => admitted };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 20));
+    assert(written.length === 1, "#1034: prompt text was written before archive");
+    admitted = false;
+    await new Promise((r) => setTimeout(r, 500));
+    assert(written.length === 1, "#1034: archived project receives no delayed submit CR");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 26 (#1031): assignment authority is re-checked when the delayed
+  //     coalesce actually mutates the PTY, not only when /api/chat schedules it.
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let current = true;
+    const deps = { ...makeDeps(), isActionCurrent: () => current };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    current = false;
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 0, "#1031: assignment rollover during coalesce suppresses stale PTY text");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 27 (#1031): rollover after prompt text but before delayed submit
+  //     cannot press Enter in a new assignment generation.
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let current = true;
+    const deps = { ...makeDeps(), isActionCurrent: () => current };
+    dispatchToAgentPTY("proj", makeMsg(), sessions, deps);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 20));
+    assert(written.length === 1, "#1031: prompt text was written while assignment was current");
+    current = false;
+    await new Promise((r) => setTimeout(r, 500));
+    assert(written.length === 1, "#1031: rolled assignment receives no delayed submit CR");
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 28 (#1031): A's stale coalesce owner cannot consume a later,
+  //     current B mention that joined the same per-agent timer. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let aCurrent = true;
+    let bCurrent = true;
+    const depsA = { ...makeDeps(), isActionCurrent: () => aCurrent };
+    const depsB = { ...makeDeps(), isActionCurrent: () => bCurrent };
+    dispatchToAgentPTY("proj", makeMsg({ id: 28 }), sessions, depsA);
+    aCurrent = false;
+    dispatchToAgentPTY("proj", makeMsg({ id: 29 }), sessions, depsB);
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 50));
+    assert(written.length === 1,
+      "#1031: a current B wake survives a stale A owner in the same coalesce cycle");
+    bCurrent = false;
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 29 (#1031): the already-armed busy-agent drain also adopts the
+  //     later current authority instead of deleting the whole wake cycle. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: Date.now(), backend: "codex" });
+    let aCurrent = true;
+    let bCurrent = true;
+    const depsA = { ...makeDeps(), isActionCurrent: () => aCurrent };
+    const depsB = { ...makeDeps(), isActionCurrent: () => bCurrent };
+    dispatchToAgentPTY("proj", makeMsg({ id: 30 }), sessions, depsA);
+    aCurrent = false;
+    dispatchToAgentPTY("proj", makeMsg({ id: 31 }), sessions, depsB);
+    await new Promise((r) => setTimeout(r, 350));
+    assert(written.length === 1,
+      "#1031: a current B wake survives a stale A owner in the same pending-drain cycle");
+    bCurrent = false;
+    cleanupSession("proj/dev");
+  }
+
+  // --- Test 30 (#1031): a manual wake sharing the coalesce cycle remains
+  //     authorized through delayed submit even if the automated lease rolls. ---
+  {
+    const { sessions, written } = makeSessions({ lastOutputAt: 0 });
+    let automatedCurrent = true;
+    dispatchToAgentPTY("proj", makeMsg({ id: 32 }), sessions, {
+      ...makeDeps(),
+      isActionCurrent: () => automatedCurrent,
+    });
+    dispatchToAgentPTY("proj", makeMsg({ id: 33 }), sessions, makeDeps());
+    await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS + 20));
+    assert(written.length === 1, "#1031: mixed manual/automated wake writes one prompt");
+    automatedCurrent = false;
+    await new Promise((r) => setTimeout(r, 500));
+    assert(written.length === 2 && written[1] === "\r",
+      "#1031: valid manual authority preserves delayed submit after automated rollover");
+    cleanupSession("proj/dev");
   }
 
   // Restore the shipped timings so nothing after this block runs on test values.

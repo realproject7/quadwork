@@ -9,7 +9,7 @@
 
 const assert = require("node:assert/strict");
 const path = require("node:path");
-const { _resolveReseedTargets, _canonicalAgentSlug } = require("./routes");
+const { _resolveReseedTargets, _resolveRepositoryReseedTargets, _canonicalAgentSlug } = require("./routes");
 
 // 1) Canonical key map — legacy reviewer1/reviewer2/t1..t3 → canonical
 //    head/re1/re2/dev. Unknown / already-canonical keys pass through so
@@ -149,4 +149,34 @@ const { _resolveReseedTargets, _canonicalAgentSlug } = require("./routes");
   assert.deepEqual(_resolveReseedTargets(null), []);
 }
 
-console.log("routes.resolveReseedTargets.test.js: all assertions passed (7 cases)");
+// 8) V2 repository expansion keeps the configured primary role paths but
+// seeds only the matching role in a secondary repository. It never derives a
+// second agent/session identity from the additional repository.
+{
+  const project = {
+    id: "multi",
+    repositories: [
+      { key: "web", repo: "Acme/Web", working_dir: "/srv/web", primary: true },
+      { key: "api", repo: "Acme/Api", working_dir: "/srv/api", primary: false },
+    ],
+    agents: {
+      head: { cwd: "/custom/web-head" },
+      re1: { cwd: "/custom/web-re1" },
+      re2: { cwd: "/custom/web-re2" },
+      dev: { cwd: "/custom/web-dev" },
+    },
+  };
+  const targets = _resolveRepositoryReseedTargets(project);
+  assert.equal(targets.length, 8);
+  const primary = targets.filter((target) => target.primaryRepository);
+  const api = targets.filter((target) => target.repositoryKey === "api");
+  assert.deepEqual(primary.map((target) => target.wtDir).sort(), [
+    "/custom/web-dev", "/custom/web-head", "/custom/web-re1", "/custom/web-re2",
+  ]);
+  assert.deepEqual(api.map((target) => `${target.agentKey}@${target.wtDir}`).sort(), [
+    "dev@/srv/api-dev", "head@/srv/api-head", "re1@/srv/api-re1", "re2@/srv/api-re2",
+  ]);
+  assert.ok(api.every((target) => target.agentKey === target.canonical), "secondary seed stays in the same role row");
+}
+
+console.log("routes.resolveReseedTargets.test.js: all assertions passed (8 cases)");

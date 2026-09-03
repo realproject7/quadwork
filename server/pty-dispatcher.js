@@ -7,6 +7,8 @@
 const IDLE_THRESHOLD_MS = 5000;
 const COALESCE_WINDOW_MS = 1000;
 const ACTIVE_SUPPRESSION_MS = 30000;
+const { envelopeFor } = require("./trusted-event-transport");
+const { batchRequestNotice } = require("./batch-request-notice");
 
 // #1010: bounded deferred-wake deadline — an escape hatch for the starvation
 // below, for the backends whose TUI never goes quiet. The Claude Code TUI
@@ -78,6 +80,7 @@ const _submitTimers = new Map();
  * @param {object} deps - { isLoopGuardPaused, safeWrite }
  */
 function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
+  if (!dispatchAuthorized(deps, projectId)) return;
   if (!msg || msg.type === "system") return;
   if (deps.isLoopGuardPaused(projectId)) return;
   if (!msg.mentions || msg.mentions.length === 0) return;
@@ -118,6 +121,132 @@ function dispatchToAgentPTY(projectId, msg, agentSessions, deps) {
   }
 }
 
+function verifiedTrustedMonitorEnvelope(projectId, candidate) {
+  if (!candidate || typeof candidate !== "object") return null;
+  let envelope;
+  try { envelope = envelopeFor(projectId, candidate.kind, candidate.anchors); }
+  catch { return null; }
+  if (candidate.project_id !== envelope.project_id || candidate.correlation_id !== envelope.correlation_id
+    || candidate.version !== envelope.version || candidate.sender !== envelope.sender
+    || candidate.type !== envelope.type || candidate.text !== envelope.text
+    || !Array.isArray(candidate.recipients) || candidate.recipients.length !== 1 || candidate.recipients[0] !== "head") {
+    return null;
+  }
+  return envelope;
+}
+
+function isVerifiedHead(session) {
+  return !!session && session.agentId === "head" && session.state === "running" && !!session.term
+    && session.lifecycleState === "verified" && typeof session.generationId === "string" && session.generationId.length > 0;
+}
+
+// A dedicated server-only trusted-event path. Unlike ordinary chat dispatch it
+// bypasses the conversational loop guard, but it still uses every PTY safety
+// rule: admission/current-identity checks, verified Head generation, busy
+// deferral, coalescing and project cancellation. It never writes a terminal
+// directly; only the shared injection lifecycle may do that later.
+function dispatchTrustedMonitorEvent(projectId, candidate, agentSessions, deps) {
+  const envelope = verifiedTrustedMonitorEnvelope(projectId, candidate);
+  if (!envelope || !deps || typeof deps.safeWrite !== "function" || typeof deps.isTrustedEventCurrent !== "function") {
+    return { ok: false, code: "trusted_event_invalid" };
+  }
+  const key = `${projectId}/head`;
+  const isCurrent = () => {
+    const session = agentSessions.get(key);
+    if (!isVerifiedHead(session) || !dispatchAuthorized(deps, projectId)) return false;
+    try { return deps.isTrustedEventCurrent(envelope, session) === true; }
+    catch { return false; }
+  };
+  if (!isCurrent()) return { ok: false, code: "trusted_event_not_current" };
+  const session = agentSessions.get(key);
+  const trustedDeps = {
+    ...deps,
+    isActionCurrent: isCurrent,
+  };
+  if (isAgentBusy(session)) {
+    queuePendingWake(key, session, agentSessions, trustedDeps);
+    return { ok: true, deferred: true, delivery_generation: session.generationId };
+  }
+  scheduleCoalescedInjection(key, projectId, "head", envelope, agentSessions, trustedDeps);
+  return { ok: true, deferred: true, delivery_generation: session.generationId };
+}
+
+// #1046 uses its own durable watcher state rather than the Project Monitor's
+// delivery table, but retains the same Head-only deferred wake discipline.
+// The input is the strict watcher plan, never a generic chat message; the
+// notice is reconstructed here before either its target or its text is used.
+function dispatchTrustedBatchRequest(projectId, candidate, agentSessions, deps) {
+  let notice;
+  try { notice = batchRequestNotice(candidate); }
+  catch { return { ok: false, code: "batch_request_notice_invalid" }; }
+  if (notice.project_id !== projectId || !deps || typeof deps.safeWrite !== "function" ||
+      typeof deps.isTrustedBatchRequestCurrent !== "function") {
+    return { ok: false, code: "batch_request_notice_invalid" };
+  }
+  const key = `${projectId}/head`;
+  const isCurrent = () => {
+    const session = agentSessions.get(key);
+    if (!isVerifiedHead(session) || !dispatchAuthorized(deps, projectId)) return false;
+    try { return deps.isTrustedBatchRequestCurrent(notice, session) === true; }
+    catch { return false; }
+  };
+  if (!isCurrent()) return { ok: false, code: "batch_request_not_current" };
+  const session = agentSessions.get(key);
+  const trustedDeps = { ...deps, isActionCurrent: isCurrent };
+  if (isAgentBusy(session)) {
+    queuePendingWake(key, session, agentSessions, trustedDeps);
+    return { ok: true, deferred: true, delivery_generation: session.generationId };
+  }
+  scheduleCoalescedInjection(key, projectId, "head", notice, agentSessions, trustedDeps);
+  return { ok: true, deferred: true, delivery_generation: session.generationId };
+}
+
+// #1034: delayed dispatcher work must consult the same server-owned archive
+// authority as the immediate mention path. Treat a missing callback as admitted
+// for backwards-compatible unit callers; production always supplies it.
+function projectAdmitted(deps, projectId) {
+  if (!deps || typeof deps.isProjectAdmitted !== "function") return true;
+  try { return deps.isProjectAdmitted(projectId) === true; }
+  catch { return false; }
+}
+
+// #1031: an identity-bound chat can remain queued behind coalescing, busy-agent
+// drains, or the delayed submit after its receiver check. Revalidate the same
+// assignment lease at every actual PTY mutation; manual callers omit the hook.
+function dispatchAuthorized(deps, projectId) {
+  if (!projectAdmitted(deps, projectId)) return false;
+  if (!deps || typeof deps.isActionCurrent !== "function") return true;
+  try { return deps.isActionCurrent() === true; }
+  catch { return false; }
+}
+
+function rememberWakeAuthority(state, deps) {
+  if (!state.authority) state.authority = { manual: null, automated: null };
+  if (deps && typeof deps.isActionCurrent === "function") state.authority.automated = deps;
+  else state.authority.manual = deps;
+}
+
+function currentWakeAuthority(state, projectId) {
+  const automated = state?.authority?.automated;
+  if (automated && dispatchAuthorized(automated, projectId)) return automated;
+  const manual = state?.authority?.manual;
+  if (manual && dispatchAuthorized(manual, projectId)) return manual;
+  return null;
+}
+
+function wakeMutationDeps(state, projectId) {
+  const selected = currentWakeAuthority(state, projectId);
+  if (!selected) return null;
+  return {
+    ...selected,
+    // A coalesced/pending cycle can represent both an identity-bound wake and
+    // a manual one. Re-evaluate the composite set at prompt and submit time so
+    // rollover of the selected automated lease cannot suppress a still-valid
+    // manual wake's Enter key.
+    isActionCurrent: () => currentWakeAuthority(state, projectId) !== null,
+  };
+}
+
 function isAgentBusy(session) {
   return session.lastOutputAt && (Date.now() - session.lastOutputAt < _timings.idleThresholdMs);
 }
@@ -154,9 +283,14 @@ function queuePendingWake(key, session, agentSessions, deps) {
 
   // A cycle is already armed for this key — the pending flag above is all a
   // repeat mention needs. Do NOT arm a second listener or a second cap.
-  if (_drainListeners.has(key)) return;
+  const existing = _drainListeners.get(key);
+  if (existing) {
+    rememberWakeAuthority(existing, deps);
+    return;
+  }
 
   const state = { disposable: null, idleHandle: null, capHandle: null, capRearmed: false };
+  rememberWakeAuthority(state, deps);
 
   // #1010: only the cycle currently registered under this key may drain. A
   // timer that outlived its own cycle (replaced, cleaned up, or already
@@ -172,16 +306,23 @@ function queuePendingWake(key, session, agentSessions, deps) {
     return live && live.state === "running" && live.term ? live : null;
   };
 
-  const deliver = (live) => {
+  const deliver = (live, authorityDeps) => {
     _pendingWake.delete(key);
     cleanupDrainListener(key);
-    injectIntoTerm(key, live.term, buildInjectionPrompt(live.agentId), deps);
+    injectIntoTerm(key, live.term, buildInjectionPrompt(live.agentId), authorityDeps);
   };
 
   // Shared preamble for both timers: returns the live session, or null if this
   // cycle should simply stand down.
   const claimCycle = () => {
     if (!isCurrentCycle()) return null;
+    const projectId = key.split("/")[0];
+    const authorityDeps = wakeMutationDeps(state, projectId);
+    if (!authorityDeps) {
+      _pendingWake.delete(key);
+      cleanupDrainListener(key);
+      return null;
+    }
     if (!_pendingWake.get(key)) {
       cleanupDrainListener(key);
       return null;
@@ -192,24 +333,25 @@ function queuePendingWake(key, session, agentSessions, deps) {
       cleanupDrainListener(key);
       return null;
     }
-    return live;
+    return { live, authorityDeps };
   };
 
   const idleDrain = () => {
-    const live = claimCycle();
-    if (!live) return;
+    const claimed = claimCycle();
+    if (!claimed) return;
 
     // #923: fire unconditionally once the agent has been quiet for the idle
     // window. Do NOT re-suppress on a recent send here — a standing-by agent
     // that just posted (then ended its turn) would otherwise be stranded again,
     // which is the exact stall this path removes. The quiet gap IS the evidence
     // the turn ended, so this delivery is not cooldown-limited either.
-    deliver(live);
+    deliver(claimed.live, claimed.authorityDeps);
   };
 
   const capDrain = () => {
-    const live = claimCycle();
-    if (!live) return;
+    const claimed = claimCycle();
+    if (!claimed) return;
+    const { live, authorityDeps } = claimed;
 
     // #1010: re-check eligibility against the LIVE session, not just the one
     // that armed the cycle. If the agent was respawned onto another backend in
@@ -265,7 +407,7 @@ function queuePendingWake(key, session, agentSessions, deps) {
     }
 
     _lastCapInjectedAt.set(key, Date.now());
-    deliver(live);
+    deliver(live, authorityDeps);
   };
 
   function resetIdleTimer() {
@@ -320,12 +462,16 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
   const existing = _coalesceTimers.get(key);
   if (existing) {
     existing.messages.push(msg);
+    rememberWakeAuthority(existing, deps);
     return;
   }
 
   const state = { messages: [msg] };
+  rememberWakeAuthority(state, deps);
   const timer = setTimeout(() => {
     _coalesceTimers.delete(key);
+    const authorityDeps = wakeMutationDeps(state, projectId);
+    if (!authorityDeps) return;
     const session = agentSessions.get(key);
     if (!session || !session.term || session.state !== "running") return;
 
@@ -338,11 +484,11 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
     const lastSent = _lastChatSentAt.get(key);
     const recentlySent = lastSent && (Date.now() - lastSent < _timings.activeSuppressionMs);
     if (isAgentBusy(session) || recentlySent) {
-      queuePendingWake(key, session, agentSessions, deps);
+      queuePendingWake(key, session, agentSessions, authorityDeps);
       return;
     }
 
-    injectIntoTerm(key, session.term, buildInjectionPrompt(agentId), deps);
+    injectIntoTerm(key, session.term, buildInjectionPrompt(agentId), authorityDeps);
   }, COALESCE_WINDOW_MS);
 
   state.timer = timer;
@@ -353,13 +499,16 @@ function scheduleCoalescedInjection(key, projectId, agentId, msg, agentSessions,
 // Without an owner, stopping a session inside the submit delay left a pending
 // "\r" write against a term that was already killed.
 function injectIntoTerm(key, term, text, deps) {
+  const projectId = key.split("/")[0];
   const flat = text.replace(/\n/g, " ");
+  if (!dispatchAuthorized(deps, projectId)) return;
   deps.safeWrite(term, flat);
   const submitDelayMs = Math.max(300, flat.length);
   const previous = _submitTimers.get(key);
   if (previous) clearTimeout(previous);
   const handle = setTimeout(() => {
     _submitTimers.delete(key);
+    if (!dispatchAuthorized(deps, projectId)) return;
     try { deps.safeWrite(term, "\r"); } catch {}
   }, submitDelayMs);
   _submitTimers.set(key, handle);
@@ -387,9 +536,51 @@ function cleanupSession(key) {
   _lastCapInjectedAt.delete(key);
 }
 
+/**
+ * Cancel every deferred dispatcher owner for one project. This is deliberately
+ * prefix-scoped and synchronous: archive persists the barrier, then calls this
+ * before its first async teardown so no pending timer can inject in the gap.
+ */
+function cancelProject(projectId) {
+  const prefix = `${projectId}/`;
+  const keys = new Set();
+  for (const map of [
+    _coalesceTimers,
+    _pendingWake,
+    _drainListeners,
+    _lastChatSentAt,
+    _lastCapInjectedAt,
+    _submitTimers,
+  ]) {
+    for (const key of map.keys()) if (key.startsWith(prefix)) keys.add(key);
+  }
+  let removed = 0;
+  for (const key of keys) {
+    for (const map of [
+      _coalesceTimers,
+      _pendingWake,
+      _drainListeners,
+      _lastChatSentAt,
+      _lastCapInjectedAt,
+      _submitTimers,
+    ]) {
+      if (map.has(key)) removed += 1;
+    }
+    cleanupSession(key);
+  }
+  return {
+    ok: true,
+    resources: { deferred_dispatches: removed },
+    cleanup_errors: [],
+  };
+}
+
 module.exports = {
   dispatchToAgentPTY,
+  dispatchTrustedMonitorEvent,
+  dispatchTrustedBatchRequest,
   cleanupSession,
+  cancelProject,
   // Exported for testing
   capEligible, // #1023: the eligibility predicate is pinned directly, not only
                // through the repaint regressions, so the fail-safe direction

@@ -139,6 +139,11 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
 
   const good = await tryWs(`ws://127.0.0.1:${PORT}${wsPath}&token=${token}`, { origin });
   ok(good.open === true, "WS with valid Origin + token → upgrade accepted (opens)");
+  const normalRoleUpgrades = await Promise.all(["head", "re1", "re2", "dev"].map((agent) =>
+    tryWs(`ws://127.0.0.1:${PORT}/ws/terminal?project=x&agent=${agent}&token=${token}`, { origin }),
+  ));
+  ok(normalRoleUpgrades.every((result) => result.open === true),
+    "all four normal agent terminal WS roles retain the authenticated upgrade path");
 
   // ── REST PTY-write auth ──────────────────────────────────────────────────
   const writeNoTok = await httpReq(PORT, { method: "POST", path: "/api/agents/x/head/write", body: JSON.stringify({ text: "hi\n" }) });
@@ -154,7 +159,7 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   ok(interruptNoTok.status === 401, "POST /interrupt without a token → 401");
 
   const interruptTok = await httpReq(PORT, { method: "POST", path: "/api/agents/x/head/interrupt", headers: { "x-session-token": token } });
-  ok(interruptTok.status === 200, "POST /interrupt with a valid token → 200 (token accepted)");
+  ok(interruptTok.status === 404, "POST /interrupt with a valid token → 404 unknown project (token accepted, lifecycle fails closed)");
 
   // ── The token must never leak through GET /api/config ────────────────────
   const cfgGet = await httpReq(PORT, { path: "/api/config" });

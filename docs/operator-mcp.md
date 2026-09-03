@@ -221,7 +221,7 @@ discipline as dashboard chat, for example `@head ...` to wake Head.
 
 | Tool | Input | Does |
 |------|-------|------|
-| `list_projects` | — | List configured projects (`id`, `name`, `repo`). |
+| `list_projects` | — | List configured projects (`id`, `name`, `repositories[]`, plus temporary primary `repo` alias). Repository entries expose only `key`, `repo`, and `primary`. |
 | `read_chat` | `project`, `since_id?`, `limit?` | Read a project's team chat (messages with `id`, `sender`, `text`, ISO `ts`). |
 | `batch_status` | `project` | Overnight-batch status `{ active, progress }` (merged batch-active + batch-progress). |
 | `read_queue` | `project` | Read the project's `OVERNIGHT-QUEUE.md` markdown. |

@@ -17,7 +17,7 @@ interface OvernightQueueWidgetProps {
 const REFRESH_MS = 10_000;
 
 /**
- * Bottom-right operator widget for OVERNIGHT-QUEUE.md (#209).
+ * Operator Features widget for OVERNIGHT-QUEUE.md (#209), in the right rail.
  *
  * Default state renders the queue file as markdown (via
  * react-markdown) so headers, lists, and rules display as rich HTML

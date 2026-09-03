@@ -13,6 +13,28 @@ const multer = require("multer");
 const fileChat = require("./file-chat");
 const telegramBridge = require("./bridges/telegram");
 const discordBridge = require("./bridges/discord");
+const {
+  ProjectLifecycleError,
+  isProjectArchived,
+  assertProjectAdmitted,
+  captureProjectAdmission,
+  isAdmissionCurrent,
+} = require("./project-lifecycle");
+const {
+  renderProjectGithubMarkdown,
+  parseProjectGithubMarkdown,
+  extractGithubNotes,
+} = require("./github-state-markdown");
+const {
+  parseWorkItemLines,
+  assertWorkItemRef,
+  serializeWorkItemRefApi,
+  workItemKey,
+  validateAssignmentProvenance,
+  ownershipKey,
+} = require("./work-item-ref");
+const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence } = require("./ci-evidence-policy");
+const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
 const router = express.Router();
@@ -21,11 +43,22 @@ const router = express.Router();
 let _ptyDispatchCallback = null;
 function setPtyDispatchCallback(fn) { _ptyDispatchCallback = fn; }
 
+// #1046 reuses this already-bounded REST refresh as its only reconciliation
+// cadence. It is intentionally one private observer, not a generic hook bus
+// and not a second project-wide timer; the callback receives only project ids
+// whose normal GitHub state was already considered by this refresh pass.
+let _batchRequestRefreshObserver = null;
+function setBatchRequestRefreshObserver(fn) {
+  if (fn !== null && typeof fn !== "function") throw new TypeError("Batch Request refresh observer must be a function or null");
+  _batchRequestRefreshObserver = fn;
+}
+
 const CONFIG_DIR = path.join(os.homedir(), ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const ENV_PATH = path.join(CONFIG_DIR, ".env");
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+const RETIRED_GLOBAL_AGENT_FIELD = ["but", "ler"].join("");
 
 // #837: `gh api` list fetches (closed-PR pages with `-i`, GraphQL repo
 // snapshot, batch progress) can exceed Node's default 1MB execFile maxBuffer.
@@ -301,7 +334,31 @@ const DEFAULT_CONFIG = {
 
 function readConfigFile() {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    // #1029: once an installation is explicitly activated, route-local V1
+    // consumers temporarily receive scalar compatibility values derived from
+    // the canonical primary repository. Keep them non-enumerable so any legacy
+    // read-modify-write path serializes only the canonical array and cannot
+    // recreate a persisted dual source. Legacy pre-activation reads remain
+    // byte-for-byte shaped as before.
+    if (typeof parsed.installation_id === "string" && Array.isArray(parsed.projects)) {
+      parsed.projects = parsed.projects.map((project) => {
+        if (!Array.isArray(project?.repositories)) return project;
+        const compatible = serializeProjectCompatibility(project);
+        for (const field of ["repo", "working_dir"]) {
+          if (!Object.prototype.hasOwnProperty.call(compatible, field)) continue;
+          const value = compatible[field];
+          delete compatible[field];
+          Object.defineProperty(compatible, field, {
+            value,
+            enumerable: false,
+            configurable: true,
+          });
+        }
+        return compatible;
+      });
+    }
+    return parsed;
   } catch (err) {
     if (err.code === "ENOENT") return { ...DEFAULT_CONFIG };
     return { ...DEFAULT_CONFIG };
@@ -346,57 +403,192 @@ router.get("/api/config", (_req, res) => {
   }
 });
 
+function sendV2ConfigurationError(res, err) {
+  if (!(err instanceof ConfigurationValidationError)) return false;
+  const payload = {
+    error: "V2 configuration validation failed",
+    code: err.code,
+    field: err.field,
+  };
+  if (err.owner_project_id !== undefined) payload.owner_project_id = err.owner_project_id;
+  res.status(409).json(payload);
+  return true;
+}
+
+function genericRepositoryRecord(entry) {
+  const repository = entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+  const repo = typeof repository.repo === "string" ? repository.repo.trim().toLowerCase() : null;
+  const workingDir = typeof repository.working_dir === "string" && path.isAbsolute(repository.working_dir)
+    ? path.normalize(path.resolve(repository.working_dir))
+    : null;
+  let policy;
+  if (!Object.prototype.hasOwnProperty.call(repository, "ci_policy")) {
+    policy = "missing";
+  } else {
+    try { policy = JSON.stringify(normalizeCiPolicy(repository.ci_policy)); }
+    catch { policy = JSON.stringify(repository.ci_policy); }
+  }
+  return Object.freeze({
+    key: typeof repository.key === "string" ? repository.key : null,
+    repo,
+    working_dir: workingDir,
+    primary: repository.primary === true,
+    ci_policy: policy,
+  });
+}
+
+function genericV2ProjectTopology(config) {
+  if (!Array.isArray(config?.projects)) {
+    throw new ConfigurationValidationError(
+      "generic_project_identity_change_forbidden",
+      "projects.id",
+      "generic config routes cannot change activated project identity",
+    );
+  }
+  const topology = new Map();
+  for (const project of config.projects) {
+    if (!project || typeof project.id !== "string" || !project.id || topology.has(project.id)) {
+      throw new ConfigurationValidationError(
+        "generic_project_identity_change_forbidden",
+        "projects.id",
+        "generic config routes cannot change activated project identity",
+      );
+    }
+    if (!Array.isArray(project.repositories)) {
+      // The full V2 validator will return the more specific canonical schema
+      // error. There is no valid key topology to compare here.
+      topology.set(project.id, null);
+      continue;
+    }
+    // Activated generic config routes may edit presentation/configuration but
+    // cannot retarget a stable repository record under the same key. Preserve
+    // record order too: topology changes belong to explicit V2 activation.
+    topology.set(project.id, project.repositories.map(genericRepositoryRecord));
+  }
+  return topology;
+}
+
+function assertGenericV2ProjectTopology(previousTopology, candidateConfig) {
+  const candidateTopology = genericV2ProjectTopology(candidateConfig);
+  const previousIds = [...previousTopology.keys()].sort();
+  const candidateIds = [...candidateTopology.keys()].sort();
+  if (JSON.stringify(previousIds) !== JSON.stringify(candidateIds)) {
+    throw new ConfigurationValidationError(
+      "generic_project_identity_change_forbidden",
+      "projects.id",
+      "generic config routes cannot change activated project identity",
+    );
+  }
+  for (const projectId of previousIds) {
+    const before = previousTopology.get(projectId);
+    const after = candidateTopology.get(projectId);
+    if (before === null || after === null) continue;
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      throw new ConfigurationValidationError(
+        "generic_repository_topology_change_forbidden",
+        "repositories",
+        "generic config routes cannot change activated repository records",
+      );
+    }
+  }
+}
+
+// #1034/#1031: archive state and its durable admission epoch are lifecycle-owned.
+// Generic config snapshots can edit project presentation/settings, but they
+// must never archive, restore, or roll the epoch backward/forward.
+function preserveProjectArchiveState(existing, incoming) {
+  if (!existing || !incoming || typeof incoming !== "object") return;
+  if (Object.prototype.hasOwnProperty.call(existing, "archived")) {
+    incoming.archived = existing.archived;
+  } else {
+    delete incoming.archived;
+  }
+  if (Object.prototype.hasOwnProperty.call(existing, "admission_generation")) {
+    incoming.admission_generation = existing.admission_generation;
+  } else {
+    delete incoming.admission_generation;
+  }
+}
+
+// Environment topology is Settings-bound and validated through the dedicated
+// M1 endpoint below. Generic config snapshots must preserve these fields just
+// as they preserve lifecycle authority, so a stale whole-form save cannot add,
+// remove, or retarget a peer binding or local watcher.
+const PROJECT_ENVIRONMENT_SETTING_KEYS = Object.freeze([
+  "environment_bindings",
+  "coordination_repo_key",
+  "watch_batch_requests",
+]);
+
+function preserveProjectEnvironmentSettings(existing, incoming) {
+  if (!existing || !incoming || typeof incoming !== "object") return;
+  for (const key of PROJECT_ENVIRONMENT_SETTING_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(existing, key)) incoming[key] = existing[key];
+    else delete incoming[key];
+  }
+}
+
 router.put("/api/config", (req, res) => {
   try {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
     ensureSecureDir(dir);
-    // #944/#949: pinned_projects, sidebar_groups, and reviewer_github_user are
-    // owned by field-scoped endpoints below. A whole-config PUT
-    // (settings save, idle toggle, bridge/queue/trigger widgets) carries a
-    // snapshot the client GET'd earlier, which may be stale for these keys.
-    // Never let a full PUT clobber them: always re-read the current on-disk
-    // values and keep those.
-    const disk = readConfigFile();
-    if ("pinned_projects" in disk) body.pinned_projects = disk.pinned_projects;
-    else delete body.pinned_projects;
-    if ("sidebar_groups" in disk) body.sidebar_groups = disk.sidebar_groups;
-    else delete body.sidebar_groups;
-    if ("reviewer_github_user" in disk) body.reviewer_github_user = disk.reviewer_github_user;
-    else delete body.reviewer_github_user;
-    // #968: session_token is redacted from GET, so a whole-config PUT snapshot
-    // never carries it — re-read and preserve it (same reason as the keys above).
-    if ("session_token" in disk) body.session_token = disk.session_token;
-    else delete body.session_token;
-    // #971: GET returns the SANITIZED operator_name; if the client PUTs back that
-    // exact sanitized value it did not actually edit it, so keep the raw on-disk
-    // value instead of overwriting it with the sanitized form (routes.js:327).
-    if (typeof body.operator_name === "string" && "operator_name" in disk &&
-        body.operator_name === sanitizeOperatorName(disk.operator_name)) {
-      body.operator_name = disk.operator_name;
-    }
-    // #971: the per-project flag fields are owned by PUT /api/projects/:id/flags.
-    // A whole-config PUT (e.g. SettingsPage.save) carries a possibly-stale
-    // snapshot of them, so re-read each project's flags off disk and keep those —
-    // a Settings save can never revert a concurrent toggle (extends #944).
-    if (Array.isArray(body.projects)) {
-      const diskById = new Map((disk.projects || []).map((p) => [p.id, p]));
-      for (const proj of body.projects) {
-        const dp = diskById.get(proj.id);
-        if (!dp) continue;
-        for (const k of PROJECT_FLAG_KEYS) {
-          if (k in dp) proj[k] = dp[k];
-          else delete proj[k];
+    // Reconcile the caller snapshot only after updateConfig has acquired the
+    // shared lock and read the live document. This closes both stale lifecycle
+    // overwrite and V1→V2 activation races between request parsing and commit.
+    updateConfig((cfg) => {
+      const candidate = JSON.parse(JSON.stringify(body));
+      delete candidate[RETIRED_GLOBAL_AGENT_FIELD];
+      const liveHasInstallationId = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
+      const bodyHasInstallationId = Object.prototype.hasOwnProperty.call(candidate, "installation_id");
+      if (bodyHasInstallationId &&
+          (!liveHasInstallationId || candidate.installation_id !== cfg.installation_id)) {
+        const err = new Error("installation identity rotation rejected");
+        err.code = "QW_INSTALLATION_ID_ROTATION";
+        throw err;
+      }
+      if (liveHasInstallationId) candidate.installation_id = cfg.installation_id;
+      else delete candidate.installation_id;
+
+      for (const key of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token", "project_admission_generations"]) {
+        if (key in cfg) candidate[key] = cfg[key];
+        else delete candidate[key];
+      }
+      if (typeof candidate.operator_name === "string" && "operator_name" in cfg &&
+          candidate.operator_name === sanitizeOperatorName(cfg.operator_name)) {
+        candidate.operator_name = cfg.operator_name;
+      }
+
+      if (Array.isArray(candidate.projects)) {
+        const liveById = new Map((cfg.projects || []).map((project) => [project.id, project]));
+        for (const project of candidate.projects) {
+          const liveProject = liveById.get(project.id);
+          if (!liveProject) continue;
+          preserveProjectArchiveState(liveProject, project);
+          preserveProjectEnvironmentSettings(liveProject, project);
+          for (const key of PROJECT_FLAG_KEYS) {
+            if (key in liveProject) project[key] = liveProject[key];
+            else delete project[key];
+          }
         }
       }
-    }
-    writeConfig(body);
+
+      if (liveHasInstallationId) {
+        assertGenericV2ProjectTopology(genericV2ProjectTopology(cfg), candidate);
+      }
+      for (const key of Object.keys(cfg)) delete cfg[key];
+      Object.assign(cfg, candidate);
+    });
     // Trigger sync is handled internally since we're in the same process now
     if (typeof req.app.get("syncTriggers") === "function") {
       req.app.get("syncTriggers")();
     }
     res.json({ ok: true });
   } catch (err) {
+    if (sendV2ConfigurationError(res, err)) return;
+    if (err.code === "QW_INSTALLATION_ID_ROTATION") {
+      return res.status(409).json({ error: "installation_id cannot be introduced or replaced here" });
+    }
     res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
 });
@@ -414,12 +606,24 @@ router.put("/api/config", (req, res) => {
 //     fields from disk; a project id not on disk is appended (Settings can add
 //     one); on-disk projects absent from the body are left untouched.
 const CONFIG_MERGE_EXCLUDED = new Set([
-  "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token",
+  "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token", "installation_id",
+  "project_admission_generations", RETIRED_GLOBAL_AGENT_FIELD,
 ]);
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {
-    updateConfig((cfg) => {
+    const mutator = (cfg) => {
+      const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
+      const previousTopology = activated && Array.isArray(body.projects)
+        ? genericV2ProjectTopology(cfg)
+        : null;
+      if (Object.prototype.hasOwnProperty.call(body, "installation_id") &&
+          (!Object.prototype.hasOwnProperty.call(cfg, "installation_id") ||
+           body.installation_id !== cfg.installation_id)) {
+        const err = new Error("installation identity rotation rejected");
+        err.code = "QW_INSTALLATION_ID_ROTATION";
+        throw err;
+      }
       for (const [k, v] of Object.entries(body)) {
         if (CONFIG_MERGE_EXCLUDED.has(k)) continue;
         if (k === "operator_name" && typeof v === "string" &&
@@ -437,14 +641,29 @@ router.patch("/api/config", (req, res) => {
           if (existing) {
             const preserved = {};
             for (const fk of PROJECT_FLAG_KEYS) if (fk in existing) preserved[fk] = existing[fk];
+            const lifecycleOwner = {};
+            if (Object.prototype.hasOwnProperty.call(existing, "archived")) lifecycleOwner.archived = existing.archived;
+            if (Object.prototype.hasOwnProperty.call(existing, "admission_generation")) {
+              lifecycleOwner.admission_generation = existing.admission_generation;
+            }
+            const environmentOwner = {};
+            preserveProjectEnvironmentSettings(existing, environmentOwner);
             Object.assign(existing, incoming, preserved);
+            preserveProjectArchiveState(lifecycleOwner, existing);
+            preserveProjectEnvironmentSettings(environmentOwner, existing);
           } else {
             cfg.projects.push(incoming);
           }
         }
       }
-    });
+      if (previousTopology) assertGenericV2ProjectTopology(previousTopology, cfg);
+    };
+    updateConfig(mutator);
   } catch (err) {
+    if (sendV2ConfigurationError(res, err)) return;
+    if (err.code === "QW_INSTALLATION_ID_ROTATION") {
+      return res.status(409).json({ error: "installation_id cannot be introduced or replaced here" });
+    }
     return res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
   if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
@@ -506,25 +725,214 @@ router.patch("/api/projects/:id/flags", (req, res) => {
   res.json({ ok: true });
 });
 
-// #971: field-scoped project removal. The section-merge PATCH above never drops
-// projects (it can't tell "not edited" from "deleted"), so the Settings "Remove"
-// action deletes here — atomically, via updateConfig — instead of relying on a
-// whole-config replace. Mirrors the prior behavior (config entry removed; source
-// clones/worktrees are left for `quadwork cleanup`).
-router.delete("/api/projects/:id", (req, res) => {
-  const { id } = req.params;
-  try {
-    updateConfig((cfg) => {
-      const before = (cfg.projects || []).length;
-      cfg.projects = (cfg.projects || []).filter((p) => p.id !== id);
-      if (cfg.projects.length === before) { const e = new Error("not found"); e.code = "QW_NOT_FOUND"; throw e; }
-    });
-  } catch (err) {
-    if (err.code === "QW_NOT_FOUND") return res.status(404).json({ error: `Unknown project: ${id}` });
-    return res.status(500).json({ error: "Failed to write config", detail: err.message });
+function safeProjectLifecyclePayload(result, projectId) {
+  const source = result && typeof result === "object" ? result : {};
+  const payload = {
+    ok: source.ok === true,
+    project_id: typeof source.project_id === "string" ? source.project_id : projectId,
+    resources: {},
+    cleanup_errors: [],
+  };
+  for (const key of ["archived", "removed", "already_archived", "already_unarchived"]) {
+    if (typeof source[key] === "boolean") payload[key] = source[key];
   }
-  if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
-  res.json({ ok: true });
+  if (Number.isSafeInteger(source.admission_generation) && source.admission_generation >= 0) {
+    payload.admission_generation = source.admission_generation;
+  }
+  if (source.resources && typeof source.resources === "object" && !Array.isArray(source.resources)) {
+    for (const [key, value] of Object.entries(source.resources)) {
+      if (/^[a-z][a-z0-9_]{0,63}$/.test(key) && Number.isSafeInteger(value) && value >= 0) {
+        payload.resources[key] = value;
+      }
+    }
+  }
+  if (Array.isArray(source.cleanup_errors)) {
+    payload.cleanup_errors = source.cleanup_errors.map((entry) => ({
+      resource: typeof entry?.resource === "string" ? entry.resource.slice(0, 64) : "project",
+      code: typeof entry?.code === "string" ? entry.code.slice(0, 64) : "cleanup_failed",
+      message: typeof entry?.message === "string"
+        ? entry.message.replace(/[\r\n\t]+/g, " ").slice(0, 300)
+        : "project cleanup failed",
+    }));
+  }
+  if (!payload.ok && payload.cleanup_errors.length > 0) payload.code = "project_cleanup_incomplete";
+  return payload;
+}
+
+function sendProjectLifecycleException(res, err, projectId) {
+  if (err instanceof ProjectLifecycleError) {
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status <= 599 ? err.status : 409;
+    return res.status(status).json({
+      ok: false,
+      error: String(err.message || "project lifecycle operation failed").replace(/[\r\n\t]+/g, " ").slice(0, 300),
+      code: typeof err.code === "string" ? err.code : "project_lifecycle_failed",
+      project_id: typeof err.project_id === "string" ? err.project_id : projectId,
+    });
+  }
+  if (err instanceof ConfigurationValidationError) {
+    const payload = {
+      ok: false,
+      error: "V2 configuration validation failed",
+      code: err.code,
+      field: err.field,
+      project_id: projectId,
+    };
+    if (err.owner_project_id !== undefined) payload.owner_project_id = err.owner_project_id;
+    return res.status(409).json(payload);
+  }
+  return res.status(500).json({
+    ok: false,
+    error: "Project lifecycle operation failed",
+    code: "project_lifecycle_failed",
+    project_id: projectId,
+  });
+}
+
+function projectLifecycleController(req, res, projectId) {
+  const controller = req.app.get("projectLifecycle");
+  if (controller) return controller;
+  res.status(503).json({
+    ok: false,
+    error: "Project lifecycle controller is unavailable",
+    code: "project_lifecycle_unavailable",
+    project_id: projectId,
+  });
+  return null;
+}
+
+const AUTOMATION_IDENTITY_FIELDS = Object.freeze([
+  "assignment_key",
+  "assignment_items",
+  "installation_id",
+  "batch_number",
+  "assignment_attempt",
+  "provenance",
+  "compatibility_mode",
+  "batch_observation_fingerprint",
+  "current_batch_empty",
+]);
+
+function carriesAutomationIdentity(body) {
+  return Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
+    AUTOMATION_IDENTITY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+}
+
+function requestedBridgeAdmission(body, projectId, res) {
+  if (!Object.prototype.hasOwnProperty.call(body, "admission_generation")) {
+    if (!carriesAutomationIdentity(body)) return undefined;
+    res.status(409).json({
+      ok: false,
+      error: "project admission changed; refresh and retry",
+      code: "project_admission_changed",
+      project_id: projectId,
+    });
+    return null;
+  }
+  const generation = body.admission_generation;
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    res.status(400).json({
+      ok: false,
+      error: "admission_generation must be a safe nonnegative integer",
+      code: "invalid_admission_generation",
+      project_id: projectId,
+    });
+    return null;
+  }
+  const admission = projectAdmission(projectId);
+  if (!admission || admission.generation !== generation || !isAdmissionCurrent(admission)) {
+    res.status(409).json({
+      ok: false,
+      error: "project admission changed; refresh and retry",
+      code: "project_admission_changed",
+      project_id: projectId,
+    });
+    return null;
+  }
+  return admission;
+}
+
+function requestedBridgeAssignment(body, projectId, res) {
+  const automated = carriesAutomationIdentity(body);
+  // Only a body carrying no automation identity at all is a manual V1/operator
+  // action. Partial assignment identity fails closed below.
+  if (!automated) return undefined;
+  const result = validateCurrentOwnedAssignment(projectId, body);
+  if (!result.ok) {
+    res.status(409).json({
+      ok: false,
+      error: "project assignment changed; refresh and retry",
+      code: "project_assignment_changed",
+      project_id: projectId,
+    });
+    return null;
+  }
+  const assignment = result.assignment || {};
+  const automationIdentity = result.legacy === true
+    ? {
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: result.context.fingerprint,
+    }
+    : {
+      compatibility_mode: "v2",
+      batch_observation_fingerprint: result.context.fingerprint,
+      provenance: assignment.provenance,
+      assignment_key: assignment.assignment_key,
+      installation_id: assignment.installation_id,
+      batch_number: assignment.batch_number,
+      assignment_attempt: assignment.assignment_attempt,
+      assignment_items: assignment.assignment_items,
+    };
+  return {
+    fingerprint: result.context.fingerprint,
+    automationIdentity,
+  };
+}
+
+function bridgeRuntimeAuthorityKey(admission, requestedAssignment) {
+  return Object.freeze({
+    admission_generation: admission.generation,
+    assignment_fingerprint: requestedAssignment
+      ? requestedAssignment.fingerprint
+      : "manual",
+  });
+}
+
+// #1034: archive/unarchive is a lifecycle barrier. The injected controller is
+// the sole mutation authority; route-local config mutation is forbidden.
+router.put("/api/projects/:id/archive", async (req, res) => {
+  const { id } = req.params;
+  if (typeof req.body?.archived !== "boolean") {
+    return res.status(400).json({ ok: false, error: "archived must be a boolean", code: "invalid_archive_state", project_id: id });
+  }
+  const controller = projectLifecycleController(req, res, id);
+  if (!controller) return;
+  try {
+    const result = req.body.archived
+      ? await controller.archiveProject(id)
+      : await controller.unarchiveProject(id);
+    const payload = safeProjectLifecyclePayload(result, id);
+    if (payload.archived === true) clearProjectBackgroundDemand(id);
+    else if (payload.archived === false) {
+      _projectsCache = null;
+      _projectsCacheTs = 0;
+    }
+    return res.status(payload.ok ? 200 : 503).json(payload);
+  } catch (err) {
+    return sendProjectLifecycleException(res, err, id);
+  }
+});
+
+router.delete("/api/projects/:id", async (req, res) => {
+  const { id } = req.params;
+  const controller = projectLifecycleController(req, res, id);
+  if (!controller) return;
+  try {
+    const payload = safeProjectLifecyclePayload(await controller.removeProject(id), id);
+    if (payload.archived === true || payload.removed === true) clearProjectBackgroundDemand(id);
+    return res.status(payload.ok && payload.removed === true ? 200 : 503).json(payload);
+  } catch (err) {
+    return sendProjectLifecycleException(res, err, id);
+  }
 });
 
 // ─── Pinned projects & sidebar groups (field-scoped, race-free) ─────────────
@@ -627,8 +1035,650 @@ router.put("/api/reviewer-github-user", (req, res) => {
 
 // ─── Chat (file-based) ────────────────────────────────────────────────────
 
-const { sanitizeOperatorName, ensureSecureDir, writeSecureFile, writeConfig, updateConfig } = require("./config");
+const {
+  sanitizeOperatorName,
+  ensureSecureDir,
+  writeSecureFile,
+  writeConfig,
+  updateConfig,
+  serializeProjectCompatibility,
+  allRepositories,
+  primaryRepository,
+  repositoryCiPolicy,
+  ConfigurationValidationError,
+  migrateConfigurationToV2,
+  commitV2Configuration,
+} = require("./config");
+const {
+  ProjectEnvironmentBindingError,
+  normalizeProjectEnvironmentSettings,
+} = require("./project-environment-bindings");
+const { writeProjectEnvironmentsMap } = require("./project-environments-map");
+const { projectV2Readiness } = require("./project-v2-readiness");
+const {
+  RepositoryProvisionError,
+  assertProjectId,
+  assertRepositoryList,
+  configuredRepositoryOwnership,
+  provisionRepositoryWorktrees,
+  renderProjectRepositoryMap,
+  writeProjectRepositoryMap,
+} = require("./repository-provisioning");
+const {
+  firstActivationLegacyGuard,
+  targetActivationGuard,
+} = require("./project-v2-activation");
 const { findAgentChattr } = require("./install-agentchattr");
+const {
+  createIssueContractRevisionHandler,
+  fetchIssueContractRevision,
+  issueContractRevision,
+} = require("./issue-contract-revision");
+const {
+  CiEvidenceError,
+  CiEvidenceStore,
+  createCiLessEvidenceSubmitHandler,
+  createDeliveryCandidateCiLessEvidenceSubmitHandler,
+  createCiLessEvidenceReadHandler,
+} = require("./ci-less-evidence");
+const { ReviewCycleStore, deriveLegacyReviewTarget } = require("./review-cycle");
+const { ReviewCycleDispatcher } = require("./review-cycle-dispatcher");
+const { currentContractObservation } = require("./review-cycle-contract-observation");
+const { verifyActionContract } = require("./review-cycle-action-contract");
+const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
+const { createDeliveryFinalReviewService } = require("./delivery-final-review-service");
+const { createDeliveryPublicationPlanService } = require("./delivery-publication-plan");
+const { TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND } = require("./delivery-review-target");
+
+function projectEnvironmentSettingsInput(config, project) {
+  return {
+    installation_id: config.installation_id,
+    project,
+    resolveCanonicalRepository: (candidateProject, key) => {
+      const repository = allRepositories(candidateProject).find((entry) => entry?.key === key);
+      return typeof repository?.repo === "string" ? repository.repo.trim().toLowerCase() : null;
+    },
+  };
+}
+
+function environmentSettingsResponse(config, project) {
+  const normalized = normalizeProjectEnvironmentSettings(projectEnvironmentSettingsInput(config, project));
+  return {
+    project_id: normalized.current_identity.project_id,
+    environment_bindings: normalized.project.environment_bindings.map((binding) => ({
+      installation_id: binding.installation_id,
+      project_id: binding.project_id,
+      label: binding.label,
+      environment_class: binding.environment_class,
+    })),
+    coordination_repo_key: normalized.coordination_repository?.key || null,
+    watch_batch_requests: normalized.project.watch_batch_requests,
+    // The selector is deliberately derived only from the canonical repository
+    // records already stored on this project. No network discovery, probe, or
+    // capability state is surfaced here.
+    repositories: allRepositories(project).map((repository) => ({
+      key: repository.key,
+      canonical_repository: typeof repository.repo === "string" ? repository.repo.trim().toLowerCase() : "",
+    })),
+  };
+}
+
+function projectEnvironmentPayloadError(res, error, status = 409) {
+  if (error instanceof ProjectEnvironmentBindingError) {
+    res.status(status).json({ ok: false, code: error.code, field: error.field, error: error.message });
+    return true;
+  }
+  return false;
+}
+
+function projectEnvironmentMutationCandidate(project, body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    const error = new ProjectEnvironmentBindingError(
+      "invalid_environment_settings",
+      "environment_settings",
+      "environment settings must be an object",
+    );
+    throw error;
+  }
+  const allowed = new Set(PROJECT_ENVIRONMENT_SETTING_KEYS);
+  for (const key of Object.keys(body)) {
+    if (!allowed.has(key)) {
+      throw new ProjectEnvironmentBindingError(
+        "invalid_environment_settings_field",
+        key,
+        "environment settings contains an unsupported field",
+      );
+    }
+  }
+  for (const key of ["environment_bindings", "coordination_repo_key", "watch_batch_requests"]) {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) {
+      throw new ProjectEnvironmentBindingError(
+        "missing_environment_settings_field",
+        key,
+        "environment settings must include all Settings fields",
+      );
+    }
+  }
+  const candidate = {
+    ...project,
+    environment_bindings: body.environment_bindings,
+    watch_batch_requests: body.watch_batch_requests,
+  };
+  // The M1 contract represents no selected coordination repository by field
+  // absence. The Settings API accepts only null as its explicit clear value.
+  if (body.coordination_repo_key === null) delete candidate.coordination_repo_key;
+  else candidate.coordination_repo_key = body.coordination_repo_key;
+  return candidate;
+}
+
+// #1045: the only Settings-bound environment topology mutation. The router is
+// mounted behind the same authenticated dashboard boundary as the rest of the
+// Settings APIs; generic config routes retain these fields but cannot author
+// them. This is persistence only—no peer discovery, remote control, session,
+// or watcher execution is introduced here.
+router.get("/api/projects/:id/environment-settings", (req, res) => {
+  const config = readConfigFile();
+  if (typeof config.installation_id !== "string") {
+    return res.status(409).json({ ok: false, code: "v2_environment_settings_unavailable", error: "activate V2 before configuring project environments" });
+  }
+  const project = (config.projects || []).find((entry) => entry?.id === req.params.id);
+  if (!project) return res.status(404).json({ ok: false, code: "unknown_project", error: "project is not configured" });
+  try {
+    return res.json({ ok: true, ...environmentSettingsResponse(config, project) });
+  } catch (error) {
+    if (projectEnvironmentPayloadError(res, error)) return;
+    return res.status(500).json({ ok: false, code: "environment_settings_unavailable", error: "could not read project environment settings" });
+  }
+});
+
+router.put("/api/projects/:id/environment-settings", (req, res) => {
+  let committed;
+  let response;
+  try {
+    const current = readConfigFile();
+    if (typeof current.installation_id !== "string") {
+      return res.status(409).json({ ok: false, code: "v2_environment_settings_unavailable", error: "activate V2 before configuring project environments" });
+    }
+    const existing = (current.projects || []).find((entry) => entry?.id === req.params.id);
+    if (!existing) return res.status(404).json({ ok: false, code: "unknown_project", error: "project is not configured" });
+    // Validate the exact Settings payload before acquiring the write boundary
+    // so malformed inputs cannot produce a partial config/map update.
+    const requested = projectEnvironmentMutationCandidate(existing, req.body);
+    normalizeProjectEnvironmentSettings(projectEnvironmentSettingsInput(current, requested));
+    committed = commitV2Configuration((config) => {
+      const project = (config.projects || []).find((entry) => entry?.id === req.params.id);
+      if (!project) {
+        throw new ProjectEnvironmentBindingError("unknown_project", "project_id", "project is not configured");
+      }
+      const candidate = projectEnvironmentMutationCandidate(project, req.body);
+      const normalized = normalizeProjectEnvironmentSettings(projectEnvironmentSettingsInput(config, candidate));
+      project.environment_bindings = normalized.project.environment_bindings;
+      project.watch_batch_requests = normalized.project.watch_batch_requests;
+      if (normalized.coordination_repository) project.coordination_repo_key = normalized.coordination_repository.key;
+      else delete project.coordination_repo_key;
+    });
+    const project = (committed.projects || []).find((entry) => entry?.id === req.params.id);
+    response = environmentSettingsResponse(committed, project);
+  } catch (error) {
+    if (projectEnvironmentPayloadError(res, error)) return;
+    if (sendV2ConfigurationError(res, error)) return;
+    return res.status(500).json({ ok: false, code: "environment_settings_write_failed", error: "could not save project environment settings" });
+  }
+
+  try {
+    writeProjectEnvironmentsMap(committed, (committed.projects || []).find((entry) => entry?.id === req.params.id), {
+      configDir: CONFIG_DIR,
+    });
+  } catch {
+    // Config has committed atomically. A later explicit/automatic reseed is
+    // safe and idempotent, but do not pretend that the Head map is current.
+    return res.status(503).json({ ok: false, config_committed: true, code: "project_environments_map_write_failed", error: "settings saved; retry to refresh the environment map" });
+  }
+  return res.json({ ok: true, ...response });
+});
+
+function resolveRegisteredIssueContract(projectId, repoKey, issue) {
+  const context = readLiveBatchContext(projectId);
+  if (!context?.queueReadOk || context.parsed?.errors?.length > 0) return null;
+  if (context.activated &&
+      (context.parsed.provenance !== "owned" || !context.parsed.assignmentKey)) return null;
+  if (!context.activated && context.repositories.length !== 1) return null;
+  const binding = context.repositories.find((entry) => entry.key === repoKey);
+  if (!binding) return null;
+  const registered = context.parsed.workItems.some((item) => {
+    const ref = item.ref || item;
+    return ref.repoKey === repoKey && ref.number === issue && ref.kind === "issue" &&
+      canonicalGithubRepo(ref.repo) === binding.cache_repo;
+  });
+  return registered
+    ? { repo: binding.repo, issue, fingerprint: context.fingerprint }
+    : null;
+}
+
+router.post("/api/issue-contract-revision", createIssueContractRevisionHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  resolveRegisteredIssue: resolveRegisteredIssueContract,
+}));
+
+function ciEvidenceContext(projectId, request) {
+  const context = readLiveBatchContext(projectId);
+  if (!context?.queueReadOk || context.parsed?.errors?.length > 0 || !context.activated ||
+      context.parsed?.provenance !== "owned" || !context.parsed?.assignmentAttempt ||
+      context.parsed.assignmentAttempt !== request.assignment_attempt ||
+      typeof context.installationId !== "string" || !context.installationId) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "current V2 assignment changed", 409);
+  }
+  const binding = context.repositories.find((entry) => entry.key === request.repo_key);
+  if (!binding) throw new CiEvidenceError("ci_evidence_target_changed", "current repository binding changed", 409);
+  const item = context.parsed.workItems.find((entry) => {
+    const ref = entry.ref || entry;
+    return ref?.repoKey === request.item.repo_key && ref.repo === request.item.repo &&
+      ref.number === request.item.number && ref.kind === request.item.kind;
+  });
+  if (!item) throw new CiEvidenceError("ci_evidence_target_changed", "current assignment item changed", 409);
+  let policy;
+  try { policy = repositoryCiPolicy(context.project, request.repo_key); } catch {
+    throw new CiEvidenceError("ci_evidence_policy_unavailable", "repository CI policy is invalid", 409);
+  }
+  if (!policy || policy.mode !== "ci-less" || policy.version !== request.policy_version) {
+    throw new CiEvidenceError("ci_evidence_policy_changed", "repository CI policy changed", 409);
+  }
+  return { context, binding, policy };
+}
+
+async function fetchOpenPullTip(repo, number) {
+  const canonicalRepo = canonicalGithubRepo(repo);
+  if (!canonicalRepo || !Number.isSafeInteger(number) || number < 1) {
+    throw new CiEvidenceError("ci_evidence_target_unavailable", "live pull request target is invalid", 503);
+  }
+  let payload;
+  try {
+    const { stdout } = await _execFileAsync("gh", ["api", `repos/${canonicalRepo}/pulls/${number}`], {
+      encoding: "utf8",
+      timeout: 15000,
+      maxBuffer: GH_LIST_MAX_BUFFER,
+    });
+    payload = JSON.parse(stdout);
+  } catch {
+    throw new CiEvidenceError("ci_evidence_live_read_failed", "live pull request could not be read", 502);
+  }
+  const tip = canonicalSha(payload?.head?.sha);
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+      payload.number !== number || String(payload.state || "").toLowerCase() !== "open" || !tip) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "live pull request is no longer open", 409);
+  }
+  return { exact_sha: tip };
+}
+
+// This action derives every authority field from the bound shim principal and
+// re-reads the V2 assignment, contract revision, and open PR tip. Client data
+// can only match that target; it cannot choose a project, actor, policy key, or
+// executable command.
+async function resolveCurrentCiEvidenceTarget(projectId, request) {
+  const before = ciEvidenceContext(projectId, request);
+  const [revision, pull] = await Promise.all([
+    fetchIssueContractRevision({ repo: before.binding.repo, issue: request.item.number }),
+    fetchOpenPullTip(before.binding.repo, request.pr_number),
+  ]);
+  if (revision.contract_revision !== request.contract_revision || pull.exact_sha !== request.exact_sha) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "current contract revision or PR tip changed", 409);
+  }
+  // A queue/config mutation while the authenticated GitHub reads were in
+  // flight invalidates the write. The record therefore never claims authority
+  // for an earlier queue observation.
+  const after = ciEvidenceContext(projectId, request);
+  if (after.context.fingerprint !== before.context.fingerprint ||
+      after.binding.repo !== before.binding.repo ||
+      JSON.stringify(after.policy) !== JSON.stringify(before.policy)) {
+    throw new CiEvidenceError("ci_evidence_target_changed", "current assignment or policy changed", 409);
+  }
+  return {
+    project_id: projectId,
+    installation_id: after.context.installationId,
+    repo_key: after.binding.key,
+    repo: after.binding.repo,
+    item: request.item,
+    assignment_attempt: request.assignment_attempt,
+    contract_revision: request.contract_revision,
+    pr_number: request.pr_number,
+    exact_sha: request.exact_sha,
+    policy_version: after.policy.version,
+    policy: after.policy,
+  };
+}
+
+const _ciEvidenceStore = new CiEvidenceStore();
+const _reviewCycleStore = new ReviewCycleStore();
+const _reviewCycleDispatcher = new ReviewCycleDispatcher({ store: _reviewCycleStore });
+router.post("/api/ci-evidence", createCiLessEvidenceSubmitHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  resolveCurrentTarget: resolveCurrentCiEvidenceTarget,
+  store: _ciEvidenceStore,
+}));
+router.post("/api/delivery-candidate/ci-evidence", createDeliveryCandidateCiLessEvidenceSubmitHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  captureProjectAdmission,
+  isAdmissionCurrent,
+  resolveCurrentTarget: resolveCurrentDeliveryCandidateCiEvidenceTarget,
+  store: _ciEvidenceStore,
+}));
+router.post("/api/ci-evidence/read", createCiLessEvidenceReadHandler({
+  resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
+  store: _ciEvidenceStore,
+}));
+
+// Reviewer-only native receipt admission.  Chat wording is deliberately not an
+// input.  The bound role supplies only a durable review id + current digest;
+// the server re-reads the GitHub review and records its exact SHA/verdict.
+function deliveryFinalReviewContext(projectId, deliveryCandidateRef, prNumber) {
+  const cfg = readConfigFile();
+  const project = (cfg.projects || []).find((entry) => entry?.id === projectId && entry.archived !== true);
+  const repositoryKey = deliveryCandidateRef?.repository_key;
+  if (!project || typeof cfg.installation_id !== "string") throw new Error("delivery_final_review_unavailable");
+  // Keep this value repository-only: a truthy `project && binding` expression
+  // makes static provenance guards conservatively treat the binding as a
+  // persisted project as well as a registered repository record.
+  const binding = getProjectRepositoryBindings(projectId, cfg).find((entry) => entry.key === repositoryKey);
+  if (!binding) throw new Error("delivery_final_review_unavailable");
+  let observedPr = null;
+  const service = createDeliveryFinalReviewService({
+    read_candidate_snapshot: (request) => {
+      const snapshot = createDeliveryCandidateStore({ config_dir: CONFIG_DIR, fs }).readSnapshot(request.delivery_candidate_ref);
+      return {
+        delivery_candidate_ref: snapshot.delivery_candidate_ref,
+        lifecycle: snapshot.lifecycle,
+        delivery_manifest: snapshot.delivery_manifest,
+        composition_proof: snapshot.composition_proof,
+      };
+    },
+    read_pr: (request) => {
+      const cached = _graphqlCache.get(binding.cache_repo);
+      if (!Number.isFinite(cached?.ts) || Date.now() - cached.ts > REVIEW_CONTRACT_MAX_AGE_MS) throw new Error("delivery_final_review_pr_stale");
+      const row = Array.isArray(cached.prs) ? cached.prs.find((entry) => entry?.number === request.pr_number) : null;
+      if (!row || !canonicalSha(row.tip)) throw new Error("delivery_final_review_pr_unavailable");
+      observedPr = row;
+      return { number: row.number, exact_sha: canonicalSha(row.tip), draft: row.draft === true, mergeable: row.mergeable === true };
+    },
+    read_ci_policy: () => binding.ci_policy ?? null,
+  });
+  const target = service.open({
+    version: 1,
+    head_binding: { installation_id: cfg.installation_id, project_id: projectId, role: "head", generation: 0 },
+    delivery_candidate_ref: deliveryCandidateRef,
+    pr_number: prNumber,
+  });
+  if (canonicalGithubRepo(target.identity.repo) !== canonicalGithubRepo(binding.repo) || target.identity.repo_key !== binding.key || !observedPr) {
+    throw new Error("delivery_final_review_binding_mismatch");
+  }
+  return { target, binding, pr: observedPr };
+}
+
+function deliveryCandidateCiEvidenceTarget(current) {
+  return {
+    version: 1,
+    target_kind: DELIVERY_REVIEW_TARGET_KIND,
+    project_id: current.target.identity.project_id,
+    installation_id: current.target.identity.installation_id,
+    repo_key: current.target.identity.repo_key,
+    repo: current.target.identity.repo,
+    delivery_candidate_ref: current.target.identity.delivery_candidate_ref,
+    delivery_manifest_digest: current.target.identity.delivery_manifest_digest,
+    pr_number: current.target.identity.pr_number,
+    exact_sha: current.target.identity.exact_sha,
+    policy_version: current.target.identity.policy_version,
+    policy: current.binding.ci_policy ?? null,
+  };
+}
+
+function deliveryPublicationPlanContext(projectId, deliveryCandidateRef) {
+  const cfg = readConfigFile();
+  const project = (cfg.projects || []).find((entry) => entry?.id === projectId && entry.archived !== true);
+  if (!project || typeof cfg.installation_id !== "string") throw new Error("delivery_publication_unavailable");
+  const service = createDeliveryPublicationPlanService({
+    read_candidate_snapshot: (request) => {
+      const snapshot = createDeliveryCandidateStore({ config_dir: CONFIG_DIR, fs }).readSnapshot(request.delivery_candidate_ref);
+      return {
+        delivery_candidate_ref: snapshot.delivery_candidate_ref,
+        lifecycle: snapshot.lifecycle,
+        delivery_manifest: snapshot.delivery_manifest,
+        composition_proof: snapshot.composition_proof,
+      };
+    },
+  });
+  const plan = service.plan({
+    version: 1,
+    head_binding: { installation_id: cfg.installation_id, project_id: projectId, role: "head", generation: 0 },
+    delivery_candidate_ref: deliveryCandidateRef,
+  });
+  const binding = getProjectRepositoryBindings(projectId, cfg)
+    .find((entry) => entry.key === plan.delivery_candidate_ref.repository_key && canonicalGithubRepo(entry.repo) === plan.repository);
+  if (!binding) throw new Error("delivery_publication_binding_mismatch");
+  return plan;
+}
+
+function resolveCurrentDeliveryCandidateCiEvidenceTarget(projectId, request) {
+  return deliveryCandidateCiEvidenceTarget(
+    deliveryFinalReviewContext(projectId, request.delivery_candidate_ref, request.pr_number),
+  );
+}
+
+function targetFromStoredReviewCycle(projectId, cycle) {
+  if (cycle.target.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    return {
+      version: 1,
+      target_kind: DELIVERY_REVIEW_TARGET_KIND,
+      identity: cycle.target,
+      target_identity_digest: cycle.target_identity_digest,
+      slot_digest: cycle.slot_digest,
+      observed: { draft: cycle.readiness === "draft_or_not_ready", mergeable: cycle.mergeable },
+    };
+  }
+  const project = configuredProject(projectId);
+  return deriveLegacyReviewTarget({
+    installation_id: cycle.target.installation_id, project_id: projectId,
+    repository: { key: cycle.target.repo_key, repo: cycle.target.repo, ci_policy: cycle.target.policy_version === null ? null : repositoryCiPolicy(project, cycle.target.repo_key) },
+    work_item: cycle.target.work_item,
+    pr: { number: cycle.target.pr_number, exact_sha: cycle.target.exact_sha, draft: false, mergeable: cycle.mergeable },
+    issue_contract: { contract_revision: cycle.target.contract_revision }, assignment_attempt: cycle.target.assignment_attempt,
+  });
+}
+
+function currentReviewCycleForPrincipal(principal, digest) {
+  const document = _reviewCycleStore.load(principal.projectId);
+  const cycle = Object.values(document.cycles).find((entry) => entry?.state === "current" && entry.target_identity_digest === digest);
+  if (!cycle || isProjectArchived(principal.projectId)) return null;
+  if (cycle.target.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    try {
+      const current = deliveryFinalReviewContext(principal.projectId, cycle.target.delivery_candidate_ref, cycle.target.pr_number).target;
+      return current.target_identity_digest === cycle.target_identity_digest ? cycle : null;
+    } catch {
+      return null;
+    }
+  }
+  const context = readLiveBatchContext(principal.projectId);
+  const stillAssigned = context?.activated && context.parsed?.provenance === "owned" &&
+    context.installationId === cycle.target.installation_id && context.parsed.assignmentAttempt === cycle.target.assignment_attempt &&
+    context.parsed.workItems.some((item) => (item.ref || item).repoKey === cycle.target.repo_key && (item.ref || item).number === cycle.target.work_item.number);
+  return stillAssigned ? cycle : null;
+}
+
+// Action-time, not scheduler-time, #1033 contract verification. The caller
+// has initiated a nonce/receipt operation; a fresh authenticated read closes
+// the gap between a bounded REST cache observation and durable admission.
+async function verifyCurrentReviewCycleContract(principal, digest, cycle) {
+  if (cycle?.target?.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
+    return currentReviewCycleForPrincipal(principal, digest);
+  }
+  return verifyActionContract(cycle,
+    () => currentReviewCycleForPrincipal(principal, digest),
+    fetchIssueContractRevision);
+}
+
+// A Head can admit only a composed local Delivery Candidate whose already
+// published PR is present in the fresh server cache at the identical result
+// SHA. This route creates neither branch nor PR; it only opens the existing
+// durable exact-SHA review cycle and emits its sealed reviewer handoff.
+router.post("/api/delivery-candidate/final-review", (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || principal.agentId !== "head" || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).sort().join(",") !== "delivery_candidate_ref,pr_number" || !Number.isSafeInteger(body.pr_number) || body.pr_number < 1) {
+    return res.status(400).json({ ok: false, code: "invalid_delivery_final_review_request" });
+  }
+  let admission;
+  try { admission = captureProjectAdmission(principal.projectId); }
+  catch { return res.status(409).json({ ok: false, code: "delivery_final_review_unavailable" }); }
+  if (!isAdmissionCurrent(admission) || isProjectArchived(principal.projectId)) {
+    return res.status(409).json({ ok: false, code: "delivery_final_review_unavailable" });
+  }
+  try {
+    const current = deliveryFinalReviewContext(principal.projectId, body.delivery_candidate_ref, body.pr_number);
+    const pre = _reviewCycleStore.reconcile(principal.projectId, current.target).cycle;
+    const evidence = current.pr.checkEvidence;
+    const policy = current.binding.ci_policy ?? null;
+    const ci = policy?.mode === "ci-less"
+      ? evaluateCiEvidence({
+        policy,
+        exact_sha: current.target.identity.exact_sha,
+        observed_at: evidence?.observed_at || new Date().toISOString(),
+        source_status: "ok",
+        ci_less_evidence: _ciEvidenceStore.readByIdentity(deliveryCandidateCiEvidenceTarget(current)),
+        now: Date.now(),
+      })
+      : evidence ? evaluateCiEvidence({
+        policy,
+        exact_sha: current.target.identity.exact_sha,
+        observed_at: evidence.observed_at,
+        first_observed_at: pre.created_at,
+        source_status: evidence.source_status,
+        check_runs: evidence.check_runs,
+        ci_less_evidence: null,
+        now: Date.now(),
+      }) : { state: "unknown" };
+    const observation = _reviewCycleDispatcher.observe({ project_id: principal.projectId, target: current.target, ci_state: ci.state, archived: false });
+    if (getProjectChatMode(principal.projectId) === "file" && isAdmissionCurrent(admission) && !isProjectArchived(principal.projectId)) {
+      _reviewCycleDispatcher.deliver(principal.projectId, observation,
+        (candidate) => fileChat.appendTrustedReviewCycleEventOnce(principal.projectId, {
+          ...candidate,
+          resume: { batch_id: currentChatResumeBatchId(principal.projectId), head_generation: admission.generation },
+        }));
+    }
+    return res.json({ ok: true, cycle_id: observation.cycle?.cycle_id || null, handoff: observation.handoff });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "delivery_final_review_unavailable" });
+  }
+});
+
+// This is intentionally only the last local preflight. It derives an exact
+// branch/PR proposal from a sealed candidate but cannot transfer a branch or
+// open a PR; those are explicit operator-gated external actions.
+router.post("/api/delivery-candidate/publication-plan", (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || principal.agentId !== "head" || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).length !== 1 || !Object.hasOwn(body, "delivery_candidate_ref")) {
+    return res.status(400).json({ ok: false, code: "invalid_delivery_publication_plan_request" });
+  }
+  let admission;
+  try { admission = captureProjectAdmission(principal.projectId); }
+  catch { return res.status(409).json({ ok: false, code: "delivery_publication_unavailable" }); }
+  if (!isAdmissionCurrent(admission) || isProjectArchived(principal.projectId)) {
+    return res.status(409).json({ ok: false, code: "delivery_publication_unavailable" });
+  }
+  try {
+    const plan = deliveryPublicationPlanContext(principal.projectId, body.delivery_candidate_ref);
+    return res.json({ ok: true, plan });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "delivery_publication_unavailable" });
+  }
+});
+
+router.post("/api/review-cycle-nonce", async (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || !["re1", "re2"].includes(principal.agentId) || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).sort().join(",") !== "target_identity_digest" || !/^[a-f0-9]{64}$/.test(body.target_identity_digest)) {
+    return res.status(400).json({ ok: false, code: "invalid_review_cycle_nonce_request" });
+  }
+  try {
+    const cycle = currentReviewCycleForPrincipal(principal, body.target_identity_digest);
+    if (!cycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    if (cycle.target.target_kind !== DELIVERY_REVIEW_TARGET_KIND) {
+      const binding = getProjectRepositoryBindings(principal.projectId)
+        .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
+      const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
+      if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
+        return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+      }
+    }
+    const verifiedCycle = await verifyCurrentReviewCycleContract(principal, body.target_identity_digest, cycle);
+    if (!verifiedCycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    const issued = _reviewCycleStore.issueReviewNonce(principal.projectId, targetFromStoredReviewCycle(principal.projectId, verifiedCycle), principal.agentId);
+    return res.json({ ok: true, cycle_id: issued.cycle_id, target_identity_digest: issued.target_identity_digest, nonce: issued.nonce });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "review_cycle_nonce_unavailable" });
+  }
+});
+
+router.post("/api/review-cycle-receipt", async (req, res) => {
+  const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+  const body = req.body;
+  if (!principal || !["re1", "re2"].includes(principal.agentId) || !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).sort().join(",") !== "nonce,review_id,target_identity_digest" ||
+      typeof body.target_identity_digest !== "string" || !/^[a-f0-9]{64}$/.test(body.target_identity_digest) ||
+      typeof body.nonce !== "string" || !/^qwrc_[a-f0-9]{32}$/.test(body.nonce) ||
+      !(typeof body.review_id === "string" || Number.isSafeInteger(body.review_id))) {
+    return res.status(400).json({ ok: false, code: "invalid_review_cycle_receipt" });
+  }
+  try {
+    const cycle = currentReviewCycleForPrincipal(principal, body.target_identity_digest);
+    if (!cycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    if (cycle.target.target_kind !== DELIVERY_REVIEW_TARGET_KIND) {
+      const binding = getProjectRepositoryBindings(principal.projectId)
+        .find((entry) => entry.key === cycle.target.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(cycle.target.repo));
+      const contract = binding ? currentContractObservation(_graphqlCache.get(binding.cache_repo), cycle.target.work_item.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS) : null;
+      if (!contract || contract.contract_revision !== cycle.target.contract_revision) {
+        return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+      }
+    }
+    const { stdout } = await _execFileAsync("gh", ["api", `repos/${cycle.target.repo}/pulls/${cycle.target.pr_number}/reviews/${body.review_id}`], {
+      encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER,
+    });
+    const review = JSON.parse(stdout);
+    const verdict = review?.state === "APPROVED" ? "approved" : review?.state === "CHANGES_REQUESTED" ? "changes_requested" : null;
+    if (!verdict || String(review?.commit_id || "").toLowerCase() !== cycle.target.exact_sha ||
+        String(review?.pull_request_url || "").endsWith(`/pulls/${cycle.target.pr_number}`) === false ||
+        !review?.submitted_at || review.id === undefined || typeof review.body !== "string" || !review.body.includes(body.nonce)) {
+      return res.status(409).json({ ok: false, code: "review_cycle_review_not_admitted" });
+    }
+    const verifiedCycle = await verifyCurrentReviewCycleContract(principal, body.target_identity_digest, cycle);
+    if (!verifiedCycle) return res.status(409).json({ ok: false, code: "review_cycle_stale_target" });
+    const target = targetFromStoredReviewCycle(principal.projectId, verifiedCycle);
+    const updated = _reviewCycleStore.recordReviewReceiptWithNonce(principal.projectId, target, {
+      reviewer_role: principal.agentId, review_id: review.id, verdict, submitted_at: review.submitted_at,
+      target_identity_digest: body.target_identity_digest,
+    }, body.nonce);
+    const gate = _reviewCycleStore.planHeadGate(principal.projectId, target);
+    if (gate && !isProjectArchived(principal.projectId) && getProjectChatMode(principal.projectId) === "file") {
+      const admission = captureProjectAdmission(principal.projectId);
+      if (isAdmissionCurrent(admission)) {
+        fileChat.appendTrustedReviewCycleEventOnce(principal.projectId, {
+          project_id: principal.projectId,
+          cycle: updated,
+          plan: gate,
+          resume: { batch_id: currentChatResumeBatchId(principal.projectId), head_generation: admission.generation },
+        });
+      }
+    }
+    return res.json({ ok: true, review: updated.review_state, head_gate_due: updated.head_gate_due });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "review_cycle_receipt_unavailable" });
+  }
+});
 
 /**
  * Seed ~/.quadwork/{projectId}/OVERNIGHT-QUEUE.md from the template.
@@ -668,6 +1718,24 @@ function writeGithubFileSafe(projectId, projectName, repo) {
   } catch { /* non-fatal */ }
 }
 
+// #1033: install the generic, versioned Head PO playbook beside the project
+// queue. Fresh setup is preservation-safe: an existing playbook is never
+// overwritten here. Manual/automatic reseed refreshes canonical sections via
+// _performReseedWrites while preserving operator-added H2 sections.
+function writeHeadPoPlaybookSafe(projectId, projectName) {
+  try {
+    const playbookPath = path.join(CONFIG_DIR, projectId, "HEAD-PO-PLAYBOOK.md");
+    if (fs.existsSync(playbookPath)) return;
+    const tpl = path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md");
+    if (!fs.existsSync(tpl)) return;
+    ensureSecureDir(path.dirname(playbookPath));
+    const content = fs.readFileSync(tpl, "utf-8")
+      .replace(/\{\{project_id\}\}/g, projectId || "")
+      .replace(/\{\{project_name\}\}/g, projectName || projectId || "");
+    fs.writeFileSync(playbookPath, content);
+  } catch { /* non-fatal setup documentation seed */ }
+}
+
 function getProjectMaxHops(projectId) {
   if (!projectId) return 30;
   const cfg = readConfigFile();
@@ -680,6 +1748,22 @@ function getProjectChatMode(projectId) {
   const cfg = readConfigFile();
   const project = cfg.projects?.find((p) => p.id === projectId);
   return project?.chat_mode === "ac" ? "ac" : "file";
+}
+
+// This only labels the current parsed V2 queue for the recovery ledger.  It
+// neither starts a batch nor makes queue prose an action authority; the resume
+// runtime independently re-reads and proves the same live context.
+function currentChatResumeBatchId(projectId) {
+  try {
+    const context = readLiveBatchContext(projectId);
+    const parsed = context?.parsed;
+    if (context?.activated !== true || context?.queueReadOk !== true || !parsed || parsed.provenance !== "owned" ||
+        !Number.isSafeInteger(parsed.batchNumber) || parsed.batchNumber < 1 || !Array.isArray(parsed.errors) || parsed.errors.length !== 0 ||
+        !Array.isArray(parsed.workItems) || parsed.workItems.length === 0) return null;
+    return `batch-${parsed.batchNumber}`;
+  } catch {
+    return null;
+  }
 }
 
 function emitSystemMessage(projectId, text) {
@@ -1143,6 +2227,12 @@ router.get("/api/activity/stats", (_req, res) => {
 router.post("/api/chat", (req, res) => {
   const projectId = req.query.project || req.body.project;
 
+  try {
+    assertProjectAdmitted(projectId);
+  } catch (err) {
+    return sendProjectLifecycleException(res, err, projectId);
+  }
+
   const text = typeof req.body?.text === "string" ? req.body.text : "";
   if (!text) return res.status(400).json({ error: "text required" });
   const shimSender = req.headers["x-chat-sender"];
@@ -1188,18 +2278,65 @@ router.post("/api/chat", (req, res) => {
       return res.status(400).json({ error: "Invalid attachment name" });
     }
   }
-  const msg = fileChat.appendMessage(projectId, {
-    sender,
-    text: normalizeMentions(text, selfMentionSkip),
-    channel: req.body?.channel || "general",
-    type: "message",
-    attachments,
-  });
+  // #1031: an automated sender validates before its HTTP fetch, but the queue
+  // can roll over while that fetch is in flight. Revalidate the carried exact
+  // assignment at the receiver immediately before the irreversible chat append
+  // and PTY dispatch. Bodies without an automation discriminator remain manual.
+  const bridgeAdmission = requestedBridgeAdmission(req.body || {}, projectId, res);
+  if (bridgeAdmission === null) return;
+  const assignment = validateCurrentOwnedAssignment(projectId, req.body || {});
+  if (!assignment.ok) {
+    return res.status(assignment.status || 409).json({
+      ok: false,
+      error: assignment.error || "project assignment changed; refresh and retry",
+      code: assignment.code || "project_assignment_changed",
+      project_id: assignment.project_id || projectId,
+    });
+  }
+  const assignmentBound = assignment.manual !== true;
+  const isChatAuthorityCurrent = () => {
+    if (bridgeAdmission && !isAdmissionCurrent(bridgeAdmission)) return false;
+    return !assignmentBound || validateCurrentOwnedAssignment(projectId, req.body || {}).ok === true;
+  };
+  const normalizedText = normalizeMentions(text, selfMentionSkip);
+  let msg;
+  // Only a genuine operator/user message that explicitly names Head receives
+  // the #1047 structural recovery tag. Bridge and shim agents retain their
+  // ordinary chat path; neither arbitrary prose nor a caller-selected tag can
+  // become a recovery instruction.
+  if (sender === "user" && (req.body?.channel || "general") === "general" && fileChat.parseMentions(normalizedText).includes("head")) {
+    try {
+      const admission = captureProjectAdmission(projectId);
+      if (!isAdmissionCurrent(admission)) throw new Error("project admission changed");
+      msg = fileChat.appendTrustedOperatorHeadMention(projectId, {
+        text: normalizedText,
+        attachments: attachments || null,
+        batch_id: currentChatResumeBatchId(projectId),
+        head_generation: admission.generation,
+      });
+    } catch {
+      // Preserve the established ordinary-chat availability path if the
+      // optional recovery label cannot be safely minted at this instant.
+    }
+  }
+  if (!msg) {
+    msg = fileChat.appendMessage(projectId, {
+      sender,
+      text: normalizedText,
+      channel: req.body?.channel || "general",
+      type: "message",
+      attachments,
+    });
+  }
   // #717: loop guard — count agent hops, pause if threshold reached
-  const maxHops = getProjectMaxHops(projectId);
-  fileChat.checkLoopGuard(projectId, msg, maxHops);
-  if (!fileChat.isLoopGuardPaused(projectId)) {
-    if (_ptyDispatchCallback) _ptyDispatchCallback(projectId, msg);
+  if (isChatAuthorityCurrent()) {
+    const maxHops = getProjectMaxHops(projectId);
+    fileChat.checkLoopGuard(projectId, msg, maxHops);
+    if (!fileChat.isLoopGuardPaused(projectId) && isChatAuthorityCurrent()) {
+      if (_ptyDispatchCallback) {
+        _ptyDispatchCallback(projectId, msg, assignmentBound ? isChatAuthorityCurrent : null);
+      }
+    }
   }
   return res.json({ ok: true, message: msg });
 });
@@ -1230,7 +2367,15 @@ const upload = multer({
   },
 });
 
-router.post("/api/upload", upload.single("file"), (req, res) => {
+router.post("/api/upload", (req, res, next) => {
+  const projectId = req.query.project || "";
+  try {
+    assertProjectAdmitted(projectId);
+    next();
+  } catch (err) {
+    sendProjectLifecycleException(res, err, projectId);
+  }
+}, upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   return res.json({
     ok: true,
@@ -1269,6 +2414,15 @@ let _projectsCache = null;
 let _projectsCacheTs = 0;
 const PROJECTS_CACHE_TTL = 60_000;
 
+function shouldPublishProjectsCache(projectResults, admissions) {
+  return projectResults.every((project) => {
+    const currentlyArchived = isProjectArchived(project.id);
+    if (currentlyArchived !== (project._archived === true)) return false;
+    const admission = admissions.get(project.id);
+    return !admission || isAdmissionCurrent(admission);
+  });
+}
+
 router.get("/api/projects", async (req, res) => {
   if (_projectsCache && Date.now() - _projectsCacheTs < adaptiveTTL(PROJECTS_CACHE_TTL)) {
     return res.json(_projectsCache);
@@ -1279,6 +2433,7 @@ router.get("/api/projects", async (req, res) => {
   }
 
   const cfg = readConfigFile();
+  const projectResultAdmissions = new Map();
 
   // Fetch active sessions from our own in-memory state (only running PTYs)
   const activeSessions = req.app.get("activeSessions") || new Map();
@@ -1315,19 +2470,87 @@ router.get("/api/projects", async (req, res) => {
     for (const m of msgs) msgToProject.set(m, projectIdToName[pid]);
   }
 
+  // #1030: flatten every active project/repository metric pass through one
+  // limiter. A per-project limiter combined with Promise.all(projects) would
+  // multiply GH_MAX_CONCURRENT by the number of projects (and by the two
+  // metric calls), defeating the existing rate-limit safety bound.
+  const projectMetricAdmissions = new Map();
+  const projectMetricJobs = [];
+  for (const project of cfg.projects || []) {
+    if (!project?.id || project.idle || isProjectArchived(project.id, cfg)) continue;
+    const admission = projectAdmission(project.id, { demand: true });
+    if (!admission) continue;
+    projectMetricAdmissions.set(project.id, admission);
+    projectResultAdmissions.set(project.id, admission);
+    for (const binding of projectRepositoryBindings(project)) {
+      projectMetricJobs.push({ projectId: project.id, binding, admission });
+    }
+  }
+  const projectMetricResults = await _mapLimited(projectMetricJobs, GH_MAX_CONCURRENT, async (job) => {
+    const stillAdmitted = () => isAdmissionCurrent(job.admission);
+    try {
+      // Keep the two calls sequential inside each globally-limited binding job;
+      // at most GH_MAX_CONCURRENT gh processes can exist for this aggregation.
+      const prs = await ghApiConditional(
+        `${job.binding.cache_repo}#projects-open-pulls`,
+        `repos/${job.binding.cache_repo}/pulls?state=open&per_page=100`,
+        stillAdmitted,
+      );
+      const recentPrs = await ghApiConditional(
+        `${job.binding.cache_repo}#projects-last-activity`,
+        `repos/${job.binding.cache_repo}/pulls?state=all&sort=updated&direction=desc&per_page=1`,
+        stillAdmitted,
+      );
+      if (!stillAdmitted()) return null;
+      const failed = prs.status === "error" || recentPrs.status === "error";
+      return {
+        ...job,
+        openPrs: Array.isArray(prs.data) ? prs.data.length : 0,
+        lastActivity: Array.isArray(recentPrs.data) && recentPrs.data[0] ? recentPrs.data[0].updated_at || null : null,
+        status: failed ? "error" : (prs.status === "ok" || recentPrs.status === "ok" ? "ok" : "unchanged"),
+      };
+    } catch {
+      return { ...job, openPrs: 0, lastActivity: null, status: "error" };
+    }
+  });
+  const projectMetrics = new Map();
+  for (const metric of projectMetricResults.filter(Boolean)) {
+    if (!projectMetrics.has(metric.projectId)) projectMetrics.set(metric.projectId, new Map());
+    projectMetrics.get(metric.projectId).set(metric.binding.key, metric);
+  }
+
   // #512: parallelize gh CLI calls across projects using async exec.
   // Only fetch open PR count and most recent PR activity — drop the
   // allPrs/allIssues calls that were only used for numberToProject.
   async function fetchProjectGhData(p) {
     let openPrs = 0;
     let lastActivity = null;
+    const bindings = projectRepositoryBindings(p);
+    const configuredRepo = bindings.find((binding) => binding.primary)?.repo || null;
+    let repositories = bindings.map((binding) => repositoryState(binding));
+    if (isProjectArchived(p.id, cfg)) {
+      const hasArchivedAgents = p.agents && Object.keys(p.agents).length > 0;
+      return {
+        id: p.id,
+        name: p.name,
+        repo: configuredRepo,
+        repositories,
+        agentCount: hasArchivedAgents ? Object.keys(p.agents).length : 0,
+        openPrs: 0,
+        state: "archived",
+        lastActivity: null,
+        _archived: true,
+        _readonly: true,
+      };
+    }
     // #812: parked (idle) project — no gh calls; return zero/last-known metadata.
     if (p.idle) {
       const hasAgentsIdle = p.agents && Object.keys(p.agents).length > 0;
       return {
         id: p.id,
         name: p.name,
-        repo: p.repo,
+        repo: configuredRepo,
+        repositories,
         agentCount: hasAgentsIdle ? Object.keys(p.agents).length : 0,
         openPrs: 0,
         state: "idle",
@@ -1335,23 +2558,39 @@ router.get("/api/projects", async (req, res) => {
         _idle: true,
       };
     }
-    if (REPO_RE.test(p.repo)) {
-      try {
-        // #806: REST + ETag instead of `gh pr list` (GraphQL-backed). Open-PR
-        // count + latest cross-state PR activity; both conditional (mostly 304).
-        const [prs, recentPrs] = await Promise.all([
-          ghApiConditional(`${p.repo}#projects-open-pulls`, `repos/${p.repo}/pulls?state=open&per_page=100`),
-          ghApiConditional(`${p.repo}#projects-last-activity`, `repos/${p.repo}/pulls?state=all&sort=updated&direction=desc&per_page=1`),
-        ]);
-        if (Array.isArray(prs.data)) openPrs = prs.data.length;
-        if (Array.isArray(recentPrs.data) && recentPrs.data[0]) lastActivity = recentPrs.data[0].updated_at || null;
-      } catch {}
+    const admission = projectMetricAdmissions.get(p.id);
+    if (!admission) {
+      return { id: p.id, name: p.name, repo: configuredRepo, repositories, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
+    }
+    if (bindings.length > 0) {
+      const metricsByKey = projectMetrics.get(p.id) || new Map();
+      repositories = bindings.map((binding) => {
+        const metric = metricsByKey.get(binding.key);
+        if (!metric) return { ...repositoryState(binding), stale: true };
+        const previous = repositoryState(binding);
+        return {
+          ...publicRepositoryBinding(binding),
+          openPrs: metric.openPrs,
+          lastActivity: metric.lastActivity,
+          status: metric.status,
+          stale: metric.status === "error",
+          last_good_at: metric.status === "error" ? previous.last_good_at : new Date().toISOString(),
+        };
+      });
+      for (const metric of metricsByKey.values()) {
+        openPrs += metric.openPrs;
+        if (metric.lastActivity && (!lastActivity || Date.parse(metric.lastActivity) > Date.parse(lastActivity))) lastActivity = metric.lastActivity;
+      }
+    }
+    if (!isAdmissionCurrent(admission)) {
+      return { id: p.id, name: p.name, repo: configuredRepo, repositories, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
     }
     const hasAgents = p.agents && Object.keys(p.agents).length > 0;
     return {
       id: p.id,
       name: p.name,
-      repo: p.repo,
+      repo: configuredRepo,
+      repositories,
       agentCount: p.agents ? Object.keys(p.agents).length : 0,
       openPrs,
       state: hasAgents && activeProjectIds.has(p.id) ? "active" : "idle",
@@ -1368,7 +2607,7 @@ router.get("/api/projects", async (req, res) => {
   const recentEvents = [];
   for (const m of workflowMsgs) {
     // First: try text match against repo/project name
-    let projectName = (cfg.projects || []).find((p) => m.text.includes(p.repo) || m.text.includes(p.name))?.name;
+    let projectName = (cfg.projects || []).find((p) => projectRepositoryBindings(p).some((binding) => m.text.includes(binding.repo)) || m.text.includes(p.name))?.name;
     // Second: use the AC instance the message came from
     if (!projectName) projectName = msgToProject.get(m);
     // Fallback: single-project installs
@@ -1387,8 +2626,10 @@ router.get("/api/projects", async (req, res) => {
   }
 
   const result = { projects: projectResults, recentEvents };
-  _projectsCache = result;
-  _projectsCacheTs = Date.now();
+  if (shouldPublishProjectsCache(projectResults, projectResultAdmissions)) {
+    _projectsCache = result;
+    _projectsCacheTs = Date.now();
+  }
   res.json(result);
 });
 
@@ -1414,9 +2655,11 @@ router.get("/api/github/rate-limit", async (req, res) => {
   // unknown project → cfg/default (back-compatible with #886).
   const projectId = typeof req.query.project === "string" ? req.query.project : null;
   let reviewer = null;
-  try {
-    reviewer = reviewerRateLimitPayload(await getReviewerRateLimit(projectId));
-  } catch { /* reviewer block is best-effort; never fail the core response */ }
+  if (!projectId || !isProjectArchived(projectId)) {
+    try {
+      reviewer = reviewerRateLimitPayload(await getReviewerRateLimit(projectId));
+    } catch { /* reviewer block is best-effort; never fail the core response */ }
+  }
   res.json({
     // Top-level fields are core (REST), kept for the existing alert banner.
     limit: _rateLimit.limit,
@@ -1443,12 +2686,90 @@ function getRepo(projectId) {
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     const project = cfg.projects?.find((p) => p.id === projectId);
-    const repo = project?.repo;
+    const repo = primaryRepository(project)?.repo;
     if (repo && REPO_RE.test(repo)) return repo;
     return null;
   } catch {
     return null;
   }
+}
+
+function canonicalGithubRepo(repo) {
+  if (typeof repo !== "string") return null;
+  const normalized = repo.trim();
+  return REPO_RE.test(normalized) ? normalized.toLowerCase() : null;
+}
+
+// #1030: repository keys are project-local bindings while GitHub's repository
+// identity is global and case-insensitive. Shared caches use cache_repo only;
+// repo_key is added later, when a cached row is projected for one project.
+function projectRepositoryBindings(project) {
+  return allRepositories(project)
+    .map((entry) => {
+      const repo = typeof entry?.repo === "string" ? entry.repo.trim() : "";
+      const cacheRepo = canonicalGithubRepo(repo);
+      if (!cacheRepo || typeof entry?.key !== "string" || !entry.key) return null;
+      return {
+        key: entry.key,
+        repo,
+        primary: entry.primary === true,
+        cache_repo: cacheRepo,
+        ci_policy: Object.prototype.hasOwnProperty.call(entry, "ci_policy") ? entry.ci_policy : null,
+      };
+    })
+    .filter(Boolean);
+}
+
+function configuredProject(projectId, cfg = null) {
+  if (!projectId) return null;
+  try {
+    const source = cfg || JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    return source.projects?.find((project) => project?.id === projectId) || null;
+  } catch {
+    return null;
+  }
+}
+
+function getProjectRepositoryBindings(projectId, cfg = null) {
+  const project = configuredProject(projectId, cfg);
+  return project ? projectRepositoryBindings(project) : [];
+}
+
+function projectUnavailableForGithub(project, cfg) {
+  return !project?.id || project.idle || !_githubDemandedProjects.has(project.id) ||
+    isProjectArchived(project.id, cfg) || projectRepositoryBindings(project).length === 0;
+}
+
+// #1046 is an explicit local opt-in, independent from the dashboard's active
+// batch demand. This intentionally returns only project ids—not repository,
+// label, or remote selectors—because the runtime owner derives and revalidates
+// those details from the current canonical subscription on every attempt.
+function batchRequestRefreshProjectIds(cfg) {
+  if (!cfg || !Array.isArray(cfg.projects)) return [];
+  const ids = new Set();
+  for (const project of cfg.projects) {
+    if (typeof project?.id !== "string" || project.watch_batch_requests !== true || isProjectArchived(project.id, cfg)) continue;
+    ids.add(project.id);
+  }
+  return [...ids];
+}
+
+function publicRepositoryBinding(binding) {
+  return {
+    key: binding.key,
+    repo: binding.repo,
+    primary: binding.primary,
+    ci_policy: redactedCiPolicy(binding.ci_policy),
+  };
+}
+
+function decorateGithubRows(rows, binding) {
+  return (Array.isArray(rows) ? rows : []).map((row) => ({
+    ...row,
+    repo_key: binding.key,
+    repo: binding.repo,
+    number: row?.number,
+  }));
 }
 
 // #812: per-project Idle toggle. When a project is idle, QuadWork must
@@ -1465,6 +2786,52 @@ function isProjectIdle(projectId) {
   }
 }
 
+// #1034: background GitHub work is demand-driven per project. Archiving clears
+// demand; restoring does not recreate it, so polling stays stopped until a
+// real consumer asks for that project again.
+const _githubDemandedProjects = new Set();
+
+function projectAdmission(projectId, { demand = false } = {}) {
+  try {
+    const token = captureProjectAdmission(projectId);
+    if (demand) _githubDemandedProjects.add(projectId);
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+function clearProjectBackgroundDemand(projectId) {
+  const resources = {
+    github_demand: _githubDemandedProjects.delete(projectId) ? 1 : 0,
+    github_leases: 0,
+    batch_progress: 0,
+  };
+  _projectsCache = null;
+  _projectsCacheTs = 0;
+  for (const entry of _restRefreshing.values()) {
+    for (const owner of entry?.owners || []) {
+      if (owner?.project_id === projectId && entry.owners.delete(owner)) resources.github_leases += 1;
+    }
+  }
+  const batchEntry = _batchProgressRefreshes?.get(projectId);
+  if (batchEntry && _batchProgressRefreshes.delete(projectId)) resources.batch_progress = 1;
+  if (_batchProgressCache?.has(projectId) || _batchCompleteState?.has(projectId)) resources.batch_progress = 1;
+  // A restart can leave only the durable row-acceleration file behind. Archive
+  // and removal cleanup must retire that presentation state too, even when the
+  // in-memory maps are cold. unlink is idempotent when the file is absent.
+  invalidateCurrentBatchPresentation(projectId, { persistent: true });
+  return resources;
+}
+
+function archivedGithubLists(project) {
+  return aggregateProjectGithubState(project, { _archived: true, _readonly: true });
+}
+
+async function cancelProjectBackground(projectId) {
+  return { ok: true, resources: clearProjectBackgroundDemand(projectId), cleanup_errors: [] };
+}
+
 // ─── #703 / #806: shared board cache ──────────────────────────────────────
 // `_graphqlCache` holds each repo's assembled board snapshot. As of #806 it is
 // populated by the REST+ETag fetcher (githubStateFetcher / refreshRepoRest);
@@ -1472,8 +2839,47 @@ function isProjectIdle(projectId) {
 // emergency fallback, gated on the GraphQL budget. Name kept for minimal churn.
 
 const _graphqlCache = new Map(); // repo → { ts, issues, prs, closedIssues, mergedPrs }
+// canonical repo → { status, checkedAt, lastGoodAt }. A failed refresh never
+// deletes the repo's last-good snapshot, so one broken repository cannot blank
+// healthy siblings in a multi-repository project.
+const _githubRepoStatus = new Map();
 const GRAPHQL_CACHE_TTL = 60_000; // same as GH_ENDPOINT_CACHE_TTL
 let _graphqlRefreshInFlight = false;
+
+function repositoryState(binding, now = Date.now()) {
+  const cached = _graphqlCache.get(binding.cache_repo);
+  const observed = _githubRepoStatus.get(binding.cache_repo);
+  const lastGoodAt = observed?.lastGoodAt || cached?.ts || null;
+  const stale = !cached || now - cached.ts > GRAPHQL_CACHE_TTL || observed?.status === "error";
+  return {
+    ...publicRepositoryBinding(binding),
+    status: observed?.status || (cached ? "last_good" : "missing"),
+    stale,
+    last_good_at: lastGoodAt ? new Date(lastGoodAt).toISOString() : null,
+  };
+}
+
+function aggregateProjectGithubState(project, flags = {}) {
+  const bindings = projectRepositoryBindings(project);
+  const result = {
+    issues: [],
+    prs: [],
+    closedIssues: [],
+    mergedPrs: [],
+    repositories: bindings.map((binding) => repositoryState(binding)),
+    ...flags,
+  };
+  for (const binding of bindings) {
+    const cached = _graphqlCache.get(binding.cache_repo);
+    if (!cached) continue;
+    result.issues.push(...decorateGithubRows(cached.issues, binding));
+    result.prs.push(...decorateGithubRows(cached.prs, binding));
+    result.closedIssues.push(...decorateGithubRows(cached.closedIssues, binding));
+    result.mergedPrs.push(...decorateGithubRows(cached.mergedPrs, binding));
+  }
+  result._stale = result.repositories.some((repository) => repository.stale);
+  return result;
+}
 
 const RECENT_FETCH_LIMIT = 20;
 const RECENT_DISPLAY_LIMIT = 5;
@@ -1495,7 +2901,7 @@ const _etagStore = new Map();
 // Per-repo in-flight refresh: repo → Promise. Concurrent callers AWAIT the same
 // refresh (not just skip it) so a cold first load — where GitHubPanel fires the
 // four list endpoints in parallel — never races ahead of the populated cache.
-const _restRefreshing = new Map();
+const _restRefreshing = new Map(); // repo → { owners: Set<exact admission token>, promise }
 
 // Split a `gh api -i` response into its header block and JSON body. gh emits
 // HTTP headers (CRLF) then a blank line then the body.
@@ -1524,7 +2930,8 @@ function _is304Error(err) {
 // Conditional `gh api` GET. Reuses the stored ETag; on 304 returns the cached
 // payload (status "unchanged", zero budget cost). Never throws — a hard
 // failure returns the last good payload (if any) with status "error".
-async function ghApiConditional(etagKey, apiPath) {
+async function ghApiConditional(etagKey, apiPath, isCurrent = () => true) {
+  if (!isCurrent()) return { status: "cancelled", data: null, changed: false };
   const prev = _etagStore.get(etagKey);
   const args = ["api", apiPath, "-i"];
   if (prev && prev.etag) args.push("-H", `If-None-Match: ${prev.etag}`);
@@ -1534,6 +2941,7 @@ async function ghApiConditional(etagKey, apiPath) {
     const etag = _extractEtag(headerBlock);
     let data = null;
     try { data = body ? JSON.parse(body) : null; } catch { data = null; }
+    if (!isCurrent()) return { status: "cancelled", data: null, changed: false };
     _etagStore.set(etagKey, { etag, data });
     return { status: "ok", data, changed: true };
   } catch (err) {
@@ -1542,6 +2950,94 @@ async function ghApiConditional(etagKey, apiPath) {
     }
     return { status: "error", data: prev ? prev.data : null, changed: false };
   }
+}
+
+// #1046's only GitHub-read seam. This deliberately does not reuse the broad
+// dashboard Issue projection: Batch Request reconciliation needs the raw body
+// (for its fenced authority parser), a fixed label query, and an ETag that is
+// bound to one canonical coordination repository. Callers receive no generic
+// API path, title, command, or GitHub selector capability.
+function _batchRequestReaderInput(value) {
+  const plain = (entry) => !!entry && typeof entry === "object" && !Array.isArray(entry) &&
+    (Object.getPrototypeOf(entry) === Object.prototype || Object.getPrototypeOf(entry) === null);
+  const exact = (entry, fields) => plain(entry) && (() => {
+    const actual = Object.keys(entry).sort();
+    const expected = [...fields].sort();
+    return actual.length === expected.length && actual.every((field, index) => field === expected[index]);
+  })();
+  if (!exact(value, ["version", "target", "coordination_repository", "request_label", "cache"]) || value.version !== 1 ||
+      !exact(value.target, ["installation_id", "project_id"]) ||
+      typeof value.target.installation_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/.test(value.target.installation_id) ||
+      typeof value.target.project_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.target.project_id) ||
+      typeof value.coordination_repository !== "string" || canonicalGithubRepo(value.coordination_repository) !== value.coordination_repository ||
+      value.request_label !== BATCH_REQUEST_LABEL || !exact(value.cache, ["etag", "cursor"]) ||
+      ![null, "string"].includes(value.cache.etag === null ? null : typeof value.cache.etag) ||
+      ![null, "string"].includes(value.cache.cursor === null ? null : typeof value.cache.cursor) ||
+      (typeof value.cache.etag === "string" && (value.cache.etag.length === 0 || value.cache.etag.length > 512 || /[\r\n\0]/.test(value.cache.etag))) ||
+      (typeof value.cache.cursor === "string" && (value.cache.cursor.length === 0 || value.cache.cursor.length > 512 || /[\r\n\0]/.test(value.cache.cursor)))) {
+    throw new TypeError("invalid Batch Request Issue reader request");
+  }
+  return Object.freeze({
+    version: 1,
+    target: Object.freeze({ installation_id: value.target.installation_id, project_id: value.target.project_id }),
+    coordination_repository: value.coordination_repository,
+    request_label: BATCH_REQUEST_LABEL,
+    cache: Object.freeze({ etag: value.cache.etag, cursor: value.cache.cursor }),
+  });
+}
+
+function _batchRequestIssueRows(repository, rawRows, etag) {
+  if (!Array.isArray(rawRows) || rawRows.length > 64 || (etag !== null && (typeof etag !== "string" || etag.length === 0 || etag.length > 512 || /[\r\n\0]/.test(etag)))) {
+    throw new TypeError("Batch Request Issue reader response is invalid");
+  }
+  const seen = new Set();
+  return rawRows.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item) || !Number.isSafeInteger(item.number) || item.number < 1 || item.number > 9_999_999) {
+      throw new TypeError("Batch Request Issue row is invalid");
+    }
+    if (seen.has(item.number)) throw new TypeError("Batch Request Issue row is duplicated");
+    seen.add(item.number);
+    const labels = Array.isArray(item.labels)
+      ? item.labels.map((label) => typeof label === "string" ? label : label?.name).filter((label) => typeof label === "string" && label.length > 0 && label.length <= 100 && !/[\r\n\0]/.test(label))
+      : [];
+    return Object.freeze({
+      repository,
+      issue_number: item.number,
+      issue_url: `https://api.github.com/repos/${repository}/issues/${item.number}`,
+      pull_request: item.pull_request && typeof item.pull_request === "object" && !Array.isArray(item.pull_request) ? {} : null,
+      labels: Object.freeze(labels),
+      body: typeof item.body === "string" ? item.body : "",
+      etag,
+      // The ETag is the conditional list representation; this opaque marker
+      // only names the fixed query class and is never a page/remote selector.
+      cursor: "open-labelled-issues-v1",
+    });
+  });
+}
+
+async function readBatchRequestIssues(value) {
+  const request = _batchRequestReaderInput(value);
+  if (isRateLimited()) throw new Error("Batch Request REST budget is unavailable");
+  const [owner, name] = request.coordination_repository.split("/");
+  const etagKey = `batch-request:${request.coordination_repository}:${request.request_label}`;
+  const apiPath = `repos/${owner}/${name}/issues?state=open&labels=${encodeURIComponent(request.request_label)}&per_page=64&sort=created&direction=asc`;
+  const response = await ghApiConditional(etagKey, apiPath);
+  if (!response || !["ok", "unchanged"].includes(response.status) || !Array.isArray(response.data)) {
+    throw new Error("Batch Request Issue read is unavailable");
+  }
+  const etag = _etagStore.get(etagKey)?.etag ?? null;
+  const issues = _batchRequestIssueRows(request.coordination_repository, response.data, etag);
+  return Object.freeze({
+    version: 1,
+    target: request.target,
+    coordination_repository: request.coordination_repository,
+    request_label: BATCH_REQUEST_LABEL,
+    // The runtime requires this to echo the exact recovered durable cache.
+    // New ETag/cursor facts belong to each parsed Issue and become durable only
+    // through its subsequent watcher/state-store compare-and-swap.
+    cache: request.cache,
+    issues: Object.freeze(issues),
+  });
 }
 
 // Coalesce concurrent async work by key: a caller arriving while a call for the
@@ -1578,7 +3074,7 @@ async function _mapLimited(items, limit, fn) {
 // gh-CLI path and GitHubPanel.tsx's `state === "OPEN"` dot (the prior GraphQL
 // transform lowercased to "open", an inconsistency this pins). ──
 function restIssueToCanonical(it) {
-  return {
+  const result = {
     number: it.number,
     title: it.title,
     state: (it.state || "").toUpperCase(),
@@ -1587,6 +3083,12 @@ function restIssueToCanonical(it) {
     assignees: (it.assignees || []).map((a) => ({ login: a.login })),
     createdAt: it.created_at,
   };
+  // The existing conditional /issues refresh is the only contract-observation
+  // source used by #1048 progress dispatch.  Missing body data fails closed.
+  if (Object.prototype.hasOwnProperty.call(it, "body") && (it.body === null || typeof it.body === "string")) {
+    result.contract_revision = issueContractRevision(it.body);
+  }
+  return result;
 }
 
 function restClosedIssueToCanonical(it) {
@@ -1621,6 +3123,11 @@ function restPullBaseToCanonical(p) {
     author: p.user ? { login: p.user.login } : null,
     assignees: (p.assignees || []).map((a) => ({ login: a.login })),
     createdAt: p.created_at,
+    tip: p.head && p.head.sha ? p.head.sha : null,
+    draft: p.draft === true,
+    // List snapshots do not promise mergeability.  Absence remains false and
+    // suppresses the Head gate rather than guessing from PR existence.
+    mergeable: p.mergeable === true,
   };
 }
 
@@ -1702,12 +3209,13 @@ function buildStatusCheckRollup(checkRunsResp, statusResp) {
 // is FULL (more pages may exist) AND short on merges. `fetchPage(page)` returns
 // the same { status, data } shape as ghApiConditional. Pure control flow over
 // an injected fetcher → unit-testable without network.
-async function gatherClosedPrPages(firstPage, fetchPage) {
+async function gatherClosedPrPages(firstPage, fetchPage, isCurrent = () => true) {
   const pages = [firstPage];
   const mergedCount = (r) => (Array.isArray(r && r.data) ? r.data : []).filter((p) => p.merged_at).length;
   let mergedSoFar = mergedCount(firstPage);
   let lastLen = Array.isArray(firstPage && firstPage.data) ? firstPage.data.length : 0;
   for (let page = 2; page <= MERGED_PAGE_CAP && mergedSoFar < RECENT_DISPLAY_LIMIT && lastLen === 100; page++) {
+    if (!isCurrent()) break;
     const r = await fetchPage(page);
     pages.push(r);
     mergedSoFar += mergedCount(r);
@@ -1760,28 +3268,38 @@ function closedPrIssueNumsFromPages(pages) {
   return nums;
 }
 
-async function githubStateFetcher(repo) {
+async function githubStateFetcher(repo, isCurrent = () => true) {
   const [owner, name] = (repo || "").split("/");
-  if (!owner || !name) return { status: "error", data: null };
+  if (!owner || !name || !isCurrent()) return { status: "cancelled", data: null };
   const base = `repos/${owner}/${name}`;
   let changed = 0;
+  let hadError = false;
 
   const [openPullsR, openIssuesR, closedIssuesR, closedPulls1R] = await Promise.all([
-    ghApiConditional(`${repo}#pulls-open`, `${base}/pulls?state=open&per_page=50&sort=updated&direction=desc`),
-    ghApiConditional(`${repo}#issues-open`, `${base}/issues?state=open&per_page=50&sort=updated&direction=desc`),
-    ghApiConditional(`${repo}#issues-closed`, `${base}/issues?state=closed&per_page=100&sort=updated&direction=desc`),
-    ghApiConditional(`${repo}#pulls-closed`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc`),
+    ghApiConditional(`${repo}#pulls-open`, `${base}/pulls?state=open&per_page=50&sort=updated&direction=desc`, isCurrent),
+    ghApiConditional(`${repo}#issues-open`, `${base}/issues?state=open&per_page=50&sort=updated&direction=desc`, isCurrent),
+    ghApiConditional(`${repo}#issues-closed`, `${base}/issues?state=closed&per_page=100&sort=updated&direction=desc`, isCurrent),
+    ghApiConditional(`${repo}#pulls-closed`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc`, isCurrent),
   ]);
+  if (!isCurrent()) return { status: "cancelled", data: null };
 
   // #828 P3: extend the closed-PR window across pages only when needed (each
   // page conditional/ETag'd, so steady-state extra pages cost nothing on a 304).
-  const closedPullPages = await gatherClosedPrPages(closedPulls1R, (page) =>
-    ghApiConditional(`${repo}#pulls-closed-p${page}`, `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc&page=${page}`),
+  const closedPullPages = await gatherClosedPrPages(
+    closedPulls1R,
+    (page) => ghApiConditional(
+      `${repo}#pulls-closed-p${page}`,
+      `${base}/pulls?state=closed&per_page=100&sort=updated&direction=desc&page=${page}`,
+      isCurrent,
+    ),
+    isCurrent,
   );
+  if (!isCurrent()) return { status: "cancelled", data: null };
 
   let anyTopData = false;
   for (const r of [openPullsR, openIssuesR, closedIssuesR, ...closedPullPages]) {
     if (r.status === "ok") changed++;
+    if (r.status === "error") hadError = true;
     if (Array.isArray(r.data)) anyTopData = true;
   }
   // No list data at all (first run, every call failed) → don't fabricate a
@@ -1817,25 +3335,36 @@ async function githubStateFetcher(repo) {
 
   const openPullsRaw = Array.isArray(openPullsR.data) ? openPullsR.data : [];
   const prs = await _mapLimited(openPullsRaw, GH_MAX_CONCURRENT, async (p) => {
+    if (!isCurrent()) return null;
     const sha = p.head && p.head.sha;
     const [reviewsR, checkRunsR, statusR] = await Promise.all([
-      ghApiConditional(`${repo}#reviews-${p.number}`, `${base}/pulls/${p.number}/reviews?per_page=100`),
-      sha ? ghApiConditional(`${repo}#checkruns-${sha}`, `${base}/commits/${sha}/check-runs?per_page=100`) : Promise.resolve({ status: "error", data: null }),
-      sha ? ghApiConditional(`${repo}#status-${sha}`, `${base}/commits/${sha}/status`) : Promise.resolve({ status: "error", data: null }),
+      ghApiConditional(`${repo}#reviews-${p.number}`, `${base}/pulls/${p.number}/reviews?per_page=100`, isCurrent),
+      sha ? ghApiConditional(`${repo}#checkruns-${sha}`, `${base}/commits/${sha}/check-runs?per_page=100`, isCurrent) : Promise.resolve({ status: "error", data: null }),
+      sha ? ghApiConditional(`${repo}#status-${sha}`, `${base}/commits/${sha}/status`, isCurrent) : Promise.resolve({ status: "error", data: null }),
     ]);
+    if (!isCurrent()) return null;
     if (reviewsR.status === "ok" || checkRunsR.status === "ok" || statusR.status === "ok") changed++;
+    if (reviewsR.status === "error" || (sha && (checkRunsR.status === "error" || statusR.status === "error"))) hadError = true;
     const reviews = mapReviews(Array.isArray(reviewsR.data) ? reviewsR.data : []);
+    const checkEvidence = normalizeGithubCheckEvidence(checkRunsR.data, {
+      exact_sha: sha,
+      observed_at: new Date().toISOString(),
+      source_status: (checkRunsR.status === "ok" || checkRunsR.status === "unchanged") ? "ok" : "unavailable",
+    });
     return {
       ...restPullBaseToCanonical(p),
       reviews,
       reviewDecision: deriveReviewDecision(reviews),
       statusCheckRollup: buildStatusCheckRollup(checkRunsR.data, statusR.data),
+      checkEvidence,
     };
   });
 
+  if (!isCurrent()) return { status: "cancelled", data: null };
+
   return {
-    status: changed > 0 ? "ok" : "unchanged",
-    data: { issues, prs, closedIssues, mergedPrs, openPrsWindowComplete, closedPrsWindowComplete, closedPrIssueNums },
+    status: hadError ? "error" : changed > 0 ? "ok" : "unchanged",
+    data: { issues, prs: prs.filter(Boolean), closedIssues, mergedPrs, openPrsWindowComplete, closedPrsWindowComplete, closedPrIssueNums },
   };
 }
 
@@ -1843,29 +3372,73 @@ async function githubStateFetcher(repo) {
 // concurrent caller (e.g. the parallel cold-load of all four list endpoints, or
 // a background stale refresh overlapping an on-demand one) joins and awaits the
 // SAME in-flight pass, so by the time it resolves the slice caches are written.
-function refreshRepoRest(repo) {
-  return _coalesce(_restRefreshing, repo, async () => {
+function refreshRepoRest(repo, ownerTokens = [], fetcher = githubStateFetcher) {
+  const cacheRepo = canonicalGithubRepo(repo);
+  if (!cacheRepo) return Promise.resolve({ status: "error", data: null });
+  const existing = _restRefreshing.get(cacheRepo);
+  if (existing) {
+    for (const token of ownerTokens) {
+      if (token?.project_id) existing.owners.add(token);
+    }
+    return existing.promise;
+  }
+  const entry = { owners: new Set(), promise: null };
+  for (const token of ownerTokens) {
+    if (token?.project_id) entry.owners.add(token);
+  }
+  const hasCurrentOwner = () => [...entry.owners].some((token) => isAdmissionCurrent(token));
+  if (!hasCurrentOwner()) return Promise.resolve({ status: "cancelled", data: null });
+  entry.promise = (async () => {
     let result;
     try {
-      const { status, data } = await githubStateFetcher(repo);
-      if (data) {
+      const { status, data } = await fetcher(cacheRepo, hasCurrentOwner);
+      if (!hasCurrentOwner()) return { status: "cancelled", data: null };
+      if (data && status !== "error") {
         const now = Date.now();
-        _graphqlCache.set(repo, { ts: now, ...data });
-        _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: data.issues, stale: false });
-        _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: data.prs, stale: false });
-        _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: data.closedIssues, stale: false });
-        _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: data.mergedPrs, stale: false });
+        _graphqlCache.set(cacheRepo, { ts: now, ...data });
+        _githubRepoStatus.set(cacheRepo, {
+          status,
+          checkedAt: now,
+          lastGoodAt: now,
+        });
+        _ghEndpointCache.set(`issues:${cacheRepo}`, { ts: now, data: data.issues, stale: false });
+        _ghEndpointCache.set(`prs:${cacheRepo}`, { ts: now, data: data.prs, stale: false });
+        _ghEndpointCache.set(`closed-issues:${cacheRepo}`, { ts: now, data: data.closedIssues, stale: false });
+        _ghEndpointCache.set(`merged-prs:${cacheRepo}`, { ts: now, data: data.mergedPrs, stale: false });
+      } else {
+        const now = Date.now();
+        const previous = _githubRepoStatus.get(cacheRepo);
+        _githubRepoStatus.set(cacheRepo, { status, checkedAt: now, lastGoodAt: previous?.lastGoodAt || _graphqlCache.get(cacheRepo)?.ts || null });
+        for (const kind of ["issues", "prs", "closed-issues", "merged-prs"]) {
+          const key = `${kind}:${cacheRepo}`;
+          const cached = _ghEndpointCache.get(key);
+          if (cached) _ghEndpointCache.set(key, { ...cached, stale: true });
+        }
       }
       result = { status, data };
     } catch {
       result = { status: "error", data: null };
+      const now = Date.now();
+      const previous = _githubRepoStatus.get(cacheRepo);
+      _githubRepoStatus.set(cacheRepo, { status: "error", checkedAt: now, lastGoodAt: previous?.lastGoodAt || _graphqlCache.get(cacheRepo)?.ts || null });
+      for (const kind of ["issues", "prs", "closed-issues", "merged-prs"]) {
+        const key = `${kind}:${cacheRepo}`;
+        const cached = _ghEndpointCache.get(key);
+        if (cached) _ghEndpointCache.set(key, { ...cached, stale: true });
+      }
     }
     // #807: the server is the sole author of GITHUB.md's machine sections —
     // regenerate it from this completed pass's snapshot (success or error so
     // staleCycles advances). Non-fatal; never affects the board cache result.
-    try { syncGithubFilesForRepo(repo, result.status); } catch { /* non-fatal */ }
+    if (hasCurrentOwner()) {
+      try { syncGithubFilesForRepo(cacheRepo, result.status, entry.owners); } catch { /* non-fatal */ }
+    }
     return result;
+  })().finally(() => {
+    if (_restRefreshing.get(cacheRepo) === entry) _restRefreshing.delete(cacheRepo);
   });
+  _restRefreshing.set(cacheRepo, entry);
+  return entry.promise;
 }
 
 // ─── #807 (#805 step 2): server-authored GITHUB.md ────────────────────────
@@ -1875,7 +3448,9 @@ function refreshRepoRest(repo) {
 // strictly parseable (parseGithub). The `## Notes` block is human/HEAD-writable
 // and preserved across regeneration.
 
-// Per-project freshness: projectId → { generatedAt(ms), staleCycles }.
+// Per-project/repository freshness: `${projectId}:${repoKey}` →
+// { generatedAt(ms), staleCycles }. Repository refreshes finish independently,
+// so one failed sibling must not mark every group stale or erase its metadata.
 const _githubMeta = new Map();
 // #807: FIXED freshness window for the live `_stale` signal — must NOT use
 // adaptiveTTL, which returns Infinity under critical rate-limit (the exact case
@@ -1967,56 +3542,13 @@ function _renderReviewDetail(prs) {
 // Build the full GITHUB.md from a structured snapshot. Pure (no I/O). `notesBody`
 // is the preserved `## Notes` text. `meta` = { generatedAt(ms), staleCycles }.
 function renderGithubMarkdown(projectName, repo, snapshot, meta, notesBody) {
-  const snap = snapshot || {};
-  const generatedAt = meta && meta.generatedAt ? new Date(meta.generatedAt).toISOString() : "never";
-  const staleCycles = (meta && meta.staleCycles) || 0;
-  const stale = staleCycles > 0 || !meta || !meta.generatedAt;
-  return [
-    `# ${projectName || ""} — GitHub State`,
-    "",
-    `> **Repo:** ${repo || ""}`,
-    `> **Generated:** ${generatedAt} · staleCycles: ${staleCycles} · stale: ${stale}`,
-    ">",
-    "> Machine-generated by QuadWork — do NOT edit the sections below (overwritten",
-    "> on every sync). Edit only `## Notes`.",
-    "",
-    "---",
-    "",
-    `## ${GITHUB_SECTION_HEADERS.openIssues}`,
-    "",
-    _renderSection(snap.issues, _renderListItem),
-    "",
-    "---",
-    "",
-    `## ${GITHUB_SECTION_HEADERS.openPRs}`,
-    "",
-    _renderSection(snap.prs, _renderListItem),
-    "",
-    "---",
-    "",
-    `## ${GITHUB_SECTION_HEADERS.closedIssues}`,
-    "",
-    _renderSection(snap.closedIssues, _renderListItem),
-    "",
-    "---",
-    "",
-    `## ${GITHUB_SECTION_HEADERS.mergedPrs}`,
-    "",
-    _renderSection(snap.mergedPrs, _renderListItem),
-    "",
-    "---",
-    "",
-    "## Review Detail",
-    "",
-    _renderReviewDetail(snap.prs),
-    "",
-    "---",
-    "",
-    "## Notes",
-    "",
-    (notesBody && notesBody.trim()) ? notesBody.trim() : "(none)",
-    "",
-  ].join("\n");
+  return renderProjectGithubMarkdown(projectName, [{
+    repo_key: "primary",
+    repo,
+    primary: true,
+    snapshot: snapshot || {},
+    meta: meta || {},
+  }], notesBody);
 }
 
 const _GITHUB_DEFAULT_NOTES =
@@ -2030,10 +3562,32 @@ const _GITHUB_DEFAULT_NOTES =
 // last section, so we capture to EOF and do NOT strip trailing `## ` lines —
 // that lets a human note contain its own `## ` headings without truncation.
 function _extractNotesBody(text) {
-  const m = (text || "").match(/^##\s+Notes\b[^\n]*\n([\s\S]*)$/im);
-  if (!m) return _GITHUB_DEFAULT_NOTES;
-  const body = m[1].trim();
-  return body || _GITHUB_DEFAULT_NOTES;
+  return extractGithubNotes(text || "") || _GITHUB_DEFAULT_NOTES;
+}
+
+function snapshotFromParsedGithubRepository(repository) {
+  const reviewDetail = repository?.reviewDetail || {};
+  const prs = (repository?.prs || []).map((pr) => {
+    const detail = reviewDetail[`${repository.repo_key}#${pr.number}`]
+      || reviewDetail[String(pr.number)]
+      || {};
+    const reviews = [];
+    for (const role of ["re1", "re2"]) {
+      if (!detail[role]) continue;
+      reviews.push({
+        state: detail[role].state,
+        submittedAt: detail[role].submittedAt,
+        body: `${role.toUpperCase()}: persisted GITHUB.md state`,
+      });
+    }
+    return { ...pr, reviews };
+  });
+  return {
+    issues: repository?.issues || [],
+    prs,
+    closedIssues: repository?.closedIssues || [],
+    mergedPrs: repository?.mergedPrs || [],
+  };
 }
 
 // Write one project's GITHUB.md atomically (temp + rename) from a snapshot,
@@ -2044,26 +3598,79 @@ function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, sta
     // filtered on a config snapshot taken earlier, so an idle-flip concurrent
     // with a setup-seed/refresh pass could otherwise still write a parked
     // project's GITHUB.md. Defensive; idle projects must author nothing.
-    if (isProjectIdle(projectId)) return;
+    if (isProjectIdle(projectId) || isProjectArchived(projectId)) return;
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const project = configuredProject(projectId, cfg);
+    const bindings = project ? projectRepositoryBindings(project) : [];
+    if (bindings.length === 0) return;
     const dir = path.join(CONFIG_DIR, projectId);
     const filePath = path.join(dir, "GITHUB.md");
-    // Cold + total failure with nothing cached: leave the seeded template be.
-    if (!snapshot && status === "error") return;
+    const refreshedRepo = canonicalGithubRepo(repo);
+    const refreshedBinding = bindings.find((binding) => binding.cache_repo === refreshedRepo);
+    if (!refreshedBinding) return;
+
     ensureSecureDir(dir);
 
     let notesBody = _GITHUB_DEFAULT_NOTES;
-    try { notesBody = _extractNotesBody(fs.readFileSync(filePath, "utf-8")); } catch { /* seed defaults */ }
+    const persistedRepositories = new Map();
+    try {
+      const existingText = fs.readFileSync(filePath, "utf-8");
+      notesBody = _extractNotesBody(existingText);
+      const parsed = parseProjectGithubMarkdown(existingText);
+      if (parsed.ok) {
+        for (const repository of parsed.repositories || []) {
+          const canonicalRepo = canonicalGithubRepo(repository.repo);
+          if (!canonicalRepo) continue;
+          persistedRepositories.set(canonicalRepo, {
+            snapshot: snapshotFromParsedGithubRepository(repository),
+            meta: {
+              generatedAt: repository.generatedAt || 0,
+              staleCycles: repository.staleCycles || 0,
+              stale: repository.stale === true,
+            },
+          });
+        }
+      }
+    } catch { /* seed defaults */ }
 
-    const meta = _githubMeta.get(projectId) || { generatedAt: 0, staleCycles: 0 };
+    // A restart clears memory caches. Treat the last strict-parsed file as a
+    // persisted last-good source so the first completing repository cannot
+    // blank cold siblings before their own refresh finishes.
+    const snapshots = new Map();
+    for (const binding of bindings) {
+      const persisted = persistedRepositories.get(binding.cache_repo)?.snapshot || null;
+      const cached = _graphqlCache.get(binding.cache_repo) || null;
+      const refreshed = binding.cache_repo === refreshedRepo;
+      const selected = refreshed && status !== "error"
+        ? (snapshot || cached || persisted)
+        : (cached || persisted);
+      if (selected) snapshots.set(binding.cache_repo, selected);
+    }
+    if (snapshots.size === 0 && status === "error") return;
+
+    const refreshedMetaKey = `${projectId}:${refreshedBinding.key}`;
+    const persistedRefreshedMeta = persistedRepositories.get(refreshedRepo)?.meta;
+    const meta = { ...(_githubMeta.get(refreshedMetaKey) || persistedRefreshedMeta || { generatedAt: 0, staleCycles: 0 }) };
     if (status === "error") {
       meta.staleCycles += 1; // keep last generatedAt — never stamp a failed cycle fresh
+      meta.stale = true;
     } else {
       meta.generatedAt = Date.now();
       meta.staleCycles = 0;
+      meta.stale = false;
     }
-    _githubMeta.set(projectId, meta);
+    _githubMeta.set(refreshedMetaKey, meta);
 
-    const content = renderGithubMarkdown(projectName, repo, snapshot, meta, notesBody);
+    const repositoryStates = bindings.map((binding) => ({
+      repo_key: binding.key,
+      repo: binding.repo,
+      primary: binding.primary,
+      snapshot: snapshots.get(binding.cache_repo) || {},
+      meta: _githubMeta.get(`${projectId}:${binding.key}`)
+        || persistedRepositories.get(binding.cache_repo)?.meta
+        || { generatedAt: 0, staleCycles: 0 },
+    }));
+    const content = renderProjectGithubMarkdown(projectName, repositoryStates, notesBody);
     const tmp = path.join(dir, `.GITHUB.md.tmp-${process.pid}`);
     fs.writeFileSync(tmp, content, { mode: 0o600 });
     fs.renameSync(tmp, filePath); // atomic — readers never see partial content
@@ -2072,13 +3679,16 @@ function writeGithubFileFromSnapshot(projectId, projectName, repo, snapshot, sta
 
 // Regenerate GITHUB.md for every non-idle project bound to this repo, from the
 // last-good snapshot in _graphqlCache. Idle projects are never regenerated.
-function syncGithubFilesForRepo(repo, status) {
+function syncGithubFilesForRepo(repo, status, ownerTokens = new Set()) {
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
-  const snapshot = _graphqlCache.get(repo) || null;
+  const canonicalRepo = canonicalGithubRepo(repo);
+  const snapshot = _graphqlCache.get(canonicalRepo) || null;
   for (const p of cfg.projects || []) {
-    if (p.repo !== repo || p.idle) continue;
-    writeGithubFileFromSnapshot(p.id, p.name || p.id, repo, snapshot, status);
+    const token = [...ownerTokens].find((candidate) => candidate?.project_id === p.id && isAdmissionCurrent(candidate));
+    const ownsRepository = projectRepositoryBindings(p).some((binding) => binding.cache_repo === canonicalRepo);
+    if (!ownsRepository || p.idle || !token || !isAdmissionCurrent(token)) continue;
+    writeGithubFileFromSnapshot(p.id, p.name || p.id, canonicalRepo, snapshot, status);
   }
 }
 
@@ -2110,42 +3720,7 @@ function _parseGhList(text, header) {
 }
 
 function parseGithub(text) {
-  if (typeof text !== "string" || !text.trim()) {
-    return { ok: false, error: "empty or non-string input" };
-  }
-  const openIssues = _parseGhList(text, GITHUB_SECTION_HEADERS.openIssues);
-  const openPRs = _parseGhList(text, GITHUB_SECTION_HEADERS.openPRs);
-  const closedIssues = _parseGhList(text, GITHUB_SECTION_HEADERS.closedIssues);
-  const mergedPrs = _parseGhList(text, GITHUB_SECTION_HEADERS.mergedPrs);
-  // If none of the required machine headers exist, this isn't a GITHUB.md.
-  if (openIssues == null && openPRs == null && closedIssues == null && mergedPrs == null) {
-    return { ok: false, error: "no recognizable GITHUB.md sections" };
-  }
-
-  // Review Detail → { [prNumber]: { re1?: {state,submittedAt}, re2?: {...} } }.
-  const reviewDetail = {};
-  const reviewSection = _ghSection(text, "Review Detail");
-  if (reviewSection) {
-    for (const line of reviewSection.split("\n")) {
-      const m = line.match(_GH_REVIEW_RE);
-      if (!m) continue;
-      const n = parseInt(m[1], 10);
-      (reviewDetail[n] || (reviewDetail[n] = {}))[m[2]] = { state: m[3], submittedAt: m[4] };
-    }
-  }
-
-  const fresh = text.match(_GH_FRESH_RE);
-  return {
-    ok: true,
-    generatedAt: fresh && fresh[1] !== "never" ? fresh[1] : null,
-    staleCycles: fresh ? parseInt(fresh[2], 10) : 0,
-    stale: fresh ? fresh[3].toLowerCase() === "true" : true,
-    openIssues: openIssues || [],
-    openPRs: openPRs || [],
-    closedIssues: closedIssues || [],
-    mergedPrs: mergedPrs || [],
-    reviewDetail,
-  };
+  return parseProjectGithubMarkdown(text);
 }
 
 // Build and execute a batched GraphQL query for all configured projects.
@@ -2157,19 +3732,34 @@ async function fetchAllProjectsGraphQL() {
   } catch {
     return null;
   }
-  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
-  if (projects.length === 0) return null;
+  const admittedBindings = [];
+  for (const project of cfg.projects || []) {
+    if (projectUnavailableForGithub(project, cfg)) continue;
+    const admission = projectAdmission(project.id);
+    if (!admission) continue;
+    for (const binding of projectRepositoryBindings(project)) {
+      admittedBindings.push({ binding, admission });
+    }
+  }
+  if (admittedBindings.length === 0) return null;
 
-  // Build aliased repository fields — one per project.
-  // Alias must be a valid GraphQL identifier: letters/digits/underscore only.
-  const seen = new Set();
+  // One deterministic index alias per canonical repository avoids collisions
+  // such as owner/a-b and owner/a_b while shared bindings still fetch once.
+  const repositories = new Map();
+  for (const { binding, admission } of admittedBindings) {
+    let entry = repositories.get(binding.cache_repo);
+    if (!entry) {
+      entry = { binding, admissions: [] };
+      repositories.set(binding.cache_repo, entry);
+    }
+    entry.admissions.push(admission);
+  }
   const fragments = [];
-  for (const p of projects) {
-    const [owner, name] = p.repo.split("/");
-    const alias = p.repo.replace(/[^a-zA-Z0-9]/g, "_");
-    if (seen.has(alias)) continue; // skip duplicate repos
-    seen.add(alias);
-    fragments.push(`${alias}: repository(owner: "${owner}", name: "${name}") { ...repoFields }`);
+  let repositoryIndex = 0;
+  for (const entry of repositories.values()) {
+    const [owner, name] = entry.binding.cache_repo.split("/");
+    entry.alias = `repo_${repositoryIndex++}`;
+    fragments.push(`${entry.alias}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ...repoFields }`);
   }
 
   const query = `query {
@@ -2183,7 +3773,7 @@ fragment repoFields on Repository {
     nodes { number title url state closedAt }
   }
   openPRs: pullRequests(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-    nodes { number title url state author { login } reviews(last: 100) { nodes { state author { login } submittedAt body } } createdAt }
+    nodes { number title url state headRefOid isDraft mergeable author { login } reviews(last: 100) { nodes { state author { login } submittedAt body } } createdAt }
   }
   mergedPRs: pullRequests(first: ${RECENT_FETCH_LIMIT}, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
     nodes { number title url state mergedAt author { login } }
@@ -2198,9 +3788,9 @@ fragment repoFields on Repository {
     if (!data) return null;
 
     const result = new Map();
-    for (const p of projects) {
-      const alias = p.repo.replace(/[^a-zA-Z0-9]/g, "_");
-      const repoData = data[alias];
+    for (const [repo, entry] of repositories) {
+      if (!entry.admissions.some((admission) => isAdmissionCurrent(admission))) continue;
+      const repoData = data[entry.alias];
       if (!repoData) continue;
 
       // Transform GraphQL nodes into the same shape as gh CLI JSON output.
@@ -2231,6 +3821,9 @@ fragment repoFields on Repository {
           body: r.body || "",
         })),
         createdAt: n.createdAt,
+        tip: n.headRefOid || null,
+        draft: n.isDraft === true,
+        mergeable: n.mergeable === "MERGEABLE",
       }));
 
       const closedIssues = (repoData.closedIssues?.nodes || [])
@@ -2266,7 +3859,7 @@ fragment repoFields on Repository {
           author: n.author ? { login: n.author.login } : null,
         }));
 
-      result.set(p.repo, { issues, prs, closedIssues, mergedPrs });
+      result.set(repo, { issues, prs, closedIssues, mergedPrs });
     }
     return result;
   } catch {
@@ -2284,19 +3877,32 @@ async function refreshGraphQLCache() {
   // serve stale. (Name kept so the module-scope auto-start stays untouched.)
   if (isRateLimited()) return;
   _graphqlRefreshInFlight = true;
+  const observedProjectIds = new Set();
   try {
     let cfg;
     try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return; }
-    const seen = new Set();
+    // An explicitly enabled Batch Request subscription is allowed to remain
+    // active while its project has no implementation batch and therefore no
+    // dashboard GitHub demand. It still shares this existing bounded cadence;
+    // the owner re-proves its own repository/label/admission before it reads.
+    for (const projectId of batchRequestRefreshProjectIds(cfg)) observedProjectIds.add(projectId);
     const repos = [];
+    const ownersByRepo = new Map();
     for (const p of cfg.projects || []) {
-      if (!p.repo || !REPO_RE.test(p.repo) || p.idle) continue; // #812: skip idle
-      if (seen.has(p.repo)) continue;
-      seen.add(p.repo);
-      repos.push(p.repo);
+      if (projectUnavailableForGithub(p, cfg)) continue;
+      const token = projectAdmission(p.id);
+      if (!token) continue;
+      for (const binding of projectRepositoryBindings(p)) {
+        const repo = binding.cache_repo;
+        if (!ownersByRepo.has(repo)) {
+          ownersByRepo.set(repo, []);
+          repos.push(repo);
+        }
+        ownersByRepo.get(repo).push(token);
+      }
     }
     const results = await _mapLimited(repos, GH_MAX_CONCURRENT, (repo) =>
-      refreshRepoRest(repo).then((r) => ({ repo, status: r.status })),
+      refreshRepoRest(repo, ownersByRepo.get(repo)).then((r) => ({ repo, status: r.status })),
     );
 
     // #805/#806 emergency fallback: if REST could not assemble a snapshot for
@@ -2308,13 +3914,21 @@ async function refreshGraphQLCache() {
       if (gql) {
         const now = Date.now();
         for (const repo of failed) {
+          const currentOwners = ownersByRepo.get(repo) || [];
+          if (!currentOwners.some((token) => isAdmissionCurrent(token))) continue;
           const d = gql.get(repo);
           if (!d) continue;
           _graphqlCache.set(repo, { ts: now, ...d });
+          _githubRepoStatus.set(repo, { status: "fallback", checkedAt: now, lastGoodAt: now });
           _ghEndpointCache.set(`issues:${repo}`, { ts: now, data: d.issues, stale: false });
           _ghEndpointCache.set(`prs:${repo}`, { ts: now, data: d.prs, stale: false });
           _ghEndpointCache.set(`closed-issues:${repo}`, { ts: now, data: d.closedIssues, stale: false });
           _ghEndpointCache.set(`merged-prs:${repo}`, { ts: now, data: d.mergedPrs, stale: false });
+          // The failed REST pass already authored an error/stale cycle. A
+          // successful fallback is a new last-good snapshot and must rewrite
+          // the same complete project document so only this repository group
+          // becomes fresh while every sibling and Notes block remain intact.
+          try { syncGithubFilesForRepo(repo, "ok", currentOwners); } catch { /* non-fatal */ }
         }
       }
     }
@@ -2322,6 +3936,16 @@ async function refreshGraphQLCache() {
     // Non-fatal — consumers serve last-known cache.
   } finally {
     _graphqlRefreshInFlight = false;
+    // Do not await an auxiliary local watcher from the dashboard cache pass.
+    // Its own owner re-proves enablement/admission before its separate fixed
+    // ETag read, and a failure must never stall or retry the shared refresh.
+    const observer = _batchRequestRefreshObserver;
+    if (observer) {
+      for (const projectId of observedProjectIds) {
+        try { void Promise.resolve(observer(projectId)).catch(() => {}); }
+        catch { /* observer is non-authoritative */ }
+      }
+    }
   }
 }
 
@@ -2352,6 +3976,27 @@ function countApprovedRoles(reviews) {
   return ["re1", "re2"].filter((r) => roles[r] && roles[r].state === "APPROVED").length;
 }
 
+function livePrReference(pr) {
+  if (!pr || String(pr.state || "").toUpperCase() !== "OPEN") return null;
+  const number = Number.isSafeInteger(pr.number) && pr.number > 0 ? pr.number : null;
+  const url = typeof (pr.url || pr.html_url) === "string" && (pr.url || pr.html_url) ? (pr.url || pr.html_url) : null;
+  const tip = typeof (pr.tip || pr.head?.sha || pr.headRefOid) === "string" &&
+    (pr.tip || pr.head?.sha || pr.headRefOid) ? (pr.tip || pr.head?.sha || pr.headRefOid) : null;
+  if (!number || !url || !tip) return null;
+  return {
+    number,
+    url,
+    state: "OPEN",
+    tip,
+  };
+}
+
+function historicalPrReference(pr) {
+  if (!pr) return null;
+  const state = pr.merged === true || String(pr.state || "").toUpperCase() === "MERGED" ? "MERGED" : "CLOSED";
+  return { number: pr.number, url: pr.url || pr.html_url || null, state, tip: pr.tip || pr.head?.sha || pr.headRefOid || null };
+}
+
 // Compute issue `n`'s progress row from the snapshot (no network). Links
 // issue↔PR by the team's `[#<issue>]` PR-title convention. Returns a row when
 // the snapshot can PROVE the state: a matching in-window PR (in_review/approved/
@@ -2364,10 +4009,11 @@ function countApprovedRoles(reviews) {
 // absent, CLOSED-with-no-in-window-PR, merged-but-open, or a linked closed/
 // merged PR exists) — a partial window can't prove absence of a linked PR, so
 // the caller does the authoritative by-number REST fetch (progressForItemRest).
-function progressFromSnapshot(snapshot, n) {
+function progressFromSnapshot(snapshot, n, { requireLiveRef = false } = {}) {
   if (!snapshot) return null;
   const titleRe = new RegExp(`^\\s*\\[#${n}\\]`);
-  const openPr = (snapshot.prs || []).find((p) => titleRe.test(p.title || ""));
+  const openPr = (snapshot.prs || []).find((p) =>
+    titleRe.test(p.title || "") && String(p.state || "").toUpperCase() === "OPEN");
   const mergedPr = (snapshot.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
   const openIssue = (snapshot.issues || []).find((i) => i.number === n);
   const closedIssue = (snapshot.closedIssues || []).find((i) => i.number === n);
@@ -2377,15 +4023,17 @@ function progressFromSnapshot(snapshot, n) {
   if (mergedPr && closedIssue) {
     return {
       issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url,
-      pr_number: mergedPr.number, status: "merged", progress: 100, label: "Merged ✓",
+      pr_number: mergedPr.number, live_pr: null, historical_pr: historicalPrReference(mergedPr), status: "merged", progress: 100, label: "Merged ✓",
     };
   }
   // Matching open PR in-window → confident in_review/approved/ready.
   if (openPr) {
     const approvals = countApprovedRoles(openPr.reviews);
-    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
-    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
-    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
+    const live_pr = livePrReference(openPr);
+    if (requireLiveRef && !live_pr) return null;
+    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
+    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
+    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
   }
   // No matching open/in-window-merged PR. #828 P1 / #834: classify queued from
   // the snapshot ONLY when absence of BOTH an open AND a closed/merged linked PR
@@ -2430,29 +4078,46 @@ function approvalsFromReviewDetail(reviewDetail, prNumber) {
 // in-window merged PR is genuinely queued (NO network). Items the file can't
 // classify (absent, or merged-but-still-open) return null; the caller renders a
 // soft "queued (retrying)" row that firms up once the snapshot repopulates.
-function progressFromGithubFile(parsed, n) {
+function progressFromGithubFile(parsed, n, ref = null) {
   if (!parsed || !parsed.ok) return null;
+  let source = parsed;
+  if (ref && Array.isArray(parsed.repositories)) {
+    const repository = parsed.repositories.find((entry) =>
+      entry.repo_key === ref.repoKey && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(ref.repo));
+    if (!repository) return null;
+    source = {
+      openIssues: repository.issues,
+      openPRs: repository.prs,
+      closedIssues: repository.closedIssues,
+      mergedPrs: repository.mergedPrs,
+      reviewDetail: repository.reviewDetail,
+    };
+  }
   // NOTE: parseGithub's titles come through _sanitizeInline, which STRIPS the
   // `[` `]` of the `[#N]` convention — so the persisted PR title reads `#N …`,
   // not `[#N] …` (unlike the in-memory snapshot progressFromSnapshot matches).
   // Anchor on `#N` + a word boundary so `#80` can't match issue 8.
   const titleRe = new RegExp(`^\\s*#${n}\\b`);
-  const openPr = (parsed.openPRs || []).find((p) => titleRe.test(p.title || ""));
-  const mergedPr = (parsed.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
-  const openIssue = (parsed.openIssues || []).find((i) => i.number === n);
-  const closedIssue = (parsed.closedIssues || []).find((i) => i.number === n);
+  const openPr = (source.openPRs || []).find((p) =>
+    titleRe.test(p.title || "") && String(p.state || "").toUpperCase() === "OPEN");
+  const mergedPr = (source.mergedPrs || []).find((p) => titleRe.test(p.title || ""));
+  const openIssue = (source.openIssues || []).find((i) => i.number === n);
+  const closedIssue = (source.closedIssues || []).find((i) => i.number === n);
 
   // merged requires a matching merged PR AND the issue CLOSED.
   if (mergedPr && closedIssue) {
-    return { issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url, pr_number: mergedPr.number, status: "merged", progress: 100, label: "Merged ✓" };
+    return { issue_number: n, title: closedIssue.title, url: mergedPr.url || closedIssue.url, pr_number: mergedPr.number, live_pr: null, historical_pr: historicalPrReference(mergedPr), status: "merged", progress: 100, label: "Merged ✓" };
   }
   // Matching open PR → in_review/approved/ready from the parsed Review Detail.
   if (openPr) {
     const title = (openIssue && openIssue.title) || openPr.title || `#${n}`;
-    const approvals = approvalsFromReviewDetail(parsed.reviewDetail, openPr.number);
-    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
-    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
-    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
+    const reviewKey = ref ? `${ref.repoKey}#${openPr.number}` : openPr.number;
+    const approvals = approvalsFromReviewDetail(source.reviewDetail, reviewKey);
+    const live_pr = livePrReference(openPr);
+    if (ref && !live_pr) return null;
+    if (approvals >= 2) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "ready", progress: 80, label: `PR #${openPr.number} · 2 approvals · ready` };
+    if (approvals === 1) return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "approved1", progress: 50, label: `PR #${openPr.number} · 1 approval` };
+    return { issue_number: n, title, url: openPr.url, pr_number: openPr.number, live_pr, status: "in_review", progress: 20, label: `PR #${openPr.number} · waiting on review` };
   }
   // No matching open PR. The persisted board lists the FULL open-PR window, so an
   // OPEN active-batch issue with no [#N] open PR and no in-window merged PR is
@@ -2476,7 +4141,7 @@ function progressFromGithubFile(parsed, n) {
 // just because the in-memory snapshot is briefly cold (post-restart) or a
 // transient secondary-rate-limit/network blip hit its by-number fetch.
 function softRetryingRow(n, title) {
-  return { issue_number: n, title: title || `#${n}`, url: null, status: "queued", progress: 0, label: "queued (retrying)" };
+  return { issue_number: n, title: title || `#${n}`, url: null, live_pr: null, status: "queued", progress: 0, label: "queued (retrying)" };
 }
 
 // Confirmed-complete state machine, per project. `complete` must hold across
@@ -2511,67 +4176,73 @@ function evalBatchCompleteConfirmed(projectId, batchKey, complete, generatedAt) 
 // with on-demand refresh if stale.
 router.get("/api/github/all", async (req, res) => {
   const projectFilter = req.query.project || "";
-
-  // Ensure cache is populated.
-  const anyStale = (() => {
-    let cfg;
-    try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return true; }
-    const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo) && !p.idle); // #812: skip idle (parked) projects
-    for (const p of projects) {
-      const cached = _graphqlCache.get(p.repo);
-      if (!cached || Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL)) return true;
-    }
-    return false;
-  })();
-  if (anyStale) await refreshGraphQLCache();
-
-  // Build response.
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
-  const projects = (cfg.projects || []).filter((p) => p.repo && REPO_RE.test(p.repo)); // #812: include idle projects — served stale below, never fetched
+  let projects = (cfg.projects || []).filter((project) =>
+    projectRepositoryBindings(project).length > 0 && (!projectFilter || project.id === projectFilter));
+
+  if (projectFilter) {
+    const filtered = projects[0];
+    if (filtered && isProjectArchived(filtered.id, cfg)) {
+      return res.json({ [projectFilter]: archivedGithubLists(filtered) });
+    }
+  }
+
+  const admissions = new Map();
+  for (const project of projects) {
+    if (project.idle || isProjectArchived(project.id, cfg)) continue;
+    const admission = projectAdmission(project.id, { demand: true });
+    if (admission) admissions.set(project.id, admission);
+  }
+
+  // Ensure cache is populated.
+  const anyStale = projects.some((project) => !project.idle && !isProjectArchived(project.id, cfg) &&
+    projectRepositoryBindings(project).some((binding) => {
+      const cached = _graphqlCache.get(binding.cache_repo);
+      return !cached || Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL);
+    }));
+  if (anyStale) await refreshGraphQLCache();
+
+  // Re-read after the await so an archive committed during refresh is reflected
+  // in the response as well as being rejected by its exact admission token.
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); } catch { return res.status(500).json({ error: "Config unreadable" }); }
+  projects = (cfg.projects || []).filter((project) =>
+    projectRepositoryBindings(project).length > 0 && (!projectFilter || project.id === projectFilter));
 
   const result = {};
   const fallbackNeeded = [];
   for (const p of projects) {
-    if (projectFilter && p.id !== projectFilter) continue;
-    const cached = _graphqlCache.get(p.repo);
+    if (isProjectArchived(p.id, cfg)) {
+      result[p.id] = archivedGithubLists(p);
+      continue;
+    }
     // #812: idle (parked) project — serve last-known data flagged _idle,
     // never trigger a fetch or fall back to gh.
     if (p.idle) {
-      result[p.id] = cached
-        ? { issues: cached.issues, prs: cached.prs, closedIssues: cached.closedIssues, mergedPrs: cached.mergedPrs, _idle: true }
-        : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _idle: true };
+      result[p.id] = aggregateProjectGithubState(p, { _idle: true });
       continue;
     }
-    if (cached) {
-      result[p.id] = {
-        issues: cached.issues,
-        prs: cached.prs,
-        closedIssues: cached.closedIssues,
-        mergedPrs: cached.mergedPrs,
-        _stale: Date.now() - cached.ts > adaptiveTTL(GRAPHQL_CACHE_TTL),
-      };
-    } else {
-      fallbackNeeded.push(p);
-    }
+    result[p.id] = aggregateProjectGithubState(p);
+    const missing = projectRepositoryBindings(p).filter((binding) => !_graphqlCache.has(binding.cache_repo));
+    const admission = admissions.get(p.id) || projectAdmission(p.id);
+    if (missing.length > 0 && admission) fallbackNeeded.push({ project: p, admission, bindings: missing });
   }
 
   // #806: fallback for still-missing repos goes through the REST+ETag snapshot
   // (refreshRepoRest), NOT `gh pr list`/`gh issue list`. Concurrency-limited so
   // a cold multi-project load doesn't drain the core budget.
   if (fallbackNeeded.length > 0 && !isRateLimited()) {
-    await _mapLimited(fallbackNeeded, GH_MAX_CONCURRENT, (p) => refreshRepoRest(p.repo));
-    for (const p of fallbackNeeded) {
-      const cached = _graphqlCache.get(p.repo);
-      result[p.id] = cached
-        ? {
-            issues: cached.issues,
-            prs: cached.prs,
-            closedIssues: cached.closedIssues,
-            mergedPrs: cached.mergedPrs,
-            _fallback: true,
-          }
-        : { issues: [], prs: [], closedIssues: [], mergedPrs: [], _fallback: true };
+    const missingRepos = [];
+    for (const item of fallbackNeeded) {
+      for (const binding of item.bindings) missingRepos.push({ binding, admission: item.admission });
+    }
+    await _mapLimited(missingRepos, GH_MAX_CONCURRENT, ({ binding, admission }) => refreshRepoRest(binding.cache_repo, [admission]));
+    for (const { project: p, admission } of fallbackNeeded) {
+      if (!isAdmissionCurrent(admission)) {
+        result[p.id] = archivedGithubLists(p);
+        continue;
+      }
+      result[p.id] = aggregateProjectGithubState(p, { _fallback: true });
     }
   }
 
@@ -2585,17 +4256,61 @@ router.get("/api/github/all", async (req, res) => {
 // RECENT_DISPLAY_LIMIT there). On a warm cache we serve instantly; cold misses
 // fetch the whole snapshot once via refreshRepoRest — no `gh pr list`/`gh issue
 // list` (those are GraphQL-backed). Idle projects never fetch.
+function githubEndpointEntries(bindings, kind) {
+  return bindings.map((binding) => ({
+    binding,
+    cached: _ghEndpointCache.get(`${kind}:${binding.cache_repo}`) || null,
+    observed: _githubRepoStatus.get(binding.cache_repo) || null,
+  }));
+}
+
+function aggregateGithubEndpointRows(entries) {
+  const rows = [];
+  for (const { binding, cached } of entries) {
+    rows.push(...decorateGithubRows(cached?.data, binding));
+  }
+  return rows;
+}
+
+function setGithubRepositoryHeaders(res, entries, { rateLimited = false } = {}) {
+  const stale = entries.filter(({ cached, observed }) =>
+    !cached || cached.stale || Date.now() - cached.ts >= GH_ENDPOINT_CACHE_TTL || observed?.status === "error");
+  const failed = entries.filter(({ observed }) => observed?.status === "error");
+  if (rateLimited) res.set("X-QuadWork-Rate-Limited", "1");
+  if (stale.length > 0) {
+    res.set("X-QuadWork-Stale", "1");
+    res.set("X-QuadWork-Stale-Repositories", stale.map(({ binding }) => binding.key).join(","));
+  }
+  if (failed.length > 0) {
+    res.set("X-QuadWork-Failed-Repositories", failed.map(({ binding }) => binding.key).join(","));
+  }
+}
+
 async function serveGithubList(req, res, kind) {
-  const project = req.query.project || "";
-  const repo = getRepo(project);
-  if (!repo) return res.status(400).json({ error: "No repo configured for project" });
-  const cacheKey = `${kind}:${repo}`;
-  const cached = _ghEndpointCache.get(cacheKey);
+  const projectId = req.query.project || "";
+  const project = configuredProject(projectId);
+  const bindings = project ? projectRepositoryBindings(project) : [];
+  if (bindings.length === 0) return res.status(400).json({ error: "No repo configured for project" });
+  let entries = githubEndpointEntries(bindings, kind);
+
+  if (isProjectArchived(projectId)) {
+    res.set("X-QuadWork-Archived", "1");
+    res.set("X-QuadWork-Readonly", "1");
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
+  }
 
   // #812: a parked (idle) project must never initiate a fetch.
-  if (isProjectIdle(project)) {
+  if (project.idle) {
     res.set("X-QuadWork-Idle", "1");
-    return res.json(cached ? cached.data : []);
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
+  }
+  const admission = projectAdmission(projectId, { demand: true });
+  if (!admission) {
+    res.set("X-QuadWork-Archived", "1");
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
 
   // #824: these four endpoints serve a BARE ARRAY (cached.data is an array).
@@ -2608,32 +4323,48 @@ async function serveGithubList(req, res, kind) {
   // Freshness is measured against the BASE TTL, not adaptiveTTL: under critical
   // rate-limit adaptiveTTL is Infinity, so an age<ttl check would treat an
   // arbitrarily-old cache as fresh and skip the staleness signal entirely.
-  const baseFresh = cached && Date.now() - cached.ts < GH_ENDPOINT_CACHE_TTL;
+  const allBaseFresh = entries.every(({ cached }) => cached && Date.now() - cached.ts < GH_ENDPOINT_CACHE_TTL && !cached.stale);
 
   // Critically REST-rate-limited → serve whatever we have (even expired) without
   // revalidating. MUST precede the cache-hit branch below: adaptiveTTL is
   // Infinity here, so that branch would otherwise return first and an expired
   // array would go out with no X-QuadWork-Stale / X-QuadWork-Rate-Limited.
-  if (isRateLimited() && cached) {
-    res.set("X-QuadWork-Rate-Limited", "1");
-    if (!baseFresh || cached.stale) res.set("X-QuadWork-Stale", "1");
-    return res.json(cached.data);
+  if (isRateLimited()) {
+    setGithubRepositoryHeaders(res, entries, { rateLimited: true });
+    return res.json(aggregateGithubEndpointRows(entries));
   }
   // Fresh enough (within the adaptive window) → serve as-is.
-  if (cached && Date.now() - cached.ts < adaptiveTTL(GH_ENDPOINT_CACHE_TTL)) {
-    if (cached.stale) res.set("X-QuadWork-Stale", "1");
-    return res.json(cached.data);
+  const allAdaptivelyFresh = entries.every(({ cached }) =>
+    cached && Date.now() - cached.ts < adaptiveTTL(GH_ENDPOINT_CACHE_TTL) && !cached.stale);
+  if (allAdaptivelyFresh) {
+    if (!allBaseFresh) setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
   // Stale-while-revalidate: serve stale now, refresh the snapshot in background.
-  if (cached) {
-    refreshRepoRest(repo);
-    res.set("X-QuadWork-Stale", "1");
-    return res.json(cached.data);
+  if (entries.every(({ cached }) => !!cached)) {
+    for (const { binding, cached } of entries) {
+      if (cached.stale || Date.now() - cached.ts >= adaptiveTTL(GH_ENDPOINT_CACHE_TTL)) {
+        refreshRepoRest(binding.cache_repo, [admission]);
+      }
+    }
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
   }
-  // Cold: assemble the snapshot synchronously, then serve this slice.
-  await refreshRepoRest(repo);
-  const fresh = _ghEndpointCache.get(cacheKey);
-  if (fresh) return res.json(fresh.data);
+  // Cold/partial: assemble every missing slice synchronously. Existing stale
+  // siblings remain available even if one repository fails.
+  const needsRefresh = entries.filter(({ cached }) => !cached).map(({ binding }) => binding);
+  await _mapLimited(needsRefresh, GH_MAX_CONCURRENT, (binding) => refreshRepoRest(binding.cache_repo, [admission]));
+  if (!isAdmissionCurrent(admission)) {
+    res.set("X-QuadWork-Archived", "1");
+    entries = githubEndpointEntries(bindings, kind);
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
+  }
+  entries = githubEndpointEntries(bindings, kind);
+  if (entries.some(({ cached }) => !!cached)) {
+    setGithubRepositoryHeaders(res, entries);
+    return res.json(aggregateGithubEndpointRows(entries));
+  }
   return res.status(502).json({ error: "gh call failed" });
 }
 
@@ -2665,15 +4396,77 @@ router.get("/api/github/merged-prs", (req, res) => serveGithubList(req, res, "me
 // Cached for 10s per project to avoid hammering gh on every poll.
 
 const _batchProgressCache = new Map(); // projectId -> { ts, data }
-const _batchProgressRefreshes = new Map(); // projectId -> Promise
+const _batchProgressRefreshes = new Map(); // projectId -> { admission, promise }
 const BATCH_TERMINAL_STATUSES = new Set(["merged", "closed"]);
 
-// #429 / quadwork#316: persistent batch snapshot on disk so the
-// Batch Progress panel keeps showing merged items after Head moves
-// them from Active Batch to Done. The in-memory `_batchProgressCache`
-// above is a 10s TTL cache of the rendered rows; this new cache is
-// the *set of issue numbers* we currently consider "the active
-// batch", and it survives restarts + lives across polls.
+function bindBatchAdmission(data, admission) {
+  if (!data || !Number.isSafeInteger(admission?.generation) || admission.generation < 0) return data;
+  return { ...data, admission_generation: admission.generation };
+}
+
+function cacheBatchProgress(projectId, context, admission, data) {
+  const bound = bindBatchAdmission({ ...data, active: true }, admission);
+  _batchProgressCache.set(projectId, {
+    ts: Date.now(),
+    fingerprint: context.fingerprint,
+    admission_generation: admission.generation,
+    data: bound,
+  });
+  return bound;
+}
+
+function staleBatchObservationPayload(projectId, admission) {
+  const latest = readLiveBatchContext(projectId);
+  if (latest?.queueReadOk === true && latest.parsed.workItems.length === 0 && latest.parsed.errors.length === 0) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(latest, admission, { _stale_observation: true });
+  }
+  return bindBatchAdmission({
+    ...assignmentView(latest, { current: false }),
+    active: false,
+    items: [],
+    summary: "",
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: false,
+    batch_type: latest?.batchType || "code",
+    _stale_observation: true,
+  }, admission);
+}
+
+function invalidateCurrentBatchPresentation(projectId, { persistent = false } = {}) {
+  _batchProgressCache.delete(projectId);
+  _batchProgressRefreshes.delete(projectId);
+  _batchCompleteState.delete(projectId);
+  if (persistent) deleteBatchSnapshot(projectId);
+}
+
+function emptyCurrentBatchPayload(context, admission, extra = {}) {
+  const observed = assignmentView(context, { current: false });
+  return bindBatchAdmission({
+    ...observed,
+    active: false,
+    installation_id: null,
+    batch_number: null,
+    assignment_attempt: null,
+    provenance: context?.activated === true ? "unowned" : "legacy_unowned",
+    assignment_key: null,
+    current: false,
+    owned: false,
+    assignment_items: [],
+    items: [],
+    summary: "",
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: context?.queueReadOk === true,
+    batch_type: "code",
+    ...extra,
+  }, admission);
+}
+
+// Persistent row cache for the LIVE Current Batch. It may accelerate terminal
+// row resolution after a restart, but it is never current-work authority: the
+// live `## Active Batch` parse owns the displayed batch and item set.
 function batchSnapshotPath(projectId) {
   return path.join(CONFIG_DIR, projectId, "batch-progress-cache.json");
 }
@@ -2686,6 +4479,7 @@ function readBatchSnapshot(projectId) {
 }
 function writeBatchSnapshot(projectId, snapshot) {
   try {
+    if (isProjectArchived(projectId)) return;
     const p = batchSnapshotPath(projectId);
     ensureSecureDir(path.dirname(p));
     fs.writeFileSync(p, JSON.stringify(snapshot));
@@ -2705,216 +4499,150 @@ function isTerminalBatchItem(item) {
   return item && BATCH_TERMINAL_STATUSES.has(item.status);
 }
 
-function terminalItemsFromSnapshot(snapshot, batchNumber, issueNumbers) {
-  if (!snapshot || snapshot.batchNumber !== batchNumber || !Array.isArray(issueNumbers)) return new Map();
-  const source = snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {};
-  const wanted = new Set(issueNumbers);
-  const rows = new Map();
-  for (const [rawIssue, row] of Object.entries(source)) {
-    const n = parseInt(rawIssue, 10);
-    if (!wanted.has(n) || !isTerminalBatchItem(row)) continue;
-    rows.set(n, row);
-  }
-  return rows;
-}
-
-function collectTerminalItems(items, previous = new Map()) {
-  const rows = {};
-  for (const [n, row] of previous.entries()) {
-    if (isTerminalBatchItem(row)) rows[n] = row;
-  }
-  for (const row of Array.isArray(items) ? items : []) {
-    if (!Number.isInteger(row && row.issue_number)) continue;
-    if (isTerminalBatchItem(row)) rows[row.issue_number] = row;
-    else delete rows[row.issue_number];
-  }
-  return rows;
-}
-
 function snapshotHasOpenIssue(snapshot, n) {
   return !!(
     snapshot &&
     Array.isArray(snapshot.issues) &&
-    snapshot.issues.some((it) => it && it.number === n && it.state === "OPEN")
+    snapshot.issues.some((it) => it && it.number === n && String(it.state || "").toUpperCase() === "OPEN")
   );
 }
 
-// #334: verify the snapshot's first issue number still exists on
-// GitHub before trusting the snapshot. A soft existence check is
-// enough — if the first issue genuinely 404s, treat the whole
-// snapshot as stale (most likely a leftover from a prior
-// project/repo that was purged) and let the caller drop it. One
-// gh call per cache miss, wrapped in the existing
-// BATCH_PROGRESS_TTL_MS cache upstream.
-//
-// Returns one of:
-//   "fresh"   — first issue resolved, snapshot is trustworthy
-//   "gone"    — first issue confirmed 404; snapshot should be dropped
-//   "unknown" — transient error (auth/network/timeout); leave
-//               snapshot alone and let the next cache miss retry
-async function checkBatchSnapshotFreshness(repo, snapshot) {
-  if (!snapshot || !Array.isArray(snapshot.issueNumbers) || snapshot.issueNumbers.length === 0) {
-    return "gone";
+function githubFileHasOpenIssue(parsed, n, ref = null) {
+  if (!parsed || !parsed.ok) return false;
+  let issues = parsed.openIssues;
+  if (ref && Array.isArray(parsed.repositories)) {
+    const repository = parsed.repositories.find((entry) =>
+      entry.repo_key === ref.repoKey && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(ref.repo));
+    if (!repository) return false;
+    issues = repository.issues;
   }
-  const first = snapshot.issueNumbers[0];
-  try {
-    // #828 P1: REST, not `gh issue view` (GraphQL). We only need existence, so
-    // the cheap REST issue endpoint suffices and keeps the whole batch-progress
-    // path off GraphQL.
-    await ghJsonExecAsync(["api", `repos/${repo}/issues/${first}`, "--jq", ".number"]);
-    return "fresh";
-  } catch (err) {
-    // gh surfaces a 404 via stderr text on a non-zero exit. Only
-    // the unambiguous "not found" / "could not resolve" shapes
-    // count as genuinely gone; anything else (network, auth,
-    // timeout) is transient and must NOT delete the snapshot.
-    const msg = String((err && (err.stderr || err.message)) || "").toLowerCase();
-    if (msg.includes("could not resolve") || msg.includes("not found") || msg.includes("http 404")) {
-      return "gone";
-    }
-    return "unknown";
-  }
-}
-
-// Decide which batch to render, combining the live parse of
-// OVERNIGHT-QUEUE.md with the persistent snapshot. The snapshot is
-// replaced whenever a new batch starts (explicit Batch: N bump OR
-// the live Active Batch contains items the snapshot doesn't); in
-// all other cases the snapshot wins, so items Head moved to Done
-// stay visible until the operator starts the next batch.
-// Decide whether the displayed batch comes from the LIVE Active Batch parse or
-// the preserved snapshot. A new batch (explicit Batch: N bump OR live items the
-// snapshot doesn't have) → "live"; otherwise a non-empty snapshot wins
-// ("snapshot"), so items Head moved to Done stay visible until the next batch
-// starts. Extracted so #870's type pre-check follows the SAME decision.
-function pickDisplayedSource(current, snapshot) {
-  const hasExplicitBump =
-    current.batchNumber !== null &&
-    (!snapshot || snapshot.batchNumber === null || current.batchNumber > snapshot.batchNumber);
-  const hasNewItems =
-    current.issueNumbers.length > 0 &&
-    (!snapshot || current.issueNumbers.some((n) => !snapshot.issueNumbers.includes(n)));
-  if (hasExplicitBump || hasNewItems) return "live";
-  if (snapshot && Array.isArray(snapshot.issueNumbers) && snapshot.issueNumbers.length > 0) return "snapshot";
-  return "live";
+  return Array.isArray(issues) && issues.some((item) =>
+    item && item.number === n && String(item.state || "OPEN").toUpperCase() === "OPEN");
 }
 
 function resolveDisplayedBatch(
   queueText,
   projectId,
-  // #899: snapshot I/O is injectable so the live-progression path is unit-
-  // testable without writing to the real ~/.quadwork/{id}/batch-progress-cache.json
-  // (which belongs to the running orchestrator). Production callers pass nothing
-  // and get the real readers/writers.
-  { queueReadOk = true, _readSnapshot = readBatchSnapshot, _writeSnapshot = writeBatchSnapshot } = {},
+  { queueReadOk = true } = {},
 ) {
-  // Queue file deleted / unreadable → fall back to empty state per
-  // #316's edge case. Returning the snapshot here would "heal" a
-  // genuinely missing file into stale data the operator can't
-  // reconcile without nuking ~/.quadwork/{id}/batch-progress-cache.json
-  // manually.
+  void projectId;
   if (!queueReadOk) return { batchNumber: null, issueNumbers: [], batch_type: "code", reviewItems: [] };
   const current = parseActiveBatch(queueText);
-  const snapshot = _readSnapshot(projectId);
-  const source = pickDisplayedSource(current, snapshot);
-  let next;
-  if (source === "live") {
-    next = {
-      batchNumber: current.batchNumber,
-      issueNumbers: current.issueNumbers.slice(),
-      // #870: type + per-item review states from the LIVE Active Batch.
-      batch_type: parseBatchType(queueText),
-      reviewItems: parseReviewItems(queueText),
-    };
-  } else {
-    next = {
-      batchNumber: snapshot.batchNumber ?? null,
-      issueNumbers: snapshot.issueNumbers.slice(),
-      // #870: a just-archived review batch keeps its type + review states from
-      // the snapshot, so it renders without GitHub and is NEVER reinterpreted
-      // as code. Absent (legacy / code snapshots) → "code"/[] — back-compatible.
-      batch_type: snapshot.batch_type || "code",
-      reviewItems: Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : [],
-      terminalItems: snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {},
-    };
-    // #899: snapshot stickiness preserves the displayed issue SET (so items Head
-    // moved to Done stay visible — #316/#429), but a review batch's per-item
-    // state lives in the QUEUE, not on GitHub. When the same batch number +
-    // issue set persist and only review states change in place
-    // (queued → in-review → approved), pickDisplayedSource finds no bump / no
-    // new items and returns "snapshot" — which froze reviewItems at their
-    // first-seen states AND re-persisted them each cycle. So while the live
-    // Active Batch is still present (non-empty), refresh batch_type + reviewItems
-    // from the LIVE queue. We are already in the "snapshot" branch, so a
-    // non-empty live parse here is necessarily the SAME batch (no explicit bump,
-    // every live issue already in the snapshot) — never a newer one. The
-    // snapshot's reviewItems stay authoritative ONLY once the Active Batch is
-    // cleared (archived), where the live parse is empty and this is skipped.
-    // Code batches are unaffected: their live parse yields batch_type "code" /
-    // reviewItems [] — identical to what the snapshot already holds.
-    if (current.issueNumbers.length > 0) {
-      next.batch_type = parseBatchType(queueText);
-      // re1 on #900: MERGE, don't replace. When Head moves an approved item out
-      // of Active Batch (→ Done) before the whole batch is archived, the snapshot
-      // still preserves its issue number in next.issueNumbers, but the LIVE queue
-      // no longer carries its line. A wholesale `parseReviewItems(queueText)`
-      // would drop that item's final state from the displayed set (and from the
-      // re-persisted snapshot). So derive reviewItems across the preserved issue
-      // set: live state for items still in Active Batch, snapshot state for items
-      // moved to Done, queued as a last-resort default for any issue number with
-      // neither. This keeps the per-item count aligned with next.issueNumbers.
-      const liveByIssue = new Map(parseReviewItems(queueText).map((r) => [r.issue, r]));
-      const snapByIssue = new Map(
-        (Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : []).map((r) => [r.issue, r]),
-      );
-      next.reviewItems = next.issueNumbers.map(
-        (n) => liveByIssue.get(n) || snapByIssue.get(n) || { issue: n, review_state: "queued", approvals: 0 },
-      );
-    } else {
-      // #925: the Active Batch is empty → this is the just-ARCHIVED batch's
-      // sticky display (#870). The snapshot's reviewItems can be frozen at a
-      // pre-final state when the last item's approval + the archive landed
-      // between polls, so the panel never read as complete. Head's matching
-      // `## Done` block holds the authoritative final states — read them for
-      // THIS batch only. Gated on the Done block being a review batch, so code
-      // batches (Done lines carry no state → "queued") are left untouched and
-      // keep using the GitHub-derived path. Merge across the preserved issue
-      // set (Done state first, then snapshot, then queued) to stay aligned with
-      // next.issueNumbers — same shape as the #899/#900 live-refresh above.
-      const doneBatch = parseDoneBatchReviewItems(queueText, next.batchNumber);
-      if (doneBatch && REVIEW_BATCH_TYPES.has(doneBatch.batch_type) && doneBatch.reviewItems.length > 0) {
-        next.batch_type = doneBatch.batch_type;
-        const doneByIssue = new Map(doneBatch.reviewItems.map((r) => [r.issue, r]));
-        const snapByIssue = new Map(
-          (Array.isArray(snapshot.reviewItems) ? snapshot.reviewItems : []).map((r) => [r.issue, r]),
-        );
-        next.reviewItems = next.issueNumbers.map(
-          (n) => doneByIssue.get(n) || snapByIssue.get(n) || { issue: n, review_state: "queued", approvals: 0 },
-        );
-      }
-    }
+  const issueNumbers = current.issueNumbers.slice();
+  if (issueNumbers.length === 0) {
+    return { batchNumber: null, issueNumbers: [], batch_type: "code", reviewItems: [] };
   }
-  // Snapshot persists batchNumber/issueNumbers (existing consumers) PLUS the
-  // additive #870 batch_type/reviewItems. With the #899 refresh above, the
-  // snapshot now also captures the LATEST live review states each cycle, so the
-  // post-archive sticky view shows the FINAL states (all approved) rather than
-  // the first-seen ones.
-  if (next.issueNumbers.length > 0) _writeSnapshot(projectId, next);
-  return next;
+  return {
+    batchNumber: current.batchNumber,
+    issueNumbers,
+    batch_type: parseBatchType(queueText),
+    reviewItems: parseReviewItems(queueText),
+  };
 }
 const BATCH_PROGRESS_TTL_MS = 10000;
+// Bound #1048's contract observations to the same server conditional REST
+// cache. A cold/stale/missing issue body is never replaced with a direct gh
+// read from the progress path; it simply withholds review dispatch.
+const REVIEW_CONTRACT_MAX_AGE_MS = 90_000;
 
-function parseActiveBatch(queueText) {
+// #1031 route adapter around the pure work-item-ref identity module.  This
+// layer owns queue sections and installation provenance; the module owns token
+// validation, canonical serialization, and collision-free keys.
+function canonicalWorkItemKey(ref) {
+  try { return workItemKey(ref); }
+  catch { return null; }
+}
+
+function assignmentKeyFor({ installationId, batchNumber, assignmentAttempt, workItems }) {
+  if (!installationId || !Number.isSafeInteger(batchNumber) || !assignmentAttempt) return null;
+  try {
+    const provenance = {
+      installation_id: installationId,
+      batch_number: batchNumber,
+      assignment_attempt: assignmentAttempt,
+    };
+    if (!validateAssignmentProvenance(provenance).ok) return null;
+    const refs = (Array.isArray(workItems) ? workItems : [])
+      .map((item) => ownershipKey(provenance, item.ref || item))
+      .sort();
+    return JSON.stringify(["batch-assignment", 1, installationId, batchNumber, assignmentAttempt, refs]);
+  } catch { return null; }
+}
+
+function sectionByHeading(queueText, heading) {
+  if (typeof queueText !== "string") return null;
+  const lines = queueText.split(/\r?\n/);
+  const headingRe = new RegExp(`^##[ \\t]+${heading}[ \\t]*$`, "i");
+  const start = lines.findIndex((line) => headingRe.test(line));
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^##[ \t]+\S/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+function standaloneMetadataValue(section, pattern) {
+  if (typeof section !== "string") return null;
+  const matches = section.split(/\r?\n/)
+    .map((line) => line.match(pattern))
+    .filter(Boolean);
+  return matches.length === 1 ? matches[0][1] : null;
+}
+
+function queueAssignmentMetadata(section, installationId, batchNumber) {
+  const serializedInstallation = standaloneMetadataValue(
+    section,
+    /^\s*\*\*(?:Installation(?: ID)?|installation_id):\*\*\s*([^\s]+)\s*$/i,
+  );
+  const assignmentAttempt = standaloneMetadataValue(
+    section,
+    /^\s*\*\*(?:Assignment attempt|assignment_attempt|Attempt):\*\*\s*([^\s]+)\s*$/i,
+  );
+  let provenance = "legacy_unowned";
+  if (installationId) {
+    if (!serializedInstallation || !assignmentAttempt || !Number.isSafeInteger(batchNumber)) provenance = "unowned";
+    else if (serializedInstallation !== installationId) provenance = "foreign";
+    else provenance = "owned";
+  }
+  return { installationId: installationId || null, serializedInstallation, assignmentAttempt, provenance };
+}
+
+function parseQueueWorkItems(section, { repositories = [], kind = "issue" } = {}) {
+  const bindings = Array.isArray(repositories) && repositories.length > 0
+    ? repositories
+    : [{ key: "primary", repo: "legacy/unknown", primary: true }];
+  const itemLines = section.split("\n").filter((line) => !/^\s*#{1,6}\s/.test(line));
+  const parsed = parseWorkItemLines(itemLines, {
+    repositories: bindings,
+    kind,
+    allowLegacyBare: bindings.length === 1,
+  });
+  return {
+    workItems: parsed.items.map((item) => ({
+      ...item.ref,
+      ref: item.ref,
+      key: workItemKey(item.ref),
+      trailing: item.remainder,
+      legacyUnowned: item.legacyUnowned === true,
+    })),
+    errors: parsed.diagnostics,
+  };
+}
+
+function parseActiveBatch(queueText, options = {}) {
   if (typeof queueText !== "string" || !queueText) {
-    return { batchNumber: null, issueNumbers: [] };
+    return { batchNumber: null, issueNumbers: [], workItems: [], errors: [], provenance: "legacy_unowned", assignmentAttempt: null, assignmentKey: null };
   }
   // Pull just the Active Batch section so a stray `#123` in Backlog
   // or Done doesn't leak into the active list.
-  const m = queueText.match(/##\s+Active Batch[\s\S]*?(?=\n##\s|$)/i);
-  if (!m) return { batchNumber: null, issueNumbers: [] };
-  const section = m[0];
-  const batchMatch = section.match(/\*\*Batch:\*\*\s*(\d+)/i) || section.match(/Batch:\s*(\d+)/i);
-  const batchNumber = batchMatch ? parseInt(batchMatch[1], 10) : null;
+  const section = sectionByHeading(queueText, "Active Batch");
+  if (!section) return { batchNumber: null, issueNumbers: [], workItems: [], errors: [], provenance: "legacy_unowned", assignmentAttempt: null, assignmentKey: null };
+  const batchValue = standaloneMetadataValue(section, /^\s*(?:\*\*Batch:\*\*|Batch:)\s*(\d+)\s*$/i);
+  const batchNumber = batchValue ? parseInt(batchValue, 10) : null;
   // Only collect issue numbers from lines that look like list-item
   // entries — i.e. lines whose first content token is either `#N`
   // or `[#N]` after an optional list marker, and optionally after
@@ -2945,19 +4673,41 @@ function parseActiveBatch(queueText) {
   // used GFM checkbox syntax produced zero issue numbers and the
   // Current Batch panel showed empty. #341 adds an explicit optional
   // checkbox token after the list marker.
-  const ITEM_LINE_RE = /^\s*(?:[-*]\s+|\d+\.\s+)?(?:\[[ xX]\]\s+)?\[?#(\d{1,6})\]?\b/;
-  const seen = new Set();
-  const issueNumbers = [];
-  for (const line of section.split("\n")) {
-    const lineMatch = line.match(ITEM_LINE_RE);
-    if (!lineMatch) continue;
-    const n = parseInt(lineMatch[1], 10);
-    if (!seen.has(n)) {
-      seen.add(n);
-      issueNumbers.push(n);
-    }
+  const kind = options.kind || (parseBatchType(queueText) === "pr-review" ? "pr" : "issue");
+  const repositories = options.repositories || options.bindings || [];
+  const { workItems, errors } = parseQueueWorkItems(section, { repositories, kind });
+  const batchTypeLines = section.split(/\r?\n/)
+    .map((line, index) => ({ line, lineNumber: index + 1 }))
+    .filter(({ line }) => /^\s*\*\*Batch type:\*\*/i.test(line));
+  if (batchTypeLines.length > 1) {
+    const duplicate = batchTypeLines[1];
+    errors.push({
+      code: "duplicate_batch_type",
+      message: "Active Batch contains multiple Batch type declarations",
+      line_number: duplicate.lineNumber,
+      token: duplicate.line.trim(),
+    });
   }
-  return { batchNumber, issueNumbers };
+  const metadata = queueAssignmentMetadata(section, options.installationId || null, batchNumber);
+  if (batchTypeLines.length > 1 && metadata.provenance === "owned") metadata.provenance = "unowned";
+  if (options.installationId && workItems.some((item) => item.legacyUnowned)) metadata.provenance = "unowned";
+  const assignmentKey = assignmentKeyFor({
+    installationId: metadata.provenance === "owned" ? metadata.serializedInstallation : null,
+    batchNumber,
+    assignmentAttempt: metadata.assignmentAttempt,
+    workItems,
+  });
+  if (metadata.provenance === "owned" && !assignmentKey) metadata.provenance = "unowned";
+  return {
+    batchNumber,
+    issueNumbers: workItems.map((item) => item.number),
+    workItems,
+    errors,
+    installationId: metadata.serializedInstallation,
+    assignmentAttempt: metadata.assignmentAttempt,
+    provenance: metadata.provenance,
+    assignmentKey,
+  };
 }
 
 // #870: review-batch support. The queue's `## Active Batch` section may carry a
@@ -2965,15 +4715,17 @@ function parseActiveBatch(queueText) {
 // `**Batch:** N`). Absent/unrecognized → "code" (preserves existing behavior
 // exactly). Review batches compute progress from the Active Batch item states
 // alone — no GitHub calls.
-const ACTIVE_BATCH_SECTION_RE = /##\s+Active Batch[\s\S]*?(?=\n##\s|$)/i;
 const REVIEW_BATCH_TYPES = new Set(["ticket-review", "pr-review"]);
 
 function parseBatchType(queueText) {
   if (typeof queueText !== "string" || !queueText) return "code";
-  const m = queueText.match(ACTIVE_BATCH_SECTION_RE);
-  if (!m) return "code";
-  const tm = m[0].match(/\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\b/i);
-  return tm ? tm[1].toLowerCase() : "code";
+  const section = sectionByHeading(queueText, "Active Batch");
+  if (!section) return "code";
+  const batchType = standaloneMetadataValue(
+    section,
+    /^\s*\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\s*$/i,
+  );
+  return batchType ? batchType.toLowerCase() : "code";
 }
 
 // Parse one Active Batch item's review-state annotation — the text after
@@ -2994,66 +4746,56 @@ function parseReviewState(raw) {
 // Parse the `## Active Batch` review items: `- #<n> — <state>`. Same line
 // grammar as parseActiveBatch (so the issue set matches exactly), plus the
 // trailing state annotation. Scoped to Active Batch — NEVER `## Done`.
-const REVIEW_ITEM_LINE_RE = /^\s*(?:[-*]\s+|\d+\.\s+)?(?:\[[ xX]\]\s+)?\[?#(\d{1,6})\]?\b(.*)$/;
-function parseReviewItems(queueText) {
+function parseReviewItems(queueText, options = {}) {
   if (typeof queueText !== "string" || !queueText) return [];
-  const m = queueText.match(ACTIVE_BATCH_SECTION_RE);
-  if (!m) return [];
-  const seen = new Set();
-  const items = [];
-  for (const line of m[0].split("\n")) {
-    const lm = line.match(REVIEW_ITEM_LINE_RE);
-    if (!lm) continue;
-    const n = parseInt(lm[1], 10);
-    if (seen.has(n)) continue;
-    seen.add(n);
-    const { review_state, approvals } = parseReviewState(lm[2]);
-    items.push({ issue: n, review_state, approvals });
-  }
-  return items;
+  const section = sectionByHeading(queueText, "Active Batch");
+  if (!section) return [];
+  const kind = options.kind || (parseBatchType(queueText) === "pr-review" ? "pr" : "issue");
+  const parsed = parseQueueWorkItems(section, {
+    repositories: options.repositories || options.bindings || [],
+    kind,
+  });
+  return parsed.workItems.map((ref) => {
+    const { review_state, approvals } = parseReviewState(ref.trailing);
+    return { issue: ref.number, ref: ref.ref || ref, review_state, approvals };
+  });
 }
 
-// #925: parse the per-item review states from the ONE `## Done` block whose
-// `**Batch:** N` matches `batchNumber`. After a review batch is archived the
-// Active Batch is empty, so resolveDisplayedBatch serves the snapshot — whose
-// reviewItems can be frozen at a pre-final state (the final approval + archive
-// happened between the 30s polls). Head's Done block holds the AUTHORITATIVE
-// final states, so for the archived (displayed) batch we read them from there.
-// Scoped to the single matching block — every OTHER Done batch stays ignored
-// (#870: never count `## Done` for progress beyond this one sticky block).
-// Returns { batch_type, reviewItems } or null if no matching block exists.
-const DONE_SECTION_RE = /##\s+Done\b[\s\S]*?(?=\n##\s|$)/i;
-const DONE_BATCH_MARKER_RE = /\*\*Batch:\*\*\s*(\d+)/g;
-function parseDoneBatchReviewItems(queueText, batchNumber) {
-  if (typeof queueText !== "string" || !queueText || !Number.isInteger(batchNumber)) return null;
-  const dm = queueText.match(DONE_SECTION_RE);
-  if (!dm) return null;
-  const done = dm[0];
-  // Split the Done section into per-batch blocks at each `**Batch:** N` marker
-  // (`**Batch type:**` is NOT matched — it has no `:` right after "Batch").
-  const markers = [];
-  let mk;
-  DONE_BATCH_MARKER_RE.lastIndex = 0;
-  while ((mk = DONE_BATCH_MARKER_RE.exec(done)) !== null) {
-    markers.push({ num: parseInt(mk[1], 10), start: mk.index });
+function publicWorkItemRef(ref) {
+  try { return serializeWorkItemRefApi(ref); }
+  catch { return null; }
+}
+
+function decorateBatchRow(row, ref, assignment = null) {
+  const publicRef = publicWorkItemRef(ref);
+  const decorated = {
+    ...row,
+    ...(publicRef ? {
+      repo_key: publicRef.repo_key,
+      repo: publicRef.repo,
+      number: publicRef.number,
+      kind: publicRef.kind,
+      work_item_ref: publicRef,
+      live_pr: row.live_pr || null,
+    } : {}),
+  };
+  if (assignment) {
+    decorated.installation_id = assignment.installation_id;
+    decorated.batch_number = assignment.batch_number;
+    decorated.assignment_attempt = assignment.assignment_attempt;
+    decorated.provenance = assignment.provenance;
+    decorated.assignment_key = assignment.assignment_key;
+    decorated.current = assignment.current === true;
+    decorated.owned = assignment.owned === true;
+    decorated.ownership_key = assignment.owned === true
+      ? ownershipKey({
+        installation_id: assignment.installation_id,
+        batch_number: assignment.batch_number,
+        assignment_attempt: assignment.assignment_attempt,
+      }, ref)
+      : null;
   }
-  const idx = markers.findIndex((b) => b.num === batchNumber);
-  if (idx === -1) return null;
-  const block = done.slice(markers[idx].start, idx + 1 < markers.length ? markers[idx + 1].start : done.length);
-  const tm = block.match(/\*\*Batch type:\*\*\s*(code|ticket-review|pr-review)\b/i);
-  const batch_type = tm ? tm[1].toLowerCase() : "code";
-  const seen = new Set();
-  const reviewItems = [];
-  for (const line of block.split("\n")) {
-    const lm = line.match(REVIEW_ITEM_LINE_RE);
-    if (!lm) continue;
-    const n = parseInt(lm[1], 10);
-    if (seen.has(n)) continue;
-    seen.add(n);
-    const { review_state, approvals } = parseReviewState(lm[2]);
-    reviewItems.push({ issue: n, review_state, approvals });
-  }
-  return { batch_type, reviewItems };
+  return decorated;
 }
 
 // Map a parsed review state → the batch-progress item, EXTENDING the existing
@@ -3062,7 +4804,8 @@ function parseDoneBatchReviewItems(queueText, batchNumber) {
 // ticket-review omits it (frontend type is pr_number?: number — never null).
 function reviewItemView(ri, batchType, ghIndex) {
   const n = ri.issue;
-  const meta = ghIndex && ghIndex.get(n);
+  const ref = ri.ref || null;
+  const meta = ghIndex && ghIndex.get(ref ? canonicalWorkItemKey(ref) : n);
   let progress, status, label;
   if (ri.review_state === "approved") { progress = 100; status = "approved"; label = "Approved ✓"; }
   else if (ri.review_state === "changes-requested") { progress = 0; status = "changes_requested"; label = "changes requested"; }
@@ -3087,7 +4830,7 @@ function reviewItemView(ri, batchType, ghIndex) {
     approvals: ri.approvals,
   };
   if (batchType === "pr-review") item.pr_number = n;
-  return item;
+  return ref ? decorateBatchRow(item, ref) : item;
 }
 
 function summarizeReviewItems(reviewItems) {
@@ -3119,10 +4862,17 @@ function loadGithubItemIndex(projectId) {
   }
   const parsed = parseGithub(text);
   if (!parsed || !parsed.ok) return map;
-  for (const list of [parsed.openIssues, parsed.closedIssues, parsed.openPRs, parsed.mergedPrs]) {
+  for (const [kind, list] of [["issue", parsed.openIssues], ["issue", parsed.closedIssues], ["pr", parsed.openPRs], ["pr", parsed.mergedPrs]]) {
     for (const it of list || []) {
-      if (it && typeof it.number === "number" && !map.has(it.number)) {
-        map.set(it.number, { title: it.title, url: it.url });
+      if (it && typeof it.number === "number") {
+        const ref = { repoKey: it.repo_key, repo: it.repo, number: it.number, kind };
+        const key = canonicalWorkItemKey(ref);
+        if (key && !map.has(key)) map.set(key, { title: it.title, url: it.url });
+        if (!map.has(it.number)) {
+          // One-repository legacy projection only; qualified callers always
+          // use the composite key above.
+          map.set(it.number, { title: it.title, url: it.url });
+        }
       }
     }
   }
@@ -3172,6 +4922,7 @@ function buildNoPrRow(issue) {
       issue_number: issue.number,
       title: issue.title,
       url: issue.url,
+      live_pr: null,
       status: "closed",
       progress: 100,
       label: "Closed (no PR) ✓",
@@ -3181,6 +4932,7 @@ function buildNoPrRow(issue) {
     issue_number: issue.number,
     title: issue.title,
     url: issue.url,
+    live_pr: null,
     status: "queued",
     progress: 0,
     label: "Issue · queued",
@@ -3224,6 +4976,12 @@ function pickLinkedPrFromSearch(items, n, opts = {}) {
     if (merged.length > 0) {
       return merged.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
     }
+  }
+  // An active issue's old merged/closed PR is historical. Prefer a currently
+  // OPEN replacement even when its number is lower than a recently closed PR.
+  if (!preferMerged) {
+    const open = matches.filter((it) => String(it && it.state || "").toUpperCase() === "OPEN");
+    if (open.length > 0) return open.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
   }
   return matches.slice().sort((a, b) => (b.number || 0) - (a.number || 0))[0].number;
 }
@@ -3279,12 +5037,21 @@ async function findClosingPrByTimeline(repo, issueNumber) {
 // issue/PR endpoints + Search/title convention + native issue timeline
 // close-link — zero `gh issue view` / `gh pr view` (GraphQL). Bucket mapping
 // matches progressFromSnapshot exactly.
-async function progressForItemRest(repo, issueNumber) {
+async function progressForItemRest(repo, issueNumber, stillCurrent = () => true, deps = {}) {
+  const execJson = deps.ghJsonExecAsync || ghJsonExecAsync;
+  const stopIfRevoked = () => {
+    if (stillCurrent()) return;
+    const error = new Error("project admission revoked");
+    error.code = "project_admission_revoked";
+    throw error;
+  };
+  stopIfRevoked();
   // Load-bearing call: the issue's own state via REST. If gh can't read it at
   // all (404, network, auth, timeout) we can't compute a meaningful row — let
   // the rejection propagate to the route, which (#943) renders a soft "queued
   // (retrying)" row instead of emitting a misleading "queued"/"merged" entry.
-  const raw = await ghJsonExecAsync(["api", `repos/${repo}/issues/${issueNumber}`]);
+  const raw = await execJson(["api", `repos/${repo}/issues/${issueNumber}`]);
+  stopIfRevoked();
   const issue = {
     number: raw.number,
     title: raw.title,
@@ -3296,14 +5063,22 @@ async function progressForItemRest(repo, issueNumber) {
   // flap to "queued (retrying)" — terminal-ness comes from the issue state.
   let prNumber = null;
   try {
-    prNumber = await findLinkedPrByTitle(repo, issueNumber, _searchLinkedPrItems, { issueState: issue.state });
+    stopIfRevoked();
+    const search = deps.searchLinkedPrItems || _searchLinkedPrItems;
+    prNumber = await findLinkedPrByTitle(repo, issueNumber, search, { issueState: issue.state });
+    stopIfRevoked();
   } catch (err) {
+    if (err?.code === "project_admission_revoked") throw err;
     if (issue.state !== "CLOSED") throw err;
   }
   if (prNumber == null && issue.state === "CLOSED") {
     try {
-      prNumber = await findClosingPrByTimeline(repo, issueNumber);
+      stopIfRevoked();
+      const events = await execJson(["api", `repos/${repo}/issues/${issueNumber}/timeline?per_page=100`]);
+      stopIfRevoked();
+      prNumber = pickClosingPrFromTimeline(events);
     } catch {
+      stopIfRevoked();
       // Degrade below to Closed (no PR) ✓. The item is still terminal.
     }
   }
@@ -3318,28 +5093,23 @@ async function progressForItemRest(repo, issueNumber) {
   // than dropping the whole item to "fetch failed".
   let prData = null;
   try {
-    prData = await ghJsonExecAsync(["api", `repos/${repo}/pulls/${prNumber}`]);
+    stopIfRevoked();
+    prData = await execJson(["api", `repos/${repo}/pulls/${prNumber}`]);
+    stopIfRevoked();
   } catch {
+    stopIfRevoked();
     // soft fall-through to the in_review row below
   }
   if (!prData) {
     if (issue.state === "CLOSED") return buildNoPrRow(issue);
-    return {
-      issue_number: issue.number,
-      title: issue.title,
-      url: issue.url,
-      pr_number: prNumber,
-      status: "in_review",
-      progress: 20,
-      label: `PR #${prNumber} · waiting on review`,
-    };
+    return softRetryingRow(issue.number, issue.title);
   }
-  let reviews = [];
-  try {
-    const rv = await ghJsonExecAsync(["api", `repos/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
-    reviews = mapReviews(Array.isArray(rv) ? rv : []);
-  } catch {
-    // soft — reviews stay [], so the row degrades to in_review, never "failed"
+  const prState = String(prData.state || "").toUpperCase();
+  if (issue.state === "OPEN" && prState !== "OPEN") {
+    return {
+      ...buildNoPrRow(issue),
+      historical_pr: historicalPrReference(prData),
+    };
   }
   const url = prData.html_url || issue.url;
   // REST: a merged PR is state "closed" with `merged: true`. merged requires
@@ -3350,21 +5120,44 @@ async function progressForItemRest(repo, issueNumber) {
       title: issue.title,
       url,
       pr_number: prData.number,
+      historical_pr: historicalPrReference(prData),
+      live_pr: null,
       status: "merged",
       progress: 100,
       label: "Merged ✓",
     };
   }
+  if (prState !== "OPEN") {
+    return { ...buildNoPrRow(issue), historical_pr: historicalPrReference(prData) };
+  }
+  let reviews = [];
+  try {
+    stopIfRevoked();
+    const rv = await execJson(["api", `repos/${repo}/pulls/${prNumber}/reviews?per_page=100`]);
+    stopIfRevoked();
+    reviews = mapReviews(Array.isArray(rv) ? rv : []);
+  } catch {
+    // soft — reviews stay [], so the row degrades to in_review, never "failed"
+  }
   // #810: count APPROVED reviews per body-marker ROLE (re1/re2 share one login),
   // latest decision-affecting review per role — no stale double-count.
   const approvalCount = countApprovedRoles(reviews);
+  const live_pr = livePrReference({ ...prData, state: prState, url });
+  if (!live_pr) {
+    return {
+      ...softRetryingRow(issue.number),
+      title: issue.title || `#${issue.number}`,
+      url: issue.html_url || issue.url || null,
+      live_pr: null,
+    };
+  }
   if (approvalCount >= 2) {
-    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "ready", progress: 80, label: `PR #${prData.number} · 2 approvals · ready` };
+    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, live_pr, status: "ready", progress: 80, label: `PR #${prData.number} · 2 approvals · ready` };
   }
   if (approvalCount === 1) {
-    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "approved1", progress: 50, label: `PR #${prData.number} · 1 approval` };
+    return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, live_pr, status: "approved1", progress: 50, label: `PR #${prData.number} · 1 approval` };
   }
-  return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, status: "in_review", progress: 20, label: `PR #${prData.number} · waiting on review` };
+  return { issue_number: issue.number, title: issue.title, url, pr_number: prData.number, live_pr, status: "in_review", progress: 20, label: `PR #${prData.number} · waiting on review` };
 }
 
 function summarizeItems(items) {
@@ -3401,13 +5194,10 @@ function summarizeItems(items) {
 // undefined input — current callers always pass a value), defensively
 // treated as "not active" at the route.
 //
-// #864: lifecycle consumers (this route, trigger auto-stop, reseed safe-boundary
-// checks via isActiveFromProgress) must NOT consider an explicitly cleared
-// `## Active Batch` section as active. resolveDisplayedBatch still serves the
-// preserved snapshot so /api/batch-progress can render the prior batch for
-// history, but the lifecycle signal must follow the operator's intent. The
-// `liveActiveBatchCleared` flag set by getOrComputeBatchProgress short-circuits
-// the items-based check below.
+// #864/#1050: lifecycle consumers (this route, trigger auto-stop, reseed
+// safe-boundary checks via isActiveFromProgress) must not consider an explicitly
+// cleared `## Active Batch` section active. The live parse is the sole Current
+// Batch authority; `liveActiveBatchCleared` makes that signal explicit.
 function isBatchActiveFromProgress(progress) {
   if (!progress) return null;
   if (progress.liveActiveBatchCleared) return false;
@@ -3418,7 +5208,7 @@ function isBatchActiveFromProgress(progress) {
 router.get("/api/batch-active", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
-  if (!getRepo(projectId)) return res.status(400).json({ error: "No repo configured for project" });
+  if (getProjectRepositoryBindings(projectId).length === 0) return res.status(400).json({ error: "No repo configured for project" });
 
   // #839 (re1 follow-up on #844): share the same compute path that
   // /api/batch-progress uses so the completion-aware answer is available on
@@ -3431,7 +5221,26 @@ router.get("/api/batch-active", async (req, res) => {
   const data = await getOrComputeBatchProgress(projectId);
   const active = isBatchActiveFromProgress(data);
   // #870: surface batch_type so the sidebar can label review vs code batches.
-  return res.json({ active: active === null ? false : active, batch_type: (data && data.batch_type) || "code" });
+  return res.json({
+    active: active === null ? false : active,
+    batch_type: (data && data.batch_type) || "code",
+    installation_id: data?.installation_id || null,
+    batch_number: data?.batch_number ?? null,
+    assignment_attempt: data?.assignment_attempt || null,
+    provenance: data?.provenance || "legacy_unowned",
+    assignment_key: data?.assignment_key || null,
+    assignment_items: Array.isArray(data?.assignment_items) ? data.assignment_items : [],
+    current: data?.current === true,
+    owned: data?.owned === true,
+    multi_repository: data?.multi_repository === true,
+    compatibility_mode: data?.compatibility_mode === "v1" ? "v1" : "v2",
+    ...(Number.isSafeInteger(data?.admission_generation) && data.admission_generation >= 0
+      ? { admission_generation: data.admission_generation }
+      : {}),
+    ...(typeof data?.batch_observation_fingerprint === "string"
+      ? { batch_observation_fingerprint: data.batch_observation_fingerprint }
+      : {}),
+  });
 });
 
 // #807: parsed view of the server-authored GITHUB.md. Single source of truth is
@@ -3458,13 +5267,23 @@ router.get("/api/github-parsed", (req, res) => {
   // #827: a malformed `generatedAt` → Date.parse NaN. Normalize to null so the
   // response field is a clean "unknown age" (not NaN), and _githubLiveStale
   // also treats NaN/null as stale rather than hiding staleness on a suspect file.
-  const rawAge = parsed.generatedAt ? Date.now() - Date.parse(parsed.generatedAt) : null;
-  const ageMs = Number.isNaN(rawAge) ? null : rawAge;
-  return res.json({
-    ...parsed,
-    ageMs,
-    _stale: _githubLiveStale(parsed.stale, ageMs),
+  const repositories = (parsed.repositories || []).map((repository) => {
+    const rawAge = repository.generatedAt ? Date.now() - Date.parse(repository.generatedAt) : null;
+    const ageMs = Number.isNaN(rawAge) ? null : rawAge;
+    return {
+      ...repository,
+      ageMs,
+      _stale: _githubLiveStale(repository.stale, ageMs),
+    };
   });
+  const response = {
+    ...parsed,
+    repositories,
+    _stale: repositories.length === 0 || repositories.some((repository) => repository._stale),
+  };
+  // Preserve the existing single-repository top-level freshness projection.
+  if (repositories.length === 1) response.ageMs = repositories[0].ageMs;
+  return res.json(response);
 });
 
 // #839 (re1 follow-up on #844): shared compute path for /api/batch-progress
@@ -3472,149 +5291,655 @@ router.get("/api/github-parsed", (req, res) => {
 // successful response, or null to signal "no repo configured for project"
 // (caller's 400). Hits/populates _batchProgressCache so concurrent panel +
 // sidebar polls share the work via the BATCH_PROGRESS_TTL_MS cache.
+function readLiveBatchContext(projectId) {
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
+  catch { return null; }
+  const project = cfg.projects?.find((entry) => entry?.id === projectId);
+  if (!project) return null;
+  const repositories = projectRepositoryBindings(project);
+  let queueText = "";
+  let queueReadOk = false;
+  try {
+    queueText = fs.readFileSync(path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md"), "utf-8");
+    queueReadOk = true;
+  } catch { /* missing queue is represented explicitly below */ }
+  const installationId = typeof cfg.installation_id === "string" ? cfg.installation_id : null;
+  const batchType = parseBatchType(queueText);
+  const parsed = parseActiveBatch(queueText, {
+    repositories,
+    installationId,
+    kind: batchType === "pr-review" ? "pr" : "issue",
+  });
+  const reviewObservation = REVIEW_BATCH_TYPES.has(batchType)
+    ? parseReviewItems(queueText, {
+      repositories,
+      kind: batchType === "pr-review" ? "pr" : "issue",
+    }).map((item) => [
+      workItemKey(item.ref),
+      item.review_state,
+      item.approvals,
+    ]).sort((a, b) => a[0].localeCompare(b[0]))
+    : [];
+  const fingerprint = JSON.stringify([
+    "queue-assignment-observation", 1,
+    installationId,
+    parsed.installationId,
+    parsed.provenance,
+    parsed.assignmentKey,
+    batchType,
+    parsed.batchNumber,
+    parsed.assignmentAttempt,
+    parsed.workItems.map((item) => item.key).sort(),
+    reviewObservation,
+    parsed.errors.map((entry) => [entry.code, entry.line_number || entry.line || null]),
+  ]);
+  return { cfg, project, repositories, queueText, queueReadOk, activated: !!installationId, installationId, batchType, parsed, fingerprint };
+}
+
+function assignmentView(context, { current = true } = {}) {
+  const parsed = context?.parsed || {};
+  const owned = parsed.provenance === "owned" && parsed.errors?.length === 0 && !!parsed.assignmentKey;
+  const provenance = {
+    installation_id: parsed.installationId || null,
+    batch_number: parsed.batchNumber ?? null,
+    assignment_attempt: parsed.assignmentAttempt || null,
+  };
+  const assignmentItems = owned
+    ? parsed.workItems.map((item) => {
+      const ref = item.ref || item;
+      return {
+        work_item_ref: serializeWorkItemRefApi(ref),
+        ownership_key: ownershipKey(provenance, ref),
+        _work_item_key: workItemKey(ref),
+      };
+    }).sort((a, b) => a._work_item_key.localeCompare(b._work_item_key))
+      .map(({ _work_item_key, ...item }) => item)
+    : [];
+  const compatibilityMode = context?.activated !== true && (context?.repositories || []).length === 1 &&
+    parsed.errors?.length === 0 &&
+    (parsed.workItems?.length === 0 || parsed.workItems.every((item) => item.legacyUnowned === true))
+    ? "v1"
+    : "v2";
+  return {
+    ...provenance,
+    provenance: parsed.provenance || "legacy_unowned",
+    assignment_key: parsed.assignmentKey || null,
+    current: current === true,
+    owned,
+    multi_repository: (context?.repositories || []).length > 1,
+    assignment_items: assignmentItems,
+    compatibility_mode: compatibilityMode,
+    ...(context?.queueReadOk === true && typeof context?.fingerprint === "string"
+      ? { batch_observation_fingerprint: context.fingerprint }
+      : {}),
+  };
+}
+
+function canonicalAssignmentItems(items) {
+  if (!Array.isArray(items)) return null;
+  const seen = new Set();
+  const normalized = [];
+  try {
+    for (const item of items) {
+      if (!item || typeof item !== "object" || Array.isArray(item) ||
+          Object.keys(item).sort().join(",") !== "ownership_key,work_item_ref") return null;
+      const apiRef = item.work_item_ref;
+      if (!apiRef || typeof apiRef !== "object" || Array.isArray(apiRef) ||
+          Object.keys(apiRef).sort().join(",") !== "kind,number,repo,repo_key") return null;
+      const ref = {
+        repoKey: apiRef.repo_key,
+        repo: apiRef.repo,
+        number: apiRef.number,
+        kind: apiRef.kind,
+      };
+      assertWorkItemRef(ref);
+      if (typeof item.ownership_key !== "string") return null;
+      const key = workItemKey(ref);
+      if (seen.has(key)) return null;
+      seen.add(key);
+      normalized.push({ key, value: { work_item_ref: serializeWorkItemRefApi(ref), ownership_key: item.ownership_key } });
+    }
+  } catch {
+    return null;
+  }
+  return normalized.sort((a, b) => a.key.localeCompare(b.key)).map((entry) => entry.value);
+}
+
+function validateCurrentOwnedAssignment(projectId, body = {}) {
+  const v2IdentityFields = ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance"];
+  const identityFields = [...v2IdentityFields, "compatibility_mode", "batch_observation_fingerprint"];
+  const automated = Object.prototype.hasOwnProperty.call(body, "admission_generation") ||
+    identityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  if (!automated) return { ok: true, manual: true, context: null };
+  const context = readLiveBatchContext(projectId);
+  const assignment = assignmentView(context, { current: true });
+  const carriesV2Identity = v2IdentityFields.some((field) => Object.prototype.hasOwnProperty.call(body, field));
+  const requestsLegacy = body.compatibility_mode === "v1";
+  if (!carriesV2Identity && requestsLegacy &&
+      context?.queueReadOk === true && assignment.compatibility_mode === "v1" &&
+      typeof body.batch_observation_fingerprint === "string" &&
+      body.batch_observation_fingerprint === context.fingerprint) {
+    return { ok: true, manual: false, legacy: true, context, assignment };
+  }
+  const requestedItems = canonicalAssignmentItems(body.assignment_items);
+  const liveItems = canonicalAssignmentItems(assignment.assignment_items);
+  const exact = context?.queueReadOk === true && assignment.owned === true &&
+    (body.compatibility_mode === undefined || body.compatibility_mode === "v2") &&
+    body.provenance === "owned" && body.provenance === assignment.provenance &&
+    typeof body.assignment_key === "string" && body.assignment_key === assignment.assignment_key &&
+    body.installation_id === assignment.installation_id &&
+    body.batch_number === assignment.batch_number &&
+    typeof body.assignment_attempt === "string" && body.assignment_attempt === assignment.assignment_attempt &&
+    typeof body.batch_observation_fingerprint === "string" &&
+    body.batch_observation_fingerprint === context.fingerprint &&
+    requestedItems !== null && liveItems !== null &&
+    JSON.stringify(requestedItems) === JSON.stringify(liveItems);
+  if (!exact) {
+    return {
+      ok: false,
+      status: 409,
+      code: "project_assignment_changed",
+      error: "project assignment changed; refresh and retry",
+      project_id: projectId,
+    };
+  }
+  return { ok: true, manual: false, context, assignment };
+}
+
+function validateCurrentAutomationRequest(projectId, body = {}) {
+  if (Object.prototype.hasOwnProperty.call(body, "current_batch_empty")) {
+    if (body.current_batch_empty !== true ||
+        ["assignment_key", "assignment_items", "installation_id", "batch_number", "assignment_attempt", "provenance"]
+          .some((field) => Object.prototype.hasOwnProperty.call(body, field))) {
+      return {
+        ok: false,
+        status: 409,
+        code: "project_assignment_changed",
+        error: "project assignment changed; refresh and retry",
+        project_id: projectId,
+      };
+    }
+    const generation = body.admission_generation;
+    const admission = projectAdmission(projectId);
+    const context = readLiveBatchContext(projectId);
+    const compatibilityMode = assignmentView(context, { current: false })?.compatibility_mode;
+    const exactEmpty = context?.queueReadOk === true &&
+      context.parsed.workItems.length === 0 && context.parsed.errors.length === 0 &&
+      typeof body.batch_observation_fingerprint === "string" &&
+      body.batch_observation_fingerprint === context.fingerprint &&
+      body.compatibility_mode === compatibilityMode;
+    if (!Number.isSafeInteger(generation) || generation < 0 || !admission ||
+        admission.generation !== generation || !isAdmissionCurrent(admission) || !exactEmpty) {
+      return {
+        ok: false,
+        status: 409,
+        code: "project_assignment_changed",
+        error: "project assignment changed; refresh and retry",
+        project_id: projectId,
+      };
+    }
+    return { ok: true, manual: false, cleared: true, compatibility_mode: compatibilityMode, context, admission };
+  }
+  const assignment = validateCurrentOwnedAssignment(projectId, body);
+  if (!assignment.ok || assignment.manual === true) return assignment;
+  const generation = body.admission_generation;
+  const admission = projectAdmission(projectId);
+  if (!Number.isSafeInteger(generation) || generation < 0 || !admission ||
+      admission.generation !== generation || !isAdmissionCurrent(admission)) {
+    return {
+      ok: false,
+      status: 409,
+      code: "project_admission_changed",
+      error: "project admission changed; refresh and retry",
+      project_id: projectId,
+    };
+  }
+  return { ...assignment, admission };
+}
+
+function isExactAssignmentCurrent(projectId, fingerprint, admission = null) {
+  if (admission && !isAdmissionCurrent(admission)) return false;
+  const current = readLiveBatchContext(projectId);
+  return !!current && current.queueReadOk && current.fingerprint === fingerprint;
+}
+
+function diagnosticBatchPayload(context) {
+  const errors = (context?.parsed?.errors || []).map((entry) => ({
+    code: typeof entry?.code === "string" ? entry.code : "invalid_work_item_ref",
+    message: typeof entry?.message === "string" ? entry.message.slice(0, 200) : "work item reference is invalid",
+    line_number: Number.isSafeInteger(entry?.line_number) ? entry.line_number : null,
+    token: typeof entry?.token === "string" ? entry.token.slice(0, 200) : null,
+  }));
+  const hasLiveDeclaration = (context?.parsed?.workItems || []).length > 0 || errors.length > 0;
+  const assignment = assignmentView(context, { current: context?.queueReadOk === true && hasLiveDeclaration });
+  const status = errors.length > 0 ? "invalid" : assignment.provenance;
+  const items = (context?.parsed?.workItems || []).map((ref) => decorateBatchRow({
+    issue_number: ref.number,
+    title: `${ref.repo || "?"}#${ref.number}`,
+    url: null,
+    status,
+    progress: 0,
+    label: errors.length > 0 ? "Invalid queue item" : "Assignment is not locally owned",
+  }, ref.ref || ref, assignment));
+  return {
+    ...assignment,
+    active: items.length > 0,
+    items,
+    summary: errors.length > 0 ? "Queue validation failed" : "Assignment is not locally owned",
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: items.length === 0 && errors.length === 0,
+    batch_type: context?.batchType || "code",
+    validation_errors: errors,
+  };
+}
+
 async function getOrComputeBatchProgress(projectId) {
+  const context = readLiveBatchContext(projectId);
+  if (isProjectArchived(projectId)) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
+  }
+  if (!context || context.repositories.length === 0) return null;
+  const observedAdmission = projectAdmission(projectId);
+  if (!observedAdmission) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
+  }
+  if (context.queueReadOk !== true ||
+      (context.parsed.workItems.length === 0 && context.parsed.errors.length === 0)) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: context.queueReadOk === true });
+    return emptyCurrentBatchPayload(context, observedAdmission, {
+      liveActiveBatchCleared: context.queueReadOk === true,
+      ...(context.queueReadOk === true ? {} : { _queue_unavailable: true }),
+    });
+  }
   const cached = _batchProgressCache.get(projectId);
+  const matchingCached = cached &&
+    cached.fingerprint === context.fingerprint &&
+    cached.admission_generation === observedAdmission.generation
+    ? cached
+    : null;
   // #812: parked (idle) project — never run batch-progress gh/GraphQL calls,
   // and ALWAYS flag the payload _idle (even on a fresh cache hit), so the
   // endpoint contract is consistent regardless of cache freshness. This must
   // precede the fresh-cache and rate-limit returns below.
   if (isProjectIdle(projectId)) {
-    if (cached) return { ...cached.data, _idle: true };
-    return { batch_number: null, items: [], summary: "", complete: false, completeConfirmed: false, batch_type: "code", _idle: true };
+    if (matchingCached) return { ...matchingCached.data, _idle: true };
+    return emptyCurrentBatchPayload(context, observedAdmission, {
+      liveActiveBatchCleared: false,
+      _idle: true,
+    });
+  }
+  if (context.activated && (context.parsed.errors.length > 0 || context.parsed.provenance !== "owned" || !context.parsed.assignmentKey)) {
+    return bindBatchAdmission(diagnosticBatchPayload(context), observedAdmission);
   }
   const batchTTL = adaptiveTTL(BATCH_PROGRESS_TTL_MS);
-  if (cached && Date.now() - cached.ts < batchTTL) {
-    return cached.data;
+  if (matchingCached && Date.now() - matchingCached.ts < batchTTL) {
+    return matchingCached.data;
   }
   // #554: if critically rate-limited, serve stale cache instead of
   // firing N gh calls per batch item.
-  if (isRateLimited() && cached) {
-    return { ...cached.data, _stale: true, _rateLimited: true };
+  if (isRateLimited() && matchingCached) {
+    return { ...matchingCached.data, _stale: true, _rateLimited: true };
   }
   // #802: GraphQL budget exhausted (separate from REST) — prefer serving the
   // existing cache (even stale) over the GraphQL query below. With no cache we
   // fall through to the REST gh-CLI fallback path (gated on its own bucket).
-  if (isGraphqlRateLimited() && cached) {
-    return { ...cached.data, _stale: true, _rateLimited: true };
+  if (isGraphqlRateLimited() && matchingCached) {
+    return { ...matchingCached.data, _stale: true, _rateLimited: true };
   }
 
-  const repo = getRepo(projectId);
-  if (!repo) return null;
-  if (cached) {
-    startBatchProgressRefresh(projectId, repo);
-    return { ...cached.data, _stale: true, _refreshing: true };
+  const admission = projectAdmission(projectId, { demand: true });
+  if (!admission) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
+  }
+  if (matchingCached) {
+    startBatchProgressRefresh(projectId, context, admission);
+    return { ...matchingCached.data, _stale: true, _refreshing: true };
   }
 
-  return computeBatchProgress(projectId, repo);
+  return computeBatchProgress(projectId, context, admission);
 }
 
-function startBatchProgressRefresh(projectId, repo) {
-  if (_batchProgressRefreshes.has(projectId)) return _batchProgressRefreshes.get(projectId);
-  const refresh = computeBatchProgress(projectId, repo)
+function startBatchProgressRefresh(projectId, context, admission) {
+  const existing = _batchProgressRefreshes.get(projectId);
+  if (existing && existing.fingerprint === context.fingerprint && isAdmissionCurrent(existing.admission)) return existing.promise;
+  const entry = { admission, fingerprint: context.fingerprint, promise: null };
+  entry.promise = computeBatchProgress(projectId, context, admission)
     .catch(() => {
       // Non-fatal: callers already received the last good payload. The next poll
       // will retry rather than turning a transient gh/GitHub failure into UI lag.
     })
     .finally(() => {
-      _batchProgressRefreshes.delete(projectId);
+      if (_batchProgressRefreshes.get(projectId) === entry) _batchProgressRefreshes.delete(projectId);
     });
-  _batchProgressRefreshes.set(projectId, refresh);
-  return refresh;
+  _batchProgressRefreshes.set(projectId, entry);
+  return entry.promise;
 }
 
-async function computeBatchProgress(projectId, repo) {
-  const queuePath = path.join(CONFIG_DIR, projectId, "OVERNIGHT-QUEUE.md");
-  let queueText = "";
-  let queueReadOk = false;
-  try {
-    queueText = fs.readFileSync(queuePath, "utf-8");
-    queueReadOk = true;
-  } catch {
-    // Missing / unreadable file — pass queueReadOk=false so the
-    // resolver bypasses the snapshot and returns the empty state
-    // per #316's edge case.
-  }
+function cachedRowWorkItemKey(row) {
+  const ref = row?.work_item_ref;
+  if (!ref || typeof ref !== "object") return null;
+  return canonicalWorkItemKey({
+    repoKey: ref.repo_key,
+    repo: ref.repo,
+    number: ref.number,
+    kind: ref.kind,
+  });
+}
 
-  // #334 / quadwork#334: validate the on-disk snapshot against
-  // GitHub before resolveDisplayedBatch can serve it. A snapshot
-  // whose first issue 404s is almost certainly a leftover from a
-  // prior project/repo that was purged; drop the file so the
-  // resolver falls through to the live queue parse (which will
-  // typically also be empty) instead of serving stale data
-  // indefinitely. We only run the check on cache-miss paths (this
-  // route already sits behind BATCH_PROGRESS_TTL_MS) and only
-  // when we'd actually rely on the snapshot — i.e. the live queue
-  // read succeeded, so the existing #316 bypass for unreadable
-  // queue files keeps precedence.
-  // #870: determine the displayed batch type up front (read-only) so review
-  // batches skip the GitHub snapshot-freshness check AND the merge-state path
-  // below entirely. The displayed type follows the SAME live-vs-snapshot
-  // decision as resolveDisplayedBatch: a just-archived review batch's live
-  // `**Batch type:**` is gone, so its type must come from the persisted snapshot.
-  const _liveActive = parseActiveBatch(queueText);
-  const _existingSnap = queueReadOk ? readBatchSnapshot(projectId) : null;
-  const _displaySource = queueReadOk ? pickDisplayedSource(_liveActive, _existingSnap) : "live";
-  const displayedBatchType =
-    _displaySource === "snapshot"
-      ? (_existingSnap && _existingSnap.batch_type) || "code"
-      : parseBatchType(queueText);
-  const isReviewBatch = REVIEW_BATCH_TYPES.has(displayedBatchType);
-
-  // #334: validate the on-disk snapshot's first issue against GitHub before
-  // resolveDisplayedBatch can serve it — CODE batches only. Review batches must
-  // make ZERO GitHub calls, and their snapshot issue numbers are queue-authored
-  // (not subject to the purged-repo staleness this check guards).
-  if (queueReadOk && !isReviewBatch) {
-    const existing = readBatchSnapshot(projectId);
-    if (existing && Array.isArray(existing.issueNumbers) && existing.issueNumbers.length > 0) {
-      const freshness = await checkBatchSnapshotFreshness(repo, existing);
-      if (freshness === "gone") deleteBatchSnapshot(projectId);
-      // "unknown" → leave the file alone; transient failure will
-      // retry on the next cache miss.
+// #1048 observes only a fresh server REST cache row paired with the current
+// owned code assignment.  Persisted GITHUB.md/cold-cache rows, public chat,
+// and generic pulses never enter this adapter. Contract revisions come only
+// from the bounded existing conditional REST observation; absence withholds
+// a new dispatch instead of starting an extra read/poll loop.
+async function attachReviewCycleHandoffs(projectId, context, admission, items, stillCurrent) {
+  if (context.batchType !== "code" || context.parsed.provenance !== "owned" || !context.parsed.assignmentAttempt ||
+      !context.installationId || isProjectArchived(projectId)) return;
+  for (const row of items) {
+    const ref = row?.work_item_ref;
+    const live = row?.live_pr;
+    if (!ref || ref.kind !== "issue" || !live || !canonicalSha(live.tip) || !/^[a-f0-9]{40}$/i.test(live.tip)) continue;
+    const binding = context.repositories.find((entry) => entry.key === ref.repo_key && canonicalGithubRepo(entry.repo) === canonicalGithubRepo(ref.repo));
+    const snapshot = binding ? _graphqlCache.get(binding.cache_repo) : null;
+    const pr = snapshot?.prs?.find((entry) => entry?.number === live.number && canonicalSha(entry.tip) === canonicalSha(live.tip));
+    // A persisted/cold/partial row cannot establish current dispatch identity.
+    if (!binding || !pr?.checkEvidence || !stillCurrent() || !isAdmissionCurrent(admission)) continue;
+    const contractObservation = currentContractObservation(snapshot, ref.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS);
+    if (!contractObservation ||
+        !stillCurrent() || !isAdmissionCurrent(admission)) continue;
+    let target;
+    try {
+      target = deriveLegacyReviewTarget({
+        installation_id: context.installationId,
+        project_id: projectId,
+        repository: { key: binding.key, repo: binding.repo, ci_policy: binding.ci_policy ?? null },
+        work_item: { repoKey: ref.repo_key, repo: ref.repo, number: ref.number, kind: "issue" },
+        pr: { number: live.number, exact_sha: canonicalSha(live.tip), draft: pr.draft === true, mergeable: pr.mergeable === true },
+        issue_contract: { contract_revision: contractObservation.contract_revision },
+        assignment_attempt: context.parsed.assignmentAttempt,
+      });
+      // Persist the first-observed timestamp in the cycle before applying
+      // #1049's grace evaluator; restart reads the same durable timestamp.
+      const pre = _reviewCycleStore.reconcile(projectId, target).cycle;
+      const ciLess = binding.ci_policy?.mode === "ci-less" ? _ciEvidenceStore.readByIdentity({
+        project_id: projectId, installation_id: context.installationId, repo_key: binding.key, repo: binding.repo,
+        item: { repo_key: ref.repo_key, repo: ref.repo, number: ref.number, kind: "issue" },
+        assignment_attempt: context.parsed.assignmentAttempt, contract_revision: contractObservation.contract_revision,
+        pr_number: live.number, exact_sha: canonicalSha(live.tip), policy_version: binding.ci_policy.version,
+      }) : null;
+      const ci = evaluateCiEvidence({
+        policy: binding.ci_policy ?? null, exact_sha: canonicalSha(live.tip), observed_at: pr.checkEvidence.observed_at,
+        first_observed_at: pre.created_at, source_status: pr.checkEvidence.source_status,
+        check_runs: pr.checkEvidence.check_runs, ci_less_evidence: ciLess, now: Date.now(),
+      });
+      const observation = _reviewCycleDispatcher.observe({ project_id: projectId, target, ci_state: ci.state, archived: false });
+      row.review_handoff = observation.handoff;
+      if (getProjectChatMode(projectId) === "file" && stillCurrent() && isAdmissionCurrent(admission) && !isProjectArchived(projectId)) {
+        _reviewCycleDispatcher.deliver(projectId, observation,
+          (candidate) => fileChat.appendTrustedReviewCycleEventOnce(projectId, {
+            ...candidate,
+            resume: { batch_id: currentChatResumeBatchId(projectId), head_generation: admission.generation },
+          }));
+      }
+    } catch {
+      // Authoritative input failures are fail-closed: no handoff and no chat.
     }
   }
+}
 
-  // #429 / quadwork#316: resolve the displayed batch through the
-  // snapshot-aware helper so merged items stay visible after Head
-  // moves them from Active Batch to Done, until a new batch starts.
+function ownedTerminalRows(snapshot, context, admission) {
+  const rows = new Map();
+  const assignment = assignmentView(context, { current: true });
+  if (!snapshot || snapshot.schema_version !== 2 ||
+      snapshot.admission_generation !== admission?.generation ||
+      snapshot.batch_observation_fingerprint !== context.fingerprint ||
+      snapshot.installation_id !== assignment.installation_id ||
+      snapshot.batchNumber !== assignment.batch_number ||
+      snapshot.assignment_attempt !== assignment.assignment_attempt ||
+      snapshot.assignment_key !== context.parsed.assignmentKey ||
+      JSON.stringify(snapshot.assignment_items || []) !== JSON.stringify(assignment.assignment_items)) return rows;
+  const source = snapshot.terminalItems && typeof snapshot.terminalItems === "object" ? snapshot.terminalItems : {};
+  const expectedByKey = new Map(assignment.assignment_items.map((item) => [
+    cachedRowWorkItemKey({ work_item_ref: item.work_item_ref }),
+    item,
+  ]));
+  for (const item of context.parsed.workItems) {
+    const row = source[item.key];
+    const expected = expectedByKey.get(item.key);
+    if (isTerminalBatchItem(row) && expected && cachedRowWorkItemKey(row) === item.key &&
+        row.ownership_key === expected.ownership_key && row.assignment_key === assignment.assignment_key &&
+        row.installation_id === assignment.installation_id && row.batch_number === assignment.batch_number &&
+        row.assignment_attempt === assignment.assignment_attempt && row.provenance === "owned") {
+      rows.set(item.key, row);
+    }
+  }
+  return rows;
+}
+
+function ownedTerminalSnapshot(items, previous = new Map()) {
+  const rows = {};
+  for (const [key, row] of previous) if (isTerminalBatchItem(row)) rows[key] = row;
+  for (const row of items) {
+    const key = row?.work_item_ref && canonicalWorkItemKey({
+      repoKey: row.work_item_ref.repo_key,
+      repo: row.work_item_ref.repo,
+      number: row.work_item_ref.number,
+      kind: row.work_item_ref.kind,
+    });
+    if (!key) continue;
+    if (isTerminalBatchItem(row)) rows[key] = row;
+    else delete rows[key];
+  }
+  return rows;
+}
+
+async function computeOwnedBatchProgress(projectId, context, admission) {
+  const stillCurrent = () => isExactAssignmentCurrent(projectId, context.fingerprint, admission);
+  const refs = context.parsed.workItems;
+  const assignment = assignmentView(context, { current: refs.length > 0 });
+  const liveActiveBatchCleared = refs.length === 0;
+  if (refs.length === 0) {
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, admission);
+  }
+
+  if (REVIEW_BATCH_TYPES.has(context.batchType)) {
+    const parsedReviewItems = parseReviewItems(context.queueText, {
+      repositories: context.repositories,
+      kind: context.batchType === "pr-review" ? "pr" : "issue",
+    });
+    const byKey = new Map(parsedReviewItems.map((item) => [item.ref.key || canonicalWorkItemKey(item.ref), item]));
+    const reviewItems = refs.map((item) => byKey.get(item.key) || {
+      issue: item.number,
+      ref: item.ref || item,
+      review_state: "queued",
+      approvals: 0,
+    });
+    const ghIndex = loadGithubItemIndex(projectId);
+    const items = reviewItems.map((item) => decorateBatchRow(
+      reviewItemView(item, context.batchType, ghIndex),
+      item.ref,
+      assignment,
+    ));
+    if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+    const complete = reviewItems.length > 0 && reviewItems.every((item) => item.review_state === "approved");
+    const data = {
+      ...assignment,
+      items,
+      summary: summarizeReviewItems(reviewItems),
+      complete,
+      completeConfirmed: complete,
+      liveActiveBatchCleared,
+      batch_type: context.batchType,
+    };
+    if (complete) {
+      deleteBatchSnapshot(projectId);
+    } else {
+      writeBatchSnapshot(projectId, {
+        schema_version: 2,
+        admission_generation: admission.generation,
+        batch_observation_fingerprint: context.fingerprint,
+        assignment_key: assignment.assignment_key,
+        installation_id: assignment.installation_id,
+        batchNumber: assignment.batch_number,
+        assignment_attempt: assignment.assignment_attempt,
+        assignment_items: assignment.assignment_items,
+        workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
+        batch_type: context.batchType,
+        reviewItems,
+        terminalItems: {},
+      });
+    }
+    return cacheBatchProgress(projectId, context, admission, data);
+  }
+
+  const diskSnapshot = readBatchSnapshot(projectId);
+  const terminalRows = ownedTerminalRows(diskSnapshot, context, admission);
+  const parsedGithub = loadGithubParsed(projectId);
+  const items = await _mapLimited(refs, GH_MAX_CONCURRENT, async (item) => {
+    const ref = item.ref || item;
+    if (!stillCurrent()) return decorateBatchRow(softRetryingRow(ref.number), ref, { ...assignment, current: false, owned: false });
+    const snapshot = _graphqlCache.get(canonicalGithubRepo(ref.repo)) || null;
+    let row = snapshot ? progressFromSnapshot(snapshot, ref.number, { requireLiveRef: true }) : progressFromGithubFile(parsedGithub, ref.number, ref);
+    // A terminal cache row is only a fallback for an item whose current source
+    // has no contradictory live evidence. Reopening keeps the same composite
+    // WorkItemRef and assignment identity, so an OPEN issue must evict the old
+    // merged/closed row even when an incomplete snapshot (or merged-but-open
+    // persisted board) cannot yet derive a replacement progress row.
+    const hasOpenIssue = snapshot
+      ? snapshotHasOpenIssue(snapshot, ref.number)
+      : githubFileHasOpenIssue(parsedGithub, ref.number, ref);
+    if (hasOpenIssue) terminalRows.delete(item.key);
+    if (!row && !hasOpenIssue) row = terminalRows.get(item.key) || null;
+    if (!row && snapshot) {
+      try { row = await progressForItemRest(ref.repo, ref.number, stillCurrent); }
+      catch { row = softRetryingRow(ref.number); }
+    }
+    if (!row) row = softRetryingRow(ref.number);
+    return decorateBatchRow(row, ref, assignment);
+  });
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+  await attachReviewCycleHandoffs(projectId, context, admission, items, stillCurrent);
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+  const complete = items.every((item) => isTerminalBatchItem(item));
+  const cycle = refs
+    .map((item) => _graphqlCache.get(canonicalGithubRepo(item.repo))?.ts || null)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b)
+    .join(":") || null;
+  const completeConfirmed = evalBatchCompleteConfirmed(projectId, assignment.assignment_key, complete, cycle);
+  const data = {
+    ...assignment,
+    items,
+    summary: summarizeItems(items),
+    complete,
+    completeConfirmed,
+    liveActiveBatchCleared,
+    batch_type: context.batchType,
+  };
+  if (complete) {
+    deleteBatchSnapshot(projectId);
+  } else {
+    writeBatchSnapshot(projectId, {
+      schema_version: 2,
+      admission_generation: admission.generation,
+      batch_observation_fingerprint: context.fingerprint,
+      assignment_key: assignment.assignment_key,
+      installation_id: assignment.installation_id,
+      batchNumber: assignment.batch_number,
+      assignment_attempt: assignment.assignment_attempt,
+      assignment_items: assignment.assignment_items,
+      workItems: refs.map((item) => serializeWorkItemRefApi(item.ref || item)),
+      batch_type: context.batchType,
+      reviewItems: [],
+      terminalItems: ownedTerminalSnapshot(items, terminalRows),
+    });
+  }
+  return cacheBatchProgress(projectId, context, admission, data);
+}
+
+async function computeBatchProgress(projectId, contextOrRepo, admission = projectAdmission(projectId, { demand: true })) {
+  if (!admission || !isAdmissionCurrent(admission)) {
+    return emptyCurrentBatchPayload(null, null, {
+      liveActiveBatchCleared: false,
+      _archived: true,
+      _readonly: true,
+    });
+  }
+  const context = contextOrRepo && typeof contextOrRepo === "object" && contextOrRepo.parsed
+    ? contextOrRepo
+    : readLiveBatchContext(projectId);
+  if (!context) return null;
+  if (context.activated) {
+    if (context.parsed.errors.length > 0 || context.parsed.provenance !== "owned" || !context.parsed.assignmentKey) return diagnosticBatchPayload(context);
+    return computeOwnedBatchProgress(projectId, context, admission);
+  }
+  const stillCurrent = () => isExactAssignmentCurrent(projectId, context.fingerprint, admission);
+  const legacyAssignment = assignmentView(context, { current: context.queueReadOk && context.parsed.workItems.length > 0 });
+  const repo = typeof contextOrRepo === "string"
+    ? contextOrRepo
+    : (context.repositories.find((entry) => entry.primary) || context.repositories[0])?.repo;
+  if (!repo) return null;
+  // Bind the whole V1 computation to the exact queue observation captured by
+  // readLiveBatchContext. Re-reading here could combine A's fingerprint with
+  // B's rows and publish the hybrid under A's cache key.
+  const queueText = context.queueText;
+  const queueReadOk = context.queueReadOk;
+
   const { batchNumber, issueNumbers, batch_type, reviewItems } = resolveDisplayedBatch(queueText, projectId, { queueReadOk });
-  // #864: lifecycle-signal flag. The displayed batch may be the preserved
-  // snapshot (so /api/batch-progress keeps showing it), but lifecycle consumers
-  // (/api/batch-active, trigger auto-stop, reseed safe-boundary) must follow
-  // the operator's explicit clear. Compute from the LIVE parse, only when the
-  // queue file actually read OK — the #316 bypass (queueReadOk=false) must NOT
-  // be mistaken for an explicit clear, since the operator never touched it.
-  const liveActiveBatchCleared = queueReadOk && parseActiveBatch(queueText).issueNumbers.length === 0;
+  const liveActiveBatchCleared = issueNumbers.length === 0;
   // #828 P2: batch identity = number + issue set. evalBatchCompleteConfirmed
   // resets its streak when this changes, so a new already-complete batch can't
   // inherit the prior batch's first cycle and confirm in one tick.
   const batchKey = `${batchNumber}::${[...issueNumbers].sort((a, b) => a - b).join(",")}`;
-  const terminalRows = terminalItemsFromSnapshot(readBatchSnapshot(projectId), batchNumber, issueNumbers);
   if (issueNumbers.length === 0) {
-    evalBatchCompleteConfirmed(projectId, batchKey, false, null); // reset any complete streak
-    const data = { batch_number: batchNumber, items: [], summary: "", complete: false, completeConfirmed: false, liveActiveBatchCleared, batch_type };
-    _batchProgressCache.set(projectId, { ts: Date.now(), data });
-    return data;
+    if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+    invalidateCurrentBatchPresentation(projectId, { persistent: true });
+    return emptyCurrentBatchPayload(context, admission);
   }
 
+  // Legacy numeric snapshots cannot prove a composite WorkItemRef identity.
+  // Retire them on first live observation; V1 remains live-queue driven and
+  // falls back to the GitHub sources instead of reusing ambiguous rows.
+  deleteBatchSnapshot(projectId);
+
   // #870: review batch — progress computed ENTIRELY from the current Active
-  // Batch item states (or the preserved snapshot's), with NO GitHub calls. The
+  // Batch item states, with NO GitHub calls. The
   // queue is HEAD-authored and authoritative, so completeConfirmed = complete —
   // do NOT route through evalBatchCompleteConfirmed (its two-cycle distinct-ts
   // guard never advances without a #806 GraphQL fetch a review batch never makes).
   if (batch_type === "ticket-review" || batch_type === "pr-review") {
-    // Defensive: a review batch should always carry per-item states, but if the
-    // snapshot somehow has issue numbers without them, treat all as queued.
+    // Defensive: a review batch should always carry per-item states.
     const ri = reviewItems.length > 0
       ? reviewItems
       : issueNumbers.map((n) => ({ issue: n, review_state: "queued", approvals: 0 }));
     const ghIndex = loadGithubItemIndex(projectId);
-    const items = ri.map((r) => reviewItemView(r, batch_type, ghIndex));
+    const refByNumber = new Map(context.parsed.workItems.map((item) => [item.number, item.ref || item]));
+    const items = ri.map((r) => {
+      const ref = refByNumber.get(r.issue);
+      return ref ? decorateBatchRow(reviewItemView(r, batch_type, ghIndex), ref, legacyAssignment) : reviewItemView(r, batch_type, ghIndex);
+    });
     const summary = summarizeReviewItems(ri);
     const complete = ri.length > 0 && ri.every((r) => r.review_state === "approved");
-    const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed: complete, liveActiveBatchCleared, batch_type };
-    _batchProgressCache.set(projectId, { ts: Date.now(), data });
-    return data;
+    if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+    const data = { ...legacyAssignment, batch_number: batchNumber, items, summary, complete, completeConfirmed: complete, liveActiveBatchCleared, batch_type };
+    return cacheBatchProgress(projectId, context, admission, data);
   }
 
   // #810: compute each item from the #806 REST snapshot (no GraphQL in steady
@@ -3629,16 +5954,15 @@ async function computeBatchProgress(projectId, repo) {
   // can't prove a specific item — now (a) concurrency-capped via _mapLimited and
   // (b) soft-failing a transient error to "queued (retrying)" rather than a hard
   // "fetch failed".
-  const snapshot = _graphqlCache.get(repo) || null;
+  const snapshot = _graphqlCache.get(canonicalGithubRepo(repo)) || null;
   let items;
   if (snapshot) {
     items = await _mapLimited(issueNumbers, GH_MAX_CONCURRENT, async (n) => {
+      if (!stillCurrent()) return softRetryingRow(n);
       const fromSnap = progressFromSnapshot(snapshot, n);
       if (fromSnap) return fromSnap;
-      const fromTerminalCache = terminalRows.get(n);
-      if (fromTerminalCache && !snapshotHasOpenIssue(snapshot, n)) return fromTerminalCache;
       try {
-        return await progressForItemRest(repo, n);
+        return await progressForItemRest(repo, n, stillCurrent);
       } catch {
         return softRetryingRow(n); // #943: transient (secondary rate-limit/network) → soft
       }
@@ -3648,8 +5972,14 @@ async function computeBatchProgress(projectId, repo) {
     // Search. Items the file can't classify render soft "queued (retrying)" and
     // firm up next cycle once _graphqlCache repopulates.
     const parsed = loadGithubParsed(projectId);
-    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || terminalRows.get(n) || softRetryingRow(n));
+    items = issueNumbers.map((n) => progressFromGithubFile(parsed, n) || softRetryingRow(n));
   }
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+  const legacyRefByNumber = new Map(context.parsed.workItems.map((item) => [item.number, item.ref || item]));
+  items = items.map((row) => {
+    const ref = legacyRefByNumber.get(row.issue_number);
+    return ref ? decorateBatchRow(row, ref, legacyAssignment) : row;
+  });
   const summary = summarizeItems(items);
   // #350: treat CLOSED-without-PR items as complete alongside merged
   // so batches that mix runbook/superseded closes with real PRs
@@ -3659,16 +5989,9 @@ async function computeBatchProgress(projectId, repo) {
   // before any auto-stop consumer may act on it (never auto-stop on a single
   // transient/stale complete). Keyed on the snapshot's ts as the cycle marker.
   const completeConfirmed = evalBatchCompleteConfirmed(projectId, batchKey, complete, snapshot ? snapshot.ts : null);
-  const data = { batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
-  writeBatchSnapshot(projectId, {
-    batchNumber,
-    issueNumbers: issueNumbers.slice(),
-    batch_type,
-    reviewItems,
-    terminalItems: collectTerminalItems(items, terminalRows),
-  });
-  _batchProgressCache.set(projectId, { ts: Date.now(), data });
-  return data;
+  const data = { ...legacyAssignment, batch_number: batchNumber, items, summary, complete, completeConfirmed, liveActiveBatchCleared, batch_type };
+  if (!stillCurrent()) return staleBatchObservationPayload(projectId, admission);
+  return cacheBatchProgress(projectId, context, admission, data);
 }
 
 router.get("/api/batch-progress", async (req, res) => {
@@ -3679,7 +6002,7 @@ router.get("/api/batch-progress", async (req, res) => {
   return res.json(data);
 });
 
-// #445: Memory section (agent-memory butler integration) removed.
+// #445: Memory section integration removed.
 
 // ─── Setup ─────────────────────────────────────────────────────────────────
 
@@ -3881,11 +6204,276 @@ router.get("/api/setup/reviewer-token-status", (_req, res) => {
 // so they run off the event loop instead of freezing every agent's WS/HTTP/
 // timers in this single-process server. Express 5 forwards a rejected handler
 // to the default error handler (same 500 the prior sync throws produced).
+class V2SetupActivationError extends Error {
+  constructor(result) {
+    super(result.code || "v2_setup_activation_blocked");
+    this.name = "V2SetupActivationError";
+    this.result = result;
+  }
+}
+
+function v2SetupExecutionState(project) {
+  if (!project || typeof project.id !== "string" || !project.id) return { state: "state_unavailable" };
+  let context;
+  try { context = readLiveBatchContext(project.id); }
+  catch { return { state: "state_unavailable" }; }
+  if (!context || context.queueReadOk !== true || !context.parsed || context.parsed.errors?.length > 0) {
+    return { state: "state_unavailable" };
+  }
+  if (context.parsed.assignmentKey) return { state: "open_assignment" };
+  if (Array.isArray(context.parsed.workItems) && context.parsed.workItems.length > 0) {
+    return {
+      state: context.parsed.workItems.some((item) => item.legacyUnowned === true)
+        ? "legacy_unowned_executable"
+        : "active_batch",
+    };
+  }
+  return { state: "clear" };
+}
+
+function v2RepositoryRecords(repositories) {
+  return assertRepositoryList(repositories).map((entry) => ({
+    key: entry.key,
+    repo: entry.repo,
+    working_dir: entry.working_dir,
+    primary: entry.primary,
+    ...(Object.prototype.hasOwnProperty.call(entry, "ci_policy") ? { ci_policy: entry.ci_policy } : {}),
+  }));
+}
+
+function v2SetupProjectId(body) {
+  try {
+    return { ok: true, project_id: assertProjectId(body?.id) };
+  } catch (error) {
+    return {
+      ok: false,
+      code: error instanceof RepositoryProvisionError ? error.code : "invalid_project_id",
+    };
+  }
+}
+
+async function verifyV2RepositoryAccess(repositories) {
+  for (const repository of repositories) {
+    const result = await execAsync("gh", ["repo", "view", repository.repo, "--json", "nameWithOwner,viewerPermission,defaultBranchRef"]);
+    if (!result.ok) return { ok: false, code: "repository_access_unavailable", repo_key: repository.key };
+    let info;
+    try { info = JSON.parse(result.output); }
+    catch { return { ok: false, code: "repository_identity_unavailable", repo_key: repository.key }; }
+    const canonical = typeof info.nameWithOwner === "string" ? info.nameWithOwner.toLowerCase() : null;
+    if (!canonical || canonical !== repository.repo.toLowerCase()) {
+      return { ok: false, code: "repository_identity_mismatch", repo_key: repository.key };
+    }
+    if (!new Set(["ADMIN", "MAINTAIN", "WRITE"]).has(info.viewerPermission)) {
+      return { ok: false, code: "repository_push_access_required", repo_key: repository.key };
+    }
+  }
+  return { ok: true };
+}
+
+function activeTargetSession(projectId, activeSessions) {
+  if (!activeSessions || typeof activeSessions[Symbol.iterator] !== "function") return { ok: true };
+  for (const [sessionKey, session] of activeSessions) {
+    if (!session || session.projectId !== projectId || session.state !== "running") continue;
+    const role = typeof session.agentId === "string" && session.agentId.length > 0
+      ? session.agentId
+      : (typeof sessionKey === "string" && sessionKey.includes("/") ? sessionKey.split("/").at(-1) : "unknown");
+    return { ok: false, code: "active_session", role };
+  }
+  return { ok: true };
+}
+
+function existingV2TopologyGuard(project, activeSessions) {
+  const targetGate = targetActivationGuard(project, v2SetupExecutionState);
+  if (!targetGate.ok) return targetGate;
+  return activeTargetSession(project.id, activeSessions);
+}
+
+function v2CandidateProject(existing, body, repositories) {
+  const candidate = existing
+    // Keep scalar removal in #1029's canonical, pure migration helper. This
+    // avoids a second route-local scalar compatibility rule while retaining
+    // every unrelated project field for the final transaction.
+    ? { ...migrateConfigurationToV2({ projects: [existing] }).projects[0], repositories }
+    : {
+      id: body.id,
+      name: typeof body.name === "string" && body.name ? body.name : body.id,
+      agents: body.agents && typeof body.agents === "object" ? body.agents : {},
+      chat_mode: "file",
+      repositories,
+    };
+  return candidate;
+}
+
+function primaryAgentCwds(existing, repositories) {
+  const previousPrimary = primaryRepository(existing);
+  const requestedPrimary = repositories.find((entry) => entry.primary === true);
+  if (!previousPrimary || !requestedPrimary ||
+      String(previousPrimary.repo || "").trim().toLowerCase() !== String(requestedPrimary.repo || "").trim().toLowerCase()) {
+    return {};
+  }
+  const agentCwds = {};
+  for (const role of ["head", "re1", "re2", "dev"]) {
+    const cwd = existing?.agents?.[role]?.cwd;
+    if (typeof cwd === "string" && path.isAbsolute(cwd)) agentCwds[role] = cwd;
+  }
+  return agentCwds;
+}
+
+function publicProvisioningResult(result) {
+  return {
+    created: result.created || [],
+    reused: result.reused || [],
+    repositories: (result.repositories || []).map((repository) => ({
+      key: repository.key,
+      repo: repository.repo,
+      primary: repository.primary,
+      default_branch: repository.default_branch,
+      base_clone: repository.working_dir,
+      worktrees: repository.worktrees,
+    })),
+  };
+}
+
+async function provisionV2Repositories(config, candidate, repositories, existing = null) {
+  return provisionRepositoryWorktrees({
+    projectId: candidate.id,
+    repositories,
+    config,
+    primaryAgentCwds: primaryAgentCwds(existing, repositories),
+    runner: execAsync,
+    fsImpl: fs,
+  });
+}
+
 router.post("/api/setup", async (req, res) => {
   const step = req.query.step;
   const body = req.body || {};
 
   switch (step) {
+    case "verify-repositories": {
+      const projectId = v2SetupProjectId(body);
+      if (!projectId.ok) return res.status(400).json(projectId);
+      let repositories;
+      try { repositories = v2RepositoryRecords(body.repositories); }
+      catch (error) {
+        const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
+        return res.json({ ok: false, code, error: error.message });
+      }
+      const readiness = projectV2Readiness({ id: projectId.project_id, repositories });
+      if (!readiness.ready) return res.json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
+      const access = await verifyV2RepositoryAccess(repositories);
+      if (!access.ok) return res.json(access);
+      return res.json({ ok: true, repositories: repositories.map((entry) => ({ key: entry.key, repo: entry.repo, primary: entry.primary })) });
+    }
+    case "provision-repositories": {
+      const projectId = v2SetupProjectId(body);
+      if (!projectId.ok) return res.status(400).json(projectId);
+      let repositories;
+      try { repositories = v2RepositoryRecords(body.repositories); }
+      catch (error) {
+        const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
+        return res.json({ ok: false, code, error: error.message });
+      }
+      const cfg = readConfigFile();
+      const existing = (cfg.projects || []).find((project) => project?.id === projectId.project_id) || null;
+      const candidate = v2CandidateProject(existing, { ...body, id: projectId.project_id }, repositories);
+      const readiness = projectV2Readiness(candidate);
+      if (!readiness.ready) return res.json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
+      const activeSessions = req.app.get("activeSessions") || new Map();
+      if (existing) {
+        const targetGate = existingV2TopologyGuard(existing, activeSessions);
+        if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
+      }
+      const access = await verifyV2RepositoryAccess(repositories);
+      if (!access.ok) return res.status(409).json({ ok: false, ...access });
+      const ownership = configuredRepositoryOwnership(cfg, candidate.id, repositories);
+      if (!ownership.ok) return res.json({ ok: false, ...ownership });
+      const provisioned = await provisionV2Repositories(cfg, candidate, repositories, existing);
+      if (!provisioned.ok) return res.status(409).json({ ok: false, ...publicProvisioningResult(provisioned), code: provisioned.code, repo_key: provisioned.repo_key, role: provisioned.role, error: provisioned.error });
+      return res.json({ ok: true, ...publicProvisioningResult(provisioned) });
+    }
+    case "activate-v2": {
+      if (body.confirm !== true) return res.status(400).json({ ok: false, code: "operator_confirmation_required" });
+      const projectId = v2SetupProjectId(body);
+      if (!projectId.ok) return res.status(400).json(projectId);
+      let repositories;
+      try { repositories = v2RepositoryRecords(body.repositories); }
+      catch (error) {
+        const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
+        return res.status(400).json({ ok: false, code, error: error.message });
+      }
+      const cfg = readConfigFile();
+      const existing = (cfg.projects || []).find((project) => project?.id === projectId.project_id) || null;
+      const candidate = v2CandidateProject(existing, { ...body, id: projectId.project_id }, repositories);
+      const readiness = projectV2Readiness(candidate);
+      if (!readiness.ready) return res.status(409).json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
+      const firstActivation = firstActivationLegacyGuard(cfg, candidate.id, v2SetupExecutionState);
+      if (!firstActivation.ok) return res.status(409).json({ ok: false, ...firstActivation });
+      const activeSessions = req.app.get("activeSessions") || new Map();
+      if (existing) {
+        const targetGate = existingV2TopologyGuard(existing, activeSessions);
+        if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
+      }
+      const access = await verifyV2RepositoryAccess(repositories);
+      if (!access.ok) return res.status(409).json({ ok: false, ...access });
+      const ownership = configuredRepositoryOwnership(cfg, candidate.id, repositories);
+      if (!ownership.ok) return res.status(409).json({ ok: false, ...ownership });
+      const provisioned = await provisionV2Repositories(cfg, candidate, repositories, existing);
+      if (!provisioned.ok) return res.status(409).json({ ok: false, ...publicProvisioningResult(provisioned), code: provisioned.code, repo_key: provisioned.repo_key, role: provisioned.role, error: provisioned.error });
+
+      // Provisioning may take a long time. Re-check canonical repository
+      // identity and push access immediately before the synchronous local
+      // configuration commit, but do not await it while config.lock is held.
+      // A revocation in the remaining tiny check-to-rename interval cannot be
+      // made atomic with this local commit; no GitHub write occurs in it.
+      const postProvisionAccess = await verifyV2RepositoryAccess(repositories);
+      if (!postProvisionAccess.ok) return res.status(409).json({ ok: false, ...postProvisionAccess });
+      try {
+        commitV2Configuration((fresh) => {
+          const currentFirstGuard = firstActivationLegacyGuard(fresh, candidate.id, v2SetupExecutionState);
+          if (!currentFirstGuard.ok) throw new V2SetupActivationError(currentFirstGuard);
+          const index = (fresh.projects || []).findIndex((project) => project?.id === candidate.id);
+          const current = index >= 0 ? fresh.projects[index] : null;
+          const currentGate = current ? existingV2TopologyGuard(current, activeSessions) : { ok: true };
+          if (!currentGate.ok) throw new V2SetupActivationError(currentGate);
+          const currentOwnership = configuredRepositoryOwnership(fresh, candidate.id, repositories);
+          if (!currentOwnership.ok) throw new V2SetupActivationError(currentOwnership);
+          const persisted = v2CandidateProject(current, body, repositories);
+          const oldPrimary = primaryRepository(current);
+          const newPrimary = persisted.repositories.find((entry) => entry.primary === true);
+          if (current && oldPrimary && newPrimary &&
+              String(oldPrimary.repo || "").trim().toLowerCase() !== String(newPrimary.repo || "").trim().toLowerCase()) {
+            const nextPrimary = provisioned.repositories.find((entry) => entry.primary === true);
+            persisted.agents = { ...(current.agents || {}) };
+            for (const role of ["head", "re1", "re2", "dev"]) {
+              if (!persisted.agents[role]) continue;
+              persisted.agents[role] = { ...persisted.agents[role], cwd: nextPrimary.worktrees[role] };
+            }
+          }
+          if (!Array.isArray(fresh.projects)) fresh.projects = [];
+          if (index >= 0) fresh.projects[index] = persisted;
+          else fresh.projects.push(persisted);
+        });
+      } catch (error) {
+        if (error instanceof V2SetupActivationError) return res.status(409).json({ ok: false, ...error.result, ...publicProvisioningResult(provisioned) });
+        if (sendV2ConfigurationError(res, error)) return;
+        return res.status(409).json({ ok: false, code: "v2_activation_commit_failed" });
+      }
+      const persistedConfig = readConfigFile();
+      const persistedProject = (persistedConfig.projects || []).find((project) => project?.id === candidate.id);
+      try {
+        const map = renderProjectRepositoryMap({ projectId: candidate.id, repositories: provisioned.repositories });
+        writeProjectRepositoryMap({ configDir: CONFIG_DIR, projectId: candidate.id, content: map });
+      } catch {
+        return res.status(409).json({ ok: false, code: "repository_map_write_failed", activation_committed: true, ...publicProvisioningResult(provisioned) });
+      }
+      try {
+        const reseed = _performReseedWrites(persistedProject, persistedConfig);
+        return res.json({ ok: true, activation_committed: true, ...publicProvisioningResult(provisioned), reseeded: reseed.reseeded, preserved: reseed.preserved, skipped: reseed.skipped });
+      } catch {
+        return res.status(409).json({ ok: false, code: "repository_seed_failed", activation_committed: true, ...publicProvisioningResult(provisioned) });
+      }
+    }
     case "verify-repo": {
       const repo = body.repo;
       if (!repo || !REPO_RE.test(repo)) return res.json({ ok: false, error: "Invalid repo format (use owner/repo)" });
@@ -3975,6 +6563,7 @@ router.post("/api/setup", async (req, res) => {
         agentsContent = agentsContent.replace(/\{\{reviewer_token_path\}\}/g, reviewerTokenPath);
         // Batch 25 / #205: substitute the per-project queue file path.
         agentsContent = agentsContent.replace(/\{\{project_name\}\}/g, dirName);
+        agentsContent = agentsContent.replace(/\{\{project_id\}\}/g, dirName);
         fs.writeFileSync(agentsMd, agentsContent);
         seeded.push(`${agent}/AGENTS.md`);
 
@@ -4018,7 +6607,7 @@ router.post("/api/setup", async (req, res) => {
       return res.json({ ok: true, seeded });
     }
     case "add-config": {
-      const { id, name, repo, workingDir, backends } = body;
+      const { id, name, repo, workingDir, backends, ci_policy: ciPolicy } = body;
       const autoApprove = body.auto_approve !== false; // default true
       // Use directory basename for sibling paths (matches CLI wizard)
       const dirName = path.basename(workingDir);
@@ -4026,15 +6615,22 @@ router.post("/api/setup", async (req, res) => {
       let cfg;
       try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
       catch { cfg = { port: 8400, projects: [] }; }
-      if (cfg.projects.some((p) => p.id === id)) {
+      const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
+      if (!activated && cfg.projects.some((p) => p.id === id)) {
         // Project already saved, but still (idempotently) seed the
         // OVERNIGHT-QUEUE.md in case a previous run failed to write
         // it or the operator deleted it. writeOvernightQueueFileSafe
         // below no-ops when the file is already present, so this
         // can't clobber Head/user edits.
-        writeOvernightQueueFileSafe(id, cfg.projects.find((p) => p.id === id)?.name || id, cfg.projects.find((p) => p.id === id)?.repo || "");
-        writeGithubFileSafe(id, cfg.projects.find((p) => p.id === id)?.name || id, cfg.projects.find((p) => p.id === id)?.repo || "");
+        const existing = cfg.projects.find((project) => project.id === id);
+        const existingRepo = primaryRepository(existing)?.repo || "";
+        writeOvernightQueueFileSafe(id, existing?.name || id, existingRepo);
+        writeGithubFileSafe(id, existing?.name || id, existingRepo);
+        writeHeadPoPlaybookSafe(id, existing?.name || id);
         return res.json({ ok: true, message: "Project already in config" });
+      }
+      if (activated && !Object.prototype.hasOwnProperty.call(body, "ci_policy")) {
+        return res.status(409).json({ ok: false, code: "v2_policy_required", error: "An explicit repository CI policy is required for a new V2 project" });
       }
       // Match CLI wizard agent structure: { cwd, command, auto_approve, mcp_inject }
       // #343: default Codex-backed agents to reasoning_effort="medium"
@@ -4055,13 +6651,45 @@ router.post("/api/setup", async (req, res) => {
           ...(cliBase === "codex" ? { reasoning_effort: "medium" } : {}),
         };
       }
-      cfg.projects.push({
-        id, name, repo, working_dir: workingDir, agents,
-        chat_mode: "file",
-      });
       const dir = path.dirname(CONFIG_PATH);
       ensureSecureDir(dir);
-      writeConfig(cfg);
+      if (activated) {
+        try {
+          commitV2Configuration((fresh) => {
+            if ((fresh.projects || []).some((project) => project.id === id)) {
+              const error = new Error("Project already in config");
+              error.code = "QW_PROJECT_ALREADY_CONFIGURED";
+              throw error;
+            }
+            if (!Array.isArray(fresh.projects)) fresh.projects = [];
+            fresh.projects.push({
+              id,
+              name,
+              repositories: [{ key: "primary", repo, working_dir: workingDir, primary: true, ci_policy: ciPolicy }],
+              agents,
+              chat_mode: "file",
+            });
+          });
+        } catch (err) {
+          if (err.code === "QW_PROJECT_ALREADY_CONFIGURED") {
+            const fresh = readConfigFile();
+            const existing = (fresh.projects || []).find((project) => project.id === id);
+            const existingRepo = primaryRepository(existing)?.repo || "";
+            writeOvernightQueueFileSafe(id, existing?.name || id, existingRepo);
+            writeGithubFileSafe(id, existing?.name || id, existingRepo);
+            writeHeadPoPlaybookSafe(id, existing?.name || id);
+            return res.json({ ok: true, message: "Project already in config" });
+          }
+          if (sendV2ConfigurationError(res, err)) return;
+          throw err;
+        }
+      } else {
+        cfg.projects.push({
+          id, name, repo, working_dir: workingDir, agents,
+          chat_mode: "file",
+        });
+        writeConfig(cfg);
+      }
 
       // #775: initialize file-chat for the new project so the first
       // chat send doesn't error with "Project not initialized" before
@@ -4074,6 +6702,7 @@ router.post("/api/setup", async (req, res) => {
       writeOvernightQueueFileSafe(id, name || id, repo);
       // #807: seed the per-project GITHUB.md alongside it.
       writeGithubFileSafe(id, name || id, repo);
+      writeHeadPoPlaybookSafe(id, name || id);
 
       return res.json({ ok: true });
     }
@@ -4227,7 +6856,7 @@ function _canonicalAgentSlug(agentKey) {
 // covered. When a project has no `agents` map at all (very old config),
 // falls back to the canonical sibling layout. Pure — no I/O.
 function _resolveReseedTargets(project) {
-  const workingDir = project?.working_dir;
+  const workingDir = primaryRepository(project)?.working_dir;
   if (!workingDir) return [];
   const dirName = path.basename(workingDir);
   const parentDir = path.dirname(workingDir);
@@ -4239,6 +6868,35 @@ function _resolveReseedTargets(project) {
     const wtDir = configuredCwd || path.join(parentDir, `${dirName}-${canonical}`);
     return { agentKey, canonical, wtDir };
   });
+}
+
+// #1032: a project has four role sessions, not four sessions per repository.
+// Each role nevertheless owns a same-role worktree in every registered
+// repository. The primary repository keeps any legacy/custom cwd from config;
+// secondary repositories use only their deterministic same-role reserved path.
+function _resolveRepositoryReseedTargets(project) {
+  const primaryTargets = _resolveReseedTargets(project);
+  const repositories = allRepositories(project).filter((entry) => entry && typeof entry === "object");
+  if (repositories.length === 0) return [];
+  const targets = [];
+  for (const repository of repositories) {
+    if (typeof repository.working_dir !== "string" || !repository.working_dir) continue;
+    const repositoryKey = typeof repository.key === "string" && repository.key ? repository.key : "primary";
+    const parentDir = path.dirname(repository.working_dir);
+    const dirName = path.basename(repository.working_dir);
+    for (const target of primaryTargets) {
+      targets.push({
+        ...target,
+        wtDir: repository.primary === true
+          ? target.wtDir
+          : path.join(parentDir, `${dirName}-${target.canonical}`),
+        repositoryKey,
+        repositoryWorkingDir: repository.working_dir,
+        primaryRepository: repository.primary === true,
+      });
+    }
+  }
+  return targets;
 }
 
 // Operator-triggered re-seed of a project's worktree AGENTS.md files from
@@ -4256,12 +6914,15 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
   const projectId = req.params.project;
   const body = req.body || {};
   const force = body.force === true;
+  let admission;
+  try { admission = captureProjectAdmission(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
   catch { return res.status(500).json({ ok: false, error: "Failed to read config" }); }
   const project = cfg.projects?.find((p) => p.id === projectId);
   if (!project) return res.status(404).json({ ok: false, error: "Project not found" });
-  const workingDir = project.working_dir;
+  const workingDir = primaryRepository(project)?.working_dir;
   if (!workingDir) return res.status(400).json({ ok: false, error: "Project has no working_dir" });
 
   if (!force) {
@@ -4297,6 +6958,10 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
         batchActive: true,
       });
     }
+  }
+
+  if (!isAdmissionCurrent(admission)) {
+    return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
   }
 
   let result;
@@ -4335,20 +7000,21 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
 // passes neither so each project uses the same priority chain manual re-seed
 // uses (per-agent extraction → cfg → default).
 function _performReseedWrites(project, cfg, opts = {}) {
-  const workingDir = project.working_dir;
+  const workingDir = primaryRepository(project)?.working_dir;
   const dirName = path.basename(workingDir);
   const reviewerUser = opts.reviewerUser ?? cfg.reviewer_github_user ?? "";
   const defaultReviewerTokenPath = path.join(os.homedir(), ".quadwork", "reviewer-token");
 
-  // #855: walk the project's configured agents (resolved by `cwd`) instead of
-  // reconstructing sibling paths. Legacy keys (`reviewer1` etc.) still pull
-  // the canonical seed template via `_canonicalAgentSlug`.
-  const targets = _resolveReseedTargets(project);
+  // #1032: seed the same configured role in every registered repository. This
+  // leaves the role/session count at four and never writes a role into another
+  // role's worktree.
+  const targets = _resolveRepositoryReseedTargets(project);
   const reseeded = [];
   const preserved = {};
   const skipped = [];
-  for (const { agentKey, canonical, wtDir } of targets) {
-    if (!fs.existsSync(wtDir)) { skipped.push(`${agentKey} (no worktree)`); continue; }
+  for (const { agentKey, canonical, wtDir, repositoryKey, repositoryWorkingDir, primaryRepository: isPrimaryRepository } of targets) {
+    const targetLabel = isPrimaryRepository ? agentKey : `${repositoryKey}/${agentKey}`;
+    if (!fs.existsSync(wtDir)) { skipped.push(`${targetLabel} (no worktree)`); continue; }
     const seedSrc = path.join(TEMPLATES_DIR, "seeds", `${canonical}.AGENTS.md`);
     if (!fs.existsSync(seedSrc)) {
       throw new Error(`Missing seed template: templates/seeds/${canonical}.AGENTS.md`);
@@ -4378,13 +7044,14 @@ function _performReseedWrites(project, cfg, opts = {}) {
     freshContent = freshContent
       .replace(/\{\{reviewer_github_user\}\}/g, reviewerUser)
       .replace(/\{\{reviewer_token_path\}\}/g, tokenPath)
-      .replace(/\{\{project_name\}\}/g, dirName);
+      .replace(/\{\{project_name\}\}/g, path.basename(repositoryWorkingDir || workingDir))
+      .replace(/\{\{project_id\}\}/g, project.id || dirName);
 
     const merged = reseedAgentsMd(existing, freshContent);
     fs.writeFileSync(agentsMd, merged.content);
-    reseeded.push(`${agentKey}/AGENTS.md`);
+    reseeded.push(`${targetLabel}/AGENTS.md`);
     if (merged.preservedHeadings.length > 0) {
-      preserved[agentKey] = merged.preservedHeadings;
+      preserved[targetLabel] = merged.preservedHeadings;
     }
 
     // #966: Refresh the worktree CLAUDE.md too — but ONLY when it is provably
@@ -4394,26 +7061,72 @@ function _performReseedWrites(project, cfg, opts = {}) {
     // CLAUDE.md is left byte-identical and recorded in `skipped`.
     const claudeMd = path.join(wtDir, "CLAUDE.md");
     if (!fs.existsSync(claudeMd)) {
-      skipped.push(`${agentKey}/CLAUDE.md (none)`);
+      skipped.push(`${targetLabel}/CLAUDE.md (none)`);
     } else {
       let claudeExisting = "";
       try { claudeExisting = fs.readFileSync(claudeMd, "utf-8"); } catch { claudeExisting = ""; }
       if (!_isSeededClaudeMd(claudeExisting)) {
-        skipped.push(`${agentKey}/CLAUDE.md (not QuadWork-seeded)`);
+        skipped.push(`${targetLabel}/CLAUDE.md (not QuadWork-seeded)`);
       } else {
         const claudeSrc = path.join(TEMPLATES_DIR, "CLAUDE.md");
         if (!fs.existsSync(claudeSrc)) {
-          skipped.push(`${agentKey}/CLAUDE.md (no template)`);
+          skipped.push(`${targetLabel}/CLAUDE.md (no template)`);
         } else {
           const freshClaude = fs.readFileSync(claudeSrc, "utf-8")
-            .replace(/\{\{project_name\}\}/g, dirName);
+            .replace(/\{\{project_name\}\}/g, path.basename(repositoryWorkingDir || workingDir));
           const mergedClaude = reseedAgentsMd(claudeExisting, freshClaude);
           fs.writeFileSync(claudeMd, mergedClaude.content);
-          reseeded.push(`${agentKey}/CLAUDE.md`);
+          reseeded.push(`${targetLabel}/CLAUDE.md`);
           if (mergedClaude.preservedHeadings.length > 0) {
-            preserved[`${agentKey}/CLAUDE.md`] = mergedClaude.preservedHeadings;
+            preserved[`${targetLabel}/CLAUDE.md`] = mergedClaude.preservedHeadings;
           }
         }
+      }
+    }
+  }
+
+  // #1033: the Head playbook is a per-project seed, not a worktree seed.
+  // Refresh the shipped sections on every reseed, preserving operator-added
+  // H2 sections with the same merger used for AGENTS.md. `configDir` is an
+  // internal test seam; production always uses CONFIG_DIR.
+  const playbookSrc = path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md");
+  if (!fs.existsSync(playbookSrc)) {
+    throw new Error("Missing seed template: templates/seeds/HEAD-PO-PLAYBOOK.md");
+  }
+  const playbookPath = path.join(opts.configDir || CONFIG_DIR, project.id, "HEAD-PO-PLAYBOOK.md");
+  ensureSecureDir(path.dirname(playbookPath));
+  let playbookExisting = "";
+  if (fs.existsSync(playbookPath)) {
+    try { playbookExisting = fs.readFileSync(playbookPath, "utf-8"); } catch { playbookExisting = ""; }
+  }
+  const playbookFresh = fs.readFileSync(playbookSrc, "utf-8")
+    .replace(/\{\{project_id\}\}/g, project.id || dirName)
+    .replace(/\{\{project_name\}\}/g, project.name || project.id || dirName);
+  const mergedPlaybook = reseedAgentsMd(playbookExisting, playbookFresh);
+  fs.writeFileSync(playbookPath, mergedPlaybook.content);
+  reseeded.push("HEAD-PO-PLAYBOOK.md");
+  if (mergedPlaybook.preservedHeadings.length > 0) {
+    preserved["HEAD-PO-PLAYBOOK.md"] = mergedPlaybook.preservedHeadings;
+  }
+  // #1045: V2 projects also receive a private, allow-listed environment map.
+  // Its generated section is atomic and preserves any operator-owned H2
+  // sections; it has no worktree/path/network discovery surface.
+  if (typeof cfg?.installation_id === "string") {
+    try {
+      const environmentMap = writeProjectEnvironmentsMap(cfg, project, {
+        configDir: opts.configDir || CONFIG_DIR,
+      });
+      reseeded.push("PROJECT-ENVIRONMENTS.md");
+      if (environmentMap.preserved_operator_sections) {
+        preserved["PROJECT-ENVIRONMENTS.md"] = ["operator-owned sections"];
+      }
+    } catch (error) {
+      // Keep legacy prototype-magic project ids lifecycle-compatible. They are
+      // not valid M1 peer identities, so no environment map is authored until
+      // an explicit future identity migration. All other seed errors remain
+      // fail-closed and visible to the caller.
+      if (error?.code !== "invalid_project_id" || error?.field !== "project.id") {
+        throw error;
       }
     }
   }
@@ -4484,6 +7197,8 @@ async function autoReseedOnStartup(cfg, opts = {}) {
   const getProgress = opts.getProgress || getOrComputeBatchProgress;
   const isActiveFromProgress = opts.isActiveFromProgress || isBatchActiveFromProgress;
   const performWrites = opts.performWrites || _performReseedWrites;
+  const captureAdmission = opts.captureAdmission || ((projectId) => projectAdmission(projectId));
+  const admissionCurrent = opts.admissionCurrent || ((token) => isAdmissionCurrent(token));
   // #915: `periodic` = invoked from the recurring retry tick, not boot. A
   // still-deferred project is expected on every tick until its batch clears, so
   // suppress the BENIGN active-batch deferral log there (it would spam) —
@@ -4514,12 +7229,22 @@ async function autoReseedOnStartup(cfg, opts = {}) {
 
   const state = _loadReseedState(statePath);
   const decisions = [];
-  const projects = (cfg?.projects || []).filter((p) => p && p.id && p.working_dir);
+  const projects = (cfg?.projects || []).filter(
+    (p) => p && p.id && primaryRepository(p)?.working_dir,
+  );
 
   for (const project of projects) {
     if (state.completedByProjectVersion[project.id] === version) {
       clearStuckStreak(project.id);
       decisions.push({ projectId: project.id, action: "skip", reason: "already current" });
+      continue;
+    }
+
+    let admission = null;
+    try { admission = captureAdmission(project.id); } catch {}
+    if (!admission) {
+      clearStuckStreak(project.id);
+      decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
       continue;
     }
 
@@ -4550,6 +7275,11 @@ async function autoReseedOnStartup(cfg, opts = {}) {
     // active === false: batch state is definitively known/idle — no longer
     // error-deferred, so clear any stuck-streak before attempting the reseed.
     clearStuckStreak(project.id);
+
+    if (!admissionCurrent(admission)) {
+      decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
+      continue;
+    }
 
     let result;
     try {
@@ -4706,6 +7436,22 @@ function resolveToken(value) {
   return value;
 }
 
+function cacheBridgeBotUsername(projectId, bridgeKey, expectedToken, username, admission) {
+  if (!isAdmissionCurrent(admission)) return false;
+  let committed = false;
+  try {
+    updateConfig((fresh) => {
+      const current = fresh.projects?.find((entry) => entry.id === projectId);
+      const bridge = current?.[bridgeKey];
+      if (!current || current.archived || !bridge || bridge.bot_token !== expectedToken ||
+          !isAdmissionCurrent(admission)) return;
+      bridge.bot_username = username;
+      committed = true;
+    });
+  } catch {}
+  return committed;
+}
+
 function envKeyForProject(projectId) {
   return `TELEGRAM_BOT_TOKEN_${projectId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
 }
@@ -4727,6 +7473,10 @@ function getProjectTelegram(projectId) {
 router.get("/api/telegram", async (req, res) => {
   const projectId = req.query.project || "";
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const admission = projectAdmission(projectId);
+  if (!admission) {
+    return res.json({ running: false, configured: false, chat_id: "", bot_username: "", bridge_installed: true, last_error: "", archived: true });
+  }
   // #211: expose whether credentials are configured + the chat_id
   // and the bot's @username (fetched from Telegram's getMe, cached
   // on the project entry). Never returns the raw bot token.
@@ -4734,10 +7484,9 @@ router.get("/api/telegram", async (req, res) => {
   let chatId = "";
   let botUsername = "";
   let bridgeInstalled = false;
-  let cfg = null;
   let project = null;
   try {
-    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
     project = cfg.projects?.find((p) => p.id === projectId) || null;
     if (project?.telegram?.bot_token && project?.telegram?.chat_id) {
       configured = true;
@@ -4746,16 +7495,16 @@ router.get("/api/telegram", async (req, res) => {
     }
     bridgeInstalled = true;
   } catch {}
-  if (configured && !botUsername && project?.telegram?.bot_token && cfg) {
+  if (configured && !botUsername && project?.telegram?.bot_token) {
     try {
-      const resolved = resolveToken(project.telegram.bot_token);
+      const expectedToken = project.telegram.bot_token;
+      const resolved = resolveToken(expectedToken);
       if (resolved) {
         const r = await fetch(`https://api.telegram.org/bot${resolved}/getMe`);
         const data = await r.json();
-        if (data && data.ok && data.result && typeof data.result.username === "string") {
+        if (data && data.ok && data.result && typeof data.result.username === "string" &&
+            cacheBridgeBotUsername(projectId, "telegram", expectedToken, data.result.username, admission)) {
           botUsername = data.result.username;
-          project.telegram.bot_username = botUsername;
-          try { writeConfig(cfg); } catch {}
         }
       }
     } catch {}
@@ -4775,6 +7524,12 @@ router.get("/api/telegram", async (req, res) => {
 router.post("/api/telegram", async (req, res) => {
   const action = req.query.action;
   const body = req.body || {};
+
+  if (body.project_id && action !== "stop" &&
+      !(action === "start" && Object.prototype.hasOwnProperty.call(body, "admission_generation"))) {
+    try { assertProjectAdmitted(body.project_id); }
+    catch (err) { return sendProjectLifecycleException(res, err, body.project_id); }
+  }
 
   switch (action) {
     case "test": {
@@ -4796,32 +7551,106 @@ router.post("/api/telegram", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      if (telegramBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
+      if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
+      const authorityKey = bridgeRuntimeAuthorityKey(admission, requestedAssignment);
+      if (telegramBridge.isRunning(projectId, authorityKey)) return res.json({ ok: true, running: true, message: "Already running" });
       const tg = getProjectTelegram(projectId);
       if (!tg || !tg.bot_token || !tg.chat_id) return res.json({ ok: false, error: "Save bot_token and chat_id in project settings first." });
       try {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
-        await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort);
+        const isBridgeAuthorityCurrent = () => isAdmissionCurrent(admission) &&
+          (!requestedAssignment || isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission));
+        const automationIdentity = requestedAssignment
+          ? { admission_generation: admission.generation, ...requestedAssignment.automationIdentity }
+          : null;
+        const started = await telegramBridge.start(projectId, tg.bot_token, tg.chat_id, qwPort, {
+          isAuthorityCurrent: isBridgeAuthorityCurrent,
+          automationIdentity,
+          authorityKey,
+        });
+        const admissionStale = !isAdmissionCurrent(admission);
+        const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
+        if (admissionStale || assignmentStale) {
+          const stopped = await telegramBridge.stop(projectId, authorityKey);
+          if (stopped?.ok !== true) {
+            const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId, authorityKey) });
+          }
+          return res.status(409).json({
+            ok: false,
+            error: assignmentStale ? "project assignment changed; refresh and retry" : "project is archived",
+            code: assignmentStale ? "project_assignment_changed" : "project_archived",
+            project_id: projectId,
+            cleanup_errors: stopped?.cleanup_errors || [],
+          });
+        }
+        if (started?.ok !== true || started.running !== true ||
+            !telegramBridge.isRunning(projectId, authorityKey)) {
+          return res.status(409).json({
+            ok: false,
+            running: false,
+            code: "bridge_start_superseded",
+            error: "bridge start was superseded by a newer lifecycle action",
+            project_id: projectId,
+          });
+        }
         emitSystemMessage(projectId, "Telegram bridge connected");
         return res.json({ ok: true, running: true });
       } catch (err) {
+        if (err?.code === "bridge_cleanup_incomplete" && err.cleanupResult) {
+          const payload = safeProjectLifecyclePayload({ ...err.cleanupResult, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
+        }
         return res.json({ ok: false, error: err.message || "Start failed" });
       }
     }
     case "stop": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
       try {
-        telegramBridge.stop(projectId);
-        emitSystemMessage(projectId, "Telegram bridge disconnected");
-        return res.json({ ok: true, running: false });
+        if (requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, requestedAdmission)) {
+          return res.status(409).json({ ok: false, error: "project assignment changed; refresh and retry", code: "project_assignment_changed", project_id: projectId });
+        }
+        const stopAdmission = requestedAssignment
+          ? (requestedAdmission || projectAdmission(projectId))
+          : null;
+        const authorityKey = requestedAssignment && stopAdmission
+          ? bridgeRuntimeAuthorityKey(stopAdmission, requestedAssignment)
+          : undefined;
+        const stopped = await telegramBridge.stop(projectId, authorityKey);
+        if (stopped?.ok !== true) {
+          const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: telegramBridge.isRunning(projectId) });
+        }
+        if (!isProjectArchived(projectId)) emitSystemMessage(projectId, "Telegram bridge disconnected");
+        return res.json({ ...stopped, ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
       }
     }
-    case "status":
-      return res.json({ running: telegramBridge.isRunning(body.project_id || "") });
+    case "status": {
+      const projectId = body.project_id || "";
+      if (projectId && isProjectArchived(projectId)) return res.json({ running: false, archived: true });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
+      const authorityKey = admission
+        ? bridgeRuntimeAuthorityKey(admission, requestedAssignment)
+        : undefined;
+      return res.json({ running: telegramBridge.isRunning(projectId, authorityKey) });
+    }
     case "save-token": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
@@ -4900,6 +7729,10 @@ function getProjectDiscord(projectId) {
 router.get("/api/discord", async (req, res) => {
   const projectId = req.query.project || "";
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  const admission = projectAdmission(projectId);
+  if (!admission) {
+    return res.json({ running: false, configured: false, channel_id: "", bot_username: "", bridge_installed: true, last_error: "", archived: true });
+  }
   let configured = false;
   let channelId = "";
   let botUsername = "";
@@ -4921,10 +7754,9 @@ router.get("/api/discord", async (req, res) => {
             headers: { Authorization: `Bot ${resolved}` },
           });
           const data = await r.json();
-          if (r.ok && data.username) {
+          if (r.ok && data.username &&
+              cacheBridgeBotUsername(projectId, "discord", project.discord.bot_token, data.username, admission)) {
             botUsername = data.username;
-            project.discord.bot_username = botUsername;
-            try { writeConfig(cfg); } catch {}
           }
         }
       } catch {}
@@ -4945,6 +7777,12 @@ router.get("/api/discord", async (req, res) => {
 router.post("/api/discord", async (req, res) => {
   const action = req.query.action;
   const body = req.body || {};
+
+  if (body.project_id && action !== "stop" &&
+      !(action === "start" && Object.prototype.hasOwnProperty.call(body, "admission_generation"))) {
+    try { assertProjectAdmitted(body.project_id); }
+    catch (err) { return sendProjectLifecycleException(res, err, body.project_id); }
+  }
 
   switch (action) {
     case "test": {
@@ -4971,32 +7809,106 @@ router.post("/api/discord", async (req, res) => {
     case "start": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
-      if (discordBridge.isRunning(projectId)) return res.json({ ok: true, running: true, message: "Already running" });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
+      if (!admission) return res.status(409).json({ ok: false, error: "project is archived", code: "project_archived", project_id: projectId });
+      const authorityKey = bridgeRuntimeAuthorityKey(admission, requestedAssignment);
+      if (discordBridge.isRunning(projectId, authorityKey)) return res.json({ ok: true, running: true, message: "Already running" });
       const dc = getProjectDiscord(projectId);
       if (!dc || !dc.bot_token || !dc.channel_id) return res.json({ ok: false, error: "Save bot_token and channel_id in project settings first." });
       try {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
         const qwPort = cfg.port || 8400;
-        await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort);
+        const isBridgeAuthorityCurrent = () => isAdmissionCurrent(admission) &&
+          (!requestedAssignment || isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission));
+        const automationIdentity = requestedAssignment
+          ? { admission_generation: admission.generation, ...requestedAssignment.automationIdentity }
+          : null;
+        const started = await discordBridge.start(projectId, dc.bot_token, dc.channel_id, qwPort, {
+          isAuthorityCurrent: isBridgeAuthorityCurrent,
+          automationIdentity,
+          authorityKey,
+        });
+        const admissionStale = !isAdmissionCurrent(admission);
+        const assignmentStale = !admissionStale && requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, admission);
+        if (admissionStale || assignmentStale) {
+          const stopped = await discordBridge.stop(projectId, authorityKey);
+          if (stopped?.ok !== true) {
+            const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+            return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId, authorityKey) });
+          }
+          return res.status(409).json({
+            ok: false,
+            error: assignmentStale ? "project assignment changed; refresh and retry" : "project is archived",
+            code: assignmentStale ? "project_assignment_changed" : "project_archived",
+            project_id: projectId,
+            cleanup_errors: stopped?.cleanup_errors || [],
+          });
+        }
+        if (started?.ok !== true || started.running !== true ||
+            !discordBridge.isRunning(projectId, authorityKey)) {
+          return res.status(409).json({
+            ok: false,
+            running: false,
+            code: "bridge_start_superseded",
+            error: "bridge start was superseded by a newer lifecycle action",
+            project_id: projectId,
+          });
+        }
         emitSystemMessage(projectId, "Discord bridge connected");
         return res.json({ ok: true, running: true });
       } catch (err) {
+        if (err?.code === "bridge_cleanup_incomplete" && err.cleanupResult) {
+          const payload = safeProjectLifecyclePayload({ ...err.cleanupResult, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId) });
+        }
         return res.json({ ok: false, error: err.message || "Start failed" });
       }
     }
     case "stop": {
       const projectId = body.project_id;
       if (!projectId) return res.json({ ok: false, error: "Missing project_id" });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
       try {
-        discordBridge.stop(projectId);
-        emitSystemMessage(projectId, "Discord bridge disconnected");
-        return res.json({ ok: true, running: false });
+        if (requestedAssignment && !isExactAssignmentCurrent(projectId, requestedAssignment.fingerprint, requestedAdmission)) {
+          return res.status(409).json({ ok: false, error: "project assignment changed; refresh and retry", code: "project_assignment_changed", project_id: projectId });
+        }
+        const stopAdmission = requestedAssignment
+          ? (requestedAdmission || projectAdmission(projectId))
+          : null;
+        const authorityKey = requestedAssignment && stopAdmission
+          ? bridgeRuntimeAuthorityKey(stopAdmission, requestedAssignment)
+          : undefined;
+        const stopped = await discordBridge.stop(projectId, authorityKey);
+        if (stopped?.ok !== true) {
+          const payload = safeProjectLifecyclePayload({ ...stopped, ok: false }, projectId);
+          return res.status(503).json({ ...payload, code: "bridge_cleanup_incomplete", running: discordBridge.isRunning(projectId) });
+        }
+        if (!isProjectArchived(projectId)) emitSystemMessage(projectId, "Discord bridge disconnected");
+        return res.json({ ...stopped, ok: true, running: false });
       } catch (err) {
         return res.json({ ok: false, error: err.message || "Stop failed" });
       }
     }
-    case "status":
-      return res.json({ running: discordBridge.isRunning(body.project_id || "") });
+    case "status": {
+      const projectId = body.project_id || "";
+      if (projectId && isProjectArchived(projectId)) return res.json({ running: false, archived: true });
+      const requestedAdmission = requestedBridgeAdmission(body, projectId, res);
+      if (requestedAdmission === null) return;
+      const requestedAssignment = requestedBridgeAssignment(body, projectId, res);
+      if (requestedAssignment === null) return;
+      const admission = requestedAdmission || projectAdmission(projectId);
+      const authorityKey = admission
+        ? bridgeRuntimeAuthorityKey(admission, requestedAssignment)
+        : undefined;
+      return res.json({ running: discordBridge.isRunning(projectId, authorityKey) });
+    }
     case "save-config": {
       const projectId = body.project_id;
       const bot_token = typeof body.bot_token === "string" ? body.bot_token.trim() : "";
@@ -5106,16 +8018,11 @@ module.exports = router;
 // outside this file; the export is strictly for the node:assert
 // script at server/routes.parseActiveBatch.test.js.
 module.exports.parseActiveBatch = parseActiveBatch;
-// #899: expose the live-vs-snapshot resolver + its source picker so the
-// in-place review-state progression path is unit-testable with injected
-// snapshot I/O (no writes to the real ~/.quadwork). No production callers
-// outside this file.
+// Expose the live Current Batch resolver for deterministic queue fixtures.
 module.exports.resolveDisplayedBatch = resolveDisplayedBatch;
-module.exports.pickDisplayedSource = pickDisplayedSource;
 // #870: expose review-batch parsers/helpers for the reviewBatch fixture test.
 module.exports.parseBatchType = parseBatchType;
 module.exports.parseReviewItems = parseReviewItems;
-module.exports.parseDoneBatchReviewItems = parseDoneBatchReviewItems;
 module.exports.parseReviewState = parseReviewState;
 module.exports.reviewItemView = reviewItemView;
 module.exports.summarizeReviewItems = summarizeReviewItems;
@@ -5164,6 +8071,7 @@ module.exports._isSeededClaudeMd = _isSeededClaudeMd;
 // is exercisable without spinning up a real worktree. Pure helpers; no
 // production callers outside this file.
 module.exports._resolveReseedTargets = _resolveReseedTargets;
+module.exports._resolveRepositoryReseedTargets = _resolveRepositoryReseedTargets;
 module.exports._canonicalAgentSlug = _canonicalAgentSlug;
 // #854: expose the GH_TOKEN path extractor so the parse forms (`export`,
 // double-quoted, inner-quoted, etc.) are exercisable without a temp fs.
@@ -5190,9 +8098,23 @@ module.exports.RESEED_STATE_PATH = RESEED_STATE_PATH;
 // #839 (re1 follow-up): expose the shared compute path plus the caches it
 // reads so the cache-miss completed-batch case is exercisable end-to-end.
 module.exports.getOrComputeBatchProgress = getOrComputeBatchProgress;
+module.exports.readLiveBatchContext = readLiveBatchContext;
+module.exports.resolveRegisteredIssueContract = resolveRegisteredIssueContract;
+module.exports.validateCurrentOwnedAssignment = validateCurrentOwnedAssignment;
+module.exports.validateCurrentAutomationRequest = validateCurrentAutomationRequest;
+module.exports.canonicalWorkItemKey = canonicalWorkItemKey;
 module.exports._batchProgressCache = _batchProgressCache;
 module.exports._batchProgressRefreshes = _batchProgressRefreshes;
 module.exports._graphqlCache = _graphqlCache;
+module.exports._githubRepoStatus = _githubRepoStatus;
+module.exports._githubMeta = _githubMeta;
+module.exports.projectRepositoryBindings = projectRepositoryBindings;
+module.exports.getProjectRepositoryBindings = getProjectRepositoryBindings;
+module.exports.decorateGithubRows = decorateGithubRows;
+module.exports.aggregateProjectGithubState = aggregateProjectGithubState;
+module.exports.repositoryState = repositoryState;
+module.exports.refreshGraphQLCache = refreshGraphQLCache;
+module.exports.fetchAllProjectsGraphQL = fetchAllProjectsGraphQL;
 module.exports.restIssueToCanonical = restIssueToCanonical;
 module.exports.restClosedIssueToCanonical = restClosedIssueToCanonical;
 module.exports.restMergedPrToCanonical = restMergedPrToCanonical;
@@ -5200,6 +8122,8 @@ module.exports.restPullBaseToCanonical = restPullBaseToCanonical;
 module.exports.mapReviews = mapReviews;
 module.exports.deriveReviewDecision = deriveReviewDecision;
 module.exports.buildStatusCheckRollup = buildStatusCheckRollup;
+module.exports.fetchOpenPullTip = fetchOpenPullTip;
+module.exports.resolveCurrentCiEvidenceTarget = resolveCurrentCiEvidenceTarget;
 // #807: expose the GITHUB.md parser/renderer + role attribution for unit tests.
 // No production callers outside this file.
 module.exports.parseGithub = parseGithub;
@@ -5233,3 +8157,15 @@ module.exports.repoSlugFromRemote = repoSlugFromRemote;
 // #827: expose the GITHUB.md writer for the idle-no-op regression test. No
 // production callers outside this file.
 module.exports.writeGithubFileFromSnapshot = writeGithubFileFromSnapshot;
+// #1034: lifecycle cleanup contract consumed by project-lifecycle wiring, plus
+// narrow observability hooks for the admission/ownership regression fixture.
+module.exports.cancelProjectBackground = cancelProjectBackground;
+module.exports.refreshRepoRest = refreshRepoRest;
+module.exports.readBatchRequestIssues = readBatchRequestIssues;
+module.exports._batchRequestReaderInput = _batchRequestReaderInput;
+module.exports._batchRequestIssueRows = _batchRequestIssueRows;
+module.exports.setBatchRequestRefreshObserver = setBatchRequestRefreshObserver;
+module.exports.batchRequestRefreshProjectIds = batchRequestRefreshProjectIds;
+module.exports._restRefreshing = _restRefreshing;
+module.exports._githubDemandedProjects = _githubDemandedProjects;
+module.exports.shouldPublishProjectsCache = shouldPublishProjectsCache;

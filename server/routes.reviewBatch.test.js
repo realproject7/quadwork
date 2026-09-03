@@ -66,7 +66,9 @@ fs.writeFileSync = function stubWrite(p, data) {
 };
 fs.mkdirSync = () => {};
 fs.statSync = () => ({ mode: 0o700, isDirectory: () => true });
-fs.unlinkSync = () => {};
+fs.unlinkSync = (p) => {
+  if (typeof p === "string" && p.endsWith("batch-progress-cache.json")) snapshotJson = null;
+};
 
 const {
   parseBatchType,
@@ -188,8 +190,7 @@ function reset() {
     ok(data.complete === false, "D: current item not approved → not complete (Done's approved ignored)");
   }
 
-  // ── E. Archive interaction: completed review batch moved to Done →
-  //      still renders from the snapshot, NO gh call, never reverts to code ──
+  // ── E. Archive interaction: Done and snapshots are historical only ────────
   {
     reset();
     cfgJson = JSON.stringify({ projects: [{ id: "rev", repo: "o/r", idle: false }] });
@@ -210,13 +211,14 @@ function reset() {
       "- #870 — approved", "- #871 — approved", "",
     ].join("\n");
     const data = await getOrComputeBatchProgress("rev");
-    ok(ghCalls === 0, `E: archived review batch made ZERO gh calls (got ${ghCalls}) — not reinterpreted as code`);
-    ok(data.batch_type === "ticket-review", "E: batch_type stays ticket-review from the snapshot (never reverts to code)");
-    ok(data.items.length === 2, "E: still renders the 2 review items from the snapshot");
-    ok(data.items.every((it) => it.review_state === "approved"), "E: items keep their review_state (not code merge-progress)");
-    ok(data.complete === true, "E: archived completed review batch reads complete");
-    ok(isBatchActiveFromProgress(data) === false, "E: lifecycle — cleared Active Batch → not active (sticky display only)");
+    ok(ghCalls === 0, `E: cleared Current Batch made ZERO gh calls (got ${ghCalls})`);
+    ok(data.active === false, "E: cleared Current Batch is explicitly inactive");
+    ok(data.batch_number === null, "E: Done/snapshot cannot supply a Current Batch number");
+    ok(data.items.length === 0, "E: Done/snapshot cannot supply Current Batch rows");
+    ok(data.complete === false, "E: historical completion is not Current Batch completion");
+    ok(isBatchActiveFromProgress(data) === false, "E: lifecycle — cleared Active Batch is not active");
     ok(data.liveActiveBatchCleared === true, "E: liveActiveBatchCleared follows the operator's clear");
+    ok(snapshotJson === null, "E: durable clear retires the sticky presentation cache");
   }
 
   // ── F. Regression: a code batch is unchanged + carries batch_type 'code' ─

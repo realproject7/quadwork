@@ -61,7 +61,7 @@ function run() {
     // Inject prose lines into the Open Issues section body.
     md = md.replace("## Open Issues\n\n(none)", "## Open Issues\n\n(none)\nSee #295 for context.\nTracking umbrella: #296");
     const p = parseGithub(md);
-    ok(p.ok === true && p.openIssues.length === 0, "prose #N lines do not become list items");
+    ok(p.ok === false, "prose #N lines inside a machine section are rejected, never parsed as items");
   }
 
   // ── 4) Review Detail: body-marker ROLE, not login (same author, two reviews) ──

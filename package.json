@@ -6,6 +6,9 @@
     "quadwork": "./bin/quadwork.js",
     "quadwork-mcp-operator": "./server/mcp-operator.js"
   },
+  "exports": {
+    "./package.json": "./package.json"
+  },
   "files": [
     "bin/",
     "server/",
@@ -13,6 +16,7 @@
     "!server/__tests__/",
     "templates/",
     "out/",
+    "src/lib/batchIdentity.js",
     "src/lib/injectMode.js",
     "docs/install-mac.md",
     "docs/install-windows.md",
@@ -29,6 +33,7 @@
     "lint": "eslint",
     "server": "node server/",
     "test": "node server/run-tests.js",
+    "resource:staging-proof": "node server/resource-staging-proof.js",
     "prepublishOnly": "npm test",
     "prepack": "npm run build",
     "release:patch": "npm version patch && git push origin main --follow-tags && VERSION=$(node -p 'require(\"./package.json\").version') && gh release create \"v$VERSION\" --generate-notes --latest && npm publish",

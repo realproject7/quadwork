@@ -15,7 +15,16 @@ const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
 
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "qw-854-home-"));
+const originalHomedir = os.homedir;
+os.homedir = () => TEST_HOME;
+process.on("exit", () => {
+  os.homedir = originalHomedir;
+  try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch {}
+});
+
 const CONFIG_PATH = path.join(os.homedir(), ".quadwork", "config.json");
+const CONFIG_DIR = path.dirname(CONFIG_PATH);
 const TEMPLATES_DIR = path.join(__dirname, "..", "templates");
 
 // ── Stub fs.readFileSync for CONFIG_PATH BEFORE requiring routes ──────────
@@ -104,6 +113,9 @@ function makeTempProject(label, agentsLayout) {
   }
   const re1Seed = realReadFileSync(path.join(TEMPLATES_DIR, "seeds", "re1.AGENTS.md"), "utf-8");
   const re2Seed = realReadFileSync(path.join(TEMPLATES_DIR, "seeds", "re2.AGENTS.md"), "utf-8");
+  const playbookSeed = realReadFileSync(path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md"), "utf-8");
+  const playbookVersion = playbookSeed.match(/^\*\*Playbook version:\*\*\s+(\d+\.\d+\.\d+)$/m);
+  assert.ok(playbookVersion, "canonical playbook seed carries a semantic version");
   // The seeds must contain the {{reviewer_token_path}} placeholder for the
   // preservation contract to be meaningful. Asserted up front so a future
   // template refactor that drops the placeholder fails this test loudly.
@@ -129,12 +141,25 @@ function makeTempProject(label, agentsLayout) {
     stubCfgJson = JSON.stringify({
       projects: [{ id: projId, name: "Test1", repo: "ex/test1", working_dir: workingDir, agents }],
     });
+    const playbookPath = path.join(CONFIG_DIR, projId, "HEAD-PO-PLAYBOOK.md");
+    fs.mkdirSync(path.dirname(playbookPath), { recursive: true });
+    fs.writeFileSync(playbookPath, [
+      "# Stale playbook",
+      "",
+      "## 1. Operating model",
+      "stale canonical body",
+      "",
+      "## Operator Notes",
+      "preserve this note",
+      "",
+    ].join("\n"));
 
     await withServer(async (base) => {
       const { status, body } = await post(`${base}/api/projects/${projId}/reseed-agents`, { force: true });
       assert.equal(status, 200, `expected 200, got ${status} ${JSON.stringify(body)}`);
       assert.equal(body.ok, true);
-      assert.equal(body.reseeded.length, 4, "all 4 agents re-seeded");
+      assert.equal(body.reseeded.length, 5, "all 4 agents and the Head playbook re-seeded");
+      assert.deepEqual(body.preserved["HEAD-PO-PLAYBOOK.md"], ["Operator Notes"]);
     });
 
     const re1After = realReadFileSync(path.join(agents.re1.cwd, "AGENTS.md"), "utf-8");
@@ -163,6 +188,12 @@ function makeTempProject(label, agentsLayout) {
     const devAfter  = realReadFileSync(path.join(agents.dev.cwd, "AGENTS.md"), "utf-8");
     assert.ok(!headAfter.includes("GH_TOKEN=$(cat"), "head seed should have no GH_TOKEN line");
     assert.ok(!devAfter.includes("GH_TOKEN=$(cat"),  "dev seed should have no GH_TOKEN line");
+    const playbookAfter = realReadFileSync(playbookPath, "utf-8");
+    assert.ok(playbookAfter.includes(playbookVersion[0]),
+      `manual reseed refreshes the canonical playbook version (${playbookVersion[1]})`);
+    assert.ok(!playbookAfter.includes("stale canonical body"));
+    assert.ok(playbookAfter.includes("preserve this note"),
+      "manual reseed preserves operator-added playbook sections");
   }
 
   // ── Test 2: default-path projects are unaffected. When the existing re1/re2

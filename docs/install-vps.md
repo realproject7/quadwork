@@ -173,7 +173,17 @@ npm install -g pm2
 
 **IMPORTANT:** pm2 strips PATH from child processes. Even if nvm is loaded, the QuadWork process won't have nvm binaries in PATH. **Do not fix with symlinks** — they resolve the binary but not the environment.
 
-Create a wrapper script:
+Before creating or starting the wrapper, complete the explicit resource-policy
+proposal/apply and `temp-install` proposal/apply sequence in
+[Resource preflight and disposable staging evidence](#resource-preflight-and-disposable-staging-evidence)
+below. Then run `quadwork resources preflight --json` and verify the accepted
+temp-root facts are owner-only, disk-backed, and available. The overall
+preflight remains non-zero while the separate containment staging proof is
+pending; temp-root readiness alone is not containment readiness.
+
+Create a wrapper script. The single-quoted `TMPDIR` value must be copied exactly
+from the accepted `runtime_resources.temp_root`; do not compute it with shell
+interpolation, `eval`, a wildcard, or a directory search:
 
 ```bash
 cat > ~/start-quadwork.sh << 'EOF'
@@ -181,6 +191,7 @@ cat > ~/start-quadwork.sh << 'EOF'
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 nvm use 24
+export TMPDIR='/home/quadwork/.quadwork/tmp'
 exec quadwork start
 EOF
 chmod +x ~/start-quadwork.sh
@@ -192,6 +203,14 @@ Start with pm2:
 pm2 start ~/start-quadwork.sh --name quadwork --interpreter /bin/bash
 pm2 save
 ```
+
+`quadwork start` re-reads the fixed policy and re-verifies that exact root before
+loading the server or spawning descendants. If the root is missing, aliased,
+memory-backed, incorrectly owned/mode-set, or below the accepted capacity, it
+discards the unverified Linux `TMPDIR`, prints a typed warning, and keeps the
+dashboard/API diagnostic plane online. Even a verified service `TMPDIR` reports
+`containment_ready=false`; worker cgroup/PTY containment still requires the
+separate staging proof.
 
 Auto-start on reboot:
 
@@ -214,6 +233,283 @@ pm2 start quadwork                # Start
 pm2 restart quadwork              # Restart
 pm2 save                          # Save state (always do after start/stop)
 ```
+
+### Resource preflight and disposable staging evidence
+
+Resource setup is deliberately two-step and is never performed by `start`,
+`init`, or `preflight`. First create a private policy file containing one exact
+`runtime_resources` v1 policy object (not a whole QuadWork config):
+
+```bash
+install -m 600 /dev/null "$HOME/quadwork-resource-policy.json"
+${EDITOR:-vi} "$HOME/quadwork-resource-policy.json"
+quadwork resources configure \
+  --policy-file "$HOME/quadwork-resource-policy.json" \
+  --json
+```
+
+For the measured 8 GiB reference VPS, the v1 proposal shape is:
+
+```json
+{
+  "version": 1,
+  "mode": "systemd-user-v1",
+  "temp_root": "/home/quadwork/.quadwork/tmp",
+  "host_reserve_mib": 1536,
+  "max_worker_scopes": 3,
+  "api": { "memory_low_mib": 512, "memory_max_mib": 1280 },
+  "worker": { "memory_high_mib": 1024, "memory_max_mib": 1200, "swap_max_mib": 512 },
+  "control": { "memory_max_mib": 512, "swap_max_mib": 256, "max_concurrent_children": 2 },
+  "temp_min_free_mib": 4096
+}
+```
+
+This is an operator-visible proposal, not a hidden default. Confirm the account
+path and measured host/swap capacity before accepting it; the strict parser
+rejects omitted or additional fields.
+
+The proposal validates the strict schema, prints the exact policy and a
+SHA-256 token, and makes no changes. Inspect it, then copy that exact token into
+the explicit apply form:
+
+```bash
+quadwork resources configure \
+  --apply \
+  --policy-file "$HOME/quadwork-resource-policy.json" \
+  --accept-sha256 '<exact-token-from-the-proposal>' \
+  --json
+```
+
+Apply re-reads the private policy file, refuses a stale token, and atomically
+updates only `runtime_resources` in the existing private
+`~/.quadwork/config.json`. It never creates a missing config or changes the
+other config fields. The Linux apply requires `/usr/bin/python3` and kernel/
+filesystem support for `renameat2(RENAME_EXCHANGE)`. Python runs with `-I`, a
+fixed script and arguments, and only `LANG=C`/`LC_ALL=C`; it does not inherit
+`PATH`, `HOME`, `PYTHONPATH`, `PYTHONHOME`, loader variables, or other user
+environment. Before creating a config candidate, it creates two private 0600
+probe files through the verified config-directory descriptor, exchanges them
+on that exact filesystem, and verifies their moved inode identities. POSIX has
+no inode-conditional unlink, so the probe files are never deleted
+automatically. The JSON result reports them as
+`result.exchange_probe_recovery_entries`.
+
+The config exchange also deliberately keeps the previous 0600 config as a
+randomly named private `.recovery` sibling and reports it as
+`result.previous_config_recovery_entry`. A refusal after probe or candidate
+creation reports every known exact basename in `recovery_entries`. These names
+are recovery candidates, not permission to delete: an exchange race can leave
+an unexpected inode under any reported name. If atomic exchange is unavailable
+or its displaced inode does not match the accepted config, apply never reports
+success and preserves every entry for explicit recovery.
+
+On the target Ubuntu host, stop every process that can write
+`~/.quadwork`, then inspect exactly one reported basename at a time. `stat`
+without `-L` is the required non-dereferencing check. Replace only the quoted
+value below; do not derive it with a wildcard:
+
+```bash
+cd -- "$HOME/.quadwork" || exit 1
+ENTRY='.config.json.resource-install-12345-0123456789abcdef01234567.recovery'
+[ -n "$ENTRY" ] && [ "$ENTRY" != '.' ] && [ "$ENTRY" != '..' ] && \
+  [ "$(basename -- "$ENTRY")" = "$ENTRY" ] || { printf '%s\n' 'invalid recovery basename' >&2; exit 1; }
+OWNER_UID=$(id -u) || exit 1
+BEFORE=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+printf 'recovery record: %s\n' "$BEFORE"
+IFS='|' read -r MODE_HEX ENTRY_UID MODE NLINK DEV INO <<EOF
+$BEFORE
+EOF
+[ $((0x$MODE_HEX & 0170000)) -eq $((0100000)) ] && \
+  [ "$ENTRY_UID" = "$OWNER_UID" ] && \
+  [ "$MODE" = '600' ] && [ "$NLINK" = '1' ] || exit 1
+AFTER=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+[ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'recovery inode changed; stop' >&2; exit 1; }
+```
+
+Only after independently identifying the contents and repeating the exact
+`AFTER` check immediately before the action may the operator use an exact
+command such as `rm -- "$ENTRY"`. Never use `*`, a prefix match, `find
+-delete`, or remove a different entry. Run the same record/recheck sequence for
+each reported probe basename; empty content alone is not identity proof.
+A reported basename can be absent if the helper failed before creating it; an
+`ENOENT` for that exact name requires no cleanup and is not permission to inspect
+or delete similarly named entries.
+
+Next, propose the disk-backed, owner-only temp-root operation derived from the
+persisted policy:
+
+```bash
+quadwork resources temp-install --json
+quadwork resources temp-install \
+  --apply \
+  --accept-sha256 '<exact-token-from-the-temp-proposal>' \
+  --json
+```
+
+The first command is read-only. The apply form can create or verify only the
+policy-owned temp root and refuses aliases, memory-backed filesystems, unsafe
+ownership/mode, or insufficient accepted capacity. It does not clean legacy
+`/tmp` paths, assign per-worker `TMPDIR`, install systemd units, restart
+QuadWork, or run pressure tests. A failed create performs no automatic rename,
+quarantine, or deletion: it returns `temp_install_failed_cleanup_required` and
+leaves the operation-created root and any substituted entries for explicit
+operator recovery. The refusal JSON reports the exact target basename in
+`recovery_entries`. Use the accepted `temp_root` parent and that one basename,
+never a wildcard; record and recheck the non-dereferenced Ubuntu facts before
+any manual action. If no exact basename remains knowable, JSON instead reports
+`recovery_scope: operation_created_entry_unlocated`; stop all writers and
+inspect the accepted parent as a whole, but do not infer a deletion target from
+a prefix, timestamp, inode order, or other heuristic:
+
+```bash
+ls -lai -- '/exact/parent/from-the-accepted-temp_root'
+```
+
+When an exact basename is reported, use this per-entry sequence:
+
+```bash
+TEMP_PARENT='/exact/parent/from-the-accepted-temp_root'
+ENTRY='exact-reported-temp-root-basename'
+cd -- "$TEMP_PARENT" || exit 1
+[ -n "$ENTRY" ] && [ "$ENTRY" != '.' ] && [ "$ENTRY" != '..' ] && \
+  [ "$(basename -- "$ENTRY")" = "$ENTRY" ] || { printf '%s\n' 'invalid recovery basename' >&2; exit 1; }
+OWNER_UID=$(id -u) || exit 1
+BEFORE=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+printf 'temp recovery record: %s\n' "$BEFORE"
+IFS='|' read -r MODE_HEX ENTRY_UID MODE NLINK DEV INO <<EOF
+$BEFORE
+EOF
+[ $((0x$MODE_HEX & 0170000)) -eq $((0040000)) ] && \
+  [ "$ENTRY_UID" = "$OWNER_UID" ] && [ "$MODE" = '700' ] || exit 1
+AFTER=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+[ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'temp recovery inode changed; stop' >&2; exit 1; }
+```
+
+Do not move or remove it until its owner, type, mode, link count, device, inode,
+and contents are understood and the exact record still matches.
+
+Run the shipped diagnostic before considering any resource-containment work:
+
+```bash
+quadwork resources preflight
+quadwork resources preflight --json
+```
+
+This preflight is read-only. A non-zero result is expected while the policy,
+temp boundary, or staging proof is unavailable; it does not install, repair,
+create, or modify systemd units. Policy/temp acceptance alone is not
+containment proof. The current `systemd-run --user --scope
+--collect --quiet` contract remains `candidate_pending_staging` and is not a
+supported production launch path.
+
+Never run memory pressure or fault injection on production. The source checkout
+contains an opt-in staging coordinator for a disposable VPS, but its bundled
+adapter deliberately returns `proof_unavailable` instead of launching a fake or
+incomplete test. A deployment-specific live adapter must provide authenticated
+API, Primary Chat-WebSocket, unrelated-worker, cgroup, node-pty, and temp probes.
+Even then, every phase remains blocked until Linux, cgroup v2, the user manager,
+the separate run flag, and this exact acknowledgement all match:
+
+```bash
+machine_id="$(tr -d '\n' < /etc/machine-id)"
+npm run resource:staging-proof -- \
+  --json \
+  --run-pressure-matrix \
+  --ack-disposable-host "DISPOSABLE-STAGING:${machine_id}"
+```
+
+Run that command only from the matching QuadWork source checkout on the named
+disposable machine. Omitting either opt-in, copying an acknowledgement from a
+different machine, or lacking a live adapter starts no matrix phase.
+
+Before a live-adapter run, record the disposable VPS identifier, candidate unit
+names, current API/global OOM counters, and the redacted JSON report in the test
+change record. On any failure, stop only the exact candidate units recorded by
+that run, wait for their process trees to exit, and verify with read-only
+`systemctl --user show <recorded-unit>` and cgroup counters. The candidate uses
+transient `--collect` scopes; do not install a persistent unit or copy candidate
+properties into production. A report is evidence only when every matrix check
+is `passed`; this guide does not claim that such a PASS has occurred.
+
+### Resource upgrade and rollback
+
+Treat a package upgrade, a resource-policy change, and a staging-proof change
+as three separate operator actions. A successful proof belongs to the exact
+reviewed QuadWork source/package candidate and disposable-host record; do not
+carry it forward to a different version or policy.
+
+Before an upgrade, record the currently installed package version and run the
+read-only checks without redirecting them into the QuadWork state directory:
+
+```bash
+npm list -g quadwork --depth=0
+quadwork resources preflight --json
+quadwork resources temp-install --json
+pm2 describe quadwork
+```
+
+Keep the exact previously accepted `runtime_resources` JSON, its package
+version, and the single-quoted `TMPDIR` used by `~/start-quadwork.sh` in the
+operator change record. Do not use a config-directory wildcard or infer a
+rollback policy from a `.recovery` filename.
+
+Install only the explicitly approved version, then repeat the policy and temp
+proposal/apply sequence above if the accepted policy changes. Every apply must
+use the SHA-256 token printed by its immediately preceding proposal; a token
+from an older file or version is invalid. Update the wrapper's single-quoted
+`TMPDIR` only when the newly accepted policy has a different exact
+`temp_root`:
+
+```bash
+npm install -g quadwork@'<approved-version>'
+quadwork resources configure \
+  --policy-file "$HOME/quadwork-resource-policy.json" \
+  --json
+quadwork resources temp-install --json
+pm2 restart quadwork
+pm2 save
+```
+
+The commands shown above deliberately stop at proposal mode. If the proposal
+diff is intended, run the documented `--apply --accept-sha256 '<exact-token>'`
+form separately, inspect its JSON recovery fields, and only then restart. After
+restart, validate the exact accepted root and the loopback resource endpoint:
+
+Keep `/api/resources` on the loopback-only operator surface. Do not expose or
+proxy it publicly: even though secrets and raw paths are redacted, the response
+reports host memory, swap, temp-capacity, and worker-scope capacity facts.
+
+```bash
+TEMP_ROOT='/exact/accepted/runtime_resources.temp_root'
+stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$TEMP_ROOT"
+findmnt --noheadings --output TARGET,FSTYPE,OPTIONS --target "$TEMP_ROOT"
+quadwork resources preflight --json
+curl --fail --silent --show-error 'http://127.0.0.1:8400/api/resources'
+```
+
+Rollback is also explicit. Reinstall the exact prior package version, restore
+the prior policy through a fresh token-bound `resources configure` proposal and
+apply (never by overwriting `config.json`), verify or create only its accepted
+temp root through `resources temp-install`, restore the wrapper's exact prior
+single-quoted `TMPDIR`, and restart:
+
+```bash
+npm install -g quadwork@'<previous-version>'
+quadwork resources configure \
+  --policy-file "$HOME/quadwork-resource-policy.previous.json" \
+  --json
+quadwork resources temp-install --json
+pm2 restart quadwork
+pm2 save
+```
+
+Again, proposal mode makes no resource-policy/temp mutation; use only the fresh
+printed tokens in separately reviewed apply commands. A rollback does not
+delete the newer temp root, exchange probes, previous-config recovery entry, or
+any worker data. Inspect only exact reported recovery basenames with the
+non-dereferencing procedure above. Containment remains unavailable until the
+rolled-back exact source and policy have their own complete disposable-staging
+PASS; production receives read-only verification only.
 
 ---
 
@@ -283,6 +579,11 @@ server {
     listen 80;
     server_name app.example.com;
 
+    # Host-capacity facts are operator-local even when the dashboard is public.
+    location = /api/resources {
+        return 404;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8400;
         proxy_http_version 1.1;
@@ -298,6 +599,9 @@ server {
 ```
 
 `proxy_read_timeout 86400` and WebSocket headers are required for live agent terminal connections.
+Keep the exact `/api/resources` exclusion when adding Step 10 authentication or
+when Certbot rewrites this server block; basic auth does not make host-capacity
+facts part of the public dashboard surface.
 
 ```bash
 sudo ln -sf /etc/nginx/sites-available/app.example.com /etc/nginx/sites-enabled/

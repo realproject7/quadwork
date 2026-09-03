@@ -7,7 +7,7 @@
 // gives the conflict-free tool modules (#791–#795) a single import surface.
 
 const http = require("http");
-const { readConfig } = require("../config");
+const { readConfig, normalizeProjectRepositories } = require("../config");
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -90,19 +90,29 @@ function createContext(port, opts = {}) {
     });
   }
 
-  // Internal: authoritative project list for validation. Returns the agent id
-  // list only (head/dev/re1/re2) — never the per-agent model/token/reasoning
-  // fields. This is the source for both assertKnownProject and the public
-  // list_projects (which strips `agents` again before returning).
+  // Internal: authoritative project list for validation. Repository summaries
+  // are an explicit public-safe projection: local working directories, CI
+  // policy, and other repository config never leave this boundary. The agent id
+  // list (head/dev/re1/re2) remains available only for validation — never the
+  // per-agent model/token/reasoning fields. list_projects strips `agents` again.
   async function getConfiguredProjects() {
     const cfg = await httpRequest("GET", "/api/config");
     const projects = Array.isArray(cfg && cfg.projects) ? cfg.projects : [];
-    return projects.map((p) => ({
-      id: p.id,
-      name: p.name,
-      repo: p.repo,
-      agents: p.agents ? Object.keys(p.agents) : [],
-    }));
+    return projects.map((p) => {
+      const repositories = normalizeProjectRepositories(p)
+        .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+        .map((entry) => ({
+          key: entry.key,
+          repo: entry.repo,
+          primary: entry.primary === true,
+        }));
+      return {
+        id: p.id,
+        name: p.name,
+        repositories,
+        agents: p.agents ? Object.keys(p.agents) : [],
+      };
+    });
   }
 
   // Every project-scoped tool (#791–#795) MUST call this before its HTTP call —

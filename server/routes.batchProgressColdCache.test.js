@@ -56,8 +56,7 @@ fs.readFileSync = function stubReadFileSync(p, ...rest) {
   if (p === CONFIG_PATH) return cfgJson;
   if (typeof p === "string" && p.endsWith("OVERNIGHT-QUEUE.md")) return queueText;
   if (typeof p === "string" && p.endsWith("GITHUB.md")) return githubMd;
-  // batch-progress-cache.json absent → readBatchSnapshot null → the upstream
-  // checkBatchSnapshotFreshness gh call is skipped entirely.
+  // No Current Batch row-acceleration file in this cold-cache fixture.
   if (typeof p === "string" && p.endsWith("batch-progress-cache.json")) {
     const err = new Error("ENOENT (test stub)");
     err.code = "ENOENT";

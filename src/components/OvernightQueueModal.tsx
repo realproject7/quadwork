@@ -12,7 +12,7 @@ interface OvernightQueueModalProps {
 /**
  * Modal wrapper around <OvernightQueueWidget /> for #226.
  *
- * The queue widget moved out of the bottom-right Operator Features
+ * The queue widget moved out of the Operator Features
  * panel and into a compact "OVERNIGHT-QUEUE.md [Edit]" row at the
  * bottom of the GitHub panel. Click Edit → this modal opens with
  * the same widget content (auto-refresh + view/edit toggle + save +

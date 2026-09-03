@@ -85,7 +85,12 @@ This is the same command QuadWork runs at project creation; it writes the trust 
 
 **Cause:** pm2 strips environment variables from child processes. Even if nvm is loaded when you run `pm2 start`, the QuadWork process inherits a minimal PATH without nvm binaries.
 
-**Fix:** Use a wrapper script that sources nvm before starting QuadWork:
+**Fix:** First complete the explicit `quadwork resources configure --apply` and
+`quadwork resources temp-install --apply` sequence from the VPS guide. Run
+`quadwork resources preflight --json` and inspect the temp-root facts before
+starting pm2. Then use a wrapper that sources nvm and exports the exact accepted
+`runtime_resources.temp_root` as a single-quoted value (never `eval`, a wildcard,
+or a discovered prefix):
 
 ```bash
 cat > ~/start-quadwork.sh << 'EOF'
@@ -93,6 +98,7 @@ cat > ~/start-quadwork.sh << 'EOF'
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 nvm use 24
+export TMPDIR='/home/quadwork/.quadwork/tmp'
 exec quadwork start
 EOF
 chmod +x ~/start-quadwork.sh
@@ -102,6 +108,11 @@ pm2 delete quadwork
 pm2 start ~/start-quadwork.sh --name quadwork --interpreter /bin/bash
 pm2 save
 ```
+
+Replace the example `TMPDIR` only with the exact value accepted in the policy.
+Startup re-verifies it read-only before loading the server. A typed warning keeps
+the dashboard/API diagnostics online but means `containment_ready=false`; do not
+treat the wrapper export or temp-root availability as cgroup/PTY staging proof.
 
 **Do NOT fix with symlinks** (e.g., `ln -s ~/.nvm/.../claude /usr/local/bin/claude`). Symlinks resolve the binary but not the environment — agents still won't find auth credentials.
 
@@ -129,7 +140,7 @@ See the [VPS Installation Guide](install-vps.md#step-2-create-non-root-user-crit
 
 ## Terminals won't attach (session token / cross-origin) — #968
 
-**Background:** The terminal WebSocket (`/ws/terminal`, `/ws/butler`) and the
+**Background:** The terminal WebSocket (`/ws/terminal`) and the
 PTY-write endpoints (`POST /api/agents/:project/:agent/write`, `/interrupt`)
 are authenticated (#968). Two checks run:
 
@@ -239,16 +250,111 @@ cleans it up. On hosts where `/tmp` is mounted with a per-user quota
 (`usrquota`), that dir grows until the quota is exhausted — after which Claude
 can't write the temp files it needs before executing any command (#957).
 
-**Check:** `du -sh /tmp/claude-$(id -u)` and try `dd if=/dev/zero
-of=/tmp/probe bs=1M count=10` — a "Disk quota exceeded" error confirms it.
+**Check:** use only read-only commands. Inspect the exact per-user root with
+`du -sh -- "/tmp/claude-$(id -u)"`, then check `df -h -- /tmp` and `quota -s`
+(when the quota client is installed). Do not create a probe file in `/tmp`.
 
-**Fix:** QuadWork sweeps stale backend temp automatically (hourly, at boot,
-and on agent teardown; entries older than 72h). If you hit the quota *before*
-a sweep (e.g. the server was down), clear it manually:
-`find /tmp/claude-$(id -u)/* -maxdepth 0 -mmin +60 -exec rm -rf {} +`
+**Fix:** prefer QuadWork's existing stale-only sweep (hourly, at boot, and on
+agent teardown; entries older than 72h). Leave it enabled and wait for the next
+sweep, or restart the documented VPS service with `pm2 restart quadwork` to run
+the boot path. `quadwork resources temp-install` does not clean this legacy
+Claude `/tmp` tree.
 
 Tune or disable via `~/.quadwork/config.json`:
 
 ```json
 { "temp_cleanup": { "enabled": true, "max_age_hours": 72 } }
 ```
+
+If operator inspection is unavoidable, first stop Claude and every QuadWork
+process that can write this tree. List the exact parent without dereferencing a
+child, manually choose one complete basename, and only record/recheck it:
+
+```bash
+LEGACY_PARENT="/tmp/claude-$(id -u)"
+[ -d "$LEGACY_PARENT" ] && [ ! -L "$LEGACY_PARENT" ] || exit 1
+ls -lai -- "$LEGACY_PARENT"
+ENTRY='paste-one-exact-basename-from-the-listing'
+cd -- "$LEGACY_PARENT" || exit 1
+[ -n "$ENTRY" ] && [ "$ENTRY" != '.' ] && [ "$ENTRY" != '..' ] && \
+  [ "$(basename -- "$ENTRY")" = "$ENTRY" ] || { printf '%s\n' 'invalid basename' >&2; exit 1; }
+OWNER_UID=$(id -u) || exit 1
+BEFORE=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+printf 'legacy temp record (type/mode|uid|mode|nlink|dev|ino): %s\n' "$BEFORE"
+IFS='|' read -r MODE_HEX ENTRY_UID MODE NLINK DEV INO <<EOF
+$BEFORE
+EOF
+[ "$ENTRY_UID" = "$OWNER_UID" ] || { printf '%s\n' 'unexpected owner; stop' >&2; exit 1; }
+AFTER=$(stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY") || exit 1
+[ "$AFTER" = "$BEFORE" ] || { printf '%s\n' 'entry changed; stop' >&2; exit 1; }
+```
+
+This inspection is not deletion authorization. Never run automatic recursive
+cleanup, a wildcard, or a prefix match. If the stale-only sweep cannot safely
+classify the exact entry, stop and repair or upgrade the affected agent through
+its supported package-manager/CLI workflow before restarting the service.
+
+## Resource staging matrix does not pass
+
+Start with the read-only diagnostic; do not begin by changing systemd or
+creating a temp directory:
+
+```bash
+quadwork resources preflight
+quadwork resources preflight --json
+```
+
+If it reports `policy_absent`, use the explicit policy proposal/apply sequence
+from the VPS install guide. If it reports an unavailable temp boundary after
+the policy is accepted, use the token-bound commands below; the first command
+is read-only and the second accepts only its exact current plan:
+
+```bash
+quadwork resources temp-install --json
+quadwork resources temp-install \
+  --apply \
+  --accept-sha256 '<exact-token-from-the-temp-proposal>' \
+  --json
+```
+
+This command only creates or verifies the temp root fixed by the persisted
+policy. It does not clean `/tmp/claude-*`, relocate an agent's `TMPDIR`, install
+systemd containment, restart a service, or establish staging evidence. On a
+failed create it intentionally performs no path-based cleanup; a
+`temp_install_failed_cleanup_required` refusal means the created root and any
+replacement entries were preserved for explicit inspection and recovery. Its
+JSON `recovery_entries` contains exact basenames only. Use the accepted
+`temp_root` parent, stop all writers, and run the non-dereferencing Ubuntu
+`stat --printf='%f|%u|%a|%h|%d|%i\n' -- "$ENTRY"` twice for one quoted reported
+basename. Mask the hexadecimal mode with `0170000` to verify its file type;
+this works for both empty and nonempty files. Record and compare type bits,
+UID, mode, link count, device, and inode
+before any manual move or removal. Never use a wildcard, prefix match,
+`find -delete`, or remove a different entry; see the VPS install guide for the
+complete no-glob recovery sequence. A refusal with
+`recovery_scope: operation_created_entry_unlocated` means no exact remaining
+basename can be reported. Stop all writers and inspect the accepted parent, but
+do not select a cleanup target by wildcard, prefix, timestamp, or guesswork.
+
+- `proof_refused` means the disposable-host acknowledgement or the separate
+  `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has
+  started.
+- `proof_unavailable` means a host gate or required live adapter is unavailable.
+  The bundled adapter intentionally returns this result rather than simulating
+  node-pty, WebSocket, cgroup, temp, health, or OOM evidence.
+- `proof_failed` means monitoring or a started phase failed. The coordinator
+  stops starting new phases and closes continuous monitoring.
+
+Do not retry a pressure phase on production and do not treat capability flags
+as proof. Preserve the redacted JSON, identify the exact candidate unit names
+from the disposable run record, stop only those units, wait for their process
+trees to exit, and compare the recorded API/global OOM counters. The candidate
+flags remain `candidate_pending_staging`; there is no automatic install/repair
+or supported-production fallback in this command.
+
+For package or resource-policy regressions, use the VPS guide's
+**Resource upgrade and rollback** procedure. Rollback means reinstalling one
+exact prior package version and re-accepting one exact prior policy through a
+fresh proposal token. Do not copy a guessed `.recovery` entry over
+`config.json`, reuse an old acceptance token, delete a newer temp root, or treat
+an earlier staging PASS as evidence for a different package/policy candidate.

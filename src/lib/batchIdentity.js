@@ -1,0 +1,405 @@
+// #1031: shared, pure UI helpers for repository-qualified batch identity.
+// Plain JS is intentional: the Next.js UI imports it through `allowJs`, while
+// the plain-node test runner can require the same production implementation.
+
+const OWNED_PROVENANCE = "owned";
+
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function positiveInteger(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function admissionGeneration(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function assignmentAttempt(value) {
+  const normalized = nonEmptyString(value);
+  return normalized && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(normalized) ? normalized : null;
+}
+
+/**
+ * Remote GitHub titles are data, never queue grammar or rendered markdown.
+ * Collapse every line/control separator, then escape inline markdown tokens so
+ * a title cannot add a checkbox, heading, link, image, or raw HTML element.
+ */
+function sanitizeRemoteTitle(value) {
+  return String(value == null ? "" : value)
+    .replace(/[\r\n\u2028\u2029]+/g, " ")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/([\\`*_[\]{}()<>#+.!|])/g, "\\$1");
+}
+
+function workItemNumber(row) {
+  if (positiveInteger(row && row.number)) return row.number;
+  if (positiveInteger(row && row.issue_number)) return row.issue_number;
+  if (positiveInteger(row && row.pr_number)) return row.pr_number;
+  return null;
+}
+
+/** Return the only executable queue token accepted for a V2 work item. */
+function qualifiedQueueToken(row) {
+  const repo = nonEmptyString(row && row.repo);
+  const number = workItemNumber(row);
+  return repo && number ? `${repo}#${number}` : null;
+}
+
+function workItemRefToken(row) {
+  const serialized = nonEmptyString(row && row.work_item_ref);
+  const rowKind = row && row.kind === "pr" ? "pr" : row && row.kind === "issue" ? "issue" : "work";
+  if (serialized) return `${serialized}:${rowKind}`;
+  const ref = row && row.work_item_ref;
+  if (ref && typeof ref === "object") {
+    const repoKey = nonEmptyString(ref.repo_key);
+    const repo = nonEmptyString(ref.repo);
+    const number = positiveInteger(ref.number);
+    const kind = ref.kind === "pr" ? "pr" : ref.kind === "issue" ? "issue" : null;
+    if (repoKey && repo && number && kind) return `${repoKey}:${repo}#${number}:${kind}`;
+  }
+  const token = qualifiedQueueToken(row);
+  return token ? `${token}:${rowKind}` : null;
+}
+
+function normalizeWorkItemRef(ref) {
+  if (!ref || typeof ref !== "object" || Array.isArray(ref)) return null;
+  const repoKey = nonEmptyString(ref.repo_key);
+  const repo = nonEmptyString(ref.repo);
+  const number = positiveInteger(ref.number);
+  const kind = ref.kind === "pr" ? "pr" : ref.kind === "issue" ? "issue" : null;
+  return repoKey && repo && number && kind ? { repo_key: repoKey, repo, number, kind } : null;
+}
+
+function sameWorkItemRef(left, right) {
+  return !!left && !!right && left.repo_key === right.repo_key && left.repo === right.repo &&
+    left.number === right.number && left.kind === right.kind;
+}
+
+function normalizeAssignmentItems(value, { allowEmpty = false } = {}) {
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) return null;
+  const seenOwnership = new Set();
+  const seenRefs = new Set();
+  const normalized = [];
+  for (const item of value) {
+    const ownershipKey = nonEmptyString(item && item.ownership_key);
+    const ref = normalizeWorkItemRef(item && item.work_item_ref);
+    const refKey = ref && `${ref.repo_key}\u0000${ref.repo}\u0000${ref.number}\u0000${ref.kind}`;
+    if (!ownershipKey || !ref || seenOwnership.has(ownershipKey) || seenRefs.has(refKey)) return null;
+    seenOwnership.add(ownershipKey);
+    seenRefs.add(refKey);
+    normalized.push({ work_item_ref: ref, ownership_key: ownershipKey });
+  }
+  return normalized;
+}
+
+function ownedWorkItemIdentityMatches(row) {
+  if (!row || typeof row !== "object" || !row.work_item_ref || typeof row.work_item_ref !== "object") return false;
+  const ref = normalizeWorkItemRef(row.work_item_ref);
+  const rowRepoKey = nonEmptyString(row.repo_key);
+  const rowRepo = nonEmptyString(row.repo);
+  const rowNumber = positiveInteger(row.number);
+  const rowKind = row.kind === "pr" ? "pr" : row.kind === "issue" ? "issue" : null;
+  return !!ref && !!rowRepoKey && !!rowRepo && !!rowNumber && !!rowKind &&
+    ref.repo_key === rowRepoKey && ref.repo === rowRepo && ref.number === rowNumber && ref.kind === rowKind;
+}
+
+/**
+ * React keys retain every authority component as a separate segment. Missing
+ * V2 provenance stays explicitly legacy/unowned; it is never inferred local.
+ */
+function workItemReactKey(row) {
+  const provenance = nonEmptyString(row && row.provenance) || "legacy_unowned";
+  const installationId = nonEmptyString(row && row.installation_id) || "-";
+  const batchNumber = positiveInteger(row && row.batch_number) || "-";
+  const attempt = assignmentAttempt(row && row.assignment_attempt) || "-";
+  const assignmentKey = nonEmptyString(row && row.assignment_key) || "-";
+  const ownershipKey = nonEmptyString(row && row.ownership_key) || "-";
+  const repoKey = nonEmptyString(row && row.repo_key) || "-";
+  const repo = nonEmptyString(row && row.repo) || "-";
+  const ref = workItemRefToken(row) || "unknown";
+  return [provenance, installationId, batchNumber, attempt, assignmentKey, ownershipKey, repoKey, repo, ref]
+    .map((part) => encodeURIComponent(String(part)))
+    .join(":");
+}
+
+function workItemDisplayLabel(row, multiRepository) {
+  const number = workItemNumber(row);
+  const bare = number ? `#${number}` : "#—";
+  if (!multiRepository) return bare;
+  const repoKey = nonEmptyString(row && row.repo_key);
+  return repoKey ? `[${repoKey}] ${bare}` : `[?] ${bare}`;
+}
+
+function assignmentIdentity(value, { allowCleared = false } = {}) {
+  if (!value || typeof value !== "object") return null;
+  const installationId = nonEmptyString(value.installation_id);
+  const batchNumber = positiveInteger(value.batch_number);
+  const attempt = assignmentAttempt(value.assignment_attempt);
+  const assignmentKey = nonEmptyString(value.assignment_key);
+  const assignmentItems = normalizeAssignmentItems(value.assignment_items, { allowEmpty: allowCleared });
+  if (
+    !installationId || !batchNumber || !attempt || !assignmentKey || !assignmentItems ||
+    value.provenance !== OWNED_PROVENANCE || value.owned !== true ||
+    (allowCleared ? value.current !== false : value.current !== true)
+  ) return null;
+  return {
+    installation_id: installationId,
+    batch_number: batchNumber,
+    assignment_attempt: attempt,
+    provenance: OWNED_PROVENANCE,
+    assignment_key: assignmentKey,
+    assignment_items: assignmentItems,
+  };
+}
+
+function rowAssignmentIdentity(value) {
+  if (!value || typeof value !== "object") return null;
+  const installationId = nonEmptyString(value.installation_id);
+  const batchNumber = positiveInteger(value.batch_number);
+  const attempt = assignmentAttempt(value.assignment_attempt);
+  if (
+    !installationId || !batchNumber || !attempt ||
+    value.provenance !== OWNED_PROVENANCE || value.current !== true || value.owned !== true
+  ) return null;
+  return {
+    installation_id: installationId,
+    batch_number: batchNumber,
+    assignment_attempt: attempt,
+    provenance: OWNED_PROVENANCE,
+  };
+}
+
+function sameBaseAssignment(left, right) {
+  return !!left && !!right && left.installation_id === right.installation_id &&
+    left.batch_number === right.batch_number && left.assignment_attempt === right.assignment_attempt &&
+    left.provenance === right.provenance;
+}
+
+function sameAssignment(left, right) {
+  return !!left && !!right &&
+    left.installation_id === right.installation_id &&
+    left.batch_number === right.batch_number &&
+    left.assignment_attempt === right.assignment_attempt &&
+    left.provenance === right.provenance &&
+    left.assignment_key === right.assignment_key &&
+    JSON.stringify(left.assignment_items) === JSON.stringify(right.assignment_items);
+}
+
+function emptyCurrentBatchSnapshot(active, progress) {
+  if (!active || !progress || active.active !== false || progress.active !== false ||
+      progress.liveActiveBatchCleared !== true || progress.complete !== false ||
+      progress.completeConfirmed !== false || progress.items.length !== 0) return null;
+  const activeAdmission = admissionGeneration(active.admission_generation);
+  const progressAdmission = admissionGeneration(progress.admission_generation);
+  const activeObservation = nonEmptyString(active.batch_observation_fingerprint);
+  const progressObservation = nonEmptyString(progress.batch_observation_fingerprint);
+  const compatibilityMode = active.compatibility_mode;
+  const expectedProvenance = compatibilityMode === "v1" ? "legacy_unowned" : "unowned";
+  if (activeAdmission === null || activeAdmission !== progressAdmission ||
+      !activeObservation || activeObservation !== progressObservation ||
+      (compatibilityMode !== "v1" && compatibilityMode !== "v2") ||
+      progress.compatibility_mode !== compatibilityMode ||
+      active.current !== false || progress.current !== false ||
+      active.owned !== false || progress.owned !== false ||
+      active.provenance !== expectedProvenance || progress.provenance !== expectedProvenance ||
+      active.installation_id != null || progress.installation_id != null ||
+      active.batch_number != null || progress.batch_number != null ||
+      active.assignment_attempt != null || progress.assignment_attempt != null ||
+      active.assignment_key != null || progress.assignment_key != null ||
+      !Array.isArray(active.assignment_items) || active.assignment_items.length !== 0 ||
+      !Array.isArray(progress.assignment_items) || progress.assignment_items.length !== 0 ||
+      typeof active.multi_repository !== "boolean" ||
+      active.multi_repository !== progress.multi_repository) return null;
+  return {
+    authority: "empty_current",
+    compatibility_mode: compatibilityMode,
+    fingerprint: ["empty", progressAdmission, progressObservation]
+      .map((part) => encodeURIComponent(String(part))).join(":"),
+    batch_observation_fingerprint: progressObservation,
+    admission_generation: progressAdmission,
+    active: false,
+    complete: false,
+    completeConfirmed: false,
+    liveActiveBatchCleared: true,
+    hasItems: false,
+    installation_id: null,
+    batch_number: null,
+    assignment_attempt: null,
+    provenance: expectedProvenance,
+    assignment_key: null,
+    assignment_items: [],
+  };
+}
+
+function legacyV1BatchSnapshot(active, progress) {
+  const activeAdmission = admissionGeneration(active.admission_generation);
+  const progressAdmission = admissionGeneration(progress.admission_generation);
+  if (
+    activeAdmission === null || activeAdmission !== progressAdmission ||
+    active.compatibility_mode !== "v1" || progress.compatibility_mode !== "v1" ||
+    active.provenance !== "legacy_unowned" || progress.provenance !== "legacy_unowned" ||
+    active.owned !== false || progress.owned !== false ||
+    typeof active.current !== "boolean" || active.current !== progress.current ||
+    active.multi_repository !== false || progress.multi_repository !== false ||
+    active.installation_id != null || progress.installation_id != null ||
+    active.assignment_attempt != null || progress.assignment_attempt != null ||
+    active.assignment_key != null || progress.assignment_key != null ||
+    !Array.isArray(active.assignment_items) || active.assignment_items.length !== 0 ||
+    !Array.isArray(progress.assignment_items) || progress.assignment_items.length !== 0
+  ) return null;
+  const activeObservation = nonEmptyString(active.batch_observation_fingerprint);
+  const progressObservation = nonEmptyString(progress.batch_observation_fingerprint);
+  if (!activeObservation || activeObservation !== progressObservation) return null;
+  const activeBatch = positiveInteger(active.batch_number);
+  const progressBatch = positiveInteger(progress.batch_number);
+  if (!activeBatch || activeBatch !== progressBatch) return null;
+  if (progress.liveActiveBatchCleared === true || progress.items.length === 0 || progress.current !== true) return null;
+  const seenRows = new Set();
+  for (const row of progress.items) {
+    if (
+      row.provenance !== "legacy_unowned" ||
+      row.owned !== false || row.current !== true || row.batch_number !== progressBatch ||
+      row.installation_id != null || row.assignment_attempt != null || row.assignment_key != null ||
+      row.ownership_key != null || !ownedWorkItemIdentityMatches(row)
+    ) return null;
+    const ref = normalizeWorkItemRef(row.work_item_ref);
+    const key = `${ref.repo_key}\u0000${ref.repo}\u0000${ref.number}\u0000${ref.kind}`;
+    if (seenRows.has(key)) return null;
+    seenRows.add(key);
+  }
+  return {
+    authority: "legacy_compatibility",
+    compatibility_mode: "v1",
+    fingerprint: `${encodeURIComponent(progressObservation)}:${progressAdmission}`,
+    batch_observation_fingerprint: progressObservation,
+    admission_generation: progressAdmission,
+    active: active.active === true,
+    complete: progress.complete === true,
+    completeConfirmed: progress.completeConfirmed === true,
+    liveActiveBatchCleared: false,
+    hasItems: true,
+    installation_id: null,
+    batch_number: progressBatch,
+    assignment_attempt: null,
+    provenance: "legacy_unowned",
+    assignment_key: null,
+    assignment_items: [],
+  };
+}
+
+/**
+ * Join the two live endpoints fail-closed. A sticky progress payload, a
+ * foreign/unowned assignment, or even one stale row cannot drive an automatic
+ * trigger/bridge transition.
+ */
+function ownedCurrentBatchSnapshot(active, progress) {
+  if (!active || typeof active.active !== "boolean" || !progress || !Array.isArray(progress.items)) return null;
+  const empty = emptyCurrentBatchSnapshot(active, progress);
+  if (empty) return empty;
+  if (active.compatibility_mode === "v1" || progress.compatibility_mode === "v1") {
+    return legacyV1BatchSnapshot(active, progress);
+  }
+  if (active.compatibility_mode !== "v2" || progress.compatibility_mode !== "v2") return null;
+  const activeAdmission = admissionGeneration(active.admission_generation);
+  const progressAdmission = admissionGeneration(progress.admission_generation);
+  if (activeAdmission === null || activeAdmission !== progressAdmission) return null;
+  const activeObservation = nonEmptyString(active.batch_observation_fingerprint);
+  const progressObservation = nonEmptyString(progress.batch_observation_fingerprint);
+  if (!activeObservation || activeObservation !== progressObservation) return null;
+  if (progress.liveActiveBatchCleared === true) return null;
+  const activeIdentity = assignmentIdentity(active);
+  const progressIdentity = assignmentIdentity(progress);
+  if (!sameAssignment(activeIdentity, progressIdentity)) return null;
+  if (progress.items.length === 0) return null;
+
+  const expectedByOwnership = new Map(progressIdentity.assignment_items.map((item) => [item.ownership_key, item.work_item_ref]));
+  if (progress.items.length > 0 && progress.items.length !== expectedByOwnership.size) return null;
+  for (const row of progress.items) {
+    const rowIdentity = rowAssignmentIdentity(row);
+    if (!sameBaseAssignment(progressIdentity, rowIdentity)) return null;
+    if (!ownedWorkItemIdentityMatches(row)) return null;
+    const ownershipKey = nonEmptyString(row.ownership_key);
+    const expectedRef = ownershipKey && expectedByOwnership.get(ownershipKey);
+    if (!expectedRef || !sameWorkItemRef(expectedRef, normalizeWorkItemRef(row.work_item_ref))) return null;
+    expectedByOwnership.delete(ownershipKey);
+  }
+  if (progress.items.length > 0 && expectedByOwnership.size !== 0) return null;
+
+  const fingerprint = [
+    progressAdmission,
+    progressObservation,
+    progressIdentity.installation_id,
+    progressIdentity.batch_number,
+    progressIdentity.assignment_attempt,
+    progressIdentity.assignment_key,
+    JSON.stringify(progressIdentity.assignment_items),
+  ].map((part) => encodeURIComponent(String(part))).join(":");
+
+  return {
+    authority: "v2_owned",
+    compatibility_mode: "v2",
+    fingerprint,
+    admission_generation: progressAdmission,
+    batch_observation_fingerprint: progressObservation,
+    active: active.active === true,
+    complete: progress.complete === true,
+    completeConfirmed: progress.completeConfirmed === true,
+    liveActiveBatchCleared: false,
+    hasItems: progress.items.length > 0,
+    installation_id: progressIdentity.installation_id,
+    batch_number: progressIdentity.batch_number,
+    assignment_attempt: progressIdentity.assignment_attempt,
+    provenance: progressIdentity.provenance,
+    assignment_key: progressIdentity.assignment_key,
+    assignment_items: progressIdentity.assignment_items.map((item) => ({
+      work_item_ref: { ...item.work_item_ref },
+      ownership_key: item.ownership_key,
+    })),
+  };
+}
+
+function assignmentRequestFields(snapshot) {
+  if (!snapshot) return {};
+  if (snapshot.authority === "empty_current") {
+    return {
+      admission_generation: snapshot.admission_generation,
+      compatibility_mode: snapshot.compatibility_mode,
+      batch_observation_fingerprint: snapshot.batch_observation_fingerprint,
+      current_batch_empty: true,
+    };
+  }
+  if (snapshot.authority === "legacy_compatibility" && snapshot.compatibility_mode === "v1") {
+    return {
+      admission_generation: snapshot.admission_generation,
+      compatibility_mode: "v1",
+      batch_observation_fingerprint: snapshot.batch_observation_fingerprint,
+    };
+  }
+  if (snapshot.authority !== "v2_owned") return {};
+  return {
+    admission_generation: snapshot.admission_generation,
+    batch_observation_fingerprint: snapshot.batch_observation_fingerprint,
+    installation_id: snapshot.installation_id,
+    batch_number: snapshot.batch_number,
+    assignment_attempt: snapshot.assignment_attempt,
+    provenance: snapshot.provenance,
+    assignment_key: snapshot.assignment_key,
+    assignment_items: snapshot.assignment_items.map((item) => ({
+      work_item_ref: { ...item.work_item_ref },
+      ownership_key: item.ownership_key,
+    })),
+  };
+}
+
+module.exports = {
+  assignmentRequestFields,
+  ownedCurrentBatchSnapshot,
+  qualifiedQueueToken,
+  sanitizeRemoteTitle,
+  workItemDisplayLabel,
+  workItemReactKey,
+};

@@ -4,7 +4,7 @@
 // The fix routes the wizard, the add-project route, the spawn default, and the
 // Settings command-change/save flow through one shared mapping in
 // src/lib/injectMode.js. This test pins that mapping and the save reconciliation
-// the component applies to agents (always) and the butler (heal-if-present).
+// the component applies to agents.
 //
 // Plain node:assert script (run via server/run-tests.js). It requires the real
 // shared module the production code and UI use — no duplicated logic.
@@ -52,21 +52,6 @@ ok(reconcileAgent({ command: "claude", mcp_inject: "env" }).mcp_inject === "flag
 ok(reconcileAgent({ command: "grok", mcp_inject: "flag" }).mcp_inject === "project_toml", "#1023: save heals a stale 'flag' on a grok-converted agent → 'project_toml'");
 ok(reconcileAgent({ command: "gemini" }).mcp_inject === "env", "save sets mcp_inject for a legacy agent that lacked one (matches spawn fallback)");
 ok(reconcileAgent({ command: "codex", mcp_inject: "proxy_flag" }).mcp_inject === "proxy_flag", "save leaves an already-correct mcp_inject unchanged");
-
-// ── save() reconciliation: the butler is HEAL-IF-PRESENT only (spawn ignores ──
-// mcp_inject and the wizard never writes one), mirroring SettingsPage.save().
-const reconcileButler = (butler) =>
-  butler
-    ? {
-        ...butler,
-        ...(butler.mcp_inject !== undefined
-          ? { mcp_inject: injectModeForCommand(butler.command || "claude") }
-          : {}),
-      }
-    : butler;
-ok(reconcileButler({ command: "gemini", mcp_inject: "flag" }).mcp_inject === "env", "#937: save heals a stale butler mcp_inject when present → 'env'");
-ok(!("mcp_inject" in reconcileButler({ command: "gemini" })), "#937: save does NOT fabricate mcp_inject on a butler that never had one");
-ok(reconcileButler(undefined) === undefined, "save leaves a missing butler config untouched");
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

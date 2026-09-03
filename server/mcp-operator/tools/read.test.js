@@ -37,8 +37,105 @@ const CHAT_MESSAGES = [
 // /api/agents returns ONLY live sessions: head running, dev stopped. re1/re2
 // are configured but absent → must surface as "missing".
 const RUNTIME_AGENTS = {
-  "plotlink/head": { state: "running", error: null },
+  "plotlink/head": {
+    state: "verified", error: null, operation_id: "operation-head", generation_id: "generation-head",
+    verification_state: "verified", health: "running", pid: 4242,
+    started_at: "2026-09-01T00:00:00.000Z", last_output_at: "2026-09-01T00:00:01.000Z",
+    last_chat_at: null, last_exit: null, last_observation: { at: "2026-09-01T00:00:01.000Z", health: "running" },
+    circuit: { open: false },
+  },
   "plotlink/dev": { state: "stopped", error: null },
+};
+
+const WEB_REF = { repo_key: "web", repo: "owner/web", number: 42, kind: "issue" };
+const API_REF = { repo_key: "api", repo: "owner/api", number: 42, kind: "issue" };
+const ASSIGNMENT_ITEMS = [
+  { work_item_ref: API_REF, ownership_key: "ownership-api-42" },
+  { work_item_ref: WEB_REF, ownership_key: "ownership-web-42" },
+];
+
+const BATCH_IDENTITY = {
+  installation_id: "123e4567-e89b-42d3-a456-426614174000",
+  batch_number: 4,
+  assignment_attempt: "attempt-4-owned",
+  provenance: "owned",
+  assignment_key: "batch-4-attempt-4-owned",
+  assignment_items: ASSIGNMENT_ITEMS,
+  current: true,
+  owned: true,
+  multi_repository: true,
+  compatibility_mode: "v2",
+};
+const ROW_IDENTITY = {
+  installation_id: BATCH_IDENTITY.installation_id,
+  batch_number: BATCH_IDENTITY.batch_number,
+  assignment_attempt: BATCH_IDENTITY.assignment_attempt,
+  provenance: BATCH_IDENTITY.provenance,
+  assignment_key: BATCH_IDENTITY.assignment_key,
+  current: BATCH_IDENTITY.current,
+  owned: BATCH_IDENTITY.owned,
+};
+
+const BATCH_ACTIVE = { active: true, batch_type: "code", ...BATCH_IDENTITY };
+const BATCH_PROGRESS = {
+  complete: false,
+  total: 2,
+  done: 0,
+  multi_repository: true,
+  ...BATCH_IDENTITY,
+  items: [
+    {
+      ...ROW_IDENTITY,
+      repo_key: "web",
+      repo: "owner/web",
+      number: 42,
+      kind: "issue",
+      work_item_ref: { repo_key: "web", repo: "owner/web", number: 42, kind: "issue" },
+      ownership_key: "ownership-web-42",
+      issue_number: 42,
+      live_pr: { number: 101, url: "https://github.com/owner/web/pull/101", state: "OPEN", tip: "a".repeat(40) },
+    },
+    {
+      ...ROW_IDENTITY,
+      repo_key: "api",
+      repo: "owner/api",
+      number: 42,
+      kind: "issue",
+      work_item_ref: { repo_key: "api", repo: "owner/api", number: 42, kind: "issue" },
+      ownership_key: "ownership-api-42",
+      issue_number: 42,
+      live_pr: null,
+      historical_pr: { number: 99, url: "https://github.com/owner/api/pull/99", state: "MERGED", tip: "b".repeat(40) },
+    },
+  ],
+};
+
+const WORK_TASK_BATCH = {
+  ok: true,
+  active: true,
+  projection: {
+    version: 1,
+    batch_manifest_digest: "a".repeat(64),
+    delivery_mode: "integrated",
+    frozen: true,
+    repositories: [{
+      repository_key: "web",
+      base_sha: "b".repeat(64),
+      work_items: [{
+        work_item: { repoKey: "web", repo: "owner/web", number: 42, kind: "issue" },
+        issue_body_revision: "c".repeat(64),
+        tasks: [{
+          work_task_ref: { repository_key: "web", task_key: "build" },
+          task_key: "build",
+          goal: "build the read projection",
+          file_boundary: ["server/work-task-projection.js"],
+          validation: ["node:test"],
+          state: "independent_review",
+          candidate: { candidate_digest: "d".repeat(64), base_sha: "b".repeat(64), candidate_sha: "e".repeat(64) },
+        }],
+      }],
+    }],
+  },
 };
 
 let passed = 0;
@@ -65,8 +162,9 @@ function startServer() {
       const url = req.url;
       if (url.startsWith("/api/config")) return send(FAKE_CONFIG);
       if (url.startsWith("/api/chat")) return send(CHAT_MESSAGES);
-      if (url.startsWith("/api/batch-active")) return send({ active: true });
-      if (url.startsWith("/api/batch-progress")) return send({ total: 3, done: 1, items: [{ issue: 791, state: "open" }] });
+      if (url.startsWith("/api/batch-active")) return send(BATCH_ACTIVE);
+      if (url.startsWith("/api/batch-progress")) return send(BATCH_PROGRESS);
+      if (url.startsWith("/api/work-task-batch")) return send(WORK_TASK_BATCH);
       if (url.startsWith("/api/queue")) return send({ ok: true, exists: true, content: "## Active Batch\n- #791\n" });
       if (url.startsWith("/api/agents")) return send(RUNTIME_AGENTS);
       return send({ error: "not found" }, 404);
@@ -110,7 +208,45 @@ async function runTests() {
   // ── batch_status: merge active + progress ───────────────────────────────
   const batch = await handlers.batch_status({ project: "plotlink" }, ctx);
   assert(batch && batch.active && batch.active.active === true, "batch_status includes active");
-  assert(batch && batch.progress && batch.progress.total === 3, "batch_status includes progress (merged)");
+  assert(batch && batch.progress && batch.progress.total === 2, "batch_status includes progress (merged)");
+  assert(
+    batch.active.assignment_attempt === "attempt-4-owned" && batch.progress.assignment_key === BATCH_IDENTITY.assignment_key,
+    "batch_status preserves the opaque assignment identity without rewriting it",
+  );
+  assert(
+    JSON.stringify(batch.active.assignment_items) === JSON.stringify(ASSIGNMENT_ITEMS) &&
+      JSON.stringify(batch.progress.assignment_items) === JSON.stringify(ASSIGNMENT_ITEMS),
+    "batch_status preserves ordered aggregate assignment_items",
+  );
+  assert(
+    batch.progress.items.length === 2 &&
+      batch.progress.items[0].issue_number === 42 && batch.progress.items[1].issue_number === 42 &&
+      batch.progress.items[0].repo === "owner/web" && batch.progress.items[1].repo === "owner/api",
+    "batch_status keeps same-number work items distinct by repository",
+  );
+  assert(
+    batch.progress.items[0].ownership_key === "ownership-web-42" &&
+      batch.progress.items[1].ownership_key === "ownership-api-42",
+    "batch_status preserves distinct per-item ownership keys",
+  );
+  assert(
+    batch.progress.items[0].live_pr.state === "OPEN" && batch.progress.items[0].live_pr.tip === "a".repeat(40),
+    "batch_status preserves the explicit OPEN live PR reference",
+  );
+  assert(
+    batch.progress.items[1].live_pr === null && batch.progress.items[1].historical_pr.state === "MERGED",
+    "batch_status does not promote a merged historical PR to live_pr",
+  );
+
+  // ── read_work_task_batch: fixed nested projection ───────────────────────
+  requests.length = 0;
+  const workTasks = await handlers.read_work_task_batch({ project: "plotlink" }, ctx);
+  assert(workTasks.active === true && workTasks.projection?.frozen === true,
+    "read_work_task_batch returns the fixed V2 projection without treating it as an action");
+  assert(workTasks.projection.repositories[0].work_items[0].tasks[0].candidate.candidate_sha === "e".repeat(64),
+    "read_work_task_batch preserves the exact candidate SHA for independent review");
+  assert(requests.filter((request) => request.includes("/api/work-task-batch")).length === 1,
+    "read_work_task_batch makes exactly one authenticated local read");
 
   // ── read_queue: returns markdown ────────────────────────────────────────
   const queue = await handlers.read_queue({ project: "plotlink" }, ctx);
@@ -133,10 +269,13 @@ async function runTests() {
   const plAgents = await handlers.list_agents({ project: "plotlink" }, ctx);
   const byAgent = Object.fromEntries(plAgents.map((a) => [a.agent, a.state]));
   assert(plAgents.length === 4, "list_agents (filtered) returns all 4 configured agents");
-  assert(byAgent.head === "running", "list_agents shows runtime state for a live agent (head=running)");
+  assert(byAgent.head === "verified", "list_agents shows canonical runtime state for a live agent (head=verified)");
   assert(byAgent.dev === "stopped", "list_agents shows runtime state for a stopped agent (dev=stopped)");
   assert(byAgent.re1 === "missing" && byAgent.re2 === "missing", "list_agents includes configured-but-untracked agents as 'missing'");
   assert(plAgents.every((a) => a.project === "plotlink"), "list_agents filters to the requested project");
+  const observedHead = plAgents.find((a) => a.agent === "head");
+  assert(observedHead && observedHead.health === "running" && observedHead.pid === 4242
+    && observedHead.generation_id === "generation-head", "list_agents preserves redacted generation and raw health observations");
 
   server.close();
   console.log(`\n${passed} passed, ${failed} failed\n`);

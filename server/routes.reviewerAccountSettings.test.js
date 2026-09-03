@@ -28,6 +28,8 @@ const real = {
   statSync: fs.statSync,
   rmSync: fs.rmSync,
   renameSync: fs.renameSync,
+  linkSync: fs.linkSync,
+  unlinkSync: fs.unlinkSync,
 };
 const files = new Map([[CONFIG_PATH, JSON.stringify({ port: 8400, reviewer_github_user: "old-reviewer", projects: [] }, null, 2)]]);
 const modes = new Map();
@@ -87,6 +89,26 @@ fs.renameSync = function stubRenameSync(src, dst) {
   }
   return real.renameSync.apply(this, arguments);
 };
+fs.linkSync = function stubLinkSync(src, dst) {
+  const s = String(src), d = String(dst);
+  if (s.startsWith(TEST_DIR) || d.startsWith(TEST_DIR)) {
+    if (!files.has(s)) { const err = new Error("ENOENT"); err.code = "ENOENT"; throw err; }
+    if (files.has(d)) { const err = new Error("EEXIST"); err.code = "EEXIST"; throw err; }
+    files.set(d, files.get(s));
+    if (modes.has(s)) modes.set(d, modes.get(s));
+    return;
+  }
+  return real.linkSync.apply(this, arguments);
+};
+fs.unlinkSync = function stubUnlinkSync(p) {
+  const key = String(p);
+  if (key.startsWith(TEST_DIR)) {
+    if (!files.has(key)) { const err = new Error("ENOENT"); err.code = "ENOENT"; throw err; }
+    files.delete(key); modes.delete(key);
+    return;
+  }
+  return real.unlinkSync.apply(this, arguments);
+};
 
 const express = require("express");
 const router = require("./routes");
@@ -101,6 +123,8 @@ function cleanup() {
   fs.statSync = real.statSync;
   fs.rmSync = real.rmSync;
   fs.renameSync = real.renameSync;
+  fs.linkSync = real.linkSync;
+  fs.unlinkSync = real.unlinkSync;
 }
 process.on("exit", cleanup);
 

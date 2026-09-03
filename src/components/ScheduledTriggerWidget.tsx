@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
+import { assignmentRequestFields, ownedCurrentBatchSnapshot } from "@/lib/batchIdentity";
 
 interface ScheduledTriggerWidgetProps {
   projectId: string;
@@ -11,9 +12,83 @@ interface ScheduledTriggerWidgetProps {
 
 // #408: batch progress shape from /api/batch-progress
 interface BatchState {
+  active: boolean;
   complete: boolean;
-  items: { issue_number: number; status: string }[];
+  completeConfirmed: boolean;
+  liveActiveBatchCleared: boolean;
+  items: Array<{
+    number: number;
+    issue_number: number;
+    status: string;
+    repo_key: string;
+    repo: string;
+    work_item_ref: string | { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string | null;
+    kind: "issue" | "pr";
+    installation_id: string | null;
+    batch_number: number;
+    assignment_attempt: string | null;
+    provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
+    assignment_key: string | null;
+    current: boolean;
+    owned: boolean;
+  }>;
   batch_number: number | null;
+  installation_id: string | null;
+  assignment_attempt: string | null;
+  provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
+  assignment_key: string | null;
+  assignment_items: Array<{
+    work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string;
+  }>;
+  current: boolean;
+  owned: boolean;
+  multi_repository: boolean;
+  compatibility_mode: "v1" | "v2";
+  admission_generation: number;
+  batch_observation_fingerprint?: string;
+}
+
+interface BatchActiveState {
+  active: boolean;
+  installation_id: string | null;
+  batch_number: number | null;
+  assignment_attempt: string | null;
+  provenance: "owned" | "foreign" | "unowned" | "legacy_unowned";
+  assignment_key: string | null;
+  assignment_items: Array<{
+    work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string;
+  }>;
+  current: boolean;
+  owned: boolean;
+  multi_repository: boolean;
+  compatibility_mode: "v1" | "v2";
+  admission_generation: number;
+  batch_observation_fingerprint?: string;
+}
+
+interface BatchLifecycleSnapshot {
+  authority: "v2_owned" | "legacy_compatibility" | "empty_current";
+  compatibility_mode: "v1" | "v2";
+  fingerprint: string;
+  admission_generation: number;
+  batch_observation_fingerprint?: string;
+  active: boolean;
+  complete: boolean;
+  completeConfirmed: boolean;
+  liveActiveBatchCleared: boolean;
+  hasItems: boolean;
+  installation_id: string | null;
+  batch_number: number | null;
+  assignment_attempt: string | null;
+  provenance: "owned" | "unowned" | "legacy_unowned";
+  assignment_key: string | null;
+  assignment_items: Array<{
+    work_item_ref: { repo_key: string; repo: string; number: number; kind: "issue" | "pr" };
+    ownership_key: string;
+  }>;
 }
 
 // How often the auto-trigger polls batch progress (same as BatchProgressPanel).
@@ -129,7 +204,7 @@ function formatCountdown(ms: number): string {
 }
 
 /**
- * Bottom-right operator widget for the Scheduled Trigger (#210).
+ * Operator Features widget for the Scheduled Trigger (#210), in the right rail.
  *
  * Combines the old Keep Alive timer with a custom message textarea.
  * "Start Trigger" hands the typed message to
@@ -185,7 +260,7 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
   const [autoTrigger, setAutoTrigger] = useState(false);
   const [autoTriggered, setAutoTriggered] = useState(false); // true when current run was auto-started
   const [autoStatus, setAutoStatus] = useState<string | null>(null); // flash message
-  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
+  const prevBatchRef = useRef<BatchLifecycleSnapshot | null>(null);
 
   // #408: load auto-trigger setting from project config on mount.
   // Reset refs on projectId change to avoid stale state across projects.
@@ -365,8 +440,9 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
   }, [autoTrigger, projectId]);
 
   // #408: auto-trigger batch lifecycle polling.
-  // When autoTrigger is ON, polls /api/batch-progress every 30s to
-  // detect batch start/complete transitions.
+  // When autoTrigger is ON, join live Active Batch authority with progress.
+  // Sticky/historical/foreign/unowned progress is never allowed to drive an
+  // automatic trigger transition.
   const autoTriggerRef = useRef(autoTrigger);
   const triggerRef = useRef(trigger);
   useEffect(() => { autoTriggerRef.current = autoTrigger; }, [autoTrigger]);
@@ -375,16 +451,23 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
   const checkBatchLifecycle = useCallback(async () => {
     if (!autoTriggerRef.current) return;
     try {
-      const r = await fetch(`/api/batch-progress?project=${encodeURIComponent(projectId)}`);
-      if (!r.ok) return;
-      const data: BatchState = await r.json();
-      const hasItems = data.items.length > 0;
+      const project = encodeURIComponent(projectId);
+      const [activeResponse, progressResponse] = await Promise.all([
+        fetch(`/api/batch-active?project=${project}`),
+        fetch(`/api/batch-progress?project=${project}`),
+      ]);
+      if (!activeResponse.ok || !progressResponse.ok) return;
+      const active: BatchActiveState = await activeResponse.json();
+      const data: BatchState = await progressResponse.json();
+      const next = ownedCurrentBatchSnapshot(active, data) as BatchLifecycleSnapshot | null;
+      if (!next) return;
       const prev = prevBatchRef.current;
-      prevBatchRef.current = { complete: data.complete, hasItems };
+      prevBatchRef.current = next;
+      const sameAssignment = prev?.fingerprint === next.fingerprint;
 
       if (!prev) {
         // First poll — if there's an active non-complete batch, auto-start
-        if (hasItems && !data.complete && !triggerRef.current?.enabled) {
+        if (next.active && next.hasItems && !next.complete && !triggerRef.current?.enabled) {
           setAutoTriggered(true);
           setAutoStatus(null);
           // Use the start endpoint directly with current field values
@@ -396,13 +479,22 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
           await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ interval: resolvedIntervalMin, duration: resolvedDurationMin, message: messageRef.current || initialMessage }),
+            body: JSON.stringify({
+              interval: resolvedIntervalMin,
+              duration: resolvedDurationMin,
+              message: messageRef.current || initialMessage,
+              ...assignmentRequestFields(next),
+            }),
           });
           await load();
         }
         // #462: First poll — batch already complete but trigger still running → auto-stop
-        if (hasItems && data.complete && triggerRef.current?.enabled) {
-          await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
+        if ((next.completeConfirmed || next.liveActiveBatchCleared) && triggerRef.current?.enabled) {
+          await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(assignmentRequestFields(next)),
+          });
           setAutoTriggered(false);
           setAutoStatus(t.autoStopStatus);
           await load();
@@ -411,8 +503,12 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
       }
 
       // Batch just completed → auto-stop
-      if (hasItems && data.complete && !prev.complete && triggerRef.current?.enabled) {
-        await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
+      if ((next.completeConfirmed || next.liveActiveBatchCleared) && triggerRef.current?.enabled) {
+        await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(assignmentRequestFields(next)),
+        });
         setAutoTriggered(false);
         setAutoStatus(t.autoStopStatus);
         await load();
@@ -420,7 +516,7 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
       }
 
       // New batch started (complete→active, or empty→active) → auto-start
-      if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !triggerRef.current?.enabled) {
+      if (next.active && next.hasItems && !next.complete && !sameAssignment && !triggerRef.current?.enabled) {
         setAutoTriggered(true);
         setAutoStatus(null);
         const draftRaw = parseFloat(durationHoursDraft);
@@ -431,7 +527,12 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
         await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ interval: resolvedIntervalMin, duration: resolvedDurationMin, message: messageRef.current || initialMessage }),
+          body: JSON.stringify({
+            interval: resolvedIntervalMin,
+            duration: resolvedDurationMin,
+            message: messageRef.current || initialMessage,
+            ...assignmentRequestFields(next),
+          }),
         });
         await load();
       }

@@ -13,6 +13,7 @@ import {
 } from "../lib/notificationSound";
 import { sessionTokenHeaders } from "@/lib/sessionToken";
 import { useLocale } from "@/components/LocaleProvider";
+import { assignmentRequestFields, ownedCurrentBatchSnapshot } from "@/lib/batchIdentity";
 
 const COPY = {
   en: {
@@ -398,6 +399,16 @@ function formatTime(seconds: number): string {
 const AWAKE_AUTO_POLL_MS = 30_000;
 const AWAKE_AUTO_DEFAULT_HOURS = 8;
 
+interface AwakeBatchLifecycleSnapshot {
+  fingerprint: string;
+  active: boolean;
+  complete: boolean;
+  completeConfirmed: boolean;
+  liveActiveBatchCleared: boolean;
+  hasItems: boolean;
+  [key: string]: unknown;
+}
+
 function SystemSection({ projectId, idle = false }: { projectId: string; idle?: boolean }) {
   const { locale } = useLocale();
   const t = COPY[locale].system;
@@ -416,7 +427,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
   const [awakeAuto, setAwakeAuto] = useState(false);
   const [awakeAutoStatus, setAwakeAutoStatus] = useState<string | null>(null);
   const awakeAutoRef = useRef(false);
-  const prevBatchRef = useRef<{ complete: boolean; hasItems: boolean } | null>(null);
+  const prevBatchRef = useRef<AwakeBatchLifecycleSnapshot | null>(null);
   // Track manual stop so auto doesn't re-start until next batch transition
   const manualStopRef = useRef(false);
   const activeRef = useRef(false);
@@ -463,7 +474,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
   };
 
   const poll = useCallback(() => {
-    fetch("/api/caffeinate/status")
+    fetch(`/api/caffeinate/status?project=${encodeURIComponent(projectId)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (!data) return;
@@ -472,7 +483,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
         setPlatform(data.platform);
       })
       .catch(() => {});
-  }, []);
+  }, [projectId]);
 
   useEffect(() => {
     poll();
@@ -484,7 +495,7 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
     fetch("/api/caffeinate/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ duration: seconds }),
+      body: JSON.stringify({ project_id: projectId, duration: seconds }),
     })
       .then((r) => r.json())
       .then((data) => {
@@ -500,7 +511,11 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
   const stop = () => {
     // #441: track manual stop so auto doesn't re-start until next batch transition
     manualStopRef.current = true;
-    fetch("/api/caffeinate/stop", { method: "POST" })
+    fetch("/api/caffeinate/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: projectId }),
+    })
       .then(() => {
         setActive(false);
         setRemaining(null);
@@ -546,74 +561,103 @@ function SystemSection({ projectId, idle = false }: { projectId: string; idle?: 
   }, [awakeAuto, projectId]);
 
   // #441: Auto start helper — uses configured hours or 8h default
-  const autoStart = useCallback(() => {
+  const autoStart = useCallback(async (snapshot: AwakeBatchLifecycleSnapshot) => {
     const raw = parseFloat(hoursDraft);
     const hours = Number.isFinite(raw) ? clampKeepAwakeHours(raw) : AWAKE_AUTO_DEFAULT_HOURS;
     const seconds = Math.round(hours * 3600);
-    fetch("/api/caffeinate/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ duration: seconds }),
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.ok) {
-          setActive(true);
-          setRemaining(seconds);
-          manualStopRef.current = false;
-        }
-      })
-      .catch(() => {});
-  }, [hoursDraft]);
+    try {
+      const response = await fetch("/api/caffeinate/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId,
+          duration: seconds,
+          ...assignmentRequestFields(snapshot),
+        }),
+      });
+      if (!response.ok) return false;
+      const data = await response.json();
+      if (!data.ok) return false;
+      setActive(true);
+      setRemaining(seconds);
+      manualStopRef.current = false;
+      return true;
+    } catch {
+      return false;
+    }
+  }, [hoursDraft, projectId]);
 
   // #441: Auto stop helper
-  const autoStop = useCallback(() => {
-    fetch("/api/caffeinate/stop", { method: "POST" })
-      .then(() => {
-        setActive(false);
-        setRemaining(null);
-      })
-      .catch(() => {});
-  }, []);
+  const autoStop = useCallback(async (snapshot: AwakeBatchLifecycleSnapshot) => {
+    try {
+      const response = await fetch("/api/caffeinate/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId,
+          ...assignmentRequestFields(snapshot),
+        }),
+      });
+      if (!response.ok) return false;
+      const data = await response.json();
+      if (!data.ok) return false;
+      setActive(false);
+      setRemaining(null);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [projectId]);
 
-  // #441: Batch lifecycle polling (same pattern as ScheduledTriggerWidget)
+  // #441 / #1031: Join live Active Batch authority with progress before
+  // allowing automatic OS power-state mutation. Sticky, historical, foreign,
+  // or unowned progress cannot start or stop caffeinate.
   useEffect(() => {
-    if (!awakeAuto || idle) return; // #812: parked project — suppress auto-awake batch-progress polling
+    if (!awakeAuto || idle) return; // #812: parked project — suppress auto-awake batch polling
     const check = async () => {
       if (!awakeAutoRef.current) return;
       try {
-        const r = await fetch(`/api/batch-progress?project=${encodeURIComponent(projectId)}`);
-        if (!r.ok) return;
-        const data = await r.json();
-        const hasItems = data.items.length > 0;
+        const project = encodeURIComponent(projectId);
+        const [activeResponse, progressResponse] = await Promise.all([
+          fetch(`/api/batch-active?project=${project}`),
+          fetch(`/api/batch-progress?project=${project}`),
+        ]);
+        if (!activeResponse.ok || !progressResponse.ok) return;
+        const activeBatch = await activeResponse.json();
+        const progress = await progressResponse.json();
+        const next = ownedCurrentBatchSnapshot(activeBatch, progress) as AwakeBatchLifecycleSnapshot | null;
+        if (!next) return;
         const prev = prevBatchRef.current;
-        prevBatchRef.current = { complete: data.complete, hasItems };
+        prevBatchRef.current = next;
+        const sameAssignment = prev?.fingerprint === next.fingerprint;
 
         // First poll — active batch + not already awake → auto-start
         if (!prev) {
-          if (hasItems && !data.complete && !activeRef.current) {
-            autoStart();
-            setAwakeAutoStatus(t.awakeStatusActive);
+          if (next.active && next.hasItems && !next.complete && !activeRef.current && !manualStopRef.current) {
+            if (await autoStart(next)) setAwakeAutoStatus(t.awakeStatusActive);
           }
-          // #462: First poll — batch already complete but caffeinate still running → auto-stop
-          if (hasItems && data.complete && activeRef.current) {
-            autoStop();
-            setAwakeAutoStatus(t.awakeStatusComplete);
+          // #462: Only confirmed completion or an explicit live clear may stop.
+          if ((next.completeConfirmed || next.liveActiveBatchCleared) && activeRef.current) {
+            if (await autoStop(next)) {
+              setAwakeAutoStatus(t.awakeStatusComplete);
+              manualStopRef.current = false;
+            }
           }
           return;
         }
 
         // Batch just completed → auto-stop
-        if (hasItems && data.complete && !prev.complete && activeRef.current) {
-          autoStop();
-          setAwakeAutoStatus(t.awakeStatusComplete);
-          manualStopRef.current = false;
+        if ((next.completeConfirmed || next.liveActiveBatchCleared) && activeRef.current) {
+          if (await autoStop(next)) {
+            setAwakeAutoStatus(t.awakeStatusComplete);
+            manualStopRef.current = false;
+          }
+          return;
         }
 
-        // New batch started (complete→active or empty→active) → auto-start
-        if (hasItems && !data.complete && (prev.complete || !prev.hasItems) && !activeRef.current && !manualStopRef.current) {
-          autoStart();
-          setAwakeAutoStatus(t.awakeStatusNew);
+        // A distinct, live owned assignment started → auto-start.
+        if (next.active && next.hasItems && !next.complete && !sameAssignment && !activeRef.current && !manualStopRef.current) {
+          if (await autoStart(next)) setAwakeAutoStatus(t.awakeStatusNew);
         }
       } catch { /* non-fatal */ }
     };
@@ -843,7 +887,7 @@ interface ControlBarProps {
 
 export default function ControlBar({ projectId, idle = false }: ControlBarProps) {
   // #210: Keep Alive moved to the Scheduled Trigger widget in the
-  // bottom-right Operator Features quadrant. ControlBar now only
+  // Operator Features panel (right rail). ControlBar now only
   // carries the server lifecycle + system controls.
   return (
     <div className="border-t border-border px-3 py-2">

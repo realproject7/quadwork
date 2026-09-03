@@ -1,0 +1,1117 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { SecureResourceDirectoryError } = require("./resource-secure-directory");
+const {
+  MAX_STATE_BYTES,
+  RESOURCE_STATE_VERSION,
+  ResourceStatePersistenceError,
+  ResourceStateStore,
+  createResourceSnapshot,
+} = require("./resource-state");
+
+const fixtures = [];
+let exchangeCounter = 0;
+process.on("exit", () => {
+  for (const fixture of fixtures) {
+    try { fs.rmSync(fixture, { recursive: true, force: true }); } catch {}
+  }
+});
+
+function fixture() {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-state-")));
+  fs.chmodSync(dir, 0o700);
+  fixtures.push(dir);
+  return { dir, filePath: path.join(dir, "resource-state.json") };
+}
+
+function pathDirectoryHandleFactory({ directory, directoryIdentity, fsImpl }) {
+  return {
+    stat: () => fsImpl.lstatSync(directory),
+    path: (name) => path.join(directory, name),
+    assertAvailable: () => {},
+    commit({ mode, source, destination, sourceIdentity, destinationIdentity }) {
+      const sourcePath = path.join(directory, source);
+      const destinationPath = path.join(directory, destination);
+      const sourceBefore = fsImpl.lstatSync(sourcePath);
+      assert.equal(String(sourceBefore.dev), String(sourceIdentity.dev));
+      assert.equal(String(sourceBefore.ino), String(sourceIdentity.ino));
+      if (mode === "noreplace") {
+        assert.throws(() => fsImpl.lstatSync(destinationPath), (error) => error.code === "ENOENT");
+        fsImpl.renameSync(sourcePath, destinationPath);
+        return;
+      }
+      const destinationBefore = fsImpl.lstatSync(destinationPath);
+      assert.equal(String(destinationBefore.dev), String(destinationIdentity.dev));
+      assert.equal(String(destinationBefore.ino), String(destinationIdentity.ino));
+      const hold = path.join(directory, `.resource-state-test-exchange-${exchangeCounter += 1}`);
+      fsImpl.renameSync(sourcePath, hold);
+      fsImpl.renameSync(destinationPath, sourcePath);
+      fsImpl.renameSync(hold, destinationPath);
+    },
+    fsync: () => {},
+    close: () => {},
+  };
+}
+
+function stateStore(options) {
+  return new ResourceStateStore({
+    directoryHandleFactory: pathDirectoryHandleFactory,
+    ...options,
+  });
+}
+
+function fact(index, extra = {}) {
+  return {
+    project_id: "quadwork",
+    generation_id: `generation-${index}`,
+    resource_class: index % 2 ? "control" : "worker",
+    unit_name: `qw-worker-${index}.scope`,
+    reason: "normal_exit",
+    exit_code: 0,
+    signal: null,
+    finished_at: `2026-08-31T00:00:${String(index).padStart(2, "0")}.000Z`,
+    ...extra,
+  };
+}
+
+function oomProvenanceFor(terminalFact, count, observedAt) {
+  return {
+    project_id: terminalFact.project_id,
+    generation_id: terminalFact.generation_id,
+    resource_class: terminalFact.resource_class,
+    unit_name: terminalFact.unit_name,
+    oom_kill_count: count,
+    observed_at: observedAt,
+  };
+}
+
+function fullState(terminalFacts = [fact(1)]) {
+  return {
+    status: "ready",
+    counts: {
+      active_worker_scopes: 2,
+      active_control_children: 1,
+      queued_control_children: 3,
+    },
+    limits: {
+      host_reserve_mib: 1536,
+      max_worker_scopes: 4,
+      max_control_children: 2,
+      worker_memory_high_mib: 1024,
+      worker_memory_max_mib: 1280,
+      worker_swap_max_mib: 512,
+      control_memory_max_mib: 512,
+      control_swap_max_mib: 256,
+      api_memory_low_mib: 256,
+      api_memory_max_mib: 512,
+      temp_min_free_mib: 4096,
+    },
+    usage: {
+      host_memory_total_mib: 8192,
+      host_memory_available_mib: 4096,
+      swap_total_mib: 4096,
+      swap_free_mib: 1024,
+      worker_memory_mib: 900,
+      control_memory_mib: 120,
+      api_memory_mib: 200,
+      static_reservation_mib: 7680,
+      static_headroom_mib: 512,
+      configured_swap_mib: 2304,
+      swap_headroom_mib: 1792,
+    },
+    temp: { disk_backed: true, free_mib: 12000, total_mib: 24000 },
+    terminal_facts: terminalFacts,
+  };
+}
+
+// Atomic 0600 persistence survives process-local store recreation.
+{
+  const { filePath } = fixture();
+  const first = stateStore({ filePath, terminalFactLimit: 3 });
+  const saved = first.save(fullState([fact(1), fact(2)]));
+  assert.equal(saved.version, RESOURCE_STATE_VERSION);
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+  const reloaded = stateStore({ filePath, terminalFactLimit: 3 }).load();
+  assert.deepEqual(reloaded, saved);
+  assert.ok(Object.isFrozen(reloaded));
+  assert.ok(Object.isFrozen(reloaded.terminal_facts));
+}
+
+// Malformed, unsupported-version, and missing files fail to an empty redacted snapshot.
+{
+  const { filePath } = fixture();
+  fs.writeFileSync(filePath, "{not json", { mode: 0o600 });
+  const store = stateStore({ filePath });
+  assert.deepEqual(store.load(), createResourceSnapshot({}));
+  fs.writeFileSync(filePath, JSON.stringify({ version: 999, terminal_facts: [fact(1)] }), { mode: 0o600 });
+  assert.deepEqual(store.load(), createResourceSnapshot({}));
+  fs.unlinkSync(filePath);
+  assert.deepEqual(store.load(), createResourceSnapshot({}));
+}
+
+// Only the documented schema crosses the persistence boundary.
+{
+  const { filePath } = fixture();
+  const secret = "SECRET-MUST-NOT-PERSIST";
+  const input = fullState([fact(1, {
+    command: secret,
+    args: [secret],
+    env: { TOKEN: secret },
+    raw_error: `/private/${secret}`,
+    terminal: secret,
+  })]);
+  input.config_path = `/private/${secret}`;
+  input.process = { input: secret };
+  input.unknown = secret;
+  input.counts.secret_count = 7;
+  input.limits.private_path = `/tmp/${secret}`;
+  input.usage.raw = secret;
+  input.temp.path = `/private/tmp/${secret}`;
+  const snapshot = stateStore({ filePath }).save(input);
+  const serialized = fs.readFileSync(filePath, "utf8");
+  assert.ok(!serialized.includes(secret));
+  assert.deepEqual(Object.keys(snapshot), [
+    "version", "status", "counts", "limits", "usage", "temp", "last_cgroup_oom", "terminal_facts",
+  ]);
+  assert.deepEqual(Object.keys(snapshot.terminal_facts[0]), [
+    "project_id", "generation_id", "resource_class", "unit_name",
+    "reason", "exit_code", "signal", "finished_at",
+  ]);
+  assert.deepEqual(snapshot.temp, { disk_backed: true, free_mib: 12000, total_mib: 24000 });
+  assert.deepEqual(
+    createResourceSnapshot({ temp: { disk_backed: false, free_mib: 100, total_mib: 200 } }).temp,
+    { disk_backed: false, free_mib: 100, total_mib: 200 },
+  );
+}
+
+// History retains only the newest valid bounded facts.
+{
+  const { filePath } = fixture();
+  const facts = [fact(0), fact(1), fact(2), fact(3), fact(4)];
+  const snapshot = stateStore({ filePath, terminalFactLimit: 3 }).save(fullState(facts));
+  assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.generation_id), [
+    "generation-2", "generation-3", "generation-4",
+  ]);
+  const disk = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  assert.equal(disk.terminal_facts.length, 3);
+}
+
+// Invalid facts interleaved at the tail do not displace the newest valid N,
+// while a hostile sparse array cannot force an unbounded scan.
+{
+  const invalidFact = (index) => fact(index, { reason: "not-a-terminal-reason" });
+  const input = [fact(0), invalidFact(10), fact(1), invalidFact(11), fact(2), invalidFact(12), fact(3), invalidFact(13)];
+  const snapshot = createResourceSnapshot({ terminal_facts: input }, { terminalFactLimit: 3 });
+  assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.generation_id), [
+    "generation-1", "generation-2", "generation-3",
+  ]);
+
+  const sparse = [];
+  sparse.length = 1_000_000;
+  let numericReads = 0;
+  const hostileSparse = new Proxy(sparse, {
+    get(target, property, receiver) {
+      if (typeof property === "string" && /^\d+$/.test(property)) numericReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  assert.deepEqual(
+    createResourceSnapshot({ terminal_facts: hostileSparse }, { terminalFactLimit: 3 }).terminal_facts,
+    [],
+  );
+  assert.equal(numericReads, 30, "scan work is capped at ten times the retention limit");
+}
+
+// Terminal reason authority has one explicit matrix. Contradictory claims are
+// retained only as unknown facts, never as a false normal/signal/OOM outcome.
+{
+  const matrix = [
+    fact(10, { reason: "normal_exit", exit_code: 0, signal: null }),
+    fact(11, { reason: "normal_exit", exit_code: 1, signal: null }),
+    fact(12, { reason: "normal_exit", exit_code: 0, signal: "SIGTERM" }),
+    fact(13, { reason: "signal", exit_code: null, signal: "SIGTERM" }),
+    fact(14, { reason: "signal", exit_code: 143, signal: "SIGTERM" }),
+    fact(15, { reason: "signal", exit_code: null, signal: null }),
+    fact(16, { reason: "oom_kill", exit_code: 137, signal: null }),
+    fact(17, { reason: "oom_kill", exit_code: null, signal: "SIGKILL" }),
+    fact(18, { reason: "oom_kill", exit_code: null, signal: 9 }),
+    fact(19, { reason: "oom_kill", exit_code: 0, signal: null }),
+    fact(20, { reason: "oom_kill", exit_code: 0, signal: "SIGKILL" }),
+    fact(21, { reason: "oom_kill", exit_code: 137, signal: "SIGTERM" }),
+    fact(22, { reason: "unknown", exit_code: 0, signal: null }),
+    fact(23, { reason: "unknown", exit_code: 17, signal: "SIGTERM" }),
+    fact(24, { reason: "unsupported", exit_code: 0, signal: null }),
+  ];
+  matrix.push(
+    fact(25, { reason: "normal_exit", exit_code: 0, signal: "invalid-signal" }),
+    fact(26, { reason: "signal", exit_code: 999, signal: "SIGTERM" }),
+    fact(27, { reason: "signal", exit_code: null, signal: "invalid-signal" }),
+    fact(28, { reason: "oom_kill", exit_code: null, signal: "invalid-signal" }),
+  );
+  const output = createResourceSnapshot({
+    last_cgroup_oom: {
+      project_id: "quadwork",
+      generation_id: "generation-19",
+      resource_class: "control",
+      unit_name: "qw-worker-19.scope",
+      oom_kill_count: 1,
+      observed_at: "2026-08-31T00:00:19Z",
+    },
+    terminal_facts: matrix,
+  }, { terminalFactLimit: 20 }).terminal_facts;
+  assert.deepEqual(output.map((entry) => entry.reason), [
+    "normal_exit", "unknown", "unknown",
+    "signal", "unknown", "unknown",
+    "unknown", "unknown", "unknown", "oom_kill", "unknown", "unknown",
+    "unknown", "unknown",
+    "unknown", "unknown", "unknown", "unknown",
+  ]);
+  assert.equal(output.some((entry) => entry.generation_id === "generation-24"), false);
+  assert.equal(
+    createResourceSnapshot({ terminal_facts: [fact(29, { reason: "oom_kill", exit_code: 0, signal: null })] })
+      .terminal_facts[0].reason,
+    "unknown",
+    "OOM without a validated persisted counter is not authoritative",
+  );
+  const zeroObservation = createResourceSnapshot({
+    last_cgroup_oom: {
+      project_id: "quadwork",
+      generation_id: "generation-29",
+      resource_class: "control",
+      unit_name: "qw-worker-29.scope",
+      oom_kill_count: 0,
+      observed_at: "2026-08-31T00:00:29Z",
+    },
+    terminal_facts: [fact(29, { reason: "oom_kill", exit_code: 0, signal: null })],
+  });
+  assert.equal(zeroObservation.last_cgroup_oom.oom_kill_count, "0", "a valid zero observation persists");
+  assert.equal(
+    zeroObservation.terminal_facts[0].reason,
+    "unknown",
+    "a valid zero counter cannot claim an OOM",
+  );
+}
+
+// OOM authority belongs to one exact immutable resource identity. Both the
+// controller's durable pre-collect observation and a post-exit observation are
+// valid; timestamp ordering is not fabricated from those separate events.
+{
+  const oomFact = fact(31, { reason: "oom_kill", exit_code: 0, signal: null });
+  const exactPreCollect = {
+    project_id: oomFact.project_id,
+    generation_id: oomFact.generation_id,
+    resource_class: oomFact.resource_class,
+    unit_name: oomFact.unit_name,
+    oom_kill_count: 3,
+    observed_at: "2026-08-01T00:00:00.000Z",
+  };
+  assert.equal(createResourceSnapshot({
+    last_cgroup_oom: exactPreCollect,
+    terminal_facts: [oomFact],
+  }).terminal_facts[0].reason, "oom_kill", "long-lived generation pre-collect observation authorizes OOM");
+
+  assert.equal(createResourceSnapshot({
+    last_cgroup_oom: { ...exactPreCollect, observed_at: "2026-09-01T00:00:00.000Z" },
+    terminal_facts: [oomFact],
+  }).terminal_facts[0].reason, "oom_kill", "post-exit observation authorizes OOM");
+
+  for (const mismatch of [
+    { generation_id: "another-generation" },
+    { project_id: "another-project" },
+    { resource_class: oomFact.resource_class === "worker" ? "control" : "worker" },
+    { unit_name: "another-worker.scope" },
+  ]) {
+    assert.equal(createResourceSnapshot({
+      last_cgroup_oom: { ...exactPreCollect, ...mismatch },
+      terminal_facts: [oomFact],
+    }).terminal_facts[0].reason, "unknown");
+  }
+
+  const legacyGlobal = createResourceSnapshot({
+    last_cgroup_oom: { oom_kill_count: 7, observed_at: oomFact.finished_at },
+    terminal_facts: [oomFact],
+  });
+  assert.equal(legacyGlobal.last_cgroup_oom, null);
+  assert.equal(legacyGlobal.terminal_facts[0].reason, "unknown");
+}
+
+// Every historical OOM carries its own qualified counter/time pair. A later
+// zero observation remains the latest global observation without invalidating
+// the earlier fact, and re-sanitization is idempotent.
+{
+  const first = fact(32, {
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    oom_kill_count: 7,
+    oom_observed_at: "2026-08-31T09:00:32+09:00",
+  });
+  const second = fact(33);
+  const snapshot = createResourceSnapshot({
+    last_cgroup_oom: oomProvenanceFor(second, 0, "2026-08-31T00:00:33Z"),
+    terminal_facts: [first, second],
+  });
+  assert.deepEqual(snapshot.terminal_facts[0], {
+    project_id: first.project_id,
+    generation_id: first.generation_id,
+    resource_class: first.resource_class,
+    unit_name: first.unit_name,
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    finished_at: first.finished_at,
+    oom_kill_count: "7",
+    oom_observed_at: "2026-08-31T00:00:32.000Z",
+  });
+  assert.equal(snapshot.last_cgroup_oom.generation_id, second.generation_id);
+  assert.equal(snapshot.last_cgroup_oom.oom_kill_count, "0");
+  assert.deepEqual(createResourceSnapshot(snapshot), snapshot);
+}
+
+// Multiple OOM generations, including exact counters above Number.MAX_SAFE_INTEGER,
+// survive JSON persistence independently of the one latest global observation.
+{
+  const { filePath } = fixture();
+  const first = fact(34, {
+    reason: "oom_kill",
+    exit_code: 0,
+    signal: null,
+    oom_kill_count: 9_007_199_254_740_993n,
+    oom_observed_at: "2026-08-01T00:00:34.001Z",
+  });
+  const second = fact(35, {
+    reason: "oom_kill",
+    exit_code: null,
+    signal: 9,
+    oom_kill_count: "18446744073709551615",
+    oom_observed_at: "2026-08-02T00:00:35.002Z",
+  });
+  const store = stateStore({ filePath });
+  const saved = store.save({
+    status: "candidate_pending_staging",
+    last_cgroup_oom: oomProvenanceFor(second, "18446744073709551615", second.oom_observed_at),
+    terminal_facts: [first, second],
+  });
+  assert.deepEqual(saved.terminal_facts.map((entry) => [entry.reason, entry.oom_kill_count]), [
+    ["oom_kill", "9007199254740993"],
+    ["oom_kill", "18446744073709551615"],
+  ]);
+  assert.doesNotThrow(() => JSON.parse(fs.readFileSync(filePath, "utf8")));
+  assert.deepEqual(stateStore({ filePath }).load(), saved);
+}
+
+// Retention bounds apply to inline-provenance facts without coupling retained
+// entries to the latest global identity.
+{
+  const oomFacts = [36, 37, 38].map((index) => fact(index, {
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    oom_kill_count: index,
+    oom_observed_at: `2026-08-01T00:00:${index}.000Z`,
+  }));
+  const snapshot = createResourceSnapshot({
+    last_cgroup_oom: oomProvenanceFor(oomFacts[2], 38, oomFacts[2].oom_observed_at),
+    terminal_facts: oomFacts,
+  }, { terminalFactLimit: 2 });
+  assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.generation_id), [
+    "generation-37", "generation-38",
+  ]);
+  assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.oom_kill_count), ["37", "38"]);
+}
+
+// Malformed or attempted inline evidence fails closed and cannot fall through
+// to a matching legacy global observation. Non-OOM facts never retain it.
+{
+  const matching = fact(39, { reason: "oom_kill", exit_code: null, signal: "SIGKILL" });
+  const global = oomProvenanceFor(matching, 5, "2026-08-31T00:00:39Z");
+  const invalidInline = [
+    { oom_kill_count: 0, oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: "01", oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: "18446744073709551616", oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: -1, oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: 1 },
+    { oom_observed_at: "2026-08-31T00:00:39Z" },
+    { oom_kill_count: 1, oom_observed_at: "2026-02-29T00:00:00Z" },
+  ];
+  for (const inline of invalidInline) {
+    const output = createResourceSnapshot({
+      last_cgroup_oom: global,
+      terminal_facts: [{ ...matching, ...inline }],
+    }).terminal_facts[0];
+    assert.equal(output.reason, "unknown");
+    assert.equal(Object.hasOwn(output, "oom_kill_count"), false);
+    assert.equal(Object.hasOwn(output, "oom_observed_at"), false);
+  }
+
+  const inheritedInline = Object.create({
+    oom_kill_count: 9,
+    oom_observed_at: "2026-08-31T00:00:39Z",
+  });
+  Object.assign(inheritedInline, matching);
+  const inheritedOutput = createResourceSnapshot({ terminal_facts: [inheritedInline] }).terminal_facts[0];
+  assert.equal(inheritedOutput.reason, "unknown");
+  assert.equal(Object.hasOwn(inheritedOutput, "oom_kill_count"), false);
+
+  const secret = "INLINE-OOM-GETTER-SECRET";
+  const hostile = { ...matching, oom_observed_at: "2026-08-31T00:00:39Z" };
+  Object.defineProperty(hostile, "oom_kill_count", {
+    enumerable: true,
+    get() { throw new Error(secret); },
+  });
+  const hostileSnapshot = createResourceSnapshot({ last_cgroup_oom: global, terminal_facts: [hostile] });
+  assert.equal(hostileSnapshot.terminal_facts[0].reason, "unknown");
+  assert.ok(!JSON.stringify(hostileSnapshot).includes(secret));
+
+  const normal = createResourceSnapshot({ terminal_facts: [fact(40, {
+    oom_kill_count: "9",
+    oom_observed_at: "2026-08-31T00:00:40Z",
+    oom_project_id: "forged-project",
+  })] }).terminal_facts[0];
+  assert.equal(Object.hasOwn(normal, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(normal, "oom_observed_at"), false);
+  assert.equal(Object.hasOwn(normal, "oom_project_id"), false);
+}
+
+// Legacy v1 facts with no inline fields migrate from one exact matching global
+// observation, then remain authoritative when the latest global observation changes.
+{
+  const legacy = fact(41, { reason: "oom_kill", exit_code: null, signal: "SIGKILL" });
+  const legacyDocument = {
+    version: 1,
+    status: "candidate_pending_staging",
+    last_cgroup_oom: oomProvenanceFor(legacy, 11, "2026-08-31T09:00:41+09:00"),
+    terminal_facts: [legacy],
+  };
+  const { filePath } = fixture();
+  fs.writeFileSync(filePath, JSON.stringify(legacyDocument), { mode: 0o600 });
+  const upgraded = stateStore({ filePath }).load();
+  assert.equal(upgraded.terminal_facts[0].reason, "oom_kill");
+  assert.equal(upgraded.terminal_facts[0].oom_kill_count, "11");
+  assert.equal(upgraded.terminal_facts[0].oom_observed_at, "2026-08-31T00:00:41.000Z");
+  const newest = fact(42);
+  const afterZero = createResourceSnapshot({
+    ...upgraded,
+    last_cgroup_oom: oomProvenanceFor(newest, 0, "2026-08-31T00:00:42Z"),
+  });
+  assert.equal(afterZero.terminal_facts[0].reason, "oom_kill");
+  assert.equal(afterZero.terminal_facts[0].oom_kill_count, "11");
+}
+
+// OOM provenance never authorizes contradictory process metadata. An exit code
+// and a signal cannot both be terminal authority, whether the observation is
+// carried inline or migrated from an exact legacy global observation.
+{
+  const inline = fact(45, {
+    reason: "oom_kill",
+    exit_code: 137,
+    signal: "SIGKILL",
+    oom_kill_count: 1,
+    oom_observed_at: "2026-08-31T00:00:44.000Z",
+  });
+  const inlineOutput = createResourceSnapshot({ terminal_facts: [inline] }).terminal_facts[0];
+  assert.equal(inlineOutput.reason, "unknown");
+  assert.equal(Object.hasOwn(inlineOutput, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(inlineOutput, "oom_observed_at"), false);
+
+  const legacy = fact(46, { reason: "oom_kill", exit_code: 137, signal: "SIGKILL" });
+  const legacyOutput = createResourceSnapshot({
+    last_cgroup_oom: oomProvenanceFor(legacy, 1, "2026-08-31T00:00:45.000Z"),
+    terminal_facts: [legacy],
+  }).terminal_facts[0];
+  assert.equal(legacyOutput.reason, "unknown");
+  assert.equal(Object.hasOwn(legacyOutput, "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(legacyOutput, "oom_observed_at"), false);
+}
+
+// A full controller-shaped snapshot is still treated as untrusted persisted
+// input. Forging an OOM reason and inline evidence cannot make contradictory
+// exit/signal metadata authoritative.
+{
+  const controllerSnapshot = {
+    protocol_status: "candidate_pending_staging",
+    control_children: { limit: 1, active: 0, queued: 0 },
+    control_class: { unit_name: "quadwork-control.slice", aggregate: true },
+    active_scopes: [],
+    last_cgroup_oom: {
+      project_id: "quadwork",
+      generation_id: "controller-generation",
+      resource_class: "worker",
+      unit_name: "qw-worker-controller.scope",
+      oom_kill_count: "1",
+      observed_at: "2026-08-31T00:00:46.000Z",
+    },
+    terminal_facts: [{
+      project_id: "quadwork",
+      generation_id: "controller-generation",
+      resource_class: "worker",
+      unit_name: "qw-worker-controller.scope",
+      reason: "oom_kill",
+      exit_code: 137,
+      signal: "SIGKILL",
+      finished_at: "2026-08-31T00:00:47.000Z",
+      oom_kill_count: "1",
+      oom_observed_at: "2026-08-31T00:00:46.000Z",
+    }],
+  };
+  const output = createResourceSnapshot(controllerSnapshot);
+  assert.equal(output.terminal_facts[0].reason, "unknown");
+  assert.equal(Object.hasOwn(output.terminal_facts[0], "oom_kill_count"), false);
+  assert.equal(Object.hasOwn(output.terminal_facts[0], "oom_observed_at"), false);
+}
+
+// Calendar rollover is rejected consistently for terminal, global, and inline
+// timestamps; a real leap day and numeric offset canonicalize normally.
+{
+  for (const [index, invalidTime] of [
+    "2026-02-29T00:00:00Z",
+    "2024-02-30T00:00:00Z",
+    "2026-04-31T00:00:00Z",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T00:60:00Z",
+    "2026-01-01T00:00:60Z",
+    "2026-01-01T00:00:00+24:00",
+    "2026-01-01T00:00:00+01:60",
+  ].entries()) {
+    const invalidFinished = createResourceSnapshot({
+      terminal_facts: [fact(43, { finished_at: invalidTime })],
+    });
+    assert.equal(invalidFinished.terminal_facts.length, 0, `invalid finished_at ${index}`);
+    const invalidGlobal = createResourceSnapshot({
+      last_cgroup_oom: oomProvenanceFor(fact(43), 1, invalidTime),
+    });
+    assert.equal(invalidGlobal.last_cgroup_oom, null, `invalid observed_at ${index}`);
+    const invalidInline = createResourceSnapshot({ terminal_facts: [fact(43, {
+      reason: "oom_kill",
+      exit_code: null,
+      signal: "SIGKILL",
+      oom_kill_count: 1,
+      oom_observed_at: invalidTime,
+    })] });
+    assert.equal(invalidInline.terminal_facts[0].reason, "unknown", `invalid inline time ${index}`);
+  }
+  const leap = createResourceSnapshot({ terminal_facts: [fact(44, {
+    finished_at: "2024-02-29T23:59:59.123+14:00",
+    reason: "oom_kill",
+    exit_code: null,
+    signal: "SIGKILL",
+    oom_kill_count: 1,
+    oom_observed_at: "2024-02-29T23:59:59.123-14:00",
+  })] }).terminal_facts[0];
+  assert.equal(leap.finished_at, "2024-02-29T09:59:59.123Z");
+  assert.equal(leap.oom_observed_at, "2024-03-01T13:59:59.123Z");
+}
+
+// `ready` is authority-bearing. It survives only when every required fact is
+// present and the policy, usage arithmetic, counts, and disk facts agree.
+{
+  assert.equal(createResourceSnapshot(fullState()).status, "ready");
+
+  const missing = fullState();
+  delete missing.counts.active_worker_scopes;
+  assert.equal(createResourceSnapshot(missing).status, "unknown");
+
+  const overLimit = fullState();
+  overLimit.counts.active_worker_scopes = overLimit.limits.max_worker_scopes + 1;
+  assert.equal(createResourceSnapshot(overLimit).status, "unknown");
+
+  const contradictory = fullState();
+  contradictory.usage.static_headroom_mib += 1;
+  assert.equal(createResourceSnapshot(contradictory).status, "unknown");
+
+  const unsafeTemp = fullState();
+  unsafeTemp.temp.disk_backed = false;
+  assert.equal(createResourceSnapshot(unsafeTemp).status, "unknown");
+
+  const lowTemp = fullState();
+  lowTemp.temp.free_mib = lowTemp.limits.temp_min_free_mib - 1;
+  assert.equal(createResourceSnapshot(lowTemp).status, "unknown");
+
+  const partialFailure = createResourceSnapshot({ status: "unavailable", counts: { active_worker_scopes: 0 } });
+  assert.equal(partialFailure.status, "unavailable", "a declared non-ready state may remain partial");
+
+  const { filePath } = fixture();
+  fs.writeFileSync(filePath, JSON.stringify({ version: 1, status: "ready", counts: {} }), { mode: 0o600 });
+  assert.equal(stateStore({ filePath }).load().status, "unknown", "reload revalidates ready authority");
+}
+
+// The last cgroup OOM counter/time pair is all-or-none and uses a canonical
+// decimal string so counters above Number.MAX_SAFE_INTEGER remain JSON-safe.
+{
+  const { filePath } = fixture();
+  const input = fullState();
+  input.last_cgroup_oom = {
+    project_id: "quadwork",
+    generation_id: "generation-1",
+    resource_class: "control",
+    unit_name: "qw-worker-1.scope",
+    oom_kill_count: 9_007_199_254_740_993n,
+    observed_at: "2026-08-31T09:15:00+09:00",
+    raw_path: "/sys/fs/cgroup/private/memory.events",
+  };
+  const store = stateStore({ filePath });
+  const saved = store.save(input);
+  assert.deepEqual(saved.last_cgroup_oom, {
+    project_id: "quadwork",
+    generation_id: "generation-1",
+    resource_class: "control",
+    unit_name: "qw-worker-1.scope",
+    oom_kill_count: "9007199254740993",
+    observed_at: "2026-08-31T00:15:00.000Z",
+  });
+  assert.doesNotThrow(() => JSON.parse(fs.readFileSync(filePath, "utf8")), "no bigint crosses JSON encoding");
+  assert.deepEqual(stateStore({ filePath }).load().last_cgroup_oom, saved.last_cgroup_oom);
+  assert.ok(!fs.readFileSync(filePath, "utf8").includes("/sys/fs"));
+
+  const identity = {
+    project_id: "quadwork",
+    generation_id: "generation-1",
+    resource_class: "control",
+    unit_name: "qw-worker-1.scope",
+  };
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: 1 } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: -1, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: "01", observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+  assert.equal(createResourceSnapshot({ last_cgroup_oom: { ...identity, oom_kill_count: 1n << 64n, observed_at: "2026-08-31T00:00:00Z" } }).last_cgroup_oom, null);
+}
+
+// A failed atomic commit preserves both the prior file and in-memory snapshot.
+{
+  const { dir, filePath } = fixture();
+  const baselineStore = stateStore({ filePath });
+  const baseline = baselineStore.save(fullState([fact(1)]));
+  const originalBytes = fs.readFileSync(filePath, "utf8");
+  const failingFs = Object.create(fs);
+  failingFs.renameSync = () => {
+    const error = new Error("injected rename failure");
+    error.code = "ENOSPC";
+    throw error;
+  };
+  const failingStore = stateStore({ filePath, fsImpl: failingFs });
+  assert.deepEqual(failingStore.load(), baseline);
+  assert.throws(
+    () => failingStore.save(fullState([fact(2)])),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED"
+      && error.recoveryEntries.length === 2,
+  );
+  assert.equal(fs.readFileSync(filePath, "utf8"), originalBytes);
+  assert.deepEqual(failingStore.snapshot(), baseline);
+  assert.equal(fs.readdirSync(dir).includes(".resource-state.json.previous"), true);
+}
+
+// Repeated saves reuse exactly one fixed previous-state sibling. The current
+// file is always the newest verified snapshot and the sibling is its immediate
+// predecessor; no successful save needs pathname deletion.
+{
+  const { dir, filePath } = fixture();
+  const store = stateStore({ filePath });
+  const first = store.save(fullState([fact(1)]));
+  assert.deepEqual(fs.readdirSync(dir), ["resource-state.json"]);
+  const second = store.save(fullState([fact(2)]));
+  const recoveryPath = path.join(dir, ".resource-state.json.previous");
+  assert.deepEqual(JSON.parse(fs.readFileSync(recoveryPath, "utf8")), first);
+  const third = store.save(fullState([fact(3)]));
+  assert.deepEqual(JSON.parse(fs.readFileSync(recoveryPath, "utf8")), second);
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")), third);
+  assert.deepEqual(fs.readdirSync(dir).sort(), [
+    ".resource-state.json.previous",
+    "resource-state.json",
+  ]);
+  const restarted = stateStore({ filePath });
+  assert.deepEqual(restarted.load(), third, "restart loads only the verified current state");
+  const fourth = restarted.save(fullState([fact(4)]));
+  assert.deepEqual(JSON.parse(fs.readFileSync(recoveryPath, "utf8")), third);
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")), fourth);
+  assert.equal(fs.readdirSync(dir).length, 2, "restart preserves the same bounded two-entry layout");
+}
+
+// A parent alias is rejected during construction before any state leaf is read
+// or written. The outside directory remains byte-for-byte untouched.
+{
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "qw-state-parent-link-")));
+  fixtures.push(root);
+  const outside = path.join(root, "outside");
+  const parent = path.join(root, "state-parent");
+  fs.mkdirSync(outside, { mode: 0o700 });
+  const outsideState = path.join(outside, "resource-state.json");
+  fs.writeFileSync(outsideState, "OUTSIDE\n", { mode: 0o600 });
+  fs.symlinkSync(outside, parent, "dir");
+  let reads = 0;
+  let writes = 0;
+  const guardedFs = Object.create(fs);
+  guardedFs.readFileSync = (...args) => { reads += 1; return fs.readFileSync(...args); };
+  guardedFs.writeFileSync = (...args) => { writes += 1; return fs.writeFileSync(...args); };
+  assert.throws(
+    () => stateStore({ filePath: path.join(parent, "resource-state.json"), fsImpl: guardedFs }),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_PARENT_UNSAFE",
+  );
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+  assert.equal(fs.readFileSync(outsideState, "utf8"), "OUTSIDE\n");
+}
+
+// Replacing the accepted parent after its handle is opened cannot redirect a
+// write. The descriptor-backed fixture writes only into the moved original and
+// the public symlink target remains untouched; commit never starts.
+{
+  const { dir, filePath } = fixture();
+  const moved = `${dir}.moved`;
+  const outside = `${dir}.outside`;
+  fixtures.push(moved, outside);
+  let commitCalls = 0;
+  function parentSwapFactory({ directory, directoryIdentity, fsImpl }) {
+    let anchored = directory;
+    return {
+      stat: () => fsImpl.lstatSync(anchored),
+      path: (name) => path.join(anchored, name),
+      assertAvailable() {
+        fs.renameSync(directory, moved);
+        fs.mkdirSync(outside, { mode: 0o700 });
+        fs.symlinkSync(outside, directory, "dir");
+        anchored = moved;
+      },
+      commit() { commitCalls += 1; },
+      fsync: () => {},
+      close: () => {},
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: parentSwapFactory });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+  );
+  assert.equal(commitCalls, 0);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  assert.deepEqual(fs.readdirSync(moved), [".resource-state.json.previous"]);
+}
+
+// Helper/platform refusal happens before the fixed candidate is created.
+{
+  const { dir, filePath } = fixture();
+  function unavailableFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      assertAvailable() {
+        throw new SecureResourceDirectoryError(
+          "rename_unavailable",
+          "PRIVATE helper unavailable /private/helper",
+        );
+      },
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: unavailableFactory });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_PERSISTENCE_UNAVAILABLE"
+      && !error.message.includes("PRIVATE"),
+  );
+  assert.deepEqual(fs.readdirSync(dir), []);
+  assert.equal(store.snapshot().status, "unknown");
+}
+
+// A no-replace conflict preserves both the unexpected destination and the
+// fully written fixed candidate. No cleanup path is invoked.
+{
+  const { dir, filePath } = fixture();
+  const recoveryPath = path.join(dir, ".resource-state.json.previous");
+  const guardedFs = Object.create(fs);
+  let unlinks = 0;
+  guardedFs.unlinkSync = () => { unlinks += 1; throw new Error("unlink forbidden"); };
+  function conflictFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit() {
+        fs.writeFileSync(filePath, "DESTINATION-VICTIM\n", { mode: 0o600 });
+        throw new SecureResourceDirectoryError("destination_exists", "destination appeared");
+      },
+    };
+  }
+  const store = new ResourceStateStore({
+    filePath,
+    fsImpl: guardedFs,
+    directoryHandleFactory: conflictFactory,
+  });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+  );
+  assert.equal(fs.readFileSync(filePath, "utf8"), "DESTINATION-VICTIM\n");
+  assert.doesNotThrow(() => JSON.parse(fs.readFileSync(recoveryPath, "utf8")));
+  assert.equal(unlinks, 0);
+}
+
+// Source substitution after Node's final candidate check is rejected by the
+// identity-bound helper seam. The symlink and intended candidate inode remain;
+// neither the current state nor the outside target is touched.
+{
+  const { dir, filePath } = fixture();
+  const baselineStore = stateStore({ filePath });
+  const baseline = baselineStore.save(fullState([fact(1)]));
+  const baselineBytes = fs.readFileSync(filePath, "utf8");
+  const outside = path.join(dir, "outside-source.txt");
+  fs.writeFileSync(outside, "OUTSIDE-SOURCE\n", { mode: 0o600 });
+  let orphan = null;
+  function sourceSwapFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit({ source }) {
+        const sourcePath = path.join(dir, source);
+        orphan = `${sourcePath}.orphan`;
+        fs.renameSync(sourcePath, orphan);
+        fs.symlinkSync(outside, sourcePath);
+        throw new SecureResourceDirectoryError("rename_failed", "source identity changed", [source]);
+      },
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: sourceSwapFactory });
+  assert.deepEqual(store.load(), baseline);
+  assert.throws(() => store.save(fullState([fact(2)])), (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED");
+  assert.equal(fs.readFileSync(filePath, "utf8"), baselineBytes);
+  assert.equal(fs.readFileSync(outside, "utf8"), "OUTSIDE-SOURCE\n");
+  assert.equal(fs.lstatSync(path.join(dir, ".resource-state.json.previous")).isSymbolicLink(), true);
+  assert.equal(fs.existsSync(orphan), true);
+  assert.deepEqual(store.snapshot(), baseline);
+}
+
+// Destination file/symlink/directory substitutions immediately before helper
+// commit are preserved with the accepted old state and candidate. No unlink is
+// permitted, and in-memory evidence remains at the loaded baseline.
+for (const replacementType of ["file", "symlink", "directory"]) {
+  const { dir, filePath } = fixture();
+  const baselineStore = stateStore({ filePath });
+  const baseline = baselineStore.save(fullState([fact(1)]));
+  const savedOld = path.join(dir, `accepted-${replacementType}.json`);
+  const outside = path.join(dir, `outside-${replacementType}.txt`);
+  fs.writeFileSync(outside, `OUTSIDE-${replacementType}\n`, { mode: 0o600 });
+  let unlinks = 0;
+  const guardedFs = Object.create(fs);
+  guardedFs.unlinkSync = () => { unlinks += 1; throw new Error("unlink forbidden"); };
+  function destinationSwapFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit() {
+        fs.renameSync(filePath, savedOld);
+        if (replacementType === "file") {
+          fs.writeFileSync(filePath, "DESTINATION-FILE\n", { mode: 0o600 });
+        } else if (replacementType === "symlink") {
+          fs.symlinkSync(outside, filePath);
+        } else {
+          fs.mkdirSync(filePath, { mode: 0o700 });
+        }
+        throw new SecureResourceDirectoryError("rename_failed", "destination identity changed");
+      },
+    };
+  }
+  const store = new ResourceStateStore({
+    filePath,
+    fsImpl: guardedFs,
+    directoryHandleFactory: destinationSwapFactory,
+  });
+  assert.deepEqual(store.load(), baseline);
+  assert.throws(() => store.save(fullState([fact(2)])), (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED");
+  assert.equal(fs.existsSync(savedOld), true);
+  assert.equal(fs.existsSync(path.join(dir, ".resource-state.json.previous")), true);
+  assert.equal(fs.readFileSync(outside, "utf8"), `OUTSIDE-${replacementType}\n`);
+  assert.equal(unlinks, 0);
+  assert.deepEqual(store.snapshot(), baseline);
+}
+
+// A helper that completed exchange but reports an ambiguous post-check leaves
+// current and previous entries intact while the process-local snapshot stays
+// at the last verified state.
+{
+  const { dir, filePath } = fixture();
+  const baselineStore = stateStore({ filePath });
+  const baseline = baselineStore.save(fullState([fact(1)]));
+  function ambiguousFactory(options) {
+    const base = pathDirectoryHandleFactory(options);
+    return {
+      ...base,
+      commit(args) {
+        base.commit(args);
+        throw new SecureResourceDirectoryError("recovery_required", "post-commit receipt unavailable");
+      },
+    };
+  }
+  const store = new ResourceStateStore({ filePath, directoryHandleFactory: ambiguousFactory });
+  assert.deepEqual(store.load(), baseline);
+  assert.throws(() => store.save(fullState([fact(2)])), (error) => error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED");
+  assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).terminal_facts[0].generation_id, "generation-2");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".resource-state.json.previous"), "utf8")).terminal_facts[0].generation_id, "generation-1");
+  assert.deepEqual(store.snapshot(), baseline);
+}
+
+// Swapping the freshly written candidate pathname to a symlink is detected
+// before commit. The uncertain symlink and displaced inode are both preserved;
+// the target outside the state store is never chmodded, written, or removed.
+{
+  const { dir, filePath } = fixture();
+  const outside = path.join(dir, "outside.txt");
+  const outsideBytes = "outside-content-must-survive\n";
+  fs.writeFileSync(outside, outsideBytes, { mode: 0o644 });
+  fs.chmodSync(outside, 0o644);
+  const swapFs = Object.create(fs);
+  let tmpPath = null;
+  let swapped = false;
+  swapFs.openSync = (target, flags, mode) => {
+    tmpPath = target;
+    return fs.openSync(target, flags, mode);
+  };
+  swapFs.writeFileSync = (target, data, options) => {
+    const orphan = `${tmpPath}.orphan`;
+    fs.renameSync(tmpPath, orphan);
+    fs.symlinkSync(outside, tmpPath);
+    swapped = true;
+    // The source writes through the already verified fd, never through the
+    // substituted pathname. The external symlink target must remain untouched.
+    fs.writeFileSync(target, data, options);
+  };
+  const store = stateStore({ filePath, fsImpl: swapFs });
+  assert.throws(
+    () => store.save(fullState()),
+    (error) => error instanceof ResourceStatePersistenceError
+      && error.code === "QW_RESOURCE_STATE_RECOVERY_REQUIRED",
+  );
+  assert.equal(swapped, true);
+  assert.equal(fs.readFileSync(outside, "utf8"), outsideBytes);
+  assert.equal(fs.statSync(outside).mode & 0o777, 0o644);
+  assert.equal(fs.existsSync(filePath), false);
+  assert.equal(fs.lstatSync(tmpPath).isSymbolicLink(), true, "uncertain name is preserved, never unlinked");
+  assert.equal(fs.existsSync(`${tmpPath}.orphan`), true, "intended candidate inode is preserved");
+  assert.equal(store.snapshot().status, "unknown");
+}
+
+// Throwing getters and contradictory/unsafe numeric facts are invalid input,
+// never a reason to inspect unknown fields or serialize raw data.
+{
+  const secret = "GETTER-SECRET-MUST-NOT-LEAK";
+  const input = fullState([fact(1), fact(2)]);
+  Object.defineProperty(input, "status", { get() { throw new Error(secret); } });
+  Object.defineProperty(input.counts, "active_worker_scopes", { get() { throw new Error(secret); } });
+  Object.defineProperty(input.limits, "worker_memory_high_mib", { get() { throw new Error(secret); } });
+  Object.defineProperty(input.usage, "host_memory_available_mib", { get() { throw new Error(secret); } });
+  Object.defineProperty(input.temp, "free_mib", { get() { throw new Error(secret); } });
+  input.last_cgroup_oom = { oom_kill_count: 1, observed_at: "2026-08-31T00:00:00Z" };
+  Object.defineProperty(input.last_cgroup_oom, "oom_kill_count", { get() { throw new Error(secret); } });
+  Object.defineProperty(input.terminal_facts[0], "reason", { get() { throw new Error(secret); } });
+  Object.defineProperty(input, "unknown", { get() { throw new Error("unknown field was read"); } });
+  input.counts.queued_control_children = Number.MAX_SAFE_INTEGER + 1;
+  input.limits.api_memory_low_mib = 900;
+  input.limits.api_memory_max_mib = 800;
+  input.limits.max_worker_scopes = 0;
+  input.usage.swap_free_mib = 3000;
+  input.usage.swap_total_mib = 2000;
+  const snapshot = createResourceSnapshot(input, { terminalFactLimit: 5 });
+  assert.equal(snapshot.status, "unknown");
+  assert.equal(snapshot.counts.active_worker_scopes, undefined);
+  assert.equal(snapshot.counts.queued_control_children, undefined);
+  assert.equal(snapshot.limits.worker_memory_high_mib, undefined);
+  assert.equal(snapshot.limits.api_memory_low_mib, undefined);
+  assert.equal(snapshot.limits.api_memory_max_mib, undefined);
+  assert.equal(snapshot.limits.max_worker_scopes, undefined);
+  assert.equal(snapshot.usage.host_memory_available_mib, undefined);
+  assert.equal(snapshot.usage.swap_free_mib, undefined);
+  assert.equal(snapshot.usage.swap_total_mib, undefined);
+  assert.equal(snapshot.temp, null);
+  assert.equal(snapshot.last_cgroup_oom, null);
+  assert.deepEqual(snapshot.terminal_facts.map((entry) => entry.generation_id), ["generation-2"]);
+  assert.ok(!JSON.stringify(snapshot).includes(secret));
+}
+
+// Reload trusts only the same regular 0600 file opened without symlink
+// following. Unsafe files are left untouched and yield an empty non-ready state.
+{
+  const expectedEmpty = createResourceSnapshot({});
+
+  const insecure = fixture();
+  fs.writeFileSync(insecure.filePath, JSON.stringify({ version: 1, ...fullState() }), { mode: 0o644 });
+  fs.chmodSync(insecure.filePath, 0o644);
+  assert.deepEqual(stateStore({ filePath: insecure.filePath }).load(), expectedEmpty);
+  assert.equal(fs.statSync(insecure.filePath).mode & 0o777, 0o644);
+
+  const symlinked = fixture();
+  const realState = path.join(symlinked.dir, "real-state.json");
+  fs.writeFileSync(realState, JSON.stringify({ version: 1, ...fullState() }), { mode: 0o600 });
+  fs.symlinkSync(realState, symlinked.filePath);
+  assert.deepEqual(stateStore({ filePath: symlinked.filePath }).load(), expectedEmpty);
+  assert.equal(fs.lstatSync(symlinked.filePath).isSymbolicLink(), true);
+
+  const directory = fixture();
+  fs.mkdirSync(directory.filePath, { mode: 0o600 });
+  assert.deepEqual(stateStore({ filePath: directory.filePath }).load(), expectedEmpty);
+
+  const wrongOwner = fixture();
+  fs.writeFileSync(wrongOwner.filePath, JSON.stringify({ version: 1, ...fullState() }), { mode: 0o600 });
+  const ownerFs = Object.create(fs);
+  let ownerOpenCalls = 0;
+  ownerFs.lstatSync = (target) => {
+    const st = fs.lstatSync(target);
+    return new Proxy(st, {
+      get(object, property) {
+        if (property === "uid" && String(target) === wrongOwner.filePath) return Number(object.uid) + 1;
+        const value = Reflect.get(object, property);
+        return typeof value === "function" ? value.bind(object) : value;
+      },
+    });
+  };
+  ownerFs.openSync = (...args) => { ownerOpenCalls += 1; return fs.openSync(...args); };
+  assert.deepEqual(stateStore({ filePath: wrongOwner.filePath, fsImpl: ownerFs }).load(), expectedEmpty);
+  assert.equal(ownerOpenCalls, 0, "wrong ownership fails before the pathname is opened");
+
+  const swapped = fixture();
+  const replacement = path.join(swapped.dir, "replacement.json");
+  fs.writeFileSync(swapped.filePath, JSON.stringify({ version: 1, ...fullState() }), { mode: 0o600 });
+  fs.writeFileSync(replacement, JSON.stringify({ version: 1, status: "unavailable" }), { mode: 0o600 });
+  const original = `${swapped.filePath}.original`;
+  const swapFs = Object.create(fs);
+  let swappedOnce = false;
+  swapFs.openSync = (target, flags) => {
+    if (!swappedOnce) {
+      swappedOnce = true;
+      fs.renameSync(target, original);
+      fs.renameSync(replacement, target);
+    }
+    return fs.openSync(target, flags);
+  };
+  assert.deepEqual(stateStore({ filePath: swapped.filePath, fsImpl: swapFs }).load(), expectedEmpty);
+
+  const oversized = fixture();
+  fs.writeFileSync(oversized.filePath, "", { mode: 0o600 });
+  fs.truncateSync(oversized.filePath, MAX_STATE_BYTES + 1);
+  const boundedFs = Object.create(fs);
+  let reads = 0;
+  boundedFs.readFileSync = (...args) => { reads += 1; return fs.readFileSync(...args); };
+  assert.deepEqual(stateStore({ filePath: oversized.filePath, fsImpl: boundedFs }).load(), expectedEmpty);
+  assert.equal(reads, 0, "oversized trusted files are rejected before read/JSON parse");
+}
+
+// The pure snapshot function performs no filesystem work.
+{
+  const originalWrite = fs.writeFileSync;
+  const originalRename = fs.renameSync;
+  fs.writeFileSync = () => { throw new Error("pure snapshot attempted a write"); };
+  fs.renameSync = () => { throw new Error("pure snapshot attempted a rename"); };
+  let snapshot;
+  try {
+    snapshot = createResourceSnapshot(fullState());
+  } finally {
+    fs.writeFileSync = originalWrite;
+    fs.renameSync = originalRename;
+  }
+  assert.equal(snapshot.status, "ready");
+}
+
+console.log("resource-state.test.js: all assertions passed");

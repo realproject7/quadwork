@@ -6,6 +6,24 @@ const path = require("path");
 const os = require("os");
 const readline = require("readline");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
+const {
+  readConfig: readSharedConfig,
+  readRuntimeResources,
+  updateConfig,
+  withSerializedConfigWrite,
+  commitV2Configuration,
+  commitConfigurationSnapshot,
+} = require("../server/config");
+const { normalizeCiPolicy } = require("../server/ci-evidence-policy");
+const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
+const { configureServiceTempEnvironment } = require("../server/resource-service-env");
+const {
+  resourceInstallFailureForError,
+  policyProposal,
+  applyPolicy,
+  tempInstallProposal,
+  applyTempInstall,
+} = require("../server/resource-install");
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -78,6 +96,17 @@ function runResult(cmd, args = [], opts = {}) {
 
 function which(cmd) {
   return run("which", [cmd]) !== null;
+}
+
+// #1032: this is an availability list, not a backend registry. The wizard
+// only needs to know which supported executable names are on PATH; model and
+// command semantics remain owned by the existing agent configuration surface.
+function installedAgentCliBackends(whichFn = which) {
+  return ["claude", "codex", "gemini", "grok"].filter((backend) => whichFn(backend));
+}
+
+function validateInstalledBackendChoice(choice, available) {
+  return typeof choice === "string" && available.includes(choice) ? choice : null;
 }
 
 // #974: does a global `npm install -g` need sudo? True only when the npm
@@ -255,9 +284,105 @@ function readConfig() {
 }
 
 function writeConfig(config) {
-  if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(CONFIG_PATH, 0o600); } catch {}
+  // The shared transaction determines activation from the locked live file.
+  // A caller cannot select the legacy branch by omitting installation_id from
+  // a stale snapshot.
+  return commitConfigurationSnapshot(config);
+}
+
+function projectRuntimeDirectory(projectId) {
+  const reservedEntries = new Set([
+    ".env",
+    "agentchattr",
+    "config.json",
+    "config.lock",
+    "reseed-state.json",
+    "reviewer-token",
+    "server.pid",
+  ]);
+  if (typeof projectId !== "string" || !projectId || projectId === "." || projectId === ".." || path.basename(projectId) !== projectId) {
+    const error = new Error("project id must name one direct QuadWork config directory");
+    error.code = "invalid_project_id";
+    throw error;
+  }
+  if (reservedEntries.has(projectId)) {
+    const error = new Error("project cleanup target is a reserved QuadWork control entry");
+    error.code = "invalid_project_id";
+    throw error;
+  }
+  const configRoot = path.resolve(CONFIG_DIR);
+  const projectDir = path.resolve(CONFIG_DIR, projectId);
+  if (path.dirname(projectDir) !== configRoot) {
+    const error = new Error("project cleanup target is outside the QuadWork config directory");
+    error.code = "invalid_project_id";
+    throw error;
+  }
+  return projectDir;
+}
+
+function cleanupLegacyProjectAfterConfirmation(projectId) {
+  const projectDir = projectRuntimeDirectory(projectId);
+  let removedDirectory = false;
+  let removedConfigEntry = false;
+  updateConfig((fresh) => {
+    if (Object.prototype.hasOwnProperty.call(fresh, "installation_id")) {
+      const error = new Error("Activated V2 projects must be removed from the dashboard so lifecycle cleanup can run.");
+      error.code = "v2_cleanup_requires_lifecycle";
+      throw error;
+    }
+    const freshIdx = (fresh.projects || []).findIndex((project) => project.id === projectId);
+    if (fs.existsSync(projectDir)) {
+      const target = fs.lstatSync(projectDir);
+      if (!target.isDirectory() || target.isSymbolicLink()) {
+        const error = new Error("project cleanup target must be a real project directory");
+        error.code = "invalid_project_cleanup_target";
+        throw error;
+      }
+      fs.rmSync(projectDir, { recursive: true, force: true });
+      removedDirectory = true;
+    }
+    if (freshIdx >= 0) {
+      fresh.projects.splice(freshIdx, 1);
+      removedConfigEntry = true;
+    }
+  });
+  return { projectDir, removedDirectory, removedConfigEntry };
+}
+
+function legacyAgentChattrDependents(config) {
+  const stillDepends = [];
+  for (const project of config.projects || []) {
+    if (!project.id) continue;
+    const dir = project.agentchattr_dir || path.join(CONFIG_DIR, project.id, "agentchattr");
+    const ready = fs.existsSync(path.join(dir, "run.py")) &&
+      fs.existsSync(path.join(dir, ".venv", "bin", "python")) &&
+      fs.existsSync(path.join(dir, "config.toml"));
+    if (!ready) stillDepends.push(project.id);
+  }
+  return stillDepends;
+}
+
+function cleanupLegacyAgentChattrAfterConfirmation() {
+  const legacyDir = path.join(CONFIG_DIR, "agentchattr");
+  return withSerializedConfigWrite(() => {
+    const fresh = readSharedConfig();
+    const stillDepends = legacyAgentChattrDependents(fresh);
+    if (stillDepends.length > 0) {
+      const error = new Error("one or more projects still depend on the legacy AgentChattr install");
+      error.code = "legacy_agentchattr_still_required";
+      error.project_ids = stillDepends;
+      throw error;
+    }
+    if (!fs.existsSync(legacyDir)) return { legacyDir, removed: false };
+    const target = fs.lstatSync(legacyDir);
+    if (!target.isDirectory() || target.isSymbolicLink()) {
+      const error = new Error("legacy AgentChattr cleanup target must be a real directory");
+      error.code = "invalid_legacy_cleanup_target";
+      throw error;
+    }
+    fs.rmSync(legacyDir, { recursive: true, force: true });
+    return { legacyDir, removed: true };
+  });
 }
 
 // ─── Prerequisites ──────────────────────────────────────────────────────────
@@ -377,11 +502,15 @@ async function checkPrereqs(rl) {
   // ── 6. AI CLIs — at least one required (independent) ──
   let hasClaude = which("claude");
   let hasCodex = which("codex");
+  const hasGemini = which("gemini");
+  const hasGrok = which("grok");
 
   if (hasClaude) ok("Claude Code");
   if (hasCodex) ok("Codex CLI");
+  if (hasGemini) ok("Gemini CLI");
+  if (hasGrok) ok("Grok CLI");
 
-  if (!hasClaude && !hasCodex) {
+  if (installedAgentCliBackends().length === 0) {
     console.log("");
     warn("You need at least one AI CLI to power your agents.");
     log("Choose one (or both) to install:");
@@ -396,7 +525,7 @@ async function checkPrereqs(rl) {
 
   // Offer to install Claude Code if missing
   if (!hasClaude) {
-    const isRequired = !hasCodex;
+    const isRequired = installedAgentCliBackends().length === 0;
     log("Claude Code — Anthropic's AI coding assistant");
     const installClaude = await askYN(rl, "Install Claude Code?", isRequired);
     if (installClaude) {
@@ -418,7 +547,7 @@ async function checkPrereqs(rl) {
 
   // Offer to install Codex CLI if missing
   if (!hasCodex) {
-    const isRequired = !hasClaude;
+    const isRequired = installedAgentCliBackends().length === 0;
     if (hasClaude) {
       console.log("");
       log("Tip: Installing Codex CLI too gives your team different AI perspectives.");
@@ -442,8 +571,8 @@ async function checkPrereqs(rl) {
     }
   }
 
-  if (!hasClaude && !hasCodex) {
-    fail("At least one AI CLI is required (Claude Code or Codex CLI).");
+  if (installedAgentCliBackends().length === 0) {
+    fail("At least one AI CLI is required (Claude Code, Codex CLI, Gemini CLI, or Grok CLI).");
     log("Install one and re-run: npx quadwork init");
     allOk = false;
   }
@@ -575,38 +704,79 @@ async function setupGitHub(rl) {
   return repo;
 }
 
+async function setupV2CiPolicy(rl) {
+  header("V2 Repository CI Policy");
+  log("Every new V2 repository needs an explicit policy. QuadWork never guesses CI checks.");
+  const mode = await ask(rl, "CI policy mode (github-checks/ci-less)", "github-checks");
+  let candidate;
+  if (mode === "ci-less") {
+    const keys = (await ask(rl, "CI-less evidence keys (comma-separated)", "operator"))
+      .split(",").map((value) => value.trim()).filter(Boolean);
+    candidate = { version: 1, mode, evidence_keys: keys };
+  } else if (mode === "github-checks") {
+    const names = (await ask(rl, "Required exact check names (comma-separated)", "test"))
+      .split(",").map((value) => value.trim()).filter(Boolean);
+    const checks = [];
+    for (const name of names) {
+      const kind = await ask(rl, `${name} classification (product/control-plane)`, "product");
+      if (kind !== "product" && kind !== "control-plane") {
+        fail("Check classification must be 'product' or 'control-plane'");
+        return null;
+      }
+      const requirement = await ask(rl, `${name} requirement (required/advisory)`, "required");
+      if (requirement !== "required" && requirement !== "advisory") {
+        fail("Check requirement must be 'required' or 'advisory'");
+        return null;
+      }
+      checks.push({ name, required: requirement === "required", kind });
+    }
+    const grace = Number(await ask(rl, "Registration grace seconds", "300"));
+    const retry = Number(await ask(rl, "Same-SHA retry budget", "1"));
+    candidate = {
+      version: 1,
+      mode,
+      registration_grace_seconds: grace,
+      same_sha_retry_budget: retry,
+      checks,
+    };
+  } else {
+    fail("CI policy mode must be 'github-checks' or 'ci-less'");
+    return null;
+  }
+  try { return normalizeCiPolicy(candidate); }
+  catch (error) {
+    fail(`Invalid V2 CI policy: ${error.message}`);
+    return null;
+  }
+}
+
 // ─── Agent Configuration ────────────────────────────────────────────────────
 
 async function setupAgents(rl, repo) {
   header("Step 3: Agent Configuration");
 
-  // Detect available CLIs
-  const hasClaude = which("claude");
-  const hasCodex = which("codex");
-  const bothAvailable = hasClaude && hasCodex;
-  const onlyOneCli = (hasClaude && !hasCodex) || (!hasClaude && hasCodex);
-  let defaultBackend = hasClaude ? "claude" : "codex";
+  // Detect every supported installed CLI. A terminal wizard must be usable on
+  // a Gemini-only or Grok-only machine as well as the older two-CLI cases.
+  const available = installedAgentCliBackends();
+  const onlyOneCli = available.length === 1;
+  let defaultBackend = available[0] || null;
 
   const backends = {};
 
   if (onlyOneCli) {
     // Single-CLI mode: default all agents, no prompt needed
-    const cliName = hasClaude ? "Claude Code" : "Codex CLI";
-    const otherName = hasClaude ? "Codex CLI" : "Claude Code";
-    const installCmd = hasClaude ? "npm install -g @openai/codex" : "npm install -g @anthropic-ai/claude-code";
+    const cliName = defaultBackend;
     ok(`${cliName} detected — all 4 agents will use ${cliName}.`);
     console.log("");
-    log(`Tip: Installing ${otherName} too gives your team different AI perspectives,`);
-    log(`which can improve code review quality. You can add it anytime:`);
-    log(`  → ${installCmd}`);
+    log("Installing an additional supported CLI later can give reviews a different perspective.");
     console.log("");
     for (const agent of AGENTS) backends[agent] = defaultBackend;
-  } else if (bothAvailable) {
-    log("Both Claude Code and Codex CLI are available.");
+  } else if (available.length > 1) {
+    log(`Available agent CLIs: ${available.join(", ")}.`);
     log("Choose which AI CLI to run in agent terminals.");
-    const backend = await ask(rl, "Default CLI backend (claude/codex)", defaultBackend);
-    if (backend !== "claude" && backend !== "codex") {
-      fail("Backend must be 'claude' or 'codex'");
+    const backend = await ask(rl, `Default CLI backend (${available.join("/")})`, defaultBackend);
+    if (!validateInstalledBackendChoice(backend, available)) {
+      fail(`Backend must be one of the installed CLIs: ${available.join(", ")}`);
       return null;
     }
     defaultBackend = backend;
@@ -617,15 +787,24 @@ async function setupAgents(rl, repo) {
       for (const agent of AGENTS) backends[agent] = backend;
     } else {
       for (const agent of AGENTS) {
-        const agentBackend = await ask(rl, `${agent.toUpperCase()} backend (claude/codex)`, backend);
-        backends[agent] = (agentBackend === "claude" || agentBackend === "codex") ? agentBackend : backend;
+        const agentBackend = await ask(rl, `${agent.toUpperCase()} backend (${available.join("/")})`, backend);
+        if (!validateInstalledBackendChoice(agentBackend, available)) {
+          fail(`${agent.toUpperCase()} backend must be one of the installed CLIs: ${available.join(", ")}`);
+          return null;
+        }
+        backends[agent] = agentBackend;
       }
     }
   } else {
-    fail("No AI CLI found — install Claude Code or Codex CLI first.");
+    fail("No AI CLI found — install Claude Code, Codex CLI, Gemini CLI, or Grok CLI first.");
     return null;
   }
   const backend = defaultBackend;
+  const activatedConfig = typeof readConfig().installation_id === "string";
+  const ciPolicy = activatedConfig
+    ? await setupV2CiPolicy(rl)
+    : null;
+  if (activatedConfig && !ciPolicy) return null;
 
   log("Path to your local clone of the repo. Four worktrees will be created next to it");
   log("(e.g., project-head/, project-re1/, project-re2/, project-dev/).");
@@ -725,6 +904,7 @@ async function setupAgents(rl, repo) {
       }
       // Batch 25 / #205: substitute the per-project queue file path.
       seedContent = seedContent.replace(/\{\{project_name\}\}/g, projectName);
+      seedContent = seedContent.replace(/\{\{project_id\}\}/g, projectName);
       fs.writeFileSync(seedDst, seedContent);
     }
   }
@@ -750,7 +930,7 @@ async function setupAgents(rl, repo) {
 
   wtSpinner.stop(true);
 
-  return { projectName, absDir, worktrees, repo, backend, backends };
+  return { projectName, absDir, worktrees, repo, backend, backends, ciPolicy };
 }
 
 // ─── Write QuadWork Config ──────────────────────────────────────────────────
@@ -779,6 +959,30 @@ function writeOvernightQueueFile(projectName, repo) {
   return true;
 }
 
+/**
+ * Seed the versioned Head PO playbook beside the project queue. Idempotent:
+ * existing operator content is preserved on CLI setup; server reseed owns
+ * version refreshes.
+ */
+function writeHeadPoPlaybook(projectName) {
+  const playbookDir = path.join(CONFIG_DIR, projectName);
+  const playbookPath = path.join(playbookDir, "HEAD-PO-PLAYBOOK.md");
+  if (fs.existsSync(playbookPath)) return false;
+  try { ensureSecureDir(playbookDir); }
+  catch (e) { warn(`Could not create ${playbookDir}: ${e.message}`); return false; }
+  const templatePath = path.join(TEMPLATES_DIR, "seeds", "HEAD-PO-PLAYBOOK.md");
+  if (!fs.existsSync(templatePath)) {
+    warn(`HEAD-PO-PLAYBOOK.md template missing at ${templatePath}`);
+    return false;
+  }
+  const content = fs.readFileSync(templatePath, "utf-8")
+    .replace(/\{\{project_id\}\}/g, projectName || "")
+    .replace(/\{\{project_name\}\}/g, projectName || "");
+  fs.writeFileSync(playbookPath, content);
+  ok(`Wrote ${playbookPath}`);
+  return true;
+}
+
 function writeQuadWorkConfig(setup) {
   header("Writing QuadWork Config");
 
@@ -795,10 +999,26 @@ function writeQuadWorkConfig(setup) {
   const project = {
     id: setup.projectName,
     name: setup.projectName,
-    repo: setup.repo,
-    working_dir: setup.absDir,
     agents: {},
   };
+  const activated = typeof config.installation_id === "string";
+  if (activated) {
+    if (!setup.ciPolicy) {
+      const error = new Error("An explicit V2 repository CI policy is required. Configure it in the V2 setup flow before adding this project.");
+      error.code = "v2_policy_required";
+      throw error;
+    }
+    project.repositories = [{
+      key: "primary",
+      repo: setup.repo,
+      working_dir: setup.absDir,
+      primary: true,
+      ci_policy: setup.ciPolicy,
+    }];
+  } else {
+    project.repo = setup.repo;
+    project.working_dir = setup.absDir;
+  }
 
   for (const agent of AGENTS) {
     const cmd = (setup.backends && setup.backends[agent]) || setup.backend;
@@ -822,18 +1042,30 @@ function writeQuadWorkConfig(setup) {
   // All new projects use file-based chat (AC is deprecated).
   project.chat_mode = "file";
 
-  const existingIdx = config.projects.findIndex((p) => p.id === setup.projectName);
-
   // Batch 25 / #204: seed the per-project OVERNIGHT-QUEUE.md at
   // ~/.quadwork/{id}/OVERNIGHT-QUEUE.md. Idempotent — if the file
   // already exists, preserve the user's / Head agent's edits.
   writeOvernightQueueFile(setup.projectName, setup.repo);
+  writeHeadPoPlaybook(setup.projectName);
 
-  // Upsert project
-  if (existingIdx >= 0) config.projects[existingIdx] = project;
-  else config.projects.push(project);
-
-  writeConfig(config);
+  if (activated) {
+    // Re-enter the shared fresh-read/validate/atomic-write boundary instead of
+    // publishing the wizard's stale whole-document snapshot. In particular,
+    // replacing an archived project would be a true→active transition and is
+    // rejected without the server lifecycle's cleanup reservation token, even
+    // though this CLI is a separate process.
+    commitV2Configuration((fresh) => {
+      if (typeof fresh.operator_name !== "string") fresh.operator_name = "user";
+      const existingIdx = fresh.projects.findIndex((entry) => entry.id === setup.projectName);
+      if (existingIdx >= 0) fresh.projects[existingIdx] = project;
+      else fresh.projects.push(project);
+    });
+  } else {
+    const existingIdx = config.projects.findIndex((entry) => entry.id === setup.projectName);
+    if (existingIdx >= 0) config.projects[existingIdx] = project;
+    else config.projects.push(project);
+    writeConfig(config);
+  }
   ok(`Wrote ${CONFIG_PATH}`);
 }
 
@@ -901,6 +1133,16 @@ async function cmdInit() {
 
 async function cmdStart() {
   console.log("\n  QuadWork Start\n");
+
+  // #1038: before loading the server (and therefore before any agent/control
+  // child spawn), re-verify the explicitly installed service temp root. This
+  // path is read-only and never blocks the diagnostic control plane.
+  const serviceTempFact = configureServiceTempEnvironment();
+  if (serviceTempFact.status === "ready") {
+    ok(`Resource temp environment verified [${serviceTempFact.code}]; containment_ready=false (service temp only).`);
+  } else {
+    warn(`Resource temp environment unavailable [${serviceTempFact.code}]; dashboard diagnostics remain online; containment_ready=false.`);
+  }
 
   const config = readConfig();
   if (config.projects.length === 0) {
@@ -1109,8 +1351,14 @@ async function cmdCleanup() {
 
     // --- Per-project cleanup ---
     if (projectId) {
+      if (typeof config.installation_id === "string") {
+        fail("Activated V2 projects must be removed from the dashboard so lifecycle cleanup can run.");
+        return;
+      }
       const idx = (config.projects || []).findIndex((p) => p.id === projectId);
-      const projectDir = path.join(CONFIG_DIR, projectId);
+      let projectDir;
+      try { projectDir = projectRuntimeDirectory(projectId); }
+      catch (error) { fail(error.message); return; }
       if (idx < 0 && !fs.existsSync(projectDir)) {
         warn(`No project '${projectId}' in config and no directory at ${projectDir}.`);
         return;
@@ -1122,15 +1370,20 @@ async function cmdCleanup() {
       const confirm = await askYN(rl, `Delete ${projectDir} and remove the config entry?`, false);
       if (!confirm) { warn("Aborted."); return; }
 
-      if (fs.existsSync(projectDir)) {
-        try { fs.rmSync(projectDir, { recursive: true, force: true }); ok(`Removed ${projectDir}`); }
-        catch (e) { fail(`Could not remove ${projectDir}: ${e.message}`); return; }
+      let cleanup;
+      try {
+        // Confirmation is an await boundary. Re-read under the shared config
+        // lock before any deletion so activation or a concurrent V1 edit during
+        // the prompt cannot turn this legacy command into a V2 lifecycle bypass.
+        cleanup = cleanupLegacyProjectAfterConfirmation(projectId);
+      } catch (error) {
+        fail(error?.code === "v2_cleanup_requires_lifecycle"
+          ? error.message
+          : `Could not clean up project: ${error.message}`);
+        return;
       }
-      if (idx >= 0) {
-        config.projects.splice(idx, 1);
-        try { writeConfig(config); ok(`Updated ${CONFIG_PATH}`); }
-        catch (e) { fail(`Could not write config: ${e.message}`); return; }
-      }
+      if (cleanup.removedDirectory) ok(`Removed ${cleanup.projectDir}`);
+      if (cleanup.removedConfigEntry) ok(`Updated ${CONFIG_PATH}`);
       return;
     }
 
@@ -1146,15 +1399,7 @@ async function cmdCleanup() {
       // Refuse if any project still depends on the legacy install — i.e.
       // any project without its own working per-project clone (run.py +
       // venv + config.toml at ROOT). Mirrors #186's resolution ladder.
-      const stillDepends = [];
-      for (const p of config.projects || []) {
-        if (!p.id) continue;
-        const dir = p.agentchattr_dir || path.join(CONFIG_DIR, p.id, "agentchattr");
-        const ok = fs.existsSync(path.join(dir, "run.py")) &&
-                   fs.existsSync(path.join(dir, ".venv", "bin", "python")) &&
-                   fs.existsSync(path.join(dir, "config.toml"));
-        if (!ok) stillDepends.push(p.id);
-      }
+      const stillDepends = legacyAgentChattrDependents(config);
       if (stillDepends.length > 0) {
         fail(`Refusing to remove legacy install — these projects still depend on it:`);
         for (const id of stillDepends) console.log(`    - ${id}`);
@@ -1167,12 +1412,237 @@ async function cmdCleanup() {
       const confirm = await askYN(rl, `Delete ${legacyDir}?`, false);
       if (!confirm) { warn("Aborted."); return; }
 
-      try { fs.rmSync(legacyDir, { recursive: true, force: true }); ok(`Removed ${legacyDir}`); }
-      catch (e) { fail(`Could not remove ${legacyDir}: ${e.message}`); return; }
+      try {
+        const cleanup = cleanupLegacyAgentChattrAfterConfirmation();
+        if (cleanup.removed) ok(`Removed ${cleanup.legacyDir}`);
+      } catch (error) {
+        if (error?.code === "legacy_agentchattr_still_required") {
+          fail("Refusing to remove legacy install — these projects still depend on it:");
+          for (const id of error.project_ids) console.log(`    - ${id}`);
+          warn(`Run 'npx quadwork start' to migrate them (#188), then re-run cleanup --legacy.`);
+        } else {
+          fail(`Could not remove ${legacyDir}: ${error.message}`);
+        }
+        return;
+      }
     }
   } finally {
     rl.close();
   }
+}
+
+// ─── Resource Preflight (#1038) ────────────────────────────────────────────
+
+const RESOURCE_PREFLIGHT_USAGE = [
+  "Usage: quadwork resources preflight [--json]",
+  "       quadwork resources configure [--apply] --policy-file ABS [--accept-sha256 HASH] [--json]",
+  "       quadwork resources temp-install [--apply] [--accept-sha256 HASH] [--json]",
+].join("\n");
+const RESOURCE_CONFIGURE_USAGE = "Usage: quadwork resources configure [--apply] --policy-file ABS [--accept-sha256 HASH] [--json]";
+const RESOURCE_TEMP_INSTALL_USAGE = "Usage: quadwork resources temp-install [--apply] [--accept-sha256 HASH] [--json]";
+
+function renderBooleanFact(value) {
+  if (value === true) return "yes";
+  if (value === false) return "no";
+  return "unavailable";
+}
+
+function renderIntegerFact(value, suffix = "", allowNegative = false) {
+  return Number.isSafeInteger(value) && (allowNegative || value >= 0) ? `${value}${suffix}` : "unavailable";
+}
+
+function renderOomPolicy(value) {
+  return value === "continue" || value === "unverified" ? value : "unavailable";
+}
+
+function renderResourcePreflight(report) {
+  const policy = report.policy || {};
+  const host = report.host || {};
+  const containment = report.containment || {};
+  const temp = report.temp || {};
+  const api = report.api || {};
+  const scopes = report.scopes || {};
+  const capacity = report.capacity || {};
+  const mib = (value) => renderIntegerFact(value, " MiB");
+  const signedMib = (value) => renderIntegerFact(value, " MiB", true);
+  const lines = [
+    "QuadWork resource preflight",
+    "===========================",
+    `Status: ${report.ok ? "PASS" : "FAIL"}`,
+    `Primary reason: ${report.reason}`,
+    `Policy configured: ${renderBooleanFact(policy.configured)}`,
+    `Configured API limits: low ${mib(policy.apiMemoryLowMib)}; max ${mib(policy.apiMemoryMaxMib)}`,
+    `Configured worker limits: high ${mib(policy.workerMemoryHighMib)}; max ${mib(policy.workerMemoryMaxMib)}; swap max ${mib(policy.workerSwapMaxMib)}`,
+    `Configured control limits: max ${mib(policy.controlMemoryMaxMib)}; swap max ${mib(policy.controlSwapMaxMib)}; concurrent children ${renderIntegerFact(policy.maxConcurrentChildren)}`,
+    `Configured host reserve: ${mib(policy.hostReserveMib)}`,
+    `Configured worker scope ceiling: ${renderIntegerFact(policy.maxWorkerScopes)}`,
+    `Configured temp free threshold: ${mib(policy.tempMinFreeMib)}`,
+    `Host memory: available ${mib(host.availableMib)}; total ${mib(host.totalMib)}`,
+    `Host swap: free ${mib(host.swapFreeMib)}; total ${mib(host.swapTotalMib)}`,
+    `Containment: cgroup v2 ${renderBooleanFact(containment.cgroupV2)}; user manager ${renderBooleanFact(containment.userManager)}; systemd-run ${renderBooleanFact(containment.systemdRun)}; scope proof ${renderBooleanFact(containment.scopeProof)}`,
+    `Temp root: exists ${renderBooleanFact(temp.exists)}; directory ${renderBooleanFact(temp.directory)}; symlink ${renderBooleanFact(temp.symlink)}; owned ${renderBooleanFact(temp.owned)}; mode 0700 ${renderBooleanFact(temp.secureMode)}; disk-backed ${renderBooleanFact(temp.diskBacked)}`,
+    `Temp capacity: free ${mib(temp.freeMib)}; total ${mib(temp.totalMib)}`,
+    `Observed API limits: low ${mib(api.memoryLowMib)}; max ${mib(api.memoryMaxMib)}; OOM policy ${renderOomPolicy(api.oomPolicy)}; separate from workers ${renderBooleanFact(api.separateFromWorkers)}`,
+    `Worker scopes: ${renderIntegerFact(scopes.admitted)} active; ${renderIntegerFact(scopes.requested)} requested; ${renderIntegerFact(scopes.staticCeiling)} static ceiling`,
+    `Static RAM reservation: ${mib(capacity.staticReservationMib)}`,
+    `Static RAM headroom: ${mib(capacity.staticHeadroomMib)}`,
+    `Configured swap reservation: ${mib(capacity.configuredSwapMib)}`,
+    `Configured swap headroom: ${mib(capacity.swapHeadroomMib)}`,
+    `Requested worker RAM: ${mib(capacity.requestedMemoryMib)}`,
+    `Requested worker swap: ${mib(capacity.requestedSwapMib)}`,
+    `Live RAM reserve plus request: ${mib(capacity.liveRequiredMib)}`,
+    `Live RAM headroom: ${signedMib(capacity.liveHeadroomMib)}`,
+    `Live swap headroom: ${signedMib(capacity.liveSwapHeadroomMib)}`,
+  ];
+  if (Array.isArray(report.reasons) && report.reasons.length > 0) {
+    lines.push("Checks:");
+    for (const reason of report.reasons) {
+      lines.push(`  - ${reason.code}/${reason.check}: ${reason.message}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function parseResourceInstallArgs(args, { needsPolicyFile }) {
+  const parsed = { apply: false, json: false, policyFile: null, acceptanceSha256: null };
+  const seen = new Set();
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    if (flag === "--apply" || flag === "--json") {
+      if (seen.has(flag)) return null;
+      seen.add(flag);
+      parsed[flag === "--apply" ? "apply" : "json"] = true;
+      continue;
+    }
+    if (flag === "--policy-file" || flag === "--accept-sha256") {
+      if (seen.has(flag) || index + 1 >= args.length) return null;
+      seen.add(flag);
+      const value = args[++index];
+      if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) return null;
+      parsed[flag === "--policy-file" ? "policyFile" : "acceptanceSha256"] = value;
+      continue;
+    }
+    return null;
+  }
+  if (needsPolicyFile !== Boolean(parsed.policyFile)) return null;
+  if (!parsed.apply && parsed.acceptanceSha256 !== null) return null;
+  if (parsed.apply !== Boolean(parsed.acceptanceSha256)) return null;
+  return parsed;
+}
+
+function renderResourceInstall(result) {
+  const lines = [
+    result.action === "configure_runtime_resources"
+      ? "QuadWork resource policy"
+      : "QuadWork resource temp root",
+    "==============================",
+    `Status: ${result.status.toUpperCase()}`,
+    `Action: ${result.action}`,
+    `Accept SHA-256: ${result.acceptance.sha256}`,
+  ];
+  if (result.policy) {
+    lines.push("Validated policy:", JSON.stringify(result.policy, null, 2));
+  }
+  lines.push("Plan:", JSON.stringify(result.plan, null, 2));
+  if (result.result) lines.push("Result:", JSON.stringify(result.result, null, 2));
+  if (result.status === "proposal") {
+    lines.push("No changes were made. Re-run with --apply and the exact SHA-256 token to apply this plan.");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function renderResourceInstallFailure(code, recoveryEntries = [], recoveryScope = null) {
+  const lines = [`QuadWork resource operation refused: ${code}`];
+  if (recoveryEntries.length > 0) {
+    lines.push("Recovery entries (exact basenames; never use wildcards):");
+    for (const entry of recoveryEntries) lines.push(`  - ${entry}`);
+  }
+  if (recoveryScope) lines.push(`Recovery scope: ${recoveryScope}`);
+  return `${lines.join("\n")}\n`;
+}
+
+function runResourceInstallCommand(subcommand, args, options = {}) {
+  const stdout = options.stdout || process.stdout;
+  const stderr = options.stderr || process.stderr;
+  const usage = subcommand === "configure" ? RESOURCE_CONFIGURE_USAGE : RESOURCE_TEMP_INSTALL_USAGE;
+  const parsed = parseResourceInstallArgs(args, { needsPolicyFile: subcommand === "configure" });
+  if (!parsed) {
+    stderr.write(`${usage}\n`);
+    return 2;
+  }
+
+  let result;
+  try {
+    if (subcommand === "configure") {
+      result = parsed.apply
+        ? (options.applyPolicy || applyPolicy)({ policyFile: parsed.policyFile, acceptanceSha256: parsed.acceptanceSha256 })
+        : (options.policyProposal || policyProposal)(parsed.policyFile);
+    } else {
+      result = parsed.apply
+        ? (options.applyTempInstall || applyTempInstall)({ acceptanceSha256: parsed.acceptanceSha256 })
+        : (options.tempInstallProposal || tempInstallProposal)();
+    }
+  } catch (err) {
+    const errorState = resourceInstallFailureForError(err);
+    const reason = errorState ? errorState.reason : "resource_operation_failed";
+    const recoveryEntries = errorState ? errorState.recoveryEntries : [];
+    const recoveryScope = errorState ? errorState.recoveryScope : null;
+    const failure = Object.freeze({
+      ok: false,
+      status: "refused",
+      reason,
+      ...(recoveryEntries.length > 0 ? { recovery_entries: recoveryEntries } : {}),
+      ...(recoveryScope ? { recovery_scope: recoveryScope } : {}),
+    });
+    if (parsed.json) stdout.write(`${JSON.stringify(failure)}\n`);
+    else stderr.write(renderResourceInstallFailure(reason, recoveryEntries, recoveryScope));
+    return 1;
+  }
+  stdout.write(parsed.json ? `${JSON.stringify(result)}\n` : renderResourceInstall(result));
+  return 0;
+}
+
+// Minimal injectable handler: the command never imports config writers and
+// never accepts a flag that could fabricate the still-pending staging proof.
+function runResourcesCommand(args, options = {}) {
+  const stdout = options.stdout || process.stdout;
+  const stderr = options.stderr || process.stderr;
+  const loadPolicy = options.readRuntimeResources || readRuntimeResources;
+  const makeProbes = options.createReadOnlyProbes || createReadOnlyProbes;
+  const preflight = options.runResourcePreflight || runResourcePreflight;
+  const commandArgs = Array.isArray(args) ? args : [];
+
+  if (commandArgs[0] === "configure" || commandArgs[0] === "temp-install") {
+    return runResourceInstallCommand(commandArgs[0], commandArgs.slice(1), options);
+  }
+
+  if (commandArgs[0] !== "preflight"
+    || commandArgs.slice(1).some((arg) => arg !== "--json")
+    || commandArgs.filter((arg) => arg === "--json").length > 1) {
+    stderr.write(`${RESOURCE_PREFLIGHT_USAGE}\n`);
+    return 2;
+  }
+
+  const json = commandArgs.includes("--json");
+  let report;
+  try {
+    const runtimeResources = loadPolicy();
+    // scopeProof deliberately defaults false. There is no CLI override until
+    // the fixed PTY/systemd staging matrix has established real proof.
+    const probes = makeProbes();
+    report = preflight({ runtimeResources, probes });
+  } catch {
+    // Reduce config/read failures to the same redacted typed policy failure.
+    // A non-object sentinel makes the canonical preflight parser fail closed.
+    report = runResourcePreflight({ runtimeResources: false, probes: Object.freeze({}) });
+  }
+
+  stdout.write(json ? `${JSON.stringify(report)}\n` : renderResourcePreflight(report));
+  return report.ok ? 0 : 1;
+}
+
+function cmdResources() {
+  process.exitCode = runResourcesCommand(process.argv.slice(3));
 }
 
 // ─── Doctor ─────────────────────────────────────────────────────────────────
@@ -1367,6 +1837,9 @@ switch (command) {
   case "doctor":
     cmdDoctor();
     break;
+  case "resources":
+    cmdResources();
+    break;
   case "migrate-agent-slugs":
     cmdMigrateAgentSlugs();
     break;
@@ -1396,6 +1869,7 @@ switch (command) {
     add-project   Add a project via CLI (alternative to web UI /setup)
     cleanup       Reclaim disk space (--project <id> or --legacy)
     doctor        Report project configuration status
+    resources     Resource policy/temp setup and read-only preflight
     migrate-agent-slugs  Rename reviewer1/reviewer2 → re1/re2 in existing projects
     ac-restore           Restore file-chat JSONL back to AC format
 
@@ -1413,10 +1887,27 @@ switch (command) {
     npx quadwork stop
     npx quadwork cleanup --project my-project
     npx quadwork cleanup --legacy
+    npx quadwork resources configure --policy-file /absolute/policy.json --json
+    npx quadwork resources temp-install --json
+    npx quadwork resources preflight --json
 `);
     process.exit(1);
 }
 }
 
 // #972: exported for unit tests (see server/binStop.test.js).
-module.exports = { sanitizePid, stopPid };
+module.exports = {
+  sanitizePid,
+  stopPid,
+  renderResourcePreflight,
+  renderResourceInstall,
+  runResourceInstallCommand,
+  runResourcesCommand,
+  cleanupLegacyProjectAfterConfirmation,
+  cleanupLegacyAgentChattrAfterConfirmation,
+  writeConfig,
+  writeQuadWorkConfig,
+  writeHeadPoPlaybook,
+  installedAgentCliBackends,
+  validateInstalledBackendChoice,
+};

@@ -25,8 +25,10 @@
 //   matches nothing where those files don't exist.
 
 const fs = require("fs");
+const crypto = require("crypto");
 const os = require("os");
 const path = require("path");
+const { removeConfinedPath } = require("./resource-temp");
 
 const DEFAULT_MAX_AGE_HOURS = 72;
 
@@ -37,7 +39,7 @@ function newestTimeMs(st) {
 
 // Remove `entry` (file or dir) if its newest timestamp is older than the
 // cutoff. Returns "removed" | "kept" | "error".
-function removeIfStale(entry, cutoffMs, result) {
+function removeIfStale(root, entry, cutoffMs, result, quarantineName = null, alreadyQuarantined = false, expectedUid = null) {
   let st;
   try {
     st = fs.lstatSync(entry);
@@ -48,8 +50,16 @@ function removeIfStale(entry, cutoffMs, result) {
     result.kept += 1;
     return "kept";
   }
+  if (alreadyQuarantined && expectedUid !== null && Number(st.uid) !== expectedUid) {
+    result.errors.push(`${entry}: quarantine ownership mismatch`);
+    return "error";
+  }
   try {
-    fs.rmSync(entry, { recursive: true, force: true });
+    if (alreadyQuarantined) {
+      fs.rmSync(entry, { recursive: true, force: true, maxRetries: 2 });
+    } else {
+      removeConfinedPath(root, entry, fs, quarantineName);
+    }
     result.removed.push(entry);
     return "removed";
   } catch (err) {
@@ -80,29 +90,53 @@ function sweepBackendTemp(opts = {}) {
     const uid = typeof opts.uid === "number"
       ? opts.uid
       : (typeof process.getuid === "function" ? process.getuid() : null);
-    if (uid !== null) {
-      const claudeDir = path.join(tmpRoot, `claude-${uid}`);
+    let canonicalRoot = null;
+    try {
+      canonicalRoot = fs.realpathSync(tmpRoot);
+    } catch {
+      canonicalRoot = null;
+    }
+
+    if (uid !== null && canonicalRoot) {
+      const claudeDir = path.join(canonicalRoot, `claude-${uid}`);
       let entries = [];
       try {
-        entries = fs.readdirSync(claudeDir);
+        const claudeStat = fs.lstatSync(claudeDir);
+        // A symlink here used to let the sweep enumerate and delete entries in
+        // an arbitrary external directory. Never traverse it.
+        if (claudeStat.isDirectory() && !claudeStat.isSymbolicLink()) {
+          entries = fs.readdirSync(claudeDir);
+        } else if (claudeStat.isSymbolicLink()) {
+          result.errors.push(`${claudeDir}: refusing symlinked claude temp directory`);
+        }
       } catch {
         entries = []; // no dir → nothing to do
       }
       for (const name of entries) {
-        removeIfStale(path.join(claudeDir, name), cutoffMs, result);
+        removeIfStale(canonicalRoot, path.join(claudeDir, name), cutoffMs, result);
       }
     }
 
     // Gemini: stray crash dumps written directly to the temp root.
     let rootEntries = [];
     try {
-      rootEntries = fs.readdirSync(tmpRoot);
+      rootEntries = canonicalRoot ? fs.readdirSync(canonicalRoot) : [];
     } catch {
       rootEntries = [];
     }
     for (const name of rootEntries) {
+      const quarantineMatch = name.match(/^gemini-client-error-quadwork-quarantine-(nouid|\d+)-([a-f0-9]{32})\.json$/);
+      if (quarantineMatch) {
+        if ((uid === null && quarantineMatch[1] === "nouid")
+          || (uid !== null && Number(quarantineMatch[1]) === uid)) {
+          removeIfStale(canonicalRoot, path.join(canonicalRoot, name), cutoffMs, result, null, true, uid);
+        }
+        continue;
+      }
       if (name.startsWith("gemini-client-error-") && name.endsWith(".json")) {
-        removeIfStale(path.join(tmpRoot, name), cutoffMs, result);
+        const owner = uid === null ? "nouid" : String(uid);
+        const quarantineName = `gemini-client-error-quadwork-quarantine-${owner}-${crypto.randomBytes(16).toString("hex")}.json`;
+        removeIfStale(canonicalRoot, path.join(canonicalRoot, name), cutoffMs, result, quarantineName);
       }
     }
   } catch (err) {

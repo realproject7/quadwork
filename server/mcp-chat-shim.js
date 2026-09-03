@@ -21,8 +21,9 @@ if (!PROJECT || !AGENT || !PORT) {
 }
 
 const BASE = `http://127.0.0.1:${PORT}`;
+const PROJECT_ROLES = new Set(["head", "dev", "re1", "re2"]);
 
-const TOOLS = [
+const CHAT_TOOLS = [
   {
     name: "chat_send",
     description: "Send a message to the project chat",
@@ -48,6 +49,317 @@ const TOOLS = [
     },
   },
 ];
+
+const ISSUE_CONTRACT_REVISION_TOOL = {
+  name: "issue_contract_revision",
+  description: "Read the authenticated live GitHub issue body revision for one registered repository in this project. The server derives project and actor from this role's shim token; callers provide only repo_key and issue.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      repo_key: { type: "string", description: "Registered project repository key" },
+      issue: { type: "integer", minimum: 1 },
+    },
+    required: ["repo_key", "issue"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+};
+
+const SUBMIT_CI_EVIDENCE_TOOL = {
+  name: "submit_ci_evidence",
+  description: "Submit bounded CI-less evidence for the authenticated Dev role's current assignment. Evidence labels are data only; this operation never executes commands.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      assignment_attempt: { type: "string" },
+      contract_revision: { type: "string" },
+      repo_key: { type: "string" },
+      item: {
+        type: "object",
+        properties: {
+          repo_key: { type: "string" },
+          repo: { type: "string" },
+          number: { type: "integer", minimum: 1 },
+          kind: { type: "string", enum: ["issue"] },
+        },
+        required: ["repo_key", "repo", "number", "kind"],
+        additionalProperties: false,
+      },
+      pr_number: { type: "integer", minimum: 1 },
+      exact_sha: { type: "string" },
+      policy_version: { type: "integer", minimum: 1 },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            key: { type: "string" },
+            outcome: { type: "string", enum: ["pass", "fail"] },
+            exit_code: { type: "integer", minimum: 0, maximum: 255 },
+            evidence_ref: { type: "string" },
+          },
+          required: ["key", "outcome", "exit_code", "evidence_ref"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["assignment_attempt", "contract_revision", "repo_key", "item", "pr_number", "exact_sha", "policy_version", "results"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
+const SUBMIT_DELIVERY_CANDIDATE_CI_EVIDENCE_TOOL = {
+  name: "submit_delivery_candidate_ci_evidence",
+  description: "Submit bounded CI-less evidence for the authenticated Dev role's already-published Delivery Candidate PR. The server rechecks the composed candidate and exact PR SHA; this operation never executes commands.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      delivery_candidate_ref: { type: "object" },
+      pr_number: { type: "integer", minimum: 1 },
+      exact_sha: { type: "string" },
+      policy_version: { type: "integer", minimum: 1 },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            key: { type: "string" },
+            outcome: { type: "string", enum: ["pass", "fail"] },
+            exit_code: { type: "integer", minimum: 0, maximum: 255 },
+            evidence_ref: { type: "string" },
+          },
+          required: ["key", "outcome", "exit_code", "evidence_ref"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["delivery_candidate_ref", "pr_number", "exact_sha", "policy_version", "results"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
+const READ_CI_EVIDENCE_TOOL = {
+  name: "read_ci_evidence",
+  description: "Read one redacted, server-authenticated CI-less evidence receipt for this project.",
+  inputSchema: {
+    type: "object",
+    properties: { record_id: { type: "string" } },
+    required: ["record_id"],
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+};
+
+const SUBMIT_WORK_TASK_CANDIDATE_TOOL = {
+  name: "submit_work_task_candidate",
+  description: "Record the authenticated Dev role's clean local WorkTask candidate SHA. The server derives the current task, base, branch, and managed worktree; this does not push, create a PR, or start CI.",
+  inputSchema: {
+    type: "object",
+    properties: { event_id: { type: "string" }, work_task_ref: { type: "object" }, candidate_sha: { type: "string" } },
+    required: ["event_id", "work_task_ref", "candidate_sha"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const ASSIGN_WORK_TASK_BUILD_TOOL = {
+  name: "assign_work_task_build",
+  description: "Assign one exact current WorkTask to the verified Dev role from the server-observed registered base. The server derives the project, base SHA, and assignment identity; this does not create a worktree, push, create a PR, or start CI.",
+  inputSchema: {
+    type: "object",
+    properties: { event_id: { type: "string" }, work_task_ref: { type: "object" } },
+    required: ["event_id", "work_task_ref"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL = {
+  name: "open_work_task_independent_review",
+  description: "Open the authenticated Head's exact WorkTask candidate for two independent reviewers. The server derives both reviewer roles, their current epoch, the project, and opening time; this does not reconcile, publish, or merge.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      event_id: { type: "string" }, work_task_ref: { type: "object" },
+      attempt: { type: "string" }, round: { type: "integer", minimum: 1 },
+    },
+    required: ["event_id", "work_task_ref", "attempt", "round"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const SUBMIT_WORK_TASK_REVIEW_RECEIPT_TOOL = {
+  name: "submit_work_task_review_receipt",
+  description: "Seal this authenticated independent reviewer's receipt for one exact WorkTask review round. The server derives reviewer role, epoch, project, and receipt time; peer receipts remain private.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      review_round_ref: { type: "object" }, candidate_digest: { type: "string" }, receipt: { type: "object" },
+    },
+    required: ["review_round_ref", "candidate_digest", "receipt"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const RECONCILE_WORK_TASK_REVIEW_TOOL = {
+  name: "reconcile_work_task_review",
+  description: "Advance the authenticated Head's released WorkTask review round through its deterministic server-side verdict reconciliation. The server reads only sealed verdict anchors; this does not expose findings, publish, or merge.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      work_task_ref: { type: "object" }, review_round_ref: { type: "object" }, candidate_digest: { type: "string" },
+    },
+    required: ["work_task_ref", "review_round_ref", "candidate_digest"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const PREPARE_DELIVERY_CANDIDATE_TOOL = {
+  name: "prepare_delivery_candidate",
+  description: "Prepare the authenticated Head's local Delivery Candidate for one registered repository. The server derives the frozen cut, result SHA, review anchors, Git-object evidence, and candidate identity; this does not push, create a PR, start CI, or merge.",
+  inputSchema: {
+    type: "object",
+    properties: { repository_key: { type: "string" } },
+    required: ["repository_key"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const COMPOSE_DELIVERY_CANDIDATE_TOOL = {
+  name: "compose_delivery_candidate",
+  description: "Record the authenticated Head's deterministic local Git-object composition proof for an already prepared Delivery Candidate. This has no branch, PR, CI, merge, or publication authority.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      delivery_candidate_ref: { type: "object" },
+      expected_revision: { type: "integer", minimum: 0 },
+      correlation_id: { type: "string" },
+      idempotency_key: { type: "string" },
+    },
+    required: ["delivery_candidate_ref", "expected_revision", "correlation_id", "idempotency_key"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const OPEN_DELIVERY_CANDIDATE_FINAL_REVIEW_TOOL = {
+  name: "open_delivery_candidate_final_review",
+  description: "Open independent final review only for the authenticated Head's composed Delivery Candidate and an already-published, server-observed PR at the exact result SHA. This does not create, push, merge, or publish a PR.",
+  inputSchema: {
+    type: "object",
+    properties: { delivery_candidate_ref: { type: "object" }, pr_number: { type: "integer", minimum: 1 } },
+    required: ["delivery_candidate_ref", "pr_number"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const PLAN_DELIVERY_CANDIDATE_PUBLICATION_TOOL = {
+  name: "plan_delivery_candidate_publication",
+  description: "Derive the authenticated Head's operator-gated publication proposal for one composed Delivery Candidate. This is read-only: it never transfers a branch, opens a PR, starts CI, or merges.",
+  inputSchema: {
+    type: "object",
+    properties: { delivery_candidate_ref: { type: "object" } },
+    required: ["delivery_candidate_ref"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+const SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL = {
+  name: "submit_review_cycle_receipt",
+  description: "Bind this authenticated reviewer's one current GitHub review object to the server-owned exact-SHA review cycle. Chat claims and prose are not accepted.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      target_identity_digest: { type: "string" },
+      review_id: { type: ["string", "integer"] },
+      nonce: { type: "string" },
+    },
+    required: ["target_identity_digest", "review_id", "nonce"],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+};
+
+const ISSUE_REVIEW_CYCLE_NONCE_TOOL = {
+  name: "issue_review_cycle_nonce",
+  description: "Read this authenticated reviewer's one private, one-time nonce for the current server-owned review cycle. Put it in the GitHub review body before submitting the receipt.",
+  inputSchema: {
+    type: "object",
+    properties: { target_identity_digest: { type: "string" } },
+    required: ["target_identity_digest"],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+// The Head resume path intentionally has no caller-selected project, agent,
+// generation, source, or endpoint.  The server derives that authority from
+// the per-role shim token and its current Head binding.
+const CHAT_RESUME_TOOL = {
+  name: "chat_resume",
+  description: "Resume the authenticated Head's bounded Primary Chat evidence page. The server derives the active Head binding from this shim token.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      cursor: { type: ["string", "null"], maxLength: 2048 },
+      limit: { type: "integer", minimum: 1, maximum: 64 },
+    },
+    required: ["cursor", "limit"],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
+function plainRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function parseChatResumeArguments(value) {
+  if (!plainRecord(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== "cursor" || keys[1] !== "limit") return null;
+  if (value.cursor !== null && (typeof value.cursor !== "string" || value.cursor.length > 2048)) return null;
+  if (!Number.isSafeInteger(value.limit) || value.limit < 1 || value.limit > 64) return null;
+  return { cursor: value.cursor, limit: value.limit };
+}
+
+function toolsForActor() {
+  if (!PROJECT_ROLES.has(AGENT)) return CHAT_TOOLS;
+  const tools = [...CHAT_TOOLS, ISSUE_CONTRACT_REVISION_TOOL, READ_CI_EVIDENCE_TOOL];
+  if (AGENT === "head" && TOKEN) tools.push(
+    CHAT_RESUME_TOOL,
+    ASSIGN_WORK_TASK_BUILD_TOOL,
+    OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL,
+    RECONCILE_WORK_TASK_REVIEW_TOOL,
+    PREPARE_DELIVERY_CANDIDATE_TOOL,
+    COMPOSE_DELIVERY_CANDIDATE_TOOL,
+    PLAN_DELIVERY_CANDIDATE_PUBLICATION_TOOL,
+    OPEN_DELIVERY_CANDIDATE_FINAL_REVIEW_TOOL,
+  );
+  if (AGENT === "dev") tools.push(SUBMIT_CI_EVIDENCE_TOOL, SUBMIT_DELIVERY_CANDIDATE_CI_EVIDENCE_TOOL, SUBMIT_WORK_TASK_CANDIDATE_TOOL);
+  if (AGENT === "re1" || AGENT === "re2") tools.push(ISSUE_REVIEW_CYCLE_NONCE_TOOL, SUBMIT_REVIEW_CYCLE_RECEIPT_TOOL, SUBMIT_WORK_TASK_REVIEW_RECEIPT_TOOL);
+  return tools;
+}
 
 function jsonRpc(id, result) {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
@@ -86,6 +398,23 @@ function httpRequest(method, urlPath, body, extraHeaders) {
 
 async function handleToolCall(id, name, params) {
   try {
+    if (name === "chat_resume") {
+      // Hidden calls from every non-Head shim are rejected locally.  A Head
+      // process must also have the token that the fixed endpoint authenticates.
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: chat_resume");
+      const request = parseChatResumeArguments(params);
+      if (!request) return jsonRpcError(id, -32602, "Invalid chat_resume arguments");
+      try {
+        const res = await httpRequest("POST", "/api/chat-resume", request, { "X-Chat-Token": TOKEN });
+        // The server's diagnostic payload can contain authorization or source
+        // details.  This fixed client boundary returns no such details.
+        if (res.status >= 400) return jsonRpcError(id, -32000, "chat_resume unavailable");
+        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+      } catch {
+        return jsonRpcError(id, -32000, "chat_resume unavailable");
+      }
+    }
+
     if (name === "chat_send") {
       const res = await httpRequest("POST", `/api/chat?project=${encodeURIComponent(PROJECT)}`, {
         text: params.message || "",
@@ -117,6 +446,135 @@ async function handleToolCall(id, name, params) {
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(Array.isArray(res.body) ? { messages: res.body } : res.body) }] });
     }
 
+    if (name === "issue_contract_revision") {
+      const res = await httpRequest(
+        "POST",
+        "/api/issue-contract-revision",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_ci_evidence") {
+      const res = await httpRequest(
+        "POST",
+        "/api/ci-evidence",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_delivery_candidate_ci_evidence") {
+      const res = await httpRequest(
+        "POST",
+        "/api/delivery-candidate/ci-evidence",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "read_ci_evidence") {
+      const res = await httpRequest(
+        "POST",
+        "/api/ci-evidence/read",
+        params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {},
+      );
+      if (res.status >= 400) {
+        return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      }
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_work_task_candidate") {
+      if (AGENT !== "dev" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: submit_work_task_candidate");
+      const res = await httpRequest("POST", "/api/work-task-candidate", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "assign_work_task_build") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: assign_work_task_build");
+      const res = await httpRequest("POST", "/api/work-task-build", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask build assignment unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "open_work_task_independent_review") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: open_work_task_independent_review");
+      const res = await httpRequest("POST", "/api/work-task-review/open", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask review opening unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_work_task_review_receipt") {
+      if ((AGENT !== "re1" && AGENT !== "re2") || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: submit_work_task_review_receipt");
+      const res = await httpRequest("POST", "/api/work-task-review/receipt", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask review receipt unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "reconcile_work_task_review") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: reconcile_work_task_review");
+      const res = await httpRequest("POST", "/api/work-task-review/reconcile", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask review reconciliation unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "prepare_delivery_candidate") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: prepare_delivery_candidate");
+      const res = await httpRequest("POST", "/api/delivery-candidate/prepare", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate preparation unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "compose_delivery_candidate") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: compose_delivery_candidate");
+      const res = await httpRequest("POST", "/api/delivery-candidate/compose", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate composition unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "open_delivery_candidate_final_review") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: open_delivery_candidate_final_review");
+      const res = await httpRequest("POST", "/api/delivery-candidate/final-review", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate final review unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "plan_delivery_candidate_publication") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: plan_delivery_candidate_publication");
+      const res = await httpRequest("POST", "/api/delivery-candidate/publication-plan", params, { "X-Chat-Token": TOKEN });
+      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate publication plan unavailable");
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "submit_review_cycle_receipt") {
+      const res = await httpRequest("POST", "/api/review-cycle-receipt", params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {});
+      if (res.status >= 400) return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "issue_review_cycle_nonce") {
+      const res = await httpRequest("POST", "/api/review-cycle-nonce", params,
+        TOKEN ? { "X-Chat-Token": TOKEN } : {});
+      if (res.status >= 400) return jsonRpcError(id, -32000, `API error ${res.status}: ${JSON.stringify(res.body)}`);
+      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
     return jsonRpcError(id, -32601, `Unknown tool: ${name}`);
   } catch (err) {
     return jsonRpcError(id, -32000, err.message);
@@ -141,7 +599,7 @@ async function handleMessage(msg) {
   }
 
   if (method === "tools/list") {
-    return jsonRpc(id, { tools: TOOLS });
+    return jsonRpc(id, { tools: toolsForActor() });
   }
 
   if (method === "tools/call") {
