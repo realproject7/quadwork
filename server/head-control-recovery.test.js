@@ -286,6 +286,15 @@ process.on("exit", cleanup);
   await new Promise((resolve) => server.once("listening", resolve));
   process.env.QW_TEST_SERVER_PORT = String(server.address().port);
   shim = startShim(server.address().port, admission.generation);
+  // #1038 fails Linux worker admission closed when no systemd resource scope is
+  // available, so a real PTY cannot be launched on CI without the in-process
+  // containment fixture the runtime exposes for exactly this case. It is a
+  // capability held in memory, not a route/config/environment value, so it
+  // cannot grant production authority — and it is not VPS or staging evidence.
+  // Without it these end-to-end tests pass on macOS (where containment is
+  // reported unsupported) and fail on Linux, which is the product behaving
+  // correctly, not a defect to be relaxed.
+  const releaseContainment = runtime._test.installLifecycleTestFixture(PROJECT, "dev", "linux-contained");
   try {
     const tools = await shim.handshake();
     assert.ok(tools.includes("recover_worker"));
@@ -449,6 +458,7 @@ process.on("exit", cleanup);
     assert.deepEqual(audit.filter((record) => record.action === "recover_worker").map((record) => record.decision), ["accepted", "denied", "accepted", "denied"]);
     ok(true, "dirty WIP, the unpushed commit, and the branch survived four recoveries byte-unchanged, and every decision is audited");
   } finally {
+    releaseContainment();
     await shim.stop();
     shim = null;
     await new Promise((resolve) => server.close(resolve));

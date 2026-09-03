@@ -202,6 +202,15 @@ process.on("exit", cleanup);
   await new Promise((resolve) => server.once("listening", resolve));
   const port = server.address().port;
   shim = startShim(port);
+  // #1038 fails Linux worker admission closed when no systemd resource scope is
+  // available, so a real PTY cannot be launched on CI without the in-process
+  // containment fixture the runtime exposes for exactly this case. It is a
+  // capability held in memory, not a route/config/environment value, so it
+  // cannot grant production authority — and it is not VPS or staging evidence.
+  // Without it these end-to-end tests pass on macOS (where containment is
+  // reported unsupported) and fail on Linux, which is the product behaving
+  // correctly, not a defect to be relaxed.
+  const releaseContainment = runtime._test.installLifecycleTestFixture(PROJECT, "dev", "linux-contained");
   try {
     const tools = await shim.handshake();
     assert.deepEqual(tools.slice(-5), ["get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit"]);
@@ -317,6 +326,7 @@ process.on("exit", cleanup);
     assert.equal(monitorEvents().length, 3);
     ok(true, "every control is a redacted durable audit record, stop suspends, and a suspended monitor evaluates nothing");
   } finally {
+    releaseContainment();
     await shim.stop();
     shim = null;
     await new Promise((resolve) => server.close(resolve));
