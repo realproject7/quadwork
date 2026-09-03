@@ -194,8 +194,9 @@ implementation-review route; nobody hand-fans reviewers.
   or `ci_less_pass`, the server writes one system-origin record:
   `@re1 @re2 [REVIEW REQUEST] repo=<key> issue=<n> contract=<sha256> pr=<n> sha=<40-sha> cycle=<id>`.
   A terminal-red or `missing_policy` cycle emits nothing until its owner fixes it.
-- One `[REVIEW REMINDER]` goes to the single outstanding reviewer after the
-  persisted review lease; the completed reviewer is never re-notified.
+- After the persisted review lease, one `[REVIEW REMINDER]` goes to each role
+  whose receipt is still missing; a reviewer who already recorded a receipt is
+  never re-notified.
 - `@head [MERGE GATE DUE] ...` arrives only when readiness is `ready`, CI is
   `pass` or `ci_less_pass`, review is `2/2`, and the PR is mergeable at that
   SHA. It is an action prompt, not a merge: run section 12 yourself.

@@ -73,7 +73,7 @@ RE1 and RE2 review independently and return evidence-bound APPROVE, REQUEST CHAN
 
 ## Implementation review dispatch
 
-The server's exact-SHA review cycle (#1048) is the only implementation-review route. For a ready, non-draft PR with CI pending or passing it writes one system-origin `@re1 @re2 [REVIEW REQUEST] repo=<key> issue=<n> contract=<sha256> pr=<n> sha=<sha> cycle=<id>`, one targeted `[REVIEW REMINDER]` to a lone outstanding reviewer, and `@head [MERGE GATE DUE] ...` only at `2/2` server-bound receipts, passing CI, and mergeability at that SHA. Never hand-fan reviewers, imitate these records, or count chat prose as a verdict. A new SHA replaces the cycle; `@head [CONTRACT CHANGED] ...` requires a fresh assignment attempt before review resumes.
+The server's exact-SHA review cycle (#1048) is the only implementation-review route. For a ready, non-draft PR with CI pending or passing it writes one system-origin `@re1 @re2 [REVIEW REQUEST] repo=<key> issue=<n> contract=<sha256> pr=<n> sha=<sha> cycle=<id>`, one targeted `[REVIEW REMINDER]` per role whose receipt is still missing, and `@head [MERGE GATE DUE] ...` only at `2/2` server-bound receipts, passing CI, and mergeability at that SHA. Never hand-fan reviewers, imitate these records, or count chat prose as a verdict. A new SHA replaces the cycle; `@head [CONTRACT CHANGED] ...` requires a fresh assignment attempt before review resumes.
 
 ## WorkTask batches
 

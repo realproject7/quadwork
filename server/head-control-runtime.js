@@ -219,7 +219,14 @@ function createHeadControlRuntime(options) {
       const projection = domain.project_current_batch();
       return Object.freeze({ active: projection !== null, projection });
     } catch (error) {
-      if (error && error.code === "head_control_work_task_state_missing") {
+      // A state file left by a superseded generation reads as "no current
+      // batch" here, exactly like a missing one.  Adoption is `initialize()`'s
+      // job and happens on the new Head's first command; until then this
+      // read-only operator surface must stay quiet rather than throw, or the
+      // Current Batch panel breaks for the whole window between an unarchive
+      // and that first command.
+      if (error && (error.code === "head_control_work_task_state_missing" ||
+                    error.code === "head_control_work_task_state_identity_mismatch")) {
         return Object.freeze({ active: false, projection: null });
       }
       throw error;

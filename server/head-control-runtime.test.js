@@ -31,6 +31,7 @@ function request(overrides = {}) {
 function fixture() {
   const config_dir = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-head-runtime-"));
   let archived = false;
+  let liveGeneration = generation;
   const sessions = new Map([[`${project_id}/head`, {
     projectId: project_id, agentId: "head", state: "running", term: {}, lifecycleState: "verified",
   }]]);
@@ -41,7 +42,7 @@ function fixture() {
     read_config: config,
     capture_project_admission(id) {
       if (id !== project_id || archived) throw new Error("stale admission");
-      return { project_id, generation };
+      return { project_id, generation: liveGeneration };
     },
     is_project_archived(id) { return id !== project_id || archived; },
     resolve_shim_principal(candidate) {
@@ -58,6 +59,9 @@ function fixture() {
     config_dir,
     sessions,
     archive() { archived = true; },
+    // An unarchive readmits the project under a new admission generation while
+    // the durable domain file still carries the previous one.
+    unarchive() { archived = false; liveGeneration += 1; },
     cleanup() { fs.rmSync(config_dir, { recursive: true, force: true }); },
   };
 }
@@ -67,6 +71,29 @@ function ok(value, message) {
   assert.ok(value, message);
   passed += 1;
   console.log(`  PASS: ${message}`);
+}
+
+// After an unarchive the durable domain file still carries the superseded
+// admission generation until the new Head's first command adopts it.  The
+// read-only operator surface must report "no current batch" for that window
+// instead of throwing, or the Current Batch panel breaks until Head acts.
+{
+  const live = fixture();
+  try {
+    assert.deepEqual(live.runtime.registerHeadToken({ project_id, generation, token }), { project_id, actor: "head", generation });
+    assert.equal(live.runtime.handle(request(), { token }).ok, true);
+    assert.equal(live.runtime.readCurrentBatchProjection({ project_id }).active, false);
+
+    live.archive();
+    live.unarchive();
+
+    const duringWindow = live.runtime.readCurrentBatchProjection({ project_id });
+    assert.deepEqual(duringWindow, { active: false, projection: null },
+      "a superseded generation's durable state reads as no current batch, not an exception");
+    ok(true, "the Current Batch read survives the unarchive window before the new Head's first command");
+  } finally {
+    live.cleanup();
+  }
 }
 
 {

@@ -121,7 +121,7 @@ For board context — what issues/PRs exist and their state — read the server-
 - **NO issue creation** — Head creates issues. If a follow-up is needed, ask @head to create it.
 - **NO PR review** — Reviewers review only
 - **NO reviewer fanout** — the server's `[REVIEW REQUEST]` is the only implementation-review route; never @mention reviewers for a PR
-- **NO push, PR, CI, merge, or deploy from a WorkTask candidate** — the server rejects publication of the `worktree-dev` candidate branch
+- **NO push, PR, CI, merge, or deploy from a WorkTask candidate** — a candidate is local evidence only. The server never publishes `worktree-dev`; nothing stops you from running a publish command yourself, so this is your obligation, not a guard you can lean on. Only #1060's Delivery Candidate path reaches a remote, and only under an operator gate.
 
 ## Design Quality
 **Visual & Layout Verification Protocol** — applies to ALL UI/frontend work.
