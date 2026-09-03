@@ -951,13 +951,30 @@ app.get("/api/work-task-batch", (req, res) => {
 app.post("/api/work-task-candidate", (req, res) => {
   const principal = activeDevCandidatePrincipal(req);
   if (!principal) return res.status(403).json({ ok: false, code: "work_task_candidate_forbidden" });
+  // The project is bound by the authenticated Dev token, never by the body:
+  // a ref for another project is refused before any identity or store read.
+  const ref = req.body?.work_task_ref;
+  if (!ref || typeof ref !== "object" || ref.project_id !== principal.projectId) {
+    return res.status(403).json({ ok: false, code: "work_task_candidate_forbidden" });
+  }
   try {
     const resolveLiveIdentity = createLiveWorkTaskIdentityResolver({
       read_live_batch_context: routes.readLiveBatchContext,
       read_repository_state: routes.repositoryState,
       read_cached_repository_snapshot: (cacheRepo) => routes._graphqlCache.get(cacheRepo),
     });
-    resolveLiveIdentity(req.body?.work_task_ref);
+    // A WorkTaskRef carries the task contract on top of the four-field source
+    // identity; the resolver re-proves that identity and its current Issue
+    // body revision, which must still match the submitted contract.
+    const identity = resolveLiveIdentity({
+      installation_id: ref.installation_id,
+      project_id: ref.project_id,
+      repository_key: ref.repository_key,
+      work_item: ref.work_item,
+    });
+    if (identity.issue_body_revision !== ref.issue_body_revision) {
+      return res.status(409).json({ ok: false, code: "stale_work_task_candidate_authority" });
+    }
     const result = devCandidateServiceForProject(principal.projectId).submitDevCandidate(req.body);
     return res.json({ ok: true, ...result });
   } catch (error) {
@@ -4332,3 +4349,4 @@ module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test
 module.exports.triggers = triggers; // #1034: project cleanup ownership test seam
 module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation test seam
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
+module.exports.app = app; // route-level test seam (QUADWORK_SKIP_LISTEN keeps the port unbound)
