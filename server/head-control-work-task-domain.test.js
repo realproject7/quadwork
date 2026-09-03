@@ -14,6 +14,8 @@ const {
 const {
   createWorkTaskPipelineStore,
 } = require("./work-task-pipeline-store");
+const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
+const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 const {
   FILE_MODE,
   DIRECTORY_MODE,
@@ -55,6 +57,27 @@ function manifest() {
       dependencies: [],
     }],
   }, { resolveRegisteredIdentity });
+}
+function reviewManifest() {
+  return buildBatchManifest({
+    version: 1,
+    installation_id: binding.installation_id,
+    project_id: binding.project_id,
+    delivery_mode: "integrated",
+    tasks: [
+      { task_key: "review", repository_key: "web", work_item: copy(issue), goal: "seal two independent receipts", file_boundary: ["server/review.js"], validation: ["node:test"], dependencies: [] },
+      { task_key: "dependent", repository_key: "web", work_item: copy(issue), goal: "build on the reviewed slice", file_boundary: ["server/dependent.js"], validation: ["node:test"], dependencies: [{ repository_key: "web", work_item: copy(issue), task_key: "review" }] },
+    ],
+  }, { resolveRegisteredIdentity });
+}
+function receipt(round, id, verdict, findings = []) {
+  const crypto = require("node:crypto");
+  const payload = { version: 1, review_round_ref: round, receipt_id: id, verdict, findings: copy(findings) };
+  const stable = (v) => Array.isArray(v) ? `[${v.map(stable).join(",")}]` : v && typeof v === "object" ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable(v[k])}`).join(",")}}` : JSON.stringify(v);
+  return { ...payload, receipt_digest: crypto.createHash("sha256").update(stable(payload), "utf8").digest("hex") };
+}
+function reviewerContext(role, at) {
+  return { version: 1, reviewer_role: role, reviewer_generation: role === "re1" ? 11 : 22, received_at: at };
 }
 function resolveRegisteredIdentity(input) {
   return {
@@ -396,6 +419,135 @@ withDirectory((directory) => {
   throwsCode(() => current.cut_batch(request("cut_batch", 3, { cut: { tasks: [{ work_task_ref: copy(state.manifest.tasks[0].ref), candidate_digest: candidateSha }] } })),
     "head_control_work_task_archived");
   ok(true, "archived external pipeline state is surfaced and blocks further Head mutations");
+});
+
+// #1058: the correction route and the Head-private propagation-stop read
+// reach the owning review service only through this bound domain, then the
+// finished batch is retired and a successor manifest is frozen for the same
+// project while the retired record stays readable for provenance.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(reviewManifest()) }));
+  const frozen = current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
+  assert.equal(frozen.revision, 2);
+  const owner = { installation_id: binding.installation_id, project_id: binding.project_id };
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  let state = store.readRecoverySnapshot(owner);
+  const ref = state.manifest.tasks[0].ref;
+  state = applyPipelineEvent(directory, state, { version: 1, kind: "assign_build", event_id: "domain_review_build", work_task_ref: copy(ref), assignment_id: "domain_review_assignment", base_sha: baseSha });
+  const candidate = exactCandidate(ref);
+  applyPipelineEvent(directory, state, { version: 1, kind: "record_candidate", event_id: "domain_review_candidate", assignment_id: "domain_review_assignment", candidate });
+  const review = createWorkTaskIndependentReviewService({ config_dir: directory, fs });
+  const opened = review.openIndependentReview({ version: 1, event_id: "domain_review_open", work_task_ref: copy(ref), attempt: "attempt_001", round: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 11 }, { reviewer_role: "re2", reviewer_generation: 22 }], opened_at: "2026-09-02T00:01:00.000Z" });
+  const stopRequest = (keys, taskRef = ref) => request("read_propagation_stop", null, { work_task_ref: copy(taskRef) }, keys);
+  const quiet = current.read_propagation_stop(stopRequest({ correlation_id: "corr_stop_quiet", idempotency_key: "idem_stop_quiet" }));
+  assert.equal(quiet.detail, null);
+  assert.equal(quiet.status.revision, 3, "the externally advanced pipeline is observed as one new controller revision");
+  review.submitTrustedReceipt({ version: 1, review_round_ref: opened.review_round_ref, candidate_digest: opened.candidate_digest,
+    receipt: receipt(opened.review_round_ref, "receipt_re2_stop", "request_changes", [{ finding_id: "finding_shared_base", severity: "blocking", propagation: "propagating", summary: "shared base drift" }]) },
+  reviewerContext("re2", "2026-09-02T00:02:00.000Z"));
+  const stop = current.read_propagation_stop(stopRequest({ correlation_id: "corr_stop_pending", idempotency_key: "idem_stop_pending" }));
+  assert.equal(stop.status.revision, 3);
+  assert.equal(stop.detail.kind, "propagation_stop_pending");
+  assert.equal(stop.detail.target, "head_private");
+  assert.equal(stop.detail.candidate_digest, opened.candidate_digest);
+  assert.deepEqual(stop.detail.dependency_chain.map((entry) => entry.task_key), ["dependent"]);
+  assert.doesNotMatch(JSON.stringify(stop), /receipt|finding|reviewer|verdict|request_changes|shared base/);
+  const foreign = { ...copy(ref), project_id: "other" };
+  throwsCode(() => current.read_propagation_stop(stopRequest({ correlation_id: "corr_stop_foreign", idempotency_key: "idem_stop_foreign" }, foreign)), "head_control_work_task_binding_denied");
+  ok(true, "a sealed propagating finding is readable only as the redacted Head-private stop over the declared chain, bound to this project");
+
+  review.submitTrustedReceipt({ version: 1, review_round_ref: opened.review_round_ref, candidate_digest: opened.candidate_digest, receipt: receipt(opened.review_round_ref, "receipt_re1_stop", "approve") }, reviewerContext("re1", "2026-09-02T00:03:00.000Z"));
+  const reconciliation = createWorkTaskReviewReconciliationService({ config_dir: directory, fs });
+  const correction = { work_task_ref: copy(ref), review_round_ref: copy(opened.review_round_ref), candidate_digest: opened.candidate_digest };
+  reconciliation.reconcileReleasedReview({ version: 1, ...copy(correction) });
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.tasks[0].state, "changes_requested");
+  assert.equal(current.get_pipeline_status(request("get_pipeline_status", null, null, { correlation_id: "corr_status_cr", idempotency_key: "idem_status_cr" })).revision, 4);
+  throwsCode(() => current.queue_local_correction(request("queue_local_correction", 4, { correction: { ...copy(correction), work_task_ref: foreign } }, { correlation_id: "corr_corr_foreign", idempotency_key: "idem_corr_foreign" })), "head_control_work_task_binding_denied");
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.tasks[0].state, "changes_requested");
+  const queued = current.queue_local_correction(request("queue_local_correction", 4, { correction: copy(correction) }));
+  assert.equal(queued.status.revision, 5);
+  assert.equal(queued.status.manifest_frozen, true);
+  assert.equal(queued.detail.outcome, "queued");
+  assert.match(queued.detail.checkpoint_id, /^checkpoint_[a-f0-9]{48}$/);
+  assert.deepEqual(queued.detail.work_task_ref, ref);
+  const slot = store.readRecoverySnapshot(owner).pipeline.tasks[0];
+  assert.equal(slot.state, "queued");
+  assert.deepEqual(slot.correction, { checkpoint_id: queued.detail.checkpoint_id, count: 1 });
+  assert.equal(queued.status.pipeline_digest, store.readRecoverySnapshot(owner).pipeline.pipeline_digest);
+  throwsCode(() => current.queue_local_correction(request("queue_local_correction", 5, { correction: { ...copy(correction), candidate_digest: "e".repeat(64) } }, { correlation_id: "corr_corr_stale", idempotency_key: "idem_corr_stale" })), "head_control_work_task_correction_rejected");
+  ok(true, "a reconciled change request is returned to Dev as one bounded correction through the bound domain");
+
+  const retired = current.retire_batch(request("retire_batch", 5, null));
+  assert.deepEqual(retired, { revision: 6, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+  assert.equal(current.project_current_batch(), null);
+  assert.throws(() => store.readRecoverySnapshot(owner), (error) => error.code === "work_task_pipeline_store_missing");
+  const provenance = store.readRetiredSnapshots(owner);
+  assert.equal(provenance.length, 1);
+  assert.equal(provenance[0].manifest.manifest_digest, frozen.manifest_digest);
+  assert.equal(provenance[0].pipeline.archived, true);
+  assert.equal(provenance[0].terminal_audit.at(-1).kind, "archive");
+  assert.equal(provenance[0].pipeline.tasks[0].correction.count, 1);
+  throwsCode(() => current.retire_batch(request("retire_batch", 6, null, { correlation_id: "corr_retire_again", idempotency_key: "idem_retire_again" })), "head_control_work_task_invalid_transition");
+  const successor = copy(manifest());
+  const put = current.put_batch_manifest(request("put_batch_manifest", 6, { manifest: successor }, { correlation_id: "corr_put_successor", idempotency_key: "idem_put_successor" }));
+  assert.equal(put.revision, 7);
+  assert.equal(put.manifest_digest, successor.manifest_digest);
+  const frozenSuccessor = current.freeze_batch_manifest(request("freeze_batch_manifest", 7, null, { correlation_id: "corr_freeze_successor", idempotency_key: "idem_freeze_successor" }));
+  assert.equal(frozenSuccessor.revision, 8);
+  assert.equal(frozenSuccessor.manifest_frozen, true);
+  assert.notEqual(frozenSuccessor.manifest_digest, frozen.manifest_digest);
+  assert.equal(store.readRecoverySnapshot(owner).manifest.manifest_digest, frozenSuccessor.manifest_digest);
+  assert.equal(store.readRetiredSnapshots(owner)[0].manifest.manifest_digest, frozen.manifest_digest);
+  assert.deepEqual(current.project_current_batch().repositories[0].work_items[0].tasks.map((task) => task.state), ["queued"]);
+  assert.equal(domain(directory).get_pipeline_status(request("get_pipeline_status", null, null, { correlation_id: "corr_status_successor", idempotency_key: "idem_status_successor" })).revision, 8);
+  ok(true, "a retired batch frees the active path for a successor freeze while its retired record stays readable for provenance");
+});
+
+// Retirement refuses a batch that still holds Dev or reviewer authority, and
+// a crash between the store's atomic retirement and the domain's empty write
+// is healed from the retired record itself instead of reporting a missing
+// pipeline forever.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
+  current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
+  const owner = { installation_id: binding.installation_id, project_id: binding.project_id };
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  const state = store.readRecoverySnapshot(owner);
+  applyPipelineEvent(directory, state, { version: 1, kind: "assign_build", event_id: "domain_active_build", work_task_ref: copy(state.manifest.tasks[0].ref), assignment_id: "domain_active_assignment", base_sha: baseSha });
+  throwsCode(() => current.retire_batch(request("retire_batch", 3, null)), "head_control_work_task_batch_active");
+  assert.equal(current.get_pipeline_status(request("get_pipeline_status", null)).manifest_frozen, true);
+  assert.equal(store.readRetiredSnapshots(owner).length, 0);
+  ok(true, "a batch with active build authority cannot be retired");
+});
+withDirectory((directory) => {
+  let armed = false;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("head-control-work-task-domain")) {
+      const error = new Error("injected crash after store retirement");
+      error.code = "EIO";
+      throw error;
+    }
+    return fs.renameSync(from, to);
+  };
+  const current = domain(directory, { fs: faultFs });
+  current.initialize();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
+  current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
+  const owner = { installation_id: binding.installation_id, project_id: binding.project_id };
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_state_write_failed");
+  assert.equal(store.readRetiredSnapshots(owner).length, 1, "the store retirement is durable before the domain write");
+  assert.match(fs.readFileSync(headControlWorkTaskDomainPath(directory, binding), "utf8"), /"stage":"frozen"/);
+  const recovered = domain(directory);
+  assert.deepEqual(recovered.get_pipeline_status(request("get_pipeline_status", null)), { revision: 3, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+  assert.equal(recovered.put_batch_manifest(request("put_batch_manifest", 3, { manifest: copy(manifest()) }, { correlation_id: "corr_put_healed", idempotency_key: "idem_put_healed" })).revision, 4);
+  ok(true, "an interrupted retirement heals to empty from the retired record and accepts a successor manifest");
 });
 
 const source = fs.readFileSync(path.join(__dirname, "head-control-work-task-domain.js"), "utf8");

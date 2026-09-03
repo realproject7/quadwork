@@ -2,9 +2,12 @@
 
 // #1044 M1: bounded Head control for the WorkTask pipeline only.  This is a
 // domain command boundary, not a general control framework: it has one bound
-// Head/project/generation, four named actions, and delegates each mutation to
-// the owning pipeline domain action.  It has no HTTP, MCP, process, monitor,
-// filesystem, delivery, or dynamic-handler authority.
+// Head/project/generation, a fixed set of named actions, and delegates each
+// mutation to the owning pipeline domain action.  It has no HTTP, MCP,
+// process, monitor, filesystem, delivery, or dynamic-handler authority.
+// #1058 adds batch retirement, the released correction route, and the
+// Head-private propagation-stop read; the last two return a bounded `detail`
+// beside the fixed status, which never enters the redacted audit record.
 
 const crypto = require("node:crypto");
 
@@ -23,8 +26,14 @@ const ACTIONS = Object.freeze([
   "put_batch_manifest",
   "freeze_batch_manifest",
   "cut_batch",
+  "retire_batch",
+  "queue_local_correction",
+  "read_propagation_stop",
 ]);
 const ACTION_SET = new Set(ACTIONS);
+const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch"]);
+const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop"]);
 
 class HeadControlPlaneError extends Error {
   constructor(code, message = code) {
@@ -149,6 +158,18 @@ function assertPutPayload(value) {
   assertBoundedPayload(value.manifest);
   return { manifest: clone(value.manifest) };
 }
+function assertTaskPayload(value, field) {
+  exact(value, [field], "invalid_head_control_request");
+  if (!plain(value[field])) fail("invalid_head_control_request", `${field} payload is invalid`);
+  assertBoundedPayload(value[field]);
+  return { [field]: clone(value[field]) };
+}
+function assertDetail(value, code) {
+  if (value === null) return null;
+  if (!plain(value)) fail(code, "domain detail is invalid");
+  assertBoundedPayload(value);
+  return clone(value);
+}
 function assertCutPayload(value) {
   exact(value, ["cut"], "invalid_head_control_request");
   if (!plain(value.cut) || !Array.isArray(value.cut.tasks) || value.cut.tasks.length === 0 || value.cut.tasks.length > MAX_CUT_TASKS ||
@@ -169,20 +190,24 @@ function request(value) {
     version: VERSION,
     action: value.action,
     principal: principal(value.principal, "invalid_head_control_request"),
-    expected_revision: revision(value.expected_revision, "invalid_head_control_request", value.action === "get_pipeline_status"),
+    expected_revision: revision(value.expected_revision, "invalid_head_control_request", READ_ACTIONS.has(value.action)),
     idempotency_key: identifier(value.idempotency_key, "invalid_head_control_request"),
     correlation_id: identifier(value.correlation_id, "invalid_head_control_request"),
     payload: null,
   };
-  if (value.action === "get_pipeline_status" || value.action === "freeze_batch_manifest") {
+  if (PAYLOADLESS_ACTIONS.has(value.action)) {
     if (value.payload !== null) fail("invalid_head_control_request", "action does not accept payload");
   } else if (value.action === "put_batch_manifest") {
     parsed.payload = assertPutPayload(value.payload);
+  } else if (value.action === "queue_local_correction") {
+    parsed.payload = assertTaskPayload(value.payload, "correction");
+  } else if (value.action === "read_propagation_stop") {
+    parsed.payload = assertTaskPayload(value.payload, "work_task_ref");
   } else {
     parsed.payload = assertCutPayload(value.payload);
   }
-  if (value.action === "get_pipeline_status") {
-    if (parsed.expected_revision !== null) fail("invalid_head_control_request", "status action cannot pin a write revision");
+  if (READ_ACTIONS.has(value.action)) {
+    if (parsed.expected_revision !== null) fail("invalid_head_control_request", "read action cannot pin a write revision");
   } else if (parsed.expected_revision === null) {
     fail("invalid_head_control_request", "mutating action requires an optimistic revision");
   }
@@ -226,7 +251,7 @@ function createHeadControlPlane(options) {
     if (audit.length >= MAX_AUDIT_RECORDS) audit.shift();
     audit.push(freeze(clone(record)));
   }
-  function response(input, decision, code, status, applied) {
+  function response(input, decision, code, status, applied, detail = null) {
     const result = status === null ? null : freeze({
       action: input.action,
       applied,
@@ -249,6 +274,7 @@ function createHeadControlPlane(options) {
       decision: freeze({ kind: decision, code }),
       result,
       audit: auditRecord,
+      detail: detail === null ? null : freeze(clone(detail)),
     });
   }
   function deny(input, code, status = null) {
@@ -262,6 +288,7 @@ function createHeadControlPlane(options) {
       // The original immutable audit is the durable record of the one domain
       // invocation.  A replay intentionally creates no second mutation/audit.
       audit: cached.audit,
+      detail: cached.detail === null ? null : freeze(clone(cached.detail)),
     });
   }
   function cache(input, fingerprint, result) {
@@ -289,12 +316,35 @@ function createHeadControlPlane(options) {
     try { return { status: assertPipelineStatus(observed, "head_control_domain_invalid_status") }; }
     catch { return { error: "head_control_domain_invalid_status" }; }
   }
+  // Detailed actions return `{ status, detail }`; every other action returns
+  // the bare fixed status.  Both are re-validated here as untrusted output.
+  function observe(input) {
+    const observed = domain[input.action](invocation(input));
+    if (!DETAILED_ACTIONS.has(input.action)) return { status: assertPipelineStatus(observed, "head_control_domain_invalid_status"), detail: null };
+    exact(observed, ["status", "detail"], "head_control_domain_invalid_status");
+    return {
+      status: assertPipelineStatus(observed.status, "head_control_domain_invalid_status"),
+      detail: assertDetail(observed.detail, "head_control_domain_invalid_status"),
+    };
+  }
+  function invokeRead(input, prior) {
+    let observed;
+    try { observed = observe(input); }
+    catch (error) {
+      return { error: error instanceof HeadControlPlaneError && error.code === "head_control_domain_invalid_status" ? error.code : "head_control_domain_rejected" };
+    }
+    if (observed.status.revision !== prior.revision) return { error: "head_control_domain_invalid_status" };
+    return observed;
+  }
   function invokeMutation(input, prior) {
     let observed;
-    try { observed = domain[input.action](invocation(input)); }
-    catch { return { error: input.action === "cut_batch" ? "head_control_unsafe_cut" : "head_control_domain_rejected" }; }
+    try { observed = observe(input); }
+    catch (error) {
+      if (error instanceof HeadControlPlaneError && error.code === "head_control_domain_invalid_status") return { error: error.code };
+      return { error: input.action === "cut_batch" ? "head_control_unsafe_cut" : "head_control_domain_rejected" };
+    }
     try {
-      const status = assertPipelineStatus(observed, "head_control_domain_invalid_status");
+      const status = observed.status;
       if (status.revision !== prior.revision + 1) return { error: "head_control_domain_invalid_status" };
       if (status.archived) return { error: "head_control_domain_invalid_transition" };
       if (input.action === "put_batch_manifest" &&
@@ -309,7 +359,13 @@ function createHeadControlPlane(options) {
           (!status.manifest_frozen || status.pipeline_digest === null || status.pipeline_digest === prior.pipeline_digest)) {
         return { error: "head_control_domain_invalid_transition" };
       }
-      return { status };
+      if (input.action === "retire_batch" && status.manifest_digest !== null) {
+        return { error: "head_control_domain_invalid_transition" };
+      }
+      if (input.action === "queue_local_correction" && (!status.manifest_frozen || status.pipeline_digest === null)) {
+        return { error: "head_control_domain_invalid_transition" };
+      }
+      return { status, detail: observed.detail };
     } catch { return { error: "head_control_domain_invalid_status" }; }
   }
 
@@ -340,7 +396,19 @@ function createHeadControlPlane(options) {
       cache(input, fingerprint, result);
       return result;
     }
-    if (status.archived) {
+    if (input.action === "read_propagation_stop") {
+      const read = !status.manifest_frozen || status.pipeline_digest === null
+        ? { error: "head_control_stop_unavailable" }
+        : invokeRead(input, status);
+      const result = read.error
+        ? deny(input, read.error, status)
+        : response(input, "accepted", "head_control_stop_observed", read.status, false, read.detail);
+      cache(input, fingerprint, result);
+      return result;
+    }
+    // Retirement is the one mutation an archived batch still accepts: it is
+    // how an archived or finished batch leaves the active path for good.
+    if (status.archived && input.action !== "retire_batch") {
       const result = deny(input, "head_control_archived", status);
       cache(input, fingerprint, result);
       return result;
@@ -365,10 +433,20 @@ function createHeadControlPlane(options) {
       cache(input, fingerprint, result);
       return result;
     }
+    if (input.action === "retire_batch" && (!status.manifest_frozen || status.pipeline_digest === null)) {
+      const result = deny(input, "head_control_retire_unsafe", status);
+      cache(input, fingerprint, result);
+      return result;
+    }
+    if (input.action === "queue_local_correction" && (!status.manifest_frozen || status.pipeline_digest === null)) {
+      const result = deny(input, "head_control_correction_unsafe", status);
+      cache(input, fingerprint, result);
+      return result;
+    }
     const mutation = invokeMutation(input, status);
     const result = mutation.error
       ? deny(input, mutation.error, status)
-      : response(input, "accepted", "head_control_applied", mutation.status, true);
+      : response(input, "accepted", "head_control_applied", mutation.status, true, mutation.detail);
     cache(input, fingerprint, result);
     return result;
   }

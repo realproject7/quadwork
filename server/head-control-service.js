@@ -19,6 +19,8 @@ const SHA_RE = /^[a-f0-9]{64}$/;
 const CODE_RE = /^head_control_[a-z0-9_]{2,95}$/;
 const ACTION_SET = new Set(ACTIONS);
 const DECISION_SET = new Set(["accepted", "denied"]);
+const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch"]);
 
 class HeadControlServiceError extends Error {
   constructor(code, message = code) {
@@ -211,13 +213,17 @@ function originalAudit(record) {
     result: record.result === null ? null : freeze(clone(record.result)),
   });
 }
-function replay(record) {
+function replay(record, detail = null) {
   const audit = originalAudit(record);
+  // The durable receipt is redacted: a replay proven from it alone carries the
+  // fixed result and no detail.  Only this process's own exact receipt can
+  // restore the detail the plane returned.
   return freeze({
     version: VERSION,
     decision: freeze({ kind: "replayed", code: "head_control_duplicate_retry" }),
     result: audit.result === null ? null : freeze(clone(audit.result)),
     audit,
+    detail: detail === null ? null : freeze(clone(detail)),
   });
 }
 function commandFingerprint(value) {
@@ -226,13 +232,12 @@ function commandFingerprint(value) {
 function commandMatchesDurablePayloadlessRecord(command, record, owner) {
   const code = "head_control_durable_replay_ambiguous";
   exact(command, ["version", "action", "principal", "expected_revision", "idempotency_key", "correlation_id", "payload"], code);
-  if (command.version !== VERSION || command.action !== record.action ||
-      (command.action !== "get_pipeline_status" && command.action !== "freeze_batch_manifest") ||
+  if (command.version !== VERSION || command.action !== record.action || !PAYLOADLESS_ACTIONS.has(command.action) ||
       command.payload !== null || record.decision !== "accepted") {
     return false;
   }
   const commandBinding = binding(command.principal, code);
-  const expectedRevision = revision(command.expected_revision, code, command.action === "get_pipeline_status");
+  const expectedRevision = revision(command.expected_revision, code, READ_ACTIONS.has(command.action));
   const idempotencyKey = identifier(command.idempotency_key, code);
   const correlationId = identifier(command.correlation_id, code);
   return sameBinding(commandBinding, owner) &&
@@ -254,10 +259,10 @@ function createHeadControlService(options) {
     try { return durableAuditSnapshot(store.read(owner), owner); }
     catch { fail("head_control_audit_unavailable", "durable Head-control audit is unavailable"); }
   }
-  function remember(command, record) {
+  function remember(command, record, detail) {
     const fingerprint = commandFingerprint(command);
     if (fingerprint === null) return;
-    const local = freeze({ fingerprint, record: freeze(clone(record)) });
+    const local = freeze({ fingerprint, record: freeze(clone(record)), detail: detail === null ? null : freeze(clone(detail)) });
     localIdempotencies.set(record.idempotency_key, local);
     localCorrelations.set(record.correlation_id, local);
   }
@@ -266,7 +271,7 @@ function createHeadControlService(options) {
     try {
       const receipt = store.append({ binding: owner, audit: result.audit });
       appendReceipt(receipt, expected, owner);
-      remember(command, expected);
+      remember(command, expected, result.detail);
     } catch {
       // The domain result is intentionally not returned without its required
       // receipt. A later exact retry can re-read the plane receipt and append
@@ -288,7 +293,7 @@ function createHeadControlService(options) {
     const fingerprint = commandFingerprint(command);
     if (localByCorrelation && localByCorrelation === localByIdempotency &&
         same(localByCorrelation.record, record) && fingerprint !== null && localByCorrelation.fingerprint === fingerprint) {
-      return replay(record);
+      return replay(record, localByCorrelation.detail);
     }
     if (commandMatchesDurablePayloadlessRecord(command, record, owner)) return replay(record);
     // The durable format deliberately omits payloads.  Any request that is

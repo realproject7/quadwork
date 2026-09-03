@@ -2,9 +2,12 @@
 
 // #1044 M4: the one durable WorkTask domain behind the fixed Head-control
 // plane.  This module owns no transport, route, dispatch, Git, delivery, or
-// audit authority.  Its only public command surface is the plane's four
+// audit authority.  Its only public command surface is the plane's fixed
 // static callbacks.  Unlike the redacted audit store, its private state keeps
 // the exact manifest / cut intent needed to recover an interrupted mutation.
+// #1058: the batch lifecycle closes with `retire_batch`, and the released
+// correction route plus the Head-private propagation-stop read reach their
+// owning review service only through this bound domain.
 
 const crypto = require("node:crypto");
 const path = require("node:path");
@@ -24,6 +27,10 @@ const {
   createWorkTaskPipelineStore,
 } = require("./work-task-pipeline-store");
 const { projectWorkTaskBatch } = require("./work-task-projection");
+const {
+  WorkTaskIndependentReviewServiceError,
+  createWorkTaskIndependentReviewService,
+} = require("./work-task-independent-review-service");
 
 const SCHEMA_VERSION = 1;
 const FILE_MODE = 0o600;
@@ -33,7 +40,11 @@ const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const IDENTIFIER_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const SHA_RE = /^[a-f0-9]{64}$/;
-const ACTIONS = new Set(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch"]);
+const ACTIONS = new Set([
+  "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch",
+  "retire_batch", "queue_local_correction", "read_propagation_stop",
+]);
+const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
 
 class HeadControlWorkTaskDomainError extends Error {
   constructor(code, message = code) {
@@ -175,19 +186,30 @@ function assertInvocation(value, expectedAction, owner) {
   }
   const actualBinding = binding(value.binding, "invalid_head_control_work_task_input");
   if (!sameBinding(actualBinding, owner)) fail("head_control_work_task_binding_denied", "domain binding is not owned by this Head");
-  const nullable = expectedAction === "get_pipeline_status";
+  const nullable = READ_ACTIONS.has(expectedAction);
   if (nullable ? value.expected_revision !== null : !Number.isSafeInteger(value.expected_revision) || value.expected_revision < 0) {
     fail("invalid_head_control_work_task_input", "optimistic revision is invalid");
   }
   if (!nullable) revision(value.expected_revision, "invalid_head_control_work_task_input");
   identifier(value.correlation_id, "invalid_head_control_work_task_input");
   identifier(value.idempotency_key, "invalid_head_control_work_task_input");
-  if (expectedAction === "get_pipeline_status" || expectedAction === "freeze_batch_manifest") {
+  if (expectedAction === "get_pipeline_status" || expectedAction === "freeze_batch_manifest" || expectedAction === "retire_batch") {
     if (value.payload !== null) fail("invalid_head_control_work_task_input", "action does not accept payload");
   } else if (expectedAction === "put_batch_manifest") {
     exact(value.payload, ["manifest"], "invalid_head_control_work_task_input");
     if (!plain(value.payload.manifest)) fail("invalid_head_control_work_task_input", "manifest payload is invalid");
     assertBoundedPayload(value.payload.manifest);
+  } else if (expectedAction === "queue_local_correction") {
+    exact(value.payload, ["correction"], "invalid_head_control_work_task_input");
+    exact(value.payload.correction, ["work_task_ref", "review_round_ref", "candidate_digest"], "invalid_head_control_work_task_input");
+    if (!plain(value.payload.correction.work_task_ref) || !plain(value.payload.correction.review_round_ref)) {
+      fail("invalid_head_control_work_task_input", "correction payload is invalid");
+    }
+    assertBoundedPayload(value.payload.correction);
+  } else if (expectedAction === "read_propagation_stop") {
+    exact(value.payload, ["work_task_ref"], "invalid_head_control_work_task_input");
+    if (!plain(value.payload.work_task_ref)) fail("invalid_head_control_work_task_input", "propagation stop payload is invalid");
+    assertBoundedPayload(value.payload.work_task_ref);
   } else {
     exact(value.payload, ["cut"], "invalid_head_control_work_task_input");
     exact(value.payload.cut, ["tasks"], "invalid_head_control_work_task_input");
@@ -314,7 +336,9 @@ function assertState(value, owner, adoptGeneration = false) {
     pending: null,
   };
   if (!new Set(["empty", "manifest", "frozen"]).has(state.stage)) fail("invalid_head_control_work_task_state", "domain stage is invalid");
-  if (state.stage === "empty" && (state.revision !== 0 || state.manifest !== null || state.pipeline_digest !== null || value.pending !== null)) {
+  // An empty stage is revision 0 before the first manifest and revision N+1
+  // after a retirement; either way it carries no manifest, pipeline, or intent.
+  if (state.stage === "empty" && (state.manifest !== null || state.pipeline_digest !== null || value.pending !== null)) {
     fail("invalid_head_control_work_task_state", "empty state is inconsistent");
   }
   if (state.stage === "manifest" && (state.revision < 1 || state.manifest === null || state.manifest.frozen !== null || state.pipeline_digest !== null)) {
@@ -425,19 +449,48 @@ function createHeadControlWorkTaskDomain(options) {
   const directory = storageDirectory(options.config_dir);
   const statePath = headControlWorkTaskDomainPath(options.config_dir, owner);
   const pipelineStore = createWorkTaskPipelineStore({ config_dir: options.config_dir, fs });
+  const reviewService = createWorkTaskIndependentReviewService({ config_dir: options.config_dir, fs });
 
-  function emptyState() {
-    return { schema_version: SCHEMA_VERSION, binding: clone(owner), revision: 0, stage: "empty", manifest: null, pipeline_digest: null, pending: null };
+  function emptyState(revisionValue = 0) {
+    return { schema_version: SCHEMA_VERSION, binding: clone(owner), revision: revisionValue, stage: "empty", manifest: null, pipeline_digest: null, pending: null };
   }
   function currentState() { return readState(fs, statePath, owner, false); }
   function readPipeline(manifest) {
     let stored;
     try { stored = pipelineStore.readRecoverySnapshot(ownerOf(owner)); }
     catch (error) {
-      if (error instanceof WorkTaskPipelineStoreError) fail("head_control_work_task_pipeline_unavailable", "pipeline state cannot be recovered");
+      if (error instanceof WorkTaskPipelineStoreError) {
+        fail(error.code === "work_task_pipeline_store_missing" ? "head_control_work_task_pipeline_missing" : "head_control_work_task_pipeline_unavailable",
+          "pipeline state cannot be recovered");
+      }
       throw error;
     }
     return pipelineSnapshot(stored, owner, manifest);
+  }
+  // A retirement is durable in the store before this domain records it.  A
+  // frozen state whose active store is gone is therefore proven retired only
+  // by an archived retired record of that exact manifest, never assumed.
+  function retiredHolds(state) {
+    let retired;
+    try { retired = pipelineStore.readRetiredSnapshots(ownerOf(owner)); }
+    catch (error) {
+      if (error instanceof WorkTaskPipelineStoreError) return false;
+      throw error;
+    }
+    return retired.some((entry) => entry.manifest.manifest_digest === state.manifest.manifest_digest && entry.pipeline.archived);
+  }
+  function ownedTaskRef(value, code) {
+    if (!plain(value) || value.installation_id !== owner.installation_id || value.project_id !== owner.project_id) {
+      fail(code, "work task belongs to another project");
+    }
+    return clone(value);
+  }
+  function reviewCall(run, code) {
+    try { return run(); }
+    catch (error) {
+      if (error instanceof WorkTaskIndependentReviewServiceError) fail(code, "review service rejected the request");
+      throw error;
+    }
   }
   function initializePipeline(manifest, pipeline) {
     try { return pipelineSnapshot(pipelineStore.initialize({
@@ -499,7 +552,7 @@ function createHeadControlWorkTaskDomain(options) {
         let recovered;
         try { recovered = readPipeline(frozenManifest); }
         catch (error) {
-          if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_unavailable") throw error;
+          if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_missing") throw error;
           let initial;
           try { initial = buildWorkTaskPipeline(frozenManifest); }
           catch { fail("head_control_work_task_pipeline_corrupt", "frozen WorkTask manifest cannot build a pipeline"); }
@@ -534,7 +587,14 @@ function createHeadControlWorkTaskDomain(options) {
       const state = currentState();
       if (state.pending !== null) fail("head_control_work_task_pending_recovery_required", "pending domain write was not recovered");
       if (state.stage !== "frozen") return { state: snapshot(state, owner), pipeline: null };
-      const stored = readPipeline(state.manifest);
+      let stored;
+      try { stored = readPipeline(state.manifest); }
+      catch (error) {
+        if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_missing" || !retiredHolds(state)) throw error;
+        const retired = emptyState(state.revision + 1);
+        writeState(fs, statePath, retired, owner);
+        return { state: snapshot(retired, owner), pipeline: null };
+      }
       if (stored.pipeline.pipeline_digest === state.pipeline_digest) return { state: snapshot(state, owner), pipeline: stored };
       const next = clone(state);
       next.revision += 1;
@@ -695,11 +755,92 @@ function createHeadControlWorkTaskDomain(options) {
     const pipeline = readPipeline(state.manifest);
     return statusFor(state, pipeline);
   }
+  // Retirement ends one frozen batch: the store archives and renames the
+  // record under CAS, then this domain returns to `empty` at the next revision
+  // so a successor manifest can be put.  A crash between those two writes is
+  // healed by `synchronizeFrozen` from the retired record itself.
+  function retire_batch(command) {
+    const input = assertInvocation(command, "retire_batch", owner);
+    prepared();
+    return withWriterLock(fs, statePath, () => {
+      const state = currentState();
+      assertMutationState(state, input, "frozen");
+      const stored = readPipeline(state.manifest);
+      if (stored.pipeline.pipeline_digest !== state.pipeline_digest) fail("head_control_work_task_pipeline_stale", "pipeline changed before retirement");
+      try {
+        pipelineStore.retire({
+          expected: {
+            installation_id: owner.installation_id,
+            project_id: owner.project_id,
+            manifest_digest: state.manifest.manifest_digest,
+            pipeline_digest: state.pipeline_digest,
+          },
+          event_id: `hretire_${hash({ binding: owner, correlation_id: input.correlation_id, idempotency_key: input.idempotency_key }).slice(0, 64)}`,
+        });
+      } catch (error) {
+        if (error instanceof WorkTaskPipelineStoreError) {
+          fail(error.code === "work_task_pipeline_store_batch_active" ? "head_control_work_task_batch_active" : "head_control_work_task_pipeline_unavailable",
+            "batch retirement was rejected");
+        }
+        throw error;
+      }
+      const next = emptyState(state.revision + 1);
+      writeState(fs, statePath, next, owner);
+      return statusFor(next, null);
+    });
+  }
+  // A released change-requested round returns its exact candidate to Dev.  The
+  // review service owns the round/pipeline transition; this domain binds the
+  // task to the owning project and frozen batch and records the new revision.
+  function queue_local_correction(command) {
+    const input = assertInvocation(command, "queue_local_correction", owner);
+    prepared();
+    return withWriterLock(fs, statePath, () => {
+      const state = currentState();
+      assertMutationState(state, input, "frozen");
+      assertCurrentManifest(state.manifest, options.resolve_registered_identity);
+      const stored = readPipeline(state.manifest);
+      if (stored.pipeline.pipeline_digest !== state.pipeline_digest || stored.pipeline.archived) {
+        fail("head_control_work_task_pipeline_stale", "pipeline changed before correction queueing");
+      }
+      const correction = input.payload.correction;
+      const queued = reviewCall(() => reviewService.queueLocalCorrection({
+        version: 1,
+        work_task_ref: ownedTaskRef(correction.work_task_ref, "head_control_work_task_binding_denied"),
+        review_round_ref: clone(correction.review_round_ref),
+        candidate_digest: correction.candidate_digest,
+      }), "head_control_work_task_correction_rejected");
+      const applied = readPipeline(state.manifest);
+      const next = clone(state);
+      next.revision += 1;
+      next.pipeline_digest = applied.pipeline.pipeline_digest;
+      writeState(fs, statePath, next, owner);
+      return freeze({
+        status: statusFor(next, applied),
+        detail: { outcome: queued.outcome, work_task_ref: clone(queued.work_task_ref), candidate_digest: queued.candidate_digest, checkpoint_id: queued.checkpoint_id },
+      });
+    });
+  }
+  // Head-private read of one task's pending pre-release propagation stop.  It
+  // is a read: the status it reports is the current one, and the redacted stop
+  // (or null) travels beside it without becoming durable audit data.
+  function read_propagation_stop(command) {
+    const input = assertInvocation(command, "read_propagation_stop", owner);
+    const current = prepared();
+    if (current.state.stage !== "frozen" || current.pipeline === null) {
+      fail("head_control_work_task_invalid_transition", "propagation stop read requires a frozen batch");
+    }
+    const stop = reviewCall(() => reviewService.readPropagationStopPending({
+      version: 1,
+      work_task_ref: ownedTaskRef(input.payload.work_task_ref, "head_control_work_task_binding_denied"),
+    }), "head_control_work_task_stop_unavailable");
+    return freeze({ status: statusFor(current.state, current.pipeline), detail: stop === null ? null : clone(stop) });
+  }
 
   // `initialize` is deliberately non-enumerable.  The existing plane exacts
-  // its domain object to these four fixed callbacks, while runtime startup
-  // still has an explicit durable bootstrap with no fifth control action.
-  const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch };
+  // its domain object to these fixed callbacks, while runtime startup still
+  // has an explicit durable bootstrap with no extra control action.
+  const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch, retire_batch, queue_local_correction, read_propagation_stop };
   Object.defineProperty(domain, "initialize", { value: initialize, enumerable: false });
   Object.defineProperty(domain, "project_current_batch", { value: project_current_batch, enumerable: false });
   return freeze(domain);

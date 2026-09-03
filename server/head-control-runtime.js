@@ -109,6 +109,15 @@ function createHeadControlRuntime(options) {
     });
   }
 
+  // The server clock is a Date; the durable domain freezes manifests with an
+  // ISO timestamp.  Convert here, as the review runtime does, so a freeze
+  // through the real route cannot fail on the clock's type.
+  function isoNow() {
+    const value = options.now();
+    if (!(value instanceof Date) || Number.isNaN(value.getTime())) throw new TypeError("Head-control clock is unavailable");
+    return value.toISOString();
+  }
+
   function resolveOwnedDomain(owner) {
     const resolver = createLiveWorkTaskIdentityResolver({
       read_live_batch_context: options.read_live_batch_context,
@@ -120,7 +129,7 @@ function createHeadControlRuntime(options) {
       config_dir: options.config_dir,
       fs: options.fs,
       resolve_registered_identity: resolver,
-      now: options.now,
+      now: isoNow,
     });
   }
 
