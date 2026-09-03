@@ -360,20 +360,20 @@ async function handleMessage(message) {
   }
 
   const id = requestId(message);
+  // The handshake and listing follow the shipped chat shim: clients send
+  // initialize capabilities/clientInfo and an optional tools/list cursor, so
+  // their params are not validated.  tools/call remains the strict surface.
   if (message.method === "initialize") {
-    try { paramsEmpty(message.params); } catch { return jsonRpcError(id, -32602, "Invalid params"); }
     return jsonRpc(id, {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
       serverInfo: { name: "quadwork-head-control", version: "1.0.0" },
     });
   }
-  if (message.method === "initialized") {
-    try { paramsEmpty(message.params); } catch { return id === null ? null : jsonRpcError(id, -32602, "Invalid params"); }
+  if (message.method === "initialized" || message.method === "notifications/initialized") {
     return null;
   }
   if (message.method === "tools/list") {
-    try { paramsEmpty(message.params); } catch { return jsonRpcError(id, -32602, "Invalid params"); }
     return jsonRpc(id, { tools: TOOL_DEFS });
   }
   if (message.method === "tools/call") {

@@ -110,12 +110,23 @@ async function run() {
   const shim = startShim();
   try {
     console.log("\n--- Head-control MCP shim tests ---\n");
-    const initialized = await shim.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    // A real MCP client always sends protocolVersion/capabilities/clientInfo
+    // on initialize, a params-less notifications/initialized, and may page
+    // tools/list with a cursor.  None of these may be rejected.
+    const initialized = await shim.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
+      protocolVersion: "2024-11-05",
+      capabilities: { roots: { listChanged: true }, sampling: {} },
+      clientInfo: { name: "claude-code", version: "1.0.0" },
+    } });
     ok(initialized.result?.protocolVersion === "2024-11-05" && initialized.result?.serverInfo?.name === "quadwork-head-control",
-      "initialize returns a Head-control MCP identity");
+      "a spec-conforming initialize handshake returns the Head-control MCP identity");
+    shim.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
-    const listed = await shim.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const listed = await shim.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: { cursor: "page-one" } });
     const tools = listed.result?.tools;
+    assert.equal(listed.error, undefined);
+    const listedAgain = await shim.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    assert.deepEqual(listedAgain.result?.tools?.map((tool) => tool.name), tools.map((tool) => tool.name));
     assert.deepEqual(tools.map((tool) => tool.name), [
       "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "recent_head_control_audit",
     ]);
@@ -159,6 +170,7 @@ async function run() {
     const malformedParams = await shim.send({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "get_pipeline_status", arguments: statusArgs, extra: true } });
     assert.equal(malformedParams.error?.code, -32602);
     assert.equal(calls.length, 1);
+    ok(true, "tools/call still rejects unknown params fields after the handshake was loosened");
     const unknownMethod = await shim.send({ jsonrpc: "2.0", id: 22, method: "control/anything", params: {} });
     assert.equal(unknownMethod.error?.code, -32601);
     const nestedUnknown = await shim.send(call(23, "cut_batch", {
