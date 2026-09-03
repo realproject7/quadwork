@@ -120,6 +120,10 @@ function nextRetiredPath(fs, statePath) {
 function temporaryPathFor(statePath) {
   return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
 }
+// The lock file body is this writer's proof of ownership. dev+ino alone cannot
+// prove it: Linux reuses an inode number as soon as the old lock is unlinked
+// and closed, so a replacement lock can carry the original's identity.
+function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
 function modeOf(stats) { return stats.mode & 0o777; }
 function lstatOrNull(fs, target) {
   try { return fs.lstatSync(target); } catch (error) {
@@ -297,6 +301,7 @@ function lockStat(fs, lockPath) {
 }
 function acquireLock(fs, statePath) {
   const lockPath = lockPathFor(statePath);
+  const token = lockToken();
   let descriptor;
   let ownStat = null;
   try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); } catch (error) {
@@ -307,6 +312,7 @@ function acquireLock(fs, statePath) {
     fail("work_task_pipeline_store_lock_failed", "pipeline store lock cannot be acquired");
   }
   try {
+    fs.writeFileSync(descriptor, token, "utf8");
     fs.chmodSync(lockPath, FILE_MODE);
     fs.fsyncSync(descriptor);
     ownStat = fs.fstatSync(descriptor);
@@ -318,19 +324,19 @@ function acquireLock(fs, statePath) {
     // replaced, retaining it fail-closed is safer than unlinking a new writer.
     try {
       const current = lockStat(fs, lockPath);
-      if (sameFile(ownStat, current)) fs.unlinkSync(lockPath);
+      if (sameFile(ownStat, current) && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
     } catch { /* a mismatched or unreadable replacement remains in place */ }
     if (error instanceof WorkTaskPipelineStoreError) throw error;
     fail("work_task_pipeline_store_lock_failed", "pipeline store lock cannot be initialized");
   }
-  return { descriptor, lockPath, stat: ownStat };
+  return { descriptor, lockPath, stat: ownStat, token };
 }
 function releaseLock(fs, lock) {
   let closeError = null;
   try { fs.closeSync(lock.descriptor); } catch (error) { closeError = error; }
   try {
     const current = lockStat(fs, lock.lockPath);
-    if (!sameFile(lock.stat, current)) fail("work_task_pipeline_store_lock_release_failed", "pipeline store lock changed before release");
+    if (!sameFile(lock.stat, current) || fs.readFileSync(lock.lockPath, "utf8") !== lock.token) fail("work_task_pipeline_store_lock_release_failed", "pipeline store lock changed before release");
     fs.unlinkSync(lock.lockPath);
   } catch (error) {
     if (error instanceof WorkTaskPipelineStoreError) throw error;

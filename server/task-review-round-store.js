@@ -281,9 +281,15 @@ function sameFile(left, right) {
   return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) && left.dev === right.dev && left.ino === right.ino;
 }
 
+// The lock file body is this writer's proof of ownership. dev+ino alone cannot
+// prove it: Linux reuses an inode number as soon as the old lock is unlinked
+// and closed, so a replacement lock can carry the original's identity.
+function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
+
 function acquireProjectWriterLock(fsImpl, rootDir, scope) {
   const directory = secureStoreDirectories(fsImpl, rootDir);
   const lockPath = lockPathFor(directory, scope);
+  const token = lockToken();
   let fd = null;
   let ownStat = null;
   try {
@@ -299,19 +305,20 @@ function acquireProjectWriterLock(fsImpl, rootDir, scope) {
     fail("task_review_round_store_persist_failed", "could not acquire project writer lock");
   }
   try {
+    fsImpl.writeFileSync(fd, token, "utf8");
     fsImpl.chmodSync(lockPath, 0o600);
     fsImpl.fsyncSync(fd);
     ownStat = fsImpl.fstatSync(fd);
     const pathStat = lockStat(fsImpl, lockPath);
     if (!sameFile(ownStat, pathStat)) fail("task_review_round_store_unsafe", "project writer lock changed during acquisition");
-    return { fd, lock_path: lockPath, stat: ownStat };
+    return { fd, lock_path: lockPath, stat: ownStat, token };
   } catch (error) {
     try { fsImpl.closeSync(fd); } catch {}
     // This cleanup is only for the just-created, never-returned lock.  It is
     // not stale-lock reaping: a mismatched replacement is retained fail-closed.
     try {
       const current = lockStat(fsImpl, lockPath);
-      if (sameFile(ownStat, current)) fsImpl.unlinkSync(lockPath);
+      if (sameFile(ownStat, current) && fsImpl.readFileSync(lockPath, "utf8") === token) fsImpl.unlinkSync(lockPath);
     } catch {}
     if (error instanceof TaskReviewRoundStoreError) throw error;
     fail("task_review_round_store_persist_failed", "could not initialize project writer lock");
@@ -324,7 +331,7 @@ function releaseProjectWriterLock(fsImpl, lock) {
   catch (error) { closeError = error; }
   try {
     const current = lockStat(fsImpl, lock.lock_path);
-    if (!sameFile(lock.stat, current)) fail("task_review_round_store_unsafe", "project writer lock changed before release");
+    if (!sameFile(lock.stat, current) || fsImpl.readFileSync(lock.lock_path, "utf8") !== lock.token) fail("task_review_round_store_unsafe", "project writer lock changed before release");
     fsImpl.unlinkSync(lock.lock_path);
   } catch (error) {
     if (error instanceof TaskReviewRoundStoreError) throw error;

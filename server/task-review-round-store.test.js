@@ -291,6 +291,45 @@ function rawStoredRound(store, ref) {
   fs.unlinkSync(lockPath);
 }
 
+// Linux reuses inode numbers eagerly, so a lock replaced after this writer
+// closed its descriptor can report the original dev+ino. The stubbed lstat
+// forces exactly that; only the lock token can then prove the replacement.
+{
+  const home = root("qw-task-review-round-inode-reuse-");
+  const normal = createTaskReviewRoundStore({ rootDir: home });
+  const opened = normal.openRound(openInput(candidate("7".repeat(64)), "attempt_inode_reuse"), assignments());
+  const lockPath = `${normal.pathFor(opened.review_round_ref)}.lock`;
+  let inspections = 0;
+  let original = null;
+  const replacingFs = new Proxy(fs, {
+    get(target, property) {
+      if (property !== "lstatSync") return Reflect.get(target, property);
+      return (inspected) => {
+        if (inspected !== lockPath) return target.lstatSync(inspected);
+        inspections += 1;
+        if (inspections === 1) {
+          original = target.lstatSync(inspected);
+          return original;
+        }
+        if (inspections === 2) {
+          target.unlinkSync(lockPath);
+          target.writeFileSync(lockPath, "replacement-writer-lock", { encoding: "utf8", mode: 0o600, flag: "wx" });
+        }
+        const stat = target.lstatSync(inspected);
+        stat.dev = original.dev;
+        stat.ino = original.ino;
+        return stat;
+      };
+    },
+  });
+  const writer = createTaskReviewRoundStore({ rootDir: home, fsImpl: replacingFs });
+  const re1Receipt = receipt(opened.review_round_ref, "receipt_re1_inode_reuse", "approve", [finding("finding_re1_inode_reuse")]);
+  throwsCode(() => writer.submitTrustedReceipt(opened.review_round_ref, opened.candidate_digest, re1Receipt,
+    reviewer("re1", 11, "2026-09-01T06:10:00.000Z")), "task_review_round_store_unsafe");
+  assert.equal(inspections, 2);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+}
+
 // Corrupt/unknown or oversized durable state fails closed for a new mutation.
 // The module does not repair, overwrite, prune, or delete the unsafe document.
 {

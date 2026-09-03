@@ -215,6 +215,10 @@ function headControlAuditStorePath(configDir, bindingValue) {
 }
 function lockPathFor(statePath) { return `${statePath}.lock`; }
 function temporaryPathFor(statePath) { return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`; }
+// The lock file body is this writer's proof of ownership. dev+ino alone cannot
+// prove it: Linux reuses an inode number as soon as the old lock is unlinked
+// and closed, so a replacement lock can carry the original's identity.
+function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
 function modeOf(stats) { return stats.mode & 0o777; }
 function lstatOrNull(fs, target) {
   try { return fs.lstatSync(target); } catch (error) {
@@ -319,6 +323,7 @@ function lockStats(fs, lockPath) {
 }
 function acquireLock(fs, statePath) {
   const lockPath = lockPathFor(statePath);
+  const token = lockToken();
   let descriptor;
   let ownStats = null;
   try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); } catch (error) {
@@ -329,6 +334,7 @@ function acquireLock(fs, statePath) {
     fail("head_control_audit_store_lock_failed", "audit store lock cannot be acquired");
   }
   try {
+    fs.writeFileSync(descriptor, token, "utf8");
     fs.chmodSync(lockPath, FILE_MODE);
     fs.fsyncSync(descriptor);
     ownStats = fs.fstatSync(descriptor);
@@ -337,18 +343,18 @@ function acquireLock(fs, statePath) {
     try { fs.closeSync(descriptor); } catch {}
     try {
       const current = lockStats(fs, lockPath);
-      if (sameFile(ownStats, current)) fs.unlinkSync(lockPath);
+      if (sameFile(ownStats, current) && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
     } catch {}
     if (error instanceof HeadControlAuditStoreError) throw error;
     fail("head_control_audit_store_lock_failed", "audit store lock cannot be initialized");
   }
-  return { descriptor, lockPath, stats: ownStats };
+  return { descriptor, lockPath, stats: ownStats, token };
 }
 function releaseLock(fs, lock) {
   let closeError = null;
   try { fs.closeSync(lock.descriptor); } catch (error) { closeError = error; }
   try {
-    if (!sameFile(lock.stats, lockStats(fs, lock.lockPath))) {
+    if (!sameFile(lock.stats, lockStats(fs, lock.lockPath)) || fs.readFileSync(lock.lockPath, "utf8") !== lock.token) {
       fail("head_control_audit_store_lock_release_failed", "audit store lock changed before release");
     }
     fs.unlinkSync(lock.lockPath);

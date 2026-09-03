@@ -211,6 +211,41 @@ withDirectory((directory) => {
   assert.equal(fs.lstatSync(lockPath).isFile(), true);
 });
 
+// Linux reuses inode numbers eagerly, so a lock replaced after this writer
+// closed its descriptor can report the original dev+ino. The stubbed lstat
+// forces exactly that; only the lock token can then prove the replacement.
+withDirectory((directory) => {
+  const { state } = initialized(directory);
+  const ref = state.manifest.tasks[0].ref;
+  const plan = planWorkTaskPipelineEvent(state.pipeline, event("assign_build", "inode_reuse_build", {
+    work_task_ref: copy(ref), assignment_id: "inode_reuse_assignment",
+  }));
+  const lockPath = `${workTaskPipelineStorePath(directory, owner)}.lock`;
+  let inspections = 0;
+  let original = null;
+  const replacingFs = Object.create(fs);
+  replacingFs.lstatSync = (target) => {
+    if (target !== lockPath) return fs.lstatSync(target);
+    inspections += 1;
+    if (inspections === 1) {
+      original = fs.lstatSync(target);
+      return original;
+    }
+    if (inspections === 2) {
+      fs.unlinkSync(lockPath);
+      fs.writeFileSync(lockPath, "replacement-writer-lock", { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+    }
+    const stats = fs.lstatSync(target);
+    stats.dev = original.dev;
+    stats.ino = original.ino;
+    return stats;
+  };
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs: replacingFs });
+  throwsCode(() => store.applyPlan({ expected: currentExpected(state), plan, terminal_disposition: null }), "work_task_pipeline_store_lock_release_failed");
+  assert.equal(inspections, 2);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+});
+
 // Missing, corrupt, and future-schema state all fail closed. In particular a
 // corrupt state cannot be silently replaced by an explicit initialization.
 withDirectory((directory) => {
