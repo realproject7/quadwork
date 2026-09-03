@@ -26,6 +26,7 @@ const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
 const { createAgentLifecycleGovernor } = require("./agent-lifecycle");
+const { captureRepositoryFacts } = require("./repository-facts");
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
 const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
@@ -1633,7 +1634,11 @@ async function recoverWorkerForHead(projectId, recovery) {
   }
   if (!lifecycle) return refuse("no_loss_evidence", { worker: facts });
   if (lifecycle.state === "stopped") return refuse("worker_stopped", { worker: facts });
-  if (!LOSS_LIFECYCLE_STATES.has(lifecycle.state)) return refuse("worker_unconfirmed", { health: "unknown", worker: facts });
+  // An admission the governor refused while opening the #1053 circuit leaves
+  // the lost generation recorded as `rejected`; the open circuit is that
+  // generation's unresolved loss, and the one explicit trial names it.
+  const lossEvidence = LOSS_LIFECYCLE_STATES.has(lifecycle.state) || (lifecycle.state === "rejected" && lifecycle.circuit?.open === true);
+  if (!lossEvidence) return refuse("worker_unconfirmed", { health: "unknown", worker: facts });
   if (lifecycle.generation_id !== recovery.expected_generation) return refuse("stale_expected_generation", { worker: facts });
   const result = await spawnAgentPty(projectId, recovery.agent, {
     suppressLifecycleMsg: true,
@@ -1642,8 +1647,9 @@ async function recoverWorkerForHead(projectId, recovery) {
     ...(lifecycle.circuit?.loss_correlation ? { lossCorrelation: lifecycle.circuit.loss_correlation } : {}),
   });
   const operation = result.lifecycle || null;
+  const repository = result.repository || null;
   if (!result.ok) {
-    return { applied: false, agent: recovery.agent, outcome: operation?.state || "rejected", reason: result.code || "launch_failed", recovered: false, operation };
+    return { applied: false, agent: recovery.agent, outcome: operation?.state || "rejected", reason: result.code || "launch_failed", recovered: false, operation, repository };
   }
   return {
     applied: true,
@@ -1653,7 +1659,26 @@ async function recoverWorkerForHead(projectId, recovery) {
     recovered: false,
     verification_state: operation?.verification_state || "unconfirmed",
     operation,
+    repository,
   };
+}
+
+// #1053: the read-only facts of the role worktree, joined with the PR/tip the
+// server already knows for each current work item.  Both are observations;
+// neither is acted on, and neither failure can block the recovery.
+async function recoveryRepositoryFacts(projectId, agentId) {
+  const repository = captureRepositoryFacts({ cwd: resolveAgentCwd(projectId, agentId) });
+  let knownPrs = [];
+  try {
+    const items = routes.readLiveBatchContext(projectId)?.parsed?.workItems || [];
+    const progress = await routes.getOrComputeBatchProgress(projectId);
+    const rows = Array.isArray(progress?.items) ? progress.items : [];
+    knownPrs = items.map((item) => {
+      const pr = progressRowFor(rows, item)?.live_pr;
+      return { subject: monitorSubjectKey(item), pr: pr ? { number: pr.number ?? null, tip: pr.tip ?? null } : null };
+    });
+  } catch { knownPrs = []; }
+  return { ...repository, known_prs: knownPrs };
 }
 
 // Deterministic server-test containment fixtures. They are an in-process
@@ -2369,6 +2394,16 @@ async function spawnAgentPty(project, agent, opts = {}) {
   }
   const testFixture = _lifecycleTestFixtures.get(`${project}/${agent}`) || null;
   const source = opts.lifecycleSource || "operator_start";
+  // #1053: a spawn after a recorded loss (or against an open circuit) is a
+  // recovery.  Capture the role worktree's read-only facts BEFORE admission
+  // and before any process exists, so dirty WIP, drift, or a missing worktree
+  // is reported rather than silently inherited.  Capture never blocks: a
+  // failure is itself a recorded `available: false` fact.
+  let previousLifecycle = null;
+  try { previousLifecycle = lifecycleGovernor.snapshot(project, agent); } catch {}
+  const repository = previousLifecycle && (LOSS_LIFECYCLE_STATES.has(previousLifecycle.state) || previousLifecycle.circuit?.open === true)
+    ? await recoveryRepositoryFacts(project, agent)
+    : null;
   const result = await lifecycleGovernor.launch({
     projectId: project,
     role: agent,
@@ -2403,14 +2438,15 @@ async function spawnAgentPty(project, agent, opts = {}) {
     // never changes the lifecycle outcome or initiates a replacement action.
     if (agent === "head") appendHeadRecoveryLifecycle(project, result.operation, source);
   }
-  if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation };
-  if (result.status === "verified") return { ok: true, lifecycle: result.operation };
+  if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation, repository };
+  if (result.status === "verified") return { ok: true, lifecycle: result.operation, repository };
   return {
     ok: false,
     code: result.reason || result.status,
     status: result.status === "rejected" ? 409 : 503,
     error: result.reason || "agent lifecycle launch failed",
     lifecycle: result.operation || null,
+    repository,
   };
 }
 
@@ -2791,12 +2827,13 @@ app.post("/api/agents/:project/:agent/start", async (req, res) => {
     lossCorrelation: typeof req.body?.loss_correlation === "string" ? req.body.loss_correlation : null,
   });
   if (result.ok) {
-    res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null });
+    res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null, ...(result.repository ? { repository: result.repository } : {}) });
   } else {
     res.status(result.status || (result.error?.includes("Unknown") ? 400 : 500)).json({
       ok: false,
       state: result.lifecycle?.state || "rejected",
       ...(result.code ? { code: result.code } : {}),
+      ...(result.repository ? { repository: result.repository } : {}),
       error: result.error,
       ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}),
     });
@@ -2876,9 +2913,9 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
     }); // #825
     if (result.ok) {
       emitSystemMessage(project, `${agent} restarted`);
-      res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null });
+      res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null, ...(result.repository ? { repository: result.repository } : {}) });
     } else {
-      res.status(result.status || 500).json({ ok: false, state: result.lifecycle?.state || "rejected", ...(result.code ? { code: result.code } : {}), error: result.error, ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}) });
+      res.status(result.status || 500).json({ ok: false, state: result.lifecycle?.state || "rejected", ...(result.code ? { code: result.code } : {}), error: result.error, ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}), ...(result.repository ? { repository: result.repository } : {}) });
     }
   } catch (err) {
     if (err instanceof ProjectLifecycleError) return respondLifecycleFailure(res, err, { state: "error" });
