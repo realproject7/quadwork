@@ -71,11 +71,17 @@ Only Head may originate this record. Generic prose, monitor output, Dev fanout, 
 
 RE1 and RE2 review independently and return evidence-bound APPROVE, REQUEST CHANGES, or BLOCK verdicts to Head, followed by qualified terminal status. Head, not Dev, edits ticket specs, files follow-ups, posts merged-PR summaries, updates review item state, and closes the review batch.
 
-## Implementation review compatibility
+## Implementation review dispatch
 
-Before the server advertises #1048 implementation-review dispatch support, the installed V1 route remains authoritative: Dev sends the single legacy implementation-PR fanout to `@re1 @re2`, reviewers report to Dev and Head, and Dev reports the dual-verdict state to Head. Head must not duplicate that fanout manually.
+The server's exact-SHA review cycle (#1048) is the only implementation-review route. For a ready, non-draft PR with CI pending or passing it writes one system-origin `@re1 @re2 [REVIEW REQUEST] repo=<key> issue=<n> contract=<sha256> pr=<n> sha=<sha> cycle=<id>`, one targeted `[REVIEW REMINDER]` to a lone outstanding reviewer, and `@head [MERGE GATE DUE] ...` only at `2/2` server-bound receipts, passing CI, and mergeability at that SHA. Never hand-fan reviewers, imitate these records, or count chat prose as a verdict. A new SHA replaces the cycle; `@head [CONTRACT CHANGED] ...` requires a fresh assignment attempt before review resumes.
 
-Once the server advertises the feature, only its exact-SHA implementation-review dispatch is valid. Head requests dispatch through the advertised service and never hand-fans reviewers. Do not assume or imitate an unadvertised future capability.
+## WorkTask batches
+
+A WorkTask is your immutable execution slice inside one ticket. Write the manifest with `put_batch_manifest`, freeze it with `freeze_batch_manifest`, assign one queued task at a time with `assign_work_task_build`, open the sealed two-reviewer round with `open_work_task_independent_review`, and advance it with `reconcile_work_task_review` after both receipts. Relay each returned identity to the role that acts next; the server sends no worker message. A task candidate is local: `accepted`/`staged` never means pushed, merged, or closed. Cut with `cut_batch` only through accepted tasks in manifest order. Never edit an assigned task, read a sealed receipt, or substitute a reviewer.
+
+## Batch Requests
+
+A system-origin `@head [BATCH REQUEST] request=<uuid> issue=<url> source=<installation-id> mode=<mode> start=<policy>` is a notice, not authority. Re-read the live Issue by number, validate its `quadwork-batch-request` fence against the notice and the registered repositories, then explicitly queue it into a normal future batch, hold it, or report `BLOCKED`. Before closing the Request Issue, append one `## Completion report` with exact PR URLs/SHAs, terminal CI/test evidence, and any remaining gate or blocker.
 
 ## Local Delivery Candidate
 

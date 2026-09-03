@@ -95,16 +95,78 @@ for (const [name, text] of [["playbook", playbook], ["docs", reviewDocs]]) {
   assert.ok(text.includes("#1048"), `${name} preserves implementation-review routing`);
 }
 
-for (const text of [dev, re1, re2, head, playbook, reviewDocs]) {
-  assert.ok(text.includes("#1048"), "implementation route cutover is explicitly feature-gated");
-  assert.match(text, /installed V1|V1 route|V1 fanout/i, "pre-#1048 compatibility remains documented");
+// #1048 cutover: the server's exact-SHA dispatcher is the sole implementation
+// review route. No seed may keep the V1 `@re1 @re2` fanout or an "until
+// advertised" dual route.
+const reviewRequest = "@re1 @re2 [REVIEW REQUEST] repo=<key> issue=<n> contract=<sha256> pr=<n> sha=";
+for (const [name, text] of [["head", head], ["dev", dev], ["re1", re1], ["re2", re2], ["playbook", playbook]]) {
+  assert.ok(text.includes("#1048"), `${name} names the dispatcher ticket`);
+  assert.ok(text.includes(reviewRequest), `${name} carries the server review request record`);
+  if (name !== "re1" && name !== "re2") assert.ok(text.includes("[MERGE GATE DUE]"), `${name} names the Head gate event`);
+  assert.doesNotMatch(text, /installed V1|V1 route|V1 fanout|until (?:the server )?advertise|before the server advertises #1048/i,
+    `${name} leaves no pre-#1048 dual route`);
 }
+assert.ok(dev.includes("never @mention reviewers for a PR"), "Dev seed forbids reviewer fanout");
+assert.ok(!dev.includes("@re1 @re2 please review"), "Dev seed drops the legacy fanout example");
+for (const [name, seed] of [["re1", re1], ["re2", re2]]) {
+  assert.ok(seed.includes("issue_review_cycle_nonce") && seed.includes("submit_review_cycle_receipt"),
+    `${name} binds its verdict through the nonce receipt`);
+  assert.ok(seed.includes("your old receipt\nnever carries forward"), `${name} never carries an old-SHA verdict forward`);
+}
+assert.ok(playbook.includes("[CONTRACT CHANGED]") && head.includes("[CONTRACT CHANGED]"),
+  "Head learns the contract-change cycle invalidation");
+
+// #1046: Head owns the Batch Request decision and completion report.
+const batchRequest = "@head [BATCH REQUEST] request=<uuid> issue=";
+for (const [name, text] of [["head", head], ["playbook", playbook]]) {
+  assert.ok(text.includes(batchRequest), `${name} carries the Batch Request notice`);
+  assert.ok(text.includes("## Completion report"), `${name} requires the completion report before closure`);
+  assert.match(text, /re-read the live issue/i, `${name} requires a live re-read`);
+  assert.ok(text.includes("BLOCKED"), `${name} allows a BLOCKED decision`);
+}
+assert.match(playbook, /queue[\s\S]{0,200}hold[\s\S]{0,200}BLOCKED/i, "playbook lists queue, hold, and BLOCKED");
+assert.ok(playbook.includes("quadwork:batch-request") && playbook.includes("quadwork-batch-request/v1"),
+  "playbook names the real label and schema");
+
+// #1058: Dev knows what a WorkTask is and that a candidate never publishes.
+assert.ok(dev.includes("submit_work_task_candidate"), "Dev seed names the candidate submission tool");
+assert.match(dev, /never `git push`es, opens a PR, starts CI, merges/, "Dev seed forbids candidate publication");
+for (const tool of ["put_batch_manifest", "freeze_batch_manifest", "assign_work_task_build", "open_work_task_independent_review", "reconcile_work_task_review", "cut_batch"]) {
+  assert.ok(head.includes(tool) && playbook.includes(tool), `Head seeds name ${tool}`);
+}
+const queue = read("templates/OVERNIGHT-QUEUE.md");
+assert.ok(queue.includes("- owner/repo#<n> — <state>"), "queue rules carry the repository-qualified item grammar");
+assert.ok(queue.includes("  - <task_key> — <state>"), "queue rules carry the nested task grammar");
+assert.ok(!queue.includes("One ticket assigned to Dev at a time"), "queue rules are no longer ticket-serial");
+for (const state of ["candidate_ready", "independent_review", "staged", "deferred"]) {
+  assert.ok(queue.includes(state) && playbook.includes(state), `task state ${state} is taught`);
+}
+
+// #1059: reviewers seal an independent receipt and never read the peer's.
+const workTaskReview = (seed) => seed.slice(seed.indexOf("## WorkTask review rounds\n"), seed.indexOf("## Review-only batches\n"));
+for (const [name, seed] of [["re1", re1], ["re2", re2]]) {
+  const section = workTaskReview(seed);
+  assert.ok(section.includes("submit_work_task_review_receipt"), `${name} names the receipt tool`);
+  assert.ok(section.includes("Seal your first pass before anything else is said"), `${name} seals before discussing`);
+  assert.ok(section.includes("Post no finding detail in chat while the round is sealed"), `${name} keeps sealed findings private`);
+  assert.ok(section.includes("A new candidate SHA cancels the round and both receipts"), `${name} drops receipts on retip`);
+  assert.doesNotMatch(section, /wait for (?:re1|re2)|read (?:re1|re2)'s verdict|after (?:re1|re2) (?:approves|submits)/i,
+    `${name} never defers to the peer reviewer`);
+}
+assert.equal(
+  workTaskReview(re1).replaceAll("RE1", "REVIEWER").replaceAll("RE2", "PEER"),
+  workTaskReview(re2).replaceAll("RE2", "REVIEWER").replaceAll("RE1", "PEER"),
+  "RE1 and RE2 carry symmetric WorkTask review protocols",
+);
 assert.match(playbook, /\*\*Playbook version:\*\*\s+\d+\.\d+\.\d+/);
 for (const phase of ["Intake and proposal", "EPIC and ticket founding", "Ticket-review phase", "PR gate and merge", "Release and operator gates", "Terminal handoff"]) {
   assert.ok(playbook.includes(phase), `playbook includes ${phase}`);
 }
-assert.doesNotMatch(allContracts, /task_key/i,
-  "later execution schema internals are not predeclared in role contracts");
+// #1058 shipped the WorkTask schema (`server/work-task-manifest.js`), so role
+// contracts may now teach `task_key`; what they may not carry is placeholder
+// text for undefined protocol.
+assert.doesNotMatch(allContracts, /\bTBD\b|to be defined|placeholder protocol/i,
+  "role contracts carry no placeholder protocol");
 assert.ok(head.includes("prepare_delivery_candidate") && head.includes("compose_delivery_candidate") && head.includes("plan_delivery_candidate_publication") && head.includes("open_delivery_candidate_final_review"),
   "Head seed documents the advertised Delivery Candidate tools without exposing their internal schema");
 assert.ok(head.includes("Never construct a Delivery Candidate reference"),

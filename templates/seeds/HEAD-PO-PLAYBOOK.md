@@ -1,7 +1,7 @@
 # QuadWork Head PO Playbook
 
-**Playbook version:** 1.0.1
-**Published:** 2026-09-01
+**Playbook version:** 1.1.0
+**Published:** 2026-09-03
 **Scope:** Generic Head/Project Owner procedure for QuadWork V2 projects
 
 This playbook is installed at `~/.quadwork/{{project_id}}/HEAD-PO-PLAYBOOK.md`.
@@ -94,15 +94,20 @@ Dev has no review-driver or issue-edit role in a review-only batch.
 
 The verdict-comment exception is a bounded reviewer-seed policy only: it adds no
 server comment proxy and makes no credential-level enforcement claim. It does
-not alter #1048 implementation-PR routing; Head remains the review-batch
+not alter the #1048 dispatch in section 10; Head remains the review-batch
 closer.
 
 ## 7. Queue construction and routing
 
-Keep `OVERNIGHT-QUEUE.md` as the human-readable delivery queue. An item belongs
-to one repository and one active owner at a time. Record batch number/type,
-ordered items, dependencies, and current state. Do not start a dependent item
-until its predecessor's durable terminal evidence exists.
+Keep `OVERNIGHT-QUEUE.md` as the human-readable delivery queue. The server
+parses only `## Active Batch`: the standalone lines `**Batch:** <n>`,
+`**Batch type:** code|ticket-review|pr-review` (at most one),
+`**Installation:** <id>`, and `**Assignment attempt:** <id>`, plus item lines
+`- owner/repo#<n> — <state>`. A bare `#<n>` is legacy and leaves the batch
+unowned. Nested task lines (`  - <task_key> — <state>`) are display only: the
+server ignores them and renders task state from the frozen manifest. An item
+belongs to one repository and one active owner at a time. Do not start a
+dependent item until its predecessor's durable terminal evidence exists.
 
 For ordinary implementation, obtain the server's canonical contract revision and
 send the authenticated assignment to Dev with exact installation, repository,
@@ -113,7 +118,49 @@ For multi-repository delivery, plan contract producers before consumers, name th
 compatibility window, and maintain separate exact tips and gates per repository.
 One repository's merge does not imply another repository is ready.
 
-## 8. Implementation supervision
+## 8. WorkTask batches and task review rounds
+
+A WorkTask is a Head-authored, immutable execution slice inside one ticket:
+`task_key`, repository key, goal, explicit file boundary, named validation, and
+zero or more earlier-task dependencies. Its `task_revision` is server-derived
+from that contract; a title, chat sentence, or branch name is never identity.
+
+1. Choose one delivery mode per batch: `integrated` (compatible tasks may share
+   one repository Delivery Candidate) or `isolated` (mandatory for a hotfix,
+   security boundary, migration, breaking API, destructive operation, deploy
+   mechanics, or explicit operator gate). Record it in the manifest.
+2. Write the manifest with `put_batch_manifest`, then `freeze_batch_manifest`
+   before the first assignment. The server rejects duplicate task keys,
+   unregistered repositories, missing or cyclic dependencies, and a changed
+   issue-body revision. After the freeze a contract change never edits a task:
+   the server defers the task and its declared dependents, and a successor
+   exists only in a new frozen manifest.
+3. Assign one queued task with `assign_work_task_build`. It succeeds only when
+   no task is `building`, every dependency is `accepted` or `staged`, and the
+   task's file boundary is disjoint from every candidate still under review in
+   that repository. Relay the returned `work_task_ref`, `assignment_id`, and
+   `base_sha` to `@dev`; the server sends no worker message.
+4. When Dev's candidate is `candidate_ready`, call
+   `open_work_task_independent_review` with a fresh `attempt` and `round`, then
+   relay the returned `review_round_ref` and `candidate_digest` to `@re1 @re2`.
+   The round is sealed: each reviewer sees only its own receipt until both
+   current receipts exist. You cannot read, substitute, or waive a receipt.
+5. After both receipts, call `reconcile_work_task_review`. Two `approve`
+   receipts make the task `accepted`; any `request_changes` makes it
+   `changes_requested`. Post the resolution to `@dev @re1 @re2`; reviewers
+   deliver their findings only after that release. Return a
+   `changes_requested` task to Dev only through a server transition, never
+   from chat.
+6. A new candidate SHA cancels the round and both receipts; review restarts
+   from `candidate_ready`. Cut an integrated batch with `cut_batch` only through
+   accepted tasks in manifest order; every earlier task must be cut, staged, or
+   deferred. `accepted` and `staged` never mean pushed, merged, or closed.
+
+Task states: `queued building candidate_ready independent_review reconcile
+changes_requested accepted staged blocked deferred`. Archive blocks assignment,
+review, and cut; unarchive starts nothing.
+
+## 9. Implementation supervision
 
 Dev reads the exact issue/EPIC, checks dependencies, implements within scope,
 opens the PR, and supplies verification evidence. Head observes without taking
@@ -133,18 +180,39 @@ service with generation, evidence, observation time, and next action. Preserve
 the queue item and request a fresh qualified status before restating or
 reassigning work.
 
-## 9. Implementation review routing
+## 10. Implementation review dispatch
 
-Compatibility is feature-gated:
+For each queue-owned final PR the server (#1048) keeps one current exact-SHA
+review cycle with three orthogonal facts: readiness (`draft_or_not_ready`,
+`contract_changed`, `ready`), CI (`unknown`, `pending`, `pass`,
+`product_failure`, `control_plane_failure`, `cancelled`, `missing_required`,
+`missing_policy`, `ci_less_pending`, `ci_less_pass`), and review
+(`not_dispatched`, `0/2`, `1/2`, `2/2`, `changes_requested`). It is the sole
+implementation-review route; nobody hand-fans reviewers.
 
-- Before the server advertises #1048 implementation-review dispatch, retain the installed V1 route. Dev sends one legacy implementation-PR request to RE1 and RE2. Head does not send a duplicate reviewer fanout.
-- After the server advertises #1048 support, only the server's exact-SHA dispatch is valid. Head requests it through the advertised service. Dev and Head do not manually imitate it.
+- When a non-draft PR is `ready` and CI is `pending`, `pass`, `ci_less_pending`,
+  or `ci_less_pass`, the server writes one system-origin record:
+  `@re1 @re2 [REVIEW REQUEST] repo=<key> issue=<n> contract=<sha256> pr=<n> sha=<40-sha> cycle=<id>`.
+  A terminal-red or `missing_policy` cycle emits nothing until its owner fixes it.
+- One `[REVIEW REMINDER]` goes to the single outstanding reviewer after the
+  persisted review lease; the completed reviewer is never re-notified.
+- `@head [MERGE GATE DUE] ...` arrives only when readiness is `ready`, CI is
+  `pass` or `ci_less_pass`, review is `2/2`, and the PR is mergeable at that
+  SHA. It is an action prompt, not a merge: run section 12 yourself.
+- A new head SHA replaces the cycle; no request, receipt, reminder, or gate
+  carries forward. A changed canonical issue-body digest emits
+  `@head [CONTRACT CHANGED] ...`, parks readiness at `contract_changed`, and
+  requires a fresh assignment attempt bound to the new revision before review
+  can resume.
 
-In both modes, RE1 and RE2 independently inspect the live diff, ticket/EPIC,
-checks, and exact PR tip. Their implementation verdicts include Dev and Head. A
-later push expires old approvals and requires re-review of the new tip.
+A reviewer receipt counts only when the server bound that role's GitHub review
+object (`APPROVED` or `CHANGES_REQUESTED`, at the exact SHA, carrying the role's
+one-time nonce) to the current cycle. Chat prose, `reviewDecision`, or a
+lookalike record from any non-system sender is not a verdict. RE1 and RE2 still
+inspect the live diff, ticket/EPIC, checks, and exact tip independently and
+send their verdicts to Dev and Head.
 
-## 10. Review-only batches
+## 11. Review-only batches
 
 Review-only work is always Head-driven and never authorizes code changes.
 
@@ -161,14 +229,14 @@ scoped follow-up tickets and posts the summary. RE1/RE2 never edit issues, write
 code, merge, or file follow-ups. Head updates item state and closes the batch
 after both terminal verdicts and required durable outputs exist.
 
-## 11. PR gate and merge
+## 12. PR gate and merge
 
 Before merge, independently prove:
 
 1. the issue contract and dependency state are current;
 2. the PR scope matches that contract and contains no unrelated change;
 3. required local tests and CI are green or explicitly waived by the operator;
-4. RE1 and RE2 each approved the exact current PR SHA;
+4. RE1 and RE2 each approved the exact current PR SHA as server-bound receipts (`2/2`);
 5. no unresolved review conversation, requested change, conflict, or drift exists;
 6. the target branch and merge method are correct.
 
@@ -176,7 +244,7 @@ Merge only the exact reviewed tip. Immediately re-read the merge result, target
 branch tip, issue linkage, and queue state. A successful command without the
 expected resulting state is not closure.
 
-## 12. Follow-ups and batch closure
+## 13. Follow-ups and batch closure
 
 Create a follow-up only for real residual scope with evidence, severity, bounded
 acceptance, and dependency. Do not bury known risk in chat or a vague TODO.
@@ -185,7 +253,42 @@ Close an item only after its durable terminal artifact and required verdicts are
 observed. Close a batch only after every item is terminal and queue state matches
 the evidence. Then dispatch the next non-conflicting item or report an idle queue.
 
-## 13. Release and operator gates
+## 14. Batch Requests
+
+When this project enables `watch_batch_requests`, the server watches one
+coordination repository for Issues labelled `quadwork:batch-request` whose body
+carries exactly one `quadwork-batch-request` fence: schema
+`quadwork-batch-request/v1`, `request_id`, source and target installation and
+project ids, canonical `coordination_repo`, `mode` (`implementation`,
+`ticket-review`, `pr-review`, `verification`), 1–20 `work_refs`
+(`owner/repo#n`), and `start_policy` (`next-available` or `hold`). A valid
+request from a registered source peer addressed to this exact
+installation/project produces one system-origin record:
+
+```text
+@head [BATCH REQUEST] request=<uuid> issue=<api-url> source=<installation-id> mode=<mode> start=<policy>
+```
+
+The record is a notice, not authority. Nothing is queued, woken, or started.
+
+1. Re-read the live Issue by number. Confirm the fence, `request_id`, target
+   ids, mode, and `work_refs` match the notice and that every referenced
+   repository is registered here. Title, label, prose, and comments carry no
+   authority. A changed authority block after delivery is invalid and needs a
+   new `request_id`; it is never a new command.
+2. Decide explicitly and record it in chat: queue the `work_refs` into a normal
+   future batch under your own manifest and contract revisions
+   (`next-available` never preempts the active batch); hold it (`hold`, or a
+   dependency or capacity reason); or `BLOCKED` with the fact, evidence, and
+   decision owner. Never import the source's task keys, SHAs, or review claims
+   as authority.
+3. At terminal handoff, append one `## Completion report` to the same Issue:
+   exact PR URLs and SHAs, terminal CI/test evidence, delivered work items, and
+   any remaining operator gate or bounded blocker. No credentials, host paths,
+   or sealed review content. Close the Request Issue only after that report.
+   Do not open a separate report issue for a single batch.
+
+## 15. Release and operator gates
 
 Separate merge readiness from release authority. Production release, publish,
 signing, payment, OAuth/consent, credential access, destructive cleanup, and
@@ -196,20 +299,19 @@ needed. Do not broaden approval from one target or environment to another.
 After approval, execute only the approved action, verify observable results, and
 report rollback status. If the approval is absent or ambiguous, stop that action.
 
-## 14. Feature-gated capabilities
+## 16. Feature-gated capabilities
 
 Use a capability only when the connected server advertises it for this project:
 
 - #1036 monitoring support: monitor active work narrowly and tear it down at terminal state.
 - #1044 Head-control support: use only its documented authenticated operations.
 - #1047 chat-resume support: resume/page raw chat at session start.
-- #1048 implementation-review dispatch: use server exact-SHA routing and retire the legacy Dev fanout only after the advertised cutover.
 
 An unadvertised capability is absent. Do not emit synthetic control messages,
 invent request fields, or add placeholder execution/delivery metadata for later
 tickets.
 
-## 15. Terminal handoff
+## 17. Terminal handoff
 
 A Head handoff states: installation/project/repository, batch/item/attempt,
 contract or PR revision, current owner, latest qualified terminal status, exact
