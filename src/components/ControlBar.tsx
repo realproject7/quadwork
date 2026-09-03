@@ -887,7 +887,7 @@ interface ControlBarProps {
 
 export default function ControlBar({ projectId, idle = false }: ControlBarProps) {
   // #210: Keep Alive moved to the Scheduled Trigger widget in the
-  // bottom-right Operator Features quadrant. ControlBar now only
+  // Operator Features panel (right rail). ControlBar now only
   // carries the server lifecycle + system controls.
   return (
     <div className="border-t border-border px-3 py-2">

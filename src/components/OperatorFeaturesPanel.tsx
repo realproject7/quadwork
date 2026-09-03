@@ -18,6 +18,8 @@ const COPY = {
         <b>Operator Features</b> — tools for running autonomous overnight batches. Includes the Scheduled Trigger, Telegram Bridge, Discord Bridge, Loop Guard, Project History, and Agent Models.
       </>
     ),
+    hide: "Hide",
+    show: "Show",
   },
   ko: {
     label: "운영자 기능",
@@ -26,19 +28,30 @@ const COPY = {
         <b>운영자 기능</b> - 야간 자율 배치를 운영할 때 쓰는 도구 모음입니다. Scheduled Trigger, Telegram Bridge, Discord Bridge, Loop Guard, Project History, Agent Models가 포함됩니다.
       </>
     ),
+    hide: "접기",
+    show: "펼치기",
   },
 } as const;
 
+interface OperatorFeaturesPanelProps {
+  projectId: string;
+  idle?: boolean;
+  /** #1052: vertical collapse state is owned by ProjectDashboard (persisted per project). */
+  expanded: boolean;
+  onToggle: () => void;
+  bodyId: string;
+}
+
 /**
- * Bottom-right quadrant of the project dashboard (#208).
+ * Bottom panel of the project dashboard's right rail (#208, #1052).
  *
  * Hosts the operator-only widgets:
  *   - #210 Scheduled Trigger
  *   - #211 Telegram Bridge
  *
  * #226: OVERNIGHT-QUEUE.md viewer/editor moved to a compact row at
- * the bottom of the GitHub panel (bottom-left quadrant) — click Edit
- * there to open the modal.
+ * the bottom of the GitHub panel (the middle right-rail panel) — click
+ * Edit there to open the modal.
  *
  * #351: two-column layout at lg+ widths — Scheduled Trigger gets
  * the full-height left column (primary surface during an
@@ -48,18 +61,28 @@ const COPY = {
  * independently if the stack exceeds panel height. Below lg the
  * layout collapses back to the single-column stack so nothing
  * clips in cramped split-view / mobile.
+ *
+ * #1052: collapsing hides the widget body (display:none) — widgets stay
+ * mounted, so Project Monitor, bridges, and batch execution are untouched.
  */
-export default function OperatorFeaturesPanel({ projectId, idle = false }: { projectId: string; idle?: boolean }) {
+export default function OperatorFeaturesPanel({ projectId, idle = false, expanded, onToggle, bodyId }: OperatorFeaturesPanelProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   return (
     <div className="flex flex-col h-full min-h-0">
-      <PanelHeader label={t.label} tooltip={
-        <InfoTooltip>
-          {t.tooltip}
-        </InfoTooltip>
-      } />
-      <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-2 p-2 overflow-auto lg:overflow-hidden">
+      <PanelHeader
+        label={t.label}
+        collapse={{ expanded, onToggle, bodyId, hideLabel: t.hide, showLabel: t.show }}
+        tooltip={
+          <InfoTooltip>
+            {t.tooltip}
+          </InfoTooltip>
+        }
+      />
+      <div
+        id={bodyId}
+        className={expanded ? "flex-1 min-h-0 flex flex-col lg:flex-row gap-2 p-2 overflow-auto lg:overflow-hidden" : "hidden"}
+      >
         {/* Left column: Scheduled Trigger spans full panel height.
             min-w-[280px] at lg+ keeps the message textarea from
             collapsing below a usable width when the panel is

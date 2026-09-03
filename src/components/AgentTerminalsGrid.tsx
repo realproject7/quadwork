@@ -1,10 +1,9 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
+import PanelHeader from "./PanelHeader";
 import TerminalGrid from "./TerminalGrid";
 import { useLocale } from "@/components/LocaleProvider";
-
-const STORAGE_KEY = "qw-terminals-collapsed";
 
 const COPY = {
   en: {
@@ -12,18 +11,18 @@ const COPY = {
     aboutLabel: "About agent terminals",
     tooltip: (
       <>
-        These show what each agent is doing in their CLI session. <b>Do not type here directly</b> — use the project chat above instead. Agents won&apos;t see messages typed in their terminals.
+        These show what each agent is doing in their CLI session. <b>Do not type here directly</b> — use the project chat instead. Agents won&apos;t see messages typed in their terminals.
       </>
     ),
-    hide: "hide",
-    show: "show",
+    hide: "Hide",
+    show: "Show",
   },
   ko: {
     title: "에이전트 터미널",
     aboutLabel: "에이전트 터미널 설명",
     tooltip: (
       <>
-        각 에이전트가 CLI 세션에서 무엇을 하고 있는지 보여주는 읽기 전용 터미널입니다. <b>여기에 직접 입력하지 마세요.</b> 위의 프로젝트 채팅을 사용해야 에이전트가 메시지를 볼 수 있습니다.
+        각 에이전트가 CLI 세션에서 무엇을 하고 있는지 보여주는 읽기 전용 터미널입니다. <b>여기에 직접 입력하지 마세요.</b> 프로젝트 채팅을 사용해야 에이전트가 메시지를 볼 수 있습니다.
       </>
     ),
     hide: "접기",
@@ -31,7 +30,7 @@ const COPY = {
   },
 } as const;
 
-// #208: the top-right quadrant must show all four agents
+// #208: the Agent Terminals panel must show all four agents
 // (Head, RE1, RE2, Dev) as a 2x2 grid. TerminalGrid's
 // default agent list only has three entries (RE1, RE2,
 // Dev) because it used to live alongside a dedicated Head panel —
@@ -57,61 +56,35 @@ interface AgentTerminalsGridProps {
   projectId: string;
   agentStates: Record<string, AgentState>;
   onStatusChange?: (agent: string, state: string) => void;
-  onCollapsedChange?: (collapsed: boolean) => void;
+  /** #1052: vertical collapse state is owned by ProjectDashboard (persisted per project). */
+  expanded: boolean;
+  onToggle: () => void;
+  bodyId: string;
 }
 
 /**
- * Top-right quadrant of the project dashboard (#208).
+ * Top panel of the project dashboard's right rail (#208, #1052).
  *
  * Wraps the existing TerminalGrid 2x2 with a header and a ? tooltip
  * that tells operators the terminals are read-only status mirrors —
- * real communication happens through the project chat panel in
- * the top-left quadrant. Without this hint, users try to type into
+ * real communication happens through the Primary Chat panel in
+ * the left column. Without this hint, users try to type into
  * the terminals and their messages are lost to the other agents.
+ *
+ * #668/#1052: collapsing unmounts only the read-only browser terminal
+ * viewers (they reconnect on expand); it never touches an agent PTY.
  */
-export default function AgentTerminalsGrid({ projectId, agentStates, onStatusChange, onCollapsedChange }: AgentTerminalsGridProps) {
+export default function AgentTerminalsGrid({ projectId, agentStates, onStatusChange, expanded, onToggle, bodyId }: AgentTerminalsGridProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [tipOpen, setTipOpen] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
-  const [hydrated, setHydrated] = useState(false);
-
-  // Load saved preference after mount to avoid hydration mismatch
-  useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY) === "true";
-    setCollapsed(saved);
-    setHydrated(true);
-  }, []);
-
-  // Persist to localStorage only after hydration
-  useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, String(collapsed));
-    onCollapsedChange?.(collapsed);
-  }, [collapsed, hydrated, onCollapsedChange]);
-
-  if (collapsed) {
-    return (
-      <div className="flex flex-col h-full min-h-0">
-        <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
-          <span className="text-[11px] text-text-muted uppercase tracking-wider">{t.title}</span>
-          <button
-            type="button"
-            onClick={() => setCollapsed(false)}
-            className="text-[10px] text-text-muted hover:text-text transition-colors"
-          >
-            ▸ {t.show}
-          </button>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
-        <div className="flex items-center gap-1.5">
-          <span className="text-[11px] text-text-muted uppercase tracking-wider">{t.title}</span>
+      <PanelHeader
+        label={t.title}
+        collapse={{ expanded, onToggle, bodyId, hideLabel: t.hide, showLabel: t.show }}
+        tooltip={
           <div
             // #399 / quadwork#264: inline-flex+items-center so the
             // (?) button vertically centers with the title text. The
@@ -137,23 +110,18 @@ export default function AgentTerminalsGrid({ projectId, agentStates, onStatusCha
               </div>
             )}
           </div>
+        }
+      />
+      {expanded && (
+        <div id={bodyId} className="flex-1 min-h-0">
+          <TerminalGrid
+            projectId={projectId}
+            agents={FOUR_AGENTS}
+            agentStates={agentStates}
+            onStatusChange={onStatusChange}
+          />
         </div>
-        <button
-          type="button"
-          onClick={() => setCollapsed(true)}
-          className="text-[10px] text-text-muted hover:text-text transition-colors"
-        >
-          ▾ {t.hide}
-        </button>
-      </div>
-      <div className="flex-1 min-h-0">
-        <TerminalGrid
-          projectId={projectId}
-          agents={FOUR_AGENTS}
-          agentStates={agentStates}
-          onStatusChange={onStatusChange}
-        />
-      </div>
+      )}
     </div>
   );
 }

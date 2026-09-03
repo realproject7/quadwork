@@ -761,7 +761,7 @@ export default function SettingsPage() {
     setSaving(true);
     try {
       // #212: Telegram credentials are now configured per-project from
-      // the bottom-right Telegram Bridge widget (#211), which writes
+      // the Telegram Bridge widget in the Operator Features panel (#211), which writes
       // its own env-references via /api/telegram?action=save-config.
       // The Settings save path no longer needs to migrate bot tokens.
       // #931: normalize every per-agent model to one valid for its command
@@ -1781,8 +1781,8 @@ export default function SettingsPage() {
 
                   {/* #212: Scheduled Trigger and Telegram Bridge sections
                        were here. Both have been moved to per-project
-                       widgets in the bottom-right Operator Features
-                       quadrant (#210 + #211). Configure them from
+                       widgets in the Operator Features
+                       panel (#210 + #211). Configure them from
                        the project page. */}
 
                   {/* Remove project */}

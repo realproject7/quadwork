@@ -168,7 +168,7 @@ async function callTelegram(action: string, body: Record<string, unknown>) {
 /**
  * Per-project Telegram Bridge widget (#211).
  *
- * Lives in the bottom-right Operator Features quadrant. Shows
+ * Lives in the Operator Features panel (right rail, #1052). Shows
  * whether the bridge is running + chat id, and gives the operator
  * start/stop + a setup modal to configure bot_token + chat_id from
  * scratch.
