@@ -132,9 +132,10 @@ from that contract; a title, chat sentence, or branch name is never identity.
 2. Write the manifest with `put_batch_manifest`, then `freeze_batch_manifest`
    before the first assignment. The server rejects duplicate task keys,
    unregistered repositories, missing or cyclic dependencies, and a changed
-   issue-body revision. After the freeze a contract change never edits a task:
-   the server defers the task and its declared dependents, and a successor
-   exists only in a new frozen manifest.
+   issue-body revision. After the freeze a contract change never edits a task.
+   No server path applies one today, so treat a changed contract as your own
+   decision: stop assigning the affected task and its declared dependents, and
+   carry the successor into a new frozen manifest.
 3. Assign one queued task with `assign_work_task_build`. It succeeds only when
    no task is `building`, every dependency is `accepted` or `staged`, and the
    task's file boundary is disjoint from every candidate still under review in
@@ -151,8 +152,11 @@ from that contract; a title, chat sentence, or branch name is never identity.
    deliver their findings only after that release. Return a
    `changes_requested` task to Dev only through a server transition, never
    from chat.
-6. A new candidate SHA cancels the round and both receipts; review restarts
-   from `candidate_ready`. Cut an integrated batch with `cut_batch` only through
+6. A released round is never cancelled or rewritten. A correction reopens the
+   task, Dev builds a candidate whose digest must differ, and re-review opens a
+   new round bound to that new SHA; the first-pass round stays released with
+   both sealed receipts as durable evidence. Cut an integrated batch with
+   `cut_batch` only through
    accepted tasks in manifest order; every earlier task must be cut, staged, or
    deferred. `accepted` and `staged` never mean pushed, merged, or closed.
 

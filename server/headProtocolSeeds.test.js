@@ -149,7 +149,14 @@ for (const [name, seed] of [["re1", re1], ["re2", re2]]) {
   assert.ok(section.includes("submit_work_task_review_receipt"), `${name} names the receipt tool`);
   assert.ok(section.includes("Seal your first pass before anything else is said"), `${name} seals before discussing`);
   assert.ok(section.includes("Post no finding detail in chat while the round is sealed"), `${name} keeps sealed findings private`);
-  assert.ok(section.includes("A new candidate SHA cancels the round and both receipts"), `${name} drops receipts on retip`);
+  // A released receipt is durable evidence. No `replace_candidate` producer and
+  // no `cancelFromTrustedState` caller exist, so a seed that promised retip
+  // cancellation described behaviour the server does not have; assert the real
+  // contract instead — a corrected candidate opens a NEW round on its new SHA
+  // and an earlier verdict never carries forward to it.
+  assert.ok(section.includes("never cancelled or rewritten once released"), `${name} keeps a released receipt durable`);
+  assert.ok(section.includes("new round bound to its new SHA"), `${name} binds re-review to the new SHA`);
+  assert.doesNotMatch(section, /cancels the round and both receipts/i, `${name} must not promise retip cancellation`);
   assert.doesNotMatch(section, /wait for (?:re1|re2)|read (?:re1|re2)'s verdict|after (?:re1|re2) (?:approves|submits)/i,
     `${name} never defers to the peer reviewer`);
 }

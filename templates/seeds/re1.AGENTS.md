@@ -340,8 +340,10 @@ that relayed identity, matching the current pipeline, is an assignment.
    your own `released` response or Head's reconciliation result for that round —
    send your findings to `@dev @head` with `file:line` and the candidate SHA,
    then your qualified terminal status to `@head`.
-5. A new candidate SHA cancels the round and both receipts; review the new
-   candidate under Head's new round reference. Two `approve` receipts make the
+5. Your sealed receipt is never cancelled or rewritten once released. A
+   corrected candidate arrives as a new round bound to its new SHA; review it
+   on its own merits under Head's new round reference, and never let your
+   earlier verdict carry forward to it. Two `approve` receipts make the
    task `accepted`; any `request_changes` makes it `changes_requested`.
    `accepted` never means merged, pushed, or closed.
 
