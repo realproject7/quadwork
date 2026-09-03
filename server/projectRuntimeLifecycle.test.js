@@ -314,13 +314,6 @@ const originalCancelBackground = routes.cancelProjectBackground;
 function cleanup() {
   routes.cancelProjectBackground = originalCancelBackground;
   os.homedir = originalHome;
-  for (const timer of [
-    ...runtime.triggers.values(),
-  ]) {
-    if (timer.timer) clearInterval(timer.timer);
-    if (timer.durationTimer) clearTimeout(timer.durationTimer);
-  }
-  runtime.triggers.clear();
   telegramBridge._instances.clear();
   discordBridge._instances.clear();
   try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch {}
@@ -370,8 +363,6 @@ process.on("exit", cleanup);
     server: { close: (cb) => { events.push("mcp:a"); cb(); } },
   });
 
-  runtime.triggers.set("a", { timer: setInterval(() => {}, 60_000) });
-  runtime.triggers.set("b", { timer: setInterval(() => {}, 60_000) });
   dispatcher._pendingWake.set("a/dev", { queued: true });
   dispatcher._pendingWake.set("b/dev", { queued: true });
   selfHeal._state.set("a/dev", { countInWindow: 1 });
@@ -393,8 +384,6 @@ process.on("exit", cleanup);
   assert.equal(partial.archived, true, "partial cleanup keeps the barrier archived");
   assert.equal(runtime.agentSessions.has("a/dev"), true, "failed resource owner is retained for retry");
   assert.equal(runtime.agentSessions.has("b/dev"), true, "another project's session is untouched");
-  assert.equal(runtime.triggers.has("a"), false);
-  assert.equal(runtime.triggers.has("b"), true, "another project's trigger is untouched");
   assert.equal(dispatcher._pendingWake.has("a/dev"), false);
   assert.equal(dispatcher._pendingWake.has("b/dev"), true, "another project's deferred wake is untouched");
   assert.equal(selfHeal._state.has("a/dev"), false);
@@ -416,9 +405,15 @@ process.on("exit", cleanup);
   let fetchCalls = 0;
   global.fetch = async () => { fetchCalls += 1; throw new Error("must not fetch"); };
   try {
-    const blockedTrigger = await runtime.sendTriggerMessage("a");
-    assert.equal(blockedTrigger.ok, false);
-    assert.equal(fetchCalls, 0, "archived scheduled trigger performs zero HTTP work");
+    // #1036: the archived project's monitor is archived with it. Neither an
+    // evaluation nor a start reaches batch authority or chat.
+    const blockedEvaluation = await runtime.evaluateProjectMonitorNow("a");
+    assert.equal(blockedEvaluation.applied, false);
+    assert.equal(blockedEvaluation.reason, "monitor_archived");
+    const blockedStart = await runtime.startProjectMonitor("a");
+    assert.equal(blockedStart.applied, false);
+    assert.equal(blockedStart.reason, "monitor_archived");
+    assert.equal(fetchCalls, 0, "archived project monitor performs zero HTTP work");
   } finally {
     global.fetch = originalFetch;
   }
@@ -517,7 +512,7 @@ process.on("exit", cleanup);
   const restored = await runtime.projectLifecycle.unarchiveProject("a");
   assert.equal(restored.ok, true);
   assert.equal(runtime.agentSessions.size, beforeUnarchiveSessions, "unarchive does not auto-start runtime work");
-  assert.equal(runtime.triggers.has("a"), false);
+  assert.equal((await runtime.readHeadProjectStatus("a")).monitor.mode, "suspended", "unarchive restores the monitor suspended, never enabled");
   assert.equal(telegramBridge.isRunning("a"), false);
   assert.equal(discordBridge.isRunning("a"), false);
 
@@ -528,81 +523,21 @@ process.on("exit", cleanup);
   liveB.discord_auto = true;
   fs.writeFileSync(configPath, JSON.stringify(liveCfg));
 
-  const liveAuthorityFetch = global.fetch;
-  const liveAuthorityValidation = routes.validateCurrentOwnedAssignment;
-  const liveAuthorityUrls = [];
-  routes.validateCurrentOwnedAssignment = () => ({ ok: true, manual: false });
-  global.fetch = async (url) => {
-    liveAuthorityUrls.push(String(url));
-    if (String(url).includes("/api/batch-progress")) return { ok: true, json: async () => ownedProgress };
-    if (String(url).includes("/api/batch-active")) return { ok: true, json: async () => ownedActive };
-    if (String(url).includes("/api/chat")) return { ok: true };
-    throw new Error(`unexpected trigger URL: ${url}`);
-  };
+  // #1036: with no ci_policy on the registered repository the project is not
+  // V2-ready, so a monitor start is a typed non-start that touches neither
+  // batch authority nor chat. There is no pulse path left to wake a worker.
+  const noPulseFetch = global.fetch;
+  let noPulseFetches = 0;
+  global.fetch = async () => { noPulseFetches += 1; throw new Error("monitor must not fetch through a pulse path"); };
   try {
-    const sentWithAuthority = await runtime.sendTriggerMessage("b");
-    assert.equal(sentWithAuthority.sent, true);
-    assert.equal(liveAuthorityUrls.filter((url) => url.includes("/api/chat")).length, 1,
-      "an exact live owned assignment still permits one trigger_auto worker wake");
+    const notReady = await runtime.startProjectMonitor("b");
+    assert.equal(notReady.applied, false);
+    assert.equal(notReady.reason, "v2_setup_not_ready");
+    assert.ok(notReady.readiness.includes("missing_policy"));
+    assert.equal(noPulseFetches, 0, "a non-ready project monitor start performs zero HTTP work");
+    assert.equal(fileChat.readMessages("b", {}).length, 0, "a non-ready project monitor start writes no chat");
   } finally {
-    global.fetch = liveAuthorityFetch;
-    routes.validateCurrentOwnedAssignment = liveAuthorityValidation;
-  }
-
-  const authorityFetch = global.fetch;
-  let authorityFetches = 0;
-  global.fetch = async (url) => {
-    authorityFetches += 1;
-    if (String(url).includes("/api/batch-progress")) {
-      return { ok: true, json: async () => ({ ...ownedProgress, provenance: "foreign", owned: false }) };
-    }
-    if (String(url).includes("/api/batch-active")) {
-      return { ok: true, json: async () => ({ ...ownedActive, provenance: "foreign", owned: false }) };
-    }
-    throw new Error("non-authoritative trigger must never reach chat mutation");
-  };
-  try {
-    const rejectedAuthority = await runtime.sendTriggerMessage("b");
-    assert.equal(rejectedAuthority.code, "batch_assignment_not_authoritative");
-    assert.equal(rejectedAuthority.sent, false);
-    assert.equal(authorityFetches, 2,
-      "foreign trigger_auto state reads only joined authority and never wakes workers");
-  } finally {
-    global.fetch = authorityFetch;
-  }
-
-  const unavailableFetch = global.fetch;
-  let unavailableFetches = 0;
-  global.fetch = async () => {
-    unavailableFetches += 1;
-    throw new Error("authority unavailable");
-  };
-  try {
-    const unavailableAuthority = await runtime.sendTriggerMessage("b");
-    assert.equal(unavailableAuthority.code, "batch_authority_unavailable");
-    assert.equal(unavailableAuthority.sent, false);
-    assert.equal(unavailableFetches, 2,
-      "trigger_auto authority read failure never falls through to chat mutation");
-  } finally {
-    global.fetch = unavailableFetch;
-  }
-
-  const actionCfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  actionCfg.projects.find((entry) => entry.id === "b").trigger_auto = false;
-  fs.writeFileSync(configPath, JSON.stringify(actionCfg));
-  const staleActionFetch = global.fetch;
-  let staleActionFetches = 0;
-  global.fetch = async () => { staleActionFetches += 1; throw new Error("stale action must not mutate chat"); };
-  try {
-    const staleAction = await runtime.sendTriggerMessage("b", { assignment_attempt: "stale" });
-    assert.equal(staleAction.code, "project_assignment_changed");
-    assert.equal(staleAction.sent, false);
-    assert.equal(staleActionFetches, 0,
-      "an identity-bound send-now revalidates assignment immediately before chat mutation");
-  } finally {
-    global.fetch = staleActionFetch;
-    actionCfg.projects.find((entry) => entry.id === "b").trigger_auto = true;
-    fs.writeFileSync(configPath, JSON.stringify(actionCfg));
+    global.fetch = noPulseFetch;
   }
 
   const lifecycleApi = require("./project-lifecycle");
@@ -656,10 +591,6 @@ process.on("exit", cleanup);
     };
   };
   try {
-    const staleTrigger = await runtime.sendTriggerMessage("b");
-    assert.equal(staleTrigger.code, "project_admission_changed");
-    assert.equal(staleFetches, 2, "stale trigger decision fetches only progress + active authority and never reaches its chat write");
-    staleFetches = 0;
     await runtime.autoStopPollingTick();
     assert.equal(staleFetches, 2, "stale batch poll fetches only progress + active authority and never reaches bridge auto-start");
   } finally {

@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -171,6 +172,153 @@ function governor(options = {}) {
     await g.transition({ projectId: "early", role: "dev", operationId: once.operation.operation_id, generationId: once.operation.generation_id, status: "exited" });
     const repeated = await g.reserve({ projectId: "early", role: "dev", source: "watchdog" });
     assert.equal(repeated.reason, "circuit_open");
+  }
+
+  // #1044: the server-assigned `head_recovery` source may take the single
+  // explicit circuit trial when it names the open circuit's loss correlation
+  // and current expected generation.  A duplicate observes the live trial,
+  // automatic sources stay refused throughout, a failed Head trial cannot be
+  // chained by Head, and only a fresh operator action authorizes another.
+  {
+    const g = governor();
+    const first = await g.reserve({ projectId: "headtrial", role: "dev", source: "operator_start", operatorAuthorized: true });
+    await g.transition({
+      projectId: "headtrial", role: "dev", operationId: first.operation.operation_id,
+      generationId: first.operation.generation_id, status: "resource_killed", lossCorrelation: "loss-head",
+    });
+    assert.equal((await g.reserve({ projectId: "headtrial", role: "dev", source: "watchdog" })).reason, "circuit_open");
+    const wrongGeneration = await g.reserve({ projectId: "headtrial", role: "dev", source: "head_recovery", expectedGeneration: "not-the-lost-one", lossCorrelation: "loss-head" });
+    assert.equal(wrongGeneration.reason, "circuit_open");
+    const wrongLoss = await g.reserve({ projectId: "headtrial", role: "dev", source: "head_recovery", expectedGeneration: first.operation.generation_id, lossCorrelation: "loss-other" });
+    assert.equal(wrongLoss.reason, "circuit_open");
+    const trial = await g.reserve({ projectId: "headtrial", role: "dev", source: "head_recovery", expectedGeneration: first.operation.generation_id, lossCorrelation: "loss-head" });
+    assert.equal(trial.status, "reserved");
+    assert.equal(trial.operation.circuit.open, true);
+    assert.equal(trial.operation.circuit.trial_operation_id, trial.operation.operation_id);
+    assert.equal(trial.operation.circuit.head_trial_operation_id, trial.operation.operation_id);
+    assert.equal(trial.operation.circuit.automatic_retries, 0, "the explicit trial is not an automatic retry");
+    const duplicate = await g.reserve({ projectId: "headtrial", role: "dev", source: "head_recovery", expectedGeneration: first.operation.generation_id, lossCorrelation: "loss-head" });
+    assert.equal(duplicate.idempotent, true);
+    assert.equal(duplicate.operation.operation_id, trial.operation.operation_id);
+    for (const source of ["watchdog", "startup_restore", "self_heal", "reseed"]) {
+      const automatic = await g.reserve({ projectId: "headtrial", role: "dev", source, expectedGeneration: first.operation.generation_id, lossCorrelation: "loss-head" });
+      assert.equal(automatic.reason, "circuit_open", `${source} is refused while the Head trial is live`);
+    }
+    assert.equal(g.snapshot("headtrial", "dev").operation_id, trial.operation.operation_id, "no second process was reserved");
+    await g.transition({ projectId: "headtrial", role: "dev", operationId: trial.operation.operation_id, generationId: trial.operation.generation_id, status: "spawned" });
+    await g.transition({ projectId: "headtrial", role: "dev", operationId: trial.operation.operation_id, generationId: trial.operation.generation_id, status: "exited" });
+    const afterFailure = g.snapshot("headtrial", "dev");
+    assert.equal(afterFailure.circuit.open, true);
+    assert.equal(afterFailure.circuit.expected_generation, trial.operation.generation_id);
+    assert.equal(afterFailure.circuit.trial_operation_id, null);
+    assert.equal(afterFailure.circuit.head_trial_operation_id, trial.operation.operation_id);
+    const chained = await g.reserve({ projectId: "headtrial", role: "dev", source: "head_recovery", expectedGeneration: trial.operation.generation_id, lossCorrelation: "loss-head" });
+    assert.equal(chained.reason, "head_trial_consumed");
+    assert.equal((await g.reserve({ projectId: "headtrial", role: "dev", source: "watchdog" })).reason, "circuit_open");
+    const operator = await g.reserve({ projectId: "headtrial", role: "dev", source: "operator_restart", operatorAuthorized: true, expectedGeneration: trial.operation.generation_id, lossCorrelation: "loss-head" });
+    assert.equal(operator.status, "reserved");
+    assert.equal(operator.operation.circuit.trial_operation_id, operator.operation.operation_id);
+    await g.transition({ projectId: "headtrial", role: "dev", operationId: operator.operation.operation_id, generationId: operator.operation.generation_id, status: "verified", structuredStatus: true });
+    const cleared = g.snapshot("headtrial", "dev").circuit;
+    assert.equal(cleared.open, false);
+    assert.equal(cleared.head_trial_operation_id, null);
+  }
+
+  // A circuit opened by an exhausted automatic retry leaves the lost
+  // generation recorded as `rejected`; Head's trial is still admitted against
+  // that exact generation, the bounded counter is not advanced, and the
+  // record round-trips through persistence with the counter intact.
+  {
+    const g = governor();
+    const first = await g.reserve({ projectId: "headearly", role: "dev", source: "operator_start", operatorAuthorized: true });
+    await g.transition({ projectId: "headearly", role: "dev", operationId: first.operation.operation_id, generationId: first.operation.generation_id, status: "exited" });
+    const retry = await g.reserve({ projectId: "headearly", role: "dev", source: "head_recovery", expectedGeneration: first.operation.generation_id });
+    assert.equal(retry.status, "reserved", "the one bounded automatic retry is still available to head_recovery");
+    await g.transition({ projectId: "headearly", role: "dev", operationId: retry.operation.operation_id, generationId: retry.operation.generation_id, status: "exited" });
+    const opened = await g.reserve({ projectId: "headearly", role: "dev", source: "head_recovery", expectedGeneration: retry.operation.generation_id });
+    assert.equal(opened.reason, "circuit_open");
+    assert.equal(opened.operation.state, "rejected");
+    assert.equal(opened.operation.circuit.reason, "early_exit");
+    const trial = await governor().reserve({
+      projectId: "headearly", role: "dev", source: "head_recovery",
+      expectedGeneration: retry.operation.generation_id, lossCorrelation: opened.operation.circuit.loss_correlation,
+    });
+    assert.equal(trial.status, "reserved");
+    assert.equal(trial.operation.circuit.automatic_retries, 1);
+    assert.equal(governor().snapshot("headearly", "dev").circuit.automatic_retries, 1);
+  }
+
+  // A production assignment key is hundreds of characters.  The circuit's
+  // loss correlation derived from it must survive persistence (the record
+  // bound is 128 chars) so an explicit trial can actually name it; both the
+  // early-exit and resource-kill openings derive the same bounded anchor.
+  {
+    const longKey = `["batch-assignment",1,"${"x".repeat(300)}"]`;
+    const g = governor({ currentWork: async () => ({ current: true, assignment: { assignment_key: longKey, assignment_attempt: "attempt-1", issue_contract_digest: null } }) });
+    const first = await g.reserve({ projectId: "longkey", role: "dev", source: "operator_start", operatorAuthorized: true });
+    await g.transition({ projectId: "longkey", role: "dev", operationId: first.operation.operation_id, generationId: first.operation.generation_id, status: "exited" });
+    const retry = await g.reserve({ projectId: "longkey", role: "dev", source: "watchdog" });
+    await g.transition({ projectId: "longkey", role: "dev", operationId: retry.operation.operation_id, generationId: retry.operation.generation_id, status: "exited" });
+    const opened = await g.reserve({ projectId: "longkey", role: "dev", source: "watchdog" });
+    assert.equal(opened.reason, "circuit_open");
+    const persisted = governor().snapshot("longkey", "dev").circuit;
+    assert.equal(typeof persisted.loss_correlation, "string", "the persisted circuit keeps its loss correlation");
+    assert.equal(persisted.loss_correlation, opened.operation.circuit.loss_correlation);
+    assert.match(persisted.loss_correlation, /^[a-f0-9]{32}:early_exit$/);
+    const trial = await governor().reserve({
+      projectId: "longkey", role: "dev", source: "operator_restart", operatorAuthorized: true,
+      expectedGeneration: retry.operation.generation_id, lossCorrelation: persisted.loss_correlation,
+    });
+    assert.equal(trial.status, "reserved", "an operator can name the persisted correlation");
+    const killed = await g.transition({ projectId: "longkey", role: "dev", operationId: trial.operation.operation_id, generationId: trial.operation.generation_id, status: "resource_killed" });
+    assert.match(killed.operation.circuit.loss_correlation, /^[a-f0-9]{32}:resource_killed$/);
+    assert.equal(governor().snapshot("longkey", "dev").circuit.loss_correlation, killed.operation.circuit.loss_correlation);
+  }
+
+  // A circuit persisted by a pre-digest server kept the raw
+  // `${assignment_key}:<reason>` correlation, which the 128-char record bound
+  // drops on read.  Upgrading must make that circuit nameable again by the
+  // same digest a fresh opening writes, for both the operator and Head, while
+  // a correlation that survived the bound is kept verbatim, a closed circuit
+  // gains none, and a second read derives the identical value.
+  {
+    const longKey = `["batch-assignment",1,"${"y".repeat(300)}"]`;
+    const shortKey = `repo:owner/repo#${"7".repeat(70)}`;
+    const digest = (projectId, role, key, reason) => `${crypto.createHash("sha256").update(`${projectId}\n${role}\n${key}`).digest("hex").slice(0, 32)}:${reason}`;
+    const legacyRecord = (key, reason, open) => ({
+      operation_id: "op-legacy", generation_id: "gen-lost", state: open ? "rejected" : "exited", source: "watchdog",
+      expected_assignment: { assignment_key: key, assignment_attempt: "attempt-1", issue_contract_digest: null },
+      circuit: { open, reason, automatic_retries: 1, loss_correlation: open ? `${key}:${reason}` : null, expected_generation: open ? "gen-lost" : null, trial_operation_id: null, head_trial_operation_id: null },
+      last_observation: { at: "2026-08-01T00:00:00.000Z", health: "unknown" }, unresolved_loss: null,
+    });
+    const filePath = projectStatePath(home, "legacy");
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(filePath, JSON.stringify({ version: 1, roles: {
+      dev: legacyRecord(longKey, "early_exit", true),
+      re1: legacyRecord(longKey, "resource_killed", true),
+      re2: legacyRecord(shortKey, "early_exit", true),
+      head: legacyRecord(longKey, "early_exit", false),
+    } }), { mode: 0o600 });
+    assert.ok(`${longKey}:early_exit`.length > 128, "the seeded raw correlation exceeds the record bound");
+    assert.ok(`${shortKey}:early_exit`.length <= 128, "the control correlation fits the record bound");
+
+    const healed = governor().snapshot("legacy", "dev").circuit;
+    assert.equal(healed.loss_correlation, digest("legacy", "dev", longKey, "early_exit"), "the dropped correlation is re-derived as the fresh digest");
+    assert.equal(governor().snapshot("legacy", "re1").circuit.loss_correlation, digest("legacy", "re1", longKey, "resource_killed"));
+    assert.equal(governor().snapshot("legacy", "dev").circuit.loss_correlation, healed.loss_correlation, "a second read derives the identical value");
+    assert.equal(governor().snapshot("legacy", "re2").circuit.loss_correlation, `${shortKey}:early_exit`, "a correlation that survived the bound is not rewritten");
+    assert.equal(governor().snapshot("legacy", "head").circuit.open, false);
+    assert.equal(governor().snapshot("legacy", "head").circuit.loss_correlation, null, "a closed circuit gains no correlation");
+
+    const operator = await governor().reserve({ projectId: "legacy", role: "dev", source: "operator_restart", operatorAuthorized: true, expectedGeneration: "gen-lost", lossCorrelation: healed.loss_correlation });
+    assert.equal(operator.status, "reserved", "the operator can take the trial on a pre-upgrade circuit");
+    assert.equal(governor().snapshot("legacy", "dev").circuit.loss_correlation, healed.loss_correlation, "the persisted trial record carries the healed correlation");
+    const head = await governor().reserve({ projectId: "legacy", role: "re1", source: "head_recovery", expectedGeneration: "gen-lost", lossCorrelation: digest("legacy", "re1", longKey, "resource_killed") });
+    assert.equal(head.status, "reserved", "Head can take the trial on a pre-upgrade circuit");
+    const wrongName = await governor().reserve({ projectId: "legacy", role: "re2", source: "operator_restart", operatorAuthorized: true, expectedGeneration: "gen-lost", lossCorrelation: digest("legacy", "re2", shortKey, "early_exit") });
+    assert.equal(wrongName.reason, "circuit_trial_authorization_required", "a surviving raw correlation is still the only name that authorizes its trial");
+    const control = await governor().reserve({ projectId: "legacy", role: "re2", source: "operator_restart", operatorAuthorized: true, expectedGeneration: "gen-lost", lossCorrelation: `${shortKey}:early_exit` });
+    assert.equal(control.status, "reserved");
   }
 
   // State survives a fresh governor instance with mode-0600 persistence and

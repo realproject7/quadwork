@@ -19,10 +19,14 @@ const {
 const { createProjectMonitorStateStore } = require("./project-monitor-state");
 const { createTrustedEventTransport } = require("./trusted-event-transport");
 const { createProjectMonitorController } = require("./project-monitor");
+const { parseQualifiedChatMarker } = require("./project-monitor-policy");
+const { projectV2Readiness } = require("./project-v2-readiness");
+const { ReviewCycleStore } = require("./review-cycle");
 const { runAcMigration } = require("./migrate-ac");
 const selfHeal = require("./self-heal");
 const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
 const { createAgentLifecycleGovernor } = require("./agent-lifecycle");
+const { captureRepositoryFacts } = require("./repository-facts");
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
 const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
@@ -656,6 +660,15 @@ const headControlRuntime = createHeadControlRuntime({
   read_repository_state: routes.repositoryState,
   read_cached_repository_snapshot: (cacheRepo) => routes._graphqlCache.get(cacheRepo),
   now: () => new Date(),
+  // #1036/#1044: the Head-only Project Monitor, bounded worker recovery, and
+  // the two read surfaces.  Each receives only the bound project id and the
+  // plane-validated payload.
+  project_controls: {
+    read_project_status: ({ project_id }) => readHeadProjectStatus(project_id),
+    read_review_handoff: ({ project_id }) => readHeadReviewHandoff(project_id),
+    project_monitor: ({ project_id, command }) => controlProjectMonitor(project_id, command),
+    recover_worker: ({ project_id, recovery }) => recoverWorkerForHead(project_id, recovery),
+  },
 });
 
 // #1058 M8: one fixed server composition for Dev's local-only candidate
@@ -916,11 +929,11 @@ routes.setBatchRequestRefreshObserver((projectId) => batchRequestRuntimeOwner.re
 // A deliberately fixed adapter route. It does not mount a generic command
 // endpoint and exposes only the typed, redacted response already produced by
 // the Head-control HTTP boundary.
-app.post("/api/head-control", (req, res) => {
+app.post("/api/head-control", async (req, res) => {
   let response;
   try {
     const token = typeof req.get("X-Head-Control-Token") === "string" ? req.get("X-Head-Control-Token") : null;
-    response = headControlRuntime.handle({ method: "POST", path: req.path, body: req.body }, { token });
+    response = await headControlRuntime.handle({ method: "POST", path: req.path, body: req.body }, { token });
   } catch {
     response = { ok: false, error: { type: "service_unavailable" } };
   }
@@ -1241,6 +1254,431 @@ async function observeProjectMonitorExit(session) {
   });
   monitorModes.set(projectId, result.state.mode);
   return result;
+}
+
+// --- #1036/#1044: Head-only Project Monitor controls ------------------------
+// The broad scheduled pulse is gone.  What remains is one fixed-policy
+// observer per project: `start` enables it for the current qualified
+// assignment, `evaluate_now` runs one deduplicated evaluation of cached/live
+// facts, and `stop` is an audited suspension.  None of them accept a message,
+// cadence, recipient, or broadcast mode; a Head event is written only when the
+// pure policy reports a transition that has not been delivered before.
+
+const HEAD_ACTION_OVERDUE_MS = 60 * 60 * 1000;
+const MONITOR_CHAT_WINDOW = 64;
+const TERMINAL_ROW_STATUSES = new Set(["merged", "closed"]);
+const LOSS_LIFECYCLE_STATES = new Set(["exited", "unresponsive", "timed_out", "resource_killed", "launch_failed"]);
+const monitorEvaluations = new Map();
+const reviewCycleReader = new ReviewCycleStore();
+
+// Archive marks the monitor archived; a later unarchive restores the project
+// but, by #1036, the monitor only ever comes back suspended.  That restore is
+// observed here on the next monitor read/control, never by a config sync.
+function currentMonitorMode(projectId) {
+  let mode = hydrateProjectMonitor(projectId);
+  if (mode !== "archived") return mode;
+  let archived = true;
+  try { archived = isProjectArchived(projectId); } catch { archived = true; }
+  if (archived) return mode;
+  try {
+    const state = projectMonitor.unarchive(projectId);
+    monitorModes.set(projectId, state.mode);
+    monitorKnownProjects.add(projectId);
+    mode = state.mode;
+  } catch { /* unreadable state stays archived until it is repaired */ }
+  return mode;
+}
+
+function monitorAnchorToken(prefix, value) {
+  return `${prefix}-${crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 16)}`;
+}
+
+function monitorSubjectKey(ref) {
+  return `${ref.repoKey}:${ref.kind}#${ref.number}`;
+}
+
+// Readiness for `start`/`evaluate_now`: #1032's pure predicate plus a live,
+// owned, error-free Active Batch.  Anything else is a typed non-start.
+function monitorProjectContext(projectId) {
+  let cfg;
+  try { cfg = readConfig(); } catch { return { ok: false, reason: "project_unavailable" }; }
+  const project = cfg.projects?.find((entry) => entry?.id === projectId);
+  if (!project) return { ok: false, reason: "project_unavailable" };
+  if (isProjectArchived(projectId, cfg)) return { ok: false, reason: "project_archived" };
+  if (project.idle) return { ok: false, reason: "project_idle" };
+  const readiness = projectV2Readiness(project);
+  if (!readiness.ready) return { ok: false, reason: "v2_setup_not_ready", readiness: readiness.reasons.map((entry) => entry.code) };
+  const context = routes.readLiveBatchContext(projectId);
+  const parsed = context?.parsed;
+  if (!context || context.activated !== true || context.queueReadOk !== true || !parsed || parsed.provenance !== "owned" ||
+      !parsed.assignmentKey || !Array.isArray(parsed.errors) || parsed.errors.length !== 0 ||
+      !Array.isArray(parsed.workItems) || parsed.workItems.length === 0) {
+    return { ok: false, reason: "no_current_qualified_subject" };
+  }
+  return { ok: true, cfg, project, context, parsed };
+}
+
+function progressRowFor(rows, item) {
+  return rows.find((row) => row?.work_item_ref && row.work_item_ref.repo_key === item.repoKey &&
+    row.work_item_ref.number === item.number && row.work_item_ref.kind === item.kind) || null;
+}
+
+function monitorChatRecords(projectId) {
+  try {
+    return fileChat.readMessages(projectId, { since_id: 0, limit: MONITOR_CHAT_WINDOW }).map((record) => ({
+      // Only a shim-authenticated Head sender can carry the sender "head";
+      // bridges and history imports are refused that reserved identity.
+      sender: record.sender,
+      authenticated: record.sender === "head" && !record.trusted_event,
+      type: record.type,
+      text: record.text,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function ciObservation(handoff) {
+  if (!handoff) return { required_state: "unknown", draft: false, dev_action_pending: false };
+  const ci = handoff.ci;
+  const required = ci === "pass" || ci === "ci_less_pass" ? "passing"
+    : ci === "pending" || ci === "ci_less_pending" ? "pending"
+      : ci === "product_failure" || ci === "control_plane_failure" || ci === "cancelled" || ci === "missing_required" ? "red"
+        : "unknown";
+  return {
+    required_state: required,
+    draft: handoff.readiness === "draft_or_not_ready",
+    dev_action_pending: handoff.dev_fix_owner === true,
+  };
+}
+
+function headGateDueAt(projectId, handoff) {
+  if (!handoff?.head_gate_due || !handoff.cycle_id) return null;
+  try {
+    const cycle = reviewCycleReader.load(projectId).cycles?.[handoff.cycle_id];
+    const issued = cycle?.events?.head_gate_due?.created_at;
+    return issued ? Date.parse(issued) + HEAD_ACTION_OVERDUE_MS : null;
+  } catch {
+    return null;
+  }
+}
+
+// One server-derived fact set for the pure monitor policy.  It reads the
+// existing project-scoped progress cache (a targeted refresh only when that
+// cache is stale), the durable review cycle, live sessions, and a bounded
+// recent chat window.  It never sweeps other projects or unowned PRs.
+async function buildMonitorObservation(projectId, ctx) {
+  const parsed = ctx.parsed;
+  const progress = await routes.getOrComputeBatchProgress(projectId);
+  const rows = Array.isArray(progress?.items) ? progress.items : [];
+  const fingerprint = progress?.batch_observation_fingerprint || ctx.context.fingerprint;
+  if (progress?.complete === true || progress?.completeConfirmed === true || progress?.liveActiveBatchCleared === true) {
+    return { terminal: true, fingerprint };
+  }
+  const items = parsed.workItems.map((item) => ({ item, row: progressRowFor(rows, item) }));
+  const current = items.find(({ row }) => !row || !TERMINAL_ROW_STATUSES.has(row.status)) || items[items.length - 1];
+  const subjectKey = monitorSubjectKey(current.item);
+  const assignmentKey = monitorAnchorToken(`b${parsed.batchNumber}`, parsed.assignmentKey);
+  const handoff = current.row?.review_handoff || null;
+  const tip = typeof current.row?.live_pr?.tip === "string" && /^[a-f0-9]{40}$/i.test(current.row.live_pr.tip) ? current.row.live_pr.tip.toLowerCase() : null;
+  const chatRecords = monitorChatRecords(projectId);
+  const markers = chatRecords.map(parseQualifiedChatMarker).filter(Boolean)
+    .filter((marker) => marker.assignment.assignment_key === assignmentKey && marker.assignment.subject_key === subjectKey);
+  const assigned = markers.some((marker) => marker.marker === "ASSIGN");
+  const statusConfirmed = markers.some((marker) => marker.marker === "STATUS" && marker.status === "DONE");
+  const mergedCount = items.filter(({ row }) => row?.status === "merged").length;
+  const allQueued = items.every(({ row }) => !row || row.status === "queued");
+  const currentQueued = !current.row || current.row.status === "queued";
+  const worker = agentSessions.get(`${projectId}/dev`);
+  const workerExited = !!worker && worker.state !== "running" && !worker.term && !!worker.lastExitAt && worker.exitedUnexpectedly === true;
+  const gateDueAt = headGateDueAt(projectId, handoff);
+  const anchors = {
+    assignment_key: assignmentKey,
+    subject_key: subjectKey,
+    repo_key: current.item.repoKey,
+    ...(tip ? { sha: tip } : {}),
+  };
+  return {
+    terminal: false,
+    fingerprint,
+    subject: { ...anchors, item: `${current.item.repo}#${current.item.number}`, kind: current.item.kind, row_status: current.row?.status || null },
+    input: {
+      project_id: projectId,
+      readiness: true,
+      assignment: anchors,
+      ci: ciObservation(handoff),
+      runtime: { process_exited: workerExited, status_confirmed: statusConfirmed },
+      progression: {
+        merged_not_advanced: mergedCount > 0 && currentQueued && !assigned,
+        next_loaded_unassigned: mergedCount === 0 && allQueued && !assigned,
+      },
+      head_action: { outstanding: gateDueAt !== null, ...(gateDueAt !== null ? { due_at: gateDueAt } : {}) },
+      chat_records: chatRecords,
+    },
+  };
+}
+
+function monitorStateSummary(projectId) {
+  const mode = currentMonitorMode(projectId);
+  let state = null;
+  try { state = monitorStateStore.load(projectId); } catch { state = null; }
+  return {
+    mode,
+    observation_hash: state?.observation_hash ?? null,
+    unresolved: Object.values(state?.unresolved || {}).map((condition) => ({ kind: condition.kind, due_at: condition.due_at })),
+    deliveries: Object.values(state?.deliveries || {}).map((delivery) => ({ kind: delivery.kind, phase: delivery.phase })),
+    last_evaluation: monitorEvaluations.get(projectId) || null,
+  };
+}
+
+async function evaluateProjectMonitorNow(projectId) {
+  const mode = currentMonitorMode(projectId);
+  if (mode !== "enabled") return { applied: false, command: "evaluate_now", reason: mode === "archived" ? "monitor_archived" : "monitor_suspended", mode };
+  const ctx = monitorProjectContext(projectId);
+  if (!ctx.ok) return { applied: false, command: "evaluate_now", reason: ctx.reason, mode, ...(ctx.readiness ? { readiness: ctx.readiness } : {}) };
+  const observation = await buildMonitorObservation(projectId, ctx);
+  const evaluatedAt = new Date().toISOString();
+  if (observation.terminal) {
+    clearProjectMonitorTerminal(projectId, observation.fingerprint || "terminal");
+    const receipt = { applied: true, command: "evaluate_now", evaluated_at: evaluatedAt, terminal: true, changed: false, conditions: [], deliveries: [], subject: null };
+    monitorEvaluations.set(projectId, receipt);
+    return receipt;
+  }
+  monitorIdentities.set(projectId, Object.freeze({
+    assignment_key: observation.subject.assignment_key,
+    subject_key: observation.subject.subject_key,
+    cycle_id: null,
+  }));
+  const result = await projectMonitor.observe(observation.input);
+  monitorModes.set(projectId, result.state.mode);
+  const receipt = {
+    applied: true,
+    command: "evaluate_now",
+    evaluated_at: evaluatedAt,
+    terminal: false,
+    changed: result.changed === true,
+    observation_hash: result.evaluation.observation_hash,
+    stall_state: result.evaluation.stall_state,
+    subject: observation.subject,
+    observations: {
+      progression: observation.input.progression,
+      head_action: observation.input.head_action,
+      ci: observation.input.ci,
+      runtime: observation.input.runtime,
+    },
+    conditions: result.evaluation.conditions.map((condition) => ({ kind: condition.kind, immediate: condition.immediate, due_at: condition.due_at })),
+    deliveries: result.deliveries.map((delivery) => ({
+      kind: delivery.envelope?.kind || null,
+      ok: delivery.ok === true,
+      duplicate: delivery.duplicate === true,
+      code: delivery.code || null,
+    })),
+  };
+  monitorEvaluations.set(projectId, receipt);
+  return receipt;
+}
+
+async function startProjectMonitor(projectId) {
+  const mode = currentMonitorMode(projectId);
+  if (mode === "archived") return { applied: false, command: "start", reason: "monitor_archived", mode };
+  const ctx = monitorProjectContext(projectId);
+  if (!ctx.ok) return { applied: false, command: "start", reason: ctx.reason, mode, ...(ctx.readiness ? { readiness: ctx.readiness } : {}) };
+  const state = projectMonitor.start(projectId);
+  monitorModes.set(projectId, state.mode);
+  monitorKnownProjects.add(projectId);
+  // A start is immediately one evaluation: the operator or Head learns at
+  // once whether a fixed-policy event was already due, and the observation
+  // hash is seeded so repeated evaluations of unchanged facts write nothing.
+  const evaluation = await evaluateProjectMonitorNow(projectId);
+  return { applied: true, command: "start", mode: monitorModes.get(projectId), evaluation };
+}
+
+function suspendProjectMonitor(projectId) {
+  const mode = currentMonitorMode(projectId);
+  if (mode === "archived") return { applied: false, command: "stop", reason: "monitor_archived", mode };
+  const state = projectMonitor.suspend(projectId);
+  monitorModes.set(projectId, state.mode);
+  monitorKnownProjects.add(projectId);
+  return { applied: true, command: "stop", mode: state.mode };
+}
+
+function controlProjectMonitor(projectId, command) {
+  if (command === "start") return startProjectMonitor(projectId);
+  if (command === "stop") return suspendProjectMonitor(projectId);
+  return evaluateProjectMonitorNow(projectId);
+}
+
+function redactedWorkerFacts(projectId, agentId) {
+  const session = agentSessions.get(`${projectId}/${agentId}`);
+  let lifecycle = null;
+  try { lifecycle = lifecycleGovernor.snapshot(projectId, agentId); } catch {}
+  const facts = publicAgentLifecycleFacts(session, lifecycle);
+  return {
+    state: facts.state,
+    verification_state: facts.verification_state,
+    health: facts.health,
+    operation_id: facts.operation_id,
+    generation_id: facts.generation_id,
+    started_at: facts.started_at,
+    last_output_at: facts.last_output_at,
+    last_chat_at: facts.last_chat_at,
+    last_exit: facts.last_exit,
+    last_observation: facts.last_observation,
+    circuit: facts.circuit,
+  };
+}
+
+function capacitySummary() {
+  let snapshot = null;
+  try { snapshot = resourceRuntimeOwner.snapshot(); } catch { snapshot = null; }
+  const capacity = snapshot?.scope_capacity && typeof snapshot.scope_capacity === "object" ? snapshot.scope_capacity : null;
+  return {
+    platform: process.platform,
+    status: typeof snapshot?.status === "string" ? snapshot.status : null,
+    pressure: snapshot?.pressure && typeof snapshot.pressure === "object"
+      ? { status: snapshot.pressure.status ?? null, reason: snapshot.pressure.reason ?? null }
+      : null,
+    scope_capacity: capacity
+      ? { admitted_worker_scopes: capacity.admitted_worker_scopes ?? null, reserved_worker_scopes: capacity.reserved_worker_scopes ?? null }
+      : null,
+  };
+}
+
+async function readHeadProjectStatus(projectId) {
+  const ctx = monitorProjectContext(projectId);
+  let subject = null;
+  let observations = null;
+  if (ctx.ok) {
+    const observation = await buildMonitorObservation(projectId, ctx);
+    subject = observation.terminal ? null : observation.subject;
+    observations = observation.terminal
+      ? { terminal: true }
+      : { terminal: false, progression: observation.input.progression, head_action: observation.input.head_action, ci: observation.input.ci, runtime: observation.input.runtime };
+  }
+  const workers = {};
+  for (const agentId of Object.keys(ctx.project?.agents || {})) workers[agentId] = redactedWorkerFacts(projectId, agentId);
+  return {
+    project_id: projectId,
+    observed_at: new Date().toISOString(),
+    readiness: ctx.ok ? { ok: true } : { ok: false, reason: ctx.reason, ...(ctx.readiness ? { codes: ctx.readiness } : {}) },
+    assignment: ctx.ok ? {
+      installation_id: ctx.context.installationId,
+      batch: ctx.parsed.batchNumber,
+      attempt: ctx.parsed.assignmentAttempt,
+      items: ctx.parsed.workItems.map((item) => ({ repo_key: item.repoKey, repo: item.repo, number: item.number, kind: item.kind })),
+      subject,
+    } : null,
+    observations,
+    monitor: monitorStateSummary(projectId),
+    workers,
+    capacity: capacitySummary(),
+  };
+}
+
+async function readHeadReviewHandoff(projectId) {
+  const ctx = monitorProjectContext(projectId);
+  if (!ctx.ok) return { subject: null, cycle: null, reason: ctx.reason };
+  const observation = await buildMonitorObservation(projectId, ctx);
+  if (observation.terminal) return { subject: null, cycle: null, reason: "batch_terminal" };
+  const progress = await routes.getOrComputeBatchProgress(projectId);
+  const rows = Array.isArray(progress?.items) ? progress.items : [];
+  const item = ctx.parsed.workItems.find((entry) => monitorSubjectKey(entry) === observation.subject.subject_key);
+  const handoff = (item && progressRowFor(rows, item)?.review_handoff) || null;
+  if (!handoff) return { subject: observation.subject, cycle: null, reason: "no_current_cycle" };
+  let stored = null;
+  try { stored = reviewCycleReader.load(projectId).cycles?.[handoff.cycle_id] || null; } catch { stored = null; }
+  // An invalidated or terminal record is historical and never presented live.
+  if (!stored || stored.state !== "current") return { subject: observation.subject, cycle: null, reason: "no_current_cycle" };
+  return {
+    subject: observation.subject,
+    cycle: {
+      cycle_id: handoff.cycle_id,
+      repo_key: handoff.repo_key,
+      pr_number: handoff.pr_number,
+      exact_sha: handoff.exact_sha,
+      readiness: handoff.readiness,
+      ci: handoff.ci,
+      review: handoff.review,
+      mergeable: handoff.mergeable,
+      head_gate_due: handoff.head_gate_due,
+      dev_fix_owner: handoff.dev_fix_owner,
+      receipts: { re1: stored.receipts?.re1 !== null, re2: stored.receipts?.re2 !== null },
+      review_request_at: stored.events?.review_request?.created_at || null,
+      head_gate_due_at: stored.events?.head_gate_due?.created_at || null,
+      lease: stored.review_lease ? { started_at: stored.review_lease.started_at, reminder_due_at: stored.review_lease.reminder_due_at } : null,
+      updated_at: stored.updated_at,
+    },
+  };
+}
+
+// Bounded recovery of one worker after structured loss evidence.  Every
+// precondition is server-owned: current assignment attempt, exact lost
+// generation, #1053 loss state, no live PTY, and the governor's own circuit,
+// capacity, and Linux containment gates.  It never stops a live process and
+// never touches a worktree; `spawned` is returned as itself, not as recovery.
+async function recoverWorkerForHead(projectId, recovery) {
+  const refuse = (reason, extra = {}) => ({ applied: false, agent: recovery.agent, outcome: "rejected", reason, recovered: false, ...extra });
+  const ctx = monitorProjectContext(projectId);
+  if (!ctx.ok) return refuse(ctx.reason);
+  if (recovery.assignment_attempt !== ctx.parsed.assignmentAttempt) return refuse("assignment_not_current");
+  if (!Object.prototype.hasOwnProperty.call(ctx.project.agents || {}, recovery.agent)) return refuse("role_ineligible");
+  const key = `${projectId}/${recovery.agent}`;
+  const session = agentSessions.get(key);
+  let lifecycle = null;
+  try { lifecycle = lifecycleGovernor.snapshot(projectId, recovery.agent); } catch { lifecycle = null; }
+  const facts = redactedWorkerFacts(projectId, recovery.agent);
+  const alive = !!session && session.state === "running" && isPtyAlive(session.term);
+  if (alive) {
+    // An alive session is either healthy or unconfirmed; neither is loss.
+    return refuse(session.lifecycleState === "verified" ? "worker_healthy" : "worker_unconfirmed", { health: session.lifecycleState === "verified" ? "running" : "unknown", worker: facts });
+  }
+  if (!lifecycle) return refuse("no_loss_evidence", { worker: facts });
+  if (lifecycle.state === "stopped") return refuse("worker_stopped", { worker: facts });
+  // An admission the governor refused while opening the #1053 circuit leaves
+  // the lost generation recorded as `rejected`; the open circuit is that
+  // generation's unresolved loss, and the one explicit trial names it.
+  const lossEvidence = LOSS_LIFECYCLE_STATES.has(lifecycle.state) || (lifecycle.state === "rejected" && lifecycle.circuit?.open === true);
+  if (!lossEvidence) return refuse("worker_unconfirmed", { health: "unknown", worker: facts });
+  if (lifecycle.generation_id !== recovery.expected_generation) return refuse("stale_expected_generation", { worker: facts });
+  const result = await spawnAgentPty(projectId, recovery.agent, {
+    suppressLifecycleMsg: true,
+    lifecycleSource: "head_recovery",
+    expectedGeneration: recovery.expected_generation,
+    ...(lifecycle.circuit?.loss_correlation ? { lossCorrelation: lifecycle.circuit.loss_correlation } : {}),
+  });
+  const operation = result.lifecycle || null;
+  const repository = result.repository || null;
+  if (!result.ok) {
+    return { applied: false, agent: recovery.agent, outcome: operation?.state || "rejected", reason: result.code || "launch_failed", recovered: false, operation, repository };
+  }
+  return {
+    applied: true,
+    agent: recovery.agent,
+    outcome: operation?.state || "spawned",
+    reason: recovery.reason_code,
+    recovered: false,
+    verification_state: operation?.verification_state || "unconfirmed",
+    operation,
+    repository,
+  };
+}
+
+// #1053: the read-only facts of the role worktree, joined with the PR/tip the
+// server already knows for each current work item.  Both are observations;
+// neither is acted on, and neither failure can block the recovery.
+async function recoveryRepositoryFacts(projectId, agentId) {
+  const repository = await captureRepositoryFacts({ cwd: resolveAgentCwd(projectId, agentId) });
+  let knownPrs = [];
+  try {
+    const items = routes.readLiveBatchContext(projectId)?.parsed?.workItems || [];
+    const progress = await routes.getOrComputeBatchProgress(projectId);
+    const rows = Array.isArray(progress?.items) ? progress.items : [];
+    knownPrs = items.map((item) => {
+      const pr = progressRowFor(rows, item)?.live_pr;
+      return { subject: monitorSubjectKey(item), pr: pr ? { number: pr.number ?? null, tip: pr.tip ?? null } : null };
+    });
+  } catch { knownPrs = []; }
+  return { ...repository, known_prs: knownPrs };
 }
 
 // Deterministic server-test containment fixtures. They are an in-process
@@ -1797,6 +2235,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       generationId: opts.generationId || null,
       _lifecycleSpawnRecorded: false,
       _lifecycleVerificationPending: false,
+      _lifecycleStructuredConfirmed: false,
       startedAt: new Date().toISOString(),
       error: null,
       // #1010: explicit backend identity for the session. The PTY dispatcher
@@ -1914,6 +2353,7 @@ function flushPendingLifecycleVerification(session) {
     generationId: session.generationId,
     status: "verified",
     health: "running",
+    structuredStatus: session._lifecycleStructuredConfirmed === true,
   }).catch(() => { session.lifecycleState = "unknown"; });
 }
 
@@ -1922,6 +2362,23 @@ function recordAgentSpawnedLifecycle(project, agent, operation) {
   const session = agentSessions.get(`${project}/${agent}`);
   if (!session || session.operationId !== operation.operation_id || session.generationId !== operation.generation_id) return;
   session._lifecycleSpawnRecorded = true;
+  flushPendingLifecycleVerification(session);
+}
+
+// The first PTY bytes distinguish spawned from verified, but they are not
+// recovery: a banner-then-crash paints them too.  A chat post authenticated
+// with the shim token minted for this spawn is this generation acting through
+// its own MCP wiring; that is the structured confirmation which lets a
+// circuit trial clear.  Recorded once per generation, never for an exited
+// session, and routed through the same generation-matched transition.
+function recordAgentChatActivity(projectId, agentId) {
+  const session = agentSessions.get(`${projectId}/${agentId}`);
+  if (!session || session.state !== "running" || !session.operationId || !session.generationId) return;
+  session.lastChatAt = new Date().toISOString();
+  if (session._lifecycleStructuredConfirmed) return;
+  session._lifecycleStructuredConfirmed = true;
+  session.lifecycleState = "verified";
+  session._lifecycleVerificationPending = true;
   flushPendingLifecycleVerification(session);
 }
 
@@ -1956,6 +2413,16 @@ async function spawnAgentPty(project, agent, opts = {}) {
   }
   const testFixture = _lifecycleTestFixtures.get(`${project}/${agent}`) || null;
   const source = opts.lifecycleSource || "operator_start";
+  // #1053: a spawn after a recorded loss (or against an open circuit) is a
+  // recovery.  Capture the role worktree's read-only facts BEFORE admission
+  // and before any process exists, so dirty WIP, drift, or a missing worktree
+  // is reported rather than silently inherited.  Capture never blocks: a
+  // failure is itself a recorded `available: false` fact.
+  let previousLifecycle = null;
+  try { previousLifecycle = lifecycleGovernor.snapshot(project, agent); } catch {}
+  const repository = previousLifecycle && (LOSS_LIFECYCLE_STATES.has(previousLifecycle.state) || previousLifecycle.circuit?.open === true)
+    ? await recoveryRepositoryFacts(project, agent)
+    : null;
   const result = await lifecycleGovernor.launch({
     projectId: project,
     role: agent,
@@ -1990,14 +2457,15 @@ async function spawnAgentPty(project, agent, opts = {}) {
     // never changes the lifecycle outcome or initiates a replacement action.
     if (agent === "head") appendHeadRecoveryLifecycle(project, result.operation, source);
   }
-  if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation };
-  if (result.status === "verified") return { ok: true, lifecycle: result.operation };
+  if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation, repository };
+  if (result.status === "verified") return { ok: true, lifecycle: result.operation, repository };
   return {
     ok: false,
     code: result.reason || result.status,
     status: result.status === "rejected" ? 409 : 503,
     error: result.reason || "agent lifecycle launch failed",
     lifecycle: result.operation || null,
+    repository,
   };
 }
 
@@ -2378,12 +2846,13 @@ app.post("/api/agents/:project/:agent/start", async (req, res) => {
     lossCorrelation: typeof req.body?.loss_correlation === "string" ? req.body.loss_correlation : null,
   });
   if (result.ok) {
-    res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null });
+    res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null, ...(result.repository ? { repository: result.repository } : {}) });
   } else {
     res.status(result.status || (result.error?.includes("Unknown") ? 400 : 500)).json({
       ok: false,
       state: result.lifecycle?.state || "rejected",
       ...(result.code ? { code: result.code } : {}),
+      ...(result.repository ? { repository: result.repository } : {}),
       error: result.error,
       ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}),
     });
@@ -2463,9 +2932,9 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
     }); // #825
     if (result.ok) {
       emitSystemMessage(project, `${agent} restarted`);
-      res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null });
+      res.json({ ok: true, state: result.lifecycle?.state || "spawned", pid: result.pid || null, lifecycle: result.lifecycle || null, ...(result.repository ? { repository: result.repository } : {}) });
     } else {
-      res.status(result.status || 500).json({ ok: false, state: result.lifecycle?.state || "rejected", ...(result.code ? { code: result.code } : {}), error: result.error, ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}) });
+      res.status(result.status || 500).json({ ok: false, state: result.lifecycle?.state || "rejected", ...(result.code ? { code: result.code } : {}), error: result.error, ...(result.lifecycle ? { lifecycle: result.lifecycle } : {}), ...(result.repository ? { repository: result.repository } : {}) });
     }
   } catch (err) {
     if (err instanceof ProjectLifecycleError) return respondLifecycleFailure(res, err, { state: "error" });
@@ -2551,16 +3020,12 @@ app.post("/api/agents/:project/:agent/write", (req, res) => {
   }
 });
 
-// --- Scheduled Triggers ---
-
-const triggers = new Map();
-
-const DEFAULT_MESSAGE = `@head @re1 @re2 @dev — Queue check.
-Discovery: read GITHUB.md (or GET /api/github-parsed) for issue/PR state instead of running gh. If GITHUB.md is absent or stale (>2 cycles / _stale), do ONE direct gh read to confirm. GITHUB.md may lag — confirm with a direct gh read before any merge/review decision.
-Head: Merge any PR with both current-revision approvals, assign next from queue.
-Dev: Work on assigned ticket or address review feedback.
-RE1/RE2: Review ONLY PRs you were @mentioned on in this chat (not all open PRs). If Dev pushed fixes, re-review. Post verdict on PR AND notify here.
-ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
+// --- Project Monitor (formerly Scheduled Triggers) ---
+// #1036: the operator-authored repeating pulse and its all-agent default text
+// no longer exist.  `/api/triggers/*` keeps its paths as compatibility names
+// for the fixed Head-only Project Monitor: start, stop, and evaluate_now.
+// Legacy `trigger_message` / interval / duration config is retained only as
+// disabled migration data under `legacy_trigger` and is never replayed.
 
 // #518: server-side bridge lifecycle helpers. Stop and start Telegram +
 // Discord bridges so they respond to batch transitions even when the
@@ -2753,247 +3218,25 @@ function isBatchAutomationCurrent(projectId, batchState, admission = null) {
     (!admission || isAdmissionCurrent(admission));
 }
 
-function triggerAutoEnabled(projectId) {
-  try {
-    return readConfig().projects?.find((entry) => entry?.id === projectId)?.trigger_auto === true;
-  } catch {
-    return false;
-  }
-}
-
-async function sendTriggerMessage(projectId, automationBody = null) {
-  let admission;
-  try { admission = captureProjectAdmission(projectId); }
-  catch {
-    stopTrigger(projectId);
-    return { ok: false, code: "project_not_admitted", sent: false };
-  }
-  const cfg = readConfig();
-  const project = cfg.projects && cfg.projects.find((p) => p.id === projectId);
-  const triggerEntryAtStart = triggers.get(projectId) || null;
-  const triggerModeEpoch = triggerEntryAtStart?.modeEpoch || 0;
-  const autoLeaseCurrent = () => {
-    if (!triggerAutoEnabled(projectId)) return false;
-    if (!triggerEntryAtStart) return true;
-    const live = triggers.get(projectId);
-    return live === triggerEntryAtStart && (live.modeEpoch || 0) === triggerModeEpoch && live.autoFollow !== false;
-  };
-
-  // #516: server-side auto-stop — check batch progress before sending.
-  // When trigger_auto is enabled, skip the message and stop the trigger
-  // (plus caffeinate) if the batch is already complete. This covers the
-  // case where the operator is on a different page and the client-side
-  // ScheduledTriggerWidget is not mounted to detect completion.
-  let autoBatchState = null;
-  if (project && project.trigger_auto) {
-    const qwPort = cfg.port || 8400;
-    try {
-      const [bpRes, activeRes] = await Promise.all([
-        fetch(`http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(projectId)}`),
-        fetch(`http://127.0.0.1:${qwPort}/api/batch-active?project=${encodeURIComponent(projectId)}`),
-      ]);
-      if (!autoLeaseCurrent()) {
-        return { ok: false, code: "trigger_auto_disabled", sent: false };
-      }
-      if (!isAdmissionCurrent(admission)) {
-        stopTrigger(projectId);
-        return { ok: false, code: "project_archived", sent: false };
-      }
-      if (!bpRes.ok || !activeRes.ok) {
-        stopTrigger(projectId);
-        return { ok: false, code: "batch_authority_unavailable", sent: false };
-      }
-      const bp = await bpRes.json();
-      const active = await activeRes.json();
-      if (!autoLeaseCurrent()) {
-        return { ok: false, code: "trigger_auto_disabled", sent: false };
-      }
-      if (!isAdmissionCurrent(admission)) {
-        stopTrigger(projectId);
-        return { ok: false, code: "project_admission_changed", sent: false };
-      }
-      // #810: gate auto-stop on completeConfirmed (two distinct successful
-      // fetch cycles), NOT a single transient/stale `complete`.
-      // #864: also auto-stop on an explicit operator clear (`liveActiveBatchCleared`).
-      // #1031: the same joined authority is required for the positive send path;
-      // foreign, unowned, stale, malformed, or unavailable progress must never
-      // wake workers merely because an old trigger timer still exists.
-      const batchState = batchAutomationState(bp, active);
-      if (!batchState.authoritative || !isBatchAutomationCurrent(projectId, batchState, admission)) {
-        stopTrigger(projectId);
-        return { ok: false, code: "batch_assignment_not_authoritative", sent: false };
-      }
-      const clearedByOperator = batchState.clearedByOperator === true;
-      if (batchState.shouldStop) {
-        clearProjectMonitorTerminal(projectId, batchState.fingerprint || "terminal");
-        console.log(`[auto-trigger] ${projectId}: batch ${clearedByOperator ? "cleared by operator" : "complete (confirmed)"}, auto-stopped`);
-        stopTrigger(projectId);
-        // Also stop caffeinate if no other triggers remain running
-        // (#441 companion fix). caffeinateProcess is global (not
-        // project-scoped), so only kill it when all work is done.
-        const released = releaseProjectCaffeinate(projectId);
-        if (released.removed) {
-          console.log(`[auto-trigger] ${projectId}: caffeinate auto-stopped (no active triggers remain)`);
-        }
-        // #518: also stop bridges when batch completes
-        // #542: transition guard — only stop if not already stopped for this completion
-        if (batchState.mode !== "empty" && (project.telegram_auto || project.discord_auto)) {
-          const prev = _bridgeBatchPrev.get(projectId);
-          if (!prev || prev.fingerprint !== batchState.fingerprint || !prev.complete) {
-            const stopped = await autoStopBridges(projectId, project, qwPort, admission, batchState);
-            if (stopped) {
-              _bridgeBatchPrev.set(projectId, {
-                fingerprint: batchState.fingerprint,
-                complete: true,
-                hasItems: batchState.hasItems,
-              });
-            }
-          }
-        }
-        return { ok: true, stopped: true, sent: false };
-      }
-      if (!batchState.active || !batchState.hasItems) {
-        stopTrigger(projectId);
-        return { ok: false, code: "batch_not_active", sent: false };
-      }
-      autoBatchState = batchState;
-    } catch (err) {
-      if (!autoLeaseCurrent()) {
-        return { ok: false, code: "trigger_auto_disabled", sent: false };
-      }
-      // Fail closed: a trigger_auto timer is an automated worker-wake path.
-      console.error(`[auto-trigger] ${projectId}: batch-progress check failed:`, err.message);
-      stopTrigger(projectId);
-      return { ok: false, code: "batch_authority_unavailable", sent: false };
-    }
-  }
-
-  const message = (project && project.trigger_message) || DEFAULT_MESSAGE;
-
-  // #401 / quadwork#277: route trigger sends through the local
-  // /api/chat path that already works for the chat panel. The old
-  // direct /api/send call required a registration token (not the
-  // session token we have on hand) and 401'd silently — agents never
-  // saw the queue-check pulse. /api/chat opens the AC ws with the
-  // session token and inherits the #230 token-resync-on-401 retry,
-  // so the trigger now gets the same proven path as the chat panel.
-  const qwPort = cfg.port || 8400;
-  const url = `http://127.0.0.1:${qwPort}/api/chat?project=${encodeURIComponent(projectId)}`;
-
-  const info = triggers.get(projectId);
-  let chatAutomationBody = null;
-  try {
-    if (!isAdmissionCurrent(admission)) {
-      stopTrigger(projectId);
-      return { ok: false, code: "project_archived", sent: false };
-    }
-    // trigger_auto follows the newly joined live assignment across A→B. The
-    // old timer remains the cadence owner, but its action identity is rebound
-    // before any chat mutation; a non-auto schedule stays pinned to the exact
-    // assignment captured when it was started.
-    if (autoBatchState) {
-      if (!isBatchAutomationCurrent(projectId, autoBatchState, admission)) {
-        stopTrigger(projectId);
-        return { ok: false, code: "project_assignment_changed", sent: false };
-      }
-      chatAutomationBody = batchAutomationRequestBody(autoBatchState);
-      if (!chatAutomationBody) {
-        stopTrigger(projectId);
-        return { ok: false, code: "project_assignment_changed", sent: false };
-      }
-      if (info) info.automationBody = chatAutomationBody;
-    } else if (automationBody) {
-      const assignment = validateTriggerAutomationRequest(projectId, automationBody);
-      if (!assignment.ok) {
-        stopTrigger(projectId);
-        return { ok: false, code: assignment.code || "project_assignment_changed", sent: false };
-      }
-      chatAutomationBody = validatedTriggerAutomationBody(assignment);
-      if (!chatAutomationBody) {
-        stopTrigger(projectId);
-        return { ok: false, code: "project_assignment_changed", sent: false };
-      }
-    }
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      // #1031: the receiver revalidates this exact discriminator immediately
-      // before appendMessage/PTY dispatch, closing rollover during fetch await.
-      body: JSON.stringify({
-        text: message,
-        channel: "general",
-        ...(chatAutomationBody ? { ...chatAutomationBody, admission_generation: admission.generation } : {}),
-      }),
-    });
-    if (!res.ok) {
-      const err = await res.text().catch(() => "");
-      console.error(`Trigger send failed for ${projectId}: ${res.status} ${err}`);
-      if (info) info.lastError = `${res.status}: ${err.slice(0, 100)}`;
-      return {
-        ok: false,
-        code: res.status === 409 ? "project_assignment_changed" : "trigger_send_failed",
-        sent: false,
-      };
-    } else {
-      if (info) info.lastError = null;
-    }
-  } catch (err) {
-    console.error(`Trigger send error for ${projectId}:`, err.message);
-    if (info) info.lastError = err.message;
-    return { ok: false, code: "trigger_send_failed", sent: false };
-  }
-
-  if (info) {
-    info.lastSent = Date.now();
-    info.nextAt = Date.now() + info.interval;
-  }
-  return { ok: true, sent: true };
-}
-
+// Project Monitor state per non-archived project.  There is deliberately no
+// message, interval, or duration field: the widget renders monitor mode, the
+// last evaluation/action, and unresolved conditions.
 app.get("/api/triggers", (_req, res) => {
   const result = {};
-  // Include active runtime triggers first.
-  for (const [id, info] of triggers) {
-    result[id] = {
-      enabled: true,
-      interval: info.interval,
-      lastSent: info.lastSent,
-      nextAt: info.nextAt,
-      lastError: info.lastError || null,
-      expiresAt: info.expiresAt || null,
-      message: null,        // filled in below from config
-      intervalMin: null,    // filled in below — last-used interval in minutes
-      durationMin: null,    // filled in below — last-used duration in minutes
-    };
-  }
-  // Enrich with the persisted message AND last-used interval/duration
-  // for every project in config.json — even projects that don't
-  // currently have a running trigger. The Scheduled Trigger widget
-  // (#210) hydrates all three controls from this on page reload.
   try {
     const cfg = readConfig();
     for (const p of (cfg.projects || [])) {
-      const msg = typeof p.trigger_message === "string" ? p.trigger_message : null;
-      const intervalMin = Number.isFinite(p.trigger_interval_min) ? p.trigger_interval_min : null;
-      const durationMin = Number.isFinite(p.trigger_duration_min) ? p.trigger_duration_min : null;
-      const existing = result[p.id];
-      if (existing) {
-        existing.message = msg;
-        existing.intervalMin = intervalMin;
-        existing.durationMin = durationMin;
-      } else if (msg !== null || intervalMin !== null || durationMin !== null) {
-        result[p.id] = {
-          enabled: false,
-          interval: intervalMin !== null ? intervalMin * 60 * 1000 : 0,
-          lastSent: null,
-          nextAt: null,
-          lastError: null,
-          expiresAt: null,
-          message: msg,
-          intervalMin,
-          durationMin,
-        };
-      }
+      if (!p?.id || isProjectArchived(p.id, cfg)) continue;
+      const monitor = monitorStateSummary(p.id);
+      result[p.id] = {
+        enabled: monitor.mode === "enabled",
+        mode: monitor.mode,
+        observation_hash: monitor.observation_hash,
+        unresolved: monitor.unresolved,
+        deliveries: monitor.deliveries,
+        last_evaluation: monitor.last_evaluation,
+        legacy_trigger_retained: !!p.legacy_trigger,
+      };
     }
   } catch { /* non-fatal */ }
   res.json(result);
@@ -3004,17 +3247,6 @@ app.get("/api/triggers", (_req, res) => {
 function isProjectIdleId(projectId) {
   try { return !!readConfig().projects?.find((p) => p.id === projectId)?.idle; }
   catch { return false; }
-}
-
-function stopTrigger(project) {
-  const existing = triggers.get(project);
-  let removed = 0;
-  if (existing) {
-    if (existing.timer) { clearInterval(existing.timer); removed += 1; }
-    if (existing.durationTimer) { clearTimeout(existing.durationTimer); removed += 1; }
-  }
-  triggers.delete(project);
-  return { ok: true, resources: { triggers: existing ? 1 : 0, trigger_timers: removed }, cleanup_errors: [] };
 }
 
 function mergeCleanupResult(aggregate, result, fallbackResource) {
@@ -3083,7 +3315,6 @@ async function cleanupProjectRuntime(projectId) {
   mergeCleanupResult(aggregate, chatResumeRuntime.revokeProject(projectId), "chat_resume");
   mergeCleanupResult(aggregate, batchRequestRuntimeOwner.revokeProject(projectId), "batch_request");
   mergeCleanupResult(aggregate, selfHeal.clearProject(projectId), "self_heal");
-  mergeCleanupResult(aggregate, stopTrigger(projectId), "trigger");
   const lifecycleCancelPromise = lifecycleGovernor.cancelProject(projectId);
   if (_bridgeBatchPrev.delete(projectId)) {
     aggregate.resources.bridge_batch_states = (aggregate.resources.bridge_batch_states || 0) + 1;
@@ -3254,10 +3485,37 @@ function rejectChangedTriggerAssignment(res, result) {
   });
 }
 
-function startTriggerSchedule(req, res) {
+const LEGACY_TRIGGER_AUTHORING_FIELDS = ["message", "interval", "duration", "interval_min", "duration_min", "recipients", "mode"];
+
+function legacyTriggerAuthoringRejected(res, body) {
+  const supplied = LEGACY_TRIGGER_AUTHORING_FIELDS.filter((field) => Object.prototype.hasOwnProperty.call(body || {}, field));
+  if (supplied.length === 0) return false;
+  res.status(400).json({
+    ok: false,
+    enabled: false,
+    code: "trigger_authoring_removed",
+    error: "The Project Monitor has a fixed policy; a message, interval, duration, recipient, or mode cannot be supplied",
+    rejected_fields: supplied,
+  });
+  return true;
+}
+
+function monitorHttpResult(res, result) {
+  return res.status(result.applied ? 200 : 409).json({
+    ok: result.applied === true,
+    enabled: result.mode === "enabled",
+    ...result,
+  });
+}
+
+// Compatibility name for Project Monitor `start`.  It validates the same
+// assignment authority the old scheduler did, then enables the fixed monitor;
+// it creates no timer and writes no chat message.
+async function startTriggerSchedule(req, res) {
   const { project } = req.params;
   try { assertProjectAdmitted(project); }
   catch (err) { return respondLifecycleFailure(res, err, { enabled: false }); }
+  if (legacyTriggerAuthoringRejected(res, req.body)) return;
   const assignment = validateTriggerAutomationRequest(project, req.body || {});
   if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
   if (assignment.cleared === true) {
@@ -3267,78 +3525,10 @@ function startTriggerSchedule(req, res) {
   if (assignment.manual !== true && !automationBody) {
     return rejectChangedTriggerAssignment(res, { project_id: project });
   }
-  // #812: refuse to start a trigger for a parked (idle) project — no
-  // timer created, no agents pulsed. Toggle the project off idle first.
   if (isProjectIdleId(project)) {
     return res.json({ ok: false, idle: true, enabled: false });
   }
-  // #418 / quadwork#306: sendImmediately was an always-true
-  // send-and-start flag from the original #210 button; operators
-  // asked for a pure scheduler (the button is now just "Start
-  // Trigger" — wait for the first interval). The field is
-  // ignored here; the send-now endpoint below still exists for
-  // the explicit one-shot path.
-  const { interval, duration, message } = req.body || {};
-  const ms = (interval || 30) * 60 * 1000;
-  const durationMs = duration ? duration * 60 * 1000 : 0; // duration in minutes, 0 = indefinite
-
-  // #210: persist the custom message AND the last-used interval +
-  // duration on the project entry so reopening an idle project
-  // pre-fills all three controls from the saved state (not just the
-  // message). Without persisting interval/duration, the widget
-  // would snap back to its defaults (15 min / 3 hr) after every
-  // reload even if the operator had picked something else.
-  try {
-    const cfg = readConfig();
-    const entry = (cfg.projects || []).find((p) => p.id === project);
-    if (entry) {
-      if (typeof message === "string" && message.length > 0) entry.trigger_message = message;
-      if (Number.isFinite(interval) && interval > 0) entry.trigger_interval_min = interval;
-      if (Number.isFinite(duration) && duration >= 0) entry.trigger_duration_min = duration;
-      writeConfig(cfg);
-    }
-  } catch (e) { /* non-fatal — timer still runs with its in-memory values */ }
-
-  const existing = triggers.get(project);
-  if (existing) {
-    if (existing.timer) clearInterval(existing.timer);
-    if (existing.durationTimer) clearTimeout(existing.durationTimer);
-  }
-
-  // #418 / quadwork#306: no immediate fire — the first send happens
-  // at T + interval via the setInterval below. Operators set the
-  // trigger up in advance of going afk and don't want it interrupting
-  // whatever agents are currently mid-task. The explicit "send now"
-  // path still lives at /api/triggers/:project/send-now for the
-  // rare case an operator actually wants to kick things off.
-  const timer = setInterval(() => {
-    const current = triggers.get(project);
-    return sendTriggerMessage(project, current?.automationBody || null);
-  }, ms);
-  const expiresAt = durationMs > 0 ? Date.now() + durationMs : null;
-
-  const triggerInfo = {
-    interval: ms,
-    timer,
-    lastSent: null,
-    nextAt: Date.now() + ms,
-    lastError: null,
-    expiresAt,
-    durationTimer: null,
-    automationBody,
-    autoFollow: triggerAutoEnabled(project),
-    modeEpoch: 0,
-  };
-
-  // Auto-stop after duration
-  if (durationMs > 0) {
-    triggerInfo.durationTimer = setTimeout(() => {
-      stopTrigger(project);
-    }, durationMs);
-  }
-
-  triggers.set(project, triggerInfo);
-  res.json({ ok: true, enabled: true, interval: ms, nextAt: Date.now() + ms, expiresAt });
+  return monitorHttpResult(res, await startProjectMonitor(project));
 }
 
 app.post("/api/triggers/:project/start", startTriggerSchedule);
@@ -3351,27 +3541,26 @@ app.post("/api/triggers/:project/stop", (req, res) => {
   if (assignment.manual !== true && !automationBody) {
     return rejectChangedTriggerAssignment(res, { project_id: project });
   }
-  stopTrigger(project);
-  res.json({ ok: true, enabled: false });
+  return monitorHttpResult(res, suspendProjectMonitor(project));
 });
 
+// Compatibility name for Project Monitor `evaluate_now`: one deduplicated
+// evaluation, a Head event only when a fixed-policy transition is due.
 app.post("/api/triggers/:project/send-now", async (req, res) => {
   const { project } = req.params;
   try { assertProjectAdmitted(project); }
   catch (err) { return respondLifecycleFailure(res, err, { sent: false }); }
+  if (legacyTriggerAuthoringRejected(res, req.body)) return;
   const assignment = validateTriggerAutomationRequest(project, req.body || {});
   if (!assignment.ok) return rejectChangedTriggerAssignment(res, assignment);
   const automationBody = validatedTriggerAutomationBody(assignment);
   if (assignment.manual !== true && !automationBody) {
     return rejectChangedTriggerAssignment(res, { project_id: project });
   }
-  // #812: parked (idle) project — do not pulse agents.
   if (isProjectIdleId(project)) {
     return res.json({ ok: false, idle: true, sent: false });
   }
-  const result = await sendTriggerMessage(project, automationBody);
-  if (!result.ok) return res.status(409).json(result);
-  res.json(result);
+  return monitorHttpResult(res, await evaluateProjectMonitorNow(project));
 });
 
 app.post("/api/triggers/sync", (_req, res) => {
@@ -3381,6 +3570,8 @@ app.post("/api/triggers/sync", (_req, res) => {
 
 // Expose syncTriggers for migrated routes (config PUT, rename)
 app.set("syncTriggers", syncTriggersFromConfig);
+// An authenticated shim post on /api/chat is the worker's structured confirmation.
+app.set("recordAgentChatActivity", recordAgentChatActivity);
 
 // --- OVERNIGHT-QUEUE.md viewer/editor (#209) ---------------------------------
 // Read/write the per-project ~/.quadwork/{id}/OVERNIGHT-QUEUE.md file from
@@ -3644,58 +3835,41 @@ wss.on("connection:terminal", async (ws, req) => {
 
 // --- Trigger auto-start from config ---
 
+// #1036 migration: a persisted operator-authored pulse must never be replayed.
+// Every legacy trigger field moves under `legacy_trigger` as disabled data
+// the first time the server or a config write observes it.  An installation
+// upgraded with `trigger_enabled: true` therefore starts no timer and posts
+// nothing; the operator or Head enables the monitor explicitly.
+const LEGACY_TRIGGER_FIELDS = ["trigger_message", "trigger_interval_min", "trigger_duration_min", "trigger_enabled", "trigger_interval"];
+
+function migrateLegacyTriggerConfig(cfg) {
+  let changed = false;
+  for (const project of (cfg?.projects || [])) {
+    if (!project || typeof project !== "object") continue;
+    const present = LEGACY_TRIGGER_FIELDS.filter((field) => Object.prototype.hasOwnProperty.call(project, field));
+    if (present.length === 0) continue;
+    const retained = { ...(project.legacy_trigger && typeof project.legacy_trigger === "object" ? project.legacy_trigger : {}) };
+    for (const field of present) {
+      retained[field.replace(/^trigger_/, "")] = project[field];
+      delete project[field];
+    }
+    retained.disabled = true;
+    retained.migrated_at = new Date().toISOString();
+    project.legacy_trigger = retained;
+    changed = true;
+  }
+  return changed;
+}
+
+// Called at startup and after every config write.  It schedules nothing: a
+// config sync cannot resurrect a pulse or enable a suspended monitor.
 function syncTriggersFromConfig() {
-  const cfg = readConfig();
-  const activeIds = new Set();
-
-  if (cfg.projects) {
-    for (const project of cfg.projects) {
-      // #812: idle (parked) projects get no trigger. Excluding them from
-      // activeIds also makes the cleanup loop below clear any timer they
-      // had — so writing idle:true via PUT /api/config (which calls this)
-      // stops a running trigger with no separate stop call.
-      if (project.trigger_enabled && !project.idle && !isProjectArchived(project.id, cfg)) {
-        activeIds.add(project.id);
-        const ms = (project.trigger_interval || 30) * 60 * 1000;
-        const existing = triggers.get(project.id);
-        if (!existing || existing.interval !== ms) {
-          if (existing && existing.timer) clearInterval(existing.timer);
-          const timer = setInterval(() => sendTriggerMessage(project.id), ms);
-          // Config sync has no live assignment receipt. Preserve legacy/manual
-          // scheduling without fabricating V2 ownership on reload.
-          triggers.set(project.id, {
-            interval: ms,
-            timer,
-            lastSent: null,
-            nextAt: Date.now() + ms,
-            lastError: null,
-            automationBody: null,
-            autoFollow: project.trigger_auto === true,
-            modeEpoch: 0,
-          });
-        } else {
-          const nextAutoFollow = project.trigger_auto === true;
-          if (existing.autoFollow !== undefined && existing.autoFollow !== nextAutoFollow) {
-            existing.modeEpoch = (existing.modeEpoch || 0) + 1;
-          }
-          existing.autoFollow = nextAutoFollow;
-          if (nextAutoFollow) continue;
-          // Turning auto-follow off converts the existing cadence back to its
-          // explicit manual mode. The interval callback reads this live field,
-          // so a prior A→B receipt cannot later stop the manual schedule.
-          existing.automationBody = null;
-        }
-      }
-    }
-  }
-
-  for (const [id, info] of triggers) {
-    if (!activeIds.has(id)) {
-      if (info.timer) clearInterval(info.timer);
-      if (info.durationTimer) clearTimeout(info.durationTimer);
-      triggers.delete(id);
-    }
-  }
+  let cfg;
+  try { cfg = readConfig(); } catch { return { migrated: false }; }
+  if (!migrateLegacyTriggerConfig(cfg)) return { migrated: false };
+  try { writeConfig(cfg); } catch (err) { console.error(`[monitor] legacy trigger migration write failed: ${err.message}`); return { migrated: false }; }
+  console.log("[monitor] legacy scheduled-trigger fields retained as disabled legacy_trigger data");
+  return { migrated: true };
 }
 
 // #516: server-side batch-completion poller. Checks every 30s whether
@@ -3715,7 +3889,6 @@ async function autoStopPollingTick() {
 
   for (const project of cfg.projects) {
     if (isProjectArchived(project.id, cfg)) {
-      stopTrigger(project.id);
       _bridgeBatchPrev.delete(project.id);
       continue;
     }
@@ -3723,26 +3896,22 @@ async function autoStopPollingTick() {
     try { admission = captureProjectAdmission(project.id); }
     catch { continue; }
     if (project.idle) continue; // #812: parked project — no batch-progress polling
-    const hasTriggerAuto = project.trigger_auto && triggers.has(project.id);
+    // #1036: an enabled monitor still needs batch terminal state so its
+    // conditions and dedup entries are cleared; it gets no pulse from here.
+    const monitorEnabled = hydrateProjectMonitor(project.id) === "enabled";
     const hasBridgeAuto = project.telegram_auto || project.discord_auto;
-    if (!hasTriggerAuto && !hasBridgeAuto) continue;
+    if (!monitorEnabled && !hasBridgeAuto) continue;
     const qwPort = cfg.port || 8400;
     try {
       const [res, activeRes] = await Promise.all([
         fetch(`http://127.0.0.1:${qwPort}/api/batch-progress?project=${encodeURIComponent(project.id)}`),
         fetch(`http://127.0.0.1:${qwPort}/api/batch-active?project=${encodeURIComponent(project.id)}`),
       ]);
-      if (!isAdmissionCurrent(admission)) {
-        stopTrigger(project.id);
-        continue;
-      }
+      if (!isAdmissionCurrent(admission)) continue;
       if (!res.ok || !activeRes.ok) continue;
       const bp = await res.json();
       const active = await activeRes.json();
-      if (!isAdmissionCurrent(admission)) {
-        stopTrigger(project.id);
-        continue;
-      }
+      if (!isAdmissionCurrent(admission)) continue;
       const batchState = batchAutomationState(bp, active);
       if (!batchState.authoritative) continue;
       if (!isBatchAutomationCurrent(project.id, batchState, admission)) continue;
@@ -3763,13 +3932,12 @@ async function autoStopPollingTick() {
 
       if (bp && shouldStop) {
         clearProjectMonitorTerminal(project.id, batchState.fingerprint || "terminal");
-        if (hasTriggerAuto) {
+        if (monitorEnabled) {
           const reason = clearedByOperator ? "cleared by operator" : "complete (confirmed)";
-          console.log(`[auto-trigger] ${project.id}: batch ${reason}, auto-stopped (poller)`);
-          stopTrigger(project.id);
+          console.log(`[monitor] ${project.id}: batch ${reason}, conditions cleared (poller)`);
           const released = releaseProjectCaffeinate(project.id);
           if (released.removed) {
-            console.log(`[auto-trigger] ${project.id}: caffeinate auto-stopped (no active triggers remain)`);
+            console.log(`[monitor] ${project.id}: caffeinate released (batch terminal)`);
           }
         }
         // #518: also stop bridges when batch completes
@@ -4271,11 +4439,6 @@ function shutdown() {
   if (_tempSweepHandle) { clearInterval(_tempSweepHandle); _tempSweepHandle = null; } // #957
   if (_watchdogHandle) { clearInterval(_watchdogHandle); _watchdogHandle = null; }
 
-  // Trigger schedulers (clears each trigger's interval + duration timers).
-  for (const project of [...triggers.keys()]) {
-    try { stopTrigger(project); } catch {}
-  }
-
   // Project Monitor owns only condition-specific timeout handles. Cancel them
   // synchronously on shutdown; no monitor state is evaluated or rewritten.
   for (const project of [...monitorKnownProjects]) {
@@ -4320,8 +4483,14 @@ module.exports = {
   stopAgentSession,
   cleanupProjectRuntime,
   projectLifecycle,
-  sendTriggerMessage,
   syncTriggersFromConfig,
+  migrateLegacyTriggerConfig,
+  startProjectMonitor,
+  suspendProjectMonitor,
+  evaluateProjectMonitorNow,
+  readHeadProjectStatus,
+  readHeadReviewHandoff,
+  recoverWorkerForHead,
   autoStartBridges,
   autoStopBridges,
   bridgeAssignmentBody,
@@ -4347,7 +4516,7 @@ module.exports = {
 };
 module.exports.agentSessions = agentSessions; // #972: test seam for shutdown() PTY cleanup
 module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test seam
-module.exports.triggers = triggers; // #1034: project cleanup ownership test seam
+module.exports.headControlRuntime = headControlRuntime; // #1044: Head-token registration test seam
 module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation test seam
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
 module.exports.runStartupMigrations = runStartupMigrations; // startup seeding (test seam)

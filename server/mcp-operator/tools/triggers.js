@@ -1,15 +1,12 @@
 "use strict";
 
-// #794: batch-execution tools (Tier 2 — act). start/stop the scheduled trigger
-// that drives a batch, and fire a single pulse on demand. set_batch/append_batch
-// (#793) DEFINE the work; these RUN it. New file under tools/ — additive,
-// auto-merged by #790's loader, no edits to existing modules.
+// #794: batch-execution tools (Tier 2 — act). #1036 retargeted them: they
+// start/stop/evaluate the fixed Head-only Project Monitor instead of a
+// repeating all-agent pulse. set_batch/append_batch (#793) DEFINE the work;
+// these observe it.
 //
-// Validate-first: POST /api/triggers/:project/start creates a setInterval for
-// ANY :project string (the backend doesn't reject unknown ids), and send-now
-// can create a stray ~/.quadwork/<id>/ chat file. So every tool calls
-// assertKnownProject(project) BEFORE its HTTP call — unknown id → clean error,
-// no request, no timer.
+// Validate-first: every tool calls assertKnownProject(project) BEFORE its HTTP
+// call — unknown id → clean error, no request, no monitor state.
 
 const IDLE_REJECTION = (project) =>
   new Error(`Project "${project}" is inactive (idle). Un-idle it first, then retry.`);
@@ -67,70 +64,77 @@ function requireStoppableBatch(project, snapshot) {
 const BATCH_STATUS_NOTE =
   "Use batch_status to gauge whether work remains: both `active` and `progress` follow the live Active Batch lifecycle, and a cleared queue reports no current work.";
 
+// #1036: the scheduled pulse is gone. These compatibility names now drive the
+// fixed-policy Head-only Project Monitor; a caller-supplied message, cadence,
+// duration, recipient, or mode is rejected before any HTTP call.
+const REMOVED_TRIGGER_FIELDS = ["message", "interval_min", "duration_min", "interval", "duration", "recipients", "mode"];
+const AUTHORING_REJECTION = (fields) =>
+  new Error(`Trigger authoring was removed (#1036): ${fields.join(", ")} cannot be supplied. The Project Monitor has a fixed policy and sends structured events to @head only.`);
+
+function assertNoTriggerAuthoring(params) {
+  const supplied = REMOVED_TRIGGER_FIELDS.filter((field) => params != null && Object.prototype.hasOwnProperty.call(params, field));
+  if (supplied.length > 0) throw AUTHORING_REJECTION(supplied);
+}
+
 module.exports = {
   defs: [
     {
       name: "start_batch",
       description:
-        "Start the SCHEDULED trigger that drives a project's batch — fires a trigger message every `interval_min` minutes (default 30), optionally auto-stopping after `duration_min` minutes (default 0 = run indefinitely). The first pulse is at T+interval, not immediately (use trigger_now for an immediate one). Define the batch first with set_batch/append_batch (#793). Only the fields you pass are persisted to the project: an omitted interval/duration/message is NOT saved — later pulses reuse the project's existing trigger_message / interval. Rejected if the project is idle (un-idle it first). " +
+        "Enable the Head-only Project Monitor for a project's live batch (compatibility name for `project_monitor start`). It creates no repeating message: the monitor observes the current qualified assignment and writes one structured `[QW-MONITOR:<kind>]` event to @head only when a fixed-policy transition is due (terminal-red CI, passing draft, worker exit before status, BLOCKED, overdue WAITING, overdue Head gate, merged-but-not-advanced, next-item-unassigned). Rejected if the project is idle, archived, not V2-ready, or has no active batch. " +
         BATCH_STATUS_NOTE + " Requires matching admission_generation and batch_observation_fingerprint from both live endpoints plus the exact current owned V2 assignment, or explicit preactivation V1 compatibility.",
       inputSchema: {
         type: "object",
         properties: {
           project: { type: "string", description: "Project id (from list_projects)." },
-          interval_min: { type: "number", description: "Minutes between trigger pulses (default 30)." },
-          duration_min: { type: "number", description: "Auto-stop after this many minutes (default 0 = indefinite)." },
-          message: { type: "string", description: "Trigger message to send each pulse (persisted; defaults to the project's existing message)." },
         },
         required: ["project"],
+        additionalProperties: false,
       },
     },
     {
       name: "trigger_now",
       description:
-        "Fire ONE trigger pulse immediately for a project (a single send-now, separate from the scheduled cadence). Use after defining a batch when you want to kick it off right away instead of waiting for start_batch's first interval. Rejected if the project is idle. " +
-        BATCH_STATUS_NOTE + " Requires matching admission_generation and batch_observation_fingerprint from both live endpoints plus the exact current owned V2 assignment, or explicit preactivation V1 compatibility.",
+        "Run ONE deduplicated Project Monitor evaluation now (compatibility name for `project_monitor evaluate_now`). It reads cached/live facts, records the evaluation, and writes a @head event only when a fixed-policy transition is genuinely due; unchanged state writes nothing and wakes no agent. It never sends a generic pulse to Dev/RE1/RE2. Rejected if the project is idle. " +
+        BATCH_STATUS_NOTE,
       inputSchema: {
         type: "object",
         properties: {
           project: { type: "string", description: "Project id (from list_projects)." },
         },
         required: ["project"],
+        additionalProperties: false,
       },
     },
     {
       name: "stop_batch",
       description:
-        "Stop a project's scheduled trigger (clears the interval timer). The batch definition in the queue is untouched — only the cadence stops. Requires an authoritative current assignment, completion confirmation, or matching explicit clear from both live batch endpoints.",
+        "Suspend a project's Project Monitor (compatibility name for `project_monitor stop`). This is an audited suspension of observation only: the batch definition, workers, and queue are untouched. Requires an authoritative current assignment, completion confirmation, or matching explicit clear from both live batch endpoints.",
       inputSchema: {
         type: "object",
         properties: {
           project: { type: "string", description: "Project id (from list_projects)." },
         },
         required: ["project"],
+        additionalProperties: false,
       },
     },
   ],
 
   handlers: {
     start_batch: async (params, ctx) => {
-      const { project, interval_min, duration_min, message } = params;
+      assertNoTriggerAuthoring(params);
+      const { project } = params;
       await ctx.assertKnownProject(project);
       const snapshot = await readAuthorizedBatch(project, ctx);
       requireLiveBatch(project, snapshot);
-      // Map tool field names → endpoint body fields (the endpoint expects
-      // interval/duration/message, NOT *_min). Send only provided fields.
-      const body = {};
-      if (interval_min != null) body.interval = interval_min;
-      if (duration_min != null) body.duration = duration_min;
-      if (message != null) body.message = message;
-      Object.assign(body, assignmentRequestFields(snapshot));
-      const res = await ctx.httpRequest("POST", `/api/triggers/${encodeURIComponent(project)}/start`, body);
+      const res = await ctx.httpRequest("POST", `/api/triggers/${encodeURIComponent(project)}/start`, assignmentRequestFields(snapshot));
       if (res && res.idle === true) throw IDLE_REJECTION(project);
       return res;
     },
 
     trigger_now: async (params, ctx) => {
+      assertNoTriggerAuthoring(params);
       const { project } = params;
       await ctx.assertKnownProject(project);
       const snapshot = await readAuthorizedBatch(project, ctx);
@@ -145,6 +149,7 @@ module.exports = {
     },
 
     stop_batch: async (params, ctx) => {
+      assertNoTriggerAuthoring(params);
       const { project } = params;
       await ctx.assertKnownProject(project);
       const snapshot = await readAuthorizedBatch(project, ctx);

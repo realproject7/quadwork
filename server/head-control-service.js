@@ -19,8 +19,8 @@ const SHA_RE = /^[a-f0-9]{64}$/;
 const CODE_RE = /^head_control_[a-z0-9_]{2,95}$/;
 const ACTION_SET = new Set(ACTIONS);
 const DECISION_SET = new Set(["accepted", "denied"]);
-const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
-const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch"]);
+const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "get_project_status", "review_handoff"]);
 
 class HeadControlServiceError extends Error {
   constructor(code, message = code) {
@@ -301,13 +301,13 @@ function createHeadControlService(options) {
     // restart, remains ambiguous and must not reach the domain.
     fail("head_control_durable_replay_ambiguous", "durable Head-control receipt cannot prove this retry");
   }
-  function execute(command) {
+  async function execute(command) {
     // This preflight happens before the plane can reach a domain callback.
     // It also rejects corrupt, substituted, or unavailable durable state.
     const records = readAuditOrFail();
     const durableReplay = durableReplayOrFail(command, records);
     if (durableReplay !== null) return durableReplay;
-    const result = plane.execute(command);
+    const result = await plane.execute(command);
     persistOrFail(result, command);
     return result;
   }

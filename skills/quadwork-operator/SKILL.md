@@ -86,9 +86,9 @@ Always start here; every other tool takes a project `id` from this list.
 | `set_batch` | `project`, `content` | Replace `OVERNIGHT-QUEUE.md` (full overwrite; rejects empty). Does **not** start it. |
 | `append_batch` | `project`, `content` | Append to the queue (read-then-write; creates if absent). Does not start it. **Lost-update caveat** — re-`read_queue` first if you may have edited it elsewhere. |
 | `ensure_batch` | `project` | Create the queue from template if absent (idempotent) → `{ ok, existed }`. |
-| `start_batch` | `project`, `interval_min?` (30), `duration_min?` (0 = indefinite), `message?` | Start the **scheduled trigger**. First pulse is at **T+interval**, not immediate. Only fields you pass are persisted. Rejected if the project is idle. |
-| `trigger_now` | `project` | Fire **one** trigger pulse immediately. Rejected if idle. |
-| `stop_batch` | `project` | Stop the scheduled trigger (clears the timer; queue untouched). |
+| `start_batch` | `project` | Enable the **Head-only Project Monitor** for the live batch. No cadence, no message, no repeating pulse: it writes one `[QW-MONITOR:<kind>]` event to `@head` only when a fixed-policy transition is due. Rejected if the project is idle, archived, not V2-ready, or has no active batch. Passing any trigger-authoring field is rejected with `trigger_authoring_removed`. |
+| `trigger_now` | `project` | Run **one** deduplicated Monitor evaluation now (compatibility name for `project_monitor evaluate_now`). Unchanged state writes nothing and wakes no agent. Rejected if idle. |
+| `stop_batch` | `project` | Suspend the project's Monitor (compatibility name for `project_monitor stop`). Observation only — batch, workers and queue are untouched. |
 | `agent_control` | `project`, `agent`, `action` | Non-destructive lifecycle: `start` / `stop` / `restart` / `interrupt` (Ctrl+C — interrupts, does not kill). |
 | `interrupt_all` | `project` | Ctrl+C every running agent in the project → `{ ok, interrupted }`. |
 
@@ -102,10 +102,12 @@ Always start here; every other tool takes a project `id` from this list.
    *(Alternatively define the queue directly with `set_batch` / `append_batch`,
    but Head-driven is the supported path.)*
 3. Kick it off:
-   - `trigger_now` for **one immediate pulse**, or
-   - `start_batch` with `interval_min` (e.g. 15) and optional `duration_min` for
-     an **overnight cadence**. Remember the first scheduled pulse is at
-     T+interval — use `trigger_now` if you want it to start right away.
+   - `start_batch` to enable the Monitor, or
+   - `trigger_now` for one immediate evaluation.
+   There is no cadence to pick and no message to write. The Monitor observes the
+   current qualified assignment and writes a single structured event to `@head`
+   only when a fixed-policy transition is due; unchanged state writes nothing
+   and wakes no agent.
 4. Monitor (below).
 
 ### Monitor a running batch

@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { createHeadControlPlane } = require("./head-control-plane");
+const { composeHeadDomain } = require("./head-control-runtime");
 const {
   buildBatchManifest,
 } = require("./work-task-manifest");
@@ -303,32 +304,6 @@ withDirectory((directory) => {
   ok(true, "exact WorkTask candidate cuts are planned, CAS-applied, and observed through one monotonic Head revision");
 });
 
-// The bridge accepts the exact immutable invocation produced by the existing
-// plane, not a look-alike direct API. This covers all four fixed callbacks
-// without adding a fifth action or a route-level adapter.
-withDirectory((directory) => {
-  const workTaskDomain = domain(directory);
-  workTaskDomain.initialize();
-  const plane = createHeadControlPlane({ binding, domain: workTaskDomain });
-  const observed = plane.execute(planeRequest("get_pipeline_status", null));
-  const put = plane.execute(planeRequest("put_batch_manifest", 0, { manifest: copy(manifest()) }));
-  const frozen = plane.execute(planeRequest("freeze_batch_manifest", 1, null));
-  assert.equal(observed.result.status.revision, 0);
-  assert.equal(put.result.status.revision, 1);
-  assert.equal(frozen.result.status.revision, 2);
-  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
-  const advanced = advanceToAccepted(directory, store.readRecoverySnapshot({ installation_id: binding.installation_id, project_id: binding.project_id }));
-  const ready = plane.execute(planeRequest("get_pipeline_status", null, null, { correlation_id: "corr_plane_ready", idempotency_key: "idem_plane_ready" }));
-  assert.equal(ready.result.status.revision, 3);
-  assert.equal(ready.result.status.cut_safe, true);
-  const cut = plane.execute(planeRequest("cut_batch", 3, {
-    cut: { tasks: [{ work_task_ref: copy(advanced.ref), candidate_digest: advanced.candidate.candidate_digest }] },
-  }, { correlation_id: "corr_plane_cut", idempotency_key: "idem_plane_cut" }));
-  assert.equal(cut.decision.kind, "accepted");
-  assert.equal(cut.result.status.revision, 4);
-  ok(true, "all four fixed Head-control plane callbacks bind to the durable WorkTask domain");
-});
-
 // Current registered identities are rechecked at each durable mutation.  A
 // changed issue contract cannot be frozen merely because an older manifest was
 // accepted before the restart.
@@ -587,4 +562,47 @@ assert.doesNotMatch(source, /head-control-audit-store|require\s*\(\s*["'](?:node
 assert.doesNotMatch(source, /(?:setInterval\s*\(|setTimeout\s*\(|publish_delivery|createServer|registerAction)/);
 ok(true, "domain has no audit-only recovery, transport, timer, delivery, or generic-action authority");
 
-console.log(`\n${passed} passed`);
+// The bridge accepts the exact immutable invocation produced by the existing
+// plane, not a look-alike direct API. This covers all four fixed callbacks
+// without adding a fifth action or a route-level adapter.
+(async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-head-domain-"));
+  fs.chmodSync(directory, DIRECTORY_MODE);
+  try {
+  const workTaskDomain = domain(directory);
+  workTaskDomain.initialize();
+  // #1036/#1044: the plane now also exacts the beside-the-pipeline controls,
+  // which the server composes around this durable domain.  The controls here
+  // only prove composition; the plane's status preflight for every action
+  // still lands on this domain's own get_pipeline_status.
+  const plane = createHeadControlPlane({ binding, domain: composeHeadDomain(binding, workTaskDomain, {
+    read_project_status: () => ({ monitor: { mode: "suspended" } }),
+    read_review_handoff: () => ({ cycle: null }),
+    project_monitor: async ({ command }) => ({ applied: true, command }),
+    recover_worker: async () => ({ applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false }),
+  }) });
+  const observed = await plane.execute(planeRequest("get_pipeline_status", null));
+  const put = await plane.execute(planeRequest("put_batch_manifest", 0, { manifest: copy(manifest()) }));
+  const frozen = await plane.execute(planeRequest("freeze_batch_manifest", 1, null));
+  assert.equal(observed.result.status.revision, 0);
+  assert.equal(put.result.status.revision, 1);
+  assert.equal(frozen.result.status.revision, 2);
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  const advanced = advanceToAccepted(directory, store.readRecoverySnapshot({ installation_id: binding.installation_id, project_id: binding.project_id }));
+  const ready = await plane.execute(planeRequest("get_pipeline_status", null, null, { correlation_id: "corr_plane_ready", idempotency_key: "idem_plane_ready" }));
+  assert.equal(ready.result.status.revision, 3);
+  assert.equal(ready.result.status.cut_safe, true);
+  const cut = await plane.execute(planeRequest("cut_batch", 3, {
+    cut: { tasks: [{ work_task_ref: copy(advanced.ref), candidate_digest: advanced.candidate.candidate_digest }] },
+  }, { correlation_id: "corr_plane_cut", idempotency_key: "idem_plane_cut" }));
+  assert.equal(cut.decision.kind, "accepted");
+  assert.equal(cut.result.status.revision, 4);
+  const beside = await plane.execute(planeRequest("get_project_status", null, null, { correlation_id: "corr_plane_project", idempotency_key: "idem_plane_project" }));
+  assert.equal(beside.decision.code, "head_control_project_observed");
+  assert.equal(beside.result.status.revision, 4, "a beside-the-pipeline read preflights status through this durable domain");
+  ok(true, "all fixed Head-control plane callbacks bind to the durable WorkTask domain, including the composed monitor/recovery controls");
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  console.log(`\n${passed} passed`);
+})().catch((error) => { console.error(error); process.exit(1); });
+
+

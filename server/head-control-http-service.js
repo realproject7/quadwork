@@ -23,9 +23,19 @@ const ACTIONS = Object.freeze([
   "retire_batch",
   "queue_local_correction",
   "read_propagation_stop",
+  "get_project_status",
+  "review_handoff",
+  "project_monitor",
+  "recover_worker",
 ]);
 const ACTION_SET = new Set(ACTIONS);
-const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
+// Reads and the two beside-the-pipeline controls carry no optimistic revision.
+const REVISION_FREE_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
+const MONITOR_COMMANDS = new Set(["start", "stop", "evaluate_now"]);
+const RECOVERABLE_ROLES = new Set(["dev", "re1", "re2"]);
+const RECOVERY_REASONS = new Set(["process_exited", "unresponsive", "resource_killed", "launch_failed"]);
+const GENERATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const ATTEMPT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const ERROR_TYPES = Object.freeze(new Set([
   "not_found",
   "invalid_request",
@@ -179,13 +189,39 @@ function sameServiceBinding(left, right) {
 
 function commandArguments(tool, value) {
   if (!plain(value)) throw new TypeError("arguments must be an object");
-  if (tool === "get_pipeline_status") {
+  if (tool === "get_pipeline_status" || tool === "get_project_status" || tool === "review_handoff") {
     exact(value, ["idempotency_key", "correlation_id"]);
     return freeze({
       expected_revision: null,
       idempotency_key: identifier(value.idempotency_key),
       correlation_id: identifier(value.correlation_id),
       payload: null,
+    });
+  }
+  if (tool === "project_monitor") {
+    exact(value, ["idempotency_key", "correlation_id", "command"]);
+    if (typeof value.command !== "string" || !MONITOR_COMMANDS.has(value.command)) throw new TypeError("command is invalid");
+    return freeze({
+      expected_revision: null,
+      idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id),
+      payload: freeze({ command: value.command }),
+    });
+  }
+  if (tool === "recover_worker") {
+    exact(value, ["idempotency_key", "correlation_id", "recovery"]);
+    if (!plain(value.recovery)) throw new TypeError("recovery is invalid");
+    exact(value.recovery, ["agent", "expected_generation", "assignment_attempt", "reason_code"]);
+    if (!RECOVERABLE_ROLES.has(value.recovery.agent) || !RECOVERY_REASONS.has(value.recovery.reason_code) ||
+        typeof value.recovery.expected_generation !== "string" || !GENERATION_RE.test(value.recovery.expected_generation) ||
+        typeof value.recovery.assignment_attempt !== "string" || !ATTEMPT_RE.test(value.recovery.assignment_attempt)) {
+      throw new TypeError("recovery is invalid");
+    }
+    return freeze({
+      expected_revision: null,
+      idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id),
+      payload: freeze({ recovery: boundedJson(value.recovery) }),
     });
   }
   if (tool === "freeze_batch_manifest" || tool === "retire_batch") {
@@ -302,7 +338,7 @@ function planeAudit(value, owner, action) {
     action,
     correlation_id: identifier(value.correlation_id),
     idempotency_key: identifier(value.idempotency_key),
-    expected_revision: revision(value.expected_revision, READ_ACTIONS.has(action)),
+    expected_revision: revision(value.expected_revision, REVISION_FREE_ACTIONS.has(action)),
     decision: value.decision,
     code: code(value.code),
     result: actionResult(value.result, action),
@@ -357,7 +393,7 @@ function durableAudit(value, owner) {
     action: value.action,
     correlation_id: identifier(value.correlation_id),
     idempotency_key: identifier(value.idempotency_key),
-    preconditions: freeze({ expected_revision: revision(value.preconditions.expected_revision, READ_ACTIONS.has(value.action)) }),
+    preconditions: freeze({ expected_revision: revision(value.preconditions.expected_revision, REVISION_FREE_ACTIONS.has(value.action)) }),
     decision: value.decision,
     code: code(value.code),
     result: actionResult(value.result, value.action),
@@ -405,7 +441,7 @@ function createHeadControlHttpService(options) {
     throw new TypeError("Head-control HTTP dependencies are required");
   }
 
-  function handle(request, authContext) {
+  async function handle(request, authContext) {
     let parsedRequest;
     try {
       exact(request, ["method", "path", "body"]);
@@ -447,7 +483,7 @@ function createHeadControlHttpService(options) {
         correlation_id: parsedRequest.arguments.correlation_id,
         payload: parsedRequest.arguments.payload,
       });
-      return success(commandResult(resolved.execute(command), owner, parsedRequest.tool));
+      return success(commandResult(await resolved.execute(command), owner, parsedRequest.tool));
     } catch {
       // Error objects can contain token, path, or backend diagnostics.  The
       // boundary intentionally emits one fixed type instead of forwarding any
