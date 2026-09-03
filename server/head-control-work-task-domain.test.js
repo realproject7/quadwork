@@ -355,6 +355,31 @@ withDirectory((directory) => {
   ok(true, "corrupt and foreign controller state fail closed instead of silently reinitializing");
 });
 
+// A Head generation bump (archive then unarchive) adopts the durable state
+// only through the explicit initialize() transition.  Until then, and for the
+// superseded generation afterwards, the state stays exactly as unreadable as
+// any other foreign binding.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
+  const next = { ...binding, generation: 8 };
+  const successor = createHeadControlWorkTaskDomain({
+    binding: next, config_dir: directory, fs, resolve_registered_identity: resolveRegisteredIdentity, now: () => "2026-09-02T00:00:00.000Z",
+  });
+  const successorRequest = () => ({ ...request("get_pipeline_status", null), binding: copy(next) });
+  throwsCode(() => successor.get_pipeline_status(successorRequest()), "head_control_work_task_state_identity_mismatch");
+  const adopted = successor.initialize();
+  assert.equal(adopted.revision, 1);
+  assert.equal(adopted.stage, "manifest");
+  assert.deepEqual(adopted.binding, next);
+  assert.equal(successor.get_pipeline_status(successorRequest()).manifest_frozen, false);
+  assert.match(fs.readFileSync(headControlWorkTaskDomainPath(directory, binding), "utf8"), /"generation":8/);
+  throwsCode(() => current.get_pipeline_status(request("get_pipeline_status", null)), "head_control_work_task_state_identity_mismatch");
+  throwsCode(() => current.initialize(), "head_control_work_task_state_identity_mismatch");
+  ok(true, "a newer Head generation adopts durable state through initialize() while the stale generation stays locked out");
+});
+
 withDirectory((directory) => {
   const current = domain(directory);
   current.initialize();
