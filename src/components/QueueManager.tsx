@@ -68,13 +68,17 @@ function generateTemplate(issues: Issue[], repositories: Repository[]): string {
   lines.push("");
   lines.push("## Rules");
   lines.push("");
-  lines.push("1. Assign ONE ticket at a time to @dev");
-  lines.push("2. Wait for @re1 AND @re2 to both approve before merging");
-  lines.push("3. After merge, immediately assign the next ticket");
-  lines.push("4. PR titles: [#<issue>] Short description");
-  lines.push("5. Branch naming: task/<issue-number>-<slug>");
-  lines.push("6. NEVER store keys/secrets");
-  lines.push("7. Communicate via project chat by tagging agents");
+  lines.push("1. Head reads this file at startup and after every merge, cut, or batch closure.");
+  lines.push("2. One Dev build task at a time. Head may assign the next independent task with a");
+  lines.push("   disjoint file boundary while RE1 and RE2 review the previous candidate;");
+  lines.push("   dependent or overlapping tasks wait.");
+  lines.push("3. Merge only after the server's [MERGE GATE DUE] for the exact PR SHA and Head's");
+  lines.push("   own live gate. Head never manually fans implementation reviewers.");
+  lines.push("4. After a merge or cut, move terminal items to ## Done and assign the next");
+  lines.push("   non-conflicting item.");
+  lines.push("5. PR titles: [#<issue>] Short description");
+  lines.push("6. Branch naming: task/<issue-number>-<slug>");
+  lines.push("7. NEVER store keys/secrets");
   lines.push("8. Do NOT push to main — only merge approved PRs");
   lines.push("");
 

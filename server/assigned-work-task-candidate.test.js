@@ -138,6 +138,23 @@ function options(ref) {
   }, options(idle.ref)), "work_task_candidate_assignment_unavailable");
 }
 
+// A SHA-1 repository is the ordinary case.  Every sibling module in this chain
+// (work-task-candidate, work-task-dev-candidate-service, work-task-managed-worktree,
+// work-task-pipeline) accepts a 40- or 64-hex object id, so this wrapper must too:
+// a 64-hex-only guard here silently rejected every submission from a real SHA-1 repo.
+{
+  const sha1Candidate = "d".repeat(40);
+  const current = pipeline();
+  const candidate = buildAssignedWorkTaskCandidate({
+    version: 1,
+    pipeline: current.pipeline,
+    work_task_ref: copy(current.ref),
+    candidate_sha: sha1Candidate,
+  }, options(current.ref));
+  assert.equal(candidate.candidate_sha, sha1Candidate);
+  assert.equal(candidate.managed_worktree.head_sha, sha1Candidate);
+}
+
 // The command wrapper owns no config, route, transport, Git, or publication
 // capability. Those authority seams must be composed by the server runtime.
 {

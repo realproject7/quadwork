@@ -67,11 +67,12 @@ implementation-PR route; Head remains the review-batch closer.
 
 ## Compatibility with implementation reviews
 
-Review batches never change the implementation-PR route. Until the server
-advertises #1048 implementation-review dispatch, the installed V1 Dev fanout remains
-the sole legacy route. After the server advertises the capability, only its
-exact-SHA dispatch is valid. Head never manually fans implementation reviewers,
-and `[ASSIGN REVIEW-BATCH]` never substitutes for that dispatcher.
+Review batches never change the implementation-PR route. The server's #1048
+exact-SHA implementation-review dispatch is the sole valid route: it owns the
+review cycle for a PR at a specific SHA, and a verdict against any other SHA
+never carries forward. The V1 Dev fanout is retired — Head never manually fans
+implementation reviewers, and `[ASSIGN REVIEW-BATCH]` never substitutes for that
+dispatcher.
 
 ## Evidence and API budget
 

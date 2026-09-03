@@ -10,7 +10,7 @@ const { assertWorkTaskPipeline } = require("./work-task-pipeline");
 const { buildWorkTaskCandidate } = require("./work-task-candidate");
 
 const VERSION = 1;
-const SHA_RE = /^[a-f0-9]{64}$/;
+const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 class AssignedWorkTaskCandidateError extends Error {
   constructor(code, message = code) {
