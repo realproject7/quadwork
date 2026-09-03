@@ -53,6 +53,12 @@ function fixture() {
     read_repository_state() { return null; },
     read_cached_repository_snapshot() { return null; },
     now: () => new Date("2026-09-01T00:00:00.000Z"),
+    project_controls: {
+      read_project_status: () => ({ assignment: null, monitor: { mode: "suspended" }, workers: {}, capacity: { platform: "test" } }),
+      read_review_handoff: () => ({ cycle: null }),
+      project_monitor: async ({ command }) => ({ applied: true, command, mode: command === "stop" ? "suspended" : "enabled" }),
+      recover_worker: async () => ({ applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false }),
+    },
   });
   return {
     runtime,
@@ -73,6 +79,7 @@ function ok(value, message) {
   console.log(`  PASS: ${message}`);
 }
 
+(async () => {
 // After an unarchive the durable domain file still carries the superseded
 // admission generation until the new Head's first command adopts it.  The
 // read-only operator surface must report "no current batch" for that window
@@ -81,7 +88,7 @@ function ok(value, message) {
   const live = fixture();
   try {
     assert.deepEqual(live.runtime.registerHeadToken({ project_id, generation, token }), { project_id, actor: "head", generation });
-    assert.equal(live.runtime.handle(request(), { token }).ok, true);
+    assert.equal((await live.runtime.handle(request(), { token })).ok, true);
     assert.equal(live.runtime.readCurrentBatchProjection({ project_id }).active, false);
 
     live.archive();
@@ -105,19 +112,19 @@ function ok(value, message) {
     ok(true, "the operator read seam reports no V2 batch without a Head token or durable-state bootstrap");
 
     assert.deepEqual(live.runtime.registerHeadToken({ project_id, generation, token }), { project_id, actor: "head", generation });
-    const first = live.runtime.handle(request(), { token });
+    const first = await live.runtime.handle(request(), { token });
     assert.equal(first.ok, true);
     assert.equal(first.result.decision.kind, "accepted");
     assert.equal(first.result.result.status.revision, 0);
-    const retry = live.runtime.handle(request(), { token });
+    const retry = await live.runtime.handle(request(), { token });
     assert.equal(retry.ok, true);
     assert.equal(retry.result.decision.kind, "replayed");
     ok(true, "one current file-chat Head token composes the durable service and preserves its receipt");
 
     live.runtime.registerHeadToken({ project_id, generation, token: replacement });
-    const old = live.runtime.handle(request(), { token });
+    const old = await live.runtime.handle(request(), { token });
     assert.deepEqual(old, { ok: false, error: { type: "authentication_failed" } });
-    const fresh = live.runtime.handle(request({ body: {
+    const fresh = await live.runtime.handle(request({ body: {
       version: 1,
       binding: { project_id, actor: "head", generation },
       request: { tool: "get_pipeline_status", arguments: { idempotency_key: "idem_runtime_new", correlation_id: "corr_runtime_new" } },
@@ -126,7 +133,7 @@ function ok(value, message) {
     ok(true, "a replacement launch revokes the preceding Head token before any service lookup");
 
     live.sessions.delete(`${project_id}/head`);
-    const inactive = live.runtime.handle(request({ body: {
+    const inactive = await live.runtime.handle(request({ body: {
       version: 1,
       binding: { project_id, actor: "head", generation },
       request: { tool: "get_pipeline_status", arguments: { idempotency_key: "idem_runtime_idle", correlation_id: "corr_runtime_idle" } },
@@ -137,7 +144,7 @@ function ok(value, message) {
     const revoked = live.runtime.revokeProject(project_id);
     assert.equal(revoked.ok, true);
     assert(revoked.resources.head_control_bindings >= 1);
-    const after = live.runtime.handle(request({ body: {
+    const after = await live.runtime.handle(request({ body: {
       version: 1,
       binding: { project_id, actor: "head", generation },
       request: { tool: "get_pipeline_status", arguments: { idempotency_key: "idem_runtime_revoked", correlation_id: "corr_runtime_revoked" } },
@@ -150,3 +157,4 @@ function ok(value, message) {
 }
 
 console.log(`\n${passed} passed`);
+})().catch((error) => { console.error(error); process.exit(1); });

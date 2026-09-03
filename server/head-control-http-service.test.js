@@ -47,12 +47,31 @@ function status(overrides = {}) {
 
 function fakeDomain() {
   let current = status();
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const controlPayloads = [];
   const domain = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
       assert.deepEqual(input.binding, OWNER);
       return clone(current);
+    },
+    get_project_status() {
+      calls.get_project_status += 1;
+      return { status: clone(current), detail: { assignment: null, monitor: { mode: "suspended" }, workers: {}, capacity: { platform: "test" } } };
+    },
+    review_handoff() {
+      calls.review_handoff += 1;
+      return { status: clone(current), detail: { cycle: null } };
+    },
+    async project_monitor(input) {
+      calls.project_monitor += 1;
+      controlPayloads.push(clone(input.payload));
+      return { status: clone(current), detail: { applied: true, command: input.payload.command, mode: "enabled" } };
+    },
+    async recover_worker(input) {
+      calls.recover_worker += 1;
+      controlPayloads.push(clone(input.payload));
+      return { status: clone(current), detail: { applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false } };
     },
     retire_batch(input) {
       calls.retire_batch += 1;
@@ -102,7 +121,7 @@ function fakeDomain() {
       return clone(current);
     },
   };
-  return { domain, calls };
+  return { domain, calls, controlPayloads };
 }
 
 function temporaryDirectory() {
@@ -166,12 +185,13 @@ function ok(value, message) {
   console.log(`  PASS: ${message}`);
 }
 
+(async () => {
 // The adapter sees the public envelope, but the binding used for the service
 // is rebuilt from the authenticated and live proofs rather than caller data.
 {
   const fixture = createFixture();
   const argumentsValue = statusArguments();
-  const first = fixture.handler.handle(request("get_pipeline_status", argumentsValue), { token: TOKEN });
+  const first = await fixture.handler.handle(request("get_pipeline_status", argumentsValue), { token: TOKEN });
   assert.equal(first.ok, true);
   assert.equal(first.result.decision.kind, "accepted");
   assert.deepEqual(first.result.audit.binding, OWNER);
@@ -179,13 +199,13 @@ function ok(value, message) {
   assert.equal(fixture.calls.get_pipeline_status, 1);
   ok(true, "authenticated Head binding is re-proved before the fixed service command");
 
-  const replay = fixture.handler.handle(request("get_pipeline_status", argumentsValue), { token: TOKEN });
+  const replay = await fixture.handler.handle(request("get_pipeline_status", argumentsValue), { token: TOKEN });
   assert.equal(replay.ok, true);
   assert.equal(replay.result.decision.kind, "replayed");
   assert.equal(fixture.calls.get_pipeline_status, 1);
   ok(true, "an exact idempotent replay stays inside the service receipt and does not re-run the domain");
 
-  const audit = fixture.handler.handle(request("recent_head_control_audit", {}), { token: TOKEN });
+  const audit = await fixture.handler.handle(request("recent_head_control_audit", {}), { token: TOKEN });
   assert.equal(audit.ok, true);
   assert.equal(audit.result.length, 1);
   assert.deepEqual(audit.result[0].binding, OWNER);
@@ -196,7 +216,7 @@ function ok(value, message) {
 // or caller-supplied principal reaches the fixed domain surface.
 {
   const fixture = createFixture();
-  const put = fixture.handler.handle(request("put_batch_manifest", {
+  const put = await fixture.handler.handle(request("put_batch_manifest", {
     expected_revision: 0,
     idempotency_key: "idem_http_put_one",
     correlation_id: "corr_http_put_one",
@@ -206,7 +226,7 @@ function ok(value, message) {
   assert.equal(put.result.result.action, "put_batch_manifest");
   assert.equal(fixture.calls.put_batch_manifest, 1);
 
-  const freeze = fixture.handler.handle(request("freeze_batch_manifest", {
+  const freeze = await fixture.handler.handle(request("freeze_batch_manifest", {
     expected_revision: 1,
     idempotency_key: "idem_http_freeze_one",
     correlation_id: "corr_http_freeze_one",
@@ -214,7 +234,7 @@ function ok(value, message) {
   assert.equal(freeze.ok, true);
   assert.equal(fixture.calls.freeze_batch_manifest, 1);
 
-  const cut = fixture.handler.handle(request("cut_batch", {
+  const cut = await fixture.handler.handle(request("cut_batch", {
     expected_revision: 2,
     idempotency_key: "idem_http_cut_one",
     correlation_id: "corr_http_cut_one",
@@ -224,7 +244,7 @@ function ok(value, message) {
   assert.equal(fixture.calls.cut_batch, 1);
   ok(true, "put, freeze, and cut preserve only their static M1 command mappings");
 
-  const stop = fixture.handler.handle(request("read_propagation_stop", {
+  const stop = await fixture.handler.handle(request("read_propagation_stop", {
     idempotency_key: "idem_http_stop_one",
     correlation_id: "corr_http_stop_one",
     work_task_ref: { task_key: "build" },
@@ -234,7 +254,7 @@ function ok(value, message) {
   assert.deepEqual(JSON.parse(JSON.stringify(stop.result.detail)), { kind: "propagation_stop_pending", dependency_chain: [{ task_key: "build" }] });
   assert.equal(Object.hasOwn(stop.result.audit, "detail"), false);
   assert.equal(fixture.calls.read_propagation_stop, 1);
-  const correction = fixture.handler.handle(request("queue_local_correction", {
+  const correction = await fixture.handler.handle(request("queue_local_correction", {
     expected_revision: 3,
     idempotency_key: "idem_http_corr_one",
     correlation_id: "corr_http_corr_one",
@@ -243,7 +263,7 @@ function ok(value, message) {
   assert.equal(correction.ok, true);
   assert.equal(correction.result.detail.outcome, "queued");
   assert.equal(fixture.calls.queue_local_correction, 1);
-  const retire = fixture.handler.handle(request("retire_batch", {
+  const retire = await fixture.handler.handle(request("retire_batch", {
     expected_revision: 4,
     idempotency_key: "idem_http_retire_one",
     correlation_id: "corr_http_retire_one",
@@ -257,7 +277,7 @@ function ok(value, message) {
     ["correction with an extra field", { expected_revision: 5, idempotency_key: "idem_http_corr_bad", correlation_id: "corr_http_corr_bad", correction: { work_task_ref: {}, review_round_ref: {}, candidate_digest: "e".repeat(64), actor: "head" } }],
     ["retirement with a payload", { expected_revision: 5, idempotency_key: "idem_http_retire_bad", correlation_id: "corr_http_retire_bad", manifest: {} }],
   ]) {
-    error(fixture.handler.handle(request(label.includes("stop") ? "read_propagation_stop" : label.includes("correction") ? "queue_local_correction" : "retire_batch", argumentsValue), { token: TOKEN }), "invalid_request");
+    error(await fixture.handler.handle(request(label.includes("stop") ? "read_propagation_stop" : label.includes("correction") ? "queue_local_correction" : "retire_batch", argumentsValue), { token: TOKEN }), "invalid_request");
   }
   assert.deepEqual([fixture.calls.read_propagation_stop, fixture.calls.queue_local_correction, fixture.calls.retire_batch], [1, 1, 1]);
   ok(true, "stop read, correction, and retirement map to their static commands, carry a bounded detail, and reject any extra field");
@@ -265,7 +285,7 @@ function ok(value, message) {
 
 {
   const fixture = createFixture();
-  const unauthorized = fixture.handler.handle(request("get_pipeline_status", statusArguments("auth")), { token: "wrong-token" });
+  const unauthorized = await fixture.handler.handle(request("get_pipeline_status", statusArguments("auth")), { token: "wrong-token" });
   error(unauthorized, "authentication_failed");
   assert.equal(fixture.authCalls.resolveBinding, 0);
   assert.equal(fixture.authCalls.resolveService, 0);
@@ -281,7 +301,7 @@ for (const [label, mutate] of [
   const fixture = createFixture();
   const forged = request("get_pipeline_status", statusArguments(`forged_${label}`));
   mutate(forged.body);
-  error(fixture.handler.handle(forged, { token: TOKEN }), "binding_mismatch");
+  error(await fixture.handler.handle(forged, { token: TOKEN }), "binding_mismatch");
   assert.equal(fixture.authCalls.resolveBinding, 0);
   assert.equal(fixture.authCalls.resolveService, 0);
   ok(true, `a forged ${label} binding is rejected before live or service resolution`);
@@ -290,10 +310,10 @@ for (const [label, mutate] of [
 {
   const fixture = createFixture();
   const malformedSelector = request("get_pipeline_status", { ...statusArguments("selector"), action: "cut_batch" });
-  error(fixture.handler.handle(malformedSelector, { token: TOKEN }), "invalid_request");
+  error(await fixture.handler.handle(malformedSelector, { token: TOKEN }), "invalid_request");
   const unknownTool = request("publish_batch", {});
-  error(fixture.handler.handle(unknownTool, { token: TOKEN }), "invalid_request");
-  const wrongPath = fixture.handler.handle({ ...request("get_pipeline_status", statusArguments("path")), path: "/api/other" }, { token: TOKEN });
+  error(await fixture.handler.handle(unknownTool, { token: TOKEN }), "invalid_request");
+  const wrongPath = await fixture.handler.handle({ ...request("get_pipeline_status", statusArguments("path")), path: "/api/other" }, { token: TOKEN });
   error(wrongPath, "not_found");
   assert.equal(fixture.authCalls.resolveService, 0);
   ok(true, "unknown selectors, tools, and endpoints cannot become generic service operations");
@@ -305,7 +325,7 @@ for (const [label, live] of [
   ["stale", { ...LIVE, generation: LIVE.generation + 1 }],
 ]) {
   const fixture = createFixture({ resolveLaunchBinding: () => live });
-  const result = fixture.handler.handle(request("get_pipeline_status", statusArguments(label)), { token: TOKEN });
+  const result = await fixture.handler.handle(request("get_pipeline_status", statusArguments(label)), { token: TOKEN });
   error(result, label === "stale" ? "binding_mismatch" : "binding_inactive");
   assert.equal(fixture.authCalls.resolveService, 0);
   ok(true, `${label} live launch state fails closed before the Head-control service`);
@@ -323,7 +343,7 @@ for (const [label, live] of [
       };
     },
   });
-  const malformed = fixture.handler.handle(request("get_pipeline_status", statusArguments("malformed_result")), { token: TOKEN });
+  const malformed = await fixture.handler.handle(request("get_pipeline_status", statusArguments("malformed_result")), { token: TOKEN });
   error(malformed, "service_unavailable");
   assert(!JSON.stringify(malformed).includes(TOKEN));
   ok(true, "a malformed or secret-bearing service result is redacted to one bounded error type");
@@ -335,8 +355,13 @@ for (const [label, live] of [
   }), TypeError);
   const source = fs.readFileSync(path.join(__dirname, "head-control-http-service.js"), "utf8");
   assert.doesNotMatch(source, /require\s*\(/);
-  assert.doesNotMatch(source, /express|createServer|listen\s*\(|github|file-chat|monitor|worker|recovery|child_process|exec\s*\(|spawn\s*\(|(?:node:)?fs|shell/i);
+  // The fixed tool and field names of #1036/#1044 necessarily spell "monitor"
+  // and "worker"; strip those identifiers so the guard still catches a real
+  // capability (a listener, filesystem, shell, chat, or GitHub access).
+  const stripped = source.replace(/\b(?:project_monitor|recover_worker|MONITOR_COMMANDS|RECOVERY_REASONS|RECOVERABLE_ROLES|recovery)\b/g, "");
+  assert.doesNotMatch(stripped, /express|createServer|listen\s*\(|github|file-chat|monitor|worker|recovery|child_process|exec\s*\(|spawn\s*\(|(?:node:)?fs|shell/i);
   ok(true, "the adapter has no listener, filesystem, shell, chat, monitor, worker, or GitHub capability");
 }
 
 console.log(`\n${passed} passed`);
+})().catch((error) => { console.error(error); process.exit(1); });

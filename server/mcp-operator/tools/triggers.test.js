@@ -246,15 +246,34 @@ async function runTests() {
     const { server, port, requests } = await startServer();
     const ctx = createContext(port);
     requests.length = 0;
-    const res = await handlers.start_batch({ project: "plotlink", interval_min: 15, duration_min: 180 }, ctx);
-    assert(res && res.enabled === true, "start_batch returns the enabled trigger info");
+    const res = await handlers.start_batch({ project: "plotlink" }, ctx);
+    assert(res && res.enabled === true, "start_batch returns the enabled monitor info");
     assert(batchReads(requests).length === 2, "start_batch joins batch-active and batch-progress");
     const post = triggerPosts(requests)[0];
     assert(post && post.url === "/api/triggers/plotlink/start", "start_batch POSTs to /api/triggers/<project>/start");
-    assert(post.body.interval === 15 && post.body.duration === 180, "start_batch maps interval_min→interval, duration_min→duration");
-    assert(!("interval_min" in post.body) && !("duration_min" in post.body), "start_batch does NOT send *_min keys");
-    assert(!("message" in post.body), "start_batch omits absent fields (no message key)");
+    assert(!("interval" in post.body) && !("duration" in post.body) && !("message" in post.body), "start_batch sends no message, interval, or duration");
     assert(hasExactV2Identity(post.body), "start_batch carries the exact V2 owned assignment identity");
+
+    // #1036: authoring inputs are rejected before any HTTP call.
+    for (const [name, invoke] of [
+      ["start_batch message", () => handlers.start_batch({ project: "plotlink", message: "@head @dev @re1 @re2 Queue check" }, ctx)],
+      ["start_batch interval_min", () => handlers.start_batch({ project: "plotlink", interval_min: 15 }, ctx)],
+      ["start_batch duration_min", () => handlers.start_batch({ project: "plotlink", duration_min: 180 }, ctx)],
+      ["trigger_now message", () => handlers.trigger_now({ project: "plotlink", message: "Review open PRs" }, ctx)],
+      ["stop_batch mode", () => handlers.stop_batch({ project: "plotlink", mode: "all-agents" }, ctx)],
+    ]) {
+      requests.length = 0;
+      const err = await expectThrows(invoke);
+      assert(err && /Trigger authoring was removed/.test(err.message), `${name} is rejected as removed trigger authoring`);
+      assert(requests.length === 0, `${name} rejection makes NO authority read or mutation POST`);
+    }
+    for (const def of require("./triggers").defs) {
+      const fields = Object.keys(def.inputSchema.properties);
+      assert(fields.length === 1 && fields[0] === "project" && def.inputSchema.additionalProperties === false,
+        `${def.name} schema exposes only project`);
+      assert(!/every `interval_min`|send.*every N minutes|all agents/i.test(def.description) && /Project Monitor/.test(def.description),
+        `${def.name} description promises the Head-only Project Monitor, not a periodic all-agent message`);
+    }
     server.close();
   }
 
@@ -307,15 +326,13 @@ async function runTests() {
     const { server, port, requests } = await startServer({ state: v1LiveState() });
     const ctx = createContext(port);
     requests.length = 0;
-    await handlers.start_batch({ project: "plotlink", message: "@head go" }, ctx);
+    await handlers.start_batch({ project: "plotlink" }, ctx);
     const post = triggerPosts(requests)[0];
-    assert(post.body.message === "@head go" && !("interval" in post.body) && !("duration" in post.body), "start_batch sends only the provided trigger option");
     assert(JSON.stringify(post.body) === JSON.stringify({
-      message: "@head go",
       admission_generation: ADMISSION_GENERATION,
       compatibility_mode: "v1",
       batch_observation_fingerprint: "legacy-observation-mcp-4",
-    }), "legacy start sends explicit V1 authority plus its observation lease");
+    }), "legacy start sends explicit V1 authority plus its observation lease and nothing else");
 
     requests.length = 0;
     await handlers.trigger_now({ project: "plotlink" }, ctx);

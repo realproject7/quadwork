@@ -14,6 +14,10 @@ const MAX_RESPONSE_BYTES = 256 * 1024;
 const IDENTIFIER_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TOKEN_RE = /^[^\s\r\n]{16,512}$/;
+const RECOVERABLE_ROLES = new Set(["dev", "re1", "re2"]);
+const RECOVERY_REASONS = new Set(["process_exited", "unresponsive", "resource_killed", "launch_failed"]);
+const GENERATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const ATTEMPT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 function plain(value) {
   return !!value && typeof value === "object" && !Array.isArray(value) &&
@@ -241,6 +245,74 @@ const TOOL_DEFS = Object.freeze([
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }),
   Object.freeze({
+    name: "get_project_status",
+    description: "Read this project's current qualified assignment, Project Monitor state and last evaluation, each worker's raw session health/generation/observation times, the redacted capacity summary, and the merged_but_not_advanced / loaded_next_item_unassigned observations. Observation times matter: `running` alone is not proof of health.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+      },
+      required: ["idempotency_key", "correlation_id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
+    name: "review_handoff",
+    description: "Read the structured current-cycle review handoff for the active repository-qualified item: repo key, PR, exact SHA, cycle id, readiness, CI, review 0/2 1/2 2/2 or changes_requested, mergeability, reviewer receipt presence, and whether the Head merge gate is due. Read-only: it never creates, repeats, or cancels a review request.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+      },
+      required: ["idempotency_key", "correlation_id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
+    name: "project_monitor",
+    description: "Control the fixed-policy Head-only Project Monitor: `start` enables observation of the current qualified assignment (refused when archived, not V2-ready, or no active batch), `stop` suspends it, `evaluate_now` runs one deduplicated evaluation of cached/live facts and delivers a Head event only when a fixed-policy transition is genuinely due. It accepts no message, cadence, recipient, or broadcast mode.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        command: { type: "string", enum: ["start", "stop", "evaluate_now"] },
+      },
+      required: ["idempotency_key", "correlation_id", "command"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
+    name: "recover_worker",
+    description: "Request one bounded relaunch of dev, re1, or re2 after structured loss evidence (exited/unresponsive/resource_killed/launch_failed) for the current assignment attempt and the exact lost generation. Refused for head, a healthy or unconfirmed session, a stale generation, a non-current assignment, an archived project, or an open circuit/insufficient capacity. Returns the lifecycle result verbatim: `spawned` is not `verified` and is never recovery.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        recovery: {
+          type: "object",
+          properties: {
+            agent: { type: "string", enum: ["dev", "re1", "re2"] },
+            expected_generation: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" },
+            assignment_attempt: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" },
+            reason_code: { type: "string", enum: ["process_exited", "unresponsive", "resource_killed", "launch_failed"] },
+          },
+          required: ["agent", "expected_generation", "assignment_attempt", "reason_code"],
+          additionalProperties: false,
+        },
+      },
+      required: ["idempotency_key", "correlation_id", "recovery"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
     name: "recent_head_control_audit",
     description: "Read the bounded redacted Head-control audit for this launch binding.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -254,9 +326,22 @@ function commandArguments(name, value) {
   if (!TOOL_NAMES.has(name)) fail("tool is unknown");
   if (!plain(value)) fail("arguments must be an object");
   let parsed;
-  if (name === "get_pipeline_status") {
+  if (name === "get_pipeline_status" || name === "get_project_status" || name === "review_handoff") {
     exact(value, ["idempotency_key", "correlation_id"]);
     parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id) };
+  } else if (name === "project_monitor") {
+    exact(value, ["idempotency_key", "correlation_id", "command"]);
+    if (!["start", "stop", "evaluate_now"].includes(value.command)) fail("command is invalid");
+    parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id), command: value.command };
+  } else if (name === "recover_worker") {
+    exact(value, ["idempotency_key", "correlation_id", "recovery"]);
+    if (!plain(value.recovery)) fail("recovery is invalid");
+    exact(value.recovery, ["agent", "expected_generation", "assignment_attempt", "reason_code"]);
+    const recovery = value.recovery;
+    if (!RECOVERABLE_ROLES.has(recovery.agent) || !RECOVERY_REASONS.has(recovery.reason_code) ||
+        typeof recovery.expected_generation !== "string" || !GENERATION_RE.test(recovery.expected_generation) ||
+        typeof recovery.assignment_attempt !== "string" || !ATTEMPT_RE.test(recovery.assignment_attempt)) fail("recovery is invalid");
+    parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id), recovery: copyJson(recovery) };
   } else if (name === "freeze_batch_manifest" || name === "retire_batch") {
     exact(value, ["expected_revision", "idempotency_key", "correlation_id"]);
     parsed = {

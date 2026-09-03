@@ -141,6 +141,12 @@ async function run() {
     agent_sessions: sessions,
     ...liveReaders(),
     now: () => new Date("2026-09-02T00:00:00.000Z"),
+    project_controls: {
+      read_project_status: () => ({ assignment: null, monitor: { mode: "suspended" }, workers: {}, capacity: { platform: "test" } }),
+      read_review_handoff: () => ({ cycle: null }),
+      project_monitor: async () => ({ applied: false, reason: "not_exercised_here" }),
+      recover_worker: async () => ({ applied: false, outcome: "rejected", reason: "not_exercised_here", recovered: false }),
+    },
   });
   runtime.registerHeadToken({ project_id, generation, token });
 
@@ -150,12 +156,12 @@ async function run() {
     let raw = "";
     req.setEncoding("utf8");
     req.on("data", (chunk) => { raw += chunk; });
-    req.on("end", () => {
+    req.on("end", async () => {
       let response;
       try {
         const header = req.headers["x-head-control-token"];
         const headerToken = typeof header === "string" ? header : null;
-        response = runtime.handle({ method: req.method, path: req.url, body: JSON.parse(raw) }, { token: headerToken });
+        response = await runtime.handle({ method: req.method, path: req.url, body: JSON.parse(raw) }, { token: headerToken });
       } catch {
         response = { ok: false, error: { type: "service_unavailable" } };
       }
@@ -175,7 +181,7 @@ async function run() {
   try {
     console.log("\n--- Head-control end-to-end (shim -> route -> runtime -> durable domain) ---\n");
     const tools = await shim.handshake();
-    assert.deepEqual(tools, ["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "queue_local_correction", "read_propagation_stop", "recent_head_control_audit"]);
+    assert.deepEqual(tools, ["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit"]);
     const empty = await shim.call("get_pipeline_status", { idempotency_key: "idem_e2e_status_0", correlation_id: "corr_e2e_status_0" });
     assert.equal(empty.decision.code, "head_control_status_observed");
     assert.equal(empty.result.status.revision, 0);
