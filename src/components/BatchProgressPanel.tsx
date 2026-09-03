@@ -41,6 +41,33 @@ interface BatchProgressItem {
   // #871: present only on review-batch items (extends the shape from #870).
   review_state?: "queued" | "in-review" | "approved" | "changes-requested";
   approvals?: number; // 0..2
+  // #1048: current exact-SHA review cycle for a code item with a live PR.
+  // Readiness, CI, and reviews are orthogonal facts; the UI renders all three
+  // instead of the scalar `in_review` label. Absent when no cycle is current.
+  review_handoff?: ReviewHandoff | null;
+}
+
+type ReviewReadiness = "draft_or_not_ready" | "contract_changed" | "ready";
+type ReviewCi =
+  | "unknown" | "pending" | "pass" | "product_failure" | "control_plane_failure"
+  | "cancelled" | "missing_required" | "missing_policy" | "ci_less_pending" | "ci_less_pass";
+type ReviewCount = "not_dispatched" | "0/2" | "1/2" | "2/2" | "changes_requested";
+
+interface ReviewHandoff {
+  pr_number: number;
+  readiness: ReviewReadiness;
+  ci: ReviewCi;
+  review: ReviewCount;
+  head_gate_due: boolean;
+  dev_fix_owner: boolean;
+}
+
+interface ReviewHandoffCopy {
+  readiness: Record<ReviewReadiness, string>;
+  ci: Record<ReviewCi, string>;
+  review: Record<ReviewCount, string>;
+  headGateDue: string;
+  devFix: string;
 }
 
 interface BatchProgressData {
@@ -149,6 +176,22 @@ const COPY = {
       reconcile: "reconciling", changes_requested: "changes requested", accepted: "accepted", staged: "staged",
       blocked: "blocked", deferred: "deferred",
     },
+    // #1048: orthogonal current-cycle facts, e.g. "PR #12 · ready · CI pending · reviews 1/2".
+    handoff: {
+      readiness: { draft_or_not_ready: "draft", contract_changed: "contract changed", ready: "ready" },
+      ci: {
+        unknown: "CI unknown", pending: "CI pending", pass: "CI pass", product_failure: "CI failed",
+        control_plane_failure: "CI control-plane failure", cancelled: "CI cancelled",
+        missing_required: "CI missing required checks", missing_policy: "CI policy missing",
+        ci_less_pending: "CI-less pending", ci_less_pass: "CI-less pass",
+      },
+      review: {
+        not_dispatched: "reviews not dispatched", "0/2": "reviews 0/2", "1/2": "reviews 1/2", "2/2": "reviews 2/2",
+        changes_requested: "changes requested",
+      },
+      headGateDue: "head gate due",
+      devFix: "dev fix",
+    },
   },
   ko: {
     loading: "배치 진행 상황 로딩 중...",
@@ -192,8 +235,32 @@ const COPY = {
       reconcile: "조정 중", changes_requested: "변경 요청", accepted: "승인", staged: "스테이징",
       blocked: "차단됨", deferred: "보류됨",
     },
+    // #1048: 준비/CI/리뷰 상태를 따로 표시 — 예: "PR #12 · 준비됨 · CI 대기 · 리뷰 1/2".
+    handoff: {
+      readiness: { draft_or_not_ready: "초안", contract_changed: "계약 변경됨", ready: "준비됨" },
+      ci: {
+        unknown: "CI 미확인", pending: "CI 대기", pass: "CI 통과", product_failure: "CI 실패",
+        control_plane_failure: "CI 제어 오류", cancelled: "CI 취소됨",
+        missing_required: "CI 필수 검사 누락", missing_policy: "CI 정책 없음",
+        ci_less_pending: "CI 없음 · 대기", ci_less_pass: "CI 없음 · 통과",
+      },
+      review: {
+        not_dispatched: "리뷰 미배정", "0/2": "리뷰 0/2", "1/2": "리뷰 1/2", "2/2": "리뷰 2/2",
+        changes_requested: "변경 요청됨",
+      },
+      headGateDue: "헤드 머지 게이트",
+      devFix: "개발 수정 필요",
+    },
   },
 } as const;
+
+// #1048: render readiness, CI, and review together — never a scalar "in review".
+function handoffLabel(handoff: ReviewHandoff, c: ReviewHandoffCopy): string {
+  const parts = [`PR #${handoff.pr_number}`, c.readiness[handoff.readiness], c.ci[handoff.ci], c.review[handoff.review]];
+  if (handoff.head_gate_due) parts.push(c.headGateDue);
+  else if (handoff.dev_fix_owner) parts.push(c.devFix);
+  return parts.join(" · ");
+}
 
 // #871: localized label for a review-batch item, derived from review_state.
 function reviewLabel(item: BatchProgressItem, rs: { queued: string; inReview: string; oneOfTwo: string; finalizing: string; approved: string; changesRequested: string }): string {
@@ -420,8 +487,15 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
           // gets the warning token. Code items (no review_state) use the
           // server label exactly as before.
           const isReviewItem = !!item.review_state;
-          const displayLabel = isReviewItem ? reviewLabel(item, t.rs) : item.label;
-          const isChanges = item.review_state === "changes-requested";
+          // #1048: a current review cycle renders its orthogonal dimensions;
+          // the server's scalar label is only the fallback when no cycle exists.
+          const handoff = item.review_handoff ?? null;
+          const displayLabel = handoff
+            ? handoffLabel(handoff, t.handoff)
+            : isReviewItem ? reviewLabel(item, t.rs) : item.label;
+          const labelClass = handoff?.head_gate_due
+            ? "text-accent"
+            : handoff?.dev_fix_owner || item.review_state === "changes-requested" ? "text-warning" : "text-text";
           const itemKey = workItemReactKey(item);
           const itemRefLabel = workItemDisplayLabel(item, data.multi_repository === true);
           const row = (
@@ -433,7 +507,7 @@ export default function BatchProgressPanel({ projectId, idle = false }: BatchPro
               <span className="text-[11px] text-text-muted tabular-nums shrink-0 w-9 text-right">
                 {item.progress}%
               </span>
-              <span className={`text-[11px] truncate flex-1 min-w-0 ${isChanges ? "text-warning" : "text-text"}`}>
+              <span className={`text-[11px] truncate flex-1 min-w-0 ${labelClass}`} title={displayLabel}>
                 {displayLabel}
               </span>
             </div>
