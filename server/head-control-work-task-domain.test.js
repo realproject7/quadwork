@@ -550,6 +550,38 @@ withDirectory((directory) => {
   ok(true, "an interrupted retirement heals to empty from the retired record and accepts a successor manifest");
 });
 
+// Linux reuses inode numbers eagerly, so a lock replaced after this writer
+// closed its descriptor can report the original dev+ino. The stubbed lstat
+// forces exactly that; only the lock token can then prove the replacement.
+withDirectory((directory) => {
+  domain(directory).initialize();
+  const lockPath = `${headControlWorkTaskDomainPath(directory, binding)}.lock`;
+  let inspections = 0;
+  let original = null;
+  const replacingFs = Object.create(fs);
+  replacingFs.lstatSync = (target) => {
+    if (target !== lockPath) return fs.lstatSync(target);
+    inspections += 1;
+    if (inspections === 1) {
+      original = fs.lstatSync(target);
+      return original;
+    }
+    if (inspections === 2) {
+      fs.unlinkSync(lockPath);
+      fs.writeFileSync(lockPath, "replacement-writer-lock", { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+    }
+    const stats = fs.lstatSync(target);
+    stats.dev = original.dev;
+    stats.ino = original.ino;
+    return stats;
+  };
+  const current = domain(directory, { fs: replacingFs });
+  throwsCode(() => current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) })), "head_control_work_task_state_lock_release_failed");
+  assert.equal(inspections, 2);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+  ok(true, "a replacement lock carrying the original dev+ino is never unlinked by the original writer");
+});
+
 const source = fs.readFileSync(path.join(__dirname, "head-control-work-task-domain.js"), "utf8");
 assert.doesNotMatch(source, /head-control-audit-store|require\s*\(\s*["'](?:node:)?(?:http|https|net|child_process)["']\s*\)/);
 assert.doesNotMatch(source, /(?:setInterval\s*\(|setTimeout\s*\(|publish_delivery|createServer|registerAction)/);

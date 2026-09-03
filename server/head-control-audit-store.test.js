@@ -188,6 +188,37 @@ function testDirectorySymlinkAndStaleLockFailClosed() {
   expectCode(() => separateStore.append({ binding: BINDING, audit: audit(2) }), "head_control_audit_store_locked");
 }
 
+// Linux reuses inode numbers eagerly, so a lock replaced after this writer
+// closed its descriptor can report the original dev+ino. The stubbed lstat
+// forces exactly that; only the lock token can then prove the replacement.
+function testForcedInodeReuseFailsClosedOnRelease() {
+  const configDir = temporaryConfigDirectory();
+  const lockPath = `${headControlAuditStorePath(configDir, BINDING)}.lock`;
+  let inspections = 0;
+  let original = null;
+  const replacingFs = Object.create(fs);
+  replacingFs.lstatSync = (target) => {
+    if (target !== lockPath) return fs.lstatSync(target);
+    inspections += 1;
+    if (inspections === 1) {
+      original = fs.lstatSync(target);
+      return original;
+    }
+    if (inspections === 2) {
+      fs.unlinkSync(lockPath);
+      fs.writeFileSync(lockPath, "replacement-writer-lock", { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+    }
+    const stats = fs.lstatSync(target);
+    stats.dev = original.dev;
+    stats.ino = original.ino;
+    return stats;
+  };
+  const store = createHeadControlAuditStore({ config_dir: configDir, fs: replacingFs });
+  expectCode(() => store.append({ binding: BINDING, audit: audit() }), "head_control_audit_store_lock_release_failed");
+  assert.equal(inspections, 2);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+}
+
 function testNoTransportOrProcessSurface() {
   const source = fs.readFileSync(path.join(__dirname, "head-control-audit-store.js"), "utf8");
   assert.doesNotMatch(source, /require\(["'](?:express|http|child_process|\.\/mcp-chat-shim)["']\)/);
@@ -199,5 +230,6 @@ testIdentityConflictsAndRedactionBoundary();
 testBoundedRotationRetainsCurrentCorrelation();
 testCorruptSymlinkAndPermissionsFailClosed();
 testDirectorySymlinkAndStaleLockFailClosed();
+testForcedInodeReuseFailsClosedOnRelease();
 testNoTransportOrProcessSurface();
 console.log("head-control-audit-store tests passed");

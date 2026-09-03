@@ -361,4 +361,43 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
   } finally { removeDirectory(directory); }
 }
 
+// Linux reuses inode numbers eagerly, so a lock replaced after this writer
+// closed its descriptor can report the original dev+ino. The stubbed lstat
+// forces exactly that; only the lock token can then prove the replacement.
+{
+  const directory = temporaryDirectory();
+  try {
+    const contracts = validContracts();
+    const ref = contracts.manifest.delivery_candidate_ref;
+    const initial = store(directory);
+    initial.initialize({ expected: expected(ref, null), delivery_manifest: copy(contracts.manifest) });
+    const lockPath = `${deliveryCandidateStorePath(directory, ref)}.lock`;
+    let lockStats = 0;
+    let original = null;
+    const replacingFs = {
+      ...fs,
+      lstatSync(target) {
+        if (target !== lockPath) return fs.lstatSync(target);
+        lockStats += 1;
+        if (lockStats === 1) {
+          original = fs.lstatSync(target);
+          return original;
+        }
+        if (lockStats === 2) {
+          fs.unlinkSync(target);
+          fs.writeFileSync(target, "replacement", { mode: 0o600, flag: "wx" });
+        }
+        const stats = fs.lstatSync(target);
+        stats.dev = original.dev;
+        stats.ino = original.ino;
+        return stats;
+      },
+    };
+    throwsCode(() => store(directory, replacingFs).recordComposed(recordInput(contracts)), "delivery_candidate_store_lock_release_failed");
+    assert.equal(lockStats, 2);
+    assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement");
+    assert.equal(initial.readSnapshot(ref).revision, 1, "a replacement carrying the original dev+ino is never unlinked by the old writer");
+  } finally { removeDirectory(directory); }
+}
+
 console.log("delivery-candidate-store tests passed");

@@ -115,6 +115,10 @@ function lockPathFor(statePath) { return `${statePath}.lock`; }
 function temporaryPathFor(statePath) {
   return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
 }
+// The lock file body is this writer's proof of ownership. dev+ino alone cannot
+// prove it: Linux reuses an inode number as soon as the old lock is unlinked
+// and closed, so a replacement lock can carry the original's identity.
+function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
 function modeOf(stats) { return stats.mode & 0o777; }
 function lstatOrNull(fs, target) {
   try { return fs.lstatSync(target); }
@@ -260,6 +264,7 @@ function lockStat(fs, lockPath) {
 }
 function acquireLock(fs, statePath) {
   const lockPath = lockPathFor(statePath);
+  const token = lockToken();
   let descriptor;
   let ownStat = null;
   try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); }
@@ -271,6 +276,7 @@ function acquireLock(fs, statePath) {
     fail("batch_request_state_store_lock_failed", "state store lock cannot be acquired");
   }
   try {
+    fs.writeFileSync(descriptor, token, "utf8");
     fs.chmodSync(lockPath, FILE_MODE);
     fs.fsyncSync(descriptor);
     ownStat = fs.fstatSync(descriptor);
@@ -280,18 +286,18 @@ function acquireLock(fs, statePath) {
   } catch (error) {
     try { fs.closeSync(descriptor); } catch { /* fail closed */ }
     try {
-      if (sameFile(ownStat, lockStat(fs, lockPath))) fs.unlinkSync(lockPath);
+      if (sameFile(ownStat, lockStat(fs, lockPath)) && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
     } catch { /* replacement remains fail closed */ }
     if (error instanceof BatchRequestStateStoreError) throw error;
     fail("batch_request_state_store_lock_failed", "state store lock cannot be initialized");
   }
-  return { descriptor, lockPath, stat: ownStat };
+  return { descriptor, lockPath, stat: ownStat, token };
 }
 function releaseLock(fs, lock) {
   let closeError = null;
   try { fs.closeSync(lock.descriptor); } catch (error) { closeError = error; }
   try {
-    if (!sameFile(lock.stat, lockStat(fs, lock.lockPath))) {
+    if (!sameFile(lock.stat, lockStat(fs, lock.lockPath)) || fs.readFileSync(lock.lockPath, "utf8") !== lock.token) {
       fail("batch_request_state_store_lock_release_failed", "state store lock changed before release");
     }
     fs.unlinkSync(lock.lockPath);

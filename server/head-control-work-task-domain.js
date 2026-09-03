@@ -384,6 +384,10 @@ function readState(fs, statePath, owner, allowMissing, adoptGeneration = false) 
   }
 }
 function temporaryPath(statePath) { return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`; }
+// The lock file body is this writer's proof of ownership. dev+ino alone cannot
+// prove it: Linux reuses an inode number as soon as the old lock is unlinked
+// and closed, so a replacement lock can carry the original's identity.
+function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
 function writeState(fs, statePath, state, owner) {
   const checked = assertState(state, owner);
   const temporary = temporaryPath(statePath);
@@ -416,6 +420,7 @@ function lockStats(fs, target) {
 }
 function withWriterLock(fs, statePath, action) {
   const lockPath = `${statePath}.lock`;
+  const token = lockToken();
   let descriptor, own;
   try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); }
   catch (error) {
@@ -423,7 +428,7 @@ function withWriterLock(fs, statePath, action) {
     fail("head_control_work_task_state_lock_failed", "domain state lock cannot be acquired");
   }
   try {
-    fs.chmodSync(lockPath, FILE_MODE); fs.fsyncSync(descriptor); own = fs.fstatSync(descriptor);
+    fs.writeFileSync(descriptor, token, "utf8"); fs.chmodSync(lockPath, FILE_MODE); fs.fsyncSync(descriptor); own = fs.fstatSync(descriptor);
     if (!sameFile(own, lockStats(fs, lockPath))) fail("head_control_work_task_state_lock_failed", "domain state lock changed during acquisition");
     return action();
   } catch (error) {
@@ -432,7 +437,7 @@ function withWriterLock(fs, statePath, action) {
     let releaseError = null;
     try { fs.closeSync(descriptor); } catch { releaseError = new HeadControlWorkTaskDomainError("head_control_work_task_state_lock_release_failed"); }
     try {
-      if (!sameFile(own, lockStats(fs, lockPath))) fail("head_control_work_task_state_lock_release_failed", "domain state lock changed before release");
+      if (!sameFile(own, lockStats(fs, lockPath)) || fs.readFileSync(lockPath, "utf8") !== token) fail("head_control_work_task_state_lock_release_failed", "domain state lock changed before release");
       fs.unlinkSync(lockPath);
     } catch (error) { releaseError = error instanceof HeadControlWorkTaskDomainError ? error : new HeadControlWorkTaskDomainError("head_control_work_task_state_lock_release_failed"); }
     if (releaseError) throw releaseError;

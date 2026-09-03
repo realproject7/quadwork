@@ -272,4 +272,37 @@ withDirectory((directory) => {
   assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
 });
 
+// Linux reuses inode numbers eagerly, so a lock replaced after this writer
+// closed its descriptor can report the original dev+ino. The stubbed lstat
+// forces exactly that; only the lock token can then prove the replacement.
+withDirectory((directory) => {
+  const { state } = initialized(directory);
+  const result = watcherResult(state.subscription_state);
+  const statePath = batchRequestStateStorePath(directory, owner);
+  const lockPath = `${statePath}.lock`;
+  let inspections = 0;
+  let original = null;
+  const replacingFs = Object.create(fs);
+  replacingFs.lstatSync = (target) => {
+    if (target !== lockPath) return fs.lstatSync(target);
+    inspections += 1;
+    if (inspections === 1) {
+      original = fs.lstatSync(target);
+      return original;
+    }
+    if (inspections === 2) {
+      fs.unlinkSync(lockPath);
+      fs.writeFileSync(lockPath, "replacement-writer-lock", { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+    }
+    const stats = fs.lstatSync(target);
+    stats.dev = original.dev;
+    stats.ino = original.ino;
+    return stats;
+  };
+  const store = createBatchRequestStateStore({ config_dir: directory, fs: replacingFs });
+  throwsCode(() => store.applyWatcherResult({ expected: { ...owner, revision: 0 }, result }), "batch_request_state_store_lock_release_failed");
+  assert.equal(inspections, 2);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+});
+
 console.log("batch-request-state-store tests passed");
