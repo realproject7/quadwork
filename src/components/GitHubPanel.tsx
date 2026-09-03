@@ -5,6 +5,7 @@ import InfoTooltip from "./InfoTooltip";
 import OvernightQueueModal from "./OvernightQueueModal";
 import BatchProgressPanel from "./BatchProgressPanel";
 import { useLocale } from "@/components/LocaleProvider";
+import { workItemDisplayLabel } from "@/lib/batchIdentity";
 
 const COPY = {
   en: {
@@ -63,8 +64,16 @@ const COPY = {
   },
 } as const;
 
-interface Issue {
+// #1031: every row from /api/github/* carries its registered repository
+// (repo_key + repo). A V2 project can bind two repositories, so a bare
+// number is not an identity — keys and labels are repository-qualified.
+interface RepoRow {
   number: number;
+  repo_key?: string;
+  repo?: string;
+}
+
+interface Issue extends RepoRow {
   title: string;
   state: string;
   assignees: { login: string }[];
@@ -77,8 +86,7 @@ interface Review {
   body: string;
 }
 
-interface PR {
-  number: number;
+interface PR extends RepoRow {
   title: string;
   state: string;
   author: { login: string };
@@ -92,14 +100,31 @@ interface PR {
 // #411 / quadwork#281: minimal shape for the recently-closed lists.
 // Both endpoints return the same fields the panel needs, so a single
 // type covers both columns.
-interface ClosedItem {
-  number: number;
+interface ClosedItem extends RepoRow {
   title: string;
   url: string;
 }
 
+// #1031: repository-qualified React key — `web#42` and `api#42` never collide.
+function rowKey(row: RepoRow): string {
+  return `${row.repo_key ?? ""}#${row.number}`;
+}
+
 function StatusDot({ color }: { color: string }) {
   return <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${color}`} />;
+}
+
+// #1031: `#42` for a single-repository project, `[web] #42` when the project
+// registers more than one repository (hover shows the full repository name).
+function RowNumber({ row, multiRepository }: { row: RepoRow; multiRepository: boolean }) {
+  return (
+    <span
+      className="text-[11px] text-text-muted min-w-8 shrink-0 whitespace-nowrap"
+      title={multiRepository ? row.repo : undefined}
+    >
+      {workItemDisplayLabel(row, multiRepository)}
+    </span>
+  );
 }
 
 function issueStatusColor(state: string): string {
@@ -143,6 +168,8 @@ function ciLabel(rollup: { state: string }[]): string {
 interface GitHubPanelProps {
   projectId: string;
   idle?: boolean;
+  /** #1031: true when the project registers more than one repository. */
+  multiRepository?: boolean;
 }
 
 // #554: rate limit status shape from /api/github/rate-limit
@@ -154,7 +181,7 @@ interface RateLimitInfo {
   critical: boolean;
 }
 
-export default function GitHubPanel({ projectId, idle = false }: GitHubPanelProps) {
+export default function GitHubPanel({ projectId, idle = false, multiRepository = false }: GitHubPanelProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -266,14 +293,14 @@ export default function GitHubPanel({ projectId, idle = false }: GitHubPanelProp
             )}
             {issues.map((issue) => (
               <a
-                key={issue.number}
+                key={rowKey(issue)}
                 href={issue.url}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-2 px-3 py-1 font-mono hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
               >
                 <StatusDot color={issueStatusColor(issue.state)} />
-                <span className="text-[11px] text-text-muted w-8 shrink-0">#{issue.number}</span>
+                <RowNumber row={issue} multiRepository={multiRepository} />
                 <span className="text-[11px] text-text truncate flex-1 min-w-0">{issue.title}</span>
                 {issue.assignees?.[0] && (
                   <span className="text-[10px] text-text-muted shrink-0">
@@ -292,14 +319,14 @@ export default function GitHubPanel({ projectId, idle = false }: GitHubPanelProp
             )}
             {closedIssues.map((issue) => (
               <a
-                key={`closed-${issue.number}`}
+                key={`closed-${rowKey(issue)}`}
                 href={issue.url}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-2 px-3 py-1 font-mono opacity-60 hover:opacity-100 hover:bg-[#1a1a1a] transition-all cursor-pointer border-b border-border/30"
               >
                 <span className="text-[11px] text-text-muted shrink-0">✓</span>
-                <span className="text-[11px] text-text-muted w-8 shrink-0">#{issue.number}</span>
+                <RowNumber row={issue} multiRepository={multiRepository} />
                 <span className="text-[11px] text-text-muted truncate flex-1 min-w-0">{issue.title}</span>
               </a>
             ))}
@@ -339,14 +366,14 @@ export default function GitHubPanel({ projectId, idle = false }: GitHubPanelProp
 
               return (
                 <a
-                  key={pr.number}
+                  key={rowKey(pr)}
                   href={pr.url}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center gap-2 px-3 py-1 font-mono hover:bg-[#1a1a1a] transition-colors cursor-pointer border-b border-border/50"
                 >
                   <StatusDot color={reviewColor(decision)} />
-                  <span className="text-[11px] text-text-muted w-8 shrink-0">#{pr.number}</span>
+                  <RowNumber row={pr} multiRepository={multiRepository} />
                   <span className="text-[11px] text-text truncate flex-1 min-w-0">{pr.title}</span>
                   {pr.assignees?.[0] && (
                     <span className="text-[10px] text-text-muted shrink-0">
@@ -382,14 +409,14 @@ export default function GitHubPanel({ projectId, idle = false }: GitHubPanelProp
             )}
             {mergedPrs.map((pr) => (
               <a
-                key={`merged-${pr.number}`}
+                key={`merged-${rowKey(pr)}`}
                 href={pr.url}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-2 px-3 py-1 font-mono opacity-60 hover:opacity-100 hover:bg-[#1a1a1a] transition-all cursor-pointer border-b border-border/30"
               >
                 <span className="text-[11px] text-text-muted shrink-0">✓</span>
-                <span className="text-[11px] text-text-muted w-8 shrink-0">#{pr.number}</span>
+                <RowNumber row={pr} multiRepository={multiRepository} />
                 <span className="text-[11px] text-text-muted truncate flex-1 min-w-0">{pr.title}</span>
               </a>
             ))}
