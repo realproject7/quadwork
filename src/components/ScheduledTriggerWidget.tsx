@@ -204,7 +204,7 @@ function formatCountdown(ms: number): string {
 }
 
 /**
- * Bottom-right operator widget for the Scheduled Trigger (#210).
+ * Operator Features widget for the Scheduled Trigger (#210), in the right rail.
  *
  * Combines the old Keep Alive timer with a custom message textarea.
  * "Start Trigger" hands the typed message to
