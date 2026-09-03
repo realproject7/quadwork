@@ -42,9 +42,20 @@ interface V2RepositoryDraft {
   ci_policy?: Record<string, unknown>;
 }
 
+// Wizard form state for one registered repository. The primary is held by
+// the repo/workdir/policy steps; this shape only backs additional entries and
+// mirrors SettingsPage's V2RepositoryDraft minus the primary marker.
+interface V2RepositoryForm {
+  key: string;
+  repo: string;
+  working_dir: string;
+  policy: CiPolicyDraft;
+}
+
 interface V2SetupResult {
   ok?: boolean;
   code?: string;
+  repo_key?: string;
   reasons?: Array<{ code?: string; repo_key?: string }>;
   repositories?: Array<{
     key?: string;
@@ -60,6 +71,18 @@ const V2_ROLES = ["head", "re1", "re2", "dev"] as const;
 
 function listFromInput(value: string) {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function blankPolicy(): CiPolicyDraft {
+  return {
+    mode: "",
+    requiredChecks: "",
+    advisoryChecks: "",
+    checkKind: "product",
+    registrationGraceSeconds: "300",
+    sameShaRetryBudget: "0",
+    evidenceKeys: "",
+  };
 }
 
 function v2PolicyFromDraft(draft: CiPolicyDraft): Record<string, unknown> | undefined {
@@ -91,9 +114,23 @@ function v2PolicyFromDraft(draft: CiPolicyDraft): Record<string, unknown> | unde
   return undefined;
 }
 
+function v2RepositoryRecord(form: V2RepositoryForm, primary: boolean): V2RepositoryDraft {
+  // Same request record SettingsPage's requestRepositories builds: the policy
+  // is rebuilt from visible draft fields on every submission.
+  const policy = v2PolicyFromDraft(form.policy);
+  return {
+    key: form.key.trim(),
+    repo: form.repo.trim(),
+    working_dir: form.working_dir.trim(),
+    primary,
+    ...(policy ? { ci_policy: policy } : {}),
+  };
+}
+
 function v2SetupMessage(result: V2SetupResult): string {
   const reason = result.reasons?.[0];
   const code = reason?.code || result.code || "setup_request_failed";
+  const repoKey = reason?.repo_key || result.repo_key;
   const labels: Record<string, string> = {
     legacy_scalar: "Replace the legacy repository fields with the explicit V2 repository record.",
     repositories_required: "Add at least one repository.",
@@ -107,7 +144,8 @@ function v2SetupMessage(result: V2SetupResult): string {
     project_not_quiesced: "Quiesce this project before changing repository topology.",
     first_activation_legacy_project_blocked: "Quiesce the listed legacy project, then retry the first V2 activation.",
   };
-  return labels[code] || `V2 setup needs attention [${code}].`;
+  const label = labels[code] || `V2 setup needs attention [${code}].`;
+  return repoKey ? `${label} Repository: ${repoKey}.` : label;
 }
 
 function isAbsoluteLocalPath(value: string) {
@@ -293,6 +331,60 @@ const AGENTS = [
 
 /* ── Component ─────────────────────────────────────────────────────────── */
 
+// One CI evidence policy form, shared by the primary repository and every
+// additional repository so the two cannot drift apart.
+function CiPolicyFields({ idPrefix, draft, onChange }: {
+  idPrefix: string; draft: CiPolicyDraft; onChange: (updates: Partial<CiPolicyDraft>) => void;
+}) {
+  return (
+    <>
+      <select
+        id={`${idPrefix}-policy-mode`}
+        value={draft.mode}
+        onChange={(e) => onChange({ mode: e.target.value as CiPolicyMode })}
+        className="w-full md:w-72 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent"
+      >
+        <option value="" className="bg-bg-surface">Choose evidence policy…</option>
+        <option value="github-checks" className="bg-bg-surface">GitHub exact check registry</option>
+        <option value="ci-less" className="bg-bg-surface">CI-less Dev evidence receipt</option>
+      </select>
+      {draft.mode === "github-checks" && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+          <div>
+            <label className="text-[10px] text-text-muted block mb-1" htmlFor={`${idPrefix}-required-checks`}>Required exact check names</label>
+            <input id={`${idPrefix}-required-checks`} value={draft.requiredChecks} onChange={(e) => onChange({ requiredChecks: e.target.value })} placeholder="unit, typecheck" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+          </div>
+          <div>
+            <label className="text-[10px] text-text-muted block mb-1" htmlFor={`${idPrefix}-advisory-checks`}>Advisory exact check names (optional)</label>
+            <input id={`${idPrefix}-advisory-checks`} value={draft.advisoryChecks} onChange={(e) => onChange({ advisoryChecks: e.target.value })} placeholder="coverage" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+          </div>
+          <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`${idPrefix}-check-kind`}>Required check ownership
+            <select id={`${idPrefix}-check-kind`} value={draft.checkKind} onChange={(e) => onChange({ checkKind: e.target.value as "product" | "control-plane" })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent">
+              <option value="product" className="bg-bg-surface">Product</option>
+              <option value="control-plane" className="bg-bg-surface">Control plane</option>
+            </select>
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`${idPrefix}-grace`}>Registration grace (seconds)
+              <input id={`${idPrefix}-grace`} inputMode="numeric" value={draft.registrationGraceSeconds} onChange={(e) => onChange({ registrationGraceSeconds: e.target.value })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+            </label>
+            <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`${idPrefix}-retry-budget`}>Same-SHA retry budget
+              <input id={`${idPrefix}-retry-budget`} inputMode="numeric" value={draft.sameShaRetryBudget} onChange={(e) => onChange({ sameShaRetryBudget: e.target.value })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+            </label>
+          </div>
+        </div>
+      )}
+      {draft.mode === "ci-less" && (
+        <div className="mt-3 max-w-md">
+          <label className="text-[10px] text-text-muted block mb-1" htmlFor={`${idPrefix}-evidence-keys`}>Required Dev evidence keys</label>
+          <input id={`${idPrefix}-evidence-keys`} value={draft.evidenceKeys} onChange={(e) => onChange({ evidenceKeys: e.target.value })} placeholder="unit, typecheck" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+          <p className="text-[10px] text-text-muted mt-1">Comma-separated data identifiers; no command is stored or executed.</p>
+        </div>
+      )}
+    </>
+  );
+}
+
 function WorkdirStep({ repo, workingDir, setWorkingDir, error, onNext }: {
   repo: string; workingDir: string; setWorkingDir: (v: string) => void; error?: string; onNext: () => void;
 }) {
@@ -429,15 +521,10 @@ export default function SetupWizard() {
   const [cliStatus, setCliStatus] = useState<{ claude: boolean; codex: boolean; gemini: boolean; grok: boolean } | null>(null);
   // V2 keeps policy selection explicit. We intentionally do not derive a
   // policy from visible GitHub checks or from a legacy project setting.
-  const [ciPolicy, setCiPolicy] = useState<CiPolicyDraft>({
-    mode: "",
-    requiredChecks: "",
-    advisoryChecks: "",
-    checkKind: "product",
-    registrationGraceSeconds: "300",
-    sameShaRetryBudget: "0",
-    evidenceKeys: "",
-  });
+  const [ciPolicy, setCiPolicy] = useState<CiPolicyDraft>(blankPolicy);
+  // Repositories registered alongside the primary. Empty for the common
+  // single-repository setup; the primary itself never lives in this list.
+  const [extraRepos, setExtraRepos] = useState<V2RepositoryForm[]>([]);
   const [v2VerifyStatus, setV2VerifyStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [v2ProvisionStatus, setV2ProvisionStatus] = useState<"idle" | "running" | "done" | "error">("idle");
   const [v2ActivationConfirmed, setV2ActivationConfirmed] = useState(false);
@@ -463,7 +550,7 @@ export default function SetupWizard() {
     setV2ActivationConfirmed(false);
     setV2Result(null);
     setV2Message("");
-  }, [repo, workingDir, backends, autoApprove]);
+  }, [repo, workingDir, backends, autoApprove, extraRepos]);
 
   useEffect(() => {
     setSteps((prev) => [
@@ -593,15 +680,21 @@ export default function SetupWizard() {
     .replace(/[^a-z0-9-]/g, "")
     .slice(0, 64);
 
-  const v2Repositories = (): V2RepositoryDraft[] => {
-    const policy = v2PolicyFromDraft(ciPolicy);
-    return [{
-      key: "primary",
-      repo: repo.trim(),
-      working_dir: workingDir.trim(),
-      primary: true,
-      ...(policy ? { ci_policy: policy } : {}),
-    }];
+  const v2Repositories = (): V2RepositoryDraft[] => [
+    v2RepositoryRecord({ key: "primary", repo, working_dir: workingDir, policy: ciPolicy }, true),
+    ...extraRepos.map((form) => v2RepositoryRecord(form, false)),
+  ];
+
+  const updateExtraRepo = (index: number, updates: Partial<V2RepositoryForm>) => {
+    setExtraRepos((previous) => previous.map((form, i) => (i === index ? { ...form, ...updates } : form)));
+  };
+
+  const addExtraRepo = () => {
+    setExtraRepos((previous) => [...previous, { key: `repo-${previous.length + 2}`, repo: "", working_dir: "", policy: blankPolicy() }]);
+  };
+
+  const removeExtraRepo = (index: number) => {
+    setExtraRepos((previous) => previous.filter((_, i) => i !== index));
   };
 
   const v2Agents = () => {
@@ -1160,49 +1253,42 @@ export default function SetupWizard() {
                   </div>
                   <div className="border-t border-border pt-3">
                     <label className="text-[10px] uppercase tracking-wider text-text-muted block mb-2" htmlFor="v2-policy-mode">CI evidence policy</label>
-                    <select
-                      id="v2-policy-mode"
-                      value={ciPolicy.mode}
-                      onChange={(e) => updateCiPolicy({ mode: e.target.value as CiPolicyMode })}
-                      className="w-full md:w-72 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent"
-                    >
-                      <option value="" className="bg-bg-surface">Choose evidence policy…</option>
-                      <option value="github-checks" className="bg-bg-surface">GitHub exact check registry</option>
-                      <option value="ci-less" className="bg-bg-surface">CI-less Dev evidence receipt</option>
-                    </select>
-                    {ciPolicy.mode === "github-checks" && (
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
-                        <div>
-                          <label className="text-[10px] text-text-muted block mb-1" htmlFor="v2-required-checks">Required exact check names</label>
-                          <input id="v2-required-checks" value={ciPolicy.requiredChecks} onChange={(e) => updateCiPolicy({ requiredChecks: e.target.value })} placeholder="unit, typecheck" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
-                        </div>
-                        <div>
-                          <label className="text-[10px] text-text-muted block mb-1" htmlFor="v2-advisory-checks">Advisory exact check names (optional)</label>
-                          <input id="v2-advisory-checks" value={ciPolicy.advisoryChecks} onChange={(e) => updateCiPolicy({ advisoryChecks: e.target.value })} placeholder="coverage" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
-                        </div>
-                        <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor="v2-check-kind">Required check ownership
-                          <select id="v2-check-kind" value={ciPolicy.checkKind} onChange={(e) => updateCiPolicy({ checkKind: e.target.value as "product" | "control-plane" })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent">
-                            <option value="product" className="bg-bg-surface">Product</option>
-                            <option value="control-plane" className="bg-bg-surface">Control plane</option>
-                          </select>
-                        </label>
-                        <div className="grid grid-cols-2 gap-2">
-                          <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor="v2-grace">Registration grace (seconds)
-                            <input id="v2-grace" inputMode="numeric" value={ciPolicy.registrationGraceSeconds} onChange={(e) => updateCiPolicy({ registrationGraceSeconds: e.target.value })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
-                          </label>
-                          <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor="v2-retry-budget">Same-SHA retry budget
-                            <input id="v2-retry-budget" inputMode="numeric" value={ciPolicy.sameShaRetryBudget} onChange={(e) => updateCiPolicy({ sameShaRetryBudget: e.target.value })} className="bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
-                          </label>
-                        </div>
+                    <CiPolicyFields idPrefix="v2" draft={ciPolicy} onChange={updateCiPolicy} />
+                  </div>
+                  <div className="border-t border-border pt-3">
+                    <p className="text-[10px] uppercase tracking-wider text-text-muted">Additional repositories</p>
+                    <p className="text-[10px] text-text-muted mt-1 leading-snug">Optional. Each registered repository gets its own four role worktrees; the repository above stays primary.</p>
+                    {extraRepos.length > 0 && (
+                      <div className="mt-3 space-y-3">
+                        {extraRepos.map((repository, index) => (
+                          <div key={index} className="border border-border p-3 min-w-0">
+                            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3">
+                              <span className="text-[11px] text-text font-semibold">Repository {index + 2}</span>
+                              <button type="button" onClick={() => removeExtraRepo(index)} className="text-[10px] text-error hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent transition-colors">Remove</button>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                              <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`v2-repo-${index}-key`}>Repository key
+                                <input id={`v2-repo-${index}-key`} value={repository.key} onChange={(e) => updateExtraRepo(index, { key: e.target.value })} placeholder={`repo-${index + 2}`} className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                              </label>
+                              <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`v2-repo-${index}-name`}>Canonical GitHub repository
+                                <input id={`v2-repo-${index}-name`} value={repository.repo} onChange={(e) => updateExtraRepo(index, { repo: e.target.value })} placeholder="owner/repo" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
+                              </label>
+                              <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`v2-repo-${index}-base`}>Verified base clone
+                                <input id={`v2-repo-${index}-base`} value={repository.working_dir} onChange={(e) => updateExtraRepo(index, { working_dir: e.target.value })} placeholder="/absolute/path/to/repository" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text font-mono outline-none focus:border-accent" />
+                              </label>
+                            </div>
+                            {repository.working_dir && !isAbsoluteLocalPath(repository.working_dir) && (
+                              <p role="alert" className="text-[11px] text-[#ffcc00] mt-2">Use an absolute local path before V2 provisioning.</p>
+                            )}
+                            <div className="border-t border-border mt-3 pt-3">
+                              <label className="text-[10px] text-text-muted block mb-1" htmlFor={`v2-repo-${index}-policy-mode`}>CI evidence policy</label>
+                              <CiPolicyFields idPrefix={`v2-repo-${index}`} draft={repository.policy} onChange={(updates) => updateExtraRepo(index, { policy: { ...repository.policy, ...updates } })} />
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     )}
-                    {ciPolicy.mode === "ci-less" && (
-                      <div className="mt-3 max-w-md">
-                        <label className="text-[10px] text-text-muted block mb-1" htmlFor="v2-evidence-keys">Required Dev evidence keys</label>
-                        <input id="v2-evidence-keys" value={ciPolicy.evidenceKeys} onChange={(e) => updateCiPolicy({ evidenceKeys: e.target.value })} placeholder="unit, typecheck" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
-                        <p className="text-[10px] text-text-muted mt-1">Comma-separated data identifiers; no command is stored or executed.</p>
-                      </div>
-                    )}
+                    <button type="button" onClick={addExtraRepo} className="mt-3 px-2 py-1 text-[10px] border border-border text-text-muted hover:text-text hover:border-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent transition-colors">Add repository</button>
                   </div>
                   <div className="border-t border-border pt-3 flex flex-col sm:flex-row gap-2">
                     <button
@@ -1311,6 +1397,9 @@ export default function SetupWizard() {
               <span className="text-text-muted block mb-0.5">{t.preview.repo}</span>
               <span className="text-text">{repo || "\u2014"}</span>
               {enableProtection && <span className="text-[10px] text-accent block">{t.preview.branchProtection}</span>}
+              {extraRepos.map((repository, index) => (
+                <span key={index} className="text-[10px] text-text-muted block">+ {repository.repo || repository.key}</span>
+              ))}
             </div>
             <div>
               <span className="text-text-muted block mb-0.5">{t.preview.backends}</span>
