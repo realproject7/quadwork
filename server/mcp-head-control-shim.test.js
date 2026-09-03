@@ -128,7 +128,8 @@ async function run() {
     const listedAgain = await shim.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     assert.deepEqual(listedAgain.result?.tools?.map((tool) => tool.name), tools.map((tool) => tool.name));
     assert.deepEqual(tools.map((tool) => tool.name), [
-      "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "recent_head_control_audit",
+      "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch",
+      "retire_batch", "queue_local_correction", "read_propagation_stop", "recent_head_control_audit",
     ]);
     for (const tool of tools) {
       assert.equal(tool.inputSchema.additionalProperties, false);
@@ -136,7 +137,7 @@ async function run() {
       assert(!fields.includes("project") && !fields.includes("project_id") && !fields.includes("actor") &&
         !fields.includes("generation") && !fields.includes("action"));
     }
-    ok(true, "tools/list has exactly the five static Head-control operations and no caller binding or action selector");
+    ok(true, "tools/list has exactly the eight static Head-control operations and no caller binding or action selector");
 
     const statusArgs = { idempotency_key: "idem_status_001", correlation_id: "corr_status_001" };
     const status = await shim.send(call(3, "get_pipeline_status", statusArgs));
@@ -202,11 +203,38 @@ async function run() {
       cut: { tasks: [{ exact_task: "task-one" }] },
     }));
     assert.equal(cut.error, undefined);
+    const taskRef = { task_key: "task-one" };
+    const stop = await shim.send(call(40, "read_propagation_stop", {
+      idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001", work_task_ref: taskRef,
+    }));
+    assert.equal(stop.error, undefined);
+    const correction = await shim.send(call(41, "queue_local_correction", {
+      expected_revision: 3, idempotency_key: "idem_corr_001", correlation_id: "corr_corr_001",
+      correction: { work_task_ref: taskRef, review_round_ref: { round: 1 }, candidate_digest: "e".repeat(64) },
+    }));
+    assert.equal(correction.error, undefined);
+    const retire = await shim.send(call(42, "retire_batch", {
+      expected_revision: 4, idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001",
+    }));
+    assert.equal(retire.error, undefined);
     const audit = await shim.send(call(27, "recent_head_control_audit", {}));
     assert.deepEqual(JSON.parse(audit.result.content[0].text), []);
     assert.deepEqual(calls.slice(1).map((entry) => entry.body.request.tool), [
-      "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "recent_head_control_audit",
+      "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "read_propagation_stop", "queue_local_correction", "retire_batch", "recent_head_control_audit",
     ]);
+    assert.deepEqual(calls[4].body.request.arguments, { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001", work_task_ref: taskRef });
+    assert.deepEqual(calls[5].body.request.arguments.correction, { work_task_ref: taskRef, review_round_ref: { round: 1 }, candidate_digest: "e".repeat(64) });
+    assert.deepEqual(calls[6].body.request.arguments, { expected_revision: 4, idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001" });
+    assert.ok(calls.slice(4, 7).every((entry) => JSON.stringify(entry.body.binding) === JSON.stringify({ project_id: PROJECT, actor: "head", generation: GENERATION })));
+    for (const [label, name, argumentsValue] of [
+      ["retire with a payload", "retire_batch", { expected_revision: 4, idempotency_key: "idem_retire_bad", correlation_id: "corr_retire_bad", manifest: {} }],
+      ["stop read pinning a revision", "read_propagation_stop", { expected_revision: 4, idempotency_key: "idem_stop_bad", correlation_id: "corr_stop_bad", work_task_ref: taskRef }],
+      ["correction with a nested selector", "queue_local_correction", { expected_revision: 4, idempotency_key: "idem_corr_bad", correlation_id: "corr_corr_bad", correction: { work_task_ref: taskRef, review_round_ref: {}, candidate_digest: "e".repeat(64), actor: "head" } }],
+    ]) {
+      const rejected = await shim.send(call(43, name, argumentsValue));
+      assert.equal(rejected.error?.code, -32602, label);
+    }
+    assert.equal(calls.length, 8);
     ok(true, "each listed operation maps to its static endpoint command without a generic action field");
 
     reply = { status: 200, raw: "not-json" };

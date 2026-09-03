@@ -47,12 +47,29 @@ function status(overrides = {}) {
 
 function fakeDomain() {
   let current = status();
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0 };
   const domain = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
       assert.deepEqual(input.binding, OWNER);
       return clone(current);
+    },
+    retire_batch(input) {
+      calls.retire_batch += 1;
+      assert.equal(input.expected_revision, current.revision);
+      current = status({ revision: current.revision + 1 });
+      return clone(current);
+    },
+    queue_local_correction(input) {
+      calls.queue_local_correction += 1;
+      assert.deepEqual(Object.keys(input.payload.correction).sort(), ["candidate_digest", "review_round_ref", "work_task_ref"]);
+      current = status({ ...current, revision: current.revision + 1, pipeline_digest: "d".repeat(64), cut_safe: false });
+      return { status: clone(current), detail: { outcome: "queued", checkpoint_id: "checkpoint_" + "f".repeat(48) } };
+    },
+    read_propagation_stop(input) {
+      calls.read_propagation_stop += 1;
+      assert.deepEqual(Object.keys(input.payload), ["work_task_ref"]);
+      return { status: clone(current), detail: { kind: "propagation_stop_pending", dependency_chain: [{ task_key: input.payload.work_task_ref.task_key }] } };
     },
     put_batch_manifest(input) {
       calls.put_batch_manifest += 1;
@@ -206,6 +223,44 @@ function ok(value, message) {
   assert.equal(cut.ok, true);
   assert.equal(fixture.calls.cut_batch, 1);
   ok(true, "put, freeze, and cut preserve only their static M1 command mappings");
+
+  const stop = fixture.handler.handle(request("read_propagation_stop", {
+    idempotency_key: "idem_http_stop_one",
+    correlation_id: "corr_http_stop_one",
+    work_task_ref: { task_key: "build" },
+  }), { token: TOKEN });
+  assert.equal(stop.ok, true);
+  assert.equal(stop.result.decision.code, "head_control_stop_observed");
+  assert.deepEqual(JSON.parse(JSON.stringify(stop.result.detail)), { kind: "propagation_stop_pending", dependency_chain: [{ task_key: "build" }] });
+  assert.equal(Object.hasOwn(stop.result.audit, "detail"), false);
+  assert.equal(fixture.calls.read_propagation_stop, 1);
+  const correction = fixture.handler.handle(request("queue_local_correction", {
+    expected_revision: 3,
+    idempotency_key: "idem_http_corr_one",
+    correlation_id: "corr_http_corr_one",
+    correction: { work_task_ref: { task_key: "build" }, review_round_ref: { round: 1 }, candidate_digest: "e".repeat(64) },
+  }), { token: TOKEN });
+  assert.equal(correction.ok, true);
+  assert.equal(correction.result.detail.outcome, "queued");
+  assert.equal(fixture.calls.queue_local_correction, 1);
+  const retire = fixture.handler.handle(request("retire_batch", {
+    expected_revision: 4,
+    idempotency_key: "idem_http_retire_one",
+    correlation_id: "corr_http_retire_one",
+  }), { token: TOKEN });
+  assert.equal(retire.ok, true);
+  assert.equal(retire.result.result.status.manifest_digest, null);
+  assert.equal(retire.result.detail, null);
+  assert.equal(fixture.calls.retire_batch, 1);
+  for (const [label, argumentsValue] of [
+    ["revision-pinned stop read", { idempotency_key: "idem_http_stop_bad", correlation_id: "corr_http_stop_bad", work_task_ref: { task_key: "build" }, expected_revision: 4 }],
+    ["correction with an extra field", { expected_revision: 5, idempotency_key: "idem_http_corr_bad", correlation_id: "corr_http_corr_bad", correction: { work_task_ref: {}, review_round_ref: {}, candidate_digest: "e".repeat(64), actor: "head" } }],
+    ["retirement with a payload", { expected_revision: 5, idempotency_key: "idem_http_retire_bad", correlation_id: "corr_http_retire_bad", manifest: {} }],
+  ]) {
+    error(fixture.handler.handle(request(label.includes("stop") ? "read_propagation_stop" : label.includes("correction") ? "queue_local_correction" : "retire_batch", argumentsValue), { token: TOKEN }), "invalid_request");
+  }
+  assert.deepEqual([fixture.calls.read_propagation_stop, fixture.calls.queue_local_correction, fixture.calls.retire_batch], [1, 1, 1]);
+  ok(true, "stop read, correction, and retirement map to their static commands, carry a bounded detail, and reject any extra field");
 }
 
 {
@@ -263,7 +318,7 @@ for (const [label, live] of [
     resolveHeadControlService() {
       return {
         binding: OWNER,
-        execute() { return { version: 1, decision: { kind: "accepted", code: "head_control_ok" }, result: { secret: TOKEN }, audit: null }; },
+        execute() { return { version: 1, decision: { kind: "accepted", code: "head_control_ok" }, result: { secret: TOKEN }, audit: null, detail: null }; },
         recentAudit() { return []; },
       };
     },

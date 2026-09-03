@@ -186,6 +186,61 @@ const TOOL_DEFS = Object.freeze([
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }),
   Object.freeze({
+    name: "retire_batch",
+    description: "Retire the frozen batch at the supplied optimistic revision so a successor manifest can be put. Refused while any task holds build or review authority.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        expected_revision: { type: "integer", minimum: 0 },
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+      },
+      required: ["expected_revision", "idempotency_key", "correlation_id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
+    name: "queue_local_correction",
+    description: "Return one released changes-requested task candidate to Dev as a bounded local correction at the supplied optimistic revision.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        expected_revision: { type: "integer", minimum: 0 },
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correction: {
+          type: "object",
+          properties: {
+            work_task_ref: { type: "object" },
+            review_round_ref: { type: "object" },
+            candidate_digest: { type: "string", pattern: "^[a-f0-9]{64}$" },
+          },
+          required: ["work_task_ref", "review_round_ref", "candidate_digest"],
+          additionalProperties: false,
+        },
+      },
+      required: ["expected_revision", "idempotency_key", "correlation_id", "correction"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
+    name: "read_propagation_stop",
+    description: "Read the Head-private pending pre-release propagation stop for one task of the frozen batch, or null.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        work_task_ref: { type: "object" },
+      },
+      required: ["idempotency_key", "correlation_id", "work_task_ref"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
     name: "recent_head_control_audit",
     description: "Read the bounded redacted Head-control audit for this launch binding.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -202,7 +257,7 @@ function commandArguments(name, value) {
   if (name === "get_pipeline_status") {
     exact(value, ["idempotency_key", "correlation_id"]);
     parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id) };
-  } else if (name === "freeze_batch_manifest") {
+  } else if (name === "freeze_batch_manifest" || name === "retire_batch") {
     exact(value, ["expected_revision", "idempotency_key", "correlation_id"]);
     parsed = {
       expected_revision: revision(value.expected_revision),
@@ -229,6 +284,25 @@ function commandArguments(name, value) {
       idempotency_key: identifier(value.idempotency_key),
       correlation_id: identifier(value.correlation_id),
       cut: copyJson(value.cut),
+    };
+  } else if (name === "queue_local_correction") {
+    exact(value, ["expected_revision", "idempotency_key", "correlation_id", "correction"]);
+    if (!plain(value.correction)) fail("correction is invalid");
+    exact(value.correction, ["work_task_ref", "review_round_ref", "candidate_digest"]);
+    if (!plain(value.correction.work_task_ref) || !plain(value.correction.review_round_ref)) fail("correction is invalid");
+    parsed = {
+      expected_revision: revision(value.expected_revision),
+      idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id),
+      correction: copyJson(value.correction),
+    };
+  } else if (name === "read_propagation_stop") {
+    exact(value, ["idempotency_key", "correlation_id", "work_task_ref"]);
+    if (!plain(value.work_task_ref)) fail("work_task_ref is invalid");
+    parsed = {
+      idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id),
+      work_task_ref: copyJson(value.work_task_ref),
     };
   } else {
     exact(value, []);

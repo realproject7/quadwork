@@ -20,8 +20,12 @@ const ACTIONS = Object.freeze([
   "put_batch_manifest",
   "freeze_batch_manifest",
   "cut_batch",
+  "retire_batch",
+  "queue_local_correction",
+  "read_propagation_stop",
 ]);
 const ACTION_SET = new Set(ACTIONS);
+const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
 const ERROR_TYPES = Object.freeze(new Set([
   "not_found",
   "invalid_request",
@@ -184,13 +188,34 @@ function commandArguments(tool, value) {
       payload: null,
     });
   }
-  if (tool === "freeze_batch_manifest") {
+  if (tool === "freeze_batch_manifest" || tool === "retire_batch") {
     exact(value, ["expected_revision", "idempotency_key", "correlation_id"]);
     return freeze({
       expected_revision: revision(value.expected_revision),
       idempotency_key: identifier(value.idempotency_key),
       correlation_id: identifier(value.correlation_id),
       payload: null,
+    });
+  }
+  if (tool === "queue_local_correction") {
+    exact(value, ["expected_revision", "idempotency_key", "correlation_id", "correction"]);
+    if (!plain(value.correction)) throw new TypeError("correction is invalid");
+    exact(value.correction, ["work_task_ref", "review_round_ref", "candidate_digest"]);
+    return freeze({
+      expected_revision: revision(value.expected_revision),
+      idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id),
+      payload: freeze({ correction: boundedJson(value.correction) }),
+    });
+  }
+  if (tool === "read_propagation_stop") {
+    exact(value, ["idempotency_key", "correlation_id", "work_task_ref"]);
+    if (!plain(value.work_task_ref)) throw new TypeError("work_task_ref is invalid");
+    return freeze({
+      expected_revision: null,
+      idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id),
+      payload: freeze({ work_task_ref: boundedJson(value.work_task_ref) }),
     });
   }
   if (tool === "put_batch_manifest") {
@@ -277,7 +302,7 @@ function planeAudit(value, owner, action) {
     action,
     correlation_id: identifier(value.correlation_id),
     idempotency_key: identifier(value.idempotency_key),
-    expected_revision: revision(value.expected_revision, action === "get_pipeline_status"),
+    expected_revision: revision(value.expected_revision, READ_ACTIONS.has(action)),
     decision: value.decision,
     code: code(value.code),
     result: actionResult(value.result, action),
@@ -300,7 +325,7 @@ function parseServiceBinding(value) {
 }
 
 function commandResult(value, owner, action) {
-  exact(value, ["version", "decision", "result", "audit"]);
+  exact(value, ["version", "decision", "result", "audit", "detail"]);
   exact(value.decision, ["kind", "code"]);
   if (value.version !== VERSION || !["accepted", "denied", "replayed"].includes(value.decision.kind)) {
     throw new TypeError("command result is invalid");
@@ -313,7 +338,9 @@ function commandResult(value, owner, action) {
       (decision.kind !== "replayed" && (decision.kind !== audit.decision || decision.code !== audit.code))) {
     throw new TypeError("command receipt is invalid");
   }
-  return freeze({ version: VERSION, decision, result, audit });
+  const detail = value.detail === null ? null : boundedJson(value.detail);
+  if (detail !== null && !plain(value.detail)) throw new TypeError("command detail is invalid");
+  return freeze({ version: VERSION, decision, result, audit, detail });
 }
 
 function durableAudit(value, owner) {
@@ -330,7 +357,7 @@ function durableAudit(value, owner) {
     action: value.action,
     correlation_id: identifier(value.correlation_id),
     idempotency_key: identifier(value.idempotency_key),
-    preconditions: freeze({ expected_revision: revision(value.preconditions.expected_revision, value.action === "get_pipeline_status") }),
+    preconditions: freeze({ expected_revision: revision(value.preconditions.expected_revision, READ_ACTIONS.has(value.action)) }),
     decision: value.decision,
     code: code(value.code),
     result: actionResult(value.result, value.action),

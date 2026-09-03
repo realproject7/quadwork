@@ -3,12 +3,15 @@
 // #1058 M9: the narrow durable bridge that turns one current queued WorkTask
 // into a Dev build assignment.  The Head transport/authentication and the
 // registered base-SHA observation remain injected boundaries.  Callers cannot
-// choose an assignment id or base SHA.
+// choose an assignment id or base SHA.  A task inside a pending pre-release
+// propagation stop's declared chain is refused here, before the base is even
+// observed; the pipeline's own readiness gate stays the authority behind it.
 
 const crypto = require("node:crypto");
 const { assertWorkTaskRef, workTaskKey } = require("./work-task-manifest");
 const { planWorkTaskPipelineEvent } = require("./work-task-pipeline");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
+const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
 
 const VERSION = 1;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
@@ -67,6 +70,19 @@ function rethrow(error, fallback) {
 function createWorkTaskBuildAssignmentService(value) {
   const deps = options(value);
   const store = createWorkTaskPipelineStore({ config_dir: deps.config_dir, fs: deps.fs });
+  const review = createWorkTaskIndependentReviewService({ config_dir: deps.config_dir, fs: deps.fs });
+  function assertNoPendingStop(pipeline, task) {
+    const key = workTaskKey(task);
+    for (const slot of pipeline.tasks) {
+      if (slot.state !== "independent_review") continue;
+      let stop;
+      try { stop = review.readPropagationStopPending(freeze({ version: VERSION, work_task_ref: clone(slot.work_task_ref) })); }
+      catch (error) { rethrow(error, "work_task_build_propagation_stop_unavailable"); }
+      if (stop !== null && stop.dependency_chain.some((ref) => workTaskKey(ref) === key)) {
+        fail("work_task_build_propagation_stop_pending", "WorkTask is inside a pending propagation stop");
+      }
+    }
+  }
   function assignBuild(value) {
     const request = input(value);
     const owner = { installation_id: request.work_task_ref.installation_id, project_id: request.work_task_ref.project_id };
@@ -83,6 +99,7 @@ function createWorkTaskBuildAssignmentService(value) {
       fail("work_task_build_event_conflict", "event identity is bound to another transition");
     }
     if (slot.state !== "queued") fail("work_task_build_assignment_unavailable", "WorkTask is not ready for a build assignment");
+    assertNoPendingStop(snapshot.pipeline, request.work_task_ref);
     let base_sha;
     try { base_sha = base(deps.read_registered_base(freeze({ version: VERSION, work_task_ref: clone(request.work_task_ref) })), request.work_task_ref); }
     catch (error) { rethrow(error, "work_task_build_base_unavailable"); }

@@ -32,17 +32,23 @@ function status(overrides = {}) {
     ...overrides,
   };
 }
+const taskRef = Object.freeze({ installation_id: binding.installation_id, project_id: binding.project_id, task_key: "build" });
+const stopDetail = Object.freeze({ kind: "propagation_stop_pending", target: "head_private", candidate_digest: "e".repeat(64), dependency_chain: [{ task_key: "dependent" }] });
 function request(action, overrides = {}) {
-  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest"
+  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch"
     ? null
     : action === "put_batch_manifest"
       ? { manifest: { version: 1, tasks: [] } }
-      : { cut: { tasks: [{ exact_task: "task-one" }] } };
+      : action === "queue_local_correction"
+        ? { correction: { work_task_ref: copy(taskRef), review_round_ref: { round: 1 }, candidate_digest: "e".repeat(64) } }
+        : action === "read_propagation_stop"
+          ? { work_task_ref: copy(taskRef) }
+          : { cut: { tasks: [{ exact_task: "task-one" }] } };
   return {
     version: VERSION,
     action,
     principal: copy(binding),
-    expected_revision: action === "get_pipeline_status" ? null : 0,
+    expected_revision: action === "get_pipeline_status" || action === "read_propagation_stop" ? null : 0,
     idempotency_key: "idem_request_001",
     correlation_id: "corr_request_001",
     payload,
@@ -51,12 +57,32 @@ function request(action, overrides = {}) {
 }
 function fakeDomain(initial = status()) {
   let current = copy(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0 };
   const domain = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
       assert.equal(input.binding.role, "head");
       return copy(current);
+    },
+    retire_batch(input) {
+      calls.retire_batch += 1;
+      assert.equal(input.expected_revision, current.revision);
+      assert.equal(input.payload, null);
+      current = status({ revision: current.revision + 1 });
+      return copy(current);
+    },
+    queue_local_correction(input) {
+      calls.queue_local_correction += 1;
+      assert.equal(input.expected_revision, current.revision);
+      assert.deepEqual(Object.keys(input.payload), ["correction"]);
+      current = status({ ...current, revision: current.revision + 1, pipeline_digest: "d".repeat(64), cut_safe: false });
+      return { status: copy(current), detail: { outcome: "queued", work_task_ref: copy(input.payload.correction.work_task_ref), candidate_digest: input.payload.correction.candidate_digest, checkpoint_id: "checkpoint_" + "f".repeat(48) } };
+    },
+    read_propagation_stop(input) {
+      calls.read_propagation_stop += 1;
+      assert.equal(input.expected_revision, null);
+      assert.deepEqual(Object.keys(input.payload), ["work_task_ref"]);
+      return { status: copy(current), detail: current.cut_safe ? null : copy(stopDetail) };
     },
     put_batch_manifest(input) {
       calls.put_batch_manifest += 1;
@@ -138,8 +164,8 @@ function ok(condition, message) {
   assert.equal(cut.decision.kind, "accepted");
   assert.equal(cut.result.status.revision, 3);
   assert.equal(cut.result.status.cut_safe, false);
-  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch"]),
-    "only the four named M1 pipeline actions are exposed");
+  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "queue_local_correction", "read_propagation_stop"]),
+    "only the seven named pipeline actions are exposed");
   ok(calls.get_pipeline_status === 4 && calls.put_batch_manifest === 1 && calls.freeze_batch_manifest === 1 && calls.cut_batch === 1,
     "each accepted action delegates once to its fixed owning pipeline action");
 
@@ -149,6 +175,88 @@ function ok(condition, message) {
   assert.equal(audit[0].result.status.pipeline_digest, null);
   ok(Object.isFrozen(cut) && Object.isFrozen(cut.audit) && Object.isFrozen(audit),
     "decision, result, and bounded audit records are immutable fixed shapes");
+}
+
+// #1058: retirement, the correction route, and the propagation-stop read use
+// the same bound authority, replay window, and fixed audit record.  A detail
+// travels beside the fixed result and never enters the audit.
+{
+  const { core, calls } = plane(status({ revision: 3, manifest_digest: manifestDigest, pipeline_digest: pipelineDigest, manifest_frozen: true, cut_safe: false }));
+  const stop = core.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
+  assert.equal(stop.decision.code, "head_control_stop_observed");
+  assert.equal(stop.result.applied, false);
+  assert.deepEqual(stop.detail, stopDetail);
+  assert.equal(Object.hasOwn(stop.audit, "detail"), false);
+  assert.deepEqual(Object.keys(stop.audit.result).sort(), ["action", "applied", "status"]);
+  const stopReplay = core.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
+  assert.equal(stopReplay.decision.kind, "replayed");
+  assert.deepEqual(stopReplay.detail, stopDetail);
+  assert.equal(calls.read_propagation_stop, 1);
+  ok(true, "the propagation-stop read returns its redacted detail beside the fixed status and replays without a second domain read");
+
+  const correction = core.execute(request("queue_local_correction", { idempotency_key: "idem_corr_001", correlation_id: "corr_corr_001", expected_revision: 3 }));
+  assert.equal(correction.decision.code, "head_control_applied");
+  assert.equal(correction.result.status.revision, 4);
+  assert.equal(correction.detail.outcome, "queued");
+  assert.match(correction.detail.checkpoint_id, /^checkpoint_/);
+  assert.equal(Object.hasOwn(correction.audit, "detail"), false);
+  assert.equal(calls.queue_local_correction, 1);
+  ok(true, "a queued local correction is one revisioned mutation whose detail stays out of the audit record");
+
+  const retired = core.execute(request("retire_batch", { idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001", expected_revision: 4 }));
+  assert.equal(retired.decision.code, "head_control_applied");
+  assert.equal(retired.result.status.revision, 5);
+  assert.equal(retired.result.status.manifest_digest, null);
+  assert.equal(retired.detail, null);
+  assert.equal(calls.retire_batch, 1);
+  const unsafeStop = core.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_empty", correlation_id: "corr_stop_empty" }));
+  assert.equal(unsafeStop.decision.code, "head_control_stop_unavailable");
+  const unsafeRetire = core.execute(request("retire_batch", { idempotency_key: "idem_retire_empty", correlation_id: "corr_retire_empty", expected_revision: 5 }));
+  assert.equal(unsafeRetire.decision.code, "head_control_retire_unsafe");
+  const unsafeCorrection = core.execute(request("queue_local_correction", { idempotency_key: "idem_corr_empty", correlation_id: "corr_corr_empty", expected_revision: 5 }));
+  assert.equal(unsafeCorrection.decision.code, "head_control_correction_unsafe");
+  assert.equal(calls.retire_batch, 1);
+  assert.equal(calls.read_propagation_stop, 1);
+  assert.equal(calls.queue_local_correction, 1);
+  ok(true, "retirement returns the batch to empty, after which no retire, correction, or stop read reaches the domain");
+
+  const archived = plane(status({ revision: 6, archived: true, manifest_digest: manifestDigest, pipeline_digest: pipelineDigest, manifest_frozen: true, cut_safe: false }));
+  const archivedRetire = archived.core.execute(request("retire_batch", { idempotency_key: "idem_retire_archived", correlation_id: "corr_retire_archived", expected_revision: 6 }));
+  assert.equal(archivedRetire.decision.code, "head_control_applied");
+  const archivedCorrection = archived.core.execute(request("queue_local_correction", { idempotency_key: "idem_corr_archived", correlation_id: "corr_corr_archived", expected_revision: 7 }));
+  assert.equal(archivedCorrection.decision.code, "head_control_correction_unsafe");
+  ok(archived.calls.retire_batch === 1 && archived.calls.queue_local_correction === 0,
+    "an archived batch can still be retired but cannot queue a correction");
+
+  const broken = fakeDomain(status({ revision: 3, manifest_digest: manifestDigest, pipeline_digest: pipelineDigest, manifest_frozen: true, cut_safe: false }));
+  broken.domain.read_propagation_stop = () => ({ status: broken.read(), detail: "leaked text" });
+  const brokenCore = createHeadControlPlane({ binding, domain: broken.domain });
+  const malformedDetail = brokenCore.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_bad", correlation_id: "corr_stop_bad" }));
+  assert.equal(malformedDetail.decision.code, "head_control_domain_invalid_status");
+  broken.domain.retire_batch = () => status({ revision: 4, manifest_digest: manifestDigest, pipeline_digest: pipelineDigest, manifest_frozen: true });
+  const notEmptied = brokenCore.execute(request("retire_batch", { idempotency_key: "idem_retire_bad", correlation_id: "corr_retire_bad", expected_revision: 3 }));
+  ok(notEmptied.decision.code === "head_control_domain_invalid_transition" && malformedDetail.detail === null,
+    "a non-object detail or a retirement that keeps its manifest fails closed");
+
+  for (const action of ["retire_batch", "queue_local_correction", "read_propagation_stop"]) {
+    const foreign = plane(status({ revision: 3, manifest_digest: manifestDigest, pipeline_digest: pipelineDigest, manifest_frozen: true }));
+    const dev = foreign.core.execute(request(action, { principal: { ...binding, role: "dev" }, expected_revision: action === "read_propagation_stop" ? null : 3 }));
+    const other = foreign.core.execute(request(action, { principal: { ...binding, project_id: "other" }, expected_revision: action === "read_propagation_stop" ? null : 3, idempotency_key: "idem_other", correlation_id: "corr_other" }));
+    const stale = foreign.core.execute(request(action, { principal: { ...binding, generation: 6 }, expected_revision: action === "read_propagation_stop" ? null : 3, idempotency_key: "idem_stale", correlation_id: "corr_stale" }));
+    assert.equal(dev.decision.code, "head_control_role_denied");
+    assert.equal(other.decision.code, "head_control_project_denied");
+    assert.equal(stale.decision.code, "head_control_generation_stale");
+    assert.equal(foreign.calls[action], 0);
+    assert.equal(foreign.calls.get_pipeline_status, 0);
+  }
+  ok(true, "Dev, cross-project, and stale-generation principals never reach retirement, correction, or the stop read");
+  assert.throws(() => core.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_rev", correlation_id: "corr_stop_rev", expected_revision: 3 })),
+    (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request");
+  assert.throws(() => core.execute(request("queue_local_correction", { idempotency_key: "idem_corr_pl", correlation_id: "corr_corr_pl", expected_revision: 3, payload: { correction: [] } })),
+    (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request");
+  assert.throws(() => core.execute(request("retire_batch", { idempotency_key: "idem_retire_pl", correlation_id: "corr_retire_pl", expected_revision: 3, payload: { anything: true } })),
+    (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request");
+  ok(true, "read actions cannot pin a revision and mutations take only their fixed payload shape");
 }
 
 // Principal binding is exact.  A mismatched role, project, or generation is a

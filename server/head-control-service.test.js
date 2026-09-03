@@ -40,16 +40,20 @@ function status(overrides = {}) {
   };
 }
 function request(action, overrides = {}) {
-  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest"
+  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch"
     ? null
     : action === "put_batch_manifest"
       ? { manifest: { version: 1, tasks: [] } }
-      : { cut: { tasks: [{ exact_task: "task-one" }] } };
+      : action === "queue_local_correction"
+        ? { correction: { work_task_ref: { task_key: "build" }, review_round_ref: { round: 1 }, candidate_digest: PIPELINE_C } }
+        : action === "read_propagation_stop"
+          ? { work_task_ref: { task_key: "build" } }
+          : { cut: { tasks: [{ exact_task: "task-one" }] } };
   return {
     version: VERSION,
     action,
     principal: clone(BINDING),
-    expected_revision: action === "get_pipeline_status" ? null : 0,
+    expected_revision: action === "get_pipeline_status" || action === "read_propagation_stop" ? null : 0,
     idempotency_key: "idem_service_001",
     correlation_id: "corr_service_001",
     payload,
@@ -58,12 +62,28 @@ function request(action, overrides = {}) {
 }
 function domain(initial = status()) {
   let current = clone(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0 };
   const actions = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
       assert.equal(input.binding.generation, BINDING.generation);
       return clone(current);
+    },
+    retire_batch(input) {
+      calls.retire_batch += 1;
+      assert.equal(input.expected_revision, current.revision);
+      current = status({ revision: current.revision + 1 });
+      return clone(current);
+    },
+    queue_local_correction(input) {
+      calls.queue_local_correction += 1;
+      assert.equal(input.expected_revision, current.revision);
+      current = status({ ...current, revision: current.revision + 1, pipeline_digest: PIPELINE_C, cut_safe: false });
+      return { status: clone(current), detail: { outcome: "queued", checkpoint_id: "checkpoint_" + "f".repeat(48) } };
+    },
+    read_propagation_stop() {
+      calls.read_propagation_stop += 1;
+      return { status: clone(current), detail: { kind: "propagation_stop_pending", dependency_chain: [] } };
     },
     put_batch_manifest(input) {
       calls.put_batch_manifest += 1;
@@ -141,7 +161,7 @@ function ok(condition, message) {
   assert.equal(put.result.status.revision, 1);
   assert.equal(frozen.result.status.revision, 2);
   assert.equal(cut.result.status.revision, 3);
-  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1 });
+  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0 });
   const records = core.recentAudit();
   assert.equal(records.length, 4);
   assert.deepEqual(Object.keys(records[0]).sort(), [
@@ -153,6 +173,45 @@ function ok(condition, message) {
   assert.equal(Object.isFrozen(records[0].result.status), true);
   ok(Object.isFrozen(cut) && Object.isFrozen(core.binding),
     "the static M1 service returns only immutable decisions and redacted durable receipts");
+}
+
+// #1058: the correction route, stop read, and retirement are audited through
+// the same durable receipt.  The receipt stays redacted (no detail), the
+// payloadless retirement replays after restart, and the payload-bearing
+// correction stays ambiguous after restart exactly like put/cut.
+{
+  const fake = domain(status({ revision: 2, manifest_digest: MANIFEST_A, pipeline_digest: PIPELINE_B, manifest_frozen: true, cut_safe: true }));
+  const configDir = configDirectory();
+  const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const stop = first.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
+  assert.equal(stop.decision.code, "head_control_stop_observed");
+  assert.equal(stop.detail.kind, "propagation_stop_pending");
+  const correctionRequest = request("queue_local_correction", { idempotency_key: "idem_corr_001", correlation_id: "corr_corr_001", expected_revision: 2 });
+  const correction = first.execute(correctionRequest);
+  assert.equal(correction.decision.code, "head_control_applied");
+  assert.equal(correction.detail.outcome, "queued");
+  const correctionReplay = first.execute(clone(correctionRequest));
+  assert.equal(correctionReplay.decision.kind, "replayed");
+  assert.equal(correctionReplay.detail.outcome, "queued");
+  const stopReplay = first.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
+  assert.equal(stopReplay.decision.kind, "replayed");
+  assert.equal(stopReplay.detail.kind, "propagation_stop_pending");
+  const retireRequest = request("retire_batch", { idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001", expected_revision: 3 });
+  const retired = first.execute(retireRequest);
+  assert.equal(retired.decision.code, "head_control_applied");
+  assert.equal(retired.result.status.manifest_digest, null);
+  const records = first.recentAudit();
+  assert.deepEqual(records.map((record) => record.action), ["read_propagation_stop", "queue_local_correction", "retire_batch"]);
+  assert.ok(records.every((record) => !Object.hasOwn(record, "detail") && !Object.hasOwn(record.result, "detail")));
+  assert.doesNotMatch(JSON.stringify(records), /checkpoint_|dependency_chain|propagation_stop_pending/);
+  assert.deepEqual([fake.calls.read_propagation_stop, fake.calls.queue_local_correction, fake.calls.retire_batch], [1, 1, 1]);
+  const afterRestart = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const retireReplay = afterRestart.execute(clone(retireRequest));
+  assert.equal(retireReplay.decision.kind, "replayed");
+  assert.equal(retireReplay.detail, null);
+  expectServiceCode(() => afterRestart.execute(clone(correctionRequest)), "head_control_durable_replay_ambiguous");
+  assert.deepEqual([fake.calls.queue_local_correction, fake.calls.retire_batch], [1, 1]);
+  ok(true, "retirement, correction, and stop read share one redacted durable receipt with the fixed restart-replay rules");
 }
 
 // Principal and optimistic-revision denials are persisted too, but cannot
