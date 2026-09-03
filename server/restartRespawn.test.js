@@ -24,7 +24,7 @@ fs.mkdirSync(path.join(TMP_HOME, ".quadwork"), { recursive: true });
 fs.writeFileSync(path.join(TMP_HOME, ".quadwork", "config.json"), JSON.stringify({ projects: [] }));
 
 const assert = require("node:assert/strict");
-const { respawnActiveBatchAgents } = require("./index");
+const { respawnActiveBatchAgents, runStartupMigrations } = require("./index");
 
 const REF = { repo_key: "repo", repo: "Acme/Repo", number: 42, kind: "issue" };
 const V2_IDENTITY = {
@@ -306,6 +306,37 @@ const admitted = {
     assert.deepEqual(out.decisions[0].agents, []);
   }
 
-  console.log("restartRespawn.test.js: all assertions passed (10 groups)");
+  // ── 11. A native V2 project (repositories[], no scalar working_dir) is
+  //         restored exactly like a legacy one. ──
+  {
+    const { fn: spawn, calls } = spy();
+    const cfg = { projects: [{
+      id: "v2native",
+      repositories: [{ key: "web", repo: "Acme/Repo", working_dir: "/tmp/v2native", primary: true }],
+      agents: { head: {}, re1: {}, re2: {}, dev: {} },
+    }] };
+    const out = await respawnActiveBatchAgents(cfg, {
+      ...admitted,
+      getProgress: async () => ACTIVE, spawnAgentPty: spawn, agentSessions: new Map(), log: () => {},
+    });
+    assert.equal(calls.length, 4, "native V2 project with an active batch → 4 agents restored");
+    assert.equal(out.decisions[0].action, "respawned");
+  }
+
+  // ── 12. Startup seeding resolves a V2 project's working directory through
+  //         the primary repository rather than the retired scalar. ──
+  {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-v2-seed-"));
+    const base = path.join(root, "repo");
+    fs.mkdirSync(path.join(root, "repo-dev"), { recursive: true });
+    runStartupMigrations({ projects: [{
+      id: "v2seed",
+      repositories: [{ key: "web", repo: "Acme/Repo", working_dir: base, primary: true }],
+    }] });
+    assert.ok(fs.existsSync(path.join(root, "repo-dev", "DESIGN-GUIDE.md")), "V2 project worktree receives the DESIGN-GUIDE.md seed");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  console.log("restartRespawn.test.js: all assertions passed (12 groups)");
   process.exit(0);
 })().catch((err) => { console.error(err); process.exit(1); });

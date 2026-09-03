@@ -4005,9 +4005,10 @@ function runStartupMigrations(cfg) {
   const designGuideSrc = path.join(__dirname, "..", "templates", "seeds", "DESIGN-GUIDE.md");
   if (fs.existsSync(designGuideSrc)) {
     for (const p of projects) {
-      if (!p.working_dir) continue;
-      const dirName = path.basename(p.working_dir);
-      const parentDir = path.dirname(p.working_dir);
+      const workingDir = primaryRepository(p)?.working_dir;
+      if (!workingDir) continue;
+      const dirName = path.basename(workingDir);
+      const parentDir = path.dirname(workingDir);
       for (const agent of ["head", "dev", "re1", "re2"]) {
         const wtDir = path.join(parentDir, `${dirName}-${agent}`);
         const dst = path.join(wtDir, "DESIGN-GUIDE.md");
@@ -4078,7 +4079,7 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
     return { decisions };
   }
 
-  const projects = (cfg?.projects || []).filter((p) => p && p.id && p.working_dir);
+  const projects = (cfg?.projects || []).filter((p) => p && p.id && primaryRepository(p)?.working_dir);
   for (const project of projects) {
     if (archived(project.id, cfg)) {
       decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
@@ -4349,4 +4350,5 @@ module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test
 module.exports.triggers = triggers; // #1034: project cleanup ownership test seam
 module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation test seam
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
+module.exports.runStartupMigrations = runStartupMigrations; // startup seeding (test seam)
 module.exports.app = app; // route-level test seam (QUADWORK_SKIP_LISTEN keeps the port unbound)
