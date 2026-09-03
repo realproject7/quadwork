@@ -232,9 +232,9 @@ discipline as dashboard chat, for example `@head ...` to wake Head.
 | Tool | Input | Does |
 |------|-------|------|
 | `send_message` | `project`, `text` | Post to the team chat **as the operator** (see security note). **This is how you start and steer batches** — `@head <plain request>`. |
-| `start_batch` | `project`, `interval_min?`, `duration_min?`, `message?` | Start the scheduled trigger that drives the batch (first pulse at T+interval). |
-| `trigger_now` | `project` | Fire one trigger pulse immediately. |
-| `stop_batch` | `project` | Stop the scheduled trigger. |
+| `start_batch` | `project` | Enable the Head-only Project Monitor for the live batch (compatibility name for `project_monitor start`). It creates no repeating message and no cadence. |
+| `trigger_now` | `project` | Run ONE deduplicated Monitor evaluation now (compatibility name for `project_monitor evaluate_now`). Unchanged state writes nothing and wakes no agent. |
+| `stop_batch` | `project` | Suspend the project's Monitor (compatibility name for `project_monitor stop`). Observation only — batch, workers and queue are untouched. |
 | `agent_control` | `project`, `agent`, `action` | Non-destructive lifecycle: `start` / `stop` / `restart` / `interrupt` (Ctrl+C). |
 | `interrupt_all` | `project` | Send Ctrl+C to every running agent in the project. |
 | `set_batch` | `project`, `content` | **Escape hatch** — overwrite `OVERNIGHT-QUEUE.md` raw. Bypasses HEAD's formatting; **not** the normal path (see below). |
@@ -254,7 +254,7 @@ Each is 1–3 tool calls. Start every session with `list_projects` to get the
 
 **Start a code batch** — let HEAD plan and write the queue:
 1. `send_message(project, "@head start a batch for <feature>: #12 #15 #18")` — HEAD files issues + writes `OVERNIGHT-QUEUE.md`, then asks you to start.
-2. Kick it off: `start_batch(project, { interval_min: 30 })` for an overnight cadence (30 min is the default; first pulse at T+interval), or `trigger_now(project)` for an immediate first pulse.
+2. Kick it off: `start_batch(project)` to enable the Monitor, or `trigger_now(project)` for one immediate evaluation. There is no cadence to choose: the Monitor writes one structured `[QW-MONITOR:<kind>]` event to `@head` only when a fixed-policy transition is genuinely due. Passing `interval_min`, `duration_min`, `message`, `recipients` or `mode` is rejected with `trigger_authoring_removed` — operator-authored trigger text no longer exists.
 3. Monitor (below).
 
 **Run a review batch** (review-only — no code, no merges). Just ask HEAD; it stamps the `**Batch type:**` marker — you never touch the queue:
