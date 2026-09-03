@@ -150,15 +150,20 @@ from that contract; a title, chat sentence, or branch name is never identity.
    receipts make the task `accepted`; any `request_changes` makes it
    `changes_requested`. Post the resolution to `@dev @re1 @re2`; reviewers
    deliver their findings only after that release. Return a
-   `changes_requested` task to Dev only through a server transition, never
-   from chat.
+   `changes_requested` task to Dev only with `queue_local_correction`, never
+   from chat. It requires the released round to have reconciled to
+   `changes_requested` and returns the task to `queued` for a new assignment.
 6. A released round is never cancelled or rewritten. A correction reopens the
    task, Dev builds a candidate whose digest must differ, and re-review opens a
    new round bound to that new SHA; the first-pass round stays released with
-   both sealed receipts as durable evidence. Cut an integrated batch with
-   `cut_batch` only through
+   both sealed receipts as durable evidence. Before assigning, check
+   `read_propagation_stop`: it names a task whose sealed change request declares
+   propagation, with the dependent chain the server derived. Assigning a task in
+   that chain is refused. Cut an integrated batch with `cut_batch` only through
    accepted tasks in manifest order; every earlier task must be cut, staged, or
-   deferred. `accepted` and `staged` never mean pushed, merged, or closed.
+   deferred. After a cut, retire the batch with `retire_batch` before writing a
+   successor manifest; a frozen batch cannot be replaced in place, and the
+   retired record stays readable as provenance. `accepted` and `staged` never mean pushed, merged, or closed.
 
 Task states: `queued building candidate_ready independent_review reconcile
 changes_requested accepted staged blocked deferred`. Archive blocks assignment,

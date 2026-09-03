@@ -160,6 +160,21 @@ for (const [name, seed] of [["re1", re1], ["re2", re2]]) {
   assert.doesNotMatch(section, /wait for (?:re1|re2)|read (?:re1|re2)'s verdict|after (?:re1|re2) (?:approves|submits)/i,
     `${name} never defers to the peer reviewer`);
 }
+// Every Head-control action must be named somewhere in the Head seeds. A tool
+// that exists but is not taught is unreachable in practice: this project has
+// already shipped a Head-control surface no client could handshake with, a
+// candidate route no submission could satisfy, and a verdict with no route back
+// to Dev. Deriving the list from the plane's own ACTIONS set means adding an
+// action without teaching it fails here instead of silently shipping.
+{
+  const { ACTIONS } = require("./head-control-plane");
+  const headSeedText = [playbook, head].join("\n");
+  const actions = [...ACTIONS];
+  const untaught = actions.filter((action) => !headSeedText.includes(action));
+  assert.deepEqual(untaught, [], `Head seeds must name every head-control action; missing: ${untaught.join(", ")}`);
+  assert.ok(actions.length >= 7, "the action set should not shrink silently");
+}
+
 assert.equal(
   workTaskReview(re1).replaceAll("RE1", "REVIEWER").replaceAll("RE2", "PEER"),
   workTaskReview(re2).replaceAll("RE2", "REVIEWER").replaceAll("RE1", "PEER"),
