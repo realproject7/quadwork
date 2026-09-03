@@ -289,7 +289,7 @@ const TOOL_DEFS = Object.freeze([
   }),
   Object.freeze({
     name: "recover_worker",
-    description: "Request one bounded relaunch of dev, re1, or re2 after structured loss evidence (exited/unresponsive/resource_killed/launch_failed) for the current assignment attempt and the exact lost generation. Refused for head, a healthy or unconfirmed session, a stale generation, a non-current assignment, an archived project, or an open circuit/insufficient capacity. Returns the lifecycle result verbatim: `spawned` is not `verified` and is never recovery.",
+    description: "Request one bounded relaunch of dev, re1, or re2 after structured loss evidence (exited/unresponsive/resource_killed/launch_failed) for the current assignment attempt and the exact lost generation. Refused for head, a healthy or unconfirmed session, a stale generation, a non-current assignment, an archived project, or insufficient capacity. An open circuit is refused too, except for the single permitted trial naming that circuit's exact loss correlation and expected generation; once that trial is consumed, further calls are refused with `head_trial_consumed` until an operator trial clears the circuit. Returns the lifecycle result verbatim: `spawned` is not `verified` and is never recovery.",
     inputSchema: {
       type: "object",
       properties: {
