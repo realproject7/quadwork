@@ -19,6 +19,7 @@ const LIFECYCLE_STATES = Object.freeze([
 const LIFECYCLE_STATE_SET = new Set(LIFECYCLE_STATES);
 const AUTOMATIC_SOURCES = new Set(["startup_restore", "watchdog", "self_heal", "head_recovery", "reseed"]);
 const OPERATOR_SOURCES = new Set(["operator_start", "operator_restart", "operator_reset", "operator_recovery"]);
+const HEAD_RECOVERY_SOURCE = "head_recovery";
 const MAX_AUTOMATIC_EARLY_EXIT_RETRIES = 1;
 
 class AgentLifecycleError extends Error {
@@ -49,6 +50,14 @@ function randomId(randomUUID, field) {
     throw new AgentLifecycleError(`invalid_${field}`);
   }
   return value;
+}
+
+// The circuit's loss correlation anchors (project, role, work identity,
+// failure signature).  It is echoed back by an explicit trial, so it must
+// stay within the persisted bound regardless of the assignment key's size.
+function lossCorrelationFor(projectId, role, record, signature) {
+  const identity = record?.expected_assignment?.assignment_key || `${projectId}/${role}`;
+  return `${crypto.createHash("sha256").update(`${projectId}\n${role}\n${identity}`).digest("hex").slice(0, 32)}:${signature}`;
 }
 
 function projectStatePath(homeDir, projectId) {
@@ -91,6 +100,9 @@ function safeCircuit(value) {
   const expectedGeneration = typeof value.expected_generation === "string" && value.expected_generation.length <= 64
     ? value.expected_generation
     : null;
+  const headTrialOperationId = typeof value.head_trial_operation_id === "string" && value.head_trial_operation_id.length <= 64
+    ? value.head_trial_operation_id
+    : null;
   return Object.freeze({
     open,
     reason,
@@ -98,6 +110,7 @@ function safeCircuit(value) {
     loss_correlation: lossCorrelation,
     expected_generation: expectedGeneration,
     trial_operation_id: trialOperationId,
+    head_trial_operation_id: headTrialOperationId,
   });
 }
 
@@ -150,6 +163,7 @@ function redactedRecord(record) {
       loss_correlation: record.circuit.loss_correlation,
       expected_generation: record.circuit.expected_generation,
       trial_operation_id: record.circuit.trial_operation_id,
+      head_trial_operation_id: record.circuit.head_trial_operation_id,
     }) : null,
   });
 }
@@ -300,13 +314,17 @@ class AgentLifecycleGovernor {
         return Object.freeze({ status: previous.state, idempotent: true, operation: redactedRecord(previous) });
       }
       const priorCircuit = previous && previous.circuit ? previous.circuit : null;
-      if (isAutomatic && priorCircuit?.open) return this._rejected("circuit_open", previous);
-      if (priorCircuit?.open && isOperator) {
+      // #1044: the server-assigned `head_recovery` source keeps every bounded
+      // automatic-retry rule, and may additionally take the one explicit
+      // circuit trial. Watchdog/startup/self-heal/reseed never can.
+      const headTrial = source === HEAD_RECOVERY_SOURCE && priorCircuit?.open === true;
+      if (isAutomatic && priorCircuit?.open && !headTrial) return this._rejected("circuit_open", previous);
+      if (priorCircuit?.open && (isOperator || headTrial)) {
         const authorizedTrial = typeof input.lossCorrelation === "string"
           && input.lossCorrelation === priorCircuit.loss_correlation
           && typeof input.expectedGeneration === "string"
           && input.expectedGeneration === priorCircuit.expected_generation;
-        if (!authorizedTrial) return this._rejected("circuit_trial_authorization_required", previous);
+        if (!authorizedTrial) return this._rejected(headTrial ? "circuit_open" : "circuit_trial_authorization_required", previous);
         // Retrying the same authorized request while the one trial is still
         // live is an observation of its existing operation, never another
         // process reservation. This check is intentionally before stale-PTY
@@ -314,6 +332,9 @@ class AgentLifecycleGovernor {
         if (priorCircuit.trial_operation_id && ["reserved", "spawned", "verified"].includes(previous.state)) {
           return Object.freeze({ status: previous.state, idempotent: true, operation: redactedRecord(previous) });
         }
+        // A failed Head-initiated trial cannot be chained by Head; only a
+        // fresh human Operator action may authorize another single trial.
+        if (headTrial && priorCircuit.head_trial_operation_id) return this._rejected("head_trial_consumed", previous);
       } else if (input.expectedGeneration && (!previous || previous.generation_id !== input.expectedGeneration)) {
         return this._rejected("stale_expected_generation", previous);
       }
@@ -333,14 +354,15 @@ class AgentLifecycleGovernor {
         state.roles[role] = previous;
         this._write(projectId, state);
       }
-      if (isAutomatic && priorCircuit && priorCircuit.automatic_retries >= MAX_AUTOMATIC_EARLY_EXIT_RETRIES) {
+      if (isAutomatic && !headTrial && priorCircuit && priorCircuit.automatic_retries >= MAX_AUTOMATIC_EARLY_EXIT_RETRIES) {
         const circuit = {
           ...priorCircuit,
           open: true,
           reason: "early_exit",
-          loss_correlation: priorCircuit.loss_correlation || `${previous.expected_assignment?.assignment_key || `${projectId}/${role}`}:early_exit`,
+          loss_correlation: priorCircuit.loss_correlation || lossCorrelationFor(projectId, role, previous, "early_exit"),
           expected_generation: previous.generation_id,
           trial_operation_id: null,
+          head_trial_operation_id: null,
         };
         state.roles[role] = { ...previous, state: "rejected", circuit, last_observation: { at: timestamp(this.now), health: "unknown" } };
         this._write(projectId, state);
@@ -366,9 +388,12 @@ class AgentLifecycleGovernor {
       const circuit = priorCircuit ? {
         ...priorCircuit,
         open: priorCircuit.open,
-        automatic_retries: isAutomatic ? priorCircuit.automatic_retries + 1 : priorCircuit.automatic_retries,
+        // The explicit trial is not an automatic retry; the bounded counter
+        // stays within its policy constant so persistence cannot reset it.
+        automatic_retries: isAutomatic && !headTrial ? priorCircuit.automatic_retries + 1 : priorCircuit.automatic_retries,
         expected_generation: priorCircuit.expected_generation,
         trial_operation_id: priorCircuit.open ? operationId : null,
+        head_trial_operation_id: headTrial ? operationId : priorCircuit.head_trial_operation_id,
       } : {
         open: false,
         reason: null,
@@ -376,6 +401,7 @@ class AgentLifecycleGovernor {
         loss_correlation: null,
         expected_generation: null,
         trial_operation_id: null,
+        head_trial_operation_id: null,
       };
       const record = {
         operation_id: operationId,
@@ -414,11 +440,11 @@ class AgentLifecycleGovernor {
           loss_correlation: null,
           expected_generation: null,
           trial_operation_id: null,
+          head_trial_operation_id: null,
         };
       let unresolvedLoss = previous.unresolved_loss;
       if (next === "resource_killed") {
-        unresolvedLoss = input.lossCorrelation
-          || `${previous.expected_assignment?.assignment_key || `${projectId}/${role}`}:resource_killed`;
+        unresolvedLoss = input.lossCorrelation || lossCorrelationFor(projectId, role, previous, "resource_killed");
         circuit.open = true;
         circuit.reason = "resource_killed";
         circuit.loss_correlation = unresolvedLoss;
@@ -430,6 +456,7 @@ class AgentLifecycleGovernor {
         circuit.loss_correlation = null;
         circuit.expected_generation = null;
         circuit.trial_operation_id = null;
+        circuit.head_trial_operation_id = null;
         circuit.automatic_retries = 0;
         unresolvedLoss = null;
       } else if (circuit.open && circuit.trial_operation_id === previous.operation_id
