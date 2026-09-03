@@ -13,6 +13,7 @@ const {
   buildWorkTaskPipeline,
   planWorkTaskPipelineEvent,
   applyWorkTaskPipelinePlan,
+  declaredWorkTaskDependents,
 } = require("./work-task-pipeline");
 
 const installation_id = "installation_alpha_0001";
@@ -475,6 +476,20 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
     work_task_ref: copy(refs(current).core), assignment_id: "unknown_assignment", title: "untrusted prose",
   });
   throwsCode(() => planWorkTaskPipelineEvent(work, invalid), "invalid_work_task_pipeline_event");
+}
+
+// The server-derived dependency chain of a task is exactly its transitive
+// declared dependents in manifest order, never the source or an unrelated
+// repository task. It is the only chain a pre-release propagation stop pauses.
+{
+  const batch = manifest();
+  const workRefs = refs(batch);
+  const work = buildWorkTaskPipeline(batch);
+  assert.deepEqual(declaredWorkTaskDependents(work, workRefs.core).map((entry) => entry.task_key), ["web", "api-client"]);
+  assert.deepEqual(declaredWorkTaskDependents(work, workRefs.ops), []);
+  assert.deepEqual(declaredWorkTaskDependents(work, workRefs.web), []);
+  assert.equal(Object.isFrozen(declaredWorkTaskDependents(work, workRefs.core)), true);
+  throwsCode(() => declaredWorkTaskDependents(work, { ...copy(workRefs.core), task_revision: "f".repeat(64) }), "unknown_work_task_ref");
 }
 
 // Purity guard: M3 owns only deterministic state and plans. Persistence,

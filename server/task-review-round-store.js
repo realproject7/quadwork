@@ -24,6 +24,7 @@ const {
   submitTaskReviewReceipt,
   viewTaskReviewRound,
   cancelTaskReviewRound,
+  planSealedTaskReviewPropagation,
 } = require("./task-review-round");
 
 const TASK_REVIEW_ROUND_STORE_VERSION = 1;
@@ -469,17 +470,21 @@ function deliveryProjection(round) {
     })),
   });
 }
-function deliveryRequest(value) {
-  exact(value, ["version", "work_task_ref", "candidate_digest"], "invalid_task_review_delivery_request");
-  if (value.version !== TASK_REVIEW_ROUND_STORE_VERSION) {
-    fail("invalid_task_review_delivery_request", "delivery request version is invalid");
-  }
+function candidateRequest(value, code) {
+  exact(value, ["version", "work_task_ref", "candidate_digest"], code);
+  if (value.version !== TASK_REVIEW_ROUND_STORE_VERSION) fail(code, "request version is invalid");
   try { assertWorkTaskRef(value.work_task_ref); }
-  catch { fail("invalid_task_review_delivery_request", "delivery work task reference is invalid"); }
+  catch { fail(code, "work task reference is invalid"); }
   return {
     work_task_ref: clone(value.work_task_ref),
-    candidate_digest: candidateDigest(value.candidate_digest, "invalid_task_review_delivery_request"),
+    candidate_digest: candidateDigest(value.candidate_digest, code),
   };
+}
+function roundsForCandidate(document, request) {
+  return Object.values(document.records)
+    .map((record) => record.round)
+    .filter((round) => round.candidate_digest === request.candidate_digest &&
+      workTaskKey(round.review_round_ref.work_task_ref) === workTaskKey(request.work_task_ref));
 }
 
 function ownReceiptProjection(round, trustedContext) {
@@ -577,19 +582,38 @@ class TaskReviewRoundStore {
   }
 
   readReleasedForDelivery(value) {
-    const request = deliveryRequest(value);
+    const request = candidateRequest(value, "invalid_task_review_delivery_request");
     const scope = {
       installation_id: request.work_task_ref.installation_id,
       project_id: request.work_task_ref.project_id,
     };
     const loaded = safeReadDocument(this.fs, this.rootDir, scope);
-    const matches = Object.values(loaded.document.records)
-      .map((record) => record.round)
-      .filter((round) => round.candidate_digest === request.candidate_digest &&
-        workTaskKey(round.review_round_ref.work_task_ref) === workTaskKey(request.work_task_ref));
+    const matches = roundsForCandidate(loaded.document, request);
     if (matches.length === 0) fail("task_review_round_not_found", "no exact persisted review round exists");
     if (matches.length !== 1) fail("task_review_round_delivery_ambiguous", "multiple review rounds match one delivery task");
     return deliveryProjection(matches[0]);
+  }
+
+  // Head-private pre-release propagation stop (#1059).  It is derived from the
+  // already-sealed receipt state, never persisted or projected separately, so
+  // no reviewer read path can observe it.  It returns null when no current
+  // round for the candidate carries a sealed propagating finding; the pure
+  // contract redacts every receipt, verdict, role, and finding field.
+  readSealedPropagationStop(value, trustedHeadContext) {
+    const request = candidateRequest(value, "invalid_task_review_propagation_request");
+    const scope = {
+      installation_id: request.work_task_ref.installation_id,
+      project_id: request.work_task_ref.project_id,
+    };
+    const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+    const matches = roundsForCandidate(loaded.document, request).filter((round) => round.status === "current");
+    if (matches.length === 0) return null;
+    if (matches.length !== 1) fail("task_review_round_propagation_ambiguous", "multiple current review rounds match one candidate");
+    try { return cloneFreeze(planSealedTaskReviewPropagation(matches[0], trustedHeadContext)); }
+    catch (error) {
+      if (error && error.code === "task_review_round_no_propagation_stop") return null;
+      throw error;
+    }
   }
 
   cancelFromTrustedState(cancellation) {

@@ -6,13 +6,17 @@
 // reviewer principal context; neither may be caller-selected by a receipt.
 // The bridge seals receipts but deliberately does not infer their combined
 // verdict or advance delivery state before explicit reconciliation exists.
+// After reconciliation it also owns the Dev correction route (#1058 step 6 /
+// #1059): one queued local correction per released change-requested round,
+// and the Head-only pre-release propagation stop read.
 
 const crypto = require("node:crypto");
 const { assertWorkTaskRef, workTaskKey } = require("./work-task-manifest");
-const { planWorkTaskPipelineEvent } = require("./work-task-pipeline");
+const { planWorkTaskPipelineEvent, declaredWorkTaskDependents } = require("./work-task-pipeline");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
 const { assertTaskReviewRoundRef, taskReviewRoundKey } = require("./task-review-round");
+const { reconcileReleasedTaskReview } = require("./task-review-reconciliation");
 
 const VERSION = 1;
 const IDENTIFIER_RE = /^[a-z][a-z0-9_-]{2,95}$/;
@@ -36,7 +40,10 @@ function sha(value, code) { if (typeof value !== "string" || !SHA_RE.test(value)
 function taskRef(value, code) { try { assertWorkTaskRef(value); } catch { fail(code, "work task reference is invalid"); } return clone(value); }
 function roundRef(value, code) { try { assertTaskReviewRoundRef(value); } catch { fail(code, "review round reference is invalid"); } return clone(value); }
 function owner(ref) { return { installation_id: ref.installation_id, project_id: ref.project_id }; }
-function reviewRoundId(ref) { return `trr_${crypto.createHash("sha256").update(taskReviewRoundKey(ref), "utf8").digest("hex").slice(0, 48)}`; }
+// Identifiers derived solely from the immutable round: a retry after a crash
+// re-derives the same pipeline event and cannot queue a second correction.
+function derivedId(prefix, ref) { return `${prefix}_${crypto.createHash("sha256").update(taskReviewRoundKey(ref), "utf8").digest("hex").slice(0, 48)}`; }
+function reviewRoundId(ref) { return derivedId("trr", ref); }
 function slotFor(pipeline, ref) {
   const key = workTaskKey(ref);
   const matches = pipeline.tasks.filter((slot) => workTaskKey(slot.work_task_ref) === key);
@@ -54,6 +61,19 @@ function receiptRequest(value) {
   exact(value, ["version", "review_round_ref", "candidate_digest", "receipt"], "invalid_work_task_review_receipt_request");
   if (value.version !== VERSION) fail("invalid_work_task_review_receipt_request", "receipt version is invalid");
   return freeze({ review_round_ref: roundRef(value.review_round_ref, "invalid_work_task_review_receipt_request"), candidate_digest: sha(value.candidate_digest, "invalid_work_task_review_receipt_request"), receipt: clone(value.receipt) });
+}
+function correctionRequest(value) {
+  const code = "invalid_work_task_correction_request";
+  exact(value, ["version", "work_task_ref", "review_round_ref", "candidate_digest"], code);
+  if (value.version !== VERSION) fail(code, "correction version is invalid");
+  const request = freeze({ work_task_ref: taskRef(value.work_task_ref, code), review_round_ref: roundRef(value.review_round_ref, code), candidate_digest: sha(value.candidate_digest, code) });
+  if (workTaskKey(request.work_task_ref) !== workTaskKey(request.review_round_ref.work_task_ref)) fail(code, "correction identity is not exact");
+  return request;
+}
+function stopRequest(value) {
+  exact(value, ["version", "work_task_ref"], "invalid_work_task_propagation_stop_request");
+  if (value.version !== VERSION) fail("invalid_work_task_propagation_stop_request", "propagation stop request version is invalid");
+  return freeze({ work_task_ref: taskRef(value.work_task_ref, "invalid_work_task_propagation_stop_request") });
 }
 function serviceOptions(value) {
   exact(value, ["config_dir", "fs"], "invalid_work_task_independent_review_service_options");
@@ -128,7 +148,61 @@ function createWorkTaskIndependentReviewService(value) {
     } catch (error) { rethrow(error, "work_task_review_receipt_failed"); }
   }
 
-  return freeze({ openIndependentReview, submitTrustedReceipt });
+  // A released change-requested round returns its exact candidate to Dev as
+  // one bounded local correction.  The sealed first-pass receipts stay in the
+  // round store untouched; the corrected candidate gets a new digest, so every
+  // later review binds to the new SHA and this round can never be reused.
+  function queueLocalCorrection(value) {
+    const input = correctionRequest(value);
+    const project = owner(input.work_task_ref);
+    let released;
+    try { released = roundStore.readReleasedForReconciliation(input.review_round_ref, input.candidate_digest); }
+    catch (error) { rethrow(error, "work_task_review_release_unavailable"); }
+    let reconciliation;
+    try { reconciliation = reconcileReleasedTaskReview(released); }
+    catch (error) { rethrow(error, "work_task_review_reconciliation_rejected"); }
+    if (reconciliation.resolution !== "changes_requested") fail("work_task_correction_not_requested", "released round did not request changes");
+    let snapshot;
+    try { snapshot = pipelineStore.readRecoverySnapshot(project); } catch (error) { rethrow(error, "work_task_review_pipeline_unavailable"); }
+    if (snapshot.pipeline.archived) fail("work_task_archive_blocked", "archived pipeline cannot queue a correction");
+    const slot = slotFor(snapshot.pipeline, input.work_task_ref);
+    const event_id = derivedId("local_correction", input.review_round_ref);
+    const checkpoint_id = derivedId("checkpoint", input.review_round_ref);
+    const result = (outcome) => freeze({ version: VERSION, outcome, work_task_ref: clone(input.work_task_ref), candidate_digest: input.candidate_digest, checkpoint_id });
+    if (snapshot.pipeline.history.some((entry) => entry.event_id === event_id)) return result("idempotent");
+    if (slot.state !== "changes_requested" || slot.candidate === null || slot.candidate.candidate_digest !== input.candidate_digest) {
+      fail("stale_work_task_review_authority", "candidate is not awaiting a local correction for this round");
+    }
+    try {
+      const plan = planWorkTaskPipelineEvent(snapshot.pipeline, { version: VERSION, kind: "queue_local_correction", event_id, work_task_ref: input.work_task_ref, checkpoint_id });
+      pipelineStore.applyPlan({ expected: { ...project, manifest_digest: snapshot.manifest.manifest_digest, pipeline_digest: snapshot.pipeline.pipeline_digest }, plan, terminal_disposition: null });
+    } catch (error) { rethrow(error, "work_task_correction_commit_failed"); }
+    return result("queued");
+  }
+
+  // Head-only.  Reports the redacted `propagation_stop_pending` event for the
+  // task's current sealed round, or null.  The dependency chain is the
+  // server-derived declared dependents; no reviewer role, verdict, or finding
+  // leaves this read, and the reviewer submit/read paths above are untouched.
+  function readPropagationStopPending(value) {
+    const input = stopRequest(value);
+    let snapshot;
+    try { snapshot = pipelineStore.readRecoverySnapshot(owner(input.work_task_ref)); } catch (error) { rethrow(error, "work_task_review_pipeline_unavailable"); }
+    const slot = slotFor(snapshot.pipeline, input.work_task_ref);
+    if (slot.state !== "independent_review" || slot.candidate === null || slot.review_assignment === null) return null;
+    let stop;
+    try {
+      stop = roundStore.readSealedPropagationStop({ version: VERSION, work_task_ref: input.work_task_ref, candidate_digest: slot.candidate.candidate_digest },
+        { version: VERSION, target: "head_private", dependency_chain: declaredWorkTaskDependents(snapshot.pipeline, input.work_task_ref) });
+    } catch (error) { rethrow(error, "work_task_propagation_stop_unavailable"); }
+    if (stop === null) return null;
+    if (reviewRoundId(stop.review_round_ref) !== slot.review_assignment.review_round_id || stop.candidate_digest !== slot.review_assignment.candidate_digest) {
+      fail("stale_work_task_review_authority", "sealed round is not the current pipeline review assignment");
+    }
+    return stop;
+  }
+
+  return freeze({ openIndependentReview, submitTrustedReceipt, queueLocalCorrection, readPropagationStopPending });
 }
 
 module.exports = { VERSION, WorkTaskIndependentReviewServiceError, reviewRoundId, createWorkTaskIndependentReviewService };

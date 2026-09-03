@@ -381,6 +381,9 @@ function planSealedTaskReviewPropagation(round, trustedHeadContext) {
     fail("invalid_trusted_head_context", "head-private propagation context is invalid");
   }
   if (round.status !== "current") fail("task_review_round_not_sealed", "only an incomplete current round may emit a sealed propagation plan");
+  if (!round.receipts.some((entry) => entry.receipt.findings.some((item) => item.propagation === "propagating"))) {
+    fail("task_review_round_no_propagation_stop", "no sealed receipt declares a propagating finding");
+  }
   const chain = trustedHeadContext.dependency_chain.map((ref) => {
     try { assertWorkTaskRef(ref); } catch { fail("invalid_trusted_head_context", "dependency-chain reference is invalid"); }
     if (ref.installation_id !== round.review_round_ref.installation_id || ref.project_id !== round.review_round_ref.project_id) {
@@ -393,6 +396,7 @@ function planSealedTaskReviewPropagation(round, trustedHeadContext) {
   // dependency chain.  It has no receipt, reviewer, finding, or detail field.
   return freeze({
     version: VERSION,
+    kind: "propagation_stop_pending",
     target: "head_private",
     review_round_ref: clone(round.review_round_ref),
     candidate_digest: round.candidate_digest,
