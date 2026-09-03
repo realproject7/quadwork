@@ -67,7 +67,7 @@ function fingerprint(dir) {
   const beforeGitDir = fingerprint(gitDir);
 
   {
-    const facts = captureRepositoryFacts({ cwd: worktree, now: () => new Date("2026-09-03T00:00:00.000Z") });
+    const facts = await captureRepositoryFacts({ cwd: worktree, now: () => new Date("2026-09-03T00:00:00.000Z") });
     assert.equal(facts.available, true);
     assert.equal(facts.reason, null);
     assert.equal(facts.captured_at, "2026-09-03T00:00:00.000Z");
@@ -100,7 +100,7 @@ function fingerprint(dir) {
     sh(elsewhere, ["commit", "-q", "-m", "remote"]);
     sh(elsewhere, ["push", "-q", "origin", "task/42-facts"]);
     sh(worktree, ["fetch", "-q", "origin"]);
-    const facts = captureRepositoryFacts({ cwd: worktree });
+    const facts = await captureRepositoryFacts({ cwd: worktree });
     assert.equal(facts.ahead, 1);
     assert.equal(facts.behind, 1);
     console.log("  PASS: HEAD-to-origin relation counts both directions");
@@ -111,7 +111,7 @@ function fingerprint(dir) {
     const detached = path.join(TMP, "detached");
     sh(TMP, ["clone", "-q", "-b", "main", remote, detached]);
     sh(detached, ["checkout", "-q", "--detach"]);
-    const facts = captureRepositoryFacts({ cwd: detached });
+    const facts = await captureRepositoryFacts({ cwd: detached });
     assert.equal(facts.available, true);
     assert.equal(facts.branch, null);
     assert.equal(typeof facts.head, "string");
@@ -128,7 +128,7 @@ function fingerprint(dir) {
     fs.mkdirSync(many);
     sh(many, ["init", "-q"]);
     for (let index = 0; index < MAX_STATUS_ENTRIES + 5; index += 1) fs.writeFileSync(path.join(many, `f${String(index).padStart(4, "0")}.txt`), "x");
-    const facts = captureRepositoryFacts({ cwd: many });
+    const facts = await captureRepositoryFacts({ cwd: many });
     assert.equal(facts.status.count, MAX_STATUS_ENTRIES + 5);
     assert.equal(facts.status.truncated, true);
     assert.equal(facts.status.entries.length, MAX_STATUS_ENTRIES);
@@ -139,18 +139,18 @@ function fingerprint(dir) {
 
   {
     // Degraded inputs are recorded facts, never exceptions.
-    assert.deepEqual(captureRepositoryFacts({ cwd: null }).reason, "worktree_unconfigured");
-    assert.deepEqual(captureRepositoryFacts({}).reason, "worktree_unconfigured");
-    const missing = captureRepositoryFacts({ cwd: path.join(TMP, "does-not-exist") });
+    assert.deepEqual((await captureRepositoryFacts({ cwd: null })).reason, "worktree_unconfigured");
+    assert.deepEqual((await captureRepositoryFacts({})).reason, "worktree_unconfigured");
+    const missing = await captureRepositoryFacts({ cwd: path.join(TMP, "does-not-exist") });
     assert.equal(missing.available, false);
     assert.equal(missing.reason, "worktree_missing");
     assert.equal(missing.status, null);
     const file = path.join(TMP, "a-file");
     fs.writeFileSync(file, "x");
-    assert.equal(captureRepositoryFacts({ cwd: file }).reason, "worktree_missing");
+    assert.equal((await captureRepositoryFacts({ cwd: file })).reason, "worktree_missing");
     const plain = path.join(TMP, "plain");
     fs.mkdirSync(plain);
-    const notRepo = captureRepositoryFacts({ cwd: plain, env: { PATH: process.env.PATH, HOME: TMP } });
+    const notRepo = await captureRepositoryFacts({ cwd: plain, env: { PATH: process.env.PATH, HOME: TMP } });
     assert.equal(notRepo.available, false);
     assert.equal(notRepo.reason, "not_a_repository");
     // A `.git` pointer file to a gitdir that no longer exists: git fails, the
@@ -158,18 +158,54 @@ function fingerprint(dir) {
     const broken = path.join(TMP, "broken");
     fs.mkdirSync(broken);
     fs.writeFileSync(path.join(broken, ".git"), `gitdir: ${path.join(TMP, "gone", ".git", "worktrees", "broken")}\n`);
-    const brokenFacts = captureRepositoryFacts({ cwd: broken });
+    const brokenFacts = await captureRepositoryFacts({ cwd: broken });
     assert.equal(brokenFacts.available, false);
     assert.equal(brokenFacts.reason, "not_a_repository");
     // An inherited GIT_DIR must not redirect the query away from the role cwd.
-    const redirected = captureRepositoryFacts({ cwd: plain, env: { ...process.env, GIT_DIR: path.join(base, ".git"), GIT_WORK_TREE: base } });
+    const redirected = await captureRepositoryFacts({ cwd: plain, env: { ...process.env, GIT_DIR: path.join(base, ".git"), GIT_WORK_TREE: base } });
     assert.equal(redirected.available, false);
     assert.equal(redirected.reason, "not_a_repository");
     // A git binary that cannot be found is also just a fact.
-    const noGit = captureRepositoryFacts({ cwd: worktree, env: { PATH: path.join(TMP, "empty-path") } });
+    const noGit = await captureRepositoryFacts({ cwd: worktree, env: { PATH: path.join(TMP, "empty-path") } });
     assert.equal(noGit.available, false);
     assert.equal(noGit.reason, "git_unavailable");
     console.log("  PASS: unconfigured, missing, non-repository, broken, env-redirected and git-less captures degrade to recorded facts");
+  }
+
+  {
+    // A repository-configured `core.fsmonitor` hook is executable code the
+    // server does not control; plain `git status` runs it, the capture must not.
+    const hooked = path.join(TMP, "hooked");
+    sh(TMP, ["clone", "-q", "-b", "main", remote, hooked]);
+    const marker = path.join(TMP, "fsmonitor-ran");
+    const hook = path.join(TMP, "fsmonitor-hook.sh");
+    fs.writeFileSync(hook, `#!/bin/sh\ntouch "${marker}"\nexit 1\n`, { mode: 0o755 });
+    sh(hooked, ["config", "core.fsmonitor", hook]);
+    execFileSync("git", ["status", "--porcelain"], { cwd: hooked, env: ENV, stdio: "ignore" });
+    assert.equal(fs.existsSync(marker), true, "control: plain git status executes the configured fsmonitor hook");
+    fs.rmSync(marker);
+    const facts = await captureRepositoryFacts({ cwd: hooked });
+    assert.equal(facts.available, true);
+    assert.equal(facts.status.clean, true);
+    assert.equal(fs.existsSync(marker), false, "the capture executed the repository's fsmonitor hook");
+    console.log("  PASS: a repository-configured fsmonitor hook runs under plain git status but never under the capture");
+  }
+
+  {
+    // A slow git never stalls the event loop: timers keep firing while the
+    // capture waits on its child processes.
+    const slowBin = path.join(TMP, "slow-bin");
+    fs.mkdirSync(slowBin);
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    fs.writeFileSync(path.join(slowBin, "git"), `#!/bin/sh\nsleep 0.2\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    let ticks = 0;
+    const timer = setInterval(() => { ticks += 1; }, 10);
+    const facts = await captureRepositoryFacts({ cwd: worktree, env: { ...process.env, PATH: `${slowBin}${path.delimiter}${process.env.PATH}` } });
+    clearInterval(timer);
+    assert.equal(facts.available, true);
+    assert.equal(facts.branch, "task/42-facts");
+    assert.ok(ticks > 0, "the event loop was blocked for the whole capture");
+    console.log("  PASS: the capture runs its git queries off the event loop");
   }
 
   console.log("repository-facts.test.js: all assertions passed");

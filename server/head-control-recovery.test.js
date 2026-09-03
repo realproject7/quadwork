@@ -9,7 +9,11 @@
 //   - an open #1053 circuit admits exactly one Head-authorized trial, an exact
 //     duplicate is replayed, a chained Head attempt is refused, the real
 //     watchdog stays refused throughout, and a fresh operator action may
-//     authorize another trial.
+//     authorize another trial;
+//   - a trial clears the circuit only when the recovered generation acts
+//     through its own MCP wiring (an authenticated chat post with the token
+//     minted for that spawn), never on its first PTY bytes, after which the
+//     real watchdog is admitted again.
 // Nothing here asserts against source text.
 
 const assert = require("node:assert/strict");
@@ -56,6 +60,36 @@ fs.writeFileSync(path.join(WORKTREES.dev, "README.md"), "dirty uncommitted work\
 fs.writeFileSync(path.join(WORKTREES.dev, "untracked.txt"), "never committed\n");
 const DEV_HEAD = sh(WORKTREES.dev, ["rev-parse", "HEAD"]);
 const PR_TIP = "b".repeat(40);
+
+// Two stand-ins for a worker CLI.  One only paints its terminal.  The other
+// does what a real CLI does with the `--mcp-config` it is spawned with: it
+// starts the chat shim named there and posts through it with the token minted
+// for this spawn (only the server port is patched, because the test server
+// listens on an ephemeral port).  Neither touches the worktree.
+const BYTES_ONLY_CLI = path.join(TMP, "bytes-only-cli.sh");
+fs.writeFileSync(BYTES_ONLY_CLI, "#!/bin/sh\necho ready\nsleep 0.3\n", { mode: 0o755 });
+const SHIM_CLI = path.join(TMP, "shim-cli.js");
+fs.writeFileSync(SHIM_CLI, `#!/usr/bin/env node
+const fs = require("fs");
+const { spawn } = require("child_process");
+const config = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("--mcp-config") + 1], "utf8"));
+const chat = config.mcpServers.chat;
+const args = chat.args.map((value, index) => (chat.args[index - 1] === "--port" ? process.env.QW_TEST_SERVER_PORT : value));
+process.stdout.write("ready\\n");
+const shim = spawn(chat.command, args, { stdio: ["pipe", "pipe", "inherit"] });
+shim.stdout.on("data", (chunk) => { if (String(chunk).includes('"id":3')) shim.stdin.end(); });
+shim.on("close", () => process.exit(0));
+for (const message of [
+  { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "worker-cli", version: "0" } } },
+  { jsonrpc: "2.0", method: "notifications/initialized" },
+  { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "chat_send", arguments: { message: "recovered and reporting in" } } },
+]) shim.stdin.write(JSON.stringify(message) + "\\n");
+`, { mode: 0o755 });
+function setDevCommand(command) {
+  const cfg = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, "config.json"), "utf8"));
+  cfg.projects[0].agents.dev.command = command;
+  fs.writeFileSync(path.join(CONFIG_DIR, "config.json"), JSON.stringify(cfg));
+}
 
 function fingerprint(dir) {
   const hash = crypto.createHash("sha256");
@@ -136,13 +170,14 @@ function seedProgress() {
 async function until(predicate, label, timeoutMs = 8000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const value = predicate();
+    const value = await predicate();
     if (value) return value;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`timed out waiting for ${label}`);
 }
 function devSession() { return runtime.agentSessions.get(`${PROJECT}/dev`); }
+async function devFacts() { return (await runtime.readHeadProjectStatus(PROJECT)).workers.dev; }
 async function devExited(previousGeneration, label) {
   await until(() => devSession()?.lifecycleState === "exited" && devSession()?.generationId !== previousGeneration, label);
   return devSession().generationId;
@@ -249,6 +284,7 @@ process.on("exit", cleanup);
   runtime.headControlRuntime.registerHeadToken({ project_id: PROJECT, generation: admission.generation, token: TOKEN });
   server = runtime.app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
+  process.env.QW_TEST_SERVER_PORT = String(server.address().port);
   shim = startShim(server.address().port, admission.generation);
   try {
     const tools = await shim.handshake();
@@ -342,8 +378,69 @@ process.on("exit", cleanup);
     assert.equal(operator.lifecycle.circuit.open, true);
     assert.equal(operator.lifecycle.circuit.trial_operation_id, operator.lifecycle.operation_id);
     assertRepositoryFacts(operator.repository, "operator trial");
-    await devExited(generation3, "operator trial exit");
+    const generation4 = await devExited(generation3, "operator trial exit");
+    assert.equal(generation4, operator.lifecycle.generation_id);
     ok(true, "Head cannot chain a second trial, the watchdog remains refused, and a fresh operator restart may authorize one more");
+
+    // 6b. A trial's first PTY bytes are not recovery: a worker that only
+    //     paints its terminal and exits leaves the circuit open, so a
+    //     banner-then-crash can never reset the bounded retry budget.
+    setDevCommand(BYTES_ONLY_CLI);
+    seedProgress();
+    const painted = await runtime.restartAgentSession(`${PROJECT}/dev`, {
+      reason: "manual", clearSelfHeal: true, lifecycleSource: "operator_restart", operatorAuthorized: true, explicitRole: true,
+      expectedGeneration: generation4, lossCorrelation,
+    });
+    assert.equal(painted.ok, true);
+    assert.equal(painted.lifecycle.circuit.trial_operation_id, painted.lifecycle.operation_id);
+    const paintedFacts = await until(async () => {
+      const facts = await devFacts();
+      return facts.generation_id === painted.lifecycle.generation_id && facts.verification_state === "verified" ? facts : null;
+    }, "bytes-only trial persisted as verified");
+    assert.equal(paintedFacts.circuit.open, true, "first PTY bytes alone do not clear the circuit");
+    assert.equal(paintedFacts.last_chat_at, null);
+    const generation5 = await devExited(generation4, "bytes-only trial exit");
+    assert.equal((await devFacts()).circuit.open, true);
+    assert.equal((await devFacts()).circuit.expected_generation, generation5);
+    seedProgress();
+    assert.match((await watchdogRespawnAttempt())[0] || "", /auto-respawn failed: circuit_open/);
+    ok(true, "a trial that only paints its terminal is verified but leaves the circuit open, and the watchdog stays refused");
+
+    // 6c. A trial whose CLI starts the chat shim from its own --mcp-config and
+    //     posts with the token minted for this spawn is the recovered
+    //     generation acting; that clears the circuit, and the real watchdog is
+    //     admitted again on the next exit.
+    setDevCommand(SHIM_CLI);
+    seedProgress();
+    const acting = await runtime.restartAgentSession(`${PROJECT}/dev`, {
+      reason: "manual", clearSelfHeal: true, lifecycleSource: "operator_restart", operatorAuthorized: true, explicitRole: true,
+      expectedGeneration: generation5, lossCorrelation,
+    });
+    assert.equal(acting.ok, true);
+    assert.equal(acting.lifecycle.circuit.open, true);
+    const cleared = await until(async () => {
+      const facts = await devFacts();
+      return facts.generation_id === acting.lifecycle.generation_id && facts.circuit.open === false ? facts : null;
+    }, "circuit cleared by the worker's authenticated post");
+    // The stand-in exits right after posting, so the record is observed either
+    // still verified or already exited; only the verified transition clears.
+    assert.ok(["verified", "exited"].includes(cleared.state), `cleared while ${cleared.state}`);
+    assert.equal(cleared.circuit.head_trial_operation_id, null);
+    assert.equal(cleared.circuit.trial_operation_id, null);
+    assert.equal(cleared.circuit.automatic_retries, 0);
+    assert.equal(cleared.circuit.loss_correlation, null);
+    assert.equal(typeof cleared.last_chat_at, "string");
+    const posted = fileChat.readMessages(PROJECT, { limit: 50 }).filter((message) => message.sender === "dev");
+    assert.equal(posted.length, 1, "exactly one authenticated dev post reached the chat");
+    assert.match(posted[0].text, /recovered and reporting in/);
+    const generation6 = await devExited(generation5, "acting trial exit");
+    assert.equal(generation6, acting.lifecycle.generation_id);
+    seedProgress();
+    assert.deepEqual(await watchdogRespawnAttempt(), [], "the watchdog's automatic respawn is admitted once the circuit is cleared");
+    const generation7 = await devExited(generation6, "watchdog respawn exit");
+    assert.notEqual(generation7, generation6);
+    assert.equal((await devFacts()).circuit.open, false);
+    ok(true, "a trial that posts through its own shim token clears the circuit, and the real watchdog is admitted again");
 
     // 7. Every recovery left the dirty worktree byte-unchanged.
     assert.deepEqual(worktreeObservation(), INITIAL_WORKTREE);

@@ -168,7 +168,7 @@ function redactedRecord(record) {
   });
 }
 
-function stateFromDisk(fsImpl, filePath) {
+function stateFromDisk(fsImpl, filePath, projectId) {
   let stat;
   try { stat = fsImpl.lstatSync(filePath); }
   catch (error) {
@@ -194,6 +194,18 @@ function stateFromDisk(fsImpl, filePath) {
     identifier(role, "role");
     const record = safeRecord(rawRecord);
     if (!record) throw new AgentLifecycleError("lifecycle_state_invalid");
+    // A circuit persisted before the digest-bounded correlation kept the raw
+    // `${assignment_key}:<reason>`, which safeCircuit drops as over-length and
+    // so left an open circuit that no trial could ever name.  Re-derive the
+    // same digest a fresh opening writes.  Only an open circuit with no
+    // surviving correlation is touched, so this is idempotent and can neither
+    // invent a correlation for a closed circuit nor replace a present one.
+    if (record.circuit?.open && record.circuit.loss_correlation === null && record.circuit.reason) {
+      record.circuit = Object.freeze({
+        ...record.circuit,
+        loss_correlation: lossCorrelationFor(projectId, role, record, record.circuit.reason),
+      });
+    }
     out.roles[role] = record;
   }
   return out;
@@ -272,7 +284,7 @@ class AgentLifecycleGovernor {
   }
 
   _read(projectId) {
-    return stateFromDisk(this.fs, projectStatePath(this.homeDir, projectId));
+    return stateFromDisk(this.fs, projectStatePath(this.homeDir, projectId), projectId);
   }
 
   _write(projectId, state) {
@@ -451,6 +463,9 @@ class AgentLifecycleGovernor {
         circuit.expected_generation = previous.generation_id;
         circuit.trial_operation_id = null;
       } else if (next === "verified" && circuit.trial_operation_id === previous.operation_id && input.structuredStatus === true) {
+        // The trial clears only on the runtime's structured confirmation: an
+        // action authenticated with this generation's own shim token, never
+        // the first PTY bytes, which a banner-then-crash also produces.
         circuit.open = false;
         circuit.reason = null;
         circuit.loss_correlation = null;
