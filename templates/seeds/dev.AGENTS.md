@@ -6,7 +6,7 @@
 **Your terminal output is INVISIBLE to all other agents. No agent can see what you print.**
 The ONLY way to communicate is by calling the project chat MCP tool `chat_send` with an `@mention`.
 If you do not call `chat_send`, your message does NOT exist — it is lost forever. There is no exception.
-- CORRECT: Call `chat_send` with message "@re1 @re2 please review PR #50"
+- CORRECT: Call `chat_send` with message "@head [STATUS DONE] ... evidence=PR#50@<sha>+tests next=merge_gate"
 - WRONG: Printing "I'll notify the reviewers" in your terminal output
 - WRONG: Assuming you communicated because you wrote text in your response
 **Every time you need another agent to act, you MUST call `chat_send`. Verify you actually invoked the tool.**
@@ -120,6 +120,8 @@ For board context — what issues/PRs exist and their state — read the server-
 - **NO `git push` to `main`** — only push feature branches for PR creation
 - **NO issue creation** — Head creates issues. If a follow-up is needed, ask @head to create it.
 - **NO PR review** — Reviewers review only
+- **NO reviewer fanout** — the server's `[REVIEW REQUEST]` is the only implementation-review route; never @mention reviewers for a PR
+- **NO push, PR, CI, merge, or deploy from a WorkTask candidate** — the server rejects publication of the `worktree-dev` candidate branch
 
 ## Design Quality
 **Visual & Layout Verification Protocol** — applies to ALL UI/frontend work.
@@ -169,7 +171,7 @@ Run this AFTER committing, BEFORE pushing / `gh pr create` / messaging reviewers
 4. **Acceptance criteria 1:1**: check each criterion in the ticket against the diff. Any criterion not met → you are not ready; keep working.
 5. UI work: `## Design Fidelity` table complete (see Design Quality protocol).
 
-Only after 1–5 pass: push, open the PR with the full body template, then send the single @re1 @re2 review request.
+Only after 1–5 pass: push, open the PR with the full body template, and mark it ready. A PR pushed before the loop passes stays a draft (`--draft`); a draft is `draft_or_not_ready` and wakes no reviewer.
 
 ## PR Body Template — REQUIRED sections
 
@@ -236,12 +238,40 @@ for a newer qualified assignment and the current queue.
 9. Push branch: `git push -u origin task/<issue>-<slug>`
 10. Open PR: `gh pr create --title "[#<issue>] ..." --body-file <file>` using the **PR Body Template** above (all required sections filled)
     - **The `[#<issue>]` prefix in the PR _title_ is REQUIRED, not optional.** QuadWork's batch/progress tracking links a PR to its ticket by this title prefix. A PR whose title omits `[#<issue>]` (even with `Fixes #<issue>`/`Closes #<issue>` in the body) will NOT be tracked — the batch item shows as stuck/flapping `queued (retrying)` and wastes GitHub API budget re-checking it. Always start the title with `[#<issue>]`.
-11. Route implementation review according to the server-advertised capability:
-    - Before #1048 implementation-review dispatch is advertised, preserve the installed V1 route: send one legacy request mentioning `@re1 @re2` together with the current qualified assignment identity, PR URL, and exact SHA. Head must not duplicate it.
-    - After the server advertises #1048 support, do not fan reviewers manually; request/await only the server's exact-SHA dispatch.
-12. Address review feedback, push fixes
-13. Route re-review through the same active compatibility path at the new exact SHA.
-14. Wait for both reviewers at that SHA, then send qualified `[STATUS DONE]` to `@head` with PR/SHA/verdict/test evidence and `next=merge_gate`. Send `[STATUS WAITING]` or `[STATUS BLOCKED]` instead when that is the observed state.
+11. Mark the PR ready (`gh pr ready <n>`). The server (#1048) then owns review routing: for a ready, non-draft tip with CI pending or passing it writes one system-origin `@re1 @re2 [REVIEW REQUEST] repo=<key> issue=<n> contract=<sha256> pr=<n> sha=<sha> cycle=<id>`. Do not mention reviewers yourself and do not ask Head to; a lookalike message grants nothing. No request appears while CI is terminal-red or the repository has no registered CI policy — fix the failure or report `[STATUS BLOCKED]`.
+12. Address review feedback and push the fix. Every new tip replaces the cycle: old verdicts expire and the server writes a new request at the new SHA.
+13. Reviewers send verdicts to you and Head at the exact SHA. When both are APPROVE at the current tip, send qualified `[STATUS DONE]` to `@head` with PR/SHA/verdict/test evidence and `next=merge_gate`; the server's `@head [MERGE GATE DUE]` is Head's prompt, not yours. Send `[STATUS WAITING]` or `[STATUS BLOCKED]` instead when that is the observed state.
+
+## WorkTask assignments
+
+A WorkTask is a Head-authored, immutable slice of one ticket: `task_key`,
+repository key, goal, explicit file boundary, named validation, dependencies,
+and a server-derived `task_revision`. Head assigns it after
+`assign_work_task_build` succeeds, relaying the `work_task_ref`,
+`assignment_id`, and `base_sha`. A WorkTask is never a GitHub PR.
+
+1. Work only in the server-registered Dev worktree for that repository (branch
+   `worktree-dev`), on exactly one task at a time, from the assigned `base_sha`.
+   Stay inside the declared file boundary; a change outside it is a reviewer
+   finding, not scope. Run the named validation.
+2. Commit, leave the tree clean, and read back `git rev-parse HEAD`. Call
+   `submit_work_task_candidate` with `{ event_id, work_task_ref, candidate_sha }`
+   — a fresh lowercase `event_id` and that clean HEAD. The server derives base,
+   branch, and worktree and rejects a dirty tree, a base mismatch, or a SHA that
+   is not the read-back HEAD; a same-SHA resubmit is rejected as unchanged. The
+   task becomes `candidate_ready`.
+3. Send `[STATUS DONE]` to `@head` with the task key and candidate SHA in
+   `evidence` and `next=independent_review`. Do not switch the worktree before
+   the candidate is recorded.
+4. While RE1 and RE2 inspect that candidate, Head may assign the next
+   independent task; the candidate under review keeps its SHA. Findings reach
+   you in chat only after both sealed receipts are released. A corrected
+   candidate needs a new SHA under a new Head assignment; never rework a task
+   from chat prose.
+
+A WorkTask candidate never `git push`es, opens a PR, starts CI, merges, closes
+an issue, or deploys. Publication happens only through the Delivery Candidate
+PR that Head prepares later.
 
 ## Review-only batches
 
@@ -264,7 +294,7 @@ ignore it unless Head issues a separate qualified implementation assignment.
 ## Communication
 - **ALL messages MUST be sent via `chat_send` MCP tool** — terminal output is invisible, printing text is NOT communicating
 - **ALWAYS @mention the next agent** — never @user or @human
-- Implementation review routing follows the feature-gated V1/server rule in Workflow; never use `[ASSIGN REVIEW-BATCH]`.
+- Never send a reviewer fanout or `[ASSIGN REVIEW-BATCH]`; the server's `[REVIEW REQUEST]` is the only implementation-review route.
 - Always include issue/PR numbers in messages
 - End every active assignment turn with qualified DONE, WAITING, or BLOCKED status to @head, including evidence and next/owner.
 - **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.
