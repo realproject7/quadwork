@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -272,6 +273,52 @@ function governor(options = {}) {
     const killed = await g.transition({ projectId: "longkey", role: "dev", operationId: trial.operation.operation_id, generationId: trial.operation.generation_id, status: "resource_killed" });
     assert.match(killed.operation.circuit.loss_correlation, /^[a-f0-9]{32}:resource_killed$/);
     assert.equal(governor().snapshot("longkey", "dev").circuit.loss_correlation, killed.operation.circuit.loss_correlation);
+  }
+
+  // A circuit persisted by a pre-digest server kept the raw
+  // `${assignment_key}:<reason>` correlation, which the 128-char record bound
+  // drops on read.  Upgrading must make that circuit nameable again by the
+  // same digest a fresh opening writes, for both the operator and Head, while
+  // a correlation that survived the bound is kept verbatim, a closed circuit
+  // gains none, and a second read derives the identical value.
+  {
+    const longKey = `["batch-assignment",1,"${"y".repeat(300)}"]`;
+    const shortKey = `repo:owner/repo#${"7".repeat(70)}`;
+    const digest = (projectId, role, key, reason) => `${crypto.createHash("sha256").update(`${projectId}\n${role}\n${key}`).digest("hex").slice(0, 32)}:${reason}`;
+    const legacyRecord = (key, reason, open) => ({
+      operation_id: "op-legacy", generation_id: "gen-lost", state: open ? "rejected" : "exited", source: "watchdog",
+      expected_assignment: { assignment_key: key, assignment_attempt: "attempt-1", issue_contract_digest: null },
+      circuit: { open, reason, automatic_retries: 1, loss_correlation: open ? `${key}:${reason}` : null, expected_generation: open ? "gen-lost" : null, trial_operation_id: null, head_trial_operation_id: null },
+      last_observation: { at: "2026-08-01T00:00:00.000Z", health: "unknown" }, unresolved_loss: null,
+    });
+    const filePath = projectStatePath(home, "legacy");
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(filePath, JSON.stringify({ version: 1, roles: {
+      dev: legacyRecord(longKey, "early_exit", true),
+      re1: legacyRecord(longKey, "resource_killed", true),
+      re2: legacyRecord(shortKey, "early_exit", true),
+      head: legacyRecord(longKey, "early_exit", false),
+    } }), { mode: 0o600 });
+    assert.ok(`${longKey}:early_exit`.length > 128, "the seeded raw correlation exceeds the record bound");
+    assert.ok(`${shortKey}:early_exit`.length <= 128, "the control correlation fits the record bound");
+
+    const healed = governor().snapshot("legacy", "dev").circuit;
+    assert.equal(healed.loss_correlation, digest("legacy", "dev", longKey, "early_exit"), "the dropped correlation is re-derived as the fresh digest");
+    assert.equal(governor().snapshot("legacy", "re1").circuit.loss_correlation, digest("legacy", "re1", longKey, "resource_killed"));
+    assert.equal(governor().snapshot("legacy", "dev").circuit.loss_correlation, healed.loss_correlation, "a second read derives the identical value");
+    assert.equal(governor().snapshot("legacy", "re2").circuit.loss_correlation, `${shortKey}:early_exit`, "a correlation that survived the bound is not rewritten");
+    assert.equal(governor().snapshot("legacy", "head").circuit.open, false);
+    assert.equal(governor().snapshot("legacy", "head").circuit.loss_correlation, null, "a closed circuit gains no correlation");
+
+    const operator = await governor().reserve({ projectId: "legacy", role: "dev", source: "operator_restart", operatorAuthorized: true, expectedGeneration: "gen-lost", lossCorrelation: healed.loss_correlation });
+    assert.equal(operator.status, "reserved", "the operator can take the trial on a pre-upgrade circuit");
+    assert.equal(governor().snapshot("legacy", "dev").circuit.loss_correlation, healed.loss_correlation, "the persisted trial record carries the healed correlation");
+    const head = await governor().reserve({ projectId: "legacy", role: "re1", source: "head_recovery", expectedGeneration: "gen-lost", lossCorrelation: digest("legacy", "re1", longKey, "resource_killed") });
+    assert.equal(head.status, "reserved", "Head can take the trial on a pre-upgrade circuit");
+    const wrongName = await governor().reserve({ projectId: "legacy", role: "re2", source: "operator_restart", operatorAuthorized: true, expectedGeneration: "gen-lost", lossCorrelation: digest("legacy", "re2", shortKey, "early_exit") });
+    assert.equal(wrongName.reason, "circuit_trial_authorization_required", "a surviving raw correlation is still the only name that authorizes its trial");
+    const control = await governor().reserve({ projectId: "legacy", role: "re2", source: "operator_restart", operatorAuthorized: true, expectedGeneration: "gen-lost", lossCorrelation: `${shortKey}:early_exit` });
+    assert.equal(control.status, "reserved");
   }
 
   // State survives a fresh governor instance with mode-0600 persistence and

@@ -1667,7 +1667,7 @@ async function recoverWorkerForHead(projectId, recovery) {
 // server already knows for each current work item.  Both are observations;
 // neither is acted on, and neither failure can block the recovery.
 async function recoveryRepositoryFacts(projectId, agentId) {
-  const repository = captureRepositoryFacts({ cwd: resolveAgentCwd(projectId, agentId) });
+  const repository = await captureRepositoryFacts({ cwd: resolveAgentCwd(projectId, agentId) });
   let knownPrs = [];
   try {
     const items = routes.readLiveBatchContext(projectId)?.parsed?.workItems || [];
@@ -2235,6 +2235,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       generationId: opts.generationId || null,
       _lifecycleSpawnRecorded: false,
       _lifecycleVerificationPending: false,
+      _lifecycleStructuredConfirmed: false,
       startedAt: new Date().toISOString(),
       error: null,
       // #1010: explicit backend identity for the session. The PTY dispatcher
@@ -2352,6 +2353,7 @@ function flushPendingLifecycleVerification(session) {
     generationId: session.generationId,
     status: "verified",
     health: "running",
+    structuredStatus: session._lifecycleStructuredConfirmed === true,
   }).catch(() => { session.lifecycleState = "unknown"; });
 }
 
@@ -2360,6 +2362,23 @@ function recordAgentSpawnedLifecycle(project, agent, operation) {
   const session = agentSessions.get(`${project}/${agent}`);
   if (!session || session.operationId !== operation.operation_id || session.generationId !== operation.generation_id) return;
   session._lifecycleSpawnRecorded = true;
+  flushPendingLifecycleVerification(session);
+}
+
+// The first PTY bytes distinguish spawned from verified, but they are not
+// recovery: a banner-then-crash paints them too.  A chat post authenticated
+// with the shim token minted for this spawn is this generation acting through
+// its own MCP wiring; that is the structured confirmation which lets a
+// circuit trial clear.  Recorded once per generation, never for an exited
+// session, and routed through the same generation-matched transition.
+function recordAgentChatActivity(projectId, agentId) {
+  const session = agentSessions.get(`${projectId}/${agentId}`);
+  if (!session || session.state !== "running" || !session.operationId || !session.generationId) return;
+  session.lastChatAt = new Date().toISOString();
+  if (session._lifecycleStructuredConfirmed) return;
+  session._lifecycleStructuredConfirmed = true;
+  session.lifecycleState = "verified";
+  session._lifecycleVerificationPending = true;
   flushPendingLifecycleVerification(session);
 }
 
@@ -3551,6 +3570,8 @@ app.post("/api/triggers/sync", (_req, res) => {
 
 // Expose syncTriggers for migrated routes (config PUT, rename)
 app.set("syncTriggers", syncTriggersFromConfig);
+// An authenticated shim post on /api/chat is the worker's structured confirmation.
+app.set("recordAgentChatActivity", recordAgentChatActivity);
 
 // --- OVERNIGHT-QUEUE.md viewer/editor (#209) ---------------------------------
 // Read/write the per-project ~/.quadwork/{id}/OVERNIGHT-QUEUE.md file from

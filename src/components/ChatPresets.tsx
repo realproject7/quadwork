@@ -13,17 +13,16 @@ const STORAGE_KEY = "qw-chat-presets";
 const LEGACY_QUEUE_FORMAT_PRESET = `@head Check your OVERNIGHT-QUEUE.md formatting. Each Active Batch item must start with \`- #<number>\` (dash, space, hash, issue number). Do NOT use \`- Issue #598\` format — only \`- #598 description\`. The Current Batch panel won't recognize items in any other format. Fix if needed and confirm.`;
 const QUALIFIED_QUEUE_FORMAT_PRESET = `@head Check your OVERNIGHT-QUEUE.md formatting without changing repository identity. In V2, each Active Batch item must use the registered repository's exact \`- owner/repo#<number> description\` form. Never rewrite a qualified reference as bare \`#<number>\`; the same number may exist in multiple repositories. Only a pre-activation V1 single-repository queue may retain \`- #<number> description\`. Fix malformed items if needed and report any unknown repository visibly.`;
 
-const DEFAULT_PRESETS: Preset[] = [
-  {
-    id: "default-1",
-    title: "Queue Check — Trigger",
-    message: `@head @dev @re1 @re2 – Queue check.
+// The retired all-agent pulse preset. The Monitor now writes structured events
+// to @head only; an untouched cached copy of this built-in is dropped below.
+const LEGACY_QUEUE_CHECK_PRESET = `@head @dev @re1 @re2 – Queue check.
 Discovery: read ~/.quadwork/{{project}}/GITHUB.md (or GET /api/github-parsed?project={{project}}) for issue/PR state instead of running gh. If it's absent or stale (>2 cycles / _stale), do ONE direct gh read to confirm. GITHUB.md may lag — confirm with a direct gh read before any merge/review decision.
 @head: Merge any PR with both approvals, assign next from ~/.quadwork/{{project}}/OVERNIGHT-QUEUE.md.
 @dev: Work on assigned ticket or address review feedback.
 @re1 & @re2: Review ONLY PRs you were @mentioned on in this chat (not all open PRs). If @dev pushed fixes, re-review. Post verdict on PR AND notify @dev here.
-ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via this chat by tagging agents. Your terminal is NOT visible.`,
-  },
+ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
+
+const DEFAULT_PRESETS: Preset[] = [
   {
     id: "default-2",
     title: "Suffix Reminder",
@@ -50,11 +49,18 @@ function loadPresets(): Preset[] {
       return DEFAULT_PRESETS;
     }
     const parsed: Preset[] = JSON.parse(raw);
-    // Migrate only the untouched built-in V1 instruction. A user-edited preset
-    // keeps its content, while installations that cached the old default stop
-    // instructing Head to destroy V2 repository-qualified identity.
+    // Migrate only untouched built-ins. A user-edited preset keeps its
+    // content, while installations that cached the old defaults stop
+    // instructing Head to destroy V2 repository-qualified identity and lose
+    // the retired all-agent pulse.
     let migrated = false;
-    const presets = parsed.map((preset) => {
+    const presets = parsed.filter((preset) => {
+      if (preset.id === "default-1" && preset.message === LEGACY_QUEUE_CHECK_PRESET) {
+        migrated = true;
+        return false;
+      }
+      return true;
+    }).map((preset) => {
       if (preset.id === "default-3" && preset.message === LEGACY_QUEUE_FORMAT_PRESET) {
         migrated = true;
         return { ...preset, message: QUALIFIED_QUEUE_FORMAT_PRESET };

@@ -671,7 +671,7 @@ router.patch("/api/config", (req, res) => {
 });
 
 // ─── Per-project flag toggles (field-scoped, race-free) — #971 ──────────────
-// The toggle widgets (idle, awake_auto, trigger_auto, telegram/discord auto,
+// The toggle widgets (idle, awake_auto, telegram/discord auto,
 // bridge filter, loop-guard auto-continue) used to GET the whole config, flip
 // one field, and PUT the entire object back — so any two overlapping toggles
 // (or a Settings save) clobbered each other with stale snapshots. This endpoint
@@ -681,7 +681,6 @@ router.patch("/api/config", (req, res) => {
 const PROJECT_FLAG_KEYS = new Set([
   "idle",
   "awake_auto",
-  "trigger_auto",
   "telegram_auto",
   "discord_auto",
   "bridge_filter_agents_only",
@@ -720,7 +719,7 @@ router.patch("/api/projects/:id/flags", (req, res) => {
     return res.status(500).json({ error: "Failed to write config", detail: err.message });
   }
 
-  // idle / trigger_auto gate the scheduler — resync it (same as the whole PUT).
+  // idle gates the scheduler — resync it (same as the whole PUT).
   if (typeof req.app.get("syncTriggers") === "function") req.app.get("syncTriggers")();
   res.json({ ok: true });
 });
@@ -2327,6 +2326,11 @@ router.post("/api/chat", (req, res) => {
       type: "message",
       attachments,
     });
+  }
+  // An authenticated shim post is this generation acting through its own MCP
+  // wiring; the runtime records it as the agent's structured confirmation.
+  if (selfMentionSkip && typeof req.app.get("recordAgentChatActivity") === "function") {
+    req.app.get("recordAgentChatActivity")(projectId, selfMentionSkip);
   }
   // #717: loop guard — count agent hops, pause if threshold reached
   if (isChatAuthorityCurrent()) {
@@ -7349,10 +7353,6 @@ router.post("/api/rename", (req, res) => {
   if (type === "project") {
     project.name = newName;
     changes.push("config.json");
-    if (project.trigger_message && project.trigger_message.includes(oldName)) {
-      project.trigger_message = project.trigger_message.replaceAll(oldName, newName);
-      changes.push("trigger_message");
-    }
     if (workDir) {
       const claudeMd = path.join(workDir, "CLAUDE.md");
       if (replaceInFile(claudeMd, oldName, newName)) changes.push("CLAUDE.md");
@@ -7368,14 +7368,6 @@ router.post("/api/rename", (req, res) => {
       if (agent.agents_md && agent.agents_md.includes(oldDisplayName)) {
         agent.agents_md = agent.agents_md.replaceAll(oldDisplayName, newName);
         changes.push("agents_md");
-      }
-      if (project.trigger_message) {
-        const oldMention = `@${oldDisplayName.toLowerCase()}`;
-        const newMention = `@${newName.toLowerCase()}`;
-        if (project.trigger_message.includes(oldMention)) {
-          project.trigger_message = project.trigger_message.replaceAll(oldMention, newMention);
-          changes.push("trigger_message");
-        }
       }
       if (workDir) {
         const tomlPaths = [

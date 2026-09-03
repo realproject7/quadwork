@@ -81,17 +81,19 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     await Promise.all([
       PATCH(server, "lv", { telegram_auto: true }),
       PATCH(server, "lv", { discord_auto: true }),
-      PATCH(server, "lv", { trigger_auto: true }),
       PATCH(server, "lv", { bridge_filter_agents_only: true }),
       PATCH(server, "lv", { auto_continue_loop_guard: true, auto_continue_delay_sec: 45 }),
     ]);
     entry = readCfg().projects.find((p) => p.id === "lv");
-    ok(entry.telegram_auto && entry.discord_auto && entry.trigger_auto && entry.bridge_filter_agents_only &&
+    ok(entry.telegram_auto && entry.discord_auto && entry.bridge_filter_agents_only &&
        entry.auto_continue_loop_guard === true && entry.auto_continue_delay_sec === 45 && entry.idle === true,
-       "five concurrent multi-field toggles all persist, none clobbered");
+       "four concurrent multi-field toggles all persist, none clobbered");
 
     // ── Validation ───────────────────────────────────────────────────────────
     ok((await PATCH(server, "lv", { bogus: true })).status === 400, "unknown flag → 400");
+    ok((await PATCH(server, "lv", { trigger_auto: true })).status === 400, "retired trigger_auto flag → 400");
+    ok(!Object.prototype.hasOwnProperty.call(readCfg().projects.find((p) => p.id === "lv"), "trigger_auto"),
+       "a retired flag is never written to config");
     ok((await PATCH(server, "lv", { idle: "yes" })).status === 400, "wrong type (string for boolean) → 400");
     ok((await PATCH(server, "lv", { auto_continue_delay_sec: -1 })).status === 400, "negative delay → 400");
     ok((await PATCH(server, "ghost", { idle: true })).status === 404, "unknown project → 404");

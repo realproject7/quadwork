@@ -5,12 +5,17 @@
 // Head BEFORE anything touches the role worktree.  Every invocation is an
 // argument-array `git` query (rev-parse, symbolic-ref, rev-list, status) run
 // with `--no-optional-locks`, so even `status` cannot refresh or write the
-// index.  Nothing here checks out, resets, cleans, stashes, restores, commits,
-// fetches, or follows a caller-selected path: the only input is the configured
-// role cwd.  A capture failure is a recorded `available: false` fact, never an
-// exception, so it can never block or crash a legitimate recovery.
+// index, and with `core.fsmonitor` forced off, because the server does not
+// control the worktree's config and `status` would otherwise execute a
+// repository-configured fsmonitor hook.  Nothing here checks out, resets,
+// cleans, stashes, restores, commits, fetches, or follows a caller-selected
+// path: the only input is the configured role cwd.  A capture failure is a
+// recorded `available: false` fact, never an exception, so it can never block
+// or crash a legitimate recovery.  Each query runs off the event loop under
+// its own timeout; a capture is at most six queries, so its worst-case wall
+// time is 6 x GIT_TIMEOUT_MS (30 s) while the API process stays responsive.
 
-const { execFileSync } = require("node:child_process");
+const { execFile } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -18,6 +23,7 @@ const GIT_TIMEOUT_MS = 5000;
 const MAX_OUTPUT_BYTES = 256 * 1024;
 const MAX_STATUS_ENTRIES = 100;
 const MAX_STATUS_LINE = 256;
+const GIT_GLOBAL_ARGS = Object.freeze(["--no-optional-locks", "-c", "core.fsmonitor=false"]);
 
 function gitEnvironment(env) {
   const out = {};
@@ -30,21 +36,21 @@ function gitEnvironment(env) {
 }
 
 function git(cwd, env, args) {
-  try {
-    const output = execFileSync("git", ["--no-optional-locks", ...args], {
-      cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: GIT_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES,
+  return new Promise((resolve) => {
+    execFile("git", [...GIT_GLOBAL_ARGS, ...args], {
+      cwd, env, encoding: "utf8", timeout: GIT_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES,
+    }, (error, output) => {
+      if (error) resolve({ ok: false, code: error.code === "ENOENT" ? "git_unavailable" : "git_failed" });
+      else resolve({ ok: true, output: output.replace(/\n$/, "") });
     });
-    return { ok: true, output: output.replace(/\n$/, "") };
-  } catch (error) {
-    return { ok: false, code: error && error.code === "ENOENT" ? "git_unavailable" : "git_failed" };
-  }
+  });
 }
 
 function unavailable(cwd, reason, capturedAt) {
   return { captured_at: capturedAt, available: false, reason, path: cwd, worktree: null, branch: null, head: null, upstream: null, ahead: null, behind: null, status: null };
 }
 
-function captureRepositoryFacts(input = {}) {
+async function captureRepositoryFacts(input = {}) {
   const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : null;
   const now = typeof input.now === "function" ? input.now : () => new Date();
   const capturedAt = now().toISOString();
@@ -54,15 +60,15 @@ function captureRepositoryFacts(input = {}) {
     try { stat = fs.statSync(cwd); } catch { return unavailable(cwd, "worktree_missing", capturedAt); }
     if (!stat.isDirectory()) return unavailable(cwd, "worktree_missing", capturedAt);
     const env = gitEnvironment(typeof input.env === "object" && input.env ? input.env : process.env);
-    const identity = git(cwd, env, ["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"]);
+    const identity = await git(cwd, env, ["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"]);
     if (!identity.ok) return unavailable(cwd, identity.code === "git_unavailable" ? "git_unavailable" : "not_a_repository", capturedAt);
     const [toplevel, gitDir, commonDir] = identity.output.split("\n").map((line) => path.resolve(cwd, line.trim()));
-    const branch = git(cwd, env, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    const head = git(cwd, env, ["rev-parse", "--verify", "--quiet", "HEAD"]);
-    const upstream = git(cwd, env, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
-    const counts = upstream.ok && head.ok ? git(cwd, env, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]) : { ok: false };
+    const branch = await git(cwd, env, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    const head = await git(cwd, env, ["rev-parse", "--verify", "--quiet", "HEAD"]);
+    const upstream = await git(cwd, env, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    const counts = upstream.ok && head.ok ? await git(cwd, env, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]) : { ok: false };
     const [ahead, behind] = counts.ok ? counts.output.split(/\s+/).map((value) => Number.parseInt(value, 10)) : [null, null];
-    const status = git(cwd, env, ["status", "--porcelain"]);
+    const status = await git(cwd, env, ["status", "--porcelain"]);
     if (!status.ok) return unavailable(cwd, "git_failed", capturedAt);
     const lines = status.output ? status.output.split("\n") : [];
     return {
