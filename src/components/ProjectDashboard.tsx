@@ -11,11 +11,20 @@ import AgentTerminalsGrid from "./AgentTerminalsGrid";
 import OperatorFeaturesPanel from "./OperatorFeaturesPanel";
 import { useLocale } from "@/components/LocaleProvider";
 import { onIdleChange } from "@/lib/idle";
+import {
+  DEFAULT_PANEL_VISIBILITY,
+  LEGACY_TERMINALS_COLLAPSED_KEY,
+  panelVisibilityKey,
+  resolvePanelVisibility,
+  serializePanelVisibility,
+} from "@/lib/panelVisibility";
 
 const MIN_SIZE = 150; // px
 const DIVIDER = 4; // px
 
 type AgentState = "running" | "stopped" | "error";
+type PanelVisibility = ReturnType<typeof resolvePanelVisibility>;
+type PanelId = keyof PanelVisibility;
 
 interface ProjectDashboardProps {
   projectId: string;
@@ -39,6 +48,8 @@ const COPY = {
         <b>GitHub</b> — open issues and pull requests on this project&apos;s repo. Click any item to open it on GitHub. The batch progress panel tracks the active batch&apos;s lifecycle from queued to merged.
       </>
     ),
+    hide: "Hide",
+    show: "Show",
   },
   ko: {
     filterAgentsTitle: "에이전트 메시지만 표시 중 - 클릭하면 전체를 표시합니다",
@@ -57,6 +68,8 @@ const COPY = {
         <b>GitHub</b> - 이 프로젝트 저장소의 열린 이슈와 PR을 보여줍니다. 항목을 클릭하면 GitHub에서 바로 열립니다. 아래 배치 진행 패널은 현재 배치가 대기에서 병합까지 어떻게 진행되는지 추적합니다.
       </>
     ),
+    hide: "접기",
+    show: "펼치기",
   },
 } as const;
 
@@ -65,10 +78,31 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   const t = COPY[locale];
   const containerRef = useRef<HTMLDivElement>(null);
   const [colRatio, setColRatio] = useState(0.5);
-  const [rowRatio, setRowRatio] = useState(0.5);
-  const dragging = useRef<"col" | "row" | null>(null);
+  const dragging = useRef(false);
   const [agentStates, setAgentStates] = useState<Record<string, AgentState>>({});
-  const [terminalsCollapsed, setTerminalsCollapsed] = useState(false);
+
+  // #1052: right-rail panel visibility (expanded booleans), persisted
+  // browser-locally per project. Presentation-only: toggling never touches
+  // the server, the column ratio, or any batch/monitor/agent lifecycle.
+  // Defaults render first; the saved preference (and the #668 legacy
+  // terminals key) is applied after mount, and storage is written only on
+  // an explicit toggle — never on first render.
+  const [panels, setPanels] = useState<PanelVisibility>(DEFAULT_PANEL_VISIBILITY);
+  useEffect(() => {
+    let saved: string | null = null;
+    let legacy: string | null = null;
+    try {
+      saved = localStorage.getItem(panelVisibilityKey(projectId));
+      legacy = localStorage.getItem(LEGACY_TERMINALS_COLLAPSED_KEY);
+    } catch { /* localStorage unavailable — keep defaults */ }
+    setPanels(resolvePanelVisibility(saved, legacy));
+  }, [projectId]);
+  const togglePanel = useCallback((id: PanelId) => {
+    const next = { ...panels, [id]: !panels[id] };
+    setPanels(next);
+    try { localStorage.setItem(panelVisibilityKey(projectId), serializePanelVisibility(next)); } catch {}
+  }, [panels, projectId]);
+  const bodyId = (id: PanelId) => `qw-panel-${id}-${encodeURIComponent(projectId)}`;
 
   // #523/#525: system message filter — source of truth is the per-project
   // config (bridge_filter_agents_only), so dashboard and bridges stay in sync.
@@ -127,6 +161,9 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   // and reacts to the shared idle signal so its pollers start/stop live when
   // the operator flips the switch elsewhere (no manual reload).
   const [idle, setIdle] = useState(false);
+  // #1031: a project with two registered repositories renders GitHub rows
+  // with their repository key so the same number in both never looks alike.
+  const [multiRepository, setMultiRepository] = useState(false);
   const idleLoadedRef = useRef(false);
   // #826: a live idle signal that arrives while the initial /api/config read is
   // in flight is AUTHORITATIVE — the operator just toggled the switch, so the
@@ -137,6 +174,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     idleLoadedRef.current = false;
     idleSignalRef.current = false;
     setIdle(false);
+    setMultiRepository(false);
   }, [projectId]);
   useEffect(() => {
     if (idleLoadedRef.current) return;
@@ -148,9 +186,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       .then((cfg) => {
         if (cancelled || !cfg) return;
         idleLoadedRef.current = true;
+        const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId) as
+          { idle?: boolean; repositories?: unknown[] } | undefined;
+        setMultiRepository(Array.isArray(entry?.repositories) && entry.repositories.length > 1);
         // A live signal already set the authoritative value — don't clobber it.
         if (idleSignalRef.current) return;
-        const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
         setIdle(!!entry?.idle);
       })
       .catch(() => {});
@@ -200,22 +240,18 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     []
   );
 
+  // #1052: one resizable vertical divider between the two columns. The old
+  // horizontal (row) divider and rowRatio are gone with the 2x2 grid.
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
       if (!dragging.current || !containerRef.current) return;
       const rect = containerRef.current.getBoundingClientRect();
-
-      if (dragging.current === "col") {
-        const x = e.clientX - rect.left;
-        setColRatio(clamp(x / rect.width, rect.width));
-      } else {
-        const y = e.clientY - rect.top;
-        setRowRatio(clamp(y / rect.height, rect.height));
-      }
+      const x = e.clientX - rect.left;
+      setColRatio(clamp(x / rect.width, rect.width));
     };
 
     const onMouseUp = () => {
-      dragging.current = null;
+      dragging.current = false;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
@@ -228,19 +264,19 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     };
   }, [clamp]);
 
-  const startDrag = (axis: "col" | "row") => {
-    dragging.current = axis;
-    document.body.style.cursor = axis === "col" ? "col-resize" : "row-resize";
+  const startDrag = () => {
+    dragging.current = true;
+    document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
   };
 
-  const colTemplate = terminalsCollapsed
-    ? `1fr ${DIVIDER}px auto`
-    : `${colRatio * 100}% ${DIVIDER}px 1fr`;
-  const rowTemplate = `${rowRatio * 100}% ${DIVIDER}px 1fr`;
+  const colTemplate = `${colRatio * 100}% ${DIVIDER}px 1fr`;
 
-  // On mobile (<lg): flex column layout, scrollable. Terminals + dividers hidden.
-  // On desktop (lg+): CSS grid 2x2 with resizable dividers (unchanged behavior).
+  // On mobile (<lg): flex column layout, scrollable. Terminals + divider hidden;
+  // GitHub and Operator Features stack below Primary Chat and stay collapsible.
+  // On desktop (lg+): two-column CSS grid — Primary Chat fills the left column,
+  // the right column is a vertical flex rail (Agent Terminals → GitHub →
+  // Operator Features) with one resizable vertical divider (#1052).
   // Components are rendered ONCE — layout switching is pure CSS via a scoped
   // media query that overrides the flex-col to a grid at lg+ breakpoint.
   return (
@@ -250,13 +286,13 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           .qw-dashboard {
             display: grid !important;
             grid-template-columns: ${colTemplate};
-            grid-template-rows: ${rowTemplate};
+            grid-template-rows: minmax(0, 1fr);
             overflow: hidden !important;
           }
         }
       `}</style>
       <div className="qw-dashboard flex flex-col w-full h-full overflow-y-auto">
-        {/* Q1: Agent primary chat */}
+        {/* Left column: Agent primary chat */}
         <div className="flex flex-col overflow-hidden border-2 border-accent h-[60vh] shrink-0 lg:h-auto lg:shrink lg:min-h-0">
           <PanelHeader label={t.chatLabel} tooltip={
             <InfoTooltip>
@@ -271,65 +307,61 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           <ControlBar projectId={projectId} idle={idle} />
         </div>
 
-        {/* Vertical divider — top segment (desktop only) */}
+        {/* Vertical divider (desktop only) */}
         <div
           className="hidden lg:block bg-border cursor-col-resize hover:bg-accent-dim transition-colors"
-          onMouseDown={() => startDrag("col")}
+          onMouseDown={startDrag}
         />
 
-        {/* Q2: Agent terminals — hidden on mobile (xterm.js + touch) */}
-        <div className="hidden lg:flex flex-col overflow-hidden">
-          <AgentTerminalsGrid
-            projectId={projectId}
-            agentStates={agentStates}
-            onStatusChange={updateAgentState}
-            onCollapsedChange={setTerminalsCollapsed}
-          />
-        </div>
-
-        {/* Horizontal divider — left segment (desktop only) */}
-        <div
-          className="hidden lg:block bg-border cursor-row-resize hover:bg-accent-dim transition-colors"
-          onMouseDown={() => startDrag("row")}
-        />
-
-        {/* Horizontal divider — center intersection (desktop only) */}
-        <div
-          className="hidden lg:block bg-border cursor-move"
-          onMouseDown={() => startDrag("col")}
-        />
-
-        {/* Horizontal divider — right segment (desktop only) */}
-        <div
-          className="hidden lg:block bg-border cursor-row-resize hover:bg-accent-dim transition-colors"
-          onMouseDown={() => startDrag("row")}
-        />
-
-        {/* Q3: GitHub panel */}
-        <div className="flex flex-col overflow-hidden border-t border-border lg:border-t-0 min-h-[40vh] shrink-0 lg:min-h-0 lg:shrink">
-          <PanelHeader label={t.githubLabel} tooltip={
-            <InfoTooltip>
-              {t.githubTooltip}
-            </InfoTooltip>
-          }>
-            {/* #866: always-on rate-limit status badge, top-right of the GITHUB header */}
-            {/* #893: pass projectId so the reviewer budget resolves per project */}
-            <GitHubRateLimitBadge projectId={projectId} />
-          </PanelHeader>
-          <div className="flex-1 min-h-0">
-            <GitHubPanel projectId={projectId} idle={idle} />
+        {/* Right rail: every expanded panel shares the remaining height
+            equally (flex-1 min-h-0, own internal scrolling); a collapsed
+            panel keeps only its 28px header. Collapse never changes the
+            rail width or the column ratio. */}
+        <div className="flex flex-col lg:min-h-0 lg:overflow-hidden">
+          {/* Agent terminals — hidden on mobile (xterm.js + touch) */}
+          <div className={`hidden lg:flex flex-col overflow-hidden ${panels.terminals ? "lg:flex-1 lg:min-h-0" : "shrink-0"}`}>
+            <AgentTerminalsGrid
+              projectId={projectId}
+              agentStates={agentStates}
+              onStatusChange={updateAgentState}
+              expanded={panels.terminals}
+              onToggle={() => togglePanel("terminals")}
+              bodyId={bodyId("terminals")}
+            />
           </div>
-        </div>
 
-        {/* Vertical divider — bottom segment (desktop only) */}
-        <div
-          className="hidden lg:block bg-border cursor-col-resize hover:bg-accent-dim transition-colors"
-          onMouseDown={() => startDrag("col")}
-        />
+          {/* GitHub panel — Issues, Pull Requests, Current Batch, OVERNIGHT-QUEUE.md */}
+          <div className={`flex flex-col overflow-hidden border-t border-border ${panels.github ? "min-h-[40vh] shrink-0 lg:min-h-0 lg:shrink lg:flex-1" : "shrink-0"}`}>
+            <PanelHeader
+              label={t.githubLabel}
+              collapse={{ expanded: panels.github, onToggle: () => togglePanel("github"), bodyId: bodyId("github"), hideLabel: t.hide, showLabel: t.show }}
+              tooltip={
+                <InfoTooltip>
+                  {t.githubTooltip}
+                </InfoTooltip>
+              }
+            >
+              {/* #866: always-on rate-limit status badge, top-right of the GITHUB header */}
+              {/* #893: pass projectId so the reviewer budget resolves per project */}
+              <GitHubRateLimitBadge projectId={projectId} />
+            </PanelHeader>
+            {/* Body stays mounted while hidden so Current Batch state and list
+                scroll positions survive collapse/show; no lifecycle changes. */}
+            <div id={bodyId("github")} className={panels.github ? "flex-1 min-h-0" : "hidden"}>
+              <GitHubPanel projectId={projectId} idle={idle} multiRepository={multiRepository} />
+            </div>
+          </div>
 
-        {/* Q4: Operator Features */}
-        <div className="border-t border-border lg:border-t-0 flex flex-col overflow-hidden">
-          <OperatorFeaturesPanel projectId={projectId} idle={idle} />
+          {/* Operator Features */}
+          <div className={`flex flex-col overflow-hidden border-t border-border ${panels.operator ? "lg:flex-1 lg:min-h-0" : "shrink-0"}`}>
+            <OperatorFeaturesPanel
+              projectId={projectId}
+              idle={idle}
+              expanded={panels.operator}
+              onToggle={() => togglePanel("operator")}
+              bodyId={bodyId("operator")}
+            />
+          </div>
         </div>
       </div>
     </div>
