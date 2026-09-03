@@ -330,6 +330,43 @@ function rawStoredRound(store, ref) {
   assert.deepEqual(fs.readdirSync(external), []);
 }
 
+// A sealed propagating first-pass receipt yields a Head-private
+// `propagation_stop_pending` read that carries identity and the trusted chain
+// only.  The peer's own read path stays neutral, a local-only seal yields no
+// stop, and release retires the pending stop in favour of the combined record.
+{
+  const home = root("qw-task-review-round-propagation-");
+  const store = createTaskReviewRoundStore({ rootDir: home });
+  const candidateValue = candidate("7".repeat(64));
+  const opened = store.openRound(openInput(candidateValue, "attempt_propagation"), assignments());
+  const request = { version: 1, work_task_ref: copy(candidateValue.work_task_ref), candidate_digest: opened.candidate_digest };
+  const headContext = { version: 1, target: "head_private", dependency_chain: [copy(candidateValue.work_task_ref)] };
+  assert.equal(store.readSealedPropagationStop(request, headContext), null);
+
+  const propagating = { ...finding("finding_re1_prop"), propagation: "propagating" };
+  store.submitTrustedReceipt(opened.review_round_ref, opened.candidate_digest, receipt(opened.review_round_ref, "receipt_re1_prop", "request_changes", [propagating]), reviewer("re1", 11, "2026-09-01T06:01:00.000Z"));
+  const stop = store.readSealedPropagationStop(request, headContext);
+  assert.deepEqual(Object.keys(stop).sort(), ["candidate_digest", "dependency_chain", "kind", "review_round_ref", "target", "version"]);
+  assert.equal(stop.kind, "propagation_stop_pending");
+  assert.equal(stop.target, "head_private");
+  assert.equal(Object.isFrozen(stop), true);
+  assert.doesNotMatch(JSON.stringify(stop), /receipt|finding|reviewer|verdict|request_changes|re1/);
+  const peerView = store.readForTrustedReviewer(opened.review_round_ref, opened.candidate_digest, reviewer("re2", 22, "2026-09-01T06:01:01.000Z"));
+  assert.deepEqual(peerView, { version: 1, status: "sealed", review_round_ref: opened.review_round_ref, own_receipt: null });
+  throwsCode(() => store.readSealedPropagationStop(request, { version: 1, target: "reviewer", dependency_chain: [] }), "invalid_trusted_head_context");
+  assert.equal(store.readSealedPropagationStop({ ...request, candidate_digest: "8".repeat(64) }, headContext), null);
+  throwsCode(() => store.readSealedPropagationStop({ ...request, version: 2 }, headContext), "invalid_task_review_propagation_request");
+
+  store.submitTrustedReceipt(opened.review_round_ref, opened.candidate_digest, receipt(opened.review_round_ref, "receipt_re2_prop", "approve"), reviewer("re2", 22, "2026-09-01T06:02:00.000Z"));
+  assert.equal(store.readSealedPropagationStop(request, headContext), null);
+  assert.equal(store.readReleasedForReconciliation(opened.review_round_ref, opened.candidate_digest).receipt_verdicts.length, 2);
+
+  const localCandidate = candidate("9".repeat(64));
+  const localOpened = store.openRound(openInput(localCandidate, "attempt_local"), assignments());
+  store.submitTrustedReceipt(localOpened.review_round_ref, localOpened.candidate_digest, receipt(localOpened.review_round_ref, "receipt_re1_local", "request_changes", [finding("finding_re1_local")]), reviewer("re1", 11, "2026-09-01T06:03:00.000Z"));
+  assert.equal(store.readSealedPropagationStop({ ...request, candidate_digest: localOpened.candidate_digest }, headContext), null);
+}
+
 // The durable layer may use filesystem primitives and an internal redacted
 // released-anchor read, but has no route, config, MCP, chat, pipeline,
 // publication, or pruning API.

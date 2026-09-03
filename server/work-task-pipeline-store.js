@@ -16,6 +16,7 @@ const {
 const {
   assertWorkTaskPipeline,
   assertWorkTaskPipelinePlan,
+  planWorkTaskPipelineEvent,
   applyWorkTaskPipelinePlan,
 } = require("./work-task-pipeline");
 
@@ -28,6 +29,8 @@ const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const TERMINAL_KINDS = new Set(["archive", "integrated_cut", "contract_change"]);
+const ACTIVE_AUTHORITY_STATES = new Set(["building", "independent_review", "reconcile"]);
+const RETIRED_SUFFIX_RE = /^\.retired\.(\d{4})\.json$/;
 
 class WorkTaskPipelineStoreError extends Error {
   constructor(code, message = code) {
@@ -81,7 +84,7 @@ function expected(value, code) {
   return { ...owner, manifest_digest: value.manifest_digest, pipeline_digest: value.pipeline_digest };
 }
 function assertFs(fs) {
-  for (const name of ["mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync", "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync"]) {
+  for (const name of ["mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync", "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync", "readdirSync"]) {
     if (typeof fs[name] !== "function") fail("invalid_work_task_pipeline_store_options", `fs.${name} is required`);
   }
   return fs;
@@ -97,6 +100,23 @@ function workTaskPipelineStorePath(configDir, owner) {
   return path.join(storageDirectory(configDir), `${normalized.installation_id}--${normalized.project_id}.json`);
 }
 function lockPathFor(statePath) { return `${statePath}.lock`; }
+// A retired batch keeps its full record beside the active path under an
+// ordinal suffix, so provenance survives every later successor freeze.
+function retiredEntries(fs, statePath) {
+  const prefix = path.basename(statePath, ".json");
+  let names;
+  try { names = fs.readdirSync(path.dirname(statePath)); } catch { fail("work_task_pipeline_store_unreadable", "pipeline store directory cannot be listed"); }
+  return names
+    .filter((name) => name.startsWith(prefix) && RETIRED_SUFFIX_RE.test(name.slice(prefix.length)))
+    .map((name) => ({ ordinal: Number(RETIRED_SUFFIX_RE.exec(name.slice(prefix.length))[1]), path: path.join(path.dirname(statePath), name) }))
+    .sort((left, right) => left.ordinal - right.ordinal);
+}
+function nextRetiredPath(fs, statePath) {
+  const entries = retiredEntries(fs, statePath);
+  const ordinal = entries.length === 0 ? 1 : entries[entries.length - 1].ordinal + 1;
+  if (ordinal > 9999) fail("work_task_pipeline_store_retired_bound", "retired batch bound reached");
+  return `${statePath.slice(0, -".json".length)}.retired.${String(ordinal).padStart(4, "0")}.json`;
+}
 function temporaryPathFor(statePath) {
   return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
 }
@@ -238,6 +258,13 @@ function decodeState(fs, statePath, owner, allowMissing) {
   if (!sameIdentity(value.identity, owner)) fail("work_task_pipeline_store_identity_mismatch", "pipeline store belongs to a different project");
   return value;
 }
+// Fsync the containing directory so a completed rename is recoverable across
+// a process or machine restart. Filesystems that do not expose a readable
+// directory descriptor fail closed rather than claiming a write.
+function fsyncDirectory(fs, directory) {
+  const directoryDescriptor = fs.openSync(directory, "r");
+  try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+}
 function writeStateAtomically(fs, statePath, state) {
   const directory = path.dirname(statePath);
   const temporaryPath = temporaryPathFor(statePath);
@@ -251,11 +278,7 @@ function writeStateAtomically(fs, statePath, state) {
     try { fs.fsyncSync(fileDescriptor); } finally { fs.closeSync(fileDescriptor); }
     fs.renameSync(temporaryPath, statePath);
     temporaryWritten = false;
-    // Fsync the containing directory so the completed rename is recoverable
-    // across a process or machine restart. Filesystems that do not expose a
-    // readable directory descriptor fail closed rather than claiming a write.
-    const directoryDescriptor = fs.openSync(directory, "r");
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+    fsyncDirectory(fs, directory);
   } catch (error) {
     if (temporaryWritten) {
       try { fs.unlinkSync(temporaryPath); } catch { /* best-effort temp cleanup only */ }
@@ -341,6 +364,13 @@ function assertInitialState(input) {
   }
   return { precondition, manifest, pipeline };
 }
+function assertRetirement(input) {
+  exact(input, ["expected", "event_id"], "invalid_work_task_pipeline_store_retirement");
+  const precondition = expected(input.expected, "invalid_work_task_pipeline_store_retirement");
+  if (precondition.pipeline_digest === null) fail("invalid_work_task_pipeline_store_retirement", "retirement requires an exact current pipeline digest");
+  if (!EVENT_ID_RE.test(input.event_id)) fail("invalid_work_task_pipeline_store_retirement", "retirement event is invalid");
+  return { precondition, event_id: input.event_id };
+}
 function assertPlanApplication(input) {
   exact(input, ["expected", "plan", "terminal_disposition"], "invalid_work_task_pipeline_store_apply");
   const precondition = expected(input.expected, "invalid_work_task_pipeline_store_apply");
@@ -396,38 +426,87 @@ function createWorkTaskPipelineStore(options) {
       fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     }
     return withWriterLock(fs, target, () => {
-      const current = decodeState(fs, target, application.precondition, false);
-      if (current.identity.installation_id !== application.precondition.installation_id || current.identity.project_id !== application.precondition.project_id ||
-          current.manifest.manifest_digest !== application.precondition.manifest_digest || current.pipeline.pipeline_digest !== application.precondition.pipeline_digest) {
-        fail("stale_work_task_pipeline_store_precondition", "stored pipeline changed before plan application");
-      }
+      const current = readCurrent(target, application.precondition);
       let nextPipeline;
       try { nextPipeline = applyWorkTaskPipelinePlan(current.pipeline, application.plan); } catch {
         fail("stale_or_invalid_work_task_pipeline_store_plan", "stored pipeline no longer accepts this plan");
       }
-      const terminalAudit = application.disposition === null ? current.terminal_audit : [
-        ...current.terminal_audit,
-        { ...application.disposition, pipeline_digest: nextPipeline.pipeline_digest },
-      ].slice(-MAX_TERMINAL_AUDIT);
-      const next = {
-        schema_version: SCHEMA_VERSION,
-        identity: clone(current.identity),
-        // The manifest is frozen, validated, and retained byte-for-value
-        // across archive, cut, and contract-change pipeline transitions.
-        manifest: clone(current.manifest),
-        pipeline: clone(nextPipeline),
-        terminal_audit: clone(terminalAudit),
-      };
-      assertStoredState(next);
-      writeStateAtomically(fs, target, next);
-      return snapshot(next);
+      return snapshot(commit(target, current, nextPipeline, application.disposition));
     });
+  }
+  function readCurrent(target, precondition) {
+    const current = decodeState(fs, target, precondition, false);
+    if (current.identity.installation_id !== precondition.installation_id || current.identity.project_id !== precondition.project_id ||
+        current.manifest.manifest_digest !== precondition.manifest_digest || current.pipeline.pipeline_digest !== precondition.pipeline_digest) {
+      fail("stale_work_task_pipeline_store_precondition", "stored pipeline changed before plan application");
+    }
+    return current;
+  }
+  function commit(target, current, nextPipeline, disposition) {
+    const terminalAudit = disposition === null ? current.terminal_audit : [
+      ...current.terminal_audit,
+      { ...disposition, pipeline_digest: nextPipeline.pipeline_digest },
+    ].slice(-MAX_TERMINAL_AUDIT);
+    const next = {
+      schema_version: SCHEMA_VERSION,
+      identity: clone(current.identity),
+      // The manifest is frozen, validated, and retained byte-for-value
+      // across archive, cut, and contract-change pipeline transitions.
+      manifest: clone(current.manifest),
+      pipeline: clone(nextPipeline),
+      terminal_audit: clone(terminalAudit),
+    };
+    assertStoredState(next);
+    writeStateAtomically(fs, target, next);
+    return next;
+  }
+  // Retirement is the explicit, durable end of one batch: the pipeline takes
+  // its audited `set_archived` transition and the whole record moves to a
+  // retired path.  Nothing is overwritten, the active path becomes free for a
+  // successor manifest, and a crash between the two steps resumes by retrying
+  // the already-archived record.
+  function retire(input) {
+    const retirement = assertRetirement(input);
+    const target = statePath(retirement.precondition);
+    if (!storageExists(fs, options.config_dir, directory)) {
+      fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
+    }
+    return withWriterLock(fs, target, () => {
+      const current = readCurrent(target, retirement.precondition);
+      let state = current;
+      if (!current.pipeline.archived) {
+        if (current.pipeline.tasks.some((slot) => ACTIVE_AUTHORITY_STATES.has(slot.state))) {
+          fail("work_task_pipeline_store_batch_active", "batch retains active build or review authority");
+        }
+        let nextPipeline;
+        try {
+          const plan = planWorkTaskPipelineEvent(current.pipeline, { version: 1, kind: "set_archived", event_id: retirement.event_id, archived: true });
+          nextPipeline = applyWorkTaskPipelinePlan(current.pipeline, plan);
+        } catch {
+          fail("stale_or_invalid_work_task_pipeline_store_plan", "stored pipeline no longer accepts the archive transition");
+        }
+        state = commit(target, current, nextPipeline, { kind: "archive", event_id: retirement.event_id, archived: true });
+      }
+      const retiredPath = nextRetiredPath(fs, target);
+      try {
+        fs.renameSync(target, retiredPath);
+        fsyncDirectory(fs, path.dirname(target));
+      } catch { fail("work_task_pipeline_store_write_failed", "pipeline store retirement rename failed"); }
+      return snapshot(state);
+    });
+  }
+  function readRetiredSnapshots(owner) {
+    const normalized = identity(owner, "invalid_work_task_pipeline_store_identity");
+    if (!storageExists(fs, options.config_dir, directory)) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
+    return freeze(retiredEntries(fs, statePath(normalized)).map((entry) => snapshot(decodeState(fs, entry.path, normalized, false))));
   }
 
   return freeze({
     readRecoverySnapshot,
+    readRetiredSnapshots,
     initialize,
     applyPlan,
+    retire,
   });
 }
 

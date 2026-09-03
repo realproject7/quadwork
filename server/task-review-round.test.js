@@ -124,8 +124,16 @@ function opened() {
   const propagation = planSealedTaskReviewPropagation(sealed.round, {
     version: 1, target: "head_private", dependency_chain: [copy(round.review_round_ref.work_task_ref)],
   });
-  assert.deepEqual(Object.keys(propagation).sort(), ["candidate_digest", "dependency_chain", "review_round_ref", "target", "version"]);
-  assert.doesNotMatch(JSON.stringify(propagation), /receipt|finding|reviewer|re2/);
+  assert.deepEqual(Object.keys(propagation).sort(), ["candidate_digest", "dependency_chain", "kind", "review_round_ref", "target", "version"]);
+  assert.equal(propagation.kind, "propagation_stop_pending");
+  assert.doesNotMatch(JSON.stringify(propagation), /receipt|finding|reviewer|verdict|re2/);
+  // A sealed first pass with only local findings is not a propagation stop:
+  // the Head-private event exists solely because a sealed receipt declared one.
+  const localOnly = submitTaskReviewReceipt(opened(), receipt(round.review_round_ref, "receipt_re2_local", "request_changes", [finding("finding_re2_local", {
+    propagation: "local",
+  })]), reviewer("re2", 22, "2026-09-01T06:01:00.000Z"));
+  assert.equal(localOnly.round.status, "current");
+  throwsCode(() => planSealedTaskReviewPropagation(localOnly.round, { version: 1, target: "head_private", dependency_chain: [] }), "task_review_round_no_propagation_stop");
 
   // Same role/context and byte-equivalent receipt is a read-back, not a second
   // receipt. A changed timestamp or content cannot overwrite the sealed one.

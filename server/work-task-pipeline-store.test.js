@@ -374,4 +374,60 @@ withDirectory((directory) => {
   assert.equal(state.pipeline.history.length, MAX_TERMINAL_AUDIT + 1);
 });
 
+// A completed batch retires through the explicit audited archive transition
+// and moves aside intact, so a successor manifest can be initialized for the
+// same project without overwriting anything. Retired records stay readable.
+withDirectory((directory) => {
+  const { store, state: initial } = initialized(directory);
+  const ref = initial.manifest.tasks[0].ref;
+  const statePath = workTaskPipelineStorePath(directory, owner);
+  let state = persist(store, initial, event("assign_build", "retire_build", { work_task_ref: copy(ref), assignment_id: "retire_assignment" }));
+  throwsCode(() => store.retire({ expected: currentExpected(state), event_id: "retire_active" }), "work_task_pipeline_store_batch_active");
+  assert.equal(fs.existsSync(statePath), true);
+  state = persist(store, state, event("record_candidate", "retire_candidate", { assignment_id: "retire_assignment", candidate: candidateFor(ref) }));
+  throwsCode(() => store.retire({ expected: { ...currentExpected(state), pipeline_digest: initial.pipeline.pipeline_digest }, event_id: "retire_stale" }), "stale_work_task_pipeline_store_precondition");
+  throwsCode(() => store.initialize({ expected: initialExpected(initial.manifest), manifest: initial.manifest, pipeline: initial.pipeline }), "work_task_pipeline_store_already_initialized");
+
+  const retired = store.retire({ expected: currentExpected(state), event_id: "retire_first" });
+  assert.equal(retired.pipeline.archived, true);
+  assert.deepEqual(retired.pipeline.history.at(-1), { event_id: "retire_first", kind: "set_archived" });
+  assert.deepEqual(retired.terminal_audit.at(-1), { kind: "archive", event_id: "retire_first", archived: true, pipeline_digest: retired.pipeline.pipeline_digest });
+  assert.equal(fs.existsSync(statePath), false);
+  throwsCode(() => store.readRecoverySnapshot(owner), "work_task_pipeline_store_missing");
+  throwsCode(() => store.retire({ expected: currentExpected(retired), event_id: "retire_again" }), "work_task_pipeline_store_missing");
+  const provenance = store.readRetiredSnapshots(owner);
+  assert.equal(provenance.length, 1);
+  assert.deepEqual(provenance[0], retired);
+  assert.equal(Object.isFrozen(provenance[0]), true);
+  assert.equal(provenance[0].pipeline.tasks[0].candidate.candidate_sha, candidate_sha);
+  const retiredFiles = fs.readdirSync(path.dirname(statePath)).filter((name) => name.includes(".retired."));
+  assert.deepEqual(retiredFiles, [`${installation_id}--${project_id}.retired.0001.json`]);
+  assert.equal(fs.statSync(path.join(path.dirname(statePath), retiredFiles[0])).mode & 0o777, FILE_MODE);
+
+  // A successor manifest for the same project now initializes cleanly and is
+  // isolated from the retired record; a fresh store sees both.
+  const successorManifest = frozenManifest({ tasks: [{
+    task_key: "successor", repository_key: "web", work_item: copy(web42), goal: "continue after the retired batch",
+    file_boundary: ["server/successor.js"], validation: ["node:test"], dependencies: [],
+  }] });
+  const successor = store.initialize({ expected: initialExpected(successorManifest), manifest: successorManifest, pipeline: buildWorkTaskPipeline(successorManifest) });
+  assert.equal(successor.pipeline.archived, false);
+  assert.equal(successor.pipeline.tasks[0].work_task_ref.task_key, "successor");
+  const restarted = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  assert.deepEqual(restarted.readRecoverySnapshot(owner), successor);
+  assert.deepEqual(restarted.readRetiredSnapshots(owner), provenance);
+
+  // An already-archived batch (an explicit earlier archive, or a crash between
+  // the archive write and the rename) retires without a second transition and
+  // takes the next ordinal, so the earlier record is never replaced.
+  const archivedSuccessor = persist(restarted, successor, event("set_archived", "successor_archive", { archived: true }), { kind: "archive", event_id: "successor_archive", archived: true });
+  const secondRetired = restarted.retire({ expected: currentExpected(archivedSuccessor), event_id: "retire_second" });
+  assert.deepEqual(secondRetired, archivedSuccessor);
+  const all = restarted.readRetiredSnapshots(owner);
+  assert.deepEqual(all.map((entry) => entry.manifest.manifest_digest), [initial.manifest.manifest_digest, successorManifest.manifest_digest]);
+  assert.deepEqual(all[0], retired);
+  throwsCode(() => restarted.readRecoverySnapshot(owner), "work_task_pipeline_store_missing");
+  throwsCode(() => restarted.retire({ expected: null, event_id: "retire_bad" }), "invalid_work_task_pipeline_store_retirement");
+});
+
 console.log("work-task-pipeline-store.test.js: all assertions passed");

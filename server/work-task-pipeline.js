@@ -743,6 +743,18 @@ function planWorkTaskPipelineEvent(pipeline, event) {
   });
 }
 
+// Declared transitive dependents of one task, in manifest order and without
+// the source.  This is the server-derived dependency chain a pre-release
+// propagation stop may pause; callers cannot widen or narrow it.
+function declaredWorkTaskDependents(pipeline, taskRef) {
+  assertWorkTaskPipeline(pipeline);
+  const source = slotFor(pipeline.tasks, taskRef, "unknown_work_task_ref");
+  const affected = dependentKeys(pipeline.tasks, source.work_task_ref);
+  return freeze(pipeline.tasks
+    .filter((slot) => slot !== source && affected.has(workTaskKey(slot.work_task_ref)))
+    .map((slot) => clone(slot.work_task_ref)));
+}
+
 function samePlan(left, right) { return stable(left) === stable(right); }
 function applyWorkTaskPipelinePlan(pipeline, plan) {
   assertWorkTaskPipeline(pipeline);
@@ -775,6 +787,7 @@ module.exports = {
   assertWorkTaskPipeline,
   assertWorkTaskPipelinePlan,
   buildWorkTaskPipeline,
+  declaredWorkTaskDependents,
   planWorkTaskPipelineEvent,
   applyWorkTaskPipelinePlan,
 };
