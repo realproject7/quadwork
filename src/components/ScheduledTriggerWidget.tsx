@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
 import { assignmentRequestFields, ownedCurrentBatchSnapshot } from "@/lib/batchIdentity";
@@ -10,7 +10,7 @@ interface ScheduledTriggerWidgetProps {
   idle?: boolean;
 }
 
-// #408: batch progress shape from /api/batch-progress
+// Batch progress / active shapes from /api/batch-progress and /api/batch-active.
 interface BatchState {
   active: boolean;
   complete: boolean;
@@ -91,365 +91,182 @@ interface BatchLifecycleSnapshot {
   }>;
 }
 
-// How often the auto-trigger polls batch progress (same as BatchProgressPanel).
-const AUTO_TRIGGER_POLL_MS = 30_000;
+// Lifecycle poll cadence (same as BatchProgressPanel).
+const LIFECYCLE_POLL_MS = 30_000;
+const STATE_POLL_MS = 5_000;
 
-interface TriggerInfo {
+interface MonitorEvaluation {
+  applied: boolean;
+  command: string;
+  evaluated_at?: string;
+  terminal?: boolean;
+  changed?: boolean;
+  reason?: string;
+  stall_state?: string;
+  subject?: { subject_key: string; item?: string; row_status?: string | null } | null;
+  conditions?: Array<{ kind: string; immediate: boolean; due_at: number | null }>;
+  deliveries?: Array<{ kind: string | null; ok: boolean; duplicate: boolean; code: string | null }>;
+}
+
+// #1036: GET /api/triggers now reports Project Monitor state. There is no
+// message, interval, or duration: the monitor is fixed policy.
+interface MonitorInfo {
   enabled: boolean;
-  interval: number;  // ms (active timer interval, 0 when idle-with-saved-state)
-  lastSent: number | null;
-  nextAt: number | null;
-  expiresAt: number | null;
-  message: string | null;
-  intervalMin: number | null; // last-used, persisted for idle reloads
-  durationMin: number | null; // last-used, persisted for idle reloads
+  mode: "enabled" | "suspended" | "archived";
+  observation_hash: string | null;
+  unresolved: Array<{ kind: string; due_at: number }>;
+  deliveries: Array<{ kind: string; phase: "recorded" | "appended" | "woken" }>;
+  last_evaluation: MonitorEvaluation | null;
+  legacy_trigger_retained: boolean;
 }
 
 const COPY = {
   en: {
-    label: (running: boolean, auto: boolean) => `Scheduled Trigger${running ? (auto ? " (auto)" : " (running)") : ""}`,
+    label: (mode: string) => `Project Monitor${mode === "enabled" ? " (observing)" : mode === "suspended" ? " (suspended)" : ""}`,
     tooltip: (
       <>
-        <b>Scheduled Trigger</b> sends a periodic message to all agents on a timer. Use this to keep the autonomous workflow running overnight. First message fires after the configured interval, not immediately.
+        <b>Project Monitor</b> is a Head-only observer with a fixed policy. It watches the current qualified assignment and writes one structured event to <b>@head</b> only when a transition is due: terminal-red CI, a passing draft, a worker exit before status, BLOCKED, an overdue WAITING, an overdue merge gate, merged-but-not-advanced, or next-item-unassigned. Unchanged state writes nothing and wakes no agent. It never sends a periodic message to all agents.
       </>
     ),
-    autoTriggerOn: "Auto-trigger ON — trigger follows batch lifecycle",
-    autoTriggerOff: "Auto-trigger OFF — manual start/stop only",
-    auto: "Auto ",
-    message: "Message",
-    sendEvery: "Send every",
-    minFor: "min for",
-    hours: "hours",
+    mode: "Mode",
+    start: "Start Monitor",
     starting: "Starting…",
-    startTrigger: "Start Trigger",
-    sending: "Sending:",
-    running: "Running",
-    next: "Next: ",
-    stopsIn: "Stops in: ",
-    untilStopped: "(until stopped)",
+    evaluate: "Evaluate now",
+    evaluating: "Evaluating…",
+    stop: "Stop Monitor",
     stopping: "Stopping…",
-    stopTrigger: "Stop Trigger",
-    autoStopStatus: "Batch complete — trigger paused. Waiting for next batch.",
+    lastEvaluation: "Last evaluation",
+    none: "none yet",
+    changed: "transition observed",
+    unchanged: "no change (nothing written)",
+    terminal: "batch terminal — conditions cleared",
+    subject: "Subject",
+    conditions: "Conditions",
+    deliveries: "Head events",
+    unresolved: "Armed deadlines",
+    legacyRetained: "A legacy scheduled-trigger message is retained as disabled data and is never sent.",
+    autoStopStatus: "Batch complete — monitor conditions cleared.",
+    refused: (reason: string) => `Not started: ${reason}`,
   },
   ko: {
-    label: (running: boolean, auto: boolean) => `예약 트리거${running ? (auto ? " (자동)" : " (실행 중)") : ""}`,
+    label: (mode: string) => `프로젝트 모니터${mode === "enabled" ? " (관찰 중)" : mode === "suspended" ? " (일시 중지)" : ""}`,
     tooltip: (
       <>
-        <b>예약 트리거</b> - 타이머에 따라 모든 에이전트에게 주기적으로 메시지를 보냅니다. 야간 자율 워크플로우를 계속 돌릴 때 사용하세요. 첫 메시지는 즉시가 아니라 설정한 간격 후에 전송됩니다.
+        <b>프로젝트 모니터</b>는 고정 정책의 Head 전용 관찰자입니다. 현재 자격 있는 할당을 관찰하고, 전환이 실제로 발생했을 때만 <b>@head</b>에게 구조화된 이벤트 하나를 씁니다: CI 실패 확정, 통과한 드래프트, 상태 보고 전 워커 종료, BLOCKED, WAITING 기한 초과, 머지 게이트 기한 초과, 머지 후 미진행, 다음 항목 미할당. 변화가 없으면 아무것도 쓰지 않고 어떤 에이전트도 깨우지 않습니다. 모든 에이전트에게 주기적으로 메시지를 보내지 않습니다.
       </>
     ),
-    autoTriggerOn: "자동 트리거 ON - 배치 생명주기에 따라 트리거가 동작합니다",
-    autoTriggerOff: "자동 트리거 OFF - 수동 시작/중지만 가능합니다",
-    auto: "자동 ",
-    message: "메시지",
-    sendEvery: "전송 간격: ",
-    minFor: "분 마다, ",
-    hours: "시간 동안",
+    mode: "모드",
+    start: "모니터 시작",
     starting: "시작 중…",
-    startTrigger: "트리거 시작",
-    sending: "전송 중:",
-    running: "실행 중",
-    next: "다음 전송: ",
-    stopsIn: "종료까지: ",
-    untilStopped: "(중지할 때까지)",
+    evaluate: "지금 평가",
+    evaluating: "평가 중…",
+    stop: "모니터 중지",
     stopping: "중지 중…",
-    stopTrigger: "트리거 중지",
-    autoStopStatus: "배치 완료 — 트리거 일시 중지. 다음 배치를 기다리는 중.",
+    lastEvaluation: "마지막 평가",
+    none: "아직 없음",
+    changed: "전환 관찰됨",
+    unchanged: "변화 없음 (기록 없음)",
+    terminal: "배치 종료 — 조건 정리됨",
+    subject: "대상",
+    conditions: "조건",
+    deliveries: "Head 이벤트",
+    unresolved: "예약된 기한",
+    legacyRetained: "예전 예약 트리거 메시지는 비활성 데이터로만 보관되며 전송되지 않습니다.",
+    autoStopStatus: "배치 완료 — 모니터 조건이 정리되었습니다.",
+    refused: (reason: string) => `시작되지 않음: ${reason}`,
   },
 } as const;
 
-// #406 / quadwork#269: trigger duration is now a free-typed numeric
-// hours input. Defaults / bounds match the issue: default 3 hours,
-// 0.1h min (≈6 minute test runs), 24h cap as a safety rail, decimals
-// allowed at 0.1h granularity. The previous "Until stopped" preset
-// is intentionally dropped — operators wanted finer control more
-// than the unbounded option. The trigger backend still takes
-// minutes; we convert hours → minutes on send.
-const DURATION_HOURS_DEFAULT = 3;
-const DURATION_HOURS_MIN = 0.1;
-const DURATION_HOURS_MAX = 24;
-function clampHours(h: number): number {
-  if (!Number.isFinite(h)) return DURATION_HOURS_DEFAULT;
-  return Math.min(Math.max(h, DURATION_HOURS_MIN), DURATION_HOURS_MAX);
-}
-function minutesToHoursStr(min: number): string {
-  if (!Number.isFinite(min) || min <= 0) return String(DURATION_HOURS_DEFAULT);
-  const h = min / 60;
-  // 1 decimal place is enough for the 0.1h step granularity, and
-  // round-trips integer minutes that map to clean fractional hours
-  // (e.g. 378 → "6.3").
-  return (Math.round(h * 10) / 10).toString();
-}
-
-function defaultMessage(projectId: string) {
-  const queuePath = `~/.quadwork/${projectId}/OVERNIGHT-QUEUE.md`;
-  const githubPath = `~/.quadwork/${projectId}/GITHUB.md`;
-  return (
-`@head @dev @re1 @re2 — Queue check.
-Discovery: read ${githubPath} (or GET /api/github-parsed?project=${projectId}) for issue/PR state instead of running gh. If it's absent or stale (>2 cycles / _stale), do ONE direct gh read to confirm. GITHUB.md may lag — confirm with a direct gh read before any merge/review decision.
-@head: Merge any PR with both approvals, assign next from ${queuePath}.
-@dev: Work on assigned ticket or address review feedback.
-@re1 & @re2: Review ONLY PRs you were @mentioned on in this chat (not all open PRs). If @dev pushed fixes, re-review. Post verdict on PR AND notify @dev here.
-ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via this chat by tagging agents. Your terminal is NOT visible.`
-  );
-}
-
-function formatCountdown(ms: number): string {
-  if (ms <= 0) return "0m 0s";
-  const h = Math.floor(ms / 3600000);
-  const m = Math.floor((ms % 3600000) / 60000);
-  const s = Math.floor((ms % 60000) / 1000);
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m ${s}s`;
+function formatAt(iso: string | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleTimeString();
 }
 
 /**
- * Operator Features widget for the Scheduled Trigger (#210), in the right rail.
+ * Operator Features widget for the Project Monitor (#1036), in the right rail.
  *
- * Combines the old Keep Alive timer with a custom message textarea.
- * "Start Trigger" hands the typed message to
- * /api/triggers/:id/start which persists it on the project entry
- * and schedules a setInterval at the configured cadence. The first
- * message fires at T + interval (not on click — see #418/#306) and
- * the interval keeps firing until duration expires or Stop is
- * pressed.
- *
- * State is sourced from GET /api/triggers every 5s so reopening the
- * project picks up the last-used message + running status.
+ * Replaces the Scheduled Trigger editor. The operator cannot author a message,
+ * cadence, or recipient list: Start enables the fixed-policy Head-only monitor
+ * for the live batch, Evaluate now runs one deduplicated evaluation, and Stop
+ * suspends observation. State is sourced from GET /api/triggers every 5s.
  */
 export default function ScheduledTriggerWidget({ projectId, idle = false }: ScheduledTriggerWidgetProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
-  const [trigger, setTrigger] = useState<TriggerInfo | null>(null);
-  const [message, setMessage] = useState<string>("");
-  const [intervalMin, setIntervalMin] = useState<number>(15);
-  // #419 / quadwork#308: draft-string mirror of intervalMin so the
-  // operator can clear the field and retype without the onChange
-  // parseInt()-|| default clobbering the buffer mid-keystroke.
-  // Same pattern as durationHoursDraft below.
-  const [intervalDraft, setIntervalDraft] = useState<string>("15");
-  const [durationMin, setDurationMin] = useState<number>(180);
-  // #406 / quadwork#269: keep a separate raw string draft for the
-  // hours input so the operator can type intermediate states like
-  // "6." or "0" without the controlled input collapsing them back
-  // (clamping on every keystroke makes "6.3" / "0.5" effectively
-  // unenterable). The draft is committed to durationMin on blur and
-  // again right before start(). Polls update the draft in lockstep
-  // with durationMin so persisted values still load correctly.
-  const [durationHoursDraft, setDurationHoursDraft] = useState<string>(() => minutesToHoursStr(180));
-  // Track which controls the operator has touched so incoming polls
-  // don't clobber mid-edit changes. The values are mirrored into
-  // refs so the memoized `load()` closure always reads the latest
-  // dirty flags + message without being re-created on every keystroke
-  // (recreating `load` would re-run the polling effect and reset the
-  // 5s interval).
-  const [intervalDirty, setIntervalDirty] = useState(false);
-  const [durationDirty, setDurationDirty] = useState(false);
-  const messageRef = useRef<string>("");
-  const intervalDirtyRef = useRef(false);
-  const durationDirtyRef = useRef(false);
-  useEffect(() => { messageRef.current = message; }, [message]);
-  useEffect(() => { intervalDirtyRef.current = intervalDirty; }, [intervalDirty]);
-  useEffect(() => { durationDirtyRef.current = durationDirty; }, [durationDirty]);
-  const [busy, setBusy] = useState(false);
+  const [monitor, setMonitor] = useState<MonitorInfo | null>(null);
+  const [busy, setBusy] = useState<null | "start" | "evaluate" | "stop">(null);
   const [error, setError] = useState<string | null>(null);
-  const [countdown, setCountdown] = useState("");
-  const [expiresCountdown, setExpiresCountdown] = useState("");
-  const initialMessage = useMemo(() => defaultMessage(projectId), [projectId]);
-  // #408: auto-trigger state
-  const [autoTrigger, setAutoTrigger] = useState(false);
-  const [autoTriggered, setAutoTriggered] = useState(false); // true when current run was auto-started
-  const [autoStatus, setAutoStatus] = useState<string | null>(null); // flash message
+  const [notice, setNotice] = useState<string | null>(null);
   const prevBatchRef = useRef<BatchLifecycleSnapshot | null>(null);
-
-  // #408: load auto-trigger setting from project config on mount.
-  // Reset refs on projectId change to avoid stale state across projects.
-  const autoTriggerLoadedRef = useRef(false);
-  useEffect(() => {
-    autoTriggerLoadedRef.current = false;
-    prevBatchRef.current = null;
-    setAutoTrigger(false);
-    setAutoTriggered(false);
-    setAutoStatus(null);
-  }, [projectId]);
-  useEffect(() => {
-    if (autoTriggerLoadedRef.current) return;
-    fetch("/api/config")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((cfg) => {
-        if (!cfg) return;
-        const entry = (cfg.projects || []).find((p: { id: string }) => p.id === projectId);
-        if (entry?.trigger_auto) {
-          setAutoTrigger(true);
-        }
-        autoTriggerLoadedRef.current = true;
-      })
-      .catch(() => {});
-  }, [projectId]);
+  const monitorRef = useRef<MonitorInfo | null>(null);
+  useEffect(() => { monitorRef.current = monitor; }, [monitor]);
+  useEffect(() => { prevBatchRef.current = null; setNotice(null); }, [projectId]);
 
   const load = useCallback(async () => {
     try {
       const r = await fetch("/api/triggers");
       if (!r.ok) throw new Error(`${r.status}`);
-      const data: Record<string, TriggerInfo> = await r.json();
-      const tr = data[projectId] || null;
-      setTrigger(tr);
-      if (tr) {
-        // Read dirty flags + current message from refs, NOT from the
-        // closure — `load` is memoized on `projectId` alone so the
-        // polling effect can keep a stable 5s cadence. Without the
-        // refs, a later poll would still see the initial empty
-        // message / clean flags and overwrite mid-edit changes.
-        if (tr.message && !messageRef.current) {
-          setMessage(tr.message);
-          messageRef.current = tr.message;
-        }
-        if (!intervalDirtyRef.current) {
-          if (tr.enabled && tr.interval) {
-            const mins = Math.max(1, Math.round(tr.interval / 60000));
-            setIntervalMin(mins);
-            setIntervalDraft(String(mins));
-          } else if (typeof tr.intervalMin === "number" && tr.intervalMin > 0) {
-            setIntervalMin(tr.intervalMin);
-            setIntervalDraft(String(tr.intervalMin));
-          }
-        }
-        if (!durationDirtyRef.current && typeof tr.durationMin === "number" && tr.durationMin >= 0) {
-          setDurationMin(tr.durationMin);
-          setDurationHoursDraft(minutesToHoursStr(tr.durationMin));
-        }
-      }
+      const data: Record<string, MonitorInfo> = await r.json();
+      setMonitor(data[projectId] || null);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
     }
   }, [projectId]);
 
-  // Seed the textarea with the ticket's default once, until the first
-  // poll returns a persisted message.
   useEffect(() => {
-    if (!message) setMessage(initialMessage);
-  }, [initialMessage, message]);
-
-  useEffect(() => {
-    if (idle) return; // #812: parked project — stop polling trigger status
+    if (idle) return; // #812: parked project — stop polling monitor state
     load();
-    const id = window.setInterval(load, 5000);
+    const id = window.setInterval(load, STATE_POLL_MS);
     return () => window.clearInterval(id);
   }, [load, idle]);
 
-  // 1-Hz tick for the live countdown while running.
-  useEffect(() => {
-    if (!trigger?.enabled) { setCountdown(""); setExpiresCountdown(""); return; }
-    const tick = () => {
-      if (trigger.nextAt) setCountdown(formatCountdown(Math.max(0, trigger.nextAt - Date.now())));
-      if (trigger.expiresAt) {
-        const remaining = Math.max(0, trigger.expiresAt - Date.now());
-        setExpiresCountdown(formatCountdown(remaining));
-        if (remaining <= 0) load();
-      } else {
-        setExpiresCountdown("");
-      }
-    };
-    tick();
-    const id = window.setInterval(tick, 1000);
-    return () => window.clearInterval(id);
-  }, [trigger?.enabled, trigger?.nextAt, trigger?.expiresAt, load]);
+  const post = useCallback(async (action: "start" | "send-now" | "stop", body: Record<string, unknown>) => {
+    const r = await fetch(`/api/triggers/${encodeURIComponent(projectId)}/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = await r.json().catch(() => null);
+    if (!r.ok && !(payload && typeof payload.reason === "string")) throw new Error(`${r.status}`);
+    return payload;
+  }, [projectId]);
 
   const start = async () => {
-    setBusy(true); setError(null);
-    // #406 / quadwork#269: commit the draft hours value before
-    // POSTing in case the user clicks Send without ever blurring
-    // the input. We compute the resolved minutes locally and pass
-    // them in the body — relying on a setDurationMin() before fetch
-    // would race the React render cycle.
-    const draftRaw = parseFloat(durationHoursDraft);
-    const resolvedHours = Number.isFinite(draftRaw) ? clampHours(draftRaw) : DURATION_HOURS_DEFAULT;
-    const resolvedDurationMin = Math.round(resolvedHours * 60);
-    if (resolvedDurationMin !== durationMin) {
-      setDurationMin(resolvedDurationMin);
-      setDurationHoursDraft(minutesToHoursStr(resolvedDurationMin));
-    }
-    // #419 / quadwork#308: same draft-commit treatment for the
-    // interval input. If the operator clears the field and hits
-    // Start without blurring, we must still POST a valid number.
-    const intervalRaw = parseInt(intervalDraft, 10);
-    const resolvedIntervalMin = Number.isFinite(intervalRaw)
-      ? Math.max(1, Math.min(1440, intervalRaw))
-      : 15;
-    if (resolvedIntervalMin !== intervalMin) {
-      setIntervalMin(resolvedIntervalMin);
-      setIntervalDraft(String(resolvedIntervalMin));
-    }
+    setBusy("start"); setError(null); setNotice(null);
     try {
-      const r = await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ interval: resolvedIntervalMin, duration: resolvedDurationMin, message }),
-      });
-      if (!r.ok) throw new Error(`${r.status}`);
-      // After the backend persists the new values, treat them as the
-      // baseline — subsequent polls should be free to re-hydrate from
-      // server state again.
-      setIntervalDirty(false);
-      setDurationDirty(false);
+      const payload = await post("start", {});
+      if (payload && payload.applied === false) setNotice(t.refused(payload.reason || payload.code || "refused"));
       await load();
     } catch (e) { setError((e as Error).message); }
-    finally { setBusy(false); }
+    finally { setBusy(null); }
+  };
+
+  const evaluate = async () => {
+    setBusy("evaluate"); setError(null); setNotice(null);
+    try {
+      const payload = await post("send-now", {});
+      if (payload && payload.applied === false) setNotice(t.refused(payload.reason || payload.code || "refused"));
+      await load();
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(null); }
   };
 
   const stop = async () => {
-    setBusy(true); setError(null);
+    setBusy("stop"); setError(null); setNotice(null);
     try {
-      const r = await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, { method: "POST" });
-      if (!r.ok) throw new Error(`${r.status}`);
-      setAutoTriggered(false);
-      setTrigger({
-        ...(trigger || {
-          interval: 0,
-          lastSent: null,
-          nextAt: null,
-          expiresAt: null,
-          message,
-          intervalMin,
-          durationMin,
-        }),
-        enabled: false,
-      });
+      await post("stop", {});
       await load();
     } catch (e) { setError((e as Error).message); }
-    finally { setBusy(false); }
+    finally { setBusy(null); }
   };
 
-  // #408: persist auto-trigger toggle to project config
-  const toggleAutoTrigger = useCallback(async () => {
-    const next = !autoTrigger;
-    setAutoTrigger(next);
-    if (!next) {
-      setAutoStatus(null);
-      prevBatchRef.current = null;
-    }
-    try {
-      // #971: field-scoped write — merges only trigger_auto (no whole-config clobber)
-      await fetch(`/api/projects/${encodeURIComponent(projectId)}/flags`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trigger_auto: next }),
-      });
-    } catch { /* non-fatal */ }
-  }, [autoTrigger, projectId]);
-
-  // #408: auto-trigger batch lifecycle polling.
-  // When autoTrigger is ON, join live Active Batch authority with progress.
-  // Sticky/historical/foreign/unowned progress is never allowed to drive an
-  // automatic trigger transition.
-  const autoTriggerRef = useRef(autoTrigger);
-  const triggerRef = useRef(trigger);
-  useEffect(() => { autoTriggerRef.current = autoTrigger; }, [autoTrigger]);
-  useEffect(() => { triggerRef.current = trigger; }, [trigger]);
-
+  // Batch lifecycle polling: join live Active Batch authority with progress.
+  // A confirmed completion or an explicit clear suspends an observing monitor
+  // with the exact assignment identity; nothing here starts one automatically
+  // (#1036: unarchive/restore remain suspended until an explicit start).
   const checkBatchLifecycle = useCallback(async () => {
-    if (!autoTriggerRef.current) return;
     try {
       const project = encodeURIComponent(projectId);
       const [activeResponse, progressResponse] = await Promise.all([
@@ -461,214 +278,119 @@ export default function ScheduledTriggerWidget({ projectId, idle = false }: Sche
       const data: BatchState = await progressResponse.json();
       const next = ownedCurrentBatchSnapshot(active, data) as BatchLifecycleSnapshot | null;
       if (!next) return;
-      const prev = prevBatchRef.current;
       prevBatchRef.current = next;
-      const sameAssignment = prev?.fingerprint === next.fingerprint;
-
-      if (!prev) {
-        // First poll — if there's an active non-complete batch, auto-start
-        if (next.active && next.hasItems && !next.complete && !triggerRef.current?.enabled) {
-          setAutoTriggered(true);
-          setAutoStatus(null);
-          // Use the start endpoint directly with current field values
-          const draftRaw = parseFloat(durationHoursDraft);
-          const resolvedHours = Number.isFinite(draftRaw) ? clampHours(draftRaw) : DURATION_HOURS_DEFAULT;
-          const resolvedDurationMin = Math.round(resolvedHours * 60);
-          const intervalRaw = parseInt(intervalDraft, 10);
-          const resolvedIntervalMin = Number.isFinite(intervalRaw) ? Math.max(1, Math.min(1440, intervalRaw)) : 15;
-          await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              interval: resolvedIntervalMin,
-              duration: resolvedDurationMin,
-              message: messageRef.current || initialMessage,
-              ...assignmentRequestFields(next),
-            }),
-          });
-          await load();
-        }
-        // #462: First poll — batch already complete but trigger still running → auto-stop
-        if ((next.completeConfirmed || next.liveActiveBatchCleared) && triggerRef.current?.enabled) {
-          await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(assignmentRequestFields(next)),
-          });
-          setAutoTriggered(false);
-          setAutoStatus(t.autoStopStatus);
-          await load();
-        }
-        return;
-      }
-
-      // Batch just completed → auto-stop
-      if ((next.completeConfirmed || next.liveActiveBatchCleared) && triggerRef.current?.enabled) {
+      if ((next.completeConfirmed || next.liveActiveBatchCleared) && monitorRef.current?.enabled) {
         await fetch(`/api/triggers/${encodeURIComponent(projectId)}/stop`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(assignmentRequestFields(next)),
         });
-        setAutoTriggered(false);
-        setAutoStatus(t.autoStopStatus);
-        await load();
-        return;
-      }
-
-      // New batch started (complete→active, or empty→active) → auto-start
-      if (next.active && next.hasItems && !next.complete && !sameAssignment && !triggerRef.current?.enabled) {
-        setAutoTriggered(true);
-        setAutoStatus(null);
-        const draftRaw = parseFloat(durationHoursDraft);
-        const resolvedHours = Number.isFinite(draftRaw) ? clampHours(draftRaw) : DURATION_HOURS_DEFAULT;
-        const resolvedDurationMin = Math.round(resolvedHours * 60);
-        const intervalRaw = parseInt(intervalDraft, 10);
-        const resolvedIntervalMin = Number.isFinite(intervalRaw) ? Math.max(1, Math.min(1440, intervalRaw)) : 15;
-        await fetch(`/api/triggers/${encodeURIComponent(projectId)}/start`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            interval: resolvedIntervalMin,
-            duration: resolvedDurationMin,
-            message: messageRef.current || initialMessage,
-            ...assignmentRequestFields(next),
-          }),
-        });
+        setNotice(t.autoStopStatus);
         await load();
       }
     } catch { /* non-fatal */ }
-  }, [projectId, durationHoursDraft, intervalDraft, initialMessage, load, t.autoStopStatus]);
+  }, [projectId, load, t.autoStopStatus]);
 
   useEffect(() => {
-    if (!autoTrigger || idle) return; // #812: parked project — suppress auto-trigger lifecycle polling
+    if (idle) return;
     checkBatchLifecycle();
-    const id = window.setInterval(checkBatchLifecycle, AUTO_TRIGGER_POLL_MS);
+    const id = window.setInterval(checkBatchLifecycle, LIFECYCLE_POLL_MS);
     return () => window.clearInterval(id);
-  }, [autoTrigger, checkBatchLifecycle, idle]);
+  }, [checkBatchLifecycle, idle]);
 
-  const running = !!trigger?.enabled;
+  const mode = monitor?.mode || "suspended";
+  const observing = mode === "enabled";
+  const last = monitor?.last_evaluation || null;
 
   return (
     <div className="flex flex-col border border-border">
       <div className="flex items-center justify-between h-7 px-3 shrink-0 border-b border-border">
         <div className="flex items-center gap-1.5">
-          <span className="text-[11px] text-text-muted uppercase tracking-wider">
-            {t.label(running, autoTriggered)}
-          </span>
-          <InfoTooltip>
-            {t.tooltip}
-          </InfoTooltip>
+          <span className="text-[11px] text-text-muted uppercase tracking-wider">{t.label(mode)}</span>
+          <InfoTooltip>{t.tooltip}</InfoTooltip>
         </div>
         <div className="flex items-center gap-2">
           {error && <span className="text-[10px] text-error">err: {error}</span>}
-          {/* #408: Auto-Trigger toggle */}
-          <button
-            type="button"
-            onClick={toggleAutoTrigger}
-            title={autoTrigger ? t.autoTriggerOn : t.autoTriggerOff}
-            className={`px-1.5 py-0.5 text-[10px] border transition-colors ${
-              autoTrigger
-                ? "border-accent/50 text-accent bg-accent/10 hover:bg-accent/20"
-                : "border-border text-text-muted hover:text-text hover:border-accent"
-            }`}
-          >
-            {t.auto}{autoTrigger ? "●" : "○"}
-          </button>
         </div>
       </div>
-      {/* #408: auto-trigger status flash */}
-      {autoStatus && (
-        <div className="px-3 py-1 text-[10px] text-accent bg-accent/5 border-b border-border/50">
-          {autoStatus}
-        </div>
+      {notice && (
+        <div className="px-3 py-1 text-[10px] text-accent bg-accent/5 border-b border-border/50">{notice}</div>
       )}
-
-      {!running ? (
-        <div className="p-3 flex flex-col gap-2">
-          <label className="text-[10px] text-text-muted uppercase tracking-wider">{t.message}</label>
-          <textarea
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            rows={6}
-            spellCheck={false}
-            className="w-full bg-bg text-text text-[11px] font-mono p-2 border border-border outline-none focus:border-accent resize-y"
-          />
-          <div className="flex items-center gap-2 flex-wrap text-[11px]">
-            <span className="text-text-muted">{t.sendEvery}</span>
-            <input
-              type="number"
-              value={intervalDraft}
-              onChange={(e) => { setIntervalDraft(e.target.value); setIntervalDirty(true); }}
-              onBlur={() => {
-                const raw = parseInt(intervalDraft, 10);
-                const clamped = Number.isFinite(raw) ? Math.max(1, Math.min(1440, raw)) : 15;
-                setIntervalMin(clamped);
-                setIntervalDraft(String(clamped));
-              }}
-              min={1}
-              max={1440}
-              className="w-12 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
-            />
-            <span className="text-text-muted">{t.minFor}</span>
-            {/* #406 / quadwork#269: free-typed hours input. The
-                draft string is committed to durationMin on blur so
-                intermediate states like "6." or "0" remain typeable
-                without instant clamp. start() also commits before
-                POSTing in case the user clicks Send without blurring. */}
-            <input
-              type="number"
-              value={durationHoursDraft}
-              onChange={(e) => {
-                setDurationHoursDraft(e.target.value);
-                setDurationDirty(true);
-              }}
-              onBlur={() => {
-                const raw = parseFloat(durationHoursDraft);
-                const hours = Number.isFinite(raw) ? clampHours(raw) : DURATION_HOURS_DEFAULT;
-                const mins = Math.round(hours * 60);
-                setDurationMin(mins);
-                setDurationHoursDraft(minutesToHoursStr(mins));
-              }}
-              min={DURATION_HOURS_MIN}
-              max={DURATION_HOURS_MAX}
-              step={0.1}
-              className="w-14 bg-transparent border border-border px-1 py-0.5 text-[11px] text-text outline-none focus:border-accent text-center"
-            />
-            <span className="text-text-muted">{t.hours}</span>
-          </div>
-          <button
-            onClick={start}
-            disabled={busy || !message.trim()}
-            className="self-start px-3 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          >
-            {busy ? t.starting : t.startTrigger}
-          </button>
-        </div>
-      ) : (
-        <div className="p-3 flex flex-col gap-2">
-          <div className="text-[11px] text-text-muted">{t.sending}</div>
-          <pre className="text-[11px] font-mono whitespace-pre-wrap text-text bg-bg-surface border border-border p-2 max-h-28 overflow-auto">{(trigger?.message || message).slice(0, 400)}</pre>
-          <div className="flex items-center gap-3 flex-wrap text-[11px]">
-            <span className="flex items-center gap-1">
+      <div className="p-3 flex flex-col gap-2 text-[11px]">
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="flex items-center gap-1">
+            {observing && (
               <span className="relative inline-flex items-center justify-center w-2 h-2">
                 <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-60 animate-ping" />
                 <span className="relative w-1.5 h-1.5 rounded-full bg-accent" />
               </span>
-              <span className="text-accent">{t.running}</span>
+            )}
+            <span className="text-text-muted">{t.mode}:</span>
+            <span className={observing ? "text-accent" : "text-text"}>{mode}</span>
+          </span>
+          {monitor && monitor.unresolved.length > 0 && (
+            <span className="text-text-muted">
+              {t.unresolved}: {monitor.unresolved.map((c) => c.kind).join(", ")}
             </span>
-            <span className="tabular-nums text-text">{t.next}{countdown}</span>
-            {expiresCountdown && <span className="tabular-nums text-text-muted">{t.stopsIn}{expiresCountdown}</span>}
-            {!trigger?.expiresAt && <span className="text-text-muted">{t.untilStopped}</span>}
-          </div>
-          <button
-            onClick={stop}
-            disabled={busy}
-            className="self-start px-3 py-1 text-[11px] text-text-muted border border-border hover:text-error hover:border-error/40 disabled:opacity-50 transition-colors"
-          >
-            {busy ? t.stopping : t.stopTrigger}
-          </button>
+          )}
         </div>
-      )}
+        <div className="flex flex-col gap-1 bg-bg-surface border border-border p-2 font-mono">
+          <div className="text-text-muted">{t.lastEvaluation}{last?.evaluated_at ? ` · ${formatAt(last.evaluated_at)}` : ""}</div>
+          {!last ? (
+            <div className="text-text-muted">{t.none}</div>
+          ) : (
+            <>
+              <div className="text-text">
+                {last.applied === false
+                  ? t.refused(last.reason || "refused")
+                  : last.terminal ? t.terminal : last.changed ? t.changed : t.unchanged}
+              </div>
+              {last.subject && (
+                <div className="text-text-muted">{t.subject}: {last.subject.item || last.subject.subject_key}{last.subject.row_status ? ` (${last.subject.row_status})` : ""}</div>
+              )}
+              {last.conditions && last.conditions.length > 0 && (
+                <div className="text-text-muted">{t.conditions}: {last.conditions.map((c) => c.kind).join(", ")}</div>
+              )}
+              {last.deliveries && last.deliveries.length > 0 && (
+                <div className="text-text-muted">
+                  {t.deliveries}: {last.deliveries.map((d) => `${d.kind}${d.ok ? (d.duplicate ? " (dup)" : "") : ` (${d.code || "failed"})`}`).join(", ")}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        {monitor?.legacy_trigger_retained && (
+          <div className="text-[10px] text-text-muted">{t.legacyRetained}</div>
+        )}
+        <div className="flex items-center gap-2 flex-wrap">
+          {!observing ? (
+            <button
+              onClick={start}
+              disabled={busy !== null || mode === "archived"}
+              className="px-3 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {busy === "start" ? t.starting : t.start}
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={evaluate}
+                disabled={busy !== null}
+                className="px-3 py-1 text-[11px] font-semibold text-bg bg-accent hover:bg-accent-dim disabled:opacity-50 transition-colors"
+              >
+                {busy === "evaluate" ? t.evaluating : t.evaluate}
+              </button>
+              <button
+                onClick={stop}
+                disabled={busy !== null}
+                className="px-3 py-1 text-[11px] text-text-muted border border-border hover:text-error hover:border-error/40 disabled:opacity-50 transition-colors"
+              >
+                {busy === "stop" ? t.stopping : t.stop}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

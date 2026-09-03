@@ -62,12 +62,28 @@ function request(action, overrides = {}) {
 }
 function domain(initial = status()) {
   let current = clone(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
   const actions = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
       assert.equal(input.binding.generation, BINDING.generation);
       return clone(current);
+    },
+    get_project_status() {
+      calls.get_project_status += 1;
+      return { status: clone(current), detail: { assignment: null, monitor: { mode: "suspended" }, workers: {}, capacity: { platform: "test" } } };
+    },
+    review_handoff() {
+      calls.review_handoff += 1;
+      return { status: clone(current), detail: { cycle: null } };
+    },
+    async project_monitor(input) {
+      calls.project_monitor += 1;
+      return { status: clone(current), detail: { applied: true, command: input.payload.command, mode: input.payload.command === "stop" ? "suspended" : "enabled" } };
+    },
+    async recover_worker(input) {
+      calls.recover_worker += 1;
+      return { status: clone(current), detail: { applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false, agent: input.payload.recovery.agent } };
     },
     retire_batch(input) {
       calls.retire_batch += 1;
@@ -128,10 +144,10 @@ function service(initial) {
   };
 }
 function expectServiceFailure(fn) {
-  assert.throws(fn, (error) => error instanceof HeadControlServiceError && error.code === "head_control_audit_unavailable");
+  return assert.rejects(fn, (error) => error instanceof HeadControlServiceError && error.code === "head_control_audit_unavailable");
 }
 function expectServiceCode(fn, code) {
-  assert.throws(fn, (error) => error instanceof HeadControlServiceError && error.code === code);
+  return assert.rejects(fn, (error) => error instanceof HeadControlServiceError && error.code === code);
 }
 
 let passed = 0;
@@ -141,27 +157,28 @@ function ok(condition, message) {
   console.log(`  PASS: ${message}`);
 }
 
+(async () => {
 // The service adds durable receipts without gaining command authority: every
 // M1 action still reaches its static owning domain action through the plane.
 {
   const { core, calls } = service();
-  const observed = core.execute(request("get_pipeline_status", {
+  const observed = await core.execute(request("get_pipeline_status", {
     idempotency_key: "idem_status_001", correlation_id: "corr_status_001",
   }));
-  const put = core.execute(request("put_batch_manifest", {
+  const put = await core.execute(request("put_batch_manifest", {
     idempotency_key: "idem_put_001", correlation_id: "corr_put_001", expected_revision: 0,
   }));
-  const frozen = core.execute(request("freeze_batch_manifest", {
+  const frozen = await core.execute(request("freeze_batch_manifest", {
     idempotency_key: "idem_freeze_001", correlation_id: "corr_freeze_001", expected_revision: 1,
   }));
-  const cut = core.execute(request("cut_batch", {
+  const cut = await core.execute(request("cut_batch", {
     idempotency_key: "idem_cut_001", correlation_id: "corr_cut_001", expected_revision: 2,
   }));
   assert.equal(observed.decision.code, "head_control_status_observed");
   assert.equal(put.result.status.revision, 1);
   assert.equal(frozen.result.status.revision, 2);
   assert.equal(cut.result.status.revision, 3);
-  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0 });
+  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 });
   const records = core.recentAudit();
   assert.equal(records.length, 4);
   assert.deepEqual(Object.keys(records[0]).sort(), [
@@ -183,21 +200,21 @@ function ok(condition, message) {
   const fake = domain(status({ revision: 2, manifest_digest: MANIFEST_A, pipeline_digest: PIPELINE_B, manifest_frozen: true, cut_safe: true }));
   const configDir = configDirectory();
   const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
-  const stop = first.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
+  const stop = await first.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
   assert.equal(stop.decision.code, "head_control_stop_observed");
   assert.equal(stop.detail.kind, "propagation_stop_pending");
   const correctionRequest = request("queue_local_correction", { idempotency_key: "idem_corr_001", correlation_id: "corr_corr_001", expected_revision: 2 });
-  const correction = first.execute(correctionRequest);
+  const correction = await first.execute(correctionRequest);
   assert.equal(correction.decision.code, "head_control_applied");
   assert.equal(correction.detail.outcome, "queued");
-  const correctionReplay = first.execute(clone(correctionRequest));
+  const correctionReplay = await first.execute(clone(correctionRequest));
   assert.equal(correctionReplay.decision.kind, "replayed");
   assert.equal(correctionReplay.detail.outcome, "queued");
-  const stopReplay = first.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
+  const stopReplay = await first.execute(request("read_propagation_stop", { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001" }));
   assert.equal(stopReplay.decision.kind, "replayed");
   assert.equal(stopReplay.detail.kind, "propagation_stop_pending");
   const retireRequest = request("retire_batch", { idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001", expected_revision: 3 });
-  const retired = first.execute(retireRequest);
+  const retired = await first.execute(retireRequest);
   assert.equal(retired.decision.code, "head_control_applied");
   assert.equal(retired.result.status.manifest_digest, null);
   const records = first.recentAudit();
@@ -206,10 +223,10 @@ function ok(condition, message) {
   assert.doesNotMatch(JSON.stringify(records), /checkpoint_|dependency_chain|propagation_stop_pending/);
   assert.deepEqual([fake.calls.read_propagation_stop, fake.calls.queue_local_correction, fake.calls.retire_batch], [1, 1, 1]);
   const afterRestart = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
-  const retireReplay = afterRestart.execute(clone(retireRequest));
+  const retireReplay = await afterRestart.execute(clone(retireRequest));
   assert.equal(retireReplay.decision.kind, "replayed");
   assert.equal(retireReplay.detail, null);
-  expectServiceCode(() => afterRestart.execute(clone(correctionRequest)), "head_control_durable_replay_ambiguous");
+  await expectServiceCode(() => afterRestart.execute(clone(correctionRequest)), "head_control_durable_replay_ambiguous");
   assert.deepEqual([fake.calls.queue_local_correction, fake.calls.retire_batch], [1, 1]);
   ok(true, "retirement, correction, and stop read share one redacted durable receipt with the fixed restart-replay rules");
 }
@@ -218,15 +235,15 @@ function ok(condition, message) {
 // invoke an owning mutation before their Head binding is checked by the plane.
 {
   const { core, calls } = service(status({ revision: 2 }));
-  const wrongProject = core.execute(request("get_pipeline_status", {
+  const wrongProject = await core.execute(request("get_pipeline_status", {
     principal: { ...BINDING, project_id: "other" },
     idempotency_key: "idem_project_001", correlation_id: "corr_project_001",
   }));
-  const staleGeneration = core.execute(request("get_pipeline_status", {
+  const staleGeneration = await core.execute(request("get_pipeline_status", {
     principal: { ...BINDING, generation: 10 },
     idempotency_key: "idem_generation_001", correlation_id: "corr_generation_001",
   }));
-  const staleRevision = core.execute(request("put_batch_manifest", {
+  const staleRevision = await core.execute(request("put_batch_manifest", {
     expected_revision: 1, idempotency_key: "idem_stale_001", correlation_id: "corr_stale_001",
   }));
   assert.equal(wrongProject.decision.code, "head_control_project_denied");
@@ -245,8 +262,8 @@ function ok(condition, message) {
   const firstRequest = request("put_batch_manifest", {
     idempotency_key: "idem_retry_001", correlation_id: "corr_retry_001", expected_revision: 0,
   });
-  const first = core.execute(firstRequest);
-  const replay = core.execute(clone(firstRequest));
+  const first = await core.execute(firstRequest);
+  const replay = await core.execute(clone(firstRequest));
   assert.equal(first.decision.kind, "accepted");
   assert.equal(replay.decision.kind, "replayed");
   assert.equal(calls.put_batch_manifest, 1);
@@ -257,7 +274,7 @@ function ok(condition, message) {
 
   // A one-sided reused identity is rejected by the durable preflight before
   // either the plane or the owning freeze action can run.
-  expectServiceCode(() => core.execute(request("freeze_batch_manifest", {
+  await expectServiceCode(() => core.execute(request("freeze_batch_manifest", {
     expected_revision: 1, idempotency_key: "idem_retry_001", correlation_id: "corr_collision_001",
   })), "head_control_durable_identity_collision");
   assert.equal(calls.freeze_batch_manifest, 0);
@@ -269,13 +286,13 @@ function ok(condition, message) {
 // another cannot name a replay and is stopped before an owned status read.
 {
   const { core, calls } = service();
-  core.execute(request("get_pipeline_status", {
+  await core.execute(request("get_pipeline_status", {
     idempotency_key: "idem_identity_one", correlation_id: "corr_identity_one",
   }));
-  core.execute(request("get_pipeline_status", {
+  await core.execute(request("get_pipeline_status", {
     idempotency_key: "idem_identity_two", correlation_id: "corr_identity_two",
   }));
-  expectServiceCode(() => core.execute(request("get_pipeline_status", {
+  await expectServiceCode(() => core.execute(request("get_pipeline_status", {
     idempotency_key: "idem_identity_two", correlation_id: "corr_identity_one",
   })), "head_control_durable_identity_collision");
   assert.equal(calls.get_pipeline_status, 2);
@@ -294,12 +311,12 @@ function ok(condition, message) {
   const firstRequest = request("put_batch_manifest", {
     idempotency_key: "idem_restart_001", correlation_id: "corr_restart_001", expected_revision: 0,
   });
-  first.execute(firstRequest);
+  await first.execute(firstRequest);
   assert.equal(fake.calls.put_batch_manifest, 1);
   const secondStore = createHeadControlAuditStore({ config_dir: configDir, fs });
   const afterRestart = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: secondStore });
-  expectServiceCode(() => afterRestart.execute(clone(firstRequest)), "head_control_durable_replay_ambiguous");
-  expectServiceCode(() => afterRestart.execute({
+  await expectServiceCode(() => afterRestart.execute(clone(firstRequest)), "head_control_durable_replay_ambiguous");
+  await expectServiceCode(() => afterRestart.execute({
     ...clone(firstRequest),
     payload: { manifest: { version: 1, tasks: [{ exact_task: "changed-payload" }] } },
   }), "head_control_durable_replay_ambiguous");
@@ -322,14 +339,14 @@ function ok(condition, message) {
   const statusRequest = request("get_pipeline_status", {
     idempotency_key: "idem_status_restart", correlation_id: "corr_status_restart",
   });
-  first.execute(statusRequest);
+  await first.execute(statusRequest);
   assert.equal(fake.calls.get_pipeline_status, 1);
   const afterRestart = createHeadControlService({
     binding: BINDING,
     domain: fake.actions,
     audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }),
   });
-  const replay = afterRestart.execute(clone(statusRequest));
+  const replay = await afterRestart.execute(clone(statusRequest));
   assert.equal(replay.decision.kind, "replayed");
   assert.equal(replay.result.status.revision, 0);
   assert.equal(fake.calls.get_pipeline_status, 1);
@@ -346,7 +363,7 @@ function ok(condition, message) {
     append() { throw new Error("must not append"); },
   });
   const unavailable = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: unavailableStore });
-  expectServiceFailure(() => unavailable.execute(request("put_batch_manifest", {
+  await expectServiceFailure(() => unavailable.execute(request("put_batch_manifest", {
     idempotency_key: "idem_unavailable_001", correlation_id: "corr_unavailable_001", expected_revision: 0,
   })));
   assert.equal(fake.calls.get_pipeline_status, 0);
@@ -365,10 +382,10 @@ function ok(condition, message) {
   const retryRequest = request("put_batch_manifest", {
     idempotency_key: "idem_append_001", correlation_id: "corr_append_001", expected_revision: 0,
   });
-  expectServiceFailure(() => retry.execute(retryRequest));
+  await expectServiceFailure(() => retry.execute(retryRequest));
   assert.equal(real.calls.put_batch_manifest, 1);
   permitAppend = true;
-  const replay = retry.execute(clone(retryRequest));
+  const replay = await retry.execute(clone(retryRequest));
   assert.equal(replay.decision.kind, "replayed");
   assert.equal(real.calls.put_batch_manifest, 1);
   assert.equal(retry.recentAudit().length, 1);
@@ -384,7 +401,7 @@ function ok(condition, message) {
     (error) => error instanceof HeadControlServiceError && error.code === "invalid_head_control_service_options");
   assert.throws(() => createHeadControlService({ binding: BINDING, domain: actions, audit_store: { read() {}, append() {}, fetch() {} } }),
     (error) => error instanceof HeadControlServiceError && error.code === "invalid_head_control_service_options");
-  assert.throws(() => core.execute({ ...request("get_pipeline_status", {
+  await assert.rejects(() => core.execute({ ...request("get_pipeline_status", {
     idempotency_key: "idem_unsupported_001", correlation_id: "corr_unsupported_001",
   }), action: "publish_delivery" }),
   (error) => error instanceof HeadControlPlaneError && error.code === "head_control_action_unsupported");
@@ -396,3 +413,4 @@ function ok(condition, message) {
 }
 
 console.log(`\n${passed} passed`);
+})().catch((error) => { console.error(error); process.exit(1); });

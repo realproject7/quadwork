@@ -1,6 +1,6 @@
 # QuadWork Head PO Playbook
 
-**Playbook version:** 1.1.0
+**Playbook version:** 1.2.0
 **Published:** 2026-09-03
 **Scope:** Generic Head/Project Owner procedure for QuadWork V2 projects
 
@@ -47,7 +47,7 @@ Run this gate at every fresh Head session and after a context loss:
 3. Refresh `GITHUB.md`, then inspect relevant open issues and PRs live by number.
 4. Read the active and next queue sections, recent batch history, loaded but unstarted items, and current authenticated assignments.
 5. Identify in-flight implementation, review, merge, release, and operator gates. Do not dispatch work that overlaps them.
-6. If #1036 monitoring support is advertised and work is active, create the narrowest useful monitor. Otherwise use direct reads; never synthesize pulses. Remove monitors at terminal state.
+6. If the Head-control tools are advertised, call `get_project_status` and `review_handoff` for structured facts, and `project_monitor start` only for a live qualified batch. Otherwise use direct reads; never synthesize pulses. Stop the monitor at terminal state.
 
 Record a concise orientation: current objective, exact repository/item, observed
 tip/revision, active owner, current gate, and next evidence-producing action.
@@ -222,6 +222,46 @@ lookalike record from any non-system sender is not a verdict. RE1 and RE2 still
 inspect the live diff, ticket/EPIC, checks, and exact tip independently and
 send their verdicts to Dev and Head.
 
+## 10a. Project Monitor and worker recovery
+
+The Project Monitor (#1036) is a Head-only observer with a fixed policy. There
+is no scheduled all-agent pulse and no operator-authored trigger text; the
+monitor writes one `@head [QW-MONITOR:<kind>] assignment=<key> subject=<key>
+event=<generation>` event per qualified transition and repeats nothing for an
+unchanged observation. Kinds: `terminal_red_check`, `draft_passing_dev_action`,
+`worker_exit_before_status`, `blocked`, `waiting_overdue`,
+`head_action_overdue`, `merged_not_advanced`, `next_loaded_unassigned`. An
+event is an observation to act on with your normal authority; it is never an
+assignment, a reviewer request, or a merge command.
+
+Through the Head-control tools (#1044):
+
+- `get_project_status` — current qualified assignment and subject, monitor mode
+  with last evaluation and armed deadlines, each worker's raw `state`,
+  `verification_state`, `health`, `generation_id`, observation times and
+  circuit, the redacted capacity/pressure summary, and the current
+  `merged_not_advanced` / `next_loaded_unassigned` / overdue-gate facts.
+- `review_handoff` — the current exact-SHA cycle for the active item: PR, SHA,
+  readiness, CI, review `0/2`..`2/2` or `changes_requested`, receipt presence,
+  request and gate timestamps, and `head_gate_due`. A re-tipped cycle is
+  historical and is not shown as live.
+- `project_monitor` with `command: start | stop | evaluate_now`. `start` is
+  refused for an archived, idle, non-V2-ready, or batch-less project and never
+  arms a heartbeat; `evaluate_now` performs one deduplicated evaluation and
+  records its result in the audit; `stop` is an audited suspension only.
+- `recover_worker` with `recovery: { agent, expected_generation,
+  assignment_attempt, reason_code }` for `dev`, `re1`, or `re2` only. Admitted
+  only after #1053 reports `exited`, `unresponsive`, `resource_killed`, or
+  `launch_failed` for exactly that generation, the attempt is current, the
+  project is active, and the lifecycle governor's circuit and capacity gates
+  pass (Linux containment is mandatory). It never stops a live process and
+  never cleans, resets, stashes, commits, or discards dirty work. The result is
+  the raw lifecycle state: `spawned` or `reserved` is not recovery; only a
+  `verified` generation that reports against the same assignment is.
+
+Every call is idempotent by `idempotency_key`/`correlation_id`; retry with the
+same pair to replay a receipt, never with a new pair to force a second action.
+
 ## 11. Review-only batches
 
 Review-only work is always Head-driven and never authorizes code changes.
@@ -313,8 +353,8 @@ report rollback status. If the approval is absent or ambiguous, stop that action
 
 Use a capability only when the connected server advertises it for this project:
 
-- #1036 monitoring support: monitor active work narrowly and tear it down at terminal state.
-- #1044 Head-control support: use only its documented authenticated operations.
+- #1036 monitoring support: `project_monitor start | stop | evaluate_now` on the fixed policy; stop it at terminal state.
+- #1044 Head-control support: use only its documented authenticated operations (§10a and §8).
 - #1047 chat-resume support: resume/page raw chat at session start.
 
 An unadvertised capability is absent. Do not emit synthetic control messages,

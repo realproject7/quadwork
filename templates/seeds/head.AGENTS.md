@@ -29,7 +29,7 @@ Before editing a proposal, queue, issue, PR, or dispatch record:
 3. Inspect the relevant open issues and PRs by number and the fresh `~/.quadwork/{{project_id}}/GITHUB.md` snapshot before creating overlapping work.
 4. Read `OVERNIGHT-QUEUE.md`, recent batch/chat history, loaded but unstarted items, and the current assignment state.
 5. Prove there is no in-flight implementation, review, merge, or release gate before dispatching a conflicting assignment.
-6. Use #1036 monitoring only when the server advertises support and active work needs it; tear it down at terminal state. Never synthesize timer or pulse messages.
+6. When the Head-control tools are advertised, read `get_project_status` before acting; start the Project Monitor with `project_monitor` only for a live qualified batch and stop it at terminal state. Never synthesize timer or pulse messages.
 
 ## Sources of truth
 
@@ -78,6 +78,14 @@ The server's exact-SHA review cycle (#1048) is the only implementation-review ro
 ## WorkTask batches
 
 A WorkTask is your immutable execution slice inside one ticket. Read current state with `get_pipeline_status` before every decision — it is the only authority for stage, revision, and task states. Write the manifest with `put_batch_manifest`, freeze it with `freeze_batch_manifest`, assign one queued task at a time with `assign_work_task_build`, open the sealed two-reviewer round with `open_work_task_independent_review`, and advance it with `reconcile_work_task_review` after both receipts. Relay each returned identity to the role that acts next; the server sends no worker message. A task candidate is local: `accepted`/`staged` never means pushed, merged, or closed. Return a `changes_requested` task to Dev with `queue_local_correction`, and check `read_propagation_stop` before assigning — a task in a sealed stop's dependent chain is refused. Cut with `cut_batch` only through accepted tasks in manifest order, then `retire_batch` before a successor manifest. Never edit an assigned task, read a sealed receipt, or substitute a reviewer.
+
+## Project Monitor and worker recovery
+
+Observe first. `get_project_status` returns the current qualified assignment, monitor mode and last evaluation, each worker's raw lifecycle state with generation and observation times, the redacted capacity summary, and the `merged_not_advanced` / `next_loaded_unassigned` observations; `review_handoff` returns the current exact-SHA review cycle (readiness, CI, 0/2 1/2 2/2, receipts, merge-gate due) and never a historical one. `running` without a fresh observation is not health.
+
+`project_monitor` takes only `start`, `stop`, or `evaluate_now`: it has no message, cadence, or recipient, and a `[QW-MONITOR:<kind>]` event it writes is an observation for you, never an assignment. Use `evaluate_now` after a state transition you caused; a duplicate observation writes nothing.
+
+Use `recover_worker` only for `dev`, `re1`, or `re2` after `get_project_status` shows structured loss (`exited`, `unresponsive`, `resource_killed`, `launch_failed`) with the exact lost `generation_id` and the current `assignment_attempt`. It is refused for a healthy or unconfirmed session, a stale generation, a non-current assignment, an archived project, an open circuit, or insufficient capacity, and it never cleans, resets, or discards a worktree. A result of `spawned` is not recovery: re-read status until the new generation is `verified` and has reported. Otherwise emit `WAITING`/`BLOCKED` or ask the operator.
 
 ## Batch Requests
 

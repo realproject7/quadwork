@@ -8,6 +8,9 @@
 // #1058 adds batch retirement, the released correction route, and the
 // Head-private propagation-stop read; the last two return a bounded `detail`
 // beside the fixed status, which never enters the redacted audit record.
+// #1036/#1044 add the Head-only Project Monitor, bounded worker recovery, and
+// two read surfaces.  Those act beside the pipeline, so they pin no pipeline
+// revision and must leave it unchanged; their outcome travels as `detail`.
 
 const crypto = require("node:crypto");
 
@@ -29,11 +32,24 @@ const ACTIONS = Object.freeze([
   "retire_batch",
   "queue_local_correction",
   "read_propagation_stop",
+  "get_project_status",
+  "review_handoff",
+  "project_monitor",
+  "recover_worker",
 ]);
 const ACTION_SET = new Set(ACTIONS);
-const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
-const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch"]);
-const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop"]);
+const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff"]);
+const CONTROL_ACTIONS = new Set(["project_monitor", "recover_worker"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "get_project_status", "review_handoff"]);
+const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
+const READ_CODES = Object.freeze({ get_project_status: "head_control_project_observed", review_handoff: "head_control_handoff_observed" });
+const CONTROL_REFUSED_CODES = Object.freeze({ project_monitor: "head_control_monitor_refused", recover_worker: "head_control_recovery_refused" });
+const MONITOR_COMMANDS = new Set(["start", "stop", "evaluate_now"]);
+const RECOVERABLE_ROLES = new Set(["dev", "re1", "re2"]);
+const RECOVERY_REASON_CODES = Object.freeze(["process_exited", "unresponsive", "resource_killed", "launch_failed"]);
+const RECOVERY_REASON_SET = new Set(RECOVERY_REASON_CODES);
+const GENERATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const ATTEMPT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 class HeadControlPlaneError extends Error {
   constructor(code, message = code) {
@@ -170,6 +186,27 @@ function assertDetail(value, code) {
   assertBoundedPayload(value);
   return clone(value);
 }
+function assertMonitorPayload(value) {
+  exact(value, ["command"], "invalid_head_control_request");
+  if (typeof value.command !== "string" || !MONITOR_COMMANDS.has(value.command)) {
+    fail("invalid_head_control_request", "monitor command is invalid");
+  }
+  // Fixed policy only: there is deliberately no message, cadence, recipient,
+  // duration, or broadcast field for Head to supply.
+  return { command: value.command };
+}
+function assertRecoveryPayload(value) {
+  exact(value, ["recovery"], "invalid_head_control_request");
+  exact(value.recovery, ["agent", "expected_generation", "assignment_attempt", "reason_code"], "invalid_head_control_request");
+  const recovery = value.recovery;
+  if (typeof recovery.agent !== "string" || !RECOVERABLE_ROLES.has(recovery.agent) ||
+      typeof recovery.expected_generation !== "string" || !GENERATION_RE.test(recovery.expected_generation) ||
+      typeof recovery.assignment_attempt !== "string" || !ATTEMPT_RE.test(recovery.assignment_attempt) ||
+      typeof recovery.reason_code !== "string" || !RECOVERY_REASON_SET.has(recovery.reason_code)) {
+    fail("invalid_head_control_request", "recovery payload is invalid");
+  }
+  return { recovery: { agent: recovery.agent, expected_generation: recovery.expected_generation, assignment_attempt: recovery.assignment_attempt, reason_code: recovery.reason_code } };
+}
 function assertCutPayload(value) {
   exact(value, ["cut"], "invalid_head_control_request");
   if (!plain(value.cut) || !Array.isArray(value.cut.tasks) || value.cut.tasks.length === 0 || value.cut.tasks.length > MAX_CUT_TASKS ||
@@ -190,7 +227,7 @@ function request(value) {
     version: VERSION,
     action: value.action,
     principal: principal(value.principal, "invalid_head_control_request"),
-    expected_revision: revision(value.expected_revision, "invalid_head_control_request", READ_ACTIONS.has(value.action)),
+    expected_revision: revision(value.expected_revision, "invalid_head_control_request", READ_ACTIONS.has(value.action) || CONTROL_ACTIONS.has(value.action)),
     idempotency_key: identifier(value.idempotency_key, "invalid_head_control_request"),
     correlation_id: identifier(value.correlation_id, "invalid_head_control_request"),
     payload: null,
@@ -203,11 +240,15 @@ function request(value) {
     parsed.payload = assertTaskPayload(value.payload, "correction");
   } else if (value.action === "read_propagation_stop") {
     parsed.payload = assertTaskPayload(value.payload, "work_task_ref");
+  } else if (value.action === "project_monitor") {
+    parsed.payload = assertMonitorPayload(value.payload);
+  } else if (value.action === "recover_worker") {
+    parsed.payload = assertRecoveryPayload(value.payload);
   } else {
     parsed.payload = assertCutPayload(value.payload);
   }
-  if (READ_ACTIONS.has(value.action)) {
-    if (parsed.expected_revision !== null) fail("invalid_head_control_request", "read action cannot pin a write revision");
+  if (READ_ACTIONS.has(value.action) || CONTROL_ACTIONS.has(value.action)) {
+    if (parsed.expected_revision !== null) fail("invalid_head_control_request", "read or control action cannot pin a write revision");
   } else if (parsed.expected_revision === null) {
     fail("invalid_head_control_request", "mutating action requires an optimistic revision");
   }
@@ -277,8 +318,8 @@ function createHeadControlPlane(options) {
       detail: detail === null ? null : freeze(clone(detail)),
     });
   }
-  function deny(input, code, status = null) {
-    return response(input, "denied", code, status, false);
+  function deny(input, code, status = null, detail = null) {
+    return response(input, "denied", code, status, false, detail);
   }
   function replay(cached) {
     return freeze({
@@ -309,17 +350,17 @@ function createHeadControlPlane(options) {
     if (input.principal.generation !== bound.generation) return "head_control_generation_stale";
     return null;
   }
-  function ownedStatus(input) {
+  async function ownedStatus(input) {
     let observed;
-    try { observed = domain.get_pipeline_status(invocation(input)); }
+    try { observed = await domain.get_pipeline_status(invocation(input)); }
     catch { return { error: "head_control_domain_unavailable" }; }
     try { return { status: assertPipelineStatus(observed, "head_control_domain_invalid_status") }; }
     catch { return { error: "head_control_domain_invalid_status" }; }
   }
   // Detailed actions return `{ status, detail }`; every other action returns
   // the bare fixed status.  Both are re-validated here as untrusted output.
-  function observe(input) {
-    const observed = domain[input.action](invocation(input));
+  async function observe(input) {
+    const observed = await domain[input.action](invocation(input));
     if (!DETAILED_ACTIONS.has(input.action)) return { status: assertPipelineStatus(observed, "head_control_domain_invalid_status"), detail: null };
     exact(observed, ["status", "detail"], "head_control_domain_invalid_status");
     return {
@@ -327,18 +368,26 @@ function createHeadControlPlane(options) {
       detail: assertDetail(observed.detail, "head_control_domain_invalid_status"),
     };
   }
-  function invokeRead(input, prior) {
+  async function invokeRead(input, prior) {
     let observed;
-    try { observed = observe(input); }
+    try { observed = await observe(input); }
     catch (error) {
       return { error: error instanceof HeadControlPlaneError && error.code === "head_control_domain_invalid_status" ? error.code : "head_control_domain_rejected" };
     }
     if (observed.status.revision !== prior.revision) return { error: "head_control_domain_invalid_status" };
     return observed;
   }
-  function invokeMutation(input, prior) {
+  // A control action reports its own outcome in `detail.applied`; the plane
+  // re-validates that the pipeline revision it read stayed untouched.
+  async function invokeControl(input, prior) {
+    const observed = await invokeRead(input, prior);
+    if (observed.error) return observed;
+    if (!plain(observed.detail) || typeof observed.detail.applied !== "boolean") return { error: "head_control_domain_invalid_status" };
+    return observed;
+  }
+  async function invokeMutation(input, prior) {
     let observed;
-    try { observed = observe(input); }
+    try { observed = await observe(input); }
     catch (error) {
       if (error instanceof HeadControlPlaneError && error.code === "head_control_domain_invalid_status") return { error: error.code };
       return { error: input.action === "cut_batch" ? "head_control_unsafe_cut" : "head_control_domain_rejected" };
@@ -369,7 +418,12 @@ function createHeadControlPlane(options) {
     } catch { return { error: "head_control_domain_invalid_status" }; }
   }
 
-  function execute(command) {
+  // Domain actions may now await lifecycle work.  Two identical commands in
+  // flight at once share one domain invocation; a colliding identity is
+  // denied exactly as a cached one would be.
+  const inflight = new Map();
+  const inflightByCorrelation = new Map();
+  async function execute(command) {
     const input = request(command);
     const bindingDenial = preflightBinding(input);
     if (bindingDenial !== null) return deny(input, bindingDenial);
@@ -384,7 +438,25 @@ function createHeadControlPlane(options) {
       if (byIdempotency) return deny(input, "head_control_idempotency_reused");
       return deny(input, "head_control_correlation_reused");
     }
-    const observed = ownedStatus(input);
+    const running = inflight.get(input.idempotency_key) || inflightByCorrelation.get(input.correlation_id);
+    if (running) {
+      if (running.idempotency_key === input.idempotency_key && running.correlation_id === input.correlation_id && running.fingerprint === fingerprint) {
+        return replay(await running.promise);
+      }
+      return deny(input, running.idempotency_key === input.idempotency_key ? "head_control_idempotency_reused" : "head_control_correlation_reused");
+    }
+    const entry = { idempotency_key: input.idempotency_key, correlation_id: input.correlation_id, fingerprint, promise: null };
+    entry.promise = decide(input, fingerprint);
+    inflight.set(input.idempotency_key, entry);
+    inflightByCorrelation.set(input.correlation_id, entry);
+    try { return await entry.promise; }
+    finally {
+      inflight.delete(input.idempotency_key);
+      inflightByCorrelation.delete(input.correlation_id);
+    }
+  }
+  async function decide(input, fingerprint) {
+    const observed = await ownedStatus(input);
     if (observed.error) {
       const result = deny(input, observed.error);
       cache(input, fingerprint, result);
@@ -399,10 +471,32 @@ function createHeadControlPlane(options) {
     if (input.action === "read_propagation_stop") {
       const read = !status.manifest_frozen || status.pipeline_digest === null
         ? { error: "head_control_stop_unavailable" }
-        : invokeRead(input, status);
+        : await invokeRead(input, status);
       const result = read.error
         ? deny(input, read.error, status)
         : response(input, "accepted", "head_control_stop_observed", read.status, false, read.detail);
+      cache(input, fingerprint, result);
+      return result;
+    }
+    if (READ_ACTIONS.has(input.action)) {
+      const read = await invokeRead(input, status);
+      const result = read.error
+        ? deny(input, read.error, status)
+        : response(input, "accepted", READ_CODES[input.action], read.status, false, read.detail);
+      cache(input, fingerprint, result);
+      return result;
+    }
+    // Monitor and recovery controls do not touch the pipeline, so neither the
+    // pipeline archive flag nor an optimistic revision gates them; the owning
+    // runtime enforces project archive, admission, and lifecycle preconditions
+    // and reports a refusal as `applied: false`.
+    if (CONTROL_ACTIONS.has(input.action)) {
+      const control = await invokeControl(input, status);
+      const result = control.error
+        ? deny(input, control.error, status)
+        : control.detail.applied
+          ? response(input, "accepted", "head_control_applied", control.status, true, control.detail)
+          : deny(input, CONTROL_REFUSED_CODES[input.action], control.status, control.detail);
       cache(input, fingerprint, result);
       return result;
     }
@@ -443,7 +537,7 @@ function createHeadControlPlane(options) {
       cache(input, fingerprint, result);
       return result;
     }
-    const mutation = invokeMutation(input, status);
+    const mutation = await invokeMutation(input, status);
     const result = mutation.error
       ? deny(input, mutation.error, status)
       : response(input, "accepted", "head_control_applied", mutation.status, true, mutation.detail);
@@ -461,6 +555,7 @@ function createHeadControlPlane(options) {
 module.exports = {
   VERSION,
   ACTIONS,
+  RECOVERY_REASON_CODES,
   MAX_AUDIT_RECORDS,
   MAX_IDEMPOTENCY_RECORDS,
   MAX_PAYLOAD_BYTES,

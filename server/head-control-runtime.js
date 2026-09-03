@@ -62,11 +62,75 @@ function runtimeKey(value) {
   return `${value.installation_id}:${value.project_id}:${value.generation}`;
 }
 
+const PROJECT_CONTROL_NAMES = Object.freeze(["read_project_status", "read_review_handoff", "project_monitor", "recover_worker"]);
+
+function projectControls(value) {
+  exact(value, PROJECT_CONTROL_NAMES);
+  for (const name of PROJECT_CONTROL_NAMES) {
+    if (typeof value[name] !== "function") throw new TypeError(`Head-control project control ${name} is required`);
+  }
+  return value;
+}
+
+function sameBinding(left, right) {
+  return left.installation_id === right.installation_id && left.project_id === right.project_id &&
+    left.role === right.role && left.generation === right.generation;
+}
+
+// #1036/#1044: the monitor, recovery, and read surfaces sit beside the durable
+// WorkTask domain.  Each callback re-proves the plane's frozen invocation is
+// bound to this Head, reads the untouched pipeline status through the same
+// owning domain, and delegates to one fixed server control that receives only
+// the bound project id and the validated payload; never a caller-selected
+// project, role, path, message, cadence, or recipient.
+function composeHeadDomain(owner, workTask, controls) {
+  function owned(invocation, action) {
+    exact(invocation, ["version", "action", "binding", "expected_revision", "correlation_id", "idempotency_key", "payload"]);
+    if (invocation.action !== action || !sameBinding(binding(invocation.binding), owner)) {
+      throw new TypeError("Head-control invocation is not bound to this Head");
+    }
+  }
+  function pipelineStatus(invocation) {
+    return workTask.get_pipeline_status({ ...invocation, action: "get_pipeline_status", expected_revision: null, payload: null });
+  }
+  const project_id = owner.project_id;
+  const beside = new Set(["get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
+  return {
+    ...workTask,
+    // The plane preflights every action with a status read that keeps the
+    // requested action name.  The WorkTask domain validates only its own
+    // seven; a beside-the-pipeline action reads status as a plain status read.
+    get_pipeline_status(invocation) {
+      return beside.has(invocation?.action) ? pipelineStatus(invocation) : workTask.get_pipeline_status(invocation);
+    },
+    async get_project_status(invocation) {
+      owned(invocation, "get_project_status");
+      const status = pipelineStatus(invocation);
+      return { status, detail: await controls.read_project_status({ project_id }) };
+    },
+    async review_handoff(invocation) {
+      owned(invocation, "review_handoff");
+      const status = pipelineStatus(invocation);
+      return { status, detail: await controls.read_review_handoff({ project_id }) };
+    },
+    async project_monitor(invocation) {
+      owned(invocation, "project_monitor");
+      const status = pipelineStatus(invocation);
+      return { status, detail: await controls.project_monitor({ project_id, command: invocation.payload.command }) };
+    },
+    async recover_worker(invocation) {
+      owned(invocation, "recover_worker");
+      const status = pipelineStatus(invocation);
+      return { status, detail: await controls.recover_worker({ project_id, recovery: { ...invocation.payload.recovery } }) };
+    },
+  };
+}
+
 function createHeadControlRuntime(options) {
   exact(options, [
     "config_dir", "fs", "read_config", "capture_project_admission", "is_project_archived",
     "resolve_shim_principal", "agent_sessions", "read_live_batch_context", "read_repository_state",
-    "read_cached_repository_snapshot", "now",
+    "read_cached_repository_snapshot", "now", "project_controls",
   ]);
   if (typeof options.config_dir !== "string" || !options.config_dir || !options.fs ||
       typeof options.read_config !== "function" || typeof options.capture_project_admission !== "function" ||
@@ -76,6 +140,7 @@ function createHeadControlRuntime(options) {
       typeof options.read_cached_repository_snapshot !== "function" || typeof options.now !== "function") {
     throw new TypeError("Head-control runtime dependencies are invalid");
   }
+  const controls = projectControls(options.project_controls);
 
   // Each project has one active Head launch credential.  The separate map is
   // intentionally not a general token registry; registration replaces the
@@ -207,11 +272,11 @@ function createHeadControlRuntime(options) {
     const key = runtimeKey(owner);
     const existing = services.get(key);
     if (existing) return existing;
-    const domain = resolveOwnedDomain(owner);
-    // Bootstrap is private runtime composition, never a fifth MCP operation.
-    domain.initialize();
+    const workTask = resolveOwnedDomain(owner);
+    // Bootstrap is private runtime composition, never an MCP operation.
+    workTask.initialize();
     const audit_store = createHeadControlAuditStore({ config_dir: options.config_dir, fs: options.fs });
-    const service = createHeadControlService({ binding: owner, domain, audit_store });
+    const service = createHeadControlService({ binding: owner, domain: composeHeadDomain(owner, workTask, controls), audit_store });
     services.set(key, service);
     return service;
   }
@@ -264,4 +329,4 @@ function createHeadControlRuntime(options) {
   return Object.freeze({ registerHeadToken, revokeProject, readCurrentBatchProjection, handle: http.handle });
 }
 
-module.exports = { createHeadControlRuntime };
+module.exports = { createHeadControlRuntime, composeHeadDomain };
