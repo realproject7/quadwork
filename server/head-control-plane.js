@@ -265,11 +265,16 @@ function createHeadControlPlane(options) {
     });
   }
   function cache(input, fingerprint, result) {
-    if (idempotency.size >= MAX_IDEMPOTENCY_RECORDS) return false;
-    const record = freeze({ fingerprint, result });
+    // Bounded oldest-first window: both maps hold the same record, so the
+    // evicted idempotency entry drops its correlation entry with it.
+    if (idempotency.size >= MAX_IDEMPOTENCY_RECORDS) {
+      const oldestKey = idempotency.keys().next().value;
+      correlations.delete(idempotency.get(oldestKey).correlation_id);
+      idempotency.delete(oldestKey);
+    }
+    const record = freeze({ fingerprint, correlation_id: input.correlation_id, result });
     idempotency.set(input.idempotency_key, record);
     correlations.set(input.correlation_id, record);
-    return true;
   }
   function preflightBinding(input) {
     if (input.principal.role !== "head") return "head_control_role_denied";
@@ -323,8 +328,6 @@ function createHeadControlPlane(options) {
       if (byIdempotency) return deny(input, "head_control_idempotency_reused");
       return deny(input, "head_control_correlation_reused");
     }
-    if (idempotency.size >= MAX_IDEMPOTENCY_RECORDS) return deny(input, "head_control_idempotency_capacity_exhausted");
-
     const observed = ownedStatus(input);
     if (observed.error) {
       const result = deny(input, observed.error);

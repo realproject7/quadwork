@@ -951,13 +951,30 @@ app.get("/api/work-task-batch", (req, res) => {
 app.post("/api/work-task-candidate", (req, res) => {
   const principal = activeDevCandidatePrincipal(req);
   if (!principal) return res.status(403).json({ ok: false, code: "work_task_candidate_forbidden" });
+  // The project is bound by the authenticated Dev token, never by the body:
+  // a ref for another project is refused before any identity or store read.
+  const ref = req.body?.work_task_ref;
+  if (!ref || typeof ref !== "object" || ref.project_id !== principal.projectId) {
+    return res.status(403).json({ ok: false, code: "work_task_candidate_forbidden" });
+  }
   try {
     const resolveLiveIdentity = createLiveWorkTaskIdentityResolver({
       read_live_batch_context: routes.readLiveBatchContext,
       read_repository_state: routes.repositoryState,
       read_cached_repository_snapshot: (cacheRepo) => routes._graphqlCache.get(cacheRepo),
     });
-    resolveLiveIdentity(req.body?.work_task_ref);
+    // A WorkTaskRef carries the task contract on top of the four-field source
+    // identity; the resolver re-proves that identity and its current Issue
+    // body revision, which must still match the submitted contract.
+    const identity = resolveLiveIdentity({
+      installation_id: ref.installation_id,
+      project_id: ref.project_id,
+      repository_key: ref.repository_key,
+      work_item: ref.work_item,
+    });
+    if (identity.issue_body_revision !== ref.issue_body_revision) {
+      return res.status(409).json({ ok: false, code: "stale_work_task_candidate_authority" });
+    }
     const result = devCandidateServiceForProject(principal.projectId).submitDevCandidate(req.body);
     return res.json({ ok: true, ...result });
   } catch (error) {
@@ -3988,9 +4005,10 @@ function runStartupMigrations(cfg) {
   const designGuideSrc = path.join(__dirname, "..", "templates", "seeds", "DESIGN-GUIDE.md");
   if (fs.existsSync(designGuideSrc)) {
     for (const p of projects) {
-      if (!p.working_dir) continue;
-      const dirName = path.basename(p.working_dir);
-      const parentDir = path.dirname(p.working_dir);
+      const workingDir = primaryRepository(p)?.working_dir;
+      if (!workingDir) continue;
+      const dirName = path.basename(workingDir);
+      const parentDir = path.dirname(workingDir);
       for (const agent of ["head", "dev", "re1", "re2"]) {
         const wtDir = path.join(parentDir, `${dirName}-${agent}`);
         const dst = path.join(wtDir, "DESIGN-GUIDE.md");
@@ -4061,7 +4079,7 @@ async function respawnActiveBatchAgents(cfg, opts = {}) {
     return { decisions };
   }
 
-  const projects = (cfg?.projects || []).filter((p) => p && p.id && p.working_dir);
+  const projects = (cfg?.projects || []).filter((p) => p && p.id && primaryRepository(p)?.working_dir);
   for (const project of projects) {
     if (archived(project.id, cfg)) {
       decisions.push({ projectId: project.id, action: "skip", reason: "project archived" });
@@ -4332,3 +4350,5 @@ module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test
 module.exports.triggers = triggers; // #1034: project cleanup ownership test seam
 module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation test seam
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
+module.exports.runStartupMigrations = runStartupMigrations; // startup seeding (test seam)
+module.exports.app = app; // route-level test seam (QUADWORK_SKIP_LISTEN keeps the port unbound)

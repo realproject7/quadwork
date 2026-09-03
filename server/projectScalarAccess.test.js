@@ -1400,10 +1400,6 @@ function runSelfFixtures() {
 const EXPECTED_PRE_ACTIVATION_LEDGER = Object.freeze({
   "bin/quadwork.js :: owner=cmdCleanup :: call=cmdCleanup :: binding=config.projects[idx] :: repo:property :: at=b5ee77fe2c04#226:log(` Config entry: ${projectId} (${config.projects[idx]": 1,
   "bin/quadwork.js :: owner=cmdDoctor :: call=cmdDoctor :: binding=p :: working_dir:property :: at=ab866067533d#109:console.log(` project:${p.id || \"(unnamed)\"} chat_mode=$": 1,
-  "server/index.js :: owner=respawnActiveBatchAgents :: call=respawnActiveBatchAgents > filter()#arg0 :: binding=p :: working_dir:property :: at=d43a64b6da2e#12:const projects = (cfg?.projects || []).filter((p) => p &": 1,
-  "server/index.js :: owner=runStartupMigrations :: call=runStartupMigrations :: binding=p :: working_dir:property :: at=3acbde7514d8#296:const parentDir = path.dirname(p.working_dir);": 1,
-  "server/index.js :: owner=runStartupMigrations :: call=runStartupMigrations :: binding=p :: working_dir:property :: at=76de06f21223#273:if (!p.working_dir) continue;": 1,
-  "server/index.js :: owner=runStartupMigrations :: call=runStartupMigrations :: binding=p :: working_dir:property :: at=7da5876fe50f#285:const dirName = path.basename(p.working_dir);": 1,
   "server/routes.js :: owner=post(\"/api/rename\")#arg1 :: call=post(\"/api/rename\")#arg1 :: binding=project :: working_dir:property :: at=204b9f7500f3#77:const workDir = project.working_dir || \"\";": 1,
 });
 

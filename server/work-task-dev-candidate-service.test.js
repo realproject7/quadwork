@@ -67,6 +67,9 @@ function fixture(directory) {
   } : assignment.precondition, plan: assignment, terminal_disposition: null });
   let inspections = 0;
   const managed_worktree = {
+    // The composed server observer exposes this extra reader; the service
+    // must forward only the three authorities the candidate builder exacts.
+    worktreeId(repositoryKey) { return `wt_${repositoryKey}_dev`; },
     resolveDevWorktree(request) {
       assert.deepEqual(request, { version: 1, work_task_ref: ref });
       return { version: 1, repository_key: "web", worktree_id: "wt_web_dev", path: "/private/var/quadwork/web-dev", branch: "worktree-dev" };

@@ -75,12 +75,16 @@ function options(value) {
       typeof value.read_canonical_installed_state !== "function") {
     fail("invalid_work_task_dev_candidate_service_options", "candidate service dependencies are invalid");
   }
+  const managed_worktree = {};
   for (const name of ["resolveDevWorktree", "canonicalizePath", "inspectManagedWorktree"]) {
     if (typeof value.managed_worktree[name] !== "function") {
       fail("invalid_work_task_dev_candidate_service_options", "managed worktree authority is invalid");
     }
+    managed_worktree[name] = value.managed_worktree[name];
   }
-  return value;
+  // The candidate builder exacts these three read authorities; the composed
+  // observer legitimately exposes more, so only the fixed set is forwarded.
+  return { ...value, managed_worktree };
 }
 function slotFor(pipeline, ref) {
   const key = workTaskKey(ref);

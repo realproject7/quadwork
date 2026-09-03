@@ -112,9 +112,11 @@ function binding(value, code) {
     generation: value.generation,
   };
 }
+function sameOwner(left, right) {
+  return left.installation_id === right.installation_id && left.project_id === right.project_id && left.role === right.role;
+}
 function sameBinding(left, right) {
-  return left.installation_id === right.installation_id && left.project_id === right.project_id &&
-    left.role === right.role && left.generation === right.generation;
+  return sameOwner(left, right) && left.generation === right.generation;
 }
 function ownerOf(bindingValue) {
   return { installation_id: bindingValue.installation_id, project_id: bindingValue.project_id };
@@ -293,11 +295,15 @@ function pending(value, state, owner, code) {
     next_pipeline_digest: value.next_pipeline_digest,
   };
 }
-function assertState(value, owner) {
+function assertState(value, owner, adoptGeneration = false) {
   exact(value, ["schema_version", "binding", "revision", "stage", "manifest", "pipeline_digest", "pending"], "invalid_head_control_work_task_state");
   if (value.schema_version !== SCHEMA_VERSION) fail("unknown_head_control_work_task_state_schema", "domain state schema is unsupported");
   const storedBinding = binding(value.binding, "invalid_head_control_work_task_state");
-  if (!sameBinding(storedBinding, owner)) fail("head_control_work_task_state_identity_mismatch", "domain state belongs to another Head generation");
+  // Only the explicit initialize() transition may read state left by an
+  // earlier Head generation of the same project; every other read requires
+  // the exact stored binding, and a stale generation can never adopt.
+  const adoptable = adoptGeneration && sameOwner(storedBinding, owner) && storedBinding.generation < owner.generation;
+  if (!sameBinding(storedBinding, owner) && !adoptable) fail("head_control_work_task_state_identity_mismatch", "domain state belongs to another Head generation");
   const state = {
     schema_version: SCHEMA_VERSION,
     binding: storedBinding,
@@ -322,7 +328,7 @@ function assertState(value, owner) {
 }
 function snapshot(state, owner) { return freeze(clone(assertState(state, owner))); }
 
-function readState(fs, statePath, owner, allowMissing) {
+function readState(fs, statePath, owner, allowMissing, adoptGeneration = false) {
   let raw;
   try {
     const stats = fs.lstatSync(statePath);
@@ -346,7 +352,7 @@ function readState(fs, statePath, owner, allowMissing) {
   }
   let decoded;
   try { decoded = JSON.parse(raw); } catch { fail("corrupt_head_control_work_task_state", "domain state JSON is corrupt"); }
-  try { return assertState(decoded, owner); }
+  try { return assertState(decoded, owner, adoptGeneration); }
   catch (error) {
     if (error instanceof HeadControlWorkTaskDomainError &&
         (error.code === "unknown_head_control_work_task_state_schema" || error.code === "head_control_work_task_state_identity_mismatch")) throw error;
@@ -549,8 +555,16 @@ function createHeadControlWorkTaskDomain(options) {
   function initialize() {
     ensureDirectories(fs, options.config_dir, directory);
     return withWriterLock(fs, statePath, () => {
-      const existing = readState(fs, statePath, owner, true);
-      if (existing !== null) return snapshot(existing, owner);
+      const existing = readState(fs, statePath, owner, true, true);
+      if (existing !== null) {
+        if (existing.binding.generation === owner.generation) return snapshot(existing, owner);
+        // An archive/unarchive generation bump rebinds the durable state to
+        // the new Head generation here, as one explicit recorded transition,
+        // instead of leaving the file permanently unreadable.
+        const rebound = { ...existing, binding: clone(owner) };
+        writeState(fs, statePath, rebound, owner);
+        return snapshot(rebound, owner);
+      }
       // `readPipeline` requires a real manifest; probe the underlying durable
       // store directly so a missing store is the sole bootstrap condition.
       try {

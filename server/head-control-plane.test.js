@@ -6,6 +6,7 @@ const path = require("node:path");
 const {
   VERSION,
   ACTIONS,
+  MAX_IDEMPOTENCY_RECORDS,
   HeadControlPlaneError,
   createHeadControlPlane,
 } = require("./head-control-plane");
@@ -219,6 +220,32 @@ function ok(condition, message) {
   assert.equal(idempotencyReuse.decision.code, "head_control_idempotency_reused");
   ok(calls.freeze_batch_manifest === 0 && core.auditSnapshot().length === 3,
     "duplicate retries and key collisions are audited without a second domain mutation");
+}
+
+// The replay window is bounded by oldest-first eviction, never by refusing
+// service: after more than MAX_IDEMPOTENCY_RECORDS commands the plane still
+// answers, recent duplicates still replay, and evicted keys are reusable.
+{
+  const { core, calls } = plane();
+  const total = MAX_IDEMPOTENCY_RECORDS + 8;
+  const statusRequest = (index) => request("get_pipeline_status", {
+    idempotency_key: `idem_window_${index}`, correlation_id: `corr_window_${index}`,
+  });
+  for (let index = 0; index < total; index += 1) {
+    assert.equal(core.execute(statusRequest(index)).decision.code, "head_control_status_observed");
+  }
+  assert.equal(calls.get_pipeline_status, total);
+  const recent = core.execute(statusRequest(total - 1));
+  assert.equal(recent.decision.kind, "replayed");
+  assert.equal(calls.get_pipeline_status, total);
+  const evicted = core.execute(statusRequest(0));
+  assert.equal(evicted.decision.code, "head_control_status_observed");
+  assert.equal(calls.get_pipeline_status, total + 1);
+  const crossed = core.execute(request("get_pipeline_status", {
+    idempotency_key: "idem_window_fresh", correlation_id: `corr_window_${total - 1}`,
+  }));
+  assert.equal(crossed.decision.code, "head_control_correlation_reused");
+  ok(true, "the plane keeps serving past MAX_IDEMPOTENCY_RECORDS by evicting the oldest replay record from both key maps");
 }
 
 // Domain result shape is a security boundary too.  A malformed result is
