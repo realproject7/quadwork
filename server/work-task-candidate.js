@@ -15,7 +15,6 @@ const WORKTREE_ID_RE = /^[a-z][a-z0-9_-]{2,63}$/;
 const BRANCH_RE = /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?!.*\/\/)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const RECEIPT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const RECEIPT_KINDS = new Set(["review_receipt", "validation_receipt"]);
-const PUBLICATION_OPERATIONS = new Set(["push", "pull_request", "ci", "release"]);
 const MAX_RECEIPTS = 128;
 
 class WorkTaskCandidateError extends Error {
@@ -263,16 +262,6 @@ function assertCandidateInvalidationPlan(plan) {
   });
   return true;
 }
-function rejectTaskCandidatePublication(candidate, intent) {
-  assertWorkTaskCandidate(candidate);
-  exact(intent, ["version", "operation", "repository_key", "branch"], "invalid_task_candidate_publication");
-  if (intent.version !== VERSION || !PUBLICATION_OPERATIONS.has(intent.operation) || !REPOSITORY_KEY_RE.test(intent.repository_key)) fail("invalid_task_candidate_publication", "candidate publication intent is invalid");
-  branch(intent.branch, "invalid_task_candidate_publication");
-  if (intent.repository_key === candidate.work_task_ref.repository_key && intent.branch === candidate.branch) {
-    fail(`work_task_candidate_${intent.operation}_prohibited`, "local work task candidates cannot publish");
-  }
-  return true;
-}
 
 module.exports = {
   VERSION,
@@ -282,5 +271,4 @@ module.exports = {
   buildWorkTaskCandidate,
   planCandidateInvalidation,
   assertCandidateInvalidationPlan,
-  rejectTaskCandidatePublication,
 };
