@@ -51,6 +51,12 @@ function manifest(goalSuffix) {
     tasks: [
       { task_key: "review", repository_key: "web", work_item: copy(issue), goal: `seal two independent receipts ${goalSuffix}`, file_boundary: ["server/review.js"], validation: ["node:test"], dependencies: [] },
       { task_key: "dependent", repository_key: "web", work_item: copy(issue), goal: `build on the reviewed slice ${goalSuffix}`, file_boundary: ["server/dependent.js"], validation: ["node:test"], dependencies: [{ repository_key: "web", work_item: copy(issue), task_key: "review" }] },
+      // #1071: an independent third task, so one task can hold a real sealed
+      // review round while another holds the propagating one.  A declared
+      // dependent cannot: a build is only assigned once its dependency is
+      // accepted or staged, so `dependent` can never own a round while
+      // `review` is still under review.
+      { task_key: "sibling", repository_key: "web", work_item: copy(issue), goal: `seal a local-only finding ${goalSuffix}`, file_boundary: ["server/sibling.js"], validation: ["node:test"], dependencies: [] },
     ],
   }, { resolveRegisteredIdentity: createLiveWorkTaskIdentityResolver(liveReaders()) });
 }
@@ -203,13 +209,30 @@ async function run() {
     // Dev builds, reviewers are assigned, and re2 seals a propagating finding.
     const reviewRef = state.manifest.tasks[0].ref;
     const dependentRef = state.manifest.tasks[1].ref;
+    const siblingRef = state.manifest.tasks[2].ref;
     const apply = (event) => {
       state = store.readRecoverySnapshot(owner);
       store.applyPlan({ expected: { ...owner, manifest_digest: state.manifest.manifest_digest, pipeline_digest: state.pipeline.pipeline_digest }, plan: planWorkTaskPipelineEvent(state.pipeline, event), terminal_disposition: null });
     };
+    const review = createWorkTaskIndependentReviewService({ config_dir, fs });
+    // #1071 (test quality): the sibling gets an ACTUAL review round of its own,
+    // still current, carrying a sealed receipt whose only finding is `local`.
+    // Its stop read must be null because of what that round says and whose it
+    // is -- not because the task has no round to look at.
+    apply({ version: 1, kind: "assign_build", event_id: "e2e_sibling_build", work_task_ref: copy(siblingRef), assignment_id: "e2e_sibling_assignment", base_sha: baseSha });
+    apply({ version: 1, kind: "record_candidate", event_id: "e2e_sibling_candidate", assignment_id: "e2e_sibling_assignment", candidate: candidateFor(siblingRef) });
+    const siblingOpened = review.openIndependentReview({ version: 1, event_id: "e2e_sibling_open", work_task_ref: copy(siblingRef), attempt: "attempt_001", round: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 11 }, { reviewer_role: "re2", reviewer_generation: 22 }], opened_at: "2026-09-02T00:00:30.000Z" });
+    const siblingSealed = review.submitTrustedReceipt({ version: 1, review_round_ref: siblingOpened.review_round_ref, candidate_digest: siblingOpened.candidate_digest,
+      receipt: receipt(siblingOpened.review_round_ref, "receipt_re2_sibling", "request_changes", [{ finding_id: "finding_sibling_local", severity: "blocking", propagation: "local", summary: "local only" }]) },
+    { version: 1, reviewer_role: "re2", reviewer_generation: 22, received_at: "2026-09-02T00:00:40.000Z" });
+    // The round the sibling stop read will consult really is open and sealed:
+    // "sealed" (not "released") is exactly the pre-release state a propagation
+    // stop is derived from, and the pipeline slot holds the review authority.
+    assert.equal(siblingSealed.outcome, "sealed");
+    assert.equal(store.readRecoverySnapshot(owner).pipeline.tasks[2].state, "independent_review");
+
     apply({ version: 1, kind: "assign_build", event_id: "e2e_review_build", work_task_ref: copy(reviewRef), assignment_id: "e2e_review_assignment", base_sha: baseSha });
     apply({ version: 1, kind: "record_candidate", event_id: "e2e_review_candidate", assignment_id: "e2e_review_assignment", candidate: candidateFor(reviewRef) });
-    const review = createWorkTaskIndependentReviewService({ config_dir, fs });
     const opened = review.openIndependentReview({ version: 1, event_id: "e2e_review_open", work_task_ref: copy(reviewRef), attempt: "attempt_001", round: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 11 }, { reviewer_role: "re2", reviewer_generation: 22 }], opened_at: "2026-09-02T00:01:00.000Z" });
     review.submitTrustedReceipt({ version: 1, review_round_ref: opened.review_round_ref, candidate_digest: opened.candidate_digest,
       receipt: receipt(opened.review_round_ref, "receipt_re2_stop", "request_changes", [{ finding_id: "finding_shared_base", severity: "blocking", propagation: "propagating", summary: "shared base drift" }]) },
@@ -221,12 +244,33 @@ async function run() {
     assert.equal(stop.detail.kind, "propagation_stop_pending");
     assert.equal(stop.detail.candidate_digest, opened.candidate_digest);
     assert.deepEqual(stop.detail.dependency_chain.map((entry) => entry.task_key), ["dependent"]);
+    // The stop that came back names the task that owns it.
+    assert.equal(stop.detail.review_round_ref.work_task_ref.task_key, "review");
     assert.doesNotMatch(JSON.stringify(stop), /receipt|finding|reviewer|verdict|request_changes|shared base/);
+    // #1071 (test quality): the sibling holds its own current sealed round, and
+    // the propagating stop above is still observable at the same moment, so a
+    // null here is the classification of the sibling's OWN finding plus task
+    // binding -- not the absence of a round.
+    const siblingStop = await shim.call("read_propagation_stop", { idempotency_key: "idem_e2e_stop_4", correlation_id: "corr_e2e_stop_4", work_task_ref: copy(siblingRef) });
+    assert.equal(siblingStop.decision.code, "head_control_stop_observed");
+    assert.equal(siblingStop.detail, null);
+    assert.doesNotMatch(JSON.stringify(siblingStop), /receipt|finding|reviewer|verdict|request_changes|local only/);
+    const stopAgain = await shim.call("read_propagation_stop", { idempotency_key: "idem_e2e_stop_5", correlation_id: "corr_e2e_stop_5", work_task_ref: copy(reviewRef) });
+    assert.equal(stopAgain.detail.kind, "propagation_stop_pending");
+    assert.equal(stopAgain.detail.review_round_ref.work_task_ref.task_key, "review");
+    // A task with no round at all is null too, for the weaker reason.
     const dependentStop = await shim.call("read_propagation_stop", { idempotency_key: "idem_e2e_stop_2", correlation_id: "corr_e2e_stop_2", work_task_ref: copy(dependentRef) });
     assert.equal(dependentStop.detail, null);
     const foreignStop = await shim.call("read_propagation_stop", { idempotency_key: "idem_e2e_stop_3", correlation_id: "corr_e2e_stop_3", work_task_ref: { ...copy(reviewRef), project_id: "other" } });
     assert.equal(foreignStop.decision.code, "head_control_domain_rejected");
-    ok(true, "Head observes the pending propagation stop as a redacted detail over the declared chain, and a foreign task ref is denied");
+    ok(true, "Head observes the pending propagation stop as a redacted detail over the declared chain, while a peer task's own sealed local-only round reads null and a foreign task ref is denied");
+
+    // Release and reconcile the sibling's round so it no longer holds review
+    // authority; retirement below refuses a batch that still does.
+    review.submitTrustedReceipt({ version: 1, review_round_ref: siblingOpened.review_round_ref, candidate_digest: siblingOpened.candidate_digest, receipt: receipt(siblingOpened.review_round_ref, "receipt_re1_sibling", "approve") },
+      { version: 1, reviewer_role: "re1", reviewer_generation: 11, received_at: "2026-09-02T00:00:50.000Z" });
+    createWorkTaskReviewReconciliationService({ config_dir, fs }).reconcileReleasedReview({ version: 1, work_task_ref: copy(siblingRef), review_round_ref: copy(siblingOpened.review_round_ref), candidate_digest: siblingOpened.candidate_digest });
+    assert.equal(store.readRecoverySnapshot(owner).pipeline.tasks[2].state, "changes_requested");
 
     review.submitTrustedReceipt({ version: 1, review_round_ref: opened.review_round_ref, candidate_digest: opened.candidate_digest, receipt: receipt(opened.review_round_ref, "receipt_re1_stop", "approve") }, { version: 1, reviewer_role: "re1", reviewer_generation: 11, received_at: "2026-09-02T00:03:00.000Z" });
     const correction = { work_task_ref: copy(reviewRef), review_round_ref: copy(opened.review_round_ref), candidate_digest: opened.candidate_digest };
@@ -287,7 +331,7 @@ async function run() {
 
     const audit = await shim.call("recent_head_control_audit", {});
     assert.deepEqual(audit.map((record) => record.action), [
-      "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "read_propagation_stop", "read_propagation_stop", "read_propagation_stop",
+      "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "read_propagation_stop", "read_propagation_stop", "read_propagation_stop", "read_propagation_stop", "read_propagation_stop",
       "queue_local_correction", "retire_batch", "put_batch_manifest", "abandon_batch_manifest", "put_batch_manifest", "freeze_batch_manifest", "abandon_batch_manifest",
     ]);
     assert.ok(audit.every((record) => !Object.hasOwn(record, "detail") && !Object.hasOwn(record, "payload")));
