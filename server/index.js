@@ -765,23 +765,20 @@ function deliveryGitObjectsForProject(projectId) {
   return createDeliveryGitObjectAdapter({
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
-    run_git: (request) => {
-      try {
-        return {
-          ok: true,
-          output: execFileSync("git", request.args, {
-            cwd: request.cwd,
-            encoding: "utf8",
-            stdio: "pipe",
-            timeout: 5000,
-            maxBuffer: 4 * 1024 * 1024,
-            ...(typeof request.input === "string" ? { input: request.input } : {}),
-          }),
-        };
-      } catch {
-        return { ok: false, output: "" };
-      }
-    },
+    // #1066: awaited one call at a time, so the loop keeps serving terminals
+    // and sockets while a candidate composes; the fixed argv, cwd, per-call
+    // bound, and buffer are unchanged and no shell is involved.
+    run_git: (request) => new Promise((resolve) => {
+      const child = require("child_process").execFile("git", request.args, {
+        cwd: request.cwd,
+        encoding: "utf8",
+        timeout: 5000,
+        maxBuffer: 4 * 1024 * 1024,
+      }, (error, stdout) => resolve(error ? { ok: false, output: "" } : { ok: true, output: stdout }));
+      child.stdin.on("error", () => {});
+      if (typeof request.input === "string") child.stdin.end(request.input);
+      else child.stdin.end();
+    }),
     read_delivery_source: (request) => deliverySourceForProject(projectId).readStagedSource(request),
   });
 }
@@ -1041,19 +1038,21 @@ app.post("/api/work-task-review/reconcile", (req, res) => {
 // observes the current registered-clone HEAD; composition only records a
 // deterministic local Git-object proof. Neither endpoint publishes a branch,
 // creates a PR, starts CI, or merges.
-app.post("/api/delivery-candidate/prepare", (req, res) => {
+app.post("/api/delivery-candidate/prepare", async (req, res) => {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   try {
-    return res.json({ ok: true, ...deliveryCandidateRuntime.prepare({ token, body: req.body }) });
+    return res.json({ ok: true, ...(await deliveryCandidateRuntime.prepare({ token, body: req.body })) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_prepare_unavailable" });
   }
 });
 
-app.post("/api/delivery-candidate/compose", (req, res) => {
+// #1066: composition is awaited (one Git call at a time under one deadline),
+// so this request no longer holds the loop for its whole Git chain.
+app.post("/api/delivery-candidate/compose", async (req, res) => {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   try {
-    return res.json({ ok: true, ...deliveryCandidateRuntime.compose({ token, body: req.body }) });
+    return res.json({ ok: true, ...(await deliveryCandidateRuntime.compose({ token, body: req.body })) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_compose_unavailable" });
   }

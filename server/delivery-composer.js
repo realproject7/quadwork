@@ -1,12 +1,13 @@
 "use strict";
 
-// #1060 M2: a closed, synchronous composition proof for a frozen Delivery
-// Candidate manifest.  This module deliberately has no Git, filesystem,
-// subprocess, network, route, or persistence capability.  Every repository
-// observation and every in-memory patch application is a narrow, injected,
-// immutable request.  The caller receives a proof only after the exact base,
-// reviewed candidates, binary full-index patches, tree objects, and final cut
-// all agree.
+// #1060 M2: a closed composition proof for a frozen Delivery Candidate
+// manifest.  This module deliberately has no Git, filesystem, subprocess,
+// network, route, or persistence capability.  Every repository observation
+// and every in-memory patch application is a narrow, injected, immutable
+// request, awaited one at a time (#1066) so the host loop keeps serving.  The
+// caller receives a proof only after the exact base, reviewed candidates,
+// binary full-index patches, tree objects, and final cut all agree, and after
+// every reviewed task and the pinned result are re-observed last.
 
 const crypto = require("node:crypto");
 const {
@@ -117,9 +118,9 @@ function composerOptions(value) {
   }
   return value;
 }
-function call(options, name, request, unavailableCode) {
+async function call(options, name, request, unavailableCode) {
   let response;
-  try { response = options[name](freeze(clone(request))); } catch { fail(unavailableCode, name + " accessor failed"); }
+  try { response = await options[name](freeze(clone(request))); } catch { fail(unavailableCode, name + " accessor failed"); }
   return response;
 }
 
@@ -274,11 +275,11 @@ function commit(value, expectedRepository, expectedSha, code) {
   }
   return { sha: value.sha, tree_sha: value.tree_sha };
 }
-function readCommit(options, repo, value, code) {
-  return commit(call(options, "readCommit", { version: VERSION, repository: repo, sha: value }, "repository_commit_unavailable"), repo, value, code);
+async function readCommit(options, repo, value, code) {
+  return commit(await call(options, "readCommit", { version: VERSION, repository: repo, sha: value }, "repository_commit_unavailable"), repo, value, code);
 }
-function readTree(options, repo, treeSha, code) {
-  return treeSnapshot(call(options, "readTree", { version: VERSION, repository: repo, tree_sha: treeSha }, "repository_tree_unavailable"), repo, treeSha, code);
+async function readTree(options, repo, treeSha, code) {
+  return treeSnapshot(await call(options, "readTree", { version: VERSION, repository: repo, tree_sha: treeSha }, "repository_tree_unavailable"), repo, treeSha, code);
 }
 
 function reviewedTask(value, stage, code) {
@@ -292,7 +293,7 @@ function reviewedTask(value, stage, code) {
   canonicalAbsolutePath(value.source_worktree_path, code);
   return true;
 }
-function readReviewedTask(options, repo, manifest, stage) {
+async function readReviewedTask(options, repo, manifest, stage) {
   const request = {
     version: VERSION,
     repository: repo,
@@ -302,7 +303,7 @@ function readReviewedTask(options, repo, manifest, stage) {
     work_task_ref: clone(stage.work_task_ref),
     candidate_digest: stage.candidate.candidate_digest,
   };
-  const observed = call(options, "readReviewedTask", request, "reviewed_task_metadata_unavailable");
+  const observed = await call(options, "readReviewedTask", request, "reviewed_task_metadata_unavailable");
   reviewedTask(observed, stage, "reviewed_task_metadata_invalid");
 }
 
@@ -329,7 +330,7 @@ function applyResult(value, expected, code) {
   }
   return { result_tree_sha: value.result_tree_sha };
 }
-function applyPatch(options, repo, manifest, stage, patch, input, expectedResult, scope, predecessorHandoffs, code) {
+async function applyPatch(options, repo, manifest, stage, patch, input, expectedResult, scope, predecessorHandoffs, code) {
   const request = {
     version: VERSION,
     repository: repo,
@@ -348,7 +349,7 @@ function applyPatch(options, repo, manifest, stage, patch, input, expectedResult
     patch: clone(patch),
     predecessor_handoffs: predecessorHandoffs.map(clone),
   };
-  const observed = call(options, "applyPatch", request, "composition_apply_unavailable");
+  const observed = await call(options, "applyPatch", request, "composition_apply_unavailable");
   return applyResult(observed, {
     scope,
     input_tree_sha: input.tree_sha,
@@ -531,7 +532,7 @@ function assertProofAgainstManifest(proof, manifestValue, prepared = null) {
   return proof;
 }
 
-function composeDeliveryCandidate(manifestValue, optionsValue) {
+async function composeDeliveryCandidate(manifestValue, optionsValue) {
   const manifest = deliveryManifest(manifestValue);
   const options = composerOptions(optionsValue);
   const ref = manifest.delivery_candidate_ref;
@@ -540,14 +541,14 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
 
   // Read all current review metadata first.  A stale candidate or sealed
   // receipt aborts before this adapter attempts even an injected patch apply.
-  for (const entry of contracts.stages) readReviewedTask(options, repo, manifest, entry.stage);
+  for (const entry of contracts.stages) await readReviewedTask(options, repo, manifest, entry.stage);
 
-  const baseCommit = readCommit(options, repo, ref.base_sha, "delivery_base_commit_invalid");
-  const resultCommit = readCommit(options, repo, ref.result_sha, "delivery_result_commit_invalid");
+  const baseCommit = await readCommit(options, repo, ref.base_sha, "delivery_base_commit_invalid");
+  const resultCommit = await readCommit(options, repo, ref.result_sha, "delivery_result_commit_invalid");
   if (baseCommit.tree_sha !== manifest.evidence.tree.base_tree_sha) fail("delivery_base_tree_mismatch", "pinned base commit tree differs from manifest evidence");
   if (resultCommit.tree_sha !== manifest.evidence.tree.result_tree_sha) fail("delivery_result_tree_mismatch", "pinned result commit tree differs from manifest evidence");
-  const baseTree = readTree(options, repo, baseCommit.tree_sha, "delivery_base_tree_invalid");
-  const resultTree = readTree(options, repo, resultCommit.tree_sha, "delivery_result_tree_invalid");
+  const baseTree = await readTree(options, repo, baseCommit.tree_sha, "delivery_base_tree_invalid");
+  const resultTree = await readTree(options, repo, resultCommit.tree_sha, "delivery_result_tree_invalid");
 
   const deliveryPatchRequest = {
     version: VERSION,
@@ -559,7 +560,7 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
     base_tree_sha: baseTree.tree_sha,
     result_tree_sha: resultTree.tree_sha,
   };
-  const deliveryPatch = binaryPatch(call(options, "readDeliveryPatch", deliveryPatchRequest, "delivery_patch_unavailable"), {
+  const deliveryPatch = binaryPatch(await call(options, "readDeliveryPatch", deliveryPatchRequest, "delivery_patch_unavailable"), {
     scope: "delivery",
     base_sha: ref.base_sha,
     result_sha: ref.result_sha,
@@ -570,14 +571,15 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
   assertPatchMatchesTrees(deliveryPatch, baseTree, resultTree, "delivery_patch_tree_mismatch");
   if (deliveryPatch.patch_digest !== manifest.evidence.patch.patch_digest) fail("delivery_patch_manifest_mismatch", "full delivery patch digest differs from manifest evidence");
 
-  const prepared = contracts.stages.map((entry) => {
+  const prepared = [];
+  for (const entry of contracts.stages) {
     const stage = entry.stage;
     // #1065: a same-repository dependent was built from its predecessor
     // candidate, so its patch is read and verified against that base tree.
     const candidateBase = stage.candidate.base_sha === ref.base_sha ? baseTree
-      : readTree(options, repo, readCommit(options, repo, stage.candidate.base_sha, "candidate_commit_invalid").tree_sha, "candidate_tree_invalid");
-    const candidateCommit = readCommit(options, repo, stage.candidate.candidate_sha, "candidate_commit_invalid");
-    const candidateTree = readTree(options, repo, candidateCommit.tree_sha, "candidate_tree_invalid");
+      : await readTree(options, repo, (await readCommit(options, repo, stage.candidate.base_sha, "candidate_commit_invalid")).tree_sha, "candidate_tree_invalid");
+    const candidateCommit = await readCommit(options, repo, stage.candidate.candidate_sha, "candidate_commit_invalid");
+    const candidateTree = await readTree(options, repo, candidateCommit.tree_sha, "candidate_tree_invalid");
     const request = {
       version: VERSION,
       repository: repo,
@@ -592,7 +594,7 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
       candidate_tree_sha: candidateTree.tree_sha,
       source_worktree_path: stage.candidate.managed_worktree.canonical_path,
     };
-    const patch = binaryPatch(call(options, "readCandidatePatch", request, "candidate_patch_unavailable"), {
+    const patch = binaryPatch(await call(options, "readCandidatePatch", request, "candidate_patch_unavailable"), {
       scope: "candidate",
       base_sha: stage.candidate.base_sha,
       result_sha: stage.candidate.candidate_sha,
@@ -601,8 +603,8 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
       source_worktree_path: stage.candidate.managed_worktree.canonical_path,
     }, "candidate_patch_invalid");
     assertPatchMatchesTrees(patch, candidateBase, candidateTree, "candidate_patch_tree_mismatch");
-    return { ...entry, candidateBase, candidateTree, patch };
-  });
+    prepared.push({ ...entry, candidateBase, candidateTree, patch });
+  }
   assertIndependentPatchOverlap(prepared, contracts.byKey);
   for (let index = 0; index < prepared.length; index += 1) {
     const entry = prepared[index];
@@ -611,7 +613,7 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
     }
   }
 
-  const deliveryApply = applyPatch(options, repo, manifest, null, deliveryPatch, baseTree, resultTree, "delivery_verification", [], "delivery_apply_not_clean");
+  const deliveryApply = await applyPatch(options, repo, manifest, null, deliveryPatch, baseTree, resultTree, "delivery_verification", [], "delivery_apply_not_clean");
   if (deliveryApply.result_tree_sha !== resultTree.tree_sha) fail("delivery_apply_not_clean", "full delivery patch did not produce pinned result tree");
 
   let currentTree = baseTree;
@@ -621,7 +623,7 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
   for (let index = 0; index < prepared.length; index += 1) {
     const entry = prepared[index];
     const stage = entry.stage;
-    const candidateApplied = applyPatch(options, repo, manifest, stage, entry.patch, entry.candidateBase, entry.candidateTree,
+    const candidateApplied = await applyPatch(options, repo, manifest, stage, entry.patch, entry.candidateBase, entry.candidateTree,
       "candidate_verification", [], "candidate_apply_not_clean");
     if (candidateApplied.result_tree_sha !== entry.candidateTree.tree_sha) fail("candidate_apply_not_clean", "candidate patch did not produce exact candidate tree");
 
@@ -633,9 +635,9 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
     }
     const predecessorHandoffs = expectedHandoffs(entry.contract, completed, sequenceByKey);
     const finalOutput = index === prepared.length - 1 ? resultTree : null;
-    const applied = applyPatch(options, repo, manifest, stage, entry.patch, currentTree, finalOutput,
+    const applied = await applyPatch(options, repo, manifest, stage, entry.patch, currentTree, finalOutput,
       "composition", predecessorHandoffs, "composition_apply_not_clean");
-    const outputTree = readTree(options, repo, applied.result_tree_sha, "composition_output_tree_invalid");
+    const outputTree = await readTree(options, repo, applied.result_tree_sha, "composition_output_tree_invalid");
     const expectedTree = expectedAppliedTree(currentTree, entry.patch.files, outputTree.tree_sha);
     if (!same(outputTree.entries, expectedTree.entries)) fail("composition_apply_tree_mismatch", "composition apply changed an unexpected blob or path");
     const step = {
@@ -665,6 +667,14 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
   if (!same(currentTree.entries, resultTree.entries) || currentTree.tree_sha !== resultTree.tree_sha) {
     fail("composition_result_tree_mismatch", "ordered candidate composition does not produce pinned delivery result tree");
   }
+
+  // #1066: the loop yielded at every observation above, so a review or the
+  // registered clone may have changed since the first reads.  Re-observe
+  // every reviewed task and the pinned result last, so the caller's durable
+  // write follows exact-current facts.
+  for (const entry of contracts.stages) await readReviewedTask(options, repo, manifest, entry.stage);
+  const currentResult = await readCommit(options, repo, ref.result_sha, "delivery_result_commit_invalid");
+  if (currentResult.tree_sha !== resultTree.tree_sha) fail("delivery_result_tree_mismatch", "pinned result commit tree changed during composition");
 
   const proof = {
     version: VERSION,

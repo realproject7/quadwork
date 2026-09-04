@@ -10,7 +10,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { execFileSync } = require("node:child_process");
+const { execFile, execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -40,9 +40,13 @@ function rejectsCode(fn, code) { return assert.rejects(fn, (error) => error.code
 
 // Mirrors the `run_git` injection of server/index.js deliveryGitObjectsForProject.
 function runGit(request) {
-  try {
-    return { ok: true, output: execFileSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 4 * 1024 * 1024, ...(typeof request.input === "string" ? { input: request.input } : {}) }) };
-  } catch { return { ok: false, output: "" }; }
+  return new Promise((resolve) => {
+    const child = execFile("git", request.args, { cwd: request.cwd, encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout) => resolve(error ? { ok: false, output: "" } : { ok: true, output: stdout }));
+    child.stdin.on("error", () => {});
+    if (typeof request.input === "string") child.stdin.end(request.input);
+    else child.stdin.end();
+  });
 }
 
 function stage(ref, base_sha, candidate_sha, name) {
@@ -257,7 +261,8 @@ async function main() {
     assert.equal(git(fixture.repository, ["show-ref"]), refsBefore, "the chain moved no ref");
     assert.equal(git(fixture.repository, ["status", "--porcelain", "--untracked-files=all"]), "");
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
-  console.log("delivery-composition-chain.test.js: all assertions passed");
 }
 
-main().catch((error) => { console.error(error); process.exit(1); });
+let finished = false;
+process.on("exit", (code) => { if (!finished && code === 0) { console.error("delivery-composition-chain.test.js: did not run to completion"); process.exitCode = 1; } });
+main().then(() => { finished = true; console.log("delivery-composition-chain.test.js: all assertions passed"); }, (error) => { console.error(error); process.exit(1); });

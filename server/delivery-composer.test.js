@@ -43,6 +43,10 @@ function digest(value) { return crypto.createHash("sha256").update(stable(value)
 function throwsCode(fn, expected) {
   assert.throws(fn, (error) => error instanceof DeliveryComposerError && error.code === expected);
 }
+// #1066: composition is awaited; a refusal is the same typed code, rejected.
+function rejectsCode(fn, expected) {
+  return assert.rejects(fn, (error) => error instanceof DeliveryComposerError && error.code === expected);
+}
 function entry(pathName, blob_sha, mode = "100644") { return { path: pathName, mode, blob_sha }; }
 function tree(tree_sha, entries) { return { tree_sha, entries: entries.map(copy).sort((left, right) => left.path.localeCompare(right.path)) }; }
 function entryMap(value) { return new Map(value.entries.map((item) => [item.path, item])); }
@@ -383,6 +387,7 @@ function createOperations(fixture, overrides = {}) {
   return { operations, calls, applyCalls };
 }
 
+async function main() {
 // A valid frozen integrated cut is completely deterministic, starts exactly
 // at the DeliveryCandidate base, follows manifest order, and never mutates
 // either the manifest or injected request data.
@@ -390,7 +395,7 @@ function createOperations(fixture, overrides = {}) {
   const fixture = buildFixture();
   const input = copy(fixture.manifest);
   const first = createOperations(fixture);
-  const proof = composeDeliveryCandidate(fixture.manifest, first.operations);
+  const proof = await composeDeliveryCandidate(fixture.manifest, first.operations);
   assert.deepEqual(fixture.manifest, input, "composition does not mutate the manifest");
   assert.equal(Object.isFrozen(proof), true);
   assert.equal(assertDeliveryCompositionProof(proof, fixture.manifest), proof);
@@ -410,7 +415,7 @@ function createOperations(fixture, overrides = {}) {
 
   const secondFixture = buildFixture();
   const second = createOperations(secondFixture);
-  const repeated = composeDeliveryCandidate(secondFixture.manifest, second.operations);
+  const repeated = await composeDeliveryCandidate(secondFixture.manifest, second.operations);
   assert.deepEqual(repeated, proof, "same exact objects and patches produce an identical proof");
 }
 
@@ -421,7 +426,7 @@ function createOperations(fixture, overrides = {}) {
 {
   const fixture = buildFixture({ chain: true });
   const operations = createOperations(fixture);
-  const proof = composeDeliveryCandidate(fixture.manifest, operations.operations);
+  const proof = await composeDeliveryCandidate(fixture.manifest, operations.operations);
   assert.equal(proof.steps[1].predecessor_handoffs.length, 1);
   assert.equal(proof.steps[1].predecessor_handoffs[0].work_task_ref.task_key, "alpha");
   const dependencyApply = operations.applyCalls.find((request) => request.scope === "composition" && request.sequence === 2);
@@ -448,7 +453,7 @@ function createOperations(fixture, overrides = {}) {
   // A non-overlapping dependent still chains from, and hands off, alpha.
   const disjoint = buildFixture({ chain: true, overlap: false });
   const disjointOperations = createOperations(disjoint);
-  const disjointProof = composeDeliveryCandidate(disjoint.manifest, disjointOperations.operations);
+  const disjointProof = await composeDeliveryCandidate(disjoint.manifest, disjointOperations.operations);
   assert.deepEqual(disjointProof.steps[1].predecessor_handoffs.map((entry) => entry.work_task_ref.task_key), ["alpha"]);
   assert.deepEqual(disjointProof.steps[1].changed_files.map((file) => file.path), ["server/bravo.js"]);
   assert.equal(disjointOperations.calls.find((call) => call.name === "readCandidatePatch" && call.request.sequence === 2).request.base_sha, alpha_candidate_sha);
@@ -457,7 +462,7 @@ function createOperations(fixture, overrides = {}) {
   // before any apply, even though the change composes cleanly on alpha.
   const undeclared = buildFixture({ chain: true, undeclaredPath: true });
   const undeclaredOperations = createOperations(undeclared);
-  throwsCode(() => composeDeliveryCandidate(undeclared.manifest, undeclaredOperations.operations), "candidate_patch_boundary_violation");
+  await rejectsCode(() => composeDeliveryCandidate(undeclared.manifest, undeclaredOperations.operations), "candidate_patch_boundary_violation");
   assert.equal(undeclaredOperations.applyCalls.length, 0);
 
   // A dependent patch described against the root blob (the pre-#1065 reading)
@@ -471,7 +476,7 @@ function createOperations(fixture, overrides = {}) {
       return recalculatePatch(changed);
     },
   });
-  throwsCode(() => composeDeliveryCandidate(staleFixture.manifest, stale.operations), "candidate_patch_tree_mismatch");
+  await rejectsCode(() => composeDeliveryCandidate(staleFixture.manifest, stale.operations), "candidate_patch_tree_mismatch");
   assert.equal(stale.applyCalls.length, 0);
 
   // Even when an adapter presents a base tree and patch that agree with each
@@ -493,7 +498,7 @@ function createOperations(fixture, overrides = {}) {
       return recalculatePatch(changed);
     },
   });
-  throwsCode(() => composeDeliveryCandidate(driftFixture.manifest, drift.operations), "composition_apply_not_clean");
+  await rejectsCode(() => composeDeliveryCandidate(driftFixture.manifest, drift.operations), "composition_apply_not_clean");
   assert.equal(drift.applyCalls.filter((request) => request.scope === "composition").length, 1, "alpha composed; bravo's composition apply was never requested");
 
   // The final chain output stays pinned to the Delivery Candidate result.
@@ -503,7 +508,7 @@ function createOperations(fixture, overrides = {}) {
       return request.scope === "composition" && request.sequence === 2 ? { ...response, result_tree_sha: intermediate_tree_sha } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(finalFixture.manifest, finalDrift.operations), "composition_apply_not_clean");
+  await rejectsCode(() => composeDeliveryCandidate(finalFixture.manifest, finalDrift.operations), "composition_apply_not_clean");
 }
 
 // Even if a malicious object adapter presents two independent patches with
@@ -512,7 +517,7 @@ function createOperations(fixture, overrides = {}) {
 {
   const fixture = buildFixture({ actualOverlap: true });
   const operations = createOperations(fixture);
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "overlapping_independent_composition_patch");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "overlapping_independent_composition_patch");
   assert.equal(operations.applyCalls.length, 0);
 }
 
@@ -525,7 +530,7 @@ function createOperations(fixture, overrides = {}) {
       return request.sequence === 1 ? { ...response, candidate_sha: "0".repeat(64) } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "stale_reviewed_task_metadata");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "stale_reviewed_task_metadata");
   assert.equal(operations.applyCalls.length, 0);
 }
 
@@ -538,7 +543,7 @@ function createOperations(fixture, overrides = {}) {
       return request.sequence === 1 ? { ...response, patch_digest: "0".repeat(64) } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(invalidDigestFixture.manifest, invalidDigest.operations), "candidate_patch_invalid");
+  await rejectsCode(() => composeDeliveryCandidate(invalidDigestFixture.manifest, invalidDigest.operations), "candidate_patch_invalid");
 
   const pathFixture = buildFixture();
   const pathMismatch = createOperations(pathFixture, {
@@ -547,7 +552,7 @@ function createOperations(fixture, overrides = {}) {
       return recalculatePatch({ ...response, source_worktree_path: response.source_worktree_path.replace("/private/var/", "/var/") });
     },
   });
-  throwsCode(() => composeDeliveryCandidate(pathFixture.manifest, pathMismatch.operations), "candidate_patch_invalid");
+  await rejectsCode(() => composeDeliveryCandidate(pathFixture.manifest, pathMismatch.operations), "candidate_patch_invalid");
 
   const treeFixture = buildFixture();
   const treeMismatch = createOperations(treeFixture, {
@@ -558,7 +563,7 @@ function createOperations(fixture, overrides = {}) {
       return recalculatePatch(changed);
     },
   });
-  throwsCode(() => composeDeliveryCandidate(treeFixture.manifest, treeMismatch.operations), "candidate_patch_tree_mismatch");
+  await rejectsCode(() => composeDeliveryCandidate(treeFixture.manifest, treeMismatch.operations), "candidate_patch_tree_mismatch");
 
   const baseFixture = buildFixture();
   const baseMismatch = createOperations(baseFixture, {
@@ -566,7 +571,7 @@ function createOperations(fixture, overrides = {}) {
       return request.sha === base_sha ? { ...response, tree_sha: "0".repeat(64) } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(baseFixture.manifest, baseMismatch.operations), "delivery_base_tree_mismatch");
+  await rejectsCode(() => composeDeliveryCandidate(baseFixture.manifest, baseMismatch.operations), "delivery_base_tree_mismatch");
 }
 
 // A fuzzy or conflicted injected apply is never accepted as a composition
@@ -578,7 +583,7 @@ function createOperations(fixture, overrides = {}) {
       return request.scope === "delivery_verification" ? { ...response, status: "conflicted" } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "delivery_apply_not_clean");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "delivery_apply_not_clean");
 }
 
 // Intermediate composition output IDs are adapter-observed, but the last
@@ -592,7 +597,7 @@ function createOperations(fixture, overrides = {}) {
         : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "composition_apply_not_clean");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "composition_apply_not_clean");
 }
 
 // The manifest's frozen order is checked by its M1 validator before the
@@ -602,7 +607,7 @@ function createOperations(fixture, overrides = {}) {
   const reordered = copy(fixture.manifest);
   reordered.staged_tasks.reverse();
   const operations = createOperations(fixture);
-  throwsCode(() => composeDeliveryCandidate(reordered, operations.operations), "invalid_delivery_manifest");
+  await rejectsCode(() => composeDeliveryCandidate(reordered, operations.operations), "invalid_delivery_manifest");
   assert.equal(operations.calls.length, 0);
 }
 
@@ -610,7 +615,7 @@ function createOperations(fixture, overrides = {}) {
 // source remains a pure dependency-injected adapter with no host capability.
 {
   const fixture = buildFixture();
-  const proof = composeDeliveryCandidate(fixture.manifest, createOperations(fixture).operations);
+  const proof = await composeDeliveryCandidate(fixture.manifest, createOperations(fixture).operations);
   assert.equal(deliveryCompositionProofDigest(proof), proof.composition_proof_digest);
   const tampered = copy(proof);
   tampered.steps[1].predecessor_handoffs = [{
@@ -633,4 +638,54 @@ function createOperations(fixture, overrides = {}) {
   assert.doesNotMatch(source, /execFile|spawn\(|git\s+apply/);
 }
 
-console.log("delivery-composer.test.js: all assertions passed");
+// #1066: every injected observation is awaited in manifest order, one at a
+// time, and the loop turns between them; a review that changes after the
+// first reads is re-observed last and refuses the proof before it exists.
+{
+  const fixture = buildFixture({ chain: true });
+  const order = [];
+  let turns = 0;
+  const marker = setInterval(() => { turns += 1; }, 0);
+  const operations = createOperations(fixture, {
+    readReviewedTask(request, response) { order.push(`review:${request.sequence}`); return new Promise((resolve) => setImmediate(() => resolve(response))); },
+    applyPatch(request, response) { order.push(`apply:${request.scope}:${request.sequence}`); return new Promise((resolve) => setImmediate(() => resolve(response))); },
+  });
+  const proof = await composeDeliveryCandidate(fixture.manifest, operations.operations);
+  clearInterval(marker);
+  assert.equal(proof.steps.length, 2);
+  assert.ok(turns > 0, `the loop turned ${turns} times while observations were awaited`);
+  assert.deepEqual(order.slice(0, 2), ["review:1", "review:2"], "reviews are read first");
+  assert.deepEqual(order.slice(-2), ["review:1", "review:2"], "reviews are re-read last, after the final composition apply");
+  assert.equal(order.filter((entry) => entry.startsWith("apply:")).length, 5);
+  const lastCommit = operations.calls.at(-1);
+  assert.equal(lastCommit.name, "readCommit");
+  assert.equal(lastCommit.request.sha, result_sha, "the pinned result commit is the last observation before the proof");
+
+  const revoked = buildFixture();
+  let reviewReads = 0;
+  const revokedOperations = createOperations(revoked, {
+    readReviewedTask(request, response) {
+      reviewReads += 1;
+      return reviewReads > 2 && request.sequence === 1 ? { ...response, terminal_review: { ...response.terminal_review, round_digest: "0".repeat(64) } } : response;
+    },
+  });
+  await rejectsCode(() => composeDeliveryCandidate(revoked.manifest, revokedOperations.operations), "stale_reviewed_task_metadata");
+  assert.equal(revokedOperations.applyCalls.filter((request) => request.scope === "composition").length, 2, "the change landed only after every composition apply");
+
+  const moved = buildFixture();
+  let resultReads = 0;
+  const movedOperations = createOperations(moved, {
+    readCommit(request, response) {
+      if (request.sha !== result_sha) return response;
+      resultReads += 1;
+      return resultReads === 2 ? { ...response, tree_sha: intermediate_tree_sha } : response;
+    },
+  });
+  await rejectsCode(() => composeDeliveryCandidate(moved.manifest, movedOperations.operations), "delivery_result_tree_mismatch");
+  assert.equal(resultReads, 2, "the pinned result is re-read once more after composition");
+}
+}
+
+let finished = false;
+process.on("exit", (code) => { if (!finished && code === 0) { console.error("delivery-composer.test.js: did not run to completion"); process.exitCode = 1; } });
+main().then(() => { finished = true; console.log("delivery-composer.test.js: all assertions passed"); }, (error) => { console.error(error); process.exit(1); });

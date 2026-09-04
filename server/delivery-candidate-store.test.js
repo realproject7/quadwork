@@ -182,9 +182,12 @@ function composerOperations(value) {
     },
   };
 }
+// #1066: composition is awaited; the fixture is deterministic, so one proof
+// composed before the blocks run is the exact proof of every fresh fixture.
+let composedProof = null;
 function validContracts() {
   const value = fixture();
-  return { manifest: value.manifest, proof: composeDeliveryCandidate(value.manifest, composerOperations(value)) };
+  return { manifest: value.manifest, proof: copy(composedProof) };
 }
 function temporaryDirectory() { return fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-delivery-store-")); }
 function removeDirectory(directory) { fs.rmSync(directory, { recursive: true, force: true }); }
@@ -195,6 +198,12 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
     expected: expected(contracts.manifest.delivery_candidate_ref, revision), delivery_manifest: copy(contracts.manifest),
     composition_proof: copy(contracts.proof), correlation_id, idempotency_key,
   };
+}
+
+async function main() {
+{
+  const value = fixture();
+  composedProof = await composeDeliveryCandidate(value.manifest, composerOperations(value));
 }
 
 // The state is tied to one full DeliveryCandidateRef, retains canonical
@@ -399,5 +408,8 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
     assert.equal(initial.readSnapshot(ref).revision, 1, "a replacement carrying the original dev+ino is never unlinked by the old writer");
   } finally { removeDirectory(directory); }
 }
+}
 
-console.log("delivery-candidate-store tests passed");
+let finished = false;
+process.on("exit", (code) => { if (!finished && code === 0) { console.error("delivery-candidate-store.test.js: did not run to completion"); process.exitCode = 1; } });
+main().then(() => { finished = true; console.log("delivery-candidate-store tests passed"); }, (error) => { console.error(error); process.exit(1); });

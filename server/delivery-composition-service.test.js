@@ -39,6 +39,11 @@ function digest(value) { return crypto.createHash("sha256").update(stable(value)
 function throwsCode(fn, code) {
   assert.throws(fn, (error) => error instanceof DeliveryCompositionServiceError && error.code === code);
 }
+// #1066: composition is awaited; a refusal is the same typed code, rejected.
+function rejectsCode(fn, code) {
+  return assert.rejects(fn, (error) => error instanceof DeliveryCompositionServiceError && error.code === code);
+}
+function later(value, ms) { return new Promise((resolve) => setTimeout(() => resolve(value), ms)); }
 function entry(pathName, blob_sha) { return { path: pathName, mode: "100644", blob_sha }; }
 function tree(tree_sha, entries) { return { tree_sha, entries: entries.map(copy).sort((a, b) => a.path.localeCompare(b.path)) }; }
 function entryMap(value) { return new Map(value.entries.map((item) => [item.path, item])); }
@@ -141,15 +146,23 @@ function fixture() {
     deliveryPatch,
   };
 }
+// `slow_tree` answers every tree read 40 ms later; `slow_result_recheck`
+// delays only the composer's final re-read of the pinned result commit.
 function operations(value, events, options = {}) {
+  let resultReads = 0;
   function object(name, callback) {
     return (request) => { events.push(`object:${name}`); return callback(request); };
   }
   return {
-    readCommit: object("readCommit", (request) => ({ version: VERSION, repository: REPOSITORY, sha: request.sha, tree_sha: value.commits.get(request.sha) })),
+    readCommit: object("readCommit", (request) => {
+      const response = { version: VERSION, repository: REPOSITORY, sha: request.sha, tree_sha: value.commits.get(request.sha) };
+      if (options.slow_result_recheck && request.sha === RESULT_SHA && (resultReads += 1) === 2) return later(response, 40);
+      return response;
+    }),
     readTree: object("readTree", (request) => {
       const found = value.trees.get(request.tree_sha);
-      return { version: VERSION, repository: REPOSITORY, tree_sha: request.tree_sha, entries: found ? copy(found.entries) : [] };
+      const response = { version: VERSION, repository: REPOSITORY, tree_sha: request.tree_sha, entries: found ? copy(found.entries) : [] };
+      return options.slow_tree ? later(response, 40) : response;
     }),
     readReviewedTask: object("readReviewedTask", (request) => {
       const stage = value.manifest.staged_tasks[request.sequence - 1];
@@ -196,6 +209,7 @@ function service(directoryValue, value, events, settings = {}) {
       return { version: VERSION, head_binding: copy(BINDING), archived };
     },
     repository_objects: operations(value, events, settings),
+    deadline: settings.deadline ?? Date.now() + 30_000,
   });
   return { core, store: actual, storeCalls, archive(value) { archived = value; } };
 }
@@ -212,6 +226,7 @@ function composeInput(value, overrides = {}) {
 let passed = 0;
 function ok(value, message) { assert.ok(value, message); passed += 1; console.log(`  PASS: ${message}`); }
 
+async function main() {
 // Head authorization comes before all durable and repository-object access;
 // every individual object read is re-authorized, then one CAS persists the
 // exact proof from the pending revision-zero manifest.
@@ -224,7 +239,7 @@ function ok(value, message) { assert.ok(value, message); passed += 1; console.lo
     assert.equal(initialized.replayed, false);
     assert.deepEqual(events.slice(0, 4), ["auth:initialize_candidate", "store:read", "auth:initialize_candidate", "store:initialize"]);
     events.length = 0;
-    const composed = runtime.core.composeCandidate(composeInput(value));
+    const composed = await runtime.core.composeCandidate(composeInput(value));
     assert.equal(composed.kind, "delivery_candidate_composed");
     assert.equal(composed.replayed, false);
     assert.equal(composed.record.revision, 1);
@@ -253,9 +268,9 @@ function ok(value, message) { assert.ok(value, message); passed += 1; console.lo
   try {
     const firstEvents = [], first = service(config, value, firstEvents);
     first.core.initializeCandidate(initializeInput(value));
-    first.core.composeCandidate(composeInput(value));
+    await first.core.composeCandidate(composeInput(value));
     const replayEvents = [], second = service(config, value, replayEvents);
-    const replay = second.core.composeCandidate(composeInput(value));
+    const replay = await second.core.composeCandidate(composeInput(value));
     assert.equal(replay.replayed, true);
     assert.equal(replay.record.composition_proof_digest.length, 64);
     assert.deepEqual(replayEvents, ["auth:compose_candidate", "store:read"]);
@@ -278,7 +293,7 @@ function ok(value, message) { assert.ok(value, message); passed += 1; console.lo
     assert.deepEqual(events, []);
     active.core.initializeCandidate(initializeInput(value));
     events.length = 0;
-    throwsCode(() => active.core.composeCandidate(composeInput(value, { expected_revision: 1 })), "stale_delivery_candidate_revision");
+    await rejectsCode(() => active.core.composeCandidate(composeInput(value, { expected_revision: 1 })), "stale_delivery_candidate_revision");
     assert.deepEqual(events, ["auth:compose_candidate", "store:read"]);
     ok(true, "archive, Head, and revision preconditions fail closed before object composition");
   } finally { fs.rmSync(config, { recursive: true, force: true }); }
@@ -291,13 +306,13 @@ function ok(value, message) { assert.ok(value, message); passed += 1; console.lo
   try {
     const bad = service(config, value, events, { bad_patch: true });
     bad.core.initializeCandidate(initializeInput(value));
-    throwsCode(() => bad.core.composeCandidate(composeInput(value)), "delivery_composition_rejected");
+    await rejectsCode(() => bad.core.composeCandidate(composeInput(value)), "delivery_composition_rejected");
     assert.equal(bad.storeCalls.record, 0);
     assert.equal(bad.store.readSnapshot(value.manifest.delivery_candidate_ref).revision, 0);
     const cleanEvents = [], clean = service(config, value, cleanEvents);
-    clean.core.composeCandidate(composeInput(value));
+    await clean.core.composeCandidate(composeInput(value));
     const before = cleanEvents.filter((entry) => entry.startsWith("object:")).length;
-    throwsCode(() => clean.core.composeCandidate(composeInput(value, { idempotency_key: "other-idempotency-1060" })), "delivery_composition_identity_collision");
+    await rejectsCode(() => clean.core.composeCandidate(composeInput(value, { idempotency_key: "other-idempotency-1060" })), "delivery_composition_identity_collision");
     const after = cleanEvents.filter((entry) => entry.startsWith("object:")).length;
     assert.equal(after, before);
     const collisionConfig = directory();
@@ -306,11 +321,50 @@ function ok(value, message) { assert.ok(value, message); passed += 1; console.lo
     });
     try {
       collision.core.initializeCandidate(initializeInput(value));
-      throwsCode(() => collision.core.composeCandidate(composeInput(value)), "delivery_composition_identity_collision");
+      await rejectsCode(() => collision.core.composeCandidate(composeInput(value)), "delivery_composition_identity_collision");
       assert.equal(collision.storeCalls.record, 1);
       assert.equal(collision.store.readSnapshot(value.manifest.delivery_candidate_ref).revision, 0);
     } finally { fs.rmSync(collisionConfig, { recursive: true, force: true }); }
     ok(true, "invalid composition evidence and identity collisions cannot create a second persisted transition");
+  } finally { fs.rmSync(config, { recursive: true, force: true }); }
+}
+
+// #1066: authorization and the one composition deadline are checked around
+// every awaited observation and immediately before the durable write.  A
+// Head that changes while an observation is pending, or a deadline that
+// passes before an observation, during one, or after the last one, ends the
+// composition with its own code and no composed record.
+{
+  const value = fixture(), config = directory();
+  try {
+    const changedEvents = [], changed = service(config, value, changedEvents);
+    changed.core.initializeCandidate(initializeInput(value));
+    const original = changed.core.composeCandidate(composeInput(value));
+    changed.archive(true);
+    await rejectsCode(() => original, "delivery_composition_archived");
+    assert.ok(changedEvents.filter((entry) => entry.startsWith("object:")).length >= 1, "at least one observation was awaited before the Head fact changed");
+    assert.equal(changed.storeCalls.record, 0);
+    assert.equal(changed.store.readSnapshot(value.manifest.delivery_candidate_ref).revision, 0);
+
+    const expiredEvents = [], expired = service(config, value, expiredEvents, { deadline: Date.now() - 1 });
+    await rejectsCode(() => expired.core.composeCandidate(composeInput(value)), "delivery_composition_deadline_exceeded");
+    assert.deepEqual(expiredEvents, ["auth:compose_candidate", "store:read", "auth:compose_candidate", "auth:compose_candidate"],
+      "an expired deadline refuses the first observation after re-proving Head, and no object is observed");
+    assert.equal(expired.storeCalls.record, 0);
+
+    const midEvents = [], mid = service(config, value, midEvents, { slow_tree: true, deadline: Date.now() + 30 });
+    await rejectsCode(() => mid.core.composeCandidate(composeInput(value)), "delivery_composition_deadline_exceeded");
+    const objectEvents = midEvents.filter((entry) => entry.startsWith("object:"));
+    assert.ok(objectEvents.includes("object:readTree") && !objectEvents.includes("object:applyPatch"), `observations stopped at the deadline: ${objectEvents.join(", ")}`);
+    assert.equal(mid.storeCalls.record, 0);
+
+    const lateEvents = [], late = service(config, value, lateEvents, { slow_result_recheck: true, deadline: Date.now() + 30 });
+    await rejectsCode(() => late.core.composeCandidate(composeInput(value)), "delivery_composition_deadline_exceeded");
+    assert.equal(lateEvents.filter((entry) => entry === "object:applyPatch").length, 3, "every observation completed before the deadline passed");
+    assert.equal(lateEvents.at(-1), "auth:compose_candidate", "the pre-write recheck re-proved Head, then refused the late proof");
+    assert.equal(late.storeCalls.record, 0);
+    assert.equal(late.store.readSnapshot(value.manifest.delivery_candidate_ref).revision, 0);
+    ok(true, "a changed Head or a passed deadline around any awaited observation, or before the write, ends composition typed and unrecorded");
   } finally { fs.rmSync(config, { recursive: true, force: true }); }
 }
 
@@ -321,9 +375,14 @@ function ok(value, message) { assert.ok(value, message); passed += 1; console.lo
   try {
     const actual = createDeliveryCandidateStore({ config_dir: config, fs });
     assert.throws(() => createDeliveryCompositionService({
-      binding: BINDING, candidate_store: actual, resolve_head_authorization() {},
+      binding: BINDING, candidate_store: actual, resolve_head_authorization() {}, deadline: Date.now() + 30_000,
       repository_objects: { ...operations(value, []), publish() {} },
     }), (error) => error instanceof DeliveryCompositionServiceError && error.code === "invalid_delivery_composition_service_options");
+    for (const deadline of [undefined, 0, -1, 1.5, "30000"]) {
+      assert.throws(() => createDeliveryCompositionService({
+        binding: BINDING, candidate_store: actual, resolve_head_authorization() {}, repository_objects: operations(value, []), deadline,
+      }), (error) => error instanceof DeliveryCompositionServiceError && error.code === "invalid_delivery_composition_service_options");
+    }
     const source = fs.readFileSync(path.join(__dirname, "delivery-composition-service.js"), "utf8");
     assert.doesNotMatch(source, /require\s*\(\s*["'](?:node:)?(?:fs|path|http|https|child_process|net|process)["']\s*\)/);
     assert.doesNotMatch(source, /require\s*\(\s*["']\.\/(?:routes|index|mcp-chat-shim|file-chat|project-monitor)["']\s*\)/);
@@ -331,5 +390,8 @@ function ok(value, message) { assert.ok(value, message); passed += 1; console.lo
     ok(true, "the service remains a fixed local composition bridge with no runtime or dynamic-action capability");
   } finally { fs.rmSync(config, { recursive: true, force: true }); }
 }
+}
 
-console.log(`\n${passed} passed`);
+let finished = false;
+process.on("exit", (code) => { if (!finished && code === 0) { console.error("delivery-composition-service.test.js: did not run to completion"); process.exitCode = 1; } });
+main().then(() => { finished = true; console.log(`\n${passed} passed`); }, (error) => { console.error(error); process.exit(1); });

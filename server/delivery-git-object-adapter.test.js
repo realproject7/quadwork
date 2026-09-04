@@ -20,6 +20,8 @@ const installation_id = "installation_delivery_git_01";
 const project_id = "quadwork";
 const owner = { installation_id, project_id, role: "head", generation: 4 };
 const manifest_digest_placeholder = "d".repeat(64);
+// #1066: every objects handle runs under one absolute composition deadline.
+const deadline = () => Date.now() + 30_000;
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
 function digest(value) { return crypto.createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex"); }
@@ -36,6 +38,10 @@ function commit(repository, message) {
   git(repository, ["add", "."]);
   git(repository, ["commit", "-m", message]);
   return git(repository, ["rev-parse", "HEAD"]);
+}
+// #1066: adapter refusals are awaited; the typed code is unchanged.
+function rejectsAdapter(fn, code) {
+  return assert.rejects(fn, (error) => error instanceof DeliveryGitObjectAdapterError && error.code === code);
 }
 function stage(ref, base_sha, candidate_sha, pathName) {
   const worktreePath = `/private/var/quadwork/${pathName}-dev`;
@@ -116,7 +122,7 @@ function applyRequest(ref, manifestDigest, scope, sequence, workTaskRef, inputTr
   };
 }
 
-function withRepository(run) {
+async function withRepository(run) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "qw-delivery-git-"));
   const repository = path.join(directory, "web");
   try {
@@ -141,13 +147,14 @@ function withRepository(run) {
     write(repository, "server/a.js", "module.exports = 'candidate-a';\n");
     write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
     const result_sha = commit(repository, "integrated result");
-    return run({ directory, repository, base_sha, candidate_a, candidate_b, result_sha });
+    return await run({ directory, repository, base_sha, candidate_a, candidate_b, result_sha });
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 }
 
-withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
+async function main() {
+await withRepository(async ({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
   const manifest = freezeBatchManifest(buildBatchManifest({
     version: 1,
     installation_id,
@@ -172,19 +179,24 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
     deferred_exclusions: [],
   };
   const calls = [];
+  // The runner resolves on a later loop turn, as the server's does; `delay`
+  // lets one test hold every call long enough for a short deadline to pass.
+  let delay = 0;
   const adapter = createDeliveryGitObjectAdapter({
     repositories: [{ key: "web", repo: "Owner/Web", working_dir: repository, primary: true }],
     primary_agent_cwds: {}, repository_worktrees: {},
     canonicalize_path(request) { return fs.realpathSync(request.path); },
     run_git(request) {
       calls.push(copy({ args: request.args, input: request.input || null }));
-      try {
-        return { ok: true, output: execFileSync("git", request.args, {
-          cwd: request.cwd, encoding: "utf8", input: request.input, timeout: 5000, maxBuffer: 4 * 1024 * 1024,
-        }) };
-      } catch {
-        return { ok: false, output: "" };
-      }
+      return new Promise((resolve) => setTimeout(() => {
+        try {
+          resolve({ ok: true, output: execFileSync("git", request.args, {
+            cwd: request.cwd, encoding: "utf8", input: request.input, timeout: 5000, maxBuffer: 4 * 1024 * 1024,
+          }) });
+        } catch {
+          resolve({ ok: false, output: "" });
+        }
+      }, delay));
     },
     read_delivery_source(request) {
       assert.equal(Object.isFrozen(request), true);
@@ -194,7 +206,7 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
   });
   const refsBefore = git(repository, ["show-ref"]);
 
-  const observed = adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
+  const observed = await adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
   assert.equal(observed.result_sha, result_sha);
   assert.deepEqual(observed.evidence.boundary.paths, ["server/a.js", "server/b.js"]);
   assert.match(observed.evidence.patch.patch_digest, /^[a-f0-9]{64}$/);
@@ -211,7 +223,7 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
     cut_id: deliverySource.cut_id,
   };
   const manifestDigest = manifest_digest_placeholder;
-  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref });
+  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: deadline() });
   const deliveryManifest = buildDeliveryManifest({
     version: 1,
     delivery_candidate_ref: ref,
@@ -222,23 +234,23 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
   }, {
     resolveRegisteredRepository() { return copy(deliverySource.registered_repository); },
   });
-  const base = objects.readCommit({ version: 1, repository: "owner/web", sha: base_sha });
-  const result = objects.readCommit({ version: 1, repository: "owner/web", sha: result_sha });
-  const candidateA = objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_a });
-  const candidateB = objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_b });
-  const baseTree = objects.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha });
-  const resultTree = objects.readTree({ version: 1, repository: "owner/web", tree_sha: result.tree_sha });
+  const base = await objects.readCommit({ version: 1, repository: "owner/web", sha: base_sha });
+  const result = await objects.readCommit({ version: 1, repository: "owner/web", sha: result_sha });
+  const candidateA = await objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_a });
+  const candidateB = await objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_b });
+  const baseTree = await objects.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha });
+  const resultTree = await objects.readTree({ version: 1, repository: "owner/web", tree_sha: result.tree_sha });
   assert.equal(baseTree.entries.length, 2);
   assert.equal(resultTree.entries.length, 2);
 
-  const fullPatch = objects.readDeliveryPatch({
+  const fullPatch = await objects.readDeliveryPatch({
     version: 1, repository: "owner/web", delivery_candidate_ref: ref, delivery_manifest_digest: manifestDigest,
     base_sha, result_sha, base_tree_sha: base.tree_sha, result_tree_sha: result.tree_sha,
   });
   assert.equal(fullPatch.files.length, 2);
   assert.ok(fullPatch.files.every((entry) => entry.binary_delta.startsWith("GIT binary patch\n")));
-  const patchA = objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[0].ref, stages[0], base.tree_sha, candidateA.tree_sha, 1));
-  const patchB = objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref, stages[1], base.tree_sha, candidateB.tree_sha, 2));
+  const patchA = await objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[0].ref, stages[0], base.tree_sha, candidateA.tree_sha, 1));
+  const patchB = await objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref, stages[1], base.tree_sha, candidateB.tree_sha, 2));
   assert.equal(patchA.files[0].path, "server/a.js");
   assert.equal(patchB.files[0].path, "server/b.js");
 
@@ -249,14 +261,14 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
   assert.equal(reviewed.candidate_sha, candidate_a);
   assert.equal(reviewed.source_worktree_path, stages[0].candidate.managed_worktree.canonical_path);
 
-  const fullApplied = objects.applyPatch(applyRequest(ref, manifestDigest, "delivery_verification", 0, null, base.tree_sha, result.tree_sha, fullPatch));
+  const fullApplied = await objects.applyPatch(applyRequest(ref, manifestDigest, "delivery_verification", 0, null, base.tree_sha, result.tree_sha, fullPatch));
   assert.equal(fullApplied.result_tree_sha, result.tree_sha);
-  const candidateApplied = objects.applyPatch(applyRequest(ref, manifestDigest, "candidate_verification", 1, manifest.tasks[0].ref, base.tree_sha, candidateA.tree_sha, patchA));
+  const candidateApplied = await objects.applyPatch(applyRequest(ref, manifestDigest, "candidate_verification", 1, manifest.tasks[0].ref, base.tree_sha, candidateA.tree_sha, patchA));
   assert.equal(candidateApplied.result_tree_sha, candidateA.tree_sha);
-  const first = objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA));
-  const final = objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, first.result_tree_sha, result.tree_sha, patchB));
+  const first = await objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA));
+  const final = await objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, first.result_tree_sha, result.tree_sha, patchB));
   assert.equal(final.result_tree_sha, result.tree_sha);
-  const proof = composeDeliveryCandidate(deliveryManifest, objects);
+  const proof = await composeDeliveryCandidate(deliveryManifest, objects);
   assert.equal(proof.result.commit_sha, result_sha);
   assert.equal(proof.steps.length, 2);
   assert.equal(git(repository, ["status", "--porcelain", "--untracked-files=all"]), "");
@@ -266,16 +278,43 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
   console.log("  PASS: registered Git adapter derives evidence and composes only unattached tree objects from native SHA-1 commits");
 
   write(repository, "untracked.txt", "dirty\n");
-  assert.throws(() => objects.readCommit({ version: 1, repository: "owner/web", sha: base_sha }),
-    (error) => error instanceof DeliveryGitObjectAdapterError && error.code === "delivery_git_commit_dirty");
+  await rejectsAdapter(() => objects.readCommit({ version: 1, repository: "owner/web", sha: base_sha }), "delivery_git_commit_dirty");
   fs.unlinkSync(path.join(repository, "untracked.txt"));
   console.log("  PASS: every object operation fails closed when the registered base clone becomes dirty");
+
+  // #1066: Git calls run one at a time on later loop turns, and the handle's
+  // deadline stops further calls: an expired handle spawns nothing, and a
+  // handle that expires mid-operation refuses the next call and never yields
+  // a tree.  The composer surfaces that as the accessor's unavailability.
+  assert.throws(() => adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref }),
+    (error) => error instanceof DeliveryGitObjectAdapterError && error.code === "invalid_delivery_git_objects_request");
+  assert.throws(() => adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: 0 }),
+    (error) => error instanceof DeliveryGitObjectAdapterError && error.code === "invalid_delivery_git_objects_request");
+  const expired = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: Date.now() - 1 });
+  const before = calls.length;
+  await rejectsAdapter(() => expired.readCommit({ version: 1, repository: "owner/web", sha: base_sha }), "delivery_git_deadline_exceeded");
+  await rejectsAdapter(() => expired.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA)), "delivery_git_deadline_exceeded");
+  assert.equal(calls.length, before, "an expired handle spawns no Git process");
+  delay = 25;
+  const short = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: Date.now() + 60 });
+  await rejectsAdapter(() => short.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA)), "delivery_git_deadline_exceeded");
+  const spawned = calls.length - before;
+  assert.ok(spawned >= 1 && spawned <= 3, `the clone recheck stopped at the deadline after ${spawned} of its 4 calls`);
+  assert.ok(!calls.slice(before).some((entry) => entry.args[0] === "mktree"), "no tree object was written after the deadline");
+  await rejectsAdapter(() => short.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha }), "delivery_git_deadline_exceeded");
+  assert.equal(calls.length, before + spawned, "every later call on the expired handle is refused before spawning");
+  const stalled = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: Date.now() + 60 });
+  await assert.rejects(() => composeDeliveryCandidate(deliveryManifest, stalled),
+    (error) => error instanceof DeliveryComposerError && error.code === "repository_commit_unavailable");
+  delay = 0;
+  assert.equal(git(repository, ["show-ref"]), refsBefore, "deadline refusals moved no ref");
+  console.log("  PASS: the objects handle deadline refuses further Git calls before they spawn, mid-operation and for the composer");
 });
 
 // #1065: the reviewed chain the pipeline actually produces.  Candidate B is
 // committed on top of candidate A (its base), rewrites the file A changed, and
 // the registered result HEAD is exactly that composition.
-function withChainRepository(run, { resultDrift = false } = {}) {
+async function withChainRepository(run, { resultDrift = false } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "qw-delivery-git-chain-"));
   const repository = path.join(directory, "web");
   try {
@@ -307,7 +346,7 @@ function withChainRepository(run, { resultDrift = false } = {}) {
     write(repository, "server/a.js", "module.exports = 'candidate-b';\n");
     if (!resultDrift) write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
     const result_sha = commit(repository, "integrated chain result");
-    return run({ directory, repository, base_sha, candidate_a, candidate_b, candidate_b_off_root, result_sha });
+    return await run({ directory, repository, base_sha, candidate_a, candidate_b, candidate_b_off_root, result_sha });
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -351,7 +390,7 @@ function chainAdapter(repository, deliverySource) {
   return { adapter, calls };
 }
 
-withChainRepository(({ repository, base_sha, candidate_a, candidate_b, candidate_b_off_root, result_sha }) => {
+await withChainRepository(async ({ repository, base_sha, candidate_a, candidate_b, candidate_b_off_root, result_sha }) => {
   const manifest = chainManifest();
   const stages = [stage(manifest.tasks[0].ref, base_sha, candidate_a, "a"), stage(manifest.tasks[1].ref, candidate_a, candidate_b, "b")];
   const deliverySource = {
@@ -367,7 +406,7 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, candidate
   const { adapter, calls } = chainAdapter(repository, deliverySource);
   const refsBefore = git(repository, ["show-ref"]);
 
-  const observed = adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
+  const observed = await adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
   assert.equal(observed.result_sha, result_sha);
   assert.deepEqual(observed.evidence.boundary.paths, ["server/a.js", "server/b.js"], "an overlapping dependent boundary is declared once");
 
@@ -379,8 +418,8 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, candidate
     version: 1, delivery_candidate_ref: ref, frozen_batch_manifest: manifest, staged_tasks: copy(stages), deferred_exclusions: [], evidence: copy(observed.evidence),
   }, { resolveRegisteredRepository() { return copy(deliverySource.registered_repository); } });
   assert.equal(deliveryManifest.staged_tasks[1].candidate.base_sha, candidate_a);
-  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref });
-  const proof = composeDeliveryCandidate(deliveryManifest, objects);
+  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: deadline() });
+  const proof = await composeDeliveryCandidate(deliveryManifest, objects);
   assert.equal(proof.result.commit_sha, result_sha);
   assert.deepEqual(proof.steps.map((step) => step.predecessor_handoffs.map((entry) => entry.work_task_ref.task_key)), [[], ["a"]]);
   assert.equal(proof.steps[1].candidate_sha, candidate_b);
@@ -392,24 +431,23 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, candidate
   console.log("  PASS: registered Git adapter composes a pipeline-built same-repository dependent chain from native commits");
 
   // #1065 negative controls against real Git objects.
-  const throwsAdapter = (fn, code) => assert.throws(fn, (error) => error instanceof DeliveryGitObjectAdapterError && error.code === code);
   const manifestDigest = deliveryManifest.delivery_manifest_digest;
-  const base = objects.readCommit({ version: 1, repository: "owner/web", sha: base_sha });
-  const candidateA = objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_a });
-  const candidateB = objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_b });
-  const baseTree = objects.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha });
-  const patchA = objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[0].ref, stages[0], base.tree_sha, candidateA.tree_sha, 1));
-  const patchB = objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref, stages[1], candidateA.tree_sha, candidateB.tree_sha, 2));
+  const base = await objects.readCommit({ version: 1, repository: "owner/web", sha: base_sha });
+  const candidateA = await objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_a });
+  const candidateB = await objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_b });
+  const baseTree = await objects.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha });
+  const patchA = await objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[0].ref, stages[0], base.tree_sha, candidateA.tree_sha, 1));
+  const patchB = await objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref, stages[1], candidateA.tree_sha, candidateB.tree_sha, 2));
   assert.deepEqual(patchB.files.map((file) => file.path), ["server/a.js", "server/b.js"]);
 
   // The dependent's patch cannot be requested against the root base.
-  throwsAdapter(() => objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref,
+  await rejectsAdapter(() => objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref,
     { candidate: { ...stages[1].candidate, base_sha } }, base.tree_sha, candidateB.tree_sha, 2)), "delivery_git_candidate_patch_stale");
 
   // A stale `before` blob: B described against the root blob of server/a.js
   // (the pre-#1065 reading) does not apply onto the accumulated tree after A,
   // while B described against A's blob does and yields the pinned result.
-  const afterA = objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA));
+  const afterA = await objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA));
   const stale = {
     ...copy(patchB), base_sha, base_tree_sha: base.tree_sha,
     files: patchB.files.map((file) => file.path === "server/a.js"
@@ -419,28 +457,28 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, candidate
     version: stale.version, format: stale.format, scope: stale.scope, base_sha: stale.base_sha, result_sha: stale.result_sha,
     base_tree_sha: stale.base_tree_sha, result_tree_sha: stale.result_tree_sha, source_worktree_path: stale.source_worktree_path, files: stale.files,
   }), "utf8").digest("hex");
-  throwsAdapter(() => objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, null, stale)), "delivery_git_apply_not_clean");
-  const composed = objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, null, patchB));
-  assert.equal(composed.result_tree_sha, objects.readCommit({ version: 1, repository: "owner/web", sha: result_sha }).tree_sha);
+  await rejectsAdapter(() => objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, null, stale)), "delivery_git_apply_not_clean");
+  const composed = await objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, null, patchB));
+  assert.equal(composed.result_tree_sha, (await objects.readCommit({ version: 1, repository: "owner/web", sha: result_sha })).tree_sha);
 
   // The final composed tree stays pinned to the expected result object.
-  throwsAdapter(() => objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, candidateA.tree_sha, patchB)), "delivery_git_apply_not_clean");
+  await rejectsAdapter(() => objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, candidateA.tree_sha, patchB)), "delivery_git_apply_not_clean");
 
   // A dependent staged on the root base is the state the pipeline can never
   // produce; evidence derivation refuses it before any object is read for it.
   const rootBased = { ...copy(deliverySource), staged_tasks: [copy(stages[0]), stage(manifest.tasks[1].ref, base_sha, candidate_b, "b")] };
-  throwsAdapter(() => adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: rootBased }), "delivery_git_evidence_candidate_invalid");
+  await rejectsAdapter(() => adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: rootBased }), "delivery_git_evidence_candidate_invalid");
   // A candidate that claims base A but was not committed on top of A is not
   // the reviewed chain either, even with identical content.
   const offRoot = { ...copy(deliverySource), staged_tasks: [copy(stages[0]), stage(manifest.tasks[1].ref, candidate_a, candidate_b_off_root, "b")] };
-  throwsAdapter(() => adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: offRoot }), "delivery_git_evidence_candidate_invalid");
+  await rejectsAdapter(() => adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: offRoot }), "delivery_git_evidence_candidate_invalid");
   assert.equal(git(repository, ["show-ref"]), refsBefore, "negative controls did not move a ref");
   console.log("  PASS: real Git objects refuse a root-based dependent, a stale before blob, and an unpinned final tree");
 });
 
 // #1065: a registered result HEAD that is not the chain composition (B's
 // server/b.js change is missing) fails closed inside the composer.
-withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
+await withChainRepository(async ({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
   const manifest = chainManifest();
   const stages = [stage(manifest.tasks[0].ref, base_sha, candidate_a, "a"), stage(manifest.tasks[1].ref, candidate_a, candidate_b, "b")];
   const deliverySource = {
@@ -449,7 +487,7 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sh
     frozen_batch_manifest: manifest, delivery_mode: "integrated", cut_id: "cut_delivery_git_chain_02", base_sha, staged_tasks: stages, deferred_exclusions: [],
   };
   const { adapter } = chainAdapter(repository, deliverySource);
-  const observed = adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
+  const observed = await adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
   assert.equal(observed.result_sha, result_sha);
   const ref = {
     version: 1, installation_id, project_id, repository_key: "web", batch_manifest_digest: manifest.manifest_digest,
@@ -458,8 +496,8 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sh
   const deliveryManifest = buildDeliveryManifest({
     version: 1, delivery_candidate_ref: ref, frozen_batch_manifest: manifest, staged_tasks: copy(stages), deferred_exclusions: [], evidence: copy(observed.evidence),
   }, { resolveRegisteredRepository() { return copy(deliverySource.registered_repository); } });
-  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref });
-  assert.throws(() => composeDeliveryCandidate(deliveryManifest, objects),
+  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: deadline() });
+  await assert.rejects(() => composeDeliveryCandidate(deliveryManifest, objects),
     (error) => error instanceof DeliveryComposerError && error.code === "composition_apply_unavailable");
   console.log("  PASS: a result HEAD that is not the chain composition cannot obtain a composition proof");
 }, { resultDrift: true });
@@ -470,5 +508,8 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sh
   assert.doesNotMatch(source, /(?:execFile|spawn\s*\(|writeFile|unlinkSync|["'](?:checkout|add|commit|reset|merge|push|pull)["'])/);
   console.log("  PASS: Git-object adapter has no direct process/filesystem or ref/worktree/publication authority");
 }
+}
 
-console.log("delivery-git-object-adapter.test.js: all assertions passed");
+let finished = false;
+process.on("exit", (code) => { if (!finished && code === 0) { console.error("delivery-git-object-adapter.test.js: did not run to completion"); process.exitCode = 1; } });
+main().then(() => { finished = true; console.log("delivery-git-object-adapter.test.js: all assertions passed"); }, (error) => { console.error(error); process.exit(1); });
