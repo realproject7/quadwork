@@ -557,6 +557,34 @@ withDirectory((directory) => {
   ok(true, "a replacement lock carrying the original dev+ino is never unlinked by the original writer");
 });
 
+// #1069: a manifest that was put but never frozen wedges the domain.  Put
+// demands `empty`, retirement demands `frozen`, and nothing else touches the
+// `manifest` stage, so Head can neither replace nor walk away from a manifest
+// it decided against, and no successor can be started for the project.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  const decidedAgainst = manifest();
+  const put = current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(decidedAgainst) }));
+  assert.equal(put.revision, 1);
+  assert.equal(put.manifest_frozen, false);
+  const successor = copy(reviewManifest());
+  assert.notEqual(successor.manifest_digest, decidedAgainst.manifest_digest);
+  throwsCode(() => current.put_batch_manifest(request("put_batch_manifest", 1, { manifest: copy(successor) }, { correlation_id: "corr_wedged_put", idempotency_key: "idem_wedged_put" })),
+    "head_control_work_task_invalid_transition");
+  throwsCode(() => current.retire_batch(request("retire_batch", 1, null, { correlation_id: "corr_wedged_retire", idempotency_key: "idem_wedged_retire" })),
+    "head_control_work_task_invalid_transition");
+  const wedged = current.get_pipeline_status(request("get_pipeline_status", null));
+  assert.equal(wedged.revision, 1);
+  assert.equal(wedged.manifest_digest, decidedAgainst.manifest_digest);
+  const abandoned = current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null));
+  assert.deepEqual(abandoned, { revision: 2, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+  const replaced = current.put_batch_manifest(request("put_batch_manifest", 2, { manifest: copy(successor) }, { correlation_id: "corr_successor_put", idempotency_key: "idem_successor_put" }));
+  assert.equal(replaced.revision, 3);
+  assert.equal(replaced.manifest_digest, successor.manifest_digest);
+  ok(true, "Head can abandon a never-frozen manifest it decided against so a successor can be put");
+});
+
 const source = fs.readFileSync(path.join(__dirname, "head-control-work-task-domain.js"), "utf8");
 assert.doesNotMatch(source, /head-control-audit-store|require\s*\(\s*["'](?:node:)?(?:http|https|net|child_process)["']\s*\)/);
 assert.doesNotMatch(source, /(?:setInterval\s*\(|setTimeout\s*\(|publish_delivery|createServer|registerAction)/);
