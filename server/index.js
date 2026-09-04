@@ -3881,10 +3881,10 @@ function syncTriggersFromConfig() {
 }
 
 // #516: server-side batch-completion poller. Checks every 30s whether
-// any trigger_auto project's batch is complete, and auto-stops the
-// trigger (plus caffeinate when no triggers remain). This runs
-// independently of the trigger tick interval, so completion is
-// detected within 30s even if the operator is on a different page.
+// any monitor-enabled or bridge-auto project's batch is complete, and
+// clears the monitor's conditions (releasing caffeinate with it). This
+// runs on its own interval, so completion is detected within 30s even
+// if the operator is on a different page.
 // #518: also handles telegram_auto / discord_auto bridge lifecycle
 // (both start and stop) so bridges respond to batch transitions
 // even when the operator is viewing a different project page.
