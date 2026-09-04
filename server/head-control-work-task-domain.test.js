@@ -16,6 +16,7 @@ const {
 } = require("./work-task-pipeline");
 const {
   createWorkTaskPipelineStore,
+  workTaskPipelineStorePath,
 } = require("./work-task-pipeline-store");
 const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
 const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
@@ -525,6 +526,45 @@ withDirectory((directory) => {
   assert.deepEqual(recovered.get_pipeline_status(request("get_pipeline_status", null)), { revision: 3, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
   assert.equal(recovered.put_batch_manifest(request("put_batch_manifest", 3, { manifest: copy(manifest()) }, { correlation_id: "corr_put_healed", idempotency_key: "idem_put_healed" })).revision, 4);
   ok(true, "an interrupted retirement heals to empty from the retired record and accepts a successor manifest");
+});
+
+// #1071: `manifestDigest` covers only the version, identity, delivery mode and
+// task refs, so a successor batch whose content repeats an already-retired
+// predecessor carries the exact same manifest digest.  If that successor's own
+// active store record is lost — a frozen store write that did not survive the
+// crash, or a partially restored config directory — recovery must not read the
+// predecessor's archived retired record as proof that THIS batch was retired.
+// Nothing retired the successor, so recovery has to fail closed and leave the
+// frozen state on disk instead of emptying it from historical content.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  const owner = { installation_id: binding.installation_id, project_id: binding.project_id };
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  const predecessor = manifest();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(predecessor) }));
+  current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
+  assert.equal(current.retire_batch(request("retire_batch", 2, null)).revision, 3);
+  assert.equal(store.readRetiredSnapshots(owner).length, 1);
+  const successor = manifest();
+  assert.equal(successor.manifest_digest, predecessor.manifest_digest,
+    "a same-content successor shares its retired predecessor's manifest digest");
+  current.put_batch_manifest(request("put_batch_manifest", 3, { manifest: copy(successor) },
+    { correlation_id: "corr_put_same_content", idempotency_key: "idem_put_same_content" }));
+  const frozenSuccessor = current.freeze_batch_manifest(request("freeze_batch_manifest", 4, null,
+    { correlation_id: "corr_freeze_same_content", idempotency_key: "idem_freeze_same_content" }));
+  assert.equal(frozenSuccessor.revision, 5);
+  assert.equal(frozenSuccessor.manifest_frozen, true);
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.pipeline_digest, frozenSuccessor.pipeline_digest);
+  fs.unlinkSync(workTaskPipelineStorePath(directory, owner));
+  throwsCode(() => domain(directory).get_pipeline_status(request("get_pipeline_status", null, null,
+    { correlation_id: "corr_status_lost", idempotency_key: "idem_status_lost" })), "head_control_work_task_pipeline_missing");
+  const persisted = fs.readFileSync(headControlWorkTaskDomainPath(directory, binding), "utf8");
+  assert.match(persisted, /"stage":"frozen"/);
+  assert.match(persisted, /"revision":5/);
+  assert.match(persisted, new RegExp(successor.manifest_digest));
+  assert.equal(store.readRetiredSnapshots(owner).length, 1, "the predecessor's retired record is untouched");
+  ok(true, "a same-content successor whose active store is lost fails closed instead of being retired by its predecessor's record");
 });
 
 // Linux reuses inode numbers eagerly, so a lock replaced after this writer
