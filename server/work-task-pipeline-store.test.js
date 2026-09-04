@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -99,12 +100,23 @@ function persist(store, state, nextEvent, terminal_disposition = null) {
   const plan = planWorkTaskPipelineEvent(state.pipeline, nextEvent);
   return store.applyPlan({ expected: currentExpected(state), plan, terminal_disposition });
 }
-function candidateFor(ref) {
+// Mirrors the module's stable digest so a test can write a record in an older
+// persisted shape whose pipeline_digest still verifies.
+function stable(value) {
+  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+function redigest(pipeline) {
+  const { pipeline_digest, ...payload } = pipeline;
+  return { ...payload, pipeline_digest: crypto.createHash("sha256").update(stable(payload), "utf8").digest("hex") };
+}
+function candidateFor(ref, sha = candidate_sha) {
   return buildWorkTaskCandidate({
     version: 1,
     work_task_ref: copy(ref),
     base_sha,
-    candidate_sha,
+    candidate_sha: sha,
     branch: "task/work-task-build",
     worktree: { repository_key: "web", worktree_id: "wt_build_01", path: "/var/folders/quadwork/task-build" },
   }, {
@@ -154,6 +166,139 @@ withDirectory((directory) => {
   assert.equal(next.pipeline.tasks[0].state, "building");
   throwsCode(() => store.applyPlan({ expected: currentExpected(state), plan, terminal_disposition: null }), "stale_work_task_pipeline_store_precondition");
   assert.deepEqual(store.readRecoverySnapshot(owner), next);
+});
+
+// #1070: the per-task correction count is persisted as its own fact. It
+// survives every corrected candidate (which clears the checkpoint that used to
+// carry it), a process restart, and a competing writer; the fourth correction
+// is refused before the store is touched, even for a plan forged past planning.
+withDirectory((directory) => {
+  let { store, state } = initialized(directory);
+  const ref = state.manifest.tasks[0].ref;
+  const statePath = workTaskPipelineStorePath(directory, owner);
+  const pipelineCode = (fn, code) => assert.throws(fn, (error) => error.code === code);
+  let candidate = candidateFor(ref);
+  state = persist(store, state, event("assign_build", "cap_build_0", { work_task_ref: copy(ref), assignment_id: "cap_assignment_0" }));
+  state = persist(store, state, event("record_candidate", "cap_candidate_0", { assignment_id: "cap_assignment_0", candidate }));
+  const requestChanges = (round) => {
+    const review = { work_task_ref: copy(ref), review_round_id: `cap_round_${round}`, candidate_digest: candidate.candidate_digest };
+    state = persist(store, state, event("assign_independent_review", `cap_review_${round}`, review));
+    state = persist(store, state, event("record_review_verdict", `cap_verdict_${round}`, { ...review, verdict: "changes_requested" }));
+    state = persist(store, state, event("reconcile_review", `cap_reconcile_${round}`, { ...review, resolution: "changes_requested" }));
+  };
+  const correction = (round, suffix = "") => event("queue_local_correction", `cap_checkpoint_${round}${suffix}`, { work_task_ref: copy(ref), checkpoint_id: `cap_checkpoint_id_${round}${suffix}` });
+  for (const round of [1, 2, 3]) {
+    requestChanges(round);
+    const contested = currentExpected(state);
+    const winner = planWorkTaskPipelineEvent(state.pipeline, correction(round));
+    const rival = planWorkTaskPipelineEvent(state.pipeline, correction(round, "_rival"));
+    state = store.applyPlan({ expected: contested, plan: winner, terminal_disposition: null });
+    assert.deepEqual(state.pipeline.tasks[0].correction, { checkpoint_id: `cap_checkpoint_id_${round}`, count: round });
+    assert.equal(state.pipeline.tasks[0].correction_count, round);
+    // The rival planned from the same snapshot loses the compare-and-swap; a
+    // rival or a replay re-planned against the winner's state finds no change
+    // request left to spend. The count moved by exactly one.
+    throwsCode(() => store.applyPlan({ expected: contested, plan: rival, terminal_disposition: null }), "stale_work_task_pipeline_store_precondition");
+    throwsCode(() => store.applyPlan({ expected: currentExpected(state), plan: rival, terminal_disposition: null }), "stale_or_invalid_work_task_pipeline_store_plan");
+    throwsCode(() => store.applyPlan({ expected: contested, plan: winner, terminal_disposition: null }), "stale_work_task_pipeline_store_precondition");
+    pipelineCode(() => planWorkTaskPipelineEvent(state.pipeline, correction(round)), "duplicate_work_task_pipeline_event");
+    assert.deepEqual(store.readRecoverySnapshot(owner), state);
+    candidate = candidateFor(ref, "cde"[round - 1].repeat(64));
+    state = persist(store, state, event("assign_build", `cap_build_${round}`, { work_task_ref: copy(ref), assignment_id: `cap_assignment_${round}` }));
+    state = persist(store, state, event("record_candidate", `cap_candidate_${round}`, { assignment_id: `cap_assignment_${round}`, candidate }));
+    const restarted = createWorkTaskPipelineStore({ config_dir: directory, fs }).readRecoverySnapshot(owner);
+    assert.deepEqual(restarted, state);
+    assert.equal(restarted.pipeline.tasks[0].correction, null);
+    assert.equal(restarted.pipeline.tasks[0].correction_count, round);
+  }
+  assert.equal(state.pipeline.history.filter((entry) => entry.kind === "queue_local_correction").length, 3);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"correction_count":3/);
+  requestChanges(4);
+  pipelineCode(() => planWorkTaskPipelineEvent(state.pipeline, correction(4)), "work_task_checkpoint_limit");
+  // A plan that skipped planning is re-derived inside the writer lock and
+  // refused there; no temporary file is written and no rename happens.
+  const forged = {
+    version: 1,
+    transaction: "work_task_pipeline",
+    precondition: { pipeline_digest: state.pipeline.pipeline_digest, manifest_digest: state.manifest.manifest_digest, history_length: state.pipeline.history.length, manifest_frozen: true, archived: false },
+    event: correction(4),
+    effects: [{ work_task_ref: copy(ref), from_state: "changes_requested", to_state: "queued" }],
+  };
+  const writes = [];
+  const countingFs = Object.create(fs);
+  // The writer lock record is written through its descriptor; only a path
+  // target is a state or temporary file write.
+  countingFs.writeFileSync = (target, ...rest) => { if (typeof target === "string") writes.push(target); return fs.writeFileSync(target, ...rest); };
+  countingFs.renameSync = (from, to) => { writes.push(String(to)); return fs.renameSync(from, to); };
+  const counting = createWorkTaskPipelineStore({ config_dir: directory, fs: countingFs });
+  const bytes = fs.readFileSync(statePath);
+  throwsCode(() => counting.applyPlan({ expected: currentExpected(state), plan: forged, terminal_disposition: null }), "stale_or_invalid_work_task_pipeline_store_plan");
+  assert.deepEqual(writes, []);
+  assert.equal(fs.readFileSync(statePath).equals(bytes), true);
+  assert.deepEqual(counting.readRecoverySnapshot(owner), state);
+  assert.equal(state.pipeline.tasks[0].correction_count, 3);
+  // Positive control: the same wrapped fs records an admitted plan's write.
+  state = persist(counting, state, event("block", "cap_block", { work_task_ref: copy(ref), block_code: "validation" }));
+  assert.equal(writes.length, 2);
+  assert.equal(writes[0].startsWith(`${statePath}.`) && writes[0].endsWith(".tmp"), true);
+  assert.equal(writes[1], statePath);
+  assert.equal(state.pipeline.tasks[0].correction_count, 3);
+});
+
+// #1070: a record persisted before `correction_count` existed stays readable
+// under its original digest. Such a slot is read with the pre-#1070 meaning
+// (the active checkpoint's count, else zero) and the field is written on the
+// next applied plan, so the cap continues from what the old record could prove.
+withDirectory((directory) => {
+  let { store, state } = initialized(directory);
+  const ref = state.manifest.tasks[0].ref;
+  const statePath = workTaskPipelineStorePath(directory, owner);
+  let candidate = candidateFor(ref);
+  state = persist(store, state, event("assign_build", "legacy_build_0", { work_task_ref: copy(ref), assignment_id: "legacy_assignment_0" }));
+  state = persist(store, state, event("record_candidate", "legacy_candidate_0", { assignment_id: "legacy_assignment_0", candidate }));
+  const requestChanges = (round) => {
+    const review = { work_task_ref: copy(ref), review_round_id: `legacy_round_${round}`, candidate_digest: candidate.candidate_digest };
+    state = persist(store, state, event("assign_independent_review", `legacy_review_${round}`, review));
+    state = persist(store, state, event("record_review_verdict", `legacy_verdict_${round}`, { ...review, verdict: "changes_requested" }));
+    state = persist(store, state, event("reconcile_review", `legacy_reconcile_${round}`, { ...review, resolution: "changes_requested" }));
+    state = persist(store, state, event("queue_local_correction", `legacy_checkpoint_${round}`, { work_task_ref: copy(ref), checkpoint_id: `legacy_checkpoint_id_${round}` }));
+  };
+  const asLegacy = () => {
+    const legacy = copy(state);
+    delete legacy.pipeline.tasks[0].correction_count;
+    legacy.pipeline = redigest(legacy.pipeline);
+    fs.writeFileSync(statePath, `${JSON.stringify(legacy)}\n`, { encoding: "utf8", mode: FILE_MODE });
+    store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+    state = store.readRecoverySnapshot(owner);
+    assert.equal(Object.prototype.hasOwnProperty.call(state.pipeline.tasks[0], "correction_count"), false);
+    assertWorkTaskPipelineStoreState(copy(state));
+  };
+  requestChanges(1);
+  candidate = candidateFor(ref, "c".repeat(64));
+  state = persist(store, state, event("assign_build", "legacy_build_1", { work_task_ref: copy(ref), assignment_id: "legacy_assignment_1" }));
+  state = persist(store, state, event("record_candidate", "legacy_candidate_1", { assignment_id: "legacy_assignment_1", candidate }));
+  requestChanges(2);
+  assert.deepEqual(state.pipeline.tasks[0].correction, { checkpoint_id: "legacy_checkpoint_id_2", count: 2 });
+  asLegacy();
+  assert.deepEqual(state.pipeline.tasks[0].correction, { checkpoint_id: "legacy_checkpoint_id_2", count: 2 });
+  state = persist(store, state, event("assign_build", "legacy_build_2", { work_task_ref: copy(ref), assignment_id: "legacy_assignment_2" }));
+  assert.equal(state.pipeline.tasks[0].correction_count, 2);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"correction_count":2/);
+  candidate = candidateFor(ref, "d".repeat(64));
+  state = persist(store, state, event("record_candidate", "legacy_candidate_2", { assignment_id: "legacy_assignment_2", candidate }));
+  assert.equal(state.pipeline.tasks[0].correction, null);
+  assert.equal(state.pipeline.tasks[0].correction_count, 2);
+  requestChanges(3);
+  assert.equal(state.pipeline.tasks[0].correction_count, 3);
+  // An old record whose checkpoint had already cleared never persisted its
+  // count anywhere; it reads as zero and the field is written as zero.
+  candidate = candidateFor(ref, "e".repeat(64));
+  state = persist(store, state, event("assign_build", "legacy_build_3", { work_task_ref: copy(ref), assignment_id: "legacy_assignment_3" }));
+  state = persist(store, state, event("record_candidate", "legacy_candidate_3", { assignment_id: "legacy_assignment_3", candidate }));
+  asLegacy();
+  assert.equal(state.pipeline.tasks[0].correction, null);
+  state = persist(store, state, event("block", "legacy_block", { work_task_ref: copy(ref), block_code: "validation" }));
+  assert.equal(state.pipeline.tasks[0].correction_count, 0);
 });
 
 // A failed rename leaves the previously committed JSON state readable and
