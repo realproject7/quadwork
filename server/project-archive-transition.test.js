@@ -17,7 +17,6 @@ const { buildWorkTaskCandidate } = require("./work-task-candidate");
 const { createWorkTaskPipelineStore, workTaskPipelineStorePath } = require("./work-task-pipeline-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
 const {
-  CANCELLATION_CAUSE,
   ProjectArchiveTransitionError,
   archiveEventId,
   createProjectArchiveTransition,
@@ -201,8 +200,15 @@ try {
 
     const round = storedRounds(seeded)[0];
     assert.equal(round.status, "cancelled");
-    assert.equal(round.cancellation.cause, CANCELLATION_CAUSE);
-    assert.equal(round.cancellation.at, "2026-09-02T00:00:00.000Z");
+    // The cause and reason are spelled out here rather than imported from the
+    // adapter: comparing the module's constant to itself passes whatever the
+    // constant is changed to, which is how a wrong-but-legal cause survived.
+    assert.equal(round.cancellation.cause, "project_archived",
+      "the adapter cancels with the archive cause, not merely some valid cause");
+    assert.equal(round.cancellation.reason, "project archived by the server lifecycle controller",
+      "the adapter sends the fixed server reason");
+    assert.equal(round.cancellation.at, "2026-09-02T00:00:00.000Z",
+      "the cancellation instant is the injected trusted clock, not a wall clock read");
     assert.equal(round.receipts.length, 0);
     assert.equal(round.release, null);
     assert.deepEqual(round.audit.map((entry) => entry.type), ["opened", "cancelled"],
