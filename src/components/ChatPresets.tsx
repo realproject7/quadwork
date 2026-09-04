@@ -11,7 +11,13 @@ export interface Preset {
 
 function loadPresets(): Preset[] {
   if (typeof window === "undefined") return DEFAULT_PRESETS;
-  return loadPresetsFrom(window.localStorage);
+  // Reaching `window.localStorage` can itself throw where site data is
+  // blocked, so the guard stays outside the helper's own try/catch.
+  try {
+    return loadPresetsFrom(window.localStorage);
+  } catch {
+    return DEFAULT_PRESETS;
+  }
 }
 
 function savePresets(presets: Preset[]) {

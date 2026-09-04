@@ -10,12 +10,33 @@ const QUALIFIED_QUEUE_FORMAT_PRESET = `@head Check your OVERNIGHT-QUEUE.md forma
 
 // The retired all-agent pulse preset. The Monitor now writes structured events
 // to @head only; an untouched cached copy of this built-in is dropped below.
+// BOTH generations that ever shipped as `default-1` are listed. An installation
+// that cached the defaults before #808 still holds the original body, which
+// matched nothing, so its retired pulse survived every later load.
+const QUEUE_CHECK_BUILTIN_TITLE = "Queue Check — Trigger";
+
+// 5a0f882 [#617] — the original pulse.
+const PRE_808_QUEUE_CHECK_PRESET = `@head @dev @re1 @re2 – Queue check.
+@head: Merge any PR with both approvals, assign next from ~/.quadwork/{{project}}/OVERNIGHT-QUEUE.md.
+@dev: Work on assigned ticket or address review feedback.
+@re1 & @re2: Review open PRs. If @dev pushed fixes, re-review. Post verdict on PR AND notify @dev here.
+ALL: Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
+
+// 21c5df0 [#808] — GITHUB.md-first discovery, @mention-scoped review.
 const LEGACY_QUEUE_CHECK_PRESET = `@head @dev @re1 @re2 – Queue check.
 Discovery: read ~/.quadwork/{{project}}/GITHUB.md (or GET /api/github-parsed?project={{project}}) for issue/PR state instead of running gh. If it's absent or stale (>2 cycles / _stale), do ONE direct gh read to confirm. GITHUB.md may lag — confirm with a direct gh read before any merge/review decision.
 @head: Merge any PR with both approvals, assign next from ~/.quadwork/{{project}}/OVERNIGHT-QUEUE.md.
 @dev: Work on assigned ticket or address review feedback.
 @re1 & @re2: Review ONLY PRs you were @mentioned on in this chat (not all open PRs). If @dev pushed fixes, re-review. Post verdict on PR AND notify @dev here.
 ALL: If nothing is assigned or pending for you, no-op quietly. Communicate via this chat by tagging agents. Your terminal is NOT visible.`;
+
+// A cached built-in counts as untouched only when its id, title AND message all
+// match a generation exactly. Matching on id + message alone silently deleted
+// the preset of anyone who had renamed the built-in but kept its body.
+const RETIRED_QUEUE_CHECK_BUILTINS = [
+  { id: "default-1", title: QUEUE_CHECK_BUILTIN_TITLE, message: PRE_808_QUEUE_CHECK_PRESET },
+  { id: "default-1", title: QUEUE_CHECK_BUILTIN_TITLE, message: LEGACY_QUEUE_CHECK_PRESET },
+];
 
 const DEFAULT_PRESETS = [
   {
@@ -40,10 +61,12 @@ function isPresetRecord(value) {
 }
 
 function isRetiredQueueCheckBuiltin(preset) {
-  return (
-    isPresetRecord(preset) &&
-    preset.id === "default-1" &&
-    preset.message === LEGACY_QUEUE_CHECK_PRESET
+  if (!isPresetRecord(preset)) return false;
+  return RETIRED_QUEUE_CHECK_BUILTINS.some(
+    (builtin) =>
+      preset.id === builtin.id &&
+      preset.title === builtin.title &&
+      preset.message === builtin.message
   );
 }
 
