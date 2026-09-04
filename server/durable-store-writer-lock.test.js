@@ -8,7 +8,8 @@
 // lock body; the record on disk is exactly what the store wrote.
 
 const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -39,7 +40,7 @@ function stable(value) {
   if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`;
   return JSON.stringify(value);
 }
-function digest(value) { return require("node:crypto").createHash("sha256").update(stable(value), "utf8").digest("hex"); }
+function digest(value) { return crypto.createHash("sha256").update(stable(value), "utf8").digest("hex"); }
 function resolveRegisteredIdentity(input) {
   return { installation_id: input.installation_id, project_id: input.project_id, repository_key: input.repository_key, work_item: copy(input.work_item), issue_body_revision: "c".repeat(64) };
 }
@@ -147,7 +148,7 @@ const STORES = {
     written(directory) {
       const store = createTaskReviewRoundStore({ rootDir: directory });
       const opened = openTaskReviewRound({ version: 1, candidate: candidate(frozenManifest("isolated").tasks[0].ref), attempt: "attempt-lock", round: 1, opened_at: "2026-09-01T06:00:00.000Z" }, reviewers());
-      return store.readForTrustedReviewer(opened.review_round_ref, opened.candidate_digest, { version: 1, reviewer_role: "re1", reviewer_generation: 11, received_at: "2026-09-01T06:01:00.000Z" }).status === "current";
+      return store.readForTrustedReviewer(opened.review_round_ref, opened.candidate_digest, { version: 1, reviewer_role: "re1", reviewer_generation: 11, received_at: "2026-09-01T06:01:00.000Z" }).status === "sealed";
     },
   },
   "head-control-work-task-domain": {
@@ -174,6 +175,31 @@ if (process.argv[2] === "--hold-writer-lock") {
     }
   };
   STORES[process.argv[3]].mutate(process.argv[4], holding);
+  return;
+}
+// Contender mode: one audit append that holds the lock for a visible window,
+// reporting when the lock was taken and released so the parent can prove
+// mutual exclusion across processes from the wall clock alone.
+if (process.argv[2] === "--contend") {
+  const contending = Object.create(fs);
+  contending.chmodSync = (target, mode) => {
+    fs.chmodSync(target, mode);
+    if (target.endsWith(".lock")) fs.writeSync(1, `ENTER ${Date.now()}\n`);
+  };
+  contending.renameSync = (from, to) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    fs.renameSync(from, to);
+  };
+  contending.unlinkSync = (target) => {
+    fs.unlinkSync(target);
+    if (target.endsWith(".lock")) fs.writeSync(1, `EXIT ${Date.now()}\n`);
+  };
+  try {
+    createHeadControlAuditStore({ config_dir: process.argv[3], fs: contending }).append({ binding, audit: audit(Number(process.argv[4])) });
+    fs.writeSync(1, "OK\n");
+  } catch (error) {
+    fs.writeSync(1, `REFUSED ${error && error.code}\n`);
+  }
   return;
 }
 
@@ -255,14 +281,125 @@ async function malformedLockStaysClosed(name) {
   });
 }
 
+// A record that parses but names an owner this host cannot prove dead is
+// honoured: a live unrelated pid (the shape PID reuse produces), a pid the
+// probe refuses with EPERM (alive, not gone), and a lock minted on another
+// host.  None of them is touched.
+function deadPid() {
+  const exited = spawnSync(process.execPath, ["-e", "0"]);
+  assert.equal(exited.status, 0);
+  assert.equal(isDead(exited.pid), true, "the probe pid belongs to a process that has exited");
+  return exited.pid;
+}
+function record(fields) {
+  return JSON.stringify({ version: 1, pid: process.pid, token: crypto.randomBytes(16).toString("hex"), host: os.hostname(), created_at: Date.now(), ...fields });
+}
+async function unprovenOwnerStaysClosed(name) {
+  const store = STORES[name];
+  await withDirectory(async (directory) => {
+    const statePath = store.statePath(directory);
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    let init = null;
+    try { process.kill(1, 0); } catch (error) { init = error.code; }
+    assert.ok(init === null || init === "EPERM", `pid 1 is alive for this user (${init})`);
+    for (const body of [record({}), record({ pid: 1 }), record({ pid: deadPid(), host: "elsewhere.invalid" })]) {
+      fs.writeFileSync(`${statePath}.lock`, body, { mode: 0o600, flag: "wx" });
+      throwsCode(() => store.mutate(directory, fs), store.locked);
+      assert.equal(fs.readFileSync(`${statePath}.lock`, "utf8"), body, `${name}: a live, refused, or foreign owner's lock is left untouched`);
+      fs.unlinkSync(`${statePath}.lock`);
+    }
+  });
+}
+
+// Linux reuses inode numbers eagerly, so a dead owner's lock that is
+// replaced between judgement and unlink can report the original dev+ino.
+// The stubbed lstat forces exactly that; only the exact record proves the
+// replacement, and the replacement's live owner is honoured.
+async function replacementIsNeverReaped(name) {
+  const store = STORES[name];
+  await withDirectory(async (directory) => {
+    const statePath = store.statePath(directory);
+    const lockPath = `${statePath}.lock`;
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(lockPath, record({ pid: deadPid() }), { mode: 0o600, flag: "wx" });
+    const replacement = record({});
+    let inspections = 0;
+    let original = null;
+    const replacingFs = Object.create(fs);
+    replacingFs.lstatSync = (target) => {
+      if (target !== lockPath) return fs.lstatSync(target);
+      inspections += 1;
+      if (inspections === 1) {
+        original = fs.lstatSync(target);
+        return original;
+      }
+      if (inspections === 2) {
+        fs.unlinkSync(lockPath);
+        fs.writeFileSync(lockPath, replacement, { mode: 0o600, flag: "wx" });
+      }
+      const stats = fs.lstatSync(target);
+      stats.dev = original.dev;
+      stats.ino = original.ino;
+      return stats;
+    };
+    throwsCode(() => store.mutate(directory, replacingFs), store.locked);
+    assert.equal(inspections, 2, `${name}: the dead owner's lock is re-inspected exactly once before any unlink`);
+    assert.equal(fs.readFileSync(lockPath, "utf8"), replacement, `${name}: the live replacement is never unlinked`);
+    assert.equal(fs.existsSync(statePath), false, `${name}: no write happened behind the replacement's owner`);
+  });
+}
+
+// Concurrent contenders on one store: at most one holds the lock at any
+// instant, every contender either commits or is refused with the typed
+// code, every commit is readable afterwards, and nothing is left behind.
+async function contendersYieldOneWriterAtATime() {
+  await withDirectory(async (directory) => {
+    const contenders = Array.from({ length: 6 }, (_, index) => {
+      const child = spawn(process.execPath, [__filename, "--contend", directory, String(index)], { stdio: ["ignore", "pipe", "inherit"] });
+      let output = "";
+      child.stdout.on("data", (chunk) => { output += chunk.toString(); });
+      return new Promise((resolve) => child.on("exit", (code) => resolve({ code, output })));
+    });
+    const outcomes = await Promise.all(contenders);
+    const windows = [];
+    let committed = 0;
+    for (const outcome of outcomes) {
+      assert.equal(outcome.code, 0, outcome.output);
+      const lines = outcome.output.trim().split("\n");
+      const verdict = lines[lines.length - 1];
+      if (verdict === "OK") {
+        committed += 1;
+        const enter = Number(/^ENTER (\d+)$/m.exec(outcome.output)[1]);
+        const exit = Number(/^EXIT (\d+)$/m.exec(outcome.output)[1]);
+        windows.push({ enter, exit });
+      } else {
+        assert.equal(verdict, "REFUSED head_control_audit_store_locked", outcome.output);
+        assert.doesNotMatch(outcome.output, /^ENTER/m, "a refused contender never held the lock");
+      }
+    }
+    assert.ok(committed >= 1, "at least one contender committed");
+    windows.sort((left, right) => left.enter - right.enter);
+    for (let index = 1; index < windows.length; index += 1) {
+      assert.ok(windows[index - 1].exit <= windows[index].enter, `lock windows overlap: ${JSON.stringify(windows)}`);
+    }
+    const statePath = headControlAuditStorePath(directory, binding);
+    const stored = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(stored.records.length, committed, "every committed winner is durable and none was lost or duplicated");
+    assert.equal(createHeadControlAuditStore({ config_dir: directory, fs }).read(binding).length, committed);
+    assert.deepEqual(artifacts(statePath), [], "no lock or temporary artifact remains after contention");
+  });
+}
+
 (async () => {
   const failures = [];
   for (const name of Object.keys(STORES)) {
-    for (const check of [deadWriterIsRecovered, malformedLockStaysClosed]) {
+    for (const check of [deadWriterIsRecovered, malformedLockStaysClosed, unprovenOwnerStaysClosed, replacementIsNeverReaped]) {
       try { await check(name); }
       catch (error) { failures.push(`${check.name}(${name}): ${error && error.message}`); }
     }
   }
+  try { await contendersYieldOneWriterAtATime(); }
+  catch (error) { failures.push(`contendersYieldOneWriterAtATime: ${error && error.message}`); }
   if (failures.length > 0) {
     console.error(failures.join("\n"));
     process.exit(1);
