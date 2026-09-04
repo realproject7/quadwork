@@ -103,8 +103,13 @@ function createProjectArchiveTransition(value) {
     let installationId;
     try { installationId = options.resolve_installation_id(); }
     catch { fail("project_archive_identity_unavailable", "installation identity could not be read"); }
+    // A project that is not registered to a V2 installation cannot key either
+    // durable store, so it has no batch to archive and no retry to schedule.
+    // A present-but-invalid identity is a different fact: the real store key is
+    // unknown, so the batch state is unknown and the transition fails closed.
+    if (installationId === undefined || installationId === null) return null;
     if (typeof installationId !== "string" || !INSTALLATION_RE.test(installationId)) {
-      fail("project_archive_identity_unavailable", "installation identity is not registered");
+      fail("project_archive_identity_unregistered", "installation identity is invalid");
     }
     return Object.freeze({ installation_id: installationId, project_id: projectId });
   }
@@ -219,6 +224,10 @@ function createProjectArchiveTransition(value) {
     catch (error) {
       record(result, "project", storeCode(error, "project_archive_identity_unavailable"),
         "archived project identity is unavailable");
+      return result;
+    }
+    if (owner === null) {
+      result.ok = true;
       return result;
     }
     archivePipeline(result, owner);

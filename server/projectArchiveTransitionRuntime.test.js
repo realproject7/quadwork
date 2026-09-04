@@ -30,6 +30,10 @@ function cleanup() {
   if (originalSkipListen === undefined) delete process.env.QUADWORK_SKIP_LISTEN; else process.env.QUADWORK_SKIP_LISTEN = originalSkipListen;
   try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 }
+// Loading the real server composition leaves durable writes in flight that can
+// recreate the seeded home after the run finishes, so the sandbox is also
+// removed at exit. Nothing here spawns a child process.
+process.on("exit", cleanup);
 
 const configDir = path.join(TEST_HOME, ".quadwork");
 const repoA = path.join(TEST_HOME, "repos", "a");
@@ -42,6 +46,17 @@ const installation_id = "installation-archive-0001";
 const base_sha = "a".repeat(64);
 const candidate_sha = "b".repeat(64);
 const copy = (value) => JSON.parse(JSON.stringify(value));
+
+// Mirrors the sealed contract's stable receipt digest so a control receipt
+// really seals instead of failing on its digest.
+function stableValue(value) {
+  if (Array.isArray(value)) return `[${value.map(stableValue).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableValue(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+function stableDigest(value) {
+  return require("node:crypto").createHash("sha256").update(stableValue(value), "utf8").digest("hex");
+}
 
 function project(id, repo, cwd) {
   return {
@@ -63,7 +78,7 @@ const { buildWorkTaskPipeline, planWorkTaskPipelineEvent } = require("./work-tas
 const { buildWorkTaskCandidate } = require("./work-task-candidate");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
-const { createWorkTaskIndependentReviewService } = require("./work-task-independent-review-service");
+const { createWorkTaskIndependentReviewService, reviewRoundId } = require("./work-task-independent-review-service");
 
 function seedProject(projectId, workDir) {
   const manifest = freezeBatchManifest(buildBatchManifest({
@@ -121,27 +136,57 @@ function seedProject(projectId, workDir) {
   });
   state = apply(state, { version: 1, kind: "assign_build", event_id: `evt_build_${projectId}`, work_task_ref: copy(ref), assignment_id: `asg_${projectId}_01`, base_sha });
   state = apply(state, { version: 1, kind: "record_candidate", event_id: `evt_candidate_${projectId}`, assignment_id: `asg_${projectId}_01`, candidate: copy(candidate) });
-  state = apply(state, { version: 1, kind: "assign_independent_review", event_id: `evt_review_${projectId}`, work_task_ref: copy(ref), review_round_id: `trr_${projectId}_01`, candidate_digest: candidate.candidate_digest });
 
+  // The round is opened first so the pipeline's review assignment can carry the
+  // exact server-derived round id the review service re-derives on every call.
   const roundStore = createTaskReviewRoundStore({ rootDir: configDir, fsImpl: fs });
   const opened = roundStore.openRound(
     { version: 1, candidate: copy(candidate), attempt: "attempt_1070", round: 1, opened_at: "2026-09-01T06:00:00.000Z" },
     { version: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 11 }, { reviewer_role: "re2", reviewer_generation: 22 }] },
   );
+  state = apply(state, { version: 1, kind: "assign_independent_review", event_id: `evt_review_${projectId}`, work_task_ref: copy(ref), review_round_id: reviewRoundId(opened.review_round_ref), candidate_digest: candidate.candidate_digest });
+
+  // A second, already-released round for the same candidate. It is terminal
+  // sealed audit: the archive transition must leave it byte-for-byte alone
+  // while it cancels the current round above.
+  const released = roundStore.openRound(
+    { version: 1, candidate: copy(candidate), attempt: "attempt_1069", round: 2, opened_at: "2026-09-01T05:00:00.000Z" },
+    { version: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 11 }, { reviewer_role: "re2", reviewer_generation: 22 }] },
+  );
+  for (const [role, generation, receipt_id] of [["re2", 22, "receipt_re2_seal"], ["re1", 11, "receipt_re1_seal"]]) {
+    const payload = {
+      version: 1,
+      review_round_ref: copy(released.review_round_ref),
+      receipt_id,
+      verdict: "request_changes",
+      findings: [{ finding_id: `${receipt_id}_finding`, severity: "blocking", propagation: "local", summary: "sealed before archive" }],
+    };
+    roundStore.submitTrustedReceipt(released.review_round_ref, released.candidate_digest,
+      { ...payload, receipt_digest: stableDigest(payload) },
+      { version: 1, reviewer_role: role, reviewer_generation: generation, received_at: "2026-09-01T05:30:00.000Z" });
+  }
   assert.equal(opened.status, "current");
   assert.equal(state.pipeline.tasks[0].state, "independent_review");
   assert.equal(state.pipeline.archived, false);
-  return { manifest, ref, candidate, store, roundStore, opened, owner: { installation_id, project_id: projectId } };
+  return { manifest, ref, candidate, store, roundStore, opened, released, owner: { installation_id, project_id: projectId } };
 }
 
 const seedA = seedProject("a", repoA);
 const seedB = seedProject("b", repoB);
 
-function storedRound(seed) {
+function storedRounds(seed) {
   const document = JSON.parse(fs.readFileSync(seed.roundStore.pathFor(seed.opened.review_round_ref), "utf8"));
-  const records = Object.values(document.records).map((entry) => entry.round);
-  assert.equal(records.length, 1);
-  return records[0];
+  return Object.values(document.records).map((entry) => entry.round);
+}
+function storedRound(seed) {
+  const match = storedRounds(seed).filter((round) => round.review_round_ref.round === 1);
+  assert.equal(match.length, 1);
+  return match[0];
+}
+function storedReleasedRound(seed) {
+  const match = storedRounds(seed).filter((round) => round.review_round_ref.round === 2);
+  assert.equal(match.length, 1);
+  return match[0];
 }
 
 const runtime = require("./index");
@@ -165,7 +210,7 @@ const runtime = require("./index");
   assert.equal(roundAfter.cancellation.cause, "project_archived",
     "cancellation carries the fixed trusted archive cause");
   assert.equal(archived.resources.task_review_rounds_cancelled, 1,
-    "the archive transition reports the round it cancelled");
+    "the archive transition cancels exactly the one current round, not the released one");
 
   // Neither candidate nor worktree is touched: the transition flips authority
   // state only, and every receipt/audit record survives byte-for-byte.
@@ -179,46 +224,58 @@ const runtime = require("./index");
   assert.equal(roundAfter.audit.length, 2, "cancellation appends to the immutable audit");
   assert.equal(roundAfter.audit[0].type, "opened");
   assert.equal(roundAfter.audit[1].type, "cancelled");
+  const releasedAfter = storedReleasedRound(seedA);
+  assert.equal(releasedAfter.status, "released", "an already-released round is never cancelled by the archive");
+  assert.equal(releasedAfter.receipts.length, 2, "sealed receipts survive the archive transition");
+  assert.equal(releasedAfter.cancellation, null);
 
   // Another project's durable batch is untouched.
   assert.equal(seedB.store.readRecoverySnapshot(seedB.owner).pipeline.archived, false,
     "archiving one project cannot archive another project's pipeline");
   assert.equal(storedRound(seedB).status, "current",
     "archiving one project cannot cancel another project's review round");
+  assert.equal(storedReleasedRound(seedB).status, "released");
 
-  // A late review/receipt/correction cannot win after the barrier.
+  // A late review/receipt/correction cannot win after the barrier. Each check
+  // is paired with the same call against the un-archived project B, so a
+  // rejection can only be the archive and never a malformed request.
   const reviewService = createWorkTaskIndependentReviewService({ config_dir: configDir, fs });
-  const receipt = {
-    version: 1,
-    review_round_ref: copy(seedA.opened.review_round_ref),
-    receipt_id: "receipt_late_01",
-    verdict: "approve",
-    findings: [],
+  const receiptFor = (seed, receipt_id) => {
+    const payload = { version: 1, review_round_ref: copy(seed.opened.review_round_ref), receipt_id, verdict: "approve", findings: [] };
+    return { ...payload, receipt_digest: stableDigest(payload) };
   };
-  assert.throws(() => reviewService.submitTrustedReceipt({
+  const submit = (seed, receipt_id) => reviewService.submitTrustedReceipt({
     version: 1,
-    review_round_ref: copy(seedA.opened.review_round_ref),
-    candidate_digest: seedA.opened.candidate_digest,
-    receipt: { ...receipt, receipt_digest: "d".repeat(64) },
-  }, { version: 1, reviewer_role: "re1", reviewer_generation: 11, received_at: "2026-09-01T07:00:00.000Z" }),
-  (error) => error && error.code === "work_task_archive_blocked",
-  "a late receipt is rejected by the archived pipeline");
-  assert.throws(() => reviewService.queueLocalCorrection({
+    review_round_ref: copy(seed.opened.review_round_ref),
+    candidate_digest: seed.opened.candidate_digest,
+    receipt: receiptFor(seed, receipt_id),
+  }, { version: 1, reviewer_role: "re1", reviewer_generation: 11, received_at: "2026-09-01T07:00:00.000Z" });
+  assert.equal(submit(seedB, "receipt_control_01").outcome, "sealed",
+    "negative control: the identical receipt seals against the un-archived project");
+  assert.throws(() => submit(seedA, "receipt_late_01"),
+    (error) => error && error.code === "stale_work_task_review_authority",
+    "a late receipt is rejected because the archived pipeline holds no live review authority");
+
+  const correct = (seed) => reviewService.queueLocalCorrection({
     version: 1,
-    work_task_ref: copy(seedA.ref),
-    review_round_ref: copy(seedA.opened.review_round_ref),
-    candidate_digest: seedA.opened.candidate_digest,
-  }),
-  (error) => error && error.code === "work_task_archive_blocked",
-  "a late correction is rejected by the archived pipeline");
+    work_task_ref: copy(seed.ref),
+    review_round_ref: copy(seed.released.review_round_ref),
+    candidate_digest: seed.released.candidate_digest,
+  });
+  assert.throws(() => correct(seedB),
+    (error) => error && error.code === "stale_work_task_review_authority",
+    "negative control: the un-archived project rejects the same correction for a non-archive reason");
+  assert.throws(() => correct(seedA),
+    (error) => error && error.code === "work_task_archive_blocked",
+    "a late correction is rejected by the archived pipeline");
 
   // An already-archived retry is idempotent and stays truthful.
   const retry = await runtime.projectLifecycle.archiveProject("a");
   assert.equal(retry.ok, true, `archive retry must complete: ${JSON.stringify(retry.cleanup_errors)}`);
   assert.equal(retry.already_archived, true);
-  assert.equal(retry.resources.work_task_pipelines_archived, 0,
+  assert.equal(retry.resources.work_task_pipelines_archived ?? 0, 0,
     "an already-archived pipeline is not archived twice");
-  assert.equal(retry.resources.task_review_rounds_cancelled, 0,
+  assert.equal(retry.resources.task_review_rounds_cancelled ?? 0, 0,
     "an already-cancelled round is not cancelled twice");
   assert.equal(seedA.store.readRecoverySnapshot(seedA.owner).pipeline.pipeline_digest, pipelineAfter.pipeline.pipeline_digest,
     "the retry writes no new pipeline transition");

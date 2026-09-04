@@ -340,7 +340,15 @@ try {
       [["project", "project_archive_identity_unavailable"]]);
     const unregistered = transitionFor(configDir, { resolve_installation_id: () => "short" })
       .archiveProjectRuntimeState(project_id);
-    assert.equal(unregistered.cleanup_errors[0].code, "project_archive_identity_unavailable");
+    assert.equal(unregistered.cleanup_errors[0].code, "project_archive_identity_unregistered");
+    // A project on an installation that was never V2-registered cannot key
+    // either durable store, so it is a clean no-op rather than a permanent
+    // cleanup failure that would block unarchive forever.
+    assert.deepEqual(transitionFor(configDir, { resolve_installation_id: () => undefined }).archiveProjectRuntimeState(project_id),
+      { ok: true, resources: {}, cleanup_errors: [] },
+      "an unregistered installation archives cleanly");
+    assert.equal(seeded.store.readRecoverySnapshot(seeded.owner).pipeline.archived, false,
+      "an unregistered installation touches no durable batch");
     const invalidScope = transitionFor(configDir).archiveProjectRuntimeState("../escape");
     assert.equal(invalidScope.cleanup_errors[0].code, "invalid_project_archive_scope");
     assert.equal(transitionFor(configDir).archiveProjectRuntimeState({ project_id, installation_id: other_installation_id }).cleanup_errors[0].code,
