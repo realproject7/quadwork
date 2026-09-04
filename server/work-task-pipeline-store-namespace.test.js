@@ -34,7 +34,6 @@ const {
   applyWorkTaskPipelinePlan,
 } = require("./work-task-pipeline");
 const {
-  FILE_MODE,
   WorkTaskPipelineStoreError,
   assertWorkTaskPipelineStoreState,
   workTaskPipelineStorePath,
@@ -44,6 +43,9 @@ const {
 // The platform bound this module has to fit inside, spelled out rather than
 // imported: `getconf NAME_MAX /` reports 255 on macOS/APFS and on Linux ext4.
 const NAME_MAX = 255;
+// The owner-only file mode every durable record must carry, spelled out here
+// so this file can never agree with a production constant that moved.
+const RECORD_MODE = 0o600;
 // The identifier bounds the store's own regexes admit, also spelled out.
 const MAX_INSTALLATION_ID_LENGTH = 128;
 const MAX_PROJECT_ID_LENGTH = 128;
@@ -159,7 +161,7 @@ function legacyRetiredPath(directory, owner, ordinal) {
   return path.join(legacyDirectory(directory),
     `${owner.installation_id}--${owner.project_id}.retired.${String(ordinal).padStart(4, "0")}.json`);
 }
-function writeLegacy(target, record, mode = FILE_MODE) {
+function writeLegacy(target, record, mode = RECORD_MODE) {
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   fs.writeFileSync(target, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode, flag: "w" });
   fs.chmodSync(target, mode);
@@ -272,7 +274,7 @@ withDirectory((directory) => {
   assert.equal(fs.existsSync(legacyRetiredPath(directory, owner, 2)), false);
   assert.equal(fs.existsSync(workTaskPipelineStorePath(directory, owner)), true);
   assert.deepEqual(retiredNames(directory, owner).length, 2);
-  assert.equal(fs.statSync(workTaskPipelineStorePath(directory, owner)).mode & 0o777, FILE_MODE);
+  assert.equal(fs.statSync(workTaskPipelineStorePath(directory, owner)).mode & 0o777, RECORD_MODE);
 
   // The migrated store keeps working: a new retirement takes the next ordinal.
   const retired = store.retire({ expected: currentExpected(recovered), event_id: "legacy_retire_next" });
@@ -325,7 +327,7 @@ withDirectory((directory) => {
 withDirectory((directory) => {
   const owner = { installation_id, project_id: "quadwork" };
   const outside = path.join(directory, "outside-record.json");
-  fs.writeFileSync(outside, `${JSON.stringify(liveRecord(owner))}\n`, { encoding: "utf8", mode: FILE_MODE });
+  fs.writeFileSync(outside, `${JSON.stringify(liveRecord(owner))}\n`, { encoding: "utf8", mode: RECORD_MODE });
   fs.mkdirSync(legacyDirectory(directory), { recursive: true, mode: 0o700 });
   const linked = legacyActivePath(directory, owner);
   fs.symlinkSync(outside, linked);
@@ -339,7 +341,7 @@ withDirectory((directory) => {
   assert.equal(fs.statSync(linked).mode & 0o777, 0o644);
   fs.unlinkSync(linked);
 
-  fs.writeFileSync(linked, "{not-json", { encoding: "utf8", mode: FILE_MODE, flag: "w" });
+  fs.writeFileSync(linked, "{not-json", { encoding: "utf8", mode: RECORD_MODE, flag: "w" });
   throwsCode(() => store.readRecoverySnapshot(owner), "corrupt_work_task_pipeline_store");
   assert.equal(fs.readFileSync(linked, "utf8"), "{not-json", "an undecidable candidate is left in place");
 });
