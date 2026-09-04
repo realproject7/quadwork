@@ -109,6 +109,18 @@ function scopeFromRef(ref, code = "invalid_task_review_round_store_scope") {
   return { installation_id: ref.installation_id, project_id: ref.project_id };
 }
 
+// A project-scope owner, for the one server-internal listing below.  It never
+// reaches a filesystem path directly: both fields are only hashed into the
+// existing per-project document name.
+function archiveScope(value, code = "invalid_task_review_round_store_scope") {
+  exact(value, ["installation_id", "project_id"], code);
+  if (typeof value.installation_id !== "string" || value.installation_id.length === 0 || value.installation_id.length > 128 ||
+      typeof value.project_id !== "string" || value.project_id.length === 0 || value.project_id.length > 128) {
+    fail(code, "review-round scope is invalid");
+  }
+  return { installation_id: value.installation_id, project_id: value.project_id };
+}
+
 function candidateDigest(value, code = "invalid_task_review_round_store_candidate") {
   if (typeof value !== "string" || !DIGEST_RE.test(value)) fail(code, "candidate digest is invalid");
   return value;
@@ -516,6 +528,23 @@ class TaskReviewRoundStore {
       if (error && error.code === "task_review_round_no_propagation_stop") return null;
       throw error;
     }
+  }
+
+  // Server-internal, project-scoped listing of the rounds that are still
+  // `current`.  It exists so the single project archive transition (#1070) can
+  // find exactly the rounds it must cancel without any caller gaining a
+  // generic round enumerator.  It projects round identity only -- never a
+  // receipt, verdict, finding, reviewer role, or cancellation body -- and it
+  // never lists a released or already-cancelled round, so a sealed terminal
+  // record is never re-offered for mutation.
+  listCurrentRoundAnchors(scope) {
+    const owner = archiveScope(scope);
+    const loaded = safeReadDocument(this.fs, this.rootDir, owner);
+    return cloneFreeze(Object.values(loaded.document.records)
+      .map((record) => record.round)
+      .filter((round) => round.status === "current")
+      .sort((left, right) => taskReviewRoundKey(left.review_round_ref).localeCompare(taskReviewRoundKey(right.review_round_ref)))
+      .map((round) => ({ review_round_ref: clone(round.review_round_ref), candidate_digest: round.candidate_digest })));
   }
 
   cancelFromTrustedState(cancellation) {
