@@ -13,6 +13,7 @@ const {
 const {
   buildWorkTaskPipeline,
   planWorkTaskPipelineEvent,
+  applyWorkTaskPipelinePlan,
 } = require("./work-task-pipeline");
 const {
   createWorkTaskPipelineStore,
@@ -932,6 +933,79 @@ withDirectory((directory) => {
   assert.equal(record.length, 1);
   assert.deepEqual(record[0].terminal_audit, audit, "the replayed retirement adds no second marker");
   ok(true, "a retirement replayed after its marker was written renames the record without duplicating the marker");
+});
+
+// Defence in depth: the two halves are required together, so a retired record
+// whose marker and pipeline disagree — a forged or corrupted record, not one
+// this store can write — answers for nothing.  Each half is checked by making
+// exactly the other half of the record wrong.
+withDirectory((directory) => {
+  let armed = false;
+  let domainWrites = 0;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("head-control-work-task-domain")) {
+      domainWrites += 1;
+      if (domainWrites === 2) {
+        const error = new Error("injected crash after store retirement");
+        error.code = "EIO";
+        throw error;
+      }
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, owner, store } = frozenBatchFor(directory, faultFs);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_state_write_failed");
+  armed = false;
+  const intent = persistedState(directory).pending;
+  const pipelineDirectory = path.dirname(workTaskPipelineStorePath(directory, owner));
+  const retiredNames = fs.readdirSync(pipelineDirectory).filter((name) => name.includes(".retired."));
+  assert.equal(retiredNames.length, 1);
+  const retiredPath = path.join(pipelineDirectory, retiredNames[0]);
+  const record = JSON.parse(fs.readFileSync(retiredPath, "utf8"));
+  const rewrite = (value) => fs.writeFileSync(retiredPath, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: FILE_MODE, flag: "w" });
+  const markerIndex = record.terminal_audit.findIndex((entry) => entry.event_id === intent.retirement_event_id);
+  assert.equal(markerIndex, 0);
+  assert.equal(record.terminal_audit[markerIndex].pipeline_digest, record.pipeline.pipeline_digest);
+
+  // (a) the marker names a pipeline the record does not hold.
+  const forgedMarker = copy(record);
+  forgedMarker.terminal_audit[markerIndex].pipeline_digest = "e".repeat(64);
+  rewrite(forgedMarker);
+  assert.equal(store.readRetiredSnapshots(owner)[0].pipeline.pipeline_digest, intent.archived_pipeline_digest,
+    "the forged record still carries the pinned pipeline, so only the marker can refuse it");
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("forged_marker")), "head_control_work_task_pipeline_missing");
+
+  // (d) the marker records an un-archive rather than the retirement's archive.
+  const forgedFlag = copy(record);
+  forgedFlag.terminal_audit[markerIndex].archived = false;
+  rewrite(forgedFlag);
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("forged_flag")), "head_control_work_task_pipeline_missing");
+
+  // (b) the record holds a pipeline the marker does not name.
+  const forgedPipeline = copy(record);
+  forgedPipeline.pipeline = applyWorkTaskPipelinePlan(record.pipeline,
+    planWorkTaskPipelineEvent(record.pipeline, { version: 1, kind: "set_archived", event_id: "forged_second_archive", archived: true }));
+  assert.notEqual(forgedPipeline.pipeline.pipeline_digest, intent.archived_pipeline_digest);
+  rewrite(forgedPipeline);
+  assert.deepEqual(store.readRetiredSnapshots(owner)[0].terminal_audit[markerIndex], record.terminal_audit[markerIndex],
+    "the forged record still carries this retirement's exact marker, so only the pipeline digest can refuse it");
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("forged_pipeline")), "head_control_work_task_pipeline_missing");
+
+  // (e) the marker's `kind` never reaches this domain's check: an audit entry
+  // that is not an archive disposition cannot carry `archived` at all, so the
+  // store's own validator refuses the whole record first.  Proven, not assumed.
+  const forgedKind = copy(record);
+  forgedKind.terminal_audit[markerIndex].kind = "contract_change";
+  rewrite(forgedKind);
+  assert.throws(() => store.readRetiredSnapshots(owner), (error) => error.code === "corrupt_work_task_pipeline_store");
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("forged_kind")), "head_control_work_task_pipeline_missing");
+
+  // (c) the record as the store actually wrote it finishes the retirement.
+  rewrite(record);
+  assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("intact_record")), emptyStatus(3));
+  ok(true, "recovery needs the pinned pipeline digest and the exact retirement marker together, never either alone");
 });
 
 // #1071: `manifestDigest` covers only the version, identity, delivery mode and
