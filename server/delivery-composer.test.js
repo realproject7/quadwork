@@ -48,7 +48,9 @@ function rejectsCode(fn, expected) {
   return assert.rejects(fn, (error) => error instanceof DeliveryComposerError && error.code === expected);
 }
 function entry(pathName, blob_sha, mode = "100644") { return { path: pathName, mode, blob_sha }; }
-function tree(tree_sha, entries) { return { tree_sha, entries: entries.map(copy).sort((left, right) => left.path.localeCompare(right.path)) }; }
+// Observed trees arrive in Git's byte order, which the composer itself checks
+// (code-unit sort is byte order for the ASCII-only paths it accepts).
+function tree(tree_sha, entries) { return { tree_sha, entries: entries.map(copy).sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0) }; }
 function entryMap(value) { return new Map(value.entries.map((item) => [item.path, item])); }
 function sameEntry(left, right) { return left === null ? right === null : right !== null && stable(left) === stable(right); }
 function diff(base, result) {
@@ -192,7 +194,10 @@ function releasedRound(workCandidate, suffix) {
 // boundary that overlaps alpha's and rewrites alpha's file on top of alpha's
 // change.  The older `dependent` flag keeps bravo on the repository root base,
 // a state the pipeline can never produce.
-function buildFixture({ dependent = false, actualOverlap = false, chain = false, overlap = true, undeclaredPath = false } = {}) {
+function buildFixture({ dependent = false, actualOverlap = false, chain = false, overlap = true, undeclaredPath = false, root = false } = {}) {
+  // `root` adds a lowercase root directory beside `README.md`: Git orders
+  // `README.md` first (byte order), a locale order puts `bin` first.
+  const rootEntries = root ? [entry("bin/cli.js", "2".repeat(64))] : [];
   const batch = frozenBatch([
     task({ task_key: "alpha", work_item: web42, boundary: ["server/alpha.js"] }),
     task({
@@ -205,30 +210,30 @@ function buildFixture({ dependent = false, actualOverlap = false, chain = false,
   const alpha = candidate(batch.tasks[0].ref, alpha_candidate_sha, "wt-alpha");
   const bravo = candidate(batch.tasks[1].ref, bravo_candidate_sha, "wt-bravo", chain ? alpha_candidate_sha : base_sha);
   const base = tree(base_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "4".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
   ]);
   const alphaTree = tree(alpha_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "6".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
   ]);
   const bravoTree = chain ? tree(bravo_tree_sha, [
-    entry("README.md", (undeclaredPath ? "9" : "3").repeat(64)),
+    ...rootEntries, entry("README.md", (undeclaredPath ? "9" : "3").repeat(64)),
     entry("server/alpha.js", (overlap ? "7" : "6").repeat(64)),
     entry("server/bravo.js", "7".repeat(64)),
   ]) : actualOverlap ? tree(bravo_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "7".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
   ]) : tree(bravo_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "4".repeat(64)),
     entry("server/bravo.js", "7".repeat(64)),
   ]);
   const result = tree(result_tree_sha, chain ? bravoTree.entries : [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "6".repeat(64)),
     entry("server/bravo.js", "7".repeat(64)),
   ]);
@@ -683,6 +688,22 @@ async function main() {
   });
   await rejectsCode(() => composeDeliveryCandidate(moved.manifest, movedOperations.operations), "delivery_result_tree_mismatch");
   assert.equal(resultReads, 2, "the pinned result is re-read once more after composition");
+}
+
+// Git orders tree entries by byte value: `README.md` precedes `bin/cli.js`,
+// where a locale order reverses them.  The composer's expected applied tree
+// must agree with the observed Git order, or a correct apply is refused as
+// `composition_apply_tree_mismatch`.
+{
+  const fixture = buildFixture({ root: true });
+  const gitOrder = ["README.md", "bin/cli.js", "server/alpha.js", "server/bravo.js"];
+  assert.deepEqual(fixture.trees.get(base_tree_sha).entries.map((item) => item.path), gitOrder);
+  assert.notDeepEqual([...gitOrder].sort((left, right) => left.localeCompare(right)), gitOrder, "this root is a locale/byte divergence");
+  const operations = createOperations(fixture);
+  const proof = await composeDeliveryCandidate(fixture.manifest, operations.operations);
+  assert.deepEqual(proof.result.entries.map((item) => item.path), gitOrder, "the proof carries entries in Git order");
+  assert.deepEqual(fixture.trees.get(intermediate_tree_sha).entries.map((item) => item.path), gitOrder, "the intermediate composed tree is read back in Git order");
+  assert.equal(operations.applyCalls.filter((request) => request.scope === "composition").length, 2);
 }
 }
 

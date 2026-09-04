@@ -530,6 +530,101 @@ await withChainRepository(async ({ repository, base_sha, candidate_a, candidate_
   console.log("  PASS: a result HEAD that is not the chain composition cannot obtain a composition proof");
 }, { resultDrift: true });
 
+// Git orders tree entries by byte value, never by locale: `README.md` sorts
+// before every lowercase root entry, and the blob `lib-versions.json` sorts
+// before the tree `lib` because a tree record compares as `lib/`.  This is a
+// realistic repository root beside real candidates; the composed entry order
+// and every tree object must be exactly what native Git makes of the result.
+async function withRootRepository(run) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "qw-delivery-git-root-"));
+  const repository = path.join(directory, "web");
+  try {
+    fs.mkdirSync(repository, { recursive: true });
+    git(repository, ["init", "-b", "main"]);
+    git(repository, ["config", "user.email", "quadwork@example.test"]);
+    git(repository, ["config", "user.name", "QuadWork Test"]);
+    git(repository, ["remote", "add", "origin", "git@github.com:owner/web.git"]);
+    for (const [relative, content] of [
+      [".gitignore", "node_modules\n"], ["README.md", "# web\n"], ["bin/cli.js", "#!/usr/bin/env node\n"],
+      ["docs/guide.md", "# guide\n"], ["lib-versions.json", "{}\n"], ["lib/util.js", "module.exports = 'util';\n"],
+      ["package.json", "{ \"name\": \"web\" }\n"], ["server/a.js", "module.exports = 'base-a';\n"], ["src/index.js", "module.exports = 'base-index';\n"],
+    ]) write(repository, relative, content);
+    const base_sha = commit(repository, "base");
+
+    git(repository, ["checkout", "-b", "candidate-a", base_sha]);
+    write(repository, "server/a.js", "module.exports = 'candidate-a';\n");
+    const candidate_a = commit(repository, "candidate a");
+
+    git(repository, ["checkout", "-b", "candidate-b", base_sha]);
+    write(repository, "src/index.js", "module.exports = 'candidate-b';\n");
+    const candidate_b = commit(repository, "candidate b");
+
+    git(repository, ["checkout", "main"]);
+    write(repository, "server/a.js", "module.exports = 'candidate-a';\n");
+    write(repository, "src/index.js", "module.exports = 'candidate-b';\n");
+    const result_sha = commit(repository, "integrated result");
+    return await run({ repository, base_sha, candidate_a, candidate_b, result_sha });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+await withRootRepository(async ({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
+  const manifest = freezeBatchManifest(buildBatchManifest({
+    version: 1, installation_id, project_id, delivery_mode: "integrated",
+    tasks: [
+      { task_key: "a", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1061, kind: "issue" }, goal: "change a", file_boundary: ["server/a.js"], validation: ["node-test"], dependencies: [] },
+      { task_key: "b", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1062, kind: "issue" }, goal: "change index", file_boundary: ["src/index.js"], validation: ["node-test"], dependencies: [] },
+    ],
+  }, { resolveRegisteredIdentity(input) { return { ...input, work_item: copy(input.work_item), issue_body_revision: "c".repeat(64) }; } }), "2026-09-02T08:00:00.000Z");
+  const stages = [stage(manifest.tasks[0].ref, base_sha, candidate_a, "a"), stage(manifest.tasks[1].ref, base_sha, candidate_b, "b")];
+  const deliverySource = {
+    version: 1,
+    registered_repository: { version: 1, installation_id, project_id, repository_key: "web", repository: "Owner/Web" },
+    frozen_batch_manifest: manifest, delivery_mode: "integrated", cut_id: "cut_delivery_git_root_01", base_sha, staged_tasks: stages, deferred_exclusions: [],
+  };
+  const { adapter, calls } = chainAdapter(repository, deliverySource);
+  const refsBefore = git(repository, ["show-ref"]);
+  const observed = await adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
+  assert.equal(observed.result_sha, result_sha);
+  const ref = {
+    version: 1, installation_id, project_id, repository_key: "web", batch_manifest_digest: manifest.manifest_digest,
+    delivery_mode: "integrated", base_sha, result_sha, cut_id: deliverySource.cut_id,
+  };
+  const deliveryManifest = buildDeliveryManifest({
+    version: 1, delivery_candidate_ref: ref, frozen_batch_manifest: manifest, staged_tasks: copy(stages), deferred_exclusions: [], evidence: copy(observed.evidence),
+  }, { resolveRegisteredRepository() { return copy(deliverySource.registered_repository); } });
+  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: deadline() });
+
+  // Native Git is the only order authority here: the flattened result paths
+  // and the root records, both genuinely different from a locale order.
+  const nativePaths = git(repository, ["ls-tree", "-r", "--name-only", result_sha]).split("\n");
+  const nativeRoot = git(repository, ["ls-tree", "--name-only", result_sha]).split("\n");
+  assert.deepEqual(nativePaths, [".gitignore", "README.md", "bin/cli.js", "docs/guide.md", "lib-versions.json", "lib/util.js", "package.json", "server/a.js", "src/index.js"]);
+  assert.deepEqual(nativeRoot, [".gitignore", "README.md", "bin", "docs", "lib-versions.json", "lib", "package.json", "server", "src"]);
+  assert.notDeepEqual([...nativePaths].sort((left, right) => left.localeCompare(right)), nativePaths, "this root is a locale/byte divergence");
+  assert.notDeepEqual([...nativeRoot].sort((left, right) => left.localeCompare(right)), nativeRoot, "these records are a locale/byte divergence");
+
+  const proof = await composeDeliveryCandidate(deliveryManifest, objects);
+  assert.equal(proof.result.tree_sha, git(repository, ["rev-parse", `${result_sha}^{tree}`]), "the composed result is the native result tree object");
+  assert.deepEqual(proof.result.entries.map((entry) => entry.path), nativePaths, "composed entry order is native `git ls-tree -r` order");
+  assert.deepEqual(proof.base.entries.map((entry) => entry.path), nativePaths);
+  assert.equal(proof.steps[0].output_tree_sha, git(repository, ["rev-parse", `${candidate_a}^{tree}`]), "the intermediate tree is candidate A's native tree object");
+  assert.equal(proof.steps[1].output_tree_sha, proof.result.tree_sha);
+  // Every tree object the adapter wrote was fed to `git mktree` already in
+  // Git's own record order, as `git ls-tree` reads that very object back.
+  const written = calls.filter((entry) => entry.args[0] === "mktree");
+  assert.ok(written.length >= 4, `mktree wrote ${written.length} tree objects`);
+  for (const entry of written) {
+    const fed = entry.input.trimEnd().split("\n").map((line) => line.split("\t")[1]);
+    assert.deepEqual(fed, git(repository, ["ls-tree", "--name-only", git(repository, ["mktree"], entry.input)]).split("\n"), "mktree input is in native record order");
+  }
+  assert.ok(written.some((entry) => entry.input.trimEnd().split("\n").map((line) => line.split("\t")[1]).join(",") === nativeRoot.join(",")), "the root tree was fed in native record order");
+  assert.equal(git(repository, ["status", "--porcelain", "--untracked-files=all"]), "");
+  assert.equal(git(repository, ["show-ref"]), refsBefore, "adapter did not move a ref");
+  console.log("  PASS: a realistic root with uppercase and file-beside-directory names composes in native Git order to the native tree objects");
+});
+
 {
   const source = fs.readFileSync(path.join(__dirname, "delivery-git-object-adapter.js"), "utf8");
   assert.doesNotMatch(source, /require\s*\(\s*["'](?:node:)?(?:child_process|http|https|net|os|fs)["']\s*\)/);
