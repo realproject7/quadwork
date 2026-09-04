@@ -40,6 +40,7 @@ const {
 const {
   WorkTaskPipelineStoreError,
   workTaskPipelineHoldsActiveAuthority,
+  workTaskPipelineStoreCarriesRetirementMarker,
   createWorkTaskPipelineStore,
 } = require("./work-task-pipeline-store");
 const { projectWorkTaskBatch } = require("./work-task-projection");
@@ -475,11 +476,17 @@ function createHeadControlWorkTaskDomain(options) {
   }
   // A retirement is durable in the store before this domain records it.  A
   // frozen state whose active store is gone is proven retired only by the one
-  // retired record the pending intent pinned.  `pipeline_digest` covers the
-  // whole pipeline payload, history included, and this retirement appended its
-  // own revision-bound event to that history, so the pinned digest names one
-  // record and no other — while a manifest digest, which a same-content
-  // successor repeats exactly, names nothing.
+  // retired record the pending intent pinned, and that proof needs BOTH halves.
+  //
+  // The pinned pipeline digest is not sufficient on its own.  It covers the
+  // whole pipeline payload, history included, so it does name one record
+  // whenever this retirement is what archived the batch — its revision-bound
+  // event is in that history.  But a batch already archived by the project
+  // archive takes no archive event from the retirement at all, and that
+  // transition derives its event from owner and manifest digest alone, with no
+  // revision: two same-content batches archived that way are byte-identical,
+  // digest included.  The store therefore writes this retirement's own marker
+  // into `terminal_audit` before it renames, and both are required here.
   function retiredRecordHolds(intent) {
     let retired;
     try { retired = pipelineStore.readRetiredSnapshots(ownerOf(owner)); }
@@ -487,7 +494,8 @@ function createHeadControlWorkTaskDomain(options) {
       if (error instanceof WorkTaskPipelineStoreError) return false;
       throw error;
     }
-    return retired.some((entry) => entry.pipeline.pipeline_digest === intent.archived_pipeline_digest);
+    return retired.some((entry) => entry.pipeline.pipeline_digest === intent.archived_pipeline_digest &&
+      workTaskPipelineStoreCarriesRetirementMarker(entry, intent.retirement_event_id, intent.archived_pipeline_digest));
   }
   function retirePipeline(manifestDigest, pipelineDigest, eventId) {
     try {

@@ -294,6 +294,57 @@ cleanup, a wildcard, or a prefix match. If the stale-only sweep cannot safely
 classify the exact entry, stop and repair or upgrade the affected agent through
 its supported package-manager/CLI workflow before restarting the service.
 
+## Head-control batch reports a missing pipeline after upgrading past #1071 — pre-release diagnostic
+
+**Applies to:** an installation upgraded across #1071 that crashed part-way
+through a batch retirement while running an older build. It cannot be created by
+this build: from #1071 onward a retirement always writes a durable intent before
+it touches the pipeline store, and recovery finishes exactly that intent.
+
+**Symptom:** every Head-control action for one project fails with
+`head_control_work_task_pipeline_missing` — reads included, so
+`get_pipeline_status` and the Current Batch surface fail too. The project cannot
+be retired, cannot take a successor manifest, and does not recover on restart.
+
+**Recognise it (all four must hold):**
+
+1. The domain state file
+   `~/.quadwork/head-control-work-task-domain/<installation_id>--<project_id>.json`
+   has `"stage":"frozen"`.
+2. That same file has `"pending":null` — there is no durable retire intent.
+3. The active pipeline record
+   `~/.quadwork/work-task-pipelines/<installation_id>--<project_id>.json`
+   does not exist.
+4. A retired record `…--<project_id>.retired.NNNN.json` exists whose
+   `manifest.manifest_digest` equals the frozen state's `manifest.manifest_digest`.
+
+Conditions 1–3 alone are the general "frozen batch, no active pipeline, no
+intent" fault, which has other causes (a lost or partially restored config
+directory). Only 4 makes an interrupted pre-#1071 retirement the likely reading,
+and even then a same-content successor produces the same digest — which is
+precisely why the server no longer acts on it.
+
+**Why it is not repaired automatically:** matching a retired record by content
+was the #1071 defect. A manifest digest covers only the version, identity,
+delivery mode and task refs, so a successor batch that repeats an earlier one is
+byte-identical to it; healing on that match destroyed live successors. The
+server now fails closed instead of guessing which batch a retired record ended.
+There is no automatic repair, no flag to re-enable the old behaviour, and none
+should be added.
+
+**Repair — a deliberate operator edit, performed only after the four conditions
+above are confirmed by inspection:** stop the server, back up both files, and
+decide from the retired record's own contents (its `terminal_audit`, its task
+states, its `pipeline.history`) whether the frozen batch really is the one that
+retired record ended. If it is, set the domain state's `"stage"` to `"empty"`,
+`"manifest"` and `"pipeline_digest"` to `null`, and increment `"revision"` by
+one, keeping mode 0600, then restart. If it is not — or if you cannot tell —
+do not edit the file; the durable state is intact and the safe move is to
+preserve both files for inspection rather than to empty a batch that may still
+be live.
+
+---
+
 ## Resource staging matrix does not pass
 
 Start with the read-only diagnostic; do not begin by changing systemd or

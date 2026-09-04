@@ -134,6 +134,32 @@ function nextRetiredPath(fs, statePath) {
 function pipelineHoldsActiveAuthority(pipeline) {
   return pipeline.tasks.some((slot) => ACTIVE_AUTHORITY_STATES.has(slot.state));
 }
+// #1071: one retirement's own audited marker in the retired record.
+//
+// INVARIANT: `retire` writes exactly this entry into `terminal_audit`, durably,
+// BEFORE it renames the record away — on the already-archived path too, where
+// the pipeline itself does not change and no history entry is appended.  A
+// retired record therefore names the retirement that ended it, not merely the
+// content it held.  Content is not enough: a project archive derives its event
+// from owner and manifest digest alone (server/project-archive-transition.js),
+// so two same-content batches archived that way carry byte-identical pipelines
+// and byte-identical pipeline digests.
+//
+// The existing `archive` disposition shape is reused deliberately rather than
+// adding a stored `retirement` kind: a retirement IS the audited archive that
+// ends that batch, the entry already carries the event id and the exact
+// pipeline digest the record will keep, and a new kind would add a persisted
+// schema variant that records no additional fact.  A dedicated kind would only
+// be needed if a record had to distinguish an archive it survived from the
+// archive that retired it — it does not, because the rename does that.
+function retirementMarker(eventId, pipelineDigest) {
+  return { kind: "archive", event_id: eventId, archived: true, pipeline_digest: pipelineDigest };
+}
+function carriesRetirementMarker(record, eventId, pipelineDigest) {
+  const marker = retirementMarker(eventId, pipelineDigest);
+  return record.terminal_audit.some((entry) => entry.kind === marker.kind && entry.event_id === marker.event_id &&
+    entry.archived === marker.archived && entry.pipeline_digest === marker.pipeline_digest);
+}
 function assertTerminalDisposition(value, code) {
   if (value === null) return null;
   if (!plain(value) || !TERMINAL_KINDS.has(value.kind)) fail(code, "terminal disposition is invalid");
@@ -384,6 +410,13 @@ function createWorkTaskPipelineStore(options) {
           fail("stale_or_invalid_work_task_pipeline_store_plan", "stored pipeline no longer accepts the archive transition");
         }
         state = commit(target, current, nextPipeline, { kind: "archive", event_id: retirement.event_id, archived: true });
+      } else if (!carriesRetirementMarker(current, retirement.event_id, current.pipeline.pipeline_digest)) {
+        // Already archived by an earlier transition: the pipeline takes no
+        // second archive event, but this retirement still records its own
+        // marker durably before the rename.  Replay finds the marker already
+        // there and writes nothing — a duplicate event id is rejected outright
+        // by `assertStoredState`, so skipping is the only correct resume.
+        state = commit(target, current, current.pipeline, { kind: "archive", event_id: retirement.event_id, archived: true });
       }
       const retiredPath = nextRetiredPath(fs, target);
       try {
@@ -416,6 +449,7 @@ module.exports = {
   WorkTaskPipelineStoreError,
   assertWorkTaskPipelineStoreState: assertStoredState,
   workTaskPipelineHoldsActiveAuthority: pipelineHoldsActiveAuthority,
+  workTaskPipelineStoreCarriesRetirementMarker: carriesRetirementMarker,
   workTaskPipelineStorePath,
   createWorkTaskPipelineStore,
 };
