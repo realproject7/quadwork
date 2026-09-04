@@ -312,11 +312,16 @@ be retired, cannot take a successor manifest, and does not recover on restart.
    `~/.quadwork/head-control-work-task-domain/<installation_id>--<project_id>.json`
    has `"stage":"frozen"`.
 2. That same file has `"pending":null` — there is no durable retire intent.
-3. The active pipeline record
+3. The active pipeline record does not exist at either of the two names it can
+   have. From #1071 onward it is
+   `~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/record.json`;
+   a store written before #1071 still has it at
    `~/.quadwork/work-task-pipelines/<installation_id>--<project_id>.json`
-   does not exist.
-4. A retired record `…--<project_id>.retired.NNNN.json` exists whose
-   `manifest.manifest_digest` equals the frozen state's `manifest.manifest_digest`.
+   until the first read migrates it (see the next section).
+4. A retired record exists whose `manifest.manifest_digest` equals the frozen
+   state's `manifest.manifest_digest` — `record.retired.NNNN.json` beside the
+   `record.json` above, or `…--<project_id>.retired.NNNN.json` in the
+   pre-#1071 layout.
 
 Conditions 1–3 alone are the general "frozen batch, no active pipeline, no
 intent" fault, which has other causes (a lost or partially restored config
@@ -342,6 +347,81 @@ one, keeping mode 0600, then restart. If it is not — or if you cannot tell —
 do not edit the file; the durable state is intact and the safe move is to
 preserve both files for inspection rather than to empty a batch that may still
 be live.
+
+## Pipeline store refuses every operation for one project after upgrading past #1071 — legacy migration
+
+**Applies to:** an installation whose WorkTask pipeline records were written
+before #1071 and are now being read by a build from #1071 onward.
+
+**What changed:** #1071 gave each identity its own directory,
+`~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/`, holding
+`record.json` and `record.retired.NNNN.json`. The pre-#1071 layout put every
+project's records in one flat directory as
+`<installation_id>--<project_id>.json` and
+`<installation_id>--<project_id>.retired.NNNN.json`, where a project id may
+itself spell another project's retired suffix.
+
+**The migration is not a separate command, and it is not deferred to a write.**
+The *first* operation that touches a project adopts that project's pre-#1071
+records — a read such as `get_pipeline_status` included. Each record moves by a
+single `rename`, so a record is always at exactly one of its two names, and an
+interrupted migration is finished by the next operation. Retired ordinals move
+first in ascending order and the active record moves last, so an interrupted
+migration never leaves a project with no active record anywhere.
+
+**Only an unambiguous record is adopted.** A candidate is taken only when its
+own stored `identity` object names this exact `installation_id` and
+`project_id`. A candidate that decodes cleanly but names a different identity is
+left exactly where it is and contributes nothing. This is not a nicety: the one
+filename `<installation_id>--quadwork.retired.0001.json` is spelled both by
+project `quadwork` at retired ordinal 1 and by the project literally named
+`quadwork.retired.0001`, and only the record's own contents can say which it is.
+
+**Symptom when it refuses:** every operation for that one project fails — reads
+included. The store raises one of:
+
+- `work_task_pipeline_store_legacy_conflict` — a migrated record and a
+  pre-#1071 record for the same identity both exist, so neither is
+  authoritative.
+- `work_task_pipeline_store_symlink_rejected` — a candidate is a symbolic link.
+- `work_task_pipeline_store_insecure_permissions` — a candidate is not a mode
+  0600 regular file owned by the server's user.
+- `corrupt_work_task_pipeline_store` or
+  `unknown_work_task_pipeline_store_schema` — a candidate cannot be decoded, so
+  whose it is cannot be established.
+- `work_task_pipeline_store_unreadable` or
+  `work_task_pipeline_store_write_failed` — the directory cannot be listed, or a
+  record could not be moved.
+
+Through Head-control these surface as `head_control_work_task_pipeline_unavailable`
+on an ordinary pipeline read, and as `head_control_work_task_pipeline_missing`
+when a pending retire intent is being recovered and its retired record cannot be
+read.
+
+**Why the refusal covers reads too — an accepted tradeoff, not an oversight.**
+Reading whichever candidate looks plausible is exactly the ambiguity #1071
+exists to remove: under the old layout one project's live record and another
+project's retired record could be the same file, and a content match was not
+enough to tell them apart. Blocking a project's reads until an operator resolves
+its state is the deliberate price of never answering for the wrong batch. It is
+not a reason to reintroduce an ambiguous read, there is no flag to re-enable
+one, and none should be added.
+
+**What to do:** stop all writers (`npx quadwork stop`), then preserve *both*
+exact paths for diagnosis — the pre-#1071 name
+`~/.quadwork/work-task-pipelines/<installation_id>--<project_id>.json` (and any
+`…--<project_id>.retired.NNNN.json` beside it) and the post-#1071 name
+`~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/record.json`
+(and any `record.retired.NNNN.json` beside it). Read each candidate's own
+`identity`, `manifest.manifest_digest`, and `terminal_audit` before concluding
+anything about which batch it belongs to.
+
+Do not delete a candidate, do not copy one over the other, and do not rename one
+into place to make the conflict go away: a name is not authority here, and a
+hand-placed record is adopted only if its stored identity already matched — in
+which case moving it was never the fix. If the two records disagree about which
+batch is current, that disagreement is the finding; preserve it rather than
+resolving it by guesswork.
 
 ---
 

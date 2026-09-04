@@ -167,6 +167,13 @@ function writeLegacy(target, record, mode = RECORD_MODE) {
   fs.chmodSync(target, mode);
   return target;
 }
+// Reads one decoy back through the store's own validator so the fixture is
+// proven acceptable rather than assumed to be.
+function decodeDecoy(target) {
+  const value = JSON.parse(fs.readFileSync(target, "utf8"));
+  assertWorkTaskPipelineStoreState(value);
+  return value;
+}
 function retiredNames(directory, owner) {
   const ownerDirectory = path.dirname(workTaskPipelineStorePath(directory, owner));
   let names;
@@ -414,6 +421,70 @@ withDirectory((directory) => {
   assert.deepEqual(retiredNames(directory, owner), ["record.retired.9998.json", "record.retired.9999.json"]);
   assert.notEqual(fs.readFileSync(activePath, "utf8"), activeBytes,
     "the archive transition before the refused rename is still durable");
+});
+
+// ---------------------------------------------------------------------------
+// The retired filter is an exact whole-name match — not a prefix, not a stem,
+// not "starts with the shape".  This directory is operator-owned state: a
+// backup copy, an editor's leftover, or a hand-widened ordinal can appear in it
+// without the product ever having written one.  A neighbour must neither be
+// read as provenance nor consume an ordinal a real retirement would take, and
+// the second is the sharper of the two: a filter that merely declines to decode
+// a neighbour still lets it silently push every later retirement along.
+// ---------------------------------------------------------------------------
+
+withDirectory((directory) => {
+  const owner = { installation_id, project_id: "quadwork" };
+  const first = seed(directory, owner, { task_key: "neighbour_one" });
+  const ownerDirectory = path.dirname(workTaskPipelineStorePath(directory, owner));
+  // Every decoy carries bytes this store would decode happily as this exact
+  // identity's own retired record, so nothing but the filename can exclude it.
+  // A decoy that failed to parse would prove only that parsing is strict.
+  const decoy = (name, task_key) => {
+    const target = path.join(ownerDirectory, name);
+    fs.writeFileSync(target, `${JSON.stringify(archivedRecord(owner, { task_key, event_id: `decoy_${task_key}` }))}\n`,
+      { encoding: "utf8", mode: RECORD_MODE, flag: "w" });
+    fs.chmodSync(target, RECORD_MODE);
+    assert.equal(decodeDecoy(target).identity.project_id, owner.project_id,
+      "the decoy really is a record this store would accept for this identity");
+    return target;
+  };
+  decoy("record.retired.0001.json.bak", "trailing");
+  decoy("xrecord.retired.0001.json", "leading");
+  decoy("record.retired.00001.json", "widened");
+
+  assert.deepEqual(first.store.readRetiredSnapshots(owner), [],
+    "a name that is not exactly record.retired.NNNN.json is never provenance");
+
+  const retiredOne = first.store.retire({ expected: currentExpected(first.state), event_id: "neighbour_retire_one" });
+  // The exact set, spelled out: the retirement took ordinal 0001, which is the
+  // ordinal it would have taken with no neighbour present at all.
+  assert.deepEqual(fs.readdirSync(ownerDirectory).sort(), [
+    "record.retired.0001.json",
+    "record.retired.0001.json.bak",
+    "record.retired.00001.json",
+    "xrecord.retired.0001.json",
+  ].sort(), "a neighbour never advances the next retired ordinal");
+  const afterOne = first.store.readRetiredSnapshots(owner);
+  assert.equal(afterOne.length, 1);
+  assert.deepEqual(afterOne[0], retiredOne);
+
+  // The same at an ordinal above 1, where the arithmetic is a successor step
+  // rather than the empty-directory default.
+  const second = seed(directory, owner, { task_key: "neighbour_two" });
+  decoy("record.retired.0002.json.bak", "trailing_two");
+  const retiredTwo = second.store.retire({ expected: currentExpected(second.state), event_id: "neighbour_retire_two" });
+  assert.deepEqual(fs.readdirSync(ownerDirectory).sort(), [
+    "record.retired.0001.json",
+    "record.retired.0001.json.bak",
+    "record.retired.00001.json",
+    "record.retired.0002.json",
+    "record.retired.0002.json.bak",
+    "xrecord.retired.0001.json",
+  ].sort(), "the successor retirement takes 0002, not 0003");
+  assert.deepEqual(second.store.readRetiredSnapshots(owner).map((entry) => entry.manifest.manifest_digest),
+    [retiredOne.manifest.manifest_digest, retiredTwo.manifest.manifest_digest],
+    "provenance is the two real records, in ordinal order, and nothing else");
 });
 
 console.log("work-task-pipeline-store-namespace.test.js: all assertions passed");
