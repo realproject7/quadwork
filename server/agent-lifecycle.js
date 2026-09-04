@@ -21,6 +21,12 @@ const AUTOMATIC_SOURCES = new Set(["startup_restore", "watchdog", "self_heal", "
 const OPERATOR_SOURCES = new Set(["operator_start", "operator_restart", "operator_reset", "operator_recovery"]);
 const HEAD_RECOVERY_SOURCE = "head_recovery";
 const MAX_AUTOMATIC_EARLY_EXIT_RETRIES = 1;
+// #1073: Head may take at most this many circuit trials per assignment, over
+// every failure signature that assignment's circuits open with.  The budget
+// resets only when the circuit belongs to a different assignment identity or
+// when an operator's trial clears the circuit; Head's own post never resets it.
+const MAX_HEAD_TRIALS_PER_ASSIGNMENT = 1;
+const HEAD_TRIAL_BUDGET_SIGNATURE = "head_trial";
 
 class AgentLifecycleError extends Error {
   constructor(code) {
@@ -103,6 +109,13 @@ function safeCircuit(value) {
   const headTrialOperationId = typeof value.head_trial_operation_id === "string" && value.head_trial_operation_id.length <= 64
     ? value.head_trial_operation_id
     : null;
+  const headTrialAssignment = typeof value.head_trial_assignment === "string" && value.head_trial_assignment.length <= 128
+    ? value.head_trial_assignment
+    : null;
+  const headTrials = Number.isSafeInteger(value.head_trials) && value.head_trials >= 0
+    && value.head_trials <= MAX_HEAD_TRIALS_PER_ASSIGNMENT
+    ? value.head_trials
+    : 0;
   return Object.freeze({
     open,
     reason,
@@ -111,6 +124,8 @@ function safeCircuit(value) {
     expected_generation: expectedGeneration,
     trial_operation_id: trialOperationId,
     head_trial_operation_id: headTrialOperationId,
+    head_trial_assignment: headTrialAssignment,
+    head_trials: headTrials,
   });
 }
 
@@ -164,6 +179,8 @@ function redactedRecord(record) {
       expected_generation: record.circuit.expected_generation,
       trial_operation_id: record.circuit.trial_operation_id,
       head_trial_operation_id: record.circuit.head_trial_operation_id,
+      head_trial_assignment: record.circuit.head_trial_assignment,
+      head_trials: record.circuit.head_trials,
     }) : null,
   });
 }
@@ -330,6 +347,7 @@ class AgentLifecycleGovernor {
       // automatic-retry rule, and may additionally take the one explicit
       // circuit trial. Watchdog/startup/self-heal/reseed never can.
       const headTrial = source === HEAD_RECOVERY_SOURCE && priorCircuit?.open === true;
+      const headTrialBudget = headTrial ? lossCorrelationFor(projectId, role, previous, HEAD_TRIAL_BUDGET_SIGNATURE) : null;
       if (isAutomatic && priorCircuit?.open && !headTrial) return this._rejected("circuit_open", previous);
       if (priorCircuit?.open && (isOperator || headTrial)) {
         const authorizedTrial = typeof input.lossCorrelation === "string"
@@ -346,7 +364,15 @@ class AgentLifecycleGovernor {
         }
         // A failed Head-initiated trial cannot be chained by Head; only a
         // fresh human Operator action may authorize another single trial.
-        if (headTrial && priorCircuit.head_trial_operation_id) return this._rejected("head_trial_consumed", previous);
+        // #1073: the same holds when Head's trial posted and then crashed.
+        // Its post cleared the circuit, so consumed trials are budgeted per
+        // assignment identity (the same anchor every loss correlation is
+        // derived from, whichever failure signature re-opened the circuit).
+        if (headTrial && (priorCircuit.head_trial_operation_id
+          || (priorCircuit.head_trial_assignment === headTrialBudget
+            && priorCircuit.head_trials >= MAX_HEAD_TRIALS_PER_ASSIGNMENT))) {
+          return this._rejected("head_trial_consumed", previous);
+        }
       } else if (input.expectedGeneration && (!previous || previous.generation_id !== input.expectedGeneration)) {
         return this._rejected("stale_expected_generation", previous);
       }
@@ -406,6 +432,10 @@ class AgentLifecycleGovernor {
         expected_generation: priorCircuit.expected_generation,
         trial_operation_id: priorCircuit.open ? operationId : null,
         head_trial_operation_id: headTrial ? operationId : priorCircuit.head_trial_operation_id,
+        head_trial_assignment: headTrial ? headTrialBudget : priorCircuit.head_trial_assignment,
+        head_trials: headTrial
+          ? (priorCircuit.head_trial_assignment === headTrialBudget ? priorCircuit.head_trials : 0) + 1
+          : priorCircuit.head_trials,
       } : {
         open: false,
         reason: null,
@@ -414,6 +444,8 @@ class AgentLifecycleGovernor {
         expected_generation: null,
         trial_operation_id: null,
         head_trial_operation_id: null,
+        head_trial_assignment: null,
+        head_trials: 0,
       };
       const record = {
         operation_id: operationId,
@@ -453,6 +485,8 @@ class AgentLifecycleGovernor {
           expected_generation: null,
           trial_operation_id: null,
           head_trial_operation_id: null,
+          head_trial_assignment: null,
+          head_trials: 0,
         };
       let unresolvedLoss = previous.unresolved_loss;
       if (next === "resource_killed") {
@@ -466,6 +500,12 @@ class AgentLifecycleGovernor {
         // The trial clears only on the runtime's structured confirmation: an
         // action authenticated with this generation's own shim token, never
         // the first PTY bytes, which a banner-then-crash also produces.
+        // #1073: a post-then-crash clears too, so Head's per-assignment
+        // budget is kept; only an operator's clearing trial resets it.
+        if (circuit.head_trial_operation_id !== previous.operation_id) {
+          circuit.head_trial_assignment = null;
+          circuit.head_trials = 0;
+        }
         circuit.open = false;
         circuit.reason = null;
         circuit.loss_correlation = null;
@@ -551,6 +591,7 @@ module.exports = {
   LIFECYCLE_FILENAME,
   LIFECYCLE_STATES,
   MAX_AUTOMATIC_EARLY_EXIT_RETRIES,
+  MAX_HEAD_TRIALS_PER_ASSIGNMENT,
   AgentLifecycleError,
   AgentLifecycleGovernor,
   createAgentLifecycleGovernor: (options) => new AgentLifecycleGovernor(options),

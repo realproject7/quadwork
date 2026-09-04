@@ -451,12 +451,69 @@ process.on("exit", cleanup);
     assert.equal((await devFacts()).circuit.open, false);
     ok(true, "a trial that posts through its own shim token clears the circuit, and the real watchdog is admitted again");
 
+    // 6d. #1073: the operator's clearing trial in 6c re-armed Head.  Head's
+    //     next trial is a worker that posts through its own shim token and
+    //     then exits: the post clears the circuit, the exit exhausts the
+    //     automatic retry, and the same circuit re-opens.  Head is refused on
+    //     it; only another operator trial that clears re-arms Head.
+    seedProgress();
+    assert.match((await watchdogRespawnAttempt())[0] || "", /auto-respawn failed: circuit_open/, "the automatic retry after 6c is exhausted");
+    const reopened = await devFacts();
+    assert.equal(reopened.circuit.open, true);
+    assert.equal(reopened.circuit.loss_correlation, lossCorrelation, "the same work failing the same way re-opens the same circuit");
+    assert.equal(reopened.circuit.head_trial_operation_id, null);
+    seedProgress();
+    const rearmed = await recover(shim, "5", generation7);
+    assert.equal(rearmed.decision.code, "head_control_applied", "the operator's clearing trial re-armed Head");
+    assert.equal(rearmed.detail.operation.circuit.head_trial_operation_id, rearmed.detail.operation.operation_id);
+    const postedThenCrashed = await until(async () => {
+      const facts = await devFacts();
+      return facts.generation_id === rearmed.detail.operation.generation_id && facts.circuit.open === false ? facts : null;
+    }, "Head's trial cleared the circuit by its authenticated post");
+    assert.equal(postedThenCrashed.circuit.head_trial_operation_id, null);
+    const generation8 = await devExited(generation7, "post-then-crash exit");
+    assert.equal(generation8, rearmed.detail.operation.generation_id);
+    seedProgress();
+    assert.deepEqual(await watchdogRespawnAttempt(), [], "the closed circuit admits the one automatic retry");
+    const generation9 = await devExited(generation8, "automatic retry exit");
+    seedProgress();
+    assert.match((await watchdogRespawnAttempt())[0] || "", /auto-respawn failed: circuit_open/);
+    assert.equal((await devFacts()).circuit.loss_correlation, lossCorrelation);
+    seedProgress();
+    const bounded = await recover(shim, "6", generation9);
+    assert.equal(bounded.decision.code, "head_control_recovery_refused");
+    assert.equal(bounded.detail.reason, "head_trial_consumed", "post-then-crash does not re-arm Head on the same circuit");
+    assert.equal(devSession().generationId, generation9, "no process was spawned for the refused trial");
+    ok(true, "a Head trial that posts and then crashes is refused a second trial on the re-opened circuit");
+
+    // 6e. A fresh operator trial that clears re-arms Head for the next
+    //     circuit, and the bound holds again there.
+    seedProgress();
+    const operatorAgain = await runtime.restartAgentSession(`${PROJECT}/dev`, {
+      reason: "manual", clearSelfHeal: true, lifecycleSource: "operator_restart", operatorAuthorized: true, explicitRole: true,
+      expectedGeneration: generation9, lossCorrelation,
+    });
+    assert.equal(operatorAgain.ok, true);
+    await until(async () => (await devFacts()).generation_id === operatorAgain.lifecycle.generation_id && (await devFacts()).circuit.open === false, "operator trial cleared");
+    const generation10 = await devExited(generation9, "operator trial exit");
+    seedProgress();
+    assert.deepEqual(await watchdogRespawnAttempt(), []);
+    const generation11 = await devExited(generation10, "automatic retry exit after operator");
+    seedProgress();
+    assert.match((await watchdogRespawnAttempt())[0] || "", /auto-respawn failed: circuit_open/);
+    seedProgress();
+    const rearmedAgain = await recover(shim, "7", generation11);
+    assert.equal(rearmedAgain.decision.code, "head_control_applied", "an operator trial that clears re-arms Head once more");
+    const generation12 = await devExited(generation11, "second re-armed trial exit");
+    assert.equal(generation12, rearmedAgain.detail.operation.generation_id);
+    ok(true, "only an operator trial that clears the circuit re-arms Head, and the post-then-crash bound holds again");
+
     // 7. Every recovery left the dirty worktree byte-unchanged.
     assert.deepEqual(worktreeObservation(), INITIAL_WORKTREE);
     assert.equal(fs.readFileSync(path.join(WORKTREES.dev, "README.md"), "utf8"), "dirty uncommitted work\n");
     const audit = await shim.call("recent_head_control_audit", {});
-    assert.deepEqual(audit.filter((record) => record.action === "recover_worker").map((record) => record.decision), ["accepted", "denied", "accepted", "denied"]);
-    ok(true, "dirty WIP, the unpushed commit, and the branch survived four recoveries byte-unchanged, and every decision is audited");
+    assert.deepEqual(audit.filter((record) => record.action === "recover_worker").map((record) => record.decision), ["accepted", "denied", "accepted", "denied", "accepted", "denied", "accepted"]);
+    ok(true, "dirty WIP, the unpushed commit, and the branch survived every recovery byte-unchanged, and every decision is audited");
   } finally {
     releaseContainment();
     await shim.stop();
