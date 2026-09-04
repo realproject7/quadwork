@@ -11,6 +11,11 @@
 // #1069: `abandon_batch_manifest` is the one exit for a manifest that was put
 // but never frozen; it is refused the moment a freeze intent or a pipeline
 // exists and never touches frozen, cut, or retired records.
+// #1071: `retire_batch` is likewise two-phase.  Its intent is durable before
+// the store retirement and names that one transition exactly, and recovery
+// finishes only the transition the intent names.  A missing active pipeline
+// with no such intent is a fact this domain cannot explain, so it fails closed
+// rather than matching a retired record by content.
 
 const crypto = require("node:crypto");
 const path = require("node:path");
@@ -34,6 +39,7 @@ const {
 } = require("./work-task-pipeline");
 const {
   WorkTaskPipelineStoreError,
+  workTaskPipelineHoldsActiveAuthority,
   createWorkTaskPipelineStore,
 } = require("./work-task-pipeline-store");
 const { projectWorkTaskBatch } = require("./work-task-projection");
@@ -53,6 +59,7 @@ const ACTIONS = new Set([
   "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop",
 ]);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
+const PENDING_ACTIONS = new Set(["freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest"]);
 const FILE_CODES = Object.freeze({
   options: "invalid_head_control_work_task_domain_options",
   unreadable: "head_control_work_task_state_unreadable",
@@ -276,8 +283,33 @@ function statusFor(state, snapshot) {
 
 function pending(value, state, owner, code) {
   if (value === null) return null;
-  if (!plain(value) || (value.action !== "freeze_batch_manifest" && value.action !== "cut_batch" && value.action !== "abandon_batch_manifest")) {
+  if (!plain(value) || !PENDING_ACTIONS.has(value.action)) {
     fail(code, "pending action is invalid");
+  }
+  if (value.action === "retire_batch") {
+    exact(value, ["action", "expected_revision", "fingerprint", "manifest_digest", "expected_pipeline_digest", "archived_pipeline_digest", "retirement_event_id"], code);
+    // The intent names the exact transition it is finishing: this revision,
+    // this manifest, the pipeline digest it is retiring, the digest the
+    // retired record will carry once the store has archived it, and its own
+    // deterministic retirement event.  A same-content successor repeats its
+    // predecessor's manifest digest at a later revision, so a digest alone can
+    // never say which batch an interrupted retirement was ending; an intent
+    // that fails this check is corrupt, never resumed.
+    if (state.stage !== "frozen" || revision(value.expected_revision, code) !== state.revision || !SHA_RE.test(value.fingerprint) ||
+        digest(value.manifest_digest, code) !== state.manifest.manifest_digest ||
+        digest(value.expected_pipeline_digest, code) !== state.pipeline_digest ||
+        !SHA_RE.test(value.archived_pipeline_digest) || !IDENTIFIER_RE.test(value.retirement_event_id)) {
+      fail(code, "pending retire precondition is invalid");
+    }
+    return {
+      action: value.action,
+      expected_revision: value.expected_revision,
+      fingerprint: value.fingerprint,
+      manifest_digest: value.manifest_digest,
+      expected_pipeline_digest: value.expected_pipeline_digest,
+      archived_pipeline_digest: value.archived_pipeline_digest,
+      retirement_event_id: value.retirement_event_id,
+    };
   }
   if (value.action === "abandon_batch_manifest") {
     exact(value, ["action", "expected_revision", "fingerprint", "manifest_digest"], code);
@@ -418,17 +450,63 @@ function createHeadControlWorkTaskDomain(options) {
     }
     return pipelineSnapshot(stored, owner, manifest);
   }
+  // The deterministic name of one retirement.  The same invocation at the same
+  // revision always produces the same event, so an intent can be replayed
+  // against the store without inventing a second archive event for the same
+  // batch.  The revision is part of that name: a same-content successor is
+  // retired at a strictly later revision, and without it an identical
+  // invocation would name its predecessor's retirement as well as its own.
+  function retirementEventId(input, revisionValue) {
+    return `hretire_${hash({ binding: owner, revision: revisionValue, correlation_id: input.correlation_id, idempotency_key: input.idempotency_key }).slice(0, 64)}`;
+  }
+  // The digest the retired record will carry.  The store archives under its own
+  // CAS before it renames the record away, so pinning the post-archive digest
+  // in the intent names that record exactly, the way a cut intent pins its next
+  // pipeline digest.  An already-archived pipeline — a project archive can
+  // archive a frozen batch the Head then retires — is renamed untouched, so its
+  // retired digest is the one it already has.
+  function archivedPipelineDigest(pipeline, eventId) {
+    if (pipeline.archived) return pipeline.pipeline_digest;
+    try {
+      return applyWorkTaskPipelinePlan(pipeline, planWorkTaskPipelineEvent(pipeline, {
+        version: 1, kind: "set_archived", event_id: eventId, archived: true,
+      })).pipeline_digest;
+    } catch { fail("head_control_work_task_pipeline_stale", "the frozen pipeline cannot take its archive transition"); }
+  }
   // A retirement is durable in the store before this domain records it.  A
-  // frozen state whose active store is gone is therefore proven retired only
-  // by an archived retired record of that exact manifest, never assumed.
-  function retiredHolds(state) {
+  // frozen state whose active store is gone is proven retired only by the one
+  // retired record the pending intent pinned.  `pipeline_digest` covers the
+  // whole pipeline payload, history included, and this retirement appended its
+  // own revision-bound event to that history, so the pinned digest names one
+  // record and no other — while a manifest digest, which a same-content
+  // successor repeats exactly, names nothing.
+  function retiredRecordHolds(intent) {
     let retired;
     try { retired = pipelineStore.readRetiredSnapshots(ownerOf(owner)); }
     catch (error) {
       if (error instanceof WorkTaskPipelineStoreError) return false;
       throw error;
     }
-    return retired.some((entry) => entry.manifest.manifest_digest === state.manifest.manifest_digest && entry.pipeline.archived);
+    return retired.some((entry) => entry.pipeline.pipeline_digest === intent.archived_pipeline_digest);
+  }
+  function retirePipeline(manifestDigest, pipelineDigest, eventId) {
+    try {
+      pipelineStore.retire({
+        expected: {
+          installation_id: owner.installation_id,
+          project_id: owner.project_id,
+          manifest_digest: manifestDigest,
+          pipeline_digest: pipelineDigest,
+        },
+        event_id: eventId,
+      });
+    } catch (error) {
+      if (error instanceof WorkTaskPipelineStoreError) {
+        fail(error.code === "work_task_pipeline_store_batch_active" ? "head_control_work_task_batch_active" : "head_control_work_task_pipeline_unavailable",
+          "batch retirement was rejected");
+      }
+      throw error;
+    }
   }
   // An active pipeline is build, review, and candidate authority.  A manifest
   // may be abandoned only while none exists for this project; the retired
@@ -518,6 +596,32 @@ function createHeadControlWorkTaskDomain(options) {
         writeState(files, statePath, abandoned, owner);
         return snapshot(abandoned, owner);
       }
+      if (state.pending.action === "retire_batch") {
+        // `assertState` already proved the intent names this exact revision,
+        // manifest, and pre-retirement pipeline digest.  Only the store side of
+        // that one transition can still be unfinished.
+        const intent = state.pending;
+        let stored = null;
+        try { stored = readPipeline(state.manifest); }
+        catch (error) {
+          if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_missing") throw error;
+        }
+        if (stored !== null) {
+          // The active record survived: either the store retirement never ran,
+          // or it archived under CAS and had not yet renamed the record away.
+          // Any other pipeline is a different batch's, never retired from here.
+          const current = stored.pipeline.pipeline_digest;
+          if (current !== intent.expected_pipeline_digest && !(stored.pipeline.archived && current === intent.archived_pipeline_digest)) {
+            fail("head_control_work_task_pipeline_stale", "retirement recovery found a changed or foreign pipeline");
+          }
+          retirePipeline(intent.manifest_digest, current, intent.retirement_event_id);
+        } else if (!retiredRecordHolds(intent)) {
+          fail("head_control_work_task_pipeline_missing", "the retirement named by the pending intent is absent from the pipeline store");
+        }
+        const retired = emptyState(state.revision + 1);
+        writeState(files, statePath, retired, owner);
+        return snapshot(retired, owner);
+      }
       if (state.pending.action === "freeze_batch_manifest") {
         assertCurrentManifest(state.manifest, options.resolve_registered_identity);
         const frozenManifest = state.pending.frozen_manifest;
@@ -559,14 +663,11 @@ function createHeadControlWorkTaskDomain(options) {
       const state = currentState();
       if (state.pending !== null) fail("head_control_work_task_pending_recovery_required", "pending domain write was not recovered");
       if (state.stage !== "frozen") return { state: snapshot(state, owner), pipeline: null };
-      let stored;
-      try { stored = readPipeline(state.manifest); }
-      catch (error) {
-        if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_missing" || !retiredHolds(state)) throw error;
-        const retired = emptyState(state.revision + 1);
-        writeState(files, statePath, retired, owner);
-        return { state: snapshot(retired, owner), pipeline: null };
-      }
+      // A frozen batch whose active pipeline is gone is never healed from
+      // retired content: only the pending intent above names a retirement, and
+      // it was already recovered.  Without one this is an unexplained loss, so
+      // the missing pipeline is reported rather than emptied.
+      const stored = readPipeline(state.manifest);
       if (stored.pipeline.pipeline_digest === state.pipeline_digest) return { state: snapshot(state, owner), pipeline: stored };
       const next = clone(state);
       next.revision += 1;
@@ -729,37 +830,37 @@ function createHeadControlWorkTaskDomain(options) {
   }
   // Retirement ends one frozen batch: the store archives and renames the
   // record under CAS, then this domain returns to `empty` at the next revision
-  // so a successor manifest can be put.  A crash between those two writes is
-  // healed by `synchronizeFrozen` from the retired record itself.
+  // so a successor manifest can be put.  The intent is durable before either
+  // store write and names that exact transition, so a crash anywhere between
+  // them is finished by `recoverPending` — and only ever that transition.
   function retire_batch(command) {
     const input = assertInvocation(command, "retire_batch", owner);
     prepared();
-    return files.withWriterLock(statePath, () => {
+    files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "frozen");
       const stored = readPipeline(state.manifest);
       if (stored.pipeline.pipeline_digest !== state.pipeline_digest) fail("head_control_work_task_pipeline_stale", "pipeline changed before retirement");
-      try {
-        pipelineStore.retire({
-          expected: {
-            installation_id: owner.installation_id,
-            project_id: owner.project_id,
-            manifest_digest: state.manifest.manifest_digest,
-            pipeline_digest: state.pipeline_digest,
-          },
-          event_id: `hretire_${hash({ binding: owner, correlation_id: input.correlation_id, idempotency_key: input.idempotency_key }).slice(0, 64)}`,
-        });
-      } catch (error) {
-        if (error instanceof WorkTaskPipelineStoreError) {
-          fail(error.code === "work_task_pipeline_store_batch_active" ? "head_control_work_task_batch_active" : "head_control_work_task_pipeline_unavailable",
-            "batch retirement was rejected");
-        }
-        throw error;
+      // The store refuses a batch that still holds build or review authority.
+      // Reach that verdict before the intent is durable: an intent whose
+      // recovery could never finish would wedge every later domain read.
+      if (workTaskPipelineHoldsActiveAuthority(stored.pipeline)) {
+        fail("head_control_work_task_batch_active", "batch retains active build or review authority");
       }
-      const next = emptyState(state.revision + 1);
+      const eventId = retirementEventId(input, state.revision);
+      const next = clone(state);
+      next.pending = {
+        action: "retire_batch",
+        expected_revision: state.revision,
+        fingerprint: invocationFingerprint(input),
+        manifest_digest: state.manifest.manifest_digest,
+        expected_pipeline_digest: state.pipeline_digest,
+        archived_pipeline_digest: archivedPipelineDigest(stored.pipeline, eventId),
+        retirement_event_id: eventId,
+      };
       writeState(files, statePath, next, owner);
-      return statusFor(next, null);
     });
+    return statusFor(recoverPending(), null);
   }
   // Abandonment ends one never-frozen manifest: Head walks away from a
   // manifest it decided against so a successor can be put.  The intent is

@@ -501,31 +501,340 @@ withDirectory((directory) => {
   assert.equal(store.readRetiredSnapshots(owner).length, 0);
   ok(true, "a batch with active build authority cannot be retired");
 });
+// #1071 shared fixture for the interrupted-retirement cases below.  Every one
+// of them reaches the same durable point: one frozen batch at revision 2 whose
+// pipeline is the freeze's initial pipeline.
+function frozenBatchFor(directory, faultFs) {
+  const current = domain(directory, faultFs ? { fs: faultFs } : {});
+  current.initialize();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
+  const frozen = current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
+  assert.equal(frozen.revision, 2);
+  return {
+    current,
+    frozen,
+    owner: { installation_id: binding.installation_id, project_id: binding.project_id },
+    store: createWorkTaskPipelineStore({ config_dir: directory, fs }),
+  };
+}
+function persistedState(directory) {
+  return JSON.parse(fs.readFileSync(headControlWorkTaskDomainPath(directory, binding), "utf8"));
+}
+const emptyStatus = (revision) => ({ revision, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+const statusRequest = (label) => request("get_pipeline_status", null, null, { correlation_id: `corr_status_${label}`, idempotency_key: `idem_status_${label}` });
+
+// #1071: the retirement intent is durable before the store retirement, names
+// that one transition exactly, and a crash after the store has retired the
+// record is finished from the intent — not from whatever the retired records
+// happen to contain.  A restart replays the same completed transition once.
+withDirectory((directory) => {
+  let armed = false;
+  let domainWrites = 0;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("head-control-work-task-domain")) {
+      domainWrites += 1;
+      // Write 1 is the intent, write 2 the empty state after the store has
+      // already retired the record.  Only the second is lost.
+      if (domainWrites === 2) {
+        const error = new Error("injected crash after store retirement");
+        error.code = "EIO";
+        throw error;
+      }
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, frozen, owner, store } = frozenBatchFor(directory, faultFs);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_state_write_failed");
+  assert.equal(domainWrites, 2, "the intent is written before the store retirement, the empty state after it");
+  assert.equal(store.readRetiredSnapshots(owner).length, 1, "the store retirement is durable before the domain write");
+  const record = store.readRetiredSnapshots(owner)[0];
+  const stalled = persistedState(directory);
+  assert.equal(stalled.stage, "frozen");
+  assert.equal(stalled.revision, 2);
+  assert.deepEqual(Object.keys(stalled.pending).sort(),
+    ["action", "archived_pipeline_digest", "expected_pipeline_digest", "expected_revision", "fingerprint", "manifest_digest", "retirement_event_id"]);
+  assert.equal(stalled.pending.action, "retire_batch");
+  assert.equal(stalled.pending.expected_revision, 2);
+  assert.equal(stalled.pending.manifest_digest, frozen.manifest_digest);
+  assert.equal(stalled.pending.expected_pipeline_digest, frozen.pipeline_digest);
+  assert.notEqual(stalled.pending.archived_pipeline_digest, stalled.pending.expected_pipeline_digest);
+  assert.equal(stalled.pending.archived_pipeline_digest, record.pipeline.pipeline_digest,
+    "the intent pins the exact digest the retired record carries");
+  assert.match(stalled.pending.retirement_event_id, /^hretire_[a-f0-9]{64}$/);
+  assert.deepEqual(record.terminal_audit, [{
+    kind: "archive", event_id: stalled.pending.retirement_event_id, archived: true, pipeline_digest: record.pipeline.pipeline_digest,
+  }]);
+  const recovered = domain(directory);
+  assert.deepEqual(recovered.get_pipeline_status(request("get_pipeline_status", null)), emptyStatus(3));
+  assert.equal(persistedState(directory).pending, null);
+  assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("replay")), emptyStatus(3),
+    "a second restart replays the same completed transition");
+  assert.equal(store.readRetiredSnapshots(owner).length, 1, "recovery never retires a second record");
+  assert.equal(recovered.put_batch_manifest(request("put_batch_manifest", 3, { manifest: copy(manifest()) }, { correlation_id: "corr_put_healed", idempotency_key: "idem_put_healed" })).revision, 4);
+  ok(true, "an interrupted retirement is finished from its exact pending intent and accepts a successor manifest");
+});
+
+// A crash before the intent reaches disk retires nothing: the store keeps its
+// active record, the domain keeps its frozen batch, and a retry retires once.
 withDirectory((directory) => {
   let armed = false;
   const faultFs = Object.create(fs);
   faultFs.renameSync = (from, to) => {
     if (armed && String(to).includes("head-control-work-task-domain")) {
-      const error = new Error("injected crash after store retirement");
+      const error = new Error("injected crash before the retirement intent");
       error.code = "EIO";
       throw error;
     }
     return fs.renameSync(from, to);
   };
-  const current = domain(directory, { fs: faultFs });
-  current.initialize();
-  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
-  current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
-  const owner = { installation_id: binding.installation_id, project_id: binding.project_id };
-  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  const { current, frozen, owner, store } = frozenBatchFor(directory, faultFs);
   armed = true;
   throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_state_write_failed");
-  assert.equal(store.readRetiredSnapshots(owner).length, 1, "the store retirement is durable before the domain write");
-  assert.match(fs.readFileSync(headControlWorkTaskDomainPath(directory, binding), "utf8"), /"stage":"frozen"/);
+  armed = false;
+  assert.equal(store.readRetiredSnapshots(owner).length, 0);
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.archived, false);
+  const stalled = persistedState(directory);
+  assert.equal(stalled.stage, "frozen");
+  assert.equal(stalled.pending, null, "no intent means nothing to recover");
+  assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("no_intent")), {
+    revision: 2, archived: false, manifest_digest: frozen.manifest_digest, pipeline_digest: frozen.pipeline_digest, manifest_frozen: true, cut_safe: false,
+  });
+  assert.deepEqual(current.retire_batch(request("retire_batch", 2, null, { correlation_id: "corr_retire_retry", idempotency_key: "idem_retire_retry" })), emptyStatus(3));
+  assert.equal(store.readRetiredSnapshots(owner).length, 1);
+  ok(true, "a crash before the retirement intent retires nothing and leaves the frozen batch retryable");
+});
+
+// A crash after the intent but before the store retirement leaves the active
+// record untouched; recovery re-drives that exact retirement to completion.
+withDirectory((directory) => {
+  let armed = false;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("work-task-pipelines") && !/\.retired\.\d{4}\.json$/.test(String(to))) {
+      const error = new Error("injected crash before the store retirement");
+      error.code = "EIO";
+      throw error;
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, frozen, owner, store } = frozenBatchFor(directory, faultFs);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_pipeline_unavailable");
+  armed = false;
+  assert.equal(store.readRetiredSnapshots(owner).length, 0);
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.archived, false);
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.pipeline_digest, frozen.pipeline_digest);
+  const stalled = persistedState(directory);
+  assert.equal(stalled.pending.action, "retire_batch");
+  assert.equal(stalled.pending.expected_pipeline_digest, frozen.pipeline_digest);
   const recovered = domain(directory);
-  assert.deepEqual(recovered.get_pipeline_status(request("get_pipeline_status", null)), { revision: 3, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
-  assert.equal(recovered.put_batch_manifest(request("put_batch_manifest", 3, { manifest: copy(manifest()) }, { correlation_id: "corr_put_healed", idempotency_key: "idem_put_healed" })).revision, 4);
-  ok(true, "an interrupted retirement heals to empty from the retired record and accepts a successor manifest");
+  assert.deepEqual(recovered.get_pipeline_status(request("get_pipeline_status", null)), emptyStatus(3));
+  const record = store.readRetiredSnapshots(owner);
+  assert.equal(record.length, 1);
+  assert.equal(record[0].pipeline.archived, true);
+  assert.equal(record[0].terminal_audit.at(-1).event_id, stalled.pending.retirement_event_id,
+    "recovery replays the intent's own deterministic retirement event, never a second one");
+  ok(true, "a crash before the store retirement is re-driven from the intent under the same retirement event");
+});
+
+// A crash after the store archived the record but before it renamed it away
+// leaves the active record at the intent's pinned archived digest; recovery
+// finishes the rename instead of treating it as a foreign pipeline.
+withDirectory((directory) => {
+  let armed = false;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && /\.retired\.\d{4}\.json$/.test(String(to))) {
+      const error = new Error("injected crash between the archive and the retired rename");
+      error.code = "EIO";
+      throw error;
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, frozen, owner, store } = frozenBatchFor(directory, faultFs);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_pipeline_unavailable");
+  armed = false;
+  assert.equal(store.readRetiredSnapshots(owner).length, 0);
+  const stranded = store.readRecoverySnapshot(owner);
+  assert.equal(stranded.pipeline.archived, true);
+  const stalled = persistedState(directory);
+  assert.notEqual(stranded.pipeline.pipeline_digest, frozen.pipeline_digest);
+  assert.equal(stalled.pending.archived_pipeline_digest, stranded.pipeline.pipeline_digest);
+  const recovered = domain(directory);
+  assert.deepEqual(recovered.get_pipeline_status(request("get_pipeline_status", null)), emptyStatus(3));
+  assert.equal(store.readRetiredSnapshots(owner).length, 1);
+  assert.equal(store.readRetiredSnapshots(owner)[0].pipeline.pipeline_digest, stalled.pending.archived_pipeline_digest);
+  ok(true, "an archived-but-unrenamed record is finished under the intent's pinned archived digest");
+});
+
+// A competing writer that advances the pipeline after the intent is durable
+// changes it into a batch the intent never named.  Recovery fails closed the
+// same way an interrupted cut does, and touches neither store nor state.
+withDirectory((directory) => {
+  let armed = false;
+  const owner = { installation_id: binding.installation_id, project_id: binding.project_id };
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    const result = fs.renameSync(from, to);
+    if (armed && String(to).includes("head-control-work-task-domain")) {
+      armed = false;
+      const live = store.readRecoverySnapshot(owner);
+      applyPipelineEvent(directory, live, {
+        version: 1, kind: "assign_build", event_id: "domain_competing_build", work_task_ref: copy(live.manifest.tasks[0].ref),
+        assignment_id: "domain_competing_assignment", base_sha: baseSha,
+      });
+    }
+    return result;
+  };
+  const { current, frozen } = frozenBatchFor(directory, faultFs);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_pipeline_stale");
+  assert.equal(store.readRetiredSnapshots(owner).length, 0);
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.archived, false);
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.tasks[0].state, "building");
+  const stalled = persistedState(directory);
+  assert.equal(stalled.stage, "frozen");
+  assert.equal(stalled.revision, 2);
+  assert.equal(stalled.pending.action, "retire_batch");
+  assert.equal(stalled.pending.expected_pipeline_digest, frozen.pipeline_digest);
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("competing")), "head_control_work_task_pipeline_stale");
+  ok(true, "a pipeline a competing writer moved after the intent is refused, never retired from the intent");
+});
+
+// The pending retirement belongs to the durable state, not to the Head that
+// wrote it: a superseded generation is locked out and only the generation that
+// adopted the state through initialize() finishes that exact transition.
+withDirectory((directory) => {
+  let armed = false;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("work-task-pipelines") && !/\.retired\.\d{4}\.json$/.test(String(to))) {
+      const error = new Error("injected crash before the store retirement");
+      error.code = "EIO";
+      throw error;
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, owner, store } = frozenBatchFor(directory, faultFs);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 2, null)), "head_control_work_task_pipeline_unavailable");
+  armed = false;
+  const next = { ...binding, generation: 8 };
+  const successor = createHeadControlWorkTaskDomain({ binding: next, config_dir: directory, fs, resolve_registered_identity: resolveRegisteredIdentity, now: () => "2026-09-02T00:00:00.000Z" });
+  assert.equal(successor.initialize().stage, "frozen");
+  throwsCode(() => current.get_pipeline_status(statusRequest("stale_generation")), "head_control_work_task_state_identity_mismatch");
+  assert.equal(store.readRetiredSnapshots(owner).length, 0);
+  assert.deepEqual(successor.get_pipeline_status({ ...statusRequest("adopting_generation"), binding: copy(next) }), emptyStatus(3));
+  assert.equal(store.readRetiredSnapshots(owner).length, 1);
+  ok(true, "a superseded generation cannot finish a pending retirement; the adopting generation finishes it once");
+});
+
+// A project archive can archive a frozen batch before Head retires it.  The
+// store renames such a record untouched rather than archiving it twice, so the
+// intent pins the digest the record already carries and an interrupted
+// retirement is still finished from that exact record.
+withDirectory((directory) => {
+  let armed = false;
+  let domainWrites = 0;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("head-control-work-task-domain")) {
+      domainWrites += 1;
+      if (domainWrites === 2) {
+        const error = new Error("injected crash after store retirement");
+        error.code = "EIO";
+        throw error;
+      }
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, frozen, owner, store } = frozenBatchFor(directory, faultFs);
+  applyPipelineEvent(directory, store.readRecoverySnapshot(owner),
+    { version: 1, kind: "set_archived", event_id: "domain_project_archive", archived: true },
+    { kind: "archive", event_id: "domain_project_archive", archived: true });
+  const archivedDigest = store.readRecoverySnapshot(owner).pipeline.pipeline_digest;
+  assert.notEqual(archivedDigest, frozen.pipeline_digest);
+  assert.equal(current.get_pipeline_status(statusRequest("archived")).archived, true);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 3, null)), "head_control_work_task_state_write_failed");
+  armed = false;
+  const intent = persistedState(directory).pending;
+  assert.equal(intent.expected_pipeline_digest, archivedDigest);
+  assert.equal(intent.archived_pipeline_digest, archivedDigest, "an already-archived record is renamed untouched");
+  const record = store.readRetiredSnapshots(owner);
+  assert.equal(record.length, 1);
+  assert.equal(record[0].pipeline.pipeline_digest, archivedDigest);
+  assert.deepEqual(record[0].terminal_audit, [{ kind: "archive", event_id: "domain_project_archive", archived: true, pipeline_digest: archivedDigest }],
+    "the retirement adds no second archive event to a record that is already archived");
+  assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("archived_recovered")), emptyStatus(4));
+  ok(true, "an already-archived batch is retired and recovered under the digest it already carries");
+});
+
+// Same-content successor: a successor repeats its predecessor's manifest digest
+// AND its initial pipeline digest byte for byte.  The intent binds revision,
+// manifest, and pipeline digest together, and the retirement event it names is
+// revision-bound, so the predecessor's retired record cannot answer for the
+// successor even under an identical invocation.
+withDirectory((directory) => {
+  let armed = false;
+  let domainWrites = 0;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("head-control-work-task-domain")) {
+      domainWrites += 1;
+      if (domainWrites === 2) {
+        const error = new Error("injected crash after store retirement");
+        error.code = "EIO";
+        throw error;
+      }
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, frozen, owner, store } = frozenBatchFor(directory, faultFs);
+  const retireKeys = { correlation_id: "corr_retire_shared", idempotency_key: "idem_retire_shared" };
+  assert.deepEqual(current.retire_batch(request("retire_batch", 2, null, retireKeys)), emptyStatus(3));
+  const predecessor = store.readRetiredSnapshots(owner)[0];
+  current.put_batch_manifest(request("put_batch_manifest", 3, { manifest: copy(manifest()) }, { correlation_id: "corr_put_same", idempotency_key: "idem_put_same" }));
+  const successor = current.freeze_batch_manifest(request("freeze_batch_manifest", 4, null, { correlation_id: "corr_freeze_same", idempotency_key: "idem_freeze_same" }));
+  assert.equal(successor.revision, 5);
+  assert.equal(successor.manifest_digest, frozen.manifest_digest, "the successor repeats the manifest digest exactly");
+  assert.equal(successor.pipeline_digest, frozen.pipeline_digest, "and starts from a byte-identical pipeline");
+  const statePath = headControlWorkTaskDomainPath(directory, binding);
+  const stored = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const withIntent = (pending) => fs.writeFileSync(statePath, JSON.stringify({ ...stored, pending }), { encoding: "utf8", mode: FILE_MODE, flag: "w" });
+  const exactIntent = {
+    action: "retire_batch",
+    expected_revision: 5,
+    fingerprint: "a".repeat(64),
+    manifest_digest: successor.manifest_digest,
+    expected_pipeline_digest: successor.pipeline_digest,
+    archived_pipeline_digest: predecessor.pipeline.pipeline_digest,
+    retirement_event_id: predecessor.terminal_audit.at(-1).event_id,
+  };
+  withIntent({ ...exactIntent, expected_revision: 2 });
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("intent_stale_revision")), "corrupt_head_control_work_task_state");
+  withIntent({ ...exactIntent, manifest_digest: "e".repeat(64) });
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("intent_other_manifest")), "corrupt_head_control_work_task_state");
+  withIntent({ ...exactIntent, expected_pipeline_digest: "e".repeat(64) });
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("intent_other_pipeline")), "corrupt_head_control_work_task_state");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"revision":5,"stage":"frozen"/, "no stale or mismatched intent retires the successor");
+  fs.writeFileSync(statePath, JSON.stringify(stored), { encoding: "utf8", mode: FILE_MODE, flag: "w" });
+  domainWrites = 0;
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 5, null, retireKeys)), "head_control_work_task_state_write_failed");
+  armed = false;
+  const own = persistedState(directory).pending;
+  assert.notEqual(own.retirement_event_id, exactIntent.retirement_event_id,
+    "the same invocation at a later revision names a different retirement event");
+  assert.notEqual(own.archived_pipeline_digest, exactIntent.archived_pipeline_digest,
+    "so the successor's intent can never be satisfied by its predecessor's retired record");
+  assert.equal(store.readRetiredSnapshots(owner).length, 2);
+  assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("successor_recovered")), emptyStatus(6));
+  ok(true, "a same-content successor is separated from its predecessor's retired record by revision, never by content");
 });
 
 // #1071: `manifestDigest` covers only the version, identity, delivery mode and

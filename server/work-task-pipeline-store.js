@@ -126,6 +126,14 @@ function nextRetiredPath(fs, statePath) {
   if (ordinal > 9999) fail("work_task_pipeline_store_retired_bound", "retired batch bound reached");
   return `${statePath.slice(0, -".json".length)}.retired.${String(ordinal).padStart(4, "0")}.json`;
 }
+// Retirement is refused while any slot still holds build or review authority.
+// #1071: the Head-control domain has to reach that same verdict before it makes
+// a retirement intent durable — an intent whose recovery could never finish is
+// a wedge, not a resumable retirement — so the predicate lives here, beside the
+// exact states it names, instead of being restated by its caller.
+function pipelineHoldsActiveAuthority(pipeline) {
+  return pipeline.tasks.some((slot) => ACTIVE_AUTHORITY_STATES.has(slot.state));
+}
 function assertTerminalDisposition(value, code) {
   if (value === null) return null;
   if (!plain(value) || !TERMINAL_KINDS.has(value.kind)) fail(code, "terminal disposition is invalid");
@@ -365,7 +373,7 @@ function createWorkTaskPipelineStore(options) {
       const current = readCurrent(target, retirement.precondition);
       let state = current;
       if (!current.pipeline.archived) {
-        if (current.pipeline.tasks.some((slot) => ACTIVE_AUTHORITY_STATES.has(slot.state))) {
+        if (pipelineHoldsActiveAuthority(current.pipeline)) {
           fail("work_task_pipeline_store_batch_active", "batch retains active build or review authority");
         }
         let nextPipeline;
@@ -407,6 +415,7 @@ module.exports = {
   MAX_TERMINAL_AUDIT,
   WorkTaskPipelineStoreError,
   assertWorkTaskPipelineStoreState: assertStoredState,
+  workTaskPipelineHoldsActiveAuthority: pipelineHoldsActiveAuthority,
   workTaskPipelineStorePath,
   createWorkTaskPipelineStore,
 };
