@@ -602,12 +602,54 @@ withDirectory((directory) => {
   // takes the next ordinal, so the earlier record is never replaced.
   const archivedSuccessor = persist(restarted, successor, event("set_archived", "successor_archive", { archived: true }), { kind: "archive", event_id: "successor_archive", archived: true });
   const secondRetired = restarted.retire({ expected: currentExpected(archivedSuccessor), event_id: "retire_second" });
-  assert.deepEqual(secondRetired, archivedSuccessor);
+  assert.deepEqual(secondRetired.pipeline, archivedSuccessor.pipeline, "an already-archived pipeline takes no second archive transition");
+  // #1071: it still records this retirement's own marker before the rename, so
+  // the retired record names the retirement that ended it and not just content.
+  assert.deepEqual(secondRetired.terminal_audit, [
+    { kind: "archive", event_id: "successor_archive", archived: true, pipeline_digest: archivedSuccessor.pipeline.pipeline_digest },
+    { kind: "archive", event_id: "retire_second", archived: true, pipeline_digest: archivedSuccessor.pipeline.pipeline_digest },
+  ], "the retirement marker is recorded even when the pipeline is already archived");
   const all = restarted.readRetiredSnapshots(owner);
   assert.deepEqual(all.map((entry) => entry.manifest.manifest_digest), [initial.manifest.manifest_digest, successorManifest.manifest_digest]);
   assert.deepEqual(all[0], retired);
   throwsCode(() => restarted.readRecoverySnapshot(owner), "work_task_pipeline_store_missing");
   throwsCode(() => restarted.retire({ expected: null, event_id: "retire_bad" }), "invalid_work_task_pipeline_store_retirement");
+});
+
+// #1071: the retirement marker is durable BEFORE the rename, and a retirement
+// replayed after a crash between those two writes renames the record without
+// writing the marker twice — a duplicate event id would make the record invalid.
+withDirectory((directory) => {
+  const { store, state: initial } = initialized(directory);
+  const archived = persist(store, initial, event("set_archived", "pre_archive", { archived: true }),
+    { kind: "archive", event_id: "pre_archive", archived: true });
+  let armed = true;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && /\.retired\.\d{4}\.json$/.test(String(to))) {
+      const error = new Error("injected crash between the marker and the retired rename");
+      error.code = "EIO";
+      throw error;
+    }
+    return fs.renameSync(from, to);
+  };
+  const faulted = createWorkTaskPipelineStore({ config_dir: directory, fs: faultFs });
+  throwsCode(() => faulted.retire({ expected: currentExpected(archived), event_id: "retire_marked" }), "work_task_pipeline_store_write_failed");
+  const stranded = store.readRecoverySnapshot(owner);
+  const audit = [
+    { kind: "archive", event_id: "pre_archive", archived: true, pipeline_digest: archived.pipeline.pipeline_digest },
+    { kind: "archive", event_id: "retire_marked", archived: true, pipeline_digest: archived.pipeline.pipeline_digest },
+  ];
+  assert.deepEqual(stranded.pipeline, archived.pipeline, "the marker write leaves the pipeline untouched");
+  assert.deepEqual(stranded.terminal_audit, audit, "the marker is durable before the rename");
+  assert.equal(store.readRetiredSnapshots(owner).length, 0);
+  armed = false;
+  const replayed = faulted.retire({ expected: currentExpected(stranded), event_id: "retire_marked" });
+  assert.deepEqual(replayed.terminal_audit, audit, "the replay adds no second marker");
+  const provenance = store.readRetiredSnapshots(owner);
+  assert.equal(provenance.length, 1);
+  assert.deepEqual(provenance[0].terminal_audit, audit);
+  throwsCode(() => store.readRecoverySnapshot(owner), "work_task_pipeline_store_missing");
 });
 
 console.log("work-task-pipeline-store.test.js: all assertions passed");

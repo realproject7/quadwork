@@ -768,8 +768,10 @@ withDirectory((directory) => {
   const record = store.readRetiredSnapshots(owner);
   assert.equal(record.length, 1);
   assert.equal(record[0].pipeline.pipeline_digest, archivedDigest);
-  assert.deepEqual(record[0].terminal_audit, [{ kind: "archive", event_id: "domain_project_archive", archived: true, pipeline_digest: archivedDigest }],
-    "the retirement adds no second archive event to a record that is already archived");
+  assert.deepEqual(record[0].terminal_audit, [
+    { kind: "archive", event_id: "domain_project_archive", archived: true, pipeline_digest: archivedDigest },
+    { kind: "archive", event_id: intent.retirement_event_id, archived: true, pipeline_digest: archivedDigest },
+  ], "the retirement adds no second archive event, but does record its own marker beside the project archive");
   assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("archived_recovered")), emptyStatus(4));
   ok(true, "an already-archived batch is retired and recovered under the digest it already carries");
 });
@@ -835,6 +837,101 @@ withDirectory((directory) => {
   assert.equal(store.readRetiredSnapshots(owner).length, 2);
   assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("successor_recovered")), emptyStatus(6));
   ok(true, "a same-content successor is separated from its predecessor's retired record by revision, never by content");
+});
+
+// #1071 (review): the pinned archived pipeline digest is not proof on its own.
+// A project archive derives its event from owner and manifest digest alone
+// (server/project-archive-transition.js), with no revision in it, so a
+// predecessor and a same-content successor archived that way hold byte-
+// identical pipelines and byte-identical pipeline digests.  Retirement takes no
+// archive transition from such a batch, so nothing revision-bound reaches its
+// history either.  Only the retirement's own durable marker separates them: a
+// successor whose active record vanished before its marker was ever written
+// must fail closed, not be answered for by its predecessor's record.
+withDirectory((directory) => {
+  // One literal event id for both batches: this is exactly what
+  // `archiveEventId(owner, manifest_digest)` yields for two same-content ones.
+  const archiveEvent = "parch_shared_same_content_archive";
+  const projectArchive = (target) => applyPipelineEvent(directory, target,
+    { version: 1, kind: "set_archived", event_id: archiveEvent, archived: true },
+    { kind: "archive", event_id: archiveEvent, archived: true });
+  let armed = false;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && String(to).includes("work-task-pipelines")) {
+      const error = new Error("injected crash before the retirement marker and rename");
+      error.code = "EIO";
+      throw error;
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, owner, store } = frozenBatchFor(directory, faultFs);
+  projectArchive(store.readRecoverySnapshot(owner));
+  assert.equal(current.get_pipeline_status(statusRequest("predecessor_archived")).revision, 3);
+  assert.deepEqual(current.retire_batch(request("retire_batch", 3, null, { correlation_id: "corr_retire_arch_pred", idempotency_key: "idem_retire_arch_pred" })), emptyStatus(4));
+  const predecessor = store.readRetiredSnapshots(owner)[0];
+  current.put_batch_manifest(request("put_batch_manifest", 4, { manifest: copy(manifest()) }, { correlation_id: "corr_put_arch_same", idempotency_key: "idem_put_arch_same" }));
+  assert.equal(current.freeze_batch_manifest(request("freeze_batch_manifest", 5, null, { correlation_id: "corr_freeze_arch_same", idempotency_key: "idem_freeze_arch_same" })).revision, 6);
+  projectArchive(store.readRecoverySnapshot(owner));
+  assert.equal(current.get_pipeline_status(statusRequest("successor_archived")).revision, 7);
+  assert.equal(store.readRecoverySnapshot(owner).pipeline.pipeline_digest, predecessor.pipeline.pipeline_digest,
+    "the successor's archived pipeline is byte-identical to the retired predecessor's");
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 7, null, { correlation_id: "corr_retire_arch_succ", idempotency_key: "idem_retire_arch_succ" })),
+    "head_control_work_task_pipeline_unavailable");
+  armed = false;
+  const intent = persistedState(directory).pending;
+  assert.equal(intent.action, "retire_batch");
+  assert.equal(intent.archived_pipeline_digest, predecessor.pipeline.pipeline_digest,
+    "so the successor's intent pins the very digest the predecessor's record carries");
+  assert.notEqual(intent.retirement_event_id, predecessor.terminal_audit.at(-1).event_id);
+  assert.equal(store.readRetiredSnapshots(owner).length, 1);
+  fs.unlinkSync(workTaskPipelineStorePath(directory, owner));
+  throwsCode(() => domain(directory).get_pipeline_status(statusRequest("arch_successor_lost")), "head_control_work_task_pipeline_missing");
+  const persisted = persistedState(directory);
+  assert.equal(persisted.stage, "frozen");
+  assert.equal(persisted.revision, 7);
+  assert.equal(persisted.pending.action, "retire_batch");
+  assert.equal(store.readRetiredSnapshots(owner).length, 1, "the predecessor's record is untouched and answers for nobody");
+  ok(true, "a project-archived predecessor cannot answer for a same-content successor whose retirement never marked a record");
+});
+
+// The marker is durable before the rename, so a retirement interrupted between
+// those two writes replays: the record is renamed and the marker is not added
+// a second time (a duplicate event id would make the stored record invalid).
+withDirectory((directory) => {
+  let armed = false;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (armed && /\.retired\.\d{4}\.json$/.test(String(to))) {
+      const error = new Error("injected crash between the marker and the retired rename");
+      error.code = "EIO";
+      throw error;
+    }
+    return fs.renameSync(from, to);
+  };
+  const { current, owner, store } = frozenBatchFor(directory, faultFs);
+  applyPipelineEvent(directory, store.readRecoverySnapshot(owner),
+    { version: 1, kind: "set_archived", event_id: "domain_project_archive", archived: true },
+    { kind: "archive", event_id: "domain_project_archive", archived: true });
+  const archivedDigest = store.readRecoverySnapshot(owner).pipeline.pipeline_digest;
+  assert.equal(current.get_pipeline_status(statusRequest("replay_archived")).revision, 3);
+  armed = true;
+  throwsCode(() => current.retire_batch(request("retire_batch", 3, null)), "head_control_work_task_pipeline_unavailable");
+  armed = false;
+  const intent = persistedState(directory).pending;
+  const stranded = store.readRecoverySnapshot(owner);
+  assert.equal(stranded.pipeline.pipeline_digest, archivedDigest, "recording the marker leaves the pipeline itself untouched");
+  const audit = [
+    { kind: "archive", event_id: "domain_project_archive", archived: true, pipeline_digest: archivedDigest },
+    { kind: "archive", event_id: intent.retirement_event_id, archived: true, pipeline_digest: archivedDigest },
+  ];
+  assert.deepEqual(stranded.terminal_audit, audit, "the retirement marker is durable before the rename");
+  assert.deepEqual(domain(directory).get_pipeline_status(statusRequest("replay_recovered")), emptyStatus(4));
+  const record = store.readRetiredSnapshots(owner);
+  assert.equal(record.length, 1);
+  assert.deepEqual(record[0].terminal_audit, audit, "the replayed retirement adds no second marker");
+  ok(true, "a retirement replayed after its marker was written renames the record without duplicating the marker");
 });
 
 // #1071: `manifestDigest` covers only the version, identity, delivery mode and
