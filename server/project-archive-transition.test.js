@@ -402,6 +402,47 @@ try {
     assert.equal(storedRounds(seeded)[0].status, "cancelled");
   }
 
+  // 10. A round that a concurrent writer leaves current after the sweep must
+  // keep the cleanup partial. The post-sweep re-read is the only thing that can
+  // see it, so it is driven here by opening a fresh round in the exact window
+  // between the last cancellation and that re-read.
+  {
+    const configDir = root("qw-archive-transition-revived-");
+    const seeded = seed(configDir);
+    const documentPath = seeded.roundStore.pathFor(seeded.opened.review_round_ref);
+    let cancellationWritten = false;
+    let revived = false;
+    const revivingFs = Object.create(fs);
+    revivingFs.renameSync = (from, to, ...rest) => {
+      const result = fs.renameSync(from, to, ...rest);
+      if (to === documentPath) cancellationWritten = true;
+      return result;
+    };
+    revivingFs.lstatSync = (target, ...rest) => {
+      // Only outside the project writer lock, so the concurrent opener is a
+      // real second writer rather than a self-deadlock.
+      if (cancellationWritten && !revived && target === documentPath && !fs.existsSync(`${documentPath}.lock`)) {
+        revived = true;
+        // A concurrent writer opens a second round for the same candidate.
+        seeded.roundStore.openRound(
+          { version: 1, candidate: copy(seeded.candidate), attempt: "attempt_1071", round: 2, opened_at: "2026-09-01T09:00:00.000Z" },
+          { version: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 11 }, { reviewer_role: "re2", reviewer_generation: 22 }] },
+        );
+      }
+      return fs.lstatSync(target, ...rest);
+    };
+
+    const swept = transitionFor(configDir, { fs: revivingFs }).archiveProjectRuntimeState(project_id);
+    assert.equal(revived, true, "the concurrent writer really did open a round inside the window");
+    assert.equal(swept.resources.task_review_rounds_cancelled, 1, "the sweep cancelled the round it saw");
+    assert.equal(swept.ok, false, "a round left current after the sweep keeps the cleanup partial");
+    assert.deepEqual(swept.cleanup_errors.map((entry) => [entry.resource, entry.code]),
+      [["task_review_round", "task_review_round_still_current"]]);
+    const retried = transitionFor(configDir).archiveProjectRuntimeState(project_id);
+    assert.deepEqual(retried, { ok: true, resources: { task_review_rounds_cancelled: 1 }, cleanup_errors: [] },
+      "the retry cancels the round the concurrent writer added");
+  }
+
   console.log("project-archive-transition.test.js: all assertions passed");
 } finally {
   removeDirectories();
