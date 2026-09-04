@@ -63,11 +63,11 @@ function frozenBatch(tasks, delivery_mode = "integrated") {
     version: 1, installation_id, project_id, delivery_mode, tasks,
   }, { resolveRegisteredIdentity }), "2026-09-01T10:00:00.000Z");
 }
-function candidate(ref, candidate_sha, worktree_id) {
+function candidate(ref, candidate_sha, worktree_id, base = base_sha) {
   return buildWorkTaskCandidate({
     version: 1,
     work_task_ref: copy(ref),
-    base_sha,
+    base_sha: base,
     candidate_sha,
     branch: `task/delivery-${worktree_id}`,
     worktree: { repository_key: ref.repository_key, worktree_id, path: `/var/folders/quadwork/${worktree_id}` },
@@ -78,7 +78,7 @@ function candidate(ref, candidate_sha, worktree_id) {
         version: 1, registered: true, readable: true, repository_key: ref.repository_key, worktree_id,
         canonical_path: `/private/var/folders/quadwork/${worktree_id}`,
         branch: `task/delivery-${worktree_id}`,
-        base_sha, head_sha: candidate_sha, dirty: false, occupancy: "vacant",
+        base_sha: base, head_sha: candidate_sha, dirty: false, occupancy: "vacant",
       };
     },
     readCanonicalInstalledState() { return { version: 1, installation_id, project_id, v1_state: "present" }; },
@@ -161,6 +161,49 @@ function integratedFixture() {
       evidence: evidence(ref, ["server/alpha.js", "server/bravo.js"]),
     },
   };
+}
+
+// #1065: the chain the pipeline actually stages.  Root task alpha builds from
+// the frozen repository base R; dependent bravo builds from alpha's exact
+// candidate SHA and may declare a boundary overlapping alpha's.
+function chainFixture({ dependent = true, overlap = true, bravoBase = null, cut_id = "cut-chain" } = {}) {
+  const batch = frozenBatch([
+    task({ task_key: "alpha", work_item: web42, boundary: ["server/alpha.js"] }),
+    task({
+      task_key: "bravo", work_item: web43,
+      boundary: overlap ? ["server/alpha.js", "server/bravo.js"] : ["server/bravo.js"],
+      dependencies: dependent ? [dependency(web42, "alpha")] : [],
+    }),
+  ]);
+  const alpha = candidate(batch.tasks[0].ref, "b".repeat(64), "wt_chain_alpha");
+  const bravo = candidate(batch.tasks[1].ref, "c".repeat(64), "wt_chain_bravo", bravoBase || alpha.candidate_sha);
+  const ref = candidateRef(batch, "integrated", "f".repeat(64), cut_id);
+  return {
+    batch, alpha, bravo, ref,
+    input: {
+      version: 1,
+      delivery_candidate_ref: ref,
+      frozen_batch_manifest: batch,
+      staged_tasks: [
+        { candidate: alpha, review_round: releasedRound(alpha, "chain-alpha") },
+        { candidate: bravo, review_round: releasedRound(bravo, "chain-bravo") },
+      ],
+      deferred_exclusions: [],
+      evidence: evidence(ref, ["server/alpha.js", "server/bravo.js"]),
+    },
+  };
+}
+
+// #1065: a pipeline-realizable same-repository chain is one root-based cut.
+{
+  const fixture = chainFixture();
+  const manifest = buildDeliveryManifest(fixture.input, options());
+  assert.equal(manifest.delivery_candidate_ref.base_sha, base_sha, "the delivery base stays the frozen repository root base");
+  assert.deepEqual(manifest.staged_tasks.map((entry) => entry.candidate.base_sha), [base_sha, fixture.alpha.candidate_sha],
+    "the dependent candidate is pinned to its predecessor candidate SHA");
+  assert.equal(manifest.staged_tasks[1].terminal_review.review_round_ref.base_sha, fixture.alpha.candidate_sha);
+  assert.deepEqual(manifest.evidence.boundary.paths, ["server/alpha.js", "server/bravo.js"], "an overlapping dependent boundary is declared once");
+  assert.equal(assertDeliveryManifest(manifest), manifest);
 }
 
 // A valid integrated cut is immutable, digest-stable, in frozen Batch order,

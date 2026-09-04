@@ -129,11 +129,11 @@ function frozenBatch(tasks) {
     },
   }), "2026-09-01T12:00:00.000Z");
 }
-function candidate(ref, candidate_sha, worktree_id) {
+function candidate(ref, candidate_sha, worktree_id, base = base_sha) {
   return buildWorkTaskCandidate({
     version: VERSION,
     work_task_ref: copy(ref),
-    base_sha,
+    base_sha: base,
     candidate_sha,
     branch: "task/" + worktree_id,
     worktree: { repository_key: "web", worktree_id, path: "/var/folders/quadwork/" + worktree_id },
@@ -150,7 +150,7 @@ function candidate(ref, candidate_sha, worktree_id) {
         worktree_id,
         canonical_path: "/private/var/folders/quadwork/" + worktree_id,
         branch: "task/" + worktree_id,
-        base_sha,
+        base_sha: base,
         head_sha: candidate_sha,
         dirty: false,
         occupancy: "vacant",
@@ -183,18 +183,23 @@ function releasedRound(workCandidate, suffix) {
     version: VERSION, reviewer_role: "re2", reviewer_generation: 22, received_at: "2026-09-01T12:03:00.000Z",
   }).round;
 }
-function buildFixture({ dependent = false, actualOverlap = false } = {}) {
+// `chain` is the shape the pipeline actually stages (#1065): bravo depends on
+// alpha, is built from alpha's exact candidate SHA, and by default declares a
+// boundary that overlaps alpha's and rewrites alpha's file on top of alpha's
+// change.  The older `dependent` flag keeps bravo on the repository root base,
+// a state the pipeline can never produce.
+function buildFixture({ dependent = false, actualOverlap = false, chain = false, overlap = true, undeclaredPath = false } = {}) {
   const batch = frozenBatch([
     task({ task_key: "alpha", work_item: web42, boundary: ["server/alpha.js"] }),
     task({
       task_key: "bravo",
       work_item: web43,
-      boundary: ["server/bravo.js"],
-      dependencies: dependent ? [dependency(web42, "alpha")] : [],
+      boundary: chain && overlap ? ["server/alpha.js", "server/bravo.js"] : ["server/bravo.js"],
+      dependencies: dependent || chain ? [dependency(web42, "alpha")] : [],
     }),
   ]);
   const alpha = candidate(batch.tasks[0].ref, alpha_candidate_sha, "wt-alpha");
-  const bravo = candidate(batch.tasks[1].ref, bravo_candidate_sha, "wt-bravo");
+  const bravo = candidate(batch.tasks[1].ref, bravo_candidate_sha, "wt-bravo", chain ? alpha_candidate_sha : base_sha);
   const base = tree(base_tree_sha, [
     entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "4".repeat(64)),
@@ -205,7 +210,11 @@ function buildFixture({ dependent = false, actualOverlap = false } = {}) {
     entry("server/alpha.js", "6".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
   ]);
-  const bravoTree = actualOverlap ? tree(bravo_tree_sha, [
+  const bravoTree = chain ? tree(bravo_tree_sha, [
+    entry("README.md", (undeclaredPath ? "9" : "3").repeat(64)),
+    entry("server/alpha.js", (overlap ? "7" : "6").repeat(64)),
+    entry("server/bravo.js", "7".repeat(64)),
+  ]) : actualOverlap ? tree(bravo_tree_sha, [
     entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "7".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
@@ -214,7 +223,7 @@ function buildFixture({ dependent = false, actualOverlap = false } = {}) {
     entry("server/alpha.js", "4".repeat(64)),
     entry("server/bravo.js", "7".repeat(64)),
   ]);
-  const result = tree(result_tree_sha, [
+  const result = tree(result_tree_sha, chain ? bravoTree.entries : [
     entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "6".repeat(64)),
     entry("server/bravo.js", "7".repeat(64)),
@@ -235,7 +244,7 @@ function buildFixture({ dependent = false, actualOverlap = false } = {}) {
     source_worktree_path: alpha.managed_worktree.canonical_path,
   });
   const bravoPatch = patch({
-    scope: "candidate", base_sha, result_sha: bravo_candidate_sha, base, result: bravoTree,
+    scope: "candidate", base_sha: bravo.base_sha, result_sha: bravo_candidate_sha, base: chain ? alphaTree : base, result: bravoTree,
     source_worktree_path: bravo.managed_worktree.canonical_path,
   });
   const deliveryPatch = patch({
@@ -405,10 +414,12 @@ function createOperations(fixture, overrides = {}) {
   assert.deepEqual(repeated, proof, "same exact objects and patches produce an identical proof");
 }
 
-// A frozen dependency becomes an explicit predecessor handoff in the
-// composition request and proof; it cannot be silently skipped or reordered.
+// #1065: a frozen dependency is staged as the chain the pipeline built (bravo
+// from alpha's exact candidate SHA, rewriting alpha's file).  Its patch is read
+// and verified against alpha's tree, composed onto the accumulated tree, and
+// becomes an explicit predecessor handoff in the composition request and proof.
 {
-  const fixture = buildFixture({ dependent: true });
+  const fixture = buildFixture({ chain: true });
   const operations = createOperations(fixture);
   const proof = composeDeliveryCandidate(fixture.manifest, operations.operations);
   assert.equal(proof.steps[1].predecessor_handoffs.length, 1);
@@ -416,6 +427,15 @@ function createOperations(fixture, overrides = {}) {
   const dependencyApply = operations.applyCalls.find((request) => request.scope === "composition" && request.sequence === 2);
   assert.deepEqual(dependencyApply.predecessor_handoffs, proof.steps[1].predecessor_handoffs);
   assert.equal(proof.steps[0].output_tree_sha, intermediate_tree_sha);
+  const bravoPatchRequest = operations.calls.find((call) => call.name === "readCandidatePatch" && call.request.sequence === 2).request;
+  assert.equal(bravoPatchRequest.base_sha, alpha_candidate_sha, "the dependent patch is requested against its own base commit");
+  assert.equal(bravoPatchRequest.base_tree_sha, alpha_tree_sha, "the dependent patch is requested against its own base tree");
+  const bravoVerification = operations.applyCalls.find((request) => request.scope === "candidate_verification" && request.sequence === 2);
+  assert.equal(bravoVerification.input_tree_sha, alpha_tree_sha, "the dependent candidate is verified from its own base tree");
+  assert.deepEqual(proof.steps[1].changed_files.map((file) => [file.path, file.before.blob_sha[0], file.after.blob_sha[0]]),
+    [["server/alpha.js", "6", "7"], ["server/bravo.js", "5", "7"]], "the overlap composes on top of alpha's change, not the root blob");
+  assert.equal(dependencyApply.input_tree_sha, intermediate_tree_sha, "the dependent composes onto the accumulated tree");
+  assert.equal(proof.result.tree_sha, result_tree_sha);
 }
 
 // Even if a malicious object adapter presents two independent patches with

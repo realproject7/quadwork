@@ -272,6 +272,120 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
   console.log("  PASS: every object operation fails closed when the registered base clone becomes dirty");
 });
 
+// #1065: the reviewed chain the pipeline actually produces.  Candidate B is
+// committed on top of candidate A (its base), rewrites the file A changed, and
+// the registered result HEAD is exactly that composition.
+function withChainRepository(run) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "qw-delivery-git-chain-"));
+  const repository = path.join(directory, "web");
+  try {
+    fs.mkdirSync(repository, { recursive: true });
+    git(repository, ["init", "-b", "main"]);
+    git(repository, ["config", "user.email", "quadwork@example.test"]);
+    git(repository, ["config", "user.name", "QuadWork Test"]);
+    git(repository, ["remote", "add", "origin", "git@github.com:owner/web.git"]);
+    write(repository, "server/a.js", "module.exports = 'base-a';\n");
+    write(repository, "server/b.js", "module.exports = 'base-b';\n");
+    const base_sha = commit(repository, "base");
+
+    git(repository, ["checkout", "-b", "candidate-a", base_sha]);
+    write(repository, "server/a.js", "module.exports = 'candidate-a';\n");
+    const candidate_a = commit(repository, "candidate a");
+
+    git(repository, ["checkout", "-b", "candidate-b", candidate_a]);
+    write(repository, "server/a.js", "module.exports = 'candidate-b';\n");
+    write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
+    const candidate_b = commit(repository, "candidate b");
+
+    git(repository, ["checkout", "main"]);
+    write(repository, "server/a.js", "module.exports = 'candidate-b';\n");
+    write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
+    const result_sha = commit(repository, "integrated chain result");
+    return run({ directory, repository, base_sha, candidate_a, candidate_b, result_sha });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+function chainManifest() {
+  const a = { repoKey: "web", repo: "Owner/Web", number: 1061, kind: "issue" };
+  return freezeBatchManifest(buildBatchManifest({
+    version: 1,
+    installation_id,
+    project_id,
+    delivery_mode: "integrated",
+    tasks: [
+      { task_key: "a", repository_key: "web", work_item: copy(a), goal: "change a", file_boundary: ["server/a.js"], validation: ["node-test"], dependencies: [] },
+      { task_key: "b", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1062, kind: "issue" }, goal: "change a and b on top of a", file_boundary: ["server/a.js", "server/b.js"], validation: ["node-test"], dependencies: [{ repository_key: "web", work_item: copy(a), task_key: "a" }] },
+    ],
+  }, {
+    resolveRegisteredIdentity(input) { return { ...input, work_item: copy(input.work_item), issue_body_revision: "c".repeat(64) }; },
+  }), "2026-09-02T08:00:00.000Z");
+}
+function chainAdapter(repository, deliverySource) {
+  const calls = [];
+  const adapter = createDeliveryGitObjectAdapter({
+    repositories: [{ key: "web", repo: "Owner/Web", working_dir: repository, primary: true }],
+    primary_agent_cwds: {}, repository_worktrees: {},
+    canonicalize_path(request) { return fs.realpathSync(request.path); },
+    run_git(request) {
+      calls.push(copy({ args: request.args, input: request.input || null }));
+      try {
+        return { ok: true, output: execFileSync("git", request.args, {
+          cwd: request.cwd, encoding: "utf8", input: request.input, timeout: 5000, maxBuffer: 4 * 1024 * 1024,
+        }) };
+      } catch {
+        return { ok: false, output: "" };
+      }
+    },
+    read_delivery_source(request) {
+      assert.equal(request.repository_key, "web");
+      return copy(deliverySource);
+    },
+  });
+  return { adapter, calls };
+}
+
+withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
+  const manifest = chainManifest();
+  const stages = [stage(manifest.tasks[0].ref, base_sha, candidate_a, "a"), stage(manifest.tasks[1].ref, candidate_a, candidate_b, "b")];
+  const deliverySource = {
+    version: 1,
+    registered_repository: { version: 1, installation_id, project_id, repository_key: "web", repository: "Owner/Web" },
+    frozen_batch_manifest: manifest,
+    delivery_mode: "integrated",
+    cut_id: "cut_delivery_git_chain_01",
+    base_sha,
+    staged_tasks: stages,
+    deferred_exclusions: [],
+  };
+  const { adapter, calls } = chainAdapter(repository, deliverySource);
+  const refsBefore = git(repository, ["show-ref"]);
+
+  const observed = adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
+  assert.equal(observed.result_sha, result_sha);
+  assert.deepEqual(observed.evidence.boundary.paths, ["server/a.js", "server/b.js"], "an overlapping dependent boundary is declared once");
+
+  const ref = {
+    version: 1, installation_id, project_id, repository_key: "web", batch_manifest_digest: manifest.manifest_digest,
+    delivery_mode: "integrated", base_sha, result_sha, cut_id: deliverySource.cut_id,
+  };
+  const deliveryManifest = buildDeliveryManifest({
+    version: 1, delivery_candidate_ref: ref, frozen_batch_manifest: manifest, staged_tasks: copy(stages), deferred_exclusions: [], evidence: copy(observed.evidence),
+  }, { resolveRegisteredRepository() { return copy(deliverySource.registered_repository); } });
+  assert.equal(deliveryManifest.staged_tasks[1].candidate.base_sha, candidate_a);
+  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref });
+  const proof = composeDeliveryCandidate(deliveryManifest, objects);
+  assert.equal(proof.result.commit_sha, result_sha);
+  assert.deepEqual(proof.steps.map((step) => step.predecessor_handoffs.map((entry) => entry.work_task_ref.task_key)), [[], ["a"]]);
+  assert.equal(proof.steps[1].candidate_sha, candidate_b);
+  const rewritten = proof.steps[1].changed_files.find((file) => file.path === "server/a.js");
+  assert.equal(rewritten.before.blob_sha, proof.steps[0].changed_files[0].after.blob_sha, "B's patch is described against A's blob, not the root blob");
+  assert.equal(git(repository, ["status", "--porcelain", "--untracked-files=all"]), "");
+  assert.equal(git(repository, ["show-ref"]), refsBefore, "adapter did not move a ref");
+  assert.ok(calls.every((entry) => !["checkout", "add", "commit", "reset", "merge", "push", "apply"].includes(entry.args[0])));
+  console.log("  PASS: registered Git adapter composes a pipeline-built same-repository dependent chain from native commits");
+});
+
 {
   const source = fs.readFileSync(path.join(__dirname, "delivery-git-object-adapter.js"), "utf8");
   assert.doesNotMatch(source, /require\s*\(\s*["'](?:node:)?(?:child_process|http|https|net|os|fs)["']\s*\)/);
