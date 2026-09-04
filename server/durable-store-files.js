@@ -119,6 +119,10 @@ function createDurableStoreFiles(options) {
       fail(codes.unreadable, "durable store path cannot be inspected");
     }
   }
+  // #1070: this is the only judgement of a durable store directory, and a
+  // directory the caller did not create must pass it exactly like one it did.
+  // A foreign owner is as disqualifying as a wrong mode: mode 0700 says
+  // nothing about *whose* 0700 it is.
   function assertRealDirectory(target, expectedMode) {
     const stats = lstatOrNull(target);
     if (stats === null) return null;
@@ -127,15 +131,26 @@ function createDurableStoreFiles(options) {
     if (expectedMode !== undefined && modeOf(stats) !== expectedMode) {
       fail(codes.insecure_permissions, "durable store directory must be mode 0700");
     }
+    const uid = ownerUid();
+    if (uid !== null && stats.uid !== uid) fail(codes.insecure_permissions, "durable store directory belongs to another user");
     return stats;
   }
   // `chain` lists the store's own fixed directories from the config root down.
   // Only the root may be created recursively; every nested level is created
   // one at a time so a missing parent is never silently manufactured.
+  //
+  // #1070: two independent first writers can both find a level missing.  The
+  // loser's non-recursive `mkdirSync` then raises EEXIST, which says only
+  // that *something* now occupies the path.  It is therefore not swallowed:
+  // it falls through to the same revalidation every freshly created level
+  // passes, which admits only the exact owner-only directory and otherwise
+  // fails closed with the owning store's own code.  There is no retry, and
+  // every other errno still escapes untouched.
   function ensureDirectories(chain) {
     chain.forEach((entry, index) => {
       if (assertRealDirectory(entry.path, entry.mode) === null) {
-        fs.mkdirSync(entry.path, { recursive: index === 0, mode: DIRECTORY_MODE });
+        try { fs.mkdirSync(entry.path, { recursive: index === 0, mode: DIRECTORY_MODE }); }
+        catch (error) { if (!error || error.code !== "EEXIST") throw error; }
         if (assertRealDirectory(entry.path, entry.mode) === null) fail(codes.unreadable, "durable store directory cannot be created");
       }
     });
