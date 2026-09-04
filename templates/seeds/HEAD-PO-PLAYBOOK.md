@@ -132,7 +132,11 @@ from that contract; a title, chat sentence, or branch name is never identity.
 2. Write the manifest with `put_batch_manifest`, then `freeze_batch_manifest`
    before the first assignment. The server rejects duplicate task keys,
    unregistered repositories, missing or cyclic dependencies, and a changed
-   issue-body revision. After the freeze a contract change never edits a task.
+   issue-body revision. A stored manifest is never overwritten: if you decide
+   against it before the freeze, clear it with `abandon_batch_manifest` at its
+   current revision, then put the successor. Abandonment is refused once the
+   freeze has begun or a pipeline exists; a frozen batch leaves only through
+   `retire_batch`. After the freeze a contract change never edits a task.
    No server path applies one today, so treat a changed contract as your own
    decision: stop assigning the affected task and its declared dependents, and
    carry the successor into a new frozen manifest.

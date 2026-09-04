@@ -129,7 +129,7 @@ async function run() {
     assert.deepEqual(listedAgain.result?.tools?.map((tool) => tool.name), tools.map((tool) => tool.name));
     assert.deepEqual(tools.map((tool) => tool.name), [
       "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch",
-      "retire_batch", "queue_local_correction", "read_propagation_stop",
+      "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop",
       "get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit",
     ]);
     for (const tool of tools) {
@@ -138,7 +138,7 @@ async function run() {
       assert(!fields.includes("project") && !fields.includes("project_id") && !fields.includes("actor") &&
         !fields.includes("generation") && !fields.includes("action"));
     }
-    ok(true, "tools/list has exactly the twelve static Head-control operations and no caller binding or action selector");
+    ok(true, "tools/list has exactly the thirteen static Head-control operations and no caller binding or action selector");
 
     const statusArgs = { idempotency_key: "idem_status_001", correlation_id: "corr_status_001" };
     const status = await shim.send(call(3, "get_pipeline_status", statusArgs));
@@ -218,24 +218,30 @@ async function run() {
       expected_revision: 4, idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001",
     }));
     assert.equal(retire.error, undefined);
+    const abandon = await shim.send(call(44, "abandon_batch_manifest", {
+      expected_revision: 5, idempotency_key: "idem_abandon_001", correlation_id: "corr_abandon_001",
+    }));
+    assert.equal(abandon.error, undefined);
     const audit = await shim.send(call(27, "recent_head_control_audit", {}));
     assert.deepEqual(JSON.parse(audit.result.content[0].text), []);
     assert.deepEqual(calls.slice(1).map((entry) => entry.body.request.tool), [
-      "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "read_propagation_stop", "queue_local_correction", "retire_batch", "recent_head_control_audit",
+      "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "read_propagation_stop", "queue_local_correction", "retire_batch", "abandon_batch_manifest", "recent_head_control_audit",
     ]);
     assert.deepEqual(calls[4].body.request.arguments, { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001", work_task_ref: taskRef });
     assert.deepEqual(calls[5].body.request.arguments.correction, { work_task_ref: taskRef, review_round_ref: { round: 1 }, candidate_digest: "e".repeat(64) });
     assert.deepEqual(calls[6].body.request.arguments, { expected_revision: 4, idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001" });
-    assert.ok(calls.slice(4, 7).every((entry) => JSON.stringify(entry.body.binding) === JSON.stringify({ project_id: PROJECT, actor: "head", generation: GENERATION })));
+    assert.deepEqual(calls[7].body.request.arguments, { expected_revision: 5, idempotency_key: "idem_abandon_001", correlation_id: "corr_abandon_001" });
+    assert.ok(calls.slice(4, 8).every((entry) => JSON.stringify(entry.body.binding) === JSON.stringify({ project_id: PROJECT, actor: "head", generation: GENERATION })));
     for (const [label, name, argumentsValue] of [
       ["retire with a payload", "retire_batch", { expected_revision: 4, idempotency_key: "idem_retire_bad", correlation_id: "corr_retire_bad", manifest: {} }],
+      ["abandon with a caller digest", "abandon_batch_manifest", { expected_revision: 5, idempotency_key: "idem_abandon_bad", correlation_id: "corr_abandon_bad", manifest_digest: "e".repeat(64) }],
       ["stop read pinning a revision", "read_propagation_stop", { expected_revision: 4, idempotency_key: "idem_stop_bad", correlation_id: "corr_stop_bad", work_task_ref: taskRef }],
       ["correction with a nested selector", "queue_local_correction", { expected_revision: 4, idempotency_key: "idem_corr_bad", correlation_id: "corr_corr_bad", correction: { work_task_ref: taskRef, review_round_ref: {}, candidate_digest: "e".repeat(64), actor: "head" } }],
     ]) {
       const rejected = await shim.send(call(43, name, argumentsValue));
       assert.equal(rejected.error?.code, -32602, label);
     }
-    assert.equal(calls.length, 8);
+    assert.equal(calls.length, 9);
     ok(true, "each listed operation maps to its static endpoint command without a generic action field");
 
     reply = { status: 200, raw: "not-json" };

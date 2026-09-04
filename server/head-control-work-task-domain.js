@@ -8,6 +8,9 @@
 // #1058: the batch lifecycle closes with `retire_batch`, and the released
 // correction route plus the Head-private propagation-stop read reach their
 // owning review service only through this bound domain.
+// #1069: `abandon_batch_manifest` is the one exit for a manifest that was put
+// but never frozen; it is refused the moment a freeze intent or a pipeline
+// exists and never touches frozen, cut, or retired records.
 
 const crypto = require("node:crypto");
 const path = require("node:path");
@@ -47,7 +50,7 @@ const IDENTIFIER_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const SHA_RE = /^[a-f0-9]{64}$/;
 const ACTIONS = new Set([
   "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch",
-  "retire_batch", "queue_local_correction", "read_propagation_stop",
+  "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop",
 ]);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
 const FILE_CODES = Object.freeze({
@@ -175,7 +178,8 @@ function assertInvocation(value, expectedAction, owner) {
   if (!nullable) revision(value.expected_revision, "invalid_head_control_work_task_input");
   identifier(value.correlation_id, "invalid_head_control_work_task_input");
   identifier(value.idempotency_key, "invalid_head_control_work_task_input");
-  if (expectedAction === "get_pipeline_status" || expectedAction === "freeze_batch_manifest" || expectedAction === "retire_batch") {
+  if (expectedAction === "get_pipeline_status" || expectedAction === "freeze_batch_manifest" || expectedAction === "retire_batch" ||
+      expectedAction === "abandon_batch_manifest") {
     if (value.payload !== null) fail("invalid_head_control_work_task_input", "action does not accept payload");
   } else if (expectedAction === "put_batch_manifest") {
     exact(value.payload, ["manifest"], "invalid_head_control_work_task_input");
@@ -272,7 +276,21 @@ function statusFor(state, snapshot) {
 
 function pending(value, state, owner, code) {
   if (value === null) return null;
-  if (!plain(value) || (value.action !== "freeze_batch_manifest" && value.action !== "cut_batch")) fail(code, "pending action is invalid");
+  if (!plain(value) || (value.action !== "freeze_batch_manifest" && value.action !== "cut_batch" && value.action !== "abandon_batch_manifest")) {
+    fail(code, "pending action is invalid");
+  }
+  if (value.action === "abandon_batch_manifest") {
+    exact(value, ["action", "expected_revision", "fingerprint", "manifest_digest"], code);
+    // The intent names the exact manifest it is clearing by revision and
+    // digest together.  A same-content successor is put at a later revision,
+    // so a digest alone can never say which put an interrupted abandon was
+    // acting on; an intent that fails this check is corrupt, never resumed.
+    if (state.stage !== "manifest" || revision(value.expected_revision, code) !== state.revision || !SHA_RE.test(value.fingerprint) ||
+        digest(value.manifest_digest, code) !== state.manifest.manifest_digest) {
+      fail(code, "pending abandon precondition is invalid");
+    }
+    return { action: value.action, expected_revision: value.expected_revision, fingerprint: value.fingerprint, manifest_digest: value.manifest_digest };
+  }
   if (value.action === "freeze_batch_manifest") {
     exact(value, ["action", "expected_revision", "fingerprint", "frozen_manifest"], code);
     if (state.stage !== "manifest" || revision(value.expected_revision, code) !== state.revision || !SHA_RE.test(value.fingerprint)) fail(code, "pending freeze precondition is invalid");
@@ -412,6 +430,18 @@ function createHeadControlWorkTaskDomain(options) {
     }
     return retired.some((entry) => entry.manifest.manifest_digest === state.manifest.manifest_digest && entry.pipeline.archived);
   }
+  // An active pipeline is build, review, and candidate authority.  A manifest
+  // may be abandoned only while none exists for this project; the retired
+  // records beside it are never consulted or touched.
+  function assertNoPipelineAuthority() {
+    try { pipelineStore.readRecoverySnapshot(ownerOf(owner)); }
+    catch (error) {
+      if (error instanceof WorkTaskPipelineStoreError && error.code === "work_task_pipeline_store_missing") return;
+      if (error instanceof WorkTaskPipelineStoreError) fail("head_control_work_task_pipeline_unavailable", "pipeline store cannot be checked before abandonment");
+      throw error;
+    }
+    fail("head_control_work_task_batch_active", "a pipeline already holds authority over this project");
+  }
   function ownedTaskRef(value, code) {
     if (!plain(value) || value.installation_id !== owner.installation_id || value.project_id !== owner.project_id) {
       fail(code, "work task belongs to another project");
@@ -479,6 +509,15 @@ function createHeadControlWorkTaskDomain(options) {
     return files.withWriterLock(statePath, () => {
       const state = currentState();
       if (state.pending === null) return snapshot(state, owner);
+      if (state.pending.action === "abandon_batch_manifest") {
+        // `assertState` already proved the intent names this exact revision
+        // and manifest digest; only the absence of pipeline authority can
+        // still have changed since the intent was written.
+        assertNoPipelineAuthority();
+        const abandoned = emptyState(state.revision + 1);
+        writeState(files, statePath, abandoned, owner);
+        return snapshot(abandoned, owner);
+      }
       if (state.pending.action === "freeze_batch_manifest") {
         assertCurrentManifest(state.manifest, options.resolve_registered_identity);
         const frozenManifest = state.pending.frozen_manifest;
@@ -722,6 +761,33 @@ function createHeadControlWorkTaskDomain(options) {
       return statusFor(next, null);
     });
   }
+  // Abandonment ends one never-frozen manifest: Head walks away from a
+  // manifest it decided against so a successor can be put.  The intent is
+  // durable before the empty write and names the manifest by revision and
+  // digest; it is refused once a freeze has begun (a pending freeze is
+  // recovered first and leaves `frozen`) or a pipeline exists, and it never
+  // reaches the pipeline store, so frozen, cut, and retired records stay put.
+  function abandon_batch_manifest(command) {
+    const input = assertInvocation(command, "abandon_batch_manifest", owner);
+    prepared();
+    files.withWriterLock(statePath, () => {
+      const state = currentState();
+      assertMutationState(state, input, "manifest");
+      assertNoPipelineAuthority();
+      const next = clone(state);
+      next.pending = {
+        action: "abandon_batch_manifest",
+        expected_revision: state.revision,
+        fingerprint: invocationFingerprint(input),
+        manifest_digest: state.manifest.manifest_digest,
+      };
+      writeState(files, statePath, next, owner);
+    });
+    // Whatever the recovery found is reported exactly, including a successor
+    // a competing writer froze meanwhile; the plane rejects anything but empty.
+    const state = recoverPending();
+    return statusFor(state, state.stage === "frozen" ? readPipeline(state.manifest) : null);
+  }
   // A released change-requested round returns its exact candidate to Dev.  The
   // review service owns the round/pipeline transition; this domain binds the
   // task to the owning project and frozen batch and records the new revision.
@@ -773,7 +839,7 @@ function createHeadControlWorkTaskDomain(options) {
   // `initialize` is deliberately non-enumerable.  The existing plane exacts
   // its domain object to these fixed callbacks, while runtime startup still
   // has an explicit durable bootstrap with no extra control action.
-  const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch, retire_batch, queue_local_correction, read_propagation_stop };
+  const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch, retire_batch, abandon_batch_manifest, queue_local_correction, read_propagation_stop };
   Object.defineProperty(domain, "initialize", { value: initialize, enumerable: false });
   Object.defineProperty(domain, "project_current_batch", { value: project_current_batch, enumerable: false });
   return freeze(domain);

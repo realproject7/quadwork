@@ -205,6 +205,21 @@ const TOOL_DEFS = Object.freeze([
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }),
   Object.freeze({
+    name: "abandon_batch_manifest",
+    description: "Abandon the stored, never-frozen batch manifest at the supplied optimistic revision so a successor manifest can be put. Refused once the manifest is frozen or any pipeline exists; frozen, cut, and retired records are never touched.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        expected_revision: { type: "integer", minimum: 0 },
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+      },
+      required: ["expected_revision", "idempotency_key", "correlation_id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
     name: "queue_local_correction",
     description: "Return one released changes-requested task candidate to Dev as a bounded local correction at the supplied optimistic revision.",
     inputSchema: {
@@ -342,7 +357,7 @@ function commandArguments(name, value) {
         typeof recovery.expected_generation !== "string" || !GENERATION_RE.test(recovery.expected_generation) ||
         typeof recovery.assignment_attempt !== "string" || !ATTEMPT_RE.test(recovery.assignment_attempt)) fail("recovery is invalid");
     parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id), recovery: copyJson(recovery) };
-  } else if (name === "freeze_batch_manifest" || name === "retire_batch") {
+  } else if (name === "freeze_batch_manifest" || name === "retire_batch" || name === "abandon_batch_manifest") {
     exact(value, ["expected_revision", "idempotency_key", "correlation_id"]);
     parsed = {
       expected_revision: revision(value.expected_revision),

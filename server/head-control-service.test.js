@@ -40,7 +40,7 @@ function status(overrides = {}) {
   };
 }
 function request(action, overrides = {}) {
-  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch"
+  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch" || action === "abandon_batch_manifest"
     ? null
     : action === "put_batch_manifest"
       ? { manifest: { version: 1, tasks: [] } }
@@ -62,7 +62,7 @@ function request(action, overrides = {}) {
 }
 function domain(initial = status()) {
   let current = clone(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
   const actions = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
@@ -88,6 +88,13 @@ function domain(initial = status()) {
     retire_batch(input) {
       calls.retire_batch += 1;
       assert.equal(input.expected_revision, current.revision);
+      current = status({ revision: current.revision + 1 });
+      return clone(current);
+    },
+    abandon_batch_manifest(input) {
+      calls.abandon_batch_manifest += 1;
+      assert.equal(input.expected_revision, current.revision);
+      assert.equal(input.payload, null);
       current = status({ revision: current.revision + 1 });
       return clone(current);
     },
@@ -178,7 +185,7 @@ function ok(condition, message) {
   assert.equal(put.result.status.revision, 1);
   assert.equal(frozen.result.status.revision, 2);
   assert.equal(cut.result.status.revision, 3);
-  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 });
+  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 });
   const records = core.recentAudit();
   assert.equal(records.length, 4);
   assert.deepEqual(Object.keys(records[0]).sort(), [
@@ -229,6 +236,26 @@ function ok(condition, message) {
   await expectServiceCode(() => afterRestart.execute(clone(correctionRequest)), "head_control_durable_replay_ambiguous");
   assert.deepEqual([fake.calls.queue_local_correction, fake.calls.retire_batch], [1, 1]);
   ok(true, "retirement, correction, and stop read share one redacted durable receipt with the fixed restart-replay rules");
+}
+
+// #1069: abandonment is payloadless, so its redacted durable receipt proves an
+// exact retry after restart without a second domain invocation.
+{
+  const fake = domain(status({ revision: 1, manifest_digest: MANIFEST_A }));
+  const configDir = configDirectory();
+  const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const abandonRequest = request("abandon_batch_manifest", { idempotency_key: "idem_abandon_001", correlation_id: "corr_abandon_001", expected_revision: 1 });
+  const abandoned = await first.execute(abandonRequest);
+  assert.equal(abandoned.decision.code, "head_control_applied");
+  assert.equal(abandoned.result.status.manifest_digest, null);
+  assert.deepEqual(first.recentAudit().map((record) => record.action), ["abandon_batch_manifest"]);
+  const afterRestart = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const replay = await afterRestart.execute(clone(abandonRequest));
+  assert.equal(replay.decision.kind, "replayed");
+  assert.equal(replay.result.status.revision, 2);
+  assert.equal(replay.detail, null);
+  assert.equal(fake.calls.abandon_batch_manifest, 1);
+  ok(true, "an abandonment replays deterministically from its redacted durable receipt after restart");
 }
 
 // Principal and optimistic-revision denials are persisted too, but cannot

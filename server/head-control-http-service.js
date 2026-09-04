@@ -21,6 +21,7 @@ const ACTIONS = Object.freeze([
   "freeze_batch_manifest",
   "cut_batch",
   "retire_batch",
+  "abandon_batch_manifest",
   "queue_local_correction",
   "read_propagation_stop",
   "get_project_status",
@@ -224,7 +225,7 @@ function commandArguments(tool, value) {
       payload: freeze({ recovery: boundedJson(value.recovery) }),
     });
   }
-  if (tool === "freeze_batch_manifest" || tool === "retire_batch") {
+  if (tool === "freeze_batch_manifest" || tool === "retire_batch" || tool === "abandon_batch_manifest") {
     exact(value, ["expected_revision", "idempotency_key", "correlation_id"]);
     return freeze({
       expected_revision: revision(value.expected_revision),

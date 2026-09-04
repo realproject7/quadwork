@@ -181,7 +181,7 @@ async function run() {
   try {
     console.log("\n--- Head-control end-to-end (shim -> route -> runtime -> durable domain) ---\n");
     const tools = await shim.handshake();
-    assert.deepEqual(tools, ["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit"]);
+    assert.deepEqual(tools, ["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit"]);
     const empty = await shim.call("get_pipeline_status", { idempotency_key: "idem_e2e_status_0", correlation_id: "corr_e2e_status_0" });
     assert.equal(empty.decision.code, "head_control_status_observed");
     assert.equal(empty.result.status.revision, 0);
@@ -254,11 +254,27 @@ async function run() {
     assert.deepEqual(runtime.readCurrentBatchProjection({ project_id }), { active: false, projection: null });
     const second = manifest("two");
     assert.notEqual(second.manifest_digest, first.manifest_digest);
-    const putAgain = await shim.call("put_batch_manifest", { expected_revision: 6, idempotency_key: "idem_e2e_put_2", correlation_id: "corr_e2e_put_2", manifest: copy(second) });
+    const decidedAgainst = await shim.call("put_batch_manifest", { expected_revision: 6, idempotency_key: "idem_e2e_put_2", correlation_id: "corr_e2e_put_2", manifest: copy(second) });
+    assert.equal(decidedAgainst.decision.code, "head_control_applied");
+    assert.equal(decidedAgainst.result.status.revision, 7);
+    // #1069: Head walks away from the never-frozen manifest through the real
+    // route; the retired record and the empty active path are untouched.
+    const abandoned = await shim.call("abandon_batch_manifest", { expected_revision: 7, idempotency_key: "idem_e2e_abandon_1", correlation_id: "corr_e2e_abandon_1" });
+    assert.equal(abandoned.decision.code, "head_control_applied");
+    assert.deepEqual(abandoned.result.status, { revision: 8, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+    assert.equal(store.readRetiredSnapshots(owner).length, 1);
+    assert.throws(() => store.readRecoverySnapshot(owner), (error) => error.code === "work_task_pipeline_store_missing");
+    assert.deepEqual(runtime.readCurrentBatchProjection({ project_id }), { active: false, projection: null });
+    const abandonedReplay = await shim.call("abandon_batch_manifest", { expected_revision: 7, idempotency_key: "idem_e2e_abandon_1", correlation_id: "corr_e2e_abandon_1" });
+    assert.equal(abandonedReplay.decision.kind, "replayed");
+    ok(true, "a put-but-never-frozen manifest is abandoned through the real entry point without touching retired provenance");
+    const putAgain = await shim.call("put_batch_manifest", { expected_revision: 8, idempotency_key: "idem_e2e_put_3", correlation_id: "corr_e2e_put_3", manifest: copy(second) });
     assert.equal(putAgain.decision.code, "head_control_applied");
-    const frozenAgain = await shim.call("freeze_batch_manifest", { expected_revision: 7, idempotency_key: "idem_e2e_freeze_2", correlation_id: "corr_e2e_freeze_2" });
+    const frozenAgain = await shim.call("freeze_batch_manifest", { expected_revision: 9, idempotency_key: "idem_e2e_freeze_2", correlation_id: "corr_e2e_freeze_2" });
     assert.equal(frozenAgain.decision.code, "head_control_applied");
-    assert.equal(frozenAgain.result.status.revision, 8);
+    assert.equal(frozenAgain.result.status.revision, 10);
+    const frozenAbandon = await shim.call("abandon_batch_manifest", { expected_revision: 10, idempotency_key: "idem_e2e_abandon_2", correlation_id: "corr_e2e_abandon_2" });
+    assert.equal(frozenAbandon.decision.code, "head_control_abandon_unsafe");
     assert.equal(frozenAgain.result.status.manifest_frozen, true);
     assert.equal(store.readRecoverySnapshot(owner).manifest.manifest_digest, frozenAgain.result.status.manifest_digest);
     const provenance = store.readRetiredSnapshots(owner);
@@ -272,17 +288,17 @@ async function run() {
     const audit = await shim.call("recent_head_control_audit", {});
     assert.deepEqual(audit.map((record) => record.action), [
       "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "read_propagation_stop", "read_propagation_stop", "read_propagation_stop",
-      "queue_local_correction", "retire_batch", "put_batch_manifest", "freeze_batch_manifest",
+      "queue_local_correction", "retire_batch", "put_batch_manifest", "abandon_batch_manifest", "put_batch_manifest", "freeze_batch_manifest", "abandon_batch_manifest",
     ]);
     assert.ok(audit.every((record) => !Object.hasOwn(record, "detail") && !Object.hasOwn(record, "payload")));
     assert.doesNotMatch(JSON.stringify(audit), /checkpoint_|dependency_chain|propagation_stop_pending|review_round_ref/);
     ok(true, "every new operation is a redacted durable audit record with no detail or payload");
 
     assert.deepEqual(await foreignProject.handshake(), tools);
-    const crossProject = await foreignProject.call("retire_batch", { expected_revision: 8, idempotency_key: "idem_e2e_foreign", correlation_id: "corr_e2e_foreign" });
+    const crossProject = await foreignProject.call("retire_batch", { expected_revision: 10, idempotency_key: "idem_e2e_foreign", correlation_id: "corr_e2e_foreign" });
     assert.equal(crossProject.error?.code, -32000);
     assert.deepEqual(await staleGeneration.handshake(), tools);
-    const stale = await staleGeneration.call("queue_local_correction", { ...correctionArguments, expected_revision: 8, idempotency_key: "idem_e2e_stale", correlation_id: "corr_e2e_stale" });
+    const stale = await staleGeneration.call("queue_local_correction", { ...correctionArguments, expected_revision: 10, idempotency_key: "idem_e2e_stale", correlation_id: "corr_e2e_stale" });
     assert.equal(stale.error?.code, -32000);
     assert.deepEqual(statuses.slice(-2), [{ status: 400, type: "binding_mismatch" }, { status: 400, type: "binding_mismatch" }]);
     principalRole = "dev";

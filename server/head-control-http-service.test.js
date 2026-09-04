@@ -47,7 +47,7 @@ function status(overrides = {}) {
 
 function fakeDomain() {
   let current = status();
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
   const controlPayloads = [];
   const domain = {
     get_pipeline_status(input) {
@@ -76,6 +76,13 @@ function fakeDomain() {
     retire_batch(input) {
       calls.retire_batch += 1;
       assert.equal(input.expected_revision, current.revision);
+      current = status({ revision: current.revision + 1 });
+      return clone(current);
+    },
+    abandon_batch_manifest(input) {
+      calls.abandon_batch_manifest += 1;
+      assert.equal(input.expected_revision, current.revision);
+      assert.equal(input.payload, null);
       current = status({ revision: current.revision + 1 });
       return clone(current);
     },
@@ -281,6 +288,31 @@ function ok(value, message) {
   }
   assert.deepEqual([fixture.calls.read_propagation_stop, fixture.calls.queue_local_correction, fixture.calls.retire_batch], [1, 1, 1]);
   ok(true, "stop read, correction, and retirement map to their static commands, carry a bounded detail, and reject any extra field");
+}
+
+// #1069: abandonment maps to its static payloadless command and rejects any
+// caller-supplied digest, manifest, or selector.
+{
+  const fixture = createFixture();
+  await fixture.handler.handle(request("put_batch_manifest", { expected_revision: 0, idempotency_key: "idem_http_put_abandon", correlation_id: "corr_http_put_abandon", manifest: { version: 1, tasks: [] } }), { token: TOKEN });
+  const abandoned = await fixture.handler.handle(request("abandon_batch_manifest", {
+    expected_revision: 1,
+    idempotency_key: "idem_http_abandon_one",
+    correlation_id: "corr_http_abandon_one",
+  }), { token: TOKEN });
+  assert.equal(abandoned.ok, true);
+  assert.equal(abandoned.result.result.action, "abandon_batch_manifest");
+  assert.equal(abandoned.result.result.status.manifest_digest, null);
+  assert.equal(abandoned.result.detail, null);
+  for (const argumentsValue of [
+    { expected_revision: 2, idempotency_key: "idem_http_abandon_bad", correlation_id: "corr_http_abandon_bad", manifest_digest: MANIFEST },
+    { expected_revision: 2, idempotency_key: "idem_http_abandon_bad", correlation_id: "corr_http_abandon_bad", manifest: {} },
+    { idempotency_key: "idem_http_abandon_bad", correlation_id: "corr_http_abandon_bad" },
+  ]) {
+    error(await fixture.handler.handle(request("abandon_batch_manifest", argumentsValue), { token: TOKEN }), "invalid_request");
+  }
+  assert.equal(fixture.calls.abandon_batch_manifest, 1);
+  ok(true, "abandonment maps to its static payloadless command and rejects a caller-supplied digest, manifest, or missing revision");
 }
 
 {

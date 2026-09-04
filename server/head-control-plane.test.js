@@ -37,7 +37,7 @@ const stopDetail = Object.freeze({ kind: "propagation_stop_pending", target: "he
 const REVISION_FREE = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
 const recovery = Object.freeze({ agent: "dev", expected_generation: "gen-lost-1", assignment_attempt: "attempt_a", reason_code: "process_exited" });
 function request(action, overrides = {}) {
-  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch" || action === "get_project_status" || action === "review_handoff"
+  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch" || action === "abandon_batch_manifest" || action === "get_project_status" || action === "review_handoff"
     ? null
     : action === "project_monitor"
       ? { command: "start" }
@@ -65,7 +65,7 @@ const projectDetail = Object.freeze({ assignment: { assignment_key: "b7-abc", su
 const handoffDetail = Object.freeze({ cycle: null, subject: "primary:issue#42" });
 function fakeDomain(initial = status()) {
   let current = copy(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
   const controlLog = [];
   const domain = {
     get_project_status(input) {
@@ -103,6 +103,13 @@ function fakeDomain(initial = status()) {
     },
     retire_batch(input) {
       calls.retire_batch += 1;
+      assert.equal(input.expected_revision, current.revision);
+      assert.equal(input.payload, null);
+      current = status({ revision: current.revision + 1 });
+      return copy(current);
+    },
+    abandon_batch_manifest(input) {
+      calls.abandon_batch_manifest += 1;
       assert.equal(input.expected_revision, current.revision);
       assert.equal(input.payload, null);
       current = status({ revision: current.revision + 1 });
@@ -202,8 +209,8 @@ function ok(condition, message) {
   assert.equal(cut.decision.kind, "accepted");
   assert.equal(cut.result.status.revision, 3);
   assert.equal(cut.result.status.cut_safe, false);
-  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]),
-    "only the seven pipeline actions plus the two reads and two controls of #1036/#1044 are exposed");
+  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]),
+    "only the eight pipeline actions plus the two reads and two controls of #1036/#1044 are exposed");
   ok(calls.get_pipeline_status === 4 && calls.put_batch_manifest === 1 && calls.freeze_batch_manifest === 1 && calls.cut_batch === 1,
     "each accepted action delegates once to its fixed owning pipeline action");
 
@@ -295,6 +302,56 @@ function ok(condition, message) {
   await assert.rejects(() => core.execute(request("retire_batch", { idempotency_key: "idem_retire_pl", correlation_id: "corr_retire_pl", expected_revision: 3, payload: { anything: true } })),
     (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request");
   ok(true, "read actions cannot pin a revision and mutations take only their fixed payload shape");
+}
+
+// #1069: abandoning a never-frozen manifest rides the same bound authority,
+// optimistic revision, replay window, and fixed audit record as retirement.
+// It is refused wherever a pipeline exists: the frozen batch leaves only
+// through retirement, and an archived one is denied before the domain.
+{
+  const { core, calls } = plane(status({ revision: 1, manifest_digest: manifestDigest }));
+  const abandonRequest = request("abandon_batch_manifest", { idempotency_key: "idem_abandon_001", correlation_id: "corr_abandon_001", expected_revision: 1 });
+  const abandoned = await core.execute(abandonRequest);
+  assert.equal(abandoned.decision.code, "head_control_applied");
+  assert.equal(abandoned.result.status.revision, 2);
+  assert.equal(abandoned.result.status.manifest_digest, null);
+  assert.equal(abandoned.detail, null);
+  assert.deepEqual(Object.keys(abandoned.audit.result).sort(), ["action", "applied", "status"]);
+  const replay = await core.execute(copy(abandonRequest));
+  assert.equal(replay.decision.kind, "replayed");
+  assert.equal(calls.abandon_batch_manifest, 1);
+  const empty = await core.execute(request("abandon_batch_manifest", { idempotency_key: "idem_abandon_empty", correlation_id: "corr_abandon_empty", expected_revision: 2 }));
+  assert.equal(empty.decision.code, "head_control_abandon_unsafe");
+  const successor = await core.execute(request("put_batch_manifest", { idempotency_key: "idem_abandon_put", correlation_id: "corr_abandon_put", expected_revision: 2 }));
+  assert.equal(successor.decision.code, "head_control_applied");
+  assert.equal(successor.result.status.revision, 3);
+  const stale = await core.execute(request("abandon_batch_manifest", { idempotency_key: "idem_abandon_stale", correlation_id: "corr_abandon_stale", expected_revision: 2 }));
+  assert.equal(stale.decision.code, "head_control_stale_revision");
+  assert.equal(calls.abandon_batch_manifest, 1);
+  ok(true, "abandonment empties a never-frozen manifest once, replays without a second invocation, and a stale revision or empty stage never reaches the domain");
+
+  const frozen = plane(status({ revision: 2, manifest_digest: manifestDigest, pipeline_digest: pipelineDigest, manifest_frozen: true, cut_safe: true }));
+  const frozenAbandon = await frozen.core.execute(request("abandon_batch_manifest", { idempotency_key: "idem_abandon_frozen", correlation_id: "corr_abandon_frozen", expected_revision: 2 }));
+  assert.equal(frozenAbandon.decision.code, "head_control_abandon_unsafe");
+  const archived = plane(status({ revision: 3, archived: true, manifest_digest: manifestDigest, pipeline_digest: pipelineDigest, manifest_frozen: true }));
+  const archivedAbandon = await archived.core.execute(request("abandon_batch_manifest", { idempotency_key: "idem_abandon_archived", correlation_id: "corr_abandon_archived", expected_revision: 3 }));
+  assert.equal(archivedAbandon.decision.code, "head_control_archived");
+  assert.equal(frozen.calls.abandon_batch_manifest + archived.calls.abandon_batch_manifest, 0);
+  const broken = fakeDomain(status({ revision: 1, manifest_digest: manifestDigest }));
+  broken.domain.abandon_batch_manifest = () => status({ revision: 2, manifest_digest: manifestDigest });
+  const kept = await createHeadControlPlane({ binding, domain: broken.domain }).execute(request("abandon_batch_manifest", { idempotency_key: "idem_abandon_kept", correlation_id: "corr_abandon_kept", expected_revision: 1 }));
+  assert.equal(kept.decision.code, "head_control_domain_invalid_transition");
+  ok(true, "a frozen or archived batch cannot be abandoned, and an abandonment that keeps its manifest fails closed");
+
+  for (const principal of [{ ...binding, role: "dev" }, { ...binding, project_id: "other" }, { ...binding, generation: 6 }]) {
+    const foreign = plane(status({ revision: 1, manifest_digest: manifestDigest }));
+    const denied = await foreign.core.execute(request("abandon_batch_manifest", { principal, expected_revision: 1 }));
+    assert.match(denied.decision.code, /^head_control_(?:role_denied|project_denied|generation_stale)$/);
+    assert.equal(foreign.calls.abandon_batch_manifest + foreign.calls.get_pipeline_status, 0);
+  }
+  await assert.rejects(() => core.execute(request("abandon_batch_manifest", { idempotency_key: "idem_abandon_pl", correlation_id: "corr_abandon_pl", expected_revision: 3, payload: { manifest_digest: manifestDigest } })),
+    (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request");
+  ok(true, "Dev, cross-project, and stale-generation principals never reach abandonment, which takes no caller-supplied digest or payload");
 }
 
 // #1036/#1044: the two read surfaces and the two controls act beside the
