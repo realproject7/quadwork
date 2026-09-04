@@ -28,7 +28,7 @@
 const crypto = require("node:crypto");
 const { planWorkTaskPipelineEvent } = require("./work-task-pipeline");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
-const { createTaskReviewRoundStore, MAX_ROUNDS_PER_PROJECT } = require("./task-review-round-store");
+const { createTaskReviewRoundStore } = require("./task-review-round-store");
 
 const VERSION = 1;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
@@ -164,15 +164,13 @@ function createProjectArchiveTransition(value) {
   // before the cancellation and stays in the immutable record, or it is
   // rejected because the round is cancelled.
   function cancelCurrentRounds(result, owner) {
+    // The listing is already bounded: the store rejects a document holding more
+    // than its per-project round bound before it can be read back.
     let anchors;
     try { anchors = roundStore.listCurrentRoundAnchors(owner); }
     catch (error) {
       record(result, ROUND_RESOURCE, storeCode(error, "task_review_round_unavailable"),
         "archived project review rounds could not be listed");
-      return;
-    }
-    if (anchors.length > MAX_ROUNDS_PER_PROJECT) {
-      record(result, ROUND_RESOURCE, "task_review_round_over_bound", "archived project exceeds its review-round bound");
       return;
     }
     let at;
