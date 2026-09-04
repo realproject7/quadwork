@@ -320,6 +320,38 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   })), "stale_work_task_candidate");
 }
 
+// #1070: the local correction cap is a per-task fact, not a property of the
+// active checkpoint. Three corrections may be queued for one task; the fourth
+// is refused before any plan exists, even though every corrected candidate
+// cleared the checkpoint authority that carried the previous count.
+{
+  const batch = manifest();
+  const workRefs = refs(batch);
+  let work = buildWorkTaskPipeline(batch);
+  let candidate = candidateFor(workRefs.core, "b");
+  work = apply(work, event("assign_build", "cap_build_0", { work_task_ref: copy(workRefs.core), assignment_id: "cap_assignment_0" }));
+  work = apply(work, event("record_candidate", "cap_candidate_0", { assignment_id: "cap_assignment_0", candidate }));
+  const requestChanges = (pipeline, round) => {
+    const review = { work_task_ref: copy(workRefs.core), review_round_id: `cap_round_${round}`, candidate_digest: candidate.candidate_digest };
+    let next = apply(pipeline, event("assign_independent_review", `cap_review_${round}`, review));
+    next = apply(next, event("record_review_verdict", `cap_verdict_${round}`, { ...review, verdict: "changes_requested" }));
+    return apply(next, event("reconcile_review", `cap_reconcile_${round}`, { ...review, resolution: "changes_requested" }));
+  };
+  const correction = (round) => event("queue_local_correction", `cap_checkpoint_${round}`, { work_task_ref: copy(workRefs.core), checkpoint_id: `cap_checkpoint_id_${round}` });
+  for (const round of [1, 2, 3]) {
+    work = requestChanges(work, round);
+    work = apply(work, correction(round));
+    assert.equal(slot(work, workRefs.core).correction.checkpoint_id, `cap_checkpoint_id_${round}`);
+    candidate = candidateFor(workRefs.core, "cde"[round - 1]);
+    work = apply(work, event("assign_build", `cap_build_${round}`, { work_task_ref: copy(workRefs.core), assignment_id: `cap_assignment_${round}` }));
+    work = apply(work, event("record_candidate", `cap_candidate_${round}`, { assignment_id: `cap_assignment_${round}`, candidate }));
+    assert.equal(slot(work, workRefs.core).correction, null);
+  }
+  work = requestChanges(work, 4);
+  assert.equal(slot(work, workRefs.core).state, "changes_requested");
+  throwsCode(() => planWorkTaskPipelineEvent(work, correction(4)), "work_task_checkpoint_limit");
+}
+
 // A server-observed candidate replacement can occur while a review is active;
 // it atomically revokes that review authority before the new exact candidate
 // becomes eligible for another independent round.
