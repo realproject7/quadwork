@@ -44,6 +44,7 @@ const { createWorkTaskIndependentReviewService } = require("./work-task-independ
 const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 const { createWorkTaskReviewRuntime } = require("./work-task-review-runtime");
 const { createWorkTaskDeliverySource } = require("./work-task-delivery-source");
+const { createProjectArchiveTransition } = require("./project-archive-transition");
 const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
 const { createDeliveryCompositionService } = require("./delivery-composition-service");
 const { createDeliveryCandidateRuntime } = require("./delivery-candidate-runtime");
@@ -3294,9 +3295,25 @@ function mergeCleanupResult(aggregate, result, fallbackResource) {
   }
 }
 
+// #1070: the one project-scope WorkTask archive transition. It is composed
+// here with server-side identity only: the project id comes from the archive
+// the lifecycle controller is performing, and the installation id is read from
+// live configuration, so no caller can name another project or installation.
+const projectArchiveTransition = createProjectArchiveTransition({
+  config_dir: path.dirname(CONFIG_PATH),
+  fs,
+  resolve_installation_id: () => readConfig()?.installation_id,
+  now: () => new Date(),
+});
+
 async function cleanupProjectRuntime(projectId) {
   const aggregate = { ok: false, resources: {}, cleanup_errors: [] };
 
+  // #1070: the durable WorkTask batch is archived in this same synchronous
+  // turn that follows barrier persistence and admission revocation, before the
+  // first await, so no late build, candidate, review, receipt, or correction
+  // can win after the barrier.
+  mergeCleanupResult(aggregate, projectArchiveTransition.archiveProjectRuntimeState(projectId), "work_task_archive");
   // This synchronous cancellation is deliberately before the first await.
   // It closes both deferred wake and delayed-submit timers in the same turn
   // that follows durable barrier persistence/revocation.
