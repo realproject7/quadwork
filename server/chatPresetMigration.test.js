@@ -144,6 +144,20 @@ assert.equal(legacyFormat.message, LEGACY_QUEUE_FORMAT, "the migration does not 
 assert.equal(migratePresets([{ id: "default-3", title: QUEUE_FORMAT_TITLE, message: QUALIFIED_QUEUE_FORMAT }]).changed,
   false, "an already-qualified queue-format preset is left alone");
 
+// The asymmetry, pinned: default-3 is a body rewrite, not a deletion, so an
+// exact legacy body under the built-in id is corrected even when the operator
+// renamed the preset. The title they chose must survive byte-for-byte.
+const renamedFormat = { id: "default-3", title: "user-renamed", message: LEGACY_QUEUE_FORMAT };
+const renamedResult = migratePresets([renamedFormat]);
+assert.equal(renamedResult.changed, true, "a renamed queue-format preset with the exact legacy body still migrates");
+assert.deepEqual(renamedResult.presets, [
+  { id: "default-3", title: "user-renamed", message: QUALIFIED_QUEUE_FORMAT },
+], "the operator's title survives byte-for-byte while the V1 body is corrected");
+assert.equal(renamedResult.presets[0].title, "user-renamed", "the title is not reset to the built-in wording");
+assert.equal(migratePresets(renamedResult.presets).changed, false,
+  "migrating the renamed-and-corrected preset again changes nothing");
+assert.equal(renamedFormat.message, LEGACY_QUEUE_FORMAT, "the renamed-preset migration does not mutate its input");
+
 // --- idempotence ----------------------------------------------------------
 const mixed = [
   builtinPulse(PRE_808_QUEUE_CHECK),

@@ -79,9 +79,19 @@ function isLegacyQueueFormatBuiltin(preset) {
 }
 
 /**
- * Migrate a parsed preset list. Only untouched built-ins are touched: a cached
- * copy of the retired all-agent pulse is dropped, and a cached copy of the V1
- * queue-format built-in is rewritten to the repository-qualified V2 wording.
+ * Migrate a parsed preset list. The two built-ins are treated asymmetrically,
+ * because one migration deletes and the other only rewrites a body:
+ *
+ *   default-1 (retired all-agent pulse) is DELETED, and only on an exact
+ *   id + title + body match against a known historical generation. Deleting a
+ *   preset a user may have adopted is unrecoverable, so a renamed copy is kept.
+ *
+ *   default-3 (V1 queue-format) is REWRITTEN on an exact id + body match, and
+ *   the stored title is preserved verbatim whatever it says. The body being
+ *   replaced instructs Head to rewrite qualified references as bare `#<number>`,
+ *   which destroys V2 repository identity; leaving that command live under a
+ *   renamed title would be worse than renaming nothing.
+ *
  * Anything else — user edits, user-authored entries, unrelated records — is
  * returned by identity. `changed` is false whenever nothing was rewritten, so
  * the caller can leave storage untouched.
