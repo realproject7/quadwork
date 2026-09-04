@@ -8,8 +8,10 @@ const { createHeadControlPlane } = require("./head-control-plane");
 const { composeHeadDomain } = require("./head-control-runtime");
 const {
   buildBatchManifest,
+  freezeBatchManifest,
 } = require("./work-task-manifest");
 const {
+  buildWorkTaskPipeline,
   planWorkTaskPipelineEvent,
 } = require("./work-task-pipeline");
 const {
@@ -585,6 +587,222 @@ withDirectory((directory) => {
   ok(true, "Head can abandon a never-frozen manifest it decided against so a successor can be put");
 });
 
+// Abandonment is not a delete or a reset.  It is impossible once a freeze has
+// begun, once a pipeline exists, and after retirement, and it never consults
+// or touches the retired records that hold frozen and cut provenance.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  const owner = { installation_id: binding.installation_id, project_id: binding.project_id };
+  const store = createWorkTaskPipelineStore({ config_dir: directory, fs });
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 0, null, { correlation_id: "corr_abandon_empty", idempotency_key: "idem_abandon_empty" })), "head_control_work_task_invalid_transition");
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
+  current.freeze_batch_manifest(request("freeze_batch_manifest", 1, null));
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 2, null, { correlation_id: "corr_abandon_frozen", idempotency_key: "idem_abandon_frozen" })), "head_control_work_task_invalid_transition");
+  const advanced = advanceToAccepted(directory, store.readRecoverySnapshot(owner));
+  current.cut_batch(request("cut_batch", 3, { cut: { tasks: [{ work_task_ref: copy(advanced.ref), candidate_digest: advanced.candidate.candidate_digest }] } }));
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 4, null, { correlation_id: "corr_abandon_cut", idempotency_key: "idem_abandon_cut" })), "head_control_work_task_invalid_transition");
+  const retired = current.retire_batch(request("retire_batch", 4, null));
+  assert.equal(retired.revision, 5);
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 5, null, { correlation_id: "corr_abandon_retired", idempotency_key: "idem_abandon_retired" })), "head_control_work_task_invalid_transition");
+  const provenanceBefore = JSON.stringify(store.readRetiredSnapshots(owner));
+  assert.equal(store.readRetiredSnapshots(owner).length, 1);
+  const decidedAgainst = copy(reviewManifest());
+  current.put_batch_manifest(request("put_batch_manifest", 5, { manifest: decidedAgainst }, { correlation_id: "corr_put_after_retire", idempotency_key: "idem_put_after_retire" }));
+  const abandoned = current.abandon_batch_manifest(request("abandon_batch_manifest", 6, null));
+  assert.equal(abandoned.revision, 7);
+  assert.equal(JSON.stringify(store.readRetiredSnapshots(owner)), provenanceBefore, "the retired record with its cut history is byte-for-value untouched");
+  assert.throws(() => store.readRecoverySnapshot(owner), (error) => error.code === "work_task_pipeline_store_missing");
+  assert.doesNotMatch(fs.readFileSync(headControlWorkTaskDomainPath(directory, binding), "utf8"), new RegExp(decidedAgainst.manifest_digest));
+  ok(true, "abandonment is refused for empty, frozen, cut, and retired states and leaves retired provenance untouched");
+});
+
+// Stale generation: after an archive/unarchive bump adopted the state, the
+// superseded Head cannot abandon; a stale revision is refused the same way.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  const decidedAgainst = manifest();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(decidedAgainst) }));
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 0, null, { correlation_id: "corr_abandon_stale_rev", idempotency_key: "idem_abandon_stale_rev" })), "head_control_work_task_stale_revision");
+  const next = { ...binding, generation: 8 };
+  const successor = createHeadControlWorkTaskDomain({ binding: next, config_dir: directory, fs, resolve_registered_identity: resolveRegisteredIdentity, now: () => "2026-09-02T00:00:00.000Z" });
+  assert.equal(successor.initialize().stage, "manifest");
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null)), "head_control_work_task_state_identity_mismatch");
+  const statePath = headControlWorkTaskDomainPath(directory, binding);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"stage":"manifest"/);
+  assert.match(fs.readFileSync(statePath, "utf8"), new RegExp(decidedAgainst.manifest_digest));
+  const adopted = successor.abandon_batch_manifest({ ...request("abandon_batch_manifest", 1, null, { correlation_id: "corr_abandon_gen8", idempotency_key: "idem_abandon_gen8" }), binding: copy(next) });
+  assert.deepEqual(adopted, { revision: 2, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+  ok(true, "a stale generation or stale revision cannot abandon; only the adopting Head generation can");
+});
+
+// Archive during the transition: the intent is durable, then the project is
+// archived and unarchived (a generation bump adopts the state) before the
+// finalize.  The superseded Head's finalize is refused, and the adopting
+// generation completes that exact intent once.
+withDirectory((directory) => {
+  const statePath = headControlWorkTaskDomainPath(directory, binding);
+  const lockPath = `${statePath}.lock`;
+  const next = { ...binding, generation: 8 };
+  const successor = createHeadControlWorkTaskDomain({ binding: next, config_dir: directory, fs, resolve_registered_identity: resolveRegisteredIdentity, now: () => "2026-09-02T00:00:00.000Z" });
+  let lockAcquisitions = 0;
+  let armed = false;
+  let adoptedDuring = false;
+  const racingFs = Object.create(fs);
+  racingFs.openSync = (target, flags, mode) => {
+    if (armed && target === lockPath && flags === "wx") {
+      lockAcquisitions += 1;
+      // prepared() takes the lock twice, the intent write is the third, and
+      // the finalize is the fourth: adopt the durable intent just before it.
+      if (lockAcquisitions === 4) {
+        assert.match(fs.readFileSync(statePath, "utf8"), /"pending":\{"action":"abandon_batch_manifest"/);
+        assert.equal(successor.initialize().binding.generation, 8);
+        adoptedDuring = true;
+      }
+    }
+    return fs.openSync(target, flags, mode);
+  };
+  const current = domain(directory, { fs: racingFs });
+  current.initialize();
+  const decidedAgainst = manifest();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(decidedAgainst) }));
+  armed = true;
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null)), "head_control_work_task_state_identity_mismatch");
+  armed = false;
+  assert.equal(adoptedDuring, true);
+  assert.equal(lockAcquisitions, 4);
+  assert.equal(fs.existsSync(lockPath), false, "the refused finalize released its writer lock");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"generation":8/);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"pending":\{"action":"abandon_batch_manifest","expected_revision":1,"fingerprint":"[a-f0-9]{64}","manifest_digest":"[a-f0-9]{64}"\}/);
+  const successorRequest = (keys) => ({ ...request("get_pipeline_status", null, null, keys), binding: copy(next) });
+  assert.deepEqual(successor.get_pipeline_status(successorRequest({ correlation_id: "corr_adopt_status", idempotency_key: "idem_adopt_status" })),
+    { revision: 2, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+  assert.match(fs.readFileSync(statePath, "utf8"), /"pending":null/);
+  assert.equal(successor.get_pipeline_status(successorRequest({ correlation_id: "corr_adopt_again", idempotency_key: "idem_adopt_again" })).revision, 2, "the recovered intent is not applied twice");
+  throwsCode(() => current.get_pipeline_status(request("get_pipeline_status", null)), "head_control_work_task_state_identity_mismatch");
+  ok(true, "an archive/unarchive bump during the transition hands the exact durable intent to the adopting generation, which completes it once");
+});
+
+// Competing writers: a live foreign writer lock refuses the abandon outright,
+// and a second Head process that abandons first leaves the other's optimistic
+// revision stale so the state is never advanced twice.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
+  const statePath = headControlWorkTaskDomainPath(directory, binding);
+  const lockPath = `${statePath}.lock`;
+  fs.writeFileSync(lockPath, JSON.stringify({ version: 1, pid: process.pid, token: "f".repeat(32), host: require("node:os").hostname(), created_at: Date.now() }), { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null)), "head_control_work_task_state_locked");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"stage":"manifest"/);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"pending":null/);
+  fs.unlinkSync(lockPath);
+  const other = domain(directory);
+  assert.equal(other.abandon_batch_manifest(request("abandon_batch_manifest", 1, null, { correlation_id: "corr_abandon_other", idempotency_key: "idem_abandon_other" })).revision, 2);
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null, { correlation_id: "corr_abandon_lost", idempotency_key: "idem_abandon_lost" })), "head_control_work_task_stale_revision");
+  assert.equal(current.get_pipeline_status(request("get_pipeline_status", null)).revision, 2, "the losing writer did not advance the state a second time");
+  ok(true, "a live competing writer lock refuses abandonment and a lost race is a stale revision, never a second abandonment");
+});
+
+// Same-content successor: the intent binds the revision and the digest
+// together.  A stale intent carrying the right digest but an earlier revision,
+// or the right revision but another digest, is corrupt and never clears the
+// manifest; only the exact pair resumes.
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  const content = manifest();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(content) }));
+  assert.equal(current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null)).revision, 2);
+  const again = current.put_batch_manifest(request("put_batch_manifest", 2, { manifest: copy(content) }, { correlation_id: "corr_put_same", idempotency_key: "idem_put_same" }));
+  assert.equal(again.revision, 3);
+  assert.equal(again.manifest_digest, content.manifest_digest, "the successor has the same content digest as the abandoned manifest");
+  assert.deepEqual(domain(directory).get_pipeline_status(request("get_pipeline_status", null)), again);
+  const statePath = headControlWorkTaskDomainPath(directory, binding);
+  const stored = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const withIntent = (intent) => fs.writeFileSync(statePath, JSON.stringify({ ...stored, pending: intent }), { encoding: "utf8", mode: FILE_MODE, flag: "w" });
+  withIntent({ action: "abandon_batch_manifest", expected_revision: 1, fingerprint: "a".repeat(64), manifest_digest: content.manifest_digest });
+  throwsCode(() => domain(directory).get_pipeline_status(request("get_pipeline_status", null)), "corrupt_head_control_work_task_state");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"revision":3,"stage":"manifest"/, "a stale intent with a matching digest never clears the same-content successor");
+  withIntent({ action: "abandon_batch_manifest", expected_revision: 3, fingerprint: "a".repeat(64), manifest_digest: "e".repeat(64) });
+  throwsCode(() => domain(directory).get_pipeline_status(request("get_pipeline_status", null)), "corrupt_head_control_work_task_state");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"revision":3,"stage":"manifest"/, "an intent naming another digest at the right revision never clears the manifest");
+  withIntent({ action: "abandon_batch_manifest", expected_revision: 3, fingerprint: "a".repeat(64), manifest_digest: content.manifest_digest });
+  assert.deepEqual(domain(directory).get_pipeline_status(request("get_pipeline_status", null)),
+    { revision: 4, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false }, "only the exact revision+digest pair resumes");
+  ok(true, "a same-content successor is distinguished from the abandoned manifest by revision, never by content digest alone");
+});
+
+// Interrupted write then restart, in both halves of the transition, and the
+// recovery refusing to clear a manifest that a pipeline came to hold.
+withDirectory((directory) => {
+  let domainRenames = 0;
+  let failAt = 0;
+  const faultFs = Object.create(fs);
+  faultFs.renameSync = (from, to) => {
+    if (String(to).includes("head-control-work-task-domain")) {
+      domainRenames += 1;
+      if (domainRenames === failAt) {
+        const error = new Error("injected crash");
+        error.code = "EIO";
+        throw error;
+      }
+    }
+    return fs.renameSync(from, to);
+  };
+  const current = domain(directory, { fs: faultFs });
+  current.initialize();
+  const content = manifest();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(content) }));
+  const statePath = headControlWorkTaskDomainPath(directory, binding);
+  // Crash before the intent is durable: nothing happened, and a retry works.
+  domainRenames = 0;
+  failAt = 1;
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null)), "head_control_work_task_state_write_failed");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"revision":1,"stage":"manifest"/);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"pending":null/);
+  assert.equal(domain(directory).get_pipeline_status(request("get_pipeline_status", null)).manifest_digest, content.manifest_digest);
+  // Crash after the intent is durable but before the empty write: a restart
+  // resumes exactly that intent, once.
+  domainRenames = 0;
+  failAt = 2;
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null, { correlation_id: "corr_abandon_retry", idempotency_key: "idem_abandon_retry" })), "head_control_work_task_state_write_failed");
+  assert.equal(domainRenames, 2);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"revision":1,"stage":"manifest"/);
+  assert.match(fs.readFileSync(statePath, "utf8"), new RegExp(`"pending":\\{"action":"abandon_batch_manifest","expected_revision":1,"fingerprint":"[a-f0-9]{64}","manifest_digest":"${content.manifest_digest}"\\}`));
+  const restarted = domain(directory);
+  assert.deepEqual(restarted.get_pipeline_status(request("get_pipeline_status", null)),
+    { revision: 2, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+  assert.match(fs.readFileSync(statePath, "utf8"), /"pending":null/);
+  const same = restarted.put_batch_manifest(request("put_batch_manifest", 2, { manifest: copy(content) }, { correlation_id: "corr_put_after_crash", idempotency_key: "idem_put_after_crash" }));
+  assert.equal(same.revision, 3);
+  assert.equal(domain(directory).get_pipeline_status(request("get_pipeline_status", null)).revision, 3, "the healed intent never reaches the same-content successor");
+  ok(true, "an interrupted abandon resumes from its exact durable intent after restart, and a crash before the intent leaves the manifest in place");
+});
+withDirectory((directory) => {
+  const current = domain(directory);
+  current.initialize();
+  const content = manifest();
+  current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(content) }));
+  const statePath = headControlWorkTaskDomainPath(directory, binding);
+  const frozen = freezeBatchManifest(content, "2026-09-02T00:00:00.000Z");
+  createWorkTaskPipelineStore({ config_dir: directory, fs }).initialize({
+    expected: { installation_id: binding.installation_id, project_id: binding.project_id, manifest_digest: frozen.manifest_digest, pipeline_digest: null },
+    manifest: copy(frozen),
+    pipeline: buildWorkTaskPipeline(frozen),
+  });
+  throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null)), "head_control_work_task_batch_active");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"revision":1,"stage":"manifest"/);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"pending":null/, "no intent is written while a pipeline holds authority");
+  const stored = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  fs.writeFileSync(statePath, JSON.stringify({ ...stored, pending: { action: "abandon_batch_manifest", expected_revision: 1, fingerprint: "a".repeat(64), manifest_digest: content.manifest_digest } }), { encoding: "utf8", mode: FILE_MODE, flag: "w" });
+  throwsCode(() => domain(directory).get_pipeline_status(request("get_pipeline_status", null)), "head_control_work_task_batch_active");
+  assert.match(fs.readFileSync(statePath, "utf8"), /"revision":1,"stage":"manifest"/);
+  assert.match(fs.readFileSync(statePath, "utf8"), /"pending":\{"action":"abandon_batch_manifest"/);
+  ok(true, "neither a new abandon nor a durable abandon intent clears a manifest once a pipeline holds authority over the project");
+});
+
 const source = fs.readFileSync(path.join(__dirname, "head-control-work-task-domain.js"), "utf8");
 assert.doesNotMatch(source, /head-control-audit-store|require\s*\(\s*["'](?:node:)?(?:http|https|net|child_process)["']\s*\)/);
 assert.doesNotMatch(source, /(?:setInterval\s*\(|setTimeout\s*\(|publish_delivery|createServer|registerAction)/);
@@ -603,12 +821,14 @@ ok(true, "domain has no audit-only recovery, transport, timer, delivery, or gene
   // which the server composes around this durable domain.  The controls here
   // only prove composition; the plane's status preflight for every action
   // still lands on this domain's own get_pipeline_status.
-  const plane = createHeadControlPlane({ binding, domain: composeHeadDomain(binding, workTaskDomain, {
+  const composed = composeHeadDomain(binding, workTaskDomain, {
     read_project_status: () => ({ monitor: { mode: "suspended" } }),
     read_review_handoff: () => ({ cycle: null }),
     project_monitor: async ({ command }) => ({ applied: true, command }),
     recover_worker: async () => ({ applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false }),
-  }) });
+  });
+  let abandonInvocations = 0;
+  const plane = createHeadControlPlane({ binding, domain: { ...composed, abandon_batch_manifest(invocation) { abandonInvocations += 1; return composed.abandon_batch_manifest(invocation); } } });
   const observed = await plane.execute(planeRequest("get_pipeline_status", null));
   const put = await plane.execute(planeRequest("put_batch_manifest", 0, { manifest: copy(manifest()) }));
   const frozen = await plane.execute(planeRequest("freeze_batch_manifest", 1, null));
@@ -629,6 +849,20 @@ ok(true, "domain has no audit-only recovery, transport, timer, delivery, or gene
   assert.equal(beside.decision.code, "head_control_project_observed");
   assert.equal(beside.result.status.revision, 4, "a beside-the-pipeline read preflights status through this durable domain");
   ok(true, "all fixed Head-control plane callbacks bind to the durable WorkTask domain, including the composed monitor/recovery controls");
+
+  // #1069: two identical abandons in flight at once are one domain invocation
+  // through the plane, and the durable state advances exactly once.
+  assert.equal((await plane.execute(planeRequest("retire_batch", 4, null, { correlation_id: "corr_plane_retire", idempotency_key: "idem_plane_retire" }))).result.status.revision, 5);
+  assert.equal((await plane.execute(planeRequest("put_batch_manifest", 5, { manifest: copy(manifest()) }, { correlation_id: "corr_plane_put_again", idempotency_key: "idem_plane_put_again" }))).result.status.revision, 6);
+  const racing = planeRequest("abandon_batch_manifest", 6, null, { correlation_id: "corr_plane_abandon_race", idempotency_key: "idem_plane_abandon_race" });
+  const [first, second] = await Promise.all([plane.execute(racing), plane.execute(copy(racing))]);
+  assert.equal(first.decision.code, "head_control_applied");
+  assert.equal(second.decision.kind, "replayed");
+  assert.equal(second.audit, first.audit);
+  assert.equal(abandonInvocations, 1);
+  assert.deepEqual(workTaskDomain.get_pipeline_status(request("get_pipeline_status", null, null, { correlation_id: "corr_race_status", idempotency_key: "idem_race_status" })),
+    { revision: 7, archived: false, manifest_digest: null, pipeline_digest: null, manifest_frozen: false, cut_safe: false });
+  ok(true, "competing identical abandons through the plane share one domain invocation and advance the durable state once");
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   console.log(`\n${passed} passed`);
 })().catch((error) => { console.error(error); process.exit(1); });
