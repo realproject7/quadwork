@@ -25,6 +25,7 @@ process.env.HOME = TEST_HOME;
 process.env.QUADWORK_SKIP_LISTEN = "1";
 
 function cleanup() {
+  if (typeof originalCancelProjectBackground === "function") routes.cancelProjectBackground = originalCancelProjectBackground;
   os.homedir = originalHomedir;
   if (originalHomeEnv === undefined) delete process.env.HOME; else process.env.HOME = originalHomeEnv;
   if (originalSkipListen === undefined) delete process.env.QUADWORK_SKIP_LISTEN; else process.env.QUADWORK_SKIP_LISTEN = originalSkipListen;
@@ -189,12 +190,29 @@ function storedReleasedRound(seed) {
   return match[0];
 }
 
+const routes = require("./routes");
 const runtime = require("./index");
+
+// Ordering probe: `routes.cancelProjectBackground` is the first asynchronous
+// teardown the runtime cleanup starts. The batch must already be archived by
+// the time it runs, so the transition cannot sit behind an await where a late
+// build, review, or receipt could still win.
+const originalCancelProjectBackground = routes.cancelProjectBackground;
+let pipelineArchivedBeforeAsyncTeardown = null;
+routes.cancelProjectBackground = (projectId) => {
+  if (projectId === "a" && pipelineArchivedBeforeAsyncTeardown === null) {
+    pipelineArchivedBeforeAsyncTeardown = seedA.store.readRecoverySnapshot(seedA.owner).pipeline.archived;
+  }
+  return originalCancelProjectBackground(projectId);
+};
 
 (async () => {
   const archived = await runtime.projectLifecycle.archiveProject("a");
   assert.equal(archived.archived, true, "archive commits the durable config barrier");
   assert.equal(archived.ok, true, `archive cleanup must complete: ${JSON.stringify(archived.cleanup_errors)}`);
+
+  assert.equal(pipelineArchivedBeforeAsyncTeardown, true,
+    "the pipeline is archived before the first asynchronous teardown is started");
 
   // The defect: without the archive transition the pipeline stays live.
   const pipelineAfter = seedA.store.readRecoverySnapshot(seedA.owner);
