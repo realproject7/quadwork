@@ -568,6 +568,24 @@ withDirectory((directory) => {
   throwsCode(() => store.retire({ expected: { ...currentExpected(state), pipeline_digest: initial.pipeline.pipeline_digest }, event_id: "retire_stale" }), "stale_work_task_pipeline_store_precondition");
   throwsCode(() => store.initialize({ expected: initialExpected(initial.manifest), manifest: initial.manifest, pipeline: initial.pipeline }), "work_task_pipeline_store_already_initialized");
 
+  // #1071 (test quality): retirement is a rename(2), which preserves mode, so
+  // asserting 0600 on the retired file only restates what the write path
+  // already guaranteed -- no realistic defect makes it fail.  The load-bearing
+  // property is the refusal: an active record whose mode has been loosened
+  // must not be retired at all.  A rename would carry that record into the
+  // retained provenance set, which nothing ever rewrites, so the one moment
+  // the permissions can still be repaired is before the move.
+  const ownerDirectory = path.dirname(statePath);
+  const activeBytes = fs.readFileSync(statePath);
+  fs.chmodSync(statePath, 0o644);
+  assert.equal(fs.statSync(statePath).mode & 0o777, 0o644, "the record really is group/world readable before the refused retirement");
+  throwsCode(() => store.retire({ expected: currentExpected(state), event_id: "retire_insecure" }), "work_task_pipeline_store_insecure_permissions");
+  assert.deepEqual(fs.readdirSync(ownerDirectory).filter((name) => name.includes(".retired.")), [], "a refused retirement creates no retired record");
+  assert.equal(fs.existsSync(statePath), true, "a refused retirement leaves the active record on its own path");
+  assert.deepEqual(fs.readFileSync(statePath), activeBytes, "a refused retirement rewrites no byte of the active record");
+  assert.equal(fs.statSync(statePath).mode & 0o777, 0o644, "a refused retirement does not quietly repair the permissions it rejected");
+  fs.chmodSync(statePath, 0o600);
+
   const retired = store.retire({ expected: currentExpected(state), event_id: "retire_first" });
   assert.equal(retired.pipeline.archived, true);
   assert.deepEqual(retired.pipeline.history.at(-1), { event_id: "retire_first", kind: "set_archived" });
@@ -587,7 +605,9 @@ withDirectory((directory) => {
   assert.equal(path.basename(statePath), "record.json");
   assert.equal(path.basename(path.dirname(statePath)), project_id);
   assert.equal(path.basename(path.dirname(path.dirname(statePath))), installation_id);
-  assert.equal(fs.statSync(path.join(path.dirname(statePath), retiredFiles[0])).mode & 0o777, FILE_MODE);
+  // The retired record carries the exact mode the refusal above demands, spelled
+  // out as a literal rather than compared against the module's own constant.
+  assert.equal(fs.statSync(path.join(ownerDirectory, retiredFiles[0])).mode & 0o777, 0o600);
 
   // A successor manifest for the same project now initializes cleanly and is
   // isolated from the retired record; a fresh store sees both.
