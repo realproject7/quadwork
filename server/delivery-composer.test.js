@@ -438,8 +438,77 @@ function createOperations(fixture, overrides = {}) {
   assert.equal(proof.result.tree_sha, result_tree_sha);
 }
 
+// #1065 negative controls around the chain.
+{
+  // The old dependent fixture (bravo depends on alpha but is based on the
+  // repository root) is a state the pipeline cannot produce; the manifest
+  // validator now refuses it instead of composing it.
+  assert.throws(() => buildFixture({ dependent: true }), (error) => error.code === "integrated_delivery_base_mismatch");
+
+  // A non-overlapping dependent still chains from, and hands off, alpha.
+  const disjoint = buildFixture({ chain: true, overlap: false });
+  const disjointOperations = createOperations(disjoint);
+  const disjointProof = composeDeliveryCandidate(disjoint.manifest, disjointOperations.operations);
+  assert.deepEqual(disjointProof.steps[1].predecessor_handoffs.map((entry) => entry.work_task_ref.task_key), ["alpha"]);
+  assert.deepEqual(disjointProof.steps[1].changed_files.map((file) => file.path), ["server/bravo.js"]);
+  assert.equal(disjointOperations.calls.find((call) => call.name === "readCandidatePatch" && call.request.sequence === 2).request.base_sha, alpha_candidate_sha);
+
+  // A dependent that changes a path outside its declared boundary is refused
+  // before any apply, even though the change composes cleanly on alpha.
+  const undeclared = buildFixture({ chain: true, undeclaredPath: true });
+  const undeclaredOperations = createOperations(undeclared);
+  throwsCode(() => composeDeliveryCandidate(undeclared.manifest, undeclaredOperations.operations), "candidate_patch_boundary_violation");
+  assert.equal(undeclaredOperations.applyCalls.length, 0);
+
+  // A dependent patch described against the root blob (the pre-#1065 reading)
+  // no longer matches the dependent's own base tree.
+  const staleFixture = buildFixture({ chain: true });
+  const stale = createOperations(staleFixture, {
+    readCandidatePatch(request, response) {
+      if (request.sequence !== 2) return response;
+      const changed = copy(response);
+      changed.files.find((file) => file.path === "server/alpha.js").before.blob_sha = "4".repeat(64);
+      return recalculatePatch(changed);
+    },
+  });
+  throwsCode(() => composeDeliveryCandidate(staleFixture.manifest, stale.operations), "candidate_patch_tree_mismatch");
+  assert.equal(stale.applyCalls.length, 0);
+
+  // Even when an adapter presents a base tree and patch that agree with each
+  // other, a `before` blob that is not the accumulated composition blob is
+  // refused before that composition apply is attempted.
+  const driftFixture = buildFixture({ chain: true });
+  let alphaTreeReads = 0;
+  const drift = createOperations(driftFixture, {
+    readTree(request, response) {
+      if (request.tree_sha !== alpha_tree_sha || (alphaTreeReads += 1) !== 2) return response;
+      const entries = copy(response.entries);
+      entries.find((item) => item.path === "server/alpha.js").blob_sha = "8".repeat(64);
+      return { ...response, entries };
+    },
+    readCandidatePatch(request, response) {
+      if (request.sequence !== 2) return response;
+      const changed = copy(response);
+      changed.files.find((file) => file.path === "server/alpha.js").before.blob_sha = "8".repeat(64);
+      return recalculatePatch(changed);
+    },
+  });
+  throwsCode(() => composeDeliveryCandidate(driftFixture.manifest, drift.operations), "composition_apply_not_clean");
+  assert.equal(drift.applyCalls.filter((request) => request.scope === "composition").length, 1, "alpha composed; bravo's composition apply was never requested");
+
+  // The final chain output stays pinned to the Delivery Candidate result.
+  const finalFixture = buildFixture({ chain: true });
+  const finalDrift = createOperations(finalFixture, {
+    applyPatch(request, response) {
+      return request.scope === "composition" && request.sequence === 2 ? { ...response, result_tree_sha: intermediate_tree_sha } : response;
+    },
+  });
+  throwsCode(() => composeDeliveryCandidate(finalFixture.manifest, finalDrift.operations), "composition_apply_not_clean");
+}
+
 // Even if a malicious object adapter presents two independent patches with
-// the same path, composition stops before an application attempt.
+// the same path, composition stops before an application attempt.  This is
+// the independent counterpart of the #1065 chain: same overlap, no dependency.
 {
   const fixture = buildFixture({ actualOverlap: true });
   const operations = createOperations(fixture);

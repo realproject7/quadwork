@@ -9,7 +9,7 @@
 
 const crypto = require("node:crypto");
 const path = require("node:path");
-const { assertDeliveryCandidateRef } = require("./delivery-candidate");
+const { assertDeliveryCandidateRef, expectedCandidateBase } = require("./delivery-candidate");
 const { workTaskKey } = require("./work-task-manifest");
 const {
   buildRepositoryWorktreePlan,
@@ -329,11 +329,13 @@ function createDeliveryGitObjectAdapter(options) {
       if (!plain(stage) || !plain(stage.candidate)) fail(code, "staged candidate is invalid");
       return taskKey(stage.candidate.work_task_ref, code);
     }));
-    const paths = deliverySource.frozen_batch_manifest.tasks
+    // A dependent may declare its predecessor's path again; the cut boundary
+    // is the declared path set, exactly as the manifest evidence pins it.
+    const paths = [...new Set(deliverySource.frozen_batch_manifest.tasks
       .filter((entry) => plain(entry) && keys.has(taskKey(entry.ref, code)))
-      .flatMap((entry) => Array.isArray(entry.contract?.file_boundary) ? entry.contract.file_boundary : [])
+      .flatMap((entry) => Array.isArray(entry.contract?.file_boundary) ? entry.contract.file_boundary : []))]
       .sort();
-    if (paths.length === 0 || new Set(paths).size !== paths.length || !paths.every((entry) => PATH_RE.test(entry))) {
+    if (paths.length === 0 || !paths.every((entry) => PATH_RE.test(entry))) {
       fail(code, "frozen delivery boundary is invalid");
     }
     return paths;
@@ -417,7 +419,7 @@ function createDeliveryGitObjectAdapter(options) {
         assertRepositoryRequest(request, ["version", "repository", "delivery_candidate_ref", "delivery_manifest_digest", "sequence", "work_task_ref", "candidate_digest", "base_sha", "candidate_sha", "base_tree_sha", "candidate_tree_sha", "source_worktree_path"], "delivery_git_candidate_patch_request_invalid");
         const requestedRef = candidateRef(request.delivery_candidate_ref, "delivery_git_candidate_patch_request_invalid");
         if (!same(requestedRef, ref) || !SHA_RE.test(request.delivery_manifest_digest) || !Number.isSafeInteger(request.sequence) || request.sequence < 1 ||
-            !SHA_RE.test(request.candidate_digest) || request.base_sha !== ref.base_sha || !SHA_RE.test(request.candidate_sha) ||
+            !SHA_RE.test(request.candidate_digest) || !SHA_RE.test(request.base_sha) || !SHA_RE.test(request.candidate_sha) ||
             !SHA_RE.test(request.base_tree_sha) || !SHA_RE.test(request.candidate_tree_sha) || typeof request.source_worktree_path !== "string") {
           fail("delivery_git_candidate_patch_request_invalid", "candidate patch request is invalid");
         }
@@ -506,13 +508,20 @@ function createDeliveryGitObjectAdapter(options) {
     const baseTree = readTree(record, record.repository, base.tree_sha, "delivery_git_evidence_base_tree_invalid");
     const resultTree = readTree(record, record.repository, result.tree_sha, "delivery_git_evidence_result_tree_invalid");
     if (baseTree.tree_sha === resultTree.tree_sha) fail("delivery_git_result_unchanged", "registered result tree has not changed");
-    for (const stage of staged.staged_tasks) {
-      if (!plain(stage) || !plain(stage.candidate) || stage.candidate.base_sha !== staged.base_sha || !SHA_RE.test(stage.candidate.candidate_sha)) {
+    // #1065: a root candidate descends from the frozen base; a same-repository
+    // dependent descends from its predecessor's exact candidate, which is its base.
+    const candidates = staged.staged_tasks.map((stage) => plain(stage) && plain(stage.candidate) ? stage.candidate
+      : fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid"));
+    for (const candidate of candidates) {
+      let expectedBase;
+      try { expectedBase = expectedCandidateBase(staged.frozen_batch_manifest.tasks, candidates, candidate, staged.base_sha); }
+      catch { fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid"); }
+      if (candidate.base_sha !== expectedBase || !SHA_RE.test(candidate.candidate_sha)) {
         fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid");
       }
-      readCommit(record, record.repository, stage.candidate.candidate_sha, "delivery_git_evidence_candidate_invalid");
-      if (!run(record, ["merge-base", "--is-ancestor", staged.base_sha, stage.candidate.candidate_sha]).ok) {
-        fail("delivery_git_evidence_candidate_invalid", "staged candidate does not descend from delivery base");
+      readCommit(record, record.repository, candidate.candidate_sha, "delivery_git_evidence_candidate_invalid");
+      if (!run(record, ["merge-base", "--is-ancestor", candidate.base_sha, candidate.candidate_sha]).ok) {
+        fail("delivery_git_evidence_candidate_invalid", "staged candidate does not descend from its base");
       }
     }
     const patch = patchFromTrees("delivery", staged.base_sha, resultSha, baseTree, resultTree, null);

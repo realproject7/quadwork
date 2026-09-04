@@ -8,9 +8,9 @@
 const { workTaskKey } = require("./work-task-manifest");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
+const { expectedCandidateBase } = require("./delivery-candidate");
 
 const VERSION = 1;
-const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 
 class WorkTaskDeliverySourceError extends Error {
@@ -80,11 +80,14 @@ function selectedEntries(snapshot, key) {
     }
     return { work_task_ref: clone(entry.ref), candidate: clone(slot.candidate) };
   });
-  const bases = new Set(selected.map((entry) => entry.candidate.base_sha));
-  if (bases.size !== 1 || !SHA_RE.test(selected[0].candidate.base_sha)) {
-    fail("work_task_delivery_base_mismatch", "staged repository candidates do not share one exact base");
+  // The frozen root base is the one the pipeline issued for this repository;
+  // a same-repository dependent was built from its predecessor candidate.
+  const root = snapshot.pipeline.repository_bases.find((entry) => entry.repository_key === key);
+  const candidates = selected.map((entry) => entry.candidate);
+  if (!root || selected.some((entry) => entry.candidate.base_sha !== expectedCandidateBase(snapshot.manifest.tasks, candidates, entry.candidate, root.base_sha))) {
+    fail("work_task_delivery_base_mismatch", "staged repository candidates do not chain exactly from the frozen repository base");
   }
-  return { selected, base_sha: selected[0].candidate.base_sha };
+  return { selected, base_sha: root.base_sha };
 }
 function rethrow(error, fallback) {
   if (error instanceof WorkTaskDeliverySourceError) throw error;

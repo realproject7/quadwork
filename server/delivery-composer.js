@@ -572,6 +572,10 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
 
   const prepared = contracts.stages.map((entry) => {
     const stage = entry.stage;
+    // #1065: a same-repository dependent was built from its predecessor
+    // candidate, so its patch is read and verified against that base tree.
+    const candidateBase = stage.candidate.base_sha === ref.base_sha ? baseTree
+      : readTree(options, repo, readCommit(options, repo, stage.candidate.base_sha, "candidate_commit_invalid").tree_sha, "candidate_tree_invalid");
     const candidateCommit = readCommit(options, repo, stage.candidate.candidate_sha, "candidate_commit_invalid");
     const candidateTree = readTree(options, repo, candidateCommit.tree_sha, "candidate_tree_invalid");
     const request = {
@@ -584,7 +588,7 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
       candidate_digest: stage.candidate.candidate_digest,
       base_sha: stage.candidate.base_sha,
       candidate_sha: stage.candidate.candidate_sha,
-      base_tree_sha: baseTree.tree_sha,
+      base_tree_sha: candidateBase.tree_sha,
       candidate_tree_sha: candidateTree.tree_sha,
       source_worktree_path: stage.candidate.managed_worktree.canonical_path,
     };
@@ -592,12 +596,12 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
       scope: "candidate",
       base_sha: stage.candidate.base_sha,
       result_sha: stage.candidate.candidate_sha,
-      base_tree_sha: baseTree.tree_sha,
+      base_tree_sha: candidateBase.tree_sha,
       result_tree_sha: candidateTree.tree_sha,
       source_worktree_path: stage.candidate.managed_worktree.canonical_path,
     }, "candidate_patch_invalid");
-    assertPatchMatchesTrees(patch, baseTree, candidateTree, "candidate_patch_tree_mismatch");
-    return { ...entry, candidateTree, patch };
+    assertPatchMatchesTrees(patch, candidateBase, candidateTree, "candidate_patch_tree_mismatch");
+    return { ...entry, candidateBase, candidateTree, patch };
   });
   assertIndependentPatchOverlap(prepared, contracts.byKey);
   for (let index = 0; index < prepared.length; index += 1) {
@@ -617,10 +621,16 @@ function composeDeliveryCandidate(manifestValue, optionsValue) {
   for (let index = 0; index < prepared.length; index += 1) {
     const entry = prepared[index];
     const stage = entry.stage;
-    const candidateApplied = applyPatch(options, repo, manifest, stage, entry.patch, baseTree, entry.candidateTree,
+    const candidateApplied = applyPatch(options, repo, manifest, stage, entry.patch, entry.candidateBase, entry.candidateTree,
       "candidate_verification", [], "candidate_apply_not_clean");
     if (candidateApplied.result_tree_sha !== entry.candidateTree.tree_sha) fail("candidate_apply_not_clean", "candidate patch did not produce exact candidate tree");
 
+    // Every changed path must leave exactly the accumulated blob it claims to
+    // replace: a dependent overlap composes, a stale or unrelated one does not.
+    const accumulated = entryMap(currentTree);
+    if (!entry.patch.files.every((file) => sameEntry(accumulated.get(file.path) || null, file.before))) {
+      fail("composition_apply_not_clean", "candidate patch does not apply to the accumulated composition tree");
+    }
     const predecessorHandoffs = expectedHandoffs(entry.contract, completed, sequenceByKey);
     const finalOutput = index === prepared.length - 1 ? resultTree : null;
     const applied = applyPatch(options, repo, manifest, stage, entry.patch, currentTree, finalOutput,

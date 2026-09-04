@@ -10,7 +10,7 @@ const { buildBatchManifest, freezeBatchManifest } = require("./work-task-manifes
 const { buildWorkTaskCandidate } = require("./work-task-candidate");
 const { openTaskReviewRound, submitTaskReviewReceipt } = require("./task-review-round");
 const { buildDeliveryManifest } = require("./delivery-candidate");
-const { composeDeliveryCandidate } = require("./delivery-composer");
+const { DeliveryComposerError, composeDeliveryCandidate } = require("./delivery-composer");
 const {
   DeliveryGitObjectAdapterError,
   createDeliveryGitObjectAdapter,
@@ -275,7 +275,7 @@ withRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) 
 // #1065: the reviewed chain the pipeline actually produces.  Candidate B is
 // committed on top of candidate A (its base), rewrites the file A changed, and
 // the registered result HEAD is exactly that composition.
-function withChainRepository(run) {
+function withChainRepository(run, { resultDrift = false } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "qw-delivery-git-chain-"));
   const repository = path.join(directory, "web");
   try {
@@ -297,11 +297,17 @@ function withChainRepository(run) {
     write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
     const candidate_b = commit(repository, "candidate b");
 
-    git(repository, ["checkout", "main"]);
+    // Same content as candidate b, but committed off the root rather than A.
+    git(repository, ["checkout", "-b", "candidate-b-off-root", base_sha]);
     write(repository, "server/a.js", "module.exports = 'candidate-b';\n");
     write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
+    const candidate_b_off_root = commit(repository, "candidate b off root");
+
+    git(repository, ["checkout", "main"]);
+    write(repository, "server/a.js", "module.exports = 'candidate-b';\n");
+    if (!resultDrift) write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
     const result_sha = commit(repository, "integrated chain result");
-    return run({ directory, repository, base_sha, candidate_a, candidate_b, result_sha });
+    return run({ directory, repository, base_sha, candidate_a, candidate_b, candidate_b_off_root, result_sha });
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -345,7 +351,7 @@ function chainAdapter(repository, deliverySource) {
   return { adapter, calls };
 }
 
-withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
+withChainRepository(({ repository, base_sha, candidate_a, candidate_b, candidate_b_off_root, result_sha }) => {
   const manifest = chainManifest();
   const stages = [stage(manifest.tasks[0].ref, base_sha, candidate_a, "a"), stage(manifest.tasks[1].ref, candidate_a, candidate_b, "b")];
   const deliverySource = {
@@ -384,7 +390,79 @@ withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sh
   assert.equal(git(repository, ["show-ref"]), refsBefore, "adapter did not move a ref");
   assert.ok(calls.every((entry) => !["checkout", "add", "commit", "reset", "merge", "push", "apply"].includes(entry.args[0])));
   console.log("  PASS: registered Git adapter composes a pipeline-built same-repository dependent chain from native commits");
+
+  // #1065 negative controls against real Git objects.
+  const throwsAdapter = (fn, code) => assert.throws(fn, (error) => error instanceof DeliveryGitObjectAdapterError && error.code === code);
+  const manifestDigest = deliveryManifest.delivery_manifest_digest;
+  const base = objects.readCommit({ version: 1, repository: "owner/web", sha: base_sha });
+  const candidateA = objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_a });
+  const candidateB = objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_b });
+  const baseTree = objects.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha });
+  const patchA = objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[0].ref, stages[0], base.tree_sha, candidateA.tree_sha, 1));
+  const patchB = objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref, stages[1], candidateA.tree_sha, candidateB.tree_sha, 2));
+  assert.deepEqual(patchB.files.map((file) => file.path), ["server/a.js", "server/b.js"]);
+
+  // The dependent's patch cannot be requested against the root base.
+  throwsAdapter(() => objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref,
+    { candidate: { ...stages[1].candidate, base_sha } }, base.tree_sha, candidateB.tree_sha, 2)), "delivery_git_candidate_patch_stale");
+
+  // A stale `before` blob: B described against the root blob of server/a.js
+  // (the pre-#1065 reading) does not apply onto the accumulated tree after A,
+  // while B described against A's blob does and yields the pinned result.
+  const afterA = objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA));
+  const stale = {
+    ...copy(patchB), base_sha, base_tree_sha: base.tree_sha,
+    files: patchB.files.map((file) => file.path === "server/a.js"
+      ? { ...copy(file), before: copy(baseTree.entries.find((entry) => entry.path === "server/a.js")) } : copy(file)),
+  };
+  stale.patch_digest = crypto.createHash("sha256").update(stable({
+    version: stale.version, format: stale.format, scope: stale.scope, base_sha: stale.base_sha, result_sha: stale.result_sha,
+    base_tree_sha: stale.base_tree_sha, result_tree_sha: stale.result_tree_sha, source_worktree_path: stale.source_worktree_path, files: stale.files,
+  }), "utf8").digest("hex");
+  throwsAdapter(() => objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, null, stale)), "delivery_git_apply_not_clean");
+  const composed = objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, null, patchB));
+  assert.equal(composed.result_tree_sha, objects.readCommit({ version: 1, repository: "owner/web", sha: result_sha }).tree_sha);
+
+  // The final composed tree stays pinned to the expected result object.
+  throwsAdapter(() => objects.applyPatch(applyRequest(ref, manifestDigest, "composition", 2, manifest.tasks[1].ref, afterA.result_tree_sha, candidateA.tree_sha, patchB)), "delivery_git_apply_not_clean");
+
+  // A dependent staged on the root base is the state the pipeline can never
+  // produce; evidence derivation refuses it before any object is read for it.
+  const rootBased = { ...copy(deliverySource), staged_tasks: [copy(stages[0]), stage(manifest.tasks[1].ref, base_sha, candidate_b, "b")] };
+  throwsAdapter(() => adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: rootBased }), "delivery_git_evidence_candidate_invalid");
+  // A candidate that claims base A but was not committed on top of A is not
+  // the reviewed chain either, even with identical content.
+  const offRoot = { ...copy(deliverySource), staged_tasks: [copy(stages[0]), stage(manifest.tasks[1].ref, candidate_a, candidate_b_off_root, "b")] };
+  throwsAdapter(() => adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: offRoot }), "delivery_git_evidence_candidate_invalid");
+  assert.equal(git(repository, ["show-ref"]), refsBefore, "negative controls did not move a ref");
+  console.log("  PASS: real Git objects refuse a root-based dependent, a stale before blob, and an unpinned final tree");
 });
+
+// #1065: a registered result HEAD that is not the chain composition (B's
+// server/b.js change is missing) fails closed inside the composer.
+withChainRepository(({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
+  const manifest = chainManifest();
+  const stages = [stage(manifest.tasks[0].ref, base_sha, candidate_a, "a"), stage(manifest.tasks[1].ref, candidate_a, candidate_b, "b")];
+  const deliverySource = {
+    version: 1,
+    registered_repository: { version: 1, installation_id, project_id, repository_key: "web", repository: "Owner/Web" },
+    frozen_batch_manifest: manifest, delivery_mode: "integrated", cut_id: "cut_delivery_git_chain_02", base_sha, staged_tasks: stages, deferred_exclusions: [],
+  };
+  const { adapter } = chainAdapter(repository, deliverySource);
+  const observed = adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
+  assert.equal(observed.result_sha, result_sha);
+  const ref = {
+    version: 1, installation_id, project_id, repository_key: "web", batch_manifest_digest: manifest.manifest_digest,
+    delivery_mode: "integrated", base_sha, result_sha, cut_id: deliverySource.cut_id,
+  };
+  const deliveryManifest = buildDeliveryManifest({
+    version: 1, delivery_candidate_ref: ref, frozen_batch_manifest: manifest, staged_tasks: copy(stages), deferred_exclusions: [], evidence: copy(observed.evidence),
+  }, { resolveRegisteredRepository() { return copy(deliverySource.registered_repository); } });
+  const objects = adapter.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref });
+  assert.throws(() => composeDeliveryCandidate(deliveryManifest, objects),
+    (error) => error instanceof DeliveryComposerError && error.code === "composition_apply_unavailable");
+  console.log("  PASS: a result HEAD that is not the chain composition cannot obtain a composition proof");
+}, { resultDrift: true });
 
 {
   const source = fs.readFileSync(path.join(__dirname, "delivery-git-object-adapter.js"), "utf8");
