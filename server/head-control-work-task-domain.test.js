@@ -1386,5 +1386,3 @@ ok(true, "domain has no audit-only recovery, transport, timer, delivery, or gene
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   console.log(`\n${passed} passed`);
 })().catch((error) => { console.error(error); process.exit(1); });
-
-
