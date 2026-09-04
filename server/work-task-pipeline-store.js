@@ -33,7 +33,19 @@ const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const TERMINAL_KINDS = new Set(["archive", "integrated_cut", "contract_change"]);
 const ACTIVE_AUTHORITY_STATES = new Set(["building", "independent_review", "reconcile"]);
-const RETIRED_SUFFIX_RE = /^\.retired\.(\d{4})\.json$/;
+// #1071: the on-disk layout is versioned and every identifier is its own whole
+// path component.  The record filenames carry no identity at all — the active
+// record is always `record.json` and a retired record is always
+// `record.retired.NNNN.json` — so the two namespaces are disjoint literal sets
+// that no identifier can be spelled to reach across, and the longest component
+// is one 128-character identifier rather than a 263-byte concatenation of two.
+const LAYOUT_VERSION = "v1";
+const ACTIVE_RECORD_NAME = "record.json";
+const RETIRED_RECORD_RE = /^record\.retired\.(\d{4})\.json$/;
+const MAX_RETIRED_ORDINAL = 9999;
+// The pre-#1071 flat layout, kept only so its records can be migrated.
+const LEGACY_SEPARATOR = "--";
+const LEGACY_RETIRED_SUFFIX_RE = /^\.retired\.(\d{4})\.json$/;
 const FILE_CODES = Object.freeze({
   options: "invalid_work_task_pipeline_store_options",
   unreadable: "work_task_pipeline_store_unreadable",
@@ -105,26 +117,58 @@ function storageDirectory(configDir) {
   }
   return path.join(configDir, "work-task-pipelines");
 }
-function workTaskPipelineStorePath(configDir, owner) {
+// The one directory an identity's records may live in.  The mapping is
+// bijective: each identifier is copied verbatim into its own path component
+// under a fixed version segment, so two identities can never share a directory
+// and one identity always resolves to one directory.  Nothing about the
+// identity is ever recovered from a filename — `decodeState` proves ownership
+// from the record's own stored identity, here as everywhere.
+function workTaskPipelineStoreDirectory(configDir, owner) {
   const normalized = identity(owner, "invalid_work_task_pipeline_store_identity");
-  return path.join(storageDirectory(configDir), `${normalized.installation_id}--${normalized.project_id}.json`);
+  return path.join(storageDirectory(configDir), LAYOUT_VERSION, normalized.installation_id, normalized.project_id);
 }
-// A retired batch keeps its full record beside the active path under an
-// ordinal suffix, so provenance survives every later successor freeze.
-function retiredEntries(fs, statePath) {
-  const prefix = path.basename(statePath, ".json");
+function workTaskPipelineStorePath(configDir, owner) {
+  return path.join(workTaskPipelineStoreDirectory(configDir, owner), ACTIVE_RECORD_NAME);
+}
+function retiredRecordName(ordinal) {
+  return `record.retired.${String(ordinal).padStart(4, "0")}.json`;
+}
+// A retired batch keeps its full record beside the active record under an
+// ordinal name, so provenance survives every later successor freeze.  Ownership
+// is the containing directory, never a filename prefix: the filter is an exact
+// whole-name match against a constant shape that no identifier appears in.
+function retiredEntries(fs, ownerDirectory) {
   let names;
-  try { names = fs.readdirSync(path.dirname(statePath)); } catch { fail("work_task_pipeline_store_unreadable", "pipeline store directory cannot be listed"); }
+  try { names = fs.readdirSync(ownerDirectory); }
+  catch (error) {
+    // An identity that has never been initialized simply owns no retired
+    // record; any other listing failure is still fail-closed.
+    if (error && error.code === "ENOENT") return [];
+    fail("work_task_pipeline_store_unreadable", "pipeline store directory cannot be listed");
+  }
   return names
-    .filter((name) => name.startsWith(prefix) && RETIRED_SUFFIX_RE.test(name.slice(prefix.length)))
-    .map((name) => ({ ordinal: Number(RETIRED_SUFFIX_RE.exec(name.slice(prefix.length))[1]), path: path.join(path.dirname(statePath), name) }))
+    .filter((name) => RETIRED_RECORD_RE.test(name))
+    .map((name) => ({ ordinal: Number(RETIRED_RECORD_RE.exec(name)[1]), path: path.join(ownerDirectory, name) }))
     .sort((left, right) => left.ordinal - right.ordinal);
 }
-function nextRetiredPath(fs, statePath) {
-  const entries = retiredEntries(fs, statePath);
+function nextRetiredPath(fs, ownerDirectory) {
+  const entries = retiredEntries(fs, ownerDirectory);
   const ordinal = entries.length === 0 ? 1 : entries[entries.length - 1].ordinal + 1;
-  if (ordinal > 9999) fail("work_task_pipeline_store_retired_bound", "retired batch bound reached");
-  return `${statePath.slice(0, -".json".length)}.retired.${String(ordinal).padStart(4, "0")}.json`;
+  if (ordinal > MAX_RETIRED_ORDINAL) fail("work_task_pipeline_store_retired_bound", "retired batch bound reached");
+  return path.join(ownerDirectory, retiredRecordName(ordinal));
+}
+// The pre-#1071 flat filenames for one identity.  These are candidate names
+// only.  `quadwork`'s retired ordinal 1 and the active record of the project
+// literally named `quadwork.retired.0001` are the same filename, which is the
+// collision this layout replaces, so a name here never decides ownership.
+function legacyActiveName(owner) {
+  return `${owner.installation_id}${LEGACY_SEPARATOR}${owner.project_id}.json`;
+}
+function legacyRetiredOrdinal(name, owner) {
+  const stem = `${owner.installation_id}${LEGACY_SEPARATOR}${owner.project_id}`;
+  if (!name.startsWith(stem)) return null;
+  const match = LEGACY_RETIRED_SUFFIX_RE.exec(name.slice(stem.length));
+  return match === null ? null : Number(match[1]);
 }
 // Retirement is refused while any slot still holds build or review authority.
 // #1071: the Head-control domain has to reach that same verdict before it makes
@@ -310,24 +354,108 @@ function createWorkTaskPipelineStore(options) {
   const files = createDurableStoreFiles({ fs: options.fs || nodeFs, error: WorkTaskPipelineStoreError, codes: FILE_CODES });
   const fs = files.fs;
   if (typeof fs.readdirSync !== "function") fail("invalid_work_task_pipeline_store_options", "fs.readdirSync is required");
-  const directory = storageDirectory(options.config_dir);
-  const directories = [{ path: options.config_dir }, { path: directory, mode: DIRECTORY_MODE }];
+  const storageRoot = storageDirectory(options.config_dir);
+  const versionRoot = path.join(storageRoot, LAYOUT_VERSION);
+  const rootDirectories = [{ path: options.config_dir }, { path: storageRoot, mode: DIRECTORY_MODE }];
 
+  function ownerDirectory(owner) {
+    return path.join(versionRoot, owner.installation_id, owner.project_id);
+  }
+  // Every level of one identity's chain, so the same owner-only judgement the
+  // storage root has always had applies to each level this layout added.
+  function ownerDirectories(owner) {
+    return [
+      ...rootDirectories,
+      { path: versionRoot, mode: DIRECTORY_MODE },
+      { path: path.join(versionRoot, owner.installation_id), mode: DIRECTORY_MODE },
+      { path: ownerDirectory(owner), mode: DIRECTORY_MODE },
+    ];
+  }
   function statePath(owner) {
-    return workTaskPipelineStorePath(options.config_dir, {
-      installation_id: owner.installation_id,
-      project_id: owner.project_id,
+    return path.join(ownerDirectory(owner), ACTIVE_RECORD_NAME);
+  }
+  // The pre-#1071 records this identity could own, retired ordinals ascending
+  // and the active record last.  Filenames only: nothing is read here.
+  function legacyCandidates(owner) {
+    let names;
+    try { names = fs.readdirSync(storageRoot); }
+    catch (error) {
+      if (error && error.code === "ENOENT") return [];
+      fail("work_task_pipeline_store_unreadable", "pipeline store directory cannot be listed");
+    }
+    const activeName = legacyActiveName(owner);
+    const retired = [];
+    let active = null;
+    for (const name of names) {
+      if (name === activeName) { active = { ordinal: null, path: path.join(storageRoot, name) }; continue; }
+      const ordinal = legacyRetiredOrdinal(name, owner);
+      if (ordinal !== null) retired.push({ ordinal, path: path.join(storageRoot, name) });
+    }
+    retired.sort((left, right) => left.ordinal - right.ordinal);
+    // The active record migrates last on purpose: until it moves, this
+    // identity still has exactly one active record somewhere, so an
+    // interrupted migration is never an identity with none.
+    return active === null ? retired : [...retired, active];
+  }
+  // A legacy filename is a candidate, never a proof.  The record's own stored
+  // identity decides, through the very same reader every other path uses, so a
+  // symlink, a mode that is not 0600, an unreadable, corrupt, or
+  // unknown-schema record fails closed here exactly as it does on a read.  A
+  // record that decodes cleanly but belongs to another identity is not ours:
+  // it is left untouched and contributes nothing.
+  function legacyRecordsOwnedBy(owner, candidates) {
+    return candidates.filter((candidate) => {
+      try { return decodeState(fs, candidate.path, owner, true) !== null; }
+      catch (error) {
+        if (error instanceof WorkTaskPipelineStoreError && error.code === "work_task_pipeline_store_identity_mismatch") return false;
+        throw error;
+      }
     });
+  }
+  // Adopt this identity's pre-#1071 records into the versioned layout, or
+  // refuse.  Each record moves by a single rename, which is atomic, so a
+  // record is always at exactly one of the two names and an interrupted
+  // migration resumes by re-running this.  A destination that is already
+  // occupied is never overwritten: a migrated record and a legacy record for
+  // one identity cannot both be authoritative, and this refuses rather than
+  // picking one.
+  function migrateLegacyRecords(owner) {
+    if (!files.storageExists(rootDirectories)) return;
+    if (legacyCandidates(owner).length === 0) return;
+    files.ensureDirectories(ownerDirectories(owner));
+    const target = statePath(owner);
+    files.withWriterLock(target, () => {
+      const owned = legacyRecordsOwnedBy(owner, legacyCandidates(owner));
+      for (const candidate of owned) {
+        const destination = candidate.ordinal === null ? target : path.join(ownerDirectory(owner), retiredRecordName(candidate.ordinal));
+        if (files.lstatOrNull(destination) !== null) {
+          fail("work_task_pipeline_store_legacy_conflict", "a migrated record already holds this identity's slot");
+        }
+        try { fs.renameSync(candidate.path, destination); }
+        catch { fail("work_task_pipeline_store_write_failed", "legacy pipeline record migration failed"); }
+      }
+      if (owned.length > 0) {
+        fsyncDirectory(fs, ownerDirectory(owner));
+        fsyncDirectory(fs, storageRoot);
+      }
+    });
+  }
+  // Every operation resolves the layout first: adopt or refuse anything left
+  // in the pre-#1071 layout, then judge each directory level that exists.
+  function prepare(owner) {
+    migrateLegacyRecords(owner);
+    return { root: files.storageExists(rootDirectories), owned: files.storageExists(ownerDirectories(owner)) };
   }
   function readRecoverySnapshot(owner) {
     const normalized = identity(owner, "invalid_work_task_pipeline_store_identity");
-    if (!files.storageExists(directories)) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
+    if (!prepare(normalized).root) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     return snapshot(decodeState(fs, statePath(normalized), normalized, false));
   }
   function initialize(input) {
     const initial = assertInitialState(input);
     const target = statePath(initial.precondition);
-    files.ensureDirectories(directories);
+    prepare(initial.precondition);
+    files.ensureDirectories(ownerDirectories(initial.precondition));
     return files.withWriterLock(target, () => {
       const existing = decodeState(fs, target, initial.precondition, true);
       if (existing !== null) fail("work_task_pipeline_store_already_initialized", "pipeline store already exists");
@@ -346,7 +474,7 @@ function createWorkTaskPipelineStore(options) {
   function applyPlan(input) {
     const application = assertPlanApplication(input);
     const target = statePath(application.precondition);
-    if (!files.storageExists(directories)) {
+    if (!prepare(application.precondition).owned) {
       fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     }
     return files.withWriterLock(target, () => {
@@ -392,7 +520,7 @@ function createWorkTaskPipelineStore(options) {
   function retire(input) {
     const retirement = assertRetirement(input);
     const target = statePath(retirement.precondition);
-    if (!files.storageExists(directories)) {
+    if (!prepare(retirement.precondition).owned) {
       fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     }
     return files.withWriterLock(target, () => {
@@ -418,7 +546,7 @@ function createWorkTaskPipelineStore(options) {
         // by `assertStoredState`, so skipping is the only correct resume.
         state = commit(target, current, current.pipeline, { kind: "archive", event_id: retirement.event_id, archived: true });
       }
-      const retiredPath = nextRetiredPath(fs, target);
+      const retiredPath = nextRetiredPath(fs, ownerDirectory(retirement.precondition));
       try {
         fs.renameSync(target, retiredPath);
         fsyncDirectory(fs, path.dirname(target));
@@ -428,8 +556,8 @@ function createWorkTaskPipelineStore(options) {
   }
   function readRetiredSnapshots(owner) {
     const normalized = identity(owner, "invalid_work_task_pipeline_store_identity");
-    if (!files.storageExists(directories)) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
-    return freeze(retiredEntries(fs, statePath(normalized)).map((entry) => snapshot(decodeState(fs, entry.path, normalized, false))));
+    if (!prepare(normalized).root) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
+    return freeze(retiredEntries(fs, ownerDirectory(normalized)).map((entry) => snapshot(decodeState(fs, entry.path, normalized, false))));
   }
 
   return freeze({
@@ -451,5 +579,6 @@ module.exports = {
   workTaskPipelineHoldsActiveAuthority: pipelineHoldsActiveAuthority,
   workTaskPipelineStoreCarriesRetirementMarker: carriesRetirementMarker,
   workTaskPipelineStorePath,
+  workTaskPipelineStoreDirectory,
   createWorkTaskPipelineStore,
 };

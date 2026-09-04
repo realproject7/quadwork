@@ -581,7 +581,12 @@ withDirectory((directory) => {
   assert.equal(Object.isFrozen(provenance[0]), true);
   assert.equal(provenance[0].pipeline.tasks[0].candidate.candidate_sha, candidate_sha);
   const retiredFiles = fs.readdirSync(path.dirname(statePath)).filter((name) => name.includes(".retired."));
-  assert.deepEqual(retiredFiles, [`${installation_id}--${project_id}.retired.0001.json`]);
+  // #1071: the retired name carries no identity, so it can never be spelled by
+  // another project's id.  Ownership is the directory the record sits in.
+  assert.deepEqual(retiredFiles, ["record.retired.0001.json"]);
+  assert.equal(path.basename(statePath), "record.json");
+  assert.equal(path.basename(path.dirname(statePath)), project_id);
+  assert.equal(path.basename(path.dirname(path.dirname(statePath))), installation_id);
   assert.equal(fs.statSync(path.join(path.dirname(statePath), retiredFiles[0])).mode & 0o777, FILE_MODE);
 
   // A successor manifest for the same project now initializes cleanly and is
