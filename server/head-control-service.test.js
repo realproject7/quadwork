@@ -258,6 +258,55 @@ function ok(condition, message) {
   ok(true, "an abandonment replays deterministically from its redacted durable receipt after restart");
 }
 
+// #1071 (test quality): the two DETAILED actions carry a payload the redacted
+// durable receipt deliberately omits, so across a recreated store and service
+// no retry of either can be proved -- not the byte-identical one, not the one
+// that drops the payload to null, not the one that changes it.  The
+// payload-dropped retry is the discriminating case: it is the exact shape a
+// payloadless classification WOULD make provable from the receipt alone, so
+// this block fails if `read_propagation_stop` or `queue_local_correction` is
+// added to PAYLOADLESS_ACTIONS.  The set that decides this is the one in
+// server/head-control-service.js (head-control-plane.js declares its own copy
+// for request validation, which never sees these retries: the service's
+// durable preflight runs before the plane).
+{
+  const fake = domain(status({ revision: 2, manifest_digest: MANIFEST_A, pipeline_digest: PIPELINE_B, manifest_frozen: true, cut_safe: true }));
+  const configDir = configDirectory();
+  const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const stopRequest = request("read_propagation_stop", { idempotency_key: "idem_detailed_stop", correlation_id: "corr_detailed_stop" });
+  const correctionRequest = request("queue_local_correction", { idempotency_key: "idem_detailed_corr", correlation_id: "corr_detailed_corr", expected_revision: 2 });
+  const stop = await first.execute(stopRequest);
+  const correction = await first.execute(correctionRequest);
+  assert.equal(stop.decision.code, "head_control_stop_observed");
+  assert.equal(correction.decision.code, "head_control_applied");
+  assert.deepEqual([fake.calls.read_propagation_stop, fake.calls.queue_local_correction], [1, 1]);
+
+  // The recreated service must read these two records back from disk, and they
+  // must be the redacted form, or the retries below would prove nothing.
+  const durable = createHeadControlAuditStore({ config_dir: configDir, fs }).read(BINDING);
+  assert.deepEqual(durable.map((record) => record.action), ["read_propagation_stop", "queue_local_correction"]);
+  assert.deepEqual(durable.map((record) => record.decision), ["accepted", "accepted"]);
+  assert.ok(durable.every((record) => !Object.hasOwn(record, "payload") && !Object.hasOwn(record, "detail")));
+
+  const recreated = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const stopReplays = [
+    clone(stopRequest),
+    { ...clone(stopRequest), payload: null },
+    { ...clone(stopRequest), payload: { work_task_ref: { task_key: "docs" } } },
+  ];
+  const correctionReplays = [
+    clone(correctionRequest),
+    { ...clone(correctionRequest), payload: null },
+    { ...clone(correctionRequest), payload: { correction: { work_task_ref: { task_key: "build" }, review_round_ref: { round: 2 }, candidate_digest: PIPELINE_B } } },
+  ];
+  for (const retry of [...stopReplays, ...correctionReplays]) {
+    await expectServiceCode(() => recreated.execute(retry), "head_control_durable_replay_ambiguous");
+  }
+  assert.deepEqual([fake.calls.read_propagation_stop, fake.calls.queue_local_correction], [1, 1]);
+  assert.deepEqual(recreated.recentAudit().map((record) => record.action), ["read_propagation_stop", "queue_local_correction"]);
+  ok(true, "no retry of a detailed action -- identical, payload-dropped, or changed -- is provable from its redacted durable receipt");
+}
+
 // Principal and optimistic-revision denials are persisted too, but cannot
 // invoke an owning mutation before their Head binding is checked by the plane.
 {
