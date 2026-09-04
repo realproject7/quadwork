@@ -12,6 +12,13 @@
 const crypto = require("node:crypto");
 const path = require("node:path");
 const {
+  FILE_MODE,
+  DIRECTORY_MODE,
+  modeOf,
+  sameFile,
+  createDurableStoreFiles,
+} = require("./durable-store-files");
+const {
   assertBatchManifest,
   freezeBatchManifest,
   assertManifestRegisteredCurrent,
@@ -33,8 +40,6 @@ const {
 } = require("./work-task-independent-review-service");
 
 const SCHEMA_VERSION = 1;
-const FILE_MODE = 0o600;
-const DIRECTORY_MODE = 0o700;
 const MAX_PAYLOAD_BYTES = 128 * 1024;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -45,6 +50,19 @@ const ACTIONS = new Set([
   "retire_batch", "queue_local_correction", "read_propagation_stop",
 ]);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
+const FILE_CODES = Object.freeze({
+  options: "invalid_head_control_work_task_domain_options",
+  unreadable: "head_control_work_task_state_unreadable",
+  symlink_rejected: "head_control_work_task_state_symlink_rejected",
+  insecure_permissions: "head_control_work_task_state_insecure_permissions",
+  write_failed: "head_control_work_task_state_write_failed",
+  locked: "head_control_work_task_state_locked",
+  lock_unsafe: "head_control_work_task_state_lock_failed",
+  lock_failed: "head_control_work_task_state_lock_failed",
+  lock_acquire_changed: "head_control_work_task_state_lock_failed",
+  lock_release_changed: "head_control_work_task_state_lock_release_failed",
+  lock_release_failed: "head_control_work_task_state_lock_release_failed",
+});
 
 class HeadControlWorkTaskDomainError extends Error {
   constructor(code, message = code) {
@@ -132,12 +150,6 @@ function sameBinding(left, right) {
 function ownerOf(bindingValue) {
   return { installation_id: bindingValue.installation_id, project_id: bindingValue.project_id };
 }
-function assertFs(fs) {
-  for (const name of ["mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync", "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync"]) {
-    if (!fs || typeof fs[name] !== "function") fail("invalid_head_control_work_task_domain_options", `fs.${name} is required`);
-  }
-  return fs;
-}
 function storageDirectory(configDir) {
   if (typeof configDir !== "string" || !path.isAbsolute(configDir) || configDir.length > 1024 || /[\u0000\r\n]/.test(configDir)) {
     fail("invalid_head_control_work_task_domain_options", "config_dir is invalid");
@@ -147,36 +159,6 @@ function storageDirectory(configDir) {
 function headControlWorkTaskDomainPath(configDir, bindingValue) {
   const owner = binding(bindingValue, "invalid_head_control_work_task_domain_identity");
   return path.join(storageDirectory(configDir), `${owner.installation_id}--${owner.project_id}.json`);
-}
-function modeOf(stats) { return stats.mode & 0o777; }
-function lstatOrNull(fs, target) {
-  try { return fs.lstatSync(target); } catch (error) {
-    if (error && error.code === "ENOENT") return null;
-    fail("head_control_work_task_state_unreadable", "domain state cannot be statted");
-  }
-}
-function sameFile(left, right) {
-  return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) && left.dev === right.dev && left.ino === right.ino;
-}
-function assertDirectory(fs, target, requiredMode) {
-  const stats = lstatOrNull(fs, target);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink()) fail("head_control_work_task_state_symlink_rejected", "domain storage path cannot be a symlink");
-  if (!stats.isDirectory()) fail("head_control_work_task_state_unreadable", "domain storage path is not a directory");
-  if (requiredMode !== undefined && modeOf(stats) !== requiredMode) {
-    fail("head_control_work_task_state_insecure_permissions", "domain storage directory must be mode 0700");
-  }
-  return stats;
-}
-function ensureDirectories(fs, configDir, directory) {
-  if (assertDirectory(fs, configDir, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(configDir, { recursive: true, mode: DIRECTORY_MODE });
-    if (assertDirectory(fs, configDir, DIRECTORY_MODE) === null) fail("head_control_work_task_state_unreadable", "domain config directory cannot be created");
-  }
-  if (assertDirectory(fs, directory, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(directory, { recursive: false, mode: DIRECTORY_MODE });
-    if (assertDirectory(fs, directory, DIRECTORY_MODE) === null) fail("head_control_work_task_state_unreadable", "domain storage directory cannot be created");
-  }
 }
 
 function assertInvocation(value, expectedAction, owner) {
@@ -383,75 +365,21 @@ function readState(fs, statePath, owner, allowMissing, adoptGeneration = false) 
     fail("corrupt_head_control_work_task_state", "domain state validation failed");
   }
 }
-function temporaryPath(statePath) { return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`; }
-// The lock file body is this writer's proof of ownership. dev+ino alone cannot
-// prove it: Linux reuses an inode number as soon as the old lock is unlinked
-// and closed, so a replacement lock can carry the original's identity.
-function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
-function writeState(fs, statePath, state, owner) {
+function writeState(files, statePath, state, owner) {
   const checked = assertState(state, owner);
-  const temporary = temporaryPath(statePath);
-  let written = false;
-  try {
-    fs.writeFileSync(temporary, `${JSON.stringify(checked)}\n`, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
-    written = true;
-    fs.chmodSync(temporary, FILE_MODE);
-    const descriptor = fs.openSync(temporary, "r");
-    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
-    fs.renameSync(temporary, statePath);
-    written = false;
-    const directoryDescriptor = fs.openSync(path.dirname(statePath), "r");
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
-    const finalStats = fs.lstatSync(statePath);
-    if (finalStats.isSymbolicLink() || !finalStats.isFile() || modeOf(finalStats) !== FILE_MODE) {
-      fail("head_control_work_task_state_write_failed", "domain state write did not produce a secure file");
-    }
-  } catch (error) {
-    if (written) { try { fs.unlinkSync(temporary); } catch { /* own temporary only */ } }
-    if (error instanceof HeadControlWorkTaskDomainError) throw error;
-    fail("head_control_work_task_state_write_failed", "domain state cannot be atomically written");
-  }
-}
-function lockStats(fs, target) {
-  const stats = lstatOrNull(fs, target);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== FILE_MODE) fail("head_control_work_task_state_lock_failed", "domain state lock is unsafe");
-  return stats;
-}
-function withWriterLock(fs, statePath, action) {
-  const lockPath = `${statePath}.lock`;
-  const token = lockToken();
-  let descriptor, own;
-  try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); }
-  catch (error) {
-    if (error && error.code === "EEXIST") { lockStats(fs, lockPath); fail("head_control_work_task_state_locked", "domain state has an active or stale lock"); }
-    fail("head_control_work_task_state_lock_failed", "domain state lock cannot be acquired");
-  }
-  try {
-    fs.writeFileSync(descriptor, token, "utf8"); fs.chmodSync(lockPath, FILE_MODE); fs.fsyncSync(descriptor); own = fs.fstatSync(descriptor);
-    if (!sameFile(own, lockStats(fs, lockPath))) fail("head_control_work_task_state_lock_failed", "domain state lock changed during acquisition");
-    return action();
-  } catch (error) {
-    throw error;
-  } finally {
-    let releaseError = null;
-    try { fs.closeSync(descriptor); } catch { releaseError = new HeadControlWorkTaskDomainError("head_control_work_task_state_lock_release_failed"); }
-    try {
-      if (!sameFile(own, lockStats(fs, lockPath)) || fs.readFileSync(lockPath, "utf8") !== token) fail("head_control_work_task_state_lock_release_failed", "domain state lock changed before release");
-      fs.unlinkSync(lockPath);
-    } catch (error) { releaseError = error instanceof HeadControlWorkTaskDomainError ? error : new HeadControlWorkTaskDomainError("head_control_work_task_state_lock_release_failed"); }
-    if (releaseError) throw releaseError;
-  }
+  files.writeFileAtomically(statePath, `${JSON.stringify(checked)}\n`);
 }
 
 function createHeadControlWorkTaskDomain(options) {
   exact(options, ["binding", "config_dir", "fs", "resolve_registered_identity", "now"], "invalid_head_control_work_task_domain_options");
   const owner = binding(options.binding, "invalid_head_control_work_task_domain_options");
-  const fs = assertFs(options.fs);
+  const files = createDurableStoreFiles({ fs: options.fs, error: HeadControlWorkTaskDomainError, codes: FILE_CODES });
+  const fs = files.fs;
   if (typeof options.resolve_registered_identity !== "function" || typeof options.now !== "function") {
     fail("invalid_head_control_work_task_domain_options", "registered identity and clock accessors are required");
   }
   const directory = storageDirectory(options.config_dir);
+  const directories = [{ path: options.config_dir, mode: DIRECTORY_MODE }, { path: directory, mode: DIRECTORY_MODE }];
   const statePath = headControlWorkTaskDomainPath(options.config_dir, owner);
   const pipelineStore = createWorkTaskPipelineStore({ config_dir: options.config_dir, fs });
   const reviewService = createWorkTaskIndependentReviewService({ config_dir: options.config_dir, fs });
@@ -537,7 +465,7 @@ function createHeadControlWorkTaskDomain(options) {
     next.manifest = clone(pipeline.manifest);
     next.pipeline_digest = pipeline.pipeline.pipeline_digest;
     next.pending = null;
-    writeState(fs, statePath, next, owner);
+    writeState(files, statePath, next, owner);
     return snapshot(next, owner);
   }
   // A pending intent was atomically committed before its second durable write.
@@ -547,8 +475,8 @@ function createHeadControlWorkTaskDomain(options) {
     // Before explicit initialization there may not even be a parent directory
     // in which a writer lock could safely exist.  Report missing state rather
     // than manufacturing a lock path or treating it as a blank controller.
-    if (lstatOrNull(fs, statePath) === null) currentState();
-    return withWriterLock(fs, statePath, () => {
+    if (files.lstatOrNull(statePath) === null) currentState();
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       if (state.pending === null) return snapshot(state, owner);
       if (state.pending.action === "freeze_batch_manifest") {
@@ -588,7 +516,7 @@ function createHeadControlWorkTaskDomain(options) {
     });
   }
   function synchronizeFrozen() {
-    return withWriterLock(fs, statePath, () => {
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       if (state.pending !== null) fail("head_control_work_task_pending_recovery_required", "pending domain write was not recovered");
       if (state.stage !== "frozen") return { state: snapshot(state, owner), pipeline: null };
@@ -597,14 +525,14 @@ function createHeadControlWorkTaskDomain(options) {
       catch (error) {
         if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_missing" || !retiredHolds(state)) throw error;
         const retired = emptyState(state.revision + 1);
-        writeState(fs, statePath, retired, owner);
+        writeState(files, statePath, retired, owner);
         return { state: snapshot(retired, owner), pipeline: null };
       }
       if (stored.pipeline.pipeline_digest === state.pipeline_digest) return { state: snapshot(state, owner), pipeline: stored };
       const next = clone(state);
       next.revision += 1;
       next.pipeline_digest = stored.pipeline.pipeline_digest;
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
       return { state: snapshot(next, owner), pipeline: stored };
     });
   }
@@ -618,8 +546,8 @@ function createHeadControlWorkTaskDomain(options) {
     if (state.stage !== allowedStage) fail("head_control_work_task_invalid_transition", "domain action is not valid in this state");
   }
   function initialize() {
-    ensureDirectories(fs, options.config_dir, directory);
-    return withWriterLock(fs, statePath, () => {
+    files.ensureDirectories(directories);
+    return files.withWriterLock(statePath, () => {
       const existing = readState(fs, statePath, owner, true, true);
       if (existing !== null) {
         if (existing.binding.generation === owner.generation) return snapshot(existing, owner);
@@ -627,7 +555,7 @@ function createHeadControlWorkTaskDomain(options) {
         // the new Head generation here, as one explicit recorded transition,
         // instead of leaving the file permanently unreadable.
         const rebound = { ...existing, binding: clone(owner) };
-        writeState(fs, statePath, rebound, owner);
+        writeState(files, statePath, rebound, owner);
         return snapshot(rebound, owner);
       }
       // `readPipeline` requires a real manifest; probe the underlying durable
@@ -642,7 +570,7 @@ function createHeadControlWorkTaskDomain(options) {
         }
       }
       const state = emptyState();
-      writeState(fs, statePath, state, owner);
+      writeState(files, statePath, state, owner);
       return snapshot(state, owner);
     });
   }
@@ -676,7 +604,7 @@ function createHeadControlWorkTaskDomain(options) {
   function put_batch_manifest(command) {
     const input = assertInvocation(command, "put_batch_manifest", owner);
     prepared();
-    return withWriterLock(fs, statePath, () => {
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "empty");
       const manifest = exactManifest(input.payload.manifest, owner, "head_control_work_task_manifest_invalid");
@@ -686,14 +614,14 @@ function createHeadControlWorkTaskDomain(options) {
       next.revision += 1;
       next.stage = "manifest";
       next.manifest = manifest;
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
       return statusFor(next, null);
     });
   }
   function freeze_batch_manifest(command) {
     const input = assertInvocation(command, "freeze_batch_manifest", owner);
     prepared();
-    withWriterLock(fs, statePath, () => {
+    files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "manifest");
       assertCurrentManifest(state.manifest, options.resolve_registered_identity);
@@ -709,7 +637,7 @@ function createHeadControlWorkTaskDomain(options) {
         fingerprint: invocationFingerprint(input),
         frozen_manifest: clone(frozenManifest),
       };
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
     });
     const state = recoverPending();
     const pipeline = readPipeline(state.manifest);
@@ -721,7 +649,7 @@ function createHeadControlWorkTaskDomain(options) {
     if (current.state.stage !== "frozen" || current.pipeline === null || current.pipeline.pipeline.archived) {
       fail("head_control_work_task_archived", "cut is unavailable for archived or non-frozen state");
     }
-    withWriterLock(fs, statePath, () => {
+    files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "frozen");
       assertCurrentManifest(state.manifest, options.resolve_registered_identity);
@@ -754,7 +682,7 @@ function createHeadControlWorkTaskDomain(options) {
         expected_pipeline_digest: stored.pipeline.pipeline_digest,
         next_pipeline_digest: nextPipeline.pipeline_digest,
       };
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
     });
     const state = recoverPending();
     const pipeline = readPipeline(state.manifest);
@@ -767,7 +695,7 @@ function createHeadControlWorkTaskDomain(options) {
   function retire_batch(command) {
     const input = assertInvocation(command, "retire_batch", owner);
     prepared();
-    return withWriterLock(fs, statePath, () => {
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "frozen");
       const stored = readPipeline(state.manifest);
@@ -790,7 +718,7 @@ function createHeadControlWorkTaskDomain(options) {
         throw error;
       }
       const next = emptyState(state.revision + 1);
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
       return statusFor(next, null);
     });
   }
@@ -800,7 +728,7 @@ function createHeadControlWorkTaskDomain(options) {
   function queue_local_correction(command) {
     const input = assertInvocation(command, "queue_local_correction", owner);
     prepared();
-    return withWriterLock(fs, statePath, () => {
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "frozen");
       assertCurrentManifest(state.manifest, options.resolve_registered_identity);
@@ -819,7 +747,7 @@ function createHeadControlWorkTaskDomain(options) {
       const next = clone(state);
       next.revision += 1;
       next.pipeline_digest = applied.pipeline.pipeline_digest;
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
       return freeze({
         status: statusFor(next, applied),
         detail: { outcome: queued.outcome, work_task_ref: clone(queued.work_task_ref), candidate_digest: queued.candidate_digest, checkpoint_id: queued.checkpoint_id },

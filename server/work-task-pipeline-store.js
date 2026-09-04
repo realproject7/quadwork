@@ -6,9 +6,14 @@
 // It deliberately exposes only an explicit initial write, read-only recovery,
 // and one compare-and-swap application of a pipeline plan.
 
-const crypto = require("crypto");
 const nodeFs = require("node:fs");
 const path = require("node:path");
+const {
+  FILE_MODE,
+  DIRECTORY_MODE,
+  modeOf,
+  createDurableStoreFiles,
+} = require("./durable-store-files");
 const {
   assertBatchManifest,
   workTaskKey,
@@ -21,8 +26,6 @@ const {
 } = require("./work-task-pipeline");
 
 const SCHEMA_VERSION = 1;
-const FILE_MODE = 0o600;
-const DIRECTORY_MODE = 0o700;
 const MAX_TERMINAL_AUDIT = 64;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -31,6 +34,19 @@ const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const TERMINAL_KINDS = new Set(["archive", "integrated_cut", "contract_change"]);
 const ACTIVE_AUTHORITY_STATES = new Set(["building", "independent_review", "reconcile"]);
 const RETIRED_SUFFIX_RE = /^\.retired\.(\d{4})\.json$/;
+const FILE_CODES = Object.freeze({
+  options: "invalid_work_task_pipeline_store_options",
+  unreadable: "work_task_pipeline_store_unreadable",
+  symlink_rejected: "work_task_pipeline_store_symlink_rejected",
+  insecure_permissions: "work_task_pipeline_store_insecure_permissions",
+  write_failed: "work_task_pipeline_store_write_failed",
+  locked: "work_task_pipeline_store_locked",
+  lock_unsafe: "work_task_pipeline_store_lock_failed",
+  lock_failed: "work_task_pipeline_store_lock_failed",
+  lock_acquire_changed: "work_task_pipeline_store_lock_failed",
+  lock_release_changed: "work_task_pipeline_store_lock_release_failed",
+  lock_release_failed: "work_task_pipeline_store_lock_release_failed",
+});
 
 class WorkTaskPipelineStoreError extends Error {
   constructor(code, message = code) {
@@ -83,12 +99,6 @@ function expected(value, code) {
   }
   return { ...owner, manifest_digest: value.manifest_digest, pipeline_digest: value.pipeline_digest };
 }
-function assertFs(fs) {
-  for (const name of ["mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync", "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync", "readdirSync"]) {
-    if (typeof fs[name] !== "function") fail("invalid_work_task_pipeline_store_options", `fs.${name} is required`);
-  }
-  return fs;
-}
 function storageDirectory(configDir) {
   if (typeof configDir !== "string" || !path.isAbsolute(configDir) || configDir.length > 1024 || /[\u0000\r\n]/.test(configDir)) {
     fail("invalid_work_task_pipeline_store_options", "config_dir must be a bounded absolute path");
@@ -99,7 +109,6 @@ function workTaskPipelineStorePath(configDir, owner) {
   const normalized = identity(owner, "invalid_work_task_pipeline_store_identity");
   return path.join(storageDirectory(configDir), `${normalized.installation_id}--${normalized.project_id}.json`);
 }
-function lockPathFor(statePath) { return `${statePath}.lock`; }
 // A retired batch keeps its full record beside the active path under an
 // ordinal suffix, so provenance survives every later successor freeze.
 function retiredEntries(fs, statePath) {
@@ -116,50 +125,6 @@ function nextRetiredPath(fs, statePath) {
   const ordinal = entries.length === 0 ? 1 : entries[entries.length - 1].ordinal + 1;
   if (ordinal > 9999) fail("work_task_pipeline_store_retired_bound", "retired batch bound reached");
   return `${statePath.slice(0, -".json".length)}.retired.${String(ordinal).padStart(4, "0")}.json`;
-}
-function temporaryPathFor(statePath) {
-  return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
-}
-// The lock file body is this writer's proof of ownership. dev+ino alone cannot
-// prove it: Linux reuses an inode number as soon as the old lock is unlinked
-// and closed, so a replacement lock can carry the original's identity.
-function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
-function modeOf(stats) { return stats.mode & 0o777; }
-function lstatOrNull(fs, target) {
-  try { return fs.lstatSync(target); } catch (error) {
-    if (error && error.code === "ENOENT") return null;
-    fail("work_task_pipeline_store_unreadable", "pipeline store cannot be statted");
-  }
-}
-function sameFile(left, right) {
-  return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) &&
-    left.dev === right.dev && left.ino === right.ino;
-}
-function assertRealDirectory(fs, target, expectedMode) {
-  const stats = lstatOrNull(fs, target);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink()) {
-    fail("work_task_pipeline_store_symlink_rejected", "pipeline store paths cannot be symbolic links");
-  }
-  if (!stats.isDirectory()) fail("work_task_pipeline_store_unreadable", "pipeline store directory is not a directory");
-  if (expectedMode !== undefined && modeOf(stats) !== expectedMode) {
-    fail("work_task_pipeline_store_insecure_permissions", "pipeline store directory must be mode 0700");
-  }
-  return stats;
-}
-function ensureDirectory(fs, rootDirectory, directory) {
-  if (assertRealDirectory(fs, rootDirectory) === null) {
-    fs.mkdirSync(rootDirectory, { recursive: true, mode: DIRECTORY_MODE });
-    if (assertRealDirectory(fs, rootDirectory) === null) fail("work_task_pipeline_store_unreadable", "pipeline config root cannot be created");
-  }
-  if (assertRealDirectory(fs, directory, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(directory, { recursive: false, mode: DIRECTORY_MODE });
-    if (assertRealDirectory(fs, directory, DIRECTORY_MODE) === null) fail("work_task_pipeline_store_unreadable", "pipeline store directory cannot be created");
-  }
-}
-function storageExists(fs, rootDirectory, directory) {
-  if (assertRealDirectory(fs, rootDirectory) === null) return false;
-  return assertRealDirectory(fs, directory, DIRECTORY_MODE) !== null;
 }
 function assertTerminalDisposition(value, code) {
   if (value === null) return null;
@@ -262,99 +227,15 @@ function decodeState(fs, statePath, owner, allowMissing) {
   if (!sameIdentity(value.identity, owner)) fail("work_task_pipeline_store_identity_mismatch", "pipeline store belongs to a different project");
   return value;
 }
-// Fsync the containing directory so a completed rename is recoverable across
-// a process or machine restart. Filesystems that do not expose a readable
-// directory descriptor fail closed rather than claiming a write.
+// Fsync the containing directory so a completed retirement rename is
+// recoverable across a process or machine restart. Filesystems that do not
+// expose a readable directory descriptor fail closed rather than claiming it.
 function fsyncDirectory(fs, directory) {
   const directoryDescriptor = fs.openSync(directory, "r");
   try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
 }
-function writeStateAtomically(fs, statePath, state) {
-  const directory = path.dirname(statePath);
-  const temporaryPath = temporaryPathFor(statePath);
-  let temporaryWritten = false;
-  try {
-    const body = `${JSON.stringify(state)}\n`;
-    fs.writeFileSync(temporaryPath, body, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
-    temporaryWritten = true;
-    fs.chmodSync(temporaryPath, FILE_MODE);
-    const fileDescriptor = fs.openSync(temporaryPath, "r");
-    try { fs.fsyncSync(fileDescriptor); } finally { fs.closeSync(fileDescriptor); }
-    fs.renameSync(temporaryPath, statePath);
-    temporaryWritten = false;
-    fsyncDirectory(fs, directory);
-  } catch (error) {
-    if (temporaryWritten) {
-      try { fs.unlinkSync(temporaryPath); } catch { /* best-effort temp cleanup only */ }
-    }
-    if (error instanceof WorkTaskPipelineStoreError) throw error;
-    fail("work_task_pipeline_store_write_failed", "atomic pipeline store write failed");
-  }
-}
-function lockStat(fs, lockPath) {
-  const stats = lstatOrNull(fs, lockPath);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== FILE_MODE) {
-    fail("work_task_pipeline_store_lock_failed", "pipeline store writer lock is unsafe");
-  }
-  return stats;
-}
-function acquireLock(fs, statePath) {
-  const lockPath = lockPathFor(statePath);
-  const token = lockToken();
-  let descriptor;
-  let ownStat = null;
-  try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); } catch (error) {
-    if (error && error.code === "EEXIST") {
-      lockStat(fs, lockPath);
-      fail("work_task_pipeline_store_locked", "pipeline store has an active or stale writer lock");
-    }
-    fail("work_task_pipeline_store_lock_failed", "pipeline store lock cannot be acquired");
-  }
-  try {
-    fs.writeFileSync(descriptor, token, "utf8");
-    fs.chmodSync(lockPath, FILE_MODE);
-    fs.fsyncSync(descriptor);
-    ownStat = fs.fstatSync(descriptor);
-    const current = lockStat(fs, lockPath);
-    if (!sameFile(ownStat, current)) fail("work_task_pipeline_store_lock_failed", "pipeline store lock changed during acquisition");
-  } catch (error) {
-    try { fs.closeSync(descriptor); } catch { /* lock failure stays fail-closed */ }
-    // This is cleanup only for the just-created lock. If its pathname was
-    // replaced, retaining it fail-closed is safer than unlinking a new writer.
-    try {
-      const current = lockStat(fs, lockPath);
-      if (sameFile(ownStat, current) && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-    } catch { /* a mismatched or unreadable replacement remains in place */ }
-    if (error instanceof WorkTaskPipelineStoreError) throw error;
-    fail("work_task_pipeline_store_lock_failed", "pipeline store lock cannot be initialized");
-  }
-  return { descriptor, lockPath, stat: ownStat, token };
-}
-function releaseLock(fs, lock) {
-  let closeError = null;
-  try { fs.closeSync(lock.descriptor); } catch (error) { closeError = error; }
-  try {
-    const current = lockStat(fs, lock.lockPath);
-    if (!sameFile(lock.stat, current) || fs.readFileSync(lock.lockPath, "utf8") !== lock.token) fail("work_task_pipeline_store_lock_release_failed", "pipeline store lock changed before release");
-    fs.unlinkSync(lock.lockPath);
-  } catch (error) {
-    if (error instanceof WorkTaskPipelineStoreError) throw error;
-    fail("work_task_pipeline_store_lock_release_failed", "pipeline store writer lock could not be released");
-  }
-  if (closeError) fail("work_task_pipeline_store_lock_release_failed", "pipeline store writer lock could not be closed");
-}
-function withWriterLock(fs, statePath, action) {
-  const lock = acquireLock(fs, statePath);
-  let result;
-  let actionError;
-  try { result = action(); } catch (error) { actionError = error; }
-  try { releaseLock(fs, lock); } catch (releaseError) {
-    if (actionError) throw actionError;
-    throw releaseError;
-  }
-  if (actionError) throw actionError;
-  return result;
+function writeStateAtomically(files, statePath, state) {
+  files.writeFileAtomically(statePath, `${JSON.stringify(state)}\n`);
 }
 function assertInitialState(input) {
   exact(input, ["expected", "manifest", "pipeline"], "invalid_work_task_pipeline_store_initialization");
@@ -392,8 +273,11 @@ function assertPlanApplication(input) {
 
 function createWorkTaskPipelineStore(options) {
   exact(options, ["config_dir", "fs"], "invalid_work_task_pipeline_store_options");
-  const fs = assertFs(options.fs || nodeFs);
+  const files = createDurableStoreFiles({ fs: options.fs || nodeFs, error: WorkTaskPipelineStoreError, codes: FILE_CODES });
+  const fs = files.fs;
+  if (typeof fs.readdirSync !== "function") fail("invalid_work_task_pipeline_store_options", "fs.readdirSync is required");
   const directory = storageDirectory(options.config_dir);
+  const directories = [{ path: options.config_dir }, { path: directory, mode: DIRECTORY_MODE }];
 
   function statePath(owner) {
     return workTaskPipelineStorePath(options.config_dir, {
@@ -403,14 +287,14 @@ function createWorkTaskPipelineStore(options) {
   }
   function readRecoverySnapshot(owner) {
     const normalized = identity(owner, "invalid_work_task_pipeline_store_identity");
-    if (!storageExists(fs, options.config_dir, directory)) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
+    if (!files.storageExists(directories)) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     return snapshot(decodeState(fs, statePath(normalized), normalized, false));
   }
   function initialize(input) {
     const initial = assertInitialState(input);
     const target = statePath(initial.precondition);
-    ensureDirectory(fs, options.config_dir, directory);
-    return withWriterLock(fs, target, () => {
+    files.ensureDirectories(directories);
+    return files.withWriterLock(target, () => {
       const existing = decodeState(fs, target, initial.precondition, true);
       if (existing !== null) fail("work_task_pipeline_store_already_initialized", "pipeline store already exists");
       const state = {
@@ -421,17 +305,17 @@ function createWorkTaskPipelineStore(options) {
         terminal_audit: [],
       };
       assertStoredState(state);
-      writeStateAtomically(fs, target, state);
+      writeStateAtomically(files, target, state);
       return snapshot(state);
     });
   }
   function applyPlan(input) {
     const application = assertPlanApplication(input);
     const target = statePath(application.precondition);
-    if (!storageExists(fs, options.config_dir, directory)) {
+    if (!files.storageExists(directories)) {
       fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     }
-    return withWriterLock(fs, target, () => {
+    return files.withWriterLock(target, () => {
       const current = readCurrent(target, application.precondition);
       let nextPipeline;
       try { nextPipeline = applyWorkTaskPipelinePlan(current.pipeline, application.plan); } catch {
@@ -463,7 +347,7 @@ function createWorkTaskPipelineStore(options) {
       terminal_audit: clone(terminalAudit),
     };
     assertStoredState(next);
-    writeStateAtomically(fs, target, next);
+    writeStateAtomically(files, target, next);
     return next;
   }
   // Retirement is the explicit, durable end of one batch: the pipeline takes
@@ -474,10 +358,10 @@ function createWorkTaskPipelineStore(options) {
   function retire(input) {
     const retirement = assertRetirement(input);
     const target = statePath(retirement.precondition);
-    if (!storageExists(fs, options.config_dir, directory)) {
+    if (!files.storageExists(directories)) {
       fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     }
-    return withWriterLock(fs, target, () => {
+    return files.withWriterLock(target, () => {
       const current = readCurrent(target, retirement.precondition);
       let state = current;
       if (!current.pipeline.archived) {
@@ -503,7 +387,7 @@ function createWorkTaskPipelineStore(options) {
   }
   function readRetiredSnapshots(owner) {
     const normalized = identity(owner, "invalid_work_task_pipeline_store_identity");
-    if (!storageExists(fs, options.config_dir, directory)) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
+    if (!files.storageExists(directories)) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
     return freeze(retiredEntries(fs, statePath(normalized)).map((entry) => snapshot(decodeState(fs, entry.path, normalized, false))));
   }
 

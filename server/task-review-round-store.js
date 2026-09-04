@@ -12,6 +12,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { createDurableStoreFiles } = require("./durable-store-files");
 const {
   assertWorkTaskRef,
   workTaskKey,
@@ -33,6 +34,19 @@ const TASK_REVIEW_ROUND_STORE_FILENAME_SUFFIX = ".json";
 const DIGEST_RE = /^[a-f0-9]{64}$/;
 const MAX_ROUNDS_PER_PROJECT = 64;
 const MAX_DOCUMENT_BYTES = 1024 * 1024;
+const FILE_CODES = Object.freeze({
+  options: "invalid_task_review_round_store_options",
+  unreadable: "task_review_round_store_unreadable",
+  symlink_rejected: "task_review_round_store_unsafe",
+  insecure_permissions: "task_review_round_store_unsafe",
+  write_failed: "task_review_round_store_persist_failed",
+  locked: "task_review_round_store_locked",
+  lock_unsafe: "task_review_round_store_unsafe",
+  lock_failed: "task_review_round_store_persist_failed",
+  lock_acquire_changed: "task_review_round_store_unsafe",
+  lock_release_changed: "task_review_round_store_unsafe",
+  lock_release_failed: "task_review_round_store_persist_failed",
+});
 
 class TaskReviewRoundStoreError extends Error {
   constructor(code, message = code) {
@@ -259,143 +273,23 @@ function secureStoreDirectories(fsImpl, rootDir) {
   return directory;
 }
 
-function lockPathFor(directory, scope) {
-  return path.join(directory, `${scopeFilename(scope)}.lock`);
+// The project writer lock is held across read -> pure transition -> atomic
+// replace.  A failed release leaves a 0600 lock behind, which every later
+// mutation fails closed on rather than guessing that it is stale.
+function withProjectWriterLock(store, scope, action) {
+  const directory = secureStoreDirectories(store.fs, store.rootDir);
+  return store.files.withWriterLock(path.join(directory, scopeFilename(scope)), action);
 }
 
-function lockStat(fsImpl, lockPath) {
-  let stat;
-  try { stat = fsImpl.lstatSync(lockPath); }
-  catch (error) {
-    if (error && error.code === "ENOENT") return null;
-    fail("task_review_round_store_unreadable", "project writer lock is unreadable");
-  }
-  const uid = ownerUid();
-  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600 || (uid !== null && stat.uid !== uid)) {
-    fail("task_review_round_store_unsafe", "project writer lock is unsafe");
-  }
-  return stat;
-}
-
-function sameFile(left, right) {
-  return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) && left.dev === right.dev && left.ino === right.ino;
-}
-
-// The lock file body is this writer's proof of ownership. dev+ino alone cannot
-// prove it: Linux reuses an inode number as soon as the old lock is unlinked
-// and closed, so a replacement lock can carry the original's identity.
-function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
-
-function acquireProjectWriterLock(fsImpl, rootDir, scope) {
-  const directory = secureStoreDirectories(fsImpl, rootDir);
-  const lockPath = lockPathFor(directory, scope);
-  const token = lockToken();
-  let fd = null;
-  let ownStat = null;
-  try {
-    fd = fsImpl.openSync(lockPath, "wx", 0o600);
-  } catch (error) {
-    if (error && error.code === "EEXIST") {
-      // A lock is deliberately never age-reaped.  The next explicit recovery
-      // action must inspect it; silently deleting a possibly live writer lock
-      // would reintroduce the exact lost-update race this guard prevents.
-      lockStat(fsImpl, lockPath);
-      fail("task_review_round_store_locked", "project has an exclusive writer lock");
-    }
-    fail("task_review_round_store_persist_failed", "could not acquire project writer lock");
-  }
-  try {
-    fsImpl.writeFileSync(fd, token, "utf8");
-    fsImpl.chmodSync(lockPath, 0o600);
-    fsImpl.fsyncSync(fd);
-    ownStat = fsImpl.fstatSync(fd);
-    const pathStat = lockStat(fsImpl, lockPath);
-    if (!sameFile(ownStat, pathStat)) fail("task_review_round_store_unsafe", "project writer lock changed during acquisition");
-    return { fd, lock_path: lockPath, stat: ownStat, token };
-  } catch (error) {
-    try { fsImpl.closeSync(fd); } catch {}
-    // This cleanup is only for the just-created, never-returned lock.  It is
-    // not stale-lock reaping: a mismatched replacement is retained fail-closed.
-    try {
-      const current = lockStat(fsImpl, lockPath);
-      if (sameFile(ownStat, current) && fsImpl.readFileSync(lockPath, "utf8") === token) fsImpl.unlinkSync(lockPath);
-    } catch {}
-    if (error instanceof TaskReviewRoundStoreError) throw error;
-    fail("task_review_round_store_persist_failed", "could not initialize project writer lock");
-  }
-}
-
-function releaseProjectWriterLock(fsImpl, lock) {
-  let closeError = null;
-  try { fsImpl.closeSync(lock.fd); }
-  catch (error) { closeError = error; }
-  try {
-    const current = lockStat(fsImpl, lock.lock_path);
-    if (!sameFile(lock.stat, current) || fsImpl.readFileSync(lock.lock_path, "utf8") !== lock.token) fail("task_review_round_store_unsafe", "project writer lock changed before release");
-    fsImpl.unlinkSync(lock.lock_path);
-  } catch (error) {
-    if (error instanceof TaskReviewRoundStoreError) throw error;
-    fail("task_review_round_store_persist_failed", "could not release project writer lock");
-  }
-  if (closeError) fail("task_review_round_store_persist_failed", "could not close project writer lock");
-}
-
-function withProjectWriterLock(fsImpl, rootDir, scope, action) {
-  const lock = acquireProjectWriterLock(fsImpl, rootDir, scope);
-  let result;
-  let actionError = null;
-  try { result = action(); }
-  catch (error) { actionError = error; }
-  try { releaseProjectWriterLock(fsImpl, lock); }
-  catch (releaseError) {
-    // Preserve the primary transition result/error.  A failed release leaves a
-    // 0600 lock behind, which every later mutation fails closed rather than
-    // guessing that it is stale.
-    if (actionError) throw actionError;
-    throw releaseError;
-  }
-  if (actionError) throw actionError;
-  return result;
-}
-
-function writeDocument(fsImpl, rootDir, scope, document, randomBytes) {
+function writeDocument(store, scope, document) {
   const normalized = finalizeDocument(document);
   const serialized = JSON.stringify(normalized);
   if (Buffer.byteLength(serialized, "utf8") > MAX_DOCUMENT_BYTES) {
     fail("task_review_round_store_over_bound", "store document exceeds its hard bound");
   }
-  let temporary = null;
-  try {
-    const directory = secureStoreDirectories(fsImpl, rootDir);
-    const filePath = path.join(directory, scopeFilename(scope));
-    const entropy = randomBytes(16);
-    if (!Buffer.isBuffer(entropy) || entropy.length < 16) throw new Error("random bytes unavailable");
-    temporary = `${filePath}.${process.pid}.${entropy.subarray(0, 16).toString("hex")}.tmp`;
-    const fd = fsImpl.openSync(temporary, "wx", 0o600);
-    try {
-      fsImpl.writeFileSync(fd, serialized, { encoding: "utf8" });
-      fsImpl.fsyncSync(fd);
-    } finally {
-      fsImpl.closeSync(fd);
-    }
-    fsImpl.chmodSync(temporary, 0o600);
-    const temporaryStat = fsImpl.lstatSync(temporary);
-    if (!temporaryStat.isFile() || temporaryStat.isSymbolicLink() || (temporaryStat.mode & 0o777) !== 0o600) {
-      fail("task_review_round_store_unsafe", "temporary store file is unsafe");
-    }
-    fsImpl.renameSync(temporary, filePath);
-    temporary = null;
-    fsImpl.chmodSync(filePath, 0o600);
-    const finalStat = verifyExistingFile(fsImpl, filePath);
-    if (finalStat === null) fail("task_review_round_store_persist_failed", "atomic replace did not create the store file");
-    return cloneFreeze(normalized);
-  } catch (error) {
-    if (temporary !== null) {
-      try { fsImpl.unlinkSync(temporary); } catch {}
-    }
-    if (error instanceof TaskReviewRoundStoreError) throw error;
-    fail("task_review_round_store_persist_failed", "could not atomically persist review-round state");
-  }
+  const directory = secureStoreDirectories(store.fs, store.rootDir);
+  store.files.writeFileAtomically(path.join(directory, scopeFilename(scope)), serialized);
+  return cloneFreeze(normalized);
 }
 
 function statusProjection(round) {
@@ -523,6 +417,7 @@ class TaskReviewRoundStore {
     this.fs = options.fsImpl || fs;
     this.rootDir = absoluteDirectory(options.rootDir || path.join(os.homedir(), ".quadwork"));
     this.randomBytes = options.randomBytes || crypto.randomBytes;
+    this.files = createDurableStoreFiles({ fs: this.fs, error: TaskReviewRoundStoreError, codes: FILE_CODES, random_bytes: this.randomBytes });
   }
 
   pathFor(reviewRoundRef) {
@@ -533,7 +428,7 @@ class TaskReviewRoundStore {
   openRound(input, trustedAssignments) {
     const opened = openTaskReviewRound(input, trustedAssignments);
     const scope = scopeFromRef(opened.review_round_ref);
-    return withProjectWriterLock(this.fs, this.rootDir, scope, () => {
+    return withProjectWriterLock(this, scope, () => {
       // State is intentionally re-read only after this project-scoped lock is
       // held.  A concurrent opener/receipt/cancellation can therefore never
       // publish a newer document between our read and atomic replace.
@@ -554,21 +449,21 @@ class TaskReviewRoundStore {
       }
       const next = clone(loaded.document);
       next.records[key] = { round: clone(opened) };
-      writeDocument(this.fs, this.rootDir, scope, next, this.randomBytes);
+      writeDocument(this, scope, next);
       return statusProjection(opened);
     });
   }
 
   submitTrustedReceipt(reviewRoundRef, digest, receipt, trustedReviewerContext) {
     const scope = scopeFromRef(reviewRoundRef);
-    return withProjectWriterLock(this.fs, this.rootDir, scope, () => {
+    return withProjectWriterLock(this, scope, () => {
       const loaded = safeReadDocument(this.fs, this.rootDir, scope);
       const located = recordFor(loaded.document, reviewRoundRef, candidateDigest(digest));
       const transition = submitTaskReviewReceipt(located.round, receipt, trustedReviewerContext);
       if (transition.outcome !== "idempotent") {
         const next = clone(loaded.document);
         next.records[located.key] = { round: clone(transition.round) };
-        writeDocument(this.fs, this.rootDir, scope, next, this.randomBytes);
+        writeDocument(this, scope, next);
       }
       return cloneFreeze({ outcome: transition.outcome, view: ownReceiptProjection(transition.round, trustedReviewerContext) });
     });
@@ -626,14 +521,14 @@ class TaskReviewRoundStore {
   cancelFromTrustedState(cancellation) {
     if (!plain(cancellation)) fail("invalid_task_review_cancellation", "trusted cancellation is invalid");
     const scope = scopeFromRef(cancellation.review_round_ref, "invalid_task_review_cancellation");
-    return withProjectWriterLock(this.fs, this.rootDir, scope, () => {
+    return withProjectWriterLock(this, scope, () => {
       const loaded = safeReadDocument(this.fs, this.rootDir, scope);
       const located = recordFor(loaded.document, cancellation.review_round_ref, candidateDigest(cancellation.candidate_digest, "invalid_task_review_cancellation"));
       const nextRound = cancelTaskReviewRound(located.round, cancellation);
       if (nextRound.round_digest !== located.round.round_digest) {
         const next = clone(loaded.document);
         next.records[located.key] = { round: clone(nextRound) };
-        writeDocument(this.fs, this.rootDir, scope, next, this.randomBytes);
+        writeDocument(this, scope, next);
       }
       return statusProjection(nextRound);
     });
