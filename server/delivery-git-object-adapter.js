@@ -17,6 +17,7 @@ const crypto = require("node:crypto");
 const path = require("node:path");
 const { assertDeliveryCandidateRef, expectedCandidateBase } = require("./delivery-candidate");
 const { workTaskKey } = require("./work-task-manifest");
+const { compareGitTreeRecords } = require("./git-tree-order");
 const {
   buildRepositoryWorktreePlan,
   canonicalRepositoryFromRemote,
@@ -385,7 +386,7 @@ function createDeliveryGitObjectAdapter(options) {
         const records = [];
         for (const file of node.files) records.push({ name: file.name, mode: file.entry.mode, type: "blob", sha: file.entry.blob_sha });
         for (const [name, child] of node.directories) records.push({ name, mode: "040000", type: "tree", sha: await writeNode(child) });
-        records.sort((left, right) => left.name.localeCompare(right.name));
+        records.sort(compareGitTreeRecords);
         if (records.length === 0 || new Set(records.map((entry) => entry.name)).size !== records.length) {
           fail(code, "composed tree hierarchy is invalid");
         }
@@ -497,9 +498,11 @@ function createDeliveryGitObjectAdapter(options) {
           if (after === null) entries.delete(file.path);
           else entries.set(file.path, { path: file.path, ...after });
         }
-        const outputEntries = [...entries.values()].sort((left, right) => left.path.localeCompare(right.path));
-        if (outputEntries.length > MAX_TREE_ENTRIES) fail("delivery_git_apply_tree_limit", "composed tree exceeds its entry bound");
-        const treeSha = await writeTreeFromEntries(current, outputEntries, "delivery_git_apply_unavailable");
+        // Order is decided once, per tree object, by the Git record comparator
+        // inside writeTreeFromEntries; a flattened pre-sort here would be a
+        // second, unobservable ordering.
+        if (entries.size > MAX_TREE_ENTRIES) fail("delivery_git_apply_tree_limit", "composed tree exceeds its entry bound");
+        const treeSha = await writeTreeFromEntries(current, entries.values(), "delivery_git_apply_unavailable");
         if (request.expected_result_tree_sha !== null && treeSha !== request.expected_result_tree_sha) {
           fail("delivery_git_apply_not_clean", "object patch did not produce its pinned result tree");
         }

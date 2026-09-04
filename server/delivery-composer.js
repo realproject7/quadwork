@@ -16,6 +16,7 @@ const {
   assertDeliveryManifest,
 } = require("./delivery-candidate");
 const { workTaskKey } = require("./work-task-manifest");
+const { compareGitTreePaths } = require("./git-tree-order");
 
 const VERSION = 1;
 const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
@@ -182,7 +183,7 @@ function expectedAppliedTree(input, files, resultSha) {
     if (file.after === null) map.delete(file.path);
     else map.set(file.path, clone(file.after));
   }
-  return { tree_sha: resultSha, entries: [...map.values()].sort((left, right) => left.path.localeCompare(right.path)) };
+  return { tree_sha: resultSha, entries: [...map.values()].sort((left, right) => compareGitTreePaths(left.path, right.path)) };
 }
 
 function patchFile(value, code) {

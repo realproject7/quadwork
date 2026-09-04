@@ -620,6 +620,10 @@ await withRootRepository(async ({ repository, base_sha, candidate_a, candidate_b
     assert.deepEqual(fed, git(repository, ["ls-tree", "--name-only", git(repository, ["mktree"], entry.input)]).split("\n"), "mktree input is in native record order");
   }
   assert.ok(written.some((entry) => entry.input.trimEnd().split("\n").map((line) => line.split("\t")[1]).join(",") === nativeRoot.join(",")), "the root tree was fed in native record order");
+  // Byte order does not loosen the path grammar: a native tree carrying a
+  // non-ASCII name is still refused exactly as before.
+  const accented = git(repository, ["mktree"], `100644 blob ${git(repository, ["rev-parse", `${result_sha}:README.md`])}\tcafé.md\n`);
+  await rejectsAdapter(() => objects.readTree({ version: 1, repository: "owner/web", tree_sha: accented }), "delivery_git_tree_invalid");
   assert.equal(git(repository, ["status", "--porcelain", "--untracked-files=all"]), "");
   assert.equal(git(repository, ["show-ref"]), refsBefore, "adapter did not move a ref");
   console.log("  PASS: a realistic root with uppercase and file-beside-directory names composes in native Git order to the native tree objects");
