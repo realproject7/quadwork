@@ -6,6 +6,14 @@
 // honoured while the owner lives, kills the owner, and then expects the next
 // writer to recover and commit.  Nothing here stubs a pid, a signal, or the
 // lock body; the record on disk is exactly what the store wrote.
+//
+// #1070: a holder child blocks forever by design, so an interrupted or
+// mid-test-failed run used to strand one per store.  Six such orphans held
+// locks for hours and cross-contaminated an unrelated suite.  Every holder
+// this file spawns is therefore tracked by handle, and the top-level
+// `finally` (and the interrupt path) kills only those handles, waits a
+// bounded moment for each, and then drops the fixtures.  Nothing here ever
+// consults the process table or matches a process by name.
 
 const assert = require("node:assert/strict");
 const { spawn, spawnSync } = require("node:child_process");
@@ -33,6 +41,12 @@ const base_sha = "a".repeat(64);
 const result_sha = "f".repeat(64);
 const candidate_sha = "b".repeat(64);
 const work_item = { repoKey: "web", repo: "Owner/Product-Web", number: 42, kind: "issue" };
+// A holder is killed by its parent within milliseconds.  This bound exists
+// only for a parent that died without reaping; it is far longer than any run
+// of this file, so it can never stand in for the parent's own cleanup.
+const HOLDER_SELF_DESTRUCT_MS = 120_000;
+const REAP_TIMEOUT_MS = 2_000;
+const ABORT_DEADLINE_MS = 3_000;
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
 function stable(value) {
@@ -171,7 +185,11 @@ if (process.argv[2] === "--hold-writer-lock") {
     fs.chmodSync(target, mode);
     if (target.endsWith(".lock")) {
       fs.writeSync(1, `HOLDING ${process.pid}\n`);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, HOLDER_SELF_DESTRUCT_MS);
+      // Reached only when no parent ever killed this holder.  Leaving the
+      // lock on disk is exactly what the SIGKILL the parent normally sends
+      // would leave, so the store's own recovery still governs it.
+      process.exit(3);
     }
   };
   STORES[process.argv[3]].mutate(process.argv[4], holding);
@@ -206,10 +224,53 @@ if (process.argv[2] === "--contend") {
 function throwsCode(fn, expected) {
   assert.throws(fn, (error) => error && error.code === expected, `expected ${expected}`);
 }
+// Every holder this process spawned, by handle.  Membership is the only
+// thing that ever authorises a kill: no pattern, no name, no process table.
+const holders = new Set();
+const fixtures = new Set();
+
+function live(holder) { return holder.child.exitCode === null && holder.child.signalCode === null; }
+function killLiveHolders() {
+  const killed = [];
+  for (const holder of holders) {
+    if (!live(holder)) continue;
+    try { holder.child.kill("SIGKILL"); killed.push(holder); } catch { /* already gone */ }
+  }
+  return killed;
+}
+async function reapHolders() {
+  const killed = killLiveHolders();
+  if (killed.length === 0) return;
+  const bound = new Promise((resolve) => setTimeout(resolve, REAP_TIMEOUT_MS).unref());
+  await Promise.all(killed.map((holder) => Promise.race([holder.exited, bound])));
+}
+function removeFixtures() {
+  for (const directory of fixtures) {
+    try { fs.rmSync(directory, { recursive: true, force: true }); } catch { /* best effort on teardown */ }
+  }
+  fixtures.clear();
+}
+// An interrupt cannot await, so it kills the tracked handles and drops the
+// fixtures synchronously.  A SIGKILL of this process itself is beyond any
+// handler; the holder's own bounded wait is the only backstop for that.
+function onInterrupt(code) {
+  return () => {
+    killLiveHolders();
+    removeFixtures();
+    process.exit(code);
+  };
+}
+process.on("SIGINT", onInterrupt(130));
+process.on("SIGTERM", onInterrupt(143));
+
 function withDirectory(run) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-writer-lock-"));
   fs.chmodSync(directory, 0o700);
-  return run(directory).finally(() => fs.rmSync(directory, { recursive: true, force: true }));
+  // Teardown is deliberately not per-scope.  A fixture removed while its
+  // holder is still alive is exactly the ordering that stranded locks, so
+  // every fixture is dropped in one place, after the holders are reaped.
+  fixtures.add(directory);
+  return run(directory);
 }
 function holdLock(name, directory) {
   const child = spawn(process.execPath, [__filename, "--hold-writer-lock", name, directory], { stdio: ["ignore", "pipe", "inherit"] });
@@ -223,7 +284,9 @@ function holdLock(name, directory) {
     });
     exited.then((outcome) => reject(new Error(`holder exited before taking the lock: ${JSON.stringify(outcome)} ${output}`)));
   });
-  return { child, exited, holding };
+  const holder = { child, exited, holding };
+  holders.add(holder);
+  return holder;
 }
 function artifacts(statePath) {
   return fs.readdirSync(path.dirname(statePath)).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp"));
@@ -390,7 +453,50 @@ async function contendersYieldOneWriterAtATime() {
   });
 }
 
-(async () => {
+// Abort harness, child half: take a real holder lock, announce the pid and
+// the fixture it owns, and then die the two ways a run actually dies — an
+// assertion that fails mid-test, and an interrupt.  Neither path gets to
+// reach the kill that the passing path performs.
+const ABORT_KINDS = Object.freeze(["assertion", "interrupt"]);
+async function abortHarnessChild(kind) {
+  await withDirectory(async (directory) => {
+    const holder = holdLock("head-control-audit-store", directory);
+    fs.writeSync(1, `ABORT-HOLDER ${await holder.holding}\nABORT-FIXTURE ${directory}\n`);
+    if (kind === "interrupt") {
+      process.kill(process.pid, "SIGINT");
+      // Keep the loop alive so the interrupt path — not this timer — is what
+      // ends the process; the timer only bounds a handler that never runs.
+      await new Promise(() => { setTimeout(() => { fs.writeSync(1, "ABORT-STUCK\n"); process.exit(9); }, ABORT_DEADLINE_MS); });
+    }
+    assert.fail("forced mid-test abort while a holder child is live");
+  });
+}
+// Abort harness, parent half: the aborted run must leave no holder of its
+// own alive and no fixture behind, and the very next check in this process
+// must behave exactly as it does on a clean machine.
+async function abortLeavesNoHolderBehind(kind) {
+  const child = spawn(process.execPath, [__filename, "--abort-harness", kind], { stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk.toString(); });
+  child.stderr.on("data", () => { /* the aborted run is expected to print its failure */ });
+  const outcome = await new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+  assert.notEqual(outcome.code, 0, `${kind}: the aborted run must fail: ${output}`);
+  assert.doesNotMatch(output, /^ABORT-STUCK$/m, `${kind}: the abort path never ran`);
+  const announced = /^ABORT-HOLDER (\d+)$/m.exec(output);
+  const fixture = /^ABORT-FIXTURE (.+)$/m.exec(output);
+  assert.ok(announced && fixture, `${kind}: the aborted run never reported its holder: ${output}`);
+  const pid = Number(announced[1]);
+
+  // Bounded far below the holder's own self-destruct wait, so only the
+  // aborted run's own cleanup can satisfy this.
+  const deadline = Date.now() + ABORT_DEADLINE_MS;
+  while (!isDead(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(isDead(pid), true, `${kind}: the aborted run left holder ${pid} alive`);
+  assert.equal(fs.existsSync(fixture[1]), false, `${kind}: the aborted run left its fixture behind`);
+  await deadWriterIsRecovered("head-control-audit-store");
+}
+
+async function suite() {
   const failures = [];
   for (const name of Object.keys(STORES)) {
     for (const check of [deadWriterIsRecovered, malformedLockStaysClosed, unprovenOwnerStaysClosed, replacementIsNeverReaped]) {
@@ -400,9 +506,32 @@ async function contendersYieldOneWriterAtATime() {
   }
   try { await contendersYieldOneWriterAtATime(); }
   catch (error) { failures.push(`contendersYieldOneWriterAtATime: ${error && error.message}`); }
-  if (failures.length > 0) {
-    console.error(failures.join("\n"));
-    process.exit(1);
+  for (const kind of ABORT_KINDS) {
+    try { await abortLeavesNoHolderBehind(kind); }
+    catch (error) { failures.push(`abortLeavesNoHolderBehind(${kind}): ${error && error.message}`); }
   }
-  console.log("durable-store-writer-lock tests passed");
+  return failures;
+}
+
+(async () => {
+  let exitCode = 0;
+  try {
+    if (process.argv[2] === "--abort-harness") {
+      await abortHarnessChild(process.argv[3]);
+    } else {
+      const failures = await suite();
+      if (failures.length > 0) {
+        console.error(failures.join("\n"));
+        exitCode = 1;
+      }
+    }
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : String(error));
+    exitCode = 1;
+  } finally {
+    await reapHolders();
+    removeFixtures();
+  }
+  if (exitCode === 0 && process.argv[2] !== "--abort-harness") console.log("durable-store-writer-lock tests passed");
+  process.exit(exitCode);
 })();
