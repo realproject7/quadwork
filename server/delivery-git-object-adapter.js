@@ -9,8 +9,9 @@
 //
 // #1066: every Git observation is awaited, one call at a time, so the server
 // loop keeps serving while a candidate composes.  Each objects handle carries
-// one composition deadline that refuses further Git calls once passed; the
-// injected runner keeps its own per-call bound.
+// one composition deadline: a call is refused once it has passed, and every
+// call runs under the smaller of the per-call bound and what remains of it,
+// so the total bound holds even for a call already in flight.
 
 const crypto = require("node:crypto");
 const path = require("node:path");
@@ -33,6 +34,7 @@ const PATCH_FORMAT = "git_full_index_binary_v1";
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_TREE_ENTRIES = 16384;
 const MAX_PATCH_FILES = 1024;
+const PER_CALL_TIMEOUT_MS = 5000;
 
 class DeliveryGitObjectAdapterError extends Error {
   constructor(code, message = code) {
@@ -248,8 +250,11 @@ function createDeliveryGitObjectAdapter(options) {
   })]));
 
   async function run(repositoryRecord, args, input = null) {
-    if (repositoryRecord.deadline !== undefined && Date.now() >= repositoryRecord.deadline) {
-      fail("delivery_git_deadline_exceeded", "Delivery Candidate composition deadline passed");
+    let timeout_ms = PER_CALL_TIMEOUT_MS;
+    if (repositoryRecord.deadline !== undefined) {
+      const remaining = repositoryRecord.deadline - Date.now();
+      if (remaining <= 0) fail("delivery_git_deadline_exceeded", "Delivery Candidate composition deadline passed");
+      timeout_ms = Math.min(PER_CALL_TIMEOUT_MS, remaining);
     }
     let observed;
     try {
@@ -257,12 +262,17 @@ function createDeliveryGitObjectAdapter(options) {
         version: VERSION,
         cwd: repositoryRecord.base_path,
         args: freeze([...args]),
+        timeout_ms,
         ...(input === null ? {} : { input }),
       }));
     } catch {
       fail("delivery_git_unavailable", "Git object observation failed");
     }
-    return gitResult(observed, "delivery_git_observation_invalid");
+    const result = gitResult(observed, "delivery_git_observation_invalid");
+    if (!result.ok && repositoryRecord.deadline !== undefined && Date.now() >= repositoryRecord.deadline) {
+      fail("delivery_git_deadline_exceeded", "Delivery Candidate composition deadline passed during a Git call");
+    }
+    return result;
   }
   async function command(repositoryRecord, args, code, input = null) {
     const observed = await run(repositoryRecord, args, input);

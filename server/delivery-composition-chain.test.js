@@ -10,7 +10,7 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { execFile, execFileSync } = require("node:child_process");
+const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -21,10 +21,12 @@ const { createDeliveryGitObjectAdapter } = require("./delivery-git-object-adapte
 const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
 const { createDeliveryCompositionService } = require("./delivery-composition-service");
 const { createDeliveryCandidateRuntime } = require("./delivery-candidate-runtime");
+const { runDeliveryGit } = require("./delivery-git-runner");
 
 const installation_id = "installation_delivery_chain_1066";
 const project_id = "quadwork";
 const TOKEN = "head-token";
+const owner = { installation_id, project_id, role: "head", generation: 4 };
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
 function stable(value) { return Array.isArray(value) ? `[${value.map(stable).join(",")}]` : value && typeof value === "object" ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}` : JSON.stringify(value); }
@@ -37,17 +39,6 @@ function write(repository, relative, content) {
 function commit(repository, message) { git(repository, ["add", "."]); git(repository, ["commit", "-q", "-m", message]); return git(repository, ["rev-parse", "HEAD"]); }
 function configDirectory() { const value = fs.mkdtempSync(path.join(os.tmpdir(), "qw-delivery-chain-")); fs.chmodSync(value, 0o700); return value; }
 function rejectsCode(fn, code) { return assert.rejects(fn, (error) => error.code === code); }
-
-// Mirrors the `run_git` injection of server/index.js deliveryGitObjectsForProject.
-function runGit(request) {
-  return new Promise((resolve) => {
-    const child = execFile("git", request.args, { cwd: request.cwd, encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
-      (error, stdout) => resolve(error ? { ok: false, output: "" } : { ok: true, output: stdout }));
-    child.stdin.on("error", () => {});
-    if (typeof request.input === "string") child.stdin.end(request.input);
-    else child.stdin.end();
-  });
-}
 
 function stage(ref, base_sha, candidate_sha, name) {
   const worktreePath = `/private/var/quadwork/${name}-dev`;
@@ -94,8 +85,9 @@ function repositoryFixture(directory) {
 }
 
 // One real chain per section: a fresh config directory (durable store), the
-// real adapter over the shared repository, and the real Head runtime.  `hook`
-// runs before every Git call with the 1-based call ordinal and the request.
+// real adapter over the shared repository driving the exact runner that
+// server/index.js injects, and the real Head runtime.  `hook` runs before
+// every Git call with the 1-based call ordinal and the request.
 function chain(fixture, hook = null) {
   const config_dir = configDirectory();
   const calls = [];
@@ -103,7 +95,7 @@ function chain(fixture, hook = null) {
     repositories: [{ key: "web", repo: "Owner/Web", working_dir: fixture.repository, primary: true }],
     primary_agent_cwds: {}, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
-    run_git: (request) => { calls.push(request.args[0]); if (hook) hook(request, calls.length); return runGit(request); },
+    run_git: (request) => { calls.push(request.args[0]); if (hook) hook(request, calls.length); return runDeliveryGit(request); },
     read_delivery_source: () => copy(fixture.source),
   });
   const sessions = new Map([[`${project_id}/head`, { projectId: project_id, agentId: "head", state: "running", term: {}, lifecycleState: "verified" }]]);
@@ -123,7 +115,7 @@ function chain(fixture, hook = null) {
   const store = createDeliveryCandidateStore({ config_dir, fs });
   const compose = (ref, correlation_id, idempotency_key, expected_revision = 0) =>
     runtime.compose({ token: TOKEN, body: { delivery_candidate_ref: copy(ref), expected_revision, correlation_id, idempotency_key } });
-  return { config_dir, calls, runtime, store, compose, close() { fs.rmSync(config_dir, { recursive: true, force: true }); } };
+  return { config_dir, calls, adapter, runtime, store, compose, close() { fs.rmSync(config_dir, { recursive: true, force: true }); } };
 }
 async function prepared(subject) {
   const record = await subject.runtime.prepare({ token: TOKEN, body: { repository_key: "web" } });
@@ -256,6 +248,34 @@ async function main() {
         assert.equal(snapshot.lifecycle.accepted_operation.correlation_id, "other-writer-1066");
         console.log("  PASS: a candidate recorded by another writer during an await keeps that result; stale in-flight work does not win");
       } finally { subject.close(); }
+    }
+
+    // The one composition deadline is a real total bound: a clone check that
+    // blocks in a slow fsmonitor hook is killed at what remains of the
+    // budget, the composition ends typed within it, and nothing is recorded.
+    {
+      const hook = path.join(directory, "slow-fsmonitor.sh");
+      fs.writeFileSync(hook, "#!/bin/sh\nexec sleep 3 </dev/null >/dev/null 2>&1\n", { mode: 0o755 });
+      const subject = chain(fixture);
+      try {
+        const ref = await prepared(subject);
+        git(fixture.repository, ["config", "core.fsmonitor", hook]);
+        const deadline = Date.now() + 300;
+        const service = createDeliveryCompositionService({
+          binding: copy(owner), candidate_store: subject.store, deadline,
+          resolve_head_authorization: () => ({ version: 1, head_binding: copy(owner), archived: false }),
+          repository_objects: subject.adapter.repositoryObjectsFor({ version: 1, head_binding: copy(owner), delivery_candidate_ref: copy(ref), deadline }),
+        });
+        const started = Date.now();
+        await rejectsCode(() => service.composeCandidate({ head_binding: copy(owner), delivery_candidate_ref: copy(ref), expected_revision: 0, correlation_id: "deadline-1066", idempotency_key: "deadline-1066" }), "delivery_composition_deadline_exceeded");
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed >= 300 && elapsed < 1500, `composition ended at the total bound (${elapsed}ms), not after the blocked call's own 5s`);
+        const snapshot = subject.store.readSnapshot(ref);
+        assert.equal(snapshot.revision, 0);
+        assert.equal(snapshot.composition_proof, null);
+        assert.equal(fs.existsSync(path.join(fixture.repository, ".git", "index.lock")), false);
+        console.log(`  PASS: a Git call blocked past the composition deadline is killed at the total bound (${elapsed}ms) and no proof is recorded`);
+      } finally { git(fixture.repository, ["config", "--unset", "core.fsmonitor"]); subject.close(); }
     }
 
     assert.equal(git(fixture.repository, ["show-ref"]), refsBefore, "the chain moved no ref");

@@ -48,6 +48,7 @@ const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
 const { createDeliveryCompositionService } = require("./delivery-composition-service");
 const { createDeliveryCandidateRuntime } = require("./delivery-candidate-runtime");
 const { createDeliveryGitObjectAdapter } = require("./delivery-git-object-adapter");
+const { runDeliveryGit } = require("./delivery-git-runner");
 const { createCanonicalInstalledStateReader } = require("./canonical-installed-state");
 const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
 const { createChatResumeRuntime } = require("./chat-resume-runtime");
@@ -765,20 +766,11 @@ function deliveryGitObjectsForProject(projectId) {
   return createDeliveryGitObjectAdapter({
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
-    // #1066: awaited one call at a time, so the loop keeps serving terminals
-    // and sockets while a candidate composes; the fixed argv, cwd, per-call
-    // bound, and buffer are unchanged and no shell is involved.
-    run_git: (request) => new Promise((resolve) => {
-      const child = require("child_process").execFile("git", request.args, {
-        cwd: request.cwd,
-        encoding: "utf8",
-        timeout: 5000,
-        maxBuffer: 4 * 1024 * 1024,
-      }, (error, stdout) => resolve(error ? { ok: false, output: "" } : { ok: true, output: stdout }));
-      child.stdin.on("error", () => {});
-      if (typeof request.input === "string") child.stdin.end(request.input);
-      else child.stdin.end();
-    }),
+    // #1066: the directly tested fixed Git runner (server/delivery-git-runner.js),
+    // awaited one call at a time under the adapter's remaining composition
+    // budget, so the loop keeps serving terminals and sockets while a
+    // candidate composes.
+    run_git: runDeliveryGit,
     read_delivery_source: (request) => deliverySourceForProject(projectId).readStagedSource(request),
   });
 }

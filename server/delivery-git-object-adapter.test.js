@@ -15,6 +15,7 @@ const {
   DeliveryGitObjectAdapterError,
   createDeliveryGitObjectAdapter,
 } = require("./delivery-git-object-adapter");
+const { runDeliveryGit } = require("./delivery-git-runner");
 
 const installation_id = "installation_delivery_git_01";
 const project_id = "quadwork";
@@ -154,7 +155,7 @@ async function withRepository(run) {
 }
 
 async function main() {
-await withRepository(async ({ repository, base_sha, candidate_a, candidate_b, result_sha }) => {
+await withRepository(async ({ directory, repository, base_sha, candidate_a, candidate_b, result_sha }) => {
   const manifest = freezeBatchManifest(buildBatchManifest({
     version: 1,
     installation_id,
@@ -187,7 +188,7 @@ await withRepository(async ({ repository, base_sha, candidate_a, candidate_b, re
     primary_agent_cwds: {}, repository_worktrees: {},
     canonicalize_path(request) { return fs.realpathSync(request.path); },
     run_git(request) {
-      calls.push(copy({ args: request.args, input: request.input || null }));
+      calls.push(copy({ args: request.args, input: request.input || null, timeout_ms: request.timeout_ms }));
       return new Promise((resolve) => setTimeout(() => {
         try {
           resolve({ ok: true, output: execFileSync("git", request.args, {
@@ -275,6 +276,7 @@ await withRepository(async ({ repository, base_sha, candidate_a, candidate_b, re
   assert.equal(git(repository, ["show-ref"]), refsBefore, "adapter did not move a ref");
   assert.ok(calls.every((entry) => !["checkout", "add", "commit", "reset", "merge", "push", "apply"].includes(entry.args[0])));
   assert.ok(calls.some((entry) => entry.args[0] === "mktree"));
+  assert.ok(calls.every((entry) => Number.isSafeInteger(entry.timeout_ms) && entry.timeout_ms > 0 && entry.timeout_ms <= 5000), "every Git call carries a bounded per-call timeout");
   console.log("  PASS: registered Git adapter derives evidence and composes only unattached tree objects from native SHA-1 commits");
 
   write(repository, "untracked.txt", "dirty\n");
@@ -300,6 +302,7 @@ await withRepository(async ({ repository, base_sha, candidate_a, candidate_b, re
   await rejectsAdapter(() => short.applyPatch(applyRequest(ref, manifestDigest, "composition", 1, manifest.tasks[0].ref, base.tree_sha, null, patchA)), "delivery_git_deadline_exceeded");
   const spawned = calls.length - before;
   assert.ok(spawned >= 1 && spawned <= 3, `the clone recheck stopped at the deadline after ${spawned} of its 4 calls`);
+  assert.ok(calls.slice(before).every((entry) => entry.timeout_ms <= 60), "each call under a short deadline is bounded by what remains of it, not the 5s ceiling");
   assert.ok(!calls.slice(before).some((entry) => entry.args[0] === "mktree"), "no tree object was written after the deadline");
   await rejectsAdapter(() => short.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha }), "delivery_git_deadline_exceeded");
   assert.equal(calls.length, before + spawned, "every later call on the expired handle is refused before spawning");
@@ -309,6 +312,31 @@ await withRepository(async ({ repository, base_sha, candidate_a, candidate_b, re
   delay = 0;
   assert.equal(git(repository, ["show-ref"]), refsBefore, "deadline refusals moved no ref");
   console.log("  PASS: the objects handle deadline refuses further Git calls before they spawn, mid-operation and for the composer");
+
+  // With the real runner, a call already in flight cannot outlive the
+  // deadline either: a status blocked in a slow fsmonitor hook is killed at
+  // what remains of the budget and reported as the deadline, not 5s later.
+  const hook = path.join(directory, "slow-fsmonitor.sh");
+  fs.writeFileSync(hook, "#!/bin/sh\nexec sleep 3 </dev/null >/dev/null 2>&1\n", { mode: 0o755 });
+  const production = createDeliveryGitObjectAdapter({
+    repositories: [{ key: "web", repo: "Owner/Web", working_dir: repository, primary: true }],
+    primary_agent_cwds: {}, repository_worktrees: {},
+    canonicalize_path(request) { return fs.realpathSync(request.path); },
+    run_git: runDeliveryGit,
+    read_delivery_source() { return copy(deliverySource); },
+  });
+  git(repository, ["config", "core.fsmonitor", hook]);
+  try {
+    const bounded = production.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: Date.now() + 300 });
+    const started = Date.now();
+    await rejectsAdapter(() => bounded.readCommit({ version: 1, repository: "owner/web", sha: base_sha }), "delivery_git_deadline_exceeded");
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 300 && elapsed < 1500, `the blocked call was killed at the total bound (${elapsed}ms)`);
+    assert.equal(fs.existsSync(path.join(repository, ".git", "index.lock")), false);
+  } finally { git(repository, ["config", "--unset", "core.fsmonitor"]); }
+  const unblocked = production.repositoryObjectsFor({ version: 1, head_binding: owner, delivery_candidate_ref: ref, deadline: deadline() });
+  assert.equal((await unblocked.readCommit({ version: 1, repository: "owner/web", sha: base_sha })).tree_sha, base.tree_sha);
+  console.log("  PASS: with the injected runner, a Git call already in flight is killed at what remains of the deadline");
 });
 
 // #1065: the reviewed chain the pipeline actually produces.  Candidate B is
