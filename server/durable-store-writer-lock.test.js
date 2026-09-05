@@ -221,6 +221,118 @@ if (process.argv[2] === "--contend") {
   return;
 }
 
+// Reaper mutex: two writers must never be inside their protected actions at once.
+// The reaper's judgement (dev+ino, then the exact record) is verified against
+// the *path*, but the unlink that acts on that judgement is also addressed by
+// path.  Between the last verification and the unlink another writer can
+// legitimately reclaim the same stale lock and take a live one, and the
+// reaper then deletes that live lock and enters its own action behind it.
+//
+// The two blocks below are the two halves of that race, each a real process
+// driving a real store.  Determinism comes from the store's own `fs` seam
+// (durable-store-files.js reads `options.fs`): the reaper parks inside the
+// instrumented `unlinkSync`, after the reaper has re-read the record it
+// judged and before the unlink happens, and only leaves when the replacer has
+// announced that it is inside its own protected action.  Nothing here waits
+// on a clock to hit the window.
+const SECTION_PREFIX = "section-";
+const RENDEZVOUS_DEADLINE_MS = 15_000;
+
+function sleepBriefly() { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); }
+function waitForAny(rendezvous, names) {
+  const deadline = Date.now() + RENDEZVOUS_DEADLINE_MS;
+  for (;;) {
+    for (const name of names) {
+      if (fs.existsSync(path.join(rendezvous, name))) return name;
+    }
+    if (Date.now() >= deadline) return null;
+    sleepBriefly();
+  }
+}
+// One definition of "another writer is inside its protected action right now",
+// used by the race and by the negative control that proves it can see one.
+// The marker is published before the snapshot is taken, so a report of
+// `others` is only ever produced when both markers were on disk together.
+function enterSection(rendezvous, role) {
+  fs.writeFileSync(path.join(rendezvous, `${SECTION_PREFIX}${role}`), String(process.pid), { mode: 0o600, flag: "wx" });
+  const others = fs.readdirSync(rendezvous).filter((name) => name.startsWith(SECTION_PREFIX) && name !== `${SECTION_PREFIX}${role}`);
+  fs.writeSync(1, `SECTION-ENTER ${role} ${JSON.stringify(others)}\n`);
+}
+function exitSection(rendezvous, role) {
+  try { fs.unlinkSync(path.join(rendezvous, `${SECTION_PREFIX}${role}`)); } catch { /* the marker is this process's own */ }
+  fs.writeSync(1, `SECTION-EXIT ${role}\n`);
+}
+
+// Race mode: `reaper` finds the stale lock first and parks at the seam;
+// `replacer` reclaims the same stale lock behind it and takes a live one.
+// Both drive the same real store through the same real code path.
+if (process.argv[2] === "--reap-race") {
+  const role = process.argv[3];
+  const configDirectory = process.argv[4];
+  const rendezvous = process.argv[5];
+  const lockPath = `${headControlAuditStorePath(configDirectory, binding)}.lock`;
+  let reReadJudgedRecord = false;
+  let parked = false;
+  let inSection = false;
+  const racing = Object.create(fs);
+  // The reaper's re-read of the record it judged: a path-addressed read of
+  // the lock by a process that does not hold it.  `readHeldLock` reads
+  // through a descriptor, so this cannot be confused with it.
+  racing.readFileSync = (target, ...rest) => {
+    if (typeof target === "string" && target === lockPath && !inSection) reReadJudgedRecord = true;
+    return fs.readFileSync(target, ...rest);
+  };
+  racing.unlinkSync = (target) => {
+    if (role === "reaper" && target === lockPath && reReadJudgedRecord && !parked && !inSection) {
+      parked = true;
+      fs.writeSync(1, "REAPER-PARKED\n");
+      waitForAny(rendezvous, [`${SECTION_PREFIX}replacer`, "replacer-done"]);
+    }
+    return fs.unlinkSync(target);
+  };
+  // The first temporary file of the atomic replace: the store is past
+  // acquisition and inside the action the lock exists to protect.
+  racing.writeFileSync = (target, ...rest) => {
+    const written = fs.writeFileSync(target, ...rest);
+    if (typeof target === "string" && target.endsWith(".tmp") && !inSection) {
+      inSection = true;
+      enterSection(rendezvous, role);
+      if (role === "replacer") waitForAny(rendezvous, ["reaper-done"]);
+    }
+    return written;
+  };
+  try {
+    createHeadControlAuditStore({ config_dir: configDirectory, fs: racing }).append({ binding, audit: audit(role === "reaper" ? 0 : 1) });
+    fs.writeSync(1, "OK\n");
+  } catch (error) {
+    fs.writeSync(1, `REFUSED ${error && error.code}\n`);
+  } finally {
+    if (inSection) exitSection(rendezvous, role);
+    fs.writeFileSync(path.join(rendezvous, `${role}-done`), "", { mode: 0o600 });
+  }
+  return;
+}
+
+// Negative control: no store and no lock, two processes ordered so that their
+// sections certainly overlap.  It exists so that an empty overlap report from
+// the race above is evidence of exclusion rather than of a blind detector.
+if (process.argv[2] === "--marker-overlap") {
+  const role = process.argv[3];
+  const rendezvous = process.argv[4];
+  if (role === "first") {
+    enterSection(rendezvous, "first");
+    fs.writeFileSync(path.join(rendezvous, "first-armed"), "", { mode: 0o600 });
+    waitForAny(rendezvous, ["second-done"]);
+    exitSection(rendezvous, "first");
+  } else {
+    waitForAny(rendezvous, ["first-armed"]);
+    enterSection(rendezvous, "second");
+    exitSection(rendezvous, "second");
+    fs.writeFileSync(path.join(rendezvous, "second-done"), "", { mode: 0o600 });
+  }
+  return;
+}
+
 function throwsCode(fn, expected) {
   assert.throws(fn, (error) => error && error.code === expected, `expected ${expected}`);
 }
@@ -496,6 +608,104 @@ async function abortLeavesNoHolderBehind(kind) {
   await deadWriterIsRecovered("head-control-audit-store");
 }
 
+
+// Parent half of the reap race.  Racers are tracked exactly like holders, so
+// the one top-level `finally` reaps them; nothing here matches a process by
+// name or consults the process table.
+function rendezvousDirectory() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-reap-race-"));
+  fs.chmodSync(directory, 0o700);
+  fixtures.add(directory);
+  return directory;
+}
+function spawnTracked(args, signal) {
+  const child = spawn(process.execPath, [__filename, ...args], { stdio: ["ignore", "pipe", "inherit"] });
+  let output = "";
+  let announce = null;
+  const announced = new Promise((resolve) => { announce = resolve; });
+  child.stdout.on("data", (chunk) => {
+    output += chunk.toString();
+    if (signal && output.includes(`${signal}\n`)) announce(true);
+  });
+  const exited = new Promise((resolve) => child.on("exit", (code, signalCode) => resolve({ code, signal: signalCode })));
+  const racer = { child, exited, announced, output: () => output };
+  holders.add(racer);
+  return racer;
+}
+function bounded(ms) { return new Promise((resolve) => { setTimeout(resolve, ms).unref(); }); }
+// A single reported entry into a protected action, with whatever other
+// writers were inside theirs at that instant.
+function sectionEntries(source, output) {
+  const entries = [];
+  for (const line of output.split("\n")) {
+    const match = /^SECTION-ENTER (\S+) (\[.*\])$/.exec(line);
+    if (match) entries.push({ source, role: match[1], others: JSON.parse(match[2]) });
+  }
+  return entries;
+}
+function verdict(output) {
+  const lines = output.trim().split("\n").filter((line) => /^(OK|REFUSED .*)$/.test(line));
+  return lines.length === 0 ? "none" : lines[lines.length - 1];
+}
+
+// The detector must be able to see an overlap that is certainly there, or an
+// empty report from the race proves nothing.
+async function overlapDetectorSeesAKnownOverlap() {
+  const rendezvous = rendezvousDirectory();
+  const first = spawnTracked(["--marker-overlap", "first", rendezvous]);
+  const second = spawnTracked(["--marker-overlap", "second", rendezvous]);
+  const outcomes = [await first.exited, await second.exited];
+  assert.deepEqual(outcomes.map((outcome) => outcome.code), [0, 0], `${first.output()}${second.output()}`);
+  const entries = [...sectionEntries("first", first.output()), ...sectionEntries("second", second.output())];
+  assert.equal(entries.length, 2, `both control processes reported an entry: ${JSON.stringify(entries)}`);
+  assert.deepEqual(
+    entries.filter((entry) => entry.others.length > 0),
+    [{ source: "second", role: "second", others: ["section-first"] }],
+    `the overlap detector missed a deliberate overlap: ${JSON.stringify(entries)}`,
+  );
+}
+
+// Reaper mutex: the reaper unlinks by path, not by the identity it verified.  A
+// second writer that legitimately reclaims the same stale lock and takes a
+// live one in that window has its live lock deleted, and both writers then
+// run their protected actions at the same time.
+async function reapRaceNeverOverlapsProtectedActions() {
+  await withDirectory(async (directory) => {
+    const rendezvous = rendezvousDirectory();
+    const statePath = headControlAuditStorePath(directory, binding);
+    const lockPath = `${statePath}.lock`;
+
+    // The stale lock is the store's own: a real writer took it and was
+    // killed inside its window.  Nothing about the record is fabricated.
+    const holder = holdLock("head-control-audit-store", directory);
+    const holderPid = await holder.holding;
+    holder.child.kill("SIGKILL");
+    assert.equal((await holder.exited).signal, "SIGKILL");
+    assert.equal(isDead(holderPid), true, "the stale lock's recorded owner is gone");
+    assert.equal(fs.lstatSync(lockPath).isFile(), true, "the killed writer left its lock on disk");
+
+    const reaper = spawnTracked(["--reap-race", "reaper", directory, rendezvous], "REAPER-PARKED");
+    // The replacer is released once the reaper is parked at the seam.  An
+    // implementation that never reaches that seam releases it by exiting, so
+    // this cannot hang on a future protocol.
+    await Promise.race([reaper.announced, reaper.exited, bounded(RENDEZVOUS_DEADLINE_MS)]);
+    const replacer = spawnTracked(["--reap-race", "replacer", directory, rendezvous]);
+    const outcomes = { reaper: await reaper.exited, replacer: await replacer.exited };
+    const entries = [...sectionEntries("reaper", reaper.output()), ...sectionEntries("replacer", replacer.output())];
+    const context = `reaper=${verdict(reaper.output())}(${JSON.stringify(outcomes.reaper)}) replacer=${verdict(replacer.output())}(${JSON.stringify(outcomes.replacer)}) entries=${JSON.stringify(entries)}`;
+
+    assert.equal(outcomes.reaper.signal, null, `the reaper died on a signal: ${context}`);
+    assert.equal(outcomes.replacer.signal, null, `the replacer died on a signal: ${context}`);
+    // Guards the assertion below against passing because nobody ever wrote.
+    assert.ok(entries.length >= 1, `neither writer reached its protected action, so exclusion was never exercised: ${context}`);
+
+    assert.deepEqual(
+      entries.filter((entry) => entry.others.length > 0), [],
+      `two writers were inside their protected actions at once: ${context}`,
+    );
+  });
+}
+
 async function suite() {
   const failures = [];
   for (const name of Object.keys(STORES)) {
@@ -506,6 +716,10 @@ async function suite() {
   }
   try { await contendersYieldOneWriterAtATime(); }
   catch (error) { failures.push(`contendersYieldOneWriterAtATime: ${error && error.message}`); }
+  for (const check of [overlapDetectorSeesAKnownOverlap, reapRaceNeverOverlapsProtectedActions]) {
+    try { await check(); }
+    catch (error) { failures.push(`${check.name}: ${error && error.message}`); }
+  }
   for (const kind of ABORT_KINDS) {
     try { await abortLeavesNoHolderBehind(kind); }
     catch (error) { failures.push(`abortLeavesNoHolderBehind(${kind}): ${error && error.message}`); }
