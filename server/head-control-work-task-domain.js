@@ -8,9 +8,24 @@
 // #1058: the batch lifecycle closes with `retire_batch`, and the released
 // correction route plus the Head-private propagation-stop read reach their
 // owning review service only through this bound domain.
+// #1069: `abandon_batch_manifest` is the one exit for a manifest that was put
+// but never frozen; it is refused the moment a freeze intent or a pipeline
+// exists and never touches frozen, cut, or retired records.
+// #1071: `retire_batch` is likewise two-phase.  Its intent is durable before
+// the store retirement and names that one transition exactly, and recovery
+// finishes only the transition the intent names.  A missing active pipeline
+// with no such intent is a fact this domain cannot explain, so it fails closed
+// rather than matching a retired record by content.
 
 const crypto = require("node:crypto");
 const path = require("node:path");
+const {
+  FILE_MODE,
+  DIRECTORY_MODE,
+  modeOf,
+  sameFile,
+  createDurableStoreFiles,
+} = require("./durable-store-files");
 const {
   assertBatchManifest,
   freezeBatchManifest,
@@ -24,6 +39,8 @@ const {
 } = require("./work-task-pipeline");
 const {
   WorkTaskPipelineStoreError,
+  workTaskPipelineHoldsActiveAuthority,
+  workTaskPipelineStoreCarriesRetirementMarker,
   createWorkTaskPipelineStore,
 } = require("./work-task-pipeline-store");
 const { projectWorkTaskBatch } = require("./work-task-projection");
@@ -33,8 +50,6 @@ const {
 } = require("./work-task-independent-review-service");
 
 const SCHEMA_VERSION = 1;
-const FILE_MODE = 0o600;
-const DIRECTORY_MODE = 0o700;
 const MAX_PAYLOAD_BYTES = 128 * 1024;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -42,9 +57,23 @@ const IDENTIFIER_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const SHA_RE = /^[a-f0-9]{64}$/;
 const ACTIONS = new Set([
   "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch",
-  "retire_batch", "queue_local_correction", "read_propagation_stop",
+  "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop",
 ]);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop"]);
+const PENDING_ACTIONS = new Set(["freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest"]);
+const FILE_CODES = Object.freeze({
+  options: "invalid_head_control_work_task_domain_options",
+  unreadable: "head_control_work_task_state_unreadable",
+  symlink_rejected: "head_control_work_task_state_symlink_rejected",
+  insecure_permissions: "head_control_work_task_state_insecure_permissions",
+  write_failed: "head_control_work_task_state_write_failed",
+  locked: "head_control_work_task_state_locked",
+  lock_unsafe: "head_control_work_task_state_lock_failed",
+  lock_failed: "head_control_work_task_state_lock_failed",
+  lock_acquire_changed: "head_control_work_task_state_lock_failed",
+  lock_release_changed: "head_control_work_task_state_lock_release_failed",
+  lock_release_failed: "head_control_work_task_state_lock_release_failed",
+});
 
 class HeadControlWorkTaskDomainError extends Error {
   constructor(code, message = code) {
@@ -132,12 +161,6 @@ function sameBinding(left, right) {
 function ownerOf(bindingValue) {
   return { installation_id: bindingValue.installation_id, project_id: bindingValue.project_id };
 }
-function assertFs(fs) {
-  for (const name of ["mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync", "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync"]) {
-    if (!fs || typeof fs[name] !== "function") fail("invalid_head_control_work_task_domain_options", `fs.${name} is required`);
-  }
-  return fs;
-}
 function storageDirectory(configDir) {
   if (typeof configDir !== "string" || !path.isAbsolute(configDir) || configDir.length > 1024 || /[\u0000\r\n]/.test(configDir)) {
     fail("invalid_head_control_work_task_domain_options", "config_dir is invalid");
@@ -147,36 +170,6 @@ function storageDirectory(configDir) {
 function headControlWorkTaskDomainPath(configDir, bindingValue) {
   const owner = binding(bindingValue, "invalid_head_control_work_task_domain_identity");
   return path.join(storageDirectory(configDir), `${owner.installation_id}--${owner.project_id}.json`);
-}
-function modeOf(stats) { return stats.mode & 0o777; }
-function lstatOrNull(fs, target) {
-  try { return fs.lstatSync(target); } catch (error) {
-    if (error && error.code === "ENOENT") return null;
-    fail("head_control_work_task_state_unreadable", "domain state cannot be statted");
-  }
-}
-function sameFile(left, right) {
-  return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) && left.dev === right.dev && left.ino === right.ino;
-}
-function assertDirectory(fs, target, requiredMode) {
-  const stats = lstatOrNull(fs, target);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink()) fail("head_control_work_task_state_symlink_rejected", "domain storage path cannot be a symlink");
-  if (!stats.isDirectory()) fail("head_control_work_task_state_unreadable", "domain storage path is not a directory");
-  if (requiredMode !== undefined && modeOf(stats) !== requiredMode) {
-    fail("head_control_work_task_state_insecure_permissions", "domain storage directory must be mode 0700");
-  }
-  return stats;
-}
-function ensureDirectories(fs, configDir, directory) {
-  if (assertDirectory(fs, configDir, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(configDir, { recursive: true, mode: DIRECTORY_MODE });
-    if (assertDirectory(fs, configDir, DIRECTORY_MODE) === null) fail("head_control_work_task_state_unreadable", "domain config directory cannot be created");
-  }
-  if (assertDirectory(fs, directory, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(directory, { recursive: false, mode: DIRECTORY_MODE });
-    if (assertDirectory(fs, directory, DIRECTORY_MODE) === null) fail("head_control_work_task_state_unreadable", "domain storage directory cannot be created");
-  }
 }
 
 function assertInvocation(value, expectedAction, owner) {
@@ -193,7 +186,8 @@ function assertInvocation(value, expectedAction, owner) {
   if (!nullable) revision(value.expected_revision, "invalid_head_control_work_task_input");
   identifier(value.correlation_id, "invalid_head_control_work_task_input");
   identifier(value.idempotency_key, "invalid_head_control_work_task_input");
-  if (expectedAction === "get_pipeline_status" || expectedAction === "freeze_batch_manifest" || expectedAction === "retire_batch") {
+  if (expectedAction === "get_pipeline_status" || expectedAction === "freeze_batch_manifest" || expectedAction === "retire_batch" ||
+      expectedAction === "abandon_batch_manifest") {
     if (value.payload !== null) fail("invalid_head_control_work_task_input", "action does not accept payload");
   } else if (expectedAction === "put_batch_manifest") {
     exact(value.payload, ["manifest"], "invalid_head_control_work_task_input");
@@ -290,7 +284,46 @@ function statusFor(state, snapshot) {
 
 function pending(value, state, owner, code) {
   if (value === null) return null;
-  if (!plain(value) || (value.action !== "freeze_batch_manifest" && value.action !== "cut_batch")) fail(code, "pending action is invalid");
+  if (!plain(value) || !PENDING_ACTIONS.has(value.action)) {
+    fail(code, "pending action is invalid");
+  }
+  if (value.action === "retire_batch") {
+    exact(value, ["action", "expected_revision", "fingerprint", "manifest_digest", "expected_pipeline_digest", "archived_pipeline_digest", "retirement_event_id"], code);
+    // The intent names the exact transition it is finishing: this revision,
+    // this manifest, the pipeline digest it is retiring, the digest the
+    // retired record will carry once the store has archived it, and its own
+    // deterministic retirement event.  A same-content successor repeats its
+    // predecessor's manifest digest at a later revision, so a digest alone can
+    // never say which batch an interrupted retirement was ending; an intent
+    // that fails this check is corrupt, never resumed.
+    if (state.stage !== "frozen" || revision(value.expected_revision, code) !== state.revision || !SHA_RE.test(value.fingerprint) ||
+        digest(value.manifest_digest, code) !== state.manifest.manifest_digest ||
+        digest(value.expected_pipeline_digest, code) !== state.pipeline_digest ||
+        !SHA_RE.test(value.archived_pipeline_digest) || !IDENTIFIER_RE.test(value.retirement_event_id)) {
+      fail(code, "pending retire precondition is invalid");
+    }
+    return {
+      action: value.action,
+      expected_revision: value.expected_revision,
+      fingerprint: value.fingerprint,
+      manifest_digest: value.manifest_digest,
+      expected_pipeline_digest: value.expected_pipeline_digest,
+      archived_pipeline_digest: value.archived_pipeline_digest,
+      retirement_event_id: value.retirement_event_id,
+    };
+  }
+  if (value.action === "abandon_batch_manifest") {
+    exact(value, ["action", "expected_revision", "fingerprint", "manifest_digest"], code);
+    // The intent names the exact manifest it is clearing by revision and
+    // digest together.  A same-content successor is put at a later revision,
+    // so a digest alone can never say which put an interrupted abandon was
+    // acting on; an intent that fails this check is corrupt, never resumed.
+    if (state.stage !== "manifest" || revision(value.expected_revision, code) !== state.revision || !SHA_RE.test(value.fingerprint) ||
+        digest(value.manifest_digest, code) !== state.manifest.manifest_digest) {
+      fail(code, "pending abandon precondition is invalid");
+    }
+    return { action: value.action, expected_revision: value.expected_revision, fingerprint: value.fingerprint, manifest_digest: value.manifest_digest };
+  }
   if (value.action === "freeze_batch_manifest") {
     exact(value, ["action", "expected_revision", "fingerprint", "frozen_manifest"], code);
     if (state.stage !== "manifest" || revision(value.expected_revision, code) !== state.revision || !SHA_RE.test(value.fingerprint)) fail(code, "pending freeze precondition is invalid");
@@ -383,75 +416,21 @@ function readState(fs, statePath, owner, allowMissing, adoptGeneration = false) 
     fail("corrupt_head_control_work_task_state", "domain state validation failed");
   }
 }
-function temporaryPath(statePath) { return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`; }
-// The lock file body is this writer's proof of ownership. dev+ino alone cannot
-// prove it: Linux reuses an inode number as soon as the old lock is unlinked
-// and closed, so a replacement lock can carry the original's identity.
-function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
-function writeState(fs, statePath, state, owner) {
+function writeState(files, statePath, state, owner) {
   const checked = assertState(state, owner);
-  const temporary = temporaryPath(statePath);
-  let written = false;
-  try {
-    fs.writeFileSync(temporary, `${JSON.stringify(checked)}\n`, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
-    written = true;
-    fs.chmodSync(temporary, FILE_MODE);
-    const descriptor = fs.openSync(temporary, "r");
-    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
-    fs.renameSync(temporary, statePath);
-    written = false;
-    const directoryDescriptor = fs.openSync(path.dirname(statePath), "r");
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
-    const finalStats = fs.lstatSync(statePath);
-    if (finalStats.isSymbolicLink() || !finalStats.isFile() || modeOf(finalStats) !== FILE_MODE) {
-      fail("head_control_work_task_state_write_failed", "domain state write did not produce a secure file");
-    }
-  } catch (error) {
-    if (written) { try { fs.unlinkSync(temporary); } catch { /* own temporary only */ } }
-    if (error instanceof HeadControlWorkTaskDomainError) throw error;
-    fail("head_control_work_task_state_write_failed", "domain state cannot be atomically written");
-  }
-}
-function lockStats(fs, target) {
-  const stats = lstatOrNull(fs, target);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== FILE_MODE) fail("head_control_work_task_state_lock_failed", "domain state lock is unsafe");
-  return stats;
-}
-function withWriterLock(fs, statePath, action) {
-  const lockPath = `${statePath}.lock`;
-  const token = lockToken();
-  let descriptor, own;
-  try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); }
-  catch (error) {
-    if (error && error.code === "EEXIST") { lockStats(fs, lockPath); fail("head_control_work_task_state_locked", "domain state has an active or stale lock"); }
-    fail("head_control_work_task_state_lock_failed", "domain state lock cannot be acquired");
-  }
-  try {
-    fs.writeFileSync(descriptor, token, "utf8"); fs.chmodSync(lockPath, FILE_MODE); fs.fsyncSync(descriptor); own = fs.fstatSync(descriptor);
-    if (!sameFile(own, lockStats(fs, lockPath))) fail("head_control_work_task_state_lock_failed", "domain state lock changed during acquisition");
-    return action();
-  } catch (error) {
-    throw error;
-  } finally {
-    let releaseError = null;
-    try { fs.closeSync(descriptor); } catch { releaseError = new HeadControlWorkTaskDomainError("head_control_work_task_state_lock_release_failed"); }
-    try {
-      if (!sameFile(own, lockStats(fs, lockPath)) || fs.readFileSync(lockPath, "utf8") !== token) fail("head_control_work_task_state_lock_release_failed", "domain state lock changed before release");
-      fs.unlinkSync(lockPath);
-    } catch (error) { releaseError = error instanceof HeadControlWorkTaskDomainError ? error : new HeadControlWorkTaskDomainError("head_control_work_task_state_lock_release_failed"); }
-    if (releaseError) throw releaseError;
-  }
+  files.writeFileAtomically(statePath, `${JSON.stringify(checked)}\n`);
 }
 
 function createHeadControlWorkTaskDomain(options) {
   exact(options, ["binding", "config_dir", "fs", "resolve_registered_identity", "now"], "invalid_head_control_work_task_domain_options");
   const owner = binding(options.binding, "invalid_head_control_work_task_domain_options");
-  const fs = assertFs(options.fs);
+  const files = createDurableStoreFiles({ fs: options.fs, error: HeadControlWorkTaskDomainError, codes: FILE_CODES });
+  const fs = files.fs;
   if (typeof options.resolve_registered_identity !== "function" || typeof options.now !== "function") {
     fail("invalid_head_control_work_task_domain_options", "registered identity and clock accessors are required");
   }
   const directory = storageDirectory(options.config_dir);
+  const directories = [{ path: options.config_dir, mode: DIRECTORY_MODE }, { path: directory, mode: DIRECTORY_MODE }];
   const statePath = headControlWorkTaskDomainPath(options.config_dir, owner);
   const pipelineStore = createWorkTaskPipelineStore({ config_dir: options.config_dir, fs });
   const reviewService = createWorkTaskIndependentReviewService({ config_dir: options.config_dir, fs });
@@ -472,17 +451,82 @@ function createHeadControlWorkTaskDomain(options) {
     }
     return pipelineSnapshot(stored, owner, manifest);
   }
+  // The deterministic name of one retirement.  The same invocation at the same
+  // revision always produces the same event, so an intent can be replayed
+  // against the store without inventing a second archive event for the same
+  // batch.  The revision is part of that name: a same-content successor is
+  // retired at a strictly later revision, and without it an identical
+  // invocation would name its predecessor's retirement as well as its own.
+  function retirementEventId(input, revisionValue) {
+    return `hretire_${hash({ binding: owner, revision: revisionValue, correlation_id: input.correlation_id, idempotency_key: input.idempotency_key }).slice(0, 64)}`;
+  }
+  // The digest the retired record will carry.  The store archives under its own
+  // CAS before it renames the record away, so pinning the post-archive digest
+  // in the intent names that record exactly, the way a cut intent pins its next
+  // pipeline digest.  An already-archived pipeline — a project archive can
+  // archive a frozen batch the Head then retires — is renamed untouched, so its
+  // retired digest is the one it already has.
+  function archivedPipelineDigest(pipeline, eventId) {
+    if (pipeline.archived) return pipeline.pipeline_digest;
+    try {
+      return applyWorkTaskPipelinePlan(pipeline, planWorkTaskPipelineEvent(pipeline, {
+        version: 1, kind: "set_archived", event_id: eventId, archived: true,
+      })).pipeline_digest;
+    } catch { fail("head_control_work_task_pipeline_stale", "the frozen pipeline cannot take its archive transition"); }
+  }
   // A retirement is durable in the store before this domain records it.  A
-  // frozen state whose active store is gone is therefore proven retired only
-  // by an archived retired record of that exact manifest, never assumed.
-  function retiredHolds(state) {
+  // frozen state whose active store is gone is proven retired only by the one
+  // retired record the pending intent pinned, and that proof needs BOTH halves.
+  //
+  // The pinned pipeline digest is not sufficient on its own.  It covers the
+  // whole pipeline payload, history included, so it does name one record
+  // whenever this retirement is what archived the batch — its revision-bound
+  // event is in that history.  But a batch already archived by the project
+  // archive takes no archive event from the retirement at all, and that
+  // transition derives its event from owner and manifest digest alone, with no
+  // revision: two same-content batches archived that way are byte-identical,
+  // digest included.  The store therefore writes this retirement's own marker
+  // into `terminal_audit` before it renames, and both are required here.
+  function retiredRecordHolds(intent) {
     let retired;
     try { retired = pipelineStore.readRetiredSnapshots(ownerOf(owner)); }
     catch (error) {
       if (error instanceof WorkTaskPipelineStoreError) return false;
       throw error;
     }
-    return retired.some((entry) => entry.manifest.manifest_digest === state.manifest.manifest_digest && entry.pipeline.archived);
+    return retired.some((entry) => entry.pipeline.pipeline_digest === intent.archived_pipeline_digest &&
+      workTaskPipelineStoreCarriesRetirementMarker(entry, intent.retirement_event_id, intent.archived_pipeline_digest));
+  }
+  function retirePipeline(manifestDigest, pipelineDigest, eventId) {
+    try {
+      pipelineStore.retire({
+        expected: {
+          installation_id: owner.installation_id,
+          project_id: owner.project_id,
+          manifest_digest: manifestDigest,
+          pipeline_digest: pipelineDigest,
+        },
+        event_id: eventId,
+      });
+    } catch (error) {
+      if (error instanceof WorkTaskPipelineStoreError) {
+        fail(error.code === "work_task_pipeline_store_batch_active" ? "head_control_work_task_batch_active" : "head_control_work_task_pipeline_unavailable",
+          "batch retirement was rejected");
+      }
+      throw error;
+    }
+  }
+  // An active pipeline is build, review, and candidate authority.  A manifest
+  // may be abandoned only while none exists for this project; the retired
+  // records beside it are never consulted or touched.
+  function assertNoPipelineAuthority() {
+    try { pipelineStore.readRecoverySnapshot(ownerOf(owner)); }
+    catch (error) {
+      if (error instanceof WorkTaskPipelineStoreError && error.code === "work_task_pipeline_store_missing") return;
+      if (error instanceof WorkTaskPipelineStoreError) fail("head_control_work_task_pipeline_unavailable", "pipeline store cannot be checked before abandonment");
+      throw error;
+    }
+    fail("head_control_work_task_batch_active", "a pipeline already holds authority over this project");
   }
   function ownedTaskRef(value, code) {
     if (!plain(value) || value.installation_id !== owner.installation_id || value.project_id !== owner.project_id) {
@@ -537,7 +581,7 @@ function createHeadControlWorkTaskDomain(options) {
     next.manifest = clone(pipeline.manifest);
     next.pipeline_digest = pipeline.pipeline.pipeline_digest;
     next.pending = null;
-    writeState(fs, statePath, next, owner);
+    writeState(files, statePath, next, owner);
     return snapshot(next, owner);
   }
   // A pending intent was atomically committed before its second durable write.
@@ -547,10 +591,45 @@ function createHeadControlWorkTaskDomain(options) {
     // Before explicit initialization there may not even be a parent directory
     // in which a writer lock could safely exist.  Report missing state rather
     // than manufacturing a lock path or treating it as a blank controller.
-    if (lstatOrNull(fs, statePath) === null) currentState();
-    return withWriterLock(fs, statePath, () => {
+    if (files.lstatOrNull(statePath) === null) currentState();
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       if (state.pending === null) return snapshot(state, owner);
+      if (state.pending.action === "abandon_batch_manifest") {
+        // `assertState` already proved the intent names this exact revision
+        // and manifest digest; only the absence of pipeline authority can
+        // still have changed since the intent was written.
+        assertNoPipelineAuthority();
+        const abandoned = emptyState(state.revision + 1);
+        writeState(files, statePath, abandoned, owner);
+        return snapshot(abandoned, owner);
+      }
+      if (state.pending.action === "retire_batch") {
+        // `assertState` already proved the intent names this exact revision,
+        // manifest, and pre-retirement pipeline digest.  Only the store side of
+        // that one transition can still be unfinished.
+        const intent = state.pending;
+        let stored = null;
+        try { stored = readPipeline(state.manifest); }
+        catch (error) {
+          if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_missing") throw error;
+        }
+        if (stored !== null) {
+          // The active record survived: either the store retirement never ran,
+          // or it archived under CAS and had not yet renamed the record away.
+          // Any other pipeline is a different batch's, never retired from here.
+          const current = stored.pipeline.pipeline_digest;
+          if (current !== intent.expected_pipeline_digest && !(stored.pipeline.archived && current === intent.archived_pipeline_digest)) {
+            fail("head_control_work_task_pipeline_stale", "retirement recovery found a changed or foreign pipeline");
+          }
+          retirePipeline(intent.manifest_digest, current, intent.retirement_event_id);
+        } else if (!retiredRecordHolds(intent)) {
+          fail("head_control_work_task_pipeline_missing", "the retirement named by the pending intent is absent from the pipeline store");
+        }
+        const retired = emptyState(state.revision + 1);
+        writeState(files, statePath, retired, owner);
+        return snapshot(retired, owner);
+      }
       if (state.pending.action === "freeze_batch_manifest") {
         assertCurrentManifest(state.manifest, options.resolve_registered_identity);
         const frozenManifest = state.pending.frozen_manifest;
@@ -588,23 +667,20 @@ function createHeadControlWorkTaskDomain(options) {
     });
   }
   function synchronizeFrozen() {
-    return withWriterLock(fs, statePath, () => {
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       if (state.pending !== null) fail("head_control_work_task_pending_recovery_required", "pending domain write was not recovered");
       if (state.stage !== "frozen") return { state: snapshot(state, owner), pipeline: null };
-      let stored;
-      try { stored = readPipeline(state.manifest); }
-      catch (error) {
-        if (!(error instanceof HeadControlWorkTaskDomainError) || error.code !== "head_control_work_task_pipeline_missing" || !retiredHolds(state)) throw error;
-        const retired = emptyState(state.revision + 1);
-        writeState(fs, statePath, retired, owner);
-        return { state: snapshot(retired, owner), pipeline: null };
-      }
+      // A frozen batch whose active pipeline is gone is never healed from
+      // retired content: only the pending intent above names a retirement, and
+      // it was already recovered.  Without one this is an unexplained loss, so
+      // the missing pipeline is reported rather than emptied.
+      const stored = readPipeline(state.manifest);
       if (stored.pipeline.pipeline_digest === state.pipeline_digest) return { state: snapshot(state, owner), pipeline: stored };
       const next = clone(state);
       next.revision += 1;
       next.pipeline_digest = stored.pipeline.pipeline_digest;
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
       return { state: snapshot(next, owner), pipeline: stored };
     });
   }
@@ -618,8 +694,8 @@ function createHeadControlWorkTaskDomain(options) {
     if (state.stage !== allowedStage) fail("head_control_work_task_invalid_transition", "domain action is not valid in this state");
   }
   function initialize() {
-    ensureDirectories(fs, options.config_dir, directory);
-    return withWriterLock(fs, statePath, () => {
+    files.ensureDirectories(directories);
+    return files.withWriterLock(statePath, () => {
       const existing = readState(fs, statePath, owner, true, true);
       if (existing !== null) {
         if (existing.binding.generation === owner.generation) return snapshot(existing, owner);
@@ -627,7 +703,7 @@ function createHeadControlWorkTaskDomain(options) {
         // the new Head generation here, as one explicit recorded transition,
         // instead of leaving the file permanently unreadable.
         const rebound = { ...existing, binding: clone(owner) };
-        writeState(fs, statePath, rebound, owner);
+        writeState(files, statePath, rebound, owner);
         return snapshot(rebound, owner);
       }
       // `readPipeline` requires a real manifest; probe the underlying durable
@@ -642,7 +718,7 @@ function createHeadControlWorkTaskDomain(options) {
         }
       }
       const state = emptyState();
-      writeState(fs, statePath, state, owner);
+      writeState(files, statePath, state, owner);
       return snapshot(state, owner);
     });
   }
@@ -676,7 +752,7 @@ function createHeadControlWorkTaskDomain(options) {
   function put_batch_manifest(command) {
     const input = assertInvocation(command, "put_batch_manifest", owner);
     prepared();
-    return withWriterLock(fs, statePath, () => {
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "empty");
       const manifest = exactManifest(input.payload.manifest, owner, "head_control_work_task_manifest_invalid");
@@ -686,14 +762,14 @@ function createHeadControlWorkTaskDomain(options) {
       next.revision += 1;
       next.stage = "manifest";
       next.manifest = manifest;
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
       return statusFor(next, null);
     });
   }
   function freeze_batch_manifest(command) {
     const input = assertInvocation(command, "freeze_batch_manifest", owner);
     prepared();
-    withWriterLock(fs, statePath, () => {
+    files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "manifest");
       assertCurrentManifest(state.manifest, options.resolve_registered_identity);
@@ -709,7 +785,7 @@ function createHeadControlWorkTaskDomain(options) {
         fingerprint: invocationFingerprint(input),
         frozen_manifest: clone(frozenManifest),
       };
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
     });
     const state = recoverPending();
     const pipeline = readPipeline(state.manifest);
@@ -721,7 +797,7 @@ function createHeadControlWorkTaskDomain(options) {
     if (current.state.stage !== "frozen" || current.pipeline === null || current.pipeline.pipeline.archived) {
       fail("head_control_work_task_archived", "cut is unavailable for archived or non-frozen state");
     }
-    withWriterLock(fs, statePath, () => {
+    files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "frozen");
       assertCurrentManifest(state.manifest, options.resolve_registered_identity);
@@ -754,7 +830,7 @@ function createHeadControlWorkTaskDomain(options) {
         expected_pipeline_digest: stored.pipeline.pipeline_digest,
         next_pipeline_digest: nextPipeline.pipeline_digest,
       };
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
     });
     const state = recoverPending();
     const pipeline = readPipeline(state.manifest);
@@ -762,37 +838,64 @@ function createHeadControlWorkTaskDomain(options) {
   }
   // Retirement ends one frozen batch: the store archives and renames the
   // record under CAS, then this domain returns to `empty` at the next revision
-  // so a successor manifest can be put.  A crash between those two writes is
-  // healed by `synchronizeFrozen` from the retired record itself.
+  // so a successor manifest can be put.  The intent is durable before either
+  // store write and names that exact transition, so a crash anywhere between
+  // them is finished by `recoverPending` — and only ever that transition.
   function retire_batch(command) {
     const input = assertInvocation(command, "retire_batch", owner);
     prepared();
-    return withWriterLock(fs, statePath, () => {
+    files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "frozen");
       const stored = readPipeline(state.manifest);
       if (stored.pipeline.pipeline_digest !== state.pipeline_digest) fail("head_control_work_task_pipeline_stale", "pipeline changed before retirement");
-      try {
-        pipelineStore.retire({
-          expected: {
-            installation_id: owner.installation_id,
-            project_id: owner.project_id,
-            manifest_digest: state.manifest.manifest_digest,
-            pipeline_digest: state.pipeline_digest,
-          },
-          event_id: `hretire_${hash({ binding: owner, correlation_id: input.correlation_id, idempotency_key: input.idempotency_key }).slice(0, 64)}`,
-        });
-      } catch (error) {
-        if (error instanceof WorkTaskPipelineStoreError) {
-          fail(error.code === "work_task_pipeline_store_batch_active" ? "head_control_work_task_batch_active" : "head_control_work_task_pipeline_unavailable",
-            "batch retirement was rejected");
-        }
-        throw error;
+      // The store refuses a batch that still holds build or review authority.
+      // Reach that verdict before the intent is durable: an intent whose
+      // recovery could never finish would wedge every later domain read.
+      if (workTaskPipelineHoldsActiveAuthority(stored.pipeline)) {
+        fail("head_control_work_task_batch_active", "batch retains active build or review authority");
       }
-      const next = emptyState(state.revision + 1);
-      writeState(fs, statePath, next, owner);
-      return statusFor(next, null);
+      const eventId = retirementEventId(input, state.revision);
+      const next = clone(state);
+      next.pending = {
+        action: "retire_batch",
+        expected_revision: state.revision,
+        fingerprint: invocationFingerprint(input),
+        manifest_digest: state.manifest.manifest_digest,
+        expected_pipeline_digest: state.pipeline_digest,
+        archived_pipeline_digest: archivedPipelineDigest(stored.pipeline, eventId),
+        retirement_event_id: eventId,
+      };
+      writeState(files, statePath, next, owner);
     });
+    return statusFor(recoverPending(), null);
+  }
+  // Abandonment ends one never-frozen manifest: Head walks away from a
+  // manifest it decided against so a successor can be put.  The intent is
+  // durable before the empty write and names the manifest by revision and
+  // digest; it is refused once a freeze has begun (a pending freeze is
+  // recovered first and leaves `frozen`) or a pipeline exists, and it never
+  // reaches the pipeline store, so frozen, cut, and retired records stay put.
+  function abandon_batch_manifest(command) {
+    const input = assertInvocation(command, "abandon_batch_manifest", owner);
+    prepared();
+    files.withWriterLock(statePath, () => {
+      const state = currentState();
+      assertMutationState(state, input, "manifest");
+      assertNoPipelineAuthority();
+      const next = clone(state);
+      next.pending = {
+        action: "abandon_batch_manifest",
+        expected_revision: state.revision,
+        fingerprint: invocationFingerprint(input),
+        manifest_digest: state.manifest.manifest_digest,
+      };
+      writeState(files, statePath, next, owner);
+    });
+    // Whatever the recovery found is reported exactly, including a successor
+    // a competing writer froze meanwhile; the plane rejects anything but empty.
+    const state = recoverPending();
+    return statusFor(state, state.stage === "frozen" ? readPipeline(state.manifest) : null);
   }
   // A released change-requested round returns its exact candidate to Dev.  The
   // review service owns the round/pipeline transition; this domain binds the
@@ -800,7 +903,7 @@ function createHeadControlWorkTaskDomain(options) {
   function queue_local_correction(command) {
     const input = assertInvocation(command, "queue_local_correction", owner);
     prepared();
-    return withWriterLock(fs, statePath, () => {
+    return files.withWriterLock(statePath, () => {
       const state = currentState();
       assertMutationState(state, input, "frozen");
       assertCurrentManifest(state.manifest, options.resolve_registered_identity);
@@ -819,7 +922,7 @@ function createHeadControlWorkTaskDomain(options) {
       const next = clone(state);
       next.revision += 1;
       next.pipeline_digest = applied.pipeline.pipeline_digest;
-      writeState(fs, statePath, next, owner);
+      writeState(files, statePath, next, owner);
       return freeze({
         status: statusFor(next, applied),
         detail: { outcome: queued.outcome, work_task_ref: clone(queued.work_task_ref), candidate_digest: queued.candidate_digest, checkpoint_id: queued.checkpoint_id },
@@ -845,7 +948,7 @@ function createHeadControlWorkTaskDomain(options) {
   // `initialize` is deliberately non-enumerable.  The existing plane exacts
   // its domain object to these fixed callbacks, while runtime startup still
   // has an explicit durable bootstrap with no extra control action.
-  const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch, retire_batch, queue_local_correction, read_propagation_stop };
+  const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch, retire_batch, abandon_batch_manifest, queue_local_correction, read_propagation_stop };
   Object.defineProperty(domain, "initialize", { value: initialize, enumerable: false });
   Object.defineProperty(domain, "project_current_batch", { value: project_current_batch, enumerable: false });
   return freeze(domain);

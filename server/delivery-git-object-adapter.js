@@ -6,11 +6,18 @@
 // composition is confined to unattached tree objects made with `git mktree`.
 // In particular, this adapter never checks out, stages, resets, commits,
 // moves a ref, pushes, or creates/removes a worktree.
+//
+// #1066: every Git observation is awaited, one call at a time, so the server
+// loop keeps serving while a candidate composes.  Each objects handle carries
+// one composition deadline: a call is refused once it has passed, and every
+// call runs under the smaller of the per-call bound and what remains of it,
+// so the total bound holds even for a call already in flight.
 
 const crypto = require("node:crypto");
 const path = require("node:path");
-const { assertDeliveryCandidateRef } = require("./delivery-candidate");
+const { assertDeliveryCandidateRef, expectedCandidateBase } = require("./delivery-candidate");
 const { workTaskKey } = require("./work-task-manifest");
+const { compareGitTreeRecords } = require("./git-tree-order");
 const {
   buildRepositoryWorktreePlan,
   canonicalRepositoryFromRemote,
@@ -28,6 +35,7 @@ const PATCH_FORMAT = "git_full_index_binary_v1";
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_TREE_ENTRIES = 16384;
 const MAX_PATCH_FILES = 1024;
+const PER_CALL_TIMEOUT_MS = 5000;
 
 class DeliveryGitObjectAdapterError extends Error {
   constructor(code, message = code) {
@@ -242,27 +250,38 @@ function createDeliveryGitObjectAdapter(options) {
     base_path: canonicalPath(options.canonicalize_path, entry.working_dir, "invalid_delivery_git_object_adapter_options"),
   })]));
 
-  function run(repositoryRecord, args, input = null) {
+  async function run(repositoryRecord, args, input = null) {
+    let timeout_ms = PER_CALL_TIMEOUT_MS;
+    if (repositoryRecord.deadline !== undefined) {
+      const remaining = repositoryRecord.deadline - Date.now();
+      if (remaining <= 0) fail("delivery_git_deadline_exceeded", "Delivery Candidate composition deadline passed");
+      timeout_ms = Math.min(PER_CALL_TIMEOUT_MS, remaining);
+    }
     let observed;
     try {
-      observed = options.run_git(freeze({
+      observed = await options.run_git(freeze({
         version: VERSION,
         cwd: repositoryRecord.base_path,
         args: freeze([...args]),
+        timeout_ms,
         ...(input === null ? {} : { input }),
       }));
     } catch {
       fail("delivery_git_unavailable", "Git object observation failed");
     }
-    return gitResult(observed, "delivery_git_observation_invalid");
+    const result = gitResult(observed, "delivery_git_observation_invalid");
+    if (!result.ok && repositoryRecord.deadline !== undefined && Date.now() >= repositoryRecord.deadline) {
+      fail("delivery_git_deadline_exceeded", "Delivery Candidate composition deadline passed during a Git call");
+    }
+    return result;
   }
-  function command(repositoryRecord, args, code, input = null) {
-    const observed = run(repositoryRecord, args, input);
+  async function command(repositoryRecord, args, code, input = null) {
+    const observed = await run(repositoryRecord, args, input);
     if (!observed.ok) fail(code, "registered Git object operation failed");
     return observed.output.trim();
   }
-  function rawCommand(repositoryRecord, args, code) {
-    const observed = run(repositoryRecord, args);
+  async function rawCommand(repositoryRecord, args, code) {
+    const observed = await run(repositoryRecord, args);
     if (!observed.ok) fail(code, "registered Git object operation failed");
     return observed.output;
   }
@@ -271,33 +290,33 @@ function createDeliveryGitObjectAdapter(options) {
     if (!record) fail(code, "repository is not registered");
     return record;
   }
-  function assertCurrentClone(record, ref, code) {
+  async function assertCurrentClone(record, ref, code) {
     const topLevel = canonicalPath(options.canonicalize_path,
-      command(record, ["rev-parse", "--show-toplevel"], `${code}_top_level_unavailable`), `${code}_top_level_invalid`);
+      await command(record, ["rev-parse", "--show-toplevel"], `${code}_top_level_unavailable`), `${code}_top_level_invalid`);
     if (topLevel !== record.base_path) fail(`${code}_top_level_mismatch`, "registered base path is not its Git worktree");
-    const origin = canonicalRepositoryFromRemote(command(record, ["remote", "get-url", "origin"], `${code}_origin_unavailable`));
+    const origin = canonicalRepositoryFromRemote(await command(record, ["remote", "get-url", "origin"], `${code}_origin_unavailable`));
     if (origin !== record.repository) fail(`${code}_origin_mismatch`, "registered base origin changed");
-    if (command(record, ["status", "--porcelain", "--untracked-files=all"], `${code}_status_unavailable`) !== "") {
+    if (await command(record, ["status", "--porcelain", "--untracked-files=all"], `${code}_status_unavailable`) !== "") {
       fail(`${code}_dirty`, "registered base clone has uncommitted changes");
     }
-    const head = command(record, ["rev-parse", "--verify", "HEAD"], `${code}_head_unavailable`);
+    const head = await command(record, ["rev-parse", "--verify", "HEAD"], `${code}_head_unavailable`);
     if (!SHA_RE.test(head)) fail(`${code}_head_invalid`, "registered base HEAD is invalid");
     if (ref !== null && head !== ref.result_sha) fail(`${code}_result_changed`, "registered base HEAD changed from Delivery Candidate result");
     return head;
   }
-  function readCommit(record, expectedRepository, value, code) {
+  async function readCommit(record, expectedRepository, value, code) {
     const objectId = sha(value, code);
-    const commitId = command(record, ["rev-parse", "--verify", `${objectId}^{commit}`], code);
+    const commitId = await command(record, ["rev-parse", "--verify", `${objectId}^{commit}`], code);
     if (commitId !== objectId) fail(code, "commit object identity is not exact");
-    const treeSha = command(record, ["show", "-s", "--format=%T", objectId], code);
+    const treeSha = await command(record, ["show", "-s", "--format=%T", objectId], code);
     if (!SHA_RE.test(treeSha)) fail(code, "commit tree identity is invalid");
     return freeze({ version: VERSION, repository: expectedRepository, sha: objectId, tree_sha: treeSha });
   }
-  function readTree(record, expectedRepository, value, code) {
+  async function readTree(record, expectedRepository, value, code) {
     const treeSha = sha(value, code);
-    const verified = command(record, ["rev-parse", "--verify", `${treeSha}^{tree}`], code);
+    const verified = await command(record, ["rev-parse", "--verify", `${treeSha}^{tree}`], code);
     if (verified !== treeSha) fail(code, "tree object identity is not exact");
-    const raw = rawCommand(record, ["ls-tree", "-r", "-z", "--full-tree", treeSha], code);
+    const raw = await rawCommand(record, ["ls-tree", "-r", "-z", "--full-tree", treeSha], code);
     const records = raw === "" ? [] : raw.split("\0").slice(0, -1);
     if (records.length > MAX_TREE_ENTRIES || (raw !== "" && !raw.endsWith("\0"))) fail(code, "tree output is invalid");
     const entries = records.map((line) => {
@@ -329,26 +348,30 @@ function createDeliveryGitObjectAdapter(options) {
       if (!plain(stage) || !plain(stage.candidate)) fail(code, "staged candidate is invalid");
       return taskKey(stage.candidate.work_task_ref, code);
     }));
-    const paths = deliverySource.frozen_batch_manifest.tasks
+    // A dependent may declare its predecessor's path again; the cut boundary
+    // is the declared path set, exactly as the manifest evidence pins it.
+    const paths = [...new Set(deliverySource.frozen_batch_manifest.tasks
       .filter((entry) => plain(entry) && keys.has(taskKey(entry.ref, code)))
-      .flatMap((entry) => Array.isArray(entry.contract?.file_boundary) ? entry.contract.file_boundary : [])
+      .flatMap((entry) => Array.isArray(entry.contract?.file_boundary) ? entry.contract.file_boundary : []))]
       .sort();
-    if (paths.length === 0 || new Set(paths).size !== paths.length || !paths.every((entry) => PATH_RE.test(entry))) {
+    if (paths.length === 0 || !paths.every((entry) => PATH_RE.test(entry))) {
       fail(code, "frozen delivery boundary is invalid");
     }
     return paths;
   }
-  function createObjects(owner, ref) {
-    const record = registered(ref, "delivery_git_repository_unregistered");
+  function createObjects(owner, ref, deadline) {
+    const registeredRecord = registered(ref, "delivery_git_repository_unregistered");
     if (owner.installation_id !== ref.installation_id || owner.project_id !== ref.project_id) {
       fail("delivery_git_candidate_owner_mismatch", "Delivery Candidate is outside this Head project");
     }
-    const requireCurrent = (code) => {
-      assertCurrentClone(record, ref, code);
+    // Every Git call of this handle runs under the one composition deadline.
+    const record = freeze({ ...registeredRecord, deadline });
+    const requireCurrent = async (code) => {
+      await assertCurrentClone(record, ref, code);
       return record;
     };
     const sourceForCandidate = (request, code) => sourceStage(freshSource(owner, ref, code), ref, request, code);
-    function writeTreeFromEntries(current, entries, code) {
+    async function writeTreeFromEntries(current, entries, code) {
       const root = { files: [], directories: new Map() };
       for (const entry of entries) {
         const segments = entry.path.split("/");
@@ -359,16 +382,16 @@ function createDeliveryGitObjectAdapter(options) {
         }
         cursor.files.push({ name: segments.at(-1), entry });
       }
-      function writeNode(node) {
+      async function writeNode(node) {
         const records = [];
         for (const file of node.files) records.push({ name: file.name, mode: file.entry.mode, type: "blob", sha: file.entry.blob_sha });
-        for (const [name, child] of node.directories) records.push({ name, mode: "040000", type: "tree", sha: writeNode(child) });
-        records.sort((left, right) => left.name.localeCompare(right.name));
+        for (const [name, child] of node.directories) records.push({ name, mode: "040000", type: "tree", sha: await writeNode(child) });
+        records.sort(compareGitTreeRecords);
         if (records.length === 0 || new Set(records.map((entry) => entry.name)).size !== records.length) {
           fail(code, "composed tree hierarchy is invalid");
         }
         const objectInput = records.map((entry) => `${entry.mode} ${entry.type} ${entry.sha}\t${entry.name}\n`).join("");
-        const treeSha = command(current, ["mktree"], code, objectInput);
+        const treeSha = await command(current, ["mktree"], code, objectInput);
         if (!SHA_RE.test(treeSha)) fail(code, "Git did not return a tree object");
         return treeSha;
       }
@@ -378,23 +401,23 @@ function createDeliveryGitObjectAdapter(options) {
       exact(request, fields, code);
       if (request.version !== VERSION || repository(request.repository, code) !== record.repository) fail(code, "repository request is not registered");
     }
-    function objectPatch(scope, request, code) {
-      const current = requireCurrent(code);
+    async function objectPatch(scope, request, code) {
+      const current = await requireCurrent(code);
       const resultSha = scope === "candidate" ? request.candidate_sha : request.result_sha;
-      const baseCommit = readCommit(current, record.repository, request.base_sha, code);
-      const resultCommit = readCommit(current, record.repository, resultSha, code);
-      const baseTree = readTree(current, record.repository, baseCommit.tree_sha, code);
-      const resultTree = readTree(current, record.repository, resultCommit.tree_sha, code);
+      const baseCommit = await readCommit(current, record.repository, request.base_sha, code);
+      const resultCommit = await readCommit(current, record.repository, resultSha, code);
+      const baseTree = await readTree(current, record.repository, baseCommit.tree_sha, code);
+      const resultTree = await readTree(current, record.repository, resultCommit.tree_sha, code);
       return patchFromTrees(scope, request.base_sha, resultSha, baseTree, resultTree, request.source_worktree_path);
     }
     return freeze({
-      readCommit(request) {
+      async readCommit(request) {
         assertRepositoryRequest(request, ["version", "repository", "sha"], "delivery_git_commit_request_invalid");
-        return readCommit(requireCurrent("delivery_git_commit"), record.repository, request.sha, "delivery_git_commit_invalid");
+        return readCommit(await requireCurrent("delivery_git_commit"), record.repository, request.sha, "delivery_git_commit_invalid");
       },
-      readTree(request) {
+      async readTree(request) {
         assertRepositoryRequest(request, ["version", "repository", "tree_sha"], "delivery_git_tree_request_invalid");
-        return readTree(requireCurrent("delivery_git_tree"), record.repository, request.tree_sha, "delivery_git_tree_invalid");
+        return readTree(await requireCurrent("delivery_git_tree"), record.repository, request.tree_sha, "delivery_git_tree_invalid");
       },
       readReviewedTask(request) {
         assertRepositoryRequest(request, ["version", "repository", "delivery_candidate_ref", "delivery_manifest_digest", "sequence", "work_task_ref", "candidate_digest"], "delivery_git_reviewed_task_request_invalid");
@@ -413,11 +436,11 @@ function createDeliveryGitObjectAdapter(options) {
           source_worktree_path: stage.candidate.managed_worktree.canonical_path,
         });
       },
-      readCandidatePatch(request) {
+      async readCandidatePatch(request) {
         assertRepositoryRequest(request, ["version", "repository", "delivery_candidate_ref", "delivery_manifest_digest", "sequence", "work_task_ref", "candidate_digest", "base_sha", "candidate_sha", "base_tree_sha", "candidate_tree_sha", "source_worktree_path"], "delivery_git_candidate_patch_request_invalid");
         const requestedRef = candidateRef(request.delivery_candidate_ref, "delivery_git_candidate_patch_request_invalid");
         if (!same(requestedRef, ref) || !SHA_RE.test(request.delivery_manifest_digest) || !Number.isSafeInteger(request.sequence) || request.sequence < 1 ||
-            !SHA_RE.test(request.candidate_digest) || request.base_sha !== ref.base_sha || !SHA_RE.test(request.candidate_sha) ||
+            !SHA_RE.test(request.candidate_digest) || !SHA_RE.test(request.base_sha) || !SHA_RE.test(request.candidate_sha) ||
             !SHA_RE.test(request.base_tree_sha) || !SHA_RE.test(request.candidate_tree_sha) || typeof request.source_worktree_path !== "string") {
           fail("delivery_git_candidate_patch_request_invalid", "candidate patch request is invalid");
         }
@@ -425,26 +448,26 @@ function createDeliveryGitObjectAdapter(options) {
         if (stage.candidate.managed_worktree.canonical_path !== request.source_worktree_path) {
           fail("delivery_git_candidate_patch_stale", "candidate worktree provenance changed");
         }
-        const patch = objectPatch("candidate", request, "delivery_git_candidate_patch");
+        const patch = await objectPatch("candidate", request, "delivery_git_candidate_patch");
         if (patch.base_tree_sha !== request.base_tree_sha || patch.result_tree_sha !== request.candidate_tree_sha) {
           fail("delivery_git_candidate_patch_stale", "candidate tree provenance changed");
         }
         return patch;
       },
-      readDeliveryPatch(request) {
+      async readDeliveryPatch(request) {
         assertRepositoryRequest(request, ["version", "repository", "delivery_candidate_ref", "delivery_manifest_digest", "base_sha", "result_sha", "base_tree_sha", "result_tree_sha"], "delivery_git_delivery_patch_request_invalid");
         const requestedRef = candidateRef(request.delivery_candidate_ref, "delivery_git_delivery_patch_request_invalid");
         if (!same(requestedRef, ref) || !SHA_RE.test(request.delivery_manifest_digest) || request.base_sha !== ref.base_sha ||
             request.result_sha !== ref.result_sha || !SHA_RE.test(request.base_tree_sha) || !SHA_RE.test(request.result_tree_sha)) {
           fail("delivery_git_delivery_patch_request_invalid", "delivery patch request is invalid");
         }
-        const patch = objectPatch("delivery", { ...request, source_worktree_path: null }, "delivery_git_delivery_patch");
+        const patch = await objectPatch("delivery", { ...request, source_worktree_path: null }, "delivery_git_delivery_patch");
         if (patch.base_tree_sha !== request.base_tree_sha || patch.result_tree_sha !== request.result_tree_sha) {
           fail("delivery_git_delivery_patch_stale", "delivery tree provenance changed");
         }
         return patch;
       },
-      applyPatch(request) {
+      async applyPatch(request) {
         assertRepositoryRequest(request, ["version", "repository", "scope", "delivery_candidate_ref", "delivery_manifest_digest", "sequence", "work_task_ref", "input_tree_sha", "expected_result_tree_sha", "patch", "predecessor_handoffs"], "delivery_git_apply_request_invalid");
         const requestedRef = candidateRef(request.delivery_candidate_ref, "delivery_git_apply_request_invalid");
         if (!same(requestedRef, ref) || !["delivery_verification", "candidate_verification", "composition"].includes(request.scope) ||
@@ -454,8 +477,8 @@ function createDeliveryGitObjectAdapter(options) {
             !Array.isArray(request.predecessor_handoffs)) {
           fail("delivery_git_apply_request_invalid", "object patch application request is invalid");
         }
-        const current = requireCurrent("delivery_git_apply");
-        const input = readTree(current, record.repository, request.input_tree_sha, "delivery_git_apply_input_tree_invalid");
+        const current = await requireCurrent("delivery_git_apply");
+        const input = await readTree(current, record.repository, request.input_tree_sha, "delivery_git_apply_input_tree_invalid");
         const patch = request.patch;
         const expectedPatchScope = request.scope === "delivery_verification" ? "delivery" : "candidate";
         if (patch.version !== VERSION || patch.format !== PATCH_FORMAT || patch.scope !== expectedPatchScope ||
@@ -475,9 +498,11 @@ function createDeliveryGitObjectAdapter(options) {
           if (after === null) entries.delete(file.path);
           else entries.set(file.path, { path: file.path, ...after });
         }
-        const outputEntries = [...entries.values()].sort((left, right) => left.path.localeCompare(right.path));
-        if (outputEntries.length > MAX_TREE_ENTRIES) fail("delivery_git_apply_tree_limit", "composed tree exceeds its entry bound");
-        const treeSha = writeTreeFromEntries(current, outputEntries, "delivery_git_apply_unavailable");
+        // Order is decided once, per tree object, by the Git record comparator
+        // inside writeTreeFromEntries; a flattened pre-sort here would be a
+        // second, unobservable ordering.
+        if (entries.size > MAX_TREE_ENTRIES) fail("delivery_git_apply_tree_limit", "composed tree exceeds its entry bound");
+        const treeSha = await writeTreeFromEntries(current, entries.values(), "delivery_git_apply_unavailable");
         if (request.expected_result_tree_sha !== null && treeSha !== request.expected_result_tree_sha) {
           fail("delivery_git_apply_not_clean", "object patch did not produce its pinned result tree");
         }
@@ -487,7 +512,7 @@ function createDeliveryGitObjectAdapter(options) {
     });
   }
 
-  function readDeliveryEvidence(request) {
+  async function readDeliveryEvidence(request) {
     exact(request, ["version", "head_binding", "delivery_source"], "invalid_delivery_git_evidence_request");
     if (request.version !== VERSION) fail("invalid_delivery_git_evidence_request", "evidence request version is invalid");
     const owner = binding(request.head_binding, "invalid_delivery_git_evidence_request");
@@ -496,23 +521,30 @@ function createDeliveryGitObjectAdapter(options) {
     if (!record || record.repository !== repository(staged.registered_repository.repository, "invalid_delivery_git_evidence_request")) {
       fail("delivery_git_repository_unregistered", "delivery repository is not registered");
     }
-    const resultSha = assertCurrentClone(record, null, "delivery_git_evidence");
+    const resultSha = await assertCurrentClone(record, null, "delivery_git_evidence");
     if (resultSha === staged.base_sha) fail("delivery_git_result_unchanged", "registered result HEAD has not advanced beyond the delivery base");
-    const base = readCommit(record, record.repository, staged.base_sha, "delivery_git_evidence_base_invalid");
-    const result = readCommit(record, record.repository, resultSha, "delivery_git_evidence_result_invalid");
-    if (!run(record, ["merge-base", "--is-ancestor", staged.base_sha, resultSha]).ok) {
+    const base = await readCommit(record, record.repository, staged.base_sha, "delivery_git_evidence_base_invalid");
+    const result = await readCommit(record, record.repository, resultSha, "delivery_git_evidence_result_invalid");
+    if (!(await run(record, ["merge-base", "--is-ancestor", staged.base_sha, resultSha])).ok) {
       fail("delivery_git_evidence_base_mismatch", "delivery base is not an ancestor of registered result");
     }
-    const baseTree = readTree(record, record.repository, base.tree_sha, "delivery_git_evidence_base_tree_invalid");
-    const resultTree = readTree(record, record.repository, result.tree_sha, "delivery_git_evidence_result_tree_invalid");
+    const baseTree = await readTree(record, record.repository, base.tree_sha, "delivery_git_evidence_base_tree_invalid");
+    const resultTree = await readTree(record, record.repository, result.tree_sha, "delivery_git_evidence_result_tree_invalid");
     if (baseTree.tree_sha === resultTree.tree_sha) fail("delivery_git_result_unchanged", "registered result tree has not changed");
-    for (const stage of staged.staged_tasks) {
-      if (!plain(stage) || !plain(stage.candidate) || stage.candidate.base_sha !== staged.base_sha || !SHA_RE.test(stage.candidate.candidate_sha)) {
+    // #1065: a root candidate descends from the frozen base; a same-repository
+    // dependent descends from its predecessor's exact candidate, which is its base.
+    const candidates = staged.staged_tasks.map((stage) => plain(stage) && plain(stage.candidate) ? stage.candidate
+      : fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid"));
+    for (const candidate of candidates) {
+      let expectedBase;
+      try { expectedBase = expectedCandidateBase(staged.frozen_batch_manifest.tasks, candidates, candidate, staged.base_sha); }
+      catch { fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid"); }
+      if (candidate.base_sha !== expectedBase || !SHA_RE.test(candidate.candidate_sha)) {
         fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid");
       }
-      readCommit(record, record.repository, stage.candidate.candidate_sha, "delivery_git_evidence_candidate_invalid");
-      if (!run(record, ["merge-base", "--is-ancestor", staged.base_sha, stage.candidate.candidate_sha]).ok) {
-        fail("delivery_git_evidence_candidate_invalid", "staged candidate does not descend from delivery base");
+      await readCommit(record, record.repository, candidate.candidate_sha, "delivery_git_evidence_candidate_invalid");
+      if (!(await run(record, ["merge-base", "--is-ancestor", candidate.base_sha, candidate.candidate_sha])).ok) {
+        fail("delivery_git_evidence_candidate_invalid", "staged candidate does not descend from its base");
       }
     }
     const patch = patchFromTrees("delivery", staged.base_sha, resultSha, baseTree, resultTree, null);
@@ -532,10 +564,12 @@ function createDeliveryGitObjectAdapter(options) {
     });
   }
   function repositoryObjectsFor(request) {
-    exact(request, ["version", "head_binding", "delivery_candidate_ref"], "invalid_delivery_git_objects_request");
-    if (request.version !== VERSION) fail("invalid_delivery_git_objects_request", "object request version is invalid");
+    exact(request, ["version", "head_binding", "delivery_candidate_ref", "deadline"], "invalid_delivery_git_objects_request");
+    if (request.version !== VERSION || !Number.isSafeInteger(request.deadline) || request.deadline <= 0) {
+      fail("invalid_delivery_git_objects_request", "object request version or deadline is invalid");
+    }
     return createObjects(binding(request.head_binding, "invalid_delivery_git_objects_request"),
-      candidateRef(request.delivery_candidate_ref, "invalid_delivery_git_objects_request"));
+      candidateRef(request.delivery_candidate_ref, "invalid_delivery_git_objects_request"), request.deadline);
   }
   return freeze({ readDeliveryEvidence, repositoryObjectsFor });
 }

@@ -44,10 +44,12 @@ const { createWorkTaskIndependentReviewService } = require("./work-task-independ
 const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 const { createWorkTaskReviewRuntime } = require("./work-task-review-runtime");
 const { createWorkTaskDeliverySource } = require("./work-task-delivery-source");
+const { createProjectArchiveTransition } = require("./project-archive-transition");
 const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
 const { createDeliveryCompositionService } = require("./delivery-composition-service");
 const { createDeliveryCandidateRuntime } = require("./delivery-candidate-runtime");
 const { createDeliveryGitObjectAdapter } = require("./delivery-git-object-adapter");
+const { runDeliveryGit } = require("./delivery-git-runner");
 const { createCanonicalInstalledStateReader } = require("./canonical-installed-state");
 const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
 const { createChatResumeRuntime } = require("./chat-resume-runtime");
@@ -765,23 +767,11 @@ function deliveryGitObjectsForProject(projectId) {
   return createDeliveryGitObjectAdapter({
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
-    run_git: (request) => {
-      try {
-        return {
-          ok: true,
-          output: execFileSync("git", request.args, {
-            cwd: request.cwd,
-            encoding: "utf8",
-            stdio: "pipe",
-            timeout: 5000,
-            maxBuffer: 4 * 1024 * 1024,
-            ...(typeof request.input === "string" ? { input: request.input } : {}),
-          }),
-        };
-      } catch {
-        return { ok: false, output: "" };
-      }
-    },
+    // #1066: the directly tested fixed Git runner (server/delivery-git-runner.js),
+    // awaited one call at a time under the adapter's remaining composition
+    // budget, so the loop keeps serving terminals and sockets while a
+    // candidate composes.
+    run_git: runDeliveryGit,
     read_delivery_source: (request) => deliverySourceForProject(projectId).readStagedSource(request),
   });
 }
@@ -1041,19 +1031,21 @@ app.post("/api/work-task-review/reconcile", (req, res) => {
 // observes the current registered-clone HEAD; composition only records a
 // deterministic local Git-object proof. Neither endpoint publishes a branch,
 // creates a PR, starts CI, or merges.
-app.post("/api/delivery-candidate/prepare", (req, res) => {
+app.post("/api/delivery-candidate/prepare", async (req, res) => {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   try {
-    return res.json({ ok: true, ...deliveryCandidateRuntime.prepare({ token, body: req.body }) });
+    return res.json({ ok: true, ...(await deliveryCandidateRuntime.prepare({ token, body: req.body })) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_prepare_unavailable" });
   }
 });
 
-app.post("/api/delivery-candidate/compose", (req, res) => {
+// #1066: composition is awaited (one Git call at a time under one deadline),
+// so this request no longer holds the loop for its whole Git chain.
+app.post("/api/delivery-candidate/compose", async (req, res) => {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   try {
-    return res.json({ ok: true, ...deliveryCandidateRuntime.compose({ token, body: req.body }) });
+    return res.json({ ok: true, ...(await deliveryCandidateRuntime.compose({ token, body: req.body })) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_compose_unavailable" });
   }
@@ -3303,9 +3295,25 @@ function mergeCleanupResult(aggregate, result, fallbackResource) {
   }
 }
 
+// #1070: the one project-scope WorkTask archive transition. It is composed
+// here with server-side identity only: the project id comes from the archive
+// the lifecycle controller is performing, and the installation id is read from
+// live configuration, so no caller can name another project or installation.
+const projectArchiveTransition = createProjectArchiveTransition({
+  config_dir: path.dirname(CONFIG_PATH),
+  fs,
+  resolve_installation_id: () => readConfig()?.installation_id,
+  now: () => new Date(),
+});
+
 async function cleanupProjectRuntime(projectId) {
   const aggregate = { ok: false, resources: {}, cleanup_errors: [] };
 
+  // #1070: the durable WorkTask batch is archived in this same synchronous
+  // turn that follows barrier persistence and admission revocation, before the
+  // first await, so no late build, candidate, review, receipt, or correction
+  // can win after the barrier.
+  mergeCleanupResult(aggregate, projectArchiveTransition.archiveProjectRuntimeState(projectId), "work_task_archive");
   // This synchronous cancellation is deliberately before the first await.
   // It closes both deferred wake and delayed-submit timers in the same turn
   // that follows durable barrier persistence/revocation.
@@ -3873,10 +3881,10 @@ function syncTriggersFromConfig() {
 }
 
 // #516: server-side batch-completion poller. Checks every 30s whether
-// any trigger_auto project's batch is complete, and auto-stops the
-// trigger (plus caffeinate when no triggers remain). This runs
-// independently of the trigger tick interval, so completion is
-// detected within 30s even if the operator is on a different page.
+// any monitor-enabled or bridge-auto project's batch is complete, and
+// clears the monitor's conditions (releasing caffeinate with it). This
+// runs on its own interval, so completion is detected within 30s even
+// if the operator is on a different page.
 // #518: also handles telegram_auto / discord_auto bridge lifecycle
 // (both start and stop) so bridges respond to batch transitions
 // even when the operator is viewing a different project page.

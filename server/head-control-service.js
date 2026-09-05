@@ -20,7 +20,7 @@ const CODE_RE = /^head_control_[a-z0-9_]{2,95}$/;
 const ACTION_SET = new Set(ACTIONS);
 const DECISION_SET = new Set(["accepted", "denied"]);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff"]);
-const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "get_project_status", "review_handoff"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "abandon_batch_manifest", "get_project_status", "review_handoff"]);
 
 class HeadControlServiceError extends Error {
   constructor(code, message = code) {

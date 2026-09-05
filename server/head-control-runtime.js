@@ -99,7 +99,7 @@ function composeHeadDomain(owner, workTask, controls) {
     ...workTask,
     // The plane preflights every action with a status read that keeps the
     // requested action name.  The WorkTask domain validates only its own
-    // seven; a beside-the-pipeline action reads status as a plain status read.
+    // eight; a beside-the-pipeline action reads status as a plain status read.
     get_pipeline_status(invocation) {
       return beside.has(invocation?.action) ? pipelineStatus(invocation) : workTask.get_pipeline_status(invocation);
     },

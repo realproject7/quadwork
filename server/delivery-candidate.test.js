@@ -21,6 +21,7 @@ const project_id = "quadwork";
 const base_sha = "a".repeat(64);
 const web42 = { repoKey: "web", repo: "Owner/Product-Web", number: 42, kind: "issue" };
 const web43 = { repoKey: "web", repo: "Owner/Product-Web", number: 43, kind: "issue" };
+const web44 = { repoKey: "web", repo: "Owner/Product-Web", number: 44, kind: "issue" };
 const api42 = { repoKey: "api", repo: "Owner/Product-Api", number: 42, kind: "issue" };
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
@@ -35,7 +36,7 @@ function throwsCode(fn, expected) {
   assert.throws(fn, (error) => error instanceof DeliveryCandidateError && error.code === expected);
 }
 function resolveRegisteredIdentity(input) {
-  const revisions = { 42: "c".repeat(64), 43: "d".repeat(64) };
+  const revisions = { 42: "c".repeat(64), 43: "d".repeat(64), 44: "1".repeat(64) };
   return {
     installation_id: input.installation_id,
     project_id: input.project_id,
@@ -63,11 +64,11 @@ function frozenBatch(tasks, delivery_mode = "integrated") {
     version: 1, installation_id, project_id, delivery_mode, tasks,
   }, { resolveRegisteredIdentity }), "2026-09-01T10:00:00.000Z");
 }
-function candidate(ref, candidate_sha, worktree_id) {
+function candidate(ref, candidate_sha, worktree_id, base = base_sha) {
   return buildWorkTaskCandidate({
     version: 1,
     work_task_ref: copy(ref),
-    base_sha,
+    base_sha: base,
     candidate_sha,
     branch: `task/delivery-${worktree_id}`,
     worktree: { repository_key: ref.repository_key, worktree_id, path: `/var/folders/quadwork/${worktree_id}` },
@@ -78,7 +79,7 @@ function candidate(ref, candidate_sha, worktree_id) {
         version: 1, registered: true, readable: true, repository_key: ref.repository_key, worktree_id,
         canonical_path: `/private/var/folders/quadwork/${worktree_id}`,
         branch: `task/delivery-${worktree_id}`,
-        base_sha, head_sha: candidate_sha, dirty: false, occupancy: "vacant",
+        base_sha: base, head_sha: candidate_sha, dirty: false, occupancy: "vacant",
       };
     },
     readCanonicalInstalledState() { return { version: 1, installation_id, project_id, v1_state: "present" }; },
@@ -163,6 +164,87 @@ function integratedFixture() {
   };
 }
 
+// #1065: the chain the pipeline actually stages.  Root task alpha builds from
+// the frozen repository base R; dependent bravo builds from alpha's exact
+// candidate SHA and may declare a boundary overlapping alpha's.
+function chainFixture({ dependent = true, overlap = true, bravoBase = null, cut_id = "cut-chain" } = {}) {
+  const batch = frozenBatch([
+    task({ task_key: "alpha", work_item: web42, boundary: ["server/alpha.js"] }),
+    task({
+      task_key: "bravo", work_item: web43,
+      boundary: overlap ? ["server/alpha.js", "server/bravo.js"] : ["server/bravo.js"],
+      dependencies: dependent ? [dependency(web42, "alpha")] : [],
+    }),
+  ]);
+  const alpha = candidate(batch.tasks[0].ref, "b".repeat(64), "wt_chain_alpha");
+  const bravo = candidate(batch.tasks[1].ref, "c".repeat(64), "wt_chain_bravo", bravoBase || alpha.candidate_sha);
+  const ref = candidateRef(batch, "integrated", "f".repeat(64), cut_id);
+  return {
+    batch, alpha, bravo, ref,
+    input: {
+      version: 1,
+      delivery_candidate_ref: ref,
+      frozen_batch_manifest: batch,
+      staged_tasks: [
+        { candidate: alpha, review_round: releasedRound(alpha, "chain-alpha") },
+        { candidate: bravo, review_round: releasedRound(bravo, "chain-bravo") },
+      ],
+      deferred_exclusions: [],
+      evidence: evidence(ref, ["server/alpha.js", "server/bravo.js"]),
+    },
+  };
+}
+
+// #1065: a pipeline-realizable same-repository chain is one root-based cut.
+{
+  const fixture = chainFixture();
+  const manifest = buildDeliveryManifest(fixture.input, options());
+  assert.equal(manifest.delivery_candidate_ref.base_sha, base_sha, "the delivery base stays the frozen repository root base");
+  assert.deepEqual(manifest.staged_tasks.map((entry) => entry.candidate.base_sha), [base_sha, fixture.alpha.candidate_sha],
+    "the dependent candidate is pinned to its predecessor candidate SHA");
+  assert.equal(manifest.staged_tasks[1].terminal_review.review_round_ref.base_sha, fixture.alpha.candidate_sha);
+  assert.deepEqual(manifest.evidence.boundary.paths, ["server/alpha.js", "server/bravo.js"], "an overlapping dependent boundary is declared once");
+  assert.equal(assertDeliveryManifest(manifest), manifest);
+
+  const noOverlap = buildDeliveryManifest(chainFixture({ overlap: false }).input, options());
+  assert.equal(noOverlap.staged_tasks[1].candidate.base_sha, fixture.alpha.candidate_sha, "a non-overlapping dependent still chains from its predecessor");
+  assert.deepEqual(noOverlap.evidence.boundary.paths, ["server/alpha.js", "server/bravo.js"]);
+}
+
+// #1065 negative controls.  A dependent built from anything but its one exact
+// predecessor candidate (the root base, a foreign SHA) is refused; an
+// independent overlap stays refused; independent root-based peers still cut.
+{
+  throwsCode(() => buildDeliveryManifest(chainFixture({ bravoBase: base_sha }).input, options()), "integrated_delivery_base_mismatch");
+  throwsCode(() => buildDeliveryManifest(chainFixture({ bravoBase: "d".repeat(64) }).input, options()), "integrated_delivery_base_mismatch");
+  throwsCode(() => buildDeliveryManifest(chainFixture({ dependent: false, bravoBase: base_sha }).input, options()), "overlapping_independent_delivery_task");
+  throwsCode(() => buildDeliveryManifest(chainFixture({ dependent: false, overlap: false, bravoBase: "b".repeat(64) }).input, options()), "integrated_delivery_base_mismatch");
+  const independent = buildDeliveryManifest(chainFixture({ dependent: false, overlap: false, bravoBase: base_sha }).input, options());
+  assert.deepEqual(independent.staged_tasks.map((entry) => entry.candidate.base_sha), [base_sha, base_sha]);
+
+  // Two same-repository predecessors leave no base the pipeline could have
+  // issued, so neither predecessor's candidate SHA is accepted.
+  for (const charlieBase of ["b".repeat(64), "c".repeat(64), base_sha]) {
+    const batch = frozenBatch([
+      task({ task_key: "alpha", work_item: web42, boundary: ["server/alpha.js"] }),
+      task({ task_key: "bravo", work_item: web43, boundary: ["server/bravo.js"] }),
+      task({ task_key: "charlie", work_item: web44, boundary: ["server/charlie.js"], dependencies: [dependency(web42, "alpha"), dependency(web43, "bravo")] }),
+    ]);
+    const alpha = candidate(batch.tasks[0].ref, "b".repeat(64), "wt_amb_alpha");
+    const bravo = candidate(batch.tasks[1].ref, "c".repeat(64), "wt_amb_bravo");
+    const charlie = candidate(batch.tasks[2].ref, "d".repeat(64), "wt_amb_charlie", charlieBase);
+    const ref = candidateRef(batch, "integrated", "f".repeat(64), "cut-ambiguous");
+    throwsCode(() => buildDeliveryManifest({
+      version: 1, delivery_candidate_ref: ref, frozen_batch_manifest: batch,
+      staged_tasks: [
+        { candidate: alpha, review_round: releasedRound(alpha, "amb-alpha") },
+        { candidate: bravo, review_round: releasedRound(bravo, "amb-bravo") },
+        { candidate: charlie, review_round: releasedRound(charlie, "amb-charlie") },
+      ],
+      deferred_exclusions: [], evidence: evidence(ref, ["server/alpha.js", "server/bravo.js", "server/charlie.js"]),
+    }, options()), "integrated_delivery_base_mismatch");
+  }
+}
 // A valid integrated cut is immutable, digest-stable, in frozen Batch order,
 // and retains only two released receipt anchors per task (not raw findings).
 {

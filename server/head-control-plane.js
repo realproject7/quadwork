@@ -30,6 +30,7 @@ const ACTIONS = Object.freeze([
   "freeze_batch_manifest",
   "cut_batch",
   "retire_batch",
+  "abandon_batch_manifest",
   "queue_local_correction",
   "read_propagation_stop",
   "get_project_status",
@@ -40,7 +41,7 @@ const ACTIONS = Object.freeze([
 const ACTION_SET = new Set(ACTIONS);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff"]);
 const CONTROL_ACTIONS = new Set(["project_monitor", "recover_worker"]);
-const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "get_project_status", "review_handoff"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "abandon_batch_manifest", "get_project_status", "review_handoff"]);
 const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
 const READ_CODES = Object.freeze({ get_project_status: "head_control_project_observed", review_handoff: "head_control_handoff_observed" });
 const CONTROL_REFUSED_CODES = Object.freeze({ project_monitor: "head_control_monitor_refused", recover_worker: "head_control_recovery_refused" });
@@ -408,7 +409,7 @@ function createHeadControlPlane(options) {
           (!status.manifest_frozen || status.pipeline_digest === null || status.pipeline_digest === prior.pipeline_digest)) {
         return { error: "head_control_domain_invalid_transition" };
       }
-      if (input.action === "retire_batch" && status.manifest_digest !== null) {
+      if ((input.action === "retire_batch" || input.action === "abandon_batch_manifest") && status.manifest_digest !== null) {
         return { error: "head_control_domain_invalid_transition" };
       }
       if (input.action === "queue_local_correction" && (!status.manifest_frozen || status.pipeline_digest === null)) {
@@ -529,6 +530,13 @@ function createHeadControlPlane(options) {
     }
     if (input.action === "retire_batch" && (!status.manifest_frozen || status.pipeline_digest === null)) {
       const result = deny(input, "head_control_retire_unsafe", status);
+      cache(input, fingerprint, result);
+      return result;
+    }
+    // Abandonment is only for a manifest that exists and was never frozen;
+    // once a pipeline exists the batch leaves through retirement alone.
+    if (input.action === "abandon_batch_manifest" && (status.manifest_digest === null || status.manifest_frozen || status.pipeline_digest !== null)) {
+      const result = deny(input, "head_control_abandon_unsafe", status);
       cache(input, fingerprint, result);
       return result;
     }

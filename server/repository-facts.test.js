@@ -192,6 +192,83 @@ function fingerprint(dir) {
   }
 
   {
+    // #1072: the mirror of the fsmonitor case, and the residual the module
+    // contract pins.  `git status` must re-read a tracked file whose stat data
+    // no longer matches its index entry, and re-reading runs the
+    // `filter.<driver>.clean` command the tracked `.gitattributes` selects:
+    // operator-owned code executing under the server's own user.  Unlike
+    // fsmonitor this cannot be switched off, because suppressing it would mean
+    // hiding `.gitattributes` / `.git/info/attributes` from git and making
+    // `status` report something untrue.  So the assertion is the inverse of
+    // the fsmonitor one: the capture DOES run the filter, and its facts are
+    // STILL true, in both the clean and the dirty direction.
+    const filtered = path.join(TMP, "filtered");
+    const marker = path.join(TMP, "clean-filter-ran");
+    const clean = path.join(TMP, "clean-filter.sh");
+    const tracked = path.join(filtered, "tracked.txt");
+    // Stat-stale without touching content: mtime/ctime no longer match the
+    // index entry, so status cannot answer from its cache and must re-read.
+    const stale = (seconds) => { const when = new Date(Date.now() - seconds * 1000); fs.utimesSync(tracked, when, when); };
+    try {
+      fs.mkdirSync(filtered);
+      sh(filtered, ["init", "-q", "-b", "main"]);
+      // Passes stdin through unchanged, so the filter cannot itself alter what
+      // status sees: dirtiness reported below is real dirtiness.
+      fs.writeFileSync(clean, `#!/bin/sh\ntouch "${marker}"\ncat\n`, { mode: 0o755 });
+      sh(filtered, ["config", "filter.marker.clean", `'${clean}'`]);
+      fs.writeFileSync(path.join(filtered, ".gitattributes"), "tracked.txt filter=marker\n");
+      fs.writeFileSync(tracked, "content\n");
+      sh(filtered, ["add", ".gitattributes", "tracked.txt"]);
+      sh(filtered, ["commit", "-q", "-m", "filtered"]);
+      // Settle the index first.  The entry `git add` just wrote is "racily
+      // clean" (its mtime is not older than the index's own mtime), so git
+      // re-reads content whatever the cache says; backdating the file and
+      // letting one plain status rewrite the entry makes the cache-hit control
+      // below deterministic instead of a sub-second coin flip.
+      stale(300);
+      sh(filtered, ["status", "--porcelain"]);
+      // Control, both directions: a settled stat-fresh entry needs no filter
+      // (which is what proves the absence check can ever be false), and the
+      // same file once stat-stale does run it under plain `git status`.
+      fs.rmSync(marker, { force: true });
+      sh(filtered, ["status", "--porcelain"]);
+      assert.equal(fs.existsSync(marker), false, "control: a settled stat-fresh tracked file is answered from the index, no filter");
+      stale(120);
+      sh(filtered, ["status", "--porcelain"]);
+      assert.equal(fs.existsSync(marker), true, "control: plain git status runs the configured clean filter on a stat-stale tracked file");
+      // Setup itself runs the filter (`git add`, and the control status above),
+      // so the marker is removed HERE: after all setup, immediately before the
+      // capture.  A marker seen below was dropped BY THE CAPTURE and can never
+      // be a setup artefact.  The control status refreshed the index, so the
+      // file is re-staled first or status would answer from the cache again.
+      stale(240);
+      fs.rmSync(marker, { force: true });
+      const facts = await captureRepositoryFacts({ cwd: filtered, env: ENV });
+      assert.equal(fs.existsSync(marker), true, "ACCEPTED EXPOSURE (#1072): the capture ran the repository-configured clean filter");
+      // ...and the facts are still true: unchanged content is reported clean.
+      assert.equal(facts.available, true);
+      assert.equal(facts.status.clean, true);
+      assert.deepEqual(facts.status.entries, []);
+      assert.equal(facts.status.count, 0);
+      // True the other way too: a real content change is still reported dirty,
+      // so `clean: true` above is a fact and not a filter-shaped blind spot.
+      fs.writeFileSync(tracked, "changed\n");
+      stale(360);
+      fs.rmSync(marker, { force: true });
+      const dirty = await captureRepositoryFacts({ cwd: filtered, env: ENV });
+      assert.equal(fs.existsSync(marker), true, "ACCEPTED EXPOSURE (#1072): the capture ran the clean filter on the modified file too");
+      assert.equal(dirty.available, true);
+      assert.equal(dirty.status.clean, false);
+      assert.deepEqual(dirty.status.entries, [" M tracked.txt"]);
+      console.log("  PASS: the capture runs a repository-configured clean filter (accepted, unsuppressable exposure) and still reports truthful status");
+    } finally {
+      fs.rmSync(filtered, { recursive: true, force: true });
+      fs.rmSync(marker, { force: true });
+      fs.rmSync(clean, { force: true });
+    }
+  }
+
+  {
     // A slow git never stalls the event loop: timers keep firing while the
     // capture waits on its child processes.
     const slowBin = path.join(TMP, "slow-bin");

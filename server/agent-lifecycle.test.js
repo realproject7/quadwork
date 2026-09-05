@@ -7,6 +7,7 @@ const os = require("os");
 const path = require("path");
 const {
   LIFECYCLE_FILENAME,
+  MAX_HEAD_TRIALS_PER_ASSIGNMENT,
   createAgentLifecycleGovernor,
   projectStatePath,
 } = require("./agent-lifecycle");
@@ -222,6 +223,194 @@ function governor(options = {}) {
     const cleared = g.snapshot("headtrial", "dev").circuit;
     assert.equal(cleared.open, false);
     assert.equal(cleared.head_trial_operation_id, null);
+  }
+
+  // #1073: a Head trial whose generation posts and then crashes clears the
+  // circuit exactly like a healthy post, but Head's trials are budgeted per
+  // assignment identity: at most MAX_HEAD_TRIALS_PER_ASSIGNMENT (= 1) over
+  // every failure signature that assignment's circuits re-open with, so
+  // alternating resource_killed / early_exit cannot re-arm Head.  The budget
+  // resets on exactly two boundaries: a circuit of a different assignment
+  // identity, and an operator trial that clears the circuit.  A failed
+  // operator trial, banner-only bytes, restarts, and Head's own post do not.
+  {
+    assert.equal(MAX_HEAD_TRIALS_PER_ASSIGNMENT, 1, "the documented cap");
+    const g = governor();
+    const ids = (r) => ({ projectId: "postcrash", role: "dev", operationId: r.operation.operation_id, generationId: r.operation.generation_id });
+    const headTrial = (lost, correlation) => g.reserve({ projectId: "postcrash", role: "dev", source: "head_recovery", expectedGeneration: lost.operation.generation_id, lossCorrelation: correlation });
+    const operatorTrial = (lost, correlation) => g.reserve({ projectId: "postcrash", role: "dev", source: "operator_restart", operatorAuthorized: true, expectedGeneration: lost.operation.generation_id, lossCorrelation: correlation });
+    const watchdog = () => g.reserve({ projectId: "postcrash", role: "dev", source: "watchdog" });
+    const post = (r) => g.transition({ ...ids(r), status: "verified", structuredStatus: true });
+    // Crash by early exit: the closed circuit admits one automatic retry,
+    // which exits, and the next automatic attempt re-opens on early_exit.
+    const crashByEarlyExit = async (r) => {
+      await g.transition({ ...ids(r), status: "exited" });
+      const retry = await watchdog();
+      assert.equal(retry.status, "reserved");
+      await g.transition({ ...ids(retry), status: "exited" });
+      const opened = await watchdog();
+      assert.equal(opened.reason, "circuit_open");
+      return { lost: retry, correlation: opened.operation.circuit.loss_correlation };
+    };
+    const first = await g.reserve({ projectId: "postcrash", role: "dev", source: "operator_start", operatorAuthorized: true });
+    const killed = await g.transition({ ...ids(first), status: "resource_killed" });
+    const R = killed.operation.circuit.loss_correlation;
+    assert.match(R, /^[a-f0-9]{32}:resource_killed$/);
+
+    // Head's one trial: banner bytes leave it open and consumed; the post
+    // clears everything except the budget, which persists.
+    const trial = await headTrial(first, R);
+    assert.equal(trial.status, "reserved");
+    assert.equal(trial.operation.circuit.head_trials, MAX_HEAD_TRIALS_PER_ASSIGNMENT, "the trial spends the whole budget");
+    assert.match(trial.operation.circuit.head_trial_assignment, /^[a-f0-9]{32}:head_trial$/);
+    const budget = trial.operation.circuit.head_trial_assignment;
+    await g.transition({ ...ids(trial), status: "spawned" });
+    await g.transition({ ...ids(trial), status: "verified" });
+    assert.equal(g.snapshot("postcrash", "dev").circuit.open, true, "first PTY bytes do not clear");
+    const posted = await post(trial);
+    assert.deepEqual({ ...posted.operation.circuit }, {
+      open: false, reason: null, automatic_retries: 0, loss_correlation: null, expected_generation: null,
+      trial_operation_id: null, head_trial_operation_id: null, head_trial_assignment: budget, head_trials: 1,
+    });
+    assert.deepEqual([governor().snapshot("postcrash", "dev").circuit.head_trial_assignment, governor().snapshot("postcrash", "dev").circuit.head_trials], [budget, 1], "the budget is persisted");
+
+    // Alternating signatures on the one assignment: R -> E -> R.
+    const early = await crashByEarlyExit(trial);
+    const E = early.correlation;
+    assert.match(E, /^[a-f0-9]{32}:early_exit$/);
+    assert.notEqual(E, R);
+    assert.equal(E.slice(0, 32), R.slice(0, 32), "same assignment, different signature");
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      assert.equal((await headTrial(early.lost, E)).reason, "head_trial_consumed", `E attempt ${attempt}: the budget spent on R covers E`);
+    }
+    assert.equal((await governor().reserve({ projectId: "postcrash", role: "dev", source: "head_recovery", expectedGeneration: early.lost.operation.generation_id, lossCorrelation: E })).reason, "head_trial_consumed", "nor after a restart");
+    assert.equal(g.snapshot("postcrash", "dev").operation_id, early.lost.operation.operation_id, "no process was reserved");
+    assert.equal((await watchdog()).reason, "circuit_open");
+    // Operator takes E's trial, posts, and is then killed: back on R.
+    const clearingOperator = await operatorTrial(early.lost, E);
+    assert.equal(clearingOperator.status, "reserved");
+    await g.transition({ ...ids(clearingOperator), status: "spawned" });
+    const clearedByOperator = await post(clearingOperator);
+    assert.deepEqual([clearedByOperator.operation.circuit.open, clearedByOperator.operation.circuit.head_trial_assignment, clearedByOperator.operation.circuit.head_trials], [false, null, 0], "an operator's clearing trial resets the budget");
+    const killedAgain = await g.transition({ ...ids(clearingOperator), status: "resource_killed" });
+    assert.equal(killedAgain.operation.circuit.loss_correlation, R);
+    const second = await headTrial(clearingOperator, R);
+    assert.equal(second.status, "reserved", "the reset budget admits Head on R");
+    assert.deepEqual([second.operation.circuit.head_trial_assignment, second.operation.circuit.head_trials], [budget, 1]);
+    await g.transition({ ...ids(second), status: "spawned" });
+    await post(second);
+    const earlyAgain = await crashByEarlyExit(second);
+    assert.equal(earlyAgain.correlation, E);
+    assert.equal((await headTrial(earlyAgain.lost, E)).reason, "head_trial_consumed", "R -> post -> E: refused");
+    // The required regression from the review, in one unbroken run: on this
+    // assignment, R -> Head trial + post -> E -> Head trial + post -> R must
+    // refuse the third Head reservation without spawning.
+    const failedOperator = await operatorTrial(earlyAgain.lost, E);
+    await g.transition({ ...ids(failedOperator), status: "spawned" });
+    await g.transition({ ...ids(failedOperator), status: "exited" });
+    assert.equal((await headTrial(failedOperator, E)).reason, "head_trial_consumed", "a failed operator trial does not reset the budget");
+    const resetOperator = await operatorTrial(failedOperator, E);
+    await g.transition({ ...ids(resetOperator), status: "spawned" });
+    await post(resetOperator);
+    const r1 = await g.transition({ ...ids(resetOperator), status: "resource_killed" });
+    assert.equal(r1.operation.circuit.loss_correlation, R);
+    const firstHead = await headTrial(resetOperator, R);
+    assert.equal(firstHead.status, "reserved", "R: first Head trial");
+    await g.transition({ ...ids(firstHead), status: "spawned" });
+    await post(firstHead);
+    const e1 = await crashByEarlyExit(firstHead);
+    assert.equal(e1.correlation, E);
+    assert.equal((await headTrial(e1.lost, E)).reason, "head_trial_consumed", "E: second Head trial refused by the assignment budget");
+  }
+
+  // #1073 regression exactly as reproduced on review: one assignment, a fresh
+  // governor, R -> Head trial + post -> E -> Head trial + post -> R.  The
+  // third Head reservation must be refused and must not create a process.
+  {
+    const g = governor();
+    const P = "alternate";
+    const ids = (r) => ({ projectId: P, role: "dev", operationId: r.operation.operation_id, generationId: r.operation.generation_id });
+    const head = (lost, correlation) => g.reserve({ projectId: P, role: "dev", source: "head_recovery", expectedGeneration: lost.operation.generation_id, lossCorrelation: correlation });
+    const first = await g.reserve({ projectId: P, role: "dev", source: "operator_start", operatorAuthorized: true });
+    const R = (await g.transition({ ...ids(first), status: "resource_killed" })).operation.circuit.loss_correlation;
+    const firstHead = await head(first, R);
+    assert.equal(firstHead.status, "reserved", "first_head");
+    await g.transition({ ...ids(firstHead), status: "spawned" });
+    await g.transition({ ...ids(firstHead), status: "verified", structuredStatus: true });
+    await g.transition({ ...ids(firstHead), status: "exited" });
+    const retry = await g.reserve({ projectId: P, role: "dev", source: "watchdog" });
+    await g.transition({ ...ids(retry), status: "exited" });
+    const openedE = await g.reserve({ projectId: P, role: "dev", source: "watchdog" });
+    const E = openedE.operation.circuit.loss_correlation;
+    assert.match(E, /:early_exit$/);
+    const secondHead = await head(retry, E);
+    assert.equal(secondHead.reason, "head_trial_consumed", "second_head on E is already over the per-assignment cap");
+    // Let an operator spend E instead so the sequence reaches R again with a
+    // Head trial having posted on the way (the reviewer's exact shape has the
+    // second Head trial admitted; under the cap it is refused here, and the
+    // operator path is the only way to continue).
+    const operatorE = await g.reserve({ projectId: P, role: "dev", source: "operator_restart", operatorAuthorized: true, expectedGeneration: retry.operation.generation_id, lossCorrelation: E });
+    assert.equal(operatorE.status, "reserved");
+    await g.transition({ ...ids(operatorE), status: "spawned" });
+    await g.transition({ ...ids(operatorE), status: "verified", structuredStatus: true });
+    const backToR = await g.transition({ ...ids(operatorE), status: "resource_killed" });
+    assert.equal(backToR.operation.circuit.loss_correlation, R, "back_to_R");
+    const thirdHead = await head(operatorE, R);
+    assert.equal(thirdHead.status, "reserved", "operator's clearing trial re-armed Head for R");
+    await g.transition({ ...ids(thirdHead), status: "spawned" });
+    await g.transition({ ...ids(thirdHead), status: "verified", structuredStatus: true });
+    await g.transition({ ...ids(thirdHead), status: "exited" });
+    const retry2 = await g.reserve({ projectId: P, role: "dev", source: "watchdog" });
+    await g.transition({ ...ids(retry2), status: "exited" });
+    assert.equal((await g.reserve({ projectId: P, role: "dev", source: "watchdog" })).operation.circuit.loss_correlation, E);
+    const fourthHead = await head(retry2, E);
+    assert.equal(fourthHead.reason, "head_trial_consumed", "R spent by Head -> E refused: the flip never re-arms");
+    assert.equal(g.snapshot(P, "dev").operation_id, retry2.operation.operation_id, "no process for the refused reservation");
+    // The other direction: Head spends the budget on E, posts, is killed, and
+    // R re-opens.  Refused, no process.
+    const operatorE2 = await g.reserve({ projectId: P, role: "dev", source: "operator_restart", operatorAuthorized: true, expectedGeneration: retry2.operation.generation_id, lossCorrelation: E });
+    await g.transition({ ...ids(operatorE2), status: "spawned" });
+    await g.transition({ ...ids(operatorE2), status: "verified", structuredStatus: true });
+    await g.transition({ ...ids(operatorE2), status: "exited" });
+    const retry3 = await g.reserve({ projectId: P, role: "dev", source: "watchdog" });
+    await g.transition({ ...ids(retry3), status: "exited" });
+    assert.equal((await g.reserve({ projectId: P, role: "dev", source: "watchdog" })).operation.circuit.loss_correlation, E);
+    const headOnE = await head(retry3, E);
+    assert.equal(headOnE.status, "reserved", "E: Head trial on the operator-reset budget");
+    await g.transition({ ...ids(headOnE), status: "spawned" });
+    await g.transition({ ...ids(headOnE), status: "verified", structuredStatus: true });
+    assert.equal((await g.transition({ ...ids(headOnE), status: "resource_killed" })).operation.circuit.loss_correlation, R);
+    assert.equal((await head(headOnE, R)).reason, "head_trial_consumed", "E spent by Head -> R refused: the flip never re-arms");
+    assert.equal(g.snapshot(P, "dev").operation_id, headOnE.operation.operation_id, "no process for the refused reservation");
+  }
+
+  // #1073 reset boundary 1: a different assignment identity is a different
+  // budget.  After Head's trial posted and ran to the end of its work, a
+  // loss on the next assignment opens a circuit whose budget starts empty.
+  {
+    let key = "repo:owner/repo#42";
+    const g = governor({ currentWork: async () => ({ current: true, assignment: { assignment_key: key, assignment_attempt: "attempt-1", issue_contract_digest: null } }) });
+    const ids = (r) => ({ projectId: "nextwork", role: "dev", operationId: r.operation.operation_id, generationId: r.operation.generation_id });
+    const first = await g.reserve({ projectId: "nextwork", role: "dev", source: "operator_start", operatorAuthorized: true });
+    const killed = await g.transition({ ...ids(first), status: "resource_killed" });
+    const trial = await g.reserve({ projectId: "nextwork", role: "dev", source: "head_recovery", expectedGeneration: first.operation.generation_id, lossCorrelation: killed.operation.circuit.loss_correlation });
+    assert.equal(trial.status, "reserved");
+    const oldBudget = trial.operation.circuit.head_trial_assignment;
+    await g.transition({ ...ids(trial), status: "spawned" });
+    await g.transition({ ...ids(trial), status: "verified", structuredStatus: true });
+    key = "repo:owner/repo#43";
+    await g.transition({ ...ids(trial), status: "exited" });
+    const retry = await g.reserve({ projectId: "nextwork", role: "dev", source: "watchdog" });
+    assert.equal(retry.status, "reserved");
+    await g.transition({ ...ids(retry), status: "exited" });
+    const opened = await g.reserve({ projectId: "nextwork", role: "dev", source: "watchdog" });
+    assert.equal(opened.reason, "circuit_open");
+    assert.notEqual(opened.operation.circuit.loss_correlation.slice(0, 32), killed.operation.circuit.loss_correlation.slice(0, 32), "different work is a different identity");
+    assert.deepEqual([opened.operation.circuit.head_trial_assignment, opened.operation.circuit.head_trials], [oldBudget, 1], "the old budget is still recorded");
+    const next = await g.reserve({ projectId: "nextwork", role: "dev", source: "head_recovery", expectedGeneration: retry.operation.generation_id, lossCorrelation: opened.operation.circuit.loss_correlation });
+    assert.equal(next.status, "reserved", "Head's one trial on the new assignment is not charged to the old one");
+    assert.notEqual(next.operation.circuit.head_trial_assignment, oldBudget);
+    assert.equal(next.operation.circuit.head_trials, 1, "the new budget starts from zero and is now spent");
   }
 
   // A circuit opened by an exhausted automatic retry leaves the lost

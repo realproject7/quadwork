@@ -155,16 +155,28 @@ function assertReviewAssignment(value, currentCandidate, state, code) {
   if (state !== "independent_review" && state !== "reconcile") fail(code, "review assignment is not active in this state");
   return value;
 }
-function assertCorrection(value, currentCandidate, state, code) {
+// #1070: the per-task correction count is its own durable, monotonic fact; it
+// never follows the active checkpoint, which every corrected candidate clears.
+// A slot persisted before the field existed reads with the pre-#1070 meaning
+// (the active checkpoint's count, else zero) and gains the field on the next
+// applied plan.
+function correctionCount(slot) {
+  if (slot.correction_count !== undefined) return slot.correction_count;
+  return slot.correction ? slot.correction.count : 0;
+}
+function assertCorrection(value, currentCandidate, state, count, code) {
   if (value === null) return null;
   exact(value, ["checkpoint_id", "count"], code);
   identifier(value.checkpoint_id, code);
   if (!Number.isSafeInteger(value.count) || value.count < 1 || value.count > MAX_CHECKPOINTS) fail(code, "correction checkpoint is invalid");
+  if (value.count !== count) fail(code, "correction checkpoint contradicts the task correction count");
   if (!currentCandidate || (state !== "queued" && state !== "building")) fail(code, "correction checkpoint is inactive");
   return value;
 }
 function assertSlot(slot, code) {
-  exact(slot, ["work_task_ref", "dependency_refs", "file_boundary", "state", "candidate", "build_assignment", "review_assignment", "correction", "blocked_from", "history"], code);
+  const fields = ["work_task_ref", "dependency_refs", "file_boundary", "state", "candidate", "build_assignment", "review_assignment", "correction", "blocked_from", "history"];
+  if (!plain(slot)) fail(code, "value must be an object");
+  exact(slot, Object.prototype.hasOwnProperty.call(slot, "correction_count") ? [...fields, "correction_count"] : fields, code);
   ref(slot.work_task_ref, code);
   fileBoundary(slot.file_boundary, code);
   if (!Array.isArray(slot.dependency_refs) || slot.dependency_refs.length > MAX_TASKS) fail(code, "dependency references are invalid");
@@ -185,7 +197,9 @@ function assertSlot(slot, code) {
     if (slot.state !== "building") fail(code, "build assignment is not active in this state");
   }
   assertReviewAssignment(slot.review_assignment, slot.candidate, slot.state, code);
-  assertCorrection(slot.correction, slot.candidate, slot.state, code);
+  const count = correctionCount(slot);
+  if (!Number.isSafeInteger(count) || count < 0 || count > MAX_CHECKPOINTS) fail(code, "task correction count is invalid");
+  assertCorrection(slot.correction, slot.candidate, slot.state, count, code);
   if (slot.blocked_from === null) {
     if (slot.state === "blocked") fail(code, "blocked task lacks resume state");
   } else {
@@ -258,6 +272,7 @@ function buildWorkTaskPipeline(manifest, options) {
     build_assignment: null,
     review_assignment: null,
     correction: null,
+    correction_count: 0,
     blocked_from: null,
     history: [],
   }));
@@ -448,6 +463,7 @@ function assertReviewBoundariesDisjoint(tasks, next) {
 // the exact plan can be recreated from the current pipeline state.
 function deriveTransition(pipeline, event) {
   const tasks = clone(pipeline.tasks);
+  for (const slot of tasks) slot.correction_count = correctionCount(slot);
   const repositoryBases = clone(pipeline.repository_bases);
   const effects = [];
   let archived = pipeline.archived;
@@ -565,11 +581,11 @@ function deriveTransition(pipeline, event) {
     case "queue_local_correction": {
       const slot = locate(event.work_task_ref);
       requireState(slot, "changes_requested");
-      const previous = slot.correction ? slot.correction.count : 0;
-      if (previous >= MAX_CHECKPOINTS) fail("work_task_checkpoint_limit", "local correction checkpoint limit reached");
+      if (slot.correction_count >= MAX_CHECKPOINTS) fail("work_task_checkpoint_limit", "local correction checkpoint limit reached");
       const from = slot.state;
       slot.state = "queued";
-      slot.correction = { checkpoint_id: event.checkpoint_id, count: previous + 1 };
+      slot.correction_count += 1;
+      slot.correction = { checkpoint_id: event.checkpoint_id, count: slot.correction_count };
       effect(slot, from);
       break;
     }

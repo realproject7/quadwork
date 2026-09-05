@@ -40,7 +40,7 @@ function status(overrides = {}) {
   };
 }
 function request(action, overrides = {}) {
-  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch"
+  const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch" || action === "abandon_batch_manifest"
     ? null
     : action === "put_batch_manifest"
       ? { manifest: { version: 1, tasks: [] } }
@@ -62,7 +62,7 @@ function request(action, overrides = {}) {
 }
 function domain(initial = status()) {
   let current = clone(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
   const actions = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
@@ -88,6 +88,13 @@ function domain(initial = status()) {
     retire_batch(input) {
       calls.retire_batch += 1;
       assert.equal(input.expected_revision, current.revision);
+      current = status({ revision: current.revision + 1 });
+      return clone(current);
+    },
+    abandon_batch_manifest(input) {
+      calls.abandon_batch_manifest += 1;
+      assert.equal(input.expected_revision, current.revision);
+      assert.equal(input.payload, null);
       current = status({ revision: current.revision + 1 });
       return clone(current);
     },
@@ -178,7 +185,7 @@ function ok(condition, message) {
   assert.equal(put.result.status.revision, 1);
   assert.equal(frozen.result.status.revision, 2);
   assert.equal(cut.result.status.revision, 3);
-  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 });
+  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 });
   const records = core.recentAudit();
   assert.equal(records.length, 4);
   assert.deepEqual(Object.keys(records[0]).sort(), [
@@ -229,6 +236,75 @@ function ok(condition, message) {
   await expectServiceCode(() => afterRestart.execute(clone(correctionRequest)), "head_control_durable_replay_ambiguous");
   assert.deepEqual([fake.calls.queue_local_correction, fake.calls.retire_batch], [1, 1]);
   ok(true, "retirement, correction, and stop read share one redacted durable receipt with the fixed restart-replay rules");
+}
+
+// #1069: abandonment is payloadless, so its redacted durable receipt proves an
+// exact retry after restart without a second domain invocation.
+{
+  const fake = domain(status({ revision: 1, manifest_digest: MANIFEST_A }));
+  const configDir = configDirectory();
+  const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const abandonRequest = request("abandon_batch_manifest", { idempotency_key: "idem_abandon_001", correlation_id: "corr_abandon_001", expected_revision: 1 });
+  const abandoned = await first.execute(abandonRequest);
+  assert.equal(abandoned.decision.code, "head_control_applied");
+  assert.equal(abandoned.result.status.manifest_digest, null);
+  assert.deepEqual(first.recentAudit().map((record) => record.action), ["abandon_batch_manifest"]);
+  const afterRestart = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const replay = await afterRestart.execute(clone(abandonRequest));
+  assert.equal(replay.decision.kind, "replayed");
+  assert.equal(replay.result.status.revision, 2);
+  assert.equal(replay.detail, null);
+  assert.equal(fake.calls.abandon_batch_manifest, 1);
+  ok(true, "an abandonment replays deterministically from its redacted durable receipt after restart");
+}
+
+// #1071 (test quality): the two DETAILED actions carry a payload the redacted
+// durable receipt deliberately omits, so across a recreated store and service
+// no retry of either can be proved -- not the byte-identical one, not the one
+// that drops the payload to null, not the one that changes it.  The
+// payload-dropped retry is the discriminating case: it is the exact shape a
+// payloadless classification WOULD make provable from the receipt alone, so
+// this block fails if `read_propagation_stop` or `queue_local_correction` is
+// added to PAYLOADLESS_ACTIONS.  The set that decides this is the one in
+// server/head-control-service.js (head-control-plane.js declares its own copy
+// for request validation, which never sees these retries: the service's
+// durable preflight runs before the plane).
+{
+  const fake = domain(status({ revision: 2, manifest_digest: MANIFEST_A, pipeline_digest: PIPELINE_B, manifest_frozen: true, cut_safe: true }));
+  const configDir = configDirectory();
+  const first = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const stopRequest = request("read_propagation_stop", { idempotency_key: "idem_detailed_stop", correlation_id: "corr_detailed_stop" });
+  const correctionRequest = request("queue_local_correction", { idempotency_key: "idem_detailed_corr", correlation_id: "corr_detailed_corr", expected_revision: 2 });
+  const stop = await first.execute(stopRequest);
+  const correction = await first.execute(correctionRequest);
+  assert.equal(stop.decision.code, "head_control_stop_observed");
+  assert.equal(correction.decision.code, "head_control_applied");
+  assert.deepEqual([fake.calls.read_propagation_stop, fake.calls.queue_local_correction], [1, 1]);
+
+  // The recreated service must read these two records back from disk, and they
+  // must be the redacted form, or the retries below would prove nothing.
+  const durable = createHeadControlAuditStore({ config_dir: configDir, fs }).read(BINDING);
+  assert.deepEqual(durable.map((record) => record.action), ["read_propagation_stop", "queue_local_correction"]);
+  assert.deepEqual(durable.map((record) => record.decision), ["accepted", "accepted"]);
+  assert.ok(durable.every((record) => !Object.hasOwn(record, "payload") && !Object.hasOwn(record, "detail")));
+
+  const recreated = createHeadControlService({ binding: BINDING, domain: fake.actions, audit_store: createHeadControlAuditStore({ config_dir: configDir, fs }) });
+  const stopReplays = [
+    clone(stopRequest),
+    { ...clone(stopRequest), payload: null },
+    { ...clone(stopRequest), payload: { work_task_ref: { task_key: "docs" } } },
+  ];
+  const correctionReplays = [
+    clone(correctionRequest),
+    { ...clone(correctionRequest), payload: null },
+    { ...clone(correctionRequest), payload: { correction: { work_task_ref: { task_key: "build" }, review_round_ref: { round: 2 }, candidate_digest: PIPELINE_B } } },
+  ];
+  for (const retry of [...stopReplays, ...correctionReplays]) {
+    await expectServiceCode(() => recreated.execute(retry), "head_control_durable_replay_ambiguous");
+  }
+  assert.deepEqual([fake.calls.read_propagation_stop, fake.calls.queue_local_correction], [1, 1]);
+  assert.deepEqual(recreated.recentAudit().map((record) => record.action), ["read_propagation_stop", "queue_local_correction"]);
+  ok(true, "no retry of a detailed action -- identical, payload-dropped, or changed -- is provable from its redacted durable receipt");
 }
 
 // Principal and optimistic-revision denials are persisted too, but cannot

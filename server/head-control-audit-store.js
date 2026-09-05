@@ -5,14 +5,18 @@
 // redacted projection of an M1 Head-control audit decision, with no payload,
 // command text, environment/config data, terminal output, or secret surface.
 
-const crypto = require("node:crypto");
 const nodeFs = require("node:fs");
 const path = require("node:path");
+const {
+  FILE_MODE,
+  DIRECTORY_MODE,
+  modeOf,
+  sameFile,
+  createDurableStoreFiles,
+} = require("./durable-store-files");
 const { VERSION, ACTIONS } = require("./head-control-plane");
 
 const SCHEMA_VERSION = 1;
-const FILE_MODE = 0o600;
-const DIRECTORY_MODE = 0o700;
 const MAX_RECORDS = 64;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -21,6 +25,19 @@ const SHA_RE = /^[a-f0-9]{64}$/;
 const CODE_RE = /^head_control_[a-z0-9_]{2,95}$/;
 const ACTION_SET = new Set(ACTIONS);
 const DECISION_SET = new Set(["accepted", "denied"]);
+const FILE_CODES = Object.freeze({
+  options: "invalid_head_control_audit_store_options",
+  unreadable: "head_control_audit_store_unreadable",
+  symlink_rejected: "head_control_audit_store_symlink_rejected",
+  insecure_permissions: "head_control_audit_store_insecure_permissions",
+  write_failed: "head_control_audit_store_write_failed",
+  locked: "head_control_audit_store_locked",
+  lock_unsafe: "head_control_audit_store_lock_failed",
+  lock_failed: "head_control_audit_store_lock_failed",
+  lock_acquire_changed: "head_control_audit_store_lock_failed",
+  lock_release_changed: "head_control_audit_store_lock_release_failed",
+  lock_release_failed: "head_control_audit_store_lock_release_failed",
+});
 
 class HeadControlAuditStoreError extends Error {
   constructor(code, message = code) {
@@ -197,12 +214,6 @@ function snapshot(state, owner) {
   return freeze(clone(normalized));
 }
 
-function assertFs(fs) {
-  for (const name of ["mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync", "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync"]) {
-    if (typeof fs[name] !== "function") fail("invalid_head_control_audit_store_options", `fs.${name} is required`);
-  }
-  return fs;
-}
 function storageDirectory(configDir) {
   if (typeof configDir !== "string" || !path.isAbsolute(configDir) || configDir.length > 1024 || /[\u0000\r\n]/.test(configDir)) {
     fail("invalid_head_control_audit_store_options", "config_dir must be a bounded absolute path");
@@ -212,46 +223,6 @@ function storageDirectory(configDir) {
 function headControlAuditStorePath(configDir, bindingValue) {
   const owner = identity(bindingValue, "invalid_head_control_audit_store_identity");
   return path.join(storageDirectory(configDir), `${owner.installation_id}--${owner.project_id}.json`);
-}
-function lockPathFor(statePath) { return `${statePath}.lock`; }
-function temporaryPathFor(statePath) { return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`; }
-// The lock file body is this writer's proof of ownership. dev+ino alone cannot
-// prove it: Linux reuses an inode number as soon as the old lock is unlinked
-// and closed, so a replacement lock can carry the original's identity.
-function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
-function modeOf(stats) { return stats.mode & 0o777; }
-function lstatOrNull(fs, target) {
-  try { return fs.lstatSync(target); } catch (error) {
-    if (error && error.code === "ENOENT") return null;
-    fail("head_control_audit_store_unreadable", "audit store cannot be statted");
-  }
-}
-function sameFile(left, right) {
-  return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) && left.dev === right.dev && left.ino === right.ino;
-}
-function assertRealDirectory(fs, target, expectedMode) {
-  const stats = lstatOrNull(fs, target);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink()) fail("head_control_audit_store_symlink_rejected", "audit store paths cannot be symbolic links");
-  if (!stats.isDirectory()) fail("head_control_audit_store_unreadable", "audit store path is not a directory");
-  if (expectedMode !== undefined && modeOf(stats) !== expectedMode) {
-    fail("head_control_audit_store_insecure_permissions", "audit directory must be mode 0700");
-  }
-  return stats;
-}
-function ensureDirectories(fs, configDir, directory) {
-  if (assertRealDirectory(fs, configDir, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(configDir, { recursive: true, mode: DIRECTORY_MODE });
-    if (assertRealDirectory(fs, configDir, DIRECTORY_MODE) === null) fail("head_control_audit_store_unreadable", "audit config directory cannot be created");
-  }
-  if (assertRealDirectory(fs, directory, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(directory, { recursive: false, mode: DIRECTORY_MODE });
-    if (assertRealDirectory(fs, directory, DIRECTORY_MODE) === null) fail("head_control_audit_store_unreadable", "audit storage directory cannot be created");
-  }
-}
-function storageExists(fs, configDir, directory) {
-  if (assertRealDirectory(fs, configDir, DIRECTORY_MODE) === null) return false;
-  return assertRealDirectory(fs, directory, DIRECTORY_MODE) !== null;
 }
 function readState(fs, statePath, owner, allowMissing) {
   let raw;
@@ -287,107 +258,24 @@ function readState(fs, statePath, owner, allowMissing) {
     fail("corrupt_head_control_audit_store", "audit store validation failed");
   }
 }
-function writeStateAtomically(fs, statePath, state, owner) {
+function writeStateAtomically(files, statePath, state, owner) {
   const checked = assertState(state, owner);
-  const temporary = temporaryPathFor(statePath);
-  let temporaryWritten = false;
-  try {
-    fs.writeFileSync(temporary, `${JSON.stringify(checked)}\n`, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
-    temporaryWritten = true;
-    fs.chmodSync(temporary, FILE_MODE);
-    const fileDescriptor = fs.openSync(temporary, "r");
-    try { fs.fsyncSync(fileDescriptor); } finally { fs.closeSync(fileDescriptor); }
-    fs.renameSync(temporary, statePath);
-    temporaryWritten = false;
-    const directoryDescriptor = fs.openSync(path.dirname(statePath), "r");
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
-    const finalStats = fs.lstatSync(statePath);
-    if (finalStats.isSymbolicLink() || !finalStats.isFile() || modeOf(finalStats) !== FILE_MODE) {
-      fail("head_control_audit_store_write_failed", "atomic audit write did not produce a secure file");
-    }
-  } catch (error) {
-    if (temporaryWritten) {
-      try { fs.unlinkSync(temporary); } catch { /* only the just-created temp is eligible for cleanup */ }
-    }
-    if (error instanceof HeadControlAuditStoreError) throw error;
-    fail("head_control_audit_store_write_failed", "atomic audit store write failed");
-  }
-}
-function lockStats(fs, lockPath) {
-  const stats = lstatOrNull(fs, lockPath);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== FILE_MODE) {
-    fail("head_control_audit_store_lock_failed", "audit store lock is unsafe");
-  }
-  return stats;
-}
-function acquireLock(fs, statePath) {
-  const lockPath = lockPathFor(statePath);
-  const token = lockToken();
-  let descriptor;
-  let ownStats = null;
-  try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); } catch (error) {
-    if (error && error.code === "EEXIST") {
-      lockStats(fs, lockPath);
-      fail("head_control_audit_store_locked", "audit store has an active or stale writer lock");
-    }
-    fail("head_control_audit_store_lock_failed", "audit store lock cannot be acquired");
-  }
-  try {
-    fs.writeFileSync(descriptor, token, "utf8");
-    fs.chmodSync(lockPath, FILE_MODE);
-    fs.fsyncSync(descriptor);
-    ownStats = fs.fstatSync(descriptor);
-    if (!sameFile(ownStats, lockStats(fs, lockPath))) fail("head_control_audit_store_lock_failed", "audit store lock changed during acquisition");
-  } catch (error) {
-    try { fs.closeSync(descriptor); } catch {}
-    try {
-      const current = lockStats(fs, lockPath);
-      if (sameFile(ownStats, current) && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-    } catch {}
-    if (error instanceof HeadControlAuditStoreError) throw error;
-    fail("head_control_audit_store_lock_failed", "audit store lock cannot be initialized");
-  }
-  return { descriptor, lockPath, stats: ownStats, token };
-}
-function releaseLock(fs, lock) {
-  let closeError = null;
-  try { fs.closeSync(lock.descriptor); } catch (error) { closeError = error; }
-  try {
-    if (!sameFile(lock.stats, lockStats(fs, lock.lockPath)) || fs.readFileSync(lock.lockPath, "utf8") !== lock.token) {
-      fail("head_control_audit_store_lock_release_failed", "audit store lock changed before release");
-    }
-    fs.unlinkSync(lock.lockPath);
-  } catch (error) {
-    if (error instanceof HeadControlAuditStoreError) throw error;
-    fail("head_control_audit_store_lock_release_failed", "audit store lock cannot be released");
-  }
-  if (closeError) fail("head_control_audit_store_lock_release_failed", "audit store lock cannot be closed");
-}
-function withWriterLock(fs, statePath, action) {
-  const lock = acquireLock(fs, statePath);
-  let result;
-  let actionError;
-  try { result = action(); } catch (error) { actionError = error; }
-  try { releaseLock(fs, lock); } catch (releaseError) {
-    if (actionError) throw actionError;
-    throw releaseError;
-  }
-  if (actionError) throw actionError;
-  return result;
+  files.writeFileAtomically(statePath, `${JSON.stringify(checked)}\n`);
 }
 
 function createHeadControlAuditStore(options) {
   exact(options, ["config_dir", "fs"], "invalid_head_control_audit_store_options");
-  const fs = assertFs(options.fs || nodeFs);
+  const files = createDurableStoreFiles({ fs: options.fs || nodeFs, error: HeadControlAuditStoreError, codes: FILE_CODES });
+  const fs = files.fs;
   const directory = storageDirectory(options.config_dir);
+  const directories = [{ path: options.config_dir, mode: DIRECTORY_MODE }, { path: directory, mode: DIRECTORY_MODE }];
 
   function statePath(bindingValue) {
     return headControlAuditStorePath(options.config_dir, bindingValue);
   }
   function read(bindingValue) {
     const owner = identity(bindingValue, "invalid_head_control_audit_store_identity");
-    if (!storageExists(fs, options.config_dir, directory)) return freeze([]);
+    if (!files.storageExists(directories)) return freeze([]);
     const state = readState(fs, statePath(owner), owner, true);
     return state === null ? freeze([]) : freeze(state.records.map(clone));
   }
@@ -396,9 +284,9 @@ function createHeadControlAuditStore(options) {
     const owner = identity(input.binding, "invalid_head_control_audit_append");
     const record = normalizeAuditRecord(input.audit);
     if (!sameIdentity(record.binding, owner)) fail("head_control_audit_append_identity_mismatch", "audit binding does not match project store");
-    ensureDirectories(fs, options.config_dir, directory);
+    files.ensureDirectories(directories);
     const target = statePath(owner);
-    return withWriterLock(fs, target, () => {
+    return files.withWriterLock(target, () => {
       const current = readState(fs, target, owner, true) || {
         schema_version: SCHEMA_VERSION,
         binding: clone(owner),
@@ -417,7 +305,7 @@ function createHeadControlAuditStore(options) {
       const records = rotated > 0 ? current.records.slice(rotated) : current.records.slice();
       records.push(record);
       const next = { schema_version: SCHEMA_VERSION, binding: clone(owner), records };
-      writeStateAtomically(fs, target, next, owner);
+      writeStateAtomically(files, target, next, owner);
       return freeze({ record: freeze(clone(record)), duplicate: false, rotated, count: records.length });
     });
   }

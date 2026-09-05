@@ -135,6 +135,52 @@ withDirectory((directory) => {
   console.log("  PASS: the corrected candidate is a new identity; first-pass receipts stay sealed and an old-SHA verdict never carries forward");
 });
 
+// #1070: the correction cap holds on the Dev correction route itself. Three
+// reconciled change requests each queue one correction even though every
+// corrected candidate clears the checkpoint; the fourth is refused with the
+// typed limit before the pipeline store changes, a replayed request stays
+// idempotent, and a round bound to a superseded candidate cannot spend one.
+withDirectory((directory) => {
+  const current = fixture(directory);
+  const owner = { installation_id, project_id };
+  const reconciliation = createWorkTaskReviewReconciliationService({ config_dir: directory, fs });
+  let candidate = current.candidate;
+  const requests = [];
+  const requestChanges = (round) => {
+    const opened = current.service.openIndependentReview({ version: 1, event_id: `cap_open_${round}`, work_task_ref: copy(current.ref), attempt: "attempt_001", round, reviewers: reviewers(), opened_at: `2026-09-02T03:0${round}:00.000Z` });
+    assert.equal(opened.candidate_digest, candidate.candidate_digest);
+    sealBoth(current.service, opened, ["request_changes", "request_changes"], `2${round}`);
+    const request = { version: 1, work_task_ref: copy(current.ref), review_round_ref: copy(opened.review_round_ref), candidate_digest: opened.candidate_digest };
+    assert.equal(reconciliation.reconcileReleasedReview(request).resolution, "changes_requested");
+    return request;
+  };
+  for (const round of [1, 2, 3]) {
+    const request = requestChanges(round);
+    assert.equal(current.service.queueLocalCorrection(request).outcome, "queued");
+    let slot = current.store.readRecoverySnapshot(owner).pipeline.tasks[0];
+    assert.equal(slot.correction.count, round);
+    assert.equal(slot.correction_count, round);
+    applyEvent(current.store, current.manifest, { version: 1, kind: "assign_build", event_id: `cap_assign_${round}`, work_task_ref: copy(current.ref), assignment_id: "review_assignment", base_sha });
+    candidate = candidateFor(current.ref, "def"[round - 1].repeat(64));
+    applyEvent(current.store, current.manifest, { version: 1, kind: "record_candidate", event_id: `cap_candidate_${round}`, assignment_id: "review_assignment", candidate });
+    slot = current.store.readRecoverySnapshot(owner).pipeline.tasks[0];
+    assert.equal(slot.correction, null);
+    assert.equal(slot.correction_count, round);
+    assert.equal(current.service.queueLocalCorrection(request).outcome, "idempotent");
+    requests.push(request);
+  }
+  const fourth = requestChanges(4);
+  const before = current.store.readRecoverySnapshot(owner);
+  assert.equal(before.pipeline.tasks[0].state, "changes_requested");
+  assert.equal(before.pipeline.tasks[0].correction_count, 3);
+  throwsCode(() => current.service.queueLocalCorrection(fourth), "work_task_checkpoint_limit");
+  throwsCode(() => current.service.queueLocalCorrection({ ...fourth, candidate_digest: requests[2].candidate_digest }), "task_review_round_not_found");
+  assert.equal(current.service.queueLocalCorrection(requests[2]).outcome, "idempotent");
+  assert.deepEqual(current.store.readRecoverySnapshot(owner), before);
+  assert.equal(before.pipeline.history.filter((entry) => entry.kind === "queue_local_correction").length, 3);
+  console.log("  PASS: the Dev correction route admits exactly MAX_CHECKPOINTS corrections per task and refuses the fourth before any pipeline write");
+});
+
 // #1059 propagation stop: a sealed propagating first-pass receipt is visible
 // only through the Head-only read, as identity plus the server-derived
 // declared dependent chain. The peer reviewer's path shows nothing, and the

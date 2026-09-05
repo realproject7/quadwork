@@ -209,6 +209,20 @@ function dependencyClosure(entries) {
   return { byKey, dependenciesOf };
 }
 
+// #1065: the pipeline builds a same-repository dependent task from its one
+// ready predecessor candidate, so that exact candidate SHA is the dependent's
+// base; every other task builds from the frozen repository root base.  Two
+// same-repository predecessors, or an absent one, leave no base to accept.
+function expectedCandidateBase(tasks, candidates, candidate, base_sha) {
+  const key = workTaskKey(candidate.work_task_ref);
+  const entry = tasks.find((task) => workTaskKey(task.ref) === key);
+  const predecessors = entry.contract.dependencies.filter((dependency) => dependency.repository_key === candidate.work_task_ref.repository_key);
+  if (predecessors.length === 0) return base_sha;
+  const predecessorKey = predecessors.length === 1 ? workTaskKey(predecessors[0]) : null;
+  const predecessor = candidates.find((other) => workTaskKey(other.work_task_ref) === predecessorKey);
+  return predecessor ? predecessor.candidate_sha : null;
+}
+
 function assertTerminalReview(value, staged, code) {
   exact(value, ["status", "review_round_ref", "round_digest", "candidate_digest", "current_sha", "receipt_anchors"], code);
   if (value.status !== "released" || !SHA_RE.test(value.round_digest) || value.candidate_digest !== staged.candidate.candidate_digest ||
@@ -338,7 +352,10 @@ function assertCutContents(ref, repository, batch, staged, deferred, evidence) {
         deferredEntries.some((entry) => entry.work_task_ref.repository_key === ref.repository_key)) {
       fail("integrated_delivery_requires_complete_batch", "integrated delivery must cut every frozen task for its registered repository");
     }
-    if (staged.some((stage) => stage.candidate.base_sha !== ref.base_sha)) fail("integrated_delivery_base_mismatch", "integrated candidates must share the delivery base SHA");
+    const candidates = staged.map((stage) => stage.candidate);
+    if (staged.some((stage) => stage.candidate.base_sha !== expectedCandidateBase(entries, candidates, stage.candidate, ref.base_sha))) {
+      fail("integrated_delivery_base_mismatch", "integrated candidates must chain exactly from the delivery base SHA");
+    }
   } else {
     if (staged.length !== 1 || deferredEntries.length !== entries.length - 1) fail("isolated_delivery_requires_single_task", "isolated delivery must stage one task and defer all peers");
     if (staged[0].candidate.base_sha !== ref.base_sha || staged[0].candidate.candidate_sha !== ref.result_sha) {
@@ -406,6 +423,7 @@ module.exports = {
   DeliveryCandidateError,
   assertDeliveryCandidateRef,
   deliveryCandidateKey,
+  expectedCandidateBase,
   assertDeliveryManifest,
   buildDeliveryManifest,
 };
