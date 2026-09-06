@@ -62,6 +62,7 @@
   "dependencies": {
     "discord.js": "^14.18.0",
     "express": "^5.2.1",
+    "fs-native-extensions": "1.5.1",
     "multer": "^2.1.1",
     "node-pty": "^1.2.0-beta.12",
     "ws": "^8.20.0"

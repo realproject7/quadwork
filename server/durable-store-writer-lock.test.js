@@ -7,6 +7,24 @@
 // writer to recover and commit.  Nothing here stubs a pid, a signal, or the
 // lock body; the record on disk is exactly what the store wrote.
 //
+// #1074: the lock is no longer the existence of a file carrying an owner
+// record; it is a whole-file advisory lock held on an open descriptor, and
+// the `.lock` file is a permanent, empty artifact nobody ever removes.  Three
+// blocks below are therefore successors rather than survivors:
+//   - `malformedLockStaysClosed` and `unprovenOwnerStaysClosed` became
+//     `lockMetadataDoesNotDecide`, which drives both directions: with no
+//     holder every one of those bodies is acquired, and with a live holder
+//     every one of them is refused.  Content is proven irrelevant either way,
+//     instead of being proven to keep the store shut;
+//   - `replacementIsNeverReaped` became
+//     `identityMismatchIsRetriedThenRefused`: there is no reap to avoid, so
+//     what is pinned is that a lock whose identity changed under the writer
+//     is dropped and retried, bounded, and then refused;
+//   - `reapRaceNeverOverlapsProtectedActions` became
+//     `mutualExclusionAcrossProcesses`, a barrier race whose two children
+//     both certainly reach their protected actions, plus two negative
+//     controls that must report the overlap it must not.
+//
 // #1070: a holder child blocks forever by design, so an interrupted or
 // mid-test-failed run used to strand one per store.  Six such orphans held
 // locks for hours and cross-contaminated an unrelated suite.  Every holder
@@ -16,7 +34,7 @@
 // consults the process table or matches a process by name.
 
 const assert = require("node:assert/strict");
-const { spawn, spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -32,6 +50,15 @@ const { createDeliveryCandidateStore, deliveryCandidateStorePath } = require("./
 const { createHeadControlAuditStore, headControlAuditStorePath } = require("./head-control-audit-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
 const { createHeadControlWorkTaskDomain, headControlWorkTaskDomainPath } = require("./head-control-work-task-domain");
+const { createDurableStoreFiles, MAX_LOCK_ATTEMPTS } = require("./durable-store-files");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
+
+// A literal, not the module's own constant: an assertion imported from the
+// thing it is checking moves with it and pins nothing.
+const EXPECTED_LOCK_ATTEMPTS = 3;
+assert.equal(MAX_LOCK_ATTEMPTS, EXPECTED_LOCK_ATTEMPTS, "the acquisition retry bound is three attempts");
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
 
 const installation_id = "installation_alpha_0001";
 const project_id = "quadwork";
@@ -118,6 +145,7 @@ function audit(index) {
 const STORES = {
   "work-task-pipeline-store": {
     locked: "work_task_pipeline_store_locked",
+    changed: "work_task_pipeline_store_lock_failed",
     statePath: (directory) => workTaskPipelineStorePath(directory, owner),
     mutate(directory, fsImpl) {
       const manifest = frozenManifest("isolated");
@@ -128,6 +156,7 @@ const STORES = {
   },
   "batch-request-state-store": {
     locked: "batch_request_state_store_locked",
+    changed: "batch_request_state_store_lock_failed",
     statePath: (directory) => batchRequestStateStorePath(directory, owner),
     mutate(directory, fsImpl) {
       return createBatchRequestStateStore({ config_dir: directory, fs: fsImpl }).initialize({ expected: { ...owner, revision: null }, subscription_state: { version: 1, cursor: null, records: [] } });
@@ -136,6 +165,7 @@ const STORES = {
   },
   "delivery-candidate-store": {
     locked: "delivery_candidate_store_locked",
+    changed: "delivery_candidate_store_lock_failed",
     statePath: (directory) => deliveryCandidateStorePath(directory, deliveryManifest().delivery_candidate_ref),
     mutate(directory, fsImpl) {
       const manifest = deliveryManifest();
@@ -145,12 +175,14 @@ const STORES = {
   },
   "head-control-audit-store": {
     locked: "head_control_audit_store_locked",
+    changed: "head_control_audit_store_lock_failed",
     statePath: (directory) => headControlAuditStorePath(directory, binding),
     mutate(directory, fsImpl) { return createHeadControlAuditStore({ config_dir: directory, fs: fsImpl }).append({ binding, audit: audit(0) }); },
     written: (directory) => createHeadControlAuditStore({ config_dir: directory, fs }).read(binding).length === 1,
   },
   "task-review-round-store": {
     locked: "task_review_round_store_locked",
+    changed: "task_review_round_store_unsafe",
     statePath: (directory) => {
       const store = createTaskReviewRoundStore({ rootDir: directory });
       return store.pathFor(openTaskReviewRound({ version: 1, candidate: candidate(frozenManifest("isolated").tasks[0].ref), attempt: "attempt-lock", round: 1, opened_at: "2026-09-01T06:00:00.000Z" }, reviewers()).review_round_ref);
@@ -167,6 +199,7 @@ const STORES = {
   },
   "head-control-work-task-domain": {
     locked: "head_control_work_task_state_locked",
+    changed: "head_control_work_task_state_lock_failed",
     statePath: (directory) => headControlWorkTaskDomainPath(directory, binding),
     mutate(directory, fsImpl) {
       return createHeadControlWorkTaskDomain({ binding, config_dir: directory, fs: fsImpl, resolve_registered_identity: resolveRegisteredIdentity, now: () => "2026-09-02T00:00:00.000Z" }).initialize();
@@ -176,14 +209,15 @@ const STORES = {
 };
 
 // Child mode: take the store's writer lock and never leave it.  The hook is
-// the chmod every store applies to its freshly created `.lock` right after
-// writing the owner record, so the record on disk is complete when the
-// parent kills this process.
+// the lock's own `lstat`, which the primitive performs to check the identity
+// of the file it just locked — so it runs strictly after the kernel granted
+// the lock and strictly before the store's action.  The parent therefore
+// kills a process that really holds the lock and really committed nothing.
 if (process.argv[2] === "--hold-writer-lock") {
   const holding = Object.create(fs);
-  holding.chmodSync = (target, mode) => {
-    fs.chmodSync(target, mode);
-    if (target.endsWith(".lock")) {
+  holding.lstatSync = (target) => {
+    const stats = fs.lstatSync(target);
+    if (typeof target === "string" && target.endsWith(".lock")) {
       fs.writeSync(1, `HOLDING ${process.pid}\n`);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, HOLDER_SELF_DESTRUCT_MS);
       // Reached only when no parent ever killed this holder.  Leaving the
@@ -191,6 +225,7 @@ if (process.argv[2] === "--hold-writer-lock") {
       // would leave, so the store's own recovery still governs it.
       process.exit(3);
     }
+    return stats;
   };
   STORES[process.argv[3]].mutate(process.argv[4], holding);
   return;
@@ -199,18 +234,34 @@ if (process.argv[2] === "--hold-writer-lock") {
 // reporting when the lock was taken and released so the parent can prove
 // mutual exclusion across processes from the wall clock alone.
 if (process.argv[2] === "--contend") {
+  // ENTER is the identity check the primitive runs once the kernel has
+  // granted the lock; EXIT is the close of that very descriptor, which is
+  // what actually hands the lock back.  Both are reported from the exact
+  // syscalls, so the window printed is never wider than the window held.
+  const lockDescriptors = new Set();
+  let entered = false;
   const contending = Object.create(fs);
-  contending.chmodSync = (target, mode) => {
-    fs.chmodSync(target, mode);
-    if (target.endsWith(".lock")) fs.writeSync(1, `ENTER ${Date.now()}\n`);
+  contending.openSync = (target, ...rest) => {
+    const descriptor = fs.openSync(target, ...rest);
+    if (typeof target === "string" && target.endsWith(".lock")) lockDescriptors.add(descriptor);
+    return descriptor;
+  };
+  contending.closeSync = (descriptor) => {
+    const held = lockDescriptors.delete(descriptor);
+    fs.closeSync(descriptor);
+    if (held && entered) fs.writeSync(1, `EXIT ${Date.now()}\n`);
+  };
+  contending.lstatSync = (target) => {
+    const stats = fs.lstatSync(target);
+    if (!entered && typeof target === "string" && target.endsWith(".lock")) {
+      entered = true;
+      fs.writeSync(1, `ENTER ${Date.now()}\n`);
+    }
+    return stats;
   };
   contending.renameSync = (from, to) => {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
     fs.renameSync(from, to);
-  };
-  contending.unlinkSync = (target) => {
-    fs.unlinkSync(target);
-    if (target.endsWith(".lock")) fs.writeSync(1, `EXIT ${Date.now()}\n`);
   };
   try {
     createHeadControlAuditStore({ config_dir: process.argv[3], fs: contending }).append({ binding, audit: audit(Number(process.argv[4])) });
@@ -221,26 +272,55 @@ if (process.argv[2] === "--contend") {
   return;
 }
 
-// Reaper mutex: two writers must never be inside their protected actions at once.
-// The reaper's judgement (dev+ino, then the exact record) is verified against
-// the *path*, but the unlink that acts on that judgement is also addressed by
-// path.  Between the last verification and the unlink another writer can
-// legitimately reclaim the same stale lock and take a live one, and the
-// reaper then deletes that live lock and enters its own action behind it.
+// Mutual exclusion across processes: two writers must never be inside their
+// protected actions at once.  The lock is a kernel-held advisory lock on the
+// `.lock` file's open descriptor, so the claim under test is precisely "the
+// kernel refuses the second holder of that inode" — and the only way to
+// believe an empty overlap report is to show that the same harness reports an
+// overlap when the primitive is wrong in each of the two ways it can be
+// wrong.  Hence three adapters driven through one identical race:
 //
-// The two blocks below are the two halves of that race, each a real process
-// driving a real store.  Determinism comes from the store's own `fs` seam
-// (durable-store-files.js reads `options.fs`): the reaper parks inside the
-// instrumented `unlinkSync`, after the reaper has re-read the record it
-// judged and before the unlink happens, and only leaves when the replacer has
-// announced that it is inside its own protected action.  Nothing here waits
-// on a clock to hit the window.
+//   kernel         the real primitive on the real lock file  -> overlap 0
+//   bypass         no kernel call at all, always grants       -> overlap > 0
+//   private-inode  the real kernel call, on a file private to
+//                  each process                               -> overlap > 0
+//
+// `private-inode` is the one that matters: it proves the exclusion comes from
+// the shared inode rather than merely from the adapter having been called.
+//
+// Both children pass a filesystem barrier before either attempts the lock, so
+// neither can win by starting first, and each reports that it saw the other
+// arrive.  A child that loses retries until it wins, so both certainly reach
+// their protected action and an empty overlap can never mean "one never ran".
 const SECTION_PREFIX = "section-";
 const RENDEZVOUS_DEADLINE_MS = 15_000;
+const SECTION_HOLD_MS = 800;
+const RACE_ADAPTERS = Object.freeze(["kernel", "bypass", "private-inode"]);
+
+class RaceStoreError extends Error {
+  constructor(code, message = code) {
+    super(message);
+    this.name = "RaceStoreError";
+    this.code = code;
+  }
+}
+const RACE_CODES = Object.freeze({
+  options: "race_options",
+  unreadable: "race_unreadable",
+  symlink_rejected: "race_symlink",
+  insecure_permissions: "race_insecure",
+  write_failed: "race_write_failed",
+  locked: "race_locked",
+  lock_unsafe: "race_lock_unsafe",
+  lock_failed: "race_lock_failed",
+  lock_acquire_changed: "race_lock_acquire_changed",
+  lock_release_changed: "race_lock_release_changed",
+  lock_release_failed: "race_lock_release_failed",
+});
 
 function sleepBriefly() { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); }
-function waitForAny(rendezvous, names) {
-  const deadline = Date.now() + RENDEZVOUS_DEADLINE_MS;
+function waitForAny(rendezvous, names, budgetMs = RENDEZVOUS_DEADLINE_MS) {
+  const deadline = Date.now() + budgetMs;
   for (;;) {
     for (const name of names) {
       if (fs.existsSync(path.join(rendezvous, name))) return name;
@@ -263,53 +343,62 @@ function exitSection(rendezvous, role) {
   fs.writeSync(1, `SECTION-EXIT ${role}\n`);
 }
 
-// Race mode: `reaper` finds the stale lock first and parks at the seam;
-// `replacer` reclaims the same stale lock behind it and takes a live one.
-// Both drive the same real store through the same real code path.
-if (process.argv[2] === "--reap-race") {
-  const role = process.argv[3];
-  const configDirectory = process.argv[4];
-  const rendezvous = process.argv[5];
-  const lockPath = `${headControlAuditStorePath(configDirectory, binding)}.lock`;
-  let reReadJudgedRecord = false;
-  let parked = false;
-  let inSection = false;
-  const racing = Object.create(fs);
-  // The reaper's re-read of the record it judged: a path-addressed read of
-  // the lock by a process that does not hold it.  `readHeldLock` reads
-  // through a descriptor, so this cannot be confused with it.
-  racing.readFileSync = (target, ...rest) => {
-    if (typeof target === "string" && target === lockPath && !inSection) reReadJudgedRecord = true;
-    return fs.readFileSync(target, ...rest);
-  };
-  racing.unlinkSync = (target) => {
-    if (role === "reaper" && target === lockPath && reReadJudgedRecord && !parked && !inSection) {
-      parked = true;
-      fs.writeSync(1, "REAPER-PARKED\n");
-      waitForAny(rendezvous, [`${SECTION_PREFIX}replacer`, "replacer-done"]);
-    }
-    return fs.unlinkSync(target);
-  };
-  // The first temporary file of the atomic replace: the store is past
-  // acquisition and inside the action the lock exists to protect.
-  racing.writeFileSync = (target, ...rest) => {
-    const written = fs.writeFileSync(target, ...rest);
-    if (typeof target === "string" && target.endsWith(".tmp") && !inSection) {
-      inSection = true;
-      enterSection(rendezvous, role);
-      if (role === "replacer") waitForAny(rendezvous, ["reaper-done"]);
-    }
-    return written;
-  };
-  try {
-    createHeadControlAuditStore({ config_dir: configDirectory, fs: racing }).append({ binding, audit: audit(role === "reaper" ? 0 : 1) });
-    fs.writeSync(1, "OK\n");
-  } catch (error) {
-    fs.writeSync(1, `REFUSED ${error && error.code}\n`);
-  } finally {
-    if (inSection) exitSection(rendezvous, role);
-    fs.writeFileSync(path.join(rendezvous, `${role}-done`), "", { mode: 0o600 });
+// The three primitives the race is run against.  Only `kernel` is the one
+// the durable stores use; the other two exist to make an empty overlap
+// report falsifiable, and both are deliberately wrong in a specific way.
+function raceAdapter(name, rendezvous) {
+  if (name === "kernel") return undefined;
+  if (name === "bypass") return { tryLock: () => true, unlock() { /* nothing was ever taken */ } };
+  if (name === "private-inode") {
+    const descriptor = fs.openSync(path.join(rendezvous, `private-${process.pid}`), "w+", 0o600);
+    return { tryLock: () => advisory.tryLock(descriptor), unlock: () => advisory.unlock(descriptor) };
   }
+  throw new Error(`unknown race adapter ${name}`);
+}
+
+// Race mode: both roles drive the same real primitive over the same real
+// lock file, meeting at a barrier first so neither wins by being early.
+if (process.argv[2] === "--mutex-race") {
+  const adapterName = process.argv[3];
+  const role = process.argv[4];
+  const workDirectory = process.argv[5];
+  const rendezvous = process.argv[6];
+  const other = role === "left" ? "right" : "left";
+  const target = path.join(workDirectory, "state.json");
+  const files = createDurableStoreFiles({
+    fs, error: RaceStoreError, codes: RACE_CODES, advisory_lock: raceAdapter(adapterName, rendezvous),
+  });
+
+  fs.writeFileSync(path.join(rendezvous, `barrier-${role}`), "", { mode: 0o600 });
+  if (waitForAny(rendezvous, [`barrier-${other}`]) === null) {
+    fs.writeSync(1, `BARRIER-TIMEOUT ${role}\n`);
+    process.exit(4);
+  }
+  fs.writeSync(1, `BARRIER ${role}\n`);
+
+  // A loser retries rather than giving up, so both roles certainly enter
+  // their protected action and "no overlap" can never mean "never ran".
+  const deadline = Date.now() + RENDEZVOUS_DEADLINE_MS;
+  for (;;) {
+    try {
+      files.withWriterLock(target, () => {
+        enterSection(rendezvous, role);
+        // Stay inside long enough that a second entrant would certainly be
+        // seen.  With a correct primitive nobody can arrive, and this is
+        // just a bounded wait; with a broken one the other role is already
+        // here and the overlap is recorded at its own entry.
+        waitForAny(rendezvous, [`${SECTION_PREFIX}${other}`], SECTION_HOLD_MS);
+        exitSection(rendezvous, role);
+      });
+      fs.writeSync(1, "OK\n");
+      break;
+    } catch (error) {
+      if (error && error.code === RACE_CODES.locked && Date.now() < deadline) { sleepBriefly(); continue; }
+      fs.writeSync(1, `REFUSED ${error && error.code}\n`);
+      break;
+    }
+  }
+  fs.writeFileSync(path.join(rendezvous, `${role}-done`), "", { mode: 0o600 });
   return;
 }
 
@@ -400,8 +489,31 @@ function holdLock(name, directory) {
   holders.add(holder);
   return holder;
 }
+// The `.lock` file is now a permanent artifact, so "clean" means exactly one
+// lock, named for this store's own state file, held by nobody, and no
+// temporary at all.  The `.tmp` half of the old assertion is kept verbatim:
+// a leaked temporary is still a leak.
 function artifacts(statePath) {
   return fs.readdirSync(path.dirname(statePath)).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp"));
+}
+function temporaries(statePath) {
+  return fs.readdirSync(path.dirname(statePath)).filter((name) => name.endsWith(".tmp"));
+}
+function unheld(lockPath) {
+  const descriptor = fs.openSync(lockPath, "r+");
+  try {
+    if (!advisory.tryLock(descriptor)) return false;
+    advisory.unlock(descriptor);
+    return true;
+  } finally { fs.closeSync(descriptor); }
+}
+function assertSettled(name, statePath) {
+  const lockPath = `${statePath}.lock`;
+  assert.deepEqual(artifacts(statePath), [path.basename(lockPath)], `${name}: the only artifact left is the permanent lock`);
+  assert.deepEqual(temporaries(statePath), [], `${name}: no temporary artifact remains`);
+  assert.equal(fs.lstatSync(lockPath).size, 0, `${name}: the permanent lock carries no body`);
+  assert.equal(fs.lstatSync(lockPath).mode & 0o777, 0o600, `${name}: the permanent lock stays owner-only`);
+  assert.equal(unheld(lockPath), true, `${name}: the permanent lock is held by nobody`);
 }
 function isDead(pid) {
   try { process.kill(pid, 0); return false; } catch (error) { return error.code === "ESRCH"; }
@@ -417,15 +529,22 @@ async function deadWriterIsRecovered(name) {
     assert.equal(fs.lstatSync(lockPath).isFile(), true, `${name}: the child left a writer lock on disk`);
     assert.equal(fs.existsSync(statePath), false, `${name}: nothing was committed while the lock is held`);
 
-    // Negative control: a live owner is honoured, whatever its lock says.
+    // Negative control: a live owner is honoured, and the lock is held in
+    // the kernel rather than merely present on disk — a file that exists but
+    // is unheld would make the refusal below prove nothing.
     throwsCode(() => store.mutate(directory, fs), store.locked);
-    assert.equal(fs.readFileSync(lockPath, "utf8").includes(String(holderPid)), true, `${name}: the lock record names the live owner pid`);
+    assert.equal(unheld(lockPath), false, `${name}: the live owner really holds the lock`);
+    assert.equal(fs.lstatSync(lockPath).size, 0, `${name}: the lock carries no owner record`);
 
+    const identity = fs.lstatSync(lockPath);
     holder.child.kill("SIGKILL");
     const outcome = await holder.exited;
     assert.equal(outcome.signal, "SIGKILL");
     assert.equal(isDead(holderPid), true, `${name}: the owner pid is gone`);
     assert.equal(fs.lstatSync(lockPath).isFile(), true, `${name}: the dead owner's lock survives its process`);
+    // Nothing reclaims it: the kernel released the lock when the killed
+    // process's descriptors closed, so the very same inode is free again.
+    assert.equal(unheld(lockPath), true, `${name}: the dead owner's lock is free without any recovery step`);
 
     // The defect: the next writer must recover from the dead owner's lock
     // and commit, instead of failing closed until an operator deletes it.
@@ -436,91 +555,109 @@ async function deadWriterIsRecovered(name) {
     }
     assert.ok(result, `${name}: recovery returned a snapshot`);
     assert.equal(store.written(directory), true, `${name}: the recovered write is durable and readable`);
-    assert.deepEqual(artifacts(statePath), [], `${name}: no lock or temporary artifact remains after recovery`);
+    const recovered = fs.lstatSync(lockPath);
+    assert.equal(recovered.ino, identity.ino, `${name}: recovery reused the dead owner's own lock inode`);
+    assert.equal(recovered.dev, identity.dev, `${name}: recovery reused the dead owner's own lock device`);
+    assertSettled(name, statePath);
   });
 }
 
-// Malformed or untrusted lock content can never identify an owner, so it is
-// never reaped: the store stays fail-closed for an explicit operator check.
-async function malformedLockStaysClosed(name) {
+// Successor to `malformedLockStaysClosed` and `unprovenOwnerStaysClosed`.
+// Under the advisory lock a lock file's body is not evidence of anything, so
+// the claim worth pinning is that it is not evidence *either way*: with
+// nobody holding the lock every one of these bodies is acquired, and with a
+// live holder every one of them is refused.  A one-directional test would
+// pass just as well against an implementation that refused everything.
+const LOCK_BODIES = Object.freeze([
+  "",
+  "locked\n",
+  `${process.pid}.${"ab".repeat(16)}`,
+  "{\"pid\":0}",
+  JSON.stringify({ version: 1, pid: 1, token: "0".repeat(32), host: os.hostname(), created_at: 0 }),
+  JSON.stringify({ version: 1, pid: process.pid, token: crypto.randomBytes(16).toString("hex"), host: "elsewhere.invalid", created_at: Date.now() }),
+]);
+
+// Direction one: no holder.  Every body is acquired, and none is rewritten.
+async function lockMetadataNeverBlocks(name) {
+  const store = STORES[name];
+  for (const body of LOCK_BODIES) {
+    await withDirectory(async (directory) => {
+      const statePath = store.statePath(directory);
+      fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(`${statePath}.lock`, body, { mode: 0o600, flag: "wx" });
+      const label = `${name}/${JSON.stringify(body.slice(0, 30))}`;
+      let result;
+      try { result = store.mutate(directory, fs); }
+      catch (error) { assert.fail(`${label}: an unheld lock was refused with ${error && error.code}`); }
+      assert.ok(result, `${label}: the writer committed`);
+      assert.equal(store.written(directory), true, `${label}: the write is durable`);
+      assert.equal(fs.readFileSync(`${statePath}.lock`, "utf8"), body, `${label}: acquiring never rewrote the lock`);
+      assert.deepEqual(temporaries(statePath), [], `${label}: no temporary remains`);
+    });
+  }
+}
+
+// Direction two: one real holder process, and the same bodies written into
+// the very lock file it holds.  The inode is untouched, so the kernel lock
+// survives the rewrite; every body is refused with the store's typed code.
+async function lockMetadataNeverAdmits(name) {
   const store = STORES[name];
   await withDirectory(async (directory) => {
     const statePath = store.statePath(directory);
-    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
-    for (const body of ["", "locked\n", `${process.pid}.${"ab".repeat(16)}`, "{\"pid\":0}", JSON.stringify({ version: 1, pid: 0, token: "0".repeat(32), host: os.hostname(), created_at: 0 })]) {
-      fs.writeFileSync(`${statePath}.lock`, body, { mode: 0o600, flag: "wx" });
+    const lockPath = `${statePath}.lock`;
+    const holder = holdLock(name, directory);
+    await holder.holding;
+    const identity = fs.lstatSync(lockPath);
+    for (const body of LOCK_BODIES) {
+      fs.writeFileSync(lockPath, body, { encoding: "utf8" });
+      const label = `${name}/${JSON.stringify(body.slice(0, 30))}`;
+      assert.equal(fs.lstatSync(lockPath).ino, identity.ino, `${label}: the body was rewritten in place`);
       throwsCode(() => store.mutate(directory, fs), store.locked);
-      assert.equal(fs.readFileSync(`${statePath}.lock`, "utf8"), body, `${name}: an unidentifiable lock is left untouched`);
-      fs.unlinkSync(`${statePath}.lock`);
+      assert.equal(fs.readFileSync(lockPath, "utf8"), body, `${label}: a refusal never rewrote the lock`);
+      assert.equal(fs.existsSync(statePath), false, `${label}: nothing was committed behind the holder`);
     }
+    holder.child.kill("SIGKILL");
+    assert.equal((await holder.exited).signal, "SIGKILL");
+    // The same file, with the last of those bodies still in it, is now
+    // simply acquired — which is the point: the body never decided anything.
+    assert.ok(store.mutate(directory, fs), `${name}: the released lock is acquired with the same body in place`);
+    assert.equal(fs.lstatSync(lockPath).ino, identity.ino, `${name}: the acquisition reused the same inode`);
   });
 }
 
-// A record that parses but names an owner this host cannot prove dead is
-// honoured: a live unrelated pid (the shape PID reuse produces), a pid the
-// probe refuses with EPERM (alive, not gone), and a lock minted on another
-// host.  None of them is touched.
-function deadPid() {
-  const exited = spawnSync(process.execPath, ["-e", "0"]);
-  assert.equal(exited.status, 0);
-  assert.equal(isDead(exited.pid), true, "the probe pid belongs to a process that has exited");
-  return exited.pid;
-}
-function record(fields) {
-  return JSON.stringify({ version: 1, pid: process.pid, token: crypto.randomBytes(16).toString("hex"), host: os.hostname(), created_at: Date.now(), ...fields });
-}
-async function unprovenOwnerStaysClosed(name) {
-  const store = STORES[name];
-  await withDirectory(async (directory) => {
-    const statePath = store.statePath(directory);
-    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
-    let init = null;
-    try { process.kill(1, 0); } catch (error) { init = error.code; }
-    assert.ok(init === null || init === "EPERM", `pid 1 is alive for this user (${init})`);
-    for (const body of [record({}), record({ pid: 1 }), record({ pid: deadPid(), host: "elsewhere.invalid" })]) {
-      fs.writeFileSync(`${statePath}.lock`, body, { mode: 0o600, flag: "wx" });
-      throwsCode(() => store.mutate(directory, fs), store.locked);
-      assert.equal(fs.readFileSync(`${statePath}.lock`, "utf8"), body, `${name}: a live, refused, or foreign owner's lock is left untouched`);
-      fs.unlinkSync(`${statePath}.lock`);
-    }
-  });
-}
-
-// Linux reuses inode numbers eagerly, so a dead owner's lock that is
-// replaced between judgement and unlink can report the original dev+ino.
-// The stubbed lstat forces exactly that; only the exact record proves the
-// replacement, and the replacement's live owner is honoured.
-async function replacementIsNeverReaped(name) {
+// Successor to `replacementIsNeverReaped`.  There is no reap to avoid any
+// more, so what is pinned is the check that replaced it: the file the kernel
+// granted the lock on must still be the file the path names.  When it is not,
+// the writer drops the lock and opens the path again — bounded, and without
+// touching whatever is now there — and then refuses.
+//
+// The stub forges exactly that disagreement: `fstat` describes the object we
+// locked, the stubbed `lstat` describes a different one.
+async function identityMismatchIsRetriedThenRefused(name) {
   const store = STORES[name];
   await withDirectory(async (directory) => {
     const statePath = store.statePath(directory);
     const lockPath = `${statePath}.lock`;
     fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(lockPath, record({ pid: deadPid() }), { mode: 0o600, flag: "wx" });
-    const replacement = record({});
-    let inspections = 0;
-    let original = null;
-    const replacingFs = Object.create(fs);
-    replacingFs.lstatSync = (target) => {
-      if (target !== lockPath) return fs.lstatSync(target);
-      inspections += 1;
-      if (inspections === 1) {
-        original = fs.lstatSync(target);
-        return original;
-      }
-      if (inspections === 2) {
-        fs.unlinkSync(lockPath);
-        fs.writeFileSync(lockPath, replacement, { mode: 0o600, flag: "wx" });
-      }
+    fs.writeFileSync(lockPath, "planted", { mode: 0o600, flag: "wx" });
+    let opens = 0;
+    const forgingFs = Object.create(fs);
+    forgingFs.openSync = (target, ...rest) => {
+      if (typeof target === "string" && target === lockPath) opens += 1;
+      return fs.openSync(target, ...rest);
+    };
+    forgingFs.lstatSync = (target) => {
       const stats = fs.lstatSync(target);
-      stats.dev = original.dev;
-      stats.ino = original.ino;
+      if (typeof target === "string" && target === lockPath) stats.ino += 1;
       return stats;
     };
-    throwsCode(() => store.mutate(directory, replacingFs), store.locked);
-    assert.equal(inspections, 2, `${name}: the dead owner's lock is re-inspected exactly once before any unlink`);
-    assert.equal(fs.readFileSync(lockPath, "utf8"), replacement, `${name}: the live replacement is never unlinked`);
-    assert.equal(fs.existsSync(statePath), false, `${name}: no write happened behind the replacement's owner`);
+    const started = Date.now();
+    throwsCode(() => store.mutate(directory, forgingFs), store.changed);
+    assert.equal(opens, EXPECTED_LOCK_ATTEMPTS, `${name}: the mismatch is retried exactly three times`);
+    assert.ok(Date.now() - started < 2000, `${name}: bounded retries never wait`);
+    assert.equal(fs.readFileSync(lockPath, "utf8"), "planted", `${name}: the file at the lock path is never touched`);
+    assert.equal(unheld(lockPath), true, `${name}: every abandoned attempt released its lock`);
+    assert.equal(fs.existsSync(statePath), false, `${name}: nothing was written behind a mismatched lock`);
   });
 }
 
@@ -561,7 +698,7 @@ async function contendersYieldOneWriterAtATime() {
     const stored = JSON.parse(fs.readFileSync(statePath, "utf8"));
     assert.equal(stored.records.length, committed, "every committed winner is durable and none was lost or duplicated");
     assert.equal(createHeadControlAuditStore({ config_dir: directory, fs }).read(binding).length, committed);
-    assert.deepEqual(artifacts(statePath), [], "no lock or temporary artifact remains after contention");
+    assertSettled("head-control-audit-store", statePath);
   });
 }
 
@@ -632,7 +769,6 @@ function spawnTracked(args, signal) {
   holders.add(racer);
   return racer;
 }
-function bounded(ms) { return new Promise((resolve) => { setTimeout(resolve, ms).unref(); }); }
 // A single reported entry into a protected action, with whatever other
 // writers were inside theirs at that instant.
 function sectionEntries(source, output) {
@@ -665,60 +801,71 @@ async function overlapDetectorSeesAKnownOverlap() {
   );
 }
 
-// Reaper mutex: the reaper unlinks by path, not by the identity it verified.  A
-// second writer that legitimately reclaims the same stale lock and takes a
-// live one in that window has its live lock deleted, and both writers then
-// run their protected actions at the same time.
-async function reapRaceNeverOverlapsProtectedActions() {
-  await withDirectory(async (directory) => {
+// Successor to `reapRaceNeverOverlapsProtectedActions`.  Two real processes,
+// one real lock file, a barrier so neither wins by starting first, and a
+// loser that retries until it wins so both certainly enter their protected
+// action.  The same harness is then run against two deliberately wrong
+// primitives, and both of those must report the overlap this one must not:
+// without them an empty report would only prove the detector was quiet.
+async function runMutexRace(adapterName) {
+  return withDirectory(async (directory) => {
     const rendezvous = rendezvousDirectory();
-    const statePath = headControlAuditStorePath(directory, binding);
-    const lockPath = `${statePath}.lock`;
+    const left = spawnTracked(["--mutex-race", adapterName, "left", directory, rendezvous]);
+    const right = spawnTracked(["--mutex-race", adapterName, "right", directory, rendezvous]);
+    const outcomes = { left: await left.exited, right: await right.exited };
+    const output = `left=${JSON.stringify(left.output())} right=${JSON.stringify(right.output())}`;
+    const entries = [...sectionEntries("left", left.output()), ...sectionEntries("right", right.output())];
+    const context = `${adapterName}: ${JSON.stringify(outcomes)} ${output}`;
 
-    // The stale lock is the store's own: a real writer took it and was
-    // killed inside its window.  Nothing about the record is fabricated.
-    const holder = holdLock("head-control-audit-store", directory);
-    const holderPid = await holder.holding;
-    holder.child.kill("SIGKILL");
-    assert.equal((await holder.exited).signal, "SIGKILL");
-    assert.equal(isDead(holderPid), true, "the stale lock's recorded owner is gone");
-    assert.equal(fs.lstatSync(lockPath).isFile(), true, "the killed writer left its lock on disk");
-
-    const reaper = spawnTracked(["--reap-race", "reaper", directory, rendezvous], "REAPER-PARKED");
-    // The replacer is released once the reaper is parked at the seam.  An
-    // implementation that never reaches that seam releases it by exiting, so
-    // this cannot hang on a future protocol.
-    await Promise.race([reaper.announced, reaper.exited, bounded(RENDEZVOUS_DEADLINE_MS)]);
-    const replacer = spawnTracked(["--reap-race", "replacer", directory, rendezvous]);
-    const outcomes = { reaper: await reaper.exited, replacer: await replacer.exited };
-    const entries = [...sectionEntries("reaper", reaper.output()), ...sectionEntries("replacer", replacer.output())];
-    const context = `reaper=${verdict(reaper.output())}(${JSON.stringify(outcomes.reaper)}) replacer=${verdict(replacer.output())}(${JSON.stringify(outcomes.replacer)}) entries=${JSON.stringify(entries)}`;
-
-    assert.equal(outcomes.reaper.signal, null, `the reaper died on a signal: ${context}`);
-    assert.equal(outcomes.replacer.signal, null, `the replacer died on a signal: ${context}`);
-    // Guards the assertion below against passing because nobody ever wrote.
-    assert.ok(entries.length >= 1, `neither writer reached its protected action, so exclusion was never exercised: ${context}`);
-
-    assert.deepEqual(
-      entries.filter((entry) => entry.others.length > 0), [],
-      `two writers were inside their protected actions at once: ${context}`,
-    );
+    // Both children must actually have met at the barrier and must actually
+    // have entered a protected action.  Without these two, "no overlap" could
+    // be produced by a child that crashed, timed out, or never got that far.
+    for (const [role, racer] of [["left", left], ["right", right]]) {
+      assert.equal(outcomes[role].signal, null, `${context}: the ${role} racer died on a signal`);
+      assert.equal(outcomes[role].code, 0, `${context}: the ${role} racer exited non-zero`);
+      assert.match(racer.output(), new RegExp(`^BARRIER ${role}$`, "m"), `${context}: the ${role} racer never reached the barrier`);
+      assert.doesNotMatch(racer.output(), /^BARRIER-TIMEOUT/m, `${context}: the barrier timed out`);
+      assert.equal(verdict(racer.output()), "OK", `${context}: the ${role} racer never committed`);
+    }
+    assert.equal(entries.length, 2, `${context}: both racers must enter a protected action`);
+    return { entries, overlaps: entries.filter((entry) => entry.others.length > 0), context };
   });
+}
+
+// The claim: with the primitive the durable stores actually use, no two
+// writers are ever inside their protected actions at once.
+async function mutualExclusionAcrossProcesses() {
+  const race = await runMutexRace("kernel");
+  assert.deepEqual(race.overlaps, [], `two writers were inside their protected actions at once: ${race.context}`);
+}
+
+// The two ways the claim above could be vacuous, each asserted here rather
+// than checked by hand.  `bypass` never asks the kernel; `private-inode`
+// asks it properly but about a file private to each process, which is what
+// separates "the adapter was called" from "exclusion binds to this inode".
+async function wrongPrimitiveOverlaps(adapterName) {
+  const race = await runMutexRace(adapterName);
+  assert.ok(race.overlaps.length > 0,
+    `${adapterName} must overlap, or the race proves nothing about the correct primitive: ${race.context}`);
 }
 
 async function suite() {
   const failures = [];
   for (const name of Object.keys(STORES)) {
-    for (const check of [deadWriterIsRecovered, malformedLockStaysClosed, unprovenOwnerStaysClosed, replacementIsNeverReaped]) {
+    for (const check of [deadWriterIsRecovered, lockMetadataNeverBlocks, lockMetadataNeverAdmits, identityMismatchIsRetriedThenRefused]) {
       try { await check(name); }
       catch (error) { failures.push(`${check.name}(${name}): ${error && error.message}`); }
     }
   }
   try { await contendersYieldOneWriterAtATime(); }
   catch (error) { failures.push(`contendersYieldOneWriterAtATime: ${error && error.message}`); }
-  for (const check of [overlapDetectorSeesAKnownOverlap, reapRaceNeverOverlapsProtectedActions]) {
+  for (const check of [overlapDetectorSeesAKnownOverlap, mutualExclusionAcrossProcesses]) {
     try { await check(); }
     catch (error) { failures.push(`${check.name}: ${error && error.message}`); }
+  }
+  for (const adapterName of RACE_ADAPTERS.filter((name) => name !== "kernel")) {
+    try { await wrongPrimitiveOverlaps(adapterName); }
+    catch (error) { failures.push(`wrongPrimitiveOverlaps(${adapterName}): ${error && error.message}`); }
   }
   for (const kind of ABORT_KINDS) {
     try { await abortLeavesNoHolderBehind(kind); }

@@ -1,12 +1,28 @@
 "use strict";
 
-// #1063/#1064: the shared durable-file primitive.  These tests pin the lock
-// record, the reap decision, the bounded retry, the replacement identity
-// checks, and the atomic replace independently of any one store's schema.
+// #1063/#1064/#1074: the shared durable-file primitive.  These tests pin the
+// writer lock, its identity checks, its bounded retry, and the atomic replace
+// independently of any one store's schema.
+//
+// #1074 changed what the lock *is*.  It used to be the existence of a file
+// carrying an owner record, which meant a writer had to judge that record and
+// then act on the judgement by path — and a legitimate replacement arriving in
+// that window was destroyed by the judge.  It is now a whole-file advisory
+// lock held on an open descriptor, and the `.lock` file is a permanent, empty,
+// owner-only artifact that is never removed.  The tests that used to pin the
+// record, the liveness probe, and the reclaim are therefore replaced here by
+// their successors:
+//   - the record tests become two-directional metadata tests: whatever a lock
+//     file contains, an unheld lock is acquired and a held one is refused, so
+//     content is proven not to be part of the verdict either way;
+//   - the reclaim tests become "a dead writer leaves nothing to reclaim";
+//   - the replacement-vs-unlink tests become "an identity mismatch is retried
+//     and then refused, and no lock path is ever unlinked or renamed".
+// The liveness-probe classification moved out of this module entirely; the
+// errno classification that replaced it lives in
+// durable-store-advisory-lock.test.js.
 
 const assert = require("node:assert/strict");
-const { spawnSync } = require("node:child_process");
-const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -14,10 +30,10 @@ const {
   FILE_MODE,
   DIRECTORY_MODE,
   MAX_LOCK_ATTEMPTS,
-  parseLockRecord,
-  classifyLivenessProbe,
+  LOCK_OPEN_FLAGS,
   createDurableStoreFiles,
 } = require("./durable-store-files");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
 
 class ProbeStoreError extends Error {
   constructor(code, message = code) {
@@ -40,8 +56,19 @@ const CODES = Object.freeze({
   lock_release_failed: "probe_lock_release_failed",
 });
 
-function throwsCode(fn, expected) {
-  assert.throws(fn, (error) => error instanceof ProbeStoreError && error.code === expected, `expected ${expected}`);
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
+// Stated as a literal, not imported: asserting a retry count against the very
+// constant the module exports would move with any change to it and pin nothing.
+const EXPECTED_LOCK_ATTEMPTS = 3;
+assert.equal(MAX_LOCK_ATTEMPTS, EXPECTED_LOCK_ATTEMPTS, "the acquisition retry bound is three attempts");
+assert.equal(typeof LOCK_OPEN_FLAGS, "number", "the lock open flags include O_NOFOLLOW on this platform");
+assert.equal((LOCK_OPEN_FLAGS & fs.constants.O_NOFOLLOW) !== 0, true, "the lock is opened O_NOFOLLOW");
+assert.equal((LOCK_OPEN_FLAGS & fs.constants.O_CREAT) !== 0, true);
+assert.equal((LOCK_OPEN_FLAGS & fs.constants.O_RDWR) !== 0, true);
+
+function throwsCode(fn, expected, message) {
+  assert.throws(fn, (error) => error instanceof ProbeStoreError && error.code === expected, message || `expected ${expected}`);
 }
 function withDirectory(run) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-durable-files-"));
@@ -51,188 +78,267 @@ function withDirectory(run) {
 function files(fsImpl = fs, extra = {}) {
   return createDurableStoreFiles({ fs: fsImpl, error: ProbeStoreError, codes: CODES, ...extra });
 }
-function record(fields = {}) {
-  return JSON.stringify({ version: 1, pid: process.pid, token: crypto.randomBytes(16).toString("hex"), host: os.hostname(), created_at: Date.now(), ...fields });
+// "Nobody holds this lock right now", asked of the kernel rather than of the
+// file's existence or contents.  Every assertion that a writer let go uses it.
+function unheld(lockPath) {
+  const descriptor = fs.openSync(lockPath, "r+");
+  try {
+    if (!advisory.tryLock(descriptor)) return false;
+    advisory.unlock(descriptor);
+    return true;
+  } finally { fs.closeSync(descriptor); }
 }
-function deadPid() {
-  const exited = spawnSync(process.execPath, ["-e", "0"]);
-  assert.equal(exited.status, 0);
-  assert.throws(() => process.kill(exited.pid, 0), (error) => error.code === "ESRCH");
-  return exited.pid;
+// A real, live holder inside this process: a descriptor with the kernel lock
+// on it.  It is a genuine second open file description, which is exactly what
+// a competing writer has.
+function holdLock(lockPath) {
+  const descriptor = fs.openSync(lockPath, LOCK_OPEN_FLAGS, FILE_MODE);
+  assert.equal(advisory.tryLock(descriptor), true, "the test holder took the lock");
+  return { release() { advisory.unlock(descriptor); fs.closeSync(descriptor); } };
 }
-function plantLock(directory, body) {
+function plantLock(directory, body, mode = FILE_MODE) {
   const target = path.join(directory, "state.json");
-  fs.writeFileSync(`${target}.lock`, body, { mode: FILE_MODE, flag: "wx" });
+  fs.writeFileSync(`${target}.lock`, body, { mode, flag: "wx" });
+  fs.chmodSync(`${target}.lock`, mode);
   return target;
 }
 
 // Construction: the store's error class and every code slot are required;
-// an incomplete fs fails with the store's own options code.
+// an incomplete fs, or an advisory adapter that is not one, fails with the
+// store's own options code.
 {
   assert.throws(() => createDurableStoreFiles({ fs, error: ProbeStoreError, codes: { ...CODES, locked: undefined } }), TypeError);
   assert.throws(() => createDurableStoreFiles({ fs, error: null, codes: CODES }), TypeError);
   throwsCode(() => files({ ...fs, fsyncSync: undefined }), "probe_options");
   throwsCode(() => files(null), "probe_options");
   throwsCode(() => files(fs, { random_bytes: "entropy" }), "probe_options");
-}
-
-// The lock record binds pid, an unforgeable token, the host, and the creation
-// instant, and is removed on release.
-withDirectory((directory) => {
-  const target = path.join(directory, "state.json");
-  const before = Date.now();
-  let seen = null;
-  files().withWriterLock(target, () => { seen = fs.readFileSync(`${target}.lock`, "utf8"); });
-  const parsed = JSON.parse(seen);
-  assert.deepEqual(Object.keys(parsed), ["version", "pid", "token", "host", "created_at"]);
-  assert.equal(parsed.version, 1);
-  assert.equal(parsed.pid, process.pid);
-  assert.match(parsed.token, /^[a-f0-9]{32}$/);
-  assert.equal(parsed.host, os.hostname());
-  assert.ok(parsed.created_at >= before && parsed.created_at <= Date.now());
-  assert.deepEqual(parseLockRecord(seen), parsed);
-  assert.equal(fs.existsSync(`${target}.lock`), false);
-  // Injected entropy shapes temporary names only; the token stays random.
-  let second = null;
-  files(fs, { random_bytes: () => Buffer.alloc(16, 7) }).withWriterLock(target, () => { second = JSON.parse(fs.readFileSync(`${target}.lock`, "utf8")).token; });
-  assert.notEqual(second, parsed.token);
-  assert.notEqual(second, "07".repeat(16));
-});
-
-// Only an exact record identifies an owner.
-{
-  for (const body of ["", "locked", `${process.pid}.${"ab".repeat(16)}`, "[]", "null", JSON.stringify({ pid: process.pid }),
-    record({ extra: true }), record({ pid: 0 }), record({ pid: 1.5 }), record({ token: "AB".repeat(16) }), record({ token: "ab".repeat(8) }),
-    record({ host: "" }), record({ created_at: -1 }), record({ version: 2 }), record({ token: "ab".repeat(16) }).replace("}", `,"pad":"${"x".repeat(600)}"}`)]) {
-    assert.equal(parseLockRecord(body), null, body.slice(0, 60));
+  for (const bad of [null, {}, { tryLock: () => true }, { unlock() {} }, "lock"]) {
+    throwsCode(() => files(fs, { advisory_lock: bad }), "probe_options", JSON.stringify(bad));
   }
 }
 
-// The probe classification: EPERM is alive, only ESRCH is dead, and anything
-// else is unverifiable.  No pid or signal is chosen here.
-{
-  assert.equal(classifyLivenessProbe({ code: "ESRCH" }), "dead");
-  assert.equal(classifyLivenessProbe({ code: "EPERM" }), "alive");
-  assert.equal(classifyLivenessProbe({ code: "EACCES" }), "unverifiable");
-  assert.equal(classifyLivenessProbe(new Error("no code")), "unverifiable");
-  assert.equal(classifyLivenessProbe(undefined), "unverifiable");
-}
-
-// A dead owner's lock is reclaimed: the next writer acquires, writes its own
-// record into a fresh inode, and releases cleanly.
+// The lock is a permanent, empty, owner-only file that is held for exactly
+// the duration of the action and never removed.  Its inode is stable across
+// acquisitions: the second writer locks the very same object as the first.
 withDirectory((directory) => {
-  const stale = record({ pid: deadPid() });
-  const target = plantLock(directory, stale);
-  let held = null;
-  const result = files().withWriterLock(target, () => {
-    held = JSON.parse(fs.readFileSync(`${target}.lock`, "utf8"));
+  const target = path.join(directory, "state.json");
+  const lockPath = `${target}.lock`;
+  let insideStats = null;
+  assert.equal(files().withWriterLock(target, () => {
+    insideStats = fs.lstatSync(lockPath);
+    assert.equal(unheld(lockPath), false, "the lock is held for the whole action");
     return "written";
+  }), "written");
+  assert.equal(insideStats.isFile(), true);
+  assert.equal(insideStats.size, 0, "the lock carries no body at all");
+  assert.equal(insideStats.mode & 0o777, FILE_MODE);
+  assert.equal(fs.existsSync(lockPath), true, "the lock file is permanent");
+  assert.equal(fs.lstatSync(lockPath).size, 0, "release writes nothing into the lock");
+  assert.equal(unheld(lockPath), true, "release hands the lock back to the kernel");
+  files().withWriterLock(target, () => {
+    const again = fs.lstatSync(lockPath);
+    assert.equal(again.ino, insideStats.ino, "the second writer locks the same inode");
+    assert.equal(again.dev, insideStats.dev);
   });
-  assert.equal(result, "written");
-  assert.equal(held.pid, process.pid);
-  assert.notEqual(held.token, JSON.parse(stale).token, "the reclaimed lock carries the new writer's own record");
-  assert.equal(fs.existsSync(`${target}.lock`), false);
+  // Injected entropy shapes temporary names only; it never reaches the lock.
+  files(fs, { random_bytes: () => Buffer.alloc(16, 7) }).withWriterLock(target, () => {
+    assert.equal(fs.lstatSync(lockPath).size, 0);
+  });
 });
 
-// A live owner, an EPERM owner, a foreign host, or an unidentifiable body
-// fails closed and is left untouched; an unsafe lock is reported as unsafe.
+// Two-directional: a lock file's metadata is not part of the verdict.  With
+// no holder every one of these bodies is acquired; with a live holder every
+// one of them is refused.  Neither direction changes the file.
 withDirectory((directory) => {
-  const target = path.join(directory, "state.json");
-  let init = null;
-  try { process.kill(1, 0); } catch (error) { init = error.code; }
-  assert.ok(init === null || init === "EPERM");
-  for (const body of [record({}), record({ pid: 1 }), record({ pid: deadPid(), host: "elsewhere.invalid" }), "", `${deadPid()}.${"ab".repeat(16)}`]) {
-    fs.writeFileSync(`${target}.lock`, body, { mode: FILE_MODE, flag: "wx" });
-    throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_locked");
-    assert.equal(fs.readFileSync(`${target}.lock`, "utf8"), body);
-    fs.unlinkSync(`${target}.lock`);
-  }
-  fs.writeFileSync(`${target}.lock`, record({ pid: deadPid() }), { mode: 0o644, flag: "wx" });
-  throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_unsafe");
-  assert.equal(fs.existsSync(`${target}.lock`), true);
-  fs.unlinkSync(`${target}.lock`);
-  fs.symlinkSync(path.join(directory, "elsewhere"), `${target}.lock`);
-  throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_unsafe");
-  assert.equal(fs.lstatSync(`${target}.lock`).isSymbolicLink(), true);
-});
-
-// Replacement between judgement and unlink: a different inode is detected by
-// dev+ino; the Linux inode-reuse shape (same dev+ino, forged by the stubbed
-// lstat) is detected only by the exact record.  Either way the live
-// replacement stays and its owner is honoured.
-for (const forgeInode of [false, true]) {
-  withDirectory((directory) => {
-    const target = plantLock(directory, record({ pid: deadPid() }));
+  const bodies = ["", "locked", "{}", "null", "[]", JSON.stringify({ version: 1, pid: process.pid, token: "ab".repeat(16), host: os.hostname(), created_at: Date.now() }), "x".repeat(600)];
+  for (const body of bodies) {
+    const target = plantLock(directory, body);
     const lockPath = `${target}.lock`;
-    const replacement = record({});
-    let inspections = 0;
-    let original = null;
-    const replacingFs = Object.create(fs);
-    replacingFs.lstatSync = (inspected) => {
-      if (inspected !== lockPath) return fs.lstatSync(inspected);
-      inspections += 1;
-      if (inspections === 1) {
-        original = fs.lstatSync(inspected);
-        return original;
-      }
-      if (inspections === 2) {
-        fs.unlinkSync(lockPath);
-        fs.writeFileSync(lockPath, replacement, { mode: FILE_MODE, flag: "wx" });
-      }
-      const stats = fs.lstatSync(inspected);
-      if (forgeInode) {
-        stats.dev = original.dev;
-        stats.ino = original.ino;
-      }
-      return stats;
-    };
-    assert.throws(() => files(replacingFs).withWriterLock(target, () => assert.fail("must not acquire")),
-      (error) => error instanceof ProbeStoreError && error.code === "probe_locked", `forgeInode=${forgeInode}: expected probe_locked`);
-    assert.equal(inspections, 2, `forgeInode=${forgeInode}`);
-    assert.equal(fs.readFileSync(lockPath, "utf8"), replacement, `forgeInode=${forgeInode}: the replacement stays`);
-  });
-}
+    const label = JSON.stringify(body.slice(0, 40));
 
-// A lock released between the failed create and the inspection is simply
-// retried; a lock that is dead again after every reclaim is retried at most
-// MAX_LOCK_ATTEMPTS times and then refused, with no waiting anywhere.
+    assert.equal(files().withWriterLock(target, () => "acquired"), "acquired", `${label}: an unheld lock is acquired whatever it says`);
+    assert.equal(fs.readFileSync(lockPath, "utf8"), body, `${label}: acquiring never rewrites the lock`);
+
+    const holder = holdLock(lockPath);
+    try {
+      throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_locked", `${label}: a held lock is refused whatever it says`);
+    } finally { holder.release(); }
+    assert.equal(fs.readFileSync(lockPath, "utf8"), body, `${label}: a refusal never rewrites the lock`);
+
+    assert.equal(files().withWriterLock(target, () => "acquired"), "acquired", `${label}: the released lock is available again`);
+    fs.unlinkSync(lockPath);
+    fs.rmSync(target, { force: true });
+  }
+});
+
+// A writer that died leaves nothing to reclaim: the kernel dropped its lock
+// when its descriptors closed, and the file it left behind is simply locked
+// again.  A live foreign holder is honoured for exactly as long as it lives.
 withDirectory((directory) => {
   const target = path.join(directory, "state.json");
-  let opens = 0;
-  const vanishingFs = Object.create(fs);
-  vanishingFs.openSync = (inspected, flags, ...rest) => {
-    if (inspected === `${target}.lock` && flags === "wx") {
-      opens += 1;
-      if (opens === 1) { const error = new Error("EEXIST"); error.code = "EEXIST"; throw error; }
-    }
-    return fs.openSync(inspected, flags, ...rest);
-  };
-  assert.equal(files(vanishingFs).withWriterLock(target, () => "written"), "written");
-  assert.equal(opens, 2);
+  const lockPath = `${target}.lock`;
+  files().withWriterLock(target, () => "first");
+  const holder = holdLock(lockPath);
+  throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_locked");
+  holder.release();
+  assert.equal(files().withWriterLock(target, () => "after"), "after", "the lock outlives its holder without any recovery step");
 });
+
+// An unsafe lock object is refused outright rather than retried: a mode that
+// lets another user open it, a file that is not a regular file, and a symlink
+// at the lock path.  None of them is repaired, replaced, or removed.
 withDirectory((directory) => {
-  const target = plantLock(directory, record({ pid: deadPid() }));
+  const target = plantLock(directory, "", 0o644);
+  const lockPath = `${target}.lock`;
+  throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_unsafe");
+  assert.equal(fs.lstatSync(lockPath).mode & 0o777, 0o644, "the unsafe lock is left exactly as found");
+  fs.unlinkSync(lockPath);
+
+  fs.symlinkSync(path.join(directory, "elsewhere"), lockPath);
+  throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_unsafe");
+  assert.equal(fs.lstatSync(lockPath).isSymbolicLink(), true, "the symlink is left in place");
+  assert.equal(fs.existsSync(path.join(directory, "elsewhere")), false, "O_NOFOLLOW never created the symlink's target");
+  fs.unlinkSync(lockPath);
+
+  fs.mkdirSync(lockPath, { mode: DIRECTORY_MODE });
+  throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_failed");
+  assert.equal(fs.lstatSync(lockPath).isDirectory(), true);
+});
+
+// An unavailable primitive is a hard failure, never a fallback.  There is no
+// path-based lock to fall back to, and writing unprotected is the defect.
+withDirectory((directory) => {
+  const target = path.join(directory, "state.json");
+  const { AdvisoryLockError } = require("./durable-store-advisory-lock");
+  const unavailable = {
+    tryLock() { throw new AdvisoryLockError("unavailable", "no kernel support"); },
+    unlock() { throw new AdvisoryLockError("unavailable", "no kernel support"); },
+  };
+  throwsCode(() => files(fs, { advisory_lock: unavailable }).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_failed");
+  assert.equal(fs.existsSync(target), false, "nothing was written without a lock");
+  const broken = {
+    tryLock() { const error = new Error("EIO"); error.code = "EIO"; throw error; },
+    unlock() {},
+  };
+  assert.throws(() => files(fs, { advisory_lock: broken }).withWriterLock(target, () => assert.fail("must not acquire")),
+    (error) => error && error.code === "EIO", "an error the adapter never classified is not swallowed");
+});
+
+// Identity mismatch: the file at the path is not the file we locked.  That is
+// retried — the path is opened again — at most MAX_LOCK_ATTEMPTS times, and
+// then refused with the store's acquire-changed code.  No waiting anywhere,
+// and the thing at the path is never touched.
+withDirectory((directory) => {
+  const target = plantLock(directory, "planted");
   const lockPath = `${target}.lock`;
   let opens = 0;
-  let reclaimed = 0;
-  const respawningFs = Object.create(fs);
-  respawningFs.openSync = (inspected, flags, ...rest) => {
-    if (inspected === lockPath && flags === "wx") opens += 1;
-    return fs.openSync(inspected, flags, ...rest);
+  const forgingFs = Object.create(fs);
+  forgingFs.openSync = (inspected, ...rest) => {
+    if (inspected === lockPath) opens += 1;
+    return fs.openSync(inspected, ...rest);
   };
-  respawningFs.unlinkSync = (inspected) => {
-    fs.unlinkSync(inspected);
-    if (inspected === lockPath) {
-      reclaimed += 1;
-      fs.writeFileSync(lockPath, record({ pid: deadPid() }), { mode: FILE_MODE, flag: "wx" });
-    }
+  forgingFs.lstatSync = (inspected) => {
+    const stats = fs.lstatSync(inspected);
+    if (inspected === lockPath) stats.ino += 1;
+    return stats;
   };
   const started = Date.now();
-  throwsCode(() => files(respawningFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_locked");
-  assert.equal(opens, MAX_LOCK_ATTEMPTS);
-  assert.equal(reclaimed, MAX_LOCK_ATTEMPTS - 1);
+  throwsCode(() => files(forgingFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_acquire_changed");
+  assert.equal(opens, EXPECTED_LOCK_ATTEMPTS, "the mismatch is retried exactly three times");
   assert.ok(Date.now() - started < 1000, "bounded retries never wait");
-  assert.equal(fs.existsSync(lockPath), true);
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "planted", "the file at the path is left alone");
+  assert.equal(unheld(lockPath), true, "every abandoned attempt released its lock");
+});
+// A mismatch that clears on the second look is simply retried into a success.
+withDirectory((directory) => {
+  const target = plantLock(directory, "planted");
+  const lockPath = `${target}.lock`;
+  let inspections = 0;
+  const flakyFs = Object.create(fs);
+  flakyFs.lstatSync = (inspected) => {
+    const stats = fs.lstatSync(inspected);
+    if (inspected === lockPath) {
+      inspections += 1;
+      if (inspections === 1) stats.ino += 1;
+    }
+    return stats;
+  };
+  assert.equal(files(flakyFs).withWriterLock(target, () => "written"), "written");
+  assert.ok(inspections >= 2, "the first look disagreed and a second was taken");
+});
+// A lock that vanishes from the path while we hold it is the same mismatch,
+// and the vanished path is re-created by the retry rather than mourned.
+withDirectory((directory) => {
+  const target = plantLock(directory, "planted");
+  const lockPath = `${target}.lock`;
+  let removed = false;
+  const vanishingFs = Object.create(fs);
+  vanishingFs.fstatSync = (descriptor) => {
+    if (!removed) { removed = true; fs.unlinkSync(lockPath); }
+    return fs.fstatSync(descriptor);
+  };
+  assert.equal(files(vanishingFs).withWriterLock(target, () => "written"), "written");
+  assert.equal(fs.existsSync(lockPath), true, "the retry created the lock the vanishing removed");
+});
+
+// No production path ever unlinks, renames, or truncates a lock.  The
+// recorder below is proven able to see such a call by the atomic replace's
+// own temporary cleanup, which it does report.
+withDirectory((directory) => {
+  const touched = [];
+  const recordingFs = Object.create(fs);
+  recordingFs.unlinkSync = (inspected) => { touched.push(["unlink", inspected]); return fs.unlinkSync(inspected); };
+  recordingFs.renameSync = (from, to) => { touched.push(["rename", from, to]); return fs.renameSync(from, to); };
+  recordingFs.truncateSync = (inspected) => { touched.push(["truncate", inspected]); return fs.truncateSync(inspected); };
+  const target = path.join(directory, "state.json");
+  const layer = files(recordingFs);
+  layer.withWriterLock(target, () => layer.writeFileAtomically(target, "{\"a\":1}\n"));
+  const holder = holdLock(`${target}.lock`);
+  try { throwsCode(() => layer.withWriterLock(target, () => assert.fail("must not acquire")), "probe_locked"); }
+  finally { holder.release(); }
+  // A write that fails after its temporary exists, so the cleanup path runs
+  // under the same recorder.
+  const failingFs = Object.create(recordingFs);
+  failingFs.renameSync = (from, to) => { touched.push(["rename", from, to]); const error = new Error("EIO"); error.code = "EIO"; throw error; };
+  const failing = files(failingFs);
+  throwsCode(() => failing.withWriterLock(target, () => failing.writeFileAtomically(target, "{\"a\":2}\n")), "probe_write_failed");
+  assert.deepEqual(touched.filter((entry) => entry.slice(1).some((value) => String(value).endsWith(".lock"))), [],
+    `a lock path was mutated: ${JSON.stringify(touched)}`);
+  // Negative control: the recorder is not blind — it saw the temporary's
+  // rename, and the failed write's cleanup of its own temporary.
+  assert.equal(touched.some((entry) => entry[0] === "rename" && entry[2] === target), true, JSON.stringify(touched));
+  assert.equal(touched.some((entry) => entry[0] === "unlink" && entry[1].endsWith(".tmp")), true, JSON.stringify(touched));
+});
+
+// The action's own outcome wins over a failed release, and the descriptor is
+// closed either way — an abandoned descriptor would keep the lock forever.
+withDirectory((directory) => {
+  const target = path.join(directory, "state.json");
+  const lockPath = `${target}.lock`;
+  const { AdvisoryLockError: ReleaseError } = require("./durable-store-advisory-lock");
+  const failingRelease = {
+    tryLock: (descriptor) => advisory.tryLock(descriptor),
+    unlock() { throw new ReleaseError("failed", "unlock failed"); },
+  };
+  const layer = files(fs, { advisory_lock: failingRelease });
+  throwsCode(() => layer.withWriterLock(target, () => "committed"), "probe_lock_release_failed");
+  assert.equal(unheld(lockPath), true, "a failed unlock still closed the descriptor, which releases the lock");
+  const boom = new Error("the action failed");
+  assert.throws(() => layer.withWriterLock(target, () => { throw boom; }), (error) => error === boom,
+    "the action's error takes precedence over the release error");
+  assert.equal(unheld(lockPath), true);
+});
+
+// A lock file replaced underneath a live holder is reported at release: the
+// window this writer protected was not the window anyone else contended on.
+withDirectory((directory) => {
+  const target = path.join(directory, "state.json");
+  const lockPath = `${target}.lock`;
+  throwsCode(() => files().withWriterLock(target, () => {
+    fs.unlinkSync(lockPath);
+    fs.writeFileSync(lockPath, "", { mode: FILE_MODE, flag: "wx" });
+  }), "probe_lock_release_changed");
+  assert.equal(unheld(lockPath), true, "the descriptor was closed even though the release was reported changed");
 });
 
 // Atomic replace: the temporary is fsynced and renamed, the directory is

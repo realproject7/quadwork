@@ -12,24 +12,48 @@
 // vocabulary; this module only fills the slot each store names for a given
 // failure.  It never selects a path, a process, or a signal for a caller.
 //
-// #1064: the lock body is an owner record (pid, per-acquisition token, host,
-// creation instant).  A lock whose recorded owner is proven dead on this
-// host is reclaimed after re-checking that the very same file (dev+ino) with
-// the very same record is still at the path; a live, foreign, unverifiable,
-// or unidentifiable owner always fails closed with the store's `locked`
-// code.  Retries are bounded and never wait.
+// #1074: the writer lock is a whole-file advisory lock held on an open file
+// descriptor, not the existence of a file at a path.  The `.lock` file is a
+// permanent, empty, owner-only artifact: it is created once and then kept
+// forever, because the lock lives in the kernel and the file is only the
+// object the kernel keys it to.  Nothing in this module ever unlinks,
+// renames, or truncates a lock path, and there is no owner record, no
+// liveness probe, and no reaper — a dead writer's lock is released by the
+// kernel when its descriptors close, so there is nothing left to reclaim.
+//
+// Path-addressed reasoning is what made the old lock unsafe: a writer could
+// verify the identity of the file at a path and then act on that judgement
+// *by path*, and a legitimate replacement in that window was deleted by the
+// verifier.  Here the acquisition is the kernel call itself; identity is only
+// re-checked afterwards, and a mismatch is answered by dropping the lock and
+// retrying — bounded, never by removing anything.
+//
+// Consequence for operators: the `.lock` file existing means nothing, and
+// deleting one while a writer holds it silently breaks mutual exclusion,
+// because the next writer then creates a *different* file and locks that.
+// docs/troubleshooting.md states this next to the opposite rule for the
+// transient `config.lock`.
 
 const crypto = require("node:crypto");
-const os = require("node:os");
+const nodeFsConstants = require("node:fs").constants;
 const path = require("node:path");
+const { AdvisoryLockError, advisoryLockAdapter } = require("./durable-store-advisory-lock");
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
-const LOCK_RECORD_VERSION = 1;
-const LOCK_RECORD_FIELDS = Object.freeze(["created_at", "host", "pid", "token", "version"]);
-const MAX_LOCK_RECORD_BYTES = 512;
+// Only an identity mismatch (the file under the path changed while we were
+// taking the kernel lock on it) is retried, and only this many times.  There
+// is no waiting anywhere: contention is reported, never slept on.
 const MAX_LOCK_ATTEMPTS = 3;
-const TOKEN_RE = /^[a-f0-9]{32}$/;
+// O_NOFOLLOW is what keeps the lock from ever being taken through a symlink.
+// It is not optional: a platform that cannot express it is reported as an
+// unsafe lock rather than silently opening without it.
+const LOCK_OPEN_FLAGS = typeof nodeFsConstants.O_NOFOLLOW === "number"
+  ? (nodeFsConstants.O_CREAT | nodeFsConstants.O_RDWR | nodeFsConstants.O_NOFOLLOW)
+  : null;
+// O_NOFOLLOW answers a symlink with ELOOP on Linux/macOS; some BSD kernels
+// answer EMLINK.  Both mean "the lock path is a symlink", never "busy".
+const SYMLINK_OPEN_CODES = Object.freeze(["ELOOP", "EMLINK"]);
 const REQUIRED_FS = Object.freeze([
   "mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync",
   "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync",
@@ -53,49 +77,6 @@ function ownerUid() {
   try { return typeof process.getuid === "function" ? process.getuid() : null; }
   catch { return null; }
 }
-// The lock file body is this writer's proof of ownership. dev+ino alone cannot
-// prove it: Linux reuses an inode number as soon as the old lock is unlinked
-// and closed, so a replacement lock can carry the original's identity.  The
-// token is never derived from injected entropy; it must be unforgeable.
-function lockRecord() {
-  return JSON.stringify({
-    version: LOCK_RECORD_VERSION,
-    pid: process.pid,
-    token: crypto.randomBytes(16).toString("hex"),
-    host: os.hostname(),
-    created_at: Date.now(),
-  });
-}
-function parseLockRecord(raw) {
-  if (typeof raw !== "string" || raw.length === 0 || Buffer.byteLength(raw, "utf8") > MAX_LOCK_RECORD_BYTES) return null;
-  let value;
-  try { value = JSON.parse(raw); } catch { return null; }
-  if (!plain(value)) return null;
-  const keys = Object.keys(value).sort();
-  if (keys.length !== LOCK_RECORD_FIELDS.length || keys.some((key, index) => key !== LOCK_RECORD_FIELDS[index])) return null;
-  if (value.version !== LOCK_RECORD_VERSION || !Number.isSafeInteger(value.pid) || value.pid < 1 ||
-      typeof value.token !== "string" || !TOKEN_RE.test(value.token) ||
-      typeof value.host !== "string" || value.host.length === 0 || value.host.length > 255 ||
-      !Number.isSafeInteger(value.created_at) || value.created_at < 0) {
-    return null;
-  }
-  return { version: LOCK_RECORD_VERSION, pid: value.pid, token: value.token, host: value.host, created_at: value.created_at };
-}
-// A signal-0 probe answers "alive" both when it succeeds and when it is
-// refused: EPERM means the process exists but belongs to someone else.  Only
-// ESRCH proves the pid is gone; anything else cannot be verified.
-function classifyLivenessProbe(error) {
-  const code = error && error.code;
-  if (code === "ESRCH") return "dead";
-  if (code === "EPERM") return "alive";
-  return "unverifiable";
-}
-function ownerLiveness(pid) {
-  try { process.kill(pid, 0); }
-  catch (error) { return classifyLivenessProbe(error); }
-  return "alive";
-}
-
 function createDurableStoreFiles(options) {
   if (!plain(options)) throw new TypeError("durable store files require an options object");
   const StoreError = options.error;
@@ -111,6 +92,14 @@ function createDurableStoreFiles(options) {
   }
   const randomBytes = options.random_bytes === undefined ? crypto.randomBytes : options.random_bytes;
   if (typeof randomBytes !== "function") fail(codes.options, "random_bytes must be a function");
+  // The kernel half of the writer lock.  Production stores never pass this;
+  // they share the process-wide adapter.  It is injectable only so a test can
+  // substitute a *deliberately wrong* primitive and prove that the exclusion
+  // this module reports actually comes from the kernel call.
+  const advisory = options.advisory_lock === undefined ? advisoryLockAdapter() : options.advisory_lock;
+  if (!advisory || typeof advisory.tryLock !== "function" || typeof advisory.unlock !== "function") {
+    fail(codes.options, "advisory_lock must expose tryLock and unlock");
+  }
 
   function lstatOrNull(target) {
     try { return fs.lstatSync(target); }
@@ -196,115 +185,103 @@ function createDurableStoreFiles(options) {
     }
   }
 
-  function lockStat(lockPath) {
-    const stats = lstatOrNull(lockPath);
-    if (stats === null) return null;
+  // The kernel's verdict is the whole acquisition; everything below only
+  // decides whether the file it was taken on is one this store may use.
+  //
+  // `mismatch` is not a failure: it means the file at the path changed
+  // identity between our open and our check, so this descriptor's lock
+  // protects the wrong object.  The answer is to drop it and open the path
+  // again — never to remove whatever is there now.
+  function openLockDescriptor(lockPath) {
+    if (LOCK_OPEN_FLAGS === null) {
+      fail(codes.lock_unsafe, "durable store writer lock requires O_NOFOLLOW, which this platform does not provide");
+    }
+    try { return fs.openSync(lockPath, LOCK_OPEN_FLAGS, FILE_MODE); }
+    catch (error) {
+      if (error && SYMLINK_OPEN_CODES.includes(error.code)) {
+        fail(codes.lock_unsafe, "durable store writer lock path is a symbolic link");
+      }
+      fail(codes.lock_failed, "durable store writer lock cannot be opened");
+    }
+  }
+  // Raise the store's own code for whatever the kernel half reported.  An
+  // unavailable primitive is a hard failure, never contention: a store that
+  // cannot be protected must refuse to write, not write unprotected.
+  function failAdvisory(error, releasing) {
+    if (error instanceof AdvisoryLockError) {
+      fail(releasing ? codes.lock_release_failed : codes.lock_failed,
+        error.reason === "unavailable"
+          ? "durable store writer lock cannot be enforced on this platform or filesystem"
+          : "durable store writer lock primitive failed");
+    }
+    throw error;
+  }
+  // Checked only *after* the lock is held, because before that the answer is
+  // worthless: anyone may replace the file between the check and the open.
+  // fstat describes the object we locked; lstat describes what the path names
+  // now.  Only their disagreement is retryable; an object that is not an
+  // owner-only regular file is unsafe outright.
+  function verifyLockedDescriptor(lockPath, descriptor) {
     const uid = ownerUid();
-    if (stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== FILE_MODE || (uid !== null && stats.uid !== uid)) {
+    let opened;
+    try { opened = fs.fstatSync(descriptor); }
+    catch { fail(codes.lock_failed, "durable store writer lock cannot be inspected"); }
+    if (!opened.isFile() || modeOf(opened) !== FILE_MODE || (uid !== null && opened.uid !== uid)) {
       fail(codes.lock_unsafe, "durable store writer lock is unsafe");
     }
-    return stats;
+    // Only identity is asked of the path.  Re-asking it for mode or owner
+    // would be asking about the inode `sameFile` has just proven is the one
+    // fstat already answered for, and a check that cannot fire on its own is
+    // not a check.  A symlink or a different object at the path is a
+    // mismatch, and the retry's own O_NOFOLLOW open is what refuses it.
+    const current = lstatOrNull(lockPath);
+    if (current === null || !sameFile(opened, current)) return "mismatch";
+    return "ok";
   }
-  // Read the record of a lock someone else holds, through a descriptor that
-  // is proven (dev+ino) to be the file lstat saw.  `null` means the lock is
-  // gone; a `record` of null means the body cannot identify an owner.
-  function readHeldLock(lockPath) {
-    const stats = lockStat(lockPath);
-    if (stats === null) return null;
-    let descriptor;
-    try { descriptor = fs.openSync(lockPath, "r"); }
-    catch (error) {
-      if (error && error.code === "ENOENT") return null;
-      fail(codes.unreadable, "durable store writer lock cannot be opened");
-    }
-    let raw = null;
-    try {
-      const opened = fs.fstatSync(descriptor);
-      if (sameFile(stats, opened) && opened.isFile() && modeOf(opened) === FILE_MODE && opened.size <= MAX_LOCK_RECORD_BYTES) {
-        raw = fs.readFileSync(descriptor, "utf8");
-      }
-    } catch (error) {
-      if (error instanceof StoreError) throw error;
-      fail(codes.unreadable, "durable store writer lock cannot be read");
-    } finally {
-      try { fs.closeSync(descriptor); } catch { /* the descriptor is only for this read */ }
-    }
-    return { stats, raw, record: raw === null ? null : parseLockRecord(raw) };
-  }
-  // Reclaim a lock only after its recorded owner is proven dead on this host,
-  // and only if the exact judged file (dev+ino) still carries the exact judged
-  // record at the path.  Returns true when the caller may try the path again
-  // and false when the lock must stay: a live, foreign, unverifiable, or
-  // unidentifiable owner, or any replacement that appeared meanwhile.
-  function reclaimDeadOwnerLock(lockPath) {
-    const held = readHeldLock(lockPath);
-    if (held === null) return true;
-    if (held.record === null || held.record.host !== os.hostname() || ownerLiveness(held.record.pid) !== "dead") return false;
-    const current = lockStat(lockPath);
-    if (current === null) return true;
-    if (!sameFile(held.stats, current)) return false;
-    let raw;
-    try { raw = fs.readFileSync(lockPath, "utf8"); }
-    catch (error) {
-      if (error && error.code === "ENOENT") return true;
-      fail(codes.unreadable, "durable store writer lock cannot be re-read");
-    }
-    if (raw !== held.raw) return false;
-    try { fs.unlinkSync(lockPath); }
-    catch (error) {
-      if (error && error.code === "ENOENT") return true;
-      fail(codes.lock_failed, "dead owner's writer lock could not be reclaimed");
-    }
-    return true;
+  function dropLock(descriptor) {
+    try { advisory.unlock(descriptor); } catch { /* the close below releases it regardless */ }
+    try { fs.closeSync(descriptor); } catch { /* the descriptor is being abandoned */ }
   }
   function acquireLock(lockPath) {
-    for (let attempt = 1; ; attempt += 1) {
-      let descriptor;
-      try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); }
+    for (let attempt = 1; attempt <= MAX_LOCK_ATTEMPTS; attempt += 1) {
+      const descriptor = openLockDescriptor(lockPath);
+      let acquired;
+      try { acquired = advisory.tryLock(descriptor); }
       catch (error) {
-        if (!error || error.code !== "EEXIST") fail(codes.lock_failed, "durable store writer lock cannot be acquired");
-        if (attempt >= MAX_LOCK_ATTEMPTS || !reclaimDeadOwnerLock(lockPath)) {
-          fail(codes.locked, "durable store writer lock is held by a live or unverifiable owner");
-        }
-        continue;
+        try { fs.closeSync(descriptor); } catch { /* fail closed */ }
+        failAdvisory(error, false);
       }
-      return initializeLock(lockPath, descriptor);
+      if (!acquired) {
+        try { fs.closeSync(descriptor); } catch { /* fail closed */ }
+        fail(codes.locked, "durable store writer lock is held by another writer");
+      }
+      let verdict;
+      try { verdict = verifyLockedDescriptor(lockPath, descriptor); }
+      catch (error) { dropLock(descriptor); throw error; }
+      if (verdict === "ok") return { descriptor, lockPath, stats: fs.fstatSync(descriptor) };
+      dropLock(descriptor);
     }
+    fail(codes.lock_acquire_changed, "durable store writer lock changed during acquisition");
   }
-  function initializeLock(lockPath, descriptor) {
-    const record = lockRecord();
-    let stats = null;
-    try {
-      fs.writeFileSync(descriptor, record, "utf8");
-      fs.chmodSync(lockPath, FILE_MODE);
-      fs.fsyncSync(descriptor);
-      stats = fs.fstatSync(descriptor);
-      if (!sameFile(stats, lockStat(lockPath))) fail(codes.lock_acquire_changed, "durable store writer lock changed during acquisition");
-    } catch (error) {
-      try { fs.closeSync(descriptor); } catch { /* fail closed */ }
-      // This cleanup is only for the just-created, never-returned lock.  A
-      // mismatched replacement is retained fail-closed for explicit recovery.
-      try {
-        if (sameFile(stats, lockStat(lockPath)) && fs.readFileSync(lockPath, "utf8") === record) fs.unlinkSync(lockPath);
-      } catch { /* a replacement remains in place */ }
-      if (error instanceof StoreError) throw error;
-      fail(codes.lock_failed, "durable store writer lock cannot be initialized");
-    }
-    return { descriptor, lockPath, stats, record };
-  }
+  // Release always closes the descriptor, whatever else goes wrong: an open
+  // descriptor is the lock, so leaking one would wedge the store far worse
+  // than reporting a failed release does.
+  //
+  // The identity re-check is a detector, not a guarantee.  If the lock file
+  // was replaced while we held it, our exclusion protected an object nobody
+  // else was contending on, and the caller is told so rather than left to
+  // assume the window was safe.
   function releaseLock(lock) {
+    let changed = false;
+    try { changed = !sameFile(lock.stats, lstatOrNull(lock.lockPath)); }
+    catch { changed = true; }
+    let unlockError = null;
+    try { advisory.unlock(lock.descriptor); } catch (error) { unlockError = error; }
     let closeError = null;
     try { fs.closeSync(lock.descriptor); } catch (error) { closeError = error; }
-    try {
-      if (!sameFile(lock.stats, lockStat(lock.lockPath)) || fs.readFileSync(lock.lockPath, "utf8") !== lock.record) {
-        fail(codes.lock_release_changed, "durable store writer lock changed before release");
-      }
-      fs.unlinkSync(lock.lockPath);
-    } catch (error) {
-      if (error instanceof StoreError) throw error;
-      fail(codes.lock_release_failed, "durable store writer lock could not be released");
-    }
-    if (closeError) fail(codes.lock_release_failed, "durable store writer lock could not be closed");
+    if (unlockError !== null) failAdvisory(unlockError, true);
+    if (closeError !== null) fail(codes.lock_release_failed, "durable store writer lock could not be closed");
+    if (changed) fail(codes.lock_release_changed, "durable store writer lock changed before release");
   }
   // The action's own result or error always wins over a failed release: a
   // failed release leaves an owner-only lock behind, which every later
@@ -330,9 +307,8 @@ module.exports = {
   FILE_MODE,
   DIRECTORY_MODE,
   MAX_LOCK_ATTEMPTS,
+  LOCK_OPEN_FLAGS,
   modeOf,
   sameFile,
-  parseLockRecord,
-  classifyLivenessProbe,
   createDurableStoreFiles,
 };
