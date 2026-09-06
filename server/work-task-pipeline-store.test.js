@@ -226,8 +226,8 @@ withDirectory((directory) => {
   };
   const writes = [];
   const countingFs = Object.create(fs);
-  // The writer lock record is written through its descriptor; only a path
-  // target is a state or temporary file write.
+  // #1074: the writer lock has no body at all, so nothing is ever written to
+  // it — every path-targeted write below is a state or temporary file write.
   countingFs.writeFileSync = (target, ...rest) => { if (typeof target === "string") writes.push(target); return fs.writeFileSync(target, ...rest); };
   countingFs.renameSync = (from, to) => { writes.push(String(to)); return fs.renameSync(from, to); };
   const counting = createWorkTaskPipelineStore({ config_dir: directory, fs: countingFs });

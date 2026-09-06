@@ -294,7 +294,13 @@ if (process.argv[2] === "--contend") {
 // their protected action and an empty overlap can never mean "one never ran".
 const SECTION_PREFIX = "section-";
 const RENDEZVOUS_DEADLINE_MS = 15_000;
-const SECTION_HOLD_MS = 800;
+// How long a racer stays inside its protected action.  It is a safety net,
+// not the mechanism: the wait below ends as soon as the other racer has
+// either joined it inside (which only a broken primitive allows), been turned
+// away, or finished.  A hold that ended on a timer instead would make this
+// race a question about scheduling latency, and it flaked as exactly that
+// under load before the stop conditions were made explicit.
+const SECTION_HOLD_MS = 5_000;
 const RACE_ADAPTERS = Object.freeze(["kernel", "bypass", "private-inode"]);
 
 class RaceStoreError extends Error {
@@ -379,21 +385,36 @@ if (process.argv[2] === "--mutex-race") {
   // A loser retries rather than giving up, so both roles certainly enter
   // their protected action and "no overlap" can never mean "never ran".
   const deadline = Date.now() + RENDEZVOUS_DEADLINE_MS;
+  let refusals = 0;
   for (;;) {
     try {
       files.withWriterLock(target, () => {
         enterSection(rendezvous, role);
-        // Stay inside long enough that a second entrant would certainly be
-        // seen.  With a correct primitive nobody can arrive, and this is
-        // just a bounded wait; with a broken one the other role is already
-        // here and the overlap is recorded at its own entry.
-        waitForAny(rendezvous, [`${SECTION_PREFIX}${other}`], SECTION_HOLD_MS);
+        // Stay inside until the other racer's fate is settled, so a second
+        // entrant is certainly seen if one is possible at all.  Exactly one
+        // of these three becomes true, and which one is the whole result:
+        // it joined this section (a broken primitive), it was turned away (a
+        // working one), or it already finished (it went first).
+        waitForAny(rendezvous, [`${SECTION_PREFIX}${other}`, `refused-${other}`, `${other}-done`], SECTION_HOLD_MS);
         exitSection(rendezvous, role);
       });
+      // How many times this role was actually turned away.  With a correct
+      // primitive the loser must be turned away at least once while the
+      // winner sits in its section; a race where nobody was ever refused
+      // never exercised exclusion at all, whatever its overlap report says.
+      fs.writeSync(1, `REFUSALS ${role} ${refusals}\n`);
       fs.writeSync(1, "OK\n");
       break;
     } catch (error) {
-      if (error && error.code === RACE_CODES.locked && Date.now() < deadline) { sleepBriefly(); continue; }
+      if (error && error.code === RACE_CODES.locked && Date.now() < deadline) {
+        refusals += 1;
+        // Published so the holder can stop waiting the moment exclusion is
+        // observed working, instead of burning the safety net every run.
+        fs.writeFileSync(path.join(rendezvous, `refused-${role}`), "", { mode: 0o600 });
+        sleepBriefly();
+        continue;
+      }
+      fs.writeSync(1, `REFUSALS ${role} ${refusals}\n`);
       fs.writeSync(1, `REFUSED ${error && error.code}\n`);
       break;
     }
@@ -828,7 +849,12 @@ async function runMutexRace(adapterName) {
       assert.equal(verdict(racer.output()), "OK", `${context}: the ${role} racer never committed`);
     }
     assert.equal(entries.length, 2, `${context}: both racers must enter a protected action`);
-    return { entries, overlaps: entries.filter((entry) => entry.others.length > 0), context };
+    const refusals = [left, right].reduce((total, racer) => {
+      const reported = /^REFUSALS \S+ (\d+)$/m.exec(racer.output());
+      assert.ok(reported, `${context}: a racer did not report its refusals`);
+      return total + Number(reported[1]);
+    }, 0);
+    return { entries, overlaps: entries.filter((entry) => entry.others.length > 0), refusals, context };
   });
 }
 
@@ -837,6 +863,10 @@ async function runMutexRace(adapterName) {
 async function mutualExclusionAcrossProcesses() {
   const race = await runMutexRace("kernel");
   assert.deepEqual(race.overlaps, [], `two writers were inside their protected actions at once: ${race.context}`);
+  // Exclusion was exercised, not merely unviolated: one racer was turned
+  // away while the other held the lock.  Without this, two runs that never
+  // met would report the same empty overlap as a lock that works.
+  assert.ok(race.refusals >= 1, `neither racer was ever refused, so exclusion was never exercised: ${race.context}`);
 }
 
 // The two ways the claim above could be vacuous, each asserted here rather
@@ -847,6 +877,7 @@ async function wrongPrimitiveOverlaps(adapterName) {
   const race = await runMutexRace(adapterName);
   assert.ok(race.overlaps.length > 0,
     `${adapterName} must overlap, or the race proves nothing about the correct primitive: ${race.context}`);
+  assert.equal(race.refusals, 0, `${adapterName} refused a writer, so it is not the always-granting control it must be: ${race.context}`);
 }
 
 async function suite() {
