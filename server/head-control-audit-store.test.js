@@ -12,6 +12,10 @@ const {
   headControlAuditStorePath,
   createHeadControlAuditStore,
 } = require("./head-control-audit-store");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
+
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
 
 const BINDING = Object.freeze({
   installation_id: "installationaudit001",
@@ -179,24 +183,38 @@ function testDirectorySymlinkAndStaleLockFailClosed() {
   const store = createHeadControlAuditStore({ config_dir: configDir, fs });
   expectCode(() => store.read(BINDING), "head_control_audit_store_symlink_rejected");
 
+  // #1074: the `.lock` file is permanent, so its presence proves nothing and
+  // planting one no longer refuses anything.  What refuses is a live holder
+  // of the kernel lock on it — asserted here in both directions, so a store
+  // that simply refused everything could not pass.
   const separateConfig = temporaryConfigDirectory();
   const separateStore = createHeadControlAuditStore({ config_dir: separateConfig, fs });
   separateStore.append({ binding: BINDING, audit: audit() });
   const lockPath = `${headControlAuditStorePath(separateConfig, BINDING)}.lock`;
-  fs.writeFileSync(lockPath, "locked\n", { mode: FILE_MODE, flag: "wx" });
-  fs.chmodSync(lockPath, FILE_MODE);
-  expectCode(() => separateStore.append({ binding: BINDING, audit: audit(2) }), "head_control_audit_store_locked");
+  assert.equal(fs.lstatSync(lockPath).isFile(), true, "the first append left the permanent lock behind");
+  const holder = fs.openSync(lockPath, "r+");
+  try {
+    assert.equal(advisory.tryLock(holder), true, "the test holder took the lock");
+    expectCode(() => separateStore.append({ binding: BINDING, audit: audit(2) }), "head_control_audit_store_locked");
+    advisory.unlock(holder);
+  } finally { fs.closeSync(holder); }
+  assert.equal(separateStore.append({ binding: BINDING, audit: audit(2) }).count, 2,
+    "the released lock lets the very same append through");
 }
 
-// Linux reuses inode numbers eagerly, so a lock replaced after this writer
-// closed its descriptor can report the original dev+ino. The stubbed lstat
-// forces exactly that; only the lock token can then prove the replacement.
-function testForcedInodeReuseFailsClosedOnRelease() {
+// #1074 successor.  The claim is unchanged — a replacement lock carrying the
+// original dev+ino is never unlinked by the writer that held the original —
+// but the outcome is not.  The writer never acts on the lock *path*, so it
+// finishes its action and leaves the replacement exactly as it found it.
+function testForcedInodeReuseNeverTouchesTheReplacement() {
   const configDir = temporaryConfigDirectory();
   const lockPath = `${headControlAuditStorePath(configDir, BINDING)}.lock`;
   let inspections = 0;
   let original = null;
+  const touched = [];
   const replacingFs = Object.create(fs);
+  replacingFs.unlinkSync = (target) => { touched.push(["unlink", target]); return fs.unlinkSync(target); };
+  replacingFs.renameSync = (from, to) => { touched.push(["rename", from, to]); return fs.renameSync(from, to); };
   replacingFs.lstatSync = (target) => {
     if (target !== lockPath) return fs.lstatSync(target);
     inspections += 1;
@@ -214,9 +232,12 @@ function testForcedInodeReuseFailsClosedOnRelease() {
     return stats;
   };
   const store = createHeadControlAuditStore({ config_dir: configDir, fs: replacingFs });
-  expectCode(() => store.append({ binding: BINDING, audit: audit() }), "head_control_audit_store_lock_release_failed");
-  assert.equal(inspections, 2);
-  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+  assert.equal(store.append({ binding: BINDING, audit: audit() }).count, 1, "the writer finished its own action");
+  assert.equal(inspections, 2, "the lock path is inspected once at acquisition and once at release");
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock", "the replacement is left exactly as it was found");
+  assert.deepEqual(touched.filter(([, ...targets]) => targets.some((target) => String(target).endsWith(".lock"))), [],
+    `the writer touched a lock path: ${JSON.stringify(touched)}`);
+  assert.equal(touched.some(([kind]) => kind === "rename"), true, "the recorder is not blind: it saw the atomic replace");
 }
 
 function testNoTransportOrProcessSurface() {
@@ -230,6 +251,6 @@ testIdentityConflictsAndRedactionBoundary();
 testBoundedRotationRetainsCurrentCorrelation();
 testCorruptSymlinkAndPermissionsFailClosed();
 testDirectorySymlinkAndStaleLockFailClosed();
-testForcedInodeReuseFailsClosedOnRelease();
+testForcedInodeReuseNeverTouchesTheReplacement();
 testNoTransportOrProcessSurface();
 console.log("head-control-audit-store tests passed");

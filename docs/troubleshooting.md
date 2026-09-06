@@ -425,6 +425,52 @@ resolving it by guesswork.
 
 ---
 
+## Two kinds of `.lock` file, with opposite meanings — #1074
+
+QuadWork has two lock files and they do **not** mean the same thing. Reading one
+as the other is how mutual exclusion gets broken by hand.
+
+**`~/.quadwork/config.lock` — transient. Its existence *is* the lock.**
+A configuration writer creates it, holds it for the length of one configuration
+write, and removes it. If it is there, someone is writing configuration, or a
+writer died mid-write. QuadWork never deletes it for you (a read-then-unlink has
+an unavoidable cross-process replacement race), so a genuinely stale one is an
+operator job: stop every writer with `npx quadwork stop`, confirm no QuadWork
+process is running, then delete `config.lock`.
+
+**A durable store's `<state-file>.lock` — permanent. Its existence means
+nothing at all.**
+Every V2 durable store keeps one of these beside its state file, for example
+`~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/record.json.lock`.
+It is created once, is always empty, and is **never removed** — not on release,
+not on shutdown, not on error. The lock is a whole-file advisory lock the kernel
+holds on an open descriptor; the file is only the object the kernel keys it to.
+A writer that dies releases its lock the instant its process ends, with the file
+still sitting there, and the next writer simply takes the lock again on the very
+same file. There is nothing stale to clean up, ever.
+
+**Deleting a store `.lock` while a writer holds it silently breaks mutual
+exclusion.** Nothing errors. The holder keeps its lock on an inode that no
+longer has a name, the next writer creates a *new* file at that path and locks
+*that* one, and both writers are then inside their protected actions at the same
+time — which is exactly the corruption the lock exists to prevent. The same goes
+for renaming, replacing, or restoring one from a backup.
+
+So:
+
+| | `config.lock` | `<state-file>.lock` |
+|---|---|---|
+| Lives for | one configuration write | forever |
+| Existence means | a write is in progress or was interrupted | nothing |
+| Safe to delete | yes, once every writer is stopped | **no — not ever** |
+| Recovering from a dead writer | delete it | nothing to do |
+
+If a store keeps reporting a `..._locked` code, something is genuinely holding
+that lock right now. Find the process (`npx quadwork stop`, then check for
+leftover `node` processes under `~/.quadwork`) rather than touching the file.
+
+---
+
 ## Resource staging matrix does not pass
 
 Start with the read-only diagnostic; do not begin by changing systemd or

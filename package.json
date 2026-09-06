@@ -41,7 +41,7 @@
     "release:major": "npm version major && git push origin main --follow-tags && VERSION=$(node -p 'require(\"./package.json\").version') && gh release create \"v$VERSION\" --generate-notes --latest && npm publish"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3.0"
   },
   "keywords": [
     "ai",

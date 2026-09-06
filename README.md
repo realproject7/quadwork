@@ -93,7 +93,7 @@ back to merged PRs that were each reviewed twice before touching `main`.
 
 ## ─ Quick Start
 
-1. Install [Node.js 20+](https://nodejs.org) if you don't have it
+1. Install [Node.js 20.3+](https://nodejs.org) if you don't have it (24 recommended)
 2. On macOS, install [Homebrew](https://brew.sh):
    `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
 3. Open your terminal and run:

@@ -430,19 +430,50 @@ async function tryInstall(rl, name, description, commands, { platform } = {}) {
   }
 }
 
+// #1074: the durable stores hold their writer lock in the kernel through the
+// `fs-native-extensions` addon, whose prebuilds are built against the Node-20
+// N-API surface from 20.3.0 onward.  20.0–20.2 are therefore refused
+// explicitly rather than passing a major-only check and failing later, deep
+// inside a store write, with an errno instead of an instruction.
+//
+// The comparison is patch-level and numeric on every component.  A major-only
+// `parseInt` cannot express this floor, and a string compare cannot either:
+// "20.10.0" sorts before "20.3.0" lexically.  `package.json` `engines` does
+// not enforce it — npm's `engine-strict` is false here, so `engines` only
+// warns — which is why this check is the real gate.
+const MINIMUM_NODE_VERSION = Object.freeze([20, 3, 0]);
+
+// Returns null for anything that is not a plain `vMAJOR.MINOR.PATCH`, so an
+// unreadable version is never silently treated as new enough.
+function parseNodeVersion(raw) {
+  if (typeof raw !== "string") return null;
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(raw.trim());
+  if (!match) return null;
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+  return parts.every((part) => Number.isSafeInteger(part) && part >= 0) ? parts : null;
+}
+function satisfiesMinimumNodeVersion(raw, minimum = MINIMUM_NODE_VERSION) {
+  const parsed = parseNodeVersion(raw);
+  if (parsed === null) return false;
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (parsed[index] > minimum[index]) return true;
+    if (parsed[index] < minimum[index]) return false;
+  }
+  return true;
+}
+
 async function checkPrereqs(rl) {
   header("Step 1: Prerequisites");
   const platform = detectPlatform();
   let allOk = true;
 
-  // ── 1. Node.js 20+ (must already exist — user ran npx) ──
+  // ── 1. Node.js 20.3.0+ (must already exist — user ran npx) ──
   const nodeVer = run("node", ["--version"]);
   if (nodeVer) {
-    const major = parseInt(nodeVer.replace("v", "").split(".")[0], 10);
-    if (major >= 20) {
+    if (satisfiesMinimumNodeVersion(nodeVer)) {
       ok(`Node.js ${nodeVer}`);
     } else {
-      fail(`Node.js ${nodeVer} — version 20 or newer is required`);
+      fail(`Node.js ${nodeVer} — version ${MINIMUM_NODE_VERSION.join(".")} or newer is required`);
       log("Update from: https://nodejs.org");
       allOk = false;
     }
@@ -1897,6 +1928,9 @@ switch (command) {
 
 // #972: exported for unit tests (see server/binStop.test.js).
 module.exports = {
+  MINIMUM_NODE_VERSION,
+  parseNodeVersion,
+  satisfiesMinimumNodeVersion,
   sanitizePid,
   stopPid,
   renderResourcePreflight,

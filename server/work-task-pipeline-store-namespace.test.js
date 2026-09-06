@@ -459,7 +459,11 @@ withDirectory((directory) => {
   const retiredOne = first.store.retire({ expected: currentExpected(first.state), event_id: "neighbour_retire_one" });
   // The exact set, spelled out: the retirement took ordinal 0001, which is the
   // ordinal it would have taken with no neighbour present at all.
+  // #1074: `record.json.lock` is the store's permanent writer lock, created
+  // by the first write and never removed.  It is named here rather than
+  // filtered out, because the point of this assertion is the exact set.
   assert.deepEqual(fs.readdirSync(ownerDirectory).sort(), [
+    "record.json.lock",
     "record.retired.0001.json",
     "record.retired.0001.json.bak",
     "record.retired.00001.json",
@@ -475,6 +479,7 @@ withDirectory((directory) => {
   decoy("record.retired.0002.json.bak", "trailing_two");
   const retiredTwo = second.store.retire({ expected: currentExpected(second.state), event_id: "neighbour_retire_two" });
   assert.deepEqual(fs.readdirSync(ownerDirectory).sort(), [
+    "record.json.lock",
     "record.retired.0001.json",
     "record.retired.0001.json.bak",
     "record.retired.00001.json",

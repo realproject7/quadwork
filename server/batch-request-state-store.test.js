@@ -272,9 +272,14 @@ withDirectory((directory) => {
   assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
 });
 
-// Linux reuses inode numbers eagerly, so a lock replaced after this writer
-// closed its descriptor can report the original dev+ino. The stubbed lstat
-// forces exactly that; only the lock token can then prove the replacement.
+// #1074 successor.  The claim is unchanged — a replacement lock carrying the
+// original dev+ino is never unlinked by the writer that was holding the
+// original — but the outcome is not.  The lock is now held in the kernel on
+// an open descriptor and the writer never acts on the lock *path* at all, so
+// there is nothing for it to destroy: it finishes its action, releases its
+// own descriptor, and leaves the replacement exactly as it found it.  The
+// recorder below is what proves the "never unlinked" half, and it is shown
+// not to be blind by the temporary the atomic replace does rename.
 withDirectory((directory) => {
   const { state } = initialized(directory);
   const result = watcherResult(state.subscription_state);
@@ -282,7 +287,10 @@ withDirectory((directory) => {
   const lockPath = `${statePath}.lock`;
   let inspections = 0;
   let original = null;
+  const touched = [];
   const replacingFs = Object.create(fs);
+  replacingFs.unlinkSync = (target) => { touched.push(["unlink", target]); return fs.unlinkSync(target); };
+  replacingFs.renameSync = (from, to) => { touched.push(["rename", from, to]); return fs.renameSync(from, to); };
   replacingFs.lstatSync = (target) => {
     if (target !== lockPath) return fs.lstatSync(target);
     inspections += 1;
@@ -300,9 +308,12 @@ withDirectory((directory) => {
     return stats;
   };
   const store = createBatchRequestStateStore({ config_dir: directory, fs: replacingFs });
-  throwsCode(() => store.applyWatcherResult({ expected: { ...owner, revision: 0 }, result }), "batch_request_state_store_lock_release_failed");
-  assert.equal(inspections, 2);
-  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+  assert.ok(store.applyWatcherResult({ expected: { ...owner, revision: 0 }, result }), "the writer finished its own action");
+  assert.equal(inspections, 2, "the lock path is inspected once at acquisition and once at release");
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock", "the replacement is left exactly as it was found");
+  assert.deepEqual(touched.filter(([, ...targets]) => targets.some((target) => String(target).endsWith(".lock"))), [],
+    `the writer touched a lock path: ${JSON.stringify(touched)}`);
+  assert.equal(touched.some(([kind]) => kind === "rename"), true, "the recorder is not blind: it saw the atomic replace");
 });
 
 console.log("batch-request-state-store tests passed");

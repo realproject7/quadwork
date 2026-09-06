@@ -16,6 +16,23 @@ const { buildWorkTaskPipeline, planWorkTaskPipelineEvent } = require("./work-tas
 const { buildWorkTaskCandidate } = require("./work-task-candidate");
 const { createWorkTaskPipelineStore, workTaskPipelineStorePath } = require("./work-task-pipeline-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
+
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
+// True exactly when no writer is inside a store action on this lock.  The
+// advisory lock binds to the open file description, so a second descriptor is
+// refused even within this process.
+function lockIsFree(lockPath) {
+  let descriptor;
+  try { descriptor = fs.openSync(lockPath, "r+"); }
+  catch { return false; }
+  try {
+    if (!advisory.tryLock(descriptor)) return false;
+    advisory.unlock(descriptor);
+    return true;
+  } finally { fs.closeSync(descriptor); }
+}
 const {
   ProjectArchiveTransitionError,
   archiveEventId,
@@ -425,9 +442,14 @@ try {
       return result;
     };
     revivingFs.lstatSync = (target, ...rest) => {
-      // Only outside the project writer lock, so the concurrent opener is a
-      // real second writer rather than a self-deadlock.
-      if (cancellationWritten && !revived && target === documentPath && !fs.existsSync(`${documentPath}.lock`)) {
+      // #1074: the `.lock` file is permanent, so its absence no longer marks
+      // the outside of the writer lock — the kernel does.  Asking the kernel
+      // whether the lock is currently held is the stronger rendezvous: it is
+      // true exactly when no store action is in progress, which is what keeps
+      // the concurrent opener below a real second writer rather than a
+      // self-deadlock.  A second descriptor is refused even inside this
+      // process, so this cannot be fooled by our own held lock.
+      if (cancellationWritten && !revived && target === documentPath && lockIsFree(`${documentPath}.lock`)) {
         revived = true;
         // A concurrent writer opens a second round for the same candidate.
         seeded.roundStore.openRound(
@@ -440,6 +462,7 @@ try {
 
     const swept = transitionFor(configDir, { fs: revivingFs }).archiveProjectRuntimeState(project_id);
     assert.equal(revived, true, "the concurrent writer really did open a round inside the window");
+    assert.equal(fs.existsSync(`${documentPath}.lock`), true, "the rendezvous was the kernel's verdict, not the lock file's absence");
     assert.equal(swept.resources.task_review_rounds_cancelled, 1, "the sweep cancelled the round it saw");
     assert.equal(swept.ok, false, "a round left current after the sweep keeps the cleanup partial");
     assert.deepEqual(swept.cleanup_errors.map((entry) => [entry.resource, entry.code]),

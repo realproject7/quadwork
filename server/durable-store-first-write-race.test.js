@@ -26,6 +26,19 @@ const {
   createHeadControlAuditStore,
   headControlAuditStorePath,
 } = require("./head-control-audit-store");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
+
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
+// "Nobody holds this lock", asked of the kernel rather than of the file.
+function unheldLock(lockPath) {
+  const descriptor = fs.openSync(lockPath, "r+");
+  try {
+    if (!advisory.tryLock(descriptor)) return false;
+    advisory.unlock(descriptor);
+    return true;
+  } finally { fs.closeSync(descriptor); }
+}
 
 const installation_id = "installation_alpha_0001";
 const project_id = "quadwork";
@@ -203,11 +216,17 @@ async function concurrentFirstWritersNeverEscapeUntyped() {
   assert.ok(committed >= 1, "at least one concurrent first writer committed");
   assert.equal(storedRecords(directory), committed, "every commit is durable and none was lost or duplicated");
   assert.equal(fs.lstatSync(path.join(directory, STORE_SUBDIRECTORY)).mode & 0o777, DIRECTORY_MODE, "the raced directory is owner-only");
+  // #1074: the writer lock is a permanent, empty artifact — the kernel holds
+  // the lock, not the file's existence — so the race is expected to leave
+  // exactly one, unheld.  A leaked temporary is still a leak.
+  const auditPath = headControlAuditStorePath(directory, binding);
   assert.deepEqual(
-    fs.readdirSync(path.dirname(headControlAuditStorePath(directory, binding))).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp")),
-    [],
-    "no lock or temporary artifact remains after the race",
+    fs.readdirSync(path.dirname(auditPath)).filter((name) => name.endsWith(".lock") || name.endsWith(".tmp")),
+    [`${path.basename(auditPath)}.lock`],
+    "the race leaves the permanent lock and no temporary artifact",
   );
+  assert.equal(fs.lstatSync(`${auditPath}.lock`).size, 0, "the permanent lock carries no body");
+  assert.equal(unheldLock(`${auditPath}.lock`), true, "no racer left the writer lock held");
 }
 
 // A lost mkdir is revalidated, never trusted.  Only the exact owner-only

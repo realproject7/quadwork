@@ -28,6 +28,19 @@ const {
   headControlWorkTaskDomainPath,
   createHeadControlWorkTaskDomain,
 } = require("./head-control-work-task-domain");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
+
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
+// #1074: the `.lock` file is permanent, so "released" is a kernel question.
+function unheldLock(lockPath) {
+  const descriptor = fs.openSync(lockPath, "r+");
+  try {
+    if (!advisory.tryLock(descriptor)) return false;
+    advisory.unlock(descriptor);
+    return true;
+  } finally { fs.closeSync(descriptor); }
+}
 
 const binding = Object.freeze({
   installation_id: "installation_domain_0001",
@@ -1047,15 +1060,22 @@ withDirectory((directory) => {
   ok(true, "a same-content successor whose active store is lost fails closed instead of being retired by its predecessor's record");
 });
 
-// Linux reuses inode numbers eagerly, so a lock replaced after this writer
-// closed its descriptor can report the original dev+ino. The stubbed lstat
-// forces exactly that; only the lock token can then prove the replacement.
+// #1074 successor.  The claim is unchanged — a replacement lock carrying the
+// original dev+ino is never unlinked by the writer that held the original —
+// but the outcome is not.  The lock is now held in the kernel on an open
+// descriptor and the writer never acts on the lock *path*, so it finishes its
+// action and leaves the replacement exactly as it found it.  The recorder is
+// what proves the "never unlinked" half, and the atomic replace's own rename
+// proves the recorder is not blind.
 withDirectory((directory) => {
   domain(directory).initialize();
   const lockPath = `${headControlWorkTaskDomainPath(directory, binding)}.lock`;
   let inspections = 0;
   let original = null;
+  const touched = [];
   const replacingFs = Object.create(fs);
+  replacingFs.unlinkSync = (target) => { touched.push(["unlink", target]); return fs.unlinkSync(target); };
+  replacingFs.renameSync = (from, to) => { touched.push(["rename", from, to]); return fs.renameSync(from, to); };
   replacingFs.lstatSync = (target) => {
     if (target !== lockPath) return fs.lstatSync(target);
     inspections += 1;
@@ -1066,16 +1086,22 @@ withDirectory((directory) => {
     if (inspections === 2) {
       fs.unlinkSync(lockPath);
       fs.writeFileSync(lockPath, "replacement-writer-lock", { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+      const stats = fs.lstatSync(target);
+      stats.dev = original.dev;
+      stats.ino = original.ino;
+      return stats;
     }
-    const stats = fs.lstatSync(target);
-    stats.dev = original.dev;
-    stats.ino = original.ino;
-    return stats;
+    // Past the swap the forgery stops: later acquisitions see the real
+    // replacement, which is what a writer arriving afterwards would see.
+    return fs.lstatSync(target);
   };
   const current = domain(directory, { fs: replacingFs });
-  throwsCode(() => current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) })), "head_control_work_task_state_lock_release_failed");
-  assert.equal(inspections, 2);
-  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+  assert.ok(current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) })), "the writer finished its own action");
+  assert.ok(inspections >= 2, "the lock path was inspected at acquisition and at release");
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock", "the replacement is left exactly as it was found");
+  assert.deepEqual(touched.filter(([, ...targets]) => targets.some((target) => String(target).endsWith(".lock"))), [],
+    `the writer touched a lock path: ${JSON.stringify(touched)}`);
+  assert.equal(touched.some(([kind]) => kind === "rename"), true, "the recorder is not blind: it saw the atomic replace");
   ok(true, "a replacement lock carrying the original dev+ino is never unlinked by the original writer");
 });
 
@@ -1171,7 +1197,7 @@ withDirectory((directory) => {
   let adoptedDuring = false;
   const racingFs = Object.create(fs);
   racingFs.openSync = (target, flags, mode) => {
-    if (armed && target === lockPath && flags === "wx") {
+    if (armed && target === lockPath) {
       lockAcquisitions += 1;
       // prepared() takes the lock twice, the intent write is the third, and
       // the finalize is the fourth: adopt the durable intent just before it.
@@ -1192,7 +1218,10 @@ withDirectory((directory) => {
   armed = false;
   assert.equal(adoptedDuring, true);
   assert.equal(lockAcquisitions, 4);
-  assert.equal(fs.existsSync(lockPath), false, "the refused finalize released its writer lock");
+  // #1074: the lock file is permanent, so "released" is a kernel question,
+  // not a filesystem-existence one.
+  assert.equal(fs.existsSync(lockPath), true, "the permanent writer lock stays on disk");
+  assert.equal(unheldLock(lockPath), true, "the refused finalize released its writer lock");
   assert.match(fs.readFileSync(statePath, "utf8"), /"generation":8/);
   assert.match(fs.readFileSync(statePath, "utf8"), /"pending":\{"action":"abandon_batch_manifest","expected_revision":1,"fingerprint":"[a-f0-9]{64}","manifest_digest":"[a-f0-9]{64}"\}/);
   const successorRequest = (keys) => ({ ...request("get_pipeline_status", null, null, keys), binding: copy(next) });
@@ -1213,11 +1242,16 @@ withDirectory((directory) => {
   current.put_batch_manifest(request("put_batch_manifest", 0, { manifest: copy(manifest()) }));
   const statePath = headControlWorkTaskDomainPath(directory, binding);
   const lockPath = `${statePath}.lock`;
-  fs.writeFileSync(lockPath, JSON.stringify({ version: 1, pid: process.pid, token: "f".repeat(32), host: require("node:os").hostname(), created_at: Date.now() }), { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+  // #1074: a foreign writer is one that holds the kernel lock, not one that
+  // left a file behind.  The abandon that is refused here goes through once
+  // that holder lets go, a few lines below.
+  const foreign = fs.openSync(lockPath, "r+");
+  assert.equal(advisory.tryLock(foreign), true, "the competing writer took the lock");
   throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null)), "head_control_work_task_state_locked");
   assert.match(fs.readFileSync(statePath, "utf8"), /"stage":"manifest"/);
   assert.match(fs.readFileSync(statePath, "utf8"), /"pending":null/);
-  fs.unlinkSync(lockPath);
+  advisory.unlock(foreign);
+  fs.closeSync(foreign);
   const other = domain(directory);
   assert.equal(other.abandon_batch_manifest(request("abandon_batch_manifest", 1, null, { correlation_id: "corr_abandon_other", idempotency_key: "idem_abandon_other" })).revision, 2);
   throwsCode(() => current.abandon_batch_manifest(request("abandon_batch_manifest", 1, null, { correlation_id: "corr_abandon_lost", idempotency_key: "idem_abandon_lost" })), "head_control_work_task_stale_revision");

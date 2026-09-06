@@ -42,8 +42,12 @@ You're now in Ubuntu. **All following steps happen inside this shell.**
 
 ## Step 3: Install Prerequisites (Ubuntu/WSL2)
 
-**Node.js 20+** (24 recommended) via nvm — nvm keeps the global npm prefix
-under `~/.nvm/`, so the `npm install -g` steps below work without `sudo`:
+**Node.js 20.3.0+** (24 recommended) via nvm — nvm keeps the global npm prefix
+under `~/.nvm/`, so the `npm install -g` steps below work without `sudo`.
+20.0-20.2 are refused: QuadWork's durable stores take their writer lock in the
+kernel through a native addon, whose prebuilds target the Node-20 N-API
+surface from 20.3.0 on. Ubuntu under WSL2 is glibc, which those prebuilds
+need; a musl distribution such as Alpine is not supported.
 ```bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 source ~/.bashrc
@@ -67,7 +71,7 @@ sudo apt-get update && sudo apt-get install -y gh
 
 Verify the toolchain:
 ```bash
-node --version   # 20 or newer
+node --version   # 20.3.0 or newer
 git --version
 gh --version
 ```
