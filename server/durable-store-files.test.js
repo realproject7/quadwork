@@ -231,6 +231,30 @@ withDirectory((directory) => {
     "the same stub reporting this process's own uid acquires, so the refusal above was the foreign owner");
 });
 
+// Nor is a lock allowed on something that is not a regular file.  A directory
+// is refused by the open itself, but an openable non-regular file — a FIFO,
+// say — is not, so the kind is forged through the same seam, with the same
+// stub reporting a regular file as the control.
+withDirectory((directory) => {
+  const target = path.join(directory, "state.json");
+  const lockPath = `${target}.lock`;
+  let regular = false;
+  const oddKindFs = Object.create(fs);
+  oddKindFs.fstatSync = (descriptor) => {
+    const stats = fs.fstatSync(descriptor);
+    if (stats.isFile() && (stats.mode & 0o777) === FILE_MODE) {
+      const answer = regular;
+      stats.isFile = () => answer;
+    }
+    return stats;
+  };
+  throwsCode(() => files(oddKindFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_unsafe");
+  assert.equal(unheld(lockPath), true, "the refused acquisition released the lock it had taken");
+  regular = true;
+  assert.equal(files(oddKindFs).withWriterLock(target, () => "written"), "written",
+    "the same stub reporting a regular file acquires, so the refusal above was the file kind");
+});
+
 // An unavailable primitive is a hard failure, never a fallback.  There is no
 // path-based lock to fall back to, and writing unprotected is the defect.
 withDirectory((directory) => {
