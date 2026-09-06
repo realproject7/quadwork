@@ -440,7 +440,15 @@ async function tryInstall(rl, name, description, commands, { platform } = {}) {
 // `parseInt` cannot express this floor, and a string compare cannot either:
 // "20.10.0" sorts before "20.3.0" lexically.  `package.json` `engines` does
 // not enforce it — npm's `engine-strict` is false here, so `engines` only
-// warns — which is why this check is the real gate.
+// warns — which is why the runtime is checked in code at all.
+//
+// The comparator below is pure and says nothing about when it runs.  Two
+// callers use it: the `init` wizard's prerequisite list, which reports the
+// installed `node --version` alongside the other tools it checks, and the
+// dispatch guard at the bottom of this file, which checks *this* process's
+// `process.version` before any command runs.  The guard is what actually
+// refuses a too-old runtime; the wizard's copy is a report, and would protect
+// `init` alone.
 const MINIMUM_NODE_VERSION = Object.freeze([20, 3, 0]);
 
 // Returns null for anything that is not a plain `vMAJOR.MINOR.PATCH`, so an
@@ -1847,6 +1855,17 @@ function cmdAcRestore() {
 // `require("../bin/quadwork")` for the pure helpers (sanitizePid, stopPid)
 // without executing a command.
 if (require.main === module) {
+// #1064: the floor is enforced here, before dispatch, so *every* command
+// refuses a too-old runtime with an instruction rather than one command doing
+// it and the rest failing later, deep inside a store write, with an errno.
+// `process.version` is this process — the interpreter that will run the
+// command — not whatever `node` happens to be on PATH.
+if (!satisfiesMinimumNodeVersion(process.version)) {
+  console.error(`QuadWork requires Node.js ${MINIMUM_NODE_VERSION.join(".")} or newer — this is ${process.version}.`);
+  console.error("Update from: https://nodejs.org");
+  process.exit(1);
+}
+
 const command = process.argv[2];
 
 switch (command) {
