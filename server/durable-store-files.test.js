@@ -8,8 +8,10 @@
 // carrying an owner record, which meant a writer had to judge that record and
 // then act on the judgement by path — and a legitimate replacement arriving in
 // that window was destroyed by the judge.  It is now a whole-file advisory
-// lock held on an open descriptor, and the `.lock` file is a permanent, empty,
-// owner-only artifact that is never removed.  The tests that used to pin the
+// lock held on an open descriptor, and the `.lock` file is a permanent,
+// owner-only artifact that is never removed — newly created locks are empty,
+// while an upgraded legacy body may remain as an inert diagnostic that is
+// never ownership evidence.  The tests that used to pin the
 // record, the liveness probe, and the reclaim are therefore replaced here by
 // their successors:
 //   - the record tests become two-directional metadata tests: whatever a lock
@@ -117,9 +119,12 @@ function plantLock(directory, body, mode = FILE_MODE) {
   }
 }
 
-// The lock is a permanent, empty, owner-only file that is held for exactly
-// the duration of the action and never removed.  Its inode is stable across
-// acquisitions: the second writer locks the very same object as the first.
+// A lock this module creates is a permanent, empty, owner-only file, held for
+// exactly the duration of the action and never removed.  (Empty is a property
+// of the ones it creates, not of every lock it will accept — the block below
+// this one plants legacy bodies and proves they survive untouched.)  Its inode
+// is stable across acquisitions: the second writer locks the very same object
+// as the first.
 withDirectory((directory) => {
   const target = path.join(directory, "state.json");
   const lockPath = `${target}.lock`;
@@ -329,6 +334,128 @@ withDirectory((directory) => {
   };
   assert.equal(files(vanishingFs).withWriterLock(target, () => "written"), "written");
   assert.equal(fs.existsSync(lockPath), true, "the retry created the lock the vanishing removed");
+});
+
+// #1064: a retry is a *re-open of the same path*, so it is only legitimate
+// once the previous attempt's lock is provably gone.  If the unlock failed,
+// the kernel's answer is unknown; if the close failed, the descriptor — and
+// any lock still attached to it — is alive inside this process.  Either way
+// the next open would be judged against a lock this writer may still hold, so
+// the acquisition must stop, with the store's own lock-failure code, on the
+// attempt that could not clean up.  It must not retry, and it must not report
+// the milder verdict it was in the middle of.
+//
+// An unlock failure with a successful close is included deliberately: "the
+// close probably released it" is a hope, and a retry may not be built on one.
+withDirectory((directory) => {
+  const target = plantLock(directory, "planted");
+  const lockPath = `${target}.lock`;
+  const { AdvisoryLockError: DropError } = require("./durable-store-advisory-lock");
+  let opens = 0;
+  const mismatchingFs = Object.create(fs);
+  mismatchingFs.openSync = (inspected, ...rest) => {
+    if (inspected === lockPath) opens += 1;
+    return fs.openSync(inspected, ...rest);
+  };
+  mismatchingFs.lstatSync = (inspected) => {
+    const stats = fs.lstatSync(inspected);
+    if (inspected === lockPath) stats.ino += 1;
+    return stats;
+  };
+
+  // Control first: with cleanup working, this very fs retries the bound and
+  // reports the mismatch.  Every refusal below is measured against this.
+  throwsCode(() => files(mismatchingFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_acquire_changed");
+  assert.equal(opens, EXPECTED_LOCK_ATTEMPTS, "the mismatch alone is retried to the bound");
+
+  // Unlock fails, close succeeds: fail closed on the first attempt.
+  opens = 0;
+  const failingUnlock = {
+    tryLock: (descriptor) => advisory.tryLock(descriptor),
+    unlock() { throw new DropError("failed", "unlock failed"); },
+  };
+  throwsCode(() => files(mismatchingFs, { advisory_lock: failingUnlock }).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_failed");
+  assert.equal(opens, 1, "an abandonment whose unlock failed is never retried");
+  assert.equal(unheld(lockPath), true, "the descriptor was still closed, so the kernel lock is gone");
+
+  // Close fails: the descriptor outlives the attempt, so likewise no retry.
+  // The stranded descriptors are closed by this test, not by the module.
+  opens = 0;
+  const stranded = [];
+  const failingCloseFs = Object.create(mismatchingFs);
+  failingCloseFs.closeSync = (descriptor) => {
+    stranded.push(descriptor);
+    const error = new Error("EIO");
+    error.code = "EIO";
+    throw error;
+  };
+  try {
+    throwsCode(() => files(failingCloseFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_failed");
+    assert.equal(opens, 1, "an abandonment whose close failed is never retried");
+  } finally {
+    for (const descriptor of stranded) { try { fs.closeSync(descriptor); } catch { /* already gone */ } }
+  }
+  assert.equal(stranded.length, 1, "the close was attempted exactly once, on the one attempt that ran");
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "planted", "no refusal touched the file at the path");
+});
+
+// The contention path opens a descriptor it never locks, and closing it is
+// not bookkeeping: an fd this process cannot account for is what the next
+// judgement about the path would be made underneath.  A failed close there is
+// reported, not swallowed behind the milder "someone else holds it".
+withDirectory((directory) => {
+  const target = path.join(directory, "state.json");
+  const lockPath = `${target}.lock`;
+  files().withWriterLock(target, () => "created the lock file");
+  const stranded = [];
+  const failingCloseFs = Object.create(fs);
+  failingCloseFs.closeSync = (descriptor) => {
+    stranded.push(descriptor);
+    const error = new Error("EIO");
+    error.code = "EIO";
+    throw error;
+  };
+  const holder = holdLock(lockPath);
+  try {
+    // Control: with a working close, the same live holder is reported as
+    // contention, so the difference below is the close and nothing else.
+    throwsCode(() => files().withWriterLock(target, () => assert.fail("must not acquire")), "probe_locked");
+    throwsCode(() => files(failingCloseFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_failed");
+  } finally {
+    holder.release();
+    for (const descriptor of stranded) { try { fs.closeSync(descriptor); } catch { /* already gone */ } }
+  }
+  assert.equal(stranded.length, 1, "the contention path closed exactly once");
+});
+
+// #1064: the acquisition takes exactly one fstat — the verifier's — and keeps
+// the stats that verdict was reached on.  A second stat after the verdict
+// re-asks a settled question, and a second stat that *throws* leaves a locked
+// descriptor that is neither returned nor released: a kernel lock with no
+// owner left to drop it.  The seam below makes every fstat after the first
+// throw, which is precisely that failure; the acquisition must not notice it,
+// because it must not be making the call.
+withDirectory((directory) => {
+  const target = path.join(directory, "state.json");
+  const lockPath = `${target}.lock`;
+  let stats = 0;
+  const oneStatFs = Object.create(fs);
+  oneStatFs.fstatSync = (descriptor) => {
+    stats += 1;
+    if (stats > 1) { const error = new Error("EIO"); error.code = "EIO"; throw error; }
+    return fs.fstatSync(descriptor);
+  };
+  assert.equal(files(oneStatFs).withWriterLock(target, () => "written"), "written",
+    "a successful acquisition never stats the descriptor a second time");
+  assert.equal(stats, 1, "exactly one fstat, the verifier's, is taken per acquisition");
+  assert.equal(unheld(lockPath), true, "the lock was released normally");
+  // Negative control: the seam is live and its failure is fatal — let the
+  // verifier's own stat throw and the acquisition fails closed, releasing
+  // what it had taken.  So the pass above is "no second call", not "the stub
+  // never fired".
+  stats = 1;
+  throwsCode(() => files(oneStatFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_failed");
+  assert.equal(unheld(lockPath), true, "the failed inspection released the lock it had taken");
 });
 
 // No production path ever unlinks, renames, or truncates a lock.  The

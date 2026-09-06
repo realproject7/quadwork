@@ -16,12 +16,22 @@
 //
 // #1074: the writer lock is a whole-file advisory lock held on an open file
 // descriptor, not the existence of a file at a path.  The `.lock` file is a
-// permanent, empty, owner-only artifact: it is created once and then kept
-// forever, because the lock lives in the kernel and the file is only the
-// object the kernel keys it to.  Nothing in this module ever unlinks,
-// renames, or truncates a lock path, and there is no owner record, no
+// permanent, owner-only artifact: it is created once and then kept forever,
+// because the lock lives in the kernel and the file is only the object the
+// kernel keys it to.  Newly created locks are empty; upgraded legacy bodies
+// may remain and are inert diagnostics, never ownership evidence — nothing
+// here reads, rewrites, or truncates one.  Nothing in this module ever
+// unlinks or renames a lock path either, and there is no owner record, no
 // liveness probe, and no reaper — a dead writer's lock is released by the
 // kernel when its descriptors close, so there is nothing left to reclaim.
+//
+// What that guarantees, and where it stops: exclusion holds between
+// cooperating QuadWork writers inside a trusted, owner-only, local config
+// directory.  External unlink, rename, or replacement of a lock path is
+// outside it, and so is NFS/SMB or any cross-host filesystem.  Conditions
+// this module can identify — an unsupported platform, an unavailable native
+// primitive, a lock object that is not an owner-only regular file — fail
+// closed rather than degrading to something weaker.
 //
 // Path-addressed reasoning is what made the old lock unsafe: a writer could
 // verify the identity of the file at a path and then act on that judgement
@@ -193,7 +203,8 @@ function createDurableStoreFiles(options) {
   // `mismatch` is not a failure: it means the file at the path changed
   // identity between our open and our check, so this descriptor's lock
   // protects the wrong object.  The answer is to drop it and open the path
-  // again — never to remove whatever is there now.
+  // again — never to remove whatever is there now, and never on an
+  // abandonment that did not provably complete.
   function openLockDescriptor(lockPath) {
     if (LOCK_OPEN_FLAGS === null) {
       fail(codes.lock_unsafe, "durable store writer lock requires O_NOFOLLOW, which this platform does not provide");
@@ -237,12 +248,42 @@ function createDurableStoreFiles(options) {
     // not a check.  A symlink or a different object at the path is a
     // mismatch, and the retry's own O_NOFOLLOW open is what refuses it.
     const current = lstatOrNull(lockPath);
-    if (current === null || !sameFile(opened, current)) return "mismatch";
-    return "ok";
+    // The stats the verdict was reached on travel with it.  Statting the
+    // descriptor again after this point would re-ask a settled question, and a
+    // second call that threw would leave a locked descriptor that is neither
+    // returned to the caller nor released — a kernel lock with no owner left
+    // to drop it.
+    if (current === null || !sameFile(opened, current)) return { verdict: "mismatch", stats: opened };
+    return { verdict: "ok", stats: opened };
   }
+  // Closing a descriptor this writer never locked — the contention and
+  // primitive-failure paths.  A close that fails is not a detail: the fd, and
+  // with it any lock the kernel may have attached to it, is still in this
+  // process, and every later judgement about the path would be made while
+  // holding something unaccounted for.  So it is reported, never swallowed.
+  function closeUnlockedDescriptor(descriptor) {
+    try { fs.closeSync(descriptor); }
+    catch { fail(codes.lock_failed, "durable store writer lock descriptor could not be closed"); }
+  }
+  // Abandoning a *held* descriptor, which is the only thing that makes a
+  // retry legitimate: the next attempt opens the same path again, and that is
+  // safe only if the lock this attempt took is provably gone.  Both calls are
+  // attempted — a failed unlock must never skip the close — but if either one
+  // fails, the previous lock may still be alive and the caller is refused
+  // rather than allowed to re-open on a hope.  An unlock that failed while the
+  // close succeeded is still fail-closed: the kernel's answer is unknown, and
+  // "probably released" is not a precondition anything may retry on.
+  //
+  // A cleanup failure is reported in preference to whatever verdict it
+  // interrupted.  Both are refusals that write nothing, but only this one
+  // describes the machinery every later decision depends on.
   function dropLock(descriptor) {
-    try { advisory.unlock(descriptor); } catch { /* the close below releases it regardless */ }
-    try { fs.closeSync(descriptor); } catch { /* the descriptor is being abandoned */ }
+    let unlockError = null;
+    try { advisory.unlock(descriptor); } catch (error) { unlockError = error; }
+    let closeError = null;
+    try { fs.closeSync(descriptor); } catch (error) { closeError = error; }
+    if (closeError !== null) fail(codes.lock_failed, "durable store writer lock descriptor could not be closed");
+    if (unlockError !== null) failAdvisory(unlockError, false);
   }
   function acquireLock(lockPath) {
     for (let attempt = 1; attempt <= MAX_LOCK_ATTEMPTS; attempt += 1) {
@@ -250,17 +291,17 @@ function createDurableStoreFiles(options) {
       let acquired;
       try { acquired = advisory.tryLock(descriptor); }
       catch (error) {
-        try { fs.closeSync(descriptor); } catch { /* fail closed */ }
+        closeUnlockedDescriptor(descriptor);
         failAdvisory(error, false);
       }
       if (!acquired) {
-        try { fs.closeSync(descriptor); } catch { /* fail closed */ }
+        closeUnlockedDescriptor(descriptor);
         fail(codes.locked, "durable store writer lock is held by another writer");
       }
-      let verdict;
-      try { verdict = verifyLockedDescriptor(lockPath, descriptor); }
+      let checked;
+      try { checked = verifyLockedDescriptor(lockPath, descriptor); }
       catch (error) { dropLock(descriptor); throw error; }
-      if (verdict === "ok") return { descriptor, lockPath, stats: fs.fstatSync(descriptor) };
+      if (checked.verdict === "ok") return { descriptor, lockPath, stats: checked.stats };
       dropLock(descriptor);
     }
     fail(codes.lock_acquire_changed, "durable store writer lock changed during acquisition");
