@@ -9,7 +9,8 @@
 //
 // #1074: the lock is no longer the existence of a file carrying an owner
 // record; it is a whole-file advisory lock held on an open descriptor, and
-// the `.lock` file is a permanent, empty artifact nobody ever removes.  Three
+// the `.lock` file is a permanent artifact nobody ever removes, empty when
+// this code created it and otherwise carrying an inert legacy body.  Three
 // blocks below are therefore successors rather than survivors:
 //   - `malformedLockStaysClosed` and `unprovenOwnerStaysClosed` became
 //     `lockMetadataDoesNotDecide`, which drives both directions: with no

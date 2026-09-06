@@ -216,7 +216,8 @@ async function concurrentFirstWritersNeverEscapeUntyped() {
   assert.ok(committed >= 1, "at least one concurrent first writer committed");
   assert.equal(storedRecords(directory), committed, "every commit is durable and none was lost or duplicated");
   assert.equal(fs.lstatSync(path.join(directory, STORE_SUBDIRECTORY)).mode & 0o777, DIRECTORY_MODE, "the raced directory is owner-only");
-  // #1074: the writer lock is a permanent, empty artifact — the kernel holds
+  // #1074: the writer lock is a permanent artifact, empty because this run
+  // created it — the kernel holds
   // the lock, not the file's existence — so the race is expected to leave
   // exactly one, unheld.  A leaked temporary is still a leak.
   const auditPath = headControlAuditStorePath(directory, binding);

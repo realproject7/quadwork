@@ -104,6 +104,12 @@ npx quadwork init
 
 4. The wizard installs everything else and opens your dashboard.
 
+> **Node.js 20.3+ on macOS or glibc Linux.** Alpine/musl is not supported:
+> QuadWork's durable stores take their writer lock in the kernel through a
+> native addon whose Linux prebuild is glibc-linked, so on musl it cannot load
+> and the stores fail closed rather than writing unprotected. Use a glibc
+> distro (Ubuntu, Debian) or macOS.
+
 That's it. The wizard handles GitHub CLI, AI tools, and
 authentication — you just follow the prompts. Subsequent runs are one
 command: `npx quadwork start`.

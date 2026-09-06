@@ -93,6 +93,13 @@ nvm use 24
 
 **Do NOT use system Node (`apt` or `nodesource`).** Only use nvm. System Node alongside nvm creates PATH conflicts — pm2 and QuadWork spawn agents with system PATH (missing nvm binaries), causing agents to fail auth or not be found.
 
+**glibc Linux only — Alpine/musl is not supported.** This guide targets Ubuntu,
+which is glibc. QuadWork's durable stores hold their writer lock in the kernel
+through a native addon whose Linux prebuild is glibc-linked, so on a musl distro
+(Alpine, and Alpine-based container images) the addon cannot load. That is a
+hard failure, not a downgrade: the stores refuse to write rather than run
+without mutual exclusion. Use a glibc image — Ubuntu or Debian.
+
 ---
 
 ## Step 5: GitHub CLI

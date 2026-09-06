@@ -442,12 +442,14 @@ process is running, then delete `config.lock`.
 nothing at all.**
 Every V2 durable store keeps one of these beside its state file, for example
 `~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/record.json.lock`.
-It is created once, is always empty, and is **never removed** — not on release,
-not on shutdown, not on error. The lock is a whole-file advisory lock the kernel
-holds on an open descriptor; the file is only the object the kernel keys it to.
-A writer that dies releases its lock the instant its process ends, with the file
-still sitting there, and the next writer simply takes the lock again on the very
-same file. There is nothing stale to clean up, ever.
+It is created once and is **never removed** — not on release, not on shutdown,
+not on error. Newly created locks are empty; upgraded legacy bodies may remain
+and are inert diagnostics, never ownership evidence. The lock is a whole-file
+advisory lock the kernel holds on an open descriptor; the file is only the
+object the kernel keys it to. A writer that dies releases its lock the instant
+its process ends, with the file still sitting there, and the next writer simply
+takes the lock again on the very same file. There is nothing stale to clean up,
+ever.
 
 **Deleting a store `.lock` while a writer holds it silently breaks mutual
 exclusion.** Nothing errors. The holder keeps its lock on an inode that no
@@ -464,6 +466,29 @@ So:
 | Existence means | a write is in progress or was interrupted | nothing |
 | Safe to delete | yes, once every writer is stopped | **no — not ever** |
 | Recovering from a dead writer | delete it | nothing to do |
+
+**What the store lock does and does not guarantee.**
+The guarantee is mutual exclusion between *cooperating QuadWork writers*
+operating inside a trusted, owner-only, local configuration directory
+(`~/.quadwork`, mode `0700`). Inside that boundary the kernel decides who is
+inside a protected action, and no amount of reasoning about a file's contents
+can override it.
+
+Outside that boundary it is not a guarantee at all:
+
+- **Anything that unlinks, renames, or replaces a lock path from outside
+  QuadWork** — a cleanup script, a backup restore, a sync client, a person with
+  `rm` — breaks it, silently, exactly as described above.
+- **NFS, SMB, and any cross-host filesystem** are out of scope. The lock is an
+  advisory lock on a local open file description; a network filesystem may
+  honour it partially, per-client, or not at all, and QuadWork cannot tell.
+  Keep `~/.quadwork` on local disk.
+- **Anything QuadWork can identify as unsupported fails closed.** An
+  unsupported platform, a native lock primitive that will not load (see the
+  musl/Alpine note in the installation guides), a filesystem answering
+  `EOPNOTSUPP`/`ENOLCK`, or a lock path that is not an owner-only regular file
+  all make the store *refuse to write*. There is no path-based fallback: a
+  store that cannot be protected does not write unprotected.
 
 If a store keeps reporting a `..._locked` code, something is genuinely holding
 that lock right now. Find the process (`npx quadwork stop`, then check for
