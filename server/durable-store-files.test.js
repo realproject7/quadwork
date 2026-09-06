@@ -205,6 +205,32 @@ withDirectory((directory) => {
   assert.equal(fs.lstatSync(lockPath).isDirectory(), true);
 });
 
+// A lock owned by another user is unsafe even at mode 0600: this process can
+// still open and lock it, so "owner-only" says nothing about *whose*.  A real
+// foreign-owned file needs a second uid, which a test does not have, so the
+// owner is forged through the fs seam — and the same stub returning this
+// process's own uid is the negative control that shows the forgery is what
+// produced the refusal.
+withDirectory((directory) => {
+  const target = path.join(directory, "state.json");
+  const lockPath = `${target}.lock`;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  assert.notEqual(uid, null, "this platform reports a uid, so the owner check is live");
+  let forge = 0;
+  const foreignFs = Object.create(fs);
+  foreignFs.fstatSync = (descriptor) => {
+    const stats = fs.fstatSync(descriptor);
+    if (stats.isFile() && (stats.mode & 0o777) === FILE_MODE) stats.uid = uid + forge;
+    return stats;
+  };
+  forge = 1;
+  throwsCode(() => files(foreignFs).withWriterLock(target, () => assert.fail("must not acquire")), "probe_lock_unsafe");
+  assert.equal(unheld(lockPath), true, "the refused acquisition released the lock it had taken");
+  forge = 0;
+  assert.equal(files(foreignFs).withWriterLock(target, () => "written"), "written",
+    "the same stub reporting this process's own uid acquires, so the refusal above was the foreign owner");
+});
+
 // An unavailable primitive is a hard failure, never a fallback.  There is no
 // path-based lock to fall back to, and writing unprotected is the defect.
 withDirectory((directory) => {
