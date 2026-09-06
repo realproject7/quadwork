@@ -5,7 +5,9 @@
 // audit, TaskReviewRound, Head-control WorkTask domain).  It owns exactly
 // the three concerns those stores used to copy: a validated fs surface with
 // owner-only directory checks, one atomic replace (temporary -> fsync ->
-// rename -> directory fsync), and one process-scoped writer lock.
+// rename -> directory fsync), and one writer lock.  That lock was
+// process-scoped when this module was written; #1074 below made it a
+// kernel-held one, which excludes across processes as well as within one.
 //
 // It is deliberately not a filesystem API.  Every store still derives its
 // own fixed paths, owns its schema, and raises its own typed error class and
@@ -283,9 +285,10 @@ function createDurableStoreFiles(options) {
     if (closeError !== null) fail(codes.lock_release_failed, "durable store writer lock could not be closed");
     if (changed) fail(codes.lock_release_changed, "durable store writer lock changed before release");
   }
-  // The action's own result or error always wins over a failed release: a
-  // failed release leaves an owner-only lock behind, which every later
-  // mutation fails closed on rather than guessing that it is stale.
+  // The action's own result or error always wins over a failed release.  The
+  // action is what the caller asked about; a release problem is a report on
+  // the machinery around it, and letting that report displace the real
+  // outcome would lose the only thing the caller cannot reconstruct.
   function withWriterLock(target, action) {
     const lock = acquireLock(`${target}.lock`);
     let result;
