@@ -744,12 +744,13 @@ async function setupGitHub(rl) {
 }
 
 async function setupV2CiPolicy(rl) {
-  header("V2 Repository CI Policy");
-  log("Every new V2 repository needs an explicit policy. QuadWork never guesses CI checks.");
-  const mode = await ask(rl, "CI policy mode (github-checks/ci-less)", "github-checks");
+  header("V2 Repository Verification");
+  log("Local verification records named results from your repository checks without GitHub Actions.");
+  log("Choose github-checks only to opt in to an existing external-check policy.");
+  const mode = await ask(rl, "Verification mode (ci-less = Local verification / github-checks)", "ci-less");
   let candidate;
   if (mode === "ci-less") {
-    const keys = (await ask(rl, "CI-less evidence keys (comma-separated)", "operator"))
+    const keys = (await ask(rl, "Local verification evidence keys (comma-separated)", "unit,typecheck,build"))
       .split(",").map((value) => value.trim()).filter(Boolean);
     candidate = { version: 1, mode, evidence_keys: keys };
   } else if (mode === "github-checks") {
@@ -1962,6 +1963,7 @@ switch (command) {
 // #972: exported for unit tests (see server/binStop.test.js).
 module.exports = {
   createCleanExit,
+  setupV2CiPolicy,
   MINIMUM_NODE_VERSION,
   parseNodeVersion,
   satisfiesMinimumNodeVersion,
