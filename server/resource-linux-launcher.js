@@ -400,6 +400,7 @@ class LinuxResourceLauncher {
     const generations = [...s.records.values()];
     const results = await Promise.allSettled(generations.map((record) => this.stopGeneration(record.generationId)));
     await Promise.allSettled([...controls, ...generations].map((record) => record.done));
+    if (s.preparing) await s.preparing;
     return { ok: results.every((row) => row.status === "fulfilled") && !s.cleanupFailed, owned_generations: generations.length };
   }
 }
