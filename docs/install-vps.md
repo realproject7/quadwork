@@ -765,8 +765,7 @@ Real Git control children wait for an observed concurrency/queue handshake.
 Thread/allocation records describe the workload; only independent kernel and
 cgroup observations establish OOM. Continuous API/chat/WS samples must stay
 within the existing 2-second failure budget throughout the pressure interval.
-A
-local pass proves Node/test/git/temp inheritance and sampled product reachability;
+A local pass proves Node/test/git/temp inheritance and sampled product reachability;
 it does not prove authenticated Claude/Codex model turns or provider temp use.
 Archive the exact package/source hashes and complete redacted JSON result.
 Never run this command against production or the shared Docker VM.

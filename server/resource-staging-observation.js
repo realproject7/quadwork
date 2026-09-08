@@ -31,7 +31,9 @@ function controlObservationReady(active, queued, observedPids) {
 function controlFilterSource(markerRoot, releaseFile) {
   return `const fs=require("fs");
 const root=${JSON.stringify(markerRoot)}, release=${JSON.stringify(releaseFile)};
-fs.writeFileSync(root+"/"+process.pid, JSON.stringify({pid:process.pid,stat:fs.readFileSync("/proc/self/stat","utf8"),cgroup:fs.readFileSync("/proc/self/cgroup","utf8")}), {mode:384,flag:"wx"});
+const staging=root+"-"+process.pid+".tmp";
+fs.writeFileSync(staging, JSON.stringify({pid:process.pid,stat:fs.readFileSync("/proc/self/stat","utf8"),cgroup:fs.readFileSync("/proc/self/cgroup","utf8")}), {mode:384,flag:"wx"});
+fs.renameSync(staging,root+"/"+process.pid);
 process.stdin.pipe(process.stdout);
 const deadline=Date.now()+15000;
 const hold=setInterval(()=>{if(fs.existsSync(release)){clearInterval(hold);}else if(Date.now()>=deadline){clearInterval(hold);process.exitCode=2;}},25);
