@@ -63,7 +63,7 @@ function readProcess(pid) {
 function sameProcess(prior, current) { return prior.pid === current.pid && prior.startTime === current.startTime && prior.cgroup === current.cgroup; }
 function cgroupPath(group) { return path.join(CGROUP_ROOT, parseCgroup(`0::${group}`)); }
 function scopeGroup(unit) {
-  if (!/^(?:quadwork-worker-[a-f0-9]{40}|qwproof-[a-f0-9-]+)\.(?:scope|service|slice)$/.test(unit)) fail("foreign_unit");
+  if (!/^(?:quadwork-worker-[a-f0-9]{40}\.scope|qwproof-[a-f0-9]{24}-api\.service)$/.test(unit)) fail("foreign_unit");
   const group = command("systemctl", ["--user", "show", unit, "--property=ControlGroup", "--value"]);
   if (!group.endsWith(`/${unit}`)) fail("scope_identity_changed");
   return parseCgroup(`0::${group}`);
