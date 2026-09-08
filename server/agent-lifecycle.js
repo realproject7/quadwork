@@ -261,16 +261,20 @@ function resourceDecision(platform, snapshot, reservations, containedLaunch) {
   if (!snapshot || typeof snapshot !== "object") return { ok: false, reason: "containment_unavailable", facts: null };
   const pressure = snapshot.pressure && typeof snapshot.pressure === "object" ? snapshot.pressure : null;
   const capacity = snapshot.scope_capacity && typeof snapshot.scope_capacity === "object" ? snapshot.scope_capacity : null;
+  const admitted = capacity?.admitted_worker_scopes;
+  const maximum = capacity?.reserved_worker_scopes;
+  const validCapacity = Number.isSafeInteger(admitted) && admitted >= 0 && Number.isSafeInteger(maximum) && maximum > 0;
+  if (snapshot.status === "capacity_exhausted" && pressure?.status === "capacity_exhausted" &&
+      pressure.reason === "preflight_capacity_exhausted" && validCapacity) {
+    return { ok: false, reason: "capacity_exhausted", facts: { admitted_worker_scopes: admitted, reserved_worker_scopes: maximum } };
+  }
   if (snapshot.status !== "ready" || !pressure || pressure.status !== "ready" || !capacity || containedLaunch !== true) {
     // candidate_pending_staging and any malformed/unknown observation are
     // deliberately one stable admission result. No caller may convert a
     // capability string into permission to use an uncontained node-pty child.
-    const reason = pressure?.reason === "capacity_exhausted" ? "capacity_exhausted" : "containment_unavailable";
-    return { ok: false, reason, facts: null };
+    return { ok: false, reason: "containment_unavailable", facts: null };
   }
-  const admitted = capacity.admitted_worker_scopes;
-  const maximum = capacity.reserved_worker_scopes;
-  if (!Number.isSafeInteger(admitted) || !Number.isSafeInteger(maximum) || admitted < 0 || maximum <= 0) {
+  if (!validCapacity) {
     return { ok: false, reason: "containment_unavailable", facts: null };
   }
   if (admitted + reservations >= maximum) {

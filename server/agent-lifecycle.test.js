@@ -75,6 +75,30 @@ function governor(options = {}) {
     assert.equal(allowed.status, "reserved");
   }
 
+  // #1086: the source preflight capacity shape remains a typed refusal,
+  // including useful bounded scope facts, without granting launch authority.
+  {
+    const capacitySnapshot = {
+      status: "capacity_exhausted",
+      pressure: { status: "capacity_exhausted", reason: "preflight_capacity_exhausted" },
+      scope_capacity: { admitted_worker_scopes: 0, reserved_worker_scopes: 3, requested_worker_scopes: 1, live_swap_headroom_mib: -16 },
+    };
+    const g = governor({ platform: "linux", resourceSnapshot: () => capacitySnapshot });
+    const rejected = await g.reserve({ projectId: "preflight-capacity", role: "dev", source: "operator_start", operatorAuthorized: true, containedLaunch: true });
+    assert.equal(rejected.status, "rejected");
+    assert.equal(rejected.reason, "capacity_exhausted");
+    assert.deepEqual(rejected.facts, { admitted_worker_scopes: 0, reserved_worker_scopes: 3 });
+    for (const [index, bad] of [
+      { ...capacitySnapshot, status: "unknown" },
+      { ...capacitySnapshot, pressure: { status: "capacity_exhausted", reason: "unknown" } },
+      { ...capacitySnapshot, scope_capacity: { admitted_worker_scopes: -1, reserved_worker_scopes: 3 } },
+    ].entries()) {
+      const invalid = governor({ platform: "linux", resourceSnapshot: () => bad });
+      const result = await invalid.reserve({ projectId: `invalid-capacity-${index}`, role: "dev", source: "operator_start", operatorAuthorized: true, containedLaunch: true });
+      assert.equal(result.reason, "containment_unavailable");
+    }
+  }
+
   // Work-less automatic or worker starts are refused; the deliberately narrow
   // authenticated Head intake exception is still available to the operator.
   {
