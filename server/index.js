@@ -1985,6 +1985,9 @@ function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
 function headControlMcpEntry(projectId, agentId, serverPort, token) {
   if (agentId !== "head") return null;
   const admission = captureProjectAdmission(projectId);
+  // Legacy installations keep chat MCP without acquiring V2 control authority.
+  // A present malformed identity must still fail the runtime's strict checks.
+  if (!Object.hasOwn(readConfig(), "installation_id")) return null;
   headControlRuntime.registerHeadToken({ project_id: projectId, generation: admission.generation, token });
   const shimPath = path.join(__dirname, "mcp-head-control-shim.js");
   return Object.freeze({
