@@ -37,12 +37,12 @@ function directory(dir) {
 function context(binding) {
   const held = [];
   const hold = (dir) => {
-    const before = fs.lstatSync(dir);
+    const before = fs.lstatSync(dir, { bigint: true });
     const fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
     held.push(fd);
-    const stat = fs.fstatSync(fd);
+    const stat = fs.fstatSync(fd, { bigint: true });
     if (!stat.isDirectory() || stat.dev !== before.dev || stat.ino !== before.ino) fail("directory identity changed");
-    return { dev: stat.dev, ino: stat.ino };
+    return { dev: String(stat.dev), ino: String(stat.ino) };
   };
   try {
     const worktree = directory(binding.worktree);
@@ -122,8 +122,8 @@ function seedOwnedWorktreeFile(binding, name, content, { runGit, adoptExact = fa
     // was relative to a pinned kernel cwd, even if a parent path moved.
     for (const [dir, expected] of [[ctx.binding.worktree, ctx.worktreeIdentity], [ctx.admin, ctx.adminIdentity]]) {
       directory(dir);
-      const actual = fs.statSync(dir);
-      if (actual.dev !== expected.dev || actual.ino !== expected.ino) fail("directory changed during seed write");
+      const actual = fs.statSync(dir, { bigint: true });
+      if (String(actual.dev) !== expected.dev || String(actual.ino) !== expected.ino) fail("directory changed during seed write");
     }
     if (!proved(ctx, name)) fail("seed receipt could not be verified");
     return { written: true };
@@ -137,8 +137,8 @@ function writeFromPinnedDirectories(input) {
   const { binding, name, content, admin, worktreeIdentity, adminIdentity, adoptExact } = input;
   if (!NAMES.has(name) || typeof content !== "string" || Buffer.byteLength(content) > 1024 * 1024) fail("invalid seed request");
   const assertCwd = (expected) => {
-    const actual = fs.statSync(".");
-    if (!actual.isDirectory() || actual.dev !== expected.dev || actual.ino !== expected.ino) fail("pinned directory identity changed");
+    const actual = fs.statSync(".", { bigint: true });
+    if (!actual.isDirectory() || String(actual.dev) !== expected.dev || String(actual.ino) !== expected.ino) fail("pinned directory identity changed");
   };
   const enter = (dir, expected) => { process.chdir(dir); assertCwd(expected); };
   assertCwd(worktreeIdentity);
