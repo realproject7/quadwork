@@ -1,5 +1,8 @@
 "use strict";
-require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
+let timeoutExit;
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture({
+  onControlExit(observation) { if (observation.options.timeout === 150) timeoutExit = observation; },
+});
 
 // #1066: the fixed Git runner server/index.js injects into the Delivery
 // Candidate chain.  Fixed program and argv with no shell, stdin fed then
@@ -11,6 +14,7 @@ const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const { MAX_TIMEOUT_MS, MAX_OUTPUT_BYTES, runDeliveryGit } = require("./delivery-git-runner");
 
 function git(cwd, args, input) { return execFileSync("git", args, { cwd, encoding: "utf8", input, timeout: 5000, maxBuffer: 16 * 1024 * 1024 }).trim(); }
@@ -82,23 +86,38 @@ async function main() {
     assert.equal(MAX_TIMEOUT_MS, 5000);
     for (const timeout_ms of [0, -1, 1.5, "5000", MAX_TIMEOUT_MS + 1, undefined]) throwsInvalid(() => runDeliveryGit(request(repository, ["rev-parse", "HEAD"], { timeout_ms })));
     const hook = path.join(directory, "slow-fsmonitor.sh");
-    fs.writeFileSync(hook, "#!/bin/sh\nexec sleep 3 </dev/null >/dev/null 2>&1\n", { mode: 0o755 });
+    const entered = `${hook}.entered`, slow = `${hook}.slow`;
+    fs.writeFileSync(hook, '#!/bin/sh\nprintf entered > "$0.entered"\nif test -f "$0.slow"; then exec sleep 3 </dev/null >/dev/null 2>&1; fi\n', { mode: 0o755 });
     git(repository, ["config", "core.fsmonitor", hook]);
+    // Prove the actual hook is usable before arming its sleep. This also
+    // avoids spending the short timeout on first-use hook initialization.
+    assert.equal((await runDeliveryGit(request(repository, ["status", "--porcelain", "--untracked-files=all"]))).ok, true);
+    assert.equal(fs.readFileSync(entered, "utf8"), "entered");
+    fs.unlinkSync(entered);
+    fs.writeFileSync(slow, "armed\n");
     let ticks = 0, marker2 = false;
     const interval = setInterval(() => { ticks += 1; }, 1);
-    const started = Date.now();
+    const wallStarted = Date.now(), started = performance.now();
     const pending = runDeliveryGit(request(repository, ["status", "--porcelain", "--untracked-files=all"], { timeout_ms: 150 }));
     setImmediate(() => { marker2 = true; });
     const timedOut = await pending;
-    const elapsed = Date.now() - started;
+    const elapsed = Math.ceil(performance.now() - started);
+    const wallElapsed = Date.now() - wallStarted;
     clearInterval(interval);
+    const diagnostic = JSON.stringify({ elapsed_ms: elapsed, wall_elapsed_ms: wallElapsed, hook_entered: fs.existsSync(entered), timeout_ms: timeoutExit?.options.timeout, killed: timeoutExit?.error?.killed, code: timeoutExit?.error?.code, signal: timeoutExit?.error?.signal, stderr: String(timeoutExit?.stderr || "").slice(0, 1000) });
     assert.deepEqual(timedOut, { ok: false, output: "" });
-    assert.ok(elapsed >= 150 && elapsed < 1500, `the child was killed at its timeout (${elapsed}ms), not after the 3s hook`);
+    assert.equal(fs.existsSync(entered), true, `the armed hook actually ran: ${diagnostic}`);
+    assert.equal(timeoutExit?.error?.killed, true, `a child timeout, not an ordinary Git error: ${diagnostic}`);
+    assert.equal(timeoutExit?.error?.signal, "SIGTERM", diagnostic);
+    assert.equal(timeoutExit?.error?.code, null, diagnostic);
+    assert.equal(timeoutExit?.stdout, "", diagnostic);
+    assert.equal(timeoutExit?.stderr, "", diagnostic);
+    assert.ok(elapsed >= 150 && elapsed < 1500, `the child was killed at its timeout, not after the 3s hook: ${diagnostic}`);
     assert.ok(marker2 && ticks > 0, `the loop turned ${ticks} times while the call ran`);
     assert.equal(fs.existsSync(path.join(repository, ".git", "index.lock")), false);
     git(repository, ["config", "--unset", "core.fsmonitor"]);
     assert.equal((await runDeliveryGit(request(repository, ["status", "--porcelain"], { timeout_ms: 5000 }))).ok, true);
-    console.log(`  PASS: the child timeout is the caller's bound (${elapsed}ms) and the loop keeps turning while git runs`);
+    console.log(`  PASS: the armed hook was killed at the caller's timeout and the loop kept turning: ${diagnostic}`);
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
 

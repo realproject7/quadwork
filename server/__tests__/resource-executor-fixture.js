@@ -5,7 +5,7 @@
 const cp = require("node:child_process");
 const util = require("node:util");
 const Module = require("node:module");
-function installResourceExecutorFixture({ runControlChild, preserveRuntimeOwner = false } = {}) {
+function installResourceExecutorFixture({ runControlChild, preserveRuntimeOwner = false, onControlExit } = {}) {
   const file = require.resolve("../resource-runtime-owner");
   const originalLoad = Module._load;
   const owner = {
@@ -15,7 +15,10 @@ function installResourceExecutorFixture({ runControlChild, preserveRuntimeOwner 
       // stdin path is exercised directly for the real Git runner tests.
       if (cp.execFile !== nativeExec && cp.execFile[util.promisify.custom]) return cp.execFile[util.promisify.custom](command, args, opts);
       return new Promise((resolve, reject) => {
-        const child = cp.execFile(command, args, opts, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
+        const child = cp.execFile(command, args, opts, (error, stdout, stderr) => {
+          onControlExit?.({ command, args, options: opts, error, stdout, stderr });
+          return error ? reject(error) : resolve({ stdout, stderr });
+        });
         child?.stdin?.on("error", () => {});
         child?.stdin?.end(input);
       });
