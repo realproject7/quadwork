@@ -22,8 +22,11 @@ console.warn = (...args) => output.push(args.join(" "));
     let reject;
     const deferred = new Promise((yes, no) => { resolve = yes; reject = no; });
     let calls = 0;
-    const exits = [];
-    const cleanExit = createCleanExit({ shutdown: () => { calls += 1; return deferred; } }, pidFile, (code) => exits.push(code));
+    const exits = [], reports = [];
+    const cleanExit = createCleanExit({ shutdown: () => { calls += 1; return deferred; } }, pidFile, (code) => exits.push(code), async (code) => {
+      assert.deepEqual(exits, [], "shutdown outcome reaches the instance owner before exit");
+      reports.push(code);
+    });
     const completion = cleanExit();
     assert.equal(cleanExit(), completion, "repeated signals join the same CLI operation");
     await Promise.resolve();
@@ -35,9 +38,10 @@ console.warn = (...args) => output.push(args.join(" "));
     else resolve({ ok: outcome === "success", cleanup_errors: outcome === "success" ? [] : [{ code: "pty_stop_failed" }] });
     await completion;
     assert.deepEqual(exits, [outcome === "success" ? 0 : 1]);
+    assert.deepEqual(reports, exits);
     assert.equal(output.some((line) => line.includes("Stopped.")), outcome === "success");
     assert.equal(output.some((line) => line.includes("Shutdown incomplete")), outcome !== "success");
-    assert.equal(fs.existsSync(pidFile), false);
+    assert.equal(fs.existsSync(pidFile), true, "only the external requester can confirm process exit and remove its exact receipt");
     assert.equal(cleanExit(), completion);
     assert.equal(calls, 1);
   }

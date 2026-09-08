@@ -15,6 +15,7 @@ const {
   commitConfigurationSnapshot,
 } = require("../server/config");
 const { normalizeCiPolicy } = require("../server/ci-evidence-policy");
+const { createCliStopOwner, requestCliStop } = require("../server/cli-stop-owner");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const { configureServiceTempEnvironment } = require("../server/resource-service-env");
 const {
@@ -1173,7 +1174,7 @@ async function cmdInit() {
 
 // #1077: signal handlers join one awaited shutdown and never report a stop
 // before the server confirms its owned processes have exited.
-function createCleanExit(serverExports, serverPidFile, exit = (code) => process.exit(code)) {
+function createCleanExit(serverExports, serverPidFile, exit = (code) => process.exit(code), beforeExit = async () => {}) {
   let completion;
   return () => {
     if (completion) return completion;
@@ -1193,7 +1194,9 @@ function createCleanExit(serverExports, serverPidFile, exit = (code) => process.
         code = 1;
         warn(`Shutdown incomplete: ${err.message}`);
       }
-      try { fs.unlinkSync(serverPidFile); } catch {}
+      // The requesting CLI removes its exact receipt only after observing exit.
+      // Ctrl+C leaves a stale receipt; a future start can replace it after exit.
+      await beforeExit(code);
       exit(code);
     });
     return completion;
@@ -1253,15 +1256,15 @@ async function cmdStart() {
   log("Press Ctrl+C to stop.\n");
   const serverExports = require(path.join(serverDir, "index.js"));
 
-  // #972: record the server PID so `quadwork stop` (which reads server.pid)
-  // actually finds this in-foreground process. Removed again on exit.
   const serverPidFile = path.join(CONFIG_DIR, "server.pid");
+  let stopOwner;
+  const cleanExit = createCleanExit(serverExports, serverPidFile, (code) => process.exit(code),
+    (code) => stopOwner?.reportShutdown(code));
   try {
-    if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
-    fs.writeFileSync(serverPidFile, String(process.pid));
-  } catch (e) { warn(`could not write server.pid: ${e.message}`); }
-
-  const cleanExit = createCleanExit(serverExports, serverPidFile);
+    stopOwner = await createCliStopOwner(serverPidFile, cleanExit);
+  } catch (error) {
+    warn(`CLI stop unavailable [${error.code || "cli_stop_owner_failed"}]. Use Ctrl+C in this foreground session.`);
+  }
 
   // #972: handle SIGTERM too so `quadwork stop` gets the same clean shutdown
   // (agent PTYs + caffeinate + timers) as Ctrl+C, not a bare process kill.
@@ -1280,58 +1283,31 @@ function sanitizePid(raw) {
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
-function stopPid(name, pidFileName) {
+async function stopPid(name, pidFileName) {
   const pidFile = path.join(CONFIG_DIR, pidFileName);
-  if (!fs.existsSync(pidFile)) return false;
-  const pid = sanitizePid(fs.readFileSync(pidFile, "utf-8"));
-  if (pid === null) {
-    // #972: never signal on a corrupt PID; just clean the stale file.
-    warn(`${name}: ignoring corrupt PID file (${pidFileName})`);
-    try { fs.unlinkSync(pidFile); } catch {}
-    return false;
-  }
-  try {
-    process.kill(pid, "SIGTERM");
-    ok(`Stopped ${name} (PID: ${pid})`);
-  } catch {
-    warn(`${name} process ${pid} not running`);
-  }
-  // #972: a failed unlink must not abort the rest of cmdStop.
-  try { fs.unlinkSync(pidFile); } catch {}
-  return true;
+  const result = await requestCliStop(pidFile, fs.realpathSync(__filename));
+  if (result.status === "stopped") ok(`Stopped ${name} (PID: ${result.pid})`);
+  else if (result.status !== "missing") warn(`${name}: ${result.status} [${result.code}]. Receipt retained; no external PID signal was sent.`);
+  return result;
 }
 
-function cmdStop() {
+async function cmdStop() {
   console.log("\n  QuadWork Stop\n");
-
-  let stopped = 0;
-  if (stopPid("Telegram bridge", "tg-bridge.pid")) stopped++;
-
-  // Stop per-project AgentChattr instances
+  const targets = [["Telegram bridge", "tg-bridge.pid"]];
   const config = readConfig();
-  for (const project of (config.projects || [])) {
-    if (stopPid(`AgentChattr (${project.id})`, `agentchattr-${project.id}.pid`)) stopped++;
+  for (const project of (config.projects || [])) targets.push([`AgentChattr (${project.id})`, `agentchattr-${project.id}.pid`]);
+  targets.push(["AgentChattr", "agentchattr.pid"], ["Server", "server.pid"]);
+  let stopped = 0, unresolved = 0;
+  for (const [name, file] of targets) {
+    const result = await stopPid(name, file);
+    if (result.status === "stopped") stopped++;
+    else if (result.status !== "missing") unresolved++;
   }
-  // Also stop legacy single-instance PID if present
-  if (stopPid("AgentChattr", "agentchattr.pid")) stopped++;
-
-  if (stopPid("Server", "server.pid")) stopped++;
-
-  // Stop caffeinate via the running server's API (targets only QuadWork's instance)
-  if (process.platform === "darwin") {
-    const cfg = readConfig();
-    const qwPort = cfg.port || 8400;
-    try {
-      const result = run("curl", ["-s", "-X", "POST", `http://127.0.0.1:${qwPort}/api/caffeinate/stop`]);
-      if (result && result.includes('"ok":true')) {
-        ok("Stopped caffeinate (sleep prevention)");
-        stopped++;
-      }
-    } catch {}
-  }
-
-  if (stopped === 0) warn("No running processes found");
-  else ok(`Stopped ${stopped} process(es)`);
+  // The verified server's shutdown owns caffeinate. Never POST to a guessed
+  // configured port: another service may now be listening there.
+  if (stopped) ok(`Stopped ${stopped} process(es)`);
+  else if (!unresolved) warn("No stop receipts found");
+  if (unresolved) { warn(`${unresolved} stop request(s) unconfirmed`); process.exitCode = 1; }
   log("");
 }
 
@@ -1867,7 +1843,7 @@ function cmdAcRestore() {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 // #972: run the CLI dispatch only when invoked directly, so tests can
-// `require("../bin/quadwork")` for the pure helpers (sanitizePid, stopPid)
+// `require("../bin/quadwork")` for focused helper tests
 // without executing a command.
 if (require.main === module) {
 // #1064: the floor is enforced here, before dispatch, so *every* command
