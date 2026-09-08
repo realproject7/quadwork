@@ -173,7 +173,11 @@ function finalizeDocument(value) {
 }
 
 function assertRecord(value, scope, key) {
-  exact(value, ["round"], "task_review_round_store_invalid");
+  exact(value, ["round", ...(plain(value) && Object.hasOwn(value, "pipeline_opening") ? ["pipeline_opening"] : [])], "task_review_round_store_invalid");
+  if (Object.hasOwn(value, "pipeline_opening")) {
+    exact(value.pipeline_opening, ["version", "event_id"], "task_review_round_store_invalid");
+    if (value.pipeline_opening.version !== 1 || typeof value.pipeline_opening.event_id !== "string" || !/^[a-z][a-z0-9_-]{2,95}$/.test(value.pipeline_opening.event_id)) fail("task_review_round_store_invalid", "pipeline opening identity is invalid");
+  }
   try { assertTaskReviewRound(value.round); }
   catch { fail("task_review_round_store_invalid", "stored round is invalid"); }
   const round = value.round;
@@ -181,7 +185,7 @@ function assertRecord(value, scope, key) {
       recordKey(round.review_round_ref, round.candidate_digest) !== key) {
     fail("task_review_round_store_invalid", "stored round identity does not match its project scope");
   }
-  return { round: clone(round) };
+  return { round: clone(round), ...(value.pipeline_opening ? { pipeline_opening: clone(value.pipeline_opening) } : {}) };
 }
 
 function assertDocument(value, scope) {
@@ -192,10 +196,15 @@ function assertDocument(value, scope) {
   }
   const entries = Object.entries(value.records);
   if (entries.length > MAX_ROUNDS_PER_PROJECT) fail("task_review_round_store_invalid", "stored document exceeds its round bound");
-  const records = Object.create(null);
+  const records = Object.create(null), events = new Set();
   for (const [key, entry] of entries) {
     if (!DIGEST_RE.test(key)) fail("task_review_round_store_invalid", "stored round key is invalid");
     records[key] = assertRecord(entry, scope, key);
+    if (records[key].pipeline_opening) {
+      const event = records[key].pipeline_opening.event_id;
+      if (events.has(event)) fail("task_review_round_store_invalid", "pipeline opening event is duplicated");
+      events.add(event);
+    }
   }
   const normalized = {
     version: value.version,
@@ -437,7 +446,29 @@ class TaskReviewRoundStore {
     return path.join(this.rootDir, TASK_REVIEW_ROUND_STORE_DIRECTORY, scopeFilename(scope));
   }
 
-  openRound(input, trustedAssignments) {
+  openRound(input, trustedAssignments) { return this._openRound(input, trustedAssignments, null); }
+
+  // Fixed service-only transaction identity, stored before pipeline CAS.
+  // Direct callers of openRound retain its strict immutable timestamp rule.
+  openPipelineRound(input, trustedAssignments, eventId) {
+    if (typeof eventId !== "string" || !/^[a-z][a-z0-9_-]{2,95}$/.test(eventId)) fail("task_review_round_conflict", "pipeline opening event is invalid");
+    return this._openRound(input, trustedAssignments, { version: 1, event_id: eventId });
+  }
+
+  assertAssignedOpening(input, trustedAssignments, eventId) {
+    if (typeof eventId !== "string" || !/^[a-z][a-z0-9_-]{2,95}$/.test(eventId)) fail("task_review_round_conflict", "pipeline opening event is invalid");
+    const opened = openTaskReviewRound(input, trustedAssignments);
+    const scope = scopeFromRef(opened.review_round_ref);
+    const loaded = safeReadDocument(this.fs, this.rootDir, scope);
+    const key = recordKey(opened.review_round_ref, opened.candidate_digest), prior = loaded.document.records[key];
+    // The service has already proven the exact existing pipeline event. This
+    // read permits legacy applied openings; it neither adds nor adopts identity.
+    if (!prior || prior.round.status === "cancelled" || prior.pipeline_opening && prior.pipeline_opening.event_id !== eventId ||
+        !sameOpening(prior.round, { ...opened, opened_at: prior.round.opened_at })) fail("task_review_round_conflict", "assigned opening no longer has the same reviewer identity");
+    return statusProjection(prior.round);
+  }
+
+  _openRound(input, trustedAssignments, pipelineOpening) {
     const opened = openTaskReviewRound(input, trustedAssignments);
     const scope = scopeFromRef(opened.review_round_ref);
     return withProjectWriterLock(this, scope, () => {
@@ -447,11 +478,24 @@ class TaskReviewRoundStore {
       const loaded = safeReadDocument(this.fs, this.rootDir, scope);
       const key = recordKey(opened.review_round_ref, opened.candidate_digest);
       const prior = loaded.document.records[key];
+      if (pipelineOpening) {
+        for (const [otherKey, record] of Object.entries(loaded.document.records)) {
+          if (otherKey !== key && (record.pipeline_opening?.event_id === pipelineOpening.event_id ||
+              record.round.candidate_digest === opened.candidate_digest &&
+              workTaskKey(record.round.review_round_ref.work_task_ref) === workTaskKey(opened.review_round_ref.work_task_ref))) {
+            fail("task_review_round_conflict", "another logical opening already owns this event or exact candidate");
+          }
+        }
+      }
       if (prior) {
         // Receipt/release/cancellation state is expected to change after the
         // immutable opening.  Retrying that same exact opening must not replace
         // it or turn a later sealed state into a conflict.
-        if (!sameOpening(prior.round, opened)) {
+        if (pipelineOpening && (!prior.pipeline_opening || prior.pipeline_opening.event_id !== pipelineOpening.event_id || prior.round.status !== "current")) {
+          fail("task_review_round_conflict", "an unapplied opening lacks the exact current persisted pipeline identity");
+        }
+        const compared = pipelineOpening ? { ...opened, opened_at: prior.round.opened_at } : opened;
+        if (!sameOpening(prior.round, compared)) {
           fail("task_review_round_conflict", "an exact review-round key already has different immutable opening state");
         }
         return statusProjection(prior.round);
@@ -460,7 +504,7 @@ class TaskReviewRoundStore {
         fail("task_review_round_store_over_bound", "project has reached its sealed review-round bound");
       }
       const next = clone(loaded.document);
-      next.records[key] = { round: clone(opened) };
+      next.records[key] = { round: clone(opened), ...(pipelineOpening ? { pipeline_opening: clone(pipelineOpening) } : {}) };
       writeDocument(this, scope, next);
       return statusProjection(opened);
     });
@@ -474,7 +518,7 @@ class TaskReviewRoundStore {
       const transition = submitTaskReviewReceipt(located.round, receipt, trustedReviewerContext);
       if (transition.outcome !== "idempotent") {
         const next = clone(loaded.document);
-        next.records[located.key] = { round: clone(transition.round) };
+        next.records[located.key] = { ...next.records[located.key], round: clone(transition.round) };
         writeDocument(this, scope, next);
       }
       return cloneFreeze({ outcome: transition.outcome, view: ownReceiptProjection(transition.round, trustedReviewerContext) });
@@ -556,7 +600,7 @@ class TaskReviewRoundStore {
       const nextRound = cancelTaskReviewRound(located.round, cancellation);
       if (nextRound.round_digest !== located.round.round_digest) {
         const next = clone(loaded.document);
-        next.records[located.key] = { round: clone(nextRound) };
+        next.records[located.key] = { ...next.records[located.key], round: clone(nextRound) };
         writeDocument(this, scope, next);
       }
       return statusProjection(nextRound);

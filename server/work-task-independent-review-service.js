@@ -113,14 +113,18 @@ function createWorkTaskIndependentReviewService(value) {
     if (prior !== null) {
       if (prior.kind === "assign_independent_review" && slot.state === "independent_review" && slot.review_assignment !== null &&
           slot.review_assignment.review_round_id === id && slot.review_assignment.candidate_digest === slot.candidate.candidate_digest) {
+        try {
+          roundStore.assertAssignedOpening({ version: VERSION, candidate: slot.candidate, attempt: input.attempt, round: input.round, opened_at: input.opened_at },
+            { version: VERSION, reviewers: input.reviewers }, input.event_id);
+        } catch (error) { rethrow(error, "work_task_review_open_failed"); }
         return publicRound("idempotent", ref, slot.candidate.candidate_digest);
       }
       fail("work_task_review_event_conflict", "event identity is already bound to another pipeline transition");
     }
     if (slot.state !== "candidate_ready") fail("work_task_review_assignment_unavailable", "candidate is not awaiting independent review");
     try {
-      roundStore.openRound({ version: VERSION, candidate: slot.candidate, attempt: input.attempt, round: input.round, opened_at: input.opened_at },
-        { version: VERSION, reviewers: input.reviewers });
+      roundStore.openPipelineRound({ version: VERSION, candidate: slot.candidate, attempt: input.attempt, round: input.round, opened_at: input.opened_at },
+        { version: VERSION, reviewers: input.reviewers }, input.event_id);
     } catch (error) { rethrow(error, "work_task_review_open_failed"); }
     let plan;
     try {
