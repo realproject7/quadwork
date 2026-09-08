@@ -17,8 +17,20 @@ const F = require("./resource-linux-facts");
 const { boundedUntil, checkProcessSet } = require("./resource-linux-launcher");
 const exec = promisify(execFile);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const SOURCE_FILES = ["resource-staging-proof.js", "resource-staging-live-adapter.js", "resource-staging-worker.js", "resource-linux-launcher.js", "resource-linux-facts.js", "resource-controller.js", "resource-runtime-owner.js", "resource-runtime-snapshot.js", "index.js"];
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
+function sourceManifest() {
+  const root = path.dirname(__dirname), files = {}, queue = ["server", "package.json", "package-lock.json"];
+  let total = 0;
+  while (queue.length) {
+    const relative = queue.shift(), absolute = path.join(root, relative), before = fs.lstatSync(absolute);
+    if (before.isDirectory()) { queue.push(...fs.readdirSync(absolute).sort().map((name) => path.join(relative, name))); continue; }
+    if (!before.isFile() || before.isSymbolicLink() || Object.keys(files).length >= 4096 || (total += before.size) > 64 * 1024 * 1024) F.fail("source_manifest_unavailable");
+    const bytes = fs.readFileSync(absolute), after = fs.lstatSync(absolute);
+    if (before.ino !== after.ino || before.dev !== after.dev || before.size !== after.size || before.mtimeMs !== after.mtimeMs) F.fail("source_changed");
+    files[relative] = sha(bytes);
+  }
+  return Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b, "en")));
+}
 function vmOomKills() { const m = /^oom_kill (\d+)$/m.exec(F.text("/proc/vmstat")); if (!m) F.fail("vm_counter_unavailable"); return Number(m[1]); }
 async function run(file, args, options = {}) { return (await exec(file, args, { timeout: 5000, maxBuffer: 1024 * 1024, ...options })).stdout.trim(); }
 async function ephemeralPort() { const s = net.createServer(); await new Promise((resolve, reject) => { s.once("error", reject); s.listen(0, "127.0.0.1", resolve); }); const port = s.address().port; await new Promise((resolve) => s.close(resolve)); return port; }
@@ -99,7 +111,8 @@ async function runClosedStagingMatrix(options) {
   const owned = { apiUnit, workers: [], tempRoot, runId };
   fs.writeFileSync(path.join(root, "ownership.json"), JSON.stringify(owned), { mode: 0o600, flag: "wx" });
   const childEnv = { HOME: root, PATH: `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`, TMPDIR: tempRoot, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid()}/bus` };
-  const result = { ok: false, reason: "proof_failed", started_phases: [], primitive: {}, integrated: {}, cleanup: { ok: false }, provider_startup: "unavailable_not_installed_or_not_exercised", provider_model_turns: "unproved_no_credentials", source_files: Object.fromEntries(SOURCE_FILES.map((name) => [name, sha(fs.readFileSync(path.join(__dirname, name)))])), versions: { node: process.version, kernel: os.release(), systemd: F.command("systemctl", ["--version"]).split("\n")[0] }, limits_mib: { ...policy, temp_root: undefined } };
+  const result = { ok: false, reason: "proof_failed", started_phases: [], primitive: {}, integrated: {}, cleanup: { ok: false }, provider_startup: "unavailable_not_installed_or_not_exercised", provider_model_turns: "unproved_no_credentials", source_files: sourceManifest(), versions: { node: process.version, kernel: os.release(), systemd: F.command("systemctl", ["--version"]).split("\n")[0] }, limits_mib: { ...policy, temp_root: undefined } };
+  result.source_digest = sha(JSON.stringify(result.source_files));
   let token = null, apiStarted = false, monitorStop = false, monitoring = null, monitorFailure = null;
   const sockets = [], protectedGroups = [], samples = [];
   let signalReceived = false;
@@ -226,6 +239,7 @@ async function runClosedStagingMatrix(options) {
     const journal = journalRows(await run("journalctl", ["-k", "-b", bootId, `--after-cursor=${anchor}`, "-o", "json", "--no-pager"]));
     const kernel = F.parseKernelInterval(journal, { bootId, ownedGroup: pressure.group, vmKills: vmOomKills() - vmBefore });
     result.integrated = { ordinary_http_launch: true, worker_memcg_oom: true, api_health: true, primary_chat_roundtrip: true, terminal_websocket: true, unrelated_worker: true, ...kernel, samples: samples.length, maximum_gap_ms: Math.max(...gaps), worst_latency_ms: Math.max(...samples.map((s) => s.latency_ms)), pressure_window_ms: pressureEnd - pressureStart, observation_resolution_ms: 250 };
+    if (sha(JSON.stringify(sourceManifest())) !== result.source_digest) F.fail("source_changed");
     result.ok = true; result.reason = "proof_passed";
   } catch (error) { result.check = publicError(error); }
   finally {
