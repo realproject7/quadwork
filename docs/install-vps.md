@@ -758,6 +758,14 @@ and report `containment_unavailable`; existing V1 workers are preserved.
 The matrix uses 96/128/16 MiB worker high/max/swap, at most 160 MiB of touched
 allocation, API 640 MiB, control 256 MiB, three worker slots and 1536 MiB host
 reserve. These are disposable fixture values, not production defaults. A
+fixed 16-thread pool touches twenty reserved 8 MiB buffers through bounded
+kernel reads, with no refill or retry. The coordinator allows at most 45 seconds
+to observe actual memcg OOM; worker/API watchdogs remain 90/120 seconds.
+Real Git control children wait for an observed concurrency/queue handshake.
+Thread/allocation records describe the workload; only independent kernel and
+cgroup observations establish OOM. Continuous API/chat/WS samples must stay
+within the existing 2-second failure budget throughout the pressure interval.
+A
 local pass proves Node/test/git/temp inheritance and sampled product reachability;
 it does not prove authenticated Claude/Codex model turns or provider temp use.
 Archive the exact package/source hashes and complete redacted JSON result.

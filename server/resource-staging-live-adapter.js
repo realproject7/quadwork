@@ -15,6 +15,7 @@ const { parseProcMeminfo } = require("./resource-preflight");
 const { createWorkerUnitBase } = require("./resource-unit");
 const F = require("./resource-linux-facts");
 const { boundedUntil, checkProcessSet } = require("./resource-linux-launcher");
+const { pressureObservations, controlMarker, controlObservationReady, controlFilterSource } = require("./resource-staging-observation");
 const exec = promisify(execFile);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
@@ -102,11 +103,13 @@ async function runClosedStagingMatrix(options) {
   });
   fs.writeFileSync(path.join(configDirectory, "config.json"), JSON.stringify({ port, file_chat_switchover_done: true, projects, runtime_resources: policy }), { mode: 0o600, flag: "wx" });
   // Throwaway Git inputs exercise the actual recovery facts path. The clean
-  // filter is real owned code, forwards content unchanged, and holds briefly
-  // so the parent can independently sample its PID/cgroup and the leaf cap.
+  // filter stays held until real identity/concurrency/queue observations
+  // release it. A bounded deadline fails instead of guessing a sampling delay.
   const controlMarkers = path.join(root, "control-observations"); fs.mkdirSync(controlMarkers, { mode: 0o700 });
+  const controlRelease = path.join(root, "control-release");
+  fs.writeFileSync(controlRelease, "release", { mode: 0o600 });
   const filter = path.join(root, "control-filter.cjs");
-  fs.writeFileSync(filter, `const fs=require("fs"); fs.writeFileSync(${JSON.stringify(controlMarkers)}+"/"+process.pid, String(process.pid), {mode:384}); process.stdin.pipe(process.stdout); setTimeout(()=>{},1200);\n`, { mode: 0o600 });
+  fs.writeFileSync(filter, controlFilterSource(controlMarkers, controlRelease), { mode: 0o600 });
   const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
   const pressureRepo = projects[0].agents.dev.cwd;
   await run("git", ["init", "-q", "-b", "main"], { cwd: pressureRepo });
@@ -116,6 +119,7 @@ async function runClosedStagingMatrix(options) {
   await run("git", ["add", ".gitattributes", "tracked.txt"], { cwd: pressureRepo });
   const staleTime = new Date(Date.now() - 300000); fs.utimesSync(path.join(pressureRepo, "tracked.txt"), staleTime, staleTime);
   for (const name of fs.readdirSync(controlMarkers)) fs.unlinkSync(path.join(controlMarkers, name));
+  fs.unlinkSync(controlRelease);
   const owned = { apiUnit, workers: [], tempRoot, runId };
   fs.writeFileSync(path.join(root, "ownership.json"), JSON.stringify(owned), { mode: 0o600, flag: "wx" });
   const childEnv = { HOME: root, PATH: `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`, TMPDIR: tempRoot, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid()}/bus` };
@@ -168,6 +172,12 @@ async function runClosedStagingMatrix(options) {
     pressure.stream.socket.send(`${JSON.stringify({ kind: "exit", challenge: pressure.ready.challenge })}\n`);
     await boundedUntil(() => { try { F.readProcess(pressure.main.pid); return false; } catch (e) { return e.code === "ENOENT"; } });
     pressure.stream.socket.close();
+    // Physical exit precedes the governor's retained terminal fact and
+    // recursive cleanup. Recovery must start from the actual exited state.
+    await boundedUntil(async () => {
+      const old = (await request(origin, "/api/agents"))["proof-pressure/dev"];
+      return old?.generation_id === pressure.generation && old.state === "exited" && old.last_exit;
+    });
     const recoveries = Array.from({ length: 3 }, () => fetch(`${origin}/api/agents/proof-pressure/dev/start`, { method: "POST", headers: { "content-type": "application/json", "x-session-token": token }, body: "{}", signal: AbortSignal.timeout(30000) }).then((r) => r.json()));
     let recoveryDone = false, recoveryError = null;
     const recovered = Promise.all(recoveries).catch((e) => { recoveryError = e; return []; }).finally(() => { recoveryDone = true; });
@@ -181,16 +191,18 @@ async function runClosedStagingMatrix(options) {
         if (!/^\d+$/.test(name)) F.fail("control_observation_invalid");
         try {
           const observed = F.readProcess(Number(name));
-          if (!observed.cgroup.includes("/quadwork-control.slice/") || !/\/quadwork-control-[a-f0-9]{40}\.scope$/.test(observed.cgroup)) F.fail("control_child_uncontained");
-          controlPids.add(observed.pid);
+          const marker = path.join(controlMarkers, name), stat = fs.lstatSync(marker);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid() || stat.size > 16384 || (stat.mode & 0o777) !== 0o600) F.fail("control_observation_invalid");
+          controlPids.add(controlMarker(F.text(marker), observed));
         } catch (e) { if (e.code !== "ENOENT" && e.check !== "process_identity_changed") throw e; }
       }
+      if (controlObservationReady(maxControl, maxQueued, controlPids) && !fs.existsSync(controlRelease)) fs.writeFileSync(controlRelease, "release", { mode: 0o600, flag: "wx" });
       await wait(50);
     }
     const recoveryResults = await recovered;
     if (recoveryError) throw recoveryError;
     const launched = recoveryResults.find((entry) => entry.ok === true && entry.lifecycle?.generation_id !== pressure.generation);
-    if (!launched || !launched.repository?.available || maxControl !== 2 || controlPids.size < 2) F.fail("control_child_path_unproven");
+    if (!launched || !launched.repository?.available || !controlObservationReady(maxControl, maxQueued, controlPids)) F.fail("control_child_path_unproven");
     const generation = launched.lifecycle.generation_id;
     const unit = `${createWorkerUnitBase({ projectId: "proof-pressure", generationId: generation })}.scope`;
     const stream = await connectTerminal(origin, "proof-pressure", token); sockets.push(stream);
@@ -229,14 +241,23 @@ async function runClosedStagingMatrix(options) {
     F.verifyWorkerGroup(pressure.group, { memoryHighMib: 96, memoryMaxMib: 128, swapMaxMib: 16 }, protectedGroups);
     if (!F.sameProcess(pressure.main, F.readProcess(pressure.main.pid))) F.fail("process_identity_changed");
     if (F.readGroup(path.posix.dirname(pressure.group)).pids.length !== 0) F.fail("parent_slice_has_foreign_process");
+    const tids = fs.readdirSync(`/proc/${pressure.main.pid}/task`).map(Number).sort((a, b) => a-b);
+    let poolThreads = 0;
+    for (const tid of tids) {
+      if (!Number.isSafeInteger(tid) || tid < 1 || F.readProcess(tid).cgroup !== pressure.group) F.fail("allocation_thread_uncontained");
+      if (F.text(`/proc/${pressure.main.pid}/task/${tid}/comm`).trim() === "libuv-worker") poolThreads++;
+    }
+    if (poolThreads !== 16 || pressure.ready.pool_size !== 16 || JSON.stringify(pressure.ready.tids) !== JSON.stringify(tids)) F.fail("allocation_pool_unproven");
     result.started_phases.push("integrated_bounded_worker_oom");
     const pressureStart = Date.now();
     pressure.stream.socket.send(`${JSON.stringify({ kind: "pressure", challenge: pressure.ready.challenge })}\n`);
-    await boundedUntil(() => pressure.stream.records.some((r) => r.kind === "allocation"), 3000);
-    await boundedUntil(() => parentOom(pressure.group) > workerBefore, 10000);
+    await boundedUntil(() => pressure.stream.records.some((r) => r.kind === "allocation_threads_after"), 3000);
+    pressureObservations(pressure.stream.records, pressure.main.pid, tids);
+    await boundedUntil(() => parentOom(pressure.group) > workerBefore, 45000);
     const pressureEnd = Date.now();
     await boundedUntil(() => { try { return F.readGroup(pressure.group).pids.length === 0; } catch (e) { return e.code === "ENOENT"; } });
     await sample();
+    result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, tids);
     monitorStop = true; await monitoring;
     if (monitorFailure) F.fail(monitorFailure);
     const gaps = samples.slice(1).map((r, i) => r.at - samples[i].at);
@@ -257,6 +278,7 @@ async function runClosedStagingMatrix(options) {
     }
   }
   finally {
+    fs.writeFileSync(controlRelease, "release", { mode: 0o600 });
     monitorStop = true; if (monitoring) await monitoring.catch(() => {});
     for (const stream of sockets) stream.socket.close();
     const failures = [];
