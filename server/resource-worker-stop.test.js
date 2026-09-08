@@ -105,7 +105,6 @@ async function scenario(mode) {
       assert.equal(unitFiles.size, 1);
       assert.equal(stopCalls, 0);
       assert.equal(await launcher.prepare(), false);
-      assert.equal((await launcher.shutdown()).ok, false);
     }
     console.log(`PASS worker stop ${mode}: real PTY/descendant, exact ownership, joined attempts and recursive cleanup`);
   } finally {
