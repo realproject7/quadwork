@@ -297,8 +297,10 @@ const SECTION_PREFIX = "section-";
 const RENDEZVOUS_DEADLINE_MS = 15_000;
 // How long a racer stays inside its protected action.  It is a safety net,
 // not the mechanism: the wait below ends as soon as the other racer has
-// either joined it inside (which only a broken primitive allows), been turned
-// away, or finished.  A hold that ended on a timer instead would make this
+// either completed its entry observation, been turned away, or finished.
+// Publishing a section marker is not an observation: removing our marker
+// before the peer snapshots it can make both entry reports miss an overlap.
+// A hold that ended on a timer instead would make this
 // race a question about scheduling latency, and it flaked as exactly that
 // under load before the stop conditions were made explicit.
 const SECTION_HOLD_MS = 5_000;
@@ -326,13 +328,14 @@ const RACE_CODES = Object.freeze({
 });
 
 function sleepBriefly() { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); }
-function waitForAny(rendezvous, names, budgetMs = RENDEZVOUS_DEADLINE_MS) {
+function waitForAny(rendezvous, names, budgetMs = RENDEZVOUS_DEADLINE_MS, onPending = () => {}) {
   const deadline = Date.now() + budgetMs;
   for (;;) {
     for (const name of names) {
       if (fs.existsSync(path.join(rendezvous, name))) return name;
     }
     if (Date.now() >= deadline) return null;
+    onPending();
     sleepBriefly();
   }
 }
@@ -340,10 +343,13 @@ function waitForAny(rendezvous, names, budgetMs = RENDEZVOUS_DEADLINE_MS) {
 // used by the race and by the negative control that proves it can see one.
 // The marker is published before the snapshot is taken, so a report of
 // `others` is only ever produced when both markers were on disk together.
-function enterSection(rendezvous, role) {
+function enterSection(rendezvous, role, beforeSnapshot = () => {}) {
   fs.writeFileSync(path.join(rendezvous, `${SECTION_PREFIX}${role}`), String(process.pid), { mode: 0o600, flag: "wx" });
+  beforeSnapshot();
   const others = fs.readdirSync(rendezvous).filter((name) => name.startsWith(SECTION_PREFIX) && name !== `${SECTION_PREFIX}${role}`);
   fs.writeSync(1, `SECTION-ENTER ${role} ${JSON.stringify(others)}\n`);
+  // A peer may remove its marker only after this snapshot has finished.
+  fs.writeFileSync(path.join(rendezvous, `observed-${role}`), "", { mode: 0o600, flag: "wx" });
 }
 function exitSection(rendezvous, role) {
   try { fs.unlinkSync(path.join(rendezvous, `${SECTION_PREFIX}${role}`)); } catch { /* the marker is this process's own */ }
@@ -370,6 +376,7 @@ if (process.argv[2] === "--mutex-race") {
   const role = process.argv[4];
   const workDirectory = process.argv[5];
   const rendezvous = process.argv[6];
+  const delayedObservation = process.argv[7] === "delayed-observation";
   const other = role === "left" ? "right" : "left";
   const target = path.join(workDirectory, "state.json");
   const files = createDurableStoreFiles({
@@ -382,6 +389,9 @@ if (process.argv[2] === "--mutex-race") {
     process.exit(4);
   }
   fs.writeSync(1, `BARRIER ${role}\n`);
+  if (delayedObservation && role === "right") {
+    assert.equal(waitForAny(rendezvous, ["observed-left"]), "observed-left");
+  }
 
   // A loser retries rather than giving up, so both roles certainly enter
   // their protected action and "no overlap" can never mean "never ran".
@@ -390,13 +400,25 @@ if (process.argv[2] === "--mutex-race") {
   for (;;) {
     try {
       files.withWriterLock(target, () => {
-        enterSection(rendezvous, role);
+        enterSection(rendezvous, role, () => {
+          if (delayedObservation && role === "right") {
+            // Force the old failing order: left already snapshotted an empty
+            // section; right has published its marker but cannot snapshot
+            // until left proves it is still waiting for that observation.
+            assert.equal(waitForAny(rendezvous, ["observation-pending-left"]), "observation-pending-left");
+          }
+        });
         // Stay inside until the other racer's fate is settled, so a second
         // entrant is certainly seen if one is possible at all.  Exactly one
         // of these three becomes true, and which one is the whole result:
-        // it joined this section (a broken primitive), it was turned away (a
-        // working one), or it already finished (it went first).
-        waitForAny(rendezvous, [`${SECTION_PREFIX}${other}`, `refused-${other}`, `${other}-done`], SECTION_HOLD_MS);
+        // it finished its snapshot (a broken primitive), it was turned away
+        // (a working one), or it already finished (it went first).
+        const settled = waitForAny(rendezvous, [`observed-${other}`, `refused-${other}`, `${other}-done`], SECTION_HOLD_MS, () => {
+          if (delayedObservation && role === "left" && fs.existsSync(path.join(rendezvous, `${SECTION_PREFIX}${other}`))) {
+            fs.writeFileSync(path.join(rendezvous, "observation-pending-left"), "", { mode: 0o600 });
+          }
+        });
+        assert.notEqual(settled, null, `${role}: peer observation or refusal never arrived`);
         exitSection(rendezvous, role);
       });
       // How many times this role was actually turned away.  With a correct
@@ -829,15 +851,15 @@ async function overlapDetectorSeesAKnownOverlap() {
 // action.  The same harness is then run against two deliberately wrong
 // primitives, and both of those must report the overlap this one must not:
 // without them an empty report would only prove the detector was quiet.
-async function runMutexRace(adapterName) {
+async function runMutexRace(adapterName, schedule = "simultaneous") {
   return withDirectory(async (directory) => {
     const rendezvous = rendezvousDirectory();
-    const left = spawnTracked(["--mutex-race", adapterName, "left", directory, rendezvous]);
-    const right = spawnTracked(["--mutex-race", adapterName, "right", directory, rendezvous]);
+    const left = spawnTracked(["--mutex-race", adapterName, "left", directory, rendezvous, schedule]);
+    const right = spawnTracked(["--mutex-race", adapterName, "right", directory, rendezvous, schedule]);
     const outcomes = { left: await left.exited, right: await right.exited };
     const output = `left=${JSON.stringify(left.output())} right=${JSON.stringify(right.output())}`;
     const entries = [...sectionEntries("left", left.output()), ...sectionEntries("right", right.output())];
-    const context = `${adapterName}: ${JSON.stringify(outcomes)} ${output}`;
+    const context = `${adapterName}/${schedule}: ${JSON.stringify(outcomes)} ${output}`;
 
     // Both children must actually have met at the barrier and must actually
     // have entered a protected action.  Without these two, "no overlap" could
@@ -850,6 +872,10 @@ async function runMutexRace(adapterName) {
       assert.equal(verdict(racer.output()), "OK", `${context}: the ${role} racer never committed`);
     }
     assert.equal(entries.length, 2, `${context}: both racers must enter a protected action`);
+    if (schedule === "delayed-observation") {
+      assert.ok(fs.existsSync(path.join(rendezvous, "observation-pending-left")), `${context}: the observation delay was not exercised`);
+      assert.deepEqual(entries.map(({ others }) => others), [[], ["section-left"]], `${context}: right must observe left after publishing its marker`);
+    }
     const refusals = [left, right].reduce((total, racer) => {
       const reported = /^REFUSALS \S+ (\d+)$/m.exec(racer.output());
       assert.ok(reported, `${context}: a racer did not report its refusals`);
@@ -874,8 +900,8 @@ async function mutualExclusionAcrossProcesses() {
 // than checked by hand.  `bypass` never asks the kernel; `private-inode`
 // asks it properly but about a file private to each process, which is what
 // separates "the adapter was called" from "exclusion binds to this inode".
-async function wrongPrimitiveOverlaps(adapterName) {
-  const race = await runMutexRace(adapterName);
+async function wrongPrimitiveOverlaps(adapterName, schedule) {
+  const race = await runMutexRace(adapterName, schedule);
   assert.ok(race.overlaps.length > 0,
     `${adapterName} must overlap, or the race proves nothing about the correct primitive: ${race.context}`);
   assert.equal(race.refusals, 0, `${adapterName} refused a writer, so it is not the always-granting control it must be: ${race.context}`);
@@ -896,8 +922,10 @@ async function suite() {
     catch (error) { failures.push(`${check.name}: ${error && error.message}`); }
   }
   for (const adapterName of RACE_ADAPTERS.filter((name) => name !== "kernel")) {
-    try { await wrongPrimitiveOverlaps(adapterName); }
-    catch (error) { failures.push(`wrongPrimitiveOverlaps(${adapterName}): ${error && error.message}`); }
+    for (const schedule of ["simultaneous", "delayed-observation"]) {
+      try { await wrongPrimitiveOverlaps(adapterName, schedule); }
+      catch (error) { failures.push(`wrongPrimitiveOverlaps(${adapterName}, ${schedule}): ${error && error.message}`); }
+    }
   }
   for (const kind of ABORT_KINDS) {
     try { await abortLeavesNoHolderBehind(kind); }
