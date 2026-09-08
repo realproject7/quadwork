@@ -50,7 +50,9 @@ function reversed(values) { return [...values].reverse(); }
 
 // Native Git is the oracle: the comparator reproduces `git ls-tree` order for
 // both shapes, and a raw tree object serialized in comparator order hashes to
-// the native tree SHA, while Git refuses the same bytes in locale order.
+// the native tree SHA, while Git's integrity check refuses locale order.
+// Older Git versions hash unsorted trees without validation, so hash-object
+// alone is not the negative-control oracle.
 {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "qw-git-tree-order-"));
   try {
@@ -80,8 +82,23 @@ function reversed(values) { return [...values].reverse(); }
     const rawTree = (ordered) => Buffer.concat(ordered.flatMap((entry) => [Buffer.from(`${entry.mode.replace(/^0+/, "")} ${entry.name}\0`, "utf8"), Buffer.from(entry.sha, "hex")]));
     const hashTree = (ordered) => execFileSync("git", ["hash-object", "-t", "tree", "--stdin"], { cwd: directory, input: rawTree(ordered), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
     assert.equal(hashTree(reversed(records).sort(compareGitTreeRecords)), nativeTree, "a tree serialized in comparator order is the native tree object");
-    assert.throws(() => hashTree([...records].sort((left, right) => left.name.localeCompare(right.name))), /not properly sorted/, "Git refuses the same records in locale order");
-    assert.throws(() => hashTree([...records].sort((left, right) => compareGitTreePaths(left.name, right.name))), /not properly sorted/, "Git refuses records ordered by name bytes without the tree slash");
+    const assertUnsortedTree = (ordered, message) => {
+      // Prove the repository is healthy before each independent control.
+      git(directory, ["fsck", "--strict", "--no-dangling"]);
+      const malformed = execFileSync("git", ["hash-object", "--literally", "-w", "-t", "tree", "--stdin"], {
+        cwd: directory, input: rawTree(ordered), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: 5000,
+      }).trim();
+      assert.notEqual(malformed, nativeTree, "negative control must differ from the native tree");
+      try {
+        assert.throws(() => git(directory, ["fsck", "--strict", "--no-dangling", malformed]), /treeNotSorted|not properly sorted/, message);
+      } finally {
+        // Do not let a previous malformed object satisfy the next control.
+        fs.unlinkSync(path.join(directory, ".git", "objects", malformed.slice(0, 2), malformed.slice(2)));
+      }
+      git(directory, ["fsck", "--strict", "--no-dangling"]);
+    };
+    assertUnsortedTree([...records].sort((left, right) => left.name.localeCompare(right.name)), "Git refuses the same records in locale order");
+    assertUnsortedTree([...records].sort((left, right) => compareGitTreePaths(left.name, right.name)), "Git refuses records ordered by name bytes without the tree slash");
     console.log("  PASS: comparator order reproduces native git ls-tree order and the native tree SHA; locale order is refused by git");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
