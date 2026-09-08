@@ -551,7 +551,7 @@ skip the rest of this section unless you want a persistent public URL.
 ### Option B — Authenticated public dashboard (nginx + SSL)
 
 Use this only if you need a persistent shared URL. It requires **both** an
-authenticating reverse proxy (Step 10 basic auth) **and** an allowlist entry so
+authenticating reverse proxy (Step 9 basic auth) **and** an allowlist entry so
 QuadWork accepts the proxied hostname — without the allowlist, QuadWork's
 loopback checks reject the forwarded `Host`/`Origin` and every terminal
 WebSocket dies.
@@ -569,8 +569,8 @@ restart QuadWork with `pm2 restart quadwork`:
 
 > `trusted_dashboard_hosts` takes effect **only** when the request truly arrives
 > via the on-box loopback proxy (nginx on `127.0.0.1`). It never lets a direct
-> remote connection through, and it is **not** a substitute for the Step 10
-> basic auth — configure both. Steps 9–10 build this authenticated proxy.
+> remote connection through, and it is **not** a substitute for the Step 9
+> basic auth — configure both. Step 10 optionally caches successful logins.
 
 ## Step 9: Domain + Nginx + SSL
 
@@ -581,7 +581,13 @@ Create an A record: `app.example.com` -> server IP.
 ### Nginx reverse proxy
 
 ```bash
-sudo apt-get install -y nginx
+sudo apt-get install -y nginx apache2-utils
+
+# Create the password file before enabling the proxy. Enter the password at
+# the prompt; do not put it in command arguments or shell history.
+sudo htpasswd -c /etc/nginx/.htpasswd admin
+sudo chown root:www-data /etc/nginx/.htpasswd
+sudo chmod 640 /etc/nginx/.htpasswd
 ```
 
 Create `/etc/nginx/sites-available/app.example.com`:
@@ -590,6 +596,9 @@ Create `/etc/nginx/sites-available/app.example.com`:
 server {
     listen 80;
     server_name app.example.com;
+
+    auth_basic "QuadWork";
+    auth_basic_user_file /etc/nginx/.htpasswd;
 
     # Host-capacity facts are operator-local even when the dashboard is public.
     location = /api/resources {
@@ -611,7 +620,7 @@ server {
 ```
 
 `proxy_read_timeout 86400` and WebSocket headers are required for live agent terminal connections.
-Keep the exact `/api/resources` exclusion when adding Step 10 authentication or
+Keep the authentication directives and exact `/api/resources` exclusion when applying Step 10 or
 when Certbot rewrites this server block; basic auth does not make host-capacity
 facts part of the public dashboard surface.
 
@@ -624,23 +633,21 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ```bash
 sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d app.example.com --non-interactive --agree-tos -m your@email.com
+sudo certbot --nginx --redirect -d app.example.com --non-interactive --agree-tos -m your@email.com
 ```
+
+Finish HTTPS setup before opening or signing into the dashboard. Use only
+`https://app.example.com`; confirm an unauthenticated request receives `401`
+before sharing the URL. The explicit `--redirect` option keeps HTTP redirected
+to HTTPS.
 
 ---
 
-## Step 10: Basic HTTP Auth (Recommended)
+## Step 10: Optional cookie-cached authentication
 
-The dashboard is publicly accessible once deployed. Add password protection:
-
-```bash
-openssl rand -base64 18
-# Save the output as your password
-
-sudo htpasswd -cb /etc/nginx/.htpasswd admin 'YOUR_GENERATED_PASSWORD'
-```
-
-### Cookie-cached auth (reduces mobile reprompts)
+Basic authentication is already required by the initial Step 9 proxy. This
+optional addition reduces mobile reprompts; it does not enable authentication
+for the first time.
 
 Mobile browsers (especially Safari) drop the `Authorization` header aggressively on new connections and WebSocket reconnects, causing repeated sign-in popups every few minutes. The fix: cache successful auth in a cookie so nginx skips the challenge on subsequent requests.
 
