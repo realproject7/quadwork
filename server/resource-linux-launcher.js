@@ -84,11 +84,11 @@ class LinuxResourceLauncher {
     STATE.set(this, state);
     Object.freeze(this);
   }
-  ready() { const s = STATE.get(this); return s.proof && !s.closed; }
+  ready() { const s = STATE.get(this); return s.proof && !s.closed && !s.cleanupFailed; }
   snapshot() { return STATE.get(this).controller.snapshot(); }
   async prepare() {
     const s = STATE.get(this);
-    if (s.closed) return false;
+    if (s.closed || s.cleanupFailed) return false;
     if (s.proof) return true;
     if (s.preparing) return s.preparing;
     s.preparing = (async () => {
@@ -295,7 +295,7 @@ class LinuxResourceLauncher {
     const s = STATE.get(this), record = s.records.get(generationId);
     if (!record) return;
     if (record.stopping) return record.stopping;
-    record.stopping = this._stopGeneration(record);
+    record.stopping = this._stopGeneration(record).catch((error) => { s.proof = false; s.cleanupFailed = true; throw error; });
     return record.stopping;
   }
   async _stopGeneration(record) {
@@ -338,7 +338,8 @@ class LinuxResourceLauncher {
     if (!values.ControlGroup && ["inactive", "failed"].includes(values.ActiveState)) return;
     if (!values.ControlGroup?.endsWith(`/${unit}`)) facts.fail("control_scope_identity_changed");
     let pids; try { pids = facts.readGroup(values.ControlGroup).pids; } catch (e) { if (e.code === "ENOENT") return; throw e; }
-    if (pids.length) await exec("systemctl", ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], { timeout: 2000, maxBuffer: 16384 });
+    if (pids.length) try { await exec("systemctl", ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], { timeout: 2000, maxBuffer: 16384 }); }
+    catch (error) { try { if (facts.readGroup(values.ControlGroup).pids.length) throw error; } catch (e) { if (e.code !== "ENOENT") throw e; } }
     await boundedUntil(() => { try { return facts.readGroup(values.ControlGroup).pids.length === 0; } catch (e) { return e.code === "ENOENT"; } });
   }
   ownsGeneration(generationId) { return STATE.get(this).records.has(generationId); }
@@ -379,7 +380,10 @@ class LinuxResourceLauncher {
         const props = unitProperties(raw);
         if (props.ControlGroup) {
           if (!props.ControlGroup.endsWith(`/${unit}`)) facts.fail("control_scope_identity_changed");
-          execFileSync("systemctl", ["--user", "stop", unit], { timeout: 3000, maxBuffer: 16384 });
+          let live = false;
+          try { live = facts.readGroup(props.ControlGroup).pids.length !== 0; } catch (e) { if (e.code !== "ENOENT") throw e; }
+          if (live) try { execFileSync("systemctl", ["--user", "stop", unit], { timeout: 3000, maxBuffer: 16384 }); }
+          catch (error) { try { if (facts.readGroup(props.ControlGroup).pids.length) throw error; } catch (e) { if (e.code !== "ENOENT") throw e; } }
           try { if (facts.readGroup(props.ControlGroup).pids.length) facts.fail("control_cleanup_incomplete"); } catch (e) { if (e.code !== "ENOENT") throw e; }
         } else if (props.LoadState !== "not-found" && !["inactive", "failed"].includes(props.ActiveState)) facts.fail("control_cleanup_unproven");
       } catch (e) { s.proof = false; s.cleanupFailed = true; throw e; }
