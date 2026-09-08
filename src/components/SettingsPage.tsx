@@ -1685,7 +1685,7 @@ export default function SettingsPage() {
                           {t.oneCliInstalled}
                         </span>
                         <code className="text-accent ml-2">
-                          {cliStatus.claude ? "npm install -g codex" : "npm install -g @anthropic-ai/claude-code"}
+                          {cliStatus.claude ? "npm install -g @openai/codex" : "npm install -g @anthropic-ai/claude-code"}
                         </code>
                       </div>
                     )}

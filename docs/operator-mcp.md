@@ -249,12 +249,12 @@ discipline as dashboard chat, for example `@head ...` to wake Head.
 
 ## Workflow recipes
 
-Each is 1–3 tool calls. Start every session with `list_projects` to get the
+Start every session with `list_projects` to get the
 `project` id; if it fails, the MCP isn't connected — fix registration, don't SSH.
 
 **Start a code batch** — let HEAD plan and write the queue:
-1. `send_message(project, "@head start a batch for <feature>: #12 #15 #18")` — HEAD files issues + writes `OVERNIGHT-QUEUE.md`, then asks you to start.
-2. Kick it off: `start_batch(project)` to enable the Monitor, or `trigger_now(project)` for one immediate evaluation. There is no cadence to choose: the Monitor writes one structured `[QW-MONITOR:<kind>]` event to `@head` only when a fixed-policy transition is genuinely due. Passing `interval_min`, `duration_min`, `message`, `recipients` or `mode` is rejected with `trigger_authoring_removed` — operator-authored trigger text no longer exists.
+1. Check `list_agents` and use the existing role lifecycle controls for any required stopped role. Send `send_message(project, "@head plan and implement <feature>: owner/repo#12 owner/repo#15")`. Head owns issue contracts, the queue and server-authenticated assignment. Queue text alone does not authorize V2 execution.
+2. Head enables the Monitor for the qualified live batch. `start_batch(project)` enables the same observation, and `trigger_now(project)` requests one immediate evaluation. Neither starts workers, creates assignments nor advances the queue. There is no cadence to choose: the Monitor writes one structured `[QW-MONITOR:<kind>]` event to `@head` only when a fixed-policy transition is genuinely due. Passing `interval_min`, `duration_min`, `message`, `recipients` or `mode` is rejected with `trigger_authoring_removed` — operator-authored trigger text no longer exists.
 3. Monitor (below).
 
 **Run a review batch** (review-only — no code, no merges). Just ask HEAD; it stamps the `**Batch type:**` marker — you never touch the queue:
@@ -263,7 +263,7 @@ Each is 1–3 tool calls. Start every session with `list_projects` to get the
 Then monitor with `batch_status` (it shows review states: *queued · in review · 1 of 2 approvals · approved*).
 
 **Monitor a batch:**
-- `batch_status(project)` — `active` is authoritative for "work remaining"; `progress` may stay sticky on a just-finished batch.
+- `batch_status(project)` — inspect the live `active` and per-item `progress`. An empty Active Batch stays empty; Current Batch never falls back to historical work. Head explicitly advances eligible work or closes the batch. Completion does not start another batch.
 - `read_chat(project, { since_id })` — tail the team conversation.
 - `read_queue(project)` — see raw item states (read-only).
 
