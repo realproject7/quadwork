@@ -232,7 +232,7 @@ const COPY = {
     ),
     workTaskStates: {
       queued: "대기", building: "빌드 중", candidate_ready: "후보 준비", independent_review: "독립 검토 중",
-      reconcile: "조정 중", changes_requested: "변경 요청", accepted: "승인", staged: "스테이징", delivered: "배포 완료",
+      reconcile: "조정 중", changes_requested: "변경 요청", accepted: "승인", staged: "스테이징", delivered: "반영 완료",
       blocked: "차단됨", deferred: "보류됨",
     },
     // #1048: 준비/CI/리뷰 상태를 따로 표시 — 예: "PR #12 · 준비됨 · CI 대기 · 리뷰 1/2".
