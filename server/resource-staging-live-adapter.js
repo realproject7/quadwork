@@ -37,7 +37,14 @@ async function run(file, args, options = {}) { return (await exec(file, args, { 
 async function ephemeralPort() { const s = net.createServer(); await new Promise((resolve, reject) => { s.once("error", reject); s.listen(0, "127.0.0.1", resolve); }); const port = s.address().port; await new Promise((resolve) => s.close(resolve)); return port; }
 async function request(origin, endpoint, { token, body, timeout = 2000 } = {}) {
   const response = await fetch(`${origin}${endpoint}`, { method: body === undefined ? "GET" : "POST", headers: { ...(token ? { "x-session-token": token } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeout) });
-  if (!response.ok) F.fail("product_http_failed");
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    const error = new Error("product_http_failed");
+    error.check = "product_http_failed";
+    error.httpFailure = { endpoint, status: response.status,
+      code: typeof body?.code === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(body.code) ? body.code : null };
+    throw error;
+  }
   const result = await response.json();
   return result;
 }
@@ -242,7 +249,7 @@ async function runClosedStagingMatrix(options) {
     result.integrated = { ordinary_http_launch: true, worker_memcg_oom: true, api_health: true, primary_chat_roundtrip: true, terminal_websocket: true, unrelated_worker: true, ...kernel, samples: samples.length, maximum_gap_ms: Math.max(...gaps), worst_latency_ms: Math.max(...samples.map((s) => s.latency_ms)), pressure_window_ms: pressureEnd - pressureStart, observation_resolution_ms: 250 };
     if (sha(JSON.stringify(sourceManifest())) !== result.source_digest) F.fail("source_changed");
     result.ok = true; result.reason = "proof_passed";
-  } catch (error) { result.check = publicError(error); }
+  } catch (error) { result.check = publicError(error); if (error.httpFailure) result.failed_request = error.httpFailure; }
   finally {
     monitorStop = true; if (monitoring) await monitoring.catch(() => {});
     for (const stream of sockets) stream.socket.close();
