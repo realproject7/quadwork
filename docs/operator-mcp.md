@@ -318,3 +318,11 @@ authenticated final reviewers approve the exact candidate, and fresh PR/base,
 mergeability, and unresolved-review checks pass. Read back the merged result
 before task/ticket closure. Publication and completion are separate delivery
 operations; recording evidence never pushes, creates a PR, or merges.
+
+### Scoped Head delivery
+
+`form_delivery`, `publish_delivery`, `inspect_delivery` and `complete_delivery` use the existing project/generation-bound Head control envelope, with `expected_revision`, correlation/idempotency keys and a closed `delivery` payload. The form declares ordinary or operator-gated scope, release intent, rollback group and fixed isolation/operator reasons. Server-resolved task/body/receipt/policy identity binds that formation to one frozen cut; it grants no credential, deployment, payment or destructive authority.
+
+Ordinary delivery publishes a create-only deterministic branch and one non-draft same-repository PR; an unknown push/PR result is reconciled from durable intent on an exact retry. It never merges automatically. `inspect_delivery(before_merge)` seals both final authenticated approvals and passing required verification at the OPEN exact head/base. After the separately authorized merge, `inspect_delivery(after_merge)` verifies the actual merge SHA/tree/parents against that immutable seal and records Head's scope inspection. `complete_delivery` marks included tasks delivered, closes only tickets whose full frozen scope is attested and delivered at the unchanged revision, and preserves per-issue partial failures for retry. Queue advance remains explicit. Missing/late premerge seals or unsupported merge provenance remain `merged_unverified`.
+
+Task review and composition do not imply named final tests passed. Final `ci-less` evidence is submitted through the existing Dev receipt tool and read with `read_ci_evidence({record_id})`, including exact candidate/base/manifest/policy and environment/scope. No hosted check command or badge is required in local mode. Existing explicit external-check policies retain their registered checks. See `HEAD-PO-PLAYBOOK.md` for the detailed fixed payload flow and recovery boundaries.

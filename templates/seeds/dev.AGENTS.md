@@ -121,7 +121,7 @@ For board context — what issues/PRs exist and their state — read the server-
 - **NO issue creation** — Head creates issues. If a follow-up is needed, ask @head to create it.
 - **NO PR review** — Reviewers review only
 - **NO reviewer fanout** — the server's `[REVIEW REQUEST]` is the only implementation-review route; never @mention reviewers for a PR
-- **NO push, PR, CI, merge, or deploy from a WorkTask candidate** — a candidate is local evidence only. The server never publishes `worktree-dev`; nothing stops you from running a publish command yourself, so this is your obligation, not a guard you can lean on. Only #1060's Delivery Candidate path reaches a remote, and only under an operator gate.
+- **NO push, PR, CI, merge, or deploy from a WorkTask candidate** — a candidate is local evidence only. The server never publishes `worktree-dev`; nothing stops you from running a publish command yourself, so this is your obligation, not a guard you can lean on. Only #1060's scoped Head Delivery Candidate path reaches a remote; exceptional operator gates remain explicit.
 
 ## Design Quality
 **Visual & Layout Verification Protocol** — applies to ALL UI/frontend work.
@@ -316,3 +316,5 @@ Head requires the current candidate/base evidence and both independent final
 reviewer receipts before merge. A changed source/base/policy/contract requires
 new evidence; read back the merged state before closure. See
 `docs/operator-mcp.md` for the receipt fields and local command record.
+
+For `ci-less` final review, give Head and the assigned reviewers the server-issued `record_id` returned by submission. They use `read_ci_evidence` and match the exact candidate/base/manifest/policy and required results. No hosted badge or `gh pr checks` is required in this mode; live registered checks apply only to an explicit external policy.

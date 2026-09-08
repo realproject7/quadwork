@@ -99,26 +99,19 @@ every staged WorkTask, call `prepare_delivery_candidate` with the registered
 repository key. If it succeeds, call `compose_delivery_candidate` with the
 returned exact reference, revision, correlation id, and idempotency key.
 
-Before any external publication, call `plan_delivery_candidate_publication` with
-the composed reference. It derives a candidate-bound branch and PR proposal but
-stops at the operator gate; it never transfers a branch or creates the PR.
+For ordinary reviewed scope, use the bound Head `form_delivery` action, then `publish_delivery` with its returned plan digest and candidate revision. The server verifies the live cut, task reviews, canonical remote and base before creating one branch/PR. Explicit operator gates still refuse. `plan_delivery_candidate_publication` reads the current proposal; it performs no remote write.
 
-After an already-published PR is observed at that exact result SHA, call
-`open_delivery_candidate_final_review` with the same reference and PR number.
-This is review admission only; it never authorizes Head to create that PR.
+Publication admits the existing final-review cycle; `open_delivery_candidate_final_review` can reobserve that same exact candidate/PR. Both current-SHA authenticated final approvals and the repository's passing verification policy are mandatory. In `ci-less` mode, use `read_ci_evidence` with Dev's server-issued `record_id`; match candidate, base, manifest and policy before accepting it. No hosted CI badge or `gh pr checks` is required in this mode; external checks apply only to an explicit external policy.
 
-Never construct a Delivery Candidate reference, result SHA, Git tree, patch,
-review anchor, worktree path, or repository identity yourself. A refusal means
-the registered clone, frozen cut, candidate, or review state drifted; re-read
-the named durable source and return the item to its owning gate. These tools
-produce only local evidence: they never create a branch or PR, run CI, push,
-merge, publish, or replace the final review and operator gates.
+Call `inspect_delivery` with `phase: before_merge` to seal the exact reviews/evidence; then perform the separately authorized exact-tip merge. After merge, call `inspect_delivery` with `phase: after_merge` and attest the complete frozen task set only for tickets whose full approved scope it covers. `complete_delivery` records delivered tasks and closes only those complete tickets. Partial cuts retain deferred work; Head advances the queue explicitly afterward. See the playbook for recovery and merge provenance.
+
+Never construct a Delivery Candidate reference, SHA, tree, patch, review anchor, path or repository identity yourself. Copy server output. Retrying the same delivery key/payload resumes its durable intent; a refusal means re-read the owning source. These actions never merge, deploy, sign, pay, or run GitHub Actions.
 
 ## Gate, merge, and closure
 
 For each PR, independently verify the ticket contract, exact current PR tip, scope, required tests/checks, both reviewer verdicts at that same tip, and unresolved conversations. A verdict on an older SHA does not count. REQUEST CHANGES or BLOCK returns ownership to the named role; do not merge around it.
 
-Merge only the reviewed exact tip, then re-read the merge result and target branch. Update queue/ticket state from observed evidence, close or create narrowly scoped follow-ups, and dispatch the next non-conflicting item. Release, publish, signing, payment, OAuth, credential, or destructive actions require the operator's explicit action-specific approval even when code is merge-ready.
+Merge only the reviewed exact tip, then re-read the merge result and target branch. Update queue/ticket state from observed evidence, close or create narrowly scoped follow-ups, and dispatch the next non-conflicting item. Release/registry publication, signing, payment, OAuth, credential, or destructive actions require the operator's explicit action-specific approval even when code is merge-ready.
 
 ## Communication
 
