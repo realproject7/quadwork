@@ -112,6 +112,7 @@ function createWorkTaskIndependentReviewService(value) {
     const prior = snapshot.pipeline.history.find((entry) => entry.event_id === input.event_id) || null;
     if (prior !== null) {
       if (prior.kind === "assign_independent_review" && slot.state === "independent_review" && slot.review_assignment !== null &&
+          slot.history.some((entry) => entry.event_id === input.event_id && entry.kind === "assign_independent_review") &&
           slot.review_assignment.review_round_id === id && slot.review_assignment.candidate_digest === slot.candidate.candidate_digest) {
         try {
           roundStore.assertAssignedOpening({ version: VERSION, candidate: slot.candidate, attempt: input.attempt, round: input.round, opened_at: input.opened_at },

@@ -90,6 +90,16 @@ function main() {
       const bytes = fs.readFileSync(f.rounds.pathFor(legacy.review_round_ref));
       assert.equal(f.runtime().open({ token: "head", body: f.body }).outcome, "idempotent", "existing legacy mapping proves its original event");
       assert.deepEqual(fs.readFileSync(f.rounds.pathFor(legacy.review_round_ref)), bytes);
+      const other = f.manifest.tasks[2].ref;
+      F.applyEvent(f.store, f.manifest, { version: 1, kind: "assign_build", event_id: "other_build", work_task_ref: other, assignment_id: "other_assignment", base_sha: "a".repeat(64) });
+      const otherCandidate = F.candidateFor(other, "d".repeat(64));
+      F.applyEvent(f.store, f.manifest, { version: 1, kind: "record_candidate", event_id: "other_candidate", assignment_id: "other_assignment", candidate: otherCandidate });
+      const otherRound = f.rounds.openRound({ ...opening, candidate: otherCandidate }, assignments);
+      F.applyEvent(f.store, f.manifest, { version: 1, kind: "assign_independent_review", event_id: "other_opening", work_task_ref: other, review_round_id: reviewRoundId(otherRound.review_round_ref), candidate_digest: otherCandidate.candidate_digest });
+      const unchanged = f.store.readRecoverySnapshot(f.scope);
+      rejects(() => f.runtime().open({ token: "head", body: { ...f.body, event_id: "other_opening" } }), "work_task_review_event_conflict");
+      assert.deepEqual(f.store.readRecoverySnapshot(f.scope), unchanged);
+      assert.equal(f.runtime().open({ token: "head", body: f.body }).outcome, "idempotent");
       console.log("PASS legacy applied opening replay is retained while an unproven legacy orphan remains closed");
     } finally { f.close(); }
   }
