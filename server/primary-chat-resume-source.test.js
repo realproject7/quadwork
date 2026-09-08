@@ -149,14 +149,19 @@ function ok(value, message) {
 {
   const records = [
     tagged(1, "head_assignment", { structural: { head_generation: 0 } }),
-    tagged(2, "head_assignment", { structural: { head_generation: 6 } }),
+    tagged(2, "head_lifecycle", { structural: { head_generation: 6 } }),
     tagged(3, "head_assignment"),
     tagged(4, "worker_terminal", { structural: { trusted: false } }),
+    tagged(5, "head_lifecycle"),
   ];
   const snapshot = source(() => window(records)).read_snapshot(request());
-  assert.deepEqual(snapshot.records.map((entry) => entry.structural.head_generation), [0, 6, 7, 7]);
-  assert.deepEqual(projection(snapshot).records.map((entry) => entry.id), [3]);
-  assert.deepEqual(records.map((entry) => entry.resume_structural.head_generation), [0, 6, 7, 7]);
+  assert.deepEqual(snapshot.records.map((entry) => entry.structural.head_generation), [0, 6, 7, 7, 7]);
+  const projected = projection(snapshot);
+  assert.deepEqual(projected.records.map((entry) => entry.id), [3, 5]);
+  assert.deepEqual(projected.diagnostics.filter((entry) => entry.code === "foreign_head_generation"), [
+    { record_id: 1, code: "foreign_head_generation" }, { record_id: 2, code: "foreign_head_generation" },
+  ]);
+  assert.deepEqual(records.map((entry) => entry.resume_structural.head_generation), [0, 6, 7, 7, 7]);
   ok(true, "retained historical generations stay immutable and do not block current Head resume");
 }
 
