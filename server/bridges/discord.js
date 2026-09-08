@@ -309,7 +309,7 @@ async function pollLoop(projectId, channelObj, qwPort) {
       if (inst.forwardedIds.has(msg.id)) continue;
 
       const text = `**${msg.sender}**: ${msg.text}`;
-      const truncated = text.length > 2000 ? text.slice(0, 2000) + "…" : text;
+      const truncated = text.length > 2000 ? text.slice(0, 1999) + "…" : text;
       if (!isAuthorizedCurrent(projectId, inst)) return;
       await track(inst, channelObj.send(truncated));
       if (!isAuthorizedCurrent(projectId, inst)) return;

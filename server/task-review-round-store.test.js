@@ -14,6 +14,10 @@ const {
   TaskReviewRoundStoreError,
   createTaskReviewRoundStore,
 } = require("./task-review-round-store");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
+
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
 
 const installation_id = "installation_alpha_0001";
 const project_id = "quadwork";
@@ -278,22 +282,33 @@ function rawStoredRound(store, ref) {
   assert.equal(stored.release.receipts.length, 2);
   assert.equal(stored.audit.filter((entry) => entry.type === "released").length, 1);
 
-  // A stale-looking 0600 lock is never silently reaped.  All three mutation
-  // entry points reject it, preserving an explicit operator recovery gate.
+  // #1074: the `.lock` file is permanent, so a stale-looking one is not a
+  // gate any more — a live holder of the kernel lock on it is.  Both
+  // directions are asserted: every mutation entry point is refused while the
+  // holder lives, and the cancel that was refused goes through once it lets
+  // go, so this cannot pass against a store that simply refuses.
   const lockPath = `${statePath}.lock`;
-  fs.writeFileSync(lockPath, "", { mode: 0o600 });
-  throwsCode(() => normal.openRound(openInput(candidateValue, "attempt_writer_lock"), assignments()), "task_review_round_store_locked");
-  throwsCode(() => normal.cancelFromTrustedState({
+  assert.equal(fs.lstatSync(lockPath).isFile(), true, "the writer lock is a permanent artifact");
+  const holder = fs.openSync(lockPath, "r+");
+  const cancelInput = {
     version: 1, review_round_ref: copy(opened.review_round_ref), candidate_digest: opened.candidate_digest,
     cause: "candidate_invalidated", reason: "operator checks stale lock", at: "2026-09-01T06:09:02.000Z",
-  }), "task_review_round_store_locked");
-  assert.equal(fs.statSync(lockPath).mode & 0o777, 0o600);
-  fs.unlinkSync(lockPath);
+  };
+  try {
+    assert.equal(advisory.tryLock(holder), true, "the test holder took the lock");
+    throwsCode(() => normal.openRound(openInput(candidateValue, "attempt_writer_lock"), assignments()), "task_review_round_store_locked");
+    throwsCode(() => normal.cancelFromTrustedState(cancelInput), "task_review_round_store_locked");
+    assert.equal(fs.statSync(lockPath).mode & 0o777, 0o600);
+    advisory.unlock(holder);
+  } finally { fs.closeSync(holder); }
+  assert.ok(normal.cancelFromTrustedState(cancelInput), "the released lock lets the very same cancellation through");
+  assert.equal(fs.statSync(lockPath).mode & 0o777, 0o600, "the permanent lock is unchanged either way");
 }
 
-// Linux reuses inode numbers eagerly, so a lock replaced after this writer
-// closed its descriptor can report the original dev+ino. The stubbed lstat
-// forces exactly that; only the lock token can then prove the replacement.
+// #1074 successor.  The claim is unchanged — a replacement lock carrying the
+// original dev+ino is never unlinked by the writer that held the original —
+// but the outcome is not.  The writer never acts on the lock *path*, so it
+// finishes its action and leaves the replacement exactly as it found it.
 {
   const home = root("qw-task-review-round-inode-reuse-");
   const normal = createTaskReviewRoundStore({ rootDir: home });
@@ -301,8 +316,11 @@ function rawStoredRound(store, ref) {
   const lockPath = `${normal.pathFor(opened.review_round_ref)}.lock`;
   let inspections = 0;
   let original = null;
+  const touched = [];
   const replacingFs = new Proxy(fs, {
     get(target, property) {
+      if (property === "unlinkSync") return (inspected) => { touched.push(["unlink", inspected]); return target.unlinkSync(inspected); };
+      if (property === "renameSync") return (from, to) => { touched.push(["rename", from, to]); return target.renameSync(from, to); };
       if (property !== "lstatSync") return Reflect.get(target, property);
       return (inspected) => {
         if (inspected !== lockPath) return target.lstatSync(inspected);
@@ -314,20 +332,24 @@ function rawStoredRound(store, ref) {
         if (inspections === 2) {
           target.unlinkSync(lockPath);
           target.writeFileSync(lockPath, "replacement-writer-lock", { encoding: "utf8", mode: 0o600, flag: "wx" });
+          const stat = target.lstatSync(inspected);
+          stat.dev = original.dev;
+          stat.ino = original.ino;
+          return stat;
         }
-        const stat = target.lstatSync(inspected);
-        stat.dev = original.dev;
-        stat.ino = original.ino;
-        return stat;
+        return target.lstatSync(inspected);
       };
     },
   });
   const writer = createTaskReviewRoundStore({ rootDir: home, fsImpl: replacingFs });
   const re1Receipt = receipt(opened.review_round_ref, "receipt_re1_inode_reuse", "approve", [finding("finding_re1_inode_reuse")]);
-  throwsCode(() => writer.submitTrustedReceipt(opened.review_round_ref, opened.candidate_digest, re1Receipt,
-    reviewer("re1", 11, "2026-09-01T06:10:00.000Z")), "task_review_round_store_unsafe");
-  assert.equal(inspections, 2);
-  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock");
+  assert.equal(writer.submitTrustedReceipt(opened.review_round_ref, opened.candidate_digest, re1Receipt,
+    reviewer("re1", 11, "2026-09-01T06:10:00.000Z")).outcome, "sealed", "the writer finished its own action");
+  assert.equal(inspections, 2, "the lock path is inspected once at acquisition and once at release");
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement-writer-lock", "the replacement is left exactly as it was found");
+  assert.deepEqual(touched.filter(([, ...targets]) => targets.some((target) => String(target).endsWith(".lock"))), [],
+    `the writer touched a lock path: ${JSON.stringify(touched)}`);
+  assert.equal(touched.some(([kind]) => kind === "rename"), true, "the recorder is not blind: it saw the atomic replace");
 }
 
 // Corrupt/unknown or oversized durable state fails closed for a new mutation.

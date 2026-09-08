@@ -9,6 +9,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { normalizeProjectRepositories } = require("./config");
+const { hasUnownedWorktreeChanges } = require("./owned-worktree-seeds");
 
 const ROLE_IDS = Object.freeze(["head", "re1", "re2", "dev"]);
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
@@ -235,7 +236,9 @@ async function inspectReservedWorktree(repository, role, worktreePath, runner, f
     return { ok: false, code: "reserved_worktree_role_mismatch", repo_key: repository.key, role, message: "reserved role worktree is not on its expected role branch" };
   }
   const status = await command(runner, "git", ["-C", worktreePath, "status", "--porcelain", "--untracked-files=all"]);
-  if (!status.ok || output(status)) {
+  if (!status.ok || hasUnownedWorktreeChanges(output(status), {
+    worktree: worktreePath, base: repository.working_dir, repo: repository.canonical_repo, role,
+  })) {
     return { ok: false, code: "reserved_worktree_dirty", repo_key: repository.key, role, message: "reserved role worktree has uncommitted changes" };
   }
   return { ok: true, action: "reuse", repo_key: repository.key, role, worktree_path: worktreePath, branch };

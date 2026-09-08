@@ -20,7 +20,7 @@ const CODE_RE = /^head_control_[a-z0-9_]{2,95}$/;
 const ACTION_SET = new Set(ACTIONS);
 const DECISION_SET = new Set(["accepted", "denied"]);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff"]);
-const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "get_project_status", "review_handoff"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "abandon_batch_manifest", "get_project_status", "review_handoff"]);
 
 class HeadControlServiceError extends Error {
   constructor(code, message = code) {
@@ -279,7 +279,7 @@ function createHeadControlService(options) {
       fail("head_control_audit_unavailable", "durable Head-control audit is unavailable");
     }
   }
-  function durableReplayOrFail(command, records) {
+  async function durableReplayOrFail(command, records) {
     if (!plain(command)) return null;
     const byCorrelation = records.find((record) => record.correlation_id === command.correlation_id) || null;
     const byIdempotency = records.find((record) => record.idempotency_key === command.idempotency_key) || null;
@@ -288,12 +288,39 @@ function createHeadControlService(options) {
       fail("head_control_durable_identity_collision", "durable Head-control identity is already used");
     }
     const record = byCorrelation;
+    // A remote timeout was truthfully denied and stays immutable. Only the
+    // four delivery owners can prove an exact durable intent and resume it.
+    // A successful reconciliation appends a deterministic, separately named
+    // receipt; it never rewrites the first denial or enables generic retry.
+    const delivery = require("./delivery-execution-contract");
+    if (delivery.ACTIONS.includes(command.action) && record.action === command.action && record.decision === "denied" &&
+        typeof options.domain.resume_delivery === "function" && sameBinding(command.principal, owner) && command.expected_revision === record.preconditions.expected_revision) {
+      exact(command, ["version", "action", "principal", "expected_revision", "idempotency_key", "correlation_id", "payload"], "head_control_durable_replay_ambiguous");
+      const invocation = { version: command.version, action: command.action, binding: command.principal, expected_revision: command.expected_revision,
+        idempotency_key: command.idempotency_key, correlation_id: command.correlation_id, payload: delivery.assertPayload(command.action, command.payload) };
+      const key = `delivery_reconcile_${delivery.digest(command)}`;
+      const reconciled = records.find((entry) => entry.correlation_id === key && entry.idempotency_key === key);
+      if (reconciled) return replay(reconciled, await options.domain.replay_delivery(invocation));
+      const resumed = await options.domain.resume_delivery(invocation);
+      const result = freeze({ action: command.action, applied: true, status: resumed.status });
+      const audit = { version: VERSION, binding: owner, action: command.action, correlation_id: key, idempotency_key: key,
+        expected_revision: command.expected_revision, decision: "accepted", code: "head_control_delivery_reconciled", result };
+      const response = freeze({ version: VERSION, decision: { kind: "accepted", code: audit.code }, result, audit, detail: resumed.detail });
+      persistOrFail(response, command);
+      return response;
+    }
     const localByCorrelation = localCorrelations.get(record.correlation_id);
     const localByIdempotency = localIdempotencies.get(record.idempotency_key);
     const fingerprint = commandFingerprint(command);
     if (localByCorrelation && localByCorrelation === localByIdempotency &&
         same(localByCorrelation.record, record) && fingerprint !== null && localByCorrelation.fingerprint === fingerprint) {
       return replay(record, localByCorrelation.detail);
+    }
+    if (require("./delivery-execution-contract").ACTIONS.includes(command.action) && record.action === command.action && record.decision === "accepted" &&
+        typeof options.domain.replay_delivery === "function" && sameBinding(command.principal, owner) && command.expected_revision === record.preconditions.expected_revision) {
+      const detail = await options.domain.replay_delivery({ version: command.version, action: command.action, binding: command.principal,
+        expected_revision: command.expected_revision, idempotency_key: command.idempotency_key, correlation_id: command.correlation_id, payload: command.payload });
+      return replay(record, detail);
     }
     if (commandMatchesDurablePayloadlessRecord(command, record, owner)) return replay(record);
     // The durable format deliberately omits payloads.  Any request that is
@@ -305,7 +332,7 @@ function createHeadControlService(options) {
     // This preflight happens before the plane can reach a domain callback.
     // It also rejects corrupt, substituted, or unavailable durable state.
     const records = readAuditOrFail();
-    const durableReplay = durableReplayOrFail(command, records);
+    const durableReplay = await durableReplayOrFail(command, records);
     if (durableReplay !== null) return durableReplay;
     const result = await plane.execute(command);
     persistOrFail(result, command);

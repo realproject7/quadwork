@@ -121,7 +121,7 @@ For board context — what issues/PRs exist and their state — read the server-
 - **NO issue creation** — Head creates issues. If a follow-up is needed, ask @head to create it.
 - **NO PR review** — Reviewers review only
 - **NO reviewer fanout** — the server's `[REVIEW REQUEST]` is the only implementation-review route; never @mention reviewers for a PR
-- **NO push, PR, CI, merge, or deploy from a WorkTask candidate** — a candidate is local evidence only. The server never publishes `worktree-dev`; nothing stops you from running a publish command yourself, so this is your obligation, not a guard you can lean on. Only #1060's Delivery Candidate path reaches a remote, and only under an operator gate.
+- **NO push, PR, CI, merge, or deploy from a WorkTask candidate** — a candidate is local evidence only. The server never publishes `worktree-dev`; nothing stops you from running a publish command yourself, so this is your obligation, not a guard you can lean on. Only #1060's scoped Head Delivery Candidate path reaches a remote; exceptional operator gates remain explicit.
 
 ## Design Quality
 **Visual & Layout Verification Protocol** — applies to ALL UI/frontend work.
@@ -300,3 +300,21 @@ ignore it unless Head issues a separate qualified implementation assignment.
 - **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.
 - **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **After merge confirmation from Head**: do NOT reply. The loop is COMPLETE — silence is required.
+
+
+## Local verification contract
+
+Use the repository's explicit evidence policy. New V2 setup selects Local
+verification (`ci-less`); existing external-check policies are never silently
+replaced. Dev runs the repository's existing checks on the clean exact candidate,
+records the integration base, normalized policy digest, actual environment and
+scope, and submits the authenticated evidence operation. Delivery evidence also
+binds the composed manifest digest. Pass requires exit code zero; missing,
+interrupted or skipped checks are not a pass. QuadWork records evidence and does
+not execute configured labels. Never trigger Actions for local verification.
+Head requires the current candidate/base evidence and both independent final
+reviewer receipts before merge. A changed source/base/policy/contract requires
+new evidence; read back the merged state before closure. See
+`docs/operator-mcp.md` for the receipt fields and local command record.
+
+For `ci-less` final review, give Head and the assigned reviewers the server-issued `record_id` returned by submission. They use `read_ci_evidence` and match the exact candidate/base/manifest/policy and required results. No hosted badge or `gh pr checks` is required in this mode; live registered checks apply only to an explicit external policy.

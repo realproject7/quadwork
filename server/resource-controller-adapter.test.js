@@ -149,6 +149,7 @@ async function main() {
       "-p", "MemoryHigh=321M",
       "-p", "MemoryMax=654M",
       "-p", "MemorySwapMax=87M",
+      "-p", "OOMPolicy=kill",
       "--", "/opt/Quad Work/bin/codex", "exec", "ticket; still-not-a-shell",
     ]);
     assert.equal(calls[0].unitName, expectedBase);
@@ -172,7 +173,7 @@ async function main() {
 
     const snapshot = adapter.snapshot();
     assert.equal(snapshot.protocol_status, SYSTEMD_SCOPE_CANDIDATE.status);
-    assert.equal(snapshot.protocol_status, "candidate_pending_staging");
+    assert.equal(snapshot.protocol_status, "supported");
     assert.deepEqual(snapshot.control_children, { limit: 2, active: 0, queued: 0 });
     assert.deepEqual(snapshot.control_class, {
       unit_name: DEFAULT_CONTROL_CLASS_NAME,

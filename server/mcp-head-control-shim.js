@@ -120,7 +120,9 @@ try {
   process.exit(1);
 }
 
+const DELIVERY = require("./delivery-execution-contract");
 const TOOL_DEFS = Object.freeze([
+  ...DELIVERY.ACTIONS.map((name) => Object.freeze({ name, description: "Execute the scoped, durable Head delivery operation. No merge, deploy, or Actions command is exposed.", inputSchema: { type: "object", properties: { expected_revision: { type: "integer", minimum: 0 }, idempotency_key: { type: "string" }, correlation_id: { type: "string" }, delivery: DELIVERY.actionSchema(name) }, required: ["expected_revision", "idempotency_key", "correlation_id", "delivery"], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } })),
   Object.freeze({
     name: "get_pipeline_status",
     description: "Read the fixed Head pipeline status for this launch binding.",
@@ -192,6 +194,21 @@ const TOOL_DEFS = Object.freeze([
   Object.freeze({
     name: "retire_batch",
     description: "Retire the frozen batch at the supplied optimistic revision so a successor manifest can be put. Refused while any task holds build or review authority.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        expected_revision: { type: "integer", minimum: 0 },
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+      },
+      required: ["expected_revision", "idempotency_key", "correlation_id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
+    name: "abandon_batch_manifest",
+    description: "Abandon the stored, never-frozen batch manifest at the supplied optimistic revision so a successor manifest can be put. Refused once the manifest is frozen or any pipeline exists; frozen, cut, and retired records are never touched.",
     inputSchema: {
       type: "object",
       properties: {
@@ -326,7 +343,10 @@ function commandArguments(name, value) {
   if (!TOOL_NAMES.has(name)) fail("tool is unknown");
   if (!plain(value)) fail("arguments must be an object");
   let parsed;
-  if (name === "get_pipeline_status" || name === "get_project_status" || name === "review_handoff") {
+  if (DELIVERY.ACTIONS.includes(name)) {
+    exact(value, ["expected_revision", "idempotency_key", "correlation_id", "delivery"]);
+    parsed = { expected_revision: revision(value.expected_revision), idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id), delivery: DELIVERY.assertPayload(name, value.delivery) };
+  } else if (name === "get_pipeline_status" || name === "get_project_status" || name === "review_handoff") {
     exact(value, ["idempotency_key", "correlation_id"]);
     parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id) };
   } else if (name === "project_monitor") {
@@ -342,7 +362,7 @@ function commandArguments(name, value) {
         typeof recovery.expected_generation !== "string" || !GENERATION_RE.test(recovery.expected_generation) ||
         typeof recovery.assignment_attempt !== "string" || !ATTEMPT_RE.test(recovery.assignment_attempt)) fail("recovery is invalid");
     parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id), recovery: copyJson(recovery) };
-  } else if (name === "freeze_batch_manifest" || name === "retire_batch") {
+  } else if (name === "freeze_batch_manifest" || name === "retire_batch" || name === "abandon_batch_manifest") {
     exact(value, ["expected_revision", "idempotency_key", "correlation_id"]);
     parsed = {
       expected_revision: revision(value.expected_revision),

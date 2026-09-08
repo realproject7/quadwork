@@ -5,6 +5,10 @@
 // repository access nor persistence: both remain narrow injected contracts.
 // In particular, this service has no publication, process, transport, or
 // generic action-dispatch capability.
+//
+// #1066: composition awaits each repository observation, so Head
+// authorization is re-proven and the one composition deadline is checked
+// around every observation and again immediately before the durable write.
 
 const {
   DeliveryCandidateError,
@@ -195,11 +199,13 @@ function mapStoreFailure(error) {
 }
 
 function createDeliveryCompositionService(options) {
-  exact(options, ["binding", "candidate_store", "resolve_head_authorization", "repository_objects"], "invalid_delivery_composition_service_options");
+  exact(options, ["binding", "candidate_store", "resolve_head_authorization", "repository_objects", "deadline"], "invalid_delivery_composition_service_options");
   const owner = freeze(headBinding(options.binding, "invalid_delivery_composition_service_options"));
   const candidateStore = store(options.candidate_store);
   const resolveAuthorization = authorizationResolver(options.resolve_head_authorization);
   const objects = repositoryObjects(options.repository_objects);
+  const deadline = options.deadline;
+  if (!Number.isSafeInteger(deadline) || deadline <= 0) fail("invalid_delivery_composition_service_options", "composition deadline is invalid");
 
   function authorize(operation, caller, ref) {
     if (!sameBinding(caller, owner)) fail("delivery_composition_head_denied", "Head binding does not match this service");
@@ -226,9 +232,13 @@ function createDeliveryCompositionService(options) {
       fail("delivery_candidate_store_unavailable", "delivery candidate store is unavailable");
     }
   }
+  function withinDeadline(message) {
+    if (Date.now() >= deadline) fail("delivery_composition_deadline_exceeded", message);
+  }
   function guardedObjects(caller, ref) {
     return Object.fromEntries(REPOSITORY_OPERATIONS.map((name) => [name, (request) => {
       authorize("compose_candidate", caller, ref);
+      withinDeadline("composition deadline passed before a repository observation");
       return objects[name](request);
     }]));
   }
@@ -295,7 +305,7 @@ function createDeliveryCompositionService(options) {
     }
     return operationRecord(initialized, "delivery_candidate_initialized", false);
   }
-  function composeCandidate(value) {
+  async function composeCandidate(value) {
     const input = compositionInput(value);
     // Authentication happens before the durable lookup and is repeated around
     // each object observation and the final state transition below.
@@ -320,17 +330,24 @@ function createDeliveryCompositionService(options) {
     }
     let compositionProof;
     try {
-      compositionProof = composeDeliveryCandidate(current.delivery_manifest, guardedObjects(input.caller, input.ref));
+      compositionProof = await composeDeliveryCandidate(current.delivery_manifest, guardedObjects(input.caller, input.ref));
     } catch (error) {
       if (error instanceof DeliveryCompositionServiceError) throw error;
+      // The composer reports every accessor failure as unavailability, which
+      // hides a Head fact or deadline refused inside a guarded observation.
+      // Re-prove both here so their own code dominates.
+      authorize("compose_candidate", input.caller, input.ref);
+      withinDeadline("composition deadline passed during repository observation");
       if (error instanceof DeliveryComposerError || error instanceof DeliveryCandidateError) {
         fail("delivery_composition_rejected", "delivery composition proof could not be established");
       }
       fail("delivery_composition_unavailable", "delivery composition object access failed");
     }
     // A changed or archived Head after the last repository observation cannot
-    // commit a proof produced under the earlier authorization fact.
+    // commit a proof produced under the earlier authorization fact, and a
+    // proof that arrives after the deadline is never recorded.
     authorize("compose_candidate", input.caller, input.ref);
+    withinDeadline("composition deadline passed before the durable write");
     let written;
     try {
       written = candidateStore.recordComposed(freeze({

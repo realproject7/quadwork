@@ -173,10 +173,10 @@ function tagMatchesRaw(raw, structural) {
     raw.sender === "system" && raw.type === "system" && structural.server_authored === true;
 }
 
-function persistedStructural(value, projectId, headGeneration, raw) {
+function persistedStructural(value, projectId, raw) {
   exact(value, STRUCTURAL_FIELDS, "primary_chat_resume_source_invalid");
   if (value.version !== VERSION || value.project_id !== projectId || typeof value.trusted !== "boolean" || !TAGS.has(value.tag) ||
-      value.head_generation !== headGeneration || value.target !== "head" || typeof value.server_authored !== "boolean" ||
+      !nonnegativeInteger(value.head_generation) || value.target !== "head" || typeof value.server_authored !== "boolean" ||
       (value.batch_id !== null && (typeof value.batch_id !== "string" || !BATCH_ID_RE.test(value.batch_id))) ||
       !tagMatchesRaw(raw, value)) {
     fail("primary_chat_resume_source_invalid", "persisted structural metadata is invalid");
@@ -187,7 +187,9 @@ function persistedStructural(value, projectId, headGeneration, raw) {
     trusted: value.trusted,
     tag: value.tag,
     batch_id: value.batch_id,
-    head_generation: headGeneration,
+    // Retained records are evidence of their original generation. The resume
+    // projection filters them against the currently admitted Head and batch.
+    head_generation: value.head_generation,
     target: "head",
     server_authored: value.server_authored,
   });
@@ -236,7 +238,7 @@ function recordsWindow(value, projectId, headGeneration) {
     previousId = raw.id;
     previousTimestamp = Date.parse(raw.ts);
     const structural = Object.prototype.hasOwnProperty.call(record, "resume_structural")
-      ? persistedStructural(record.resume_structural, projectId, headGeneration, raw)
+      ? persistedStructural(record.resume_structural, projectId, raw)
       : inertStructural(projectId, headGeneration);
     records.push(freeze({ raw, structural }));
   }

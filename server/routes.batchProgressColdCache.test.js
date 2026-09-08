@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #943: code-batch progress must read the PERSISTED GITHUB.md snapshot when the
 // in-memory _graphqlCache is empty (e.g. just after a server restart), instead
 // of firing an uncapped burst of live per-item Searches that mis-rendered queued

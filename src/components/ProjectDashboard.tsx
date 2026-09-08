@@ -22,7 +22,11 @@ import {
 const MIN_SIZE = 150; // px
 const DIVIDER = 4; // px
 
-type AgentState = "running" | "stopped" | "error";
+interface AgentSnapshot {
+  projectId: string;
+  states: Record<string, string>;
+  generations: Record<string, string | null>;
+}
 type PanelVisibility = ReturnType<typeof resolvePanelVisibility>;
 type PanelId = keyof PanelVisibility;
 
@@ -79,7 +83,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [colRatio, setColRatio] = useState(0.5);
   const dragging = useRef(false);
-  const [agentStates, setAgentStates] = useState<Record<string, AgentState>>({});
+  const [agentSnapshot, setAgentSnapshot] = useState<AgentSnapshot>({ projectId, states: {}, generations: {} });
+  // Never render the previous project's generation during navigation, even
+  // before the new project's first status request has finished.
+  const agentStates = agentSnapshot.projectId === projectId ? agentSnapshot.states : {};
+  const agentGenerations = agentSnapshot.projectId === projectId ? agentSnapshot.generations : {};
 
   // #1052: right-rail panel visibility (expanded booleans), persisted
   // browser-locally per project. Presentation-only: toggling never touches
@@ -203,30 +211,42 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     }
   }), [projectId]);
 
-  // Poll agent states
+  // Poll observed state and generation together. Generation is a viewer
+  // reconnect signal, never authority to start an agent.
   useEffect(() => {
+    let cancelled = false;
+    let requestSequence = 0;
+    let acceptedSequence = 0;
     const poll = () => {
+      const sequence = ++requestSequence;
       fetch("/api/agents")
-        .then((r) => r.ok ? r.json() : {})
+        .then((r) => r.ok ? r.json() : null)
         .then((data) => {
-          const states: Record<string, AgentState> = {};
+          if (cancelled || sequence < acceptedSequence || !data || typeof data !== "object" || Array.isArray(data)) return;
+          const states: Record<string, string> = {};
+          const generations: Record<string, string | null> = {};
           for (const [key, info] of Object.entries(data)) {
-            if (key.startsWith(`${projectId}/`)) {
-              const agent = key.split("/")[1];
-              states[agent] = (info as { state: string }).state as AgentState;
+            if (key.startsWith(`${projectId}/`) && info && typeof info === "object") {
+              const agent = key.slice(projectId.length + 1);
+              const facts = info as { state?: unknown; generation_id?: unknown };
+              states[agent] = typeof facts.state === "string" ? facts.state : "unknown";
+              generations[agent] = typeof facts.generation_id === "string" && facts.generation_id ? facts.generation_id : null;
             }
           }
-          setAgentStates(states);
+          acceptedSequence = sequence;
+          setAgentSnapshot({ projectId, states, generations });
         })
         .catch(() => {});
     };
     poll();
     const interval = setInterval(poll, 5000);
-    return () => clearInterval(interval);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [projectId]);
 
   const updateAgentState = (agent: string, state: string) => {
-    setAgentStates((prev) => ({ ...prev, [agent]: state as AgentState }));
+    setAgentSnapshot((prev) => prev.projectId === projectId
+      ? { ...prev, states: { ...prev.states, [agent]: state } }
+      : { projectId, states: { [agent]: state }, generations: {} });
   };
 
   const clamp = useCallback(
@@ -323,6 +343,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             <AgentTerminalsGrid
               projectId={projectId}
               agentStates={agentStates}
+              agentGenerations={agentGenerations}
               onStatusChange={updateAgentState}
               expanded={panels.terminals}
               onToggle={() => togglePanel("terminals")}

@@ -34,6 +34,7 @@ const STATUS_REASONS = new Map([
     "preflight_containment_unavailable", "controller_snapshot_invalid",
     "controller_protocol_unavailable", "runtime_observation_inconsistent",
     "api_self_identity_unproven",
+    "proof_authority_unavailable",
   ])],
   ["temp_unavailable", new Set(["preflight_temp_unavailable"])],
   ["capacity_exhausted", new Set(["preflight_capacity_exhausted"])],

@@ -15,6 +15,7 @@ const {
   commitConfigurationSnapshot,
 } = require("../server/config");
 const { normalizeCiPolicy } = require("../server/ci-evidence-policy");
+const { createCliStopOwner, requestCliStop } = require("../server/cli-stop-owner");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const { configureServiceTempEnvironment } = require("../server/resource-service-env");
 const {
@@ -430,19 +431,58 @@ async function tryInstall(rl, name, description, commands, { platform } = {}) {
   }
 }
 
+// #1074: the durable stores hold their writer lock in the kernel through the
+// `fs-native-extensions` addon, whose prebuilds are built against the Node-20
+// N-API surface from 20.3.0 onward.  20.0–20.2 are therefore refused
+// explicitly rather than passing a major-only check and failing later, deep
+// inside a store write, with an errno instead of an instruction.
+//
+// The comparison is patch-level and numeric on every component.  A major-only
+// `parseInt` cannot express this floor, and a string compare cannot either:
+// "20.10.0" sorts before "20.3.0" lexically.  `package.json` `engines` does
+// not enforce it — npm's `engine-strict` is false here, so `engines` only
+// warns — which is why the runtime is checked in code at all.
+//
+// The comparator below is pure and says nothing about when it runs.  Two
+// callers use it: the `init` wizard's prerequisite list, which reports the
+// installed `node --version` alongside the other tools it checks, and the
+// dispatch guard at the bottom of this file, which checks *this* process's
+// `process.version` before any command runs.  The guard is what actually
+// refuses a too-old runtime; the wizard's copy is a report, and would protect
+// `init` alone.
+const MINIMUM_NODE_VERSION = Object.freeze([20, 3, 0]);
+
+// Returns null for anything that is not a plain `vMAJOR.MINOR.PATCH`, so an
+// unreadable version is never silently treated as new enough.
+function parseNodeVersion(raw) {
+  if (typeof raw !== "string") return null;
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(raw.trim());
+  if (!match) return null;
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+  return parts.every((part) => Number.isSafeInteger(part) && part >= 0) ? parts : null;
+}
+function satisfiesMinimumNodeVersion(raw, minimum = MINIMUM_NODE_VERSION) {
+  const parsed = parseNodeVersion(raw);
+  if (parsed === null) return false;
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (parsed[index] > minimum[index]) return true;
+    if (parsed[index] < minimum[index]) return false;
+  }
+  return true;
+}
+
 async function checkPrereqs(rl) {
   header("Step 1: Prerequisites");
   const platform = detectPlatform();
   let allOk = true;
 
-  // ── 1. Node.js 20+ (must already exist — user ran npx) ──
+  // ── 1. Node.js 20.3.0+ (must already exist — user ran npx) ──
   const nodeVer = run("node", ["--version"]);
   if (nodeVer) {
-    const major = parseInt(nodeVer.replace("v", "").split(".")[0], 10);
-    if (major >= 20) {
+    if (satisfiesMinimumNodeVersion(nodeVer)) {
       ok(`Node.js ${nodeVer}`);
     } else {
-      fail(`Node.js ${nodeVer} — version 20 or newer is required`);
+      fail(`Node.js ${nodeVer} — version ${MINIMUM_NODE_VERSION.join(".")} or newer is required`);
       log("Update from: https://nodejs.org");
       allOk = false;
     }
@@ -705,12 +745,13 @@ async function setupGitHub(rl) {
 }
 
 async function setupV2CiPolicy(rl) {
-  header("V2 Repository CI Policy");
-  log("Every new V2 repository needs an explicit policy. QuadWork never guesses CI checks.");
-  const mode = await ask(rl, "CI policy mode (github-checks/ci-less)", "github-checks");
+  header("V2 Repository Verification");
+  log("Local verification records named results from your repository checks without GitHub Actions.");
+  log("Choose github-checks only to opt in to an existing external-check policy.");
+  const mode = await ask(rl, "Verification mode (ci-less = Local verification / github-checks)", "ci-less");
   let candidate;
   if (mode === "ci-less") {
-    const keys = (await ask(rl, "CI-less evidence keys (comma-separated)", "operator"))
+    const keys = (await ask(rl, "Local verification evidence keys (comma-separated)", "unit,typecheck,build"))
       .split(",").map((value) => value.trim()).filter(Boolean);
     candidate = { version: 1, mode, evidence_keys: keys };
   } else if (mode === "github-checks") {
@@ -1131,6 +1172,37 @@ async function cmdInit() {
 
 
 
+// #1077: signal handlers join one awaited shutdown and never report a stop
+// before the server confirms its owned processes have exited.
+function createCleanExit(serverExports, serverPidFile, exit = (code) => process.exit(code), beforeExit = async () => {}) {
+  let completion;
+  return () => {
+    if (completion) return completion;
+    completion = Promise.resolve().then(async () => {
+      console.log("");
+      log("Shutting down...");
+      let code = 0;
+      try {
+        const result = await serverExports.shutdown();
+        if (result?.ok !== true) throw new Error("owned resource cleanup could not be confirmed");
+        ok("Stopped.");
+        console.log("");
+        log("To restart:");
+        log(`  ${c.dim}npx --yes quadwork start${c.reset}`);
+        console.log("");
+      } catch (err) {
+        code = 1;
+        warn(`Shutdown incomplete: ${err.message}`);
+      }
+      // The requesting CLI removes its exact receipt only after observing exit.
+      // Ctrl+C leaves a stale receipt; a future start can replace it after exit.
+      await beforeExit(code);
+      exit(code);
+    });
+    return completion;
+  };
+}
+
 async function cmdStart() {
   console.log("\n  QuadWork Start\n");
 
@@ -1184,30 +1256,15 @@ async function cmdStart() {
   log("Press Ctrl+C to stop.\n");
   const serverExports = require(path.join(serverDir, "index.js"));
 
-  // #972: record the server PID so `quadwork stop` (which reads server.pid)
-  // actually finds this in-foreground process. Removed again on exit.
   const serverPidFile = path.join(CONFIG_DIR, "server.pid");
+  let stopOwner;
+  const cleanExit = createCleanExit(serverExports, serverPidFile, (code) => process.exit(code),
+    (code) => stopOwner?.reportShutdown(code));
   try {
-    if (!fs.existsSync(CONFIG_DIR)) ensureSecureDir(CONFIG_DIR);
-    fs.writeFileSync(serverPidFile, String(process.pid));
-  } catch (e) { warn(`could not write server.pid: ${e.message}`); }
-
-  let shuttingDown = false;
-  const cleanExit = () => {
-    if (shuttingDown) return; // idempotent: SIGINT then SIGTERM
-    shuttingDown = true;
-    console.log("");
-    log("Shutting down...");
-    try { serverExports && serverExports.shutdown && serverExports.shutdown(); }
-    catch (e) { warn(`shutdown failed: ${e.message}`); }
-    try { fs.unlinkSync(serverPidFile); } catch {}
-    ok("Stopped.");
-    console.log("");
-    log("To restart:");
-    log(`  ${c.dim}npx --yes quadwork start${c.reset}`);
-    console.log("");
-    process.exit(0);
-  };
+    stopOwner = await createCliStopOwner(serverPidFile, cleanExit);
+  } catch (error) {
+    warn(`CLI stop unavailable [${error.code || "cli_stop_owner_failed"}]. Use Ctrl+C in this foreground session.`);
+  }
 
   // #972: handle SIGTERM too so `quadwork stop` gets the same clean shutdown
   // (agent PTYs + caffeinate + timers) as Ctrl+C, not a bare process kill.
@@ -1226,58 +1283,31 @@ function sanitizePid(raw) {
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
-function stopPid(name, pidFileName) {
+async function stopPid(name, pidFileName) {
   const pidFile = path.join(CONFIG_DIR, pidFileName);
-  if (!fs.existsSync(pidFile)) return false;
-  const pid = sanitizePid(fs.readFileSync(pidFile, "utf-8"));
-  if (pid === null) {
-    // #972: never signal on a corrupt PID; just clean the stale file.
-    warn(`${name}: ignoring corrupt PID file (${pidFileName})`);
-    try { fs.unlinkSync(pidFile); } catch {}
-    return false;
-  }
-  try {
-    process.kill(pid, "SIGTERM");
-    ok(`Stopped ${name} (PID: ${pid})`);
-  } catch {
-    warn(`${name} process ${pid} not running`);
-  }
-  // #972: a failed unlink must not abort the rest of cmdStop.
-  try { fs.unlinkSync(pidFile); } catch {}
-  return true;
+  const result = await requestCliStop(pidFile, fs.realpathSync(__filename));
+  if (result.status === "stopped") ok(`Stopped ${name} (PID: ${result.pid})`);
+  else if (result.status !== "missing") warn(`${name}: ${result.status} [${result.code}]. Receipt retained; no external PID signal was sent.`);
+  return result;
 }
 
-function cmdStop() {
+async function cmdStop() {
   console.log("\n  QuadWork Stop\n");
-
-  let stopped = 0;
-  if (stopPid("Telegram bridge", "tg-bridge.pid")) stopped++;
-
-  // Stop per-project AgentChattr instances
+  const targets = [["Telegram bridge", "tg-bridge.pid"]];
   const config = readConfig();
-  for (const project of (config.projects || [])) {
-    if (stopPid(`AgentChattr (${project.id})`, `agentchattr-${project.id}.pid`)) stopped++;
+  for (const project of (config.projects || [])) targets.push([`AgentChattr (${project.id})`, `agentchattr-${project.id}.pid`]);
+  targets.push(["AgentChattr", "agentchattr.pid"], ["Server", "server.pid"]);
+  let stopped = 0, unresolved = 0;
+  for (const [name, file] of targets) {
+    const result = await stopPid(name, file);
+    if (result.status === "stopped") stopped++;
+    else if (result.status !== "missing") unresolved++;
   }
-  // Also stop legacy single-instance PID if present
-  if (stopPid("AgentChattr", "agentchattr.pid")) stopped++;
-
-  if (stopPid("Server", "server.pid")) stopped++;
-
-  // Stop caffeinate via the running server's API (targets only QuadWork's instance)
-  if (process.platform === "darwin") {
-    const cfg = readConfig();
-    const qwPort = cfg.port || 8400;
-    try {
-      const result = run("curl", ["-s", "-X", "POST", `http://127.0.0.1:${qwPort}/api/caffeinate/stop`]);
-      if (result && result.includes('"ok":true')) {
-        ok("Stopped caffeinate (sleep prevention)");
-        stopped++;
-      }
-    } catch {}
-  }
-
-  if (stopped === 0) warn("No running processes found");
-  else ok(`Stopped ${stopped} process(es)`);
+  // The verified server's shutdown owns caffeinate. Never POST to a guessed
+  // configured port: another service may now be listening there.
+  if (stopped) ok(`Stopped ${stopped} process(es)`);
+  else if (!unresolved) warn("No stop receipts found");
+  if (unresolved) { warn(`${unresolved} stop request(s) unconfirmed`); process.exitCode = 1; }
   log("");
 }
 
@@ -1813,9 +1843,20 @@ function cmdAcRestore() {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 // #972: run the CLI dispatch only when invoked directly, so tests can
-// `require("../bin/quadwork")` for the pure helpers (sanitizePid, stopPid)
+// `require("../bin/quadwork")` for focused helper tests
 // without executing a command.
 if (require.main === module) {
+// #1064: the floor is enforced here, before dispatch, so *every* command
+// refuses a too-old runtime with an instruction rather than one command doing
+// it and the rest failing later, deep inside a store write, with an errno.
+// `process.version` is this process — the interpreter that will run the
+// command — not whatever `node` happens to be on PATH.
+if (!satisfiesMinimumNodeVersion(process.version)) {
+  console.error(`QuadWork requires Node.js ${MINIMUM_NODE_VERSION.join(".")} or newer — this is ${process.version}.`);
+  console.error("Update from: https://nodejs.org");
+  process.exit(1);
+}
+
 const command = process.argv[2];
 
 switch (command) {
@@ -1897,6 +1938,11 @@ switch (command) {
 
 // #972: exported for unit tests (see server/binStop.test.js).
 module.exports = {
+  createCleanExit,
+  setupV2CiPolicy,
+  MINIMUM_NODE_VERSION,
+  parseNodeVersion,
+  satisfiesMinimumNodeVersion,
   sanitizePid,
   stopPid,
   renderResourcePreflight,

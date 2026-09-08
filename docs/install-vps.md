@@ -78,7 +78,7 @@ sudo apt-get update
 sudo apt-get install -y git apache2-utils
 ```
 
-`apache2-utils` provides `htpasswd` (used in Step 10 for HTTP basic auth).
+`apache2-utils` provides `htpasswd` (used in Step 9 for HTTP basic auth).
 
 ---
 
@@ -92,6 +92,13 @@ nvm use 24
 ```
 
 **Do NOT use system Node (`apt` or `nodesource`).** Only use nvm. System Node alongside nvm creates PATH conflicts — pm2 and QuadWork spawn agents with system PATH (missing nvm binaries), causing agents to fail auth or not be found.
+
+**glibc Linux only — Alpine/musl is not supported.** This guide targets Ubuntu,
+which is glibc. QuadWork's durable stores hold their writer lock in the kernel
+through a native addon whose Linux prebuild is glibc-linked, so on a musl distro
+(Alpine, and Alpine-based container images) the addon cannot load. That is a
+hard failure, not a downgrade: the stores refuse to write rather than run
+without mutual exclusion. Use a glibc image — Ubuntu or Debian.
 
 ---
 
@@ -133,15 +140,8 @@ codex             # Follow login prompt
 gemini            # Follow login prompt (only if using Gemini)
 ```
 
-**If migrating from an existing server**, copy auth configs instead:
-
-```bash
-# From your local machine
-ssh quadwork-old 'tar czf /tmp/auth-backup.tar.gz .claude .codex .config/gh'
-scp quadwork-old:/tmp/auth-backup.tar.gz /tmp/
-scp /tmp/auth-backup.tar.gz quadwork:/tmp/
-ssh quadwork 'cd ~ && tar xzf /tmp/auth-backup.tar.gz && rm /tmp/auth-backup.tar.gz'
-```
+If migrating from an existing server, authenticate on the new server using the
+same interactive login steps above.
 
 ---
 
@@ -210,7 +210,7 @@ memory-backed, incorrectly owned/mode-set, or below the accepted capacity, it
 discards the unverified Linux `TMPDIR`, prints a typed warning, and keeps the
 dashboard/API diagnostic plane online. Even a verified service `TMPDIR` reports
 `containment_ready=false`; worker cgroup/PTY containment still requires the
-separate staging proof.
+source-owned non-pressure runtime probe.
 
 Auto-start on reboot:
 
@@ -263,6 +263,13 @@ For the measured 8 GiB reference VPS, the v1 proposal shape is:
   "temp_min_free_mib": 4096
 }
 ```
+
+All Head, Dev, RE1 and RE2 PTYs consume worker slots. This three-slot proposal
+requires phased scheduling and cannot run all four roles concurrently. Full
+four-role concurrency requires an explicitly accepted `max_worker_scopes >= 4`
+and measured RAM/swap capacity for the API, control class, four worker maxima
+and host reserve. The bounded staging profile also uses three slots and is not
+a provider-memory sizing result.
 
 This is an operator-visible proposal, not a hidden default. Confirm the account
 path and measured host/swap capacity before accepting it; the strict parser
@@ -396,19 +403,20 @@ quadwork resources preflight --json
 ```
 
 This preflight is read-only. A non-zero result is expected while the policy,
-temp boundary, or staging proof is unavailable; it does not install, repair,
-create, or modify systemd units. Policy/temp acceptance alone is not
-containment proof. The current `systemd-run --user --scope
---collect --quiet` contract remains `candidate_pending_staging` and is not a
-supported production launch path.
+temp boundary, or actual platform capabilities are unavailable. It does not
+install or repair units. The Linux API keeps serving health and Primary Chat
+when worker containment is unavailable. Worker starts require the source-owned
+runtime to verify the effective API limits, cgroup v2 and systemd 253 or later,
+then complete a real non-pressure node-pty/descendant/temp probe. Config values
+and serialized receipts cannot bypass that probe.
 
-Never run memory pressure or fault injection on production. The source checkout
-contains an opt-in staging coordinator for a disposable VPS, but its bundled
-adapter deliberately returns `proof_unavailable` instead of launching a fake or
-incomplete test. A deployment-specific live adapter must provide authenticated
-API, Primary Chat-WebSocket, unrelated-worker, cgroup, node-pty, and temp probes.
-Even then, every phase remains blocked until Linux, cgroup v2, the user manager,
-the separate run flag, and this exact acknowledgement all match:
+The shipped closed staging coordinator launches a fresh local API through its
+ordinary start route, observes real Node/test/Git and detached children, verifies
+actual disk-backed temp writes, and samples API health, Primary Chat HTTP
+roundtrips, terminal WebSocket continuity and an unrelated worker throughout
+one bounded memcg OOM. It uses no provider credentials and does not prove a
+provider model turn. Run it only on a disposable Linux machine with Node 24,
+4 GiB RAM, at least 64 MiB swap and readable kernel journal/cgroup facts:
 
 ```bash
 machine_id="$(tr -d '\n' < /etc/machine-id)"
@@ -418,18 +426,22 @@ npm run resource:staging-proof -- \
   --ack-disposable-host "DISPOSABLE-STAGING:${machine_id}"
 ```
 
-Run that command only from the matching QuadWork source checkout on the named
-disposable machine. Omitting either opt-in, copying an acknowledgement from a
-different machine, or lacking a live adapter starts no matrix phase.
+Both opt-ins are required on the exact disposable machine. The CLI accepts no
+adapter, probe callback, target URL, command, signer key, or PASS receipt. Run
+from the exact installed candidate without `NODE_OPTIONS` or `NODE_PATH`.
+Never run pressure on production. Kernel-journal ambiguity, a failed continuous
+sample, or uncertain cleanup fails the run; a redacted report is evidence only
+for its recorded source hashes, versions, limits and actual observations.
 
-Before a live-adapter run, record the disposable VPS identifier, candidate unit
-names, current API/global OOM counters, and the redacted JSON report in the test
-change record. On any failure, stop only the exact candidate units recorded by
-that run, wait for their process trees to exit, and verify with read-only
-`systemctl --user show <recorded-unit>` and cgroup counters. The candidate uses
-transient `--collect` scopes; do not install a persistent unit or copy candidate
-properties into production. A report is evidence only when every matrix check
-is `passed`; this guide does not claim that such a PASS has occurred.
+Normal Git/GitHub CLI children use one source-owned control executor, a shared
+bounded control slice and advisory leaf slots across API processes. Its runtime
+unit is fixed to the accepted control policy; a different or foreign existing
+unit is refused. Small bounded systemd/proc bootstrap observations execute in
+the API reserve. Each generation has an exact owned slice, scope and temp root;
+the runtime removes its own generation units after confirmed tree exit. It
+retains the active generation's parent OOM counter through scope collection.
+A failed proof preserves its private ownership directory for exact cleanup;
+never stop units or delete temp by a broad prefix or wildcard.
 
 ### Resource upgrade and rollback
 
@@ -539,7 +551,7 @@ skip the rest of this section unless you want a persistent public URL.
 ### Option B — Authenticated public dashboard (nginx + SSL)
 
 Use this only if you need a persistent shared URL. It requires **both** an
-authenticating reverse proxy (Step 10 basic auth) **and** an allowlist entry so
+authenticating reverse proxy (Step 9 basic auth) **and** an allowlist entry so
 QuadWork accepts the proxied hostname — without the allowlist, QuadWork's
 loopback checks reject the forwarded `Host`/`Origin` and every terminal
 WebSocket dies.
@@ -557,8 +569,8 @@ restart QuadWork with `pm2 restart quadwork`:
 
 > `trusted_dashboard_hosts` takes effect **only** when the request truly arrives
 > via the on-box loopback proxy (nginx on `127.0.0.1`). It never lets a direct
-> remote connection through, and it is **not** a substitute for the Step 10
-> basic auth — configure both. Steps 9–10 build this authenticated proxy.
+> remote connection through, and it is **not** a substitute for the Step 9
+> basic auth — configure both. Step 10 optionally caches successful logins.
 
 ## Step 9: Domain + Nginx + SSL
 
@@ -569,7 +581,13 @@ Create an A record: `app.example.com` -> server IP.
 ### Nginx reverse proxy
 
 ```bash
-sudo apt-get install -y nginx
+sudo apt-get install -y nginx apache2-utils
+
+# Create the password file before enabling the proxy. Enter the password at
+# the prompt; do not put it in command arguments or shell history.
+sudo htpasswd -c /etc/nginx/.htpasswd admin
+sudo chown root:www-data /etc/nginx/.htpasswd
+sudo chmod 640 /etc/nginx/.htpasswd
 ```
 
 Create `/etc/nginx/sites-available/app.example.com`:
@@ -578,6 +596,9 @@ Create `/etc/nginx/sites-available/app.example.com`:
 server {
     listen 80;
     server_name app.example.com;
+
+    auth_basic "QuadWork";
+    auth_basic_user_file /etc/nginx/.htpasswd;
 
     # Host-capacity facts are operator-local even when the dashboard is public.
     location = /api/resources {
@@ -599,7 +620,7 @@ server {
 ```
 
 `proxy_read_timeout 86400` and WebSocket headers are required for live agent terminal connections.
-Keep the exact `/api/resources` exclusion when adding Step 10 authentication or
+Keep the authentication directives and exact `/api/resources` exclusion when applying Step 10 or
 when Certbot rewrites this server block; basic auth does not make host-capacity
 facts part of the public dashboard surface.
 
@@ -612,23 +633,21 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ```bash
 sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d app.example.com --non-interactive --agree-tos -m your@email.com
+sudo certbot --nginx --redirect -d app.example.com --non-interactive --agree-tos -m your@email.com
 ```
+
+Finish HTTPS setup before opening or signing into the dashboard. Use only
+`https://app.example.com`; confirm an unauthenticated request receives `401`
+before sharing the URL. The explicit `--redirect` option keeps HTTP redirected
+to HTTPS.
 
 ---
 
-## Step 10: Basic HTTP Auth (Recommended)
+## Step 10: Optional cookie-cached authentication
 
-The dashboard is publicly accessible once deployed. Add password protection:
-
-```bash
-openssl rand -base64 18
-# Save the output as your password
-
-sudo htpasswd -cb /etc/nginx/.htpasswd admin 'YOUR_GENERATED_PASSWORD'
-```
-
-### Cookie-cached auth (reduces mobile reprompts)
+Basic authentication is already required by the initial Step 9 proxy. This
+optional addition reduces mobile reprompts; it does not enable authentication
+for the first time.
 
 Mobile browsers (especially Safari) drop the `Authorization` header aggressively on new connections and WebSocket reconnects, causing repeated sign-in popups every few minutes. The fix: cache successful auth in a cookie so nginx skips the challenge on subsequent requests.
 
@@ -701,7 +720,7 @@ chmod 600 ~/.quadwork/.env
 11. Create `~/start-quadwork.sh` wrapper script (loads nvm before exec)
 12. Start with pm2 wrapper, save, configure startup
 13. Verify reboot survival: `sudo reboot`, then check `pm2 list`
-14. **Remote access:** either SSH-forward `ssh -L 8400:127.0.0.1:8400 quadwork` (recommended, nothing published), **or** for a persistent public URL: set `trusted_dashboard_hosts` in config, then DNS A record → nginx reverse proxy + SSL → HTTP basic auth (never expose the port unauthenticated)
+14. **Remote access:** either SSH-forward `ssh -L 8400:127.0.0.1:8400 quadwork` (recommended, nothing published), **or** for a persistent public URL: set `trusted_dashboard_hosts` in config, then DNS A record → password file and basic auth → authenticated nginx proxy + SSL → optional login cookie cache (never expose the port unauthenticated)
 
 ## Note: /tmp quotas and Claude temp
 
@@ -711,3 +730,49 @@ Claude bash command starts failing silently with exit 1 (see
 [troubleshooting](troubleshooting.md#every-claude-bash-command-fails-silently-exit-1-no-output)).
 QuadWork sweeps stale entries automatically (hourly + on agent teardown,
 72h age) — configurable via `temp_cleanup` in `~/.quadwork/config.json`.
+
+### Closed disposable containment matrix (#1038)
+
+The installed runner accepts only scalar CLI flags. It owns a fresh local HOME,
+config, loopback API, diagnostic agents, actual chat HTTP requests and terminal
+WebSocket connections. It never accepts an adapter, URL, proof JSON or signer.
+The trusted boundary is the installed source and dedicated local OS account;
+cgroup inheritance does not sandbox hostile same-user systemd bus access.
+
+Run only inside a dedicated disposable Linux VM with 4 GiB RAM, modest swap,
+a real systemd user manager >=253, cgroup v2 and readable kernel journal:
+
+```sh
+node server/resource-staging-proof.js --json --run-pressure-matrix \
+  --ack-disposable-host "DISPOSABLE-STAGING:$(cat /etc/machine-id)"
+```
+
+Read-only/missing acknowledgement attempts refuse before any workload. The
+fixed invocation is node-pty → `systemd-run --user --scope --collect --quiet`,
+with MemoryHigh/MemoryMax/MemorySwapMax and `OOMPolicy=kill`; effective kernel
+limits and `memory.oom.group` are checked before pressure. No `--pipe` or
+uncontained fallback exists. An actual non-pressure PTY/resize/signal/descendant
+probe gates ordinary Linux worker launch. Unsupported hosts retain API/chat
+and report `containment_unavailable`; existing V1 workers are preserved.
+
+The matrix uses 96/128/16 MiB worker high/max/swap, at most 160 MiB of touched
+allocation, API 640 MiB, control 256 MiB, three worker slots and 1536 MiB host
+reserve. These are disposable fixture values, not production defaults. A
+fixed 16-thread pool can touch twenty reserved 8 MiB buffers through bounded
+kernel reads, with no refill or retry. The worker first arms and reports actual
+thread IDs and reserved bytes, without opening a pressure read. The coordinator
+receives and validates that record, rechecks the live process, threads, limits,
+unchanged OOM baseline and monitors, then releases the one-shot reads. One
+monotonic 45-second deadline covers arm, validation, release and actual memcg
+OOM; worker/API watchdogs remain 90/120 seconds. Reservation is not resident
+memory or completed work. If OOM kills the worker before its optional dispatch
+record arrives, submitted count remains null; only received full completions
+count as touched bytes. Missing armed facts or independent OOM evidence fails.
+Real Git control children wait for an observed concurrency/queue handshake.
+Thread/allocation records describe the workload; only independent kernel and
+cgroup observations establish OOM. Continuous API/chat/WS samples must stay
+within the existing 2-second failure budget throughout the pressure interval.
+A local pass proves Node/test/git/temp inheritance and sampled product reachability;
+it does not prove authenticated Claude/Codex model turns or provider temp use.
+Archive the exact package/source hashes and complete redacted JSON result.
+Never run this command against production or the shared Docker VM.

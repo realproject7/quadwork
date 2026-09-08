@@ -109,32 +109,42 @@ const CACHE_SIZE = 200;
 const MAX_RESUME_SOURCE_RECORDS = 2048;
 const MAX_RESUME_SOURCE_BYTES = 128 * 1024 * 1024;
 
+function isProjectInitialized(projectId) {
+  return projectState.get(projectId)?.initialized === true;
+}
+
 function initProject(projectId) {
+  // Activation retries reuse the live owner without resetting chat/cache state.
+  // nextId alone is not proof: getNextId can recover it before initialization.
+  if (isProjectInitialized(projectId)) return;
   const dir = chatDir(projectId);
   ensureSecureDir(dir);
-
   acquireWriterLock(projectId);
 
   const state = getState(projectId);
-  state.nextId = recoverNextId(projectId);
-
-  // Populate cache from existing file
-  const filePath = chatFile(projectId);
-  if (fs.existsSync(filePath)) {
-    const content = fs.readFileSync(filePath, "utf-8");
-    const lines = content.split("\n");
+  try {
+    const nextId = recoverNextId(projectId);
+    const filePath = chatFile(projectId);
     const records = [];
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        records.push(JSON.parse(line));
-      } catch {
-        // already warned during recoverNextId
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, "utf-8");
+      for (const line of content.split("\n")) {
+        if (!line.trim()) continue;
+        try { records.push(JSON.parse(line)); }
+        catch { /* already warned during recoverNextId */ }
       }
     }
+    state.nextId = nextId;
     state.cache = records.slice(-CACHE_SIZE);
+    state.initialized = true;
+  } catch (error) {
+    // Only release a lock this call successfully acquired. A recovery read
+    // failure must not strand an own-PID lock and make the retry impossible.
+    releaseWriterLock(projectId);
+    state.nextId = null;
+    state.cache = [];
+    throw error;
   }
-
   console.log(`[file-chat] Initialized project ${projectId}, next ID: ${state.nextId}, cached: ${state.cache.length} messages`);
 }
 
@@ -718,6 +728,7 @@ function resolveShimPrincipal(token) {
 
 module.exports = {
   initProject,
+  isProjectInitialized,
   shutdownProject,
   appendMessage,
   // Private server composition seam. No route/MCP surface exposes it.

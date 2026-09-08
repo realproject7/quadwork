@@ -249,12 +249,12 @@ discipline as dashboard chat, for example `@head ...` to wake Head.
 
 ## Workflow recipes
 
-Each is 1–3 tool calls. Start every session with `list_projects` to get the
+Start every session with `list_projects` to get the
 `project` id; if it fails, the MCP isn't connected — fix registration, don't SSH.
 
 **Start a code batch** — let HEAD plan and write the queue:
-1. `send_message(project, "@head start a batch for <feature>: #12 #15 #18")` — HEAD files issues + writes `OVERNIGHT-QUEUE.md`, then asks you to start.
-2. Kick it off: `start_batch(project)` to enable the Monitor, or `trigger_now(project)` for one immediate evaluation. There is no cadence to choose: the Monitor writes one structured `[QW-MONITOR:<kind>]` event to `@head` only when a fixed-policy transition is genuinely due. Passing `interval_min`, `duration_min`, `message`, `recipients` or `mode` is rejected with `trigger_authoring_removed` — operator-authored trigger text no longer exists.
+1. Check `list_agents` and use the existing role lifecycle controls for any required stopped role. Send `send_message(project, "@head plan and implement <feature>: owner/repo#12 owner/repo#15")`. Head owns issue contracts, the queue and server-authenticated assignment. Queue text alone does not authorize V2 execution.
+2. Head enables the Monitor for the qualified live batch. `start_batch(project)` enables the same observation, and `trigger_now(project)` requests one immediate evaluation. Neither starts workers, creates assignments nor advances the queue. There is no cadence to choose: the Monitor writes one structured `[QW-MONITOR:<kind>]` event to `@head` only when a fixed-policy transition is genuinely due. Passing `interval_min`, `duration_min`, `message`, `recipients` or `mode` is rejected with `trigger_authoring_removed` — operator-authored trigger text no longer exists.
 3. Monitor (below).
 
 **Run a review batch** (review-only — no code, no merges). Just ask HEAD; it stamps the `**Batch type:**` marker — you never touch the queue:
@@ -263,7 +263,7 @@ Each is 1–3 tool calls. Start every session with `list_projects` to get the
 Then monitor with `batch_status` (it shows review states: *queued · in review · 1 of 2 approvals · approved*).
 
 **Monitor a batch:**
-- `batch_status(project)` — `active` is authoritative for "work remaining"; `progress` may stay sticky on a just-finished batch.
+- `batch_status(project)` — inspect the live `active` and per-item `progress`. An empty Active Batch stays empty; Current Batch never falls back to historical work. Head explicitly advances eligible work or closes the batch. Completion does not start another batch.
 - `read_chat(project, { since_id })` — tail the team conversation.
 - `read_queue(project)` — see raw item states (read-only).
 
@@ -279,3 +279,50 @@ Then monitor with `batch_status` (it shows review states: *queued · in review �
 - **`send_message` acts as the human operator.** Messages post with sender `user`, which **resets the chat loop guard** (same as typing in the dashboard). Use it deliberately — `@head do X` wakes Head via the dispatcher.
 - **Destructive operations are intentionally NOT exposed** in this epic: no full reset, no agent-config reset, no raw PTY writes. `agent_control` is limited to the `start`/`stop`/`restart`/`interrupt` allow-list.
 - Unknown project / agent ids are rejected client-side **before** any HTTP call, so a typo can't create stray `~/.quadwork/<id>/` state or a runaway trigger timer.
+
+
+## Local verification and merge evidence
+
+New V2 repository setup selects **Local verification** (`ci-less`) with named
+`unit`, `typecheck`, and `build` evidence keys. Adjust the labels to the actual
+repository contract. Existing external-check policies remain explicit and
+unchanged. Labels are data; QuadWork never executes them as commands.
+
+For this repository, run the existing commands locally on a clean exact
+candidate: `npm test`, `npx tsc --noEmit`, and `npm run build`. `npm test` includes
+package smoke (`server/pack-smoke.test.js`); retain ticket-specific Linux
+containment, live upgrade, and browser checks. Record failures and honest skips.
+No GitHub Actions workflow or self-hosted Actions runner is used.
+
+Dev submits `submit_ci_evidence` for a legacy assignment or
+`submit_delivery_candidate_ci_evidence` for a composed, published delivery.
+Both require the exact head SHA, integration `base_sha`, `policy_version`,
+normalized `policy_digest`, and `verification: { environment, scope }` describing
+the actual runtime/platform and commands/acceptance scope. The delivery operation
+also requires `delivery_manifest_digest`. Copy identity from current server
+state; never invent a digest. Each configured key supplies
+`{ key, outcome: "pass" | "fail", exit_code, evidence_ref }`. Pass requires exit
+code zero. References identify bounded local logs or their digests, not raw logs
+or executable commands. A server receipt authenticates Dev's report; it is not
+OS-level test attestation. Old records without complete identity are historical
+and must be replaced by a current submission.
+
+The server rechecks the current assignment/contract or composed manifest and a
+fresh OPEN, non-draft PR head/base before accepting evidence. Source, base,
+policy, or contract changes remove standing. A successful delivery submission
+reevaluates its final-review cycle without polling or reading Actions checks.
+Explicit external policies still require their registered checks to pass.
+
+Head merges only after all required evidence passes, both independently
+authenticated final reviewers approve the exact candidate, and fresh PR/base,
+mergeability, and unresolved-review checks pass. Read back the merged result
+before task/ticket closure. Publication and completion are separate delivery
+operations; recording evidence never pushes, creates a PR, or merges.
+
+### Scoped Head delivery
+
+`form_delivery`, `publish_delivery`, `inspect_delivery` and `complete_delivery` use the existing project/generation-bound Head control envelope, with `expected_revision`, correlation/idempotency keys and a closed `delivery` payload. The form declares ordinary or operator-gated scope, release intent, rollback group and fixed isolation/operator reasons. Server-resolved task/body/receipt/policy identity binds that formation to one frozen cut; it grants no credential, deployment, payment or destructive authority.
+
+Ordinary delivery publishes a create-only deterministic branch and one non-draft same-repository PR; an unknown push/PR result is reconciled from durable intent on an exact retry. It never merges automatically. `inspect_delivery(before_merge)` seals both final authenticated approvals and passing required verification at the OPEN exact head/base. After the separately authorized merge, `inspect_delivery(after_merge)` verifies the actual merge SHA/tree/parents against that immutable seal and records Head's scope inspection. `complete_delivery` marks included tasks delivered, closes only tickets whose full frozen scope is attested and delivered at the unchanged revision, and preserves per-issue partial failures for retry. Queue advance remains explicit. Missing/late premerge seals or unsupported merge provenance remain `merged_unverified`.
+
+Task review and composition do not imply named final tests passed. Final `ci-less` evidence is submitted through the existing Dev receipt tool and read with `read_ci_evidence({record_id})`, including exact candidate/base/manifest/policy and environment/scope. No hosted check command or badge is required in local mode. Existing explicit external-check policies retain their registered checks. See `HEAD-PO-PLAYBOOK.md` for the detailed fixed payload flow and recovery boundaries.

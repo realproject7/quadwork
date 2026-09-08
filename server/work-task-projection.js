@@ -2,7 +2,7 @@
 
 // #1058 M7: deterministic, read-only projection for the nested Current Batch
 // surface. It receives already-validated durable manifest/pipeline state and
-// emits display data only; it cannot infer tasks, alter queue state, disclose
+// includes the server-recorded delivered state and emits display data only; it cannot infer tasks, alter queue state, disclose
 // local worktree paths, or create a delivery/publication action.
 
 const { assertBatchManifest, workTaskKey } = require("./work-task-manifest");

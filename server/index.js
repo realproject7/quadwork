@@ -31,7 +31,7 @@ const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectM
 const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
-const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
+const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { createHeadControlRuntime } = require("./head-control-runtime");
 const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identity-resolver");
@@ -44,10 +44,12 @@ const { createWorkTaskIndependentReviewService } = require("./work-task-independ
 const { createWorkTaskReviewReconciliationService } = require("./work-task-review-reconciliation-service");
 const { createWorkTaskReviewRuntime } = require("./work-task-review-runtime");
 const { createWorkTaskDeliverySource } = require("./work-task-delivery-source");
+const { createProjectArchiveTransition } = require("./project-archive-transition");
 const { createDeliveryCandidateStore } = require("./delivery-candidate-store");
 const { createDeliveryCompositionService } = require("./delivery-composition-service");
 const { createDeliveryCandidateRuntime } = require("./delivery-candidate-runtime");
 const { createDeliveryGitObjectAdapter } = require("./delivery-git-object-adapter");
+const { runDeliveryGit } = require("./delivery-git-runner");
 const { createCanonicalInstalledStateReader } = require("./canonical-installed-state");
 const { createBatchRequestRuntimeOwner } = require("./batch-request-runtime-owner");
 const { createChatResumeRuntime } = require("./chat-resume-runtime");
@@ -64,6 +66,11 @@ const net = require("net");
 const crypto = require("crypto");
 const config = readConfig();
 const PORT = config.port || 8400;
+// #1077: close admission synchronously, including the await before PTY spawn.
+let shuttingDown = false;
+let shutdownPromise = null;
+const pendingAgentLaunches = new Set();
+const ptyStopOperations = new WeakMap();
 
 // #968: shared session token gating the PTY-driving surface (/ws/terminal,
 // /write, /interrupt). Auto-provisioned + persisted to config.json
@@ -119,7 +126,10 @@ function emitSystemMessage(projectId, text) {
 }
 
 const app = express();
-const resourceRuntimeOwner = createResourceRuntimeOwner();
+const resourceRuntimeOwner = getSharedResourceRuntimeOwner();
+// Preparation is a bounded diagnostic operation; it neither starts an agent
+// nor blocks API/chat startup. Its outcome is reflected by the resource owner.
+if (!process.env.QUADWORK_SKIP_LISTEN) resourceRuntimeOwner.prepareWorkerLaunch().catch(() => {});
 // #412 / quadwork#279: bump the global JSON body limit to 10mb so
 // POST /api/project-history can accept full chat exports. The
 // default ~100kb 413'd long before the route-local parser had a
@@ -194,7 +204,7 @@ app.get("/api/session-token", (req, res) => {
 // --- Safe PTY write helper (#670) ---
 
 function safeWrite(term, data) {
-  if (!term) return false;
+  if (shuttingDown || !term) return false;
   try { term.write(data); return true; }
   catch (err) {
     if (err.code === "EIO") return false;
@@ -663,6 +673,7 @@ const headControlRuntime = createHeadControlRuntime({
   // #1036/#1044: the Head-only Project Monitor, bounded worker recovery, and
   // the two read surfaces.  Each receives only the bound project id and the
   // plane-validated payload.
+  create_delivery_service: createHeadDeliveryService,
   project_controls: {
     read_project_status: ({ project_id }) => readHeadProjectStatus(project_id),
     read_review_handoff: ({ project_id }) => readHeadReviewHandoff(project_id),
@@ -670,6 +681,43 @@ const headControlRuntime = createHeadControlRuntime({
     recover_worker: ({ project_id, recovery }) => recoverWorkerForHead(project_id, recovery),
   },
 });
+
+routes.setDeliveryPublicationPlanReader((projectId, ref) => headControlRuntime.readDeliveryPublicationPlan(projectId, ref));
+
+// Resolve one canonical repository transport on each fixed command. No caller
+// path, arbitrary executable, remote override or credential crosses this seam.
+function createHeadDeliveryService({ binding, domain, is_binding_current }) {
+  function forRef(ref) {
+    const cfg = readConfig();
+    const project = cfg.projects?.find((entry) => entry?.id === binding.project_id && entry.archived !== true);
+    if (!project || cfg.installation_id !== binding.installation_id) throw new TypeError("delivery project unavailable");
+    const primary = primaryRepository(project);
+    const primaryAgentCwds = {};
+    if (primary) for (const role of ["head", "re1", "re2", "dev"]) {
+      const candidate = project.agents?.[role]?.cwd;
+      if (typeof candidate === "string" && path.isAbsolute(candidate)) primaryAgentCwds[role] = candidate;
+    }
+    const plan = require("./repository-provisioning").buildRepositoryWorktreePlan(allRepositories(project), { primaryAgentCwds, repositoryWorktrees: {} });
+    const selected = plan.find((entry) => entry.key === ref.repository_key);
+    if (!selected) throw new TypeError("delivery repository unavailable");
+    const canonicalDirectory = fs.realpathSync(selected.working_dir);
+    return routes.createDeliveryExecutionService({ binding, domain, repository: selected.canonical_repo, cwd: selected.working_dir,
+      read_source: (request) => deliverySourceForProject(binding.project_id).readStagedSource(request),
+      is_current: () => {
+        const admission = captureProjectAdmission(binding.project_id), currentCfg = readConfig();
+        const session = agentSessions.get(`${binding.project_id}/head`);
+        const currentProject = currentCfg.projects?.find((entry) => entry?.id === binding.project_id && entry.archived !== true);
+        const repository = currentProject ? allRepositories(currentProject).find((entry) => entry.key === ref.repository_key) : null;
+        return is_binding_current() && currentCfg.installation_id === binding.installation_id && repository?.repo?.toLowerCase() === selected.canonical_repo &&
+          fs.realpathSync(repository.working_dir) === canonicalDirectory &&
+          admission.generation === binding.generation && isAdmissionCurrent(admission) && session?.state === "running" && !!session.term && session.lifecycleState === "verified";
+      },
+    });
+  }
+  return Object.freeze({ execute: (command) => forRef(command.payload.delivery_candidate_ref).execute(command),
+    resume: (command) => forRef(command.payload.delivery_candidate_ref).resume(command),
+    replay: (command) => forRef(command.payload.delivery_candidate_ref).replay(command), plan: (ref) => forRef(ref).plan(ref) });
+}
 
 // #1058 M8: one fixed server composition for Dev's local-only candidate
 // receipt.  The endpoint below authenticates Dev separately; this helper never
@@ -690,7 +738,7 @@ function devCandidateServiceForProject(projectId) {
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
     run_git: (request) => {
-      try { return { ok: true, output: execFileSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
+      try { return { ok: true, output: resourceRuntimeOwner.runControlChildSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
       catch { return { ok: false, output: "" }; }
     },
   });
@@ -717,7 +765,7 @@ function registeredWorkTaskBaseForProject(projectId) {
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
     run_git: (request) => {
-      try { return { ok: true, output: execFileSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
+      try { return { ok: true, output: resourceRuntimeOwner.runControlChildSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
       catch { return { ok: false, output: "" }; }
     },
   });
@@ -765,23 +813,11 @@ function deliveryGitObjectsForProject(projectId) {
   return createDeliveryGitObjectAdapter({
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
-    run_git: (request) => {
-      try {
-        return {
-          ok: true,
-          output: execFileSync("git", request.args, {
-            cwd: request.cwd,
-            encoding: "utf8",
-            stdio: "pipe",
-            timeout: 5000,
-            maxBuffer: 4 * 1024 * 1024,
-            ...(typeof request.input === "string" ? { input: request.input } : {}),
-          }),
-        };
-      } catch {
-        return { ok: false, output: "" };
-      }
-    },
+    // #1066: the directly tested fixed Git runner (server/delivery-git-runner.js),
+    // awaited one call at a time under the adapter's remaining composition
+    // budget, so the loop keeps serving terminals and sockets while a
+    // candidate composes.
+    run_git: runDeliveryGit,
     read_delivery_source: (request) => deliverySourceForProject(projectId).readStagedSource(request),
   });
 }
@@ -1041,19 +1077,21 @@ app.post("/api/work-task-review/reconcile", (req, res) => {
 // observes the current registered-clone HEAD; composition only records a
 // deterministic local Git-object proof. Neither endpoint publishes a branch,
 // creates a PR, starts CI, or merges.
-app.post("/api/delivery-candidate/prepare", (req, res) => {
+app.post("/api/delivery-candidate/prepare", async (req, res) => {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   try {
-    return res.json({ ok: true, ...deliveryCandidateRuntime.prepare({ token, body: req.body }) });
+    return res.json({ ok: true, ...(await deliveryCandidateRuntime.prepare({ token, body: req.body })) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_prepare_unavailable" });
   }
 });
 
-app.post("/api/delivery-candidate/compose", (req, res) => {
+// #1066: composition is awaited (one Git call at a time under one deadline),
+// so this request no longer holds the loop for its whole Git chain.
+app.post("/api/delivery-candidate/compose", async (req, res) => {
   const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
   try {
-    return res.json({ ok: true, ...deliveryCandidateRuntime.compose({ token, body: req.body }) });
+    return res.json({ ok: true, ...(await deliveryCandidateRuntime.compose({ token, body: req.body })) });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_candidate_compose_unavailable" });
   }
@@ -1947,6 +1985,9 @@ function writeMcpConfigFile(projectId, agentId, mcpHttpPort, token) {
 function headControlMcpEntry(projectId, agentId, serverPort, token) {
   if (agentId !== "head") return null;
   const admission = captureProjectAdmission(projectId);
+  // Legacy installations keep chat MCP without acquiring V2 control authority.
+  // A present malformed identity must still fail the runtime's strict checks.
+  if (!Object.hasOwn(readConfig(), "installation_id")) return null;
   headControlRuntime.registerHeadToken({ project_id: projectId, generation: admission.generation, token });
   const shimPath = path.join(__dirname, "mcp-head-control-shim.js");
   return Object.freeze({
@@ -1999,7 +2040,7 @@ function writeFileChatMcpConfig(projectId, agentId, serverPort) {
 function excludeGrokFromGit(cwd) {
   let out;
   try {
-    out = execFileSync("git", ["rev-parse", "--git-common-dir"], {
+    out = resourceRuntimeOwner.runControlChildSync("git", ["rev-parse", "--git-common-dir"], {
       cwd,
       encoding: "utf-8",
       stdio: "pipe",
@@ -2195,6 +2236,7 @@ async function launchAgentPty(project, agent, opts = {}) {
   const key = `${project}/${agent}`;
 
   try {
+    if (shuttingDown) return shutdownAdmissionFailure();
     const captureAdmission = opts.captureProjectAdmission || captureProjectAdmission;
     const admissionCurrent = opts.isAdmissionCurrent || isAdmissionCurrent;
     const lease = opts.admissionToken || captureAdmission(project);
@@ -2209,18 +2251,25 @@ async function launchAgentPty(project, agent, opts = {}) {
     // Registration and MCP argument construction await remote work. Archive
     // may commit in that gap, so the lease must still be current immediately
     // before creating the process owner.
+    if (shuttingDown) return shutdownAdmissionFailure();
     if (!admissionCurrent(lease)) {
       return { ok: false, code: "project_archived", status: 409, error: "project is archived" };
     }
     const args = built.args;
 
-    const term = (opts.ptySpawn || pty.spawn)(command, args, {
+    const terminalOptions = {
       name: "xterm-256color",
       cols: 120,
       rows: 30,
       cwd,
       env: { ...process.env, ...extraEnv },
-    });
+    };
+    const term = process.platform === "linux" && !_lifecycleTestFixtures.has(key)
+      ? await resourceRuntimeOwner.spawnWorkerPty({ projectId: project, generationId: opts.generationId, command, args, cwd, env: terminalOptions.env, assertLaunchCurrent: () => {
+        if (shuttingDown) throw new ProjectLifecycleError("server_shutting_down", project, "server is shutting down", 503);
+        if (!admissionCurrent(lease)) throw new ProjectLifecycleError("project_archived", project, "project is archived", 409);
+      } })
+      : (opts.ptySpawn || pty.spawn)(command, args, terminalOptions);
 
     const session = {
       projectId: project,
@@ -2261,6 +2310,7 @@ async function launchAgentPty(project, agent, opts = {}) {
     // the buffer accumulates so the next connect gets replay.
     const SCROLLBACK_SIZE = 64 * 1024;
     term.onData((data) => {
+      if (shuttingDown || session._stopping) return;
       session.lastOutputAt = Date.now();
       // The first bytes from THIS PTY are a runtime-ready observation. They
       // prove neither task completion nor semantic agent health, but they do
@@ -2322,6 +2372,7 @@ async function launchAgentPty(project, agent, opts = {}) {
     });
 
     term.onExit(({ exitCode }) => {
+      session._ptyExited = true;
       const current = agentSessions.get(key);
       if (current && current.term === term) {
         markSessionExited(key, current, exitCode);
@@ -2385,7 +2436,20 @@ function recordAgentChatActivity(projectId, agentId) {
 // The single admission path used by routes, restart/recovery, watchdog and
 // startup restoration. Its private launch callback receives server-generated
 // immutable IDs only after the durable reservation succeeds.
-async function spawnAgentPty(project, agent, opts = {}) {
+function shutdownAdmissionFailure() {
+  return { ok: false, code: "server_shutting_down", status: 503, error: "server is shutting down", lifecycle: null };
+}
+
+function spawnAgentPty(project, agent, opts = {}) {
+  if (shuttingDown) return Promise.resolve(shutdownAdmissionFailure());
+  const operation = admitAgentPty(project, agent, opts);
+  pendingAgentLaunches.add(operation);
+  // Observe both outcomes without creating an unhandled rejected finally chain.
+  void operation.then(() => pendingAgentLaunches.delete(operation), () => pendingAgentLaunches.delete(operation));
+  return operation;
+}
+
+async function admitAgentPty(project, agent, opts = {}) {
   // Preserve the project lifecycle barrier before evaluating source authority:
   // an archived/revoked project is never reported as merely an unauthorised
   // operator action, and its existing admission lease is reused below.
@@ -2412,6 +2476,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
     return { ok: false, code: "role_ineligible", status: 404, error: "agent role is not configured", lifecycle: null };
   }
   const testFixture = _lifecycleTestFixtures.get(`${project}/${agent}`) || null;
+  if (process.platform === "linux" && !testFixture) await resourceRuntimeOwner.prepareWorkerLaunch();
   const source = opts.lifecycleSource || "operator_start";
   // #1053: a spawn after a recorded loss (or against an open circuit) is a
   // recovery.  Capture the role worktree's read-only facts BEFORE admission
@@ -2423,6 +2488,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
   const repository = previousLifecycle && (LOSS_LIFECYCLE_STATES.has(previousLifecycle.state) || previousLifecycle.circuit?.open === true)
     ? await recoveryRepositoryFacts(project, agent)
     : null;
+  let shutdownRejected = false;
   const result = await lifecycleGovernor.launch({
     projectId: project,
     role: agent,
@@ -2435,21 +2501,24 @@ async function spawnAgentPty(project, agent, opts = {}) {
     expectedGeneration: opts.expectedGeneration,
     lossCorrelation: opts.lossCorrelation,
     liveSession: isPtyAlive(agentSessions.get(`${project}/${agent}`)?.term),
-    // Only the private in-process fixture registry can set this capability.
-    // HTTP, config, environment, and ordinary internal opts always reach the
-    // real resource owner with containedLaunch:false below.
+    // Source-owned runtime observations and a real non-pressure PTY probe
+    // establish this capability. HTTP/config cannot supply a proof boolean.
     testFixture,
-    // #1038 has no pinned supported PTY scope in this source yet. This
-    // node-pty launch must therefore never satisfy Linux containment by an
-    // option supplied from a route or recovery caller.
-    containedLaunch: testFixture?.containedLaunch === true,
-    launch: ({ operation_id, generation_id }) => launchAgentPty(project, agent, {
-      ...opts,
-      admissionToken: admission,
-      operationId: operation_id,
-      generationId: generation_id,
-    }),
+    containedLaunch: testFixture?.containedLaunch === true || resourceRuntimeOwner.workerLaunchSupported(),
+    launch: async ({ operation_id, generation_id }) => {
+      const launched = await launchAgentPty(project, agent, {
+        ...opts,
+        admissionToken: admission,
+        operationId: operation_id,
+        generationId: generation_id,
+      });
+      shutdownRejected = launched.code === "server_shutting_down";
+      return launched;
+    },
   });
+  // The governor records launch_failed and releases its reservation before
+  // returning the specific server admission failure to the caller.
+  if (shutdownRejected) return { ...shutdownAdmissionFailure(), lifecycle: result.operation || null };
   if (result.status === "spawned") {
     recordAgentSpawnedLifecycle(project, agent, result.operation);
     // A Head reset is observable even if it crashes before it can send a
@@ -2493,11 +2562,11 @@ function markSessionExited(key, session, exitCode) {
   session.state = "stopped";
   session.error = exitCode ? `exit:${exitCode}` : null;
   session.term = null;
-  session.exitedUnexpectedly = true;
+  session.exitedUnexpectedly = !session._stopping && !shuttingDown;
   session.lastExitAt = new Date().toISOString();
   session.exitReason = exitCode == null ? "unknown" : "exit";
   const resourceKilled = hasTrustedResourceKill(session);
-  session.lifecycleState = resourceKilled ? "resource_killed" : "exited";
+  session.lifecycleState = session.exitedUnexpectedly ? (resourceKilled ? "resource_killed" : "exited") : "stopped";
   if (session.operationId && session.generationId) {
     lifecycleGovernor.transition({
       projectId: session.projectId,
@@ -2511,7 +2580,7 @@ function markSessionExited(key, session, exitCode) {
   // Exit observation is monitor-only: it cannot restart, reassign, merge, or
   // enable monitoring. It is ignored unless a persisted enabled Monitor has a
   // current trusted assignment/cycle receipt to bind the event.
-  void observeProjectMonitorExit(session).catch(() => {});
+  if (session.exitedUnexpectedly) void observeProjectMonitorExit(session).catch(() => {});
   for (const v of session.viewers) {
     if (v.readyState <= 1) v.close(1000, `exited:${exitCode == null ? "" : exitCode}`);
   }
@@ -2530,6 +2599,43 @@ function isPtyAlive(term) {
   } catch (err) {
     return err && err.code === "EPERM";
   }
+}
+
+// Keep termination tied to the captured PTY object and its exit observation.
+// Never escalate after that owner exited, even if its numeric PID was reused.
+function stopOwnedPty(session) {
+  const term = session.term;
+  if (!term) return Promise.resolve();
+  const existing = ptyStopOperations.get(term);
+  if (existing) return existing;
+  const operation = (async () => {
+    const pid = term.pid;
+    if (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0)) throw new Error("Invalid owned PTY PID");
+    let exited = session._ptyExited === true;
+    const subscription = typeof term.onExit === "function" ? term.onExit(() => { exited = true; }) : null;
+    const gone = () => exited || (pid !== undefined && !isPtyAlive({ pid }));
+    const signal = (name) => {
+      if (gone()) return;
+      if (session.term !== term || term.pid !== pid) throw new Error("PTY ownership changed during stop");
+      if (term.kill(name) === false) throw new Error("PTY did not accept stop signal");
+    };
+    const waitForExit = async (timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!gone() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+      return gone();
+    };
+    try {
+      signal(); // node-pty uses SIGHUP on Unix; Windows owns its native teardown.
+      if (pid === undefined || await waitForExit(500)) return;
+      signal("SIGKILL");
+      if (!await waitForExit(1000)) throw new Error("PTY remained alive after forced stop");
+    } finally {
+      subscription?.dispose();
+    }
+  })();
+  ptyStopOperations.set(term, operation);
+  void operation.catch(() => { if (ptyStopOperations.get(term) === operation) ptyStopOperations.delete(term); });
+  return operation;
 }
 
 async function stopAgentSession(key, {
@@ -2553,22 +2659,27 @@ async function stopAgentSession(key, {
     emitSystemMessage(session.projectId, `${session.agentId} left`);
   }
   cleanupPtyDispatcher(key);
+  if (session) {
+    session._stopping = true;
+    session.state = "stopping";
+  }
   if (session?.term) {
-    const term = session.term;
+    const stoppedTerm = session.term;
     try {
-      const killed = term.kill();
-      if (killed === false) throw new Error("PTY did not accept stop signal");
-      if (typeof term.pid === "number") {
-        for (let i = 0; i < 20 && isPtyAlive(term); i++) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-        if (isPtyAlive(term)) throw new Error("PTY remained alive after stop");
-      }
+      if (resourceRuntimeOwner.ownsWorkerGeneration(session.generationId)) {
+        const stopped = await resourceRuntimeOwner.stopWorkerGeneration(session.generationId);
+        if (!stopped.ok) throw new Error("Resource scope stop could not be confirmed");
+      } else await stopOwnedPty(session);
+      if (session.term && session.term !== stoppedTerm) throw new Error("PTY ownership changed during stop");
       session.term = null;
       resources.ptys += 1;
     } catch (err) {
       cleanupErrors.push({ resource: "pty", code: "pty_stop_failed", message: err?.message || "PTY stop failed" });
     }
+  }
+  if (session && !session.term && resourceRuntimeOwner.ownsWorkerGeneration(session.generationId)) {
+    try { if (!(await resourceRuntimeOwner.stopWorkerGeneration(session.generationId)).ok) throw new Error("Resource scope cleanup incomplete"); }
+    catch { cleanupErrors.push({ resource: "pty", code: "resource_scope_stop_failed", message: "Resource scope cleanup could not be confirmed" }); }
   }
   if (session) {
     const viewers = session.viewers instanceof Set ? session.viewers : new Set();
@@ -2582,10 +2693,11 @@ async function stopAgentSession(key, {
         cleanupErrors.push({ resource: "viewer", code: "viewer_stop_failed", message: err?.message || "Terminal viewer stop failed" });
       }
     }
-    session.state = "stopped";
-    session.error = null;
+    const ptyFailed = cleanupErrors.some((error) => error.resource === "pty");
+    session.state = ptyFailed ? "error" : "stopped";
+    session.error = ptyFailed ? "PTY stop could not be confirmed" : null;
     session.exitedUnexpectedly = false;
-    session.lifecycleState = "stopped";
+    session.lifecycleState = ptyFailed ? "unknown" : "stopped";
     if (session.operationId && session.generationId) {
       try {
         await lifecycleGovernor.transition({
@@ -2593,7 +2705,7 @@ async function stopAgentSession(key, {
           role: session.agentId,
           operationId: session.operationId,
           generationId: session.generationId,
-          status: "stopped",
+          status: session.lifecycleState,
           health: "unknown",
         });
       } catch {
@@ -2616,7 +2728,7 @@ async function stopAgentSession(key, {
   // deferred (setImmediate) so it never blocks the stop path, and stale-only,
   // so it never touches files a still-live agent on the shared /tmp/claude-{uid}
   // is using. This only reads a session's OWN temp when that session is gone.
-  setImmediate(backendTempSweepTick);
+  if (!shuttingDown) setImmediate(backendTempSweepTick);
   return { ok: cleanupErrors.length === 0, resources, cleanup_errors: cleanupErrors };
 }
 
@@ -2629,6 +2741,7 @@ async function stopAgentSession(key, {
 // teardown-triggered sweep from overlapping the periodic one.
 let _tempSweepRunning = false;
 function backendTempSweepTick() {
+  if (shuttingDown) return;
   if (_tempSweepRunning) return;
   _tempSweepRunning = true;
   try {
@@ -2884,6 +2997,7 @@ async function restartAgentSession(key, {
   clearSelfHeal = false,
   lifecycleSource = "operator_restart",
   operatorAuthorized = false,
+  allowHeadIntake = false,
   explicitRole = false,
   expectedGeneration = null,
   lossCorrelation = null,
@@ -2909,6 +3023,7 @@ async function restartAgentSession(key, {
     admissionToken: admission,
     lifecycleSource,
     operatorAuthorized,
+    allowHeadIntake,
     explicitRole,
     ...(expectedGeneration ? { expectedGeneration } : {}),
     ...(lossCorrelation ? { lossCorrelation } : {}),
@@ -2926,6 +3041,7 @@ app.post("/api/agents/:project/:agent/restart", async (req, res) => {
       clearSelfHeal: true,
       lifecycleSource: "operator_restart",
       operatorAuthorized: true,
+      allowHeadIntake: true,
       explicitRole: true,
       expectedGeneration: typeof req.body?.expected_generation === "string" ? req.body.expected_generation : null,
       lossCorrelation: typeof req.body?.loss_correlation === "string" ? req.body.loss_correlation : null,
@@ -3303,9 +3419,25 @@ function mergeCleanupResult(aggregate, result, fallbackResource) {
   }
 }
 
+// #1070: the one project-scope WorkTask archive transition. It is composed
+// here with server-side identity only: the project id comes from the archive
+// the lifecycle controller is performing, and the installation id is read from
+// live configuration, so no caller can name another project or installation.
+const projectArchiveTransition = createProjectArchiveTransition({
+  config_dir: path.dirname(CONFIG_PATH),
+  fs,
+  resolve_installation_id: () => readConfig()?.installation_id,
+  now: () => new Date(),
+});
+
 async function cleanupProjectRuntime(projectId) {
   const aggregate = { ok: false, resources: {}, cleanup_errors: [] };
 
+  // #1070: the durable WorkTask batch is archived in this same synchronous
+  // turn that follows barrier persistence and admission revocation, before the
+  // first await, so no late build, candidate, review, receipt, or correction
+  // can win after the barrier.
+  mergeCleanupResult(aggregate, projectArchiveTransition.archiveProjectRuntimeState(projectId), "work_task_archive");
   // This synchronous cancellation is deliberately before the first await.
   // It closes both deferred wake and delayed-submit timers in the same turn
   // that follows durable barrier persistence/revocation.
@@ -3873,10 +4005,10 @@ function syncTriggersFromConfig() {
 }
 
 // #516: server-side batch-completion poller. Checks every 30s whether
-// any trigger_auto project's batch is complete, and auto-stops the
-// trigger (plus caffeinate when no triggers remain). This runs
-// independently of the trigger tick interval, so completion is
-// detected within 30s even if the operator is on a different page.
+// any monitor-enabled or bridge-auto project's batch is complete, and
+// clears the monitor's conditions (releasing caffeinate with it). This
+// runs on its own interval, so completion is detected within 30s even
+// if the operator is on a different page.
 // #518: also handles telegram_auto / discord_auto bridge lifecycle
 // (both start and stop) so bridges respond to batch transitions
 // even when the operator is viewing a different project page.
@@ -4126,13 +4258,16 @@ async function watchdogCheck(deps = {}) {
 }
 
 function startWatchdog() {
-  if (_watchdogHandle) return;
+  if (shuttingDown || _watchdogHandle) return;
   _watchdogHandle = setInterval(watchdogCheck, 60_000);
   console.log("[watchdog] stuck-agent watchdog started (60s interval, 10m threshold)");
 }
 
 // #657: extracted startup migrations so full-reset can re-run them
 function runStartupMigrations(cfg) {
+  // V2 instruction writes belong to the receipt-aware reseed owner (#1101).
+  // Legacy slug/design migrations must not bypass that ownership proof.
+  if (Object.hasOwn(cfg, "installation_id")) return;
   const projects = (cfg.projects || []).filter((p) => p?.id && !isProjectArchived(p.id, cfg));
 
   // reseed stale slugs
@@ -4347,6 +4482,7 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
     throw err;
   });
   server.listen(PORT, "127.0.0.1", async () => {
+  if (shuttingDown) return;
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
   const startupCfg = readConfig();
@@ -4396,11 +4532,13 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   // evaluate GitHub/queue state or start a suspended monitor. A pending receipt
   // may be re-delivered only when its fixed Head recipient is already verified.
   for (const p of admittedStartupCfg.projects) {
+    if (shuttingDown) return;
     if (p.chat_mode !== "file" || fileChat._getState(p.id).nextId === null) continue;
     try { await resumePersistedProjectMonitor(p.id); }
     catch (err) { console.error(`[monitor] ${p.id}: trusted delivery recovery deferred: ${err.message}`); }
   }
 
+  if (shuttingDown) return;
   runStartupMigrations(admittedStartupCfg);
 
   // #856: Auto-reseed worktree AGENTS.md when the package version changes.
@@ -4416,6 +4554,7 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   // #992: restore agents for any project mid-batch (see fn comment). Runs
   // AFTER auto-reseed (which defers active-batch projects, so their seeds are
   // untouched) and must never block boot.
+  if (shuttingDown) return;
   try {
     await respawnActiveBatchAgents(admittedStartupCfg);
   } catch (err) {
@@ -4426,13 +4565,50 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   });
 }
 
-// #972: clean shutdown. Ctrl+C previously orphaned the detached caffeinate
-// process (Mac never slept again), left agent
-// PTYs (and their CLI children holding worktree locks) alive, and never cleared
-// the polling/watchdog timers or the bridge/trigger connections. Every step is
-// independently guarded so the function stays idempotent (SIGINT then SIGTERM,
-// or a full-reset re-run, can call it more than once safely).
+// #1077: every caller joins one bounded cleanup. Admission closes in the
+// calling turn, before any cleanup awaits an external owner.
 function shutdown() {
+  if (shutdownPromise) return shutdownPromise;
+  shuttingDown = true;
+  let complete;
+  shutdownPromise = new Promise((resolve) => { complete = resolve; });
+  void cleanupServerRuntime().then(complete, (err) => complete({
+    ok: false,
+    resources: {},
+    cleanup_errors: [{ resource: "server", code: "shutdown_failed", message: err?.message || "Shutdown failed" }],
+  }));
+  return shutdownPromise;
+}
+
+async function cleanupServerRuntime() {
+  const aggregate = { ok: false, resources: {}, cleanup_errors: [] };
+  const pending = [];
+  // All cleanup starts before our first await. A stuck bridge, pending launch
+  // or proxy cannot hold the CLI indefinitely or turn a timeout into success.
+  const collect = (resource, action) => {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ ok: false, resources: {}, cleanup_errors: [
+        { resource, code: "shutdown_timeout", message: "Shutdown cleanup timed out" },
+      ] }), 6000);
+    });
+    let operation;
+    try { operation = Promise.resolve(action()); }
+    catch (err) { operation = Promise.reject(err); }
+    const bounded = Promise.race([operation, timeout]).catch((err) => ({
+      ok: false, resources: {}, cleanup_errors: [
+        { resource, code: "shutdown_failed", message: err?.message || "Shutdown cleanup failed" },
+      ],
+    })).finally(() => clearTimeout(timer));
+    pending.push(bounded.then((result) => ({ resource, result })));
+  };
+  // Synchronously fences resource starts before awaiting pending launch setup;
+  // includes generations that do not yet have an agentSessions entry.
+  collect("resource_scopes", async () => {
+    const result = await resourceRuntimeOwner.shutdown();
+    return { ok: result.ok, resources: { resource_generations: result.owned_generations }, cleanup_errors: result.ok ? [] : [{ resource: "resource_scope", code: "resource_cleanup_incomplete", message: "Resource scope cleanup could not be confirmed" }] };
+  });
+
   // Polling + watchdog timers.
   if (_autoStopHandle) { clearInterval(_autoStopHandle); _autoStopHandle = null; }
   if (_reseedRetryHandle) { clearInterval(_reseedRetryHandle); _reseedRetryHandle = null; }
@@ -4441,8 +4617,21 @@ function shutdown() {
 
   // Project Monitor owns only condition-specific timeout handles. Cancel them
   // synchronously on shutdown; no monitor state is evaluated or rewritten.
-  for (const project of [...monitorKnownProjects]) {
-    try { projectMonitor.shutdown(project); } catch {}
+  const projectIds = new Set(monitorKnownProjects);
+  try { for (const p of readConfig().projects || []) if (p?.id) projectIds.add(p.id); }
+  catch (err) {
+    aggregate.cleanup_errors.push({ resource: "config", code: "shutdown_config_failed", message: err?.message || "Config unavailable" });
+  }
+  for (const key of [...agentSessions.keys(), ...mcpProxies.keys()]) projectIds.add(key.split("/")[0]);
+  for (const project of projectIds) {
+    try {
+      projectMonitor.shutdown(project);
+      cancelPtyDispatchProject(project);
+      selfHeal.clearProject(project);
+    } catch (err) {
+      aggregate.cleanup_errors.push({ resource: "project", code: "shutdown_cancel_failed", message: err?.message || "Project cancellation failed" });
+    }
+    collect("route_background", () => routes.cancelProjectBackground(project));
   }
   monitorKnownProjects.clear();
   monitorModes.clear();
@@ -4450,26 +4639,45 @@ function shutdown() {
   clearProjectMonitorTerminal._fingerprints.clear();
 
   // Message bridges (in-process Discord/Telegram clients).
-  void telegramBridge.stopAll().catch((err) => console.error("[shutdown] Telegram bridge stop failed:", err?.message || err));
-  void discordBridge.stopAll().catch((err) => console.error("[shutdown] Discord bridge stop failed:", err?.message || err));
+  for (const [resource, bridge] of [["telegram_bridge", telegramBridge], ["discord_bridge", discordBridge]]) {
+    collect(resource, async () => {
+      const results = await bridge.stopAll();
+      const merged = { ok: false, resources: {}, cleanup_errors: [] };
+      for (const result of results) mergeCleanupResult(merged, result, resource);
+      merged.ok = merged.cleanup_errors.length === 0;
+      return merged;
+    });
+  }
 
   // caffeinate is spawned detached+unref, so it survives our exit unless killed.
   if (caffeinateProcess.process) {
-    try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
-    clearCaffeinateProcess();
-  }
-
-  // Agent PTYs (and the CLI children they hold).
-  for (const [, session] of agentSessions) {
-    if (session && session.term) { try { session.term.kill(); } catch {} }
-  }
-
-  const cfg = readConfig();
-  for (const p of (cfg.projects || [])) {
-    if (p.chat_mode === "file") {
-      try { fileChat.shutdownProject(p.id); } catch {}
+    try {
+      if (caffeinateProcess.process.kill("SIGTERM") === false) throw new Error("Caffeinate did not accept stop signal");
+      clearCaffeinateProcess();
+    } catch (err) {
+      aggregate.cleanup_errors.push({ resource: "caffeinate", code: "caffeinate_stop_failed", message: err?.message || "Caffeinate stop failed" });
     }
   }
+
+  // The session owner cancels deferred writes, stops its exact PTY, and closes
+  // viewers/proxies. It does not claim control of unverified descendants.
+  for (const key of new Set([...agentSessions.keys(), ...mcpProxies.keys()])) {
+    collect("session", () => stopAgentSession(key, { clearSelfHeal: true, suppressLifecycleMsg: true }));
+  }
+  collect("pending_launches", async () => {
+    await Promise.all([...pendingAgentLaunches]);
+    return { ok: true, resources: {}, cleanup_errors: [] };
+  });
+
+  for (const project of projectIds) {
+    try { fileChat.shutdownProject(project); }
+    catch (err) {
+      aggregate.cleanup_errors.push({ resource: "file_chat", code: "file_chat_stop_failed", message: err?.message || "File chat stop failed" });
+    }
+  }
+  for (const { resource, result } of await Promise.all(pending)) mergeCleanupResult(aggregate, result, resource);
+  aggregate.ok = aggregate.cleanup_errors.length === 0;
+  return aggregate;
 }
 
 module.exports = {

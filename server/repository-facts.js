@@ -9,13 +9,26 @@
 // control the worktree's config and `status` would otherwise execute a
 // repository-configured fsmonitor hook.  Nothing here checks out, resets,
 // cleans, stashes, restores, commits, fetches, or follows a caller-selected
-// path: the only input is the configured role cwd.  A capture failure is a
-// recorded `available: false` fact, never an exception, so it can never block
-// or crash a legitimate recovery.  Each query runs off the event loop under
-// its own timeout; a capture is at most six queries, so its worst-case wall
-// time is 6 x GIT_TIMEOUT_MS (30 s) while the API process stays responsive.
+// path: the only input is the configured role cwd.  #1072: "read-only" is a
+// claim about repository state, not about execution.  `status` still runs the
+// `filter.<driver>.clean` command a tracked `.gitattributes` selects, whenever
+// its stat cache leaves a tracked file possibly-changed and the content must
+// be re-read to answer; that command is operator-owned code executing under
+// the same user and trust boundary as the server.  The residual is documented
+// and pinned rather than suppressed, because unlike fsmonitor it cannot be
+// switched off: doing so would mean hiding `.gitattributes` /
+// `.git/info/attributes` from git, which would make `status` report something
+// untrue, the one thing a facts capture must never do.  A worktree whose
+// attributes and config the operator does not trust is therefore outside this
+// module's boundary, not made safe by it; `repository-facts.test.js` pins both
+// halves: the fsmonitor hook never runs, the clean filter does.  A capture
+// failure is a recorded `available: false` fact, never an exception, so it can
+// never block or crash a legitimate recovery.  Each query runs off the event
+// loop under its own timeout; a capture is at most six queries, so its
+// worst-case wall time is 6 x GIT_TIMEOUT_MS (30 s) while the API process
+// stays responsive.
 
-const { execFile } = require("node:child_process");
+const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -36,14 +49,10 @@ function gitEnvironment(env) {
 }
 
 function git(cwd, env, args) {
-  return new Promise((resolve) => {
-    execFile("git", [...GIT_GLOBAL_ARGS, ...args], {
-      cwd, env, encoding: "utf8", timeout: GIT_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES,
-    }, (error, output) => {
-      if (error) resolve({ ok: false, code: error.code === "ENOENT" ? "git_unavailable" : "git_failed" });
-      else resolve({ ok: true, output: output.replace(/\n$/, "") });
-    });
-  });
+  return getSharedResourceRuntimeOwner().runControlChild("git", [...GIT_GLOBAL_ARGS, ...args], {
+    cwd, env, encoding: "utf8", timeout: GIT_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES,
+  }).then(({ stdout }) => ({ ok: true, output: stdout.replace(/\n$/, "") }),
+    (error) => ({ ok: false, code: error.code === "ENOENT" ? "git_unavailable" : "git_failed" }));
 }
 
 function unavailable(cwd, reason, capturedAt) {

@@ -55,6 +55,7 @@ interface EnvironmentDraft {
 type CiPolicyMode = "" | "github-checks" | "ci-less";
 
 interface CiPolicyDraft {
+  configuredPolicy?: Record<string, unknown>;
   mode: CiPolicyMode;
   requiredChecks: string;
   advisoryChecks: string;
@@ -104,13 +105,13 @@ function listFromInput(value: string) {
 
 function blankPolicy(): CiPolicyDraft {
   return {
-    mode: "",
+    mode: "ci-less",
     requiredChecks: "",
     advisoryChecks: "",
     checkKind: "product",
     registrationGraceSeconds: "300",
     sameShaRetryBudget: "0",
-    evidenceKeys: "",
+    evidenceKeys: "unit, typecheck, build",
   };
 }
 
@@ -131,6 +132,7 @@ function policyDraftFromRepository(repository: V2Repository): CiPolicyDraft {
     return {
       ...blankPolicy(),
       mode: "github-checks",
+      configuredPolicy: policy,
       requiredChecks: checks.filter((check) => check.required).map((check) => check.name).join(", "),
       advisoryChecks: checks.filter((check) => !check.required).map((check) => check.name).join(", "),
       checkKind: checks[0]?.kind || "product",
@@ -138,7 +140,7 @@ function policyDraftFromRepository(repository: V2Repository): CiPolicyDraft {
       sameShaRetryBudget: String(policy.same_sha_retry_budget ?? 0),
     };
   }
-  return blankPolicy();
+  return { ...blankPolicy(), mode: "", evidenceKeys: "" };
 }
 
 function repositoryDraftFromConfig(repositories: V2Repository[] | undefined): V2RepositoryDraft[] {
@@ -174,6 +176,11 @@ function environmentFieldId(projectId: string, field?: string): string {
 }
 
 function policyFromDraft(draft: CiPolicyDraft): Record<string, unknown> | undefined {
+  if (draft.configuredPolicy) {
+    const original = policyDraftFromRepository({ ci_policy: draft.configuredPolicy } as V2Repository);
+    const fields: (keyof CiPolicyDraft)[] = ["mode", "requiredChecks", "advisoryChecks", "checkKind", "registrationGraceSeconds", "sameShaRetryBudget", "evidenceKeys"];
+    if (fields.every((key) => draft[key] === original[key])) return draft.configuredPolicy;
+  }
   if (draft.mode === "ci-less") {
     const evidenceKeys = listFromInput(draft.evidenceKeys);
     return evidenceKeys.length > 0 ? { version: 1, mode: "ci-less", evidence_keys: evidenceKeys } : undefined;
@@ -220,8 +227,8 @@ function v2Message(result: V2SetupResult): string {
   const labels: Record<string, string> = {
     legacy_scalar: "Replace the legacy repository record through this V2 setup flow.",
     repositories_required: "Add at least one repository.",
-    missing_policy: "Choose and complete a CI evidence policy for every repository.",
-    invalid_ci_policy: "Complete the selected CI evidence policy with valid values.",
+    missing_policy: "Choose and complete a Verification policy for every repository.",
+    invalid_ci_policy: "Complete the selected Verification policy with valid values.",
     invalid_primary_repository_count: "Select exactly one primary repository.",
     repository_push_access_required: "GitHub write, maintain, or admin access is required.",
     repository_identity_mismatch: "GitHub returned a different canonical repository identity.",
@@ -1501,11 +1508,11 @@ export default function SettingsPage() {
                             </label>
                           </div>
                           <div className="border-t border-border mt-3 pt-3">
-                            <label className="text-[10px] text-text-muted block mb-1" htmlFor={`policy-mode-${project.id}-${repositoryIndex}`}>CI evidence policy</label>
+                            <label className="text-[10px] text-text-muted block mb-1" htmlFor={`policy-mode-${project.id}-${repositoryIndex}`}>Verification policy</label>
                             <select id={`policy-mode-${project.id}-${repositoryIndex}`} value={repository.policy.mode} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { mode: e.target.value as CiPolicyMode })} className="w-full md:w-72 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent">
                               <option value="" className="bg-bg-surface">Choose evidence policy…</option>
-                              <option value="github-checks" className="bg-bg-surface">GitHub exact check registry</option>
-                              <option value="ci-less" className="bg-bg-surface">CI-less Dev evidence receipt</option>
+                              <option value="github-checks" className="bg-bg-surface">External GitHub checks</option>
+                              <option value="ci-less" className="bg-bg-surface">Local verification</option>
                             </select>
                             {repository.policy.mode === "github-checks" && (
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
@@ -1533,10 +1540,10 @@ export default function SettingsPage() {
                             )}
                             {repository.policy.mode === "ci-less" && (
                               <div className="mt-2 max-w-md">
-                                <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`evidence-keys-${project.id}-${repositoryIndex}`}>Required Dev evidence keys
+                                <label className="text-[10px] text-text-muted flex flex-col gap-1" htmlFor={`evidence-keys-${project.id}-${repositoryIndex}`}>Required local evidence keys
                                   <input id={`evidence-keys-${project.id}-${repositoryIndex}`} value={repository.policy.evidenceKeys} onChange={(e) => updateV2Policy(project.id, repositoryIndex, { evidenceKeys: e.target.value })} placeholder="unit, typecheck" className="min-w-0 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
                                 </label>
-                                <p className="mt-1 text-[10px] text-text-muted">Comma-separated data identifiers; evidence is not a command.</p>
+                                <p className="mt-1 text-[10px] text-text-muted">Dev runs your repository checks locally and submits results for these labels. QuadWork does not run the labels as commands.</p>
                               </div>
                             )}
                           </div>
@@ -1678,7 +1685,7 @@ export default function SettingsPage() {
                           {t.oneCliInstalled}
                         </span>
                         <code className="text-accent ml-2">
-                          {cliStatus.claude ? "npm install -g codex" : "npm install -g @anthropic-ai/claude-code"}
+                          {cliStatus.claude ? "npm install -g @openai/codex" : "npm install -g @anthropic-ai/claude-code"}
                         </code>
                       </div>
                     )}

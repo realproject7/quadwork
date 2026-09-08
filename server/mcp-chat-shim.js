@@ -72,7 +72,7 @@ const ISSUE_CONTRACT_REVISION_TOOL = {
 
 const SUBMIT_CI_EVIDENCE_TOOL = {
   name: "submit_ci_evidence",
-  description: "Submit bounded CI-less evidence for the authenticated Dev role's current assignment. Evidence labels are data only; this operation never executes commands.",
+  description: "Submit bounded local verification evidence for the authenticated Dev role's current assignment. Evidence labels are data only; this operation never executes commands.",
   inputSchema: {
     type: "object",
     properties: {
@@ -93,6 +93,12 @@ const SUBMIT_CI_EVIDENCE_TOOL = {
       pr_number: { type: "integer", minimum: 1 },
       exact_sha: { type: "string" },
       policy_version: { type: "integer", minimum: 1 },
+      base_sha: { type: "string", pattern: "^[a-f0-9]{40}$" },
+      policy_digest: { type: "string", pattern: "^[a-f0-9]{64}$" },
+      verification: {
+        type: "object", properties: { environment: { type: "string", minLength: 1, maxLength: 512 }, scope: { type: "string", minLength: 1, maxLength: 512 } },
+        required: ["environment", "scope"], additionalProperties: false,
+      },
       results: {
         type: "array",
         items: {
@@ -108,7 +114,7 @@ const SUBMIT_CI_EVIDENCE_TOOL = {
         },
       },
     },
-    required: ["assignment_attempt", "contract_revision", "repo_key", "item", "pr_number", "exact_sha", "policy_version", "results"],
+    required: ["assignment_attempt", "contract_revision", "repo_key", "item", "pr_number", "exact_sha", "policy_version", "base_sha", "policy_digest", "verification", "results"],
     additionalProperties: false,
   },
   annotations: {
@@ -121,14 +127,21 @@ const SUBMIT_CI_EVIDENCE_TOOL = {
 
 const SUBMIT_DELIVERY_CANDIDATE_CI_EVIDENCE_TOOL = {
   name: "submit_delivery_candidate_ci_evidence",
-  description: "Submit bounded CI-less evidence for the authenticated Dev role's already-published Delivery Candidate PR. The server rechecks the composed candidate and exact PR SHA; this operation never executes commands.",
+  description: "Submit bounded local verification evidence for the authenticated Dev role's already-published Delivery Candidate PR. The server rechecks the composed candidate and exact PR SHA; this operation never executes commands.",
   inputSchema: {
     type: "object",
     properties: {
       delivery_candidate_ref: { type: "object" },
+      delivery_manifest_digest: { type: "string", pattern: "^[a-f0-9]{64}$" },
       pr_number: { type: "integer", minimum: 1 },
       exact_sha: { type: "string" },
       policy_version: { type: "integer", minimum: 1 },
+      base_sha: { type: "string", pattern: "^[a-f0-9]{40}$" },
+      policy_digest: { type: "string", pattern: "^[a-f0-9]{64}$" },
+      verification: {
+        type: "object", properties: { environment: { type: "string", minLength: 1, maxLength: 512 }, scope: { type: "string", minLength: 1, maxLength: 512 } },
+        required: ["environment", "scope"], additionalProperties: false,
+      },
       results: {
         type: "array",
         items: {
@@ -144,7 +157,7 @@ const SUBMIT_DELIVERY_CANDIDATE_CI_EVIDENCE_TOOL = {
         },
       },
     },
-    required: ["delivery_candidate_ref", "pr_number", "exact_sha", "policy_version", "results"],
+    required: ["delivery_candidate_ref", "delivery_manifest_digest", "pr_number", "exact_sha", "policy_version", "base_sha", "policy_digest", "verification", "results"],
     additionalProperties: false,
   },
   annotations: {

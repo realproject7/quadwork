@@ -1,4 +1,5 @@
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture({ preserveRuntimeOwner: true });
 
 // Route-level coverage for POST /api/work-task-candidate.  The endpoint is
 // driven over HTTP against the composed server app with a real Git base clone

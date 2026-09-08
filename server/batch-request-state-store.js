@@ -6,9 +6,15 @@
 // explicit initialization, a read-only recovery snapshot, and one atomic CAS
 // application of a watcher reconciliation result.
 
-const crypto = require("node:crypto");
 const nodeFs = require("node:fs");
 const path = require("node:path");
+const {
+  FILE_MODE,
+  DIRECTORY_MODE,
+  modeOf,
+  sameFile,
+  createDurableStoreFiles,
+} = require("./durable-store-files");
 const {
   VERSION: SUBSCRIPTION_VERSION,
   BatchRequestSubscriptionError,
@@ -25,14 +31,25 @@ const {
 } = require("./batch-request-contract");
 
 const SCHEMA_VERSION = 1;
-const FILE_MODE = 0o600;
-const DIRECTORY_MODE = 0o700;
 const INSTALLATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REPOSITORY_RE = /^[a-z0-9][a-z0-9._-]{0,99}\/[a-z0-9][a-z0-9._-]{0,99}$/;
 const ISSUE_NUMBER_RE = /^[1-9]\d{0,6}$/;
 const SHA_RE = /^[a-f0-9]{64}$/;
 const DIAGNOSTIC_RE = /^[a-z][a-z0-9_]{2,127}$/;
+const FILE_CODES = Object.freeze({
+  options: "invalid_batch_request_state_store_options",
+  unreadable: "batch_request_state_store_unreadable",
+  symlink_rejected: "batch_request_state_store_symlink_rejected",
+  insecure_permissions: "batch_request_state_store_insecure_permissions",
+  write_failed: "batch_request_state_store_write_failed",
+  locked: "batch_request_state_store_locked",
+  lock_unsafe: "batch_request_state_store_lock_failed",
+  lock_failed: "batch_request_state_store_lock_failed",
+  lock_acquire_changed: "batch_request_state_store_lock_failed",
+  lock_release_changed: "batch_request_state_store_lock_release_failed",
+  lock_release_failed: "batch_request_state_store_lock_release_failed",
+});
 
 class BatchRequestStateStoreError extends Error {
   constructor(code, message = code) {
@@ -95,12 +112,6 @@ function canonicalSubscriptionState(value, code) {
     throw error;
   }
 }
-function assertFs(fs) {
-  for (const name of ["mkdirSync", "lstatSync", "fstatSync", "readFileSync", "writeFileSync", "renameSync", "chmodSync", "openSync", "closeSync", "fsyncSync", "unlinkSync"]) {
-    if (typeof fs[name] !== "function") fail("invalid_batch_request_state_store_options", `fs.${name} is required`);
-  }
-  return fs;
-}
 function storageDirectory(configDir) {
   if (typeof configDir !== "string" || !path.isAbsolute(configDir) || configDir.length > 1024 || /[\u0000\r\n]/.test(configDir)) {
     fail("invalid_batch_request_state_store_options", "config_dir must be a bounded absolute path");
@@ -110,50 +121,6 @@ function storageDirectory(configDir) {
 function batchRequestStateStorePath(configDir, owner) {
   const normalized = identity(owner, "invalid_batch_request_state_store_identity");
   return path.join(storageDirectory(configDir), `${normalized.installation_id}--${normalized.project_id}.json`);
-}
-function lockPathFor(statePath) { return `${statePath}.lock`; }
-function temporaryPathFor(statePath) {
-  return `${statePath}.${process.pid}.${crypto.randomBytes(12).toString("hex")}.tmp`;
-}
-// The lock file body is this writer's proof of ownership. dev+ino alone cannot
-// prove it: Linux reuses an inode number as soon as the old lock is unlinked
-// and closed, so a replacement lock can carry the original's identity.
-function lockToken() { return `${process.pid}.${crypto.randomBytes(16).toString("hex")}`; }
-function modeOf(stats) { return stats.mode & 0o777; }
-function lstatOrNull(fs, target) {
-  try { return fs.lstatSync(target); }
-  catch (error) {
-    if (error && error.code === "ENOENT") return null;
-    fail("batch_request_state_store_unreadable", "state store path cannot be inspected");
-  }
-}
-function sameFile(left, right) {
-  return left && right && Number.isSafeInteger(left.dev) && Number.isSafeInteger(left.ino) &&
-    left.dev === right.dev && left.ino === right.ino;
-}
-function assertRealDirectory(fs, target, expectedMode) {
-  const stats = lstatOrNull(fs, target);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink()) fail("batch_request_state_store_symlink_rejected", "state store paths cannot be symbolic links");
-  if (!stats.isDirectory()) fail("batch_request_state_store_unreadable", "state store path is not a directory");
-  if (expectedMode !== undefined && modeOf(stats) !== expectedMode) {
-    fail("batch_request_state_store_insecure_permissions", "state store directory must be mode 0700");
-  }
-  return stats;
-}
-function ensureDirectory(fs, root, directory) {
-  if (assertRealDirectory(fs, root) === null) {
-    fs.mkdirSync(root, { recursive: true, mode: DIRECTORY_MODE });
-    if (assertRealDirectory(fs, root) === null) fail("batch_request_state_store_unreadable", "config root cannot be created");
-  }
-  if (assertRealDirectory(fs, directory, DIRECTORY_MODE) === null) {
-    fs.mkdirSync(directory, { recursive: false, mode: DIRECTORY_MODE });
-    if (assertRealDirectory(fs, directory, DIRECTORY_MODE) === null) fail("batch_request_state_store_unreadable", "state store directory cannot be created");
-  }
-}
-function storageExists(fs, root, directory) {
-  if (assertRealDirectory(fs, root) === null) return false;
-  return assertRealDirectory(fs, directory, DIRECTORY_MODE) !== null;
 }
 
 function assertStoredState(value) {
@@ -232,92 +199,8 @@ function decodeState(fs, statePath, owner, allowMissing) {
     subscription_state: canonicalSubscriptionState(value.subscription_state, "invalid_batch_request_state_store_state"),
   };
 }
-function writeStateAtomically(fs, statePath, state) {
-  const directory = path.dirname(statePath);
-  const temporaryPath = temporaryPathFor(statePath);
-  let temporaryWritten = false;
-  try {
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
-    temporaryWritten = true;
-    fs.chmodSync(temporaryPath, FILE_MODE);
-    const fileDescriptor = fs.openSync(temporaryPath, "r");
-    try { fs.fsyncSync(fileDescriptor); } finally { fs.closeSync(fileDescriptor); }
-    fs.renameSync(temporaryPath, statePath);
-    temporaryWritten = false;
-    const directoryDescriptor = fs.openSync(directory, "r");
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
-  } catch (error) {
-    if (temporaryWritten) {
-      try { fs.unlinkSync(temporaryPath); } catch { /* temp cleanup only */ }
-    }
-    if (error instanceof BatchRequestStateStoreError) throw error;
-    fail("batch_request_state_store_write_failed", "atomic state store write failed");
-  }
-}
-function lockStat(fs, lockPath) {
-  const stats = lstatOrNull(fs, lockPath);
-  if (stats === null) return null;
-  if (stats.isSymbolicLink() || !stats.isFile() || modeOf(stats) !== FILE_MODE) {
-    fail("batch_request_state_store_lock_failed", "state store writer lock is unsafe");
-  }
-  return stats;
-}
-function acquireLock(fs, statePath) {
-  const lockPath = lockPathFor(statePath);
-  const token = lockToken();
-  let descriptor;
-  let ownStat = null;
-  try { descriptor = fs.openSync(lockPath, "wx", FILE_MODE); }
-  catch (error) {
-    if (error && error.code === "EEXIST") {
-      lockStat(fs, lockPath);
-      fail("batch_request_state_store_locked", "state store has an active or stale writer lock");
-    }
-    fail("batch_request_state_store_lock_failed", "state store lock cannot be acquired");
-  }
-  try {
-    fs.writeFileSync(descriptor, token, "utf8");
-    fs.chmodSync(lockPath, FILE_MODE);
-    fs.fsyncSync(descriptor);
-    ownStat = fs.fstatSync(descriptor);
-    if (!sameFile(ownStat, lockStat(fs, lockPath))) {
-      fail("batch_request_state_store_lock_failed", "state store lock changed during acquisition");
-    }
-  } catch (error) {
-    try { fs.closeSync(descriptor); } catch { /* fail closed */ }
-    try {
-      if (sameFile(ownStat, lockStat(fs, lockPath)) && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-    } catch { /* replacement remains fail closed */ }
-    if (error instanceof BatchRequestStateStoreError) throw error;
-    fail("batch_request_state_store_lock_failed", "state store lock cannot be initialized");
-  }
-  return { descriptor, lockPath, stat: ownStat, token };
-}
-function releaseLock(fs, lock) {
-  let closeError = null;
-  try { fs.closeSync(lock.descriptor); } catch (error) { closeError = error; }
-  try {
-    if (!sameFile(lock.stat, lockStat(fs, lock.lockPath)) || fs.readFileSync(lock.lockPath, "utf8") !== lock.token) {
-      fail("batch_request_state_store_lock_release_failed", "state store lock changed before release");
-    }
-    fs.unlinkSync(lock.lockPath);
-  } catch (error) {
-    if (error instanceof BatchRequestStateStoreError) throw error;
-    fail("batch_request_state_store_lock_release_failed", "state store writer lock could not be released");
-  }
-  if (closeError) fail("batch_request_state_store_lock_release_failed", "state store writer lock could not be closed");
-}
-function withWriterLock(fs, statePath, action) {
-  const lock = acquireLock(fs, statePath);
-  let result;
-  let actionError;
-  try { result = action(); } catch (error) { actionError = error; }
-  try { releaseLock(fs, lock); } catch (releaseError) {
-    if (actionError) throw actionError;
-    throw releaseError;
-  }
-  if (actionError) throw actionError;
-  return result;
+function writeStateAtomically(files, statePath, state) {
+  files.writeFileAtomically(statePath, `${JSON.stringify(state)}\n`);
 }
 
 function canonicalIssueUrl(value, repository, number, code) {
@@ -404,8 +287,10 @@ function assertApplication(input) {
 
 function createBatchRequestStateStore(options) {
   exact(options, ["config_dir", "fs"], "invalid_batch_request_state_store_options");
-  const fs = assertFs(options.fs || nodeFs);
+  const files = createDurableStoreFiles({ fs: options.fs || nodeFs, error: BatchRequestStateStoreError, codes: FILE_CODES });
+  const fs = files.fs;
   const directory = storageDirectory(options.config_dir);
+  const directories = [{ path: options.config_dir }, { path: directory, mode: DIRECTORY_MODE }];
 
   function statePath(owner) {
     return batchRequestStateStorePath(options.config_dir, {
@@ -415,7 +300,7 @@ function createBatchRequestStateStore(options) {
   }
   function readRecoverySnapshot(owner) {
     const normalized = identity(owner, "invalid_batch_request_state_store_identity");
-    if (!storageExists(fs, options.config_dir, directory)) {
+    if (!files.storageExists(directories)) {
       fail("batch_request_state_store_missing", "state store is not initialized");
     }
     return recoverySnapshot(decodeState(fs, statePath(normalized), normalized, false));
@@ -423,8 +308,8 @@ function createBatchRequestStateStore(options) {
   function initialize(input) {
     const initial = assertInitialization(input);
     const target = statePath(initial.precondition);
-    ensureDirectory(fs, options.config_dir, directory);
-    return withWriterLock(fs, target, () => {
+    files.ensureDirectories(directories);
+    return files.withWriterLock(target, () => {
       const existing = decodeState(fs, target, initial.precondition, true);
       if (existing !== null) fail("batch_request_state_store_already_initialized", "state store already exists");
       const state = {
@@ -434,17 +319,17 @@ function createBatchRequestStateStore(options) {
         subscription_state: clone(initial.subscription_state),
       };
       assertStoredState(state);
-      writeStateAtomically(fs, target, state);
+      writeStateAtomically(files, target, state);
       return recoverySnapshot(state);
     });
   }
   function applyWatcherResult(input) {
     const application = assertApplication(input);
     const target = statePath(application.precondition);
-    if (!storageExists(fs, options.config_dir, directory)) {
+    if (!files.storageExists(directories)) {
       fail("batch_request_state_store_missing", "state store is not initialized");
     }
-    return withWriterLock(fs, target, () => {
+    return files.withWriterLock(target, () => {
       const current = decodeState(fs, target, application.precondition, false);
       if (current.revision !== application.precondition.revision) {
         fail("stale_batch_request_state_store_revision", "state store changed before reconciliation result application");
@@ -461,7 +346,7 @@ function createBatchRequestStateStore(options) {
         subscription_state: clone(admitted.next_state),
       };
       assertStoredState(next);
-      writeStateAtomically(fs, target, next);
+      writeStateAtomically(files, target, next);
       // The only time a Head plan leaves this module is after its exact
       // backing delivery record and revision are safely committed.  A caller
       // that loses this receipt must reread/reconcile; a stale CAS never

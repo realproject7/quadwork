@@ -1,4 +1,5 @@
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture({ preserveRuntimeOwner: true });
 
 // #1023: grok is the fourth agent backend. buildAgentArgs must produce exactly
 // `--always-approve`, an optional `--model <slug>`, and `--trust` — and, because

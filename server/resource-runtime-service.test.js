@@ -292,12 +292,12 @@ function createHarness({
 }
 
 // A supported-looking controller cannot mint ready authority while the source
-// has no pinned proof receipt. Caller-provided lookalikes remain non-authority.
+// has no source-observed platform authority. Caller lookalikes remain non-authority.
 {
   const worker = identity("quadwork", "generation-proof");
   const { service } = createHarness({ workers: [worker], protocolStatus: "supported", proofAuthority: {} });
   const snapshot = service.snapshot();
-  assert.equal(snapshot.status, "candidate_pending_staging");
+  assert.equal(snapshot.status, "containment_unavailable");
   assert.equal(snapshot.pressure.reason, "proof_authority_unavailable");
 }
 

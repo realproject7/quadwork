@@ -7,6 +7,7 @@ const {
   sameCiPolicyIdentity,
   normalizeGithubCheckEvidence,
   evaluateCiEvidence,
+  ciEvidenceRecordDigest,
 } = require("./ci-evidence-policy");
 
 let passed = 0;
@@ -131,10 +132,26 @@ assert.deepEqual(normalized.check_runs[0], {
 ok(true, "check normalization preserves exact ID, attempt, name, conclusion, URL, SHA, and observation time");
 
 const ciLess = { version: 1, mode: "ci-less", evidence_keys: ["unit", "typecheck"] };
-assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok" }).state, "ci_less_pending");
-assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok", ci_less_evidence: { policy_version: 1, exact_sha: SHA, results: [{ key: "unit", outcome: "pass" }, { key: "typecheck", outcome: "pass" }] } }).state, "ci_less_pass");
-assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok", ci_less_evidence: { policy_version: 1, exact_sha: SHA, results: [{ key: "unit", outcome: "fail" }, { key: "typecheck", outcome: "pass" }] } }).state, "product_failure");
-ok(true, "CI-less evidence is pending, pass, or product failure only for the exact configured key set and SHA");
+const BASE = "b".repeat(40);
+function localRecord(outcome = "pass", exitCode = outcome === "pass" ? 0 : 1) {
+  const identity = { version: 2, project_id: "fixture", installation_id: "installation_fixture_01", repo_key: "web", repo: "Owner/Web", item: { repo_key: "web", repo: "Owner/Web", number: 1, kind: "issue" }, assignment_attempt: "attempt_1", contract_revision: "c".repeat(64), pr_number: 1,
+    policy_version: 1, policy_digest: deriveCiPolicyIdentity(ciLess).policy_digest, exact_sha: SHA, base_sha: BASE };
+  const results = [{ key: "unit", outcome, exit_code: exitCode, evidence_ref: "unit:log" }, { key: "typecheck", outcome: "pass", exit_code: 0, evidence_ref: "typecheck:log" }];
+  const verification = { environment: "Node 24 Linux", scope: "unit and typecheck commands" };
+  const record_digest = ciEvidenceRecordDigest({ identity, results, verification });
+  return { identity, identity_hash: ciEvidenceRecordDigest(identity), results, verification, record_digest, record_id: `ce_${record_digest.slice(0,32)}`, observed_at: AT };
+}
+function localEvaluate(record, extra = {}) {
+  return evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, base_sha: BASE, observed_at: AT, source_status: "ok", ci_less_evidence: record, ...extra });
+}
+assert.equal(localEvaluate(null).state, "ci_less_pending");
+assert.equal(localEvaluate(localRecord()).state, "ci_less_pass");
+assert.equal(localEvaluate(localRecord("fail")).state, "product_failure");
+assert.equal(localEvaluate(localRecord("pass", 7)).state, "unknown", "even a rehashed persisted pass/nonzero record is invalid");
+assert.equal(localEvaluate(localRecord(), { base_sha: "9".repeat(40) }).state, "unknown");
+assert.equal(localEvaluate(localRecord(), { policy: { ...ciLess, evidence_keys: ["unit"] } }).state, "unknown");
+assert.equal(localEvaluate({ policy_version: 1, exact_sha: SHA, results: [{ key: "unit", outcome: "pass" }] }).state, "unknown");
+ok(true, "local evidence binds base/policy/declared scope and rejects legacy or contradictory records");
 
 // A policy identity is semantic rather than object-order based. Reusing a
 // receipt/evaluation identity after even a same-version policy edit is an
@@ -174,19 +191,9 @@ assert.equal(exhausted.retry.retry_eligible, false);
 assert.equal(exhausted.retry.retry_remaining, 0);
 ok(true, "same-SHA retry eligibility is bounded, explicit, and never automatic");
 
-const fullCiLessRecord = {
-  record_id: "ce_0123456789abcdef0123456789abcdef",
-  record_digest: "a".repeat(64),
-  identity_hash: "b".repeat(64),
-  identity: { policy_version: 1, exact_sha: SHA },
-  observed_at: AT,
-  results: [
-    { key: "unit", outcome: "pass", exit_code: 0, evidence_ref: "unit:sha256:abc" },
-    { key: "typecheck", outcome: "pass", exit_code: 0, evidence_ref: "typecheck:sha256:def" },
-  ],
-};
-assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok", ci_less_evidence: fullCiLessRecord }).state, "ci_less_pass");
-assert.equal(evaluateCiEvidence({ policy: ciLess, exact_sha: SHA, observed_at: AT, source_status: "ok", ci_less_evidence: { ...fullCiLessRecord, results: [{ key: "unit", outcome: "pass" }] } }).invalidation.code, "invalid_ci_less_evidence");
-ok(true, "CI-less evidence accepts only one exact current key/SHA record and rejects incomplete or malformed receipts");
+const fullCiLessRecord = localRecord();
+assert.equal(localEvaluate(fullCiLessRecord).state, "ci_less_pass");
+assert.equal(localEvaluate({ ...fullCiLessRecord, results: [{ key: "unit", outcome: "pass" }] }).invalidation.code, "invalid_ci_less_evidence");
+ok(true, "CI-less evidence accepts only one complete current receipt and rejects malformed persisted evidence");
 
 console.log(`\n${passed} ci-evidence policy assertions passed`);

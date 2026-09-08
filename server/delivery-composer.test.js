@@ -43,8 +43,14 @@ function digest(value) { return crypto.createHash("sha256").update(stable(value)
 function throwsCode(fn, expected) {
   assert.throws(fn, (error) => error instanceof DeliveryComposerError && error.code === expected);
 }
+// #1066: composition is awaited; a refusal is the same typed code, rejected.
+function rejectsCode(fn, expected) {
+  return assert.rejects(fn, (error) => error instanceof DeliveryComposerError && error.code === expected);
+}
 function entry(pathName, blob_sha, mode = "100644") { return { path: pathName, mode, blob_sha }; }
-function tree(tree_sha, entries) { return { tree_sha, entries: entries.map(copy).sort((left, right) => left.path.localeCompare(right.path)) }; }
+// Observed trees arrive in Git's byte order, which the composer itself checks
+// (code-unit sort is byte order for the ASCII-only paths it accepts).
+function tree(tree_sha, entries) { return { tree_sha, entries: entries.map(copy).sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0) }; }
 function entryMap(value) { return new Map(value.entries.map((item) => [item.path, item])); }
 function sameEntry(left, right) { return left === null ? right === null : right !== null && stable(left) === stable(right); }
 function diff(base, result) {
@@ -129,11 +135,11 @@ function frozenBatch(tasks) {
     },
   }), "2026-09-01T12:00:00.000Z");
 }
-function candidate(ref, candidate_sha, worktree_id) {
+function candidate(ref, candidate_sha, worktree_id, base = base_sha) {
   return buildWorkTaskCandidate({
     version: VERSION,
     work_task_ref: copy(ref),
-    base_sha,
+    base_sha: base,
     candidate_sha,
     branch: "task/" + worktree_id,
     worktree: { repository_key: "web", worktree_id, path: "/var/folders/quadwork/" + worktree_id },
@@ -150,7 +156,7 @@ function candidate(ref, candidate_sha, worktree_id) {
         worktree_id,
         canonical_path: "/private/var/folders/quadwork/" + worktree_id,
         branch: "task/" + worktree_id,
-        base_sha,
+        base_sha: base,
         head_sha: candidate_sha,
         dirty: false,
         occupancy: "vacant",
@@ -183,39 +189,51 @@ function releasedRound(workCandidate, suffix) {
     version: VERSION, reviewer_role: "re2", reviewer_generation: 22, received_at: "2026-09-01T12:03:00.000Z",
   }).round;
 }
-function buildFixture({ dependent = false, actualOverlap = false } = {}) {
+// `chain` is the shape the pipeline actually stages (#1065): bravo depends on
+// alpha, is built from alpha's exact candidate SHA, and by default declares a
+// boundary that overlaps alpha's and rewrites alpha's file on top of alpha's
+// change.  The older `dependent` flag keeps bravo on the repository root base,
+// a state the pipeline can never produce.
+function buildFixture({ dependent = false, actualOverlap = false, chain = false, overlap = true, undeclaredPath = false, root = false } = {}) {
+  // `root` adds a lowercase root directory beside `README.md`: Git orders
+  // `README.md` first (byte order), a locale order puts `bin` first.
+  const rootEntries = root ? [entry("bin/cli.js", "2".repeat(64))] : [];
   const batch = frozenBatch([
     task({ task_key: "alpha", work_item: web42, boundary: ["server/alpha.js"] }),
     task({
       task_key: "bravo",
       work_item: web43,
-      boundary: ["server/bravo.js"],
-      dependencies: dependent ? [dependency(web42, "alpha")] : [],
+      boundary: chain && overlap ? ["server/alpha.js", "server/bravo.js"] : ["server/bravo.js"],
+      dependencies: dependent || chain ? [dependency(web42, "alpha")] : [],
     }),
   ]);
   const alpha = candidate(batch.tasks[0].ref, alpha_candidate_sha, "wt-alpha");
-  const bravo = candidate(batch.tasks[1].ref, bravo_candidate_sha, "wt-bravo");
+  const bravo = candidate(batch.tasks[1].ref, bravo_candidate_sha, "wt-bravo", chain ? alpha_candidate_sha : base_sha);
   const base = tree(base_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "4".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
   ]);
   const alphaTree = tree(alpha_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "6".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
   ]);
-  const bravoTree = actualOverlap ? tree(bravo_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+  const bravoTree = chain ? tree(bravo_tree_sha, [
+    ...rootEntries, entry("README.md", (undeclaredPath ? "9" : "3").repeat(64)),
+    entry("server/alpha.js", (overlap ? "7" : "6").repeat(64)),
+    entry("server/bravo.js", "7".repeat(64)),
+  ]) : actualOverlap ? tree(bravo_tree_sha, [
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "7".repeat(64)),
     entry("server/bravo.js", "5".repeat(64)),
   ]) : tree(bravo_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "4".repeat(64)),
     entry("server/bravo.js", "7".repeat(64)),
   ]);
-  const result = tree(result_tree_sha, [
-    entry("README.md", "3".repeat(64)),
+  const result = tree(result_tree_sha, chain ? bravoTree.entries : [
+    ...rootEntries, entry("README.md", "3".repeat(64)),
     entry("server/alpha.js", "6".repeat(64)),
     entry("server/bravo.js", "7".repeat(64)),
   ]);
@@ -235,7 +253,7 @@ function buildFixture({ dependent = false, actualOverlap = false } = {}) {
     source_worktree_path: alpha.managed_worktree.canonical_path,
   });
   const bravoPatch = patch({
-    scope: "candidate", base_sha, result_sha: bravo_candidate_sha, base, result: bravoTree,
+    scope: "candidate", base_sha: bravo.base_sha, result_sha: bravo_candidate_sha, base: chain ? alphaTree : base, result: bravoTree,
     source_worktree_path: bravo.managed_worktree.canonical_path,
   });
   const deliveryPatch = patch({
@@ -374,6 +392,7 @@ function createOperations(fixture, overrides = {}) {
   return { operations, calls, applyCalls };
 }
 
+async function main() {
 // A valid frozen integrated cut is completely deterministic, starts exactly
 // at the DeliveryCandidate base, follows manifest order, and never mutates
 // either the manifest or injected request data.
@@ -381,7 +400,7 @@ function createOperations(fixture, overrides = {}) {
   const fixture = buildFixture();
   const input = copy(fixture.manifest);
   const first = createOperations(fixture);
-  const proof = composeDeliveryCandidate(fixture.manifest, first.operations);
+  const proof = await composeDeliveryCandidate(fixture.manifest, first.operations);
   assert.deepEqual(fixture.manifest, input, "composition does not mutate the manifest");
   assert.equal(Object.isFrozen(proof), true);
   assert.equal(assertDeliveryCompositionProof(proof, fixture.manifest), proof);
@@ -401,29 +420,109 @@ function createOperations(fixture, overrides = {}) {
 
   const secondFixture = buildFixture();
   const second = createOperations(secondFixture);
-  const repeated = composeDeliveryCandidate(secondFixture.manifest, second.operations);
+  const repeated = await composeDeliveryCandidate(secondFixture.manifest, second.operations);
   assert.deepEqual(repeated, proof, "same exact objects and patches produce an identical proof");
 }
 
-// A frozen dependency becomes an explicit predecessor handoff in the
-// composition request and proof; it cannot be silently skipped or reordered.
+// #1065: a frozen dependency is staged as the chain the pipeline built (bravo
+// from alpha's exact candidate SHA, rewriting alpha's file).  Its patch is read
+// and verified against alpha's tree, composed onto the accumulated tree, and
+// becomes an explicit predecessor handoff in the composition request and proof.
 {
-  const fixture = buildFixture({ dependent: true });
+  const fixture = buildFixture({ chain: true });
   const operations = createOperations(fixture);
-  const proof = composeDeliveryCandidate(fixture.manifest, operations.operations);
+  const proof = await composeDeliveryCandidate(fixture.manifest, operations.operations);
   assert.equal(proof.steps[1].predecessor_handoffs.length, 1);
   assert.equal(proof.steps[1].predecessor_handoffs[0].work_task_ref.task_key, "alpha");
   const dependencyApply = operations.applyCalls.find((request) => request.scope === "composition" && request.sequence === 2);
   assert.deepEqual(dependencyApply.predecessor_handoffs, proof.steps[1].predecessor_handoffs);
   assert.equal(proof.steps[0].output_tree_sha, intermediate_tree_sha);
+  const bravoPatchRequest = operations.calls.find((call) => call.name === "readCandidatePatch" && call.request.sequence === 2).request;
+  assert.equal(bravoPatchRequest.base_sha, alpha_candidate_sha, "the dependent patch is requested against its own base commit");
+  assert.equal(bravoPatchRequest.base_tree_sha, alpha_tree_sha, "the dependent patch is requested against its own base tree");
+  const bravoVerification = operations.applyCalls.find((request) => request.scope === "candidate_verification" && request.sequence === 2);
+  assert.equal(bravoVerification.input_tree_sha, alpha_tree_sha, "the dependent candidate is verified from its own base tree");
+  assert.deepEqual(proof.steps[1].changed_files.map((file) => [file.path, file.before.blob_sha[0], file.after.blob_sha[0]]),
+    [["server/alpha.js", "6", "7"], ["server/bravo.js", "5", "7"]], "the overlap composes on top of alpha's change, not the root blob");
+  assert.equal(dependencyApply.input_tree_sha, intermediate_tree_sha, "the dependent composes onto the accumulated tree");
+  assert.equal(proof.result.tree_sha, result_tree_sha);
+}
+
+// #1065 negative controls around the chain.
+{
+  // The old dependent fixture (bravo depends on alpha but is based on the
+  // repository root) is a state the pipeline cannot produce; the manifest
+  // validator now refuses it instead of composing it.
+  assert.throws(() => buildFixture({ dependent: true }), (error) => error.code === "integrated_delivery_base_mismatch");
+
+  // A non-overlapping dependent still chains from, and hands off, alpha.
+  const disjoint = buildFixture({ chain: true, overlap: false });
+  const disjointOperations = createOperations(disjoint);
+  const disjointProof = await composeDeliveryCandidate(disjoint.manifest, disjointOperations.operations);
+  assert.deepEqual(disjointProof.steps[1].predecessor_handoffs.map((entry) => entry.work_task_ref.task_key), ["alpha"]);
+  assert.deepEqual(disjointProof.steps[1].changed_files.map((file) => file.path), ["server/bravo.js"]);
+  assert.equal(disjointOperations.calls.find((call) => call.name === "readCandidatePatch" && call.request.sequence === 2).request.base_sha, alpha_candidate_sha);
+
+  // A dependent that changes a path outside its declared boundary is refused
+  // before any apply, even though the change composes cleanly on alpha.
+  const undeclared = buildFixture({ chain: true, undeclaredPath: true });
+  const undeclaredOperations = createOperations(undeclared);
+  await rejectsCode(() => composeDeliveryCandidate(undeclared.manifest, undeclaredOperations.operations), "candidate_patch_boundary_violation");
+  assert.equal(undeclaredOperations.applyCalls.length, 0);
+
+  // A dependent patch described against the root blob (the pre-#1065 reading)
+  // no longer matches the dependent's own base tree.
+  const staleFixture = buildFixture({ chain: true });
+  const stale = createOperations(staleFixture, {
+    readCandidatePatch(request, response) {
+      if (request.sequence !== 2) return response;
+      const changed = copy(response);
+      changed.files.find((file) => file.path === "server/alpha.js").before.blob_sha = "4".repeat(64);
+      return recalculatePatch(changed);
+    },
+  });
+  await rejectsCode(() => composeDeliveryCandidate(staleFixture.manifest, stale.operations), "candidate_patch_tree_mismatch");
+  assert.equal(stale.applyCalls.length, 0);
+
+  // Even when an adapter presents a base tree and patch that agree with each
+  // other, a `before` blob that is not the accumulated composition blob is
+  // refused before that composition apply is attempted.
+  const driftFixture = buildFixture({ chain: true });
+  let alphaTreeReads = 0;
+  const drift = createOperations(driftFixture, {
+    readTree(request, response) {
+      if (request.tree_sha !== alpha_tree_sha || (alphaTreeReads += 1) !== 2) return response;
+      const entries = copy(response.entries);
+      entries.find((item) => item.path === "server/alpha.js").blob_sha = "8".repeat(64);
+      return { ...response, entries };
+    },
+    readCandidatePatch(request, response) {
+      if (request.sequence !== 2) return response;
+      const changed = copy(response);
+      changed.files.find((file) => file.path === "server/alpha.js").before.blob_sha = "8".repeat(64);
+      return recalculatePatch(changed);
+    },
+  });
+  await rejectsCode(() => composeDeliveryCandidate(driftFixture.manifest, drift.operations), "composition_apply_not_clean");
+  assert.equal(drift.applyCalls.filter((request) => request.scope === "composition").length, 1, "alpha composed; bravo's composition apply was never requested");
+
+  // The final chain output stays pinned to the Delivery Candidate result.
+  const finalFixture = buildFixture({ chain: true });
+  const finalDrift = createOperations(finalFixture, {
+    applyPatch(request, response) {
+      return request.scope === "composition" && request.sequence === 2 ? { ...response, result_tree_sha: intermediate_tree_sha } : response;
+    },
+  });
+  await rejectsCode(() => composeDeliveryCandidate(finalFixture.manifest, finalDrift.operations), "composition_apply_not_clean");
 }
 
 // Even if a malicious object adapter presents two independent patches with
-// the same path, composition stops before an application attempt.
+// the same path, composition stops before an application attempt.  This is
+// the independent counterpart of the #1065 chain: same overlap, no dependency.
 {
   const fixture = buildFixture({ actualOverlap: true });
   const operations = createOperations(fixture);
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "overlapping_independent_composition_patch");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "overlapping_independent_composition_patch");
   assert.equal(operations.applyCalls.length, 0);
 }
 
@@ -436,7 +535,7 @@ function createOperations(fixture, overrides = {}) {
       return request.sequence === 1 ? { ...response, candidate_sha: "0".repeat(64) } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "stale_reviewed_task_metadata");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "stale_reviewed_task_metadata");
   assert.equal(operations.applyCalls.length, 0);
 }
 
@@ -449,7 +548,7 @@ function createOperations(fixture, overrides = {}) {
       return request.sequence === 1 ? { ...response, patch_digest: "0".repeat(64) } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(invalidDigestFixture.manifest, invalidDigest.operations), "candidate_patch_invalid");
+  await rejectsCode(() => composeDeliveryCandidate(invalidDigestFixture.manifest, invalidDigest.operations), "candidate_patch_invalid");
 
   const pathFixture = buildFixture();
   const pathMismatch = createOperations(pathFixture, {
@@ -458,7 +557,7 @@ function createOperations(fixture, overrides = {}) {
       return recalculatePatch({ ...response, source_worktree_path: response.source_worktree_path.replace("/private/var/", "/var/") });
     },
   });
-  throwsCode(() => composeDeliveryCandidate(pathFixture.manifest, pathMismatch.operations), "candidate_patch_invalid");
+  await rejectsCode(() => composeDeliveryCandidate(pathFixture.manifest, pathMismatch.operations), "candidate_patch_invalid");
 
   const treeFixture = buildFixture();
   const treeMismatch = createOperations(treeFixture, {
@@ -469,7 +568,7 @@ function createOperations(fixture, overrides = {}) {
       return recalculatePatch(changed);
     },
   });
-  throwsCode(() => composeDeliveryCandidate(treeFixture.manifest, treeMismatch.operations), "candidate_patch_tree_mismatch");
+  await rejectsCode(() => composeDeliveryCandidate(treeFixture.manifest, treeMismatch.operations), "candidate_patch_tree_mismatch");
 
   const baseFixture = buildFixture();
   const baseMismatch = createOperations(baseFixture, {
@@ -477,7 +576,7 @@ function createOperations(fixture, overrides = {}) {
       return request.sha === base_sha ? { ...response, tree_sha: "0".repeat(64) } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(baseFixture.manifest, baseMismatch.operations), "delivery_base_tree_mismatch");
+  await rejectsCode(() => composeDeliveryCandidate(baseFixture.manifest, baseMismatch.operations), "delivery_base_tree_mismatch");
 }
 
 // A fuzzy or conflicted injected apply is never accepted as a composition
@@ -489,7 +588,7 @@ function createOperations(fixture, overrides = {}) {
       return request.scope === "delivery_verification" ? { ...response, status: "conflicted" } : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "delivery_apply_not_clean");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "delivery_apply_not_clean");
 }
 
 // Intermediate composition output IDs are adapter-observed, but the last
@@ -503,7 +602,7 @@ function createOperations(fixture, overrides = {}) {
         : response;
     },
   });
-  throwsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "composition_apply_not_clean");
+  await rejectsCode(() => composeDeliveryCandidate(fixture.manifest, operations.operations), "composition_apply_not_clean");
 }
 
 // The manifest's frozen order is checked by its M1 validator before the
@@ -513,7 +612,7 @@ function createOperations(fixture, overrides = {}) {
   const reordered = copy(fixture.manifest);
   reordered.staged_tasks.reverse();
   const operations = createOperations(fixture);
-  throwsCode(() => composeDeliveryCandidate(reordered, operations.operations), "invalid_delivery_manifest");
+  await rejectsCode(() => composeDeliveryCandidate(reordered, operations.operations), "invalid_delivery_manifest");
   assert.equal(operations.calls.length, 0);
 }
 
@@ -521,7 +620,7 @@ function createOperations(fixture, overrides = {}) {
 // source remains a pure dependency-injected adapter with no host capability.
 {
   const fixture = buildFixture();
-  const proof = composeDeliveryCandidate(fixture.manifest, createOperations(fixture).operations);
+  const proof = await composeDeliveryCandidate(fixture.manifest, createOperations(fixture).operations);
   assert.equal(deliveryCompositionProofDigest(proof), proof.composition_proof_digest);
   const tampered = copy(proof);
   tampered.steps[1].predecessor_handoffs = [{
@@ -544,4 +643,70 @@ function createOperations(fixture, overrides = {}) {
   assert.doesNotMatch(source, /execFile|spawn\(|git\s+apply/);
 }
 
-console.log("delivery-composer.test.js: all assertions passed");
+// #1066: every injected observation is awaited in manifest order, one at a
+// time, and the loop turns between them; a review that changes after the
+// first reads is re-observed last and refuses the proof before it exists.
+{
+  const fixture = buildFixture({ chain: true });
+  const order = [];
+  let turns = 0;
+  const marker = setInterval(() => { turns += 1; }, 0);
+  const operations = createOperations(fixture, {
+    readReviewedTask(request, response) { order.push(`review:${request.sequence}`); return new Promise((resolve) => setImmediate(() => resolve(response))); },
+    applyPatch(request, response) { order.push(`apply:${request.scope}:${request.sequence}`); return new Promise((resolve) => setImmediate(() => resolve(response))); },
+  });
+  const proof = await composeDeliveryCandidate(fixture.manifest, operations.operations);
+  clearInterval(marker);
+  assert.equal(proof.steps.length, 2);
+  assert.ok(turns > 0, `the loop turned ${turns} times while observations were awaited`);
+  assert.deepEqual(order.slice(0, 2), ["review:1", "review:2"], "reviews are read first");
+  assert.deepEqual(order.slice(-2), ["review:1", "review:2"], "reviews are re-read last, after the final composition apply");
+  assert.equal(order.filter((entry) => entry.startsWith("apply:")).length, 5);
+  const lastCommit = operations.calls.at(-1);
+  assert.equal(lastCommit.name, "readCommit");
+  assert.equal(lastCommit.request.sha, result_sha, "the pinned result commit is the last observation before the proof");
+
+  const revoked = buildFixture();
+  let reviewReads = 0;
+  const revokedOperations = createOperations(revoked, {
+    readReviewedTask(request, response) {
+      reviewReads += 1;
+      return reviewReads > 2 && request.sequence === 1 ? { ...response, terminal_review: { ...response.terminal_review, round_digest: "0".repeat(64) } } : response;
+    },
+  });
+  await rejectsCode(() => composeDeliveryCandidate(revoked.manifest, revokedOperations.operations), "stale_reviewed_task_metadata");
+  assert.equal(revokedOperations.applyCalls.filter((request) => request.scope === "composition").length, 2, "the change landed only after every composition apply");
+
+  const moved = buildFixture();
+  let resultReads = 0;
+  const movedOperations = createOperations(moved, {
+    readCommit(request, response) {
+      if (request.sha !== result_sha) return response;
+      resultReads += 1;
+      return resultReads === 2 ? { ...response, tree_sha: intermediate_tree_sha } : response;
+    },
+  });
+  await rejectsCode(() => composeDeliveryCandidate(moved.manifest, movedOperations.operations), "delivery_result_tree_mismatch");
+  assert.equal(resultReads, 2, "the pinned result is re-read once more after composition");
+}
+
+// Git orders tree entries by byte value: `README.md` precedes `bin/cli.js`,
+// where a locale order reverses them.  The composer's expected applied tree
+// must agree with the observed Git order, or a correct apply is refused as
+// `composition_apply_tree_mismatch`.
+{
+  const fixture = buildFixture({ root: true });
+  const gitOrder = ["README.md", "bin/cli.js", "server/alpha.js", "server/bravo.js"];
+  assert.deepEqual(fixture.trees.get(base_tree_sha).entries.map((item) => item.path), gitOrder);
+  assert.notDeepEqual([...gitOrder].sort((left, right) => left.localeCompare(right)), gitOrder, "this root is a locale/byte divergence");
+  const operations = createOperations(fixture);
+  const proof = await composeDeliveryCandidate(fixture.manifest, operations.operations);
+  assert.deepEqual(proof.result.entries.map((item) => item.path), gitOrder, "the proof carries entries in Git order");
+  assert.deepEqual(fixture.trees.get(intermediate_tree_sha).entries.map((item) => item.path), gitOrder, "the intermediate composed tree is read back in Git order");
+  assert.equal(operations.applyCalls.filter((request) => request.scope === "composition").length, 2);
+}
+}
+
+let finished = false;
+process.on("exit", (code) => { if (!finished && code === 0) { console.error("delivery-composer.test.js: did not run to completion"); process.exitCode = 1; } });
+main().then(() => { finished = true; console.log("delivery-composer.test.js: all assertions passed"); }, (error) => { console.error(error); process.exit(1); });

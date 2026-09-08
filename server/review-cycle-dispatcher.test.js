@@ -37,7 +37,7 @@ function target(sha = SHA_A) {
     project_id: PROJECT,
     repository: { key: "web", repo: "Acme/Web", ci_policy: policy() },
     work_item: { repoKey: "web", repo: "Acme/Web", number: 42, kind: "issue" },
-    pr: { number: 99, exact_sha: sha, draft: false, mergeable: true },
+    pr: { number: 99, base_sha: "0".repeat(40), exact_sha: sha, draft: false, mergeable: true },
     issue_contract: { contract_revision: CONTRACT },
     assignment_attempt: "attempt-a",
   });

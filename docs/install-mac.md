@@ -9,14 +9,16 @@ Step-by-step guide for installing QuadWork on macOS. Designed for both humans an
 ### Check existing tools
 
 ```bash
-node --version   # Need 20+ (24 recommended)
+node --version   # Need 20.3.0 or newer (24 recommended)
 git --version
 gh --version
 ```
 
 ### Install missing prerequisites
 
-**Node.js 20+** (via nvm — strongly recommended):
+**Node.js 20.3.0+** (via nvm — strongly recommended). 20.0-20.2 are refused:
+QuadWork's durable stores take their writer lock in the kernel through a
+native addon, whose prebuilds target the Node-20 N-API surface from 20.3.0 on.
 ```bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 source ~/.zshrc

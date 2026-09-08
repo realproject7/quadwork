@@ -1,8 +1,9 @@
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 
-// #1032 end-to-end route proof with real config/map writes and fake direct
-// execFile results. No shell is invoked; git/gh command arrays are asserted by
-// the provisioner tests separately.
+// #1032 route proof with real linked Git worktrees and config/map/seed writes.
+// Async provision/access results remain controlled for deterministic admission
+// races; the seed owner and its one-shot child inspect real Git/filesystem state.
 
 const assert = require("node:assert/strict");
 const childProcess = require("node:child_process");
@@ -13,7 +14,7 @@ const os = require("os");
 const path = require("path");
 const util = require("util");
 
-const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-v2-setup-"));
+const TEST_HOME = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-v2-setup-")));
 const originalHomedir = os.homedir;
 const originalExecFile = childProcess.execFile;
 os.homedir = () => TEST_HOME;
@@ -81,13 +82,24 @@ function writeQueue(projectId, content = "# Queue\n\n## Active Batch\n\n") {
 function makeWorktrees(root) {
   const base = path.join(root, "target");
   const api = path.join(root, "target-api");
-  for (const directory of [base, api]) fs.mkdirSync(path.join(directory, ".git"), { recursive: true });
+  const git = (directory, ...args) => childProcess.execFileSync("git", ["-C", directory, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, HOME: TEST_HOME, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  for (const [directory, repository] of [[base, "acme/target"], [api, "acme/api"]]) {
+    fs.mkdirSync(directory, { recursive: true });
+    git(directory, "init", "-b", "main");
+    fs.writeFileSync(path.join(directory, "README.md"), "# Real linked worktree fixture\n");
+    git(directory, "add", "README.md");
+    git(directory, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "fixture");
+    git(directory, "remote", "add", "origin", `https://github.com/${repository}.git`);
+  }
   const agents = {};
   for (const role of ["head", "re1", "re2", "dev"]) {
     const primary = path.join(root, `custom-target-${role}`);
     const secondary = path.join(root, `target-api-${role}`);
-    fs.mkdirSync(primary, { recursive: true });
-    fs.mkdirSync(secondary, { recursive: true });
+    git(base, "worktree", "add", "-b", `worktree-${role}`, primary, "HEAD");
+    git(api, "worktree", "add", "-b", `worktree-${role}`, secondary, "HEAD");
     agents[role] = { cwd: primary, command: "codex", auto_approve: true };
   }
   return { base, api, agents };
@@ -137,7 +149,7 @@ function assertNoRoleWorktreeCreation(label) {
   app.use(routes);
   const server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-v2-worktrees-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-v2-worktrees-")));
   const paths = makeWorktrees(root);
   const requestBody = { id: "target", repositories: repositories(paths), confirm: true };
   try {

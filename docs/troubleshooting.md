@@ -294,6 +294,208 @@ cleanup, a wildcard, or a prefix match. If the stale-only sweep cannot safely
 classify the exact entry, stop and repair or upgrade the affected agent through
 its supported package-manager/CLI workflow before restarting the service.
 
+## Head-control batch reports a missing pipeline after upgrading past #1071 — pre-release diagnostic
+
+**Applies to:** an installation upgraded across #1071 that crashed part-way
+through a batch retirement while running an older build. It cannot be created by
+this build: from #1071 onward a retirement always writes a durable intent before
+it touches the pipeline store, and recovery finishes exactly that intent.
+
+**Symptom:** every Head-control action for one project fails with
+`head_control_work_task_pipeline_missing` — reads included, so
+`get_pipeline_status` and the Current Batch surface fail too. The project cannot
+be retired, cannot take a successor manifest, and does not recover on restart.
+
+**Recognise it (all four must hold):**
+
+1. The domain state file
+   `~/.quadwork/head-control-work-task-domain/<installation_id>--<project_id>.json`
+   has `"stage":"frozen"`.
+2. That same file has `"pending":null` — there is no durable retire intent.
+3. The active pipeline record does not exist at either of the two names it can
+   have. From #1071 onward it is
+   `~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/record.json`;
+   a store written before #1071 still has it at
+   `~/.quadwork/work-task-pipelines/<installation_id>--<project_id>.json`
+   until the first read migrates it (see the next section).
+4. A retired record exists whose `manifest.manifest_digest` equals the frozen
+   state's `manifest.manifest_digest` — `record.retired.NNNN.json` beside the
+   `record.json` above, or `…--<project_id>.retired.NNNN.json` in the
+   pre-#1071 layout.
+
+Conditions 1–3 alone are the general "frozen batch, no active pipeline, no
+intent" fault, which has other causes (a lost or partially restored config
+directory). Only 4 makes an interrupted pre-#1071 retirement the likely reading,
+and even then a same-content successor produces the same digest — which is
+precisely why the server no longer acts on it.
+
+**Why it is not repaired automatically:** matching a retired record by content
+was the #1071 defect. A manifest digest covers only the version, identity,
+delivery mode and task refs, so a successor batch that repeats an earlier one is
+byte-identical to it; healing on that match destroyed live successors. The
+server now fails closed instead of guessing which batch a retired record ended.
+There is no automatic repair, no flag to re-enable the old behaviour, and none
+should be added.
+
+**Repair — a deliberate operator edit, performed only after the four conditions
+above are confirmed by inspection:** stop the server, back up both files, and
+decide from the retired record's own contents (its `terminal_audit`, its task
+states, its `pipeline.history`) whether the frozen batch really is the one that
+retired record ended. If it is, set the domain state's `"stage"` to `"empty"`,
+`"manifest"` and `"pipeline_digest"` to `null`, and increment `"revision"` by
+one, keeping mode 0600, then restart. If it is not — or if you cannot tell —
+do not edit the file; the durable state is intact and the safe move is to
+preserve both files for inspection rather than to empty a batch that may still
+be live.
+
+## Pipeline store refuses every operation for one project after upgrading past #1071 — legacy migration
+
+**Applies to:** an installation whose WorkTask pipeline records were written
+before #1071 and are now being read by a build from #1071 onward.
+
+**What changed:** #1071 gave each identity its own directory,
+`~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/`, holding
+`record.json` and `record.retired.NNNN.json`. The pre-#1071 layout put every
+project's records in one flat directory as
+`<installation_id>--<project_id>.json` and
+`<installation_id>--<project_id>.retired.NNNN.json`, where a project id may
+itself spell another project's retired suffix.
+
+**The migration is not a separate command, and it is not deferred to a write.**
+The *first* operation that touches a project adopts that project's pre-#1071
+records — a read such as `get_pipeline_status` included. Each record moves by a
+single `rename`, so a record is always at exactly one of its two names, and an
+interrupted migration is finished by the next operation. Retired ordinals move
+first in ascending order and the active record moves last, so an interrupted
+migration never leaves a project with no active record anywhere.
+
+**Only an unambiguous record is adopted.** A candidate is taken only when its
+own stored `identity` object names this exact `installation_id` and
+`project_id`. A candidate that decodes cleanly but names a different identity is
+left exactly where it is and contributes nothing. This is not a nicety: the one
+filename `<installation_id>--quadwork.retired.0001.json` is spelled both by
+project `quadwork` at retired ordinal 1 and by the project literally named
+`quadwork.retired.0001`, and only the record's own contents can say which it is.
+
+**Symptom when it refuses:** every operation for that one project fails — reads
+included. The store raises one of:
+
+- `work_task_pipeline_store_legacy_conflict` — a migrated record and a
+  pre-#1071 record for the same identity both exist, so neither is
+  authoritative.
+- `work_task_pipeline_store_symlink_rejected` — a candidate is a symbolic link.
+- `work_task_pipeline_store_insecure_permissions` — a candidate is not a mode
+  0600 regular file owned by the server's user.
+- `corrupt_work_task_pipeline_store` or
+  `unknown_work_task_pipeline_store_schema` — a candidate cannot be decoded, so
+  whose it is cannot be established.
+- `work_task_pipeline_store_unreadable` or
+  `work_task_pipeline_store_write_failed` — the directory cannot be listed, or a
+  record could not be moved.
+
+Through Head-control these surface as `head_control_work_task_pipeline_unavailable`
+on an ordinary pipeline read, and as `head_control_work_task_pipeline_missing`
+when a pending retire intent is being recovered and its retired record cannot be
+read.
+
+**Why the refusal covers reads too — an accepted tradeoff, not an oversight.**
+Reading whichever candidate looks plausible is exactly the ambiguity #1071
+exists to remove: under the old layout one project's live record and another
+project's retired record could be the same file, and a content match was not
+enough to tell them apart. Blocking a project's reads until an operator resolves
+its state is the deliberate price of never answering for the wrong batch. It is
+not a reason to reintroduce an ambiguous read, there is no flag to re-enable
+one, and none should be added.
+
+**What to do:** stop all writers (`npx quadwork stop`), then preserve *both*
+exact paths for diagnosis — the pre-#1071 name
+`~/.quadwork/work-task-pipelines/<installation_id>--<project_id>.json` (and any
+`…--<project_id>.retired.NNNN.json` beside it) and the post-#1071 name
+`~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/record.json`
+(and any `record.retired.NNNN.json` beside it). Read each candidate's own
+`identity`, `manifest.manifest_digest`, and `terminal_audit` before concluding
+anything about which batch it belongs to.
+
+Do not delete a candidate, do not copy one over the other, and do not rename one
+into place to make the conflict go away: a name is not authority here, and a
+hand-placed record is adopted only if its stored identity already matched — in
+which case moving it was never the fix. If the two records disagree about which
+batch is current, that disagreement is the finding; preserve it rather than
+resolving it by guesswork.
+
+---
+
+## Two kinds of `.lock` file, with opposite meanings — #1074
+
+QuadWork has two lock files and they do **not** mean the same thing. Reading one
+as the other is how mutual exclusion gets broken by hand.
+
+**`~/.quadwork/config.lock` — transient. Its existence *is* the lock.**
+A configuration writer creates it, holds it for the length of one configuration
+write, and removes it. If it is there, someone is writing configuration, or a
+writer died mid-write. QuadWork never deletes it for you (a read-then-unlink has
+an unavoidable cross-process replacement race), so a genuinely stale one is an
+operator job: stop every writer with `npx quadwork stop`, confirm no QuadWork
+process is running, then delete `config.lock`.
+
+**A durable store's `<state-file>.lock` — permanent. Its existence means
+nothing at all.**
+Every V2 durable store keeps one of these beside its state file, for example
+`~/.quadwork/work-task-pipelines/v1/<installation_id>/<project_id>/record.json.lock`.
+It is created once and is **never removed** — not on release, not on shutdown,
+not on error. Newly created locks are empty; upgraded legacy bodies may remain
+and are inert diagnostics, never ownership evidence. The lock is a whole-file
+advisory lock the kernel holds on an open descriptor; the file is only the
+object the kernel keys it to. A writer that dies releases its lock the instant
+its process ends, with the file still sitting there, and the next writer simply
+takes the lock again on the very same file. There is nothing stale to clean up,
+ever.
+
+**Deleting a store `.lock` while a writer holds it silently breaks mutual
+exclusion.** Nothing errors. The holder keeps its lock on an inode that no
+longer has a name, the next writer creates a *new* file at that path and locks
+*that* one, and both writers are then inside their protected actions at the same
+time — which is exactly the corruption the lock exists to prevent. The same goes
+for renaming, replacing, or restoring one from a backup.
+
+So:
+
+| | `config.lock` | `<state-file>.lock` |
+|---|---|---|
+| Lives for | one configuration write | forever |
+| Existence means | a write is in progress or was interrupted | nothing |
+| Safe to delete | yes, once every writer is stopped | **no — not ever** |
+| Recovering from a dead writer | delete it | nothing to do |
+
+**What the store lock does and does not guarantee.**
+The guarantee is mutual exclusion between *cooperating QuadWork writers*
+operating inside a trusted, owner-only, local configuration directory
+(`~/.quadwork`, mode `0700`). Inside that boundary the kernel decides who is
+inside a protected action, and no amount of reasoning about a file's contents
+can override it.
+
+Outside that boundary it is not a guarantee at all:
+
+- **Anything that unlinks, renames, or replaces a lock path from outside
+  QuadWork** — a cleanup script, a backup restore, a sync client, a person with
+  `rm` — breaks it, silently, exactly as described above.
+- **NFS, SMB, and any cross-host filesystem** are out of scope. The lock is an
+  advisory lock on a local open file description; a network filesystem may
+  honour it partially, per-client, or not at all, and QuadWork cannot tell.
+  Keep `~/.quadwork` on local disk.
+- **Anything QuadWork can identify as unsupported fails closed.** An
+  unsupported platform, a native lock primitive that will not load (see the
+  musl/Alpine note in the installation guides), a filesystem answering
+  `EOPNOTSUPP`/`ENOLCK`, or a lock path that is not an owner-only regular file
+  all make the store *refuse to write*. There is no path-based fallback: a
+  store that cannot be protected does not write unprotected.
+
+If a store keeps reporting a `..._locked` code, something is genuinely holding
+that lock right now. Find the process (`npx quadwork stop`, then check for
+leftover `node` processes under `~/.quadwork`) rather than touching the file.
+
+---
+
 ## Resource staging matrix does not pass
 
 Start with the read-only diagnostic; do not begin by changing systemd or
@@ -339,9 +541,9 @@ do not select a cleanup target by wildcard, prefix, timestamp, or guesswork.
 - `proof_refused` means the disposable-host acknowledgement or the separate
   `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has
   started.
-- `proof_unavailable` means a host gate or required live adapter is unavailable.
-  The bundled adapter intentionally returns this result rather than simulating
-  node-pty, WebSocket, cgroup, temp, health, or OOM evidence.
+- `proof_unavailable` means a required host capability or observation is
+  unavailable. The closed shipped coordinator requires actual cgroup, journal,
+  node-pty, temp, health and transport facts; it accepts no replacement adapter.
 - `proof_failed` means monitoring or a started phase failed. The coordinator
   stops starting new phases and closes continuous monitoring.
 
@@ -349,8 +551,10 @@ Do not retry a pressure phase on production and do not treat capability flags
 as proof. Preserve the redacted JSON, identify the exact candidate unit names
 from the disposable run record, stop only those units, wait for their process
 trees to exit, and compare the recorded API/global OOM counters. The candidate
-flags remain `candidate_pending_staging`; there is no automatic install/repair
-or supported-production fallback in this command.
+runtime does not treat this report as a portable permission token. Normal worker
+readiness comes from direct Linux capability checks and a real non-pressure
+probe. Unavailable containment keeps the API/chat online and refuses new worker
+starts; the pressure command never repairs a production service.
 
 For package or resource-policy regressions, use the VPS guide's
 **Resource upgrade and rollback** procedure. Rollback means reinstalling one
@@ -358,3 +562,19 @@ exact prior package version and re-accepting one exact prior policy through a
 fresh proposal token. Do not copy a guessed `.recovery` entry over
 `config.json`, reuse an old acceptance token, delete a newer temp root, or treat
 an earlier staging PASS as evidence for a different package/policy candidate.
+
+### Linux containment unavailable
+
+Keep the API running and inspect the read-only resource report. New worker
+starts require real cgroup v2/user-manager support, finite protected API limits,
+disk-backed generation temp and the source-owned non-pressure PTY probe. A
+config boolean, old receipt, environment module or copied PASS cannot enable it.
+Repair the explicitly configured service/resource policy, then request a fresh
+start. Do not stop healthy legacy workers merely to probe support.
+
+A failed disposable matrix must not be reported as PASS. `cleanup_incomplete`
+preserves its private ownership directory; inspect only the exact recorded units,
+PIDs and generation temp. Never run broad `pkill`, delete arbitrary `/tmp`, or
+stop a shared service. Kernel journal denial or ambiguous/global OOM makes the
+proof unavailable. `/proc/vmstat` OOM counts include memcg victims and are not a
+global-only counter. No provider credentials are required or read by the matrix.

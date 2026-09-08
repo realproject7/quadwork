@@ -12,7 +12,6 @@ const {
   buildWorkTaskCandidate,
   planCandidateInvalidation,
   assertCandidateInvalidationPlan,
-  rejectTaskCandidatePublication,
 } = require("./work-task-candidate");
 
 const installation_id = "installation_alpha_0001";
@@ -173,21 +172,6 @@ throwsCode(() => buildCandidate({ readCanonicalInstalledState() { return { versi
   const tampered = copy(plan);
   tampered.events.shift();
   throwsCode(() => assertCandidateInvalidationPlan(tampered), "invalid_candidate_invalidation_plan");
-}
-
-// Publication is rejected only when the intent targets this candidate's exact
-// repository/branch; unrelated local branches have no authority inferred by
-// this narrow candidate capability.
-{
-  const candidate = buildCandidate();
-  for (const operation of ["push", "pull_request", "ci", "release"]) {
-    throwsCode(() => rejectTaskCandidatePublication(candidate, {
-      version: 1, operation, repository_key: "web", branch: "task/work-task-build",
-    }), `work_task_candidate_${operation}_prohibited`);
-  }
-  assert.equal(rejectTaskCandidatePublication(candidate, {
-    version: 1, operation: "push", repository_key: "web", branch: "task/other-local-work",
-  }), true);
 }
 
 // Purity guard: M2 contains only deterministic contracts plus injected read

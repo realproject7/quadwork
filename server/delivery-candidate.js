@@ -84,6 +84,79 @@ function assertDeliveryCandidateRef(value, code = "invalid_delivery_candidate_re
   return value;
 }
 
+// Internal server completion provenance, not a caller approval. Publication
+// and composition resolve these records from the owning pipeline store; this
+// pure validator only preserves their closed, immutable identity in manifests.
+function assertDeliveryCompletionRecord(value, code = "invalid_delivery_completion_record") {
+  exact(value, ["version", "receipt_digest", "candidate_ref", "manifest_digest", "base_sha", "result_sha", "result_tree", "merge_sha", "merge_tree", "work_task_refs"], code);
+  const ref = assertDeliveryCandidateRef(value.candidate_ref, code);
+  if (value.version !== 1 || !/^[a-f0-9]{64}$/.test(value.receipt_digest) || !/^[a-f0-9]{64}$/.test(value.manifest_digest)
+    || ["base_sha", "result_sha", "result_tree", "merge_sha", "merge_tree"].some((key) => typeof value[key] !== "string" || !SHA_RE.test(value[key]))
+    || value.base_sha !== ref.base_sha || value.result_sha !== ref.result_sha || value.result_tree !== value.merge_tree
+    || value.merge_sha === value.base_sha || !Array.isArray(value.work_task_refs) || value.work_task_refs.length === 0 || value.work_task_refs.length > MAX_TASKS) {
+    fail(code, "delivery completion identity or equal-tree proof is invalid");
+  }
+  const keys = new Set();
+  for (const taskRef of value.work_task_refs) {
+    try { assertWorkTaskRef(taskRef); } catch { fail(code, "delivered task reference is invalid"); }
+    const key = workTaskKey(taskRef);
+    if (keys.has(key) || taskRef.installation_id !== ref.installation_id || taskRef.project_id !== ref.project_id || taskRef.repository_key !== ref.repository_key) {
+      fail(code, "delivered task identity is inconsistent");
+    }
+    keys.add(key);
+  }
+  return value;
+}
+
+function deliveredRecordsFromExclusions(exclusions) {
+  const records = new Map();
+  for (const exclusion of exclusions) {
+    if (!Object.hasOwn(exclusion, "delivery")) continue;
+    const record = assertDeliveryCompletionRecord(exclusion.delivery);
+    if (exclusion.reason !== "already_delivered" || !record.work_task_refs.some((ref) => sameWorkTask(ref, exclusion.work_task_ref))) {
+      fail("invalid_delivery_deferred_exclusion", "delivered exclusion does not match its immutable task receipt");
+    }
+    const prior = records.get(record.receipt_digest);
+    if (prior && stable(prior) !== stable(record)) fail("invalid_delivery_deferred_exclusion", "delivery receipt identity collides");
+    records.set(record.receipt_digest, record);
+  }
+  return [...records.values()];
+}
+
+function deliveredTaskMap(records, candidateRef = null) {
+  const byTask = new Map();
+  const byBase = new Map();
+  for (const record of records) {
+    assertDeliveryCompletionRecord(record);
+    if (candidateRef && (record.candidate_ref.installation_id !== candidateRef.installation_id
+      || record.candidate_ref.project_id !== candidateRef.project_id || record.candidate_ref.batch_manifest_digest !== candidateRef.batch_manifest_digest)) {
+      fail("invalid_delivery_deferred_exclusion", "delivery predecessor belongs to another frozen batch");
+    }
+    const baseKey = `${record.candidate_ref.repository_key}:${record.base_sha}`;
+    if (byBase.has(baseKey) && byBase.get(baseKey).receipt_digest !== record.receipt_digest) fail("invalid_delivery_deferred_exclusion", "delivery predecessor chain forks");
+    byBase.set(baseKey, record);
+    for (const taskRef of record.work_task_refs) {
+      const key = workTaskKey(taskRef);
+      if (byTask.has(key)) fail("invalid_delivery_deferred_exclusion", "delivered task is duplicated");
+      byTask.set(key, record);
+    }
+  }
+  // Same-repository history must lead to this exact current base. Cross-repo
+  // receipts satisfy only qualified dependencies, never this repository base.
+  if (candidateRef) for (const record of records) {
+    if (record.candidate_ref.repository_key !== candidateRef.repository_key) continue;
+    let current = record;
+    const visited = new Set();
+    while (current.merge_sha !== candidateRef.base_sha) {
+      if (visited.has(current.receipt_digest)) fail("invalid_delivery_deferred_exclusion", "delivery predecessor chain cycles");
+      visited.add(current.receipt_digest);
+      current = byBase.get(`${candidateRef.repository_key}:${current.merge_sha}`);
+      if (!current) fail("invalid_delivery_deferred_exclusion", "delivery predecessor does not reach the current base");
+    }
+  }
+  return byTask;
+}
+
 function deliveryCandidateKey(value) {
   const ref = assertDeliveryCandidateRef(value);
   return JSON.stringify(["delivery-candidate-ref", VERSION, ref.installation_id, ref.project_id, ref.repository_key,
@@ -181,9 +254,13 @@ function stagedTaskInput(value, sequence) {
 }
 
 function deferredExclusion(value) {
-  exact(value, ["work_task_ref", "reason"], "invalid_delivery_deferred_exclusion");
+  exact(value, ["work_task_ref", "reason", ...(plain(value) && Object.hasOwn(value, "delivery") ? ["delivery"] : [])], "invalid_delivery_deferred_exclusion");
   try { assertWorkTaskRef(value.work_task_ref); } catch { fail("invalid_delivery_deferred_exclusion", "deferred work task reference is invalid"); }
-  return { work_task_ref: clone(value.work_task_ref), reason: text(value.reason, "invalid_delivery_deferred_exclusion", 160) };
+  const result = { work_task_ref: clone(value.work_task_ref), reason: text(value.reason, "invalid_delivery_deferred_exclusion", 160),
+    ...(Object.hasOwn(value, "delivery") ? { delivery: clone(assertDeliveryCompletionRecord(value.delivery)) } : {}) };
+  if ((result.reason === "already_delivered") !== Object.hasOwn(result, "delivery")) fail("invalid_delivery_deferred_exclusion", "delivered reason requires exact receipt provenance");
+  deliveredRecordsFromExclusions([result]);
+  return result;
 }
 
 function pathOverlaps(left, right) {
@@ -207,6 +284,23 @@ function dependencyClosure(entries) {
     return found;
   }
   return { byKey, dependenciesOf };
+}
+
+// #1065: the pipeline builds a same-repository dependent task from its one
+// ready predecessor candidate, so that exact candidate SHA is the dependent's
+// base; every other task builds from the frozen repository root base.  Two
+// same-repository predecessors, or an absent one, leave no base to accept.
+function expectedCandidateBase(tasks, candidates, candidate, base_sha, deliveredRecords = []) {
+  const key = workTaskKey(candidate.work_task_ref);
+  const entry = tasks.find((task) => workTaskKey(task.ref) === key);
+  if (!entry) return null;
+  const delivered = deliveredTaskMap(deliveredRecords);
+  const predecessors = entry.contract.dependencies.filter((dependency) => dependency.repository_key === candidate.work_task_ref.repository_key
+    && !delivered.has(workTaskKey(dependency)));
+  if (predecessors.length === 0) return base_sha;
+  const predecessorKey = predecessors.length === 1 ? workTaskKey(predecessors[0]) : null;
+  const predecessor = candidates.find((other) => workTaskKey(other.work_task_ref) === predecessorKey);
+  return predecessor ? predecessor.candidate_sha : null;
 }
 
 function assertTerminalReview(value, staged, code) {
@@ -281,7 +375,6 @@ function assertCutContents(ref, repository, batch, staged, deferred, evidence) {
   const entries = assertBatchCut(batch, ref);
   const graph = dependencyClosure(entries);
   const stageKeys = new Set();
-  const itemKeys = new Set();
   const stagedEntries = staged.map((stage, index) => {
     assertStagedTask(stage, index + 1, "invalid_delivery_staged_task");
     const key = workTaskKey(stage.work_task_ref);
@@ -291,9 +384,7 @@ function assertCutContents(ref, repository, batch, staged, deferred, evidence) {
       fail("delivery_repository_spoof", "staged task crosses the registered delivery repository");
     }
     if (stageKeys.has(key)) fail("duplicate_delivery_work_task", "staged work task is duplicated");
-    const itemKey = workItemKey(stage.work_item);
-    if (itemKeys.has(itemKey)) fail("duplicate_delivery_work_item", "delivery work item is duplicated");
-    stageKeys.add(key); itemKeys.add(itemKey);
+    stageKeys.add(key);
     return entry;
   });
   if (staged.length === 0 || staged.length > MAX_TASKS) fail("invalid_delivery_staged_task", "delivery cut has no bounded staged tasks");
@@ -312,9 +403,15 @@ function assertCutContents(ref, repository, batch, staged, deferred, evidence) {
   const expectedDeferredOrder = entries.filter((entry) => !stageKeys.has(workTaskKey(entry.ref))).map((entry) => workTaskKey(entry.ref));
   if (stable([...deferredKeys]) !== stable(expectedDeferredOrder)) fail("unsafe_partial_delivery_cut", "frozen batch tasks must be staged or explicitly deferred in order");
 
+  const deliveredRecords = deliveredRecordsFromExclusions(deferredEntries);
+  const delivered = deliveredTaskMap(deliveredRecords, ref);
+  for (const [key] of delivered) {
+    if (!deferredKeys.has(key)) fail("invalid_delivery_deferred_exclusion", "delivered receipt is outside the exact exclusion complement");
+  }
+
   for (const entry of stagedEntries) {
     for (const dependency of graph.dependenciesOf(workTaskKey(entry.ref))) {
-      if (!stageKeys.has(dependency)) fail("unsafe_partial_delivery_cut", "staged task dependency is absent from delivery cut");
+      if (!stageKeys.has(dependency) && !delivered.has(dependency)) fail("unsafe_partial_delivery_cut", "staged task dependency is absent from delivery cut and delivered provenance");
     }
   }
 
@@ -328,17 +425,21 @@ function assertCutContents(ref, repository, batch, staged, deferred, evidence) {
   }
 
   if (ref.delivery_mode === "integrated") {
-    // An integrated cut is whole-repository, not necessarily whole-batch:
-    // V2 freezes one project batch that can contain independent registered
-    // repositories.  Each repository gets its own final candidate, while the
-    // closed dependency check above still rejects a staged task whose required
-    // predecessor is deferred in another repository.
+    // The exact remaining prefix is explicit; delivered history is retained
+    // as exclusions and contributes no patch or new publication membership.
     const repositoryEntries = entries.filter((entry) => entry.ref.repository_key === ref.repository_key);
-    if (repositoryEntries.length === 0 || staged.length !== repositoryEntries.length ||
-        deferredEntries.some((entry) => entry.work_task_ref.repository_key === ref.repository_key)) {
-      fail("integrated_delivery_requires_complete_batch", "integrated delivery must cut every frozen task for its registered repository");
+    const last = repositoryEntries.findLastIndex((entry) => stageKeys.has(workTaskKey(entry.ref)));
+    for (const entry of repositoryEntries.slice(0, last)) {
+      const key = workTaskKey(entry.ref);
+      if (!stageKeys.has(key) && !delivered.has(key)
+        && !deferredEntries.some((excluded) => workTaskKey(excluded.work_task_ref) === key && excluded.reason === "explicitly_deferred")) {
+        fail("unsafe_partial_delivery_cut", "integrated delivery skips an unresolved earlier task");
+      }
     }
-    if (staged.some((stage) => stage.candidate.base_sha !== ref.base_sha)) fail("integrated_delivery_base_mismatch", "integrated candidates must share the delivery base SHA");
+    const candidates = staged.map((stage) => stage.candidate);
+    if (staged.some((stage) => stage.candidate.base_sha !== expectedCandidateBase(entries, candidates, stage.candidate, ref.base_sha, deliveredRecords))) {
+      fail("integrated_delivery_base_mismatch", "integrated candidates must chain exactly from the delivery base SHA");
+    }
   } else {
     if (staged.length !== 1 || deferredEntries.length !== entries.length - 1) fail("isolated_delivery_requires_single_task", "isolated delivery must stage one task and defer all peers");
     if (staged[0].candidate.base_sha !== ref.base_sha || staged[0].candidate.candidate_sha !== ref.result_sha) {
@@ -406,6 +507,9 @@ module.exports = {
   DeliveryCandidateError,
   assertDeliveryCandidateRef,
   deliveryCandidateKey,
+  expectedCandidateBase,
+  assertDeliveryCompletionRecord,
+  deliveredRecordsFromExclusions,
   assertDeliveryManifest,
   buildDeliveryManifest,
 };

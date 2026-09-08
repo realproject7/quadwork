@@ -50,11 +50,10 @@ const FOUR_AGENTS = [
   { id: "re2", label: "RE2" },
 ];
 
-type AgentState = "running" | "stopped" | "error";
-
 interface AgentTerminalsGridProps {
   projectId: string;
-  agentStates: Record<string, AgentState>;
+  agentStates: Record<string, string>;
+  agentGenerations?: Record<string, string | null>;
   onStatusChange?: (agent: string, state: string) => void;
   /** #1052: vertical collapse state is owned by ProjectDashboard (persisted per project). */
   expanded: boolean;
@@ -74,7 +73,7 @@ interface AgentTerminalsGridProps {
  * #668/#1052: collapsing unmounts only the read-only browser terminal
  * viewers (they reconnect on expand); it never touches an agent PTY.
  */
-export default function AgentTerminalsGrid({ projectId, agentStates, onStatusChange, expanded, onToggle, bodyId }: AgentTerminalsGridProps) {
+export default function AgentTerminalsGrid({ projectId, agentStates, agentGenerations, onStatusChange, expanded, onToggle, bodyId }: AgentTerminalsGridProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const [tipOpen, setTipOpen] = useState(false);
@@ -118,6 +117,7 @@ export default function AgentTerminalsGrid({ projectId, agentStates, onStatusCha
             projectId={projectId}
             agents={FOUR_AGENTS}
             agentStates={agentStates}
+            agentGenerations={agentGenerations}
             onStatusChange={onStatusChange}
           />
         </div>

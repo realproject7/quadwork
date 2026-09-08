@@ -77,7 +77,7 @@ The server's exact-SHA review cycle (#1048) is the only implementation-review ro
 
 ## WorkTask batches
 
-A WorkTask is your immutable execution slice inside one ticket. Read current state with `get_pipeline_status` before every decision — it is the only authority for stage, revision, and task states. Write the manifest with `put_batch_manifest`, freeze it with `freeze_batch_manifest`, assign one queued task at a time with `assign_work_task_build`, open the sealed two-reviewer round with `open_work_task_independent_review`, and advance it with `reconcile_work_task_review` after both receipts. Relay each returned identity to the role that acts next; the server sends no worker message. A task candidate is local: `accepted`/`staged` never means pushed, merged, or closed. Return a `changes_requested` task to Dev with `queue_local_correction`, and check `read_propagation_stop` before assigning — a task in a sealed stop's dependent chain is refused. Cut with `cut_batch` only through accepted tasks in manifest order, then `retire_batch` before a successor manifest. Never edit an assigned task, read a sealed receipt, or substitute a reviewer.
+A WorkTask is your immutable execution slice inside one ticket. Read current state with `get_pipeline_status` before every decision — it is the only authority for stage, revision, and task states. Write the manifest with `put_batch_manifest`, freeze it with `freeze_batch_manifest`, assign one queued task at a time with `assign_work_task_build`, open the sealed two-reviewer round with `open_work_task_independent_review`, and advance it with `reconcile_work_task_review` after both receipts. Relay each returned identity to the role that acts next; the server sends no worker message. A task candidate is local: `accepted`/`staged` never means pushed, merged, or closed. Return a `changes_requested` task to Dev with `queue_local_correction`, and check `read_propagation_stop` before assigning — a task in a sealed stop's dependent chain is refused. Cut with `cut_batch` only through accepted tasks in manifest order, then `retire_batch` before a successor manifest. A manifest you decide against before freezing leaves only through `abandon_batch_manifest` at its current revision; it is refused once the freeze has begun, and a put never overwrites a stored manifest. Never edit an assigned task, read a sealed receipt, or substitute a reviewer.
 
 ## Project Monitor and worker recovery
 
@@ -99,26 +99,19 @@ every staged WorkTask, call `prepare_delivery_candidate` with the registered
 repository key. If it succeeds, call `compose_delivery_candidate` with the
 returned exact reference, revision, correlation id, and idempotency key.
 
-Before any external publication, call `plan_delivery_candidate_publication` with
-the composed reference. It derives a candidate-bound branch and PR proposal but
-stops at the operator gate; it never transfers a branch or creates the PR.
+For ordinary reviewed scope, use the bound Head `form_delivery` action, then `publish_delivery` with its returned plan digest and candidate revision. The server verifies the live cut, task reviews, canonical remote and base before creating one branch/PR. Explicit operator gates still refuse. `plan_delivery_candidate_publication` reads the current proposal; it performs no remote write.
 
-After an already-published PR is observed at that exact result SHA, call
-`open_delivery_candidate_final_review` with the same reference and PR number.
-This is review admission only; it never authorizes Head to create that PR.
+Publication admits the existing final-review cycle; `open_delivery_candidate_final_review` can reobserve that same exact candidate/PR. Both current-SHA authenticated final approvals and the repository's passing verification policy are mandatory. In `ci-less` mode, use `read_ci_evidence` with Dev's server-issued `record_id`; match candidate, base, manifest and policy before accepting it. No hosted CI badge or `gh pr checks` is required in this mode; external checks apply only to an explicit external policy.
 
-Never construct a Delivery Candidate reference, result SHA, Git tree, patch,
-review anchor, worktree path, or repository identity yourself. A refusal means
-the registered clone, frozen cut, candidate, or review state drifted; re-read
-the named durable source and return the item to its owning gate. These tools
-produce only local evidence: they never create a branch or PR, run CI, push,
-merge, publish, or replace the final review and operator gates.
+Call `inspect_delivery` with `phase: before_merge` to seal the exact reviews/evidence; then perform the separately authorized exact-tip merge. After merge, call `inspect_delivery` with `phase: after_merge` and attest the complete frozen task set only for tickets whose full approved scope it covers. `complete_delivery` records delivered tasks and closes only those complete tickets. Partial cuts retain deferred work; Head advances the queue explicitly afterward. See the playbook for recovery and merge provenance.
+
+Never construct a Delivery Candidate reference, SHA, tree, patch, review anchor, path or repository identity yourself. Copy server output. Retrying the same delivery key/payload resumes its durable intent; a refusal means re-read the owning source. These actions never merge, deploy, sign, pay, or run GitHub Actions.
 
 ## Gate, merge, and closure
 
 For each PR, independently verify the ticket contract, exact current PR tip, scope, required tests/checks, both reviewer verdicts at that same tip, and unresolved conversations. A verdict on an older SHA does not count. REQUEST CHANGES or BLOCK returns ownership to the named role; do not merge around it.
 
-Merge only the reviewed exact tip, then re-read the merge result and target branch. Update queue/ticket state from observed evidence, close or create narrowly scoped follow-ups, and dispatch the next non-conflicting item. Release, publish, signing, payment, OAuth, credential, or destructive actions require the operator's explicit action-specific approval even when code is merge-ready.
+Merge only the reviewed exact tip, then re-read the merge result and target branch. Update queue/ticket state from observed evidence, close or create narrowly scoped follow-ups, and dispatch the next non-conflicting item. Release/registry publication, signing, payment, OAuth, credential, or destructive actions require the operator's explicit action-specific approval even when code is merge-ready.
 
 ## Communication
 
@@ -126,3 +119,10 @@ Merge only the reviewed exact tip, then re-read the merge result and target bran
 - Address the role that must act next and include repository/item/attempt identity plus evidence.
 - Never copy an entire ticket or this playbook into chat; cite the durable source and exact revision.
 - When blocked, name the fact, what was checked, who owns the decision, and the smallest next action.
+## Local verification contract
+
+Use the registered evidence policy: new setup defaults to Local verification (`ci-less`); preserve explicit external-check policies.
+Dev runs existing checks on the clean exact candidate and submits authenticated evidence bound to source/base, policy, actual environment/scope, and the delivery manifest.
+Only completed exit-zero checks pass; missing, interrupted, or skipped checks do not. QuadWork records evidence without executing configured labels. Never trigger Actions for local verification.
+Merge requires current evidence and both independent final reviewer receipts. Source/base/policy/contract drift requires new evidence; read back the merge before closure.
+See the playbook and `docs/operator-mcp.md` for receipt fields and command records.

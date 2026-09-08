@@ -15,6 +15,10 @@ const {
   deliveryCandidateStorePath,
   createDeliveryCandidateStore,
 } = require("./delivery-candidate-store");
+const { advisoryLockAdapter } = require("./durable-store-advisory-lock");
+
+const advisory = advisoryLockAdapter();
+assert.equal(advisory.available, true, `the advisory lock primitive must be available: ${advisory.unavailable}`);
 
 const VERSION = 1;
 const installation_id = "installation_alpha_0001";
@@ -182,9 +186,12 @@ function composerOperations(value) {
     },
   };
 }
+// #1066: composition is awaited; the fixture is deterministic, so one proof
+// composed before the blocks run is the exact proof of every fresh fixture.
+let composedProof = null;
 function validContracts() {
   const value = fixture();
-  return { manifest: value.manifest, proof: composeDeliveryCandidate(value.manifest, composerOperations(value)) };
+  return { manifest: value.manifest, proof: copy(composedProof) };
 }
 function temporaryDirectory() { return fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-delivery-store-")); }
 function removeDirectory(directory) { fs.rmSync(directory, { recursive: true, force: true }); }
@@ -195,6 +202,12 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
     expected: expected(contracts.manifest.delivery_candidate_ref, revision), delivery_manifest: copy(contracts.manifest),
     composition_proof: copy(contracts.proof), correlation_id, idempotency_key,
   };
+}
+
+async function main() {
+{
+  const value = fixture();
+  composedProof = await composeDeliveryCandidate(value.manifest, composerOperations(value));
 }
 
 // The state is tied to one full DeliveryCandidateRef, retains canonical
@@ -318,8 +331,17 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
     const statePath = deliveryCandidateStorePath(directory, ref);
     const instance = store(directory);
     instance.initialize({ expected: expected(ref, null), delivery_manifest: copy(contracts.manifest) });
-    fs.writeFileSync(`${statePath}.lock`, "locked", { mode: 0o600, flag: "wx" });
-    throwsCode(() => instance.recordComposed(recordInput(contracts)), "delivery_candidate_store_locked");
+    // #1074: the `.lock` file is permanent, so planting one proves nothing.
+    // A live holder of the kernel lock on it is what refuses — and the same
+    // call goes through once that holder lets go, so this is not a store
+    // that simply refuses.
+    const holder = fs.openSync(`${statePath}.lock`, "r+");
+    try {
+      assert.equal(advisory.tryLock(holder), true, "the test holder took the lock");
+      throwsCode(() => instance.recordComposed(recordInput(contracts)), "delivery_candidate_store_locked");
+      advisory.unlock(holder);
+    } finally { fs.closeSync(holder); }
+    assert.equal(instance.recordComposed(recordInput(contracts)).snapshot.revision, 1, "the released lock lets the very same call through");
   } finally { removeDirectory(directory); }
 }
 {
@@ -361,9 +383,10 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
   } finally { removeDirectory(directory); }
 }
 
-// Linux reuses inode numbers eagerly, so a lock replaced after this writer
-// closed its descriptor can report the original dev+ino. The stubbed lstat
-// forces exactly that; only the lock token can then prove the replacement.
+// #1074 successor.  The claim is unchanged — a replacement lock carrying the
+// original dev+ino is never unlinked by the writer that held the original —
+// but the outcome is not.  The writer never acts on the lock *path*, so it
+// finishes its action and leaves the replacement exactly as it found it.
 {
   const directory = temporaryDirectory();
   try {
@@ -374,8 +397,11 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
     const lockPath = `${deliveryCandidateStorePath(directory, ref)}.lock`;
     let lockStats = 0;
     let original = null;
+    const touched = [];
     const replacingFs = {
       ...fs,
+      unlinkSync(target) { touched.push(["unlink", target]); return fs.unlinkSync(target); },
+      renameSync(from, to) { touched.push(["rename", from, to]); return fs.renameSync(from, to); },
       lstatSync(target) {
         if (target !== lockPath) return fs.lstatSync(target);
         lockStats += 1;
@@ -393,11 +419,17 @@ function recordInput(contracts, revision = 0, correlation_id = "correlation-1060
         return stats;
       },
     };
-    throwsCode(() => store(directory, replacingFs).recordComposed(recordInput(contracts)), "delivery_candidate_store_lock_release_failed");
-    assert.equal(lockStats, 2);
-    assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement");
+    assert.equal(store(directory, replacingFs).recordComposed(recordInput(contracts)).snapshot.revision, 1, "the writer finished its own action");
+    assert.equal(lockStats, 2, "the lock path is inspected once at acquisition and once at release");
+    assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement", "the replacement is left exactly as it was found");
+    assert.deepEqual(touched.filter(([, ...targets]) => targets.some((target) => String(target).endsWith(".lock"))), [],
+      `the writer touched a lock path: ${JSON.stringify(touched)}`);
+    assert.equal(touched.some(([kind]) => kind === "rename"), true, "the recorder is not blind: it saw the atomic replace");
     assert.equal(initial.readSnapshot(ref).revision, 1, "a replacement carrying the original dev+ino is never unlinked by the old writer");
   } finally { removeDirectory(directory); }
 }
+}
 
-console.log("delivery-candidate-store tests passed");
+let finished = false;
+process.on("exit", (code) => { if (!finished && code === 0) { console.error("delivery-candidate-store.test.js: did not run to completion"); process.exitCode = 1; } });
+main().then(() => { finished = true; console.log("delivery-candidate-store tests passed"); }, (error) => { console.error(error); process.exit(1); });

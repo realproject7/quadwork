@@ -144,12 +144,34 @@ function ok(value, message) {
   ok(true, "mixed tagged and legacy windows become a bounded projection-ready immutable snapshot without prose inference");
 }
 
-// Persisted authority is project- and Head-generation-bound.  A malformed,
+// Retained history keeps its original generation. The existing projection
+// selects only the current generation without invalidating the whole window.
+{
+  const records = [
+    tagged(1, "head_assignment", { structural: { head_generation: 0 } }),
+    tagged(2, "head_lifecycle", { structural: { head_generation: 6 } }),
+    tagged(3, "head_assignment"),
+    tagged(4, "worker_terminal", { structural: { trusted: false } }),
+    tagged(5, "head_lifecycle"),
+  ];
+  const snapshot = source(() => window(records)).read_snapshot(request());
+  assert.deepEqual(snapshot.records.map((entry) => entry.structural.head_generation), [0, 6, 7, 7, 7]);
+  const projected = projection(snapshot);
+  assert.deepEqual(projected.records.map((entry) => entry.id), [3, 5]);
+  assert.deepEqual(projected.diagnostics.filter((entry) => entry.code === "foreign_head_generation"), [
+    { record_id: 1, code: "foreign_head_generation" }, { record_id: 2, code: "foreign_head_generation" },
+  ]);
+  assert.deepEqual(records.map((entry) => entry.resume_structural.head_generation), [0, 6, 7, 7, 7]);
+  ok(true, "retained historical generations stay immutable and do not block current Head resume");
+}
+
+// Persisted authority is project- and Head-generation-bound. A malformed,
 // foreign, or raw-incompatible tag is a source corruption, not a diagnostic
 // that an integration layer could accidentally ignore.
 for (const record of [
   tagged(1, "head_assignment", { structural: { project_id: "other-project" } }),
-  tagged(1, "head_assignment", { structural: { head_generation: 8 } }),
+  ...[-1, 0.5, "7", null, Number.MAX_SAFE_INTEGER + 1].map((head_generation) =>
+    tagged(1, "head_assignment", { structural: { head_generation } })),
   tagged(1, "head_assignment", { structural: { forged: true } }),
   tagged(1, "head_assignment", { raw: { sender: "dev" } }),
 ]) {

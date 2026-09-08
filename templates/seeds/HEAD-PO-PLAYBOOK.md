@@ -132,12 +132,16 @@ from that contract; a title, chat sentence, or branch name is never identity.
 2. Write the manifest with `put_batch_manifest`, then `freeze_batch_manifest`
    before the first assignment. The server rejects duplicate task keys,
    unregistered repositories, missing or cyclic dependencies, and a changed
-   issue-body revision. After the freeze a contract change never edits a task.
+   issue-body revision. A stored manifest is never overwritten: if you decide
+   against it before the freeze, clear it with `abandon_batch_manifest` at its
+   current revision, then put the successor. Abandonment is refused once the
+   freeze has begun or a pipeline exists; a frozen batch leaves only through
+   `retire_batch`. After the freeze a contract change never edits a task.
    No server path applies one today, so treat a changed contract as your own
    decision: stop assigning the affected task and its declared dependents, and
    carry the successor into a new frozen manifest.
 3. Assign one queued task with `assign_work_task_build`. It succeeds only when
-   no task is `building`, every dependency is `accepted` or `staged`, and the
+   no task is `building`, every dependency is `accepted`, `staged` or provably `delivered`, and the
    task's file boundary is disjoint from every candidate still under review in
    that repository. Relay the returned `work_task_ref`, `assignment_id`, and
    `base_sha` to `@dev`; the server sends no worker message.
@@ -285,7 +289,7 @@ Before merge, independently prove:
 
 1. the issue contract and dependency state are current;
 2. the PR scope matches that contract and contains no unrelated change;
-3. required local tests and CI are green or explicitly waived by the operator;
+3. the repository's required verification passes for the exact candidate and integration base; local mode requires authenticated Dev receipts, while explicitly configured external checks must also pass;
 4. RE1 and RE2 each approved the exact current PR SHA as server-bound receipts (`2/2`);
 5. no unresolved review conversation, requested change, conflict, or drift exists;
 6. the target branch and merge method are correct.
@@ -340,7 +344,7 @@ The record is a notice, not authority. Nothing is queued, woken, or started.
 
 ## 15. Release and operator gates
 
-Separate merge readiness from release authority. Production release, publish,
+Separate merge readiness from release authority. Production release, registry publication,
 signing, payment, OAuth/consent, credential access, destructive cleanup, and
 irreversible external communication require explicit action-specific operator
 approval. Present exact target, evidence, effect, rollback, and the decision
@@ -371,3 +375,31 @@ project chat and durable GitHub/queue state; do not create private handoff files
 End with one of: delivery complete with evidence; safely waiting on a named
 observable event; or blocked on a named owner and decision. Never imply that a
 future action already happened.
+
+
+## Local verification contract
+
+Use the repository's explicit evidence policy. New V2 setup selects Local
+verification (`ci-less`); existing external-check policies are never silently
+replaced. Dev runs the repository's existing checks on the clean exact candidate,
+records the integration base, normalized policy digest, actual environment and
+scope, and submits the authenticated evidence operation. Delivery evidence also
+binds the composed manifest digest. Pass requires exit code zero; missing,
+interrupted or skipped checks are not a pass. QuadWork records evidence and does
+not execute configured labels. Never trigger Actions for local verification.
+Head requires the current candidate/base evidence and both independent final
+reviewer receipts before merge. A changed source/base/policy/contract requires
+new evidence; read back the merged state before closure. See
+`docs/operator-mcp.md` for the receipt fields and local command record.
+
+## Autonomous repository delivery
+
+After the existing local prepare/compose steps, `form_delivery` records Head's scoped ordinary/isolated classification, release intent and rollback group beside the current frozen cut. It resolves current assignment, exact task/body revisions, independent receipts and repository policy; a caller boolean cannot waive an operator gate. Fixed isolation reasons require isolated mode. Credential/payment/signing/registry/production/destructive work and explicit `operator-hold`, `operator-gated`, `requires-operator-approval` labels or `<!-- quadwork:operator-gate -->` remain blocked in this ordinary route. Old manifests without formation cannot publish.
+
+`publish_delivery` takes the server's ref, candidate revision and plan digest through the existing Head optimistic/idempotent envelope. It validates the effective canonical GitHub target, exact pinned default branch, reviewed tree and live formation before each remote step. It creates an absent deterministic branch only, reads it back, and creates/finds one same-repository non-draft PR with the manifest marker. A collision, closed-unmerged PR or base drift is a refusal. Never repair the remote, force-overwrite a branch, delete a partial publication or manufacture a new key just because a response was lost. Retry the same exact operation to query the branch/PR first. Archive preserves factual partial effects and prevents the next mutation. A recovered failed operation has a separate reconciliation audit; the original denial stays recorded. After a Head generation change, the old binding cannot retry. A fresh authenticated `form_delivery` may adopt an already-published ordinary candidate only when the exact frozen facts and declaration still match; the original publication receipt and plan remain immutable.
+
+Publication proves composition and current task review; it does not claim the required named final checks passed. Dev may run those checks before publication on the exact clean candidate and submit the authenticated final PR receipt afterward only while candidate/base/manifest/policy still match. `ci-less` requires the current `read_ci_evidence({record_id})` results and environment/scope. Explicit external policy requires its registered live checks. Both independent exact-SHA final reviewers still inspect integration and composition effects.
+
+Before merging, call `inspect_delivery` with `phase: before_merge`, `judgment: approved` and empty `complete_scope_tasks`. It seals fresh OPEN/non-draft exact head/base, both authenticated approvals, passing required verification and policy. Then use the normal explicitly authorized exact-head merge, respecting branch protection and unresolved conversations; there is no merge action in this executor. Afterward call `inspect_delivery` with `phase: after_merge`. It verifies the MERGED PR against the immutable premerge seal, actual merge tree and parents, and reachability from the target branch. Merge and squash are supported; a merge SHA different from candidate SHA and later unrelated target-branch commits are normal. Missing/late seals, wrong tree/parents/head, dismissed reviews or unsupported provenance yield `merged_unverified`, never fabricated premerge evidence.
+
+In postmerge inspection, `complete_scope_tasks` contains the exact frozen refs Head attests cover each ticket's entire approved contract. `complete_delivery` names that inspection receipt and maps only the included exact tasks to delivered. It closes a ticket only when every required frozen ref is delivered, Head attested full scope, and the fresh body revision still matches. Partial scope/remaining tasks leave the issue open. Closure intent and each readback persist independently; a retry skips matching already-closed issues and resumes unfinished closure. It never edits issue bodies or advances the queue. The pipeline records delivered predecessor provenance and advances the repository base to the actual merge SHA; remaining old-base candidates are invalidated for fresh build/review. A partial cut never retires the frozen batch.

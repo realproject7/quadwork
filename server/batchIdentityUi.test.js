@@ -345,9 +345,15 @@ assert.match(queueManager, /disabled=\{directStartBlocked\}/, "activated V2 Queu
 assert.match(queueManager, /server-issued assignment workflow/, "blocked QueueManager action explains the authoritative start prerequisite");
 assert.doesNotMatch(queueManager, /await copyPrompt\(\)[\s\S]{0,100}Prompt copied/, "send failure never copies an executable prompt as a fallback");
 
+// #1073 moved the preset copy and the storage migration into a shared plain-JS
+// module so the migration can be executed, not pattern-matched. The wording of
+// the queue-format preset is still guarded here; the migration behaviour it used
+// to approximate with a source-text match is now asserted by running the helper
+// in server/chatPresetMigration.test.js.
+const chatPresetMigration = fs.readFileSync(path.join(root, "src", "lib", "chatPresetMigration.js"), "utf8");
+assert.match(chatPresetMigration, /owner\/repo#<number>/, "queue-format preset preserves V2 repository-qualified identity");
+assert.match(chatPresetMigration, /pre-activation V1 single-repository/, "queue-format preset keeps the narrow V1 bare-ref compatibility boundary");
 const chatPresets = fs.readFileSync(path.join(root, "src", "components", "ChatPresets.tsx"), "utf8");
-assert.match(chatPresets, /owner\/repo#<number>/, "queue-format preset preserves V2 repository-qualified identity");
-assert.match(chatPresets, /pre-activation V1 single-repository/, "queue-format preset keeps the narrow V1 bare-ref compatibility boundary");
-assert.match(chatPresets, /preset\.message === LEGACY_QUEUE_FORMAT_PRESET/, "cached untouched V1 defaults migrate without clobbering user edits");
+assert.match(chatPresets, /loadPresetsFrom\(window\.localStorage\)/, "the preset UI reads storage through the shared migration helper");
 
 console.log("batch identity UI tests passed");

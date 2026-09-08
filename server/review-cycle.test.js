@@ -45,7 +45,7 @@ function source(overrides = {}) {
     project_id: PROJECT,
     repository: { key: "web", repo: "Acme/Web", ci_policy: policy() },
     work_item: { repoKey: "web", repo: "Acme/Web", number: 42, kind: "issue" },
-    pr: { number: 99, exact_sha: SHA_A, draft: false, mergeable: true },
+    pr: { number: 99, base_sha: "0".repeat(40), exact_sha: SHA_A, draft: false, mergeable: true },
     issue_contract: { contract_revision: CONTRACT_A },
     assignment_attempt: "attempt-a",
   };
@@ -396,6 +396,8 @@ const migrationPath = migrationStore.pathFor(migrationProject);
 const v3 = JSON.parse(fs.readFileSync(migrationPath, "utf8"));
 const migrationCycleId = Object.keys(v3.cycles)[0];
 const v3Cycle = v3.cycles[migrationCycleId];
+v3Cycle.target.version = 1;
+delete v3Cycle.target.base_sha;
 const legacyTargetDigest = legacyV3TargetDigest(v3Cycle.target);
 const legacySlotDigest = legacyV3SlotDigest(v3Cycle.target);
 v3.version = 3;
@@ -408,11 +410,14 @@ fs.writeFileSync(migrationPath, `${JSON.stringify(v3)}\n`, { encoding: "utf8", m
 const migrated = freshStore().load(migrationProject);
 const migratedCycle = migrated.cycles[migrationCycleId];
 assert.equal(migrated.version, REVIEW_CYCLE_STORE_VERSION);
-assert.equal(migratedCycle.target_identity_digest, targetIdentityDigest(migrationTarget.identity));
-assert.equal(migratedCycle.slot_digest, targetSlotDigest(migrationTarget.identity));
-assert.equal(migratedCycle.receipts.re1.target_identity_digest, migrationTarget.target_identity_digest);
-assert.equal(migrated.slots[migrationTarget.slot_digest], migrationCycleId);
-assert.equal(freshStore().current(migrationProject, migrationTarget).cycle_id, migrationCycleId);
+assert.equal(migratedCycle.target_identity_digest, targetIdentityDigest(v3Cycle.target));
+assert.equal(migratedCycle.receipts.re1.review_id, "601");
+assert.equal(migratedCycle.state, "invalidated");
+assert.deepEqual(migratedCycle.invalidation.reasons, ["base_changed"]);
+assert.equal(Object.keys(migrated.slots).length, 0);
+const freshBaseCycle = freshStore().reconcile(migrationProject, migrationTarget).cycle;
+assert.notEqual(freshBaseCycle.cycle_id, migrationCycleId);
+assert.deepEqual(freshBaseCycle.receipts, { re1: null, re2: null });
 const malformedV3 = JSON.parse(JSON.stringify(v3));
 malformedV3.cycles[migrationCycleId].target_identity_digest = "0".repeat(64);
 fs.writeFileSync(migrationPath, `${JSON.stringify(malformedV3)}\n`, { encoding: "utf8", mode: 0o600, flag: "w" });
@@ -421,6 +426,21 @@ assert.throws(
   (error) => error.code === "review_cycle_store_invalid",
 );
 ok(true, "V3 review cycles migrate only from verified legacy digests into canonical WorkItemRef exact-SHA identity");
+
+const baseProject = "base-drift";
+const baseTarget = target({ project_id: baseProject });
+store.reconcile(baseProject, baseTarget);
+store.setCiState(baseProject, baseTarget, "pass");
+store.planReviewRequest(baseProject, baseTarget);
+store.recordReviewReceipt(baseProject, baseTarget, receipt("re1", 901, "approved", { target_identity_digest: baseTarget.target_identity_digest }));
+const baseMoved = target({ project_id: baseProject, pr: { base_sha: "9".repeat(40) } });
+const baseReplaced = store.reconcile(baseProject, baseMoved);
+assert.deepEqual(baseReplaced.invalidated.reasons, ["base_changed"]);
+assert.deepEqual(baseReplaced.cycle.receipts, { re1: null, re2: null });
+assert.equal(baseReplaced.cycle.head_gate_due, false);
+assert.equal(store.invalidateCurrent(baseProject, baseReplaced.cycle.cycle_id, baseMoved.target_identity_digest), true);
+assert.equal(store.invalidateCurrent(baseProject, baseReplaced.cycle.cycle_id, baseMoved.target_identity_digest), false);
+ok(true, "integration base drift replaces review standing and current-target retirement is idempotent");
 
 const terminal = restarted.markTerminal(PROJECT, ciLess);
 assert.equal(terminal.state, "terminal");

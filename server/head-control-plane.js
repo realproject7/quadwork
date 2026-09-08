@@ -14,6 +14,7 @@
 
 const crypto = require("node:crypto");
 
+const DELIVERY = require("./delivery-execution-contract");
 const VERSION = 1;
 const MAX_AUDIT_RECORDS = 128;
 const MAX_IDEMPOTENCY_RECORDS = 64;
@@ -30,18 +31,20 @@ const ACTIONS = Object.freeze([
   "freeze_batch_manifest",
   "cut_batch",
   "retire_batch",
+  "abandon_batch_manifest",
   "queue_local_correction",
   "read_propagation_stop",
   "get_project_status",
   "review_handoff",
   "project_monitor",
   "recover_worker",
+  ...DELIVERY.ACTIONS,
 ]);
 const ACTION_SET = new Set(ACTIONS);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff"]);
 const CONTROL_ACTIONS = new Set(["project_monitor", "recover_worker"]);
-const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "get_project_status", "review_handoff"]);
-const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
+const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "abandon_batch_manifest", "get_project_status", "review_handoff"]);
+const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", ...DELIVERY.ACTIONS]);
 const READ_CODES = Object.freeze({ get_project_status: "head_control_project_observed", review_handoff: "head_control_handoff_observed" });
 const CONTROL_REFUSED_CODES = Object.freeze({ project_monitor: "head_control_monitor_refused", recover_worker: "head_control_recovery_refused" });
 const MONITOR_COMMANDS = new Set(["start", "stop", "evaluate_now"]);
@@ -234,6 +237,8 @@ function request(value) {
   };
   if (PAYLOADLESS_ACTIONS.has(value.action)) {
     if (value.payload !== null) fail("invalid_head_control_request", "action does not accept payload");
+  } else if (DELIVERY.ACTIONS.includes(value.action)) {
+    parsed.payload = DELIVERY.assertPayload(value.action, value.payload);
   } else if (value.action === "put_batch_manifest") {
     parsed.payload = assertPutPayload(value.payload);
   } else if (value.action === "queue_local_correction") {
@@ -279,8 +284,8 @@ function invocation(value) {
 function createHeadControlPlane(options) {
   exact(options, ["binding", "domain"], "invalid_head_control_options");
   const bound = binding(options.binding, "invalid_head_control_options");
-  exact(options.domain, ACTIONS, "invalid_head_control_options");
-  for (const action of ACTIONS) {
+  exact(options.domain, ACTIONS.filter((action) => !DELIVERY.ACTIONS.includes(action) || Object.hasOwn(options.domain, action)), "invalid_head_control_options");
+  for (const action of ACTIONS.filter((action) => !DELIVERY.ACTIONS.includes(action) || Object.hasOwn(options.domain, action))) {
     if (typeof options.domain[action] !== "function") fail("invalid_head_control_options", `${action} domain action is required`);
   }
   const domain = options.domain;
@@ -390,11 +395,11 @@ function createHeadControlPlane(options) {
     try { observed = await observe(input); }
     catch (error) {
       if (error instanceof HeadControlPlaneError && error.code === "head_control_domain_invalid_status") return { error: error.code };
-      return { error: input.action === "cut_batch" ? "head_control_unsafe_cut" : "head_control_domain_rejected" };
+      return { error: input.action === "cut_batch" ? "head_control_unsafe_cut" : "head_control_domain_rejected", detail: DELIVERY.ACTIONS.includes(input.action) ? { code: /^[a-z][a-z0-9_]{2,127}$/.test(error?.code || "") ? error.code : "delivery_operation_unknown", ...(error?.code === "merged_unverified" && error.facts ? { facts: DELIVERY.bounded(error.facts) } : {}) } : null };
     }
     try {
       const status = observed.status;
-      if (status.revision !== prior.revision + 1) return { error: "head_control_domain_invalid_status" };
+      if (DELIVERY.ACTIONS.includes(input.action) ? status.revision < prior.revision : status.revision !== prior.revision + 1) return { error: "head_control_domain_invalid_status" };
       if (status.archived) return { error: "head_control_domain_invalid_transition" };
       if (input.action === "put_batch_manifest" &&
           (status.manifest_digest === null || status.manifest_frozen || status.pipeline_digest !== null || status.cut_safe)) {
@@ -408,7 +413,7 @@ function createHeadControlPlane(options) {
           (!status.manifest_frozen || status.pipeline_digest === null || status.pipeline_digest === prior.pipeline_digest)) {
         return { error: "head_control_domain_invalid_transition" };
       }
-      if (input.action === "retire_batch" && status.manifest_digest !== null) {
+      if ((input.action === "retire_batch" || input.action === "abandon_batch_manifest") && status.manifest_digest !== null) {
         return { error: "head_control_domain_invalid_transition" };
       }
       if (input.action === "queue_local_correction" && (!status.manifest_frozen || status.pipeline_digest === null)) {
@@ -507,7 +512,7 @@ function createHeadControlPlane(options) {
       cache(input, fingerprint, result);
       return result;
     }
-    if (input.expected_revision !== status.revision) {
+    if (input.expected_revision !== status.revision && !DELIVERY.ACTIONS.includes(input.action)) {
       const result = deny(input, "head_control_stale_revision", status);
       cache(input, fingerprint, result);
       return result;
@@ -532,6 +537,13 @@ function createHeadControlPlane(options) {
       cache(input, fingerprint, result);
       return result;
     }
+    // Abandonment is only for a manifest that exists and was never frozen;
+    // once a pipeline exists the batch leaves through retirement alone.
+    if (input.action === "abandon_batch_manifest" && (status.manifest_digest === null || status.manifest_frozen || status.pipeline_digest !== null)) {
+      const result = deny(input, "head_control_abandon_unsafe", status);
+      cache(input, fingerprint, result);
+      return result;
+    }
     if (input.action === "queue_local_correction" && (!status.manifest_frozen || status.pipeline_digest === null)) {
       const result = deny(input, "head_control_correction_unsafe", status);
       cache(input, fingerprint, result);
@@ -539,7 +551,7 @@ function createHeadControlPlane(options) {
     }
     const mutation = await invokeMutation(input, status);
     const result = mutation.error
-      ? deny(input, mutation.error, status)
+      ? deny(input, mutation.error, status, mutation.detail || null)
       : response(input, "accepted", "head_control_applied", mutation.status, true, mutation.detail);
     cache(input, fingerprint, result);
     return result;

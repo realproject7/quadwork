@@ -72,9 +72,9 @@ Always start here; every other tool takes a project `id` from this list.
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `list_projects` | — | `[{ id, name, repo }]` |
+| `list_projects` | — | `[{ id, name, repositories, repo }]`; `repo` is the temporary primary alias. Use `repositories[]` for qualified work. |
 | `read_chat` | `project`, `since_id?`, `limit?` (default 50) | message array (`id`, `sender`, `text`, ISO `ts`, `type`, `channel`) |
-| `batch_status` | `project` | `{ active, progress }` — `active` follows the live `## Active Batch` lifecycle (cleared queue → `false`) and is **authoritative** for "work remaining"; `progress` may keep rendering a just-finished batch (sticky display) |
+| `batch_status` | `project` | `{ active, progress }` follows the live `## Active Batch`. An empty section stays empty; completed or historical work never becomes a new assignment. |
 | `read_queue` | `project` | `{ exists, content }` (raw `OVERNIGHT-QUEUE.md` markdown) |
 | `list_agents` | `project?` | `[{ project, agent, state, error }]` — `state` is `running` / `stopped` / `missing` (omit `project` for all projects) |
 
@@ -94,25 +94,24 @@ Always start here; every other tool takes a project `id` from this list.
 
 ## 3. Workflow recipes
 
-### Assign & start a batch
-1. `list_projects` → grab the `id`.
-2. **Let Head plan the work** (the normal flow): `send_message` →
-   `"@head start a batch for <feature>: #12 #15 #18"`. Head files the issues and
-   writes `OVERNIGHT-QUEUE.md`, then asks you to start.
-   *(Alternatively define the queue directly with `set_batch` / `append_batch`,
-   but Head-driven is the supported path.)*
-3. Kick it off:
-   - `start_batch` to enable the Monitor, or
-   - `trigger_now` for one immediate evaluation.
-   There is no cadence to pick and no message to write. The Monitor observes the
-   current qualified assignment and writes a single structured event to `@head`
-   only when a fixed-policy transition is due; unchanged state writes nothing
-   and wakes no agent.
-4. Monitor (below).
+### Assign and observe a batch
+1. `list_projects` → use the exact project id and registered repositories.
+2. `list_agents` → confirm the configured roles are running. Use the existing `agent_control` lifecycle tools to start a stopped role when the operator has authorized the work.
+3. `send_message` → `"@head plan and implement <feature>: owner/repo#12 owner/repo#15"`. Head owns issue edits, scope, the queue, frozen manifests and authenticated assignment. A queue file or chat sentence alone cannot authorize a V2 worker.
+4. Head enables the Project Monitor after the batch is qualified. `start_batch` enables this same observation; `trigger_now` requests one immediate evaluation. Neither creates assignments, starts workers, nor advances the queue. There is no cadence or repeating message. Due events go only to Head.
+5. Observe progress below. Head explicitly advances eligible work and closes the batch at completion. Empty or completed batches never start the next batch automatically.
+
+For Local verification, Dev runs the repository's required commands and submits
+named `unit`, `typecheck`, and `build` receipts for the exact candidate and base.
+These labels are not executable commands. Head needs passing current evidence,
+two independent exact-candidate final approvals and a fresh merge gate before
+merging. No GitHub Actions run is required in local mode; explicit external-check
+policies retain their own requirements. Follow the
+[verification contract](../../docs/operator-mcp.md#local-verification-and-merge-evidence).
 
 ### Monitor a running batch
-- `batch_status` → trust `active` for whether work remains; `progress` for the
-  per-item bars (it may stay "sticky" on a just-finished batch).
+- `batch_status` → inspect the live `active` and per-item `progress`. Current
+  Batch never falls back to historical work when the Active Batch section is empty.
 - `read_chat` with `since_id` (the last id you saw) to tail the team conversation.
 - `read_queue` to see raw item states.
 
@@ -127,6 +126,10 @@ Review batches review *tickets* or *merged PRs* in review-only mode (no code, no
 merges). Just ask Head — it stamps the `**Batch type:**` marker:
 - `send_message` → `"@head review tickets #12 #15"` (`ticket-review`), or
 - `send_message` → `"@head review merged PRs #40 #41"` (`pr-review`).
+
+Head alone edits issue contracts, files follow-ups and closes review items. Dev
+has no review-driver or issue-edit role. Reviewers return independent verdicts
+bound to the assigned revision or merged SHA.
 
 `batch_status` then shows review states (*queued · in review · 1 of 2 approvals ·
 approved*), not merge language. See
@@ -153,13 +156,12 @@ GraphQL-backed `gh pr list` (see the review-batch recipe above).
 - **`send_message` acts as the human operator** (sender `user`) and **resets the
   chat loop guard** — exactly as if a human typed in the dashboard. It *wakes*
   agents (`@head do X`). Use it deliberately; don't spam it.
-- **Don't touch infrastructure ports.** Never kill or "manage" the QuadWork
-  backend port (default **8400**) or a project's orchestrator MCP ports
-  (`mcp_http_port` / `mcp_sse_port`) — operating QuadWork through these tools is
-  what runs *you*. `agent_control` only touches an agent's own PTY, which is safe.
+- **Do not manage the backend through agent lifecycle tools.** The backend
+  defaults to port **8400**. `agent_control` manages the selected role session;
+  it does not control the backend. V2 has no per-project legacy MCP HTTP/SSE ports.
 - **Act-tools mutate live state — confirm before destructive moves.**
-  `set_batch` overwrites the **entire** queue; `start_batch` starts a recurring
-  timer; `append_batch` is not atomic (re-read first). Destructive ops
+  `set_batch` overwrites the **entire** queue; `start_batch` enables observation
+  only; `append_batch` is not atomic (re-read first). Destructive ops
   (full reset, config reset, raw PTY writes) are intentionally **not** exposed.
 - Unknown project/agent ids are rejected **before** any HTTP call, so a typo
   can't strand `~/.quadwork/<id>/` state or start a runaway trigger.

@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #837 regression: ghApiConditional must parse a >1MB closed-PR list page
 // rather than crashing on Node's default 1MB execFile maxBuffer. A measured
 // realproject7/quadwork `pulls?state=closed&per_page=100` -i page was

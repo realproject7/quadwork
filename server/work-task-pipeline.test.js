@@ -320,6 +320,114 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   })), "stale_work_task_candidate");
 }
 
+// #1070: the local correction cap is a per-task fact, not a property of the
+// active checkpoint. Three corrections may be queued for one task; the fourth
+// is refused before any plan exists, even though every corrected candidate
+// cleared the checkpoint authority that carried the previous count.
+{
+  const batch = manifest();
+  const workRefs = refs(batch);
+  let work = buildWorkTaskPipeline(batch);
+  let candidate = candidateFor(workRefs.core, "b");
+  work = apply(work, event("assign_build", "cap_build_0", { work_task_ref: copy(workRefs.core), assignment_id: "cap_assignment_0" }));
+  work = apply(work, event("record_candidate", "cap_candidate_0", { assignment_id: "cap_assignment_0", candidate }));
+  const requestChanges = (pipeline, round) => {
+    const review = { work_task_ref: copy(workRefs.core), review_round_id: `cap_round_${round}`, candidate_digest: candidate.candidate_digest };
+    let next = apply(pipeline, event("assign_independent_review", `cap_review_${round}`, review));
+    next = apply(next, event("record_review_verdict", `cap_verdict_${round}`, { ...review, verdict: "changes_requested" }));
+    return apply(next, event("reconcile_review", `cap_reconcile_${round}`, { ...review, resolution: "changes_requested" }));
+  };
+  const correction = (round) => event("queue_local_correction", `cap_checkpoint_${round}`, { work_task_ref: copy(workRefs.core), checkpoint_id: `cap_checkpoint_id_${round}` });
+  assert.equal(slot(work, workRefs.core).correction_count, 0);
+  for (const round of [1, 2, 3]) {
+    work = requestChanges(work, round);
+    assert.equal(slot(work, workRefs.core).correction_count, round - 1);
+    work = apply(work, correction(round));
+    assert.deepEqual(slot(work, workRefs.core).correction, { checkpoint_id: `cap_checkpoint_id_${round}`, count: round });
+    assert.equal(slot(work, workRefs.core).correction_count, round);
+    // The same event replayed is a duplicate, never a second increment.
+    throwsCode(() => planWorkTaskPipelineEvent(work, correction(round)), "duplicate_work_task_pipeline_event");
+    candidate = candidateFor(workRefs.core, "cde"[round - 1]);
+    work = apply(work, event("assign_build", `cap_build_${round}`, { work_task_ref: copy(workRefs.core), assignment_id: `cap_assignment_${round}` }));
+    assert.equal(slot(work, workRefs.core).correction.count, round);
+    work = apply(work, event("record_candidate", `cap_candidate_${round}`, { assignment_id: `cap_assignment_${round}`, candidate }));
+    assert.equal(slot(work, workRefs.core).correction, null);
+    assert.equal(slot(work, workRefs.core).correction_count, round);
+  }
+  work = requestChanges(work, 4);
+  assert.equal(slot(work, workRefs.core).state, "changes_requested");
+  assert.equal(slot(work, workRefs.core).correction_count, 3);
+  throwsCode(() => planWorkTaskPipelineEvent(work, correction(4)), "work_task_checkpoint_limit");
+  assert.equal(work.history.filter((entry) => entry.kind === "queue_local_correction").length, 3);
+  // A verdict against a candidate that is no longer current never touches the
+  // count, and a server-observed replacement candidate carries it forward
+  // through a fresh review round and its reconciliation.
+  const stale = candidate;
+  candidate = candidateFor(workRefs.core, "f");
+  work = apply(work, event("replace_candidate", "cap_replace", { candidate }));
+  assert.equal(slot(work, workRefs.core).state, "candidate_ready");
+  assert.equal(slot(work, workRefs.core).correction_count, 3);
+  work = apply(work, event("assign_independent_review", "cap_review_5", { work_task_ref: copy(workRefs.core), review_round_id: "cap_round_5", candidate_digest: candidate.candidate_digest }));
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("record_review_verdict", "cap_stale_verdict", {
+    work_task_ref: copy(workRefs.core), review_round_id: "cap_round_5", candidate_digest: stale.candidate_digest, verdict: "changes_requested",
+  })), "stale_work_task_candidate");
+  work = apply(work, event("record_review_verdict", "cap_verdict_5", { work_task_ref: copy(workRefs.core), review_round_id: "cap_round_5", candidate_digest: candidate.candidate_digest, verdict: "changes_requested" }));
+  work = apply(work, event("reconcile_review", "cap_reconcile_5", { work_task_ref: copy(workRefs.core), review_round_id: "cap_round_5", candidate_digest: candidate.candidate_digest, resolution: "changes_requested" }));
+  assert.equal(slot(work, workRefs.core).correction_count, 3);
+  throwsCode(() => planWorkTaskPipelineEvent(work, correction(5)), "work_task_checkpoint_limit");
+  // The count is validated as its own bounded fact and the active checkpoint
+  // must agree with it; neither can be forged past the cap.
+  const rejects = (pipeline, reason) => assert.throws(() => assertWorkTaskPipeline(pipeline), (error) => error instanceof WorkTaskPipelineError && error.code === "invalid_work_task_pipeline" && reason.test(error.message));
+  for (const forged of [4, -1, 2.5, "3", null]) {
+    const malformed = copy(work);
+    slot(malformed, workRefs.core).correction_count = forged;
+    rejects(malformed, /task correction count is invalid/);
+  }
+  const disagreeing = copy(work);
+  slot(disagreeing, workRefs.core).state = "queued";
+  slot(disagreeing, workRefs.core).correction = { checkpoint_id: "cap_forged", count: 1 };
+  rejects(disagreeing, /contradicts the task correction count/);
+}
+
+// #1070: a propagation stop and a contract change clear correction authority
+// on the source and its declared dependents, but never a task's correction
+// count; a paused dependent resumes with the corrections it already spent.
+{
+  const batch = manifest();
+  const workRefs = refs(batch);
+  let work = buildWorkTaskPipeline(batch);
+  const core = moveToCandidate(work, workRefs.core, "b", "prop_core");
+  work = core.pipeline;
+  const coreReview = { work_task_ref: copy(workRefs.core), review_round_id: "prop_core_round", candidate_digest: core.candidate.candidate_digest };
+  work = apply(work, event("assign_independent_review", "prop_core_review", coreReview));
+  work = apply(work, event("record_review_verdict", "prop_core_verdict", { ...coreReview, verdict: "approved" }));
+  work = apply(work, event("reconcile_review", "prop_core_reconcile", { ...coreReview, resolution: "accepted" }));
+  const web = moveToCandidate(work, workRefs.web, "c", "prop_web");
+  work = web.pipeline;
+  const webReview = { work_task_ref: copy(workRefs.web), review_round_id: "prop_web_round", candidate_digest: web.candidate.candidate_digest };
+  work = apply(work, event("assign_independent_review", "prop_web_review", webReview));
+  work = apply(work, event("record_review_verdict", "prop_web_verdict", { ...webReview, verdict: "changes_requested" }));
+  work = apply(work, event("reconcile_review", "prop_web_reconcile", { ...webReview, resolution: "changes_requested" }));
+  work = apply(work, event("queue_local_correction", "prop_web_checkpoint", { work_task_ref: copy(workRefs.web), checkpoint_id: "prop_web_checkpoint_one" }));
+  assert.equal(slot(work, workRefs.web).correction_count, 1);
+  work = apply(work, event("propagating_finding", "prop_finding", { work_task_ref: copy(workRefs.core), candidate_digest: core.candidate.candidate_digest, finding_id: "prop_finding_one" }));
+  assert.equal(slot(work, workRefs.core).state, "changes_requested");
+  assert.equal(slot(work, workRefs.core).correction_count, 0);
+  assert.equal(slot(work, workRefs.web).state, "blocked");
+  assert.equal(slot(work, workRefs.web).correction, null);
+  assert.equal(slot(work, workRefs.web).correction_count, 1);
+  assert.equal(slot(work, workRefs["api-client"]).correction_count, 0);
+  // The change request a propagation stop raises on the source spends one of
+  // the source's own corrections; the dependents' counts are untouched.
+  work = apply(work, event("queue_local_correction", "prop_core_checkpoint", { work_task_ref: copy(workRefs.core), checkpoint_id: "prop_core_checkpoint_one" }));
+  assert.equal(slot(work, workRefs.core).correction_count, 1);
+  work = apply(work, event("unblock", "prop_unblock", { work_task_ref: copy(workRefs.web) }));
+  assert.equal(slot(work, workRefs.web).state, "queued");
+  assert.equal(slot(work, workRefs.web).correction_count, 1);
+  work = apply(work, event("contract_change", "prop_contract", { work_task_ref: copy(workRefs.core), observed_issue_body_revision: "f".repeat(64) }));
+  assert.deepEqual(work.tasks.map((entry) => [entry.state, entry.correction, entry.correction_count]), [["deferred", null, 1], ["deferred", null, 1], ["deferred", null, 0], ["queued", null, 0]]);
+}
+
 // A server-observed candidate replacement can occur while a review is active;
 // it atomically revokes that review authority before the new exact candidate
 // becomes eligible for another independent round.

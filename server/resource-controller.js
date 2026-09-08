@@ -1,11 +1,11 @@
 "use strict";
 
-// #1038: This is a candidate invocation contract until the disposable-VPS
-// staging matrix proves PTY ownership, resize/signals, exit propagation, and
-// descendant containment. In particular, do not add --pipe: it does not make
-// the child a TTY controller. #1053 owns the later node-pty/live-spawn wiring.
+// #1038: supported describes this fixed systemd >=253 primitive, not runtime
+// readiness or a staging PASS. The closed launch owner must first observe a
+// real bounded PTY/descendant probe on this host. Do not add --pipe: it does
+// not make the child a TTY controller.
 const SYSTEMD_SCOPE_CANDIDATE = Object.freeze({
-  status: "candidate_pending_staging",
+  status: "supported",
   executable: "systemd-run",
   fixedArgs: Object.freeze(["--user", "--scope", "--collect", "--quiet"]),
 });
@@ -14,13 +14,14 @@ const SYSTEMD_SCOPE_CANDIDATE = Object.freeze({
 // builder describes the separate, explicit candidate command that would set a
 // shared slice's aggregate properties. Nothing in this module executes it.
 const SYSTEMD_CONTROL_CLASS_CANDIDATE = Object.freeze({
-  status: "candidate_pending_staging",
+  status: "supported",
   executable: "systemctl",
   fixedArgs: Object.freeze(["--user", "--runtime", "set-property"]),
 });
 
 const UNIT_NAME_RE = /^[a-z][a-z0-9-]{0,62}$/;
 const CONTROL_CLASS_NAME_RE = /^[a-z][a-z0-9-]{0,62}\.slice$/;
+const OWNED_PARENT_SLICE_RE = /^quadwork-(?:(?:staging|proof)-[a-f0-9]{16,64}|worker-group-[a-f0-9]{40})\.slice$/;
 const QUALIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SIGNAL_RE = /^SIG[A-Z0-9]{1,30}$/;
 const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
@@ -110,10 +111,25 @@ function buildWorkerScopeInvocation(spec) {
     ...SYSTEMD_SCOPE_CANDIDATE.fixedArgs,
     `--unit=${ids.unitName}`,
   ];
+  // Names are generated and owned by the closed launch/staging coordinator.
+  // Syntax validation is not a claim that an arbitrary existing slice is ours.
+  if (Object.prototype.hasOwnProperty.call(spec, "parentSlice")) {
+    if (typeof spec.parentSlice !== "string" || !OWNED_PARENT_SLICE_RE.test(spec.parentSlice)) {
+      throw invalid("parentSlice", "must be a generated QuadWork worker or staging slice");
+    }
+    args.push(`--slice=${spec.parentSlice}`);
+  }
+  if (Object.prototype.hasOwnProperty.call(spec, "runtimeMaxSec")) {
+    if (!Number.isSafeInteger(spec.runtimeMaxSec) || spec.runtimeMaxSec < 1 || spec.runtimeMaxSec > 120) {
+      throw invalid("runtimeMaxSec", "must be an integer from 1 through 120 seconds");
+    }
+    args.push("-p", `RuntimeMaxSec=${spec.runtimeMaxSec}s`);
+  }
   for (const property of [
     `MemoryHigh=${limits.memoryHighMib}M`,
     `MemoryMax=${limits.memoryMaxMib}M`,
     `MemorySwapMax=${limits.swapMaxMib}M`,
+    "OOMPolicy=kill",
   ]) args.push("-p", property);
   args.push("--", spec.command, ...(spec.args || []));
   return {

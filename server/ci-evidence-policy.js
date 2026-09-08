@@ -204,7 +204,7 @@ function invalidResult(policy, identity, input, code) {
 
 function normalizeEvaluationInput(input) {
   if (!plain(input)) return null;
-  const allowed = new Set(["policy", "policy_identity", "exact_sha", "observed_at", "first_observed_at", "source_status", "check_runs", "ci_less_evidence", "retry_count", "now"]);
+  const allowed = new Set(["policy", "policy_identity", "exact_sha", "observed_at", "first_observed_at", "source_status", "check_runs", "ci_less_evidence", "base_sha", "retry_count", "now"]);
   if (Object.keys(input).some((key) => !allowed.has(key)) || !own(input, "exact_sha") || !own(input, "observed_at") || !own(input, "source_status") ||
       !canonicalSha(input.exact_sha) || !canonicalTimestamp(input.observed_at) || !["ok", "unavailable"].includes(input.source_status)) return null;
   if (own(input, "first_observed_at") && input.first_observed_at !== null && !canonicalTimestamp(input.first_observed_at)) return null;
@@ -215,31 +215,55 @@ function normalizeEvaluationInput(input) {
 }
 
 function keyListEquals(actual, expected) { return actual.length === expected.length && actual.every((key, index) => key === expected[index]); }
-function ciLessRecord(record, policy, exactSha) {
+function normalizeLocalVerification(value) {
+  exact(value, ["environment", "scope"], "invalid_local_verification");
+  return freeze({
+    environment: text(value.environment, "invalid_local_verification", "verification environment", 512),
+    scope: text(value.scope, "invalid_local_verification", "verification scope", 512),
+  });
+}
+
+function ciLessRecord(record, policy, exactSha, baseSha) {
   if (record === null || record === undefined) return { kind: "absent" };
   if (!plain(record)) return { kind: "invalid" };
-  const recordKeys = Object.keys(record).sort();
-  let policyVersion, recordSha, records;
-  if (keyListEquals(recordKeys, ["exact_sha", "policy_version", "results"])) {
-    policyVersion = record.policy_version; recordSha = canonicalSha(record.exact_sha); records = record.results;
-  } else if (keyListEquals(recordKeys, ["identity", "identity_hash", "observed_at", "record_digest", "record_id", "results"]) && plain(record.identity)) {
-    policyVersion = record.identity.policy_version; recordSha = canonicalSha(record.identity.exact_sha); records = record.results;
-  } else return { kind: "invalid" };
-  if (policyVersion !== policy.version || recordSha !== exactSha || !Array.isArray(records) || records.length !== policy.evidence_keys.length) return { kind: "invalid" };
+  const fields = ["identity", "identity_hash", "observed_at", "record_digest", "record_id", "results", "verification"];
+  if (!keyListEquals(Object.keys(record).sort(), fields) || !plain(record.identity)) return { kind: "invalid" };
+  const identity = record.identity;
+  const common = ["version", "project_id", "installation_id", "repo_key", "repo", "pr_number", "exact_sha", "base_sha", "policy_version", "policy_digest"];
+  const delivery = identity.target_kind === "delivery_candidate_pr";
+  const expected = [...common, ...(delivery ? ["target_kind", "delivery_candidate_ref", "delivery_manifest_digest"] : ["item", "assignment_attempt", "contract_revision"])].sort();
+  if (!keyListEquals(Object.keys(identity).sort(), expected) ||
+      typeof identity.project_id !== "string" || !identity.project_id || typeof identity.installation_id !== "string" || !identity.installation_id ||
+      !/^[a-z][a-z0-9-]{0,31}$/.test(identity.repo_key) || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(identity.repo) ||
+      !Number.isSafeInteger(identity.pr_number) || identity.pr_number < 1) return { kind: "invalid" };
+  if (delivery) {
+    const ref = identity.delivery_candidate_ref;
+    if (!plain(ref) || ref.project_id !== identity.project_id || ref.installation_id !== identity.installation_id ||
+        ref.repository_key !== identity.repo_key || ref.base_sha !== baseSha || ref.result_sha !== exactSha ||
+        !/^[a-f0-9]{64}$/.test(identity.delivery_manifest_digest)) return { kind: "invalid" };
+  } else if (!plain(identity.item) || identity.item.repo_key !== identity.repo_key || identity.item.repo !== identity.repo || identity.item.kind !== "issue" ||
+      !Number.isSafeInteger(identity.item.number) || identity.item.number < 1 || typeof identity.assignment_attempt !== "string" || !identity.assignment_attempt ||
+      !/^[a-f0-9]{64}$/.test(identity.contract_revision)) return { kind: "invalid" };
+  if (identity.version !== 2 || identity.policy_version !== policy.version || identity.exact_sha !== exactSha ||
+      !canonicalSha(baseSha) || identity.base_sha !== baseSha ||
+      identity.policy_digest !== deriveCiPolicyIdentity(policy).policy_digest ||
+      !canonicalTimestamp(record.observed_at) || !Array.isArray(record.results) || record.results.length !== policy.evidence_keys.length) return { kind: "invalid" };
+  try { normalizeLocalVerification(record.verification); } catch { return { kind: "invalid" }; }
+  if (record.identity_hash !== sha256(identity) || record.record_digest !== sha256({ identity, results: record.results, verification: record.verification }) ||
+      record.record_id !== `ce_${record.record_digest.slice(0, 32)}`) return { kind: "invalid" };
   const outcomes = new Map();
-  for (const entry of records) {
-    if (!plain(entry)) return { kind: "invalid" };
-    const keys = Object.keys(entry).sort();
-    const small = keyListEquals(keys, ["key", "outcome"]);
-    const stored = keyListEquals(keys, ["evidence_ref", "exit_code", "key", "outcome"]);
-    if ((!small && !stored) || !policy.evidence_keys.includes(entry.key) || !["pass", "fail"].includes(entry.outcome) || outcomes.has(entry.key)) return { kind: "invalid" };
-    if (stored && (!Number.isSafeInteger(entry.exit_code) || entry.exit_code < 0 || entry.exit_code > 255 || typeof entry.evidence_ref !== "string" || entry.evidence_ref.length === 0 || entry.evidence_ref.length > 512 || /[\u0000\r\n]/.test(entry.evidence_ref))) return { kind: "invalid" };
+  for (const entry of record.results) {
+    if (!plain(entry) || !keyListEquals(Object.keys(entry).sort(), ["evidence_ref", "exit_code", "key", "outcome"]) ||
+        !policy.evidence_keys.includes(entry.key) || !["pass", "fail"].includes(entry.outcome) || outcomes.has(entry.key) ||
+        !Number.isSafeInteger(entry.exit_code) || entry.exit_code < 0 || entry.exit_code > 255 ||
+        (entry.outcome === "pass" && entry.exit_code !== 0) ||
+        typeof entry.evidence_ref !== "string" || entry.evidence_ref.length === 0 || entry.evidence_ref.length > 512 || /[\u0000\r\n]/.test(entry.evidence_ref)) return { kind: "invalid" };
     outcomes.set(entry.key, entry.outcome);
   }
   return policy.evidence_keys.every((key) => outcomes.has(key)) ? { kind: "current", outcomes } : { kind: "invalid" };
 }
 function evaluateCiLess(policy, identity, input, exactSha, observedAt, retryCount) {
-  const record = ciLessRecord(input.ci_less_evidence, policy, exactSha);
+  const record = ciLessRecord(input.ci_less_evidence, policy, exactSha, input.base_sha);
   if (record.kind === "absent") return result(policy, identity, exactSha, observedAt, "ci_less_pending", [], retryCount);
   if (record.kind === "invalid") return result(policy, identity, exactSha, observedAt, "unknown", [], retryCount, freeze({ state: "invalidated", code: "invalid_ci_less_evidence" }));
   const checks = policy.evidence_keys.map((key) => freeze({ name: key, required: true, kind: "product", state: record.outcomes.get(key), source: "ci_less_evidence" }));
@@ -307,6 +331,7 @@ function ciEvidenceRecordDigest(value) { return sha256(value); }
 
 module.exports = {
   POLICY_VERSION,
+  normalizeLocalVerification,
   CiEvidencePolicyError,
   normalizeCiPolicy,
   deriveCiPolicyIdentity,

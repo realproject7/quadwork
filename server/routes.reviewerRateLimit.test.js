@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #886/#893: project-aware reviewer rate-limit tests. #893 resolves the reviewer
 // token path from the selected project's reviewer worktree AGENTS.md (custom
 // paths), with worktree winning over cfg, and omits a stale login for a custom

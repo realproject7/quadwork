@@ -79,6 +79,36 @@ fs.mkdirSync(QW_DIR, { recursive: true });
 // resource teardown error. The failed Discord instance remains owned so a
 // repeated archive can retry it; another project's instance is untouched. ---
 async function runLifecycleTests() {
+// #1084: reject the same oversized content a real Discord client rejects.
+// A long first message must not prevent the following message/cursor advance.
+{
+  const originalFetch = global.fetch;
+  const prefix = "**head**: ";
+  const messages = [1999, 2000, 2001, 5000].map((length, index) => ({
+    id: index + 1, sender: "head", text: "x".repeat(length - prefix.length),
+  }));
+  messages.push({ id: 5, sender: "head", text: "following message" });
+  const sent = [];
+  global.fetch = async () => ({ ok: true, json: async () => messages });
+  discordBridge._instances.set("dc-content-limit", {
+    cursor: 0, forwardedIds: new Set(), timer: null, stopping: false,
+    controllers: new Set(), inFlight: new Set(), client: { destroy: async () => {} },
+  });
+  try {
+    await discordBridge._pollLoop("dc-content-limit", { send: async (content) => {
+      assert.ok(content.length <= 2000, "Discord refuses oversized content");
+      sent.push(content);
+    } }, 8400);
+    assert.equal(sent.length, 5, "oversized content cannot stall subsequent messages");
+    assert.deepEqual(sent.slice(0, 2), messages.slice(0, 2).map((m) => prefix + m.text));
+    assert.deepEqual(sent.slice(2, 4).map((text) => [text.length, text.endsWith("…")]), [[2000, true], [2000, true]]);
+    assert.equal(sent[4], prefix + "following message");
+    assert.equal(discordBridge.readCursor("dc-content-limit"), 5);
+  } finally {
+    await discordBridge.stop("dc-content-limit");
+    global.fetch = originalFetch;
+  }
+}
 {
   telegramBridge._instances.set("tg-a", {
     timer: setTimeout(() => {}, 60_000),

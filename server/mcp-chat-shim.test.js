@@ -267,8 +267,15 @@ async function runTests() {
     "tools/list hides reviewer-only review-cycle receipt tools from dev");
   assert(!toolNames.includes("submit_work_task_review_receipt"), "tools/list hides independent WorkTask review receipts from dev");
 
+  for (const name of ["submit_ci_evidence", "submit_delivery_candidate_ci_evidence"]) {
+    const schema = listResp.result.tools.find((tool) => tool.name === name).inputSchema;
+    for (const field of ["base_sha", "policy_digest", "verification"]) assert(schema.required.includes(field), `${name} requires ${field}`);
+    assert(schema.properties.verification.additionalProperties === false, "verification context has a closed schema");
+  }
   const deliveryCiEvidenceArguments = {
     delivery_candidate_ref: { version: 1 },
+    delivery_manifest_digest: "b".repeat(64),
+    base_sha: "b".repeat(40), policy_digest: "c".repeat(64), verification: { environment: "test", scope: "unit" },
     pr_number: 1060,
     exact_sha: "a".repeat(40),
     policy_version: 1,

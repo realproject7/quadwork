@@ -14,7 +14,11 @@ const {
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-ci-less-"));
 const SHA = "b".repeat(40);
 const REVISION = "c".repeat(64);
+const { deriveCiPolicyIdentity, evaluateCiEvidence } = require("./ci-evidence-policy");
 const POLICY = { version: 1, mode: "ci-less", evidence_keys: ["unit", "typecheck"] };
+const POLICY_DIGEST = deriveCiPolicyIdentity(POLICY).policy_digest;
+const BASE = "a".repeat(40);
+const VERIFICATION = { environment: "Node 24 / Linux x64", scope: "npm test; npx tsc --noEmit" };
 const DELIVERY_REF = Object.freeze({
   version: 1,
   installation_id: "installation_1234567890abcdef",
@@ -58,6 +62,7 @@ function request(results, overrides = {}) {
       pr_number: 99,
       exact_sha: SHA,
       policy_version: 1,
+      base_sha: BASE, policy_digest: POLICY_DIGEST, verification: VERIFICATION,
       results: results || [
         { key: "unit", outcome: "pass", exit_code: 0, evidence_ref: "unit:sha256:abc" },
         { key: "typecheck", outcome: "pass", exit_code: 0, evidence_ref: "typecheck:sha256:def" },
@@ -79,9 +84,13 @@ function targetFor(projectId, submitted) {
     pr_number: submitted.pr_number,
     exact_sha: submitted.exact_sha,
     policy_version: submitted.policy_version,
+    base_sha: BASE, policy_digest: POLICY_DIGEST,
     policy: POLICY,
   };
   if (targetMode === "stale") return { ...target, assignment_attempt: "attempt-b" };
+  if (targetMode === "base") return { ...target, base_sha: "9".repeat(40) };
+  if (targetMode === "contract") return { ...target, contract_revision: "9".repeat(64) };
+  if (targetMode === "policy") return { ...target, policy_digest: "9".repeat(64) };
   if (targetMode === "sha") return { ...target, exact_sha: "d".repeat(40) };
   return target;
 }
@@ -92,9 +101,11 @@ function deliveryRequest(results, overrides = {}) {
     query: {},
     body: {
       delivery_candidate_ref: DELIVERY_REF,
+      delivery_manifest_digest: "e".repeat(64),
       pr_number: 100,
       exact_sha: SHA,
       policy_version: 1,
+      base_sha: BASE, policy_digest: POLICY_DIGEST, verification: VERIFICATION,
       results: results || [
         { key: "unit", outcome: "pass", exit_code: 0, evidence_ref: "unit:sha256:delivery" },
         { key: "typecheck", outcome: "pass", exit_code: 0, evidence_ref: "typecheck:sha256:delivery" },
@@ -117,8 +128,12 @@ function deliveryTargetFor(projectId, submitted) {
     pr_number: submitted.pr_number,
     exact_sha: submitted.exact_sha,
     policy_version: submitted.policy_version,
+    base_sha: BASE, policy_digest: POLICY_DIGEST,
     policy: POLICY,
   };
+  if (deliveryTargetMode === "base") return { ...target, base_sha: "9".repeat(40) };
+  if (deliveryTargetMode === "manifest") return { ...target, delivery_manifest_digest: "9".repeat(64) };
+  if (deliveryTargetMode === "policy") return { ...target, policy_digest: "9".repeat(64) };
   if (deliveryTargetMode === "retipped") return { ...target, exact_sha: "f".repeat(40) };
   if (deliveryTargetMode === "foreign") return { ...target, delivery_candidate_ref: { ...target.delivery_candidate_ref, project_id: "p2" } };
   return target;
@@ -303,6 +318,7 @@ function ok(value, message) {
         pr_number: submitted.pr_number,
         exact_sha: submitted.exact_sha,
         policy_version: submitted.policy_version,
+        base_sha: BASE, policy_digest: POLICY_DIGEST,
         policy: POLICY,
       };
     },
@@ -345,6 +361,7 @@ function ok(value, message) {
         pr_number: submitted.pr_number,
         exact_sha: submitted.exact_sha,
         policy_version: submitted.policy_version,
+        base_sha: BASE, policy_digest: POLICY_DIGEST,
         policy: POLICY,
       };
     },
@@ -357,6 +374,40 @@ function ok(value, message) {
   assert.equal(fs.existsSync(path.join(rejectedStoreRoot, "p1", "ci-evidence.json")), false);
   assert.deepEqual(rejectedStore.readDocument("p1").records, {});
   ok(true, "a rejected final admission leaves no durable evidence receipt");
+
+  for (const mode of ["base", "contract", "policy"]) {
+    targetMode = mode;
+    const rejected = responseCapture(); await submit(request(), rejected);
+    assert.equal(rejected.statusCode, 409, mode);
+  }
+  targetMode = "current";
+  for (const mode of ["base", "manifest", "policy"]) {
+    deliveryTargetMode = mode;
+    const rejected = responseCapture(); await submitDelivery(deliveryRequest(), rejected);
+    assert.equal(rejected.statusCode, 409, mode);
+  }
+  deliveryTargetMode = "current";
+  for (const field of ["base_sha", "policy_digest", "verification"]) {
+    const input = request(); delete input.body[field];
+    const rejected = responseCapture(); await submit(input, rejected);
+    assert.equal(rejected.statusCode, 400, field);
+  }
+  for (const rows of [
+    [{ key: "unit", outcome: "pass", exit_code: 7, evidence_ref: "failure" }, { key: "typecheck", outcome: "pass", exit_code: 0, evidence_ref: "ok" }],
+    [{ key: "unit", outcome: "pass", exit_code: 0, evidence_ref: "ok" }, { key: "unit", outcome: "pass", exit_code: 0, evidence_ref: "duplicate" }],
+  ]) {
+    const rejected = responseCapture(); await submit(request(rows), rejected);
+    assert.equal(rejected.statusCode, 400);
+  }
+  ok(true, "changed base/contract/manifest/policy, incomplete identity, duplicate keys and pass/nonzero fail closed");
+  const receipt = store.readByIdentity(deliveryTargetFor("p1", deliveryRequest().body));
+  const evaluate = (value) => evaluateCiEvidence({ policy: POLICY, exact_sha: SHA, base_sha: BASE, source_status: "ok", observed_at: new Date().toISOString(), ci_less_evidence: value });
+  assert.equal(evaluate(receipt).state, "ci_less_pass");
+  assert.equal(evaluate({ ...receipt, results: receipt.results.map((row) => ({ ...row, exit_code: 7 })) }).state, "unknown");
+  assert.equal(evaluate({ ...receipt, verification: undefined }).state, "unknown");
+  assert.equal(evaluate({ ...receipt, identity: { ...receipt.identity, version: 1 } }).state, "unknown");
+  assert.equal(store.readByIdentity({ ...deliveryTargetFor("p1", deliveryRequest().body), base_sha: "9".repeat(40) }), null);
+  ok(true, "persisted malformed/incomplete records cannot grant current local verification standing");
 
   const beforeRecords = Object.keys(store.readDocument("p1").records).length;
   generation += 1;

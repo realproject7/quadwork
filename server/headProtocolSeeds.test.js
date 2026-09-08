@@ -195,3 +195,12 @@ assert.ok(head.includes("Never construct a Delivery Candidate reference"),
   "Head seed keeps Git evidence and candidate identity server-derived");
 
 console.log("headProtocolSeeds.test.js: all assertions passed");
+
+// #1076/#1060: all roles follow registered local verification without an
+// implicit hosted-check requirement; formal reviewer independence is unchanged.
+for (const [name, seed] of [["head", head], ["dev", dev], ["re1", re1], ["re2", re2]]) {
+  assert.ok(seed.includes("read_ci_evidence") && seed.includes("record_id"), `${name} reads the authenticated record identity`);
+  assert.match(seed, /No hosted|no hosted/, `${name} does not require a hosted badge in ci-less mode`);
+  assert.match(seed, /explicit external/, `${name} retains explicit external policies`);
+  assert.doesNotMatch(seed, /Build passes \(live `gh pr checks|and CI with live `gh pr checks|CI: `gh pr checks/, `${name} has no unconditional hosted-check gate`);
+}

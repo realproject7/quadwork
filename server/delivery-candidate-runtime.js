@@ -5,10 +5,16 @@
 // Git-object evidence, durable candidate state, and proof composition remain
 // closed injected authorities. Head never supplies a worktree path, base SHA,
 // review receipt, tree, patch, or repository identity.
+//
+// #1066: composition is awaited, so one Delivery Candidate composes at most
+// once at a time in this process (an exact duplicate joins, a conflicting
+// identity fails closed) and every composition runs under one deadline
+// shared by the composition service and each Git call.
 
-const { buildDeliveryManifest, assertDeliveryCandidateRef } = require("./delivery-candidate");
+const { buildDeliveryManifest, assertDeliveryCandidateRef, deliveryCandidateKey } = require("./delivery-candidate");
 
 const VERSION = 1;
+const COMPOSITION_DEADLINE_MS = 30_000;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 
@@ -73,14 +79,15 @@ function createDeliveryCandidateRuntime(value) {
     return freeze({ installation_id: config.installation_id, project_id: principal.projectId, role: "head", generation: admission.generation });
   }
   function runtimeService(owner, token, ref) {
+    const deadline = Date.now() + COMPOSITION_DEADLINE_MS;
     let store, objects;
     try {
       store = deps.create_candidate_store({ config_dir: deps.config_dir, fs: deps.fs });
-      objects = deps.repository_objects_for(freeze({ version: VERSION, head_binding: clone(owner), delivery_candidate_ref: clone(ref) }));
+      objects = deps.repository_objects_for(freeze({ version: VERSION, head_binding: clone(owner), delivery_candidate_ref: clone(ref), deadline }));
     } catch (error) { fail(safeCode(error, "delivery_candidate_runtime_unavailable"), "Delivery Candidate runtime is unavailable"); }
     try {
       return deps.create_composition_service({
-        binding: clone(owner), candidate_store: store, repository_objects: objects,
+        binding: clone(owner), candidate_store: store, repository_objects: objects, deadline,
         resolve_head_authorization: () => {
           const live = activeHead(token);
           if (!sameBinding(live, owner) || live.project_id !== ref.project_id || live.installation_id !== ref.installation_id) {
@@ -91,7 +98,7 @@ function createDeliveryCandidateRuntime(value) {
       });
     } catch (error) { fail(safeCode(error, "delivery_candidate_runtime_unavailable"), "Delivery Candidate composition service is unavailable"); }
   }
-  function prepare(request) {
+  async function prepare(request) {
     if (!plain(request)) fail("invalid_delivery_candidate_runtime_request", "delivery request is invalid");
     exact(request.body, ["repository_key"], "invalid_delivery_candidate_prepare_request");
     if (!REPOSITORY_KEY_RE.test(request.body.repository_key)) fail("invalid_delivery_candidate_prepare_request", "repository key is invalid");
@@ -100,7 +107,7 @@ function createDeliveryCandidateRuntime(value) {
     try { staged = source(deps.read_delivery_source(freeze({ version: VERSION, installation_id: owner.installation_id, project_id: owner.project_id, repository_key: request.body.repository_key })), owner); }
     catch (error) { if (error instanceof DeliveryCandidateRuntimeError) throw error; fail(safeCode(error, "delivery_candidate_source_unavailable"), "Delivery Candidate source is unavailable"); }
     if (staged.registered_repository.repository_key !== request.body.repository_key) fail("delivery_candidate_source_invalid", "Delivery Candidate source repository is mismatched");
-    try { observed = evidence(deps.read_delivery_evidence(freeze({ version: VERSION, head_binding: clone(owner), delivery_source: clone(staged) })), owner, request.body.repository_key); }
+    try { observed = evidence(await deps.read_delivery_evidence(freeze({ version: VERSION, head_binding: clone(owner), delivery_source: clone(staged) })), owner, request.body.repository_key); }
     catch (error) { if (error instanceof DeliveryCandidateRuntimeError) throw error; fail(safeCode(error, "delivery_candidate_evidence_unavailable"), "Delivery Candidate evidence is unavailable"); }
     const ref = { version: VERSION, installation_id: owner.installation_id, project_id: owner.project_id, repository_key: request.body.repository_key,
       batch_manifest_digest: staged.frozen_batch_manifest.manifest_digest, delivery_mode: staged.delivery_mode, base_sha: staged.base_sha,
@@ -115,17 +122,35 @@ function createDeliveryCandidateRuntime(value) {
     try { return runtimeService(owner, request.token, ref).initializeCandidate({ head_binding: clone(owner), delivery_candidate_ref: clone(ref), delivery_manifest: manifest }); }
     catch (error) { if (error instanceof DeliveryCandidateRuntimeError) throw error; fail(safeCode(error, "delivery_candidate_prepare_unavailable"), "Delivery Candidate preparation is unavailable"); }
   }
-  function compose(request) {
+  // In-flight compositions by Delivery Candidate key: the exact operation
+  // identity that started one, and its pending result.
+  const inflight = new Map();
+  async function compose(request) {
     if (!plain(request)) fail("invalid_delivery_candidate_runtime_request", "delivery request is invalid");
     const owner = activeHead(request.token);
     let ref;
     try { ref = assertDeliveryCandidateRef(request.body?.delivery_candidate_ref); }
     catch { fail("invalid_delivery_candidate_compose_request", "Delivery Candidate reference is invalid"); }
     if (ref.installation_id !== owner.installation_id || ref.project_id !== owner.project_id) fail("delivery_candidate_principal_unavailable", "Delivery Candidate is outside the current Head project");
-    try { return runtimeService(owner, request.token, ref).composeCandidate({ head_binding: clone(owner), delivery_candidate_ref: clone(ref), expected_revision: request.body?.expected_revision, correlation_id: request.body?.correlation_id, idempotency_key: request.body?.idempotency_key }); }
-    catch (error) { if (error instanceof DeliveryCandidateRuntimeError) throw error; fail(safeCode(error, "delivery_candidate_composition_unavailable"), "Delivery Candidate composition is unavailable"); }
+    const { expected_revision, correlation_id, idempotency_key } = request.body;
+    if (typeof correlation_id !== "string" || typeof idempotency_key !== "string") fail("invalid_delivery_candidate_compose_request", "composition identity is invalid");
+    const key = deliveryCandidateKey(ref);
+    const active = inflight.get(key);
+    if (active) {
+      if (active.correlation_id === correlation_id && active.idempotency_key === idempotency_key && active.expected_revision === expected_revision) return active.promise;
+      if (active.correlation_id === correlation_id || active.idempotency_key === idempotency_key) fail("delivery_composition_identity_collision", "composition identity is already bound to an in-flight composition");
+      fail("delivery_candidate_compose_busy", "Delivery Candidate composition is already in flight");
+    }
+    const promise = (async () => {
+      try { return await runtimeService(owner, request.token, ref).composeCandidate({ head_binding: clone(owner), delivery_candidate_ref: clone(ref), expected_revision, correlation_id, idempotency_key }); }
+      catch (error) { if (error instanceof DeliveryCandidateRuntimeError) throw error; fail(safeCode(error, "delivery_candidate_composition_unavailable"), "Delivery Candidate composition is unavailable"); }
+    })();
+    inflight.set(key, { correlation_id, idempotency_key, expected_revision, promise });
+    const settle = () => { if (inflight.get(key)?.promise === promise) inflight.delete(key); };
+    promise.then(settle, settle);
+    return promise;
   }
   return freeze({ prepare, compose });
 }
 
-module.exports = { VERSION, DeliveryCandidateRuntimeError, createDeliveryCandidateRuntime };
+module.exports = { VERSION, COMPOSITION_DEADLINE_MS, DeliveryCandidateRuntimeError, createDeliveryCandidateRuntime };

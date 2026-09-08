@@ -83,7 +83,7 @@ function sameBinding(left, right) {
 // owning domain, and delegates to one fixed server control that receives only
 // the bound project id and the validated payload; never a caller-selected
 // project, role, path, message, cadence, or recipient.
-function composeHeadDomain(owner, workTask, controls) {
+function composeHeadDomain(owner, workTask, controls, delivery = null) {
   function owned(invocation, action) {
     exact(invocation, ["version", "action", "binding", "expected_revision", "correlation_id", "idempotency_key", "payload"]);
     if (invocation.action !== action || !sameBinding(binding(invocation.binding), owner)) {
@@ -94,12 +94,13 @@ function composeHeadDomain(owner, workTask, controls) {
     return workTask.get_pipeline_status({ ...invocation, action: "get_pipeline_status", expected_revision: null, payload: null });
   }
   const project_id = owner.project_id;
-  const beside = new Set(["get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
-  return {
+  const deliveryActions = require("./delivery-execution-contract").ACTIONS;
+  const beside = new Set(["get_project_status", "review_handoff", "project_monitor", "recover_worker", ...deliveryActions]);
+  const composed = {
     ...workTask,
     // The plane preflights every action with a status read that keeps the
     // requested action name.  The WorkTask domain validates only its own
-    // seven; a beside-the-pipeline action reads status as a plain status read.
+    // eight; a beside-the-pipeline action reads status as a plain status read.
     get_pipeline_status(invocation) {
       return beside.has(invocation?.action) ? pipelineStatus(invocation) : workTask.get_pipeline_status(invocation);
     },
@@ -124,6 +125,20 @@ function composeHeadDomain(owner, workTask, controls) {
       return { status, detail: await controls.recover_worker({ project_id, recovery: { ...invocation.payload.recovery } }) };
     },
   };
+  if (delivery) {
+    for (const action of deliveryActions) composed[action] = async (invocation) => {
+      owned(invocation, action);
+      const detail = await delivery.execute(invocation);
+      return { status: pipelineStatus(invocation), detail };
+    };
+    Object.defineProperty(composed, "replay_delivery", { enumerable: false, value: (invocation) => delivery.replay(invocation) });
+    Object.defineProperty(composed, "resume_delivery", { enumerable: false, value: async (invocation) => {
+      owned(invocation, invocation.action);
+      const detail = await delivery.resume(invocation);
+      return { status: pipelineStatus(invocation), detail };
+    } });
+  }
+  return composed;
 }
 
 function createHeadControlRuntime(options) {
@@ -131,6 +146,7 @@ function createHeadControlRuntime(options) {
     "config_dir", "fs", "read_config", "capture_project_admission", "is_project_archived",
     "resolve_shim_principal", "agent_sessions", "read_live_batch_context", "read_repository_state",
     "read_cached_repository_snapshot", "now", "project_controls",
+    ...(Object.hasOwn(options, "create_delivery_service") ? ["create_delivery_service"] : []),
   ]);
   if (typeof options.config_dir !== "string" || !options.config_dir || !options.fs ||
       typeof options.read_config !== "function" || typeof options.capture_project_admission !== "function" ||
@@ -213,6 +229,7 @@ function createHeadControlRuntime(options) {
     }
     const old = tokenByProject.get(value.project_id);
     if (old) tokens.delete(old);
+    for (const key of services.keys()) if (key.includes(`:${value.project_id}:`)) services.delete(key);
     tokens.set(value.token, Object.freeze({
       installation_id: config.installation_id,
       project_id: value.project_id,
@@ -267,6 +284,17 @@ function createHeadControlRuntime(options) {
     });
   }
 
+  function deliveryService(owner, workTask) {
+    if (!options.create_delivery_service) return null;
+    const launchToken = tokenByProject.get(owner.project_id);
+    const term = options.agent_sessions.get(`${owner.project_id}/head`)?.term;
+    const is_binding_current = () => {
+      if (!launchToken || !term || tokenByProject.get(owner.project_id) !== launchToken || options.agent_sessions.get(`${owner.project_id}/head`)?.term !== term) return false;
+      try { return resolveLaunchBinding({ project_id: owner.project_id, actor: "head", generation: owner.generation }).active === true; } catch { return false; }
+    };
+    return options.create_delivery_service({ binding: owner, domain: workTask, is_binding_current });
+  }
+
   function resolveHeadControlService(value) {
     const owner = binding(value);
     const key = runtimeKey(owner);
@@ -276,7 +304,7 @@ function createHeadControlRuntime(options) {
     // Bootstrap is private runtime composition, never an MCP operation.
     workTask.initialize();
     const audit_store = createHeadControlAuditStore({ config_dir: options.config_dir, fs: options.fs });
-    const service = createHeadControlService({ binding: owner, domain: composeHeadDomain(owner, workTask, controls), audit_store });
+    const service = createHeadControlService({ binding: owner, domain: composeHeadDomain(owner, workTask, controls, deliveryService(owner, workTask)), audit_store });
     services.set(key, service);
     return service;
   }
@@ -325,8 +353,15 @@ function createHeadControlRuntime(options) {
     return Object.freeze({ ok: true, resources: Object.freeze({ head_control_bindings: removed }), cleanup_errors: Object.freeze([]) });
   }
 
+  async function readDeliveryPublicationPlan(projectId, ref) {
+    const owner = currentReadBinding(projectId);
+    const workTask = resolveOwnedDomain(owner);
+    if (!options.create_delivery_service) throw new TypeError("delivery executor unavailable");
+    return deliveryService(owner, workTask).plan(ref);
+  }
+
   const http = createHeadControlHttpService({ authenticateToken, resolveLaunchBinding, resolveHeadControlService });
-  return Object.freeze({ registerHeadToken, revokeProject, readCurrentBatchProjection, handle: http.handle });
+  return Object.freeze({ registerHeadToken, revokeProject, readCurrentBatchProjection, readDeliveryPublicationPlan, handle: http.handle });
 }
 
 module.exports = { createHeadControlRuntime, composeHeadDomain };
