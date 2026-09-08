@@ -15,7 +15,7 @@ const { parseProcMeminfo } = require("./resource-preflight");
 const { createWorkerUnitBase } = require("./resource-unit");
 const F = require("./resource-linux-facts");
 const { boundedUntil, checkProcessSet } = require("./resource-linux-launcher");
-const { pressureObservations, controlMarker, controlObservationReady, controlFilterSource } = require("./resource-staging-observation");
+const { pressureObservations, verifyPressureRelease, controlMarker, controlObservationReady, controlFilterSource } = require("./resource-staging-observation");
 const { createPressureObservationWindow } = require("./resource-pressure-deadline");
 const exec = promisify(execFile);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -129,7 +129,7 @@ async function runClosedStagingMatrix(options) {
   const childEnv = { HOME: root, PATH: `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`, TMPDIR: tempRoot, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid()}/bus` };
   const result = { ok: false, reason: "proof_failed", started_phases: [], primitive: {}, integrated: {}, cleanup: { ok: false }, provider_startup: "unavailable_not_installed_or_not_exercised", provider_model_turns: "unproved_no_credentials", source_files: sourceManifest(), versions: { node: process.version, kernel: os.release(), systemd: F.command("systemctl", ["--version"]).split("\n")[0] }, limits_mib: { ...policy, temp_root: undefined } };
   result.source_digest = sha(JSON.stringify(result.source_files));
-  let token = null, apiStarted = false, monitorStop = false, monitoring = null, monitorFailure = null, pressureWindow = null;
+  let token = null, apiStarted = false, monitorStop = false, monitoring = null, monitorFailure = null, pressureWindow = null, pressureReleased = false;
   const sockets = [], protectedGroups = [], samples = [];
   let signalReceived = false;
   const onSignal = () => { signalReceived = true; monitorFailure = "proof_interrupted"; };
@@ -255,15 +255,33 @@ async function runClosedStagingMatrix(options) {
     pressure.threadIds = tids;
     result.started_phases.push("integrated_bounded_worker_oom");
     const pressureStart = Date.now(); pressureWindow = createPressureObservationWindow();
-    pressure.stream.socket.send(`${JSON.stringify({ kind: "pressure", challenge: pressure.ready.challenge })}\n`);
-    await pressureWindow.waitFor(() => pressure.stream.records.some((r) => r.kind === "allocation_threads_after"), () => monitorFailure);
-    result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, tids);
-    await pressureWindow.waitFor(() => parentOom(pressure.group) > workerBefore, () => monitorFailure);
+    pressure.stream.socket.send(`${JSON.stringify({ kind: "pressure_arm", challenge: pressure.ready.challenge })}\n`);
+    await pressureWindow.waitFor(() => {
+      if (pressure.stream.records.some((r) => r.kind === "pressure_refused" || r.kind === "allocation_failed")) F.fail("allocation_observation_invalid");
+      return pressure.stream.records.some((r) => r.kind === "allocation_armed");
+    }, () => monitorFailure);
+    // Obtain a fresh actual monitor roundtrip before the synchronous local
+    // identity/caps/counter checks and fixed release. All use the same budget.
+    await pressureWindow.waitFor(async () => {
+      await sample();
+      if (samples.some((row) => row.latency_ms > 2000) || samples.slice(1).some((row, index) => row.at - samples[index].at > 2000)) F.fail("monitor_interval_missing");
+      return true;
+    }, () => monitorFailure);
+    result.pressure_workload = { ...verifyPressureRelease(pressure, protectedGroups, workerBefore), release_sent: false };
+    pressureWindow.assertCurrent(() => monitorFailure);
+    pressure.stream.socket.send(`${JSON.stringify({ kind: "pressure_release", challenge: pressure.ready.challenge })}\n`);
+    pressureReleased = true;
+    result.pressure_workload.release_sent = true;
+    await pressureWindow.waitFor(() => {
+      // Explicit failures and contradictory records cannot be hidden by OOM.
+      result.pressure_workload = { ...pressureObservations(pressure.stream.records, pressure.main.pid, tids), release_sent: true };
+      return parentOom(pressure.group) > workerBefore;
+    }, () => monitorFailure);
     const pressureEnd = Date.now();
     result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: pressureWindow.elapsedMs() };
     await boundedUntil(() => { try { return F.readGroup(pressure.group).pids.length === 0; } catch (e) { return e.code === "ENOENT"; } });
     await sample();
-    result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, tids);
+    result.pressure_workload = { ...pressureObservations(pressure.stream.records, pressure.main.pid, tids), release_sent: pressureReleased };
     monitorStop = true; await monitoring;
     if (monitorFailure) F.fail(monitorFailure);
     const gaps = samples.slice(1).map((r, i) => r.at - samples[i].at);
@@ -280,7 +298,7 @@ async function runClosedStagingMatrix(options) {
     if (pressureWindow && !result.pressure_observation) result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: pressureWindow.elapsedMs() };
     const pressure = owned.workers.find((w) => w.project === "proof-pressure");
     if (pressure?.threadIds) {
-      try { result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, pressure.threadIds); } catch {}
+      try { result.pressure_workload = { ...pressureObservations(pressure.stream.records, pressure.main.pid, pressure.threadIds), release_sent: pressureReleased }; } catch {}
     }
     result.check = publicError(error);
     if (error.httpFailure) result.failed_request = error.httpFailure;

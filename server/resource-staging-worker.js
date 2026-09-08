@@ -30,10 +30,10 @@ if (process.argv[2] === "--held-child") {
   ];
   for (const child of children) child.on("error", () => { process.exitCode = 1; });
   const emit = (kind, facts = {}) => process.stdout.write(`QW_RESOURCE:${JSON.stringify({ kind, pid: process.pid, ...facts })}\n`);
-  let sequence = 0, input = "", allocating = false;
+  let sequence = 0, input = "", pressureState = "ready";
   const buffers = [];
   const readiness = { challenge, children: children.map((child) => child.pid), temp_file: file, tty: process.stdin.isTTY === true && process.stdout.isTTY === true, columns: process.stdout.columns, rows: process.stdout.rows };
-  const heartbeat = setInterval(() => { emit("heartbeat", { sequence: ++sequence }); if (poolReady && !allocating && sequence % 5 === 0) emit("ready", readiness); }, 200);
+  const heartbeat = setInterval(() => { emit("heartbeat", { sequence: ++sequence }); if (poolReady && pressureState === "ready" && sequence % 5 === 0) emit("ready", readiness); }, 200);
   const finish = (code) => { clearInterval(heartbeat); for (const child of children) { try { child.kill("SIGTERM"); } catch {} } process.exit(code); };
   process.once("SIGTERM", () => finish(0));
   process.once("SIGINT", () => finish(0));
@@ -49,29 +49,38 @@ if (process.argv[2] === "--held-child") {
       if (request.challenge !== challenge) continue;
       if (request.kind === "ping") emit("pong", { nonce: request.nonce });
       if (request.kind === "exit") finish(23);
-      if (request.kind === "pressure" && !allocating) {
-        if (!poolReady) { emit("pressure_refused"); continue; }
-        try { verifyWorkerGroup(readProcess(process.pid).cgroup, { memoryHighMib: 96, memoryMaxMib: 128, swapMaxMib: 16 }); }
-        catch { emit("pressure_refused"); continue; }
-        allocating = true;
-        emit("allocation_start");
-        const tids = () => fs.readdirSync("/proc/self/task").map(Number).sort((a, b) => a-b);
-        emit("allocation_threads_before", { pool_size: 16, tids: tids(), max_buffers: 20, buffer_bytes: 8 * 1024 * 1024 });
-        const zero = fs.openSync("/dev/zero", "r");
-        let completed = 0;
-        // Reserve all twenty buffers before any kernel read touches them.
-        // Interleaving reservation with reads can throttle this dispatch loop.
-        for (let index = 0; index < 20; index++) buffers.push(Buffer.allocUnsafe(8 * 1024 * 1024));
-        emit("allocation_reserved", { buffers: buffers.length, bytes: buffers.reduce((sum, b) => sum+b.length, 0) });
-        for (const [index, buffer] of buffers.entries()) {
-          fs.read(zero, buffer, 0, buffer.length, null, (error, bytes) => {
-            if (error || bytes !== buffer.length) { emit("allocation_failed"); finish(2); return; }
-            completed++;
-            emit("allocation", { index, bytes, mib: completed * 8 });
-            if (completed === 20) { fs.closeSync(zero); emit("allocation_cap_reached"); }
-          });
-        }
-        emit("allocation_threads_after", { pool_size: 16, tids: tids(), requested_buffers: buffers.length });
+      if (request.kind === "pressure_arm" && pressureState === "ready") {
+        pressureState = "arming";
+        try {
+          if (!poolReady || Object.keys(request).some((key) => !["kind", "challenge"].includes(key))) throw new Error("invalid arm");
+          verifyWorkerGroup(readProcess(process.pid).cgroup, { memoryHighMib: 96, memoryMaxMib: 128, swapMaxMib: 16 });
+          // Reservation is not a claim that physical pages have been touched.
+          // No pressure descriptor or kernel read exists until release arrives.
+          for (let index = 0; index < 20; index++) buffers.push(Buffer.allocUnsafe(8 * 1024 * 1024));
+          pressureState = "armed";
+          emit("allocation_armed", { pool_size: 16, tids: fs.readdirSync("/proc/self/task").map(Number).sort((a, b) => a-b),
+            buffers: buffers.length, buffer_bytes: 8 * 1024 * 1024, bytes: buffers.reduce((sum, buffer) => sum + buffer.length, 0) });
+        } catch { pressureState = "failed"; emit("pressure_refused"); finish(2); }
+      }
+      if (request.kind === "pressure_release" && pressureState === "armed") {
+        // One-way transition happens before any operation that can fail.
+        pressureState = "released";
+        try {
+          if (Object.keys(request).some((key) => !["kind", "challenge"].includes(key))) throw new Error("invalid release");
+          verifyWorkerGroup(readProcess(process.pid).cgroup, { memoryHighMib: 96, memoryMaxMib: 128, swapMaxMib: 16 });
+          const zero = fs.openSync("/dev/zero", "r");
+          let completed = 0;
+          for (const [index, buffer] of buffers.entries()) {
+            fs.read(zero, buffer, 0, buffer.length, null, (error, bytes) => {
+              if (error || bytes !== buffer.length) { pressureState = "failed"; emit("allocation_failed"); finish(2); return; }
+              completed++;
+              emit("allocation", { index, bytes, mib: completed * 8 });
+              if (completed === 20) { fs.closeSync(zero); emit("allocation_cap_reached"); }
+            });
+          }
+          // OOM can kill this process before this optional diagnostic arrives.
+          emit("allocation_threads_after", { pool_size: 16, tids: fs.readdirSync("/proc/self/task").map(Number).sort((a, b) => a-b), requested_buffers: buffers.length });
+        } catch { pressureState = "failed"; emit("allocation_failed"); finish(2); }
       }
     }
   });

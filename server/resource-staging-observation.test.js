@@ -8,19 +8,27 @@ const { pressureObservations, controlMarker, controlObservationReady, controlFil
 const F = require("./resource-linux-facts");
 const tids = Array.from({ length: 23 }, (_, i) => i + 100), pid = tids[0], size = 8 * 1024 * 1024;
 const headers = [
-  { kind: "allocation_start", pid },
-  { kind: "allocation_threads_before", pid, pool_size: 16, tids, max_buffers: 20, buffer_bytes: size },
-  { kind: "allocation_reserved", pid, buffers: 20, bytes: 20 * size },
-  { kind: "allocation_threads_after", pid, pool_size: 16, tids, requested_buffers: 20 },
+  { kind: "allocation_armed", pid, pool_size: 16, tids, buffers: 20, buffer_bytes: size, bytes: 20 * size },
 ];
-assert.equal(pressureObservations(headers, pid, tids).completed_bytes, 0, "OOM may occur before any read callback");
-const complete = [...headers, ...Array.from({ length: 20 }, (_, i) => ({ kind: "allocation", pid, index: 19-i, bytes: size, mib: (i+1)*8 })), { kind: "allocation_cap_reached", pid }];
+const armed = pressureObservations(headers, pid, tids);
+assert.equal(armed.completed_bytes, 0, "OOM may occur before any read callback");
+assert.equal(armed.submitted_buffers, null, "arming does not prove that reads were submitted");
+assert.equal(armed.threads_after, null, "post-dispatch threads are unproved if absent");
+const after = { kind: "allocation_threads_after", pid, pool_size: 16, tids, requested_buffers: 20 };
+const complete = [...headers, after, ...Array.from({ length: 20 }, (_, i) => ({ kind: "allocation", pid, index: 19-i, bytes: size, mib: (i+1)*8 })), { kind: "allocation_cap_reached", pid }];
 assert.equal(pressureObservations(complete, pid, tids).completed_bytes, 160 * 1024 * 1024);
+assert.equal(pressureObservations(complete, pid, tids).submitted_buffers, 20);
+const partial = pressureObservations([...headers, { kind: "allocation", pid, index: 7, bytes: size, mib: 8 }], pid, tids);
+assert.equal(partial.completed_bytes, size); assert.equal(partial.submitted_buffers, null, "a completion cannot invent the missing complete submission record");
+assert.throws(() => pressureObservations([], pid, tids));
 for (const mutate of [
-  (r) => { r[1].pool_size = 17; }, (r) => { r[2].bytes++; }, (r) => { r[3].requested_buffers++; },
-  (r) => { r[3].tids[2] = r[3].tids[1]; }, (r) => { r[4].index = 20; }, (r) => { r[5].index = r[4].index; },
-  (r) => { r[4].bytes--; }, (r) => { r[4].pid++; }, (r) => { r[4].mib = 16; },
-  (r) => { r[4].kind = "allocation_failed"; }, (r) => { r.splice(4, 1); }, (r) => { r.push(r[3]); },
+  (r) => { r[0].pool_size = 17; }, (r) => { r[0].bytes++; }, (r) => { r[0].buffers++; },
+  (r) => { r[0].buffer_bytes--; }, (r) => { r[0].pid++; }, (r) => { r[0].tids[2] = r[0].tids[1]; },
+  (r) => { r[1].requested_buffers++; }, (r) => { r[1].tids[2] = r[1].tids[1]; },
+  (r) => { r[2].index = 20; }, (r) => { r[3].index = r[2].index; },
+  (r) => { r[2].bytes--; }, (r) => { r[2].pid++; }, (r) => { r[2].mib = 16; },
+  (r) => { r[2].kind = "allocation_failed"; }, (r) => { r.splice(2, 1); },
+  (r) => { r.splice(1, 0, r[0]); }, (r) => { r.splice(2, 0, r[1]); }, (r) => { r.push(r[1]); },
 ]) { const copy = structuredClone(complete); mutate(copy); assert.throws(() => pressureObservations(copy, pid, tids)); }
 assert.equal(controlObservationReady(2, 1, new Set([11, 12])), true);
 assert.equal(controlObservationReady(2, 0, new Set([11, 12])), false, "queue must actually be observed");

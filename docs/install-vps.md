@@ -758,9 +758,16 @@ and report `containment_unavailable`; existing V1 workers are preserved.
 The matrix uses 96/128/16 MiB worker high/max/swap, at most 160 MiB of touched
 allocation, API 640 MiB, control 256 MiB, three worker slots and 1536 MiB host
 reserve. These are disposable fixture values, not production defaults. A
-fixed 16-thread pool touches twenty reserved 8 MiB buffers through bounded
-kernel reads, with no refill or retry. The coordinator allows at most 45 seconds
-to observe actual memcg OOM; worker/API watchdogs remain 90/120 seconds.
+fixed 16-thread pool can touch twenty reserved 8 MiB buffers through bounded
+kernel reads, with no refill or retry. The worker first arms and reports actual
+thread IDs and reserved bytes, without opening a pressure read. The coordinator
+receives and validates that record, rechecks the live process, threads, limits,
+unchanged OOM baseline and monitors, then releases the one-shot reads. One
+monotonic 45-second deadline covers arm, validation, release and actual memcg
+OOM; worker/API watchdogs remain 90/120 seconds. Reservation is not resident
+memory or completed work. If OOM kills the worker before its optional dispatch
+record arrives, submitted count remains null; only received full completions
+count as touched bytes. Missing armed facts or independent OOM evidence fails.
 Real Git control children wait for an observed concurrency/queue handshake.
 Thread/allocation records describe the workload; only independent kernel and
 cgroup observations establish OOM. Continuous API/chat/WS samples must stay

@@ -25,6 +25,10 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   let called = false; now = 45000;
   await assert.rejects(window.waitFor(() => { called = true; return true; }, healthy), expired);
   assert.equal(called, false, "an already-true observation after expiration is never executed");
+  assert.throws(() => window.assertCurrent(healthy), expired, "release cannot start at the deadline");
+  now = 0; window = createPressureObservationWindow();
+  window.assertCurrent(healthy);
+  assert.throws(() => window.assertCurrent(() => "continuous_monitor_failed"), (e) => e.check === "continuous_monitor_failed", "release rechecks monitor abort");
 
   now = 0; window = createPressureObservationWindow();
   await window.waitFor(() => { now = 40000; return true; }, healthy);

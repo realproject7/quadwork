@@ -17,6 +17,7 @@ function createPressureObservationWindow() {
   }
   return Object.freeze({
     elapsedMs: () => Math.round(performance.now() - started),
+    assertCurrent: (readFailure) => { remaining(readFailure); },
     async waitFor(read, readFailure) {
       for (;;) {
         remaining(readFailure); // Never start a read after expiration/abort.
