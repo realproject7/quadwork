@@ -1,5 +1,5 @@
-require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 
 // #1066: the fixed Git runner server/index.js injects into the Delivery
 // Candidate chain.  Fixed program and argv with no shell, stdin fed then

@@ -4,9 +4,10 @@
 // these tests exercise route/Git semantics, not Linux containment authority.
 const cp = require("node:child_process");
 const util = require("node:util");
+const Module = require("node:module");
 function installResourceExecutorFixture({ runControlChild } = {}) {
   const file = require.resolve("../resource-runtime-owner");
-  const original = require(file);
+  const originalLoad = Module._load;
   const owner = {
     runControlChild: runControlChild || ((command, args, options = {}) => {
       const { input, ...opts } = options;
@@ -21,8 +22,14 @@ function installResourceExecutorFixture({ runControlChild } = {}) {
     }),
     runControlChildSync: (...args) => cp.execFileSync(...args),
   };
-  require.cache[file].exports = { ...original, getSharedResourceRuntimeOwner: () => owner };
-  return () => { require.cache[file].exports = original; };
+  // Load production dependencies only when the test normally imports them,
+  // after its private HOME/fs setup. Never read the operator's config early.
+  Module._load = function (request, parent, main) {
+    const result = originalLoad.call(this, request, parent, main);
+    if (request.includes("resource-runtime-owner") && Module._resolveFilename(request, parent) === file) return { ...result, getSharedResourceRuntimeOwner: () => owner };
+    return result;
+  };
+  return () => { Module._load = originalLoad; };
 }
 const nativeExec = cp.execFile;
 module.exports = { installResourceExecutorFixture };

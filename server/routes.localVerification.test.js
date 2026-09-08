@@ -1,5 +1,5 @@
-require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 
 // Exercise the production routes/stores/dispatcher and file-chat transport.
 // Only GitHub I/O and the already-tested composed-candidate store reader are

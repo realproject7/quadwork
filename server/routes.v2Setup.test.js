@@ -1,5 +1,5 @@
-require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 
 // #1032 end-to-end route proof with real config/map writes and fake direct
 // execFile results. No shell is invoked; git/gh command arrays are asserted by
