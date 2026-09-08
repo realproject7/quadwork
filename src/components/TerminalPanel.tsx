@@ -200,6 +200,7 @@ export default function TerminalPanel({
       if (cancelled) return;
 
       const tok = await sessionTokenParam(); // #968: auth the terminal WS
+      if (cancelled) return;
       const endpoint = `${base}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agentId)}${tok ? `&${tok}` : ""}`;
       const ws = new WebSocket(endpoint);
       wsRef.current = ws;
