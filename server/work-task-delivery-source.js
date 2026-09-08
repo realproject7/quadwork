@@ -9,6 +9,7 @@ const { workTaskKey } = require("./work-task-manifest");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
 const { createTaskReviewRoundStore } = require("./task-review-round-store");
 const { expectedCandidateBase } = require("./delivery-candidate");
+const { currentDeliveryCut } = require("./work-task-pipeline");
 
 const VERSION = 1;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
@@ -62,33 +63,37 @@ function repository(value, owner) {
   }
   return freeze(clone(value));
 }
-function cutId(pipeline) {
-  const cut = [...pipeline.history].reverse().find((entry) => entry.kind === "integrated_cut");
-  if (!cut || typeof cut.event_id !== "string" || !/^[a-z][a-z0-9_-]{2,95}$/.test(cut.event_id)) {
-    fail("work_task_delivery_cut_unavailable", "no durable integrated cut is available");
-  }
-  return cut.event_id;
-}
 function selectedEntries(snapshot, key) {
   const slots = new Map(snapshot.pipeline.tasks.map((slot) => [workTaskKey(slot.work_task_ref), slot]));
-  const entries = snapshot.manifest.tasks.filter((entry) => entry.ref.repository_key === key);
-  if (entries.length === 0) fail("work_task_delivery_repository_unavailable", "batch has no task for this registered repository");
-  const selected = entries.map((entry) => {
-    const slot = slots.get(workTaskKey(entry.ref));
-    if (!slot || slot.state !== "staged" || slot.candidate === null) {
-      fail("work_task_delivery_staging_incomplete", "all repository WorkTasks must be staged before delivery preparation");
+  if (!snapshot.manifest.tasks.some((entry) => entry.ref.repository_key === key)) fail("work_task_delivery_repository_unavailable", "batch has no task for this registered repository");
+  let cut;
+  try { cut = currentDeliveryCut(snapshot.pipeline, key, snapshot.manifest.delivery_mode); }
+  catch (error) { rethrow(error, "work_task_delivery_cut_unavailable"); }
+  const selected = cut.work_task_refs.map((taskRef) => ({ work_task_ref: clone(taskRef), candidate: clone(slots.get(workTaskKey(taskRef)).candidate) }));
+  const selectedKeys = new Set(selected.map((entry) => workTaskKey(entry.work_task_ref)));
+  const deliveries = snapshot.pipeline.deliveries || [];
+  const delivered = new Map(deliveries.flatMap((record) => record.work_task_refs.map((taskRef) => [workTaskKey(taskRef), record])));
+  for (const entry of selected) {
+    const slot = slots.get(workTaskKey(entry.work_task_ref));
+    if (slot.dependency_refs.some((dependency) => !selectedKeys.has(workTaskKey(dependency)) && !delivered.has(workTaskKey(dependency)))) {
+      fail("work_task_delivery_dependency_unavailable", "staged dependency lacks current-cut or delivered provenance");
     }
-    return { work_task_ref: clone(entry.ref), candidate: clone(slot.candidate) };
-  });
-  // The frozen root base is the one the pipeline issued for this repository;
-  // a same-repository dependent was built from its predecessor candidate.
+  }
   const root = snapshot.pipeline.repository_bases.find((entry) => entry.repository_key === key);
   const candidates = selected.map((entry) => entry.candidate);
-  if (!root || selected.some((entry) => entry.candidate.base_sha !== expectedCandidateBase(snapshot.manifest.tasks, candidates, entry.candidate, root.base_sha))) {
-    fail("work_task_delivery_base_mismatch", "staged repository candidates do not chain exactly from the frozen repository base");
+  if (!root || selected.some((entry) => entry.candidate.base_sha !== expectedCandidateBase(snapshot.manifest.tasks, candidates, entry.candidate, root.base_sha, deliveries))) {
+    fail("work_task_delivery_base_mismatch", "staged repository candidates do not chain from the current repository base");
   }
-  return { selected, base_sha: root.base_sha };
+  const deferred_exclusions = snapshot.manifest.tasks.filter((entry) => !selectedKeys.has(workTaskKey(entry.ref))).map((entry) => {
+    const slot = slots.get(workTaskKey(entry.ref));
+    const record = delivered.get(workTaskKey(entry.ref));
+    if (record) return { work_task_ref: clone(entry.ref), reason: "already_delivered", delivery: clone(record) };
+    return { work_task_ref: clone(entry.ref), reason: entry.ref.repository_key !== key ? "separate_repository_delivery_candidate"
+      : slot.state === "deferred" ? "explicitly_deferred" : "safe_cut_deferred" };
+  });
+  return { selected, base_sha: root.base_sha, cut_id: cut.cut_id, deferred_exclusions };
 }
+
 function rethrow(error, fallback) {
   if (error instanceof WorkTaskDeliverySourceError) throw error;
   const code = typeof error?.code === "string" && /^[a-z][a-z0-9_]{2,127}$/.test(error.code) ? error.code : fallback;
@@ -109,7 +114,7 @@ function createWorkTaskDeliverySource(value) {
     if (!snapshot.manifest.frozen || snapshot.pipeline.manifest_frozen !== true) {
       fail("work_task_delivery_batch_not_frozen", "delivery requires a frozen WorkTask batch");
     }
-    const { selected, base_sha } = selectedEntries(snapshot, input.repository_key);
+    const { selected, base_sha, cut_id, deferred_exclusions } = selectedEntries(snapshot, input.repository_key);
     let registered;
     try {
       registered = repository(deps.read_registered_repository(freeze({ version: VERSION, ...owner, repository_key: input.repository_key })), owner);
@@ -124,15 +129,12 @@ function createWorkTaskDeliverySource(value) {
       } catch (error) { rethrow(error, "work_task_delivery_review_unavailable"); }
       return { candidate: clone(entry.candidate), terminal_review: clone(terminal_review) };
     });
-    const deferred_exclusions = snapshot.manifest.tasks
-      .filter((entry) => entry.ref.repository_key !== input.repository_key)
-      .map((entry) => ({ work_task_ref: clone(entry.ref), reason: "separate_repository_delivery_candidate" }));
     return freeze({
       version: VERSION,
       registered_repository: registered,
       frozen_batch_manifest: clone(snapshot.manifest),
       delivery_mode: snapshot.manifest.delivery_mode,
-      cut_id: cutId(snapshot.pipeline),
+      cut_id,
       base_sha,
       staged_tasks,
       deferred_exclusions,

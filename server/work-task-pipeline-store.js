@@ -23,7 +23,10 @@ const {
   assertWorkTaskPipelinePlan,
   planWorkTaskPipelineEvent,
   applyWorkTaskPipelinePlan,
+  applyWorkTaskPipelineDelivery,
 } = require("./work-task-pipeline");
+
+const { assertDeliveryCompletionRecord } = require("./delivery-candidate");
 
 const SCHEMA_VERSION = 1;
 const MAX_TERMINAL_AUDIT = 64;
@@ -486,6 +489,39 @@ function createWorkTaskPipelineStore(options) {
       return snapshot(commit(target, current, nextPipeline, application.disposition));
     });
   }
+  // Called only by the fixed server delivery executor after its immutable
+  // postmerge proof/intent. This is not exposed as a generic pipeline event.
+  function recordDelivery(input) {
+    exact(input, ["expected", "delivery"], "invalid_work_task_pipeline_store_delivery");
+    const precondition = expected(input.expected, "invalid_work_task_pipeline_store_delivery");
+    if (precondition.pipeline_digest === null) fail("invalid_work_task_pipeline_store_delivery", "delivery requires an exact pipeline digest");
+    let delivery;
+    try { delivery = clone(assertDeliveryCompletionRecord(input.delivery)); }
+    catch { fail("invalid_work_task_pipeline_store_delivery", "delivery completion proof identity is invalid"); }
+    if (!sameIdentity(delivery.candidate_ref, precondition) || delivery.candidate_ref.batch_manifest_digest !== precondition.manifest_digest) {
+      fail("work_task_delivery_identity_mismatch", "delivery belongs to a different owner or frozen batch");
+    }
+    const target = statePath(precondition);
+    if (!prepare(precondition).owned) fail("work_task_pipeline_store_missing", "pipeline store is not initialized");
+    return files.withWriterLock(target, () => {
+      const current = decodeState(fs, target, precondition, false);
+      if (current.manifest.manifest_digest !== precondition.manifest_digest) fail("stale_work_task_pipeline_store_precondition", "frozen batch changed before delivery");
+      const prior = (current.pipeline.deliveries || []).find((record) => record.receipt_digest === delivery.receipt_digest);
+      if (prior) {
+        // Compare canonical content before the stale first-attempt CAS: a lost
+        // acknowledgement must reconcile the same receipt without a new write.
+        const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(",")}]` : plain(value)
+          ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}` : JSON.stringify(value);
+        if (stable(prior) !== stable(delivery)) fail("work_task_delivery_receipt_collision", "delivery receipt was reused with different content");
+        return snapshot(current);
+      }
+      if (current.pipeline.pipeline_digest !== precondition.pipeline_digest) fail("stale_work_task_pipeline_store_precondition", "pipeline changed before delivery");
+      let nextPipeline;
+      try { nextPipeline = applyWorkTaskPipelineDelivery(current.pipeline, delivery); }
+      catch (error) { fail(error.code || "invalid_work_task_pipeline_store_delivery", "pipeline refuses this delivery completion"); }
+      return snapshot(commit(target, current, nextPipeline, null));
+    });
+  }
   function readCurrent(target, precondition) {
     const current = decodeState(fs, target, precondition, false);
     if (current.identity.installation_id !== precondition.installation_id || current.identity.project_id !== precondition.project_id ||
@@ -565,6 +601,7 @@ function createWorkTaskPipelineStore(options) {
     readRetiredSnapshots,
     initialize,
     applyPlan,
+    recordDelivery,
     retire,
   });
 }

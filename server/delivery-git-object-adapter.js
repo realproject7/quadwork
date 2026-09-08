@@ -15,7 +15,7 @@
 
 const crypto = require("node:crypto");
 const path = require("node:path");
-const { assertDeliveryCandidateRef, expectedCandidateBase } = require("./delivery-candidate");
+const { assertDeliveryCandidateRef, expectedCandidateBase, deliveredRecordsFromExclusions } = require("./delivery-candidate");
 const { workTaskKey } = require("./work-task-manifest");
 const { compareGitTreeRecords } = require("./git-tree-order");
 const {
@@ -537,7 +537,7 @@ function createDeliveryGitObjectAdapter(options) {
       : fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid"));
     for (const candidate of candidates) {
       let expectedBase;
-      try { expectedBase = expectedCandidateBase(staged.frozen_batch_manifest.tasks, candidates, candidate, staged.base_sha); }
+      try { expectedBase = expectedCandidateBase(staged.frozen_batch_manifest.tasks, candidates, candidate, staged.base_sha, deliveredRecordsFromExclusions(staged.deferred_exclusions)); }
       catch { fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid"); }
       if (candidate.base_sha !== expectedBase || !SHA_RE.test(candidate.candidate_sha)) {
         fail("delivery_git_evidence_candidate_invalid", "staged candidate provenance is invalid");

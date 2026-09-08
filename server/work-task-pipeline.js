@@ -16,6 +16,8 @@ const {
   assertWorkTaskCandidate,
 } = require("./work-task-candidate");
 
+const { assertDeliveryCompletionRecord } = require("./delivery-candidate");
+
 const VERSION = 1;
 const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const EVENT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
@@ -29,6 +31,7 @@ const TASK_STATES = new Set([
   "changes_requested",
   "accepted",
   "staged",
+  "delivered",
   "blocked",
   "deferred",
 ]);
@@ -51,7 +54,8 @@ const EVENT_KINDS = new Set([
   "propagating_finding",
   "contract_change",
 ]);
-const DEPENDENCY_READY_STATES = new Set(["accepted", "staged"]);
+const DEPENDENCY_READY_STATES = new Set(["accepted", "staged", "delivered"]);
+const INTERNAL_HISTORY_KINDS = new Set(["record_delivery"]);
 const MAX_TASKS = 64;
 const MAX_HISTORY = 512;
 const MAX_CHECKPOINTS = 3;
@@ -122,6 +126,7 @@ function pipelinePayload(pipeline) {
     repository_bases: pipeline.repository_bases,
     history: pipeline.history,
     tasks: pipeline.tasks,
+    ...(Object.hasOwn(pipeline, "deliveries") ? { deliveries: pipeline.deliveries } : {}),
   };
 }
 function pipelineDigest(pipeline) { return hash(pipelinePayload(pipeline)); }
@@ -176,7 +181,11 @@ function assertCorrection(value, currentCandidate, state, count, code) {
 function assertSlot(slot, code) {
   const fields = ["work_task_ref", "dependency_refs", "file_boundary", "state", "candidate", "build_assignment", "review_assignment", "correction", "blocked_from", "history"];
   if (!plain(slot)) fail(code, "value must be an object");
-  exact(slot, Object.prototype.hasOwnProperty.call(slot, "correction_count") ? [...fields, "correction_count"] : fields, code);
+  exact(slot, [...fields, ...["correction_count", "invalidated_candidate"].filter((field) => Object.hasOwn(slot, field))], code);
+  if (Object.hasOwn(slot, "invalidated_candidate")) {
+    candidate(slot.invalidated_candidate, code);
+    if (!sameRef(slot.invalidated_candidate.work_task_ref, slot.work_task_ref)) fail(code, "invalidated candidate belongs to another task");
+  }
   ref(slot.work_task_ref, code);
   fileBoundary(slot.file_boundary, code);
   if (!Array.isArray(slot.dependency_refs) || slot.dependency_refs.length > MAX_TASKS) fail(code, "dependency references are invalid");
@@ -187,7 +196,7 @@ function assertSlot(slot, code) {
     candidate(slot.candidate, code);
     if (!sameRef(slot.candidate.work_task_ref, slot.work_task_ref)) fail(code, "candidate belongs to another work task");
   }
-  const requiresCandidate = new Set(["candidate_ready", "independent_review", "reconcile", "changes_requested", "accepted", "staged"]);
+  const requiresCandidate = new Set(["candidate_ready", "independent_review", "reconcile", "changes_requested", "accepted", "staged", "delivered"]);
   if (requiresCandidate.has(slot.state) && slot.candidate === null) fail(code, "state requires an exact candidate");
   if (slot.state === "deferred" && slot.candidate !== null) fail(code, "deferred task retains candidate authority");
   if (slot.build_assignment === null) {
@@ -212,7 +221,7 @@ function assertSlot(slot, code) {
   slot.history.forEach((entry) => {
     exact(entry, ["event_id", "kind"], code);
     identifier(entry.event_id, code);
-    if (!EVENT_KINDS.has(entry.kind)) fail(code, "task history kind is invalid");
+    if (!EVENT_KINDS.has(entry.kind) && !INTERNAL_HISTORY_KINDS.has(entry.kind)) fail(code, "task history kind is invalid");
   });
   return slot;
 }
@@ -232,7 +241,8 @@ function assertRepositoryBases(value, tasks, code) {
 }
 
 function assertWorkTaskPipeline(pipeline) {
-  exact(pipeline, ["version", "manifest_digest", "manifest_frozen", "archived", "repository_bases", "history", "tasks", "pipeline_digest"], "invalid_work_task_pipeline");
+  exact(pipeline, ["version", "manifest_digest", "manifest_frozen", "archived", "repository_bases", "history", "tasks", "pipeline_digest",
+    ...(Object.hasOwn(pipeline, "deliveries") ? ["deliveries"] : [])], "invalid_work_task_pipeline");
   if (pipeline.version !== VERSION || !SHA_RE.test(pipeline.manifest_digest) || typeof pipeline.manifest_frozen !== "boolean" || typeof pipeline.archived !== "boolean" ||
       !Array.isArray(pipeline.tasks) || pipeline.tasks.length === 0 || pipeline.tasks.length > MAX_TASKS || !Array.isArray(pipeline.history) || pipeline.history.length > MAX_HISTORY || !SHA_RE.test(pipeline.pipeline_digest)) {
     fail("invalid_work_task_pipeline", "pipeline shape is invalid");
@@ -250,11 +260,141 @@ function assertWorkTaskPipeline(pipeline) {
   pipeline.history.forEach((entry) => {
     exact(entry, ["event_id", "kind"], "invalid_work_task_pipeline");
     identifier(entry.event_id, "invalid_work_task_pipeline");
-    if (!EVENT_KINDS.has(entry.kind) || historyIds.has(entry.event_id)) fail("invalid_work_task_pipeline", "pipeline history is invalid or duplicated");
+    if ((!EVENT_KINDS.has(entry.kind) && !INTERNAL_HISTORY_KINDS.has(entry.kind)) || historyIds.has(entry.event_id)) fail("invalid_work_task_pipeline", "pipeline history is invalid or duplicated");
     historyIds.add(entry.event_id);
   });
+  assertDeliveryMappings(pipeline);
   if (pipeline.pipeline_digest !== pipelineDigest(pipeline)) fail("invalid_work_task_pipeline", "pipeline digest mismatch");
   return pipeline;
+}
+
+// Delivery records are written only by the store's internal completion method.
+// They are not accepted by parseEvent or by the public generic plan surface.
+function assertDeliveryMappings(pipeline) {
+  const records = Object.hasOwn(pipeline, "deliveries") ? pipeline.deliveries : [];
+  if (!Array.isArray(records) || records.length > MAX_TASKS) fail("invalid_work_task_pipeline", "delivery history bound is invalid");
+  const mapped = new Set();
+  const receipts = new Set();
+  const lastByRepository = new Map();
+  for (const record of records) {
+    try { assertDeliveryCompletionRecord(record); } catch { fail("invalid_work_task_pipeline", "delivery completion record is invalid"); }
+    const identity = record.candidate_ref;
+    if (identity.batch_manifest_digest !== pipeline.manifest_digest || receipts.has(record.receipt_digest)) {
+      fail("invalid_work_task_pipeline", "delivery history identity is inconsistent");
+    }
+    const previous = lastByRepository.get(identity.repository_key);
+    if (previous && record.base_sha !== previous.merge_sha) fail("invalid_work_task_pipeline", "delivery repository base chain is broken");
+    lastByRepository.set(identity.repository_key, record);
+    receipts.add(record.receipt_digest);
+    const eventId = `delivery_${record.receipt_digest}`;
+    if (!pipeline.history.some((event) => event.kind === "record_delivery" && event.event_id === eventId)) {
+      fail("invalid_work_task_pipeline", "delivery record lacks its internal transition");
+    }
+    let previousIndex = -1;
+    for (const taskRef of record.work_task_refs) {
+      const key = workTaskKey(taskRef);
+      const index = pipeline.tasks.findIndex((slot) => sameRef(slot.work_task_ref, taskRef));
+      const slot = pipeline.tasks[index];
+      if (!slot || index <= previousIndex || mapped.has(key) || slot.state !== "delivered"
+        || slot.work_task_ref.installation_id !== identity.installation_id || slot.work_task_ref.project_id !== identity.project_id
+        || !slot.history.some((event) => event.kind === "record_delivery" && event.event_id === eventId)) {
+        fail("invalid_work_task_pipeline", "delivered task mapping is inconsistent");
+      }
+      mapped.add(key);
+      previousIndex = index;
+    }
+  }
+  if (pipeline.history.some((event) => event.kind === "record_delivery" && !receipts.has(event.event_id.slice("delivery_".length)))) {
+    fail("invalid_work_task_pipeline", "delivery transition lacks its immutable receipt");
+  }
+  for (const slot of pipeline.tasks) {
+    if (slot.history.some((event) => event.kind === "record_delivery" && !receipts.has(event.event_id.slice("delivery_".length)))) {
+      fail("invalid_work_task_pipeline", "task delivery history lacks its immutable receipt");
+    }
+    if ((slot.state === "delivered") !== mapped.has(workTaskKey(slot.work_task_ref))) {
+      fail("invalid_work_task_pipeline", "task has no exact delivery mapping");
+    }
+  }
+  for (const [repository, record] of lastByRepository) {
+    if (assignedRepositoryBase(pipeline.repository_bases, repository)?.base_sha !== record.merge_sha) {
+      fail("invalid_work_task_pipeline", "repository base is not its verified merge result");
+    }
+  }
+}
+
+function currentDeliveryCut(pipeline, repositoryKey, mode = "integrated") {
+  assertWorkTaskPipeline(pipeline);
+  const slots = pipeline.tasks.filter((slot) => slot.work_task_ref.repository_key === repositoryKey && slot.state === "staged");
+  if (slots.length === 0 || (mode === "isolated" && slots.length !== 1)) fail("work_task_delivery_staging_incomplete", "no bounded staged repository cut is available");
+  let cutIndex = -1;
+  for (const slot of slots) {
+    const staged = [...slot.history].reverse().find((entry) => entry.kind === "integrated_cut" || entry.kind === "stage_candidate");
+    if (!staged || (mode === "integrated" && staged.kind !== "integrated_cut")) fail("work_task_delivery_cut_unavailable", "staged task has no recorded delivery cut");
+    const index = pipeline.history.findIndex((entry) => entry.event_id === staged.event_id && entry.kind === staged.kind);
+    if (index < 0) fail("work_task_delivery_cut_unavailable", "recorded cut is unavailable");
+    cutIndex = Math.max(cutIndex, index);
+  }
+  const last = pipeline.tasks.indexOf(slots[slots.length - 1]);
+  if (pipeline.tasks.slice(0, last).some((slot) => slot.work_task_ref.repository_key === repositoryKey
+    && !["staged", "delivered", "deferred"].includes(slot.state))) {
+    fail("work_task_delivery_staging_incomplete", "delivery cut skips unresolved repository work");
+  }
+  return freeze({ cut_id: pipeline.history[cutIndex].event_id, work_task_refs: slots.map((slot) => clone(slot.work_task_ref)) });
+}
+
+function applyWorkTaskPipelineDelivery(pipeline, delivery) {
+  assertWorkTaskPipeline(pipeline);
+  assertDeliveryCompletionRecord(delivery);
+  if (pipeline.archived || !pipeline.manifest_frozen) fail("work_task_archive_blocked", "delivery requires the active frozen pipeline");
+  if (pipeline.history.length >= MAX_HISTORY || (pipeline.deliveries || []).length >= MAX_TASKS) fail("work_task_pipeline_history_full", "delivery history bound reached");
+  const ref = delivery.candidate_ref;
+  if (ref.batch_manifest_digest !== pipeline.manifest_digest) fail("work_task_delivery_identity_mismatch", "delivery belongs to another batch");
+  const base = assignedRepositoryBase(pipeline.repository_bases, ref.repository_key);
+  if (!base || base.base_sha !== delivery.base_sha) fail("work_task_delivery_base_mismatch", "delivery does not advance the current repository base");
+  if (pipeline.tasks.some((slot) => slot.work_task_ref.repository_key === ref.repository_key
+    && ["building", "independent_review", "reconcile"].includes(slot.state))) {
+    fail("work_task_delivery_active_authority", "resolve active repository builds and reviews before advancing the base");
+  }
+  const cut = currentDeliveryCut(pipeline, ref.repository_key, ref.delivery_mode);
+  if (cut.cut_id !== ref.cut_id || stable(cut.work_task_refs) !== stable(delivery.work_task_refs)) {
+    fail("work_task_delivery_cut_mismatch", "completion must map the exact recorded repository cut");
+  }
+  const selected = new Set(delivery.work_task_refs.map(workTaskKey));
+  for (const slot of pipeline.tasks.filter((slot) => selected.has(workTaskKey(slot.work_task_ref)))) {
+    if (slot.dependency_refs.some((dependency) => !selected.has(workTaskKey(dependency))
+      && slotFor(pipeline.tasks, dependency, "work_task_delivery_dependency_unavailable").state !== "delivered")) {
+      fail("work_task_delivery_dependency_unavailable", "completion lacks a delivered or included predecessor");
+    }
+  }
+  const event = { event_id: `delivery_${delivery.receipt_digest}`, kind: "record_delivery" };
+  const tasks = clone(pipeline.tasks);
+  for (const slot of tasks) {
+    if (slot.work_task_ref.repository_key !== ref.repository_key || slot.state === "delivered") continue;
+    if (slot.work_task_ref.installation_id !== ref.installation_id || slot.work_task_ref.project_id !== ref.project_id) {
+      fail("work_task_delivery_identity_mismatch", "delivery belongs to another owner");
+    }
+    if (selected.has(workTaskKey(slot.work_task_ref))) {
+      slot.state = "delivered";
+      slot.history.push(clone(event));
+    } else if (slot.candidate !== null) {
+      // Keep the old local identity for diagnosis; its task-review store and
+      // managed worktree stay untouched. New assignment must use the new base.
+      slot.invalidated_candidate = clone(slot.candidate);
+      slot.candidate = null;
+      clearAuthority(slot);
+      if (slot.state === "blocked") slot.blocked_from = "queued";
+      else { slot.state = "queued"; slot.blocked_from = null; }
+      slot.history.push(clone(event));
+    }
+  }
+  const next = withDigest({ ...pipeline, tasks,
+    repository_bases: pipeline.repository_bases.map((entry) => entry.repository_key === ref.repository_key
+      ? { ...entry, base_sha: delivery.merge_sha } : clone(entry)),
+    deliveries: [...(pipeline.deliveries || []).map(clone), clone(delivery)],
+    history: [...pipeline.history, event],
+  });
+  assertWorkTaskPipeline(next);
+  return next;
 }
 
 function buildWorkTaskPipeline(manifest, options) {
@@ -399,7 +539,7 @@ function clearAuthority(slot) {
 }
 function blockSlot(slot) {
   if (slot.state === "blocked") return false;
-  if (slot.state === "deferred") return false;
+  if (slot.state === "deferred" || slot.state === "delivered") return false;
   const from = slot.state;
   const resume = from === "building" ? "queued" :
     (from === "independent_review" || from === "reconcile" ? "candidate_ready" : from);
@@ -429,7 +569,7 @@ function expectedBuildBase(tasks, repositoryBases, slot) {
   if (slot.candidate !== null) return slot.candidate.base_sha;
   const sameRepositoryDependencies = slot.dependency_refs
     .map((dependency) => slotFor(tasks, dependency, "invalid_work_task_pipeline_state"))
-    .filter((dependency) => dependency.work_task_ref.repository_key === slot.work_task_ref.repository_key);
+    .filter((dependency) => dependency.work_task_ref.repository_key === slot.work_task_ref.repository_key && dependency.state !== "delivered");
   if (sameRepositoryDependencies.length > 1) {
     fail("work_task_dependency_base_ambiguous", "task has multiple same-repository predecessor bases");
   }
@@ -621,7 +761,7 @@ function deriveTransition(pipeline, event) {
         const key = workTaskKey(slot.work_task_ref);
         const cut = cutByKey.get(key);
         if (!cut) {
-          if (slot.state !== "staged" && slot.state !== "deferred") {
+          if (slot.state !== "staged" && slot.state !== "deferred" && slot.state !== "delivered") {
             fail("integrated_cut_prefix_incomplete", "cut skips an unresolved earlier manifest task");
           }
           continue;
@@ -634,7 +774,7 @@ function deriveTransition(pipeline, event) {
         const slot = locate(cut.work_task_ref);
         for (const dependency of dependencyKeys(slot)) {
           const parent = tasks[indexByKey.get(dependency)];
-          if (parent.state !== "staged" && !selected.has(dependency)) fail("integrated_cut_dependency_not_ready", "cut omits an un-staged dependency");
+          if (parent.state !== "staged" && parent.state !== "delivered" && !selected.has(dependency)) fail("integrated_cut_dependency_not_ready", "cut omits an un-staged dependency");
         }
         const from = slot.state;
         slot.state = "staged";
@@ -663,7 +803,7 @@ function deriveTransition(pipeline, event) {
     }
     case "propagating_finding": {
       const source = locate(event.work_task_ref);
-      if (!source.candidate || source.state === "blocked" || source.state === "deferred") fail("invalid_work_task_pipeline_state", "finding source is not an active candidate task");
+      if (!source.candidate || source.state === "blocked" || source.state === "deferred" || source.state === "delivered") fail("invalid_work_task_pipeline_state", "finding source is not an active candidate task");
       ensureCandidate(source, event.candidate_digest);
       const sourceFrom = source.state;
       source.state = "changes_requested";
@@ -690,7 +830,7 @@ function deriveTransition(pipeline, event) {
       // Contract changes do not create successors. They issue an immutable
       // defer/revocation plan for exactly the source and declared dependents.
       for (const slot of tasks) {
-        if (!affected.has(workTaskKey(slot.work_task_ref))) continue;
+        if (!affected.has(workTaskKey(slot.work_task_ref)) || slot.state === "delivered") continue;
         const from = slot.state;
         slot.state = "deferred";
         slot.candidate = null;
@@ -791,6 +931,7 @@ function applyWorkTaskPipelinePlan(pipeline, plan) {
     repository_bases: transition.repositoryBases,
     history: [...pipeline.history, { event_id: expected.event.event_id, kind: expected.event.kind }],
     tasks,
+    ...(Object.hasOwn(pipeline, "deliveries") ? { deliveries: clone(pipeline.deliveries) } : {}),
   });
   assertWorkTaskPipeline(next);
   return next;
@@ -804,6 +945,8 @@ module.exports = {
   assertWorkTaskPipelinePlan,
   buildWorkTaskPipeline,
   declaredWorkTaskDependents,
+  currentDeliveryCut,
+  applyWorkTaskPipelineDelivery,
   planWorkTaskPipelineEvent,
   applyWorkTaskPipelinePlan,
 };

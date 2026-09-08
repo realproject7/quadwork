@@ -14,6 +14,7 @@ const {
   DeliveryCandidateError,
   assertDeliveryCandidateRef,
   assertDeliveryManifest,
+  deliveredRecordsFromExclusions,
 } = require("./delivery-candidate");
 const { workTaskKey } = require("./work-task-manifest");
 const { compareGitTreePaths } = require("./git-tree-order");
@@ -399,8 +400,9 @@ function assertIndependentPatchOverlap(entries, byKey) {
     }
   }
 }
-function expectedHandoffs(contract, completed, sequenceByKey) {
-  const dependencies = contract.dependencies.map((dependency) => {
+function expectedHandoffs(contract, completed, sequenceByKey, manifest) {
+  const delivered = new Set(deliveredRecordsFromExclusions(manifest.deferred_exclusions).flatMap((record) => record.work_task_refs.map(workTaskKey)));
+  const dependencies = contract.dependencies.filter((dependency) => !delivered.has(workTaskKey(dependency))).map((dependency) => {
     const key = taskKey(dependency, "invalid_delivery_manifest");
     const predecessor = completed.get(key);
     if (!predecessor) fail("dependent_predecessor_not_handed_off", "dependent task precedes a required frozen predecessor");
@@ -525,7 +527,7 @@ function assertProofAgainstManifest(proof, manifestValue, prepared = null) {
       .map((candidate) => [taskKey(candidate.work_task_ref, "invalid_composition_proof"), {
         sequence: candidate.sequence, work_task_ref: candidate.work_task_ref,
         candidate_digest: candidate.candidate_digest, output_tree_sha: candidate.output_tree_sha,
-      }])), sequenceByKey);
+      }])), sequenceByKey, manifest);
     if (!same(step.predecessor_handoffs, expected)) fail("composition_proof_manifest_mismatch", "proof predecessor handoff is not exact");
   }
   const patchEntries = contracts.stages.map((entry) => ({ key: entry.key, patch: { files: byProofKey.get(entry.key).changed_files } }));
@@ -634,7 +636,7 @@ async function composeDeliveryCandidate(manifestValue, optionsValue) {
     if (!entry.patch.files.every((file) => sameEntry(accumulated.get(file.path) || null, file.before))) {
       fail("composition_apply_not_clean", "candidate patch does not apply to the accumulated composition tree");
     }
-    const predecessorHandoffs = expectedHandoffs(entry.contract, completed, sequenceByKey);
+    const predecessorHandoffs = expectedHandoffs(entry.contract, completed, sequenceByKey, manifest);
     const finalOutput = index === prepared.length - 1 ? resultTree : null;
     const applied = await applyPatch(options, repo, manifest, stage, entry.patch, currentTree, finalOutput,
       "composition", predecessorHandoffs, "composition_apply_not_clean");

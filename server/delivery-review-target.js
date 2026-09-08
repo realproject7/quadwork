@@ -48,13 +48,14 @@ function source(value) {
 }
 function identityFor(manifest, prFact, policy) {
   const ref = manifest.delivery_candidate_ref;
-  const work_items = manifest.staged_tasks.map((stage) => ({
+  const allItems = manifest.staged_tasks.map((stage) => ({
     repoKey: stage.work_item.repoKey,
     repo: canonicalRepository(stage.work_item.repo, "invalid_delivery_review_target_source"),
     number: stage.work_item.number,
     kind: stage.work_item.kind,
   }));
-  if (work_items.length === 0 || new Set(work_items.map((item) => JSON.stringify(item))).size !== work_items.length) {
+  const work_items = [...new Map(allItems.map((item) => [JSON.stringify(item), item])).values()];
+  if (work_items.length === 0) {
     fail("invalid_delivery_review_target_source", "Delivery Candidate work-item provenance is invalid");
   }
   const policy_identity = policy === null ? null : deriveCiPolicyIdentity(policy);

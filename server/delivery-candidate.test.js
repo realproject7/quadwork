@@ -340,9 +340,8 @@ function chainFixture({ dependent = true, overlap = true, bravoBase = null, cut_
   throwsCode(() => buildDeliveryManifest(stale, options()), "stale_delivery_review_anchor");
 }
 
-// Integrated cuts must cover their registered repository's entire frozen
-// batch slice. Duplicate tasks, reordered provenance, and undeclared same-repo
-// peers cannot become a partial cut.
+// Integrated cuts preserve an explicit compatible prefix. Duplicate tasks,
+// reordered provenance and omitted exclusions remain invalid.
 {
   const fixture = integratedFixture();
   const duplicate = copy(fixture.input);
@@ -350,9 +349,15 @@ function chainFixture({ dependent = true, overlap = true, bravoBase = null, cut_
   throwsCode(() => buildDeliveryManifest(duplicate, options()), "duplicate_delivery_work_task");
   const partial = copy(fixture.input);
   partial.staged_tasks.pop();
-  partial.deferred_exclusions = [{ work_task_ref: copy(fixture.batch.tasks[1].ref), reason: "not allowed in integrated cut" }];
+  partial.deferred_exclusions = [{ work_task_ref: copy(fixture.batch.tasks[1].ref), reason: "safe_cut_deferred" }];
   partial.evidence = evidence(fixture.ref, ["server/alpha.js"]);
-  throwsCode(() => buildDeliveryManifest(partial, options()), "integrated_delivery_requires_complete_batch");
+  assert.equal(buildDeliveryManifest(partial, options()).staged_tasks.length, 1);
+  const omitted = copy(partial); omitted.deferred_exclusions = [];
+  throwsCode(() => buildDeliveryManifest(omitted, options()), "unsafe_partial_delivery_cut");
+  const skipped = copy(fixture.input); skipped.staged_tasks.shift();
+  skipped.deferred_exclusions = [{ work_task_ref: copy(fixture.batch.tasks[0].ref), reason: "safe_cut_deferred" }];
+  skipped.evidence = evidence(fixture.ref, ["server/bravo.js"]);
+  throwsCode(() => buildDeliveryManifest(skipped, options()), "unsafe_partial_delivery_cut");
   const reversed = copy(fixture.input);
   reversed.staged_tasks.reverse();
   throwsCode(() => buildDeliveryManifest(reversed, options()), "invalid_delivery_task_order");
