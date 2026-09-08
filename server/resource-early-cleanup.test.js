@@ -58,7 +58,7 @@ async function scenario(mode) {
     "./durable-store-files": { createDurableStoreFiles: () => ({ ensureDirectories() {}, withAsyncWriterLock: (_p, fn) => fn() }) },
     "./resource-linux-facts": {
       ...realFacts,
-      readProcess: (pid) => ({ pid, startTime: "controlled-native-identity", cgroup: "/api" }),
+      readProcess: (pid) => { if (nativeExited) { const e = new Error("native child exited"); e.code = "ENOENT"; throw e; } return { pid, startTime: "controlled-native-identity", cgroup: "/api" }; },
       scopeGroup() { throw new Error("scope never appeared"); },
       text: (p) => mode === "parent-descendant" && p.includes("nested.scope") ? `${term.pid}\n` : "",
     },
