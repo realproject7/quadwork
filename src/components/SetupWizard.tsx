@@ -75,13 +75,13 @@ function listFromInput(value: string) {
 
 function blankPolicy(): CiPolicyDraft {
   return {
-    mode: "",
+    mode: "ci-less",
     requiredChecks: "",
     advisoryChecks: "",
     checkKind: "product",
     registrationGraceSeconds: "300",
     sameShaRetryBudget: "0",
-    evidenceKeys: "",
+    evidenceKeys: "unit, typecheck, build",
   };
 }
 
@@ -134,8 +134,8 @@ function v2SetupMessage(result: V2SetupResult): string {
   const labels: Record<string, string> = {
     legacy_scalar: "Replace the legacy repository fields with the explicit V2 repository record.",
     repositories_required: "Add at least one repository.",
-    missing_policy: "Choose and complete a CI evidence policy for every repository.",
-    invalid_ci_policy: "Complete the selected CI evidence policy with valid values.",
+    missing_policy: "Choose and complete a Verification policy for every repository.",
+    invalid_ci_policy: "Complete the selected Verification policy with valid values.",
     invalid_primary_repository_count: "Select exactly one primary repository.",
     repository_push_access_required: "GitHub write, maintain, or admin access is required for this repository.",
     repository_identity_mismatch: "GitHub returned a different canonical repository identity. Recheck the repository.",
@@ -331,7 +331,7 @@ const AGENTS = [
 
 /* ── Component ─────────────────────────────────────────────────────────── */
 
-// One CI evidence policy form, shared by the primary repository and every
+// One Verification policy form, shared by the primary repository and every
 // additional repository so the two cannot drift apart.
 function CiPolicyFields({ idPrefix, draft, onChange }: {
   idPrefix: string; draft: CiPolicyDraft; onChange: (updates: Partial<CiPolicyDraft>) => void;
@@ -345,8 +345,8 @@ function CiPolicyFields({ idPrefix, draft, onChange }: {
         className="w-full md:w-72 bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent"
       >
         <option value="" className="bg-bg-surface">Choose evidence policy…</option>
-        <option value="github-checks" className="bg-bg-surface">GitHub exact check registry</option>
-        <option value="ci-less" className="bg-bg-surface">CI-less Dev evidence receipt</option>
+        <option value="github-checks" className="bg-bg-surface">External GitHub checks</option>
+        <option value="ci-less" className="bg-bg-surface">Local verification</option>
       </select>
       {draft.mode === "github-checks" && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
@@ -376,9 +376,9 @@ function CiPolicyFields({ idPrefix, draft, onChange }: {
       )}
       {draft.mode === "ci-less" && (
         <div className="mt-3 max-w-md">
-          <label className="text-[10px] text-text-muted block mb-1" htmlFor={`${idPrefix}-evidence-keys`}>Required Dev evidence keys</label>
+          <label className="text-[10px] text-text-muted block mb-1" htmlFor={`${idPrefix}-evidence-keys`}>Required local evidence keys</label>
           <input id={`${idPrefix}-evidence-keys`} value={draft.evidenceKeys} onChange={(e) => onChange({ evidenceKeys: e.target.value })} placeholder="unit, typecheck" className="w-full bg-transparent border border-border px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent" />
-          <p className="text-[10px] text-text-muted mt-1">Comma-separated data identifiers; no command is stored or executed.</p>
+          <p className="text-[10px] text-text-muted mt-1">Dev runs your repository checks locally and submits results for these labels. QuadWork does not run the labels as commands.</p>
         </div>
       )}
     </>
@@ -1234,7 +1234,7 @@ export default function SetupWizard() {
               <div>
                 <h2 className="text-sm font-semibold text-text mb-1">V2 repository preflight</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  Choose an explicit CI evidence policy, verify canonical GitHub access, then provision the four role worktrees. Provisioning does not activate or start agents.
+                  Choose an explicit Verification policy, verify canonical GitHub access, then provision the four role worktrees. Provisioning does not activate or start agents.
                 </p>
                 <div className="border border-border bg-bg-surface p-3 mb-4 space-y-3">
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -1252,7 +1252,7 @@ export default function SetupWizard() {
                     </div>
                   </div>
                   <div className="border-t border-border pt-3">
-                    <label className="text-[10px] uppercase tracking-wider text-text-muted block mb-2" htmlFor="v2-policy-mode">CI evidence policy</label>
+                    <label className="text-[10px] uppercase tracking-wider text-text-muted block mb-2" htmlFor="v2-policy-mode">Verification policy</label>
                     <CiPolicyFields idPrefix="v2" draft={ciPolicy} onChange={updateCiPolicy} />
                   </div>
                   <div className="border-t border-border pt-3">
@@ -1281,7 +1281,7 @@ export default function SetupWizard() {
                               <p role="alert" className="text-[11px] text-[#ffcc00] mt-2">Use an absolute local path before V2 provisioning.</p>
                             )}
                             <div className="border-t border-border mt-3 pt-3">
-                              <label className="text-[10px] text-text-muted block mb-1" htmlFor={`v2-repo-${index}-policy-mode`}>CI evidence policy</label>
+                              <label className="text-[10px] text-text-muted block mb-1" htmlFor={`v2-repo-${index}-policy-mode`}>Verification policy</label>
                               <CiPolicyFields idPrefix={`v2-repo-${index}`} draft={repository.policy} onChange={(updates) => updateExtraRepo(index, { policy: { ...repository.policy, ...updates } })} />
                             </div>
                           </div>

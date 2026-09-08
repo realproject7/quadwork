@@ -11,7 +11,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { assertWorkItemRef } = require("./work-item-ref");
-const { canonicalSha, normalizeCiPolicy } = require("./ci-evidence-policy");
+const { canonicalSha, normalizeCiPolicy, deriveCiPolicyIdentity } = require("./ci-evidence-policy");
 const {
   TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND,
   assertDeliveryReviewTargetIdentity,
@@ -163,6 +163,7 @@ function targetDigestIdentity(identity) {
     },
     pr_number: identity.pr_number,
     exact_sha: identity.exact_sha,
+    ...(identity.version === 2 ? { base_sha: identity.base_sha } : {}),
     contract_revision: identity.contract_revision,
     policy_version: identity.policy_version,
     policy_digest: identity.policy_digest,
@@ -173,7 +174,7 @@ function targetDigestIdentity(identity) {
 function slotDigestIdentity(identity) {
   if (identity?.target_kind === DELIVERY_REVIEW_TARGET_KIND) return null;
   return {
-    version: identity.version,
+    version: 1,
     target_kind: identity.target_kind,
     installation_id: identity.installation_id,
     project_id: identity.project_id,
@@ -263,18 +264,19 @@ function assertTargetIdentity(identity, code = "invalid_review_cycle_target") {
     "work_item",
     "pr_number",
     "exact_sha",
+    ...(identity.version === 2 ? ["base_sha"] : []),
     "contract_revision",
     "policy_version",
     "policy_digest",
     "assignment_attempt",
   ], code);
-  if (identity.version !== 1 || identity.target_kind !== LEGACY_REVIEW_TARGET_KIND) {
+  if (![1, 2].includes(identity.version) || identity.target_kind !== LEGACY_REVIEW_TARGET_KIND) {
     fail("unknown_review_cycle_target_kind", "only the registered legacy review target kind is accepted");
   }
   if (!INSTALLATION_ID_RE.test(identity.installation_id) || !validProjectId(identity.project_id) ||
       !REPOSITORY_KEY_RE.test(identity.repo_key) || !canonicalRepository(identity.repo) ||
       !Number.isSafeInteger(identity.pr_number) || identity.pr_number < 1 ||
-      !canonicalSha(identity.exact_sha) || !EXACT_SHA_RE.test(identity.exact_sha) || !CONTRACT_REVISION_RE.test(identity.contract_revision) ||
+      (identity.version === 2 && !canonicalSha(identity.base_sha)) || !canonicalSha(identity.exact_sha) || !EXACT_SHA_RE.test(identity.exact_sha) || !CONTRACT_REVISION_RE.test(identity.contract_revision) ||
       !ASSIGNMENT_ATTEMPT_RE.test(identity.assignment_attempt)) {
     fail(code, "legacy review target identity is invalid");
   }
@@ -309,14 +311,14 @@ function deriveLegacyReviewTarget(source) {
     "assignment_attempt",
   ], "invalid_review_cycle_source");
   exactKeys(source.repository, ["key", "repo", "ci_policy"], "invalid_review_cycle_source");
-  exactKeys(source.pr, ["number", "exact_sha", "draft", "mergeable"], "invalid_review_cycle_source");
+  exactKeys(source.pr, ["number", "exact_sha", "base_sha", "draft", "mergeable"], "invalid_review_cycle_source");
   exactKeys(source.issue_contract, ["contract_revision"], "invalid_review_cycle_source");
 
   if (!INSTALLATION_ID_RE.test(source.installation_id) || !validProjectId(source.project_id) ||
       !REPOSITORY_KEY_RE.test(source.repository.key) || !canonicalRepository(source.repository.repo) ||
       !ASSIGNMENT_ATTEMPT_RE.test(source.assignment_attempt) ||
       !Number.isSafeInteger(source.pr.number) || source.pr.number < 1 ||
-      !canonicalSha(source.pr.exact_sha) || !EXACT_SHA_RE.test(source.pr.exact_sha) || typeof source.pr.draft !== "boolean" ||
+      !canonicalSha(source.pr.base_sha) || !canonicalSha(source.pr.exact_sha) || !EXACT_SHA_RE.test(source.pr.exact_sha) || typeof source.pr.draft !== "boolean" ||
       typeof source.pr.mergeable !== "boolean" || !CONTRACT_REVISION_RE.test(source.issue_contract.contract_revision)) {
     fail("invalid_review_cycle_source", "server-derived legacy review source is invalid");
   }
@@ -333,7 +335,7 @@ function deriveLegacyReviewTarget(source) {
     catch { fail("invalid_review_cycle_policy", "registered CI policy is invalid"); }
   }
   const identity = {
-    version: 1,
+    version: 2,
     target_kind: LEGACY_REVIEW_TARGET_KIND,
     installation_id: source.installation_id,
     project_id: source.project_id,
@@ -347,9 +349,10 @@ function deriveLegacyReviewTarget(source) {
     },
     pr_number: source.pr.number,
     exact_sha: canonicalSha(source.pr.exact_sha),
+    base_sha: canonicalSha(source.pr.base_sha),
     contract_revision: source.issue_contract.contract_revision,
     policy_version: policy ? policy.version : null,
-    policy_digest: policy ? sha256(policy) : null,
+    policy_digest: policy ? deriveCiPolicyIdentity(policy).policy_digest : null,
     assignment_attempt: source.assignment_attempt,
   };
   assertTargetIdentity(identity, "invalid_review_cycle_source");
@@ -514,10 +517,10 @@ function normalizeCycle(value, expectedId) {
   if (value.invalidation !== null) {
     exactKeys(value.invalidation, ["reasons", "at"], "review_cycle_store_invalid");
     if (!Array.isArray(value.invalidation.reasons) || value.invalidation.reasons.length === 0 ||
-        value.invalidation.reasons.length > 4 || !validIsoTimestamp(value.invalidation.at)) {
+        value.invalidation.reasons.length > 7 || !validIsoTimestamp(value.invalidation.at)) {
       fail("review_cycle_store_invalid", "review-cycle invalidation is invalid");
     }
-    const allowed = new Set(["exact_sha_changed", "contract_changed", "policy_changed", "assignment_changed", "delivery_candidate_changed"]);
+    const allowed = new Set(["exact_sha_changed", "contract_changed", "policy_changed", "assignment_changed", "delivery_candidate_changed", "base_changed", "target_unavailable"]);
     const reasons = [...new Set(value.invalidation.reasons)];
     if (reasons.length !== value.invalidation.reasons.length || reasons.some((reason) => !allowed.has(reason))) {
       fail("review_cycle_store_invalid", "review-cycle invalidation reason is invalid");
@@ -716,6 +719,15 @@ function normalizeDocument(value) {
       fail("review_cycle_store_invalid", "current review cycle is missing from the slot index");
     }
   }
+  // Pre-base identities remain historical evidence only. Never invent a base
+  // or carry their approvals into a fresh, base-bound observation.
+  for (const cycle of Object.values(cycles)) {
+    if (cycle.state === "current" && cycle.target.target_kind === LEGACY_REVIEW_TARGET_KIND && cycle.target.version === 1) {
+      cycle.state = "invalidated";
+      cycle.invalidation = { reasons: ["base_changed"], at: cycle.updated_at };
+      delete slots[cycle.slot_digest];
+    }
+  }
   return { version: REVIEW_CYCLE_STORE_VERSION, cycles, slots };
 }
 
@@ -757,6 +769,7 @@ function initialReadiness(target, requiresFreshAttempt) {
 
 function invalidationReasons(previous, next) {
   const reasons = [];
+  if (previous.target.base_sha !== next.identity.base_sha) reasons.push("base_changed");
   if (previous.target.exact_sha !== next.identity.exact_sha) reasons.push("exact_sha_changed");
   if (previous.target.target_kind === LEGACY_REVIEW_TARGET_KIND && next.identity.target_kind === LEGACY_REVIEW_TARGET_KIND &&
       previous.target.contract_revision !== next.identity.contract_revision) reasons.push("contract_changed");
@@ -975,6 +988,19 @@ class ReviewCycleStore {
     document.slots[cycle.slot_digest] = cycle.cycle_id;
     this._write(projectId, document);
     return deepFreeze({ cycle: safeCycleSnapshot(cycle), invalidated, created: true });
+  }
+
+  invalidateCurrent(projectId, cycleId, digest, reason = "target_unavailable") {
+    if (!["target_unavailable", "base_changed", "exact_sha_changed"].includes(reason)) fail("invalid_review_cycle_target", "invalidation reason is invalid");
+    const document = this._read(projectId);
+    const cycle = document.cycles[cycleId];
+    if (!cycle || cycle.state !== "current" || cycle.target_identity_digest !== digest || document.slots[cycle.slot_digest] !== cycleId) return false;
+    cycle.state = "invalidated";
+    cycle.updated_at = clockIso(this.now);
+    cycle.invalidation = { reasons: [reason], at: cycle.updated_at };
+    delete document.slots[cycle.slot_digest];
+    this._write(projectId, document);
+    return true;
   }
 
   setReadiness(projectId, target, readiness) {

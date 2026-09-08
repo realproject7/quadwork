@@ -279,3 +279,42 @@ Then monitor with `batch_status` (it shows review states: *queued · in review �
 - **`send_message` acts as the human operator.** Messages post with sender `user`, which **resets the chat loop guard** (same as typing in the dashboard). Use it deliberately — `@head do X` wakes Head via the dispatcher.
 - **Destructive operations are intentionally NOT exposed** in this epic: no full reset, no agent-config reset, no raw PTY writes. `agent_control` is limited to the `start`/`stop`/`restart`/`interrupt` allow-list.
 - Unknown project / agent ids are rejected client-side **before** any HTTP call, so a typo can't create stray `~/.quadwork/<id>/` state or a runaway trigger timer.
+
+
+## Local verification and merge evidence
+
+New V2 repository setup selects **Local verification** (`ci-less`) with named
+`unit`, `typecheck`, and `build` evidence keys. Adjust the labels to the actual
+repository contract. Existing external-check policies remain explicit and
+unchanged. Labels are data; QuadWork never executes them as commands.
+
+For this repository, run the existing commands locally on a clean exact
+candidate: `npm test`, `npx tsc --noEmit`, and `npm run build`. `npm test` includes
+package smoke (`server/pack-smoke.test.js`); retain ticket-specific Linux
+containment, live upgrade, and browser checks. Record failures and honest skips.
+No GitHub Actions workflow or self-hosted Actions runner is used.
+
+Dev submits `submit_ci_evidence` for a legacy assignment or
+`submit_delivery_candidate_ci_evidence` for a composed, published delivery.
+Both require the exact head SHA, integration `base_sha`, `policy_version`,
+normalized `policy_digest`, and `verification: { environment, scope }` describing
+the actual runtime/platform and commands/acceptance scope. The delivery operation
+also requires `delivery_manifest_digest`. Copy identity from current server
+state; never invent a digest. Each configured key supplies
+`{ key, outcome: "pass" | "fail", exit_code, evidence_ref }`. Pass requires exit
+code zero. References identify bounded local logs or their digests, not raw logs
+or executable commands. A server receipt authenticates Dev's report; it is not
+OS-level test attestation. Old records without complete identity are historical
+and must be replaced by a current submission.
+
+The server rechecks the current assignment/contract or composed manifest and a
+fresh OPEN, non-draft PR head/base before accepting evidence. Source, base,
+policy, or contract changes remove standing. A successful delivery submission
+reevaluates its final-review cycle without polling or reading Actions checks.
+Explicit external policies still require their registered checks to pass.
+
+Head merges only after all required evidence passes, both independently
+authenticated final reviewers approve the exact candidate, and fresh PR/base,
+mergeability, and unresolved-review checks pass. Read back the merged result
+before task/ticket closure. Publication and completion are separate delivery
+operations; recording evidence never pushes, creates a PR, or merges.

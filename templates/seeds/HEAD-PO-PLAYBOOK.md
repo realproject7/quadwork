@@ -289,7 +289,7 @@ Before merge, independently prove:
 
 1. the issue contract and dependency state are current;
 2. the PR scope matches that contract and contains no unrelated change;
-3. required local tests and CI are green or explicitly waived by the operator;
+3. the repository's required verification passes for the exact candidate and integration base; local mode requires authenticated Dev receipts, while explicitly configured external checks must also pass;
 4. RE1 and RE2 each approved the exact current PR SHA as server-bound receipts (`2/2`);
 5. no unresolved review conversation, requested change, conflict, or drift exists;
 6. the target branch and merge method are correct.
@@ -375,3 +375,19 @@ project chat and durable GitHub/queue state; do not create private handoff files
 End with one of: delivery complete with evidence; safely waiting on a named
 observable event; or blocked on a named owner and decision. Never imply that a
 future action already happened.
+
+
+## Local verification contract
+
+Use the repository's explicit evidence policy. New V2 setup selects Local
+verification (`ci-less`); existing external-check policies are never silently
+replaced. Dev runs the repository's existing checks on the clean exact candidate,
+records the integration base, normalized policy digest, actual environment and
+scope, and submits the authenticated evidence operation. Delivery evidence also
+binds the composed manifest digest. Pass requires exit code zero; missing,
+interrupted or skipped checks are not a pass. QuadWork records evidence and does
+not execute configured labels. Never trigger Actions for local verification.
+Head requires the current candidate/base evidence and both independent final
+reviewer receipts before merge. A changed source/base/policy/contract requires
+new evidence; read back the merged state before closure. See
+`docs/operator-mcp.md` for the receipt fields and local command record.

@@ -33,7 +33,7 @@ const {
   validateAssignmentProvenance,
   ownershipKey,
 } = require("./work-item-ref");
-const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence } = require("./ci-evidence-policy");
+const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence, deriveCiPolicyIdentity } = require("./ci-evidence-policy");
 const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
 
@@ -1304,11 +1304,12 @@ async function fetchOpenPullTip(repo, number) {
     throw new CiEvidenceError("ci_evidence_live_read_failed", "live pull request could not be read", 502);
   }
   const tip = canonicalSha(payload?.head?.sha);
+  const baseSha = canonicalSha(payload?.base?.sha);
   if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
-      payload.number !== number || String(payload.state || "").toLowerCase() !== "open" || !tip) {
+      payload.number !== number || String(payload.state || "").toLowerCase() !== "open" || !tip || !baseSha || payload.draft === true) {
     throw new CiEvidenceError("ci_evidence_target_changed", "live pull request is no longer open", 409);
   }
-  return { exact_sha: tip };
+  return { number, exact_sha: tip, base_sha: baseSha, draft: false, mergeable: payload.mergeable === true, observed_at: new Date().toISOString() };
 }
 
 // This action derives every authority field from the bound shim principal and
@@ -1321,7 +1322,7 @@ async function resolveCurrentCiEvidenceTarget(projectId, request) {
     fetchIssueContractRevision({ repo: before.binding.repo, issue: request.item.number }),
     fetchOpenPullTip(before.binding.repo, request.pr_number),
   ]);
-  if (revision.contract_revision !== request.contract_revision || pull.exact_sha !== request.exact_sha) {
+  if (revision.contract_revision !== request.contract_revision || pull.exact_sha !== request.exact_sha || pull.base_sha !== request.base_sha) {
     throw new CiEvidenceError("ci_evidence_target_changed", "current contract revision or PR tip changed", 409);
   }
   // A queue/config mutation while the authenticated GitHub reads were in
@@ -1344,6 +1345,8 @@ async function resolveCurrentCiEvidenceTarget(projectId, request) {
     pr_number: request.pr_number,
     exact_sha: request.exact_sha,
     policy_version: after.policy.version,
+    base_sha: pull.base_sha,
+    policy_digest: deriveCiPolicyIdentity(after.policy).policy_digest,
     policy: after.policy,
   };
 }
@@ -1364,6 +1367,14 @@ router.post("/api/delivery-candidate/ci-evidence", createDeliveryCandidateCiLess
   isAdmissionCurrent,
   resolveCurrentTarget: resolveCurrentDeliveryCandidateCiEvidenceTarget,
   store: _ciEvidenceStore,
+  onAccepted: async (projectId, request) => {
+    const existing = Object.values(_reviewCycleStore.load(projectId).cycles).find((cycle) =>
+      cycle.state === "current" && cycle.target.target_kind === DELIVERY_REVIEW_TARGET_KIND &&
+      cycle.target.pr_number === request.pr_number && cycle.target.repo_key === request.delivery_candidate_ref.repository_key);
+    if (!existing) return; // Dev evidence cannot open a Head-owned final-review cycle.
+    const current = await freshDeliveryFinalReviewContext(projectId, request.delivery_candidate_ref, request.pr_number);
+    observeDeliveryReview(projectId, current, captureProjectAdmission(projectId));
+  },
 }));
 router.post("/api/ci-evidence/read", createCiLessEvidenceReadHandler({
   resolveShimPrincipal: (token) => fileChat.resolveShimPrincipal(token),
@@ -1373,7 +1384,7 @@ router.post("/api/ci-evidence/read", createCiLessEvidenceReadHandler({
 // Reviewer-only native receipt admission.  Chat wording is deliberately not an
 // input.  The bound role supplies only a durable review id + current digest;
 // the server re-reads the GitHub review and records its exact SHA/verdict.
-function deliveryFinalReviewContext(projectId, deliveryCandidateRef, prNumber) {
+function deliveryFinalReviewContext(projectId, deliveryCandidateRef, prNumber, freshPr = null) {
   const cfg = readConfigFile();
   const project = (cfg.projects || []).find((entry) => entry?.id === projectId && entry.archived !== true);
   const repositoryKey = deliveryCandidateRef?.repository_key;
@@ -1396,9 +1407,10 @@ function deliveryFinalReviewContext(projectId, deliveryCandidateRef, prNumber) {
     },
     read_pr: (request) => {
       const cached = _graphqlCache.get(binding.cache_repo);
-      if (!Number.isFinite(cached?.ts) || Date.now() - cached.ts > REVIEW_CONTRACT_MAX_AGE_MS) throw new Error("delivery_final_review_pr_stale");
-      const row = Array.isArray(cached.prs) ? cached.prs.find((entry) => entry?.number === request.pr_number) : null;
-      if (!row || !canonicalSha(row.tip)) throw new Error("delivery_final_review_pr_unavailable");
+      if (!freshPr && (!Number.isFinite(cached?.ts) || Date.now() - cached.ts > REVIEW_CONTRACT_MAX_AGE_MS)) throw new Error("delivery_final_review_pr_stale");
+      const row = freshPr || (Array.isArray(cached?.prs) ? cached.prs.find((entry) => entry?.number === request.pr_number) : null);
+      if (!row || !canonicalSha(row.tip) || row.state !== "OPEN" || row.draft === true ||
+          canonicalSha(row.baseSha) !== deliveryCandidateRef.base_sha) throw new Error("delivery_final_review_pr_unavailable");
       observedPr = row;
       return { number: row.number, exact_sha: canonicalSha(row.tip), draft: row.draft === true, mergeable: row.mergeable === true };
     },
@@ -1429,6 +1441,8 @@ function deliveryCandidateCiEvidenceTarget(current) {
     pr_number: current.target.identity.pr_number,
     exact_sha: current.target.identity.exact_sha,
     policy_version: current.target.identity.policy_version,
+    base_sha: current.target.identity.delivery_candidate_ref.base_sha,
+    policy_digest: current.target.identity.policy_digest,
     policy: current.binding.ci_policy ?? null,
   };
 }
@@ -1459,10 +1473,71 @@ function deliveryPublicationPlanContext(projectId, deliveryCandidateRef) {
   return plan;
 }
 
-function resolveCurrentDeliveryCandidateCiEvidenceTarget(projectId, request) {
+async function freshDeliveryFinalReviewContext(projectId, ref, prNumber) {
+  const binding = getProjectRepositoryBindings(projectId).find((entry) => entry.key === ref?.repository_key);
+  if (!binding) throw new CiEvidenceError("delivery_ci_evidence_target_changed", "registered repository changed", 409);
+  const pull = await fetchOpenPullTip(binding.repo, prNumber);
+  return deliveryFinalReviewContext(projectId, ref, prNumber, {
+    number: prNumber, state: "OPEN", tip: pull.exact_sha, baseSha: pull.base_sha,
+    draft: pull.draft, mergeable: pull.mergeable, observed_at: pull.observed_at,
+  });
+}
+
+async function resolveCurrentDeliveryCandidateCiEvidenceTarget(projectId, request) {
   return deliveryCandidateCiEvidenceTarget(
-    deliveryFinalReviewContext(projectId, request.delivery_candidate_ref, request.pr_number),
+    await freshDeliveryFinalReviewContext(projectId, request.delivery_candidate_ref, request.pr_number),
   );
+}
+
+// One owner consumes both receipt admission and the existing repository refresh.
+// It neither polls nor writes evidence, and the durable dispatcher deduplicates wakes.
+function observeDeliveryReview(projectId, current, admission) {
+  if (!isAdmissionCurrent(admission) || isProjectArchived(projectId)) throw new Error("delivery_final_review_unavailable");
+  const pre = _reviewCycleStore.reconcile(projectId, current.target).cycle;
+  const policy = current.binding.ci_policy ?? null;
+  const evidence = current.pr.checkEvidence;
+  const ci = policy?.mode === "ci-less" ? evaluateCiEvidence({
+    policy, exact_sha: current.target.identity.exact_sha,
+    base_sha: current.target.identity.delivery_candidate_ref.base_sha,
+    observed_at: current.pr.observed_at || new Date().toISOString(), source_status: "ok",
+    ci_less_evidence: _ciEvidenceStore.readByIdentity(deliveryCandidateCiEvidenceTarget(current)), now: Date.now(),
+  }) : evidence ? evaluateCiEvidence({
+    policy, exact_sha: current.target.identity.exact_sha, observed_at: evidence.observed_at,
+    first_observed_at: pre.created_at, source_status: evidence.source_status,
+    check_runs: evidence.check_runs, now: Date.now(),
+  }) : { state: "unknown" };
+  const observation = _reviewCycleDispatcher.observe({ project_id: projectId, target: current.target, ci_state: ci.state, archived: false });
+  if (getProjectChatMode(projectId) === "file" && isAdmissionCurrent(admission) && !isProjectArchived(projectId)) {
+    _reviewCycleDispatcher.deliver(projectId, observation, (candidate) => fileChat.appendTrustedReviewCycleEventOnce(projectId, {
+      ...candidate, resume: { batch_id: currentChatResumeBatchId(projectId), head_generation: admission.generation },
+    }));
+  }
+  return observation;
+}
+
+function refreshDeliveryReviewCycles(repo, owners, sourceCurrent) {
+  const visited = new Set();
+  for (const admission of owners) {
+    const projectId = admission.project_id;
+    if (visited.has(projectId) || !isAdmissionCurrent(admission) || isProjectArchived(projectId)) continue;
+    visited.add(projectId);
+    for (const cycle of Object.values(_reviewCycleStore.load(projectId).cycles)) {
+      if (cycle.state !== "current" || cycle.target.target_kind !== DELIVERY_REVIEW_TARGET_KIND || canonicalGithubRepo(cycle.target.repo) !== repo) continue;
+      try {
+        if (!sourceCurrent) {
+          const target = targetFromStoredReviewCycle(projectId, cycle);
+          _reviewCycleStore.setCiState(projectId, target, "unknown");
+          _reviewCycleStore.setMergeability(projectId, target, false);
+          continue;
+        }
+        observeDeliveryReview(projectId, deliveryFinalReviewContext(projectId, cycle.target.delivery_candidate_ref, cycle.target.pr_number), admission);
+      } catch {
+        // A successful current repository observation that can no longer prove
+        // this candidate retires its standing without creating a successor.
+        _reviewCycleStore.invalidateCurrent(projectId, cycle.cycle_id, cycle.target_identity_digest);
+      }
+    }
+  }
 }
 
 function targetFromStoredReviewCycle(projectId, cycle) {
@@ -1481,7 +1556,7 @@ function targetFromStoredReviewCycle(projectId, cycle) {
     installation_id: cycle.target.installation_id, project_id: projectId,
     repository: { key: cycle.target.repo_key, repo: cycle.target.repo, ci_policy: cycle.target.policy_version === null ? null : repositoryCiPolicy(project, cycle.target.repo_key) },
     work_item: cycle.target.work_item,
-    pr: { number: cycle.target.pr_number, exact_sha: cycle.target.exact_sha, draft: false, mergeable: cycle.mergeable },
+    pr: { number: cycle.target.pr_number, exact_sha: cycle.target.exact_sha, base_sha: cycle.target.base_sha, draft: false, mergeable: cycle.mergeable },
     issue_contract: { contract_revision: cycle.target.contract_revision }, assignment_attempt: cycle.target.assignment_attempt,
   });
 }
@@ -1490,14 +1565,9 @@ function currentReviewCycleForPrincipal(principal, digest) {
   const document = _reviewCycleStore.load(principal.projectId);
   const cycle = Object.values(document.cycles).find((entry) => entry?.state === "current" && entry.target_identity_digest === digest);
   if (!cycle || isProjectArchived(principal.projectId)) return null;
-  if (cycle.target.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
-    try {
-      const current = deliveryFinalReviewContext(principal.projectId, cycle.target.delivery_candidate_ref, cycle.target.pr_number).target;
-      return current.target_identity_digest === cycle.target_identity_digest ? cycle : null;
-    } catch {
-      return null;
-    }
-  }
+  // This is a durable lookup only. Both nonce and receipt callers must pass
+  // verifyCurrentReviewCycleContract's fresh PR/candidate read before mutation.
+  if (cycle.target.target_kind === DELIVERY_REVIEW_TARGET_KIND) return cycle;
   const context = readLiveBatchContext(principal.projectId);
   const stillAssigned = context?.activated && context.parsed?.provenance === "owned" &&
     context.installationId === cycle.target.installation_id && context.parsed.assignmentAttempt === cycle.target.assignment_attempt &&
@@ -1510,8 +1580,12 @@ function currentReviewCycleForPrincipal(principal, digest) {
 // the gap between a bounded REST cache observation and durable admission.
 async function verifyCurrentReviewCycleContract(principal, digest, cycle) {
   if (cycle?.target?.target_kind === DELIVERY_REVIEW_TARGET_KIND) {
-    return currentReviewCycleForPrincipal(principal, digest);
+    const current = await freshDeliveryFinalReviewContext(principal.projectId, cycle.target.delivery_candidate_ref, cycle.target.pr_number);
+    return current.target.target_identity_digest === cycle.target_identity_digest &&
+      currentReviewCycleForPrincipal(principal, digest)?.cycle_id === cycle.cycle_id ? cycle : null;
   }
+  const pull = await fetchOpenPullTip(cycle.target.repo, cycle.target.pr_number);
+  if (pull.exact_sha !== cycle.target.exact_sha || pull.base_sha !== cycle.target.base_sha) return null;
   return verifyActionContract(cycle,
     () => currentReviewCycleForPrincipal(principal, digest),
     fetchIssueContractRevision);
@@ -1521,7 +1595,7 @@ async function verifyCurrentReviewCycleContract(principal, digest, cycle) {
 // published PR is present in the fresh server cache at the identical result
 // SHA. This route creates neither branch nor PR; it only opens the existing
 // durable exact-SHA review cycle and emits its sealed reviewer handoff.
-router.post("/api/delivery-candidate/final-review", (req, res) => {
+router.post("/api/delivery-candidate/final-review", async (req, res) => {
   const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
   const body = req.body;
   if (!principal || principal.agentId !== "head" || !body || typeof body !== "object" || Array.isArray(body) ||
@@ -1535,37 +1609,11 @@ router.post("/api/delivery-candidate/final-review", (req, res) => {
     return res.status(409).json({ ok: false, code: "delivery_final_review_unavailable" });
   }
   try {
-    const current = deliveryFinalReviewContext(principal.projectId, body.delivery_candidate_ref, body.pr_number);
-    const pre = _reviewCycleStore.reconcile(principal.projectId, current.target).cycle;
-    const evidence = current.pr.checkEvidence;
-    const policy = current.binding.ci_policy ?? null;
-    const ci = policy?.mode === "ci-less"
-      ? evaluateCiEvidence({
-        policy,
-        exact_sha: current.target.identity.exact_sha,
-        observed_at: evidence?.observed_at || new Date().toISOString(),
-        source_status: "ok",
-        ci_less_evidence: _ciEvidenceStore.readByIdentity(deliveryCandidateCiEvidenceTarget(current)),
-        now: Date.now(),
-      })
-      : evidence ? evaluateCiEvidence({
-        policy,
-        exact_sha: current.target.identity.exact_sha,
-        observed_at: evidence.observed_at,
-        first_observed_at: pre.created_at,
-        source_status: evidence.source_status,
-        check_runs: evidence.check_runs,
-        ci_less_evidence: null,
-        now: Date.now(),
-      }) : { state: "unknown" };
-    const observation = _reviewCycleDispatcher.observe({ project_id: principal.projectId, target: current.target, ci_state: ci.state, archived: false });
-    if (getProjectChatMode(principal.projectId) === "file" && isAdmissionCurrent(admission) && !isProjectArchived(principal.projectId)) {
-      _reviewCycleDispatcher.deliver(principal.projectId, observation,
-        (candidate) => fileChat.appendTrustedReviewCycleEventOnce(principal.projectId, {
-          ...candidate,
-          resume: { batch_id: currentChatResumeBatchId(principal.projectId), head_generation: admission.generation },
-        }));
-    }
+    const binding = getProjectRepositoryBindings(principal.projectId).find((entry) => entry.key === body.delivery_candidate_ref?.repository_key);
+    const current = binding?.ci_policy?.mode === "ci-less"
+      ? await freshDeliveryFinalReviewContext(principal.projectId, body.delivery_candidate_ref, body.pr_number)
+      : deliveryFinalReviewContext(principal.projectId, body.delivery_candidate_ref, body.pr_number);
+    const observation = observeDeliveryReview(principal.projectId, current, admission);
     return res.json({ ok: true, cycle_id: observation.cycle?.cycle_id || null, handoff: observation.handoff });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_final_review_unavailable" });
@@ -3128,6 +3176,7 @@ function restPullBaseToCanonical(p) {
     assignees: (p.assignees || []).map((a) => ({ login: a.login })),
     createdAt: p.created_at,
     tip: p.head && p.head.sha ? p.head.sha : null,
+    baseSha: canonicalSha(p.base?.sha),
     draft: p.draft === true,
     // List snapshots do not promise mergeability.  Absence remains false and
     // suppresses the Head gate rather than guessing from PR existence.
@@ -3272,10 +3321,21 @@ function closedPrIssueNumsFromPages(pages) {
   return nums;
 }
 
+function repositoryUsesLocalVerification(repo) {
+  try {
+    const cfg = readConfigFile();
+    const bindings = (cfg.projects || []).filter((project) => project.archived !== true)
+      .flatMap((project) => getProjectRepositoryBindings(project.id, cfg))
+      .filter((binding) => binding.cache_repo === canonicalGithubRepo(repo));
+    return bindings.length > 0 && bindings.every((binding) => binding.ci_policy?.mode === "ci-less");
+  } catch { return false; }
+}
+
 async function githubStateFetcher(repo, isCurrent = () => true) {
   const [owner, name] = (repo || "").split("/");
   if (!owner || !name || !isCurrent()) return { status: "cancelled", data: null };
   const base = `repos/${owner}/${name}`;
+  const localVerification = repositoryUsesLocalVerification(repo);
   let changed = 0;
   let hadError = false;
 
@@ -3343,12 +3403,12 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
     const sha = p.head && p.head.sha;
     const [reviewsR, checkRunsR, statusR] = await Promise.all([
       ghApiConditional(`${repo}#reviews-${p.number}`, `${base}/pulls/${p.number}/reviews?per_page=100`, isCurrent),
-      sha ? ghApiConditional(`${repo}#checkruns-${sha}`, `${base}/commits/${sha}/check-runs?per_page=100`, isCurrent) : Promise.resolve({ status: "error", data: null }),
-      sha ? ghApiConditional(`${repo}#status-${sha}`, `${base}/commits/${sha}/status`, isCurrent) : Promise.resolve({ status: "error", data: null }),
+      sha && !localVerification ? ghApiConditional(`${repo}#checkruns-${sha}`, `${base}/commits/${sha}/check-runs?per_page=100`, isCurrent) : Promise.resolve({ status: "error", data: null }),
+      sha && !localVerification ? ghApiConditional(`${repo}#status-${sha}`, `${base}/commits/${sha}/status`, isCurrent) : Promise.resolve({ status: "error", data: null }),
     ]);
     if (!isCurrent()) return null;
     if (reviewsR.status === "ok" || checkRunsR.status === "ok" || statusR.status === "ok") changed++;
-    if (reviewsR.status === "error" || (sha && (checkRunsR.status === "error" || statusR.status === "error"))) hadError = true;
+    if (reviewsR.status === "error" || (sha && !localVerification && (checkRunsR.status === "error" || statusR.status === "error"))) hadError = true;
     const reviews = mapReviews(Array.isArray(reviewsR.data) ? reviewsR.data : []);
     const checkEvidence = normalizeGithubCheckEvidence(checkRunsR.data, {
       exact_sha: sha,
@@ -3360,7 +3420,8 @@ async function githubStateFetcher(repo, isCurrent = () => true) {
       reviews,
       reviewDecision: deriveReviewDecision(reviews),
       statusCheckRollup: buildStatusCheckRollup(checkRunsR.data, statusR.data),
-      checkEvidence,
+      checkEvidence: localVerification ? null : checkEvidence,
+      observed_at: new Date().toISOString(),
     };
   });
 
@@ -3435,6 +3496,7 @@ function refreshRepoRest(repo, ownerTokens = [], fetcher = githubStateFetcher) {
     // regenerate it from this completed pass's snapshot (success or error so
     // staleCycles advances). Non-fatal; never affects the board cache result.
     if (hasCurrentOwner()) {
+      try { refreshDeliveryReviewCycles(cacheRepo, entry.owners, result.status !== "error" && result.status !== "cancelled"); } catch { /* affected gates fail closed at action time */ }
       try { syncGithubFilesForRepo(cacheRepo, result.status, entry.owners); } catch { /* non-fatal */ }
     }
     return result;
@@ -5663,7 +5725,7 @@ async function attachReviewCycleHandoffs(projectId, context, admission, items, s
     const snapshot = binding ? _graphqlCache.get(binding.cache_repo) : null;
     const pr = snapshot?.prs?.find((entry) => entry?.number === live.number && canonicalSha(entry.tip) === canonicalSha(live.tip));
     // A persisted/cold/partial row cannot establish current dispatch identity.
-    if (!binding || !pr?.checkEvidence || !stillCurrent() || !isAdmissionCurrent(admission)) continue;
+    if (!binding || !pr || !canonicalSha(pr.baseSha) || (binding.ci_policy?.mode !== "ci-less" && !pr.checkEvidence) || !stillCurrent() || !isAdmissionCurrent(admission)) continue;
     const contractObservation = currentContractObservation(snapshot, ref.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS);
     if (!contractObservation ||
         !stillCurrent() || !isAdmissionCurrent(admission)) continue;
@@ -5674,7 +5736,7 @@ async function attachReviewCycleHandoffs(projectId, context, admission, items, s
         project_id: projectId,
         repository: { key: binding.key, repo: binding.repo, ci_policy: binding.ci_policy ?? null },
         work_item: { repoKey: ref.repo_key, repo: ref.repo, number: ref.number, kind: "issue" },
-        pr: { number: live.number, exact_sha: canonicalSha(live.tip), draft: pr.draft === true, mergeable: pr.mergeable === true },
+        pr: { number: live.number, exact_sha: canonicalSha(live.tip), base_sha: canonicalSha(pr.baseSha), draft: pr.draft === true, mergeable: pr.mergeable === true },
         issue_contract: { contract_revision: contractObservation.contract_revision },
         assignment_attempt: context.parsed.assignmentAttempt,
       });
@@ -5686,11 +5748,13 @@ async function attachReviewCycleHandoffs(projectId, context, admission, items, s
         item: { repo_key: ref.repo_key, repo: ref.repo, number: ref.number, kind: "issue" },
         assignment_attempt: context.parsed.assignmentAttempt, contract_revision: contractObservation.contract_revision,
         pr_number: live.number, exact_sha: canonicalSha(live.tip), policy_version: binding.ci_policy.version,
+        base_sha: canonicalSha(pr.baseSha), policy_digest: deriveCiPolicyIdentity(binding.ci_policy).policy_digest,
       }) : null;
       const ci = evaluateCiEvidence({
-        policy: binding.ci_policy ?? null, exact_sha: canonicalSha(live.tip), observed_at: pr.checkEvidence.observed_at,
-        first_observed_at: pre.created_at, source_status: pr.checkEvidence.source_status,
-        check_runs: pr.checkEvidence.check_runs, ci_less_evidence: ciLess, now: Date.now(),
+        policy: binding.ci_policy ?? null, exact_sha: canonicalSha(live.tip), base_sha: canonicalSha(pr.baseSha),
+        observed_at: binding.ci_policy?.mode === "ci-less" ? pr.observed_at || new Date(snapshot.ts).toISOString() : pr.checkEvidence.observed_at,
+        first_observed_at: pre.created_at, source_status: binding.ci_policy?.mode === "ci-less" ? "ok" : pr.checkEvidence.source_status,
+        check_runs: pr.checkEvidence?.check_runs, ci_less_evidence: ciLess, now: Date.now(),
       });
       const observation = _reviewCycleDispatcher.observe({ project_id: projectId, target, ci_state: ci.state, archived: false });
       row.review_handoff = observation.handoff;
@@ -8161,3 +8225,8 @@ module.exports.batchRequestRefreshProjectIds = batchRequestRefreshProjectIds;
 module.exports._restRefreshing = _restRefreshing;
 module.exports._githubDemandedProjects = _githubDemandedProjects;
 module.exports.shouldPublishProjectsCache = shouldPublishProjectsCache;
+
+module.exports.freshDeliveryFinalReviewContext = freshDeliveryFinalReviewContext;
+module.exports.observeDeliveryReview = observeDeliveryReview;
+module.exports.refreshDeliveryReviewCycles = refreshDeliveryReviewCycles;
+module.exports.repositoryUsesLocalVerification = repositoryUsesLocalVerification;

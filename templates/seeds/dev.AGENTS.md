@@ -300,3 +300,19 @@ ignore it unless Head issues a separate qualified implementation assignment.
 - **Always reply to the operator**: when the operator (sender: "user") sends a message that mentions you or is addressed to you, you MUST reply via `chat_send`. If it's a question, answer it. If it's an instruction, confirm what you will do, then do it. If it's not actionable for your role, reply explaining that and suggest which agent should handle it. The operator's terminal is invisible — if you don't `chat_send`, your response does not exist.
 - **No acknowledgment messages between agents** — don't send "on it", "noted", "standing by" to other agents. This rule does NOT apply to operator messages — always reply to the operator.
 - **After merge confirmation from Head**: do NOT reply. The loop is COMPLETE — silence is required.
+
+
+## Local verification contract
+
+Use the repository's explicit evidence policy. New V2 setup selects Local
+verification (`ci-less`); existing external-check policies are never silently
+replaced. Dev runs the repository's existing checks on the clean exact candidate,
+records the integration base, normalized policy digest, actual environment and
+scope, and submits the authenticated evidence operation. Delivery evidence also
+binds the composed manifest digest. Pass requires exit code zero; missing,
+interrupted or skipped checks are not a pass. QuadWork records evidence and does
+not execute configured labels. Never trigger Actions for local verification.
+Head requires the current candidate/base evidence and both independent final
+reviewer receipts before merge. A changed source/base/policy/contract requires
+new evidence; read back the merged state before closure. See
+`docs/operator-mcp.md` for the receipt fields and local command record.

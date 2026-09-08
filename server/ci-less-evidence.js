@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { canonicalSha, normalizeCiPolicy } = require("./ci-evidence-policy");
+const { canonicalSha, normalizeCiPolicy, deriveCiPolicyIdentity, normalizeLocalVerification } = require("./ci-evidence-policy");
 const { assertDeliveryCandidateRef, deliveryCandidateKey } = require("./delivery-candidate");
 
 const PROJECT_ROLES = new Set(["head", "dev", "re1", "re2"]);
@@ -62,6 +62,16 @@ function normalizedItem(value) {
   });
 }
 
+function submissionContext(body) {
+  if (!canonicalSha(body.base_sha) || !REVISION_RE.test(body.policy_digest)) {
+    throw new CiEvidenceError("invalid_ci_evidence_context", "exact integration base and policy digest are required");
+  }
+  let verification;
+  try { verification = normalizeLocalVerification(body.verification); }
+  catch { throw new CiEvidenceError("invalid_ci_evidence_context", "verification environment and scope are required"); }
+  return { base_sha: body.base_sha, policy_digest: body.policy_digest, verification };
+}
+
 function normalizedSubmitRequest(body) {
   exactObject(body, [
     "assignment_attempt",
@@ -71,6 +81,9 @@ function normalizedSubmitRequest(body) {
     "pr_number",
     "exact_sha",
     "policy_version",
+    "base_sha",
+    "policy_digest",
+    "verification",
     "results",
   ], "invalid_ci_evidence_request");
   if (typeof body.assignment_attempt !== "string" || body.assignment_attempt.length === 0 || body.assignment_attempt.length > 128 ||
@@ -91,34 +104,41 @@ function normalizedSubmitRequest(body) {
     pr_number: body.pr_number,
     exact_sha: canonicalSha(body.exact_sha),
     policy_version: body.policy_version,
+    ...submissionContext(body),
     results: body.results,
   });
 }
 
 // #1060 extends the existing CI-less receipt store with one closed final-PR
 // identity. A local WorkTask is deliberately not accepted here: only a
-// composed repository Delivery Candidate can carry final-hosted-check proof.
+// composed repository Delivery Candidate can carry final local verification proof.
 function normalizedDeliveryCandidateSubmitRequest(body) {
   exactObject(body, [
     "delivery_candidate_ref",
+    "delivery_manifest_digest",
     "pr_number",
     "exact_sha",
     "policy_version",
+    "base_sha",
+    "policy_digest",
+    "verification",
     "results",
   ], "invalid_delivery_ci_evidence_request");
   let deliveryCandidateRef;
   try { deliveryCandidateRef = assertDeliveryCandidateRef(body.delivery_candidate_ref); }
   catch { throw new CiEvidenceError("invalid_delivery_ci_evidence_request", "Delivery Candidate reference is invalid"); }
-  if (!Number.isSafeInteger(body.pr_number) || body.pr_number < 1 || !canonicalSha(body.exact_sha) ||
+  if (!REVISION_RE.test(body.delivery_manifest_digest) || !Number.isSafeInteger(body.pr_number) || body.pr_number < 1 || !canonicalSha(body.exact_sha) ||
       !Number.isSafeInteger(body.policy_version) || body.policy_version < 1 ||
       !Array.isArray(body.results) || body.results.length === 0 || body.results.length > 64) {
     throw new CiEvidenceError("invalid_delivery_ci_evidence_request", "Delivery Candidate CI evidence identity is invalid");
   }
   return Object.freeze({
     delivery_candidate_ref: Object.freeze({ ...deliveryCandidateRef }),
+    delivery_manifest_digest: body.delivery_manifest_digest,
     pr_number: body.pr_number,
     exact_sha: canonicalSha(body.exact_sha),
     policy_version: body.policy_version,
+    ...submissionContext(body),
     results: body.results,
   });
 }
@@ -134,6 +154,7 @@ function normalizedResults(rawResults, policy) {
     exactObject(result, ["key", "outcome", "exit_code", "evidence_ref"], "invalid_ci_evidence_result");
     if (typeof result.key !== "string" || !expected.has(result.key) || seen.has(result.key) ||
         !["pass", "fail"].includes(result.outcome) ||
+        (result.outcome === "pass" && result.exit_code !== 0) ||
         !Number.isSafeInteger(result.exit_code) || result.exit_code < 0 || result.exit_code > 255 ||
         typeof result.evidence_ref !== "string" || result.evidence_ref.length === 0 || result.evidence_ref.length > 512 ||
         /[\r\n\u0000]/.test(result.evidence_ref)) {
@@ -160,7 +181,8 @@ function normalizedTarget(target, request, projectId) {
       typeof target.repo !== "string" || !REPOSITORY_RE.test(target.repo) ||
       target.assignment_attempt !== request.assignment_attempt || target.contract_revision !== request.contract_revision ||
       target.pr_number !== request.pr_number || canonicalSha(target.exact_sha) !== request.exact_sha ||
-      target.policy_version !== request.policy_version) {
+      target.policy_version !== request.policy_version || target.base_sha !== request.base_sha ||
+      target.policy_digest !== request.policy_digest) {
     throw new CiEvidenceError("ci_evidence_target_changed", "current assignment, contract, PR tip, or policy changed", 409);
   }
   const item = normalizedItem(target.item);
@@ -171,7 +193,8 @@ function normalizedTarget(target, request, projectId) {
   try { policy = normalizeCiPolicy(target.policy); } catch {
     throw new CiEvidenceError("ci_evidence_policy_unavailable", "current CI policy is unavailable", 409);
   }
-  if (policy.mode !== "ci-less" || policy.version !== request.policy_version) {
+  if (policy.mode !== "ci-less" || policy.version !== request.policy_version ||
+      deriveCiPolicyIdentity(policy).policy_digest !== request.policy_digest) {
     throw new CiEvidenceError("ci_evidence_policy_changed", "current repository CI policy changed", 409);
   }
   return Object.freeze({
@@ -186,6 +209,8 @@ function normalizedTarget(target, request, projectId) {
     pr_number: target.pr_number,
     exact_sha: request.exact_sha,
     policy_version: policy.version,
+    base_sha: request.base_sha,
+    policy_digest: request.policy_digest,
     policy,
   });
 }
@@ -203,6 +228,8 @@ function normalizedDeliveryCandidateTarget(target, request, projectId) {
     "pr_number",
     "exact_sha",
     "policy_version",
+    "base_sha",
+    "policy_digest",
     "policy",
   ], "delivery_ci_evidence_target_changed");
   let ref;
@@ -213,17 +240,20 @@ function normalizedDeliveryCandidateTarget(target, request, projectId) {
       typeof target.repo_key !== "string" || !REPOSITORY_KEY_RE.test(target.repo_key) ||
       typeof target.repo !== "string" || !REPOSITORY_RE.test(target.repo) ||
       ref.installation_id !== target.installation_id || ref.project_id !== projectId || ref.repository_key !== target.repo_key ||
-      deliveryCandidateKey(ref) !== deliveryCandidateKey(request.delivery_candidate_ref) ||
+      deliveryCandidateKey(ref) !== deliveryCandidateKey(request.delivery_candidate_ref) || ref.base_sha !== request.base_sha || ref.result_sha !== request.exact_sha ||
       typeof target.delivery_manifest_digest !== "string" || !REVISION_RE.test(target.delivery_manifest_digest) ||
+      target.delivery_manifest_digest !== request.delivery_manifest_digest ||
       target.pr_number !== request.pr_number || canonicalSha(target.exact_sha) !== request.exact_sha ||
-      target.policy_version !== request.policy_version) {
+      target.policy_version !== request.policy_version || target.base_sha !== request.base_sha ||
+      target.policy_digest !== request.policy_digest) {
     throw new CiEvidenceError("delivery_ci_evidence_target_changed", "current Delivery Candidate, PR tip, or policy changed", 409);
   }
   let policy;
   try { policy = normalizeCiPolicy(target.policy); } catch {
     throw new CiEvidenceError("ci_evidence_policy_unavailable", "current CI policy is unavailable", 409);
   }
-  if (policy.mode !== "ci-less" || policy.version !== request.policy_version) {
+  if (policy.mode !== "ci-less" || policy.version !== request.policy_version ||
+      deriveCiPolicyIdentity(policy).policy_digest !== request.policy_digest) {
     throw new CiEvidenceError("ci_evidence_policy_changed", "current Delivery Candidate CI policy changed", 409);
   }
   return Object.freeze({
@@ -238,6 +268,8 @@ function normalizedDeliveryCandidateTarget(target, request, projectId) {
     pr_number: target.pr_number,
     exact_sha: request.exact_sha,
     policy_version: policy.version,
+    base_sha: request.base_sha,
+    policy_digest: request.policy_digest,
     policy,
   });
 }
@@ -245,7 +277,7 @@ function normalizedDeliveryCandidateTarget(target, request, projectId) {
 function recordIdentity(target) {
   if (target?.target_kind === DELIVERY_TARGET_KIND) {
     return Object.freeze({
-      version: target.version,
+      version: 2,
       target_kind: DELIVERY_TARGET_KIND,
       project_id: target.project_id,
       installation_id: target.installation_id,
@@ -256,10 +288,12 @@ function recordIdentity(target) {
       pr_number: target.pr_number,
       exact_sha: target.exact_sha,
       policy_version: target.policy_version,
+      base_sha: target.base_sha,
+      policy_digest: target.policy_digest,
     });
   }
   return Object.freeze({
-    version: target.version,
+    version: 2,
     project_id: target.project_id,
     installation_id: target.installation_id,
     repo_key: target.repo_key,
@@ -270,6 +304,8 @@ function recordIdentity(target) {
     pr_number: target.pr_number,
     exact_sha: target.exact_sha,
     policy_version: target.policy_version,
+      base_sha: target.base_sha,
+      policy_digest: target.policy_digest,
   });
 }
 
@@ -279,6 +315,7 @@ function redactedRecord(record) {
     record_id: record.record_id,
     identity: record.identity,
     observed_at: record.observed_at,
+    verification: record.verification,
     results: Object.freeze((record.results || []).map((result) => Object.freeze({
       key: result.key,
       outcome: result.outcome,
@@ -362,10 +399,11 @@ class CiEvidenceStore {
     }
   }
 
-  upsert(target, results) {
+  upsert(target, results, verification) {
+    verification = normalizeLocalVerification(verification);
     const identity = recordIdentity(target);
     const identityHash = sha256(identity);
-    const recordDigest = sha256({ identity, results });
+    const recordDigest = sha256({ identity, results, verification });
     const document = this.readDocument(target.project_id);
     const existing = document.records[identityHash];
     if (existing?.record_digest === recordDigest) return existing;
@@ -377,6 +415,7 @@ class CiEvidenceStore {
       identity_hash: identityHash,
       identity,
       observed_at: observedAt,
+      verification,
       results,
     });
     document.records[identityHash] = record;
@@ -386,7 +425,14 @@ class CiEvidenceStore {
 
   readByIdentity(target) {
     const document = this.readDocument(target.project_id);
-    return document.records[sha256(recordIdentity(target))] || null;
+    const identity = recordIdentity(target);
+    const record = document.records[sha256(identity)];
+    if (!record || !canonicalSha(identity.base_sha) || !REVISION_RE.test(identity.policy_digest) ||
+        stableJson(record.identity) !== stableJson(identity) || record.identity_hash !== sha256(identity) ||
+        record.record_digest !== sha256({ identity, results: record.results, verification: record.verification }) ||
+        record.record_id !== `ce_${record.record_digest.slice(0, 32)}`) return null;
+    try { normalizeLocalVerification(record.verification); } catch { return null; }
+    return record;
   }
 
   readByRecordId(projectId, recordId) {
@@ -445,13 +491,17 @@ function createCiLessEvidenceSubmitHandler(options = {}) {
         if (!isAdmissionCurrent(admission)) {
           throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
         }
-        const record = store.upsert(target, results);
+        const record = store.upsert(target, results, request.verification);
         const persisted = store.readByIdentity(target);
         if (!persisted || persisted.record_id !== record.record_id || persisted.record_digest !== record.record_digest) {
           throw new CiEvidenceError("ci_evidence_store_readback_failed", "CI evidence persistence could not be verified", 503);
         }
         return persisted;
       });
+      if (typeof options.onAccepted === "function") {
+        if (!isAdmissionCurrent(admission)) throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
+        await options.onAccepted(principal.projectId, request, readBack);
+      }
       return res.json({ ok: true, record: redactedRecord(readBack) });
     } catch (error) {
       const failure = error instanceof CiEvidenceError
@@ -493,13 +543,17 @@ function createDeliveryCandidateCiLessEvidenceSubmitHandler(options = {}) {
         if (!isAdmissionCurrent(admission)) {
           throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
         }
-        const record = store.upsert(target, results);
+        const record = store.upsert(target, results, request.verification);
         const persisted = store.readByIdentity(target);
         if (!persisted || persisted.record_id !== record.record_id || persisted.record_digest !== record.record_digest) {
           throw new CiEvidenceError("ci_evidence_store_readback_failed", "CI evidence persistence could not be verified", 503);
         }
         return persisted;
       });
+      if (typeof options.onAccepted === "function") {
+        if (!isAdmissionCurrent(admission)) throw new CiEvidenceError("ci_evidence_admission_changed", "project admission changed", 409);
+        await options.onAccepted(principal.projectId, request, readBack);
+      }
       return res.json({ ok: true, record: redactedRecord(readBack) });
     } catch (error) {
       const failure = error instanceof CiEvidenceError
