@@ -127,7 +127,9 @@ function createWorkTaskDeliverySource(value) {
           version: VERSION, work_task_ref: clone(entry.work_task_ref), candidate_digest: entry.candidate.candidate_digest,
         });
       } catch (error) { rethrow(error, "work_task_delivery_review_unavailable"); }
-      return { candidate: clone(entry.candidate), terminal_review: clone(terminal_review) };
+      if (terminal_review.version !== VERSION) fail("work_task_delivery_review_unavailable", "released review envelope version is unsupported");
+      const { version, ...anchor } = terminal_review;
+      return { candidate: clone(entry.candidate), terminal_review: clone(anchor) };
     });
     return freeze({
       version: VERSION,
