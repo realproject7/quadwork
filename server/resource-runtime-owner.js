@@ -3,7 +3,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { execFileSync } = require("child_process");
+const { execFileSync, execFile } = require("child_process");
 const { readRuntimeResources } = require("./config");
 const { createReadOnlyProbes } = require("./resource-preflight");
 const { ResourceObservationProvider } = require("./resource-observation");
@@ -29,6 +29,7 @@ const SOURCE_RUNTIME_SNAPSHOT = ResourceRuntimeService.prototype.snapshot;
 const SOURCE_STATE_LOAD = ResourceStateStore.prototype.load;
 const SOURCE_STATE_SAVE = ResourceStateStore.prototype.save;
 const SOURCE_STATE_SNAPSHOT = ResourceStateStore.prototype.snapshot;
+let sharedRuntimeOwner = null;
 
 class ResourceRuntimeOwnerError extends Error {
   constructor(code, message) {
@@ -299,9 +300,24 @@ class ResourceRuntimeOwner {
   }
   async shutdown() { return OWNER_STATE.get(this)?.launcher?.shutdown() || { ok: true, owned_generations: 0 }; }
   async runControlChild(file, args, options) {
+    if (process.platform !== "linux") {
+      const { input, ...nativeOptions } = options || {};
+      return new Promise((resolve, reject) => {
+        const child = execFile(file, args, { timeout: 30000, maxBuffer: 32 * 1024 * 1024, ...nativeOptions }, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
+        child.stdin?.on("error", () => {});
+        child.stdin?.end(input);
+      });
+    }
     const launcher = OWNER_STATE.get(this)?.launcher;
+    if (launcher && !launcher.ready()) await launcher.prepare();
     if (!launcher?.ready()) throw new ResourceRuntimeOwnerError("containment_unavailable", "control resource containment is unavailable");
     return launcher.runControlChild(file, args, options);
+  }
+  runControlChildSync(file, args, options) {
+    if (process.platform !== "linux") return execFileSync(file, args, { timeout: 10000, maxBuffer: 32 * 1024 * 1024, ...options });
+    const launcher = OWNER_STATE.get(this)?.launcher;
+    if (!launcher?.ready()) throw new ResourceRuntimeOwnerError("containment_unavailable", "control resource containment is unavailable");
+    return launcher.runControlChildSync(file, args, options);
   }
 
   persist(snapshot) {
@@ -331,6 +347,10 @@ class ResourceRuntimeOwner {
 function createResourceRuntimeOwner(options) {
   return new ResourceRuntimeOwner(options);
 }
+function getSharedResourceRuntimeOwner() {
+  if (!sharedRuntimeOwner) sharedRuntimeOwner = new ResourceRuntimeOwner();
+  return sharedRuntimeOwner;
+}
 
 function captureResourceRuntimeOwner(owner) {
   const state = OWNER_STATE.get(owner);
@@ -356,6 +376,7 @@ module.exports = {
   ResourceRuntimeOwnerError,
   ResourceRuntimeOwner,
   createResourceRuntimeOwner,
+  getSharedResourceRuntimeOwner,
   captureResourceRuntimeOwner,
   resourceStateFilePath,
   mergeControllerEvidence,

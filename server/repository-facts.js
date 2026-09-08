@@ -28,7 +28,7 @@
 // worst-case wall time is 6 x GIT_TIMEOUT_MS (30 s) while the API process
 // stays responsive.
 
-const { execFile } = require("node:child_process");
+const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -49,14 +49,10 @@ function gitEnvironment(env) {
 }
 
 function git(cwd, env, args) {
-  return new Promise((resolve) => {
-    execFile("git", [...GIT_GLOBAL_ARGS, ...args], {
-      cwd, env, encoding: "utf8", timeout: GIT_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES,
-    }, (error, output) => {
-      if (error) resolve({ ok: false, code: error.code === "ENOENT" ? "git_unavailable" : "git_failed" });
-      else resolve({ ok: true, output: output.replace(/\n$/, "") });
-    });
-  });
+  return getSharedResourceRuntimeOwner().runControlChild("git", [...GIT_GLOBAL_ARGS, ...args], {
+    cwd, env, encoding: "utf8", timeout: GIT_TIMEOUT_MS, maxBuffer: MAX_OUTPUT_BYTES,
+  }).then(({ stdout }) => ({ ok: true, output: stdout.replace(/\n$/, "") }),
+    (error) => ({ ok: false, code: error.code === "ENOENT" ? "git_unavailable" : "git_failed" }));
 }
 
 function unavailable(cwd, reason, capturedAt) {

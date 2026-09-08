@@ -9,7 +9,7 @@
 // composition deadline).  A process failure or timeout resolves `{ ok: false }`
 // so the adapter fails closed; only an invalid request throws.
 
-const { execFile } = require("node:child_process");
+const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const path = require("node:path");
 
 const VERSION = 1;
@@ -34,13 +34,9 @@ function runDeliveryGit(request) {
   if (!Number.isSafeInteger(request.timeout_ms) || request.timeout_ms <= 0 || request.timeout_ms > MAX_TIMEOUT_MS) {
     throw invalid("timeout must be a positive integer within the fixed ceiling");
   }
-  return new Promise((resolve) => {
-    const child = execFile("git", [...request.args], {
-      cwd: request.cwd, encoding: "utf8", timeout: request.timeout_ms, maxBuffer: MAX_OUTPUT_BYTES,
-    }, (error, stdout) => resolve(error ? { ok: false, output: "" } : { ok: true, output: stdout }));
-    child.stdin.on("error", () => {});
-    child.stdin.end(request.input);
-  });
+  return getSharedResourceRuntimeOwner().runControlChild("git", [...request.args], {
+    cwd: request.cwd, encoding: "utf8", timeout: request.timeout_ms, maxBuffer: MAX_OUTPUT_BYTES, input: request.input,
+  }).then(({ stdout }) => ({ ok: true, output: stdout }), () => ({ ok: false, output: "" }));
 }
 
 module.exports = { VERSION, MAX_TIMEOUT_MS, MAX_OUTPUT_BYTES, runDeliveryGit };

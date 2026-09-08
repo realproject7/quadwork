@@ -31,7 +31,7 @@ const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectM
 const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
-const { createResourceRuntimeOwner } = require("./resource-runtime-owner");
+const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { createHeadControlRuntime } = require("./head-control-runtime");
 const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identity-resolver");
@@ -126,7 +126,10 @@ function emitSystemMessage(projectId, text) {
 }
 
 const app = express();
-const resourceRuntimeOwner = createResourceRuntimeOwner();
+const resourceRuntimeOwner = getSharedResourceRuntimeOwner();
+// Preparation is a bounded diagnostic operation; it neither starts an agent
+// nor blocks API/chat startup. Its outcome is reflected by the resource owner.
+if (!process.env.QUADWORK_SKIP_LISTEN) resourceRuntimeOwner.prepareWorkerLaunch().catch(() => {});
 // #412 / quadwork#279: bump the global JSON body limit to 10mb so
 // POST /api/project-history can accept full chat exports. The
 // default ~100kb 413'd long before the route-local parser had a
@@ -697,7 +700,7 @@ function devCandidateServiceForProject(projectId) {
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
     run_git: (request) => {
-      try { return { ok: true, output: execFileSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
+      try { return { ok: true, output: resourceRuntimeOwner.runControlChildSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
       catch { return { ok: false, output: "" }; }
     },
   });
@@ -724,7 +727,7 @@ function registeredWorkTaskBaseForProject(projectId) {
     repositories: allRepositories(project), primary_agent_cwds: primaryAgentCwds, repository_worktrees: {},
     canonicalize_path: (request) => fs.realpathSync(request.path),
     run_git: (request) => {
-      try { return { ok: true, output: execFileSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
+      try { return { ok: true, output: resourceRuntimeOwner.runControlChildSync("git", request.args, { cwd: request.cwd, encoding: "utf8", stdio: "pipe", timeout: 5000, maxBuffer: 32 * 1024 }) }; }
       catch { return { ok: false, output: "" }; }
     },
   });
@@ -1996,7 +1999,7 @@ function writeFileChatMcpConfig(projectId, agentId, serverPort) {
 function excludeGrokFromGit(cwd) {
   let out;
   try {
-    out = execFileSync("git", ["rev-parse", "--git-common-dir"], {
+    out = resourceRuntimeOwner.runControlChildSync("git", ["rev-parse", "--git-common-dir"], {
       cwd,
       encoding: "utf-8",
       stdio: "pipe",
@@ -2221,7 +2224,10 @@ async function launchAgentPty(project, agent, opts = {}) {
       env: { ...process.env, ...extraEnv },
     };
     const term = process.platform === "linux" && !_lifecycleTestFixtures.has(key)
-      ? await resourceRuntimeOwner.spawnWorkerPty({ projectId: project, generationId: opts.generationId, command, args, cwd, env: terminalOptions.env, assertLaunchCurrent: () => { if (!admissionCurrent(lease)) throw new ProjectLifecycleError("project_archived", "project is archived", 409); } })
+      ? await resourceRuntimeOwner.spawnWorkerPty({ projectId: project, generationId: opts.generationId, command, args, cwd, env: terminalOptions.env, assertLaunchCurrent: () => {
+        if (shuttingDown) throw new ProjectLifecycleError("server_shutting_down", project, "server is shutting down", 503);
+        if (!admissionCurrent(lease)) throw new ProjectLifecycleError("project_archived", project, "project is archived", 409);
+      } })
       : (opts.ptySpawn || pty.spawn)(command, args, terminalOptions);
 
     const session = {
@@ -2619,13 +2625,20 @@ async function stopAgentSession(key, {
   if (session?.term) {
     const stoppedTerm = session.term;
     try {
-      await stopOwnedPty(session);
+      if (resourceRuntimeOwner.ownsWorkerGeneration(session.generationId)) {
+        const stopped = await resourceRuntimeOwner.stopWorkerGeneration(session.generationId);
+        if (!stopped.ok) throw new Error("Resource scope stop could not be confirmed");
+      } else await stopOwnedPty(session);
       if (session.term && session.term !== stoppedTerm) throw new Error("PTY ownership changed during stop");
       session.term = null;
       resources.ptys += 1;
     } catch (err) {
       cleanupErrors.push({ resource: "pty", code: "pty_stop_failed", message: err?.message || "PTY stop failed" });
     }
+  }
+  if (session && !session.term && resourceRuntimeOwner.ownsWorkerGeneration(session.generationId)) {
+    try { if (!(await resourceRuntimeOwner.stopWorkerGeneration(session.generationId)).ok) throw new Error("Resource scope cleanup incomplete"); }
+    catch { cleanupErrors.push({ resource: "pty", code: "resource_scope_stop_failed", message: "Resource scope cleanup could not be confirmed" }); }
   }
   if (session) {
     const viewers = session.viewers instanceof Set ? session.viewers : new Set();
@@ -4542,6 +4555,12 @@ async function cleanupServerRuntime() {
     })).finally(() => clearTimeout(timer));
     pending.push(bounded.then((result) => ({ resource, result })));
   };
+  // Synchronously fences resource starts before awaiting pending launch setup;
+  // includes generations that do not yet have an agentSessions entry.
+  collect("resource_scopes", async () => {
+    const result = await resourceRuntimeOwner.shutdown();
+    return { ok: result.ok, resources: { resource_generations: result.owned_generations }, cleanup_errors: result.ok ? [] : [{ resource: "resource_scope", code: "resource_cleanup_incomplete", message: "Resource scope cleanup could not be confirmed" }] };
+  });
 
   // Polling + watchdog timers.
   if (_autoStopHandle) { clearInterval(_autoStopHandle); _autoStopHandle = null; }

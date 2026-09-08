@@ -1,7 +1,7 @@
 "use strict";
 const assert = require("node:assert/strict");
 const F = require("./resource-linux-facts");
-const stat = "42 (worker (with spaces)) S 12 42 42 34816 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0";
+const stat = "42 (worker (with spaces)) S 12 42 42 34816 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0";
 assert.deepEqual(F.parseProcStat(stat), { pid: 42, state: "S", ppid: 12, pgrp: 42, session: 42, tty: 34816, startTime: "12345" });
 assert.equal(F.sameProcess({ pid: 42, startTime: "1", cgroup: "/a" }, { pid: 42, startTime: "2", cgroup: "/a" }), false);
 for (const input of ["0::/a/../b", "0::/a\n0::/b", "1:memory:/a", "0::/a//b"]) assert.throws(() => F.parseCgroup(input));

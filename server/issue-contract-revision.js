@@ -1,10 +1,9 @@
 "use strict";
 
 const crypto = require("crypto");
-const { execFile } = require("child_process");
-const { promisify } = require("util");
 
-const execFileAsync = promisify(execFile);
+const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
+const execFileAsync = (...args) => getSharedResourceRuntimeOwner().runControlChild(...args);
 const PROJECT_ROLES = new Set(["head", "dev", "re1", "re2"]);
 const REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;

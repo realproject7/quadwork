@@ -109,7 +109,7 @@ function parseKernelInterval(entries, { bootId, ownedGroup, vmKills }) {
     if (row._BOOT_ID !== bootId || typeof row.__CURSOR !== "string" || typeof row.MESSAGE !== "string") fail("kernel_interval_incomplete");
     const message = row.MESSAGE;
     if (/oom-kill:/.test(message)) {
-      if (!message.includes("constraint=CONSTRAINT_MEMCG") || !message.includes(`oom_memcg=${ownedGroup}`)) fail("global_or_unclassified_oom");
+      if (!message.includes("constraint=CONSTRAINT_MEMCG") || /(?:^|,)oom_memcg=([^,\s]+)/.exec(message)?.[1] !== ownedGroup) fail("global_or_unclassified_oom");
       ownedContext = true;
     }
     if (/(?:Out of memory|Memory cgroup out of memory): Killed process \d+/.test(message)) {

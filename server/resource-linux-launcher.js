@@ -4,16 +4,19 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const pty = require("node-pty");
-const { execFile } = require("child_process");
+const { execFile, execFileSync } = require("child_process");
 const { promisify } = require("util");
-const { ResourceController, buildControlClassConfiguration } = require("./resource-controller");
+const { ResourceController, buildControlClassConfiguration, buildControlScopeInvocation } = require("./resource-controller");
 const { createWorkerUnitBase, createControlUnitBase } = require("./resource-unit");
 const { inspectTempRoot, createGenerationTemp, reclaimGenerationTemp } = require("./resource-temp");
 const { runResourcePreflight, createReadOnlyProbes } = require("./resource-preflight");
 const facts = require("./resource-linux-facts");
+const { createDurableStoreFiles } = require("./durable-store-files");
 const exec = promisify(execFile);
 const STATE = new WeakMap();
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+class ResourceLockError extends Error { constructor(code, message) { super(message); this.code = code; this.check = "resource_admission_lock_unavailable"; } }
+const lockFiles = createDurableStoreFiles({ fs, error: ResourceLockError, codes: Object.fromEntries(["options", "unreadable", "symlink_rejected", "insecure_permissions", "write_failed", "locked", "lock_unsafe", "lock_failed", "lock_acquire_changed", "lock_release_changed", "lock_release_failed"].map((code) => [code, `resource_${code}`])) });
 
 async function boundedUntil(read, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -58,7 +61,7 @@ class LinuxResourceLauncher {
     STATE.set(this, state);
     Object.freeze(this);
   }
-  ready() { return STATE.get(this).proof; }
+  ready() { const s = STATE.get(this); return s.proof && !s.closed; }
   snapshot() { return STATE.get(this).controller.snapshot(); }
   async prepare() {
     const s = STATE.get(this);
@@ -97,9 +100,18 @@ class LinuxResourceLauncher {
   }
   tempForGeneration(generationId) { return STATE.get(this).records.get(generationId)?.tempPath || null; }
   async spawnPty(spec) {
+    const runtimeDir = `/run/user/${process.getuid()}`;
+    if (process.env.XDG_RUNTIME_DIR !== runtimeDir || fs.realpathSync(runtimeDir) !== runtimeDir) facts.fail("user_runtime_identity_invalid");
+    const directory = path.join(runtimeDir, "quadwork-resources");
+    lockFiles.ensureDirectories([directory]);
+    return lockFiles.withAsyncWriterLock(path.join(directory, "worker-admission"), () => this._spawnPty(spec), Date.now() + 15000);
+  }
+  async _spawnPty(spec) {
     const s = STATE.get(this);
     if (s.closed) facts.fail("server_shutting_down");
     if (!s.proof && spec.probe !== true) facts.fail("containment_unavailable");
+    const preflight = runResourcePreflight({ runtimeResources: s.policy, probes: createReadOnlyProbes({ scopeProof: true }), requestedWorkerScopes: 1 });
+    if (!preflight.ok) facts.fail("worker_capacity_or_limits_unavailable");
     const unitName = createWorkerUnitBase(spec);
     if (s.pending.has(unitName) || s.records.has(spec.generationId)) facts.fail("scope_identity_collision");
     const tempFacts = inspectTempRoot({ tempRoot: s.policy.temp_root, minimumFreeBytes: s.policy.temp_min_free_mib * facts.MIB });
@@ -110,7 +122,10 @@ class LinuxResourceLauncher {
     const record = { ...spec, unitName, parentSlice: `quadwork-worker-group-${unitName.slice("quadwork-worker-".length)}.slice`, tempFacts, tempPath: temp.path || temp, resolveStarted, rejectStarted, term: null, group: null, done: null, cleaned: false };
     s.pending.set(unitName, record); s.records.set(spec.generationId, record);
     record.done = s.controller.runWorkerScope({ projectId: spec.projectId, generationId: spec.generationId, unitName, parentSlice: record.parentSlice, ...(spec.probe ? { runtimeMaxSec: 90 } : {}), command: spec.command, args: spec.args, limits: { memoryHighMib: s.policy.worker.memory_high_mib, memoryMaxMib: s.policy.worker.memory_max_mib, swapMaxMib: s.policy.worker.swap_max_mib } });
-    record.done.catch((error) => { rejectStarted(error); }).finally(() => s.pending.delete(unitName));
+    record.done.catch(async (error) => {
+      try { await this.stopGeneration(spec.generationId); } catch { s.proof = false; }
+      rejectStarted(error);
+    }).finally(() => s.pending.delete(unitName));
     return started;
   }
   async _execute(invocation) {
@@ -118,8 +133,20 @@ class LinuxResourceLauncher {
     if (!record) facts.fail("scope_owner_missing");
     if (invocation.resourceClass === "control") {
       if (s.closed || !s.proof) facts.fail("containment_unavailable");
-      const output = await exec(invocation.file, invocation.args, record.options);
-      return { code: 0, signal: null, stdout: output.stdout, stderr: output.stderr };
+      const { input, ...options } = record.options;
+      if (input !== undefined && (!Buffer.isBuffer(input) && typeof input !== "string" || Buffer.byteLength(input) > 16 * 1024 * 1024)) facts.fail("control_input_invalid");
+      try {
+        const output = await new Promise((resolve, reject) => {
+          const child = execFile(invocation.file, invocation.args, options, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
+          record.child = child;
+          child.stdin.on("error", () => {});
+          child.stdin.end(input);
+        });
+        return { code: 0, signal: null, stdout: output.stdout, stderr: output.stderr };
+      } finally {
+        try { await this._cleanupControlScope(invocation.unitName); }
+        catch (error) { s.proof = false; throw error; }
+      }
     }
     record.setup = this._prepareSlice(record);
     await record.setup;
@@ -161,17 +188,25 @@ class LinuxResourceLauncher {
   }
   async _confirmExit(record) {
     if (record.cleaned) return;
-    await boundedUntil(() => {
+    if (record.reclaiming) return record.reclaiming;
+    record.reclaiming = (async () => { await boundedUntil(() => {
       try { const group = facts.readGroup(record.group); return group.pids.length === 0; }
       catch (error) { return error.code === "ENOENT"; }
     });
     reclaimGenerationTemp({ facts: record.tempFacts, generationId: record.generationId, confirmedProcessTreeExit: true });
     record.cleaned = true;
+    })();
+    return record.reclaiming;
   }
   async waitForGeneration(generationId) { return STATE.get(this).records.get(generationId)?.done; }
   async stopGeneration(generationId) {
     const s = STATE.get(this), record = s.records.get(generationId);
     if (!record) return;
+    if (record.stopping) return record.stopping;
+    record.stopping = this._stopGeneration(record);
+    return record.stopping;
+  }
+  async _stopGeneration(record) {
     if (record.setup) await record.setup.catch(() => {});
     if (record.group) {
       let live = false;
@@ -185,7 +220,7 @@ class LinuxResourceLauncher {
       // Before scope creation only the exact owned node-pty child is signalled.
       try { record.term.kill("SIGKILL"); } catch {}
       // The scope may have appeared concurrently. Resolve and verify it first.
-      try { record.group = facts.scopeGroup(`${record.unitName}.scope`); return this.stopGeneration(generationId); } catch (e) { if (e.check === "scope_identity_changed") throw e; }
+      try { record.group = facts.scopeGroup(`${record.unitName}.scope`); return this._stopGeneration(record); } catch (e) { if (e.check === "scope_identity_changed") throw e; }
     }
     if (record.unitFile) {
       await exec("systemctl", ["--user", "stop", record.parentSlice], { timeout: 3000, maxBuffer: 16384 });
@@ -200,6 +235,16 @@ class LinuxResourceLauncher {
     record.trace?.close();
     return { ok: true, owned: true };
   }
+  async _cleanupControlScope(unitName) {
+    const unit = `${unitName}.scope`;
+    const output = await exec("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,ControlGroup"], { timeout: 2000, maxBuffer: 16384 });
+    const values = Object.fromEntries(output.stdout.trim().split("\n").map((line) => { const i = line.indexOf("="); return [line.slice(0, i), line.slice(i + 1)]; }));
+    if (values.LoadState === "not-found" && !values.ControlGroup) return;
+    if (!values.ControlGroup && ["inactive", "failed"].includes(values.ActiveState)) return;
+    if (!values.ControlGroup?.endsWith(`/${unit}`)) facts.fail("control_scope_identity_changed");
+    if (facts.readGroup(values.ControlGroup).pids.length) await exec("systemctl", ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], { timeout: 2000, maxBuffer: 16384 });
+    await boundedUntil(() => { try { return facts.readGroup(values.ControlGroup).pids.length === 0; } catch (e) { return e.code === "ENOENT"; } });
+  }
   ownsGeneration(generationId) { return STATE.get(this).records.has(generationId); }
   async runControlChild(file, args, options = {}) {
     const s = STATE.get(this);
@@ -211,6 +256,29 @@ class LinuxResourceLauncher {
       const output = await s.controller.runControlChild({ ...ids, unitName, command: file, args, signal: options.signal });
       return { stdout: output.result.stdout, stderr: output.result.stderr };
     } finally { s.pending.delete(unitName); }
+  }
+  runControlChildSync(file, args, options = {}) {
+    const s = STATE.get(this);
+    if (!s.proof || s.closed) facts.fail("containment_unavailable");
+    const limiter = s.controller.controlLimiter;
+    if (limiter.active >= limiter.limit) facts.fail("control_capacity_exhausted");
+    const ids = { projectId: "control-plane", generationId: s.controlGeneration, operationId: crypto.randomBytes(12).toString("hex") };
+    const invocation = buildControlScopeInvocation({ ...ids, unitName: createControlUnitBase(ids), controlClassName: "quadwork-control.slice", command: file, args });
+    limiter.active += 1;
+    try { return execFileSync(invocation.file, invocation.args, { timeout: 10000, maxBuffer: 32 * 1024 * 1024, ...options }); }
+    finally {
+      try {
+        const unit = `${invocation.ids.unitName}.scope`;
+        const raw = execFileSync("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,ControlGroup"], { encoding: "utf8", timeout: 2000, maxBuffer: 16384 });
+        const props = Object.fromEntries(raw.trim().split("\n").map((line) => { const i = line.indexOf("="); return [line.slice(0, i), line.slice(i + 1)]; }));
+        if (props.ControlGroup) {
+          if (!props.ControlGroup.endsWith(`/${unit}`)) facts.fail("control_scope_identity_changed");
+          execFileSync("systemctl", ["--user", "stop", unit], { timeout: 3000, maxBuffer: 16384 });
+          try { if (facts.readGroup(props.ControlGroup).pids.length) facts.fail("control_cleanup_incomplete"); } catch (e) { if (e.code !== "ENOENT") throw e; }
+        } else if (props.LoadState !== "not-found" && !["inactive", "failed"].includes(props.ActiveState)) facts.fail("control_cleanup_unproven");
+      } catch (e) { s.proof = false; throw e; }
+      finally { limiter.active -= 1; }
+    }
   }
   async shutdown() {
     const s = STATE.get(this); s.closed = true;

@@ -3,8 +3,9 @@
  * Routes: config, chat, projects, memory, setup, rename, github/issues, github/prs, telegram
  */
 const express = require("express");
-const { execFile: _execFileCb, execFileSync, spawn } = require("child_process");
-const _execFileAsync = require("util").promisify(_execFileCb);
+const { spawn } = require("child_process");
+const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
+const _execFileAsync = (...args) => getSharedResourceRuntimeOwner().runControlChild(...args);
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -6186,9 +6187,9 @@ async function createAgentWorktree(workingDir, wtDir, branchName, execFn = execA
 // ─── GitHub helpers for Setup Wizard ──────────────────────────────────────
 
 // GitHub user info
-router.get("/api/github/user", (_req, res) => {
+router.get("/api/github/user", async (_req, res) => {
   try {
-    const out = execFileSync("gh", ["api", "user", "--jq", "{login: .login}"], { encoding: "utf-8", timeout: 10000 });
+    const { stdout: out } = await _execFileAsync("gh", ["api", "user", "--jq", "{login: .login}"], { encoding: "utf-8", timeout: 10000 });
     res.json(JSON.parse(out));
   } catch {
     res.status(502).json({ error: "GitHub CLI not authenticated" });
@@ -6196,9 +6197,9 @@ router.get("/api/github/user", (_req, res) => {
 });
 
 // GitHub orgs the authenticated user belongs to
-router.get("/api/github/orgs", (_req, res) => {
+router.get("/api/github/orgs", async (_req, res) => {
   try {
-    const out = execFileSync("gh", ["api", "user/orgs", "--jq", "[.[].login]"], { encoding: "utf-8", timeout: 10000 });
+    const { stdout: out } = await _execFileAsync("gh", ["api", "user/orgs", "--jq", "[.[].login]"], { encoding: "utf-8", timeout: 10000 });
     const orgs = JSON.parse(out);
     res.json(Array.isArray(orgs) ? orgs : []);
   } catch {
@@ -6207,11 +6208,11 @@ router.get("/api/github/orgs", (_req, res) => {
 });
 
 // GitHub repo list for an owner (only repos with push access)
-router.get("/api/github/repos", (req, res) => {
+router.get("/api/github/repos", async (req, res) => {
   const owner = req.query.owner;
   if (!owner) return res.status(400).json({ error: "Missing owner" });
   try {
-    const out = execFileSync("gh", ["repo", "list", String(owner), "--json", "name,description,isPrivate,viewerPermission", "--limit", "50"], { encoding: "utf-8", timeout: 15000 });
+    const { stdout: out } = await _execFileAsync("gh", ["repo", "list", String(owner), "--json", "name,description,isPrivate,viewerPermission", "--limit", "50"], { encoding: "utf-8", timeout: 15000 });
     const repos = JSON.parse(out);
     // Filter to repos with push access (ADMIN, MAINTAIN, WRITE)
     const pushAccess = new Set(["ADMIN", "MAINTAIN", "WRITE"]);
