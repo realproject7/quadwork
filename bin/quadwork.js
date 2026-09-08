@@ -1170,6 +1170,35 @@ async function cmdInit() {
 
 
 
+// #1077: signal handlers join one awaited shutdown and never report a stop
+// before the server confirms its owned processes have exited.
+function createCleanExit(serverExports, serverPidFile, exit = (code) => process.exit(code)) {
+  let completion;
+  return () => {
+    if (completion) return completion;
+    completion = Promise.resolve().then(async () => {
+      console.log("");
+      log("Shutting down...");
+      let code = 0;
+      try {
+        const result = await serverExports.shutdown();
+        if (result?.ok !== true) throw new Error("owned resource cleanup could not be confirmed");
+        ok("Stopped.");
+        console.log("");
+        log("To restart:");
+        log(`  ${c.dim}npx --yes quadwork start${c.reset}`);
+        console.log("");
+      } catch (err) {
+        code = 1;
+        warn(`Shutdown incomplete: ${err.message}`);
+      }
+      try { fs.unlinkSync(serverPidFile); } catch {}
+      exit(code);
+    });
+    return completion;
+  };
+}
+
 async function cmdStart() {
   console.log("\n  QuadWork Start\n");
 
@@ -1231,22 +1260,7 @@ async function cmdStart() {
     fs.writeFileSync(serverPidFile, String(process.pid));
   } catch (e) { warn(`could not write server.pid: ${e.message}`); }
 
-  let shuttingDown = false;
-  const cleanExit = () => {
-    if (shuttingDown) return; // idempotent: SIGINT then SIGTERM
-    shuttingDown = true;
-    console.log("");
-    log("Shutting down...");
-    try { serverExports && serverExports.shutdown && serverExports.shutdown(); }
-    catch (e) { warn(`shutdown failed: ${e.message}`); }
-    try { fs.unlinkSync(serverPidFile); } catch {}
-    ok("Stopped.");
-    console.log("");
-    log("To restart:");
-    log(`  ${c.dim}npx --yes quadwork start${c.reset}`);
-    console.log("");
-    process.exit(0);
-  };
+  const cleanExit = createCleanExit(serverExports, serverPidFile);
 
   // #972: handle SIGTERM too so `quadwork stop` gets the same clean shutdown
   // (agent PTYs + caffeinate + timers) as Ctrl+C, not a bare process kill.
@@ -1947,6 +1961,7 @@ switch (command) {
 
 // #972: exported for unit tests (see server/binStop.test.js).
 module.exports = {
+  createCleanExit,
   MINIMUM_NODE_VERSION,
   parseNodeVersion,
   satisfiesMinimumNodeVersion,

@@ -66,6 +66,11 @@ const net = require("net");
 const crypto = require("crypto");
 const config = readConfig();
 const PORT = config.port || 8400;
+// #1077: close admission synchronously, including the await before PTY spawn.
+let shuttingDown = false;
+let shutdownPromise = null;
+const pendingAgentLaunches = new Set();
+const ptyStopOperations = new WeakMap();
 
 // #968: shared session token gating the PTY-driving surface (/ws/terminal,
 // /write, /interrupt). Auto-provisioned + persisted to config.json
@@ -196,7 +201,7 @@ app.get("/api/session-token", (req, res) => {
 // --- Safe PTY write helper (#670) ---
 
 function safeWrite(term, data) {
-  if (!term) return false;
+  if (shuttingDown || !term) return false;
   try { term.write(data); return true; }
   catch (err) {
     if (err.code === "EIO") return false;
@@ -2187,6 +2192,7 @@ async function launchAgentPty(project, agent, opts = {}) {
   const key = `${project}/${agent}`;
 
   try {
+    if (shuttingDown) return shutdownAdmissionFailure();
     const captureAdmission = opts.captureProjectAdmission || captureProjectAdmission;
     const admissionCurrent = opts.isAdmissionCurrent || isAdmissionCurrent;
     const lease = opts.admissionToken || captureAdmission(project);
@@ -2201,6 +2207,7 @@ async function launchAgentPty(project, agent, opts = {}) {
     // Registration and MCP argument construction await remote work. Archive
     // may commit in that gap, so the lease must still be current immediately
     // before creating the process owner.
+    if (shuttingDown) return shutdownAdmissionFailure();
     if (!admissionCurrent(lease)) {
       return { ok: false, code: "project_archived", status: 409, error: "project is archived" };
     }
@@ -2253,6 +2260,7 @@ async function launchAgentPty(project, agent, opts = {}) {
     // the buffer accumulates so the next connect gets replay.
     const SCROLLBACK_SIZE = 64 * 1024;
     term.onData((data) => {
+      if (shuttingDown || session._stopping) return;
       session.lastOutputAt = Date.now();
       // The first bytes from THIS PTY are a runtime-ready observation. They
       // prove neither task completion nor semantic agent health, but they do
@@ -2314,6 +2322,7 @@ async function launchAgentPty(project, agent, opts = {}) {
     });
 
     term.onExit(({ exitCode }) => {
+      session._ptyExited = true;
       const current = agentSessions.get(key);
       if (current && current.term === term) {
         markSessionExited(key, current, exitCode);
@@ -2377,7 +2386,20 @@ function recordAgentChatActivity(projectId, agentId) {
 // The single admission path used by routes, restart/recovery, watchdog and
 // startup restoration. Its private launch callback receives server-generated
 // immutable IDs only after the durable reservation succeeds.
-async function spawnAgentPty(project, agent, opts = {}) {
+function shutdownAdmissionFailure() {
+  return { ok: false, code: "server_shutting_down", status: 503, error: "server is shutting down", lifecycle: null };
+}
+
+function spawnAgentPty(project, agent, opts = {}) {
+  if (shuttingDown) return Promise.resolve(shutdownAdmissionFailure());
+  const operation = admitAgentPty(project, agent, opts);
+  pendingAgentLaunches.add(operation);
+  // Observe both outcomes without creating an unhandled rejected finally chain.
+  void operation.then(() => pendingAgentLaunches.delete(operation), () => pendingAgentLaunches.delete(operation));
+  return operation;
+}
+
+async function admitAgentPty(project, agent, opts = {}) {
   // Preserve the project lifecycle barrier before evaluating source authority:
   // an archived/revoked project is never reported as merely an unauthorised
   // operator action, and its existing admission lease is reused below.
@@ -2415,6 +2437,7 @@ async function spawnAgentPty(project, agent, opts = {}) {
   const repository = previousLifecycle && (LOSS_LIFECYCLE_STATES.has(previousLifecycle.state) || previousLifecycle.circuit?.open === true)
     ? await recoveryRepositoryFacts(project, agent)
     : null;
+  let shutdownRejected = false;
   const result = await lifecycleGovernor.launch({
     projectId: project,
     role: agent,
@@ -2435,13 +2458,20 @@ async function spawnAgentPty(project, agent, opts = {}) {
     // node-pty launch must therefore never satisfy Linux containment by an
     // option supplied from a route or recovery caller.
     containedLaunch: testFixture?.containedLaunch === true,
-    launch: ({ operation_id, generation_id }) => launchAgentPty(project, agent, {
-      ...opts,
-      admissionToken: admission,
-      operationId: operation_id,
-      generationId: generation_id,
-    }),
+    launch: async ({ operation_id, generation_id }) => {
+      const launched = await launchAgentPty(project, agent, {
+        ...opts,
+        admissionToken: admission,
+        operationId: operation_id,
+        generationId: generation_id,
+      });
+      shutdownRejected = launched.code === "server_shutting_down";
+      return launched;
+    },
   });
+  // The governor records launch_failed and releases its reservation before
+  // returning the specific server admission failure to the caller.
+  if (shutdownRejected) return { ...shutdownAdmissionFailure(), lifecycle: result.operation || null };
   if (result.status === "spawned") {
     recordAgentSpawnedLifecycle(project, agent, result.operation);
     // A Head reset is observable even if it crashes before it can send a
@@ -2485,11 +2515,11 @@ function markSessionExited(key, session, exitCode) {
   session.state = "stopped";
   session.error = exitCode ? `exit:${exitCode}` : null;
   session.term = null;
-  session.exitedUnexpectedly = true;
+  session.exitedUnexpectedly = !session._stopping && !shuttingDown;
   session.lastExitAt = new Date().toISOString();
   session.exitReason = exitCode == null ? "unknown" : "exit";
   const resourceKilled = hasTrustedResourceKill(session);
-  session.lifecycleState = resourceKilled ? "resource_killed" : "exited";
+  session.lifecycleState = session.exitedUnexpectedly ? (resourceKilled ? "resource_killed" : "exited") : "stopped";
   if (session.operationId && session.generationId) {
     lifecycleGovernor.transition({
       projectId: session.projectId,
@@ -2503,7 +2533,7 @@ function markSessionExited(key, session, exitCode) {
   // Exit observation is monitor-only: it cannot restart, reassign, merge, or
   // enable monitoring. It is ignored unless a persisted enabled Monitor has a
   // current trusted assignment/cycle receipt to bind the event.
-  void observeProjectMonitorExit(session).catch(() => {});
+  if (session.exitedUnexpectedly) void observeProjectMonitorExit(session).catch(() => {});
   for (const v of session.viewers) {
     if (v.readyState <= 1) v.close(1000, `exited:${exitCode == null ? "" : exitCode}`);
   }
@@ -2522,6 +2552,43 @@ function isPtyAlive(term) {
   } catch (err) {
     return err && err.code === "EPERM";
   }
+}
+
+// Keep termination tied to the captured PTY object and its exit observation.
+// Never escalate after that owner exited, even if its numeric PID was reused.
+function stopOwnedPty(session) {
+  const term = session.term;
+  if (!term) return Promise.resolve();
+  const existing = ptyStopOperations.get(term);
+  if (existing) return existing;
+  const operation = (async () => {
+    const pid = term.pid;
+    if (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0)) throw new Error("Invalid owned PTY PID");
+    let exited = session._ptyExited === true;
+    const subscription = typeof term.onExit === "function" ? term.onExit(() => { exited = true; }) : null;
+    const gone = () => exited || (pid !== undefined && !isPtyAlive({ pid }));
+    const signal = (name) => {
+      if (gone()) return;
+      if (session.term !== term || term.pid !== pid) throw new Error("PTY ownership changed during stop");
+      if (term.kill(name) === false) throw new Error("PTY did not accept stop signal");
+    };
+    const waitForExit = async (timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!gone() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+      return gone();
+    };
+    try {
+      signal(); // node-pty uses SIGHUP on Unix; Windows owns its native teardown.
+      if (pid === undefined || await waitForExit(500)) return;
+      signal("SIGKILL");
+      if (!await waitForExit(1000)) throw new Error("PTY remained alive after forced stop");
+    } finally {
+      subscription?.dispose();
+    }
+  })();
+  ptyStopOperations.set(term, operation);
+  void operation.catch(() => { if (ptyStopOperations.get(term) === operation) ptyStopOperations.delete(term); });
+  return operation;
 }
 
 async function stopAgentSession(key, {
@@ -2545,17 +2612,15 @@ async function stopAgentSession(key, {
     emitSystemMessage(session.projectId, `${session.agentId} left`);
   }
   cleanupPtyDispatcher(key);
+  if (session) {
+    session._stopping = true;
+    session.state = "stopping";
+  }
   if (session?.term) {
-    const term = session.term;
+    const stoppedTerm = session.term;
     try {
-      const killed = term.kill();
-      if (killed === false) throw new Error("PTY did not accept stop signal");
-      if (typeof term.pid === "number") {
-        for (let i = 0; i < 20 && isPtyAlive(term); i++) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-        if (isPtyAlive(term)) throw new Error("PTY remained alive after stop");
-      }
+      await stopOwnedPty(session);
+      if (session.term && session.term !== stoppedTerm) throw new Error("PTY ownership changed during stop");
       session.term = null;
       resources.ptys += 1;
     } catch (err) {
@@ -2574,10 +2639,11 @@ async function stopAgentSession(key, {
         cleanupErrors.push({ resource: "viewer", code: "viewer_stop_failed", message: err?.message || "Terminal viewer stop failed" });
       }
     }
-    session.state = "stopped";
-    session.error = null;
+    const ptyFailed = cleanupErrors.some((error) => error.resource === "pty");
+    session.state = ptyFailed ? "error" : "stopped";
+    session.error = ptyFailed ? "PTY stop could not be confirmed" : null;
     session.exitedUnexpectedly = false;
-    session.lifecycleState = "stopped";
+    session.lifecycleState = ptyFailed ? "unknown" : "stopped";
     if (session.operationId && session.generationId) {
       try {
         await lifecycleGovernor.transition({
@@ -2585,7 +2651,7 @@ async function stopAgentSession(key, {
           role: session.agentId,
           operationId: session.operationId,
           generationId: session.generationId,
-          status: "stopped",
+          status: session.lifecycleState,
           health: "unknown",
         });
       } catch {
@@ -2608,7 +2674,7 @@ async function stopAgentSession(key, {
   // deferred (setImmediate) so it never blocks the stop path, and stale-only,
   // so it never touches files a still-live agent on the shared /tmp/claude-{uid}
   // is using. This only reads a session's OWN temp when that session is gone.
-  setImmediate(backendTempSweepTick);
+  if (!shuttingDown) setImmediate(backendTempSweepTick);
   return { ok: cleanupErrors.length === 0, resources, cleanup_errors: cleanupErrors };
 }
 
@@ -2621,6 +2687,7 @@ async function stopAgentSession(key, {
 // teardown-triggered sweep from overlapping the periodic one.
 let _tempSweepRunning = false;
 function backendTempSweepTick() {
+  if (shuttingDown) return;
   if (_tempSweepRunning) return;
   _tempSweepRunning = true;
   try {
@@ -4134,7 +4201,7 @@ async function watchdogCheck(deps = {}) {
 }
 
 function startWatchdog() {
-  if (_watchdogHandle) return;
+  if (shuttingDown || _watchdogHandle) return;
   _watchdogHandle = setInterval(watchdogCheck, 60_000);
   console.log("[watchdog] stuck-agent watchdog started (60s interval, 10m threshold)");
 }
@@ -4355,6 +4422,7 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
     throw err;
   });
   server.listen(PORT, "127.0.0.1", async () => {
+  if (shuttingDown) return;
   console.log(`QuadWork server listening on http://127.0.0.1:${PORT}`);
   syncTriggersFromConfig();
   const startupCfg = readConfig();
@@ -4404,11 +4472,13 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   // evaluate GitHub/queue state or start a suspended monitor. A pending receipt
   // may be re-delivered only when its fixed Head recipient is already verified.
   for (const p of admittedStartupCfg.projects) {
+    if (shuttingDown) return;
     if (p.chat_mode !== "file" || fileChat._getState(p.id).nextId === null) continue;
     try { await resumePersistedProjectMonitor(p.id); }
     catch (err) { console.error(`[monitor] ${p.id}: trusted delivery recovery deferred: ${err.message}`); }
   }
 
+  if (shuttingDown) return;
   runStartupMigrations(admittedStartupCfg);
 
   // #856: Auto-reseed worktree AGENTS.md when the package version changes.
@@ -4424,6 +4494,7 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   // #992: restore agents for any project mid-batch (see fn comment). Runs
   // AFTER auto-reseed (which defers active-batch projects, so their seeds are
   // untouched) and must never block boot.
+  if (shuttingDown) return;
   try {
     await respawnActiveBatchAgents(admittedStartupCfg);
   } catch (err) {
@@ -4434,13 +4505,44 @@ if (!process.env.QUADWORK_SKIP_LISTEN) {
   });
 }
 
-// #972: clean shutdown. Ctrl+C previously orphaned the detached caffeinate
-// process (Mac never slept again), left agent
-// PTYs (and their CLI children holding worktree locks) alive, and never cleared
-// the polling/watchdog timers or the bridge/trigger connections. Every step is
-// independently guarded so the function stays idempotent (SIGINT then SIGTERM,
-// or a full-reset re-run, can call it more than once safely).
+// #1077: every caller joins one bounded cleanup. Admission closes in the
+// calling turn, before any cleanup awaits an external owner.
 function shutdown() {
+  if (shutdownPromise) return shutdownPromise;
+  shuttingDown = true;
+  let complete;
+  shutdownPromise = new Promise((resolve) => { complete = resolve; });
+  void cleanupServerRuntime().then(complete, (err) => complete({
+    ok: false,
+    resources: {},
+    cleanup_errors: [{ resource: "server", code: "shutdown_failed", message: err?.message || "Shutdown failed" }],
+  }));
+  return shutdownPromise;
+}
+
+async function cleanupServerRuntime() {
+  const aggregate = { ok: false, resources: {}, cleanup_errors: [] };
+  const pending = [];
+  // All cleanup starts before our first await. A stuck bridge, pending launch
+  // or proxy cannot hold the CLI indefinitely or turn a timeout into success.
+  const collect = (resource, action) => {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ ok: false, resources: {}, cleanup_errors: [
+        { resource, code: "shutdown_timeout", message: "Shutdown cleanup timed out" },
+      ] }), 6000);
+    });
+    let operation;
+    try { operation = Promise.resolve(action()); }
+    catch (err) { operation = Promise.reject(err); }
+    const bounded = Promise.race([operation, timeout]).catch((err) => ({
+      ok: false, resources: {}, cleanup_errors: [
+        { resource, code: "shutdown_failed", message: err?.message || "Shutdown cleanup failed" },
+      ],
+    })).finally(() => clearTimeout(timer));
+    pending.push(bounded.then((result) => ({ resource, result })));
+  };
+
   // Polling + watchdog timers.
   if (_autoStopHandle) { clearInterval(_autoStopHandle); _autoStopHandle = null; }
   if (_reseedRetryHandle) { clearInterval(_reseedRetryHandle); _reseedRetryHandle = null; }
@@ -4449,8 +4551,21 @@ function shutdown() {
 
   // Project Monitor owns only condition-specific timeout handles. Cancel them
   // synchronously on shutdown; no monitor state is evaluated or rewritten.
-  for (const project of [...monitorKnownProjects]) {
-    try { projectMonitor.shutdown(project); } catch {}
+  const projectIds = new Set(monitorKnownProjects);
+  try { for (const p of readConfig().projects || []) if (p?.id) projectIds.add(p.id); }
+  catch (err) {
+    aggregate.cleanup_errors.push({ resource: "config", code: "shutdown_config_failed", message: err?.message || "Config unavailable" });
+  }
+  for (const key of [...agentSessions.keys(), ...mcpProxies.keys()]) projectIds.add(key.split("/")[0]);
+  for (const project of projectIds) {
+    try {
+      projectMonitor.shutdown(project);
+      cancelPtyDispatchProject(project);
+      selfHeal.clearProject(project);
+    } catch (err) {
+      aggregate.cleanup_errors.push({ resource: "project", code: "shutdown_cancel_failed", message: err?.message || "Project cancellation failed" });
+    }
+    collect("route_background", () => routes.cancelProjectBackground(project));
   }
   monitorKnownProjects.clear();
   monitorModes.clear();
@@ -4458,26 +4573,45 @@ function shutdown() {
   clearProjectMonitorTerminal._fingerprints.clear();
 
   // Message bridges (in-process Discord/Telegram clients).
-  void telegramBridge.stopAll().catch((err) => console.error("[shutdown] Telegram bridge stop failed:", err?.message || err));
-  void discordBridge.stopAll().catch((err) => console.error("[shutdown] Discord bridge stop failed:", err?.message || err));
+  for (const [resource, bridge] of [["telegram_bridge", telegramBridge], ["discord_bridge", discordBridge]]) {
+    collect(resource, async () => {
+      const results = await bridge.stopAll();
+      const merged = { ok: false, resources: {}, cleanup_errors: [] };
+      for (const result of results) mergeCleanupResult(merged, result, resource);
+      merged.ok = merged.cleanup_errors.length === 0;
+      return merged;
+    });
+  }
 
   // caffeinate is spawned detached+unref, so it survives our exit unless killed.
   if (caffeinateProcess.process) {
-    try { caffeinateProcess.process.kill("SIGTERM"); } catch {}
-    clearCaffeinateProcess();
-  }
-
-  // Agent PTYs (and the CLI children they hold).
-  for (const [, session] of agentSessions) {
-    if (session && session.term) { try { session.term.kill(); } catch {} }
-  }
-
-  const cfg = readConfig();
-  for (const p of (cfg.projects || [])) {
-    if (p.chat_mode === "file") {
-      try { fileChat.shutdownProject(p.id); } catch {}
+    try {
+      if (caffeinateProcess.process.kill("SIGTERM") === false) throw new Error("Caffeinate did not accept stop signal");
+      clearCaffeinateProcess();
+    } catch (err) {
+      aggregate.cleanup_errors.push({ resource: "caffeinate", code: "caffeinate_stop_failed", message: err?.message || "Caffeinate stop failed" });
     }
   }
+
+  // The session owner cancels deferred writes, stops its exact PTY, and closes
+  // viewers/proxies. It does not claim control of unverified descendants.
+  for (const key of new Set([...agentSessions.keys(), ...mcpProxies.keys()])) {
+    collect("session", () => stopAgentSession(key, { clearSelfHeal: true, suppressLifecycleMsg: true }));
+  }
+  collect("pending_launches", async () => {
+    await Promise.all([...pendingAgentLaunches]);
+    return { ok: true, resources: {}, cleanup_errors: [] };
+  });
+
+  for (const project of projectIds) {
+    try { fileChat.shutdownProject(project); }
+    catch (err) {
+      aggregate.cleanup_errors.push({ resource: "file_chat", code: "file_chat_stop_failed", message: err?.message || "File chat stop failed" });
+    }
+  }
+  for (const { resource, result } of await Promise.all(pending)) mergeCleanupResult(aggregate, result, resource);
+  aggregate.ok = aggregate.cleanup_errors.length === 0;
+  return aggregate;
 }
 
 module.exports = {
