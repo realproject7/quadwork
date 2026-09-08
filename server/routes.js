@@ -1407,7 +1407,8 @@ function deliveryFinalReviewContext(projectId, deliveryCandidateRef, prNumber, f
     },
     read_pr: (request) => {
       const cached = _graphqlCache.get(binding.cache_repo);
-      if (!freshPr && (!Number.isFinite(cached?.ts) || Date.now() - cached.ts > REVIEW_CONTRACT_MAX_AGE_MS)) throw new Error("delivery_final_review_pr_stale");
+      if (!freshPr && (!Number.isFinite(cached?.ts) || Date.now() < cached.ts || Date.now() - cached.ts > REVIEW_CONTRACT_MAX_AGE_MS ||
+          ["error", "cancelled"].includes(_githubRepoStatus.get(binding.cache_repo)?.status))) throw new Error("delivery_final_review_pr_stale");
       const row = freshPr || (Array.isArray(cached?.prs) ? cached.prs.find((entry) => entry?.number === request.pr_number) : null);
       if (!row || !canonicalSha(row.tip) || row.state !== "OPEN" || row.draft === true ||
           canonicalSha(row.baseSha) !== deliveryCandidateRef.base_sha) throw new Error("delivery_final_review_pr_unavailable");
@@ -5725,7 +5726,8 @@ async function attachReviewCycleHandoffs(projectId, context, admission, items, s
     const snapshot = binding ? _graphqlCache.get(binding.cache_repo) : null;
     const pr = snapshot?.prs?.find((entry) => entry?.number === live.number && canonicalSha(entry.tip) === canonicalSha(live.tip));
     // A persisted/cold/partial row cannot establish current dispatch identity.
-    if (!binding || !pr || !canonicalSha(pr.baseSha) || (binding.ci_policy?.mode !== "ci-less" && !pr.checkEvidence) || !stillCurrent() || !isAdmissionCurrent(admission)) continue;
+    if (!binding || !pr || !canonicalSha(pr.baseSha) || ["error", "cancelled"].includes(_githubRepoStatus.get(binding.cache_repo)?.status) ||
+        (binding.ci_policy?.mode !== "ci-less" && !pr.checkEvidence) || !stillCurrent() || !isAdmissionCurrent(admission)) continue;
     const contractObservation = currentContractObservation(snapshot, ref.number, Date.now(), REVIEW_CONTRACT_MAX_AGE_MS);
     if (!contractObservation ||
         !stillCurrent() || !isAdmissionCurrent(admission)) continue;

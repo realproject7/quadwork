@@ -625,7 +625,7 @@ function migrateV3Document(value) {
     if (!CYCLE_ID_RE.test(cycleId) || !isPlainObject(raw) || !isPlainObject(raw.target)) {
       fail("review_cycle_store_invalid", "review-cycle record is invalid");
     }
-    if (raw.target.target_kind !== LEGACY_REVIEW_TARGET_KIND) {
+    if (raw.target.target_kind !== LEGACY_REVIEW_TARGET_KIND || raw.target.version !== 1) {
       fail("review_cycle_store_invalid", "V3 review-cycle target kind is invalid");
     }
     try { assertTargetIdentity(raw.target, "review_cycle_store_invalid"); }

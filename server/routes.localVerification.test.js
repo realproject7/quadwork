@@ -139,6 +139,12 @@ function evidenceBody(extra = {}) {
   assert.equal(repeated.body.record.record_id, submitted.body.record.record_id);
   assert.equal(gateMessages().length, 1, "retry causes no duplicate Head wake");
   assert.equal(commands.some((row) => /check-runs|\/status(?:\?|$)/.test(row.args[1])), false);
+  await routes.refreshRepoRest("owner/web", [captureProjectAdmission(project_id)], async () => ({ status: "error", data: null }));
+  assert.equal(currentCycle().ci_state, "unknown", "a failed current PR refresh removes passing evidence standing");
+  assert.equal(currentCycle().mergeable, false);
+  await routes.refreshRepoRest("owner/web", [captureProjectAdmission(project_id)]);
+  assert.equal(currentCycle().ci_state, "ci_less_pass");
+  assert.equal(gateMessages().length, 1, "re-observing the same current evidence does not repeat the gate notice");
   for (const patch of [{ state: "closed" }, { draft: true }, { head: { sha: "9".repeat(40) } }, { base: { sha: "9".repeat(40) } }]) {
     const before = pull; pull = { ...pull, ...patch };
     const result = await invoke("/api/delivery-candidate/ci-evidence", "dev", evidenceBody());
@@ -156,6 +162,10 @@ function evidenceBody(extra = {}) {
   await routes.refreshRepoRest("owner/web", [captureProjectAdmission(project_id)]);
   assert.equal(currentCycle(), undefined, "successful PR refresh retires base-drift review standing");
   assert.equal(gateMessages().length, 1);
+  pull = { ...pull, base: { sha: base_sha } };
+  const withoutHead = await invoke("/api/delivery-candidate/ci-evidence", "dev", evidenceBody());
+  assert.equal(withoutHead.statusCode, 200);
+  assert.equal(currentCycle(), undefined, "Dev receipt alone cannot open a new Head-owned final review");
   selectedPolicy = { version: 1, mode: "github-checks", registration_grace_seconds: 0, same_sha_retry_budget: 0, checks: [{ name: "unit", required: true, kind: "product" }] };
   writeConfig(); checksUnavailable = false;
   const external = await routes.githubStateFetcher("owner/web");
