@@ -78,7 +78,7 @@ sudo apt-get update
 sudo apt-get install -y git apache2-utils
 ```
 
-`apache2-utils` provides `htpasswd` (used in Step 10 for HTTP basic auth).
+`apache2-utils` provides `htpasswd` (used in Step 9 for HTTP basic auth).
 
 ---
 
@@ -720,7 +720,7 @@ chmod 600 ~/.quadwork/.env
 11. Create `~/start-quadwork.sh` wrapper script (loads nvm before exec)
 12. Start with pm2 wrapper, save, configure startup
 13. Verify reboot survival: `sudo reboot`, then check `pm2 list`
-14. **Remote access:** either SSH-forward `ssh -L 8400:127.0.0.1:8400 quadwork` (recommended, nothing published), **or** for a persistent public URL: set `trusted_dashboard_hosts` in config, then DNS A record → nginx reverse proxy + SSL → HTTP basic auth (never expose the port unauthenticated)
+14. **Remote access:** either SSH-forward `ssh -L 8400:127.0.0.1:8400 quadwork` (recommended, nothing published), **or** for a persistent public URL: set `trusted_dashboard_hosts` in config, then DNS A record → password file and basic auth → authenticated nginx proxy + SSL → optional login cookie cache (never expose the port unauthenticated)
 
 ## Note: /tmp quotas and Claude temp
 
