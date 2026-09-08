@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import TerminalPanel from "./TerminalPanel";
+import AgentLifecycleControls from "./AgentLifecycleControls";
 import { sessionTokenHeaders } from "@/lib/sessionToken";
 
 // #399 / quadwork#264: how long an agent stays "active" after its
@@ -121,6 +122,7 @@ export default function TerminalGrid({
       {agents.map((agent, i) => {
         const isExpanded = expanded === agent.id;
         const isHidden = expanded !== null && !isExpanded;
+        const isVerified = agentStates[agent.id] === "running" || agentStates[agent.id] === "verified";
 
         return (
           <div
@@ -146,11 +148,11 @@ export default function TerminalGrid({
                     signals "agent is working". Idle/stopped/error
                     states omit the ring. */}
                 <span className="relative inline-flex items-center justify-center w-2 h-2">
-                  {agentStates[agent.id] === "running" && isActive(agent.id) && (
+                  {isVerified && isActive(agent.id) && (
                     <span className="absolute inline-flex h-full w-full rounded-full bg-accent opacity-60 animate-ping" />
                   )}
                   <span className={`relative w-1.5 h-1.5 rounded-full ${
-                    agentStates[agent.id] === "running" ? "bg-accent"
+                    isVerified ? "bg-accent"
                       : agentStates[agent.id] === "error" ? "bg-error"
                       : "bg-text-muted"
                   }`} />
@@ -162,7 +164,7 @@ export default function TerminalGrid({
                     the ticket's "minimal aesthetic" constraint. */}
                 <span
                   className={`text-[11px] uppercase tracking-wider ${
-                    agentStates[agent.id] === "running" && isActive(agent.id)
+                    isVerified && isActive(agent.id)
                       ? "text-accent animate-name-shimmer"
                       : "text-text-muted"
                   }`}
@@ -171,41 +173,8 @@ export default function TerminalGrid({
                 </span>
               </div>
               <div className="flex items-center gap-1">
-                {agentStates[agent.id] !== "running" && (
-                  <button
-                    onClick={() => {
-                      fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agent.id)}&action=start`, { method: "POST" })
-                        .then((r) => r.json())
-                        .then((d) => { if (d.state && onStatusChange) onStatusChange(agent.id, d.state); })
-                        .catch(() => {});
-                    }}
-                    className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
-                    title="Start"
-                  >▶</button>
-                )}
-                {agentStates[agent.id] === "running" && (
-                  <button
-                    onClick={() => {
-                      fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agent.id)}&action=stop`, { method: "POST" })
-                        .then((r) => r.json())
-                        .then((d) => { if (d.state && onStatusChange) onStatusChange(agent.id, d.state); })
-                        .catch(() => {});
-                    }}
-                    className="text-[10px] text-text-muted hover:text-error transition-colors px-0.5"
-                    title="Stop"
-                  >■</button>
-                )}
-                <button
-                  onClick={() => {
-                    fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agent.id)}&action=restart`, { method: "POST" })
-                      .then((r) => r.json())
-                      .then((d) => { if (d.state && onStatusChange) onStatusChange(agent.id, d.state); })
-                      .catch(() => {});
-                  }}
-                  className="text-[10px] text-text-muted hover:text-accent transition-colors px-0.5"
-                  title="Restart"
-                >↻</button>
-                {agentStates[agent.id] === "running" && (
+                <AgentLifecycleControls key={`${projectId}/${agent.id}`} projectId={projectId} agentId={agent.id} status={agentStates[agent.id]} onStatusChange={(state) => onStatusChange?.(agent.id, state)} />
+                {isVerified && (
                   <button
                     onClick={async () => {
                       // #968: auth the PTY write

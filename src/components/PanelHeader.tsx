@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import AgentLifecycleControls from "./AgentLifecycleControls";
 
 /**
  * #1052: vertical collapse contract for a top-level right-rail panel.
@@ -18,7 +19,7 @@ export interface PanelCollapse {
 
 interface PanelHeaderProps {
   label: string;
-  status?: "running" | "stopped" | "error";
+  status?: string;
   projectId?: string;
   agentId?: string;
   onStatusChange?: (newStatus: string) => void;
@@ -33,25 +34,12 @@ interface PanelHeaderProps {
 
 export default function PanelHeader({ label, status, projectId, agentId, onStatusChange, tooltip, children, collapse }: PanelHeaderProps) {
   const dotColor =
-    status === "running"
+    status === "running" || status === "verified"
       ? "bg-accent"
       : status === "error"
         ? "bg-error"
         : "bg-text-muted";
 
-  const lifecycleAction = (action: string) => {
-    if (!projectId || !agentId) return;
-    fetch(`/api/agents?project=${encodeURIComponent(projectId)}&agent=${encodeURIComponent(agentId)}&action=${action}`, {
-      method: "POST",
-    })
-      .then((r) => r.json())
-      .then((d) => {
-        if (onStatusChange && d.state) onStatusChange(d.state);
-      })
-      .catch(() => {});
-  };
-
-  const showControls = projectId && agentId;
   const expanded = collapse ? collapse.expanded : true;
 
   return (
@@ -67,34 +55,8 @@ export default function PanelHeader({ label, status, projectId, agentId, onStatu
       </div>
       <div className="flex items-center gap-1.5">
         {expanded && children}
-        {showControls && (
-          <>
-            {status !== "running" && (
-              <button
-                onClick={() => lifecycleAction("start")}
-                className="text-[10px] text-text-muted hover:text-accent transition-colors px-1"
-                title="Start"
-              >
-                ▶
-              </button>
-            )}
-            {status === "running" && (
-              <button
-                onClick={() => lifecycleAction("stop")}
-                className="text-[10px] text-text-muted hover:text-error transition-colors px-1"
-                title="Stop"
-              >
-                ■
-              </button>
-            )}
-            <button
-              onClick={() => lifecycleAction("restart")}
-              className="text-[10px] text-text-muted hover:text-accent transition-colors px-1"
-              title="Restart"
-            >
-              ↻
-            </button>
-          </>
+        {projectId && agentId && (
+          <AgentLifecycleControls key={`${projectId}/${agentId}`} projectId={projectId} agentId={agentId} status={status} onStatusChange={onStatusChange} />
         )}
         {collapse && (
           // #1052: ≥24x24 hit target inside the 28px header, 12px text/chevron.
