@@ -97,11 +97,12 @@ function createDeliveryExecutor(deps) {
       if (op?.result) return C.clone(op.result);
       if (!op && command.action !== "form_delivery" && snapshot.revision !== command.payload.expected_candidate_revision) C.fail("delivery_candidate_revision_stale");
       if (!op && domain.delivery_context().status.revision !== command.expected_revision) C.fail("delivery_domain_revision_stale");
+      domain.record_delivery_intent(command);
       let delivery = C.clone(snapshot.delivery || C.initialDelivery());
       if (!op) {
         if (delivery.operations.length >= 64) C.fail("delivery_operation_history_full");
         op = { action: command.action, idempotency_key: command.idempotency_key, correlation_id: command.correlation_id,
-          fingerprint: C.digest(command), step: "intent", result: null, failure: null };
+          fingerprint: C.digest(command), step: "intent", checkpoint: null, result: null, failure: null };
         delivery.operations.push(op);
         snapshot = store.recordDelivery(ref, snapshot.revision, delivery);
       }
@@ -135,6 +136,8 @@ function createDeliveryExecutor(deps) {
           }
           const currentPlan = await plan(ref);
           if (currentPlan.plan_digest !== command.payload.plan_digest) C.fail("delivery_plan_changed");
+          op.checkpoint = C.sealed({ plan: currentPlan, branch_sha: null });
+          save("publication_preflight");
           await mutationReady(currentPlan);
           let oid = await remote.branch(currentPlan.branch);
           if (oid !== null && oid !== ref.result_sha) C.fail("delivery_branch_collision");
@@ -144,6 +147,7 @@ function createDeliveryExecutor(deps) {
           }
           oid = await remote.branch(currentPlan.branch);
           if (oid !== ref.result_sha) C.fail("delivery_branch_readback_failed");
+          op.checkpoint = C.sealed({ plan: currentPlan, branch_sha: oid });
           save("branch_observed");
           // Remote effects that completed during archive remain factual history;
           // this guard prevents the next effect, never erases the branch.
@@ -197,7 +201,7 @@ function createDeliveryExecutor(deps) {
           const pipeline = deps.read_pipeline();
           delivery.completion = C.sealed({ version: 1, inspection_digest: delivery.inspection.digest, merge: merged,
             expected: { installation_id: ref.installation_id, project_id: ref.project_id, manifest_digest: ref.batch_manifest_digest, pipeline_digest: pipeline.pipeline.pipeline_digest },
-            tasks: manifest.staged_tasks.map((s) => s.work_task_ref), issues: [], pipeline_recorded: false });
+            inspection: C.clone(delivery.inspection), tasks: manifest.staged_tasks.map((s) => s.work_task_ref), issues: [], pipeline_recorded: false });
           save("completion_intent");
         }
         guard();
@@ -207,6 +211,7 @@ function createDeliveryExecutor(deps) {
           candidate_ref: ref, manifest_digest: manifest.delivery_manifest_digest, base_sha: ref.base_sha, result_sha: ref.result_sha,
           result_tree: manifest.evidence.tree.result_tree_sha, merge_sha: merged.merge_sha, merge_tree: merged.merge_tree, work_task_refs: completion.tasks } });
         completion.pipeline_recorded = true;
+        completion.closure_inspection_digest = delivery.inspection.digest;
         delete completion.digest; delivery.completion = C.sealed(completion); save("tasks_delivered");
         for (const item of uniqueItems(manifest)) {
           const required = manifest.frozen_batch_manifest.tasks.filter((t) => same(t.ref.work_item, item)).map((t) => t.ref);
@@ -215,7 +220,7 @@ function createDeliveryExecutor(deps) {
           let reason = null;
           if (required.some((r) => !pipeline.pipeline.tasks.some((slot) => same(slot.work_task_ref, r) && slot.state === "delivered"))) reason = "tasks_remaining";
           if (required.some((r) => !delivery.inspection.complete_scope_tasks.some((attested) => same(attested, r)))) reason = "full_scope_attestation_required";
-          let record = { work_item: item, state: "open", reason };
+          let record = { work_item: item, state: "open", reason, inspection_digest: delivery.inspection.digest };
           if (!reason) {
             guard();
             const fresh = await remote.issue(item.number);
@@ -230,7 +235,7 @@ function createDeliveryExecutor(deps) {
               guard(); if (immediatelyBefore.state !== "closed") await remote.closeIssue(item.number);
               const readback = await remote.issue(item.number);
               if (readback.state !== "closed" || required.some((r) => r.issue_body_revision !== issueContractRevision(readback.body))) C.fail("delivery_issue_close_unknown");
-              record = { work_item: item, state: "closed", reason: null };
+              record = { work_item: item, state: "closed", reason: null, inspection_digest: delivery.inspection.digest };
             }
           }
           completion.issues = completion.issues.filter((x) => !same(x.work_item, item)).concat([record]);
@@ -238,6 +243,7 @@ function createDeliveryExecutor(deps) {
         }
         return done({ completion_digest: delivery.completion.digest, merge_sha: merged.merge_sha, issues: completion.issues, candidate_revision: snapshot.revision + 1 });
       } catch (error) {
+        if (error?.code === "merged_unverified" && error.facts) op.checkpoint = C.sealed({ merge_observation: error.facts });
         op.failure = /^[a-z][a-z0-9_]{2,127}$/.test(error?.code || "") ? error.code : "delivery_operation_unknown";
         delivery.operations = delivery.operations.map((entry) => entry.idempotency_key === op.idempotency_key ? C.clone(op) : entry);
         store.recordDelivery(ref, snapshot.revision, delivery);
@@ -245,19 +251,26 @@ function createDeliveryExecutor(deps) {
       }
     }, deadline);
   }
+  function unverified(pull, object = null) {
+    const error = new C.DeliveryExecutionError("merged_unverified");
+    error.facts = { pr_number: pull.number, state: pull.state, original_head: pull.head,
+      base_branch: pull.base_branch, merge_sha: pull.merge_sha, merged_at: pull.merged_at,
+      merge_tree: object?.tree || null };
+    throw error;
+  }
   async function verifyMerged(snapshot, delivery) {
     guard();
     const ref = snapshot.delivery_candidate_ref, publication = delivery.publication;
     const pull = await remote.readPull(publication.pull.number);
     const seal = [...delivery.premerge_seals].reverse().find((entry) => Date.parse(entry.observed_at) < Date.parse(pull.merged_at));
-    if (!seal || pull.state !== "MERGED" || pull.head !== ref.result_sha || pull.repository !== publication.plan.repository || pull.base_branch !== publication.plan.base_branch || pull.head_branch !== publication.plan.branch) C.fail("merged_unverified");
+    if (!seal || pull.state !== "MERGED" || pull.head !== ref.result_sha || pull.repository !== publication.plan.repository || pull.base_branch !== publication.plan.base_branch || pull.head_branch !== publication.plan.branch) unverified(pull);
     C.assertSeal(seal);
-    if (seal.ref.result_sha !== ref.result_sha || seal.ref.base_sha !== ref.base_sha || seal.manifest_digest !== snapshot.delivery_manifest.delivery_manifest_digest || seal.publication_digest !== publication.digest) C.fail("merged_unverified");
-    if (Object.values(seal.evidence.reviews).some((r) => Date.parse(r.submitted_at) > Date.parse(seal.observed_at))) C.fail("merged_unverified");
+    if (seal.ref.result_sha !== ref.result_sha || seal.ref.base_sha !== ref.base_sha || seal.manifest_digest !== snapshot.delivery_manifest.delivery_manifest_digest || seal.publication_digest !== publication.digest) unverified(pull);
+    if (Object.values(seal.evidence.reviews).some((r) => Date.parse(r.submitted_at) > Date.parse(seal.observed_at))) unverified(pull);
     await deps.revalidate_sealed_reviews(seal.evidence, pull);
     const object = await remote.mergedObjects(pull.merge_sha, pull.base_branch);
     if (!object.reachable || object.tree !== seal.result_tree || object.parents[0] !== ref.base_sha ||
-        !(object.parents.length === 1 || object.parents.length === 2 && object.parents[1] === ref.result_sha)) C.fail("merged_unverified");
+        !(object.parents.length === 1 || object.parents.length === 2 && object.parents[1] === ref.result_sha)) unverified(pull, object);
     guard();
     return { version: 1, premerge_seal_digest: seal.digest, pr_number: pull.number, merge_sha: object.sha,
       merge_tree: object.tree, parents: object.parents, merged_at: pull.merged_at, original_head: pull.head, target_tip: object.target_tip };
@@ -269,7 +282,14 @@ function createDeliveryExecutor(deps) {
     if (!op?.result) C.fail("delivery_replay_unproven");
     return C.clone(op.result);
   }
-  return Object.freeze({ execute, plan, replay });
+  async function resume(command) {
+    C.assertPayload(command.action, command.payload);
+    if (!same(command.binding, binding)) C.fail("delivery_binding_denied");
+    owned(command.payload.delivery_candidate_ref);
+    if (!readOperation(composed(command.payload.delivery_candidate_ref), command)) C.fail("delivery_replay_unproven");
+    return execute(command);
+  }
+  return Object.freeze({ execute, plan, replay, resume });
 }
 function assertPull(pull, plan, ref) {
   if (pull.repository !== plan.repository || pull.head_branch !== plan.branch || pull.base_branch !== plan.base_branch || pull.head !== ref.result_sha || pull.base !== ref.base_sha || pull.draft || pull.state !== "OPEN" ||

@@ -209,8 +209,8 @@ function ok(condition, message) {
   assert.equal(cut.decision.kind, "accepted");
   assert.equal(cut.result.status.revision, 3);
   assert.equal(cut.result.status.cut_safe, false);
-  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]),
-    "only the eight pipeline actions plus the two reads and two controls of #1036/#1044 are exposed");
+  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "form_delivery", "publish_delivery", "inspect_delivery", "complete_delivery"]),
+    "only the fixed pipeline, project and delivery actions are exposed");
   ok(calls.get_pipeline_status === 4 && calls.put_batch_manifest === 1 && calls.freeze_batch_manifest === 1 && calls.cut_batch === 1,
     "each accepted action delegates once to its fixed owning pipeline action");
 
@@ -591,7 +591,7 @@ function ok(condition, message) {
 {
   assert.throws(() => createHeadControlPlane({ binding, domain: {} }),
     (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_options");
-  await assert.rejects(() => plane().core.execute({ ...request("get_pipeline_status"), action: "publish_delivery" }),
+  await assert.rejects(() => plane().core.execute({ ...request("get_pipeline_status"), action: "merge_delivery" }),
     (error) => error instanceof HeadControlPlaneError && error.code === "head_control_action_unsupported");
   await assert.rejects(() => plane().core.execute(request("put_batch_manifest", {
     payload: { manifest: { oversized: "x".repeat(128 * 1024 + 1) } },

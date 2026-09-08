@@ -23,7 +23,7 @@ function stable(value) {
 function digest(value) { return crypto.createHash("sha256").update(stable(value)).digest("hex"); }
 function clone(value) { return JSON.parse(JSON.stringify(value)); }
 function bounded(value) { if (Buffer.byteLength(stable(value)) > 384 * 1024) fail("delivery_record_too_large"); return value; }
-function sha(value) { if (typeof value !== "string" || !/^[a-f0-9]{40}$/.test(value)) fail("delivery_sha_invalid"); return value; }
+function sha(value) { if (typeof value !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value)) fail("delivery_sha_invalid"); return value; }
 function hash(value) { if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) fail("delivery_digest_invalid"); return value; }
 function text(value, max = 160) { if (typeof value !== "string" || !value.length || value.length > max || /[\u0000-\u001f]/.test(value)) fail("delivery_input_invalid"); return value; }
 function revision(value) { if (!Number.isSafeInteger(value) || value < 0) fail("delivery_revision_invalid"); return value; }
@@ -58,9 +58,10 @@ function assertDelivery(value) {
   if (value.version !== 1 || !Array.isArray(value.operations) || value.operations.length > 64 || !Array.isArray(value.premerge_seals) || value.premerge_seals.length > 16) fail("delivery_record_invalid");
   const keys = new Set(), correlations = new Set();
   for (const op of value.operations) {
-    exact(op, ["action", "idempotency_key", "correlation_id", "fingerprint", "step", "result", "failure"]);
+    exact(op, ["action", "idempotency_key", "correlation_id", "fingerprint", "step", "checkpoint", "result", "failure"]);
     if (!ACTIONS.includes(op.action) || keys.has(op.idempotency_key) || correlations.has(op.correlation_id)) fail("delivery_operation_invalid");
     text(op.idempotency_key); text(op.correlation_id); hash(op.fingerprint); text(op.step); keys.add(op.idempotency_key); correlations.add(op.correlation_id);
+    if (op.checkpoint !== null) assertSeal(op.checkpoint);
     if (op.result !== null) assertSeal(op.result);
     if (op.failure !== null && !/^[a-z][a-z0-9_]{2,127}$/.test(op.failure)) fail("delivery_operation_invalid");
   }
@@ -70,4 +71,17 @@ function assertDelivery(value) {
   if (value.completion !== null) assertSeal(value.completion);
   bounded(value); return value;
 }
-module.exports = { ACTIONS, ISOLATION_REASONS, OPERATOR_REASONS, DeliveryExecutionError, fail, plain, exact, stable, digest, clone, bounded, sha, hash, text, revision, assertPayload, sealed, assertSeal, initialDelivery, assertDelivery };
+function actionSchema(action) {
+  const ref = { type: "object", properties: { version: { const: 1 }, installation_id: { type: "string" }, project_id: { type: "string" }, repository_key: { type: "string" }, batch_manifest_digest: { type: "string" }, delivery_mode: { enum: ["integrated", "isolated"] }, base_sha: { type: "string" }, result_sha: { type: "string" }, cut_id: { type: "string" } }, required: ["version", "installation_id", "project_id", "repository_key", "batch_manifest_digest", "delivery_mode", "base_sha", "result_sha", "cut_id"], additionalProperties: false };
+  const properties = { delivery_candidate_ref: ref };
+  if (action === "form_delivery") Object.assign(properties, { classification: { enum: ["ordinary", "operator_gated"] }, release_intent: { type: "string", maxLength: 160 }, rollback_group: { type: "string", maxLength: 160 }, isolation_reasons: { type: "array", items: { enum: ISOLATION_REASONS }, uniqueItems: true }, operator_reasons: { type: "array", items: { enum: OPERATOR_REASONS }, uniqueItems: true } });
+  else {
+    properties.expected_candidate_revision = { type: "integer", minimum: 0 };
+    if (action === "publish_delivery") properties.plan_digest = { type: "string", pattern: "^[a-f0-9]{64}$" };
+    else if (action === "inspect_delivery") Object.assign(properties, { phase: { enum: ["before_merge", "after_merge"] }, judgment: { const: "approved" }, complete_scope_tasks: { type: "array", maxItems: 64, items: { type: "object" }, description: "Exact frozen WorkTaskRefs which Head attests cover their entire approved ticket scope; empty before merge." } });
+    else if (action === "complete_delivery") properties.inspection_digest = { type: "string", pattern: "^[a-f0-9]{64}$" };
+    else fail("delivery_action_unsupported");
+  }
+  return { type: "object", properties, required: Object.keys(properties), additionalProperties: false };
+}
+module.exports = { ACTIONS, ISOLATION_REASONS, OPERATOR_REASONS, DeliveryExecutionError, fail, plain, exact, stable, digest, clone, bounded, sha, hash, text, revision, assertPayload, actionSchema, sealed, assertSeal, initialDelivery, assertDelivery };

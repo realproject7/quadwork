@@ -396,7 +396,9 @@ function createDeliveryCandidateStore(options) {
     readSnapshot(ref);
     return files.withAsyncWriterLock(`${target.state}.execution`, action, deadline);
   }
-  return freeze({ readSnapshot, initialize, recordComposed, recordDelivery, withExecution });
+  const store = { readSnapshot, initialize, recordComposed };
+  Object.defineProperties(store, { recordDelivery: { value: recordDelivery }, withExecution: { value: withExecution } });
+  return freeze(store);
 }
 
 module.exports = {

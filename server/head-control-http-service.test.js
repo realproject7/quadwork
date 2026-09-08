@@ -386,7 +386,7 @@ for (const [label, live] of [
     authenticateToken() {}, resolveLaunchBinding() {}, resolveHeadControlService() {}, extra: true,
   }), TypeError);
   const source = fs.readFileSync(path.join(__dirname, "head-control-http-service.js"), "utf8");
-  assert.doesNotMatch(source, /require\s*\(/);
+  assert.doesNotMatch(source.replace('require("./delivery-execution-contract")', ""), /require\s*\(/);
   // The fixed tool and field names of #1036/#1044 necessarily spell "monitor"
   // and "worker"; strip those identifiers so the guard still catches a real
   // capability (a listener, filesystem, shell, chat, or GitHub access).

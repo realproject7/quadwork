@@ -395,7 +395,7 @@ function createHeadControlPlane(options) {
     try { observed = await observe(input); }
     catch (error) {
       if (error instanceof HeadControlPlaneError && error.code === "head_control_domain_invalid_status") return { error: error.code };
-      return { error: input.action === "cut_batch" ? "head_control_unsafe_cut" : "head_control_domain_rejected", detail: DELIVERY.ACTIONS.includes(input.action) ? { code: /^[a-z][a-z0-9_]{2,127}$/.test(error?.code || "") ? error.code : "delivery_operation_unknown" } : null };
+      return { error: input.action === "cut_batch" ? "head_control_unsafe_cut" : "head_control_domain_rejected", detail: DELIVERY.ACTIONS.includes(input.action) ? { code: /^[a-z][a-z0-9_]{2,127}$/.test(error?.code || "") ? error.code : "delivery_operation_unknown", ...(error?.code === "merged_unverified" && error.facts ? { facts: DELIVERY.bounded(error.facts) } : {}) } : null };
     }
     try {
       const status = observed.status;

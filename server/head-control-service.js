@@ -288,6 +288,27 @@ function createHeadControlService(options) {
       fail("head_control_durable_identity_collision", "durable Head-control identity is already used");
     }
     const record = byCorrelation;
+    // A remote timeout was truthfully denied and stays immutable. Only the
+    // four delivery owners can prove an exact durable intent and resume it.
+    // A successful reconciliation appends a deterministic, separately named
+    // receipt; it never rewrites the first denial or enables generic retry.
+    const delivery = require("./delivery-execution-contract");
+    if (delivery.ACTIONS.includes(command.action) && record.action === command.action && record.decision === "denied" &&
+        typeof options.domain.resume_delivery === "function" && sameBinding(command.principal, owner) && command.expected_revision === record.preconditions.expected_revision) {
+      exact(command, ["version", "action", "principal", "expected_revision", "idempotency_key", "correlation_id", "payload"], "head_control_durable_replay_ambiguous");
+      const invocation = { version: command.version, action: command.action, binding: command.principal, expected_revision: command.expected_revision,
+        idempotency_key: command.idempotency_key, correlation_id: command.correlation_id, payload: delivery.assertPayload(command.action, command.payload) };
+      const key = `delivery_reconcile_${delivery.digest(command)}`;
+      const reconciled = records.find((entry) => entry.correlation_id === key && entry.idempotency_key === key);
+      if (reconciled) return replay(reconciled, await options.domain.replay_delivery(invocation));
+      const resumed = await options.domain.resume_delivery(invocation);
+      const result = freeze({ action: command.action, applied: true, status: resumed.status });
+      const audit = { version: VERSION, binding: owner, action: command.action, correlation_id: key, idempotency_key: key,
+        expected_revision: command.expected_revision, decision: "accepted", code: "head_control_delivery_reconciled", result };
+      const response = freeze({ version: VERSION, decision: { kind: "accepted", code: audit.code }, result, audit, detail: resumed.detail });
+      persistOrFail(response, command);
+      return response;
+    }
     const localByCorrelation = localCorrelations.get(record.correlation_id);
     const localByIdempotency = localIdempotencies.get(record.idempotency_key);
     const fingerprint = commandFingerprint(command);

@@ -76,7 +76,10 @@ function createDeliveryPublicationPlanService(value) {
     const repository = manifest.registered_repository.repository;
     if (typeof repository !== "string" || !REPOSITORY_RE.test(repository)) fail("delivery_publication_plan_invalid", "registered repository is invalid");
     const branch = `quadwork/delivery-${hash({ delivery_candidate_key: deliveryCandidateKey(ref), delivery_manifest_digest: manifest.delivery_manifest_digest }).slice(0, 32)}`;
-    const workItems = manifest.staged_tasks.map((stage) => ({ repo: stage.work_item.repo, number: stage.work_item.number, kind: stage.work_item.kind }));
+    const workItems = [...new Map(manifest.staged_tasks.map((stage) => {
+      const item = { repo: stage.work_item.repo, number: stage.work_item.number, kind: stage.work_item.kind };
+      return [`${item.repo.toLowerCase()}#${item.number}:${item.kind}`, item];
+    })).values()];
     const title = `[QuadWork] Delivery ${ref.cut_id}`;
     const body = [
       "<!-- quadwork-delivery-candidate -->",

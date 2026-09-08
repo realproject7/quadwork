@@ -686,7 +686,7 @@ routes.setDeliveryPublicationPlanReader((projectId, ref) => headControlRuntime.r
 
 // Resolve one canonical repository transport on each fixed command. No caller
 // path, arbitrary executable, remote override or credential crosses this seam.
-function createHeadDeliveryService({ binding, domain }) {
+function createHeadDeliveryService({ binding, domain, is_binding_current }) {
   function forRef(ref) {
     const cfg = readConfig();
     const project = cfg.projects?.find((entry) => entry?.id === binding.project_id && entry.archived !== true);
@@ -700,6 +700,7 @@ function createHeadDeliveryService({ binding, domain }) {
     const plan = require("./repository-provisioning").buildRepositoryWorktreePlan(allRepositories(project), { primaryAgentCwds, repositoryWorktrees: {} });
     const selected = plan.find((entry) => entry.key === ref.repository_key);
     if (!selected) throw new TypeError("delivery repository unavailable");
+    const canonicalDirectory = fs.realpathSync(selected.working_dir);
     return routes.createDeliveryExecutionService({ binding, domain, repository: selected.canonical_repo, cwd: selected.working_dir,
       read_source: (request) => deliverySourceForProject(binding.project_id).readStagedSource(request),
       is_current: () => {
@@ -707,12 +708,14 @@ function createHeadDeliveryService({ binding, domain }) {
         const session = agentSessions.get(`${binding.project_id}/head`);
         const currentProject = currentCfg.projects?.find((entry) => entry?.id === binding.project_id && entry.archived !== true);
         const repository = currentProject ? allRepositories(currentProject).find((entry) => entry.key === ref.repository_key) : null;
-        return currentCfg.installation_id === binding.installation_id && repository?.repo?.toLowerCase() === selected.canonical_repo &&
+        return is_binding_current() && currentCfg.installation_id === binding.installation_id && repository?.repo?.toLowerCase() === selected.canonical_repo &&
+          fs.realpathSync(repository.working_dir) === canonicalDirectory &&
           admission.generation === binding.generation && isAdmissionCurrent(admission) && session?.state === "running" && !!session.term && session.lifecycleState === "verified";
       },
     });
   }
   return Object.freeze({ execute: (command) => forRef(command.payload.delivery_candidate_ref).execute(command),
+    resume: (command) => forRef(command.payload.delivery_candidate_ref).resume(command),
     replay: (command) => forRef(command.payload.delivery_candidate_ref).replay(command), plan: (ref) => forRef(ref).plan(ref) });
 }
 

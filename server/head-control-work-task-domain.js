@@ -352,8 +352,18 @@ function pending(value, state, owner, code) {
   };
 }
 function assertState(value, owner, adoptGeneration = false) {
-  exact(value, ["schema_version", "binding", "revision", "stage", "manifest", "pipeline_digest", "pending", ...(Object.hasOwn(value, "delivery_formation") ? ["delivery_formation"] : [])], "invalid_head_control_work_task_state");
+  exact(value, ["schema_version", "binding", "revision", "stage", "manifest", "pipeline_digest", "pending", ...(Object.hasOwn(value, "delivery_formation") ? ["delivery_formation"] : []), ...(Object.hasOwn(value, "delivery_operations") ? ["delivery_operations"] : [])], "invalid_head_control_work_task_state");
   if (value.delivery_formation != null) deliveryContract.assertSeal(value.delivery_formation);
+  if (Object.hasOwn(value, "delivery_operations")) {
+    if (!Array.isArray(value.delivery_operations) || value.delivery_operations.length > 64) fail("invalid_head_control_work_task_state");
+    for (const operation of value.delivery_operations) {
+      exact(operation, ["action", "idempotency_key", "correlation_id", "fingerprint", "candidate_key"], "invalid_head_control_work_task_state");
+      if (!deliveryContract.ACTIONS.includes(operation.action)) fail("invalid_head_control_work_task_state");
+      identifier(operation.idempotency_key, "invalid_head_control_work_task_state"); identifier(operation.correlation_id, "invalid_head_control_work_task_state");
+      digest(operation.fingerprint, "invalid_head_control_work_task_state"); deliveryContract.text(operation.candidate_key, 4096);
+    }
+    if (new Set(value.delivery_operations.map((op) => op.idempotency_key)).size !== value.delivery_operations.length || new Set(value.delivery_operations.map((op) => op.correlation_id)).size !== value.delivery_operations.length) fail("invalid_head_control_work_task_state");
+  }
   if (value.schema_version !== SCHEMA_VERSION) fail("unknown_head_control_work_task_state_schema", "domain state schema is unsupported");
   const storedBinding = binding(value.binding, "invalid_head_control_work_task_state");
   // Only the explicit initialize() transition may read state left by an
@@ -370,6 +380,7 @@ function assertState(value, owner, adoptGeneration = false) {
     pipeline_digest: digest(value.pipeline_digest, "invalid_head_control_work_task_state", true),
     pending: null,
     ...(Object.hasOwn(value, "delivery_formation") ? { delivery_formation: clone(value.delivery_formation) } : {}),
+    ...(Object.hasOwn(value, "delivery_operations") ? { delivery_operations: clone(value.delivery_operations) } : {}),
   };
   if (!new Set(["empty", "manifest", "frozen"]).has(state.stage)) fail("invalid_head_control_work_task_state", "domain stage is invalid");
   // An empty stage is revision 0 before the first manifest and revision N+1
@@ -958,6 +969,25 @@ function createHeadControlWorkTaskDomain(options) {
     assertCurrentManifest(current.state.manifest, options.resolve_registered_identity);
     return freeze({ state: current.state, pipeline: current.pipeline, status: statusFor(current.state, current.pipeline) });
   }
+  // Reserve the Head request identity across candidates in this frozen batch
+  // before a remote effect. This closes the crash-before-Head-audit window;
+  // one candidate's own store cannot detect a key reused on another candidate.
+  function record_delivery_intent(command) {
+    deliveryContract.assertPayload(command.action, command.payload);
+    if (!sameBinding(command.binding, owner)) fail("head_control_delivery_denied");
+    const ref = command.payload.delivery_candidate_ref;
+    return files.withWriterLock(statePath, () => {
+      const state = currentState();
+      if (state.stage !== "frozen" || state.manifest.manifest_digest !== ref.batch_manifest_digest) fail("head_control_delivery_stale");
+      const operations = state.delivery_operations || [];
+      const incoming = { action: command.action, idempotency_key: command.idempotency_key, correlation_id: command.correlation_id,
+        fingerprint: deliveryContract.digest(command), candidate_key: require("./delivery-candidate").deliveryCandidateKey(ref) };
+      const prior = operations.find((entry) => entry.idempotency_key === incoming.idempotency_key || entry.correlation_id === incoming.correlation_id);
+      if (prior) { if (!same(prior, incoming)) fail("head_control_delivery_identity_collision"); return; }
+      if (operations.length >= 64) fail("head_control_delivery_history_full");
+      writeState(files, statePath, { ...state, delivery_operations: [...operations, incoming] }, owner);
+    });
+  }
   function record_delivery_formation(command, facts) {
     const payload = deliveryContract.assertPayload("form_delivery", command.payload);
     if (!sameBinding(command.binding, owner) || command.action !== "form_delivery") fail("head_control_delivery_denied");
@@ -984,6 +1014,7 @@ function createHeadControlWorkTaskDomain(options) {
   Object.defineProperty(domain, "initialize", { value: initialize, enumerable: false });
   Object.defineProperty(domain, "project_current_batch", { value: project_current_batch, enumerable: false });
   Object.defineProperty(domain, "delivery_context", { value: delivery_context, enumerable: false });
+  Object.defineProperty(domain, "record_delivery_intent", { value: record_delivery_intent, enumerable: false });
   Object.defineProperty(domain, "record_delivery_formation", { value: record_delivery_formation, enumerable: false });
   return freeze(domain);
 }

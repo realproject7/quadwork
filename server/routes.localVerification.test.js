@@ -125,7 +125,7 @@ function evidenceBody(extra = {}) {
     const nonce = await invoke("/api/review-cycle-nonce", role, { target_identity_digest });
     assert.equal(nonce.statusCode, 200, JSON.stringify(nonce.body));
     const review_id = index + 1;
-    reviewRows.set(review_id, { id: review_id, state: "APPROVED", commit_id: result_sha, pull_request_url: "https://api.github.com/repos/owner/web/pulls/1062", submitted_at: new Date().toISOString(), body: nonce.body.nonce });
+    reviewRows.set(review_id, { id: review_id, state: "APPROVED", commit_id: result_sha, pull_request_url: "https://api.github.com/repos/owner/web/pulls/1062", submitted_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"), body: nonce.body.nonce });
     const receipt = await invoke("/api/review-cycle-receipt", role, { target_identity_digest, review_id, nonce: nonce.body.nonce });
     assert.equal(receipt.statusCode, 200, JSON.stringify(receipt.body));
   }
@@ -134,6 +134,19 @@ function evidenceBody(extra = {}) {
   assert.equal(submitted.statusCode, 200, JSON.stringify(submitted.body));
   assert.equal(currentCycle().ci_state, "ci_less_pass");
   assert.equal(gateMessages().length, 1, "passing receipt advances the already-open cycle exactly once");
+  // #1060 uses the real existing owner, not a synthetic approval boolean.
+  // GitHub uses second precision, while durable receipt timestamps normalize
+  // to milliseconds; equivalent instants must retain native standing.
+  const deliveryEvidence = routes.createDeliveryReviewEvidenceService(project_id);
+  assert.match(currentCycle().receipts.re1.submitted_at, /\.000Z$/);
+  const sealed = await deliveryEvidence.read_merge_gate(candidate.delivery_candidate_ref, 1062);
+  assert.equal(sealed.ready, true); assert.equal(sealed.verification.record_id, submitted.body.record.record_id);
+  assert.equal(commands.some((row) => /check-runs|\/status(?:\?|$)/.test(row.args[1])), false, "premerge local proof never reads hosted check/status APIs");
+  const originalReview = { ...reviewRows.get(1) };
+  reviewRows.get(1).state = "DISMISSED";
+  await assert.rejects(() => deliveryEvidence.revalidate_sealed_reviews(sealed), (error) => error.code === "delivery_review_integrity_lost");
+  reviewRows.set(1, originalReview);
+  await deliveryEvidence.revalidate_sealed_reviews(sealed);
   const repeated = await invoke("/api/delivery-candidate/ci-evidence", "dev", evidenceBody());
   assert.equal(repeated.statusCode, 200);
   assert.equal(repeated.body.record.record_id, submitted.body.record.record_id);
@@ -166,6 +179,11 @@ function evidenceBody(extra = {}) {
   const withoutHead = await invoke("/api/delivery-candidate/ci-evidence", "dev", evidenceBody());
   assert.equal(withoutHead.statusCode, 200);
   assert.equal(currentCycle(), undefined, "Dev receipt alone cannot open a new Head-owned final review");
+  // A terminalized old cycle retains its immutable proof for MERGED facts;
+  // sealed review validation does not call the OPEN-only context reader.
+  pull = { ...pull, state: "closed", merged_at: new Date().toISOString(), base: { sha: "8".repeat(40) } };
+  await deliveryEvidence.revalidate_sealed_reviews(sealed);
+  pull = { ...pull, state: "open", merged_at: null, base: { sha: base_sha } };
   selectedPolicy = { version: 1, mode: "github-checks", registration_grace_seconds: 0, same_sha_retry_budget: 0, checks: [{ name: "unit", required: true, kind: "product" }] };
   writeConfig(); checksUnavailable = false;
   const external = await routes.githubStateFetcher("owner/web");

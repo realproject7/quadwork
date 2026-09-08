@@ -1092,10 +1092,8 @@ const { TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND } = require("./delivery-review-
 
 // #1060: scoped executor composition shares the existing exact-review and
 // local-evidence owners. All Git/GitHub children use the control budget helper.
-function createDeliveryExecutionService({ binding, domain, read_source, repository, cwd, is_current }) {
+function createDeliveryReviewEvidenceService(projectId) {
   const C = require("./delivery-execution-contract");
-  const remote = require("./delivery-remote").createDeliveryRemote({ repository, cwd, run: _execFileAsync });
-  const pipelineStore = require("./work-task-pipeline-store").createWorkTaskPipelineStore({ config_dir: CONFIG_DIR, fs });
   async function nativeReviews(evidence) {
     const target = evidence.target.identity;
     for (const role of ["re1", "re2"]) {
@@ -1104,11 +1102,11 @@ function createDeliveryExecutionService({ binding, domain, read_source, reposito
       const { stdout } = await _execFileAsync("gh", ["api", `repos/${target.repo}/pulls/${target.pr_number}/reviews/${receipt.review_id}`], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
       const review = JSON.parse(stdout);
       if (String(review.id) !== String(receipt.review_id) || review.state !== "APPROVED" || review.commit_id !== target.exact_sha ||
-          review.submitted_at !== receipt.submitted_at || review.pull_request_url?.toLowerCase() !== `https://api.github.com/repos/${target.repo.toLowerCase()}/pulls/${target.pr_number}`) C.fail("delivery_review_integrity_lost");
+          !Number.isFinite(Date.parse(review.submitted_at)) || Date.parse(review.submitted_at) !== Date.parse(receipt.submitted_at) || review.pull_request_url?.toLowerCase() !== `https://api.github.com/repos/${target.repo.toLowerCase()}/pulls/${target.pr_number}`) C.fail("delivery_review_integrity_lost");
     }
   }
   async function read_merge_gate(ref, prNumber) {
-    const current = await freshDeliveryFinalReviewContext(binding.project_id, ref, prNumber);
+    const current = await freshDeliveryFinalReviewContext(projectId, ref, prNumber);
     const policy = current.binding.ci_policy;
     if (policy?.mode === "github-checks") {
       const { stdout } = await _execFileAsync("gh", ["api", `repos/${current.binding.repo}/commits/${ref.result_sha}/check-runs?per_page=100`], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
@@ -1116,8 +1114,8 @@ function createDeliveryExecutionService({ binding, domain, read_source, reposito
       if (!Array.isArray(response.check_runs) || response.total_count > response.check_runs.length) C.fail("delivery_checks_incomplete");
       current.pr.checkEvidence = normalizeGithubCheckEvidence(response, { exact_sha: ref.result_sha, observed_at: new Date().toISOString(), source_status: "ok" });
     }
-    observeDeliveryReview(binding.project_id, current, captureProjectAdmission(binding.project_id));
-    const cycles = Object.values(_reviewCycleStore.load(binding.project_id).cycles);
+    observeDeliveryReview(projectId, current, captureProjectAdmission(projectId));
+    const cycles = Object.values(_reviewCycleStore.load(projectId).cycles);
     const cycle = cycles.find((entry) => entry.state === "current" && entry.target_identity_digest === current.target.target_identity_digest);
     if (!cycle || !require("./review-cycle").headGateDue(cycle)) C.fail("delivery_merge_gate_pending");
     const evidence = { ready: true, target: current.target, cycle_id: cycle.cycle_id, reviews: cycle.receipts,
@@ -1126,6 +1124,18 @@ function createDeliveryExecutionService({ binding, domain, read_source, reposito
     await nativeReviews(evidence);
     return C.clone(evidence);
   }
+  async function revalidate_sealed_reviews(evidence) {
+    const cycle = _reviewCycleStore.load(projectId).cycles[evidence.cycle_id];
+    if (!cycle || cycle.target_identity_digest !== evidence.target.target_identity_digest || C.stable(cycle.receipts) !== C.stable(evidence.reviews)) C.fail("delivery_review_integrity_lost");
+    await nativeReviews(evidence);
+  }
+  return Object.freeze({ read_merge_gate, revalidate_sealed_reviews });
+}
+function createDeliveryExecutionService({ binding, domain, read_source, repository, cwd, is_current }) {
+  const C = require("./delivery-execution-contract");
+  const remote = require("./delivery-remote").createDeliveryRemote({ repository, cwd, run: _execFileAsync });
+  const pipelineStore = require("./work-task-pipeline-store").createWorkTaskPipelineStore({ config_dir: CONFIG_DIR, fs });
+  const reviews = createDeliveryReviewEvidenceService(binding.project_id);
   return require("./delivery-executor").createDeliveryExecutor({ binding, domain, remote, read_source, is_current,
     store: createDeliveryCandidateStore({ config_dir: CONFIG_DIR, fs }), now: () => new Date().toISOString(),
     read_scope(ref) {
@@ -1137,12 +1147,8 @@ function createDeliveryExecutionService({ binding, domain, read_source, reposito
       return { assignment_digest: C.digest(context.fingerprint), policy: repositoryCiPolicy(context.project, ref.repository_key) };
     },
     observe_review: async (ref, number) => observeDeliveryReview(binding.project_id, await freshDeliveryFinalReviewContext(binding.project_id, ref, number), captureProjectAdmission(binding.project_id)),
-    read_merge_gate,
-    async revalidate_sealed_reviews(evidence) {
-      const cycle = _reviewCycleStore.load(binding.project_id).cycles[evidence.cycle_id];
-      if (!cycle || cycle.target_identity_digest !== evidence.target.target_identity_digest || C.stable(cycle.receipts) !== C.stable(evidence.reviews)) C.fail("delivery_review_integrity_lost");
-      await nativeReviews(evidence);
-    },
+    read_merge_gate: reviews.read_merge_gate,
+    revalidate_sealed_reviews: reviews.revalidate_sealed_reviews,
     read_pipeline: () => pipelineStore.readRecoverySnapshot({ installation_id: binding.installation_id, project_id: binding.project_id }),
     record_delivery: (input) => pipelineStore.recordDelivery(input),
   });
@@ -8301,3 +8307,5 @@ module.exports.repositoryUsesLocalVerification = repositoryUsesLocalVerification
 
 module.exports.createDeliveryExecutionService = createDeliveryExecutionService;
 module.exports.setDeliveryPublicationPlanReader = setDeliveryPublicationPlanReader;
+
+module.exports.createDeliveryReviewEvidenceService = createDeliveryReviewEvidenceService;

@@ -122,7 +122,7 @@ try {
 
 const DELIVERY = require("./delivery-execution-contract");
 const TOOL_DEFS = Object.freeze([
-  ...DELIVERY.ACTIONS.map((name) => Object.freeze({ name, description: "Execute the scoped, durable Head delivery operation. No merge, deploy, or Actions command is exposed.", inputSchema: { type: "object", properties: { expected_revision: { type: "integer", minimum: 0 }, idempotency_key: { type: "string" }, correlation_id: { type: "string" }, delivery: { type: "object" } }, required: ["expected_revision", "idempotency_key", "correlation_id", "delivery"], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } })),
+  ...DELIVERY.ACTIONS.map((name) => Object.freeze({ name, description: "Execute the scoped, durable Head delivery operation. No merge, deploy, or Actions command is exposed.", inputSchema: { type: "object", properties: { expected_revision: { type: "integer", minimum: 0 }, idempotency_key: { type: "string" }, correlation_id: { type: "string" }, delivery: DELIVERY.actionSchema(name) }, required: ["expected_revision", "idempotency_key", "correlation_id", "delivery"], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } })),
   Object.freeze({
     name: "get_pipeline_status",
     description: "Read the fixed Head pipeline status for this launch binding.",

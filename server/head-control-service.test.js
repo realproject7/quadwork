@@ -479,7 +479,7 @@ function ok(condition, message) {
     (error) => error instanceof HeadControlServiceError && error.code === "invalid_head_control_service_options");
   await assert.rejects(() => core.execute({ ...request("get_pipeline_status", {
     idempotency_key: "idem_unsupported_001", correlation_id: "corr_unsupported_001",
-  }), action: "publish_delivery" }),
+  }), action: "merge_delivery" }),
   (error) => error instanceof HeadControlPlaneError && error.code === "head_control_action_unsupported");
   const source = fs.readFileSync(path.join(__dirname, "head-control-service.js"), "utf8");
   assert.doesNotMatch(source, /require\s*\(\s*["'](?:node:)?(?:fs|path|http|https|child_process|net)["']\s*\)/);

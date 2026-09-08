@@ -132,6 +132,11 @@ function composeHeadDomain(owner, workTask, controls, delivery = null) {
       return { status: pipelineStatus(invocation), detail };
     };
     Object.defineProperty(composed, "replay_delivery", { enumerable: false, value: (invocation) => delivery.replay(invocation) });
+    Object.defineProperty(composed, "resume_delivery", { enumerable: false, value: async (invocation) => {
+      owned(invocation, invocation.action);
+      const detail = await delivery.resume(invocation);
+      return { status: pipelineStatus(invocation), detail };
+    } });
   }
   return composed;
 }
@@ -224,6 +229,7 @@ function createHeadControlRuntime(options) {
     }
     const old = tokenByProject.get(value.project_id);
     if (old) tokens.delete(old);
+    for (const key of services.keys()) if (key.includes(`:${value.project_id}:`)) services.delete(key);
     tokens.set(value.token, Object.freeze({
       installation_id: config.installation_id,
       project_id: value.project_id,
@@ -278,6 +284,17 @@ function createHeadControlRuntime(options) {
     });
   }
 
+  function deliveryService(owner, workTask) {
+    if (!options.create_delivery_service) return null;
+    const launchToken = tokenByProject.get(owner.project_id);
+    const term = options.agent_sessions.get(`${owner.project_id}/head`)?.term;
+    const is_binding_current = () => {
+      if (!launchToken || !term || tokenByProject.get(owner.project_id) !== launchToken || options.agent_sessions.get(`${owner.project_id}/head`)?.term !== term) return false;
+      try { return resolveLaunchBinding({ project_id: owner.project_id, actor: "head", generation: owner.generation }).active === true; } catch { return false; }
+    };
+    return options.create_delivery_service({ binding: owner, domain: workTask, is_binding_current });
+  }
+
   function resolveHeadControlService(value) {
     const owner = binding(value);
     const key = runtimeKey(owner);
@@ -287,7 +304,7 @@ function createHeadControlRuntime(options) {
     // Bootstrap is private runtime composition, never an MCP operation.
     workTask.initialize();
     const audit_store = createHeadControlAuditStore({ config_dir: options.config_dir, fs: options.fs });
-    const service = createHeadControlService({ binding: owner, domain: composeHeadDomain(owner, workTask, controls, options.create_delivery_service ? options.create_delivery_service({ binding: owner, domain: workTask }) : null), audit_store });
+    const service = createHeadControlService({ binding: owner, domain: composeHeadDomain(owner, workTask, controls, deliveryService(owner, workTask)), audit_store });
     services.set(key, service);
     return service;
   }
@@ -340,7 +357,7 @@ function createHeadControlRuntime(options) {
     const owner = currentReadBinding(projectId);
     const workTask = resolveOwnedDomain(owner);
     if (!options.create_delivery_service) throw new TypeError("delivery executor unavailable");
-    return options.create_delivery_service({ binding: owner, domain: workTask }).plan(ref);
+    return deliveryService(owner, workTask).plan(ref);
   }
 
   const http = createHeadControlHttpService({ authenticateToken, resolveLaunchBinding, resolveHeadControlService });
