@@ -222,9 +222,12 @@ function storageDirectory(configDir) {
 }
 function headControlAuditStorePath(configDir, bindingValue) {
   const owner = identity(bindingValue, "invalid_head_control_audit_store_identity");
+  return path.join(storageDirectory(configDir), "generations", `${owner.installation_id}--${owner.project_id}--generation-${owner.generation}.json`);
+}
+function legacyStorePath(configDir, owner) {
   return path.join(storageDirectory(configDir), `${owner.installation_id}--${owner.project_id}.json`);
 }
-function readState(fs, statePath, owner, allowMissing) {
+function readState(fs, statePath, owner, allowMissing, legacy = false) {
   let raw;
   try {
     const stats = fs.lstatSync(statePath);
@@ -252,7 +255,16 @@ function readState(fs, statePath, owner, allowMissing) {
   }
   let decoded;
   try { decoded = JSON.parse(raw); } catch { fail("corrupt_head_control_audit_store", "audit store JSON is corrupt"); }
-  try { return assertState(decoded, owner); }
+  try {
+    if (!legacy) return assertState(decoded, owner);
+    const storedOwner = identity(decoded.binding, "invalid_head_control_audit_store_state");
+    if (storedOwner.installation_id !== owner.installation_id || storedOwner.project_id !== owner.project_id || storedOwner.role !== owner.role) {
+      fail("head_control_audit_store_identity_mismatch", "legacy audit belongs to another project");
+    }
+    // A legacy generation is only an identity observation. Validate every
+    // receipt against that exact generation; never relabel or adopt receipts.
+    return assertState(decoded, storedOwner);
+  }
   catch (error) {
     if (error instanceof HeadControlAuditStoreError && error.code === "head_control_audit_store_identity_mismatch") throw error;
     fail("corrupt_head_control_audit_store", "audit store validation failed");
@@ -270,13 +282,28 @@ function createHeadControlAuditStore(options) {
   const directory = storageDirectory(options.config_dir);
   const directories = [{ path: options.config_dir, mode: DIRECTORY_MODE }, { path: directory, mode: DIRECTORY_MODE }];
 
+  const generationDirectories = [...directories, { path: path.join(directory, "generations"), mode: DIRECTORY_MODE }];
+
   function statePath(bindingValue) {
     return headControlAuditStorePath(options.config_dir, bindingValue);
+  }
+  function selectedState(owner) {
+    const legacyPath = legacyStorePath(options.config_dir, owner);
+    const legacy = readState(fs, legacyPath, owner, true, true);
+    const target = statePath(owner);
+    const current = files.storageExists(generationDirectories) ? readState(fs, target, owner, true) : null;
+    if (legacy && sameIdentity(legacy.binding, owner)) {
+      if (current !== null) fail("head_control_audit_store_ambiguous", "both current-generation audit histories exist");
+      // Same-generation upgrades retain the existing exact replay/collision
+      // history and its original writer lock. Higher generations never write it.
+      return { target: legacyPath, state: legacy };
+    }
+    return { target, state: current };
   }
   function read(bindingValue) {
     const owner = identity(bindingValue, "invalid_head_control_audit_store_identity");
     if (!files.storageExists(directories)) return freeze([]);
-    const state = readState(fs, statePath(owner), owner, true);
+    const { state } = selectedState(owner);
     return state === null ? freeze([]) : freeze(state.records.map(clone));
   }
   function append(input) {
@@ -285,9 +312,12 @@ function createHeadControlAuditStore(options) {
     const record = normalizeAuditRecord(input.audit);
     if (!sameIdentity(record.binding, owner)) fail("head_control_audit_append_identity_mismatch", "audit binding does not match project store");
     files.ensureDirectories(directories);
-    const target = statePath(owner);
+    const { target } = selectedState(owner);
+    if (target === statePath(owner)) files.ensureDirectories(generationDirectories);
     return files.withWriterLock(target, () => {
-      const current = readState(fs, target, owner, true) || {
+      const observed = selectedState(owner);
+      if (observed.target !== target) fail("head_control_audit_store_changed", "audit path changed before its writer lock");
+      const current = observed.state || {
         schema_version: SCHEMA_VERSION,
         binding: clone(owner),
         records: [],
