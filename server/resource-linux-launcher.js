@@ -199,8 +199,10 @@ class LinuxResourceLauncher {
       await this._confirmExit(record);
       return { code: exit.signal ? null : exit.exitCode, signal: exit.signal || null, ...(observation ? { scopeObservation: observation } : {}) };
     } catch (error) {
-      record.rejectStarted(error);
+      // Keep the admission lock until cleanup completes or installs its
+      // permanent uncertainty fence; callers cannot race a failed launch.
       await this.stopGeneration(record.generationId);
+      record.rejectStarted(error);
       throw error;
     }
   }

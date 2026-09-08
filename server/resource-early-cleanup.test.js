@@ -74,6 +74,7 @@ async function scenario(mode) {
     const launched = launcher.spawnPty({ projectId: "early-test", generationId: "early-generation", probe: true, command: process.execPath, args: [], cwd: root, env: {} });
     await assert.rejects(launched);
     if (mode === "absent-scope") {
+      assert.equal(fs.existsSync(temp), false, "failed admission settles only after successful cleanup");
       assert.deepEqual(await launcher.stopGeneration("early-generation"), { ok: true, owned: true });
       assert.equal(nativeExited, true);
       assert.equal(fs.existsSync(temp), false);
