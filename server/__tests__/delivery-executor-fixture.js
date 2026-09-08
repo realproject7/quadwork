@@ -42,9 +42,9 @@ function rejectsCode(fn, code) { return assert.rejects(fn, (error) => error.code
 
 function stage(ref, base_sha, candidate_sha, name) {
   const worktreePath = `/private/var/quadwork/${name}-dev`;
-  const candidate = buildWorkTaskCandidate({ version: 1, work_task_ref: copy(ref), base_sha, candidate_sha, branch: `task/${name}`, worktree: { repository_key: "web", worktree_id: `wt_web_${name}`, path: worktreePath } }, {
+  const candidate = buildWorkTaskCandidate({ version: 1, work_task_ref: copy(ref), base_sha, candidate_sha, branch: `task/${name}`, worktree: { repository_key: ref.repository_key, worktree_id: `wt_${ref.repository_key}_${name}`, path: worktreePath } }, {
     canonicalizePath(input) { return { version: 1, canonical_path: input.path }; },
-    inspectManagedWorktree(input) { return { version: 1, registered: true, readable: true, repository_key: "web", worktree_id: `wt_web_${name}`, canonical_path: input.expected.canonical_path, branch: `task/${name}`, base_sha, head_sha: candidate_sha, dirty: false, occupancy: "vacant" }; },
+    inspectManagedWorktree(input) { return { version: 1, registered: true, readable: true, repository_key: ref.repository_key, worktree_id: `wt_${ref.repository_key}_${name}`, canonical_path: input.expected.canonical_path, branch: `task/${name}`, base_sha, head_sha: candidate_sha, dirty: false, occupancy: "vacant" }; },
     readCanonicalInstalledState() { return { version: 1, installation_id, project_id, v1_state: "present" }; },
   });
   const opened = openTaskReviewRound({ version: 1, candidate: copy(candidate), attempt: `attempt_${name}`, round: 1, opened_at: "2026-09-04T08:01:00.000Z" }, { version: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 1 }, { reviewer_role: "re2", reviewer_generation: 1 }] });
@@ -55,7 +55,7 @@ function stage(ref, base_sha, candidate_sha, name) {
     receipt_anchors: released.release.receipts.map((entry) => ({ reviewer_role: entry.reviewer_role, reviewer_generation: entry.reviewer_generation, receipt_id: entry.receipt.receipt_id, receipt_digest: entry.receipt.receipt_digest, verdict: entry.receipt.verdict })).sort((left, right) => left.reviewer_role.localeCompare(right.reviewer_role)) } };
 }
 
-function repositoryFixture(directory) {
+function repositoryFixture(directory, { otherRepository = false } = {}) {
   const repository = path.join(directory, "web");
   fs.mkdirSync(repository, { recursive: true });
   git(repository, ["init", "-q", "-b", "main"]);
@@ -82,7 +82,7 @@ function repositoryFixture(directory) {
   const manifest = freezeBatchManifest(buildBatchManifest({ version: 1, installation_id, project_id, delivery_mode: "integrated", tasks: [
     { task_key: "a", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1061, kind: "issue" }, goal: "change a", file_boundary: ["pkg/alpha/a.js"], validation: ["node-test"], dependencies: [] },
     { task_key: "b", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1061, kind: "issue" }, goal: "change b", file_boundary: ["pkg/beta/a.js"], validation: ["node-test"], dependencies: [] },
-    { task_key: "c", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1062, kind: "issue" }, goal: "change c", file_boundary: ["pkg/gamma/a.js"], validation: ["node-test"], dependencies: [] },
+    { task_key: "c", repository_key: otherRepository ? "api" : "web", work_item: { repoKey: otherRepository ? "api" : "web", repo: otherRepository ? "Owner/Api" : "Owner/Web", number: 1062, kind: "issue" }, goal: "change c", file_boundary: ["pkg/gamma/a.js"], validation: ["node-test"], dependencies: [] },
   ] }, { resolveRegisteredIdentity(input) { return { ...input, work_item: copy(input.work_item), issue_body_revision: require("../issue-contract-revision").issueContractRevision("Approved complete scope") }; } }), "2026-09-04T08:00:00.000Z");
   const source = { version: 1, registered_repository: { version: 1, installation_id, project_id, repository_key: "web", repository: "Owner/Web" }, frozen_batch_manifest: manifest, delivery_mode: "integrated", cut_id: "cut_delivery_chain_1066", base_sha,
     staged_tasks: [stage(manifest.tasks[0].ref, base_sha, candidate_a, "a"), stage(manifest.tasks[1].ref, base_sha, candidate_b, "b"), stage(manifest.tasks[2].ref, base_sha, candidate_c, "c")], deferred_exclusions: [] };

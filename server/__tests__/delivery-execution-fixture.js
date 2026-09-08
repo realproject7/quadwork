@@ -23,9 +23,9 @@ const clock = { value: "2026-09-08T08:00:00.000Z" };
 const owner = F.owner;
 let serial = 0;
 function command(action, revision, payload) { const key = `delivery_${++serial}`; return { version: 1, action, binding: owner, expected_revision: revision, correlation_id: key, idempotency_key: key, payload }; }
-async function fixture({ prefix = false } = {}) {
+async function fixture({ prefix = false, otherRepository = false } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "qw-delivery-executor-"));
-  const repo = F.repositoryFixture(directory), configDir = F.configDirectory();
+  const repo = F.repositoryFixture(directory, { otherRepository }), configDir = F.configDirectory();
   let currentOwner = owner;
   let domain = createHeadControlWorkTaskDomain({ binding: owner, config_dir: configDir, fs,
     resolve_registered_identity: (input) => ({ ...input, issue_body_revision: issueContractRevision("Approved complete scope") }), now: () => clock.value });
@@ -97,7 +97,11 @@ async function fixture({ prefix = false } = {}) {
         return sealedEvidence;
       },
       revalidate_sealed_reviews: async (evidence) => { assert.equal(evidence.verification.results.length, 3); },
-      read_pipeline: readPipeline, record_delivery: (input) => pipelineStore.recordDelivery(input),
+      read_pipeline: readPipeline, record_delivery: (input) => {
+        (state.mappingInputs ||= []).push(F.copy(input));
+        if (state.failMappingBefore) { state.failMappingBefore = false; C.fail("mapping_response_lost"); }
+        return pipelineStore.recordDelivery(input);
+      },
     });
   }
   let exec = executor();
@@ -149,7 +153,11 @@ async function fixture({ prefix = false } = {}) {
     const tip = F.git(repo.repository, ["commit-tree", (await object(mergeSha)).tree, "-p", mergeSha, "-m", "later unrelated target commit"]);
     F.git(repo.repository, ["push", "-q", bare, `${tip}:refs/heads/main`]); return tip;
   }
-  return { get ref() { return ref; }, get exec() { return exec; }, get domain() { return domain; }, adoptGeneration, advanceTarget, successor, state, executor, chain, readPipeline, invoke, candidateRevision, form, publish, seal, merge, remote,
+  function transition(kind, taskKey, fields = {}) {
+    const task = readPipeline().pipeline.tasks.find((slot) => slot.work_task_ref.task_key === taskKey);
+    return apply(kind, { ...(kind === "replace_candidate" ? {} : { work_task_ref: task.work_task_ref }), ...fields });
+  }
+  return { get owner() { return currentOwner; }, transition, get ref() { return ref; }, get exec() { return exec; }, get domain() { return domain; }, adoptGeneration, advanceTarget, successor, state, executor, chain, readPipeline, invoke, candidateRevision, form, publish, seal, merge, remote,
     evidence: () => sealedEvidence, close() { chain.close(); fs.rmSync(directory, { recursive: true, force: true }); } };
 }
 module.exports = { fixture, F, C, clock, owner, command, composeHeadDomain, createHeadControlService, createHeadControlAuditStore, createHeadControlHttpService };

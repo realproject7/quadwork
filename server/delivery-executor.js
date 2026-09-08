@@ -7,6 +7,12 @@ const { issueContractRevision } = require("./issue-contract-revision");
 const { normalizeCiPolicy, deriveCiPolicyIdentity } = require("./ci-evidence-policy");
 const C = require("./delivery-execution-contract");
 const same = (a, b) => C.stable(a) === C.stable(b);
+// Whole-project pipeline digests are atomic observation/CAS fences, not a
+// long-lived veto over a candidate when another task legitimately progresses.
+function standingFacts(value) { const { pipeline_digest, ...relevant } = value; return relevant; }
+// A sealed merge retains the policy it passed. Later policy edits cannot
+// reinterpret it; current source, assignment, reviews and scope still must match.
+function completionFacts(value) { const { policy, policy_value, ...relevant } = standingFacts(value); return relevant; }
 const uniqueItems = (manifest) => [...new Map(manifest.staged_tasks.map((s) => [C.digest(s.work_item), s.work_item])).values()];
 
 function createDeliveryExecutor(deps) {
@@ -45,12 +51,13 @@ function createDeliveryExecutor(deps) {
       if (issue.operator_hold === true || /<!--\s*quadwork:operator-gate\s*-->/.test(issue.body)) operatorHolds.push(item);
     }
     guard();
-    const after = domain.delivery_context(), scope = deps.read_scope(ref);
-    if (after.status.pipeline_digest !== before.status.pipeline_digest || !same(scopeBefore, scope)) C.fail("delivery_scope_changed");
-    const policy = normalizeCiPolicy(scope.policy);
+    const policy = normalizeCiPolicy(scopeBefore.policy);
     const object = await remote.object(ref.result_sha);
     if (object.tree !== manifest.evidence.tree.result_tree_sha) C.fail("delivery_composition_changed");
     await remote.object(ref.base_sha);
+    const after = domain.delivery_context(), scope = deps.read_scope(ref);
+    if (after.status.pipeline_digest !== before.status.pipeline_digest || !same(scopeBefore, scope)) C.fail("delivery_scope_changed");
+    guard();
     return { manifest_digest: ref.batch_manifest_digest, pipeline_digest: before.status.pipeline_digest,
       cut_id: ref.cut_id, delivery_manifest_digest: manifest.delivery_manifest_digest, source_digest: C.digest(source),
       assignment_digest: scope.assignment_digest, policy: deriveCiPolicyIdentity(policy), policy_value: policy,
@@ -61,7 +68,7 @@ function createDeliveryExecutor(deps) {
     const receipt = domain.delivery_context().state.delivery_formation;
     if (!receipt) C.fail("delivery_formation_required");
     C.assertSeal(receipt);
-    if (!same(receipt.binding, binding) || !same(receipt.facts, current) || !same(receipt.declaration.delivery_candidate_ref, snapshot.delivery_candidate_ref)) C.fail("delivery_formation_stale");
+    if (!same(receipt.binding, binding) || !same(standingFacts(receipt.facts), standingFacts(current)) || !same(receipt.declaration.delivery_candidate_ref, snapshot.delivery_candidate_ref)) C.fail("delivery_formation_stale");
     if (receipt.declaration.classification !== "ordinary" || current.operator_holds.length || receipt.declaration.operator_reasons.length) C.fail("operator_gate_required");
     if (receipt.declaration.isolation_reasons.length && snapshot.delivery_candidate_ref.delivery_mode !== "isolated") C.fail("delivery_isolation_required");
     return receipt;
@@ -71,12 +78,12 @@ function createDeliveryExecutor(deps) {
     const origin = snapshot.delivery?.publication;
     if (!origin || origin.plan.plan_digest !== planValue.plan_digest || !origin.formation) return false;
     C.assertSeal(origin.formation);
-    // A freshly authenticated higher generation may re-form the same ordinary
-    // candidate. Its new authority never rewrites the original publication.
+    // A current authenticated Head may re-form the same ordinary candidate.
+    // An unrelated pipeline transition does not change its reviewed standing. Its new authority never rewrites the original publication.
     return origin.formation.binding.installation_id === binding.installation_id &&
       origin.formation.binding.project_id === binding.project_id && origin.formation.binding.role === "head" &&
-      origin.formation.binding.generation < binding.generation &&
-      same(origin.formation.facts, form.facts) && same(origin.formation.declaration, form.declaration);
+      origin.formation.binding.generation <= binding.generation &&
+      same(standingFacts(origin.formation.facts), standingFacts(form.facts)) && same(origin.formation.declaration, form.declaration);
   }
   async function plan(ref) {
     owned(ref);
@@ -92,6 +99,28 @@ function createDeliveryExecutor(deps) {
       if (same({ ...original, formation_digest: form.digest }, content)) return C.clone(prior);
     }
     return { ...content, plan_digest: C.digest(content) };
+  }
+  async function mappingExpected(snapshot, delivery, record) {
+    guard();
+    const current = deps.read_pipeline();
+    if (current.pipeline.archived || current.manifest.manifest_digest !== record.candidate_ref.batch_manifest_digest) C.fail("delivery_completion_source_changed");
+    const prior = (current.pipeline.deliveries || []).find((entry) => entry.receipt_digest === record.receipt_digest);
+    if (prior) {
+      if (!same(prior, record)) C.fail("delivery_completion_receipt_collision");
+      // The existing store compares exact applied content before its old CAS.
+      // Never reconstruct an already delivered cut from successor task state.
+      return delivery.completion.expected;
+    }
+    const observed = await facts(snapshot);
+    const origin = delivery.publication.formation;
+    if (!origin || !same(completionFacts(origin.facts), completionFacts(observed))) C.fail("delivery_completion_source_changed");
+    C.assertSeal(origin);
+    guard();
+    if (domain.delivery_context().status.pipeline_digest !== observed.pipeline_digest) C.fail("delivery_scope_changed");
+    // Keep the original completion intent and receipt immutable. This one
+    // bounded attempt uses a freshly proven observation; the pipeline owner
+    // still checks exact cut/dependencies/base and active authority under lock.
+    return { ...delivery.completion.expected, pipeline_digest: observed.pipeline_digest };
   }
   function readOperation(snapshot, command) {
     const operations = snapshot.delivery?.operations || [];
@@ -225,9 +254,13 @@ function createDeliveryExecutor(deps) {
         guard();
         const completion = C.clone(delivery.completion);
         const proof = C.sealed({ version: 1, inspection_digest: completion.inspection_digest, merge: completion.merge, tasks: completion.tasks });
-        const pipeline = deps.record_delivery({ expected: completion.expected, delivery: { version: 1, receipt_digest: proof.digest,
+        const record = { version: 1, receipt_digest: proof.digest,
           candidate_ref: ref, manifest_digest: manifest.delivery_manifest_digest, base_sha: ref.base_sha, result_sha: ref.result_sha,
-          result_tree: manifest.evidence.tree.result_tree_sha, merge_sha: merged.merge_sha, merge_tree: merged.merge_tree, work_task_refs: completion.tasks } });
+          result_tree: manifest.evidence.tree.result_tree_sha, merge_sha: merged.merge_sha, merge_tree: merged.merge_tree, work_task_refs: completion.tasks };
+        const expected = await mappingExpected(snapshot, delivery, record);
+        op.checkpoint = C.sealed({ receipt_digest: proof.digest, expected }); save("mapping_intent");
+        guard();
+        const pipeline = deps.record_delivery({ expected, delivery: record });
         completion.pipeline_recorded = true;
         completion.closure_inspection_digest = delivery.inspection.digest;
         delete completion.digest; delivery.completion = C.sealed(completion); save("tasks_delivered");
