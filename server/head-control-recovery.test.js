@@ -1,4 +1,5 @@
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture({ preserveRuntimeOwner: true });
 
 // #1053/#1044: drive worker recovery the way a real Head does (spawned
 // Head-control MCP shim -> /api/head-control -> runtime -> index.js owners ->

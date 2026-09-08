@@ -1,4 +1,5 @@
 "use strict";
+require("./resource-executor-fixture").installResourceExecutorFixture();
 
 // #1066: the Delivery Candidate composition chain driven end to end — Head
 // runtime -> composition service -> composer -> Git-object adapter -> git —

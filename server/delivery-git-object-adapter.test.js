@@ -1,4 +1,5 @@
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");

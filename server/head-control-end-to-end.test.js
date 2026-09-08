@@ -187,7 +187,7 @@ async function run() {
   try {
     console.log("\n--- Head-control end-to-end (shim -> route -> runtime -> durable domain) ---\n");
     const tools = await shim.handshake();
-    assert.deepEqual(tools, ["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit"]);
+    assert.deepEqual(tools, ["form_delivery", "publish_delivery", "inspect_delivery", "complete_delivery", "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit"]);
     const empty = await shim.call("get_pipeline_status", { idempotency_key: "idem_e2e_status_0", correlation_id: "corr_e2e_status_0" });
     assert.equal(empty.decision.code, "head_control_status_observed");
     assert.equal(empty.result.status.revision, 0);

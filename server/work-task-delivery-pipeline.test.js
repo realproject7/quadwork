@@ -1,4 +1,5 @@
 "use strict";
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 
 // Actual local Git commits/trees plus the real durable pipeline, released
 // independent review, source, adapter and composer. No GitHub operation runs.
