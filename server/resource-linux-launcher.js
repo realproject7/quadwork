@@ -294,6 +294,13 @@ class LinuxResourceLauncher {
       try { const group = facts.readGroup(record.group); return group.pids.length === 0; }
       catch (error) { return error.code === "ENOENT"; }
     });
+    // Native exit and an empty direct scope do not exclude a surviving
+    // descendant in the generation's parent. Every reclaim path, including
+    // ordinary exit racing stop(), must confirm the exact owned subtree.
+    await boundedUntil(async () => {
+      try { await this._confirmOwnedParentEmpty(record); return true; }
+      catch (error) { if (error.check === "owned_parent_not_empty") return false; throw error; }
+    });
     reclaimGenerationTemp({ facts: record.tempFacts, generationId: record.generationId, confirmedProcessTreeExit: true });
     record.cleaned = true;
     })();
@@ -363,15 +370,23 @@ class LinuxResourceLauncher {
       }
     }
     if (record.group) {
+      let signalError;
       let live = false;
       try { live = facts.readGroup(record.group).pids.length !== 0; } catch (error) { if (error.code !== "ENOENT") throw error; }
       if (live) {
         if (facts.scopeGroup(`${record.unitName}.scope`) !== record.group) facts.fail("scope_identity_changed");
-        await exec("systemctl", ["--user", "kill", "--signal=SIGKILL", "--kill-whom=all", `${record.unitName}.scope`], { timeout: 3000, maxBuffer: 16384 });
+        try { await exec("systemctl", ["--user", "kill", "--signal=SIGKILL", "--kill-whom=all", `${record.unitName}.scope`], { timeout: 3000, maxBuffer: 16384 }); }
+        catch (error) { signalError = error; }
       }
-      if (record.term) await this._waitNativeExit(record);
-      if (earlyNative) await this._confirmOwnedParentEmpty(record);
-      await this._confirmExit(record);
+      try {
+        if (record.term) await this._waitNativeExit(record);
+        await this._confirmExit(record);
+      } catch (error) {
+        // systemd can fail after delivering SIGKILL. Keep that diagnostic
+        // when observation also fails; only observed complete cleanup wins.
+        if (signalError && error.cause === undefined) error.cause = signalError;
+        throw error;
+      }
     } else if (earlyNative) {
       await this._confirmOwnedParentEmpty(record);
     }
