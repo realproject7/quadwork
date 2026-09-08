@@ -609,7 +609,7 @@ function seedConfig(config) {
     ["repository", "Acme/Owned", b, "repository_owned_by_active_project"],
     ["same path", "Acme/Other", a, "repository_working_dir_owned_by_active_project"],
     ["path alias", "Acme/Other", alias, "repository_working_dir_owned_by_active_project"],
-    ["nested path", "Acme/Other", nested, "repository_working_dir_owned_by_active_project"],
+    ["canonical overlap", "Acme/Other", `${nested}/..`, "repository_working_dir_owned_by_active_project"],
   ];
   for (const reverse of [false, true]) {
     for (const [label, repo, dir, code] of cases) {
