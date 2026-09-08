@@ -6,6 +6,7 @@
 // the three live authorities below; this adapter proves their agreement
 // before resolving, much less invoking, the Head-control service.
 
+const DELIVERY = require("./delivery-execution-contract");
 const API_PATH = "/api/head-control";
 const VERSION = 1;
 const MAX_ARGUMENT_BYTES = 128 * 1024;
@@ -28,6 +29,7 @@ const ACTIONS = Object.freeze([
   "review_handoff",
   "project_monitor",
   "recover_worker",
+  ...DELIVERY.ACTIONS,
 ]);
 const ACTION_SET = new Set(ACTIONS);
 // Reads and the two beside-the-pipeline controls carry no optimistic revision.
@@ -190,6 +192,11 @@ function sameServiceBinding(left, right) {
 
 function commandArguments(tool, value) {
   if (!plain(value)) throw new TypeError("arguments must be an object");
+  if (DELIVERY.ACTIONS.includes(tool)) {
+    exact(value, ["expected_revision", "idempotency_key", "correlation_id", "delivery"]);
+    return freeze({ expected_revision: revision(value.expected_revision), idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id), payload: DELIVERY.assertPayload(tool, boundedJson(value.delivery)) });
+  }
   if (tool === "get_pipeline_status" || tool === "get_project_status" || tool === "review_handoff") {
     exact(value, ["idempotency_key", "correlation_id"]);
     return freeze({

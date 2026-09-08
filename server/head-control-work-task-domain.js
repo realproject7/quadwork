@@ -49,6 +49,7 @@ const {
   createWorkTaskIndependentReviewService,
 } = require("./work-task-independent-review-service");
 
+const deliveryContract = require("./delivery-execution-contract");
 const SCHEMA_VERSION = 1;
 const MAX_PAYLOAD_BYTES = 128 * 1024;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
@@ -351,7 +352,8 @@ function pending(value, state, owner, code) {
   };
 }
 function assertState(value, owner, adoptGeneration = false) {
-  exact(value, ["schema_version", "binding", "revision", "stage", "manifest", "pipeline_digest", "pending"], "invalid_head_control_work_task_state");
+  exact(value, ["schema_version", "binding", "revision", "stage", "manifest", "pipeline_digest", "pending", ...(Object.hasOwn(value, "delivery_formation") ? ["delivery_formation"] : [])], "invalid_head_control_work_task_state");
+  if (value.delivery_formation != null) deliveryContract.assertSeal(value.delivery_formation);
   if (value.schema_version !== SCHEMA_VERSION) fail("unknown_head_control_work_task_state_schema", "domain state schema is unsupported");
   const storedBinding = binding(value.binding, "invalid_head_control_work_task_state");
   // Only the explicit initialize() transition may read state left by an
@@ -367,6 +369,7 @@ function assertState(value, owner, adoptGeneration = false) {
     manifest: value.manifest === null ? null : exactManifest(value.manifest, owner, "invalid_head_control_work_task_state"),
     pipeline_digest: digest(value.pipeline_digest, "invalid_head_control_work_task_state", true),
     pending: null,
+    ...(Object.hasOwn(value, "delivery_formation") ? { delivery_formation: clone(value.delivery_formation) } : {}),
   };
   if (!new Set(["empty", "manifest", "frozen"]).has(state.stage)) fail("invalid_head_control_work_task_state", "domain stage is invalid");
   // An empty stage is revision 0 before the first manifest and revision N+1
@@ -945,12 +948,43 @@ function createHeadControlWorkTaskDomain(options) {
     return freeze({ status: statusFor(current.state, current.pipeline), detail: stop === null ? null : clone(stop) });
   }
 
+  // Private fixed delivery seams: only the launch-bound runtime can call
+  // them, and formation remains owned by this manifest's durable record.
+  function delivery_context() {
+    const current = prepared();
+    if (current.state.stage !== "frozen" || current.pipeline === null || current.pipeline.pipeline.archived) {
+      fail("head_control_delivery_unavailable", "delivery requires the current unarchived frozen batch");
+    }
+    assertCurrentManifest(current.state.manifest, options.resolve_registered_identity);
+    return freeze({ state: current.state, pipeline: current.pipeline, status: statusFor(current.state, current.pipeline) });
+  }
+  function record_delivery_formation(command, facts) {
+    const payload = deliveryContract.assertPayload("form_delivery", command.payload);
+    if (!sameBinding(command.binding, owner) || command.action !== "form_delivery") fail("head_control_delivery_denied");
+    const fingerprint = deliveryContract.digest(command);
+    delivery_context();
+    return files.withWriterLock(statePath, () => {
+      const state = currentState();
+      if (state.delivery_formation?.operation?.fingerprint === fingerprint) return state.delivery_formation;
+      if (state.delivery_formation?.operation?.idempotency_key === command.idempotency_key || state.delivery_formation?.operation?.correlation_id === command.correlation_id) fail("head_control_delivery_identity_collision");
+      assertMutationState(state, command, "frozen");
+      if (facts.manifest_digest !== state.manifest.manifest_digest || facts.pipeline_digest !== state.pipeline_digest) fail("head_control_delivery_stale");
+      const receipt = deliveryContract.sealed({ version: 1, binding: clone(owner), declaration: payload, facts: clone(facts),
+        operation: { fingerprint, idempotency_key: command.idempotency_key, correlation_id: command.correlation_id }, observed_at: options.now() });
+      const next = { ...state, revision: state.revision + 1, delivery_formation: receipt };
+      writeState(files, statePath, next, owner);
+      return freeze(receipt);
+    });
+  }
+
   // `initialize` is deliberately non-enumerable.  The existing plane exacts
   // its domain object to these fixed callbacks, while runtime startup still
   // has an explicit durable bootstrap with no extra control action.
   const domain = { get_pipeline_status, put_batch_manifest, freeze_batch_manifest, cut_batch, retire_batch, abandon_batch_manifest, queue_local_correction, read_propagation_stop };
   Object.defineProperty(domain, "initialize", { value: initialize, enumerable: false });
   Object.defineProperty(domain, "project_current_batch", { value: project_current_batch, enumerable: false });
+  Object.defineProperty(domain, "delivery_context", { value: delivery_context, enumerable: false });
+  Object.defineProperty(domain, "record_delivery_formation", { value: record_delivery_formation, enumerable: false });
   return freeze(domain);
 }
 

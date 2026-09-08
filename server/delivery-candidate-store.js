@@ -27,6 +27,7 @@ const {
   assertDeliveryCompositionProof,
 } = require("./delivery-composer");
 
+const { assertDelivery, initialDelivery } = require("./delivery-execution-contract");
 const SCHEMA_VERSION = 1;
 const IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$/;
 const LIFECYCLE = new Set(["pending_composition", "composed"]);
@@ -162,7 +163,8 @@ function normalizeAcceptedOperation(value, code) {
 }
 function assertStoredState(value, expectedRef = null) {
   const code = "invalid_delivery_candidate_store_state";
-  exact(value, ["schema_version", "delivery_candidate_ref", "revision", "lifecycle", "delivery_manifest", "composition_proof"], code);
+  exact(value, ["schema_version", "delivery_candidate_ref", "revision", "lifecycle", "delivery_manifest", "composition_proof", ...(Object.hasOwn(value, "delivery") ? ["delivery"] : [])], code);
+  if (Object.hasOwn(value, "delivery")) assertDelivery(value.delivery);
   if (value.schema_version !== SCHEMA_VERSION || !Number.isSafeInteger(value.revision) || value.revision < 0) {
     fail(code, "delivery candidate store schema or revision is invalid");
   }
@@ -181,7 +183,7 @@ function assertStoredState(value, expectedRef = null) {
       fail(code, "pending delivery candidate state is inconsistent");
     }
   } else {
-    if (value.revision !== 1 || value.lifecycle.accepted_operation === null || value.composition_proof === null) {
+    if (value.revision < 1 || value.lifecycle.accepted_operation === null || value.composition_proof === null) {
       fail(code, "composed delivery candidate state is inconsistent");
     }
     const accepted = normalizeAcceptedOperation(value.lifecycle.accepted_operation, code);
@@ -200,6 +202,7 @@ function assertStoredState(value, expectedRef = null) {
     },
     delivery_manifest: clone(storedManifest),
     composition_proof: value.composition_proof === null ? null : clone(value.composition_proof),
+    ...(Object.hasOwn(value, "delivery") ? { delivery: clone(value.delivery) } : {}),
   };
 }
 function snapshot(state, expectedRef) { return freeze(clone(assertStoredState(state, expectedRef))); }
@@ -376,7 +379,24 @@ function createDeliveryCandidateStore(options) {
     });
   }
 
-  return freeze({ readSnapshot, initialize, recordComposed });
+  function recordDelivery(ref, expectedRevision, delivery) {
+    assertDelivery(delivery);
+    const target = paths(ref);
+    return files.withWriterLock(target.state, () => {
+      const current = readState(fs, target.state, target.ref, false);
+      if (current.lifecycle.status !== "composed" || current.revision !== expectedRevision) fail("stale_delivery_candidate_store_revision", "candidate changed");
+      const next = { ...current, revision: current.revision + 1, delivery: clone(delivery) };
+      assertStoredState(next, target.ref);
+      writeStateAtomically(files, target.state, next);
+      return snapshot(next, target.ref);
+    });
+  }
+  async function withExecution(ref, action, deadline) {
+    const target = paths(ref);
+    readSnapshot(ref);
+    return files.withAsyncWriterLock(`${target.state}.execution`, action, deadline);
+  }
+  return freeze({ readSnapshot, initialize, recordComposed, recordDelivery, withExecution });
 }
 
 module.exports = {

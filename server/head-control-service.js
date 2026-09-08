@@ -279,7 +279,7 @@ function createHeadControlService(options) {
       fail("head_control_audit_unavailable", "durable Head-control audit is unavailable");
     }
   }
-  function durableReplayOrFail(command, records) {
+  async function durableReplayOrFail(command, records) {
     if (!plain(command)) return null;
     const byCorrelation = records.find((record) => record.correlation_id === command.correlation_id) || null;
     const byIdempotency = records.find((record) => record.idempotency_key === command.idempotency_key) || null;
@@ -295,6 +295,12 @@ function createHeadControlService(options) {
         same(localByCorrelation.record, record) && fingerprint !== null && localByCorrelation.fingerprint === fingerprint) {
       return replay(record, localByCorrelation.detail);
     }
+    if (require("./delivery-execution-contract").ACTIONS.includes(command.action) && record.action === command.action && record.decision === "accepted" &&
+        typeof options.domain.replay_delivery === "function" && sameBinding(command.principal, owner) && command.expected_revision === record.preconditions.expected_revision) {
+      const detail = await options.domain.replay_delivery({ version: command.version, action: command.action, binding: command.principal,
+        expected_revision: command.expected_revision, idempotency_key: command.idempotency_key, correlation_id: command.correlation_id, payload: command.payload });
+      return replay(record, detail);
+    }
     if (commandMatchesDurablePayloadlessRecord(command, record, owner)) return replay(record);
     // The durable format deliberately omits payloads.  Any request that is
     // not exactly provable from the fixed receipt, including put/cut after a
@@ -305,7 +311,7 @@ function createHeadControlService(options) {
     // This preflight happens before the plane can reach a domain callback.
     // It also rejects corrupt, substituted, or unavailable durable state.
     const records = readAuditOrFail();
-    const durableReplay = durableReplayOrFail(command, records);
+    const durableReplay = await durableReplayOrFail(command, records);
     if (durableReplay !== null) return durableReplay;
     const result = await plane.execute(command);
     persistOrFail(result, command);

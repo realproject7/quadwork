@@ -1090,6 +1090,69 @@ const { createDeliveryFinalReviewService } = require("./delivery-final-review-se
 const { createDeliveryPublicationPlanService } = require("./delivery-publication-plan");
 const { TARGET_KIND: DELIVERY_REVIEW_TARGET_KIND } = require("./delivery-review-target");
 
+// #1060: scoped executor composition shares the existing exact-review and
+// local-evidence owners. All Git/GitHub children use the control budget helper.
+function createDeliveryExecutionService({ binding, domain, read_source, repository, cwd, is_current }) {
+  const C = require("./delivery-execution-contract");
+  const remote = require("./delivery-remote").createDeliveryRemote({ repository, cwd, run: _execFileAsync });
+  const pipelineStore = require("./work-task-pipeline-store").createWorkTaskPipelineStore({ config_dir: CONFIG_DIR, fs });
+  async function nativeReviews(evidence) {
+    const target = evidence.target.identity;
+    for (const role of ["re1", "re2"]) {
+      const receipt = evidence.reviews[role];
+      if (!receipt || !/^[0-9]+$/.test(String(receipt.review_id))) C.fail("delivery_review_integrity_lost");
+      const { stdout } = await _execFileAsync("gh", ["api", `repos/${target.repo}/pulls/${target.pr_number}/reviews/${receipt.review_id}`], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
+      const review = JSON.parse(stdout);
+      if (String(review.id) !== String(receipt.review_id) || review.state !== "APPROVED" || review.commit_id !== target.exact_sha ||
+          review.submitted_at !== receipt.submitted_at || review.pull_request_url?.toLowerCase() !== `https://api.github.com/repos/${target.repo.toLowerCase()}/pulls/${target.pr_number}`) C.fail("delivery_review_integrity_lost");
+    }
+  }
+  async function read_merge_gate(ref, prNumber) {
+    const current = await freshDeliveryFinalReviewContext(binding.project_id, ref, prNumber);
+    const policy = current.binding.ci_policy;
+    if (policy?.mode === "github-checks") {
+      const { stdout } = await _execFileAsync("gh", ["api", `repos/${current.binding.repo}/commits/${ref.result_sha}/check-runs?per_page=100`], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
+      const response = JSON.parse(stdout);
+      if (!Array.isArray(response.check_runs) || response.total_count > response.check_runs.length) C.fail("delivery_checks_incomplete");
+      current.pr.checkEvidence = normalizeGithubCheckEvidence(response, { exact_sha: ref.result_sha, observed_at: new Date().toISOString(), source_status: "ok" });
+    }
+    observeDeliveryReview(binding.project_id, current, captureProjectAdmission(binding.project_id));
+    const cycles = Object.values(_reviewCycleStore.load(binding.project_id).cycles);
+    const cycle = cycles.find((entry) => entry.state === "current" && entry.target_identity_digest === current.target.target_identity_digest);
+    if (!cycle || !require("./review-cycle").headGateDue(cycle)) C.fail("delivery_merge_gate_pending");
+    const evidence = { ready: true, target: current.target, cycle_id: cycle.cycle_id, reviews: cycle.receipts,
+      policy: normalizeCiPolicy(policy), verification: policy.mode === "ci-less" ? _ciEvidenceStore.readByIdentity(deliveryCandidateCiEvidenceTarget(current)) : current.pr.checkEvidence };
+    if (!evidence.verification) C.fail("delivery_verification_missing");
+    await nativeReviews(evidence);
+    return C.clone(evidence);
+  }
+  return require("./delivery-executor").createDeliveryExecutor({ binding, domain, remote, read_source, is_current,
+    store: createDeliveryCandidateStore({ config_dir: CONFIG_DIR, fs }), now: () => new Date().toISOString(),
+    read_scope(ref) {
+      const context = readLiveBatchContext(binding.project_id);
+      if (!context?.activated || !context.queueReadOk || context.installationId !== binding.installation_id || context.batchType !== "code" ||
+          context.parsed.provenance !== "owned" || context.parsed.errors.length || !context.parsed.assignmentAttempt || !context.parsed.assignmentKey) C.fail("delivery_assignment_changed");
+      const registered = context.repositories.find((entry) => entry.key === ref.repository_key);
+      if (!registered || canonicalGithubRepo(registered.repo) !== repository.toLowerCase()) C.fail("delivery_repository_changed");
+      return { assignment_digest: C.digest(context.fingerprint), policy: repositoryCiPolicy(context.project, ref.repository_key) };
+    },
+    observe_review: async (ref, number) => observeDeliveryReview(binding.project_id, await freshDeliveryFinalReviewContext(binding.project_id, ref, number), captureProjectAdmission(binding.project_id)),
+    read_merge_gate,
+    async revalidate_sealed_reviews(evidence) {
+      const cycle = _reviewCycleStore.load(binding.project_id).cycles[evidence.cycle_id];
+      if (!cycle || cycle.target_identity_digest !== evidence.target.target_identity_digest || C.stable(cycle.receipts) !== C.stable(evidence.reviews)) C.fail("delivery_review_integrity_lost");
+      await nativeReviews(evidence);
+    },
+    read_pipeline: () => pipelineStore.readRecoverySnapshot({ installation_id: binding.installation_id, project_id: binding.project_id }),
+    record_delivery: (input) => pipelineStore.recordDelivery(input),
+  });
+}
+let deliveryPublicationPlanReader = null;
+function setDeliveryPublicationPlanReader(reader) {
+  if (typeof reader !== "function" || deliveryPublicationPlanReader !== null) throw new TypeError("delivery plan reader is fixed at startup");
+  deliveryPublicationPlanReader = reader;
+}
+
 function projectEnvironmentSettingsInput(config, project) {
   return {
     installation_id: config.installation_id,
@@ -1624,8 +1687,8 @@ router.post("/api/delivery-candidate/final-review", async (req, res) => {
 
 // This is intentionally only the last local preflight. It derives an exact
 // branch/PR proposal from a sealed candidate but cannot transfer a branch or
-// open a PR; those are explicit operator-gated external actions.
-router.post("/api/delivery-candidate/publication-plan", (req, res) => {
+// open a PR; the fixed authenticated Head publication action executes it.
+router.post("/api/delivery-candidate/publication-plan", async (req, res) => {
   const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
   const body = req.body;
   if (!principal || principal.agentId !== "head" || !body || typeof body !== "object" || Array.isArray(body) ||
@@ -1639,7 +1702,9 @@ router.post("/api/delivery-candidate/publication-plan", (req, res) => {
     return res.status(409).json({ ok: false, code: "delivery_publication_unavailable" });
   }
   try {
-    const plan = deliveryPublicationPlanContext(principal.projectId, body.delivery_candidate_ref);
+    const plan = deliveryPublicationPlanReader
+      ? await deliveryPublicationPlanReader(principal.projectId, body.delivery_candidate_ref)
+      : deliveryPublicationPlanContext(principal.projectId, body.delivery_candidate_ref);
     return res.json({ ok: true, plan });
   } catch (error) {
     return res.status(409).json({ ok: false, code: error?.code || "delivery_publication_unavailable" });
@@ -8233,3 +8298,6 @@ module.exports.freshDeliveryFinalReviewContext = freshDeliveryFinalReviewContext
 module.exports.observeDeliveryReview = observeDeliveryReview;
 module.exports.refreshDeliveryReviewCycles = refreshDeliveryReviewCycles;
 module.exports.repositoryUsesLocalVerification = repositoryUsesLocalVerification;
+
+module.exports.createDeliveryExecutionService = createDeliveryExecutionService;
+module.exports.setDeliveryPublicationPlanReader = setDeliveryPublicationPlanReader;
