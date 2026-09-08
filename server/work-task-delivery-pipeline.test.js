@@ -91,12 +91,12 @@ async function fixture(tasks, run) {
     const local = localCandidate(ref, base, suffix);
     event("record_candidate", { assignment_id, candidate: local.candidate });
     const round = review.openIndependentReview({ version: 1, event_id: `open_${suffix}`, work_task_ref: ref,
-      attempt: `attempt_${suffix}`, round: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 1 }, { reviewer_role: "re2", reviewer_generation: 1 }], opened_at: "2026-09-08T08:01:00Z" });
+      attempt: `attempt_${suffix}`, round: 1, reviewers: [{ reviewer_role: "re1", reviewer_generation: 1 }, { reviewer_role: "re2", reviewer_generation: 1 }], opened_at: "2026-09-08T08:01:00.000Z" });
     for (const reviewer_role of ["re1", "re2"]) {
       const payload = { version: 1, review_round_ref: copy(round.review_round_ref), receipt_id: `receipt_${reviewer_role}_${suffix}`, verdict: "approve", findings: [] };
       review.submitTrustedReceipt({ version: 1, review_round_ref: round.review_round_ref, candidate_digest: round.candidate_digest,
         receipt: { ...payload, receipt_digest: digest(payload) } },
-      { version: 1, reviewer_role, reviewer_generation: 1, received_at: "2026-09-08T08:02:00Z" });
+      { version: 1, reviewer_role, reviewer_generation: 1, received_at: "2026-09-08T08:02:00.000Z" });
     }
     reconcile.reconcileReleasedReview({ version: 1, work_task_ref: ref, review_round_ref: round.review_round_ref, candidate_digest: round.candidate_digest });
     return local;
