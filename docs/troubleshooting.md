@@ -541,9 +541,9 @@ do not select a cleanup target by wildcard, prefix, timestamp, or guesswork.
 - `proof_refused` means the disposable-host acknowledgement or the separate
   `--run-pressure-matrix` opt-in is absent or mismatched. No matrix phase has
   started.
-- `proof_unavailable` means a host gate or required live adapter is unavailable.
-  The bundled adapter intentionally returns this result rather than simulating
-  node-pty, WebSocket, cgroup, temp, health, or OOM evidence.
+- `proof_unavailable` means a required host capability or observation is
+  unavailable. The closed shipped coordinator requires actual cgroup, journal,
+  node-pty, temp, health and transport facts; it accepts no replacement adapter.
 - `proof_failed` means monitoring or a started phase failed. The coordinator
   stops starting new phases and closes continuous monitoring.
 
@@ -551,8 +551,10 @@ Do not retry a pressure phase on production and do not treat capability flags
 as proof. Preserve the redacted JSON, identify the exact candidate unit names
 from the disposable run record, stop only those units, wait for their process
 trees to exit, and compare the recorded API/global OOM counters. The candidate
-flags remain `candidate_pending_staging`; there is no automatic install/repair
-or supported-production fallback in this command.
+runtime does not treat this report as a portable permission token. Normal worker
+readiness comes from direct Linux capability checks and a real non-pressure
+probe. Unavailable containment keeps the API/chat online and refuses new worker
+starts; the pressure command never repairs a production service.
 
 For package or resource-policy regressions, use the VPS guide's
 **Resource upgrade and rollback** procedure. Rollback means reinstalling one

@@ -6,7 +6,7 @@ const crypto = require("crypto");
 const pty = require("node-pty");
 const { execFile, execFileSync } = require("child_process");
 const { promisify } = require("util");
-const { ResourceController, buildControlClassConfiguration, buildControlScopeInvocation } = require("./resource-controller");
+const { ResourceController, buildControlScopeInvocation } = require("./resource-controller");
 const { createWorkerUnitBase, createControlUnitBase } = require("./resource-unit");
 const { inspectTempRoot, createGenerationTemp, reclaimGenerationTemp } = require("./resource-temp");
 const { runResourcePreflight, createReadOnlyProbes } = require("./resource-preflight");
@@ -22,6 +22,26 @@ async function boundedUntil(read, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   do { const value = await read(); if (value) return value; await wait(25); } while (Date.now() < deadline);
   facts.fail("scope_observation_timeout");
+}
+function runtimeDirectory() {
+  const root = `/run/user/${process.getuid()}`;
+  if (process.env.XDG_RUNTIME_DIR !== root || fs.realpathSync(root) !== root || fs.lstatSync(root).uid !== process.getuid()) facts.fail("user_runtime_identity_invalid");
+  const directory = path.join(root, "quadwork-resources");
+  lockFiles.ensureDirectories([directory]);
+  return directory;
+}
+function unitProperties(raw) {
+  return Object.fromEntries(String(raw).trim().split("\n").map((line) => { const i = line.indexOf("="); return [line.slice(0, i), line.slice(i + 1)]; }));
+}
+function absentUnitOutput(error) {
+  const raw = error?.stdout;
+  if (raw && unitProperties(raw).LoadState === "not-found" && !unitProperties(raw).ControlGroup) return raw;
+  throw error;
+}
+function controlOptions(options, fallbackTimeout) {
+  const timeout = options.timeout ?? fallbackTimeout, maxBuffer = options.maxBuffer ?? 32 * 1024 * 1024;
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 110000 || !Number.isSafeInteger(maxBuffer) || maxBuffer < 1 || maxBuffer > 32 * 1024 * 1024) facts.fail("control_bounds_invalid");
+  return { ...options, timeout, maxBuffer };
 }
 function dataRecords(term) {
   const records = []; let pending = "";
@@ -40,9 +60,12 @@ function checkProcessSet(ready, group) {
   if (!ready.tty || !Array.isArray(ready.children) || ready.children.length !== 3) facts.fail("pty_descendant_proof_failed");
   const main = facts.readProcess(ready.pid);
   if (main.tty === 0 || main.cgroup !== group) facts.fail("controlling_tty_unproven");
-  for (const pid of ready.children) {
+  for (const [index, pid] of ready.children.entries()) {
     const child = facts.readProcess(pid);
     if (child.ppid !== ready.pid || child.cgroup !== group) facts.fail("descendant_cgroup_mismatch");
+    const executable = path.basename(fs.readlinkSync(`/proc/${pid}/exe`));
+    if (index === 1 ? executable !== "git" : executable !== path.basename(process.execPath)) facts.fail("descendant_executable_mismatch");
+    if (index === 2 && (child.session !== child.pid || child.pgrp !== child.pid || child.pgrp === main.pgrp)) facts.fail("detached_descendant_unproven");
   }
   return main;
 }
@@ -65,6 +88,7 @@ class LinuxResourceLauncher {
   snapshot() { return STATE.get(this).controller.snapshot(); }
   async prepare() {
     const s = STATE.get(this);
+    if (s.closed) return false;
     if (s.proof) return true;
     if (s.preparing) return s.preparing;
     s.preparing = (async () => {
@@ -74,8 +98,7 @@ class LinuxResourceLauncher {
       if (!runResourcePreflight({ runtimeResources: s.policy, probes, requestedWorkerScopes: 1 }).ok) return false;
       const version = facts.command("systemctl", ["--user", "show", "--property=Version", "--value"]);
       if (!(Number(/^(\d+)/.exec(version)?.[1]) >= 253)) return false;
-      const control = buildControlClassConfiguration({ controlClassName: "quadwork-control.slice", limits: { memoryMaxMib: s.policy.control.memory_max_mib, swapMaxMib: s.policy.control.swap_max_mib } });
-      await exec(control.file, control.args, { timeout: 5000, maxBuffer: 16384 });
+      await this._prepareControlClass();
       const generationId = `probe-${crypto.randomBytes(12).toString("hex")}`;
       const term = await this.spawnPty({ projectId: "resource-probe", generationId, command: process.execPath, args: [path.join(__dirname, "resource-staging-worker.js")], cwd: __dirname, env: { ...process.env }, probe: true });
       const trace = s.records.get(generationId).trace;
@@ -100,10 +123,7 @@ class LinuxResourceLauncher {
   }
   tempForGeneration(generationId) { return STATE.get(this).records.get(generationId)?.tempPath || null; }
   async spawnPty(spec) {
-    const runtimeDir = `/run/user/${process.getuid()}`;
-    if (process.env.XDG_RUNTIME_DIR !== runtimeDir || fs.realpathSync(runtimeDir) !== runtimeDir) facts.fail("user_runtime_identity_invalid");
-    const directory = path.join(runtimeDir, "quadwork-resources");
-    lockFiles.ensureDirectories([directory]);
+    const directory = runtimeDirectory();
     return lockFiles.withAsyncWriterLock(path.join(directory, "worker-admission"), () => this._spawnPty(spec), Date.now() + 15000);
   }
   async _spawnPty(spec) {
@@ -112,6 +132,9 @@ class LinuxResourceLauncher {
     if (!s.proof && spec.probe !== true) facts.fail("containment_unavailable");
     const preflight = runResourcePreflight({ runtimeResources: s.policy, probes: createReadOnlyProbes({ scopeProof: true }), requestedWorkerScopes: 1 });
     if (!preflight.ok) facts.fail("worker_capacity_or_limits_unavailable");
+    // A replacement can retire the exact previous generation after its tree
+    // has exited; the current generation's parent counter stays until stop.
+    for (const record of s.records.values()) if (record.projectId === spec.projectId && record.exited && !record.retired) await this.stopGeneration(record.generationId);
     const unitName = createWorkerUnitBase(spec);
     if (s.pending.has(unitName) || s.records.has(spec.generationId)) facts.fail("scope_identity_collision");
     const tempFacts = inspectTempRoot({ tempRoot: s.policy.temp_root, minimumFreeBytes: s.policy.temp_min_free_mib * facts.MIB });
@@ -121,7 +144,7 @@ class LinuxResourceLauncher {
     const started = new Promise((resolve, reject) => { resolveStarted = resolve; rejectStarted = reject; });
     const record = { ...spec, unitName, parentSlice: `quadwork-worker-group-${unitName.slice("quadwork-worker-".length)}.slice`, tempFacts, tempPath: temp.path || temp, resolveStarted, rejectStarted, term: null, group: null, done: null, cleaned: false };
     s.pending.set(unitName, record); s.records.set(spec.generationId, record);
-    record.done = s.controller.runWorkerScope({ projectId: spec.projectId, generationId: spec.generationId, unitName, parentSlice: record.parentSlice, ...(spec.probe ? { runtimeMaxSec: 90 } : {}), command: spec.command, args: spec.args, limits: { memoryHighMib: s.policy.worker.memory_high_mib, memoryMaxMib: s.policy.worker.memory_max_mib, swapMaxMib: s.policy.worker.swap_max_mib } });
+    record.done = s.controller.runWorkerScope({ projectId: spec.projectId, generationId: spec.generationId, unitName, parentSlice: record.parentSlice, ...(spec.probe || spec.command === path.join(__dirname, "resource-staging-worker.js") ? { runtimeMaxSec: 90 } : {}), command: spec.command, args: spec.args, limits: { memoryHighMib: s.policy.worker.memory_high_mib, memoryMaxMib: s.policy.worker.memory_max_mib, swapMaxMib: s.policy.worker.swap_max_mib } });
     record.done.catch(async (error) => {
       try { await this.stopGeneration(spec.generationId); } catch { s.proof = false; }
       rejectStarted(error);
@@ -131,23 +154,7 @@ class LinuxResourceLauncher {
   async _execute(invocation) {
     const s = STATE.get(this), record = s.pending.get(invocation.unitName);
     if (!record) facts.fail("scope_owner_missing");
-    if (invocation.resourceClass === "control") {
-      if (s.closed || !s.proof) facts.fail("containment_unavailable");
-      const { input, ...options } = record.options;
-      if (input !== undefined && (!Buffer.isBuffer(input) && typeof input !== "string" || Buffer.byteLength(input) > 16 * 1024 * 1024)) facts.fail("control_input_invalid");
-      try {
-        const output = await new Promise((resolve, reject) => {
-          const child = execFile(invocation.file, invocation.args, options, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
-          record.child = child;
-          child.stdin.on("error", () => {});
-          child.stdin.end(input);
-        });
-        return { code: 0, signal: null, stdout: output.stdout, stderr: output.stderr };
-      } finally {
-        try { await this._cleanupControlScope(invocation.unitName); }
-        catch (error) { s.proof = false; throw error; }
-      }
-    }
+    if (invocation.resourceClass === "control") return this._withControlSlot(() => this._executeControl(invocation, record), record.options.signal);
     record.setup = this._prepareSlice(record);
     await record.setup;
     if (s.closed) facts.fail("server_shutting_down");
@@ -162,17 +169,102 @@ class LinuxResourceLauncher {
       record.parentGroup = path.posix.dirname(group);
       if (!record.parentGroup.endsWith(`/${record.parentSlice}`)) facts.fail("scope_parent_mismatch");
       facts.verifyWorkerGroup(group, { memoryHighMib: s.policy.worker.memory_high_mib, memoryMaxMib: s.policy.worker.memory_max_mib, swapMaxMib: s.policy.worker.swap_max_mib }, [facts.readProcess(process.pid).cgroup]);
-      record.resolveStarted(term);
-      const exit = await exited;
+      this._verifyAncestorBudget(group);
+      // Publish terminal callbacks only after the controller has retained its
+      // exact generation OOM/exit fact and confirmed tree exit. Other PTY
+      // operations remain bound to the real native instance.
+      const publicTerm = new Proxy(term, { get(target, key) {
+        if (key === "onExit") return (listener) => {
+          let active = true;
+          const subscription = target.onExit((exit) => {
+            const deliver = () => { if (active) listener(exit); };
+            record.done.then(deliver, deliver).catch(() => {});
+          });
+          return { dispose() { active = false; subscription.dispose(); } };
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+      record.resolveStarted(publicTerm);
+      const exit = await exited; record.exited = true;
       let observation = null;
       try { observation = { capturedBeforeCollect: true, oomKillCount: String(facts.readGroup(record.parentGroup).events.oom_kill), observedAt: new Date().toISOString() }; } catch {}
       await this._confirmExit(record);
-      return { code: exit.exitCode, signal: exit.signal ? `SIG${exit.signal}` : null, ...(observation ? { scopeObservation: observation } : {}) };
+      return { code: exit.signal ? null : exit.exitCode, signal: exit.signal || null, ...(observation ? { scopeObservation: observation } : {}) };
     } catch (error) {
       record.rejectStarted(error);
       await this.stopGeneration(record.generationId);
       throw error;
     }
+  }
+  async _executeControl(invocation, record) {
+      const s = STATE.get(this);
+      if (s.closed || !s.proof || record.options.signal?.aborted) facts.fail("containment_unavailable");
+      this._verifyControlClass();
+      const args = [...invocation.args]; args.splice(args.indexOf("--"), 0, "-p", `RuntimeMaxSec=${Math.ceil(record.options.timeout / 1000) + 5}s`);
+      const { input, ...options } = record.options;
+      if (input !== undefined && (!Buffer.isBuffer(input) && typeof input !== "string" || Buffer.byteLength(input) > 16 * 1024 * 1024)) facts.fail("control_input_invalid");
+      try {
+        const output = await new Promise((resolve, reject) => {
+          const child = execFile(invocation.file, args, options, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
+          record.child = child;
+          child.stdin.on("error", () => {});
+          child.stdin.end(input);
+        });
+        return { code: 0, signal: null, stdout: output.stdout, stderr: output.stderr };
+      } finally {
+        try { await this._cleanupControlScope(invocation.unitName); }
+        catch (error) { s.proof = false; s.cleanupFailed = true; throw error; }
+      }
+  }
+  _verifyAncestorBudget(group) {
+    const { policy } = STATE.get(this), apiGroup = facts.readProcess(process.pid).cgroup;
+    const allClassesMib = policy.api.memory_max_mib + policy.control.memory_max_mib + policy.max_worker_scopes * policy.worker.memory_max_mib;
+    for (let parent = path.posix.dirname(group); parent !== "/"; parent = path.posix.dirname(parent)) {
+      if (apiGroup === parent || apiGroup.startsWith(`${parent}/`)) {
+        const raw = facts.text(path.join(facts.cgroupPath(parent), "memory.max")).trim();
+        if (raw !== "max" && (!/^\d+$/.test(raw) || Number(raw) < allClassesMib * facts.MIB)) facts.fail("shared_ancestor_capacity_unavailable");
+      }
+    }
+  }
+  async _prepareControlClass() {
+    const s = STATE.get(this); runtimeDirectory();
+    const directory = path.join(process.env.XDG_RUNTIME_DIR, "systemd", "user");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (fs.realpathSync(directory) !== directory) facts.fail("user_unit_path_unsafe");
+    const file = path.join(directory, "quadwork-control.slice");
+    const content = `[Unit]\nDescription=QuadWork shared bounded control children\nStopWhenUnneeded=no\n[Slice]\nMemoryAccounting=yes\nMemoryMax=${s.policy.control.memory_max_mib}M\nMemorySwapMax=${s.policy.control.swap_max_mib}M\n# concurrency=${s.policy.control.max_concurrent_children}\n`;
+    await lockFiles.withAsyncWriterLock(path.join(runtimeDirectory(), "control-policy"), async () => {
+      try { fs.writeFileSync(file, content, { flag: "wx", mode: 0o600 }); }
+      catch (e) {
+        if (e.code !== "EEXIST") throw e;
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o600 || facts.text(file) !== content) facts.fail("control_policy_owner_conflict");
+      }
+      await exec("systemctl", ["--user", "daemon-reload"], { timeout: 5000, maxBuffer: 16384 });
+      await exec("systemctl", ["--user", "start", "quadwork-control.slice"], { timeout: 5000, maxBuffer: 16384 });
+      this._verifyControlClass();
+    });
+  }
+  _verifyControlClass() {
+    const s = STATE.get(this), group = facts.command("systemctl", ["--user", "show", "quadwork-control.slice", "--property=ControlGroup", "--value"]);
+    if (!group.endsWith("/quadwork-control.slice")) facts.fail("control_class_identity_changed");
+    const limits = facts.readGroup(group);
+    if (limits.memoryMax !== s.policy.control.memory_max_mib * facts.MIB || limits.swapMax !== s.policy.control.swap_max_mib * facts.MIB) facts.fail("control_limits_unavailable");
+    this._verifyAncestorBudget(group);
+  }
+  async _withControlSlot(action, signal) {
+    const s = STATE.get(this), root = runtimeDirectory(), deadline = Date.now() + 30000;
+    do {
+      if (s.closed || signal?.aborted) facts.fail("server_shutting_down");
+      for (let slot = 0; slot < s.policy.control.max_concurrent_children; slot += 1) {
+        let entered = false;
+        try { return await lockFiles.withAsyncWriterLock(path.join(root, `control-slot-${slot}`), () => { entered = true; return action(); }, Date.now()); }
+        catch (e) { if (entered || e.code !== "resource_locked") throw e; }
+      }
+      await wait(25);
+    } while (Date.now() < deadline);
+    facts.fail("control_capacity_exhausted");
   }
   async _prepareSlice(record) {
     const runtimeDir = process.env.XDG_RUNTIME_DIR;
@@ -232,17 +324,21 @@ class LinuxResourceLauncher {
       reclaimGenerationTemp({ facts: record.tempFacts, generationId: record.generationId, confirmedProcessTreeExit: true });
       record.cleaned = true;
     }
-    record.trace?.close();
+    record.trace?.close(); record.retired = true;
+    const records = STATE.get(this).records;
+    const retired = [...records.values()].filter((entry) => entry.retired);
+    for (const old of retired.slice(0, -100)) records.delete(old.generationId);
     return { ok: true, owned: true };
   }
   async _cleanupControlScope(unitName) {
     const unit = `${unitName}.scope`;
-    const output = await exec("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,ControlGroup"], { timeout: 2000, maxBuffer: 16384 });
-    const values = Object.fromEntries(output.stdout.trim().split("\n").map((line) => { const i = line.indexOf("="); return [line.slice(0, i), line.slice(i + 1)]; }));
+    const output = await exec("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,ControlGroup"], { timeout: 2000, maxBuffer: 16384 }).catch((e) => ({ stdout: absentUnitOutput(e) }));
+    const values = unitProperties(output.stdout);
     if (values.LoadState === "not-found" && !values.ControlGroup) return;
     if (!values.ControlGroup && ["inactive", "failed"].includes(values.ActiveState)) return;
     if (!values.ControlGroup?.endsWith(`/${unit}`)) facts.fail("control_scope_identity_changed");
-    if (facts.readGroup(values.ControlGroup).pids.length) await exec("systemctl", ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], { timeout: 2000, maxBuffer: 16384 });
+    let pids; try { pids = facts.readGroup(values.ControlGroup).pids; } catch (e) { if (e.code === "ENOENT") return; throw e; }
+    if (pids.length) await exec("systemctl", ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], { timeout: 2000, maxBuffer: 16384 });
     await boundedUntil(() => { try { return facts.readGroup(values.ControlGroup).pids.length === 0; } catch (e) { return e.code === "ENOENT"; } });
   }
   ownsGeneration(generationId) { return STATE.get(this).records.has(generationId); }
@@ -251,9 +347,13 @@ class LinuxResourceLauncher {
     if (!s.proof || s.closed) facts.fail("containment_unavailable");
     const ids = { projectId: "control-plane", generationId: s.controlGeneration, operationId: crypto.randomBytes(12).toString("hex") };
     const unitName = createControlUnitBase(ids);
-    s.pending.set(unitName, { options: { encoding: "utf8", timeout: 30000, maxBuffer: 32 * 1024 * 1024, ...options } });
+    const abort = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, abort.signal]) : abort.signal;
+    const record = { resourceClass: "control", abort, options: { encoding: "utf8", ...controlOptions(options, 30000), signal } };
+    s.pending.set(unitName, record);
     try {
-      const output = await s.controller.runControlChild({ ...ids, unitName, command: file, args, signal: options.signal });
+      record.done = s.controller.runControlChild({ ...ids, unitName, command: file, args, signal });
+      const output = await record.done;
       return { stdout: output.result.stdout, stderr: output.result.stderr };
     } finally { s.pending.delete(unitName); }
   }
@@ -264,26 +364,43 @@ class LinuxResourceLauncher {
     if (limiter.active >= limiter.limit) facts.fail("control_capacity_exhausted");
     const ids = { projectId: "control-plane", generationId: s.controlGeneration, operationId: crypto.randomBytes(12).toString("hex") };
     const invocation = buildControlScopeInvocation({ ...ids, unitName: createControlUnitBase(ids), controlClassName: "quadwork-control.slice", command: file, args });
+    options = controlOptions(options, 10000);
+    invocation.args.splice(invocation.args.indexOf("--"), 0, "-p", `RuntimeMaxSec=${Math.ceil(options.timeout / 1000) + 5}s`);
+    const action = () => {
+    this._verifyControlClass();
     limiter.active += 1;
-    try { return execFileSync(invocation.file, invocation.args, { timeout: 10000, maxBuffer: 32 * 1024 * 1024, ...options }); }
+    try { return execFileSync(invocation.file, invocation.args, options); }
     finally {
       try {
         const unit = `${invocation.ids.unitName}.scope`;
-        const raw = execFileSync("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,ControlGroup"], { encoding: "utf8", timeout: 2000, maxBuffer: 16384 });
-        const props = Object.fromEntries(raw.trim().split("\n").map((line) => { const i = line.indexOf("="); return [line.slice(0, i), line.slice(i + 1)]; }));
+        let raw;
+        try { raw = execFileSync("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,ControlGroup"], { encoding: "utf8", timeout: 2000, maxBuffer: 16384 }); }
+        catch (e) { raw = absentUnitOutput(e); }
+        const props = unitProperties(raw);
         if (props.ControlGroup) {
           if (!props.ControlGroup.endsWith(`/${unit}`)) facts.fail("control_scope_identity_changed");
           execFileSync("systemctl", ["--user", "stop", unit], { timeout: 3000, maxBuffer: 16384 });
           try { if (facts.readGroup(props.ControlGroup).pids.length) facts.fail("control_cleanup_incomplete"); } catch (e) { if (e.code !== "ENOENT") throw e; }
         } else if (props.LoadState !== "not-found" && !["inactive", "failed"].includes(props.ActiveState)) facts.fail("control_cleanup_unproven");
-      } catch (e) { s.proof = false; throw e; }
+      } catch (e) { s.proof = false; s.cleanupFailed = true; throw e; }
       finally { limiter.active -= 1; }
     }
+    };
+    for (let slot = 0; slot < s.policy.control.max_concurrent_children; slot += 1) {
+      let entered = false;
+      try { return lockFiles.withWriterLock(path.join(runtimeDirectory(), `control-slot-${slot}`), () => { entered = true; return action(); }); }
+      catch (e) { if (entered || e.code !== "resource_locked") throw e; }
+    }
+    facts.fail("control_capacity_exhausted");
   }
   async shutdown() {
     const s = STATE.get(this); s.closed = true;
-    const results = await Promise.allSettled([...s.records.keys()].map((id) => this.stopGeneration(id)));
-    return { ok: results.every((row) => row.status === "fulfilled"), owned_generations: s.records.size };
+    const controls = [...s.pending.values()].filter((record) => record.resourceClass === "control");
+    for (const record of controls) record.abort.abort();
+    const generations = [...s.records.values()];
+    const results = await Promise.allSettled(generations.map((record) => this.stopGeneration(record.generationId)));
+    await Promise.allSettled([...controls, ...generations].map((record) => record.done));
+    return { ok: results.every((row) => row.status === "fulfilled") && !s.cleanupFailed, owned_generations: generations.length };
   }
 }
 module.exports = { LinuxResourceLauncher, boundedUntil, dataRecords, checkProcessSet };

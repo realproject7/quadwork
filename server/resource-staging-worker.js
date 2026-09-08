@@ -21,7 +21,7 @@ if (process.argv[2] === "--held-child") {
   const testFile = path.join(directory, "held.test.cjs");
   fs.writeFileSync(testFile, 'const {test}=require("node:test"); test("held descendant", async()=>{await new Promise(r=>setTimeout(r,90000));});\n', { mode: 0o600 });
   const children = [
-    spawn(process.execPath, ["--test", testFile], { stdio: "ignore", env: process.env }),
+    spawn(process.execPath, ["--test", "--test-isolation=none", testFile], { stdio: "ignore", env: process.env }),
     spawn("git", ["hash-object", "--stdin"], { stdio: ["pipe", "ignore", "ignore"], env: process.env }),
     spawn(process.execPath, [__filename, "--held-child"], { detached: true, stdio: "ignore", env: process.env }),
   ];

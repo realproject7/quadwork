@@ -431,18 +431,19 @@ if (process.platform === "linux") {
     fs.rmSync(patchedHome, { recursive: true, force: true });
   }
 
-  // Production composition is owned by index: construct once, then register
+  // Production composition is owned by index: share one default owner, then register
   // once after JSON middleware. Owner no longer imports or mounts HTTP.
   const indexSource = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
   const ownerSource = fs.readFileSync(path.join(__dirname, "resource-runtime-owner.js"), "utf8");
-  assert.equal((indexSource.match(/createResourceRuntimeOwner\(\)/g) || []).length, 1);
+  assert.equal((indexSource.match(/getSharedResourceRuntimeOwner\(\)/g) || []).length, 1);
   assert.equal((indexSource.match(/registerResourceHttp\(app, resourceRuntimeOwner\)/g) || []).length, 1);
   assert(indexSource.indexOf('app.use(express.json({ limit: "10mb" }))')
     < indexSource.indexOf("registerResourceHttp(app, resourceRuntimeOwner)"));
   assert.equal(ownerSource.includes('require("./resource-http")'), false);
   assert.equal(ownerSource.includes("register(app)"), false);
   assert.equal(indexSource.includes("runWorkerScope"), false);
-  assert.equal(indexSource.includes("runControlChild"), false);
+  assert.equal(indexSource.includes("runControlChildSync"), true);
+  assert.equal(indexSource.includes("new ResourceController"), false);
 
   console.log("resource-runtime-owner.test.js: all assertions passed");
 })().catch((error) => {

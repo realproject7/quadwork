@@ -49,7 +49,7 @@ function resourceStateFilePath(homeDir = os.homedir()) {
 function unavailableExecutor() {
   throw new ResourceRuntimeOwnerError(
     "QW_RESOURCE_CANDIDATE_UNAVAILABLE",
-    "resource process execution is unavailable until staging proof is pinned",
+    "resource process execution requires live platform capability and the owned PTY probe",
   );
 }
 
@@ -304,8 +304,8 @@ class ResourceRuntimeOwner {
       const { input, ...nativeOptions } = options || {};
       return new Promise((resolve, reject) => {
         const child = execFile(file, args, { timeout: 30000, maxBuffer: 32 * 1024 * 1024, ...nativeOptions }, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
-        child.stdin?.on("error", () => {});
-        child.stdin?.end(input);
+        child?.stdin?.on("error", () => {});
+        child?.stdin?.end(input);
       });
     }
     const launcher = OWNER_STATE.get(this)?.launcher;

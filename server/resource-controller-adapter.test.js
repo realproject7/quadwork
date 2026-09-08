@@ -172,7 +172,7 @@ async function main() {
 
     const snapshot = adapter.snapshot();
     assert.equal(snapshot.protocol_status, SYSTEMD_SCOPE_CANDIDATE.status);
-    assert.equal(snapshot.protocol_status, "candidate_pending_staging");
+    assert.equal(snapshot.protocol_status, "supported");
     assert.deepEqual(snapshot.control_children, { limit: 2, active: 0, queued: 0 });
     assert.deepEqual(snapshot.control_class, {
       unit_name: DEFAULT_CONTROL_CLASS_NAME,

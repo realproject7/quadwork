@@ -69,6 +69,8 @@ async function runClosedStagingMatrix(options) {
   const anchor = await journalAnchor(bootId); // permission/completeness before creating workloads
   // A fresh owned home is the only product config/credential directory.
   const root = fs.mkdtempSync(path.join(os.homedir(), ".quadwork-proof-"));
+  let workloadAttempted = false;
+  try {
   fs.chmodSync(root, 0o700);
   const configDirectory = path.join(root, ".quadwork"), tempRoot = path.join(root, "tmp");
   fs.mkdirSync(configDirectory, { mode: 0o700 }); ensureTempRoot({ tempRoot });
@@ -79,6 +81,21 @@ async function runClosedStagingMatrix(options) {
     return { id, name: id, workingDir: cwd, chat_mode: "file", agents: { dev: { command: path.join(__dirname, "resource-staging-worker.js"), cwd, mcp_inject: "none", auto_approve: false } } };
   });
   fs.writeFileSync(path.join(configDirectory, "config.json"), JSON.stringify({ port, file_chat_switchover_done: true, projects, runtime_resources: policy }), { mode: 0o600, flag: "wx" });
+  // Throwaway Git inputs exercise the actual recovery facts path. The clean
+  // filter is real owned code, forwards content unchanged, and holds briefly
+  // so the parent can independently sample its PID/cgroup and the leaf cap.
+  const controlMarkers = path.join(root, "control-observations"); fs.mkdirSync(controlMarkers, { mode: 0o700 });
+  const filter = path.join(root, "control-filter.cjs");
+  fs.writeFileSync(filter, `const fs=require("fs"); fs.writeFileSync(${JSON.stringify(controlMarkers)}+"/"+process.pid, String(process.pid), {mode:384}); process.stdin.pipe(process.stdout); setTimeout(()=>{},1200);\n`, { mode: 0o600 });
+  const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const pressureRepo = projects[0].agents.dev.cwd;
+  await run("git", ["init", "-q", "-b", "main"], { cwd: pressureRepo });
+  await run("git", ["config", "filter.observer.clean", `${quote(process.execPath)} ${quote(filter)}`], { cwd: pressureRepo });
+  fs.writeFileSync(path.join(pressureRepo, ".gitattributes"), "tracked.txt filter=observer\n");
+  fs.writeFileSync(path.join(pressureRepo, "tracked.txt"), "unchanged\n");
+  await run("git", ["add", ".gitattributes", "tracked.txt"], { cwd: pressureRepo });
+  const staleTime = new Date(Date.now() - 300000); fs.utimesSync(path.join(pressureRepo, "tracked.txt"), staleTime, staleTime);
+  for (const name of fs.readdirSync(controlMarkers)) fs.unlinkSync(path.join(controlMarkers, name));
   const owned = { apiUnit, workers: [], tempRoot, runId };
   fs.writeFileSync(path.join(root, "ownership.json"), JSON.stringify(owned), { mode: 0o600, flag: "wx" });
   const childEnv = { HOME: root, PATH: `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`, TMPDIR: tempRoot, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid()}/bus` };
@@ -96,8 +113,8 @@ async function runClosedStagingMatrix(options) {
     await run("systemctl", ["--user", "kill", "--signal=SIGKILL", "--kill-whom=all", worker.unit]);
   }
   try {
+    workloadAttempted = true; apiStarted = true;
     await run("systemd-run", ["--user", "--collect", "--quiet", `--unit=${apiUnit}`, "--service-type=exec", "-p", "MemoryMax=640M", "-p", "MemoryLow=128M", "-p", "OOMPolicy=continue", "-p", "RuntimeMaxSec=120", ...Object.entries(childEnv).map(([k, v]) => `--setenv=${k}=${v}`), "--", process.execPath, path.join(__dirname, "index.js")]);
-    apiStarted = true;
     await boundedUntil(async () => { try { return (await request(origin, "/api/health")).status === "ok"; } catch { return false; } }, 15000);
     token = (await request(origin, "/api/session-token")).token;
     if (typeof token !== "string" || token.length < 16) F.fail("local_session_unavailable");
@@ -119,13 +136,51 @@ async function runClosedStagingMatrix(options) {
       owned.workers.push(record);
       fs.writeFileSync(path.join(root, "ownership.json"), JSON.stringify({ apiUnit, workers: owned.workers.map(({ project, generation, unit, group }) => ({ project, generation, unit, group })) }), { mode: 0o600 });
     }
-    const pressure = owned.workers[0], survivor = owned.workers[1];
+    let pressure = owned.workers[0]; const survivor = owned.workers[1];
     protectedGroups.push(survivor.group);
     pressure.stream.socket.send(JSON.stringify({ type: "resize", cols: 101, rows: 35 }));
     await boundedUntil(() => pressure.stream.records.find((r) => r.kind === "resize" && r.columns === 101 && r.rows === 35));
     process.kill(pressure.main.pid, "SIGUSR1");
     await boundedUntil(() => pressure.stream.records.find((r) => r.kind === "signal"));
     result.primitive = { pty_controlling_terminal: true, resize: true, signal: true, descendants: 6, node_test_git_detached: true, actual_temp_write: true, provider_substitute: false };
+    // An actual terminal exit creates the ordinary recovery-facts trigger.
+    pressure.stream.socket.send(`${JSON.stringify({ kind: "exit", challenge: pressure.ready.challenge })}\n`);
+    await boundedUntil(() => { try { F.readProcess(pressure.main.pid); return false; } catch (e) { return e.code === "ENOENT"; } });
+    pressure.stream.socket.close();
+    const recoveries = Array.from({ length: 3 }, () => fetch(`${origin}/api/agents/proof-pressure/dev/start`, { method: "POST", headers: { "content-type": "application/json", "x-session-token": token }, body: "{}", signal: AbortSignal.timeout(30000) }).then((r) => r.json()));
+    let recoveryDone = false, recoveryError = null;
+    const recovered = Promise.all(recoveries).catch((e) => { recoveryError = e; return []; }).finally(() => { recoveryDone = true; });
+    let maxControl = 0, maxQueued = 0; const controlPids = new Set();
+    while (!recoveryDone) {
+      const snapshot = await request(origin, "/api/resources");
+      maxControl = Math.max(maxControl, snapshot.counts?.active_control_children || 0);
+      maxQueued = Math.max(maxQueued, snapshot.resource_usage?.control?.queued_children || snapshot.counts?.queued_control_children || 0);
+      if (maxControl > 2) F.fail("control_child_limit_exceeded");
+      for (const name of fs.readdirSync(controlMarkers)) {
+        if (!/^\d+$/.test(name)) F.fail("control_observation_invalid");
+        try {
+          const observed = F.readProcess(Number(name));
+          if (!observed.cgroup.includes("/quadwork-control.slice/") || !/\/quadwork-control-[a-f0-9]{40}\.scope$/.test(observed.cgroup)) F.fail("control_child_uncontained");
+          controlPids.add(observed.pid);
+        } catch (e) { if (e.code !== "ENOENT" && e.check !== "process_identity_changed") throw e; }
+      }
+      await wait(50);
+    }
+    const recoveryResults = await recovered;
+    if (recoveryError) throw recoveryError;
+    const launched = recoveryResults.find((entry) => entry.ok === true && entry.lifecycle?.generation_id !== pressure.generation);
+    if (!launched || !launched.repository?.available || maxControl !== 2 || controlPids.size < 2) F.fail("control_child_path_unproven");
+    const generation = launched.lifecycle.generation_id;
+    const unit = `${createWorkerUnitBase({ projectId: "proof-pressure", generationId: generation })}.scope`;
+    const stream = await connectTerminal(origin, "proof-pressure", token); sockets.push(stream);
+    const ready = await boundedUntil(() => stream.records.find((row) => row.kind === "ready"));
+    const group = F.scopeGroup(unit); const main = checkProcessSet(ready, group);
+    F.verifyWorkerGroup(group, { memoryHighMib: 96, memoryMaxMib: 128, swapMaxMib: 16 }, protectedGroups);
+    F.verifyTempFile(ready.temp_file, path.join(tempRoot, `generation-${generation}`));
+    pressure = { project: "proof-pressure", generation, unit, group, main, ready, stream };
+    owned.workers[0] = pressure;
+    fs.writeFileSync(path.join(root, "ownership.json"), JSON.stringify({ apiUnit, workers: owned.workers.map(({ project, generation, unit, group }) => ({ project, generation, unit, group })) }), { mode: 0o600 });
+    result.primitive.control = { real_git_recovery: true, observed_children: controlPids.size, maximum_concurrent: maxControl, observed_queued: maxQueued, configured_limit: 2 };
     const survivorBefore = parentOom(survivor.group), workerBefore = parentOom(pressure.group), vmBefore = vmOomKills();
     // Every sample is an actual product roundtrip and the original live WS.
     let sequence = 0;
@@ -194,5 +249,11 @@ async function runClosedStagingMatrix(options) {
     process.removeListener("SIGINT", onSignal); process.removeListener("SIGTERM", onSignal);
   }
   return result;
+  } catch (error) {
+    // Before any launch only this fresh directory exists. Once a launch has
+    // been attempted, an unexpected cleanup failure preserves exact ownership.
+    if (!workloadAttempted) { fs.rmSync(root, { recursive: true }); throw error; }
+    return { ok: false, reason: "cleanup_incomplete", check: publicError(error), started_phases: [], cleanup: { ok: false, failures: ["ownership_cleanup_unproven"] }, ownership_directory: root };
+  }
 }
 module.exports = { runClosedStagingMatrix };

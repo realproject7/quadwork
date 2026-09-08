@@ -47,8 +47,8 @@ async function main() {
     throwsInvalid(() => runDeliveryGit(request("relative/path", ["rev-parse", "HEAD"])));
     throwsInvalid(() => runDeliveryGit({ ...request(repository, ["rev-parse", "HEAD"]), version: 2 }));
     const source = fs.readFileSync(path.join(__dirname, "delivery-git-runner.js"), "utf8");
-    assert.equal((source.match(/execFile\(/g) || []).length, 1);
-    assert.match(source, /execFile\("git", /);
+    assert.equal((source.match(/runControlChild\(/g) || []).length, 1);
+    assert.match(source, /runControlChild\("git", /);
     assert.doesNotMatch(source, /shell\s*:|\bexec\(|spawn\(|execSync|execFileSync|fork\(/);
     // The production seam: server/index.js injects this exact function into
     // the Delivery Candidate Git-object adapter, not a copy of it.
