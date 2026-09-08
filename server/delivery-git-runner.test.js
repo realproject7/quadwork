@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 "use strict";
 
 // #1066: the fixed Git runner server/index.js injects into the Delivery

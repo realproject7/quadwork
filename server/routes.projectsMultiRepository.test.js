@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #1030: /api/projects aggregates every normalized repository while archived
 // and idle projects initiate zero GitHub calls. Plain node:assert integration.
 

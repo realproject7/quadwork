@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #1031: repository-qualified batch identity and ownership integration.
 // Plain node:assert script.
 

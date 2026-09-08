@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 "use strict";
 
 // Exercise the production routes/stores/dispatcher and file-chat transport.

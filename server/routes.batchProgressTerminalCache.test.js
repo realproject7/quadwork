@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #1050: legacy numeric terminal caches are never Current Batch authority;
 // in-memory rendered rows remain an observation-keyed performance cache.
 

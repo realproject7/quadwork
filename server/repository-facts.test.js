@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 "use strict";
 
 // #1053: the read-only repository-facts capture is exercised against real git

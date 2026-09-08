@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #951: batch-progress must link CLOSED issues to PRs via GitHub's native
 // close-link, not only the `[#N]` title convention. It must also keep CLOSED
 // issues terminal when lookup fails. #1050 retires the Current Batch row cache
@@ -23,7 +24,7 @@ cp.execFile = function stubRunner(file, args, opts, cb) {
   if (file !== "gh" || typeof done !== "function") return realRunner.apply(this, arguments);
   ghCalls.push(args.slice());
   const target = args.find((a) => typeof a === "string" && a.startsWith("repos/"));
-  const ok = (json) => done(null, { stdout: JSON.stringify(json), stderr: "" });
+  const ok = (json) => done(null, JSON.stringify(json), "");
   setImmediate(() => {
     if (target === "repos/o/r/issues/488") {
       return ok({ number: 488, title: "native closed", state: "closed", html_url: "https://x/i/488" });

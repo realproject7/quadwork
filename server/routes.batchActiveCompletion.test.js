@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #839 regression: /api/batch-active must drop to active:false once a batch
 // is complete, even if Head leaves a parked/blocked ticket in the
 // `## Active Batch` section. The route now derives `active` from the shared

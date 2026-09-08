@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 "use strict";
 
 // #1032 end-to-end route proof with real config/map writes and fake direct

@@ -1,3 +1,4 @@
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
 // #870: review-batch server tests — batch-type marker + queue-driven
 // completion, with ZERO GitHub calls. Plain node:assert-style script (run with
 // `node server/routes.reviewBatch.test.js`).
