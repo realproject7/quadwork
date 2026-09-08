@@ -344,7 +344,26 @@ function createDurableStoreFiles(options) {
     return result;
   }
 
-  return Object.freeze({ fs, lstatOrNull, assertRealDirectory, ensureDirectories, storageExists, writeFileAtomically, withWriterLock });
+  // A candidate execution holds the same permanent advisory inode across
+  // awaited transport calls. Contention sleeps asynchronously and has a fixed
+  // deadline; the short atomic writer lock remains a separate inode.
+  async function withAsyncWriterLock(target, action, deadline = Date.now() + 30000) {
+    let lock;
+    while (!lock) {
+      try { lock = acquireLock(`${target}.lock`); }
+      catch (error) {
+        if (error.code !== codes.locked || Date.now() >= deadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+      }
+    }
+    let result, actionError;
+    try { result = await action(); } catch (error) { actionError = error; }
+    try { releaseLock(lock); } catch (error) { if (!actionError) throw error; }
+    if (actionError) throw actionError;
+    return result;
+  }
+
+  return Object.freeze({ fs, lstatOrNull, assertRealDirectory, ensureDirectories, storageExists, writeFileAtomically, withWriterLock, withAsyncWriterLock });
 }
 
 module.exports = {
