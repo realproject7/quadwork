@@ -22,6 +22,7 @@ interface TerminalGridProps {
   projectId: string;
   agents?: Agent[];
   agentStates?: Record<string, string>;
+  agentGenerations?: Record<string, string | null>;
   onStatusChange?: (agentId: string, state: string) => void;
 }
 
@@ -50,6 +51,7 @@ export default function TerminalGrid({
   projectId,
   agents = DEFAULT_AGENTS,
   agentStates = {},
+  agentGenerations = {},
   onStatusChange,
 }: TerminalGridProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -203,6 +205,7 @@ export default function TerminalGrid({
               <TerminalPanel
                 projectId={projectId}
                 agentId={agent.id}
+                generationId={agentGenerations[agent.id] ?? null}
                 onActivity={() => markActivity(agent.id)}
               />
             </div>

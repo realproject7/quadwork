@@ -9,6 +9,8 @@ import { sessionTokenParam } from "@/lib/sessionToken";
 interface TerminalPanelProps {
   projectId: string;
   agentId: string;
+  /** Server-observed generation. A change reattaches only this viewer. */
+  generationId?: string | null;
   /** WebSocket server base URL */
   wsUrl?: string;
   /**
@@ -25,6 +27,7 @@ interface TerminalPanelProps {
 export default function TerminalPanel({
   projectId,
   agentId,
+  generationId = null,
   wsUrl,
   onActivity,
 }: TerminalPanelProps) {
@@ -206,6 +209,7 @@ export default function TerminalPanel({
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (cancelled || wsRef.current !== ws) return;
         reattachAttempts = 0;
         ws.send(
           JSON.stringify({
@@ -221,6 +225,7 @@ export default function TerminalPanel({
       };
 
       ws.onmessage = (e) => {
+        if (cancelled || wsRef.current !== ws) return;
         term.write(e.data);
         if (!fitPending) {
           fitPending = true;
@@ -281,7 +286,7 @@ export default function TerminalPanel({
       fitRef.current = null;
       wsRef.current = null;
     };
-  }, [projectId, agentId, wsUrl, fit]);
+  }, [projectId, agentId, generationId, wsUrl, fit]);
 
   return <div ref={containerRef} className="w-full h-full" />;
 }
