@@ -61,7 +61,7 @@ async function fixture(tasks, run) {
     const state = read(), event_id = `event_${++serial}_${kind}`;
     return store.applyPlan({ expected: { ...owner, manifest_digest: manifest.manifest_digest, pipeline_digest: state.pipeline.pipeline_digest },
       plan: planWorkTaskPipelineEvent(state.pipeline, { version: 1, kind, event_id, ...fields }),
-      terminal_disposition: kind === "integrated_cut" ? { kind, event_id } : null });
+      terminal_disposition: kind === "integrated_cut" ? { kind, event_id } : kind === "set_archived" ? { kind: "archive", event_id, archived: fields.archived } : null });
   }
   function assign(ref, base) {
     const assignment_id = `assignment_${++serial}`;
@@ -152,6 +152,17 @@ await fixture([task("alpha", 42), task("bravo", 42, [{ repository_key: "web", wo
   const completedA = f.merged(composedA, "squash");
   assert.throws(() => f.store.recordDelivery(completedA), { code: "work_task_delivery_active_authority" });
   const oldBravo = f.accept(b, alpha.candidate.candidate_sha, "bravo_old", inFlight);
+  completedA.expected.pipeline_digest = f.read().pipeline.pipeline_digest;
+  const wrongCut = copy(completedA); wrongCut.delivery.work_task_refs.push(copy(b));
+  assert.throws(() => f.store.recordDelivery(wrongCut), { code: "work_task_delivery_cut_mismatch" });
+  const wrongOwner = copy(completedA); wrongOwner.expected.project_id = "other";
+  assert.throws(() => f.store.recordDelivery(wrongOwner), { code: "work_task_delivery_identity_mismatch" });
+  const wrongTree = copy(completedA); wrongTree.delivery.merge_tree = "f".repeat(40);
+  assert.throws(() => f.store.recordDelivery(wrongTree), { code: "invalid_work_task_pipeline_store_delivery" });
+  f.event("set_archived", { archived: true });
+  completedA.expected.pipeline_digest = f.read().pipeline.pipeline_digest;
+  assert.throws(() => f.store.recordDelivery(completedA), { code: "work_task_archive_blocked" });
+  f.event("set_archived", { archived: false });
   completedA.expected.pipeline_digest = f.read().pipeline.pipeline_digest;
   // Process death after the single atomic mapping/base commit: restart uses
   // the old intent and must observe, rather than repeat, the exact completion.

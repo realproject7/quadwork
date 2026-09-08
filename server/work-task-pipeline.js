@@ -242,7 +242,7 @@ function assertRepositoryBases(value, tasks, code) {
 
 function assertWorkTaskPipeline(pipeline) {
   exact(pipeline, ["version", "manifest_digest", "manifest_frozen", "archived", "repository_bases", "history", "tasks", "pipeline_digest",
-    ...(Object.hasOwn(pipeline, "deliveries") ? ["deliveries"] : [])], "invalid_work_task_pipeline");
+    ...(plain(pipeline) && Object.hasOwn(pipeline, "deliveries") ? ["deliveries"] : [])], "invalid_work_task_pipeline");
   if (pipeline.version !== VERSION || !SHA_RE.test(pipeline.manifest_digest) || typeof pipeline.manifest_frozen !== "boolean" || typeof pipeline.archived !== "boolean" ||
       !Array.isArray(pipeline.tasks) || pipeline.tasks.length === 0 || pipeline.tasks.length > MAX_TASKS || !Array.isArray(pipeline.history) || pipeline.history.length > MAX_HISTORY || !SHA_RE.test(pipeline.pipeline_digest)) {
     fail("invalid_work_task_pipeline", "pipeline shape is invalid");
