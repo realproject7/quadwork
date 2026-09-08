@@ -126,19 +126,10 @@ Merge only the reviewed exact tip, then re-read the merge result and target bran
 - Address the role that must act next and include repository/item/attempt identity plus evidence.
 - Never copy an entire ticket or this playbook into chat; cite the durable source and exact revision.
 - When blocked, name the fact, what was checked, who owns the decision, and the smallest next action.
-
-
 ## Local verification contract
 
-Use the repository's explicit evidence policy. New V2 setup selects Local
-verification (`ci-less`); existing external-check policies are never silently
-replaced. Dev runs the repository's existing checks on the clean exact candidate,
-records the integration base, normalized policy digest, actual environment and
-scope, and submits the authenticated evidence operation. Delivery evidence also
-binds the composed manifest digest. Pass requires exit code zero; missing,
-interrupted or skipped checks are not a pass. QuadWork records evidence and does
-not execute configured labels. Never trigger Actions for local verification.
-Head requires the current candidate/base evidence and both independent final
-reviewer receipts before merge. A changed source/base/policy/contract requires
-new evidence; read back the merged state before closure. See
-`docs/operator-mcp.md` for the receipt fields and local command record.
+Use the registered evidence policy: new setup defaults to Local verification (`ci-less`); preserve explicit external-check policies.
+Dev runs existing checks on the clean exact candidate and submits authenticated evidence bound to source/base, policy, actual environment/scope, and the delivery manifest.
+Only completed exit-zero checks pass; missing, interrupted, or skipped checks do not. QuadWork records evidence without executing configured labels. Never trigger Actions for local verification.
+Merge requires current evidence and both independent final reviewer receipts. Source/base/policy/contract drift requires new evidence; read back the merge before closure.
+See the playbook and `docs/operator-mcp.md` for receipt fields and command records.
