@@ -27,7 +27,7 @@ function runtimeDirectory() {
   const root = `/run/user/${process.getuid()}`;
   if (process.env.XDG_RUNTIME_DIR !== root || fs.realpathSync(root) !== root || fs.lstatSync(root).uid !== process.getuid()) facts.fail("user_runtime_identity_invalid");
   const directory = path.join(root, "quadwork-resources");
-  lockFiles.ensureDirectories([directory]);
+  lockFiles.ensureDirectories([{ path: directory, mode: 0o700 }]);
   return directory;
 }
 function unitProperties(raw) {
