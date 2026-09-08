@@ -2213,13 +2213,16 @@ async function launchAgentPty(project, agent, opts = {}) {
     }
     const args = built.args;
 
-    const term = (opts.ptySpawn || pty.spawn)(command, args, {
+    const terminalOptions = {
       name: "xterm-256color",
       cols: 120,
       rows: 30,
       cwd,
       env: { ...process.env, ...extraEnv },
-    });
+    };
+    const term = process.platform === "linux" && !_lifecycleTestFixtures.has(key)
+      ? await resourceRuntimeOwner.spawnWorkerPty({ projectId: project, generationId: opts.generationId, command, args, cwd, env: terminalOptions.env, assertLaunchCurrent: () => { if (!admissionCurrent(lease)) throw new ProjectLifecycleError("project_archived", "project is archived", 409); } })
+      : (opts.ptySpawn || pty.spawn)(command, args, terminalOptions);
 
     const session = {
       projectId: project,
@@ -2426,6 +2429,7 @@ async function admitAgentPty(project, agent, opts = {}) {
     return { ok: false, code: "role_ineligible", status: 404, error: "agent role is not configured", lifecycle: null };
   }
   const testFixture = _lifecycleTestFixtures.get(`${project}/${agent}`) || null;
+  if (process.platform === "linux" && !testFixture) await resourceRuntimeOwner.prepareWorkerLaunch();
   const source = opts.lifecycleSource || "operator_start";
   // #1053: a spawn after a recorded loss (or against an open circuit) is a
   // recovery.  Capture the role worktree's read-only facts BEFORE admission
@@ -2450,14 +2454,10 @@ async function admitAgentPty(project, agent, opts = {}) {
     expectedGeneration: opts.expectedGeneration,
     lossCorrelation: opts.lossCorrelation,
     liveSession: isPtyAlive(agentSessions.get(`${project}/${agent}`)?.term),
-    // Only the private in-process fixture registry can set this capability.
-    // HTTP, config, environment, and ordinary internal opts always reach the
-    // real resource owner with containedLaunch:false below.
+    // Source-owned runtime observations and a real non-pressure PTY probe
+    // establish this capability. HTTP/config cannot supply a proof boolean.
     testFixture,
-    // #1038 has no pinned supported PTY scope in this source yet. This
-    // node-pty launch must therefore never satisfy Linux containment by an
-    // option supplied from a route or recovery caller.
-    containedLaunch: testFixture?.containedLaunch === true,
+    containedLaunch: testFixture?.containedLaunch === true || resourceRuntimeOwner.workerLaunchSupported(),
     launch: async ({ operation_id, generation_id }) => {
       const launched = await launchAgentPty(project, agent, {
         ...opts,

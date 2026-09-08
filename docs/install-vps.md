@@ -718,3 +718,35 @@ Claude bash command starts failing silently with exit 1 (see
 [troubleshooting](troubleshooting.md#every-claude-bash-command-fails-silently-exit-1-no-output)).
 QuadWork sweeps stale entries automatically (hourly + on agent teardown,
 72h age) — configurable via `temp_cleanup` in `~/.quadwork/config.json`.
+
+### Closed disposable containment matrix (#1038)
+
+The installed runner accepts only scalar CLI flags. It owns a fresh local HOME,
+config, loopback API, diagnostic agents, actual chat HTTP requests and terminal
+WebSocket connections. It never accepts an adapter, URL, proof JSON or signer.
+The trusted boundary is the installed source and dedicated local OS account;
+cgroup inheritance does not sandbox hostile same-user systemd bus access.
+
+Run only inside a dedicated disposable Linux VM with 4 GiB RAM, modest swap,
+a real systemd user manager >=253, cgroup v2 and readable kernel journal:
+
+```sh
+node server/resource-staging-proof.js --json --run-pressure-matrix \
+  --ack-disposable-host "DISPOSABLE-STAGING:$(cat /etc/machine-id)"
+```
+
+Read-only/missing acknowledgement attempts refuse before any workload. The
+fixed invocation is node-pty → `systemd-run --user --scope --collect --quiet`,
+with MemoryHigh/MemoryMax/MemorySwapMax and `OOMPolicy=kill`; effective kernel
+limits and `memory.oom.group` are checked before pressure. No `--pipe` or
+uncontained fallback exists. An actual non-pressure PTY/resize/signal/descendant
+probe gates ordinary Linux worker launch. Unsupported hosts retain API/chat
+and report `containment_unavailable`; existing V1 workers are preserved.
+
+The matrix uses 96/128/16 MiB worker high/max/swap, at most 160 MiB of touched
+allocation, API 640 MiB, control 256 MiB, three worker slots and 1536 MiB host
+reserve. These are disposable fixture values, not production defaults. A
+local pass proves Node/test/git/temp inheritance and sampled product reachability;
+it does not prove authenticated Claude/Codex model turns or provider temp use.
+Archive the exact package/source hashes and complete redacted JSON result.
+Never run this command against production or the shared Docker VM.

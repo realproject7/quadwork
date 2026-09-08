@@ -560,3 +560,19 @@ exact prior package version and re-accepting one exact prior policy through a
 fresh proposal token. Do not copy a guessed `.recovery` entry over
 `config.json`, reuse an old acceptance token, delete a newer temp root, or treat
 an earlier staging PASS as evidence for a different package/policy candidate.
+
+### Linux containment unavailable
+
+Keep the API running and inspect the read-only resource report. New worker
+starts require real cgroup v2/user-manager support, finite protected API limits,
+disk-backed generation temp and the source-owned non-pressure PTY probe. A
+config boolean, old receipt, environment module or copied PASS cannot enable it.
+Repair the explicitly configured service/resource policy, then request a fresh
+start. Do not stop healthy legacy workers merely to probe support.
+
+A failed disposable matrix must not be reported as PASS. `cleanup_incomplete`
+preserves its private ownership directory; inspect only the exact recorded units,
+PIDs and generation temp. Never run broad `pkill`, delete arbitrary `/tmp`, or
+stop a shared service. Kernel journal denial or ambiguous/global OOM makes the
+proof unavailable. `/proc/vmstat` OOM counts include memcg victims and are not a
+global-only counter. No provider credentials are required or read by the matrix.

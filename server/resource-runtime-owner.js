@@ -13,6 +13,8 @@ const {
   createResourceRuntimeService,
 } = require("./resource-runtime-service");
 const { parseRuntimeResources } = require("./resource-policy");
+const { LinuxResourceLauncher } = require("./resource-linux-launcher");
+const { createResourceRuntimeProofAuthority } = require("./resource-runtime-snapshot");
 const {
   DEFAULT_TERMINAL_FACT_LIMIT,
   ResourceStateStore,
@@ -224,19 +226,28 @@ class ResourceRuntimeOwner {
       runtimeService: null,
       stateStore,
       persistedEvidence,
+      launcher: null,
     };
     try {
-      const probes = createReadOnlyProbes({
+      // Injected read-only fixtures can never acquire process capability.
+      if (fsImpl === fs && execFileSyncImpl === execFileSync && homeDir === os.homedir() && process.platform === "linux") {
+        state.launcher = new LinuxResourceLauncher(policy);
+      }
+      const rawProbes = createReadOnlyProbes({
         fsImpl,
         execFileSyncImpl,
         scopeProof: false,
       });
+      const probes = Object.fromEntries(["memory", "containment", "temp", "api", "activeScopes"].map((name) => [name, (...args) => {
+        if (!state.launcher?.ready()) return rawProbes[name](...args);
+        return createReadOnlyProbes({ fsImpl, execFileSyncImpl, scopeProof: true })[name](...args);
+      }]));
       const observationProvider = new ResourceObservationProvider({
         fsImpl,
         execFileSyncImpl,
         timeoutMs: OBSERVATION_TIMEOUT_MS,
       });
-      const controller = createResourceControllerAdapter({
+      const controller = state.launcher || createResourceControllerAdapter({
         policy,
         observationProvider,
         executeProcess: unavailableExecutor,
@@ -251,6 +262,7 @@ class ResourceRuntimeOwner {
         probes,
         controllerAdapter: snapshotOnlyController,
         observationProvider,
+        ...(state.launcher ? { proofAuthority: createResourceRuntimeProofAuthority() } : {}),
       });
     } catch {
       state.runtimeService = null;
@@ -263,6 +275,33 @@ class ResourceRuntimeOwner {
     const state = OWNER_STATE.get(this);
     if (!state) throw new TypeError("ResourceRuntimeOwner receiver is invalid");
     return ownerSnapshot(state);
+  }
+
+  async prepareWorkerLaunch() {
+    const state = OWNER_STATE.get(this);
+    if (!state?.launcher) return false;
+    return state.launcher.prepare();
+  }
+
+  workerLaunchSupported() { return OWNER_STATE.get(this)?.launcher?.ready() === true; }
+
+  async spawnWorkerPty(spec) {
+    const state = OWNER_STATE.get(this);
+    if (!state?.launcher?.ready()) throw new ResourceRuntimeOwnerError("containment_unavailable", "Linux worker containment is unavailable");
+    return state.launcher.spawnPty(spec);
+  }
+
+  ownsWorkerGeneration(generationId) { return OWNER_STATE.get(this)?.launcher?.ownsGeneration(generationId) === true; }
+  async stopWorkerGeneration(generationId) {
+    const launcher = OWNER_STATE.get(this)?.launcher;
+    if (!launcher?.ownsGeneration(generationId)) return { ok: false, owned: false, reason: "resource_generation_not_owned" };
+    return launcher.stopGeneration(generationId);
+  }
+  async shutdown() { return OWNER_STATE.get(this)?.launcher?.shutdown() || { ok: true, owned_generations: 0 }; }
+  async runControlChild(file, args, options) {
+    const launcher = OWNER_STATE.get(this)?.launcher;
+    if (!launcher?.ready()) throw new ResourceRuntimeOwnerError("containment_unavailable", "control resource containment is unavailable");
+    return launcher.runControlChild(file, args, options);
   }
 
   persist(snapshot) {

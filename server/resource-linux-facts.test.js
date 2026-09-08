@@ -1,0 +1,17 @@
+"use strict";
+const assert = require("node:assert/strict");
+const F = require("./resource-linux-facts");
+const stat = "42 (worker (with spaces)) S 12 42 42 34816 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0";
+assert.deepEqual(F.parseProcStat(stat), { pid: 42, state: "S", ppid: 12, pgrp: 42, session: 42, tty: 34816, startTime: "12345" });
+assert.equal(F.sameProcess({ pid: 42, startTime: "1", cgroup: "/a" }, { pid: 42, startTime: "2", cgroup: "/a" }), false);
+for (const input of ["0::/a/../b", "0::/a\n0::/b", "1:memory:/a", "0::/a//b"]) assert.throws(() => F.parseCgroup(input));
+assert.deepEqual(F.parseEvents("low 0\nhigh 1\nmax 2\noom 1\noom_kill 1\n"), { low: 0, high: 1, max: 2, oom: 1, oom_kill: 1 });
+for (const value of ["oom 0", "oom_kill 0\noom_kill 1", "oom_kill max"]) assert.throws(() => F.parseEvents(value));
+const bootId = "a".repeat(32), ownedGroup = "/user.slice/owned.scope";
+const row = (MESSAGE) => ({ _BOOT_ID: bootId, __CURSOR: "cursor", MESSAGE });
+const events = [row(`oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=${ownedGroup},task=worker,pid=42`), row("Memory cgroup out of memory: Killed process 42 (node)")];
+assert.equal(F.parseKernelInterval(events, { bootId, ownedGroup, vmKills: 1 }).classified_memcg_kills, 1);
+for (const options of [{ bootId: "wrong", ownedGroup, vmKills: 1 }, { bootId, ownedGroup: "/foreign", vmKills: 1 }, { bootId, ownedGroup, vmKills: 2 }]) assert.throws(() => F.parseKernelInterval(events, options));
+assert.throws(() => F.parseKernelInterval([row("oom-kill:constraint=CONSTRAINT_NONE"), ...events], { bootId, ownedGroup, vmKills: 1 }));
+assert.throws(() => F.parseKernelInterval([], { bootId, ownedGroup, vmKills: 0 }));
+console.log("resource-linux-facts: process identity, cgroup and kernel interval discriminators passed");
