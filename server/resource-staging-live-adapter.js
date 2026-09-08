@@ -128,7 +128,7 @@ async function runClosedStagingMatrix(options) {
   const childEnv = { HOME: root, PATH: `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`, TMPDIR: tempRoot, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid()}/bus` };
   const result = { ok: false, reason: "proof_failed", started_phases: [], primitive: {}, integrated: {}, cleanup: { ok: false }, provider_startup: "unavailable_not_installed_or_not_exercised", provider_model_turns: "unproved_no_credentials", source_files: sourceManifest(), versions: { node: process.version, kernel: os.release(), systemd: F.command("systemctl", ["--version"]).split("\n")[0] }, limits_mib: { ...policy, temp_root: undefined } };
   result.source_digest = sha(JSON.stringify(result.source_files));
-  let token = null, apiStarted = false, monitorStop = false, monitoring = null, monitorFailure = null;
+  let token = null, apiStarted = false, monitorStop = false, monitoring = null, monitorFailure = null, pressureStarted = null;
   const sockets = [], protectedGroups = [], samples = [];
   let signalReceived = false;
   const onSignal = () => { signalReceived = true; monitorFailure = "proof_interrupted"; };
@@ -251,13 +251,15 @@ async function runClosedStagingMatrix(options) {
       if (F.text(`/proc/${pressure.main.pid}/task/${tid}/comm`).trim() === "libuv-worker") poolThreads++;
     }
     if (poolThreads !== 16 || pressure.ready.pool_size !== 16 || JSON.stringify(pressure.ready.tids) !== JSON.stringify(tids)) F.fail("allocation_pool_unproven");
+    pressure.threadIds = tids;
     result.started_phases.push("integrated_bounded_worker_oom");
-    const pressureStart = Date.now();
+    const pressureStart = Date.now(); pressureStarted = pressureStart;
     pressure.stream.socket.send(`${JSON.stringify({ kind: "pressure", challenge: pressure.ready.challenge })}\n`);
     await boundedUntil(() => pressure.stream.records.some((r) => r.kind === "allocation_threads_after"), 3000);
-    pressureObservations(pressure.stream.records, pressure.main.pid, tids);
+    result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, tids);
     await boundedUntil(() => parentOom(pressure.group) > workerBefore, 45000);
     const pressureEnd = Date.now();
+    result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: pressureEnd - pressureStart };
     await boundedUntil(() => { try { return F.readGroup(pressure.group).pids.length === 0; } catch (e) { return e.code === "ENOENT"; } });
     await sample();
     result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, tids);
@@ -274,6 +276,11 @@ async function runClosedStagingMatrix(options) {
     if (sha(JSON.stringify(sourceManifest())) !== result.source_digest) F.fail("source_changed");
     result.ok = true; result.reason = "proof_passed";
   } catch (error) {
+    if (pressureStarted !== null) result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: Date.now() - pressureStarted };
+    const pressure = owned.workers.find((w) => w.project === "proof-pressure");
+    if (pressure?.threadIds) {
+      try { result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, pressure.threadIds); } catch {}
+    }
     result.check = publicError(error);
     if (error.httpFailure) result.failed_request = error.httpFailure;
     if (apiStarted) {
