@@ -204,6 +204,8 @@ const COPY = {
     modelsStep: {
       title: "Configure agent CLI backends",
       desc: "Each agent runs its own CLI instance. Pick the backend for each role.",
+      reviewerSettings: "Open Settings → Reviewer Account (new tab)",
+      reviewerSettingsHelp: "Reviewer credentials are global and managed in Settings. Project activation does not configure them.",
       next: "Next",
     },
     workspacesStep: {
@@ -227,7 +229,6 @@ const COPY = {
       repo: "Repository",
       branchProtection: "+ branch protection",
       backends: "Backends",
-      reviewer: "Reviewer",
       directory: "Directory",
       status: "Status",
     },
@@ -283,6 +284,8 @@ const COPY = {
     modelsStep: {
       title: "에이전트 CLI 백엔드 구성",
       desc: "각 에이전트는 자체 CLI 인스턴스를 사용합니다. 역할별로 백엔드를 선택하세요.",
+      reviewerSettings: "설정 → 리뷰어 계정 열기 (새 탭)",
+      reviewerSettingsHelp: "리뷰어 인증 정보는 설정에서 전역으로 관리합니다. 프로젝트 활성화 시에는 변경하지 않습니다.",
       next: "다음",
     },
     workspacesStep: {
@@ -306,7 +309,6 @@ const COPY = {
       repo: "저장소",
       branchProtection: "+ 브랜치 보호",
       backends: "백엔드",
-      reviewer: "리뷰어",
       directory: "디렉터리",
       status: "상태",
     },
@@ -509,11 +511,6 @@ export default function SetupWizard() {
     head: "claude", re1: "claude", re2: "claude", dev: "claude",
   });
   const [autoApprove, setAutoApprove] = useState(true);
-  const [showReviewerCreds, setShowReviewerCreds] = useState(false);
-  const [reviewerUser, setReviewerUser] = useState("");
-  const [reviewerTokenMode, setReviewerTokenMode] = useState<"paste" | "file">("paste");
-  const [reviewerTokenValue, setReviewerTokenValue] = useState("");
-  const [reviewerTokenPath, setReviewerTokenPath] = useState("~/.quadwork/reviewer-token");
   const [workingDir, setWorkingDir] = useState("");
   const [loading, setLoading] = useState(false);
   const [workspaceLog, setWorkspaceLog] = useState<string[]>([]);
@@ -764,21 +761,6 @@ export default function SetupWizard() {
     goNext();
   };
 
-  const saveReviewerTokenIfRequested = async () => {
-    if (!showReviewerCreds || reviewerTokenMode !== "paste" || !reviewerTokenValue) return true;
-    try {
-      const response = await fetch("/api/setup/save-token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: reviewerTokenValue }),
-      });
-      const result = await response.json();
-      return result.ok === true;
-    } catch {
-      return false;
-    }
-  };
-
   // Final activation is the only config mutation in this UI flow. It is
   // explicitly confirmed and deliberately does not launch or restart agents.
   const launchProject = async () => {
@@ -787,11 +769,6 @@ export default function SetupWizard() {
       return;
     }
     setLaunchStatus("running");
-    if (!await saveReviewerTokenIfRequested()) {
-      setLaunchStatus("error");
-      setV2Message("Reviewer credential storage failed [reviewer_token_save_failed]. Retry activation after checking the credential.");
-      return;
-    }
     const result = await runV2Step("activate-v2");
     if (result.ok) {
       setLaunchStatus("done");
@@ -1112,102 +1089,12 @@ export default function SetupWizard() {
                   </span>
                 </label>
 
-                {/* Reviewer credentials toggle */}
-                <label className="flex items-center gap-2 mb-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={showReviewerCreds}
-                    onChange={(e) => setShowReviewerCreds(e.target.checked)}
-                    className="accent-accent"
-                  />
-                  <span className="text-[11px] text-text-muted">
-                    Configure reviewer credentials (for GitHub PR reviews)
-                  </span>
-                </label>
-
-                {showReviewerCreds && (
-                  <div className="border border-border p-3 mb-4 space-y-3">
-                    <div>
-                      <label className="text-[11px] text-text-muted block mb-1">Reviewer GitHub username</label>
-                      <input
-                        value={reviewerUser}
-                        onChange={(e) => setReviewerUser(e.target.value)}
-                        placeholder="github-username"
-                        className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-text-muted block mb-2">Token source</label>
-                      <div className="flex gap-4 mb-2">
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="radio"
-                            name="tokenMode"
-                            checked={reviewerTokenMode === "paste"}
-                            onChange={() => setReviewerTokenMode("paste")}
-                            className="accent-accent"
-                          />
-                          <span className="text-[11px] text-text">Paste token</span>
-                        </label>
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="radio"
-                            name="tokenMode"
-                            checked={reviewerTokenMode === "file"}
-                            onChange={() => setReviewerTokenMode("file")}
-                            className="accent-accent"
-                          />
-                          <span className="text-[11px] text-text">Use existing file</span>
-                        </label>
-                      </div>
-                      {reviewerTokenMode === "paste" ? (
-                        <>
-                          <input
-                            value={reviewerTokenValue}
-                            onChange={(e) => setReviewerTokenValue(e.target.value)}
-                            placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-                            type="password"
-                            className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
-                          />
-                          <div className="mt-2 text-[10px] text-text-muted leading-relaxed">
-                            <p>Paste a GitHub <span className="text-text">Personal Access Token (classic)</span>.</p>
-                            <p className="mt-1">
-                              Create one at{" "}
-                              <a
-                                href="https://github.com/settings/tokens"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-accent hover:underline"
-                              >
-                                github.com/settings/tokens
-                              </a>
-                              {" "}&#8594; Generate new token (classic)
-                            </p>
-                            <p className="mt-1">
-                              Required permission: <span className="text-accent">repo</span> (Full control of private repositories)
-                              <br />
-                              <span className="text-text-muted">Needed for reading PRs, posting reviews, and approving/requesting changes</span>
-                            </p>
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <input
-                            value={reviewerTokenPath}
-                            onChange={(e) => setReviewerTokenPath(e.target.value)}
-                            placeholder="~/.quadwork/reviewer-token"
-                            className="w-full bg-transparent border border-border px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
-                          />
-                          {reviewerTokenPath && !reviewerTokenPath.startsWith("~/.quadwork") && !reviewerTokenPath.startsWith(String.raw`${process.env.HOME}/.quadwork`) && (
-                            <p className="text-[10px] text-[#ffcc00] mt-1">
-                              This path may be inside a git repository. Consider using the default ~/.quadwork/ location to avoid accidentally committing tokens.
-                            </p>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  </div>
-                )}
+                <div className="border border-border p-3 mb-4 text-[11px]">
+                  <a href="/settings" target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
+                    {t.modelsStep.reviewerSettings}
+                  </a>
+                  <p className="text-text-muted mt-1.5">{t.modelsStep.reviewerSettingsHelp}</p>
+                </div>
 
                 <button
                   onClick={goNext}
@@ -1410,12 +1297,6 @@ export default function SetupWizard() {
                 </div>
               ))}
             </div>
-            {showReviewerCreds && reviewerUser && (
-              <div>
-                <span className="text-text-muted block mb-0.5">{t.preview.reviewer}</span>
-                <span className="text-text">@{reviewerUser}</span>
-              </div>
-            )}
             <div>
               <span className="text-text-muted block mb-0.5">{t.preview.directory}</span>
               <span className="text-text font-mono text-[10px]">{workingDir || "\u2014"}</span>
