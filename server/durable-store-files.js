@@ -348,6 +348,8 @@ function createDurableStoreFiles(options) {
   // awaited transport calls. Contention sleeps asynchronously and has a fixed
   // deadline; the short atomic writer lock remains a separate inode.
   async function withAsyncWriterLock(target, action, deadline = Date.now() + 30000) {
+    // This deadline bounds acquisition, not the action's awaited runtime.
+    if (!Number.isFinite(deadline) || !Number.isSafeInteger(deadline) || deadline <= 0 || typeof action !== "function") fail(codes.options, "async writer lock requires an absolute deadline and action");
     let lock;
     while (!lock) {
       try { lock = acquireLock(`${target}.lock`); }
@@ -356,10 +358,10 @@ function createDurableStoreFiles(options) {
         await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
       }
     }
-    let result, actionError;
-    try { result = await action(); } catch (error) { actionError = error; }
-    try { releaseLock(lock); } catch (error) { if (!actionError) throw error; }
-    if (actionError) throw actionError;
+    let result, actionError, actionFailed = false;
+    try { result = await action(); } catch (error) { actionError = error; actionFailed = true; }
+    try { releaseLock(lock); } catch (error) { if (!actionFailed) throw error; }
+    if (actionFailed) throw actionError;
     return result;
   }
 
