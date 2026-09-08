@@ -66,6 +66,18 @@ function createDeliveryExecutor(deps) {
     if (receipt.declaration.isolation_reasons.length && snapshot.delivery_candidate_ref.delivery_mode !== "isolated") C.fail("delivery_isolation_required");
     return receipt;
   }
+  function formationOwnsPlan(snapshot, form, planValue) {
+    if (form.digest === planValue.formation_digest) return true;
+    const origin = snapshot.delivery?.publication;
+    if (!origin || origin.plan.plan_digest !== planValue.plan_digest || !origin.formation) return false;
+    C.assertSeal(origin.formation);
+    // A freshly authenticated higher generation may re-form the same ordinary
+    // candidate. Its new authority never rewrites the original publication.
+    return origin.formation.binding.installation_id === binding.installation_id &&
+      origin.formation.binding.project_id === binding.project_id && origin.formation.binding.role === "head" &&
+      origin.formation.binding.generation < binding.generation &&
+      same(origin.formation.facts, form.facts) && same(origin.formation.declaration, form.declaration);
+  }
   async function plan(ref) {
     owned(ref);
     const snapshot = composed(ref), form = await formation(snapshot);
@@ -74,6 +86,11 @@ function createDeliveryExecutor(deps) {
     const old = basePlan(snapshot);
     const content = { ...old, kind: "delivery_publication_ready", operator_approval_required: false,
       base_branch: base.branch, base_sha: base.sha, formation_digest: form.digest };
+    const prior = snapshot.delivery?.publication?.plan;
+    if (prior && formationOwnsPlan(snapshot, form, prior)) {
+      const { plan_digest: ignored, ...original } = prior;
+      if (same({ ...original, formation_digest: form.digest }, content)) return C.clone(prior);
+    }
     return { ...content, plan_digest: C.digest(content) };
   }
   function readOperation(snapshot, command) {
@@ -115,7 +132,7 @@ function createDeliveryExecutor(deps) {
       const mutationReady = async (planValue) => {
         guard(); if (Date.now() >= deadline) C.fail("delivery_deadline_exceeded");
         const form = await formation(snapshot);
-        if (form.digest !== planValue.formation_digest) C.fail("delivery_formation_stale");
+        if (!formationOwnsPlan(snapshot, form, planValue)) C.fail("delivery_formation_stale");
         await remote.validate();
         const base = await remote.base();
         if (base.branch !== planValue.base_branch || base.sha !== ref.base_sha) C.fail("delivery_base_drift");
@@ -135,6 +152,7 @@ function createDeliveryExecutor(deps) {
             if (delivery.publication.plan.plan_digest !== command.payload.plan_digest) C.fail("delivery_plan_changed");
           }
           const currentPlan = await plan(ref);
+          const currentFormation = await formation(snapshot);
           if (currentPlan.plan_digest !== command.payload.plan_digest) C.fail("delivery_plan_changed");
           op.checkpoint = C.sealed({ plan: currentPlan, branch_sha: null });
           save("publication_preflight");
@@ -162,7 +180,7 @@ function createDeliveryExecutor(deps) {
           }
           pull = await remote.readPull(pull.number);
           assertPull(pull, currentPlan, ref);
-          delivery.publication = C.sealed({ version: 1, plan: currentPlan, pull, branch_sha: oid, observed_at: deps.now() });
+          if (!delivery.publication) delivery.publication = C.sealed({ version: 1, plan: currentPlan, formation: currentFormation, pull, branch_sha: oid, observed_at: deps.now() });
           save("published"); guard();
           await deps.observe_review(ref, pull.number);
           return done({ publication_digest: delivery.publication.digest, pr_number: pull.number, url: pull.url, candidate_revision: snapshot.revision + 1 });
