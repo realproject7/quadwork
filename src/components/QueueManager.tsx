@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
-import { sessionTokenParam, sessionTokenHeaders } from "@/lib/sessionToken";
+import { sessionTokenHeaders } from "@/lib/sessionToken";
 import { qualifiedQueueToken, sanitizeRemoteTitle } from "@/lib/batchIdentity";
 
 interface Issue {
@@ -212,88 +212,19 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
         return;
       }
 
-      // #968: auth the PTY-driving calls (WS + writes).
+      // Authenticate the prompt write to the existing Head session.
       const auth = await sessionTokenHeaders();
-      const tok = await sessionTokenParam();
 
       // Same-origin: all API calls go to the same host
-      let res = await fetch(`/api/agents/${projectId}/head/write`, {
+      const res = await fetch(`/api/agents/${projectId}/head/write`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...auth },
         body: JSON.stringify({ text: prompt + "\n" }),
       });
 
-      // If no session exists, create one and start the Head agent
       if (res.status === 404) {
-        const project = cfg.projects?.find((p: { id: string }) => p.id === projectId);
-        const headCommand = project?.agents?.head?.command || "claude";
-
-        // Open WebSocket to create PTY session
-        // In dev mode, WS connects directly to Express backend since Next.js doesn't proxy WS
-        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const backendPort = cfg.port || 8400;
-        const currentPort = parseInt(window.location.port, 10);
-        const wsHost = (currentPort && currentPort !== backendPort)
-          ? `${window.location.hostname}:${backendPort}`
-          : window.location.host;
-        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?project=${encodeURIComponent(projectId)}&agent=head${tok ? `&${tok}` : ""}`;
-        const ws = new WebSocket(wsUrl);
-        try {
-          await new Promise<void>((resolve, reject) => {
-            ws.onopen = () => resolve();
-            ws.onerror = () => reject(new Error("WebSocket failed"));
-            setTimeout(() => reject(new Error("WebSocket timeout")), 5000);
-          });
-
-          // #973: poll /api/sessions until the PTY the WS just spawned is
-          // registered, instead of a fixed 500ms sleep a slow spawn on a
-          // busy event loop could outrun — which would write the head
-          // command into a shell that isn't ready yet.
-          const sessionReady = await new Promise<boolean>((resolve) => {
-            const deadline = Date.now() + 5000;
-            const probe = async () => {
-              try {
-                const sres = await fetch("/api/sessions");
-                if (sres.ok) {
-                  const list = await sres.json();
-                  if (Array.isArray(list) && list.some((s) => s && s.projectId === projectId && s.agentId === "head")) {
-                    resolve(true);
-                    return;
-                  }
-                }
-              } catch { /* transient — keep probing */ }
-              if (Date.now() < deadline) setTimeout(probe, 150);
-              else resolve(false);
-            };
-            probe();
-          });
-          if (!sessionReady) throw new Error("session did not come up");
-
-          // Start the Head agent CLI in the PTY shell
-          await fetch(`/api/agents/${projectId}/head/write`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", ...auth },
-            body: JSON.stringify({ text: `${headCommand}\n` }),
-          });
-
-          // Wait for the agent CLI to initialize before sending the prompt.
-          // There's no liveness signal for CLI readiness (the session is
-          // already live), so this stays a short fixed warm-up.
-          await new Promise((r) => setTimeout(r, 3000));
-
-          // Now write the queue prompt to the running agent
-          res = await fetch(`/api/agents/${projectId}/head/write`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", ...auth },
-            body: JSON.stringify({ text: prompt + "\n" }),
-          });
-        } finally {
-          // #973: the bootstrap WS existed only to spawn the PTY; the real
-          // Head terminal attaches as its own viewer. Close it so it doesn't
-          // leak open for the lifetime of the page. (The server keeps the
-          // PTY alive with zero viewers — it's torn down only on stop/reset.)
-          try { ws.close(); } catch { /* already closing */ }
-        }
+        alert("Head is stopped. Start Head from the project terminal controls, then retry Send to Head.");
+        return;
       }
 
       if (res.ok) {
