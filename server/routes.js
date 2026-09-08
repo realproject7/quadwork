@@ -1817,7 +1817,7 @@ function writeOvernightQueueFileSafe(projectId, projectName, repo) {
     let content = fs.readFileSync(tpl, "utf-8");
     content = content.replace(/\{\{project_name\}\}/g, projectName || projectId || "");
     content = content.replace(/\{\{repo\}\}/g, repo || "");
-    fs.writeFileSync(queuePath, content);
+    fs.writeFileSync(queuePath, content, { flag: "wx" });
   } catch { /* non-fatal */ }
 }
 
@@ -1834,7 +1834,7 @@ function writeGithubFileSafe(projectId, projectName, repo) {
     let content = fs.readFileSync(tpl, "utf-8");
     content = content.replace(/\{\{project_name\}\}/g, projectName || projectId || "");
     content = content.replace(/\{\{repo\}\}/g, repo || "");
-    fs.writeFileSync(ghPath, content);
+    fs.writeFileSync(ghPath, content, { flag: "wx" });
   } catch { /* non-fatal */ }
 }
 
@@ -6570,6 +6570,27 @@ router.post("/api/setup", async (req, res) => {
       // made atomic with this local commit; no GitHub write occurs in it.
       const postProvisionAccess = await verifyV2RepositoryAccess(repositories);
       if (!postProvisionAccess.ok) return res.status(409).json({ ok: false, ...postProvisionAccess });
+      // Prepare required create-only files before publishing a new project.
+      // A missing queue after commit would fail the existing retry admission.
+      let initializationStep = "queue";
+      try {
+        const repo = primaryRepository(candidate)?.repo || "";
+        for (const [stepName, fileName, seed] of [
+          ["queue", "OVERNIGHT-QUEUE.md", writeOvernightQueueFileSafe],
+          ["github", "GITHUB.md", writeGithubFileSafe],
+        ]) {
+          initializationStep = stepName;
+          seed(candidate.id, candidate.name || candidate.id, repo);
+          // These established helpers swallow errors. Existing operator files
+          // remain untouched, but success requires a readable regular file.
+          const target = path.join(CONFIG_DIR, candidate.id, fileName);
+          const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+          try { if (!fs.fstatSync(fd).isFile()) throw new Error("project file unavailable"); }
+          finally { fs.closeSync(fd); }
+        }
+      } catch {
+        return res.status(409).json({ ok: false, code: "project_runtime_initialization_failed", initialization_step: initializationStep, activation_committed: false, ...publicProvisioningResult(provisioned) });
+      }
       try {
         commitV2Configuration((fresh) => {
           const currentFirstGuard = firstActivationLegacyGuard(fresh, candidate.id, v2SetupExecutionState);
@@ -6603,6 +6624,14 @@ router.post("/api/setup", async (req, res) => {
       }
       const persistedConfig = readConfigFile();
       const persistedProject = (persistedConfig.projects || []).find((project) => project?.id === candidate.id);
+      // Fresh V2 setup never visits legacy add-config. Initialize its live chat
+      // owner before success or reseeding, preserving clean worktrees for retry.
+      try {
+        fileChat.initProject(persistedProject.id);
+        if (!fileChat.isProjectInitialized(persistedProject.id)) throw new Error("file chat unavailable");
+      } catch {
+        return res.status(409).json({ ok: false, code: "project_runtime_initialization_failed", initialization_step: "file_chat", activation_committed: true, ...publicProvisioningResult(provisioned) });
+      }
       try {
         const map = renderProjectRepositoryMap({ projectId: candidate.id, repositories: provisioned.repositories });
         writeProjectRepositoryMap({ configDir: CONFIG_DIR, projectId: candidate.id, content: map });
