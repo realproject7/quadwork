@@ -140,15 +140,8 @@ codex             # Follow login prompt
 gemini            # Follow login prompt (only if using Gemini)
 ```
 
-**If migrating from an existing server**, copy auth configs instead:
-
-```bash
-# From your local machine
-ssh quadwork-old 'tar czf /tmp/auth-backup.tar.gz .claude .codex .config/gh'
-scp quadwork-old:/tmp/auth-backup.tar.gz /tmp/
-scp /tmp/auth-backup.tar.gz quadwork:/tmp/
-ssh quadwork 'cd ~ && tar xzf /tmp/auth-backup.tar.gz && rm /tmp/auth-backup.tar.gz'
-```
+If migrating from an existing server, authenticate on the new server using the
+same interactive login steps above.
 
 ---
 
