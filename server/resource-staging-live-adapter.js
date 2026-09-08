@@ -16,6 +16,7 @@ const { createWorkerUnitBase } = require("./resource-unit");
 const F = require("./resource-linux-facts");
 const { boundedUntil, checkProcessSet } = require("./resource-linux-launcher");
 const { pressureObservations, controlMarker, controlObservationReady, controlFilterSource } = require("./resource-staging-observation");
+const { createPressureObservationWindow } = require("./resource-pressure-deadline");
 const exec = promisify(execFile);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
@@ -128,7 +129,7 @@ async function runClosedStagingMatrix(options) {
   const childEnv = { HOME: root, PATH: `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`, TMPDIR: tempRoot, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid()}/bus` };
   const result = { ok: false, reason: "proof_failed", started_phases: [], primitive: {}, integrated: {}, cleanup: { ok: false }, provider_startup: "unavailable_not_installed_or_not_exercised", provider_model_turns: "unproved_no_credentials", source_files: sourceManifest(), versions: { node: process.version, kernel: os.release(), systemd: F.command("systemctl", ["--version"]).split("\n")[0] }, limits_mib: { ...policy, temp_root: undefined } };
   result.source_digest = sha(JSON.stringify(result.source_files));
-  let token = null, apiStarted = false, monitorStop = false, monitoring = null, monitorFailure = null, pressureStarted = null;
+  let token = null, apiStarted = false, monitorStop = false, monitoring = null, monitorFailure = null, pressureWindow = null;
   const sockets = [], protectedGroups = [], samples = [];
   let signalReceived = false;
   const onSignal = () => { signalReceived = true; monitorFailure = "proof_interrupted"; };
@@ -253,13 +254,13 @@ async function runClosedStagingMatrix(options) {
     if (poolThreads !== 16 || pressure.ready.pool_size !== 16 || JSON.stringify(pressure.ready.tids) !== JSON.stringify(tids)) F.fail("allocation_pool_unproven");
     pressure.threadIds = tids;
     result.started_phases.push("integrated_bounded_worker_oom");
-    const pressureStart = Date.now(); pressureStarted = pressureStart;
+    const pressureStart = Date.now(); pressureWindow = createPressureObservationWindow();
     pressure.stream.socket.send(`${JSON.stringify({ kind: "pressure", challenge: pressure.ready.challenge })}\n`);
-    await boundedUntil(() => pressure.stream.records.some((r) => r.kind === "allocation_threads_after"), 3000);
+    await pressureWindow.waitFor(() => pressure.stream.records.some((r) => r.kind === "allocation_threads_after"), () => monitorFailure);
     result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, tids);
-    await boundedUntil(() => parentOom(pressure.group) > workerBefore, 45000);
+    await pressureWindow.waitFor(() => parentOom(pressure.group) > workerBefore, () => monitorFailure);
     const pressureEnd = Date.now();
-    result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: pressureEnd - pressureStart };
+    result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: pressureWindow.elapsedMs() };
     await boundedUntil(() => { try { return F.readGroup(pressure.group).pids.length === 0; } catch (e) { return e.code === "ENOENT"; } });
     await sample();
     result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, tids);
@@ -276,7 +277,7 @@ async function runClosedStagingMatrix(options) {
     if (sha(JSON.stringify(sourceManifest())) !== result.source_digest) F.fail("source_changed");
     result.ok = true; result.reason = "proof_passed";
   } catch (error) {
-    if (pressureStarted !== null) result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: Date.now() - pressureStarted };
+    if (pressureWindow && !result.pressure_observation) result.pressure_observation = { oom_deadline_ms: 45000, elapsed_ms: pressureWindow.elapsedMs() };
     const pressure = owned.workers.find((w) => w.project === "proof-pressure");
     if (pressure?.threadIds) {
       try { result.pressure_workload = pressureObservations(pressure.stream.records, pressure.main.pid, pressure.threadIds); } catch {}
