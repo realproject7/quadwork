@@ -19,7 +19,8 @@ const exec = promisify(execFile);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
 function sourceManifest() {
-  const root = path.dirname(__dirname), files = {}, queue = ["server", "package.json", "package-lock.json"];
+  const root = path.dirname(__dirname), files = {}, queue = ["server", "package.json"];
+  if (fs.existsSync(path.join(root, "package-lock.json"))) queue.push("package-lock.json");
   let total = 0;
   while (queue.length) {
     const relative = queue.shift(), absolute = path.join(root, relative), before = fs.lstatSync(absolute);
