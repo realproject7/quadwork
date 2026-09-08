@@ -261,7 +261,7 @@ export default function GitHubPanel({ projectId, idle = false, multiRepository =
   }, [fetchData, idle]);
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex flex-col h-full min-h-0 overflow-y-auto">
       {/* #554: rate limit indicator */}
       {rateLimit && (rateLimit.critical || rateLimit.low) && (
         <div className={`px-3 py-1 text-[10px] shrink-0 ${
@@ -276,9 +276,11 @@ export default function GitHubPanel({ projectId, idle = false, multiRepository =
         </div>
       )}
       {/* #226: side-by-side issues + PRs columns (stacked on mobile) */}
-      <div className="flex-1 min-h-0 flex flex-col lg:flex-row">
+      {/* Keep list rows reachable when the bounded batch panel fills a short
+          rail; the outer body scrolls to expose the batch and queue below. */}
+      <div className="flex-1 min-h-96 lg:min-h-48 flex flex-col lg:flex-row">
         {/* Issues column */}
-        <div className="flex-1 min-w-0 flex flex-col border-b lg:border-b-0 lg:border-r border-border">
+        <div className="flex-1 min-w-0 min-h-0 flex flex-col border-b lg:border-b-0 lg:border-r border-border">
           <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
               {t.issues(issues.length)}
@@ -334,7 +336,7 @@ export default function GitHubPanel({ projectId, idle = false, multiRepository =
         </div>
 
         {/* PRs column */}
-        <div className="flex-1 min-w-0 flex flex-col">
+        <div className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="px-3 py-1.5 border-b border-border shrink-0 flex items-center gap-1.5">
             <span className="text-[10px] text-text-muted uppercase tracking-wider">
               {t.prs(prs.length)}
