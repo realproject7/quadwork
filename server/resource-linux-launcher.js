@@ -161,10 +161,17 @@ class LinuxResourceLauncher {
     record.assertLaunchCurrent?.();
     const term = pty.spawn(invocation.file, invocation.args, { name: "xterm-256color", cols: 120, rows: 30, cwd: record.cwd, env: { ...record.env, TMPDIR: record.tempPath } });
     record.term = term;
+    // Retain the native child exit before subscribing to output or awaiting
+    // scope discovery. Early systemd-run failure still has this exact owner.
+    record.nativeExit = new Promise((resolve) => term.onExit((exit) => { record.nativeExited = true; record.exited = true; resolve(exit); }));
+    record.nativeIdentity = null;
+    try { record.nativeIdentity = facts.readProcess(term.pid); } catch {}
     record.trace = dataRecords(term);
-    const exited = new Promise((resolve) => term.onExit(resolve));
     try {
-      const group = await boundedUntil(() => { try { return facts.scopeGroup(`${invocation.unitName}.scope`); } catch { return null; } });
+      const group = await boundedUntil(() => {
+        if (record.nativeExited) facts.fail("native_exit_before_scope_observation");
+        try { return facts.scopeGroup(`${invocation.unitName}.scope`); } catch { return null; }
+      });
       record.group = group;
       record.parentGroup = path.posix.dirname(group);
       if (!record.parentGroup.endsWith(`/${record.parentSlice}`)) facts.fail("scope_parent_mismatch");
@@ -186,7 +193,7 @@ class LinuxResourceLauncher {
         return typeof value === "function" ? value.bind(target) : value;
       } });
       record.resolveStarted(publicTerm);
-      const exit = await exited; record.exited = true;
+      const exit = await record.nativeExit;
       let observation = null;
       try { observation = { capturedBeforeCollect: true, oomKillCount: String(facts.readGroup(record.parentGroup).events.oom_kill), observedAt: new Date().toISOString() }; } catch {}
       await this._confirmExit(record);
@@ -298,8 +305,61 @@ class LinuxResourceLauncher {
     record.stopping = this._stopGeneration(record).catch((error) => { s.proof = false; s.cleanupFailed = true; throw error; });
     return record.stopping;
   }
+  async _waitNativeExit(record) {
+    if (!record.nativeExit) facts.fail("native_exit_unconfirmed");
+    let timer;
+    try {
+      await Promise.race([record.nativeExit, new Promise((_, reject) => {
+        timer = setTimeout(() => { try { facts.fail("native_exit_unconfirmed"); } catch (e) { reject(e); } }, 3000);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  async _ownedUnitGroup(unit) {
+    const result = await exec("systemctl", ["--user", "show", unit, "--property=Id,LoadState,ActiveState,ControlGroup"], { timeout: 2000, maxBuffer: 16384 }).catch((e) => ({ stdout: absentUnitOutput(e) }));
+    const props = unitProperties(result.stdout);
+    if (props.LoadState === "not-found" && !props.ControlGroup) return null;
+    if (props.Id !== unit) facts.fail("scope_identity_changed");
+    if (!props.ControlGroup && ["inactive", "failed"].includes(props.ActiveState)) return null;
+    if (!props.ControlGroup?.endsWith(`/${unit}`)) facts.fail("scope_identity_changed");
+    return facts.parseCgroup(`0::${props.ControlGroup}`);
+  }
+  async _confirmOwnedParentEmpty(record) {
+    const group = await this._ownedUnitGroup(record.parentSlice);
+    if (group === null) return;
+    // Parent cgroup.procs alone excludes descendants. Inspect the complete
+    // exact owned subtree, including a scope created during native shutdown.
+    const queue = [facts.cgroupPath(group)]; let count = 0;
+    while (queue.length) {
+      const directory = queue.shift();
+      if (++count > 64) facts.fail("owned_parent_observation_unbounded");
+      try {
+        if (facts.parsePids(facts.text(path.join(directory, "cgroup.procs"))).length) facts.fail("owned_parent_not_empty");
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          if (entry.isSymbolicLink()) facts.fail("owned_parent_identity_changed");
+          if (entry.isDirectory()) queue.push(path.join(directory, entry.name));
+        }
+      } catch (e) { if (e.code !== "ENOENT") throw e; }
+    }
+  }
   async _stopGeneration(record) {
     if (record.setup) await record.setup.catch(() => {});
+    const earlyNative = !!record.term && !record.group;
+    if (earlyNative) {
+      // Signal only this still-identical native child. A missing identity is
+      // not permission to signal a PID, but an already observed exit suffices.
+      if (!record.nativeExited && record.nativeIdentity) {
+        let current = null; try { current = facts.readProcess(record.term.pid); } catch {}
+        if (current && record.nativeIdentity.pid === current.pid && record.nativeIdentity.startTime === current.startTime) {
+          try { record.term.kill("SIGKILL"); } catch {}
+        }
+      }
+      await this._waitNativeExit(record);
+      const group = await this._ownedUnitGroup(`${record.unitName}.scope`);
+      if (group !== null) {
+        if (!path.posix.dirname(group).endsWith(`/${record.parentSlice}`)) facts.fail("scope_parent_mismatch");
+        record.group = group;
+      }
+    }
     if (record.group) {
       let live = false;
       try { live = facts.readGroup(record.group).pids.length !== 0; } catch (error) { if (error.code !== "ENOENT") throw error; }
@@ -307,12 +367,11 @@ class LinuxResourceLauncher {
         if (facts.scopeGroup(`${record.unitName}.scope`) !== record.group) facts.fail("scope_identity_changed");
         await exec("systemctl", ["--user", "kill", "--signal=SIGKILL", "--kill-whom=all", `${record.unitName}.scope`], { timeout: 3000, maxBuffer: 16384 });
       }
+      if (record.term) await this._waitNativeExit(record);
+      if (earlyNative) await this._confirmOwnedParentEmpty(record);
       await this._confirmExit(record);
-    } else if (record.term) {
-      // Before scope creation only the exact owned node-pty child is signalled.
-      try { record.term.kill("SIGKILL"); } catch {}
-      // The scope may have appeared concurrently. Resolve and verify it first.
-      try { record.group = facts.scopeGroup(`${record.unitName}.scope`); return this._stopGeneration(record); } catch (e) { if (e.check === "scope_identity_changed") throw e; }
+    } else if (earlyNative) {
+      await this._confirmOwnedParentEmpty(record);
     }
     if (record.unitFile) {
       await exec("systemctl", ["--user", "stop", record.parentSlice], { timeout: 3000, maxBuffer: 16384 });
@@ -320,7 +379,7 @@ class LinuxResourceLauncher {
       fs.unlinkSync(record.unitFile);
       record.unitFile = null;
     }
-    if (!record.term && !record.cleaned) {
+    if ((!record.term || earlyNative) && !record.cleaned) {
       reclaimGenerationTemp({ facts: record.tempFacts, generationId: record.generationId, confirmedProcessTreeExit: true });
       record.cleaned = true;
     }
