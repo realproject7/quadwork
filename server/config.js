@@ -701,8 +701,9 @@ function validateV2Configuration(config, options = {}) {
         );
       }
     } catch (error) {
-      if (isLegacyCurrentProjectIdentityError(error)) return;
-      rethrowProjectEnvironmentValidation(error);
+      // Grandfathering only skips environment identity validation. This
+      // project must still register every active repository/path owner below.
+      if (!isLegacyCurrentProjectIdentityError(error)) rethrowProjectEnvironmentValidation(error);
     }
 
     // `idle` is an execution flag, not archival state. Only explicit archived

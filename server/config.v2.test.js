@@ -597,6 +597,41 @@ function seedConfig(config) {
   assert.equal(diskBytes(), before);
 }
 
+// #1083: legacy environment-map IDs retain ordinary active ownership. The
+// pre-fix catch returned from the whole project iteration and accepted these
+// duplicate repository inputs in both orders (recorded before the correction).
+{
+  const a = repoDir("legacy-ownership-a"), b = repoDir("legacy-ownership-b");
+  const nested = repoDir("legacy-ownership-a/nested");
+  const alias = path.join(REPOS_DIR, "legacy-ownership-alias");
+  fs.symlinkSync(a, alias, "dir");
+  const cases = [
+    ["repository", "Acme/Owned", b, "repository_owned_by_active_project"],
+    ["same path", "Acme/Other", a, "repository_working_dir_owned_by_active_project"],
+    ["path alias", "Acme/Other", alias, "repository_working_dir_owned_by_active_project"],
+    ["nested path", "Acme/Other", nested, "repository_working_dir_owned_by_active_project"],
+  ];
+  for (const reverse of [false, true]) {
+    for (const [label, repo, dir, code] of cases) {
+      const projects = [project("__proto__", [repository("one", "acme/OWNED", a)], { idle: true }), project("ordinary", [repository("two", repo, dir)])];
+      if (reverse) projects.reverse();
+      expectCode(() => validateV2Configuration(activated(projects)), code, `legacy ID keeps ${label} ownership in ${reverse ? "reverse" : "forward"} order`);
+    }
+    for (const archivedId of ["__proto__", "ordinary"]) {
+      const projects = [project("__proto__", [repository("one", "Acme/Owned", a)]), project("ordinary", [repository("two", "acme/OWNED", alias)])];
+      projects.find((entry) => entry.id === archivedId).archived = true;
+      if (reverse) projects.reverse();
+      validateV2Configuration(activated(projects));
+      ok(true, `explicit archive releases ${archivedId} ownership in both project orders`);
+    }
+  }
+  const valid = activated([project("__proto__", [repository("one", "Acme/Owned", a)]), project("ordinary", [repository("two", "Acme/Other", b)])]);
+  const before = JSON.stringify(valid);
+  validateV2Configuration(valid);
+  assert.equal(JSON.stringify(valid), before, "legacy compatibility never mutates or renames the project");
+  ok(true, "valid grandfathered project remains accepted without mutation");
+}
+
 // Pure migration removes scalar persistence, preserves every unrelated nested
 // value and ci_policy, and is structurally idempotent.
 {
