@@ -82,7 +82,10 @@ function parentOom(group) { return F.readGroup(path.posix.dirname(group)).events
 function publicError(error) { return typeof error?.check === "string" && /^[a-z_]+$/.test(error.check) ? error.check : "live_phase_failed"; }
 
 async function runClosedStagingMatrix(options) {
-  if (!options || Object.keys(options).some((k) => !["acknowledgement", "runPressure", "json"].includes(k)) || process.platform !== "linux" || options.runPressure !== true || options.acknowledgement !== `DISPOSABLE-STAGING:${F.text("/etc/machine-id").trim()}` || process.env.NODE_OPTIONS || process.env.NODE_PATH) F.fail("disposable_gate_refused");
+  if (!options || Object.keys(options).some((k) => !["acknowledgement", "runPressure", "json"].includes(k)) || process.platform !== "linux" || options.runPressure !== true || process.env.NODE_OPTIONS || process.env.NODE_PATH) F.fail("disposable_gate_refused");
+  let machineId;
+  try { machineId = F.text("/etc/machine-id").trim(); } catch { F.fail("disposable_gate_refused"); }
+  if (!/^[a-f0-9]{32}$/.test(machineId) || options.acknowledgement !== `DISPOSABLE-STAGING:${machineId}`) F.fail("disposable_gate_refused");
   const memory = parseProcMeminfo(F.text("/proc/meminfo"));
   if (memory.totalMib < 3800 || memory.totalMib > 4352 || memory.swapTotalMib < 64 || memory.availableMib < 2816) F.fail("staging_capacity_unavailable");
   const runId = crypto.randomBytes(12).toString("hex"), apiUnit = `qwproof-${runId}-api.service`;
