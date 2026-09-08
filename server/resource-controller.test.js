@@ -1,7 +1,7 @@
 // #1038: argument-array systemd scope candidate, leaf-only control semaphore,
 // redacted observations, and terminal-fact classification. No real systemd or
 // node-pty process is used here; the disposable VPS staging matrix owns that
-// evidence before this candidate can become the supported launcher contract.
+// evidence before this primitive can admit an ordinary worker.
 
 "use strict";
 
@@ -55,8 +55,8 @@ function controlSpec(index, overrides = {}) {
 }
 
 async function main() {
-  ok(SYSTEMD_SCOPE_CANDIDATE.status === "candidate_pending_staging",
-    "systemd user-scope flags are explicitly marked as a staging candidate");
+  ok(SYSTEMD_SCOPE_CANDIDATE.status === "supported",
+    "fixed primitive availability is separate from host PTY readiness");
 
   const worker = buildWorkerScopeInvocation(workerSpec());
   assert.deepEqual(worker.args, [
@@ -65,12 +65,37 @@ async function main() {
     "-p", "MemoryHigh=1024M",
     "-p", "MemoryMax=1200M",
     "-p", "MemorySwapMax=512M",
+    "-p", "OOMPolicy=kill",
     "--", "/opt/Quad Work/bin/codex", "exec", "ticket; echo-not-a-shell",
   ]);
   ok(worker.file === "systemd-run" && !worker.args.includes("--pipe"),
     "worker invocation is the exact no-pipe candidate flag set");
   ok(worker.args.at(-1) === "ticket; echo-not-a-shell" && !worker.shell,
     "command data remains one argument and no shell option exists");
+
+  for (const parentSlice of [
+    `quadwork-proof-${"a".repeat(16)}.slice`,
+    `quadwork-staging-${"b".repeat(64)}.slice`,
+    `quadwork-worker-group-${"c".repeat(40)}.slice`,
+  ]) {
+    const bounded = buildWorkerScopeInvocation(workerSpec({ parentSlice, runtimeMaxSec: 120 }));
+    assert.equal(bounded.args[5], `--slice=${parentSlice}`);
+    assert.deepEqual(bounded.args.slice(6, 8), ["-p", "RuntimeMaxSec=120s"]);
+    assert.equal(bounded.args.filter((arg) => arg === "OOMPolicy=kill").length, 1);
+    assert.equal(bounded.args.indexOf("RuntimeMaxSec=120s") < bounded.args.indexOf("--"), true);
+  }
+  for (const parentSlice of [undefined, null, "system.slice", "user.slice", "quadwork-control.slice",
+    "quadwork-proof-short.slice", `quadwork-worker-group-${"a".repeat(39)}.slice`,
+    `../quadwork-proof-${"a".repeat(16)}.slice`, `quadwork-proof-${"a".repeat(16)}.slice;echo`]) {
+    assert.throws(() => buildWorkerScopeInvocation(workerSpec({ parentSlice })),
+      { code: "QW_INVALID_RESOURCE_ARGUMENT", field: "parentSlice" });
+  }
+  for (const runtimeMaxSec of [undefined, null, 0, -1, 0.5, 121, Infinity, "30"]) {
+    assert.throws(() => buildWorkerScopeInvocation(workerSpec({ runtimeMaxSec })),
+      { code: "QW_INVALID_RESOURCE_ARGUMENT", field: "runtimeMaxSec" });
+  }
+  assert(buildWorkerScopeInvocation(workerSpec({ runtimeMaxSec: 1 })).args.includes("RuntimeMaxSec=1s"));
+  ok(true, "bounded lifetime and generated parent slices cannot inject flags or select foreign slices");
 
   const controlClass = buildControlClassConfiguration({
     controlClassName: DEFAULT_CONTROL_CLASS_NAME,

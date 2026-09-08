@@ -4,6 +4,9 @@ const assert = require("assert/strict");
 const { DEFAULT_RUNTIME_RESOURCE_PROPOSAL } = require("./resource-policy");
 const {
   parseProcMeminfo,
+  readCgroupV2Path,
+  parseSystemdVersion,
+  parseSystemdApiUnit,
   createReadOnlyProbes,
   runResourcePreflight,
 } = require("./resource-preflight");
@@ -351,7 +354,9 @@ function fakeExec(command, args) {
   if (args.includes("list-units")) {
     return "quadwork-worker-a.scope loaded active running A\nquadwork-worker-b.scope loaded active running B\nother.scope loaded active running Other\n";
   }
-  if (args.includes("--property=OOMPolicy")) return "continue";
+  if (args.includes("--property=Id,ControlGroup,ActiveState,OOMPolicy")) {
+    return "Id=pm2-quadwork.service\nControlGroup=/system.slice/pm2-quadwork.service\nActiveState=active\nOOMPolicy=continue\n";
+  }
   return "259";
 }
 const adapter = createReadOnlyProbes({
@@ -373,9 +378,76 @@ assert(execCalls.every(([command, args]) => {
 assert(execCalls.some(([command, args]) => command === "systemctl"
   && args.join(" ") === "--user --property=Version --value show"));
 assert(execCalls.some(([command, args]) => command === "systemctl"
-  && args.join(" ") === "--property=OOMPolicy --value show pm2-quadwork.service"));
+  && args.join(" ") === "--property=Id,ControlGroup,ActiveState,OOMPolicy show pm2-quadwork.service"));
 assert(execCalls.some(([command, args]) => command === "systemctl"
   && args.join(" ") === "--user --type=scope --state=running --no-legend --plain list-units"));
+
+// Unit identity is checked in both managers: a successful response for a
+// different cgroup must not suppress the real user-service fallback.
+{
+  const selfPath = "/system.slice/pm2-quadwork.service";
+  const userCalls = [];
+  const userAdapter = createReadOnlyProbes({
+    fsImpl: fakeFs, cgroupRoot: "/cgroup", scopeProof: false,
+    execFileSyncImpl(command, args, options) {
+      userCalls.push(args);
+      assert.equal(options.timeout, 5000);
+      assert.equal(options.maxBuffer, 65536);
+      const group = args.includes("--user") ? selfPath : "/other.slice/pm2-quadwork.service";
+      return `Id=pm2-quadwork.service\nControlGroup=${group}\nActiveState=active\nOOMPolicy=continue\n`;
+    },
+  });
+  assert.deepEqual(userAdapter.api(), {
+    memoryLowMib: 512, memoryMaxMib: 1280, oomPolicy: "continue", separateFromWorkers: false,
+  });
+  assert.equal(userCalls.length, 2);
+  assert.equal(userCalls[0].includes("--user"), false);
+  assert.equal(userCalls[1].includes("--user"), true);
+
+  for (const systemResult of ["", "OOMPolicy=continue", "permission denied", null]) {
+    const fallback = createReadOnlyProbes({ fsImpl: fakeFs, cgroupRoot: "/cgroup",
+      execFileSyncImpl(command, args) {
+        if (!args.includes("--user")) {
+          if (systemResult === null) throw new Error("secret system service error");
+          return systemResult;
+        }
+        return `OOMPolicy=continue\nActiveState=active\nControlGroup=${selfPath}\nId=pm2-quadwork.service\n`;
+      },
+    });
+    assert.equal(fallback.api().oomPolicy, "continue");
+  }
+  const foreign = createReadOnlyProbes({ fsImpl: fakeFs, cgroupRoot: "/cgroup",
+    execFileSyncImpl() { return "Id=other.service\nControlGroup=/other.service\nActiveState=active\nOOMPolicy=continue"; },
+  });
+  assert.equal(foreign.api().oomPolicy, undefined);
+}
+
+// Version gates cover both the CLI binary and the reachable user manager.
+for (const [version, expected] of [["systemd 252", false], ["systemd 253 (253.1)", true],
+  ["255.4-1ubuntu8.14", true], ["unsupported", false], ["", false]]) {
+  const versioned = createReadOnlyProbes({ fsImpl: fakeFs, cgroupRoot: "/cgroup",
+    execFileSyncImpl() { return version; },
+  });
+  assert.deepEqual(versioned.containment(), { cgroupV2: true, userManager: expected, systemdRun: expected, scopeProof: false });
+}
+for (const invalid of [null, {}, "true", "252oops", "x255", "255token", "9".repeat(65537)]) {
+  assert.equal(parseSystemdVersion(invalid), null);
+}
+assert.equal(parseSystemdVersion("systemd 253\n+PAM +AUDIT"), 253);
+assert.equal(readCgroupV2Path("0::/user.slice/user-1000.slice/qw-api.service\n"), "/user.slice/user-1000.slice/qw-api.service");
+for (const bad of ["0::/a\n0::/b\n", "0::/a\n1:memory:/a\n", "0::/../a", "0::/a//b", "0::/a/./b", "0::/a\\b", "0::/a\u0000b", "0::/a b", "1:memory:/a"]) {
+  assert.throws(() => readCgroupV2Path(bad));
+}
+{
+  const expected = { unitName: "qw-api.service", cgroupPath: "/user.slice/qw-api.service" };
+  const fields = "Id=qw-api.service\nControlGroup=/user.slice/qw-api.service\nActiveState=active\nOOMPolicy=continue";
+  assert.deepEqual(parseSystemdApiUnit(fields, expected), { ...expected, oomPolicy: "continue" });
+  for (const bad of [fields + "\nOOMPolicy=continue", fields + "\nExtra=true", fields.replace("active", "inactive"),
+    fields.replace("OOMPolicy=continue", "OOMPolicy=trusted"), fields.replace("/user.slice", "/system.slice"),
+    fields.replace("Id=qw-api.service", "Id=other.service"), "OOMPolicy=continue"]) {
+    assert.equal(parseSystemdApiUnit(bad, expected), null);
+  }
+}
 
 files.set(
   "/cgroup/system.slice/pm2-quadwork.service/memory.max",

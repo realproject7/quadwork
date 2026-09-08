@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 const {
   DEFAULT_RUNTIME_RESOURCE_PROPOSAL,
 } = require("./resource-policy");
@@ -208,9 +209,9 @@ function fixture(overrides = {}) {
 {
   const input = fixture();
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.status, "candidate_pending_staging");
+  assert.equal(snapshot.status, "containment_unavailable");
   assert.deepEqual(snapshot.pressure, {
-    status: "candidate_pending_staging",
+    status: "containment_unavailable",
     reason: "proof_authority_unavailable",
   });
   assert.deepEqual(snapshot.counts, {
@@ -270,8 +271,8 @@ function fixture(overrides = {}) {
   assert.equal(Object.isFrozen(snapshot.resource_usage), true);
   assert.equal(Object.isFrozen(snapshot.worker_scopes), true);
   assert.equal(Object.isFrozen(snapshot.worker_scopes[0]), true);
-  assert.equal(createResourceSnapshot(snapshot).status, "candidate_pending_staging",
-    "runtime output is ResourceStateStore-compatible without an unpinned ready claim");
+  assert.equal(createResourceSnapshot(snapshot).status, "containment_unavailable",
+    "runtime output is ResourceStateStore-compatible without an unobserved ready claim");
   const json = JSON.stringify(snapshot);
   assert.equal(json.includes(DEFAULT_RUNTIME_RESOURCE_PROPOSAL.temp_root), false);
   assert.equal(json.includes("command"), false);
@@ -326,25 +327,25 @@ for (const mutate of [
 }
 
 // Raw preflight/controller claims and capability lookalikes cannot mint
-// staging authority. No reviewed receipt/source fingerprint is pinned yet.
+// local runtime authority. A platform primitive alone is not ready.
 for (const proofAuthority of [undefined, null, {}, "supported", { apiUnitName: "pm2-quadwork.service" }]) {
   const input = fixture({ proofAuthority });
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.status, "candidate_pending_staging");
+  assert.equal(snapshot.status, "containment_unavailable");
   assert.equal(snapshot.pressure.reason, "proof_authority_unavailable");
 }
 
 {
   const input = fixture();
   input.apiObservation = { ...input.apiObservation, self: false };
-  assert.equal(buildResourceRuntimeSnapshot(input).status, "candidate_pending_staging",
-    "a raw API self flag cannot replace a source-pinned receipt");
+  assert.equal(buildResourceRuntimeSnapshot(input).status, "containment_unavailable",
+    "a raw API self flag cannot replace a real API capability observation");
 
   const hostileAuthorityInput = Object.defineProperty({}, "receiptBytes", {
     get() { throw new Error("PROOF-AUTHORITY-SECRET"); },
   });
   assert.throws(() => createResourceRuntimeProofAuthority(hostileAuthorityInput), (error) =>
-    error.code === "QW_RESOURCE_PROOF_NOT_PINNED"
+    error.code === "QW_INVALID_RESOURCE_PROOF_AUTHORITY"
       && !error.message.includes("SECRET"));
   assert.throws(() => createResourceRuntimeProofAuthority({
     receiptBytes: JSON.stringify({
@@ -353,7 +354,35 @@ for (const proofAuthority of [undefined, null, {}, "supported", { apiUnitName: "
       controller_source_sha256: "a".repeat(64),
       api_unit_name: "pm2-quadwork.service",
     }),
-  }), (error) => error.code === "QW_RESOURCE_PROOF_NOT_PINNED");
+  }), (error) => error.code === "QW_INVALID_RESOURCE_PROOF_AUTHORITY");
+}
+
+// Exercise the exported production factory in an ordinary child process. There
+// is no injected factory, preloaded source, fake executable or staging receipt.
+{
+  for (const value of [undefined, null, true, false, {}, "supported", () => true]) {
+    assert.throws(() => createResourceRuntimeProofAuthority(value), { code: "QW_INVALID_RESOURCE_PROOF_AUTHORITY" });
+  }
+  const { proxy, revoke } = Proxy.revocable({}, {});
+  revoke();
+  assert.throws(() => createResourceRuntimeProofAuthority(proxy), { code: "QW_INVALID_RESOURCE_PROOF_AUTHORITY" });
+  const output = JSON.parse(execFileSync(process.execPath, ["-e", `
+    const { createResourceRuntimeProofAuthority } = require(${JSON.stringify(require.resolve("./resource-runtime-snapshot"))});
+    try {
+      const capability = createResourceRuntimeProofAuthority();
+      process.stdout.write(JSON.stringify({ status: "capability", opaque: Object.keys(capability).length === 0,
+        frozen: Object.isFrozen(capability), prototype: Object.getPrototypeOf(capability) === null }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ status: "unavailable", code: error.code, message: error.message }));
+    }
+  `], { encoding: "utf8", timeout: 30000, maxBuffer: 65536 }));
+  if (process.platform !== "linux") assert.equal(output.status, "unavailable");
+  if (output.status === "unavailable") {
+    assert.equal(output.code, "QW_RESOURCE_PROOF_UNAVAILABLE");
+    assert.equal(output.message, "local systemd resource primitives or API identity are unavailable");
+  } else {
+    assert.deepEqual(output, { status: "capability", opaque: true, frozen: true, prototype: true });
+  }
 }
 
 {
@@ -415,7 +444,7 @@ for (const [index, mutate] of [
   const input = fixture();
   mutate(input);
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.status, index === 0 ? "candidate_pending_staging" : "containment_unavailable");
+  assert.equal(snapshot.status, "containment_unavailable");
   assert.equal(snapshot.pressure.reason, index === 0
     ? "proof_authority_unavailable"
     : index === 4 || index === 7
@@ -573,7 +602,7 @@ for (const [index, mutate] of [
     workerObservation(first, input.runtimeResources, { current: MIB_BYTES, peak: 3n * MIB_BYTES }),
   ];
   const snapshot = buildResourceRuntimeSnapshot(input);
-  assert.equal(snapshot.status, "candidate_pending_staging");
+  assert.equal(snapshot.status, "containment_unavailable");
   assert.deepEqual(snapshot.worker_scopes.map((scope) => [scope.project_id, scope.generation_id]), [
     [first.projectId, first.generationId],
     [second.projectId, second.generationId],
@@ -600,7 +629,7 @@ for (const [index, mutate] of [
   const input = fixture();
   input.workerObservations[0].observed_at = "2024-02-29T23:59:59.123-14:00";
   const leap = buildResourceRuntimeSnapshot(input);
-  assert.equal(leap.status, "candidate_pending_staging");
+  assert.equal(leap.status, "containment_unavailable");
   assert.equal(leap.worker_scopes[0].observed_at, "2024-03-01T13:59:59.123Z");
 }
 
@@ -669,7 +698,7 @@ for (const [index, mutate] of [
   const persisted = persistResourceRuntimeSnapshot(store, snapshot);
   assert.equal(saves, 1);
   assert.equal(savedValue, snapshot);
-  assert.equal(persisted.status, "candidate_pending_staging");
+  assert.equal(persisted.status, "containment_unavailable");
   assert.equal(Object.hasOwn(persisted, "pressure"), false, "state persistence keeps only its allowlist");
   assert.throws(() => persistResourceRuntimeSnapshot({}, snapshot), (error) =>
     error instanceof ResourceRuntimePersistenceError

@@ -1,6 +1,9 @@
 "use strict";
 
-const crypto = require("crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const { readCgroupV2Path, parseSystemdVersion, parseSystemdApiUnit } = require("./resource-preflight");
 const {
   parseRuntimeResources,
   calculateStaticReservationMib,
@@ -19,12 +22,12 @@ const SYSTEMD_UNIT_RE = /^[a-z][a-z0-9.-]{0,127}$/;
 const API_UNIT_RE = /^[a-z][a-z0-9.-]{0,127}\.(?:service|scope)$/;
 const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 const PROOF_AUTHORITIES = new WeakMap();
-// Intentionally unset until a disposable-host PASS receipt and the exact
-// controller source it exercised are reviewed and pinned in source together.
-// A fingerprint is not a secret; authority comes from requiring receipt bytes
-// whose SHA-256 matches the reviewed pin, rather than trusting a caller claim.
-const PINNED_STAGING_RECEIPT_SHA256 = null;
-const PINNED_CONTROLLER_SOURCE_SHA256 = null;
+// The authority identifies a real local platform/API observation. It is not a
+// staging receipt or permission to launch: the closed runtime owner separately
+// requires its actual bounded PTY/descendant probe before setting scopeProof.
+const CGROUP2_MAGIC = 0x63677270n;
+const CGROUP_ROOT = "/sys/fs/cgroup";
+const MAX_CAPABILITY_BYTES = 65536;
 const PREFLIGHT_FAILURES = new Set([
   "invalid_resource_policy",
   "containment_unavailable",
@@ -42,55 +45,87 @@ class ResourceRuntimePersistenceError extends Error {
   }
 }
 
-function createResourceRuntimeProofAuthority(options = {}) {
-  if (PINNED_STAGING_RECEIPT_SHA256 === null || PINNED_CONTROLLER_SOURCE_SHA256 === null) {
-    const error = new Error("no reviewed staging receipt is pinned in this source");
-    error.code = "QW_RESOURCE_PROOF_NOT_PINNED";
-    throw error;
-  }
-  const receiptBytes = safeGet(options, "receiptBytes");
-  if (typeof receiptBytes !== "string" || Buffer.byteLength(receiptBytes, "utf8") > 16 * 1024) {
-    const error = new TypeError("staging receipt bytes are invalid");
+function capabilityUnavailable() {
+  const error = new Error("local systemd resource primitives or API identity are unavailable");
+  error.code = "QW_RESOURCE_PROOF_UNAVAILABLE";
+  return error;
+}
+
+function createResourceRuntimeProofAuthority() {
+  // Reject even empty objects, lookalikes, undefined and hostile getters before
+  // observing anything. Caller receipts, fs/process adapters and bools have no
+  // input path into the production authority.
+  if (arguments.length !== 0) {
+    const error = new TypeError("resource capability authority accepts no caller arguments");
     error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
     throw error;
   }
-  const digest = crypto.createHash("sha256").update(receiptBytes, "utf8").digest("hex");
-  if (digest !== PINNED_STAGING_RECEIPT_SHA256) {
-    const error = new TypeError("staging receipt does not match the source pin");
-    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
-    throw error;
-  }
-  let receipt;
   try {
-    receipt = JSON.parse(receiptBytes);
+    if (process.platform !== "linux") throw capabilityUnavailable();
+    function read(file) {
+      const value = fs.readFileSync(file, "utf8");
+      if (Buffer.byteLength(value, "utf8") > MAX_CAPABILITY_BYTES) throw capabilityUnavailable();
+      return value;
+    }
+    function command(file, args) {
+      return execFileSync(file, args, {
+        encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000, maxBuffer: MAX_CAPABILITY_BYTES,
+      });
+    }
+    const runVersion = parseSystemdVersion(command("systemd-run", ["--user", "--version"]));
+    const managerVersion = parseSystemdVersion(command("systemctl", ["--user", "--property=Version", "--value", "show"]));
+    if (runVersion < 253 || managerVersion < 253) throw capabilityUnavailable();
+    const rootStat = fs.statfsSync(CGROUP_ROOT, { bigint: true });
+    if (BigInt.asUintN(32, rootStat.type) !== CGROUP2_MAGIC
+      || !read(path.join(CGROUP_ROOT, "cgroup.controllers")).trim().split(/\s+/).includes("memory")) {
+      throw capabilityUnavailable();
+    }
+    const cgroupPath = readCgroupV2Path(read("/proc/self/cgroup"));
+    const apiUnitName = path.posix.basename(cgroupPath);
+    if (!API_UNIT_RE.test(apiUnitName) || apiUnitName.startsWith("quadwork-worker-")
+      || apiUnitName.startsWith("quadwork-control-") || cgroupPath === "/") throw capabilityUnavailable();
+    const directory = path.join(CGROUP_ROOT, cgroupPath);
+    if (fs.realpathSync(CGROUP_ROOT) !== CGROUP_ROOT || fs.realpathSync(directory) !== directory
+      || !fs.statSync(directory).isDirectory()) throw capabilityUnavailable();
+    const memberPids = read(path.join(directory, "cgroup.procs")).trim().split(/\s+/);
+    if (!memberPids.every((pid) => /^[1-9]\d*$/.test(pid)) || !memberPids.includes(String(process.pid))) {
+      throw capabilityUnavailable();
+    }
+    function finiteBytes(file) {
+      const value = uint64(read(file).trim());
+      if (value === null) throw capabilityUnavailable();
+      return value;
+    }
+    const memoryLow = finiteBytes(path.join(directory, "memory.low"));
+    const memoryMax = finiteBytes(path.join(directory, "memory.max"));
+    if (memoryLow === 0n || memoryMax === 0n || memoryLow > memoryMax) throw capabilityUnavailable();
+    // A lower ancestor cap cannot be ignored when reporting the self limit as
+    // effective. Root has no memory.max file; every non-root ancestor does.
+    for (let ancestor = path.dirname(directory); ancestor !== CGROUP_ROOT; ancestor = path.dirname(ancestor)) {
+      if (!ancestor.startsWith(CGROUP_ROOT + path.sep)) throw capabilityUnavailable();
+      const raw = read(path.join(ancestor, "memory.max")).trim();
+      const maximum = raw === "max" ? null : uint64(raw);
+      if (raw !== "max" && (maximum === null || maximum < memoryMax)) throw capabilityUnavailable();
+    }
+    let api = null;
+    for (const manager of [[], ["--user"]]) {
+      try {
+        api = parseSystemdApiUnit(command("systemctl", [
+          ...manager, "--property=Id,ControlGroup,ActiveState,OOMPolicy", "show", apiUnitName,
+        ]), { unitName: apiUnitName, cgroupPath });
+        if (api) break;
+      } catch { /* A dedicated API service may belong to the user manager. */ }
+    }
+    if (!api || api.oomPolicy !== "continue" || readCgroupV2Path(read("/proc/self/cgroup")) !== cgroupPath
+      || finiteBytes(path.join(directory, "memory.low")) !== memoryLow
+      || finiteBytes(path.join(directory, "memory.max")) !== memoryMax) throw capabilityUnavailable();
+    const authority = Object.freeze(Object.create(null));
+    PROOF_AUTHORITIES.set(authority, Object.freeze({ apiUnitName }));
+    return authority;
   } catch {
-    const error = new TypeError("staging receipt is invalid");
-    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
-    throw error;
+    // Do not expose raw process errors, environment, unit paths or command logs.
+    throw capabilityUnavailable();
   }
-  if (!hasOnlyKeys(receipt, new Set(["version", "status", "controller_source_sha256", "api_unit_name"]))) {
-    const error = new TypeError("staging receipt schema is invalid");
-    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
-    throw error;
-  }
-  const apiUnitName = safeGet(receipt, "api_unit_name");
-  if (typeof apiUnitName !== "string"
-    || !API_UNIT_RE.test(apiUnitName)
-    || apiUnitName.startsWith("quadwork-worker-")
-    || apiUnitName.startsWith("quadwork-control-")
-    || safeGet(receipt, "version") !== 1
-    || safeGet(receipt, "status") !== "proof_passed"
-    || safeGet(receipt, "controller_source_sha256") !== PINNED_CONTROLLER_SOURCE_SHA256) {
-    const error = new TypeError("apiUnitName must be an exact systemd service or scope unit");
-    error.code = "QW_INVALID_RESOURCE_PROOF_AUTHORITY";
-    throw error;
-  }
-  // The object deliberately carries no serializable claim. Only this module's
-  // private WeakMap can recognize it; configuration, HTTP input, preflight
-  // strings, and lookalike objects cannot mint staging authority.
-  const authority = Object.freeze(Object.create(null));
-  PROOF_AUTHORITIES.set(authority, Object.freeze({ apiUnitName }));
-  return authority;
 }
 
 function proofAuthorityMetadata(value) {
@@ -670,7 +705,7 @@ function buildResourceRuntimeSnapshot({
     status = "containment_unavailable";
     reason = "api_self_identity_unproven";
   } else if (proof === null) {
-    status = "candidate_pending_staging";
+    status = "containment_unavailable";
     reason = "proof_authority_unavailable";
   } else if (apiObservedUnit !== proof.apiUnitName) {
     status = "containment_unavailable";

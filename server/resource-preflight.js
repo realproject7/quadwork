@@ -64,11 +64,38 @@ function parseProcMeminfo(text) {
 }
 
 function readCgroupV2Path(text) {
-  const line = String(text || "").split(/\r?\n/).find((entry) => entry.startsWith("0::"));
-  if (!line) throw new Error("unified cgroup path unavailable");
-  const value = line.slice(3);
-  if (!value.startsWith("/")) throw new Error("invalid unified cgroup path");
+  if (typeof text !== "string" || text.length > 16384) throw new Error("invalid unified cgroup record");
+  const lines = text.trimEnd().split(/\r?\n/);
+  if (lines.length !== 1 || !lines[0].startsWith("0::")) throw new Error("unified cgroup path unavailable");
+  const value = lines[0].slice(3);
+  if (!value.startsWith("/") || /[\u0000-\u0020\u007f\\]/.test(value)
+    || (value !== "/" && value.split("/").slice(1).some((part) => !part || part === "." || part === ".."))) {
+    throw new Error("invalid unified cgroup path");
+  }
   return value;
+}
+
+function parseSystemdVersion(text) {
+  if (typeof text !== "string" || text.length > 65536) return null;
+  const match = /^(?:systemd )?(\d{3,5})(?=[.\s()-]|$)/.exec(text.trim());
+  return match ? Number(match[1]) : null;
+}
+
+// A property-only OOMPolicy query can accidentally describe a same-named unit
+// in the other manager. Bind every accepted result to our actual proc cgroup.
+// This pure parser returns facts only; it cannot mint runtime authority.
+function parseSystemdApiUnit(text, { unitName, cgroupPath }) {
+  if (typeof text !== "string" || text.length > 65536) return null;
+  const properties = new Map();
+  for (const line of text.trimEnd().split(/\r?\n/)) {
+    const match = /^(Id|ControlGroup|ActiveState|OOMPolicy)=(.*)$/.exec(line);
+    if (!match || properties.has(match[1])) return null;
+    properties.set(match[1], match[2]);
+  }
+  if (properties.size !== 4 || properties.get("Id") !== unitName
+    || properties.get("ControlGroup") !== cgroupPath || properties.get("ActiveState") !== "active"
+    || !["continue", "stop", "kill"].includes(properties.get("OOMPolicy"))) return null;
+  return Object.freeze({ unitName, cgroupPath, oomPolicy: properties.get("OOMPolicy") });
 }
 
 function cgroupValueToMib(raw) {
@@ -89,8 +116,9 @@ function createReadOnlyProbes(options = {}) {
   const procRoot = options.procRoot || "/proc";
   const cgroupRoot = options.cgroupRoot || "/sys/fs/cgroup";
   const scopePrefix = options.scopePrefix || "quadwork-worker-";
-  // Capability is not proof. The integration/staging layer must explicitly
-  // supply true only after the fixed PTY/descendant matrix has passed.
+  // This adapter and its injectable dependencies are read-only report seams,
+  // not admission authority. Only the closed runtime owner supplies true after
+  // its real bounded PTY/descendant probe; no product request selects options.
   const scopeProof = options.scopeProof === true;
   const uid = options.uid !== undefined
     ? options.uid
@@ -101,12 +129,13 @@ function createReadOnlyProbes(options = {}) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 5000,
+      maxBuffer: 65536,
     })).trim();
   }
 
-  function commandWorks(command, args) {
+  function versionSupported(command, args) {
     try {
-      return execText(command, args).length > 0;
+      return parseSystemdVersion(execText(command, args)) >= 253;
     } catch {
       return false;
     }
@@ -130,8 +159,8 @@ function createReadOnlyProbes(options = {}) {
     containment() {
       return {
         cgroupV2: fsImpl.existsSync(path.join(cgroupRoot, "cgroup.controllers")),
-        userManager: commandWorks("systemctl", ["--user", "--property=Version", "--value", "show"]),
-        systemdRun: commandWorks("systemd-run", ["--user", "--version"]),
+        userManager: versionSupported("systemctl", ["--user", "--property=Version", "--value", "show"]),
+        systemdRun: versionSupported("systemd-run", ["--user", "--version"]),
         scopeProof,
       };
     },
@@ -168,8 +197,15 @@ function createReadOnlyProbes(options = {}) {
       const memoryMaxMib = cgroupValueToMib(fsImpl.readFileSync(path.join(cgroup.resolved, "memory.max"), "utf8"));
       let oomPolicy;
       const unit = path.posix.basename(cgroup.relative);
-      if (/\.(?:service|scope)$/.test(unit)) {
-        try { oomPolicy = execText("systemctl", ["--property=OOMPolicy", "--value", "show", unit]); } catch {}
+      if (/^[a-z][a-z0-9.-]{0,127}\.(?:service|scope)$/.test(unit)) {
+        for (const manager of [[], ["--user"]]) {
+          try {
+            const observed = parseSystemdApiUnit(execText("systemctl", [
+              ...manager, "--property=Id,ControlGroup,ActiveState,OOMPolicy", "show", unit,
+            ]), { unitName: unit, cgroupPath: cgroup.relative });
+            if (observed) { oomPolicy = observed.oomPolicy; break; }
+          } catch {}
+        }
       }
       return {
         memoryLowMib,
@@ -401,6 +437,9 @@ function runResourcePreflight({ runtimeResources, probes, requestedWorkerScopes 
 module.exports = {
   REASON_MESSAGES,
   parseProcMeminfo,
+  readCgroupV2Path,
+  parseSystemdVersion,
+  parseSystemdApiUnit,
   createReadOnlyProbes,
   runResourcePreflight,
 };
