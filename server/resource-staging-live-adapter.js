@@ -249,7 +249,13 @@ async function runClosedStagingMatrix(options) {
     result.integrated = { ordinary_http_launch: true, worker_memcg_oom: true, api_health: true, primary_chat_roundtrip: true, terminal_websocket: true, unrelated_worker: true, ...kernel, samples: samples.length, maximum_gap_ms: Math.max(...gaps), worst_latency_ms: Math.max(...samples.map((s) => s.latency_ms)), pressure_window_ms: pressureEnd - pressureStart, observation_resolution_ms: 250 };
     if (sha(JSON.stringify(sourceManifest())) !== result.source_digest) F.fail("source_changed");
     result.ok = true; result.reason = "proof_passed";
-  } catch (error) { result.check = publicError(error); if (error.httpFailure) result.failed_request = error.httpFailure; }
+  } catch (error) {
+    result.check = publicError(error);
+    if (error.httpFailure) result.failed_request = error.httpFailure;
+    if (apiStarted) {
+      try { result.resource_diagnostic = await request(origin, "/api/resources"); } catch {}
+    }
+  }
   finally {
     monitorStop = true; if (monitoring) await monitoring.catch(() => {});
     for (const stream of sockets) stream.socket.close();
