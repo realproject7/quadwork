@@ -5,6 +5,7 @@
 const express = require("express");
 const { spawn } = require("child_process");
 const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
+const { seedOwnedWorktreeFile } = require("./owned-worktree-seeds");
 const _execFileAsync = (...args) => getSharedResourceRuntimeOwner().runControlChild(...args);
 const fs = require("fs");
 const path = require("path");
@@ -7140,6 +7141,7 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
     result = _performReseedWrites(project, cfg, {
       reviewerUser: body.reviewerUser,
       reviewerTokenPath: body.reviewerTokenPath,
+      adoptExactSeeds: true,
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
@@ -7217,6 +7219,29 @@ function _performReseedWrites(project, cfg, opts = {}) {
       .replace(/\{\{reviewer_token_path\}\}/g, tokenPath)
       .replace(/\{\{project_name\}\}/g, path.basename(repositoryWorkingDir || workingDir))
       .replace(/\{\{project_id\}\}/g, project.id || dirName);
+
+    // V2 generated files have one owner and exact receipts. Legacy reseed
+    // semantics remain below; tracked/operator files never become V2 seeds.
+    if (Object.hasOwn(cfg, "installation_id")) {
+      const repository = allRepositories(project).find((entry) => entry.key === repositoryKey);
+      const binding = { worktree: wtDir, base: repositoryWorkingDir, repo: repository.repo, role: canonical };
+      const writeSeed = (name, content) => {
+        const result = seedOwnedWorktreeFile(binding, name, content, {
+          adoptExact: opts.adoptExactSeeds === true,
+          runGit: (args) => getSharedResourceRuntimeOwner().runControlChildSync("git", ["-C", wtDir, ...args], { encoding: "utf8", timeout: 10000 }),
+        });
+        if (result.skipped) skipped.push(`${targetLabel}/${name} (${result.skipped})`);
+        else reseeded.push(`${targetLabel}/${name}`);
+      };
+      writeSeed("AGENTS.md", freshContent);
+      const claudeMd = path.join(wtDir, "CLAUDE.md");
+      if (fs.existsSync(claudeMd)) {
+        writeSeed("CLAUDE.md", fs.readFileSync(path.join(TEMPLATES_DIR, "CLAUDE.md"), "utf8")
+          .replace(/\{\{project_name\}\}/g, path.basename(repositoryWorkingDir)));
+      } else skipped.push(`${targetLabel}/CLAUDE.md (none)`);
+      writeSeed("DESIGN-GUIDE.md", fs.readFileSync(path.join(TEMPLATES_DIR, "seeds", "DESIGN-GUIDE.md"), "utf8"));
+      continue;
+    }
 
     const merged = reseedAgentsMd(existing, freshContent);
     fs.writeFileSync(agentsMd, merged.content);

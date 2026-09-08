@@ -334,6 +334,19 @@ const admitted = {
       repositories: [{ key: "web", repo: "Acme/Repo", working_dir: base, primary: true }],
     }] });
     assert.ok(fs.existsSync(path.join(root, "repo-dev", "DESIGN-GUIDE.md")), "V2 project worktree receives the DESIGN-GUIDE.md seed");
+    // With explicit V2 installation identity, direct legacy migrations must
+    // not alter receipt-owned or repository-authored instructions. Actual V2
+    // activation/automatic reseed is covered with real Git in the seed test.
+    const agents = path.join(root, "repo-dev", "AGENTS.md");
+    fs.writeFileSync(agents, "# Operator instructions @reviewer1\n");
+    const design = path.join(root, "repo-dev", "DESIGN-GUIDE.md");
+    fs.unlinkSync(design);
+    runStartupMigrations({ installation_id: "installation_0000000000000001", projects: [{
+      id: "v2seed", agents: { dev: { cwd: path.join(root, "repo-dev") } },
+      repositories: [{ key: "web", repo: "Acme/Repo", working_dir: base, primary: true }],
+    }] });
+    assert.equal(fs.readFileSync(agents, "utf8"), "# Operator instructions @reviewer1\n");
+    assert.equal(fs.existsSync(design), false, "V2 startup does not bypass the receipt-aware owner");
     fs.rmSync(root, { recursive: true, force: true });
   }
 

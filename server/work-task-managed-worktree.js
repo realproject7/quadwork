@@ -6,6 +6,7 @@
 // switches, cleans, resets, pushes, or removes a worktree.
 
 const path = require("node:path");
+const { hasUnownedWorktreeChanges } = require("./owned-worktree-seeds");
 const { assertWorkTaskRef } = require("./work-task-manifest");
 const {
   buildRepositoryWorktreePlan,
@@ -194,7 +195,9 @@ function createManagedWorktreeObserver(options) {
     if (command(repository, ["branch", "--show-current"], "managed_worktree_branch_unavailable") !== requested.expected.branch) {
       fail("managed_worktree_branch_mismatch", "Dev worktree branch changed");
     }
-    if (command(repository, ["status", "--porcelain", "--untracked-files=all"], "managed_worktree_status_unavailable") !== "") {
+    if (hasUnownedWorktreeChanges(command(repository, ["status", "--porcelain", "--untracked-files=all"], "managed_worktree_status_unavailable"), {
+      worktree: repository.dev_path, base: repository.base_path, repo: repository.canonical_repo, role: "dev",
+    })) {
       fail("managed_worktree_dirty", "Dev worktree has uncommitted changes");
     }
     if (command(repository, ["rev-parse", "--verify", "HEAD"], "managed_worktree_head_unavailable") !== requested.expected.candidate_sha) {

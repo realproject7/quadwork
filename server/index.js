@@ -4265,6 +4265,9 @@ function startWatchdog() {
 
 // #657: extracted startup migrations so full-reset can re-run them
 function runStartupMigrations(cfg) {
+  // V2 instruction writes belong to the receipt-aware reseed owner (#1101).
+  // Legacy slug/design migrations must not bypass that ownership proof.
+  if (Object.hasOwn(cfg, "installation_id")) return;
   const projects = (cfg.projects || []).filter((p) => p?.id && !isProjectArchived(p.id, cfg));
 
   // reseed stale slugs
