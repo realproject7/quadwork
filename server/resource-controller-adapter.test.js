@@ -149,6 +149,7 @@ async function main() {
       "-p", "MemoryHigh=321M",
       "-p", "MemoryMax=654M",
       "-p", "MemorySwapMax=87M",
+      "-p", "OOMPolicy=kill",
       "--", "/opt/Quad Work/bin/codex", "exec", "ticket; still-not-a-shell",
     ]);
     assert.equal(calls[0].unitName, expectedBase);
