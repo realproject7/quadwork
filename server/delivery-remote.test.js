@@ -20,6 +20,7 @@ async function main() {
         calls.push({ file, args: [...args] });
         if (file === "gh") {
           assert.equal(args[0], "api");
+          assert.equal(args[args.indexOf("--hostname") + 1], "github.com", "GH_HOST cannot redirect the canonical GitHub target");
           if (args[1] === "repos/owner/web") return { stdout: JSON.stringify({ full_name: "owner/web", default_branch: "main" }) };
           return { stdout: JSON.stringify(args[1].includes("?state=all") ? [pull] : pull) };
         }

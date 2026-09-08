@@ -23,7 +23,7 @@ function createDeliveryRemote({ repository, cwd, run, now = () => new Date().toI
   const git = (args, optional = false) => execute("git", args, optional);
   const api = async (suffix, args = []) => {
     let parsed;
-    try { parsed = JSON.parse(await execute("gh", ["api", `repos/${repository}${suffix}`, ...args])); } catch { fail("delivery_remote_read_or_write_unknown"); }
+    try { parsed = JSON.parse(await execute("gh", ["api", `repos/${repository}${suffix}`, "--hostname", "github.com", ...args])); } catch { fail("delivery_remote_read_or_write_unknown"); }
     return parsed;
   };
   async function validate() {

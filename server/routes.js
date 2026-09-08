@@ -1099,7 +1099,7 @@ function createDeliveryReviewEvidenceService(projectId) {
     for (const role of ["re1", "re2"]) {
       const receipt = evidence.reviews[role];
       if (!receipt || !/^[0-9]+$/.test(String(receipt.review_id))) C.fail("delivery_review_integrity_lost");
-      const { stdout } = await _execFileAsync("gh", ["api", `repos/${target.repo}/pulls/${target.pr_number}/reviews/${receipt.review_id}`], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
+      const { stdout } = await _execFileAsync("gh", ["api", `repos/${target.repo}/pulls/${target.pr_number}/reviews/${receipt.review_id}`, "--hostname", "github.com"], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
       const review = JSON.parse(stdout);
       if (String(review.id) !== String(receipt.review_id) || review.state !== "APPROVED" || review.commit_id !== target.exact_sha ||
           !Number.isFinite(Date.parse(review.submitted_at)) || Date.parse(review.submitted_at) !== Date.parse(receipt.submitted_at) || review.pull_request_url?.toLowerCase() !== `https://api.github.com/repos/${target.repo.toLowerCase()}/pulls/${target.pr_number}`) C.fail("delivery_review_integrity_lost");
@@ -1109,7 +1109,7 @@ function createDeliveryReviewEvidenceService(projectId) {
     const current = await freshDeliveryFinalReviewContext(projectId, ref, prNumber);
     const policy = current.binding.ci_policy;
     if (policy?.mode === "github-checks") {
-      const { stdout } = await _execFileAsync("gh", ["api", `repos/${current.binding.repo}/commits/${ref.result_sha}/check-runs?per_page=100`], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
+      const { stdout } = await _execFileAsync("gh", ["api", `repos/${current.binding.repo}/commits/${ref.result_sha}/check-runs?per_page=100`, "--hostname", "github.com"], { encoding: "utf8", timeout: 15000, maxBuffer: GH_LIST_MAX_BUFFER });
       const response = JSON.parse(stdout);
       if (!Array.isArray(response.check_runs) || response.total_count > response.check_runs.length) C.fail("delivery_checks_incomplete");
       current.pr.checkEvidence = normalizeGithubCheckEvidence(response, { exact_sha: ref.result_sha, observed_at: new Date().toISOString(), source_status: "ok" });
