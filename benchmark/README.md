@@ -13,6 +13,8 @@ node benchmark/v1-zero-actions.cjs --repo .
 node --test benchmark/v1-zero-actions.test.cjs
 node --test benchmark/v2-workload-adapter.test.cjs
 node --test benchmark/v2-disposable-runtime-harness.test.cjs
+node benchmark/calibration-protocol.cjs --protocol /path/to/mode-1-or-mode-2-protocol.json
+node --test benchmark/calibration-protocol.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -102,3 +104,14 @@ the marker, ownership, permissions, canonical path, and empty-root condition
 are checked before the durable services are composed. A populated store
 namespace or any root/marker symlink is rejected without writing. It is replay
 coverage and cannot qualify as a live benchmark observation.
+
+`calibration-protocol.cjs` accepts only a bounded Mode 1 or Mode 2 preparation
+record. It binds source/harness/workload, the disposable target base, role
+model/CLI/effort identities, cache and Actions storage observations, and turn,
+token, and wall-time caps. Every safety field must be false. The module has no
+execution, persistence, process, network, GitHub, Git, release, or npm APIs.
+It returns a digest and redacted report with `execution_authorized: false`.
+Mode 1 retains the zero-Actions feasibility blocker until a later bounded
+delivery exercise proves it. A separately reviewed executor must bind this
+exact digest to retained evidence and enforce the manifest, approval, and
+provider budget gates itself.
