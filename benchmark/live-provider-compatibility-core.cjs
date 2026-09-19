@@ -76,7 +76,6 @@ function createDisposableLiveCompatibilityRoot(value = {}, runtime) {
   const parentStat = fs.lstatSync(parent); required(parentStat.isDirectory() && !parentStat.isSymbolicLink(), 'live_root_create');
   const root = fs.mkdtempSync(path.join(parent, 'quadwork-live-compatibility-')); fs.chmodSync(root, 0o700);
   fs.writeFileSync(path.join(root, ROOT_MARKER), MARKER_BODY, { encoding: 'utf8', mode: 0o600, flag: 'wx' }); fs.chmodSync(path.join(root, ROOT_MARKER), 0o600);
-  fs.writeFileSync(path.join(root, CODEX_FINAL_MESSAGE), '', { encoding: 'utf8', mode: 0o600, flag: 'wx' }); fs.chmodSync(path.join(root, CODEX_FINAL_MESSAGE), 0o600);
   localGit(runtime, root, ['init', '--quiet']);
   // The ownership marker is harness metadata, not a candidate file. Keeping it
   // in the repository-local exclude makes the pre/post clean-tree assertion
@@ -136,6 +135,7 @@ function gitMetadataDigest(root) {
 function rootFacts(root, runtime) {
   const checked = checkedMarkedRoot(root, ROOT_MARKER, new Set([ROOT_MARKER, '.git', CODEX_FINAL_MESSAGE]), 'live_unsafe_root');
   required(OWNED_ROOTS.has(checked), 'live_root_not_owned');
+  required(!fs.existsSync(path.join(checked, CODEX_FINAL_MESSAGE)), 'live_unsafe_root');
   required(localGit(runtime, checked, ['remote']).trim() === '', 'live_remote_present'); required(localGit(runtime, checked, ['status', '--porcelain=v1']).trim() === '', 'live_unsafe_root');
   return Object.freeze({ entry_count: fs.readdirSync(checked).length, git_metadata_digest: gitMetadataDigest(checked), remote_count: 0, changed_entry_count: 0 });
 }
@@ -161,6 +161,11 @@ function capture(runtime, command, args, options) {
   return captureChild(child, options);
 }
 function versionMatches(result, contract) { return result.output_digest === contract.version_digest && !result.timed_out && !result.overflow && result.code === 0 && !result.signal; }
+function createCodexFinalMessage(root) {
+  required(OWNED_ROOTS.has(root), 'live_root_not_owned'); const filename = path.join(root, CODEX_FINAL_MESSAGE); let fd;
+  try { fd = fs.openSync(filename, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; fs.chmodSync(filename, 0o600); }
+  catch { try { if (fd !== undefined) fs.closeSync(fd); } catch {} throw new LiveCompatibilityError('live_final_message'); }
+}
 function cleanupCodexFinalMessage(root) { try { fs.unlinkSync(path.join(root, CODEX_FINAL_MESSAGE)); } catch {} }
 function consumeCodexFinalMessage(root) {
   const filename = path.join(root, CODEX_FINAL_MESSAGE); let fd;
@@ -192,17 +197,19 @@ function terminalReport(contract, selectedCaps, result_class, details = {}) {
 async function runInstalledCompatibility(value, runtime) {
   exact(value, ['adapter', 'evidence_directory', 'executable', 'root_directory'], 'live_run_shape'); const reviewed = REVIEWED_EXECUTIONS[value.adapter]; required(reviewed, 'live_adapter_not_supported'); const contractReview = reviewedContract(reviewed); const adapter = ADAPTERS[value.adapter]; required(adapter && adapter.id === contractReview.adapter.id, 'live_adapter_not_supported'); const selectedCaps = caps(runtime);
   const evidenceRoot = checkedMarkedRoot(value.evidence_directory, EVIDENCE_MARKER, new Set([EVIDENCE_MARKER, 'terminal.json', '.terminal.lock']), 'live_evidence_root'); const reservation = reserveTerminal(evidenceRoot);
+  let root;
   try {
-  const root = checkedMarkedRoot(value.root_directory, ROOT_MARKER, new Set([ROOT_MARKER, '.git', CODEX_FINAL_MESSAGE]), 'live_unsafe_root'); required(OWNED_ROOTS.has(root), 'live_root_not_owned'); required(!fs.existsSync(path.join(evidenceRoot, 'terminal.json')), 'live_terminal_already_recorded');
+  const candidateRoot = checkedMarkedRoot(value.root_directory, ROOT_MARKER, new Set([ROOT_MARKER, '.git', CODEX_FINAL_MESSAGE]), 'live_unsafe_root'); required(OWNED_ROOTS.has(candidateRoot), 'live_root_not_owned'); root = candidateRoot; required(!fs.existsSync(path.join(evidenceRoot, 'terminal.json')), 'live_terminal_already_recorded');
   const runIdentity = observedIdentity(); const compiled = profile(adapter, root); assertHostIsolation(adapter, compiled, root, runtime); const preFacts = rootFacts(root, runtime); const resolvedExecutable = executable(contractReview, value.executable);
   const contract = Object.freeze({ adapter, executable: resolvedExecutable, identity: runIdentity, pre_facts: preFacts, digest: digest(JSON.stringify({ adapter: adapter.id, model_id: adapter.model_id, executable_digest: resolvedExecutable.digest, identity: runIdentity, profile_digest: digest(JSON.stringify(compiled)), pre_facts: preFacts })) }); const startedAt = Date.now();
   let version; try { version = await capture(runtime, resolvedExecutable.path, ['--version'], { cwd: root, env: sanitizedEnvironment(), max_output_bytes: selectedCaps.max_version_output_bytes, timeout_ms: 5_000 }); } catch { const report = terminalReport(contract, selectedCaps, 'version_failed'); persistTerminal(evidenceRoot, report); return report; }
   const versionDigest = version.output_digest; if (!versionMatches(version, contractReview)) { const report = terminalReport(contract, selectedCaps, 'version_failed', { cli_version_digest: versionDigest, output_bytes: version.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
+  if (adapter.id === 'codex') createCodexFinalMessage(root);
   let invocation; try { invocation = await capture(runtime, resolvedExecutable.path, compiled, { cwd: root, env: sanitizedEnvironment(), expected_response: adapter.id === 'claude' ? 'QUADWORK_LIVE_OK' : undefined, max_output_bytes: selectedCaps.max_output_bytes, timeout_ms: selectedCaps.max_elapsed_ms }); } catch { const report = terminalReport(contract, selectedCaps, 'process_failed', { cli_version_digest: versionDigest, external_process_started: true, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
   const finalResponse = adapter.id === 'codex' ? consumeCodexFinalMessage(root) : Object.freeze({ response_digest: invocation.output_digest, response_ok: invocation.response_ok === true });
   let result_class = 'completed'; if (invocation.timed_out) result_class = 'timeout'; else if (invocation.overflow) result_class = 'output_cap_exceeded'; else if (invocation.code !== 0 || invocation.signal) result_class = 'login_or_entitlement_failure'; else if (!finalResponse.response_ok) result_class = 'response_contract_failed'; let postFacts = null; try { postFacts = rootFacts(root, runtime); if (JSON.stringify(preFacts) !== JSON.stringify(postFacts)) result_class = 'repository_mutated'; } catch { result_class = 'repository_mutated'; }
   const report = terminalReport(contract, selectedCaps, result_class, { cli_version_digest: versionDigest, response_digest: finalResponse.response_digest, response_contract_passed: finalResponse.response_ok, post_facts: postFacts, external_process_started: true, output_bytes: invocation.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report;
-  } finally { cleanupCodexFinalMessage(value.root_directory); releaseReservation(reservation); }
+  } finally { if (root) cleanupCodexFinalMessage(root); releaseReservation(reservation); }
 }
 
-module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, cleanupCodexFinalMessage, consumeCodexFinalMessage, executable, executableSize, profile, terminalReport, versionMatches }) });
+module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, cleanupCodexFinalMessage, consumeCodexFinalMessage, createCodexFinalMessage, executable, executableSize, profile, terminalReport, versionMatches }) });

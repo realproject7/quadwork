@@ -89,15 +89,26 @@ test('compiled argv is exactly the source-controlled Codex or Claude profile', (
 test('Codex final-message adapter accepts only the sentinel and deletes transient content', () => {
   const value = roots(), filename = path.join(value.root, '.quadwork-live-codex-final-message');
   try {
-    assert.equal(fs.statSync(filename).isFile(), true); assert.equal(fs.statSync(filename).mode & 0o777, 0o600);
+    const preEntries = fs.readdirSync(value.root).sort();
+    assert.equal(fs.existsSync(filename), false); core.testHooks.createCodexFinalMessage(value.root); assert.equal(fs.statSync(filename).isFile(), true); assert.equal(fs.statSync(filename).mode & 0o777, 0o600);
     fs.writeFileSync(filename, 'QUADWORK_LIVE_OK\n', { mode: 0o600 }); fs.chmodSync(filename, 0o600);
     const accepted = core.testHooks.consumeCodexFinalMessage(value.root); assert.equal(accepted.response_ok, true); assert.equal(fs.existsSync(filename), false);
-    fs.writeFileSync(filename, 'provider private output', { mode: 0o600 }); fs.chmodSync(filename, 0o600);
+    assert.deepEqual(fs.readdirSync(value.root).sort(), preEntries);
+    core.testHooks.createCodexFinalMessage(value.root); fs.writeFileSync(filename, 'provider private output', { mode: 0o600 }); fs.chmodSync(filename, 0o600);
     const rejected = core.testHooks.consumeCodexFinalMessage(value.root); assert.equal(rejected.response_ok, false); assert.equal(fs.existsSync(filename), false); assert.equal(JSON.stringify(rejected).includes('private output'), false);
-    fs.writeFileSync(filename, 'QUADWORK_LIVE_OK', { mode: 0o600 }); fs.chmodSync(filename, 0o644);
+    core.testHooks.createCodexFinalMessage(value.root); fs.writeFileSync(filename, 'QUADWORK_LIVE_OK', { mode: 0o600 }); fs.chmodSync(filename, 0o644);
     assert.equal(core.testHooks.consumeCodexFinalMessage(value.root).response_ok, false); assert.equal(fs.existsSync(filename), false);
     fs.writeFileSync(path.join(value.parent, 'outside'), 'QUADWORK_LIVE_OK'); fs.symlinkSync(path.join(value.parent, 'outside'), filename);
     assert.equal(core.testHooks.consumeCodexFinalMessage(value.root).response_ok, false); assert.equal(fs.existsSync(filename), false);
+  } finally { cleanup(value); }
+});
+
+test('failed preflight never cleans a caller-created raw root', async () => {
+  const value = roots(), forged = path.join(value.parent, 'forged-root'), final = path.join(forged, '.quadwork-live-codex-final-message');
+  try {
+    fs.mkdirSync(forged, { mode: 0o700 }); fs.writeFileSync(path.join(forged, live.ROOT_MARKER), 'quadwork-live-compatibility-v1\n', { mode: 0o600 }); fs.mkdirSync(path.join(forged, '.git')); fs.writeFileSync(final, 'caller-private', { mode: 0o600 });
+    await assert.rejects(() => core.runInstalledCompatibility({ adapter: 'codex', evidence_directory: value.evidence, executable: '/tmp/not-codex', root_directory: forged }), /live_root_not_owned/);
+    assert.equal(fs.existsSync(final), true);
   } finally { cleanup(value); }
 });
 
