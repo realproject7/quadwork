@@ -56,6 +56,12 @@ test('legacy inspection is snapshot-only and rejects reviewed sessions', () => {
   assert.match(server, /scrollback: Buffer\.isBuffer\(session\.scrollback\) \? session\.scrollback\.toString/);
   assert.doesNotMatch(server.slice(server.indexOf('module.exports = {'), server.indexOf('module.exports.mcpProxies')), /agentSessions/);
 });
+test('legacy mutable facade is guarded by the exact test flag and denies reviewed overwrite', () => {
+  const server = fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'), 'utf8');
+  assert.match(server, /process\.env\.QUADWORK_TEST_RUNTIME === "1"/);
+  assert.match(server, /if \(!visible\(session\) \|\| !visible\(existing\) && existing\)/);
+  assert.match(server, /module\.exports\.agentSessions = runtimeTestHooks\.agentSessions/);
+});
 test('child protocol has no test hook or caller-supplied launch surface and direct import cannot prepare', async () => {
   const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'), 'utf8');
   assert.doesNotMatch(source, /testHooks|dependencies|ptySpawn/);
