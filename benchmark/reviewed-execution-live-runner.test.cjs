@@ -1,5 +1,6 @@
 'use strict';
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -20,6 +21,12 @@ test('fixed workers carry source-fixed roles and prepare before loading the serv
     assert.match(source, new RegExp(`role = '${role}'`));
     assert.ok(source.indexOf('prepareFixedChild') < source.indexOf("require('../server/index.js')"));
     assert.doesNotMatch(source, /argv|prompt|command|runner-bridge/);
+  }
+});
+test('a directly started worker has no IPC admission and exits before preparation or provider launch', () => {
+  for (const file of ['reviewed-execution-live-worker-codex.cjs', 'reviewed-execution-live-worker-claude.cjs']) {
+    const result = spawnSync(process.execPath, [path.join(__dirname, file)], { env: { PATH: process.env.PATH || '/usr/bin:/bin' }, encoding: 'utf8', timeout: 5000 });
+    assert.equal(result.status, 1); assert.equal(result.stdout, ''); assert.equal(result.stderr, '');
   }
 });
 test('server retains its launch closure and has no importable reviewed bridge', () => {
