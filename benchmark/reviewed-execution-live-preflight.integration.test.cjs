@@ -48,7 +48,7 @@ function copyActiveChildFixture(directory) {
   copy('server'); copy('benchmark'); copy('src');
   const runner = path.join(directory, 'benchmark', 'reviewed-execution-live-runner.cjs');
   const runnerSource = fs.readFileSync(runner, 'utf8');
-  const runnerChanged = runnerSource.replace("env: { PATH: process.env.PATH || '/usr/bin:/bin'", "env: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_REVIEWED_FIXTURE_PRECLAIM: process.env.QUADWORK_REVIEWED_FIXTURE_PRECLAIM, QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER, QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER, QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN, QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT: process.env.QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT, QUADWORK_REVIEWED_FIXTURE_STOP_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_STOP_MARKER, QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER, PATH: process.env.PATH || '/usr/bin:/bin'");
+  const runnerChanged = runnerSource.replace("env: { PATH: process.env.PATH || '/usr/bin:/bin'", "env: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_REVIEWED_FIXTURE_PRECLAIM: process.env.QUADWORK_REVIEWED_FIXTURE_PRECLAIM, QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER, QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER, QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN, QUADWORK_REVIEWED_FIXTURE_CLAIMED_SPAWN_FAILURE: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_SPAWN_FAILURE, QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT: process.env.QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT, QUADWORK_REVIEWED_FIXTURE_STOP_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_STOP_MARKER, QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER, PATH: process.env.PATH || '/usr/bin:/bin'");
   assert.notEqual(runnerChanged, runnerSource, 'fixture forwards only its disposable fixture controls to its fixed child');
   fs.writeFileSync(runner, runnerChanged, { mode: 0o600 }); fs.chmodSync(runner, 0o600);
   const server = path.join(directory, 'server', 'index.js');
@@ -67,7 +67,7 @@ function copyActiveChildFixture(directory) {
     ws: "class W { on(){return this} once(){return this} send(){} close(){} }; module.exports={WebSocketServer:W,WebSocket:W};",
     // The claimed-run fixture uses a source-local terminal which can only emit
     // the fixed sentinel.  It cannot exec, receive argv, or contact a provider.
-    'node-pty': "module.exports={spawn(){if(process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN!=='1')throw new Error('fixture PTY launch is forbidden');let data,onexit;return {onData(fn){data=fn;return {dispose(){}}},onExit(fn){onexit=fn;return {dispose(){}}},write(){queueMicrotask(()=>data&&data('QUADWORK_V2_PRODUCT_PATH_OK\\n'))},kill(){queueMicrotask(()=>onexit&&onexit({exitCode:0}));return true}}}};",
+    'node-pty': "module.exports={spawn(){if(process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_SPAWN_FAILURE==='1')throw new Error('fixed fixture PTY spawn failure');if(process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN!=='1')throw new Error('fixture PTY launch is forbidden');let data,onexit;return {onData(fn){data=fn;return {dispose(){}}},onExit(fn){onexit=fn;return {dispose(){}}},write(){queueMicrotask(()=>data&&data('QUADWORK_V2_PRODUCT_PATH_OK\\n'))},kill(){queueMicrotask(()=>onexit&&onexit({exitCode:0}));return true}}}};",
     multer: "function m(){return {single(){return (a,b,c)=>c&&c()}}};m.diskStorage=x=>x;module.exports=m;",
   };
   for (const [name, source] of Object.entries(modules)) { const target = path.join(directory, 'node_modules', name, 'index.js'); mkdir(path.dirname(target)); fs.writeFileSync(target, source, { mode: 0o600 }); }
@@ -229,6 +229,35 @@ test('source-fixed claimed run returns an attested redacted failure after its re
     assert.equal(fs.existsSync(path.join(gate.ledger, `${gate.authorization_key}.launch`)), true);
     const encoded = JSON.stringify(result);
     for (const secret of [profiles.WORKLOAD, home, fixture]) assert.equal(encoded.includes(secret), false);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+test('source-fixed claim followed by a pre-terminal PTY failure attests removal of its term-less session and returns the child failure', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-claimed-spawn-failure-source-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-claimed-spawn-failure-home-'));
+  try {
+    const profiles = copyActiveChildFixture(fixture);
+    const expectedHead = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).trim();
+    const candidateDigest = profiles.candidateDigest(fixture);
+    const gate = gateFixture(home, profiles, expectedHead, candidateDigest);
+    const runner = path.join(fixture, 'benchmark', 'reviewed-execution-live-runner.cjs');
+    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedCodex().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
+      cwd: fixture, encoding: 'utf8', timeout: 15_000,
+      env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, USERPROFILE: home, QUADWORK_REVIEWED_FIXTURE_CLAIMED_SPAWN_FAILURE: '1' },
+    });
+    assert.equal(invoked.status, 0, `${invoked.stdout}\n${invoked.stderr}`);
+    const result = JSON.parse(invoked.stdout);
+    assert.equal(result.result_class, 'attempt_indeterminate');
+    assert.equal(result.provider_turns, 1);
+    assert.equal(result.launch_claim_state, 'claimed');
+    assert.equal(result.failure_stage, 'postclaim');
+    assert.equal(result.root_cleanup_ok, true);
+    assert.equal(result.survivor_free, true);
+    assert.equal(fs.existsSync(path.join(gate.ledger, `${gate.authorization_key}.launch`)), true);
+    const encoded = JSON.stringify(result);
+    for (const secret of [profiles.WORKLOAD, 'fixed fixture PTY spawn failure', home, fixture]) assert.equal(encoded.includes(secret), false);
   } finally {
     fs.rmSync(fixture, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
