@@ -13,7 +13,7 @@ const MAX_IPC_BYTES = 16 * 1024;
 const MAX_CHILD_MS = 60_000;
 const RESULT_DRAIN_MS = 100;
 const FIELDS = Object.freeze(['schema_version', 'purpose', 'profile_id', 'backend', 'model', 'expected_head', 'candidate_digest', 'gate_receipt_digest', 'result_class', 'provider_turns', 'launch_claim_state', 'failure_stage', 'lifecycle_verified', 'sentinel_digest', 'output_bytes', 'output_capped', 'elapsed_ms', 'root_cleanup_ok', 'survivor_free', 'source_rechecked_before_prompt', 'gate_rechecked_before_prompt', 'pre_root_facts', 'post_root_facts', 'credential_copy_or_store_api_used', 'keychain_immutability_claimed', 'peer_level_network_filter_available', 'release_evidence']);
-const RESULTS = new Set(['completed', 'preflight_blocked', 'launch_failed', 'launch_indeterminate', 'attempt_indeterminate', 'output_cap_exceeded', 'cleanup_failed', 'worker_verification_failed', 'worker_start_failed', 'worker_timeout', 'worker_result_invalid', 'worker_exit_unverified', 'worker_exited_without_result']);
+const RESULTS = new Set(['completed', 'preflight_blocked', 'launch_failed', 'launch_indeterminate', 'attempt_indeterminate', 'output_cap_exceeded', 'cleanup_failed', 'worker_verification_failed', 'worker_start_failed', 'worker_timeout', 'worker_result_invalid', 'worker_exit_unverified', 'worker_cleanup_unverified', 'worker_exited_without_result']);
 const PRELAUNCH_RESULTS = new Set(['preflight_blocked', 'launch_failed', 'attempt_indeterminate', 'cleanup_failed']);
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
 const sameUser = stat => typeof process.getuid !== 'function' || stat.uid === process.getuid();
@@ -36,8 +36,13 @@ function runFixedWorker(filename) {
       // truthful prelaunch/cleanup facts. Do not replace a valid zero-turn
       // refusal with a parent-made, conservative one-turn fallback merely
       // because cleanup was unsuccessful.
-      if (report && exited.code === 0 && (report.provider_turns === 0 || (report.root_cleanup_ok && report.survivor_free))) return finish(report);
-      finish(fixedFailure(profile, report ? 'worker_exit_unverified' : 'worker_exited_without_result', 1, verified.candidate_digest));
+      // The result is authenticated by the one-shot pipe and acknowledged
+      // before the worker exits.  A claimed attempt that attests both cleanup
+      // and survivor absence remains safe to report even if a later process
+      // exit status is non-zero.  Do not, however, promote an unattested child
+      // report: expose only the parent-owned, redacted classification.
+      if (report && ((report.provider_turns === 0 && exited.code === 0) || (report.provider_turns === 1 && report.root_cleanup_ok && report.survivor_free))) return finish(report);
+      finish(fixedFailure(profile, report ? (report.provider_turns === 1 ? 'worker_cleanup_unverified' : 'worker_exit_unverified') : 'worker_exited_without_result', 1, verified.candidate_digest));
     };
     const terminate = result => { if (terminating) return; terminating = result; if (exited) return concludeExit(); try { child?.kill('SIGTERM'); } catch {} escalation = setTimeout(() => { try { child?.kill('SIGKILL'); } catch {} }, 2_000); };
     const timer = setTimeout(() => terminate('worker_timeout'), MAX_CHILD_MS);
