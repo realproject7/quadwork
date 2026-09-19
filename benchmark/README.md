@@ -121,13 +121,18 @@ provider budget gates itself.
 evidence layer, not a provider runner. It accepts only exact contracts whose
 source, harness, workload, adapter, protocol, and concrete base artifacts are
 regular files at fixed absolute paths inside a caller-created marked disposable
-input root. It calculates their SHA-256 digests itself, re-parses the protocol,
-and checks the concrete base identity before recording anything. Its evidence
+target root. That root also contains a canonical artifact manifest whose digest
+must equal the protocol-bound manifest digest; each artifact and concrete base
+file is compared to the manifest before the first ledger append. It calculates
+their SHA-256 digests itself, re-parses the protocol, and checks the concrete
+base identity before recording anything. Its evidence
 directory must have been created by `createDisposableCalibrationEvidenceRoot()`;
 each append uses an exclusive lock, a re-read/CAS prefix check, file and
 directory fsync, and an atomic rename. Reports retain only structured input
 digests, actual injected Actions/cache/artifact observations, and monotonic
-start/end/duration references; no provider text or credentials are retained.
+start/end/duration references; a bounded append-only `observations.json` index
+binds each ledger record to those secret-free structured observations. No
+provider text, credentials, or absolute artifact paths are retained publicly.
 
 Current `calibration-protocol.cjs` fixes `provider_execution_permitted` to
 false, so this executor always records a Mode 2
