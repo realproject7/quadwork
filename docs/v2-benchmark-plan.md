@@ -209,6 +209,16 @@ File-level ownership and live issue ACs are required before agent implementation
 Do not create a general scheduler or copy production state machines into the
 harness. Unit A cannot claim completion of B or C.
 
+The initial Unit A implementation has a deliberately read-only ledger validator
+(`benchmark/evidence.cjs`). Its append operation is a pure, immutable-value
+transformation so the future runtime must retain the returned full history; it
+does not write a file or attempt to erase evidence. A single ledger carries one
+of `live`, `replay`, or `historical` provenance only. Its public report excludes
+anchor values and evidence references, so raw provider/chat content and secrets
+have no accepted field. It returns structural completeness only: full task and
+receipt validation stays in the later manifest/evidence verifier, so no report
+from this utility can authorize calibration, a freeze, or Mode 3 timing.
+
 ## Initial preflight, 2026-09-19
 
 - Worktree: `quadwork-v2-benchmark-prep`, branch `task/1037-benchmark-prep`.

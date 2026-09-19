@@ -7,6 +7,8 @@ node benchmark/preflight.cjs \
   --manifest docs/v2-benchmark-manifest.draft.json \
   --repo .
 node --test benchmark/preflight.test.cjs
+node benchmark/evidence.cjs --ledger /path/to/ledger.json
+node --test benchmark/evidence.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -20,6 +22,27 @@ operator's approval, freeze targets, or run any benchmark. It never grants those
 capabilities based on a caller-supplied approval or Mode 3 flag. It checks only
 the preparation schema; nested run contracts and approval evidence need the
 later reviewed implementation.
+
+`evidence.cjs` is the companion offline validator for the append-only benchmark
+ledger. It accepts a single provenance class (`live`, `replay`, or `historical`)
+per ledger, validates fixed identity anchors and per-run ordering, and creates a
+secret-free structural result summary. It never authorizes a speed result: the
+later manifest/evidence verifier must bind actual receipts, complete tasks, and
+the approved freeze before timing can be considered. Records bind an immutable
+source/harness/workload run anchor separately from a changing candidate/repository
+delivery identity, and include task, role, generation, attempt, and sanitized model identity.
+Candidate identity is `null` only for pre-candidate start/ready/assignment,
+failure/interruption, and recovery events.
+Failed, interrupted,
+replayed, historical, malformed, or incomplete runs remain represented but are
+never counted as speed results. The module's `appendRecord` API returns a new
+validated ledger with the prior prefix intact and links its records by hash; it
+performs no persistence itself. The runner that eventually persists records must
+use that API, retain all previous records, and retain the resulting ledger digest
+as evidence. The chain detects changes only when a previously retained digest is
+compared; it cannot by itself attest to external storage history. This tool does
+not validate a manifest freeze, invoke a model,
+or permit Mode 3 timing.
 
 Use Node 20.3+ on macOS with Command Line Tools Git at
 `/Library/Developer/CommandLineTools/usr/bin/git`, or Linux with `/usr/bin/git`.
