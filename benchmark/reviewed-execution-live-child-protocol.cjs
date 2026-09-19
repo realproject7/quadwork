@@ -108,7 +108,9 @@ async function completeFixedChild(role, runtime) {
     shutdown = await runtime.shutdown();
     post = rootFacts(state.root);
     const survivor_free = stopped?.ok === true && stopped?.resources?.ptys === 1 && stopped?.resources?.sessions === 1;
-    const root_clean = rootMatches(state.pre, post) && removeOwnedRoot(state.root);
+    const postcondition_ok = rootMatches(state.pre, post);
+    const root_removed = removeOwnedRoot(state.root);
+    const root_clean = postcondition_ok && root_removed;
     const environment_restored = restore();
     const decision = outcome.finalizeEffects({ provider_turns, lifecycle: lifecycle_verified ? 'verified' : 'unverified', sentinel: observed.sentinel, output_capped: observed.output_capped, timed_out: !observed.sentinel && !observed.output_capped, effects: { stop: () => stopped?.ok === true, shutdown: () => shutdown?.ok === true, survivor: () => survivor_free, root: () => root_clean, git: () => post !== null, environment: () => environment_restored } });
     return report(state.profile, state.facts, { gate_receipt_digest: state.gate.receipt_digest, result_class: decision.result_class, provider_turns: decision.provider_turns, lifecycle_verified: decision.lifecycle_verified, sentinel: observed.sentinel, output_bytes: observed.output_bytes, output_capped: observed.output_capped, elapsed_ms: Date.now() - state.started, root_cleanup_ok: decision.root_cleanup_ok, survivor_free: decision.survivor_free, rechecked, pre: state.pre, post });
@@ -118,10 +120,12 @@ async function completeFixedChild(role, runtime) {
     try { post = rootFacts(state.root); } catch {}
     const observed = observer.snapshot();
     const survivor_free = provider_turns === 0 || (stopped?.ok === true && stopped?.resources?.ptys === 1 && stopped?.resources?.sessions === 1);
-    const root_clean = removeOwnedRoot(state.root) && rootMatches(state.pre, post);
+    const postcondition_ok = rootMatches(state.pre, post);
+    const root_removed = removeOwnedRoot(state.root);
+    const root_clean = root_removed && postcondition_ok;
     const environment_restored = restore();
     const decision = outcome.finalizeEffects({ provider_turns, lifecycle: 'unverified', launch: provider_turns ? undefined : false, sentinel: false, output_capped: observed.output_capped, timed_out: provider_turns > 0, effects: { stop: () => provider_turns === 0 || stopped?.ok === true, shutdown: () => provider_turns === 0 || shutdown?.ok === true, survivor: () => survivor_free, root: () => root_clean, git: () => post !== null, environment: () => environment_restored } });
-    return report(state.profile, state.facts, { gate_receipt_digest: state.gate.receipt_digest, result_class: provider_turns > 0 ? 'attempt_indeterminate' : decision.result_class, provider_turns: decision.provider_turns, output_bytes: observed.output_bytes, output_capped: observed.output_capped, elapsed_ms: Date.now() - state.started, root_cleanup_ok: decision.root_cleanup_ok, survivor_free: decision.survivor_free, rechecked, pre: state.pre, post });
+    return report(state.profile, state.facts, { gate_receipt_digest: state.gate.receipt_digest, result_class: decision.result_class, provider_turns: decision.provider_turns, output_bytes: observed.output_bytes, output_capped: observed.output_capped, elapsed_ms: Date.now() - state.started, root_cleanup_ok: decision.root_cleanup_ok, survivor_free: decision.survivor_free, rechecked, pre: state.pre, post });
   } finally { fixed = null; }
 }
 function failedChildReport(role) { const profile = Object.values(profiles.PROFILES).find(entry => entry.role === role); return report(profile, null, { result_class: 'attempt_indeterminate' }); }
