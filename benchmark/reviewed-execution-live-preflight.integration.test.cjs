@@ -48,7 +48,7 @@ function copyActiveChildFixture(directory) {
   copy('server'); copy('benchmark'); copy('src');
   const runner = path.join(directory, 'benchmark', 'reviewed-execution-live-runner.cjs');
   const runnerSource = fs.readFileSync(runner, 'utf8');
-  const runnerChanged = runnerSource.replace("env: { PATH: process.env.PATH || '/usr/bin:/bin'", "env: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_REVIEWED_FIXTURE_PRECLAIM: process.env.QUADWORK_REVIEWED_FIXTURE_PRECLAIM, QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER, QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER, QUADWORK_REVIEWED_FIXTURE_STOP_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_STOP_MARKER, QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER, PATH: process.env.PATH || '/usr/bin:/bin'");
+  const runnerChanged = runnerSource.replace("env: { PATH: process.env.PATH || '/usr/bin:/bin'", "env: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_REVIEWED_FIXTURE_PRECLAIM: process.env.QUADWORK_REVIEWED_FIXTURE_PRECLAIM, QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_ADMISSION_MARKER, QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER, QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN: process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN, QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT: process.env.QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT, QUADWORK_REVIEWED_FIXTURE_STOP_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_STOP_MARKER, QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER: process.env.QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER, PATH: process.env.PATH || '/usr/bin:/bin'");
   assert.notEqual(runnerChanged, runnerSource, 'fixture forwards only its disposable fixture controls to its fixed child');
   fs.writeFileSync(runner, runnerChanged, { mode: 0o600 }); fs.chmodSync(runner, 0o600);
   const server = path.join(directory, 'server', 'index.js');
@@ -59,13 +59,15 @@ function copyActiveChildFixture(directory) {
   const recordEnv = "if (preclaimProfile) { if (process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER) fs.appendFileSync(process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER, JSON.stringify({ kind: 'env', role: agentId, env: { ...preclaimProfile.env } }) + '\\n'); return { ...preclaimProfile.env }; }";
   const interceptedClaim = "const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, PROFILES: REVIEWED_EXECUTION_PROFILES, claimAuthorization: profileClaimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require(\"./reviewed-execution-profiles\");\nconst claimAuthorization = (...args) => { if (process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER) { fs.appendFileSync(process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER, JSON.stringify({ kind: 'claim', profile_id: args[0]?.id }) + '\\n'); throw new Error('fixture_claim_boundary'); } return profileClaimAuthorization(...args); };";
   const observedFinalizers = "stopAgentSession: (...args) => { if (process.env.QUADWORK_REVIEWED_FIXTURE_STOP_MARKER) fs.writeFileSync(process.env.QUADWORK_REVIEWED_FIXTURE_STOP_MARKER, 'called'); return stopAgentSession(...args); },\n    shutdown: (...args) => { if (process.env.QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER) fs.writeFileSync(process.env.QUADWORK_REVIEWED_FIXTURE_SHUTDOWN_MARKER, 'called'); return shutdown(...args); },";
-  const serverChanged = serverSource.replace('const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, PROFILES: REVIEWED_EXECUTION_PROFILES, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");', interceptedClaim).replace('async function buildAgentArgs(projectId, agentId) {', failBuild).replace('if (preclaimProfile) return { args: [...preclaimProfile.provider_argv] };', recordArgs).replace('if (preclaimProfile) return { ...preclaimProfile.env };', recordEnv).replace('async function runReviewedExecution(role) {', observeAdmission).replace('const reviewedChild = require("../benchmark/reviewed-execution-live-child-protocol.cjs");', "if (process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER) installLifecycleTestFixture(REVIEWED_EXECUTION_PROJECT, reviewedChildRole, 'linux-contained');\n  const reviewedChild = require(\"../benchmark/reviewed-execution-live-child-protocol.cjs\");").replace('stopAgentSession,\n    shutdown,', observedFinalizers);
+  const serverChanged = serverSource.replace('const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, PROFILES: REVIEWED_EXECUTION_PROFILES, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");', interceptedClaim).replace('async function buildAgentArgs(projectId, agentId) {', failBuild).replace('if (preclaimProfile) return { args: [...preclaimProfile.provider_argv] };', recordArgs).replace('if (preclaimProfile) return { ...preclaimProfile.env };', recordEnv).replace('async function runReviewedExecution(role) {', observeAdmission).replace('const reviewedChild = require("../benchmark/reviewed-execution-live-child-protocol.cjs");', "if (process.env.QUADWORK_REVIEWED_FIXTURE_CLAIM_MARKER) installLifecycleTestFixture(REVIEWED_EXECUTION_PROJECT, reviewedChildRole, 'linux-contained');\n  const reviewedChild = require(\"../benchmark/reviewed-execution-live-child-protocol.cjs\");").replace('stopAgentSession,\n    shutdown,', observedFinalizers).replace('sendReviewedResultAndAwaitParent(report, 0);', "sendReviewedResultAndAwaitParent(report, process.env.QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT === '1' ? 1 : 0);");
   assert.notEqual(serverChanged, serverSource, 'fixture injects only a fixed missing preclaim prerequisite and finalizer observation');
   fs.writeFileSync(server, serverChanged, { mode: 0o600 }); fs.chmodSync(server, 0o600);
   const modules = {
     express: "function app(){return Object.assign(function(){},{use(){},get(){},post(){},put(){},delete(){},patch(){},options(){},set(){},listen(){return {on(){},close(){}}}})};app.Router=app;app.json=()=>((a,b,c)=>c&&c());app.static=()=>((a,b,c)=>c&&c());module.exports=app;",
     ws: "class W { on(){return this} once(){return this} send(){} close(){} }; module.exports={WebSocketServer:W,WebSocket:W};",
-    'node-pty': "module.exports={spawn(){throw new Error('fixture PTY launch is forbidden')}};",
+    // The claimed-run fixture uses a source-local terminal which can only emit
+    // the fixed sentinel.  It cannot exec, receive argv, or contact a provider.
+    'node-pty': "module.exports={spawn(){if(process.env.QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN!=='1')throw new Error('fixture PTY launch is forbidden');let data,onexit;return {onData(fn){data=fn;return {dispose(){}}},onExit(fn){onexit=fn;return {dispose(){}}},write(){queueMicrotask(()=>data&&data('QUADWORK_V2_PRODUCT_PATH_OK\\n'))},kill(){queueMicrotask(()=>onexit&&onexit({exitCode:0}));return true}}}};",
     multer: "function m(){return {single(){return (a,b,c)=>c&&c()}}};m.diskStorage=x=>x;module.exports=m;",
   };
   for (const [name, source] of Object.entries(modules)) { const target = path.join(directory, 'node_modules', name, 'index.js'); mkdir(path.dirname(target)); fs.writeFileSync(target, source, { mode: 0o600 }); }
@@ -202,4 +204,33 @@ test('source-fixed Codex and Claude revalidate their exact preclaim args and env
       } finally { fs.rmSync(home, { recursive: true, force: true }); }
     }
   } finally { fs.rmSync(fixture, { recursive: true, force: true }); }
+});
+test('source-fixed claimed run returns an attested redacted failure after its result is ACKed even when the worker exits non-zero', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-claimed-result-source-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-claimed-result-home-'));
+  try {
+    const profiles = copyActiveChildFixture(fixture);
+    const expectedHead = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).trim();
+    const candidateDigest = profiles.candidateDigest(fixture);
+    const gate = gateFixture(home, profiles, expectedHead, candidateDigest);
+    const runner = path.join(fixture, 'benchmark', 'reviewed-execution-live-runner.cjs');
+    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedCodex().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
+      cwd: fixture, encoding: 'utf8', timeout: 15_000,
+      env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, USERPROFILE: home, QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN: '1', QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT: '1' },
+    });
+    assert.equal(invoked.status, 0, `${invoked.stdout}\n${invoked.stderr}`);
+    const result = JSON.parse(invoked.stdout);
+    assert.equal(result.provider_turns, 1);
+    assert.equal(result.launch_claim_state, 'claimed');
+    assert.equal(result.failure_stage, 'postclaim');
+    assert.equal(result.root_cleanup_ok, true);
+    assert.equal(result.survivor_free, true);
+    assert.equal(result.result_class, 'attempt_indeterminate');
+    assert.equal(fs.existsSync(path.join(gate.ledger, `${gate.authorization_key}.launch`)), true);
+    const encoded = JSON.stringify(result);
+    for (const secret of [profiles.WORKLOAD, home, fixture]) assert.equal(encoded.includes(secret), false);
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

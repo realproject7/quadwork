@@ -28,15 +28,16 @@ const fork = (file, args, options) => {
     const profile = profiles.PROFILES.v2_codex_readonly_v1;
     const facts = { root_digest: 'a'.repeat(64), entry_digest: 'b'.repeat(64), entry_count: 1, remote_count: 0, changed_entry_count: 0 };
     const prelaunch = resultHarnessMode === 'prelaunch-refusal' || resultHarnessMode === 'prelaunch-cleanup-failure';
-    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed';
+    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure';
     const cleanupFailure = resultHarnessMode === 'prelaunch-cleanup-failure' || oneTurnUnsafe;
-    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : malformedClaim ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || malformedClaim ? 'postclaim' : 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || malformedClaim ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
+    const postclaimFailure = malformedClaim || claimedNonzeroFailure || unverifiedNonzeroFailure;
+    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
     if (resultHarnessMode === 'duplicate') {
       queueMicrotask(() => { child.emit('exit', 0); setImmediate(() => { child.emit('message', { type: 'reviewed_execution_result', report }); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report: { ...report, output_bytes: 7 } })); }); });
     } else if (prelaunch) {
       queueMicrotask(() => { child.emit('message', { type: 'reviewed_execution_result', report }); child.emit('exit', 0); });
     } else {
-      process.nextTick(() => { child.emit('exit', 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
+      process.nextTick(() => { child.emit('exit', claimedNonzeroFailure || claimedNonzeroCompleted || unverifiedNonzeroFailure ? 1 : 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
     }
     return true;
   };
@@ -55,6 +56,9 @@ function oneTurnUnsafeHarness() { return resultHarness('one-turn-unsafe'); }
 function malformedClaimHarness() { return resultHarness('malformed-claim'); }
 function invalidClaimStageHarness() { return resultHarness('invalid-claim-stage'); }
 function zeroTurnCompletedHarness() { return resultHarness('zero-turn-completed'); }
+function claimedNonzeroFailureHarness() { return resultHarness('claimed-nonzero-failure'); }
+function claimedNonzeroCompletedHarness() { return resultHarness('claimed-nonzero-completed'); }
+function unverifiedNonzeroFailureHarness() { return resultHarness('unverified-nonzero-failure'); }
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -71,6 +75,25 @@ test('parent accepts a valid redacted result that is delivered adjacent to worke
   assert.equal(result.provider_turns, 1);
   assert.equal(result.root_cleanup_ok, true);
   assert.equal(result.survivor_free, true);
+});
+test('parent preserves an attested claimed failure result after a later non-zero worker exit', async () => {
+  const result = await claimedNonzeroFailureHarness().run();
+  assert.equal(result.result_class, 'attempt_indeterminate');
+  assert.equal(result.provider_turns, 1);
+  assert.equal(result.launch_claim_state, 'claimed');
+  assert.equal(result.root_cleanup_ok, true);
+  assert.equal(result.survivor_free, true);
+});
+test('parent rejects claimed completion and unverified failure after a non-zero worker exit', async () => {
+  for (const harness of [claimedNonzeroCompletedHarness, unverifiedNonzeroFailureHarness]) {
+    const result = await harness().run();
+    assert.equal(result.result_class, 'worker_cleanup_unverified');
+    assert.equal(result.provider_turns, 1);
+    assert.equal(result.launch_claim_state, 'unverified');
+    assert.equal(result.failure_stage, 'parent_unverified');
+    assert.equal(result.root_cleanup_ok, false);
+    assert.equal(result.survivor_free, false);
+  }
 });
 test('parent fails closed on a second valid terminal result and selects neither', async () => {
   const result = await duplicateResultHarness().run();
@@ -93,7 +116,7 @@ test('parent returns valid zero-turn prelaunch refusal and cleanup failure repor
 });
 test('parent refuses an unsafe one-turn report even when its IPC shape is valid', async () => {
   const result = await oneTurnUnsafeHarness().run();
-  assert.equal(result.result_class, 'worker_exit_unverified');
+  assert.equal(result.result_class, 'worker_cleanup_unverified');
   assert.equal(result.provider_turns, 1);
   assert.equal(result.root_cleanup_ok, false);
   assert.equal(result.survivor_free, false);
