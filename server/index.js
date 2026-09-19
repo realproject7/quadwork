@@ -33,7 +33,7 @@ const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
-const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
+const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, PROFILES: REVIEWED_EXECUTION_PROFILES, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
 const { assertReviewedExecutionGate } = require("./reviewed-execution-gate");
 // #1117's no-input runner is the only production caller. Generic HTTP/config
 // starts are denied even when an otherwise-valid reviewed role is configured.
@@ -41,6 +41,17 @@ const REVIEWED_EXECUTION_LIVE_ENABLED = true;
 // This permit set is closure-private: no config, HTTP request, exported API,
 // or importable module can mint a value for generic start/reset/restart paths.
 const reviewedExecutionFixedLaunches = new WeakSet();
+// The authenticated fixed child asks for its immutable provider argv/env before
+// runReviewedExecution reads the disposable config. Keep that preclaim step
+// closed to its already-admitted role; ordinary config and all generic starts
+// still resolve their agent settings through reviewedExecutionFor below.
+const reviewedPreclaimArgumentRoles = new Set();
+
+function reviewedPreclaimArgumentProfile(projectId, agentId) {
+  if (projectId !== REVIEWED_EXECUTION_PROJECT || !reviewedPreclaimArgumentRoles.has(agentId)) return null;
+  const matches = Object.values(REVIEWED_EXECUTION_PROFILES).filter(profile => profile.role === agentId);
+  return matches.length === 1 ? matches[0] : null;
+}
 
 function reviewedExecutionFor(projectId, agentId, agentCfg) {
   const id = agentCfg?.reviewed_execution_id;
@@ -2228,6 +2239,8 @@ function writeGrokProjectConfig(projectId, agentId, cwd, serverPort) {
  * Async because Codex proxy_flag mode needs to await proxy startup.
  */
 async function buildAgentArgs(projectId, agentId) {
+  const preclaimProfile = reviewedPreclaimArgumentProfile(projectId, agentId);
+  if (preclaimProfile) return { args: [...preclaimProfile.provider_argv] };
   const cfg = readConfig();
   const project = cfg.projects?.find((p) => p.id === projectId);
   if (!project) return { args: [] };
@@ -2329,6 +2342,8 @@ async function buildAgentArgs(projectId, agentId) {
  * Build extra env vars for an agent (MCP injection via env for Gemini).
  */
 function buildAgentEnv(projectId, agentId) {
+  const preclaimProfile = reviewedPreclaimArgumentProfile(projectId, agentId);
+  if (preclaimProfile) return { ...preclaimProfile.env };
   const cfg = readConfig();
   const project = cfg.projects?.find((p) => p.id === projectId);
   if (!project) return {};
@@ -4905,6 +4920,7 @@ if (process.env.QUADWORK_TEST_RUNTIME === "1") {
 // installed in a bridge, global, route, or event listener.
 const reviewedChildRole = process.env.QUADWORK_REVIEWED_EXECUTION_CHILD_ROLE;
 if ((reviewedChildRole === "benchmark_codex" || reviewedChildRole === "benchmark_claude") && typeof process.send === "function") {
+  reviewedPreclaimArgumentRoles.add(reviewedChildRole);
   const reviewedChild = require("../benchmark/reviewed-execution-live-child-protocol.cjs");
   const reviewedParentNonce = process.env.QUADWORK_REVIEWED_PARENT_NONCE;
   const sendReviewedResultAndAwaitParent = (report, exitCode) => {
