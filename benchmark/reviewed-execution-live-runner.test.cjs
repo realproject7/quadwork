@@ -69,6 +69,7 @@ test('production evaluator makes output cap, timeout, lifecycle, remote rejectio
   assert.equal(outcome.finalize({ ...baseline, lifecycle: 'spawned' }).result_class, 'attempt_indeterminate');
   assert.equal(outcome.finalize({ ...baseline, launch: false }).result_class, 'launch_failed');
   for (const field of ['stop', 'shutdown', 'survivor', 'root', 'git', 'environment']) { const value = outcome.finalize({ ...baseline, [field]: false }); assert.equal(value.result_class, 'cleanup_failed'); assert.equal(value.root_cleanup_ok, false); }
+  for (const failed of ['stop', 'shutdown', 'survivor', 'root', 'git', 'environment']) { const effects = Object.fromEntries(['stop', 'shutdown', 'survivor', 'root', 'git', 'environment'].map(name => [name, () => name !== failed])); const value = outcome.finalizeEffects({ provider_turns: 1, lifecycle: 'verified', sentinel: true, effects }); assert.equal(value.result_class, 'cleanup_failed'); }
 });
 test('non-launching production report harness redacts prompt, output, path and token fields', () => {
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const report = reportHarness().report(profile, { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, { prompt: profiles.WORKLOAD, output: 'token=private', path: '/private/root', token: 'private', result_class: 'attempt_indeterminate' }); const text = JSON.stringify(report);
