@@ -2,12 +2,14 @@
 const assert = require('node:assert/strict');
 const { fork, spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
+const Module = require('node:module');
 const profiles = require('../server/reviewed-execution-profiles');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const runner = require('./reviewed-execution-live-runner.cjs');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
+function reportHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', 'module.exports = Object.freeze({ report });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -67,4 +69,8 @@ test('production evaluator makes output cap, timeout, lifecycle, remote rejectio
   assert.equal(outcome.finalize({ ...baseline, lifecycle: 'spawned' }).result_class, 'attempt_indeterminate');
   assert.equal(outcome.finalize({ ...baseline, launch: false }).result_class, 'launch_failed');
   for (const field of ['stop', 'shutdown', 'survivor', 'root', 'git', 'environment']) { const value = outcome.finalize({ ...baseline, [field]: false }); assert.equal(value.result_class, 'cleanup_failed'); assert.equal(value.root_cleanup_ok, false); }
+});
+test('non-launching production report harness redacts prompt, output, path and token fields', () => {
+  const profile = profiles.PROFILES.v2_claude_restricted_v1; const report = reportHarness().report(profile, { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, { prompt: profiles.WORKLOAD, output: 'token=private', path: '/private/root', token: 'private', result_class: 'attempt_indeterminate' }); const text = JSON.stringify(report);
+  for (const hidden of [profiles.WORKLOAD, 'token=private', '/private/root', 'private']) assert.equal(text.includes(hidden), false);
 });
