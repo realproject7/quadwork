@@ -49,6 +49,13 @@ test('server retains its launch closure and has no importable reviewed bridge', 
   assert.doesNotMatch(server.slice(server.indexOf('module.exports = {'), server.indexOf('module.exports.mcpProxies')), /runReviewedExecution/);
   assert.equal(fs.existsSync(path.join(__dirname, '..', 'server', 'reviewed-execution-runner-bridge.js')), false);
 });
+test('legacy inspection is snapshot-only and rejects reviewed sessions', () => {
+  const server = fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'), 'utf8');
+  assert.match(server, /function inspectLegacySession\(key\)/);
+  assert.match(server, /session\.reviewedExecution === true\) return null/);
+  assert.match(server, /scrollback: Buffer\.isBuffer\(session\.scrollback\) \? session\.scrollback\.toString/);
+  assert.doesNotMatch(server.slice(server.indexOf('module.exports = {'), server.indexOf('module.exports.mcpProxies')), /agentSessions/);
+});
 test('child protocol has no test hook or caller-supplied launch surface and direct import cannot prepare', async () => {
   const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'), 'utf8');
   assert.doesNotMatch(source, /testHooks|dependencies|ptySpawn/);
