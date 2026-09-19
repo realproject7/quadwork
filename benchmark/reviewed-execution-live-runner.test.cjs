@@ -20,9 +20,9 @@ test('parent has no server import, bridge, PTY, prompt, config or caller-control
 test('fixed workers carry source-fixed roles and prepare before loading the server', () => {
   for (const [file, role] of [['reviewed-execution-live-worker-codex.cjs', 'benchmark_codex'], ['reviewed-execution-live-worker-claude.cjs', 'benchmark_claude']]) {
     const source = fs.readFileSync(path.join(__dirname, file), 'utf8');
-    assert.match(source, new RegExp(`role = '${role}'`));
-    assert.ok(source.indexOf('prepareFixedChild') < source.indexOf("require('../server/index.js')"));
-    assert.doesNotMatch(source, /argv|prompt|command|runner-bridge/);
+    assert.match(source, new RegExp(`QUADWORK_REVIEWED_EXECUTION_CHILD_ROLE = '${role}'`));
+    assert.match(source, /require\('\.\/reviewed-execution-live-child-protocol\.cjs'\)/);
+    assert.doesNotMatch(source, /argv|prompt|command|runner-bridge|prepareFixedChild/);
   }
 });
 test('a directly started worker has no IPC admission and exits before preparation or provider launch', () => {
@@ -33,7 +33,7 @@ test('a directly started worker has no IPC admission and exits before preparatio
 });
 test('self-supplied IPC nonce, candidate, and worker hash still cannot admit without the parent-only pipe secret', async () => {
   const file = path.join(__dirname, 'reviewed-execution-live-worker-claude.cjs');
-  const child = fork(file, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], env: { PATH: process.env.PATH || '/usr/bin:/bin', QUADWORK_REVIEWED_PARENT_NONCE: 'a'.repeat(64), QUADWORK_REVIEWED_CANDIDATE_DIGEST: profiles.candidateDigest(), QUADWORK_REVIEWED_WORKER_DIGEST: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') } });
+  const child = fork(file, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], env: { PATH: process.env.PATH || '/usr/bin:/bin', QUADWORK_REVIEWED_EXECUTION_CHILD: '1', QUADWORK_REVIEWED_PARENT_NONCE: 'a'.repeat(64), QUADWORK_REVIEWED_CANDIDATE_DIGEST: profiles.candidateDigest(), QUADWORK_REVIEWED_WORKER_DIGEST: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') } });
   const result = await new Promise(resolve => { let messages = 0; child.on('message', () => { messages += 1; }); child.once('exit', code => resolve({ code, messages })); });
   assert.deepEqual(result, { code: 1, messages: 0 });
 });
@@ -45,8 +45,10 @@ test('server retains its launch closure and has no importable reviewed bridge', 
   assert.doesNotMatch(server.slice(server.indexOf('module.exports = {'), server.indexOf('module.exports.mcpProxies')), /runReviewedExecution/);
   assert.equal(fs.existsSync(path.join(__dirname, '..', 'server', 'reviewed-execution-runner-bridge.js')), false);
 });
-test('child protocol has no test hook or caller-supplied launch surface', () => {
+test('child protocol has no test hook or caller-supplied launch surface and direct import cannot prepare', async () => {
   const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'), 'utf8');
   assert.doesNotMatch(source, /testHooks|dependencies|ptySpawn/);
   assert.match(source, /rootMatches\(state\.pre, post\)/);
+  const protocol = require('./reviewed-execution-live-child-protocol.cjs');
+  await assert.rejects(() => protocol.prepareFixedChild({}), /child_state/);
 });
