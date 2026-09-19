@@ -7,36 +7,37 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const test = require('node:test');
-const live = require('./live-provider-compatibility.cjs');
+const publicLive = require('./live-provider-compatibility.cjs');
+const live = require('./live-provider-compatibility.test-fixture.cjs');
 
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
-const identity = () => ({ base_digest: sha('base'), harness_digest: sha('harness'), source_digest: sha('source'), workload_digest: sha('workload') });
-function fixture(script = 'console.log(process.argv.includes("--version") ? "fake 1.0" : "QUADWORK_LIVE_OK");') {
+function fixture(script = 'console.log(process.argv.includes("--version") ? "fake" : "QUADWORK_LIVE_OK");', adapter = 'codex', versionedWrapper = false) {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'quadwork-live-test-'));
-  const root = live.createDisposableLiveCompatibilityRoot({ parent_dir: parent });
-  const evidence = live.createDisposableLiveCompatibilityEvidenceRoot({ parent_dir: parent });
-  const executable = path.join(parent, 'codex');
-  fs.writeFileSync(executable, `#!/usr/bin/env node\n${script}\n`, { mode: 0o700 }); fs.chmodSync(executable, 0o700);
-  return { parent, root, evidence, executable };
+  const root = publicLive.createDisposableLiveCompatibilityRoot({ parent_dir: parent });
+  const evidence = publicLive.createDisposableLiveCompatibilityEvidenceRoot({ parent_dir: parent });
+  const executable = path.join(parent, adapter), target = versionedWrapper ? path.join(parent, `${adapter}-versioned`) : executable;
+  fs.writeFileSync(target, `#!/usr/bin/env node\n${script}\n`, { mode: 0o700 }); fs.chmodSync(target, 0o700); if (versionedWrapper) fs.symlinkSync(target, executable);
+  return { adapter, parent, root, evidence, executable };
 }
 function run(fix, extra = {}, runtime) {
-  const selectedIdentity = extra.identity || identity();
-  return live.runLiveCompatibility({ adapter: 'codex', authorization: live.createReviewedExecutionAuthorization(selectedIdentity), evidence_directory: fix.evidence, executable: fix.executable, identity: selectedIdentity, root_directory: fix.root, ...extra }, runtime);
+  return live.runFakeCompatibility(fix.adapter, fix.executable, { evidence_directory: fix.evidence, root_directory: fix.root, ...extra }, runtime);
 }
 const cleanup = fix => fs.rmSync(fix.parent, { recursive: true, force: true });
 
 test('registry is frozen and contains only the release-required Codex and Claude adapters', () => {
-  assert.deepEqual(Object.keys(live.ADAPTERS).sort(), ['claude', 'codex']);
-  assert.equal(live.ADAPTERS.codex.argv.includes('--dangerously-bypass-approvals-and-sandbox'), false);
-  assert.equal(live.ADAPTERS.claude.argv.includes('--dangerously-skip-permissions'), false);
-  assert.equal(live.ADAPTERS.claude.argv.includes('--tools'), true);
-  assert.equal(live.ADAPTERS.codex.argv.includes('--sandbox'), true);
+  assert.deepEqual(Object.keys(publicLive.ADAPTERS).sort(), ['claude', 'codex']);
+  assert.equal(Object.hasOwn(publicLive, 'createReviewedExecutionAuthorization'), false);
+  assert.equal(Object.hasOwn(publicLive, 'runReviewedCompatibility'), false);
+  assert.equal(publicLive.ADAPTERS.codex.argv.includes('--dangerously-bypass-approvals-and-sandbox'), false);
+  assert.equal(publicLive.ADAPTERS.claude.argv.includes('--dangerously-skip-permissions'), false);
+  assert.equal(publicLive.ADAPTERS.claude.argv.includes('--tools'), true);
+  assert.equal(publicLive.ADAPTERS.codex.argv.includes('--sandbox'), true);
 });
 
-test('forged JSON capability is rejected before any child is launched', async () => {
+test('production API cannot mint a capability or accept a fake binary before launch', async () => {
   const fix = fixture(); let launches = 0;
   try {
-    await assert.rejects(() => live.runLiveCompatibility({ adapter: 'codex', authorization: JSON.parse('{}'), evidence_directory: fix.evidence, executable: fix.executable, identity: identity(), root_directory: fix.root }, { spawn: () => { launches++; throw new Error('must not spawn'); } }), /live_execution_not_authorized/);
+    await assert.rejects(() => publicLive.runReviewedLiveCompatibility({ adapter: 'codex', authorization: JSON.parse('{}'), evidence_directory: fix.evidence, executable: fix.executable, root_directory: fix.root }), /live_run_shape|live_executable/);
     assert.equal(launches, 0);
   } finally { cleanup(fix); }
 });
@@ -45,8 +46,8 @@ test('arbitrary args, aliases, models, and unsupported providers are rejected be
   const fix = fixture(); let launches = 0;
   const forbidden = { spawn: () => { launches++; throw new Error('must not spawn'); } };
   try {
-    await assert.rejects(() => run(fix, { adapter: 'grok', args: ['--evil'] }, forbidden), /live_run_shape|live_adapter_not_supported/);
-    await assert.rejects(() => live.runLiveCompatibility({ adapter: 'codex', authorization: live.createReviewedExecutionAuthorization(identity()), evidence_directory: fix.evidence, executable: fix.executable, identity: identity(), root_directory: fix.root, model: 'default' }, forbidden), /live_run_shape/);
+    await assert.rejects(() => run(fix, { args: ['--evil'] }, forbidden), /live_run_shape/);
+    await assert.rejects(() => live.runFakeCompatibility('grok', fix.executable, { evidence_directory: fix.evidence, root_directory: fix.root }, forbidden), /live_reviewed_contract/);
     assert.equal(launches, 0);
   } finally { cleanup(fix); }
 });
@@ -55,7 +56,7 @@ test('symlinked roots and roots with remotes fail before a provider launch', asy
   const fix = fixture(); let launches = 0; const forbidden = { spawn: () => { launches++; throw new Error('must not spawn'); } };
   try {
     const linked = path.join(fix.parent, 'linked-root'); fs.symlinkSync(fix.root, linked);
-    await assert.rejects(() => live.runLiveCompatibility({ adapter: 'codex', authorization: live.createReviewedExecutionAuthorization(identity()), evidence_directory: fix.evidence, executable: fix.executable, identity: identity(), root_directory: linked }, forbidden), /live_unsafe_root/);
+    await assert.rejects(() => live.runFakeCompatibility('codex', fix.executable, { evidence_directory: fix.evidence, root_directory: linked }, forbidden), /live_unsafe_root/);
     execFileSync('/usr/bin/git', ['remote', 'add', 'origin', 'https://example.invalid/repo.git'], { cwd: fix.root });
     await assert.rejects(() => run(fix, {}, forbidden), /live_remote_present/);
     assert.equal(launches, 0);
@@ -63,7 +64,7 @@ test('symlinked roots and roots with remotes fail before a provider launch', asy
 });
 
 test('the smoke persists only sanitized facts and strips credential environment', async () => {
-  const fix = fixture('if (process.argv.includes("--version")) console.log("fake 1.0"); else { if (process.env.GH_TOKEN || process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN) process.exit(9); process.stderr.write("ghp_SECRET_MUST_NOT_RETAIN"); console.log("QUADWORK_LIVE_OK"); }');
+  const fix = fixture('if (process.argv.includes("--version")) console.log("fake"); else { if (process.env.GH_TOKEN || process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN) process.exit(9); process.stderr.write("ghp_SECRET_MUST_NOT_RETAIN"); console.log("QUADWORK_LIVE_OK"); }');
   const oldGh = process.env.GH_TOKEN, oldNpm = process.env.NPM_TOKEN;
   process.env.GH_TOKEN = 'secret'; process.env.NPM_TOKEN = 'secret';
   try {
@@ -88,7 +89,7 @@ test('timeout and output caps create terminal classes without retaining output',
 test('unavailable host isolation and a second terminal record are rejected before another provider invocation', async () => {
   const fix = fixture(); let launches = 0;
   try {
-    await assert.rejects(() => run(fix, {}, { assert_host_isolation: () => false, spawn: () => { launches++; throw new Error('must not spawn'); } }), /live_host_isolation_unavailable/);
+    await assert.rejects(() => run(fix, {}, { test_isolation_unavailable: true, spawn: () => { launches++; throw new Error('must not spawn'); } }), /live_host_isolation_unavailable/);
     assert.equal(launches, 0);
     const first = await run(fix); assert.equal(first.result_class, 'completed');
     await assert.rejects(() => run(fix), /live_terminal_already_recorded/);
@@ -103,10 +104,20 @@ test('a zero-exit response other than the fixed sentinel is retained as a failed
   } finally { cleanup(fix); }
 });
 
-test('a reviewed capability binds the immutable identity and rejects a mismatch before launch', async () => {
-  const fix = fixture(); let launches = 0; const bound = identity(), forged = { ...bound, source_digest: sha('other source') };
+test('a reviewed contract binds the executable and version digest before launch', async () => {
+  const fix = fixture(); let launches = 0; const reviewed = live.fakeReviewedContract('codex', fix.executable); const forged = { ...reviewed, executable_digest: sha('other binary') };
   try {
-    await assert.rejects(() => live.runLiveCompatibility({ adapter: 'codex', authorization: live.createReviewedExecutionAuthorization(bound), evidence_directory: fix.evidence, executable: fix.executable, identity: forged, root_directory: fix.root }, { spawn: () => { launches++; throw new Error('must not spawn'); } }), /live_identity_not_authorized/);
+    await assert.rejects(() => live.runReviewedCompatibility(forged, { adapter: 'codex', evidence_directory: fix.evidence, executable: fix.executable, root_directory: fix.root }, { spawn: () => { launches++; throw new Error('must not spawn'); } }), /live_executable_not_reviewed/);
     assert.equal(launches, 0);
   } finally { cleanup(fix); }
+});
+
+test('a Claude wrapper may resolve to a versioned filename and keeps its fixed safe argv', async () => {
+  const fix = fixture('if (process.argv.includes("--version")) console.log("fake"); else { const required = ["-p", "--restricted", "--safe-mode", "--strict-mcp-config", "--tools", ""]; if (required.every(arg => process.argv.includes(arg)) && !process.argv.includes("-C")) console.log("QUADWORK_LIVE_OK"); else process.exit(12); }', 'claude', true);
+  try { const report = await run(fix); assert.equal(report.result_class, 'completed'); } finally { cleanup(fix); }
+});
+
+test('a provider mutation under .git invalidates the post-run repository fact', async () => {
+  const fix = fixture('if (process.argv.includes("--version")) console.log("fake"); else { require("node:fs").appendFileSync(require("node:path").join(process.cwd(), ".git", "config"), "# mutation\\n"); console.log("QUADWORK_LIVE_OK"); }');
+  try { const report = await run(fix); assert.equal(report.result_class, 'repository_mutated'); } finally { cleanup(fix); }
 });
