@@ -188,7 +188,7 @@ async function attempt(profile, dependencies = {}) {
       // runner passes no command, argv, environment, config, lifecycle, or PTY input.
       await runtime.buildAgentArgs(profiles.PROJECT, profile.role); runtime.buildAgentEnv(profiles.PROJECT, profile.role);
       providerTurns = 1;
-      const launched = await runtime.spawnAgentPty(profiles.PROJECT, profile.role, { lifecycleSource: 'operator_start', operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true });
+      const launched = await (profile.backend === 'codex' ? runtime.runReviewedCodex() : runtime.runReviewedClaude());
       if (!launched?.ok) return { result_class: 'launch_failed' };
       const session = runtime.agentSessions?.get(`${profiles.PROJECT}/${profile.role}`);
       if (!session?.term || typeof session.term.onData !== 'function') return { result_class: 'launch_indeterminate' };

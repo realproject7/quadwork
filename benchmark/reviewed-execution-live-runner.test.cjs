@@ -49,7 +49,7 @@ test('fake-only fixed V2 chain has no caller-provided prompt/argv/env and consum
     agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term, lifecycleState: 'verified' }]]),
     async buildAgentArgs(project, role) { calls.push(['args', project, role]); return { args: [] }; },
     buildAgentEnv(project, role) { calls.push(['env', project, role]); return {}; },
-    async spawnAgentPty() { calls.push(['spawn']); return { ok: true }; },
+    async runReviewedClaude() { calls.push(['spawn']); return { ok: true }; },
     async stopAgentSession() { calls.push(['stop']); return { ok: true }; }, async shutdown() { calls.push(['shutdown']); return { ok: true }; },
   };
   const result = await runner.testHooks.attempt(profile, {
@@ -63,7 +63,7 @@ test('fake-only fixed V2 chain has no caller-provided prompt/argv/env and consum
 
 test('fake source or receipt drift immediately before the fixed write is consumed and never sends a workload', async () => {
   let factReads = 0; let wrote = false; const term = { onData() {}, write() { wrote = true; } };
-  const runtime = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term, lifecycleState: 'verified' }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), spawnAgentPty: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
+  const runtime = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term, lifecycleState: 'verified' }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), runReviewedClaude: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
   const result = await runner.testHooks.attempt(profile, {
     sourceFacts: () => (++factReads === 1 ? facts : { ...facts, expected_head: 'c'.repeat(40) }), readGateReceipt: () => ({ receipt_digest: 'd'.repeat(64) }), removeOwnedRoot: () => true,
     writeIsolatedConfig: () => ({ home: '/tmp' }), disposableRootFacts: () => ({ root_digest: 'f'.repeat(64), entry_digest: 'f'.repeat(64), entry_count: 0, entries: [], remote_count: 0, changed_entry_count: 0 }), durableStopProof: () => true, runtime, prepare: async () => ({ root: '/fake', preflight: { result_class: 'preflight_ready' }, config: {} }),
@@ -77,14 +77,14 @@ test('fake timeout, remote-style rejection, lifecycle failure, output cap, and c
     writeIsolatedConfig: () => ({ home: '/tmp' }), disposableRootFacts: () => ({ root_digest: 'f'.repeat(64), entry_digest: 'f'.repeat(64), entry_count: 0, entries: [], remote_count: 0, changed_entry_count: 0 }), durableStopProof: () => true,
     prepare: async () => ({ root: '/fake', preflight: { result_class: 'preflight_ready' }, config: {} }), runtime, ...extra,
   });
-  const rejected = { agentSessions: new Map(), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), spawnAgentPty: async () => ({ ok: false }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
+  const rejected = { agentSessions: new Map(), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), runReviewedClaude: async () => ({ ok: false }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
   assert.equal((await base(rejected)).result_class, 'launch_failed');
   const listeners = []; const term = { onData(fn) { listeners.push(fn); }, write() { for (const fn of listeners) fn('x'.repeat(16 * 1024 + 1)); } };
-  const capped = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), spawnAgentPty: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
+  const capped = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), runReviewedClaude: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
   assert.equal((await base(capped, { readDurableLifecycle: () => ({ roles: { [profile.role]: { state: 'verified' } } }) })).result_class, 'output_cap_exceeded');
-  const lifecycle = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term: { onData() {}, write() {} } }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), spawnAgentPty: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
+  const lifecycle = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term: { onData() {}, write() {} } }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), runReviewedClaude: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
   let clock = 0; assert.equal((await base(lifecycle, { now: () => (clock += 50_000), sleep: async () => {}, readDurableLifecycle: () => ({ roles: { [profile.role]: { state: 'spawned' } } }) })).result_class, 'attempt_indeterminate');
-  const cleanup = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term: { onData(fn) { this.fn = fn; }, write() { this.fn('QUADWORK_V2_PRODUCT_PATH_OK\n'); } } }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), spawnAgentPty: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: false }), shutdown: async () => ({ ok: true }) };
+  const cleanup = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term: { onData(fn) { this.fn = fn; }, write() { this.fn('QUADWORK_V2_PRODUCT_PATH_OK\n'); } } }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), runReviewedClaude: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: false }), shutdown: async () => ({ ok: true }) };
   assert.equal((await base(cleanup, { readDurableLifecycle: () => ({ roles: { [profile.role]: { state: 'verified' } } }) })).result_class, 'cleanup_failed');
 });
 
@@ -103,5 +103,5 @@ test('live source has exactly two no-input entry points, bounded in-memory outpu
   assert.match(source, /MAX_OUTPUT_BYTES = 16 \* 1024/); assert.match(source, /const finalFacts = factsFor\(repository\); gateReader/);
   assert.doesNotMatch(source, /createGate|writeGate|app\.post|http\.request|spawn\(/);
   const server = fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'), 'utf8');
-  assert.match(server, /assertReviewedExecutionGate/); assert.doesNotMatch(server, /ReviewedExecutionCapability|spawnReviewedCodex|reviewed_execution_caller_unauthorized/); assert.equal(Object.hasOwn(require('./reviewed-execution-live-runner.cjs'), 'testHooks'), false);
+  assert.match(server, /reviewedExecutionFixedLaunches/); assert.match(server, /reviewed_execution_fixed_runner_required/); assert.match(server, /function runReviewedCodex\(\)/); assert.match(server, /function runReviewedClaude\(\)/); assert.equal(Object.hasOwn(require('./reviewed-execution-live-runner.cjs'), 'testHooks'), false);
 });

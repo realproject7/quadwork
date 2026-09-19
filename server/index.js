@@ -38,6 +38,9 @@ const { assertReviewedExecutionGate } = require("./reviewed-execution-gate");
 // #1117's no-input runner is the only production caller. Generic HTTP/config
 // starts are denied even when an otherwise-valid reviewed role is configured.
 const REVIEWED_EXECUTION_LIVE_ENABLED = true;
+// This permit set is closure-private: no config, HTTP request, exported API,
+// or importable module can mint a value for generic start/reset/restart paths.
+const reviewedExecutionFixedLaunches = new Set();
 
 function reviewedExecutionFor(projectId, agentId, agentCfg) {
   const id = agentCfg?.reviewed_execution_id;
@@ -2301,7 +2304,10 @@ async function launchAgentPty(project, agent, opts = {}) {
 
     const agentCfg = readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {};
     const reviewedExecution = reviewedExecutionFor(project, agent, agentCfg);
-    if (reviewedExecution) assertReviewedExecutionGate(reviewedExecution, reviewedExecutionBinding(agentCfg));
+    if (reviewedExecution) {
+      if (!reviewedExecutionFixedLaunches.has(key)) throw new Error("reviewed_execution_fixed_runner_required");
+      assertReviewedExecutionGate(reviewedExecution, reviewedExecutionBinding(agentCfg));
+    }
     const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
     const extraEnv = buildAgentEnv(project, agent);
     // #565: buildAgentArgs is inside try-catch so registration failures
@@ -2518,6 +2524,20 @@ function spawnAgentPty(project, agent, opts = {}) {
   void operation.then(() => pendingAgentLaunches.delete(operation), () => pendingAgentLaunches.delete(operation));
   return operation;
 }
+
+// The only two source-fixed doors into a reviewed process launch. They take no
+// caller data and are never wired to HTTP, reset, restart, recovery, or WS.
+async function runReviewedExecution(role) {
+  const fixed = role === "benchmark_codex" || role === "benchmark_claude" ? role : null;
+  if (!fixed) throw new Error("reviewed_execution_role_invalid");
+  const key = `${REVIEWED_EXECUTION_PROJECT}/${fixed}`;
+  reviewedExecutionFixedLaunches.add(key);
+  try { return await spawnAgentPty(REVIEWED_EXECUTION_PROJECT, fixed, { lifecycleSource: "operator_start", operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true }); }
+  finally { reviewedExecutionFixedLaunches.delete(key); }
+}
+
+function runReviewedCodex() { return runReviewedExecution("benchmark_codex"); }
+function runReviewedClaude() { return runReviewedExecution("benchmark_claude"); }
 
 async function admitAgentPty(project, agent, opts = {}) {
   // Preserve the project lifecycle barrier before evaluating source authority:
@@ -4758,6 +4778,8 @@ module.exports = {
   watchdogCheck,
   markSessionExited,
   spawnAgentPty,
+  runReviewedCodex,
+  runReviewedClaude,
   stopAgentSession,
   cleanupProjectRuntime,
   projectLifecycle,
