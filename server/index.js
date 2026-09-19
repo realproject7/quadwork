@@ -3190,9 +3190,6 @@ app.post("/api/agents/:project/interrupt-all", (req, res) => {
 
 // --- Sessions tracking (for /api/projects dashboard) ---
 
-// Expose agentSessions to migrated routes
-app.set("activeSessions", agentSessions);
-
 app.get("/api/sessions", (_req, res) => {
   const sessions = [];
   for (const [, info] of agentSessions) {
