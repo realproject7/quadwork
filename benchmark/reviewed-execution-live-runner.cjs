@@ -13,7 +13,6 @@ const { execFileSync } = require('node:child_process');
 const contract = require('./reviewed-execution-contract.cjs');
 const productPath = require('./v2-product-path-core.cjs');
 const profiles = require('../server/reviewed-execution-profiles');
-const { internalReviewedExecutionCapability } = require('../server/reviewed-execution-live-capability');
 
 const GATE_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-gates');
 const LEDGER_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-ledger-parent');
@@ -128,7 +127,7 @@ function disposableRootFacts(root) {
       const filename = path.join(directory, name), child = relative ? `${relative}/${name}` : name, stat = fs.lstatSync(filename);
       const gitMetadata = child === 'repository/.git' || child.startsWith('repository/.git/');
       if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()) || !sameUser(stat) || (!gitMetadata && mode(stat) !== 0o700 && mode(stat) !== 0o600) || (gitMetadata && (mode(stat) & 0o022) !== 0)) throw new Error('reviewed_execution_root_unsafe');
-      entries.push(`${child}:${stat.isDirectory() ? 'd' : 'f'}:${mode(stat).toString(8)}`);
+      entries.push(`${child}:${stat.isDirectory() ? 'd' : 'f'}:${mode(stat).toString(8)}:${stat.isFile() ? sha256(fs.readFileSync(filename)) : '-'}`);
       if (stat.isDirectory()) walk(filename, child);
     }
   };
@@ -140,7 +139,12 @@ function postRootMatches(pre, post) {
   if (!pre || !post || !Array.isArray(pre.entries) || !Array.isArray(post.entries)) return false;
   const after = new Set(post.entries);
   if (!pre.entries.every(entry => after.has(entry))) return false;
-  return post.entries.every(entry => pre.entries.includes(entry) || /^home\/\.quadwork\/benchmark-product-path(?:\/[^/]+)*:(?:d|f):[67]00$/.test(entry));
+  return post.entries.every(entry => pre.entries.includes(entry) || /^home\/\.quadwork\/benchmark-product-path(?:\/[^/]+)*:(?:d|f):[67]00:[a-f0-9-]+$/.test(entry));
+}
+
+function durableStopProof(home, profile, stopped) {
+  if (stopped?.ok !== true || stopped?.resources?.ptys !== 1 || stopped?.resources?.sessions !== 1) return false;
+  try { const value = JSON.parse(fs.readFileSync(path.join(home, '.quadwork', profiles.PROJECT, 'agent-lifecycle-state.json'), 'utf8')); return value?.roles?.[profile.role]?.state === 'stopped'; } catch { return false; }
 }
 
 function redactedReport(profile, facts, fields = {}) {
@@ -173,18 +177,18 @@ async function attempt(profile, dependencies = {}) {
   const factsFor = dependencies.sourceFacts || sourceFacts; const gateReader = dependencies.readGateReceipt || readGateReceipt; const cleanupRoot = dependencies.removeOwnedRoot || removeOwnedRoot;
   const facts = factsFor(repository); const gate = gateReader(profile, facts, dependencies.gate_parent || GATE_PARENT); const started = now();
   const prepare = dependencies.prepare || (() => prepareFromGate(profile, gate));
-  let prepared; let root = null; let runtime = null; let preRootFacts = null; let providerTurns = 0; let outputBytes = 0; let output = ''; let capped = false; let lifecycleVerified = false; let sentinel = false; let rechecked = false;
+  let prepared; let root = null; let locations = null; let runtime = null; let preRootFacts = null; let stopped = null; let shutdown = null; let stopFailed = false; let shutdownFailed = false; let providerTurns = 0; let outputBytes = 0; let output = ''; let capped = false; let lifecycleVerified = false; let sentinel = false; let rechecked = false;
   try {
     prepared = await prepare(); root = prepared.root;
     if (prepared.preflight?.result_class !== 'preflight_ready') return redactedReport(profile, facts, { gate_receipt_digest: gate.receipt_digest, result_class: 'preflight_blocked', provider_turns: 0, elapsed_ms: now() - started, root_cleanup_ok: cleanupRoot(root) });
-    const locations = (dependencies.writeIsolatedConfig || writeIsolatedConfig)(prepared); preRootFacts = (dependencies.disposableRootFacts || disposableRootFacts)(root);
+    locations = (dependencies.writeIsolatedConfig || writeIsolatedConfig)(prepared); preRootFacts = (dependencies.disposableRootFacts || disposableRootFacts)(root);
     runtime = dependencies.runtime || await withEnvironment(locations.home, async () => require('../server/index.js'));
     const run = async () => {
       // These are the unmodified V2 public construction/admission APIs.  The
       // runner passes no command, argv, environment, config, lifecycle, or PTY input.
       await runtime.buildAgentArgs(profiles.PROJECT, profile.role); runtime.buildAgentEnv(profiles.PROJECT, profile.role);
       providerTurns = 1;
-      const launched = await runtime.spawnAgentPty(profiles.PROJECT, profile.role, { lifecycleSource: 'operator_start', operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true, reviewedExecutionCapability: internalReviewedExecutionCapability() });
+      const launched = await runtime.spawnAgentPty(profiles.PROJECT, profile.role, { lifecycleSource: 'operator_start', operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true });
       if (!launched?.ok) return { result_class: 'launch_failed' };
       const session = runtime.agentSessions?.get(`${profiles.PROJECT}/${profile.role}`);
       if (!session?.term || typeof session.term.onData !== 'function') return { result_class: 'launch_indeterminate' };
@@ -203,24 +207,26 @@ async function attempt(profile, dependencies = {}) {
       return { result_class: capped ? 'output_cap_exceeded' : sentinel && lifecycleVerified ? 'completed' : 'attempt_indeterminate' };
     };
     const outcome = await withEnvironment(locations.home, run);
-    const stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${profile.role}`, { suppressLifecycleMsg: true, removeEntry: true });
-    const shutdown = await runtime.shutdown();
+    try { stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${profile.role}`, { suppressLifecycleMsg: true, removeEntry: true }); } catch (error) { stopFailed = true; throw error; }
+    try { shutdown = await runtime.shutdown(); } catch (error) { shutdownFailed = true; throw error; }
     let postRootFacts = null; try { postRootFacts = (dependencies.disposableRootFacts || disposableRootFacts)(root); } catch {}
-    const survivorFree = dependencies.noSurvivors ? dependencies.noSurvivors(runtime, profile) : runtime.agentSessions?.has(`${profiles.PROJECT}/${profile.role}`) === false;
-    const removed = cleanupRoot(root); const cleanup = stopped?.ok === true && shutdown?.ok === true && survivorFree && removed && postRootMatches(preRootFacts, postRootFacts);
+    const survivorFree = (dependencies.durableStopProof || durableStopProof)(locations.home, profile, stopped);
+    const removed = cleanupRoot(root); const cleanup = !stopFailed && !shutdownFailed && stopped?.ok === true && shutdown?.ok === true && survivorFree && removed && postRootMatches(preRootFacts, postRootFacts);
     const result_class = cleanup && outcome.result_class === 'completed' ? 'completed' : cleanup ? outcome.result_class : 'cleanup_failed';
     return redactedReport(profile, facts, { gate_receipt_digest: gate.receipt_digest, ...outcome, result_class, provider_turns: providerTurns, lifecycle_verified: lifecycleVerified, sentinel_digest: sentinel ? sha256('QUADWORK_V2_PRODUCT_PATH_OK') : null, output_bytes: outputBytes, output_capped: capped, elapsed_ms: now() - started, root_cleanup_ok: cleanup, survivor_free: survivorFree, source_rechecked_before_prompt: rechecked, gate_rechecked_before_prompt: rechecked, pre_root_facts: preRootFacts, post_root_facts: postRootFacts });
   } catch {
     if (runtime && providerTurns) {
-      try { await runtime.stopAgentSession(`${profiles.PROJECT}/${profile.role}`, { suppressLifecycleMsg: true, removeEntry: true }); } catch {}
-      try { await runtime.shutdown(); } catch {}
+      try { stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${profile.role}`, { suppressLifecycleMsg: true, removeEntry: true }); } catch { stopped = null; stopFailed = true; }
+      try { shutdown = await runtime.shutdown(); } catch { shutdown = null; shutdownFailed = true; }
     }
-    const cleanup = root ? cleanupRoot(root) : true;
-    return redactedReport(profile, facts, { gate_receipt_digest: gate.receipt_digest, result_class: providerTurns ? 'attempt_indeterminate' : 'preflight_blocked', provider_turns: providerTurns, output_bytes: outputBytes, output_capped: capped, elapsed_ms: now() - started, root_cleanup_ok: cleanup, source_rechecked_before_prompt: rechecked, gate_rechecked_before_prompt: rechecked, pre_root_facts: preRootFacts });
+    let postRootFacts = null; try { if (root) postRootFacts = (dependencies.disposableRootFacts || disposableRootFacts)(root); } catch {}
+    const removed = root ? cleanupRoot(root) : true; const survivorFree = locations && stopped ? (dependencies.durableStopProof || durableStopProof)(locations.home, profile, stopped) : providerTurns === 0;
+    const cleanup = removed && (providerTurns === 0 || !stopFailed && !shutdownFailed && stopped?.ok === true && shutdown?.ok === true && survivorFree && postRootMatches(preRootFacts, postRootFacts));
+    return redactedReport(profile, facts, { gate_receipt_digest: gate.receipt_digest, result_class: providerTurns && !cleanup ? 'cleanup_failed' : providerTurns ? 'attempt_indeterminate' : 'preflight_blocked', provider_turns: providerTurns, output_bytes: outputBytes, output_capped: capped, elapsed_ms: now() - started, root_cleanup_ok: cleanup, survivor_free: survivorFree, source_rechecked_before_prompt: rechecked, gate_rechecked_before_prompt: rechecked, pre_root_facts: preRootFacts, post_root_facts: postRootFacts });
   }
 }
 
 function runReviewedCodex() { return attempt(profiles.PROFILES.v2_codex_readonly_v1); }
 function runReviewedClaude() { return attempt(profiles.PROFILES.v2_claude_restricted_v1); }
 
-module.exports = Object.freeze({ runReviewedCodex, runReviewedClaude, testHooks: Object.freeze({ attempt, disposableRootFacts, gateFilename, postRootMatches, readGateReceipt, redactedReport, sourceFacts, withEnvironment }) });
+module.exports = Object.freeze({ runReviewedCodex, runReviewedClaude });

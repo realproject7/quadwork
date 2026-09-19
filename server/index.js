@@ -34,7 +34,7 @@ const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
-const { isInternalReviewedExecutionCapability } = require("./reviewed-execution-live-capability");
+const { assertReviewedExecutionGate } = require("./reviewed-execution-gate");
 // #1117's no-input runner is the only production caller. Generic HTTP/config
 // starts are denied even when an otherwise-valid reviewed role is configured.
 const REVIEWED_EXECUTION_LIVE_ENABLED = true;
@@ -2301,7 +2301,7 @@ async function launchAgentPty(project, agent, opts = {}) {
 
     const agentCfg = readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {};
     const reviewedExecution = reviewedExecutionFor(project, agent, agentCfg);
-    if (reviewedExecution && !isInternalReviewedExecutionCapability(opts.reviewedExecutionCapability)) throw new Error("reviewed_execution_caller_unauthorized");
+    if (reviewedExecution) assertReviewedExecutionGate(reviewedExecution, reviewedExecutionBinding(agentCfg));
     const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
     const extraEnv = buildAgentEnv(project, agent);
     // #565: buildAgentArgs is inside try-catch so registration failures
