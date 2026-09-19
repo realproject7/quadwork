@@ -2443,6 +2443,13 @@ async function launchAgentPty(project, agent, opts = {}) {
       agentId: agent,
       term,
       reviewedExecution: !!reviewedPlan,
+      // Reviewed execution intentionally never retains terminal content.  This
+      // one bit records only whether the server saw any PTY data before the
+      // fixed child attached its private observer to this exact terminal.
+      // It is reset with every session and is not part of the public session
+      // inspection surface.
+      _reviewedPreObserverPtyDataSeen: false,
+      _reviewedObserverAttached: false,
       viewers: new Set(),
       viewerDims: new Map(),
       lastDims: null,
@@ -2480,6 +2487,14 @@ async function launchAgentPty(project, agent, opts = {}) {
     const SCROLLBACK_SIZE = 64 * 1024;
     term.onData((data) => {
       if (shuttingDown || session._stopping) return;
+      if (session.reviewedExecution) {
+        if (!session._reviewedObserverAttached) {
+          session._reviewedPreObserverPtyDataSeen = true;
+        }
+        // The reviewed child has its own bounded observer.  The server must
+        // not retain, classify, or forward any reviewed terminal bytes.
+        return;
+      }
       session.lastOutputAt = Date.now();
       // The first bytes from THIS PTY are a runtime-ready observation. They
       // prove neither task completion nor semantic agent health, but they do
@@ -2631,7 +2646,26 @@ async function runReviewedExecution(role) {
   // Preserve only this fixed boundary; never expose its exit status, command,
   // path, or terminal output to the reviewed execution report.
   if (!session?.term) return Object.freeze({ ...launched, reviewed_launch_diagnostic: "pty_unavailable_after_claim" });
-  return Object.freeze({ ...launched, reviewed_session: Object.freeze({ onData: listener => session.term.onData(listener), onExit: listener => session.term.onExit(listener), writeFixedWorkload: () => session.term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`) }) });
+  const term = session.term;
+  let observerAttached = false, preObserverPtyDataSeen = false;
+  const attachObserver = listener => {
+    if (observerAttached || typeof listener !== "function") throw new Error("reviewed_execution_observer_invalid");
+    const subscription = term.onData(listener);
+    // Freeze the private server observation at attachment time.  Later PTY
+    // output and later session mutation cannot change what the child reports.
+    preObserverPtyDataSeen = session._reviewedPreObserverPtyDataSeen === true;
+    observerAttached = true;
+    session._reviewedObserverAttached = true;
+    return subscription;
+  };
+  return Object.freeze({ ...launched, reviewed_session: Object.freeze({
+    onData: attachObserver,
+    onExit: listener => term.onExit(listener),
+    // This closure is the only route from the private server session to the
+    // child.  It exposes neither PTY bytes nor mutable session state.
+    preObserverPtyDataSeen: () => observerAttached && preObserverPtyDataSeen,
+    writeFixedWorkload: () => term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`),
+  }) });
 }
 
 async function admitAgentPty(project, agent, opts = {}) {
@@ -4076,6 +4110,11 @@ wss.on("connection:terminal", async (ws, req) => {
   try { assertProjectAdmitted(projectId); }
   catch {
     ws.close(1008, "project-unavailable");
+    return;
+  }
+
+  if (session.reviewedExecution) {
+    ws.close(1008, "reviewed-session-private");
     return;
   }
 
