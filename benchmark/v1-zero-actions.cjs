@@ -2,8 +2,8 @@
 'use strict';
 
 // Read-only source audit for the shipped V1 reference. It establishes only
-// whether the tagged source's merge-ready predicate requires check results.
-// It cannot observe GitHub branch protection, create a PR, or prove a delivery.
+// whether the tagged dashboard readiness predicate requires check results.
+// It does not audit Head's actual merge decision, branch protection, or delivery.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -23,7 +23,7 @@ class AuditError extends Error {}
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const required = (condition, code) => { if (!condition) throw new AuditError(code); };
 
-function git(repository, args) {
+function gitResult(repository, args) {
   const result = spawnSync(GIT, [
     '--no-pager', '--no-optional-locks', '-c', 'protocol.allow=never',
     '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-C', repository, ...args,
@@ -36,7 +36,16 @@ function git(repository, args) {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  return !result.error && result.status === 0 ? result.stdout : null;
+  return Object.freeze({
+    ok: !result.error && result.status === 0,
+    status: Number.isInteger(result.status) ? result.status : null,
+    stdout: typeof result.stdout === 'string' ? result.stdout : '',
+  });
+}
+
+function git(repository, args) {
+  const result = gitResult(repository, args);
+  return result.ok ? result.stdout : null;
 }
 
 function sourceBody(source, start, end) {
@@ -50,25 +59,25 @@ function evaluateSources(sources) {
   for (const [key, expected] of Object.entries(FILES)) {
     required(typeof sources[key] === 'string' && hash(sources[key]) === expected.sha256, `source_hash_mismatch_${key}`);
   }
-  return evaluatePolicy(sources);
-}
-
-function evaluatePolicy(sources) {
-  required(sources && typeof sources === 'object', 'source_audit_invalid_input');
   const readiness = sourceBody(sources.routes, 'function progressFromSnapshot(snapshot, n) {', 'function approvalsFromReviewDetail(');
   required(readiness !== null, 'source_readiness_predicate_missing');
   required(readiness.includes('const approvals = countApprovedRoles(openPr.reviews);'), 'source_role_approval_missing');
   required(readiness.includes('if (approvals >= 2) return') && readiness.includes('status: "ready"'), 'source_two_approval_ready_missing');
   required(!readiness.includes('statusCheckRollup') && !readiness.includes('check_runs') && !readiness.includes('required_check'), 'source_check_result_gate_found');
-  required(sources.index.includes('Head: Merge any PR with both current-revision approvals, assign next from queue.'), 'source_trigger_merge_policy_missing');
+  required(sources.index.includes('Head: Merge any PR with both current-revision approvals, assign next from queue.'), 'source_trigger_text_missing');
   const packageJson = JSON.parse(sources.package);
   required(packageJson && packageJson.version === '2.7.1', 'source_package_version_mismatch');
   return Object.freeze({
     source_hashes_match: true,
-    readiness_requires_two_role_approvals: true,
-    readiness_requires_check_result: false,
-    trigger_merge_policy_requires_two_role_approvals: true,
+    dashboard_readiness_requires_two_role_approvals: true,
+    dashboard_readiness_requires_check_result: false,
+    default_trigger_mentions_two_role_approvals: true,
   });
+}
+
+function ciLessReceiptState(result) {
+  if (result && result.ok) return result.stdout.length > 0 ? 'present' : 'absent';
+  return 'unknown';
 }
 
 function audit(repository) {
@@ -90,20 +99,23 @@ function audit(repository) {
     sources[key] = value;
   }
   const policy = evaluateSources(sources);
-  const ciLessPresent = git(repo, ['cat-file', '-e', `${V1_SHA}:server/ci-less-evidence.js`]) === '';
+  const ciLessReceipt = ciLessReceiptState(gitResult(repo, ['ls-tree', '-z', V1_SHA, '--', 'server/ci-less-evidence.js']));
+  const blockers = [
+    'no_disposable_repository_delivery_observed',
+    'head_merge_decision_not_audited',
+    'branch_protection_and_merge_policy_not_observed',
+  ];
+  if (ciLessReceipt === 'absent') blockers.push('v1_has_no_ci_less_receipt_support');
+  if (ciLessReceipt === 'unknown') blockers.push('v1_ci_less_receipt_support_unknown');
   return Object.freeze({
     report_version: 1,
     purpose: 'v1_zero_actions_source_policy_audit',
     source: { tag: V1_TAG, sha: V1_SHA, files: Object.fromEntries(Object.entries(FILES).map(([key, file]) => [key, file.sha256])) },
     policy,
-    v1_ci_less_receipt_support: ciLessPresent,
-    conclusion: 'source_policy_compatible_delivery_unproved',
+    v1_ci_less_receipt_state: ciLessReceipt,
+    conclusion: 'dashboard_readiness_without_check_result_delivery_unproved',
     actions_execution: 'not_attempted',
-    blockers: [
-      'no_disposable_repository_delivery_observed',
-      'branch_protection_and_merge_policy_not_observed',
-      'v1_has_no_ci_less_receipt_support',
-    ],
+    blockers,
     execution_authorized: false,
     mode_1_zero_actions_feasibility_proved: false,
   });
@@ -120,5 +132,5 @@ function main(argv) {
   }
 }
 
-module.exports = { AuditError, V1_SHA, V1_TAG, FILES, evaluateSources, evaluatePolicy, audit };
+module.exports = { AuditError, V1_SHA, V1_TAG, FILES, evaluateSources, ciLessReceiptState, audit };
 if (require.main === module) process.exitCode = main(process.argv.slice(2));

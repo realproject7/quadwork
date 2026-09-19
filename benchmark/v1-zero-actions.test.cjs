@@ -4,7 +4,8 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
-const { V1_SHA, FILES, evaluateSources, evaluatePolicy, audit, AuditError } = require('./v1-zero-actions.cjs');
+const audited = require('./v1-zero-actions.cjs');
+const { V1_SHA, FILES, evaluateSources, ciLessReceiptState, audit } = audited;
 
 const repository = path.resolve(__dirname, '..');
 const git = process.platform === 'darwin' ? '/Library/Developer/CommandLineTools/usr/bin/git' : '/usr/bin/git';
@@ -20,10 +21,11 @@ function sources() {
 test('shipped V1 source satisfies the bounded source-policy audit', () => {
   const report = audit(repository);
   assert.equal(report.source.sha, V1_SHA);
-  assert.equal(report.policy.readiness_requires_two_role_approvals, true);
-  assert.equal(report.policy.readiness_requires_check_result, false);
-  assert.equal(report.v1_ci_less_receipt_support, false);
+  assert.equal(report.policy.dashboard_readiness_requires_two_role_approvals, true);
+  assert.equal(report.policy.dashboard_readiness_requires_check_result, false);
+  assert.equal(report.v1_ci_less_receipt_state, 'absent');
   assert.equal(report.mode_1_zero_actions_feasibility_proved, false);
+  assert.ok(report.blockers.includes('head_merge_decision_not_audited'));
   assert.ok(report.blockers.includes('branch_protection_and_merge_policy_not_observed'));
 });
 
@@ -46,8 +48,15 @@ test('the CLI accepts only a repository argument and never authorizes execution'
   assert.equal(JSON.parse(bad.stdout).error, 'usage_expected_repo');
 });
 
-test('a source policy regression is rejected independently of the immutable digest check', () => {
+test('the public evaluator cannot make an unhashed source-policy claim', () => {
   const altered = sources();
   altered.routes = altered.routes.replace('const approvals = countApprovedRoles(openPr.reviews);', 'const approvals = countApprovedRoles(openPr.reviews); const statusCheckRollup = [];');
-  assert.throws(() => evaluatePolicy(altered), new RegExp('source_check_result_gate_found'));
+  assert.equal(audited.evaluatePolicy, undefined);
+  assert.throws(() => evaluateSources(altered), new RegExp('source_hash_mismatch_routes'));
+});
+
+test('ci-less receipt absence is distinct from a Git read failure', () => {
+  assert.equal(ciLessReceiptState({ ok: true, status: 0, stdout: '100644 blob deadbeef\tserver/ci-less-evidence.js\0' }), 'present');
+  assert.equal(ciLessReceiptState({ ok: true, status: 0, stdout: '' }), 'absent');
+  assert.equal(ciLessReceiptState({ ok: false, status: null }), 'unknown');
 });
