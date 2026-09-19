@@ -16,6 +16,7 @@ node --test benchmark/v2-disposable-runtime-harness.test.cjs
 node benchmark/calibration-protocol.cjs --protocol /path/to/mode-1-or-mode-2-protocol.json
 node --test benchmark/calibration-protocol.test.cjs
 node --test benchmark/calibration-executor.test.cjs
+node --test benchmark/live-provider-compatibility.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -148,3 +149,29 @@ a caller-supplied config or version string cannot grant that capability. Mode 1
 continues to retain its unproved zero-Actions blocker. Nothing here can publish,
 release, mutate GitHub, authorize Mode 3 timing, or write outside the marked
 evidence directory.
+
+`live-provider-compatibility.cjs` is the separately reviewed #1109 local smoke
+for the current release-required Codex and Claude CLIs. It does not import,
+weaken, or interpret the preparation protocol. Its frozen registry has exactly
+those two adapters, with a pinned model and noninteractive tool-disabled or
+read-only argv profile for each. A caller cannot supply a model, argv, shell
+command, provider alias, or JSON authorization. A reviewed in-process
+capability binds the base, harness, source, and workload digests before a child
+process is created. A zero-exit process also must return exactly the fixed
+`QUADWORK_LIVE_OK` sentinel on stdout with no stderr; the raw response is never
+retained.
+
+The smoke creates an executor-owned `0700` disposable Git root, rejects a
+symlink, any remote, unsafe permissions, and a changed repository before and
+after its one-turn run. It invokes only a digest-bound absolute executable with
+`shell: false`, a restricted environment, and no Git credential helper or
+inherited GitHub/npm credentials. Prompt text, provider output, absolute paths,
+auth output, and environment values are not retained. A missing executable,
+unsafe root, unsupported adapter/model, unavailable isolation, output cap,
+timeout, login/entitlement failure, or second terminal record fails closed.
+
+This is compatibility evidence only. It does not authorize Mode 3 timing,
+target freeze, a delivery claim, Actions, a release recommendation, a version
+change, or npm publish. A future backend such as Grok needs a reviewed source
+change adding one static adapter, a pinned model, a safe argv profile, and
+equivalent fake-CLI tests. It cannot be enabled by JSON or config.
