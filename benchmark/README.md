@@ -9,6 +9,8 @@ node benchmark/preflight.cjs \
 node --test benchmark/preflight.test.cjs
 node benchmark/evidence.cjs --ledger /path/to/ledger.json
 node --test benchmark/evidence.test.cjs
+node benchmark/v1-zero-actions.cjs --repo .
+node --test benchmark/v1-zero-actions.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -63,3 +65,10 @@ provider supplies a candidate. `WORKLOAD.json`, the adapter, and the acceptance
 test are designated read-only inputs; the future adapter must record their
 digests before and after every assignment. The fixtures do not start QuadWork,
 call a provider, create a repository, or constitute a live benchmark.
+
+`v1-zero-actions.cjs` is a separate read-only source-policy audit for the
+shipped V1 tag. It proves only that V1's source-level ready predicate does not
+require a check result. Its report deliberately leaves Mode 1 unproved because
+branch protection and the complete disposable-repository delivery path require
+a later live exercise. See
+[`docs/v2-v1-zero-actions-feasibility.md`](../docs/v2-v1-zero-actions-feasibility.md).

@@ -83,6 +83,15 @@ observation. A V1 local-policy adaptation is a changed experimental condition
 that requires an explicit contract decision before a total-improvement claim.
 Missing matched baseline evidence leaves the corresponding release gate open.
 
+The checked-in V1 source-policy audit establishes a narrower result: tag
+`v2.7.1` computes readiness from two current role-attributed approvals without
+using its displayed check-rollup data. It does not establish that a target
+repository's branch protection accepts that path, or that a real V1 delivery
+completed with Actions disabled. Its report is therefore
+`source_policy_compatible_delivery_unproved`, and the manifest stays
+`mode_1_zero_actions_feasibility: "unproved"` until the bounded live exercise
+completes.
+
 ## Task bundle and safety scenarios
 
 Build a small, dependency-free single-repository Node fixture project with real
