@@ -190,6 +190,14 @@ V2 server and uses its real `buildAgentArgs`, `buildAgentEnv`, `spawnAgentPty`,
 lifecycle admission, PTY, and stop paths. It rejects MCP/token/proxy and
 permission-bypass results before a provider prompt is written.
 
+Before V2 admission, the worker checks the reviewed resolved executable and
+version plus a local authentication/model-identity preflight; a failed check is
+a durable zero-turn block. It binds the server source digest and the effective
+V2 argument/environment profile digests before the prompt, then records both
+pre- and post-run no-remote/clean-root facts. Timeout handling first requests
+graceful worker teardown, and the worker's `finally` stops its exact owned PTY
+and V2 runtime before any result is emitted.
+
 The artifact records only redacted digests and terminal facts. It never stores
 the prompt, output, token, config bytes, absolute paths, authentication data,
 or raw terminal data. Fake-only tests cover the config and root isolation,

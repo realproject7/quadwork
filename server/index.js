@@ -2106,7 +2106,13 @@ async function buildAgentArgs(projectId, agentId) {
 
   const agentCfg = project.agents?.[agentId] || {};
   const command = agentCfg.command || "claude";
-  const cliBase = command.split("/").pop().split(" ")[0];
+  // A digest-bound benchmark may use a versioned resolved executable whose
+  // basename is not the provider name (for example Claude's version file).
+  // command_identity is only an argument-grammar selector: it cannot replace
+  // the configured command or grant auto-approval/MCP capability.
+  const cliBase = typeof agentCfg.command_identity === "string" && /^(?:codex|claude|gemini|grok)$/.test(agentCfg.command_identity)
+    ? agentCfg.command_identity
+    : command.split("/").pop().split(" ")[0];
   const args = [];
 
   // Permission bypass flags
@@ -2202,7 +2208,9 @@ function buildAgentEnv(projectId, agentId) {
 
   const agentCfg = project.agents?.[agentId] || {};
   const command = agentCfg.command || "claude";
-  const cliBase = command.split("/").pop().split(" ")[0];
+  const cliBase = typeof agentCfg.command_identity === "string" && /^(?:codex|claude|gemini|grok)$/.test(agentCfg.command_identity)
+    ? agentCfg.command_identity
+    : command.split("/").pop().split(" ")[0];
   const env = {};
 
   // Gemini: inject MCP via env var
