@@ -35,7 +35,6 @@ const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
 const { assertReviewedExecutionGate } = require("./reviewed-execution-gate");
-const reviewedRunnerBridge = require("./reviewed-execution-runner-bridge");
 // #1117's no-input runner is the only production caller. Generic HTTP/config
 // starts are denied even when an otherwise-valid reviewed role is configured.
 const REVIEWED_EXECUTION_LIVE_ENABLED = true;
@@ -2541,11 +2540,6 @@ async function runReviewedExecution(role) {
   return Object.freeze({ ...launched, reviewed_session: Object.freeze({ onData: listener => session.term.onData(listener), writeFixedWorkload: () => session.term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`) }) });
 }
 
-function runReviewedCodex() { return runReviewedExecution("benchmark_codex"); }
-function runReviewedClaude() { return runReviewedExecution("benchmark_claude"); }
-
-reviewedRunnerBridge.installFixedRunnerEntries({ codex: runReviewedCodex, claude: runReviewedClaude });
-
 async function admitAgentPty(project, agent, opts = {}) {
   // Preserve the project lifecycle barrier before evaluating source authority:
   // an archived/revoked project is never reported as merely an unauthorised
@@ -4822,3 +4816,23 @@ module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation 
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
 module.exports.runStartupMigrations = runStartupMigrations; // startup seeding (test seam)
 module.exports.app = app; // route-level test seam (QUADWORK_SKIP_LISTEN keeps the port unbound)
+
+// This branch is reachable only in one of the two source-fixed IPC workers.
+// The worker prepares the isolated HOME before this module is loaded; the
+// callback below remains in this module's closure and is neither exported nor
+// installed in a bridge, global, route, or event listener.
+const reviewedChildRole = process.env.QUADWORK_REVIEWED_EXECUTION_CHILD_ROLE;
+if ((reviewedChildRole === "benchmark_codex" || reviewedChildRole === "benchmark_claude") && typeof process.send === "function") {
+  const reviewedChild = require("../benchmark/reviewed-execution-live-child-protocol.cjs");
+  void reviewedChild.completeFixedChild(reviewedChildRole, Object.freeze({
+    buildAgentArgs,
+    buildAgentEnv,
+    stopAgentSession,
+    shutdown,
+    launch: () => runReviewedExecution(reviewedChildRole),
+  })).then((report) => {
+    process.send(Object.freeze({ type: "reviewed_execution_result", report }), () => process.exit(0));
+  }).catch(() => {
+    process.send(Object.freeze({ type: "reviewed_execution_result", report: reviewedChild.failedChildReport(reviewedChildRole) }), () => process.exit(1));
+  });
+}
