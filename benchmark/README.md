@@ -74,12 +74,14 @@ branch protection and the complete disposable-repository delivery path require
 a later live exercise. See
 [`docs/v2-v1-zero-actions-feasibility.md`](../docs/v2-v1-zero-actions-feasibility.md).
 
-`v2-workload-adapter.cjs` maps a parsed fixture plus **observed disposable
-ticket bindings** into V2's real frozen WorkTask manifest and in-memory
+`v2-workload-adapter.cjs` maps a parsed fixture plus caller-supplied ticket
+bindings into V2's real frozen WorkTask manifest and in-memory
 pipeline primitives. It cannot invent ticket identities from the fixture. Its
 local contract test creates temporary Git worktrees and real V2 candidate
 objects, then proves the pipeline fixture can build B1 while A1 is under
 independent review and the overlap fixture refuses A2 before A1 is accepted.
-It is replay coverage only: it does not start the server, use authenticated
+It rejects task paths that overlap the fixture's declared read-only inputs. It
+is replay coverage only: it does not attest that caller-supplied bindings were
+observed, start the server, use authenticated
 HTTP/MCP routes, launch a model, produce an authentic reviewer identity, or
 qualify as a live benchmark observation.

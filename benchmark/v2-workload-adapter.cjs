@@ -43,6 +43,8 @@ function workload(value) {
     return freeze({ id: task.id, ticket: task.ticket, path: task.path, depends_on: [...task.depends_on] });
   });
   if (new Set(tasks.map((task) => task.id)).size !== tasks.length) fail("duplicate_benchmark_workload_task", "workload task id is duplicated");
+  const protectedPaths = new Set(value.read_only_paths);
+  if (tasks.some((task) => protectedPaths.has(task.path))) fail("benchmark_workload_task_path_read_only", "workload task path is read-only");
   const known = new Set(tasks.map((task) => task.id));
   if (tasks.some((task) => task.depends_on.some((dependency) => !known.has(dependency)))) fail("unknown_benchmark_workload_dependency", "workload dependency is unknown");
   return freeze({ schema_version: 1, class: value.class, tasks, read_only_paths: [...value.read_only_paths] });
