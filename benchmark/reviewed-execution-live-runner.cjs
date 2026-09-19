@@ -18,7 +18,7 @@ const PRELAUNCH_RESULTS = new Set(['preflight_blocked', 'launch_failed', 'attemp
 // A non-zero worker exit is never a success signal.  These are the only
 // post-claim child outcomes whose redacted facts are safe to preserve after
 // the ACK/exit race: each is a failure the fixed child can actually produce.
-const ATTESTED_CLAIMED_POSTCLAIM_FAILURES = new Set(['attempt_indeterminate', 'output_cap_exceeded', 'cleanup_failed']);
+const ATTESTED_CLAIMED_POSTCLAIM_FAILURES = new Set(['launch_indeterminate', 'attempt_indeterminate', 'output_cap_exceeded', 'cleanup_failed']);
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
 const sameUser = stat => typeof process.getuid !== 'function' || stat.uid === process.getuid();
 function fixedFailure(profile, result, provider_turns, candidate_digest = null) { return Object.freeze({ schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest, gate_receipt_digest: null, result_class: result, provider_turns, launch_claim_state: provider_turns === 0 ? 'none' : 'unverified', failure_stage: 'parent_unverified', lifecycle_verified: false, sentinel_digest: null, output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: false, survivor_free: false, source_rechecked_before_prompt: false, gate_rechecked_before_prompt: false, pre_root_facts: null, post_root_facts: null, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false }); }

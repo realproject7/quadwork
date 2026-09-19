@@ -206,6 +206,7 @@ test('production evaluator makes output cap, timeout, lifecycle, remote rejectio
   assert.equal(outcome.observe(['x'.repeat(outcome.OUTPUT_CAP_BYTES + 1)]).output_capped, true);
   const baseline = { provider_turns: 1, lifecycle: 'verified', stop: true, shutdown: true, survivor: true, root: true, git: true, environment: true, sentinel: true };
   assert.equal(outcome.finalize({ ...baseline, output_capped: true }).result_class, 'output_cap_exceeded');
+  assert.equal(outcome.finalize({ ...baseline, terminal_exited: true }).result_class, 'launch_indeterminate');
   assert.equal(outcome.finalize({ ...baseline, timed_out: true }).result_class, 'attempt_indeterminate');
   assert.equal(outcome.finalize({ ...baseline, lifecycle: 'spawned' }).result_class, 'attempt_indeterminate');
   assert.equal(outcome.finalize({ ...baseline, launch: false }).result_class, 'launch_failed');

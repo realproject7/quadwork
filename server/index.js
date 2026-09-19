@@ -2627,7 +2627,7 @@ async function runReviewedExecution(role) {
   const launched = await spawnAgentPty(REVIEWED_EXECUTION_PROJECT, fixed, { lifecycleSource: "operator_start", operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true, reviewedExecutionPermit: permit });
   const session = agentSessions.get(`${REVIEWED_EXECUTION_PROJECT}/${fixed}`);
   if (!launched?.ok || !session?.term) return launched;
-  return Object.freeze({ ...launched, reviewed_session: Object.freeze({ onData: listener => session.term.onData(listener), writeFixedWorkload: () => session.term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`) }) });
+  return Object.freeze({ ...launched, reviewed_session: Object.freeze({ onData: listener => session.term.onData(listener), onExit: listener => session.term.onExit(listener), writeFixedWorkload: () => session.term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`) }) });
 }
 
 async function admitAgentPty(project, agent, opts = {}) {
