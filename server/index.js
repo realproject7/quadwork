@@ -4906,6 +4906,18 @@ if (process.env.QUADWORK_TEST_RUNTIME === "1") {
 const reviewedChildRole = process.env.QUADWORK_REVIEWED_EXECUTION_CHILD_ROLE;
 if ((reviewedChildRole === "benchmark_codex" || reviewedChildRole === "benchmark_claude") && typeof process.send === "function") {
   const reviewedChild = require("../benchmark/reviewed-execution-live-child-protocol.cjs");
+  const reviewedParentNonce = process.env.QUADWORK_REVIEWED_PARENT_NONCE;
+  const sendReviewedResultAndAwaitParent = (report, exitCode) => {
+    let done = false;
+    const finish = (code) => { if (done) return; done = true; clearTimeout(timer); process.exit(code); };
+    const timer = setTimeout(() => finish(1), 2_000);
+    timer.unref();
+    process.once("message", (message) => {
+      if (message?.type === "reviewed_execution_result_ack" && message.nonce === reviewedParentNonce) finish(exitCode);
+    });
+    try { process.send(Object.freeze({ type: "reviewed_execution_result", report }), (error) => { if (error) finish(1); }); }
+    catch { finish(1); }
+  };
   void reviewedChild.completeFixedChild(reviewedChildRole, Object.freeze({
     buildAgentArgs,
     buildAgentEnv,
@@ -4913,8 +4925,8 @@ if ((reviewedChildRole === "benchmark_codex" || reviewedChildRole === "benchmark
     shutdown,
     launch: () => runReviewedExecution(reviewedChildRole),
   })).then((report) => {
-    process.send(Object.freeze({ type: "reviewed_execution_result", report }), () => process.exit(0));
+    sendReviewedResultAndAwaitParent(report, 0);
   }).catch(() => {
-    process.send(Object.freeze({ type: "reviewed_execution_result", report: reviewedChild.failedChildReport(reviewedChildRole) }), () => process.exit(1));
+    sendReviewedResultAndAwaitParent(reviewedChild.failedChildReport(reviewedChildRole), 1);
   });
 }

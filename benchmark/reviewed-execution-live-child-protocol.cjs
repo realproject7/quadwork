@@ -129,13 +129,25 @@ async function completeFixedChild(role, runtime) {
   } finally { fixed = null; }
 }
 function failedChildReport(role) { const profile = Object.values(profiles.PROFILES).find(entry => entry.role === role); return report(profile, null, { result_class: 'attempt_indeterminate' }); }
+function sendResultAndAwaitParent(reportValue, exitCode) {
+  const nonce = process.env.QUADWORK_REVIEWED_PARENT_NONCE;
+  let done = false;
+  const finish = code => { if (done) return; done = true; clearTimeout(timer); process.exit(code); };
+  const timer = setTimeout(() => finish(1), 2_000);
+  timer.unref();
+  process.once('message', message => {
+    if (message?.type === 'reviewed_execution_result_ack' && message.nonce === nonce) finish(exitCode);
+  });
+  try { process.send(Object.freeze({ type: 'reviewed_execution_result', report: reportValue }), error => { if (error) finish(1); }); }
+  catch { finish(1); }
+}
 function bootstrapFixedWorker() {
   const role = process.env.QUADWORK_REVIEWED_EXECUTION_CHILD_ROLE; const profile = Object.values(profiles.PROFILES).find(entry => entry.role === role); const nonce = process.env.QUADWORK_REVIEWED_PARENT_NONCE; const candidate = process.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST;
   let selfDigest; try { selfDigest = sha256(fs.readFileSync(process.argv[1])); } catch { return process.exit(1); }
   if (!profile || typeof process.send !== 'function' || !/^[a-f0-9]{64}$/.test(nonce) || candidate !== profiles.candidateDigest() || selfDigest !== process.env.QUADWORK_REVIEWED_WORKER_DIGEST) return process.exit(1);
   try { channelSecret = Buffer.alloc(32); if (fs.readSync(4, channelSecret, 0, 32, null) !== 32) throw new Error('short'); } catch { return process.exit(1); }
   process.send({ type: 'reviewed_execution_ready', nonce, candidate_digest: candidate, worker_digest: process.env.QUADWORK_REVIEWED_WORKER_DIGEST, proof: crypto.createHmac('sha256', channelSecret).update(nonce).digest('hex') });
-  process.once('message', message => { if (message?.type !== 'reviewed_execution_admit' || message.nonce !== nonce || !/^[a-f0-9]{64}$/.test(message.admission) || message.proof !== crypto.createHmac('sha256', channelSecret).update(`${nonce}:${message.admission}`).digest('hex')) return process.exit(1); parentAdmitted = true; void prepareFixedChild(profile).then(value => { if (value) process.send({ type: 'reviewed_execution_result', report: value }, () => process.exit(0)); else require('../server/index.js'); }).catch(() => process.send({ type: 'reviewed_execution_result', report: failedChildReport(role) }, () => process.exit(1))); });
+  process.once('message', message => { if (message?.type !== 'reviewed_execution_admit' || message.nonce !== nonce || !/^[a-f0-9]{64}$/.test(message.admission) || message.proof !== crypto.createHmac('sha256', channelSecret).update(`${nonce}:${message.admission}`).digest('hex')) return process.exit(1); parentAdmitted = true; void prepareFixedChild(profile).then(value => { if (value) sendResultAndAwaitParent(value, 0); else require('../server/index.js'); }).catch(() => sendResultAndAwaitParent(failedChildReport(role), 1)); });
 }
 // This private module is reachable only from fixed worker/server files. It is
 // intentionally absent from the public runner surface and has no test hooks.
