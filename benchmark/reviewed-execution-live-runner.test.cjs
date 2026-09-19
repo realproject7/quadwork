@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const runner = require('./reviewed-execution-live-runner.cjs');
+const fake = require('./reviewed-execution-live-test-factory.cjs');
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -51,4 +52,17 @@ test('child protocol has no test hook or caller-supplied launch surface and dire
   assert.match(source, /rootMatches\(state\.pre, post\)/);
   const protocol = require('./reviewed-execution-live-child-protocol.cjs');
   await assert.rejects(() => protocol.prepareFixedChild({}), /child_state/);
+});
+
+test('fake PTY accepts only the exact newline-delimited sentinel and records the fixed workload once', async () => {
+  const success = await fake.attempt({ chunks: ['banner\n', `${fake.SENTINEL}\n`] });
+  assert.equal(success.result_class, 'completed'); assert.equal(success.wrote, fake.WORKLOAD); assert.equal(success.provider_turns, 1);
+  for (const chunks of [[`${fake.SENTINEL} extra\n`], [`prefix ${fake.SENTINEL}\n`], ['no sentinel\n']]) assert.equal((await fake.attempt({ chunks })).result_class, 'attempt_indeterminate');
+});
+test('fake PTY bounds output and makes timeout, lifecycle, remote rejection, cleanup, root and restoration failures non-success', async () => {
+  assert.equal((await fake.attempt({ chunks: ['x'.repeat(fake.MAX + 1)] })).result_class, 'output_cap_exceeded');
+  assert.equal((await fake.attempt({ chunks: [], timeout: true })).result_class, 'attempt_indeterminate');
+  assert.equal((await fake.attempt({ chunks: [`${fake.SENTINEL}\n`], lifecycle: 'spawned' })).result_class, 'attempt_indeterminate');
+  assert.deepEqual(await fake.attempt({ launch: false }), { result_class: 'launch_failed', provider_turns: 1, wrote: '' });
+  for (const field of ['stop', 'shutdown', 'survivor', 'root', 'git', 'restored']) { const value = await fake.attempt({ chunks: [`${fake.SENTINEL}\n`], [field]: false }); assert.equal(value.result_class, 'cleanup_failed'); assert.equal(value.root_cleanup_ok, false); }
 });
