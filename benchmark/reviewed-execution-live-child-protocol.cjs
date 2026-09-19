@@ -84,6 +84,11 @@ async function prepareFixedChild(profile) {
   } catch { const root_cleanup_ok = prepared?.root ? removeOwnedRoot(prepared.root) : false; return report(profile, facts, { gate_receipt_digest: gate?.receipt_digest || null, launch_claim_state: 'none', failure_stage: 'prelaunch', elapsed_ms: Date.now() - started, root_cleanup_ok, survivor_free: true }); }
 }
 function restore() { if (!fixed) return false; for (const [key, value] of Object.entries(fixed.previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } return process.env.HOME === fixed.previous.HOME && process.env.USERPROFILE === fixed.previous.USERPROFILE && process.env.QUADWORK_SKIP_LISTEN === fixed.previous.QUADWORK_SKIP_LISTEN && process.env.QUADWORK_REVIEWED_GATE_HOME === fixed.previous.QUADWORK_REVIEWED_GATE_HOME; }
+// A claimed launch can fail before node-pty hands back a terminal.  The server
+// records that state as a term-less session; successful removal of that one
+// session is an attestation that no owned terminal survives, not a missing
+// cleanup observation.  Any other count remains unverified.
+function survivorFree(stopped) { return stopped?.ok === true && stopped?.resources?.sessions === 1 && (stopped?.resources?.ptys === 0 || stopped?.resources?.ptys === 1); }
 async function completeFixedChild(role, runtime) {
   const state = fixed;
   if (!parentAdmitted || !state || state.profile.role !== role || !runtime || typeof runtime.launch !== 'function') throw new Error('reviewed_execution_child_state');
@@ -110,7 +115,7 @@ async function completeFixedChild(role, runtime) {
     stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${role}`, { suppressLifecycleMsg: true, removeEntry: true });
     shutdown = await runtime.shutdown();
     post = rootFacts(state.root);
-    const survivor_free = stopped?.ok === true && stopped?.resources?.ptys === 1 && stopped?.resources?.sessions === 1;
+    const survivor_free = survivorFree(stopped);
     const postcondition_ok = rootMatches(state.pre, post);
     const root_removed = removeOwnedRoot(state.root);
     const root_clean = postcondition_ok && root_removed;
@@ -124,7 +129,7 @@ async function completeFixedChild(role, runtime) {
     try { if (provider_turns) shutdown = await runtime.shutdown(); } catch {}
     try { post = rootFacts(state.root); } catch {}
     const observed = observer.snapshot();
-    const survivor_free = provider_turns === 0 || (stopped?.ok === true && stopped?.resources?.ptys === 1 && stopped?.resources?.sessions === 1);
+    const survivor_free = provider_turns === 0 || survivorFree(stopped);
     const postcondition_ok = rootMatches(state.pre, post);
     const root_removed = removeOwnedRoot(state.root);
     const root_clean = root_removed && postcondition_ok;
