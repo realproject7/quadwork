@@ -143,9 +143,8 @@ function assertHostIsolation(adapter, compiled, root, runtime) {
   required(runtime?.test_isolation_unavailable !== true, 'live_host_isolation_unavailable');
 }
 function runChild(runtime, command, args, options) { return (runtime?.spawn || spawn)(command, args, { cwd: options.cwd, env: options.env, shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); }
-function capture(runtime, command, args, options) {
+function captureChild(child, options) {
   return new Promise((resolve, reject) => {
-    let child; try { child = runChild(runtime, command, args, options); } catch (error) { reject(error); return; }
     let bytes = 0, stdoutBytes = 0, stderrBytes = 0, overflow = false, timedOut = false, settled = false; const stdout = [], outputHash = crypto.createHash('sha256');
     const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch {} }, options.timeout_ms); timer.unref?.();
     const finish = result => { if (!settled) { settled = true; clearTimeout(timer); resolve(result); } };
@@ -153,6 +152,11 @@ function capture(runtime, command, args, options) {
     child.stdout?.on('data', chunk => observe(chunk, 'stdout')); child.stderr?.on('data', chunk => observe(chunk, 'stderr')); child.once('error', error => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } }); child.once('close', (code, signal) => { const response = Buffer.concat(stdout).toString('utf8'); const response_ok = options.expected_response === undefined ? null : stderrBytes === 0 && stdoutBytes <= 128 && (response === options.expected_response || response === `${options.expected_response}\n`); finish({ code, signal, bytes, output_digest: outputHash.digest('hex'), overflow, response_ok, timed_out: timedOut }); });
   });
 }
+function capture(runtime, command, args, options) {
+  let child; try { child = runChild(runtime, command, args, options); } catch (error) { return Promise.reject(error); }
+  return captureChild(child, options);
+}
+function versionMatches(result, contract) { return result.output_digest === contract.version_digest && !result.timed_out && !result.overflow && result.code === 0 && !result.signal; }
 function persistTerminal(evidenceRoot, report) {
   const root = checkedMarkedRoot(evidenceRoot, EVIDENCE_MARKER, new Set([EVIDENCE_MARKER, 'terminal.json', '.terminal.lock']), 'live_evidence_root'); const filename = path.join(root, 'terminal.json'); required(!fs.existsSync(filename), 'live_terminal_already_recorded');
   const encoded = Buffer.from(JSON.stringify(report) + '\n', 'utf8'); required(encoded.length <= 8 * 1024, 'live_evidence_report'); let fd;
@@ -177,11 +181,11 @@ async function runInstalledCompatibility(value, runtime) {
   const runIdentity = observedIdentity(); const compiled = profile(adapter, root); assertHostIsolation(adapter, compiled, root, runtime); const preFacts = rootFacts(root, runtime); const resolvedExecutable = executable(contractReview, value.executable);
   const contract = Object.freeze({ adapter, executable: resolvedExecutable, identity: runIdentity, pre_facts: preFacts, digest: digest(JSON.stringify({ adapter: adapter.id, model_id: adapter.model_id, executable_digest: resolvedExecutable.digest, identity: runIdentity, profile_digest: digest(JSON.stringify(compiled)), pre_facts: preFacts })) }); const startedAt = Date.now();
   let version; try { version = await capture(runtime, resolvedExecutable.path, ['--version'], { cwd: root, env: sanitizedEnvironment(), max_output_bytes: selectedCaps.max_version_output_bytes, timeout_ms: 5_000 }); } catch { const report = terminalReport(contract, selectedCaps, 'version_failed'); persistTerminal(evidenceRoot, report); return report; }
-  const versionDigest = version.output_digest; if (version.timed_out || version.overflow || version.code !== 0 || version.signal || versionDigest !== contractReview.version_digest) { const report = terminalReport(contract, selectedCaps, 'version_failed', { cli_version_digest: versionDigest, output_bytes: version.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
+  const versionDigest = version.output_digest; if (!versionMatches(version, contractReview)) { const report = terminalReport(contract, selectedCaps, 'version_failed', { cli_version_digest: versionDigest, output_bytes: version.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
   let invocation; try { invocation = await capture(runtime, resolvedExecutable.path, compiled, { cwd: root, env: sanitizedEnvironment(), expected_response: 'QUADWORK_LIVE_OK', max_output_bytes: selectedCaps.max_output_bytes, timeout_ms: selectedCaps.max_elapsed_ms }); } catch { const report = terminalReport(contract, selectedCaps, 'process_failed', { cli_version_digest: versionDigest, external_process_started: true, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
   let result_class = 'completed'; if (invocation.timed_out) result_class = 'timeout'; else if (invocation.overflow) result_class = 'output_cap_exceeded'; else if (invocation.code !== 0 || invocation.signal) result_class = 'login_or_entitlement_failure'; else if (!invocation.response_ok) result_class = 'response_contract_failed'; let postFacts = null; try { postFacts = rootFacts(root, runtime); if (JSON.stringify(preFacts) !== JSON.stringify(postFacts)) result_class = 'repository_mutated'; } catch { result_class = 'repository_mutated'; }
   const report = terminalReport(contract, selectedCaps, result_class, { cli_version_digest: versionDigest, response_digest: invocation.output_digest, response_contract_passed: invocation.response_ok === true, post_facts: postFacts, external_process_started: true, output_bytes: invocation.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report;
   } finally { releaseReservation(reservation); }
 }
 
-module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment });
+module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, executable, profile, terminalReport, versionMatches }) });

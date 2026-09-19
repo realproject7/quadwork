@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const test = require('node:test');
 const live = require('./live-provider-compatibility.cjs');
 const core = require('./live-provider-compatibility-core.cjs');
@@ -13,6 +14,15 @@ function roots() {
   return { parent, root: live.createDisposableLiveCompatibilityRoot({ parent_dir: parent }), evidence: live.createDisposableLiveCompatibilityEvidenceRoot({ parent_dir: parent }) };
 }
 const cleanup = value => fs.rmSync(value.parent, { recursive: true, force: true });
+function fake(parent, name, script, symlink = false) {
+  const target = path.join(parent, symlink ? `${name}-versioned` : name), wrapper = path.join(parent, name);
+  fs.writeFileSync(target, `#!/usr/bin/env node\n${script}\n`, { mode: 0o700 }); fs.chmodSync(target, 0o700); if (symlink) fs.symlinkSync(target, wrapper);
+  return wrapper;
+}
+async function captureFake(parent, script, options = {}) {
+  const executable = fake(parent, `fake-${Math.random().toString(16).slice(2)}`, script);
+  return core.testHooks.captureChild(spawn(executable, [], { stdio: ['ignore', 'pipe', 'pipe'] }), { expected_response: 'QUADWORK_LIVE_OK', max_output_bytes: 64, timeout_ms: 2_000, ...options });
+}
 
 test('production exports have no caller-controlled reviewed contract or authorization factory', () => {
   assert.deepEqual(Object.keys(live.ADAPTERS).sort(), ['claude', 'codex']);
@@ -57,5 +67,31 @@ test('a symlinked .git directory is rejected by the local metadata guard', async
   try {
     const git = path.join(value.root, '.git'), moved = path.join(value.parent, 'real-git'); fs.renameSync(git, moved); fs.symlinkSync(moved, git);
     await assert.rejects(() => core.runInstalledCompatibility({ adapter: 'codex', evidence_directory: value.evidence, executable: '/tmp/not-codex', root_directory: value.root }), /live_git_metadata|live_unsafe_root/);
+  } finally { cleanup(value); }
+});
+
+test('fake CLI capture enforces the exact sentinel, timeout, and output cap without retaining raw output', async () => {
+  const value = roots();
+  try {
+    const wrong = await captureFake(value.parent, 'console.log("wrong")'); assert.equal(wrong.response_ok, false);
+    const loud = await captureFake(value.parent, 'setTimeout(() => console.log("x".repeat(1000)), 30)'); assert.equal(loud.overflow, true);
+    const slow = await captureFake(value.parent, 'setTimeout(() => console.log("QUADWORK_LIVE_OK"), 4000)', { timeout_ms: 500 }); assert.equal(slow.timed_out, true);
+    const report = core.testHooks.terminalReport({ adapter: live.ADAPTERS.codex, executable: { digest: 'a'.repeat(64) }, digest: 'b'.repeat(64), pre_facts: {} }, live.CAPS, 'response_contract_failed', { response_digest: wrong.output_digest, response_contract_passed: false });
+    assert.equal(JSON.stringify(report).includes('wrong'), false);
+  } finally { cleanup(value); }
+});
+
+test('fake Codex executable and versioned Claude wrapper require exact binary and version digests', async () => {
+  const value = roots();
+  try {
+    const codex = fake(value.parent, 'codex', 'console.log("fake")'); const codexResolved = fs.realpathSync(codex);
+    const codexContract = { executable_path: codex, resolved_path: codexResolved, executable_digest: require('node:crypto').createHash('sha256').update(fs.readFileSync(codexResolved)).digest('hex') };
+    assert.equal(core.testHooks.executable(codexContract, codex).path, codexResolved);
+    assert.throws(() => core.testHooks.executable({ ...codexContract, executable_digest: '0'.repeat(64) }, codex), /live_executable_not_reviewed/);
+    const claude = fake(value.parent, 'claude', 'console.log("fake")', true); const claudeProfile = core.testHooks.profile(live.ADAPTERS.claude, value.root);
+    assert.equal(fs.realpathSync(claude).endsWith('claude-versioned'), true); assert.equal(claudeProfile.includes('-C'), false);
+    const version = await captureFake(value.parent, 'setTimeout(() => console.log("fake"), 30)', { expected_response: undefined });
+    assert.equal(core.testHooks.versionMatches(version, { version_digest: version.output_digest }), true);
+    assert.equal(core.testHooks.versionMatches(version, { version_digest: 'f'.repeat(64) }), false);
   } finally { cleanup(value); }
 });
