@@ -94,4 +94,6 @@ test("adapter requires observed disposable ticket bindings and rejects malformed
   assert.throws(() => createV2FixtureBatch({ ...input, workload: invalid, ticket_bindings: [...input.ticket_bindings, { ticket: "ticket_b", repository_key: "catalog", repo: "Example/Catalog", number: 102, kind: "issue" }] }), error => error instanceof V2WorkloadAdapterError && error.code === "unknown_benchmark_workload_dependency");
   const protectedPath = workload("pipeline"); protectedPath.tasks[0].path = "WORKLOAD.json";
   assert.throws(() => createV2FixtureBatch({ ...input, workload: protectedPath, ticket_bindings: [...input.ticket_bindings, { ticket: "ticket_b", repository_key: "catalog", repo: "Example/Catalog", number: 102, kind: "issue" }] }), error => error instanceof V2WorkloadAdapterError && error.code === "benchmark_workload_task_path_read_only");
+  const protectedDirectory = workload("pipeline"); protectedDirectory.tasks[0].path = "src";
+  assert.throws(() => createV2FixtureBatch({ ...input, workload: protectedDirectory, ticket_bindings: [...input.ticket_bindings, { ticket: "ticket_b", repository_key: "catalog", repo: "Example/Catalog", number: 102, kind: "issue" }] }), error => error instanceof V2WorkloadAdapterError && error.code === "benchmark_workload_task_path_read_only");
 });
