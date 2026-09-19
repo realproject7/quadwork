@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const runner = require('./reviewed-execution-live-runner.cjs');
-const fake = require('./reviewed-execution-live-test-factory.cjs');
+const outcome = require('./reviewed-execution-live-outcome.cjs');
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -54,15 +54,17 @@ test('child protocol has no test hook or caller-supplied launch surface and dire
   await assert.rejects(() => protocol.prepareFixedChild({}), /child_state/);
 });
 
-test('fake PTY accepts only the exact newline-delimited sentinel and records the fixed workload once', async () => {
-  const success = await fake.attempt({ chunks: ['banner\n', `${fake.SENTINEL}\n`] });
-  assert.equal(success.result_class, 'completed'); assert.equal(success.wrote, fake.WORKLOAD); assert.equal(success.provider_turns, 1);
-  for (const chunks of [[`${fake.SENTINEL} extra\n`], [`prefix ${fake.SENTINEL}\n`], ['no sentinel\n']]) assert.equal((await fake.attempt({ chunks })).result_class, 'attempt_indeterminate');
+test('production pure evaluator accepts only the exact newline-delimited sentinel and binds the profile workload/cap', () => {
+  const success = outcome.observe(['banner\n', `${outcome.SENTINEL}\n`]);
+  assert.equal(outcome.WORKLOAD, `${profiles.WORKLOAD}\n`); assert.equal(outcome.OUTPUT_CAP_BYTES, 16 * 1024); assert.equal(success.sentinel, true);
+  for (const chunks of [[`${outcome.SENTINEL} extra\n`], [`prefix ${outcome.SENTINEL}\n`], ['no sentinel\n']]) assert.equal(outcome.observe(chunks).sentinel, false);
 });
-test('fake PTY bounds output and makes timeout, lifecycle, remote rejection, cleanup, root and restoration failures non-success', async () => {
-  assert.equal((await fake.attempt({ chunks: ['x'.repeat(fake.MAX + 1)] })).result_class, 'output_cap_exceeded');
-  assert.equal((await fake.attempt({ chunks: [], timeout: true })).result_class, 'attempt_indeterminate');
-  assert.equal((await fake.attempt({ chunks: [`${fake.SENTINEL}\n`], lifecycle: 'spawned' })).result_class, 'attempt_indeterminate');
-  assert.deepEqual(await fake.attempt({ launch: false }), { result_class: 'launch_failed', provider_turns: 1, wrote: '' });
-  for (const field of ['stop', 'shutdown', 'survivor', 'root', 'git', 'restored']) { const value = await fake.attempt({ chunks: [`${fake.SENTINEL}\n`], [field]: false }); assert.equal(value.result_class, 'cleanup_failed'); assert.equal(value.root_cleanup_ok, false); }
+test('production evaluator makes output cap, timeout, lifecycle, remote rejection, cleanup, root/git/env failures non-success', () => {
+  assert.equal(outcome.observe(['x'.repeat(outcome.OUTPUT_CAP_BYTES + 1)]).output_capped, true);
+  const baseline = { provider_turns: 1, lifecycle: 'verified', stop: true, shutdown: true, survivor: true, root: true, git: true, environment: true, sentinel: true };
+  assert.equal(outcome.finalize({ ...baseline, output_capped: true }).result_class, 'output_cap_exceeded');
+  assert.equal(outcome.finalize({ ...baseline, timed_out: true }).result_class, 'attempt_indeterminate');
+  assert.equal(outcome.finalize({ ...baseline, lifecycle: 'spawned' }).result_class, 'attempt_indeterminate');
+  assert.equal(outcome.finalize({ ...baseline, launch: false }).result_class, 'launch_failed');
+  for (const field of ['stop', 'shutdown', 'survivor', 'root', 'git', 'environment']) { const value = outcome.finalize({ ...baseline, [field]: false }); assert.equal(value.result_class, 'cleanup_failed'); assert.equal(value.root_cleanup_ok, false); }
 });

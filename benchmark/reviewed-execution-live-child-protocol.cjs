@@ -12,10 +12,11 @@ const { execFileSync } = require('node:child_process');
 const contract = require('./reviewed-execution-contract.cjs');
 const productPath = require('./v2-product-path-core.cjs');
 const profiles = require('../server/reviewed-execution-profiles');
+const outcome = require('./reviewed-execution-live-outcome.cjs');
 
 const GATE_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-gates');
 const LEDGER_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-ledger-parent');
-const MAX_OUTPUT_BYTES = 16 * 1024;
+const MAX_OUTPUT_BYTES = outcome.OUTPUT_CAP_BYTES;
 const MAX_ELAPSED_MS = 45_000;
 const MAX_GATE_AGE_MS = 15 * 60 * 1000;
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
