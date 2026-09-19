@@ -25,7 +25,7 @@ nonblank NDJSON line contains exactly `id`, `title`, `tags`, and `enabled`.
 `enabled` is boolean. Reject unknown or missing fields, malformed JSON, wrong
 types, and duplicate IDs without coercion. Preserve strings verbatim. Accept
 LF and CRLF; skip whitespace-only lines. Empty input returns an empty array.
-Throw an Error with one-based physical `line` for invalid input. Blank lines
+Throw an Error with a one-based numeric `line` property for invalid input. Blank lines
 still count when locating a later error. Input must be a string.
 
 Acceptance covers normal and Unicode records, empty input, mixed blank lines,
@@ -61,12 +61,12 @@ not file writing or spreadsheet execution.
 
 ## Two performance classes
 
-- Pipeline-eligible: A1 owns `src/parse.js`; A2 owns `src/select.js`; B1 owns
-  `src/format.js`. A2 has a declared task dependency on A1, while B1 is independent
+- Pipeline-eligible: A1 owns `src/parse.cjs`; A2 owns `src/select.cjs`; B1 owns
+  `src/format.cjs`. A2 has a declared task dependency on A1, while B1 is independent
   and ready when A1 enters review. A fixed starting adapter exposes all exports;
   no task needs a shared export-file edit.
 - Overlap-bound: same functions and acceptance checks, implemented in one
-  `src/catalog.js`; dependencies are A1 → A2 → B1. A fixed starting adapter exposes
+  `src/catalog.cjs`; dependencies are A1 → A2 → B1. A fixed starting adapter exposes
   those exports. This class correctly serializes even if remaining work is small.
 
 Baseline files expose clear `not implemented` errors for the provider's target

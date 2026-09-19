@@ -219,6 +219,14 @@ have no accepted field. It returns structural completeness only: full task and
 receipt validation stays in the later manifest/evidence verifier, so no report
 from this utility can authorize calibration, a freeze, or Mode 3 timing.
 
+The initial Unit B input is `benchmark/fixtures/catalog/`. Both fixture roots
+have the same acceptance suite and fixed adapter, but the pipeline-eligible
+layout gives A1, A2, and B1 separate implementation files while the overlap-
+bound layout requires all three to change one file. Their baseline stubs are
+intentionally incomplete. No fixture test result is evidence of a provider run
+until a later adapter has created a recorded disposable repository and verified
+the read-only input digests.
+
 ## Initial preflight, 2026-09-19
 
 - Worktree: `quadwork-v2-benchmark-prep`, branch `task/1037-benchmark-prep`.

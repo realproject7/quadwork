@@ -55,3 +55,11 @@ file allowlist.
 The measurement design and proposed work bundle are in
 [`docs/v2-benchmark-plan.md`](../docs/v2-benchmark-plan.md) and
 [`docs/v2-benchmark-workload.md`](../docs/v2-benchmark-workload.md).
+
+`fixtures/catalog/` contains the two non-shipping starting repositories for
+that workload. Each has dependency-free acceptance tests and intentional
+`not implemented` task stubs, so its acceptance command must fail before a
+provider supplies a candidate. `WORKLOAD.json`, the adapter, and the acceptance
+test are designated read-only inputs; the future adapter must record their
+digests before and after every assignment. The fixtures do not start QuadWork,
+call a provider, create a repository, or constitute a live benchmark.

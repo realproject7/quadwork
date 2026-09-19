@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "class": "pipeline_eligible",
+  "tasks": [
+    { "id": "a1", "ticket": "ticket_a", "path": "src/parse.cjs", "depends_on": [] },
+    { "id": "a2", "ticket": "ticket_a", "path": "src/select.cjs", "depends_on": ["a1"] },
+    { "id": "b1", "ticket": "ticket_b", "path": "src/format.cjs", "depends_on": [] }
+  ],
+  "read_only_paths": ["package.json", "src/index.cjs", "test/catalog.test.cjs", "WORKLOAD.json"]
+}
