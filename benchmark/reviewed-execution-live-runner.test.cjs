@@ -1,6 +1,8 @@
 'use strict';
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
+const { fork, spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
+const profiles = require('../server/reviewed-execution-profiles');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -28,6 +30,12 @@ test('a directly started worker has no IPC admission and exits before preparatio
     const result = spawnSync(process.execPath, [path.join(__dirname, file)], { env: { PATH: process.env.PATH || '/usr/bin:/bin' }, encoding: 'utf8', timeout: 5000 });
     assert.equal(result.status, 1); assert.equal(result.stdout, ''); assert.equal(result.stderr, '');
   }
+});
+test('self-supplied IPC nonce, candidate, and worker hash still cannot admit without the parent-only pipe secret', async () => {
+  const file = path.join(__dirname, 'reviewed-execution-live-worker-claude.cjs');
+  const child = fork(file, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], env: { PATH: process.env.PATH || '/usr/bin:/bin', QUADWORK_REVIEWED_PARENT_NONCE: 'a'.repeat(64), QUADWORK_REVIEWED_CANDIDATE_DIGEST: profiles.candidateDigest(), QUADWORK_REVIEWED_WORKER_DIGEST: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') } });
+  const result = await new Promise(resolve => { let messages = 0; child.on('message', () => { messages += 1; }); child.once('exit', code => resolve({ code, messages })); });
+  assert.deepEqual(result, { code: 1, messages: 0 });
 });
 test('server retains its launch closure and has no importable reviewed bridge', () => {
   const server = fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'), 'utf8');
