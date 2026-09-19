@@ -119,3 +119,9 @@ test('fake Codex executable and versioned Claude wrapper require exact binary an
     assert.equal(core.testHooks.versionMatches(version, { version_digest: 'f'.repeat(64) }), false);
   } finally { cleanup(value); }
 });
+
+test('reviewed current Codex and Claude binary size classes are accepted while oversized binaries fail', () => {
+  assert.equal(core.testHooks.executableSize(220_568_528), 220_568_528);
+  assert.equal(core.testHooks.executableSize(217_662_576), 217_662_576);
+  assert.throws(() => core.testHooks.executableSize(512 * 1024 * 1024 + 1), /live_executable/);
+});

@@ -29,6 +29,7 @@ const ADAPTERS = Object.freeze({
 });
 const SAFE_WORKLOAD = 'Return exactly QUADWORK_LIVE_OK. Do not use tools. Do not read, write, or change files.';
 const CAPS = Object.freeze({ max_elapsed_ms: 45_000, max_output_bytes: 4_096, max_provider_turns: 1, max_version_output_bytes: 4_096 });
+const MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024;
 
 class LiveCompatibilityError extends Error {}
 const required = (condition, code) => { if (!condition) throw new LiveCompatibilityError(code); };
@@ -111,10 +112,11 @@ function executable(contract, filename) {
   required(typeof filename === 'string' && path.isAbsolute(filename) && SAFE_TEXT(filename), 'live_executable');
   let source, resolved, target; try { source = fs.lstatSync(filename); resolved = fs.realpathSync(filename); target = fs.statSync(resolved); } catch { throw new LiveCompatibilityError('live_executable'); }
   required((source.isFile() || source.isSymbolicLink()) && target.isFile() && (target.mode & 0o111) !== 0 && filename === contract.executable_path && resolved === contract.resolved_path, 'live_executable');
-  const bytes = fs.readFileSync(resolved); required(bytes.length > 0 && bytes.length <= 128 * 1024 * 1024, 'live_executable');
+  executableSize(target.size); const bytes = fs.readFileSync(resolved); required(bytes.length === target.size, 'live_executable');
   required(digest(bytes) === contract.executable_digest, 'live_executable_not_reviewed');
   return Object.freeze({ path: resolved, digest: contract.executable_digest });
 }
+function executableSize(size) { required(Number.isSafeInteger(size) && size > 0 && size <= MAX_EXECUTABLE_BYTES, 'live_executable'); return size; }
 function gitMetadataDigest(root) {
   const base = path.join(root, '.git'); const entries = [];
   const baseStat = fs.lstatSync(base); required(baseStat.isDirectory() && !baseStat.isSymbolicLink(), 'live_git_metadata');
@@ -188,4 +190,4 @@ async function runInstalledCompatibility(value, runtime) {
   } finally { releaseReservation(reservation); }
 }
 
-module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, executable, profile, terminalReport, versionMatches }) });
+module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, executable, executableSize, profile, terminalReport, versionMatches }) });
