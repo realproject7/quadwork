@@ -14,6 +14,7 @@ const productPath = require('./v2-product-path-core.cjs');
 const profiles = require('../server/reviewed-execution-profiles');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
 
+const REVIEWED_GATE_HOME = os.homedir();
 const GATE_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-gates');
 const LEDGER_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-ledger-parent');
 const MAX_OUTPUT_BYTES = outcome.OUTPUT_CAP_BYTES;
@@ -79,10 +80,10 @@ async function prepareFixedChild(profile) {
     const project = { id: profiles.PROJECT, name: 'Reviewed V2 product path', idle: true, chat_mode: 'file', repositories: [{ key: 'benchmark', repo: 'local/benchmark', working_dir: repository, primary: true }], agents: { [profile.role]: agent } };
     prepared = { root, binding, preflight, config: { port: 18991, installation_id: 'benchmark_product_path_0001', session_token: crypto.randomBytes(32).toString('hex'), temp_cleanup: { enabled: false }, projects: [project] } };
     if (preflight?.result_class !== 'preflight_ready') return report(profile, facts, { gate_receipt_digest: gate.receipt_digest, launch_claim_state: 'none', failure_stage: 'prelaunch', elapsed_ms: Date.now() - started, root_cleanup_ok: removeOwnedRoot(root), survivor_free: true });
-    const locations = writeConfig(prepared); const pre = rootFacts(root); const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN }; process.env.HOME = locations.home; process.env.USERPROFILE = locations.home; process.env.QUADWORK_SKIP_LISTEN = '1'; fixed = Object.freeze({ profile, facts, gate, root, locations, pre, previous, started }); return null;
+    const locations = writeConfig(prepared); const pre = rootFacts(root); const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN, QUADWORK_REVIEWED_GATE_HOME: process.env.QUADWORK_REVIEWED_GATE_HOME }; process.env.HOME = locations.home; process.env.USERPROFILE = locations.home; process.env.QUADWORK_SKIP_LISTEN = '1'; process.env.QUADWORK_REVIEWED_GATE_HOME = REVIEWED_GATE_HOME; fixed = Object.freeze({ profile, facts, gate, root, locations, pre, previous, started }); return null;
   } catch { const root_cleanup_ok = prepared?.root ? removeOwnedRoot(prepared.root) : false; return report(profile, facts, { gate_receipt_digest: gate?.receipt_digest || null, launch_claim_state: 'none', failure_stage: 'prelaunch', elapsed_ms: Date.now() - started, root_cleanup_ok, survivor_free: true }); }
 }
-function restore() { if (!fixed) return false; for (const [key, value] of Object.entries(fixed.previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } return process.env.HOME === fixed.previous.HOME && process.env.USERPROFILE === fixed.previous.USERPROFILE && process.env.QUADWORK_SKIP_LISTEN === fixed.previous.QUADWORK_SKIP_LISTEN; }
+function restore() { if (!fixed) return false; for (const [key, value] of Object.entries(fixed.previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } return process.env.HOME === fixed.previous.HOME && process.env.USERPROFILE === fixed.previous.USERPROFILE && process.env.QUADWORK_SKIP_LISTEN === fixed.previous.QUADWORK_SKIP_LISTEN && process.env.QUADWORK_REVIEWED_GATE_HOME === fixed.previous.QUADWORK_REVIEWED_GATE_HOME; }
 async function completeFixedChild(role, runtime) {
   const state = fixed;
   if (!parentAdmitted || !state || state.profile.role !== role || !runtime || typeof runtime.launch !== 'function') throw new Error('reviewed_execution_child_state');

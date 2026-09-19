@@ -45,12 +45,11 @@ const reviewedExecutionFixedLaunches = new WeakSet();
 // runReviewedExecution reads the disposable config. Keep that preclaim step
 // closed to its already-admitted role; ordinary config and all generic starts
 // still resolve their agent settings through reviewedExecutionFor below.
-const reviewedPreclaimArgumentRoles = new Set();
+const reviewedPreclaimArgumentProfiles = new Map();
 
 function reviewedPreclaimArgumentProfile(projectId, agentId) {
-  if (projectId !== REVIEWED_EXECUTION_PROJECT || !reviewedPreclaimArgumentRoles.has(agentId)) return null;
-  const matches = Object.values(REVIEWED_EXECUTION_PROFILES).filter(profile => profile.role === agentId);
-  return matches.length === 1 ? matches[0] : null;
+  const profile = reviewedPreclaimArgumentProfiles.get(agentId);
+  return projectId === REVIEWED_EXECUTION_PROJECT && profile?.role === agentId ? profile : null;
 }
 
 function reviewedExecutionFor(projectId, agentId, agentCfg) {
@@ -4920,7 +4919,9 @@ if (process.env.QUADWORK_TEST_RUNTIME === "1") {
 // installed in a bridge, global, route, or event listener.
 const reviewedChildRole = process.env.QUADWORK_REVIEWED_EXECUTION_CHILD_ROLE;
 if ((reviewedChildRole === "benchmark_codex" || reviewedChildRole === "benchmark_claude") && typeof process.send === "function") {
-  reviewedPreclaimArgumentRoles.add(reviewedChildRole);
+  const reviewedPreclaimProfile = Object.values(REVIEWED_EXECUTION_PROFILES).find(profile => profile.role === reviewedChildRole);
+  if (!reviewedPreclaimProfile) process.exit(1);
+  reviewedPreclaimArgumentProfiles.set(reviewedChildRole, reviewedPreclaimProfile);
   const reviewedChild = require("../benchmark/reviewed-execution-live-child-protocol.cjs");
   const reviewedParentNonce = process.env.QUADWORK_REVIEWED_PARENT_NONCE;
   const sendReviewedResultAndAwaitParent = (report, exitCode) => {
