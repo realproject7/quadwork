@@ -46,6 +46,25 @@ intended executable, server, templates, output, selected source helpers, and
 published documentation only. It must not include benchmark fixtures or local
 evidence files.
 
+## GitHub Actions storage guard
+
+Actions is disabled for this repository, so release preparation must create no
+Actions minutes, caches, or artifacts. Before the release-source PR and before
+the tag, record these read-only account-usage checks:
+
+```bash
+gh api repos/realproject7/quadwork/actions/permissions
+gh api repos/realproject7/quadwork/actions/cache/usage
+gh api --paginate --slurp repos/realproject7/quadwork/actions/artifacts \
+  | jq '[.[].artifacts[]|select(.expired==false)|.size_in_bytes]|add // 0'
+```
+
+The permission result must remain `enabled: false`; cache and artifact values
+are recorded as facts, never offset by adding a workflow cache. Do not add
+`actions/cache`, `setup-node` caching, `node_modules` caches, or artifact
+uploads as a release workaround. A request to enable Actions is a separate
+operator-approved change with an explicit minutes and storage budget.
+
 The final release commit needs the same local proof after its merge to `main`.
 If that commit differs from the reviewed release-source candidate, repeat the
 affected review and verification before continuing.
