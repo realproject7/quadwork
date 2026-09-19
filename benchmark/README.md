@@ -15,6 +15,7 @@ node --test benchmark/v2-workload-adapter.test.cjs
 node --test benchmark/v2-disposable-runtime-harness.test.cjs
 node benchmark/calibration-protocol.cjs --protocol /path/to/mode-1-or-mode-2-protocol.json
 node --test benchmark/calibration-protocol.test.cjs
+node --test benchmark/calibration-executor.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -115,3 +116,35 @@ Mode 1 retains the zero-Actions feasibility blocker until a later bounded
 delivery exercise proves it. A separately reviewed executor must bind this
 exact digest to retained evidence and enforce the manifest, approval, and
 provider budget gates itself.
+
+`calibration-executor.cjs` is the current separately bounded, non-shipping
+evidence layer, not a provider runner. It accepts only exact contracts whose
+source, harness, workload, adapter, protocol, and concrete base artifacts are
+regular files at fixed absolute paths inside a caller-created marked disposable
+target root. That root also contains a canonical artifact manifest whose digest
+must equal the protocol-bound manifest digest; each artifact and concrete base
+file is compared to the manifest before the first ledger append. It calculates
+their SHA-256 digests itself, re-parses the protocol, and checks the concrete
+base identity before recording anything. Its evidence
+directory must have been created by `createDisposableCalibrationEvidenceRoot()`;
+each append uses an exclusive lock, a re-read/CAS prefix check, file and
+directory fsync, and an atomic rename. Reports retain only structured input
+digests, actual injected Actions/cache/artifact observations, and monotonic
+start/end/duration references; each observation is first persisted as a
+secret-free content-addressed immutable file, and the authoritative ledger
+commits only its digest in `evidence_ref`. An unreferenced observation after an
+interrupted write is harmless; every committed ledger reference is rechecked.
+No
+provider text, credentials, or absolute artifact paths are retained publicly.
+
+Current `calibration-protocol.cjs` fixes `provider_execution_permitted` to
+false, so this executor always records a Mode 2
+`provider_execution_not_permitted` result and never instantiates a provider,
+adapter route, harness endpoint, or child process. It rejects shell, preload,
+and eval argv even though they are never executed. A future reviewed execution
+layer would need a non-serializable trusted authorization dependency containing
+an explicit executable allowlist, exact artifact digest, and constrained argv;
+a caller-supplied config or version string cannot grant that capability. Mode 1
+continues to retain its unproved zero-Actions blocker. Nothing here can publish,
+release, mutate GitHub, authorize Mode 3 timing, or write outside the marked
+evidence directory.
