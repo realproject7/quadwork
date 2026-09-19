@@ -23,7 +23,7 @@ test('the closed profile registry contains only the reviewed Codex and Claude la
 
 test('candidate input list is explicit and includes the V2 launch chain, reviewed evidence, sandbox, workload, and runner', () => {
   assert.deepEqual(profiles.CANDIDATE_FILES, [
-    'server/index.js', 'server/config.js', 'server/agent-lifecycle.js', 'server/project-lifecycle.js', 'server/pty-dispatcher.js', 'server/resource-runtime-owner.js', 'server/file-chat.js', 'server/reviewed-execution-profiles.js', 'benchmark/live-provider-reviewed-contracts.cjs', 'benchmark/v2-product-path-core.cjs', 'benchmark/reviewed-execution-contract.cjs', 'benchmark/reviewed-execution-runner.cjs',
+    'server/index.js', 'server/config.js', 'server/agent-lifecycle.js', 'server/project-lifecycle.js', 'server/pty-dispatcher.js', 'server/resource-runtime-owner.js', 'server/file-chat.js', 'server/reviewed-execution-profiles.js', 'server/reviewed-execution-gate.js', 'benchmark/live-provider-reviewed-contracts.cjs', 'benchmark/v2-product-path-core.cjs', 'benchmark/reviewed-execution-contract.cjs', 'benchmark/reviewed-execution-runner.cjs', 'benchmark/reviewed-execution-live-runner.cjs', 'benchmark/reviewed-execution-live-outcome.cjs', 'benchmark/reviewed-execution-live-child-protocol.cjs', 'benchmark/reviewed-execution-live-worker-codex.cjs', 'benchmark/reviewed-execution-live-worker-claude.cjs',
   ]);
   assert.match(profiles.WORKLOAD, /QUADWORK_V2_PRODUCT_PATH_OK/);
   assert.match(profiles.SENTINEL_RULE, /exact_stdout_line/);
@@ -93,5 +93,5 @@ test('server integration uses the private resolver at args, env, and final PTY l
   assert.match(source, /resolveReviewedExecution\(projectId, agentId, id\)/);
   assert.match(source, /reviewedExecution\s*\? reviewedLaunchPlan\(project, agent, reviewedExecution\.id, reviewedExecutionBinding\(agentCfg\)\)/);
   assert.match(source, /command: launchCommand/); assert.match(source, /reviewedPlan \? reviewedTerminalEnvironment\(reviewedPlan\)/);
-  assert.match(source, /const REVIEWED_EXECUTION_LIVE_ENABLED = false/);
+  assert.match(source, /const REVIEWED_EXECUTION_LIVE_ENABLED = true/);
 });

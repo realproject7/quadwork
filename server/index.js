@@ -33,10 +33,14 @@ const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
-const { WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
-// #1115 remains structurally prepared only. A later reviewed ticket must add
-// the fresh-review and Actions/cache/artifact gate before this can be enabled.
-const REVIEWED_EXECUTION_LIVE_ENABLED = false;
+const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
+const { assertReviewedExecutionGate } = require("./reviewed-execution-gate");
+// #1117's no-input runner is the only production caller. Generic HTTP/config
+// starts are denied even when an otherwise-valid reviewed role is configured.
+const REVIEWED_EXECUTION_LIVE_ENABLED = true;
+// This permit set is closure-private: no config, HTTP request, exported API,
+// or importable module can mint a value for generic start/reset/restart paths.
+const reviewedExecutionFixedLaunches = new WeakSet();
 
 function reviewedExecutionFor(projectId, agentId, agentCfg) {
   const id = agentCfg?.reviewed_execution_id;
@@ -251,7 +255,7 @@ app.get("/api/session-token", (req, res) => {
 // --- Safe PTY write helper (#670) ---
 
 function safeWrite(term, data) {
-  if (shuttingDown || !term) return false;
+  if (shuttingDown || !term || term._reviewedExecution === true) return false;
   try { term.write(data); return true; }
   catch (err) {
     if (err.code === "EIO") return false;
@@ -2300,6 +2304,11 @@ async function launchAgentPty(project, agent, opts = {}) {
 
     const agentCfg = readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {};
     const reviewedExecution = reviewedExecutionFor(project, agent, agentCfg);
+    if (reviewedExecution) {
+      if (!reviewedExecutionFixedLaunches.has(opts.reviewedExecutionPermit)) throw new Error("reviewed_execution_fixed_runner_required");
+      reviewedExecutionFixedLaunches.delete(opts.reviewedExecutionPermit);
+      assertReviewedExecutionGate(reviewedExecution, reviewedExecutionBinding(agentCfg));
+    }
     const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
     const extraEnv = buildAgentEnv(project, agent);
     // #565: buildAgentArgs is inside try-catch so registration failures
@@ -2343,6 +2352,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       projectId: project,
       agentId: agent,
       term,
+      reviewedExecution: !!reviewedPlan,
       viewers: new Set(),
       viewerDims: new Map(),
       lastDims: null,
@@ -2367,6 +2377,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       // #538: scrollback is scrubbed of likely secrets before replay.
       scrollback: Buffer.alloc(0),
     };
+    if (reviewedPlan) Object.defineProperty(term, '_reviewedExecution', { value: true, configurable: false });
     agentSessions.set(key, session);
 
     if (!opts.suppressLifecycleMsg) {
@@ -2515,6 +2526,18 @@ function spawnAgentPty(project, agent, opts = {}) {
   // Observe both outcomes without creating an unhandled rejected finally chain.
   void operation.then(() => pendingAgentLaunches.delete(operation), () => pendingAgentLaunches.delete(operation));
   return operation;
+}
+
+// The only two source-fixed doors into a reviewed process launch. They take no
+// caller data and are never wired to HTTP, reset, restart, recovery, or WS.
+async function runReviewedExecution(role) {
+  const fixed = role === "benchmark_codex" || role === "benchmark_claude" ? role : null;
+  if (!fixed) throw new Error("reviewed_execution_role_invalid");
+  const permit = Object.freeze({}); reviewedExecutionFixedLaunches.add(permit);
+  const launched = await spawnAgentPty(REVIEWED_EXECUTION_PROJECT, fixed, { lifecycleSource: "operator_start", operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true, reviewedExecutionPermit: permit });
+  const session = agentSessions.get(`${REVIEWED_EXECUTION_PROJECT}/${fixed}`);
+  if (!launched?.ok || !session?.term) return launched;
+  return Object.freeze({ ...launched, reviewed_session: Object.freeze({ onData: listener => session.term.onData(listener), writeFixedWorkload: () => session.term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`) }) });
 }
 
 async function admitAgentPty(project, agent, opts = {}) {
@@ -3160,9 +3183,6 @@ app.post("/api/agents/:project/interrupt-all", (req, res) => {
 });
 
 // --- Sessions tracking (for /api/projects dashboard) ---
-
-// Expose agentSessions to migrated routes
-app.set("activeSessions", agentSessions);
 
 app.get("/api/sessions", (_req, res) => {
   const sessions = [];
@@ -4790,10 +4810,29 @@ module.exports = {
   restartAgentSession,
   _test: Object.freeze({ installLifecycleTestFixture }),
 };
-module.exports.agentSessions = agentSessions; // #972: test seam for shutdown() PTY cleanup
 module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test seam
 module.exports.headControlRuntime = headControlRuntime; // #1044: Head-token registration test seam
 module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation test seam
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
 module.exports.runStartupMigrations = runStartupMigrations; // startup seeding (test seam)
 module.exports.app = app; // route-level test seam (QUADWORK_SKIP_LISTEN keeps the port unbound)
+
+// This branch is reachable only in one of the two source-fixed IPC workers.
+// The worker prepares the isolated HOME before this module is loaded; the
+// callback below remains in this module's closure and is neither exported nor
+// installed in a bridge, global, route, or event listener.
+const reviewedChildRole = process.env.QUADWORK_REVIEWED_EXECUTION_CHILD_ROLE;
+if ((reviewedChildRole === "benchmark_codex" || reviewedChildRole === "benchmark_claude") && typeof process.send === "function") {
+  const reviewedChild = require("../benchmark/reviewed-execution-live-child-protocol.cjs");
+  void reviewedChild.completeFixedChild(reviewedChildRole, Object.freeze({
+    buildAgentArgs,
+    buildAgentEnv,
+    stopAgentSession,
+    shutdown,
+    launch: () => runReviewedExecution(reviewedChildRole),
+  })).then((report) => {
+    process.send(Object.freeze({ type: "reviewed_execution_result", report }), () => process.exit(0));
+  }).catch(() => {
+    process.send(Object.freeze({ type: "reviewed_execution_result", report: reviewedChild.failedChildReport(reviewedChildRole) }), () => process.exit(1));
+  });
+}

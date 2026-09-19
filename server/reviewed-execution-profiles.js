@@ -45,10 +45,16 @@ const CANDIDATE_FILES = Object.freeze([
   'server/resource-runtime-owner.js',
   'server/file-chat.js',
   'server/reviewed-execution-profiles.js',
+  'server/reviewed-execution-gate.js',
   'benchmark/live-provider-reviewed-contracts.cjs',
   'benchmark/v2-product-path-core.cjs',
   'benchmark/reviewed-execution-contract.cjs',
   'benchmark/reviewed-execution-runner.cjs',
+  'benchmark/reviewed-execution-live-runner.cjs',
+  'benchmark/reviewed-execution-live-outcome.cjs',
+  'benchmark/reviewed-execution-live-child-protocol.cjs',
+  'benchmark/reviewed-execution-live-worker-codex.cjs',
+  'benchmark/reviewed-execution-live-worker-claude.cjs',
 ]);
 
 function candidateDigest(repositoryRoot = path.resolve(__dirname, '..')) {
