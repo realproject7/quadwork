@@ -51,6 +51,18 @@ function safeDirectory(directory, parent, code) {
   if (!stat.isDirectory() || stat.isSymbolicLink() || mode(stat) !== 0o700 || !sameUser(stat) || path.dirname(real) !== parentReal) throw new Error(code);
   return real;
 }
+function workerAuthorization(root) {
+  let rootStat, entries, marker, authority, message;
+  try { rootStat = fs.lstatSync(root); entries = fs.readdirSync(root).sort(); marker = fs.lstatSync(path.join(root, core.ROOT_MARKER)); authority = fs.lstatSync(path.join(root, '.worker-authority')); message = JSON.parse(fs.readFileSync(0, 'utf8')); } catch { throw new Error('product_path_worker_authorization'); }
+  const expected = ['.worker-authority', core.ROOT_MARKER, 'evidence', 'home', 'repository'].sort();
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || mode(rootStat) !== 0o700 || !sameUser(rootStat) || JSON.stringify(entries) !== JSON.stringify(expected) || !marker.isFile() || marker.isSymbolicLink() || mode(marker) !== 0o600 || fs.readFileSync(path.join(root, core.ROOT_MARKER), 'utf8') !== 'quadwork-v2-product-path-v1\n' || !authority.isFile() || authority.isSymbolicLink() || mode(authority) !== 0o600 || !message || Object.keys(message).sort().join(',') !== 'nonce,source_digest' || typeof message.nonce !== 'string' || !/^[a-f0-9]{64}$/.test(message.nonce) || typeof message.source_digest !== 'string' || !/^[a-f0-9]{64}$/.test(message.source_digest) || fs.readFileSync(path.join(root, '.worker-authority'), 'utf8') !== `${digest(message.nonce)}\n`) throw new Error('product_path_worker_authorization');
+  return Object.freeze({ source_digest: message.source_digest });
+}
+function validateExecutable() {
+  const contract = reviewed[adapter.id]; let stat, real, bytes;
+  try { stat = fs.lstatSync(adapter.command); real = fs.realpathSync(adapter.command); bytes = fs.readFileSync(real); } catch { throw new Error('product_path_executable_unreviewed'); }
+  if (!contract || adapter.command !== contract.resolved_path || !stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) === 0 || real !== contract.resolved_path || digest(bytes) !== contract.executable_digest) throw new Error('product_path_executable_unreviewed');
+}
 function rootFacts(root) {
   const repository = safeDirectory(path.join(root, 'repository'), root, 'product_path_repository_unsafe');
   const run = args => execFileSync('/usr/bin/git', ['-c', 'credential.helper=', ...args], { cwd: repository, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: false, timeout: 3_000, env: { HOME: os.devNull, PATH: process.env.PATH || '', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: '0' } });
@@ -75,7 +87,8 @@ function preflight() {
 }
 function lifecycleState() { try { const state = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.quadwork', project, 'agent-lifecycle-state.json'), 'utf8')); return state?.roles?.[adapter.role]?.state === 'verified' ? 'verified' : 'unverified'; } catch { return 'unverified'; } }
 async function main() {
-  if (!adapter) throw new Error('product_path_worker_shape'); const root = path.dirname(process.env.HOME || ''); safeDirectory(process.env.HOME, root, 'product_path_home_unsafe');
+  if (!adapter) throw new Error('product_path_worker_shape'); const root = path.dirname(process.env.HOME || ''); const authorization = workerAuthorization(root); safeDirectory(process.env.HOME, root, 'product_path_home_unsafe'); validateExecutable();
+  if (digest(fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'))) !== authorization.source_digest) throw new Error('product_path_source_changed');
   const runtime = require('../server/index.js'), config = require('../server/config.js').readConfig(); port = config.port; if (!Number.isSafeInteger(port) || port <= 0 || port >= 65536) throw new Error('product_path_port_unsafe'); validateConfigHome(root, config); await waitForHealth();
   const preFacts = rootFacts(root), built = await runtime.buildAgentArgs(project, adapter.role), additional = runtime.buildAgentEnv(project, adapter.role), effectiveEnv = { ...process.env, ...additional }; core.noUnsafeArgs(built.args, effectiveEnv);
   const base = { argument_profile_digest: digest(JSON.stringify(built.args)), environment_profile_digest: digest(JSON.stringify(Object.keys(effectiveEnv).sort().map(key => [key, effectiveEnv[key]]))), pre_root_facts: preFacts, external_process_started: false, lifecycle_state: 'unverified' };

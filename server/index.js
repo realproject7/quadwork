@@ -2106,13 +2106,13 @@ async function buildAgentArgs(projectId, agentId) {
 
   const agentCfg = project.agents?.[agentId] || {};
   const command = agentCfg.command || "claude";
-  // A digest-bound benchmark may use a versioned resolved executable whose
-  // basename is not the provider name (for example Claude's version file).
-  // command_identity is only an argument-grammar selector: it cannot replace
-  // the configured command or grant auto-approval/MCP capability.
-  const cliBase = typeof agentCfg.command_identity === "string" && /^(?:codex|claude|gemini|grok)$/.test(agentCfg.command_identity)
-    ? agentCfg.command_identity
-    : command.split("/").pop().split(" ")[0];
+  // A versioned resolved Claude executable has no provider-shaped basename.
+  // This exception is deliberately limited to the owned #1113 benchmark role;
+  // normal configuration cannot select a conflicting argument grammar.
+  const benchmarkIdentity = projectId === "benchmark-product-path"
+    && ((agentId === "benchmark_codex" && agentCfg.command_identity === "codex") || (agentId === "benchmark_claude" && agentCfg.command_identity === "claude"))
+    ? agentCfg.command_identity : null;
+  const cliBase = benchmarkIdentity || command.split("/").pop().split(" ")[0];
   const args = [];
 
   // Permission bypass flags
@@ -2208,9 +2208,10 @@ function buildAgentEnv(projectId, agentId) {
 
   const agentCfg = project.agents?.[agentId] || {};
   const command = agentCfg.command || "claude";
-  const cliBase = typeof agentCfg.command_identity === "string" && /^(?:codex|claude|gemini|grok)$/.test(agentCfg.command_identity)
-    ? agentCfg.command_identity
-    : command.split("/").pop().split(" ")[0];
+  const benchmarkIdentity = projectId === "benchmark-product-path"
+    && ((agentId === "benchmark_codex" && agentCfg.command_identity === "codex") || (agentId === "benchmark_claude" && agentCfg.command_identity === "claude"))
+    ? agentCfg.command_identity : null;
+  const cliBase = benchmarkIdentity || command.split("/").pop().split(" ")[0];
   const env = {};
 
   // Gemini: inject MCP via env var

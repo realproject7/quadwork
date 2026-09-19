@@ -73,6 +73,18 @@ test('worker source has no provider-configurable pty or admission dependency sea
   assert.doesNotMatch(source, /ptySpawn|buildAgentArgs:\s*|spawnAgentPty:\s*|REVIEWED_EXECUTIONS|createReviewedExecutionAuthorization/);
   assert.match(source, /if \(!preflight\(\)\).*preflight_blocked[\s\S]*spawnAgentPty/);
   assert.match(source, /finally[\s\S]*stopAgentSession[\s\S]*runtime\.shutdown[\s\S]*postFacts/);
+  assert.match(source, /workerAuthorization\(root\)[\s\S]*validateExecutable\(\)[\s\S]*product_path_source_changed[\s\S]*require\('\.\.\/server\/index\.js'\)/);
+});
+
+test('worker authorization is one-shot, root-owned, and its marker becomes part of the exact root layout', () => {
+  const directory = parent();
+  try {
+    const root = core.createDisposableProductPathRoot({ parent_dir: directory });
+    const authorization = core.testHooks.workerAuthorization(root);
+    assert.match(authorization.nonce, /^[a-f0-9]{64}$/); assert.equal(fs.readFileSync(path.join(root, '.worker-authority'), 'utf8').trim().length, 64);
+    fs.writeFileSync(path.join(root, '.worker-authority'), '0'.repeat(64) + '\n', { mode: 0o600 });
+    assert.notEqual(fs.readFileSync(path.join(root, '.worker-authority'), 'utf8'), require('node:crypto').createHash('sha256').update(authorization.nonce).digest('hex') + '\n');
+  } finally { cleanup(directory); }
 });
 
 test('fake CLI traverses the real V2 spawnAgentPty admission and PTY lifecycle without a fixture seam', () => {
@@ -81,11 +93,11 @@ test('fake CLI traverses the real V2 spawnAgentPty admission and PTY lifecycle w
     const home = path.join(directory, 'home'), configDir = path.join(home, '.quadwork'), repository = path.join(directory, 'repository'), fake = path.join(directory, 'fake-cli');
     fs.mkdirSync(configDir, { recursive: true, mode: 0o700 }); fs.mkdirSync(repository, { recursive: true, mode: 0o700 });
     fs.writeFileSync(fake, '#!/usr/bin/env node\nrequire("fs").writeFileSync(require("path").join(process.env.HOME,"fake-pid"),String(process.pid)); process.stdout.write("fake-ready\\n"); setInterval(() => {}, 1000);\n', { mode: 0o700 }); fs.chmodSync(fake, 0o700);
-    fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({ port: 18999, installation_id: 'benchmark_product_path_0001', temp_cleanup: { enabled: false }, projects: [{ id: 'fixture', name: 'fixture', idle: true, chat_mode: 'file', repositories: [{ key: 'fixture', repo: 'local/fixture', working_dir: repository, primary: true }], agents: { fixture_role: { cwd: repository, command: fake, command_identity: 'claude', model: 'claude-sonnet-4-6', auto_approve: false, mcp_inject: 'none' } } }] }), { mode: 0o600 });
+    fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({ port: 18999, installation_id: 'benchmark_product_path_0001', temp_cleanup: { enabled: false }, projects: [{ id: 'benchmark-product-path', name: 'fixture', idle: true, chat_mode: 'file', repositories: [{ key: 'fixture', repo: 'local/fixture', working_dir: repository, primary: true }], agents: { benchmark_claude: { cwd: repository, command: fake, command_identity: 'claude', model: 'claude-sonnet-4-6', auto_approve: false, mcp_inject: 'none' } } }] }), { mode: 0o600 });
     const script = [
       "const fs=require('fs'), path=require('path');",
       "const runtime=require('./server/index.js');",
-      "(async()=>{ const built=await runtime.buildAgentArgs('fixture','fixture_role'); if (JSON.stringify(built.args)!==JSON.stringify(['--model','claude-sonnet-4-6'])) throw new Error('unexpected args'); const launched=await runtime.spawnAgentPty('fixture','fixture_role',{lifecycleSource:'operator_start',operatorAuthorized:true,explicitRole:true,suppressLifecycleMsg:true}); if(!launched.ok) throw new Error('launch failed'); let durable; for(let i=0;i<40;i++){ await new Promise(r=>setTimeout(r,25)); durable=JSON.parse(fs.readFileSync(path.join(process.env.HOME,'.quadwork','fixture','agent-lifecycle-state.json'),'utf8')); if(durable.roles.fixture_role.state==='verified') break; } if(durable.roles.fixture_role.state!=='verified') throw new Error('not verified'); const stopped=await runtime.stopAgentSession('fixture/fixture_role',{suppressLifecycleMsg:true,removeEntry:true}); if(!stopped.ok) throw new Error('stop failed'); await runtime.shutdown(); process.exit(0); })().catch(e=>{console.error(e.stack);process.exit(1)});",
+      "(async()=>{ const built=await runtime.buildAgentArgs('benchmark-product-path','benchmark_claude'); if (JSON.stringify(built.args)!==JSON.stringify(['--model','claude-sonnet-4-6'])) throw new Error('unexpected args'); const launched=await runtime.spawnAgentPty('benchmark-product-path','benchmark_claude',{lifecycleSource:'operator_start',operatorAuthorized:true,explicitRole:true,suppressLifecycleMsg:true}); if(!launched.ok) throw new Error('launch failed'); let durable; for(let i=0;i<40;i++){ await new Promise(r=>setTimeout(r,25)); durable=JSON.parse(fs.readFileSync(path.join(process.env.HOME,'.quadwork','benchmark-product-path','agent-lifecycle-state.json'),'utf8')); if(durable.roles.benchmark_claude.state==='verified') break; } if(durable.roles.benchmark_claude.state!=='verified') throw new Error('not verified'); const stopped=await runtime.stopAgentSession('benchmark-product-path/benchmark_claude',{suppressLifecycleMsg:true,removeEntry:true}); if(!stopped.ok) throw new Error('stop failed'); await runtime.shutdown(); process.exit(0); })().catch(e=>{console.error(e.stack);process.exit(1)});",
     ].join('');
     const moduleRoots = [path.join(process.cwd(), 'node_modules'), path.join(path.dirname(process.cwd()), 'quadwork', 'node_modules')].filter(fs.existsSync);
     const result = spawnSync(process.execPath, ['-e', script], { cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home, USERPROFILE: home, QUADWORK_SKIP_LISTEN: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, NODE_PATH: moduleRoots.join(path.delimiter) || (process.env.NODE_PATH || '') }, encoding: 'utf8', timeout: 10_000 });

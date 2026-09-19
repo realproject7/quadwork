@@ -198,6 +198,15 @@ pre- and post-run no-remote/clean-root facts. Timeout handling first requests
 graceful worker teardown, and the worker's `finally` stops its exact owned PTY
 and V2 runtime before any result is emitted.
 
+The worker also consumes one parent-issued authorization nonce and checks the
+exact owned-root marker/layout, source digest, and binary digest before loading
+the server. This is a same-user admission guard, not a credential boundary. No
+provider-auth directory is referenced in this contract: the isolated HOME
+therefore fails closed when authentication is unavailable. A future live-auth
+contract needs a provider-reviewed mechanism that can prove both read-only
+credential access and the safe CLI profile; it cannot be enabled by an env var
+or a caller-supplied path.
+
 The artifact records only redacted digests and terminal facts. It never stores
 the prompt, output, token, config bytes, absolute paths, authentication data,
 or raw terminal data. Fake-only tests cover the config and root isolation,

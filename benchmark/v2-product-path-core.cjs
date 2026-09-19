@@ -76,6 +76,10 @@ function createRoot(value = {}) {
   git(path.join(root, 'repository'), ['init', '--quiet']);
   const checked = checkedRoot(root, ROOT_MARKER, new Set([ROOT_MARKER, 'home', 'repository', 'evidence']), 'product_path_root_create'); OWNED_ROOTS.add(checked); return checked;
 }
+function workerAuthorization(root) {
+  required(OWNED_ROOTS.has(root), 'product_path_root_not_owned'); const nonce = crypto.randomBytes(32).toString('hex'), filename = path.join(root, '.worker-authority');
+  fs.writeFileSync(filename, `${digest(nonce)}\n`, { mode: 0o600, flag: 'wx' }); fs.chmodSync(filename, 0o600); return Object.freeze({ nonce, digest: digest(nonce) });
+}
 function createEvidence(root) {
   required(OWNED_ROOTS.has(root), 'product_path_root_not_owned'); const evidence = path.join(root, 'evidence');
   fs.writeFileSync(path.join(evidence, EVIDENCE_MARKER), MARKER_BODY, { mode: 0o600, flag: 'wx' }); fs.chmodSync(path.join(evidence, EVIDENCE_MARKER), 0o600);
@@ -105,7 +109,7 @@ function safeChild(parent, child, code) {
   return real;
 }
 function writeConfig(root, config) {
-  required(OWNED_ROOTS.has(root), 'product_path_root_not_owned'); checkedRoot(root, ROOT_MARKER, new Set([ROOT_MARKER, 'home', 'repository', 'evidence']), 'product_path_root_unsafe'); const home = safeChild(root, path.join(root, 'home'), 'product_path_home_unsafe'), directory = path.join(home, '.quadwork'), filename = path.join(directory, 'config.json');
+  required(OWNED_ROOTS.has(root), 'product_path_root_not_owned'); checkedRoot(root, ROOT_MARKER, new Set([ROOT_MARKER, 'home', 'repository', 'evidence', '.worker-authority']), 'product_path_root_unsafe'); const home = safeChild(root, path.join(root, 'home'), 'product_path_home_unsafe'), directory = path.join(home, '.quadwork'), filename = path.join(directory, 'config.json');
   fs.mkdirSync(directory, { mode: 0o700 }); fs.chmodSync(directory, 0o700); safeChild(home, directory, 'product_path_config_directory_unsafe'); fs.writeFileSync(filename, JSON.stringify(config), { mode: 0o600, flag: 'wx' }); const stat = fs.lstatSync(filename); required(stat.isFile() && !stat.isSymbolicLink() && mode(stat) === 0o600 && sameUser(stat), 'product_path_config_unsafe');
   return Object.freeze({ home, config: filename });
 }
@@ -149,10 +153,10 @@ function workerResult(child, timeoutMs) {
 }
 async function runReviewedProductPath(value) {
   exact(value, ['adapter', 'parent_dir'], 'product_path_run_shape'); const adapter = ADAPTERS[value.adapter]; required(adapter, 'product_path_adapter_not_supported'); required(safePath(value.parent_dir), 'product_path_run_shape');
-  const root = createRoot({ parent_dir: value.parent_dir }); const evidence = createEvidence(root); const exec = executable(adapter); repositoryFacts(root); const port = await freePort(); const config = configFor(adapter, root, port); const locations = writeConfig(root, config); const sourceDigest = digest(fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'))); const started = Date.now();
-  const child = spawn(process.execPath, [path.join(__dirname, 'v2-product-path-worker.cjs'), adapter.id], { cwd: path.join(__dirname, '..'), env: safeEnvironment(locations.home), stdio: ['ignore', 'pipe', 'pipe'], shell: false, windowsHide: true });
+  const root = createRoot({ parent_dir: value.parent_dir }); const evidence = createEvidence(root); const exec = executable(adapter); const authorization = workerAuthorization(root); repositoryFacts(root); const port = await freePort(); const config = configFor(adapter, root, port); const locations = writeConfig(root, config); const sourceDigest = digest(fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'))); const started = Date.now();
+  const child = spawn(process.execPath, [path.join(__dirname, 'v2-product-path-worker.cjs'), adapter.id], { cwd: path.join(__dirname, '..'), env: safeEnvironment(locations.home), stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true }); child.stdin.end(JSON.stringify({ nonce: authorization.nonce, source_digest: sourceDigest }) + '\n');
   const result = await workerResult(child, CAPS.max_elapsed_ms + 15_000); const report = redactedReport(adapter, exec, { ...result, source_digest: sourceDigest, elapsed_ms: Date.now() - started, config_isolated: fs.existsSync(locations.config) && path.dirname(locations.config) !== path.join(os.homedir(), '.quadwork') }); persist(evidence, report);
   return Object.freeze({ evidence_directory: evidence, report });
 }
 
-module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, ProductPathError, ROOT_MARKER, WORKLOAD, createDisposableProductPathRoot: createRoot, noUnsafeArgs, runReviewedProductPath, safeEnvironment, testHooks: Object.freeze({ checkedRoot, configFor, createEvidence, executable, persist, redactedReport, repositoryFacts, safeChild, workerResult, writeConfig }) });
+module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, ProductPathError, ROOT_MARKER, WORKLOAD, createDisposableProductPathRoot: createRoot, noUnsafeArgs, runReviewedProductPath, safeEnvironment, testHooks: Object.freeze({ checkedRoot, configFor, createEvidence, executable, persist, redactedReport, repositoryFacts, safeChild, workerAuthorization, workerResult, writeConfig }) });
