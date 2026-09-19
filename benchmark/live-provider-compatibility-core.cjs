@@ -28,6 +28,7 @@ const ADAPTERS = Object.freeze({
   claude: Object.freeze({ id: 'claude', model_id: 'claude-sonnet-4-6', role: 'compatibility_smoke', argv: Object.freeze(['-p', '--restricted', '--safe-mode', '--strict-mcp-config', '--no-session-persistence', '--permission-mode', 'dontAsk', '--permission-prompts', 'none', '--tools', '', '--output-format', 'text', '--model', 'claude-sonnet-4-6']) }),
 });
 const SAFE_WORKLOAD = 'Return exactly QUADWORK_LIVE_OK. Do not use tools. Do not read, write, or change files.';
+const CODEX_FINAL_MESSAGE = '.quadwork-live-codex-final-message';
 const CAPS = Object.freeze({ max_elapsed_ms: 45_000, max_output_bytes: 4_096, max_provider_turns: 1, max_version_output_bytes: 4_096 });
 const MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024;
 
@@ -137,7 +138,7 @@ function rootFacts(root, runtime) {
   required(localGit(runtime, checked, ['remote']).trim() === '', 'live_remote_present'); required(localGit(runtime, checked, ['status', '--porcelain=v1']).trim() === '', 'live_unsafe_root');
   return Object.freeze({ entry_count: fs.readdirSync(checked).length, git_metadata_digest: gitMetadataDigest(checked), remote_count: 0, changed_entry_count: 0 });
 }
-function profile(adapter, root) { return Object.freeze(adapter.id === 'codex' ? [...adapter.argv, '-C', root, SAFE_WORKLOAD] : [...adapter.argv, SAFE_WORKLOAD]); }
+function profile(adapter, root) { return Object.freeze(adapter.id === 'codex' ? [...adapter.argv, '-C', root, '--output-last-message', path.join(root, CODEX_FINAL_MESSAGE), SAFE_WORKLOAD] : [...adapter.argv, SAFE_WORKLOAD]); }
 function assertHostIsolation(adapter, compiled, root, runtime) {
   const expected = profile(adapter, root); required(JSON.stringify(compiled) === JSON.stringify(expected), 'live_host_isolation_unavailable');
   if (adapter.id === 'codex') required(compiled.includes('--sandbox') && compiled.includes('read-only') && !compiled.includes('--dangerously-bypass-approvals-and-sandbox'), 'live_host_isolation_unavailable');
@@ -159,6 +160,16 @@ function capture(runtime, command, args, options) {
   return captureChild(child, options);
 }
 function versionMatches(result, contract) { return result.output_digest === contract.version_digest && !result.timed_out && !result.overflow && result.code === 0 && !result.signal; }
+function consumeCodexFinalMessage(root) {
+  const filename = path.join(root, CODEX_FINAL_MESSAGE); let bytes = null;
+  try {
+    const stat = fs.lstatSync(filename);
+    required(!stat.isSymbolicLink() && stat.isFile() && permissions(stat) === 0o600 && sameUser(stat) && stat.size > 0 && stat.size <= CAPS.max_output_bytes, 'live_final_message');
+    bytes = fs.readFileSync(filename); required(bytes.length === stat.size, 'live_final_message');
+    return Object.freeze({ response_digest: digest(bytes), response_ok: bytes.toString('utf8') === 'QUADWORK_LIVE_OK' || bytes.toString('utf8') === 'QUADWORK_LIVE_OK\n' });
+  } catch { return Object.freeze({ response_digest: bytes ? digest(bytes) : null, response_ok: false }); }
+  finally { try { const stat = fs.lstatSync(filename); if (stat.isFile() || stat.isSymbolicLink()) fs.unlinkSync(filename); } catch {} }
+}
 function persistTerminal(evidenceRoot, report) {
   const root = checkedMarkedRoot(evidenceRoot, EVIDENCE_MARKER, new Set([EVIDENCE_MARKER, 'terminal.json', '.terminal.lock']), 'live_evidence_root'); const filename = path.join(root, 'terminal.json'); required(!fs.existsSync(filename), 'live_terminal_already_recorded');
   const encoded = Buffer.from(JSON.stringify(report) + '\n', 'utf8'); required(encoded.length <= 8 * 1024, 'live_evidence_report'); let fd;
@@ -184,10 +195,11 @@ async function runInstalledCompatibility(value, runtime) {
   const contract = Object.freeze({ adapter, executable: resolvedExecutable, identity: runIdentity, pre_facts: preFacts, digest: digest(JSON.stringify({ adapter: adapter.id, model_id: adapter.model_id, executable_digest: resolvedExecutable.digest, identity: runIdentity, profile_digest: digest(JSON.stringify(compiled)), pre_facts: preFacts })) }); const startedAt = Date.now();
   let version; try { version = await capture(runtime, resolvedExecutable.path, ['--version'], { cwd: root, env: sanitizedEnvironment(), max_output_bytes: selectedCaps.max_version_output_bytes, timeout_ms: 5_000 }); } catch { const report = terminalReport(contract, selectedCaps, 'version_failed'); persistTerminal(evidenceRoot, report); return report; }
   const versionDigest = version.output_digest; if (!versionMatches(version, contractReview)) { const report = terminalReport(contract, selectedCaps, 'version_failed', { cli_version_digest: versionDigest, output_bytes: version.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
-  let invocation; try { invocation = await capture(runtime, resolvedExecutable.path, compiled, { cwd: root, env: sanitizedEnvironment(), expected_response: 'QUADWORK_LIVE_OK', max_output_bytes: selectedCaps.max_output_bytes, timeout_ms: selectedCaps.max_elapsed_ms }); } catch { const report = terminalReport(contract, selectedCaps, 'process_failed', { cli_version_digest: versionDigest, external_process_started: true, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
-  let result_class = 'completed'; if (invocation.timed_out) result_class = 'timeout'; else if (invocation.overflow) result_class = 'output_cap_exceeded'; else if (invocation.code !== 0 || invocation.signal) result_class = 'login_or_entitlement_failure'; else if (!invocation.response_ok) result_class = 'response_contract_failed'; let postFacts = null; try { postFacts = rootFacts(root, runtime); if (JSON.stringify(preFacts) !== JSON.stringify(postFacts)) result_class = 'repository_mutated'; } catch { result_class = 'repository_mutated'; }
-  const report = terminalReport(contract, selectedCaps, result_class, { cli_version_digest: versionDigest, response_digest: invocation.output_digest, response_contract_passed: invocation.response_ok === true, post_facts: postFacts, external_process_started: true, output_bytes: invocation.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report;
+  let invocation; try { invocation = await capture(runtime, resolvedExecutable.path, compiled, { cwd: root, env: sanitizedEnvironment(), expected_response: adapter.id === 'claude' ? 'QUADWORK_LIVE_OK' : undefined, max_output_bytes: selectedCaps.max_output_bytes, timeout_ms: selectedCaps.max_elapsed_ms }); } catch { const report = terminalReport(contract, selectedCaps, 'process_failed', { cli_version_digest: versionDigest, external_process_started: true, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report; }
+  const finalResponse = adapter.id === 'codex' ? consumeCodexFinalMessage(root) : Object.freeze({ response_digest: invocation.output_digest, response_ok: invocation.response_ok === true });
+  let result_class = 'completed'; if (invocation.timed_out) result_class = 'timeout'; else if (invocation.overflow) result_class = 'output_cap_exceeded'; else if (invocation.code !== 0 || invocation.signal) result_class = 'login_or_entitlement_failure'; else if (!finalResponse.response_ok) result_class = 'response_contract_failed'; let postFacts = null; try { postFacts = rootFacts(root, runtime); if (JSON.stringify(preFacts) !== JSON.stringify(postFacts)) result_class = 'repository_mutated'; } catch { result_class = 'repository_mutated'; }
+  const report = terminalReport(contract, selectedCaps, result_class, { cli_version_digest: versionDigest, response_digest: finalResponse.response_digest, response_contract_passed: finalResponse.response_ok, post_facts: postFacts, external_process_started: true, output_bytes: invocation.bytes, elapsed_ms: Date.now() - startedAt }); persistTerminal(evidenceRoot, report); return report;
   } finally { releaseReservation(reservation); }
 }
 
-module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, executable, executableSize, profile, terminalReport, versionMatches }) });
+module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, consumeCodexFinalMessage, executable, executableSize, profile, terminalReport, versionMatches }) });

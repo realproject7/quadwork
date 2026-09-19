@@ -81,8 +81,18 @@ test('model aliases and provider aliases fail the public exact-shape gate', asyn
 test('compiled argv is exactly the source-controlled Codex or Claude profile', () => {
   const value = roots();
   try {
-    assert.deepEqual(core.testHooks.profile(live.ADAPTERS.codex, value.root), ['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--color', 'never', '-m', 'gpt-5.6-luna', '-C', value.root, 'Return exactly QUADWORK_LIVE_OK. Do not use tools. Do not read, write, or change files.']);
+    assert.deepEqual(core.testHooks.profile(live.ADAPTERS.codex, value.root), ['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--color', 'never', '-m', 'gpt-5.6-luna', '-C', value.root, '--output-last-message', path.join(value.root, '.quadwork-live-codex-final-message'), 'Return exactly QUADWORK_LIVE_OK. Do not use tools. Do not read, write, or change files.']);
     assert.deepEqual(core.testHooks.profile(live.ADAPTERS.claude, value.root), ['-p', '--restricted', '--safe-mode', '--strict-mcp-config', '--no-session-persistence', '--permission-mode', 'dontAsk', '--permission-prompts', 'none', '--tools', '', '--output-format', 'text', '--model', 'claude-sonnet-4-6', 'Return exactly QUADWORK_LIVE_OK. Do not use tools. Do not read, write, or change files.']);
+  } finally { cleanup(value); }
+});
+
+test('Codex final-message adapter accepts only the sentinel and deletes transient content', () => {
+  const value = roots(), filename = path.join(value.root, '.quadwork-live-codex-final-message');
+  try {
+    fs.writeFileSync(filename, 'QUADWORK_LIVE_OK\n', { mode: 0o600 }); fs.chmodSync(filename, 0o600);
+    const accepted = core.testHooks.consumeCodexFinalMessage(value.root); assert.equal(accepted.response_ok, true); assert.equal(fs.existsSync(filename), false);
+    fs.writeFileSync(filename, 'provider private output', { mode: 0o600 }); fs.chmodSync(filename, 0o600);
+    const rejected = core.testHooks.consumeCodexFinalMessage(value.root); assert.equal(rejected.response_ok, false); assert.equal(fs.existsSync(filename), false); assert.equal(JSON.stringify(rejected).includes('private output'), false);
   } finally { cleanup(value); }
 });
 
