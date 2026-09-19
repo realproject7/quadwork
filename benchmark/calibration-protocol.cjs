@@ -52,7 +52,9 @@ function validateProtocol(value) {
   required(CLASSES.has(value.workload_class), 'calibration_workload_class');
   number(value.repetition, 64, 'calibration_repetition', 1);
   required(DIGEST.test(value.manifest_digest), 'calibration_manifest_digest');
-  required(['proved', 'unproved'].includes(value.mode_1_zero_actions_feasibility), 'calibration_mode_1_feasibility');
+  // This preparation-only module has no evidence path, so a submitted
+  // assertion must never clear the Mode 1 feasibility blocker.
+  required(value.mode_1_zero_actions_feasibility === 'unproved', 'calibration_mode_1_feasibility');
   exact(value.run_anchor, ['harness_sha', 'source_sha', 'workload_sha'], 'calibration_run_anchor');
   for (const key of Object.keys(value.run_anchor)) required(SHA.test(value.run_anchor[key]), 'calibration_run_anchor');
   exact(value.target, ['base_sha', 'repository'], 'calibration_target');
