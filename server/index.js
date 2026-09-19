@@ -2626,7 +2626,11 @@ async function runReviewedExecution(role) {
   const permit = Object.freeze({}); reviewedExecutionFixedLaunches.add(permit);
   const launched = await spawnAgentPty(REVIEWED_EXECUTION_PROJECT, fixed, { lifecycleSource: "operator_start", operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true, reviewedExecutionPermit: permit });
   const session = agentSessions.get(`${REVIEWED_EXECUTION_PROJECT}/${fixed}`);
-  if (!launched?.ok || !session?.term) return launched;
+  if (!launched?.ok) return launched;
+  // A claimed terminal can exit while the fixed server launch is resolving.
+  // Preserve only this fixed boundary; never expose its exit status, command,
+  // path, or terminal output to the reviewed execution report.
+  if (!session?.term) return Object.freeze({ ...launched, reviewed_launch_diagnostic: "pty_unavailable_after_claim" });
   return Object.freeze({ ...launched, reviewed_session: Object.freeze({ onData: listener => session.term.onData(listener), onExit: listener => session.term.onExit(listener), writeFixedWorkload: () => session.term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`) }) });
 }
 
