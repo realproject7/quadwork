@@ -62,6 +62,30 @@ test('public runner rejects arbitrary fields before any provider process is elig
   } finally { cleanup(value); }
 });
 
+test('an owned root with a Git remote is rejected before executable preflight', async () => {
+  const value = roots();
+  try {
+    require('node:child_process').execFileSync('/usr/bin/git', ['remote', 'add', 'origin', 'https://example.invalid/quadwork.git'], { cwd: value.root });
+    await assert.rejects(() => live.runReviewedLiveCompatibility({ adapter: 'codex', evidence_directory: value.evidence, executable: '/tmp/not-codex', root_directory: value.root }), /live_remote_present/);
+  } finally { cleanup(value); }
+});
+
+test('model aliases and provider aliases fail the public exact-shape gate', async () => {
+  const first = roots(), second = roots();
+  try {
+    await assert.rejects(() => live.runReviewedLiveCompatibility({ adapter: 'codex', evidence_directory: first.evidence, executable: '/tmp/not-codex', model: 'default', root_directory: first.root }), /live_run_shape/);
+    await assert.rejects(() => live.runReviewedLiveCompatibility({ adapter: 'codex-default', evidence_directory: second.evidence, executable: '/tmp/not-codex', root_directory: second.root }), /live_adapter_not_supported/);
+  } finally { cleanup(first); cleanup(second); }
+});
+
+test('compiled argv is exactly the source-controlled Codex or Claude profile', () => {
+  const value = roots();
+  try {
+    assert.deepEqual(core.testHooks.profile(live.ADAPTERS.codex, value.root), ['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--color', 'never', '-m', 'gpt-5.6-luna', '-C', value.root, 'Return exactly QUADWORK_LIVE_OK. Do not use tools. Do not read, write, or change files.']);
+    assert.deepEqual(core.testHooks.profile(live.ADAPTERS.claude, value.root), ['-p', '--restricted', '--safe-mode', '--strict-mcp-config', '--no-session-persistence', '--permission-mode', 'dontAsk', '--permission-prompts', 'none', '--tools', '', '--output-format', 'text', '--model', 'claude-sonnet-4-6', 'Return exactly QUADWORK_LIVE_OK. Do not use tools. Do not read, write, or change files.']);
+  } finally { cleanup(value); }
+});
+
 test('a symlinked .git directory is rejected by the local metadata guard', async () => {
   const value = roots();
   try {
