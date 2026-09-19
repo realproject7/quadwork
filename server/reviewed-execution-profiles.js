@@ -49,6 +49,7 @@ const CANDIDATE_FILES = Object.freeze([
   'benchmark/v2-product-path-core.cjs',
   'benchmark/reviewed-execution-contract.cjs',
   'benchmark/reviewed-execution-runner.cjs',
+  'benchmark/reviewed-execution-live-runner.cjs',
 ]);
 
 function candidateDigest(repositoryRoot = path.resolve(__dirname, '..')) {

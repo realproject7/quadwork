@@ -33,10 +33,11 @@ const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
-const { WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
-// #1115 remains structurally prepared only. A later reviewed ticket must add
-// the fresh-review and Actions/cache/artifact gate before this can be enabled.
-const REVIEWED_EXECUTION_LIVE_ENABLED = false;
+const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
+// #1117's no-input runner is the only production caller. Generic HTTP/config
+// starts are denied even when an otherwise-valid reviewed role is configured.
+const REVIEWED_EXECUTION_LIVE_ENABLED = true;
+const reviewedExecutionLaunchKeys = new Set();
 
 function reviewedExecutionFor(projectId, agentId, agentCfg) {
   const id = agentCfg?.reviewed_execution_id;
@@ -2300,6 +2301,7 @@ async function launchAgentPty(project, agent, opts = {}) {
 
     const agentCfg = readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {};
     const reviewedExecution = reviewedExecutionFor(project, agent, agentCfg);
+    if (reviewedExecution && !reviewedExecutionLaunchKeys.has(key)) throw new Error("reviewed_execution_caller_unauthorized");
     const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
     const extraEnv = buildAgentEnv(project, agent);
     // #565: buildAgentArgs is inside try-catch so registration failures
@@ -2516,6 +2518,24 @@ function spawnAgentPty(project, agent, opts = {}) {
   void operation.then(() => pendingAgentLaunches.delete(operation), () => pendingAgentLaunches.delete(operation));
   return operation;
 }
+
+// No HTTP route and no caller-controlled command/model/config/PTY input. The
+// #1117 runner invokes one of these source-fixed entries after its external PO
+// receipt recheck. The ephemeral capability blocks ordinary start/restart APIs.
+async function spawnReviewedExecution(role) {
+  const fixed = role === "benchmark_codex" || role === "benchmark_claude" ? role : null;
+  if (!fixed) throw new Error("reviewed_execution_role_invalid");
+  const key = `${REVIEWED_EXECUTION_PROJECT}/${fixed}`;
+  reviewedExecutionLaunchKeys.add(key);
+  try {
+    return await spawnAgentPty(REVIEWED_EXECUTION_PROJECT, fixed, {
+      lifecycleSource: "operator_start", operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true,
+    });
+  } finally { reviewedExecutionLaunchKeys.delete(key); }
+}
+
+function spawnReviewedCodex() { return spawnReviewedExecution("benchmark_codex"); }
+function spawnReviewedClaude() { return spawnReviewedExecution("benchmark_claude"); }
 
 async function admitAgentPty(project, agent, opts = {}) {
   // Preserve the project lifecycle barrier before evaluating source authority:
@@ -4756,6 +4776,8 @@ module.exports = {
   watchdogCheck,
   markSessionExited,
   spawnAgentPty,
+  spawnReviewedCodex,
+  spawnReviewedClaude,
   stopAgentSession,
   cleanupProjectRuntime,
   projectLifecycle,
