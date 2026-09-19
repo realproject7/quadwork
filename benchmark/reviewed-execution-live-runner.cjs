@@ -13,6 +13,7 @@ const { execFileSync } = require('node:child_process');
 const contract = require('./reviewed-execution-contract.cjs');
 const productPath = require('./v2-product-path-core.cjs');
 const profiles = require('../server/reviewed-execution-profiles');
+const runnerBridge = require('../server/reviewed-execution-runner-bridge');
 
 const GATE_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-gates');
 const LEDGER_PARENT = path.join(os.homedir(), 'Library', 'Application Support', 'QuadWork', 'reviewed-execution-ledger-parent');
@@ -188,16 +189,17 @@ async function attempt(profile, dependencies = {}) {
       // runner passes no command, argv, environment, config, lifecycle, or PTY input.
       await runtime.buildAgentArgs(profiles.PROJECT, profile.role); runtime.buildAgentEnv(profiles.PROJECT, profile.role);
       providerTurns = 1;
-      const launched = await (profile.backend === 'codex' ? runtime.runReviewedCodex() : runtime.runReviewedClaude());
+      const reviewedBridge = dependencies.runnerBridge || runnerBridge;
+      const launched = await (profile.backend === 'codex' ? reviewedBridge.runReviewedCodex() : reviewedBridge.runReviewedClaude());
       if (!launched?.ok) return { result_class: 'launch_failed' };
-      const session = runtime.agentSessions?.get(`${profiles.PROJECT}/${profile.role}`);
-      if (!session?.term || typeof session.term.onData !== 'function') return { result_class: 'launch_indeterminate' };
-      session.term.onData(chunk => { outputBytes += Buffer.byteLength(chunk); if (outputBytes > MAX_OUTPUT_BYTES) { capped = true; return; } output += String(chunk); });
+      const session = launched?.reviewed_session;
+      if (!session || typeof session.onData !== 'function' || typeof session.writeFixedWorkload !== 'function') return { result_class: 'launch_indeterminate' };
+      session.onData(chunk => { outputBytes += Buffer.byteLength(chunk); if (outputBytes > MAX_OUTPUT_BYTES) { capped = true; return; } output += String(chunk); });
       // Re-read both facts immediately before the one fixed private PTY write.
       const finalFacts = factsFor(repository); gateReader(profile, finalFacts, dependencies.gate_parent || GATE_PARENT);
       if (finalFacts.expected_head !== facts.expected_head || finalFacts.candidate_digest !== facts.candidate_digest || capped) return { result_class: 'attempt_indeterminate' };
       rechecked = true;
-      try { session.term.write(profiles.WORKLOAD + '\n'); } catch { return { result_class: 'attempt_indeterminate' }; }
+      try { session.writeFixedWorkload(); } catch { return { result_class: 'attempt_indeterminate' }; }
       const deadline = now() + MAX_ELAPSED_MS;
       while (now() < deadline && !capped && !sentinel) { sentinel = output.split(/\r?\n/).includes('QUADWORK_V2_PRODUCT_PATH_OK'); await (dependencies.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms))))(25); }
       // The durable lifecycle file is the source of truth. An in-memory state

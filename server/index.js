@@ -35,12 +35,13 @@ const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
 const { PROJECT: REVIEWED_EXECUTION_PROJECT, WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
 const { assertReviewedExecutionGate } = require("./reviewed-execution-gate");
+const reviewedRunnerBridge = require("./reviewed-execution-runner-bridge");
 // #1117's no-input runner is the only production caller. Generic HTTP/config
 // starts are denied even when an otherwise-valid reviewed role is configured.
 const REVIEWED_EXECUTION_LIVE_ENABLED = true;
 // This permit set is closure-private: no config, HTTP request, exported API,
 // or importable module can mint a value for generic start/reset/restart paths.
-const reviewedExecutionFixedLaunches = new Set();
+const reviewedExecutionFixedLaunches = new WeakSet();
 
 function reviewedExecutionFor(projectId, agentId, agentCfg) {
   const id = agentCfg?.reviewed_execution_id;
@@ -255,7 +256,7 @@ app.get("/api/session-token", (req, res) => {
 // --- Safe PTY write helper (#670) ---
 
 function safeWrite(term, data) {
-  if (shuttingDown || !term) return false;
+  if (shuttingDown || !term || term._reviewedExecution === true) return false;
   try { term.write(data); return true; }
   catch (err) {
     if (err.code === "EIO") return false;
@@ -2305,7 +2306,8 @@ async function launchAgentPty(project, agent, opts = {}) {
     const agentCfg = readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {};
     const reviewedExecution = reviewedExecutionFor(project, agent, agentCfg);
     if (reviewedExecution) {
-      if (!reviewedExecutionFixedLaunches.has(key)) throw new Error("reviewed_execution_fixed_runner_required");
+      if (!reviewedExecutionFixedLaunches.has(opts.reviewedExecutionPermit)) throw new Error("reviewed_execution_fixed_runner_required");
+      reviewedExecutionFixedLaunches.delete(opts.reviewedExecutionPermit);
       assertReviewedExecutionGate(reviewedExecution, reviewedExecutionBinding(agentCfg));
     }
     const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
@@ -2351,6 +2353,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       projectId: project,
       agentId: agent,
       term,
+      reviewedExecution: !!reviewedPlan,
       viewers: new Set(),
       viewerDims: new Map(),
       lastDims: null,
@@ -2375,6 +2378,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       // #538: scrollback is scrubbed of likely secrets before replay.
       scrollback: Buffer.alloc(0),
     };
+    if (reviewedPlan) Object.defineProperty(term, '_reviewedExecution', { value: true, configurable: false });
     agentSessions.set(key, session);
 
     if (!opts.suppressLifecycleMsg) {
@@ -2530,14 +2534,17 @@ function spawnAgentPty(project, agent, opts = {}) {
 async function runReviewedExecution(role) {
   const fixed = role === "benchmark_codex" || role === "benchmark_claude" ? role : null;
   if (!fixed) throw new Error("reviewed_execution_role_invalid");
-  const key = `${REVIEWED_EXECUTION_PROJECT}/${fixed}`;
-  reviewedExecutionFixedLaunches.add(key);
-  try { return await spawnAgentPty(REVIEWED_EXECUTION_PROJECT, fixed, { lifecycleSource: "operator_start", operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true }); }
-  finally { reviewedExecutionFixedLaunches.delete(key); }
+  const permit = Object.freeze({}); reviewedExecutionFixedLaunches.add(permit);
+  const launched = await spawnAgentPty(REVIEWED_EXECUTION_PROJECT, fixed, { lifecycleSource: "operator_start", operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true, reviewedExecutionPermit: permit });
+  const session = agentSessions.get(`${REVIEWED_EXECUTION_PROJECT}/${fixed}`);
+  if (!launched?.ok || !session?.term) return launched;
+  return Object.freeze({ ...launched, reviewed_session: Object.freeze({ onData: listener => session.term.onData(listener), writeFixedWorkload: () => session.term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`) }) });
 }
 
 function runReviewedCodex() { return runReviewedExecution("benchmark_codex"); }
 function runReviewedClaude() { return runReviewedExecution("benchmark_claude"); }
+
+reviewedRunnerBridge.installFixedRunnerEntries({ codex: runReviewedCodex, claude: runReviewedClaude });
 
 async function admitAgentPty(project, agent, opts = {}) {
   // Preserve the project lifecycle barrier before evaluating source authority:
@@ -4778,8 +4785,6 @@ module.exports = {
   watchdogCheck,
   markSessionExited,
   spawnAgentPty,
-  runReviewedCodex,
-  runReviewedClaude,
   stopAgentSession,
   cleanupProjectRuntime,
   projectLifecycle,
@@ -4814,7 +4819,6 @@ module.exports = {
   restartAgentSession,
   _test: Object.freeze({ installLifecycleTestFixture }),
 };
-module.exports.agentSessions = agentSessions; // #972: test seam for shutdown() PTY cleanup
 module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test seam
 module.exports.headControlRuntime = headControlRuntime; // #1044: Head-token registration test seam
 module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation test seam

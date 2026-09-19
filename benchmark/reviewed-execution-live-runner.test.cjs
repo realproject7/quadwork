@@ -54,7 +54,7 @@ test('fake-only fixed V2 chain has no caller-provided prompt/argv/env and consum
   };
   const result = await runner.testHooks.attempt(profile, {
     sourceFacts: () => facts, readGateReceipt: () => ({ receipt_digest: 'd'.repeat(64) }), removeOwnedRoot: () => true,
-    writeIsolatedConfig: () => ({ home: '/tmp', config_digest: 'e'.repeat(64) }), disposableRootFacts: () => ({ root_digest: 'f'.repeat(64), entry_digest: 'f'.repeat(64), entry_count: 0, entries: [], remote_count: 0, changed_entry_count: 0 }), durableStopProof: () => true, readDurableLifecycle: () => ({ roles: { [profile.role]: { state: 'verified' } } }), runtime,
+    writeIsolatedConfig: () => ({ home: '/tmp', config_digest: 'e'.repeat(64) }), disposableRootFacts: () => ({ root_digest: 'f'.repeat(64), entry_digest: 'f'.repeat(64), entry_count: 0, entries: [], remote_count: 0, changed_entry_count: 0 }), durableStopProof: () => true, readDurableLifecycle: () => ({ roles: { [profile.role]: { state: 'verified' } } }), runtime, runnerBridge: { runReviewedClaude: async () => { calls.push(['spawn']); return { ok: true, reviewed_session: { onData: term.onData.bind(term), writeFixedWorkload: () => term.write(profiles.WORKLOAD + '\n') } }; } },
     prepare: async () => ({ root: '/fake', preflight: { result_class: 'preflight_ready' }, config: {} }),
   });
   assert.equal(wrote, profiles.WORKLOAD + '\n'); assert.equal(result.result_class, 'completed'); assert.equal(result.provider_turns, 1);
@@ -66,7 +66,7 @@ test('fake source or receipt drift immediately before the fixed write is consume
   const runtime = { agentSessions: new Map([[`${profiles.PROJECT}/${profile.role}`, { term, lifecycleState: 'verified' }]]), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), runReviewedClaude: async () => ({ ok: true }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
   const result = await runner.testHooks.attempt(profile, {
     sourceFacts: () => (++factReads === 1 ? facts : { ...facts, expected_head: 'c'.repeat(40) }), readGateReceipt: () => ({ receipt_digest: 'd'.repeat(64) }), removeOwnedRoot: () => true,
-    writeIsolatedConfig: () => ({ home: '/tmp' }), disposableRootFacts: () => ({ root_digest: 'f'.repeat(64), entry_digest: 'f'.repeat(64), entry_count: 0, entries: [], remote_count: 0, changed_entry_count: 0 }), durableStopProof: () => true, runtime, prepare: async () => ({ root: '/fake', preflight: { result_class: 'preflight_ready' }, config: {} }),
+    writeIsolatedConfig: () => ({ home: '/tmp' }), disposableRootFacts: () => ({ root_digest: 'f'.repeat(64), entry_digest: 'f'.repeat(64), entry_count: 0, entries: [], remote_count: 0, changed_entry_count: 0 }), durableStopProof: () => true, runtime, runnerBridge: { runReviewedClaude: async () => ({ ok: true, reviewed_session: { onData: term.onData.bind(term), writeFixedWorkload: () => term.write(profiles.WORKLOAD + '\n') } }) }, prepare: async () => ({ root: '/fake', preflight: { result_class: 'preflight_ready' }, config: {} }),
   });
   assert.equal(wrote, false); assert.equal(result.provider_turns, 1); assert.equal(result.result_class, 'attempt_indeterminate');
 });
@@ -75,7 +75,7 @@ test('fake timeout, remote-style rejection, lifecycle failure, output cap, and c
   const base = (runtime, extra = {}) => runner.testHooks.attempt(profile, {
     sourceFacts: () => facts, readGateReceipt: () => ({ receipt_digest: 'd'.repeat(64) }), removeOwnedRoot: () => true,
     writeIsolatedConfig: () => ({ home: '/tmp' }), disposableRootFacts: () => ({ root_digest: 'f'.repeat(64), entry_digest: 'f'.repeat(64), entry_count: 0, entries: [], remote_count: 0, changed_entry_count: 0 }), durableStopProof: () => true,
-    prepare: async () => ({ root: '/fake', preflight: { result_class: 'preflight_ready' }, config: {} }), runtime, ...extra,
+    prepare: async () => ({ root: '/fake', preflight: { result_class: 'preflight_ready' }, config: {} }), runtime, runnerBridge: { runReviewedClaude: async () => { const session = runtime.agentSessions.get(`${profiles.PROJECT}/${profile.role}`); return session ? { ok: true, reviewed_session: { onData: session.term.onData.bind(session.term), writeFixedWorkload: () => session.term.write(profiles.WORKLOAD + '\n') } } : { ok: false }; } }, ...extra,
   });
   const rejected = { agentSessions: new Map(), buildAgentArgs: async () => ({}), buildAgentEnv: () => ({}), runReviewedClaude: async () => ({ ok: false }), stopAgentSession: async () => ({ ok: true }), shutdown: async () => ({ ok: true }) };
   assert.equal((await base(rejected)).result_class, 'launch_failed');
@@ -103,5 +103,5 @@ test('live source has exactly two no-input entry points, bounded in-memory outpu
   assert.match(source, /MAX_OUTPUT_BYTES = 16 \* 1024/); assert.match(source, /const finalFacts = factsFor\(repository\); gateReader/);
   assert.doesNotMatch(source, /createGate|writeGate|app\.post|http\.request|spawn\(/);
   const server = fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'), 'utf8');
-  assert.match(server, /reviewedExecutionFixedLaunches/); assert.match(server, /reviewed_execution_fixed_runner_required/); assert.match(server, /function runReviewedCodex\(\)/); assert.match(server, /function runReviewedClaude\(\)/); assert.equal(Object.hasOwn(require('./reviewed-execution-live-runner.cjs'), 'testHooks'), false);
+  assert.match(server, /reviewedExecutionFixedLaunches/); assert.match(server, /reviewed_execution_fixed_runner_required/); assert.match(server, /function runReviewedCodex\(\)/); assert.match(server, /function runReviewedClaude\(\)/); assert.match(server, /term\._reviewedExecution === true/); assert.doesNotMatch(server.slice(server.indexOf('module.exports = {')), /runReviewedCodex|runReviewedClaude|agentSessions/); assert.equal(Object.hasOwn(require('./reviewed-execution-live-runner.cjs'), 'testHooks'), false);
 });
