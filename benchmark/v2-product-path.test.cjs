@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const core = require('./v2-product-path-core.cjs');
 
@@ -74,6 +74,7 @@ test('worker source has no provider-configurable pty or admission dependency sea
   assert.match(source, /if \(!preflight\(\)\).*preflight_blocked[\s\S]*spawnAgentPty/);
   assert.match(source, /finally[\s\S]*stopAgentSession[\s\S]*runtime\.shutdown[\s\S]*postFacts/);
   assert.match(source, /workerAuthorization\(root\)[\s\S]*validateExecutable\(\)[\s\S]*product_path_source_changed[\s\S]*require\('\.\.\/server\/index\.js'\)/);
+  assert.match(source, /if \(!preflight\(\)\)[\s\S]*require\('\.\.\/server\/index\.js'\)/, 'dependency loading occurs only after the zero-turn preflight');
 });
 
 test('worker authorization is one-shot, root-owned, and its marker becomes part of the exact root layout', () => {
@@ -85,6 +86,14 @@ test('worker authorization is one-shot, root-owned, and its marker becomes part 
     fs.writeFileSync(path.join(root, '.worker-authority'), '0'.repeat(64) + '\n', { mode: 0o600 });
     assert.notEqual(fs.readFileSync(path.join(root, '.worker-authority'), 'utf8'), require('node:crypto').createHash('sha256').update(authorization.nonce).digest('hex') + '\n');
   } finally { cleanup(directory); }
+});
+
+test('parent waits through the full acknowledged worker cleanup grace before escalation', async () => {
+  const child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>setTimeout(()=>{process.stdout.write('PRODUCT_PATH_RESULT {\\\"result_class\\\":\\\"timeout\\\",\\\"cleanup_ok\\\":true}\\n');process.exit(0)},6000));setInterval(()=>{},1000)"], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const result = await core.testHooks.workerResult(child, 100);
+  assert.equal(result.result_class, 'timeout'); assert.equal(result.cleanup_ok, true);
+  assert.throws(() => process.kill(child.pid, 0), /ESRCH/, 'worker exits after its own cleanup acknowledgement, not parent SIGKILL');
+  assert.equal(core.WORKER_CLEANUP_GRACE_MS >= 15_000, true);
 });
 
 test('fake CLI traverses the real V2 spawnAgentPty admission and PTY lifecycle without a fixture seam', () => {

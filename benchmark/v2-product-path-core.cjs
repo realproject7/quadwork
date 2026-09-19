@@ -21,6 +21,10 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const OWNED_ROOTS = new Set();
 const OWNED_EVIDENCE = new Set();
 const CAPS = Object.freeze({ max_elapsed_ms: 45_000, max_output_bytes: 16 * 1024, max_provider_turns: 1 });
+// Worker cleanup has two independently bounded six-second operations. The
+// parent must never SIGKILL during that acknowledged cleanup window.
+const WORKER_CLEANUP_GRACE_MS = 15_000;
+const WORKER_TIMEOUT_MS = 90_000;
 const WORKLOAD = 'Return exactly QUADWORK_PRODUCT_PATH_OK. Do not use tools. Do not read, write, or change files.';
 
 const ADAPTERS = Object.freeze({
@@ -143,7 +147,7 @@ function workerResult(child, timeoutMs) {
     let bytes = 0, overflow = false, buffer = ''; let settled = false;
     const finish = value => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
     let escalating = false;
-    const gracefulStop = () => { try { child.kill('SIGTERM'); } catch {} setTimeout(() => { if (child.exitCode === null) { escalating = true; try { child.kill('SIGKILL'); } catch {} } }, 5_000).unref?.(); };
+    const gracefulStop = () => { try { child.kill('SIGTERM'); } catch {} setTimeout(() => { if (child.exitCode === null) { escalating = true; try { child.kill('SIGKILL'); } catch {} } }, WORKER_CLEANUP_GRACE_MS).unref?.(); };
     const timer = setTimeout(() => { gracefulStop(); }, timeoutMs); timer.unref?.();
     const observe = chunk => { bytes += Buffer.byteLength(chunk); if (bytes > CAPS.max_output_bytes) { overflow = true; gracefulStop(); return; } buffer += chunk.toString('utf8'); };
     child.stdout.on('data', observe); child.stderr.on('data', observe);
@@ -155,8 +159,8 @@ async function runReviewedProductPath(value) {
   exact(value, ['adapter', 'parent_dir'], 'product_path_run_shape'); const adapter = ADAPTERS[value.adapter]; required(adapter, 'product_path_adapter_not_supported'); required(safePath(value.parent_dir), 'product_path_run_shape');
   const root = createRoot({ parent_dir: value.parent_dir }); const evidence = createEvidence(root); const exec = executable(adapter); const authorization = workerAuthorization(root); repositoryFacts(root); const port = await freePort(); const config = configFor(adapter, root, port); const locations = writeConfig(root, config); const sourceDigest = digest(fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'))); const started = Date.now();
   const child = spawn(process.execPath, [path.join(__dirname, 'v2-product-path-worker.cjs'), adapter.id], { cwd: path.join(__dirname, '..'), env: safeEnvironment(locations.home), stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true }); child.stdin.end(JSON.stringify({ nonce: authorization.nonce, source_digest: sourceDigest }) + '\n');
-  const result = await workerResult(child, CAPS.max_elapsed_ms + 15_000); const report = redactedReport(adapter, exec, { ...result, source_digest: sourceDigest, elapsed_ms: Date.now() - started, config_isolated: fs.existsSync(locations.config) && path.dirname(locations.config) !== path.join(os.homedir(), '.quadwork') }); persist(evidence, report);
+  const result = await workerResult(child, WORKER_TIMEOUT_MS); const report = redactedReport(adapter, exec, { ...result, source_digest: sourceDigest, elapsed_ms: Date.now() - started, config_isolated: fs.existsSync(locations.config) && path.dirname(locations.config) !== path.join(os.homedir(), '.quadwork') }); persist(evidence, report);
   return Object.freeze({ evidence_directory: evidence, report });
 }
 
-module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, ProductPathError, ROOT_MARKER, WORKLOAD, createDisposableProductPathRoot: createRoot, noUnsafeArgs, runReviewedProductPath, safeEnvironment, testHooks: Object.freeze({ checkedRoot, configFor, createEvidence, executable, persist, redactedReport, repositoryFacts, safeChild, workerAuthorization, workerResult, writeConfig }) });
+module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, ProductPathError, ROOT_MARKER, WORKER_CLEANUP_GRACE_MS, WORKER_TIMEOUT_MS, WORKLOAD, createDisposableProductPathRoot: createRoot, noUnsafeArgs, runReviewedProductPath, safeEnvironment, testHooks: Object.freeze({ checkedRoot, configFor, createEvidence, executable, persist, redactedReport, repositoryFacts, safeChild, workerAuthorization, workerResult, writeConfig }) });

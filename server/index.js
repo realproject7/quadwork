@@ -33,6 +33,20 @@ const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
+
+function benchmarkCommandIdentity(projectId, agentId, agentCfg) {
+  // Only the executor-owned #1113 project can name a versioned resolved
+  // binary whose basename loses the provider identity. This does not create a
+  // general configuration selector for production projects.
+  if (projectId !== "benchmark-product-path") return null;
+  if (agentId === "benchmark_codex" && agentCfg?.command_identity === "codex") return "codex";
+  if (agentId === "benchmark_claude" && agentCfg?.command_identity === "claude") return "claude";
+  return null;
+}
+
+function configuredCliBase(projectId, agentId, agentCfg, command) {
+  return benchmarkCommandIdentity(projectId, agentId, agentCfg) || command.split("/").pop().split(" ")[0];
+}
 const { createHeadControlRuntime } = require("./head-control-runtime");
 const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identity-resolver");
 const { createManagedWorktreeObserver } = require("./work-task-managed-worktree");
@@ -2109,10 +2123,7 @@ async function buildAgentArgs(projectId, agentId) {
   // A versioned resolved Claude executable has no provider-shaped basename.
   // This exception is deliberately limited to the owned #1113 benchmark role;
   // normal configuration cannot select a conflicting argument grammar.
-  const benchmarkIdentity = projectId === "benchmark-product-path"
-    && ((agentId === "benchmark_codex" && agentCfg.command_identity === "codex") || (agentId === "benchmark_claude" && agentCfg.command_identity === "claude"))
-    ? agentCfg.command_identity : null;
-  const cliBase = benchmarkIdentity || command.split("/").pop().split(" ")[0];
+  const cliBase = configuredCliBase(projectId, agentId, agentCfg, command);
   const args = [];
 
   // Permission bypass flags
@@ -2208,10 +2219,7 @@ function buildAgentEnv(projectId, agentId) {
 
   const agentCfg = project.agents?.[agentId] || {};
   const command = agentCfg.command || "claude";
-  const benchmarkIdentity = projectId === "benchmark-product-path"
-    && ((agentId === "benchmark_codex" && agentCfg.command_identity === "codex") || (agentId === "benchmark_claude" && agentCfg.command_identity === "claude"))
-    ? agentCfg.command_identity : null;
-  const cliBase = benchmarkIdentity || command.split("/").pop().split(" ")[0];
+  const cliBase = configuredCliBase(projectId, agentId, agentCfg, command);
   const env = {};
 
   // Gemini: inject MCP via env var
@@ -2301,7 +2309,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       // the Claude TUI repaints continuously while idle. Derived with the same
       // helper the spawn/arg paths use, so "claude", "/usr/bin/claude" and
       // "claude --foo" all resolve to "claude".
-      backend: cliBaseFromCommand(command),
+      backend: configuredCliBase(project, agent, readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {}, command),
       lastOutputAt: Date.now(),
       // #418: ring buffer of recent PTY output so reconnecting WS
       // clients see the terminal state instead of a blank panel.

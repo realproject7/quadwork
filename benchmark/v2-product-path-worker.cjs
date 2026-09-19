@@ -9,7 +9,6 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
-const { WebSocket } = require('ws');
 const core = require('./v2-product-path-core.cjs');
 const reviewed = require('./live-provider-reviewed-contracts.cjs');
 
@@ -35,6 +34,7 @@ function request(method, pathname, token, body, timeoutMs = 5_000) {
 async function waitForHealth() { for (let i = 0; i < 160; i++) { if (abort) throw new Error('product_path_aborted'); try { if ((await request('GET', '/api/health', null, undefined, 500)).status === 200) return; } catch {} await sleep(25); } throw new Error('product_path_server_unavailable'); }
 function terminalObservation(token) {
   let ws, finish;
+  const { WebSocket } = require('ws');
   const result = new Promise((resolve, reject) => {
     let bytes = 0, output = crypto.createHash('sha256'), tail = '', settled = false;
     finish = value => { if (!settled) { settled = true; clearTimeout(timer); try { ws?.close(); } catch {} resolve(value); } };
@@ -89,12 +89,16 @@ function lifecycleState() { try { const state = JSON.parse(fs.readFileSync(path.
 async function main() {
   if (!adapter) throw new Error('product_path_worker_shape'); const root = path.dirname(process.env.HOME || ''); const authorization = workerAuthorization(root); safeDirectory(process.env.HOME, root, 'product_path_home_unsafe'); validateExecutable();
   if (digest(fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'))) !== authorization.source_digest) throw new Error('product_path_source_changed');
-  const runtime = require('../server/index.js'), config = require('../server/config.js').readConfig(); port = config.port; if (!Number.isSafeInteger(port) || port <= 0 || port >= 65536) throw new Error('product_path_port_unsafe'); validateConfigHome(root, config); await waitForHealth();
-  const preFacts = rootFacts(root), built = await runtime.buildAgentArgs(project, adapter.role), additional = runtime.buildAgentEnv(project, adapter.role), effectiveEnv = { ...process.env, ...additional }; core.noUnsafeArgs(built.args, effectiveEnv);
-  const base = { argument_profile_digest: digest(JSON.stringify(built.args)), environment_profile_digest: digest(JSON.stringify(Object.keys(effectiveEnv).sort().map(key => [key, effectiveEnv[key]]))), pre_root_facts: preFacts, external_process_started: false, lifecycle_state: 'unverified' };
-  const started = Date.now(); let launched = null, observation = null, outcome = { ...base, result_class: 'worker_failed' };
+  const config = require('../server/config.js').readConfig(); port = config.port; if (!Number.isSafeInteger(port) || port <= 0 || port >= 65536) throw new Error('product_path_port_unsafe'); validateConfigHome(root, config);
+  const preFacts = rootFacts(root), base = { pre_root_facts: preFacts, external_process_started: false, lifecycle_state: 'unverified' };
+  const started = Date.now(); let runtime = null, launched = null, observation = null, outcome = { ...base, result_class: 'worker_failed' };
   try {
     if (!preflight()) { outcome = { ...base, result_class: 'preflight_blocked' }; return outcome; }
+    try { runtime = require('../server/index.js'); } catch { outcome = { ...base, result_class: 'initialization_blocked' }; return outcome; }
+    await waitForHealth();
+    const built = await runtime.buildAgentArgs(project, adapter.role), additional = runtime.buildAgentEnv(project, adapter.role), effectiveEnv = { ...process.env, ...additional }; core.noUnsafeArgs(built.args, effectiveEnv);
+    const environmentEntries = Object.keys(effectiveEnv).sort().map(key => [key, effectiveEnv[key]]);
+    Object.assign(base, { argument_profile_digest: digest(JSON.stringify(built.args)), environment_profile_digest: digest(JSON.stringify(environmentEntries)) });
     launched = await bounded(runtime.spawnAgentPty(project, adapter.role, { lifecycleSource: 'operator_start', operatorAuthorized: true, explicitRole: true, suppressLifecycleMsg: true }), 10_000, 'product_path_spawn_timeout');
     if (!launched.ok) { outcome = { ...base, result_class: 'preflight_blocked' }; return outcome; }
     observation = terminalObservation(config.session_token); currentObservation = observation;
@@ -106,7 +110,7 @@ async function main() {
   finally {
     observation?.close(); currentObservation = null; let stopped = { ok: true }, shutdown = { ok: true }, postFacts = null;
     try { if (launched?.ok) stopped = await bounded(runtime.stopAgentSession(`${project}/${adapter.role}`, { suppressLifecycleMsg: true, removeEntry: true }), 6_000, 'product_path_stop_timeout'); } catch { stopped = { ok: false }; }
-    try { shutdown = await bounded(runtime.shutdown(), 6_000, 'product_path_shutdown_timeout'); } catch { shutdown = { ok: false }; }
+    try { if (runtime) shutdown = await bounded(runtime.shutdown(), 6_000, 'product_path_shutdown_timeout'); } catch { shutdown = { ok: false }; }
     try { postFacts = rootFacts(root); } catch {}
     Object.assign(outcome, { post_root_facts: postFacts, cleanup_ok: stopped.ok === true && shutdown.ok === true && postFacts !== null, elapsed_ms: Date.now() - started });
   }
