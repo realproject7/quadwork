@@ -56,7 +56,7 @@ the tag, record these read-only account-usage checks:
 gh api repos/realproject7/quadwork/actions/permissions
 gh api repos/realproject7/quadwork/actions/cache/usage
 gh api --paginate --slurp repos/realproject7/quadwork/actions/artifacts \
-  -q '[.[].artifacts[]|select(.expired==false)|.size_in_bytes]|add // 0'
+  | jq '[.[].artifacts[]|select(.expired==false)|.size_in_bytes]|add // 0'
 ```
 
 The permission result must remain `enabled: false`; cache and artifact values
