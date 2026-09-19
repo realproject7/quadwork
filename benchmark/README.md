@@ -9,6 +9,9 @@ node benchmark/preflight.cjs \
 node --test benchmark/preflight.test.cjs
 node benchmark/evidence.cjs --ledger /path/to/ledger.json
 node --test benchmark/evidence.test.cjs
+node benchmark/v1-zero-actions.cjs --repo .
+node --test benchmark/v1-zero-actions.test.cjs
+node --test benchmark/v2-workload-adapter.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -63,3 +66,22 @@ provider supplies a candidate. `WORKLOAD.json`, the adapter, and the acceptance
 test are designated read-only inputs; the future adapter must record their
 digests before and after every assignment. The fixtures do not start QuadWork,
 call a provider, create a repository, or constitute a live benchmark.
+
+`v1-zero-actions.cjs` is a separate read-only source-policy audit for the
+shipped V1 tag. It proves only that V1's source-level ready predicate does not
+require a check result. Its report deliberately leaves Mode 1 unproved because
+branch protection and the complete disposable-repository delivery path require
+a later live exercise. See
+[`docs/v2-v1-zero-actions-feasibility.md`](../docs/v2-v1-zero-actions-feasibility.md).
+
+`v2-workload-adapter.cjs` maps a parsed fixture plus caller-supplied ticket
+bindings into V2's real frozen WorkTask manifest and in-memory
+pipeline primitives. It cannot invent ticket identities from the fixture. Its
+local contract test creates temporary Git worktrees and real V2 candidate
+objects, then proves the pipeline fixture can build B1 while A1 is under
+independent review and the overlap fixture refuses A2 before A1 is accepted.
+It rejects task paths that overlap the fixture's declared read-only inputs. It
+is replay coverage only: it does not attest that caller-supplied bindings were
+observed, start the server, use authenticated
+HTTP/MCP routes, launch a model, produce an authentic reviewer identity, or
+qualify as a live benchmark observation.

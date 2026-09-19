@@ -83,6 +83,15 @@ observation. A V1 local-policy adaptation is a changed experimental condition
 that requires an explicit contract decision before a total-improvement claim.
 Missing matched baseline evidence leaves the corresponding release gate open.
 
+The checked-in V1 source audit establishes a narrower result: the V1 dashboard
+computes `ready` from two role-attributed approvals without using its displayed
+check-rollup data. It does not audit Head's actual merge decision, establish
+candidate freshness, show that a target repository's branch protection accepts
+that path, or prove a real V1 delivery with Actions disabled. Its report is
+therefore `dashboard_readiness_without_check_result_delivery_unproved`, and the manifest stays
+`mode_1_zero_actions_feasibility: "unproved"` until the bounded live exercise
+completes.
+
 ## Task bundle and safety scenarios
 
 Build a small, dependency-free single-repository Node fixture project with real
