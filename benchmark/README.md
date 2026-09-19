@@ -156,9 +156,10 @@ weaken, or interpret the preparation protocol. Its frozen registry has exactly
 those two adapters, with a pinned model and noninteractive tool-disabled or
 read-only argv profile for each. A caller cannot supply a model, argv, shell
 command, provider alias, or JSON authorization. A source-controlled reviewed
-execution registry binds the base, harness, source, and workload digests plus
-the wrapper path, resolved executable digest, and CLI version digest before a
-provider turn. A zero-exit process also must return exactly the fixed
+execution registry binds the wrapper path, resolved executable digest, and CLI
+version digest before a provider turn. The observation records current harness,
+source, and workload digests without claiming an independently verified delivery
+base. A zero-exit process also must return exactly the fixed
 `QUADWORK_LIVE_OK` sentinel on stdout with no stderr; the raw response is never
 retained.
 
