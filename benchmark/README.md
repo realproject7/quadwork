@@ -178,3 +178,22 @@ target freeze, a delivery claim, Actions, a release recommendation, a version
 change, or npm publish. A future backend such as Grok needs a reviewed source
 change adding one static adapter, a pinned model, a safe argv profile, and
 equivalent fake-CLI tests. It cannot be enabled by JSON or config.
+
+`v2-product-path-core.cjs` is a distinct #1113 baseline boundary. It does not
+weaken or import the calibration protocol or executor. Before an authenticated
+turn it creates an executor-owned `0700` temporary root, local no-remote Git
+repository, and isolated `HOME/.quadwork/config.json`; the normal operator
+`~/.quadwork` state is neither read nor written. The config has only one static
+reviewed Codex or Claude identity, exact model, a disposable cwd,
+`auto_approve:false`, and `mcp_inject:"none"`. The worker imports the unmodified
+V2 server and uses its real `buildAgentArgs`, `buildAgentEnv`, `spawnAgentPty`,
+lifecycle admission, PTY, and stop paths. It rejects MCP/token/proxy and
+permission-bypass results before a provider prompt is written.
+
+The artifact records only redacted digests and terminal facts. It never stores
+the prompt, output, token, config bytes, absolute paths, authentication data,
+or raw terminal data. Fake-only tests cover the config and root isolation,
+argument rejection, static identities, report redaction, ownership, and the
+absence of a production dependency-injection seam. A live run remains bounded
+to one turn, requires post-merge review approval, and cannot authorize Actions,
+remote Git, versioning, release, or npm publication.
