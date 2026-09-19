@@ -11,9 +11,10 @@ const runner = require('./reviewed-execution-live-runner.cjs');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
 function reportHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', 'module.exports = Object.freeze({ report });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function activeHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = 'let __removed = 0, __match = true; sourceFacts = () => fixed.facts; readGateReceipt = () => fixed.gate; rootFacts = () => ({ entries: ["base"], root_digest: "a".repeat(64), entry_digest: "a".repeat(64), entry_count: 1 }); rootMatches = () => __match; removeOwnedRoot = () => { __removed += 1; return true; }; module.exports = Object.freeze({ set(state, match) { fixed = state; parentAdmitted = true; __match = match; }, completeFixedChild, removed: () => __removed });'; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
-function exitRaceHarness() {
+function resultHarness(mode) {
   const filename = path.join(__dirname, 'reviewed-execution-live-runner.cjs');
   const fakeFork = `const { EventEmitter } = require('node:events');
+const resultHarnessMode = ${JSON.stringify(mode)};
 const fork = (file, args, options) => {
   const child = new EventEmitter(); let secret = null;
   child.stdio = [null, null, null, null, { end(value) {
@@ -27,7 +28,11 @@ const fork = (file, args, options) => {
     const profile = profiles.PROFILES.v2_codex_readonly_v1;
     const facts = { root_digest: 'a'.repeat(64), entry_digest: 'b'.repeat(64), entry_count: 1, remote_count: 0, changed_entry_count: 0 };
     const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: 'completed', provider_turns: 1, lifecycle_verified: true, sentinel_digest: 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: true, survivor_free: true, source_rechecked_before_prompt: true, gate_rechecked_before_prompt: true, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
-    process.nextTick(() => { child.emit('exit', 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
+    if (resultHarnessMode === 'duplicate') {
+      queueMicrotask(() => { child.emit('message', { type: 'reviewed_execution_result', report }); child.emit('exit', 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report: { ...report, output_bytes: 7 } })); });
+    } else {
+      process.nextTick(() => { child.emit('exit', 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
+    }
     return true;
   };
   return child;
@@ -37,6 +42,8 @@ const fork = (file, args, options) => {
     .replace('module.exports = Object.freeze({ runReviewedCodex, runReviewedClaude });', 'module.exports = Object.freeze({ run: runReviewedCodex });');
   const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports;
 }
+function exitRaceHarness() { return resultHarness('exit-race'); }
+function duplicateResultHarness() { return resultHarness('duplicate'); }
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -53,6 +60,14 @@ test('parent accepts a valid redacted result that is delivered adjacent to worke
   assert.equal(result.provider_turns, 1);
   assert.equal(result.root_cleanup_ok, true);
   assert.equal(result.survivor_free, true);
+});
+test('parent fails closed on a second valid terminal result and selects neither', async () => {
+  const result = await duplicateResultHarness().run();
+  assert.equal(result.result_class, 'worker_result_invalid');
+  assert.equal(result.provider_turns, 1);
+  assert.equal(result.root_cleanup_ok, false);
+  assert.equal(result.survivor_free, false);
+  assert.equal(result.output_bytes, 0);
 });
 test('fixed workers carry source-fixed roles and prepare before loading the server', () => {
   for (const [file, role] of [['reviewed-execution-live-worker-codex.cjs', 'benchmark_codex'], ['reviewed-execution-live-worker-claude.cjs', 'benchmark_claude']]) {
