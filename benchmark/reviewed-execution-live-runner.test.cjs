@@ -27,9 +27,14 @@ const fork = (file, args, options) => {
     if (message.type !== 'reviewed_execution_admit') return true;
     const profile = profiles.PROFILES.v2_codex_readonly_v1;
     const facts = { root_digest: 'a'.repeat(64), entry_digest: 'b'.repeat(64), entry_count: 1, remote_count: 0, changed_entry_count: 0 };
-    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: 'completed', provider_turns: 1, lifecycle_verified: true, sentinel_digest: 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: true, survivor_free: true, source_rechecked_before_prompt: true, gate_rechecked_before_prompt: true, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
+    const prelaunch = resultHarnessMode === 'prelaunch-refusal' || resultHarnessMode === 'prelaunch-cleanup-failure';
+    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe';
+    const cleanupFailure = resultHarnessMode === 'prelaunch-cleanup-failure' || oneTurnUnsafe;
+    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch ? 0 : 1, lifecycle_verified: !prelaunch, sentinel_digest: prelaunch ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
     if (resultHarnessMode === 'duplicate') {
       queueMicrotask(() => { child.emit('exit', 0); setImmediate(() => { child.emit('message', { type: 'reviewed_execution_result', report }); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report: { ...report, output_bytes: 7 } })); }); });
+    } else if (prelaunch) {
+      queueMicrotask(() => { child.emit('message', { type: 'reviewed_execution_result', report }); child.emit('exit', 0); });
     } else {
       process.nextTick(() => { child.emit('exit', 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
     }
@@ -44,6 +49,9 @@ const fork = (file, args, options) => {
 }
 function exitRaceHarness() { return resultHarness('exit-race'); }
 function duplicateResultHarness() { return resultHarness('duplicate'); }
+function prelaunchRefusalHarness() { return resultHarness('prelaunch-refusal'); }
+function prelaunchCleanupFailureHarness() { return resultHarness('prelaunch-cleanup-failure'); }
+function oneTurnUnsafeHarness() { return resultHarness('one-turn-unsafe'); }
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -68,6 +76,24 @@ test('parent fails closed on a second valid terminal result and selects neither'
   assert.equal(result.root_cleanup_ok, false);
   assert.equal(result.survivor_free, false);
   assert.equal(result.output_bytes, 0);
+});
+test('parent returns valid zero-turn prelaunch refusal and cleanup failure reports unchanged', async () => {
+  const refusal = await prelaunchRefusalHarness().run();
+  assert.equal(refusal.result_class, 'preflight_blocked');
+  assert.equal(refusal.provider_turns, 0);
+  assert.equal(refusal.survivor_free, true);
+  const cleanup = await prelaunchCleanupFailureHarness().run();
+  assert.equal(cleanup.result_class, 'cleanup_failed');
+  assert.equal(cleanup.provider_turns, 0);
+  assert.equal(cleanup.root_cleanup_ok, false);
+  assert.equal(cleanup.survivor_free, true);
+});
+test('parent refuses an unsafe one-turn report even when its IPC shape is valid', async () => {
+  const result = await oneTurnUnsafeHarness().run();
+  assert.equal(result.result_class, 'worker_exit_unverified');
+  assert.equal(result.provider_turns, 1);
+  assert.equal(result.root_cleanup_ok, false);
+  assert.equal(result.survivor_free, false);
 });
 test('fixed workers carry source-fixed roles and prepare before loading the server', () => {
   for (const [file, role] of [['reviewed-execution-live-worker-codex.cjs', 'benchmark_codex'], ['reviewed-execution-live-worker-claude.cjs', 'benchmark_claude']]) {
