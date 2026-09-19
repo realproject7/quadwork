@@ -175,6 +175,20 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
   // obtain Linux renameat2(RENAME_EXCHANGE); it is not visible to require().
   assetTargets.push("server/resource-rename-exchange-helper.py");
 
+  // The reviewed runner loads its candidate-bound worker chain by fixed path.
+  // It is deliberately not reachable by a normal literal require scan.
+  assetTargets.push(
+    "benchmark/live-provider-reviewed-contracts.cjs",
+    "benchmark/v2-product-path-core.cjs",
+    "benchmark/reviewed-execution-contract.cjs",
+    "benchmark/reviewed-execution-runner.cjs",
+    "benchmark/reviewed-execution-live-runner.cjs",
+    "benchmark/reviewed-execution-live-outcome.cjs",
+    "benchmark/reviewed-execution-live-child-protocol.cjs",
+    "benchmark/reviewed-execution-live-worker-codex.cjs",
+    "benchmark/reviewed-execution-live-worker-claude.cjs",
+  );
+
   const missingAssets = assetTargets.filter((t) => !shipped.has(t));
   assert.deepEqual(
     missingAssets,

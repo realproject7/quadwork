@@ -43,7 +43,9 @@ function runOne(file) {
     const child = spawn(process.execPath, [file], {
       cwd: ROOT,
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      // The compatibility facade is intentionally available only to these
+      // isolated test children, never to normal runtime imports.
+      env: { ...process.env, QUADWORK_TEST_RUNTIME: "1" },
     });
     let stdout = "";
     let stderr = "";

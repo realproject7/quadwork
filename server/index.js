@@ -723,6 +723,66 @@ function inspectLegacySession(key) {
   });
 }
 
+// Deliberately test-process-only compatibility facade. It is created only
+// when the dedicated runner flag is exact, never published by normal runtime
+// exports, and cannot read, delete, or replace a reviewed execution entry.
+// The optional map argument lets the focused test exercise the same guards
+// without gaining access to this process's session map.
+function createTestSessionFacade(sessions = agentSessions) {
+  const visible = (session) => !!session && session.reviewedExecution !== true;
+  const facade = {
+    get(key) {
+      const session = sessions.get(key);
+      return visible(session) ? session : undefined;
+    },
+    has(key) { return visible(sessions.get(key)); },
+    set(key, session) {
+      const existing = sessions.get(key);
+      if (!visible(session) || !visible(existing) && existing) {
+        throw new Error("reviewed_session_test_hook_denied");
+      }
+      sessions.set(key, session);
+      return facade;
+    },
+    delete(key) {
+      return visible(sessions.get(key)) ? sessions.delete(key) : false;
+    },
+    clear() {
+      for (const [key, session] of sessions) if (visible(session)) sessions.delete(key);
+    },
+    *entries() {
+      for (const entry of sessions) if (visible(entry[1])) yield entry;
+    },
+    *keys() {
+      for (const [key, session] of sessions) if (visible(session)) yield key;
+    },
+    *values() {
+      for (const session of sessions.values()) if (visible(session)) yield session;
+    },
+    forEach(callback, thisArg) {
+      for (const [key, session] of facade.entries()) callback.call(thisArg, session, key, facade);
+    },
+    get size() {
+      let count = 0;
+      for (const _ of facade.keys()) count += 1;
+      return count;
+    },
+    [Symbol.iterator]() { return facade.entries(); },
+  };
+  return Object.freeze(facade);
+}
+
+const runtimeTestHooks = (() => {
+  const hooks = { installLifecycleTestFixture };
+  if (process.env.QUADWORK_TEST_RUNTIME === "1") {
+    Object.defineProperties(hooks, {
+      agentSessions: { value: createTestSessionFacade(), enumerable: false },
+      createSessionFacade: { value: createTestSessionFacade, enumerable: false },
+    });
+  }
+  return Object.freeze(hooks);
+})();
+
 // #1044 M5: only the server composes the transport, durable Head-control
 // domain, current assignment readers, and live PTY facts. The MCP shim gets a
 // per-Head launch token, not a route/config capability.
@@ -4825,7 +4885,7 @@ module.exports = {
   releaseManualCaffeinate,
   restartAgentSession,
   inspectLegacySession,
-  _test: Object.freeze({ installLifecycleTestFixture }),
+  _test: runtimeTestHooks,
 };
 module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test seam
 module.exports.headControlRuntime = headControlRuntime; // #1044: Head-token registration test seam
@@ -4833,6 +4893,11 @@ module.exports.caffeinateProcess = caffeinateProcess; // #1034: owner-isolation 
 module.exports.respawnActiveBatchAgents = respawnActiveBatchAgents; // #992: startup respawn (DI'd for tests)
 module.exports.runStartupMigrations = runStartupMigrations; // startup seeding (test seam)
 module.exports.app = app; // route-level test seam (QUADWORK_SKIP_LISTEN keeps the port unbound)
+if (process.env.QUADWORK_TEST_RUNTIME === "1") {
+  // Legacy test files retain Map-like access only inside the isolated runner.
+  // Normal routes, HTTP/WS/MCP modules, and non-test consumers never receive it.
+  module.exports.agentSessions = runtimeTestHooks.agentSessions;
+}
 
 // This branch is reachable only in one of the two source-fixed IPC workers.
 // The worker prepares the isolated HOME before this module is loaded; the
