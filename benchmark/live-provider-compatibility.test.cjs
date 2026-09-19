@@ -89,10 +89,15 @@ test('compiled argv is exactly the source-controlled Codex or Claude profile', (
 test('Codex final-message adapter accepts only the sentinel and deletes transient content', () => {
   const value = roots(), filename = path.join(value.root, '.quadwork-live-codex-final-message');
   try {
+    assert.equal(fs.statSync(filename).isFile(), true); assert.equal(fs.statSync(filename).mode & 0o777, 0o600);
     fs.writeFileSync(filename, 'QUADWORK_LIVE_OK\n', { mode: 0o600 }); fs.chmodSync(filename, 0o600);
     const accepted = core.testHooks.consumeCodexFinalMessage(value.root); assert.equal(accepted.response_ok, true); assert.equal(fs.existsSync(filename), false);
     fs.writeFileSync(filename, 'provider private output', { mode: 0o600 }); fs.chmodSync(filename, 0o600);
     const rejected = core.testHooks.consumeCodexFinalMessage(value.root); assert.equal(rejected.response_ok, false); assert.equal(fs.existsSync(filename), false); assert.equal(JSON.stringify(rejected).includes('private output'), false);
+    fs.writeFileSync(filename, 'QUADWORK_LIVE_OK', { mode: 0o600 }); fs.chmodSync(filename, 0o644);
+    assert.equal(core.testHooks.consumeCodexFinalMessage(value.root).response_ok, false); assert.equal(fs.existsSync(filename), false);
+    fs.writeFileSync(path.join(value.parent, 'outside'), 'QUADWORK_LIVE_OK'); fs.symlinkSync(path.join(value.parent, 'outside'), filename);
+    assert.equal(core.testHooks.consumeCodexFinalMessage(value.root).response_ok, false); assert.equal(fs.existsSync(filename), false);
   } finally { cleanup(value); }
 });
 
