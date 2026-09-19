@@ -707,6 +707,22 @@ app.get("/api/caffeinate/status", (req, res) => {
 // PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
 const agentSessions = new Map();
 
+// Compatibility inspection for legacy launch tests and diagnostics. It is a
+// value snapshot, never the mutable session/PTY object, and deliberately
+// refuses reviewed executions so no caller can regain their terminal handle.
+function inspectLegacySession(key) {
+  if (typeof key !== "string" || key.length > 512) return null;
+  const session = agentSessions.get(key);
+  if (!session || session.reviewedExecution === true) return null;
+  return Object.freeze({
+    hasTerminal: !!session.term,
+    pid: Number.isSafeInteger(session.term?.pid) ? session.term.pid : null,
+    scrollback: Buffer.isBuffer(session.scrollback) ? session.scrollback.toString("utf8") : "",
+    ptyExited: session._ptyExited === true,
+    lifecycleState: typeof session.lifecycleState === "string" ? session.lifecycleState : null,
+  });
+}
+
 // #1044 M5: only the server composes the transport, durable Head-control
 // domain, current assignment readers, and live PTY facts. The MCP shim gets a
 // per-Head launch token, not a route/config capability.
@@ -4808,6 +4824,7 @@ module.exports = {
   releaseProjectCaffeinate,
   releaseManualCaffeinate,
   restartAgentSession,
+  inspectLegacySession,
   _test: Object.freeze({ installLifecycleTestFixture }),
 };
 module.exports.mcpProxies = mcpProxies; // #1034: project cleanup ownership test seam

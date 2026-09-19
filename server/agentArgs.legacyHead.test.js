@@ -70,14 +70,15 @@ async function start(project) {
   ownedKeys.push(`${project}/head`);
   const result = await runtime.spawnAgentPty(project, "head", { operatorAuthorized: true, allowHeadIntake: true, suppressLifecycleMsg: true });
   assert.equal(result.ok, true, JSON.stringify(result));
-  const session = runtime.agentSessions.get(`${project}/head`);
-  assert.ok(Number.isSafeInteger(session?.term?.pid) && session.term.pid > 0);
+  let session = runtime.inspectLegacySession(`${project}/head`);
+  assert.ok(Number.isSafeInteger(session?.pid) && session.pid > 0);
   const deadline = Date.now() + 4000;
-  while (!session.scrollback.toString().includes("LOCAL_MCP_FIXTURE_READY") && Date.now() < deadline) {
+  while (!session.scrollback.includes("LOCAL_MCP_FIXTURE_READY") && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 10));
+    session = runtime.inspectLegacySession(`${project}/head`);
   }
-  assert.ok(session.scrollback.toString().includes("LOCAL_MCP_FIXTURE_READY"), "real CLI accepts the ordinary MCP launch arguments");
-  assert.equal(session._ptyExited, undefined);
+  assert.ok(session.scrollback.includes("LOCAL_MCP_FIXTURE_READY"), "real CLI accepts the ordinary MCP launch arguments");
+  assert.equal(session.ptyExited, false);
   return session;
 }
 
@@ -126,7 +127,7 @@ async function start(project) {
     fixtures.push(runtime._test.installLifecycleTestFixture("invalid", "head", "linux-contained"));
     const refused = await runtime.spawnAgentPty("invalid", "head", { operatorAuthorized: true, allowHeadIntake: true, suppressLifecycleMsg: true });
     assert.equal(refused.ok, false);
-    assert.equal(runtime.agentSessions.get("invalid/head")?.term, null);
+    assert.equal(runtime.inspectLegacySession("invalid/head")?.hasTerminal, false);
     assert.equal(fs.existsSync(path.join(configDir, "invalid", "mcp-head.json")), false);
     assert.equal(fs.readFileSync(observationPath, "utf8").trim().split("\n").length, 2);
     save();
