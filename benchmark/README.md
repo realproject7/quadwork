@@ -211,3 +211,35 @@ argument rejection, static identities, report redaction, ownership, and the
 absence of a production dependency-injection seam. A live run remains bounded
 to one turn, requires post-merge review approval, and cannot authorize Actions,
 remote Git, versioning, release, or npm publication.
+
+`reviewed-execution-contract.cjs` and `reviewed-execution-runner.cjs` add the
+#1115 execution-authorization preparation layer. It has exactly two closed
+profiles: `v2_codex_readonly_v1` and `v2_claude_restricted_v1`. The private V2
+resolver accepts only the owned `benchmark-product-path` role plus one of those
+IDs. It fixes the resolved binary, model, provider argv, static environment,
+`sandbox-exec` wrapper, backend, and PTY prompt route. Normal projects and
+arbitrary configuration cannot select a profile.
+
+Before any provider activity, preparation creates a source-generated `0600`
+sandbox profile and atomically consumes a `0700` executor-owned `O_EXCL` ledger
+record keyed to the candidate digest, profile, and authorization. The record is
+never cleaned, so every retry is refused even after a blocked preflight. The
+candidate digest explicitly covers the V2 launch chain, profile source,
+sandbox template, reviewed binary/version evidence, workload, sentinel rule,
+and runner. The final PTY construction recomputes it before launch.
+
+This change contains no provider auth or workload invocation. Its local
+preflight is capped at five seconds and 4 KiB, reports zero turns, and blocks
+on any unavailable local prerequisite. The sandbox default-denies writes
+outside the disposable root and ledger. It permits outbound connections only
+for the fixed binary, fixed model, fixed no-tools argv path. It does not claim
+hostname-level filtering or Keychain immutability, and it never copies,
+prints, hashes, or persists credential values. Live activity remains prohibited
+until two independent reviews approve the exact candidate and the required
+Actions/cache/artifact observations are fresh.
+
+The live selector is deliberately disabled in this change. In particular, this
+layer does not run a provider CLI, PTY, or dynamic version command. The recorded
+version digest is static reviewed evidence only. A later reviewed contract must
+add the fresh-review and Actions/cache/artifact gate together with complete
+sentinel, cleanup, post-root, and process-survivor proof before enabling it.

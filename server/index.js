@@ -33,6 +33,39 @@ const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
 const { getSharedResourceRuntimeOwner } = require("./resource-runtime-owner");
 const { registerResourceHttp } = require("./resource-http");
+const { WORKLOAD: REVIEWED_EXECUTION_WORKLOAD, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan } = require("./reviewed-execution-profiles");
+// #1115 remains structurally prepared only. A later reviewed ticket must add
+// the fresh-review and Actions/cache/artifact gate before this can be enabled.
+const REVIEWED_EXECUTION_LIVE_ENABLED = false;
+
+function reviewedExecutionFor(projectId, agentId, agentCfg) {
+  const id = agentCfg?.reviewed_execution_id;
+  if (id === undefined) return null;
+  if (!REVIEWED_EXECUTION_LIVE_ENABLED) throw new Error("reviewed_execution_not_enabled");
+  const profile = resolveReviewedExecution(projectId, agentId, id);
+  if (!profile) throw new Error("reviewed_execution_not_authorized");
+  return profile;
+}
+
+function reviewedExecutionBinding(agentCfg) {
+  return {
+    candidate_digest: agentCfg?.reviewed_execution_candidate_digest,
+    disposable_root: agentCfg?.reviewed_execution_root,
+    ledger_directory: agentCfg?.reviewed_execution_ledger_directory,
+    authorization_key: agentCfg?.reviewed_execution_authorization_key,
+    sandbox_profile: agentCfg?.reviewed_execution_sandbox_profile,
+    sandbox_digest: agentCfg?.reviewed_execution_sandbox_digest,
+  };
+}
+
+function reviewedTerminalEnvironment(plan) {
+  const home = path.join(plan.disposable_root, "home");
+  return {
+    HOME: home, USERPROFILE: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+    LANG: "C", LC_ALL: "C", TERM: "xterm-256color", GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: "0", ...plan.env,
+  };
+}
 
 function benchmarkCommandIdentity(projectId, agentId, agentCfg) {
   // Only the executor-owned #1113 project can name a versioned resolved
@@ -225,6 +258,7 @@ function safeWrite(term, data) {
     throw err;
   }
 }
+
 
 // --- #968: PTY-surface auth (Origin allowlist + shared session token) ---
 
@@ -2119,6 +2153,8 @@ async function buildAgentArgs(projectId, agentId) {
   if (!project) return { args: [] };
 
   const agentCfg = project.agents?.[agentId] || {};
+  const reviewedExecution = reviewedExecutionFor(projectId, agentId, agentCfg);
+  if (reviewedExecution) return { args: [...reviewedExecution.provider_argv] };
   const command = agentCfg.command || "claude";
   // A versioned resolved Claude executable has no provider-shaped basename.
   // This exception is deliberately limited to the owned #1113 benchmark role;
@@ -2218,6 +2254,8 @@ function buildAgentEnv(projectId, agentId) {
   if (!project) return {};
 
   const agentCfg = project.agents?.[agentId] || {};
+  const reviewedExecution = reviewedExecutionFor(projectId, agentId, agentCfg);
+  if (reviewedExecution) return { ...reviewedExecution.env };
   const command = agentCfg.command || "claude";
   const cliBase = configuredCliBase(projectId, agentId, agentCfg, command);
   const env = {};
@@ -2260,6 +2298,8 @@ async function launchAgentPty(project, agent, opts = {}) {
     const cwd = resolveAgentCwd(project, agent);
     if (!cwd) return { ok: false, error: `Unknown agent: ${key}` };
 
+    const agentCfg = readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {};
+    const reviewedExecution = reviewedExecutionFor(project, agent, agentCfg);
     const command = resolveAgentCommand(project, agent) || (process.env.SHELL || "/bin/zsh");
     const extraEnv = buildAgentEnv(project, agent);
     // #565: buildAgentArgs is inside try-catch so registration failures
@@ -2272,21 +2312,32 @@ async function launchAgentPty(project, agent, opts = {}) {
     if (!admissionCurrent(lease)) {
       return { ok: false, code: "project_archived", status: 409, error: "project is archived" };
     }
-    const args = built.args;
+    // Recompute the complete candidate digest and source-generated sandbox
+    // immediately before PTY creation. A changed source, profile, binary
+    // evidence, workload, or binding cannot reach a provider process.
+    const reviewedPlan = reviewedExecution
+      ? reviewedLaunchPlan(project, agent, reviewedExecution.id, reviewedExecutionBinding(agentCfg))
+      : null;
+    if (reviewedPlan && path.resolve(cwd) !== reviewedPlan.repository) {
+      throw new Error("reviewed_execution_cwd_invalid");
+    }
+    const args = reviewedPlan ? reviewedPlan.argv : built.args;
+    const launchCommand = reviewedPlan ? reviewedPlan.executable : command;
+    if (reviewedPlan) claimAuthorization(reviewedExecution, reviewedExecutionBinding(agentCfg));
 
     const terminalOptions = {
       name: "xterm-256color",
       cols: 120,
       rows: 30,
       cwd,
-      env: { ...process.env, ...extraEnv },
+      env: reviewedPlan ? reviewedTerminalEnvironment(reviewedPlan) : { ...process.env, ...extraEnv },
     };
     const term = process.platform === "linux" && !_lifecycleTestFixtures.has(key)
-      ? await resourceRuntimeOwner.spawnWorkerPty({ projectId: project, generationId: opts.generationId, command, args, cwd, env: terminalOptions.env, assertLaunchCurrent: () => {
+      ? await resourceRuntimeOwner.spawnWorkerPty({ projectId: project, generationId: opts.generationId, command: launchCommand, args, cwd, env: terminalOptions.env, assertLaunchCurrent: () => {
         if (shuttingDown) throw new ProjectLifecycleError("server_shutting_down", project, "server is shutting down", 503);
         if (!admissionCurrent(lease)) throw new ProjectLifecycleError("project_archived", project, "project is archived", 409);
       } })
-      : (opts.ptySpawn || pty.spawn)(command, args, terminalOptions);
+      : (opts.ptySpawn || pty.spawn)(launchCommand, args, terminalOptions);
 
     const session = {
       projectId: project,
@@ -2309,7 +2360,7 @@ async function launchAgentPty(project, agent, opts = {}) {
       // the Claude TUI repaints continuously while idle. Derived with the same
       // helper the spawn/arg paths use, so "claude", "/usr/bin/claude" and
       // "claude --foo" all resolve to "claude".
-      backend: configuredCliBase(project, agent, readConfig().projects?.find((entry) => entry?.id === project)?.agents?.[agent] || {}, command),
+      backend: reviewedPlan?.backend || configuredCliBase(project, agent, agentCfg, command),
       lastOutputAt: Date.now(),
       // #418: ring buffer of recent PTY output so reconnecting WS
       // clients see the terminal state instead of a blank panel.
