@@ -31,7 +31,11 @@ function runFixedWorker(filename) {
     const concludeExit = () => {
       if (!exited || settled) return;
       if (terminating) return finish(fixedFailure(profile, terminating, 1, verified.candidate_digest));
-      if (report && exited.code === 0 && report.root_cleanup_ok && report.survivor_free) return finish(report);
+      // A shape-validated child report is already redacted and carries the
+      // truthful prelaunch/cleanup facts. Do not replace a valid zero-turn
+      // refusal with a parent-made, conservative one-turn fallback merely
+      // because cleanup was unsuccessful.
+      if (report && exited.code === 0) return finish(report);
       finish(fixedFailure(profile, report ? 'worker_exit_unverified' : 'worker_exited_without_result', 1, verified.candidate_digest));
     };
     const terminate = result => { if (terminating) return; terminating = result; if (exited) return concludeExit(); try { child?.kill('SIGTERM'); } catch {} escalation = setTimeout(() => { try { child?.kill('SIGKILL'); } catch {} }, 2_000); };
