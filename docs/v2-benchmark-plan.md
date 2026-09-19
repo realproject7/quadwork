@@ -75,6 +75,13 @@ All disposable target repositories must have Actions disabled before any push
 or PR and verified disabled throughout the experiment. No deployment webhook
 is attached. No run, retry, check result, or approval is fabricated.
 
+This prevents account-level Actions minutes and Actions cache/artifact storage
+from the benchmark as well. Record repository Actions permission, active cache
+bytes/count, and non-expired artifact bytes before and after any live exercise.
+Do not trade local verification time for hosted `node_modules`/npm caches or
+artifact uploads. Any future exception needs an explicit operator-approved
+minutes and storage budget and is outside this benchmark contract.
+
 An unmodified V1 gate may wait for hosted checks that this experiment forbids.
 First prove whether its supported local policy can complete the matched flow.
 If not, record Mode 1 as blocked. Do not patch V1, inject a green hosted status,
