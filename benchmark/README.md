@@ -96,4 +96,9 @@ directory. Its role tokens exercise server-derived Head/reviewer identity and
 generation; they are synthetic local test identities, not provider or user
 authentication. It deliberately has no MCP endpoint, provider launcher, GitHub
 or Git transport, package/release operation, or process execution capability.
-It is replay coverage and cannot qualify as a live benchmark observation.
+It starts only from a root created by `createDisposableV2RuntimeRoot()` or an
+otherwise empty root explicitly marked with `markDisposableV2RuntimeRoot()`;
+the marker, ownership, permissions, canonical path, and empty-root condition
+are checked before the durable services are composed. A populated store
+namespace or any root/marker symlink is rejected without writing. It is replay
+coverage and cannot qualify as a live benchmark observation.

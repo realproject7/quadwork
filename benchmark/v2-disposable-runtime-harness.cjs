@@ -12,6 +12,9 @@
 // must never be recorded as a live benchmark authentication claim.
 
 const http = require("node:http");
+const nodeFs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { createWorkTaskBuildRuntime } = require("../server/work-task-build-runtime");
 const { createWorkTaskReviewRuntime } = require("../server/work-task-review-runtime");
 const { createLiveWorkTaskIdentityResolver } = require("../server/live-work-task-identity-resolver");
@@ -22,6 +25,10 @@ const { createWorkTaskReviewReconciliationService } = require("../server/work-ta
 class DisposableV2RuntimeHarnessError extends Error {
   constructor(code, message = code) { super(message); this.name = "DisposableV2RuntimeHarnessError"; this.code = code; }
 }
+const DISPOSABLE_ROOT_MARKER = ".quadwork-benchmark-disposable-v1";
+const DISPOSABLE_ROOT_MARKER_BODY = "quadwork-benchmark-disposable-v1\n";
+const ROOT_DIRECTORY_MODE = 0o700;
+const MARKER_FILE_MODE = 0o600;
 function fail(code, message) { throw new DisposableV2RuntimeHarnessError(code, message); }
 function plain(value) { return !!value && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null); }
 function exact(value, fields, code) {
@@ -35,13 +42,101 @@ function token(value) { return typeof value === "string" && value.length > 0 && 
 function session(value, projectId, role) {
   return plain(value) && value.projectId === projectId && value.agentId === role && value.state === "running" && !!value.term && value.lifecycleState === "verified";
 }
+function mode(value) { return value.mode & 0o777; }
+function currentUid() { try { return typeof process.getuid === "function" ? process.getuid() : null; } catch { return null; } }
+function rootFilesystem(io) {
+  for (const method of ["lstatSync", "realpathSync", "readdirSync", "readFileSync"]) {
+    if (!io || typeof io[method] !== "function") fail("invalid_disposable_v2_runtime_harness_options", `fs.${method} is required`);
+  }
+  return io;
+}
+function disposableRoot(configDir, io, code = "invalid_disposable_v2_runtime_config_root") {
+  if (typeof configDir !== "string" || !path.isAbsolute(configDir) || configDir.length > 1024 || /[\u0000\r\n]/.test(configDir)) {
+    fail(code, "disposable config root is invalid");
+  }
+  let stats, canonical;
+  try {
+    stats = io.lstatSync(configDir);
+    if (stats.isSymbolicLink() || !stats.isDirectory() || mode(stats) !== ROOT_DIRECTORY_MODE) fail(code, "disposable config root is unsafe");
+    const uid = currentUid();
+    if (uid !== null && stats.uid !== uid) fail(code, "disposable config root belongs to another user");
+    canonical = io.realpathSync(configDir);
+  } catch (error) {
+    if (error instanceof DisposableV2RuntimeHarnessError) throw error;
+    fail(code, "disposable config root is unavailable");
+  }
+  let names;
+  try { names = io.readdirSync(canonical); }
+  catch { fail(code, "disposable config root is unreadable"); }
+  if (!Array.isArray(names) || names.length !== 1 || names[0] !== DISPOSABLE_ROOT_MARKER) {
+    fail(code, "disposable config root must be empty except for its marker");
+  }
+  const marker = path.join(canonical, DISPOSABLE_ROOT_MARKER);
+  try {
+    const markerStats = io.lstatSync(marker);
+    const uid = currentUid();
+    if (markerStats.isSymbolicLink() || !markerStats.isFile() || mode(markerStats) !== MARKER_FILE_MODE ||
+        (uid !== null && markerStats.uid !== uid) || io.readFileSync(marker, "utf8") !== DISPOSABLE_ROOT_MARKER_BODY) {
+      fail(code, "disposable config root marker is unsafe");
+    }
+  } catch (error) {
+    if (error instanceof DisposableV2RuntimeHarnessError) throw error;
+    fail(code, "disposable config root marker is unavailable");
+  }
+  return canonical;
+}
+function markDisposableV2RuntimeRoot(configDir, io = nodeFs) {
+  if (!io || typeof io.writeFileSync !== "function" || typeof io.chmodSync !== "function") {
+    fail("invalid_disposable_v2_runtime_root_mark", "filesystem cannot mark a disposable root");
+  }
+  if (typeof configDir !== "string" || !path.isAbsolute(configDir) || configDir.length > 1024 || /[\u0000\r\n]/.test(configDir)) {
+    fail("invalid_disposable_v2_runtime_root_mark", "disposable root is invalid");
+  }
+  let stats, canonical, names;
+  try {
+    stats = io.lstatSync(configDir);
+    if (stats.isSymbolicLink() || !stats.isDirectory() || mode(stats) !== ROOT_DIRECTORY_MODE) fail("invalid_disposable_v2_runtime_root_mark", "disposable root is unsafe");
+    const uid = currentUid();
+    if (uid !== null && stats.uid !== uid) fail("invalid_disposable_v2_runtime_root_mark", "disposable root belongs to another user");
+    canonical = io.realpathSync(configDir); names = io.readdirSync(canonical);
+    if (!Array.isArray(names) || names.length !== 0) fail("invalid_disposable_v2_runtime_root_mark", "disposable root is not empty");
+    io.writeFileSync(path.join(canonical, DISPOSABLE_ROOT_MARKER), DISPOSABLE_ROOT_MARKER_BODY, { encoding: "utf8", mode: MARKER_FILE_MODE, flag: "wx" });
+    io.chmodSync(path.join(canonical, DISPOSABLE_ROOT_MARKER), MARKER_FILE_MODE);
+  } catch (error) {
+    if (error instanceof DisposableV2RuntimeHarnessError) throw error;
+    fail("invalid_disposable_v2_runtime_root_mark", "disposable root cannot be marked");
+  }
+  return disposableRoot(canonical, io, "invalid_disposable_v2_runtime_root_mark");
+}
+function createDisposableV2RuntimeRoot(value = {}) {
+  if (!plain(value) || Object.keys(value).some((key) => key !== "fs" && key !== "parent_dir")) {
+    fail("invalid_disposable_v2_runtime_root_create", "root creation options are invalid");
+  }
+  const io = value.fs === undefined ? nodeFs : value.fs;
+  const parent = value.parent_dir === undefined ? os.tmpdir() : value.parent_dir;
+  if (!io || typeof io.mkdtempSync !== "function" || typeof io.chmodSync !== "function") fail("invalid_disposable_v2_runtime_root_create", "filesystem cannot create a disposable root");
+  if (typeof parent !== "string" || !path.isAbsolute(parent) || parent.length > 1024 || /[\u0000\r\n]/.test(parent)) fail("invalid_disposable_v2_runtime_root_create", "root parent is invalid");
+  let canonicalParent, root;
+  try {
+    const stats = io.lstatSync(parent);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) fail("invalid_disposable_v2_runtime_root_create", "root parent is unsafe");
+    canonicalParent = io.realpathSync(parent);
+    root = io.mkdtempSync(path.join(canonicalParent, "quadwork-benchmark-disposable-"));
+    io.chmodSync(root, ROOT_DIRECTORY_MODE);
+  } catch (error) {
+    if (error instanceof DisposableV2RuntimeHarnessError) throw error;
+    fail("invalid_disposable_v2_runtime_root_create", "disposable root cannot be created");
+  }
+  return markDisposableV2RuntimeRoot(root, io);
+}
 
 function options(value) {
   exact(value, [
     "config_dir", "fs", "project_id", "tokens", "agent_sessions", "admission", "live_batch_context",
     "repository_state", "cached_repository_snapshot", "read_registered_base", "now",
   ], "invalid_disposable_v2_runtime_harness_options");
-  if (typeof value.config_dir !== "string" || !value.config_dir.startsWith("/") || !value.fs || typeof value.project_id !== "string" ||
+  const io = rootFilesystem(value.fs);
+  if (typeof value.project_id !== "string" ||
       !plain(value.tokens) || !value.agent_sessions || typeof value.agent_sessions.get !== "function" || !plain(value.admission) ||
       !plain(value.live_batch_context) || !plain(value.repository_state) || !plain(value.cached_repository_snapshot) ||
       typeof value.read_registered_base !== "function" || typeof value.now !== "function") {
@@ -60,7 +155,7 @@ function options(value) {
   if (value.admission.project_id !== value.project_id || !Number.isSafeInteger(value.admission.generation) || value.admission.generation < 0) {
     fail("invalid_disposable_v2_runtime_harness_options", "harness admission is invalid");
   }
-  return value;
+  return { ...value, config_dir: disposableRoot(value.config_dir, io) };
 }
 
 function createDisposableV2RuntimeHarness(value) {
@@ -154,4 +249,10 @@ function createDisposableV2RuntimeHarness(value) {
   return Object.freeze({ start, stop, route_names: Object.freeze([...handlers.keys()]), purpose: "disposable_local_http_replay_only" });
 }
 
-module.exports = { DisposableV2RuntimeHarnessError, createDisposableV2RuntimeHarness };
+module.exports = {
+  DISPOSABLE_ROOT_MARKER,
+  DisposableV2RuntimeHarnessError,
+  createDisposableV2RuntimeRoot,
+  createDisposableV2RuntimeHarness,
+  markDisposableV2RuntimeRoot,
+};

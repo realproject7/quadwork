@@ -38,7 +38,7 @@ function loadRuntimeWithSingleProcessLockFixture() {
     };
   } finally { Module._load = original; }
 }
-const { buildBatchManifest, freezeBatchManifest, buildWorkTaskPipeline, planWorkTaskPipelineEvent, buildWorkTaskCandidate, createWorkTaskPipelineStore, createDisposableV2RuntimeHarness, DisposableV2RuntimeHarnessError } = loadRuntimeWithSingleProcessLockFixture();
+const { buildBatchManifest, freezeBatchManifest, buildWorkTaskPipeline, planWorkTaskPipelineEvent, buildWorkTaskCandidate, createWorkTaskPipelineStore, createDisposableV2RuntimeRoot, createDisposableV2RuntimeHarness, markDisposableV2RuntimeRoot, DisposableV2RuntimeHarnessError } = loadRuntimeWithSingleProcessLockFixture();
 
 const installation_id = "benchmark_installation_0001";
 const project_id = "benchmark-local";
@@ -71,7 +71,6 @@ function fixture(root) {
   }] }, { resolveRegisteredIdentity(input) { return { ...input, work_item: copy(input.work_item), issue_body_revision: revision }; } }), "2026-09-19T00:00:00.000Z");
   const ref = manifest.tasks[0].ref;
   const store = createWorkTaskPipelineStore({ config_dir: root, fs });
-  store.initialize({ expected: { installation_id, project_id, manifest_digest: manifest.manifest_digest, pipeline_digest: null }, manifest, pipeline: buildWorkTaskPipeline(manifest) });
   const sessions = new Map(["head", "dev", "re1", "re2"].map((role) => [`${project_id}/${role}`, session(role)]));
   const tokens = { head: "head-local-token", re1: "re1-local-token", re2: "re2-local-token" };
   const live_batch_context = { activated: true, queueReadOk: true, installationId: installation_id, batchType: "code", project: { id: project_id },
@@ -82,6 +81,7 @@ function fixture(root) {
     cached_repository_snapshot: { ts: 1, issues: [{ number: 101, contract_revision: revision }] },
     read_registered_base: () => ({ version: 1, repository_key: "catalog", base_sha }), now: () => new Date("2026-09-19T00:01:00.000Z"),
   });
+  store.initialize({ expected: { installation_id, project_id, manifest_digest: manifest.manifest_digest, pipeline_digest: null }, manifest, pipeline: buildWorkTaskPipeline(manifest) });
   return { ref, store, harness, tokens };
 }
 function recordCandidate(current, root) {
@@ -96,7 +96,7 @@ function recordCandidate(current, root) {
 }
 
 test("disposable HTTP routes bind build and reviewer roles through production V2 runtime services", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "qw-v2-disposable-http-"));
+  const root = createDisposableV2RuntimeRoot({ fs });
   let harness;
   try {
     const current = fixture(root); harness = current.harness; const listener = await harness.start();
@@ -123,13 +123,51 @@ test("disposable HTTP routes bind build and reviewer roles through production V2
 });
 
 test("harness refuses non-verified sessions before any loopback route exists", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "qw-v2-disposable-invalid-"));
+  const root = createDisposableV2RuntimeRoot({ fs });
   try {
     const sessions = new Map(["head", "dev", "re1", "re2"].map((role) => [`${project_id}/${role}`, session(role)]));
     sessions.get(`${project_id}/re2`).lifecycleState = "spawned";
     assert.throws(() => createDisposableV2RuntimeHarness({ config_dir: root, fs, project_id, tokens: { head: "head", re1: "re1", re2: "re2" }, agent_sessions: sessions,
       admission: { project_id, generation: 0 }, live_batch_context: {}, repository_state: {}, cached_repository_snapshot: {}, read_registered_base: () => ({}), now: () => new Date(),
     }), (error) => error instanceof DisposableV2RuntimeHarnessError && error.code === "invalid_disposable_v2_runtime_harness_options");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("harness rejects populated, unmarked, and symlinked config roots without writing durable namespaces", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "qw-v2-disposable-root-"));
+  try {
+    const populated = createDisposableV2RuntimeRoot({ fs, parent_dir: parent });
+    fs.mkdirSync(path.join(populated, "work-task-pipelines"), { mode: 0o700 });
+    fs.writeFileSync(path.join(populated, "work-task-pipelines", "sentinel"), "unchanged\n", { mode: 0o600 });
+    const populatedBefore = fs.readdirSync(populated).sort();
+    assert.throws(() => fixture(populated), (error) => error instanceof DisposableV2RuntimeHarnessError && error.code === "invalid_disposable_v2_runtime_config_root");
+    assert.deepEqual(fs.readdirSync(populated).sort(), populatedBefore);
+    assert.equal(fs.readFileSync(path.join(populated, "work-task-pipelines", "sentinel"), "utf8"), "unchanged\n");
+
+    const unmarked = fs.mkdtempSync(path.join(parent, "unmarked-")); fs.chmodSync(unmarked, 0o700);
+    assert.throws(() => fixture(unmarked), (error) => error instanceof DisposableV2RuntimeHarnessError && error.code === "invalid_disposable_v2_runtime_config_root");
+    assert.deepEqual(fs.readdirSync(unmarked), []);
+
+    const link = path.join(parent, "root-link"); fs.symlinkSync(unmarked, link, "dir");
+    assert.throws(() => fixture(link), (error) => error instanceof DisposableV2RuntimeHarnessError && error.code === "invalid_disposable_v2_runtime_config_root");
+    assert.deepEqual(fs.readdirSync(unmarked), []);
+
+    const markerLinked = createDisposableV2RuntimeRoot({ fs, parent_dir: parent });
+    const marker = path.join(markerLinked, ".quadwork-benchmark-disposable-v1");
+    const markerTarget = path.join(parent, "marker-target");
+    fs.writeFileSync(markerTarget, "quadwork-benchmark-disposable-v1\n", { mode: 0o600 }); fs.unlinkSync(marker); fs.symlinkSync(markerTarget, marker);
+    assert.throws(() => fixture(markerLinked), (error) => error instanceof DisposableV2RuntimeHarnessError && error.code === "invalid_disposable_v2_runtime_config_root");
+    assert.equal(fs.readFileSync(markerTarget, "utf8"), "quadwork-benchmark-disposable-v1\n");
+  } finally { fs.rmSync(parent, { recursive: true, force: true }); }
+});
+
+test("an explicitly marked empty root is canonicalized before durable services are composed", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "qw-v2-explicit-root-")); fs.chmodSync(root, 0o700);
+  try {
+    const marked = markDisposableV2RuntimeRoot(root, fs);
+    assert.equal(marked, fs.realpathSync(root));
+    const current = fixture(root);
+    assert.equal(current.store.readRecoverySnapshot({ installation_id, project_id }).manifest.project_id, project_id);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
