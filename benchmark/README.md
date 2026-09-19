@@ -121,11 +121,16 @@ provider budget gates itself.
 layer. It accepts only an exact executor-run contract whose protocol digest,
 source/harness/workload/adapter digests, target base, disposable-root
 attestation, Actions/storage observations, identities, and positive caps agree.
-It validates a fixed future provider argv but never invokes it. A valid attempt
-appends `run_started` and a redacted `run_failed` record through
-`evidence.appendRecord`; input-digest drift and cap overflow are retained as
-evidence without raw provider output. Mode 1 records its unproved zero-Actions
-blocker. Mode 2 permits only the existing local V2 adapter and loopback harness
-route and remains blocked because provider execution is intentionally absent.
-It cannot publish, release, mutate GitHub, authorize Mode 3 timing, or persist
-a ledger.
+Its explicit evidence directory must have been created by
+`createDisposableCalibrationEvidenceRoot()`; every valid attempt atomically
+persists an append-only `live` ledger there and refuses a replacement or
+rewritten prefix. It probes only a configured absolute, non-shell executable
+with its fixed `--version` argv and requires that output to match the bound
+developer CLI version. A Mode 2 command has one fixed provider-turn allowance,
+the remaining token cap in its argv, and the remaining wall-time as its process
+timeout. It discards process output and a zero exit without a candidate receipt
+is unqualified evidence, never a benchmark success. Mode 2 also requires a
+caller-instantiated result from the existing V2 workload adapter and local
+loopback harness. Mode 1 records its unproved zero-Actions blocker. It cannot
+publish, release, mutate GitHub, authorize Mode 3 timing, or write outside its
+marked evidence directory.
