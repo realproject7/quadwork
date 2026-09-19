@@ -45,6 +45,7 @@ const CANDIDATE_FILES = Object.freeze([
   'server/resource-runtime-owner.js',
   'server/file-chat.js',
   'server/reviewed-execution-profiles.js',
+  'server/reviewed-execution-live-capability.js',
   'benchmark/live-provider-reviewed-contracts.cjs',
   'benchmark/v2-product-path-core.cjs',
   'benchmark/reviewed-execution-contract.cjs',
