@@ -11,6 +11,7 @@ const { fork } = require('node:child_process');
 const profiles = require('../server/reviewed-execution-profiles');
 const MAX_IPC_BYTES = 16 * 1024;
 const MAX_CHILD_MS = 60_000;
+const RESULT_DRAIN_MS = 100;
 const FIELDS = Object.freeze(['schema_version', 'purpose', 'profile_id', 'backend', 'model', 'expected_head', 'candidate_digest', 'gate_receipt_digest', 'result_class', 'provider_turns', 'lifecycle_verified', 'sentinel_digest', 'output_bytes', 'output_capped', 'elapsed_ms', 'root_cleanup_ok', 'survivor_free', 'source_rechecked_before_prompt', 'gate_rechecked_before_prompt', 'pre_root_facts', 'post_root_facts', 'credential_copy_or_store_api_used', 'keychain_immutability_claimed', 'peer_level_network_filter_available', 'release_evidence']);
 const RESULTS = new Set(['completed', 'preflight_blocked', 'launch_failed', 'launch_indeterminate', 'attempt_indeterminate', 'output_cap_exceeded', 'cleanup_failed', 'worker_verification_failed', 'worker_start_failed', 'worker_timeout', 'worker_result_invalid', 'worker_exit_unverified', 'worker_exited_without_result']);
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -25,15 +26,21 @@ function runFixedWorker(filename) {
   const profile = filename.includes('codex') ? profiles.PROFILES.v2_codex_readonly_v1 : profiles.PROFILES.v2_claude_restricted_v1;
   let verified; try { verified = verifyWorker(filename); } catch { return Promise.resolve(fixedFailure(profile, 'worker_verification_failed', 0)); }
   return new Promise(resolve => {
-    let settled = false, report = null, admitted = false, terminating = null; const nonce = crypto.randomBytes(32).toString('hex'), channelSecret = crypto.randomBytes(32); let child; let escalation = null;
-    const finish = value => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(escalation); try { child?.disconnect(); } catch {} resolve(value); };
-    const terminate = result => { if (terminating) return; terminating = result; try { child?.kill('SIGTERM'); } catch {} escalation = setTimeout(() => { try { child?.kill('SIGKILL'); } catch {} }, 2_000); };
+    let settled = false, report = null, admitted = false, terminating = null, exited = null; const nonce = crypto.randomBytes(32).toString('hex'), channelSecret = crypto.randomBytes(32); let child; let escalation = null, resultDrain = null;
+    const finish = value => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(escalation); clearTimeout(resultDrain); try { child?.disconnect(); } catch {} resolve(value); };
+    const concludeExit = () => {
+      if (!exited || settled) return;
+      if (terminating) return finish(fixedFailure(profile, terminating, 1, verified.candidate_digest));
+      if (report && exited.code === 0 && report.root_cleanup_ok && report.survivor_free) return finish(report);
+      finish(fixedFailure(profile, report ? 'worker_exit_unverified' : 'worker_exited_without_result', 1, verified.candidate_digest));
+    };
+    const terminate = result => { if (terminating) return; terminating = result; if (exited) return concludeExit(); try { child?.kill('SIGTERM'); } catch {} escalation = setTimeout(() => { try { child?.kill('SIGKILL'); } catch {} }, 2_000); };
     const timer = setTimeout(() => terminate('worker_timeout'), MAX_CHILD_MS);
     try { child = fork(verified.file, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc', 'pipe'], serialization: 'json', env: { PATH: process.env.PATH || '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C', QUADWORK_REVIEWED_EXECUTION_CHILD: '1', QUADWORK_REVIEWED_CANDIDATE_DIGEST: verified.candidate_digest, QUADWORK_REVIEWED_WORKER_DIGEST: verified.worker_digest, QUADWORK_REVIEWED_PARENT_NONCE: nonce } }); child.stdio[4].end(channelSecret); }
     catch { finish(fixedFailure(profile, 'worker_start_failed', 0)); return; }
-    child.on('message', message => { if (Buffer.byteLength(JSON.stringify(message)) > MAX_IPC_BYTES) return terminate('worker_result_invalid'); if (!admitted && message?.type === 'reviewed_execution_ready' && message.nonce === nonce && message.candidate_digest === verified.candidate_digest && message.worker_digest === verified.worker_digest && message.proof === crypto.createHmac('sha256', channelSecret).update(nonce).digest('hex')) { admitted = true; const admission = crypto.randomBytes(32).toString('hex'); child.send(Object.freeze({ type: 'reviewed_execution_admit', nonce, admission, proof: crypto.createHmac('sha256', channelSecret).update(`${nonce}:${admission}`).digest('hex') })); return; } if (admitted && message?.type === 'reviewed_execution_result' && reportShape(message.report, profile, verified.candidate_digest)) { report = redact(message.report); return; } terminate('worker_result_invalid'); });
+    child.on('message', message => { if (Buffer.byteLength(JSON.stringify(message)) > MAX_IPC_BYTES) return terminate('worker_result_invalid'); if (!admitted && message?.type === 'reviewed_execution_ready' && message.nonce === nonce && message.candidate_digest === verified.candidate_digest && message.worker_digest === verified.worker_digest && message.proof === crypto.createHmac('sha256', channelSecret).update(nonce).digest('hex')) { admitted = true; const admission = crypto.randomBytes(32).toString('hex'); child.send(Object.freeze({ type: 'reviewed_execution_admit', nonce, admission, proof: crypto.createHmac('sha256', channelSecret).update(`${nonce}:${admission}`).digest('hex') })); return; } if (admitted && message?.type === 'reviewed_execution_result' && reportShape(message.report, profile, verified.candidate_digest)) { report = redact(message.report); try { child.send(Object.freeze({ type: 'reviewed_execution_result_ack', nonce })); } catch {} if (exited) concludeExit(); return; } terminate('worker_result_invalid'); });
     child.once('error', () => { if (child) terminate('worker_start_failed'); else finish(fixedFailure(profile, 'worker_start_failed', 1, verified.candidate_digest)); });
-    child.once('exit', code => { if (terminating) return finish(fixedFailure(profile, terminating, 1, verified.candidate_digest)); if (report && code === 0 && report.root_cleanup_ok && report.survivor_free) finish(report); else finish(fixedFailure(profile, report ? 'worker_exit_unverified' : 'worker_exited_without_result', 1, verified.candidate_digest)); });
+    child.once('exit', code => { exited = Object.freeze({ code }); if (terminating || report) return concludeExit(); resultDrain = setTimeout(concludeExit, RESULT_DRAIN_MS); });
   });
 }
 function runReviewedCodex() { return runFixedWorker('reviewed-execution-live-worker-codex.cjs'); }

@@ -11,6 +11,32 @@ const runner = require('./reviewed-execution-live-runner.cjs');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
 function reportHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', 'module.exports = Object.freeze({ report });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function activeHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = 'let __removed = 0, __match = true; sourceFacts = () => fixed.facts; readGateReceipt = () => fixed.gate; rootFacts = () => ({ entries: ["base"], root_digest: "a".repeat(64), entry_digest: "a".repeat(64), entry_count: 1 }); rootMatches = () => __match; removeOwnedRoot = () => { __removed += 1; return true; }; module.exports = Object.freeze({ set(state, match) { fixed = state; parentAdmitted = true; __match = match; }, completeFixedChild, removed: () => __removed });'; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
+function exitRaceHarness() {
+  const filename = path.join(__dirname, 'reviewed-execution-live-runner.cjs');
+  const fakeFork = `const { EventEmitter } = require('node:events');
+const fork = (file, args, options) => {
+  const child = new EventEmitter(); let secret = null;
+  child.stdio = [null, null, null, null, { end(value) {
+    secret = Buffer.from(value);
+    queueMicrotask(() => child.emit('message', { type: 'reviewed_execution_ready', nonce: options.env.QUADWORK_REVIEWED_PARENT_NONCE, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, worker_digest: options.env.QUADWORK_REVIEWED_WORKER_DIGEST, proof: crypto.createHmac('sha256', secret).update(options.env.QUADWORK_REVIEWED_PARENT_NONCE).digest('hex') }));
+  } }];
+  child.disconnect = () => {};
+  child.kill = () => {};
+  child.send = message => {
+    if (message.type !== 'reviewed_execution_admit') return true;
+    const profile = profiles.PROFILES.v2_codex_readonly_v1;
+    const facts = { root_digest: 'a'.repeat(64), entry_digest: 'b'.repeat(64), entry_count: 1, remote_count: 0, changed_entry_count: 0 };
+    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: 'completed', provider_turns: 1, lifecycle_verified: true, sentinel_digest: 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: true, survivor_free: true, source_rechecked_before_prompt: true, gate_rechecked_before_prompt: true, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
+    process.nextTick(() => { child.emit('exit', 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
+    return true;
+  };
+  return child;
+};`;
+  const source = fs.readFileSync(filename, 'utf8')
+    .replace("const { fork } = require('node:child_process');", fakeFork)
+    .replace('module.exports = Object.freeze({ runReviewedCodex, runReviewedClaude });', 'module.exports = Object.freeze({ run: runReviewedCodex });');
+  const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports;
+}
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -20,6 +46,13 @@ test('parent has no server import, bridge, PTY, prompt, config or caller-control
   const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-runner.cjs'), 'utf8');
   for (const forbidden of ['../server/index.js', 'runner-bridge', 'node-pty', 'WORKLOAD', 'buildAgentArgs', 'spawnAgentPty', 'reviewed_session']) assert.equal(source.includes(forbidden), false, forbidden);
   assert.match(source, /verifyWorker\(filename\)/); assert.match(source, /fork\(verified\.file/); assert.match(source, /MAX_IPC_BYTES = 16 \* 1024/);
+});
+test('parent accepts a valid redacted result that is delivered adjacent to worker exit', async () => {
+  const result = await exitRaceHarness().run();
+  assert.equal(result.result_class, 'completed');
+  assert.equal(result.provider_turns, 1);
+  assert.equal(result.root_cleanup_ok, true);
+  assert.equal(result.survivor_free, true);
 });
 test('fixed workers carry source-fixed roles and prepare before loading the server', () => {
   for (const [file, role] of [['reviewed-execution-live-worker-codex.cjs', 'benchmark_codex'], ['reviewed-execution-live-worker-claude.cjs', 'benchmark_claude']]) {
@@ -68,6 +101,14 @@ test('child protocol has no test hook or caller-supplied launch surface and dire
   assert.match(source, /rootMatches\(state\.pre, post\)/);
   const protocol = require('./reviewed-execution-live-child-protocol.cjs');
   await assert.rejects(() => protocol.prepareFixedChild({}), /child_state/);
+});
+test('fixed children wait for the parent result receipt before exiting', () => {
+  const protocol = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'), 'utf8');
+  const server = fs.readFileSync(path.join(__dirname, '..', 'server', 'index.js'), 'utf8');
+  assert.match(protocol, /function sendResultAndAwaitParent\(reportValue, exitCode\)/);
+  assert.match(protocol, /reviewed_execution_result_ack/);
+  assert.match(server, /const sendReviewedResultAndAwaitParent = \(report, exitCode\)/);
+  assert.match(server, /reviewed_execution_result_ack/);
 });
 
 test('production pure evaluator accepts only the exact newline-delimited sentinel and binds the profile workload/cap', () => {
