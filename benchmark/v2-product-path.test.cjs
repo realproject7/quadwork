@@ -69,12 +69,8 @@ test('public runner rejects test seams, arbitrary command/model/argv, and an unk
 
 test('worker source has no provider-configurable pty or admission dependency seam', () => {
   const source = fs.readFileSync(path.join(__dirname, 'v2-product-path-worker.cjs'), 'utf8');
-  assert.match(source, /runtime\.spawnAgentPty/); assert.match(source, /runtime\.buildAgentArgs/);
-  assert.doesNotMatch(source, /ptySpawn|buildAgentArgs:\s*|spawnAgentPty:\s*|REVIEWED_EXECUTIONS|createReviewedExecutionAuthorization/);
-  assert.match(source, /if \(!preflight\(\)\).*preflight_blocked[\s\S]*spawnAgentPty/);
-  assert.match(source, /finally[\s\S]*stopAgentSession[\s\S]*runtime\.shutdown[\s\S]*postFacts/);
-  assert.match(source, /workerAuthorization\(root\)[\s\S]*validateExecutable\(\)[\s\S]*product_path_source_changed[\s\S]*require\('\.\.\/server\/index\.js'\)/);
-  assert.match(source, /if \(!preflight\(\)\)[\s\S]*require\('\.\.\/server\/index\.js'\)/, 'dependency loading occurs only after the zero-turn preflight');
+  assert.doesNotMatch(source, /(?:spawnAgentPty|buildAgentArgs|login['", ]|auth['", ]|\/write|WORKLOAD|WebSocket|http\.request|spawnSync)/);
+  assert.match(source, /workerAuthorization\(root\)[\s\S]*validateExecutable\(\)[\s\S]*product_path_source_changed[\s\S]*preflight_blocked/);
 });
 
 test('worker authorization is one-shot, root-owned, and its marker becomes part of the exact root layout', () => {
@@ -106,7 +102,7 @@ test('fake CLI traverses the real V2 spawnAgentPty admission and PTY lifecycle w
     const script = [
       "const fs=require('fs'), path=require('path');",
       "const runtime=require('./server/index.js');",
-      "(async()=>{ const built=await runtime.buildAgentArgs('benchmark-product-path','benchmark_claude'); if (JSON.stringify(built.args)!==JSON.stringify(['--model','claude-sonnet-4-6'])) throw new Error('unexpected args'); const launched=await runtime.spawnAgentPty('benchmark-product-path','benchmark_claude',{lifecycleSource:'operator_start',operatorAuthorized:true,explicitRole:true,suppressLifecycleMsg:true}); if(!launched.ok) throw new Error('launch failed'); let durable; for(let i=0;i<40;i++){ await new Promise(r=>setTimeout(r,25)); durable=JSON.parse(fs.readFileSync(path.join(process.env.HOME,'.quadwork','benchmark-product-path','agent-lifecycle-state.json'),'utf8')); if(durable.roles.benchmark_claude.state==='verified') break; } if(durable.roles.benchmark_claude.state!=='verified') throw new Error('not verified'); const stopped=await runtime.stopAgentSession('benchmark-product-path/benchmark_claude',{suppressLifecycleMsg:true,removeEntry:true}); if(!stopped.ok) throw new Error('stop failed'); await runtime.shutdown(); process.exit(0); })().catch(e=>{console.error(e.stack);process.exit(1)});",
+      "(async()=>{ const built=await runtime.buildAgentArgs('benchmark-product-path','benchmark_claude'); if (JSON.stringify(built.args)!==JSON.stringify(['--model','claude-sonnet-4-6'])) throw new Error('unexpected args'); const launched=await runtime.spawnAgentPty('benchmark-product-path','benchmark_claude',{lifecycleSource:'operator_start',operatorAuthorized:true,explicitRole:true,suppressLifecycleMsg:true}); if(!launched.ok||launched.backend!=='claude') throw new Error('launch backend mismatch'); let durable; for(let i=0;i<40;i++){ await new Promise(r=>setTimeout(r,25)); durable=JSON.parse(fs.readFileSync(path.join(process.env.HOME,'.quadwork','benchmark-product-path','agent-lifecycle-state.json'),'utf8')); if(durable.roles.benchmark_claude.state==='verified') break; } if(durable.roles.benchmark_claude.state!=='verified') throw new Error('not verified'); const stopped=await runtime.stopAgentSession('benchmark-product-path/benchmark_claude',{suppressLifecycleMsg:true,removeEntry:true}); if(!stopped.ok) throw new Error('stop failed'); await runtime.shutdown(); process.exit(0); })().catch(e=>{console.error(e.stack);process.exit(1)});",
     ].join('');
     const moduleRoots = [path.join(process.cwd(), 'node_modules'), path.join(path.dirname(process.cwd()), 'quadwork', 'node_modules')].filter(fs.existsSync);
     const result = spawnSync(process.execPath, ['-e', script], { cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home, USERPROFILE: home, QUADWORK_SKIP_LISTEN: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, NODE_PATH: moduleRoots.join(path.delimiter) || (process.env.NODE_PATH || '') }, encoding: 'utf8', timeout: 10_000 });

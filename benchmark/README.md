@@ -190,19 +190,16 @@ V2 server and uses its real `buildAgentArgs`, `buildAgentEnv`, `spawnAgentPty`,
 lifecycle admission, PTY, and stop paths. It rejects MCP/token/proxy and
 permission-bypass results before a provider prompt is written.
 
-Before V2 admission, the worker checks the reviewed resolved executable and
-version plus a local authentication/model-identity preflight; a failed check is
-a durable zero-turn block. It binds the server source digest and the effective
-V2 argument/environment profile digests before the prompt, then records both
-pre- and post-run no-remote/clean-root facts. Timeout handling first requests
-graceful worker teardown, and the worker's `finally` stops its exact owned PTY
-and V2 runtime before any result is emitted.
+Before V2 admission, the worker checks only the reviewed resolved executable,
+source, and owned-root integrity, then unconditionally writes a durable
+zero-turn `preflight_blocked` result. It never authenticates a provider, loads
+the V2 server, opens a PTY, attaches a terminal, or sends a workload. The
+separate fake-CLI test alone exercises V2 argument/lifecycle behavior.
 
 The worker also consumes one parent-issued authorization nonce and checks the
 exact owned-root marker/layout, source digest, and binary digest before loading
 the server. This is a same-user admission guard, not a credential boundary. No
-provider-auth directory is referenced in this contract: the isolated HOME
-therefore fails closed when authentication is unavailable. A future live-auth
+provider-auth directory is referenced in this contract. A future live-auth
 contract needs a provider-reviewed mechanism that can prove both read-only
 credential access and the safe CLI profile; it cannot be enabled by an env var
 or a caller-supplied path.

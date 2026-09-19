@@ -2543,8 +2543,8 @@ async function admitAgentPty(project, agent, opts = {}) {
     // never changes the lifecycle outcome or initiates a replacement action.
     if (agent === "head") appendHeadRecoveryLifecycle(project, result.operation, source);
   }
-  if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation, repository };
-  if (result.status === "verified") return { ok: true, lifecycle: result.operation, repository };
+  if (result.status === "spawned") return { ok: true, pid: result.pid, lifecycle: result.operation, repository, backend: agentSessions.get(`${project}/${agent}`)?.backend || null };
+  if (result.status === "verified") return { ok: true, lifecycle: result.operation, repository, backend: agentSessions.get(`${project}/${agent}`)?.backend || null };
   return {
     ok: false,
     code: result.reason || result.status,
