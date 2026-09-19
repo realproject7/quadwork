@@ -130,8 +130,11 @@ directory must have been created by `createDisposableCalibrationEvidenceRoot()`;
 each append uses an exclusive lock, a re-read/CAS prefix check, file and
 directory fsync, and an atomic rename. Reports retain only structured input
 digests, actual injected Actions/cache/artifact observations, and monotonic
-start/end/duration references; a bounded append-only `observations.json` index
-binds each ledger record to those secret-free structured observations. No
+start/end/duration references; each observation is first persisted as a
+secret-free content-addressed immutable file, and the authoritative ledger
+commits only its digest in `evidence_ref`. An unreferenced observation after an
+interrupted write is harmless; every committed ledger reference is rechecked.
+No
 provider text, credentials, or absolute artifact paths are retained publicly.
 
 Current `calibration-protocol.cjs` fixes `provider_execution_permitted` to
