@@ -15,6 +15,7 @@ node --test benchmark/v2-workload-adapter.test.cjs
 node --test benchmark/v2-disposable-runtime-harness.test.cjs
 node benchmark/calibration-protocol.cjs --protocol /path/to/mode-1-or-mode-2-protocol.json
 node --test benchmark/calibration-protocol.test.cjs
+node --test benchmark/calibration-executor.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -115,3 +116,16 @@ Mode 1 retains the zero-Actions feasibility blocker until a later bounded
 delivery exercise proves it. A separately reviewed executor must bind this
 exact digest to retained evidence and enforce the manifest, approval, and
 provider budget gates itself.
+
+`calibration-executor.cjs` is that separately bounded, non-shipping contract
+layer. It accepts only an exact executor-run contract whose protocol digest,
+source/harness/workload/adapter digests, target base, disposable-root
+attestation, Actions/storage observations, identities, and positive caps agree.
+It validates a fixed future provider argv but never invokes it. A valid attempt
+appends `run_started` and a redacted `run_failed` record through
+`evidence.appendRecord`; input-digest drift and cap overflow are retained as
+evidence without raw provider output. Mode 1 records its unproved zero-Actions
+blocker. Mode 2 permits only the existing local V2 adapter and loopback harness
+route and remains blocked because provider execution is intentionally absent.
+It cannot publish, release, mutate GitHub, authorize Mode 3 timing, or persist
+a ledger.
