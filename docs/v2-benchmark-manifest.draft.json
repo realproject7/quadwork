@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "status": "draft_unfrozen",
+  "contract_issue": "https://github.com/realproject7/quadwork/issues/1037",
+  "observed_on": "2026-09-19",
+  "product_sources": {
+    "v1": {
+      "package": "quadwork@2.7.1",
+      "sha": "59198955480c2224e1980e1645690d34a8ec0db3",
+      "tag": "v2.7.1",
+      "registry_integrity": "sha512-KqX0R5ckZ6R4c0gdDWV1LOigLiwpw36i3QzH+AU3S/h63daSKuj4PeGU/VOP29OT9y4DTDH9C/wtfrq7DZ93yA==",
+      "pr_1057_merged": false,
+      "artifact_verified": false
+    },
+    "v2": {
+      "sha": "9e1d08fc57ea46b2aa5356bfa573e8c028d1cdc8",
+      "verified_same_tree_candidate": "75a1230addc5516c0be2c1b043dc7912687da19a"
+    }
+  },
+  "harness_sha": null,
+  "workload_sha": null,
+  "task_bundle": null,
+  "performance_classes": ["pipeline_eligible", "dependency_overlap_bound"],
+  "modes": [
+    {"id": 1, "kind": "shipped_v1", "implementation_slots": 1, "reviewer_slots": 2, "definition": "Installed shipped source; local-policy feasibility unresolved"},
+    {"id": 2, "kind": "local_first_ablation", "implementation_slots": 1, "reviewer_slots": 2, "definition": "V2 primitives; serial single-ticket delivery; no pipelining or cross-ticket composition"},
+    {"id": 3, "kind": "v2", "implementation_slots": 1, "reviewer_slots": 2, "definition": "Normal authenticated V2 build, review and integrated repository delivery"},
+    {"id": 4, "kind": "direct_matched", "implementation_slots": 1, "reviewer_slots": 2, "definition": "Direct orchestration with matched host and role model budget"},
+    {"id": 5, "kind": "direct_ceiling", "implementation_slots": 2, "reviewer_slots": 2, "definition": "Descriptive two-builder ceiling; no universal speed ratio"}
+  ],
+  "role_models": null,
+  "host_budget": null,
+  "run_budget": null,
+  "cache_policy": null,
+  "run_order": null,
+  "mode_1_zero_actions_feasibility": "unproved",
+  "calibration_receipts": [],
+  "targets": {
+    "metric": "batch_wall_time_ms",
+    "eligible_class": "pipeline_eligible",
+    "v1_to_v2_percent": null,
+    "ablation_to_v2_percent": null,
+    "next_assignment_slo_ms": null,
+    "derivation": null
+  },
+  "operator_approval": null,
+  "independent_review": null,
+  "freeze_digest": null,
+  "prior_freeze_digest": null,
+  "mode_3_timing_permitted": false,
+  "actions_permitted": false,
+  "npm_publish_permitted": false
+}
