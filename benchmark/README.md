@@ -12,6 +12,7 @@ node --test benchmark/evidence.test.cjs
 node benchmark/v1-zero-actions.cjs --repo .
 node --test benchmark/v1-zero-actions.test.cjs
 node --test benchmark/v2-workload-adapter.test.cjs
+node --test benchmark/v2-disposable-runtime-harness.test.cjs
 ```
 
 The report verifies local product commit/tag/tree identities, calculates a
@@ -85,3 +86,19 @@ is replay coverage only: it does not attest that caller-supplied bindings were
 observed, start the server, use authenticated
 HTTP/MCP routes, launch a model, produce an authentic reviewer identity, or
 qualify as a live benchmark observation.
+
+`v2-disposable-runtime-harness.cjs` is the next local-only contract layer. It
+starts only a caller-owned loopback HTTP app and preserves the fixed V2 route
+names for build assignment and independent-review opening, receipt, and
+reconciliation. The app composes the production WorkTask runtime, live identity
+resolver, review/build services, and durable stores against a disposable config
+directory. Its role tokens exercise server-derived Head/reviewer identity and
+generation; they are synthetic local test identities, not provider or user
+authentication. It deliberately has no MCP endpoint, provider launcher, GitHub
+or Git transport, package/release operation, or process execution capability.
+It starts only from a root created by `createDisposableV2RuntimeRoot()` or an
+otherwise empty root explicitly marked with `markDisposableV2RuntimeRoot()`;
+the marker, ownership, permissions, canonical path, and empty-root condition
+are checked before the durable services are composed. A populated store
+namespace or any root/marker symlink is rejected without writing. It is replay
+coverage and cannot qualify as a live benchmark observation.
