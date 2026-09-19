@@ -93,7 +93,7 @@ async function completeFixedChild(role, runtime) {
   const state = fixed;
   if (!parentAdmitted || !state || state.profile.role !== role || !runtime || typeof runtime.launch !== 'function') throw new Error('reviewed_execution_child_state');
   let provider_turns = 0, launch_claim_state = 'none', lifecycle_verified = false, rechecked = false, stopped = null, shutdown = null, post = null;
-  const observer = outcome.createObserver();
+  const observer = outcome.createObserver(); let terminal_exited = false;
   try {
     await runtime.buildAgentArgs(profiles.PROJECT, role);
     runtime.buildAgentEnv(profiles.PROJECT, role);
@@ -103,14 +103,18 @@ async function completeFixedChild(role, runtime) {
     const session = launched?.reviewed_session;
     if (!launched?.ok || !session || typeof session.onData !== 'function' || typeof session.writeFixedWorkload !== 'function') throw new Error('launch');
     session.onData(chunk => observer.push(chunk));
+    if (typeof session.onExit === 'function') session.onExit(() => { terminal_exited = true; });
     const fresh = sourceFacts();
     readGateReceipt(state.profile, fresh);
     if (fresh.expected_head !== state.facts.expected_head || fresh.candidate_digest !== state.facts.candidate_digest || observer.snapshot().output_capped) throw new Error('drift');
     rechecked = true;
     session.writeFixedWorkload();
     const until = Date.now() + MAX_ELAPSED_MS;
-    while (Date.now() < until && !observer.snapshot().output_capped && !observer.snapshot().sentinel) await new Promise(resolve => setTimeout(resolve, 25));
-    const observed = observer.snapshot();
+    while (Date.now() < until && !terminal_exited && !observer.snapshot().output_capped && !observer.snapshot().sentinel) await new Promise(resolve => setTimeout(resolve, 25));
+    // Stop/shutdown itself emits a terminal exit. Freeze the observation
+    // before cleanup so that expected teardown cannot masquerade as a launch
+    // exit which occurred before any provider observation.
+    const observed = observer.snapshot(), terminal_exited_before_observation = terminal_exited;
     try { const lifecycle = JSON.parse(fs.readFileSync(path.join(state.locations.home, '.quadwork', profiles.PROJECT, 'agent-lifecycle-state.json'), 'utf8')); lifecycle_verified = lifecycle?.roles?.[role]?.state === 'verified'; } catch {}
     stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${role}`, { suppressLifecycleMsg: true, removeEntry: true });
     shutdown = await runtime.shutdown();
@@ -120,7 +124,7 @@ async function completeFixedChild(role, runtime) {
     const root_removed = removeOwnedRoot(state.root);
     const root_clean = postcondition_ok && root_removed;
     const environment_restored = restore();
-    const decision = outcome.finalizeEffects({ provider_turns, lifecycle: lifecycle_verified ? 'verified' : 'unverified', sentinel: observed.sentinel, output_capped: observed.output_capped, timed_out: !observed.sentinel && !observed.output_capped, effects: { stop: () => stopped?.ok === true, shutdown: () => shutdown?.ok === true, survivor: () => survivor_free, root: () => root_clean, git: () => post !== null, environment: () => environment_restored } });
+    const decision = outcome.finalizeEffects({ provider_turns, lifecycle: lifecycle_verified ? 'verified' : 'unverified', sentinel: observed.sentinel, output_capped: observed.output_capped, terminal_exited: terminal_exited_before_observation && !observed.sentinel && !observed.output_capped, timed_out: !terminal_exited_before_observation && !observed.sentinel && !observed.output_capped, effects: { stop: () => stopped?.ok === true, shutdown: () => shutdown?.ok === true, survivor: () => survivor_free, root: () => root_clean, git: () => post !== null, environment: () => environment_restored } });
     return report(state.profile, state.facts, { gate_receipt_digest: state.gate.receipt_digest, result_class: decision.result_class, launch_claim_state, failure_stage: decision.result_class === 'completed' ? 'none' : 'postclaim', lifecycle_verified: decision.lifecycle_verified, sentinel: observed.sentinel, output_bytes: observed.output_bytes, output_capped: observed.output_capped, elapsed_ms: Date.now() - state.started, root_cleanup_ok: decision.root_cleanup_ok, survivor_free: decision.survivor_free, rechecked, pre: state.pre, post });
   } catch {
     launch_claim_state = launchClaimState(state);
