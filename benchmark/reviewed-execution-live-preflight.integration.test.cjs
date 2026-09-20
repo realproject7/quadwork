@@ -5,6 +5,7 @@
 // copy deliberately names a missing binary, so it cannot launch a provider.
 const assert = require('node:assert/strict');
 const { execFileSync, spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -78,6 +79,11 @@ function copyActiveChildFixture(directory) {
   for (const [name, source] of Object.entries(modules)) { const target = path.join(directory, 'node_modules', name, 'index.js'); mkdir(path.dirname(target)); fs.writeFileSync(target, source, { mode: 0o600 }); }
   execFileSync('/usr/bin/git', ['init', '-q'], { cwd: directory }); execFileSync('/usr/bin/git', ['config', 'user.email', 'quadwork-test@invalid'], { cwd: directory }); execFileSync('/usr/bin/git', ['config', 'user.name', 'QuadWork test'], { cwd: directory }); execFileSync('/usr/bin/git', ['add', '.'], { cwd: directory }); execFileSync('/usr/bin/git', ['commit', '-qm', 'fixture'], { cwd: directory });
   return require(path.join(directory, 'server', 'reviewed-execution-profiles.js'));
+}
+function installCodexFinalMessageFixture(directory, observation) {
+  const fake = `const fs=require('fs');module.exports={spawn(command,args){const final=args[args.indexOf('--output-last-message')+1];const workload=args.at(-1);fs.writeFileSync(${JSON.stringify(observation)},JSON.stringify({command,args,final,workload}));const data=[],exits=new Set(),emit=()=>{for(const fn of exits)fn({})};setTimeout(()=>{fs.writeFileSync(final,'QUADWORK_V2_PRODUCT_PATH_OK',{mode:0o600});emit()},10);return {onData(fn){data.push(fn);return {dispose(){}}},onExit(fn){exits.add(fn);return {dispose(){exits.delete(fn)}}},write(){fs.writeFileSync(${JSON.stringify(observation)}+'.write','unexpected');},kill(){queueMicrotask(emit);return true}}}};`;
+  const target = path.join(directory, 'node_modules', 'node-pty', 'index.js'); fs.writeFileSync(target, fake, { mode: 0o600 }); fs.chmodSync(target, 0o600);
+  execFileSync('/usr/bin/git', ['add', 'node_modules/node-pty/index.js'], { cwd: directory }); execFileSync('/usr/bin/git', ['commit', '-qm', 'codex final fixture'], { cwd: directory });
 }
 function gateFixture(home, profiles, expectedHead, candidateDigest, profileId = 'v2_codex_readonly_v1') {
   const support = path.join(home, 'Library', 'Application Support', 'QuadWork');
@@ -217,9 +223,9 @@ test('source-fixed claimed run returns an attested redacted failure after its re
     const profiles = copyActiveChildFixture(fixture);
     const expectedHead = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).trim();
     const candidateDigest = profiles.candidateDigest(fixture);
-    const gate = gateFixture(home, profiles, expectedHead, candidateDigest);
+    const gate = gateFixture(home, profiles, expectedHead, candidateDigest, 'v2_claude_restricted_v1');
     const runner = path.join(fixture, 'benchmark', 'reviewed-execution-live-runner.cjs');
-    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedCodex().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
+    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedClaude().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
       cwd: fixture, encoding: 'utf8', timeout: 15_000,
       env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, USERPROFILE: home, QUADWORK_REVIEWED_FIXTURE_CLAIMED_RUN: '1', QUADWORK_REVIEWED_FIXTURE_FORCE_NONZERO_EXIT: '1' },
     });
@@ -270,7 +276,7 @@ test('source-fixed claim followed by a pre-terminal PTY failure attests removal 
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
-test('source-fixed claimed zero-output timeout proves prompt delivery reached the observed PTY, without a provider process', () => {
+test('source-fixed Claude zero-output timeout proves PTY prompt delivery without a provider process', () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-zero-output-source-'));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-zero-output-home-'));
   const promptMarker = path.join(home, 'fixed-prompt-write');
@@ -278,9 +284,9 @@ test('source-fixed claimed zero-output timeout proves prompt delivery reached th
     const profiles = copyActiveChildFixture(fixture);
     const expectedHead = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).trim();
     const candidateDigest = profiles.candidateDigest(fixture);
-    const gate = gateFixture(home, profiles, expectedHead, candidateDigest);
+    const gate = gateFixture(home, profiles, expectedHead, candidateDigest, 'v2_claude_restricted_v1');
     const runner = path.join(fixture, 'benchmark', 'reviewed-execution-live-runner.cjs');
-    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedCodex().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
+    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedClaude().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
       cwd: fixture, encoding: 'utf8', timeout: 15_000,
       env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, USERPROFILE: home, QUADWORK_REVIEWED_FIXTURE_ZERO_OUTPUT: '1', QUADWORK_REVIEWED_FIXTURE_PROMPT_MARKER: promptMarker },
     });
@@ -308,7 +314,7 @@ test('source-fixed claimed zero-output timeout proves prompt delivery reached th
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
-test('source-fixed claimed PTY exit before observation is classified separately from a zero-output timeout', () => {
+test('source-fixed Claude PTY exit before observation is classified separately from a zero-output timeout', () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-zero-output-exit-source-'));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-zero-output-exit-home-'));
   const promptMarker = path.join(home, 'fixed-prompt-write');
@@ -316,9 +322,9 @@ test('source-fixed claimed PTY exit before observation is classified separately 
     const profiles = copyActiveChildFixture(fixture);
     const expectedHead = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).trim();
     const candidateDigest = profiles.candidateDigest(fixture);
-    const gate = gateFixture(home, profiles, expectedHead, candidateDigest);
+    const gate = gateFixture(home, profiles, expectedHead, candidateDigest, 'v2_claude_restricted_v1');
     const runner = path.join(fixture, 'benchmark', 'reviewed-execution-live-runner.cjs');
-    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedCodex().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
+    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedClaude().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], {
       cwd: fixture, encoding: 'utf8', timeout: 15_000,
       env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, USERPROFILE: home, QUADWORK_REVIEWED_FIXTURE_ZERO_OUTPUT: '1', QUADWORK_REVIEWED_FIXTURE_ZERO_OUTPUT_EXIT: '1', QUADWORK_REVIEWED_FIXTURE_PROMPT_MARKER: promptMarker },
     });
@@ -342,6 +348,29 @@ test('source-fixed claimed PTY exit before observation is classified separately 
     fs.rmSync(fixture, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+test('source-fixed Codex argv completion uses the transient final-message file and never writes a PTY prompt', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-codex-final-source-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-codex-final-home-'));
+  const observation = path.join(home, 'fixed-codex-argv.json');
+  try {
+    const profiles = copyActiveChildFixture(fixture); installCodexFinalMessageFixture(fixture, observation);
+    const expectedHead = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).trim();
+    const candidateDigest = profiles.candidateDigest(fixture); const gate = gateFixture(home, profiles, expectedHead, candidateDigest);
+    const runner = path.join(fixture, 'benchmark', 'reviewed-execution-live-runner.cjs');
+    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedCodex().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], { cwd: fixture, encoding: 'utf8', timeout: 15_000, env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, USERPROFILE: home } });
+    assert.equal(invoked.status, 0, `${invoked.stdout}\n${invoked.stderr}`);
+    assert.ok(fs.existsSync(observation), `${invoked.stdout}\n${invoked.stderr}`);
+    const result = JSON.parse(invoked.stdout), launch = JSON.parse(fs.readFileSync(observation, 'utf8'));
+    const profile = profiles.PROFILES.v2_codex_readonly_v1;
+    assert.deepEqual(launch.args.slice(launch.args.indexOf(profile.executable) + 1), [...profile.provider_argv, '-C', path.join(path.dirname(launch.final), 'repository'), '--output-last-message', launch.final, profiles.WORKLOAD]);
+    assert.equal(launch.workload, profiles.WORKLOAD); assert.equal(path.basename(launch.final), profiles.CODEX_FINAL_MESSAGE);
+    assert.equal(fs.existsSync(`${observation}.write`), false); assert.equal(fs.existsSync(launch.final), false);
+    assert.equal(result.workload_write_attempted, false); assert.equal(result.workload_submitted_at_launch, true); assert.equal(result.terminal_exit_phase, 'after_launch_submission');
+    assert.equal(result.sentinel_digest, crypto.createHash('sha256').update('QUADWORK_V2_PRODUCT_PATH_OK').digest('hex')); assert.equal(result.output_bytes, 0); assert.equal(result.root_cleanup_ok, true); assert.equal(result.survivor_free, true);
+    const encoded = JSON.stringify(result); for (const secret of [profiles.WORKLOAD, launch.final, home, fixture]) assert.equal(encoded.includes(secret), false);
+    assert.equal(fs.existsSync(path.join(gate.ledger, `${gate.authorization_key}.launch`)), true);
+  } finally { fs.rmSync(fixture, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
 });
 test('source-fixed claimed PTY exit before the server wrapper is redacted as the host launch boundary', () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-pty-unavailable-source-'));

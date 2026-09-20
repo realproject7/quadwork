@@ -9,6 +9,10 @@ const path = require('node:path');
 const PROJECT = 'benchmark-product-path';
 const SANDBOX_EXECUTABLE = '/usr/bin/sandbox-exec';
 const CODEX_HOME = '/Users/cho/.codex';
+// The reviewed Codex command writes its only completion signal here.  This is
+// deliberately at the disposable-root boundary (rather than the repository)
+// so it can be removed before the post-run repository/root facts are taken.
+const CODEX_FINAL_MESSAGE = '.quadwork-v2-codex-final-message';
 const WORKLOAD = 'Reply with exactly: QUADWORK_V2_PRODUCT_PATH_OK';
 const SENTINEL_RULE = 'exact_stdout_line:QUADWORK_V2_PRODUCT_PATH_OK';
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -22,7 +26,11 @@ const PROFILES = Object.freeze({
     executable_digest: '62709f1e3beddf61abdc16fc6e702e7fc90ad2aed26e33e6d319ab4a5a090c7a',
     version_digest: 'd11fe443fb44b5a2250aad94b2ec3971cf2ab34e65ecc9895017ff03160add90',
     model: 'gpt-5.6-luna',
-    provider_argv: Object.freeze(['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--ask-for-approval', 'never', '-c', 'model="gpt-5.6-luna"']),
+    // The dynamic disposable paths and source-fixed workload are appended by
+    // reviewedProviderArgv() at final launch.  Keeping this base closed makes
+    // the preclaim path provider-free while the actual Codex launch matches
+    // the proven noninteractive argv contract.
+    provider_argv: Object.freeze(['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--color', 'never', '-m', 'gpt-5.6-luna']),
     env: Object.freeze({ CODEX_HOME }),
   }),
   v2_claude_restricted_v1: Object.freeze({
@@ -74,6 +82,18 @@ function resolveReviewedExecution(projectId, role, reviewedExecutionId) {
   const profile = PROFILES[reviewedExecutionId];
   if (!profile || profile.role !== role) return null;
   return profile;
+}
+
+function codexFinalMessagePath(disposableRoot) {
+  if (!safeAbsolutePath(disposableRoot)) throw new Error('reviewed_execution_root_invalid');
+  return path.join(disposableRoot, CODEX_FINAL_MESSAGE);
+}
+
+function reviewedProviderArgv(profile, repository, disposableRoot) {
+  if (!profile || !safeAbsolutePath(repository) || !safeAbsolutePath(disposableRoot)) throw new Error('reviewed_execution_argv_invalid');
+  if (profile.backend !== 'codex') return profile.provider_argv;
+  if (repository !== path.join(disposableRoot, 'repository')) throw new Error('reviewed_execution_argv_invalid');
+  return Object.freeze([...profile.provider_argv, '-C', repository, '--output-last-message', codexFinalMessagePath(disposableRoot), WORKLOAD]);
 }
 
 function sandboxSource(profile, candidate, disposableRoot, ledgerDirectory) {
@@ -163,10 +183,10 @@ function reviewedLaunchPlan(projectId, role, reviewedExecutionId, binding) {
   const sandbox = validateSandbox(profile, binding.candidate_digest, root, ledger, binding.sandbox_profile, binding.sandbox_digest);
   return Object.freeze({
     executable: SANDBOX_EXECUTABLE,
-    argv: Object.freeze(['-f', sandbox, profile.executable, ...profile.provider_argv]),
+    argv: Object.freeze(['-f', sandbox, profile.executable, ...reviewedProviderArgv(profile, repository, root)]),
     env: Object.freeze({ ...profile.env }),
     backend: profile.backend,
-    prompt_delivery: 'pty_write',
+    prompt_delivery: profile.backend === 'codex' ? 'argv' : 'pty_write',
     profile_id: profile.id,
     disposable_root: root,
     repository,
@@ -174,4 +194,4 @@ function reviewedLaunchPlan(projectId, role, reviewedExecutionId, binding) {
   });
 }
 
-module.exports = Object.freeze({ CANDIDATE_FILES, CODEX_HOME, PROJECT, PROFILES, SANDBOX_EXECUTABLE, SENTINEL_RULE, WORKLOAD, candidateDigest, claimAuthorization, resolveReviewedExecution, reviewedLaunchPlan, sandboxSource, sha256 });
+module.exports = Object.freeze({ CANDIDATE_FILES, CODEX_FINAL_MESSAGE, CODEX_HOME, PROJECT, PROFILES, SANDBOX_EXECUTABLE, SENTINEL_RULE, WORKLOAD, candidateDigest, claimAuthorization, codexFinalMessagePath, resolveReviewedExecution, reviewedLaunchPlan, reviewedProviderArgv, sandboxSource, sha256 });

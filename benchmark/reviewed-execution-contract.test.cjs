@@ -15,7 +15,7 @@ function makeDirectory(parent, name) { const directory = path.join(parent, name)
 
 test('the closed profile registry contains only the reviewed Codex and Claude launches', () => {
   assert.deepEqual(Object.keys(profiles.PROFILES).sort(), ['v2_claude_restricted_v1', 'v2_codex_readonly_v1']);
-  assert.deepEqual(profiles.PROFILES.v2_codex_readonly_v1.provider_argv, ['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--ask-for-approval', 'never', '-c', 'model="gpt-5.6-luna"']);
+  assert.deepEqual(profiles.PROFILES.v2_codex_readonly_v1.provider_argv, ['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--color', 'never', '-m', 'gpt-5.6-luna']);
   assert.deepEqual(profiles.PROFILES.v2_claude_restricted_v1.provider_argv, ['--restricted', '--safe-mode', '--strict-mcp-config', '--tools', '', '--permission-mode', 'dontAsk', '--permission-prompts', 'none', '--model', 'claude-sonnet-4-6']);
   assert.equal(profiles.resolveReviewedExecution('ordinary-project', 'benchmark_codex', 'v2_codex_readonly_v1'), null);
   assert.equal(profiles.resolveReviewedExecution('benchmark-product-path', 'benchmark_codex', 'v2_claude_restricted_v1'), null);
@@ -43,9 +43,9 @@ test('final PTY launch plan is exactly sandbox-exec plus the fixed profile comma
   const sandbox = contract.createSandbox({ profile_id: profile.id, candidate_digest: candidate, disposable_root: root, ledger_directory: ledger, sandbox_directory: sandboxParent });
   const plan = profiles.reviewedLaunchPlan('benchmark-product-path', 'benchmark_codex', profile.id, { candidate_digest: candidate, disposable_root: root, ledger_directory: ledger, authorization_key: authorization.authorization_key, sandbox_profile: sandbox.path, sandbox_digest: sandbox.digest });
   assert.equal(plan.executable, '/usr/bin/sandbox-exec');
-  assert.deepEqual(plan.argv, ['-f', sandbox.path, profile.executable, ...profile.provider_argv]);
+  assert.deepEqual(plan.argv, ['-f', sandbox.path, profile.executable, ...profile.provider_argv, '-C', plan.repository, '--output-last-message', path.join(plan.disposable_root, profiles.CODEX_FINAL_MESSAGE), profiles.WORKLOAD]);
   assert.deepEqual(plan.env, { CODEX_HOME: '/Users/cho/.codex' });
-  assert.equal(plan.backend, 'codex'); assert.equal(plan.prompt_delivery, 'pty_write');
+  assert.equal(plan.backend, 'codex'); assert.equal(plan.prompt_delivery, 'argv');
   const binding = { candidate_digest: candidate, disposable_root: root, ledger_directory: ledger, authorization_key: authorization.authorization_key, sandbox_profile: sandbox.path, sandbox_digest: sandbox.digest };
   profiles.claimAuthorization(profile, binding);
   assert.throws(() => profiles.claimAuthorization(profile, binding), /authorization_claimed/);

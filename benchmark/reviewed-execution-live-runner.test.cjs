@@ -5,11 +5,13 @@ const crypto = require('node:crypto');
 const Module = require('node:module');
 const profiles = require('../server/reviewed-execution-profiles');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const runner = require('./reviewed-execution-live-runner.cjs');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
 function reportHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', 'module.exports = Object.freeze({ report, launchClaimState });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
+function finalMessageHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = 'module.exports = Object.freeze({ cleanupRootIdentity, createCodexFinalMessage, consumeCodexFinalMessage, cleanupCodexFinalMessage });'; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function activeHarness(claimState = 'claimed') { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = `let __removed = 0, __match = true; sourceFacts = () => fixed.facts; readGateReceipt = () => fixed.gate; launchClaimState = () => ${JSON.stringify(claimState)}; rootFacts = () => ({ entries: ["base"], root_digest: "a".repeat(64), entry_digest: "a".repeat(64), entry_count: 1 }); rootMatches = () => __match; removeOwnedRoot = () => { __removed += 1; return true; }; module.exports = Object.freeze({ set(state, match) { fixed = state; parentAdmitted = true; __match = match; }, completeFixedChild, removed: () => __removed });`; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function resultHarness(mode) {
   const filename = path.join(__dirname, 'reviewed-execution-live-runner.cjs');
@@ -31,13 +33,13 @@ const fork = (file, args, options) => {
     const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure'; const claimedCleanupAndExit = resultHarnessMode === 'claimed-cleanup-and-exit'; const reportAbsent = resultHarnessMode === 'report-absent'; const forgedPhase = resultHarnessMode === 'forged-phase'; const forgedDisposition = resultHarnessMode === 'forged-disposition'; const forgedAfterWithoutWrite = resultHarnessMode === 'forged-after-without-write'; const forgedPreObserver = resultHarnessMode === 'forged-pre-observer'; const forgedZeroTurnActivity = resultHarnessMode === 'forged-zero-turn-activity'; const forgedCompletedWithoutWrite = resultHarnessMode === 'forged-completed-without-write';
     const cleanupFailure = resultHarnessMode === 'prelaunch-cleanup-failure' || oneTurnUnsafe || claimedCleanupAndExit;
     const postclaimFailure = malformedClaim || claimedNonzeroFailure || unverifiedNonzeroFailure;
-    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', launch_diagnostic: 'none', pre_observer_pty_data_seen: false, pre_workload_output_seen: false, workload_write_attempted: !prelaunch, terminal_exit_phase: 'none', worker_report_disposition: 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
+    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', launch_diagnostic: 'none', pre_observer_pty_data_seen: false, pre_workload_output_seen: false, workload_write_attempted: false, workload_submitted_at_launch: !prelaunch, terminal_exit_phase: 'none', worker_report_disposition: 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
     if (forgedPhase) report.terminal_exit_phase = 'forged';
     if (forgedDisposition) report.worker_report_disposition = 'claimed_exit_unattested';
     if (forgedAfterWithoutWrite) { report.terminal_exit_phase = 'after_workload_attempt'; report.workload_write_attempted = false; }
     if (forgedPreObserver) report.pre_observer_pty_data_seen = true;
     if (forgedZeroTurnActivity) { report.provider_turns = 0; report.launch_claim_state = 'none'; report.failure_stage = 'prelaunch'; report.result_class = 'preflight_blocked'; report.workload_write_attempted = true; }
-    if (forgedCompletedWithoutWrite) report.workload_write_attempted = false;
+    if (forgedCompletedWithoutWrite) report.workload_submitted_at_launch = false;
     if (reportAbsent) {
       queueMicrotask(() => child.emit('exit', 0));
     } else if (resultHarnessMode === 'duplicate') {
@@ -263,13 +265,41 @@ test('non-launching production report harness redacts prompt, output, path and t
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const report = reportHarness().report(profile, { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, { prompt: profiles.WORKLOAD, output: 'token=private', path: '/private/root', token: 'private', result_class: 'attempt_indeterminate' }); const text = JSON.stringify(report);
   for (const hidden of [profiles.WORKLOAD, 'token=private', '/private/root', 'private']) assert.equal(text.includes(hidden), false);
 });
+test('Codex transient final-message channel accepts only an owned exact sentinel and always removes the file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-final-message-')); fs.chmodSync(root, 0o700); const marker = path.join(root, '.quadwork-v2-product-path-root-v1'); fs.writeFileSync(marker, 'quadwork-v2-product-path-v1\n', { mode: 0o600 }); fs.chmodSync(marker, 0o600);
+  const final = profiles.codexFinalMessagePath(root); const outside = path.join(root, 'outside'); const channel = finalMessageHarness(); const cleanupRoot = channel.cleanupRootIdentity(root);
+  try {
+    channel.createCodexFinalMessage(root, cleanupRoot); assert.equal(fs.lstatSync(final).isFile(), true); assert.equal(fs.statSync(final).mode & 0o777, 0o600);
+    fs.writeFileSync(final, outcome.SENTINEL, { mode: 0o600 }); fs.chmodSync(final, 0o600);
+    assert.equal(channel.consumeCodexFinalMessage(root, cleanupRoot), true); assert.equal(fs.existsSync(final), false);
+    channel.createCodexFinalMessage(root, cleanupRoot); fs.writeFileSync(final, 'private provider output', { mode: 0o600 }); fs.chmodSync(final, 0o600);
+    const rejected = channel.consumeCodexFinalMessage(root, cleanupRoot); assert.equal(rejected, false); assert.equal(fs.existsSync(final), false); assert.equal(JSON.stringify({ rejected }).includes('private provider output'), false);
+    channel.createCodexFinalMessage(root, cleanupRoot); fs.writeFileSync(final, outcome.SENTINEL, { mode: 0o600 }); fs.chmodSync(final, 0o644);
+    assert.equal(channel.consumeCodexFinalMessage(root, cleanupRoot), false); assert.equal(fs.existsSync(final), false);
+    fs.writeFileSync(outside, outcome.SENTINEL, { mode: 0o600 }); fs.symlinkSync(outside, final);
+    assert.equal(channel.consumeCodexFinalMessage(root, cleanupRoot), false); assert.equal(fs.existsSync(final), false); assert.equal(fs.existsSync(outside), true);
+    channel.createCodexFinalMessage(root, cleanupRoot); channel.cleanupCodexFinalMessage(cleanupRoot); assert.equal(fs.existsSync(final), false);
+    // A provider can remove the mutable marker, but cannot replace the
+    // captured root identity. The fixed final basename is still unlinked.
+    fs.unlinkSync(marker); fs.chmodSync(root, 0o755); fs.writeFileSync(final, 'raw final content', { mode: 0o644 }); fs.chmodSync(final, 0o644);
+    assert.equal(channel.cleanupCodexFinalMessage(cleanupRoot), true); assert.equal(fs.existsSync(final), false);
+    fs.symlinkSync(outside, final); assert.equal(channel.cleanupCodexFinalMessage(cleanupRoot), true); assert.equal(fs.existsSync(final), false); assert.equal(fs.existsSync(outside), true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+test('Codex submits its fixed workload at launch and never by a later PTY write', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'), 'utf8');
+  assert.match(source, /if \(!codex\) \{ workload_write_attempted = true; session\.writeFixedWorkload\(\); \}/);
+  assert.match(source, /const completion_sentinel = codex \? final_message_valid : observed\.sentinel/);
+  assert.match(source, /if \(codex\) createCodexFinalMessage\(state\.root, state\.cleanup_root\)/);
+  assert.match(source, /if \(codex\) cleanupCodexFinalMessage\(state\.cleanup_root\)/);
+});
 test('active protocol harness always attempts controlled removal and preserves cleanup_failed in normal/catch paths', async () => {
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const makeState = () => ({ profile, facts: { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, gate: { receipt_digest: 'c'.repeat(64) }, root: '/fake', locations: { home: '/fake-home' }, pre: { entries: ['base'] }, previous: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN }, started: Date.now() });
   const normal = activeHarness(); normal.set(makeState(), true); const listeners = []; const normalResult = await normal.completeFixedChild(profile.role, { buildAgentArgs: async () => {}, buildAgentEnv: () => ({}), launch: async () => ({ ok: true, reviewed_session: { onData: listener => listeners.push(listener), preObserverPtyDataSeen: () => false, writeFixedWorkload: () => listeners.forEach(listener => listener(`${outcome.SENTINEL}\n`)) } }), stopAgentSession: async () => ({ ok: true, resources: { ptys: 1, sessions: 1 } }), shutdown: async () => ({ ok: true }) }); assert.equal(normal.removed(), 1); assert.notEqual(normalResult.result_class, 'cleanup_failed');
   const caught = activeHarness(); caught.set(makeState(), false); const caughtResult = await caught.completeFixedChild(profile.role, { buildAgentArgs: async () => {}, buildAgentEnv: () => ({}), launch: async () => { throw new Error('remote rejected'); }, stopAgentSession: async () => ({ ok: false, resources: {} }), shutdown: async () => ({ ok: true }) }); assert.equal(caught.removed(), 1); assert.equal(caughtResult.result_class, 'cleanup_failed'); assert.equal(caughtResult.provider_turns, 1);
 });
 test('active child retains only redacted synthetic pre-observer PTY evidence across an early exit', async () => {
-  const profile = profiles.PROFILES.v2_codex_readonly_v1;
+  const profile = profiles.PROFILES.v2_claude_restricted_v1;
   const makeState = () => ({ profile, facts: { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, gate: { receipt_digest: 'c'.repeat(64) }, root: '/fake', locations: { home: '/fake-home' }, pre: { entries: ['base'] }, previous: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN }, started: Date.now() });
   for (const [preObserverData, label] of [[true, 'synthetic data before observer'], [false, 'synthetic no-data exit']]) {
     const active = activeHarness(); active.set(makeState(), true); let exit;
@@ -294,7 +324,7 @@ test('active child retains only redacted synthetic pre-observer PTY evidence acr
   }
 });
 test('active child records only bounded workload and terminal phases', async () => {
-  const profile = profiles.PROFILES.v2_codex_readonly_v1;
+  const profile = profiles.PROFILES.v2_claude_restricted_v1;
   const makeState = () => ({ profile, facts: { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, gate: { receipt_digest: 'c'.repeat(64) }, root: '/fake', locations: { home: '/fake-home' }, pre: { entries: ['base'] }, previous: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN }, started: Date.now() });
   for (const [exitBeforeWorkload, outputBeforeWorkload, phase, label] of [[true, false, 'before_workload_attempt', 'exit first'], [false, false, 'after_workload_attempt', 'exit after write'], [false, true, 'after_workload_attempt', 'output before write']]) {
     const active = activeHarness(); active.set(makeState(), true); let data, exit;
