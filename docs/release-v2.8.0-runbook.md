@@ -152,12 +152,19 @@ The resumed checklist must distinguish these proofs:
 Record append-only raw-free receipts: scenario and attempt identity, UTC time,
 source commit, archive digest, installed-file verification, provider/model
 identity, declared bounds, success/failure/block class, and bounded lifecycle
-and cleanup facts. Preserve failures. Retain no raw prompts, terminal/provider
-output, authentication data, or Keychain data. Do not capture transcripts or
-persist those values in screenshots, logs, issues, or reports. Remove only
-executor-owned transient scenario data within the declared cleanup scope;
-retain the sanitized receipts and historical evidence. If the chosen path
-cannot meet these retention or authority limits, stop and record the gate.
+and cleanup facts. Preserve failures. Evidence receipts, screenshots, logs,
+issues, and reports must contain no raw prompts, terminal/provider output,
+authentication data, or Keychain data. Do not capture an extra transcript.
+The ordinary product may temporarily keep scrollback or chat data while it
+runs; the reviewed runner's non-retention behavior does not prove otherwise.
+Before a later ordinary-product action, establish that its temporary data can
+stay within the declared executor-owned scope and be removed during cleanup.
+No raw content may remain after the scenario. Do not inspect, import, or alter
+provider authentication or Keychain data to establish that condition. If
+confinement or cleanup cannot be established within existing authority, record
+a retention gate and stop before the action. Remove only owned transient data;
+retain sanitized receipts and historical evidence. This policy adds no product
+retention bypass or provider-state authority.
 
 No automatic retry or reviewed-runner fallback is authorized. A failed action
 blocks the corresponding support and publish recommendation. Successful local
