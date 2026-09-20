@@ -281,7 +281,7 @@ test('Codex transient final-message channel accepts only an owned exact sentinel
     channel.createCodexFinalMessage(root, cleanupRoot); channel.cleanupCodexFinalMessage(cleanupRoot); assert.equal(fs.existsSync(final), false);
     // A provider can remove the mutable marker, but cannot replace the
     // captured root identity. The fixed final basename is still unlinked.
-    fs.unlinkSync(marker); fs.writeFileSync(final, 'raw final content', { mode: 0o600 }); fs.chmodSync(final, 0o600);
+    fs.unlinkSync(marker); fs.chmodSync(root, 0o755); fs.writeFileSync(final, 'raw final content', { mode: 0o644 }); fs.chmodSync(final, 0o644);
     assert.equal(channel.cleanupCodexFinalMessage(cleanupRoot), true); assert.equal(fs.existsSync(final), false);
     fs.symlinkSync(outside, final); assert.equal(channel.cleanupCodexFinalMessage(cleanupRoot), true); assert.equal(fs.existsSync(final), false); assert.equal(fs.existsSync(outside), true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

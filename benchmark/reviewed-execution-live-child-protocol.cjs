@@ -73,7 +73,7 @@ function cleanupRootIdentity(root) {
 function checkedCleanupRoot(identity) {
   if (!identity || typeof identity.root !== 'string' || !Number.isSafeInteger(identity.device) || !Number.isSafeInteger(identity.inode)) throw new Error('reviewed_execution_cleanup_root_unsafe');
   const stat = fs.lstatSync(identity.root);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || mode(stat) !== 0o700 || !sameUser(stat) || stat.dev !== identity.device || stat.ino !== identity.inode || fs.realpathSync(identity.root) !== identity.root) throw new Error('reviewed_execution_cleanup_root_unsafe');
+  if (!stat.isDirectory() || stat.isSymbolicLink() || !sameUser(stat) || stat.dev !== identity.device || stat.ino !== identity.inode || fs.realpathSync(identity.root) !== identity.root) throw new Error('reviewed_execution_cleanup_root_unsafe');
   return identity.root;
 }
 function cleanupCodexFinalMessage(identity) {
