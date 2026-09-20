@@ -71,7 +71,7 @@ function runFixedWorker(filename) {
   const profile = filename.includes('codex') ? profiles.PROFILES.v2_codex_readonly_v1 : profiles.PROFILES.v2_claude_restricted_v1;
   let verified; try { verified = verifyWorker(filename); } catch { return Promise.resolve(fixedFailure(profile, 'worker_verification_failed', 0)); }
   return new Promise(resolve => {
-    let settled = false, report = null, admitted = false, terminating = null, exited = null; const nonce = crypto.randomBytes(32).toString('hex'), channelSecret = crypto.randomBytes(32); let child; let escalation = null, resultDrain = null;
+    let settled = false, report = null, admitted = false, spawned = false, terminating = null, exited = null; const nonce = crypto.randomBytes(32).toString('hex'), channelSecret = crypto.randomBytes(32); let child; let escalation = null, resultDrain = null;
     const finish = value => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(escalation); clearTimeout(resultDrain); try { child?.disconnect(); } catch {} resolve(value); };
     const concludeExit = () => {
       if (!exited || settled) return;
@@ -90,13 +90,39 @@ function runFixedWorker(filename) {
       if (report && ((report.provider_turns === 0 && exited.code === 0) || (report.provider_turns === 1 && report.root_cleanup_ok && report.survivor_free && (exited.code === 0 || attestedClaimedFailureAfterNonzeroExit)))) return finish(redact(report, disposition));
       finish(fixedFailure(profile, report ? (report.provider_turns === 1 ? 'worker_cleanup_unverified' : 'worker_exit_unverified') : 'worker_exited_without_result', 1, verified.candidate_digest, disposition));
     };
-    const terminate = result => { if (terminating) return; terminating = result; if (exited) return concludeExit(); try { child?.kill('SIGTERM'); } catch {} escalation = setTimeout(() => { try { child?.kill('SIGKILL'); } catch {} }, 2_000); };
+    const terminate = result => {
+      if (settled || terminating) return;
+      terminating = result;
+      if (exited) return concludeExit();
+      try { child?.kill('SIGTERM'); } catch {}
+      if (settled) return;
+      escalation = setTimeout(() => {
+        try { child?.kill('SIGKILL'); } catch {}
+        // A missing exit event cannot leave the caller pending indefinitely.
+        // Sending a signal does not attest provider cleanup or zero turns.
+        finish(fixedFailure(profile, terminating, 1, verified.candidate_digest, claimedDisposition(report, exited)));
+      }, 2_000);
+    };
     const timer = setTimeout(() => terminate('worker_timeout'), MAX_CHILD_MS);
-    try { child = fork(verified.file, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc', 'pipe'], serialization: 'json', env: { PATH: process.env.PATH || '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C', QUADWORK_REVIEWED_EXECUTION_CHILD: '1', QUADWORK_REVIEWED_CANDIDATE_DIGEST: verified.candidate_digest, QUADWORK_REVIEWED_WORKER_DIGEST: verified.worker_digest, QUADWORK_REVIEWED_PARENT_NONCE: nonce } }); child.stdio[4].end(channelSecret); }
+    try { child = fork(verified.file, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc', 'pipe'], serialization: 'json', env: { PATH: process.env.PATH || '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C', QUADWORK_REVIEWED_EXECUTION_CHILD: '1', QUADWORK_REVIEWED_CANDIDATE_DIGEST: verified.candidate_digest, QUADWORK_REVIEWED_WORKER_DIGEST: verified.worker_digest, QUADWORK_REVIEWED_PARENT_NONCE: nonce } }); }
     catch { finish(fixedFailure(profile, 'worker_start_failed', 0)); return; }
-    child.on('message', message => { if (settled) return; if (Buffer.byteLength(JSON.stringify(message)) > MAX_IPC_BYTES) return terminate('worker_result_invalid'); if (!admitted && message?.type === 'reviewed_execution_ready' && message.nonce === nonce && message.candidate_digest === verified.candidate_digest && message.worker_digest === verified.worker_digest && message.proof === crypto.createHmac('sha256', channelSecret).update(nonce).digest('hex')) { admitted = true; const admission = crypto.randomBytes(32).toString('hex'); child.send(Object.freeze({ type: 'reviewed_execution_admit', nonce, admission, proof: crypto.createHmac('sha256', channelSecret).update(`${nonce}:${admission}`).digest('hex') })); return; } if (admitted && message?.type === 'reviewed_execution_result') { if (report || !reportShape(message.report, profile, verified.candidate_digest)) return terminate('worker_result_invalid'); report = redact(message.report); try { child.send(Object.freeze({ type: 'reviewed_execution_result_ack', nonce })); } catch {} return; } terminate('worker_result_invalid'); });
-    child.once('error', () => { if (child) terminate('worker_start_failed'); else finish(fixedFailure(profile, 'worker_start_failed', 1, verified.candidate_digest)); });
-    child.once('exit', code => { exited = Object.freeze({ code }); if (terminating) return concludeExit(); resultDrain = setTimeout(concludeExit, RESULT_DRAIN_MS); });
+    child.once('spawn', () => { spawned = true; });
+    child.on('message', message => { if (settled || terminating) return; if (Buffer.byteLength(JSON.stringify(message)) > MAX_IPC_BYTES) return terminate('worker_result_invalid'); if (!admitted && message?.type === 'reviewed_execution_ready' && message.nonce === nonce && message.candidate_digest === verified.candidate_digest && message.worker_digest === verified.worker_digest && message.proof === crypto.createHmac('sha256', channelSecret).update(nonce).digest('hex')) { admitted = true; const admission = crypto.randomBytes(32).toString('hex'); try { child.send(Object.freeze({ type: 'reviewed_execution_admit', nonce, admission, proof: crypto.createHmac('sha256', channelSecret).update(`${nonce}:${admission}`).digest('hex') })); } catch { terminate('worker_start_failed'); } return; } if (admitted && message?.type === 'reviewed_execution_result') { if (report || !reportShape(message.report, profile, verified.candidate_digest)) return terminate('worker_result_invalid'); report = redact(message.report); try { child.send(Object.freeze({ type: 'reviewed_execution_result_ack', nonce })); } catch {} return; } terminate('worker_result_invalid'); });
+    child.on('error', () => {
+      if (settled) return;
+      // fork() can return a ChildProcess whose spawn later fails. Such a
+      // failure has no PID/spawn/admission and need not produce an exit event.
+      if (!spawned && child.pid === undefined && !admitted) return finish(fixedFailure(profile, 'worker_start_failed', 0, verified.candidate_digest));
+      terminate('worker_start_failed');
+    });
+    child.once('exit', code => { if (settled) return; exited = Object.freeze({ code }); if (terminating) return concludeExit(); resultDrain = setTimeout(concludeExit, RESULT_DRAIN_MS); });
+    child.once('close', () => {
+      if (settled || exited) return;
+      finish(fixedFailure(profile, terminating || 'worker_exit_unverified', 1, verified.candidate_digest, claimedDisposition(report, null)));
+    });
+    // A pipe failure after fork returned is not proof that no worker ran.
+    try { child.stdio[4].on('error', () => terminate('worker_start_failed')); child.stdio[4].end(channelSecret); }
+    catch { terminate('worker_start_failed'); }
   });
 }
 function runReviewedCodex() { return runFixedWorker('reviewed-execution-live-worker-codex.cjs'); }
