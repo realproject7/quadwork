@@ -57,7 +57,7 @@ const repositories = ["first", "second"].map((key, index) => {
 const request = { id: "fresh", name: "Fresh", confirm: true, repositories,
   agents: Object.fromEntries(roles.map((role) => [role, { cwd: `${repositories[0].working_dir}-${role}`, command: "codex", auto_approve: false }])) };
 const express = require("express");
-const app = express(); app.use(express.json()); app.set("activeSessions", new Map()); app.use(routes);
+const app = express(); app.use(express.json()); app.set("readSessionLiveness", () => []); app.use(routes);
 const server = app.listen(0, "127.0.0.1");
 function post(url, value) {
   return new Promise((resolve, reject) => {

@@ -20,11 +20,13 @@ function resultHarness(mode) {
   const fakeFork = `const { EventEmitter } = require('node:events');
 const resultHarnessMode = ${JSON.stringify(mode)};
 const fork = (file, args, options) => {
-  const child = new EventEmitter(); let secret = null;
-  child.stdio = [null, null, null, null, { end(value) {
+  const child = new EventEmitter(); child.pid = 12345; let secret = null;
+  const secretPipe = new EventEmitter();
+  secretPipe.end = value => {
     secret = Buffer.from(value);
-    queueMicrotask(() => child.emit('message', { type: 'reviewed_execution_ready', nonce: options.env.QUADWORK_REVIEWED_PARENT_NONCE, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, worker_digest: options.env.QUADWORK_REVIEWED_WORKER_DIGEST, proof: crypto.createHmac('sha256', secret).update(options.env.QUADWORK_REVIEWED_PARENT_NONCE).digest('hex') }));
-  } }];
+    queueMicrotask(() => { child.emit('spawn'); child.emit('message', { type: 'reviewed_execution_ready', nonce: options.env.QUADWORK_REVIEWED_PARENT_NONCE, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, worker_digest: options.env.QUADWORK_REVIEWED_WORKER_DIGEST, proof: crypto.createHmac('sha256', secret).update(options.env.QUADWORK_REVIEWED_PARENT_NONCE).digest('hex') }); });
+  };
+  child.stdio = [null, null, null, null, secretPipe];
   child.disconnect = () => {};
   child.kill = () => {};
   child.send = message => {
@@ -43,7 +45,11 @@ const fork = (file, args, options) => {
     if (forgedZeroTurnActivity) { report.provider_turns = 0; report.launch_claim_state = 'none'; report.failure_stage = 'prelaunch'; report.result_class = 'preflight_blocked'; report.workload_write_attempted = true; }
     if (forgedCompletedWithoutWrite) report.workload_submitted_at_launch = false;
     if (forgedCleanupAttestation) report.cleanup_attestation = 'unverified';
-    if (reportAbsent) {
+    if (resultHarnessMode === 'report-error-close') {
+      queueMicrotask(() => { child.emit('message', { type: 'reviewed_execution_result', report }); child.emit('error', new Error('fake IPC failure')); child.emit('close', 0); });
+    } else if (resultHarnessMode === 'exit-close-race') {
+      queueMicrotask(() => { child.emit('exit', 0); child.emit('close', 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
+    } else if (reportAbsent) {
       queueMicrotask(() => child.emit('exit', 0));
     } else if (resultHarnessMode === 'duplicate') {
       queueMicrotask(() => { child.emit('exit', 0); setImmediate(() => { child.emit('message', { type: 'reviewed_execution_result', report }); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report: { ...report, output_bytes: 7 } })); }); });
@@ -82,6 +88,54 @@ function forgedZeroTurnActivityHarness() { return resultHarness('forged-zero-tur
 function forgedCompletedWithoutWriteHarness() { return resultHarness('forged-completed-without-write'); }
 function forgedCleanupAttestationHarness() { return resultHarness('forged-cleanup-attestation'); }
 
+function workerFailureHarness(mode) {
+  const filename = path.join(__dirname, 'reviewed-execution-live-runner.cjs');
+  const fakeFork = `const { EventEmitter } = require('node:events');
+const failureMode = ${JSON.stringify(mode)};
+const observations = { kills: [], disconnects: 0, admissions: 0 };
+const fork = (file, args, options) => {
+  const failure = () => Object.assign(new Error('private synthetic worker error'), { code: 'EAGAIN' });
+  if (failureMode === 'fork-throw') throw failure();
+  const child = new EventEmitter(), secretPipe = new EventEmitter();
+  if (!['failed-spawn', 'failed-spawn-no-close', 'spawn-event-error', 'admission-error'].includes(failureMode)) child.pid = 12345;
+  child.stdio = [null, null, null, null, secretPipe];
+  child.disconnect = () => { observations.disconnects += 1; };
+  child.kill = signal => { observations.kills.push(signal); };
+  child.send = () => { observations.admissions += 1; throw failure(); };
+  secretPipe.end = secret => {
+    if (failureMode === 'pipe-throw') throw failure();
+    queueMicrotask(() => {
+      if (failureMode.startsWith('failed-spawn')) {
+        child.emit('error', failure());
+        if (failureMode === 'failed-spawn') child.emit('close', -11);
+        // Late and repeated terminal events must not change the settled result.
+        child.emit('error', failure());
+        if (failureMode === 'failed-spawn') child.emit('exit', 0);
+        return;
+      }
+      if (!['pid-error', 'admission-error'].includes(failureMode)) child.emit('spawn');
+      if (failureMode === 'timeout') return;
+      if (failureMode === 'pipe-error') { secretPipe.emit('error', failure()); return; }
+      const ready = { type: 'reviewed_execution_ready', nonce: options.env.QUADWORK_REVIEWED_PARENT_NONCE, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, worker_digest: options.env.QUADWORK_REVIEWED_WORKER_DIGEST, proof: crypto.createHmac('sha256', secret).update(options.env.QUADWORK_REVIEWED_PARENT_NONCE).digest('hex') };
+      if (failureMode === 'admission-error') { child.emit('message', ready); child.emit('error', failure()); return; }
+      if (failureMode === 'close-without-exit') { child.emit('close', 1); child.emit('message', ready); return; }
+      child.emit('error', failure());
+      // Ready after termination must never admit a new provider attempt.
+      child.emit('message', ready);
+      if (failureMode === 'spawned-error-exit') child.emit('exit', 1);
+      if (failureMode !== 'spawned-error-stuck') child.emit('close', 1);
+    });
+  };
+  return child;
+};`;
+  const source = fs.readFileSync(filename, 'utf8')
+    .replace("const { fork } = require('node:child_process');", fakeFork)
+    .replace('const MAX_CHILD_MS = 60_000;', 'const MAX_CHILD_MS = 20;')
+    .replace('}, 2_000);', '}, 20);')
+    .replace('module.exports = Object.freeze({ runReviewedCodex, runReviewedClaude });', 'module.exports = Object.freeze({ run: runReviewedCodex, observations });');
+  const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports;
+}
+
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
   for (const entry of Object.values(runner)) assert.equal(entry.length, 0);
@@ -98,6 +152,53 @@ test('parent accepts a valid redacted result that is delivered adjacent to worke
   assert.equal(result.root_cleanup_ok, true);
   assert.equal(result.survivor_free, true);
 });
+test('parent drains a valid result when close follows exit before result delivery', async () => {
+  const result = await resultHarness('exit-close-race').run();
+  assert.equal(result.result_class, 'completed');
+  assert.equal(result.provider_turns, 1);
+});
+test('parent never turns a claimed result followed by an IPC error into success or zero turns', async () => {
+  const result = await resultHarness('report-error-close').run();
+  assert.equal(result.result_class, 'worker_start_failed');
+  assert.equal(result.provider_turns, 1);
+  assert.equal(result.launch_claim_state, 'unverified');
+  assert.equal(result.worker_report_disposition, 'claimed_exit_unattested');
+  assert.equal(result.root_cleanup_ok, false);
+  assert.equal(result.survivor_free, false);
+});
+for (const mode of ['fork-throw', 'failed-spawn', 'failed-spawn-no-close']) {
+  test(`parent promptly reports proven ${mode} without waiting for exit`, { timeout: 1000 }, async () => {
+    const fixture = workerFailureHarness(mode);
+    const result = await fixture.run();
+    assert.equal(result.result_class, 'worker_start_failed');
+    assert.equal(result.provider_turns, 0);
+    assert.equal(result.launch_claim_state, 'none');
+    assert.equal(result.root_cleanup_ok, false);
+    assert.equal(result.survivor_free, false);
+    assert.equal(result.cleanup_attestation, 'unverified');
+    assert.deepEqual(fixture.observations.kills, []);
+    assert.equal(fixture.observations.disconnects, mode === 'fork-throw' ? 0 : 1);
+    assert.equal(fixture.observations.admissions, 0);
+    assert.equal(JSON.stringify(result).includes('private synthetic worker error'), false);
+  });
+}
+for (const mode of ['pid-error', 'spawn-event-error', 'spawned-error-exit', 'spawned-error-stuck', 'close-without-exit', 'pipe-throw', 'pipe-error', 'admission-error', 'timeout']) {
+  test(`parent settles ${mode} conservatively within its termination bound`, { timeout: 1000 }, async () => {
+    const fixture = workerFailureHarness(mode);
+    const result = await fixture.run();
+    assert.equal(result.result_class, mode === 'timeout' ? 'worker_timeout' : mode === 'close-without-exit' ? 'worker_exit_unverified' : 'worker_start_failed');
+    assert.equal(result.provider_turns, 1);
+    assert.equal(result.launch_claim_state, 'unverified');
+    assert.equal(result.failure_stage, 'parent_unverified');
+    assert.equal(result.root_cleanup_ok, false);
+    assert.equal(result.survivor_free, false);
+    assert.equal(result.cleanup_attestation, 'unverified');
+    assert.equal(fixture.observations.disconnects, 1);
+    assert.equal(fixture.observations.admissions, mode === 'admission-error' ? 1 : 0);
+    if (['spawned-error-stuck', 'pipe-throw', 'pipe-error', 'admission-error', 'timeout'].includes(mode)) assert.deepEqual(fixture.observations.kills, ['SIGTERM', 'SIGKILL']);
+    assert.equal(JSON.stringify(result).includes('private synthetic worker error'), false);
+  });
+}
 test('parent preserves an attested claimed failure result after a later non-zero worker exit', async () => {
   const result = await claimedNonzeroFailureHarness().run();
   assert.equal(result.result_class, 'attempt_indeterminate');

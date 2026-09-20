@@ -1,8 +1,49 @@
 # V2 release benchmark preparation (#1037)
 
-Status: design draft. No calibration, Mode 3 timing, target freeze, or release approval.
-This document implements the existing #1037 measurement contract; it does not
-waive its acceptance criteria. The accompanying manifest is deliberately unfrozen.
+## Current stage, 2026-09-20 (#1155)
+
+Implementation, source audit, reviewed fixes, deterministic checks, local build,
+isolated installation, and test preparation may proceed. Real-provider turns,
+product E2E/device verification, and live benchmarks are on hold until the
+operator returns and explicitly resumes testing. This hold also applies to
+automations. The PO must carry it into the handoff and continuity watcher.
+
+Complete the source-audit ledger and its fixes with exact-source evidence.
+Record source completion separately from pending product, provider, device,
+and benchmark proof. #1037 remains open while its retained verification or
+release gate is unresolved; source completion alone does not close it.
+
+The reviewed runner remains a security harness and historical evidence. Further
+reviewed-runner attempts are no longer a prerequisite for implementation
+completion, provider support, or release proof. Preserve every authorization,
+failure, diagnostic, and receipt at its original identity and scope. Consumed
+one-shot authorizations remain consumed and must never be retried or reset.
+Only unresolved future execution obligations are superseded by this stage split.
+
+After implementation and source-audit fixes are complete, follow the
+[local-install procedure](release-v2.8.0-runbook.md#local-install-readiness-before-testing)
+to pack the exact reviewed final source, record its commit and archive digest,
+and install that archive into an isolated local target. Preparation stops before
+starting the product or providers. After the operator resumes, one bounded
+project-path action each with Codex and Claude must use that installed artifact.
+CLI presence/version, startup, deterministic fixtures, and historical runner
+receipts do not establish this installed-product provider proof.
+
+Missing login, device confirmation, or additional provider-state authority is
+an operator gate. This stage permits no interactive login, OAuth grant, or
+credential/auth-file/Keychain inspection, copying, or change. The existing
+[provider-state authority boundary](reviewed-execution-provider-state-boundary.md)
+still applies. Record only raw-free outcomes and identities.
+
+Failed or unperformed local-install proof blocks provider-support and publish
+recommendation, not an honestly scoped implementation-completion claim. That
+proof must precede any version change, tag, release, or npm publish. The matched
+benchmark gates and manifest-freeze order below still apply before performance
+or release claims. They are deferred, not waived, and cannot run during the
+operator-return hold. No release action is authorized by this document.
+
+The measurement design remains a draft. No calibration, Mode 3 timing, target
+freeze, or release approval is claimed. The manifest remains unfrozen.
 
 ## Verified identities
 
@@ -172,6 +213,11 @@ target repos, and do not call that a provider-cold cache guarantee.
 
 ## Calibration and freeze order
 
+Methodology review and offline harness preparation may proceed now. The live
+steps begin only after the operator explicitly resumes testing and the
+local-install/provider-state gates above are satisfied. Authentication
+prerequisites do not authorize inspecting or changing credentials.
+
 1. Review the methodology, task bundle, run/cost caps, identities, and adapters.
 2. Build and validate the harness offline. Mode 3 throughput remains disabled.
 3. Check provider authentication without exposing credentials; a harmless live
@@ -213,6 +259,11 @@ Reports reject replay/live mixing, incomplete runs, missing identity anchors,
 duplicate terminal observations, and regressions in monotonic ordering.
 
 ## Bounded implementation sequence
+
+The done conditions below describe their own evidence classes. Live work in
+Unit C and release actions in Unit D are deferred gates, not prerequisites for
+source-audit or implementation completion. No unit may relabel another unit's
+evidence as its own success.
 
 | Unit | Allowed scope | Done condition |
 |---|---|---|

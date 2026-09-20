@@ -67,6 +67,7 @@ function request(server, method, urlPath, body) {
 
 (async () => {
   const app = express();
+  app.set("readSessionLiveness", () => []);
   app.use(express.json());
   app.use(router);
   const server = app.listen(0, "127.0.0.1");

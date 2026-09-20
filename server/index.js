@@ -717,6 +717,14 @@ app.get("/api/caffeinate/status", (req, res) => {
 // PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
 const agentSessions = new Map();
 
+// Routes observe fresh running-role identities, never the private session,
+// terminal, output, or reviewed-execution observer. Each read is a frozen copy.
+app.set("readSessionLiveness", () => Object.freeze(
+  [...agentSessions.values()]
+    .filter((session) => session.state === "running")
+    .map((session) => Object.freeze({ projectId: session.projectId, agentId: session.agentId }))
+));
+
 // Compatibility inspection for legacy launch tests and diagnostics. It is a
 // value snapshot, never the mutable session/PTY object, and deliberately
 // refuses reviewed executions so no caller can regain their terminal handle.
@@ -2459,6 +2467,8 @@ async function launchAgentPty(project, agent, opts = {}) {
       generationId: opts.generationId || null,
       _lifecycleSpawnRecorded: false,
       _lifecycleVerificationPending: false,
+      _lifecycleVerification: null,
+      _reviewedLifecycleVerified: false,
       _lifecycleStructuredConfirmed: false,
       startedAt: new Date().toISOString(),
       error: null,
@@ -2487,6 +2497,15 @@ async function launchAgentPty(project, agent, opts = {}) {
     const SCROLLBACK_SIZE = 64 * 1024;
     term.onData((data) => {
       if (shuttingDown || session._stopping) return;
+      if (agentSessions.get(key) !== session || session.term !== term || session.state !== "running") return;
+      // Nonempty bytes from THIS generation prove runtime readiness only.
+      // Reviewed sessions keep this bounded fact, never the observed bytes.
+      if ((typeof data === "string" || Buffer.isBuffer(data)) && data.length > 0
+        && session.lifecycleState === "spawned" && session.operationId && session.generationId) {
+        session.lifecycleState = "verified";
+        session._lifecycleVerificationPending = true;
+        flushPendingLifecycleVerification(session);
+      }
       if (session.reviewedExecution) {
         if (!session._reviewedObserverAttached) {
           session._reviewedPreObserverPtyDataSeen = true;
@@ -2496,14 +2515,6 @@ async function launchAgentPty(project, agent, opts = {}) {
         return;
       }
       session.lastOutputAt = Date.now();
-      // The first bytes from THIS PTY are a runtime-ready observation. They
-      // prove neither task completion nor semantic agent health, but they do
-      // distinguish spawned from verified without trusting a pid/map entry.
-      if (session.lifecycleState === "spawned" && session.operationId && session.generationId) {
-        session.lifecycleState = "verified";
-        session._lifecycleVerificationPending = true;
-        flushPendingLifecycleVerification(session);
-      }
       // A verified Head generation is a local lifecycle fact. It may recover
       // one durable trusted receipt after a crash, but it never starts a
       // suspended monitor or creates a repeating health/pulse loop.
@@ -2581,7 +2592,7 @@ function flushPendingLifecycleVerification(session) {
   if (!session?._lifecycleSpawnRecorded || !session._lifecycleVerificationPending
     || !session.operationId || !session.generationId) return;
   session._lifecycleVerificationPending = false;
-  lifecycleGovernor.transition({
+  session._lifecycleVerification = lifecycleGovernor.transition({
     projectId: session.projectId,
     role: session.agentId,
     operationId: session.operationId,
@@ -2589,6 +2600,14 @@ function flushPendingLifecycleVerification(session) {
     status: "verified",
     health: "running",
     structuredStatus: session._lifecycleStructuredConfirmed === true,
+  }).then((result) => {
+    // A stale transition resolves as rejected. Only the persisted observation
+    // for this exact operation/generation may become a private readiness fact.
+    if (session.reviewedExecution && result?.status === "verified"
+      && result.operation?.operation_id === session.operationId
+      && result.operation?.generation_id === session.generationId) {
+      session._reviewedLifecycleVerified = true;
+    }
   }).catch(() => { session.lifecycleState = "unknown"; });
 }
 
@@ -2664,6 +2683,23 @@ async function runReviewedExecution(role) {
     // This closure is the only route from the private server session to the
     // child.  It exposes neither PTY bytes nor mutable session state.
     preObserverPtyDataSeen: () => observerAttached && preObserverPtyDataSeen,
+    // Codex can exit before the child checks completion. Remember a prior
+    // accepted ready observation, but recheck the durable generation now so
+    // a replacement cannot inherit it. This read-only closure is child-private.
+    lifecycleVerified: async () => {
+      try {
+        await session._lifecycleVerification;
+        const current = lifecycleGovernor.snapshot(REVIEWED_EXECUTION_PROJECT, fixed);
+        return agentSessions.get(`${REVIEWED_EXECUTION_PROJECT}/${fixed}`) === session
+          && !session._stopping
+          && session._reviewedLifecycleVerified === true
+          && session.operationId === launched.lifecycle?.operation_id
+          && session.generationId === launched.lifecycle?.generation_id
+          && current?.operation_id === session.operationId
+          && current?.generation_id === session.generationId
+          && (current.state === "verified" || current.state === "exited");
+      } catch { return false; }
+    },
     writeFixedWorkload: () => term.write(`${REVIEWED_EXECUTION_WORKLOAD}\n`),
   }) });
 }
