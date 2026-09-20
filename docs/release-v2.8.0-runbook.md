@@ -93,11 +93,14 @@ symlink, restart a service, use a production/VPS target, or alter credentials.
 Use task-specific path variables taken from that local receipt. For dependency
 installation, run from the owned package directory with a clean child
 environment. For example, with `qw_package_dir` set to the exact
-`$qw_prefix/node_modules/quadwork` directory:
+`$qw_prefix/node_modules/quadwork` directory, first create two distinct empty
+owner-only files at `$qw_cache/user.npmrc` and `$qw_cache/global.npmrc` in the
+fresh preparation root. npm rejects using the same file for both config layers.
 
 ```sh
 env -i PATH="$qw_tool_path" HOME="$qw_runtime_home" USERPROFILE="$qw_runtime_home" \
-  npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null \
+  npm_config_userconfig="$qw_cache/user.npmrc" \
+  npm_config_globalconfig="$qw_cache/global.npmrc" \
   npm_config_cache="$qw_cache" \
   "$qw_npm" ci --prefix "$qw_package_dir" --omit=dev --no-audit --no-fund
 ```
