@@ -5,6 +5,7 @@ const profiles = require('../server/reviewed-execution-profiles');
 const OUTPUT_CAP_BYTES = 16 * 1024;
 const WORKLOAD = `${profiles.WORKLOAD}\n`;
 const SENTINEL = 'QUADWORK_V2_PRODUCT_PATH_OK';
+const CLEANUP_ATTESTATIONS = Object.freeze(['none', 'stop', 'shutdown', 'survivor', 'root', 'environment', 'unverified']);
 function createObserver() {
   let output_bytes = 0, output_capped = false, sentinel = false, at_line_start = true, match_index = 0, sentinel_cr = false;
   const resetLine = () => { at_line_start = true; match_index = 0; sentinel_cr = false; };
@@ -22,6 +23,18 @@ function createObserver() {
   return Object.freeze({ push(chunk) { output_bytes += Buffer.byteLength(chunk); if (output_bytes > OUTPUT_CAP_BYTES) { output_capped = true; return; } for (const character of String(chunk)) observeCharacter(character); }, snapshot() { return Object.freeze({ output_bytes, output_capped, sentinel: sentinel || match_index === SENTINEL.length }); } });
 }
 function observe(chunks = []) { const observer = createObserver(); for (const chunk of chunks) observer.push(chunk); return observer.snapshot(); }
-function finalize(value = {}) { const provider_turns = value.provider_turns === 0 ? 0 : 1; const lifecycle_verified = value.lifecycle === 'verified'; const root_cleanup_ok = value.stop === true && value.shutdown === true && value.survivor === true && value.root === true && value.git === true && value.environment === true; const result_class = value.launch === false ? 'launch_failed' : !root_cleanup_ok ? 'cleanup_failed' : value.output_capped === true ? 'output_cap_exceeded' : value.terminal_exited === true ? 'launch_indeterminate' : value.timed_out === true ? 'attempt_indeterminate' : value.sentinel === true && lifecycle_verified ? 'completed' : 'attempt_indeterminate'; return Object.freeze({ result_class, provider_turns, lifecycle_verified, root_cleanup_ok, survivor_free: value.survivor === true }); }
+// This is deliberately a category, not a detail channel: it records only the
+// first failed pre-existing cleanup attestation. `root` includes the existing
+// root-facts/git postcondition, whose digests stay in their existing redacted
+// fields. It never includes an error, path, exit status, or provider output.
+function cleanupAttestation(value = {}) {
+  if (value.stop !== true) return 'stop';
+  if (value.shutdown !== true) return 'shutdown';
+  if (value.survivor !== true) return 'survivor';
+  if (value.root !== true || value.git !== true) return 'root';
+  if (value.environment !== true) return 'environment';
+  return 'none';
+}
+function finalize(value = {}) { const provider_turns = value.provider_turns === 0 ? 0 : 1; const lifecycle_verified = value.lifecycle === 'verified'; const cleanup_attestation = cleanupAttestation(value); const root_cleanup_ok = cleanup_attestation === 'none'; const result_class = value.launch === false ? 'launch_failed' : !root_cleanup_ok ? 'cleanup_failed' : value.output_capped === true ? 'output_cap_exceeded' : value.terminal_exited === true ? 'launch_indeterminate' : value.timed_out === true ? 'attempt_indeterminate' : value.sentinel === true && lifecycle_verified ? 'completed' : 'attempt_indeterminate'; return Object.freeze({ result_class, provider_turns, lifecycle_verified, root_cleanup_ok, survivor_free: value.survivor === true, cleanup_attestation }); }
 function finalizeEffects(value = {}) { const effect = name => { try { return value.effects?.[name]?.() === true; } catch { return false; } }; return finalize({ provider_turns: value.provider_turns, lifecycle: value.lifecycle, launch: value.launch, sentinel: value.sentinel, output_capped: value.output_capped, terminal_exited: value.terminal_exited, timed_out: value.timed_out, stop: effect('stop'), shutdown: effect('shutdown'), survivor: effect('survivor'), root: effect('root'), git: effect('git'), environment: effect('environment') }); }
-module.exports = Object.freeze({ OUTPUT_CAP_BYTES, SENTINEL, WORKLOAD, createObserver, observe, finalize, finalizeEffects });
+module.exports = Object.freeze({ OUTPUT_CAP_BYTES, SENTINEL, WORKLOAD, CLEANUP_ATTESTATIONS, createObserver, observe, cleanupAttestation, finalize, finalizeEffects });
