@@ -56,6 +56,10 @@ test('final PTY launch plan is exactly sandbox-exec plus the fixed profile comma
 test('sandbox source is candidate-bound, source-generated, denies by default, and gives writes only to owned root and ledger', () => {
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const source = profiles.sandboxSource(profile, 'a'.repeat(64), '/private/tmp/owned-root', '/private/tmp/owned-ledger');
   assert.match(source, /^\(version 1\)\n; #1115 generated/m); assert.match(source, /\(deny default\)/); assert.match(source, /candidate_digest a{64}/);
+  assert.equal((source.match(/\(allow file-read-data \(literal \"\/\"\)\)/g) || []).length, 1);
+  assert.doesNotMatch(source, /\(allow file-read\* \(literal \"\/\"\)\)/);
+  assert.doesNotMatch(source, /\(allow file-read\* \(subpath \"\/\"\)\)/);
+  assert.doesNotMatch(source, /\(allow file-write\* \((?:literal|subpath) \"\/\"\)\)/);
   assert.match(source, /file-write\* \(subpath \"\/private\/tmp\/owned-root\"\)/);
   assert.match(source, /file-write\* \(subpath \"\/private\/tmp\/owned-ledger\"\)/);
   assert.doesNotMatch(source, /\.quadwork/); assert.doesNotMatch(source, /ssh|npm|github/i);
