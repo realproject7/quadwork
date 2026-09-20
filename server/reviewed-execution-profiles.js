@@ -90,6 +90,10 @@ function sandboxSource(profile, candidate, disposableRoot, ledgerDirectory) {
     '(allow sysctl-read)',
     '(allow mach-lookup)',
     '(allow network-outbound)',
+    // node-pty launches the fixed sandboxed child through the macOS root vnode.
+    // This permits data-read on that vnode only. It is not recursive and does
+    // not grant metadata or write access anywhere beneath the root.
+    '(allow file-read-data (literal "/"))',
     ...readPaths.map(item => `(allow file-read* (subpath \"${item}\"))`),
     `(allow file-write* (subpath \"${disposableRoot}\"))`,
     `(allow file-write* (subpath \"${ledgerDirectory}\"))`,
