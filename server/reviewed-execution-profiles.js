@@ -60,6 +60,7 @@ const CANDIDATE_FILES = Object.freeze([
   'benchmark/reviewed-execution-runner.cjs',
   'benchmark/reviewed-execution-live-runner.cjs',
   'benchmark/reviewed-execution-live-outcome.cjs',
+  'benchmark/reviewed-execution-provider-state-boundary.cjs',
   'benchmark/reviewed-execution-live-child-protocol.cjs',
   'benchmark/reviewed-execution-live-worker-codex.cjs',
   'benchmark/reviewed-execution-live-worker-claude.cjs',

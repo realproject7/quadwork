@@ -10,6 +10,7 @@ const path = require('node:path');
 const test = require('node:test');
 const runner = require('./reviewed-execution-live-runner.cjs');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
+const providerStateBoundary = require('./reviewed-execution-provider-state-boundary.cjs');
 function reportHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', 'module.exports = Object.freeze({ report, launchClaimState });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function finalMessageHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = 'module.exports = Object.freeze({ cleanupRootIdentity, createCodexFinalMessage, consumeCodexFinalMessage, cleanupCodexFinalMessage });'; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function activeHarness(claimState = 'claimed') { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = `let __removed = 0, __match = true; sourceFacts = () => fixed.facts; readGateReceipt = () => fixed.gate; launchClaimState = () => ${JSON.stringify(claimState)}; rootFacts = () => ({ entries: ["base"], root_digest: "a".repeat(64), entry_digest: "a".repeat(64), entry_count: 1 }); rootMatches = () => __match; removeOwnedRoot = () => { __removed += 1; return true; }; module.exports = Object.freeze({ set(state, match) { fixed = state; parentAdmitted = true; __match = match; }, completeFixedChild, removed: () => __removed });`; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
@@ -30,16 +31,17 @@ const fork = (file, args, options) => {
     const profile = profiles.PROFILES.v2_codex_readonly_v1;
     const facts = { root_digest: 'a'.repeat(64), entry_digest: 'b'.repeat(64), entry_count: 1, remote_count: 0, changed_entry_count: 0 };
     const prelaunch = resultHarnessMode === 'prelaunch-refusal' || resultHarnessMode === 'prelaunch-cleanup-failure';
-    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure'; const claimedCleanupAndExit = resultHarnessMode === 'claimed-cleanup-and-exit'; const reportAbsent = resultHarnessMode === 'report-absent'; const forgedPhase = resultHarnessMode === 'forged-phase'; const forgedDisposition = resultHarnessMode === 'forged-disposition'; const forgedAfterWithoutWrite = resultHarnessMode === 'forged-after-without-write'; const forgedPreObserver = resultHarnessMode === 'forged-pre-observer'; const forgedZeroTurnActivity = resultHarnessMode === 'forged-zero-turn-activity'; const forgedCompletedWithoutWrite = resultHarnessMode === 'forged-completed-without-write';
+    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure'; const claimedCleanupAndExit = resultHarnessMode === 'claimed-cleanup-and-exit'; const reportAbsent = resultHarnessMode === 'report-absent'; const forgedPhase = resultHarnessMode === 'forged-phase'; const forgedDisposition = resultHarnessMode === 'forged-disposition'; const forgedAfterWithoutWrite = resultHarnessMode === 'forged-after-without-write'; const forgedPreObserver = resultHarnessMode === 'forged-pre-observer'; const forgedZeroTurnActivity = resultHarnessMode === 'forged-zero-turn-activity'; const forgedCompletedWithoutWrite = resultHarnessMode === 'forged-completed-without-write'; const forgedCleanupAttestation = resultHarnessMode === 'forged-cleanup-attestation';
     const cleanupFailure = resultHarnessMode === 'prelaunch-cleanup-failure' || oneTurnUnsafe || claimedCleanupAndExit;
     const postclaimFailure = malformedClaim || claimedNonzeroFailure || unverifiedNonzeroFailure;
-    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', launch_diagnostic: 'none', pre_observer_pty_data_seen: false, pre_workload_output_seen: false, workload_write_attempted: false, workload_submitted_at_launch: !prelaunch, terminal_exit_phase: 'none', worker_report_disposition: 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
+    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', launch_diagnostic: 'none', pre_observer_pty_data_seen: false, pre_workload_output_seen: false, workload_write_attempted: false, workload_submitted_at_launch: !prelaunch, terminal_exit_phase: 'none', worker_report_disposition: 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, cleanup_attestation: cleanupFailure ? 'root' : 'none', source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
     if (forgedPhase) report.terminal_exit_phase = 'forged';
     if (forgedDisposition) report.worker_report_disposition = 'claimed_exit_unattested';
     if (forgedAfterWithoutWrite) { report.terminal_exit_phase = 'after_workload_attempt'; report.workload_write_attempted = false; }
     if (forgedPreObserver) report.pre_observer_pty_data_seen = true;
     if (forgedZeroTurnActivity) { report.provider_turns = 0; report.launch_claim_state = 'none'; report.failure_stage = 'prelaunch'; report.result_class = 'preflight_blocked'; report.workload_write_attempted = true; }
     if (forgedCompletedWithoutWrite) report.workload_submitted_at_launch = false;
+    if (forgedCleanupAttestation) report.cleanup_attestation = 'unverified';
     if (reportAbsent) {
       queueMicrotask(() => child.emit('exit', 0));
     } else if (resultHarnessMode === 'duplicate') {
@@ -77,6 +79,7 @@ function forgedAfterWithoutWriteHarness() { return resultHarness('forged-after-w
 function forgedPreObserverHarness() { return resultHarness('forged-pre-observer'); }
 function forgedZeroTurnActivityHarness() { return resultHarness('forged-zero-turn-activity'); }
 function forgedCompletedWithoutWriteHarness() { return resultHarness('forged-completed-without-write'); }
+function forgedCleanupAttestationHarness() { return resultHarness('forged-cleanup-attestation'); }
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -180,6 +183,11 @@ test('parent rejects logically inconsistent child phase and observation claims',
     assert.equal(result.result_class, 'worker_result_invalid');
   }
 });
+test('parent rejects a child cleanup report without a specific attestation category', async () => {
+  const result = await forgedCleanupAttestationHarness().run();
+  assert.equal(result.result_class, 'worker_result_invalid');
+  assert.equal(result.cleanup_attestation, 'unverified');
+});
 test('fixed workers carry source-fixed roles and prepare before loading the server', () => {
   for (const [file, role] of [['reviewed-execution-live-worker-codex.cjs', 'benchmark_codex'], ['reviewed-execution-live-worker-claude.cjs', 'benchmark_claude']]) {
     const source = fs.readFileSync(path.join(__dirname, file), 'utf8');
@@ -258,8 +266,25 @@ test('production evaluator makes output cap, timeout, lifecycle, remote rejectio
   assert.equal(outcome.finalize({ ...baseline, timed_out: true }).result_class, 'attempt_indeterminate');
   assert.equal(outcome.finalize({ ...baseline, lifecycle: 'spawned' }).result_class, 'attempt_indeterminate');
   assert.equal(outcome.finalize({ ...baseline, launch: false }).result_class, 'launch_failed');
-  for (const field of ['stop', 'shutdown', 'survivor', 'root', 'git', 'environment']) { const value = outcome.finalize({ ...baseline, [field]: false }); assert.equal(value.result_class, 'cleanup_failed'); assert.equal(value.root_cleanup_ok, false); }
+  for (const field of ['stop', 'shutdown', 'survivor', 'root', 'git', 'environment']) { const value = outcome.finalize({ ...baseline, [field]: false }); assert.equal(value.result_class, 'cleanup_failed'); assert.equal(value.root_cleanup_ok, false); assert.equal(value.cleanup_attestation, field === 'git' ? 'root' : field); }
   for (const failed of ['stop', 'shutdown', 'survivor', 'root', 'git', 'environment']) { const effects = Object.fromEntries(['stop', 'shutdown', 'survivor', 'root', 'git', 'environment'].map(name => [name, () => name !== failed])); const value = outcome.finalizeEffects({ provider_turns: 1, lifecycle: 'verified', sentinel: true, effects }); assert.equal(value.result_class, 'cleanup_failed'); }
+});
+test('cleanup attestation is an ordered redacted category and never retains effect details', () => {
+  const baseline = { stop: true, shutdown: true, survivor: true, root: true, git: true, environment: true };
+  assert.equal(outcome.cleanupAttestation(baseline), 'none');
+  assert.equal(outcome.cleanupAttestation({ ...baseline, stop: false, shutdown: false }), 'stop');
+  assert.equal(outcome.cleanupAttestation({ ...baseline, shutdown: false, survivor: false }), 'shutdown');
+  assert.equal(outcome.cleanupAttestation({ ...baseline, survivor: false, root: false }), 'survivor');
+  assert.equal(outcome.finalize({ ...baseline, environment: false }).cleanup_attestation, 'environment');
+});
+test('provider-state boundary compares source facts without reading provider state', () => {
+  const facts = providerStateBoundary.sourceFacts();
+  assert.deepEqual(facts.normal_home, { home: 'inherited_safe_environment', provider_state_observed: false });
+  assert.deepEqual(facts.reviewed_claude, { home: 'executor_owned_disposable', provider_state_observed: false, provider_state_read_authorized: false });
+  assert.equal(facts.reviewed_codex.static_codex_home_authority_preexisting, true);
+  assert.equal(facts.future_expansion_authority, providerStateBoundary.OPERATOR_CREDENTIAL_AUTHORITY);
+  const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-provider-state-boundary.cjs'), 'utf8');
+  for (const forbidden of ['readdirSync(os.homedir', 'copyFileSync', 'mount', 'keytar']) assert.equal(source.includes(forbidden), false, forbidden);
 });
 test('non-launching production report harness redacts prompt, output, path and token fields', () => {
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const report = reportHarness().report(profile, { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, { prompt: profiles.WORKLOAD, output: 'token=private', path: '/private/root', token: 'private', result_class: 'attempt_indeterminate' }); const text = JSON.stringify(report);
