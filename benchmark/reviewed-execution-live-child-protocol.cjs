@@ -161,7 +161,7 @@ async function completeFixedChild(role, runtime) {
   const state = fixed;
   if (!parentAdmitted || !state || state.profile.role !== role || !runtime || typeof runtime.launch !== 'function') throw new Error('reviewed_execution_child_state');
   let provider_turns = 0, launch_claim_state = 'none', lifecycle_verified = false, rechecked = false, stopped = null, shutdown = null, post = null, launch_diagnostic = 'none';
-  const observer = outcome.createObserver(state.profile.backend); const codex = state.profile.backend === 'codex'; let terminal_exited = false, pre_observer_pty_data_seen = false, pre_workload_output_seen = false, workload_write_attempted = false, workload_submitted_at_launch = false, terminal_exit_phase = 'none';
+  const observer = outcome.createObserver(state.profile); const codex = state.profile.backend === 'codex'; let terminal_exited = false, pre_observer_pty_data_seen = false, pre_workload_output_seen = false, workload_write_attempted = false, workload_submitted_at_launch = false, terminal_exit_phase = 'none';
   try {
     await runtime.buildAgentArgs(profiles.PROJECT, role);
     runtime.buildAgentEnv(profiles.PROJECT, role);

@@ -262,7 +262,7 @@ test('production observer retains no raw terminal output while checking the fixe
 test('early terminal diagnostics use only complete fixed signatures and never retain secret-like bytes', () => {
   assert.deepEqual(outcome.EARLY_EXIT_DIAGNOSTICS, ['none', 'provider_auth_unavailable', 'sandbox_policy_denied', 'provider_command_unavailable', 'unclassified_early_exit']);
   for (const signature of outcome.EARLY_EXIT_SIGNATURES) {
-    const observer = outcome.createObserver('codex');
+    const observer = outcome.createObserver(signature.profile_id ? profiles.PROFILES[signature.profile_id] : 'codex');
     observer.push(signature.text.slice(0, 3)); observer.push(`${signature.text.slice(3)}\r\n`);
     assert.equal(outcome.earlyExitDiagnostic(observer.snapshot()), signature.diagnostic);
   }
@@ -277,6 +277,28 @@ test('early terminal diagnostics use only complete fixed signatures and never re
   assert.equal(serialized.includes(secret), false);
   assert.equal(serialized.includes('Authentication required'), false);
   assert.equal(serialized.includes('unclassified_early_exit'), true);
+});
+test('pinned CLI auth lines require their exact immutable profile and canonical LF or CRLF terminator', () => {
+  const pinned = outcome.EARLY_EXIT_SIGNATURES.filter(signature => signature.profile_id);
+  assert.deepEqual(pinned.map(signature => ({ profile_id: signature.profile_id, backend: signature.backend, executable_digest: signature.executable_digest, diagnostic: signature.diagnostic })), [
+    { profile_id: 'v2_codex_readonly_v1', backend: 'codex', executable_digest: profiles.PROFILES.v2_codex_readonly_v1.executable_digest, diagnostic: 'provider_auth_unavailable' },
+    { profile_id: 'v2_claude_restricted_v1', backend: 'claude', executable_digest: profiles.PROFILES.v2_claude_restricted_v1.executable_digest, diagnostic: 'provider_auth_unavailable' },
+  ]);
+  for (const signature of pinned) {
+    const profile = profiles.PROFILES[signature.profile_id];
+    for (const terminator of ['\n', '\r\n']) {
+      const observer = outcome.createObserver(profile); observer.push(`${signature.text}${terminator}`);
+      assert.equal(outcome.earlyExitDiagnostic(observer.snapshot()), 'provider_auth_unavailable');
+    }
+    for (const variant of [signature.text, `${signature.text}\r`, `prefix ${signature.text}\n`, `${signature.text} credential=synthetic-terminal-output\n`, `${signature.text}\nextra`]) {
+      const observer = outcome.createObserver(profile); observer.push(variant);
+      assert.equal(outcome.earlyExitDiagnostic(observer.snapshot()), 'unclassified_early_exit');
+    }
+    const wrong = outcome.createObserver(profile.backend === 'codex' ? profiles.PROFILES.v2_claude_restricted_v1 : profiles.PROFILES.v2_codex_readonly_v1); wrong.push(`${signature.text}\n`);
+    assert.equal(outcome.earlyExitDiagnostic(wrong.snapshot()), 'unclassified_early_exit');
+    const cloned = outcome.createObserver({ ...profile }); cloned.push(`${signature.text}\n`);
+    assert.equal(outcome.earlyExitDiagnostic(cloned.snapshot()), 'unclassified_early_exit');
+  }
 });
 test('parent accepts a diagnostic only in the exact early-exit state and rejects forged enum values', () => {
   const profile = profiles.PROFILES.v2_codex_readonly_v1; const candidate = 'a'.repeat(64);
