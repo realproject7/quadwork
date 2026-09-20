@@ -9,6 +9,12 @@ const path = require('node:path');
 const PROJECT = 'benchmark-product-path';
 const SANDBOX_EXECUTABLE = '/usr/bin/sandbox-exec';
 const CODEX_HOME = '/Users/cho/.codex';
+const CODEX_AUTH_FILE = '/Users/cho/.codex/auth.json';
+const CLAUDE_AUTH_FILE = '/Users/cho/.claude.json';
+// The pinned Claude binary resolves its global `.claude.json` as
+// path.join(CLAUDE_CONFIG_DIR, '.claude.json').  This is a locator only: the
+// Seatbelt policy below still permits just CLAUDE_AUTH_FILE, never this parent.
+const CLAUDE_CONFIG_DIR = '/Users/cho';
 // The reviewed Codex command writes its only completion signal here.  This is
 // deliberately at the disposable-root boundary (rather than the repository)
 // so it can be removed before the post-run repository/root facts are taken.
@@ -32,6 +38,7 @@ const PROFILES = Object.freeze({
     // the proven noninteractive argv contract.
     provider_argv: Object.freeze(['exec', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--color', 'never', '-m', 'gpt-5.6-luna']),
     env: Object.freeze({ CODEX_HOME }),
+    provider_state_file: CODEX_AUTH_FILE,
   }),
   v2_claude_restricted_v1: Object.freeze({
     id: 'v2_claude_restricted_v1', role: 'benchmark_claude', backend: 'claude',
@@ -40,7 +47,8 @@ const PROFILES = Object.freeze({
     version_digest: '57acde8af4b70a838ef099b3d1215ce7261164a836b69a79738cc73675a0ded1',
     model: 'claude-sonnet-4-6',
     provider_argv: Object.freeze(['--restricted', '--safe-mode', '--strict-mcp-config', '--tools', '', '--permission-mode', 'dontAsk', '--permission-prompts', 'none', '--model', 'claude-sonnet-4-6']),
-    env: Object.freeze({}),
+    env: Object.freeze({ CLAUDE_CONFIG_DIR }),
+    provider_state_file: CLAUDE_AUTH_FILE,
   }),
 });
 
@@ -97,9 +105,44 @@ function reviewedProviderArgv(profile, repository, disposableRoot) {
   return Object.freeze([...profile.provider_argv, '-C', repository, '--output-last-message', codexFinalMessagePath(disposableRoot), WORKLOAD]);
 }
 
+function overlaps(directory, filename) {
+  const relative = path.relative(directory, filename);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function noSymlinkParents(filename) {
+  const parsed = path.parse(filename);
+  let current = parsed.root;
+  for (const part of filename.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink()) throw new Error('reviewed_execution_provider_state_unavailable');
+  }
+}
+
+// This deliberately validates only filesystem metadata.  In particular, it
+// never opens the auth file, walks its parent, or invokes a provider/keychain
+// command.  The returned filename is used only as a literal Seatbelt rule.
+function validateProviderState(profile, disposableRoot, ledgerDirectory) {
+  const registered = profile && PROFILES[profile.id] === profile;
+  const filename = registered ? profile.provider_state_file : null;
+  if (!safeAbsolutePath(filename) || !safeAbsolutePath(disposableRoot) || !safeAbsolutePath(ledgerDirectory)
+    || (profile.backend === 'claude' && profile.env?.CLAUDE_CONFIG_DIR !== path.dirname(filename))) throw new Error('reviewed_execution_provider_state_unavailable');
+  try {
+    noSymlinkParents(filename);
+    const stat = fs.lstatSync(filename);
+    const canonical = fs.realpathSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || !sameUser(stat) || (stat.mode & 0o777) !== 0o600 || canonical !== filename || overlaps(disposableRoot, filename) || overlaps(ledgerDirectory, filename)) throw new Error('unsafe');
+  } catch {
+    throw new Error('reviewed_execution_provider_state_unavailable');
+  }
+  return filename;
+}
+
 function sandboxSource(profile, candidate, disposableRoot, ledgerDirectory) {
   if (!profile || !/^[a-f0-9]{64}$/.test(candidate) || !safeAbsolutePath(disposableRoot) || !safeAbsolutePath(ledgerDirectory)) throw new Error('reviewed_execution_sandbox_shape');
-  const readPaths = ['/System', '/usr/lib', '/usr/share', '/private/var/db', '/dev', profile.executable, disposableRoot, ledgerDirectory, ...(profile.backend === 'codex' ? [CODEX_HOME] : [])];
+  const providerState = validateProviderState(profile, disposableRoot, ledgerDirectory);
+  const readPaths = ['/System', '/usr/lib', '/usr/share', '/private/var/db', '/dev', profile.executable, disposableRoot, ledgerDirectory];
   return [
     '(version 1)',
     '; #1115 generated. Do not edit.',
@@ -116,6 +159,7 @@ function sandboxSource(profile, candidate, disposableRoot, ledgerDirectory) {
     // not grant metadata or write access anywhere beneath the root.
     '(allow file-read-data (literal "/"))',
     ...readPaths.map(item => `(allow file-read* (subpath \"${item}\"))`),
+    `(allow file-read* (literal \"${providerState}\"))`,
     `(allow file-write* (subpath \"${disposableRoot}\"))`,
     `(allow file-write* (subpath \"${ledgerDirectory}\"))`,
   ].join('\n') + '\n';
@@ -181,6 +225,7 @@ function reviewedLaunchPlan(projectId, role, reviewedExecutionId, binding) {
   const ledger = checkedOwnedDirectory(binding.ledger_directory, 'reviewed_execution_ledger_invalid');
   validateAuthorization(profile, binding.candidate_digest, ledger, binding.authorization_key);
   validateProfileExecutable(profile);
+  validateProviderState(profile, root, ledger);
   const sandbox = validateSandbox(profile, binding.candidate_digest, root, ledger, binding.sandbox_profile, binding.sandbox_digest);
   return Object.freeze({
     executable: SANDBOX_EXECUTABLE,
@@ -195,4 +240,4 @@ function reviewedLaunchPlan(projectId, role, reviewedExecutionId, binding) {
   });
 }
 
-module.exports = Object.freeze({ CANDIDATE_FILES, CODEX_FINAL_MESSAGE, CODEX_HOME, PROJECT, PROFILES, SANDBOX_EXECUTABLE, SENTINEL_RULE, WORKLOAD, candidateDigest, claimAuthorization, codexFinalMessagePath, resolveReviewedExecution, reviewedLaunchPlan, reviewedProviderArgv, sandboxSource, sha256 });
+module.exports = Object.freeze({ CANDIDATE_FILES, CLAUDE_AUTH_FILE, CLAUDE_CONFIG_DIR, CODEX_AUTH_FILE, CODEX_FINAL_MESSAGE, CODEX_HOME, PROJECT, PROFILES, SANDBOX_EXECUTABLE, SENTINEL_RULE, WORKLOAD, candidateDigest, claimAuthorization, codexFinalMessagePath, resolveReviewedExecution, reviewedLaunchPlan, reviewedProviderArgv, sandboxSource, sha256, validateProviderState });

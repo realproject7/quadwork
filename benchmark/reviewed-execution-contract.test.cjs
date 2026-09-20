@@ -6,12 +6,21 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const Module = require('node:module');
 const contract = require('./reviewed-execution-contract.cjs');
 const runner = require('./reviewed-execution-runner.cjs');
 const profiles = require('../server/reviewed-execution-profiles');
 
-function tempRoot() { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'quadwork-reviewed-execution-test-')); fs.chmodSync(root, 0o700); return root; }
+function tempRoot() { const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'quadwork-reviewed-execution-test-'))); fs.chmodSync(root, 0o700); return root; }
 function makeDirectory(parent, name) { const directory = path.join(parent, name); fs.mkdirSync(directory, { mode: 0o700 }); fs.chmodSync(directory, 0o700); return directory; }
+function stateProfileHarness(codexFile, claudeFile) {
+  const filename = path.join(__dirname, '..', 'server', 'reviewed-execution-profiles.js');
+  const source = fs.readFileSync(filename, 'utf8')
+    .replace("const CODEX_AUTH_FILE = '/Users/cho/.codex/auth.json';", `const CODEX_AUTH_FILE = ${JSON.stringify(codexFile)};`)
+    .replace("const CLAUDE_AUTH_FILE = '/Users/cho/.claude.json';", `const CLAUDE_AUTH_FILE = ${JSON.stringify(claudeFile)};`);
+  const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename);
+  return mod.exports;
+}
 
 test('the closed profile registry contains only the reviewed Codex and Claude launches', () => {
   assert.deepEqual(Object.keys(profiles.PROFILES).sort(), ['v2_claude_restricted_v1', 'v2_codex_readonly_v1']);
@@ -53,6 +62,17 @@ test('final PTY launch plan is exactly sandbox-exec plus the fixed profile comma
   assert.throws(() => profiles.reviewedLaunchPlan('benchmark-product-path', 'benchmark_codex', profile.id, { candidate_digest: candidate, disposable_root: root, ledger_directory: ledger, authorization_key: '0'.repeat(64), sandbox_profile: sandbox.path, sandbox_digest: sandbox.digest }), /authorization_invalid/);
 });
 
+test('Claude uses its binary-recognized config locator while HOME stays disposable and the sandbox remains file-only', () => {
+  const home = tempRoot(); const profile = profiles.PROFILES.v2_claude_restricted_v1;
+  const environment = contract.safeEnvironment(home, profile);
+  assert.equal(environment.HOME, home);
+  assert.equal(environment.USERPROFILE, home);
+  assert.equal(environment.CLAUDE_CONFIG_DIR, path.dirname(profile.provider_state_file));
+  assert.equal(environment.CODEX_HOME, undefined);
+  assert.deepEqual(Object.keys(profile.env), ['CLAUDE_CONFIG_DIR']);
+  assert.equal(path.join(environment.CLAUDE_CONFIG_DIR, '.claude.json'), profile.provider_state_file);
+});
+
 test('sandbox source is candidate-bound, source-generated, denies by default, and gives writes only to owned root and ledger', () => {
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const source = profiles.sandboxSource(profile, 'a'.repeat(64), '/private/tmp/owned-root', '/private/tmp/owned-ledger');
   assert.match(source, /^\(version 1\)\n; #1115 generated/m); assert.match(source, /\(deny default\)/); assert.match(source, /candidate_digest a{64}/);
@@ -64,6 +84,42 @@ test('sandbox source is candidate-bound, source-generated, denies by default, an
   assert.match(source, /file-write\* \(subpath \"\/private\/tmp\/owned-ledger\"\)/);
   assert.doesNotMatch(source, /\.quadwork/); assert.doesNotMatch(source, /ssh|npm|github/i);
   assert.throws(() => profiles.sandboxSource(profile, 'a'.repeat(64), '/private/tmp/owned") (allow file-write* (subpath "/"))', '/private/tmp/owned-ledger'), /sandbox_shape/);
+});
+
+test('provider state is a closed exact-file metadata boundary with every unsafe shape rejected before launch', () => {
+  const parent = tempRoot(); const root = makeDirectory(parent, 'root'); const ledger = makeDirectory(parent, 'ledger'); const authDir = makeDirectory(parent, 'codex'); const claude = path.join(parent, 'claude.json'); const codex = path.join(authDir, 'auth.json');
+  fs.writeFileSync(codex, 'fixture', { mode: 0o600 }); fs.chmodSync(codex, 0o600);
+  fs.writeFileSync(claude, 'fixture', { mode: 0o600 }); fs.chmodSync(claude, 0o600);
+  const fixture = stateProfileHarness(codex, claude); const codexProfile = fixture.PROFILES.v2_codex_readonly_v1;
+  try {
+    assert.equal(fixture.validateProviderState(codexProfile, root, ledger), codex);
+    const source = fixture.sandboxSource(codexProfile, 'a'.repeat(64), root, ledger);
+    assert.equal(source.includes(`(allow file-read* (literal \"${codex}\"))`), true);
+    assert.equal(source.includes(`(allow file-read* (subpath \"${authDir}\"))`), false);
+    assert.equal(source.includes('CODEX_HOME'), false);
+    assert.throws(() => fixture.validateProviderState({ ...codexProfile }, root, ledger), /provider_state_unavailable/);
+    const absent = stateProfileHarness(path.join(parent, 'absent'), claude);
+    assert.throws(() => absent.validateProviderState(absent.PROFILES.v2_codex_readonly_v1, root, ledger), /provider_state_unavailable/);
+    const symlink = path.join(parent, 'symlink-auth'); fs.symlinkSync(codex, symlink);
+    const symlinked = stateProfileHarness(symlink, claude);
+    assert.throws(() => symlinked.validateProviderState(symlinked.PROFILES.v2_codex_readonly_v1, root, ledger), /provider_state_unavailable/);
+    const parentTarget = makeDirectory(parent, 'target'); const parentAuth = path.join(parentTarget, 'auth.json'); fs.writeFileSync(parentAuth, 'fixture', { mode: 0o600 }); fs.chmodSync(parentAuth, 0o600);
+    const parentLink = path.join(parent, 'linked-parent'); fs.symlinkSync(parentTarget, parentLink);
+    const parentSymlink = stateProfileHarness(path.join(parentLink, 'auth.json'), claude);
+    assert.throws(() => parentSymlink.validateProviderState(parentSymlink.PROFILES.v2_codex_readonly_v1, root, ledger), /provider_state_unavailable/);
+    const directory = stateProfileHarness(authDir, claude);
+    assert.throws(() => directory.validateProviderState(directory.PROFILES.v2_codex_readonly_v1, root, ledger), /provider_state_unavailable/);
+    fs.chmodSync(codex, 0o644);
+    assert.throws(() => fixture.validateProviderState(codexProfile, root, ledger), /provider_state_unavailable/);
+    fs.chmodSync(codex, 0o600);
+    const originalRealpath = fs.realpathSync; fs.realpathSync = value => value === codex ? `${codex}.mismatch` : originalRealpath(value);
+    try { assert.throws(() => fixture.validateProviderState(codexProfile, root, ledger), /provider_state_unavailable/); } finally { fs.realpathSync = originalRealpath; }
+    const originalLstat = fs.lstatSync; fs.lstatSync = value => value === codex ? { ...originalLstat(value), uid: process.getuid() + 1 } : originalLstat(value);
+    try { assert.throws(() => fixture.validateProviderState(codexProfile, root, ledger), /provider_state_unavailable/); } finally { fs.lstatSync = originalLstat; }
+    const overlap = path.join(root, 'auth.json'); fs.writeFileSync(overlap, 'fixture', { mode: 0o600 }); fs.chmodSync(overlap, 0o600);
+    const overlapping = stateProfileHarness(overlap, claude);
+    assert.throws(() => overlapping.validateProviderState(overlapping.PROFILES.v2_codex_readonly_v1, root, ledger), /provider_state_unavailable/);
+  } finally { fs.rmSync(parent, { recursive: true, force: true }); }
 });
 
 test('O_EXCL ledger consumes one authorization before preflight and rejects retry or concurrent-equivalent use', () => {
