@@ -114,7 +114,12 @@ export default function GitHubRateLimitBadge({ projectId }: { projectId?: string
     : [];
 
   return (
-    <div className="flex items-center gap-2 text-[10px] font-mono text-text-muted">
+    <div
+      role="region"
+      aria-label="GitHub rate limits (scroll for all accounts and buckets)"
+      tabIndex={0}
+      className="flex min-w-0 items-center gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain text-[10px] font-mono text-text-muted focus-visible:-outline-offset-1"
+    >
       {mainSpans}
       {reviewerSpans.length > 0 && (
         <>

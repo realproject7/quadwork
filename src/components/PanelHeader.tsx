@@ -41,10 +41,11 @@ export default function PanelHeader({ label, status, projectId, agentId, onStatu
         : "bg-text-muted";
 
   const expanded = collapse ? collapse.expanded : true;
+  const hasSecondaryContent = Boolean(collapse && children);
 
   return (
-    <div className="flex items-center justify-between gap-2 px-3 h-7 shrink-0 border-b border-border">
-      <div className="flex items-center gap-2">
+    <div className={`flex items-center justify-between gap-2 px-3 h-7 shrink-0 border-b border-border ${hasSecondaryContent ? "@container/panel-header" : ""}`}>
+      <div className={`flex items-center gap-2 ${hasSecondaryContent ? "shrink-0" : ""}`}>
         {status && (
           <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
         )}
@@ -53,7 +54,7 @@ export default function PanelHeader({ label, status, projectId, agentId, onStatu
         </span>
         {expanded && tooltip}
       </div>
-      <div className="flex items-center gap-1.5">
+      <div className={`flex items-center gap-1.5 ${hasSecondaryContent ? "min-w-0" : ""}`}>
         {expanded && children}
         {projectId && agentId && (
           <AgentLifecycleControls key={`${projectId}/${agentId}`} projectId={projectId} agentId={agentId} status={status} onStatusChange={onStatusChange} />
@@ -67,12 +68,15 @@ export default function PanelHeader({ label, status, projectId, agentId, onStatu
             aria-expanded={expanded}
             aria-controls={collapse.bodyId}
             aria-label={`${expanded ? collapse.hideLabel : collapse.showLabel} ${label}`}
-            className={`inline-flex items-center gap-1 min-w-6 min-h-6 px-1 text-xs leading-none transition-colors ${
+            className={`inline-flex shrink-0 items-center gap-1 min-w-6 min-h-6 px-1 text-xs leading-none transition-colors ${
               expanded ? "text-text-muted hover:text-text" : "text-accent hover:text-accent-dim"
             }`}
           >
             <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
-            {expanded ? collapse.hideLabel : collapse.showLabel}
+            {/* Leave room for secondary content even in a narrow desktop rail. */}
+            <span className={expanded && hasSecondaryContent ? "hidden @[240px]/panel-header:inline" : undefined}>
+              {expanded ? collapse.hideLabel : collapse.showLabel}
+            </span>
           </button>
         )}
       </div>
