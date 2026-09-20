@@ -14,9 +14,9 @@ const MAX_CHILD_MS = 60_000;
 const RESULT_DRAIN_MS = 100;
 const FIELDS = Object.freeze(['schema_version', 'purpose', 'profile_id', 'backend', 'model', 'expected_head', 'candidate_digest', 'gate_receipt_digest', 'result_class', 'provider_turns', 'launch_claim_state', 'failure_stage', 'launch_diagnostic', 'pre_observer_pty_data_seen', 'pre_workload_output_seen', 'workload_write_attempted', 'workload_submitted_at_launch', 'terminal_exit_phase', 'worker_report_disposition', 'lifecycle_verified', 'sentinel_digest', 'output_bytes', 'output_capped', 'elapsed_ms', 'root_cleanup_ok', 'survivor_free', 'cleanup_attestation', 'source_rechecked_before_prompt', 'gate_rechecked_before_prompt', 'pre_root_facts', 'post_root_facts', 'credential_copy_or_store_api_used', 'keychain_immutability_claimed', 'peer_level_network_filter_available', 'release_evidence']);
 const LAUNCH_DIAGNOSTICS = new Set(['none', 'pty_unavailable_after_claim', 'pty_exited_before_observation']);
-const RESULTS = new Set(['completed', 'preflight_blocked', 'launch_failed', 'launch_indeterminate', 'attempt_indeterminate', 'output_cap_exceeded', 'cleanup_failed', 'worker_verification_failed', 'worker_start_failed', 'worker_timeout', 'worker_result_invalid', 'worker_exit_unverified', 'worker_cleanup_unverified', 'worker_exited_without_result']);
+const RESULTS = new Set(['completed', 'preflight_blocked', 'provider_state_unavailable', 'launch_failed', 'launch_indeterminate', 'attempt_indeterminate', 'output_cap_exceeded', 'cleanup_failed', 'worker_verification_failed', 'worker_start_failed', 'worker_timeout', 'worker_result_invalid', 'worker_exit_unverified', 'worker_cleanup_unverified', 'worker_exited_without_result']);
 const CLEANUP_ATTESTATIONS = new Set(['none', 'stop', 'shutdown', 'survivor', 'root', 'environment', 'unverified']);
-const PRELAUNCH_RESULTS = new Set(['preflight_blocked', 'launch_failed', 'attempt_indeterminate', 'cleanup_failed']);
+const PRELAUNCH_RESULTS = new Set(['preflight_blocked', 'provider_state_unavailable', 'launch_failed', 'attempt_indeterminate', 'cleanup_failed']);
 // A non-zero worker exit is never a success signal.  These are the only
 // post-claim child outcomes whose redacted facts are safe to preserve after
 // the ACK/exit race: each is a failure the fixed child can actually produce.
@@ -31,8 +31,8 @@ function reportShape(value, profile, candidate_digest) {
   const claim = value?.launch_claim_state, stage = value?.failure_stage;
   const zeroTurnPrelaunch = claim === 'none' && value?.provider_turns === 0 && stage === 'prelaunch' && PRELAUNCH_RESULTS.has(value?.result_class);
   const claimedComplete = claim === 'claimed' && value?.provider_turns === 1 && stage === 'none' && value?.result_class === 'completed';
-  const claimedPostlaunch = claim === 'claimed' && value?.provider_turns === 1 && stage === 'postclaim' && value?.result_class !== 'completed';
-  const unverifiedPostlaunch = claim === 'unverified' && value?.provider_turns === 1 && stage === 'postclaim' && value?.result_class !== 'completed';
+  const claimedPostlaunch = claim === 'claimed' && value?.provider_turns === 1 && stage === 'postclaim' && value?.result_class !== 'completed' && value?.result_class !== 'provider_state_unavailable';
+  const unverifiedPostlaunch = claim === 'unverified' && value?.provider_turns === 1 && stage === 'postclaim' && value?.result_class !== 'completed' && value?.result_class !== 'provider_state_unavailable';
   const codexLaunchSubmission = profile?.backend === 'codex' && value?.workload_submitted_at_launch === true && value?.workload_write_attempted === false;
   const claudePtyWrite = profile?.backend === 'claude' && value?.workload_write_attempted === true && value?.workload_submitted_at_launch === false;
   const childFactsConsistent = !(value?.terminal_exit_phase === 'after_workload_attempt' && !claudePtyWrite)

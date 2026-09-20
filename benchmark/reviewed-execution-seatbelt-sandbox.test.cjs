@@ -20,8 +20,13 @@ function ownedDirectory(parent, name) {
   return directory;
 }
 
-function fixtureProfile(executable) {
-  return Object.freeze({ ...profiles.PROFILES.v2_claude_restricted_v1, executable, backend: 'fixture' });
+function fixtureSource(executable, candidate, root, ledger) {
+  // The production registry is identity-closed.  This fixture rewrites only
+  // the already-generated executable literals after that boundary has run;
+  // it never constructs an alternate provider profile or provider state.
+  const production = profiles.PROFILES.v2_claude_restricted_v1;
+  return profiles.sandboxSource(production, candidate, root, ledger)
+    .replaceAll(`\"${production.executable}\"`, `\"${executable}\"`);
 }
 
 function runFixture(profileSource, executable, argv, cwd, observe) {
@@ -69,8 +74,7 @@ test('macOS Seatbelt root-vnode read admits the fixed PTY sentinel but preserves
   fs.chmodSync(outside, 0o600);
   const candidate = 'a'.repeat(64);
   try {
-    const printfProfile = fixtureProfile('/usr/bin/printf');
-    const fixedSource = profiles.sandboxSource(printfProfile, candidate, root, ledger);
+    const fixedSource = fixtureSource('/usr/bin/printf', candidate, root, ledger);
     assert.equal(fixedSource.includes(ROOT_READ_RULE), true);
     let fixedSentinelSeen = false;
     const fixed = await runFixture(fixedSource, '/usr/bin/printf', ['PTY_OK\\n'], root, chunk => {
@@ -86,8 +90,7 @@ test('macOS Seatbelt root-vnode read admits the fixed PTY sentinel but preserves
     assert.equal(noRuleOutputSeen, false);
     assert.equal(noRule.signal, 6);
 
-    const catProfile = fixtureProfile('/bin/cat');
-    const containmentSource = profiles.sandboxSource(catProfile, candidate, root, ledger);
+    const containmentSource = fixtureSource('/bin/cat', candidate, root, ledger);
     let outsideContentSeen = false;
     const containment = await runFixture(containmentSource, '/bin/cat', [outside], root, chunk => {
       // Retain no terminal text. The boolean is enough to prove that the

@@ -12,6 +12,7 @@ const runner = require('./reviewed-execution-live-runner.cjs');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
 const providerStateBoundary = require('./reviewed-execution-provider-state-boundary.cjs');
 function reportHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', 'module.exports = Object.freeze({ report, launchClaimState });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
+function shapeHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-runner.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ runReviewedCodex, runReviewedClaude });', 'module.exports = Object.freeze({ reportShape });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function finalMessageHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = 'module.exports = Object.freeze({ cleanupRootIdentity, createCodexFinalMessage, consumeCodexFinalMessage, cleanupCodexFinalMessage });'; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function activeHarness(claimState = 'claimed') { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = `let __removed = 0, __match = true; sourceFacts = () => fixed.facts; readGateReceipt = () => fixed.gate; launchClaimState = () => ${JSON.stringify(claimState)}; rootFacts = () => ({ entries: ["base"], root_digest: "a".repeat(64), entry_digest: "a".repeat(64), entry_count: 1 }); rootMatches = () => __match; removeOwnedRoot = () => { __removed += 1; return true; }; module.exports = Object.freeze({ set(state, match) { fixed = state; parentAdmitted = true; __match = match; }, completeFixedChild, removed: () => __removed });`; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function resultHarness(mode) {
@@ -280,11 +281,18 @@ test('cleanup attestation is an ordered redacted category and never retains effe
 test('provider-state boundary compares source facts without reading provider state', () => {
   const facts = providerStateBoundary.sourceFacts();
   assert.deepEqual(facts.normal_home, { home: 'inherited_safe_environment', provider_state_observed: false });
-  assert.deepEqual(facts.reviewed_claude, { home: 'executor_owned_disposable', provider_state_observed: false, provider_state_read_authorized: false });
-  assert.equal(facts.reviewed_codex.static_codex_home_authority_preexisting, true);
+  assert.deepEqual(facts.reviewed_claude, { home: 'executor_owned_disposable', provider_state_observed: false, provider_state_read_authorized: true, provider_state_binding: 'exact_file_metadata_validated', provider_state_locator: 'fixed_claude_config_dir' });
+  assert.deepEqual(facts.reviewed_codex, { home: 'executor_owned_disposable', provider_state_observed: false, provider_state_read_authorized: true, provider_state_binding: 'exact_file_metadata_validated' });
   assert.equal(facts.future_expansion_authority, providerStateBoundary.OPERATOR_CREDENTIAL_AUTHORITY);
   const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-provider-state-boundary.cjs'), 'utf8');
   for (const forbidden of ['readdirSync(os.homedir', 'copyFileSync', 'mount', 'keytar']) assert.equal(source.includes(forbidden), false, forbidden);
+});
+test('provider_state_unavailable is accepted only as a zero-turn prelaunch redacted result', () => {
+  const profile = profiles.PROFILES.v2_codex_readonly_v1; const candidate = 'a'.repeat(64);
+  const value = reportHarness().report(profile, { expected_head: 'b'.repeat(40), candidate_digest: candidate }, { result_class: 'provider_state_unavailable', launch_claim_state: 'none', failure_stage: 'prelaunch', root_cleanup_ok: true, survivor_free: true, cleanup_attestation: 'none' });
+  assert.equal(shapeHarness().reportShape(value, profile, candidate), true);
+  assert.equal(shapeHarness().reportShape({ ...value, provider_turns: 1, launch_claim_state: 'claimed', failure_stage: 'postclaim' }, profile, candidate), false);
+  assert.equal(shapeHarness().reportShape({ ...value, workload_submitted_at_launch: true, terminal_exit_phase: 'after_launch_submission' }, profile, candidate), false);
 });
 test('non-launching production report harness redacts prompt, output, path and token fields', () => {
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const report = reportHarness().report(profile, { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, { prompt: profiles.WORKLOAD, output: 'token=private', path: '/private/root', token: 'private', result_class: 'attempt_indeterminate' }); const text = JSON.stringify(report);

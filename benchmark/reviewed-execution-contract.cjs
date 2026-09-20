@@ -83,18 +83,21 @@ function preflight({ profile_id, candidate_digest, disposable_root, ledger_direc
   try {
     const profile = profiles.PROFILES[profile_id];
     if (!profile || candidate_digest !== profiles.candidateDigest()) throw new Error('candidate');
+    // Metadata-only validation must happen before a sandbox is generated or a
+    // server process can reach the launch/claim boundary.  Do not collapse
+    // this refusal into a generic preflight result: the live schema needs to
+    // prove that unavailable approved state was a zero-turn prelaunch exit.
+    profiles.validateProviderState(profile, disposable_root, ledger_directory);
     profiles.reviewedLaunchPlan(profiles.PROJECT, profile.role, profile.id, { candidate_digest, disposable_root, ledger_directory, authorization_key, sandbox_profile, sandbox_digest });
     checkedDirectory(disposable_root, 0o700, 'root'); checkedDirectory(ledger_directory, 0o700, 'ledger'); checkedDirectory(home, 0o700, 'home');
     const binary = fs.lstatSync(profile.executable);
     if (!binary.isFile() || binary.isSymbolicLink() || !sameUser(binary) || sha256(fs.readFileSync(profile.executable)) !== profile.executable_digest) throw new Error('binary');
     if (!fs.existsSync(profiles.SANDBOX_EXECUTABLE)) throw new Error('sandbox');
-    // No credential is read. Codex only checks that its static read-only source
-    // exists; Claude authentication is provider-managed Keychain state.
-    if (profile.backend === 'codex' && !fs.existsSync(profiles.CODEX_HOME)) throw new Error('auth_source');
     if (!/^[a-f0-9]{64}$/.test(profile.version_digest)) throw new Error('version_evidence');
     if (Date.now() - started > MAX_PREFLIGHT_MS) throw new Error('timeout');
     return Object.freeze({ result_class: 'preflight_ready', provider_turns: 0, elapsed_ms: Date.now() - started });
-  } catch {
+  } catch (error) {
+    if (error?.message === 'reviewed_execution_provider_state_unavailable') return Object.freeze({ result_class: 'provider_state_unavailable', provider_turns: 0, elapsed_ms: Date.now() - started });
     return Object.freeze({ result_class: 'preflight_blocked', provider_turns: 0, elapsed_ms: Date.now() - started });
   }
 }

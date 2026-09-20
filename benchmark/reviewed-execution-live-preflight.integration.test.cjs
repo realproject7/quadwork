@@ -19,7 +19,7 @@ function mkdir(directory) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   fs.chmodSync(directory, 0o700);
 }
-function copyCandidateFixture(directory) {
+function copyCandidateFixture(directory, { providerStateUnavailable = false } = {}) {
   for (const relative of candidateFiles) {
     const target = path.join(directory, relative);
     mkdir(path.dirname(target));
@@ -27,7 +27,8 @@ function copyCandidateFixture(directory) {
   }
   const profiles = path.join(directory, 'server', 'reviewed-execution-profiles.js');
   const source = fs.readFileSync(profiles, 'utf8');
-  const changed = source.replace("executable: '/opt/homebrew/Caskroom/codex/0.153.1/bin/codex'", "executable: '/definitely-unavailable/quadwork-reviewed-codex'");
+  let changed = source.replace("executable: '/opt/homebrew/Caskroom/codex/0.153.1/bin/codex'", "executable: '/definitely-unavailable/quadwork-reviewed-codex'");
+  if (providerStateUnavailable) changed = changed.replace("const CODEX_AUTH_FILE = '/Users/cho/.codex/auth.json';", "const CODEX_AUTH_FILE = '/definitely-unavailable/quadwork-reviewed-auth.json';");
   assert.notEqual(changed, source, 'fixture replaced the local prerequisite only');
   fs.writeFileSync(profiles, changed, { mode: 0o600 });
   fs.chmodSync(profiles, 0o600);
@@ -138,6 +139,26 @@ test('source-fixed parent and authenticated child return an actual zero-turn una
     fs.rmSync(fixture, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+test('missing approved provider state is a redacted zero-turn prelaunch refusal before authorization claim', () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-provider-state-source-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-provider-state-home-'));
+  try {
+    const profiles = copyCandidateFixture(fixture, { providerStateUnavailable: true });
+    const expectedHead = execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: fixture, encoding: 'utf8' }).trim();
+    const candidateDigest = profiles.candidateDigest(fixture);
+    const gate = gateFixture(home, profiles, expectedHead, candidateDigest);
+    const runner = path.join(fixture, 'benchmark', 'reviewed-execution-live-runner.cjs');
+    const invoked = spawnSync(process.execPath, ['-e', "require(process.argv[1]).runReviewedCodex().then(value => process.stdout.write(JSON.stringify(value))).catch(error => { console.error(error.stack); process.exit(1); });", runner], { cwd: fixture, encoding: 'utf8', timeout: 5_000, env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: home, USERPROFILE: home } });
+    assert.equal(invoked.status, 0, `${invoked.stdout}\n${invoked.stderr}`);
+    const result = JSON.parse(invoked.stdout);
+    assert.equal(result.result_class, 'provider_state_unavailable');
+    assert.equal(result.provider_turns, 0);
+    assert.equal(result.launch_claim_state, 'none');
+    assert.equal(result.failure_stage, 'prelaunch');
+    assert.equal(fs.existsSync(path.join(gate.ledger, `${gate.authorization_key}.launch`)), false);
+    assert.equal(JSON.stringify(result).includes('/definitely-unavailable/quadwork-reviewed-auth.json'), false);
+  } finally { fs.rmSync(fixture, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
 });
 test('source-fixed active child reaches server runReviewedExecution/buildAgentArgs, fails a fixed missing preclaim prerequisite, and reports zero turns', () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-active-source-'));
