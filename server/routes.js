@@ -2540,6 +2540,22 @@ let _projectsCache = null;
 let _projectsCacheTs = 0;
 const PROJECTS_CACHE_TTL = 60_000;
 
+function readSessionLiveness(app) {
+  try {
+    const observe = app.get("readSessionLiveness");
+    if (typeof observe !== "function") return null;
+    const facts = observe();
+    if (!Array.isArray(facts)) return null;
+    for (const fact of facts) {
+      if (!fact || Object.keys(fact).length !== 2 ||
+          !Object.hasOwn(fact, "projectId") || !Object.hasOwn(fact, "agentId") ||
+          typeof fact.projectId !== "string" || !fact.projectId ||
+          typeof fact.agentId !== "string" || !fact.agentId) return null;
+    }
+    return facts;
+  } catch { return null; }
+}
+
 function shouldPublishProjectsCache(projectResults, admissions) {
   return projectResults.every((project) => {
     const currentlyArchived = isProjectArchived(project.id);
@@ -2550,23 +2566,28 @@ function shouldPublishProjectsCache(projectResults, admissions) {
 }
 
 router.get("/api/projects", async (req, res) => {
+  // GitHub metadata is cached, but session state is read at response time,
+  // including after asynchronous metric collection and on cache hits.
+  const respond = (result) => {
+    const sessions = readSessionLiveness(req.app);
+    if (!sessions) return res.status(503).json({ ok: false, code: "session_liveness_unavailable" });
+    const activeProjectIds = new Set(sessions.map((session) => session.projectId));
+    return res.json({ ...result, projects: result.projects.map((project) =>
+      project._archived || project._idle ? project : {
+        ...project,
+        state: project.agentCount > 0 && activeProjectIds.has(project.id) ? "active" : "idle",
+      }) });
+  };
   if (_projectsCache && Date.now() - _projectsCacheTs < adaptiveTTL(PROJECTS_CACHE_TTL)) {
-    return res.json(_projectsCache);
+    return respond(_projectsCache);
   }
   // #554: serve stale projects cache when critically rate-limited
   if (isRateLimited() && _projectsCache) {
-    return res.json(_projectsCache);
+    return respond(_projectsCache);
   }
 
   const cfg = readConfigFile();
   const projectResultAdmissions = new Map();
-
-  // Fetch active sessions from our own in-memory state (only running PTYs)
-  const activeSessions = req.app.get("activeSessions") || new Map();
-  const activeProjectIds = new Set();
-  for (const [, info] of activeSessions) {
-    if (info.projectId && info.state === "running") activeProjectIds.add(info.projectId);
-  }
 
   // Fetch chat messages from all projects (per-project AgentChattr instances)
   const chatMsgsByProject = {};
@@ -2711,7 +2732,6 @@ router.get("/api/projects", async (req, res) => {
     if (!isAdmissionCurrent(admission)) {
       return { id: p.id, name: p.name, repo: configuredRepo, repositories, agentCount: 0, openPrs: 0, state: "archived", lastActivity: null, _archived: true, _readonly: true };
     }
-    const hasAgents = p.agents && Object.keys(p.agents).length > 0;
     return {
       id: p.id,
       name: p.name,
@@ -2719,7 +2739,7 @@ router.get("/api/projects", async (req, res) => {
       repositories,
       agentCount: p.agents ? Object.keys(p.agents).length : 0,
       openPrs,
-      state: hasAgents && activeProjectIds.has(p.id) ? "active" : "idle",
+      state: "idle", // Fresh session liveness is overlaid when responding.
       lastActivity,
     };
   }
@@ -2756,7 +2776,7 @@ router.get("/api/projects", async (req, res) => {
     _projectsCache = result;
     _projectsCacheTs = Date.now();
   }
-  res.json(result);
+  respond(result);
 });
 
 // ─── GitHub Rate Limit (#554) ──────────────────────────────────────────────
@@ -6413,22 +6433,21 @@ async function verifyV2RepositoryAccess(repositories) {
   return { ok: true };
 }
 
-function activeTargetSession(projectId, activeSessions) {
-  if (!activeSessions || typeof activeSessions[Symbol.iterator] !== "function") return { ok: true };
-  for (const [sessionKey, session] of activeSessions) {
-    if (!session || session.projectId !== projectId || session.state !== "running") continue;
-    const role = typeof session.agentId === "string" && session.agentId.length > 0
-      ? session.agentId
-      : (typeof sessionKey === "string" && sessionKey.includes("/") ? sessionKey.split("/").at(-1) : "unknown");
-    return { ok: false, code: "active_session", role };
+function activeTargetSession(projectId, app) {
+  const sessions = readSessionLiveness(app);
+  if (!sessions) return { ok: false, code: "session_liveness_unavailable" };
+  for (const session of sessions) {
+    if (session.projectId === projectId) return { ok: false, code: "active_session", role: session.agentId };
   }
   return { ok: true };
 }
 
-function existingV2TopologyGuard(project, activeSessions) {
-  const targetGate = targetActivationGuard(project, v2SetupExecutionState);
-  if (!targetGate.ok) return targetGate;
-  return activeTargetSession(project.id, activeSessions);
+function v2TopologyGuard(project, projectId, app) {
+  if (project) {
+    const targetGate = targetActivationGuard(project, v2SetupExecutionState);
+    if (!targetGate.ok) return targetGate;
+  }
+  return activeTargetSession(projectId, app);
 }
 
 function v2CandidateProject(existing, body, repositories) {
@@ -6522,13 +6541,12 @@ router.post("/api/setup", async (req, res) => {
       const candidate = v2CandidateProject(existing, { ...body, id: projectId.project_id }, repositories);
       const readiness = projectV2Readiness(candidate);
       if (!readiness.ready) return res.json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
-      const activeSessions = req.app.get("activeSessions") || new Map();
-      if (existing) {
-        const targetGate = existingV2TopologyGuard(existing, activeSessions);
-        if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
-      }
+      const targetGate = v2TopologyGuard(existing, candidate.id, req.app);
+      if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
       const access = await verifyV2RepositoryAccess(repositories);
       if (!access.ok) return res.status(409).json({ ok: false, ...access });
+      const postAccessGate = v2TopologyGuard(existing, candidate.id, req.app);
+      if (!postAccessGate.ok) return res.status(409).json({ ok: false, ...postAccessGate });
       const ownership = configuredRepositoryOwnership(cfg, candidate.id, repositories);
       if (!ownership.ok) return res.json({ ok: false, ...ownership });
       const provisioned = await provisionV2Repositories(cfg, candidate, repositories, existing);
@@ -6552,13 +6570,12 @@ router.post("/api/setup", async (req, res) => {
       if (!readiness.ready) return res.status(409).json({ ok: false, code: "v2_setup_not_ready", reasons: readiness.reasons });
       const firstActivation = firstActivationLegacyGuard(cfg, candidate.id, v2SetupExecutionState);
       if (!firstActivation.ok) return res.status(409).json({ ok: false, ...firstActivation });
-      const activeSessions = req.app.get("activeSessions") || new Map();
-      if (existing) {
-        const targetGate = existingV2TopologyGuard(existing, activeSessions);
-        if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
-      }
+      const targetGate = v2TopologyGuard(existing, candidate.id, req.app);
+      if (!targetGate.ok) return res.status(409).json({ ok: false, ...targetGate });
       const access = await verifyV2RepositoryAccess(repositories);
       if (!access.ok) return res.status(409).json({ ok: false, ...access });
+      const postAccessGate = v2TopologyGuard(existing, candidate.id, req.app);
+      if (!postAccessGate.ok) return res.status(409).json({ ok: false, ...postAccessGate });
       const ownership = configuredRepositoryOwnership(cfg, candidate.id, repositories);
       if (!ownership.ok) return res.status(409).json({ ok: false, ...ownership });
       const provisioned = await provisionV2Repositories(cfg, candidate, repositories, existing);
@@ -6598,7 +6615,7 @@ router.post("/api/setup", async (req, res) => {
           if (!currentFirstGuard.ok) throw new V2SetupActivationError(currentFirstGuard);
           const index = (fresh.projects || []).findIndex((project) => project?.id === candidate.id);
           const current = index >= 0 ? fresh.projects[index] : null;
-          const currentGate = current ? existingV2TopologyGuard(current, activeSessions) : { ok: true };
+          const currentGate = v2TopologyGuard(current, candidate.id, req.app);
           if (!currentGate.ok) throw new V2SetupActivationError(currentGate);
           const currentOwnership = configuredRepositoryOwnership(fresh, candidate.id, repositories);
           if (!currentOwnership.ok) throw new V2SetupActivationError(currentOwnership);

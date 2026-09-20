@@ -25,7 +25,9 @@ test("normal imports have no mutable legacy session facade", () => {
     process.env.QUADWORK_SKIP_LISTEN = "1";
     delete process.env.QUADWORK_TEST_RUNTIME;
     const runtime = require("./server/index");
-    const absent = !Object.hasOwn(runtime, "agentSessions") && !Object.hasOwn(runtime._test, "agentSessions");
+    const facts = runtime.app.get("readSessionLiveness")();
+    const absent = !Object.hasOwn(runtime, "agentSessions") && !Object.hasOwn(runtime._test, "agentSessions") &&
+      runtime.app.get("activeSessions") === undefined && Object.isFrozen(facts) && facts.length === 0;
     Promise.resolve(runtime.shutdown()).then(() => process.exit(absent ? 0 : 1));
   `;
   const result = spawnSync(process.execPath, ["-e", script], {
@@ -42,6 +44,30 @@ process.env.HOME = home;
 process.env.QUADWORK_SKIP_LISTEN = "1";
 process.env.QUADWORK_TEST_RUNTIME = "1";
 const runtime = require("./index");
+
+test("production liveness observer exposes only immutable running identities", () => {
+  const facade = runtime._test.agentSessions;
+  const session = {
+    projectId: "fixture", agentId: "dev", state: "running",
+    term: { write() { throw new Error("terminal must remain private"); } },
+    scrollback: Buffer.from("private fixture output"),
+    observer() { throw new Error("observer must remain private"); },
+  };
+  facade.set("fixture/dev", session);
+  facade.set("fixture/re1", { projectId: "fixture", agentId: "re1", state: "stopped" });
+  const read = runtime.app.get("readSessionLiveness");
+  const facts = read();
+  assert.deepEqual(facts, [{ projectId: "fixture", agentId: "dev" }]);
+  assert.equal(Object.isFrozen(facts), true);
+  assert.equal(Object.isFrozen(facts[0]), true);
+  assert.equal(Reflect.set(facts[0], "agentId", "head"), false);
+  assert.equal(Reflect.set(facts, "length", 0), false);
+  assert.equal(session.agentId, "dev");
+  session.state = "stopped";
+  assert.deepEqual(read(), [], "each read observes the current private owner");
+  assert.deepEqual(facts, [{ projectId: "fixture", agentId: "dev" }], "prior facts are detached snapshots");
+  facade.clear();
+});
 
 test("flagged facade rejects any reviewed entry or replacement", () => {
   assert.equal(Object.hasOwn(runtime._test, "agentSessions"), true);

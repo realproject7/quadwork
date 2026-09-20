@@ -717,6 +717,14 @@ app.get("/api/caffeinate/status", (req, res) => {
 // PTY (term) is the source of truth for "running". WS is optional (attaches to view terminal).
 const agentSessions = new Map();
 
+// Routes observe fresh running-role identities, never the private session,
+// terminal, output, or reviewed-execution observer. Each read is a frozen copy.
+app.set("readSessionLiveness", () => Object.freeze(
+  [...agentSessions.values()]
+    .filter((session) => session.state === "running")
+    .map((session) => Object.freeze({ projectId: session.projectId, agentId: session.agentId }))
+));
+
 // Compatibility inspection for legacy launch tests and diagnostics. It is a
 // value snapshot, never the mutable session/PTY object, and deliberately
 // refuses reviewed executions so no caller can regain their terminal handle.

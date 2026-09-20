@@ -88,7 +88,7 @@ function request(server, pathname) {
     const express = require("express");
     const routes = require("./routes");
     const app = express();
-    app.set("activeSessions", new Map());
+    app.set("readSessionLiveness", () => []);
     app.use(routes);
     server = app.listen(0, "127.0.0.1");
     await new Promise((resolve) => server.once("listening", resolve));

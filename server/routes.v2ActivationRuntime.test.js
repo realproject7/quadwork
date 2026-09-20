@@ -75,7 +75,7 @@ function worktreeAdds() { return calls.filter((call) => call[0] === "git" && cal
 
 (async () => {
   const app = express(); app.use(express.json());
-  const sessions = new Map(); app.set("activeSessions", sessions);
+  app.set("readSessionLiveness", () => []);
   let dispatched = 0;
   routes.setPtyDispatchCallback(() => { dispatched++; });
   app.use(routes);
@@ -209,7 +209,6 @@ function worktreeAdds() { return calls.filter((call) => call[0] === "git" && cal
     assert.ok(fs.statSync(queueFile).isFile());
     assert.equal(fileChat.isProjectInitialized(queueFailure.id), true);
     assert.equal(JSON.parse(fs.readFileSync(configPath)).operator_name, originalConfig.operator_name);
-    assert.equal(sessions.size, 0);
     console.log("routes.v2ActivationRuntime.test.js: real Git/Express/file-chat fresh activation, first chat, preservation and pre/post-commit failure/retry passed");
   } finally {
     routes.setPtyDispatchCallback(null);

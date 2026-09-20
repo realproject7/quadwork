@@ -1,5 +1,5 @@
 "use strict";
-require("./__tests__/resource-executor-fixture").installResourceExecutorFixture();
+const restoreResourceFixture = require("./__tests__/resource-executor-fixture").installResourceExecutorFixture({ preserveRuntimeOwner: true });
 
 // #1032 route proof with real linked Git worktrees and config/map/seed writes.
 // Async provision/access results remain controlled for deterministic admission
@@ -7,7 +7,6 @@ require("./__tests__/resource-executor-fixture").installResourceExecutorFixture(
 
 const assert = require("node:assert/strict");
 const childProcess = require("node:child_process");
-const express = require("express");
 const fs = require("fs");
 const http = require("http");
 const os = require("os");
@@ -17,16 +16,19 @@ const util = require("util");
 const TEST_HOME = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-v2-setup-")));
 const originalHomedir = os.homedir;
 const originalExecFile = childProcess.execFile;
+const originalEnv = { ...process.env };
 os.homedir = () => TEST_HOME;
+Object.assign(process.env, { HOME: TEST_HOME, USERPROFILE: TEST_HOME, QUADWORK_SKIP_LISTEN: "1", QUADWORK_TEST_RUNTIME: "1" });
 
 const CONFIG_DIR = path.join(TEST_HOME, ".quadwork");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
+fs.writeFileSync(CONFIG_PATH, JSON.stringify({ projects: [], temp_cleanup: { enabled: false } }), { mode: 0o600 });
 
 let dirtyPath = null;
 let githubMode = "ok";
 let provisionHook = null;
-const activeSessions = new Map();
+let accessHook = null;
 let commandCalls = [];
 function fakeExecFile(cmd, args, options, callback) {
   const done = typeof options === "function" ? options : callback;
@@ -42,6 +44,9 @@ function fakeExecFile(cmd, args, options, callback) {
       viewerPermission: githubMode === "readonly" ? "READ" : "WRITE",
       defaultBranchRef: { name: "main" },
     });
+    if (accessHook) { const hook = accessHook; accessHook = null; hook(); }
+  } else if (cmd === "gh" && args[0] === "api") {
+    stdout = "HTTP/2 200\n\n[]";
   } else if (cmd === "git" && args.slice(2).join(" ") === "rev-parse --show-toplevel") stdout = base;
   else if (cmd === "git" && args.slice(2).join(" ") === "remote get-url origin") stdout = `https://github.com/${repository}.git`;
   else if (cmd === "git" && args.slice(2).join(" ") === "rev-parse --verify HEAD") stdout = "a".repeat(40);
@@ -70,6 +75,8 @@ fakeExecFile[util.promisify.custom] = (cmd, args, options) => new Promise((resol
 childProcess.execFile = fakeExecFile;
 
 const routes = require("./routes");
+const runtime = require("./index");
+const activeSessions = runtime._test.agentSessions;
 
 function readBytes() { return fs.readFileSync(CONFIG_PATH, "utf8"); }
 function writeConfig(value) { fs.writeFileSync(CONFIG_PATH, JSON.stringify(value, null, 2), { mode: 0o600 }); }
@@ -116,15 +123,15 @@ function legacyProject(id, paths) {
   return { id, name: id, repo: "Acme/Target", working_dir: paths.base, agents: paths.agents, chat_mode: "file" };
 }
 
-function post(server, urlPath, body) {
+function post(server, urlPath, body, method = "POST") {
   return new Promise((resolve, reject) => {
-    const payload = Buffer.from(JSON.stringify(body));
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
     const request = http.request({
       host: "127.0.0.1",
       port: server.address().port,
-      method: "POST",
+      method,
       path: urlPath,
-      headers: { "content-type": "application/json", "content-length": payload.length },
+      headers: payload ? { "content-type": "application/json", "content-length": payload.length } : {},
     }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
@@ -143,10 +150,11 @@ function assertNoRoleWorktreeCreation(label) {
 }
 
 (async () => {
-  const app = express();
-  app.use(express.json());
-  app.set("activeSessions", activeSessions);
-  app.use(routes);
+  // Use the genuine runtime composition. A test-supplied app/session Map hid
+  // #1156 because production no longer exposed that private Map to routes.
+  const app = runtime.app;
+  const observeSessions = app.get("readSessionLiveness");
+  assert.equal(app.get("activeSessions"), undefined, "raw sessions remain private");
   const server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-v2-worktrees-")));
@@ -225,8 +233,8 @@ function assertNoRoleWorktreeCreation(label) {
     assert.equal(commandCalls.length, 0, "invalid verify id never reaches repository access");
     console.log("  PASS: invalid project ids fail before provisioning");
 
-    // Existing projects are topology-frozen while any injected live role
-    // session exists, for both dry provisioning and final activation.
+    // Populate only the existing isolated test facade. Both route consumers
+    // must obtain facts through the real server-owned observer.
     activeSessions.set("target/dev", { projectId: "target", agentId: "dev", state: "running" });
     before = readBytes();
     commandCalls = [];
@@ -240,8 +248,55 @@ function assertNoRoleWorktreeCreation(label) {
     assert.deepEqual(response.body, { ok: false, code: "active_session", role: "dev" });
     assert.equal(readBytes(), before);
     assert.equal(commandCalls.length, 0, "live session activation block precedes external verification");
+    response = await post(server, "/api/projects", undefined, "GET");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.projects.find((project) => project.id === "target").state, "active");
+    const metadataCalls = commandCalls.length;
+    activeSessions.clear();
+    activeSessions.set("other/dev", { projectId: "other", agentId: "dev", state: "running" });
+    activeSessions.set("target/dev", { projectId: "target", agentId: "dev", state: "stopped" });
+    response = await post(server, "/api/projects", undefined, "GET");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.projects.find((project) => project.id === "target").state, "idle");
+    assert.equal(commandCalls.length, metadataCalls, "cached metadata still receives fresh session facts");
+    response = await post(server, "/api/setup?step=provision-repositories", requestBody);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.ok, true, "unrelated and stopped sessions permit target provisioning");
     activeSessions.clear();
     console.log("  PASS: live target sessions block both provisioning and activation before side effects");
+
+    for (const observer of [undefined, null, () => null, () => new Map(), () => [null], () => new Array(1),
+      () => Promise.resolve([]), () => [Object.assign(Object.create({ projectId: "target", agentId: "dev" }), { a: 1, b: 2 })],
+      () => [{ projectId: "target" }], () => [{ projectId: "target", agentId: "dev", term: {} }],
+      () => { throw new Error("fixture observation unavailable"); }]) {
+      app.set("readSessionLiveness", observer);
+      before = readBytes();
+      commandCalls = [];
+      for (const step of ["provision-repositories", "activate-v2"]) {
+        response = await post(server, `/api/setup?step=${step}`, requestBody);
+        assert.equal(response.status, 409);
+        assert.deepEqual(response.body, { ok: false, code: "session_liveness_unavailable" });
+        assert.equal(readBytes(), before, "unavailable observation never commits config");
+        assert.equal(commandCalls.length, 0, "unavailable observation never verifies or provisions repositories");
+      }
+    }
+    response = await post(server, "/api/projects", undefined, "GET");
+    assert.equal(response.status, 503, "unavailable observation cannot report an idle project");
+    app.set("readSessionLiveness", observeSessions);
+    console.log("  PASS: missing, malformed, and throwing liveness observations fail closed");
+
+    for (const step of ["provision-repositories", "activate-v2"]) {
+      before = readBytes();
+      commandCalls = [];
+      accessHook = () => activeSessions.set("target/head", { projectId: "target", agentId: "head", state: "running" });
+      response = await post(server, `/api/setup?step=${step}`, requestBody);
+      assert.equal(response.status, 409);
+      assert.deepEqual(response.body, { ok: false, code: "active_session", role: "head" });
+      assert.equal(readBytes(), before);
+      assert.ok(commandCalls.every((call) => call.cmd === "gh"), "a start during access checking blocks before provisioning");
+      activeSessions.clear();
+    }
+    console.log("  PASS: fresh post-access liveness blocks both setup actions before provisioning");
 
     // Any other legacy project's executable queue blocks the one global first
     // migration before provision or config write.
@@ -282,6 +337,22 @@ function assertNoRoleWorktreeCreation(label) {
     activeSessions.clear();
     console.log("  PASS: commit-time live-session recheck rejects a topology race");
 
+    before = readBytes();
+    provisionHook = () => { accessHook = () => activeSessions.set("target/re2", { projectId: "target", agentId: "re2", state: "running" }); };
+    response = await post(server, "/api/setup?step=activate-v2", requestBody);
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, "active_session");
+    assert.equal(response.body.role, "re2");
+    assert.equal(readBytes(), before, "a start during final access checking blocks configuration commit");
+    activeSessions.clear();
+    provisionHook = () => app.set("readSessionLiveness", () => null);
+    response = await post(server, "/api/setup?step=activate-v2", requestBody);
+    assert.equal(response.status, 409);
+    assert.equal(response.body.code, "session_liveness_unavailable");
+    assert.equal(readBytes(), before, "lost observation during provisioning fails the final guard closed");
+    app.set("readSessionLiveness", observeSessions);
+    console.log("  PASS: final guard re-reads liveness after all awaits and rejects lost observations");
+
     // A concurrent registration can claim the same canonical repository after
     // the pre-provision check. The final config transaction rechecks ownership
     // and keeps its own activation out of the changed document.
@@ -319,6 +390,8 @@ function assertNoRoleWorktreeCreation(label) {
     // persists arrays only and emits an atomic map without starting sessions.
     writeConfig({ projects: [legacyProject("target", paths)] });
     writeQueue("target");
+    activeSessions.set("other/dev", { projectId: "other", agentId: "dev", state: "running" });
+    activeSessions.set("target/dev", { projectId: "target", agentId: "dev", state: "stopped" });
     commandCalls = [];
     response = await post(server, "/api/setup?step=activate-v2", requestBody);
     assert.equal(response.status, 200, JSON.stringify(response.body));
@@ -340,13 +413,20 @@ function assertNoRoleWorktreeCreation(label) {
     assert.ok(!map.includes("operator"), "map contains no policy evidence keys");
     console.log("  PASS: final activation commits canonical arrays and an atomic redacted map without session start/restart");
   } finally {
-    server.close();
+    activeSessions.clear();
+    await runtime.shutdown();
+    await new Promise((resolve) => server.close(resolve));
+    restoreResourceFixture();
     childProcess.execFile = originalExecFile;
     os.homedir = originalHomedir;
+    for (const key of ["HOME", "USERPROFILE", "QUADWORK_SKIP_LISTEN", "QUADWORK_TEST_RUNTIME"]) {
+      if (originalEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = originalEnv[key];
+    }
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(TEST_HOME, { recursive: true, force: true });
   }
-  console.log("\n10 passed, 0 failed\n");
+  console.log("\nroutes.v2Setup.test.js: all assertions passed\n");
 })().catch((error) => {
   childProcess.execFile = originalExecFile;
   os.homedir = originalHomedir;
