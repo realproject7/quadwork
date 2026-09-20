@@ -1,5 +1,27 @@
 # Reviewed execution provider-state authority boundary
 
+## Current status, 2026-09-20 (#1155)
+
+The comparison below preserves the historical source facts and authority limits
+recorded for #1147. It is not installed-product provider support or release
+proof. The reviewed runner remains a security harness; its unresolved future
+one-shot obligations no longer block implementation or source-audit completion.
+Preserve prior authorizations, consumed attempts, diagnostics, and evidence
+unchanged. Consumed authorizations cannot be retried, reset, or reused.
+
+Real-provider turns, product E2E/device checks, and live benchmarks remain on
+hold until the operator returns and explicitly resumes testing. Local build,
+isolated installation, and test preparation do not authorize reading provider
+state. The later installed-product check must use the exact reviewed artifact
+and retain only raw-free result facts; this historical note cannot satisfy it.
+
+No interactive login, OAuth grant, credential/auth-file/Keychain inspection,
+copying, or change is authorized. Missing login, device confirmation, or extra
+provider-state access remains an operator gate. The explicit authority rule at
+the end of this note remains in force for every later execution path.
+
+## Historical source comparison (#1147)
+
 This note is a source-fact comparison for #1147. It is not authentication,
 entitlement, provider availability, or credential evidence. The implementation
 and its test read checked-in source only; they do not enumerate, open, copy,

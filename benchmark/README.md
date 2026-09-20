@@ -2,6 +2,48 @@
 
 This is the first preparation utility for #1037, not a benchmark runner.
 
+## Current stage, 2026-09-20 (#1155)
+
+Offline preparation, deterministic regression checks, and source audit may
+continue. Real-provider turns, product E2E/device checks, and live benchmarks
+must wait until the operator returns and explicitly resumes testing. Carry
+this hold into the handoff and continuity watcher; no automation may launch
+live tests while it applies.
+
+The reviewed runner is a security harness and historical evidence, not required
+provider-support or release proof. Preserve its authorizations, attempted runs,
+failures, diagnostics, and receipts without rewriting their outcomes. Consumed
+one-shot authorizations stay consumed and cannot be retried or reset. Only
+unresolved future execution obligations are superseded; the older preparation
+and execution descriptions below do not grant a fresh attempt.
+
+Record source-audit completion separately from pending live verification, and
+keep compound #1037 open for its retained product and release gates. Once the
+implementation and audit fixes are complete, follow the
+[local-install readiness procedure](../docs/release-v2.8.0-runbook.md#local-install-readiness-before-testing).
+Build and pack the exact reviewed final source, record the commit and archive
+digest, install into an isolated local target, and prepare disposable scenarios.
+Do not start the product or providers during this preparation stage.
+
+After the operator resumes, one bounded project-path action each with Codex and
+Claude must use that exact installed artifact. Record raw-free success/failure,
+source/artifact and provider/model identities, and bounded outcome facts.
+CLI presence/version, startup, replay tests, and historical runner results do
+not prove this installed-product path. Failed or unperformed proof blocks
+provider-support and publish recommendation, not a scoped implementation claim.
+
+No interactive login, OAuth grant, credential/auth-file/Keychain inspection,
+copying, or change is authorized. Missing login, device confirmation, or extra
+provider-state access is an operator gate under the unchanged
+[authority boundary](../docs/reviewed-execution-provider-state-boundary.md).
+Local-install provider proof precedes any version, tag, release, or npm publish.
+The matched benchmark and manifest-freeze gates remain required for performance
+and release claims and run only after testing resumes. Actions stays disabled,
+with zero active cache and artifacts. This stage authorizes no release,
+deployment, registry publication, or replacement of an existing installation.
+
+## Offline commands and existing harness contracts
+
 ```sh
 node benchmark/preflight.cjs \
   --manifest docs/v2-benchmark-manifest.draft.json \
@@ -57,8 +99,9 @@ Use Node 20.3+ on macOS with Command Line Tools Git at
 No Windows support is claimed for this non-shipping helper. Git runs with a
 restricted child environment, fixed argv, bounded execution and output, no
 replacement objects, and no allowed network transport. No global config is
-changed. The top-level `benchmark/` directory is outside the package's shipped
-file allowlist.
+changed. Benchmark fixtures and standalone preparation tools are outside the
+package's shipped file allowlist; only the selected runtime helpers explicitly
+listed in `package.json` ship with the product.
 
 The measurement design and proposed work bundle are in
 [`docs/v2-benchmark-plan.md`](../docs/v2-benchmark-plan.md) and
@@ -228,18 +271,19 @@ candidate digest explicitly covers the V2 launch chain, profile source,
 sandbox template, reviewed binary/version evidence, workload, sentinel rule,
 and runner. The final PTY construction recomputes it before launch.
 
-This change contains no provider auth or workload invocation. Its local
-preflight is capped at five seconds and 4 KiB, reports zero turns, and blocks
-on any unavailable local prerequisite. The sandbox default-denies writes
-outside the disposable root and ledger. It permits outbound connections only
+The original #1115 preparation change contained no provider auth or workload
+invocation. Its local preflight is capped at five seconds and 4 KiB, reports
+zero turns, and blocks on any unavailable local prerequisite. The sandbox
+default-denies writes outside the disposable root and ledger. It permits outbound connections only
 for the fixed binary, fixed model, fixed no-tools argv path. It does not claim
 hostname-level filtering or Keychain immutability, and it never copies,
 prints, hashes, or persists credential values. Live activity remains prohibited
 until two independent reviews approve the exact candidate and the required
 Actions/cache/artifact observations are fresh.
 
-The live selector is deliberately disabled in this change. In particular, this
-layer does not run a provider CLI, PTY, or dynamic version command. The recorded
-version digest is static reviewed evidence only. A later reviewed contract must
-add the fresh-review and Actions/cache/artifact gate together with complete
-sentinel, cleanup, post-root, and process-survivor proof before enabling it.
+The live selector was deliberately disabled in the original #1115 preparation
+change. The later #1117 contract and its hardening defined reviewed live
+execution separately, including fresh review, Actions/cache/artifact checks,
+sentinel, cleanup, post-root, and process-survivor requirements. Those contracts
+and their observed outcomes remain historical evidence. Their presence is not
+authorization to execute now, and consumed one-shots cannot be repeated.
