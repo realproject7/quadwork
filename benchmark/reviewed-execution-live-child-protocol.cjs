@@ -196,7 +196,10 @@ async function completeFixedChild(role, runtime) {
     // owned, exact-sentinel final-message file can set this fact, and consume
     // removes that file before root facts are captured below.
     const final_message_valid = codex ? consumeCodexFinalMessage(state.root, state.cleanup_root) : false;
-    try { const lifecycle = JSON.parse(fs.readFileSync(path.join(state.locations.home, '.quadwork', profiles.PROJECT, 'agent-lifecycle-state.json'), 'utf8')); lifecycle_verified = lifecycle?.roles?.[role]?.state === 'verified'; } catch {}
+    // The server observes the exact launched PTY and confirms its durable
+    // generation. A status-only file read could accept a different generation
+    // or lose a real ready observation when Codex exits before this check.
+    try { lifecycle_verified = typeof session.lifecycleVerified === 'function' && await session.lifecycleVerified() === true; } catch {}
     stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${role}`, { suppressLifecycleMsg: true, removeEntry: true });
     shutdown = await runtime.shutdown();
     post = rootFacts(state.root);
