@@ -28,16 +28,20 @@ const fork = (file, args, options) => {
     const profile = profiles.PROFILES.v2_codex_readonly_v1;
     const facts = { root_digest: 'a'.repeat(64), entry_digest: 'b'.repeat(64), entry_count: 1, remote_count: 0, changed_entry_count: 0 };
     const prelaunch = resultHarnessMode === 'prelaunch-refusal' || resultHarnessMode === 'prelaunch-cleanup-failure';
-    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure';
-    const cleanupFailure = resultHarnessMode === 'prelaunch-cleanup-failure' || oneTurnUnsafe;
+    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure'; const claimedCleanupAndExit = resultHarnessMode === 'claimed-cleanup-and-exit'; const reportAbsent = resultHarnessMode === 'report-absent'; const forgedPhase = resultHarnessMode === 'forged-phase'; const forgedDisposition = resultHarnessMode === 'forged-disposition';
+    const cleanupFailure = resultHarnessMode === 'prelaunch-cleanup-failure' || oneTurnUnsafe || claimedCleanupAndExit;
     const postclaimFailure = malformedClaim || claimedNonzeroFailure || unverifiedNonzeroFailure;
-    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', launch_diagnostic: 'none', pre_observer_pty_data_seen: false, lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
-    if (resultHarnessMode === 'duplicate') {
+    const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', launch_diagnostic: 'none', pre_observer_pty_data_seen: false, pre_workload_output_seen: false, workload_write_attempted: !prelaunch, terminal_exit_phase: 'none', worker_report_disposition: 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
+    if (forgedPhase) report.terminal_exit_phase = 'forged';
+    if (forgedDisposition) report.worker_report_disposition = 'claimed_exit_unattested';
+    if (reportAbsent) {
+      queueMicrotask(() => child.emit('exit', 0));
+    } else if (resultHarnessMode === 'duplicate') {
       queueMicrotask(() => { child.emit('exit', 0); setImmediate(() => { child.emit('message', { type: 'reviewed_execution_result', report }); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report: { ...report, output_bytes: 7 } })); }); });
     } else if (prelaunch) {
       queueMicrotask(() => { child.emit('message', { type: 'reviewed_execution_result', report }); child.emit('exit', 0); });
     } else {
-      process.nextTick(() => { child.emit('exit', claimedNonzeroFailure || claimedNonzeroCompleted || unverifiedNonzeroFailure ? 1 : 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
+      process.nextTick(() => { child.emit('exit', claimedNonzeroFailure || claimedNonzeroCompleted || unverifiedNonzeroFailure || claimedCleanupAndExit ? 1 : 0); setImmediate(() => child.emit('message', { type: 'reviewed_execution_result', report })); });
     }
     return true;
   };
@@ -59,6 +63,10 @@ function zeroTurnCompletedHarness() { return resultHarness('zero-turn-completed'
 function claimedNonzeroFailureHarness() { return resultHarness('claimed-nonzero-failure'); }
 function claimedNonzeroCompletedHarness() { return resultHarness('claimed-nonzero-completed'); }
 function unverifiedNonzeroFailureHarness() { return resultHarness('unverified-nonzero-failure'); }
+function claimedCleanupAndExitHarness() { return resultHarness('claimed-cleanup-and-exit'); }
+function reportAbsentHarness() { return resultHarness('report-absent'); }
+function forgedPhaseHarness() { return resultHarness('forged-phase'); }
+function forgedDispositionHarness() { return resultHarness('forged-disposition'); }
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -94,6 +102,16 @@ test('parent rejects claimed completion and unverified failure after a non-zero 
     assert.equal(result.root_cleanup_ok, false);
     assert.equal(result.survivor_free, false);
   }
+});
+test('parent reports only redacted worker-report dispositions for every fallback combination', async () => {
+  const absent = await reportAbsentHarness().run();
+  assert.equal(absent.worker_report_disposition, 'report_absent');
+  const cleanup = await oneTurnUnsafeHarness().run();
+  assert.equal(cleanup.worker_report_disposition, 'claimed_cleanup_unattested');
+  const exit = await claimedNonzeroCompletedHarness().run();
+  assert.equal(exit.worker_report_disposition, 'claimed_exit_unattested');
+  const both = await claimedCleanupAndExitHarness().run();
+  assert.equal(both.worker_report_disposition, 'claimed_cleanup_and_exit_unattested');
 });
 test('parent fails closed on a second valid terminal result and selects neither', async () => {
   const result = await duplicateResultHarness().run();
@@ -139,6 +157,12 @@ test('parent rejects a fake zero-turn prelaunch completion before it can be sele
   assert.equal(result.provider_turns, 1);
   assert.equal(result.launch_claim_state, 'unverified');
   assert.equal(result.failure_stage, 'parent_unverified');
+});
+test('parent rejects forged child phase and parent-owned disposition fields', async () => {
+  for (const harness of [forgedPhaseHarness, forgedDispositionHarness]) {
+    const result = await harness().run();
+    assert.equal(result.result_class, 'worker_result_invalid');
+  }
 });
 test('fixed workers carry source-fixed roles and prepare before loading the server', () => {
   for (const [file, role] of [['reviewed-execution-live-worker-codex.cjs', 'benchmark_codex'], ['reviewed-execution-live-worker-claude.cjs', 'benchmark_claude']]) {
@@ -200,7 +224,15 @@ test('fixed children wait for the parent result receipt before exiting', () => {
 test('production pure evaluator accepts only the exact newline-delimited sentinel and binds the profile workload/cap', () => {
   const success = outcome.observe(['banner\n', `${outcome.SENTINEL}\n`]);
   assert.equal(outcome.WORKLOAD, `${profiles.WORKLOAD}\n`); assert.equal(outcome.OUTPUT_CAP_BYTES, 16 * 1024); assert.equal(success.sentinel, true);
+  assert.equal(outcome.observe([outcome.SENTINEL.slice(0, 8), `${outcome.SENTINEL.slice(8)}\n`]).sentinel, true);
   for (const chunks of [[`${outcome.SENTINEL} extra\n`], [`prefix ${outcome.SENTINEL}\n`], ['no sentinel\n']]) assert.equal(outcome.observe(chunks).sentinel, false);
+});
+test('production observer retains no raw terminal output while checking the fixed sentinel', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-outcome.cjs'), 'utf8');
+  assert.doesNotMatch(source, /let output\s*=/);
+  const observer = outcome.createObserver(); const secretLikeOutput = 'credential=synthetic-terminal-output';
+  observer.push(secretLikeOutput);
+  assert.equal(JSON.stringify(observer.snapshot()).includes(secretLikeOutput), false);
 });
 test('production evaluator makes output cap, timeout, lifecycle, remote rejection, cleanup, root/git/env failures non-success', () => {
   assert.equal(outcome.observe(['x'.repeat(outcome.OUTPUT_CAP_BYTES + 1)]).output_capped, true);
@@ -245,6 +277,30 @@ test('active child retains only redacted synthetic pre-observer PTY evidence acr
     assert.equal(result.sentinel_digest, null, label);
     assert.equal(JSON.stringify(result).includes('synthetic'), false, label);
     assert.equal(JSON.stringify(result).includes(secretLikePreObserverChunk), false, label);
+  }
+});
+test('active child records only bounded workload and terminal phases', async () => {
+  const profile = profiles.PROFILES.v2_codex_readonly_v1;
+  const makeState = () => ({ profile, facts: { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, gate: { receipt_digest: 'c'.repeat(64) }, root: '/fake', locations: { home: '/fake-home' }, pre: { entries: ['base'] }, previous: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN }, started: Date.now() });
+  for (const [exitBeforeWorkload, outputBeforeWorkload, phase, label] of [[true, false, 'before_workload_attempt', 'exit first'], [false, false, 'after_workload_attempt', 'exit after write'], [false, true, 'after_workload_attempt', 'output before write']]) {
+    const active = activeHarness(); active.set(makeState(), true); let data, exit;
+    const secretLikeChunk = 'credential=synthetic-pre-workload';
+    const result = await active.completeFixedChild(profile.role, {
+      buildAgentArgs: async () => {}, buildAgentEnv: () => ({}),
+      launch: async () => ({ ok: true, reviewed_session: {
+        onData: listener => { data = listener; if (outputBeforeWorkload) listener(secretLikeChunk); },
+        onExit: listener => { exit = listener; if (exitBeforeWorkload) listener(); },
+        preObserverPtyDataSeen: () => false,
+        writeFixedWorkload: () => { if (!exitBeforeWorkload) exit(); },
+      } }),
+      stopAgentSession: async () => ({ ok: true, resources: { ptys: 1, sessions: 1 } }), shutdown: async () => ({ ok: true }),
+    });
+    assert.equal(result.workload_write_attempted, true, label);
+    assert.equal(result.pre_workload_output_seen, outputBeforeWorkload, label);
+    assert.equal(result.terminal_exit_phase, phase, label);
+    assert.equal(result.worker_report_disposition, 'none', label);
+    assert.equal(JSON.stringify(result).includes(secretLikeChunk), false, label);
+    assert.equal(typeof data, 'function', label);
   }
 });
 test('reviewed server PTY handling returns before retention, lifecycle, self-heal, or viewer forwarding', () => {
