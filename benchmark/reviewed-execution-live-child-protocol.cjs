@@ -105,12 +105,13 @@ async function completeFixedChild(role, runtime) {
     if (!launched?.ok || !session || typeof session.onData !== 'function' || typeof session.preObserverPtyDataSeen !== 'function' || typeof session.writeFixedWorkload !== 'function') throw new Error('launch');
     session.onData(chunk => observer.push(chunk));
     pre_observer_pty_data_seen = session.preObserverPtyDataSeen() === true;
+    pre_workload_output_seen = pre_observer_pty_data_seen || observer.snapshot().output_bytes > 0;
     if (typeof session.onExit === 'function') session.onExit(() => { terminal_exited = true; terminal_exit_phase = workload_write_attempted ? 'after_workload_attempt' : 'before_workload_attempt'; });
     const fresh = sourceFacts();
     readGateReceipt(state.profile, fresh);
     if (fresh.expected_head !== state.facts.expected_head || fresh.candidate_digest !== state.facts.candidate_digest || observer.snapshot().output_capped) throw new Error('drift');
     rechecked = true;
-    pre_workload_output_seen = pre_observer_pty_data_seen || observer.snapshot().output_bytes > 0;
+    pre_workload_output_seen = pre_workload_output_seen || observer.snapshot().output_bytes > 0;
     workload_write_attempted = true;
     session.writeFixedWorkload();
     const until = Date.now() + MAX_ELAPSED_MS;

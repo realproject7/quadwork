@@ -28,12 +28,16 @@ const fork = (file, args, options) => {
     const profile = profiles.PROFILES.v2_codex_readonly_v1;
     const facts = { root_digest: 'a'.repeat(64), entry_digest: 'b'.repeat(64), entry_count: 1, remote_count: 0, changed_entry_count: 0 };
     const prelaunch = resultHarnessMode === 'prelaunch-refusal' || resultHarnessMode === 'prelaunch-cleanup-failure';
-    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure'; const claimedCleanupAndExit = resultHarnessMode === 'claimed-cleanup-and-exit'; const reportAbsent = resultHarnessMode === 'report-absent'; const forgedPhase = resultHarnessMode === 'forged-phase'; const forgedDisposition = resultHarnessMode === 'forged-disposition';
+    const oneTurnUnsafe = resultHarnessMode === 'one-turn-unsafe'; const malformedClaim = resultHarnessMode === 'malformed-claim'; const invalidClaimStage = resultHarnessMode === 'invalid-claim-stage'; const zeroTurnCompleted = resultHarnessMode === 'zero-turn-completed'; const claimedNonzeroFailure = resultHarnessMode === 'claimed-nonzero-failure'; const claimedNonzeroCompleted = resultHarnessMode === 'claimed-nonzero-completed'; const unverifiedNonzeroFailure = resultHarnessMode === 'unverified-nonzero-failure'; const claimedCleanupAndExit = resultHarnessMode === 'claimed-cleanup-and-exit'; const reportAbsent = resultHarnessMode === 'report-absent'; const forgedPhase = resultHarnessMode === 'forged-phase'; const forgedDisposition = resultHarnessMode === 'forged-disposition'; const forgedAfterWithoutWrite = resultHarnessMode === 'forged-after-without-write'; const forgedPreObserver = resultHarnessMode === 'forged-pre-observer'; const forgedZeroTurnActivity = resultHarnessMode === 'forged-zero-turn-activity'; const forgedCompletedWithoutWrite = resultHarnessMode === 'forged-completed-without-write';
     const cleanupFailure = resultHarnessMode === 'prelaunch-cleanup-failure' || oneTurnUnsafe || claimedCleanupAndExit;
     const postclaimFailure = malformedClaim || claimedNonzeroFailure || unverifiedNonzeroFailure;
     const report = { schema_version: 1, purpose: 'reviewed_v2_product_path_live_attempt', profile_id: profile.id, backend: profile.backend, model: profile.model, expected_head: null, candidate_digest: options.env.QUADWORK_REVIEWED_CANDIDATE_DIGEST, gate_receipt_digest: null, result_class: cleanupFailure ? 'cleanup_failed' : postclaimFailure ? 'attempt_indeterminate' : prelaunch ? 'preflight_blocked' : 'completed', provider_turns: prelaunch || zeroTurnCompleted ? 0 : 1, launch_claim_state: prelaunch || zeroTurnCompleted ? 'none' : malformedClaim || invalidClaimStage || unverifiedNonzeroFailure ? 'unverified' : 'claimed', failure_stage: invalidClaimStage || prelaunch || zeroTurnCompleted ? 'prelaunch' : cleanupFailure || postclaimFailure ? 'postclaim' : 'none', launch_diagnostic: 'none', pre_observer_pty_data_seen: false, pre_workload_output_seen: false, workload_write_attempted: !prelaunch, terminal_exit_phase: 'none', worker_report_disposition: 'none', lifecycle_verified: !prelaunch && !malformedClaim, sentinel_digest: prelaunch || postclaimFailure ? null : 'c'.repeat(64), output_bytes: 0, output_capped: false, elapsed_ms: 0, root_cleanup_ok: !cleanupFailure, survivor_free: true, source_rechecked_before_prompt: !prelaunch, gate_rechecked_before_prompt: !prelaunch, pre_root_facts: facts, post_root_facts: facts, credential_copy_or_store_api_used: false, keychain_immutability_claimed: false, peer_level_network_filter_available: false, release_evidence: false };
     if (forgedPhase) report.terminal_exit_phase = 'forged';
     if (forgedDisposition) report.worker_report_disposition = 'claimed_exit_unattested';
+    if (forgedAfterWithoutWrite) { report.terminal_exit_phase = 'after_workload_attempt'; report.workload_write_attempted = false; }
+    if (forgedPreObserver) report.pre_observer_pty_data_seen = true;
+    if (forgedZeroTurnActivity) { report.provider_turns = 0; report.launch_claim_state = 'none'; report.failure_stage = 'prelaunch'; report.result_class = 'preflight_blocked'; report.workload_write_attempted = true; }
+    if (forgedCompletedWithoutWrite) report.workload_write_attempted = false;
     if (reportAbsent) {
       queueMicrotask(() => child.emit('exit', 0));
     } else if (resultHarnessMode === 'duplicate') {
@@ -67,6 +71,10 @@ function claimedCleanupAndExitHarness() { return resultHarness('claimed-cleanup-
 function reportAbsentHarness() { return resultHarness('report-absent'); }
 function forgedPhaseHarness() { return resultHarness('forged-phase'); }
 function forgedDispositionHarness() { return resultHarness('forged-disposition'); }
+function forgedAfterWithoutWriteHarness() { return resultHarness('forged-after-without-write'); }
+function forgedPreObserverHarness() { return resultHarness('forged-pre-observer'); }
+function forgedZeroTurnActivityHarness() { return resultHarness('forged-zero-turn-activity'); }
+function forgedCompletedWithoutWriteHarness() { return resultHarness('forged-completed-without-write'); }
 
 test('public parent exposes only fixed no-input provider entries', () => {
   assert.deepEqual(Object.keys(runner).sort(), ['runReviewedClaude', 'runReviewedCodex']);
@@ -160,6 +168,12 @@ test('parent rejects a fake zero-turn prelaunch completion before it can be sele
 });
 test('parent rejects forged child phase and parent-owned disposition fields', async () => {
   for (const harness of [forgedPhaseHarness, forgedDispositionHarness]) {
+    const result = await harness().run();
+    assert.equal(result.result_class, 'worker_result_invalid');
+  }
+});
+test('parent rejects logically inconsistent child phase and observation claims', async () => {
+  for (const harness of [forgedAfterWithoutWriteHarness, forgedPreObserverHarness, forgedZeroTurnActivityHarness, forgedCompletedWithoutWriteHarness]) {
     const result = await harness().run();
     assert.equal(result.result_class, 'worker_result_invalid');
   }
