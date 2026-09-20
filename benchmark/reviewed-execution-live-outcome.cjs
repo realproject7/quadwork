@@ -15,10 +15,19 @@ const EARLY_EXIT_SIGNATURES = Object.freeze([
   Object.freeze({ backends: Object.freeze(['codex', 'claude']), diagnostic: 'provider_auth_unavailable', text: 'Not logged in' }),
   Object.freeze({ backends: Object.freeze(['codex', 'claude']), diagnostic: 'sandbox_policy_denied', text: 'sandbox-exec: sandbox_apply: Operation not permitted' }),
   Object.freeze({ backends: Object.freeze(['codex', 'claude']), diagnostic: 'provider_command_unavailable', text: 'command not found' }),
+  Object.freeze({ profile_id: 'v2_codex_readonly_v1', backend: 'codex', executable_digest: '62709f1e3beddf61abdc16fc6e702e7fc90ad2aed26e33e6d319ab4a5a090c7a', diagnostic: 'provider_auth_unavailable', text: 'Failed to load ChatGPT credentials while enforcing workspace restrictions:' }),
+  Object.freeze({ profile_id: 'v2_claude_restricted_v1', backend: 'claude', executable_digest: '73d6a2a55c46907e49bd8bb7608e134333bd71173351ee16ddce7d7db9914b9c', diagnostic: 'provider_auth_unavailable', text: 'Keychain access denied. In CI environments, use {allowUnrestrictedAccess: true} option.' }),
 ]);
 
-function createEarlyExitRecognizer(backend) {
-  const candidates = EARLY_EXIT_SIGNATURES.filter(item => item.backends.includes(backend)).map(item => Object.freeze({ item, index: 0 }));
+function signatureApplies(item, source) {
+  const backend = typeof source === 'string' ? source : source?.backend;
+  if (!item.profile_id) return item.backends.includes(backend);
+  const profile = profiles.PROFILES[item.profile_id];
+  return source === profile && profile.backend === item.backend && profile.executable_digest === item.executable_digest;
+}
+
+function createEarlyExitRecognizer(source) {
+  const candidates = EARLY_EXIT_SIGNATURES.filter(item => signatureApplies(item, source)).map(item => Object.freeze({ item, index: 0 }));
   let active = candidates, matched = null, invalid = candidates.length === 0, trailing_cr = false, line_ended = false, finished = false;
   return Object.freeze({
     push(character) {
@@ -48,7 +57,7 @@ function createEarlyExitRecognizer(backend) {
       if (character === '\n' && !trailing_cr) { line_ended = true; return; }
       invalid = true;
     },
-    snapshot() { return !invalid && matched && !trailing_cr ? matched : 'unclassified_early_exit'; },
+    snapshot() { return !invalid && matched && line_ended ? matched : 'unclassified_early_exit'; },
   });
 }
 
@@ -57,9 +66,9 @@ function earlyExitDiagnostic(snapshot) {
   return snapshot.early_exit_match;
 }
 
-function createObserver(backend) {
+function createObserver(source) {
   let output_bytes = 0, output_capped = false, sentinel = false, at_line_start = true, match_index = 0, sentinel_cr = false;
-  const early = createEarlyExitRecognizer(backend);
+  const early = createEarlyExitRecognizer(source);
   const resetLine = () => { at_line_start = true; match_index = 0; sentinel_cr = false; };
   const observeCharacter = character => {
     if (character === '\n' || character === '\r') early.endLine(character); else early.push(character);
