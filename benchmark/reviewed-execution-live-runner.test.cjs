@@ -11,7 +11,7 @@ const test = require('node:test');
 const runner = require('./reviewed-execution-live-runner.cjs');
 const outcome = require('./reviewed-execution-live-outcome.cjs');
 function reportHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', 'module.exports = Object.freeze({ report, launchClaimState });'); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
-function finalMessageHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = 'safeRoot = root => root; module.exports = Object.freeze({ createCodexFinalMessage, consumeCodexFinalMessage, cleanupCodexFinalMessage });'; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
+function finalMessageHarness() { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = 'module.exports = Object.freeze({ cleanupRootIdentity, createCodexFinalMessage, consumeCodexFinalMessage, cleanupCodexFinalMessage });'; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function activeHarness(claimState = 'claimed') { const filename = path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'); const injected = `let __removed = 0, __match = true; sourceFacts = () => fixed.facts; readGateReceipt = () => fixed.gate; launchClaimState = () => ${JSON.stringify(claimState)}; rootFacts = () => ({ entries: ["base"], root_digest: "a".repeat(64), entry_digest: "a".repeat(64), entry_count: 1 }); rootMatches = () => __match; removeOwnedRoot = () => { __removed += 1; return true; }; module.exports = Object.freeze({ set(state, match) { fixed = state; parentAdmitted = true; __match = match; }, completeFixedChild, removed: () => __removed });`; const source = fs.readFileSync(filename, 'utf8').replace('module.exports = Object.freeze({ prepareFixedChild, completeFixedChild, failedChildReport });', injected); const mod = new Module(filename, module); mod.filename = filename; mod.paths = Module._nodeModulePaths(path.dirname(filename)); mod._compile(source, filename); return mod.exports; }
 function resultHarness(mode) {
   const filename = path.join(__dirname, 'reviewed-execution-live-runner.cjs');
@@ -266,27 +266,32 @@ test('non-launching production report harness redacts prompt, output, path and t
   for (const hidden of [profiles.WORKLOAD, 'token=private', '/private/root', 'private']) assert.equal(text.includes(hidden), false);
 });
 test('Codex transient final-message channel accepts only an owned exact sentinel and always removes the file', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-final-message-')); fs.chmodSync(root, 0o700);
-  const final = profiles.codexFinalMessagePath(root); const outside = path.join(root, 'outside'); const channel = finalMessageHarness();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qw-reviewed-final-message-')); fs.chmodSync(root, 0o700); const marker = path.join(root, '.quadwork-v2-product-path-root-v1'); fs.writeFileSync(marker, 'quadwork-v2-product-path-v1\n', { mode: 0o600 }); fs.chmodSync(marker, 0o600);
+  const final = profiles.codexFinalMessagePath(root); const outside = path.join(root, 'outside'); const channel = finalMessageHarness(); const cleanupRoot = channel.cleanupRootIdentity(root);
   try {
-    channel.createCodexFinalMessage(root); assert.equal(fs.lstatSync(final).isFile(), true); assert.equal(fs.statSync(final).mode & 0o777, 0o600);
+    channel.createCodexFinalMessage(root, cleanupRoot); assert.equal(fs.lstatSync(final).isFile(), true); assert.equal(fs.statSync(final).mode & 0o777, 0o600);
     fs.writeFileSync(final, outcome.SENTINEL, { mode: 0o600 }); fs.chmodSync(final, 0o600);
-    assert.equal(channel.consumeCodexFinalMessage(root), true); assert.equal(fs.existsSync(final), false);
-    channel.createCodexFinalMessage(root); fs.writeFileSync(final, 'private provider output', { mode: 0o600 }); fs.chmodSync(final, 0o600);
-    const rejected = channel.consumeCodexFinalMessage(root); assert.equal(rejected, false); assert.equal(fs.existsSync(final), false); assert.equal(JSON.stringify({ rejected }).includes('private provider output'), false);
-    channel.createCodexFinalMessage(root); fs.writeFileSync(final, outcome.SENTINEL, { mode: 0o600 }); fs.chmodSync(final, 0o644);
-    assert.equal(channel.consumeCodexFinalMessage(root), false); assert.equal(fs.existsSync(final), false);
+    assert.equal(channel.consumeCodexFinalMessage(root, cleanupRoot), true); assert.equal(fs.existsSync(final), false);
+    channel.createCodexFinalMessage(root, cleanupRoot); fs.writeFileSync(final, 'private provider output', { mode: 0o600 }); fs.chmodSync(final, 0o600);
+    const rejected = channel.consumeCodexFinalMessage(root, cleanupRoot); assert.equal(rejected, false); assert.equal(fs.existsSync(final), false); assert.equal(JSON.stringify({ rejected }).includes('private provider output'), false);
+    channel.createCodexFinalMessage(root, cleanupRoot); fs.writeFileSync(final, outcome.SENTINEL, { mode: 0o600 }); fs.chmodSync(final, 0o644);
+    assert.equal(channel.consumeCodexFinalMessage(root, cleanupRoot), false); assert.equal(fs.existsSync(final), false);
     fs.writeFileSync(outside, outcome.SENTINEL, { mode: 0o600 }); fs.symlinkSync(outside, final);
-    assert.equal(channel.consumeCodexFinalMessage(root), false); assert.equal(fs.existsSync(final), false); assert.equal(fs.existsSync(outside), true);
-    channel.createCodexFinalMessage(root); channel.cleanupCodexFinalMessage(root); assert.equal(fs.existsSync(final), false);
+    assert.equal(channel.consumeCodexFinalMessage(root, cleanupRoot), false); assert.equal(fs.existsSync(final), false); assert.equal(fs.existsSync(outside), true);
+    channel.createCodexFinalMessage(root, cleanupRoot); channel.cleanupCodexFinalMessage(cleanupRoot); assert.equal(fs.existsSync(final), false);
+    // A provider can remove the mutable marker, but cannot replace the
+    // captured root identity. The fixed final basename is still unlinked.
+    fs.unlinkSync(marker); fs.writeFileSync(final, 'raw final content', { mode: 0o600 }); fs.chmodSync(final, 0o600);
+    assert.equal(channel.cleanupCodexFinalMessage(cleanupRoot), true); assert.equal(fs.existsSync(final), false);
+    fs.symlinkSync(outside, final); assert.equal(channel.cleanupCodexFinalMessage(cleanupRoot), true); assert.equal(fs.existsSync(final), false); assert.equal(fs.existsSync(outside), true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 test('Codex submits its fixed workload at launch and never by a later PTY write', () => {
   const source = fs.readFileSync(path.join(__dirname, 'reviewed-execution-live-child-protocol.cjs'), 'utf8');
   assert.match(source, /if \(!codex\) \{ workload_write_attempted = true; session\.writeFixedWorkload\(\); \}/);
   assert.match(source, /const completion_sentinel = codex \? final_message_valid : observed\.sentinel/);
-  assert.match(source, /if \(codex\) createCodexFinalMessage\(state\.root\)/);
-  assert.match(source, /if \(codex\) cleanupCodexFinalMessage\(state\.root\)/);
+  assert.match(source, /if \(codex\) createCodexFinalMessage\(state\.root, state\.cleanup_root\)/);
+  assert.match(source, /if \(codex\) cleanupCodexFinalMessage\(state\.cleanup_root\)/);
 });
 test('active protocol harness always attempts controlled removal and preserves cleanup_failed in normal/catch paths', async () => {
   const profile = profiles.PROFILES.v2_claude_restricted_v1; const makeState = () => ({ profile, facts: { expected_head: 'a'.repeat(40), candidate_digest: 'b'.repeat(64) }, gate: { receipt_digest: 'c'.repeat(64) }, root: '/fake', locations: { home: '/fake-home' }, pre: { entries: ['base'] }, previous: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN }, started: Date.now() });

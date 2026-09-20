@@ -66,14 +66,34 @@ function rootMatches(pre, post) {
   const after = new Set(post.entries); if (!pre.entries.every(entry => after.has(entry))) return false;
   return post.entries.every(entry => pre.entries.includes(entry) || /^home\/\.quadwork\/benchmark-product-path:d:700:-$/.test(entry) || /^home\/\.quadwork\/benchmark-product-path\/agent-lifecycle-state\.json:f:600:[a-f0-9]{64}$/.test(entry));
 }
-function cleanupCodexFinalMessage(root) {
-  try { fs.unlinkSync(profiles.codexFinalMessagePath(safeRoot(root))); } catch {}
+function cleanupRootIdentity(root) {
+  const checked = safeRoot(root), stat = fs.lstatSync(checked);
+  return Object.freeze({ root: checked, device: stat.dev, inode: stat.ino });
+}
+function checkedCleanupRoot(identity) {
+  if (!identity || typeof identity.root !== 'string' || !Number.isSafeInteger(identity.device) || !Number.isSafeInteger(identity.inode)) throw new Error('reviewed_execution_cleanup_root_unsafe');
+  const stat = fs.lstatSync(identity.root);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || mode(stat) !== 0o700 || !sameUser(stat) || stat.dev !== identity.device || stat.ino !== identity.inode || fs.realpathSync(identity.root) !== identity.root) throw new Error('reviewed_execution_cleanup_root_unsafe');
+  return identity.root;
+}
+function cleanupCodexFinalMessage(identity) {
+  // Cleanup deliberately does not re-check the mutable root marker.  The
+  // captured directory identity is sufficient to unlink only the fixed
+  // basename. lstat/unlink never follows a final-message symlink.
+  let filename;
+  try {
+    filename = profiles.codexFinalMessagePath(checkedCleanupRoot(identity));
+    const stat = fs.lstatSync(filename);
+    if ((!stat.isFile() && !stat.isSymbolicLink()) || !sameUser(stat)) return false;
+    fs.unlinkSync(filename);
+    return !fs.existsSync(filename);
+  } catch (error) { return error?.code === 'ENOENT'; }
 }
 // Codex's final-message file is a transient completion channel.  It is
 // created only after pre-root facts have been captured, never follows a
 // symlink, and is removed before every post-root observation.  Its contents
 // are reduced immediately to a boolean/digest fact and never leave this child.
-function createCodexFinalMessage(root) {
+function createCodexFinalMessage(root, cleanup_root) {
   let fd;
   try {
     const filename = profiles.codexFinalMessagePath(safeRoot(root));
@@ -81,11 +101,11 @@ function createCodexFinalMessage(root) {
     fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; fs.chmodSync(filename, 0o600);
   } catch {
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
-    cleanupCodexFinalMessage(root);
+    cleanupCodexFinalMessage(cleanup_root);
     throw new Error('reviewed_execution_final_message_create');
   }
 }
-function consumeCodexFinalMessage(root) {
+function consumeCodexFinalMessage(root, cleanup_root) {
   const expected = Buffer.from(outcome.SENTINEL, 'utf8'); let fd;
   try {
     const filename = profiles.codexFinalMessagePath(safeRoot(root));
@@ -98,7 +118,7 @@ function consumeCodexFinalMessage(root) {
   } catch { return false; }
   finally {
     try { if (fd !== undefined) fs.closeSync(fd); } catch {}
-    cleanupCodexFinalMessage(root);
+    cleanupCodexFinalMessage(cleanup_root);
   }
 }
 function launchClaimState(state) { const key = state?.gate?.authorization_key; if (!/^[a-f0-9]{64}$/.test(key || '')) return 'unverified'; let filename; try { filename = path.join(checkedDirectory(state.gate.ledger_directory, 'reviewed_execution_gate_ledger_unsafe'), `${key}.launch`); } catch { return 'unverified'; } let stat; try { stat = fs.lstatSync(filename); } catch (error) { return error?.code === 'ENOENT' ? 'none' : 'unverified'; } try { const body = `${state.facts.candidate_digest}\n${state.profile.id}\n${key}\n`; return stat.isFile() && !stat.isSymbolicLink() && mode(stat) === 0o600 && sameUser(stat) && fs.readFileSync(filename, 'utf8') === body ? 'claimed' : 'unverified'; } catch { return 'unverified'; } }
@@ -115,7 +135,7 @@ async function prepareFixedChild(profile) {
     const project = { id: profiles.PROJECT, name: 'Reviewed V2 product path', idle: true, chat_mode: 'file', repositories: [{ key: 'benchmark', repo: 'local/benchmark', working_dir: repository, primary: true }], agents: { [profile.role]: agent } };
     prepared = { root, binding, preflight, config: { port: 18991, installation_id: 'benchmark_product_path_0001', session_token: crypto.randomBytes(32).toString('hex'), temp_cleanup: { enabled: false }, projects: [project] } };
     if (preflight?.result_class !== 'preflight_ready') return report(profile, facts, { gate_receipt_digest: gate.receipt_digest, launch_claim_state: 'none', failure_stage: 'prelaunch', elapsed_ms: Date.now() - started, root_cleanup_ok: removeOwnedRoot(root), survivor_free: true });
-    const locations = writeConfig(prepared); const pre = rootFacts(root); const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN, QUADWORK_REVIEWED_GATE_HOME: process.env.QUADWORK_REVIEWED_GATE_HOME }; process.env.HOME = locations.home; process.env.USERPROFILE = locations.home; process.env.QUADWORK_SKIP_LISTEN = '1'; process.env.QUADWORK_REVIEWED_GATE_HOME = REVIEWED_GATE_HOME; fixed = Object.freeze({ profile, facts, gate, root, locations, pre, previous, started }); return null;
+    const locations = writeConfig(prepared); const pre = rootFacts(root); const cleanup_root = cleanupRootIdentity(root); const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, QUADWORK_SKIP_LISTEN: process.env.QUADWORK_SKIP_LISTEN, QUADWORK_REVIEWED_GATE_HOME: process.env.QUADWORK_REVIEWED_GATE_HOME }; process.env.HOME = locations.home; process.env.USERPROFILE = locations.home; process.env.QUADWORK_SKIP_LISTEN = '1'; process.env.QUADWORK_REVIEWED_GATE_HOME = REVIEWED_GATE_HOME; fixed = Object.freeze({ profile, facts, gate, root, cleanup_root, locations, pre, previous, started }); return null;
   } catch { const root_cleanup_ok = prepared?.root ? removeOwnedRoot(prepared.root) : false; return report(profile, facts, { gate_receipt_digest: gate?.receipt_digest || null, launch_claim_state: 'none', failure_stage: 'prelaunch', elapsed_ms: Date.now() - started, root_cleanup_ok, survivor_free: true }); }
 }
 function restore() { if (!fixed) return false; for (const [key, value] of Object.entries(fixed.previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } return process.env.HOME === fixed.previous.HOME && process.env.USERPROFILE === fixed.previous.USERPROFILE && process.env.QUADWORK_SKIP_LISTEN === fixed.previous.QUADWORK_SKIP_LISTEN && process.env.QUADWORK_REVIEWED_GATE_HOME === fixed.previous.QUADWORK_REVIEWED_GATE_HOME; }
@@ -135,7 +155,7 @@ async function completeFixedChild(role, runtime) {
     // This must be after the pre-root snapshot from prepareFixedChild().  The
     // fixed argv already names this path; creation cannot be influenced by a
     // terminal write or by provider output.
-    if (codex) createCodexFinalMessage(state.root);
+    if (codex) createCodexFinalMessage(state.root, state.cleanup_root);
     const launched = await runtime.launch();
     launch_claim_state = launchClaimState(state);
     provider_turns = launch_claim_state === 'none' ? 0 : 1;
@@ -162,7 +182,7 @@ async function completeFixedChild(role, runtime) {
     // Terminal bytes are never a Codex completion signal.  Only the regular,
     // owned, exact-sentinel final-message file can set this fact, and consume
     // removes that file before root facts are captured below.
-    const final_message_valid = codex ? consumeCodexFinalMessage(state.root) : false;
+    const final_message_valid = codex ? consumeCodexFinalMessage(state.root, state.cleanup_root) : false;
     try { const lifecycle = JSON.parse(fs.readFileSync(path.join(state.locations.home, '.quadwork', profiles.PROJECT, 'agent-lifecycle-state.json'), 'utf8')); lifecycle_verified = lifecycle?.roles?.[role]?.state === 'verified'; } catch {}
     stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${role}`, { suppressLifecycleMsg: true, removeEntry: true });
     shutdown = await runtime.shutdown();
@@ -181,7 +201,7 @@ async function completeFixedChild(role, runtime) {
     provider_turns = launch_claim_state === 'none' ? 0 : 1;
     try { if (provider_turns) stopped = await runtime.stopAgentSession(`${profiles.PROJECT}/${role}`, { suppressLifecycleMsg: true, removeEntry: true }); } catch {}
     try { if (provider_turns) shutdown = await runtime.shutdown(); } catch {}
-    if (codex) cleanupCodexFinalMessage(state.root);
+    if (codex) cleanupCodexFinalMessage(state.cleanup_root);
     try { post = rootFacts(state.root); } catch {}
     const observed = observer.snapshot();
     const survivor_free = provider_turns === 0 || survivorFree(stopped);
