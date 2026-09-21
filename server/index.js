@@ -807,9 +807,12 @@ const runtimeTestHooks = (() => {
 // per-Head launch token, not a route/config capability.
 const headTicketReviewAdmission = createHeadTicketReviewAdmission({
   config_dir: path.dirname(CONFIG_PATH),
+  fs,
   read_config: readConfig,
   read_live_batch_context: routes.readLiveBatchContext,
+  all_repositories: allRepositories,
   write_secure_file: writeSecureFile,
+  ensure_secure_dir: ensureSecureDir,
   random_id: () => crypto.randomUUID(),
 });
 const headControlRuntime = createHeadControlRuntime({

@@ -38,6 +38,7 @@ const {
 const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence, deriveCiPolicyIdentity } = require("./ci-evidence-policy");
 const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
 const { injectModeForCommand } = require("../src/lib/injectMode.js");
+const { admissionMatchesContext } = require("./head-ticket-review-admission");
 
 const router = express.Router();
 
@@ -1315,6 +1316,14 @@ function resolveRegisteredIssueContract(projectId, repoKey, issue) {
   if (!context.activated && context.repositories.length !== 1) return null;
   const binding = context.repositories.find((entry) => entry.key === repoKey);
   if (!binding) return null;
+  if (context.batchType === "ticket-review" && !admissionMatchesContext({
+    config_dir: CONFIG_DIR,
+    fs,
+    context,
+    project_id: projectId,
+    repository_key: repoKey,
+    issue,
+  })) return null;
   const registered = context.parsed.workItems.some((item) => {
     const ref = item.ref || item;
     return ref.repoKey === repoKey && ref.number === issue && ref.kind === "issue" &&

@@ -18,13 +18,19 @@ let config = { installation_id: INSTALLATION_ID, projects: [{ id: "p", repositor
 let queue = "";
 let writtenSnapshot = null;
 let githubFileText = null;
+let ticketReviewAdmission = null;
 let ghCalls = 0;
 
 const realRead = fs.readFileSync;
+const realLstat = fs.lstatSync;
 const realExec = cp.execFile;
 fs.readFileSync = function readStub(file, ...rest) {
   if (file === CONFIG_PATH) return JSON.stringify(config);
   if (typeof file === "string" && file.endsWith("OVERNIGHT-QUEUE.md")) return queue;
+  if (typeof file === "string" && file.endsWith("ticket-review-admission.json")) {
+    if (ticketReviewAdmission !== null) return ticketReviewAdmission;
+    const error = new Error("missing admission"); error.code = "ENOENT"; throw error;
+  }
   if (typeof file === "string" && file.endsWith("batch-progress-cache.json")) {
     if (writtenSnapshot) return JSON.stringify(writtenSnapshot);
     const error = new Error("missing snapshot"); error.code = "ENOENT"; throw error;
@@ -34,6 +40,12 @@ fs.readFileSync = function readStub(file, ...rest) {
     const error = new Error("missing board"); error.code = "ENOENT"; throw error;
   }
   return realRead.call(this, file, ...rest);
+};
+fs.lstatSync = function lstatStub(file, ...rest) {
+  if (typeof file === "string" && file.endsWith("ticket-review-admission.json") && ticketReviewAdmission !== null) {
+    return { isFile: () => true, mode: 0o600, uid: process.getuid(), size: Buffer.byteLength(ticketReviewAdmission), dev: 7, ino: 11 };
+  }
+  return realLstat.call(this, file, ...rest);
 };
 fs.writeFileSync = function writeStub(file, data) {
   if (typeof file === "string" && file.endsWith("batch-progress-cache.json")) writtenSnapshot = JSON.parse(data);
@@ -101,6 +113,16 @@ async function run() {
   queue = active(["- Acme/Web#42 pull request"], { type: "pr-review" });
   assert.equal(resolveRegisteredIssueContract("p", "web", 42), null,
     "a PR review row cannot be used as an issue-body digest oracle");
+  queue = active(["- Acme/Web#42 ticket"], { type: "ticket-review" });
+  assert.equal(resolveRegisteredIssueContract("p", "web", 42), null,
+    "a ticket-review queue row without server-owned admission provenance cannot mint an issue revision read");
+  ticketReviewAdmission = JSON.stringify({ version: 1, installation_id: INSTALLATION_ID, project_id: "p", repository_key: "web",
+    repository: "acme/web", issue: 42, batch: 12, attempt: "attempt_a" });
+  assert.equal(resolveRegisteredIssueContract("p", "web", 42)?.repo, "Acme/Web",
+    "the exact server-owned ticket-review admission enables only its assigned issue revision read");
+  assert.equal(resolveRegisteredIssueContract("p", "api", 42), null,
+    "a server-owned ticket-review admission cannot authorize the same issue number in another repository");
+  ticketReviewAdmission = null;
   queue = active(["- Acme/Web#42 first", "- Acme/API#42 second"]);
 
   // Multi-repo bare, unknown, malformed, and duplicate refs fail the whole parse.
@@ -614,6 +636,7 @@ async function run() {
 
 run().finally(() => {
   fs.readFileSync = realRead;
+  fs.lstatSync = realLstat;
   cp.execFile = realExec;
 }).catch((error) => {
   console.error(error);

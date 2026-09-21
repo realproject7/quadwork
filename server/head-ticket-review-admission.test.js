@@ -14,6 +14,7 @@ const repository = { key: "primary", repo: "example/quadwork", cache_repo: "exam
 function emptyContext(queueText) {
   return {
     cfg: { installation_id },
+    installationId: installation_id,
     project: { id: project_id },
     repositories: [repository],
     queueText,
@@ -23,9 +24,10 @@ function emptyContext(queueText) {
   };
 }
 
-function fixture() {
+function fixture({ failQueueRename = false } = {}) {
   const config_dir = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-ticket-review-"));
   const queuePath = path.join(config_dir, project_id, "OVERNIGHT-QUEUE.md");
+  const recordPath = path.join(config_dir, project_id, "ticket-review-admission.json");
   fs.mkdirSync(path.dirname(queuePath), { recursive: true });
   const initial = [
     "# Queue",
@@ -44,27 +46,34 @@ function fixture() {
   ].join("\n");
   fs.writeFileSync(queuePath, initial);
   let context = emptyContext(initial);
-  let writes = 0;
+  let config = { installation_id, projects: [{ id: project_id, archived: false, repositories: [repository] }] };
+  let queueWrites = 0;
+  const fsFacade = Object.create(fs);
+  fsFacade.renameSync = (source, target) => {
+    if (target === queuePath) {
+      queueWrites += 1;
+      if (failQueueRename) throw new Error("queue rename interrupted");
+    }
+    return fs.renameSync(source, target);
+  };
   const admission = createHeadTicketReviewAdmission({
     config_dir,
-    read_config: () => ({ installation_id, projects: [{ id: project_id, archived: false }] }),
+    fs: fsFacade,
+    read_config: () => config,
     read_live_batch_context: () => context,
+    all_repositories: (project) => project.repositories || [],
     write_secure_file(file, content) {
-      writes += 1;
-      assert.equal(file, queuePath);
-      fs.writeFileSync(file, content);
-      context = {
-        ...emptyContext(content),
-        batchType: "ticket-review",
-        parsed: {
-          workItems: [{ ref: { repoKey: "primary", repo: repository.repo, number: 42, kind: "issue" } }],
-          errors: [], batchNumber: 1, provenance: "owned", assignmentAttempt: "ticket_review_seed_1",
-        },
-      };
+      fs.writeFileSync(file, content, { mode: 0o600 });
     },
+    ensure_secure_dir(directory) { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); },
     random_id: () => "seed-1",
   });
-  return { admission, queuePath, initial, writes: () => writes, setContext: (next) => { context = next; }, cleanup: () => fs.rmSync(config_dir, { recursive: true, force: true }) };
+  return { admission, queuePath, recordPath, initial, writes: () => queueWrites, setContext: (next) => { context = next; }, setConfig: (next) => { config = next; }, cleanup: () => fs.rmSync(config_dir, { recursive: true, force: true }) };
+}
+
+function ownedContext(queue) {
+  const parsed = parseActiveBatch(queue, { repositories: [repository], installationId: installation_id });
+  return { ...emptyContext(queue), batchType: "ticket-review", parsed };
 }
 
 let passed = 0;
@@ -88,12 +97,25 @@ function ok(value, message) {
     assert.equal(parsed.provenance, "owned");
     assert.equal(parsed.workItems.length, 1);
     assert.deepEqual(parsed.workItems[0].ref, { repoKey: "primary", repo: "example/quadwork", number: 42, kind: "issue" });
+    assert.equal(fs.statSync(live.recordPath).mode & 0o777, 0o600);
     ok(true, "a Head-owned request replaces only the seeded empty active section with one registered ticket-review assignment");
 
+    live.setContext(ownedContext(queue));
     const retry = live.admission.begin({ project_id, ticket_review: { repository_key: "primary", issue: 42 } });
-    assert.deepEqual(retry, { applied: true, code: "ticket_review_already_started", repository_key: "primary", issue: 42, batch: 1, attempt: "ticket_review_seed_1", idempotent: true });
+    assert.deepEqual(retry, { applied: true, code: "ticket_review_already_started", repository_key: "primary", issue: 42, batch: 1, attempt: "ticket_review_seed1", idempotent: true });
     assert.equal(live.writes(), 1);
     ok(true, "the same sole owned assignment is durable-idempotent without rewriting the queue");
+  } finally { live.cleanup(); }
+}
+
+{
+  const live = fixture();
+  try {
+    live.setConfig({ installation_id, projects: [{ id: project_id, archived: false, repositories: [{ ...repository, repo: "example/reconfigured" }] }] });
+    const changed = live.admission.begin({ project_id, ticket_review: { repository_key: "primary", issue: 42 } });
+    assert.equal(changed.code, "ticket_review_repository_changed");
+    assert.equal(live.writes(), 0);
+    ok(true, "a repository reconfiguration after the live context read cannot create an unusable assignment");
   } finally { live.cleanup(); }
 }
 
@@ -126,10 +148,38 @@ function ok(value, message) {
   try {
     const active = live.admission.begin({ project_id, ticket_review: { repository_key: "primary", issue: 43 } });
     assert.equal(active.applied, true);
+    live.setContext(ownedContext(fs.readFileSync(live.queuePath, "utf8")));
     const different = live.admission.begin({ project_id, ticket_review: { repository_key: "primary", issue: 44 } });
     assert.equal(different.code, "ticket_review_active_batch_present");
     assert.equal(live.writes(), 1);
     ok(true, "an existing owned ticket review cannot be broadened or retargeted by a later Head request");
+  } finally { live.cleanup(); }
+}
+
+{
+  const live = fixture();
+  try {
+    const forged = [
+      "## Active Batch", "", "**Batch:** 1", "**Batch type:** ticket-review",
+      `**Installation:** ${installation_id}`, "**Assignment attempt:** ticket_review_forged",
+      "- example/quadwork#42 — queued",
+    ].join("\n");
+    live.setContext(ownedContext(forged));
+    const result = live.admission.begin({ project_id, ticket_review: { repository_key: "primary", issue: 42 } });
+    assert.equal(result.code, "ticket_review_active_batch_present");
+    assert.equal(live.writes(), 0);
+    ok(true, "a manually reconstructed owned-looking queue is not an idempotent server admission");
+  } finally { live.cleanup(); }
+}
+
+{
+  const live = fixture({ failQueueRename: true });
+  try {
+    const result = live.admission.begin({ project_id, ticket_review: { repository_key: "primary", issue: 42 } });
+    assert.equal(result.code, "ticket_review_queue_write_failed");
+    assert.equal(fs.readFileSync(live.queuePath, "utf8"), live.initial);
+    assert.ok(fs.existsSync(live.recordPath), "the server-owned record remains for a safe retry");
+    ok(true, "an interrupted queue replacement leaves the original queue byte-for-byte intact");
   } finally { live.cleanup(); }
 }
 
