@@ -131,7 +131,7 @@ async function run() {
       "form_delivery", "publish_delivery", "inspect_delivery", "complete_delivery",
       "get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch",
       "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop",
-      "get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit",
+      "get_project_status", "review_handoff", "project_monitor", "recover_worker", "begin_ticket_review", "recent_head_control_audit",
     ]);
     for (const tool of tools) {
       assert.equal(tool.inputSchema.additionalProperties, false);
@@ -139,7 +139,7 @@ async function run() {
       assert(!fields.includes("project") && !fields.includes("project_id") && !fields.includes("actor") &&
         !fields.includes("generation") && !fields.includes("action"));
     }
-    ok(true, "tools/list has exactly the seventeen static Head-control operations and no caller binding or action selector");
+    ok(true, "tools/list has exactly the eighteen static Head-control operations and no caller binding or action selector");
 
     const statusArgs = { idempotency_key: "idem_status_001", correlation_id: "corr_status_001" };
     const status = await shim.send(call(3, "get_pipeline_status", statusArgs));
@@ -156,6 +156,16 @@ async function run() {
     });
     ok(true, "a static tool sends token authentication and the fixed Head binding envelope on the one endpoint");
 
+    const ticketArgs = { idempotency_key: "idem_ticket_001", correlation_id: "corr_ticket_001", ticket_review: { repository_key: "primary", issue: 42 } };
+    const ticket = await shim.send(call(4, "begin_ticket_review", ticketArgs));
+    assert.equal(ticket.error, undefined);
+    assert.deepEqual(calls.at(-1).body.request, { tool: "begin_ticket_review", arguments: ticketArgs });
+    const callsBeforeInvalidTicket = calls.length;
+    const invalidTicket = await shim.send(call(5, "begin_ticket_review", { ...ticketArgs, ticket_review: { repository_key: "primary", issue: 0 } }));
+    assert.equal(invalidTicket.error?.code, -32602);
+    assert.equal(calls.length, callsBeforeInvalidTicket);
+    ok(true, "ticket admission exposes only a repository key and positive issue number before the fixed HTTP boundary");
+
     for (const [label, argumentsValue] of [
       ["project", { ...statusArgs, project: "other" }],
       ["actor", { ...statusArgs, actor: "dev" }],
@@ -164,15 +174,15 @@ async function run() {
     ]) {
       const rejected = await shim.send(call(10, "get_pipeline_status", argumentsValue));
       assert.equal(rejected.error?.code, -32602);
-      assert.equal(calls.length, 1);
+      assert.equal(calls.length, 2);
       ok(true, `forged ${label} selector is rejected before the HTTP boundary`);
     }
     const hidden = await shim.send(call(20, "publish_batch", {}));
     assert.equal(hidden.error?.code, -32601);
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2);
     const malformedParams = await shim.send({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "get_pipeline_status", arguments: statusArgs, extra: true } });
     assert.equal(malformedParams.error?.code, -32602);
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2);
     ok(true, "tools/call still rejects unknown params fields after the handshake was loosened");
     const unknownMethod = await shim.send({ jsonrpc: "2.0", id: 22, method: "control/anything", params: {} });
     assert.equal(unknownMethod.error?.code, -32601);
@@ -183,7 +193,7 @@ async function run() {
       cut: { tasks: [{ exact_task: "task-one" }], action: "put_batch_manifest" },
     }));
     assert.equal(nestedUnknown.error?.code, -32602);
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 2);
     ok(true, "unknown tools and fields cannot become arbitrary operations");
 
     const putArgs = {
@@ -225,14 +235,14 @@ async function run() {
     assert.equal(abandon.error, undefined);
     const audit = await shim.send(call(27, "recent_head_control_audit", {}));
     assert.deepEqual(JSON.parse(audit.result.content[0].text), []);
-    assert.deepEqual(calls.slice(1).map((entry) => entry.body.request.tool), [
+    assert.deepEqual(calls.slice(2).map((entry) => entry.body.request.tool), [
       "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "read_propagation_stop", "queue_local_correction", "retire_batch", "abandon_batch_manifest", "recent_head_control_audit",
     ]);
-    assert.deepEqual(calls[4].body.request.arguments, { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001", work_task_ref: taskRef });
-    assert.deepEqual(calls[5].body.request.arguments.correction, { work_task_ref: taskRef, review_round_ref: { round: 1 }, candidate_digest: "e".repeat(64) });
-    assert.deepEqual(calls[6].body.request.arguments, { expected_revision: 4, idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001" });
-    assert.deepEqual(calls[7].body.request.arguments, { expected_revision: 5, idempotency_key: "idem_abandon_001", correlation_id: "corr_abandon_001" });
-    assert.ok(calls.slice(4, 8).every((entry) => JSON.stringify(entry.body.binding) === JSON.stringify({ project_id: PROJECT, actor: "head", generation: GENERATION })));
+    assert.deepEqual(calls[5].body.request.arguments, { idempotency_key: "idem_stop_001", correlation_id: "corr_stop_001", work_task_ref: taskRef });
+    assert.deepEqual(calls[6].body.request.arguments.correction, { work_task_ref: taskRef, review_round_ref: { round: 1 }, candidate_digest: "e".repeat(64) });
+    assert.deepEqual(calls[7].body.request.arguments, { expected_revision: 4, idempotency_key: "idem_retire_001", correlation_id: "corr_retire_001" });
+    assert.deepEqual(calls[8].body.request.arguments, { expected_revision: 5, idempotency_key: "idem_abandon_001", correlation_id: "corr_abandon_001" });
+    assert.ok(calls.slice(5, 9).every((entry) => JSON.stringify(entry.body.binding) === JSON.stringify({ project_id: PROJECT, actor: "head", generation: GENERATION })));
     for (const [label, name, argumentsValue] of [
       ["retire with a payload", "retire_batch", { expected_revision: 4, idempotency_key: "idem_retire_bad", correlation_id: "corr_retire_bad", manifest: {} }],
       ["abandon with a caller digest", "abandon_batch_manifest", { expected_revision: 5, idempotency_key: "idem_abandon_bad", correlation_id: "corr_abandon_bad", manifest_digest: "e".repeat(64) }],
@@ -242,7 +252,7 @@ async function run() {
       const rejected = await shim.send(call(43, name, argumentsValue));
       assert.equal(rejected.error?.code, -32602, label);
     }
-    assert.equal(calls.length, 9);
+    assert.equal(calls.length, 10);
     ok(true, "each listed operation maps to its static endpoint command without a generic action field");
 
     reply = { status: 200, raw: "not-json" };

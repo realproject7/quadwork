@@ -213,7 +213,7 @@ process.on("exit", cleanup);
   const releaseContainment = runtime._test.installLifecycleTestFixture(PROJECT, "dev", "linux-contained");
   try {
     const tools = await shim.handshake();
-    assert.deepEqual(tools.slice(-5), ["get_project_status", "review_handoff", "project_monitor", "recover_worker", "recent_head_control_audit"]);
+    assert.deepEqual(tools.slice(-6), ["get_project_status", "review_handoff", "project_monitor", "recover_worker", "begin_ticket_review", "recent_head_control_audit"]);
 
     // 1. Observe first: the read surface shows the qualified assignment,
     //    suspended monitor, worker facts with observation times, and capacity.

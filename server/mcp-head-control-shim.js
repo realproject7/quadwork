@@ -330,6 +330,29 @@ const TOOL_DEFS = Object.freeze([
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }),
   Object.freeze({
+    name: "begin_ticket_review",
+    description: "Establish one minimal, owned ticket-review assignment for one registered repository issue when the Active Batch is the seeded empty state. It is idempotent only for that same sole assignment and never edits an existing batch, issue, or WorkTask manifest.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idempotency_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        correlation_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{2,95}$" },
+        ticket_review: {
+          type: "object",
+          properties: {
+            repository_key: { type: "string", pattern: "^[a-z][a-z0-9_-]{0,63}$" },
+            issue: { type: "integer", minimum: 1 },
+          },
+          required: ["repository_key", "issue"],
+          additionalProperties: false,
+        },
+      },
+      required: ["idempotency_key", "correlation_id", "ticket_review"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }),
+  Object.freeze({
     name: "recent_head_control_audit",
     description: "Read the bounded redacted Head-control audit for this launch binding.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -362,6 +385,13 @@ function commandArguments(name, value) {
         typeof recovery.expected_generation !== "string" || !GENERATION_RE.test(recovery.expected_generation) ||
         typeof recovery.assignment_attempt !== "string" || !ATTEMPT_RE.test(recovery.assignment_attempt)) fail("recovery is invalid");
     parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id), recovery: copyJson(recovery) };
+  } else if (name === "begin_ticket_review") {
+    exact(value, ["idempotency_key", "correlation_id", "ticket_review"]);
+    if (!plain(value.ticket_review)) fail("ticket_review is invalid");
+    exact(value.ticket_review, ["repository_key", "issue"]);
+    if (typeof value.ticket_review.repository_key !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(value.ticket_review.repository_key) ||
+        !Number.isSafeInteger(value.ticket_review.issue) || value.ticket_review.issue < 1) fail("ticket_review is invalid");
+    parsed = { idempotency_key: identifier(value.idempotency_key), correlation_id: identifier(value.correlation_id), ticket_review: copyJson(value.ticket_review) };
   } else if (name === "freeze_batch_manifest" || name === "retire_batch" || name === "abandon_batch_manifest") {
     exact(value, ["expected_revision", "idempotency_key", "correlation_id"]);
     parsed = {

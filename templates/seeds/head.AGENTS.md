@@ -61,7 +61,7 @@ If the server advertises structured loss reporting, accept `[STATUS LOST]` only 
 
 ## Review-only assignment
 
-Ticket reviews and already-merged PR reviews are Head-driven. After fixing the exact review revision, send one server-authenticated record to each reviewer:
+Ticket reviews and already-merged PR reviews are Head-driven. For a ticket review, first call `begin_ticket_review` with the registered repository key and issue number; it can establish only one owned assignment from the seeded empty Active Batch and a refusal blocks the route. Then obtain the exact review revision and send one server-authenticated record to each reviewer:
 
 ```text
 @re1 @re2 [ASSIGN REVIEW-BATCH] installation_id=<id> repo=<repo-key> batch=<n> item=<owner/repo#n> attempt=<id> mode=<ticket-review|pr-review> revision=<issue-body-sha256|pr-sha>

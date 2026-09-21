@@ -62,7 +62,7 @@ function request(action, overrides = {}) {
 }
 function domain(initial = status()) {
   let current = clone(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0, begin_ticket_review: 0 };
   const actions = {
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
@@ -84,6 +84,10 @@ function domain(initial = status()) {
     async recover_worker(input) {
       calls.recover_worker += 1;
       return { status: clone(current), detail: { applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false, agent: input.payload.recovery.agent } };
+    },
+    async begin_ticket_review(input) {
+      calls.begin_ticket_review += 1;
+      return { status: clone(current), detail: { applied: false, code: "not_exercised_here", repository_key: input.payload.ticket_review.repository_key, issue: input.payload.ticket_review.issue, batch: null, attempt: null, idempotent: false } };
     },
     retire_batch(input) {
       calls.retire_batch += 1;
@@ -185,7 +189,7 @@ function ok(condition, message) {
   assert.equal(put.result.status.revision, 1);
   assert.equal(frozen.result.status.revision, 2);
   assert.equal(cut.result.status.revision, 3);
-  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 });
+  assert.deepEqual(calls, { get_pipeline_status: 4, put_batch_manifest: 1, freeze_batch_manifest: 1, cut_batch: 1, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0, begin_ticket_review: 0 });
   const records = core.recentAudit();
   assert.equal(records.length, 4);
   assert.deepEqual(Object.keys(records[0]).sort(), [

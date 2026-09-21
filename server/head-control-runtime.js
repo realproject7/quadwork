@@ -62,7 +62,7 @@ function runtimeKey(value) {
   return `${value.installation_id}:${value.project_id}:${value.generation}`;
 }
 
-const PROJECT_CONTROL_NAMES = Object.freeze(["read_project_status", "read_review_handoff", "project_monitor", "recover_worker"]);
+const PROJECT_CONTROL_NAMES = Object.freeze(["read_project_status", "read_review_handoff", "project_monitor", "recover_worker", "begin_ticket_review"]);
 
 function projectControls(value) {
   exact(value, PROJECT_CONTROL_NAMES);
@@ -95,7 +95,7 @@ function composeHeadDomain(owner, workTask, controls, delivery = null) {
   }
   const project_id = owner.project_id;
   const deliveryActions = require("./delivery-execution-contract").ACTIONS;
-  const beside = new Set(["get_project_status", "review_handoff", "project_monitor", "recover_worker", ...deliveryActions]);
+  const beside = new Set(["get_project_status", "review_handoff", "project_monitor", "recover_worker", "begin_ticket_review", ...deliveryActions]);
   const composed = {
     ...workTask,
     // The plane preflights every action with a status read that keeps the
@@ -123,6 +123,11 @@ function composeHeadDomain(owner, workTask, controls, delivery = null) {
       owned(invocation, "recover_worker");
       const status = pipelineStatus(invocation);
       return { status, detail: await controls.recover_worker({ project_id, recovery: { ...invocation.payload.recovery } }) };
+    },
+    async begin_ticket_review(invocation) {
+      owned(invocation, "begin_ticket_review");
+      const status = pipelineStatus(invocation);
+      return { status, detail: await controls.begin_ticket_review({ project_id, ticket_review: { ...invocation.payload.ticket_review } }) };
     },
   };
   if (delivery) {

@@ -47,7 +47,7 @@ function status(overrides = {}) {
 
 function fakeDomain() {
   let current = status();
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0, begin_ticket_review: 0 };
   const controlPayloads = [];
   const domain = {
     get_pipeline_status(input) {
@@ -72,6 +72,11 @@ function fakeDomain() {
       calls.recover_worker += 1;
       controlPayloads.push(clone(input.payload));
       return { status: clone(current), detail: { applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false } };
+    },
+    async begin_ticket_review(input) {
+      calls.begin_ticket_review += 1;
+      controlPayloads.push(clone(input.payload));
+      return { status: clone(current), detail: { applied: true, code: "ticket_review_started", repository_key: input.payload.ticket_review.repository_key, issue: input.payload.ticket_review.issue, batch: 1, attempt: "ticket_review_test", idempotent: false } };
     },
     retire_batch(input) {
       calls.retire_batch += 1;
@@ -288,6 +293,29 @@ function ok(value, message) {
   }
   assert.deepEqual([fixture.calls.read_propagation_stop, fixture.calls.queue_local_correction, fixture.calls.retire_batch], [1, 1, 1]);
   ok(true, "stop read, correction, and retirement map to their static commands, carry a bounded detail, and reject any extra field");
+}
+
+{
+  const fixture = createFixture();
+  const started = await fixture.handler.handle(request("begin_ticket_review", {
+    idempotency_key: "idem_http_ticket_one",
+    correlation_id: "corr_http_ticket_one",
+    ticket_review: { repository_key: "primary", issue: 42 },
+  }), { token: TOKEN });
+  assert.equal(started.ok, true);
+  assert.equal(started.result.result.action, "begin_ticket_review");
+  assert.equal(started.result.result.status.revision, 0);
+  assert.equal(fixture.calls.begin_ticket_review, 1);
+  assert.deepEqual(fixture.controlPayloads, [{ ticket_review: { repository_key: "primary", issue: 42 } }]);
+  for (const argumentsValue of [
+    { idempotency_key: "idem_http_ticket_bad", correlation_id: "corr_http_ticket_bad", ticket_review: { repository_key: "primary", issue: 0 } },
+    { idempotency_key: "idem_http_ticket_bad", correlation_id: "corr_http_ticket_bad", ticket_review: { repository_key: "primary", issue: 42, repo: "other/repo" } },
+    { expected_revision: 0, idempotency_key: "idem_http_ticket_bad", correlation_id: "corr_http_ticket_bad", ticket_review: { repository_key: "primary", issue: 42 } },
+  ]) {
+    error(await fixture.handler.handle(request("begin_ticket_review", argumentsValue), { token: TOKEN }), "invalid_request");
+  }
+  assert.equal(fixture.calls.begin_ticket_review, 1);
+  ok(true, "ticket admission carries only the registered repository key and issue through the revision-free Head control boundary");
 }
 
 // #1069: abandonment maps to its static payloadless command and rejects any

@@ -29,16 +29,18 @@ const ACTIONS = Object.freeze([
   "review_handoff",
   "project_monitor",
   "recover_worker",
+  "begin_ticket_review",
   ...DELIVERY.ACTIONS,
 ]);
 const ACTION_SET = new Set(ACTIONS);
 // Reads and the two beside-the-pipeline controls carry no optimistic revision.
-const REVISION_FREE_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
+const REVISION_FREE_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "begin_ticket_review"]);
 const MONITOR_COMMANDS = new Set(["start", "stop", "evaluate_now"]);
 const RECOVERABLE_ROLES = new Set(["dev", "re1", "re2"]);
 const RECOVERY_REASONS = new Set(["process_exited", "unresponsive", "resource_killed", "launch_failed"]);
 const GENERATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ATTEMPT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const REPOSITORY_KEY_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 const ERROR_TYPES = Object.freeze(new Set([
   "not_found",
   "invalid_request",
@@ -230,6 +232,21 @@ function commandArguments(tool, value) {
       idempotency_key: identifier(value.idempotency_key),
       correlation_id: identifier(value.correlation_id),
       payload: freeze({ recovery: boundedJson(value.recovery) }),
+    });
+  }
+  if (tool === "begin_ticket_review") {
+    exact(value, ["idempotency_key", "correlation_id", "ticket_review"]);
+    if (!plain(value.ticket_review)) throw new TypeError("ticket_review is invalid");
+    exact(value.ticket_review, ["repository_key", "issue"]);
+    if (typeof value.ticket_review.repository_key !== "string" || !REPOSITORY_KEY_RE.test(value.ticket_review.repository_key) ||
+        !Number.isSafeInteger(value.ticket_review.issue) || value.ticket_review.issue < 1) {
+      throw new TypeError("ticket_review is invalid");
+    }
+    return freeze({
+      expected_revision: null,
+      idempotency_key: identifier(value.idempotency_key),
+      correlation_id: identifier(value.correlation_id),
+      payload: freeze({ ticket_review: freeze({ repository_key: value.ticket_review.repository_key, issue: value.ticket_review.issue }) }),
     });
   }
   if (tool === "freeze_batch_manifest" || tool === "retire_batch" || tool === "abandon_batch_manifest") {

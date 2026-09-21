@@ -58,6 +58,7 @@ function fixture() {
       read_review_handoff: () => ({ cycle: null }),
       project_monitor: async ({ command }) => ({ applied: true, command, mode: command === "stop" ? "suspended" : "enabled" }),
       recover_worker: async () => ({ applied: false, outcome: "rejected", reason: "no_loss_evidence", recovered: false }),
+      begin_ticket_review: async () => ({ applied: false, code: "not_exercised_here", repository_key: null, issue: null, batch: null, attempt: null, idempotent: false }),
     },
   });
   return {

@@ -38,21 +38,23 @@ const ACTIONS = Object.freeze([
   "review_handoff",
   "project_monitor",
   "recover_worker",
+  "begin_ticket_review",
   ...DELIVERY.ACTIONS,
 ]);
 const ACTION_SET = new Set(ACTIONS);
 const READ_ACTIONS = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff"]);
-const CONTROL_ACTIONS = new Set(["project_monitor", "recover_worker"]);
+const CONTROL_ACTIONS = new Set(["project_monitor", "recover_worker", "begin_ticket_review"]);
 const PAYLOADLESS_ACTIONS = new Set(["get_pipeline_status", "freeze_batch_manifest", "retire_batch", "abandon_batch_manifest", "get_project_status", "review_handoff"]);
-const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", ...DELIVERY.ACTIONS]);
+const DETAILED_ACTIONS = new Set(["queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "begin_ticket_review", ...DELIVERY.ACTIONS]);
 const READ_CODES = Object.freeze({ get_project_status: "head_control_project_observed", review_handoff: "head_control_handoff_observed" });
-const CONTROL_REFUSED_CODES = Object.freeze({ project_monitor: "head_control_monitor_refused", recover_worker: "head_control_recovery_refused" });
+const CONTROL_REFUSED_CODES = Object.freeze({ project_monitor: "head_control_monitor_refused", recover_worker: "head_control_recovery_refused", begin_ticket_review: "head_control_ticket_review_refused" });
 const MONITOR_COMMANDS = new Set(["start", "stop", "evaluate_now"]);
 const RECOVERABLE_ROLES = new Set(["dev", "re1", "re2"]);
 const RECOVERY_REASON_CODES = Object.freeze(["process_exited", "unresponsive", "resource_killed", "launch_failed"]);
 const RECOVERY_REASON_SET = new Set(RECOVERY_REASON_CODES);
 const GENERATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ATTEMPT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const REPOSITORY_KEY_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 
 class HeadControlPlaneError extends Error {
   constructor(code, message = code) {
@@ -210,6 +212,15 @@ function assertRecoveryPayload(value) {
   }
   return { recovery: { agent: recovery.agent, expected_generation: recovery.expected_generation, assignment_attempt: recovery.assignment_attempt, reason_code: recovery.reason_code } };
 }
+function assertTicketReviewPayload(value) {
+  exact(value, ["ticket_review"], "invalid_head_control_request");
+  exact(value.ticket_review, ["repository_key", "issue"], "invalid_head_control_request");
+  if (typeof value.ticket_review.repository_key !== "string" || !REPOSITORY_KEY_RE.test(value.ticket_review.repository_key) ||
+      !Number.isSafeInteger(value.ticket_review.issue) || value.ticket_review.issue < 1) {
+    fail("invalid_head_control_request", "ticket-review payload is invalid");
+  }
+  return { ticket_review: { repository_key: value.ticket_review.repository_key, issue: value.ticket_review.issue } };
+}
 function assertCutPayload(value) {
   exact(value, ["cut"], "invalid_head_control_request");
   if (!plain(value.cut) || !Array.isArray(value.cut.tasks) || value.cut.tasks.length === 0 || value.cut.tasks.length > MAX_CUT_TASKS ||
@@ -249,6 +260,8 @@ function request(value) {
     parsed.payload = assertMonitorPayload(value.payload);
   } else if (value.action === "recover_worker") {
     parsed.payload = assertRecoveryPayload(value.payload);
+  } else if (value.action === "begin_ticket_review") {
+    parsed.payload = assertTicketReviewPayload(value.payload);
   } else {
     parsed.payload = assertCutPayload(value.payload);
   }
