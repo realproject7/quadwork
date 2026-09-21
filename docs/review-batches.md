@@ -32,7 +32,11 @@ the batch to `## Done` only after every item is terminal.
 
 ## Assignment authority
 
-Head fixes the canonical issue-body revision or merged PR SHA, then uses the
+For `ticket-review`, Head first uses its server-authenticated
+`begin_ticket_review` operation with the registered repository key and issue
+number. It establishes only one owned assignment from the seeded empty Active
+Batch and refuses to edit an existing batch. Head then fixes the canonical
+issue-body revision (or, for `pr-review`, the merged PR SHA) and uses the
 server-authenticated project chat sender to assign both reviewers:
 
 ```text
@@ -46,7 +50,7 @@ not the implementation-review dispatcher.
 
 ## Ticket-review loop
 
-1. Head obtains the canonical issue revision through the server service and sends the authenticated review assignment.
+1. Head calls `begin_ticket_review` for the exact registered repository key and issue, confirms the owned assignment, obtains the canonical issue revision through the server service, and sends the authenticated review assignment.
 2. RE1 and RE2 independently read that exact issue body plus bounded current-code/dependency evidence.
 3. Immediately before a permitted comment, each reviewer calls the existing project/agent-bound `issue_contract_revision` operation with only `repo_key` and `issue`, then requires its current server-issued `contract_revision`, canonical repository/issue, and successful source status to match the assignment. Reviewers read the live issue body for review evidence but never derive or hash its revision locally. A stale, missing, conflicting, or failed server-issued identity/revision is `BLOCK` and authorizes no write.
 4. For a current Head-qualified assignment only, each reviewer may make one `gh issue comment` call. After the server-issued revision read, the reviewer reads the live repository `main` SHA and scans live issue comments for that reviewer's complete assignment marker using that server-issued revision. The comment must carry the reviewer role, full assignment identity, APPROVE/REQUEST CHANGES/BLOCK verdict, bounded criterion evidence, and the live main SHA. Before posting, a matching marker makes the operation idempotent (no new comment); after posting, a live read-back against the same server-issued revision must show exactly one complete matching comment.

@@ -29,7 +29,7 @@ async function main() {
     let current = owner;
     const services = [];
     function connection(binding) {
-      const controls = { read_project_status: async () => ({}), read_review_handoff: async () => ({}), project_monitor: async () => ({}), recover_worker: async () => ({}) };
+      const controls = { read_project_status: async () => ({}), read_review_handoff: async () => ({}), project_monitor: async () => ({}), recover_worker: async () => ({}), begin_ticket_review: async () => ({ applied: false }) };
       const service = createHeadControlService({ binding, domain: composeHeadDomain(binding, f.domain, controls, f.exec), audit_store: createHeadControlAuditStore({ config_dir: f.chain.config_dir, fs }) });
       services.push(service);
       const publicBinding = { project_id: binding.project_id, actor: "head", generation: binding.generation };

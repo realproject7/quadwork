@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const { fixture, F, C, clock, composeHeadDomain, createHeadControlService, createHeadControlAuditStore, createHeadControlHttpService } = require("./__tests__/delivery-execution-fixture");
 function httpFor(f) {
   const owner = f.owner;
-  const controls = { read_project_status: async () => ({}), read_review_handoff: async () => ({}), project_monitor: async () => ({}), recover_worker: async () => ({}) };
+  const controls = { read_project_status: async () => ({}), read_review_handoff: async () => ({}), project_monitor: async () => ({}), recover_worker: async () => ({}), begin_ticket_review: async () => ({ applied: false }) };
   const service = createHeadControlService({ binding: owner, domain: composeHeadDomain(owner, f.domain, controls, f.exec), audit_store: createHeadControlAuditStore({ config_dir: f.chain.config_dir, fs }) });
   const binding = { project_id: owner.project_id, actor: "head", generation: owner.generation };
   const http = createHeadControlHttpService({ authenticateToken: (auth) => auth.token === "head-progress" ? binding : null,

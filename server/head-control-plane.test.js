@@ -34,7 +34,7 @@ function status(overrides = {}) {
 }
 const taskRef = Object.freeze({ installation_id: binding.installation_id, project_id: binding.project_id, task_key: "build" });
 const stopDetail = Object.freeze({ kind: "propagation_stop_pending", target: "head_private", candidate_digest: "e".repeat(64), dependency_chain: [{ task_key: "dependent" }] });
-const REVISION_FREE = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker"]);
+const REVISION_FREE = new Set(["get_pipeline_status", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "begin_ticket_review"]);
 const recovery = Object.freeze({ agent: "dev", expected_generation: "gen-lost-1", assignment_attempt: "attempt_a", reason_code: "process_exited" });
 function request(action, overrides = {}) {
   const payload = action === "get_pipeline_status" || action === "freeze_batch_manifest" || action === "retire_batch" || action === "abandon_batch_manifest" || action === "get_project_status" || action === "review_handoff"
@@ -43,6 +43,8 @@ function request(action, overrides = {}) {
       ? { command: "start" }
     : action === "recover_worker"
       ? { recovery: { ...recovery } }
+    : action === "begin_ticket_review"
+      ? { ticket_review: { repository_key: "primary", issue: 42 } }
     : action === "put_batch_manifest"
       ? { manifest: { version: 1, tasks: [] } }
       : action === "queue_local_correction"
@@ -65,7 +67,7 @@ const projectDetail = Object.freeze({ assignment: { assignment_key: "b7-abc", su
 const handoffDetail = Object.freeze({ cycle: null, subject: "primary:issue#42" });
 function fakeDomain(initial = status()) {
   let current = copy(initial);
-  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0 };
+  const calls = { get_pipeline_status: 0, put_batch_manifest: 0, freeze_batch_manifest: 0, cut_batch: 0, retire_batch: 0, abandon_batch_manifest: 0, queue_local_correction: 0, read_propagation_stop: 0, get_project_status: 0, review_handoff: 0, project_monitor: 0, recover_worker: 0, begin_ticket_review: 0 };
   const controlLog = [];
   const domain = {
     get_project_status(input) {
@@ -95,6 +97,11 @@ function fakeDomain(initial = status()) {
       return { status: copy(current), detail: stale
         ? { applied: false, outcome: "rejected", reason: "stale_expected_generation", recovered: false }
         : { applied: true, outcome: "spawned", recovered: false, verification_state: "unconfirmed" } };
+    },
+    async begin_ticket_review(input) {
+      calls.begin_ticket_review += 1;
+      assert.deepEqual(input.payload, { ticket_review: { repository_key: "primary", issue: 42 } });
+      return { status: copy(current), detail: { applied: true, code: "ticket_review_started", repository_key: "primary", issue: 42, batch: 1, attempt: "ticket_review_test", idempotent: false } };
     },
     get_pipeline_status(input) {
       calls.get_pipeline_status += 1;
@@ -209,7 +216,7 @@ function ok(condition, message) {
   assert.equal(cut.decision.kind, "accepted");
   assert.equal(cut.result.status.revision, 3);
   assert.equal(cut.result.status.cut_safe, false);
-  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "form_delivery", "publish_delivery", "inspect_delivery", "complete_delivery"]),
+  ok(JSON.stringify(ACTIONS) === JSON.stringify(["get_pipeline_status", "put_batch_manifest", "freeze_batch_manifest", "cut_batch", "retire_batch", "abandon_batch_manifest", "queue_local_correction", "read_propagation_stop", "get_project_status", "review_handoff", "project_monitor", "recover_worker", "begin_ticket_review", "form_delivery", "publish_delivery", "inspect_delivery", "complete_delivery"]),
     "only the fixed pipeline, project and delivery actions are exposed");
   ok(calls.get_pipeline_status === 4 && calls.put_batch_manifest === 1 && calls.freeze_batch_manifest === 1 && calls.cut_batch === 1,
     "each accepted action delegates once to its fixed owning pipeline action");
@@ -391,6 +398,16 @@ function ok(condition, message) {
   assert.equal(calls.project_monitor, 3);
   ok(true, "start, stop, and evaluate_now are the only monitor commands and each is one audited domain call");
 
+  const ticketRequest = request("begin_ticket_review", { idempotency_key: "idem_ticket_start", correlation_id: "corr_ticket_start" });
+  const ticketStarted = await core.execute(ticketRequest);
+  assert.equal(ticketStarted.decision.code, "head_control_applied");
+  assert.equal(ticketStarted.result.status.revision, 3, "ticket admission must not mutate a WorkTask pipeline revision");
+  assert.deepEqual(ticketStarted.detail, { applied: true, code: "ticket_review_started", repository_key: "primary", issue: 42, batch: 1, attempt: "ticket_review_test", idempotent: false });
+  const ticketReplay = await core.execute(copy(ticketRequest));
+  assert.equal(ticketReplay.decision.kind, "replayed");
+  assert.equal(calls.begin_ticket_review, 1);
+  ok(true, "ticket-review admission is one revision-free Head control with an idempotent replay receipt");
+
   const recovered = await core.execute(request("recover_worker", { idempotency_key: "idem_recover_001", correlation_id: "corr_recover_001" }));
   assert.equal(recovered.decision.code, "head_control_applied");
   assert.equal(recovered.detail.outcome, "spawned");
@@ -460,11 +477,20 @@ function ok(condition, message) {
     await assert.rejects(() => core.execute(request("recover_worker", { idempotency_key: "idem_recover_bad", correlation_id: "corr_recover_bad", payload: { recovery: { ...recovery, ...recoveryOverrides } } })),
       (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request", label);
   }
+  for (const [label, payload] of [
+    ["a cross-project selector", { ticket_review: { repository_key: "primary", issue: 42 }, project_id: "other" }],
+    ["an unregistered payload field", { ticket_review: { repository_key: "primary", issue: 42, repo: "other/repo" } }],
+    ["a non-positive issue", { ticket_review: { repository_key: "primary", issue: 0 } }],
+  ]) {
+    await assert.rejects(() => core.execute(request("begin_ticket_review", { idempotency_key: "idem_ticket_bad", correlation_id: "corr_ticket_bad", payload })),
+      (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request", label);
+  }
   await assert.rejects(() => core.execute(request("get_project_status", { idempotency_key: "idem_project_bad", correlation_id: "corr_project_bad", payload: { project: "other" } })),
     (error) => error instanceof HeadControlPlaneError && error.code === "invalid_head_control_request");
   assert.equal(calls.project_monitor, 3);
   assert.equal(calls.recover_worker, 2);
-  ok(true, "monitor text/cadence, a Head recovery, an unlisted reason, a caller project, or a pinned control revision never reach the domain");
+  assert.equal(calls.begin_ticket_review, 1);
+  ok(true, "monitor text/cadence, a Head recovery, an unlisted reason, a caller project, or an invalid ticket target never reach the domain");
 }
 
 // Principal binding is exact.  A mismatched role, project, or generation is a

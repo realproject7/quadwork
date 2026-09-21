@@ -95,6 +95,7 @@ function configuredCliBase(projectId, agentId, agentCfg, command) {
   return benchmarkCommandIdentity(projectId, agentId, agentCfg) || command.split("/").pop().split(" ")[0];
 }
 const { createHeadControlRuntime } = require("./head-control-runtime");
+const { createHeadTicketReviewAdmission } = require("./head-ticket-review-admission");
 const { createLiveWorkTaskIdentityResolver } = require("./live-work-task-identity-resolver");
 const { createManagedWorktreeObserver } = require("./work-task-managed-worktree");
 const { createRegisteredWorkTaskBaseObserver } = require("./registered-work-task-base");
@@ -804,6 +805,13 @@ const runtimeTestHooks = (() => {
 // #1044 M5: only the server composes the transport, durable Head-control
 // domain, current assignment readers, and live PTY facts. The MCP shim gets a
 // per-Head launch token, not a route/config capability.
+const headTicketReviewAdmission = createHeadTicketReviewAdmission({
+  config_dir: path.dirname(CONFIG_PATH),
+  read_config: readConfig,
+  read_live_batch_context: routes.readLiveBatchContext,
+  write_secure_file: writeSecureFile,
+  random_id: () => crypto.randomUUID(),
+});
 const headControlRuntime = createHeadControlRuntime({
   config_dir: path.dirname(CONFIG_PATH),
   fs,
@@ -825,6 +833,7 @@ const headControlRuntime = createHeadControlRuntime({
     read_review_handoff: ({ project_id }) => readHeadReviewHandoff(project_id),
     project_monitor: ({ project_id, command }) => controlProjectMonitor(project_id, command),
     recover_worker: ({ project_id, recovery }) => recoverWorkerForHead(project_id, recovery),
+    begin_ticket_review: ({ project_id, ticket_review }) => headTicketReviewAdmission.begin({ project_id, ticket_review }),
   },
 });
 

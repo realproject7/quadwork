@@ -82,13 +82,14 @@ operator decision; do not silently rewrite history beneath an active worker.
 Use `ticket-review` before implementation when a contract is new, cross-cutting,
 security-sensitive, or difficult to reverse.
 
-1. Fix the canonical issue-body revision through the server service.
-2. Send RE1 and RE2 the Head-authenticated review-only assignment with exact installation, repository, batch, item, attempt, mode, and revision.
-3. Reviewers independently check bounded scope, testable acceptance, feasibility against current code, dependency order, internal consistency, and security.
-4. Immediately before a reviewer may post one durable ticket-review verdict comment, the reviewer calls the existing project/agent-bound `issue_contract_revision` operation with only `repo_key` and `issue`. Its current server-issued `contract_revision`, canonical repository/issue, and successful source status must match the qualified assignment. Reviewers never derive or hash this revision locally. They then obtain a live `main` SHA, complete an idempotency scan using that server-issued revision, and perform a successful comment read-back against it. The comment must state reviewer role, complete assignment identity, verdict, bounded evidence, and live main SHA. A duplicate marker, identity/revision mismatch, or missing read-back is `BLOCK`, not a retry write.
-5. That comment is reviewer evidence only. It neither edits the issue nor accepts the ticket; Head alone validates the evidence, advances state, applies issue edits, reassigns attempts, and closes the review batch.
-6. On REQUEST CHANGES, Head edits the issue, obtains the new canonical revision, advances the attempt, and requests review again. Old-revision verdicts expire.
-7. On two APPROVEs at the same revision, Head records approval and closes the item. BLOCK requires the named owner to resolve the stated fact.
+1. Call Head-only `begin_ticket_review` with only the registered `repository_key` and issue number. It may replace only the seeded empty Active Batch with one owned ticket-review assignment; it never edits an existing batch, issue, or WorkTask manifest. A refusal is a block, not an instruction to reconstruct the queue manually.
+2. Fix the canonical issue-body revision through the server service after that assignment is current.
+3. Send RE1 and RE2 the Head-authenticated review-only assignment with exact installation, repository, batch, item, attempt, mode, and revision.
+4. Reviewers independently check bounded scope, testable acceptance, feasibility against current code, dependency order, internal consistency, and security.
+5. Immediately before a reviewer may post one durable ticket-review verdict comment, the reviewer calls the existing project/agent-bound `issue_contract_revision` operation with only `repo_key` and `issue`. Its current server-issued `contract_revision`, canonical repository/issue, and successful source status must match the qualified assignment. Reviewers never derive or hash this revision locally. They then obtain a live `main` SHA, complete an idempotency scan using that server-issued revision, and perform a successful comment read-back against it. The comment must state reviewer role, complete assignment identity, verdict, bounded evidence, and live main SHA. A duplicate marker, identity/revision mismatch, or missing read-back is `BLOCK`, not a retry write.
+6. That comment is reviewer evidence only. It neither edits the issue nor accepts the ticket; Head alone validates the evidence, advances state, applies issue edits, reassigns attempts, and closes the review batch.
+7. On REQUEST CHANGES, Head edits the issue, obtains the new canonical revision, advances the attempt, and requests review again. Old-revision verdicts expire.
+8. On two APPROVEs at the same revision, Head records approval and closes the item. BLOCK requires the named owner to resolve the stated fact.
 
 Dev has no review-driver or issue-edit role in a review-only batch.
 
