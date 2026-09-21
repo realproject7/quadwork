@@ -18,6 +18,16 @@ const originalPath = process.env.PATH;
 os.homedir = () => TMP;
 process.env.HOME = TMP;
 process.env.QUADWORK_SKIP_LISTEN = "1";
+// Keep the test directly runnable, including by an independent reviewer. The
+// test runtime facade is an in-memory test-only capability; production code
+// receives neither this environment value nor its exported session map.
+process.env.QUADWORK_TEST_RUNTIME = "1";
+
+// A fresh npm package excludes test files, so this source test also serves as
+// its external product harness when QUADWORK_PRODUCT_ROOT names that package.
+// Defaulting to the repository root keeps the normal source-tree regression
+// unchanged.
+const PRODUCT_ROOT = process.env.QUADWORK_PRODUCT_ROOT || path.resolve(__dirname, "..");
 
 const CONFIG_DIR = path.join(TMP, ".quadwork");
 const PROJECT = "alpha";
@@ -27,8 +37,8 @@ const REVIEWER_TOKEN = "reviewer-ticket-review-e2e-token-0001";
 const REPO_DIR = path.join(TMP, "repo");
 const HEAD_DIR = path.join(TMP, "head");
 const BIN_DIR = path.join(TMP, "bin");
-const HEAD_SHIM = path.join(__dirname, "mcp-head-control-shim.js");
-const CHAT_SHIM = path.join(__dirname, "mcp-chat-shim.js");
+const HEAD_SHIM = path.join(PRODUCT_ROOT, "server", "mcp-head-control-shim.js");
+const CHAT_SHIM = path.join(PRODUCT_ROOT, "server", "mcp-chat-shim.js");
 
 for (const directory of [path.join(CONFIG_DIR, PROJECT), REPO_DIR, HEAD_DIR, BIN_DIR]) {
   fs.mkdirSync(directory, { recursive: true });
@@ -77,10 +87,10 @@ fs.writeFileSync(ghPath, [
 fs.chmodSync(ghPath, 0o755);
 process.env.PATH = `${BIN_DIR}${path.delimiter}${originalPath || ""}`;
 
-const routes = require("./routes");
-const fileChat = require("./file-chat");
-const { captureProjectAdmission } = require("./project-lifecycle");
-const runtime = require("./index");
+const routes = require(path.join(PRODUCT_ROOT, "server", "routes"));
+const fileChat = require(path.join(PRODUCT_ROOT, "server", "file-chat"));
+const { captureProjectAdmission } = require(path.join(PRODUCT_ROOT, "server", "project-lifecycle"));
+const runtime = require(path.join(PRODUCT_ROOT, "server", "index"));
 
 function startJsonRpcShim(script, args) {
   const proc = spawn("node", [script, ...args], { stdio: ["pipe", "pipe", "pipe"] });
