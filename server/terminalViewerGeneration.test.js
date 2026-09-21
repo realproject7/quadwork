@@ -48,6 +48,7 @@ function component(name, { dependencies = {}, globals = {} } = {}) {
     if (id in dependencies) return dependencies[id];
     if (id.endsWith(".css")) return {};
     if (id === "@/lib/panelVisibility") return require("../src/lib/panelVisibility");
+    if (id === "@/lib/panelResize") return require("../src/lib/panelResize");
     if (id === "@/components/LocaleProvider") return { useLocale: () => ({ locale: "en" }) };
     if (id.startsWith("./")) return { __esModule: true, default: id.slice(2) };
     throw new Error(`Unexpected import ${id}`);
