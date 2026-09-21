@@ -4,7 +4,7 @@ This is the actions-free release path for the open release gate in #1026. It
 replaces its obsolete requirement for a green GitHub Actions check. It does not
 authorize a release, tag, deployment, credential change, or `npm publish`.
 
-## Current status, 2026-09-21 (#1155, #1026)
+## Current status, 2026-09-22 (#1155, #1026, #1028)
 
 `main` is version `2.7.1`. The planned public version is `2.8.0`, as recorded
 in #1026. The V2 implementation merged at `9e1d08fc57ea46b2aa5356bfa573e8c028d1cdc8`.
