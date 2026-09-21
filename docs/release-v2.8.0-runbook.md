@@ -4,16 +4,16 @@ This is the actions-free release path for the open release gate in #1026. It
 replaces its obsolete requirement for a green GitHub Actions check. It does not
 authorize a release, tag, deployment, credential change, or `npm publish`.
 
-## Current status, 2026-09-21 (#1155, #1026)
+## Current status, 2026-09-22 (#1155, #1026, #1028)
 
 `main` is version `2.7.1`. The planned public version is `2.8.0`, as recorded
 in #1026. The V2 implementation merged at `9e1d08fc57ea46b2aa5356bfa573e8c028d1cdc8`.
 The source-audit and verification work in #1037 must be reported separately.
 Implementation and source-audit completion require their ledger, resolved
 findings, deterministic checks, and two independent exact-candidate reviews.
-Real-provider turns, product E2E/device checks, and live benchmarks are on hold
-until the operator returns and explicitly resumes testing. Keep #1037 open for
-its retained verification and release gates, even after source work is complete.
+Real-provider turns, product E2E/device checks, and live benchmarks remain
+pending. Keep #1037 open for its retained verification and release gates, even
+after source work is complete.
 
 Local build, isolated installation, and test preparation are authorized after
 the implementation and audit fixes are complete. Installation readiness is not
@@ -32,8 +32,10 @@ installation, with the ordinary user `HOME` inherited unchanged.
 
 The matched benchmark and manifest-freeze order in
 [the benchmark plan](v2-benchmark-plan.md) still apply before performance or
-release claims. Do not prepare or merge a version bump until those gates pass
-and the operator authorizes the release stage.
+provider-support claims. The operator's 2026-09-22 decision recorded in #1028
+authorizes one `2.8.0` publication before those pending live checks. That
+exception does not authorize a performance or provider-support claim, a tag
+rewrite, an automated retry, or a republish.
 
 The reviewed runner is now a security harness and historical evidence, not the
 required provider-support or release proof. Preserve all past authorizations,
@@ -224,18 +226,18 @@ retention bypass or provider-state authority.
 
 No automatic retry or reviewed-runner fallback is authorized. A failed action
 blocks the corresponding support claim and subsequent release recommendation.
-Successful local proof still does not authorize a version change, tag, release,
-npm publish, or deployment. The recorded persistent local candidate remains a
-test target only.
+Successful local proof is post-publication support evidence. It does not
+authorize a tag rewrite, an automated retry, a republish, or a deployment. The
+recorded persistent local candidate remains a test target only.
 
 ## Release-source pull request
 
-This later stage requires operator authorization, successful pre-publication
-package-integrity proof, and the retained #1037 release-recommendation gates.
-The normal-home provider-continuity check remains an explicitly scheduled
-post-publication support verification, not a prerequisite for the version-bump
-pull request that precedes publication. Only then create one release-source
-pull request from the current `main` tip. Its only changes are:
+This stage has the operator authorization recorded in #1028 and requires
+successful pre-publication package-integrity proof. The normal-home
+provider-continuity check remains an explicitly scheduled post-publication
+support verification, not a prerequisite for the version-bump pull request
+that precedes publication. Create one release-source pull request from the
+current `main` tip. Its only changes are:
 
 - `package.json`: root `version` is `2.8.0`.
 - `package-lock.json`: root `version` and `packages[""].version` are `2.8.0`.
