@@ -149,6 +149,14 @@ function assertNoRoleWorktreeCreation(label) {
   assert.ok(!commandCalls.some((call) => call.cmd === "git" && call.args.includes("worktree") && call.args.includes("add")), label);
 }
 
+// V2 setup is deliberately provider-free. Repository verification and
+// worktree provisioning may use gh and git, but must never turn a configured
+// provider into an implicit first-use/login/trust/MCP prompt.
+function assertNoProviderCliInvocation(label) {
+  const providerCommands = new Set(["claude", "codex", "gemini", "grok"]);
+  assert.ok(!commandCalls.some((call) => providerCommands.has(path.basename(call.cmd))), label);
+}
+
 (async () => {
   // Use the genuine runtime composition. A test-supplied app/session Map hid
   // #1156 because production no longer exposed that private Map to routes.
@@ -262,6 +270,7 @@ function assertNoRoleWorktreeCreation(label) {
     response = await post(server, "/api/setup?step=provision-repositories", requestBody);
     assert.equal(response.status, 200, JSON.stringify(response.body));
     assert.equal(response.body.ok, true, "unrelated and stopped sessions permit target provisioning");
+    assertNoProviderCliInvocation("V2 provisioning never launches a provider CLI");
     activeSessions.clear();
     console.log("  PASS: live target sessions block both provisioning and activation before side effects");
 
@@ -396,6 +405,7 @@ function assertNoRoleWorktreeCreation(label) {
     response = await post(server, "/api/setup?step=activate-v2", requestBody);
     assert.equal(response.status, 200, JSON.stringify(response.body));
     assert.equal(response.body.ok, true);
+    assertNoProviderCliInvocation("V2 activation never launches a provider CLI");
     assert.equal(response.body.created.length, 0, "all clean reserved worktrees were reused");
     assert.equal(response.body.reused.length, 8);
     const disk = JSON.parse(readBytes());

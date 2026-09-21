@@ -17,9 +17,19 @@ its retained verification and release gates, even after source work is complete.
 
 Local build, isolated installation, and test preparation are authorized after
 the implementation and audit fixes are complete. Installation readiness is not
-product/provider success. The later local-install proof must precede any version
-change, tag, release, or npm publish. Failed or unperformed proof blocks
-provider-support and publish recommendation, not a scoped implementation claim.
+product/provider success. The pre-publication package-integrity proof must
+precede a version change, tag, release, or npm publish. The later normal-home
+provider-continuity verification occurs only after operator publication because
+it must exercise the public package without replacing the operator's provider
+home. Its result is a provider-support status, not a retroactive condition on
+an already immutable publication.
+
+An isolated child `HOME` is valid only for deterministic package and runtime
+smoke. It deliberately appears as a new provider machine and therefore cannot
+prove login persistence, folder trust, or MCP-consent continuity. That proof is
+performed only after the operator's package publication and normal global
+installation, with the ordinary user `HOME` inherited unchanged.
+
 The matched benchmark and manifest-freeze order in
 [the benchmark plan](v2-benchmark-plan.md) still apply before performance or
 release claims. Do not prepare or merge a version bump until those gates pass
@@ -157,6 +167,28 @@ dashboard. Stop this owned foreground instance with its
 Ctrl+C shutdown path and confirm its owned processes exited; do not signal
 unrelated processes or call a global `quadwork stop`.
 
+### Post-publication normal-home session-continuity verification
+
+The isolated-child launch above remains a package smoke only. After the
+operator has published the reviewed package and installed that exact public
+version globally, verify ordinary provider-session continuity separately. Start
+the recorded global executable with the normal shell environment: do not use
+`env -i`, do not replace `HOME` or `USERPROFILE`, and do not copy, inspect, or
+modify provider authentication data. Confirm the executable version before
+launching.
+
+The operator alone resolves any newly presented login, OAuth, folder-trust,
+MCP, or system-permission prompt. Once that explicit handoff is complete, the
+PO may exercise ordinary dashboard and terminal interactions while preserving
+the running product. A new provider prompt returns the action to the operator.
+This check verifies that the product's normal launch path preserves existing
+provider state; it must not be simulated with the isolated smoke environment.
+It is post-publication support verification, not a circular prerequisite for
+the publication that makes the normal global install available. A failure or
+block must be recorded honestly and blocks provider-support claims and any
+subsequent release recommendation; it does not authorize a republish, tag
+rewrite, credential action, or automated retry.
+
 The resumed checklist must distinguish these proofs:
 
 - One bounded project-path action with Codex and one with Claude through the
@@ -191,16 +223,19 @@ retain sanitized receipts and historical evidence. This policy adds no product
 retention bypass or provider-state authority.
 
 No automatic retry or reviewed-runner fallback is authorized. A failed action
-blocks the corresponding support and publish recommendation. Successful local
-proof still does not authorize a version change, tag, release, npm publish, or
-deployment. The recorded persistent local candidate remains a test target only.
+blocks the corresponding support claim and subsequent release recommendation.
+Successful local proof still does not authorize a version change, tag, release,
+npm publish, or deployment. The recorded persistent local candidate remains a
+test target only.
 
 ## Release-source pull request
 
-This later stage requires operator authorization, successful local-install
-provider proof, and the retained #1037 release-recommendation gates. Only then
-create one release-source pull request from the current `main` tip. Its only
-changes are:
+This later stage requires operator authorization, successful pre-publication
+package-integrity proof, and the retained #1037 release-recommendation gates.
+The normal-home provider-continuity check remains an explicitly scheduled
+post-publication support verification, not a prerequisite for the version-bump
+pull request that precedes publication. Only then create one release-source
+pull request from the current `main` tip. Its only changes are:
 
 - `package.json`: root `version` is `2.8.0`.
 - `package-lock.json`: root `version` and `packages[""].version` are `2.8.0`.
