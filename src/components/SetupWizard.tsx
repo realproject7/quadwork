@@ -1121,7 +1121,7 @@ export default function SetupWizard() {
               <div>
                 <h2 className="text-sm font-semibold text-text mb-1">V2 repository preflight</h2>
                 <p className="text-[11px] text-text-muted mb-4">
-                  Choose an explicit Verification policy, verify canonical GitHub access, then provision the four role worktrees. Provisioning does not activate or start agents.
+                  Choose an explicit Verification policy, verify canonical GitHub access, then provision the four role worktrees. Provisioning does not activate, start, or invoke a provider CLI; provider login, folder trust, and MCP consent occur only when a role is explicitly started.
                 </p>
                 <div className="border border-border bg-bg-surface p-3 mb-4 space-y-3">
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
