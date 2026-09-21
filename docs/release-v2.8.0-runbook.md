@@ -4,7 +4,7 @@ This is the actions-free release path for the open release gate in #1026. It
 replaces its obsolete requirement for a green GitHub Actions check. It does not
 authorize a release, tag, deployment, credential change, or `npm publish`.
 
-## Current status, 2026-09-20 (#1155)
+## Current status, 2026-09-21 (#1155, #1026)
 
 `main` is version `2.7.1`. The planned public version is `2.8.0`, as recorded
 in #1026. The V2 implementation merged at `9e1d08fc57ea46b2aa5356bfa573e8c028d1cdc8`.
@@ -37,12 +37,32 @@ The release notes must be generated from the final release commit. Do not reuse
 #1026's earlier Grok-only note as the complete description of this release, and
 do not make an unmeasured V2 performance claim.
 
+### Operator-approved persistent local candidate
+
+Before the later operator-resumed live verification, the PO may prepare one
+exact final-source tarball and replace the unused QuadWork global package in
+this Mac's active Node `v24.18.0` prefix with that local tarball. This narrow
+exception exists so the operator signs in, trusts the disposable test folder,
+and starts the product once, then the same installed product and terminal
+sessions remain available for the full live checklist. It is not npm
+publication, a version/tag/release action, a service restart, or authority to
+start a provider turn before the operator returns.
+
+Record the prior package version/path, source commit, archive digest, global
+package path, and installed-file verification. Do not alter the existing
+QuadWork configuration, projects, provider state, Keychain, service, or any
+other Node prefix. The operator alone completes login, trust, and any system
+prompt. After that handoff, the PO performs ordinary browser and terminal
+clicks, keeping the installed product running; only a new login, OAuth, or
+system permission prompt returns to the operator.
+
 ## Local-install readiness before testing
 
 This stage stops before product startup or provider execution. Keep every
 existing installation, service, configuration, project, and user-owned file
-untouched. Do not run `quadwork init`, replace a global install, add a global
-symlink, restart a service, use a production/VPS target, or alter credentials.
+untouched, except for the narrowly recorded persistent local candidate above.
+Do not run `quadwork init`, add a global symlink, restart a service, use a
+production/VPS target, or alter credentials.
 
 1. Select the final clean reviewed source after audit fixes. Record its commit,
    tree, two independent review receipts, and local validation results. Use
@@ -130,9 +150,10 @@ env -i PATH="$qw_runtime_path" HOME="$qw_runtime_home" USERPROFILE="$qw_runtime_
 ```
 
 `qw_runtime_path` must be explicitly recorded; adding a provider-state path or
-environment variable requires its own authority. Do not use `npx quadwork`, an
-unqualified global CLI, `quadwork init`, or an existing service. Open only the
-selected loopback dashboard. Stop this owned foreground instance with its
+environment variable requires its own authority. The persistent candidate may
+use its recorded global executable, but must not use `npx quadwork`,
+`quadwork init`, or an existing service. Open only the selected loopback
+dashboard. Stop this owned foreground instance with its
 Ctrl+C shutdown path and confirm its owned processes exited; do not signal
 unrelated processes or call a global `quadwork stop`.
 
@@ -171,8 +192,8 @@ retention bypass or provider-state authority.
 
 No automatic retry or reviewed-runner fallback is authorized. A failed action
 blocks the corresponding support and publish recommendation. Successful local
-proof still does not authorize a version change, tag, release, npm publish,
-deployment, or replacement of an existing installation.
+proof still does not authorize a version change, tag, release, npm publish, or
+deployment. The recorded persistent local candidate remains a test target only.
 
 ## Release-source pull request
 
