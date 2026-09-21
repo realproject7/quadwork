@@ -4,6 +4,12 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import TerminalPanel from "./TerminalPanel";
 import AgentLifecycleControls from "./AgentLifecycleControls";
 import { sessionTokenHeaders } from "@/lib/sessionToken";
+import {
+  TERMINAL_DIVIDER_SIZE,
+  TERMINAL_MIN_PANE_SIZE,
+  clampTerminalSplitRatio,
+  terminalGridLayout,
+} from "@/lib/panelResize";
 
 // #399 / quadwork#264: how long an agent stays "active" after its
 // last PTY output before the activity ring stops pulsing.
@@ -32,20 +38,7 @@ const DEFAULT_AGENTS: Agent[] = [
   { id: "dev", label: "Dev" },
 ];
 
-// Border classes per tile. 3-agent legacy layout (re1/re2/dev)
-// has a full-width bottom tile; the 4-agent layout used by the new
-// #208 Agent Terminals panel (right rail) has all four tiles in a 2x2 grid.
-const GRID_CLASSES_3 = [
-  "border-r border-b border-border", // top-left
-  "border-b border-border",          // top-right
-  "col-span-2",                      // bottom full-width
-];
-const GRID_CLASSES_4 = [
-  "border-r border-b border-border", // top-left
-  "border-b border-border",          // top-right
-  "border-r border-border",          // bottom-left
-  "",                                // bottom-right
-];
+type SplitAxis = "column" | "row";
 
 export default function TerminalGrid({
   projectId,
@@ -55,7 +48,61 @@ export default function TerminalGrid({
   onStatusChange,
 }: TerminalGridProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
-  const gridClasses = agents.length >= 4 ? GRID_CLASSES_4 : GRID_CLASSES_3;
+  const [columnRatio, setColumnRatio] = useState(0.5);
+  const [rowRatio, setRowRatio] = useState(0.5);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef<{ axis: SplitAxis } | null>(null);
+
+  // Each terminal keeps its own ResizeObserver, so changing either split
+  // automatically refits xterm and sends the new PTY dimensions. The grid
+  // only owns the visual boundary and its minimum-size contract.
+  const clampRatio = useCallback(clampTerminalSplitRatio, []);
+
+  useEffect(() => {
+    const stopDragging = () => {
+      if (!dragging.current) return;
+      dragging.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    const moveDivider = (event: MouseEvent) => {
+      if (!dragging.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      if (dragging.current.axis === "column") {
+        setColumnRatio(clampRatio((event.clientX - rect.left) / rect.width, rect.width));
+      } else {
+        setRowRatio(clampRatio((event.clientY - rect.top) / rect.height, rect.height));
+      }
+    };
+    window.addEventListener("mousemove", moveDivider);
+    window.addEventListener("mouseup", stopDragging);
+    return () => {
+      window.removeEventListener("mousemove", moveDivider);
+      window.removeEventListener("mouseup", stopDragging);
+    };
+  }, [clampRatio]);
+
+  const startDrag = (axis: SplitAxis) => {
+    dragging.current = { axis };
+    document.body.style.cursor = axis === "column" ? "col-resize" : "row-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  const nudgeSplit = (axis: SplitAxis, amount: number) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    const total = axis === "column" ? rect?.width : rect?.height;
+    if (!total) return;
+    if (axis === "column") setColumnRatio((value) => clampRatio(value + amount, total));
+    else setRowRatio((value) => clampRatio(value + amount, total));
+  };
+
+  const layout = terminalGridLayout(agents.length);
+  const gridStyle = {
+    gridTemplateColumns: `minmax(${TERMINAL_MIN_PANE_SIZE}px, ${columnRatio}fr) ${TERMINAL_DIVIDER_SIZE}px minmax(${TERMINAL_MIN_PANE_SIZE}px, ${1 - columnRatio}fr)`,
+    gridTemplateRows: layout.hasHorizontalSplit
+      ? `minmax(${TERMINAL_MIN_PANE_SIZE}px, ${rowRatio}fr) ${TERMINAL_DIVIDER_SIZE}px minmax(${TERMINAL_MIN_PANE_SIZE}px, ${1 - rowRatio}fr)`
+      : "minmax(0, 1fr)",
+  };
 
   // #399 / quadwork#264: derive a "currently active" signal from the
   // PTY ws stream so the ring only pulses while the agent is actually
@@ -120,21 +167,24 @@ export default function TerminalGrid({
   void activityTick;
 
   return (
-    <div className="w-full h-full relative grid grid-rows-2 grid-cols-2">
+    <div ref={containerRef} className="w-full h-full relative grid overflow-hidden" style={gridStyle}>
       {agents.map((agent, i) => {
         const isExpanded = expanded === agent.id;
         const isHidden = expanded !== null && !isExpanded;
         const isVerified = agentStates[agent.id] === "running" || agentStates[agent.id] === "verified";
+        const gridPosition = layout.positions[i] || {};
 
         return (
           <div
             key={agent.id}
-            className={`flex flex-col ${
+            className={`flex flex-col min-w-0 min-h-0 ${
               isExpanded
                 ? "absolute inset-0 z-10 bg-bg"
-                : `${gridClasses[i] || ""}`
+                : ""
             }`}
-            style={isHidden ? { visibility: "hidden", overflow: "hidden" } : undefined}
+            style={isHidden
+              ? { ...gridPosition, visibility: "hidden", overflow: "hidden" }
+              : gridPosition}
           >
             <div
               className={`flex items-center justify-between px-3 shrink-0 border-b border-border ${
@@ -212,6 +262,36 @@ export default function TerminalGrid({
           </div>
         );
       })}
+      {expanded === null && layout.hasVerticalSplit && (
+        <div
+          role="separator"
+          aria-label="Resize terminal columns"
+          aria-orientation="vertical"
+          tabIndex={0}
+          className="z-20 bg-border cursor-col-resize hover:bg-accent-dim focus-visible:bg-accent-dim focus-visible:outline-none"
+          style={{ gridColumn: "2", gridRow: layout.fourOrMore ? "1 / 4" : "1" }}
+          onMouseDown={() => startDrag("column")}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft") { event.preventDefault(); nudgeSplit("column", -0.05); }
+            if (event.key === "ArrowRight") { event.preventDefault(); nudgeSplit("column", 0.05); }
+          }}
+        />
+      )}
+      {expanded === null && layout.hasHorizontalSplit && (
+        <div
+          role="separator"
+          aria-label="Resize terminal rows"
+          aria-orientation="horizontal"
+          tabIndex={0}
+          className="z-20 bg-border cursor-row-resize hover:bg-accent-dim focus-visible:bg-accent-dim focus-visible:outline-none"
+          style={{ gridColumn: "1 / 4", gridRow: "2" }}
+          onMouseDown={() => startDrag("row")}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowUp") { event.preventDefault(); nudgeSplit("row", -0.05); }
+            if (event.key === "ArrowDown") { event.preventDefault(); nudgeSplit("row", 0.05); }
+          }}
+        />
+      )}
     </div>
   );
 }

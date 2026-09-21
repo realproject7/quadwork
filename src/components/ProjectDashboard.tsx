@@ -11,6 +11,7 @@ import AgentTerminalsGrid from "./AgentTerminalsGrid";
 import OperatorFeaturesPanel from "./OperatorFeaturesPanel";
 import { useLocale } from "@/components/LocaleProvider";
 import { onIdleChange } from "@/lib/idle";
+import { RAIL_DIVIDER_SIZE, clampRailPair, railPanelMinimum } from "@/lib/panelResize";
 import {
   DEFAULT_PANEL_VISIBILITY,
   LEGACY_TERMINALS_COLLAPSED_KEY,
@@ -29,6 +30,8 @@ interface AgentSnapshot {
 }
 type PanelVisibility = ReturnType<typeof resolvePanelVisibility>;
 type PanelId = keyof PanelVisibility;
+type RailPanelId = "terminals" | "github" | "operator";
+type RailRatios = Record<RailPanelId, number>;
 
 interface ProjectDashboardProps {
   projectId: string;
@@ -81,8 +84,16 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   const { locale } = useLocale();
   const t = COPY[locale];
   const containerRef = useRef<HTMLDivElement>(null);
+  const rightRailRef = useRef<HTMLDivElement>(null);
   const [colRatio, setColRatio] = useState(0.5);
-  const dragging = useRef(false);
+  const [railRatios, setRailRatios] = useState<RailRatios>({ terminals: 1, github: 1, operator: 1 });
+  const columnDragging = useRef(false);
+  const railDragging = useRef<{
+    before: RailPanelId;
+    after: RailPanelId;
+    startY: number;
+    ratios: RailRatios;
+  } | null>(null);
   const [agentSnapshot, setAgentSnapshot] = useState<AgentSnapshot>({ projectId, states: {}, generations: {} });
   // Never render the previous project's generation during navigation, even
   // before the new project's first status request has finished.
@@ -260,18 +271,37 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     []
   );
 
-  // #1052: one resizable vertical divider between the two columns. The old
-  // horizontal (row) divider and rowRatio are gone with the 2x2 grid.
+  // The desktop dashboard exposes every visual boundary as a real splitter.
+  // The main divider controls chat versus the rail; each rail divider only
+  // redistributes the two adjacent expanded panels, leaving the third intact.
+  // Panels retain a usable minimum while xterm handles the resulting PTY resize
+  // through TerminalPanel's ResizeObserver.
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
-      if (!dragging.current || !containerRef.current) return;
-      const rect = containerRef.current.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      setColRatio(clamp(x / rect.width, rect.width));
+      if (columnDragging.current && containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        setColRatio(clamp(x / rect.width, rect.width));
+      }
+      const drag = railDragging.current;
+      const rail = rightRailRef.current;
+      if (!drag || !rail) return;
+      const rect = rail.getBoundingClientRect();
+      const available = Math.max(1, rect.height - RAIL_DIVIDER_SIZE * 2);
+      const totalWeight = Object.values(drag.ratios).reduce((total, value) => total + value, 0);
+      const pixelDelta = e.clientY - drag.startY;
+      setRailRatios(clampRailPair({
+        ratios: drag.ratios,
+        before: drag.before,
+        after: drag.after,
+        totalPx: rect.height,
+        requestedBefore: drag.ratios[drag.before] + (pixelDelta / available) * totalWeight,
+      }));
     };
 
     const onMouseUp = () => {
-      dragging.current = false;
+      columnDragging.current = false;
+      railDragging.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
@@ -284,10 +314,38 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     };
   }, [clamp]);
 
-  const startDrag = () => {
-    dragging.current = true;
+  const startColumnDrag = () => {
+    columnDragging.current = true;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+  };
+
+  const startRailDrag = (before: RailPanelId, after: RailPanelId) => {
+    return (event: React.MouseEvent<HTMLDivElement>) => {
+      railDragging.current = { before, after, startY: event.clientY, ratios: railRatios };
+      document.body.style.cursor = "row-resize";
+      document.body.style.userSelect = "none";
+    };
+  };
+
+  const nudgeRail = (before: RailPanelId, after: RailPanelId, amount: number) => {
+    const height = rightRailRef.current?.getBoundingClientRect().height;
+    if (!height) return;
+    setRailRatios(clampRailPair({
+      ratios: railRatios,
+      before,
+      after,
+      totalPx: height,
+      requestedBefore: railRatios[before] + amount,
+    }));
+  };
+
+  const railPanelStyle = (id: RailPanelId): React.CSSProperties | undefined => {
+    if (!panels[id]) return undefined;
+    return {
+      "--qw-rail-grow": String(railRatios[id]),
+      "--qw-rail-min-size": `${railPanelMinimum(id)}px`,
+    } as React.CSSProperties;
   };
 
   const colTemplate = `${colRatio * 100}% ${DIVIDER}px 1fr`;
@@ -296,7 +354,8 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
   // GitHub and Operator Features stack below Primary Chat and stay collapsible.
   // On desktop (lg+): two-column CSS grid — Primary Chat fills the left column,
   // the right column is a vertical flex rail (Agent Terminals → GitHub →
-  // Operator Features) with one resizable vertical divider (#1052).
+  // Operator Features). Every desktop split is resizable; mobile stays a
+  // straightforward stacked, scrollable presentation.
   // Components are rendered ONCE — layout switching is pure CSS via a scoped
   // media query that overrides the flex-col to a grid at lg+ breakpoint.
   return (
@@ -308,6 +367,11 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             grid-template-columns: ${colTemplate};
             grid-template-rows: minmax(0, 1fr);
             overflow: hidden !important;
+          }
+          .qw-rail-panel[data-expanded="true"] {
+            flex-grow: var(--qw-rail-grow);
+            flex-basis: 0;
+            min-height: var(--qw-rail-min-size);
           }
         }
       `}</style>
@@ -330,16 +394,24 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
         {/* Vertical divider (desktop only) */}
         <div
           className="hidden lg:block bg-border cursor-col-resize hover:bg-accent-dim transition-colors"
-          onMouseDown={startDrag}
+          role="separator"
+          aria-label="Resize primary chat and side panels"
+          aria-orientation="vertical"
+          tabIndex={0}
+          onMouseDown={startColumnDrag}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft") { event.preventDefault(); setColRatio((value) => clamp(value - 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
+            if (event.key === "ArrowRight") { event.preventDefault(); setColRatio((value) => clamp(value + 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
+          }}
         />
 
         {/* Right rail: every expanded panel shares the remaining height
             equally (flex-1 min-h-0, own internal scrolling); a collapsed
             panel keeps only its 28px header. Collapse never changes the
             rail width or the column ratio. */}
-        <div className="flex flex-col lg:min-h-0 lg:overflow-hidden">
+        <div ref={rightRailRef} className="flex flex-col lg:min-h-0 lg:overflow-hidden">
           {/* Agent terminals — hidden on mobile (xterm.js + touch) */}
-          <div className={`hidden lg:flex flex-col overflow-hidden ${panels.terminals ? "lg:flex-1 lg:min-h-0" : "shrink-0"}`}>
+          <div data-expanded={panels.terminals} className={`qw-rail-panel hidden lg:flex flex-col overflow-hidden ${panels.terminals ? "lg:min-h-0" : "shrink-0"}`} style={railPanelStyle("terminals")}>
             <AgentTerminalsGrid
               projectId={projectId}
               agentStates={agentStates}
@@ -351,8 +423,23 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             />
           </div>
 
+          {panels.terminals && panels.github && (
+            <div
+              role="separator"
+              aria-label="Resize agent terminals and GitHub panels"
+              aria-orientation="horizontal"
+              tabIndex={0}
+              className="hidden lg:block shrink-0 h-1 bg-border cursor-row-resize hover:bg-accent-dim focus-visible:bg-accent-dim focus-visible:outline-none"
+              onMouseDown={startRailDrag("terminals", "github")}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowUp") { event.preventDefault(); nudgeRail("terminals", "github", -0.05); }
+                if (event.key === "ArrowDown") { event.preventDefault(); nudgeRail("terminals", "github", 0.05); }
+              }}
+            />
+          )}
+
           {/* GitHub panel — Issues, Pull Requests, Current Batch, OVERNIGHT-QUEUE.md */}
-          <div className={`flex flex-col overflow-hidden border-t border-border ${panels.github ? "min-h-[40vh] shrink-0 lg:min-h-0 lg:shrink lg:flex-1" : "shrink-0"}`}>
+          <div data-expanded={panels.github} className={`qw-rail-panel flex flex-col overflow-hidden border-t border-border ${panels.github ? "min-h-[40vh] shrink-0 lg:min-h-0 lg:shrink" : "shrink-0"}`} style={railPanelStyle("github")}>
             <PanelHeader
               label={t.githubLabel}
               collapse={{ expanded: panels.github, onToggle: () => togglePanel("github"), bodyId: bodyId("github"), hideLabel: t.hide, showLabel: t.show }}
@@ -373,8 +460,23 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
             </div>
           </div>
 
+          {panels.github && panels.operator && (
+            <div
+              role="separator"
+              aria-label="Resize GitHub and operator features panels"
+              aria-orientation="horizontal"
+              tabIndex={0}
+              className="hidden lg:block shrink-0 h-1 bg-border cursor-row-resize hover:bg-accent-dim focus-visible:bg-accent-dim focus-visible:outline-none"
+              onMouseDown={startRailDrag("github", "operator")}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowUp") { event.preventDefault(); nudgeRail("github", "operator", -0.05); }
+                if (event.key === "ArrowDown") { event.preventDefault(); nudgeRail("github", "operator", 0.05); }
+              }}
+            />
+          )}
+
           {/* Operator Features */}
-          <div className={`flex flex-col overflow-hidden border-t border-border ${panels.operator ? "lg:flex-1 lg:min-h-0" : "shrink-0"}`}>
+          <div data-expanded={panels.operator} className={`qw-rail-panel flex flex-col overflow-hidden border-t border-border ${panels.operator ? "lg:min-h-0" : "shrink-0"}`} style={railPanelStyle("operator")}>
             <OperatorFeaturesPanel
               projectId={projectId}
               idle={idle}
