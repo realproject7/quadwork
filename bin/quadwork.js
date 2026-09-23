@@ -491,10 +491,10 @@ function satisfiesMinimumNodeVersion(raw, minimum = MINIMUM_NODE_VERSION) {
 const NODE_PTY_FIX = [
   "node-pty is unusable. Fix:",
   "  1. If install scripts were skipped, reinstall with them explicitly allowed:",
-  "       npm install -g quadwork@latest --allow-scripts=node-pty",
+  "       npm install -g quadwork@latest --allow-scripts=node-pty --ignore-scripts=false",
   "  2. If that still fails, the platform may be unsupported. Supported:",
-  "       macOS (arm64, x64), Linux glibc (x64, arm64). See docs/troubleshooting.md",
-  "       under \"node-pty install-scripts warning\".",
+  "       macOS arm64, Linux glibc (x64, arm64). macOS x64 is unverified.",
+  "       See docs/troubleshooting.md under \"node-pty install-scripts warning\".",
 ].join("\n");
 
 function loadNodePty() {

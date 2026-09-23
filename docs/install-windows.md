@@ -133,7 +133,7 @@ npm list -g quadwork
 > without a global install via `npx quadwork@latest init` / `npx quadwork@latest start`.
 
 The install may also print a warning that `node-pty`'s install scripts are
-"not yet covered by allowScripts." This is advisory. npm still runs the
+"not yet covered by allowScripts". This is advisory. npm still runs the
 scripts by default; it is only telling you that you have not explicitly
 reviewed them. WSL2's Ubuntu is glibc Linux, and on glibc Linux (x64 or
 arm64) this needs no action: node-pty's bundled prebuild loads and a PTY
@@ -141,7 +141,7 @@ spawns fine, whether the scripts run (the default) or are skipped (verified
 both ways). If `quadwork start` or `quadwork doctor` then reports `node-pty
 is unusable`, run:
 ```bash
-npm install -g quadwork@latest --allow-scripts=node-pty
+npm install -g quadwork@latest --allow-scripts=node-pty --ignore-scripts=false
 ```
 See [Troubleshooting: node-pty install-scripts warning](troubleshooting.md#node-pty-install-scripts-warning) for the full explanation and platform table.
 

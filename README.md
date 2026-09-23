@@ -111,7 +111,7 @@ npx quadwork init
 > distro (Ubuntu, Debian) or macOS.
 
 > **`node-pty` install-scripts warning?** The install may print a warning
-> that `node-pty`'s install scripts are "not yet covered by allowScripts."
+> that `node-pty`'s install scripts are "not yet covered by allowScripts".
 > This is advisory; npm still runs the scripts by default. On every
 > supported platform we've verified (macOS arm64, Linux x64, Linux arm64),
 > no action is needed either way. The bundled prebuild loads whether the

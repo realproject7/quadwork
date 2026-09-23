@@ -139,7 +139,7 @@ async function runLoadFailureAndRealChecks() {
     assert.deepEqual(result, { ok: true }, "the real node-pty in this worktree loads and spawns a PTY");
   }
 
-  assert.match(NODE_PTY_FIX, /npm install -g quadwork@latest --allow-scripts=node-pty/, "the fix names the exact remedy command");
+  assert.match(NODE_PTY_FIX, /npm install -g quadwork@latest --allow-scripts=node-pty --ignore-scripts=false/, "the fix names the exact remedy command, including the .npmrc ignore-scripts override");
   assert.match(NODE_PTY_FIX, /docs\/troubleshooting\.md/, "the fix points at the documented section");
 
   console.log("  PASS: checkNodePty load-failure short-circuit, spawn-failure passthrough, and the real worktree node-pty");

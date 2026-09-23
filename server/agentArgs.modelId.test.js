@@ -204,6 +204,18 @@ async function main() {
       ok(r3.status === 200 && readCfg().projects.length === 1 && readCfg().projects[0].agents.dev.model === "claude-opus-5-5",
         "AC3: PUT with only well-formed models is written");
     }
+
+    // ── #1177: POST /api/setup persists body.agents, so it rejects invalid ids too ──
+    {
+      const before = JSON.stringify(readCfg());
+      for (const step of ["verify-repositories", "activate-v2"]) {
+        const r = await req(server, { method: "POST", urlPath: `/api/setup?step=${step}`,
+          body: { id: "p9", agents: { head: { command: "codex", model: "" }, dev: { command: "claude", model: 'bad"id' } } } });
+        ok(r.status === 400 && r.body.ok === false && r.body.error === "Invalid model id for p9/dev",
+          `#1177: POST /api/setup?step=${step} rejects an invalid agent model (400, names the agent)`);
+      }
+      ok(JSON.stringify(readCfg()) === before, "#1177: a rejected setup request writes nothing");
+    }
   } finally {
     server.close();
   }
