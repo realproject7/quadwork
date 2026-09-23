@@ -163,6 +163,18 @@ is never opened to the public network directly. Remote access is added later
 (see [Remote Access](#remote-access)) via an SSH tunnel or an authenticated
 reverse proxy.
 
+### `node-pty` install-scripts warning
+
+The install may print a warning that npm skipped install scripts for
+`node-pty`. On glibc Linux (x64 or arm64 — an Ubuntu/Debian VPS is glibc) this
+needs no action: node-pty's bundled prebuild loads and a PTY spawns fine with
+the scripts skipped (verified). If `quadwork start` or `quadwork doctor` then
+reports `node-pty is unusable`, run:
+```bash
+npm install -g quadwork@latest --allow-scripts=node-pty
+```
+See [Troubleshooting: node-pty install-scripts warning](troubleshooting.md#node-pty-install-scripts-warning) for the full explanation and platform table.
+
 ---
 
 ## Step 8: Process Management with pm2

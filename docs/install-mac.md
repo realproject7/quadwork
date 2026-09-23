@@ -97,6 +97,19 @@ npm list -g quadwork
 # You should see the installed version, e.g. quadwork@2.7.0
 ```
 
+### `node-pty` install-scripts warning
+
+The install may print a warning that npm skipped install scripts for
+`node-pty`. On **Apple Silicon (arm64)** this needs no action — node-pty's
+bundled prebuild loads and a PTY spawns fine with the scripts skipped
+(verified). On **Intel Macs (x64)** this has not been verified either way; if
+`quadwork start` or `quadwork doctor` then reports `node-pty is unusable`,
+run:
+```bash
+npm install -g quadwork@latest --allow-scripts=node-pty
+```
+See [Troubleshooting: node-pty install-scripts warning](troubleshooting.md#node-pty-install-scripts-warning) for the full explanation and platform table.
+
 ### Troubleshooting: `EACCES: permission denied`
 
 If you see an error like:

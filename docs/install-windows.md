@@ -132,6 +132,16 @@ npm list -g quadwork
 > nvm-managed. Re-do the nvm step in Step 3 (recommended), or run QuadWork
 > without a global install via `npx quadwork@latest init` / `npx quadwork@latest start`.
 
+The install may also print a warning that npm skipped install scripts for
+`node-pty`. WSL2's Ubuntu is glibc Linux, and on glibc Linux (x64 or arm64)
+this needs no action: node-pty's bundled prebuild loads and a PTY spawns fine
+with the scripts skipped (verified). If `quadwork start` or `quadwork doctor`
+then reports `node-pty is unusable`, run:
+```bash
+npm install -g quadwork@latest --allow-scripts=node-pty
+```
+See [Troubleshooting: node-pty install-scripts warning](troubleshooting.md#node-pty-install-scripts-warning) for the full explanation and platform table.
+
 ---
 
 ## Step 6: Initialize & Start
