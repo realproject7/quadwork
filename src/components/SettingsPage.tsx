@@ -3,8 +3,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
-import { modelsForBackend, effectiveModel, sanitizeModel } from "@/lib/agentModels";
-import { injectModeForCommand } from "@/lib/injectMode";
+import { modelChoices, sanitizeModel, isValidModelId, CUSTOM_MODEL_VALUE, MODEL_FLAG_COPY, type DiscoveredModels } from "@/lib/agentModels";
+import { injectModeForCommand, cliBaseFromCommand } from "@/lib/injectMode";
 import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
@@ -337,6 +337,12 @@ const COPY = {
     retryCleanup: "Retry cleanup",
     newProject: "New Project",
     unsavedChanges: "Unsaved changes",
+    // #1172: model select — hand entry, stale-model flags, save rejection.
+    otherModel: "Other…",
+    ...MODEL_FLAG_COPY.en,
+    modelIdPlaceholder: "model id",
+    invalidModelIds: (agents: string) =>
+      `Not saved: invalid model id for ${agents}. Use letters, digits and . _ : / @ - (no spaces or quotes, not starting with -).`,
   },
   ko: {
     loading: "로딩 중...",
@@ -417,6 +423,11 @@ const COPY = {
     retryCleanup: "정리 다시 시도",
     newProject: "새 프로젝트",
     unsavedChanges: "저장되지 않은 변경사항",
+    otherModel: "직접 입력…",
+    ...MODEL_FLAG_COPY.ko,
+    modelIdPlaceholder: "모델 ID",
+    invalidModelIds: (agents: string) =>
+      `저장되지 않음: ${agents}의 모델 ID가 잘못되었습니다. 영문, 숫자와 . _ : / @ - 만 사용할 수 있습니다 (공백·따옴표 불가, -로 시작 불가).`,
   },
 } as const;
 
@@ -546,6 +557,11 @@ export default function SettingsPage() {
   // still need a per-key flag, so we keep `expanded` but no longer
   // gate the project body on it — every project is open by default.
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // #1172: agent rows (`${project.id}-${agentId}`) showing the hand-entry model
+  // input, the CLI-discovered model lists, and a rejected-save message.
+  const [customModel, setCustomModel] = useState<Record<string, boolean>>({});
+  const [discoveredModels, setDiscoveredModels] = useState<DiscoveredModels>({});
+  const [saveError, setSaveError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [projectLifecyclePending, setProjectLifecyclePending] = useState<Record<string, "archive" | "restore" | "remove">>({});
   const [projectLifecycleErrors, setProjectLifecycleErrors] = useState<Record<string, string>>({});
@@ -627,6 +643,15 @@ export default function SettingsPage() {
     fetch("/api/cli-status")
       .then((r) => r.json())
       .then((status) => setCliStatus(status))
+      .catch(() => {});
+  }, []);
+
+  // #1172: models the installed CLIs offer, fetched once when Settings opens
+  // (the server bounds + caches discovery). On failure the shipped lists stay.
+  useEffect(() => {
+    fetch("/api/agent-model-catalog")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data?.models) setDiscoveredModels(data.models); })
       .catch(() => {});
   }, []);
 
@@ -765,17 +790,30 @@ export default function SettingsPage() {
 
   const save = async () => {
     if (!config) return;
+    // #1172: refuse to persist a model id outside MODEL_ID_PATTERN (the PUT
+    // route and the spawn path refuse it too) instead of rewriting it.
+    const invalidModels = config.projects.flatMap((p) =>
+      Object.entries(p.agents || {})
+        .filter(([, a]) => {
+          const model = sanitizeModel(cliBaseFromCommand(a.command), a.model, discoveredModels);
+          return model !== "" && !isValidModelId(model);
+        })
+        .map(([id]) => `${p.name || p.id}/${id}`));
+    if (invalidModels.length > 0) {
+      setSaveError(t.invalidModelIds(invalidModels.join(", ")));
+      return;
+    }
+    setSaveError("");
     setSaving(true);
     try {
       // #212: Telegram credentials are now configured per-project from
       // the Telegram Bridge widget in the Operator Features panel (#211), which writes
       // its own env-references via /api/telegram?action=save-config.
       // The Settings save path no longer needs to migrate bot tokens.
-      // #931: normalize every per-agent model to one valid for its command
-      // before persisting. This is the catch-all the AC requires ("Saving
-      // persists a model valid for that agent's CLI") — it heals a model left
-      // invalid by the old hardcoded dropdown (e.g. a codex agent saved with
-      // "sonnet"). sanitizeModel keeps "" (CLI default) as-is.
+      // #931/#1172: normalize every per-agent model before persisting with the
+      // #1172 heal rule: a model known only for a different backend (e.g. a
+      // codex agent left on "sonnet") heals to "" (CLI default); "" stays "";
+      // any other model is kept as-is, never silently rewritten.
       // #937: reconcile mcp_inject the same way. Every agent carries one (the
       // wizard writes it and the spawn path reads it), so always re-derive it
       // from the command — this heals a stale "flag" left on an agent converted
@@ -787,7 +825,7 @@ export default function SettingsPage() {
           for (const [id, a] of Object.entries(p.agents)) {
             agents[id] = {
               ...a,
-              model: sanitizeModel(a.command || "claude", a.model),
+              model: sanitizeModel(cliBaseFromCommand(a.command), a.model, discoveredModels),
               mcp_inject: injectModeForCommand(a.command || "claude"),
             };
           }
@@ -815,13 +853,18 @@ export default function SettingsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patchBody),
       });
-      if (!res.ok) throw new Error(`${res.status}`);
+      if (!res.ok) {
+        // #1172: surface the server's rejection (e.g. an invalid model id).
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Save failed (${res.status})`);
+      }
       setConfig(normalizedConfig);
       savedConfigRef.current = JSON.stringify(normalizedConfig);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       console.error(err);
+      setSaveError((err as Error).message);
     }
     setSaving(false);
   };
@@ -1225,13 +1268,16 @@ export default function SettingsPage() {
     <div className="h-full w-full overflow-y-auto p-6">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-lg font-semibold text-text tracking-tight">{t.title}</h1>
-        <button
-          onClick={save}
-          disabled={saving}
-          className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
-        >
-          {saving ? t.saving : saved ? t.saved : t.save}
-        </button>
+        <div className="flex items-center gap-3">
+          {saveError && <span role="alert" className="text-[11px] text-error max-w-[480px]">{saveError}</span>}
+          <button
+            onClick={save}
+            disabled={saving}
+            className="px-4 py-1.5 bg-accent text-bg text-[12px] font-semibold hover:bg-accent-dim transition-colors disabled:opacity-50"
+          >
+            {saving ? t.saving : saved ? t.saved : t.save}
+          </button>
+        </div>
       </div>
 
       {/* #405 / quadwork#278: operator identity — name shown next to
@@ -1713,16 +1759,17 @@ export default function SettingsPage() {
                             <select
                               value={agent.command || "claude"}
                               onChange={(e) => {
-                                // #931: changing the command must reset the model to one
-                                // valid for the new backend — otherwise a Claude model leaks onto a
-                                // codex/gemini agent and is saved/spawned as invalid.
+                                // #931/#1172: changing the command resets the model to the
+                                // CLI default ("") — never a pinned concrete model — so a
+                                // Claude model can't leak onto a codex/gemini agent.
                                 // #937: likewise reset mcp_inject to the new backend's
                                 // mode — otherwise converting to gemini leaves a stale
                                 // "flag" and the CLI crashes on launch (--mcp-config).
                                 const command = e.target.value;
+                                setCustomModel({ ...customModel, [`${project.id}-${agentId}`]: false });
                                 updateAgent(idx, agentId, {
                                   command,
-                                  model: effectiveModel(command, agent.model),
+                                  model: "",
                                   mcp_inject: injectModeForCommand(command),
                                 });
                               }}
@@ -1742,21 +1789,45 @@ export default function SettingsPage() {
                                 </option>
                               ))}
                             </select>
-                            <select
-                              // #931: provider-aware model options that track the agent's
-                              // command (codex/gemini/claude). effectiveModel shows the
-                              // saved model when valid, else the backend's first option —
-                              // so an unset model or a stale cross-backend value (e.g. a
-                              // codex agent left on "sonnet" by the old hardcoded list)
-                              // never renders blank or as the wrong model.
-                              value={effectiveModel(agent.command || "claude", agent.model)}
-                              onChange={(e) => updateAgent(idx, agentId, { model: e.target.value })}
-                              className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
-                            >
-                              {modelsForBackend(agent.command || "claude").map((m) => (
-                                <option key={m.value} value={m.value} className="bg-bg-surface">{m.label}</option>
-                              ))}
-                            </select>
+                            <div className="flex flex-col gap-0.5 min-w-0">
+                              <select
+                                // #931/#1172: provider-aware model options keyed by the
+                                // command basename: "(CLI default)", the CLI-discovered
+                                // list (else the shipped one), the saved model if it is
+                                // not listed (kept + flagged), and Other… for hand entry.
+                                // The value is the raw saved model — what the agent
+                                // actually runs — so an unset model shows as the CLI
+                                // default; a cross-backend leftover is flagged as healed
+                                // on save, exactly like the Agent Models modal.
+                                value={customModel[`${project.id}-${agentId}`]
+                                  ? CUSTOM_MODEL_VALUE
+                                  : agent.model || ""}
+                                onChange={(e) => {
+                                  const custom = e.target.value === CUSTOM_MODEL_VALUE;
+                                  setCustomModel({ ...customModel, [`${project.id}-${agentId}`]: custom });
+                                  if (!custom) updateAgent(idx, agentId, { model: e.target.value });
+                                }}
+                                className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
+                              >
+                                {modelChoices(cliBaseFromCommand(agent.command), agent.model, discoveredModels).map((m) => (
+                                  <option key={m.value} value={m.value} className="bg-bg-surface">
+                                    {m.label}
+                                    {m.flag ? ` ${t[m.flag]}` : ""}
+                                  </option>
+                                ))}
+                                <option value={CUSTOM_MODEL_VALUE} className="bg-bg-surface">{t.otherModel}</option>
+                              </select>
+                              {customModel[`${project.id}-${agentId}`] && (
+                                <input
+                                  autoFocus
+                                  value={agent.model || ""}
+                                  onChange={(e) => updateAgent(idx, agentId, { model: e.target.value.trim() })}
+                                  placeholder={t.modelIdPlaceholder}
+                                  aria-invalid={!!agent.model && !isValidModelId(agent.model)}
+                                  className="bg-transparent text-[11px] font-mono text-text outline-none border border-border px-1 py-0.5 focus:border-accent aria-[invalid=true]:border-error"
+                                />
+                              )}
+                            </div>
                             <input
                               value={agent.cwd || ""}
                               onChange={(e) => updateAgent(idx, agentId, { cwd: e.target.value })}
@@ -1942,7 +2013,7 @@ export default function SettingsPage() {
       {/* Sticky save bar */}
       {isDirty && (
         <div className="fixed bottom-0 left-0 right-0 border-t border-border bg-bg-surface px-6 py-3 flex items-center justify-between z-50">
-          <span className="text-[12px] text-text-muted">{t.unsavedChanges}</span>
+          <span className={`text-[12px] ${saveError ? "text-error" : "text-text-muted"}`}>{saveError || t.unsavedChanges}</span>
           <button
             onClick={save}
             disabled={saving}

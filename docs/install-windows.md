@@ -162,12 +162,12 @@ browser. Create your first project from the dashboard at
 `init`:
 
 - **Name / Repo (`owner/repo`) / Working directory** (absolute path to your repo clone).
-- **Agent backends & models** — in the **Agent Models** step, choose a CLI
-  backend (**Claude Code**, **Codex**, or **Gemini CLI**) for each of the four
-  roles (Head, Dev, RE1, RE2), and optionally pick a specific model per role
-  (e.g. `opus` / `sonnet` for Claude, `gpt-5.4` / `gpt-5.6-*` for Codex,
-  `gemini-2.5-pro` / `gemini-2.5-flash` for Gemini). Leave a role on
-  **(CLI default)** to use the backend's own default model.
+- **Agent backends:** in the **Agent Models** step, choose a CLI backend
+  (**Claude Code**, **Codex**, **Gemini CLI** or **Grok CLI**) for each of the four
+  roles (Head, Dev, RE1, RE2). Each role starts on the CLI's own default
+  model. To pin a model later, use **Settings** or the **Agent Models** panel.
+  They list the models your installed CLI offers, and you can also type any
+  other model id.
 
 QuadWork then creates a git worktree for each agent next to your repo
 (`project-head/`, `project-dev/`, `project-re1/`, `project-re2/`) and seeds

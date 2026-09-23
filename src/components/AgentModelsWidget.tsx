@@ -22,7 +22,7 @@
 import { useCallback, useEffect, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
-import { optionsForBackend } from "@/lib/agentModels";
+import { modelChoices, isValidModelId, CUSTOM_MODEL_VALUE, MODEL_FLAG_COPY, type DiscoveredModels } from "@/lib/agentModels";
 
 const COPY = {
   en: {
@@ -32,12 +32,17 @@ const COPY = {
     restartRequired: "restart required",
     restartRequiredTooltip: "Config changed — running session is still on the old model/effort. Click Restart to apply.",
     default: "(default)",
-    custom: "(custom)",
+    // #1172: stale-model flags + hand-entered model id.
+    ...MODEL_FLAG_COPY.en,
+    other: "Other…",
+    customPlaceholder: "model id",
+    set: "Set",
+    invalidModelError: "Invalid model id",
     restart: "Restart",
     restartTooltip: "Restart this agent to pick up the new model / reasoning setting",
     help: (
       <>
-        Codex reasoning effort defaults to <code className="text-text">medium</code> for new projects. Blank model falls back to the CLI default. Click Restart to apply changes to a live session.
+        Codex reasoning effort defaults to <code className="text-text">medium</code> for new projects. Blank model falls back to the CLI default. Choose Other… to enter any model id. Click Restart to apply changes to a live session.
       </>
     ),
     summary: (id: string, backend: string) => (
@@ -60,12 +65,16 @@ const COPY = {
     restartRequired: "재시작 필요",
     restartRequiredTooltip: "설정이 변경되었습니다. 실행 중인 세션에는 이전 설정이 적용되어 있습니다. 재시작을 클릭하여 적용하세요.",
     default: "(기본값)",
-    custom: "(사용자 정의)",
+    ...MODEL_FLAG_COPY.ko,
+    other: "직접 입력…",
+    customPlaceholder: "모델 ID",
+    set: "적용",
+    invalidModelError: "잘못된 모델 ID",
     restart: "재시작",
     restartTooltip: "에이전트를 재시작하여 새로운 모델/추론 설정을 적용합니다",
     help: (
       <>
-        Codex 추론 수준은 새 프로젝트의 경우 <code className="text-text">medium</code>으로 기본 설정됩니다. 모델을 비워두면 CLI 기본값이 사용됩니다. 변경 사항을 적용하려면 재시작을 클릭하세요.
+        Codex 추론 수준은 새 프로젝트의 경우 <code className="text-text">medium</code>으로 기본 설정됩니다. 모델을 비워두면 CLI 기본값이 사용됩니다. 다른 모델 ID는 직접 입력…으로 지정하세요. 변경 사항을 적용하려면 재시작을 클릭하세요.
       </>
     ),
     summary: (id: string, backend: string) => (
@@ -98,9 +107,10 @@ interface AgentModelsWidgetProps {
 // No xhigh — explicitly excluded per #343 ("capacity-failure hot spot").
 const REASONING_LEVELS = ["minimal", "low", "medium", "high"] as const;
 
-// #931: the backend model catalog + `optionsForBackend` moved to the pure,
-// React-free `@/lib/agentModels` module so it can be shared with SettingsPage
-// and unit-tested under node. Imported above.
+// #931: the backend model catalog moved to the pure, React-free
+// `@/lib/agentModels` module so it can be shared with SettingsPage and
+// unit-tested under node. Imported above. #1172: both surfaces build their
+// rows with `modelChoices`, merging the CLI-discovered list.
 
 // #367: modal body — the full configuration UI from the original
 // AgentModelsWidget, unchanged except for being wrapped in a
@@ -121,6 +131,13 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
   // "needs restart" badge next to the agent id so it is visually
   // obvious which sessions are running stale config.
   const [needsRestart, setNeedsRestart] = useState<Set<string>>(new Set());
+  // #1172: models discovered from the installed CLIs (fetched once when the
+  // modal opens; the server bounds + caches discovery). Until it arrives, or
+  // if it fails, rows use the shipped list.
+  const [discovered, setDiscovered] = useState<DiscoveredModels>({});
+  // #1172: agent whose model is being entered by hand (Other…), + draft id.
+  const [customFor, setCustomFor] = useState<string | null>(null);
+  const [customDraft, setCustomDraft] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -136,6 +153,15 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
 
   useEffect(() => { load(); }, [load]);
 
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/agent-model-catalog")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (!cancelled && data?.models) setDiscovered(data.models); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
   // #367: Escape closes the modal, matching TelegramSetupModal.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -143,6 +169,7 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Resolves true when the server accepted the change.
   const update = async (agentId: string, patch: Partial<Pick<AgentRow, "model" | "reasoning_effort">>) => {
     setBusy(agentId);
     setError(null);
@@ -162,8 +189,10 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
         return next;
       });
       await load();
+      return true;
     } catch (e) {
       setError((e as Error).message);
+      return false;
     } finally {
       setBusy(null);
     }
@@ -235,25 +264,33 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
                   {t.restartRequired}
                 </span>
               )}
-              {/* #343: backend-specific model dropdown. Empty value
-                  = CLI default (no override). Options come from
-                  MODEL_OPTIONS[backend]; unknown backends fall
-                  back to just the "(CLI default)" entry. */}
+              {/* #343/#1172: backend-specific model dropdown. Empty
+                  value = CLI default (no override). Rows come from
+                  modelChoices: the CLI-discovered list (else the
+                  shipped one), plus a persisted model the CLI does not
+                  list, kept selectable and flagged so a hand-entered
+                  override never vanishes. Other… enters any id. */}
               <select
-                value={row.model}
+                value={customFor === row.agent_id ? CUSTOM_MODEL_VALUE : row.model}
                 disabled={busy === row.agent_id}
-                onChange={(e) => update(row.agent_id, { model: e.target.value })}
+                onChange={(e) => {
+                  if (e.target.value === CUSTOM_MODEL_VALUE) {
+                    setCustomFor(row.agent_id);
+                    setCustomDraft(row.model);
+                    return;
+                  }
+                  setCustomFor(null);
+                  update(row.agent_id, { model: e.target.value });
+                }}
                 className="flex-1 min-w-[140px] bg-transparent border border-border px-1 py-0.5 text-[11px] font-mono text-text outline-none focus:border-accent cursor-pointer disabled:opacity-50"
               >
-                {optionsForBackend(row.backend).map((opt) => (
-                  <option key={opt.value} value={opt.value} className="bg-bg-surface">{opt.label}</option>
+                {modelChoices(row.backend, row.model, discovered).map((opt) => (
+                  <option key={opt.value} value={opt.value} className="bg-bg-surface">
+                    {opt.label}
+                    {opt.flag ? ` ${t[opt.flag]}` : ""}
+                  </option>
                 ))}
-                {/* If the persisted model isn't in the known list
-                    (e.g. operator hand-edited config.json), keep
-                    it selectable so their override doesn't vanish. */}
-                {row.model && !optionsForBackend(row.backend).some((o) => o.value === row.model) && (
-                  <option value={row.model} className="bg-bg-surface">{row.model} {t.custom}</option>
-                )}
+                <option value={CUSTOM_MODEL_VALUE} className="bg-bg-surface">{t.other}</option>
               </select>
               {row.reasoning_supported ? (
                 <select
@@ -279,6 +316,38 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
               >
                 {busy === row.agent_id ? "…" : t.restart}
               </button>
+              {customFor === row.agent_id && (
+                <form
+                  className="flex items-center gap-1 basis-full pl-[7.5rem]"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const id = customDraft.trim();
+                    if (id && !isValidModelId(id)) {
+                      setError(t.invalidModelError);
+                      return;
+                    }
+                    // #1172: a rejected id keeps the input open with the typed
+                    // text; the server's error shows in the header.
+                    if (await update(row.agent_id, { model: id })) setCustomFor(null);
+                  }}
+                >
+                  <input
+                    autoFocus
+                    value={customDraft}
+                    onChange={(e) => setCustomDraft(e.target.value)}
+                    placeholder={t.customPlaceholder}
+                    aria-invalid={customDraft.trim() !== "" && !isValidModelId(customDraft.trim())}
+                    className="flex-1 min-w-[140px] bg-transparent border border-border px-1 py-0.5 text-[11px] font-mono text-text outline-none focus:border-accent aria-[invalid=true]:border-error"
+                  />
+                  <button
+                    type="submit"
+                    disabled={busy === row.agent_id}
+                    className="shrink-0 px-1.5 py-0.5 text-[10px] text-text-muted border border-border hover:text-accent hover:border-accent/40 disabled:opacity-50 transition-colors"
+                  >
+                    {t.set}
+                  </button>
+                </form>
+              )}
             </div>
           ))}
           <p className="mt-2 text-[10px] text-text-muted leading-snug">

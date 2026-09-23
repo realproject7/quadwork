@@ -37,7 +37,8 @@ const {
 } = require("./work-item-ref");
 const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence, deriveCiPolicyIdentity } = require("./ci-evidence-policy");
 const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
-const { injectModeForCommand } = require("../src/lib/injectMode.js");
+const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
+const { isValidModelId, invalidAgentModelRefs } = require("./agent-model-catalog");
 const { admissionMatchesContext } = require("./head-ticket-review-admission");
 
 const router = express.Router();
@@ -532,6 +533,11 @@ function preserveProjectEnvironmentSettings(existing, incoming) {
 }
 
 router.put("/api/config", (req, res) => {
+  // #1172: same model-id check as the PATCH below (every config write path).
+  const invalidModels = invalidAgentModelRefs(req.body && req.body.projects);
+  if (invalidModels.length > 0) {
+    return res.status(400).json({ ok: false, error: `Invalid model id for ${invalidModels.join(", ")}` });
+  }
   try {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
@@ -614,6 +620,12 @@ const CONFIG_MERGE_EXCLUDED = new Set([
 ]);
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
+  // #1172: the Settings save writes agent models through here — reject any
+  // non-empty model outside MODEL_ID_PATTERN, as the agent-models PUT does.
+  const invalidModels = invalidAgentModelRefs(body.projects);
+  if (invalidModels.length > 0) {
+    return res.status(400).json({ ok: false, error: `Invalid model id for ${invalidModels.join(", ")}` });
+  }
   try {
     const mutator = (cfg) => {
       const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
@@ -8167,8 +8179,9 @@ router.get("/api/project/:projectId/agent-models", (req, res) => {
     if (!project) return res.status(404).json({ error: "Unknown project" });
     const rows = ["head", "re1", "re2", "dev"].map((agentId) => {
       const a = project.agents?.[agentId] || {};
-      const command = a.command || "claude";
-      const cliBase = command.split("/").pop().split(" ")[0];
+      // #1172: backends are keyed by command basename, the same helper the
+      // Settings page and spawn defaults use.
+      const cliBase = cliBaseFromCommand(a.command);
       return {
         agent_id: agentId,
         backend: cliBase,
@@ -8194,6 +8207,12 @@ router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
   const reasoning = typeof body.reasoning_effort === "string" ? body.reasoning_effort.trim() : undefined;
   if (reasoning && reasoning !== "" && !ALLOWED_REASONING_EFFORTS.has(reasoning)) {
     return res.json({ ok: false, error: `Invalid reasoning_effort: ${reasoning}` });
+  }
+  // #1172: a model id may be any CLI's (discovered or hand-entered), but it must
+  // match MODEL_ID_PATTERN — no quotes, whitespace or leading "-" — so it can't
+  // break Codex's `-c model="…"` quoting or be read as a flag at spawn.
+  if (model && !isValidModelId(model)) {
+    return res.json({ ok: false, error: `Invalid model id: ${JSON.stringify(model)}` });
   }
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");

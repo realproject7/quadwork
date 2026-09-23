@@ -167,12 +167,12 @@ doesn't, open it yourself to reach the web UI.
    - **Name:** Your project name
    - **Repo:** GitHub repo in `owner/repo` format
    - **Working directory:** Absolute path to the repo clone
-   - **Agent backends & models:** In the **Agent Models** step, pick a CLI
-     backend — **Claude Code**, **Codex**, or **Gemini CLI** — for each of the
-     four roles (Head, Dev, RE1, RE2), and optionally select a specific model
-     per role (e.g. `opus` / `sonnet` for Claude, `gpt-5.4` / `gpt-5.6-*` for
-     Codex, `gemini-2.5-pro` / `gemini-2.5-flash` for Gemini). Leave a role on
-     **(CLI default)** to use the backend's own default model.
+   - **Agent backends:** In the **Agent Models** step, pick a CLI backend
+     (**Claude Code**, **Codex**, **Gemini CLI** or **Grok CLI**) for each of the
+     four roles (Head, Dev, RE1, RE2). Each role starts on the CLI's own
+     default model. To pin a model later, use **Settings** or the **Agent
+     Models** panel. They list the models your installed CLI offers, and you
+     can also type any other model id.
 4. Click **Create**
 
 QuadWork will:
