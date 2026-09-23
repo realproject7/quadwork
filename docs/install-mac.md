@@ -100,7 +100,7 @@ npm list -g quadwork
 ### `node-pty` install-scripts warning
 
 The install may print a warning that npm skipped install scripts for
-`node-pty`. On **Apple Silicon (arm64)** this needs no action — node-pty's
+`node-pty`. On **Apple Silicon (arm64)** this needs no action. node-pty's
 bundled prebuild loads and a PTY spawns fine with the scripts skipped
 (verified). On **Intel Macs (x64)** this has not been verified either way; if
 `quadwork start` or `quadwork doctor` then reports `node-pty is unusable`,

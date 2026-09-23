@@ -489,7 +489,7 @@ const NODE_PTY_FIX = [
   "  1. Reinstall with its scripts allowed:",
   "       npm install -g quadwork@latest --allow-scripts=node-pty",
   "  2. If that still fails, the platform may be unsupported. Supported:",
-  "       macOS (arm64, x64), Linux glibc (x64, arm64) — see docs/troubleshooting.md",
+  "       macOS (arm64, x64), Linux glibc (x64, arm64). See docs/troubleshooting.md",
   "       under \"node-pty install-scripts warning\".",
 ].join("\n");
 

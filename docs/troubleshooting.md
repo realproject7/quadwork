@@ -19,18 +19,18 @@ npm warn install-scripts Run `npm install -g --allow-scripts=node-pty` to allow 
 
 npm skips `node-pty`'s `install` and `postinstall` scripts unless you've explicitly approved them for that package.
 
-**Cause:** Those scripts build node-pty's native addon from source (`node-gyp rebuild`) when the platform has no bundled prebuilt binary. node-pty ships prebuilt binaries for QuadWork's supported platforms, so on a supported platform the skipped scripts don't matter — the bundled prebuild loads and a PTY spawns without ever running `install` or `postinstall`.
+**Cause:** Those scripts build node-pty's native addon from source (`node-gyp rebuild`) when the platform has no bundled prebuilt binary. node-pty ships prebuilt binaries for QuadWork's supported platforms, so on a supported platform the skipped scripts don't matter, the bundled prebuild loads and a PTY spawns without ever running `install` or `postinstall`.
 
 **Fix:** Whether you need to do anything depends on your platform. This was checked by installing `quadwork@2.8.0` with npm's default allow-scripts behavior (scripts skipped) and confirming `node-pty` still loads and spawns a PTY:
 
 | Platform | Approving scripts needed? | node-pty version checked | How it was checked |
 |---|---|---|---|
-| macOS arm64 | No — bundled prebuild loads | 1.2.0-beta.15 | Verified on real hardware (2026-09-23) |
-| macOS x64 | Unverified — no action confirmed either way | — | Not checked; no x64 Mac available |
-| Linux x64, glibc (covers a VPS) | No — bundled prebuild loads | 1.2.0-beta.15 | Verified in a `node:24-bookworm` Docker container, `--platform linux/amd64` (QEMU emulation) |
-| Linux arm64, glibc (also what a VPS or Windows/WSL2 on an ARM host uses) | No — bundled prebuild loads | 1.2.0-beta.15 | Verified in a `node:24-bookworm` Docker container, native arm64 |
+| macOS arm64 | No, the bundled prebuild loads | 1.2.0-beta.15 | Verified on real hardware (2026-09-23) |
+| macOS x64 | Unverified, not confirmed either way | n/a | Not checked; no x64 Mac available |
+| Linux x64, glibc (covers a VPS) | No, the bundled prebuild loads | 1.2.0-beta.15 | Verified in a `node:24-bookworm` Docker container, `--platform linux/amd64` (QEMU emulation) |
+| Linux arm64, glibc (also what a VPS or Windows/WSL2 on an ARM host uses) | No, the bundled prebuild loads | 1.2.0-beta.15 | Verified in a `node:24-bookworm` Docker container, native arm64 |
 
-musl (e.g. Alpine) is already out of scope — see [README.md](../README.md) — and native Windows is unsupported; see [docs/install-windows.md](install-windows.md).
+musl (e.g. Alpine) is already out of scope (see [README.md](../README.md)), and native Windows is unsupported; see [docs/install-windows.md](install-windows.md).
 
 If **`quadwork start` or `quadwork doctor` reports `node-pty is unusable`**, the warning does need action on your host. Run:
 
@@ -38,7 +38,7 @@ If **`quadwork start` or `quadwork doctor` reports `node-pty is unusable`**, the
 npm install -g quadwork@latest --allow-scripts=node-pty
 ```
 
-If it still fails after that, node-pty has no prebuild for your platform and would need to build from source (a C++ toolchain and `node-gyp`, not something QuadWork sets up for you) — treat this as an unsupported platform rather than debugging the build.
+If it still fails after that, node-pty has no prebuild for your platform and would need to build from source (a C++ toolchain and `node-gyp`, not something QuadWork sets up for you), treat this as an unsupported platform rather than debugging the build.
 
 ---
 
