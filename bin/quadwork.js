@@ -471,6 +471,81 @@ function satisfiesMinimumNodeVersion(raw, minimum = MINIMUM_NODE_VERSION) {
   return true;
 }
 
+// #1173: node-pty is required at the top of server/index.js and
+// server/resource-linux-launcher.js. Left unchecked, a broken load or a PTY
+// that can't spawn only surfaces as a raw throw deep in that require chain,
+// after `start` had already scheduled the browser-open timer. This check
+// runs before that require and before the timer is scheduled, so the
+// operator gets one instruction instead of a stack trace. `doctor` calls the
+// same check to report, not to exit.
+//
+// npm's "install scripts not yet covered by allowScripts" warning is
+// advisory: npm still runs the scripts by default (see `npm help
+// approve-scripts`), it is only flagging that they were not explicitly
+// reviewed. It is not evidence of a real problem. On every platform verified
+// for #1173 (macOS arm64, Linux x64, Linux arm64), node-pty's bundled
+// prebuild loads and a PTY spawns fine whether the scripts run (the
+// default) or are skipped (`--ignore-scripts`). So a load or spawn failure
+// here means the host genuinely cannot run node-pty, not that scripts need
+// approving.
+const NODE_PTY_FIX = [
+  "node-pty is unusable. Fix:",
+  "  1. If install scripts were skipped, reinstall with them explicitly allowed:",
+  "       npm install -g quadwork@latest --allow-scripts=node-pty",
+  "  2. If that still fails, the platform may be unsupported. Supported:",
+  "       macOS (arm64, x64), Linux glibc (x64, arm64). See docs/troubleshooting.md",
+  "       under \"node-pty install-scripts warning\".",
+].join("\n");
+
+function loadNodePty() {
+  return require("node-pty");
+}
+
+// Spawns a trivial, self-exiting process through the given pty module and
+// resolves once it exits (or the timeout fires). Takes `pty` as a parameter
+// rather than requiring it itself so a load failure and a spawn failure stay
+// two separate, separately testable steps. Native Windows is unsupported
+// (see docs/install-windows.md), so this only spawns the Unix shape.
+function spawnPtyProbe(pty, { timeoutMs = 5000 } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    try {
+      const proc = pty.spawn("/bin/echo", ["ok"], { name: "xterm-color", cols: 80, rows: 24 });
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+        settle({ ok: false, code: "node_pty_spawn_timeout", message: `PTY spawn did not exit within ${timeoutMs}ms` });
+      }, timeoutMs);
+      proc.onExit(({ exitCode }) => {
+        clearTimeout(timer);
+        if (exitCode === 0) settle({ ok: true });
+        else settle({ ok: false, code: "node_pty_spawn_nonzero_exit", message: `PTY spawn exited with code ${exitCode}` });
+      });
+    } catch (error) {
+      settle({ ok: false, code: "node_pty_spawn_threw", message: error.message });
+    }
+  });
+}
+
+// Returns { ok: true } or { ok: false, code, message }. `loadPty` and
+// `spawnProbe` are injectable so tests can exercise the load-failure and
+// spawn-failure branches without needing a genuinely broken host.
+async function checkNodePty({ loadPty = loadNodePty, spawnProbe = spawnPtyProbe, timeoutMs = 5000 } = {}) {
+  let pty;
+  try {
+    pty = loadPty();
+  } catch (error) {
+    return { ok: false, code: "node_pty_load_failed", message: error.message };
+  }
+  const spawnResult = await spawnProbe(pty, { timeoutMs });
+  if (!spawnResult.ok) return { ok: false, code: spawnResult.code, message: spawnResult.message };
+  return { ok: true };
+}
+
 async function checkPrereqs(rl) {
   header("Step 1: Prerequisites");
   const platform = detectPlatform();
@@ -1238,6 +1313,17 @@ async function cmdStart() {
     process.exit(1);
   }
 
+  // #1173: verify node-pty loads and can spawn a PTY before the server
+  // (which requires node-pty at its top) is loaded, and before the
+  // browser-open timer below is even scheduled.
+  const ptyCheck = await checkNodePty();
+  if (!ptyCheck.ok) {
+    fail(`node-pty is unusable [${ptyCheck.code}]: ${ptyCheck.message}`);
+    console.error(NODE_PTY_FIX);
+    process.exit(1);
+  }
+  ok("node-pty loads and can spawn a PTY.");
+
   // Open dashboard in browser after a short delay
   const dashboardUrl = `http://127.0.0.1:${port}`;
   setTimeout(() => {
@@ -1697,6 +1783,24 @@ function cmdDoctor() {
     console.log(`  (could not enumerate projects: ${err.message})`);
   }
   console.log("");
+
+  // #1173: same node-pty load/spawn check `start` runs, reported here
+  // instead of exiting so the rest of the doctor report still prints.
+  // Chained rather than `await`ed so `cmdDoctor` stays a plain (non-async)
+  // function declaration — an `async` modifier here would shift every
+  // later AST node's position within this function, including the
+  // pre-#1173 `p.working_dir` read the scalar-access ledger in
+  // server/projectScalarAccess.test.js pins by AST ordinal.
+  return checkNodePty().then((ptyCheck) => {
+    if (ptyCheck.ok) {
+      ok("node-pty loads and can spawn a PTY.");
+    } else {
+      fail(`node-pty is unusable [${ptyCheck.code}]: ${ptyCheck.message}`);
+      console.error(NODE_PTY_FIX);
+      process.exitCode = 1;
+    }
+    console.log("");
+  });
 }
 
 // ─── Migrate Agent Slugs ────────────────────────────────────────────────────
@@ -1956,4 +2060,8 @@ module.exports = {
   writeHeadPoPlaybook,
   installedAgentCliBackends,
   validateInstalledBackendChoice,
+  checkNodePty,
+  spawnPtyProbe,
+  loadNodePty,
+  NODE_PTY_FIX,
 };
