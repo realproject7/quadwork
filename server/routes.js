@@ -615,6 +615,15 @@ const CONFIG_MERGE_EXCLUDED = new Set([
 ]);
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
+  // #1172: the Settings save writes agent models through here — reject any
+  // non-empty model outside MODEL_ID_PATTERN, as the agent-models PUT does.
+  const invalidModels = (Array.isArray(body.projects) ? body.projects : []).flatMap((project) =>
+    Object.entries((project && project.agents) || {})
+      .filter(([, agent]) => agent && agent.model !== undefined && agent.model !== null && agent.model !== "" && !isValidModelId(agent.model))
+      .map(([agentId]) => `${project.id}/${agentId}`));
+  if (invalidModels.length > 0) {
+    return res.status(400).json({ ok: false, error: `Invalid model id for ${invalidModels.join(", ")}` });
+  }
   try {
     const mutator = (cfg) => {
       const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");

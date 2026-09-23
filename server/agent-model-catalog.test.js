@@ -9,6 +9,7 @@ const fs = require("fs");
 const path = require("path");
 const {
   parseCodexModels,
+  parseGrokModels,
   discoverAgentModels,
   createModelCatalogCache,
   DISCOVERY_SOURCES,
@@ -39,6 +40,9 @@ const CODEX_FIXTURE = JSON.stringify({
   ],
 });
 
+// Exact `grok models` stdout (grok 0.2.118, not logged in; exit 0, empty stderr).
+const GROK_UNAUTHENTICATED = "You are not authenticated.\n\nDefault model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n";
+
 // A source that runs `node -e <script>` and parses stdout like codex's does.
 const nodeSource = (script) => ({ command: process.execPath, args: ["-e", script], parse: parseCodexModels });
 const printFixture = `process.stdout.write(${JSON.stringify(CODEX_FIXTURE)})`;
@@ -54,8 +58,30 @@ async function main() {
   // ── the production source is keyed by command basename and read-only ──
   ok(DISCOVERY_SOURCES.codex.command === "codex" && DISCOVERY_SOURCES.codex.args.join(" ") === "debug models",
     "codex discovery runs `codex debug models`");
-  ok(Object.keys(DISCOVERY_SOURCES).join(",") === "codex",
-    "only codex has a discovery source; claude/gemini/grok use the shipped list");
+  ok(DISCOVERY_SOURCES.grok.command === "grok" && DISCOVERY_SOURCES.grok.args.join(" ") === "models",
+    "grok discovery runs `grok models`");
+  ok(Object.keys(DISCOVERY_SOURCES).sort().join(",") === "codex,grok",
+    "only codex and grok have a discovery source; claude/gemini use the shipped list");
+
+  // ── grok parser: the "* <id>" rows under "Available models:" ──
+  ok(parseGrokModels(GROK_UNAUTHENTICATED).join(",") === "grok-4.5",
+    "parseGrokModels reads grok 0.2.118's unauthenticated output (grok-4.5, '(default)' suffix stripped)");
+  ok(parseGrokModels("Default model: grok-5\n\nAvailable models:\n  * grok-5 (default)\n  * grok-5-mini\n  * grok-4.5\n").join(",") === "grok-5,grok-5-mini,grok-4.5",
+    "parseGrokModels lists every row, default or not");
+  ok(parseGrokModels("Available models:\r\n  * grok-5 (default)\r\n").join(",") === "grok-5", "parseGrokModels accepts CRLF output");
+  ok(parseGrokModels('Available models:\n  * grok"x\n  * -flag\n  * grok-5\n').join(",") === "grok-5",
+    "parseGrokModels drops ids outside MODEL_ID_PATTERN");
+  ok(parseGrokModels("Available models:\n  * grok-5\n\nTip: run grok --help\n").join(",") === "grok-5",
+    "parseGrokModels stops at the blank line ending the list");
+  for (const [label, out] of [
+    ["no 'Available models:' header", "Default model: grok-4.5\n"],
+    ["a row of another shape", "Available models:\n  - grok-4.5\n"],
+    ["a table row", "Available models:\n  grok-4.5   default   256k\n"],
+  ]) {
+    let failedParse = false;
+    try { parseGrokModels(out); } catch { failedParse = true; }
+    ok(failedParse, `parseGrokModels throws on a changed format (${label})`);
+  }
   ok(DISCOVERY_TIMEOUT_MS > 0 && DISCOVERY_TIMEOUT_MS <= 10000, "discovery has a bounded timeout");
 
   // ── AC1: a discovered model is returned ──
@@ -63,6 +89,23 @@ async function main() {
     const r = await discoverAgentModels({ sources: { codex: nodeSource(printFixture) } });
     ok(r.models.codex && r.models.codex.join(",") === "gpt-7-nova,gpt-6-astra", "AC1: discovered models are returned per backend");
     ok(Object.keys(r.errors).length === 0, "a successful discovery reports no error");
+  }
+  {
+    const grokSource = (script) => ({ ...nodeSource(script), parse: parseGrokModels });
+    const r = await discoverAgentModels({ sources: {
+      grok: grokSource(`process.stdout.write(${JSON.stringify(GROK_UNAUTHENTICATED)})`),
+    } });
+    ok(r.models.grok && r.models.grok.join(",") === "grok-4.5", "AC1: grok models discovered through a child process");
+    for (const [label, script] of [
+      ["changed format", 'process.stdout.write("Models: grok-4.5\\n")'],
+      ["empty list", 'process.stdout.write("Available models:\\n")'],
+      ["non-zero exit", "process.exit(2)"],
+    ]) {
+      const f = await discoverAgentModels({ sources: { grok: grokSource(script) } });
+      ok(!("grok" in f.models) && typeof f.errors.grok === "string", `AC8: grok ${label} → shipped list (${f.errors.grok})`);
+    }
+    const t = await discoverAgentModels({ sources: { grok: grokSource("setTimeout(() => {}, 30000)") }, timeoutMs: 300 });
+    ok(!("grok" in t.models) && /timed out/.test(t.errors.grok || ""), "AC8: a hung `grok models` times out → shipped list");
   }
 
   // ── AC8: every failure drops the backend (→ shipped list) and never throws ──

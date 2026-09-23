@@ -7,10 +7,10 @@
 // all) — valid for every CLI, and what a new or unset agent runs on.
 //
 // #1172: the lists below are only the SHIPPED FALLBACK. When a CLI has its own
-// discovery source (today: `codex debug models`, via GET
+// discovery source (today: `codex debug models` and `grok models`, via GET
 // /api/agent-model-catalog → server/agent-model-catalog.js) its discovered list
 // replaces the shipped one, so a new model is selectable without a QuadWork
-// release. Backends without a discovery source (claude, gemini, grok) use the
+// release. Backends without a discovery source (claude, gemini) use the
 // shipped list; any other id can be entered by hand in both surfaces.
 export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
   // #1172: refreshed from `codex debug models` (visibility "list", codex-cli
@@ -48,9 +48,8 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     { value: "gemini-2.5-pro", label: "gemini-2.5-pro" },
     { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
   ],
-  // #1023: xAI Grok Build CLI. `grok models` on an authenticated account lists
-  // exactly one model, which is also the CLI's default; there is no
-  // "latest"-style alias, so the "" row is the only auto-tracking mechanism.
+  // #1023: xAI Grok Build CLI. There is no "latest"-style alias. #1172: this
+  // row is the fallback; `grok models` discovery supplies the live list.
   grok: [
     { value: "", label: "(CLI default)" },
     { value: "grok-4.5", label: "grok-4.5" },

@@ -3,11 +3,12 @@
 // #1172: model ids through the real server — the agent-models PUT route, the
 // spawn path (buildAgentArgs) and GET /api/agent-model-catalog.
 //
-// A temp HOME holds the config, and a fake `codex` placed first on PATH stands
-// in for the provider CLI: it prints a `codex debug models`-shaped fixture and
-// appends to a marker file on every run, so the test can prove when discovery
-// ran (the catalog route) and when it did not (the spawn path). No real
-// provider CLI is started. QUADWORK_SKIP_LISTEN keeps the server port unbound;
+// A temp HOME holds the config, and a fake `codex` and `grok` placed first on
+// PATH stand in for the provider CLIs: each prints a `codex debug models` /
+// `grok models`-shaped fixture and appends to a marker file on every run, so
+// the test can prove when discovery ran (the catalog route) and when it did
+// not (the spawn path). No real provider CLI is started. The Settings save
+// path (PATCH /api/config) is driven through the same app. QUADWORK_SKIP_LISTEN keeps the server port unbound;
 // the app is mounted on an ephemeral port instead.
 
 const fs = require("fs");
@@ -29,11 +30,14 @@ if (SHIM) {
     { slug: "gpt-7-nova", visibility: "list" },
     { slug: "gpt-hidden", visibility: "hide" },
   ] });
-  fs.writeFileSync(path.join(FAKE_BIN, "codex"),
-    `#!${process.execPath}\n` +
-    `require("fs").appendFileSync(${JSON.stringify(MARKER)}, process.argv.slice(2).join(" ") + "\\n");\n` +
-    `process.stdout.write(${JSON.stringify(fixture)});\n`,
-    { mode: 0o755 });
+  const grokFixture = "You are not authenticated.\n\nDefault model: grok-5\n\nAvailable models:\n  * grok-5 (default)\n  * grok-4.5\n";
+  for (const [cli, out] of [["codex", fixture], ["grok", grokFixture]]) {
+    fs.writeFileSync(path.join(FAKE_BIN, cli),
+      `#!${process.execPath}\n` +
+      `require("fs").appendFileSync(${JSON.stringify(MARKER)}, ${JSON.stringify(cli + " ")} + process.argv.slice(2).join(" ") + "\\n");\n` +
+      `process.stdout.write(${JSON.stringify(out)});\n`,
+      { mode: 0o755 });
+  }
   process.env.PATH = `${FAKE_BIN}${path.delimiter}${process.env.PATH}`;
 }
 
@@ -58,6 +62,12 @@ fs.writeFileSync(CONFIG_PATH, JSON.stringify({
       gemini_quote: { command: "gemini", model: 'x"y' },
       grok_valid: { command: "grok", model: "grok-4.5" },
     },
+  }, {
+    // Settings-save (PATCH) fixture: only well-formed models.
+    id: "p2",
+    name: "p2",
+    working_dir: path.join(TMP_HOME, "p2"),
+    agents: { head: { command: "codex", model: "gpt-5.5" }, dev: { command: "claude" } },
   }],
 }));
 
@@ -135,22 +145,44 @@ async function main() {
       ok(row("re1").backend === "codex", "AC7: GET keys a path-qualified command by its basename (cliBaseFromCommand)");
     }
 
+    // ── AC3: the Settings save path (PATCH /api/config) rejects invalid ids ──
+    {
+      const p2 = () => readCfg().projects.find((p) => p.id === "p2");
+      const patchAgents = (agents) => req(server, { method: "PATCH", urlPath: "/api/config",
+        body: { projects: [{ id: "p2", name: "p2", agents }] } });
+      const before = JSON.stringify(readCfg());
+      for (const bad of ['gpt"5', "-rf", "gpt 5"]) {
+        const r = await patchAgents({ ...p2().agents, dev: { command: "claude", model: bad } });
+        ok(r.status === 400 && r.body.ok === false && r.body.error === "Invalid model id for p2/dev",
+          `AC3: PATCH /api/config rejects ${JSON.stringify(bad)} (400, names only the bad agent)`);
+      }
+      ok(JSON.stringify(readCfg()) === before, "AC3: a rejected PATCH writes nothing");
+      const r = await patchAgents({ head: { command: "codex", model: "" }, dev: { command: "claude", model: "claude-opus-5-5" } });
+      ok(r.status === 200 && p2().agents.dev.model === "claude-opus-5-5" && p2().agents.head.model === "",
+        "AC3/AC4: PATCH persists a valid id and an unset ('') model");
+      const r2 = await req(server, { method: "PATCH", urlPath: "/api/config", body: { operator_name: "op" } });
+      ok(r2.status === 200, "a PATCH with no projects is unaffected by the model check");
+    }
+
     if (!SHIM) {
       console.log("  SKIP: PATH-shim discovery checks (POSIX shebang shim; not run on Windows)");
     } else {
       // ── AC7: the spawn path never runs discovery ──
-      ok(markerRuns().length === 0, "AC7: spawning codex agents never ran `codex debug models`");
+      ok(markerRuns().length === 0, "AC7: spawning codex/grok agents never ran `codex debug models` / `grok models`");
 
       // ── AC1/AC7: the catalog route runs discovery once and caches it ──
       const first = await req(server, { urlPath: "/api/agent-model-catalog" });
       ok(first.status === 200 && JSON.stringify(first.body.models.codex) === '["gpt-7-nova"]',
         "AC1: GET /api/agent-model-catalog returns the model the installed CLI lists (unknown to QuadWork)");
-      ok(markerRuns().join("|") === "debug models", "AC7: the route ran exactly `codex debug models`");
-      ok(!("claude" in first.body.models), "AC1: backends with no discovery source are absent (shipped list)");
+      ok(JSON.stringify(first.body.models.grok) === '["grok-5","grok-4.5"]',
+        "AC1: the catalog route returns the models `grok models` lists (grok-5 unknown to QuadWork)");
+      ok(markerRuns().sort().join("|") === "codex debug models|grok models", "AC7: the route ran exactly `codex debug models` and `grok models`, once each");
+      ok(!("claude" in first.body.models) && !("gemini" in first.body.models), "AC1: backends with no discovery source are absent (shipped list)");
       await req(server, { urlPath: "/api/agent-model-catalog" });
-      ok(markerRuns().length === 1, "AC7: a second open within the TTL is served from cache");
+      ok(markerRuns().length === 2, "AC7: a second open within the TTL is served from cache");
       await buildAgentArgs("p1", "codex_valid");
-      ok(markerRuns().length === 1, "AC7: spawning after discovery still never runs it");
+      await buildAgentArgs("p1", "grok_valid");
+      ok(markerRuns().length === 2, "AC7: spawning after discovery still never runs it");
     }
   } finally {
     server.close();

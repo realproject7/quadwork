@@ -9,9 +9,10 @@
 // asserts the two patterns are identical.
 //
 // Discovery: asks an installed CLI which models it offers, so a new model is
-// selectable without a QuadWork release. Only CLIs with a machine-readable
-// listing have a source (codex: `codex debug models`, JSON, entries with
-// visibility "list"); every other backend uses the shipped list. Discovery is
+// selectable without a QuadWork release. Only CLIs with a model listing have a
+// source (codex: `codex debug models`, JSON, entries with visibility "list";
+// grok: `grok models`, the "Available models:" list); every other backend
+// (claude, gemini) uses the shipped list. Discovery is
 // fetched by the Settings page and the Agent Models modal when they open —
 // never by the spawn path — is bounded by DISCOVERY_TIMEOUT_MS, and cached for
 // DISCOVERY_CACHE_MS. Any failure (CLI missing, not logged in, offline,
@@ -39,10 +40,35 @@ function parseCodexModels(stdout) {
     .map((m) => m.slug);
 }
 
+// `grok models` (grok 0.2.118) prints, logged in or not, e.g.:
+//   Default model: grok-4.5
+//
+//   Available models:
+//     * grok-4.5 (default)
+// Only the "* <id>" rows under "Available models:" are read; a missing header
+// or a row of any other shape means the format changed.
+function parseGrokModels(stdout) {
+  const lines = String(stdout).split(/\r?\n/);
+  const start = lines.findIndex((l) => l.trim() === "Available models:");
+  if (start < 0) throw new Error("unexpected `grok models` output");
+  const ids = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === "") {
+      if (ids.length > 0) break;
+      continue;
+    }
+    const m = /^\s*\*\s+(\S+)(?: \(default\))?\s*$/.exec(line);
+    if (!m) throw new Error("unexpected `grok models` output");
+    if (isValidModelId(m[1])) ids.push(m[1]);
+  }
+  return ids;
+}
+
 // Keyed by command basename (cliBaseFromCommand), the same key as the rest of
 // the model catalog.
 const DISCOVERY_SOURCES = {
   codex: { command: "codex", args: ["debug", "models"], parse: parseCodexModels },
+  grok: { command: "grok", args: ["models"], parse: parseGrokModels },
 };
 const DISCOVERY_TIMEOUT_MS = 5000;
 const DISCOVERY_CACHE_MS = 5 * 60 * 1000;
@@ -116,6 +142,7 @@ module.exports = {
   MODEL_ID_PATTERN,
   isValidModelId,
   parseCodexModels,
+  parseGrokModels,
   DISCOVERY_SOURCES,
   DISCOVERY_TIMEOUT_MS,
   discoverAgentModels,
