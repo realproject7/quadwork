@@ -174,6 +174,14 @@ function runSubprocessWiringChecks() {
     ["-r", preload, BIN_PATH, ...args],
     { encoding: "utf8", env: { ...process.env, HOME: tempHome, USERPROFILE: tempHome }, timeout: 15000 },
   );
+  // No forced-failure preload: exercises the real, unmocked node-pty in this
+  // worktree, so the success path is asserted end to end too, not just the
+  // failure path above.
+  const runCliClean = (...args) => spawnSync(
+    process.execPath,
+    [BIN_PATH, ...args],
+    { encoding: "utf8", env: { ...process.env, HOME: tempHome, USERPROFILE: tempHome }, timeout: 15000 },
+  );
 
   try {
     // `start`: must fail closed, with the fix text, and never reach the
@@ -202,7 +210,14 @@ function runSubprocessWiringChecks() {
     const usage = runCli("not-a-command");
     assert.match(usage.stdout, /Usage: quadwork/, "an unrelated command is unaffected by the forced node-pty failure");
 
-    console.log("  PASS: start and doctor are wired to checkNodePty; start fails before opening a browser or requiring the server");
+    // Success path, no forced failure: `doctor` exits 0 and reports the
+    // check passed, using this worktree's real node-pty.
+    const doctorOk = runCliClean("doctor");
+    assert.equal(doctorOk.status, 0, `doctor must exit 0 when node-pty genuinely works: ${doctorOk.stdout}${doctorOk.stderr}`);
+    assert.match(doctorOk.stdout, /node-pty loads and can spawn a PTY\./, doctorOk.stdout);
+    assert.doesNotMatch(doctorOk.stdout + doctorOk.stderr, /node-pty is unusable/, "no failure is reported on the success path");
+
+    console.log("  PASS: start and doctor are wired to checkNodePty; start fails before opening a browser or requiring the server; doctor exits 0 on success");
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

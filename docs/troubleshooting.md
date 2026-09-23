@@ -8,37 +8,62 @@ Common issues and fixes, structured as **Symptom > Cause > Fix**. Searchable by 
 
 *(#1173)*
 
-**Symptom:** `npm install -g quadwork@latest` prints a warning like:
+**Symptom:** `npm install -g quadwork@latest` prints a warning like this
+(quoted exactly as npm 11.16.0 prints it):
 
 ```
-npm warn install-scripts 1 package has install scripts not yet covered by allowScripts:
-npm warn install-scripts   node-pty@1.2.0-beta.15 (install: node scripts/prebuild.js || node-gyp rebuild; postinstall: node scripts/post-install.js)
-npm warn install-scripts
-npm warn install-scripts Run `npm install -g --allow-scripts=node-pty` to allow these scripts once, or `npm config set allow-scripts=node-pty --location=user` to allow them for all global installs.
+npm warn allow-scripts 1 package has install scripts not yet covered by allowScripts:
+npm warn allow-scripts   node-pty@1.2.0-beta.15 (install: node scripts/prebuild.js || node-gyp rebuild; postinstall: node scripts/post-install.js)
+npm warn allow-scripts
+npm warn allow-scripts Run `npm approve-scripts --allow-scripts-pending` to review, or `npm approve-scripts <pkg>` to allow.
 ```
 
-npm skips `node-pty`'s `install` and `postinstall` scripts unless you've explicitly approved them for that package.
+**This warning is advisory.** npm 11.16.0 still runs `node-pty`'s `install`
+and `postinstall` scripts by default; it only warns that you have not
+explicitly reviewed and approved them. `npm help approve-scripts` says
+plainly: "install scripts still run by default." The warning is not telling
+you the install failed or that anything was skipped.
 
-**Cause:** Those scripts build node-pty's native addon from source (`node-gyp rebuild`) when the platform has no bundled prebuilt binary. node-pty ships prebuilt binaries for QuadWork's supported platforms, so on a supported platform the skipped scripts don't matter, the bundled prebuild loads and a PTY spawns without ever running `install` or `postinstall`.
+The `npm approve-scripts` command the warning suggests edits a project's own
+`package.json` to record which packages' scripts you've reviewed. It has no
+effect on a global (`-g`) install like `npm install -g quadwork@latest`,
+since there is no project `package.json` for it to edit.
 
-**Fix:** Whether you need to do anything depends on your platform. This was checked by installing `quadwork@2.8.0` with npm's default allow-scripts behavior (scripts skipped) and confirming `node-pty` still loads and spawns a PTY:
+**Cause:** `node-pty`'s `install` script builds its native addon from source
+(`node-gyp rebuild`) only when the platform has no bundled prebuilt binary;
+otherwise it finds the existing prebuild and does nothing. node-pty ships
+prebuilt binaries for QuadWork's supported platforms, so on a supported
+platform this warning, and even an install with scripts fully disabled
+(`--ignore-scripts`), does not stop `node-pty` from working. The bundled
+prebuild loads and a PTY spawns either way.
 
-| Platform | Approving scripts needed? | node-pty version checked | How it was checked |
+**Fix:** Whether you need to do anything depends on your platform. Each row
+below was checked two ways: installing `quadwork@2.8.0` normally (scripts
+run, the default) and installing it with `--ignore-scripts` (scripts
+skipped, which is not npm's default but is what a stricter script policy
+would do), then confirming `node-pty` still loads and spawns a PTY:
+
+| Platform | Action needed? | node-pty version checked | How it was checked |
 |---|---|---|---|
-| macOS arm64 | No, the bundled prebuild loads | 1.2.0-beta.15 | Verified on real hardware (2026-09-23) |
-| macOS x64 | Unverified, not confirmed either way | n/a | Not checked; no x64 Mac available |
-| Linux x64, glibc (covers a VPS) | No, the bundled prebuild loads | 1.2.0-beta.15 | Verified in a `node:24-bookworm` Docker container, `--platform linux/amd64` (QEMU emulation) |
-| Linux arm64, glibc (also what a VPS or Windows/WSL2 on an ARM host uses) | No, the bundled prebuild loads | 1.2.0-beta.15 | Verified in a `node:24-bookworm` Docker container, native arm64 |
+| macOS arm64 | No. The bundled prebuild loads either way. | 1.2.0-beta.15 | Scripts run: real hardware (2026-09-23). Scripts skipped: `npm install -g --prefix <tmpdir> quadwork@2.8.0 --ignore-scripts` on the same hardware |
+| macOS x64 | Unverified. Not confirmed either way. | n/a | Not checked, no x64 Mac available |
+| Linux x64, glibc (covers a VPS) | No. The bundled prebuild loads either way. | 1.2.0-beta.15 | `node:24-bookworm` Docker container, `--platform linux/amd64` (QEMU emulation), both with a normal install and with `--ignore-scripts` |
+| Linux arm64, glibc (also what a VPS or Windows/WSL2 on an ARM host uses) | No. The bundled prebuild loads either way. | 1.2.0-beta.15 | `node:24-bookworm` Docker container, native arm64, both with a normal install and with `--ignore-scripts` |
 
 musl (e.g. Alpine) is already out of scope (see [README.md](../README.md)), and native Windows is unsupported; see [docs/install-windows.md](install-windows.md).
 
-If **`quadwork start` or `quadwork doctor` reports `node-pty is unusable`**, the warning does need action on your host. Run:
+If **`quadwork start` or `quadwork doctor` reports `node-pty is unusable`**,
+something on your host really is broken and the warning above is not the
+cause. Try reinstalling with scripts explicitly allowed:
 
 ```bash
 npm install -g quadwork@latest --allow-scripts=node-pty
 ```
 
-If it still fails after that, node-pty has no prebuild for your platform and would need to build from source (a C++ toolchain and `node-gyp`, not something QuadWork sets up for you), treat this as an unsupported platform rather than debugging the build.
+If it still fails after that, node-pty has no prebuild for your platform and
+would need to build from source (a C++ toolchain and `node-gyp`, not
+something QuadWork sets up for you). Treat this as an unsupported platform
+rather than debugging the build.
 
 ---
 

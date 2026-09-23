@@ -111,9 +111,11 @@ npx quadwork init
 > distro (Ubuntu, Debian) or macOS.
 
 > **`node-pty` install-scripts warning?** The install may print a warning
-> that npm skipped install scripts for `node-pty`. On every supported
-> platform we've verified (macOS arm64, Linux x64, Linux arm64), this needs
-> no action. The bundled prebuild loads without them. See
+> that `node-pty`'s install scripts are "not yet covered by allowScripts."
+> This is advisory; npm still runs the scripts by default. On every
+> supported platform we've verified (macOS arm64, Linux x64, Linux arm64),
+> no action is needed either way. The bundled prebuild loads whether the
+> scripts run or are skipped. See
 > [Troubleshooting](docs/troubleshooting.md#node-pty-install-scripts-warning)
 > if `quadwork start` or `quadwork doctor` reports `node-pty is unusable`.
 

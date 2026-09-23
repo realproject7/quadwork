@@ -472,21 +472,25 @@ function satisfiesMinimumNodeVersion(raw, minimum = MINIMUM_NODE_VERSION) {
 }
 
 // #1173: node-pty is required at the top of server/index.js and
-// server/resource-linux-launcher.js. Left unchecked, a broken load (npm
-// skipped node-pty's install/postinstall scripts and the platform has no
-// usable bundled prebuild) or a PTY that can't spawn only surfaces as a raw
-// throw deep in that require chain — after `start` had already scheduled the
-// browser-open timer. This check runs before that require and before the
-// timer is scheduled, so the operator gets one instruction instead of a
-// stack trace. `doctor` calls the same check to report, not to exit.
+// server/resource-linux-launcher.js. Left unchecked, a broken load or a PTY
+// that can't spawn only surfaces as a raw throw deep in that require chain,
+// after `start` had already scheduled the browser-open timer. This check
+// runs before that require and before the timer is scheduled, so the
+// operator gets one instruction instead of a stack trace. `doctor` calls the
+// same check to report, not to exit.
 //
-// On every platform verified for #1173 (macOS arm64, Linux x64, Linux
-// arm64), node-pty's bundled prebuild loads and a PTY spawns fine even with
-// install scripts skipped — so a load or spawn failure here means the host
-// genuinely cannot run node-pty, not that scripts merely need approving.
+// npm's "install scripts not yet covered by allowScripts" warning is
+// advisory: npm still runs the scripts by default (see `npm help
+// approve-scripts`), it is only flagging that they were not explicitly
+// reviewed. It is not evidence of a real problem. On every platform verified
+// for #1173 (macOS arm64, Linux x64, Linux arm64), node-pty's bundled
+// prebuild loads and a PTY spawns fine whether the scripts run (the
+// default) or are skipped (`--ignore-scripts`). So a load or spawn failure
+// here means the host genuinely cannot run node-pty, not that scripts need
+// approving.
 const NODE_PTY_FIX = [
   "node-pty is unusable. Fix:",
-  "  1. Reinstall with its scripts allowed:",
+  "  1. If install scripts were skipped, reinstall with them explicitly allowed:",
   "       npm install -g quadwork@latest --allow-scripts=node-pty",
   "  2. If that still fails, the platform may be unsupported. Supported:",
   "       macOS (arm64, x64), Linux glibc (x64, arm64). See docs/troubleshooting.md",
@@ -500,7 +504,8 @@ function loadNodePty() {
 // Spawns a trivial, self-exiting process through the given pty module and
 // resolves once it exits (or the timeout fires). Takes `pty` as a parameter
 // rather than requiring it itself so a load failure and a spawn failure stay
-// two separate, separately testable steps.
+// two separate, separately testable steps. Native Windows is unsupported
+// (see docs/install-windows.md), so this only spawns the Unix shape.
 function spawnPtyProbe(pty, { timeoutMs = 5000 } = {}) {
   return new Promise((resolve) => {
     let settled = false;
@@ -510,9 +515,7 @@ function spawnPtyProbe(pty, { timeoutMs = 5000 } = {}) {
       resolve(result);
     };
     try {
-      const shell = process.platform === "win32" ? "cmd.exe" : "/bin/echo";
-      const args = process.platform === "win32" ? ["/c", "echo ok"] : ["ok"];
-      const proc = pty.spawn(shell, args, { name: "xterm-color", cols: 80, rows: 24 });
+      const proc = pty.spawn("/bin/echo", ["ok"], { name: "xterm-color", cols: 80, rows: 24 });
       const timer = setTimeout(() => {
         try { proc.kill(); } catch {}
         settle({ ok: false, code: "node_pty_spawn_timeout", message: `PTY spawn did not exit within ${timeoutMs}ms` });
