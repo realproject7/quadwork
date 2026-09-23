@@ -57,8 +57,11 @@ something on your host really is broken and the warning above is not the
 cause. Try reinstalling with scripts explicitly allowed:
 
 ```bash
-npm install -g quadwork@latest --allow-scripts=node-pty
+npm install -g quadwork@latest --allow-scripts=node-pty --ignore-scripts=false
 ```
+
+`--ignore-scripts=false` matters if your `.npmrc` sets `ignore-scripts=true`.
+That setting otherwise wins over `--allow-scripts`.
 
 If it still fails after that, node-pty has no prebuild for your platform and
 would need to build from source (a C++ toolchain and `node-gyp`, not

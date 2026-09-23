@@ -6531,6 +6531,11 @@ async function provisionV2Repositories(config, candidate, repositories, existing
 router.post("/api/setup", async (req, res) => {
   const step = req.query.step;
   const body = req.body || {};
+  // #1177: setup persists body.agents, so it is a model write path too (#1172 AC3).
+  const invalidModels = invalidAgentModelRefs([{ id: body.id, agents: body.agents }]);
+  if (invalidModels.length > 0) {
+    return res.status(400).json({ ok: false, error: `Invalid model id for ${invalidModels.join(", ")}` });
+  }
 
   switch (step) {
     case "verify-repositories": {

@@ -99,8 +99,9 @@ npm list -g quadwork
 
 ### `node-pty` install-scripts warning
 
-The install may print a warning that `node-pty`'s install scripts are "not
-yet covered by allowScripts." This is advisory. npm still runs the scripts by
+The install may print
+`npm warn allow-scripts 1 package has install scripts not yet covered by allowScripts:`
+followed by a `node-pty` line. This is advisory. npm still runs the scripts by
 default; it is only telling you that you have not explicitly reviewed them.
 No action is needed on **Apple Silicon (arm64)**: node-pty's bundled prebuild
 loads and a PTY spawns fine, whether the scripts run (the default) or are
@@ -108,7 +109,7 @@ skipped (verified both ways). On **Intel Macs (x64)** this has not been
 verified either way. If `quadwork start` or `quadwork doctor` then reports
 `node-pty is unusable`, run:
 ```bash
-npm install -g quadwork@latest --allow-scripts=node-pty
+npm install -g quadwork@latest --allow-scripts=node-pty --ignore-scripts=false
 ```
 See [Troubleshooting: node-pty install-scripts warning](troubleshooting.md#node-pty-install-scripts-warning) for the full explanation and platform table.
 
