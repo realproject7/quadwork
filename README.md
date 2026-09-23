@@ -110,8 +110,9 @@ npx quadwork init
 > and the stores fail closed rather than writing unprotected. Use a glibc
 > distro (Ubuntu, Debian) or macOS.
 
-> **`node-pty` install-scripts warning?** The install may print a warning
-> that `node-pty`'s install scripts are "not yet covered by allowScripts".
+> **`node-pty` install-scripts warning?** The install may print
+> `npm warn allow-scripts 1 package has install scripts not yet covered by allowScripts:`
+> followed by a `node-pty` line.
 > This is advisory; npm still runs the scripts by default. On every
 > supported platform we've verified (macOS arm64, Linux x64, Linux arm64),
 > no action is needed either way. The bundled prebuild loads whether the
