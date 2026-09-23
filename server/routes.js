@@ -37,7 +37,8 @@ const {
 } = require("./work-item-ref");
 const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence, deriveCiPolicyIdentity } = require("./ci-evidence-policy");
 const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
-const { injectModeForCommand } = require("../src/lib/injectMode.js");
+const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
+const { isValidModelId } = require("./agent-model-catalog");
 const { admissionMatchesContext } = require("./head-ticket-review-admission");
 
 const router = express.Router();
@@ -8167,8 +8168,9 @@ router.get("/api/project/:projectId/agent-models", (req, res) => {
     if (!project) return res.status(404).json({ error: "Unknown project" });
     const rows = ["head", "re1", "re2", "dev"].map((agentId) => {
       const a = project.agents?.[agentId] || {};
-      const command = a.command || "claude";
-      const cliBase = command.split("/").pop().split(" ")[0];
+      // #1172: backends are keyed by command basename, the same helper the
+      // Settings page and spawn defaults use.
+      const cliBase = cliBaseFromCommand(a.command);
       return {
         agent_id: agentId,
         backend: cliBase,
@@ -8194,6 +8196,12 @@ router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
   const reasoning = typeof body.reasoning_effort === "string" ? body.reasoning_effort.trim() : undefined;
   if (reasoning && reasoning !== "" && !ALLOWED_REASONING_EFFORTS.has(reasoning)) {
     return res.json({ ok: false, error: `Invalid reasoning_effort: ${reasoning}` });
+  }
+  // #1172: a model id may be any CLI's (discovered or hand-entered), but it must
+  // match MODEL_ID_PATTERN — no quotes, whitespace or leading "-" — so it can't
+  // break Codex's `-c model="…"` quoting or be read as a flag at spawn.
+  if (model && !isValidModelId(model)) {
+    return res.json({ ok: false, error: `Invalid model id: ${JSON.stringify(model)}` });
   }
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");

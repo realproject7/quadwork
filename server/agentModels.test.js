@@ -1,20 +1,25 @@
-// #931: the per-agent Settings Model dropdown was hardcoded to Claude models,
-// so a codex/gemini agent could be saved with a Claude model (e.g. "sonnet")
-// that its CLI can't use. The fix routes both the dropdown and the save path
-// through the pure helpers in src/lib/agentModels.ts. This test pins those
-// helpers — most importantly that an invalid existing model (codex + "sonnet")
-// is healed to the first valid codex model on save, and that "" (CLI default)
-// is never clobbered. Plain node:assert script (run via server/run-tests.js).
+// #931/#1172: the per-agent model helpers shared by the Settings page and the
+// Agent Models modal (src/lib/agentModels.ts). #931 routed both surfaces
+// through these helpers; #1172 replaced the first-option display/heal with the
+// CLI-default display, the cross-backend heal rule, the stale-model flag, the
+// CLI-discovered list and model-id validation. Plain node:assert script (run
+// via server/run-tests.js).
 //
 // Node strips the TS types at require-time, so we can exercise the real shared
 // module the components use — no duplicated logic, no transpile step.
 
+const fs = require("fs");
+const path = require("path");
 const {
+  MODEL_OPTIONS,
+  MODEL_ID_PATTERN,
+  isValidModelId,
   optionsForBackend,
-  modelsForBackend,
-  effectiveModel,
+  modelChoices,
   sanitizeModel,
+  CUSTOM_MODEL_VALUE,
 } = require("../src/lib/agentModels.ts");
+const serverCatalog = require("./agent-model-catalog");
 
 let passed = 0,
   failed = 0;
@@ -27,55 +32,100 @@ const ok = (c, m) => {
     console.error(`  FAIL: ${m}`);
   }
 };
+const values = (rows) => rows.map((o) => o.value);
 
-// ── optionsForBackend: raw lists incl. the "" CLI-default row ──
-ok(optionsForBackend("codex").some((o) => o.value === ""), "optionsForBackend(codex) includes the (CLI default) row");
-ok(optionsForBackend("codex").some((o) => o.value === "gpt-5.4"), "optionsForBackend(codex) lists codex models");
-ok(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].every((s) => optionsForBackend("codex").some((o) => o.value === s)), "#999: optionsForBackend(codex) includes the GPT-5.6 Sol/Terra/Luna slugs");
+// ── optionsForBackend: shipped lists incl. the "" CLI-default row ──
+ok(optionsForBackend("codex")[0].value === "", "optionsForBackend(codex) starts with the (CLI default) row");
+ok(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"].every((s) => values(optionsForBackend("codex")).includes(s)),
+  "#1172: shipped codex list matches what `codex debug models` lists (incl. gpt-6-astra, gpt-5.5)");
+ok(!["gpt-5.4", "gpt-5", "gpt-4o"].some((s) => values(optionsForBackend("codex")).includes(s)),
+  "#1172: shipped codex list drops gpt-5.4 / gpt-5 / gpt-4o, which the CLI no longer lists");
+ok(["fable", "opus", "sonnet", "claude-opus-5-5", "claude-opus-5", "claude-fable-5"].every((s) => values(optionsForBackend("claude")).includes(s)),
+  "#1172: shipped claude list has the documented fable/opus/sonnet aliases and the claude-opus-5-5 pin");
 ok(optionsForBackend("nope").length === 1 && optionsForBackend("nope")[0].value === "", "optionsForBackend(unknown) → single CLI-default row");
-ok(optionsForBackend("claude").some((o) => o.value === "claude-opus-5"), "#1018: optionsForBackend(claude) includes the claude-opus-5 pin (both selection surfaces read this list)");
-ok(optionsForBackend("grok")[0].value === "" && optionsForBackend("grok").some((o) => o.value === "grok-4.5"), "#1023: optionsForBackend(grok) is the (CLI default) row followed by the grok-4.5 pin");
+ok(optionsForBackend("grok")[0].value === "" && values(optionsForBackend("grok")).includes("grok-4.5"), "#1023: grok is (CLI default) + grok-4.5");
 
-// ── modelsForBackend: concrete (non-"") options, claude fallback ──
-ok(modelsForBackend("codex").every((o) => o.value !== ""), "modelsForBackend(codex) strips the (CLI default) row");
-ok(modelsForBackend("codex")[0].value === "gpt-5.4", "modelsForBackend(codex)[0] is the first concrete codex model");
-ok(modelsForBackend("gemini")[0].value === "gemini-2.5-pro", "modelsForBackend(gemini)[0] is the first concrete gemini model");
-ok(modelsForBackend("claude")[0].value === "opus", "modelsForBackend(claude)[0] is opus (not the CLI-default row)");
-ok(modelsForBackend("grok")[0].value === "grok-4.5", "#1023: modelsForBackend(grok)[0] is grok-4.5 (the #931 default/heal target)");
-ok(modelsForBackend("nope").length > 0 && modelsForBackend("nope")[0].value === "opus", "modelsForBackend(unknown) falls back to Claude's concrete list");
+// ── AC1: a discovered model QuadWork has never heard of is selectable ──
+const discovered = { codex: ["gpt-7-nova", "gpt-6-astra"] };
+ok(values(optionsForBackend("codex", discovered)).join(",") === ",gpt-7-nova,gpt-6-astra",
+  "#1172 AC1: a discovered list replaces the shipped one ((CLI default) row first)");
+ok(values(modelChoices("codex", "", discovered)).includes("gpt-7-nova"),
+  "#1172 AC1: an unknown discovered model (gpt-7-nova) is a selectable row");
+ok(values(optionsForBackend("claude", discovered)).join(",") === values(MODEL_OPTIONS.claude).join(","),
+  "#1172 AC1: a backend with no discovery result uses the shipped list");
+ok(values(optionsForBackend("codex", { codex: [] })).join(",") === values(MODEL_OPTIONS.codex).join(","),
+  "#1172 AC8: an empty discovered list falls back to the shipped list");
 
-// ── effectiveModel: what the dropdown DISPLAYS ──
-ok(effectiveModel("claude", "sonnet") === "sonnet", "effectiveModel keeps a valid claude model");
-ok(effectiveModel("codex", "gpt-5") === "gpt-5", "effectiveModel keeps a valid codex model");
-ok(effectiveModel("codex", "sonnet") === "gpt-5.4", "effectiveModel: a stale Claude 'sonnet' on a codex agent shows the first codex model (not blank, not 'sonnet')");
-ok(effectiveModel("codex", "") === "gpt-5.4", "effectiveModel: unset model defaults to the backend's first option (#931 AC2 — not 'sonnet')");
-ok(effectiveModel("claude", undefined) === "opus", "effectiveModel: undefined model defaults to the backend's first option");
-ok(effectiveModel("gemini", "gpt-5") === "gemini-2.5-pro", "effectiveModel: a cross-backend value resolves to the gemini first option");
-ok(effectiveModel("claude", "claude-opus-5") === "claude-opus-5", "#1018: effectiveModel displays the claude-opus-5 pin as-is (not the opus alias)");
+// ── AC4: an unset model is shown as the CLI default ──
+ok(sanitizeModel("codex", null) === "", "#1172 AC4: a null model displays as '' (CLI default), not gpt-5.4");
+ok(sanitizeModel("claude", undefined) === "", "#1172 AC4: an undefined model displays as '' (CLI default), not opus");
+ok(modelChoices("codex", "")[0].value === "" && modelChoices("codex", "")[0].label === "(CLI default)",
+  "#1172 AC4: the CLI-default row is always offered (can be chosen)");
+ok(modelChoices("codex", "").every((o) => !o.flag), "#1172 AC4: an unset model adds no flagged row");
 
-// ── #1018: deterministic placement. The pin must sit immediately after
-// claude-fable-5 and before the 4.x pins (newest pin first) — and never first,
-// so the #931 default/heal target above stays "opus".
+// ── Untouched save keeps an unset model unset (regression guard) ──
+ok(sanitizeModel("codex", "") === "", "sanitizeModel keeps '' (CLI default) — never clobbered");
+ok(sanitizeModel("gemini", undefined) === "", "sanitizeModel maps undefined → '' (CLI default), not a fabricated model");
+ok(sanitizeModel("grok", "") === "", "#1023: sanitizeModel keeps '' on grok");
+
+// ── AC6: heal rule ──
+ok(sanitizeModel("codex", "sonnet") === "", "#1172 AC6: a Claude 'sonnet' on a codex agent heals to the CLI default (not gpt-5.4)");
+ok(sanitizeModel("gemini", "opus") === "", "#1172 AC6: a Claude model on a gemini agent heals to the CLI default");
+ok(sanitizeModel("grok", "sonnet") === "", "#1172 AC6: a Claude model on a grok agent heals to the CLI default");
+ok(sanitizeModel("claude", "gpt-7-nova", discovered) === "", "#1172 AC6: a model known only from discovery for codex heals on a claude agent");
+ok(sanitizeModel("claude", "gpt-7-nova") === "gpt-7-nova", "#1172 AC6: without that discovery it is unknown everywhere, so it is kept");
+ok(sanitizeModel("codex", "gpt-5.6-terra") === "gpt-5.6-terra", "sanitizeModel keeps a listed codex model");
+ok(sanitizeModel("codex", "gpt-5.6-terra", discovered) === "gpt-5.6-terra",
+  "#1172 AC6: a shipped codex model the discovery omits is still known for codex → kept, not healed");
+ok(sanitizeModel("claude", "claude-opus-5") === "claude-opus-5", "#1018: a saved claude-opus-5 pin is kept (never healed to the alias)");
+ok(sanitizeModel("codex", "gpt-5.4") === "gpt-5.4", "#1172 AC6: an unlisted id known for no backend (gpt-5.4) is kept, never rewritten");
+ok(sanitizeModel("codex", "my-proxy/gpt-x") === "my-proxy/gpt-x", "#1172 AC6: a hand-entered id is kept");
+
+// ── AC6: stale-model flag ──
 {
-  const claude = modelsForBackend("claude").map((o) => o.value);
-  ok(claude[claude.indexOf("claude-fable-5") + 1] === "claude-opus-5", "#1018: claude-opus-5 sits immediately after claude-fable-5");
-  ok(claude.indexOf("claude-opus-5") < claude.indexOf("claude-opus-4-8"), "#1018: claude-opus-5 precedes the Opus 4.x pins");
-  ok(claude.indexOf("opus") === 0, "#1018: the opus alias remains the first concrete Claude option");
+  const rows = modelChoices("codex", "gpt-5.4");
+  const stale = rows.find((o) => o.value === "gpt-5.4");
+  ok(stale && stale.flag === "not_offered", "#1172 AC6: a kept unlisted model stays selectable, flagged not_offered");
+  ok(rows.filter((o) => o.flag).length === 1, "#1172 AC6: only the stale row is flagged");
+  ok(!values(optionsForBackend("codex")).includes("gpt-5.4"), "#1172: modelChoices never mutates the shipped list");
+  ok(!modelChoices("codex", "gpt-7-nova", discovered).some((o) => o.flag), "#1172: a discovered model is not flagged");
+  ok(modelChoices("codex", "gpt-6-astra", discovered).find((o) => o.value === "gpt-6-astra").flag === undefined,
+    "#1172: a listed saved model is not duplicated or flagged");
+  ok(modelChoices("codex", 'gpt"x').find((o) => o.value === 'gpt"x').flag === "invalid",
+    "#1172: a saved id failing MODEL_ID_PATTERN is flagged invalid");
 }
 
-// ── sanitizeModel: what gets PERSISTED on save ──
-ok(sanitizeModel("codex", "sonnet") === "gpt-5.4", "#931 core: saving a codex agent with 'sonnet' persists the first valid codex model");
-ok(sanitizeModel("gemini", "opus") === "gemini-2.5-pro", "sanitizeModel heals a Claude model on a gemini agent");
-ok(sanitizeModel("codex", "gpt-4o") === "gpt-4o", "sanitizeModel keeps an already-valid codex model");
-ok(sanitizeModel("claude", "claude-opus-4-8") === "claude-opus-4-8", "sanitizeModel keeps a valid pinned claude model");
-ok(sanitizeModel("claude", "claude-fable-5") === "claude-fable-5", "#958: sanitizeModel keeps claude-fable-5 (new family, not covered by the opus/sonnet aliases)");
-ok(sanitizeModel("claude", "claude-opus-5") === "claude-opus-5", "#1018: sanitizeModel keeps the claude-opus-5 pin (a saved pin is never healed to the alias)");
-ok(sanitizeModel("grok", "sonnet") === "grok-4.5", "#1023 AC: sanitizeModel heals a Claude 'sonnet' on a grok agent → grok-4.5");
-ok(sanitizeModel("grok", "grok-4.5") === "grok-4.5", "#1023: sanitizeModel keeps an already-valid grok model");
-ok(sanitizeModel("grok", "") === "", "#1023 AC: sanitizeModel keeps '' (CLI default) on grok — never clobbered");
-ok(effectiveModel("grok", "opus") === "grok-4.5", "#1023: a stale cross-backend model on a grok agent displays grok-4.5");
-ok(sanitizeModel("codex", "") === "", "sanitizeModel keeps '' (CLI default) — valid for every CLI, never clobbered");
-ok(sanitizeModel("gemini", undefined) === "", "sanitizeModel maps undefined → '' (CLI default), not a fabricated model");
+// ── AC2/AC3: model-id validation ──
+ok(isValidModelId("gpt-5.6-terra") && isValidModelId("claude-opus-5-5") && isValidModelId("org/model:v1@2"),
+  "#1172 AC2: well-formed ids are accepted (incl. . _ : / @ -)");
+ok(isValidModelId("a") && isValidModelId("a".repeat(128)) && !isValidModelId("a".repeat(129)), "#1172 AC2: 1–128 chars");
+ok(!isValidModelId('gpt"5'), "#1172 AC3: a quote is rejected");
+ok(!isValidModelId("-rf") && !isValidModelId("--model"), "#1172 AC3: a leading '-' is rejected");
+ok(!isValidModelId("gpt 5") && !isValidModelId(" gpt-5") && !isValidModelId("gpt-5\n") && !isValidModelId("gpt\t5"),
+  "#1172 AC3: whitespace is rejected");
+ok(!isValidModelId("") && !isValidModelId(null) && !isValidModelId(5), "#1172 AC3: empty / non-string is not a model id");
+ok(!isValidModelId(CUSTOM_MODEL_VALUE), "#1172: the Other… sentinel can never collide with a valid id");
+ok(MODEL_ID_PATTERN.source === serverCatalog.MODEL_ID_PATTERN.source && MODEL_ID_PATTERN.flags === serverCatalog.MODEL_ID_PATTERN.flags,
+  "#1172: the UI and server model-id patterns are identical");
+for (const id of ["gpt-5", 'gpt"5', "-x", "a b", "a".repeat(129), "org/m:1@x"]) {
+  ok(isValidModelId(id) === serverCatalog.isValidModelId(id), `#1172: UI and server validators agree on ${JSON.stringify(id)}`);
+}
+ok(Object.values(MODEL_OPTIONS).flat().every((o) => o.value === "" || isValidModelId(o.value)), "#1172: every shipped id is well-formed");
+
+// ── Wiring: both surfaces use the shared helpers (source assertions) ──
+{
+  const settings = fs.readFileSync(path.join(__dirname, "..", "src", "components", "SettingsPage.tsx"), "utf8");
+  const modal = fs.readFileSync(path.join(__dirname, "..", "src", "components", "AgentModelsWidget.tsx"), "utf8");
+  ok(!/effectiveModel|modelsForBackend/.test(settings), "#1172 AC4: Settings no longer renders the first concrete option for an unset model");
+  ok(/const command = e\.target\.value;\s*setCustomModel\([^;]*\);\s*updateAgent\(idx, agentId, \{\s*command,\s*model: "",/.test(settings),
+    "#1172 AC5: changing an agent's command resets its model to '' (CLI default)");
+  ok(settings.includes("modelChoices(") && settings.includes("CUSTOM_MODEL_VALUE") && settings.includes('fetch("/api/agent-model-catalog")'),
+    "#1172 AC1/AC2: Settings lists discovered models and offers hand entry");
+  ok(settings.includes("sanitizeModel(cliBaseFromCommand(a.command), a.model, discoveredModels)") && settings.includes("setSaveError(t.invalidModelIds("),
+    "#1172 AC3/AC6: Settings save applies the heal rule and refuses an invalid id");
+  ok(modal.includes("modelChoices(row.backend, row.model, discovered)") && modal.includes("CUSTOM_MODEL_VALUE") && modal.includes('fetch("/api/agent-model-catalog")'),
+    "#1172 AC1/AC2/AC4: the modal lists discovered models, keeps the CLI-default row and offers hand entry");
+}
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

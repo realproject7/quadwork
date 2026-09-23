@@ -28,6 +28,7 @@ const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
 const { createAgentLifecycleGovernor } = require("./agent-lifecycle");
 const { captureRepositoryFacts } = require("./repository-facts");
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
+const { isValidModelId, createModelCatalogCache } = require("./agent-model-catalog");
 const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
@@ -414,6 +415,16 @@ app.get("/api/cli-status", (_req, res) => {
     gemini: isCliInstalled("gemini"),
     grok: isCliInstalled("grok"),
   });
+});
+
+// #1172: models each installed CLI currently offers, keyed by command basename.
+// Fetched by Settings and the Agent Models modal when they open; bounded and
+// cached in server/agent-model-catalog.js. A backend missing from `models`
+// (no discovery source, or discovery failed — reason in `errors`) uses the
+// shipped list. Never called from the spawn path.
+const getAgentModelCatalog = createModelCatalogCache();
+app.get("/api/agent-model-catalog", async (_req, res) => {
+  res.json(await getAgentModelCatalog());
 });
 
 // --- Port availability check ---
@@ -2298,24 +2309,32 @@ async function buildAgentArgs(projectId, agentId) {
   // Grok: --model <slug> (the Grok CLI's -m / --model flag)
   //   #1023: reasoning_effort is deliberately not wired (the CLI supports
   //   --reasoning-effort; deferred until requested — model-only, like gemini).
+  // #1172: a stored model that fails MODEL_ID_PATTERN (hand-edited config) is
+  // never passed to a CLI — it could break the `-c model="…"` quoting or be
+  // read as a flag. The agent runs on its CLI default instead.
+  let model = agentCfg.model;
+  if (model && !isValidModelId(model)) {
+    console.warn(`[agents] ${projectId}/${agentId}: ignoring invalid model id ${JSON.stringify(model)}; using the CLI default`);
+    model = "";
+  }
   if (cliBase === "codex") {
-    if (agentCfg.model && typeof agentCfg.model === "string") {
-      args.push("-c", `model="${agentCfg.model}"`);
+    if (model) {
+      args.push("-c", `model="${model}"`);
     }
     if (agentCfg.reasoning_effort && typeof agentCfg.reasoning_effort === "string") {
       args.push("-c", `model_reasoning_effort="${agentCfg.reasoning_effort}"`);
     }
   } else if (cliBase === "claude") {
-    if (agentCfg.model && typeof agentCfg.model === "string") {
-      args.push("--model", agentCfg.model);
+    if (model) {
+      args.push("--model", model);
     }
   } else if (cliBase === "gemini") {
-    if (agentCfg.model && typeof agentCfg.model === "string") {
-      args.push("--model", agentCfg.model);
+    if (model) {
+      args.push("--model", model);
     }
   } else if (cliBase === "grok") {
-    if (agentCfg.model && typeof agentCfg.model === "string") {
-      args.push("--model", agentCfg.model);
+    if (model) {
+      args.push("--model", model);
     }
   }
 

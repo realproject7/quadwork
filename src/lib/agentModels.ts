@@ -1,42 +1,41 @@
-// #343/#367/#931: backend-specific model catalog + the helpers that keep a
-// per-agent model valid for its CLI. Kept as pure data + logic
-// (NO React) so it is shared by AgentModelsWidget + SettingsPage AND can be
-// unit-tested directly under node (see server/agentModels.test.js).
+// #343/#367/#931/#1172: backend-specific model catalog + the helpers that keep
+// a per-agent model valid for its CLI. Kept as pure data + logic (NO React) so
+// it is shared by AgentModelsWidget + SettingsPage AND can be unit-tested
+// directly under node (see server/agentModels.test.js).
 //
 // Empty string = "use the CLI's own default" (no -c / --model flag passed at
-// all) — valid for every CLI. The lists below are the known-good slugs we ship
-// with this release; operators who need something bleeding edge can still
-// override by editing ~/.quadwork/config.json directly.
+// all) — valid for every CLI, and what a new or unset agent runs on.
+//
+// #1172: the lists below are only the SHIPPED FALLBACK. When a CLI has its own
+// discovery source (today: `codex debug models`, via GET
+// /api/agent-model-catalog → server/agent-model-catalog.js) its discovered list
+// replaces the shipped one, so a new model is selectable without a QuadWork
+// release. Backends without a discovery source (claude, gemini, grok) use the
+// shipped list; any other id can be entered by hand in both surfaces.
 export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
+  // #1172: refreshed from `codex debug models` (visibility "list", codex-cli
+  // 0.153.1). gpt-5.4 / gpt-5 / gpt-4o were dropped — the CLI no longer lists
+  // them; an agent still saved on one keeps it and is flagged as not offered.
   codex: [
     { value: "", label: "(CLI default)" },
-    { value: "gpt-5.4", label: "gpt-5.4" },
-    { value: "gpt-5", label: "gpt-5" },
-    { value: "gpt-4o", label: "gpt-4o" },
-    // #999: GPT-5.6 Sol/Terra/Luna — new concrete slugs. Appended AFTER the
-    // existing rows so modelsForBackend("codex")[0] stays "gpt-5.4" (the #931
-    // default/heal target). Same append pattern as the #958 Fable-5 row.
+    { value: "gpt-6-astra", label: "gpt-6-astra" },
     { value: "gpt-5.6-sol", label: "gpt-5.6-sol" },
     { value: "gpt-5.6-terra", label: "gpt-5.6-terra" },
     { value: "gpt-5.6-luna", label: "gpt-5.6-luna" },
+    { value: "gpt-daybreak-blue-latest", label: "gpt-daybreak-blue-latest" },
+    { value: "gpt-5.5", label: "gpt-5.5" },
   ],
   claude: [
     { value: "", label: "(CLI default)" },
-    // #841: CLI-documented aliases (`claude --help` → "alias for the latest
-    // model"). Auto-track new Opus/Sonnet releases without needing a QuadWork
-    // update; pinned `claude-opus-4-X` rows below remain for operators who
-    // want a specific version locked in.
+    // #841/#1172: CLI-documented aliases (`claude --help` → "an alias for the
+    // latest model (e.g. 'fable', 'opus', or 'sonnet')"). They auto-track new
+    // releases without a QuadWork update; the pins below are for operators who
+    // want a specific version locked in. Claude has no model-listing command.
+    { value: "fable", label: "fable (latest)" },
     { value: "opus", label: "opus (latest)" },
     { value: "sonnet", label: "sonnet (latest)" },
-    // #958: Fable 5 is a new model family, so the opus/sonnet aliases above
-    // never resolve to it — it needs its own pinned row. Deliberately NOT the
-    // first concrete row: modelsForBackend("claude")[0] ("opus") is the
-    // default/heal target and must stay put (#931).
     { value: "claude-fable-5", label: "claude-fable-5" },
-    // #1018: Claude Opus 5 pin for operators who need a reproducible version
-    // rather than the moving `opus` alias (which already resolves to it). Sits
-    // after `claude-fable-5` and before the 4.x pins — newest pin first — and
-    // never first, so modelsForBackend("claude")[0] stays "opus" (#931).
+    { value: "claude-opus-5-5", label: "claude-opus-5-5" },
     { value: "claude-opus-5", label: "claude-opus-5" },
     { value: "claude-opus-4-8", label: "claude-opus-4-8" },
     { value: "claude-opus-4-7", label: "claude-opus-4-7" },
@@ -51,46 +50,80 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
   ],
   // #1023: xAI Grok Build CLI. `grok models` on an authenticated account lists
   // exactly one model, which is also the CLI's default; there is no
-  // "latest"-style alias, so the "" row is the only auto-tracking mechanism
-  // here. Append new pins BELOW grok-4.5 so modelsForBackend("grok")[0] — the
-  // #931 default/heal target — stays put.
+  // "latest"-style alias, so the "" row is the only auto-tracking mechanism.
   grok: [
     { value: "", label: "(CLI default)" },
     { value: "grok-4.5", label: "grok-4.5" },
   ],
 };
 
-// Raw option list for a backend (includes the "" CLI-default row). Unknown
-// backends fall back to a single CLI-default row.
-export function optionsForBackend(backend: string) {
+// #1172: the one accepted model-id shape. It excludes quotes, whitespace and a
+// leading "-", so an id can never break Codex's `-c model="<id>"` quoting or be
+// read as a flag. server/agent-model-catalog.js carries the same pattern for
+// the write routes and the spawn path (Node can't load this .ts there);
+// server/agentModels.test.js asserts the two are identical.
+export const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$/;
+
+export function isValidModelId(id: unknown): id is string {
+  return typeof id === "string" && MODEL_ID_PATTERN.test(id);
+}
+
+// Discovered model ids per backend (command basename), as returned by
+// GET /api/agent-model-catalog `models`. A backend absent here uses its
+// shipped list.
+export type DiscoveredModels = Record<string, string[]>;
+
+// Raw option list for a backend (includes the "" CLI-default row). A discovered
+// list replaces the shipped one; unknown backends fall back to a single
+// CLI-default row.
+export function optionsForBackend(backend: string, discovered?: DiscoveredModels) {
+  const found = discovered?.[backend];
+  if (found && found.length > 0) {
+    return [{ value: "", label: "(CLI default)" }, ...found.map((id) => ({ value: id, label: id }))];
+  }
   return MODEL_OPTIONS[backend] || [{ value: "", label: "(CLI default)" }];
 }
 
-// Concrete (non-"") model options for a backend — used by the inline Settings
-// dropdowns, which don't offer the "" CLI-default row. Unknown backends (or a
-// backend with no concrete models) fall back to Claude's list, so the dropdown
-// is never empty and `[0]` is always defined.
-export function modelsForBackend(backend: string) {
-  const opts = optionsForBackend(backend).filter((o) => o.value !== "");
-  return opts.length > 0 ? opts : optionsForBackend("claude").filter((o) => o.value !== "");
+// Every id QuadWork knows for a backend: shipped ∪ discovered.
+function knownFor(backend: string, discovered?: DiscoveredModels) {
+  return new Set([
+    ...(MODEL_OPTIONS[backend] || []).map((o) => o.value),
+    ...(discovered?.[backend] || []),
+  ].filter((v) => v !== ""));
 }
 
-// The model to DISPLAY in an inline dropdown: the saved model if it is a
-// concrete valid option for the backend, else the backend's first concrete
-// option — so an unset ("") or stale/cross-backend value (e.g. a Claude
-// "sonnet" left on a codex agent) never renders blank or as the wrong model.
-export function effectiveModel(backend: string, model: string | undefined) {
-  const opts = modelsForBackend(backend);
-  return model && opts.some((o) => o.value === model) ? model : opts[0].value;
+// The model to PERSIST (and display in Settings, so what is shown is what a
+// save writes). #1172 heal rule, replacing the #931 first-option heal:
+//   - "" / unset stays "" (CLI default);
+//   - a model known for a different backend (shipped or discovered) and not
+//     for this one heals to "" (e.g. a Claude "sonnet" left on a codex agent);
+//   - anything else is kept as-is — never silently rewritten. If the backend
+//     does not list it, `modelChoices` flags it.
+export function sanitizeModel(backend: string, model: string | undefined | null, discovered?: DiscoveredModels) {
+  if (!model) return "";
+  if (knownFor(backend, discovered).has(model)) return model;
+  const backends = new Set([...Object.keys(MODEL_OPTIONS), ...Object.keys(discovered || {})]);
+  for (const other of backends) {
+    if (other !== backend && knownFor(other, discovered).has(model)) return "";
+  }
+  return model;
 }
 
-// The model to PERSIST: heal a non-empty model that is not valid for the
-// backend (the #931 bug — the old hardcoded dropdown could save a Claude model
-// onto a codex/gemini agent, which the spawn path then forwards as an invalid
-// `-c model=` / `--model`). "" is kept as-is — it means "use the CLI default",
-// which is valid for every CLI, so we never clobber a deliberate default.
-export function sanitizeModel(backend: string, model: string | undefined) {
-  if (!model) return model ?? "";
-  const opts = modelsForBackend(backend);
-  return opts.some((o) => o.value === model) ? model : opts[0].value;
+// Sentinel <option> value for "enter a model id by hand". Starts with "_", so
+// it can never collide with a valid model id.
+export const CUSTOM_MODEL_VALUE = "__custom__";
+
+export type ModelChoiceFlag = "not_offered" | "invalid";
+
+// The <select> rows for one agent, shared by both surfaces: the CLI-default
+// row, the backend's listed models, and — if the saved model is not listed —
+// that saved model kept selectable with a flag ("not_offered" when it is a
+// well-formed id the CLI does not list, "invalid" when it fails
+// MODEL_ID_PATTERN and would be refused on save / at spawn).
+export function modelChoices(backend: string, saved: string | undefined | null, discovered?: DiscoveredModels) {
+  const rows: { value: string; label: string; flag?: ModelChoiceFlag }[] = [...optionsForBackend(backend, discovered)];
+  if (saved && !rows.some((o) => o.value === saved)) {
+    rows.push({ value: saved, label: saved, flag: isValidModelId(saved) ? "not_offered" : "invalid" });
+  }
+  return rows;
 }
