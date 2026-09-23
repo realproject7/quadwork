@@ -184,6 +184,26 @@ async function main() {
       await buildAgentArgs("p1", "grok_valid");
       ok(markerRuns().length === 2, "AC7: spawning after discovery still never runs it");
     }
+
+    // ── AC3: the legacy whole-config PUT /api/config rejects invalid ids too ──
+    {
+      const putConfig = (body) => req(server, { method: "PUT", urlPath: "/api/config", body });
+      const before = JSON.stringify(readCfg());
+      // The on-disk p1 fixture holds hand-edited invalid ids (spawn checks above).
+      const r = await putConfig({ ...readCfg(), operator_name: "changed-by-rejected-put" });
+      ok(r.status === 400 && r.body.ok === false && /^Invalid model id for p1\/codex_quote, p1\/codex_dash, p1\/codex_space/.test(r.body.error),
+        "AC3: PUT /api/config rejects a config whose agent models fail the id pattern (400, names the agents)");
+      ok(JSON.stringify(readCfg()) === before, "AC3: a rejected whole-config PUT writes nothing");
+      const clean = readCfg();
+      clean.projects = clean.projects.filter((p) => p.id === "p2");
+      clean.projects[0].agents.dev.model = "gpt 5";
+      const r2 = await putConfig(clean);
+      ok(r2.status === 400 && r2.body.error === "Invalid model id for p2/dev", "AC3: PUT rejects whitespace in a single agent's model");
+      clean.projects[0].agents.dev.model = "claude-opus-5-5";
+      const r3 = await putConfig(clean);
+      ok(r3.status === 200 && readCfg().projects.length === 1 && readCfg().projects[0].agents.dev.model === "claude-opus-5-5",
+        "AC3: PUT with only well-formed models is written");
+    }
   } finally {
     server.close();
   }

@@ -106,6 +106,10 @@ const REQUIRE_RE = /require\(\s*["'](\.[^"']*)["']\s*\)/g;
     'src/lib/injectMode.js is require()d by runtime code and must stay in the tarball (#937)',
   );
   assert.ok(
+    shipped.has("src/lib/modelId.js"),
+    "src/lib/modelId.js (model-id pattern) is require()d by server/agent-model-catalog.js and must ship (#1172)",
+  );
+  assert.ok(
     shipped.has("src/lib/batchIdentity.js"),
     "Operator MCP batch actions require the shared assignment-identity helper in installed packages (#1031)",
   );

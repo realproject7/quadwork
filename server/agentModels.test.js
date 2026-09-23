@@ -12,14 +12,13 @@ const fs = require("fs");
 const path = require("path");
 const {
   MODEL_OPTIONS,
-  MODEL_ID_PATTERN,
   isValidModelId,
   optionsForBackend,
   modelChoices,
   sanitizeModel,
   CUSTOM_MODEL_VALUE,
+  MODEL_FLAG_COPY,
 } = require("../src/lib/agentModels.ts");
-const serverCatalog = require("./agent-model-catalog");
 
 let passed = 0,
   failed = 0;
@@ -85,8 +84,25 @@ ok(sanitizeModel("codex", "my-proxy/gpt-x") === "my-proxy/gpt-x", "#1172 AC6: a 
 {
   const rows = modelChoices("codex", "gpt-5.4");
   const stale = rows.find((o) => o.value === "gpt-5.4");
-  ok(stale && stale.flag === "not_offered", "#1172 AC6: a kept unlisted model stays selectable, flagged not_offered");
+  ok(stale && stale.flag === "not_known",
+    "#1172 AC6: a kept unlisted model stays selectable; with no discovered list it is flagged not_known (the CLI was not checked)");
   ok(rows.filter((o) => o.flag).length === 1, "#1172 AC6: only the stale row is flagged");
+  ok(modelChoices("codex", "gpt-5.4", discovered).find((o) => o.value === "gpt-5.4").flag === "not_offered",
+    "#1172 AC6: when discovery for the backend succeeded, an unlisted model is flagged not_offered");
+  ok(modelChoices("codex", "gpt-5.4", { grok: ["grok-5"] }).find((o) => o.value === "gpt-5.4").flag === "not_known",
+    "#1172 AC6: discovery for another backend does not make this one 'not offered'");
+  ok(modelChoices("claude", "my-model").find((o) => o.value === "my-model").flag === "not_known",
+    "#1172 AC6: a backend with no discovery source flags an unlisted model not_known");
+  {
+    const leftover = modelChoices("codex", "sonnet").find((o) => o.value === "sonnet");
+    ok(leftover && leftover.flag === "other_backend",
+      "#1172 AC6: a cross-backend leftover (sonnet on codex) is shown as-is, flagged other_backend (not displayed as healed)");
+  }
+  ok(/another CLI/.test(MODEL_FLAG_COPY.en.other_backend) && /Save/.test(MODEL_FLAG_COPY.en.other_backend) && /CLI default/.test(MODEL_FLAG_COPY.en.other_backend),
+    "#1172: the other_backend flag says it is another CLI's model and that Save resets it to the CLI default");
+  ok(MODEL_FLAG_COPY.en.not_offered === "(not offered by CLI)" && MODEL_FLAG_COPY.en.not_known === "(not in the known list)",
+    "#1172: 'not offered by CLI' only for a checked CLI, 'not in the known list' otherwise");
+  ok(Object.keys(MODEL_FLAG_COPY.en).sort().join() === Object.keys(MODEL_FLAG_COPY.ko).sort().join(), "#1172: every flag has en + ko copy");
   ok(!values(optionsForBackend("codex")).includes("gpt-5.4"), "#1172: modelChoices never mutates the shipped list");
   ok(!modelChoices("codex", "gpt-7-nova", discovered).some((o) => o.flag), "#1172: a discovered model is not flagged");
   ok(modelChoices("codex", "gpt-6-astra", discovered).find((o) => o.value === "gpt-6-astra").flag === undefined,
@@ -105,11 +121,6 @@ ok(!isValidModelId("gpt 5") && !isValidModelId(" gpt-5") && !isValidModelId("gpt
   "#1172 AC3: whitespace is rejected");
 ok(!isValidModelId("") && !isValidModelId(null) && !isValidModelId(5), "#1172 AC3: empty / non-string is not a model id");
 ok(!isValidModelId(CUSTOM_MODEL_VALUE), "#1172: the Other… sentinel can never collide with a valid id");
-ok(MODEL_ID_PATTERN.source === serverCatalog.MODEL_ID_PATTERN.source && MODEL_ID_PATTERN.flags === serverCatalog.MODEL_ID_PATTERN.flags,
-  "#1172: the UI and server model-id patterns are identical");
-for (const id of ["gpt-5", 'gpt"5', "-x", "a b", "a".repeat(129), "org/m:1@x"]) {
-  ok(isValidModelId(id) === serverCatalog.isValidModelId(id), `#1172: UI and server validators agree on ${JSON.stringify(id)}`);
-}
 ok(Object.values(MODEL_OPTIONS).flat().every((o) => o.value === "" || isValidModelId(o.value)), "#1172: every shipped id is well-formed");
 
 // ── Wiring: both surfaces use the shared helpers (source assertions) ──
@@ -123,6 +134,14 @@ ok(Object.values(MODEL_OPTIONS).flat().every((o) => o.value === "" || isValidMod
     "#1172 AC1/AC2: Settings lists discovered models and offers hand entry");
   ok(settings.includes("sanitizeModel(cliBaseFromCommand(a.command), a.model, discoveredModels)") && settings.includes("setSaveError(t.invalidModelIds("),
     "#1172 AC3/AC6: Settings save applies the heal rule and refuses an invalid id");
+  ok(settings.includes(": agent.model || \"\"}") && settings.includes("modelChoices(cliBaseFromCommand(agent.command), agent.model, discoveredModels)"),
+    "#1172: the Settings select shows the raw saved model (what the agent runs), like the modal");
+  ok(settings.includes("throw new Error(data.error || `Save failed (${res.status})`)") && settings.includes("setSaveError((err as Error).message)"),
+    "#1172: a server-rejected Settings save shows the server's error in the saveError UI");
+  ok(modal.includes("if (await update(row.agent_id, { model: id })) setCustomFor(null);"),
+    "#1172: a rejected Other… id keeps the input (and its typed text) open");
+  ok(settings.includes("${t[m.flag]}") && modal.includes("${t[opt.flag]}") && settings.includes("...MODEL_FLAG_COPY.en") && modal.includes("...MODEL_FLAG_COPY.en"),
+    "#1172: both surfaces render the same shared flag wording");
   ok(modal.includes("modelChoices(row.backend, row.model, discovered)") && modal.includes("CUSTOM_MODEL_VALUE") && modal.includes('fetch("/api/agent-model-catalog")'),
     "#1172 AC1/AC2/AC4: the modal lists discovered models, keeps the CLI-default row and offers hand entry");
 }

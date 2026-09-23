@@ -56,16 +56,10 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
   ],
 };
 
-// #1172: the one accepted model-id shape. It excludes quotes, whitespace and a
-// leading "-", so an id can never break Codex's `-c model="<id>"` quoting or be
-// read as a flag. server/agent-model-catalog.js carries the same pattern for
-// the write routes and the spawn path (Node can't load this .ts there);
-// server/agentModels.test.js asserts the two are identical.
-export const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$/;
-
-export function isValidModelId(id: unknown): id is string {
-  return typeof id === "string" && MODEL_ID_PATTERN.test(id);
-}
+// #1172: the one accepted model-id shape lives in the plain-JS modelId.js,
+// shared with the server's write routes and spawn path.
+import { isValidModelId } from "./modelId.js";
+export { MODEL_ID_PATTERN, isValidModelId } from "./modelId.js";
 
 // Discovered model ids per backend (command basename), as returned by
 // GET /api/agent-model-catalog `models`. A backend absent here uses its
@@ -112,17 +106,46 @@ export function sanitizeModel(backend: string, model: string | undefined | null,
 // it can never collide with a valid model id.
 export const CUSTOM_MODEL_VALUE = "__custom__";
 
-export type ModelChoiceFlag = "not_offered" | "invalid";
+// Why a saved model is not one of the backend's listed rows:
+//   - "other_backend": known for a different CLI and not this one; a Settings
+//     save heals it to "" (CLI default) — see sanitizeModel;
+//   - "invalid": fails MODEL_ID_PATTERN; refused on save and never spawned;
+//   - "not_offered": discovery for this backend succeeded and did not list it;
+//   - "not_known": no discovered list for this backend (no discovery source,
+//     discovery failed, or still loading) and the shipped list lacks it — the
+//     CLI was not checked, so nothing is claimed about what it offers.
+export type ModelChoiceFlag = "other_backend" | "invalid" | "not_offered" | "not_known";
 
 // The <select> rows for one agent, shared by both surfaces: the CLI-default
 // row, the backend's listed models, and — if the saved model is not listed —
-// that saved model kept selectable with a flag ("not_offered" when it is a
-// well-formed id the CLI does not list, "invalid" when it fails
-// MODEL_ID_PATTERN and would be refused on save / at spawn).
+// that saved model, kept selectable (the surfaces show what the agent actually
+// runs) with a ModelChoiceFlag.
 export function modelChoices(backend: string, saved: string | undefined | null, discovered?: DiscoveredModels) {
   const rows: { value: string; label: string; flag?: ModelChoiceFlag }[] = [...optionsForBackend(backend, discovered)];
   if (saved && !rows.some((o) => o.value === saved)) {
-    rows.push({ value: saved, label: saved, flag: isValidModelId(saved) ? "not_offered" : "invalid" });
+    const flag: ModelChoiceFlag = !isValidModelId(saved)
+      ? "invalid"
+      : sanitizeModel(backend, saved, discovered) === ""
+        ? "other_backend"
+        : (discovered?.[backend]?.length ?? 0) > 0 ? "not_offered" : "not_known";
+    rows.push({ value: saved, label: saved, flag });
   }
   return rows;
 }
+
+// Flag suffixes, keyed by ModelChoiceFlag. One copy for both surfaces so the
+// Settings row and the Agent Models modal say the same thing.
+export const MODEL_FLAG_COPY: Record<"en" | "ko", Record<ModelChoiceFlag, string>> = {
+  en: {
+    other_backend: "(another CLI's model; Save in Settings resets it to CLI default)",
+    invalid: "(invalid id)",
+    not_offered: "(not offered by CLI)",
+    not_known: "(not in the known list)",
+  },
+  ko: {
+    other_backend: "(다른 CLI의 모델, 설정에서 저장하면 CLI 기본값으로 재설정)",
+    invalid: "(잘못된 ID)",
+    not_offered: "(CLI 목록에 없음)",
+    not_known: "(알려진 목록에 없음)",
+  },
+};

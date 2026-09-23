@@ -22,7 +22,7 @@
 import { useCallback, useEffect, useState } from "react";
 import InfoTooltip from "./InfoTooltip";
 import { useLocale } from "@/components/LocaleProvider";
-import { modelChoices, isValidModelId, CUSTOM_MODEL_VALUE, type DiscoveredModels } from "@/lib/agentModels";
+import { modelChoices, isValidModelId, CUSTOM_MODEL_VALUE, MODEL_FLAG_COPY, type DiscoveredModels } from "@/lib/agentModels";
 
 const COPY = {
   en: {
@@ -33,8 +33,7 @@ const COPY = {
     restartRequiredTooltip: "Config changed — running session is still on the old model/effort. Click Restart to apply.",
     default: "(default)",
     // #1172: stale-model flags + hand-entered model id.
-    notOffered: "(not offered by CLI)",
-    invalidModel: "(invalid id)",
+    ...MODEL_FLAG_COPY.en,
     other: "Other…",
     customPlaceholder: "model id",
     set: "Set",
@@ -66,8 +65,7 @@ const COPY = {
     restartRequired: "재시작 필요",
     restartRequiredTooltip: "설정이 변경되었습니다. 실행 중인 세션에는 이전 설정이 적용되어 있습니다. 재시작을 클릭하여 적용하세요.",
     default: "(기본값)",
-    notOffered: "(CLI 목록에 없음)",
-    invalidModel: "(잘못된 ID)",
+    ...MODEL_FLAG_COPY.ko,
     other: "직접 입력…",
     customPlaceholder: "모델 ID",
     set: "적용",
@@ -171,6 +169,7 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Resolves true when the server accepted the change.
   const update = async (agentId: string, patch: Partial<Pick<AgentRow, "model" | "reasoning_effort">>) => {
     setBusy(agentId);
     setError(null);
@@ -190,8 +189,10 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
         return next;
       });
       await load();
+      return true;
     } catch (e) {
       setError((e as Error).message);
+      return false;
     } finally {
       setBusy(null);
     }
@@ -286,7 +287,7 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
                 {modelChoices(row.backend, row.model, discovered).map((opt) => (
                   <option key={opt.value} value={opt.value} className="bg-bg-surface">
                     {opt.label}
-                    {opt.flag === "not_offered" ? ` ${t.notOffered}` : opt.flag === "invalid" ? ` ${t.invalidModel}` : ""}
+                    {opt.flag ? ` ${t[opt.flag]}` : ""}
                   </option>
                 ))}
                 <option value={CUSTOM_MODEL_VALUE} className="bg-bg-surface">{t.other}</option>
@@ -318,15 +319,16 @@ function AgentModelsModal({ projectId, onClose }: { projectId: string; onClose: 
               {customFor === row.agent_id && (
                 <form
                   className="flex items-center gap-1 basis-full pl-[7.5rem]"
-                  onSubmit={(e) => {
+                  onSubmit={async (e) => {
                     e.preventDefault();
                     const id = customDraft.trim();
                     if (id && !isValidModelId(id)) {
                       setError(t.invalidModelError);
                       return;
                     }
-                    setCustomFor(null);
-                    update(row.agent_id, { model: id });
+                    // #1172: a rejected id keeps the input open with the typed
+                    // text; the server's error shows in the header.
+                    if (await update(row.agent_id, { model: id })) setCustomFor(null);
                   }}
                 >
                   <input

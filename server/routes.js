@@ -38,7 +38,7 @@ const {
 const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canonicalSha, evaluateCiEvidence, deriveCiPolicyIdentity } = require("./ci-evidence-policy");
 const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
-const { isValidModelId } = require("./agent-model-catalog");
+const { isValidModelId, invalidAgentModelRefs } = require("./agent-model-catalog");
 const { admissionMatchesContext } = require("./head-ticket-review-admission");
 
 const router = express.Router();
@@ -533,6 +533,11 @@ function preserveProjectEnvironmentSettings(existing, incoming) {
 }
 
 router.put("/api/config", (req, res) => {
+  // #1172: same model-id check as the PATCH below (every config write path).
+  const invalidModels = invalidAgentModelRefs(req.body && req.body.projects);
+  if (invalidModels.length > 0) {
+    return res.status(400).json({ ok: false, error: `Invalid model id for ${invalidModels.join(", ")}` });
+  }
   try {
     const body = req.body;
     const dir = path.dirname(CONFIG_PATH);
@@ -617,10 +622,7 @@ router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   // #1172: the Settings save writes agent models through here — reject any
   // non-empty model outside MODEL_ID_PATTERN, as the agent-models PUT does.
-  const invalidModels = (Array.isArray(body.projects) ? body.projects : []).flatMap((project) =>
-    Object.entries((project && project.agents) || {})
-      .filter(([, agent]) => agent && agent.model !== undefined && agent.model !== null && agent.model !== "" && !isValidModelId(agent.model))
-      .map(([agentId]) => `${project.id}/${agentId}`));
+  const invalidModels = invalidAgentModelRefs(body.projects);
   if (invalidModels.length > 0) {
     return res.status(400).json({ ok: false, error: `Invalid model id for ${invalidModels.join(", ")}` });
   }

@@ -6,6 +6,7 @@
 // execFile paths, not a stubbed runner. No provider CLI is ever started here.
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const {
   parseCodexModels,
@@ -44,7 +45,7 @@ const CODEX_FIXTURE = JSON.stringify({
 const GROK_UNAUTHENTICATED = "You are not authenticated.\n\nDefault model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n";
 
 // A source that runs `node -e <script>` and parses stdout like codex's does.
-const nodeSource = (script) => ({ command: process.execPath, args: ["-e", script], parse: parseCodexModels });
+const nodeSource = (script) => ({ name: "codex debug models", command: process.execPath, args: ["-e", script], parse: parseCodexModels });
 const printFixture = `process.stdout.write(${JSON.stringify(CODEX_FIXTURE)})`;
 
 async function main() {
@@ -91,7 +92,7 @@ async function main() {
     ok(Object.keys(r.errors).length === 0, "a successful discovery reports no error");
   }
   {
-    const grokSource = (script) => ({ ...nodeSource(script), parse: parseGrokModels });
+    const grokSource = (script) => ({ ...nodeSource(script), name: "grok models", parse: parseGrokModels });
     const r = await discoverAgentModels({ sources: {
       grok: grokSource(`process.stdout.write(${JSON.stringify(GROK_UNAUTHENTICATED)})`),
     } });
@@ -110,7 +111,7 @@ async function main() {
 
   // ── AC8: every failure drops the backend (→ shipped list) and never throws ──
   const failures = {
-    "missing CLI": { command: path.join(__dirname, "no-such-cli-1172"), args: [], parse: parseCodexModels },
+    "missing CLI": { name: "codex debug models", command: path.join(__dirname, "no-such-cli-1172"), args: [], parse: parseCodexModels },
     "non-zero exit (e.g. not logged in / offline)": nodeSource('process.stderr.write("not logged in"); process.exit(1)'),
     "changed output format": nodeSource('process.stdout.write("Available models:\\n  gpt-7\\n")'),
     "empty list": nodeSource('process.stdout.write(JSON.stringify({ models: [] }))'),
@@ -119,6 +120,23 @@ async function main() {
     const r = await discoverAgentModels({ sources: { codex: source } });
     ok(!("codex" in r.models) && typeof r.errors.codex === "string" && r.errors.codex.length > 0 && !/not logged in/.test(r.errors.codex),
       `AC8: ${label} → no discovered list, short error recorded without CLI stderr (${r.errors.codex})`);
+  }
+
+  // ── parse failures report a fixed message, never text from the CLI output ──
+  for (const [label, out] of [
+    ["invalid JSON", "SECRET-acct-9f3e not json"],
+    ["JSON of another shape", JSON.stringify({ SECRET: "acct-9f3e" })],
+    ["JSON that is not an object", JSON.stringify("SECRET-acct-9f3e")],
+  ]) {
+    const r = await discoverAgentModels({ sources: { codex: nodeSource(`process.stdout.write(${JSON.stringify(out)})`) } });
+    ok(r.errors.codex === "unexpected `codex debug models` output",
+      `AC8: ${label} → the fixed "unexpected \`codex debug models\` output" message (got ${JSON.stringify(r.errors.codex)})`);
+  }
+  {
+    const r = await discoverAgentModels({ sources: {
+      grok: { ...nodeSource('process.stdout.write("Available models:\\n  SECRET-acct-9f3e grok\\n")'), name: "grok models", parse: parseGrokModels },
+    } });
+    ok(r.errors.grok === "unexpected `grok models` output", "AC8: a grok parse failure reports the fixed message");
   }
 
   // ── AC7/AC8: timeout is bounded and falls back ──
@@ -132,6 +150,33 @@ async function main() {
     ok(!("codex" in r.models) && /timed out/.test(r.errors.codex || ""), "AC8: a hung CLI times out → no discovered list");
     ok(elapsed < 5000, `AC7: the timeout bounds discovery (${elapsed}ms for a 30s hang)`);
     ok(r.models.other && r.models.other.length === 2, "a timeout on one backend does not drop another backend's result");
+  }
+
+  // ── a timeout kills the CLI's whole process group (no orphaned helpers) ──
+  if (process.platform === "win32") {
+    console.log("  SKIP: process-group kill check (POSIX process groups; not run on Windows)");
+  } else {
+    const pidFile = path.join(os.tmpdir(), `qw-1172-grandchild-${process.pid}.pid`);
+    try { fs.rmSync(pidFile, { force: true }); } catch {}
+    // Stand-in CLI: starts a detached-from-its-stdio sleeping helper, records
+    // its pid, then hangs itself.
+    const spawnsHelper =
+      'const { spawn } = require("child_process");' +
+      `const g = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });` +
+      `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));` +
+      "setTimeout(() => {}, 30000);";
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const r = await discoverAgentModels({ sources: { codex: nodeSource(spawnsHelper) }, timeoutMs: 1000 });
+    const helperPid = Number(fs.readFileSync(pidFile, "utf8"));
+    let gone = false;
+    for (let i = 0; i < 40 && !gone; i++) {
+      gone = !alive(helperPid);
+      if (!gone) await new Promise((res) => setTimeout(res, 50));
+    }
+    ok(/timed out/.test(r.errors.codex || ""), "AC7: the stand-in that spawned a helper timed out");
+    ok(helperPid > 0 && gone, "AC7: the helper (grandchild) is gone after the timeout — the whole group was killed");
+    if (!gone) { try { process.kill(helperPid, "SIGKILL"); } catch {} }
+    try { fs.rmSync(pidFile, { force: true }); } catch {}
   }
 
   // ── stdin is closed: a CLI waiting for prompt input gets EOF, not a hang ──

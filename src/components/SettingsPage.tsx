@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "@/components/LocaleProvider";
-import { modelChoices, sanitizeModel, isValidModelId, CUSTOM_MODEL_VALUE, type DiscoveredModels } from "@/lib/agentModels";
+import { modelChoices, sanitizeModel, isValidModelId, CUSTOM_MODEL_VALUE, MODEL_FLAG_COPY, type DiscoveredModels } from "@/lib/agentModels";
 import { injectModeForCommand, cliBaseFromCommand } from "@/lib/injectMode";
 import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
@@ -339,8 +339,7 @@ const COPY = {
     unsavedChanges: "Unsaved changes",
     // #1172: model select — hand entry, stale-model flags, save rejection.
     otherModel: "Other…",
-    modelNotOffered: "(not offered by CLI)",
-    modelInvalid: "(invalid id)",
+    ...MODEL_FLAG_COPY.en,
     modelIdPlaceholder: "model id",
     invalidModelIds: (agents: string) =>
       `Not saved: invalid model id for ${agents}. Use letters, digits and . _ : / @ - (no spaces or quotes, not starting with -).`,
@@ -425,8 +424,7 @@ const COPY = {
     newProject: "새 프로젝트",
     unsavedChanges: "저장되지 않은 변경사항",
     otherModel: "직접 입력…",
-    modelNotOffered: "(CLI 목록에 없음)",
-    modelInvalid: "(잘못된 ID)",
+    ...MODEL_FLAG_COPY.ko,
     modelIdPlaceholder: "모델 ID",
     invalidModelIds: (agents: string) =>
       `저장되지 않음: ${agents}의 모델 ID가 잘못되었습니다. 영문, 숫자와 . _ : / @ - 만 사용할 수 있습니다 (공백·따옴표 불가, -로 시작 불가).`,
@@ -855,13 +853,18 @@ export default function SettingsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patchBody),
       });
-      if (!res.ok) throw new Error(`${res.status}`);
+      if (!res.ok) {
+        // #1172: surface the server's rejection (e.g. an invalid model id).
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Save failed (${res.status})`);
+      }
       setConfig(normalizedConfig);
       savedConfigRef.current = JSON.stringify(normalizedConfig);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       console.error(err);
+      setSaveError((err as Error).message);
     }
     setSaving(false);
   };
@@ -1790,13 +1793,15 @@ export default function SettingsPage() {
                               <select
                                 // #931/#1172: provider-aware model options keyed by the
                                 // command basename: "(CLI default)", the CLI-discovered
-                                // list (else the shipped one), a saved model the CLI does
-                                // not list (kept + flagged), and Other… for hand entry.
-                                // The value is what save persists, so an unset model
-                                // shows as the CLI default, never as a concrete model.
+                                // list (else the shipped one), the saved model if it is
+                                // not listed (kept + flagged), and Other… for hand entry.
+                                // The value is the raw saved model — what the agent
+                                // actually runs — so an unset model shows as the CLI
+                                // default; a cross-backend leftover is flagged as healed
+                                // on save, exactly like the Agent Models modal.
                                 value={customModel[`${project.id}-${agentId}`]
                                   ? CUSTOM_MODEL_VALUE
-                                  : sanitizeModel(cliBaseFromCommand(agent.command), agent.model, discoveredModels)}
+                                  : agent.model || ""}
                                 onChange={(e) => {
                                   const custom = e.target.value === CUSTOM_MODEL_VALUE;
                                   setCustomModel({ ...customModel, [`${project.id}-${agentId}`]: custom });
@@ -1804,14 +1809,10 @@ export default function SettingsPage() {
                                 }}
                                 className="bg-transparent text-[11px] text-text outline-none border border-border px-1 py-0.5 focus:border-accent"
                               >
-                                {modelChoices(
-                                  cliBaseFromCommand(agent.command),
-                                  sanitizeModel(cliBaseFromCommand(agent.command), agent.model, discoveredModels),
-                                  discoveredModels,
-                                ).map((m) => (
+                                {modelChoices(cliBaseFromCommand(agent.command), agent.model, discoveredModels).map((m) => (
                                   <option key={m.value} value={m.value} className="bg-bg-surface">
                                     {m.label}
-                                    {m.flag === "not_offered" ? ` ${t.modelNotOffered}` : m.flag === "invalid" ? ` ${t.modelInvalid}` : ""}
+                                    {m.flag ? ` ${t[m.flag]}` : ""}
                                   </option>
                                 ))}
                                 <option value={CUSTOM_MODEL_VALUE} className="bg-bg-surface">{t.otherModel}</option>

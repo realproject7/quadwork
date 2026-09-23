@@ -2,11 +2,9 @@
 
 // #1172: model-id validation + per-CLI model discovery.
 //
-// Validation: MODEL_ID_PATTERN is the one accepted model-id shape, enforced by
-// the agent-models PUT route and by buildAgentArgs at spawn. It mirrors
-// src/lib/agentModels.ts (Node can't load that .ts in production and the
-// package doesn't ship src/lib/agentModels.ts); server/agentModels.test.js
-// asserts the two patterns are identical.
+// Validation: MODEL_ID_PATTERN (src/lib/modelId.js, shared with the UI) is the
+// one accepted model-id shape, enforced by the agent-models PUT route, the
+// config write routes and by buildAgentArgs at spawn.
 //
 // Discovery: asks an installed CLI which models it offers, so a new model is
 // selectable without a QuadWork release. Only CLIs with a model listing have a
@@ -21,19 +19,26 @@
 // non-interactively with stdin closed, so it can't sit on a login / trust /
 // consent prompt; QuadWork itself never reads provider auth files.
 
-const { execFile } = require("child_process");
+const { spawn } = require("child_process");
 const os = require("os");
 
-const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$/;
+const { MODEL_ID_PATTERN, isValidModelId } = require("../src/lib/modelId.js");
 
-function isValidModelId(id) {
-  return typeof id === "string" && MODEL_ID_PATTERN.test(id);
+// `<project id>/<agent id>` for every agent in a config write body whose
+// non-empty model fails MODEL_ID_PATTERN (the PUT and PATCH /api/config
+// handlers reject the write when this is non-empty).
+function invalidAgentModelRefs(projects) {
+  return (Array.isArray(projects) ? projects : []).flatMap((project) =>
+    Object.entries((project && project.agents) || {})
+      .filter(([, agent]) => agent && agent.model !== undefined && agent.model !== null && agent.model !== "" && !isValidModelId(agent.model))
+      .map(([agentId]) => `${project.id}/${agentId}`));
 }
 
 // `codex debug models` → { models: [{ slug, visibility, ... }] }. Hidden
 // (visibility "hide") entries are internal and not offered in the CLI picker.
 function parseCodexModels(stdout) {
-  const data = JSON.parse(stdout);
+  let data;
+  try { data = JSON.parse(stdout); } catch { data = null; }
   if (!data || !Array.isArray(data.models)) throw new Error("unexpected `codex debug models` output");
   return data.models
     .filter((m) => m && m.visibility === "list" && isValidModelId(m.slug))
@@ -67,36 +72,61 @@ function parseGrokModels(stdout) {
 // Keyed by command basename (cliBaseFromCommand), the same key as the rest of
 // the model catalog.
 const DISCOVERY_SOURCES = {
-  codex: { command: "codex", args: ["debug", "models"], parse: parseCodexModels },
-  grok: { command: "grok", args: ["models"], parse: parseGrokModels },
+  codex: { name: "codex debug models", command: "codex", args: ["debug", "models"], parse: parseCodexModels },
+  grok: { name: "grok models", command: "grok", args: ["models"], parse: parseGrokModels },
 };
 const DISCOVERY_TIMEOUT_MS = 5000;
 const DISCOVERY_CACHE_MS = 5 * 60 * 1000;
 // `codex debug models` prints ~400 KB today (per-model instructions included).
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
+// The CLI runs in its own process group (detached → setsid on POSIX), so a
+// timeout kills the whole group: a helper process the CLI spawned can't be
+// left running after QuadWork gave up on it.
+function killGroup(child) {
+  try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+}
+
 function runSource(source, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const child = execFile(source.command, source.args, {
+    let settled = false;
+    const finish = (err, stdout) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(stdout);
+    };
+    // stdin: a pipe closed at once (EOF — an interactive prompt can't wait for
+    // input); stderr is never read — it can carry account details.
+    const child = spawn(source.command, source.args, {
       cwd: os.tmpdir(),
-      timeout: timeoutMs,
-      killSignal: "SIGKILL",
-      maxBuffer: MAX_OUTPUT_BYTES,
+      detached: true,
+      stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
-    }, (err, stdout) => {
-      if (!err) return resolve(stdout);
-      // Short reasons only — never echo the CLI's stderr (it can carry account
-      // details) back to the dashboard.
-      if (err.killed && typeof err.code !== "string") return reject(new Error(`timed out after ${timeoutMs}ms`));
-      if (err.code === "ENOENT") return reject(new Error(`${source.command} not found`));
-      if (typeof err.code === "number") return reject(new Error(`exited with code ${err.code}`));
-      reject(new Error(err.code || "failed to run"));
     });
-    // No TTY and EOF on stdin: an interactive prompt can't wait for input.
-    if (child.stdin) {
-      child.stdin.on("error", () => {});
-      child.stdin.end();
-    }
+    const chunks = [];
+    let bytes = 0;
+    child.stdout.on("data", (d) => {
+      bytes += d.length;
+      if (bytes > MAX_OUTPUT_BYTES) {
+        killGroup(child);
+        return finish(new Error("output too large"));
+      }
+      chunks.push(d);
+    });
+    // Short fixed reasons only, never text from the CLI.
+    child.on("error", (err) => finish(new Error(err.code === "ENOENT" ? `${source.command} not found` : "failed to run")));
+    child.on("close", (code) => {
+      if (code === 0) finish(null, Buffer.concat(chunks).toString("utf8"));
+      else finish(new Error(code === null ? "failed to run" : `exited with code ${code}`));
+    });
+    const timer = setTimeout(() => {
+      if (child.pid) killGroup(child);
+      finish(new Error(`timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdin.on("error", () => {});
+    child.stdin.end();
   });
 }
 
@@ -107,7 +137,11 @@ async function discoverAgentModels({ sources = DISCOVERY_SOURCES, timeoutMs = DI
   const errors = {};
   await Promise.all(Object.entries(sources).map(async ([backend, source]) => {
     try {
-      const list = [...new Set(source.parse(await runSource(source, timeoutMs)))];
+      const stdout = await runSource(source, timeoutMs);
+      let parsed;
+      // A fixed message: never text derived from the CLI's output.
+      try { parsed = source.parse(stdout); } catch { throw new Error(`unexpected \`${source.name}\` output`); }
+      const list = [...new Set(parsed)];
       if (list.length === 0) throw new Error("no models listed");
       models[backend] = list;
     } catch (err) {
@@ -141,6 +175,7 @@ function createModelCatalogCache({ discover = discoverAgentModels, ttlMs = DISCO
 module.exports = {
   MODEL_ID_PATTERN,
   isValidModelId,
+  invalidAgentModelRefs,
   parseCodexModels,
   parseGrokModels,
   DISCOVERY_SOURCES,
