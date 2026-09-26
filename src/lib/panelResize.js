@@ -5,6 +5,25 @@ const TERMINAL_MIN_PANE_SIZE = 120;
 const RAIL_DIVIDER_SIZE = 4;
 const RAIL_MIN_PANEL_SIZE = 120;
 const RAIL_MIN_TERMINAL_SIZE = RAIL_MIN_PANEL_SIZE * 2 + TERMINAL_DIVIDER_SIZE + 28;
+// #1187: the chat/rail divider stops where every panel header still fits on
+// one line with all of its controls. Measured at 1260px in Geist Mono: the
+// chat header (title, ?, "Filter system log: off") needs 329px and the widest
+// rail header (Operator Features, ?, Hide) needs 224px.
+const COLUMN_DIVIDER_SIZE = 4;
+const CHAT_MIN_COLUMN_SIZE = 340;
+const RAIL_MIN_COLUMN_SIZE = 240;
+
+function clampColumnRatio(ratio, totalPx) {
+  const minimum = CHAT_MIN_COLUMN_SIZE / totalPx;
+  const maximum = (totalPx - COLUMN_DIVIDER_SIZE - RAIL_MIN_COLUMN_SIZE) / totalPx;
+  return Math.min(maximum, Math.max(minimum, ratio));
+}
+
+// The grid keeps the same minimums, so a window resize after a drag cannot
+// squeeze either column below its headers either.
+function dashboardColumnTemplate(ratio) {
+  return `minmax(${CHAT_MIN_COLUMN_SIZE}px, ${ratio * 100}%) ${COLUMN_DIVIDER_SIZE}px minmax(${RAIL_MIN_COLUMN_SIZE}px, 1fr)`;
+}
 
 function clampTerminalSplitRatio(ratio, totalPx) {
   const available = Math.max(1, totalPx - TERMINAL_DIVIDER_SIZE);
@@ -60,6 +79,11 @@ module.exports = {
   RAIL_DIVIDER_SIZE,
   RAIL_MIN_PANEL_SIZE,
   RAIL_MIN_TERMINAL_SIZE,
+  COLUMN_DIVIDER_SIZE,
+  CHAT_MIN_COLUMN_SIZE,
+  RAIL_MIN_COLUMN_SIZE,
+  clampColumnRatio,
+  dashboardColumnTemplate,
   clampTerminalSplitRatio,
   terminalGridLayout,
   railPanelMinimum,

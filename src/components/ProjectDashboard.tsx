@@ -11,7 +11,7 @@ import AgentTerminalsGrid from "./AgentTerminalsGrid";
 import OperatorFeaturesPanel from "./OperatorFeaturesPanel";
 import { useLocale } from "@/components/LocaleProvider";
 import { onIdleChange } from "@/lib/idle";
-import { RAIL_DIVIDER_SIZE, clampRailPair, railPanelMinimum } from "@/lib/panelResize";
+import { RAIL_DIVIDER_SIZE, clampColumnRatio, clampRailPair, dashboardColumnTemplate, railPanelMinimum } from "@/lib/panelResize";
 import {
   DEFAULT_PANEL_VISIBILITY,
   LEGACY_TERMINALS_COLLAPSED_KEY,
@@ -19,9 +19,6 @@ import {
   resolvePanelVisibility,
   serializePanelVisibility,
 } from "@/lib/panelVisibility";
-
-const MIN_SIZE = 150; // px
-const DIVIDER = 4; // px
 
 interface AgentSnapshot {
   projectId: string;
@@ -260,17 +257,6 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       : { projectId, states: { [agent]: state }, generations: {} });
   };
 
-  const clamp = useCallback(
-    (ratio: number, totalPx: number) => {
-      // Available space excludes the divider track
-      const available = totalPx - DIVIDER;
-      const minRatio = MIN_SIZE / totalPx;
-      const maxRatio = (available - MIN_SIZE) / totalPx;
-      return Math.min(maxRatio, Math.max(minRatio, ratio));
-    },
-    []
-  );
-
   // The desktop dashboard exposes every visual boundary as a real splitter.
   // The main divider controls chat versus the rail; each rail divider only
   // redistributes the two adjacent expanded panels, leaving the third intact.
@@ -281,7 +267,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       if (columnDragging.current && containerRef.current) {
         const rect = containerRef.current.getBoundingClientRect();
         const x = e.clientX - rect.left;
-        setColRatio(clamp(x / rect.width, rect.width));
+        setColRatio(clampColumnRatio(x / rect.width, rect.width));
       }
       const drag = railDragging.current;
       const rail = rightRailRef.current;
@@ -312,7 +298,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [clamp]);
+  }, []);
 
   const startColumnDrag = () => {
     columnDragging.current = true;
@@ -348,7 +334,7 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
     } as React.CSSProperties;
   };
 
-  const colTemplate = `${colRatio * 100}% ${DIVIDER}px 1fr`;
+  const colTemplate = dashboardColumnTemplate(colRatio);
 
   // On mobile (<lg): flex column layout, scrollable. Terminals + divider hidden;
   // GitHub and Operator Features stack below Primary Chat and stay collapsible.
@@ -400,8 +386,8 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           tabIndex={0}
           onMouseDown={startColumnDrag}
           onKeyDown={(event) => {
-            if (event.key === "ArrowLeft") { event.preventDefault(); setColRatio((value) => clamp(value - 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
-            if (event.key === "ArrowRight") { event.preventDefault(); setColRatio((value) => clamp(value + 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
+            if (event.key === "ArrowLeft") { event.preventDefault(); setColRatio((value) => clampColumnRatio(value - 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
+            if (event.key === "ArrowRight") { event.preventDefault(); setColRatio((value) => clampColumnRatio(value + 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
           }}
         />
 

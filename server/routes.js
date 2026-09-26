@@ -279,9 +279,13 @@ async function getReviewerRateLimit(projectId) {
 // #886/#893: build the reviewer block from a cache entry, or null when there's
 // no token / no bucket data (key omitted → single-account view unchanged).
 function reviewerRateLimitPayload(entry) {
-  if (!entry || (!entry.core && !entry.graphql && !entry.search)) return null;
+  if (!entry) return null;
   const out = {};
   if (entry.login) out.login = entry.login;
+  // #1187: the latest lookup for this token failed. Say so instead of sending
+  // the retained buckets, which the badge would show as the current budget.
+  if (entry.error) return { ...out, error: true };
+  if (!entry.core && !entry.graphql && !entry.search) return null;
   if (entry.core) out.core = bucketView(entry.core);
   if (entry.graphql) out.graphql = bucketView(entry.graphql);
   if (entry.search) out.search = bucketView(entry.search);
@@ -8326,6 +8330,9 @@ module.exports._resolveReviewerTokenPath = _resolveReviewerTokenPath;
 module.exports._reviewerTokenPathAllowed = _reviewerTokenPathAllowed;
 module.exports.getReviewerRateLimit = getReviewerRateLimit;
 module.exports.reviewerRateLimitPayload = reviewerRateLimitPayload;
+// #1187: expose the main rate-limit refresh so the badge test can drive a
+// failed and then a successful `gh api rate_limit` lookup through the route.
+module.exports.refreshRateLimit = refreshRateLimit;
 // #856: expose the auto-reseed startup hook + supporting state/version
 // helpers. server/index.js calls `autoReseedOnStartup` after config is
 // loaded; the helpers are exposed for unit tests + the integration test

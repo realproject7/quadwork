@@ -6,6 +6,11 @@ const {
   TERMINAL_MIN_PANE_SIZE,
   RAIL_DIVIDER_SIZE,
   RAIL_MIN_TERMINAL_SIZE,
+  COLUMN_DIVIDER_SIZE,
+  CHAT_MIN_COLUMN_SIZE,
+  RAIL_MIN_COLUMN_SIZE,
+  clampColumnRatio,
+  dashboardColumnTemplate,
   clampTerminalSplitRatio,
   terminalGridLayout,
   railPanelMinimum,
@@ -62,5 +67,25 @@ function renderedSize(ratios, id, totalPx, dividerCount) {
   assert.ok(renderedSize(keyboardNudge, "github", 900, 2) >= railPanelMinimum("github") - 0.001, "keyboard nudge also respects the adjacent minimum");
   console.log("  PASS: rail drag and keyboard nudges preserve terminal and adjacent-panel bounds");
 
-  console.log("\n3 passed, 0 failed\n");
+  // #1187: the chat/rail divider stops where the panel headers still fit on
+  // one line. Header widths measured live at 1260px (Geist Mono, en): chat
+  // 328.7px, widest rail header (Operator Features) 223.7px.
+  assert.ok(CHAT_MIN_COLUMN_SIZE >= 329, "the chat column minimum fits the measured chat header");
+  assert.ok(RAIL_MIN_COLUMN_SIZE >= 224, "the rail column minimum fits the widest measured rail header");
+  // Dashboard widths at lg: 1024 with the expanded sidebar, 1260 and 1920 with the collapsed one.
+  for (const total of [816, 1196, 1856]) {
+    const chatAtLeftStop = clampColumnRatio(-1, total) * total;
+    const railAtRightStop = total - COLUMN_DIVIDER_SIZE - clampColumnRatio(2, total) * total;
+    assert.ok(Math.abs(chatAtLeftStop - CHAT_MIN_COLUMN_SIZE) < 0.001, `${total}px: the left stop keeps the chat column at its minimum`);
+    assert.ok(Math.abs(railAtRightStop - RAIL_MIN_COLUMN_SIZE) < 0.001, `${total}px: the right stop keeps the rail column at its minimum`);
+    assert.equal(clampColumnRatio(0.5, total), 0.5, `${total}px: a centered ratio is unchanged`);
+  }
+  // The grid template enforces the same minimums as the drag/keyboard clamp.
+  assert.equal(
+    dashboardColumnTemplate(0.5),
+    `minmax(${CHAT_MIN_COLUMN_SIZE}px, 50%) ${COLUMN_DIVIDER_SIZE}px minmax(${RAIL_MIN_COLUMN_SIZE}px, 1fr)`,
+  );
+  console.log("  PASS: the chat/rail divider stops keep both columns wide enough for their headers");
+
+  console.log("\n4 passed, 0 failed\n");
 })();

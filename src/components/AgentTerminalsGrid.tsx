@@ -111,8 +111,10 @@ export default function AgentTerminalsGrid({ projectId, agentStates, agentGenera
           </div>
         }
       />
-      {expanded && (
-        <div id={bodyId} className="flex-1 min-h-0">
+      {/* #1187: the body element stays mounted (hidden) so the header's
+          aria-controls always resolves; only the viewers unmount (#668). */}
+      <div id={bodyId} className={expanded ? "flex-1 min-h-0" : "hidden"}>
+        {expanded && (
           <TerminalGrid
             projectId={projectId}
             agents={FOUR_AGENTS}
@@ -120,8 +122,8 @@ export default function AgentTerminalsGrid({ projectId, agentStates, agentGenera
             agentGenerations={agentGenerations}
             onStatusChange={onStatusChange}
           />
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
