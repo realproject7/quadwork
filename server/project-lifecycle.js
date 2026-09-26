@@ -31,6 +31,18 @@ function lifecycleError(code, projectId, message, status) {
   return new ProjectLifecycleError(code, projectId, message, status);
 }
 
+// #1184: archive, restore and remove are not a V2 activation boundary. On a
+// never-activated installation they are refused with nothing written, so the
+// operator activates V2 through the explicit, confirmed flow instead.
+function v2LifecycleUnavailable(projectId) {
+  return lifecycleError(
+    "v2_project_lifecycle_unavailable",
+    projectId,
+    "Activate V2 first: use V2 repository setup on a project, or Add Project (V2 setup) in Settings. Then archive, restore or remove.",
+    409,
+  );
+}
+
 function requireProjectId(projectId) {
   if (typeof projectId !== "string" || projectId.length === 0) {
     throw lifecycleError("invalid_project_id", projectId, "project id is required", 400);
@@ -359,7 +371,12 @@ function createProjectLifecycleController(options = {}) {
         : unarchiveProjectEnvironmentSettings(project);
       project.watch_batch_requests = governedEnvironmentSettings.watch_batch_requests;
       project.archived = archived;
-    }, lifecycleTransition);
+    }, lifecycleTransition, {
+      // #1184: the V2 commit asks for a new installation_id only when none is
+      // persisted, under config.lock and before it migrates or writes, so this
+      // refusal leaves a never-activated installation byte-for-byte unchanged.
+      idGenerator: () => { throw v2LifecycleUnavailable(projectId); },
+    });
     return { previousArchived, generation };
   }
 
@@ -414,6 +431,14 @@ function createProjectLifecycleController(options = {}) {
         current = readConfiguration();
       } catch {
         throw lifecycleError("project_config_unavailable", projectId, "project configuration is unavailable", 503);
+      }
+      // #1184: refuse an archived project before the V2 ownership preflight,
+      // which would otherwise fail on the absent identity. Absence is the test
+      // the V2 commit uses to decide activation. A project that is not
+      // archived still gets the no-op below, with no write or V2 validation.
+      if (!Object.prototype.hasOwnProperty.call(current || {}, "installation_id") &&
+          projectFromConfig(current, projectId)?.archived === true) {
+        throw v2LifecycleUnavailable(projectId);
       }
       const preflight = reserveUnarchiveOwnership(projectId, current, validateConfiguration);
       if (preflight.already_unarchived) {
