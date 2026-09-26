@@ -48,11 +48,13 @@ function realQuadworkDirs() {
 }
 const REAL_QUADWORK_DIRS = realQuadworkDirs();
 
-// Tests inherit this environment without gh's auth variables, so a gh that a
-// test still reaches (a real one, after this runner removed the stand-in) has
-// no operator auth to use. The throwaway HOME already hides the gh config.
+// Tests inherit this environment without gh's token variables, so no test
+// process sees the operator's gh token. Each test also gets a GH_CONFIG_DIR in
+// its throwaway HOME (runOne), which gh reads before XDG_CONFIG_HOME or HOME,
+// so a real gh reached anyway, for example by a shell that runs it by absolute
+// path, reads no gh config. It may still find a token in the OS keychain.
 const TEST_ENV = { ...process.env };
-for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR"]) delete TEST_ENV[key];
+for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) delete TEST_ENV[key];
 
 // The stand-in gh records the call in the calling file's report (inherited
 // env), so a call from a process that outlives its file is still charged to it.
@@ -128,6 +130,7 @@ function runOne(file, index) {
         QUADWORK_TEST_RUNTIME: "1",
         HOME: home,
         USERPROFILE: home,
+        GH_CONFIG_DIR: path.join(home, ".config", "gh"),
         ...(process.platform === "win32" ? {} : { PATH: `${GH_BIN}${path.delimiter}${process.env.PATH || ""}` }),
         NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require ${JSON.stringify(GUARD)}`].filter(Boolean).join(" "),
         QUADWORK_TEST_GUARDED_DIRS: JSON.stringify(guardedDirs),

@@ -52,21 +52,30 @@ function install(dirs) {
     return Object.assign(error, { code: "EACCES", errno: -13, syscall: op, path: target });
   }
 
-  function replace(owner, name, check) {
+  function replace(owner, name, check, { guardPromisified = false } = {}) {
     const original = owner[name];
     if (typeof original !== "function") return;
-    const guard = (fn) => function (...args) {
+    const wrapped = function (...args) {
       const result = check(args);
-      return result === undefined ? fn.apply(this, args) : result();
+      return result === undefined ? original.apply(this, args) : result();
     };
-    const wrapped = guard(original);
     for (const key of Reflect.ownKeys(original)) {
-      if (key !== "prototype" && key !== promisify.custom) Object.defineProperty(wrapped, key, Object.getOwnPropertyDescriptor(original, key));
+      if (key === "prototype" || (guardPromisified && key === promisify.custom)) continue;
+      Object.defineProperty(wrapped, key, Object.getOwnPropertyDescriptor(original, key));
     }
-    // util.promisify(wrapped) returns the custom form (execFile, exec). It
-    // calls the original directly, so it gets the same check.
+    // util.promisify(wrapped) returns the custom form when there is one. In
+    // child_process it calls the original directly, so it gets the same check,
+    // and a refusal rejects the way a failed call does.
     const custom = original[promisify.custom];
-    if (typeof custom === "function") Object.defineProperty(wrapped, promisify.custom, { value: guard(custom) });
+    if (guardPromisified && typeof custom === "function") {
+      Object.defineProperty(wrapped, promisify.custom, {
+        value: function (...args) {
+          const result = check(args);
+          if (result === undefined) return custom.apply(this, args);
+          try { return result(); } catch (error) { return Promise.reject(error); }
+        },
+      });
+    }
     owner[name] = wrapped;
     return wrapped;
   }
@@ -176,7 +185,7 @@ function install(dirs) {
       if (!target) return undefined;
       const error = refuse(`child_process.${name}${gh ? " (gh)" : ""}`, target);
       return () => { throw error; };
-    });
+    }, { guardPromisified: true });
   }
 }
 

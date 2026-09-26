@@ -31,15 +31,17 @@ fs.writeFileSync(operatorConfig, "{\"operator\":true}\n");
 const before = fs.statSync(operatorConfig).mtimeMs;
 
 const swallow = "const t = (fn) => { try { fn(); } catch {} };";
-const GH_AUTH_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR"];
+const GH_TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
 const fixtures = {
   // The ambient HOME is the runner's throwaway one: outside the runner it is
   // the operator's. Its .quadwork is absent and must stay absent.
   "1-ambient": `${swallow} const fs = require("fs"), path = require("path"), q = path.join(require("os").homedir(), ".quadwork");
     t(() => fs.mkdirSync(path.join(q, "p"), { recursive: true })); t(() => fs.readFileSync(path.join(q, "config.json")));`,
+  // A refused promisified call rejects the way a failed call does; it does not
+  // throw (that would exit 3).
   "2-gh": `${swallow} const cp = require("child_process");
     t(() => cp.execFileSync("gh", ["api", "rate_limit"])); t(() => cp.execSync("gh from-shell", { stdio: "ignore" }));
-    t(() => require("util").promisify(cp.execFile)("gh", ["promisified"]).catch(() => {}));`,
+    try { require("util").promisify(cp.execFile)("gh", ["promisified"]).catch(() => {}); } catch { process.exitCode = 3; }`,
   // A gh call recorded after its file exited is still charged to that file.
   "3-late": `require("child_process").spawn("sh", ["-c", "sleep 0.3; gh late"], { detached: true, stdio: "ignore" }).unref();`,
   // Files run in name order. Besides its own checks, this file's timer keeps
@@ -52,8 +54,10 @@ const fixtures = {
     require("child_process").spawnSync("true", [require("path").join(require("os").homedir(), ".quadwork-sibling")]);`,
   // A shell the preload cannot load into creates ~/.quadwork in the HOME.
   "6-shell": `require("child_process").execFileSync("sh", ["-c", "mkdir \\"$HOME/.quadwork\\""]);`,
-  // The runner's gh auth variables never reach a test.
-  "7-env": `process.exit(${JSON.stringify(GH_AUTH_ENV)}.some((key) => key in process.env) ? 1 : 0);`,
+  // The runner's gh tokens never reach a test, and gh's config dir is in the
+  // throwaway HOME whatever the runner had.
+  "7-env": `const inHome = String(process.env.GH_CONFIG_DIR).startsWith(require("os").homedir() + require("path").sep);
+    process.exit(${JSON.stringify(GH_TOKEN_ENV)}.some((key) => key in process.env) || !inHome ? 1 : 0);`,
 };
 for (const [name, source] of Object.entries(fixtures)) fs.writeFileSync(path.join(serverDir, `${name}.test.js`), source);
 
@@ -63,7 +67,7 @@ const run = spawnSync(process.execPath, [path.join(serverDir, "run-tests.js")], 
   timeout: 30_000,
   env: {
     ...process.env,
-    ...Object.fromEntries(GH_AUTH_ENV.map((key) => [key, "fixture"])),
+    ...Object.fromEntries([...GH_TOKEN_ENV, "GH_CONFIG_DIR"].map((key) => [key, "fixture"])),
     HOME: operatorHome,
     USERPROFILE: operatorHome,
     QW_GUARD_OPERATOR_CONFIG: operatorConfig,
@@ -96,4 +100,4 @@ assert.equal(fs.statSync(operatorConfig).mtimeMs, before, "the operator config w
 
 assert.deepEqual(verdict("5-clean"), ["▶ server/5-clean.test.js … PASS"]);
 assert.deepEqual(verdict("7-env"), ["▶ server/7-env.test.js … PASS"]);
-console.log("realHomeGuard.test.js: PASS (refused and charged: ambient HOME, operator HOME, gh, promisified gh, late gh, shell-made ~/.quadwork; clean file and sibling name pass; gh auth env stripped)");
+console.log("realHomeGuard.test.js: PASS (refused and charged: ambient HOME, operator HOME, gh, promisified gh, late gh, shell-made ~/.quadwork; clean file and sibling name pass; gh tokens stripped, gh config dir in HOME)");
