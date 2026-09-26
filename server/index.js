@@ -185,7 +185,10 @@ function emitSystemMessage(projectId, text) {
     if (isProjectArchived(projectId)) return;
     if (routes.getProjectChatMode(projectId) !== "file") return;
     fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
-  } catch {}
+  } catch (err) {
+    // #1183: a lifecycle line that cannot be written is logged, not lost silently.
+    console.error(`[file-chat] ${projectId}: lifecycle line "${text}" not recorded: ${err?.message || err}`);
+  }
 }
 
 const app = express();
@@ -1349,7 +1352,9 @@ function appendHeadRecoveryLifecycle(projectId, operation, reason) {
       batch_id: currentRecoveryBatchId(projectId, installationId),
     });
     return true;
-  } catch {
+  } catch (err) {
+    // #1183: a Head recovery line that cannot be written is logged, not lost silently.
+    console.error(`[file-chat] ${projectId}: Head recovery line not recorded: ${err?.message || err}`);
     return false;
   }
 }
@@ -3871,7 +3876,28 @@ async function cleanupProjectRuntime(projectId) {
   return aggregate;
 }
 
-const projectLifecycle = createProjectLifecycleController({ cleanupProject: cleanupProjectRuntime });
+// #1183: archive cleanup shuts the project's file chat down, and startup is
+// the only other place that starts it. Restore starts it again, so the chat and
+// its lifecycle lines work without a server restart. Nothing else comes back:
+// agent sessions, the Monitor and the bridges stay stopped until started.
+function restoreProjectChat(projectId) {
+  try {
+    if (routes.getProjectChatMode(projectId) === "file") fileChat.initProject(projectId);
+  } catch (err) {
+    // As in cleanup, the raw error stays in the server log and the response
+    // gets only the typed entry.
+    console.error(`[project-lifecycle] ${projectId}: file chat restart failed: ${err?.message || err}`);
+    throw Object.assign(new Error("Project chat could not start. Restart QuadWork to retry."), {
+      resource: "file_chat",
+      code: "file_chat_start_failed",
+    });
+  }
+}
+
+const projectLifecycle = createProjectLifecycleController({
+  cleanupProject: cleanupProjectRuntime,
+  restoreProject: restoreProjectChat,
+});
 app.set("projectLifecycle", projectLifecycle);
 
 function validateTriggerAutomationRequest(projectId, body = {}) {

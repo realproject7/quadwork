@@ -313,6 +313,7 @@ function normalizeCleanupResult(result) {
 function createProjectLifecycleController(options = {}) {
   const commitConfiguration = options.commitV2Configuration || commitProjectLifecycleConfiguration;
   const cleanupProject = options.cleanupProject;
+  const restoreProject = options.restoreProject;
   const revokeAdmission = options.revokeProjectAdmission || revokeProjectAdmission;
   const readConfiguration = options.readConfig || readConfig;
   const validateConfiguration = options.validateV2Configuration || validateV2Configuration;
@@ -398,6 +399,19 @@ function createProjectLifecycleController(options = {}) {
     }
   }
 
+  // #1183: archive cleanup stopped runtime that a restored project needs at
+  // once (its chat). The hook runs only after the restore commit, so a project
+  // that stays archived never gets it back. A failure is reported, not swallowed.
+  async function restoreUnarchivedProject(projectId) {
+    if (typeof restoreProject !== "function") return [];
+    try {
+      await restoreProject(projectId);
+      return [];
+    } catch (error) {
+      return [safeCleanupError(error)];
+    }
+  }
+
   async function archiveUnlocked(projectId, lifecycleTransition) {
     const committed = await commitArchived(projectId, true, lifecycleTransition);
     const generation = revokeAdmission(projectId, { generation: committed.generation });
@@ -472,14 +486,17 @@ function createProjectLifecycleController(options = {}) {
 
         const committed = await commitArchived(projectId, false, preflight.reservation);
         revokeAdmission(projectId, { generation: committed.generation });
+        // #1183: the project stays restored if its runtime cannot come back;
+        // the response says which part failed instead of claiming success.
+        const restoreErrors = await restoreUnarchivedProject(projectId);
         return {
-          ok: true,
+          ok: restoreErrors.length === 0,
           project_id: projectId,
           archived: false,
           already_unarchived: false,
           admission_generation: committed.generation,
           resources: cleanup.resources,
-          cleanup_errors: [],
+          cleanup_errors: restoreErrors,
         };
       } finally {
         releaseUnarchiveOwnership(projectId, preflight.reservation);
