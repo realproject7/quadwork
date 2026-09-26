@@ -149,6 +149,51 @@ assert.deepEqual(legacyCommitted.projects, [{ id: "keep" }]);
 assert.equal(legacyCommitted.concurrent_field, "preserve");
 assert.equal(fs.existsSync(legacyTargetDir), false);
 
+// #1210: cleanup refuses every QuadWork control entry through the shared
+// definition (server/control-entries.js), and leaves the entry in place. This
+// config is legacy, so cleanup would delete a directory entry it let through.
+const configBeforeRefusals = fs.readFileSync(CONFIG_PATH, "utf8");
+for (const [name, entry] of [
+  // The names the old cleanup list had.
+  [".env", ".env"], ["agentchattr", "agentchattr"], ["config.json", "config.json"], ["config.lock", "config.lock"],
+  ["reseed-state.json", "reseed-state.json"], ["reviewer-token", "reviewer-token"], ["server.pid", "server.pid"],
+  // Entries it lacked.
+  ["work-task-pipelines", "work-task-pipelines"], ["delivery-candidates", "delivery-candidates"], ["tmp", "tmp"],
+  ["resource-state.json", "resource-state.json"], ["tg-bridge.pid", "tg-bridge.pid"], ["server.pid.lock", "server.pid.lock"],
+  ["tg-bridge-cursor-keep.json", "tg-bridge-cursor-keep.json"], ["agentchattr-keep.pid", "agentchattr-keep.pid"],
+  // Case variants. On a case-insensitive file system they open the entry itself.
+  ["AgentChattr", "agentchattr"], ["Config.JSON", "config.json"], ["TMP", "tmp"],
+]) {
+  const entryPath = path.join(CONFIG_DIR, entry);
+  const made = !fs.existsSync(entryPath);
+  if (made) {
+    fs.mkdirSync(entryPath);
+    fs.writeFileSync(path.join(entryPath, "keep.txt"), "control-state");
+  }
+  assert.throws(
+    () => cleanupLegacyProjectAfterConfirmation(name),
+    (error) => error?.code === "invalid_project_id",
+    `cleanup rejects control entry ${name}`,
+  );
+  if (made) {
+    assert.equal(fs.readFileSync(path.join(entryPath, "keep.txt"), "utf8"), "control-state", `cleanup leaves ${entry} in place`);
+    fs.rmSync(entryPath, { recursive: true, force: true });
+  }
+}
+assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), configBeforeRefusals, "refused cleanups leave config.json unchanged");
+
+// A legacy project named like a mktemp -d folder is not the temp root, so its
+// cleanup still runs.
+const mktempNamed = "tmp.tdyHjGd4cU";
+fs.mkdirSync(path.join(CONFIG_DIR, mktempNamed));
+const withMktempNamed = JSON.parse(configBeforeRefusals);
+withMktempNamed.projects.push({ id: mktempNamed });
+fs.writeFileSync(CONFIG_PATH, JSON.stringify(withMktempNamed, null, 2));
+const mktempCleanup = cleanupLegacyProjectAfterConfirmation(mktempNamed);
+assert.equal(mktempCleanup.removedDirectory, true, `cleanup removes ${mktempNamed}`);
+assert.equal(mktempCleanup.removedConfigEntry, true, `cleanup removes the ${mktempNamed} config entry`);
+assert.deepEqual(JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")).projects, [{ id: "keep" }]);
+
 const legacyInstallDir = path.join(CONFIG_DIR, "agentchattr");
 fs.mkdirSync(legacyInstallDir, { recursive: true });
 fs.writeFileSync(path.join(legacyInstallDir, "keep.txt"), "legacy-runtime");

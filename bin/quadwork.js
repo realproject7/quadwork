@@ -15,6 +15,7 @@ const {
   commitConfigurationSnapshot,
 } = require("../server/config");
 const { normalizeCiPolicy } = require("../server/ci-evidence-policy");
+const { namesControlEntry } = require("../server/control-entries");
 const { createCliStopOwner, requestCliStop } = require("../server/cli-stop-owner");
 const { resolveCliExecutable } = require("../server/cli-executable");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
@@ -300,21 +301,12 @@ function writeConfig(config) {
 }
 
 function projectRuntimeDirectory(projectId) {
-  const reservedEntries = new Set([
-    ".env",
-    "agentchattr",
-    "config.json",
-    "config.lock",
-    "reseed-state.json",
-    "reviewer-token",
-    "server.pid",
-  ]);
   if (typeof projectId !== "string" || !projectId || projectId === "." || projectId === ".." || path.basename(projectId) !== projectId) {
     const error = new Error("project id must name one direct QuadWork config directory");
     error.code = "invalid_project_id";
     throw error;
   }
-  if (reservedEntries.has(projectId)) {
+  if (namesControlEntry(projectId)) {
     const error = new Error("project cleanup target is a reserved QuadWork control entry");
     error.code = "invalid_project_id";
     throw error;
