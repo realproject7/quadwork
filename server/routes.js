@@ -1092,6 +1092,7 @@ const {
   renderProjectRepositoryMap,
   writeProjectRepositoryMap,
 } = require("./repository-provisioning");
+const { namesControlEntry } = require("./control-entries");
 const {
   firstActivationLegacyGuard,
   targetActivationGuard,
@@ -6481,9 +6482,23 @@ function v2RepositoryRecords(repositories) {
   }));
 }
 
-function v2SetupProjectId(body) {
+// #1210: a new project's directory is ~/.quadwork/<id>. A new id must pass the
+// project-id rule and must not name one of QuadWork's own entries there, the
+// ones project cleanup refuses (control-entries.js).
+function assertNewProjectId(projectId) {
+  assertProjectId(projectId);
+  if (namesControlEntry(projectId)) throw new RepositoryProvisionError("invalid_project_id", "project id is reserved");
+  return projectId;
+}
+
+// An id configured in `config` keeps the project-id rule alone. Any other id is
+// new and must pass assertNewProjectId.
+function v2SetupProjectId(body, config) {
+  const id = body?.id;
+  const configured = typeof id === "string" && Array.isArray(config?.projects) &&
+    config.projects.some((project) => project?.id === id);
   try {
-    return { ok: true, project_id: assertProjectId(body?.id) };
+    return { ok: true, project_id: configured ? assertProjectId(id) : assertNewProjectId(id) };
   } catch (error) {
     return {
       ok: false,
@@ -6595,7 +6610,7 @@ router.post("/api/setup", async (req, res) => {
 
   switch (step) {
     case "verify-repositories": {
-      const projectId = v2SetupProjectId(body);
+      const projectId = v2SetupProjectId(body, readConfigFile());
       if (!projectId.ok) return res.status(400).json(projectId);
       let repositories;
       try { repositories = v2RepositoryRecords(body.repositories); }
@@ -6610,7 +6625,8 @@ router.post("/api/setup", async (req, res) => {
       return res.json({ ok: true, repositories: repositories.map((entry) => ({ key: entry.key, repo: entry.repo, primary: entry.primary })) });
     }
     case "provision-repositories": {
-      const projectId = v2SetupProjectId(body);
+      const cfg = readConfigFile();
+      const projectId = v2SetupProjectId(body, cfg);
       if (!projectId.ok) return res.status(400).json(projectId);
       let repositories;
       try { repositories = v2RepositoryRecords(body.repositories); }
@@ -6618,7 +6634,6 @@ router.post("/api/setup", async (req, res) => {
         const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
         return res.json({ ok: false, code, error: error.message });
       }
-      const cfg = readConfigFile();
       const existing = (cfg.projects || []).find((project) => project?.id === projectId.project_id) || null;
       const candidate = v2CandidateProject(existing, { ...body, id: projectId.project_id }, repositories);
       const readiness = projectV2Readiness(candidate);
@@ -6637,7 +6652,8 @@ router.post("/api/setup", async (req, res) => {
     }
     case "activate-v2": {
       if (body.confirm !== true) return res.status(400).json({ ok: false, code: "operator_confirmation_required" });
-      const projectId = v2SetupProjectId(body);
+      const cfg = readConfigFile();
+      const projectId = v2SetupProjectId(body, cfg);
       if (!projectId.ok) return res.status(400).json(projectId);
       let repositories;
       try { repositories = v2RepositoryRecords(body.repositories); }
@@ -6645,7 +6661,6 @@ router.post("/api/setup", async (req, res) => {
         const code = error instanceof RepositoryProvisionError ? error.code : "invalid_repositories";
         return res.status(400).json({ ok: false, code, error: error.message });
       }
-      const cfg = readConfigFile();
       const existing = (cfg.projects || []).find((project) => project?.id === projectId.project_id) || null;
       const candidate = v2CandidateProject(existing, { ...body, id: projectId.project_id }, repositories);
       const readiness = projectV2Readiness(candidate);
@@ -6697,6 +6712,10 @@ router.post("/api/setup", async (req, res) => {
           if (!currentFirstGuard.ok) throw new V2SetupActivationError(currentFirstGuard);
           const index = (fresh.projects || []).findIndex((project) => project?.id === candidate.id);
           const current = index >= 0 ? fresh.projects[index] : null;
+          // #1210: an id configured at the first check may be gone under
+          // config.lock. It is then new, so it must pass the new-id check.
+          const currentId = v2SetupProjectId(body, fresh);
+          if (!currentId.ok) throw new V2SetupActivationError(currentId);
           const currentGate = v2TopologyGuard(current, candidate.id, req.app);
           if (!currentGate.ok) throw new V2SetupActivationError(currentGate);
           const currentOwnership = configuredRepositoryOwnership(fresh, candidate.id, repositories);
@@ -6886,12 +6905,13 @@ router.post("/api/setup", async (req, res) => {
       try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
       catch { cfg = { port: 8400, projects: [] }; }
       // #1207: the writes below build ~/.quadwork/<id> paths from this id. A new
-      // id must pass the rule the V2 setup steps use. A configured id keeps its
+      // id must pass the rule the V2 setup steps use, which also refuses the
+      // names of QuadWork's own entries there (#1210). A configured id keeps its
       // re-run path while it names one direct directory there (#1203), since
       // CLI setup names a project after its folder. Any other id gets 400
       // before anything touches the disk.
       const configured = Array.isArray(cfg.projects) && cfg.projects.some((project) => project?.id === id);
-      if (configured ? !namesOneDirectDirectory(id) : !v2SetupProjectId(body).ok) {
+      if (configured ? !namesOneDirectDirectory(id) : !v2SetupProjectId(body, cfg).ok) {
         return res.status(400).json({ ok: false, code: "invalid_project_id" });
       }
       // Use directory basename for sibling paths (matches CLI wizard)
@@ -6943,10 +6963,10 @@ router.post("/api/setup", async (req, res) => {
               error.code = "QW_PROJECT_ALREADY_CONFIGURED";
               throw error;
             }
-            // #1207: a new id must pass the rule. The step's first check,
-            // before config.lock, may have found this id configured before
-            // another writer removed it.
-            assertProjectId(id);
+            // #1207, #1210: a new id must pass the new-id rule. The step's
+            // first check, before config.lock, may have found this id
+            // configured before another writer removed it.
+            assertNewProjectId(id);
             if (!Array.isArray(fresh.projects)) fresh.projects = [];
             fresh.projects.push({
               id,

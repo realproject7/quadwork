@@ -19,6 +19,12 @@
 // id that climbs out of ~/.quadwork or out of HOME still lands where the
 // snapshot sees it.
 //
+// #1210: a new id must also not name one of QuadWork's own entries under
+// ~/.quadwork (server/control-entries.js). Such an id gets 400 and touches
+// nothing, on add-config and on each V2 setup step, and add-config's V2 path
+// refuses it under config.lock too, as in the third case. A configured id with
+// such a name behaves as before on all four steps.
+//
 // Run through `npm test` (server/run-tests.js), never directly.
 
 const { test, before, after } = require("node:test");
@@ -73,14 +79,14 @@ const express = require("express");
 
 let server;
 
-function request(body) {
+function request(body, step = "add-config") {
   return new Promise((resolve, reject) => {
     const payload = Buffer.from(JSON.stringify(body));
     const req = http.request({
       host: "127.0.0.1",
       port: server.address().port,
       method: "POST",
-      path: "/api/setup?step=add-config",
+      path: `/api/setup?step=${step}`,
       agent: false,
       headers: { "content-type": "application/json", "content-length": payload.length },
     }, (res) => {
@@ -134,6 +140,32 @@ function probeBody(id) {
   return { id, name: "Probe", repo: "acme/probe", workingDir: path.join(WORK, "probe"), backends: {}, ci_policy: CI_POLICY };
 }
 
+// #1210: the V2 setup steps, and a body that would pass each step's other
+// input checks if its id were let through. activate-v2 also needs `confirm`.
+const V2_STEPS = ["verify-repositories", "provision-repositories", "activate-v2"];
+function v2ProbeBody(id) {
+  return {
+    id, name: "Probe", confirm: true,
+    repositories: [{ key: "primary", repo: "acme/probe", working_dir: path.join(WORK, "probe"), primary: true, ci_policy: CI_POLICY }],
+  };
+}
+
+// A configured project named `id`, in the shape of CONFIGURED[kind].
+function configuredAs(kind, id) {
+  const repo = `acme/${id}`;
+  const workingDir = path.join(WORK, id);
+  return kind === "v2"
+    ? { id, name: id, agents: {}, chat_mode: "file", repositories: [{ key: "primary", repo, working_dir: workingDir, primary: true }] }
+    : { id, name: id, repo, working_dir: workingDir, agents: {}, chat_mode: "file" };
+}
+
+// A file entry, a directory entry, a case variant of each, and two entries the
+// old cleanup list did not have, one of them a lock file.
+const CONTROL_ENTRY_IDS = ["config.json", "agentchattr", "Config.JSON", "AgentChattr", "work-task-pipelines", "server.pid.lock"];
+// CLI setup names a project after its folder, so a configured project can be
+// named after a control entry.
+const CONFIGURED_ENTRY_ID = "agentchattr";
+
 // Refused requests: 400 invalid_project_id, nothing touched. ~/.quadwork starts
 // each case at 0755. The new-project paths and the V2 path harden it to 0700
 // before any other write, so that shows up too. The legacy re-run path hardens
@@ -141,11 +173,11 @@ function probeBody(id) {
 // went wrong.
 async function assertRefused(cases) {
   const wrong = [];
-  for (const { label, kind, projects, body } of cases) {
+  for (const { label, kind, projects, body, step } of cases) {
     writeConfig(kind, projects);
     fs.chmodSync(CONFIG_DIR, 0o755);
     const beforeSnapshot = baselineSnapshot();
-    const response = await request(body);
+    const response = await request(body, step);
     const actual = { status: response.status, code: response.json?.code, touched: changes(beforeSnapshot, snapshot()) };
     const expected = { status: 400, code: "invalid_project_id", touched: [] };
     if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: label, actual, expected });
@@ -218,31 +250,80 @@ test("a configured id that fails the project-id rule keeps its re-run path", asy
   }
 });
 
-test("on the V2 path, an id that is gone by the time config.lock is held is new there and must pass the rule", async () => {
-  // Another writer removes "My Project" after the step's first read found it
+test("on the V2 path, an id that is gone by the time config.lock is held is new there and must pass the new-id rule", async () => {
+  // Another writer removes the project after the step's first read found it
   // configured: that read still lists it, the read under config.lock does not.
-  writeConfig("v2", []);
-  const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
-  fs.chmodSync(CONFIG_DIR, 0o755);
-  const beforeSnapshot = baselineSnapshot();
-  const readFileSync = fs.readFileSync;
-  let staleReads = 0;
-  fs.readFileSync = function (file, ...rest) {
-    if (file === CONFIG_PATH && staleReads === 0) {
-      staleReads += 1;
-      return JSON.stringify(configFor("v2"));
+  // "My Project" fails the project-id rule. agentchattr passes it but names a
+  // QuadWork control entry (#1210).
+  for (const [id, stale] of [[LEGACY_ID, CONFIGURED.v2], [CONFIGURED_ENTRY_ID, configuredAs("v2", CONFIGURED_ENTRY_ID)]]) {
+    writeConfig("v2", []);
+    const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
+    fs.chmodSync(CONFIG_DIR, 0o755);
+    const beforeSnapshot = baselineSnapshot();
+    const readFileSync = fs.readFileSync;
+    let staleReads = 0;
+    fs.readFileSync = function (file, ...rest) {
+      if (file === CONFIG_PATH && staleReads === 0) {
+        staleReads += 1;
+        return JSON.stringify(configFor("v2", [stale]));
+      }
+      return readFileSync.call(this, file, ...rest);
+    };
+    let response;
+    try { response = await request(probeBody(id)); }
+    finally { fs.readFileSync = readFileSync; }
+    assert.equal(staleReads, 1, `${id}: the step's first read saw the id configured`);
+    assert.deepEqual({ status: response.status, code: response.json?.code }, { status: 400, code: "invalid_project_id" }, `${id}: response`);
+    assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), configBytes, `${id}: config.json is unchanged`);
+    // By then the step had hardened ~/.quadwork to 0700 and taken config.lock.
+    // Nothing was created, changed or removed below it.
+    assert.deepEqual(changes(beforeSnapshot, snapshot()), ["changed home/.quadwork"], `${id}: touched`);
+  }
+});
+
+test("a new id that names a QuadWork control entry gets 400 and touches nothing on every setup step", async () => {
+  await assertRefused(["legacy", "v2", "missing"].flatMap((kind) => CONTROL_ENTRY_IDS.flatMap((id) => [
+    ...V2_STEPS.map((step) => ({ label: `${kind} config: ${step} ${id}`, kind, step, body: v2ProbeBody(id) })),
+    { label: `${kind} config: add-config ${id}`, kind, body: probeBody(id) },
+  ])));
+});
+
+test("a configured id that names a QuadWork control entry keeps its add-config re-run path", async () => {
+  for (const kind of ["legacy", "v2"]) {
+    writeConfig(kind, [CONFIGURED[kind], configuredAs(kind, CONFIGURED_ENTRY_ID)]);
+    fs.rmSync(path.join(CONFIG_DIR, CONFIGURED_ENTRY_ID), { recursive: true, force: true });
+    const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
+    const beforeSnapshot = baselineSnapshot();
+    const response = await request(probeBody(CONFIGURED_ENTRY_ID));
+    assert.equal(response.status, 200, `${kind}: status (${JSON.stringify(response.json)})`);
+    assert.deepEqual(response.json, { ok: true, message: "Project already in config" }, `${kind}: body`);
+    assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), configBytes, `${kind}: config.json is unchanged`);
+    assert.deepEqual(changes(beforeSnapshot, snapshot()), [
+      "changed home/.quadwork",
+      `created home/.quadwork/${CONFIGURED_ENTRY_ID}`,
+      `created home/.quadwork/${CONFIGURED_ENTRY_ID}/GITHUB.md`,
+      `created home/.quadwork/${CONFIGURED_ENTRY_ID}/HEAD-PO-PLAYBOOK.md`,
+      `created home/.quadwork/${CONFIGURED_ENTRY_ID}/OVERNIGHT-QUEUE.md`,
+    ], `${kind}: touched`);
+    assert.match(fs.readFileSync(path.join(CONFIG_DIR, CONFIGURED_ENTRY_ID, "OVERNIGHT-QUEUE.md"), "utf8"),
+      /^> \*\*Repo:\*\* acme\/agentchattr$/m, `${kind}: queue repo`);
+  }
+});
+
+test("on the V2 setup steps, a configured id that names a QuadWork control entry passes the id check as before", async () => {
+  const wrong = [];
+  for (const kind of ["legacy", "v2"]) {
+    writeConfig(kind, [CONFIGURED[kind], configuredAs(kind, CONFIGURED_ENTRY_ID)]);
+    for (const step of V2_STEPS) {
+      const beforeSnapshot = baselineSnapshot();
+      // The body has no repositories, so the check after the id check refuses it.
+      const response = await request({ id: CONFIGURED_ENTRY_ID, confirm: true }, step);
+      const actual = { status: response.status, code: response.json?.code, touched: changes(beforeSnapshot, snapshot()) };
+      const expected = { status: step === "activate-v2" ? 400 : 200, code: "repositories_required", touched: [] };
+      if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${kind} config: ${step}`, actual, expected });
     }
-    return readFileSync.call(this, file, ...rest);
-  };
-  let response;
-  try { response = await request(probeBody(LEGACY_ID)); }
-  finally { fs.readFileSync = readFileSync; }
-  assert.equal(staleReads, 1, "the step's first read saw the id configured");
-  assert.deepEqual({ status: response.status, code: response.json?.code }, { status: 400, code: "invalid_project_id" });
-  assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), configBytes, "config.json is unchanged");
-  // By then the step had hardened ~/.quadwork to 0700 and taken config.lock.
-  // Nothing was created, changed or removed below it.
-  assert.deepEqual(changes(beforeSnapshot, snapshot()), ["changed home/.quadwork"]);
+  }
+  assert.deepEqual(wrong, []);
 });
 
 test("a valid new id still sets up as before", async () => {
