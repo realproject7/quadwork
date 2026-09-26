@@ -176,7 +176,8 @@ export default function TopHeader() {
 
   return (
     <>
-      <header className="sticky top-0 z-40 flex h-12 items-center justify-between border-b border-white/10 bg-neutral-950/90 px-4 backdrop-blur">
+      {/* #1187: below lg the left padding leaves room for the Sidebar's fixed menu button. */}
+      <header className="sticky top-0 z-40 flex h-12 items-center justify-between border-b border-white/10 bg-neutral-950/90 pl-14 pr-4 lg:pl-4 backdrop-blur">
         <div className="flex items-center gap-3 min-w-0">
           <Link href="/" className="flex items-center gap-1.5 text-sm font-bold text-accent hover:text-blue-400 shrink-0">
             <img src="/icon.svg" alt="" width={18} height={18} className="inline-block" />

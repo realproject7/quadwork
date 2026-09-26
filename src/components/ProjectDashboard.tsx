@@ -11,7 +11,7 @@ import AgentTerminalsGrid from "./AgentTerminalsGrid";
 import OperatorFeaturesPanel from "./OperatorFeaturesPanel";
 import { useLocale } from "@/components/LocaleProvider";
 import { onIdleChange } from "@/lib/idle";
-import { RAIL_DIVIDER_SIZE, clampColumnRatio, clampRailPair, dashboardColumnTemplate, railPanelMinimum } from "@/lib/panelResize";
+import { RAIL_DIVIDER_SIZE, clampColumnRatio, clampRailPair, dashboardColumnTemplate, railPanelMinimum, stepColumnRatio } from "@/lib/panelResize";
 import {
   DEFAULT_PANEL_VISIBILITY,
   LEGACY_TERMINALS_COLLAPSED_KEY,
@@ -386,8 +386,8 @@ export default function ProjectDashboard({ projectId }: ProjectDashboardProps) {
           tabIndex={0}
           onMouseDown={startColumnDrag}
           onKeyDown={(event) => {
-            if (event.key === "ArrowLeft") { event.preventDefault(); setColRatio((value) => clampColumnRatio(value - 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
-            if (event.key === "ArrowRight") { event.preventDefault(); setColRatio((value) => clampColumnRatio(value + 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
+            if (event.key === "ArrowLeft") { event.preventDefault(); setColRatio((value) => stepColumnRatio(value, -0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
+            if (event.key === "ArrowRight") { event.preventDefault(); setColRatio((value) => stepColumnRatio(value, 0.05, containerRef.current?.getBoundingClientRect().width || 1)); }
           }}
         />
 

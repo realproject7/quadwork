@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useLocale } from "@/components/LocaleProvider";
 import { mainRateLimitKnown, reviewerRateLimitKnown } from "@/lib/rateLimitStatus";
 
 // #866: always-on GitHub rate-limit badge for the GITHUB panel header.
@@ -11,6 +12,22 @@ import { mainRateLimitKnown, reviewerRateLimitKnown } from "@/lib/rateLimitStatu
 // #886: also renders a second group for the reviewer-token account when the
 // response includes a `reviewer` block (two-account setups), since GitHub
 // budgets are per-account, not aggregated.
+
+// #1187: the unknown-state copy, localized like GitHubPanel's rate-limit banner.
+const COPY = {
+  en: {
+    unknown: "rate limit unknown",
+    unknownTitle: "GitHub rate limit unknown: the gh rate-limit lookup failed or has not run yet.",
+    reviewerUnknown: "unknown",
+    reviewerUnknownTitle: "Reviewer rate limit unknown: its gh rate-limit lookup failed.",
+  },
+  ko: {
+    unknown: "API 제한 알 수 없음",
+    unknownTitle: "GitHub API 제한을 알 수 없습니다. gh 조회가 실패했거나 아직 실행되지 않았습니다.",
+    reviewerUnknown: "알 수 없음",
+    reviewerUnknownTitle: "리뷰어 계정의 API 제한을 알 수 없습니다. gh 조회가 실패했습니다.",
+  },
+} as const;
 
 interface Bucket {
   limit: number;
@@ -85,6 +102,8 @@ function unknownSpan(label: string, title: string) {
 }
 
 export default function GitHubRateLimitBadge({ projectId }: { projectId?: string }) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   const [data, setData] = useState<RateLimitResponse | null>(null);
 
   useEffect(() => {
@@ -143,9 +162,7 @@ export default function GitHubRateLimitBadge({ projectId }: { projectId?: string
       tabIndex={0}
       className="flex min-w-0 items-center gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain text-[10px] font-mono text-text-muted focus-visible:-outline-offset-1"
     >
-      {mainKnown
-        ? mainSpans
-        : unknownSpan("rate limit unknown", "GitHub rate limit unknown: the gh rate-limit lookup failed or has not run yet.")}
+      {mainKnown ? mainSpans : unknownSpan(t.unknown, t.unknownTitle)}
       {reviewer && (!reviewerKnown || reviewerSpans.length > 0) && (
         <>
           <span className="text-border" aria-hidden>
@@ -153,9 +170,7 @@ export default function GitHubRateLimitBadge({ projectId }: { projectId?: string
           </span>
           <span className="flex items-center gap-1.5 whitespace-nowrap">
             <span className="opacity-70">{reviewer.login || "reviewer"}:</span>
-            {reviewerKnown
-              ? reviewerSpans
-              : unknownSpan("unknown", "Reviewer rate limit unknown: its gh rate-limit lookup failed.")}
+            {reviewerKnown ? reviewerSpans : unknownSpan(t.reviewerUnknown, t.reviewerUnknownTitle)}
           </span>
         </>
       )}

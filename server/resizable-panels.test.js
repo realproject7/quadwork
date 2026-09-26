@@ -10,6 +10,7 @@ const {
   CHAT_MIN_COLUMN_SIZE,
   RAIL_MIN_COLUMN_SIZE,
   clampColumnRatio,
+  stepColumnRatio,
   dashboardColumnTemplate,
   clampTerminalSplitRatio,
   terminalGridLayout,
@@ -87,5 +88,28 @@ function renderedSize(ratios, id, totalPx, dividerCount) {
   );
   console.log("  PASS: the chat/rail divider stops keep both columns wide enough for their headers");
 
-  console.log("\n4 passed, 0 failed\n");
+  // The rail also holds the terminal grid. At the right stop the grid keeps its
+  // own minimum (two 120px panes and the 4px split), its split can still move,
+  // and at the 50% split a running HEAD tile header fits: 164.7px measured in
+  // Geist Mono (HEAD, "Verified", stop, restart and /c buttons).
+  assert.ok(RAIL_MIN_COLUMN_SIZE >= TERMINAL_MIN_PANE_SIZE * 2 + TERMINAL_DIVIDER_SIZE, "the terminal grid fits the rail at its stop");
+  assert.ok(clampTerminalSplitRatio(0, RAIL_MIN_COLUMN_SIZE) < 0.5, "the terminal split can still move at the rail stop");
+  assert.ok((RAIL_MIN_COLUMN_SIZE - TERMINAL_DIVIDER_SIZE) / 2 >= 164.7, "a running HEAD tile header fits at the 50% split");
+  assert.ok(CHAT_MIN_COLUMN_SIZE + COLUMN_DIVIDER_SIZE + RAIL_MIN_COLUMN_SIZE <= 816, "both minimums fit the narrowest lg dashboard");
+  console.log("  PASS: the rail stop keeps the terminal grid and its tile headers whole");
+
+  // A stop set at a wide window leaves the saved ratio past the stop once the
+  // window shrinks; the grid shows the stop. The first arrow press away from
+  // it must move the divider a full step from where it is shown.
+  for (const [stop, step] of [[2, -0.05], [-1, 0.05]]) {
+    const saved = clampColumnRatio(stop, 1856);
+    const shown = clampColumnRatio(saved, 816);
+    assert.notEqual(saved, shown, "the saved ratio is past the narrow window's stop");
+    assert.ok(Math.abs(stepColumnRatio(saved, step, 816) - shown - step) < 1e-9, `the first ${step < 0 ? "ArrowLeft" : "ArrowRight"} press moves the divider`);
+  }
+  assert.ok(Math.abs(stepColumnRatio(0.5, 0.05, 1196) - 0.55) < 1e-9, "a step inside the range is unchanged");
+  assert.equal(stepColumnRatio(clampColumnRatio(2, 1196), 0.05, 1196), clampColumnRatio(2, 1196), "a step past the stop stays at the stop");
+  console.log("  PASS: the first arrow press after a window shrink moves the divider");
+
+  console.log("\n6 passed, 0 failed\n");
 })();
