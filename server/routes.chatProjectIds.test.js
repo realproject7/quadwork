@@ -301,10 +301,10 @@ test("a configured id that fails the project-id rule still reads and writes chat
 });
 
 test("a configured id that is not one direct directory under ~/.quadwork gets 400 on every chat route and touches nothing", async () => {
-  // A hand-edited config can hold such ids, and so can the legacy add-config
-  // setup step, which stores its id unchecked. Startup would start chat for
-  // "../edited" (unarchived, file chat), so it has a chat folder outside
-  // ~/.quadwork.
+  // A hand-edited config can hold such ids, and so can one written by the
+  // legacy add-config setup step before #1207 checked its id. Startup would
+  // start chat for "../edited" (unarchived, file chat), so it has a chat folder
+  // outside ~/.quadwork.
   const EDITED = [".", "..", "../edited", "edited/sub", "edited\u0000nul"];
   writeConfig([...configured, ...[...EDITED, ""].map((id) => ({ id, chat_mode: "file" }))]);
   fileChat.initProject("../edited");
