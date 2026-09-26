@@ -38,7 +38,7 @@ function v2LifecycleUnavailable(projectId) {
   return lifecycleError(
     "v2_project_lifecycle_unavailable",
     projectId,
-    "activate V2 in V2 repository setup before archiving, restoring, or removing a project",
+    "Activate V2 first: use V2 repository setup on a project, or Add Project (V2 setup) in Settings. Then archive, restore or remove.",
     409,
   );
 }
@@ -432,10 +432,12 @@ function createProjectLifecycleController(options = {}) {
       } catch {
         throw lifecycleError("project_config_unavailable", projectId, "project configuration is unavailable", 503);
       }
-      // #1184: refuse before the V2 ownership preflight, which would otherwise
-      // fail on the absent identity. Absence is the test the V2 commit uses to
-      // decide activation.
-      if (!Object.prototype.hasOwnProperty.call(current || {}, "installation_id")) {
+      // #1184: refuse an archived project before the V2 ownership preflight,
+      // which would otherwise fail on the absent identity. Absence is the test
+      // the V2 commit uses to decide activation. A project that is not
+      // archived still gets the no-op below, with no write or V2 validation.
+      if (!Object.prototype.hasOwnProperty.call(current || {}, "installation_id") &&
+          projectFromConfig(current, projectId)?.archived === true) {
         throw v2LifecycleUnavailable(projectId);
       }
       const preflight = reserveUnarchiveOwnership(projectId, current, validateConfiguration);

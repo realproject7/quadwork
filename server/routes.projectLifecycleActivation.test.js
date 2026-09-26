@@ -1,7 +1,8 @@
 // #1184: archive, restore and remove never activate V2. On a never-activated
 // installation with two legacy projects each action is refused with a message
 // that points to the explicit activation flow, config.json keeps its exact
-// bytes (no installation_id, no migrated sibling), and no cleanup runs. After
+// bytes (no installation_id, no migrated sibling), and no cleanup runs.
+// Restoring a project that is not archived stays a read-only no-op. After
 // explicit activation the same actions work. Real router, lifecycle controller
 // and config boundary against an isolated HOME. Plain node:assert.
 
@@ -31,7 +32,7 @@ const { createProjectLifecycleController, _admissionGenerations } = require("./p
 
 const REFUSAL = {
   ok: false,
-  error: "activate V2 in V2 repository setup before archiving, restoring, or removing a project",
+  error: "Activate V2 first: use V2 repository setup on a project, or Add Project (V2 setup) in Settings. Then archive, restore or remove.",
   code: "v2_project_lifecycle_unavailable",
   project_id: "alpha",
 };
@@ -95,11 +96,13 @@ function request(server, method, urlPath, body) {
   const server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
 
-  async function expectRefused(label, method, urlPath, body, bravo) {
+  // Every call on the never-activated install leaves config.json, the other
+  // project, the config lock, runtime cleanup and live admission untouched.
+  async function expectNoChange(label, method, urlPath, body, bravo, status, payload) {
     const before = bytes();
     const response = await request(server, method, urlPath, body);
-    assert.equal(response.status, 409, `${label}: refused with conflict`);
-    assert.deepEqual(response.json, REFUSAL, `${label}: refusal points to the explicit V2 activation flow`);
+    assert.equal(response.status, status, `${label}: responds ${status}`);
+    assert.deepEqual(response.json, payload, `${label}: exact response payload`);
     assert.equal(bytes(), before, `${label}: config.json keeps its exact bytes`);
     const disk = readDisk();
     assert.equal(Object.prototype.hasOwnProperty.call(disk, "installation_id"), false,
@@ -110,6 +113,8 @@ function request(server, method, urlPath, body) {
     assert.deepEqual(cleanupCalls, [], `${label}: no runtime cleanup runs`);
     assert.equal(_admissionGenerations.has("alpha"), false, `${label}: live admission is not revoked`);
   }
+  const expectRefused = (label, method, urlPath, body, bravo) =>
+    expectNoChange(label, method, urlPath, body, bravo, 409, REFUSAL);
 
   try {
     // Archive (and remove, which archives first) on a never-activated install.
@@ -117,6 +122,18 @@ function request(server, method, urlPath, body) {
     writeLegacy([legacyProject("alpha"), activeBravo]);
     await expectRefused("archive", "PUT", "/api/projects/alpha/archive", { archived: true }, activeBravo);
     await expectRefused("remove", "DELETE", "/api/projects/alpha", undefined, activeBravo);
+
+    // Restoring a project that is not archived stays the read-only no-op it
+    // was before #1184: 200, no write, no V2 validation.
+    await expectNoChange("already-active restore", "PUT", "/api/projects/alpha/archive", { archived: false }, activeBravo, 200, {
+      ok: true,
+      project_id: "alpha",
+      archived: false,
+      already_unarchived: true,
+      admission_generation: 0,
+      resources: {},
+      cleanup_errors: [],
+    });
 
     // Restore, and the archived row's cleanup retry, on a never-activated
     // install whose project was archived before V2 lifecycle existed.
