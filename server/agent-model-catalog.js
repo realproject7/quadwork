@@ -76,8 +76,8 @@ function parseGrokModels(stdout) {
 }
 
 // Keyed by command basename (cliBaseFromCommand), the same key as the rest of
-// the model catalog. `command` is the bare CLI name: resolved by
-// discoveryTargets, and the name in a "not found" error.
+// the model catalog; discoveryTargets resolves each key as a bare CLI name.
+// `command` is the CLI name a "not found" error reports.
 const DISCOVERY_SOURCES = {
   codex: { name: "codex debug models", command: "codex", args: ["debug", "models"], parse: parseCodexModels },
   grok: { name: "grok models", command: "grok", args: ["models"], parse: parseGrokModels },

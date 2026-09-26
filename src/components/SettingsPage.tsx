@@ -827,10 +827,14 @@ export default function SettingsPage() {
       // wizard writes it and the spawn path reads it), so always re-derive it
       // from the command — this heals a stale "flag" left on an agent converted
       // to gemini before this fix, which would otherwise crash the CLI.
+      // #1176: an archived project is never sent, so it keeps its saved
+      // snapshot: an edit made before archiving is not recorded as saved.
+      let savedProjects: ProjectConfig[] = [];
+      try { savedProjects = JSON.parse(savedConfigRef.current).projects || []; } catch { /* no saved snapshot yet */ }
       const normalizedConfig = {
         ...config,
         projects: config.projects.map((p) => {
-          if (p.archived) return p;
+          if (p.archived) return savedProjects.find((s) => s.id === p.id) ?? p;
           const agents: Record<string, AgentConfig> = {};
           for (const [id, a] of Object.entries(p.agents)) {
             agents[id] = {

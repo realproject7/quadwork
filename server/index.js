@@ -414,10 +414,12 @@ function resolveCliExecutable(command) {
     "/usr/local/bin",
   ];
   // A relative PATH entry is skipped: spawn would resolve it against the
-  // agent's cwd, not the server's.
+  // agent's cwd, not the server's. The candidate is concatenated like the OS
+  // lookup builds it: path.join would fold a `..` without following a
+  // symlinked directory.
   for (const dir of dirs) {
     if (!path.isAbsolute(dir)) continue;
-    const file = path.join(dir, command);
+    const file = dir + path.sep + command;
     if (isExecutable(file)) return file;
   }
   return null;
@@ -444,12 +446,17 @@ app.get("/api/cli-status", (_req, res) => {
 // executables resolveCliExecutable finds, as spawn does: the one each bare CLI
 // name runs and each configured agent command's own, so an absolute-path
 // command gets that executable's models. A reviewed-execution role is never
-// run here: it starts only through its own fixed launch plan.
+// run here: it starts only through its own fixed launch plan. Config-derived
+// executables run only for a caller /api/session-token trusts; any other
+// caller gets bare-name discovery only.
 const getAgentModelCatalog = createModelCatalogCache();
-app.get("/api/agent-model-catalog", async (_req, res) => {
-  const commands = (readConfig().projects || []).flatMap((p) => Object.values((p && p.agents) || {})
-    .filter((a) => a && a.reviewed_execution_id === undefined)
-    .map((a) => a.command));
+app.get("/api/agent-model-catalog", async (req, res) => {
+  const trusted = isLocalTokenRequest(req) || isTrustedProxyRequest(req);
+  const commands = trusted
+    ? (readConfig().projects || []).flatMap((p) => Object.values((p && p.agents) || {})
+      .filter((a) => a && a.reviewed_execution_id === undefined)
+      .map((a) => a.command))
+    : [];
   res.json(await getAgentModelCatalog(discoveryTargets(commands, resolveCliExecutable)));
 });
 

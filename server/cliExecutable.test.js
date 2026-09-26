@@ -14,6 +14,7 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 if (process.platform === "win32") {
   console.log("  SKIP: POSIX shebang stand-in CLIs (not run on Windows)");
@@ -49,7 +50,25 @@ const REVIEWED_CODEX = standIn(path.join(TMP_HOME, "reviewed"), "reviewed-codex"
 // Not executable: an install check that only tests existence would report it.
 fs.mkdirSync(path.join(TMP_HOME, ".local", "bin"), { recursive: true });
 fs.writeFileSync(path.join(TMP_HOME, ".local", "bin", "gemini"), "not a program\n", { mode: 0o644 });
-process.env.PATH = FAKE_BIN;
+// A relative PATH entry holding a gemini, run from TMP_HOME: it would resolve
+// against the server's cwd, never the agent's, so the resolver skips it.
+const REL_ENTRY = "relbin";
+fs.mkdirSync(path.join(TMP_HOME, REL_ENTRY));
+fs.writeFileSync(path.join(TMP_HOME, REL_ENTRY, "gemini"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+// A PATH entry through a symlinked dir and `..`: the kernel follows the link
+// first (sym/link -> sym/real/sub, so link/.. is sym/real), where path.join
+// would fold it to sym/bin, which does not exist. The claude there prints the
+// path it was run as.
+const SYM = path.join(TMP_HOME, "sym");
+fs.mkdirSync(path.join(SYM, "real", "sub"), { recursive: true });
+fs.mkdirSync(path.join(SYM, "real", "bin"));
+fs.writeFileSync(path.join(SYM, "real", "bin", "claude"), "#!/bin/sh\nprintf '%s\\n' \"$0\"\n", { mode: 0o755 });
+fs.symlinkSync(path.join(SYM, "real", "sub"), path.join(SYM, "link"));
+const SYM_ENTRY = `${SYM}/link/../bin`;
+const SYM_CLAUDE = `${SYM_ENTRY}/claude`;
+process.env.PATH = [FAKE_BIN, REL_ENTRY, SYM_ENTRY].join(path.delimiter);
+const ORIGINAL_CWD = process.cwd();
+process.chdir(TMP_HOME);
 
 fs.mkdirSync(CWD, { recursive: true });
 const CONFIG_PATH = path.join(TMP_HOME, ".quadwork", "config.json");
@@ -57,6 +76,8 @@ fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
 fs.writeFileSync(CONFIG_PATH, JSON.stringify({
   // Not 8400: nothing here may reach an operator's live server.
   port: 48176,
+  // An on-box reverse proxy's forwarded name (#988), trusted like loopback.
+  trusted_dashboard_hosts: ["dash.example"],
   projects: [{
     id: "p1",
     name: "p1",
@@ -95,9 +116,9 @@ const isExecutableFile = (file) => {
   }
 };
 
-function get(server, urlPath) {
+function get(server, urlPath, headers = {}) {
   return new Promise((resolve, reject) => {
-    http.get({ host: "127.0.0.1", port: server.address().port, path: urlPath }, (res) => {
+    http.get({ host: "127.0.0.1", port: server.address().port, path: urlPath, headers }, (res) => {
       const c = [];
       res.on("data", (d) => c.push(d));
       res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(c).toString() || "null") }));
@@ -144,6 +165,23 @@ async function main() {
         `#1176: ${backend} is reported installed (${status[backend]}) exactly when spawn resolves an executable (${file})`);
     }
     ok(markerRuns().length === 0, "#1176: the install check and the spawn path never run a CLI");
+    // The OS lookup of `claude` on this PATH runs the stand-in, which prints the
+    // path it ran as.
+    const osLookup = spawnSync("claude", [], { env: { PATH: process.env.PATH }, encoding: "utf8" }).stdout.trim();
+    ok(osLookup === SYM_CLAUDE && status.claude === true && spawned.claude_any === SYM_CLAUDE,
+      `#1176: a PATH dir through a symlink and \`..\` resolves to the file the OS lookup runs (${spawned.claude_any})`);
+    ok(!String(spawned.gemini_any).startsWith(REL_ENTRY),
+      `#1176: a relative PATH entry is skipped: its gemini is never what spawn runs (${spawned.gemini_any})`);
+
+    // An untrusted caller (a foreign Host, or a foreign Origin) gets bare-name
+    // discovery only. It comes first, so no earlier run has been cached.
+    for (const [label, headers] of [["a foreign Host", { host: "evil.example" }], ["a foreign Origin", { origin: "http://evil.example" }]]) {
+      const r = await get(server, "/api/agent-model-catalog", headers);
+      ok(r.status === 200 && JSON.stringify(r.body.models.codex) === '["gpt-7-nova"]' && JSON.stringify(r.body.models.grok) === '["grok-5"]',
+        `#1176: an untrusted caller (${label}) gets the bare-name CLIs' models only`);
+    }
+    ok(markerRuns().sort().join("|") === "home-grok models|path-codex debug models",
+      "#1176: an untrusted caller never runs a config-derived executable");
 
     const first = await get(server, "/api/agent-model-catalog");
     ok(first.status === 200 && JSON.stringify(first.body.models.grok) === '["grok-5"]',
@@ -154,6 +192,12 @@ async function main() {
       "#1176: discovery ran each resolved executable once, with its fixed arguments");
     ok(!markerRuns().some((run) => run.startsWith("reviewed-codex")) && !first.body.models.codex.includes("gpt-reviewed-1"),
       "#1176: a reviewed-execution role's command is never run by discovery");
+    const proxied = await get(server, "/api/agent-model-catalog", { host: "dash.example" });
+    ok(JSON.stringify(proxied.body.models.codex) === '["gpt-7-nova","gpt-pinned-1"]',
+      "#1176: a trusted reverse-proxy caller (trusted_dashboard_hosts) gets the config-derived models too");
+    const untrustedLater = await get(server, "/api/agent-model-catalog", { host: "evil.example" });
+    ok(JSON.stringify(untrustedLater.body.models.codex) === '["gpt-7-nova"]',
+      "#1176: an untrusted caller never gets a config-derived executable's cached models either");
 
     await get(server, "/api/agent-model-catalog");
     ok(markerRuns().length === 3, "#1176: a second open is served from the cache");
@@ -170,12 +214,14 @@ async function main() {
   } finally {
     server.close();
   }
+  process.chdir(ORIGINAL_CWD);
   try { fs.rmSync(TMP_HOME, { recursive: true, force: true }); } catch {}
   console.log(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);
 }
 
 main().catch((err) => {
+  process.chdir(ORIGINAL_CWD);
   try { fs.rmSync(TMP_HOME, { recursive: true, force: true }); } catch {}
   console.error(err);
   process.exit(1);

@@ -613,21 +613,29 @@ router.put("/api/config", (req, res) => {
 //     sanitized one it GET'd;
 //   - projects are merged by id, PRESERVING each project's field-scoped flag
 //     fields from disk; a project id not on disk is appended (Settings can add
-//     one); on-disk projects absent from the body are left untouched.
+//     one); on-disk projects absent from the body are left untouched, and so
+//     (#1176) are projects archived on disk, whatever the body says.
 const CONFIG_MERGE_EXCLUDED = new Set([
   "projects", "pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token", "installation_id",
   "project_admission_generations", RETIRED_GLOBAL_AGENT_FIELD,
 ]);
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
-  // #1172: the Settings save writes agent models through here — reject any
-  // non-empty model outside MODEL_ID_PATTERN, as the agent-models PUT does.
-  const invalidModels = invalidAgentModelRefs(body.projects);
-  if (invalidModels.length > 0) {
-    return res.status(400).json({ ok: false, error: `Invalid model id for ${invalidModels.join(", ")}` });
-  }
   try {
     const mutator = (cfg) => {
+      // #1176: a project archived on disk is ignored in the body (checked
+      // under the lock), so a stale Settings tab can't rewrite or heal its
+      // agents, nor block the save with its model.
+      const archived = new Set((cfg.projects || []).filter((p) => p && p.archived === true).map((p) => p.id));
+      const projects = Array.isArray(body.projects) ? body.projects.filter((p) => !(p && archived.has(p.id))) : body.projects;
+      // #1172: the Settings save writes agent models through here — reject any
+      // non-empty model outside MODEL_ID_PATTERN, as the agent-models PUT does.
+      const invalidModels = invalidAgentModelRefs(projects);
+      if (invalidModels.length > 0) {
+        const err = new Error(`Invalid model id for ${invalidModels.join(", ")}`);
+        err.code = "QW_INVALID_MODEL_ID";
+        throw err;
+      }
       const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
       const previousTopology = activated && Array.isArray(body.projects)
         ? genericV2ProjectTopology(cfg)
@@ -647,10 +655,10 @@ router.patch("/api/config", (req, res) => {
         }
         cfg[k] = v;
       }
-      if (Array.isArray(body.projects)) {
+      if (Array.isArray(projects)) {
         if (!Array.isArray(cfg.projects)) cfg.projects = [];
         const byId = new Map(cfg.projects.map((p) => [p.id, p]));
-        for (const incoming of body.projects) {
+        for (const incoming of projects) {
           if (!incoming || typeof incoming !== "object" || !incoming.id) continue;
           const existing = byId.get(incoming.id);
           if (existing) {
@@ -675,6 +683,7 @@ router.patch("/api/config", (req, res) => {
     };
     updateConfig(mutator);
   } catch (err) {
+    if (err.code === "QW_INVALID_MODEL_ID") return res.status(400).json({ ok: false, error: err.message });
     if (sendV2ConfigurationError(res, err)) return;
     if (err.code === "QW_INSTALLATION_ID_ROTATION") {
       return res.status(409).json({ error: "installation_id cannot be introduced or replaced here" });

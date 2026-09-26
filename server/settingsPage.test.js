@@ -158,6 +158,23 @@ test("#1176: an archived project's invalid model gets a notice, never blocks Sav
   assert.equal(modelSelect(ui.agentRow("arch", "dev")).props.value, 'bad"id');
 });
 
+test("#1176: an edit made before archiving is not recorded as saved", async () => {
+  const ui = await mount({ port: 8400, projects: [
+    { id: "p1", name: "p1", agents: { dev: agent("claude", "opus", { mcp_inject: "flag" }) } },
+    { id: "p2", name: "p2", agents: { dev: agent("codex", "", { mcp_inject: "proxy_flag" }) } },
+  ] });
+  modelSelect(ui.agentRow("p1", "dev")).props.onChange({ target: { value: "sonnet" } });
+  assert.equal(modelSelect(ui.agentRow("p1", "dev")).props.value, "sonnet", "fixture: the unsaved edit is shown");
+  const button = (container, label) => find(container, (n) => n.type === "button" && text(n) === label);
+  await button(find(ui.render(), (n) => n.props && n.props.id === "project-p1"), "Archive").props.onClick();
+
+  await ui.save();
+  assert.deepEqual(ui.patches()[0].projects.map((p) => p.id), ["p2"], "the archived project is not sent");
+  await button(find(ui.render(), (n) => n.key === "p1" && n.type === "div"), "Restore").props.onClick();
+  assert.equal(modelSelect(ui.agentRow("p1", "dev")).props.value, "opus",
+    "after restore Settings shows the stored model, not the edit Save never sent");
+});
+
 test("#1176: an invalid model on an active project still blocks Save and names it", async () => {
   const ui = await mount({ port: 8400, projects: [
     { id: "p1", name: "p1", agents: { dev: agent("claude", 'bad"id', { mcp_inject: "flag" }) } },
