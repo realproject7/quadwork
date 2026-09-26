@@ -334,6 +334,8 @@ const COPY = {
     restore: "Restore",
     confirmRemove: "Confirm Remove",
     lifecycleFailed: "Project lifecycle operation failed",
+    // #1183: a restored project's chat did not start (file_chat_start_failed).
+    lifecycleChatStartFailed: "Project chat did not start. Archive and restore the project to retry. If it keeps failing, check the project's chat files. Restarting QuadWork will fail until the cause is fixed.",
     retryCleanup: "Retry cleanup",
     newProject: "New Project",
     unsavedChanges: "Unsaved changes",
@@ -423,6 +425,7 @@ const COPY = {
     restore: "복원",
     confirmRemove: "제거 확인",
     lifecycleFailed: "프로젝트 상태 변경에 실패했습니다",
+    lifecycleChatStartFailed: "프로젝트 채팅을 시작하지 못했습니다. 프로젝트를 보관한 뒤 다시 복원해 재시도하세요. 계속 실패하면 프로젝트의 채팅 파일을 확인하세요. 원인을 해결하기 전에는 QuadWork를 재시작해도 실행되지 않습니다.",
     retryCleanup: "정리 다시 시도",
     newProject: "새 프로젝트",
     unsavedChanges: "저장되지 않은 변경사항",
@@ -1159,7 +1162,9 @@ export default function SettingsPage() {
         const error = entry && typeof entry === "object" ? entry as Record<string, unknown> : {};
         const resource = typeof error.resource === "string" ? error.resource : "project";
         const code = typeof error.code === "string" ? error.code : "cleanup_failed";
-        const message = typeof error.message === "string" ? error.message : t.lifecycleFailed;
+        // #1183: this code has Settings copy, so the operator reads it in their language.
+        const message = code === "file_chat_start_failed" ? t.lifecycleChatStartFailed
+          : typeof error.message === "string" ? error.message : t.lifecycleFailed;
         return `${resource} [${code}]: ${message}`;
       }).join(" · ");
     }

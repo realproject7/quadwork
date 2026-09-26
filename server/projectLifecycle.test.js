@@ -192,16 +192,46 @@ async function rejectsCode(fn, code) {
     readConfig: restoreStore.read,
     validateV2Configuration: () => {},
     cleanupProject: async () => { cleanupCalls += 1; return { ok: true, resources: { sessions: 0 } }; },
+    // #1183: the runtime comes back only once the restore is durable and the
+    // project is admitted again.
+    restoreProject: async (projectId) => {
+      restoreEvents.push(`restore:${projectId}:admitted=${!isProjectArchived(projectId, restoreStore.read())}`);
+    },
   });
   const restored = await restoreController.unarchiveProject("restore");
   assert.equal(restored.ok, true);
   assert.equal(restored.archived, false);
   assert.equal(cleanupCalls, 1, "unarchive verifies the archived runtime is fully quiesced");
   assert.deepEqual(restored.resources, { sessions: 0 });
+  assert.deepEqual(restored.cleanup_errors, []);
+  assert.deepEqual(restoreEvents, ["commit:restore:false", "restore:restore:admitted=true"],
+    "one commit, then one runtime restore on the admitted project");
   assert.equal(restoreStore.read().projects[0].archived, false);
   assert.equal(restoreStore.read().projects[0].watch_batch_requests, false,
     "unarchive does not revive the archived project's local watcher");
 
+  // #1183: a runtime that cannot come back is reported, never swallowed. The
+  // project stays restored and the typed entry names the failed resource.
+  const failedRestoreStore = inMemoryCommit(config(project("failed-restore", true)));
+  const failedRestore = createProjectLifecycleController({
+    commitV2Configuration: failedRestoreStore.commit,
+    readConfig: failedRestoreStore.read,
+    validateV2Configuration: () => {},
+    cleanupProject: async () => ({ ok: true, resources: { sessions: 0 } }),
+    restoreProject: () => {
+      throw Object.assign(new Error("Project chat could not start"), { resource: "file_chat", code: "file_chat_start_failed" });
+    },
+  });
+  const failedRestored = await failedRestore.unarchiveProject("failed-restore");
+  assert.equal(failedRestored.ok, false, "a failed runtime restore is not reported as success");
+  assert.equal(failedRestored.archived, false, "the committed restore is still reported");
+  assert.deepEqual(failedRestored.cleanup_errors, [
+    { resource: "file_chat", code: "file_chat_start_failed", message: "Project chat could not start" },
+  ]);
+  assert.equal(failedRestoreStore.read().projects[0].archived, false);
+
+  const unexpectedRestores = [];
+  const neverRestore = (projectId) => { unexpectedRestores.push(projectId); };
   const dirtyRestoreStore = inMemoryCommit(config(project("dirty-restore", true)));
   const dirtyRestore = createProjectLifecycleController({
     commitV2Configuration: dirtyRestoreStore.commit,
@@ -212,10 +242,12 @@ async function rejectsCode(fn, code) {
       resources: { sessions: 1 },
       cleanup_errors: [{ resource: "pty", code: "kill_failed", message: "retry" }],
     }),
+    restoreProject: neverRestore,
   });
   const heldRestore = await dirtyRestore.unarchiveProject("dirty-restore");
   assert.equal(heldRestore.ok, false);
   assert.equal(heldRestore.archived, true, "partial cleanup keeps the admission barrier set");
+  assert.deepEqual(unexpectedRestores, [], "a held restore never runs the runtime restore");
   assert.equal(dirtyRestoreStore.read().projects[0].archived, true);
 
   const alreadyOpenStore = inMemoryCommit(config(project("already-open", false)));
@@ -225,9 +257,11 @@ async function rejectsCode(fn, code) {
     readConfig: alreadyOpenStore.read,
     validateV2Configuration: () => {},
     cleanupProject: async () => { alreadyOpenCleanupCalls += 1; return { ok: true }; },
+    restoreProject: neverRestore,
   });
   const alreadyRestored = await alreadyOpen.unarchiveProject("already-open");
   assert.equal(alreadyRestored.already_unarchived, true);
+  assert.deepEqual(unexpectedRestores, [], "the idempotent no-op leaves live runtime alone");
   assert.equal(alreadyOpenCleanupCalls, 0, "idempotent unarchive never stops a live project");
 
   const collisionStore = inMemoryCommit(config(project("owner"), project("collision", true)));

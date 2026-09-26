@@ -2,7 +2,8 @@
 // installation with two legacy projects each action is refused with a message
 // that points to the explicit activation flow, config.json keeps its exact
 // bytes (no installation_id, no migrated sibling), and no cleanup runs.
-// Restoring a project that is not archived stays a read-only no-op. After
+// Restoring a project that is not archived stays a read-only no-op, and an
+// unknown id or an invalid archived value keeps its 404 or 503. After
 // explicit activation the same actions work. Real router, lifecycle controller
 // and config boundary against an isolated HOME. Plain node:assert.
 
@@ -133,6 +134,23 @@ function request(server, method, urlPath, body) {
       admission_generation: 0,
       resources: {},
       cleanup_errors: [],
+    });
+
+    // An unknown id and an invalid archived value keep main's answers on a
+    // never-activated install: 404 and 503, nothing written. The invalid value
+    // is truthy, so the #1184 refusal must check `archived === true`, not truthiness.
+    await expectNoChange("unknown restore", "PUT", "/api/projects/ghost/archive", { archived: false }, activeBravo, 404, {
+      ok: false,
+      error: "project is not configured",
+      code: "unknown_project",
+      project_id: "ghost",
+    });
+    writeLegacy([legacyProject("alpha", { archived: "true" }), activeBravo]);
+    await expectNoChange("invalid archived restore", "PUT", "/api/projects/alpha/archive", { archived: false }, activeBravo, 503, {
+      ok: false,
+      error: "project archive state is invalid",
+      code: "invalid_project_archive_state",
+      project_id: "alpha",
     });
 
     // Restore, and the archived row's cleanup retry, on a never-activated

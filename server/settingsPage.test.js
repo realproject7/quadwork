@@ -20,12 +20,11 @@ const JS = ts.transpileModule(fs.readFileSync(FILE, "utf8"), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
 }).outputText;
 
-// Real shared modules; stand-ins only for the Next.js runtime, the locale
-// context and two child components these checks never render.
+// Real shared modules; stand-ins only for the Next.js runtime and two child
+// components these checks never render. mount() stands in for the locale context.
 const DEPENDENCIES = {
   "react/jsx-runtime": () => require("react/jsx-runtime"),
   "next/navigation": () => ({ useRouter: () => ({ push() {}, replace() {} }), useSearchParams: () => ({ get: () => null }) }),
-  "@/components/LocaleProvider": () => ({ useLocale: () => ({ locale: "en", setLocale() {} }) }),
   "@/lib/agentModels": () => require("../src/lib/agentModels.ts"),
   "@/lib/injectMode": () => require("../src/lib/injectMode.js"),
   "@/lib/idle": () => require("../src/lib/idle.ts"),
@@ -52,7 +51,8 @@ const hasOption = (select, value) => [...walk(select.props.children)].some((n) =
 const flush = async () => { for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve)); };
 
 // Mounts Settings on `config` (GET /api/config) and runs its mount effects.
-async function mount(config) {
+// #1183: `locale` and `archiveReply` (the archive route's response) are optional.
+async function mount(config, { locale = "en", archiveReply = null } = {}) {
   const cells = [];
   let cursor = 0;
   let effects = [];
@@ -77,12 +77,15 @@ async function mount(config) {
     if (url === "/api/config" && !options.method) return respond(JSON.parse(JSON.stringify(config)));
     if (url === "/api/cli-status") return respond({ claude: true, codex: true, gemini: true, grok: true });
     if (url === "/api/agent-model-catalog") return respond({ models: {}, errors: {} });
-    if (/^\/api\/projects\/[^/]+\/archive$/.test(url)) return respond({ ok: true, archived: JSON.parse(options.body).archived });
+    if (/^\/api\/projects\/[^/]+\/archive$/.test(url)) {
+      return archiveReply ? archiveReply(JSON.parse(options.body)) : respond({ ok: true, archived: JSON.parse(options.body).archived });
+    }
     return respond({ ok: true });
   };
   const mod = { exports: {} };
   new Function("require", "module", "exports", "fetch", JS)((name) => {
     if (name === "react") return hooks;
+    if (name === "@/components/LocaleProvider") return { useLocale: () => ({ locale, setLocale() {} }) };
     if (DEPENDENCIES[name]) return DEPENDENCIES[name]();
     throw new Error(`Unexpected dependency ${name}`);
   }, mod, mod.exports, fetch);
@@ -183,4 +186,34 @@ test("#1176: an invalid model on an active project still blocks Save and names i
   await ui.save();
   assert.equal(ui.patches().length, 0, "nothing is sent");
   assert.match(text(saveError(ui.render())), /invalid model id for p1\/dev\./, "the error names only the active agent");
+});
+
+test("#1183: a restored project whose chat did not start shows Settings copy in the operator's language", async () => {
+  // The archive route's reply when the restore commits but the chat does not
+  // start. The raw message stands in for server text Settings must not show.
+  const reply = () => ({ ok: false, status: 503, json: async () => ({
+    ok: false,
+    project_id: "arch",
+    archived: false,
+    already_unarchived: false,
+    admission_generation: 2,
+    resources: {},
+    code: "project_cleanup_incomplete",
+    cleanup_errors: [{ resource: "file_chat", code: "file_chat_start_failed", message: "raw server message" }],
+  }) });
+  for (const [locale, restoreLabel, copy] of [
+    ["en", "Restore", "Project chat did not start. Archive and restore the project to retry. If it keeps failing, check the project's chat files. Restarting QuadWork will fail until the cause is fixed."],
+    ["ko", "복원", "프로젝트 채팅을 시작하지 못했습니다. 프로젝트를 보관한 뒤 다시 복원해 재시도하세요. 계속 실패하면 프로젝트의 채팅 파일을 확인하세요. 원인을 해결하기 전에는 QuadWork를 재시작해도 실행되지 않습니다."],
+  ]) {
+    const ui = await mount({ port: 8400, projects: [
+      { id: "arch", name: "Old Project", archived: true, agents: { dev: agent("claude", "opus", { mcp_inject: "flag" }) } },
+    ] }, { locale, archiveReply: reply });
+    const archivedRow = find(ui.render(), (n) => n.key === "arch" && n.type === "div");
+    await find(archivedRow, (n) => n.type === "button" && text(n) === restoreLabel).props.onClick();
+    const row = find(ui.render(), (n) => n.props && n.props.id === "project-arch");
+    assert.ok(row, `${locale}: the committed restore moves the project back to the active list`);
+    const alert = find(row, (n) => n.props && n.props.role === "alert");
+    assert.equal(text(alert), `file_chat [file_chat_start_failed]: ${copy}`,
+      `${locale}: the failed chat start is shown in the operator's language, with its safe retry`);
+  }
 });
