@@ -6,6 +6,12 @@ const {
   TERMINAL_MIN_PANE_SIZE,
   RAIL_DIVIDER_SIZE,
   RAIL_MIN_TERMINAL_SIZE,
+  COLUMN_DIVIDER_SIZE,
+  CHAT_MIN_COLUMN_SIZE,
+  RAIL_MIN_COLUMN_SIZE,
+  clampColumnRatio,
+  stepColumnRatio,
+  dashboardColumnTemplate,
   clampTerminalSplitRatio,
   terminalGridLayout,
   railPanelMinimum,
@@ -62,5 +68,48 @@ function renderedSize(ratios, id, totalPx, dividerCount) {
   assert.ok(renderedSize(keyboardNudge, "github", 900, 2) >= railPanelMinimum("github") - 0.001, "keyboard nudge also respects the adjacent minimum");
   console.log("  PASS: rail drag and keyboard nudges preserve terminal and adjacent-panel bounds");
 
-  console.log("\n3 passed, 0 failed\n");
+  // #1187: the chat/rail divider stops where the panel headers still fit on
+  // one line. Header widths measured live at 1260px (Geist Mono, en): chat
+  // 328.7px, widest rail header (Operator Features) 223.7px.
+  assert.ok(CHAT_MIN_COLUMN_SIZE >= 329, "the chat column minimum fits the measured chat header");
+  assert.ok(RAIL_MIN_COLUMN_SIZE >= 224, "the rail column minimum fits the widest measured rail header");
+  // Dashboard widths at lg: 1024 with the expanded sidebar, 1260 and 1920 with the collapsed one.
+  for (const total of [816, 1196, 1856]) {
+    const chatAtLeftStop = clampColumnRatio(-1, total) * total;
+    const railAtRightStop = total - COLUMN_DIVIDER_SIZE - clampColumnRatio(2, total) * total;
+    assert.ok(Math.abs(chatAtLeftStop - CHAT_MIN_COLUMN_SIZE) < 0.001, `${total}px: the left stop keeps the chat column at its minimum`);
+    assert.ok(Math.abs(railAtRightStop - RAIL_MIN_COLUMN_SIZE) < 0.001, `${total}px: the right stop keeps the rail column at its minimum`);
+    assert.equal(clampColumnRatio(0.5, total), 0.5, `${total}px: a centered ratio is unchanged`);
+  }
+  // The grid template enforces the same minimums as the drag/keyboard clamp.
+  assert.equal(
+    dashboardColumnTemplate(0.5),
+    `minmax(${CHAT_MIN_COLUMN_SIZE}px, 50%) ${COLUMN_DIVIDER_SIZE}px minmax(${RAIL_MIN_COLUMN_SIZE}px, 1fr)`,
+  );
+  console.log("  PASS: the chat/rail divider stops keep both columns wide enough for their headers");
+
+  // The rail also holds the terminal grid. At the right stop the grid keeps its
+  // own minimum (two 120px panes and the 4px split), its split can still move,
+  // and at the 50% split a running HEAD tile header fits: 164.7px measured in
+  // Geist Mono (HEAD, "Verified", stop, restart and /c buttons).
+  assert.ok(RAIL_MIN_COLUMN_SIZE >= TERMINAL_MIN_PANE_SIZE * 2 + TERMINAL_DIVIDER_SIZE, "the terminal grid fits the rail at its stop");
+  assert.ok(clampTerminalSplitRatio(0, RAIL_MIN_COLUMN_SIZE) < 0.5, "the terminal split can still move at the rail stop");
+  assert.ok((RAIL_MIN_COLUMN_SIZE - TERMINAL_DIVIDER_SIZE) / 2 >= 164.7, "a running HEAD tile header fits at the 50% split");
+  assert.ok(CHAT_MIN_COLUMN_SIZE + COLUMN_DIVIDER_SIZE + RAIL_MIN_COLUMN_SIZE <= 816, "both minimums fit the narrowest lg dashboard");
+  console.log("  PASS: the rail stop keeps the terminal grid and its tile headers whole");
+
+  // A stop set at a wide window leaves the saved ratio past the stop once the
+  // window shrinks; the grid shows the stop. The first arrow press away from
+  // it must move the divider a full step from where it is shown.
+  for (const [stop, step] of [[2, -0.05], [-1, 0.05]]) {
+    const saved = clampColumnRatio(stop, 1856);
+    const shown = clampColumnRatio(saved, 816);
+    assert.notEqual(saved, shown, "the saved ratio is past the narrow window's stop");
+    assert.ok(Math.abs(stepColumnRatio(saved, step, 816) - shown - step) < 1e-9, `the first ${step < 0 ? "ArrowLeft" : "ArrowRight"} press moves the divider`);
+  }
+  assert.ok(Math.abs(stepColumnRatio(0.5, 0.05, 1196) - 0.55) < 1e-9, "a step inside the range is unchanged");
+  assert.equal(stepColumnRatio(clampColumnRatio(2, 1196), 0.05, 1196), clampColumnRatio(2, 1196), "a step past the stop stays at the stop");
+  console.log("  PASS: the first arrow press after a window shrink moves the divider");
+
+  console.log("\n6 passed, 0 failed\n");
 })();

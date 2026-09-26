@@ -752,11 +752,15 @@ export default function Sidebar() {
 
   return (
     <>
-      {/* Mobile hamburger button — fixed below the top header, only below lg */}
+      {/* Mobile hamburger button — only below lg. #1187: it sits inside the
+          48px top header bar, whose left padding below lg keeps the header
+          text clear of it, so it covers no text. z-[45] puts it above the
+          header (z-40) and below every overlay and modal (z-50+). */}
       <button
         type="button"
         onClick={() => setMobileOpen(true)}
-        className="fixed top-14 left-2 z-30 lg:hidden w-10 h-10 flex items-center justify-center bg-bg-surface border border-border text-text-muted hover:text-accent"
+        aria-label="Open sidebar"
+        className="fixed top-1 left-2 z-[45] lg:hidden w-10 h-10 flex items-center justify-center bg-bg-surface border border-border text-text-muted hover:text-accent"
       >
         <HamburgerIcon />
       </button>

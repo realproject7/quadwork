@@ -10,7 +10,9 @@ import AgentLifecycleControls from "./AgentLifecycleControls";
 export interface PanelCollapse {
   expanded: boolean;
   onToggle: () => void;
-  /** id of the panel body element, exposed via aria-controls */
+  /** id of the panel body element, exposed via aria-controls. #1187: the
+   *  element must stay in the DOM (hidden) while collapsed so the reference
+   *  always resolves. */
   bodyId: string;
   /** localized control text, e.g. "Hide" / "Show" */
   hideLabel: string;
@@ -45,16 +47,20 @@ export default function PanelHeader({ label, status, projectId, agentId, onStatu
 
   return (
     <div className={`flex items-center justify-between gap-2 px-3 h-7 shrink-0 border-b border-border ${hasSecondaryContent ? "@container/panel-header" : ""}`}>
-      <div className={`flex items-center gap-2 ${hasSecondaryContent ? "shrink-0" : ""}`}>
+      {/* #1187: the title never wraps, so the header keeps its 28px height,
+          and the controls never shrink. The dashboard divider keeps every
+          column wide enough for its headers; if a column is narrower still,
+          the title truncates before any control is clipped. */}
+      <div className={`flex items-center gap-2 ${hasSecondaryContent ? "shrink-0" : "min-w-0"}`}>
         {status && (
           <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
         )}
-        <span className="text-[11px] text-text-muted uppercase tracking-wider">
+        <span className="truncate text-[11px] text-text-muted uppercase tracking-wider">
           {label}
         </span>
         {expanded && tooltip}
       </div>
-      <div className={`flex items-center gap-1.5 ${hasSecondaryContent ? "min-w-0" : ""}`}>
+      <div className={`flex items-center gap-1.5 ${hasSecondaryContent ? "min-w-0" : "shrink-0"}`}>
         {expanded && children}
         {projectId && agentId && (
           <AgentLifecycleControls key={`${projectId}/${agentId}`} projectId={projectId} agentId={agentId} status={status} onStatusChange={onStatusChange} />

@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useLocale } from "@/components/LocaleProvider";
+import { mainRateLimitKnown, reviewerRateLimitKnown } from "@/lib/rateLimitStatus";
 
 // #866: always-on GitHub rate-limit badge for the GITHUB panel header.
 // Self-contained: fetches /api/github/rate-limit on the same 60s cadence as
@@ -11,6 +13,22 @@ import { useEffect, useState } from "react";
 // response includes a `reviewer` block (two-account setups), since GitHub
 // budgets are per-account, not aggregated.
 
+// #1187: the unknown-state copy, localized like GitHubPanel's rate-limit banner.
+const COPY = {
+  en: {
+    unknown: "rate limit unknown",
+    unknownTitle: "GitHub rate limit unknown: the gh rate-limit lookup failed or has not run yet.",
+    reviewerUnknown: "unknown",
+    reviewerUnknownTitle: "Reviewer rate limit unknown: its gh rate-limit lookup failed.",
+  },
+  ko: {
+    unknown: "API 제한 알 수 없음",
+    unknownTitle: "GitHub API 제한을 알 수 없습니다. gh 조회가 실패했거나 아직 실행되지 않았습니다.",
+    reviewerUnknown: "알 수 없음",
+    reviewerUnknownTitle: "리뷰어 계정의 API 제한을 알 수 없습니다. gh 조회가 실패했습니다.",
+  },
+} as const;
+
 interface Bucket {
   limit: number;
   remaining: number;
@@ -19,12 +37,17 @@ interface Bucket {
 
 interface ReviewerBlock {
   login?: string;
+  /** #1187: true when the latest reviewer lookup failed */
+  error?: boolean;
   core?: Bucket;
   graphql?: Bucket;
   search?: Bucket;
 }
 
 interface RateLimitResponse {
+  /** #1187: last lookup time and failure, used to tell a real budget from the defaults */
+  updatedAt?: number;
+  error?: string | null;
   core?: Bucket;
   graphql?: Bucket;
   search?: Bucket;
@@ -66,7 +89,21 @@ function bucketSpans(items: { label: string; b?: Bucket }[]) {
     ));
 }
 
+// #1187: stands in for a group's buckets when its latest lookup failed.
+function unknownSpan(label: string, title: string) {
+  return (
+    <span className="flex items-center gap-1 whitespace-nowrap" title={title}>
+      <span className="text-text-muted" aria-hidden>
+        ●
+      </span>
+      <span>{label}</span>
+    </span>
+  );
+}
+
 export default function GitHubRateLimitBadge({ projectId }: { projectId?: string }) {
+  const { locale } = useLocale();
+  const t = COPY[locale];
   const [data, setData] = useState<RateLimitResponse | null>(null);
 
   useEffect(() => {
@@ -93,19 +130,24 @@ export default function GitHubRateLimitBadge({ projectId }: { projectId?: string
   }, [projectId]);
 
   // Degrade gracefully: render nothing until we have data.
-  const mainSpans = data
+  if (!data) return null;
+  // #1187: a failed or not-yet-run lookup shows "unknown", never the server's
+  // default (or last) budget as if it were current.
+  const mainKnown = mainRateLimitKnown(data);
+  const mainSpans = mainKnown
     ? bucketSpans([
         { label: "core", b: data.core },
         { label: "gql", b: data.graphql },
         { label: "search", b: data.search },
       ])
     : [];
-  if (mainSpans.length === 0) return null;
+  if (mainKnown && mainSpans.length === 0) return null;
 
   // #886: reviewer account — graphql is the at-risk budget (review discovery),
   // so show it (plus core/search when present). Absent on single-account setups.
-  const reviewer = data?.reviewer;
-  const reviewerSpans = reviewer
+  const reviewer = data.reviewer;
+  const reviewerKnown = reviewerRateLimitKnown(reviewer);
+  const reviewerSpans = reviewer && reviewerKnown
     ? bucketSpans([
         { label: "gql", b: reviewer.graphql },
         { label: "core", b: reviewer.core },
@@ -120,15 +162,15 @@ export default function GitHubRateLimitBadge({ projectId }: { projectId?: string
       tabIndex={0}
       className="flex min-w-0 items-center gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain text-[10px] font-mono text-text-muted focus-visible:-outline-offset-1"
     >
-      {mainSpans}
-      {reviewerSpans.length > 0 && (
+      {mainKnown ? mainSpans : unknownSpan(t.unknown, t.unknownTitle)}
+      {reviewer && (!reviewerKnown || reviewerSpans.length > 0) && (
         <>
           <span className="text-border" aria-hidden>
             |
           </span>
           <span className="flex items-center gap-1.5 whitespace-nowrap">
-            <span className="opacity-70">{reviewer?.login || "reviewer"}:</span>
-            {reviewerSpans}
+            <span className="opacity-70">{reviewer.login || "reviewer"}:</span>
+            {reviewerKnown ? reviewerSpans : unknownSpan(t.reviewerUnknown, t.reviewerUnknownTitle)}
           </span>
         </>
       )}
