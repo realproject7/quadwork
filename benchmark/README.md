@@ -87,12 +87,65 @@ Failed, interrupted,
 replayed, historical, malformed, or incomplete runs remain represented but are
 never counted as speed results. The module's `appendRecord` API returns a new
 validated ledger with the prior prefix intact and links its records by hash; it
-performs no persistence itself. The runner that eventually persists records must
-use that API, retain all previous records, and retain the resulting ledger digest
-as evidence. The chain detects changes only when a previously retained digest is
-compared; it cannot by itself attest to external storage history. This tool does
-not validate a manifest freeze, invoke a model,
-or permit Mode 3 timing.
+performs no persistence itself. `ledger-writer.cjs` persists that value. Retain
+the resulting ledger digest as evidence: the chain detects changes only when a
+previously retained digest is compared, and it cannot by itself attest to
+external storage history. This tool does not validate a manifest freeze, invoke
+a model, or permit Mode 3 timing.
+
+The record schema is closed (#1182). No field accepts free text: each is an
+enum, digest, SHA, number, timestamp, `owner/repo` name, lowercase identifier,
+or one of these fixed forms. `cache_policy` is `fresh_local_session` or
+`record_provider_cache_telemetry`. `model_identity` is a lowercase model id such
+as `openai.gpt-5.6-luna`. `evidence_ref` is generated, never caller text. It is
+`writer/<sha256>` from the ledger writer, or `executor/<reason>/<sha256>` with
+one of the historical calibration executor's fixed reason codes. A
+`local_validation` record has origin `harness_acceptance` or `local_validation`,
+the product's own validation. Origin is part of the duplicate-event key, and
+only a product `local_validation` record satisfies a successful run.
+
+`ledger-writer.cjs` is the durable, append-only writer for one run's ledger.
+`createRunLedgerRoot({ parent_dir })` creates a marked `0700` root that holds
+one ledger for one run. `appendRunEvent(root, prior, record, observation)`
+accepts any validator event for Modes 1 to 5. `prior` is the caller's last
+committed ledger, so a stale or rewritten on-disk prefix is refused. The caller
+supplies every record field except `sequence`, `prior_record_digest`, and
+`evidence_ref`, which the writer generates. The writer persists the observation
+first as a content-addressed `0600` file. It then commits the ledger under an
+exclusive lock, with a re-read prefix check, fsync, and an atomic rename. An
+append that would push the ledger past the validator's 512 KiB limit is refused
+before anything is written. A killed writer leaves the last committed ledger
+valid, with every observation it references present. The next append reclaims
+a dead writer's lock and temporary files. Two kill points fail closed instead.
+A kill before the lock holds a PID leaves an empty lock, which is refused as
+possibly live. A kill inside an observation write leaves a partial file, which
+blocks only that identical observation. The committed ledger references neither
+file, and removing it clears the block. The calibration executor persists
+through the same helpers. The writer's tests run with
+`node --test benchmark/ledger-writer.test.cjs`.
+
+Each observation payload has exactly these fields. Its only strings are fixed
+enum values, so it cannot hold free text.
+
+- `provider_turns`: one entry per provider turn, with `input_tokens`,
+  `cached_input_tokens`, and `output_tokens`. Each is a count or `unavailable`,
+  never zero or an estimate when telemetry is missing.
+- `counters`, each counted since the run's previous record:
+  - `remote_pushes`: Git pushes to a remote.
+  - `pull_requests`: pull requests opened.
+  - `merges`: pull requests merged.
+  - `validation_attempts`: runs of product validation or harness acceptance.
+  - `role_wakes`: times a role was woken or prompted to act.
+  - `chat_bytes`: bytes of chat messages written. Only the count is kept.
+  - `no_ops`: wakes that changed no task, review, or delivery state.
+  - `recovery_events`: recoveries performed, such as a role restart.
+- `external_waits`: one interval per wait, with a `category` of
+  `provider_rate_limit`, `git_remote`, or `github_api`, and its start and end on
+  the run's monotonic clock.
+- `host`: `unavailable`, or the `sampling_interval_ms`, the sampler's measured
+  `sampler_overhead_ms` (its own CPU time), and `samples` of host `cpu_percent`,
+  `rss_bytes` summed over the run's processes, `swap_used_bytes`, and
+  `memory_pressure` (`normal`, `warn`, or `critical`).
 
 Use Node 20.3+ on macOS with Command Line Tools Git at
 `/Library/Developer/CommandLineTools/usr/bin/git`, or Linux with `/usr/bin/git`.
