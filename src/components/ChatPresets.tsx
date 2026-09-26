@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { DEFAULT_PRESETS, STORAGE_KEY, loadPresetsFrom } from "@/lib/chatPresetMigration";
-import { OPEN_MOBILE_SIDEBAR_EVENT } from "./Sidebar";
+import { OPEN_MOBILE_SIDEBAR_EVENT } from "@/lib/mobileSidebar";
 
 export interface Preset {
   id: string;

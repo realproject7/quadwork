@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import AboutModal from "./AboutModal";
-import { openMobileSidebar, HamburgerIcon } from "./Sidebar";
+import { HamburgerIcon } from "./Sidebar";
+import { openMobileSidebar } from "@/lib/mobileSidebar";
 
 const GITHUB_URL = "https://github.com/realproject7/quadwork";
 
