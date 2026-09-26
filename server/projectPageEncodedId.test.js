@@ -1,9 +1,8 @@
 "use strict";
 
 // #1209: the dashboard works for a configured project whose id needs URL
-// encoding: a legacy id with a space ("My Project", which CLI setup takes from a
-// folder name) or with a "%" ("100%"). A plain id ("alpha") must behave as
-// before. The real pages run here: Home, the sidebar, the project page
+// encoding (IDS lists the kinds), and a plain id ("alpha") behaves as before.
+// The real pages run here: Home, the sidebar, the project page
 // (ProjectPageClient and all it renders, from ChatPanel to the terminals and
 // the operator widgets), the queue page and Settings. Every module is
 // transpiled with the repo's own `typescript` (the ts.transpileModule precedent
@@ -38,9 +37,13 @@ const ORIGIN = "http://quadwork.test";
 
 // ---- The fixture --------------------------------------------------------------
 
-// None of the projects has a V2 repository yet, so Home also links each one to
-// its row in Settings.
-const IDS = ["My Project", "100%", "alpha"];
+// CLI setup takes a legacy id from a folder name, so an id can hold any of
+// these: a space ("My Project"), a lone "%" ("100%"), text that looks like an
+// escape ("a%20b", configured as that exact text, so it must be decoded exactly
+// once), and a reserved character ("C#", which encodeURI and decodeURI leave
+// alone). "alpha" needs no encoding. None of the projects has a V2 repository
+// yet, so Home also links each one to its row in Settings.
+const IDS = ["My Project", "100%", "a%20b", "C#", "alpha"];
 const CONFIG = { projects: IDS.map((id) => ({ id, name: id, agents: {} })) };
 const MESSAGE = { id: 1, sender: "head", text: "hello from head", ts: "2026-09-27T00:00:00.000Z", channel: "general" };
 // A saved chat preset that names its project; ChatPresets fills {{project}} in.

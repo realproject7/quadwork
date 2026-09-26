@@ -6,8 +6,9 @@ export function decodeUrlComponent(value: string): string {
   try {
     return decodeURIComponent(value);
   } catch {
-    // Not a valid escape, such as a hand-typed /project/100%: the browser keeps
-    // a lone "%" as typed, so the text already is the id.
+    // Not a valid escape, such as a hand-typed /project/100% (the browser keeps
+    // a lone "%" as typed). Keep the text as typed; for /project/100% that is
+    // the id.
     return value;
   }
 }
