@@ -7,7 +7,7 @@ import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
 
-function HamburgerIcon() {
+export function HamburgerIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
       <path d="M3 5h14M3 10h14M3 15h14" />
@@ -223,6 +223,17 @@ function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onCo
 const SIDEBAR_KEY = "qw-sidebar-expanded";
 const GROUP_COLLAPSE_KEY = "qw-sidebar-collapsed-groups";
 
+// #1198: the mobile menu button now renders from TopHeader.tsx (so Tab
+// reaches it before the header's own controls — item 1), so it opens this
+// sidebar through a window event instead of a shared prop. Same pub/sub
+// shape as idle.ts's IDLE_EVENT.
+export const OPEN_MOBILE_SIDEBAR_EVENT = "quadwork:open-mobile-sidebar";
+
+export function openMobileSidebar(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(OPEN_MOBILE_SIDEBAR_EVENT));
+}
+
 interface ContextMenu {
   x: number;
   y: number;
@@ -284,6 +295,13 @@ export default function Sidebar() {
   useEffect(() => {
     setMobileOpen(false);
   }, [pathname]);
+
+  // #1198: opened by TopHeader's menu button via openMobileSidebar() above.
+  useEffect(() => {
+    const open = () => setMobileOpen(true);
+    window.addEventListener(OPEN_MOBILE_SIDEBAR_EVENT, open);
+    return () => window.removeEventListener(OPEN_MOBILE_SIDEBAR_EVENT, open);
+  }, []);
 
   // Restore persisted state on mount — only on desktop-width screens
   useEffect(() => {
@@ -752,18 +770,13 @@ export default function Sidebar() {
 
   return (
     <>
-      {/* Mobile hamburger button — only below lg. #1187: it sits inside the
-          48px top header bar, whose left padding below lg keeps the header
-          text clear of it, so it covers no text. z-[45] puts it above the
-          header (z-40) and below every overlay and modal (z-50+). */}
-      <button
-        type="button"
-        onClick={() => setMobileOpen(true)}
-        aria-label="Open sidebar"
-        className="fixed top-1 left-2 z-[45] lg:hidden w-10 h-10 flex items-center justify-center bg-bg-surface border border-border text-text-muted hover:text-accent"
-      >
-        <HamburgerIcon />
-      </button>
+      {/* #1198: the menu button that used to render here now lives in
+          TopHeader.tsx, which sits first in the DOM (see layout.tsx) so
+          below `lg` Tab reaches it before the header's own controls. It
+          calls openMobileSidebar() (above), which the effect above
+          listens for. Fixed positioning keeps its on-screen spot
+          unchanged (#1187: inside the 48px top header bar, z-[45] above
+          the header z-40, below every overlay/modal z-50+). */}
 
       {/* Mobile overlay backdrop */}
       {mobileOpen && (
@@ -782,6 +795,7 @@ export default function Sidebar() {
         <button
           type="button"
           onClick={() => setMobileOpen(false)}
+          aria-label="Close sidebar"
           className="self-end shrink-0 w-10 h-10 flex items-center justify-center text-text-muted hover:text-accent mb-1"
         >
           <CloseXIcon />

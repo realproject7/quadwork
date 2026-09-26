@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import AboutModal from "./AboutModal";
+import { openMobileSidebar, HamburgerIcon } from "./Sidebar";
 
 const GITHUB_URL = "https://github.com/realproject7/quadwork";
 
@@ -162,21 +163,42 @@ export default function TopHeader() {
     }
   }, [animationEnabled, liveSuffix]);
 
+  // #1198: rendered from here (not Sidebar.tsx) so Tab reaches it before
+  // this header's own controls — TopHeader sits first in the DOM (see
+  // layout.tsx). Fixed positioning means moving it here doesn't move it
+  // on screen. Always rendered, mounted or not, so it's never briefly
+  // unfocusable during hydration; the click asks Sidebar to open via a
+  // window event (openMobileSidebar, defined alongside Sidebar's state).
+  const menuButton = (
+    <button
+      type="button"
+      onClick={openMobileSidebar}
+      aria-label="Open sidebar"
+      className="fixed top-1 left-2 z-[45] lg:hidden w-10 h-10 flex items-center justify-center bg-bg-surface border border-border text-text-muted hover:text-accent"
+    >
+      <HamburgerIcon />
+    </button>
+  );
+
   if (!mounted) {
     // #372: empty placeholder shell with the same dimensions as
     // the real header so layout doesn't jump on hydration. SSR
     // and first client render produce identical HTML → no #418.
     return (
-      <header
-        className="sticky top-0 z-40 flex h-12 items-center justify-between border-b border-white/10 bg-neutral-950/90 px-4 backdrop-blur"
-        aria-hidden="true"
-      />
+      <>
+        {menuButton}
+        <header
+          className="sticky top-0 z-40 flex h-12 items-center justify-between border-b border-white/10 bg-neutral-950/90 px-4 backdrop-blur"
+          aria-hidden="true"
+        />
+      </>
     );
   }
 
   return (
     <>
-      {/* #1187: below lg the left padding leaves room for the Sidebar's fixed menu button. */}
+      {menuButton}
+      {/* #1187: below lg the left padding leaves room for the fixed menu button. */}
       <header className="sticky top-0 z-40 flex h-12 items-center justify-between border-b border-white/10 bg-neutral-950/90 pl-14 pr-4 lg:pl-4 backdrop-blur">
         <div className="flex items-center gap-3 min-w-0">
           <Link href="/" className="flex items-center gap-1.5 text-sm font-bold text-accent hover:text-blue-400 shrink-0">
