@@ -4,6 +4,8 @@
 // real child process — `node -e <script>` standing in for a provider CLI — so
 // the timeout, exit-code, missing-binary and parse paths are the production
 // execFile paths, not a stubbed runner. No provider CLI is ever started here.
+// #1176: discovery runs one resolved executable per target; here the node
+// binary is each target's executable and the script is the source's args.
 
 const fs = require("fs");
 const os = require("os");
@@ -11,6 +13,7 @@ const path = require("path");
 const {
   parseCodexModels,
   parseGrokModels,
+  discoveryTargets,
   discoverAgentModels,
   createModelCatalogCache,
   DISCOVERY_SOURCES,
@@ -44,9 +47,16 @@ const CODEX_FIXTURE = JSON.stringify({
 // Exact `grok models` stdout (grok 0.2.118, not logged in; exit 0, empty stderr).
 const GROK_UNAUTHENTICATED = "You are not authenticated.\n\nDefault model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n";
 
-// A source that runs `node -e <script>` and parses stdout like codex's does.
-const nodeSource = (script) => ({ name: "codex debug models", command: process.execPath, args: ["-e", script], parse: parseCodexModels });
+// A source whose fixed args are `-e <script>`, parsed like codex's; run with
+// the node binary as its executable.
+const nodeSource = (script) => ({ name: "codex debug models", command: "codex", args: ["-e", script], parse: parseCodexModels });
 const printFixture = `process.stdout.write(${JSON.stringify(CODEX_FIXTURE)})`;
+// Every source gets one target: the node binary, or `executable` if given.
+const discover = (sources, { executable = process.execPath, ...opts } = {}) => discoverAgentModels({
+  sources,
+  targets: Object.keys(sources).map((backend) => ({ backend, executable })),
+  ...opts,
+});
 
 async function main() {
   // ── parser ──
@@ -87,39 +97,46 @@ async function main() {
 
   // ── AC1: a discovered model is returned ──
   {
-    const r = await discoverAgentModels({ sources: { codex: nodeSource(printFixture) } });
+    const r = await discover({ codex: nodeSource(printFixture) });
     ok(r.models.codex && r.models.codex.join(",") === "gpt-7-nova,gpt-6-astra", "AC1: discovered models are returned per backend");
     ok(Object.keys(r.errors).length === 0, "a successful discovery reports no error");
   }
   {
     const grokSource = (script) => ({ ...nodeSource(script), name: "grok models", parse: parseGrokModels });
-    const r = await discoverAgentModels({ sources: {
+    const r = await discover({
       grok: grokSource(`process.stdout.write(${JSON.stringify(GROK_UNAUTHENTICATED)})`),
-    } });
+    });
     ok(r.models.grok && r.models.grok.join(",") === "grok-4.5", "AC1: grok models discovered through a child process");
     for (const [label, script] of [
       ["changed format", 'process.stdout.write("Models: grok-4.5\\n")'],
       ["empty list", 'process.stdout.write("Available models:\\n")'],
       ["non-zero exit", "process.exit(2)"],
     ]) {
-      const f = await discoverAgentModels({ sources: { grok: grokSource(script) } });
+      const f = await discover({ grok: grokSource(script) });
       ok(!("grok" in f.models) && typeof f.errors.grok === "string", `AC8: grok ${label} → shipped list (${f.errors.grok})`);
     }
-    const t = await discoverAgentModels({ sources: { grok: grokSource("setTimeout(() => {}, 30000)") }, timeoutMs: 300 });
+    const t = await discover({ grok: grokSource("setTimeout(() => {}, 30000)") }, { timeoutMs: 300 });
     ok(!("grok" in t.models) && /timed out/.test(t.errors.grok || ""), "AC8: a hung `grok models` times out → shipped list");
   }
 
   // ── AC8: every failure drops the backend (→ shipped list) and never throws ──
   const failures = {
-    "missing CLI": { name: "codex debug models", command: path.join(__dirname, "no-such-cli-1172"), args: [], parse: parseCodexModels },
-    "non-zero exit (e.g. not logged in / offline)": nodeSource('process.stderr.write("not logged in"); process.exit(1)'),
-    "changed output format": nodeSource('process.stdout.write("Available models:\\n  gpt-7\\n")'),
-    "empty list": nodeSource('process.stdout.write(JSON.stringify({ models: [] }))'),
+    "missing CLI": [nodeSource(""), path.join(__dirname, "no-such-cli-1172")],
+    "non-zero exit (e.g. not logged in / offline)": [nodeSource('process.stderr.write("not logged in"); process.exit(1)')],
+    "changed output format": [nodeSource('process.stdout.write("Available models:\\n  gpt-7\\n")')],
+    "empty list": [nodeSource('process.stdout.write(JSON.stringify({ models: [] }))')],
   };
-  for (const [label, source] of Object.entries(failures)) {
-    const r = await discoverAgentModels({ sources: { codex: source } });
+  for (const [label, [source, executable]] of Object.entries(failures)) {
+    const r = await discover({ codex: source }, { executable });
     ok(!("codex" in r.models) && typeof r.errors.codex === "string" && r.errors.codex.length > 0 && !/not logged in/.test(r.errors.codex),
       `AC8: ${label} → no discovered list, short error recorded without CLI stderr (${r.errors.codex})`);
+  }
+  {
+    const r = await discover({ codex: nodeSource("") }, { executable: path.join(__dirname, "no-such-cli-1172") });
+    ok(r.errors.codex === "codex not found", "#1176: a missing executable reports the fixed \"codex not found\" (never the path)");
+    const none = await discoverAgentModels({ targets: [], sources: { codex: nodeSource(printFixture) } });
+    ok(!("codex" in none.models) && none.errors.codex === "codex not found",
+      "#1176: a backend with no resolved executable runs nothing and reports \"codex not found\"");
   }
 
   // ── parse failures report a fixed message, never text from the CLI output ──
@@ -128,24 +145,21 @@ async function main() {
     ["JSON of another shape", JSON.stringify({ SECRET: "acct-9f3e" })],
     ["JSON that is not an object", JSON.stringify("SECRET-acct-9f3e")],
   ]) {
-    const r = await discoverAgentModels({ sources: { codex: nodeSource(`process.stdout.write(${JSON.stringify(out)})`) } });
+    const r = await discover({ codex: nodeSource(`process.stdout.write(${JSON.stringify(out)})`) });
     ok(r.errors.codex === "unexpected `codex debug models` output",
       `AC8: ${label} → the fixed "unexpected \`codex debug models\` output" message (got ${JSON.stringify(r.errors.codex)})`);
   }
   {
-    const r = await discoverAgentModels({ sources: {
+    const r = await discover({
       grok: { ...nodeSource('process.stdout.write("Available models:\\n  SECRET-acct-9f3e grok\\n")'), name: "grok models", parse: parseGrokModels },
-    } });
+    });
     ok(r.errors.grok === "unexpected `grok models` output", "AC8: a grok parse failure reports the fixed message");
   }
 
   // ── AC7/AC8: timeout is bounded and falls back ──
   {
     const started = Date.now();
-    const r = await discoverAgentModels({
-      sources: { codex: nodeSource("setTimeout(() => {}, 30000)"), other: nodeSource(printFixture) },
-      timeoutMs: 300,
-    });
+    const r = await discover({ codex: nodeSource("setTimeout(() => {}, 30000)"), other: nodeSource(printFixture) }, { timeoutMs: 300 });
     const elapsed = Date.now() - started;
     ok(!("codex" in r.models) && /timed out/.test(r.errors.codex || ""), "AC8: a hung CLI times out → no discovered list");
     ok(elapsed < 5000, `AC7: the timeout bounds discovery (${elapsed}ms for a 30s hang)`);
@@ -166,7 +180,7 @@ async function main() {
       `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));` +
       "setTimeout(() => {}, 30000);";
     const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-    const r = await discoverAgentModels({ sources: { codex: nodeSource(spawnsHelper) }, timeoutMs: 1000 });
+    const r = await discover({ codex: nodeSource(spawnsHelper) }, { timeoutMs: 1000 });
     const helperPid = Number(fs.readFileSync(pidFile, "utf8"));
     let gone = false;
     for (let i = 0; i < 40 && !gone; i++) {
@@ -183,33 +197,89 @@ async function main() {
   {
     const waitsForInput = 'process.stdin.on("data", () => {}); process.stdin.on("end", () => { process.stderr.write("login required"); process.exit(1); });';
     const started = Date.now();
-    const r = await discoverAgentModels({ sources: { codex: nodeSource(waitsForInput) }, timeoutMs: 4000 });
+    const r = await discover({ codex: nodeSource(waitsForInput) }, { timeoutMs: 4000 });
     ok(!("codex" in r.models) && r.errors.codex === "exited with code 1" && Date.now() - started < 4000,
       "AC8: a CLI that would prompt reads EOF and fails fast (no prompt can wait on the operator)");
   }
 
-  // ── AC7: cache — one run per TTL window, concurrent callers share it ──
+  // ── #1176: targets, one per resolved executable (the resolver's answer) ──
   {
-    let calls = 0;
+    const resolved = { codex: "/p/codex", grok: "/p/grok", "/opt/a/codex": "/opt/a/codex", "/opt/b/grok": "/opt/b/grok", "/p/codex": "/p/codex" };
+    const asked = [];
+    const resolve = (command) => { asked.push(command); return resolved[command] || null; };
+    const targets = discoveryTargets(["codex", "/opt/a/codex", "claude", "/opt/b/grok", undefined, "codex --profile x", "/p/codex", "/opt/missing/codex"], resolve);
+    ok(JSON.stringify(targets) === JSON.stringify([
+      { backend: "codex", executable: "/p/codex" },
+      { backend: "grok", executable: "/p/grok" },
+      { backend: "codex", executable: "/opt/a/codex" },
+      { backend: "grok", executable: "/opt/b/grok" },
+    ]), "#1176: each bare CLI name's executable, then each agent command's own; one target per resolved executable");
+    ok(!asked.includes("claude") && !asked.includes(undefined),
+      "#1176: a command with no discovery source (claude, unset) is never resolved or run");
+    ok(discoveryTargets(["gemini"], () => null).length === 0, "#1176: nothing resolved → no targets");
+  }
+
+  // ── #1176: each target runs its own executable with the source's fixed args ──
+  if (process.platform === "win32") {
+    console.log("  SKIP: executable-per-target check (POSIX shebang stand-ins; not run on Windows)");
+  } else {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-1176-exec-"));
+    const marker = path.join(dir, "runs.log");
+    const standIn = (name, slugs) => {
+      fs.mkdirSync(path.join(dir, name));
+      const file = path.join(dir, name, "codex");
+      fs.writeFileSync(file, `#!${process.execPath}\n` +
+        `require("fs").appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(name + " ")} + process.argv.slice(2).join(" ") + "\\n");\n` +
+        `process.stdout.write(${JSON.stringify(JSON.stringify({ models: slugs.map((slug) => ({ slug, visibility: "list" })) }))});\n`, { mode: 0o755 });
+      return file;
+    };
+    const onPath = standIn("path", ["gpt-7-nova", "gpt-6-astra"]);
+    const pinned = standIn("pinned", ["gpt-6-astra", "gpt-pinned-1"]);
+    const r = await discoverAgentModels({
+      sources: { codex: DISCOVERY_SOURCES.codex },
+      targets: [{ backend: "codex", executable: onPath }, { backend: "codex", executable: pinned }],
+    });
+    ok(r.models.codex && r.models.codex.join(",") === "gpt-7-nova,gpt-6-astra,gpt-pinned-1",
+      "#1176: a backend lists the union of its executables' models, in target order, de-duplicated");
+    const runs = fs.readFileSync(marker, "utf8").split("\n").filter(Boolean).sort();
+    ok(runs.join("|") === "path debug models|pinned debug models",
+      "#1176: each resolved executable ran once, with the fixed `debug models` arguments");
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // ── AC7/#1176: cache per resolved executable, one run per TTL window ──
+  {
+    const calls = [];
     let clock = 1000;
     const get = createModelCatalogCache({
-      discover: async () => { calls++; return { models: { codex: [`m${calls}`] }, errors: {} }; },
+      list: async (source, executable) => { calls.push(executable); return [`m${calls.length}`]; },
       ttlMs: 60000,
       now: () => clock,
     });
-    const [a, b] = await Promise.all([get(), get()]);
-    ok(calls === 1 && a === b, "AC7: concurrent callers share one discovery run");
-    await get();
-    ok(calls === 1, "AC7: a cached result is reused within the TTL (no rerun per render/open)");
+    const a1 = { backend: "codex", executable: "/p/codex" };
+    const [a, b] = await Promise.all([get([a1]), get([a1])]);
+    ok(calls.length === 1 && a.models.codex.join() === "m1" && b.models.codex.join() === "m1",
+      "AC7: concurrent callers share one discovery run");
+    await get([a1]);
+    ok(calls.length === 1, "AC7: a cached result is reused within the TTL (no rerun per render/open)");
+    const withPinned = await get([a1, { backend: "codex", executable: "/opt/a/codex" }]);
+    ok(calls.length === 2 && calls[1] === "/opt/a/codex" && withPinned.models.codex.join() === "m1,m2",
+      "#1176: a newly configured executable runs once; the cached one is not rerun");
+    await get([a1, { backend: "codex", executable: "/opt/a/codex" }]);
+    ok(calls.length === 2, "#1176: each executable keeps its own cache entry");
     clock += 60001;
-    const c = await get();
-    ok(calls === 2 && c.models.codex[0] === "m2", "AC7: discovery reruns after the TTL expires");
+    const c = await get([a1]);
+    ok(calls.length === 3 && c.models.codex.join() === "m3", "AC7: discovery reruns after the TTL expires");
   }
   {
-    const get = createModelCatalogCache({ discover: async () => { throw new Error("boom"); } });
-    const r = await get();
-    ok(r && typeof r.models === "object" && Object.keys(r.models).length === 0 && /boom/.test(r.errors.discovery),
-      "AC8: a throwing discover still resolves (empty models → shipped lists)");
+    let calls = 0;
+    const get = createModelCatalogCache({ list: async () => { calls++; throw new Error("boom"); } });
+    const t = [{ backend: "codex", executable: "/p/codex" }];
+    const r = await get(t);
+    ok(r && typeof r.models === "object" && !("codex" in r.models) && r.errors.codex === "boom" && r.errors.grok === "grok not found",
+      "AC8: a throwing run still resolves (that backend reports the error → shipped list)");
+    await get(t);
+    ok(calls === 1, "AC7: a failed run is cached too (reused for the TTL)");
   }
 
   // ── AC7: the spawn path never references discovery ──

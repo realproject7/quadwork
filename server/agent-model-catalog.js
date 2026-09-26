@@ -18,11 +18,17 @@
 // result, so callers fall back to the shipped list. The CLI runs
 // non-interactively with stdin closed, so it can't sit on a login / trust /
 // consent prompt; QuadWork itself never reads provider auth files.
+//
+// #1176: discovery runs resolved executables (discoveryTargets), found by the
+// resolver the spawn path and /api/cli-status use, not a bare name on PATH.
+// An agent with an absolute-path command gets that executable's models. The
+// cache is per resolved executable.
 
 const { spawn } = require("child_process");
 const os = require("os");
 
 const { MODEL_ID_PATTERN, isValidModelId } = require("../src/lib/modelId.js");
+const { cliBaseFromCommand } = require("../src/lib/injectMode.js");
 
 // `<project id>/<agent id>` for every agent in a config write body whose
 // non-empty model fails MODEL_ID_PATTERN (the PUT and PATCH /api/config
@@ -70,7 +76,8 @@ function parseGrokModels(stdout) {
 }
 
 // Keyed by command basename (cliBaseFromCommand), the same key as the rest of
-// the model catalog.
+// the model catalog. `command` is the bare CLI name: resolved by
+// discoveryTargets, and the name in a "not found" error.
 const DISCOVERY_SOURCES = {
   codex: { name: "codex debug models", command: "codex", args: ["debug", "models"], parse: parseCodexModels },
   grok: { name: "grok models", command: "grok", args: ["models"], parse: parseGrokModels },
@@ -87,7 +94,9 @@ function killGroup(child) {
   try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
 }
 
-function runSource(source, timeoutMs) {
+// #1176: runs `executable` (a resolved path; no shell) with the source's fixed
+// arguments.
+function runSource(source, executable, timeoutMs) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (err, stdout) => {
@@ -99,7 +108,7 @@ function runSource(source, timeoutMs) {
     };
     // stdin: a pipe closed at once (EOF — an interactive prompt can't wait for
     // input); stderr is never read — it can carry account details.
-    const child = spawn(source.command, source.args, {
+    const child = spawn(executable, source.args, {
       cwd: os.tmpdir(),
       detached: true,
       stdio: ["pipe", "pipe", "ignore"],
@@ -130,45 +139,69 @@ function runSource(source, timeoutMs) {
   });
 }
 
+// One run of one executable → its listed ids. Throws a short fixed message.
+async function listExecutableModels(source, executable, timeoutMs = DISCOVERY_TIMEOUT_MS) {
+  const stdout = await runSource(source, executable, timeoutMs);
+  let parsed;
+  // A fixed message: never text derived from the CLI's output.
+  try { parsed = source.parse(stdout); } catch { throw new Error(`unexpected \`${source.name}\` output`); }
+  const list = [...new Set(parsed)];
+  if (list.length === 0) throw new Error("no models listed");
+  return list;
+}
+
+// #1176: what discovery runs, one { backend, executable } per resolved
+// executable: each source's bare CLI name first (the CLI /api/cli-status
+// reports), then every configured agent command that has a source. `resolve`
+// is server/index.js resolveCliExecutable, the resolver the spawn path uses.
+function discoveryTargets(commands, resolve, sources = DISCOVERY_SOURCES) {
+  const targets = new Map();
+  for (const command of [...Object.keys(sources), ...commands]) {
+    const backend = cliBaseFromCommand(command);
+    const executable = sources[backend] ? resolve(command) : null;
+    if (executable && !targets.has(executable)) targets.set(executable, { backend, executable });
+  }
+  return [...targets.values()];
+}
+
 // → { models: { [backend]: string[] }, errors: { [backend]: string } }. Never
 // rejects: each backend either lists at least one model or reports an error.
-async function discoverAgentModels({ sources = DISCOVERY_SOURCES, timeoutMs = DISCOVERY_TIMEOUT_MS } = {}) {
-  const models = {};
-  const errors = {};
-  await Promise.all(Object.entries(sources).map(async ([backend, source]) => {
+// #1176: a backend lists the union of its targets' models (target order), else
+// reports its first error, or "<cli> not found" when nothing resolved.
+async function discoverAgentModels({ targets, sources = DISCOVERY_SOURCES, timeoutMs = DISCOVERY_TIMEOUT_MS,
+  list = (source, executable) => listExecutableModels(source, executable, timeoutMs) }) {
+  const results = await Promise.all(targets.map(async ({ backend, executable }) => {
     try {
-      const stdout = await runSource(source, timeoutMs);
-      let parsed;
-      // A fixed message: never text derived from the CLI's output.
-      try { parsed = source.parse(stdout); } catch { throw new Error(`unexpected \`${source.name}\` output`); }
-      const list = [...new Set(parsed)];
-      if (list.length === 0) throw new Error("no models listed");
-      models[backend] = list;
+      return { backend, models: await list(sources[backend], executable) };
     } catch (err) {
-      errors[backend] = (err && err.message) || String(err);
+      return { backend, error: (err && err.message) || String(err) };
     }
   }));
+  const models = {};
+  const errors = {};
+  for (const [backend, source] of Object.entries(sources)) {
+    const own = results.filter((r) => r.backend === backend);
+    const listed = [...new Set(own.flatMap((r) => r.models || []))];
+    if (listed.length > 0) models[backend] = listed;
+    else errors[backend] = (own.find((r) => r.error) || {}).error || `${source.command} not found`;
+  }
   return { models, errors };
 }
 
-// Cached, de-duplicated discovery: concurrent callers share one run, and a
-// result (including a failed one) is reused for ttlMs.
-function createModelCatalogCache({ discover = discoverAgentModels, ttlMs = DISCOVERY_CACHE_MS, now = Date.now } = {}) {
-  let cached = null;
-  let inflight = null;
-  return function getModelCatalog() {
-    if (cached && now() - cached.at < ttlMs) return Promise.resolve(cached.result);
-    if (!inflight) {
-      inflight = Promise.resolve()
-        .then(() => discover())
-        .catch((err) => ({ models: {}, errors: { discovery: (err && err.message) || String(err) } }))
-        .then((result) => {
-          cached = { at: now(), result };
-          inflight = null;
-          return result;
-        });
-    }
-    return inflight;
+// #1176: discovery cached per resolved executable. Concurrent callers share
+// one run, and a result (including a failed one) is reused for ttlMs.
+function createModelCatalogCache({ list = listExecutableModels, ttlMs = DISCOVERY_CACHE_MS, now = Date.now } = {}) {
+  const runs = new Map();
+  const cachedList = (source, executable) => {
+    const run = runs.get(executable);
+    if (run && (run.at === null || now() - run.at < ttlMs)) return run.result;
+    const next = { at: null, result: Promise.resolve().then(() => list(source, executable)) };
+    next.result.catch(() => {}).then(() => { next.at = now(); });
+    runs.set(executable, next);
+    return next.result;
+  };
+  return function getModelCatalog(targets) {
+    return discoverAgentModels({ targets, list: cachedList });
   };
 }
 
@@ -180,6 +213,7 @@ module.exports = {
   parseGrokModels,
   DISCOVERY_SOURCES,
   DISCOVERY_TIMEOUT_MS,
+  discoveryTargets,
   discoverAgentModels,
   createModelCatalogCache,
 };

@@ -68,6 +68,14 @@ fs.writeFileSync(CONFIG_PATH, JSON.stringify({
     name: "p2",
     working_dir: path.join(TMP_HOME, "p2"),
     agents: { head: { command: "codex", model: "gpt-5.5" }, dev: { command: "claude" } },
+  }, {
+    // #1176: an archived project holding a hand-edited invalid id and a
+    // cross-backend leftover the Settings heal would rewrite.
+    id: "p3",
+    name: "p3",
+    archived: true,
+    working_dir: path.join(TMP_HOME, "p3"),
+    agents: { dev: { command: "codex", model: 'bad"id', mcp_inject: "flag" }, head: { command: "codex", model: "sonnet" } },
   }],
 }));
 
@@ -162,6 +170,13 @@ async function main() {
         "AC3/AC4: PATCH persists a valid id and an unset ('') model");
       const r2 = await req(server, { method: "PATCH", urlPath: "/api/config", body: { operator_name: "op" } });
       ok(r2.status === 200, "a PATCH with no projects is unaffected by the model check");
+      // #1176: the body Settings sends omits archived projects; the invalid id
+      // on archived p3 does not block it, and p3 is left exactly as stored.
+      const p3 = () => JSON.stringify(readCfg().projects.find((p) => p.id === "p3"));
+      const storedP3 = p3();
+      const r3 = await patchAgents({ head: { command: "codex", model: "" }, dev: { command: "claude", model: "opus" } });
+      ok(r3.status === 200 && p2().agents.dev.model === "opus" && p3() === storedP3,
+        "#1176: a Settings save without the archived project succeeds and leaves its stored agents unchanged (no rewrite, no heal)");
     }
 
     if (!SHIM) {

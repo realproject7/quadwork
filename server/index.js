@@ -28,7 +28,7 @@ const tempCleanup = require("./temp-cleanup"); // #957: stale backend-temp sweep
 const { createAgentLifecycleGovernor } = require("./agent-lifecycle");
 const { captureRepositoryFacts } = require("./repository-facts");
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
-const { isValidModelId, createModelCatalogCache } = require("./agent-model-catalog");
+const { isValidModelId, createModelCatalogCache, discoveryTargets } = require("./agent-model-catalog");
 const { assignmentRequestFields, ownedCurrentBatchSnapshot } = require("../src/lib/batchIdentity.js");
 const telegramBridge = require("./bridges/telegram"); // #972: stop on shutdown
 const discordBridge = require("./bridges/discord");   // #972: stop on shutdown
@@ -385,27 +385,46 @@ function requireSessionToken(req, res) {
 
 // --- CLI status detection ---
 
-const { execFileSync } = require("child_process");
+// #1176: the executable a CLI command runs. One answer for the install check
+// (/api/cli-status), the spawn path (launchAgentPty) and model discovery
+// (/api/agent-model-catalog), so a CLI reported as installed is one an agent
+// can start and discovery can list. A command containing "/" names its
+// executable (only an absolute path resolves). A bare name is looked up on the
+// server's PATH, then in install locations a non-login PATH can lack: #586
+// ~/.local/bin and ~/.npm-global/bin (installers add them in ~/.bashrc, which
+// a Node server never sources), #1023 ~/.grok/bin (grok's `curl | bash`
+// installer). Returns an absolute path, or null when no executable is found.
+function resolveCliExecutable(command) {
+  if (typeof command !== "string" || command === "") return null;
+  const isExecutable = (file) => {
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (command.includes("/")) return path.isAbsolute(command) && isExecutable(command) ? command : null;
+  const home = os.homedir();
+  const dirs = [
+    ...(process.env.PATH || "").split(path.delimiter),
+    path.join(home, ".local", "bin"),
+    path.join(home, ".npm-global", "bin"),
+    path.join(home, ".grok", "bin"),
+    "/usr/local/bin",
+  ];
+  // A relative PATH entry is skipped: spawn would resolve it against the
+  // agent's cwd, not the server's.
+  for (const dir of dirs) {
+    if (!path.isAbsolute(dir)) continue;
+    const file = path.join(dir, command);
+    if (isExecutable(file)) return file;
+  }
+  return null;
+}
 
 function isCliInstalled(cmd) {
-  try {
-    execFileSync("which", [cmd], { encoding: "utf-8", stdio: "pipe" });
-    return true;
-  } catch {
-    // #586: fallback for VPS/headless environments where ~/.local/bin
-    // is not in the inherited PATH (e.g. Claude Code installer adds to
-    // ~/.bashrc but Node's execFileSync doesn't source profile files).
-    // #1023: ~/.grok/bin covers grok's `curl | bash` installer, which does not
-    // put the binary on the npm global path. The list is generic, so this also
-    // probes ~/.grok/bin/claude etc. — harmless, those paths simply don't exist.
-    const fallbacks = [
-      path.join(os.homedir(), ".local", "bin", cmd),
-      path.join(os.homedir(), ".npm-global", "bin", cmd),
-      path.join(os.homedir(), ".grok", "bin", cmd),
-      `/usr/local/bin/${cmd}`,
-    ];
-    return fallbacks.some((p) => fs.existsSync(p));
-  }
+  return resolveCliExecutable(cmd) !== null;
 }
 
 app.get("/api/cli-status", (_req, res) => {
@@ -421,10 +440,17 @@ app.get("/api/cli-status", (_req, res) => {
 // Fetched by Settings and the Agent Models modal when they open; bounded and
 // cached in server/agent-model-catalog.js. A backend missing from `models`
 // (no discovery source, or discovery failed — reason in `errors`) uses the
-// shipped list. Never called from the spawn path.
+// shipped list. Never called from the spawn path. #1176: discovery runs the
+// executables resolveCliExecutable finds, as spawn does: the one each bare CLI
+// name runs and each configured agent command's own, so an absolute-path
+// command gets that executable's models. A reviewed-execution role is never
+// run here: it starts only through its own fixed launch plan.
 const getAgentModelCatalog = createModelCatalogCache();
 app.get("/api/agent-model-catalog", async (_req, res) => {
-  res.json(await getAgentModelCatalog());
+  const commands = (readConfig().projects || []).flatMap((p) => Object.values((p && p.agents) || {})
+    .filter((a) => a && a.reviewed_execution_id === undefined)
+    .map((a) => a.command));
+  res.json(await getAgentModelCatalog(discoveryTargets(commands, resolveCliExecutable)));
 });
 
 // --- Port availability check ---
@@ -2460,7 +2486,10 @@ async function launchAgentPty(project, agent, opts = {}) {
       throw new Error("reviewed_execution_cwd_invalid");
     }
     const args = reviewedPlan ? reviewedPlan.argv : built.args;
-    const launchCommand = reviewedPlan ? reviewedPlan.executable : command;
+    // #1176: run the executable the install check and discovery resolve
+    // (else the configured command as-is). A reviewed plan names its own
+    // executable; its configured provider path is never touched.
+    const launchCommand = reviewedPlan ? reviewedPlan.executable : (resolveCliExecutable(command) || command);
     if (reviewedPlan) claimAuthorization(reviewedExecution, reviewedExecutionBinding(agentCfg));
 
     const terminalOptions = {
