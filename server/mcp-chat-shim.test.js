@@ -5,6 +5,13 @@ const http = require("http");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+
+// #1188: a temporary HOME, never the real ~/.quadwork. The spawned shims
+// inherit it.
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "qw-mcp-shim-"));
+Object.assign(process.env, { HOME: home, USERPROFILE: home });
+process.on("exit", () => { try { fs.rmSync(home, { recursive: true, force: true }); } catch {} });
+
 const { ensureSecureDir } = require("./config");
 const fileChat = require("./file-chat");
 const {

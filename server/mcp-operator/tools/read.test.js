@@ -7,6 +7,16 @@
 // config ∪ runtime. (Transport/stdio is already covered by mcp-operator.test.js.)
 
 const http = require("http");
+
+// #1188: a temporary HOME, never the real ~/.quadwork: the context reads the
+// session token from config.json.
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "qw-mcp-operator-"));
+Object.assign(process.env, { HOME: home, USERPROFILE: home });
+process.on("exit", () => { try { fs.rmSync(home, { recursive: true, force: true }); } catch {} });
+
 const { createContext } = require("../context");
 const read = require("./read");
 

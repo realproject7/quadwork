@@ -11,6 +11,15 @@
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+
+// #1188: a temporary HOME, never the real ~/.quadwork: the context reads the
+// session token from config.json. The spawned operator inherits it.
+const fs = require("fs");
+const os = require("os");
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "qw-mcp-operator-"));
+Object.assign(process.env, { HOME: home, USERPROFILE: home });
+process.on("exit", () => { try { fs.rmSync(home, { recursive: true, force: true }); } catch {} });
+
 const { createContext } = require("./mcp-operator/context");
 
 const OPERATOR = path.join(__dirname, "mcp-operator.js");

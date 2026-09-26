@@ -8262,9 +8262,14 @@ router.put("/api/project/:projectId/agent-models/:agentId", (req, res) => {
 });
 
 // #554: start rate-limit polling as soon as routes are loaded.
-startRateLimitPolling();
 // #703: start batched GraphQL polling for dashboard data.
-startGraphQLPolling();
+// #1188: never in the isolated test runtime (the index.js gate): a test that
+// loads routes would otherwise run a real `gh api rate_limit` on the
+// operator's gh auth. Tests drive refreshRateLimit / refreshGraphQLCache.
+if (process.env.QUADWORK_TEST_RUNTIME !== "1") {
+  startRateLimitPolling();
+  startGraphQLPolling();
+}
 
 module.exports = router;
 // #341: export parseActiveBatch for unit tests. No production callers

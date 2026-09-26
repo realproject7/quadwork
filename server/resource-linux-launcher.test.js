@@ -3,6 +3,11 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+// #1188: a temporary HOME, never the real ~/.quadwork: owner construction
+// reads runtime_resources from config.json.
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "qw-resource-launcher-"));
+Object.assign(process.env, { HOME: home, USERPROFILE: home });
+process.on("exit", () => { try { fs.rmSync(home, { recursive: true, force: true }); } catch {} });
 const { createDurableStoreFiles } = require("./durable-store-files");
 const { getSharedResourceRuntimeOwner, createResourceRuntimeOwner } = require("./resource-runtime-owner");
 class LockError extends Error { constructor(code, message) { super(message); this.code = code; } }
