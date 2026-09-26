@@ -385,8 +385,11 @@ export default function Sidebar() {
   // still finds the drawer's (now hidden, unfocusable) buttons via
   // querySelectorAll, and calls preventDefault() on every Tab only to
   // .focus() something that can't take it, leaving Tab dead everywhere.
+  // The query is `64rem`, exactly Tailwind v4's `lg`: media-query rem follows
+  // the browser's default font size, so a px value would drift from
+  // `lg:hidden` whenever that setting is not 16px.
   useEffect(() => {
-    const mq = window.matchMedia("(min-width: 1024px)");
+    const mq = window.matchMedia("(min-width: 64rem)");
     const handler = (e: MediaQueryListEvent) => { if (e.matches) setMobileOpen(false); };
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
