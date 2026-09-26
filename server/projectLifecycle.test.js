@@ -1,4 +1,15 @@
 const assert = require("assert");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+// #1188: a temporary HOME, never the real ~/.quadwork. Controller archives
+// revoke admission through the default config reader, which a test cannot
+// inject.
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "qw-project-lifecycle-"));
+Object.assign(process.env, { HOME: home, USERPROFILE: home });
+process.on("exit", () => { try { fs.rmSync(home, { recursive: true, force: true }); } catch {} });
+
 const {
   ProjectLifecycleError,
   isProjectArchived,
@@ -57,7 +68,7 @@ async function rejectsCode(fn, code) {
   const leaseConfig = config(project("lease"));
   const firstLease = captureProjectAdmission("lease", { readConfig: () => leaseConfig });
   assert.equal(isAdmissionCurrent(firstLease, { readConfig: () => leaseConfig }), true);
-  revokeProjectAdmission("lease");
+  revokeProjectAdmission("lease", { readConfig: () => leaseConfig });
   assert.equal(isAdmissionCurrent(firstLease, { readConfig: () => leaseConfig }), false, "revocation invalidates in-flight work");
   const secondLease = captureProjectAdmission("lease", { readConfig: () => leaseConfig });
   assert.equal(isAdmissionCurrent(secondLease, { readConfig: () => leaseConfig }), true);

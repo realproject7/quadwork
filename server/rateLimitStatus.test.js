@@ -10,6 +10,7 @@
 // ts.transpileModule precedent in server/terminalLifecycleControls.test.js).
 
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -112,8 +113,9 @@ let passed = 0;
 const pass = (message) => { passed++; console.log(`  PASS: ${message}`); };
 
 (async () => {
-  // The module-load refresh runs with the failing fixture.
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // #1188: routes does not poll at load in the test runtime, so the first
+  // lookup runs here, with the failing fixture.
+  await routes.refreshRateLimit();
 
   let body = await getRateLimit();
   assert.ok(body.error, "the failed lookup is reported");
@@ -192,6 +194,21 @@ const pass = (message) => { passed++; console.log(`  PASS: ${message}`); };
   body = await getRateLimitAfter(122_000);
   assert.equal("reviewer" in body, false);
   pass("removing the reviewer token drops the reviewer block");
+
+  // #1188: outside the test runtime, loading routes still refreshes the rate
+  // limit at once (the pollers start at load), here through a fixture.
+  const normalImport = spawnSync(process.execPath, ["-e", `
+    const calls = [];
+    require("./server/__tests__/resource-executor-fixture").installResourceExecutorFixture({
+      runControlChild: async (command, args) => { calls.push([command, ...args].join(" ")); throw new Error("fixture"); },
+    });
+    require("./server/routes");
+    setTimeout(() => { console.log(JSON.stringify(calls)); process.exit(0); }, 50);
+  `], { cwd: path.join(__dirname, ".."), encoding: "utf8", env: { ...process.env, QUADWORK_TEST_RUNTIME: "" } });
+  assert.equal(normalImport.status, 0, normalImport.stderr);
+  const loadCalls = JSON.parse(normalImport.stdout.trim().split("\n").pop());
+  assert.ok(loadCalls.some((call) => call.startsWith("gh api rate_limit")), JSON.stringify(loadCalls));
+  pass("a normal import refreshes the rate limit at load; the test runtime does not");
 
   console.log(`\n${passed} passed, 0 failed\n`);
   process.exit(0);

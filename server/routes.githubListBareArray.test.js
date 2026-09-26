@@ -29,6 +29,12 @@ const realReadFileSync = fs.readFileSync;
 fs.readFileSync = (p, ...rest) =>
   p === CONFIG_PATH ? FAKE_CONFIG : realReadFileSync(p, ...rest);
 
+// #1188: the stale-flag case starts a background refresh. Its GitHub reads go
+// to a failing control-child fixture, never the real gh.
+require("./__tests__/resource-executor-fixture").installResourceExecutorFixture({
+  runControlChild: async (command) => { throw new Error(`no control child in this test: ${command}`); },
+});
+
 const routes = require("./routes");
 const { serveGithubList, _ghEndpointCache, _rateLimit } = routes;
 

@@ -18,12 +18,18 @@ fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
 fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ projects: [], temp_cleanup: { enabled: false } }), { mode: 0o600 });
 
 test("normal imports have no mutable legacy session facade", () => {
+  // #1188: a normal import starts the routes pollers; their gh lookups go to a
+  // failing control-child fixture, never the real gh.
   const script = `
     const os = require("node:os");
     os.homedir = () => process.env.QW_FACADE_HOME;
     process.env.HOME = process.env.QW_FACADE_HOME;
     process.env.QUADWORK_SKIP_LISTEN = "1";
     delete process.env.QUADWORK_TEST_RUNTIME;
+    require("./server/__tests__/resource-executor-fixture").installResourceExecutorFixture({
+      preserveRuntimeOwner: true,
+      runControlChild: async (command) => { throw new Error("no control child in this test: " + command); },
+    });
     const runtime = require("./server/index");
     const facts = runtime.app.get("readSessionLiveness")();
     const absent = !Object.hasOwn(runtime, "agentSessions") && !Object.hasOwn(runtime._test, "agentSessions") &&

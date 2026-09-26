@@ -3,6 +3,12 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+
+// #1188: a temporary HOME, never the real ~/.quadwork.
+const home = fs.mkdtempSync(path.join(os.tmpdir(), "qw-system-msg-"));
+Object.assign(process.env, { HOME: home, USERPROFILE: home });
+process.on("exit", () => { try { fs.rmSync(home, { recursive: true, force: true }); } catch {} });
+
 const fileChat = require("./file-chat");
 
 const PROJECT = "__system_msg_test__";
