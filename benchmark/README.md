@@ -231,18 +231,26 @@ node --test benchmark/live-provider-flag-check.test.cjs
 ```
 
 It runs the smoke's digest check first and starts no process if that fails.
-Then it checks the version digest and parses only help output. Each CLI runs
-under a macOS Seatbelt profile in its own fresh `0700` throwaway HOME inside the
-given directory, and each call has a five-second bound. The profile denies all
-network access, the `security` command that Claude's startup uses to read the
-Keychain, writes outside that HOME, and any access to `~/.claude*`, `~/.codex`,
-and `~/Library/Keychains`. The check confirms that help lists every fixed flag
-of both compiled compatibility argv profiles. Where help lists choices, each
-fixed value must be one of them. A missing flag fails the check, and exit zero
-means both CLIs passed. The throwaway HOME is deleted afterward. The result
-keeps only flag names, value-check classes, and digests. It never holds help
-text, a path, or the workload. The check never sends a workload or makes a
-provider request, and it is not provider-support evidence.
+Then it checks the version digest and parses only help output. Each CLI runs in
+its own fresh `0700` throwaway HOME inside the given directory, under a
+deny-by-default macOS Seatbelt profile in the style of the reviewed-execution
+profile. The profile allows only exec of the pinned file, sysctl reads, a data
+read of the root directory, reads under `/usr/share`, and reads and writes
+inside that HOME. Both pinned CLIs needed each of these on 2026-09-26.
+Everything else is denied, including network access, forks, every other
+executable (so the `security` command that Claude's startup runs to read the
+Keychain), mach lookups and launchd job creation, and all other reads and
+writes (so `~/.claude*`, `~/.codex`, and `~/Library/Keychains`). Each call runs
+in its own process group with a five-second bound. The whole group is killed
+on timeout and again when the call ends. The HOME is then deleted, and a HOME
+that is still present fails the check as `home_cleanup_failed`.
+
+The check confirms that help lists every fixed flag of both compiled
+compatibility argv profiles. Where help lists choices, each fixed value must be
+one of them. A missing flag fails the check, and exit zero means both CLIs
+passed. The result keeps only flag names, value-check classes, and digests. It
+never holds help text, a path, or the workload. The check never sends a
+workload or makes a provider request, and it is not provider-support evidence.
 
 This is provider-CLI compatibility evidence only. It does not prove the full
 QuadWork `buildAgentArgs` or PTY launch path. It does not authorize Mode 3 timing,

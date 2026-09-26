@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const core = require('./live-provider-compatibility-core.cjs');
 const flagCheck = require('./live-provider-flag-check.cjs');
@@ -98,26 +98,32 @@ Commands:
 function parent() { return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'quadwork-flag-check-test-'))); }
 const cleanup = directory => fs.rmSync(directory, { recursive: true, force: true });
 const homes = directory => fs.readdirSync(directory).filter(entry => entry.startsWith('quadwork-flag-check-home-'));
+const NODE = fs.realpathSync(process.execPath);
+const settle = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 // A fake CLI in the pinned install shape: a wrapper symlink to a versioned file.
 function install(directory, id, { help = id === 'codex' ? CODEX_HELP : CLAUDE_HELP, version = VERSION[id], body = 'respond();' } = {}) {
   const target = path.join(directory, id === 'codex' ? 'Caskroom/codex/0.157.1/bin/codex' : 'claude/versions/2.1.283'), wrapper = path.join(directory, 'bin', id);
   fs.mkdirSync(path.dirname(target), { recursive: true }); fs.mkdirSync(path.dirname(wrapper), { recursive: true });
-  fs.writeFileSync(target, `#!${process.execPath}\nconst args = process.argv.slice(2).join(' ');\nconst respond = () => { if (args === '--version') process.stdout.write(${JSON.stringify(version)}); else if (args === ${JSON.stringify(HELP_ARGS[id])}) process.stdout.write(${JSON.stringify(help)}); else process.exitCode = 64; };\n${body}\n`, { mode: 0o700 });
+  fs.writeFileSync(target, `#!${NODE}\nconst args = process.argv.slice(2).join(' ');\nconst respond = () => { if (args === '--version') process.stdout.write(${JSON.stringify(version)}); else if (args === ${JSON.stringify(HELP_ARGS[id])}) process.stdout.write(${JSON.stringify(help)}); else process.exitCode = 64; };\n${body}\n`, { mode: 0o700 });
   fs.symlinkSync(target, wrapper);
   return { adapter: core.ADAPTERS[id], executable_path: wrapper, resolved_path: target, executable_digest: sha(fs.readFileSync(target)), version_digest: sha(VERSION[id]) };
 }
-function spy(result) {
+// Test-only rules that let a Node-script fake start under the production
+// profile: the interpreter, its own reads, and path metadata for its realpath.
+const fakeRules = target => [`(allow process-exec-interpreter (literal "${NODE}"))`, `(allow file-read* (literal "${NODE}") (literal "${target}") (subpath "/System/Library/OpenSSL"))`, '(allow file-read-metadata)'];
+const check = (contract, directory, runtime = {}) => flagCheck.testHooks.checkFlags(contract, directory, { test_profile_rules: fakeRules(contract.resolved_path), ...runtime });
+function spy(replacement) {
   const calls = [];
-  return { calls, runtime: { spawn_sync: (command, args, options) => {
+  return { calls, spawn: (command, args, options) => {
     calls.push({ command, args: [...args], options, home_mode: fs.statSync(options.env.HOME).mode & 0o777 });
-    return result ? result(command, args, options) : spawnSync(command, args, options);
-  } } };
+    return (replacement || spawn)(command, args, options);
+  } };
 }
 
-test('pinned fake Codex and Claude CLIs accept every fixed flag, and the report is raw-free', { skip: !isMacSandbox }, () => {
+test('pinned fake Codex and Claude CLIs accept every fixed flag, and the report is raw-free', { skip: !isMacSandbox }, async () => {
   const directory = parent();
   try {
-    const codex = flagCheck.testHooks.checkFlags(install(directory, 'codex'), directory), claude = flagCheck.testHooks.checkFlags(install(directory, 'claude'), directory);
+    const codex = await check(install(directory, 'codex'), directory), claude = await check(install(directory, 'claude'), directory);
     for (const [report, id, version, flags] of [[codex, 'codex', '0.157.1', CODEX_FLAGS], [claude, 'claude', '2.1.283', CLAUDE_FLAGS]]) {
       assert.equal(report.result_class, 'flags_accepted'); assert.equal(report.adapter, id); assert.equal(report.pinned_version, version);
       assert.equal(report.provider_support_evidence, false); assert.equal(report.version_digest_matched, true); assert.equal(report.positionals_accepted, true); assert.equal(report.external_process_started, true);
@@ -133,32 +139,31 @@ test('pinned fake Codex and Claude CLIs accept every fixed flag, and the report 
   } finally { cleanup(directory); }
 });
 
-test('the digest check runs first: a stale pin or changed bytes start no process and create no HOME', () => {
+test('the digest check runs first: a stale pin or changed bytes start no process and create no HOME', async () => {
   const directory = parent();
   try {
     const contract = install(directory, 'codex'), observed = spy();
-    assert.throws(() => flagCheck.testHooks.checkFlags({ ...contract, resolved_path: path.join(directory, 'Caskroom/codex/0.156.0/bin/codex') }, directory, observed.runtime), { message: 'live_executable_stale_pin: pinned 0.156.0, found 0.157.1' });
-    assert.throws(() => flagCheck.testHooks.checkFlags({ ...contract, executable_digest: '0'.repeat(64) }, directory, observed.runtime), { message: 'live_executable_not_reviewed: pinned 0.157.1, found 0.157.1' });
+    await assert.rejects(() => check({ ...contract, resolved_path: path.join(directory, 'Caskroom/codex/0.156.0/bin/codex') }, directory, { spawn: observed.spawn }), { message: 'live_executable_stale_pin: pinned 0.156.0, found 0.157.1' });
+    await assert.rejects(() => check({ ...contract, executable_digest: '0'.repeat(64) }, directory, { spawn: observed.spawn }), { message: 'live_executable_not_reviewed: pinned 0.157.1, found 0.157.1' });
     assert.equal(observed.calls.length, 0); assert.deepEqual(homes(directory), []);
   } finally { cleanup(directory); }
 });
 
-test('every process is a sandboxed, time-bounded version or help call in a fresh throwaway HOME', { skip: !isMacSandbox }, () => {
+test('every call runs sandboxed in its own process group with a fresh throwaway HOME', { skip: !isMacSandbox }, async () => {
   const directory = parent(), saved = { CODEX_HOME: process.env.CODEX_HOME, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
   process.env.CODEX_HOME = path.join(directory, 'inherited-codex-home'); process.env.CLAUDE_CONFIG_DIR = path.join(directory, 'inherited-claude-config');
   try {
     const observed = spy(), contracts = { codex: install(directory, 'codex'), claude: install(directory, 'claude') };
-    for (const id of ['codex', 'claude']) assert.equal(flagCheck.testHooks.checkFlags(contracts[id], directory, observed.runtime).result_class, 'flags_accepted');
-    assert.deepEqual(observed.calls.map(call => call.args.slice(2)), [['/usr/bin/true'], [contracts.codex.resolved_path, '--version'], [contracts.codex.resolved_path, 'exec', '--help'], ['/usr/bin/true'], [contracts.claude.resolved_path, '--version'], [contracts.claude.resolved_path, '--help']]);
-    const userHome = os.userInfo().homedir;
+    for (const id of ['codex', 'claude']) assert.equal((await check(contracts[id], directory, { spawn: observed.spawn })).result_class, 'flags_accepted');
+    assert.deepEqual(observed.calls.map(call => call.args.slice(2)), [[flagCheck.PROBE_EXECUTABLE], [contracts.codex.resolved_path, '--version'], [contracts.codex.resolved_path, 'exec', '--help'], [flagCheck.PROBE_EXECUTABLE], [contracts.claude.resolved_path, '--version'], [contracts.claude.resolved_path, '--help']]);
     for (const call of observed.calls) {
-      const home = call.options.env.HOME, profile = call.args[1];
-      assert.equal(call.command, flagCheck.SANDBOX_EXECUTABLE); assert.equal(call.args[0], '-p');
+      const home = call.options.env.HOME, executable = call.args[2];
+      assert.equal(call.command, flagCheck.SANDBOX_EXECUTABLE); assert.equal(call.args[0], '-p'); assert.equal(call.options.detached, true, 'own process group'); assert.equal(call.options.shell, false);
+      // The pinned CLI runs under the production profile; only the fake's interpreter rules are appended.
+      assert.equal(call.args[1], executable === flagCheck.PROBE_EXECUTABLE ? flagCheck.testHooks.sandboxProfile(home, executable) : [flagCheck.testHooks.sandboxProfile(home, executable), ...fakeRules(executable)].join('\n'));
       assert.equal(path.dirname(home), directory); assert.match(path.basename(home), /^quadwork-flag-check-home-/); assert.notEqual(home, os.homedir()); assert.equal(call.home_mode, 0o700);
-      assert.equal(call.options.cwd, home); assert.equal(call.options.env.TMPDIR, path.join(home, 'tmp')); assert.equal(call.options.env.PATH, '/usr/bin:/bin'); assert.equal(call.options.shell, false);
+      assert.equal(call.options.cwd, home); assert.equal(call.options.env.TMPDIR, path.join(home, 'tmp')); assert.equal(call.options.env.PATH, '/usr/bin:/bin');
       assert.equal(Object.hasOwn(call.options.env, 'CODEX_HOME'), false); assert.equal(Object.hasOwn(call.options.env, 'CLAUDE_CONFIG_DIR'), false);
-      assert.equal(call.options.timeout, flagCheck.CAPS.max_elapsed_ms); assert.equal(call.options.killSignal, 'SIGKILL'); assert.equal(call.options.maxBuffer <= flagCheck.CAPS.max_help_bytes, true);
-      for (const rule of ['(allow default)', '(deny network*)', '(deny process-exec (literal "/usr/bin/security"))', '(deny file-write*)', `(allow file-write* (subpath "${home}") (literal "/dev/null"))`, `(deny file-read* file-write* (prefix "${userHome}/.claude") (subpath "${userHome}/.codex") (subpath "${userHome}/Library/Keychains"))`]) assert.equal(profile.includes(rule), true, rule);
       assert.equal(fs.existsSync(home), false, 'the throwaway HOME is removed after the check');
     }
     assert.equal(new Set(observed.calls.map(call => call.options.env.HOME)).size, 2, 'each adapter gets a fresh HOME');
@@ -168,7 +173,7 @@ test('every process is a sandboxed, time-bounded version or help call in a fresh
   }
 });
 
-test('a flag or value the pinned CLI no longer accepts fails the check', { skip: !isMacSandbox }, () => {
+test('a flag or value the pinned CLI no longer accepts fails the check', { skip: !isMacSandbox }, async () => {
   const cases = [
     ['claude', CLAUDE_HELP.replace(/^ {2}--safe-mode .*\n/m, ''), '--safe-mode', report => report.flags.find(flag => flag.flag === '--safe-mode').accepted === false],
     ['claude', CLAUDE_HELP.replace(/^ {2}--safe-mode .*\n/m, '').replace('Commands:\n', 'Commands:\n  --safe-mode                           Listed only as a command\n'), 'safe-mode outside Options', report => report.flags.find(flag => flag.flag === '--safe-mode').accepted === false],
@@ -181,81 +186,129 @@ test('a flag or value the pinned CLI no longer accepts fails the check', { skip:
   for (const [id, help, name, detail] of cases) {
     const directory = parent();
     try {
-      const report = flagCheck.testHooks.checkFlags(install(directory, id, { help }), directory);
+      const report = await check(install(directory, id, { help }), directory);
       assert.equal(report.result_class, 'flag_rejected', name); assert.equal(detail(report), true, name); assert.equal(report.version_digest_matched, true, name);
     } finally { cleanup(directory); }
   }
 });
 
-test('a version mismatch stops before help, and a failing, slow, or oversized help fails closed within the bound', { skip: !isMacSandbox }, () => {
-  const run = (options, runtime) => { const directory = parent(); try { return flagCheck.testHooks.checkFlags(install(directory, 'codex', options), directory, runtime); } finally { cleanup(directory); } };
+test('a version mismatch stops before help, and a failing, slow, or oversized help fails closed within the bound', { skip: !isMacSandbox }, async () => {
+  const run = async (options, runtime) => { const directory = parent(); try { return await check(install(directory, 'codex', options), directory, runtime); } finally { cleanup(directory); } };
   const observed = spy();
-  const mismatch = run({ version: 'codex-cli 0.158.0\n' }, observed.runtime);
+  const mismatch = await run({ version: 'codex-cli 0.158.0\n' }, { spawn: observed.spawn });
   assert.equal(mismatch.result_class, 'version_failed'); assert.equal(mismatch.help_digest, null); assert.deepEqual(observed.calls.map(call => call.args.slice(3)), [[], ['--version']]);
-  assert.equal(run({ body: "if (args === '--version') respond(); else process.exitCode = 2;" }).result_class, 'help_failed');
-  const bound = { test_caps: { ...flagCheck.CAPS, max_elapsed_ms: 3_000 } }, startedAt = Date.now();
-  assert.equal(run({ body: "if (args === '--version') respond(); else setTimeout(respond, 60_000);" }, bound).result_class, 'help_failed');
+  assert.equal((await run({ body: "if (args === '--version') respond(); else process.exitCode = 2;" })).result_class, 'help_failed');
+  const startedAt = Date.now();
+  assert.equal((await run({ body: "if (args === '--version') respond(); else setTimeout(respond, 60_000);" }, { test_caps: { ...flagCheck.CAPS, max_elapsed_ms: 3_000 } })).result_class, 'help_failed');
   assert.equal(Date.now() - startedAt < 20_000, true, 'the slow help call is killed at the time bound');
-  assert.equal(run({ help: CODEX_HELP + 'x'.repeat(2048) }, { test_caps: { ...flagCheck.CAPS, max_help_bytes: 1024 } }).result_class, 'help_failed');
-  assert.throws(() => run({}, { test_caps: { ...flagCheck.CAPS, max_elapsed_ms: flagCheck.CAPS.max_elapsed_ms + 1 } }), /flag_check_caps/);
+  assert.equal((await run({ help: CODEX_HELP + 'x'.repeat(2048) }, { test_caps: { ...flagCheck.CAPS, max_help_bytes: 1024 } })).result_class, 'help_failed');
+  await assert.rejects(() => run({}, { test_caps: { ...flagCheck.CAPS, max_elapsed_ms: flagCheck.CAPS.max_elapsed_ms + 1 } }), /flag_check_caps/);
 });
 
-test('a refused sandbox reports isolation_unavailable before any pinned CLI starts', { skip: !isMacSandbox }, () => {
+test('the whole process group dies on completion and on timeout, so no helper can recreate the deleted HOME', { skip: !isMacSandbox }, async () => {
+  // The help call starts a helper that recreates HOME/after after a delay. The
+  // production profile denies forks; these test rules allow only this helper.
+  const helper = delay => `if (args !== '--version') require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => require("node:fs").mkdirSync(require("node:path").join(process.env.HOME, "after"), { recursive: true }), ${delay})'], { stdio: 'ignore' }).unref();`;
+  const helperRules = target => [...fakeRules(target), '(allow process-fork)', `(allow process-exec (literal "${NODE}"))`, '(allow file-read* file-write* (literal "/dev/null"))'];
+  // Control: outside the checker, the same fake's helper outlives it and recreates a deleted HOME.
+  const control = parent();
+  try {
+    const contract = install(control, 'claude', { body: `${helper(300)} respond();` }), home = path.join(control, 'control-home'); fs.mkdirSync(home, { mode: 0o700 });
+    spawnSync(contract.resolved_path, ['--help'], { env: { HOME: home }, stdio: 'ignore', timeout: 5_000 }); fs.rmSync(home, { recursive: true, force: true });
+    await settle(1_500); assert.equal(fs.existsSync(path.join(home, 'after')), true, 'the helper survives an unmanaged call');
+  } finally { cleanup(control); }
+  for (const [name, body, runtime, expected, wait] of [
+    ['completion', `${helper(1_000)} respond();`, {}, 'flags_accepted', 2_500],
+    ['timeout', `${helper(4_000)} if (args === '--version') respond(); else setTimeout(respond, 60_000);`, { test_caps: { ...flagCheck.CAPS, max_elapsed_ms: 3_000 } }, 'help_failed', 2_500],
+  ]) {
+    const directory = parent();
+    try {
+      const contract = install(directory, 'claude', { body }), observed = spy();
+      const report = await flagCheck.testHooks.checkFlags(contract, directory, { ...runtime, spawn: observed.spawn, test_profile_rules: helperRules(contract.resolved_path) });
+      assert.equal(report.result_class, expected, name);
+      await settle(wait);
+      assert.equal(fs.existsSync(observed.calls[0].options.env.HOME), false, `${name}: no helper recreated the throwaway HOME`); assert.deepEqual(homes(directory), [], name);
+    } finally { cleanup(directory); }
+  }
+});
+
+test('a throwaway HOME that is still present after cleanup fails closed with its own result', { skip: !isMacSandbox }, async () => {
   const directory = parent();
   try {
-    const observed = spy(() => ({ status: 71, signal: null, stdout: Buffer.alloc(0), stderr: Buffer.from('sandbox_apply: Operation not permitted\n') }));
-    const report = flagCheck.testHooks.checkFlags(install(directory, 'claude'), directory, observed.runtime);
+    const body = "if (args !== '--version') { const fs = require('node:fs'), path = require('node:path'), locked = path.join(process.env.HOME, 'locked'); fs.mkdirSync(locked); fs.writeFileSync(path.join(locked, 'file'), 'x'); fs.chmodSync(locked, 0o500); } respond();";
+    const report = await check(install(directory, 'codex', { body }), directory);
+    assert.equal(report.result_class, 'home_cleanup_failed'); assert.equal(homes(directory).length, 1);
+  } finally {
+    for (const home of homes(directory)) fs.chmodSync(path.join(directory, home, 'locked'), 0o700);
+    cleanup(directory);
+  }
+});
+
+test('a refused sandbox reports isolation_unavailable before any pinned CLI starts', { skip: !isMacSandbox }, async () => {
+  const directory = parent();
+  try {
+    const observed = spy((command, args, options) => spawn(process.execPath, ['-e', 'process.exit(71)'], options));
+    const report = await check(install(directory, 'claude'), directory, { spawn: observed.spawn });
     assert.equal(report.result_class, 'isolation_unavailable'); assert.equal(report.external_process_started, false);
-    assert.deepEqual(observed.calls.map(call => call.args.slice(2)), [['/usr/bin/true']]); assert.deepEqual(homes(directory), []);
+    assert.deepEqual(observed.calls.map(call => call.args.slice(2)), [[flagCheck.PROBE_EXECUTABLE]]); assert.deepEqual(homes(directory), []);
   } finally { cleanup(directory); }
 });
 
-test('the sandbox denies network, the Keychain command, and writes outside the throwaway HOME', { skip: !isMacSandbox }, async () => {
+test('under the checker a fake cannot reach the network, start a process, or write outside its HOME', { skip: !isMacSandbox }, async () => {
   const directory = parent(), outside = path.join(directory, 'outside'); fs.mkdirSync(outside, { mode: 0o700 });
   let connections = 0; const server = net.createServer(socket => { connections += 1; socket.destroy(); });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const body = `const fs = require('node:fs'), net = require('node:net'), cp = require('node:child_process'); const breaches = []; let done = false;
-try { cp.execFileSync('/usr/bin/security', ['-h'], { stdio: 'ignore' }); breaches.push('security'); } catch {}
+if (!cp.spawnSync('/usr/bin/security', ['-h'], { stdio: 'ignore' }).error) breaches.push('security');
+if (!cp.spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' }).error) breaches.push('fork');
 try { fs.writeFileSync(${JSON.stringify(path.join(outside, 'written'))}, 'x'); breaches.push('write'); } catch {}
 const finish = () => { if (done) return; done = true; if (breaches.length) process.stdout.write('isolation breached: ' + breaches.join(',')); else respond(); };
 const socket = net.connect(${server.address().port}, '127.0.0.1'); socket.on('connect', () => { breaches.push('network'); socket.destroy(); finish(); }); socket.on('error', finish);`;
     const contract = install(directory, 'claude', { body });
-    // spawnSync blocks this event loop, so accepted connections are counted
-    // only after it yields.
-    const settle = async (expected = 0) => { for (let waited = 0; connections < expected && waited < 5_000; waited += 50) await new Promise(resolve => setTimeout(resolve, 50)); await new Promise(resolve => setTimeout(resolve, 300)); };
-    // Control: outside the sandbox the same fake detects all three breaches.
+    // Control: outside the sandbox the same fake detects every breach.
     const control = spawnSync(contract.resolved_path, ['--version'], { encoding: 'utf8', timeout: 5_000 });
-    await settle(1); assert.equal(control.stdout, 'isolation breached: security,write,network'); assert.equal(connections, 1);
+    for (let waited = 0; connections < 1 && waited < 5_000; waited += 50) await settle(50);
+    assert.equal(control.stdout, 'isolation breached: security,fork,write,network'); assert.equal(connections, 1);
     fs.rmSync(path.join(outside, 'written')); connections = 0;
-    const report = flagCheck.testHooks.checkFlags(contract, directory);
-    await settle(); assert.equal(report.result_class, 'flags_accepted'); assert.equal(connections, 0); assert.deepEqual(fs.readdirSync(outside), []);
+    const report = await check(contract, directory);
+    await settle(300); assert.equal(report.result_class, 'flags_accepted'); assert.equal(connections, 0); assert.deepEqual(fs.readdirSync(outside), []);
   } finally { server.close(); cleanup(directory); }
 });
 
-test('the sandbox profile keeps provider-state and Keychain paths under the user home unreadable', { skip: !isMacSandbox }, () => {
-  const directory = parent(), userHome = path.join(directory, 'user-home'), home = path.join(directory, 'throwaway');
-  const guarded = ['.claude.json', '.claude/settings.json', '.claude-extra', '.codex/auth.json', 'Library/Keychains/login.keychain-db'];
+test('the production profile is deny-by-default and alone denies network, other programs, forks, and outside reads and writes', { skip: !isMacSandbox }, async () => {
+  assert.deepEqual(flagCheck.testHooks.sandboxProfile('/throwaway/home', '/pinned/cli').split('\n'), ['(version 1)', '(deny default)', '(allow process-exec (literal "/pinned/cli"))', '(allow sysctl-read)', '(allow file-read-data (literal "/"))', '(allow file-read* (subpath "/usr/share"))', '(allow file-read* file-write* (subpath "/throwaway/home"))']);
+  const directory = parent(), home = path.join(directory, 'throwaway'), userHome = path.join(directory, 'user-home');
+  let connections = 0; const server = net.createServer(socket => { connections += 1; socket.destroy(); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
-    for (const relative of [...guarded, 'visible.txt']) { fs.mkdirSync(path.dirname(path.join(userHome, relative)), { recursive: true }); fs.writeFileSync(path.join(userHome, relative), 'fixture'); }
-    fs.mkdirSync(home, { mode: 0o700 });
-    const probe = `const fs = require('node:fs'), path = require('node:path'); const result = {};
-for (const relative of ${JSON.stringify([...guarded, 'visible.txt'])}) { try { fs.readFileSync(path.join(${JSON.stringify(userHome)}, relative)); result[relative] = 'read'; } catch (error) { result[relative] = error.code; } }
-for (const [name, file] of [['home', ${JSON.stringify(path.join(home, 'w'))}], ['user_home', ${JSON.stringify(path.join(userHome, 'w'))}]]) { try { fs.writeFileSync(file, 'x'); result[name] = 'written'; } catch (error) { result[name] = error.code; } }
-process.stdout.write(JSON.stringify(result));`;
-    const control = JSON.parse(spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8' }).stdout);
-    assert.equal(Object.values(control).every(value => value === 'read' || value === 'written'), true, 'without the sandbox every probe succeeds');
-    fs.rmSync(path.join(home, 'w')); fs.rmSync(path.join(userHome, 'w'));
-    const sandboxed = spawnSync(flagCheck.SANDBOX_EXECUTABLE, ['-p', flagCheck.testHooks.sandboxProfile(home, userHome), process.execPath, '-e', probe], { encoding: 'utf8', timeout: 5_000 });
-    assert.deepEqual(JSON.parse(sandboxed.stdout), { ...Object.fromEntries(guarded.map(relative => [relative, 'EPERM'])), 'visible.txt': 'read', home: 'written', user_home: 'EPERM' });
-  } finally { cleanup(directory); }
+    fs.mkdirSync(home, { mode: 0o700 }); fs.writeFileSync(path.join(home, 'inside.txt'), 'inside');
+    const guarded = ['.claude.json', '.claude/settings.json', '.codex/auth.json', 'Library/Keychains/login.keychain-db'].map(relative => path.join(userHome, relative));
+    for (const file of guarded) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, 'fixture'); }
+    // Each probe binary is itself the only executable the generated profile allows.
+    const sandboxed = (binary, ...args) => spawnSync(flagCheck.SANDBOX_EXECUTABLE, ['-p', flagCheck.testHooks.sandboxProfile(home, binary), binary, ...args], { cwd: home, encoding: 'utf8', timeout: 5_000 });
+    assert.equal(sandboxed('/bin/cat', path.join(home, 'inside.txt')).stdout, 'inside'); assert.equal(sandboxed('/usr/bin/touch', path.join(home, 'written')).status, 0);
+    const denied = result => result.status !== 0 && /Operation not permitted/.test(result.stderr);
+    for (const file of guarded) { assert.equal(spawnSync('/bin/cat', [file], { encoding: 'utf8' }).stdout, 'fixture'); assert.equal(denied(sandboxed('/bin/cat', file)), true, file); }
+    assert.equal(denied(sandboxed('/usr/bin/touch', path.join(userHome, 'written'))), true); assert.equal(fs.existsSync(path.join(userHome, 'written')), false);
+    assert.equal(denied(sandboxed('/usr/bin/env', '/usr/bin/security', '-h')), true, 'no other executable, so no Keychain command');
+    // `time` names itself when fork fails and names the program when only exec fails.
+    assert.equal(spawnSync('/usr/bin/time', ['/usr/bin/true']).status, 0); assert.match(sandboxed('/usr/bin/time', '/usr/bin/true').stderr, /^time: time: Operation not permitted/, 'no fork');
+    const port = String(server.address().port);
+    assert.equal(denied(sandboxed('/usr/bin/nc', '-v', '-z', '-w', '2', '127.0.0.1', port)), true, 'no network'); await settle(300); assert.equal(connections, 0);
+    assert.equal(spawnSync('/usr/bin/nc', ['-z', '-w', '2', '127.0.0.1', port]).status, 0); for (let waited = 0; connections < 1 && waited < 5_000; waited += 50) await settle(50); assert.equal(connections, 1);
+  } finally { server.close(); cleanup(directory); }
 });
 
-test('the CLI and public entry reject a bad invocation before any digest check', () => {
-  const script = path.join(__dirname, 'live-provider-flag-check.cjs');
-  for (const [args, code] of [[[], 'flag_check_usage'], [['--home-parent'], 'flag_check_usage'], [['--home-parent', 'relative/dir'], 'flag_check_home_parent'], [['--home-parent', path.join(os.tmpdir(), 'quadwork-flag-check-missing-parent-x7')], 'flag_check_home_parent']]) {
-    const result = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', timeout: 10_000 });
-    assert.equal(result.status, 2, args.join(' ')); assert.deepEqual(JSON.parse(result.stdout), { error: code });
-  }
-  assert.throws(() => flagCheck.runFlagCheck({ home_parent: os.tmpdir(), adapter: 'codex' }), /flag_check_shape/);
+test('the CLI and public entry reject a bad invocation before any digest check', async () => {
+  // The missing parent lives inside a directory this test creates, so it can
+  // never exist and the invocation can never reach a pinned CLI.
+  const directory = parent(), script = path.join(__dirname, 'live-provider-flag-check.cjs');
+  try {
+    for (const [args, code] of [[[], 'flag_check_usage'], [['--home-parent'], 'flag_check_usage'], [['--home-parent', 'relative/dir'], 'flag_check_home_parent'], [['--home-parent', path.join(directory, 'missing-parent')], 'flag_check_home_parent']]) {
+      const result = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', timeout: 10_000 });
+      assert.equal(result.status, 2, args.join(' ')); assert.deepEqual(JSON.parse(result.stdout), { error: code });
+    }
+    await assert.rejects(() => flagCheck.runFlagCheck({ home_parent: directory, adapter: 'codex' }), /flag_check_shape/);
+  } finally { cleanup(directory); }
 });
