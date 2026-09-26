@@ -378,6 +378,20 @@ export default function Sidebar() {
     return () => mq.removeEventListener("change", handler);
   }, []);
 
+  // #1198: close the mobile drawer once the viewport reaches `lg` (widening
+  // the window, or zooming out). At `lg+` the drawer is `lg:hidden`
+  // (display:none) but stays in the DOM, so without this, `mobileOpen`
+  // would stay stuck true — the focus-trap effect below keeps running,
+  // still finds the drawer's (now hidden, unfocusable) buttons via
+  // querySelectorAll, and calls preventDefault() on every Tab only to
+  // .focus() something that can't take it, leaving Tab dead everywhere.
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const handler = (e: MediaQueryListEvent) => { if (e.matches) setMobileOpen(false); };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
   const toggleExpanded = () => {
     setExpanded((prev) => {
       const next = !prev;

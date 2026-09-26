@@ -79,13 +79,17 @@ interface OperatorFeaturesPanelProps {
 // width, nothing clipped.
 //
 // Measured via ResizeObserver rather than a CSS container query
-// (`@container`, the pattern PanelHeader.tsx uses): `container-type` also
-// applies layout containment, which makes the container a new containing
-// block for any `position:fixed` descendant. AgentModelsWidget's Configure
-// dialog and the Telegram/Discord setup modals are exactly such descendants
-// (plain `fixed inset-0`, expecting the viewport) — under a container query
-// they'd clip to this panel's box instead of covering the screen.
-// ResizeObserver has no such side effect.
+// (`@container`, the pattern PanelHeader.tsx uses). This panel wraps
+// full-viewport `fixed inset-0` modals (AgentModelsWidget's Configure
+// dialog, the Telegram/Discord setup modals) that expect the viewport as
+// their containing block. `container-type` doesn't actually force layout
+// containment in current browsers — MDN documented it as also creating a
+// containing block for fixed/absolute descendants, which the CSSWG
+// clarified was wrong; the correction has shipped in Chrome, Firefox and
+// Safari (mdn/content#43405) — so that's not a live bug today. Using
+// ResizeObserver instead just means this split never has to depend on
+// that containing-block question at all, on this or any other browser
+// version.
 const TWO_COLUMN_MIN_WIDTH = 560;
 
 export default function OperatorFeaturesPanel({ projectId, idle = false, expanded, onToggle, bodyId }: OperatorFeaturesPanelProps) {
