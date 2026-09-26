@@ -172,12 +172,19 @@ test('repositories within GitHub limits, the four roles, and protocol model ids 
   const at = repository => ({ delivery_identity: deliveryIdentity({ repository, candidate_sha: null }) });
   // One real-length sample per credential shape, built at runtime.
   const body = (length, alphabet = 'Zq7R8x2L') => alphabet.repeat(Math.ceil(length / alphabet.length)).slice(0, length);
+  const digits = length => body(length, '8406512973');
   const credentials = [
     ...['p', 'o', 'u', 's', 'r'].map(kind => `gh${kind}_${body(36)}`), `github_pat_${body(22)}_${body(59)}`,
-    `sk-${body(48)}`, `sk-ant-api03-${body(95, 'Zq7R8x2L-_')}`, `sk_live_${body(24)}`, `rk_test_${body(24)}`,
-    `xoxb-123456789012-1234567890123-${body(24)}`, `xoxp-${body(10)}`, `AKIA${body(16, 'Q7R8X2LZ')}`,
-    `npm_${body(36)}`, `glpat-${body(20, 'Zq7R8x2L-_')}`, `hf_${body(34)}`, `AIza${body(35, 'Zq7R8x2L-_')}`,
+    // Real project, service-account, and admin keys exceed both field limits; these are the longest fragments that fit.
+    `sk-${body(48)}`, `sk-proj-${body(91, 'Zq7R8x2L-_')}`, `sk-svcacct-${body(88, 'Zq7R8x2L-_')}`, `sk-admin-${body(90, 'Zq7R8x2L-_')}`,
+    `sk-ant-api03-${body(95, 'Zq7R8x2L-_')}`, `sk-ant-admin01-${body(93, 'Zq7R8x2L-_')}`, `sk_live_${body(24)}`, `rk_test_${body(24)}`,
+    `xoxb-${digits(13)}-${digits(13)}-${body(24)}`, `xoxp-${digits(13)}-${digits(13)}-${digits(13)}-${body(32, '0123456789abcdef')}`,
+    `AKIA${body(16, 'Q7R8X2LZ')}`, `npm_${body(36)}`, `glpat-${body(20, 'Zq7R8x2L-_')}`, `hf_${body(34)}`, `AIza${body(35, 'Zq7R8x2L-_')}`,
   ];
+  // Lowercase hyphenated words-only names, including ones that start like a key prefix, are never credentials.
+  const wordsOnly = ['flask-restful-api-template', 'task-management-system-api', 'risk-assessment-framework', 'bench-task-dependency-overlap-bound', 'xoxo-game-of-life', 'task-supercalifragilisticexpialidocious', 'risk-proj-management-dashboard-for-enterprise-teams', 'glpat-rotation-helper-scripts'];
+  for (const name of wordsOnly) { accepted(at(`owner/${name}`)); accepted({ model_identity: name }); }
+  for (const repository of ['realproject7/bench-task-dependency-overlap-bound', 'owner/Flask-RESTful-API-Template-2026-Edition']) accepted(at(repository));
   for (const repository of ['octocat/Hello-World', 'a/b', `${'A'.repeat(39)}/${'r'.repeat(100)}`, 'my.org_x/repo.name-1', 'owner/risk-analyzer', 'owner/task-sk', 'owner/xoxo-game', 'owner/sk-tools', 'owner/my-sk-tool']) accepted(at(repository));
   for (const repository of [`${'A'.repeat(40)}/repo`, `owner/${'r'.repeat(101)}`, `x/${'A'.repeat(100 * 1024)}`, 'owner', 'owner/repo/extra', '/repo', 'owner/']) failure(ledger([event(1, 'run_started', at(repository))]), 'evidence_delivery_identity');
   for (const token of credentials) {

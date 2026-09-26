@@ -333,7 +333,9 @@ test('protocol-valid head ids and repositories that main recorded still give the
     assert.equal(report.status, 'blocked'); assert.equal(report.reason, 'provider_execution_not_permitted');
     assert.deepEqual(ledger.records.map(item => [item.event, item.model_identity]), [['run_started', identity], ['run_failed', identity]]);
   }
-  for (const repository of ['owner/xoxo-game', 'owner/sk-tools', 'owner/my-sk-tool']) {
+  const repositories = ['owner/xoxo-game', 'owner/sk-tools', 'owner/my-sk-tool', 'owner/flask-restful-api-template', 'owner/task-management-system-api', 'owner/risk-assessment-framework', 'realproject7/bench-task-dependency-overlap-bound', 'owner/xoxo-game-of-life'];
+  // A mixed-case name pins the hyphen-free legacy `sk-` body; the last two pin the words-only guards.
+  for (const repository of [...repositories, 'owner/Flask-RESTful-API-Template-2026-Edition', 'owner/risk-proj-management-dashboard-for-enterprise-teams', 'owner/glpat-rotation-helper-scripts']) {
     const { report, ledger } = calibrate(parent, ROLE, ENVIRONMENT, repository);
     assert.equal(report.status, 'blocked'); assert.equal(report.reason, 'provider_execution_not_permitted');
     assert.deepEqual(ledger.records.map(item => [item.event, item.delivery_identity.repository]), [['run_started', repository], ['run_failed', repository]]);
@@ -346,5 +348,5 @@ test('model identity accepts exactly the calibration protocol model-id rule, min
   const ids = ['GPT-5', 'gpt_5', 'OpenAI', '01ai', 'gpt-5.6-luna', 'claude-3:beta', 'a+b', 'a', 'a'.repeat(128), 'a'.repeat(129), '-x', '.x', '_x', 'x/y', 'x y', '', 'é', 'x\n'];
   for (const id of ids) assert.equal(ledgerAccepts(id), protocolAccepts(id), JSON.stringify(id));
   assert.ok(ids.some(protocolAccepts) && !ids.every(protocolAccepts));
-  for (const id of [TOKEN, `sk-ant-${'Zq7'.repeat(8)}`, `AKIA${'Q'.repeat(16)}`, `xoxb-${'1'.repeat(12)}`]) { assert.equal(protocolAccepts(id), true, id); assert.equal(ledgerAccepts(id), false, id); }
+  for (const id of [TOKEN, `sk-ant-api03-${'Zq7-_'.repeat(19)}`, `AKIA${'Q'.repeat(16)}`, `xoxb-${'1'.repeat(13)}-${'2'.repeat(13)}-${'Zq7R8x2L'.repeat(3)}`]) { assert.equal(protocolAccepts(id), true, id); assert.equal(ledgerAccepts(id), false, id); }
 });

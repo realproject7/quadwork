@@ -100,17 +100,40 @@ fixed forms. `role` is `head`, `dev`, `re1`, or `re2`. `cache_policy` is
 follows the calibration protocol's model-id rule, up to 128 characters, such as
 `openai.gpt-5.6-luna`. `repository` is `owner/repo` within GitHub's limits: an
 owner of up to 39 and a repository name of up to 100 letters, digits, `.`, `_`,
-or `-`. A repository or model identity that contains a credential shape
-anywhere is refused. A shape is a token prefix plus its characteristic body, for
-GitHub classic and fine-grained, OpenAI and Anthropic, Stripe, Slack, AWS, npm,
-GitLab, Hugging Face, and Google keys. A short name such as `sk-tools` or
-`xoxo-game` is not a credential shape and passes. `evidence_ref` is generated,
+or `-`. A repository or model identity that contains one of the credential
+shapes below, anywhere in the value, is refused. `evidence_ref` is generated,
 never caller text. It is `writer/<sha256>` from the ledger writer, or
 `executor/<reason>/<sha256>` with one of the historical calibration executor's
 fixed reason codes. A `local_validation` record has origin `harness_acceptance`
 or `local_validation`, the product's own validation. Origin is part of a
 validation record's duplicate-event key, and only a product `local_validation`
 record satisfies a successful run.
+
+Each credential shape is a key prefix plus the body of the provider's real
+format:
+
+- GitHub: `gh[pousr]_` and 36 or more letters or digits, or `github_pat_` and
+  22 or more letters, digits, or `_`.
+- OpenAI: legacy `sk-` and 32 or more letters or digits with no hyphen (real
+  keys have 48), or `sk-proj-`, `sk-svcacct-`, or `sk-admin-` and 40 or more
+  letters, digits, `_`, or `-`. Real project keys are longer than either field
+  allows, so this refuses a pasted fragment.
+- Anthropic: `sk-ant-api` or `sk-ant-admin`, two digits, `-`, and 40 or more
+  letters, digits, `_`, or `-` (real `sk-ant-api03-` keys have 95).
+- Stripe: `sk_` or `rk_`, then `live_` or `test_`, and 16 or more letters or
+  digits.
+- Slack: `xox` and one of `a`, `b`, `p`, `o`, `s`, or `r`, then `-`, a numeric
+  ID of 6 or more digits, `-`, and 10 or more letters, digits, or `-`. A bot
+  token is `xoxb-`, two IDs of 10 to 13 digits, and 24 letters or digits.
+- AWS `AKIA` and 16 capitals or digits. npm `npm_` and 36 letters or digits.
+  GitLab `glpat-` and 20 letters, digits, `_`, or `-`. Hugging Face `hf_` and
+  30 or more letters or digits. Google `AIza` and 35 letters, digits, `_`, or
+  `-`.
+
+The legacy OpenAI, OpenAI project, and GitLab bodies must also contain a
+capital, digit, or `_`, which random keys always do. With the Slack numeric ID,
+this means a lowercase hyphenated words-only name never matches. Names such as
+`flask-restful-api-template`, `xoxo-game-of-life`, and `sk-tools` pass.
 
 `ledger-writer.cjs` is the durable, append-only writer for one run's ledger.
 `createRunLedgerRoot({ parent_dir })` creates a marked `0700` root that holds
