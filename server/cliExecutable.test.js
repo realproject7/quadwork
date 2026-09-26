@@ -2,13 +2,14 @@
 
 // #1176: the install check (/api/cli-status), the spawn path and model
 // discovery (/api/agent-model-catalog) resolve a CLI command to the same
-// executable (resolveCliExecutable in index.js). Driven through the real server
-// with a temp HOME and a PATH holding only stand-in CLIs: a `codex` on PATH, a
-// `grok` only in ~/.grok/bin (grok's installer location, off PATH) and a
-// pinned codex an agent names by absolute path. Each stand-in logs every run
-// to a marker file. Spawn is observed through the injected ptySpawn, which
-// records the executable and throws, so no process starts. No provider CLI is
-// ever run: nothing on this PATH or under this HOME is a real one.
+// executable (resolveCliExecutable, server/cli-executable.js). Driven through
+// the real server with a temp HOME and a PATH holding only stand-in CLIs: a
+// `codex` on PATH, a `grok` only in ~/.grok/bin (grok's installer location,
+// off PATH) and a pinned codex an agent names by absolute path. Each stand-in
+// logs every run to a marker file. Spawn is observed through the injected
+// ptySpawn, which records the executable and throws, so no process starts. No
+// provider CLI is ever run: nothing on this PATH or under this HOME is a real
+// one.
 
 const fs = require("fs");
 const http = require("http");
