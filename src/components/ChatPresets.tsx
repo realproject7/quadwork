@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { DEFAULT_PRESETS, STORAGE_KEY, loadPresetsFrom } from "@/lib/chatPresetMigration";
+import { OPEN_MOBILE_SIDEBAR_EVENT } from "@/lib/mobileSidebar";
 
 export interface Preset {
   id: string;
@@ -38,6 +39,18 @@ export default function ChatPresets({ projectId, onSend }: ChatPresetsProps) {
 
   useEffect(() => {
     setPresets(loadPresets());
+  }, []);
+
+  // #1198: below `lg` this menu's own click-outside backdrop (z-40, further
+  // down) sits under the fixed sidebar-menu button (z-[45]), so tapping
+  // that button hits the button, not this backdrop, and never triggers
+  // its close. Closing here instead, whenever the sidebar is asked to
+  // open, means this menu never stays open behind the newly opened
+  // sidebar.
+  useEffect(() => {
+    const close = () => { setOpen(false); setEditing(null); };
+    window.addEventListener(OPEN_MOBILE_SIDEBAR_EVENT, close);
+    return () => window.removeEventListener(OPEN_MOBILE_SIDEBAR_EVENT, close);
   }, []);
 
   const persist = useCallback((next: Preset[]) => {
