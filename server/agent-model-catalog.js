@@ -153,7 +153,8 @@ async function listExecutableModels(source, executable, timeoutMs = DISCOVERY_TI
 // #1176: what discovery runs, one { backend, executable } per resolved
 // executable: each source's bare CLI name first (the CLI /api/cli-status
 // reports), then every configured agent command that has a source. `resolve`
-// is server/index.js resolveCliExecutable, the resolver the spawn path uses.
+// is resolveCliExecutable (server/cli-executable.js), the resolver the spawn
+// path uses.
 function discoveryTargets(commands, resolve, sources = DISCOVERY_SOURCES) {
   const targets = new Map();
   for (const command of [...Object.keys(sources), ...commands]) {

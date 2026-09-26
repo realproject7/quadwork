@@ -2072,6 +2072,7 @@ module.exports = {
   writeHeadPoPlaybook,
   installedAgentCliBackends,
   validateInstalledBackendChoice,
+  checkPrereqs,
   checkNodePty,
   spawnPtyProbe,
   loadNodePty,
