@@ -1931,14 +1931,22 @@ function emitSystemMessage(projectId, text) {
   }
 }
 
-// #1203: chat routes build ~/.quadwork/<id> paths from the request's id, so
-// they accept only the id of a configured project that passes the project-id
-// rule. Archived projects are still configured; a removed one is not.
+// #1203: chat routes build ~/.quadwork/<id> paths from the request's id. They
+// accept only a configured project's id (archived included, removed not), and
+// it must name one direct directory there: not "." or "..", no path separator,
+// no NUL. It may fail the project-id rule, since CLI setup names a project
+// after its folder. An id that is not configured gets 404 if it passes that
+// rule and 400 if not. Every refusal comes before anything touches the disk.
 function assertChatProject(projectId) {
-  try { assertProjectId(projectId); }
-  catch { throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400); }
-  if (!(readConfigFile().projects || []).some((project) => project?.id === projectId)) {
+  const configured = typeof projectId === "string" &&
+    (readConfigFile().projects || []).some((project) => project?.id === projectId);
+  if (!configured) {
+    try { assertProjectId(projectId); }
+    catch { throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400); }
     throw new ProjectLifecycleError("unknown_project", projectId, "project is not configured", 404);
+  }
+  if (!projectId || projectId === "." || projectId === ".." || projectId.includes("\0") || path.basename(projectId) !== projectId) {
+    throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400);
   }
 }
 
