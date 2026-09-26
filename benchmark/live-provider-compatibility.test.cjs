@@ -147,7 +147,36 @@ test('fake Codex executable and versioned Claude wrapper require exact binary an
 });
 
 test('reviewed current Codex and Claude binary size classes are accepted while oversized binaries fail', () => {
-  assert.equal(core.testHooks.executableSize(220_568_528), 220_568_528);
-  assert.equal(core.testHooks.executableSize(217_662_576), 217_662_576);
+  assert.equal(core.testHooks.executableSize(238_223_808), 238_223_808);
+  assert.equal(core.testHooks.executableSize(225_036_032), 225_036_032);
   assert.throws(() => core.testHooks.executableSize(512 * 1024 * 1024 + 1), /live_executable/);
+});
+
+test('the registry pins exactly codex-cli 0.157.1 and Claude Code 2.1.283', () => {
+  assert.deepEqual(require('./live-provider-reviewed-contracts.cjs'), {
+    codex: { adapter: 'codex', executable_path: '/opt/homebrew/bin/codex', resolved_path: '/opt/homebrew/Caskroom/codex/0.157.1/bin/codex', executable_digest: '27ceb5f9b957b43a519efe4eaa3816a0bffb0a531a2c89af18840c0a3c016a7d', version_digest: 'a2af91afbeed67d4d94d7ae88f4f7864866bb5923ab435c0955d779a3e8161f1' },
+    claude: { adapter: 'claude', executable_path: '/Users/cho/.local/bin/claude', resolved_path: '/Users/cho/.local/share/claude/versions/2.1.283', executable_digest: 'd8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e', version_digest: 'b211344c57abae865f3f5b379f1f813d5102cde273c025c18b42c84bbeb899ea' },
+  });
+});
+
+test('a stale pin fails closed naming only the pinned and found versions, read from paths without running the binary', () => {
+  const value = roots();
+  try {
+    const ran = path.join(value.parent, 'found-binary-ran');
+    const install = (relative, name) => { const target = path.join(value.parent, relative); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(ran)}, 'ran')\n`, { mode: 0o700 }); const wrapper = path.join(value.parent, 'bin', name); fs.mkdirSync(path.dirname(wrapper), { recursive: true }); fs.symlinkSync(target, wrapper); return wrapper; };
+    const sha = file => require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    const codex = install('Caskroom/codex/0.158.0/bin/codex', 'codex'), claude = install('claude/versions/2.1.290', 'claude');
+    const real = fs.realpathSync(value.parent);
+    const failure = (contract, wrapper) => { try { core.testHooks.executable(contract, wrapper); } catch (error) { return error; } assert.fail('the pin mismatch was accepted'); };
+    const staleCodex = failure({ executable_path: codex, resolved_path: path.join(real, 'Caskroom/codex/0.157.1/bin/codex'), executable_digest: sha(codex) }, codex);
+    assert.equal(staleCodex.message, 'live_executable_stale_pin: pinned 0.157.1, found 0.158.0');
+    const staleClaude = failure({ executable_path: claude, resolved_path: path.join(real, 'claude/versions/2.1.283'), executable_digest: sha(claude) }, claude);
+    assert.equal(staleClaude.message, 'live_executable_stale_pin: pinned 2.1.283, found 2.1.290');
+    const rebuilt = failure({ executable_path: claude, resolved_path: fs.realpathSync(claude), executable_digest: '0'.repeat(64) }, claude);
+    assert.equal(rebuilt.message, 'live_executable_not_reviewed: pinned 2.1.290, found 2.1.290');
+    const unversioned = fake(value.parent, 'unversioned', 'process.exit(0)', true);
+    assert.equal(failure({ executable_path: unversioned, resolved_path: path.join(real, 'claude/versions/2.1.283'), executable_digest: sha(unversioned) }, unversioned).message, 'live_executable_stale_pin: pinned 2.1.283, found unrecognized');
+    for (const error of [staleCodex, staleClaude, rebuilt]) { assert.equal(error instanceof live.LiveCompatibilityError, true); for (const place of [value.parent, real, os.homedir()]) assert.equal(error.message.includes(place), false); }
+    assert.equal(fs.existsSync(ran), false, 'the found binary was never run to learn its version');
+  } finally { cleanup(value); }
 });

@@ -206,6 +206,14 @@ base. A zero-exit process also must return exactly the fixed
 `QUADWORK_LIVE_OK` sentinel on stdout with no stderr; the raw response is never
 retained.
 
+Since #1181 the registry pins codex-cli 0.157.1 and Claude Code 2.1.283, as
+measured on 2026-09-26. The Codex digest covers only `bin/codex`, not the helper
+binaries that ship beside it, such as `codex-code-mode-host` and
+`codex-path/rg`. A wrapper that resolves to another file, or changed bytes,
+fails closed before any provider turn. The error names the pinned and found
+versions. Both come from path segments. The found binary is never run to learn
+its version, and no path appears in the error.
+
 The smoke creates an executor-owned `0700` disposable Git root, rejects a
 symlink, any remote, unsafe permissions, and a changed repository before and
 after its one-turn run. It invokes only a digest-bound absolute executable with
@@ -214,6 +222,35 @@ inherited GitHub/npm credentials. Prompt text, provider output, absolute paths,
 auth output, and environment values are not retained. A missing executable,
 unsafe root, unsupported adapter/model, unavailable isolation, output cap,
 timeout, login/entitlement failure, or second terminal record fails closed.
+
+Run the #1181 flag check before any live pass:
+
+```sh
+node benchmark/live-provider-flag-check.cjs --home-parent /path/to/existing-dir
+node --test benchmark/live-provider-flag-check.test.cjs
+```
+
+It runs the smoke's digest check first and starts no process if that fails.
+Then it checks the version digest and parses only help output. Each CLI runs in
+its own fresh `0700` throwaway HOME inside the given directory, under a
+deny-by-default macOS Seatbelt profile in the style of the reviewed-execution
+profile. The profile allows only exec of the pinned file, sysctl reads, a data
+read of the root directory, reads under `/usr/share`, and reads and writes
+inside that HOME. Both pinned CLIs needed each of these on 2026-09-26.
+Everything else is denied, including network access, forks, every other
+executable (so the `security` command that Claude's startup runs to read the
+Keychain), mach lookups and launchd job creation, and all other reads and
+writes (so `~/.claude*`, `~/.codex`, and `~/Library/Keychains`). Each call runs
+in its own process group with a five-second bound. The whole group is killed
+on timeout and again when the call ends. The HOME is then deleted, and a HOME
+that is still present fails the check as `home_cleanup_failed`.
+
+The check confirms that help lists every fixed flag of both compiled
+compatibility argv profiles. Where help lists choices, each fixed value must be
+one of them. A missing flag fails the check, and exit zero means both CLIs
+passed. The result keeps only flag names, value-check classes, and digests. It
+never holds help text, a path, or the workload. The check never sends a
+workload or makes a provider request, and it is not provider-support evidence.
 
 This is provider-CLI compatibility evidence only. It does not prove the full
 QuadWork `buildAgentArgs` or PTY launch path. It does not authorize Mode 3 timing,
