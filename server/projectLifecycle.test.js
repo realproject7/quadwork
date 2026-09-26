@@ -4,8 +4,8 @@ const os = require("os");
 const path = require("path");
 
 // #1188: a temporary HOME, never the real ~/.quadwork. Controller archives
-// revoke admission through the default config reader, which a test cannot
-// inject.
+// call revokeProjectAdmission without passing their readConfig on, so it
+// reads the default config.
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "qw-project-lifecycle-"));
 Object.assign(process.env, { HOME: home, USERPROFILE: home });
 process.on("exit", () => { try { fs.rmSync(home, { recursive: true, force: true }); } catch {} });
