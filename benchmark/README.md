@@ -100,15 +100,17 @@ fixed forms. `role` is `head`, `dev`, `re1`, or `re2`. `cache_policy` is
 follows the calibration protocol's model-id rule, up to 128 characters, such as
 `openai.gpt-5.6-luna`. `repository` is `owner/repo` within GitHub's limits: an
 owner of up to 39 and a repository name of up to 100 letters, digits, `.`, `_`,
-or `-`. A repository or model identity with a known credential shape at the
-start of a word (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `sk-`,
-`xox?-`, or `AKIA`) is refused. `evidence_ref` is generated, never caller text.
-It is `writer/<sha256>` from the ledger writer, or `executor/<reason>/<sha256>`
-with one of the historical calibration executor's fixed reason codes. A
-`local_validation` record has origin `harness_acceptance` or `local_validation`,
-the product's own validation. Origin is part of a validation record's
-duplicate-event key, and only a product `local_validation` record satisfies a
-successful run.
+or `-`. A repository or model identity that contains a credential shape
+anywhere is refused. A shape is a token prefix plus its characteristic body, for
+GitHub classic and fine-grained, OpenAI and Anthropic, Stripe, Slack, AWS, npm,
+GitLab, Hugging Face, and Google keys. A short name such as `sk-tools` or
+`xoxo-game` is not a credential shape and passes. `evidence_ref` is generated,
+never caller text. It is `writer/<sha256>` from the ledger writer, or
+`executor/<reason>/<sha256>` with one of the historical calibration executor's
+fixed reason codes. A `local_validation` record has origin `harness_acceptance`
+or `local_validation`, the product's own validation. Origin is part of a
+validation record's duplicate-event key, and only a product `local_validation`
+record satisfies a successful run.
 
 `ledger-writer.cjs` is the durable, append-only writer for one run's ledger.
 `createRunLedgerRoot({ parent_dir })` creates a marked `0700` root that holds

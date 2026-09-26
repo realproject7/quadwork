@@ -302,10 +302,10 @@ const { digest: protocolDigest, validateProtocol } = require('./calibration-prot
 const { attemptCalibration, createDisposableCalibrationEvidenceRoot, createDisposableCalibrationInputRoot } = require('./calibration-executor.cjs');
 const ROLE = { provider: 'openai', model_id: 'gpt-5.6-terra', cli_version: 'test-cli-1.0.0', effort: 'high' };
 const ENVIRONMENT = { observe_environment: () => ({ actions: { enabled: false }, storage: { active_cache_bytes: 0, active_artifact_bytes: 0 } }) };
-function calibrationProtocol(head = ROLE) { return { schema_version: 1, run_id: 'mode_2_pipeline_1', mode: 2, workload_class: 'pipeline_eligible', repetition: 1, created_at: '2026-09-19T00:00:00.000Z', manifest_digest: 'a'.repeat(64), run_anchor: { source_sha: sha('b'), harness_sha: sha('c'), workload_sha: sha('d') }, target: { repository: 'owner/disposable-repository', base_sha: sha('e') }, role_identities: { head, dev: ROLE, re1: ROLE, re2: { ...ROLE, provider: 'anthropic', model_id: 'claude-sonnet-4' } }, budget: { max_elapsed_ms: 100, max_provider_turns: 2, max_recorded_tokens: 10 }, cache: { policy: 'fresh_local_session', provider_cache: 'record_provider_cache_telemetry', hosted_actions_cache: false, npm_cache: false }, actions: { enabled: false, active_cache_bytes: 0, active_artifact_bytes: 0 }, mode_1_zero_actions_feasibility: 'unproved', safety: { actions_permitted: false, npm_publish_permitted: false, provider_execution_permitted: false, mode_3_timing_permitted: false } }; }
+function calibrationProtocol(head = ROLE, repository = 'owner/disposable-repository') { return { schema_version: 1, run_id: 'mode_2_pipeline_1', mode: 2, workload_class: 'pipeline_eligible', repetition: 1, created_at: '2026-09-19T00:00:00.000Z', manifest_digest: 'a'.repeat(64), run_anchor: { source_sha: sha('b'), harness_sha: sha('c'), workload_sha: sha('d') }, target: { repository, base_sha: sha('e') }, role_identities: { head, dev: ROLE, re1: ROLE, re2: { ...ROLE, provider: 'anthropic', model_id: 'claude-sonnet-4' } }, budget: { max_elapsed_ms: 100, max_provider_turns: 2, max_recorded_tokens: 10 }, cache: { policy: 'fresh_local_session', provider_cache: 'record_provider_cache_telemetry', hosted_actions_cache: false, npm_cache: false }, actions: { enabled: false, active_cache_bytes: 0, active_artifact_bytes: 0 }, mode_1_zero_actions_feasibility: 'unproved', safety: { actions_permitted: false, npm_publish_permitted: false, provider_execution_permitted: false, mode_3_timing_permitted: false } }; }
 // One executor attempt from a fresh marked input root: its report and persisted ledger.
-function calibrate(parent, head, runtime) {
-  const p = calibrationProtocol(head), directory = createDisposableCalibrationInputRoot({ parent_dir: parent }), files = {}, content = { base: JSON.stringify(p.target), adapter: 'adapter', harness: 'harness', source: 'source', workload: 'workload' };
+function calibrate(parent, head, runtime, repository) {
+  const p = calibrationProtocol(head, repository), directory = createDisposableCalibrationInputRoot({ parent_dir: parent }), files = {}, content = { base: JSON.stringify(p.target), adapter: 'adapter', harness: 'harness', source: 'source', workload: 'workload' };
   for (const [key, value] of Object.entries(content)) { files[key] = path.join(directory, `${key}.input`); fs.writeFileSync(files[key], value, { mode: 0o600 }); }
   const manifest = { schema_version: 1, target: p.target, artifacts: Object.fromEntries(Object.keys(content).map(key => [key, sha256(fs.readFileSync(files[key]))])) };
   p.manifest_digest = protocolDigest(manifest);
@@ -327,11 +327,16 @@ test('historical calibration-executor records stay valid, including failure reas
   }
 }));
 
-test('protocol-valid head ids that main recorded still give the executor its blocked two-record ledger (#1191)', () => withParent(parent => {
+test('protocol-valid head ids and repositories that main recorded still give the executor its blocked two-record ledger (#1191)', () => withParent(parent => {
   for (const id of ['GPT-5', 'gpt_5', 'OpenAI', '01ai']) for (const head of [{ ...ROLE, model_id: id }, { ...ROLE, provider: id }]) {
     const { report, ledger } = calibrate(parent, head, ENVIRONMENT), identity = `${head.provider}.${head.model_id}`;
     assert.equal(report.status, 'blocked'); assert.equal(report.reason, 'provider_execution_not_permitted');
     assert.deepEqual(ledger.records.map(item => [item.event, item.model_identity]), [['run_started', identity], ['run_failed', identity]]);
+  }
+  for (const repository of ['owner/xoxo-game', 'owner/sk-tools', 'owner/my-sk-tool']) {
+    const { report, ledger } = calibrate(parent, ROLE, ENVIRONMENT, repository);
+    assert.equal(report.status, 'blocked'); assert.equal(report.reason, 'provider_execution_not_permitted');
+    assert.deepEqual(ledger.records.map(item => [item.event, item.delivery_identity.repository]), [['run_started', repository], ['run_failed', repository]]);
   }
 }));
 

@@ -170,12 +170,19 @@ test('the validator stays read-only: its source has no write, process, or networ
 test('repositories within GitHub limits, the four roles, and protocol model ids pass; credential shapes and oversized values do not (#1191)', () => {
   const accepted = overrides => assert.equal(summarizeLedger(ledger([event(1, 'run_started', overrides)])).record_count, 1);
   const at = repository => ({ delivery_identity: deliveryIdentity({ repository, candidate_sha: null }) });
-  const shapes = ['gh' + 'p_', 'gh' + 'o_', 'gh' + 'u_', 'gh' + 's_', 'gh' + 'r_', 'github' + '_pat_', 'sk' + '-', 'xox' + 'b-', 'xox' + 'p-', 'AK' + 'IA'].map(prefix => `${prefix}Zq7R8x2L`);
-  for (const repository of ['octocat/Hello-World', 'a/b', `${'A'.repeat(39)}/${'r'.repeat(100)}`, 'my.org_x/repo.name-1', 'owner/risk-analyzer', 'owner/task-sk']) accepted(at(repository));
+  // One real-length sample per credential shape, built at runtime.
+  const body = (length, alphabet = 'Zq7R8x2L') => alphabet.repeat(Math.ceil(length / alphabet.length)).slice(0, length);
+  const credentials = [
+    ...['p', 'o', 'u', 's', 'r'].map(kind => `gh${kind}_${body(36)}`), `github_pat_${body(22)}_${body(59)}`,
+    `sk-${body(48)}`, `sk-ant-api03-${body(95, 'Zq7R8x2L-_')}`, `sk_live_${body(24)}`, `rk_test_${body(24)}`,
+    `xoxb-123456789012-1234567890123-${body(24)}`, `xoxp-${body(10)}`, `AKIA${body(16, 'Q7R8X2LZ')}`,
+    `npm_${body(36)}`, `glpat-${body(20, 'Zq7R8x2L-_')}`, `hf_${body(34)}`, `AIza${body(35, 'Zq7R8x2L-_')}`,
+  ];
+  for (const repository of ['octocat/Hello-World', 'a/b', `${'A'.repeat(39)}/${'r'.repeat(100)}`, 'my.org_x/repo.name-1', 'owner/risk-analyzer', 'owner/task-sk', 'owner/xoxo-game', 'owner/sk-tools', 'owner/my-sk-tool']) accepted(at(repository));
   for (const repository of [`${'A'.repeat(40)}/repo`, `owner/${'r'.repeat(101)}`, `x/${'A'.repeat(100 * 1024)}`, 'owner', 'owner/repo/extra', '/repo', 'owner/']) failure(ledger([event(1, 'run_started', at(repository))]), 'evidence_delivery_identity');
-  for (const shape of shapes) {
-    for (const repository of [`owner/${shape}`, `${shape}/repo`, `owner/backup-${shape}`, `owner/x.${shape}`]) failure(ledger([event(1, 'run_started', at(repository))]), 'evidence_delivery_identity');
-    for (const model_identity of [shape, `openai.${shape}`, `openai:${shape}`]) failure(ledger([event(1, 'run_started', { model_identity })]), 'evidence_model_identity');
+  for (const token of credentials) {
+    for (const repository of [`owner/${token}`, `owner/x${token}`, `${token}/repo`, `x${token}/repo`]) failure(ledger([event(1, 'run_started', at(repository))]), 'evidence_delivery_identity');
+    for (const model_identity of [token, `x${token}`, `openai.${token}`, `openai.x${token}`]) failure(ledger([event(1, 'run_started', { model_identity })]), 'evidence_model_identity');
   }
   for (const role of ['head', 'dev', 're1', 're2']) accepted({ role });
   for (const role of ['planner', 'reviewer', 'dev2', 'Head', `ghp_${'zq7'.repeat(12)}`, '']) failure(ledger([event(1, 'run_started', { role })]), 'evidence_role');

@@ -14,9 +14,11 @@ const DIGEST = /^[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9_-]{0,63}$/;
 // GitHub's limits: an owner of up to 39 and a repository of up to 100 characters.
 const REPOSITORY = /^[A-Za-z0-9._-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
-// Known credential shapes at the start of a word (GitHub, OpenAI/Anthropic,
-// Slack, AWS). Refused in repository and model identity values.
-const CREDENTIAL = /(?:^|[^A-Za-z0-9])(?:gh[pousr]_|github_pat_|sk-|xox.-|AKIA)/;
+// Credential shapes, each a token prefix plus its characteristic body, matched
+// anywhere in a repository or model identity value: GitHub classic and
+// fine-grained, OpenAI/Anthropic, Stripe, Slack, AWS, npm, GitLab, Hugging
+// Face, and Google keys.
+const CREDENTIAL = /gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|sk-(?:ant-)?[A-Za-z0-9_-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|xox[abposr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|npm_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{30,}|AIza[0-9A-Za-z_-]{35}/;
 // #1182 closed text fields. Evidence refs are generated, never caller text:
 // ledger-writer.cjs writes `writer/<sha256>`, and historical calibration
 // executor records use `executor/<reason>/<sha256>` with its reachable reasons.
