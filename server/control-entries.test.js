@@ -17,20 +17,20 @@ function wrong(names, expected) {
 test("every entry QuadWork keeps directly under ~/.quadwork is covered", () => {
   assert.deepEqual(wrong([
     // Files
-    ".env", "config.json", "config.lock", "reseed-state.json", "resource-state.json",
-    "reviewer-token", "server.pid", "tg-bridge.pid",
+    ".env", "agentchattr.pid", "config.json", "config.lock", "reseed-state.json",
+    "resource-state.json", "reviewer-token", "server.pid", "tg-bridge.pid",
     // Directories
     "agentchattr", "batch-request-watchers", "delivery-candidates", "head-control-audit",
     "head-control-work-task-domain", "task-review-rounds", "tmp", "work-task-pipelines",
-    // Names made from a project id, a PID or a random part
+    // Names made from a project id or from random characters
     "agentchattr-my-app.pid", "tg-bridge-cursor-my-app.json", "tg-bridge-offset-my-app.json",
     "telegram-bridge-cursor-my-app.json", "dc-bridge-cursor-my-app.json",
-    "discord-bridge-cursor-my-app.json", `stop-${"0".repeat(32)}.sock`,
-    `.resource-exchange-probe-${"0".repeat(24)}-a`,
-    // Lock, temporary and recovery files made from an entry's name
-    "agentchattr.pid", "server.pid.lock", "server.pid.123.0a1b.tmp", "tg-bridge.pid.lock",
-    "config.json.123.tmp", "config.lock.123.token.tmp", ".resource-state.json.previous",
-    ".config.json.resource-install-123-0a1b.recovery",
+    "discord-bridge-cursor-my-app.json", `stop-${"0a".repeat(16)}.sock`,
+    `.resource-exchange-probe-${"0a".repeat(12)}-a`, `.resource-exchange-probe-${"0a".repeat(12)}-b`,
+    // The lock, temporary and recovery files QuadWork makes next to an entry
+    "config.json.4242.tmp", `.config.json.resource-install-4242-${"0a".repeat(12)}.recovery`,
+    "config.lock.4242.0b9e8f2c-5a1d-4c3b-9e7f-1a2b3c4d5e6f.tmp", ".resource-state.json.previous",
+    "server.pid.lock", `server.pid.4242.${"0a".repeat(16)}.tmp`,
   ], true), []);
 });
 
@@ -47,6 +47,9 @@ test("a project name close to an entry is not an entry", () => {
     "my-app", "My Project", "agentchattr-fork", "agentchattr2", "config", "configjson",
     "x.config.json", "server", "stop-motion", "tg-bridge", "reviewer-tokens", "tmp-project",
     "tmpl", "work-task-pipelines-v2",
+    // An entry's name with a suffix that QuadWork never makes. mktemp -d names
+    // a folder tmp.XXXXXXXXXX.
+    "tmp.tdyHjGd4cU", "agentchattr.io", "delivery-candidates.v2",
   ], false), []);
 });
 

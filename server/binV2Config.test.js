@@ -182,6 +182,18 @@ for (const [name, entry] of [
 }
 assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), configBeforeRefusals, "refused cleanups leave config.json unchanged");
 
+// A legacy project named like a mktemp -d folder is not the temp root, so its
+// cleanup still runs.
+const mktempNamed = "tmp.tdyHjGd4cU";
+fs.mkdirSync(path.join(CONFIG_DIR, mktempNamed));
+const withMktempNamed = JSON.parse(configBeforeRefusals);
+withMktempNamed.projects.push({ id: mktempNamed });
+fs.writeFileSync(CONFIG_PATH, JSON.stringify(withMktempNamed, null, 2));
+const mktempCleanup = cleanupLegacyProjectAfterConfirmation(mktempNamed);
+assert.equal(mktempCleanup.removedDirectory, true, `cleanup removes ${mktempNamed}`);
+assert.equal(mktempCleanup.removedConfigEntry, true, `cleanup removes the ${mktempNamed} config entry`);
+assert.deepEqual(JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")).projects, [{ id: "keep" }]);
+
 const legacyInstallDir = path.join(CONFIG_DIR, "agentchattr");
 fs.mkdirSync(legacyInstallDir, { recursive: true });
 fs.writeFileSync(path.join(legacyInstallDir, "keep.txt"), "legacy-runtime");
