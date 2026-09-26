@@ -15,12 +15,20 @@
 //
 // Faked seams for what needs layout: Tab order across layout.tsx is read from
 // the fake document, and the lg close runs on the injected matchMedia. The fake
-// follows only the browser rules these checks rely on:
+// follows only the browser rules these checks rely on, to pass or to catch a
+// broken change:
 // - Tab order is DOM order, with positive tabindex first and negative tabindex
 //   skipped. A Tab that no keydown listener cancels moves focus to the next
 //   stop. Past either end, focus leaves the page.
+// - The inert and hidden attributes cover the element and everything inside
+//   it: none of it is focusable or a Tab stop, and assistive technology does
+//   not see it. hidden is display:none (the UA style sheet, made !important by
+//   Tailwind's preflight). aria-hidden="true" hides a subtree from assistive
+//   technology only. A click on an inert or hidden element throws: hit-testing
+//   skips it, and the fake cannot tell what is underneath.
 // - focus() only works on a focusable element. When the focused element is
-//   removed, focus falls back to <body>.
+//   removed or can no longer take focus, focus falls back to <body> (HTML's
+//   focus fixup rule).
 // - A click first moves focus to the target's nearest focusable ancestor, or
 //   to <body>, as Chrome's mousedown does. It then runs the onClick handlers up
 //   the tree and reaches window. Enter on a focused button or link clicks it
@@ -29,17 +37,21 @@
 //   simulated viewport. A media-query rem is the browser's default font size.
 //   On a resize, every list whose result flips fires `change`.
 //
-// Browser-only, covered by PR #1200's browser proof, because the fake has no
-// CSS and no layout:
-// - What a width hides. Every rendered element counts as displayed. Below lg
-//   that is true of every Tab stop these pages render before and inside the
-//   drawer. The desktop rail, hidden below lg, only appears here as a place
-//   focus must not leak to.
+// Browser-only, covered by the browser proof on PRs #1200 and #1212, because
+// the fake has no CSS and no layout:
+// - What a width hides. Only the hidden attribute hides an element here. Below
+//   lg every Tab stop these pages render before and inside the drawer is
+//   displayed. The desktop rail is not: in a browser at 390px it is
+//   display:none. Here its stops are in the Tab order at every width. The
+//   open-drawer tests use them as a place focus must not leak to, and the
+//   #1205 walk passes through them.
 // - Where a tap lands: the overlay covering the page, and the z-[45] menu
 //   button above the presets backdrop. A click goes to the element the test
 //   names.
 // - The drawer's position and slide. "Open" here means the drawer has its
-//   slid-in class, translate-x-0.
+//   slid-in class, translate-x-0. PR #1212's browser proof covers the slide
+//   with the closed drawer inert. Here the closed drawer, and everything in
+//   it, only has to stay displayed.
 // - focus and blur events. The fake only tracks document.activeElement.
 
 const test = require("node:test");
@@ -65,11 +77,16 @@ class FakeText extends FakeNode {
 }
 // The React prop behind each HTML attribute a selector reads.
 const PROP_OF = { class: "className", for: "htmlFor", tabindex: "tabIndex" };
+// React 19 renders inert and hidden as boolean attributes. Any other value is
+// not rendered as written (inert="" renders no attribute at all), so it throws
+// instead of guessing.
+const BOOLEAN_ONLY = new Set(["inert", "hidden"]);
 class FakeElement extends FakeNode {
   constructor(document, localName) { super(); this.ownerDocument = document; this.localName = localName; this.props = {}; }
   getAttribute(name) {
     const value = this.props[PROP_OF[name] || name];
     if (value == null || typeof value === "function") return null;
+    if (BOOLEAN_ONLY.has(name) && typeof value !== "boolean") throw new Error(`fake document: ${name}=${JSON.stringify(value)} is not a boolean`);
     if (typeof value === "boolean") return /^(aria|data)-/.test(name) ? String(value) : value ? "" : null;
     return String(value);
   }
@@ -109,9 +126,16 @@ function matchesCompound(el, selector) {
   return true;
 }
 
+// The element, then each ancestor up to the document.
+const ancestry = (el) => (el instanceof FakeElement ? [el, ...ancestry(el.parentNode)] : []);
+const inertOrHidden = (el) => ancestry(el).some((n) => n.getAttribute("inert") !== null || n.getAttribute("hidden") !== null);
+// Whether assistive technology sees the element.
+const exposed = (el) => !inertOrHidden(el) && !ancestry(el).some((n) => n.getAttribute("aria-hidden") === "true");
+
 // HTML's focusable areas, for the elements these pages render.
 const tabIndex = (el) => { const raw = el.getAttribute("tabindex"); return raw === null || raw.trim() === "" ? NaN : Number(raw); };
 function focusable(el) {
+  if (inertOrHidden(el)) return false;
   const disabled = el.getAttribute("disabled") !== null;
   if (["button", "select", "textarea"].includes(el.localName)) return !disabled;
   if (el.localName === "input") return !disabled && el.getAttribute("type") !== "hidden";
@@ -360,6 +384,9 @@ function createPage({ width = 390, defaultFontSize = 16 } = {}) {
       instances.delete(id);
       for (const cell of instance.cells) if (cell && cell.effect && typeof cell.cleanup === "function") cell.cleanup();
     }
+    // The focus fixup rule. It stays on <body> even if the element can take
+    // focus again later.
+    if (document.focused && !(document.focused.isConnected && focusable(document.focused))) document.focused = null;
   }
   // Commit effects and re-render until nothing is left, including the fetches.
   async function settle() {
@@ -408,6 +435,8 @@ function createPage({ width = 390, defaultFontSize = 16 } = {}) {
     },
     drawerOpen: () => classes(page.drawer()).includes("translate-x-0"),
     drawerStops: () => tabOrder(document).filter((el) => page.drawer().contains(el)),
+    // Every control the drawer renders, whether or not it can take focus.
+    drawerControls: () => page.drawer().querySelectorAll("a[href], button, input, select, textarea, [tabindex]"),
     // The drawer's click-outside overlay: the one click target outside the
     // drawer that opening the drawer added. `closedTargets` is recorded by
     // openPage, while the drawer is closed.
@@ -436,6 +465,7 @@ function createPage({ width = 390, defaultFontSize = 16 } = {}) {
       return event;
     },
     async click(target) {
+      if (inertOrHidden(target)) throw new Error(`fake document: ${show(target)} is inert or hidden, so a click cannot land on it`);
       let focusTarget = target;
       while (focusTarget instanceof FakeElement && !focusable(focusTarget)) focusTarget = focusTarget.parentNode;
       document.focused = focusTarget instanceof FakeElement ? focusTarget : null;
@@ -555,9 +585,13 @@ test("#1198: reaching Tailwind's lg closes the drawer and releases Tab, at a 16p
     await page.click(page.menuButton());
     await page.resize(lgPx - 1);
     assert.equal(page.drawerOpen(), true, `${defaultFontSize}px default font: still open 1px below lg (${lgPx}px)`);
+    assert.ok(page.drawer().contains(page.active()), `${defaultFontSize}px default font: fixture: focus is inside the open drawer`);
 
     await page.resize(lgPx);
     assert.equal(page.drawerOpen(), false, `${defaultFontSize}px default font: closed at lg`);
+    // In a browser the closed drawer is display:none at lg. Here it is inert.
+    // Either way, the focus fixup rule moves focus out of it.
+    assertSame(page.active(), page.document.body, `${defaultFontSize}px default font: focus fell back to <body> from the closed drawer`);
     const about = page.button("About QuadWork");
     about.focus();
     const tab = await page.press("Tab");
@@ -566,6 +600,7 @@ test("#1198: reaching Tailwind's lg closes the drawer and releases Tab, at a 16p
 
     // Crossing lg again, as a second tablet rotation does, closes it again.
     await page.resize(lgPx - 1);
+    assert.equal(page.drawerStops().length, 0, `${defaultFontSize}px default font: back below lg, the drawer that closed at lg has no Tab stops`);
     await page.click(page.menuButton());
     assert.equal(page.drawerOpen(), true, `${defaultFontSize}px default font: fixture: reopened below lg`);
     await page.resize(lgPx);
@@ -600,4 +635,48 @@ test("#1198: the drawer's close button is named \"Close sidebar\"", async () => 
 
   await page.click(named[0]);
   assert.equal(page.drawerOpen(), false, "and it is the control that closes the drawer");
+});
+
+test("#1205: below lg, the closed drawer is out of the Tab order and hidden from assistive technology", async () => {
+  assert.equal(createPage().drawerStops().length, 0, "the hydrating render already keeps the closed drawer out of the Tab order");
+  const page = await openPage();
+  assert.equal(page.drawerOpen(), false, "fixture: the drawer starts closed");
+  assert.ok(page.drawerControls().length >= 3 && page.drawerControls().includes(page.button("Close sidebar")),
+    "fixture: the closed drawer still renders its close button and sidebar controls");
+  const dom = descendants(page.document.documentElement);
+  const afterDrawer = (el) => dom.indexOf(el) > dom.indexOf(page.drawer());
+  assert.ok(page.tabOrder().some(afterDrawer) && !page.tabOrder().every(afterDrawer),
+    "fixture: the page has Tab stops before and after the drawer, so a walk passes it");
+
+  const checkClosed = async (when) => {
+    // The drawer slides as a whole: nothing around it or in it may be hidden.
+    const hidden = [...ancestry(page.drawer()), ...descendants(page.drawer())].find((el) => el.getAttribute("hidden") !== null);
+    if (hidden) assert.fail(`${when}: ${show(hidden)} is hidden, so the closed drawer cannot slide as a whole`);
+    // From the menu button, all the way around the page and back, both ways.
+    for (const shiftKey of [false, true]) {
+      const keys = shiftKey ? "Shift+Tab" : "Tab";
+      const order = page.tabOrder(), visited = new Set();
+      page.menuButton().focus();
+      for (let i = 1; i <= order.length + 1; i++) {
+        await page.press("Tab", { shiftKey });
+        if (page.drawer().contains(page.active())) assert.fail(`${when}: ${keys} ${i} from the menu button focused ${show(page.active())} in the closed drawer`);
+        visited.add(page.active());
+      }
+      assert.ok(order.every((el) => visited.has(el)), `${when}: ${keys} reached every Tab stop on the page`);
+      assertSame(page.active(), page.menuButton(), `${when}: ${keys} went around the page and back to the menu button`);
+    }
+    for (const el of page.drawerControls()) {
+      if (exposed(el)) assert.fail(`${when}: ${show(el)} in the closed drawer is exposed to assistive technology`);
+    }
+  };
+
+  await checkClosed("before opening");
+  await page.click(page.menuButton());
+  assert.equal(page.drawerOpen(), true, "fixture: the drawer opened");
+  for (const el of page.drawerControls()) {
+    if (!exposed(el)) assert.fail(`open: ${show(el)} is hidden from assistive technology`);
+  }
+  await page.press("Escape");
+  assert.equal(page.drawerOpen(), false, "fixture: Escape closed the drawer");
+  await checkClosed("after closing");
 });
