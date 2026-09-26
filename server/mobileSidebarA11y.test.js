@@ -6,11 +6,12 @@
 // the page. Every module is transpiled with the repo's own `typescript` (the
 // ts.transpileModule precedent in server/settingsPage.test.js and
 // server/terminalViewerGeneration.test.js), and the components import the real
-// @/lib modules. Stand-ins replace only the Next.js runtime (next/link renders
-// its <a href>, and CSS imports are empty) and the browser: a hook runtime, a
-// small fake document built from the rendered elements, window events,
-// matchMedia, a fetch that serves a fixture config, and timers that never
-// fire. The repo has no DOM library.
+// @/lib modules. Stand-ins replace React's renderer and hooks (only
+// createContext and react/jsx-runtime are real), the Next.js runtime, and the
+// browser, including a small fake document built from the rendered elements;
+// STAND_INS and createPage set them all up. The repo has no DOM library. The
+// hook runtime is this file's model of React: effect order, batching and ref
+// timing come from it and are not cross-checked against react-dom.
 //
 // Faked seams for what needs layout: Tab order across layout.tsx is read from
 // the fake document, and the lg close runs on the injected matchMedia. The fake
@@ -562,6 +563,13 @@ test("#1198: reaching Tailwind's lg closes the drawer and releases Tab, at a 16p
     const tab = await page.press("Tab");
     assert.equal(tab.defaultPrevented, false, `${defaultFontSize}px default font: Tab is no longer trapped`);
     assertSame(page.active(), page.tabOrder()[page.tabOrder().indexOf(about) + 1], `${defaultFontSize}px default font: Tab moves on from About`);
+
+    // Crossing lg again, as a second tablet rotation does, closes it again.
+    await page.resize(lgPx - 1);
+    await page.click(page.menuButton());
+    assert.equal(page.drawerOpen(), true, `${defaultFontSize}px default font: fixture: reopened below lg`);
+    await page.resize(lgPx);
+    assert.equal(page.drawerOpen(), false, `${defaultFontSize}px default font: closed at lg again`);
   }
 });
 
