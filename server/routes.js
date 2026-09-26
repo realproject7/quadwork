@@ -1931,14 +1931,20 @@ function emitSystemMessage(projectId, text) {
   }
 }
 
+// #1203: an id names one direct directory under ~/.quadwork when it is a
+// string, not empty, not "." or "..", with no path separator and no NUL.
+function namesOneDirectDirectory(projectId) {
+  return typeof projectId === "string" && projectId !== "" && projectId !== "." && projectId !== ".." &&
+    !projectId.includes("\0") && path.basename(projectId) === projectId;
+}
+
 // #1203: chat routes build ~/.quadwork/<id> paths from the request's id, so
 // they accept only a configured project's id (archived included, removed not)
-// that names one direct directory there: not empty, not "." or "..", no path
-// separator, no NUL. It may fail the project-id rule, since CLI setup names a
-// project after its folder. An unconfigured id gets 404 if it passes the rule,
-// else 400. A config.json that cannot be read or parsed, or is missing, gets
-// 503 with the admission check's code and is not created. Each refusal comes
-// before any write.
+// that names one direct directory there (namesOneDirectDirectory). It may fail
+// the project-id rule, since CLI setup names a project after its folder. An
+// unconfigured id gets 404 if it passes the rule, else 400. A config.json that
+// cannot be read or parsed, or is missing, gets 503 with the admission check's
+// code and is not created. Each refusal comes before any write.
 function assertChatProject(projectId) {
   let config;
   try { config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
@@ -1950,7 +1956,7 @@ function assertChatProject(projectId) {
     catch { throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400); }
     throw new ProjectLifecycleError("unknown_project", projectId, "project is not configured", 404);
   }
-  if (!projectId || projectId === "." || projectId === ".." || projectId.includes("\0") || path.basename(projectId) !== projectId) {
+  if (!namesOneDirectDirectory(projectId)) {
     throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400);
   }
 }
@@ -6876,12 +6882,21 @@ router.post("/api/setup", async (req, res) => {
     case "add-config": {
       const { id, name, repo, workingDir, backends, ci_policy: ciPolicy } = body;
       const autoApprove = body.auto_approve !== false; // default true
-      // Use directory basename for sibling paths (matches CLI wizard)
-      const dirName = path.basename(workingDir);
-      const parentDir = path.dirname(workingDir);
       let cfg;
       try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
       catch { cfg = { port: 8400, projects: [] }; }
+      // #1207: the writes below build ~/.quadwork/<id> paths from this id. A new
+      // id must pass the rule the V2 setup steps use. A configured id keeps its
+      // re-run path while it names one direct directory there (#1203), since
+      // CLI setup names a project after its folder. Any other id gets 400
+      // before anything touches the disk.
+      const configured = Array.isArray(cfg.projects) && cfg.projects.some((project) => project?.id === id);
+      if (configured ? !namesOneDirectDirectory(id) : !v2SetupProjectId(body).ok) {
+        return res.status(400).json({ ok: false, code: "invalid_project_id" });
+      }
+      // Use directory basename for sibling paths (matches CLI wizard)
+      const dirName = path.basename(workingDir);
+      const parentDir = path.dirname(workingDir);
       const activated = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
       if (!activated && cfg.projects.some((p) => p.id === id)) {
         // Project already saved, but still (idempotently) seed the
@@ -6928,6 +6943,10 @@ router.post("/api/setup", async (req, res) => {
               error.code = "QW_PROJECT_ALREADY_CONFIGURED";
               throw error;
             }
+            // #1207: a new id must pass the rule. The step's first check,
+            // before config.lock, may have found this id configured before
+            // another writer removed it.
+            assertProjectId(id);
             if (!Array.isArray(fresh.projects)) fresh.projects = [];
             fresh.projects.push({
               id,
@@ -6947,6 +6966,7 @@ router.post("/api/setup", async (req, res) => {
             writeHeadPoPlaybookSafe(id, existing?.name || id);
             return res.json({ ok: true, message: "Project already in config" });
           }
+          if (err instanceof RepositoryProvisionError) return res.status(400).json({ ok: false, code: err.code });
           if (sendV2ConfigurationError(res, err)) return;
           throw err;
         }
