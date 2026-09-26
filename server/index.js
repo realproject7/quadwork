@@ -3876,18 +3876,23 @@ async function cleanupProjectRuntime(projectId) {
   return aggregate;
 }
 
-// #1183: archive cleanup shuts the project's file chat down, and startup is
-// the only other place that starts it. Restore starts it again, so the chat and
-// its lifecycle lines work without a server restart. Nothing else comes back:
-// agent sessions, the Monitor and the bridges stay stopped until started.
+// #1183: archive cleanup shuts the project's file chat down. Startup, V2 setup
+// activation and the legacy add-project step start chat, but none of them runs
+// on restore, so restore starts it again here and the chat and its lifecycle
+// lines work without a server restart. Nothing else comes back: agent
+// sessions, the Monitor and the bridges stay stopped until started.
 function restoreProjectChat(projectId) {
+  // Shutdown has already stopped every project's chat. Starting one now would
+  // leave a live writer lock behind the stopped server; startup starts it.
+  if (shuttingDown) return;
   try {
     if (routes.getProjectChatMode(projectId) === "file") fileChat.initProject(projectId);
   } catch (err) {
     // As in cleanup, the raw error stays in the server log and the response
-    // gets only the typed entry.
+    // gets only the typed entry. Archive then restore retries safely; a server
+    // restart does not, because startup exits when any project's chat fails.
     console.error(`[project-lifecycle] ${projectId}: file chat restart failed: ${err?.message || err}`);
-    throw Object.assign(new Error("Project chat could not start. Restart QuadWork to retry."), {
+    throw Object.assign(new Error("Project chat did not start. Archive and restore the project to retry. If it keeps failing, check the project's chat files. Restarting QuadWork will fail until the cause is fixed."), {
       resource: "file_chat",
       code: "file_chat_start_failed",
     });

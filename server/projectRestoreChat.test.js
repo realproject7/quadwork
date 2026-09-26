@@ -4,9 +4,14 @@
 // index.js is loaded without listening against an isolated HOME. Archive and
 // restore go through the real HTTP route, lifecycle controller and runtime
 // cleanup; the chat post goes through the real chat route and the lifecycle
-// lines through the real agent launch path. A lost lifecycle line and a chat
-// that cannot restart are logged and reported, never silent. The agent PTY is
-// an in-memory stand-in, so no process or provider CLI runs. Plain node:assert.
+// lines through the real agent launch path. The project is active, V2-ready
+// with an owned Active Batch and has both bridges configured, and its Monitor
+// and bridges really run before archive, so a restore that started any of them
+// again would be seen. A lost lifecycle line and a chat that cannot restart
+// are logged and reported, and a shutdown that overlaps a restore leaves no
+// chat behind. Nothing leaves the process: the agent PTY is an in-memory
+// stand-in, fetch and discord.js are doubles, and batch progress is served
+// without GitHub. Plain node:assert.
 
 const assert = require("node:assert/strict");
 const fs = require("fs");
@@ -20,35 +25,80 @@ os.homedir = () => TEST_HOME;
 process.env.HOME = TEST_HOME;
 process.env.QUADWORK_SKIP_LISTEN = "1";
 
+const INSTALLATION = "installation_restore_chat_1183";
 const configDir = path.join(TEST_HOME, ".quadwork");
 const configPath = path.join(configDir, "config.json");
 const repo = path.join(TEST_HOME, "repo");
-fs.mkdirSync(configDir, { recursive: true });
+fs.mkdirSync(path.join(configDir, "rc"), { recursive: true });
 fs.mkdirSync(repo, { recursive: true });
 fs.writeFileSync(configPath, JSON.stringify({
-  installation_id: "installation-restore-chat-1183",
+  installation_id: INSTALLATION,
   temp_cleanup: { enabled: false },
   projects: [{
     id: "rc",
     name: "rc",
     archived: false,
-    idle: true,
     chat_mode: "file",
-    repositories: [{ key: "primary", repo: "Owner/RestoreChat", working_dir: repo, primary: true }],
+    repositories: [{
+      key: "primary",
+      repo: "Owner/RestoreChat",
+      working_dir: repo,
+      primary: true,
+      ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] },
+    }],
     agents: {
       head: { cwd: repo, command: "/bin/sh", mcp_inject: "none" },
       dev: { cwd: repo, command: "/bin/sh", mcp_inject: "none" },
     },
+    telegram: { bot_token: "1183:restore-chat-fixture", chat_id: "1183" },
+    discord: { bot_token: "restore-chat-fixture", channel_id: "1183" },
+    telegram_auto: true,
+    discord_auto: true,
   }],
 }), { mode: 0o600 });
+fs.writeFileSync(path.join(configDir, "rc", "OVERNIGHT-QUEUE.md"), [
+  "## Active Batch",
+  "**Batch:** 7",
+  "**Batch type:** code",
+  `**Installation ID:** ${INSTALLATION}`,
+  "**Assignment attempt:** attempt_a",
+  "- Owner/RestoreChat#42 active",
+].join("\n"));
 
 const fileChat = require("./file-chat");
+const routes = require("./routes");
 const telegramBridge = require("./bridges/telegram");
 const discordBridge = require("./bridges/discord");
 const runtime = require("./index");
 
 const chatFile = path.join(configDir, "rc", "chat", "general.jsonl");
+const writerLock = path.join(configDir, "rc", "chat", ".writer.pid");
 let server;
+
+// Offline doubles. Every fetch is recorded and answered here (local chat reads
+// get an empty list, the Telegram API an empty update list), discord.js logs
+// in to nothing, and batch progress never reaches GitHub.
+const fetches = [];
+const originalFetch = global.fetch;
+global.fetch = async (url) => {
+  const target = String(url);
+  fetches.push(target);
+  const body = target.startsWith("https://api.telegram.org/") ? { ok: true, result: [] } : [];
+  return { ok: true, status: 200, json: async () => body };
+};
+const discordLogins = [];
+class FakeDiscordClient {
+  constructor() { this.channels = { fetch: async () => ({ send: async () => {} }) }; }
+  async login(token) { discordLogins.push(token); }
+  on() {}
+  async destroy() {}
+}
+discordBridge._setDiscordLibForTest({
+  Client: FakeDiscordClient,
+  GatewayIntentBits: { Guilds: 1, GuildMessages: 2, MessageContent: 4 },
+});
+const originalBatchProgress = routes.getOrComputeBatchProgress;
+routes.getOrComputeBatchProgress = async () => null;
 
 function request(method, urlPath, body) {
   return new Promise((resolve, reject) => {
@@ -75,6 +125,8 @@ function request(method, urlPath, body) {
   });
 }
 
+const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
 function chatRecords() {
   if (!fs.existsSync(chatFile)) return [];
   return fs.readFileSync(chatFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
@@ -82,6 +134,10 @@ function chatRecords() {
 
 function projectSessions() {
   return [...runtime.agentSessions.keys()].filter((key) => key.startsWith("rc/"));
+}
+
+async function monitorMode() {
+  return (await runtime.readHeadProjectStatus("rc")).monitor.mode;
 }
 
 // The same operator start the /api/agents/:project/:agent/start route makes,
@@ -119,10 +175,26 @@ async function stopAgents() {
     fileChat.initProject("rc");
     server = runtime.app.listen(0, "127.0.0.1");
     await new Promise((resolve) => server.once("listening", resolve));
+    // Bridge routes address the configured port; point it at this server.
+    const liveConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    fs.writeFileSync(configPath, JSON.stringify({ ...liveConfig, port: server.address().port }), { mode: 0o600 });
 
     let response = await request("POST", "/api/chat?project=rc", { text: "before archive" });
     assert.equal(response.status, 200, response.text);
-    const firstId = response.json.message.id;
+
+    // Controls: in this fixture the Monitor and both bridges really run, so the
+    // AC 5 checks after restore can see them if restore starts them again.
+    const monitorStarted = await runtime.startProjectMonitor("rc");
+    assert.equal(monitorStarted.applied, true, JSON.stringify(monitorStarted));
+    assert.equal(await monitorMode(), "enabled", "fixture: the Monitor really runs before archive");
+    for (const kind of ["telegram", "discord"]) {
+      response = await request("POST", `/api/${kind}?action=start`, { project_id: "rc" });
+      assert.equal(response.status, 200, response.text);
+      assert.equal(response.json.running, true, response.text);
+    }
+    assert.equal(telegramBridge.isRunning("rc"), true, "fixture: the Telegram bridge really runs before archive");
+    assert.equal(discordBridge.isRunning("rc"), true, "fixture: the Discord bridge really runs before archive");
+    const lastIdBeforeArchive = chatRecords().at(-1).id;
 
     // AC 2: archive shuts the chat down, and it stays shut while archived.
     response = await request("PUT", "/api/projects/rc/archive", { archived: true });
@@ -130,6 +202,9 @@ async function stopAgents() {
     assert.equal(response.json.archived, true);
     assert.equal(response.json.resources.file_chat_engines, 1, "archive stops the live chat engine");
     assert.equal(fileChat.isProjectInitialized("rc"), false, "archive shuts the project's chat down");
+    assert.equal(await monitorMode(), "archived", "archive archives the running Monitor");
+    assert.equal(telegramBridge.isRunning("rc"), false, "archive stops the Telegram bridge");
+    assert.equal(discordBridge.isRunning("rc"), false, "archive stops the Discord bridge");
     response = await request("POST", "/api/chat?project=rc", { text: "while archived" });
     assert.equal(response.status, 409, response.text);
     assert.equal(response.json.code, "project_archived");
@@ -155,22 +230,28 @@ async function stopAgents() {
     runtime.agentSessions.get("rc/dev").term.kill = () => {};
 
     // AC 1: a completed restore brings the chat back with no restart.
+    await flush();
+    const fetchesBeforeRestore = fetches.length;
+    const loginsBeforeRestore = discordLogins.length;
     response = await request("PUT", "/api/projects/rc/archive", { archived: false });
     assert.equal(response.status, 200, response.text);
     assert.equal(response.json.ok, true);
     assert.equal(response.json.archived, false);
     assert.deepEqual(response.json.cleanup_errors, []);
     assert.equal(fileChat.isProjectInitialized("rc"), true, "restore re-initializes the project's chat");
-    response = await request("POST", "/api/chat?project=rc", { text: "after restore" });
-    assert.equal(response.status, 200, response.text);
-    assert.equal(response.json.message.id, firstId + 1, "the restored chat continues its persisted history");
 
     // AC 5: only chat came back. No agent session, Monitor or bridge started.
+    await flush();
     assert.deepEqual(projectSessions(), [], "restore starts no agent session");
-    assert.equal((await runtime.readHeadProjectStatus("rc")).monitor.mode, "suspended",
-      "restore leaves the Monitor suspended");
+    assert.equal(await monitorMode(), "suspended", "restore leaves the Monitor suspended");
     assert.equal(telegramBridge.isRunning("rc"), false, "restore starts no Telegram bridge");
     assert.equal(discordBridge.isRunning("rc"), false, "restore starts no Discord bridge");
+    assert.deepEqual(fetches.slice(fetchesBeforeRestore), [], "restore makes no bridge or network request");
+    assert.equal(discordLogins.length, loginsBeforeRestore, "restore logs no Discord bridge in");
+
+    response = await request("POST", "/api/chat?project=rc", { text: "after restore" });
+    assert.equal(response.status, 200, response.text);
+    assert.equal(response.json.message.id, lastIdBeforeArchive + 1, "the restored chat continues its persisted history");
 
     // Lifecycle lines from the real launch path land in the restored chat.
     const beforeLaunch = chatRecords().length;
@@ -214,8 +295,9 @@ async function stopAgents() {
     await stopAgents();
 
     // A chat that cannot start again is reported, not swallowed. The project
-    // stays restored, the response carries only the typed entry, and the raw
-    // cause (here an unreadable chat history) stays in the server log.
+    // stays restored, the response carries only the typed entry and its safe
+    // retry (archive and restore, never a server restart), and the raw cause
+    // (here an unreadable chat history) stays in the server log.
     response = await request("PUT", "/api/projects/rc/archive", { archived: true });
     assert.equal(response.status, 200, response.text);
     const restartLog = [];
@@ -237,12 +319,33 @@ async function stopAgents() {
     assert.deepEqual(response.json.cleanup_errors, [{
       resource: "file_chat",
       code: "file_chat_start_failed",
-      message: "Project chat could not start. Restart QuadWork to retry.",
+      message: "Project chat did not start. Archive and restore the project to retry. If it keeps failing, check the project's chat files. Restarting QuadWork will fail until the cause is fixed.",
     }]);
     assert.equal(response.text.includes("fixture history read failed"), false, "the raw cause stays out of the response");
     assert.equal(fileChat.isProjectInitialized("rc"), false, "a failed restart leaves no half-started chat");
     assert.ok(restartLog.some((line) => line === "[project-lifecycle] rc: file chat restart failed: fixture history read failed"),
       `the raw cause is logged: ${JSON.stringify(restartLog)}`);
+
+    // The advised retry works: archive and restore again starts the chat.
+    response = await request("PUT", "/api/projects/rc/archive", { archived: true });
+    assert.equal(response.status, 200, response.text);
+    response = await request("PUT", "/api/projects/rc/archive", { archived: false });
+    assert.equal(response.status, 200, response.text);
+    assert.equal(fileChat.isProjectInitialized("rc"), true, "archive and restore again retries the chat start");
+
+    // A shutdown that begins while a restore is in flight stops every chat at
+    // once. The restore still commits, but it must not start this chat after
+    // that, or a live writer lock would outlive the stopped server.
+    response = await request("PUT", "/api/projects/rc/archive", { archived: true });
+    assert.equal(response.status, 200, response.text);
+    const restoring = runtime.projectLifecycle.unarchiveProject("rc");
+    const stopping = runtime.shutdown();
+    const [restored, stopped] = await Promise.all([restoring, stopping]);
+    assert.equal(restored.ok, true, JSON.stringify(restored));
+    assert.equal(restored.archived, false, "the restore committed, so its chat hook ran during shutdown");
+    assert.equal(stopped.ok, true, JSON.stringify(stopped));
+    assert.equal(fileChat.isProjectInitialized("rc"), false, "no chat is started once shutdown has begun");
+    assert.equal(fs.existsSync(writerLock), false, "no writer lock outlives the stopped server");
 
     console.log("projectRestoreChat.test.js: all assertions passed");
   } finally {
@@ -250,6 +353,8 @@ async function stopAgents() {
     for (const release of fixtures) release();
     if (server) await new Promise((resolve) => server.close(resolve));
     await runtime.shutdown();
+    global.fetch = originalFetch;
+    routes.getOrComputeBatchProgress = originalBatchProgress;
     os.homedir = originalHome;
     try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch {}
   }
