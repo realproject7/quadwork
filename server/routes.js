@@ -1931,8 +1931,34 @@ function emitSystemMessage(projectId, text) {
   }
 }
 
+// #1203: chat routes build ~/.quadwork/<id> paths from the request's id, so
+// they accept only a configured project's id (archived included, removed not)
+// that names one direct directory there: not empty, not "." or "..", no path
+// separator, no NUL. It may fail the project-id rule, since CLI setup names a
+// project after its folder. An unconfigured id gets 404 if it passes the rule,
+// else 400. A config.json that cannot be read or parsed, or is missing, gets
+// 503 with the admission check's code and is not created. Each refusal comes
+// before any write.
+function assertChatProject(projectId) {
+  let config;
+  try { config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
+  catch { throw new ProjectLifecycleError("project_config_unavailable", projectId, "project configuration is unavailable", 503); }
+  const configured = typeof projectId === "string" && Array.isArray(config?.projects) &&
+    config.projects.some((project) => project?.id === projectId);
+  if (!configured) {
+    try { assertProjectId(projectId); }
+    catch { throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400); }
+    throw new ProjectLifecycleError("unknown_project", projectId, "project is not configured", 404);
+  }
+  if (!projectId || projectId === "." || projectId === ".." || projectId.includes("\0") || path.basename(projectId) !== projectId) {
+    throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400);
+  }
+}
+
 router.get("/api/chat", (req, res) => {
   const projectId = req.query.project;
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
 
   const sinceId = Number(req.query.since_id) || Number(req.query.cursor) || 0;
   const messages = fileChat.readMessages(projectId, {
@@ -2037,6 +2063,8 @@ const RESERVED_HISTORY_SENDERS = new Set([
 router.get("/api/project-history", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   try {
     const messages = fileChat.readMessages(projectId, { limit: 100000 });
     res.json({
@@ -2059,6 +2087,8 @@ router.get("/api/project-history", (req, res) => {
 router.post("/api/project-history", async (req, res) => {
   const projectId = req.query.project || req.body?.project_id;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
 
   const body = req.body;
   if (!body || typeof body !== "object") {
@@ -2197,6 +2227,8 @@ router.post("/api/project-history/restore", async (req, res) => {
   const projectId = req.query.project;
   const name = req.query.name || req.body?.name;
   if (!projectId || !name) return res.status(400).json({ error: "Missing project or name" });
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   // Prevent path traversal — only allow basenames from the snapshot
   // directory; reject anything with a separator or ".." segment.
   if (name !== path.basename(name) || name.includes("..") || !name.endsWith(".json")) {
@@ -2387,6 +2419,7 @@ router.post("/api/chat", (req, res) => {
   const projectId = req.query.project || req.body.project;
 
   try {
+    assertChatProject(projectId);
     assertProjectAdmitted(projectId);
   } catch (err) {
     return sendProjectLifecycleException(res, err, projectId);

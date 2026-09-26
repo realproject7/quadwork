@@ -117,9 +117,8 @@ function createContext(port, opts = {}) {
 
   // Every project-scoped tool (#791–#795) MUST call this before its HTTP call —
   // read OR write — except list_agents, which validates only when `project` is
-  // supplied. Backend trigger/chat/queue endpoints accept unknown ids and
-  // strand state (live timers, stray ~/.quadwork/<id>/ files), so the guard
-  // lives client-side here.
+  // supplied. An unknown id then fails here with the list_projects hint and no
+  // request is sent, whatever the endpoint would do with it.
   async function assertKnownProject(id) {
     const projects = await getConfiguredProjects();
     if (!projects.some((p) => p.id === id)) {

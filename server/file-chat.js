@@ -612,15 +612,10 @@ function readMessages(projectId, { since_id = 0, limit = 50 } = {}) {
     }
   }
 
-  // Fall back to disk
+  // Fall back to disk. #1203: a read never creates the chat file or its
+  // directories. A missing file has no messages yet; the first append makes it.
   const filePath = chatFile(projectId);
-  if (!fs.existsSync(filePath)) {
-    console.warn(`[file-chat] Missing chat file for project ${projectId}, creating empty`);
-    const dir = chatDir(projectId);
-    ensureSecureDir(dir);
-    writeSecureFile(filePath, "");
-    return [];
-  }
+  if (!fs.existsSync(filePath)) return [];
 
   const content = fs.readFileSync(filePath, "utf-8");
   const lines = content.split("\n");

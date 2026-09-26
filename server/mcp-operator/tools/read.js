@@ -3,12 +3,13 @@
 // #791: Tier 1 read-only observation tools. A NEW file under tools/ — additive,
 // no edits to existing tool modules (the conflict-free structure from #790).
 //
-// Reads are NOT side-effect-free on unknown projects: GET /api/chat →
-// readMessages CREATES ~/.quadwork/<project>/chat/general.jsonl if missing, so
-// a bogus id strands state. Every project-scoped tool here calls
-// assertKnownProject(project) BEFORE its HTTP call. list_agents validates only
-// when `project` is supplied. (httpRequest's timeout/ECONNREFUSED/non-2xx
-// mapping comes for free from #790.)
+// Every project-scoped tool here calls assertKnownProject(project) BEFORE its
+// HTTP call, so an unknown id fails with the list_projects hint and sends no
+// request. (Before #1203, GET /api/chat also created
+// ~/.quadwork/<project>/chat/general.jsonl for a bogus id; it now refuses the
+// id and creates nothing.) list_agents validates only when `project` is
+// supplied. (httpRequest's timeout/ECONNREFUSED/non-2xx mapping comes for free
+// from #790.)
 
 module.exports = {
   defs: [
