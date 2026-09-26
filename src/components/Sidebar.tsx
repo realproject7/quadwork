@@ -6,8 +6,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
+import { OPEN_MOBILE_SIDEBAR_EVENT } from "@/lib/mobileSidebar";
 
-function HamburgerIcon() {
+export function HamburgerIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
       <path d="M3 5h14M3 10h14M3 15h14" />
@@ -223,6 +224,11 @@ function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onCo
 const SIDEBAR_KEY = "qw-sidebar-expanded";
 const GROUP_COLLAPSE_KEY = "qw-sidebar-collapsed-groups";
 
+// #1198: elements a keyboard user can land on, for the mobile drawer's
+// focus trap below.
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 interface ContextMenu {
   x: number;
   y: number;
@@ -239,6 +245,8 @@ export default function Sidebar() {
   const [backendStatus, setBackendStatus] = useState<"online" | "offline" | "recovering">("online");
   const [expanded, setExpanded] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const mobileAsideRef = useRef<HTMLElement>(null);
+  const mobileCloseButtonRef = useRef<HTMLButtonElement>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
   const [version, setVersion] = useState<string>("");
   const configRef = useRef<Record<string, unknown> | null>(null);
@@ -280,10 +288,75 @@ export default function Sidebar() {
     setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, idle } : p)));
   }), []);
 
-  // Close mobile overlay on navigation
+  // Close mobile overlay on navigation. Not routed through closeDrawer:
+  // navigation itself moves the page along, so it shouldn't also yank
+  // focus back to the menu button.
   useEffect(() => {
     setMobileOpen(false);
   }, [pathname]);
+
+  // #1198: opened by TopHeader's menu button via openMobileSidebar()
+  // (@/lib/mobileSidebar).
+  useEffect(() => {
+    const open = () => setMobileOpen(true);
+    window.addEventListener(OPEN_MOBILE_SIDEBAR_EVENT, open);
+    return () => window.removeEventListener(OPEN_MOBILE_SIDEBAR_EVENT, open);
+  }, []);
+
+  // #1198: close the drawer and hand focus back to the menu button that
+  // opened it — the close button, Escape, and the backdrop all go through
+  // this one path (see the focus trap below for why plain setMobileOpen
+  // isn't enough on its own).
+  const closeMobileDrawer = useCallback(() => {
+    setMobileOpen(false);
+    (document.querySelector('[aria-label="Open sidebar"]') as HTMLElement | null)?.focus();
+  }, []);
+
+  // #1198: focus moves into the drawer the moment it opens — without this,
+  // the first Tab after "Open sidebar" continues into TopHeader's own
+  // controls (still tabbable behind the backdrop) rather than the drawer,
+  // since Sidebar (and its aside) sits after TopHeader in the DOM.
+  useEffect(() => {
+    if (mobileOpen) mobileCloseButtonRef.current?.focus();
+  }, [mobileOpen]);
+
+  // #1198: trap Tab/Shift+Tab inside the open drawer (Escape closes it too).
+  // The drawer's own children already tab through each other in the right
+  // order — a plain DOM sibling walk — so the only leaks are at the two
+  // ends: Tab past the last item would otherwise continue into <main>,
+  // and Shift+Tab past the first would otherwise walk back into
+  // TopHeader's controls behind the backdrop. Wrapping those two cases is
+  // enough; no focus-trap dependency needed.
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeMobileDrawer();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const aside = mobileAsideRef.current;
+      if (!aside) return;
+      const focusables = Array.from(aside.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      const inside = active instanceof Node && aside.contains(active);
+      if (e.shiftKey) {
+        if (!inside || active === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (!inside || active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [mobileOpen, closeMobileDrawer]);
 
   // Restore persisted state on mount — only on desktop-width screens
   useEffect(() => {
@@ -301,6 +374,23 @@ export default function Sidebar() {
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 767px)");
     const handler = (e: MediaQueryListEvent) => { if (e.matches) setExpanded(false); };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  // #1198: close the mobile drawer once the viewport reaches `lg` (widening
+  // the window, or zooming out). At `lg+` the drawer is `lg:hidden`
+  // (display:none) but stays in the DOM, so without this, `mobileOpen`
+  // would stay stuck true — the focus-trap effect below keeps running,
+  // still finds the drawer's (now hidden, unfocusable) buttons via
+  // querySelectorAll, and calls preventDefault() on every Tab only to
+  // .focus() something that can't take it, leaving Tab dead everywhere.
+  // The query is `64rem`, exactly Tailwind v4's `lg`: media-query rem follows
+  // the browser's default font size, so a px value would drift from
+  // `lg:hidden` whenever that setting is not 16px.
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 64rem)");
+    const handler = (e: MediaQueryListEvent) => { if (e.matches) setMobileOpen(false); };
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
   }, []);
@@ -752,36 +842,34 @@ export default function Sidebar() {
 
   return (
     <>
-      {/* Mobile hamburger button — only below lg. #1187: it sits inside the
-          48px top header bar, whose left padding below lg keeps the header
-          text clear of it, so it covers no text. z-[45] puts it above the
-          header (z-40) and below every overlay and modal (z-50+). */}
-      <button
-        type="button"
-        onClick={() => setMobileOpen(true)}
-        aria-label="Open sidebar"
-        className="fixed top-1 left-2 z-[45] lg:hidden w-10 h-10 flex items-center justify-center bg-bg-surface border border-border text-text-muted hover:text-accent"
-      >
-        <HamburgerIcon />
-      </button>
+      {/* #1198: the menu button that used to render here now lives in
+          TopHeader.tsx, which sits first in the DOM (see layout.tsx) so
+          below `lg` Tab reaches it before the header's own controls. It
+          calls openMobileSidebar() (@/lib/mobileSidebar), which the
+          effect above listens for. Fixed positioning keeps its on-screen
+          spot unchanged (#1187: inside the 48px top header bar, z-[45]
+          above the header z-40, below every overlay/modal z-50+). */}
 
       {/* Mobile overlay backdrop */}
       {mobileOpen && (
         <div
           className="fixed inset-0 z-40 bg-black/50 lg:hidden"
-          onClick={() => setMobileOpen(false)}
+          onClick={closeMobileDrawer}
         />
       )}
 
       {/* Mobile overlay sidebar — always expanded, slides in from left */}
       <aside
+        ref={mobileAsideRef}
         className={`fixed inset-y-0 left-0 z-50 w-52 bg-bg-surface border-r border-border flex flex-col py-3 px-2 items-stretch overflow-y-auto transition-transform duration-200 ease-in-out lg:hidden ${
           mobileOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
         <button
+          ref={mobileCloseButtonRef}
           type="button"
-          onClick={() => setMobileOpen(false)}
+          onClick={closeMobileDrawer}
+          aria-label="Close sidebar"
           className="self-end shrink-0 w-10 h-10 flex items-center justify-center text-text-muted hover:text-accent mb-1"
         >
           <CloseXIcon />
