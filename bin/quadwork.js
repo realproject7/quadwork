@@ -16,6 +16,7 @@ const {
 } = require("../server/config");
 const { normalizeCiPolicy } = require("../server/ci-evidence-policy");
 const { createCliStopOwner, requestCliStop } = require("../server/cli-stop-owner");
+const { resolveCliExecutable } = require("../server/cli-executable");
 const { createReadOnlyProbes, runResourcePreflight } = require("../server/resource-preflight");
 const { configureServiceTempEnvironment } = require("../server/resource-service-env");
 const {
@@ -99,11 +100,18 @@ function which(cmd) {
   return run("which", [cmd]) !== null;
 }
 
+// #1186: an agent CLI is installed when the shared resolver finds it: the
+// executable Settings reports and spawn runs, including one only in an extra
+// install folder that `which` misses.
+function agentCliInstalled(backend) {
+  return resolveCliExecutable(backend) !== null;
+}
+
 // #1032: this is an availability list, not a backend registry. The wizard
-// only needs to know which supported executable names are on PATH; model and
+// only needs to know which supported executable names are installed; model and
 // command semantics remain owned by the existing agent configuration surface.
-function installedAgentCliBackends(whichFn = which) {
-  return ["claude", "codex", "gemini", "grok"].filter((backend) => whichFn(backend));
+function installedAgentCliBackends(isInstalled = agentCliInstalled) {
+  return ["claude", "codex", "gemini", "grok"].filter((backend) => isInstalled(backend));
 }
 
 function validateInstalledBackendChoice(choice, available) {
@@ -615,10 +623,10 @@ async function checkPrereqs(rl) {
   }
 
   // ── 6. AI CLIs — at least one required (independent) ──
-  let hasClaude = which("claude");
-  let hasCodex = which("codex");
-  const hasGemini = which("gemini");
-  const hasGrok = which("grok");
+  let hasClaude = agentCliInstalled("claude");
+  let hasCodex = agentCliInstalled("codex");
+  const hasGemini = agentCliInstalled("gemini");
+  const hasGrok = agentCliInstalled("grok");
 
   if (hasClaude) ok("Claude Code");
   if (hasCodex) ok("Codex CLI");
@@ -651,7 +659,7 @@ async function checkPrereqs(rl) {
         } else {
           execFileSync("npm", ["install", "-g", "@anthropic-ai/claude-code"], { stdio: "inherit", timeout: 120000 });
         }
-        hasClaude = which("claude");
+        hasClaude = agentCliInstalled("claude");
         if (hasClaude) ok("Claude Code installed");
         else warn(`Install seemed to succeed but 'claude' not found on PATH. Try restarting your terminal.`);
       } catch {
@@ -677,7 +685,7 @@ async function checkPrereqs(rl) {
         } else {
           execFileSync("npm", ["install", "-g", "@openai/codex"], { stdio: "inherit", timeout: 120000 });
         }
-        hasCodex = which("codex");
+        hasCodex = agentCliInstalled("codex");
         if (hasCodex) ok("Codex CLI installed");
         else warn(`Install seemed to succeed but 'codex' not found on PATH. Try restarting your terminal.`);
       } catch {
@@ -724,7 +732,9 @@ async function checkPrereqs(rl) {
 
     // Claude Code auth
     if (hasClaude) {
-      const claudeAuth = run("claude", ["auth", "status"]) || run("claude", ["--version"]);
+      // #1186: check and log in to the claude found above, as spawn runs it.
+      const claude = resolveCliExecutable("claude") || "claude";
+      const claudeAuth = run(claude, ["auth", "status"]) || run(claude, ["--version"]);
       if (claudeAuth && (claudeAuth.includes("authenticated") || claudeAuth.includes("Logged in") || claudeAuth.includes("@"))) {
         ok("Claude Code — authenticated");
       } else {
@@ -733,7 +743,7 @@ async function checkPrereqs(rl) {
         if (doLogin) {
           rl.pause();
           process.stdin.setRawMode && process.stdin.setRawMode(false);
-          const { status } = require("child_process").spawnSync("claude", ["auth", "login"], { stdio: "inherit", timeout: 600000 });
+          const { status } = require("child_process").spawnSync(claude, ["auth", "login"], { stdio: "inherit", timeout: 600000 });
           rl.resume();
           if (status === 0) {
             ok("Claude Code — authentication complete");
@@ -748,7 +758,9 @@ async function checkPrereqs(rl) {
 
     // Codex CLI auth
     if (hasCodex) {
-      const codexAuth = run("codex", ["login", "status"]) || run("codex", ["--version"]);
+      // #1186: check and log in to the codex found above, as spawn runs it.
+      const codex = resolveCliExecutable("codex") || "codex";
+      const codexAuth = run(codex, ["login", "status"]) || run(codex, ["--version"]);
       if (codexAuth && (codexAuth.includes("authenticated") || codexAuth.includes("Logged in") || codexAuth.includes("@"))) {
         ok("Codex CLI — authenticated");
       } else {
@@ -757,7 +769,7 @@ async function checkPrereqs(rl) {
         if (doLogin) {
           rl.pause();
           process.stdin.setRawMode && process.stdin.setRawMode(false);
-          const { status } = require("child_process").spawnSync("codex", ["login"], { stdio: "inherit", timeout: 600000 });
+          const { status } = require("child_process").spawnSync(codex, ["login"], { stdio: "inherit", timeout: 600000 });
           rl.resume();
           if (status === 0) {
             ok("Codex CLI — authentication complete");

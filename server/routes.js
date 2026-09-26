@@ -39,6 +39,7 @@ const { normalizeCiPolicy, normalizeGithubCheckEvidence, redactedCiPolicy, canon
 const { REQUEST_LABEL: BATCH_REQUEST_LABEL } = require("./batch-request-subscription");
 const { injectModeForCommand, cliBaseFromCommand } = require("../src/lib/injectMode.js");
 const { isValidModelId, invalidAgentModelRefs } = require("./agent-model-catalog");
+const { resolveCliExecutable } = require("./cli-executable");
 const { admissionMatchesContext } = require("./head-ticket-review-admission");
 
 const router = express.Router();
@@ -6739,17 +6740,19 @@ router.post("/api/setup", async (req, res) => {
       // Pre-trust worktree directories for Claude Code agents (#599).
       // Running `claude -p` in a directory auto-trusts it for future sessions,
       // preventing the interactive "Do you trust this directory?" prompt.
+      // #1186: it runs the claude the shared resolver finds, the one Settings
+      // reports and spawn runs, including one only in an extra install folder.
       const agentBackends = body.backends || {};
       const claudeAgents = agents.filter((a) => (agentBackends[a] || "claude") === "claude");
       if (claudeAgents.length > 0) {
-        const claudePath = await execAsync("which", ["claude"]);
-        if (claudePath.ok) {
+        const claude = resolveCliExecutable("claude");
+        if (claude) {
           for (const agent of claudeAgents) {
             const wtDir = path.join(parentDir, `${projectName}-${agent}`);
             if (!fs.existsSync(wtDir)) continue;
             // #975: await off the event loop. A hung `claude -p` (15s timeout)
             // per agent used to block the whole server; now it yields.
-            await execAsync("claude", ["-p", "echo ok"], { cwd: wtDir, timeout: 15000, stdio: "pipe" });
+            await execAsync(claude, ["-p", "echo ok"], { cwd: wtDir, timeout: 15000, stdio: "pipe" });
           }
         }
       }
