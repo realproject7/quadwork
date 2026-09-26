@@ -15,7 +15,8 @@
 export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
   // #1172: refreshed from `codex debug models` (visibility "list", codex-cli
   // 0.153.1). gpt-5.4 / gpt-5 / gpt-4o were dropped — the CLI no longer lists
-  // them; an agent still saved on one keeps it and is flagged as not offered.
+  // them. #1176: they live on in RETIRED_MODELS; a codex agent still saved on
+  // one keeps it and is flagged as retired.
   codex: [
     { value: "", label: "(CLI default)" },
     { value: "gpt-6-astra", label: "gpt-6-astra" },
@@ -56,6 +57,13 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
   ],
 };
 
+// #1176: ids a backend's shipped list dropped because its CLI no longer lists
+// them. Used only by the heal rule (an agent of another CLI saved on one heals
+// to the CLI default) and the "retired" flag. Never offered as a choice.
+const RETIRED_MODELS: Record<string, string[]> = {
+  codex: ["gpt-5.4", "gpt-5", "gpt-4o"],
+};
+
 // #1172: the one accepted model-id shape lives in the plain-JS modelId.js,
 // shared with the server's write routes and spawn path.
 import { isValidModelId } from "./modelId.js";
@@ -88,8 +96,9 @@ function knownFor(backend: string, discovered?: DiscoveredModels) {
 // The model to PERSIST (and display in Settings, so what is shown is what a
 // save writes). #1172 heal rule, replacing the #931 first-option heal:
 //   - "" / unset stays "" (CLI default);
-//   - a model known for a different backend (shipped or discovered) and not
-//     for this one heals to "" (e.g. a Claude "sonnet" left on a codex agent);
+//   - a model known for a different backend (shipped, discovered or #1176
+//     retired) and not for this one heals to "" (e.g. a Claude "sonnet" left
+//     on a codex agent);
 //   - anything else is kept as-is — never silently rewritten. If the backend
 //     does not list it, `modelChoices` flags it.
 export function sanitizeModel(backend: string, model: string | undefined | null, discovered?: DiscoveredModels) {
@@ -97,7 +106,7 @@ export function sanitizeModel(backend: string, model: string | undefined | null,
   if (knownFor(backend, discovered).has(model)) return model;
   const backends = new Set([...Object.keys(MODEL_OPTIONS), ...Object.keys(discovered || {})]);
   for (const other of backends) {
-    if (other !== backend && knownFor(other, discovered).has(model)) return "";
+    if (other !== backend && (knownFor(other, discovered).has(model) || RETIRED_MODELS[other]?.includes(model))) return "";
   }
   return model;
 }
@@ -110,11 +119,13 @@ export const CUSTOM_MODEL_VALUE = "__custom__";
 //   - "other_backend": known for a different CLI and not this one; a Settings
 //     save heals it to "" (CLI default) — see sanitizeModel;
 //   - "invalid": fails MODEL_ID_PATTERN; refused on save and never spawned;
+//   - "retired": #1176 one of this backend's RETIRED_MODELS (its CLI stopped
+//     listing it); kept as-is, like any saved model;
 //   - "not_offered": discovery for this backend succeeded and did not list it;
 //   - "not_known": no discovered list for this backend (no discovery source,
 //     discovery failed, or still loading) and the shipped list lacks it — the
 //     CLI was not checked, so nothing is claimed about what it offers.
-export type ModelChoiceFlag = "other_backend" | "invalid" | "not_offered" | "not_known";
+export type ModelChoiceFlag = "other_backend" | "invalid" | "retired" | "not_offered" | "not_known";
 
 // The <select> rows for one agent, shared by both surfaces: the CLI-default
 // row, the backend's listed models, and — if the saved model is not listed —
@@ -127,7 +138,9 @@ export function modelChoices(backend: string, saved: string | undefined | null, 
       ? "invalid"
       : sanitizeModel(backend, saved, discovered) === ""
         ? "other_backend"
-        : (discovered?.[backend]?.length ?? 0) > 0 ? "not_offered" : "not_known";
+        : RETIRED_MODELS[backend]?.includes(saved)
+          ? "retired"
+          : (discovered?.[backend]?.length ?? 0) > 0 ? "not_offered" : "not_known";
     rows.push({ value: saved, label: saved, flag });
   }
   return rows;
@@ -139,12 +152,14 @@ export const MODEL_FLAG_COPY: Record<"en" | "ko", Record<ModelChoiceFlag, string
   en: {
     other_backend: "(another CLI's model; Save in Settings resets it to CLI default)",
     invalid: "(invalid id)",
+    retired: "(retired model)",
     not_offered: "(not offered by CLI)",
     not_known: "(not in the known list)",
   },
   ko: {
     other_backend: "(다른 CLI의 모델, 설정에서 저장하면 CLI 기본값으로 재설정)",
     invalid: "(잘못된 ID)",
+    retired: "(지원 종료된 모델)",
     not_offered: "(CLI 목록에 없음)",
     not_known: "(알려진 목록에 없음)",
   },

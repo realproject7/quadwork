@@ -145,6 +145,7 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     // ── PATCH /api/config: the section-merge Settings save (no whole-config PUT) ─
     // Send only owned sections (Settings strips the flags): operator_name echoed
     // sanitized, a retired top-level field, and a project with edited agents.
+    const lvBefore = JSON.stringify(readCfg().projects[0]);
     const patch = await req(server, { method: "PATCH", urlPath: "/api/config", body: {
       operator_name: "Alice", // sanitized echo — must keep raw "Alice!"
       [RETIRED_GLOBAL_AGENT_FIELD]: { command: "claude", model: "opus" },
@@ -154,7 +155,9 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     const d2 = readCfg();
     ok(d2.operator_name === "Alice!", "PATCH keeps the raw operator_name on a sanitized echo");
     ok(!Object.prototype.hasOwnProperty.call(d2, RETIRED_GLOBAL_AGENT_FIELD), "PATCH discards the retired global metadata field");
-    ok(d2.projects[0].name === "Renamed" && d2.projects[0].agents.head.command === "codex", "PATCH merges owned per-project fields (name, agents)");
+    // #1176: lv is archived on disk here, so the merge leaves it untouched. The
+    // name/agents merge into an active project is checked below.
+    ok(JSON.stringify(d2.projects[0]) === lvBefore, "#1176: PATCH leaves a project archived on disk untouched (name, agents ignored)");
     ok(d2.projects[0].idle === true && d2.projects[0].telegram_auto === true, "PATCH preserves the field-scoped flags from disk (no clobber)");
     ok(d2.projects[0].archived === true, "PATCH cannot restore an archived project from a stale body");
     ok(d2.projects[0].admission_generation === 5, "PATCH preserves the lifecycle-owned admission generation");
@@ -179,6 +182,12 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     } });
     ok(!Object.prototype.hasOwnProperty.call(readCfg().projects.find((project) => project.id === "lv"), "archived"),
        "generic PATCH cannot archive when lifecycle owns an absent archived field");
+    await req(server, { method: "PATCH", urlPath: "/api/config", body: {
+      projects: [{ id: "lv", name: "Renamed", agents: { head: { command: "codex" } } }],
+    } });
+    const activeLv = readCfg().projects.find((project) => project.id === "lv");
+    ok(activeLv.name === "Renamed" && activeLv.agents.head.command === "codex", "PATCH merges owned per-project fields (name, agents)");
+    ok(activeLv.idle === true && activeLv.telegram_auto === true, "PATCH preserves the field-scoped flags from disk on an active project (no clobber)");
 
     // PATCH must never touch the field-scoped-owned top-level keys.
     writeCfg({ ...readCfg(), pinned_projects: ["lv"] });

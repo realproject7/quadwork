@@ -38,7 +38,9 @@ ok(optionsForBackend("codex")[0].value === "", "optionsForBackend(codex) starts 
 ok(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"].every((s) => values(optionsForBackend("codex")).includes(s)),
   "#1172: shipped codex list matches what `codex debug models` lists (incl. gpt-6-astra, gpt-5.5)");
 ok(!["gpt-5.4", "gpt-5", "gpt-4o"].some((s) => values(optionsForBackend("codex")).includes(s)),
-  "#1172: shipped codex list drops gpt-5.4 / gpt-5 / gpt-4o, which the CLI no longer lists");
+  "#1172/#1176: shipped codex list drops gpt-5.4 / gpt-5 / gpt-4o, which the CLI no longer lists; they are never offered");
+ok(!["gpt-5.4", "gpt-5", "gpt-4o"].some((s) => values(modelChoices("codex", "")).includes(s)),
+  "#1176: the retired codex ids are not offered as codex choices (no saved model)");
 ok(["fable", "opus", "sonnet", "claude-opus-5-5", "claude-opus-5", "claude-fable-5"].every((s) => values(optionsForBackend("claude")).includes(s)),
   "#1172: shipped claude list has the documented fable/opus/sonnet aliases and the claude-opus-5-5 pin");
 ok(optionsForBackend("nope").length === 1 && optionsForBackend("nope")[0].value === "", "optionsForBackend(unknown) → single CLI-default row");
@@ -77,20 +79,37 @@ ok(sanitizeModel("codex", "gpt-5.6-terra") === "gpt-5.6-terra", "sanitizeModel k
 ok(sanitizeModel("codex", "gpt-5.6-terra", discovered) === "gpt-5.6-terra",
   "#1172 AC6: a shipped codex model the discovery omits is still known for codex → kept, not healed");
 ok(sanitizeModel("claude", "claude-opus-5") === "claude-opus-5", "#1018: a saved claude-opus-5 pin is kept (never healed to the alias)");
-ok(sanitizeModel("codex", "gpt-5.4") === "gpt-5.4", "#1172 AC6: an unlisted id known for no backend (gpt-5.4) is kept, never rewritten");
+ok(sanitizeModel("codex", "gpt-5.4") === "gpt-5.4", "#1176: a retired codex id (gpt-5.4) on a codex agent is kept, never rewritten");
+ok(sanitizeModel("codex", "gpt-legacy-x") === "gpt-legacy-x", "#1172 AC6: an unlisted id known for no backend is kept, never rewritten");
 ok(sanitizeModel("codex", "my-proxy/gpt-x") === "my-proxy/gpt-x", "#1172 AC6: a hand-entered id is kept");
+for (const retired of ["gpt-5.4", "gpt-5", "gpt-4o"]) {
+  ok(sanitizeModel("claude", retired) === "" && sanitizeModel("gemini", retired) === "" && sanitizeModel("grok", retired) === "",
+    `#1176: a Claude/Gemini/Grok agent saved on the retired codex id ${retired} heals to the CLI default`);
+}
 
 // ── AC6: stale-model flag ──
 {
-  const rows = modelChoices("codex", "gpt-5.4");
-  const stale = rows.find((o) => o.value === "gpt-5.4");
+  const rows = modelChoices("codex", "gpt-legacy-x");
+  const stale = rows.find((o) => o.value === "gpt-legacy-x");
   ok(stale && stale.flag === "not_known",
     "#1172 AC6: a kept unlisted model stays selectable; with no discovered list it is flagged not_known (the CLI was not checked)");
   ok(rows.filter((o) => o.flag).length === 1, "#1172 AC6: only the stale row is flagged");
-  ok(modelChoices("codex", "gpt-5.4", discovered).find((o) => o.value === "gpt-5.4").flag === "not_offered",
+  ok(modelChoices("codex", "gpt-legacy-x", discovered).find((o) => o.value === "gpt-legacy-x").flag === "not_offered",
     "#1172 AC6: when discovery for the backend succeeded, an unlisted model is flagged not_offered");
-  ok(modelChoices("codex", "gpt-5.4", { grok: ["grok-5"] }).find((o) => o.value === "gpt-5.4").flag === "not_known",
+  ok(modelChoices("codex", "gpt-legacy-x", { grok: ["grok-5"] }).find((o) => o.value === "gpt-legacy-x").flag === "not_known",
     "#1172 AC6: discovery for another backend does not make this one 'not offered'");
+  // #1176: a retired codex id is its own flag, not "not in the known list".
+  {
+    const retired = modelChoices("codex", "gpt-5.4");
+    ok(retired.find((o) => o.value === "gpt-5.4").flag === "retired" && retired.filter((o) => o.flag).length === 1,
+      "#1176: a codex agent saved on gpt-5.4 keeps a selectable row flagged retired (not not_known)");
+    ok(modelChoices("codex", "gpt-4o", discovered).find((o) => o.value === "gpt-4o").flag === "retired",
+      "#1176: with a codex discovered list that omits it, a retired id is still flagged retired (not not_offered)");
+    ok(!modelChoices("codex", "gpt-5", { codex: ["gpt-5", "gpt-6-astra"] }).some((o) => o.flag),
+      "#1176: an installed CLI that lists a retired id offers it (discovered row, no flag)");
+    ok(modelChoices("claude", "gpt-5").find((o) => o.value === "gpt-5").flag === "other_backend",
+      "#1176: a retired codex id on a claude agent is flagged as another CLI's model");
+  }
   ok(modelChoices("claude", "my-model").find((o) => o.value === "my-model").flag === "not_known",
     "#1172 AC6: a backend with no discovery source flags an unlisted model not_known");
   {
@@ -102,6 +121,8 @@ ok(sanitizeModel("codex", "my-proxy/gpt-x") === "my-proxy/gpt-x", "#1172 AC6: a 
     "#1172: the other_backend flag says it is another CLI's model and that Save resets it to the CLI default");
   ok(MODEL_FLAG_COPY.en.not_offered === "(not offered by CLI)" && MODEL_FLAG_COPY.en.not_known === "(not in the known list)",
     "#1172: 'not offered by CLI' only for a checked CLI, 'not in the known list' otherwise");
+  ok(MODEL_FLAG_COPY.en.retired === "(retired model)" && MODEL_FLAG_COPY.ko.retired !== MODEL_FLAG_COPY.ko.not_known,
+    "#1176: the retired flag has its own copy, distinct from 'not in the known list'");
   ok(Object.keys(MODEL_FLAG_COPY.en).sort().join() === Object.keys(MODEL_FLAG_COPY.ko).sort().join(), "#1172: every flag has en + ko copy");
   ok(!values(optionsForBackend("codex")).includes("gpt-5.4"), "#1172: modelChoices never mutates the shipped list");
   ok(!modelChoices("codex", "gpt-7-nova", discovered).some((o) => o.flag), "#1172: a discovered model is not flagged");
@@ -128,8 +149,8 @@ ok(Object.values(MODEL_OPTIONS).flat().every((o) => o.value === "" || isValidMod
   const settings = fs.readFileSync(path.join(__dirname, "..", "src", "components", "SettingsPage.tsx"), "utf8");
   const modal = fs.readFileSync(path.join(__dirname, "..", "src", "components", "AgentModelsWidget.tsx"), "utf8");
   ok(!/effectiveModel|modelsForBackend/.test(settings), "#1172 AC4: Settings no longer renders the first concrete option for an unset model");
-  ok(/const command = e\.target\.value;\s*setCustomModel\([^;]*\);\s*updateAgent\(idx, agentId, \{\s*command,\s*model: "",/.test(settings),
-    "#1172 AC5: changing an agent's command resets its model to '' (CLI default)");
+  // #1172 AC5 (a command change resets the model to the CLI default) is a
+  // behaviour test since #1176: server/settingsPage.test.js.
   ok(settings.includes("modelChoices(") && settings.includes("CUSTOM_MODEL_VALUE") && settings.includes('fetch("/api/agent-model-catalog")'),
     "#1172 AC1/AC2: Settings lists discovered models and offers hand entry");
   ok(settings.includes("sanitizeModel(cliBaseFromCommand(a.command), a.model, discoveredModels)") && settings.includes("setSaveError(t.invalidModelIds("),

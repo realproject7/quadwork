@@ -343,6 +343,9 @@ const COPY = {
     modelIdPlaceholder: "model id",
     invalidModelIds: (agents: string) =>
       `Not saved: invalid model id for ${agents}. Use letters, digits and . _ : / @ - (no spaces or quotes, not starting with -).`,
+    // #1176: non-blocking notice on an archived project row.
+    archivedInvalidModelIds: (agents: string) =>
+      `Invalid model id for ${agents}. Save leaves archived projects unchanged. Restore the project to fix it.`,
   },
   ko: {
     loading: "로딩 중...",
@@ -428,6 +431,8 @@ const COPY = {
     modelIdPlaceholder: "모델 ID",
     invalidModelIds: (agents: string) =>
       `저장되지 않음: ${agents}의 모델 ID가 잘못되었습니다. 영문, 숫자와 . _ : / @ - 만 사용할 수 있습니다 (공백·따옴표 불가, -로 시작 불가).`,
+    archivedInvalidModelIds: (agents: string) =>
+      `${agents}의 모델 ID가 잘못되었습니다. 저장은 보관된 프로젝트를 변경하지 않습니다. 고치려면 프로젝트를 복원하세요.`,
   },
 } as const;
 
@@ -792,7 +797,11 @@ export default function SettingsPage() {
     if (!config) return;
     // #1172: refuse to persist a model id outside MODEL_ID_PATTERN (the PUT
     // route and the spawn path refuse it too) instead of rewriting it.
-    const invalidModels = config.projects.flatMap((p) =>
+    // #1176: active projects only. Save never sends an archived project (it
+    // has no model control, and PATCH /api/config leaves a project missing
+    // from the body untouched), so its stored agents are never rewritten or
+    // healed and an invalid id there only gets a notice.
+    const invalidModels = config.projects.filter((p) => !p.archived).flatMap((p) =>
       Object.entries(p.agents || {})
         .filter(([, a]) => {
           const model = sanitizeModel(cliBaseFromCommand(a.command), a.model, discoveredModels);
@@ -818,9 +827,14 @@ export default function SettingsPage() {
       // wizard writes it and the spawn path reads it), so always re-derive it
       // from the command — this heals a stale "flag" left on an agent converted
       // to gemini before this fix, which would otherwise crash the CLI.
+      // #1176: an archived project is never sent, so it keeps its saved
+      // snapshot: an edit made before archiving is not recorded as saved.
+      let savedProjects: ProjectConfig[] = [];
+      try { savedProjects = JSON.parse(savedConfigRef.current).projects || []; } catch { /* no saved snapshot yet */ }
       const normalizedConfig = {
         ...config,
         projects: config.projects.map((p) => {
+          if (p.archived) return savedProjects.find((s) => s.id === p.id) ?? p;
           const agents: Record<string, AgentConfig> = {};
           for (const [id, a] of Object.entries(p.agents)) {
             agents[id] = {
@@ -840,7 +854,7 @@ export default function SettingsPage() {
       for (const k of ["pinned_projects", "sidebar_groups", "reviewer_github_user", "session_token"]) {
         delete patchBody[k];
       }
-      patchBody.projects = normalizedConfig.projects.map((project) => ({
+      patchBody.projects = normalizedConfig.projects.filter((project) => !project.archived).map((project) => ({
         // Settings owns only project metadata and agent configuration. An
         // allowlist, rather than stripping scalar fields after a spread,
         // guarantees the generic PATCH can never carry repository topology.
@@ -1938,6 +1952,10 @@ export default function SettingsPage() {
             {config.projects.filter((p) => p.archived).map((project) => {
               const idx = config.projects.indexOf(project);
               const lifecyclePending = projectLifecyclePending[project.id];
+              // #1176: named in a notice; Save never sends this project.
+              const invalidModels = Object.entries(project.agents || {})
+                .filter(([, a]) => !!a?.model && !isValidModelId(a.model))
+                .map(([id]) => `${project.name || project.id}/${id}`);
               return (
                 <div key={project.id} className="border border-border mb-3 opacity-60">
                   <div className="flex items-center justify-between px-3 py-2">
@@ -1987,6 +2005,11 @@ export default function SettingsPage() {
                       )}
                     </div>
                   </div>
+                  {invalidModels.length > 0 && (
+                    <p role="status" aria-live="polite" className="mx-3 mb-3 text-[10px] text-[#ffcc00] break-words">
+                      {t.archivedInvalidModelIds(invalidModels.join(", "))}
+                    </p>
+                  )}
                   {projectLifecycleErrors[project.id] && (
                     <div role="alert" className="mx-3 mb-3 border border-error/30 bg-error/5 px-3 py-2 text-[10px] text-error break-words">
                       {projectLifecycleErrors[project.id]}
