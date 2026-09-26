@@ -15,7 +15,8 @@
 //
 // Faked seams for what needs layout: Tab order across layout.tsx is read from
 // the fake document, and the lg close runs on the injected matchMedia. The fake
-// follows only the browser rules these checks rely on:
+// follows only the browser rules these checks rely on, to pass or to catch a
+// broken change:
 // - Tab order is DOM order, with positive tabindex first and negative tabindex
 //   skipped. A Tab that no keydown listener cancels moves focus to the next
 //   stop. Past either end, focus leaves the page.
@@ -36,19 +37,21 @@
 //   simulated viewport. A media-query rem is the browser's default font size.
 //   On a resize, every list whose result flips fires `change`.
 //
-// Browser-only, covered by PR #1200's browser proof, because the fake has no
-// CSS and no layout:
+// Browser-only, covered by the browser proof on PRs #1200 and #1212, because
+// the fake has no CSS and no layout:
 // - What a width hides. Only the hidden attribute hides an element here. Below
 //   lg every Tab stop these pages render before and inside the drawer is
-//   displayed. The desktop rail, hidden below lg, only appears here as a place
-//   focus must not leak to.
+//   displayed. The desktop rail is not: in a browser at 390px it is
+//   display:none. Here its stops are in the Tab order at every width. The
+//   open-drawer tests use them as a place focus must not leak to, and the
+//   #1205 walk passes through them.
 // - Where a tap lands: the overlay covering the page, and the z-[45] menu
 //   button above the presets backdrop. A click goes to the element the test
 //   names.
 // - The drawer's position and slide. "Open" here means the drawer has its
-//   slid-in class, translate-x-0. The #1205 PR's browser proof covers the
-//   slide with the closed drawer inert. Here the closed drawer only has to
-//   stay displayed.
+//   slid-in class, translate-x-0. PR #1212's browser proof covers the slide
+//   with the closed drawer inert. Here the closed drawer, and everything in
+//   it, only has to stay displayed.
 // - focus and blur events. The fake only tracks document.activeElement.
 
 const test = require("node:test");
@@ -582,9 +585,13 @@ test("#1198: reaching Tailwind's lg closes the drawer and releases Tab, at a 16p
     await page.click(page.menuButton());
     await page.resize(lgPx - 1);
     assert.equal(page.drawerOpen(), true, `${defaultFontSize}px default font: still open 1px below lg (${lgPx}px)`);
+    assert.ok(page.drawer().contains(page.active()), `${defaultFontSize}px default font: fixture: focus is inside the open drawer`);
 
     await page.resize(lgPx);
     assert.equal(page.drawerOpen(), false, `${defaultFontSize}px default font: closed at lg`);
+    // In a browser the closed drawer is display:none at lg. Here it is inert.
+    // Either way, the focus fixup rule moves focus out of it.
+    assertSame(page.active(), page.document.body, `${defaultFontSize}px default font: focus fell back to <body> from the closed drawer`);
     const about = page.button("About QuadWork");
     about.focus();
     const tab = await page.press("Tab");
@@ -593,6 +600,7 @@ test("#1198: reaching Tailwind's lg closes the drawer and releases Tab, at a 16p
 
     // Crossing lg again, as a second tablet rotation does, closes it again.
     await page.resize(lgPx - 1);
+    assert.equal(page.drawerStops().length, 0, `${defaultFontSize}px default font: back below lg, the drawer that closed at lg has no Tab stops`);
     await page.click(page.menuButton());
     assert.equal(page.drawerOpen(), true, `${defaultFontSize}px default font: fixture: reopened below lg`);
     await page.resize(lgPx);
@@ -641,7 +649,9 @@ test("#1205: below lg, the closed drawer is out of the Tab order and hidden from
     "fixture: the page has Tab stops before and after the drawer, so a walk passes it");
 
   const checkClosed = async (when) => {
-    assert.equal(page.drawer().getAttribute("hidden"), null, `${when}: the closed drawer stays displayed, so it can still slide`);
+    // The drawer slides as a whole: nothing around it or in it may be hidden.
+    const hidden = [...ancestry(page.drawer()), ...descendants(page.drawer())].find((el) => el.getAttribute("hidden") !== null);
+    if (hidden) assert.fail(`${when}: ${show(hidden)} is hidden, so the closed drawer cannot slide as a whole`);
     // From the menu button, all the way around the page and back, both ways.
     for (const shiftKey of [false, true]) {
       const keys = shiftKey ? "Shift+Tab" : "Tab";
