@@ -46,7 +46,9 @@
 //   button above the presets backdrop. A click goes to the element the test
 //   names.
 // - The drawer's position and slide. "Open" here means the drawer has its
-//   slid-in class, translate-x-0.
+//   slid-in class, translate-x-0. The #1205 PR's browser proof covers the
+//   slide with the closed drawer inert. Here the closed drawer only has to
+//   stay displayed.
 // - focus and blur events. The fake only tracks document.activeElement.
 
 const test = require("node:test");
@@ -430,6 +432,8 @@ function createPage({ width = 390, defaultFontSize = 16 } = {}) {
     },
     drawerOpen: () => classes(page.drawer()).includes("translate-x-0"),
     drawerStops: () => tabOrder(document).filter((el) => page.drawer().contains(el)),
+    // Every control the drawer renders, whether or not it can take focus.
+    drawerControls: () => page.drawer().querySelectorAll("a[href], button, input, select, textarea, [tabindex]"),
     // The drawer's click-outside overlay: the one click target outside the
     // drawer that opening the drawer added. `closedTargets` is recorded by
     // openPage, while the drawer is closed.
@@ -623,4 +627,46 @@ test("#1198: the drawer's close button is named \"Close sidebar\"", async () => 
 
   await page.click(named[0]);
   assert.equal(page.drawerOpen(), false, "and it is the control that closes the drawer");
+});
+
+test("#1205: below lg, the closed drawer is out of the Tab order and hidden from assistive technology", async () => {
+  assert.equal(createPage().drawerStops().length, 0, "the hydrating render already keeps the closed drawer out of the Tab order");
+  const page = await openPage();
+  assert.equal(page.drawerOpen(), false, "fixture: the drawer starts closed");
+  assert.ok(page.drawerControls().length >= 3 && page.drawerControls().includes(page.button("Close sidebar")),
+    "fixture: the closed drawer still renders its close button and sidebar controls");
+  const dom = descendants(page.document.documentElement);
+  const afterDrawer = (el) => dom.indexOf(el) > dom.indexOf(page.drawer());
+  assert.ok(page.tabOrder().some(afterDrawer) && !page.tabOrder().every(afterDrawer),
+    "fixture: the page has Tab stops before and after the drawer, so a walk passes it");
+
+  const checkClosed = async (when) => {
+    assert.equal(page.drawer().getAttribute("hidden"), null, `${when}: the closed drawer stays displayed, so it can still slide`);
+    // From the menu button, all the way around the page and back, both ways.
+    for (const shiftKey of [false, true]) {
+      const keys = shiftKey ? "Shift+Tab" : "Tab";
+      const order = page.tabOrder(), visited = new Set();
+      page.menuButton().focus();
+      for (let i = 1; i <= order.length + 1; i++) {
+        await page.press("Tab", { shiftKey });
+        if (page.drawer().contains(page.active())) assert.fail(`${when}: ${keys} ${i} from the menu button focused ${show(page.active())} in the closed drawer`);
+        visited.add(page.active());
+      }
+      assert.ok(order.every((el) => visited.has(el)), `${when}: ${keys} reached every Tab stop on the page`);
+      assertSame(page.active(), page.menuButton(), `${when}: ${keys} went around the page and back to the menu button`);
+    }
+    for (const el of page.drawerControls()) {
+      if (exposed(el)) assert.fail(`${when}: ${show(el)} in the closed drawer is exposed to assistive technology`);
+    }
+  };
+
+  await checkClosed("before opening");
+  await page.click(page.menuButton());
+  assert.equal(page.drawerOpen(), true, "fixture: the drawer opened");
+  for (const el of page.drawerControls()) {
+    if (!exposed(el)) assert.fail(`open: ${show(el)} is hidden from assistive technology`);
+  }
+  await page.press("Escape");
+  assert.equal(page.drawerOpen(), false, "fixture: Escape closed the drawer");
+  await checkClosed("after closing");
 });

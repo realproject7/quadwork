@@ -859,8 +859,13 @@ export default function Sidebar() {
       )}
 
       {/* Mobile overlay sidebar — always expanded, slides in from left */}
+      {/* #1205: closed, the translate alone would leave its controls in the
+          Tab order and the accessibility tree. `inert` takes them out and
+          does not change rendering, so the slide still plays both ways.
+          `hidden` (display:none) would cut the slide. */}
       <aside
         ref={mobileAsideRef}
+        inert={!mobileOpen}
         className={`fixed inset-y-0 left-0 z-50 w-52 bg-bg-surface border-r border-border flex flex-col py-3 px-2 items-stretch overflow-y-auto transition-transform duration-200 ease-in-out lg:hidden ${
           mobileOpen ? "translate-x-0" : "-translate-x-full"
         }`}
