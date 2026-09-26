@@ -94,15 +94,21 @@ external storage history. This tool does not validate a manifest freeze, invoke
 a model, or permit Mode 3 timing.
 
 The record schema is closed (#1182). No field accepts free text: each is an
-enum, digest, SHA, number, timestamp, `owner/repo` name, lowercase identifier,
-or one of these fixed forms. `cache_policy` is `fresh_local_session` or
-`record_provider_cache_telemetry`. `model_identity` is a lowercase model id such
-as `openai.gpt-5.6-luna`. `evidence_ref` is generated, never caller text. It is
-`writer/<sha256>` from the ledger writer, or `executor/<reason>/<sha256>` with
-one of the historical calibration executor's fixed reason codes. A
+enum, digest, SHA, number, timestamp, lowercase identifier, or one of these
+fixed forms. `role` is `head`, `dev`, `re1`, or `re2`. `cache_policy` is
+`fresh_local_session` or `record_provider_cache_telemetry`. `model_identity`
+follows the calibration protocol's model-id rule, up to 128 characters, such as
+`openai.gpt-5.6-luna`. `repository` is `owner/repo` within GitHub's limits: an
+owner of up to 39 and a repository name of up to 100 letters, digits, `.`, `_`,
+or `-`. A repository or model identity with a known credential shape at the
+start of a word (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `sk-`,
+`xox?-`, or `AKIA`) is refused. `evidence_ref` is generated, never caller text.
+It is `writer/<sha256>` from the ledger writer, or `executor/<reason>/<sha256>`
+with one of the historical calibration executor's fixed reason codes. A
 `local_validation` record has origin `harness_acceptance` or `local_validation`,
-the product's own validation. Origin is part of the duplicate-event key, and
-only a product `local_validation` record satisfies a successful run.
+the product's own validation. Origin is part of a validation record's
+duplicate-event key, and only a product `local_validation` record satisfies a
+successful run.
 
 `ledger-writer.cjs` is the durable, append-only writer for one run's ledger.
 `createRunLedgerRoot({ parent_dir })` creates a marked `0700` root that holds
@@ -120,8 +126,12 @@ a dead writer's lock and temporary files. Two kill points fail closed instead.
 A kill before the lock holds a PID leaves an empty lock, which is refused as
 possibly live. A kill inside an observation write leaves a partial file, which
 blocks only that identical observation. The committed ledger references neither
-file, and removing it clears the block. The calibration executor persists
-through the same helpers. The writer's tests run with
+file, and removing it clears the block. Two writers that recover the same
+dead writer's lock at once can both proceed. Both report success, but one
+committed append is silently overwritten. The losing writer's next append is
+refused as a stale prefix (`ledger_writer_evidence_prefix`), and the ledger
+stays valid. #1192 tracks these recovery limits. The calibration executor
+persists through the same helpers. The writer's tests run with
 `node --test benchmark/ledger-writer.test.cjs`.
 
 Each observation payload has exactly these fields. Its only strings are fixed
