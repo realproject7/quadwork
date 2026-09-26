@@ -3,6 +3,7 @@
 import dynamic from "next/dynamic";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
+import { decodeUrlComponent } from "@/lib/urlComponent";
 
 const ProjectDashboard = dynamic(() => import("@/components/ProjectDashboard"), { ssr: false });
 
@@ -20,9 +21,10 @@ export default function ProjectPageClient() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => { setMounted(true); }, []);
 
-  // Extract project ID from URL path: /project/<id>
+  // Extract project ID from URL path: /project/<id>. #1209: the path is still
+  // percent-encoded, so decode it to the configured id.
   const segments = pathname.split("/");
-  const id = segments[2] || "";
+  const id = decodeUrlComponent(segments[2] || "");
 
   if (!mounted || !id || id === "_") {
     return null;

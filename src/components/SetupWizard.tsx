@@ -773,7 +773,7 @@ export default function SetupWizard() {
     if (result.ok) {
       setLaunchStatus("done");
       updateStep(currentStep, { status: "done" });
-      setTimeout(() => router.push(`/project/${projectId}`), 1200);
+      setTimeout(() => router.push(`/project/${encodeURIComponent(projectId)}`), 1200);
     } else {
       setLaunchStatus("error");
       updateStep(currentStep, { status: "error", error: v2SetupMessage(result) });

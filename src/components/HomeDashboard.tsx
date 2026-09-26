@@ -219,7 +219,7 @@ export default function HomeDashboard() {
                   : t.v2Unavailable;
               return (
               <div key={project.id} className="border border-border bg-bg-surface hover:bg-[#1a1a1a] transition-colors group min-w-0">
-                <Link href={`/project/${project.id}`} className="block p-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
+                <Link href={`/project/${encodeURIComponent(project.id)}`} className="block p-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
                   <div className="flex items-center justify-between gap-3 mb-3">
                   <div className="flex items-center gap-2 min-w-0">
                     <span

@@ -3,6 +3,7 @@
 import dynamic from "next/dynamic";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
+import { decodeUrlComponent } from "@/lib/urlComponent";
 
 const QueueManager = dynamic(() => import("@/components/QueueManager"), { ssr: false });
 
@@ -15,8 +16,9 @@ export default function QueuePageClient() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => { setMounted(true); }, []);
 
+  // #1209: decode the still-encoded path segment to the configured id.
   const segments = pathname.split("/");
-  const id = segments[2] || "";
+  const id = decodeUrlComponent(segments[2] || "");
 
   if (!mounted || !id || id === "_") {
     return null;
