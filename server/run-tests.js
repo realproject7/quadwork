@@ -34,8 +34,10 @@ const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-test-run-"));
 const GH_BIN = path.join(RUN_DIR, "bin");
 const GH_LOG = path.join(RUN_DIR, "gh-calls.log");
 
-// The real ~/.quadwork by every name this machine gives it, plus whatever a
-// parent runner already guards (a nested runner keeps its parent's guard).
+// The real ~/.quadwork under HOME, the passwd home and their realpaths, plus
+// whatever a parent runner already guards (a nested runner keeps its parent's
+// guard). The guard compares paths as text, so another alias of the home
+// directory is not covered.
 function realQuadworkDirs() {
   const homes = [os.homedir()];
   try { homes.push(os.userInfo().homedir); } catch { /* no passwd entry */ }
@@ -46,10 +48,19 @@ function realQuadworkDirs() {
 }
 const REAL_QUADWORK_DIRS = realQuadworkDirs();
 
+// Tests inherit this environment without gh's token variables, so no test
+// process sees the operator's gh token. Each test also gets a GH_CONFIG_DIR in
+// its throwaway HOME (runOne), which gh reads before XDG_CONFIG_HOME or HOME,
+// so a real gh reached anyway, for example by a shell that runs it by absolute
+// path, reads no gh config. It may still find a token in the OS keychain.
+const TEST_ENV = { ...process.env };
+for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) delete TEST_ENV[key];
+
 // The stand-in gh records the call in the calling file's report (inherited
 // env), so a call from a process that outlives its file is still charged to it.
-// Node callers never reach it: the preload refuses any gh that resolves to it
-// or to a real gh found on this PATH (BLOCKED_GH), at spawn time.
+// A Node spawn of gh itself is refused by the preload at spawn time when it
+// resolves to the stand-in or to a real gh found on this PATH (BLOCKED_GH). A
+// shell (exec, execSync, sh -c) runs the stand-in instead, which records it.
 const BLOCKED_GH = [];
 if (process.platform !== "win32") {
   for (const dir of (process.env.PATH || "").split(path.delimiter)) {
@@ -115,10 +126,11 @@ function runOne(file, index) {
       // The compatibility facade is intentionally available only to these
       // isolated test children, never to normal runtime imports.
       env: {
-        ...process.env,
+        ...TEST_ENV,
         QUADWORK_TEST_RUNTIME: "1",
         HOME: home,
         USERPROFILE: home,
+        GH_CONFIG_DIR: path.join(home, ".config", "gh"),
         ...(process.platform === "win32" ? {} : { PATH: `${GH_BIN}${path.delimiter}${process.env.PATH || ""}` }),
         NODE_OPTIONS: [process.env.NODE_OPTIONS, `--require ${JSON.stringify(GUARD)}`].filter(Boolean).join(" "),
         QUADWORK_TEST_GUARDED_DIRS: JSON.stringify(guardedDirs),

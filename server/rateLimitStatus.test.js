@@ -23,8 +23,10 @@ const RATE_JSON = JSON.stringify({
   graphql: { limit: 5000, remaining: 3999, reset: nowSec + 3600 },
   search: { limit: 30, remaining: 29, reset: nowSec + 60 },
 });
+let controlCalls = 0;
 require("./__tests__/resource-executor-fixture").installResourceExecutorFixture({
   runControlChild: (command, args) => {
+    controlCalls++;
     if (command === "gh" && Array.isArray(args) && args.includes("rate_limit")) {
       return ghFails
         ? Promise.reject(new Error("gh: not logged in (test fixture)"))
@@ -115,6 +117,9 @@ const pass = (message) => { passed++; console.log(`  PASS: ${message}`); };
 (async () => {
   // #1188: routes does not poll at load in the test runtime, so the first
   // lookup runs here, with the failing fixture.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(controlCalls, 0, "loading routes in the test runtime runs no control child");
+  pass("loading routes in the test runtime runs no control child");
   await routes.refreshRateLimit();
 
   let body = await getRateLimit();
@@ -208,7 +213,7 @@ const pass = (message) => { passed++; console.log(`  PASS: ${message}`); };
   assert.equal(normalImport.status, 0, normalImport.stderr);
   const loadCalls = JSON.parse(normalImport.stdout.trim().split("\n").pop());
   assert.ok(loadCalls.some((call) => call.startsWith("gh api rate_limit")), JSON.stringify(loadCalls));
-  pass("a normal import refreshes the rate limit at load; the test runtime does not");
+  pass("a normal import refreshes the rate limit at load");
 
   console.log(`\n${passed} passed, 0 failed\n`);
   process.exit(0);
