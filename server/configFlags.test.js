@@ -187,6 +187,7 @@ const PATCH = (server, id, flags) => req(server, { method: "PATCH", urlPath: `/a
     } });
     const activeLv = readCfg().projects.find((project) => project.id === "lv");
     ok(activeLv.name === "Renamed" && activeLv.agents.head.command === "codex", "PATCH merges owned per-project fields (name, agents)");
+    ok(activeLv.idle === true && activeLv.telegram_auto === true, "PATCH preserves the field-scoped flags from disk on an active project (no clobber)");
 
     // PATCH must never touch the field-scoped-owned top-level keys.
     writeCfg({ ...readCfg(), pinned_projects: ["lv"] });
