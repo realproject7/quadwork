@@ -204,7 +204,7 @@ async function races(parent) {
 }
 
 // SIGKILL cannot reveal a missing fsync, so this pins the order of the calls instead.
-test('an observation, reused or new, is fsynced with its directory before the ledger rename that references it (#1192)', () => withParent(parent => {
+test('an observation, reused or new, and its directory are fsynced before the ledger rename, the ledger before it, and the root after it (#1192)', () => withParent(parent => {
   for (const reused of [true, false]) {
     const root = createRunLedgerRoot({ parent_dir: parent }), prior = appendRunEvent(root, empty(), record('run_started'), observation());
     const bytes = Buffer.from(JSON.stringify(validateObservation(full())) + '\n'), directory = path.join(root, EVIDENCE_OBSERVATIONS), target = path.join(directory, `${sha256(bytes)}.json`);
@@ -212,15 +212,29 @@ test('an observation, reused or new, is fsynced with its directory before the le
     if (reused) fs.writeFileSync(target, bytes, { mode: 0o600 });
     const calls = [], opened = new Map(), { openSync, fsyncSync, renameSync } = fs;
     fs.openSync = (...args) => { const fd = openSync(...args); opened.set(fd, args[0]); return fd; };
-    fs.fsyncSync = fd => { calls.push(['fsync', opened.get(fd)]); return fsyncSync(fd); };
-    fs.renameSync = (from, to) => { calls.push(['rename', to]); return renameSync(from, to); };
+    fs.fsyncSync = fd => { calls.push({ kind: 'fsync', target: opened.get(fd) }); return fsyncSync(fd); };
+    fs.renameSync = (from, to) => { calls.push({ kind: 'rename', from, target: to }); return renameSync(from, to); };
     try { assert.equal(appendRunEvent(root, prior, record('task_ready', { task_id: 'a1' }), full()).records.length, 2); } finally { Object.assign(fs, { openSync, fsyncSync, renameSync }); }
-    const at = (kind, name) => calls.findIndex(call => call[0] === kind && call[1] === name), commit = at('rename', path.join(root, EVIDENCE_LEDGER));
-    assert.ok(commit > 0, JSON.stringify(calls));
-    for (const name of [target, directory]) assert.ok(at('fsync', name) >= 0 && at('fsync', name) < commit, `${reused ? 'reused' : 'new'} ${name}`);
-    assert.equal(at('rename', target) === -1, reused);
+    // The first matching call after index `after`, or -1.
+    const find = (kind, name, after = -1) => calls.findIndex((call, index) => index > after && call.kind === kind && call.target === name);
+    const commit = find('rename', path.join(root, EVIDENCE_LEDGER)), landed = find('rename', target), label = reused ? 'reused' : 'new';
+    assert.ok(commit > 0, JSON.stringify(calls)); assert.equal(landed === -1, reused);
+    // Both come after a new observation's rename into place, so its directory entry is durable too.
+    for (const name of [target, directory]) { const synced = find('fsync', name, landed); assert.ok(synced > landed && synced < commit, `${label} ${name}`); }
+    const staged = find('fsync', calls[commit].from);
+    assert.ok(staged >= 0 && staged < commit, `${label}: the ledger is fsynced under its temporary name before its rename`);
+    assert.ok(find('fsync', root, commit) > commit, `${label}: the root is fsynced after the ledger rename`);
     assert.equal(committed(root).records.length, 2);
   }
+}));
+
+// PID 1 belongs to root, so probing it fails with EPERM, which still means the process exists.
+test('a registration naming a live PID of another user is treated as live and kept (#1192)', () => withParent(parent => {
+  if (process.getuid?.() !== 0) assert.throws(() => process.kill(1, 0), error => error?.code === 'EPERM');
+  const root = createRunLedgerRoot({ parent_dir: parent }), lock = path.join(root, EVIDENCE_LOCK), entry = `1-${crypto.randomBytes(16).toString('hex')}`;
+  fs.mkdirSync(lock, { mode: 0o700 }); fs.writeFileSync(path.join(lock, entry), '', { mode: 0o600 });
+  refused(() => appendRunEvent(root, empty(), record('run_started'), observation()), 'ledger_writer_evidence_lock');
+  assert.deepEqual(fs.readdirSync(lock), [entry]); assert.equal(fs.existsSync(path.join(root, EVIDENCE_LEDGER)), false);
 }));
 
 test('a stale or rewritten prefix is refused and the committed ledger is left unchanged', () => withParent(parent => {

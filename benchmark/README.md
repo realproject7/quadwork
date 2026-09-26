@@ -165,9 +165,15 @@ least one sees the other and refuses. An entry is removed only by its exact
 name: by its own writer, or by any writer once its PID is dead. The directory is
 removed only while empty. So no writer can remove a live writer's entry. An
 empty directory is simply reused, even when a live writer has just created it
-and not yet added its entry. Liveness is a PID check, so all writers must run on
-one host. Anything else at the lock path, such as a lock file from before #1192,
-is refused and kept.
+and not yet added its entry.
+
+Liveness is a PID check, so all writers must share one PID namespace. A writer
+in another PID namespace, such as a container that shares the root through a
+bind mount, can see a live writer's PID as dead and remove its entry. An entry
+whose PID has been reused by another process counts as live, so it blocks
+writers until that process exits. Anything else at the lock path is refused and
+kept. This includes a lock file from before #1192. Delete that file by hand once
+no pre-#1192 writer is running.
 
 A writer killed at any point leaves the last committed ledger valid, and every
 observation it references complete. It can leave an empty lock directory, its
