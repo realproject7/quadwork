@@ -9,9 +9,12 @@ const { spawn } = require("node:child_process");
 const worker = require.resolve("./resource-staging-worker");
 async function scenario(mode) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "qw-arm-unit-")), metricsFile = path.join(root, "metrics.json"), preload = path.join(root, "fixture.cjs");
+  // Counters are rewritten in place: one descriptor, one fixed-size record.
+  // Re-creating the file on every update is slow while the host is flushing
+  // its disk, and those saves added up past the 10 s bound (#1180).
   fs.writeFileSync(preload, `const Module=require("node:module"), fs=require("node:fs"), original=Module._load;
 const metrics={reservations:0,opens:0,calls:0,bytes:0,full:0,closed:false,verifications:0}; let zero;
-const save=()=>fs.writeFileSync(${JSON.stringify(metricsFile)},JSON.stringify(metrics)); save();
+const metricsFd=fs.openSync(${JSON.stringify(metricsFile)},"w+"), save=()=>fs.writeSync(metricsFd,JSON.stringify(metrics).padEnd(256),0); save();
 const allocate=Buffer.allocUnsafe; Buffer.allocUnsafe=function(size){const buffer=allocate(size);if(size===8388608){metrics.reservations++;save();}return buffer;};
 const wrapper={...fs,openSync(file,...args){const fd=fs.openSync(file,...args);if(file==="/dev/zero"){zero=fd;metrics.opens++;save();}return fd;},closeSync(fd){if(fd===zero){metrics.closed=true;save();}return fs.closeSync(fd);},readdirSync(file,...args){if(file==="/proc/self/task"&&process.platform!=="linux")return Array.from({length:23},(_,i)=>String(process.pid+i));return fs.readdirSync(file,...args);},read(fd,buffer,offset,length,position,callback){metrics.calls++;metrics.bytes+=length;save();const call=metrics.calls;return fs.read(fd,buffer,offset,length,position,(error,bytes,b)=>{if(!error&&bytes===length&&buffer[0]===0&&buffer[length-1]===0)metrics.full++;if(call===1&&${JSON.stringify(mode)}==="short")bytes--;if(call===1&&${JSON.stringify(mode)}==="error")error=new Error("controlled read failure");save();callback(error,bytes,b);});}};
 Module._load=function(request,parent,main){if(parent?.filename===${JSON.stringify(worker)}){if(request==="fs")return wrapper;if(request==="./resource-linux-facts")return {readProcess:()=>({cgroup:"/unit-fixture"}),verifyWorkerGroup(){metrics.verifications++;save();if((${JSON.stringify(mode)}==="arm-limit"&&metrics.verifications===1)||(${JSON.stringify(mode)}==="release-limit"&&metrics.verifications===2))throw new Error("actual cap unavailable fixture");}};if(request==="child_process")return {spawn(){return {pid:42,on(){},kill(){}};}};}return original.call(this,request,parent,main);};
