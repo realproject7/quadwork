@@ -12,11 +12,30 @@ const MAX_BYTES = 512 * 1024;
 const SHA = /^[a-f0-9]{40}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9_-]{0,63}$/;
-const REPOSITORY = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-const EVIDENCE_REF = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,511}$/;
+// GitHub's limits: an owner of up to 39 and a repository of up to 100 characters.
+const REPOSITORY = /^[A-Za-z0-9._-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
+// Credential shapes, each a token prefix plus its characteristic body, matched
+// anywhere in a repository or model identity value: GitHub classic and
+// fine-grained, OpenAI legacy and project/service-account/admin, Anthropic,
+// Stripe, Slack, AWS, npm, GitLab, Hugging Face, and Google keys. Bodies that
+// could otherwise be lowercase words need a capital, digit, or `_`, and the
+// Slack body starts with its numeric ID, so a lowercase hyphenated
+// words-only name never matches.
+const CREDENTIAL = /gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|sk-(?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]{32,}|sk-(?:proj|svcacct|admin)-(?=[A-Za-z0-9_-]*[A-Z0-9_])[A-Za-z0-9_-]{40,}|sk-ant-(?:api|admin)\d\d-[A-Za-z0-9_-]{40,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|xox[abposr]-\d{6,}-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|npm_[A-Za-z0-9]{36}|glpat-(?=[A-Za-z0-9_-]{0,19}[A-Z0-9_])[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{30,}|AIza[0-9A-Za-z_-]{35}/;
+// #1182 closed text fields. Evidence refs are generated, never caller text:
+// ledger-writer.cjs writes `writer/<sha256>`, and historical calibration
+// executor records use `executor/<reason>/<sha256>` with its reachable reasons.
+const EXECUTOR_REASONS = ['preflight', 'provider_execution_not_permitted', 'mode_1_zero_actions_feasibility_unproved', 'cap_overflow', 'environment_observation_drift', 'environment_observation_unavailable', 'calibration_executor_environment_unavailable', 'calibration_executor_environment_observation'];
+const EVIDENCE_REF = new RegExp(`^(?:writer|executor/(?:${EXECUTOR_REASONS.join('|')}))/[a-f0-9]{64}$`);
+// calibration-protocol.cjs's model-id rule (its TEXT pattern), bounded to 128 characters.
+const MODEL_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}$/;
+const ROLES = new Set(['head', 'dev', 're1', 're2']);
+const CACHE_POLICIES = new Set(['fresh_local_session', 'record_provider_cache_telemetry']);
 const PROVENANCE = new Set(['live', 'replay', 'historical']);
 const CLASSES = new Set(['pipeline_eligible', 'dependency_overlap_bound', 'safety_recovery']);
 const ORIGINS = new Set(['harness', 'provider', 'local_validation', 'github_authenticated_rest']);
+// A validation record is harness acceptance or the product's own local validation.
+const VALIDATION_ORIGINS = new Set(['harness_acceptance', 'local_validation']);
 const EVENTS = new Set([
   'run_started', 'task_ready', 'assignment', 'candidate_ready', 'review_started',
   'review_sealed', 'review_released', 'correction', 'local_validation',
@@ -47,7 +66,6 @@ function timestamp(value) {
   requireEvidence(typeof value === 'string' && value.length === 24 && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value, 'evidence_timestamp');
   return value;
 }
-function text(value, max, code) { requireEvidence(typeof value === 'string' && value.length > 0 && value.length <= max && !/[\u0000-\u001f]/.test(value), code); return value; }
 function matches(value, pattern) { return typeof value === 'string' && pattern.test(value); }
 function runAnchor(value) {
   exact(value, ['harness_sha', 'source_sha', 'workload_sha'], 'evidence_run_anchor');
@@ -56,7 +74,7 @@ function runAnchor(value) {
 }
 function deliveryIdentity(value, event) {
   exact(value, ['base_sha', 'candidate_sha', 'repository'], 'evidence_delivery_identity');
-  requireEvidence(matches(value.repository, REPOSITORY), 'evidence_delivery_identity');
+  requireEvidence(matches(value.repository, REPOSITORY) && !CREDENTIAL.test(value.repository), 'evidence_delivery_identity');
   requireEvidence(matches(value.base_sha, SHA), 'evidence_delivery_identity');
   const beforeCandidate = new Set(['run_started', 'task_ready', 'assignment']);
   const candidateOptional = new Set(['recovery', 'run_failed', 'run_interrupted']);
@@ -72,12 +90,12 @@ function record(value, ledgerProvenance) {
   requireEvidence(Number.isSafeInteger(value.repetition) && value.repetition >= 1 && value.repetition <= 64, 'evidence_repetition');
   requireEvidence(EVENTS.has(value.event), 'evidence_event');
   requireEvidence(PROVENANCE.has(value.provenance) && value.provenance === ledgerProvenance, 'evidence_provenance_mixed');
-  requireEvidence(ORIGINS.has(value.origin), 'evidence_origin'); requireEvidence(matches(value.role, ID), 'evidence_role');
-  requireEvidence(matches(value.model_identity, /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/), 'evidence_model_identity');
+  requireEvidence((value.event === 'local_validation' ? VALIDATION_ORIGINS : ORIGINS).has(value.origin), 'evidence_origin'); requireEvidence(ROLES.has(value.role), 'evidence_role');
+  requireEvidence(matches(value.model_identity, MODEL_IDENTITY) && !CREDENTIAL.test(value.model_identity), 'evidence_model_identity');
   requireEvidence(matches(value.task_id, ID), 'evidence_task_id'); requireEvidence(matches(value.attempt_id, ID), 'evidence_attempt_id');
   requireEvidence(Number.isSafeInteger(value.role_generation) && value.role_generation >= 1 && value.role_generation <= 64, 'evidence_role_generation');
   requireEvidence(value.prior_record_digest === null || matches(value.prior_record_digest, DIGEST), 'evidence_prior_digest');
-  text(value.cache_policy, 128, 'evidence_cache_policy');
+  requireEvidence(CACHE_POLICIES.has(value.cache_policy), 'evidence_cache_policy');
   requireEvidence(Number.isSafeInteger(value.monotonic_ms) && value.monotonic_ms >= 0, 'evidence_monotonic_ms'); timestamp(value.observed_at);
   requireEvidence(typeof value.evidence_ref === 'string' && EVIDENCE_REF.test(value.evidence_ref), 'evidence_ref');
   return Object.freeze({ ...value, run_anchor: runAnchor(value.run_anchor), delivery_identity: deliveryIdentity(value.delivery_identity, value.event) });
@@ -99,9 +117,10 @@ function validateLedger(value) {
     requireEvidence(!run.terminal, 'evidence_after_terminal');
     requireEvidence(sameAnchor(run.run_anchor, item.run_anchor) && run.mode === item.mode && run.workload_class === item.workload_class && run.repetition === item.repetition, 'evidence_run_identity_changed');
     requireEvidence(item.monotonic_ms >= run.monotonic_ms, 'evidence_monotonic_regression'); requireEvidence(item.observed_at >= run.observed_at, 'evidence_timestamp_regression');
-    const eventTask = `${item.event}:${item.task_id}:${item.role}:${item.role_generation}:${item.attempt_id}:${item.delivery_identity.repository}:${item.delivery_identity.candidate_sha ?? 'none'}`;
+    const eventTask = `${item.event}:${item.task_id}:${item.role}:${item.role_generation}:${item.attempt_id}:${item.delivery_identity.repository}:${item.delivery_identity.candidate_sha ?? 'none'}${item.event === 'local_validation' ? `:${item.origin}` : ''}`;
     requireEvidence(!run.event_tasks.has(eventTask) || item.event === 'recovery', 'evidence_duplicate_event');
-    run.monotonic_ms = item.monotonic_ms; run.observed_at = item.observed_at; run.events.add(item.event); run.event_tasks.add(eventTask); if (TERMINAL.has(item.event)) run.terminal = item.event; previousRecord = item;
+    // Harness acceptance never satisfies the product's own validation requirement.
+    run.monotonic_ms = item.monotonic_ms; run.observed_at = item.observed_at; if (item.event !== 'local_validation' || item.origin === 'local_validation') run.events.add(item.event); run.event_tasks.add(eventTask); if (TERMINAL.has(item.event)) run.terminal = item.event; previousRecord = item;
   }
   return Object.freeze({ ledger: normalized, runs });
 }
@@ -132,5 +151,5 @@ function main(argv) {
   try { requireEvidence(argv.length === 2 && argv[0] === '--ledger' && typeof argv[1] === 'string' && argv[1].length > 0 && argv[1].length <= 4096 && !argv[1].startsWith('-') && !argv[1].includes('\0'), 'usage_expected_ledger'); process.stdout.write(JSON.stringify(summarizeLedger(loadLedger(argv[1]))) + '\n'); return 0; }
   catch (error) { process.stdout.write(JSON.stringify({ report_version: 1, purpose: 'offline_evidence_validation', error: error instanceof EvidenceError ? error.message : 'evidence_validation_failed' }) + '\n'); return 1; }
 }
-module.exports = { EvidenceError, digest, validateLedger, summarizeLedger, appendRecord, loadLedger, MAX_BYTES };
+module.exports = { EvidenceError, digest, validateLedger, summarizeLedger, appendRecord, loadLedger, MAX_BYTES, EVENTS: Object.freeze([...EVENTS]) };
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
