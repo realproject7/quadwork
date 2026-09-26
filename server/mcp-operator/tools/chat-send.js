@@ -25,8 +25,8 @@ module.exports = {
   handlers: {
     send_message: async (params, ctx) => {
       const { project, text } = params;
-      // Validate first — an unknown id would otherwise create a stray
-      // ~/.quadwork/<id>/chat/ file via appendMessage.
+      // Validate first, so an unknown id fails with the list_projects hint
+      // and no request is sent.
       await ctx.assertKnownProject(project);
       // Deliberately send NO X-Chat-Sender / X-Bridge-Sender header, so
       // /api/chat records the message as sender "user" (the operator).

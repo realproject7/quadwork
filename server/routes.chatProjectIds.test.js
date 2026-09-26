@@ -5,12 +5,12 @@
 //
 // Pinned here:
 //   - a chat read never creates files or directories;
-//   - every chat route (GET/POST /api/chat, the history export and import, and
-//     snapshot restore) accepts only a configured project's id (archived
-//     included, removed not) that names one direct directory under
-//     ~/.quadwork. A configured id may fail the project-id rule
-//     (assertProjectId), since CLI setup names a project after its folder. An
-//     id that is not configured gets 404 if it passes the rule, else 400.
+//   - every chat route in CHAT_ROUTES accepts only a configured project's id,
+//     matched exactly (archived included, removed not), that names one direct
+//     directory under ~/.quadwork. A configured id may fail the project-id
+//     rule (assertProjectId), since CLI setup names a project after its
+//     folder. An id that is not configured gets 404 if it passes the rule,
+//     else 400. A config.json that is missing or cannot be parsed gets 503.
 // Every refused request asserts its status and that nothing under the test's
 // temporary root changed. The root holds HOME, so an id that climbs out of
 // ~/.quadwork or out of HOME still lands where the snapshot sees it.
@@ -47,24 +47,32 @@ const PROJECTS = [
   { id: "My Project", chat_mode: "file" },
 ];
 const LEGACY_IDS = [".dotfiles", "My Project"];
-// Removed in before(): they leave config, as Settings > Remove does, and
-// "gone" also loses its folder (the #1203 report).
-const REMOVED = [{ id: "gone", chat_mode: "file" }, { id: "kept", chat_mode: "file" }];
 
 // The restore route re-posts to 127.0.0.1:<config.port>, 8400 when unset. The
 // port is 1 (nothing listens) until this test's server does, then its port.
+// "gone" and "kept" are configured until removeProject() removes them.
 let configPort = 1;
+let configured = [...PROJECTS, { id: "gone", chat_mode: "file" }, { id: "kept", chat_mode: "file" }];
 let tombstones = {};
-function writeConfig(projects) {
+function writeConfig(projects = configured) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify({
     port: configPort, projects, project_admission_generations: tombstones,
   }), { mode: 0o600 });
 }
-writeConfig([...PROJECTS, ...REMOVED]);
+writeConfig();
 
 const fileChat = require("./file-chat");
 const router = require("./routes");
 const express = require("express");
+
+// Settings > Remove as the lifecycle leaves it: chat stopped, no config entry,
+// an admission tombstone.
+function removeProject(id) {
+  fileChat.shutdownProject(id);
+  configured = configured.filter((project) => project.id !== id);
+  tombstones = { ...tombstones, [id]: 2 };
+  writeConfig();
+}
 
 let server;
 
@@ -94,13 +102,14 @@ function request(method, urlPath, body) {
   });
 }
 
-// Every path under ROOT with its type, size and mtime: a file or directory
-// created, changed or removed anywhere under the root shows up in changes().
+// Every path under ROOT with its type, size, mode and mtime: a file or
+// directory created, changed (even by chmod alone) or removed anywhere under
+// the root shows up in changes().
 function snapshot(dir = ROOT, out = new Map()) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
     const stat = fs.lstatSync(full);
-    out.set(path.relative(ROOT, full), `${entry.isDirectory() ? "dir" : "file"}:${stat.size}:${stat.mtimeMs}`);
+    out.set(path.relative(ROOT, full), `${entry.isDirectory() ? "dir" : "file"}:${stat.size}:${stat.mode.toString(8)}:${stat.mtimeMs}`);
     if (entry.isDirectory()) snapshot(full, out);
   }
   return out;
@@ -152,7 +161,7 @@ before(async () => {
   server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
   configPort = server.address().port;
-  writeConfig([...PROJECTS, ...REMOVED]);
+  writeConfig();
 
   // alpha and the legacy ids have history and a snapshot; beta is running with
   // no message yet (its chat folder exists, general.jsonl does not); arch never
@@ -168,12 +177,9 @@ before(async () => {
     }));
   }
 
-  // Remove "gone" and "kept" the way the lifecycle leaves them: chat stopped,
-  // no config entry, an admission tombstone. The operator deleted gone's folder.
-  fileChat.shutdownProject("gone");
-  fileChat.shutdownProject("kept");
-  tombstones = { gone: 2, kept: 2 };
-  writeConfig(PROJECTS);
+  // The #1203 report: "gone" was removed and the operator deleted its folder
+  // before a dashboard tab polled it again.
+  removeProject("gone");
   fs.rmSync(path.join(CONFIG_DIR, "gone"), { recursive: true, force: true });
 });
 
@@ -210,9 +216,24 @@ test("an unknown project id gets 404 on every chat route and touches nothing", a
 });
 
 test("a removed project's id gets 404 on every chat route and touches nothing", async () => {
+  // kept is served while it is configured and removed only now, so a project
+  // list read once and kept cannot hide the removal.
+  const served = await request("GET", "/api/chat?project=kept");
+  assert.equal(served.status, 200, "GET /api/chat kept while configured");
+  assert.ok(served.json.some((m) => m.text === "hello from kept"), "kept's history is served while configured");
+  removeProject("kept");
+
   await assertRefused(CHAT_ROUTES.flatMap((route) => [
     { route, query: "project=gone", status: 404, code: "unknown_project", label: "removed id, folder deleted" },
     { route, query: "project=kept", status: 404, code: "unknown_project", label: "removed id, folder kept" },
+  ]));
+});
+
+test("a configured id matches exactly, so another case of it is not configured", async () => {
+  await assertRefused(CHAT_ROUTES.flatMap((route) => [
+    { route, query: "project=ALPHA", status: 404, code: "unknown_project", label: "ALPHA (alpha is configured)" },
+    // Not configured and, with its space, not a plain project id either.
+    { route, query: "project=my%20project", status: 400, code: "invalid_project_id", label: "my project (My Project is configured)" },
   ]));
 });
 
@@ -247,7 +268,7 @@ test("an id that is not configured and not a plain project id gets 400 on every 
       { route, query: "project=", status: 400, label: "empty id" },
       { route, query: "", status: 400, label: "no id" },
     ]),
-    // The POST routes also take the id from the body.
+    // POST /api/chat and the import also take the id from the body.
     { route: CHAT_ROUTES[1], query: "", status: 400, code: "invalid_project_id", label: "body id ../x", body: { project: "../x", text: "hello" } },
     {
       route: CHAT_ROUTES[3], query: "", status: 400, code: "invalid_project_id", label: "body id ../x",
@@ -281,10 +302,11 @@ test("a configured id that fails the project-id rule still reads and writes chat
 
 test("a configured id that is not one direct directory under ~/.quadwork gets 400 on every chat route and touches nothing", async () => {
   // A hand-edited config can hold such ids, and so can the legacy add-config
-  // setup step, which stores its id unchecked. Startup starts chat for every
-  // configured project, so "../edited" has a chat folder outside ~/.quadwork.
+  // setup step, which stores its id unchecked. Startup would start chat for
+  // "../edited" (unarchived, file chat), so it has a chat folder outside
+  // ~/.quadwork.
   const EDITED = [".", "..", "../edited", "edited/sub", "edited\u0000nul"];
-  writeConfig([...PROJECTS, ...[...EDITED, ""].map((id) => ({ id, chat_mode: "file" }))]);
+  writeConfig([...configured, ...[...EDITED, ""].map((id) => ({ id, chat_mode: "file" }))]);
   fileChat.initProject("../edited");
   try {
     await assertRefused([
@@ -297,7 +319,30 @@ test("a configured id that is not one direct directory under ~/.quadwork gets 40
     ]);
   } finally {
     fileChat.shutdownProject("../edited");
-    writeConfig(PROJECTS);
+    writeConfig();
+  }
+});
+
+// A configured id and a legacy one, on every chat route.
+const BROKEN_CONFIG_CASES = CHAT_ROUTES.flatMap((route) => ["alpha", "My Project"].map((id) => ({
+  route, query: `project=${encodeURIComponent(id)}`, status: 503, code: "project_config_unavailable", label: id,
+})));
+
+test("a config.json that cannot be parsed gets 503 on every chat route and touches nothing", async () => {
+  fs.writeFileSync(CONFIG_PATH, "{ not json", { mode: 0o600 });
+  try {
+    await assertRefused(BROKEN_CONFIG_CASES);
+  } finally {
+    writeConfig();
+  }
+});
+
+test("a missing config.json gets 503 on every chat route and is not created", async () => {
+  fs.rmSync(CONFIG_PATH);
+  try {
+    await assertRefused(BROKEN_CONFIG_CASES);
+  } finally {
+    writeConfig();
   }
 });
 

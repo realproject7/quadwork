@@ -1931,15 +1931,20 @@ function emitSystemMessage(projectId, text) {
   }
 }
 
-// #1203: chat routes build ~/.quadwork/<id> paths from the request's id. They
-// accept only a configured project's id (archived included, removed not), and
-// it must name one direct directory there: not "." or "..", no path separator,
-// no NUL. It may fail the project-id rule, since CLI setup names a project
-// after its folder. An id that is not configured gets 404 if it passes that
-// rule and 400 if not. Every refusal comes before anything touches the disk.
+// #1203: chat routes build ~/.quadwork/<id> paths from the request's id, so
+// they accept only a configured project's id (archived included, removed not)
+// that names one direct directory there: not empty, not "." or "..", no path
+// separator, no NUL. It may fail the project-id rule, since CLI setup names a
+// project after its folder. An unconfigured id gets 404 if it passes the rule,
+// else 400. A config.json that cannot be read or parsed, or is missing, gets
+// 503 with the admission check's code and is not created. Each refusal comes
+// before any write.
 function assertChatProject(projectId) {
-  const configured = typeof projectId === "string" &&
-    (readConfigFile().projects || []).some((project) => project?.id === projectId);
+  let config;
+  try { config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
+  catch { throw new ProjectLifecycleError("project_config_unavailable", projectId, "project configuration is unavailable", 503); }
+  const configured = typeof projectId === "string" && Array.isArray(config?.projects) &&
+    config.projects.some((project) => project?.id === projectId);
   if (!configured) {
     try { assertProjectId(projectId); }
     catch { throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400); }
