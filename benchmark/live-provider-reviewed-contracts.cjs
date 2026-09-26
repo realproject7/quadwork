@@ -1,5 +1,5 @@
 'use strict';
 module.exports = Object.freeze({
-  codex: Object.freeze({ adapter: 'codex', executable_path: '/opt/homebrew/bin/codex', resolved_path: '/opt/homebrew/Caskroom/codex/0.153.1/bin/codex', executable_digest: '62709f1e3beddf61abdc16fc6e702e7fc90ad2aed26e33e6d319ab4a5a090c7a', version_digest: 'd11fe443fb44b5a2250aad94b2ec3971cf2ab34e65ecc9895017ff03160add90' }),
-  claude: Object.freeze({ adapter: 'claude', executable_path: '/Users/cho/.local/bin/claude', resolved_path: '/Users/cho/.local/share/claude/versions/2.1.277', executable_digest: '73d6a2a55c46907e49bd8bb7608e134333bd71173351ee16ddce7d7db9914b9c', version_digest: '57acde8af4b70a838ef099b3d1215ce7261164a836b69a79738cc73675a0ded1' }),
+  codex: Object.freeze({ adapter: 'codex', executable_path: '/opt/homebrew/bin/codex', resolved_path: '/opt/homebrew/Caskroom/codex/0.157.1/bin/codex', executable_digest: '27ceb5f9b957b43a519efe4eaa3816a0bffb0a531a2c89af18840c0a3c016a7d', version_digest: 'a2af91afbeed67d4d94d7ae88f4f7864866bb5923ab435c0955d779a3e8161f1' }),
+  claude: Object.freeze({ adapter: 'claude', executable_path: '/Users/cho/.local/bin/claude', resolved_path: '/Users/cho/.local/share/claude/versions/2.1.283', executable_digest: 'd8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e', version_digest: 'b211344c57abae865f3f5b379f1f813d5102cde273c025c18b42c84bbeb899ea' }),
 });

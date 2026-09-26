@@ -109,12 +109,19 @@ function caps(runtime) {
   for (const key of Object.keys(CAPS)) required(Number.isSafeInteger(selected[key]) && selected[key] > 0 && selected[key] <= CAPS[key], 'live_caps');
   return Object.freeze({ ...selected });
 }
+// #1181: a pin mismatch names the pinned and found versions. Both come from
+// path segments, never from running the found binary. Only a bounded
+// version-shaped segment is reported, never an absolute or home path.
+const VERSION_SEGMENT = /^\d{1,6}(?:\.\d{1,6}){1,3}(?:[-+][0-9A-Za-z.]{1,32})?$/;
+const pathVersion = filename => (typeof filename === 'string' && filename.split(path.sep).reverse().find(segment => VERSION_SEGMENT.test(segment))) || 'unrecognized';
+const pinMismatch = (code, contract, resolved) => new LiveCompatibilityError(`${code}: pinned ${pathVersion(contract.resolved_path)}, found ${pathVersion(resolved)}`);
 function executable(contract, filename) {
   required(typeof filename === 'string' && path.isAbsolute(filename) && SAFE_TEXT(filename), 'live_executable');
   let source, resolved, target; try { source = fs.lstatSync(filename); resolved = fs.realpathSync(filename); target = fs.statSync(resolved); } catch { throw new LiveCompatibilityError('live_executable'); }
-  required((source.isFile() || source.isSymbolicLink()) && target.isFile() && (target.mode & 0o111) !== 0 && filename === contract.executable_path && resolved === contract.resolved_path, 'live_executable');
+  required((source.isFile() || source.isSymbolicLink()) && target.isFile() && (target.mode & 0o111) !== 0 && filename === contract.executable_path, 'live_executable');
+  if (resolved !== contract.resolved_path) throw pinMismatch('live_executable_stale_pin', contract, resolved);
   executableSize(target.size); const bytes = fs.readFileSync(resolved); required(bytes.length === target.size, 'live_executable');
-  required(digest(bytes) === contract.executable_digest, 'live_executable_not_reviewed');
+  if (digest(bytes) !== contract.executable_digest) throw pinMismatch('live_executable_not_reviewed', contract, resolved);
   return Object.freeze({ path: resolved, digest: contract.executable_digest });
 }
 function executableSize(size) { required(Number.isSafeInteger(size) && size > 0 && size <= MAX_EXECUTABLE_BYTES, 'live_executable'); return size; }
@@ -212,4 +219,4 @@ async function runInstalledCompatibility(value, runtime) {
   } finally { if (root) cleanupCodexFinalMessage(root); releaseReservation(reservation); }
 }
 
-module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, cleanupCodexFinalMessage, consumeCodexFinalMessage, createCodexFinalMessage, executable, executableSize, profile, terminalReport, versionMatches }) });
+module.exports = Object.freeze({ ADAPTERS, CAPS, EVIDENCE_MARKER, LiveCompatibilityError, ROOT_MARKER, createDisposableLiveCompatibilityEvidenceRoot, createDisposableLiveCompatibilityRoot, reserveTerminal, runInstalledCompatibility, sanitizedEnvironment, testHooks: Object.freeze({ captureChild, cleanupCodexFinalMessage, consumeCodexFinalMessage, createCodexFinalMessage, executable, executableSize, pathVersion, profile, terminalReport, versionMatches }) });
