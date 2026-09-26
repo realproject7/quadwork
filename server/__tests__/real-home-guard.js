@@ -2,18 +2,20 @@
 
 // #1188: test-only preload. server/run-tests.js loads it with NODE_OPTIONS
 // --require into every test process, so every Node child that inherits the
-// environment loads it too. Any fs call, process.chdir, or child_process cwd or
-// argument that names a directory in QUADWORK_TEST_GUARDED_DIRS is refused with
-// EACCES before it reaches the file system, and so is spawning a gh listed in
-// QUADWORK_TEST_BLOCKED_GH. Each refusal is recorded in
-// QUADWORK_TEST_GUARD_REPORT so the runner fails the file even when the test
-// swallows the error. The check is on the path the process asks for, so an
-// absent directory stays absent, and it only sees this process's own calls:
-// a live QuadWork server writing the same directory can never trip it.
+// environment loads it too. An fs call, process.chdir, or child_process cwd or
+// argument whose path (a string, Buffer or file: URL) names a directory in
+// QUADWORK_TEST_GUARDED_DIRS is refused with EACCES before it reaches the file
+// system, and so is spawning a gh listed in QUADWORK_TEST_BLOCKED_GH. Each
+// refusal is recorded in QUADWORK_TEST_GUARD_REPORT so the runner fails the
+// file even when the test swallows the error. The check is on the path text the
+// process asks for, not a resolved symlink, so an absent directory stays absent,
+// and it only sees this process's own calls: a live QuadWork server writing the
+// same directory can never trip it.
 
 const fs = require("fs");
 const path = require("path");
 const { fileURLToPath } = require("url");
+const { promisify } = require("util");
 
 const INSTALLED = Symbol.for("quadwork.realHomeGuard");
 
@@ -53,13 +55,18 @@ function install(dirs) {
   function replace(owner, name, check) {
     const original = owner[name];
     if (typeof original !== "function") return;
-    const wrapped = function (...args) {
+    const guard = (fn) => function (...args) {
       const result = check(args);
-      return result === undefined ? original.apply(this, args) : result();
+      return result === undefined ? fn.apply(this, args) : result();
     };
+    const wrapped = guard(original);
     for (const key of Reflect.ownKeys(original)) {
-      if (key !== "prototype") Object.defineProperty(wrapped, key, Object.getOwnPropertyDescriptor(original, key));
+      if (key !== "prototype" && key !== promisify.custom) Object.defineProperty(wrapped, key, Object.getOwnPropertyDescriptor(original, key));
     }
+    // util.promisify(wrapped) returns the custom form (execFile, exec). It
+    // calls the original directly, so it gets the same check.
+    const custom = original[promisify.custom];
+    if (typeof custom === "function") Object.defineProperty(wrapped, promisify.custom, { value: guard(custom) });
     owner[name] = wrapped;
     return wrapped;
   }
@@ -146,10 +153,20 @@ function install(dirs) {
   }
 
   // A child process is refused when it would start inside a guarded directory
-  // or is handed a guarded path, which covers the non-Node children (sh, git)
-  // this preload cannot load into.
+  // or is handed a guarded path. That is the only check a non-Node child (sh,
+  // git) gets, as this preload cannot load into it: one that finds the
+  // directory itself (from $HOME) is seen only when it creates .quadwork in the
+  // throwaway HOME, which the runner checks after each file. A guarded path may
+  // sit inside a longer argument (`--dir=<path>`), but a longer name such as
+  // `.quadwork-proof` is a sibling, not the guarded directory.
   const childProcess = require("child_process");
-  const rootText = (value) => typeof value === "string" && roots.some((root) => fold(value).includes(root));
+  const rootText = (value) => typeof value === "string" && roots.some((root) => {
+    const text = fold(value);
+    for (let at = text.indexOf(root); at !== -1; at = text.indexOf(root, at + 1)) {
+      if (!/[\w.-]/.test(text.charAt(at + root.length))) return true;
+    }
+    return false;
+  });
   for (const name of ["spawn", "spawnSync", "execFile", "execFileSync", "exec", "execSync", "fork"]) {
     replace(childProcess, name, (args) => {
       const options = args.slice(1).find((arg) => arg && typeof arg === "object" && !Array.isArray(arg));
