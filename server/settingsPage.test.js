@@ -28,6 +28,7 @@ const DEPENDENCIES = {
   "@/lib/agentModels": () => require("../src/lib/agentModels.ts"),
   "@/lib/injectMode": () => require("../src/lib/injectMode.js"),
   "@/lib/idle": () => require("../src/lib/idle.ts"),
+  "@/lib/urlComponent": () => require("../src/lib/urlComponent.ts"),
   "./ActiveSwitch": () => ({ default: () => null }),
   "./ConfirmModal": () => ({ default: () => null }),
 };

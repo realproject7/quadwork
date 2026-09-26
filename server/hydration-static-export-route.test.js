@@ -96,6 +96,7 @@ function instantiate({ source, fileName, pathname, reactModule, host }) {
   const requireStub = (id) => {
     if (id === "react") return reactModule;
     if (id === "react/jsx-runtime" || id === "react/jsx-dev-runtime") return require(id);
+    if (id === "@/lib/urlComponent") return require("../src/lib/urlComponent.ts");
     if (id === "next/navigation") {
       return {
         usePathname: () => {
