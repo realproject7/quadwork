@@ -6,17 +6,18 @@
 //
 // Pinned here, on a legacy config and on an activated (V2) one:
 //   - a new id must pass the project-id rule the V2 setup steps use
-//     (assertProjectId). Any other id gets 400 and touches nothing;
+//     (assertProjectId);
 //   - a configured id keeps the re-run path, even one that fails the rule
 //     (CLI setup names a project after its folder), while it names one direct
-//     directory under ~/.quadwork (#1203). Any other configured id gets 400
-//     and touches nothing;
+//     directory under ~/.quadwork (#1203);
 //   - on the V2 path, an id that is no longer configured under config.lock is
 //     new there, so it must pass the rule too;
 //   - a valid new id still sets up as before.
-// Every refused request asserts its status and that nothing under the test's
-// temporary root changed. The root holds HOME, so an id that climbs out of
-// ~/.quadwork or out of HOME still lands where the snapshot sees it.
+// Each refused request gets 400. Nothing under the test's temporary root
+// changes, except in the third case: the step refuses it under config.lock,
+// by which time it has changed ~/.quadwork itself. The root holds HOME, so an
+// id that climbs out of ~/.quadwork or out of HOME still lands where the
+// snapshot sees it.
 //
 // Run through `npm test` (server/run-tests.js), never directly.
 
@@ -120,20 +121,30 @@ function changes(beforeSnapshot, afterSnapshot) {
   return out.sort();
 }
 
+// A "before" snapshot with ~/.quadwork's mtime set to 0, so an entry made or
+// removed in it moves the mtime whatever the file system's timestamp
+// precision.
+function baselineSnapshot() {
+  fs.utimesSync(CONFIG_DIR, 0, 0);
+  return snapshot();
+}
+
 // A body that would set up a project if its id were let through.
 function probeBody(id) {
   return { id, name: "Probe", repo: "acme/probe", workingDir: path.join(WORK, "probe"), backends: {}, ci_policy: CI_POLICY };
 }
 
 // Refused requests: 400 invalid_project_id, nothing touched. ~/.quadwork starts
-// each case at 0755, so the 0700 hardening that every write path runs first
-// shows up too. Every case runs, and a failure lists each case that went wrong.
+// each case at 0755. The new-project paths and the V2 path harden it to 0700
+// before any other write, so that shows up too. The legacy re-run path hardens
+// only ~/.quadwork/<id>. Every case runs, and a failure lists each case that
+// went wrong.
 async function assertRefused(cases) {
   const wrong = [];
   for (const { label, kind, projects, body } of cases) {
     writeConfig(kind, projects);
     fs.chmodSync(CONFIG_DIR, 0o755);
-    const beforeSnapshot = snapshot();
+    const beforeSnapshot = baselineSnapshot();
     const response = await request(body);
     const actual = { status: response.status, code: response.json?.code, touched: changes(beforeSnapshot, snapshot()) };
     const expected = { status: 400, code: "invalid_project_id", touched: [] };
@@ -160,8 +171,11 @@ test("a new id that fails the project-id rule gets 400 and touches nothing", asy
     [".", "."],
     ["..", ".."],
     ["empty", ""],
-    // Not configured ("My Project" is), and its space fails the rule.
+    // These three name one direct directory but fail the rule. None is
+    // configured.
     ["Other Project", "Other Project"],
+    [".hidden", ".hidden"],
+    ["129 characters", "a".repeat(129)],
     ["no id", undefined],
     ["number", 7],
   ];
@@ -173,7 +187,7 @@ test("a new id that fails the project-id rule gets 400 and touches nothing", asy
 });
 
 test("a configured id that is not one direct directory under ~/.quadwork gets 400 and touches nothing", async () => {
-  // Only a hand-edited config, or one written before #1207, holds such ids.
+  // A legacy config written through the config API can hold such ids.
   const EDITED = [".", "..", "../edited", "edited/sub", "", "edited\u0000nul"];
   await assertRefused(["legacy", "v2"].flatMap((kind) => {
     const projects = [CONFIGURED[kind], ...EDITED.map((id) => ({ id, chat_mode: "file" }))];
@@ -186,7 +200,7 @@ test("a configured id that fails the project-id rule keeps its re-run path", asy
     writeConfig(kind);
     fs.rmSync(path.join(CONFIG_DIR, LEGACY_ID), { recursive: true, force: true });
     const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
-    const beforeSnapshot = snapshot();
+    const beforeSnapshot = baselineSnapshot();
     const response = await request(probeBody(LEGACY_ID));
     assert.equal(response.status, 200, `${kind}: status (${JSON.stringify(response.json)})`);
     assert.deepEqual(response.json, { ok: true, message: "Project already in config" }, `${kind}: body`);
@@ -210,7 +224,7 @@ test("on the V2 path, an id that is gone by the time config.lock is held is new 
   writeConfig("v2", []);
   const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
   fs.chmodSync(CONFIG_DIR, 0o755);
-  const beforeSnapshot = snapshot();
+  const beforeSnapshot = baselineSnapshot();
   const readFileSync = fs.readFileSync;
   let staleReads = 0;
   fs.readFileSync = function (file, ...rest) {
@@ -236,7 +250,7 @@ test("a valid new id still sets up as before", async () => {
     const id = `fresh-${kind}`;
     const workingDir = path.join(WORK, id);
     writeConfig(kind);
-    const beforeSnapshot = snapshot();
+    const beforeSnapshot = baselineSnapshot();
     const response = await request({
       id, name: `Fresh ${kind}`, repo: `acme/${id}`, workingDir, backends: {},
       ...(kind === "v2" ? { ci_policy: CI_POLICY } : {}),

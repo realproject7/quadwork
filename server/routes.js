@@ -6943,8 +6943,9 @@ router.post("/api/setup", async (req, res) => {
               error.code = "QW_PROJECT_ALREADY_CONFIGURED";
               throw error;
             }
-            // #1207: a new id must pass the rule. The check above may have
-            // found this id configured before another writer removed it.
+            // #1207: a new id must pass the rule. The step's first check,
+            // before config.lock, may have found this id configured before
+            // another writer removed it.
             assertProjectId(id);
             if (!Array.isArray(fresh.projects)) fresh.projects = [];
             fresh.projects.push({
