@@ -1920,7 +1920,10 @@ function currentChatResumeBatchId(projectId) {
 function emitSystemMessage(projectId, text) {
   try {
     fileChat.appendMessage(projectId, { sender: "system", type: "system", text });
-  } catch {}
+  } catch (err) {
+    // #1194: a bridge system line that cannot be written is logged, not lost silently.
+    console.error(`[file-chat] ${projectId}: system line "${text}" not recorded: ${err?.message || err}`);
+  }
 }
 
 router.get("/api/chat", (req, res) => {
@@ -8286,6 +8289,7 @@ module.exports.evalBatchCompleteConfirmed = evalBatchCompleteConfirmed;
 module.exports.normalizeMentions = normalizeMentions;
 // #714: expose for file-chat integration
 module.exports.getProjectChatMode = getProjectChatMode;
+module.exports.emitSystemMessage = emitSystemMessage;
 // #730: PTY dispatch callback setter
 module.exports.setPtyDispatchCallback = setPtyDispatchCallback;
 // #802: expose the GraphQL rate-limit bucket + predicates for unit tests.
