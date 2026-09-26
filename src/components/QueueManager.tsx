@@ -216,7 +216,7 @@ export default function QueueManager({ projectId }: QueueManagerProps) {
       const auth = await sessionTokenHeaders();
 
       // Same-origin: all API calls go to the same host
-      const res = await fetch(`/api/agents/${projectId}/head/write`, {
+      const res = await fetch(`/api/agents/${encodeURIComponent(projectId)}/head/write`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...auth },
         body: JSON.stringify({ text: prompt + "\n" }),

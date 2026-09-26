@@ -7,6 +7,7 @@ import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
 import { OPEN_MOBILE_SIDEBAR_EVENT } from "@/lib/mobileSidebar";
+import { decodeUrlComponent } from "@/lib/urlComponent";
 
 export function HamburgerIcon() {
   return (
@@ -148,7 +149,7 @@ function ProjectIcon({ project, isActive, expanded, pinned, hasActiveBatch, onCo
   const link = (
     <Link
       ref={ref}
-      href={`/project/${project.id}`}
+      href={`/project/${encodeURIComponent(project.id)}`}
       className={`flex items-center gap-2 ${expanded ? "flex-1 min-w-0" : ""} rounded-sm transition-colors`}
       onMouseEnter={() => {
         if (expanded) return;
@@ -481,7 +482,7 @@ export default function Sidebar() {
   const isHome = pathname === "/";
   const isSettings = pathname === "/settings";
   const activeProjectId = pathname.startsWith("/project/")
-    ? pathname.split("/")[2]
+    ? decodeUrlComponent(pathname.split("/")[2])
     : null;
 
   const persistPins = useCallback((newPins: string[]) => {

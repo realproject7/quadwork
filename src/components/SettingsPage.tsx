@@ -8,6 +8,7 @@ import { injectModeForCommand, cliBaseFromCommand } from "@/lib/injectMode";
 import ActiveSwitch from "./ActiveSwitch";
 import ConfirmModal from "./ConfirmModal";
 import { persistProjectIdle, onIdleChange, idleConfirmTitle, IDLE_CONFIRM_BODY } from "@/lib/idle";
+import { decodeUrlComponent } from "@/lib/urlComponent";
 
 interface AgentConfig {
   display_name: string;
@@ -789,7 +790,9 @@ export default function SettingsPage() {
 
   useEffect(() => {
     if (!config) return;
-    const hash = window.location.hash.replace("#", "");
+    // #1209: the fragment is still percent-encoded (Home links to
+    // /settings#project-<encoded id>), and the row ids use the configured id.
+    const hash = decodeUrlComponent(window.location.hash.replace("#", ""));
     if (hash) {
       const el = document.getElementById(hash);
       if (el) el.scrollIntoView({ behavior: "smooth" });
