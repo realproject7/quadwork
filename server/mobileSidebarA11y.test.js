@@ -19,8 +19,15 @@
 // - Tab order is DOM order, with positive tabindex first and negative tabindex
 //   skipped. A Tab that no keydown listener cancels moves focus to the next
 //   stop. Past either end, focus leaves the page.
+// - The inert and hidden attributes cover the element and everything inside
+//   it: none of it is focusable or a Tab stop, and assistive technology does
+//   not see it. hidden is display:none (the UA style sheet, made !important by
+//   Tailwind's preflight). aria-hidden="true" hides a subtree from assistive
+//   technology only. A click on an inert or hidden element throws: hit-testing
+//   skips it, and the fake cannot tell what is underneath.
 // - focus() only works on a focusable element. When the focused element is
-//   removed, focus falls back to <body>.
+//   removed or can no longer take focus, focus falls back to <body> (HTML's
+//   focus fixup rule).
 // - A click first moves focus to the target's nearest focusable ancestor, or
 //   to <body>, as Chrome's mousedown does. It then runs the onClick handlers up
 //   the tree and reaches window. Enter on a focused button or link clicks it
@@ -31,9 +38,9 @@
 //
 // Browser-only, covered by PR #1200's browser proof, because the fake has no
 // CSS and no layout:
-// - What a width hides. Every rendered element counts as displayed. Below lg
-//   that is true of every Tab stop these pages render before and inside the
-//   drawer. The desktop rail, hidden below lg, only appears here as a place
+// - What a width hides. Only the hidden attribute hides an element here. Below
+//   lg every Tab stop these pages render before and inside the drawer is
+//   displayed. The desktop rail, hidden below lg, only appears here as a place
 //   focus must not leak to.
 // - Where a tap lands: the overlay covering the page, and the z-[45] menu
 //   button above the presets backdrop. A click goes to the element the test
@@ -65,11 +72,16 @@ class FakeText extends FakeNode {
 }
 // The React prop behind each HTML attribute a selector reads.
 const PROP_OF = { class: "className", for: "htmlFor", tabindex: "tabIndex" };
+// React 19 renders inert and hidden as boolean attributes. Any other value is
+// not rendered as written (inert="" renders no attribute at all), so it throws
+// instead of guessing.
+const BOOLEAN_ONLY = new Set(["inert", "hidden"]);
 class FakeElement extends FakeNode {
   constructor(document, localName) { super(); this.ownerDocument = document; this.localName = localName; this.props = {}; }
   getAttribute(name) {
     const value = this.props[PROP_OF[name] || name];
     if (value == null || typeof value === "function") return null;
+    if (BOOLEAN_ONLY.has(name) && typeof value !== "boolean") throw new Error(`fake document: ${name}=${JSON.stringify(value)} is not a boolean`);
     if (typeof value === "boolean") return /^(aria|data)-/.test(name) ? String(value) : value ? "" : null;
     return String(value);
   }
@@ -109,9 +121,16 @@ function matchesCompound(el, selector) {
   return true;
 }
 
+// The element, then each ancestor up to the document.
+const ancestry = (el) => (el instanceof FakeElement ? [el, ...ancestry(el.parentNode)] : []);
+const inertOrHidden = (el) => ancestry(el).some((n) => n.getAttribute("inert") !== null || n.getAttribute("hidden") !== null);
+// Whether assistive technology sees the element.
+const exposed = (el) => !inertOrHidden(el) && !ancestry(el).some((n) => n.getAttribute("aria-hidden") === "true");
+
 // HTML's focusable areas, for the elements these pages render.
 const tabIndex = (el) => { const raw = el.getAttribute("tabindex"); return raw === null || raw.trim() === "" ? NaN : Number(raw); };
 function focusable(el) {
+  if (inertOrHidden(el)) return false;
   const disabled = el.getAttribute("disabled") !== null;
   if (["button", "select", "textarea"].includes(el.localName)) return !disabled;
   if (el.localName === "input") return !disabled && el.getAttribute("type") !== "hidden";
@@ -360,6 +379,9 @@ function createPage({ width = 390, defaultFontSize = 16 } = {}) {
       instances.delete(id);
       for (const cell of instance.cells) if (cell && cell.effect && typeof cell.cleanup === "function") cell.cleanup();
     }
+    // The focus fixup rule. It stays on <body> even if the element can take
+    // focus again later.
+    if (document.focused && !(document.focused.isConnected && focusable(document.focused))) document.focused = null;
   }
   // Commit effects and re-render until nothing is left, including the fetches.
   async function settle() {
@@ -436,6 +458,7 @@ function createPage({ width = 390, defaultFontSize = 16 } = {}) {
       return event;
     },
     async click(target) {
+      if (inertOrHidden(target)) throw new Error(`fake document: ${show(target)} is inert or hidden, so a click cannot land on it`);
       let focusTarget = target;
       while (focusTarget instanceof FakeElement && !focusable(focusTarget)) focusTarget = focusTarget.parentNode;
       document.focused = focusTarget instanceof FakeElement ? focusTarget : null;
