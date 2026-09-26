@@ -18,10 +18,11 @@ const REPOSITORY = /^[A-Za-z0-9._-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
 // anywhere in a repository or model identity value: GitHub classic and
 // fine-grained, OpenAI legacy and project/service-account/admin, Anthropic,
 // Stripe, Slack, AWS, npm, GitLab, Hugging Face, and Google keys. Bodies that
-// could otherwise be lowercase words need a capital, digit, or `_`, and the
-// Slack body starts with its numeric ID, so a lowercase hyphenated
-// words-only name never matches.
-const CREDENTIAL = /gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|sk-(?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]{32,}|sk-(?:proj|svcacct|admin)-(?=[A-Za-z0-9_-]*[A-Z0-9_])[A-Za-z0-9_-]{40,}|sk-ant-(?:api|admin)\d\d-[A-Za-z0-9_-]{40,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|xox[abposr]-\d{6,}-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|npm_[A-Za-z0-9]{36}|glpat-(?=[A-Za-z0-9_-]{0,19}[A-Z0-9_])[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{30,}|AIza[0-9A-Za-z_-]{35}/;
+// could otherwise be lowercase words need a capital, digit, or `_`, the OpenAI
+// project and GitLab ones within their first 20 characters, and the Slack body
+// starts with its numeric ID, so a lowercase hyphenated words-only name never
+// matches.
+const CREDENTIAL = /gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|sk-(?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]{32,}|sk-(?:proj|svcacct|admin)-(?=[A-Za-z0-9_-]{0,19}[A-Z0-9_])[A-Za-z0-9_-]{40,}|sk-ant-(?:api|admin)\d\d-[A-Za-z0-9_-]{40,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|xox[abposr]-\d{6,}-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|npm_[A-Za-z0-9]{36}|glpat-(?=[A-Za-z0-9_-]{0,19}[A-Z0-9_])[A-Za-z0-9_-]{20}|hf_[A-Za-z0-9]{30,}|AIza[0-9A-Za-z_-]{35}/;
 // #1182 closed text fields. Evidence refs are generated, never caller text:
 // ledger-writer.cjs writes `writer/<sha256>`, and historical calibration
 // executor records use `executor/<reason>/<sha256>` with its reachable reasons.

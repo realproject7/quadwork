@@ -181,9 +181,16 @@ test('repositories within GitHub limits, the four roles, and protocol model ids 
     `xoxb-${digits(13)}-${digits(13)}-${body(24)}`, `xoxp-${digits(13)}-${digits(13)}-${digits(13)}-${body(32, '0123456789abcdef')}`,
     `AKIA${body(16, 'Q7R8X2LZ')}`, `npm_${body(36)}`, `glpat-${body(20, 'Zq7R8x2L-_')}`, `hf_${body(34)}`, `AIza${body(35, 'Zq7R8x2L-_')}`,
   ];
-  // Lowercase hyphenated words-only names, including ones that start like a key prefix, are never credentials.
-  const wordsOnly = ['flask-restful-api-template', 'task-management-system-api', 'risk-assessment-framework', 'bench-task-dependency-overlap-bound', 'xoxo-game-of-life', 'task-supercalifragilisticexpialidocious', 'risk-proj-management-dashboard-for-enterprise-teams', 'glpat-rotation-helper-scripts'];
+  // Lowercase hyphenated words-only names, including ones that start like a key prefix, are never credentials,
+  // and neither is one whose only digits come after the first 20 characters of a key-like body (#1192).
+  const wordsOnly = ['flask-restful-api-template', 'task-management-system-api', 'risk-assessment-framework', 'bench-task-dependency-overlap-bound', 'xoxo-game-of-life', 'task-supercalifragilisticexpialidocious', 'risk-proj-management-dashboard-for-enterprise-teams', 'glpat-rotation-helper-scripts', 'risk-admin-console-for-enterprise-security-teams-2026'];
   for (const name of wordsOnly) { accepted(at(`owner/${name}`)); accepted({ model_identity: name }); }
+  // The OpenAI project-key guard reads exactly the first 20 body characters, as the GitLab one does.
+  for (const lead of [0, 19, 20]) {
+    const name = `sk-proj-${'a'.repeat(lead)}Z${'a'.repeat(40)}`;
+    if (lead < 20) { failure(ledger([event(1, 'run_started', at(`owner/${name}`))]), 'evidence_delivery_identity'); failure(ledger([event(1, 'run_started', { model_identity: name })]), 'evidence_model_identity'); }
+    else { accepted(at(`owner/${name}`)); accepted({ model_identity: name }); }
+  }
   for (const repository of ['realproject7/bench-task-dependency-overlap-bound', 'owner/Flask-RESTful-API-Template-2026-Edition']) accepted(at(repository));
   for (const repository of ['octocat/Hello-World', 'a/b', `${'A'.repeat(39)}/${'r'.repeat(100)}`, 'my.org_x/repo.name-1', 'owner/risk-analyzer', 'owner/task-sk', 'owner/xoxo-game', 'owner/sk-tools', 'owner/my-sk-tool']) accepted(at(repository));
   for (const repository of [`${'A'.repeat(40)}/repo`, `owner/${'r'.repeat(101)}`, `x/${'A'.repeat(100 * 1024)}`, 'owner', 'owner/repo/extra', '/repo', 'owner/']) failure(ledger([event(1, 'run_started', at(repository))]), 'evidence_delivery_identity');

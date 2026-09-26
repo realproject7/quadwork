@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { EVENTS, MAX_BYTES, appendRecord, digest, loadLedger, summarizeLedger, validateLedger } = require('./evidence.cjs');
 const { EVIDENCE_LEDGER, EVIDENCE_LOCK, EVIDENCE_OBSERVATIONS, appendRunEvent, createRunLedgerRoot, validateObservation } = require('./ledger-writer.cjs');
@@ -93,7 +93,7 @@ test('every validator event for every mode is persisted append-only, one ledger 
   for (const [name, mode] of [[EVIDENCE_LEDGER, 0o600], [EVIDENCE_OBSERVATIONS, 0o700], [path.join(EVIDENCE_OBSERVATIONS, `${first.records[0].evidence_ref.slice(7)}.json`), 0o600]]) assert.equal(fs.statSync(path.join(root, name)).mode & 0o777, mode);
 }));
 
-test('a writer killed at any fs step leaves the last committed ledger valid with every referenced observation present', () => withParent(parent => {
+test('a writer killed at any fs step leaves a valid committed ledger that the next append continues with no manual cleanup (#1192)', t => withParent(parent => {
   const scenarios = [
     { seed: [], next: [record('run_started'), full()], after: [record('task_ready', { task_id: 'a1' }), observation()] },
     { seed: [[record('run_started'), observation()]], next: [record('candidate_ready', { task_id: 'a1', role: 'dev' }), full()], after: [record('review_started', { task_id: 'a1', role: 're1' }), observation()] },
@@ -103,32 +103,138 @@ test('a writer killed at any fs step leaves the last committed ledger valid with
     const reference = seeded(), expected = appendRunEvent(reference.root, reference.prior, ...scenario.next);
     const clean = seeded(), run = child({ root: clean.root, prior: clean.prior, record: scenario.next[0], observation: scenario.next[1], kill_at: 0 }), total = Number(run.stdout);
     assert.equal(run.status, 0, run.stderr); assert.deepEqual(committed(clean.root), expected); assert.ok(total > 20);
-    const hash = expected.records.at(-1).evidence_ref.slice('writer/'.length), outcomes = { before_commit: 0, empty_lock: 0, partial_observation: 0, after_commit: 0 };
+    // Every kind of residue a kill can leave occurs at some step, and none of them needs manual cleanup.
+    const hash = expected.records.at(-1).evidence_ref.slice('writer/'.length), residue = { none: 0, empty_lock: 0, dead_registration: 0, temporary: 0, unreferenced_observation: 0, committed: 0 };
     for (let kill_at = 1; kill_at <= total; kill_at += 1) {
       const { root, prior } = seeded(), lock = path.join(root, EVIDENCE_LOCK), pending = path.join(root, EVIDENCE_OBSERVATIONS, `${hash}.json`);
-      const result = child({ root, prior, record: scenario.next[0], observation: scenario.next[1], kill_at }), retry = () => appendRunEvent(root, prior, ...scenario.next);
+      const result = child({ root, prior, record: scenario.next[0], observation: scenario.next[1], kill_at });
       assert.equal(result.signal, 'SIGKILL', `step ${kill_at}: ${result.stderr}`);
-      const onDisk = committed(root), landed = onDisk !== null && digest(onDisk) === digest(expected);
-      if (landed) {
-        outcomes.after_commit += 1;
-        assert.equal(appendRunEvent(root, expected, ...scenario.after).records.length, expected.records.length + 1);
-      } else {
-        assert.deepEqual(onDisk ?? validateLedger(empty()).ledger, validateLedger(prior).ledger);
-        // Two kill points leave fail-closed residue that the committed ledger never references.
-        if (fs.existsSync(lock) && fs.readFileSync(lock, 'utf8') === '') {
-          // Between creating the lock and writing its PID: refused as a possibly live lock, and kept.
-          outcomes.empty_lock += 1; refused(retry, 'ledger_writer_evidence_lock'); assert.equal(fs.existsSync(lock), true); fs.unlinkSync(lock);
-        } else if (fs.existsSync(pending) && sha256(fs.readFileSync(pending)) !== hash) {
-          // Inside the content-addressed observation write: the partial file blocks only this identical observation.
-          outcomes.partial_observation += 1; refused(retry, 'ledger_writer_evidence_persist'); assert.deepEqual(committed(root) ?? validateLedger(empty()).ledger, validateLedger(prior).ledger); fs.unlinkSync(pending);
-        } else outcomes.before_commit += 1;
-        assert.deepEqual(retry(), expected);
-      }
+      const onDisk = committed(root), landed = onDisk !== null && digest(onDisk) === digest(expected), registrations = fs.existsSync(lock) ? fs.readdirSync(lock) : null;
+      // No kill leaves a partial observation at its content address.
+      if (fs.existsSync(pending)) assert.equal(sha256(fs.readFileSync(pending)), hash, `step ${kill_at}`);
+      const found = { empty_lock: registrations?.length === 0, dead_registration: registrations?.length > 0, temporary: fs.readdirSync(root).some(name => name.endsWith('.tmp')), unreferenced_observation: !landed && fs.existsSync(pending), committed: landed };
+      found.none = !Object.values(found).some(Boolean);
+      for (const [kind, seen] of Object.entries(found)) if (seen) residue[kind] += 1;
+      if (landed) assert.equal(appendRunEvent(root, expected, ...scenario.after).records.length, expected.records.length + 1);
+      else { assert.deepEqual(onDisk ?? validateLedger(empty()).ledger, validateLedger(prior).ledger); assert.deepEqual(appendRunEvent(root, prior, ...scenario.next), expected, `step ${kill_at}`); }
       assert.equal(committed(root).records.length, expected.records.length + (landed ? 1 : 0));
       assert.equal(fs.readdirSync(root).some(name => name === EVIDENCE_LOCK || name.endsWith('.tmp')), false);
     }
-    assert.ok(Object.values(outcomes).every(value => value > 0), JSON.stringify(outcomes));
+    t.diagnostic(`${total} kill points; kill points leaving each residue: ${JSON.stringify(residue)}`);
+    assert.ok(Object.values(residue).every(value => value > 0), JSON.stringify(residue));
   }
+}));
+
+// Runs one append in a child that pauses at named points until the parent releases it (#1192). A point
+// names an fs call, the path it acts on (or, with `inside`, that path's directory), and whether the
+// child pauses before or after it. The parent coordinates children through files in `sync`.
+const RACER = [
+  "const fs = require('node:fs'), path = require('node:path');",
+  "const input = JSON.parse(fs.readFileSync(0, 'utf8')), { existsSync, writeFileSync } = fs, nap = new Int32Array(new SharedArrayBuffer(4)), deadline = Date.now() + 30000;",
+  "const hold = point => { writeFileSync(path.join(input.sync, `${input.name}.${point}`), ''); while (!existsSync(path.join(input.sync, `${input.name}.${point}.go`))) { if (Date.now() > deadline) process.exit(3); Atomics.wait(nap, 0, 0, 2); } };",
+  "for (const { point, call, target, inside, after } of input.points) { const original = fs[call]; let pending = true; fs[call] = function (...args) { if (!pending || (inside ? path.dirname(String(args[0])) : args[0]) !== target) return original.apply(this, args); pending = false; if (!after) hold(point); try { return original.apply(this, args); } finally { if (after) hold(point); } }; }",
+  "const { appendRunEvent } = require(input.module);",
+  "let outcome; try { outcome = { ledger: appendRunEvent(input.root, input.prior, input.record, input.observation) }; } catch (error) { outcome = { code: error.message }; }",
+  "process.stdout.write(JSON.stringify(outcome));",
+].join('\n');
+async function race(parent, state, schedule) {
+  const root = createRunLedgerRoot({ parent_dir: parent }), sync = fs.mkdtempSync(path.join(parent, 'sync-')), lock = path.join(root, EVIDENCE_LOCK), filename = path.join(root, EVIDENCE_LEDGER);
+  const prior = appendRunEvent(root, empty(), record('run_started'), observation()), racers = new Map();
+  // A dead writer's registration, or the empty directory a writer killed before registering leaves.
+  if (state !== 'none') fs.mkdirSync(lock, { mode: 0o700 });
+  if (state === 'stale') fs.writeFileSync(path.join(lock, `${spawnSync(process.execPath, ['-e', '']).pid}-${crypto.randomBytes(16).toString('hex')}`), '', { mode: 0o600 });
+  const points = { window: { call: 'mkdirSync', target: lock, after: true }, registered: { call: 'openSync', target: lock, inside: true, after: true }, listed: { call: 'readdirSync', target: lock, after: true }, entered: { call: 'existsSync', target: filename, after: false } };
+  const start = (name, holds) => {
+    const racer = { name, stdout: '', stderr: '', exited: false, process: spawn(process.execPath, ['-e', RACER], { stdio: ['pipe', 'pipe', 'pipe'] }) };
+    racer.closed = new Promise(resolve => racer.process.on('close', () => { racer.exited = true; resolve(); }));
+    racer.process.stdout.on('data', chunk => { racer.stdout += chunk; }); racer.process.stderr.on('data', chunk => { racer.stderr += chunk; });
+    racer.process.stdin.end(JSON.stringify({ module: path.join(__dirname, 'ledger-writer.cjs'), sync, name, root, prior, record: record('task_ready', { task_id: name }), observation: observation(), points: [...holds, 'entered'].map(point => ({ point, ...points[point] })) }));
+    racers.set(name, racer); return racer;
+  };
+  // Waits until each named child has paused at the point or exited; a hard deadline bounds every wait.
+  const settle = async (names, point) => { const deadline = Date.now() + 20000; while (!names.every(name => racers.get(name).exited || fs.existsSync(path.join(sync, `${name}.${point}`)))) { assert.ok(Date.now() < deadline, `${state}: timed out at ${point}`); await new Promise(resolve => setTimeout(resolve, 2)); } };
+  const release = (names, point) => { for (const name of names) fs.writeFileSync(path.join(sync, `${name}.${point}.go`), ''); };
+  let timer;
+  try {
+    await schedule({ start, settle, release });
+    // Every child that got inside the lock is released together, so two holders would both commit.
+    const names = [...racers.keys()]; await settle(names, 'entered'); release(names, 'entered');
+    await Promise.race([Promise.all([...racers.values()].map(racer => racer.closed)), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${state}: children did not exit`)), 20000); })]);
+  } finally { clearTimeout(timer); for (const racer of racers.values()) if (!racer.exited) racer.process.kill('SIGKILL'); await Promise.all([...racers.values()].map(racer => racer.closed)); }
+  const outcomes = Object.fromEntries([...racers.values()].map(racer => [racer.name, JSON.parse(racer.stdout || JSON.stringify({ code: `exit: ${racer.stderr}` }))]));
+  return { root, prior, lock, outcomes };
+}
+// At most one writer proceeds, the committed ledger is the winner's, and the lock leaves nothing behind.
+function settled({ root, prior, lock, outcomes }, winner) {
+  for (const [name, outcome] of Object.entries(outcomes)) {
+    if (name === winner) assert.equal(digest(outcome.ledger), digest(appendRecord(prior, { ...record('task_ready', { task_id: name }), sequence: 2, evidence_ref: `writer/${sha256(JSON.stringify(validateObservation(observation())) + '\n')}` })), name);
+    else assert.deepEqual(outcome, { code: 'ledger_writer_evidence_lock' }, name);
+  }
+  const ledger = committed(root); assert.equal(digest(ledger), digest(winner ? outcomes[winner].ledger : prior));
+  assert.equal(fs.existsSync(lock), false); assert.equal(fs.readdirSync(root).some(name => name.endsWith('.tmp')), false);
+  // The losers then continue in turn, with no manual cleanup.
+  let current = ledger;
+  for (const name of Object.keys(outcomes).filter(name => name !== winner)) current = appendRunEvent(root, current, record('task_ready', { task_id: name }), observation());
+  assert.equal(committed(root).records.length, 1 + Object.keys(outcomes).length);
+}
+
+test('at most one of two writers recovering a stale or empty lock proceeds, and no reported append is lost (#1192)', { timeout: 120000 }, async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'quadwork-ledger-writer-'));
+  try { await races(parent); } finally { fs.rmSync(parent, { recursive: true, force: true }); }
+});
+async function races(parent) {
+  for (const state of ['stale', 'empty']) {
+    // Both register and both list before either decides: each sees the other, so neither proceeds.
+    settled(await race(parent, state, async ({ start, settle, release }) => {
+      start('a1', ['registered', 'listed']); start('b1', ['registered', 'listed']);
+      for (const point of ['registered', 'listed']) { await settle(['a1', 'b1'], point); release(['a1', 'b1'], point); }
+    }), null);
+  }
+  // `none`: the empty directory is a live writer's own window between creating it and registering.
+  for (const state of ['stale', 'empty', 'none']) {
+    // b1 pauses right after creating or finding the lock directory; a1 then recovers the lock and holds it.
+    // Resumed, b1 sees a1 and refuses, and so does c1, which comes after b1's release.
+    settled(await race(parent, state, async ({ start, settle, release }) => {
+      start('b1', ['window']); await settle(['b1'], 'window');
+      start('a1', []); await settle(['a1'], 'entered');
+      release(['b1'], 'window'); await settle(['b1'], 'entered');
+      start('c1', []); await settle(['c1'], 'entered');
+    }), 'a1');
+  }
+}
+
+// SIGKILL cannot reveal a missing fsync, so this pins the order of the calls instead.
+test('an observation, reused or new, and its directory are fsynced before the ledger rename, the ledger before it, and the root after it (#1192)', () => withParent(parent => {
+  for (const reused of [true, false]) {
+    const root = createRunLedgerRoot({ parent_dir: parent }), prior = appendRunEvent(root, empty(), record('run_started'), observation());
+    const bytes = Buffer.from(JSON.stringify(validateObservation(full())) + '\n'), directory = path.join(root, EVIDENCE_OBSERVATIONS), target = path.join(directory, `${sha256(bytes)}.json`);
+    // What a writer killed after its observation landed, and before it synced, leaves behind.
+    if (reused) fs.writeFileSync(target, bytes, { mode: 0o600 });
+    const calls = [], opened = new Map(), { openSync, fsyncSync, renameSync } = fs;
+    fs.openSync = (...args) => { const fd = openSync(...args); opened.set(fd, args[0]); return fd; };
+    fs.fsyncSync = fd => { calls.push({ kind: 'fsync', target: opened.get(fd) }); return fsyncSync(fd); };
+    fs.renameSync = (from, to) => { calls.push({ kind: 'rename', from, target: to }); return renameSync(from, to); };
+    try { assert.equal(appendRunEvent(root, prior, record('task_ready', { task_id: 'a1' }), full()).records.length, 2); } finally { Object.assign(fs, { openSync, fsyncSync, renameSync }); }
+    // The first matching call after index `after`, or -1.
+    const find = (kind, name, after = -1) => calls.findIndex((call, index) => index > after && call.kind === kind && call.target === name);
+    const commit = find('rename', path.join(root, EVIDENCE_LEDGER)), landed = find('rename', target), label = reused ? 'reused' : 'new';
+    assert.ok(commit > 0, JSON.stringify(calls)); assert.equal(landed === -1, reused);
+    // Both come after a new observation's rename into place, so its directory entry is durable too.
+    for (const name of [target, directory]) { const synced = find('fsync', name, landed); assert.ok(synced > landed && synced < commit, `${label} ${name}`); }
+    const staged = find('fsync', calls[commit].from);
+    assert.ok(staged >= 0 && staged < commit, `${label}: the ledger is fsynced under its temporary name before its rename`);
+    assert.ok(find('fsync', root, commit) > commit, `${label}: the root is fsynced after the ledger rename`);
+    assert.equal(committed(root).records.length, 2);
+  }
+}));
+
+// PID 1 belongs to root, so probing it fails with EPERM, which still means the process exists.
+test('a registration naming a live PID of another user is treated as live and kept (#1192)', () => withParent(parent => {
+  if (process.getuid?.() !== 0) assert.throws(() => process.kill(1, 0), error => error?.code === 'EPERM');
+  const root = createRunLedgerRoot({ parent_dir: parent }), lock = path.join(root, EVIDENCE_LOCK), entry = `1-${crypto.randomBytes(16).toString('hex')}`;
+  fs.mkdirSync(lock, { mode: 0o700 }); fs.writeFileSync(path.join(lock, entry), '', { mode: 0o600 });
+  refused(() => appendRunEvent(root, empty(), record('run_started'), observation()), 'ledger_writer_evidence_lock');
+  assert.deepEqual(fs.readdirSync(lock), [entry]); assert.equal(fs.existsSync(path.join(root, EVIDENCE_LEDGER)), false);
 }));
 
 test('a stale or rewritten prefix is refused and the committed ledger is left unchanged', () => withParent(parent => {
@@ -143,9 +249,13 @@ test('a stale or rewritten prefix is refused and the committed ledger is left un
     fs.writeFileSync(filename, JSON.stringify(rewritten) + '\n');
     refused(() => appendRunEvent(root, second, ...next), 'ledger_writer_evidence_prefix');
   }
-  // A rewritten record that breaks the hash chain is refused through the moved lock wrapper's code.
-  const broken = JSON.parse(bytes); broken.records[0].task_id = 'b1'; fs.writeFileSync(filename, JSON.stringify(broken) + '\n');
-  refused(() => appendRunEvent(root, second, ...next), 'ledger_writer_evidence_lock');
+  // A committed ledger tampered with on disk, by a record that breaks the hash chain or by truncation, is refused as such (#1192).
+  const broken = JSON.parse(bytes); broken.records[0].task_id = 'b1';
+  for (const tampered of [JSON.stringify(broken) + '\n', bytes.subarray(0, bytes.length >> 1)]) {
+    fs.writeFileSync(filename, tampered);
+    refused(() => appendRunEvent(root, second, ...next), 'ledger_writer_evidence_ledger');
+    assert.deepEqual(fs.readFileSync(filename), Buffer.from(tampered)); assert.equal(fs.existsSync(path.join(root, EVIDENCE_LOCK)), false);
+  }
   fs.writeFileSync(filename, bytes);
   assert.equal(appendRunEvent(root, second, ...next).records.length, 3);
 }));
@@ -286,7 +396,7 @@ test('provenance classes cannot mix in one writer ledger', () => withParent(pare
   assert.deepEqual(committed(root), replay);
 }));
 
-test('the writer refuses a root it did not create, a symlinked root, and an unexpected entry', () => withParent(parent => {
+test('the writer refuses a root it did not create, a symlinked root, an unexpected entry, and a lock that is not its lock directory', () => withParent(parent => {
   const unmarked = fs.mkdtempSync(path.join(parent, 'unmarked-')), root = createRunLedgerRoot({ parent_dir: parent }), link = path.join(parent, 'link');
   fs.chmodSync(unmarked, 0o700); fs.symlinkSync(root, link);
   for (const directory of [unmarked, link, 'relative/root']) refused(() => appendRunEvent(directory, empty(), record('run_started'), observation()), 'ledger_writer_root');
@@ -294,6 +404,14 @@ test('the writer refuses a root it did not create, a symlinked root, and an unex
   refused(() => appendRunEvent(root, empty(), record('run_started'), observation()), 'ledger_writer_root');
   refused(() => createRunLedgerRoot({ parent_dir: 'relative/parent' }), 'ledger_writer_root_create');
   assert.deepEqual(fs.readdirSync(unmarked), []); assert.equal(fs.existsSync(path.join(root, EVIDENCE_LEDGER)), false);
+  // A pre-#1192 lock file, even one naming a dead PID, cannot be removed safely by path, so it is refused and kept, as is a symlink.
+  const elsewhere = fs.mkdtempSync(path.join(parent, 'elsewhere-'));
+  for (const plantLock of [lock => fs.writeFileSync(lock, `${spawnSync(process.execPath, ['-e', '']).pid}\n`, { mode: 0o600 }), lock => fs.writeFileSync(lock, '', { mode: 0o600 }), lock => fs.symlinkSync(elsewhere, lock)]) {
+    const locked = createRunLedgerRoot({ parent_dir: parent }), lock = path.join(locked, EVIDENCE_LOCK); plantLock(lock);
+    refused(() => appendRunEvent(locked, empty(), record('run_started'), observation()), 'ledger_writer_evidence_lock');
+    assert.equal(fs.lstatSync(lock).isDirectory(), false); assert.equal(fs.existsSync(path.join(locked, EVIDENCE_LEDGER)), false);
+  }
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
 }));
 
 // Calibration-executor records are the historical ledger records this schema
@@ -334,8 +452,9 @@ test('protocol-valid head ids and repositories that main recorded still give the
     assert.deepEqual(ledger.records.map(item => [item.event, item.model_identity]), [['run_started', identity], ['run_failed', identity]]);
   }
   const repositories = ['owner/xoxo-game', 'owner/sk-tools', 'owner/my-sk-tool', 'owner/flask-restful-api-template', 'owner/task-management-system-api', 'owner/risk-assessment-framework', 'realproject7/bench-task-dependency-overlap-bound', 'owner/xoxo-game-of-life'];
-  // A mixed-case name pins the hyphen-free legacy `sk-` body; the last two pin the words-only guards.
-  for (const repository of [...repositories, 'owner/Flask-RESTful-API-Template-2026-Edition', 'owner/risk-proj-management-dashboard-for-enterprise-teams', 'owner/glpat-rotation-helper-scripts']) {
+  // A mixed-case name pins the hyphen-free legacy `sk-` body; the last three pin the words-only guards,
+  // and the last of them that the project-key guard reads only the first 20 body characters (#1192).
+  for (const repository of [...repositories, 'owner/Flask-RESTful-API-Template-2026-Edition', 'owner/risk-proj-management-dashboard-for-enterprise-teams', 'owner/glpat-rotation-helper-scripts', 'owner/risk-admin-console-for-enterprise-security-teams-2026']) {
     const { report, ledger } = calibrate(parent, ROLE, ENVIRONMENT, repository);
     assert.equal(report.status, 'blocked'); assert.equal(report.reason, 'provider_execution_not_permitted');
     assert.deepEqual(ledger.records.map(item => [item.event, item.delivery_identity.repository]), [['run_started', repository], ['run_failed', repository]]);

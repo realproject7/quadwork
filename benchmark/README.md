@@ -131,33 +131,56 @@ format:
   `-`.
 
 The legacy OpenAI, OpenAI project, and GitLab bodies must also contain a
-capital, digit, or `_`, which random keys always do. With the Slack numeric ID,
-this means a lowercase hyphenated words-only name never matches. Names such as
-`flask-restful-api-template`, `xoxo-game-of-life`, and `sk-tools` pass.
+capital, digit, or `_`, which random keys almost always do. The OpenAI project
+and GitLab bodies must have one in their first 20 characters, so a digit later
+in a name does not count. With the Slack numeric ID, this means a lowercase
+hyphenated words-only name never matches. Names such as
+`flask-restful-api-template`, `xoxo-game-of-life`, `sk-tools`, and
+`risk-admin-console-for-enterprise-security-teams-2026` pass.
 
 `ledger-writer.cjs` is the durable, append-only writer for one run's ledger.
 `createRunLedgerRoot({ parent_dir })` creates a marked `0700` root that holds
 one ledger for one run. `appendRunEvent(root, prior, record, observation)`
 accepts any validator event for Modes 1 to 5. `prior` is the caller's last
-committed ledger, so a stale or rewritten on-disk prefix is refused. The caller
-supplies every record field except `sequence`, `prior_record_digest`, and
-`evidence_ref`, which the writer generates. The writer persists the observation
-first as a content-addressed `0600` file. It then commits the ledger under an
-exclusive lock, with a re-read prefix check, fsync, and an atomic rename. An
-append that would push the ledger past the validator's 512 KiB limit is refused
-before anything is written. A killed writer leaves the last committed ledger
-valid, with every observation it references present. The next append reclaims
-a dead writer's lock and temporary files. Two kill points fail closed instead.
-A kill before the lock holds a PID leaves an empty lock, which is refused as
-possibly live. A kill inside an observation write leaves a partial file, which
-blocks only that identical observation. The committed ledger references neither
-file, and removing it clears the block. Two writers that recover the same
-dead writer's lock at once can both proceed. Both report success, but one
-committed append is silently overwritten. The losing writer's next append is
-refused as a stale prefix (`ledger_writer_evidence_prefix`), and the ledger
-stays valid. #1192 tracks these recovery limits. The calibration executor
-persists through the same helpers. The writer's tests run with
-`node --test benchmark/ledger-writer.test.cjs`.
+committed ledger, so a stale or rewritten on-disk prefix is refused
+(`ledger_writer_evidence_prefix`). A committed ledger that no longer validates,
+such as one tampered with on disk, is refused as
+`ledger_writer_evidence_ledger`. The caller supplies every record field except
+`sequence`, `prior_record_digest`, and `evidence_ref`, which the writer
+generates. An append that would push the ledger past the validator's 512 KiB
+limit is refused before anything is written.
+
+Each append runs under an exclusive lock. The writer first persists the
+observation as a content-addressed `0600` file: it writes and fsyncs the bytes
+under a temporary name, then renames them into place. It fsyncs that file and
+its directory, including a file that an earlier, killed attempt left behind.
+Only then does it commit the ledger, with a re-read prefix check, fsync, and an
+atomic rename.
+
+The lock is the `.ledger.lock` directory. Each writer adds an entry named by its
+PID and a random suffix, and then lists the directory. It proceeds only if every
+other entry names a dead PID, and it removes those. Otherwise it refuses
+(`ledger_writer_evidence_lock`). So of two writers that add entries at once, at
+least one sees the other and refuses. An entry is removed only by its exact
+name: by its own writer, or by any writer once its PID is dead. The directory is
+removed only while empty. So no writer can remove a live writer's entry. An
+empty directory is simply reused, even when a live writer has just created it
+and not yet added its entry.
+
+Liveness is a PID check, so all writers must share one PID namespace. A writer
+in another PID namespace, such as a container that shares the root through a
+bind mount, can see a live writer's PID as dead and remove its entry. An entry
+whose PID has been reused by another process counts as live, so it blocks
+writers until that process exits. Anything else at the lock path is refused and
+kept. This includes a lock file from before #1192. Delete that file by hand once
+no pre-#1192 writer is running.
+
+A writer killed at any point leaves the last committed ledger valid, and every
+observation it references complete. It can leave an empty lock directory, its
+own dead entry, temporary files, or a complete observation that no ledger
+references yet. The next append removes or reuses each of them, with no manual
+cleanup. The calibration executor persists through the same helpers. The
+writer's tests run with `node --test benchmark/ledger-writer.test.cjs`.
 
 Each observation payload has exactly these fields. Its only strings are fixed
 enum values, so it cannot hold free text.

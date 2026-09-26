@@ -5,8 +5,8 @@
 // closed, secret-free observation payload by a content address the writer
 // generates itself. It never launches a provider, contacts a remote service,
 // or writes outside a marked root it created. ledgerStore() is the marked-root
-// and ledger persistence moved unchanged from calibration-executor.cjs, which
-// imports it with its own error class and code prefix.
+// and ledger persistence shared with calibration-executor.cjs, which imports
+// it with its own error class and code prefix.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -16,6 +16,7 @@ const EVIDENCE_LEDGER = 'ledger.json';
 const EVIDENCE_OBSERVATIONS = 'observations';
 const EVIDENCE_LOCK = '.ledger.lock';
 const TEMPORARY = /^\.ledger-[a-f0-9]{64}\.tmp$/;
+const REGISTRATION = /^(\d{1,12})-[a-f0-9]{32}$/;
 const RUN_MARKER = '.quadwork-benchmark-ledger-v1';
 const RUN_MARKER_BODY = 'quadwork-benchmark-ledger-v1\n';
 const RUN_ROOT = new Set([RUN_MARKER, EVIDENCE_LEDGER, EVIDENCE_OBSERVATIONS, EVIDENCE_LOCK]);
@@ -29,6 +30,7 @@ function uid() { return typeof process.getuid === 'function' ? process.getuid() 
 function mode(stat) { return stat.mode & 0o777; }
 function safeText(value, limit = 1024) { return typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\u0000\r\n]/.test(value); }
 function sha256(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex'); }
+function alive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error?.code !== 'ESRCH'; } }
 
 function ledgerStore(ErrorClass, scope) {
   function required(value, code) { if (!value) throw new ErrorClass(code); }
@@ -47,9 +49,63 @@ function ledgerStore(ErrorClass, scope) {
     const parent = fs.realpathSync(parent_dir), parentStat = fs.lstatSync(parent); required(parentStat.isDirectory() && !parentStat.isSymbolicLink(), code);
     const root = fs.mkdtempSync(path.join(parent, prefix)); fs.chmodSync(root, 0o700); fs.writeFileSync(path.join(root, marker), body, { encoding: 'utf8', mode: 0o600, flag: 'wx' }); fs.chmodSync(path.join(root, marker), 0o600); return root;
   }
-  function readLedger(root, supplied) { const filename = path.join(root, EVIDENCE_LEDGER); if (!fs.existsSync(filename)) { required(supplied.records.length === 0, `${scope}_evidence_prefix`); return; } const stat = fs.lstatSync(filename); required(!stat.isSymbolicLink() && stat.isFile() && mode(stat) === 0o600 && stat.size <= 512 * 1024, `${scope}_evidence_ledger`); let parsed; try { parsed = JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { throw new ErrorClass(`${scope}_evidence_ledger`); } const normalized = validateLedger(parsed).ledger; required(evidenceDigest(normalized) === evidenceDigest(supplied), `${scope}_evidence_prefix`); for (const item of normalized.records) { const hash = item.evidence_ref.split('/').at(-1), observation = path.join(root, EVIDENCE_OBSERVATIONS, `${hash}.json`); required(/^[a-f0-9]{64}$/.test(hash) && fs.existsSync(observation) && sha256(fs.readFileSync(observation)) === hash, `${scope}_observation_missing`); } }
-  function withLock(root, callback) { const lock = path.join(root, EVIDENCE_LOCK); let fd; try { if (fs.existsSync(lock)) { const raw = fs.readFileSync(lock, 'utf8'); if (!/^\d{1,12}\n$/.test(raw)) throw new ErrorClass(`${scope}_evidence_lock`); const pid = Number(raw.trim()); let active = true; try { process.kill(pid, 0); } catch (error) { active = error?.code !== 'ESRCH'; } if (active) throw new ErrorClass(`${scope}_evidence_lock`); fs.unlinkSync(lock); } for (const name of fs.readdirSync(root)) if (TEMPORARY.test(name)) fs.unlinkSync(path.join(root, name)); fd = fs.openSync(lock, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600); fs.writeSync(fd, `${process.pid}\n`); fs.fsyncSync(fd); return callback(); } catch (error) { if (error instanceof ErrorClass) throw error; throw new ErrorClass(`${scope}_evidence_lock`); } finally { try { if (fd !== undefined) { fs.closeSync(fd); fs.unlinkSync(lock); } } catch {} } }
-  function persistAppend(root, supplied, next, bytes, hash) { return withLock(root, () => { readLedger(root, supplied); const filename = path.join(root, EVIDENCE_LEDGER), directory = path.join(root, EVIDENCE_OBSERVATIONS), observation = path.join(directory, `${hash}.json`), temporary = path.join(root, `.ledger-${crypto.randomBytes(32).toString('hex')}.tmp`); let fd; try { if (!fs.existsSync(directory)) { fs.mkdirSync(directory, { mode: 0o700 }); fs.chmodSync(directory, 0o700); } const directoryStat = fs.lstatSync(directory); required(directoryStat.isDirectory() && !directoryStat.isSymbolicLink() && mode(directoryStat) === 0o700 && (uid() === null || directoryStat.uid === uid()), `${scope}_evidence_persist`); if (!fs.existsSync(observation)) { fs.writeFileSync(observation, bytes, { mode: 0o600, flag: 'wx' }); fs.chmodSync(observation, 0o600); fd = fs.openSync(observation, fs.constants.O_RDONLY); fs.fsyncSync(fd); fs.closeSync(fd); fd = fs.openSync(directory, fs.constants.O_RDONLY); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; } const observationStat = fs.lstatSync(observation); required(observationStat.isFile() && !observationStat.isSymbolicLink() && mode(observationStat) === 0o600 && (uid() === null || observationStat.uid === uid()) && observationStat.size <= 512 * 1024 && sha256(fs.readFileSync(observation)) === hash, `${scope}_evidence_persist`); fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600); fs.writeFileSync(fd, JSON.stringify(next) + '\n', 'utf8'); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; fs.renameSync(temporary, filename); fs.chmodSync(filename, 0o600); fd = fs.openSync(root, fs.constants.O_RDONLY); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; return next; } catch { try { if (fd !== undefined) fs.closeSync(fd); if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } catch {} throw new ErrorClass(`${scope}_evidence_persist`); } }); }
+  // The writer commits only valid owner-only ledgers, so any other committed ledger was changed on disk.
+  function readLedger(root, supplied) {
+    const filename = path.join(root, EVIDENCE_LEDGER);
+    if (!fs.existsSync(filename)) { required(supplied.records.length === 0, `${scope}_evidence_prefix`); return; }
+    let normalized;
+    try { const stat = fs.lstatSync(filename); required(!stat.isSymbolicLink() && stat.isFile() && mode(stat) === 0o600 && stat.size <= 512 * 1024, `${scope}_evidence_ledger`); normalized = validateLedger(JSON.parse(fs.readFileSync(filename, 'utf8'))).ledger; } catch { throw new ErrorClass(`${scope}_evidence_ledger`); }
+    required(evidenceDigest(normalized) === evidenceDigest(supplied), `${scope}_evidence_prefix`);
+    for (const item of normalized.records) { const hash = item.evidence_ref.split('/').at(-1), observation = path.join(root, EVIDENCE_OBSERVATIONS, `${hash}.json`); let intact = false; try { intact = /^[a-f0-9]{64}$/.test(hash) && sha256(fs.readFileSync(observation)) === hash; } catch {} required(intact, `${scope}_observation_missing`); }
+  }
+  // The lock is a directory with one registration per writer, named by its PID and a random suffix.
+  // A writer lists the directory only after registering, and proceeds only if every other entry is
+  // a dead writer's registration. So of two writers registering at once, at least one sees the other
+  // and refuses. A registration is removed only by its unique name: by its own writer, or once its
+  // PID is dead. The directory is removed only while empty. So no writer removes a live registration.
+  // A kill leaves at most an empty directory, which the next writer reuses, or a dead registration,
+  // which it removes. Neither needs a bounded age.
+  function withLock(root, callback) {
+    const lock = path.join(root, EVIDENCE_LOCK), own = `${process.pid}-${crypto.randomBytes(16).toString('hex')}`, registration = path.join(lock, own);
+    let registered = false;
+    const release = () => { if (registered) try { fs.unlinkSync(registration); fs.rmdirSync(lock); } catch {} };
+    try {
+      try { fs.mkdirSync(lock, { mode: 0o700 }); } catch (error) { if (error?.code !== 'EEXIST') throw error; }
+      const stat = fs.lstatSync(lock); required(stat.isDirectory() && !stat.isSymbolicLink(), `${scope}_evidence_lock`);
+      const fd = fs.openSync(registration, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600); registered = true; fs.closeSync(fd);
+      let held = false;
+      for (const name of fs.readdirSync(lock)) {
+        if (name === own) continue;
+        const pid = REGISTRATION.exec(name)?.[1];
+        if (pid === undefined || alive(Number(pid))) held = true;
+        else try { fs.unlinkSync(path.join(lock, name)); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+      }
+      required(!held, `${scope}_evidence_lock`);
+      for (const name of fs.readdirSync(root)) if (TEMPORARY.test(name)) fs.unlinkSync(path.join(root, name));
+    } catch (error) { release(); if (error instanceof ErrorClass) throw error; throw new ErrorClass(`${scope}_evidence_lock`); }
+    try { return callback(); } finally { release(); }
+  }
+  function sync(target) { const fd = fs.openSync(target, fs.constants.O_RDONLY); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+  function writeDurably(filename, bytes) { const fd = fs.openSync(filename, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600); try { fs.fchmodSync(fd, 0o600); fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+  function persistAppend(root, supplied, next, bytes, hash) {
+    return withLock(root, () => {
+      readLedger(root, supplied);
+      const filename = path.join(root, EVIDENCE_LEDGER), directory = path.join(root, EVIDENCE_OBSERVATIONS), observation = path.join(directory, `${hash}.json`), temporary = () => path.join(root, `.ledger-${crypto.randomBytes(32).toString('hex')}.tmp`);
+      let pending;
+      try {
+        if (!fs.existsSync(directory)) { fs.mkdirSync(directory, { mode: 0o700 }); fs.chmodSync(directory, 0o700); }
+        const directoryStat = fs.lstatSync(directory); required(directoryStat.isDirectory() && !directoryStat.isSymbolicLink() && mode(directoryStat) === 0o700 && (uid() === null || directoryStat.uid === uid()), `${scope}_evidence_persist`);
+        // Renamed into place whole, so a killed writer leaves the observation complete or absent, never partial.
+        if (!fs.existsSync(observation)) { pending = temporary(); writeDurably(pending, bytes); fs.renameSync(pending, observation); pending = undefined; }
+        const observationStat = fs.lstatSync(observation); required(observationStat.isFile() && !observationStat.isSymbolicLink() && mode(observationStat) === 0o600 && (uid() === null || observationStat.uid === uid()) && observationStat.size <= 512 * 1024 && sha256(fs.readFileSync(observation)) === hash, `${scope}_evidence_persist`);
+        // A reused observation may come from a writer killed before it synced, so the observation and its
+        // directory entry are made durable before the ledger that references them is renamed into place.
+        sync(observation); sync(directory);
+        pending = temporary(); writeDurably(pending, Buffer.from(JSON.stringify(next) + '\n')); fs.renameSync(pending, filename); pending = undefined; sync(root);
+        return next;
+      } catch { try { if (pending !== undefined && fs.existsSync(pending)) fs.unlinkSync(pending); } catch {} throw new ErrorClass(`${scope}_evidence_persist`); }
+    });
+  }
   return Object.freeze({ markerRoot, createMarkedRoot, persistAppend });
 }
 
