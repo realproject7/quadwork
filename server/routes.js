@@ -1931,8 +1931,21 @@ function emitSystemMessage(projectId, text) {
   }
 }
 
+// #1203: chat routes build ~/.quadwork/<id> paths from the request's id, so
+// they accept only the id of a configured project that passes the project-id
+// rule. Archived projects are still configured; a removed one is not.
+function assertChatProject(projectId) {
+  try { assertProjectId(projectId); }
+  catch { throw new ProjectLifecycleError("invalid_project_id", projectId, "project id is invalid", 400); }
+  if (!(readConfigFile().projects || []).some((project) => project?.id === projectId)) {
+    throw new ProjectLifecycleError("unknown_project", projectId, "project is not configured", 404);
+  }
+}
+
 router.get("/api/chat", (req, res) => {
   const projectId = req.query.project;
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
 
   const sinceId = Number(req.query.since_id) || Number(req.query.cursor) || 0;
   const messages = fileChat.readMessages(projectId, {
@@ -2037,6 +2050,8 @@ const RESERVED_HISTORY_SENDERS = new Set([
 router.get("/api/project-history", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   try {
     const messages = fileChat.readMessages(projectId, { limit: 100000 });
     res.json({
@@ -2059,6 +2074,8 @@ router.get("/api/project-history", (req, res) => {
 router.post("/api/project-history", async (req, res) => {
   const projectId = req.query.project || req.body?.project_id;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
 
   const body = req.body;
   if (!body || typeof body !== "object") {
@@ -2197,6 +2214,8 @@ router.post("/api/project-history/restore", async (req, res) => {
   const projectId = req.query.project;
   const name = req.query.name || req.body?.name;
   if (!projectId || !name) return res.status(400).json({ error: "Missing project or name" });
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   // Prevent path traversal — only allow basenames from the snapshot
   // directory; reject anything with a separator or ".." segment.
   if (name !== path.basename(name) || name.includes("..") || !name.endsWith(".json")) {
@@ -2387,6 +2406,7 @@ router.post("/api/chat", (req, res) => {
   const projectId = req.query.project || req.body.project;
 
   try {
+    assertChatProject(projectId);
     assertProjectAdmitted(projectId);
   } catch (err) {
     return sendProjectLifecycleException(res, err, projectId);
