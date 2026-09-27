@@ -235,8 +235,14 @@ nothing, when you reach the dashboard by anything other than a loopback host —
 a **reverse proxy / domain** (e.g. the nginx setup in the
 [VPS guide](install-vps.md)), a **tailnet / LAN address**, or a separately
 hosted frontend. In those cases `GET /api/session-token` returns 403 by design.
+Since #1215 every other `/api` route applies the same checks, so the rest of
+the dashboard gets 403 too (see the `trusted_dashboard_hosts` section below).
 
-**Fix:** Set the token manually in the browser, once per browser:
+**Fix:** Open the dashboard on `127.0.0.1` or `localhost`, directly or through
+an SSH tunnel, or serve it through an authenticated on-box reverse proxy whose
+host is in `trusted_dashboard_hosts` (next section). If the rest of the
+dashboard works and only the terminals fail to attach, set the token manually
+in the browser, once per browser:
 
 ```js
 // In the browser devtools console, on the QuadWork tab:
@@ -277,6 +283,16 @@ arrived via the local proxy, not directly off-box — **and** (2) the forwarded
 DNS-rebinding page, an un-allowlisted proxy) still gets `403`, so #968's
 protections are unchanged. The allowlist is **opt-in**: with it unset (the
 default) behaviour is exactly loopback-only as before.
+
+**Every API route (#1215).** The same loopback and allowlist checks now cover
+the whole `/api` surface, not only the token fetch. Before any route runs, a
+request gets `403` unless its socket is loopback, its `Host` is a loopback host
+or a `trusted_dashboard_hosts` entry, its `Origin` (when sent) is one too, and
+its `Sec-Fetch-Site` (when sent) is not `cross-site`. Remote access therefore
+still needs both parts of the setup above: an authenticated on-box reverse
+proxy and its host in `trusted_dashboard_hosts`. A proxy host that is not in
+the list now gets `403` on the whole API, not only on the terminals, so the
+dashboard cannot load or save anything. Add the host and restart QuadWork.
 
 > [!IMPORTANT]
 > The reverse proxy **must** be authenticated (e.g. nginx Basic Auth) and bound

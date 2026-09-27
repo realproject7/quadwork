@@ -197,6 +197,14 @@ const resourceRuntimeOwner = getSharedResourceRuntimeOwner();
 // Preparation is a bounded diagnostic operation; it neither starts an agent
 // nor blocks API/chat startup. Its outcome is reflected by the resource owner.
 if (!process.env.QUADWORK_SKIP_LISTEN) resourceRuntimeOwner.prepareWorkerLaunch().catch(() => {});
+// #1215: every /api request must pass the local-request rule
+// (isLocalApiRequest). It runs before the JSON body parser and before any
+// route, including the resource route registered below outside
+// server/routes.js. A refused request is never parsed and reaches no route.
+app.use("/api", (req, res, next) => {
+  if (isLocalApiRequest(req)) return next();
+  res.status(403).json({ error: "Local access only" });
+});
 // #412 / quadwork#279: bump the global JSON body limit to 10mb so
 // POST /api/project-history can accept full chat exports. The
 // default ~100kb 413'd long before the route-local parser had a
@@ -299,11 +307,37 @@ function hostnameOfOrigin(origin) {
   try { return new URL(origin).hostname.toLowerCase(); } catch { return null; }
 }
 
+// True when `hostname` (parsed from a Host or Origin header) is a loopback
+// name. The one definition of a loopback host for every Host/Origin check.
+function isLoopbackHostname(hostname) {
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+}
+
 // True when `host` (an `Origin`/`Host` header value, "name[:port]") resolves to
 // a loopback name. Used to keep the session token on-box.
 function isLoopbackHostHeader(host) {
-  const hostname = hostnameOfHostHeader(host);
-  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+  return isLoopbackHostname(hostnameOfHostHeader(host));
+}
+
+// #1215: a hostname the API accepts in Host and Origin: a loopback name, or a
+// trusted_dashboard_hosts entry for an on-box reverse proxy (#988).
+function isApiHostname(hostname) {
+  return isLoopbackHostname(hostname) || TRUSTED_DASHBOARD_HOSTS.has(hostname);
+}
+
+// #1215: the rule every /api request must pass (mounted ahead of all routes).
+// The socket must be loopback. The Host must name a loopback host or a trusted
+// entry, and so must the Origin when one is sent. A browser sends
+// `Sec-Fetch-Site: cross-site` on a request made by a page from another site;
+// that request is refused too. /api/session-token applies its stricter check
+// on top of this one. The terminal WebSocket upgrade has its own check
+// (isAllowedWsOrigin).
+function isLocalApiRequest(req) {
+  if (!isLocalhost(req.socket.remoteAddress)) return false;
+  if (!isApiHostname(hostnameOfHostHeader(req.headers.host))) return false;
+  const origin = req.headers.origin;
+  if (origin && !isApiHostname(hostnameOfOrigin(origin))) return false;
+  return req.headers["sec-fetch-site"] !== "cross-site";
 }
 
 // #988: true when the request arrived over loopback (i.e. from the on-box
@@ -341,11 +375,7 @@ function isLocalTokenRequest(req) {
   // Origin (present on cross-origin/CORS requests) is a full URL, not a bare
   // host — parse it directly and require loopback too.
   const origin = req.headers.origin;
-  if (origin) {
-    let o;
-    try { o = new URL(origin); } catch { return false; }
-    if (o.hostname !== "127.0.0.1" && o.hostname !== "localhost" && o.hostname !== "::1") return false;
-  }
+  if (origin && !isLoopbackHostname(hostnameOfOrigin(origin))) return false;
   return true;
 }
 
@@ -361,7 +391,7 @@ function isAllowedWsOrigin(req) {
   if (!origin) return false;
   let u;
   try { u = new URL(origin); } catch { return false; }
-  if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "::1") return true;
+  if (isLoopbackHostname(u.hostname)) return true;
   // #988: an allowlisted reverse-proxy dashboard origin (verified loopback +
   // trusted forwarded Host/Origin) is accepted consistently with the token fetch.
   if (isTrustedProxyRequest(req)) return true;

@@ -568,7 +568,8 @@ skip the rest of this section unless you want a persistent public URL.
 Use this only if you need a persistent shared URL. It requires **both** an
 authenticating reverse proxy (Step 9 basic auth) **and** an allowlist entry so
 QuadWork accepts the proxied hostname — without the allowlist, QuadWork's
-loopback checks reject the forwarded `Host`/`Origin` and every terminal
+loopback checks reject the forwarded `Host`/`Origin`: every API request gets
+`403` (#1215), so the dashboard cannot load its data, and every terminal
 WebSocket dies.
 
 Add your domain to `~/.quadwork/config.json` (create the key if absent), then
