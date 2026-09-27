@@ -262,13 +262,13 @@ app.get("/api/health", (_req, res) => {
 });
 
 // #968: hand the shared session token to the LOCAL dashboard only, so it can
-// auto-attach it to WS + PTY-write calls with no operator action. The guard
-// checks socket IP + Host + Origin are all loopback (see isLocalTokenRequest)
-// so a DNS-rebinding page or a same-host reverse proxy can't pull the token to
-// a remote origin. Non-loopback (tailnet/LAN/proxied) callers get 403 — the
-// token is never leaked off-box. The one exception (#988) is an
-// operator-configured trusted_dashboard_hosts allowlist for an authenticated
-// on-box reverse proxy (see isTrustedProxyRequest).
+// auto-attach it to WS + PTY-write calls with no operator action. The token
+// goes only to a request on a loopback socket whose Host, and Origin when
+// sent, are both loopback names (isLocalTokenRequest) or both
+// trusted_dashboard_hosts entries (#988, isTrustedProxyRequest). Anything else
+// gets 403. A request through a proxy that rewrites Host to a loopback name,
+// with no Origin, also passes, so an on-box proxy must authenticate its users
+// (#988; see docs/troubleshooting.md).
 app.get("/api/session-token", (req, res) => {
   if (!isLocalTokenRequest(req) && !isTrustedProxyRequest(req))
     return res.status(403).json({ error: "Local access only" });

@@ -208,7 +208,8 @@ See the [VPS Installation Guide](install-vps.md#step-2-create-non-root-user-crit
 
 **Symptom:** The dashboard shows no projects or data, or pages load but saving
 settings, sending chat or starting agents fails. The `/api/...` requests in the
-browser's network tab (or `curl` against the port) return
+browser's network tab (or `curl` through the proxy URL; a plain `curl` to
+`127.0.0.1` on the box still gets 200) return
 `403 {"error":"Local access only"}`.
 
 **Cause:** Every `/api` route accepts a request only from this machine's own

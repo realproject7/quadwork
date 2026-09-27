@@ -101,8 +101,14 @@ function listen(target) {
   return new Promise((resolve) => target.listen(0, "127.0.0.1", resolve));
 }
 
+// close() waits for every open connection to end, and a Node fetch client can
+// leave one open that never sent a request; closeIdleConnections() does not
+// end it. Nothing is in flight when a test closes a listener.
 function close(target) {
-  return new Promise((resolve) => target.close(() => resolve()));
+  return new Promise((resolve) => {
+    target.close(() => resolve());
+    target.closeAllConnections();
+  });
 }
 
 // `body` is JSON-encoded; `rawBody` is sent as is.
