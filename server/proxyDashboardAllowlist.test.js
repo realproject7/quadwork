@@ -136,16 +136,24 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   ok(JSON.parse(tokLoop.body).token === token, "(c) loopback dashboard gets the same token");
 
   // ── (b) Foreign host NOT in the allowlist: token 403 (DNS-rebind intact) ─
+  // #1215: the API rule refuses these before the token route runs.
   const foreignHost = await httpReq(PORT, { path: "/api/session-token", headers: { host: "evil.example" } });
-  ok(foreignHost.status === 403, "(b) GET /api/session-token with a foreign Host (not allowlisted) → 403");
+  ok(foreignHost.status === 403, "(b) GET /api/session-token with a foreign Host (not allowlisted) → 403 (API rule)");
   const foreignOrigin = await httpReq(PORT, { path: "/api/session-token", headers: { host: `localhost:${PORT}`, origin: "https://evil.example" } });
-  ok(foreignOrigin.status === 403, "(b) GET /api/session-token with a foreign Origin (not allowlisted) → 403");
+  ok(foreignOrigin.status === 403, "(b) GET /api/session-token with a foreign Origin (not allowlisted) → 403 (API rule)");
 
   // ── (d) Partial spoof: only ONE of Host/Origin is trusted → 403 ──────────
-  const spoofOrigin = await httpReq(PORT, { path: "/api/session-token", headers: { host: TRUSTED, origin: "https://evil.example" } });
-  ok(spoofOrigin.status === 403, "(d) trusted Host but foreign Origin → 403 (both must be allowlisted)");
-  const spoofHost = await httpReq(PORT, { path: "/api/session-token", headers: { host: "evil.example", origin: `https://${TRUSTED}` } });
-  ok(spoofHost.status === 403, "(d) foreign Host but trusted Origin → 403");
+  // Each mix pairs the trusted name with a loopback one. The API rule (#1215)
+  // admits it (GET /api/health → 200), so the 403 comes from the token rule:
+  // Host and Origin must both be loopback, or both be allowlisted.
+  for (const [label, headers] of [
+    ["trusted Host but loopback Origin", { host: TRUSTED, origin: `http://localhost:${PORT}` }],
+    ["loopback Host but trusted Origin", { host: `localhost:${PORT}`, origin: `https://${TRUSTED}` }],
+  ]) {
+    const health = await httpReq(PORT, { path: "/api/health", headers });
+    const tok = await httpReq(PORT, { path: "/api/session-token", headers });
+    ok(health.status === 200 && tok.status === 403, `(d) ${label}: the API rule admits it; the token rule → 403`);
+  }
 
   // ── (a) WS: trusted proxy Origin + Host + token → upgrade accepted ───────
   const wsGood = await tryWs(PORT, `${wsPath}&token=${token}`, proxyHeaders);
@@ -162,6 +170,14 @@ const ok = (c, m) => { assert.ok(c, m); passed++; console.log(`  PASS: ${m}`); }
   // ── (d) WS: partial spoof (trusted Host, foreign Origin) → 403 ───────────
   const wsSpoof = await tryWs(PORT, `${wsPath}&token=${token}`, { host: TRUSTED, origin: "https://evil.example" });
   ok(wsSpoof.open === false && wsSpoof.status === 403, "(d) WS with trusted Host but foreign Origin → 403, not opened");
+
+  // ── (d) WS: trusted Origin but an untrusted Host + VALID token → 403 ─────
+  // An allowlisted Origin opens the WS only through the trusted-proxy path,
+  // which needs the forwarded Host allowlisted too.
+  for (const [label, host] of [["a foreign Host", "evil.example"], ["a loopback Host", `localhost:${PORT}`]]) {
+    const ws = await tryWs(PORT, `${wsPath}&token=${token}`, { host, origin: `https://${TRUSTED}` });
+    ok(ws.open === false && ws.status === 403, `(d) WS with trusted Origin but ${label} + valid token → 403, not opened`);
+  }
 
   // ── (b) WS: MATCHED foreign Host+Origin (both evil.example) + VALID token ──
   // The #968 same-host fallback must NOT open the WS here: the socket is loopback
