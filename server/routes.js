@@ -537,6 +537,24 @@ function preserveProjectEnvironmentSettings(existing, incoming) {
   }
 }
 
+// #1216: PUT and PATCH /api/config store a body project whose id is not in the
+// config as a new project, and ~/.quadwork/<id> paths are built from that id.
+// A new id must pass the new-id rule (assertNewProjectId). An id the config
+// already holds is kept as it is, even one that fails that rule (#1203, #1210).
+// Ids are matched as the routes match projects: by exact value.
+function assertConfigWriteProjectIds(ids, config) {
+  const configured = new Set(Array.isArray(config?.projects) ? config.projects.map((project) => project?.id) : []);
+  for (const id of ids) if (!configured.has(id)) assertNewProjectId(id);
+}
+
+// config.json before config.lock is taken, for the first id check, so that a
+// refused id touches nothing. As in add-config's first check, a config.json
+// that is missing or cannot be read or parsed holds no projects.
+function readConfigBeforeLock() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
+  catch { return null; }
+}
+
 router.put("/api/config", (req, res) => {
   // #1172: same model-id check as the PATCH below (every config write path).
   const invalidModels = invalidAgentModelRefs(req.body && req.body.projects);
@@ -545,12 +563,18 @@ router.put("/api/config", (req, res) => {
   }
   try {
     const body = req.body;
+    // #1216: the body's projects replace the config's, so each one is stored.
+    const projectIds = Array.isArray(body?.projects) ? body.projects.map((project) => project?.id) : [];
+    assertConfigWriteProjectIds(projectIds, readConfigBeforeLock());
     const dir = path.dirname(CONFIG_PATH);
     ensureSecureDir(dir);
     // Reconcile the caller snapshot only after updateConfig has acquired the
     // shared lock and read the live document. This closes both stale lifecycle
     // overwrite and V1→V2 activation races between request parsing and commit.
     updateConfig((cfg) => {
+      // #1216: again against the config read under the lock, since another
+      // writer may have removed a project after the first check.
+      assertConfigWriteProjectIds(projectIds, cfg);
       const candidate = JSON.parse(JSON.stringify(body));
       delete candidate[RETIRED_GLOBAL_AGENT_FIELD];
       const liveHasInstallationId = Object.prototype.hasOwnProperty.call(cfg, "installation_id");
@@ -599,6 +623,7 @@ router.put("/api/config", (req, res) => {
     }
     res.json({ ok: true });
   } catch (err) {
+    if (err instanceof RepositoryProvisionError) return res.status(400).json({ ok: false, error: err.message, code: err.code });
     if (sendV2ConfigurationError(res, err)) return;
     if (err.code === "QW_INSTALLATION_ID_ROTATION") {
       return res.status(409).json({ error: "installation_id cannot be introduced or replaced here" });
@@ -627,7 +652,12 @@ const CONFIG_MERGE_EXCLUDED = new Set([
 router.patch("/api/config", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   try {
+    // #1216: the merge below skips a body project whose id is falsy.
+    const projectIds = Array.isArray(body.projects) ? body.projects.map((project) => project?.id).filter(Boolean) : [];
+    assertConfigWriteProjectIds(projectIds, readConfigBeforeLock());
     const mutator = (cfg) => {
+      // #1216: again against the config read under the lock, as in the PUT.
+      assertConfigWriteProjectIds(projectIds, cfg);
       // #1176: a project archived on disk is ignored in the body (checked
       // under the lock), so a stale Settings tab can't rewrite or heal its
       // agents, nor block the save with its model.
@@ -689,6 +719,7 @@ router.patch("/api/config", (req, res) => {
     updateConfig(mutator);
   } catch (err) {
     if (err.code === "QW_INVALID_MODEL_ID") return res.status(400).json({ ok: false, error: err.message });
+    if (err instanceof RepositoryProvisionError) return res.status(400).json({ ok: false, error: err.message, code: err.code });
     if (sendV2ConfigurationError(res, err)) return;
     if (err.code === "QW_INSTALLATION_ID_ROTATION") {
       return res.status(409).json({ error: "installation_id cannot be introduced or replaced here" });
@@ -1945,7 +1976,8 @@ function namesOneDirectDirectory(projectId) {
 // the project-id rule, since CLI setup names a project after its folder. An
 // unconfigured id gets 404 if it passes the rule, else 400. A config.json that
 // cannot be read or parsed, or is missing, gets 503 with the admission check's
-// code and is not created. Each refusal comes before any write.
+// code and is not created. Each refusal comes before any write. GET
+// /api/batch-progress checks its id with this rule too (#1216).
 function assertChatProject(projectId) {
   let config;
   try { config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
@@ -6238,6 +6270,11 @@ async function computeBatchProgress(projectId, contextOrRepo, admission = projec
 router.get("/api/batch-progress", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  // #1216: the batch snapshot helpers build ~/.quadwork/<id> paths, and they
+  // treat an id that is not configured as archived, which removes
+  // <id>/batch-progress-cache.json. The chat routes' rule comes first.
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   const data = await getOrComputeBatchProgress(projectId);
   if (data === null) return res.status(400).json({ error: "No repo configured for project" });
   return res.json(data);
