@@ -539,13 +539,26 @@ function preserveProjectEnvironmentSettings(existing, incoming) {
 
 // #1216: PUT and PATCH /api/config store a body project whose id is not in the
 // config as a new project, and ~/.quadwork/<id> paths are built from that id.
-// A new id must pass the new-id rule (assertNewProjectId), which also compares
-// it with the config's ids when letter case is ignored (#1219). An id the
-// config already holds is kept as it is, even one that fails that rule (#1203,
-// #1210). Ids are matched as the routes match projects: by exact value.
+// A new id must pass the new-id rule (assertNewProjectId). #1219: that rule
+// also compares it with the config's ids when letter case is ignored, and here
+// it must not match another new id in the body either, compared the same way.
+// An id the config already holds is kept as it is, even one that fails that
+// rule (#1203, #1210). Ids are matched as the routes match projects: by exact
+// value.
 function assertConfigWriteProjectIds(ids, config) {
   const configured = new Set(Array.isArray(config?.projects) ? config.projects.map((project) => project?.id) : []);
-  for (const id of ids) if (!configured.has(id)) assertNewProjectId(id, config);
+  const newIds = [];
+  for (const id of ids) {
+    if (configured.has(id)) continue;
+    assertNewProjectId(id, config);
+    const earlier = newIds.find((other) => sameNameIgnoringCase(other, id));
+    if (earlier !== undefined) {
+      throw new RepositoryProvisionError("invalid_project_id", earlier === id
+        ? `project id ${JSON.stringify(id)} appears more than once in this request`
+        : `project id matches new project ${JSON.stringify(earlier)} in this request except for letter case`);
+    }
+    newIds.push(id);
+  }
 }
 
 // config.json before config.lock is taken, for the first id check, so that a
@@ -564,9 +577,11 @@ router.put("/api/config", (req, res) => {
   }
   try {
     const body = req.body;
-    // #1219: the body replaces the config, so a projects value that is not an
-    // array would be stored as the config's projects, which the routes read as
-    // a list. It is refused before anything is written.
+    // #1219: the body replaces the config, and the routes read the config's
+    // projects as a list. A projects value that is not an array is refused
+    // here, before anything is written. Otherwise, on a legacy config or with
+    // no config.json, the write below stores it as given; on an activated
+    // config it is refused with 409, but only after config.lock is taken.
     if (body && Object.prototype.hasOwnProperty.call(body, "projects") && !Array.isArray(body.projects)) {
       return res.status(400).json({ ok: false, error: "projects must be an array", code: "invalid_projects" });
     }
@@ -5527,8 +5542,10 @@ router.get("/api/batch-active", async (req, res) => {
 
 // #807: parsed view of the server-authored GITHUB.md. Single source of truth is
 // the file, so this endpoint and file-reading agents see identical data. An id
-// with no configured repo gets 400 (a traversal id isn't in config → getRepo
-// null → 400). Surfaces freshness + a distinct parse-error result.
+// that is not configured gets 400 (getRepo null), a traversal id included, and
+// so does a configured project with no repo. A configured id is not checked
+// further: for a configured "../x" this reads ~/.quadwork/../x/GITHUB.md.
+// Surfaces freshness + a distinct parse-error result.
 router.get("/api/github-parsed", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
@@ -6540,9 +6557,11 @@ function v2RepositoryRecords(repositories) {
 // that `config` does not hold exactly, so configured ids are not affected.
 function assertNewProjectId(projectId, config) {
   assertProjectId(projectId);
-  const configured = Array.isArray(config?.projects) ? config.projects : [];
-  if (namesControlEntry(projectId) || configured.some((project) => sameNameIgnoringCase(project?.id, projectId))) {
-    throw new RepositoryProvisionError("invalid_project_id", "project id is reserved");
+  if (namesControlEntry(projectId)) throw new RepositoryProvisionError("invalid_project_id", "project id is reserved");
+  const clash = (Array.isArray(config?.projects) ? config.projects : []).find((project) => sameNameIgnoringCase(project?.id, projectId));
+  if (clash) {
+    throw new RepositoryProvisionError("invalid_project_id",
+      `project id matches configured project ${JSON.stringify(clash.id)} except for letter case`);
   }
   return projectId;
 }

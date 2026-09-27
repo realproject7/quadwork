@@ -20,12 +20,16 @@
 //
 // #1219, also pinned here:
 //   - a PUT whose projects is present and not an array gets 400
-//     invalid_projects and touches nothing. The PUT used to store it as given.
-//     PATCH never stores the body's projects value, so it leaves the config's
-//     projects as they are;
-//   - a new id that matches a configured id when letter case is ignored gets
-//     400 invalid_project_id and touches nothing. Two configured ids that
-//     differ only in case are both kept.
+//     invalid_projects and touches nothing. On a legacy config or none, the
+//     PUT used to store it as given; on a V2 config it got 409, after taking
+//     config.lock. PATCH never stores the body's projects value, so it leaves
+//     the config's projects as they are;
+//   - a new id that matches a configured id, or another new id in the same
+//     request, when letter case is ignored gets 400 invalid_project_id and
+//     touches nothing, also when another writer added the configured id after
+//     the route's first check. The message names the id it matches. Two
+//     configured ids that differ only in case are both kept, and a configured
+//     id with regex syntax characters refuses no other id.
 //
 // Run through `npm test` (server/run-tests.js), never directly.
 
@@ -153,29 +157,33 @@ function baselineSnapshot() {
   return snapshot();
 }
 
-// A body that would store a project with this id if the id were let through:
-// PUT sends the whole config with the project added, PATCH sends only that
-// project. The project has a chat_mode, which a Settings save never sends: it
+// A body that would store a project with each of these ids if the ids were let
+// through: PUT sends the whole config with the projects added, PATCH sends only
+// those projects. Each has a chat_mode, which a Settings save never sends: it
 // sends each project's id, name and agents.
-function probeBody(method, config, id) {
-  const probe = { id, name: "Probe", agents: {}, chat_mode: "file" };
-  if (method === "PATCH") return { projects: [probe] };
-  return config ? { ...config, projects: [...config.projects, probe] } : { port: 1, operator_name: "user", projects: [probe] };
+function probeBody(method, config, ids) {
+  const probes = ids.map((id) => ({ id, name: "Probe", agents: {}, chat_mode: "file" }));
+  if (method === "PATCH") return { projects: probes };
+  return config ? { ...config, projects: [...config.projects, ...probes] } : { port: 1, operator_name: "user", projects: probes };
 }
 
-// Refused requests: 400 invalid_project_id, nothing touched. ~/.quadwork starts
-// each case at 0755, so hardening it to 0700, which the PUT and config.lock
-// both do, shows up too. Every case runs, and a failure lists each case that
-// went wrong.
+// Refused requests: 400 invalid_project_id, nothing touched, and the message
+// when a case gives one. ~/.quadwork starts each case at 0755, so hardening it
+// to 0700, which the PUT and config.lock both do, shows up too. Every case
+// runs, and a failure lists each case that went wrong.
 async function assertRefused(cases) {
   const wrong = [];
-  for (const { label, kind, method, id, ids } of cases) {
-    const config = writeConfig(kind, ids);
+  for (const { label, kind, method, id, newIds = [id], configuredIds, error } of cases) {
+    const config = writeConfig(kind, configuredIds);
     fs.chmodSync(CONFIG_DIR, 0o755);
     const beforeSnapshot = baselineSnapshot();
-    const response = await request(method, probeBody(method, config, id));
+    const response = await request(method, probeBody(method, config, newIds));
     const actual = { status: response.status, code: response.json?.code, touched: changes(beforeSnapshot, snapshot()) };
     const expected = { status: 400, code: "invalid_project_id", touched: [] };
+    if (error !== undefined) {
+      actual.error = response.json?.error;
+      expected.error = error;
+    }
     if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: label, actual, expected });
   }
   assert.deepEqual(wrong, []);
@@ -238,9 +246,94 @@ const CASE_VARIANTS = [
 ];
 
 test("a new id that matches a configured id when letter case is ignored gets 400 and touches nothing", async () => {
-  const ids = [...new Set(CASE_VARIANTS.map(([configured]) => configured))];
+  const configuredIds = [...new Set(CASE_VARIANTS.map(([configured]) => configured))];
+  // The message names the configured project, except for "my project", which
+  // the project-id rule refuses first.
+  const errorFor = (configured, id) => (id === "my project"
+    ? "project id is invalid"
+    : `project id matches configured project ${JSON.stringify(configured)} except for letter case`);
   await assertRefused(["legacy", "v2"].flatMap((kind) => METHODS.flatMap((method) =>
-    CASE_VARIANTS.map(([configured, id]) => ({ label: `${kind} config: ${method} ${id} (${configured} is configured)`, kind, method, id, ids })))));
+    CASE_VARIANTS.map(([configured, id]) => ({
+      label: `${kind} config: ${method} ${id} (${configured} is configured)`, kind, method, id, configuredIds, error: errorFor(configured, id),
+    })))));
+});
+
+test("new ids in one request that match each other when letter case is ignored get 400 and touch nothing", async () => {
+  // Neither id is configured. On a legacy config, or none, both used to be
+  // stored.
+  const PAIRS = [
+    [["beta", "BETA"], 'project id matches new project "beta" in this request except for letter case'],
+    [["Beta", "bETA"], 'project id matches new project "Beta" in this request except for letter case'],
+    [["beta", "beta"], 'project id "beta" appears more than once in this request'],
+  ];
+  await assertRefused(KINDS.flatMap((kind) => METHODS.flatMap((method) => PAIRS.map(([newIds, error]) => ({
+    label: `${kind} config: ${method} ${newIds.join(" and ")}`, kind, method, newIds, error,
+  })))));
+});
+
+test("a new id that matches an id another writer added before config.lock is held gets 400", async () => {
+  // The route's first read has no alpha, so ALPHA passes the first check. By
+  // the time config.lock is held, another writer has added alpha. A legacy
+  // config, where nothing else refuses ALPHA.
+  const wrong = [];
+  for (const method of METHODS) {
+    const stale = configFor("legacy", [LEGACY_ID]);
+    writeConfig("legacy", [LEGACY_ID, "alpha"]);
+    const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
+    fs.chmodSync(CONFIG_DIR, 0o755);
+    const beforeSnapshot = baselineSnapshot();
+    const readFileSync = fs.readFileSync;
+    let staleReads = 0;
+    fs.readFileSync = function (file, ...rest) {
+      if (file === CONFIG_PATH && staleReads === 0) {
+        staleReads += 1;
+        return JSON.stringify(stale);
+      }
+      return readFileSync.call(this, file, ...rest);
+    };
+    let response;
+    // The body is built from the config the tab loaded before alpha was added.
+    try { response = await request(method, probeBody(method, stale, ["ALPHA"])); }
+    finally { fs.readFileSync = readFileSync; }
+    const actual = {
+      staleReads,
+      status: response.status,
+      code: response.json?.code,
+      error: response.json?.error,
+      configUnchanged: fs.readFileSync(CONFIG_PATH, "utf8") === configBytes,
+      touched: changes(beforeSnapshot, snapshot()),
+    };
+    // By then the route had taken config.lock, which hardens ~/.quadwork to
+    // 0700. Nothing was created, changed or removed below it.
+    const expected = {
+      staleReads: 1,
+      status: 400,
+      code: "invalid_project_id",
+      error: 'project id matches configured project "alpha" except for letter case',
+      configUnchanged: true,
+      touched: ["changed home/.quadwork"],
+    };
+    if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: method, actual, expected });
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test("a configured id with regex syntax characters refuses no other new id", async () => {
+  // The case check builds a RegExp from each configured id. Unescaped, "a.b"
+  // would match "aXb", and "Proj (old" would not compile.
+  const configuredIds = [LEGACY_ID, "a.b", "Proj (old"];
+  for (const method of METHODS) {
+    const config = writeConfig("legacy", configuredIds);
+    const response = await request(method, probeBody(method, config, ["aXb", "proj-old"]));
+    assert.deepEqual({ status: response.status, json: response.json }, { status: 200, json: { ok: true } }, `${method}: response`);
+    assert.deepEqual(JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")).projects.map((project) => project.id),
+      [...configuredIds, "aXb", "proj-old"], `${method}: configured ids`);
+  }
+  // A new id that matches "a.b" when case is ignored is still refused.
+  await assertRefused(METHODS.map((method) => ({
+    label: `legacy config: ${method} A.B`, kind: "legacy", method, id: "A.B", configuredIds,
+    error: 'project id matches configured project "a.b" except for letter case',
+  })));
 });
 
 test("a PUT whose projects is present and not an array gets 400 and touches nothing", async () => {
@@ -353,7 +446,7 @@ test("a valid new id is still written", async () => {
       const config = writeConfig(kind);
       const id = `fresh-${method.toLowerCase()}-${kind}`;
       const beforeSnapshot = baselineSnapshot();
-      const response = await request(method, probeBody(method, config, id));
+      const response = await request(method, probeBody(method, config, [id]));
       assert.deepEqual({ status: response.status, json: response.json }, { status: 200, json: { ok: true } }, `${method} ${kind}: response`);
       const projects = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")).projects;
       assert.deepEqual(projects.map((project) => project.id), [...(config ? [LEGACY_ID, "alpha"] : []), id], `${method} ${kind}: configured ids`);

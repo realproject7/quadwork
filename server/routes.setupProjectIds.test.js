@@ -30,7 +30,8 @@
 // ~/.quadwork/<id>. Such an id gets 400 and touches nothing on add-config and
 // on each V2 setup step. add-config's V2 path also refuses it under
 // config.lock, when another writer added the configured id after the step's
-// first check. Configured ids that differ only in case behave as before.
+// first check. Configured ids that differ only in case behave as before, and a
+// configured id with regex syntax characters refuses no other new id.
 //
 // Run through `npm test` (server/run-tests.js), never directly.
 
@@ -420,6 +421,26 @@ test("configured ids that differ only in letter case behave as before on every s
       ],
     };
     if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${kind} config: add-config ALPHA`, actual, expected });
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test("on the V2 setup steps, a configured id with regex syntax characters refuses no other new id", async () => {
+  // The case check builds a RegExp from each configured id. Unescaped, "a.b"
+  // would match "aXb", and "Proj (old" would not compile.
+  const wrong = [];
+  for (const kind of ["legacy", "v2"]) {
+    writeConfig(kind, [CONFIGURED[kind], configuredAs(kind, "a.b"), configuredAs(kind, "Proj (old")]);
+    for (const id of ["aXb", "proj-old"]) {
+      for (const step of V2_STEPS) {
+        const beforeSnapshot = baselineSnapshot();
+        // The body has no repositories, so the check after the id check refuses it.
+        const response = await request({ id, confirm: true }, step);
+        const actual = { status: response.status, code: response.json?.code, touched: changes(beforeSnapshot, snapshot()) };
+        const expected = { status: step === "activate-v2" ? 400 : 200, code: "repositories_required", touched: [] };
+        if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${kind} config: ${step} ${id}`, actual, expected });
+      }
+    }
   }
   assert.deepEqual(wrong, []);
 });
