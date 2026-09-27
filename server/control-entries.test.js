@@ -3,11 +3,14 @@
 // check in setup use it. The names below are spelled out here, not read from
 // the module, so dropping an entry there fails this file.
 //
+// #1219: sameNameIgnoringCase compares two names as the entries are compared.
+// The new-id checks use it to compare a new id with the configured ids.
+//
 // Run through `npm test` (server/run-tests.js), never directly.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { namesControlEntry } = require("./control-entries");
+const { namesControlEntry, sameNameIgnoringCase } = require("./control-entries");
 
 // The names for which namesControlEntry does not answer `expected`.
 function wrong(names, expected) {
@@ -55,4 +58,24 @@ test("a project name close to an entry is not an entry", () => {
 
 test("a value that is not a string is not an entry", () => {
   assert.deepEqual([undefined, null, 7, {}, ["config.json"]].filter((value) => namesControlEntry(value)), []);
+});
+
+test("two names that differ only in letter case are the same name, either way round", () => {
+  const SAME = [
+    ["alpha", "ALPHA"], ["My Project", "my project"], ["a.b", "A.B"], ["Proj (old", "proj (OLD"],
+    // LONG S folds to "s" and KELVIN SIGN to "k", as for the entries.
+    ["\u017Fcout", "SCOUT"], ["\u212Aite", "kite"],
+  ];
+  assert.deepEqual(SAME.filter(([a, b]) => !sameNameIgnoringCase(a, b) || !sameNameIgnoringCase(b, a)), []);
+});
+
+test("a name is compared as text, so regex syntax characters in it match only themselves", () => {
+  // Every character with a meaning in a RegExp, and "/".
+  const SYNTAX = "^$\\.*+?()[]{}|/";
+  assert.equal(sameNameIgnoringCase(SYNTAX, SYNTAX), true);
+  const DIFFERENT = [
+    ["a.b", "aXb"], ["a|b", "a"], ["a|b", "b"], ["x*", "xxx"], ["[ab]", "a"], ["Proj (old", "Proj old"],
+    [SYNTAX, "x"], ["alpha", "alpha2"], ["alpha", 7], [7, "7"], [null, null],
+  ];
+  assert.deepEqual(DIFFERENT.filter(([a, b]) => sameNameIgnoringCase(a, b) || sameNameIgnoringCase(b, a)), []);
 });

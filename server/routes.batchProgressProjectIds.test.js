@@ -18,6 +18,13 @@
 // out of ~/.quadwork or out of HOME still lands where the snapshot sees it.
 // Configured projects, archived included, are served as before.
 //
+// #1219: GET /api/batch-active runs the same helpers, and the sidebar polls it
+// for every project. It checked only that the id was a configured project with
+// a repository, so a configured id such as "../edited" still had its snapshot
+// file removed outside ~/.quadwork. It now checks its id with the same rule:
+// each refusal case below runs on both routes, and configured projects are
+// served by both as before.
+//
 // Run through `npm test` (server/run-tests.js), never directly.
 
 const { test, before, after } = require("node:test");
@@ -92,13 +99,15 @@ const express = require("express");
 
 let server;
 
-function request(query) {
+const ROUTES = ["batch-progress", "batch-active"];
+
+function request(route, query) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: "127.0.0.1",
       port: server.address().port,
       method: "GET",
-      path: `/api/batch-progress?${query}`,
+      path: `/api/${route}?${query}`,
       agent: false,
     }, (res) => {
       let text = "";
@@ -147,20 +156,22 @@ function baselineSnapshot() {
 }
 
 // Refused requests: exact status (and error code when given), nothing touched.
-// Every case runs, and a failure lists each case that went wrong.
+// Every case runs on each route, and a failure lists each case that went wrong.
 async function assertRefused(cases) {
   const wrong = [];
-  for (const { query, status, code, label } of cases) {
-    plant();
-    const beforeSnapshot = baselineSnapshot();
-    const response = await request(query);
-    const actual = { status: response.status, touched: changes(beforeSnapshot, snapshot()) };
-    const expected = { status, touched: [] };
-    if (code) {
-      actual.code = response.json?.code;
-      expected.code = code;
+  for (const route of ROUTES) {
+    for (const { query, status, code, label } of cases) {
+      plant();
+      const beforeSnapshot = baselineSnapshot();
+      const response = await request(route, query);
+      const actual = { status: response.status, touched: changes(beforeSnapshot, snapshot()) };
+      const expected = { status, touched: [] };
+      if (code) {
+        actual.code = response.json?.code;
+        expected.code = code;
+      }
+      if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${route}: ${label}`, actual, expected });
     }
-    if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: label, actual, expected });
   }
   assert.deepEqual(wrong, []);
 }
@@ -248,27 +259,34 @@ test("a missing config.json gets 503 and is not created", async () => {
 
 test("configured projects are served as before, archived included", async () => {
   const retired = (id) => [`changed home/.quadwork/${id}`, `removed home/.quadwork/${id}/batch-progress-cache.json`];
+  // batch-active answers from the same payload: no current batch here.
+  const inactive = { active: false, current: false, owned: false, provenance: "legacy_unowned", compatibility_mode: "v1" };
+  const noRepo = { error: "No repo configured for project" };
   const CASES = [
     // An empty Active Batch retires the snapshot file.
-    { id: "alpha", status: 200, fields: { active: false, liveActiveBatchCleared: true, _archived: undefined }, touched: retired("alpha") },
-    { id: LEGACY_ID, status: 200, fields: { active: false, liveActiveBatchCleared: true, _archived: undefined }, touched: retired(LEGACY_ID) },
+    { route: "batch-progress", id: "alpha", status: 200, fields: { active: false, liveActiveBatchCleared: true, _archived: undefined }, touched: retired("alpha") },
+    { route: "batch-progress", id: LEGACY_ID, status: 200, fields: { active: false, liveActiveBatchCleared: true, _archived: undefined }, touched: retired(LEGACY_ID) },
     // An archived project is served read-only, and its snapshot is retired.
-    { id: "arch", status: 200, fields: { active: false, liveActiveBatchCleared: false, _archived: true, _readonly: true }, touched: retired("arch") },
+    { route: "batch-progress", id: "arch", status: 200, fields: { active: false, liveActiveBatchCleared: false, _archived: true, _readonly: true }, touched: retired("arch") },
     // A configured project with no repository.
-    { id: "norepo", status: 400, fields: { error: "No repo configured for project" }, touched: [] },
+    { route: "batch-progress", id: "norepo", status: 400, fields: noRepo, touched: [] },
+    { route: "batch-active", id: "alpha", status: 200, fields: inactive, touched: retired("alpha") },
+    { route: "batch-active", id: LEGACY_ID, status: 200, fields: inactive, touched: retired(LEGACY_ID) },
+    { route: "batch-active", id: "arch", status: 200, fields: inactive, touched: retired("arch") },
+    { route: "batch-active", id: "norepo", status: 400, fields: noRepo, touched: [] },
   ];
   const wrong = [];
-  for (const { id, status, fields, touched } of CASES) {
+  for (const { route, id, status, fields, touched } of CASES) {
     plant();
     const beforeSnapshot = baselineSnapshot();
-    const response = await request(`project=${encodeURIComponent(id)}`);
+    const response = await request(route, `project=${encodeURIComponent(id)}`);
     const actual = {
       status: response.status,
       fields: Object.fromEntries(Object.keys(fields).map((key) => [key, response.json?.[key]])),
       touched: changes(beforeSnapshot, snapshot()),
     };
     const expected = { status, fields, touched };
-    if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: id, actual, expected });
+    if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${route}: ${id}`, actual, expected });
   }
   assert.deepEqual(wrong, []);
 });
