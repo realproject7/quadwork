@@ -188,6 +188,11 @@ async function main() {
     const untrusted = await get(server, "/api/agent-model-catalog", UNTRUSTED);
     ok(untrusted.status === 200 && JSON.stringify(untrusted.body.models.codex) === '["gpt-7-nova"]' && JSON.stringify(untrusted.body.models.grok) === '["grok-5"]',
       "#1176: an untrusted caller gets the bare-name CLIs' models only");
+    // The token rule compares an Origin's host as the URL parser returns it; a
+    // non-http scheme keeps "LOCALHOST" uppercase, so this caller is not trusted.
+    const upper = await get(server, "/api/agent-model-catalog", { origin: "x://LOCALHOST" });
+    ok(upper.status === 200 && JSON.stringify(upper.body.models.codex) === '["gpt-7-nova"]',
+      "#1215: an Origin of x://LOCALHOST is not trusted by the catalog's check");
     ok(markerRuns().sort().join("|") === "home-grok models|path-codex debug models",
       "#1176: an untrusted caller never runs a config-derived executable");
 

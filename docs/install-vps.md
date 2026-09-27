@@ -636,6 +636,8 @@ server {
 ```
 
 `proxy_read_timeout 86400` and WebSocket headers are required for live agent terminal connections.
+`proxy_set_header Host $host` is required too: QuadWork checks the browser's host against
+`trusted_dashboard_hosts` on every API request (#1215).
 Keep the authentication directives and exact `/api/resources` exclusion when applying Step 10 or
 when Certbot rewrites this server block; basic auth does not make host-capacity
 facts part of the public dashboard surface.

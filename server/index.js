@@ -138,9 +138,8 @@ const ptyStopOperations = new WeakMap();
 
 // #968: shared session token gating the PTY-driving surface (/ws/terminal,
 // /write, /interrupt). Auto-provisioned + persisted to config.json
-// so the LOCAL dashboard attaches it with zero operator friction; tailnet/LAN
-// exposure must supply it out-of-band (see docs/*). Kept out of any response
-// except the localhost-only /api/session-token endpoint.
+// so the LOCAL dashboard attaches it with zero operator friction. Kept out of
+// any response except the localhost-only /api/session-token endpoint.
 let SESSION_TOKEN =
   typeof config.session_token === "string" && config.session_token
     ? config.session_token
@@ -266,10 +265,10 @@ app.get("/api/health", (_req, res) => {
 // auto-attach it to WS + PTY-write calls with no operator action. The guard
 // checks socket IP + Host + Origin are all loopback (see isLocalTokenRequest)
 // so a DNS-rebinding page or a same-host reverse proxy can't pull the token to
-// a remote origin. Non-loopback (tailnet/LAN/proxied) callers get 403 and must
-// configure the token out-of-band — it is never leaked off-box. The one
-// exception (#988) is an operator-configured trusted_dashboard_hosts allowlist
-// for an authenticated on-box reverse proxy (see isTrustedProxyRequest).
+// a remote origin. Non-loopback (tailnet/LAN/proxied) callers get 403 — the
+// token is never leaked off-box. The one exception (#988) is an
+// operator-configured trusted_dashboard_hosts allowlist for an authenticated
+// on-box reverse proxy (see isTrustedProxyRequest).
 app.get("/api/session-token", (req, res) => {
   if (!isLocalTokenRequest(req) && !isTrustedProxyRequest(req))
     return res.status(403).json({ error: "Local access only" });
@@ -327,16 +326,20 @@ function isApiHostname(hostname) {
 
 // #1215: the rule every /api request must pass (mounted ahead of all routes).
 // The socket must be loopback. The Host must name a loopback host or a trusted
-// entry, and so must the Origin when one is sent. A browser sends
-// `Sec-Fetch-Site: cross-site` on a request made by a page from another site;
-// that request is refused too. /api/session-token applies its stricter check
-// on top of this one. The terminal WebSocket upgrade has its own check
+// entry, and so must the Origin when one is sent. A proxy that rewrites Host
+// (`next dev` does) sends the browser's host in X-Forwarded-Host; when that
+// header is sent, every host it lists must pass the same check. A browser
+// sends `Sec-Fetch-Site: cross-site` on a request made by a page from another
+// site; that request is refused too. /api/session-token applies its stricter
+// check on top of this one. The terminal WebSocket upgrade has its own check
 // (isAllowedWsOrigin).
 function isLocalApiRequest(req) {
   if (!isLocalhost(req.socket.remoteAddress)) return false;
   if (!isApiHostname(hostnameOfHostHeader(req.headers.host))) return false;
   const origin = req.headers.origin;
   if (origin && !isApiHostname(hostnameOfOrigin(origin))) return false;
+  const forwardedHost = req.headers["x-forwarded-host"];
+  if (forwardedHost && !forwardedHost.split(",").every((host) => isApiHostname(hostnameOfHostHeader(host.trim())))) return false;
   return req.headers["sec-fetch-site"] !== "cross-site";
 }
 
@@ -368,14 +371,19 @@ function isTrustedProxyRequest(req) {
 // to 127.0.0.1) or a same-host reverse proxy keeps `req.ip` at 127.0.0.1 while
 // the browser's Host/Origin is a REMOTE name. Require the socket IP AND the Host
 // header AND the Origin (when the browser sends one) to all be loopback.
-// Remote/proxied/tailnet access uses the out-of-band localStorage token instead.
+// Remote access goes through a trusted on-box proxy (isTrustedProxyRequest).
 function isLocalTokenRequest(req) {
   if (!isLocalhost(req.ip)) return false;
   if (!isLoopbackHostHeader(req.headers.host)) return false;
   // Origin (present on cross-origin/CORS requests) is a full URL, not a bare
-  // host — parse it directly and require loopback too.
+  // host — parse it directly and require loopback too. The hostname is
+  // compared as the URL parser returns it, without lowercasing.
   const origin = req.headers.origin;
-  if (origin && !isLoopbackHostname(hostnameOfOrigin(origin))) return false;
+  if (origin) {
+    let o;
+    try { o = new URL(origin); } catch { return false; }
+    if (!isLoopbackHostname(o.hostname)) return false;
+  }
   return true;
 }
 
