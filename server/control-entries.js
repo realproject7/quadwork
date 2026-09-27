@@ -53,4 +53,11 @@ function namesControlEntry(name) {
   return typeof name === "string" && CONTROL_ENTRY_PATTERNS.some((pattern) => pattern.test(name));
 }
 
-module.exports = { namesControlEntry };
+// #1219: whether two names are the same name when letter case is ignored,
+// compared as the entries above are.
+function sameNameIgnoringCase(a, b) {
+  return typeof a === "string" && typeof b === "string" &&
+    new RegExp(`^${a.replace(/[$()*+.?[\\\]^{|}]/g, "\\$&")}$`, "iu").test(b);
+}
+
+module.exports = { namesControlEntry, sameNameIgnoringCase };

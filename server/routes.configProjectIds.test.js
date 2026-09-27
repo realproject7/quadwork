@@ -18,6 +18,15 @@
 // The snapshot covers the whole root, which holds HOME, with each entry's mode
 // and mtime, so config.lock being taken shows up as a change to ~/.quadwork.
 //
+// #1219, also pinned here:
+//   - a PUT whose projects is present and not an array gets 400
+//     invalid_projects and touches nothing. The PUT used to store it as given.
+//     PATCH never stores the body's projects value, so it leaves the config's
+//     projects as they are;
+//   - a new id that matches a configured id when letter case is ignored gets
+//     400 invalid_project_id and touches nothing. Two configured ids that
+//     differ only in case are both kept.
+//
 // Run through `npm test` (server/run-tests.js), never directly.
 
 const { test, before, after } = require("node:test");
@@ -48,10 +57,13 @@ const LEGACY_ID = "My Project";
 const ENTRY_ID = "agentchattr";
 
 // A project record in the shape a write of that kind of config leaves it: an
-// activated config's write adds the two environment settings.
+// activated config's write adds the two environment settings. Its repository
+// and folder are named after the id's bytes, so ids that differ only in letter
+// case get their own, as an activated config requires.
 function projectAs(kind, id) {
-  const repo = `acme/${id.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
-  const workingDir = path.join(WORK, id);
+  const slug = Buffer.from(id).toString("hex");
+  const repo = `acme/${slug}`;
+  const workingDir = path.join(WORK, slug);
   return kind === "v2"
     ? {
       id, name: id, agents: {}, chat_mode: "file",
@@ -142,8 +154,9 @@ function baselineSnapshot() {
 }
 
 // A body that would store a project with this id if the id were let through:
-// PUT sends the whole config with the project added, PATCH sends the project
-// in the shape the Settings save uses.
+// PUT sends the whole config with the project added, PATCH sends only that
+// project. The project has a chat_mode, which a Settings save never sends: it
+// sends each project's id, name and agents.
 function probeBody(method, config, id) {
   const probe = { id, name: "Probe", agents: {}, chat_mode: "file" };
   if (method === "PATCH") return { projects: [probe] };
@@ -156,8 +169,8 @@ function probeBody(method, config, id) {
 // went wrong.
 async function assertRefused(cases) {
   const wrong = [];
-  for (const { label, kind, method, id } of cases) {
-    const config = writeConfig(kind);
+  for (const { label, kind, method, id, ids } of cases) {
+    const config = writeConfig(kind, ids);
     fs.chmodSync(CONFIG_DIR, 0o755);
     const beforeSnapshot = baselineSnapshot();
     const response = await request(method, probeBody(method, config, id));
@@ -211,8 +224,61 @@ test("a new id that names a QuadWork control entry gets 400 and touches nothing"
     CONTROL_ENTRY_IDS.map((id) => ({ label: `${kind} config: ${method} ${id}`, kind, method, id })))));
 });
 
+// #1219: a configured id and a new id that matches it when letter case is
+// ignored. On a case-insensitive file system, such as the macOS default, both
+// projects would share one ~/.quadwork/<id>. Case is ignored as for control
+// entries: LONG S folds to "s" and KELVIN SIGN to "k". "my project" also fails
+// the project-id rule, for its space.
+const CASE_VARIANTS = [
+  ["alpha", "ALPHA"],
+  ["alpha", "Alpha"],
+  [LEGACY_ID, "my project"],
+  ["\u017Fcout", "scout"],
+  ["\u212Aite", "kite"],
+];
+
+test("a new id that matches a configured id when letter case is ignored gets 400 and touches nothing", async () => {
+  const ids = [...new Set(CASE_VARIANTS.map(([configured]) => configured))];
+  await assertRefused(["legacy", "v2"].flatMap((kind) => METHODS.flatMap((method) =>
+    CASE_VARIANTS.map(([configured, id]) => ({ label: `${kind} config: ${method} ${id} (${configured} is configured)`, kind, method, id, ids })))));
+});
+
+test("a PUT whose projects is present and not an array gets 400 and touches nothing", async () => {
+  const NOT_ARRAYS = [["null", null], ["object", {}], ["project", { id: "fresh" }], ["string", "fresh"], ["number", 7], ["true", true], ["false", false]];
+  const wrong = [];
+  for (const kind of KINDS) {
+    for (const [label, projects] of NOT_ARRAYS) {
+      const config = writeConfig(kind);
+      fs.chmodSync(CONFIG_DIR, 0o755);
+      const beforeSnapshot = baselineSnapshot();
+      const response = await request("PUT", { ...(config || { port: 1, operator_name: "user" }), projects });
+      const actual = { status: response.status, json: response.json, touched: changes(beforeSnapshot, snapshot()) };
+      const expected = { status: 400, json: { ok: false, error: "projects must be an array", code: "invalid_projects" }, touched: [] };
+      if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${kind} config: ${label}`, actual, expected });
+    }
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test("a PATCH whose projects is not an array leaves the config's projects as they are", async () => {
+  // The merge never assigns the body's projects value, and it merges projects
+  // only from an array.
+  const wrong = [];
+  for (const kind of ["legacy", "v2"]) {
+    for (const projects of [null, {}, { id: "fresh" }, "fresh", 7, true, false]) {
+      const config = writeConfig(kind);
+      const response = await request("PATCH", { projects });
+      const stored = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")).projects;
+      if (!isDeepStrictEqual(stored, config.projects)) wrong.push({ case: `${kind} config: ${JSON.stringify(projects)}`, status: response.status, stored });
+    }
+  }
+  assert.deepEqual(wrong, []);
+});
+
 test("ids already in the config are kept as they are, even ones that fail the new-id rule", async () => {
-  const IDS = [LEGACY_ID, ENTRY_ID, "alpha"];
+  // #1219: alpha and ALPHA differ only in letter case. Both are configured, so
+  // neither is new.
+  const IDS = [LEGACY_ID, ENTRY_ID, "alpha", "ALPHA"];
   for (const kind of ["legacy", "v2"]) {
     for (const method of METHODS) {
       writeConfig(kind, IDS);

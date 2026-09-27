@@ -25,6 +25,13 @@
 // refuses it under config.lock too, as in the third case. A configured id with
 // such a name behaves as before on all four steps.
 //
+// #1219: a new id must also not match a configured id when letter case is
+// ignored: on a case-insensitive file system both projects would share one
+// ~/.quadwork/<id>. Such an id gets 400 and touches nothing on add-config and
+// on each V2 setup step. add-config's V2 path also refuses it under
+// config.lock, when another writer added the configured id after the step's
+// first check. Configured ids that differ only in case behave as before.
+//
 // Run through `npm test` (server/run-tests.js), never directly.
 
 const { test, before, after } = require("node:test");
@@ -322,6 +329,97 @@ test("on the V2 setup steps, a configured id that names a QuadWork control entry
       const expected = { status: step === "activate-v2" ? 400 : 200, code: "repositories_required", touched: [] };
       if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${kind} config: ${step}`, actual, expected });
     }
+  }
+  assert.deepEqual(wrong, []);
+});
+
+// #1219: a configured id and a new id that matches it when letter case is
+// ignored. Case is ignored as for control entries: LONG S folds to "s" and
+// KELVIN SIGN to "k". "my project" also fails the project-id rule, for its
+// space.
+const CASE_VARIANTS = [
+  ["alpha", "ALPHA"],
+  ["alpha", "Alpha"],
+  [LEGACY_ID, "my project"],
+  ["\u017Fcout", "scout"],
+  ["\u212Aite", "kite"],
+];
+
+test("a new id that matches a configured id when letter case is ignored gets 400 and touches nothing on every setup step", async () => {
+  await assertRefused(["legacy", "v2"].flatMap((kind) => {
+    const projects = [CONFIGURED[kind], ...["alpha", "\u017Fcout", "\u212Aite"].map((id) => configuredAs(kind, id))];
+    return CASE_VARIANTS.flatMap(([configured, id]) => [
+      ...V2_STEPS.map((step) => ({ label: `${kind} config: ${step} ${id} (${configured} is configured)`, kind, projects, step, body: v2ProbeBody(id) })),
+      { label: `${kind} config: add-config ${id} (${configured} is configured)`, kind, projects, body: probeBody(id) },
+    ]);
+  }));
+});
+
+test("on the V2 path, a new id that matches an id another writer added before config.lock is held gets 400", async () => {
+  // The step's first read has no alpha, so ALPHA passes the first check. By
+  // the time config.lock is held, another writer has added alpha.
+  writeConfig("v2", [CONFIGURED.v2, configuredAs("v2", "alpha")]);
+  const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
+  fs.chmodSync(CONFIG_DIR, 0o755);
+  const beforeSnapshot = baselineSnapshot();
+  const readFileSync = fs.readFileSync;
+  let staleReads = 0;
+  fs.readFileSync = function (file, ...rest) {
+    if (file === CONFIG_PATH && staleReads === 0) {
+      staleReads += 1;
+      return JSON.stringify(configFor("v2", [CONFIGURED.v2]));
+    }
+    return readFileSync.call(this, file, ...rest);
+  };
+  let response;
+  try { response = await request(probeBody("ALPHA")); }
+  finally { fs.readFileSync = readFileSync; }
+  assert.equal(staleReads, 1, "the step's first read did not list alpha");
+  assert.deepEqual({ status: response.status, code: response.json?.code }, { status: 400, code: "invalid_project_id" }, "response");
+  assert.equal(fs.readFileSync(CONFIG_PATH, "utf8"), configBytes, "config.json is unchanged");
+  // By then the step had hardened ~/.quadwork to 0700 and taken config.lock.
+  // Nothing was created, changed or removed below it.
+  assert.deepEqual(changes(beforeSnapshot, snapshot()), ["changed home/.quadwork"], "touched");
+});
+
+test("configured ids that differ only in letter case behave as before on every setup step", async () => {
+  const wrong = [];
+  for (const kind of ["legacy", "v2"]) {
+    writeConfig(kind, [CONFIGURED[kind], configuredAs(kind, "alpha"), configuredAs(kind, "ALPHA")]);
+    for (const id of ["alpha", "ALPHA"]) {
+      for (const step of V2_STEPS) {
+        const beforeSnapshot = baselineSnapshot();
+        // The body has no repositories, so the check after the id check refuses it.
+        const response = await request({ id, confirm: true }, step);
+        const actual = { status: response.status, code: response.json?.code, touched: changes(beforeSnapshot, snapshot()) };
+        const expected = { status: step === "activate-v2" ? 400 : 200, code: "repositories_required", touched: [] };
+        if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${kind} config: ${step} ${id}`, actual, expected });
+      }
+    }
+    // add-config takes the re-run path, which seeds what is missing.
+    for (const id of ["alpha", "ALPHA"]) fs.rmSync(path.join(CONFIG_DIR, id), { recursive: true, force: true });
+    const configBytes = fs.readFileSync(CONFIG_PATH, "utf8");
+    const beforeSnapshot = baselineSnapshot();
+    const response = await request(probeBody("ALPHA"));
+    const actual = {
+      status: response.status,
+      json: response.json,
+      configUnchanged: fs.readFileSync(CONFIG_PATH, "utf8") === configBytes,
+      touched: changes(beforeSnapshot, snapshot()),
+    };
+    const expected = {
+      status: 200,
+      json: { ok: true, message: "Project already in config" },
+      configUnchanged: true,
+      touched: [
+        "changed home/.quadwork",
+        "created home/.quadwork/ALPHA",
+        "created home/.quadwork/ALPHA/GITHUB.md",
+        "created home/.quadwork/ALPHA/HEAD-PO-PLAYBOOK.md",
+        "created home/.quadwork/ALPHA/OVERNIGHT-QUEUE.md",
+      ],
+    };
+    if (!isDeepStrictEqual(actual, expected)) wrong.push({ case: `${kind} config: add-config ALPHA`, actual, expected });
   }
   assert.deepEqual(wrong, []);
 });

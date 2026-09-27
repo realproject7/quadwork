@@ -411,6 +411,25 @@ function assertNoProviderCliInvocation(label) {
     assert.equal(readBytes(), before, "the refused id is not added and the config is not activated");
     console.log("  PASS: an id that is gone under config.lock must pass the new-id check before activation");
 
+    // #1219: that check also refuses a new id that matches a configured id
+    // when letter case is ignored. During provisioning another writer
+    // replaces "target" with "Target", a project with its own repository.
+    const caseVariant = {
+      id: "Target", name: "Target", agents: {},
+      repositories: [{ key: "primary", repo: "Acme/Other", working_dir: path.join(root, "other"), primary: true, ci_policy: { version: 1, mode: "ci-less", evidence_keys: ["operator"] } }],
+    };
+    writeConfig({ projects: [legacyProject("target", paths)] });
+    writeQueue("target");
+    provisionHook = () => writeConfig({ projects: [caseVariant] });
+    before = JSON.stringify({ projects: [caseVariant] }, null, 2);
+    commandCalls = [];
+    response = await post(server, "/api/setup?step=activate-v2", requestBody);
+    assert.equal(response.status, 409, JSON.stringify(response.body));
+    assert.equal(response.body.code, "invalid_project_id");
+    assert.ok(commandCalls.some((call) => call.cmd === "git"), "the configured id reached provisioning");
+    assert.equal(readBytes(), before, "the refused id is not added and the config is not activated");
+    console.log("  PASS: under config.lock, a new id that matches a configured id when case is ignored is refused before activation");
+
     // Clear the other project from config, then prove the actual final commit
     // persists arrays only and emits an atomic map without starting sessions.
     writeConfig({ projects: [legacyProject("target", paths)] });

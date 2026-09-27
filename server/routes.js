@@ -539,12 +539,13 @@ function preserveProjectEnvironmentSettings(existing, incoming) {
 
 // #1216: PUT and PATCH /api/config store a body project whose id is not in the
 // config as a new project, and ~/.quadwork/<id> paths are built from that id.
-// A new id must pass the new-id rule (assertNewProjectId). An id the config
-// already holds is kept as it is, even one that fails that rule (#1203, #1210).
-// Ids are matched as the routes match projects: by exact value.
+// A new id must pass the new-id rule (assertNewProjectId), which also compares
+// it with the config's ids when letter case is ignored (#1219). An id the
+// config already holds is kept as it is, even one that fails that rule (#1203,
+// #1210). Ids are matched as the routes match projects: by exact value.
 function assertConfigWriteProjectIds(ids, config) {
   const configured = new Set(Array.isArray(config?.projects) ? config.projects.map((project) => project?.id) : []);
-  for (const id of ids) if (!configured.has(id)) assertNewProjectId(id);
+  for (const id of ids) if (!configured.has(id)) assertNewProjectId(id, config);
 }
 
 // config.json before config.lock is taken, for the first id check, so that a
@@ -563,6 +564,12 @@ router.put("/api/config", (req, res) => {
   }
   try {
     const body = req.body;
+    // #1219: the body replaces the config, so a projects value that is not an
+    // array would be stored as the config's projects, which the routes read as
+    // a list. It is refused before anything is written.
+    if (body && Object.prototype.hasOwnProperty.call(body, "projects") && !Array.isArray(body.projects)) {
+      return res.status(400).json({ ok: false, error: "projects must be an array", code: "invalid_projects" });
+    }
     // #1216: the body's projects replace the config's, so each one is stored.
     const projectIds = Array.isArray(body?.projects) ? body.projects.map((project) => project?.id) : [];
     assertConfigWriteProjectIds(projectIds, readConfigBeforeLock());
@@ -1123,7 +1130,7 @@ const {
   renderProjectRepositoryMap,
   writeProjectRepositoryMap,
 } = require("./repository-provisioning");
-const { namesControlEntry } = require("./control-entries");
+const { namesControlEntry, sameNameIgnoringCase } = require("./control-entries");
 const {
   firstActivationLegacyGuard,
   targetActivationGuard,
@@ -1977,7 +1984,8 @@ function namesOneDirectDirectory(projectId) {
 // unconfigured id gets 404 if it passes the rule, else 400. A config.json that
 // cannot be read or parsed, or is missing, gets 503 with the admission check's
 // code and is not created. Each refusal comes before any write. GET
-// /api/batch-progress checks its id with this rule too (#1216).
+// /api/batch-progress (#1216) and GET /api/batch-active (#1219) check their
+// ids with this rule too.
 function assertChatProject(projectId) {
   let config;
   try { config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")); }
@@ -5478,6 +5486,10 @@ function isBatchActiveFromProgress(progress) {
 router.get("/api/batch-active", async (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
+  // #1219: this route runs the batch snapshot helpers that GET
+  // /api/batch-progress runs, so it checks its id with the same rule first.
+  try { assertChatProject(projectId); }
+  catch (err) { return sendProjectLifecycleException(res, err, projectId); }
   if (getProjectRepositoryBindings(projectId).length === 0) return res.status(400).json({ error: "No repo configured for project" });
 
   // #839 (re1 follow-up on #844): share the same compute path that
@@ -5514,9 +5526,9 @@ router.get("/api/batch-active", async (req, res) => {
 });
 
 // #807: parsed view of the server-authored GITHUB.md. Single source of truth is
-// the file, so this endpoint and file-reading agents see identical data. Same
-// project/config guard as batch-active (a traversal id isn't in config →
-// getRepo null → 400). Surfaces freshness + a distinct parse-error result.
+// the file, so this endpoint and file-reading agents see identical data. An id
+// with no configured repo gets 400 (a traversal id isn't in config → getRepo
+// null → 400). Surfaces freshness + a distinct parse-error result.
 router.get("/api/github-parsed", (req, res) => {
   const projectId = req.query.project;
   if (!projectId) return res.status(400).json({ error: "Missing project" });
@@ -6521,21 +6533,28 @@ function v2RepositoryRecords(repositories) {
 
 // #1210: a new project's directory is ~/.quadwork/<id>. A new id must pass the
 // project-id rule and must not name one of QuadWork's own entries there, the
-// ones project cleanup refuses (control-entries.js).
-function assertNewProjectId(projectId) {
+// ones project cleanup refuses (control-entries.js). #1219: nor may it match a
+// project id configured in `config` when letter case is ignored, compared as
+// those entries are: on a case-insensitive file system, such as the macOS
+// default, both projects would share one directory. Callers check only ids
+// that `config` does not hold exactly, so configured ids are not affected.
+function assertNewProjectId(projectId, config) {
   assertProjectId(projectId);
-  if (namesControlEntry(projectId)) throw new RepositoryProvisionError("invalid_project_id", "project id is reserved");
+  const configured = Array.isArray(config?.projects) ? config.projects : [];
+  if (namesControlEntry(projectId) || configured.some((project) => sameNameIgnoringCase(project?.id, projectId))) {
+    throw new RepositoryProvisionError("invalid_project_id", "project id is reserved");
+  }
   return projectId;
 }
 
 // An id configured in `config` keeps the project-id rule alone. Any other id is
-// new and must pass assertNewProjectId.
+// new and must pass assertNewProjectId against `config`.
 function v2SetupProjectId(body, config) {
   const id = body?.id;
   const configured = typeof id === "string" && Array.isArray(config?.projects) &&
     config.projects.some((project) => project?.id === id);
   try {
-    return { ok: true, project_id: configured ? assertProjectId(id) : assertNewProjectId(id) };
+    return { ok: true, project_id: configured ? assertProjectId(id) : assertNewProjectId(id, config) };
   } catch (error) {
     return {
       ok: false,
@@ -6943,10 +6962,11 @@ router.post("/api/setup", async (req, res) => {
       catch { cfg = { port: 8400, projects: [] }; }
       // #1207: the writes below build ~/.quadwork/<id> paths from this id. A new
       // id must pass the rule the V2 setup steps use, which also refuses the
-      // names of QuadWork's own entries there (#1210). A configured id keeps its
-      // re-run path while it names one direct directory there (#1203), since
-      // CLI setup names a project after its folder. Any other id gets 400
-      // before anything touches the disk.
+      // names of QuadWork's own entries there (#1210) and an id that matches a
+      // configured one when letter case is ignored (#1219). A configured id
+      // keeps its re-run path while it names one direct directory there
+      // (#1203), since CLI setup names a project after its folder. Any other id
+      // gets 400 before anything touches the disk.
       const configured = Array.isArray(cfg.projects) && cfg.projects.some((project) => project?.id === id);
       if (configured ? !namesOneDirectDirectory(id) : !v2SetupProjectId(body, cfg).ok) {
         return res.status(400).json({ ok: false, code: "invalid_project_id" });
@@ -7002,8 +7022,10 @@ router.post("/api/setup", async (req, res) => {
             }
             // #1207, #1210: a new id must pass the new-id rule. The step's
             // first check, before config.lock, may have found this id
-            // configured before another writer removed it.
-            assertNewProjectId(id);
+            // configured before another writer removed it. #1219: another
+            // writer may also have added an id that this one matches when
+            // letter case is ignored.
+            assertNewProjectId(id, fresh);
             if (!Array.isArray(fresh.projects)) fresh.projects = [];
             fresh.projects.push({
               id,
