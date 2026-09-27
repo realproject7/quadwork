@@ -568,7 +568,8 @@ skip the rest of this section unless you want a persistent public URL.
 Use this only if you need a persistent shared URL. It requires **both** an
 authenticating reverse proxy (Step 9 basic auth) **and** an allowlist entry so
 QuadWork accepts the proxied hostname — without the allowlist, QuadWork's
-loopback checks reject the forwarded `Host`/`Origin` and every terminal
+loopback checks reject the forwarded `Host`/`Origin`: every API request gets
+`403` (#1215), so the dashboard cannot load its data, and every terminal
 WebSocket dies.
 
 Add your domain to `~/.quadwork/config.json` (create the key if absent), then
@@ -635,6 +636,8 @@ server {
 ```
 
 `proxy_read_timeout 86400` and WebSocket headers are required for live agent terminal connections.
+`proxy_set_header Host $host` is required too: QuadWork checks the browser's host against
+`trusted_dashboard_hosts` on every API request (#1215).
 Keep the authentication directives and exact `/api/resources` exclusion when applying Step 10 or
 when Certbot rewrites this server block; basic auth does not make host-capacity
 facts part of the public dashboard surface.

@@ -204,6 +204,46 @@ See the [VPS Installation Guide](install-vps.md#step-2-create-non-root-user-crit
 
 ---
 
+## Dashboard is blank or saves fail: `403 Local access only` — #1215
+
+**Symptom:** The dashboard shows no projects or data, or pages load but saving
+settings, sending chat or starting agents fails. The `/api/...` requests in the
+browser's network tab (or `curl` through the proxy URL; a plain `curl` to
+`127.0.0.1` on the box still gets 200) return
+`403 {"error":"Local access only"}`.
+
+**Cause:** Every `/api` route accepts a request only from this machine's own
+dashboard, a local tool, or an on-box reverse proxy listed in
+`trusted_dashboard_hosts`. Before any route runs, a request gets that 403
+unless:
+
+- its socket is loopback (QuadWork listens on `127.0.0.1` only);
+- its `Host` names a loopback host (`127.0.0.1`, `localhost`) or a
+  `trusted_dashboard_hosts` entry;
+- its `Origin`, when the browser sends one, does too;
+- its `X-Forwarded-Host`, when a proxy sends one, does too, for every host it
+  lists;
+- its `Sec-Fetch-Site`, when the browser sends one, is not `cross-site`.
+
+**Fix:**
+
+- Open the dashboard on `http://127.0.0.1:<port>` or `http://localhost:<port>`,
+  on the machine itself or through an SSH tunnel
+  (`ssh -L 8400:127.0.0.1:8400 <server>`).
+- For a public URL, use an authenticated reverse proxy on the same machine,
+  have it forward the browser's host to QuadWork (`proxy_set_header Host $host`
+  in nginx, as the [VPS guide](install-vps.md) does), and add that host to
+  `trusted_dashboard_hosts` (see *Reverse proxy (nginx + Basic Auth)* below). A
+  forwarded host that is not in the list gets 403 on every API request, so the
+  dashboard stays blank.
+- A proxy that sends its own upstream `Host` instead (nginx's default is the
+  `proxy_pass` address, `127.0.0.1:8400`) passes the `Host` check, so pages
+  load, but saves carry the browser's `Origin` and get 403 unless that host is
+  in the list, and terminals do not attach. Forward the browser's host as
+  above.
+
+---
+
 ## Terminals won't attach (session token / cross-origin) — #968
 
 **Background:** The terminal WebSocket (`/ws/terminal`) and the
@@ -234,31 +274,25 @@ never leaves the box automatically.
 nothing, when you reach the dashboard by anything other than a loopback host —
 a **reverse proxy / domain** (e.g. the nginx setup in the
 [VPS guide](install-vps.md)), a **tailnet / LAN address**, or a separately
-hosted frontend. In those cases `GET /api/session-token` returns 403 by design.
+hosted frontend. In those cases `GET /api/session-token` returns 403 by design,
+and since #1215 so does every other `/api` route (see *Dashboard is blank or
+saves fail* above).
 
-**Fix:** Set the token manually in the browser, once per browser:
-
-```js
-// In the browser devtools console, on the QuadWork tab:
-localStorage.setItem("quadwork_session_token", "<value from ~/.quadwork/config.json>");
-// then reload the page.
-```
-
-Read the value on the server with:
-
-```bash
-grep session_token ~/.quadwork/config.json
-```
+**Fix:** Open the dashboard on `127.0.0.1` or `localhost`, directly or through
+an SSH tunnel, or serve it through an authenticated on-box reverse proxy that
+forwards the browser's host and lists it in `trusted_dashboard_hosts` (next
+section). Setting the token by hand in the browser does not help: the page's
+API requests and the terminal WebSocket are refused on the same host checks.
 
 ### Reverse proxy (nginx + Basic Auth): `trusted_dashboard_hosts` — #988
 
 If you serve the dashboard through an **on-box, authenticated reverse proxy** —
 e.g. the [VPS guide](install-vps.md) nginx setup terminating HTTP Basic Auth and
 proxying `https://p7.quadwork.xyz` to `127.0.0.1:8400` — the browser's `Host`
-and `Origin` are the public domain, so `GET /api/session-token` refuses them and
-every terminal WebSocket closes with code `1006`. Rather than set the token by
-hand in each browser, allowlist the proxied host so the dashboard can fetch the
-token itself.
+and `Origin` are the public domain, so every API request, including
+`GET /api/session-token`, gets 403 and every terminal WebSocket closes with code
+`1006`. Allowlist the proxied host so the dashboard can reach the API and fetch
+the token itself.
 
 Add the public host(s) to `~/.quadwork/config.json` and restart QuadWork:
 
@@ -277,6 +311,16 @@ arrived via the local proxy, not directly off-box — **and** (2) the forwarded
 DNS-rebinding page, an un-allowlisted proxy) still gets `403`, so #968's
 protections are unchanged. The allowlist is **opt-in**: with it unset (the
 default) behaviour is exactly loopback-only as before.
+
+**Every API route (#1215).** The same host checks now cover the whole `/api`
+surface, not only the token fetch (the full rule is under *Dashboard is blank
+or saves fail* above). Remote access therefore still needs both parts of this
+setup: an authenticated on-box reverse proxy that forwards the browser's host
+(`proxy_set_header Host $host`), and that host in `trusted_dashboard_hosts`. A
+forwarded host that is not in the list gets `403 {"error":"Local access only"}`
+on the whole API, not only on the terminals. If the proxy also sends
+`X-Forwarded-Host`, every host in it must be a loopback host or in the list.
+Add the host and restart QuadWork.
 
 > [!IMPORTANT]
 > The reverse proxy **must** be authenticated (e.g. nginx Basic Auth) and bound

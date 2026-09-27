@@ -1,9 +1,10 @@
 // #968: shared session token for the PTY-driving surface (terminal
 // WebSockets + /write + /interrupt). The server auto-provisions it and hands it
 // to the LOCAL dashboard via GET /api/session-token, so the operator sees no
-// change. For tailnet/LAN access (where that endpoint 403s), set
-// localStorage["quadwork_session_token"] to the value from ~/.quadwork/config.json
-// (see docs/troubleshooting.md).
+// change. A value in localStorage["quadwork_session_token"], when set, is used
+// instead. Where the dashboard's own fetch of that endpoint gets 403, so do its
+// other API calls (#1215); the fix is the host setup in
+// docs/troubleshooting.md, not a token set by hand.
 
 let cached: string | null = null;
 let inflight: Promise<string> | null = null;

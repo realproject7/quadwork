@@ -174,13 +174,25 @@ async function main() {
     ok(!String(spawned.gemini_any).startsWith(REL_ENTRY),
       `#1176: a relative PATH entry is skipped: its gemini is never what spawn runs (${spawned.gemini_any})`);
 
-    // An untrusted caller (a foreign Host, or a foreign Origin) gets bare-name
-    // discovery only. It comes first, so no earlier run has been cached.
+    // #1215: a foreign Host or a foreign Origin gets 403 from the API rule and
+    // runs nothing.
     for (const [label, headers] of [["a foreign Host", { host: "evil.example" }], ["a foreign Origin", { origin: "http://evil.example" }]]) {
       const r = await get(server, "/api/agent-model-catalog", headers);
-      ok(r.status === 200 && JSON.stringify(r.body.models.codex) === '["gpt-7-nova"]' && JSON.stringify(r.body.models.grok) === '["grok-5"]',
-        `#1176: an untrusted caller (${label}) gets the bare-name CLIs' models only`);
+      ok(r.status === 403, `#1215: a caller with ${label} gets 403 from the API rule`);
     }
+    ok(markerRuns().length === 0, "#1215: a refused caller runs no executable");
+    // A caller the API rule admits but /api/session-token does not trust (a
+    // loopback Host with a trusted proxy's Origin) gets bare-name discovery
+    // only. It comes first, so no earlier run has been cached.
+    const UNTRUSTED = { origin: "https://dash.example" };
+    const untrusted = await get(server, "/api/agent-model-catalog", UNTRUSTED);
+    ok(untrusted.status === 200 && JSON.stringify(untrusted.body.models.codex) === '["gpt-7-nova"]' && JSON.stringify(untrusted.body.models.grok) === '["grok-5"]',
+      "#1176: an untrusted caller gets the bare-name CLIs' models only");
+    // The token rule compares an Origin's host as the URL parser returns it; a
+    // non-http scheme keeps "LOCALHOST" uppercase, so this caller is not trusted.
+    const upper = await get(server, "/api/agent-model-catalog", { origin: "x://LOCALHOST" });
+    ok(upper.status === 200 && JSON.stringify(upper.body.models.codex) === '["gpt-7-nova"]',
+      "#1215: an Origin of x://LOCALHOST is not trusted by the catalog's check");
     ok(markerRuns().sort().join("|") === "home-grok models|path-codex debug models",
       "#1176: an untrusted caller never runs a config-derived executable");
 
@@ -196,7 +208,7 @@ async function main() {
     const proxied = await get(server, "/api/agent-model-catalog", { host: "dash.example" });
     ok(JSON.stringify(proxied.body.models.codex) === '["gpt-7-nova","gpt-pinned-1"]',
       "#1176: a trusted reverse-proxy caller (trusted_dashboard_hosts) gets the config-derived models too");
-    const untrustedLater = await get(server, "/api/agent-model-catalog", { host: "evil.example" });
+    const untrustedLater = await get(server, "/api/agent-model-catalog", UNTRUSTED);
     ok(JSON.stringify(untrustedLater.body.models.codex) === '["gpt-7-nova"]',
       "#1176: an untrusted caller never gets a config-derived executable's cached models either");
 
