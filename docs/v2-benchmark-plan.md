@@ -1,5 +1,15 @@
 # V2 release benchmark preparation (#1037)
 
+## Status, 2026-09-28
+
+The operator withdrew the five-mode matched benchmark to prioritize a usable
+V2 workflow. Do not run Modes 1–5, freeze performance targets, or create
+benchmark repositories under this plan. The design below is retained as a
+historical proposal. Its execution and release-gate instructions are superseded
+by the current scope in [#1037](https://github.com/realproject7/quadwork/issues/1037).
+The narrower product check does not support a measured speed or token-savings
+claim.
+
 ## Current stage, 2026-09-20 (#1155)
 
 Implementation, source audit, reviewed fixes, deterministic checks, local build,
