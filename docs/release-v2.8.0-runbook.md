@@ -1,5 +1,15 @@
 # v2.8.0 release runbook
 
+## Status, 2026-09-28
+
+This runbook records the earlier 2.8.0 release process. QuadWork 2.10.0 is
+published, and its public-package Codex and Claude checks are recorded in
+[#1037](https://github.com/realproject7/quadwork/issues/1037). The operator
+withdrew the matched benchmark and target-freeze plan on 2026-09-28. References
+to those gates below are historical; they do not authorize new benchmark runs
+or block the narrower V2 usability check now defined in #1037. No quantitative
+performance claim follows from that scope change.
+
 This is the actions-free release path for the open release gate in #1026. It
 replaces its obsolete requirement for a green GitHub Actions check. It does not
 authorize a release, tag, deployment, credential change, or `npm publish`.
