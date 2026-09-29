@@ -125,6 +125,25 @@ test("dashboard discards prior-project and unmounted reads; generation flows thr
   assert.equal(intervals.size, 0);
 });
 
+test("expanding a terminal removes its grid placement so it fills the whole rail", () => {
+  const grid = component("TerminalGrid", { dependencies: { "@/lib/sessionToken": {} } });
+  const props = {
+    projectId: "project",
+    agents: [
+      { id: "head", label: "HEAD" }, { id: "dev", label: "DEV" },
+      { id: "re1", label: "RE1" }, { id: "re2", label: "RE2" },
+    ],
+  };
+  let tiles = grid.render(props).props.children[0];
+  assert.deepEqual(tiles[1].props.style, { gridColumn: "3", gridRow: "1" });
+  tiles[1].props.children[0].props.children[0].props.onClick();
+  tiles = grid.render(props).props.children[0];
+  assert.match(tiles[1].props.className, /absolute inset-0/);
+  assert.equal(tiles[1].props.style?.gridColumn, undefined, "grid placement must not constrain the absolute containing block");
+  assert.equal(tiles[1].props.style?.gridRow, undefined);
+  assert.deepEqual(tiles[0].props.style, { gridColumn: "1", gridRow: "1", visibility: "hidden", overflow: "hidden" });
+});
+
 function viewer() {
   const terminals = [], sockets = [], timers = [], requests = [];
   let now = 0, token = async () => "token=fixture";
