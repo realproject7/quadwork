@@ -3,6 +3,7 @@
 
 const http = require("http");
 const readline = require("readline");
+const { workTaskKey } = require("./work-task-manifest");
 
 const args = process.argv.slice(2);
 function flag(name) {
@@ -22,6 +23,23 @@ if (!PROJECT || !AGENT || !PORT) {
 
 const BASE = `http://127.0.0.1:${PORT}`;
 const PROJECT_ROLES = new Set(["head", "dev", "re1", "re2"]);
+const WORK_TASK_CANDIDATE_REJECTION_CODES = new Set([
+  "work_task_candidate_forbidden",
+  "stale_work_task_candidate_authority",
+  "invalid_work_task_dev_candidate_request",
+  "work_task_archive_blocked",
+  "work_task_candidate_assignment_unavailable",
+  "work_task_candidate_event_conflict",
+  "work_task_candidate_no_change",
+  "work_task_candidate_worktree_unavailable",
+  "work_task_candidate_submission_rejected",
+  "work_task_candidate_pipeline_unavailable",
+  "work_task_candidate_commit_failed",
+  "work_task_candidate_assignment_mismatch",
+  "work_task_candidate_base_mismatch",
+  "work_task_candidate_not_changed",
+  "stale_work_task_pipeline_store_precondition",
+]);
 
 const CHAT_TOOLS = [
   {
@@ -347,6 +365,14 @@ function plainRecord(value) {
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 
+function validWorkTaskCandidateSuccess(body, submittedRef) {
+  if (!plainRecord(body) || Object.keys(body).sort().join(",") !== "candidate_digest,ok,outcome,version,work_task_ref" ||
+      body.ok !== true || body.version !== 1 || !["recorded", "idempotent"].includes(body.outcome) ||
+      typeof body.candidate_digest !== "string" || !/^[a-f0-9]{64}$/.test(body.candidate_digest)) return false;
+  try { return workTaskKey(body.work_task_ref) === workTaskKey(submittedRef); }
+  catch { return false; }
+}
+
 function parseChatResumeArguments(value) {
   if (!plainRecord(value)) return null;
   const keys = Object.keys(value).sort();
@@ -513,9 +539,22 @@ async function handleToolCall(id, name, params) {
 
     if (name === "submit_work_task_candidate") {
       if (AGENT !== "dev" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: submit_work_task_candidate");
-      const res = await httpRequest("POST", "/api/work-task-candidate", params, { "X-Chat-Token": TOKEN });
-      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
-      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+      try {
+        const res = await httpRequest("POST", "/api/work-task-candidate", { ...params, version: 1 }, { "X-Chat-Token": TOKEN });
+        if (res.status >= 400) {
+          const code = plainRecord(res.body) && res.body.ok === false &&
+            WORK_TASK_CANDIDATE_REJECTION_CODES.has(res.body.code) ? res.body.code : "WorkTask candidate unavailable";
+          return jsonRpcError(id, -32000, code);
+        }
+        if (res.status !== 200 || !validWorkTaskCandidateSuccess(res.body, params.work_task_ref)) {
+          return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
+        }
+        const result = { ok: true, version: 1, outcome: res.body.outcome,
+          candidate_digest: res.body.candidate_digest, work_task_ref: params.work_task_ref };
+        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
+      } catch {
+        return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
+      }
     }
 
     if (name === "assign_work_task_build") {

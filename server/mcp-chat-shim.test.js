@@ -35,11 +35,13 @@ const issueFetches = [];
 const chatResumeRequests = [];
 const workTaskReviewRequests = [];
 const workTaskBuildRequests = [];
+const workTaskCandidateRequests = [];
 const deliveryCandidateRequests = [];
 const deliveryCiEvidenceRequests = [];
 let chatResumeFailure = false;
 let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
+let workTaskCandidateResponse;
 
 function sendJsonRpc(proc, msg) {
   proc.stdin.write(JSON.stringify(msg) + "\n");
@@ -147,6 +149,14 @@ function startTestServer() {
       if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
       workTaskBuildRequests.push({ token: req.headers["x-chat-token"], body: req.body });
       res.json({ ok: true, outcome: "assigned" });
+    });
+    app.post("/api/work-task-candidate", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "dev") return res.status(403).json({ ok: false, code: "work_task_candidate_forbidden" });
+      workTaskCandidateRequests.push({ token: req.headers["x-chat-token"], body: req.body });
+      const { status, body } = workTaskCandidateResponse;
+      if (typeof body === "string") return res.status(status).type("text/plain").send(body);
+      return res.status(status).json(body);
     });
     app.post("/api/work-task-review/receipt", (req, res) => {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
@@ -273,6 +283,59 @@ async function runTests() {
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
     "tools/list hides reviewer-only review-cycle receipt tools from dev");
   assert(!toolNames.includes("submit_work_task_review_receipt"), "tools/list hides independent WorkTask review receipts from dev");
+
+  const candidateSchema = listResp.result.tools.find((tool) => tool.name === "submit_work_task_candidate").inputSchema;
+  assert(JSON.stringify(Object.keys(candidateSchema.properties).sort()) === JSON.stringify(["candidate_sha", "event_id", "work_task_ref"]) &&
+    candidateSchema.additionalProperties === false && !candidateSchema.required.includes("version"),
+  "Dev candidate tool advertises only its three caller-owned fields");
+  const candidateArguments = { event_id: "record_candidate_001", work_task_ref: {
+    version: 1, installation_id: "installation_mcp_shim_0001", project_id: "mcp-shim-test", repository_key: "web",
+    work_item: { repoKey: "web", repo: "Acme/Web", number: 42, kind: "issue" },
+    issue_body_revision: "c".repeat(64), task_key: "build", task_revision: "d".repeat(64),
+  }, candidate_sha: "a".repeat(40) };
+  const candidateSuccessBody = { ok: true, version: 1, outcome: "recorded", candidate_digest: "b".repeat(64),
+    work_task_ref: candidateArguments.work_task_ref };
+  workTaskCandidateResponse = { status: 200, body: candidateSuccessBody };
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 200, method: "tools/call", params: {
+    name: "submit_work_task_candidate", arguments: candidateArguments,
+  } });
+  const candidateSuccess = await readResponse(shim);
+  assert(JSON.stringify(JSON.parse(candidateSuccess.result?.content?.[0]?.text || "{}")) === JSON.stringify(candidateSuccessBody) &&
+    workTaskCandidateRequests.length === 1 && workTaskCandidateRequests[0].token === TEST_TOKEN &&
+    JSON.stringify(workTaskCandidateRequests[0].body) === JSON.stringify({ ...candidateArguments, version: 1 }),
+  "advertised Dev input forwards a fixed versioned payload with its bound token");
+
+  const reversedRef = Object.fromEntries(Object.entries(candidateArguments.work_task_ref).reverse());
+  reversedRef.work_item = Object.fromEntries(Object.entries(candidateArguments.work_task_ref.work_item).reverse());
+  workTaskCandidateResponse = { status: 200, body: { ...candidateSuccessBody, work_task_ref: reversedRef } };
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 2002, method: "tools/call", params: {
+    name: "submit_work_task_candidate", arguments: candidateArguments,
+  } });
+  const reorderedSuccess = await readResponse(shim);
+  assert(JSON.stringify(JSON.parse(reorderedSuccess.result?.content?.[0]?.text || "{}")) === JSON.stringify(candidateSuccessBody),
+    "semantically identical reordered WorkTaskRef succeeds without echoing the server body");
+
+  for (const [status, body, expected] of [
+    [409, { ok: false, code: "stale_work_task_candidate_authority", error: `private=${TEST_TOKEN}` }, "stale_work_task_candidate_authority"],
+    [409, { ok: false, code: `secret_${TEST_TOKEN}`, error: "private/path" }, "WorkTask candidate unavailable"],
+    [409, { ok: true, code: "work_task_candidate_assignment_unavailable" }, "WorkTask candidate unavailable"],
+    [409, [{ ok: false, code: "work_task_candidate_assignment_unavailable" }], "WorkTask candidate unavailable"],
+    [409, `private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+    [200, { ...candidateSuccessBody, path: `private=${TEST_TOKEN}` }, "WorkTask candidate unavailable"],
+    [200, `private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+    [302, `private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+    [206, candidateSuccessBody, "WorkTask candidate unavailable"],
+  ]) {
+    workTaskCandidateResponse = { status, body };
+    sendJsonRpc(shim, { jsonrpc: "2.0", id: 2001, method: "tools/call", params: {
+      name: "submit_work_task_candidate", arguments: candidateArguments,
+    } });
+    const rejected = await readResponse(shim);
+    assert(rejected.error?.code === -32000 && rejected.error.message === expected &&
+      !JSON.stringify(rejected).includes(TEST_TOKEN),
+    `candidate rejection exposes only ${expected === "WorkTask candidate unavailable" ? "a generic code" : "the allowlisted code"}`);
+  }
+  workTaskCandidateResponse = { status: 200, body: candidateSuccessBody };
 
   for (const name of ["submit_ci_evidence", "submit_delivery_candidate_ci_evidence"]) {
     const schema = listResp.result.tools.find((tool) => tool.name === name).inputSchema;
