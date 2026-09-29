@@ -174,6 +174,9 @@ export default function TerminalGrid({
         const isVerified = agentStates[agent.id] === "running" || agentStates[agent.id] === "verified";
         const gridPosition = layout.positions[i] || {};
 
+        // A positioned grid item uses its assigned grid area as its
+        // containing block. Drop the placement when expanded so inset-0
+        // covers the entire terminal grid instead of one quadrant.
         return (
           <div
             key={agent.id}
@@ -182,9 +185,11 @@ export default function TerminalGrid({
                 ? "absolute inset-0 z-10 bg-bg"
                 : ""
             }`}
-            style={isHidden
-              ? { ...gridPosition, visibility: "hidden", overflow: "hidden" }
-              : gridPosition}
+            style={isExpanded
+              ? undefined
+              : isHidden
+                ? { ...gridPosition, visibility: "hidden", overflow: "hidden" }
+                : gridPosition}
           >
             <div
               className={`flex items-center justify-between px-3 shrink-0 border-b border-border ${
