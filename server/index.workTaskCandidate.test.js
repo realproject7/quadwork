@@ -12,7 +12,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawn } = require("node:child_process");
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-candidate-route-"));
 const TMP_HOME = path.join(TMP, "home");
@@ -30,6 +30,7 @@ const fileChat = require("./file-chat");
 const { buildBatchManifest, freezeBatchManifest } = require("./work-task-manifest");
 const { buildWorkTaskPipeline, planWorkTaskPipelineEvent } = require("./work-task-pipeline");
 const { createWorkTaskPipelineStore } = require("./work-task-pipeline-store");
+const SHIM = path.join(__dirname, "mcp-chat-shim.js");
 
 const installation_id = "installation_route_candidate_0001";
 const project_id = "quadwork";
@@ -166,12 +167,49 @@ function post(port, body, token) {
 function submission(overrides = {}) {
   return { version: 1, event_id: "route_record_candidate", work_task_ref: copy(ref), candidate_sha: candidateSha, ...overrides };
 }
+function shimCall(proc, id, name, args) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      proc.stdout.removeListener("data", onData);
+      reject(new Error("MCP candidate response timed out"));
+    }, 5000);
+    function onData(data) {
+      proc.mcpBuffer = (proc.mcpBuffer || "") + data.toString();
+      const end = proc.mcpBuffer.indexOf("\n");
+      if (end < 0) return;
+      const line = proc.mcpBuffer.slice(0, end);
+      proc.mcpBuffer = proc.mcpBuffer.slice(end + 1);
+      clearTimeout(timeout);
+      proc.stdout.removeListener("data", onData);
+      try { resolve(JSON.parse(line)); } catch (error) { reject(error); }
+    }
+    proc.stdout.on("data", onData);
+    proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: name === "tools/list" ? name : "tools/call",
+      ...(name === "tools/list" ? {} : { params: { name, arguments: args } }) }) + "\n");
+  });
+}
 
 (async () => {
-  const server = http.createServer(index.app);
+  const forwarded = [];
+  const server = http.createServer((req, res) => {
+    if (req.url === "/api/work-task-candidate") {
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => { forwarded.push(JSON.parse(raw)); });
+    }
+    index.app(req, res);
+  });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
+  const shim = spawn(process.execPath, [SHIM, "--project", project_id, "--agent", "dev", "--port", String(port), "--token", TOKEN],
+    { stdio: ["pipe", "pipe", "pipe"] });
   try {
+    const listed = await shimCall(shim, 1, "tools/list");
+    const schema = listed.result.tools.find((tool) => tool.name === "submit_work_task_candidate")?.inputSchema;
+    assert.deepEqual(schema.required, ["event_id", "work_task_ref", "candidate_sha"]);
+    assert.equal(schema.additionalProperties, false);
+    ok(true, "the supported Dev MCP tool advertises the three candidate fields");
+
     const anonymous = await post(port, submission(), null);
     assert.equal(anonymous.status, 403);
     assert.equal(anonymous.json.code, "work_task_candidate_forbidden");
@@ -188,23 +226,36 @@ function submission(overrides = {}) {
     assert.equal(persistedTask().state, "building");
     ok(true, "a WorkTaskRef whose Issue body revision is no longer current is refused before recording");
 
-    const recorded = await post(port, submission(), TOKEN);
-    assert.equal(recorded.status, 200, JSON.stringify(recorded.json));
-    assert.equal(recorded.json.ok, true);
-    assert.equal(recorded.json.outcome, "recorded");
-    assert.match(recorded.json.candidate_digest, /^[a-f0-9]{64}$/);
-    assert.deepEqual(recorded.json.work_task_ref, ref);
+    const submitted = { event_id: "route_record_candidate", work_task_ref: copy(ref), candidate_sha: candidateSha };
+    const mcpRecorded = await shimCall(shim, 2, "submit_work_task_candidate", submitted);
+    assert.equal(mcpRecorded.error, undefined);
+    const recorded = JSON.parse(mcpRecorded.result.content[0].text);
+    assert.equal(recorded.ok, true);
+    assert.equal(recorded.outcome, "recorded");
+    assert.match(recorded.candidate_digest, /^[a-f0-9]{64}$/);
+    assert.deepEqual(recorded.work_task_ref, ref);
+    assert.deepEqual(forwarded.at(-1), { ...submitted, version: 1 });
     const task = persistedTask();
     assert.equal(task.state, "candidate_ready");
     assert.equal(task.candidate.candidate_sha, candidateSha);
-    assert.equal(task.candidate.candidate_digest, recorded.json.candidate_digest);
-    ok(true, "the composed route accepts a full WorkTaskRef, re-proves live identity, and records the Dev worktree HEAD");
+    assert.equal(task.candidate.candidate_digest, recorded.candidate_digest);
+    ok(true, "the MCP tool forwards version 1 and the composed route records the clean Dev worktree HEAD");
+
+    const mcpStale = await shimCall(shim, 3, "submit_work_task_candidate", {
+      ...submitted, work_task_ref: { ...copy(ref), issue_body_revision: "d".repeat(64) },
+    });
+    assert.equal(mcpStale.error?.code, -32000);
+    assert.equal(mcpStale.error?.message, "stale_work_task_candidate_authority");
+    assert.equal(persistedTask().candidate.candidate_sha, candidateSha);
+    ok(true, "the MCP rejection returns only the allowlisted stale-authority code and preserves the recorded candidate");
 
     const retry = await post(port, submission(), TOKEN);
     assert.equal(retry.status, 200);
     assert.equal(retry.json.outcome, "idempotent");
     ok(true, "an exact retry through the route is acknowledged idempotently");
   } finally {
+    shim.stdin.end();
+    await new Promise((resolve) => shim.once("close", resolve));
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(TMP, { recursive: true, force: true });
   }

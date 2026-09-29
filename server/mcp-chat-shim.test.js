@@ -35,11 +35,13 @@ const issueFetches = [];
 const chatResumeRequests = [];
 const workTaskReviewRequests = [];
 const workTaskBuildRequests = [];
+const workTaskCandidateRequests = [];
 const deliveryCandidateRequests = [];
 const deliveryCiEvidenceRequests = [];
 let chatResumeFailure = false;
 let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
+let workTaskCandidateResponse = { status: 200, body: { ok: true, outcome: "recorded" } };
 
 function sendJsonRpc(proc, msg) {
   proc.stdin.write(JSON.stringify(msg) + "\n");
@@ -147,6 +149,14 @@ function startTestServer() {
       if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
       workTaskBuildRequests.push({ token: req.headers["x-chat-token"], body: req.body });
       res.json({ ok: true, outcome: "assigned" });
+    });
+    app.post("/api/work-task-candidate", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "dev") return res.status(403).json({ ok: false, code: "work_task_candidate_forbidden" });
+      workTaskCandidateRequests.push({ token: req.headers["x-chat-token"], body: req.body });
+      const { status, body } = workTaskCandidateResponse;
+      if (typeof body === "string") return res.status(status).type("text/plain").send(body);
+      return res.status(status).json(body);
     });
     app.post("/api/work-task-review/receipt", (req, res) => {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
@@ -273,6 +283,38 @@ async function runTests() {
   assert(!toolNames.includes("issue_review_cycle_nonce") && !toolNames.includes("submit_review_cycle_receipt"),
     "tools/list hides reviewer-only review-cycle receipt tools from dev");
   assert(!toolNames.includes("submit_work_task_review_receipt"), "tools/list hides independent WorkTask review receipts from dev");
+
+  const candidateSchema = listResp.result.tools.find((tool) => tool.name === "submit_work_task_candidate").inputSchema;
+  assert(JSON.stringify(Object.keys(candidateSchema.properties).sort()) === JSON.stringify(["candidate_sha", "event_id", "work_task_ref"]) &&
+    candidateSchema.additionalProperties === false && !candidateSchema.required.includes("version"),
+  "Dev candidate tool advertises only its three caller-owned fields");
+  const candidateArguments = { event_id: "record_candidate_001", work_task_ref: { task_key: "build" }, candidate_sha: "a".repeat(40) };
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 200, method: "tools/call", params: {
+    name: "submit_work_task_candidate", arguments: candidateArguments,
+  } });
+  const candidateSuccess = await readResponse(shim);
+  assert(JSON.parse(candidateSuccess.result?.content?.[0]?.text || "{}").outcome === "recorded" &&
+    workTaskCandidateRequests.length === 1 && workTaskCandidateRequests[0].token === TEST_TOKEN &&
+    JSON.stringify(workTaskCandidateRequests[0].body) === JSON.stringify({ ...candidateArguments, version: 1 }),
+  "advertised Dev input forwards a fixed versioned payload with its bound token");
+
+  for (const [body, expected] of [
+    [{ ok: false, code: "stale_work_task_candidate_authority", error: `private=${TEST_TOKEN}` }, "stale_work_task_candidate_authority"],
+    [{ ok: false, code: `secret_${TEST_TOKEN}`, error: "private/path" }, "WorkTask candidate unavailable"],
+    [{ ok: true, code: "work_task_candidate_assignment_unavailable" }, "WorkTask candidate unavailable"],
+    [[{ ok: false, code: "work_task_candidate_assignment_unavailable" }], "WorkTask candidate unavailable"],
+    [`private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+  ]) {
+    workTaskCandidateResponse = { status: 409, body };
+    sendJsonRpc(shim, { jsonrpc: "2.0", id: 2001, method: "tools/call", params: {
+      name: "submit_work_task_candidate", arguments: candidateArguments,
+    } });
+    const rejected = await readResponse(shim);
+    assert(rejected.error?.code === -32000 && rejected.error.message === expected &&
+      !JSON.stringify(rejected).includes(TEST_TOKEN),
+    `candidate rejection exposes only ${expected === "WorkTask candidate unavailable" ? "a generic code" : "the allowlisted code"}`);
+  }
+  workTaskCandidateResponse = { status: 200, body: { ok: true, outcome: "recorded" } };
 
   for (const name of ["submit_ci_evidence", "submit_delivery_candidate_ci_evidence"]) {
     const schema = listResp.result.tools.find((tool) => tool.name === name).inputSchema;
