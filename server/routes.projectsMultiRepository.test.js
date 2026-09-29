@@ -50,9 +50,10 @@ fakeExecFile[util.promisify.custom] = async (_command, args) => {
     return { stdout: JSON.stringify({ data: {
       repo_0: { ...emptyRepo, openIssues: { nodes: [
         { number: 42, title: "owned issue", body: ISSUE_BODY, state: "OPEN" },
-        { number: 43, title: "empty issue", body: null, state: "OPEN" },
-        { number: 44, title: "missing body", state: "OPEN" },
-        { number: 45, title: "invalid body", body: 7, state: "OPEN" },
+        { number: 43, title: "empty issue", body: "", state: "OPEN" },
+        { number: 44, title: "null body", body: null, state: "OPEN" },
+        { number: 45, title: "missing body", state: "OPEN" },
+        { number: 46, title: "invalid body", body: 7, state: "OPEN" },
       ] } },
       repo_1: emptyRepo, repo_2: emptyRepo, repo_3: emptyRepo,
     } }), stderr: "" };
@@ -138,9 +139,11 @@ function request(server, pathname) {
     const revision = issueContractRevision(ISSUE_BODY);
     assert.equal(issues[0].contract_revision, revision);
     assert.equal(issues[0].contract_revision, routes.restIssueToCanonical({ number: 42, body: ISSUE_BODY }).contract_revision);
-    assert.equal(issues[1].contract_revision, issueContractRevision(null));
+    assert.equal(issues[1].contract_revision, issueContractRevision(""));
+    assert.equal(routes.restIssueToCanonical({ number: 43, body: null }).contract_revision, issueContractRevision(null));
     assert.equal(Object.hasOwn(issues[2], "contract_revision"), false);
     assert.equal(Object.hasOwn(issues[3], "contract_revision"), false);
+    assert.equal(Object.hasOwn(issues[4], "contract_revision"), false);
     assert.ok(issues.every((row) => !Object.hasOwn(row, "body")));
     assert.ok(!JSON.stringify(fallback.get("acme/app")).includes("fallback contract sentinel"));
     const markdown = routes.renderGithubMarkdown("Active", "Acme/App", fallback.get("acme/app"), {}, "");
@@ -182,10 +185,12 @@ function request(server, pathname) {
       issues: [{ ...issues[0], contract_revision: issueContractRevision("changed body") }] });
     assert.throws(() => assertManifestRegisteredCurrent(manifest, { resolveRegisteredIdentity }),
       (error) => error.code === "stale_work_task_contract");
-    routes._graphqlCache.set("acme/app", { ts: now, ...fallback.get("acme/app"), issues: [{ ...issues[2], number: 42 }] });
-    assert.throws(() => resolveRegisteredIdentity({ installation_id: installationId, project_id: "active",
-      repository_key: "app", work_item: workItem }),
-    (error) => error instanceof LiveWorkTaskIdentityResolverError && error.code === "live_work_task_identity_unavailable");
+    for (const row of issues.slice(2)) {
+      routes._graphqlCache.set("acme/app", { ts: now, ...fallback.get("acme/app"), issues: [{ ...row, number: 42 }] });
+      assert.throws(() => resolveRegisteredIdentity({ installation_id: installationId, project_id: "active",
+        repository_key: "app", work_item: workItem }),
+      (error) => error instanceof LiveWorkTaskIdentityResolverError && error.code === "live_work_task_identity_unavailable");
+    }
     console.log("routes.projectsMultiRepository.test.js: all assertions passed");
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));

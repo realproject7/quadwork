@@ -4100,9 +4100,9 @@ fragment repoFields on Repository {
           assignees: (n.assignees?.nodes || []).map((a) => ({ login: a.login })),
           createdAt: n.createdAt,
         };
-        // Match REST's contract observation. Never retain the raw body in the
-        // dashboard cache, and leave malformed or absent bodies unqualified.
-        if (Object.prototype.hasOwnProperty.call(n, "body") && (n.body === null || typeof n.body === "string")) {
+        // GraphQL Issue.body is non-null; null or absent data cannot qualify
+        // a revision. Never retain the raw body in the dashboard cache.
+        if (typeof n.body === "string") {
           row.contract_revision = issueContractRevision(n.body);
         }
         return row;
