@@ -41,7 +41,7 @@ const deliveryCiEvidenceRequests = [];
 let chatResumeFailure = false;
 let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
-let workTaskCandidateResponse = { status: 200, body: { ok: true, outcome: "recorded" } };
+let workTaskCandidateResponse;
 
 function sendJsonRpc(proc, msg) {
   proc.stdin.write(JSON.stringify(msg) + "\n");
@@ -289,23 +289,30 @@ async function runTests() {
     candidateSchema.additionalProperties === false && !candidateSchema.required.includes("version"),
   "Dev candidate tool advertises only its three caller-owned fields");
   const candidateArguments = { event_id: "record_candidate_001", work_task_ref: { task_key: "build" }, candidate_sha: "a".repeat(40) };
+  const candidateSuccessBody = { ok: true, version: 1, outcome: "recorded", candidate_digest: "b".repeat(64),
+    work_task_ref: candidateArguments.work_task_ref };
+  workTaskCandidateResponse = { status: 200, body: candidateSuccessBody };
   sendJsonRpc(shim, { jsonrpc: "2.0", id: 200, method: "tools/call", params: {
     name: "submit_work_task_candidate", arguments: candidateArguments,
   } });
   const candidateSuccess = await readResponse(shim);
-  assert(JSON.parse(candidateSuccess.result?.content?.[0]?.text || "{}").outcome === "recorded" &&
+  assert(JSON.stringify(JSON.parse(candidateSuccess.result?.content?.[0]?.text || "{}")) === JSON.stringify(candidateSuccessBody) &&
     workTaskCandidateRequests.length === 1 && workTaskCandidateRequests[0].token === TEST_TOKEN &&
     JSON.stringify(workTaskCandidateRequests[0].body) === JSON.stringify({ ...candidateArguments, version: 1 }),
   "advertised Dev input forwards a fixed versioned payload with its bound token");
 
-  for (const [body, expected] of [
-    [{ ok: false, code: "stale_work_task_candidate_authority", error: `private=${TEST_TOKEN}` }, "stale_work_task_candidate_authority"],
-    [{ ok: false, code: `secret_${TEST_TOKEN}`, error: "private/path" }, "WorkTask candidate unavailable"],
-    [{ ok: true, code: "work_task_candidate_assignment_unavailable" }, "WorkTask candidate unavailable"],
-    [[{ ok: false, code: "work_task_candidate_assignment_unavailable" }], "WorkTask candidate unavailable"],
-    [`private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+  for (const [status, body, expected] of [
+    [409, { ok: false, code: "stale_work_task_candidate_authority", error: `private=${TEST_TOKEN}` }, "stale_work_task_candidate_authority"],
+    [409, { ok: false, code: `secret_${TEST_TOKEN}`, error: "private/path" }, "WorkTask candidate unavailable"],
+    [409, { ok: true, code: "work_task_candidate_assignment_unavailable" }, "WorkTask candidate unavailable"],
+    [409, [{ ok: false, code: "work_task_candidate_assignment_unavailable" }], "WorkTask candidate unavailable"],
+    [409, `private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+    [200, { ...candidateSuccessBody, path: `private=${TEST_TOKEN}` }, "WorkTask candidate unavailable"],
+    [200, `private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+    [302, `private=${TEST_TOKEN}`, "WorkTask candidate unavailable"],
+    [206, candidateSuccessBody, "WorkTask candidate unavailable"],
   ]) {
-    workTaskCandidateResponse = { status: 409, body };
+    workTaskCandidateResponse = { status, body };
     sendJsonRpc(shim, { jsonrpc: "2.0", id: 2001, method: "tools/call", params: {
       name: "submit_work_task_candidate", arguments: candidateArguments,
     } });
@@ -314,7 +321,7 @@ async function runTests() {
       !JSON.stringify(rejected).includes(TEST_TOKEN),
     `candidate rejection exposes only ${expected === "WorkTask candidate unavailable" ? "a generic code" : "the allowlisted code"}`);
   }
-  workTaskCandidateResponse = { status: 200, body: { ok: true, outcome: "recorded" } };
+  workTaskCandidateResponse = { status: 200, body: candidateSuccessBody };
 
   for (const name of ["submit_ci_evidence", "submit_delivery_candidate_ci_evidence"]) {
     const schema = listResp.result.tools.find((tool) => tool.name === name).inputSchema;

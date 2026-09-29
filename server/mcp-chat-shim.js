@@ -364,6 +364,14 @@ function plainRecord(value) {
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 
+function validWorkTaskCandidateSuccess(body, submittedRef) {
+  return plainRecord(body) && Object.keys(body).sort().join(",") === "candidate_digest,ok,outcome,version,work_task_ref" &&
+    body.ok === true && body.version === 1 && ["recorded", "idempotent"].includes(body.outcome) &&
+    typeof body.candidate_digest === "string" && /^[a-f0-9]{64}$/.test(body.candidate_digest) &&
+    plainRecord(submittedRef) && plainRecord(body.work_task_ref) &&
+    JSON.stringify(body.work_task_ref) === JSON.stringify(submittedRef);
+}
+
 function parseChatResumeArguments(value) {
   if (!plainRecord(value)) return null;
   const keys = Object.keys(value).sort();
@@ -537,7 +545,12 @@ async function handleToolCall(id, name, params) {
             WORK_TASK_CANDIDATE_REJECTION_CODES.has(res.body.code) ? res.body.code : "WorkTask candidate unavailable";
           return jsonRpcError(id, -32000, code);
         }
-        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+        if (res.status !== 200 || !validWorkTaskCandidateSuccess(res.body, params.work_task_ref)) {
+          return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
+        }
+        const result = { ok: true, version: 1, outcome: res.body.outcome,
+          candidate_digest: res.body.candidate_digest, work_task_ref: params.work_task_ref };
+        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
       } catch {
         return jsonRpcError(id, -32000, "WorkTask candidate unavailable");
       }
