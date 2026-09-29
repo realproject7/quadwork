@@ -167,6 +167,8 @@ test("a late generation reconnects after the stopped probe window; stable polls 
   const props = { projectId: "project", agentId: "head", generationId: null, wsUrl: "ws://fixture" };
   await f.render(props);
   f.sockets[0].open();
+  assert.deepEqual(f.sockets[0].sent.map((frame) => JSON.parse(frame).type), ["resize", "replay", "refresh"],
+    "a reconnect restores the bounded replay tail, then asks the live PTY to repaint without input");
   const closing = f.sockets[0].onclose({ reason: "stopped", code: 1008 });
   for (let i = 0; i < 10; i++) await f.advance(200);
   await closing;

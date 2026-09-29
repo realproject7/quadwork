@@ -222,6 +222,11 @@ export default function TerminalPanel({
         // seeded against reality and doesn't immediately resend it.
         lastSentSizeRef.current = { cols: term.cols, rows: term.rows };
         ws.send(JSON.stringify({ type: "replay" }));
+        // The server's bounded replay buffer is a raw byte tail, so it cannot
+        // reconstruct an interactive TUI's prior screen by itself. Ask the
+        // PTY to emit a resize redraw after replay; this does not write input
+        // to the agent and lets it repaint at the viewer's current size.
+        ws.send(JSON.stringify({ type: "refresh" }));
       };
 
       ws.onmessage = (e) => {

@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const { WebSocketServer, WebSocket } = require("ws");
 const pty = require("node-pty");
+const { refreshTerminalScreen } = require("./terminal-screen-refresh");
 const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, primaryRepository, allRepositories } = require("./config");
 const routes = require("./routes");
@@ -4296,6 +4297,12 @@ wss.on("connection:terminal", async (ws, req) => {
         } else {
           ws.send(`\x1b[2m[agent online — waiting for input]\x1b[0m\r\n`);
         }
+        return;
+      }
+      if (parsed.type === "refresh") {
+        // Reconstruct the interactive screen after the raw-tail replay. Never
+        // forward this viewer control frame to the agent as terminal input.
+        try { refreshTerminalScreen(session.term, session.lastDims); } catch {}
         return;
       }
     } catch {}
