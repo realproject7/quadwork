@@ -5,7 +5,11 @@ const fs = require("fs");
 const os = require("os");
 const { WebSocketServer, WebSocket } = require("ws");
 const pty = require("node-pty");
-const { refreshTerminalScreen } = require("./terminal-screen-refresh");
+const {
+  requestTerminalScreenRefresh,
+  cancelTerminalScreenRefresh,
+  createTerminalRefreshGate,
+} = require("./terminal-screen-refresh");
 const { spawn } = require("child_process");
 const { readConfig, resolveAgentCwd, resolveAgentCommand, CONFIG_PATH, ensureSecureDir, writeSecureFile, writeConfig, primaryRepository, allRepositories } = require("./config");
 const routes = require("./routes");
@@ -2886,6 +2890,7 @@ function hasTrustedResourceKill(session) {
 // watchdog liveness probe (which catches the case where onExit never fired and
 // the dashboard was left showing a stale `running`).
 function markSessionExited(key, session, exitCode) {
+  cancelTerminalScreenRefresh(session);
   cleanupPtyDispatcher(key);
   session.state = "stopped";
   session.error = exitCode ? `exit:${exitCode}` : null;
@@ -2990,6 +2995,7 @@ async function stopAgentSession(key, {
   if (session) {
     session._stopping = true;
     session.state = "stopping";
+    cancelTerminalScreenRefresh(session);
   }
   if (session?.term) {
     const stoppedTerm = session.term;
@@ -4254,6 +4260,7 @@ wss.on("connection:terminal", async (ws, req) => {
   }
 
   session.viewers.add(ws);
+  const terminalRefreshGate = createTerminalRefreshGate();
 
   // PTY → this viewer (#538: scrub secrets from live output)
   const dataHandler = session.term.onData((data) => {
@@ -4292,6 +4299,7 @@ wss.on("connection:terminal", async (ws, req) => {
         return;
       }
       if (parsed.type === "replay") {
+        terminalRefreshGate.markReplay();
         if (session.scrollback && session.scrollback.length > 0) {
           ws.send(scrubScrollback(session.scrollback));
         } else {
@@ -4302,7 +4310,10 @@ wss.on("connection:terminal", async (ws, req) => {
       if (parsed.type === "refresh") {
         // Reconstruct the interactive screen after the raw-tail replay. Never
         // forward this viewer control frame to the agent as terminal input.
-        try { refreshTerminalScreen(session.term, session.lastDims); } catch {}
+        // The per-connection gate accepts one in-order refresh only.
+        if (terminalRefreshGate.requestRefresh()) {
+          try { requestTerminalScreenRefresh(session); } catch {}
+        }
         return;
       }
     } catch {}
@@ -4313,6 +4324,7 @@ wss.on("connection:terminal", async (ws, req) => {
     dataHandler.dispose();
     session.viewers.delete(ws);
     session.viewerDims.delete(ws);
+    if (session.viewers.size === 0) cancelTerminalScreenRefresh(session);
     if (session.viewerDims.size > 0 && session.term) {
       const dims = [...session.viewerDims.values()];
       const merged = {
