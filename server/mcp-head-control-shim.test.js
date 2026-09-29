@@ -292,6 +292,30 @@ async function run() {
     }
     ok(true, "all four delivery tools transport only their closed payload and reject remote overrides before HTTP");
 
+    for (const [name, args, metadata] of [
+      ["get_project_status", { idempotency_key: "idem_meta_status", correlation_id: "corr_meta_status" }, { progressToken: 1 }],
+      ["recent_head_control_audit", {}, { progressToken: "audit-1" }],
+    ]) {
+      const before = calls.length;
+      const withMeta = await shim.send({ ...call(70, name, args), params: { name, arguments: args, _meta: metadata } });
+      assert.equal(withMeta.error, undefined);
+      assert.equal(calls.length, before + 1);
+      assert.deepEqual(calls.at(-1).body.request, { tool: name, arguments: args });
+      assert(!JSON.stringify(calls.at(-1).body).includes("progressToken"));
+    }
+    for (const params of [
+      { name: "get_project_status", arguments: {}, _meta: "bad" },
+      { name: "get_project_status", arguments: {}, _meta: { progressToken: {} } },
+      { name: "get_project_status", arguments: {}, _meta: { progressToken: 1.5 } },
+      { name: "get_project_status", _meta: { progressToken: 1 } },
+      { name: "get_project_status", arguments: {}, _meta: { progressToken: 1 }, extra: true },
+    ]) {
+      const before = calls.length;
+      assert.equal((await shim.send({ jsonrpc: "2.0", id: 71, method: "tools/call", params })).error?.code, -32602);
+      assert.equal(calls.length, before);
+    }
+    ok(true, "optional MCP metadata is ignored without relaxing operation arguments or unknown-field rejection");
+
     const source = fs.readFileSync(SHIM, "utf8");
     assert.match(source, /require\("node:http"\)/);
     assert.match(source, /require\("node:readline"\)/);

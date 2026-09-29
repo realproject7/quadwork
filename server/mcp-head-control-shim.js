@@ -537,7 +537,12 @@ function paramsEmpty(params) {
 
 async function handleToolCall(id, params) {
   try {
-    exact(params, ["name", "arguments"]);
+    allowed(params, ["name", "arguments", "_meta"]);
+    if (!hasOwn(params, "name") || !hasOwn(params, "arguments") ||
+        (hasOwn(params, "_meta") && !plain(params._meta))) fail("invalid tool call params");
+    if (hasOwn(params, "_meta") && hasOwn(params._meta, "progressToken") &&
+        typeof params._meta.progressToken !== "string" &&
+        !Number.isSafeInteger(params._meta.progressToken)) fail("invalid progress token");
     if (typeof params.name !== "string" || !TOOL_NAMES.has(params.name)) {
       return jsonRpcError(id, -32601, "Tool not found");
     }
