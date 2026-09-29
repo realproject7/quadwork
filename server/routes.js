@@ -4060,7 +4060,7 @@ async function fetchAllProjectsGraphQL() {
 }
 fragment repoFields on Repository {
   openIssues: issues(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-    nodes { number title url state labels(first: 5) { nodes { name } } assignees(first: 5) { nodes { login } } createdAt }
+    nodes { number title body url state labels(first: 5) { nodes { name } } assignees(first: 5) { nodes { login } } createdAt }
   }
   closedIssues: issues(first: ${RECENT_FETCH_LIMIT}, states: CLOSED, orderBy: {field: UPDATED_AT, direction: DESC}) {
     nodes { number title url state closedAt }
@@ -4090,15 +4090,23 @@ fragment repoFields on Repository {
       // #806: pin canonical uppercase state for emergency-fallback parity with
       // the REST path. reviewDecision/statusCheckRollup are absent here (the
       // GraphQL query doesn't fetch them) — acceptable for a degraded fallback.
-      const issues = (repoData.openIssues?.nodes || []).map((n) => ({
-        number: n.number,
-        title: n.title,
-        state: (n.state || "").toUpperCase(),
-        url: n.url,
-        labels: (n.labels?.nodes || []).map((l) => ({ name: l.name })),
-        assignees: (n.assignees?.nodes || []).map((a) => ({ login: a.login })),
-        createdAt: n.createdAt,
-      }));
+      const issues = (repoData.openIssues?.nodes || []).map((n) => {
+        const row = {
+          number: n.number,
+          title: n.title,
+          state: (n.state || "").toUpperCase(),
+          url: n.url,
+          labels: (n.labels?.nodes || []).map((l) => ({ name: l.name })),
+          assignees: (n.assignees?.nodes || []).map((a) => ({ login: a.login })),
+          createdAt: n.createdAt,
+        };
+        // Match REST's contract observation. Never retain the raw body in the
+        // dashboard cache, and leave malformed or absent bodies unqualified.
+        if (Object.prototype.hasOwnProperty.call(n, "body") && (n.body === null || typeof n.body === "string")) {
+          row.contract_revision = issueContractRevision(n.body);
+        }
+        return row;
+      });
 
       const prs = (repoData.openPRs?.nodes || []).map((n) => ({
         number: n.number,
