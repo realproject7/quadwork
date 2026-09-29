@@ -688,3 +688,60 @@ PIDs and generation temp. Never run broad `pkill`, delete arbitrary `/tmp`, or
 stop a shared service. Kernel journal denial or ambiguous/global OOM makes the
 proof unavailable. `/proc/vmstat` OOM counts include memcg victims and are not a
 global-only counter. No provider credentials are required or read by the matrix.
+
+---
+
+## Seed conflict after an upgrade: `[reseed] <project>: CONFLICT — seed conflict — preserved …` — #1222
+
+**Symptom:** After upgrading, the server log shows a line such as
+`[reseed] my-project: CONFLICT — seed conflict — preserved re1/AGENTS.md (unowned); … state NOT advanced`.
+The line appears at startup and then at most once every 15 minutes while the
+project stays pending. **Re-seed AGENTS.md** in the dashboard reports the same
+conflict. The dashboard and agent sessions keep working. That project's role
+worktrees keep their old instructions until you resolve the conflict.
+
+**Cause:** V2 projects write `AGENTS.md`, `CLAUDE.md` and `DESIGN-GUIDE.md`
+into each role worktree as untracked files, and record a private ownership
+receipt for each file they write. QuadWork only overwrites a file whose bytes
+and identity match its receipt. An existing file is preserved unchanged when:
+
+- `(unowned)`: it has no receipt, for example a file written by an older
+  version or by hand. QuadWork never assumes ownership from the filename.
+- `(modified)`: it has a receipt, but the file has since been edited, replaced
+  or relinked.
+
+The other seed files in the project are still refreshed, but the project's
+version marker stays pending, so each automatic retry tries again. The log
+names only the project, the role (`re1`, or `<repository>/re1` for an
+additional repository) and the seed filename. It never includes file contents,
+paths or credentials.
+
+**Fix:** QuadWork does not decide what happens to this file. For each
+file listed in the conflict:
+
+1. **Inspect it** in the role worktree (for example `<project>-re1/AGENTS.md`),
+   and check whether it has local notes you want to keep.
+2. **Back it up outside the worktree**, for example
+   `cp <project>-re1/AGENTS.md ~/quadwork-seed-backup-re1-AGENTS.md`.
+3. **Compare it to the current template.** The installed QuadWork package
+   ships the templates under `templates/seeds/` (`<role>.AGENTS.md` and
+   `DESIGN-GUIDE.md`) and `templates/CLAUDE.md`. `{{…}}` placeholders are
+   filled in when the file is written.
+4. **Choose one:**
+   - **Keep it pending.** Leave the file where it is. It stays byte-for-byte
+     unchanged, the project stays pending, and the log line continues at most
+     every 15 minutes.
+   - **Replace it.** Move the file out of the worktree (not just a copy), then
+     click **Re-seed AGENTS.md** in the dashboard once the batch is idle.
+     QuadWork writes the current seed with a fresh receipt and advances the
+     project's version marker. A later automatic retry does the same. If you
+     edit the new file afterwards, it is reported as `(modified)` on the next
+     reseed.
+
+Tracked seed files, meaning files committed in the repository, belong to the
+repository and are not part of this recovery. Reseed skips them unchanged. Change
+them through a normal pull request.
+
+A `[reseed] <project>: ERROR — …` line is a different failure, for example a
+role worktree that is not on its `worktree-<role>` branch. This procedure does
+not resolve it.
