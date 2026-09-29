@@ -10,6 +10,8 @@ const os = require("node:os");
 const path = require("node:path");
 const util = require("node:util");
 
+const ISSUE_BODY = "fallback contract sentinel\r\n";
+
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "quadwork-projects-multi-"));
 const originalHomedir = os.homedir;
 const originalExecFile = childProcess.execFile;
@@ -46,7 +48,14 @@ fakeExecFile[util.promisify.custom] = async (_command, args) => {
       openPRs: { nodes: [] }, mergedPRs: { nodes: [] },
     };
     return { stdout: JSON.stringify({ data: {
-      repo_0: emptyRepo, repo_1: emptyRepo, repo_2: emptyRepo, repo_3: emptyRepo,
+      repo_0: { ...emptyRepo, openIssues: { nodes: [
+        { number: 42, title: "owned issue", body: ISSUE_BODY, state: "OPEN" },
+        { number: 43, title: "empty issue", body: "", state: "OPEN" },
+        { number: 44, title: "null body", body: null, state: "OPEN" },
+        { number: 45, title: "missing body", state: "OPEN" },
+        { number: 46, title: "invalid body", body: 7, state: "OPEN" },
+      ] } },
+      repo_1: emptyRepo, repo_2: emptyRepo, repo_3: emptyRepo,
     } }), stderr: "" };
   }
   activeProjectCalls += 1;
@@ -87,6 +96,9 @@ function request(server, pathname) {
   try {
     const express = require("express");
     const routes = require("./routes");
+    const { issueContractRevision } = require("./issue-contract-revision");
+    const { createLiveWorkTaskIdentityResolver, LiveWorkTaskIdentityResolverError } = require("./live-work-task-identity-resolver");
+    const { buildBatchManifest, assertManifestRegisteredCurrent } = require("./work-task-manifest");
     const app = express();
     app.set("readSessionLiveness", () => []);
     app.use(routes);
@@ -122,6 +134,63 @@ function request(server, pathname) {
     assert.match(queryArg, /repo_0: repository/);
     assert.match(queryArg, /repo_1: repository/);
     assert.match(queryArg, /repo_3: repository/);
+    assert.match(queryArg, /openIssues:[\s\S]*nodes \{ number title body url state/);
+    const issues = fallback.get("acme/app").issues;
+    const revision = issueContractRevision(ISSUE_BODY);
+    assert.equal(issues[0].contract_revision, revision);
+    assert.equal(issues[0].contract_revision, routes.restIssueToCanonical({ number: 42, body: ISSUE_BODY }).contract_revision);
+    assert.equal(issues[1].contract_revision, issueContractRevision(""));
+    assert.equal(routes.restIssueToCanonical({ number: 43, body: null }).contract_revision, issueContractRevision(null));
+    assert.equal(Object.hasOwn(issues[2], "contract_revision"), false);
+    assert.equal(Object.hasOwn(issues[3], "contract_revision"), false);
+    assert.equal(Object.hasOwn(issues[4], "contract_revision"), false);
+    assert.ok(issues.every((row) => !Object.hasOwn(row, "body")));
+    assert.ok(!JSON.stringify(fallback.get("acme/app")).includes("fallback contract sentinel"));
+    const markdown = routes.renderGithubMarkdown("Active", "Acme/App", fallback.get("acme/app"), {}, "");
+    assert.ok(!markdown.includes("fallback contract sentinel"), "GITHUB.md rendering excludes the raw issue body");
+
+    const installationId = "00000000-0000-4000-8000-000000000001";
+    const workItem = { repoKey: "app", repo: "Acme/App", number: 42, kind: "issue" };
+    const binding = { key: "app", repo: "Acme/App", cache_repo: "acme/app" };
+    const activeContext = {
+      activated: true, queueReadOk: true, installationId, batchType: "code",
+      project: { id: "active" }, repositories: [binding],
+      parsed: { provenance: "owned", installationId, batchNumber: 1,
+        assignmentAttempt: "attempt_fallback_1", assignmentKey: "owned-fallback",
+        errors: [], workItems: [{ ref: workItem, legacyUnowned: false }] },
+    };
+    const now = Date.now();
+    routes._graphqlCache.set("acme/app", { ts: now, ...fallback.get("acme/app") });
+    routes._graphqlCache.set("acme/api", { ts: now, ...fallback.get("acme/api") });
+    routes._githubRepoStatus.set("acme/app", { status: "fallback", checkedAt: now, lastGoodAt: now });
+    routes._githubRepoStatus.set("acme/api", { status: "fallback", checkedAt: now, lastGoodAt: now });
+    const dashboard = await request(server, "/api/github/all?project=active");
+    assert.equal(dashboard.status, 200);
+    assert.equal(dashboard.json.active.issues.find((row) => row.number === 42).contract_revision, revision);
+    assert.ok(!JSON.stringify(dashboard.json).includes("fallback contract sentinel"));
+    const resolveRegisteredIdentity = createLiveWorkTaskIdentityResolver({
+      read_live_batch_context: () => activeContext,
+      read_repository_state: routes.repositoryState,
+      read_cached_repository_snapshot: (repo) => routes._graphqlCache.get(repo),
+    });
+    assert.equal(routes.repositoryState(binding).stale, false);
+    assert.equal(routes.repositoryState(binding).status, "fallback");
+    const source = { version: 1, installation_id: installationId, project_id: "active", delivery_mode: "integrated",
+      tasks: [{ task_key: "fallback", repository_key: "app", work_item: workItem,
+        goal: "admit the current issue contract", file_boundary: ["server/routes.js"], validation: ["node:test"], dependencies: [] }] };
+    const manifest = buildBatchManifest(source, { resolveRegisteredIdentity });
+    assert.equal(manifest.tasks[0].ref.issue_body_revision, revision);
+    assert.equal(assertManifestRegisteredCurrent(manifest, { resolveRegisteredIdentity }), true);
+    routes._graphqlCache.set("acme/app", { ts: now, ...fallback.get("acme/app"),
+      issues: [{ ...issues[0], contract_revision: issueContractRevision("changed body") }] });
+    assert.throws(() => assertManifestRegisteredCurrent(manifest, { resolveRegisteredIdentity }),
+      (error) => error.code === "stale_work_task_contract");
+    for (const row of issues.slice(2)) {
+      routes._graphqlCache.set("acme/app", { ts: now, ...fallback.get("acme/app"), issues: [{ ...row, number: 42 }] });
+      assert.throws(() => resolveRegisteredIdentity({ installation_id: installationId, project_id: "active",
+        repository_key: "app", work_item: workItem }),
+      (error) => error instanceof LiveWorkTaskIdentityResolverError && error.code === "live_work_task_identity_unavailable");
+    }
     console.log("routes.projectsMultiRepository.test.js: all assertions passed");
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
