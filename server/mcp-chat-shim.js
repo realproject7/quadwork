@@ -3,6 +3,7 @@
 
 const http = require("http");
 const readline = require("readline");
+const { workTaskKey } = require("./work-task-manifest");
 
 const args = process.argv.slice(2);
 function flag(name) {
@@ -365,11 +366,11 @@ function plainRecord(value) {
 }
 
 function validWorkTaskCandidateSuccess(body, submittedRef) {
-  return plainRecord(body) && Object.keys(body).sort().join(",") === "candidate_digest,ok,outcome,version,work_task_ref" &&
-    body.ok === true && body.version === 1 && ["recorded", "idempotent"].includes(body.outcome) &&
-    typeof body.candidate_digest === "string" && /^[a-f0-9]{64}$/.test(body.candidate_digest) &&
-    plainRecord(submittedRef) && plainRecord(body.work_task_ref) &&
-    JSON.stringify(body.work_task_ref) === JSON.stringify(submittedRef);
+  if (!plainRecord(body) || Object.keys(body).sort().join(",") !== "candidate_digest,ok,outcome,version,work_task_ref" ||
+      body.ok !== true || body.version !== 1 || !["recorded", "idempotent"].includes(body.outcome) ||
+      typeof body.candidate_digest !== "string" || !/^[a-f0-9]{64}$/.test(body.candidate_digest)) return false;
+  try { return workTaskKey(body.work_task_ref) === workTaskKey(submittedRef); }
+  catch { return false; }
 }
 
 function parseChatResumeArguments(value) {

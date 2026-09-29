@@ -288,7 +288,11 @@ async function runTests() {
   assert(JSON.stringify(Object.keys(candidateSchema.properties).sort()) === JSON.stringify(["candidate_sha", "event_id", "work_task_ref"]) &&
     candidateSchema.additionalProperties === false && !candidateSchema.required.includes("version"),
   "Dev candidate tool advertises only its three caller-owned fields");
-  const candidateArguments = { event_id: "record_candidate_001", work_task_ref: { task_key: "build" }, candidate_sha: "a".repeat(40) };
+  const candidateArguments = { event_id: "record_candidate_001", work_task_ref: {
+    version: 1, installation_id: "installation_mcp_shim_0001", project_id: "mcp-shim-test", repository_key: "web",
+    work_item: { repoKey: "web", repo: "Acme/Web", number: 42, kind: "issue" },
+    issue_body_revision: "c".repeat(64), task_key: "build", task_revision: "d".repeat(64),
+  }, candidate_sha: "a".repeat(40) };
   const candidateSuccessBody = { ok: true, version: 1, outcome: "recorded", candidate_digest: "b".repeat(64),
     work_task_ref: candidateArguments.work_task_ref };
   workTaskCandidateResponse = { status: 200, body: candidateSuccessBody };
@@ -300,6 +304,16 @@ async function runTests() {
     workTaskCandidateRequests.length === 1 && workTaskCandidateRequests[0].token === TEST_TOKEN &&
     JSON.stringify(workTaskCandidateRequests[0].body) === JSON.stringify({ ...candidateArguments, version: 1 }),
   "advertised Dev input forwards a fixed versioned payload with its bound token");
+
+  const reversedRef = Object.fromEntries(Object.entries(candidateArguments.work_task_ref).reverse());
+  reversedRef.work_item = Object.fromEntries(Object.entries(candidateArguments.work_task_ref.work_item).reverse());
+  workTaskCandidateResponse = { status: 200, body: { ...candidateSuccessBody, work_task_ref: reversedRef } };
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 2002, method: "tools/call", params: {
+    name: "submit_work_task_candidate", arguments: candidateArguments,
+  } });
+  const reorderedSuccess = await readResponse(shim);
+  assert(JSON.stringify(JSON.parse(reorderedSuccess.result?.content?.[0]?.text || "{}")) === JSON.stringify(candidateSuccessBody),
+    "semantically identical reordered WorkTaskRef succeeds without echoing the server body");
 
   for (const [status, body, expected] of [
     [409, { ok: false, code: "stale_work_task_candidate_authority", error: `private=${TEST_TOKEN}` }, "stale_work_task_candidate_authority"],
