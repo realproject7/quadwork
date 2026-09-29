@@ -62,7 +62,7 @@ const server = app.listen(0, "127.0.0.1");
 function post(url, value) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(value);
-    const req = http.request({ hostname: "127.0.0.1", port: server.address().port, path: url, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (res) => {
+    const req = http.request({ hostname: "127.0.0.1", port: server.address().port, path: url, method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (res) => {
       let data = ""; res.on("data", (s) => { data += s; });
       res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(data) }));
     }); req.on("error", reject); req.end(body);
