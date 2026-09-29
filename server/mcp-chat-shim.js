@@ -4,6 +4,7 @@
 const http = require("http");
 const readline = require("readline");
 const { workTaskKey } = require("./work-task-manifest");
+const { assertTaskReviewRoundRef } = require("./task-review-round");
 
 const args = process.argv.slice(2);
 function flag(name) {
@@ -38,6 +39,33 @@ const WORK_TASK_CANDIDATE_REJECTION_CODES = new Set([
   "work_task_candidate_assignment_mismatch",
   "work_task_candidate_base_mismatch",
   "work_task_candidate_not_changed",
+  "stale_work_task_pipeline_store_precondition",
+]);
+const WORK_TASK_REVIEW_OPEN_REJECTION_CODES = new Set([
+  "work_task_review_principal_unavailable",
+  "invalid_work_task_review_open_request",
+  "work_task_reviewer_assignment_unavailable",
+  "stale_work_task_review_authority",
+  "live_work_task_identity_unavailable",
+  "work_task_review_clock_unavailable",
+  "work_task_review_service_unavailable",
+  "work_task_review_pipeline_unavailable",
+  "work_task_archive_blocked",
+  "work_task_review_assignment_unavailable",
+  "work_task_review_candidate_unavailable",
+  "work_task_review_event_conflict",
+  "work_task_review_open_failed",
+  "work_task_review_assignment_failed",
+  "invalid_task_review_round_open",
+  "invalid_task_review_assignments",
+  "task_review_round_conflict",
+  "task_review_round_store_locked",
+  "task_review_round_store_unreadable",
+  "task_review_round_store_persist_failed",
+  "task_review_round_store_unsafe",
+  "task_review_round_store_invalid",
+  "task_review_round_store_over_bound",
+  "task_review_round_store_root_invalid",
   "stale_work_task_pipeline_store_precondition",
 ]);
 
@@ -373,6 +401,17 @@ function validWorkTaskCandidateSuccess(body, submittedRef) {
   catch { return false; }
 }
 
+function validWorkTaskReviewOpenSuccess(body, submitted) {
+  if (!plainRecord(body) || Object.keys(body).sort().join(",") !== "candidate_digest,ok,outcome,review_round_ref,version" ||
+      body.ok !== true || body.version !== 1 || !["opened", "idempotent"].includes(body.outcome) ||
+      typeof body.candidate_digest !== "string" || !/^[a-f0-9]{64}$/.test(body.candidate_digest)) return false;
+  try {
+    assertTaskReviewRoundRef(body.review_round_ref);
+    return workTaskKey(body.review_round_ref.work_task_ref) === workTaskKey(submitted.work_task_ref) &&
+      body.review_round_ref.attempt === submitted.attempt && body.review_round_ref.round === submitted.round;
+  } catch { return false; }
+}
+
 function parseChatResumeArguments(value) {
   if (!plainRecord(value)) return null;
   const keys = Object.keys(value).sort();
@@ -566,9 +605,22 @@ async function handleToolCall(id, name, params) {
 
     if (name === "open_work_task_independent_review") {
       if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: open_work_task_independent_review");
-      const res = await httpRequest("POST", "/api/work-task-review/open", params, { "X-Chat-Token": TOKEN });
-      if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask review opening unavailable");
-      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+      try {
+        const res = await httpRequest("POST", "/api/work-task-review/open", params, { "X-Chat-Token": TOKEN });
+        if (res.status >= 400) {
+          const code = plainRecord(res.body) && res.body.ok === false &&
+            WORK_TASK_REVIEW_OPEN_REJECTION_CODES.has(res.body.code) ? res.body.code : "WorkTask review opening unavailable";
+          return jsonRpcError(id, -32000, code);
+        }
+        if (res.status !== 200 || !validWorkTaskReviewOpenSuccess(res.body, params)) {
+          return jsonRpcError(id, -32000, "WorkTask review opening unavailable");
+        }
+        const result = { ok: true, version: 1, outcome: res.body.outcome,
+          review_round_ref: res.body.review_round_ref, candidate_digest: res.body.candidate_digest };
+        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
+      } catch {
+        return jsonRpcError(id, -32000, "WorkTask review opening unavailable");
+      }
     }
 
     if (name === "submit_work_task_review_receipt") {

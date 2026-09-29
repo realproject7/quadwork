@@ -42,6 +42,7 @@ let chatResumeFailure = false;
 let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
 let workTaskCandidateResponse;
+let workTaskReviewOpenResponse;
 
 function sendJsonRpc(proc, msg) {
   proc.stdin.write(JSON.stringify(msg) + "\n");
@@ -142,7 +143,9 @@ function startTestServer() {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
       if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
       workTaskReviewRequests.push({ kind: "open", token: req.headers["x-chat-token"], body: req.body });
-      res.json({ ok: true, outcome: "opened" });
+      const { status, body } = workTaskReviewOpenResponse;
+      if (typeof body === "string") return res.status(status).type("text/plain").send(body);
+      return res.status(status).json(body);
     });
     app.post("/api/work-task-build", (req, res) => {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
@@ -426,7 +429,19 @@ async function runTests() {
     JSON.stringify(workTaskBuildRequests[0].body) === JSON.stringify(buildArguments),
   "Head build assignment forwards only its typed arguments and existing shim token");
 
-  const openArguments = { event_id: "open_review_001", work_task_ref: { task_key: "review" }, attempt: "attempt_001", round: 1 };
+  const openWorkTaskRef = {
+    version: 1, installation_id: "installation_review_shim_0001", project_id: "mcp-shim-test",
+    repository_key: "web", work_item: { repoKey: "web", repo: "Acme/Web", number: 42, kind: "issue" },
+    issue_body_revision: "c".repeat(64), task_key: "review", task_revision: "d".repeat(64),
+  };
+  const openArguments = { event_id: "open_review_001", work_task_ref: openWorkTaskRef, attempt: "attempt_001", round: 1 };
+  const openRoundRef = {
+    version: 1, installation_id: openWorkTaskRef.installation_id, project_id: openWorkTaskRef.project_id,
+    work_task_ref: openWorkTaskRef, task_revision: openWorkTaskRef.task_revision,
+    base_sha: "a".repeat(64), candidate_sha: "b".repeat(64), attempt: "attempt_001", round: 1,
+  };
+  workTaskReviewOpenResponse = { status: 200, body: { ok: true, version: 1, outcome: "opened",
+    review_round_ref: openRoundRef, candidate_digest: "e".repeat(64) } };
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 211, method: "tools/call", params: {
     name: "open_work_task_independent_review", arguments: openArguments,
   } });
@@ -437,6 +452,28 @@ async function runTests() {
     workTaskReviewRequests[0].token === HEAD_RESUME_TOKEN && JSON.stringify(workTaskReviewRequests[0].body) === JSON.stringify(openArguments),
   "Head review opening forwards only its typed arguments and existing shim token");
 
+  for (const [status, body, expected] of [
+    [409, { ok: false, code: "work_task_reviewer_assignment_unavailable", secret: HEAD_RESUME_TOKEN }, "work_task_reviewer_assignment_unavailable"],
+    [409, { ok: false, code: "task_review_round_store_unsafe", path: "/private/review" }, "task_review_round_store_unsafe"],
+    [409, { ok: false, code: "secret_internal_path", secret: HEAD_RESUME_TOKEN }, "WorkTask review opening unavailable"],
+    [409, { ok: true, code: "work_task_reviewer_assignment_unavailable" }, "WorkTask review opening unavailable"],
+    [409, [{ ok: false, code: "work_task_reviewer_assignment_unavailable" }], "WorkTask review opening unavailable"],
+    [503, `private=${HEAD_RESUME_TOKEN}`, "WorkTask review opening unavailable"],
+    [200, { ok: true, outcome: "opened", secret: HEAD_RESUME_TOKEN }, "WorkTask review opening unavailable"],
+  ]) {
+    workTaskReviewOpenResponse = { status, body };
+    sendJsonRpc(headShim, { jsonrpc: "2.0", id: 2111, method: "tools/call", params: {
+      name: "open_work_task_independent_review", arguments: openArguments,
+    } });
+    const rejected = await readResponse(headShim);
+    assert(rejected.error?.code === -32000 && rejected.error.message === expected,
+      "review-open rejection reveals only an allowlisted code or its generic fallback");
+    assert(!JSON.stringify(rejected).includes(HEAD_RESUME_TOKEN), "review-open failures never reveal the Head token");
+    assert(!JSON.stringify(rejected).includes("/private/review"), "review-open failures never reveal a private path");
+  }
+  workTaskReviewOpenResponse = { status: 200, body: { ok: true, version: 1, outcome: "opened",
+    review_round_ref: openRoundRef, candidate_digest: "e".repeat(64) } };
+
   const reconcileArguments = { work_task_ref: { task_key: "review" }, review_round_ref: { attempt: "attempt_001" }, candidate_digest: "e".repeat(64) };
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 212, method: "tools/call", params: {
     name: "reconcile_work_task_review", arguments: reconcileArguments,
@@ -444,8 +481,8 @@ async function runTests() {
   const reconcileReviewResp = await readResponse(headShim);
   assert(JSON.parse(reconcileReviewResp.result?.content?.[0]?.text || "{}").outcome === "reconciled",
     "authenticated Head can call the fixed WorkTask review reconciliation endpoint");
-  assert(workTaskReviewRequests.length === 2 && workTaskReviewRequests[1].kind === "reconcile" &&
-    workTaskReviewRequests[1].token === HEAD_RESUME_TOKEN && JSON.stringify(workTaskReviewRequests[1].body) === JSON.stringify(reconcileArguments),
+  assert(workTaskReviewRequests.at(-1).kind === "reconcile" &&
+    workTaskReviewRequests.at(-1).token === HEAD_RESUME_TOKEN && JSON.stringify(workTaskReviewRequests.at(-1).body) === JSON.stringify(reconcileArguments),
   "Head review reconciliation forwards only its typed arguments and existing shim token");
 
   const prepareArguments = { repository_key: "web" };
@@ -525,7 +562,7 @@ async function runTests() {
   } });
   const hiddenOpen = await readResponse(shim);
   assert(hiddenOpen.error?.code === -32601, "non-Head hidden WorkTask review opening calls are denied locally");
-  assert(workTaskReviewRequests.length === 2, "non-Head review opening calls never reach the fixed endpoint");
+  assert(workTaskReviewRequests.length === 9, "non-Head review opening calls never reach the fixed endpoint");
 
   sendJsonRpc(shim, { jsonrpc: "2.0", id: 232, method: "tools/call", params: {
     name: "prepare_delivery_candidate", arguments: prepareArguments,
@@ -555,8 +592,8 @@ async function runTests() {
   const receiptResp = await readResponse(re1Shim);
   assert(JSON.parse(receiptResp.result?.content?.[0]?.text || "{}").outcome === "sealed",
     "authenticated reviewer can seal through the fixed WorkTask receipt endpoint");
-  assert(workTaskReviewRequests.length === 3 && workTaskReviewRequests[2].kind === "receipt" && workTaskReviewRequests[2].role === "re1" &&
-    workTaskReviewRequests[2].token === re1ReceiptToken && JSON.stringify(workTaskReviewRequests[2].body) === JSON.stringify(receiptArguments),
+  assert(workTaskReviewRequests.length === 10 && workTaskReviewRequests.at(-1).kind === "receipt" && workTaskReviewRequests.at(-1).role === "re1" &&
+    workTaskReviewRequests.at(-1).token === re1ReceiptToken && JSON.stringify(workTaskReviewRequests.at(-1).body) === JSON.stringify(receiptArguments),
   "review receipt forwards only its typed arguments and existing reviewer token");
   await stopShim(re1Shim);
 
