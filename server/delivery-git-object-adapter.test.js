@@ -133,12 +133,14 @@ async function withRepository(run) {
     git(repository, ["config", "user.email", "quadwork@example.test"]);
     git(repository, ["config", "user.name", "QuadWork Test"]);
     git(repository, ["remote", "add", "origin", "git@github.com:owner/web.git"]);
+    write(repository, "src/app/project/[id]/page.tsx", "export default function Page() { return null; }\n");
     write(repository, "server/a.js", "module.exports = 'base-a';\n");
     write(repository, "server/b.js", "module.exports = 'base-b';\n");
     const base_sha = commit(repository, "base");
 
     git(repository, ["checkout", "-b", "candidate-a", base_sha]);
     write(repository, "server/a.js", "module.exports = 'candidate-a';\n");
+    write(repository, "src/app/project/[id]/page.tsx", "export default function Page() { return 'candidate-a'; }\n");
     const candidate_a = commit(repository, "candidate a");
 
     git(repository, ["checkout", "-b", "candidate-b", base_sha]);
@@ -147,6 +149,7 @@ async function withRepository(run) {
 
     git(repository, ["checkout", "main"]);
     write(repository, "server/a.js", "module.exports = 'candidate-a';\n");
+    write(repository, "src/app/project/[id]/page.tsx", "export default function Page() { return 'candidate-a'; }\n");
     write(repository, "server/b.js", "module.exports = 'candidate-b';\n");
     const result_sha = commit(repository, "integrated result");
     return await run({ directory, repository, base_sha, candidate_a, candidate_b, result_sha });
@@ -163,7 +166,7 @@ await withRepository(async ({ directory, repository, base_sha, candidate_a, cand
     project_id,
     delivery_mode: "integrated",
     tasks: [
-      { task_key: "a", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1061, kind: "issue" }, goal: "change a", file_boundary: ["server/a.js"], validation: ["node-test"], dependencies: [] },
+      { task_key: "a", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1061, kind: "issue" }, goal: "change a", file_boundary: ["server/a.js", "src/app/project/[id]/page.tsx"], validation: ["node-test"], dependencies: [] },
       { task_key: "b", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 1062, kind: "issue" }, goal: "change b", file_boundary: ["server/b.js"], validation: ["node-test"], dependencies: [] },
     ],
   }, {
@@ -210,7 +213,8 @@ await withRepository(async ({ directory, repository, base_sha, candidate_a, cand
 
   const observed = await adapter.readDeliveryEvidence({ version: 1, head_binding: owner, delivery_source: copy(deliverySource) });
   assert.equal(observed.result_sha, result_sha);
-  assert.deepEqual(observed.evidence.boundary.paths, ["server/a.js", "server/b.js"]);
+  assert.equal(git(repository, ["ls-tree", "-r", "--name-only", base_sha]).includes("src/app/project/[id]/page.tsx"), true);
+  assert.deepEqual(observed.evidence.boundary.paths, ["server/a.js", "server/b.js", "src/app/project/[id]/page.tsx"]);
   assert.match(observed.evidence.patch.patch_digest, /^[a-f0-9]{64}$/);
 
   const ref = {
@@ -242,18 +246,19 @@ await withRepository(async ({ directory, repository, base_sha, candidate_a, cand
   const candidateB = await objects.readCommit({ version: 1, repository: "owner/web", sha: candidate_b });
   const baseTree = await objects.readTree({ version: 1, repository: "owner/web", tree_sha: base.tree_sha });
   const resultTree = await objects.readTree({ version: 1, repository: "owner/web", tree_sha: result.tree_sha });
-  assert.equal(baseTree.entries.length, 2);
-  assert.equal(resultTree.entries.length, 2);
+  assert.equal(baseTree.entries.length, 3);
+  assert.equal(resultTree.entries.length, 3);
 
   const fullPatch = await objects.readDeliveryPatch({
     version: 1, repository: "owner/web", delivery_candidate_ref: ref, delivery_manifest_digest: manifestDigest,
     base_sha, result_sha, base_tree_sha: base.tree_sha, result_tree_sha: result.tree_sha,
   });
-  assert.equal(fullPatch.files.length, 2);
+  assert.equal(fullPatch.files.length, 3);
   assert.ok(fullPatch.files.every((entry) => entry.binary_delta.startsWith("GIT binary patch\n")));
   const patchA = await objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[0].ref, stages[0], base.tree_sha, candidateA.tree_sha, 1));
   const patchB = await objects.readCandidatePatch(requestForPatch(ref, manifestDigest, manifest.tasks[1].ref, stages[1], base.tree_sha, candidateB.tree_sha, 2));
   assert.equal(patchA.files[0].path, "server/a.js");
+  assert.equal(patchA.files[1].path, "src/app/project/[id]/page.tsx");
   assert.equal(patchB.files[0].path, "server/b.js");
 
   const reviewed = objects.readReviewedTask({

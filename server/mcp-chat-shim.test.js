@@ -22,6 +22,12 @@ const {
 const crypto = require("crypto");
 
 const PROJECT = "__mcp_shim_test__";
+const prepareSuccessBody = { ok: true, version: 1, kind: "delivery_candidate_initialized", replayed: false,
+  record: { delivery_candidate_ref: { version: 1, installation_id: "installation_shim_test_01",
+    project_id: "quadwork-shim-test", repository_key: "web", batch_manifest_digest: "a".repeat(64),
+    delivery_mode: "integrated", base_sha: "b".repeat(40), result_sha: "c".repeat(40), cut_id: "cut_test_001" },
+  revision: 0, lifecycle: "pending_composition", delivery_manifest_digest: "d".repeat(64),
+  composition_proof_digest: null } };
 const OTHER_PROJECT = "__mcp_shim_other__";
 const AGENT = "dev";
 const TEST_TOKEN = crypto.randomBytes(16).toString("hex");
@@ -43,6 +49,7 @@ let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
 let workTaskCandidateResponse;
 let workTaskReviewOpenResponse;
+let deliveryPrepareResponse = { status: 200, body: prepareSuccessBody };
 
 function sendJsonRpc(proc, msg) {
   proc.stdin.write(JSON.stringify(msg) + "\n");
@@ -177,7 +184,9 @@ function startTestServer() {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
       if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
       deliveryCandidateRequests.push({ kind: "prepare", token: req.headers["x-chat-token"], body: req.body });
-      res.json({ ok: true, outcome: "prepared" });
+      const { status, body } = deliveryPrepareResponse;
+      if (typeof body === "string") return res.status(status).type("text/plain").send(body);
+      res.status(status).json(body);
     });
     app.post("/api/delivery-candidate/compose", (req, res) => {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
@@ -490,11 +499,35 @@ async function runTests() {
     name: "prepare_delivery_candidate", arguments: prepareArguments,
   } });
   const preparedDelivery = await readResponse(headShim);
-  assert(JSON.parse(preparedDelivery.result?.content?.[0]?.text || "{}").outcome === "prepared",
+  assert(JSON.parse(preparedDelivery.result?.content?.[0]?.text || "{}").kind === "delivery_candidate_initialized",
     "authenticated Head can prepare a Delivery Candidate through the fixed endpoint");
   assert(deliveryCandidateRequests.length === 1 && deliveryCandidateRequests[0].kind === "prepare" &&
     deliveryCandidateRequests[0].token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests[0].body) === JSON.stringify(prepareArguments),
   "Delivery Candidate preparation forwards only the typed repository key and existing Head token");
+  for (const response of [
+    { status: 409, body: { ok: false, code: "delivery_git_evidence_base_tree_invalid", secret: HEAD_RESUME_TOKEN } },
+    { status: 409, body: { ok: false, code: "unknown_private_error", secret: HEAD_RESUME_TOKEN } },
+    { status: 409, body: `private path /private/delivery ${HEAD_RESUME_TOKEN}` },
+  ]) {
+    deliveryPrepareResponse = response;
+    sendJsonRpc(headShim, { jsonrpc: "2.0", id: 2131, method: "tools/call", params: {
+      name: "prepare_delivery_candidate", arguments: prepareArguments,
+    } });
+    const rejected = await readResponse(headShim);
+    assert(rejected.error?.code === -32000, "prepare failures return a bounded error");
+    assert(rejected.error?.message === (response.body?.code === "delivery_git_evidence_base_tree_invalid"
+      ? "delivery_git_evidence_base_tree_invalid" : "Delivery Candidate preparation unavailable"),
+    "prepare failures reveal only a known code");
+    assert(!JSON.stringify(rejected).includes(HEAD_RESUME_TOKEN) && !JSON.stringify(rejected).includes("/private/delivery"));
+  }
+  deliveryPrepareResponse = { status: 200, body: { ...prepareSuccessBody, private_path: "/private/delivery" } };
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 2132, method: "tools/call", params: {
+    name: "prepare_delivery_candidate", arguments: prepareArguments,
+  } });
+  const malformedPrepare = await readResponse(headShim);
+  assert(malformedPrepare.error?.message === "Delivery Candidate preparation unavailable" &&
+    !JSON.stringify(malformedPrepare).includes("/private/delivery"), "malformed prepare success is redacted");
+  deliveryPrepareResponse = { status: 200, body: prepareSuccessBody };
 
   const composeArguments = { delivery_candidate_ref: { version: 1 }, expected_revision: 0, correlation_id: "compose_001", idempotency_key: "compose_001" };
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 214, method: "tools/call", params: {
@@ -503,8 +536,8 @@ async function runTests() {
   const composedDelivery = await readResponse(headShim);
   assert(JSON.parse(composedDelivery.result?.content?.[0]?.text || "{}").outcome === "composed",
     "authenticated Head can compose a Delivery Candidate through the fixed endpoint");
-  assert(deliveryCandidateRequests.length === 2 && deliveryCandidateRequests[1].kind === "compose" &&
-    deliveryCandidateRequests[1].token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests[1].body) === JSON.stringify(composeArguments),
+  assert(deliveryCandidateRequests.length === 6 && deliveryCandidateRequests.at(-1).kind === "compose" &&
+    deliveryCandidateRequests.at(-1).token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests.at(-1).body) === JSON.stringify(composeArguments),
   "Delivery Candidate composition forwards only its typed candidate revision and existing Head token");
 
   const publicationPlanArguments = { delivery_candidate_ref: { version: 1 } };
@@ -514,8 +547,8 @@ async function runTests() {
   const publicationPlan = await readResponse(headShim);
   assert(JSON.parse(publicationPlan.result?.content?.[0]?.text || "{}").outcome === "publication-planned",
     "authenticated Head can derive a Delivery Candidate publication plan through the fixed endpoint");
-  assert(deliveryCandidateRequests.length === 3 && deliveryCandidateRequests[2].kind === "publication-plan" &&
-    deliveryCandidateRequests[2].token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests[2].body) === JSON.stringify(publicationPlanArguments),
+  assert(deliveryCandidateRequests.length === 7 && deliveryCandidateRequests.at(-1).kind === "publication-plan" &&
+    deliveryCandidateRequests.at(-1).token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests.at(-1).body) === JSON.stringify(publicationPlanArguments),
   "Delivery Candidate publication planning forwards only its typed reference and existing Head token");
 
   const finalReviewArguments = { delivery_candidate_ref: { version: 1 }, pr_number: 1062 };
@@ -525,8 +558,8 @@ async function runTests() {
   const finalReview = await readResponse(headShim);
   assert(JSON.parse(finalReview.result?.content?.[0]?.text || "{}").outcome === "final-review-opened",
     "authenticated Head can open the fixed Delivery Candidate final-review endpoint");
-  assert(deliveryCandidateRequests.length === 4 && deliveryCandidateRequests[3].kind === "final-review" &&
-    deliveryCandidateRequests[3].token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests[3].body) === JSON.stringify(finalReviewArguments),
+  assert(deliveryCandidateRequests.length === 8 && deliveryCandidateRequests.at(-1).kind === "final-review" &&
+    deliveryCandidateRequests.at(-1).token === HEAD_RESUME_TOKEN && JSON.stringify(deliveryCandidateRequests.at(-1).body) === JSON.stringify(finalReviewArguments),
   "Delivery Candidate final review forwards only its typed reference/PR number and existing Head token");
 
   for (const invalid of [
@@ -569,7 +602,7 @@ async function runTests() {
   } });
   const hiddenPrepare = await readResponse(shim);
   assert(hiddenPrepare.error?.code === -32601, "non-Head hidden Delivery Candidate preparation is denied locally");
-  assert(deliveryCandidateRequests.length === 4, "non-Head Delivery Candidate preparation never reaches the fixed endpoint");
+  assert(deliveryCandidateRequests.length === 8, "non-Head Delivery Candidate preparation never reaches the fixed endpoint");
 
   chatResumeFailure = true;
   sendJsonRpc(headShim, { jsonrpc: "2.0", id: 24, method: "tools/call", params: {

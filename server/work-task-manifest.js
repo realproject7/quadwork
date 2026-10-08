@@ -15,7 +15,7 @@ const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const REPO_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const TASK_KEY_RE = /^[a-z][a-z0-9_-]{0,63}$/;
-const PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=-]{1,240}$/;
+const PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=\[\]-]{1,240}$/;
 const VALIDATION_RE = /^[a-z][a-z0-9_.:-]{0,95}$/;
 const DELIVERY_MODES = new Set(["integrated", "isolated"]);
 const TRANSITIONS = new Set(["cut", "defer", "contract_change"]);

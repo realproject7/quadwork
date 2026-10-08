@@ -29,7 +29,9 @@ const INSTALLATION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-const PATH_RE = /^(?!\/)(?!.*\/\/)(?!.*(?:^|\/)\.(?:\/|$))(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._\/@+~=-]{1,240}$/;
+// Dynamic route segments such as Next.js `[id]` are ordinary Git path names.
+// Keep the existing traversal and length checks while admitting those bytes.
+const PATH_RE = /^(?!\/)(?!.*\/\/)(?!.*(?:^|\/)\.(?:\/|$))(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._\/@+~=\[\]-]{1,240}$/;
 const MODE_RE = /^(100644|100755|120000)$/;
 const PATCH_FORMAT = "git_full_index_binary_v1";
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;

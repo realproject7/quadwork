@@ -22,7 +22,7 @@ const { compareGitTreePaths } = require("./git-tree-order");
 const VERSION = 1;
 const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-const PATH_RE = /^(?!\/)(?!.*\/\/)(?!.*(?:^|\/)\.(?:\/|$))(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=-]{1,240}$/;
+const PATH_RE = /^(?!\/)(?!.*\/\/)(?!.*(?:^|\/)\.(?:\/|$))(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=\[\]-]{1,240}$/;
 const ABSOLUTE_PATH_RE = /^(?!.*\/\/)(?!.*(?:^|\/)\.(?:\/|$))(?!.*(?:^|\/)\.\.(?:\/|$))\/[A-Za-z0-9._/@+~=-]{1,1024}$/;
 const MODE_RE = /^(100644|100755|120000)$/;
 const PATCH_FORMAT = "git_full_index_binary_v1";
