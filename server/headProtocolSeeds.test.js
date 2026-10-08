@@ -194,6 +194,13 @@ assert.ok(head.includes("prepare_delivery_candidate") && head.includes("compose_
 assert.ok(head.includes("Never construct a Delivery Candidate reference"),
   "Head seed keeps Git evidence and candidate identity server-derived");
 
+assert.ok(head.includes("every operator question, blocker, requested decision, and material result") &&
+  head.includes("project Primary Chat with an explicit @user mention"),
+  "Head sends all operator-facing decisions and results through Primary Chat");
+assert.ok(head.includes("Agent terminals are not an operator inbox") &&
+  head.includes("Terminal-only prompts or prose never count as operator communication or justify waiting"),
+  "terminal-only Head prompts cannot block on an unseen operator response");
+
 console.log("headProtocolSeeds.test.js: all assertions passed");
 
 // #1076/#1060: all roles follow registered local verification without an
