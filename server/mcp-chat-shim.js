@@ -5,6 +5,7 @@ const http = require("http");
 const readline = require("readline");
 const { workTaskKey } = require("./work-task-manifest");
 const { assertTaskReviewRoundRef } = require("./task-review-round");
+const { assertDeliveryCandidateRef } = require("./delivery-candidate");
 
 const args = process.argv.slice(2);
 function flag(name) {
@@ -67,6 +68,25 @@ const WORK_TASK_REVIEW_OPEN_REJECTION_CODES = new Set([
   "task_review_round_store_over_bound",
   "task_review_round_store_root_invalid",
   "stale_work_task_pipeline_store_precondition",
+]);
+const DELIVERY_PREPARE_REJECTION_CODES = new Set([
+  "work_task_delivery_batch_not_frozen",
+  "work_task_delivery_cut_unavailable",
+  "work_task_delivery_review_unavailable",
+  "work_task_delivery_base_mismatch",
+  "work_task_delivery_repository_unavailable",
+  "delivery_git_evidence_dirty",
+  "delivery_git_evidence_base_invalid",
+  "delivery_git_evidence_base_tree_invalid",
+  "delivery_git_evidence_result_invalid",
+  "delivery_git_evidence_result_tree_invalid",
+  "delivery_git_evidence_base_mismatch",
+  "delivery_git_evidence_boundary_invalid",
+  "delivery_git_evidence_candidate_invalid",
+  "delivery_git_result_unchanged",
+  "delivery_candidate_source_invalid",
+  "delivery_candidate_evidence_invalid",
+  "delivery_candidate_prepare_rejected",
 ]);
 
 const CHAT_TOOLS = [
@@ -412,6 +432,21 @@ function validWorkTaskReviewOpenSuccess(body, submitted) {
   } catch { return false; }
 }
 
+function validDeliveryPrepareSuccess(body, submitted) {
+  if (!plainRecord(body) || Object.keys(body).sort().join(",") !== "kind,ok,record,replayed,version" ||
+      body.ok !== true || body.version !== 1 || body.kind !== "delivery_candidate_initialized" ||
+      typeof body.replayed !== "boolean" || !plainRecord(body.record) ||
+      Object.keys(body.record).sort().join(",") !== "composition_proof_digest,delivery_candidate_ref,delivery_manifest_digest,lifecycle,revision" ||
+      !Number.isSafeInteger(body.record.revision) || body.record.revision < 0 ||
+      !["pending_composition", "composed"].includes(body.record.lifecycle) ||
+      !/^[a-f0-9]{64}$/.test(body.record.delivery_manifest_digest) ||
+      (body.record.composition_proof_digest !== null && !/^[a-f0-9]{64}$/.test(body.record.composition_proof_digest))) return false;
+  try {
+    const ref = assertDeliveryCandidateRef(body.record.delivery_candidate_ref);
+    return ref.repository_key === submitted.repository_key;
+  } catch { return false; }
+}
+
 function parseChatResumeArguments(value) {
   if (!plainRecord(value)) return null;
   const keys = Object.keys(value).sort();
@@ -639,9 +674,25 @@ async function handleToolCall(id, name, params) {
 
     if (name === "prepare_delivery_candidate") {
       if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: prepare_delivery_candidate");
-      const res = await httpRequest("POST", "/api/delivery-candidate/prepare", params, { "X-Chat-Token": TOKEN });
-      if (res.status >= 400) return jsonRpcError(id, -32000, "Delivery Candidate preparation unavailable");
-      return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+      try {
+        const res = await httpRequest("POST", "/api/delivery-candidate/prepare", params, { "X-Chat-Token": TOKEN });
+        if (res.status >= 400) {
+          const code = plainRecord(res.body) && res.body.ok === false &&
+            DELIVERY_PREPARE_REJECTION_CODES.has(res.body.code) ? res.body.code : "Delivery Candidate preparation unavailable";
+          return jsonRpcError(id, -32000, code);
+        }
+        if (res.status !== 200 || !validDeliveryPrepareSuccess(res.body, params)) {
+          return jsonRpcError(id, -32000, "Delivery Candidate preparation unavailable");
+        }
+        const { version, kind, replayed, record } = res.body;
+        const result = { ok: true, version, kind, replayed,
+          record: { delivery_candidate_ref: record.delivery_candidate_ref, revision: record.revision,
+            lifecycle: record.lifecycle, delivery_manifest_digest: record.delivery_manifest_digest,
+            composition_proof_digest: record.composition_proof_digest } };
+        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
+      } catch {
+        return jsonRpcError(id, -32000, "Delivery Candidate preparation unavailable");
+      }
     }
 
     if (name === "compose_delivery_candidate") {

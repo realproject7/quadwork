@@ -19,7 +19,7 @@ const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REPOSITORY_KEY_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const REPOSITORY_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const CUT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
-const PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=-]{1,240}$/;
+const PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/@+~=\[\]-]{1,240}$/;
 const RECEIPT_ID_RE = /^[a-z][a-z0-9_-]{2,95}$/;
 const REVIEWER_ROLES = new Set(["re1", "re2"]);
 const VERDICTS = new Set(["approve", "request_changes"]);
