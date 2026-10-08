@@ -10,6 +10,13 @@ const NAMES = new Set(["AGENTS.md", "CLAUDE.md", "DESIGN-GUIDE.md"]);
 const digest = (content) => crypto.createHash("sha256").update(content).digest("hex");
 
 function fail(message) { throw new Error(`Owned worktree seed: ${message}`); }
+// #1222: an existing untracked file without a matching receipt is preserved.
+// The error names only the seed and its ownership class, never content/paths.
+function conflict(name, ownership) {
+  const described = ownership === "unowned" ? "an unowned file" : "a modified owned seed";
+  return Object.assign(new Error(`Owned worktree seed: ${name} is ${described}; preserved`), {
+    code: "seed_conflict", seed: name, ownership });
+}
 function regular(file) {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.nlink !== 1) fail("expected an unlinked regular file");
@@ -106,6 +113,17 @@ function seedOwnedWorktreeFile(binding, name, content, { runGit, adoptExact = fa
     receiptPath(ctx, name); // fixed seed-name allowlist
     if (run(["ls-files", "--stage", "--", name])) return { skipped: "tracked" };
     if (typeof content !== "string" || Buffer.byteLength(content) > 1024 * 1024) fail("invalid seed content");
+    // Classify before the writer runs; the pinned child still enforces the
+    // same ownership proof, so this check never authorizes a write.
+    const file = path.join(ctx.binding.worktree, name);
+    if (exists(file) && !proved(ctx, name)) {
+      const receipted = exists(receiptPath(ctx, name));
+      let exact = false;
+      if (adoptExact && !receipted) {
+        try { exact = read(file).content.equals(Buffer.from(content, "utf8")); } catch { exact = false; }
+      }
+      if (!exact) throw conflict(name, receipted ? "modified" : "unowned");
+    }
     // Keep both directory descriptors open until the child exits: their
     // inodes cannot be recycled while the child compares its kernel cwd.
     // No descriptor forwarding/systemd changes or new worker are required.

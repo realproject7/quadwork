@@ -7365,6 +7365,10 @@ router.post("/api/projects/:project/reseed-agents", async (req, res) => {
       adoptExactSeeds: true,
     });
   } catch (err) {
+    // #1222: preserved conflicts leave the version marker pending.
+    if (err instanceof ReseedConflictError) {
+      return res.status(409).json({ ok: false, code: err.code, error: err.message, conflicts: err.conflicts, reseeded: err.partial.reseeded, skipped: err.partial.skipped });
+    }
     return res.status(500).json({ ok: false, error: err.message });
   }
   // #915: a manual reseed writes the current-version seeds, so advance the
@@ -7406,6 +7410,7 @@ function _performReseedWrites(project, cfg, opts = {}) {
   const reseeded = [];
   const preserved = {};
   const skipped = [];
+  const conflicts = [];
   for (const { agentKey, canonical, wtDir, repositoryKey, repositoryWorkingDir, primaryRepository: isPrimaryRepository } of targets) {
     const targetLabel = isPrimaryRepository ? agentKey : `${repositoryKey}/${agentKey}`;
     if (!fs.existsSync(wtDir)) { skipped.push(`${targetLabel} (no worktree)`); continue; }
@@ -7447,10 +7452,19 @@ function _performReseedWrites(project, cfg, opts = {}) {
       const repository = allRepositories(project).find((entry) => entry.key === repositoryKey);
       const binding = { worktree: wtDir, base: repositoryWorkingDir, repo: repository.repo, role: canonical };
       const writeSeed = (name, content) => {
-        const result = seedOwnedWorktreeFile(binding, name, content, {
-          adoptExact: opts.adoptExactSeeds === true,
-          runGit: (args) => getSharedResourceRuntimeOwner().runControlChildSync("git", ["-C", wtDir, ...args], { encoding: "utf8", timeout: 10000 }),
-        });
+        let result;
+        try {
+          result = seedOwnedWorktreeFile(binding, name, content, {
+            adoptExact: opts.adoptExactSeeds === true,
+            runGit: (args) => getSharedResourceRuntimeOwner().runControlChildSync("git", ["-C", wtDir, ...args], { encoding: "utf8", timeout: 10000 }),
+          });
+        } catch (error) {
+          // #1222: keep seeding the remaining files; the caller fails the
+          // project after the loop so its version marker stays pending.
+          if (error?.code !== "seed_conflict") throw error;
+          conflicts.push({ target: targetLabel, seed: name, ownership: error.ownership });
+          return;
+        }
         if (result.skipped) skipped.push(`${targetLabel}/${name} (${result.skipped})`);
         else reseeded.push(`${targetLabel}/${name}`);
       };
@@ -7547,7 +7561,20 @@ function _performReseedWrites(project, cfg, opts = {}) {
       }
     }
   }
+  if (conflicts.length > 0) throw new ReseedConflictError(conflicts, { reseeded, skipped, preserved });
   return { reseeded, skipped, preserved };
+}
+
+// #1222: one or more existing untracked seeds were preserved. The message and
+// `conflicts` carry only role target, seed filename, and ownership class.
+class ReseedConflictError extends Error {
+  constructor(conflicts, partial) {
+    super(`seed conflict — preserved ${conflicts.map((c) => `${c.target}/${c.seed} (${c.ownership})`).join(", ")}; ` +
+      "inspect and resolve each file, then run Re-seed (see docs/troubleshooting.md)");
+    this.code = "seed_conflict";
+    this.conflicts = conflicts;
+    this.partial = partial;
+  }
 }
 
 // ─── #856: Auto-reseed on version upgrade ────────────────────────────────
@@ -7605,6 +7632,11 @@ function _saveReseedState(state, statePath = RESEED_STATE_PATH) {
 // project stays observable without per-tick spam. Exported for test reset.
 const PERIODIC_DEFER_LOG_EVERY = 15; // ~15 min at the 60s retry-tick cadence
 const _periodicDeferStreak = new Map();
+// #1222: per-project last log time for a still-pending seed conflict. Startup
+// always logs; periodic retries log at most once per interval. Cleared when
+// the project resolves, so a later conflict logs immediately.
+const SEED_CONFLICT_LOG_INTERVAL_MS = 15 * 60 * 1000;
+const _seedConflictLoggedAt = new Map();
 
 async function autoReseedOnStartup(cfg, opts = {}) {
   const version = opts.version || _readPackageVersion();
@@ -7643,6 +7675,13 @@ async function autoReseedOnStartup(cfg, opts = {}) {
   // active batch) clears its streak, so a fresh stuck episode logs immediately
   // rather than waiting out a stale counter.
   const clearStuckStreak = (projectId) => { _periodicDeferStreak.delete(projectId); };
+  const now = opts.now || Date.now;
+  const logSeedConflict = (projectId, message) => {
+    const last = _seedConflictLoggedAt.get(projectId);
+    if (periodic && last !== undefined && now() - last < SEED_CONFLICT_LOG_INTERVAL_MS) return;
+    _seedConflictLoggedAt.set(projectId, now());
+    log(message);
+  };
 
   const state = _loadReseedState(statePath);
   const decisions = [];
@@ -7653,6 +7692,7 @@ async function autoReseedOnStartup(cfg, opts = {}) {
   for (const project of projects) {
     if (state.completedByProjectVersion[project.id] === version) {
       clearStuckStreak(project.id);
+      _seedConflictLoggedAt.delete(project.id);
       decisions.push({ projectId: project.id, action: "skip", reason: "already current" });
       continue;
     }
@@ -7702,11 +7742,17 @@ async function autoReseedOnStartup(cfg, opts = {}) {
     try {
       result = performWrites(project, cfg, {});
     } catch (err) {
+      if (err instanceof ReseedConflictError) {
+        decisions.push({ projectId: project.id, action: "conflict", conflicts: err.conflicts });
+        logSeedConflict(project.id, `[reseed] ${project.id}: CONFLICT — ${err.message}; state NOT advanced`);
+        continue;
+      }
       decisions.push({ projectId: project.id, action: "error", error: err.message });
       log(`[reseed] ${project.id}: ERROR — ${err.message}; state NOT advanced, will retry automatically (next tick or restart)`);
       continue;
     }
 
+    _seedConflictLoggedAt.delete(project.id);
     state.completedByProjectVersion[project.id] = version;
     try {
       _saveReseedState(state, statePath);
@@ -8515,6 +8561,9 @@ module.exports.PERIODIC_DEFER_LOG_EVERY = PERIODIC_DEFER_LOG_EVERY;
 module.exports._saveReseedState = _saveReseedState;
 module.exports._readPackageVersion = _readPackageVersion;
 module.exports._performReseedWrites = _performReseedWrites;
+module.exports.ReseedConflictError = ReseedConflictError;
+module.exports._seedConflictLoggedAt = _seedConflictLoggedAt;
+module.exports.SEED_CONFLICT_LOG_INTERVAL_MS = SEED_CONFLICT_LOG_INTERVAL_MS;
 module.exports.RESEED_STATE_PATH = RESEED_STATE_PATH;
 // #839 (re1 follow-up): expose the shared compute path plus the caches it
 // reads so the cache-miss completed-batch case is exercisable end-to-end.

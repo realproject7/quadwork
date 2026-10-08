@@ -42,6 +42,9 @@ const {
   _performReseedWrites,
   _periodicDeferStreak,
   PERIODIC_DEFER_LOG_EVERY,
+  ReseedConflictError,
+  _seedConflictLoggedAt,
+  SEED_CONFLICT_LOG_INTERVAL_MS,
 } = require("./routes");
 
 const autoReseedOnStartup = (cfg, options = {}) => autoReseedOnStartupRaw(cfg, {
@@ -556,6 +559,81 @@ function quietLog() {
     });
     await boot(); await boot(); await boot();
     assert.equal(blines.filter((l) => /reset16/.test(l)).length, 3, "boot (non-periodic) logs every error-deferral — no throttle");
+  }
+
+  // 17. #1222: a preserved seed conflict keeps the marker pending. Startup
+  //     logs it; periodic retries of the same pending project log at most
+  //     once per SEED_CONFLICT_LOG_INTERVAL_MS; a successful retry advances the
+  //     marker and resets the throttle, so a later conflict logs immediately.
+  {
+    _seedConflictLoggedAt.clear();
+    const cfg = { projects: [{ id: "conf17", working_dir: "/tmp/conf17" }] };
+    const statePath = path.join(tmp("conf17"), "state.json");
+    const { log, lines } = quietLog();
+    let clock = 1_000_000;
+    let conflicted = true;
+    let writes = 0;
+    const performWrites = () => {
+      writes++;
+      if (conflicted) {
+        throw new ReseedConflictError([{ target: "re1", seed: "AGENTS.md", ownership: "unowned" }],
+          { reseeded: ["head/AGENTS.md"], skipped: [], preserved: {} });
+      }
+      return { reseeded: ["re1/AGENTS.md"], skipped: [], preserved: {} };
+    };
+    const run = (periodic, version = "2.10.0") => autoReseedOnStartup(cfg, {
+      version, statePath, log, periodic, now: () => clock, performWrites,
+      getProgress: async () => ({ items: [], complete: false }),
+    });
+    const count = () => lines.filter((l) => /conf17: CONFLICT/.test(l)).length;
+
+    const boot = await run(false);
+    assert.deepEqual(boot.decisions[0], { projectId: "conf17", action: "conflict",
+      conflicts: [{ target: "re1", seed: "AGENTS.md", ownership: "unowned" }] });
+    assert.equal(count(), 1, "startup logs the conflict");
+    assert.match(lines[0], /conf17: CONFLICT — seed conflict — preserved re1\/AGENTS\.md \(unowned\).*state NOT advanced/);
+    assert.equal(_loadReseedState(statePath).completedByProjectVersion.conf17, undefined, "partial failure is not completion");
+
+    for (let i = 0; i < 14; i++) { clock += 60_000; await run(true); }
+    assert.equal(writes, 15, "each retry still attempts the write");
+    assert.equal(count(), 1, "periodic retries within 15 minutes stay silent");
+    clock += 60_000; await run(true);
+    assert.equal(count(), 2, "the same pending conflict re-logs once the interval elapses");
+    clock += SEED_CONFLICT_LOG_INTERVAL_MS - 1; await run(true);
+    assert.equal(count(), 2, "at most once per interval");
+    await run(false);
+    assert.equal(count(), 3, "a restart always logs");
+
+    conflicted = false; clock += 60_000;
+    assert.equal((await run(true)).decisions[0].action, "reseeded");
+    assert.equal(_loadReseedState(statePath).completedByProjectVersion.conf17, "2.10.0", "successful retry advances the marker");
+    assert.ok(!_seedConflictLoggedAt.has("conf17"), "resolution clears the throttle");
+
+    conflicted = true; clock += 60_000;
+    assert.equal((await run(true, "2.11.0")).decisions[0].action, "conflict");
+    assert.equal(count(), 4, "a new conflict after resolution logs immediately on a periodic tick");
+  }
+
+  // 18. #1222: active or unknown batch state still defers a conflicting
+  //     project before any write, and a deferral does not log a conflict.
+  {
+    _seedConflictLoggedAt.clear();
+    const cfg = { projects: [{ id: "conf18", working_dir: "/tmp/conf18" }] };
+    const statePath = path.join(tmp("conf18"), "state.json");
+    const { log, lines } = quietLog();
+    let writes = 0;
+    const performWrites = () => { writes++; throw new ReseedConflictError([{ target: "dev", seed: "AGENTS.md", ownership: "modified" }], { reseeded: [], skipped: [], preserved: {} }); };
+    for (const getProgress of [
+      async () => ({ items: [{ status: "in_review" }], complete: false }),
+      async () => null,
+      async () => { throw new Error("gh down"); },
+    ]) {
+      const out = await autoReseedOnStartup(cfg, { version: "2.10.0", statePath, log, getProgress, performWrites });
+      assert.equal(out.decisions[0].action, "deferred");
+    }
+    assert.equal(writes, 0, "deferred projects are never written");
+    assert.ok(!lines.some((l) => /CONFLICT/.test(l)));
+    assert.equal(_loadReseedState(statePath).completedByProjectVersion.conf18, undefined);
   }
 
   console.log("routes.autoReseed.test.js: all assertions passed");

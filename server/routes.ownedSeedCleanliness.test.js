@@ -62,7 +62,7 @@ const server = app.listen(0, "127.0.0.1");
 function post(url, value) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(value);
-    const req = http.request({ hostname: "127.0.0.1", port: server.address().port, path: url, method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (res) => {
+    const req = http.request({ hostname: "127.0.0.1", port: server.address().port, path: url, method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (res) => {
       let data = ""; res.on("data", (s) => { data += s; });
       res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(data) }));
     }); req.on("error", reject); req.end(body);
@@ -70,6 +70,15 @@ function post(url, value) {
 }
 const activate = () => post("/api/setup?step=activate-v2", request);
 const reseed = () => post("/api/projects/fresh/reseed-agents", {}); // Real idle admission, no force.
+// #1222: a preserved untracked seed is a 409 conflict naming only role/seed.
+async function conflicted(ownership) {
+  const result = await reseed();
+  assert.equal(result.status, 409, JSON.stringify(result));
+  assert.equal(result.body.code, "seed_conflict");
+  assert.deepEqual(result.body.conflicts, [{ target: "dev", seed: "AGENTS.md", ownership }]);
+  assert.ok(!result.body.error.includes(root), "conflict error carries no local paths");
+  return result;
+}
 function receipt(worktree, name = "AGENTS.md") {
   const admin = fs.readFileSync(path.join(worktree, ".git"), "utf8").trim().slice("gitdir: ".length);
   return path.join(admin, `quadwork-owned-seed-${name}.json`);
@@ -124,34 +133,56 @@ function receipt(worktree, name = "AGENTS.md") {
     await dirty(); fs.unlinkSync(path.join(dev, "operator.txt")); check();
 
     fs.appendFileSync(seed, "\nOperator edit\n"); const modified = fs.readFileSync(seed);
-    await dirty(); assert.equal((await reseed()).status, 500);
+    await dirty(); await conflicted("modified");
     assert.deepEqual(fs.readFileSync(seed), modified, "modified owned seed is preserved");
     fs.writeFileSync(seed, clean); check();
 
     // Replacement with even identical bytes has a different file identity.
     const saved = path.join(root, "saved-seed"); fs.renameSync(seed, saved); fs.writeFileSync(seed, clean);
-    await dirty(); assert.equal((await reseed()).status, 500);
+    await dirty(); await conflicted("modified");
     fs.unlinkSync(seed); fs.renameSync(saved, seed); check();
 
     fs.renameSync(seed, saved); const foreign = path.join(root, "foreign.md"); fs.writeFileSync(foreign, "foreign target\n"); fs.symlinkSync(foreign, seed);
-    await dirty(); assert.equal((await reseed()).status, 500);
+    await dirty(); await conflicted("modified");
     assert.equal(fs.readFileSync(foreign, "utf8"), "foreign target\n");
     fs.unlinkSync(seed); fs.renameSync(saved, seed); check();
 
     const receiptFile = receipt(dev); const savedReceipt = fs.readFileSync(receiptFile);
     const wrong = JSON.parse(savedReceipt); wrong.binding.worktree = candidates[1].dev;
-    fs.writeFileSync(receiptFile, JSON.stringify(wrong)); await dirty(); assert.equal((await reseed()).status, 500);
+    fs.writeFileSync(receiptFile, JSON.stringify(wrong)); await dirty(); await conflicted("modified");
     fs.writeFileSync(receiptFile, savedReceipt); check();
 
     const savedReceiptPath = path.join(root, "receipt-backup"); fs.renameSync(receiptFile, savedReceiptPath); fs.symlinkSync(savedReceiptPath, receiptFile);
-    await dirty(); assert.equal((await reseed()).status, 500);
+    await dirty(); await conflicted("modified");
     assert.deepEqual(fs.readFileSync(savedReceiptPath), savedReceipt);
     fs.unlinkSync(receiptFile); fs.renameSync(savedReceiptPath, receiptFile); check();
 
     fs.unlinkSync(receiptFile); fs.writeFileSync(seed, "# Foreign untracked instructions\n");
-    await dirty(); assert.equal((await reseed()).status, 500);
-    assert.equal(fs.readFileSync(seed, "utf8"), "# Foreign untracked instructions\n");
-    fs.writeFileSync(seed, clean); assert.equal((await reseed()).status, 200); check();
+    const foreignBytes = fs.readFileSync(seed);
+    await dirty(); const partial = await conflicted("unowned");
+    assert.deepEqual(fs.readFileSync(seed), foreignBytes, "unreceipted foreign seed is preserved byte-for-byte");
+    assert.ok(!fs.existsSync(receiptFile), "ownership is never inferred from the filename");
+    // Partial failure: other current owned seeds are still refreshed, but the
+    // project is not reported complete and its version marker stays pending.
+    assert.ok(partial.body.reseeded.includes("head/AGENTS.md") && partial.body.reseeded.includes("dev/DESIGN-GUIDE.md"));
+    for (const other of candidates.slice(1)) other.check();
+    const statePath = path.join(configDir, "conflict-reseed-state.json"), lines = [];
+    const auto = (opts = {}) => routes.autoReseedOnStartup(cfg, { version: "1222-proof", statePath, log: (line) => lines.push(line), ...opts });
+    const pending = await auto();
+    assert.deepEqual(pending.decisions[0], { projectId: "fresh", action: "conflict", conflicts: [{ target: "dev", seed: "AGENTS.md", ownership: "unowned" }] });
+    assert.equal(routes._loadReseedState(statePath).completedByProjectVersion.fresh, undefined, "conflict keeps the marker pending");
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /fresh: CONFLICT .*dev\/AGENTS\.md \(unowned\)/);
+    assert.doesNotMatch(lines[0], /Foreign untracked instructions|reviewer-token|GH_TOKEN/);
+    assert.ok(!lines[0].includes(root), "conflict log carries no local paths");
+    await auto({ periodic: true }); assert.equal(lines.length, 1, "periodic retry of the same pending conflict is throttled");
+    assert.deepEqual(fs.readFileSync(seed), foreignBytes);
+    // Operator moved the file out of the worktree: the retry advances the marker.
+    fs.renameSync(seed, path.join(root, "foreign-backup.md"));
+    assert.equal((await auto({ periodic: true })).decisions[0].action, "reseeded");
+    assert.equal(routes._loadReseedState(statePath).completedByProjectVersion.fresh, "1222-proof");
+    assert.ok(!routes._seedConflictLoggedAt.has("fresh"), "resolution resets the conflict throttle");
+    check();
 
     // Tracked generated-looking content is never hidden or overwritten.
     git(dev, "add", "AGENTS.md"); commit(dev, "repository adopts instructions");
@@ -159,7 +190,7 @@ function receipt(worktree, name = "AGENTS.md") {
     await dirty(); assert.equal((await reseed()).status, 200);
     assert.deepEqual(fs.readFileSync(seed), tracked);
     assert.match(git(dev, "status", "--porcelain"), /M AGENTS\.md/);
-    console.log("routes.ownedSeedCleanliness.test.js: PASS (two real repositories, eight worktrees, activation/candidates/reuse/idle reseed/recovery; tracked, foreign, modified, replaced, symlink, wrong-path, unrelated-file guards)");
+    console.log("routes.ownedSeedCleanliness.test.js: PASS (two real repositories, eight worktrees, activation/candidates/reuse/idle reseed/recovery; tracked, foreign, modified, replaced, symlink, wrong-path, unrelated-file guards; #1222 conflict preservation, partial failure, pending marker)");
   } finally {
     fileChat.removeProject?.("fresh"); fileChat.stopWatching?.();
     await new Promise((resolve) => server.close(resolve)); restore(); os.homedir = originalHome;
