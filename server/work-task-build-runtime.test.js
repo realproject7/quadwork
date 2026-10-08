@@ -38,6 +38,11 @@ function fixture(options = {}) {
         calls.push({ kind: "assign", input: copy(input), base: serviceOptions.read_registered_base({ version: 1, work_task_ref: copy(input.work_task_ref) }) });
         return { outcome: "assigned", assignment_id: "build_" + "a".repeat(64), base_sha: "b".repeat(64) };
       },
+      recoverStaleBase: (input) => {
+        calls.push({ kind: "recover", input: copy(input), base: serviceOptions.read_registered_base({ version: 1, work_task_ref: copy(input.work_task_ref) }) });
+        return { version: 1, outcome: "recovered", work_task_ref: copy(input.work_task_ref),
+          retired_assignment_id: "build_" + "a".repeat(64), base_sha: "b".repeat(64) };
+      },
     }),
     read_registered_base: (project, request) => {
       calls.push({ kind: "base", project, request: copy(request) });
@@ -64,6 +69,21 @@ function fixture(options = {}) {
   throwsCode(() => missingDev.runtime.assign({ token: "head-token", body: { event_id: "assign_runtime_002", work_task_ref: copy(ref) } }), "work_task_build_principal_unavailable");
   assert.equal(missingDev.calls.length, 0);
   console.log("  PASS: build assignment fails closed until the assigned Dev is verified");
+}
+
+{
+  const missingDev = fixture();
+  missingDev.sessions.set(project_id + "/dev", session("dev", false));
+  const result = missingDev.runtime.recover({ token: "head-token", body: {
+    event_id: "recover_runtime_001", work_task_ref: copy(ref), expected_pipeline_digest: "e".repeat(64),
+  } });
+  assert.equal(result.outcome, "recovered", "Head can revoke stale authority even while Dev is unavailable");
+  assert.deepEqual(missingDev.calls[1].input, { version: 1, event_id: "recover_runtime_001",
+    work_task_ref: copy(ref), expected_pipeline_digest: "e".repeat(64) });
+  throwsCode(() => missingDev.runtime.recover({ token: "invalid", body: {
+    event_id: "recover_runtime_002", work_task_ref: copy(ref), expected_pipeline_digest: "e".repeat(64),
+  } }), "work_task_build_principal_unavailable");
+  console.log("  PASS: only current Head can recover a stale build without Dev readiness");
 }
 
 {

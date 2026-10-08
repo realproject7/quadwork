@@ -41,6 +41,7 @@ const issueFetches = [];
 const chatResumeRequests = [];
 const workTaskReviewRequests = [];
 const workTaskBuildRequests = [];
+const workTaskRecoveryRequests = [];
 const workTaskCandidateRequests = [];
 const deliveryCandidateRequests = [];
 const deliveryCiEvidenceRequests = [];
@@ -49,6 +50,7 @@ let admissionGeneration = 7;
 let registeredFingerprint = "queue-observation-a";
 let workTaskCandidateResponse;
 let workTaskReviewOpenResponse;
+let workTaskRecoveryResponse = null;
 let deliveryPrepareResponse = { status: 200, body: prepareSuccessBody };
 
 function sendJsonRpc(proc, msg) {
@@ -159,6 +161,14 @@ function startTestServer() {
       if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
       workTaskBuildRequests.push({ token: req.headers["x-chat-token"], body: req.body });
       res.json({ ok: true, outcome: "assigned" });
+    });
+    app.post("/api/work-task-build/recover", (req, res) => {
+      const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
+      if (!principal || principal.projectId !== PROJECT || principal.agentId !== "head") return res.status(403).json({ ok: false });
+      workTaskRecoveryRequests.push({ token: req.headers["x-chat-token"], body: req.body });
+      if (workTaskRecoveryResponse !== null) return res.status(workTaskRecoveryResponse.status).json(workTaskRecoveryResponse.body);
+      res.json({ ok: true, version: 1, outcome: "recovered", work_task_ref: req.body.work_task_ref,
+        retired_assignment_id: "build_" + "a".repeat(64), base_sha: "b".repeat(40) });
     });
     app.post("/api/work-task-candidate", (req, res) => {
       const principal = fileChat.resolveShimPrincipal(req.headers["x-chat-token"]);
@@ -288,6 +298,7 @@ async function runTests() {
   assert(toolNames.includes("read_ci_evidence"), "tools/list exposes redacted CI evidence reads to dev");
   assert(!toolNames.includes("chat_resume"), "tools/list hides Head-only chat_resume from dev");
   assert(!toolNames.includes("assign_work_task_build"), "tools/list hides Head-only WorkTask build assignment from dev");
+  assert(!toolNames.includes("recover_work_task_build"), "tools/list hides Head-only WorkTask build recovery from dev");
   assert(!toolNames.includes("open_work_task_independent_review"), "tools/list hides Head-only WorkTask review opening from dev");
   assert(!toolNames.includes("reconcile_work_task_review"), "tools/list hides Head-only WorkTask review reconciliation from dev");
   assert(!toolNames.includes("prepare_delivery_candidate") && !toolNames.includes("compose_delivery_candidate") && !toolNames.includes("plan_delivery_candidate_publication") && !toolNames.includes("open_delivery_candidate_final_review"),
@@ -394,6 +405,8 @@ async function runTests() {
       `tools/list exposes chat_resume only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("assign_work_task_build") === (role === "head"),
       `tools/list exposes WorkTask build assignment only to authenticated Head role ${role}`);
+    assert(roleToolNames.includes("recover_work_task_build") === (role === "head"),
+      `tools/list exposes WorkTask build recovery only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("open_work_task_independent_review") === (role === "head"),
       `tools/list exposes WorkTask review opening only to authenticated Head role ${role}`);
     assert(roleToolNames.includes("reconcile_work_task_review") === (role === "head"),
@@ -437,6 +450,34 @@ async function runTests() {
   assert(workTaskBuildRequests.length === 1 && workTaskBuildRequests[0].token === HEAD_RESUME_TOKEN &&
     JSON.stringify(workTaskBuildRequests[0].body) === JSON.stringify(buildArguments),
   "Head build assignment forwards only its typed arguments and existing shim token");
+  const recoveryArguments = { event_id: "recover_build_001", work_task_ref: candidateArguments.work_task_ref,
+    expected_pipeline_digest: "f".repeat(64) };
+  sendJsonRpc(headShim, { jsonrpc: "2.0", id: 2101, method: "tools/call", params: {
+    name: "recover_work_task_build", arguments: recoveryArguments,
+  } });
+  const recoveryResponse = await readResponse(headShim);
+  assert(JSON.parse(recoveryResponse.result?.content?.[0]?.text || "{}").outcome === "recovered",
+    "authenticated Head can recover one stale build");
+  assert(workTaskRecoveryRequests.length === 1 && workTaskRecoveryRequests[0].token === HEAD_RESUME_TOKEN &&
+    JSON.stringify(workTaskRecoveryRequests[0].body) === JSON.stringify(recoveryArguments),
+  "recovery forwards only the exact task, event, digest, and bound Head token");
+  for (const response of [
+    { status: 409, body: { ok: false, code: "work_task_stale_base_recovery_stale", secret: HEAD_RESUME_TOKEN } },
+    { status: 409, body: { ok: false, code: "private_recovery_failure", secret: HEAD_RESUME_TOKEN } },
+    { status: 200, body: { ok: true, outcome: "recovered", secret: HEAD_RESUME_TOKEN } },
+  ]) {
+    workTaskRecoveryResponse = response;
+    sendJsonRpc(headShim, { jsonrpc: "2.0", id: 2102, method: "tools/call", params: {
+      name: "recover_work_task_build", arguments: recoveryArguments,
+    } });
+    const rejected = await readResponse(headShim);
+    assert(rejected.error?.code === -32000 &&
+      rejected.error?.message === (response.body.code === "work_task_stale_base_recovery_stale"
+        ? "work_task_stale_base_recovery_stale" : "WorkTask build recovery unavailable") &&
+      !JSON.stringify(rejected).includes(HEAD_RESUME_TOKEN),
+    "recovery reveals only a known code or a generic refusal");
+  }
+  workTaskRecoveryResponse = null;
 
   const openWorkTaskRef = {
     version: 1, installation_id: "installation_review_shim_0001", project_id: "mcp-shim-test",
@@ -589,6 +630,12 @@ async function runTests() {
   const hiddenBuild = await readResponse(shim);
   assert(hiddenBuild.error?.code === -32601, "non-Head hidden WorkTask build assignment calls are denied locally");
   assert(workTaskBuildRequests.length === 1, "non-Head build assignment calls never reach the fixed endpoint");
+  sendJsonRpc(shim, { jsonrpc: "2.0", id: 2301, method: "tools/call", params: {
+    name: "recover_work_task_build", arguments: recoveryArguments,
+  } });
+  const hiddenRecovery = await readResponse(shim);
+  assert(hiddenRecovery.error?.code === -32601 && workTaskRecoveryRequests.length === 4,
+    "non-Head build recovery never reaches the fixed endpoint");
 
   sendJsonRpc(shim, { jsonrpc: "2.0", id: 231, method: "tools/call", params: {
     name: "open_work_task_independent_review", arguments: openArguments,

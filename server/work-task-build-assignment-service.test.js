@@ -11,12 +11,16 @@ const installation_id = "installation_build_service_0001", project_id = "quadwor
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
 function withDir(run) { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qw-build-service-")); try { return run(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); } }
 function fixture(dir) {
-  const manifest = freezeBatchManifest(buildBatchManifest({ version: 1, installation_id, project_id, delivery_mode: "integrated", tasks: [{ task_key: "build", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 42, kind: "issue" }, goal: "assign a server base", file_boundary: ["server/build.js"], validation: ["node-test"], dependencies: [] }] }, { resolveRegisteredIdentity(input) { return { ...input, work_item: copy(input.work_item), issue_body_revision: "c".repeat(64) }; } }), "2026-09-02T00:00:00.000Z");
+  const manifest = freezeBatchManifest(buildBatchManifest({ version: 1, installation_id, project_id, delivery_mode: "integrated", tasks: [
+    { task_key: "build", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 42, kind: "issue" }, goal: "assign a server base", file_boundary: ["server/build.js"], validation: ["node-test"], dependencies: [] },
+    { task_key: "other", repository_key: "web", work_item: { repoKey: "web", repo: "Owner/Web", number: 43, kind: "issue" }, goal: "keep another task queued", file_boundary: ["server/other.js"], validation: ["node-test"], dependencies: [] },
+  ] }, { resolveRegisteredIdentity(input) { return { ...input, work_item: copy(input.work_item), issue_body_revision: "c".repeat(64) }; } }), "2026-09-02T00:00:00.000Z");
   const store = createWorkTaskPipelineStore({ config_dir: dir, fs });
   store.initialize({ expected: { installation_id, project_id, manifest_digest: manifest.manifest_digest, pipeline_digest: null }, manifest, pipeline: buildWorkTaskPipeline(manifest) });
   const calls = [];
-  const service = createWorkTaskBuildAssignmentService({ config_dir: dir, fs, read_registered_base(request) { calls.push(request); return { version: 1, repository_key: "web", base_sha }; } });
-  return { ref: manifest.tasks[0].ref, store, service, calls };
+  const observed = { sha: base_sha };
+  const service = createWorkTaskBuildAssignmentService({ config_dir: dir, fs, read_registered_base(request) { calls.push(request); return { version: 1, repository_key: "web", base_sha: observed.sha }; } });
+  return { ref: manifest.tasks[0].ref, store, service, calls, observed };
 }
 withDir((dir) => {
   const current = fixture(dir);
@@ -33,6 +37,64 @@ withDir((dir) => {
   current.service.assignBuild({ version: 1, event_id: "assign_build_002", work_task_ref: copy(current.ref) });
   assert.throws(() => current.service.assignBuild({ version: 1, event_id: "other_build_002", work_task_ref: copy(current.ref) }), (error) => error instanceof WorkTaskBuildAssignmentServiceError && error.code === "work_task_build_assignment_unavailable");
   console.log("  PASS: a second build cannot overlap the active exact WorkTask assignment");
+});
+withDir((dir) => {
+  const current = fixture(dir);
+  const first = current.service.assignBuild({ version: 1, event_id: "assign_before_drift", work_task_ref: copy(current.ref) });
+  const before = current.store.readRecoverySnapshot({ installation_id, project_id }).pipeline;
+  current.observed.sha = "b".repeat(40);
+  const request = { version: 1, event_id: "recover_before_candidate", work_task_ref: copy(current.ref), expected_pipeline_digest: before.pipeline_digest };
+  const recovered = current.service.recoverStaleBase(request);
+  assert.equal(recovered.outcome, "recovered");
+  assert.equal(current.service.recoverStaleBase(request).outcome, "idempotent", "interrupted retry does not create another recovery");
+  const state = current.store.readRecoverySnapshot({ installation_id, project_id }).pipeline;
+  assert.equal(state.tasks[0].state, "queued");
+  assert.deepEqual(state.tasks[1], before.tasks[1], "other task remains unchanged");
+  assert.equal(state.tasks[0].build_assignment, null);
+  assert.equal(state.tasks[0].retired_builds[0].assignment.assignment_id, first.assignment_id);
+  assert.equal(state.repository_bases[0].base_sha, current.observed.sha);
+  assert.throws(() => current.service.recoverStaleBase({ ...request, event_id: "recover_stale_revision" }),
+    (error) => error instanceof WorkTaskBuildAssignmentServiceError && error.code === "work_task_stale_base_recovery_stale");
+  const second = current.service.assignBuild({ version: 1, event_id: "assign_after_drift", work_task_ref: copy(current.ref) });
+  assert.equal(second.base_sha, current.observed.sha);
+  assert.notEqual(second.assignment_id, first.assignment_id, "retired Dev authority is never reused");
+  assert.throws(() => current.service.assignBuild({ version: 1, event_id: "assign_before_drift", work_task_ref: copy(current.ref) }),
+    (error) => error instanceof WorkTaskBuildAssignmentServiceError && error.code === "work_task_build_event_conflict",
+    "retrying the old assignment cannot return the new Dev authority");
+  console.log("  PASS: stale-base recovery retires an active build once and pins the new observed base on reassignment");
+});
+withDir((dir) => {
+  const current = fixture(dir);
+  const first = current.service.assignBuild({ version: 1, event_id: "assign_candidate_drift", work_task_ref: copy(current.ref) });
+  const candidateSha = "c".repeat(40);
+  const candidate = buildWorkTaskCandidate({ version: 1, work_task_ref: copy(current.ref), base_sha, candidate_sha: candidateSha,
+    branch: "worktree-dev", worktree: { repository_key: "web", worktree_id: "wt_web_dev", path: "/private/var/quadwork/web-dev" } }, {
+    canonicalizePath(input) { return { version: 1, canonical_path: input.path }; },
+    inspectManagedWorktree(input) { return { version: 1, registered: true, readable: true, repository_key: "web", worktree_id: "wt_web_dev",
+      canonical_path: input.expected.canonical_path, branch: input.expected.branch, base_sha, head_sha: candidateSha, dirty: false, occupancy: "vacant" }; },
+    readCanonicalInstalledState() { return { version: 1, installation_id, project_id, v1_state: "present" }; },
+  });
+  let state = current.store.readRecoverySnapshot({ installation_id, project_id });
+  const plan = planWorkTaskPipelineEvent(state.pipeline, { version: 1, kind: "record_candidate", event_id: "candidate_before_drift",
+    assignment_id: first.assignment_id, candidate });
+  current.store.applyPlan({ expected: { installation_id, project_id, manifest_digest: state.manifest.manifest_digest, pipeline_digest: state.pipeline.pipeline_digest },
+    plan, terminal_disposition: null });
+  state = current.store.readRecoverySnapshot({ installation_id, project_id });
+  current.observed.sha = "b".repeat(40);
+  const recovered = current.service.recoverStaleBase({ version: 1, event_id: "recover_after_candidate",
+    work_task_ref: copy(current.ref), expected_pipeline_digest: state.pipeline.pipeline_digest });
+  assert.equal(recovered.outcome, "recovered");
+  const after = current.store.readRecoverySnapshot({ installation_id, project_id }).pipeline;
+  assert.equal(after.tasks[0].state, "queued");
+  assert.equal(after.tasks[0].candidate, null);
+  assert.equal(after.tasks[0].retired_builds[0].candidate.candidate_digest, candidate.candidate_digest);
+  assert.equal(after.tasks[0].retired_builds[0].assignment.assignment_id, first.assignment_id);
+  const second = current.service.assignBuild({ version: 1, event_id: "assign_candidate_again", work_task_ref: copy(current.ref) });
+  assert.notEqual(second.assignment_id, first.assignment_id);
+  assert.throws(() => planWorkTaskPipelineEvent(current.store.readRecoverySnapshot({ installation_id, project_id }).pipeline,
+    { version: 1, kind: "record_candidate", event_id: "old_candidate_retry", assignment_id: first.assignment_id, candidate }),
+  (error) => error.code === "work_task_candidate_assignment_mismatch");
+  console.log("  PASS: recovery archives a submitted candidate and rejects its old Dev assignment after reassignment");
 });
 // A task inside a pending pre-release propagation stop's declared chain is
 // refused before the registered base is observed; once the round releases,
